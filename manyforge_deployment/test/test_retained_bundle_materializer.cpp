@@ -13,6 +13,7 @@
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #include <manyforge_deployment/retention_qualified_deployment.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
+#include <manyforge_deployment/runtime_contract_capability_declarations.hpp>
 #include <manyforge_deployment/runtime_policy_codec.hpp>
 #include <manyforge_deployment/runtime_contract_registry.hpp>
 #include <manyforge_deployment/site_overlay_resolution.hpp>
@@ -80,41 +81,6 @@ namespace {
 constexpr std::string_view kZeroDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
-using LogicalSceneCapabilityReference =
-    std::pair<std::string_view, std::string_view>;
-
-constexpr std::array<LogicalSceneCapabilityReference, 14U>
-    kLogicalSceneCapabilityReferences{{
-        {"collision.query.detailed",
-         "sha256:59cfd352c4a08e315f95c2cb93ada8d2a16a6d2155f83b1c7603e9643088f73b"},
-        {"collision.query.pre_execution",
-         "sha256:c45cdcea2f79fbef5d1bc95db064078560c7d5d161b72667a5ce2c72a7432eca"},
-        {"observability.trace.scene",
-         "sha256:aa079df5821ad6ad0fdfc15f15368ca6682cd17dd1c804998e4e954fe1979180"},
-        {"scene.edit.add",
-         "sha256:9f7fbd7203abe565edfb6468d9e52fa15c028f3636615eb62a8d5e8e0c84fea5"},
-        {"scene.edit.attach_detach",
-         "sha256:444c80303025e78b49df614d71c7df35d0f40867cb0901a8bd0117e65d50eed2"},
-        {"scene.edit.remove",
-         "sha256:c19f72293c0b9f54b24e8f165b27112e3ad8496e1d319f0d20d74b7eee6951bc"},
-        {"scene.edit.update_pose",
-         "sha256:2289472ab0392c94e512d8bfe65406ef7a7ffafb73b40381bd36f627248de4f3"},
-        {"scene.edit.upsert",
-         "sha256:01668536a12a75af7024ce6dd1248ce5fd18f25f75d1fadfb953b4b7da0ed1f2"},
-        {"scene.object.query",
-         "sha256:59bad10b1c6eea73c493dbba88cf15befe3345d32bbebd0b7c7fce4947531109"},
-        {"scene.reference.resolve",
-         "sha256:4f66fab4656567598a11844b3b2572112b5239d9eaca4a538f90e082db7154d9"},
-        {"scene.shape.box",
-         "sha256:76e9a3ca351e30e271ec75e3b6de1ea42a718f81cca35cda6bab4ee642e1e12d"},
-        {"scene.shape.cylinder",
-         "sha256:4ffc860d1851db9b3a7fd82f5e9bd88eb1eca624dba372852fb2912fab9e34d5"},
-        {"scene.shape.mesh",
-         "sha256:5ea0a60f5d788c2133419b84f110f0edc033405c7bfd7385086888f09bd2779e"},
-        {"scene.shape.sphere",
-         "sha256:d84d92a0e0d9592ead27340278315b3a691c18a902fec44bc99626f36d9bc8f2"},
-    }};
-
 struct LogicalSceneRuntimeCoverage final {
   std::vector<core::CapabilityProviderBindingDTO> bindings;
   std::vector<LogicalCapabilityTemplate> capabilities;
@@ -132,18 +98,20 @@ make_logical_scene_runtime_coverage(const core::RuntimeUnitDTO& runtime,
   const core::ProviderManifestRevision provider_manifest_revision{
       std::string(kZeroDigest)};
   LogicalSceneRuntimeCoverage result;
-  result.bindings.reserve(kLogicalSceneCapabilityReferences.size());
-  result.capabilities.reserve(kLogicalSceneCapabilityReferences.size());
-  result.endpoints.reserve(kLogicalSceneCapabilityReferences.size());
-  for (const auto& [capability_id, capability_revision] :
-       kLogicalSceneCapabilityReferences) {
+  const auto& declarations =
+      runtime_contract_capabilities::kLogicalSceneServices;
+  result.bindings.reserve(declarations.size());
+  result.capabilities.reserve(declarations.size());
+  result.endpoints.reserve(declarations.size());
+  for (const auto capability_id : declarations) {
     const auto* descriptor =
         core::find_builtin_capability_definition(capability_id);
-    if (descriptor == nullptr ||
-        descriptor->capability_definition_revision != capability_revision) {
+    if (descriptor == nullptr) {
       throw std::logic_error(
           "logical-scene regression fixture has a stale capability");
     }
+    const auto capability_revision =
+        descriptor->capability_definition_revision;
     const core::CapabilityProviderBindingId binding_id(
         "logical_scene_" + std::string(capability_id));
     const core::CapabilityProviderBindingRevision binding_revision{
@@ -1467,8 +1435,7 @@ TEST(RetainedBundleMaterializer,
       R"({"collision_monitor_period_ms":50,"execution_tick_hz":100,"initial_joint_positions_rad":[0,0,1.57,0,0,0],"mode":"simulated","planner_rng_seed":12345})");
   EXPECT_NO_THROW(
       detail::require_native_execution_runtime_product_matches_retained_bundle(
-          manifest, launch_descriptor, std::nullopt, bundle->value(),
-          group.runtime_unit_id));
+          manifest, launch_descriptor, bundle->value(), group.runtime_unit_id));
   const auto runtime_configuration =
       native_execution_runtime_contract::require_configuration(
           *bundle, group.runtime_unit_id);
@@ -1484,8 +1451,8 @@ TEST(RetainedBundleMaterializer,
           changed_configuration)));
   EXPECT_THROW(
       detail::require_native_execution_runtime_product_matches_retained_bundle(
-          changed_configuration, launch_descriptor, std::nullopt,
-          bundle->value(), group.runtime_unit_id),
+          changed_configuration, launch_descriptor, bundle->value(),
+          group.runtime_unit_id),
       RetainedBundleError);
   const std::string changed_liveness = replace_once(
       manifest, "\"heartbeat_period_ns\":250000000",
@@ -1555,15 +1522,6 @@ TEST(RetainedBundleMaterializer,
       product.product_contract_revision,
       detail::ros2_control_execution_runtime_product_contract_revision());
   ASSERT_EQ(product.artifact_refs.size(), 2U);
-  EXPECT_EQ(std::count_if(
-                product.artifact_refs.begin(), product.artifact_refs.end(),
-                [](const auto &artifact) {
-                  return artifact.artifact_role_id.value() ==
-                         detail::
-                             kRos2ControlExecutionRuntimeBuildIdentityArtifactRole;
-                }),
-            0);
-
   const std::string manifest = require_product_artifact_bytes(
       product, detail::kRos2ControlExecutionRuntimeManifestArtifactRole,
       raw_store);
@@ -1580,8 +1538,7 @@ TEST(RetainedBundleMaterializer,
       R"({"collision_monitor_period_ms":100,"execution_tick_hz":100,"initial_joint_positions_rad":[0,0,1.57,0,0,0],"isaac_profile":"lite6","mode":"commanded_sim","planner_rng_seed":12345,"runtime_collision_immediate_query_budget_ms":75,"runtime_collision_lookahead_cycle_budget_ms":350,"runtime_collision_lookahead_max_samples":32,"runtime_collision_lookahead_query_budget_ms":75,"runtime_collision_lookahead_s":2,"runtime_collision_lookahead_workers":4,"runtime_dynamic_body_max_age_cap_ms":1000,"validation_collision_workers":4})");
   EXPECT_NO_THROW(
       detail::require_ros2_control_execution_runtime_product_matches_retained_bundle(
-          manifest, launch_descriptor, std::nullopt, bundle->value(),
-          group.runtime_unit_id));
+          manifest, launch_descriptor, bundle->value(), group.runtime_unit_id));
 
   const auto runtime_configuration =
       ros2_control_execution_runtime_contract::require_configuration(
@@ -1614,8 +1571,8 @@ TEST(RetainedBundleMaterializer,
           changed_configuration)));
   EXPECT_THROW(
       detail::require_ros2_control_execution_runtime_product_matches_retained_bundle(
-          changed_configuration, launch_descriptor, std::nullopt,
-          bundle->value(), group.runtime_unit_id),
+          changed_configuration, launch_descriptor, bundle->value(),
+          group.runtime_unit_id),
       RetainedBundleError);
   EXPECT_NO_THROW(static_cast<void>(
       detail::RetainedBundleReloadAuthority::reload(bundle->canonical_bytes())));
@@ -1763,7 +1720,7 @@ TEST(RetainedBundleMaterializer,
     EXPECT_NO_THROW(
         detail::
             require_native_execution_runtime_product_matches_retained_bundle(
-                manifest, launch_descriptor, std::nullopt, bundle->value(),
+                manifest, launch_descriptor, bundle->value(),
                 group.runtime_unit_id));
   }
   ASSERT_EQ(capabilities_by_runtime.size(), 2U);
@@ -1805,15 +1762,20 @@ TEST(RetainedBundleMaterializer,
     ASSERT_EQ(requirements.size(), 1U);
     const auto& requirement = requirements.front().requirement;
     ASSERT_EQ(requirement.required_capabilities.size(),
-              kLogicalSceneCapabilityReferences.size());
+              runtime_contract_capabilities::kLogicalSceneServices.size());
 
     std::vector<core::RuntimeCapabilityContractRefDTO> expected_capabilities;
-    expected_capabilities.reserve(kLogicalSceneCapabilityReferences.size());
-    for (const auto& [capability_id, capability_revision] :
-         kLogicalSceneCapabilityReferences) {
+    expected_capabilities.reserve(
+        runtime_contract_capabilities::kLogicalSceneServices.size());
+    for (const auto capability_id :
+         runtime_contract_capabilities::kLogicalSceneServices) {
+      const auto* descriptor =
+          core::find_builtin_capability_definition(capability_id);
+      ASSERT_NE(descriptor, nullptr);
       expected_capabilities.push_back({
           core::CapabilityId(std::string(capability_id)),
-          core::CapabilityDefinitionRevision(std::string(capability_revision)),
+          core::CapabilityDefinitionRevision(
+              std::string(descriptor->capability_definition_revision)),
       });
     }
     EXPECT_EQ(requirement.required_capabilities, expected_capabilities);
@@ -2058,6 +2020,36 @@ TEST(RetainedBundleMaterializer,
                    canonical_json(extra))),
                RetainedBundleError);
 
+  CanonicalValue diagnostic_family = bundle->normalized_root();
+  auto family_rows =
+      array_member(diagnostic_family, "runtime_contract_requirements");
+  const auto& original_requirement =
+      bundle->value().runtime_contract_requirements.front().requirement;
+  auto diagnostic_capabilities = original_requirement.required_capabilities;
+  ASSERT_FALSE(diagnostic_capabilities.empty());
+  diagnostic_capabilities.front().capability_definition_revision =
+      core::CapabilityDefinitionRevision(std::string(kZeroDigest));
+  const auto rebuilt_requirement = core::MakeRuntimeContractRequirement(
+      core::RuntimeImplementationFamilyId("compatible.alternative.runtime"),
+      original_requirement.required_api_contract_ids,
+      std::move(diagnostic_capabilities));
+  ASSERT_TRUE(rebuilt_requirement.ok());
+  const auto encoded_requirement =
+      core::EncodeRuntimeContractRequirement(rebuilt_requirement.value());
+  ASSERT_TRUE(encoded_requirement.ok());
+  auto first_family_row = family_rows.front();
+  first_family_row = replace_object_member(
+      first_family_row, "requirement",
+      parse_strict_json_model_yaml(encoded_requirement.value()).root());
+  family_rows.front() = std::move(first_family_row);
+  diagnostic_family = replace_root_member(
+      diagnostic_family, "runtime_contract_requirements",
+      CanonicalValue(std::move(family_rows)));
+  diagnostic_family = reidentify_retained_bundle(std::move(diagnostic_family));
+  EXPECT_NO_THROW(static_cast<void>(
+      detail::RetainedBundleReloadAuthority::reload(
+          canonical_json(diagnostic_family))));
+
   CanonicalValue bad_digest = bundle->normalized_root();
   auto digest_rows = array_member(bad_digest, "runtime_contract_requirements");
   auto first_row = digest_rows.front();
@@ -2178,11 +2170,11 @@ TEST(RetainedBundleMaterializer,
           replace_once(launch_descriptor,
                        detail::kNativeExecutionRuntimeInstalledTargetId,
                        "caller_selected_target"),
-          std::nullopt, bundle->value(), group.runtime_unit_id),
+          bundle->value(), group.runtime_unit_id),
       RetainedBundleError);
   EXPECT_THROW(
       detail::require_native_execution_runtime_product_matches_retained_bundle(
-          manifest, launch_descriptor, std::nullopt, bundle->value(),
+          manifest, launch_descriptor, bundle->value(),
           core::RuntimeUnitId("different_runtime")),
       RetainedBundleError);
 }
@@ -2383,50 +2375,12 @@ TEST(ControlDomainControlVerifier,
   const auto fixture =
       test::make_lite6_stoppable_controllable_retention_fixture();
   const core::ControlDomainId domain_id(std::string(test::kLite6ArmDomainId));
-  // Structural emitter/verifier coverage needs the exact row shape but must
-  // not mint or imply production qualification. The production materializer
-  // obtains the equivalent row only from sealed runner evidence.
-  const std::array<core::StopImplementationQualificationDTO, 1U>
-      structural_qualifications{{
-          {
-              core::RegisteredStopCommandKindId("manyforge.stop.software_hard"),
-              core::ProviderContractRefDTO{
-                  core::ProviderContractRoleId("software_hard_stop"),
-                  core::SchemaId(
-                      "manyforge.value_schema.provider_contract.empty.v1"),
-                  core::SchemaRevision(
-                      std::string(test::lite6_controllable_fixture_detail::
-                                      kEmptyProviderContractSchemaRevision)),
-              },
-              core::ProductId(detail::native_execution_runtime_product_id(
-                  core::RuntimeUnitId(
-                      std::string(test::kLite6NativeExecutionRuntimeId)))),
-              core::ProductContractId(std::string(
-                  detail::kNativeExecutionRuntimeProductContractId)),
-              detail::native_execution_runtime_product_contract_revision(),
-              std::nullopt,
-              core::StopInvocationLaneId(
-                  "manyforge.native_execution_host.focused_software_hard.v1"),
-              core::RetainedArtifactRefDTO{
-                  core::ArtifactRoleId(std::string(
-                      core::kStopImplementationQualificationArtifactRole)),
-                  std::string(core::kStopImplementationQualificationMediaType),
-                  1U,
-                  core::ContentDigest(std::string(kZeroDigest)),
-                  core::ContentAddressedStoreKey(
-                      "sha256/"
-                      "00000000000000000000000000000000000000000000000000000000"
-                      "00000000"),
-              },
-          },
-      }};
   const std::string bytes = detail::emit_control_domain_control(
-      fixture.qualified.compiler_ir(), domain_id, structural_qualifications);
+      fixture.qualified.compiler_ir(), domain_id);
   const CanonicalValue control =
       detail::parse_and_verify_control_domain_control(bytes);
   EXPECT_NO_THROW(detail::require_control_domain_control_matches(
-      bytes, fixture.qualified.compiler_ir(), domain_id,
-      structural_qualifications));
+      bytes, fixture.qualified.compiler_ir(), domain_id));
   const auto not_stoppable_fixture =
       test::make_lite6_controllable_retention_fixture();
   const std::string not_stoppable_bytes = detail::emit_control_domain_control(
@@ -2532,89 +2486,7 @@ TEST(ControlDomainControlVerifier,
       RetainedBundleError);
 }
 
-TEST(ControlDomainControlVerifier,
-     Ros2ControlStopQualificationClosesToItsRuntimeUnitAndContract) {
-  const auto fixture =
-      test::make_lite6_ros2_control_motion_retention_fixture(true);
-  const core::ControlDomainId domain_id(std::string(test::kLite6ArmDomainId));
-  const core::RetainedArtifactRefDTO structural_artifact{
-      core::ArtifactRoleId(std::string(
-          core::kStopImplementationQualificationArtifactRole)),
-      std::string(core::kStopImplementationQualificationMediaType),
-      1U,
-      core::ContentDigest(std::string(kZeroDigest)),
-      core::ContentAddressedStoreKey(
-          "sha256/"
-          "0000000000000000000000000000000000000000000000000000000000000000"),
-  };
-  const std::array<core::StopImplementationQualificationDTO, 1U>
-      qualifications{{
-          {
-              core::RegisteredStopCommandKindId(
-                  "manyforge.stop.software_hard"),
-              core::ProviderContractRefDTO{
-                  core::ProviderContractRoleId("software_hard_stop"),
-                  core::SchemaId(
-                      "manyforge.value_schema.provider_contract.empty.v1"),
-                  core::SchemaRevision(std::string(
-                      test::lite6_controllable_fixture_detail::
-                          kEmptyProviderContractSchemaRevision)),
-              },
-              core::ProductId(
-                  detail::ros2_control_execution_runtime_product_id(
-                      core::RuntimeUnitId(std::string(
-                          test::kLite6Ros2ControlExecutionRuntimeId)))),
-              core::ProductContractId(std::string(
-                  detail::kRos2ControlExecutionRuntimeProductContractId)),
-              detail::
-                  ros2_control_execution_runtime_product_contract_revision(),
-              std::nullopt,
-              core::StopInvocationLaneId(
-                  "manyforge.ros2_control_execution_host."
-                  "focused_software_hard.v1"),
-              structural_artifact,
-          },
-      }};
-
-  const std::string bytes = detail::emit_control_domain_control(
-      fixture.qualified.compiler_ir(), domain_id, qualifications);
-  const CanonicalValue control =
-      detail::parse_and_verify_control_domain_control(bytes);
-  EXPECT_NO_THROW(detail::require_control_domain_control_matches(
-      bytes, fixture.qualified.compiler_ir(), domain_id, qualifications));
-  const auto &retained_qualifications =
-      array_member(control, "stop_implementation_qualifications");
-  ASSERT_EQ(retained_qualifications.size(), 1U);
-  EXPECT_EQ(string_member(retained_qualifications.front(), "product_id"),
-            detail::ros2_control_execution_runtime_product_id(
-                core::RuntimeUnitId(std::string(
-                    test::kLite6Ros2ControlExecutionRuntimeId))));
-  EXPECT_EQ(
-      detail::ros2_control_execution_runtime_product_id(core::RuntimeUnitId(
-          std::string(test::kLite6Ros2ControlExecutionRuntimeId))),
-      detail::native_execution_runtime_product_id(core::RuntimeUnitId(
-          std::string(test::kLite6Ros2ControlExecutionRuntimeId))));
-  EXPECT_EQ(string_member(retained_qualifications.front(),
-                          "product_contract_id"),
-            detail::kRos2ControlExecutionRuntimeProductContractId);
-
-  auto wrong_kind = qualifications;
-  wrong_kind.front().product_id = core::ProductId(
-      detail::native_execution_runtime_product_id(core::RuntimeUnitId(
-          std::string(test::kLite6Ros2ControlExecutionRuntimeId))));
-  wrong_kind.front().product_contract_id = core::ProductContractId(
-      std::string(detail::kNativeExecutionRuntimeProductContractId));
-  wrong_kind.front().product_contract_revision =
-      detail::native_execution_runtime_product_contract_revision();
-  wrong_kind.front().invocation_lane_id = core::StopInvocationLaneId(
-      "manyforge.native_execution_host.focused_software_hard.v1");
-  EXPECT_THROW(
-      static_cast<void>(detail::emit_control_domain_control(
-          fixture.qualified.compiler_ir(), domain_id, wrong_kind)),
-      RetainedBundleError);
-}
-
-TEST(ControlDomainControlVerifier,
+ TEST(ControlDomainControlVerifier,
      SelfConsistentImplementationRelabelStillRejects) {
   const auto direct = test::make_lite6_controllable_retention_fixture();
   const auto chained =

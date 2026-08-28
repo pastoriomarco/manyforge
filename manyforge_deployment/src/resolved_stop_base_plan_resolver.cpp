@@ -293,20 +293,6 @@ parse_authority_class(std::string_view value) {
   fail("state authority class is unknown");
 }
 
-[[nodiscard]] core::MotionControlledStopMode
-parse_motion_mode(std::string_view value) {
-  if (value == "soft_on_path") {
-    return core::MotionControlledStopMode::kSoftOnPath;
-  }
-  if (value == "spring_back_hold") {
-    return core::MotionControlledStopMode::kSpringBackHold;
-  }
-  if (value == "hard_deceleration") {
-    return core::MotionControlledStopMode::kHardDeceleration;
-  }
-  fail("motion-controlled Stop mode is unknown");
-}
-
 [[nodiscard]] core::SafetySystemRequestActionClass
 parse_safety_action(std::string_view value) {
   if (value == "protective_stop_request") {
@@ -690,42 +676,6 @@ parse_scope(const CanonicalValue &value, std::string_view path,
   fail("Stop containment scope kind is unknown");
 }
 
-[[nodiscard]] core::StopImplementationQualificationDTO
-parse_stop_implementation_qualification(const CanonicalValue &value,
-                                        std::string_view path) {
-  return {
-      core::RegisteredStopCommandKindId(
-          text(member(value, "registered_command_kind_id", path), path)),
-      parse_contract(member(value, "provider_contract_ref", path), path),
-      core::ProductId(text(member(value, "product_id", path), path)),
-      core::ProductContractId(
-          text(member(value, "product_contract_id", path), path)),
-      core::ProductContractRevision(
-          text(member(value, "product_contract_revision", path), path)),
-      optional_strong<core::EndpointRoleId>(
-          member(value, "endpoint_role_id", path), path),
-      core::StopInvocationLaneId(
-          text(member(value, "invocation_lane_id", path), path)),
-      parse_artifact(member(value, "qualification_artifact_ref", path), path),
-  };
-}
-
-[[nodiscard]] core::ControlledStopSubstitutionQualificationDTO
-parse_substitution_qualification(const CanonicalValue &value,
-                                 std::string_view path) {
-  return {
-      parse_contract(member(value, "provider_contract_ref", path), path),
-      core::ProductId(text(member(value, "product_id", path), path)),
-      core::ProductContractId(
-          text(member(value, "product_contract_id", path), path)),
-      core::ProductContractRevision(
-          text(member(value, "product_contract_revision", path), path)),
-      parse_motion_mode(text(member(value, "requested_stop_mode", path), path)),
-      parse_motion_mode(text(member(value, "executed_stop_mode", path), path)),
-      parse_artifact(member(value, "qualification_artifact_ref", path), path),
-  };
-}
-
 [[nodiscard]] core::CommissionedStopInterfaceDTO
 parse_commissioned(const CanonicalValue &value, std::string_view path) {
   const auto &kind = member(value, "external_resource_kind", path);
@@ -848,23 +798,6 @@ core::ResolvedStopBasePlanDTO resolve_verified_stop_base_plan(
     fail("active route has no stoppable retained plan");
   }
 
-  std::vector<core::StopImplementationQualificationDTO>
-      implementation_qualifications;
-  for (const auto &row :
-       array(member(root, "stop_implementation_qualifications", "control"),
-             "control")) {
-    implementation_qualifications.push_back(
-        parse_stop_implementation_qualification(row, "implementation"));
-  }
-  std::vector<core::ControlledStopSubstitutionQualificationDTO>
-      substitution_qualifications;
-  for (const auto &row :
-       array(member(root, "controlled_stop_substitution_qualifications",
-                    "control"),
-             "control")) {
-    substitution_qualifications.push_back(
-        parse_substitution_qualification(row, "substitution"));
-  }
   std::vector<core::CommissionedStopInterfaceDTO> commissioned;
   for (const auto &row :
        array(member(root, "commissioned_stop_interfaces", "control"),
@@ -957,32 +890,6 @@ core::ResolvedStopBasePlanDTO resolve_verified_stop_base_plan(
             ? core::StopActionClass::kSafetySystemRequest
             : core::StopActionClass::kControlled;
 
-    if (stage_kind == core::StopEscalationStageKind::kSoftwareHard) {
-      const auto matches = [&](const auto &candidate) {
-        return command.registered_command_kind_id.has_value() &&
-               command.provider_contract_ref.has_value() &&
-               candidate.registered_command_kind_id ==
-                   *command.registered_command_kind_id &&
-               candidate.provider_contract_ref ==
-                   *command.provider_contract_ref &&
-               candidate.product_id == runtime_product.product->product_id &&
-               candidate.product_contract_id ==
-                   runtime_product.product->product_contract_id &&
-               candidate.product_contract_revision ==
-                   runtime_product.product->product_contract_revision &&
-               candidate.endpoint_role_id == command_target.endpoint_role_id;
-      };
-      const auto found =
-          std::find_if(implementation_qualifications.begin(),
-                       implementation_qualifications.end(), matches);
-      if (found == implementation_qualifications.end() ||
-          std::find_if(std::next(found), implementation_qualifications.end(),
-                       matches) != implementation_qualifications.end()) {
-        fail("software-hard stage has no sole exact qualification");
-      }
-      qualification.software_hard_implementation_qualification = *found;
-    }
-
     const auto &default_parameters =
         member(source, "default_contract_parameters", "stage");
     std::optional<core::JsonObjectDTO> parameters;
@@ -991,34 +898,21 @@ core::ResolvedStopBasePlanDTO resolve_verified_stop_base_plan(
       if (stage_kind == core::StopEscalationStageKind::kNominal &&
           command.command_kind ==
               core::StopContainmentCommandKind::kMotionControlledStop) {
-        const auto matches = [&](const auto &candidate) {
-          return command.provider_contract_ref.has_value() &&
-                 candidate.provider_contract_ref ==
-                     *command.provider_contract_ref &&
-                 candidate.product_id == runtime_product.product->product_id &&
-                 candidate.product_contract_id ==
-                     runtime_product.product->product_contract_id &&
-                 candidate.product_contract_revision ==
-                     runtime_product.product->product_contract_revision;
-        };
         const auto substitution_parameter =
             parameters->find("recoverable_substitution_mode");
         const bool requests_substitution =
             substitution_parameter != parameters->end() &&
             !std::holds_alternative<std::nullptr_t>(
                 substitution_parameter->second.value);
-        const auto found =
-            std::find_if(substitution_qualifications.begin(),
-                         substitution_qualifications.end(), matches);
         if (requests_substitution) {
-          if (found == substitution_qualifications.end() ||
-              std::find_if(std::next(found), substitution_qualifications.end(),
-                           matches) != substitution_qualifications.end()) {
-            fail("nominal substitution has no sole exact qualification");
+          if (!command.provider_contract_ref.has_value()) {
+            fail("nominal substitution has no provider contract");
           }
-          qualification.controlled_substitution_qualification = *found;
-        } else if (found != substitution_qualifications.end()) {
-          fail("unrequested controlled substitution qualification is present");
+          qualification.controlled_substitution_contract =
+              core::ControlledStopSubstitutionContractDTO{
+                  *command.provider_contract_ref,
+                  core::MotionControlledStopMode::kSoftOnPath,
+                  core::MotionControlledStopMode::kSpringBackHold};
         }
       }
     }

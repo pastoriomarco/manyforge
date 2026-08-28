@@ -13,7 +13,6 @@
 #include "manyforge_deployment/closed_schema.hpp"
 #include "manyforge_deployment/content_identity.hpp"
 #include "manyforge_deployment/runtime_contract_registry.hpp"
-#include "stop_qualification_evidence_internal.hpp"
 #include "verified_retained_bundle_internal.hpp"
 
 namespace manyforge::deployment::detail {
@@ -221,22 +220,6 @@ require_artifact(const core::RetainedProductDTO &product,
         "ros2_control execution product omits an artifact role");
   }
   return *match;
-}
-
-[[nodiscard]] const core::RetainedArtifactRefDTO *
-find_artifact(const core::RetainedProductDTO &product, std::string_view role) {
-  const core::RetainedArtifactRefDTO *match = nullptr;
-  for (const auto &artifact : product.artifact_refs) {
-    if (artifact.artifact_role_id.value() != role) {
-      continue;
-    }
-    if (match != nullptr) {
-      fail_retained_bundle(
-          "ros2_control execution product repeats an artifact role");
-    }
-    match = &artifact;
-  }
-  return match;
 }
 
 } // namespace
@@ -573,7 +556,6 @@ CanonicalValue parse_and_verify_ros2_control_execution_runtime_manifest(
 void require_ros2_control_execution_runtime_product_matches_retained_bundle(
     std::string_view manifest_bytes,
     std::string_view launch_descriptor_bytes,
-    std::optional<std::string_view> implementation_build_identity_bytes,
     const core::RetainedBundleDTO &retained_bundle,
     const core::RuntimeUnitId &runtime_unit_id) {
   const auto manifest =
@@ -609,9 +591,7 @@ void require_ros2_control_execution_runtime_product_matches_retained_bundle(
           kRos2ControlExecutionRuntimeProductContractId ||
       product.product_contract_revision !=
           ros2_control_execution_runtime_product_contract_revision() ||
-      product.artifact_refs.size() !=
-          2U + static_cast<std::size_t>(
-                   implementation_build_identity_bytes.has_value())) {
+      product.artifact_refs.size() != 2U) {
     fail_retained_bundle("ros2_control execution retained product has an "
                          "incoherent identity");
   }
@@ -619,41 +599,17 @@ void require_ros2_control_execution_runtime_product_matches_retained_bundle(
       product, kRos2ControlExecutionRuntimeManifestArtifactRole);
   const auto &launch_ref = require_artifact(
       product, kRos2ControlExecutionRuntimeLaunchDescriptorArtifactRole);
-  const auto *build_identity_ref = find_artifact(
-      product, kRos2ControlExecutionRuntimeBuildIdentityArtifactRole);
   if (manifest_ref.media_type !=
           kRos2ControlExecutionRuntimeManifestMediaType ||
       manifest_ref.content_digest.value() != sha256_digest(manifest_bytes) ||
       manifest_ref.byte_size != manifest_bytes.size() ||
       launch_ref.media_type !=
           kRos2ControlExecutionRuntimeLaunchDescriptorMediaType ||
-      launch_ref.content_digest.value() !=
-          sha256_digest(launch_descriptor_bytes) ||
-      launch_ref.byte_size != launch_descriptor_bytes.size() ||
-      (build_identity_ref != nullptr) !=
-          implementation_build_identity_bytes.has_value()) {
+      launch_ref.content_digest.value() != sha256_digest(launch_descriptor_bytes) ||
+      launch_ref.byte_size != launch_descriptor_bytes.size()) {
     fail_retained_bundle("ros2_control execution product artifact table "
                          "differs from its bytes");
   }
-  if (implementation_build_identity_bytes.has_value()) {
-    const auto identity = parse_stop_implementation_build_identity(
-        *implementation_build_identity_bytes);
-    if (implementation_build_identity_bytes->empty() ||
-        build_identity_ref->media_type !=
-            kRos2ControlExecutionRuntimeBuildIdentityMediaType ||
-        build_identity_ref->content_digest.value() !=
-            sha256_digest(*implementation_build_identity_bytes) ||
-        build_identity_ref->byte_size !=
-            implementation_build_identity_bytes->size() ||
-        identity.implementation_id !=
-            kRos2ControlExecutionRuntimeImplementationId ||
-        identity.installed_target_id !=
-            kRos2ControlExecutionRuntimeInstalledTargetId) {
-      fail_retained_bundle("ros2_control execution build identity differs "
-                           "from its exact runtime product");
-    }
-  }
-
   bool source_found = false;
   for (const auto &source : retained_bundle.provenance.source_records) {
     std::visit(

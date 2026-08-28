@@ -77,7 +77,6 @@ class SnapshotExecutionBackend final : public IExecutionBackend {
                                          std::nullopt,
                                          std::nullopt,
                                          std::nullopt,
-                                         std::nullopt,
                                          0,
                                          {},
                                          std::nullopt};

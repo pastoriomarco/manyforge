@@ -352,65 +352,29 @@ template <typename Enum>
       std::move(overlay_value)};
 }
 
-[[nodiscard]] StopImplementationQualificationDTO decode_stop_implementation(
+[[nodiscard]] ControlledStopSubstitutionContractDTO decode_substitution(
     const CanonicalValue& value) {
   exact_object(
       value,
-      {"registered_command_kind_id", "provider_contract_ref", "product_id", "product_contract_id",
-       "product_contract_revision", "invocation_lane_id", "qualification_artifact_ref"},
-      {"endpoint_role_id"}, "Stop implementation qualification");
-  std::optional<EndpointRoleId> endpoint;
-  if (const auto* item = optional_member(value, "endpoint_role_id")) {
-    endpoint = EndpointRoleId(text(*item, "endpoint_role_id"));
-  }
-  return {
-      RegisteredStopCommandKindId(text(member(value, "registered_command_kind_id", "qualification"),
-                                       "registered_command_kind_id")),
-      decode_contract(member(value, "provider_contract_ref", "qualification")),
-      ProductId(text(member(value, "product_id", "qualification"), "product_id")),
-      ProductContractId(
-          text(member(value, "product_contract_id", "qualification"), "product_contract_id")),
-      ProductContractRevision(text(member(value, "product_contract_revision", "qualification"),
-                                   "product_contract_revision")),
-      std::move(endpoint),
-      StopInvocationLaneId(
-          text(member(value, "invocation_lane_id", "qualification"), "invocation_lane_id")),
-      decode_artifact(member(value, "qualification_artifact_ref", "qualification"))};
-}
-
-[[nodiscard]] ControlledStopSubstitutionQualificationDTO decode_substitution(
-    const CanonicalValue& value) {
-  exact_object(
-      value,
-      {"provider_contract_ref", "product_id", "product_contract_id", "product_contract_revision",
-       "requested_stop_mode", "executed_stop_mode", "qualification_artifact_ref"},
-      {}, "controlled Stop substitution qualification");
+      {"provider_contract_ref", "requested_stop_mode", "executed_stop_mode"},
+      {}, "controlled Stop substitution contract");
   return {decode_contract(member(value, "provider_contract_ref", "substitution")),
-          ProductId(text(member(value, "product_id", "substitution"), "product_id")),
-          ProductContractId(
-              text(member(value, "product_contract_id", "substitution"), "product_contract_id")),
-          ProductContractRevision(text(member(value, "product_contract_revision", "substitution"),
-                                       "product_contract_revision")),
           motion_stop_mode(member(value, "requested_stop_mode", "substitution")),
-          motion_stop_mode(member(value, "executed_stop_mode", "substitution")),
-          decode_artifact(member(value, "qualification_artifact_ref", "substitution"))};
+          motion_stop_mode(member(value, "executed_stop_mode", "substitution"))};
 }
 
 [[nodiscard]] ResolvedStopCommandQualificationDTO decode_qualification(
     const CanonicalValue& value) {
   exact_object(
       value, {"stop_action_class"},
-      {"controlled_substitution_qualification", "software_hard_implementation_qualification",
+      {"controlled_substitution_contract",
        "safety_system_request_action_class", "commissioned_stop_interface_id",
        "commissioned_stop_interface_revision", "commissioning_evidence_artifact_ref"},
       "resolved command qualification");
   ResolvedStopCommandQualificationDTO result;
   result.stop_action_class = action_class(member(value, "stop_action_class", "qualification"));
-  if (const auto* item = optional_member(value, "controlled_substitution_qualification")) {
-    result.controlled_substitution_qualification = decode_substitution(*item);
-  }
-  if (const auto* item = optional_member(value, "software_hard_implementation_qualification")) {
-    result.software_hard_implementation_qualification = decode_stop_implementation(*item);
+  if (const auto* item = optional_member(value, "controlled_substitution_contract")) {
+    result.controlled_substitution_contract = decode_substitution(*item);
   }
   if (const auto* item = optional_member(value, "safety_system_request_action_class")) {
     result.safety_system_request_action_class = safety_action_class(*item);

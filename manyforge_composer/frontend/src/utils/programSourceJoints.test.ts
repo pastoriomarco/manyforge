@@ -99,7 +99,6 @@ const applied: AppliedProgramSelection = {
     contact_grasp_bindings: [],
     provenance: {
       binding_compiler_contract_digest: 'sha256:contract',
-      binding_compiler_build_digest: 'sha256:build',
       role_assignment_digest: 'sha256:roles',
       source_records: [],
       resolved_output_records: [],

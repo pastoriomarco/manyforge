@@ -78,7 +78,6 @@ using namespace std::chrono_literals;
                                        std::nullopt,
                                        std::nullopt,
                                        std::nullopt,
-                                       std::nullopt,
                                        0,
                                        {},
                                        ErrorDTO{"fixture_failure", "fixture terminal result", {}}};

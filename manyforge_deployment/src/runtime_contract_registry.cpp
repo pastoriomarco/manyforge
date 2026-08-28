@@ -11,6 +11,7 @@
 #include <manyforge_core/runtime_contract_manifest_codec.hpp>
 #include <manyforge_core/types/capability_definition.hpp>
 #include <manyforge_core/types/error_code.hpp>
+#include <manyforge_deployment/runtime_contract_capability_declarations.hpp>
 
 #include "native_execution_runtime_unit_internal.hpp"
 #include "reference_runtime_unit_internal.hpp"
@@ -22,158 +23,23 @@ namespace {
 
 using core::RuntimeCapabilityContractRefDTO;
 
-using CapabilityReference = std::pair<std::string_view, std::string_view>;
-
-// These are the maintained installed-runtime declarations.  They are
-// intentionally explicit rather than being inferred from the node catalog,
-// executable registry, or the complete capability-definition registry.
-constexpr std::array<CapabilityReference, 14U>
-    kLogicalSceneServicesOfferedCapabilities{{
-        {"collision.query.detailed",
-         "sha256:59cfd352c4a08e315f95c2cb93ada8d2a16a6d2155f83b1c7603e9643088f73b"},
-        {"collision.query.pre_execution",
-         "sha256:c45cdcea2f79fbef5d1bc95db064078560c7d5d161b72667a5ce2c72a7432eca"},
-        {"observability.trace.scene",
-         "sha256:aa079df5821ad6ad0fdfc15f15368ca6682cd17dd1c804998e4e954fe1979180"},
-        {"scene.edit.add",
-         "sha256:9f7fbd7203abe565edfb6468d9e52fa15c028f3636615eb62a8d5e8e0c84fea5"},
-        {"scene.edit.attach_detach",
-         "sha256:444c80303025e78b49df614d71c7df35d0f40867cb0901a8bd0117e65d50eed2"},
-        {"scene.edit.remove",
-         "sha256:c19f72293c0b9f54b24e8f165b27112e3ad8496e1d319f0d20d74b7eee6951bc"},
-        {"scene.edit.update_pose",
-         "sha256:2289472ab0392c94e512d8bfe65406ef7a7ffafb73b40381bd36f627248de4f3"},
-        {"scene.edit.upsert",
-         "sha256:01668536a12a75af7024ce6dd1248ce5fd18f25f75d1fadfb953b4b7da0ed1f2"},
-        {"scene.object.query",
-         "sha256:59bad10b1c6eea73c493dbba88cf15befe3345d32bbebd0b7c7fce4947531109"},
-        {"scene.reference.resolve",
-         "sha256:4f66fab4656567598a11844b3b2572112b5239d9eaca4a538f90e082db7154d9"},
-        {"scene.shape.box",
-         "sha256:76e9a3ca351e30e271ec75e3b6de1ea42a718f81cca35cda6bab4ee642e1e12d"},
-        {"scene.shape.cylinder",
-         "sha256:4ffc860d1851db9b3a7fd82f5e9bd88eb1eca624dba372852fb2912fab9e34d5"},
-        {"scene.shape.mesh",
-         "sha256:5ea0a60f5d788c2133419b84f110f0edc033405c7bfd7385086888f09bd2779e"},
-        {"scene.shape.sphere",
-         "sha256:d84d92a0e0d9592ead27340278315b3a691c18a902fec44bc99626f36d9bc8f2"},
-    }};
-
-constexpr std::array<CapabilityReference, 22U>
-    kNativeExecutionOfferedCapabilities{{
-        {"execution.contact.geometric",
-         "sha256:63a3d877d78d71a5932cce5c92d2932b740fbba6e88d00ca3b5dd94429e3eb3d"},
-        {"execution.contact.geometric_signed_penetration",
-         "sha256:b2f0e892d401460c6b43b1c1b8b39a0cad5fcc130ba694c2c5e32d6cc2d8c323"},
-        {"execution.feedback.phase_events",
-         "sha256:37a4b6d145a96b0336ad03680c3222a63da28168764663cee7f5185fcbd467da"},
-        {"execution.feedback.state_snapshots",
-         "sha256:bdcd8c70d34d34bba3735e6e1b191cade422d9b50223afed895465e0062be85a"},
-        {"execution.pause",
-         "sha256:20f45f87bb6ad07f4b180c2e7c781347016c64c89808ae04a41f1dff50b7085e"},
-        {"execution.reset",
-         "sha256:24fa527d5e81814f8a395d1d3eeae3c3236c1249b05d84d2cd48abf3f2a27ebb"},
-        {"execution.resume",
-         "sha256:442663e2f2283bb503f89a21e760b732150424cd44c504a55de26e621f99e142"},
-        {"execution.stop.soft",
-         "sha256:3ed811803c31726c758e227fc52bd57854cc6e7fa09dff0fd117d41800d4f8b9"},
-        {"execution.trajectory.execute",
-         "sha256:7e5958db0906b84cb4e5c68ab0ef896f74dc0ba49a9ceb4d918b386abaf9f28c"},
-        {"model.kinematics.fk",
-         "sha256:c99e2dc6d89129ca1d1d4a44d561d878b786df610d1ff241f6e09b5b100edb28"},
-        {"model.limits.joint",
-         "sha256:4212f32bfc7e9b04cb11db023da86b9a8f75531b5d775674d559631d93b65053"},
-        {"planning.motion.cartesian_path",
-         "sha256:be53c54ff0aa662db108113e9273e847e790d1b6f0adbba591d50f2237134a00"},
-        {"planning.motion.joint_goal",
-         "sha256:0f6cb2fda7e1d05f20a5867203b84c0e0427440f4b11657941a907c2e2a23dce"},
-        {"planning.motion.pose_goal",
-         "sha256:422c7d9025d46e0fc660705a4f05171a235279872f91c820e952cf16792b8148"},
-        {"planning.profile.balanced",
-         "sha256:14c53dad299a42d6604eac14240d015e22a4bc1adb363fb252111e62a2d2ad90"},
-        {"planning.profile.first_feasible",
-         "sha256:e0f578ef9af205b3c7c184fb1124ffb4fe3c35874b5e993358b43a2dc43d2674"},
-        {"planning.profile.quality_bounded",
-         "sha256:7f570672270455207d5fb8eb210cd1dd22a99d7909421cf0dc8036c32e4beffb"},
-        {"planning.trajectory.time_parameterized",
-         "sha256:1fde55ff59f977844d1e42a115df0e66305953803e7f2830fec4821e3cd36385"},
-        {"state.observed.current",
-         "sha256:c1ec4dacead10e33176830d634e9b2287e4b96322a54700c1c3910bcba461c02"},
-        {"tool.gripper.command",
-         "sha256:a24b841e7c0323815a3576869d5819340bc6a98f1c2ffd5b47131e26698e9392"},
-        {"tool.gripper.feedback",
-         "sha256:53cebcf32900bf3fab41aeb490a9176d3130ae53c1a289c954f1eb8d07738e23"},
-        {"validation.trajectory.non_collision",
-         "sha256:3cd04895527038906ddcb9c6ca9fd87f4535eba41e5014b04917c66603f26653"},
-    }};
-
-constexpr std::array<CapabilityReference, 27U>
-    kRos2ControlExecutionOfferedCapabilities{{
-        {"component.lifecycle.disable",
-         "sha256:578cd871bc7248d18f1ccafe2659acb9d9ad35570c17b30758312d65b37fb4d1"},
-        {"component.lifecycle.enable",
-         "sha256:c0d8704375f520e69f04dccbdbe1f8856bab2c0c185ea59cddc4f34f50cbc1f7"},
-        {"component.lifecycle.observe",
-         "sha256:deb6815e681e8879c172e1a7dcd03a55154bc599efaa35167c9d23f54d6b9104"},
-        {"component.lifecycle.prepare",
-         "sha256:c61d01109243632bd3a4184061863cee480a35f253aabac7719fea634e2defd3"},
-        {"component.lifecycle.recover",
-         "sha256:7303e9db6f3c6d94b00ed8c448bb98abe156775f562e122cb8046799a7d41e9a"},
-        {"execution.contact.geometric",
-         "sha256:63a3d877d78d71a5932cce5c92d2932b740fbba6e88d00ca3b5dd94429e3eb3d"},
-        {"execution.contact.geometric_signed_penetration",
-         "sha256:b2f0e892d401460c6b43b1c1b8b39a0cad5fcc130ba694c2c5e32d6cc2d8c323"},
-        {"execution.feedback.phase_events",
-         "sha256:37a4b6d145a96b0336ad03680c3222a63da28168764663cee7f5185fcbd467da"},
-        {"execution.feedback.state_snapshots",
-         "sha256:bdcd8c70d34d34bba3735e6e1b191cade422d9b50223afed895465e0062be85a"},
-        {"execution.pause",
-         "sha256:20f45f87bb6ad07f4b180c2e7c781347016c64c89808ae04a41f1dff50b7085e"},
-        {"execution.reset",
-         "sha256:24fa527d5e81814f8a395d1d3eeae3c3236c1249b05d84d2cd48abf3f2a27ebb"},
-        {"execution.resume",
-         "sha256:442663e2f2283bb503f89a21e760b732150424cd44c504a55de26e621f99e142"},
-        {"execution.stop.soft",
-         "sha256:3ed811803c31726c758e227fc52bd57854cc6e7fa09dff0fd117d41800d4f8b9"},
-        {"execution.trajectory.execute",
-         "sha256:7e5958db0906b84cb4e5c68ab0ef896f74dc0ba49a9ceb4d918b386abaf9f28c"},
-        {"model.kinematics.fk",
-         "sha256:c99e2dc6d89129ca1d1d4a44d561d878b786df610d1ff241f6e09b5b100edb28"},
-        {"model.limits.joint",
-         "sha256:4212f32bfc7e9b04cb11db023da86b9a8f75531b5d775674d559631d93b65053"},
-        {"planning.motion.cartesian_path",
-         "sha256:be53c54ff0aa662db108113e9273e847e790d1b6f0adbba591d50f2237134a00"},
-        {"planning.motion.joint_goal",
-         "sha256:0f6cb2fda7e1d05f20a5867203b84c0e0427440f4b11657941a907c2e2a23dce"},
-        {"planning.motion.pose_goal",
-         "sha256:422c7d9025d46e0fc660705a4f05171a235279872f91c820e952cf16792b8148"},
-        {"planning.profile.balanced",
-         "sha256:14c53dad299a42d6604eac14240d015e22a4bc1adb363fb252111e62a2d2ad90"},
-        {"planning.profile.first_feasible",
-         "sha256:e0f578ef9af205b3c7c184fb1124ffb4fe3c35874b5e993358b43a2dc43d2674"},
-        {"planning.profile.quality_bounded",
-         "sha256:7f570672270455207d5fb8eb210cd1dd22a99d7909421cf0dc8036c32e4beffb"},
-        {"planning.trajectory.time_parameterized",
-         "sha256:1fde55ff59f977844d1e42a115df0e66305953803e7f2830fec4821e3cd36385"},
-        {"state.observed.current",
-         "sha256:c1ec4dacead10e33176830d634e9b2287e4b96322a54700c1c3910bcba461c02"},
-        {"tool.gripper.command",
-         "sha256:a24b841e7c0323815a3576869d5819340bc6a98f1c2ffd5b47131e26698e9392"},
-        {"tool.gripper.feedback",
-         "sha256:53cebcf32900bf3fab41aeb490a9176d3130ae53c1a289c954f1eb8d07738e23"},
-        {"validation.trajectory.non_collision",
-         "sha256:3cd04895527038906ddcb9c6ca9fd87f4535eba41e5014b04917c66603f26653"},
-    }};
-
 template <std::size_t N>
 [[nodiscard]] std::vector<RuntimeCapabilityContractRefDTO>
-declared_capabilities(const std::array<CapabilityReference, N>& declaration) {
+declared_capabilities(const std::array<std::string_view, N>& capability_ids) {
   std::vector<RuntimeCapabilityContractRefDTO> result;
   result.reserve(N);
-  for (const auto& [capability_id, revision] : declaration) {
-    result.emplace_back(core::CapabilityId(std::string(capability_id)),
-                        core::CapabilityDefinitionRevision(
-                            std::string(revision)));
+  for (const auto capability_id : capability_ids) {
+    const auto* definition =
+        core::find_builtin_capability_definition(capability_id);
+    if (definition == nullptr) {
+      throw std::logic_error("runtime contract declaration names unknown "
+                             "capability " +
+                             std::string(capability_id));
+    }
+    result.emplace_back(
+        core::CapabilityId(std::string(capability_id)),
+        core::CapabilityDefinitionRevision(
+            std::string(definition->capability_definition_revision)));
   }
   return result;
 }
@@ -181,11 +47,23 @@ declared_capabilities(const std::array<CapabilityReference, N>& declaration) {
 template <std::size_t N, std::size_t M>
 [[nodiscard]] std::vector<RuntimeCapabilityContractRefDTO>
 declared_capabilities(
-    const std::array<CapabilityReference, N>& runtime_declaration,
-    const std::array<CapabilityReference, M>& shared_declaration) {
-  auto result = declared_capabilities(runtime_declaration);
-  const auto shared = declared_capabilities(shared_declaration);
-  result.insert(result.end(), shared.begin(), shared.end());
+    const std::array<std::string_view, N>& first,
+    const std::array<std::string_view, M>& second) {
+  auto result = declared_capabilities(first);
+  const auto appended = declared_capabilities(second);
+  result.insert(result.end(), appended.begin(), appended.end());
+  return result;
+}
+
+template <std::size_t N, std::size_t M, std::size_t O>
+[[nodiscard]] std::vector<RuntimeCapabilityContractRefDTO>
+declared_capabilities(
+    const std::array<std::string_view, N>& first,
+    const std::array<std::string_view, M>& second,
+    const std::array<std::string_view, O>& third) {
+  auto result = declared_capabilities(first, second);
+  const auto appended = declared_capabilities(third);
+  result.insert(result.end(), appended.begin(), appended.end());
   return result;
 }
 
@@ -232,7 +110,7 @@ declared_capabilities(
           core::ApiContractId(std::string(api)), std::string(owner)};
 }
 
-void validate_row(const BuildQualifiedRuntimeContract& row) {
+void validate_row(const RuntimeContractDeclaration& row) {
   const auto exact_product = [&]() {
     if (row.runtime_profile_id().value() ==
         detail::kReferenceRuntimeProfileId) {
@@ -402,16 +280,16 @@ void validate_row(const BuildQualifiedRuntimeContract& row) {
 
 }  // namespace
 
-std::vector<BuildQualifiedRuntimeContract>
-BuildQualifiedRuntimeContractRegistry::make_rows() {
+std::vector<RuntimeContractDeclaration>
+RuntimeContractDeclarationRegistry::make_rows() {
   const std::string reference_product_revision =
       detail::reference_runtime_product_contract_revision().value();
   const std::string native_product_revision =
       detail::native_execution_runtime_product_contract_revision().value();
   const std::string ros_product_revision =
       detail::ros2_control_execution_runtime_product_contract_revision().value();
-  std::vector<BuildQualifiedRuntimeContract> rows;
-  rows.push_back(BuildQualifiedRuntimeContract(
+  std::vector<RuntimeContractDeclaration> rows;
+  rows.push_back(RuntimeContractDeclaration(
       core::RuntimeProfileId(std::string(detail::kReferenceRuntimeProfileId)),
       core::RuntimeProfileRevision(
           detail::reference_runtime_profile_revision()),
@@ -432,7 +310,7 @@ BuildQualifiedRuntimeContractRegistry::make_rows() {
       {endpoint_mapping(detail::kReferenceRuntimeStatusEndpointRoleId,
                         detail::kReferenceRuntimeStatusApiContractId,
                         "reference-runtime")}));
-  rows.push_back(BuildQualifiedRuntimeContract(
+  rows.push_back(RuntimeContractDeclaration(
       core::RuntimeProfileId(
           std::string(detail::kNativeExecutionRuntimeProfileId)),
       core::RuntimeProfileRevision(
@@ -452,8 +330,9 @@ BuildQualifiedRuntimeContractRegistry::make_rows() {
            core::ApiContractId(std::string(
                native_execution_runtime_contract::
                    kLogicalSceneEndpointApiContractId))},
-          declared_capabilities(kNativeExecutionOfferedCapabilities,
-                                kLogicalSceneServicesOfferedCapabilities)),
+          declared_capabilities(
+              runtime_contract_capabilities::kExecutionServices,
+              runtime_contract_capabilities::kLogicalSceneServices)),
       {role_mapping(detail::kNativeExecutionRuntimeRoleId,
                     native_execution_runtime_contract::kRuntimeRoleApiContractId,
                     "native-execution-host")},
@@ -469,7 +348,7 @@ BuildQualifiedRuntimeContractRegistry::make_rows() {
            detail::kNativeExecutionRuntimeLogicalSceneEndpointRoleId,
            native_execution_runtime_contract::kLogicalSceneEndpointApiContractId,
            "native-execution-host")}));
-  rows.push_back(BuildQualifiedRuntimeContract(
+  rows.push_back(RuntimeContractDeclaration(
       core::RuntimeProfileId(
           std::string(detail::kRos2ControlExecutionRuntimeProfileId)),
       core::RuntimeProfileRevision(
@@ -491,8 +370,10 @@ BuildQualifiedRuntimeContractRegistry::make_rows() {
            core::ApiContractId(std::string(
                ros2_control_execution_runtime_contract::
                    kLogicalSceneEndpointApiContractId))},
-          declared_capabilities(kRos2ControlExecutionOfferedCapabilities,
-                                kLogicalSceneServicesOfferedCapabilities)),
+          declared_capabilities(
+              runtime_contract_capabilities::kComponentLifecycleServices,
+              runtime_contract_capabilities::kExecutionServices,
+              runtime_contract_capabilities::kLogicalSceneServices)),
       {role_mapping(
           detail::kRos2ControlExecutionRuntimeRoleId,
           ros2_control_execution_runtime_contract::kRuntimeRoleApiContractId,
@@ -518,7 +399,7 @@ BuildQualifiedRuntimeContractRegistry::make_rows() {
 namespace {
 
 [[nodiscard]] core::RuntimeContractManifestSetDTO make_manifest_set(
-    const std::vector<BuildQualifiedRuntimeContract>& rows) {
+    const std::vector<RuntimeContractDeclaration>& rows) {
   std::vector<core::RuntimeContractOfferDTO> offers;
   offers.reserve(rows.size());
   for (const auto& row : rows) {
@@ -534,7 +415,7 @@ namespace {
 
 }  // namespace
 
-BuildQualifiedRuntimeContract::BuildQualifiedRuntimeContract(
+RuntimeContractDeclaration::RuntimeContractDeclaration(
     core::RuntimeProfileId runtime_profile_id,
     core::RuntimeProfileRevision runtime_profile_revision,
     core::ProductContractId runtime_product_id,
@@ -552,7 +433,7 @@ BuildQualifiedRuntimeContract::BuildQualifiedRuntimeContract(
       source_endpoint_api_mappings_(
           std::move(source_endpoint_api_mappings)) {}
 
-BuildQualifiedRuntimeContractRegistry::BuildQualifiedRuntimeContractRegistry()
+RuntimeContractDeclarationRegistry::RuntimeContractDeclarationRegistry()
     : contracts_(make_rows()),
       package_manifest_set_(make_manifest_set(contracts_)) {
   std::set<std::string, std::less<>> families;
@@ -586,8 +467,8 @@ BuildQualifiedRuntimeContractRegistry::BuildQualifiedRuntimeContractRegistry()
   }
 }
 
-const BuildQualifiedRuntimeContract*
-BuildQualifiedRuntimeContractRegistry::find(
+const RuntimeContractDeclaration*
+RuntimeContractDeclarationRegistry::find(
     const core::RuntimeProfileId& runtime_profile_id,
     const core::RuntimeProfileRevision& runtime_profile_revision,
     const core::ProductContractId& runtime_product_id,
@@ -603,9 +484,9 @@ BuildQualifiedRuntimeContractRegistry::find(
   return it == contracts_.end() ? nullptr : &*it;
 }
 
-const BuildQualifiedRuntimeContractRegistry&
-build_qualified_runtime_contract_registry() {
-  static const BuildQualifiedRuntimeContractRegistry registry;
+const RuntimeContractDeclarationRegistry&
+runtime_contract_declaration_registry() {
+  static const RuntimeContractDeclarationRegistry registry;
   return registry;
 }
 
@@ -635,22 +516,22 @@ core::RuntimeContractOfferDTO decode_runtime_contract_offer_projection(
   }
 }
 
-const BuildQualifiedRuntimeContract& require_runtime_contract(
+const RuntimeContractDeclaration& require_runtime_contract(
     const core::RuntimeProfileId& runtime_profile_id,
     const core::RuntimeProfileRevision& runtime_profile_revision,
     const core::ProductContractId& runtime_product_id,
     const core::ProductContractRevision& runtime_product_revision) {
-  const auto* result = build_qualified_runtime_contract_registry().find(
+  const auto* result = runtime_contract_declaration_registry().find(
       runtime_profile_id, runtime_profile_revision, runtime_product_id,
       runtime_product_revision);
   if (result == nullptr) {
     fail_retained_bundle(
-        "runtime profile/product has no build-qualified contract row");
+        "runtime profile/product has no component contract declaration");
   }
   return *result;
 }
 
-const BuildQualifiedRuntimeContract& require_runtime_contract_for_unit(
+const RuntimeContractDeclaration& require_runtime_contract_for_unit(
     const core::RuntimeUnitDTO& runtime_unit) {
   if (runtime_unit.runtime_profile_id.value() ==
       detail::kReferenceRuntimeProfileId) {
@@ -691,7 +572,7 @@ namespace {
 }
 
 [[nodiscard]] std::string mapping_api(
-    const BuildQualifiedRuntimeContract& row,
+    const RuntimeContractDeclaration& row,
     const core::EndpointRoleId& endpoint_role_id) {
   const auto mapping = std::find_if(
       row.source_endpoint_api_mappings().begin(),
@@ -948,7 +829,7 @@ void require_runtime_contract_requirements(
     std::span<const core::RetainedRuntimeContractRequirementDTO> requirements,
     std::span<const core::RetainedRuntimeUnitProductsDTO>
         runtime_unit_products) {
-  const auto& registry = build_qualified_runtime_contract_registry();
+  const auto& registry = runtime_contract_declaration_registry();
   const auto package_verified =
       core::VerifyRuntimeContractManifestSet(registry.package_manifest_set());
   if (!package_verified.ok()) {
@@ -1016,11 +897,6 @@ void require_runtime_contract_requirements(
         decoded_package_offer.value() != row.offer()) {
       fail_retained_bundle(
           "decoded package runtime offer differs from the registry offer");
-    }
-    if (requirement.requirement.runtime_implementation_id !=
-        row.offer().runtime_implementation_id) {
-      fail_retained_bundle(
-          "retained runtime-contract requirement selects the wrong family");
     }
     const auto verified =
         core::VerifyRuntimeContractRequirement(requirement.requirement);

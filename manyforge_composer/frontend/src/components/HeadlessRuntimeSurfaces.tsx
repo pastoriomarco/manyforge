@@ -25,6 +25,13 @@ import type {
   HistoryAlarmPhase,
 } from './ExecutionHistoryPanel';
 import type { RuntimeStatusView } from './RuntimeStatusOverlay';
+import { KernelErrorPanel } from './KernelErrorPanel';
+
+export interface ClientOperationalError {
+  id: string;
+  title: string;
+  message: string;
+}
 
 
 function lifecycleLabel(state: AlarmLifecycleState): string {
@@ -88,6 +95,7 @@ export function runtimeStatusView(
     activeAcknowledged: number;
     programCycleState?: string;
     executionOwnerAvailable?: boolean;
+    clientErrorCount?: number;
   } = {
     unacknowledged: 0,
     activeAcknowledged: 0,
@@ -110,6 +118,14 @@ export function runtimeStatusView(
       label: 'operator alarms',
       status: context.unacknowledged > 0 ? 'fault' : 'warning',
       detail: `${context.unacknowledged} acknowledgement required · ${context.activeAcknowledged} active acknowledged`,
+    });
+  }
+  if ((context.clientErrorCount ?? 0) > 0) {
+    components.push({
+      id: 'composer_client_errors',
+      label: 'Composer client errors',
+      status: 'fault',
+      detail: `${context.clientErrorCount} acknowledgement required`,
     });
   }
   if (context.programCycleState === 'terminal_awaiting_reset') {
@@ -194,16 +210,22 @@ function requestId(): string {
 interface HeadlessRuntimeSurfacesProps {
   enabled: boolean;
   headlessStateSource: HeadlessStateSource;
+  clientErrors?: ClientOperationalError[];
+  onAcknowledgeClientError?: (id: string) => void;
 }
 
 interface HeadlessRuntimeSurfacesViewProps {
   enabled: boolean;
   headlessState: HeadlessStateResult;
+  clientErrors?: ClientOperationalError[];
+  onAcknowledgeClientError?: (id: string) => void;
 }
 
 export function HeadlessRuntimeSurfacesView({
   enabled,
   headlessState,
+  clientErrors = [],
+  onAcknowledgeClientError,
 }: HeadlessRuntimeSurfacesViewProps) {
   const { snapshot, error, reconnect } = headlessState;
   const [busyActivation, setBusyActivation] = useState<string | null>(null);
@@ -314,6 +336,33 @@ export function HeadlessRuntimeSurfacesView({
   return (
     <>
       <aside className="operator-alarm-stack" aria-label="Operator alarms">
+        {clientErrors.map((clientError) => (
+          <div className="operator-alarm-panel" key={clientError.id}>
+            <details open>
+              <summary>
+                COMPOSER ERROR — ACKNOWLEDGEMENT REQUIRED · {clientError.title}
+              </summary>
+              <KernelErrorPanel
+                error={{ code: clientError.id, message: clientError.message }}
+                presentation={{
+                  headline: clientError.title,
+                  hint: 'Acknowledge after reviewing this client-side command or response failure.',
+                  severity: 'error',
+                }}
+                presentationKey={clientError.id}
+                eyebrow="Composer client error"
+              />
+            </details>
+            <div className="operator-alarm-actions">
+              <button
+                type="button"
+                onClick={() => onAcknowledgeClientError?.(clientError.id)}
+              >
+                Acknowledge message
+              </button>
+            </div>
+          </div>
+        ))}
         {panels.map((alarm) => (
           <OperatorAlarmPanel
             key={alarm.activationId}
@@ -388,12 +437,16 @@ export function HeadlessRuntimeSurfacesView({
 export function HeadlessRuntimeSurfaces({
   enabled,
   headlessStateSource,
+  clientErrors = [],
+  onAcknowledgeClientError,
 }: HeadlessRuntimeSurfacesProps) {
   const headlessState = useShellHeadlessState(headlessStateSource);
   return (
     <HeadlessRuntimeSurfacesView
       enabled={enabled}
       headlessState={headlessState}
+      clientErrors={clientErrors}
+      onAcknowledgeClientError={onAcknowledgeClientError}
     />
   );
 }

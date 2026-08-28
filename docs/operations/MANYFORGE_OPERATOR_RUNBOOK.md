@@ -37,11 +37,11 @@ O1 evidence before live use.
 ### Prepare the immutable package root
 
 Prepare the package root from the same clean source and pinned container used
-for the qualified build. The maintained all-row production materializer is the
-only preparation path: it requires all three prepared model families and the
-exact native and ROS 2 control Stop-qualification tuples. Copy every value
-below from the source-matched build and dated qualification record; these
-variables are not evidence placeholders.
+for the selected build. The maintained all-row production materializer is the
+only preparation path: it requires all three prepared model families and
+validates their semantic runtime contracts. Runtime Stop behavior remains
+covered by the normal component and integration test suites; standard package
+creation does not consume test reports or executable hashes.
 
 ```bash
 MANYFORGE_ROOT=/absolute/path/to/manyforge
@@ -50,17 +50,6 @@ MATERIALIZER=/absolute/path/to/manyforge_maintained_deployment_occurrences
 PREPARED_LITE6=/absolute/path/to/lite6_lite_gripper_structural
 PREPARED_UR5=/absolute/path/to/ur5_roboplan_structural
 PREPARED_UR10E=/absolute/path/to/ur10e_robotiq_2f_140_structural
-NATIVE_STOP_IMPLEMENTATION_BUILD=/absolute/path/to/native-implementation-build.json
-NATIVE_STOP_INSTALLED_TARGET=/absolute/path/to/native-installed-target
-NATIVE_STOP_RUNNER_CONTRACT=/absolute/path/to/native-runner-contract.json
-NATIVE_STOP_RUNNER=/absolute/path/to/native-stop-qualification-runner
-NATIVE_STOP_IMPLEMENTATION_EVIDENCE=/absolute/path/to/native-implementation-evidence.json
-NATIVE_STOP_SUBSTITUTION_EVIDENCE=/absolute/path/to/native-substitution-evidence.json
-ROS_STOP_IMPLEMENTATION_BUILD=/absolute/path/to/ros-implementation-build.json
-ROS_STOP_INSTALLED_TARGET=/absolute/path/to/ros-installed-target
-ROS_STOP_RUNNER_CONTRACT=/absolute/path/to/ros-runner-contract.json
-ROS_STOP_RUNNER=/absolute/path/to/ros-stop-qualification-runner
-ROS_STOP_IMPLEMENTATION_EVIDENCE=/absolute/path/to/ros-implementation-evidence.json
 if [ -e "$PACKAGE_ROOT" ]; then
   printf 'PACKAGE_ROOT must be a new destination: %s\n' "$PACKAGE_ROOT" >&2
   exit 1
@@ -71,15 +60,7 @@ mkdir "$PACKAGE_ROOT" || exit 1
   --workspace-root "$MANYFORGE_ROOT" --package-root "$PACKAGE_ROOT" \
   --prepared "lite6_lite_gripper=$PREPARED_LITE6" \
   --prepared "ur5_roboplan=$PREPARED_UR5" \
-  --prepared "ur10e_robotiq_2f_140=$PREPARED_UR10E" \
-  --stop-evidence-candidate \
-    "$NATIVE_STOP_IMPLEMENTATION_BUILD" "$NATIVE_STOP_INSTALLED_TARGET" \
-    "$NATIVE_STOP_RUNNER_CONTRACT" "$NATIVE_STOP_RUNNER" \
-    "$NATIVE_STOP_IMPLEMENTATION_EVIDENCE" "$NATIVE_STOP_SUBSTITUTION_EVIDENCE" \
-  --stop-evidence-candidate \
-    "$ROS_STOP_IMPLEMENTATION_BUILD" "$ROS_STOP_INSTALLED_TARGET" \
-    "$ROS_STOP_RUNNER_CONTRACT" "$ROS_STOP_RUNNER" \
-    "$ROS_STOP_IMPLEMENTATION_EVIDENCE" -
+  --prepared "ur10e_robotiq_2f_140=$PREPARED_UR10E"
 ```
 
 The command must complete successfully before the root is usable. Discard a

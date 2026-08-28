@@ -81,11 +81,15 @@ TEST(RuntimeContractManifestCodec, SortsAtCanonicalConstructionAndRoundTrips) {
   EXPECT_EQ(decoded.value(), result.value());
 }
 
-TEST(RuntimeContractManifestCodec, RequiresExactCapabilityRegistryRevision) {
+TEST(RuntimeContractManifestCodec,
+     AcceptsCatalogRevisionProvenanceButRejectsUnknownCapability) {
   auto offer = Offer();
   offer.provided_capabilities.front().capability_definition_revision =
       CapabilityDefinitionRevision("sha256:" + std::string(64U, '0'));
-  EXPECT_FALSE(VerifyRuntimeContractOffer(offer).ok());
+  const auto rebuilt = MakeRuntimeContractOffer(
+      offer.runtime_implementation_id, offer.provided_api_contract_ids,
+      offer.provided_capabilities);
+  EXPECT_TRUE(rebuilt.ok());
 
   auto unknown = Offer();
   unknown.provided_capabilities.front().capability_id =
@@ -157,6 +161,14 @@ TEST(RuntimeContractManifestCodec, RejectsDuplicateUnsortedAndOversizedRows) {
                                          ApiContractId("api.motion")};
   EXPECT_FALSE(VerifyRuntimeContractOffer(duplicate).ok());
 
+  auto duplicate_capability = Capability();
+  duplicate_capability.capability_definition_revision =
+      CapabilityDefinitionRevision("sha256:" + std::string(64U, '0'));
+  EXPECT_FALSE(MakeRuntimeContractOffer(
+                   RuntimeImplementationFamilyId("family"), {},
+                   {Capability(), duplicate_capability})
+                   .ok());
+
   std::vector<ApiContractId> too_many_apis;
   for (std::size_t index = 0U; index <= kMaxRuntimeContractApiContractIds; ++index) {
     too_many_apis.emplace_back("api." + std::to_string(index));
@@ -176,7 +188,8 @@ TEST(RuntimeContractManifestCodec, RejectsDuplicateUnsortedAndOversizedRows) {
                    .ok());
 }
 
-TEST(RuntimeContractManifestCodec, CompatibilityAcceptsExactAndStrictSuperset) {
+TEST(RuntimeContractManifestCodec,
+     CompatibilityUsesOnlyImmutableApiAndCapabilityIds) {
   const auto offer = Offer();
   const auto requirement = Requirement();
   EXPECT_TRUE(CheckRuntimeContractCompatibility(offer, requirement).ok());
@@ -184,7 +197,24 @@ TEST(RuntimeContractManifestCodec, CompatibilityAcceptsExactAndStrictSuperset) {
   auto wrong_family = requirement;
   wrong_family.runtime_implementation_id =
       RuntimeImplementationFamilyId("other-family");
-  EXPECT_FALSE(CheckRuntimeContractCompatibility(offer, wrong_family).ok());
+  const auto rebuilt_other_implementation = MakeRuntimeContractRequirement(
+      wrong_family.runtime_implementation_id,
+      wrong_family.required_api_contract_ids, wrong_family.required_capabilities);
+  ASSERT_TRUE(rebuilt_other_implementation.ok());
+  EXPECT_TRUE(CheckRuntimeContractCompatibility(
+                  offer, rebuilt_other_implementation.value())
+                  .ok());
+
+  auto other_revision = requirement.required_capabilities;
+  other_revision.front().capability_definition_revision =
+      CapabilityDefinitionRevision("sha256:" + std::string(64U, '0'));
+  const auto rebuilt_other_revision = MakeRuntimeContractRequirement(
+      requirement.runtime_implementation_id,
+      requirement.required_api_contract_ids, std::move(other_revision));
+  ASSERT_TRUE(rebuilt_other_revision.ok());
+  EXPECT_TRUE(
+      CheckRuntimeContractCompatibility(offer, rebuilt_other_revision.value())
+          .ok());
 
   auto missing_api = requirement;
   missing_api.required_api_contract_ids = {ApiContractId("api.missing")};

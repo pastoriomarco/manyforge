@@ -126,7 +126,7 @@ struct RetainedRuntimeUnitProductsDTO final {
 /// One compiler-sealed runtime-contract requirement.  This is intentionally
 /// a top-level retained table rather than runtime product metadata: product
 /// artifacts own lifecycle/configuration facts, while this row owns the
-/// pre-store compatibility proof.
+/// pre-store semantic compatibility requirement.
 struct RetainedRuntimeContractRequirementDTO final {
   RuntimeUnitId runtime_unit_id;
   RuntimeContractRequirementDTO requirement;

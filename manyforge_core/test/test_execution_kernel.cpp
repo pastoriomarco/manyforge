@@ -887,7 +887,6 @@ ParticipantStopStageResultDTO unsupported_stop_stage(const ResolvedParticipantSt
                                        std::nullopt,
                                        std::nullopt,
                                        std::nullopt,
-                                       std::nullopt,
                                        0,
                                        {},
                                        error};

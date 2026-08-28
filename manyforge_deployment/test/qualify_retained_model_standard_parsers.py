@@ -153,8 +153,6 @@ def _parse_control_product(data: bytes, manifest: dict[str, Any]) -> dict[str, A
             "activation_sets",
             "routes",
             "stop_applicability",
-            "stop_implementation_qualifications",
-            "controlled_stop_substitution_qualifications",
             "commissioned_stop_interfaces",
             "source_conformance",
         },
@@ -317,15 +315,10 @@ def _parse_control_product(data: bytes, manifest: dict[str, Any]) -> dict[str, A
         and stop["stop_evidence_policy_revision"] == binding["stop_evidence_policy_revision"],
         "control Stop applicability differs from its binding route",
     )
-    for field in (
-        "stop_implementation_qualifications",
-        "controlled_stop_substitution_qualifications",
-        "commissioned_stop_interfaces",
-    ):
-        _require(
-            control[field] == [],
-            f"non-stoppable direct control fixture unexpectedly carries {field}",
-        )
+    _require(
+        control["commissioned_stop_interfaces"] == [],
+        "non-stoppable direct control fixture unexpectedly carries commissioned Stop interfaces",
+    )
     conformance = control["source_conformance"]
     _require(isinstance(conformance, dict), "control source conformance must be an object")
     _exact_keys(conformance, {"api_version", "source_conformance_digest"}, "control source conformance")

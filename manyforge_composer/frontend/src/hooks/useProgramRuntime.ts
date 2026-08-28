@@ -437,6 +437,12 @@ export function useProgramRuntime(
     }));
   }, []);
 
+  const dismissError = useCallback(() => {
+    setState((current) => current.error === null
+      ? current
+      : { ...current, error: null });
+  }, []);
+
   const run = useCallback(async () => {
     const requestId = identity('program-run-start');
     const request = buildProgramStartRequest(
@@ -791,6 +797,7 @@ export function useProgramRuntime(
     refresh,
     selectScenario,
     clearScenarioSelection,
+    dismissError,
     run,
     stop,
     reset,
@@ -813,6 +820,7 @@ export function useProgramRuntime(
     active,
     applyRecoveryAction,
     clearScenarioSelection,
+    dismissError,
     cycleState,
     refresh,
     reset,

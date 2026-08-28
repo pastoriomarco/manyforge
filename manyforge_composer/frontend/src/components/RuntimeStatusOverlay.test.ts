@@ -36,4 +36,26 @@ describe('runtime status presentation shell', () => {
     expect(html).toContain('readiness-degraded');
     expect(html).toContain('Warn');
   });
+
+  it('includes Composer client failures in the single attention count', () => {
+    const html = renderToStaticMarkup(createElement(RuntimeStatusOverlay, {
+      status: {
+        readiness: 'degraded',
+        summaryLabel: 'Attention required',
+        profileLabel: 'native',
+        authorityLabel: 'source-owned facts',
+        userMessage: 'One client response requires review.',
+        capabilities: [],
+        components: [],
+      },
+      backendConnected: true,
+      connectionLabel: 'Headless owner connected',
+      connectionDetail: 'Current projection',
+      unacknowledgedAlarms: 1,
+      activeAcknowledgedAlarms: 1,
+      clientErrorCount: 1,
+    }));
+
+    expect(html).toContain('runtime-status-count">3');
+  });
 });

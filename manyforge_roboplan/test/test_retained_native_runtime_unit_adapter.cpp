@@ -181,7 +181,7 @@ struct NativeFixture final {
                        return candidate.runtime_unit_id == unit.runtime_unit_id;
                      });
     const auto *qualified =
-        deployment::build_qualified_runtime_contract_registry().find(
+        deployment::runtime_contract_declaration_registry().find(
             unit.runtime_profile_id, unit.runtime_profile_revision,
             product->product_contract_id(),
             product->product_contract_revision());
@@ -628,7 +628,6 @@ TEST(RetainedNativeRuntimeUnitAdapter,
      DirectChildOwnsStableEmptyAdmissionBeforeApplyAndRestartMintsNewEpoch) {
   NativeFixture fixture;
   ASSERT_TRUE(fixture.product.has_value());
-  EXPECT_FALSE(fixture.product->implementation_build_identity().has_value());
   auto adapter = MakeAdapter(fixture, MANYFORGE_NATIVE_EXECUTION_TARGET_ROOT);
 
   EXPECT_EQ(adapter.ObserveProcess(*fixture.query).state(),
@@ -721,116 +720,10 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   static_cast<void>(::close(package_descriptor));
 }
 
-TEST(
-    RetainedNativeRuntimeUnitAdapter,
-    RetainedBuildIdentityMatchesOnceAndRejectsTargetDigestMismatchBeforeLaunch) {
-  NativeFixture fixture(MANYFORGE_I7_BUILD_IDENTIFIED_NATIVE_FIXTURE_ROOT);
-  ASSERT_TRUE(fixture.product.has_value());
-  ASSERT_TRUE(fixture.product->implementation_build_identity().has_value());
-
-  ScopedTemporaryRoot target_root;
-  const auto source =
-      std::filesystem::path(MANYFORGE_NATIVE_EXECUTION_TARGET_ROOT) /
-      std::string(contract::kInstalledTargetId);
-  const auto target =
-      target_root.path() / std::string(contract::kInstalledTargetId);
-  ASSERT_TRUE(std::filesystem::copy_file(source, target,
-                                         std::filesystem::copy_options::none));
-  std::filesystem::permissions(target,
-                               std::filesystem::status(source).permissions(),
-                               std::filesystem::perm_options::replace);
-  const auto candidate_worker_source =
-      std::filesystem::path(MANYFORGE_NATIVE_EXECUTION_TARGET_ROOT) /
-      std::string(contract::kCandidateWorkerInstalledTargetId);
-  const auto candidate_worker_target =
-      target_root.path() /
-      std::string(contract::kCandidateWorkerInstalledTargetId);
-  ASSERT_TRUE(std::filesystem::copy_file(candidate_worker_source,
-                                         candidate_worker_target,
-                                         std::filesystem::copy_options::none));
-  std::filesystem::permissions(
-      candidate_worker_target,
-      std::filesystem::status(candidate_worker_source).permissions(),
-      std::filesystem::perm_options::replace);
-
-  auto adapter = MakeAdapter(fixture, target_root.path());
-  EXPECT_EQ(adapter.EnsureRunning(*fixture.query).state(),
-            component_manager::ProcessPresenceState::kPresent);
-  EXPECT_EQ(adapter.EnsureStopped(*fixture.query).state(),
-            component_manager::ProcessPresenceState::kAbsent);
-
-  {
-    std::fstream stream(target,
-                        std::ios::binary | std::ios::in | std::ios::out);
-    ASSERT_TRUE(stream.good());
-    char first = 0;
-    stream.read(&first, 1U);
-    ASSERT_EQ(stream.gcount(), 1);
-    first = static_cast<char>(static_cast<unsigned char>(first) ^ 0x01U);
-    stream.seekp(0);
-    stream.write(&first, 1U);
-    ASSERT_TRUE(stream.good());
-  }
-
-  EXPECT_THROW(static_cast<void>(adapter.EnsureRunning(*fixture.query)),
-               component_manager::RetainedNativeRuntimeUnitAdapterError);
-  EXPECT_EQ(adapter.ObserveProcess(*fixture.query).state(),
-            component_manager::ProcessPresenceState::kAbsent);
-}
-
 TEST(RetainedNativeRuntimeUnitAdapter,
-     DistinctQualifiedNativePackagesReplaceOnlyAfterCleanStop) {
-  NativeFixture package_a(MANYFORGE_I7_BUILD_IDENTIFIED_NATIVE_FIXTURE_ROOT);
-  NativeFixture package_b(MANYFORGE_O1_4G_REPLACEMENT_NATIVE_FIXTURE_ROOT);
-  ASSERT_TRUE(package_a.product.has_value());
-  ASSERT_TRUE(package_b.product.has_value());
-  ASSERT_TRUE(package_a.product->implementation_build_identity().has_value());
-  ASSERT_TRUE(package_b.product->implementation_build_identity().has_value());
-  ASSERT_NE(package_a.root, package_b.root);
-  ASSERT_NE(package_a.bundle->retained_bundle_id(),
-            package_b.bundle->retained_bundle_id());
-  EXPECT_NE(package_a.product->retained_bundle_id(),
-            package_b.product->retained_bundle_id());
-  EXPECT_NE(package_a.product->product_identity(),
-            package_b.product->product_identity());
-  // Configuration is deliberately retained while bundle, product, and build
-  // identities differ.
-  EXPECT_EQ(package_a.product->configuration_identity(),
-            package_b.product->configuration_identity());
-
-  const auto *qualified_a =
-      deployment::build_qualified_runtime_contract_registry().find(
-          package_a.query->plan.runtime_profile_id,
-          package_a.query->plan.runtime_profile_revision,
-          package_a.product->product_contract_id(),
-          package_a.product->product_contract_revision());
-  const auto *qualified_b =
-      deployment::build_qualified_runtime_contract_registry().find(
-          package_b.query->plan.runtime_profile_id,
-          package_b.query->plan.runtime_profile_revision,
-          package_b.product->product_contract_id(),
-          package_b.product->product_contract_revision());
-  ASSERT_NE(qualified_a, nullptr);
-  ASSERT_NE(qualified_b, nullptr);
-  EXPECT_EQ(qualified_a->offer(), qualified_b->offer());
-  const auto &qualified_manifest_set =
-      deployment::build_qualified_runtime_contract_registry()
-          .package_manifest_set();
-  ASSERT_FALSE(qualified_manifest_set.offers.empty());
-  EXPECT_EQ(qualified_a->offer(), qualified_manifest_set.offers.front());
-  EXPECT_EQ(package_a.query->plan.runtime_contract_offer_digest,
-            package_b.query->plan.runtime_contract_offer_digest);
-  ASSERT_TRUE(component_manager::VerifyNativeExecutionRuntimeUnitForHost(
-                  *package_a.bundle, package_a.query->plan.runtime_unit_id,
-                  package_a.artifact_source, contract::kOperatingSystem,
-                  contract::kLaunchEnvironmentContract)
-                  .has_value());
-  ASSERT_TRUE(component_manager::VerifyNativeExecutionRuntimeUnitForHost(
-                  *package_b.bundle, package_b.query->plan.runtime_unit_id,
-                  package_b.artifact_source, contract::kOperatingSystem,
-                  contract::kLaunchEnvironmentContract)
-                  .has_value());
-
+     CompatibleImplementationReplacementNeedsNoBinaryProof) {
+  NativeFixture package;
+  ASSERT_TRUE(package.product.has_value());
   ScopedTemporaryRoot target_root_a;
   ScopedTemporaryRoot target_root_b;
   const auto candidate_worker_source =
@@ -843,65 +736,52 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   const auto target_b =
       InstallNativeTestTargets(MANYFORGE_NATIVE_PICK_PLACE_EXECUTION_TARGET,
                                candidate_worker_source, target_root_b.path());
-  const auto executable_digest_a =
-      content_identity::sha256_digest(ReadFile(target_a));
-  const auto executable_digest_b =
-      content_identity::sha256_digest(ReadFile(target_b));
-  ASSERT_NE(executable_digest_a, executable_digest_b);
-  EXPECT_EQ(executable_digest_a,
-            package_a.product->implementation_build_identity()
-                ->installed_target_content_digest.value());
-  EXPECT_EQ(executable_digest_b,
-            package_b.product->implementation_build_identity()
-                ->installed_target_content_digest.value());
-  EXPECT_NE(package_a.product->implementation_build_identity()
-                ->implementation_source_build_fingerprint,
-            package_b.product->implementation_build_identity()
-                ->implementation_source_build_fingerprint);
+  ASSERT_NE(content_identity::sha256_digest(ReadFile(target_a)),
+            content_identity::sha256_digest(ReadFile(target_b)));
 
-  // The package root and lifecycle owner are both out of scope before B is
-  // started; this is a sequential full-stop replacement, not a live swap.
+  // Both distinct binaries embed the same semantic runtime offer. Replacement
+  // remains a clean Stop/start boundary, not a live executable swap.
   {
-    auto adapter_a = MakeAdapter(package_a, target_root_a.path());
-    const auto started_a = adapter_a.EnsureRunning(*package_a.query);
+    auto adapter_a = MakeAdapter(package, target_root_a.path());
+    const auto started_a = adapter_a.EnsureRunning(*package.query);
     ASSERT_EQ(started_a.state(),
               component_manager::ProcessPresenceState::kPresent);
     ASSERT_TRUE(adapter_a
                     .ObserveProgress(
-                        *package_a.query,
+                        *package.query,
                         core::RuntimeEpoch(started_a.process_incarnation()))
                     .has_value());
-    EXPECT_EQ(adapter_a.EnsureStopped(*package_a.query).state(),
+    EXPECT_EQ(adapter_a.EnsureStopped(*package.query).state(),
               component_manager::ProcessPresenceState::kAbsent);
-    EXPECT_EQ(adapter_a.ObserveProcess(*package_a.query).state(),
+    EXPECT_EQ(adapter_a.ObserveProcess(*package.query).state(),
               component_manager::ProcessPresenceState::kAbsent);
   }
 
   {
-    auto adapter_b = MakeAdapter(package_b, target_root_b.path());
-    const auto first_b = adapter_b.EnsureRunning(*package_b.query);
+    auto adapter_b = MakeAdapter(package, target_root_b.path());
+    const auto first_b = adapter_b.EnsureRunning(*package.query);
     ASSERT_EQ(first_b.state(),
               component_manager::ProcessPresenceState::kPresent);
     const core::RuntimeEpoch first_epoch(first_b.process_incarnation());
     ASSERT_TRUE(
-        adapter_b.ObserveProgress(*package_b.query, first_epoch).has_value());
-    EXPECT_EQ(adapter_b.EnsureStopped(*package_b.query).state(),
+        adapter_b.ObserveProgress(*package.query, first_epoch).has_value());
+    EXPECT_EQ(adapter_b.EnsureStopped(*package.query).state(),
               component_manager::ProcessPresenceState::kAbsent);
-    EXPECT_EQ(adapter_b.ObserveProcess(*package_b.query).state(),
+    EXPECT_EQ(adapter_b.ObserveProcess(*package.query).state(),
               component_manager::ProcessPresenceState::kAbsent);
 
-    const auto second_b = adapter_b.EnsureRunning(*package_b.query);
+    const auto second_b = adapter_b.EnsureRunning(*package.query);
     ASSERT_EQ(second_b.state(),
               component_manager::ProcessPresenceState::kPresent);
     EXPECT_NE(second_b.process_incarnation(), first_epoch.value());
     ASSERT_TRUE(
         adapter_b
-            .ObserveProgress(*package_b.query,
+            .ObserveProgress(*package.query,
                              core::RuntimeEpoch(second_b.process_incarnation()))
             .has_value());
-    EXPECT_EQ(adapter_b.EnsureStopped(*package_b.query).state(),
+    EXPECT_EQ(adapter_b.EnsureStopped(*package.query).state(),
               component_manager::ProcessPresenceState::kAbsent);
-    EXPECT_EQ(adapter_b.ObserveProcess(*package_b.query).state(),
+    EXPECT_EQ(adapter_b.ObserveProcess(*package.query).state(),
               component_manager::ProcessPresenceState::kAbsent);
   }
 }

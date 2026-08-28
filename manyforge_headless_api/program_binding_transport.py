@@ -50,7 +50,7 @@ _FIELDS = {
     "command_schema": ("command_schema_id", "command_schema_revision"),
     "contact": ("contact_policy_id", "contact_policy_revision", "runtime_object_id", "allowed_body_bindings", "max_penetration_m", "terminal_window_start_fraction"),
     "contact_body": ("component_role_id", "target_role_id", "controllable_component_id", "command_target_id", "model_role_id", "collision_body_role_id", "model_instance_id", "model_revision", "collision_body_ids"),
-    "provenance": ("binding_compiler_contract_digest", "binding_compiler_build_digest", "role_assignment_digest", "source_records", "resolved_output_records"),
+    "provenance": ("binding_compiler_contract_digest", "role_assignment_digest", "source_records", "resolved_output_records"),
     "provenance_record": ("record_kind", "record_id", "revision"),
 }
 _MODIFICATION_VALUES = frozenset(('forbidden', 'human_approval', 'llm_allowed'))
@@ -415,7 +415,7 @@ def validate_program_binding(value: object, *, label: str = "program_binding") -
     _sorted_unique(contacts, lambda x: x["contact_policy_id"], f"{label}.contact_grasp_bindings")
 
     provenance = _record(root["provenance"], _FIELDS["provenance"], f"{label}.provenance")
-    for field in ("binding_compiler_contract_digest", "binding_compiler_build_digest", "role_assignment_digest"):
+    for field in ("binding_compiler_contract_digest", "role_assignment_digest"):
         _digest(provenance[field], f"{label}.provenance.{field}")
     for field in ("source_records", "resolved_output_records"):
         records = _array(provenance[field], f"{label}.provenance.{field}", maximum=_PROVENANCE_MAX)

@@ -41,8 +41,10 @@ MakeRuntimeContractManifestSet(std::vector<RuntimeContractOfferDTO> offers);
 [[nodiscard]] Result<RuntimeContractManifestSetDTO>
 DecodeRuntimeContractManifestSet(std::string_view canonical_bytes);
 
-/// Check compatibility only after both records have crossed their respective
-/// verification boundaries. This operation has no provider, scope, target, or
+/// Check immutable API/capability-ID compatibility only after both records have
+/// crossed their respective verification boundaries. Implementation-family and
+/// capability-definition revisions are diagnostic/catalog provenance, not
+/// compatibility equality. This operation has no provider, scope, target, or
 /// runtime authority.
 [[nodiscard]] Result<void> CheckRuntimeContractCompatibility(
     const RuntimeContractOfferDTO& offer,

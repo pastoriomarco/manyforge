@@ -621,51 +621,6 @@ template <typename Strong>
   });
 }
 
-[[nodiscard]] CanonicalValue stop_implementation_qualification_projection(
-    const core::StopImplementationQualificationDTO& qualification) {
-  return CanonicalValue(CanonicalValue::Object{
-      {"registered_command_kind_id",
-       CanonicalValue(qualification.registered_command_kind_id.value())},
-      {"provider_contract_ref",
-       provider_contract_projection(qualification.provider_contract_ref)},
-      {"product_id", CanonicalValue(qualification.product_id.value())},
-      {"product_contract_id",
-       CanonicalValue(qualification.product_contract_id.value())},
-      {"product_contract_revision",
-       CanonicalValue(qualification.product_contract_revision.value())},
-      {"endpoint_role_id",
-       optional_strong_projection(qualification.endpoint_role_id)},
-      {"invocation_lane_id",
-       CanonicalValue(qualification.invocation_lane_id.value())},
-      {"qualification_artifact_ref",
-       retained_artifact_ref_projection(
-           qualification.qualification_artifact_ref)},
-  });
-}
-
-[[nodiscard]] CanonicalValue
-controlled_stop_substitution_qualification_projection(
-    const core::ControlledStopSubstitutionQualificationDTO& qualification) {
-  return CanonicalValue(CanonicalValue::Object{
-      {"provider_contract_ref",
-       provider_contract_projection(qualification.provider_contract_ref)},
-      {"product_id", CanonicalValue(qualification.product_id.value())},
-      {"product_contract_id",
-       CanonicalValue(qualification.product_contract_id.value())},
-      {"product_contract_revision",
-       CanonicalValue(qualification.product_contract_revision.value())},
-      {"requested_stop_mode",
-       CanonicalValue(std::string(
-           core::to_string(qualification.requested_stop_mode)))},
-      {"executed_stop_mode",
-       CanonicalValue(std::string(
-           core::to_string(qualification.executed_stop_mode)))},
-      {"qualification_artifact_ref",
-       retained_artifact_ref_projection(
-           qualification.qualification_artifact_ref)},
-  });
-}
-
 [[nodiscard]] CanonicalValue stop_command_projection(
     const core::StopContainmentCommandDTO& command) {
   return CanonicalValue(CanonicalValue::Object{
@@ -977,58 +932,11 @@ template <typename Stop>
 
 [[nodiscard]] CanonicalValue control_domain_projection(
     const CompilerQualifiedCellIr& compiler_ir,
-    const core::ControlDomainId& control_domain_id,
-    std::span<const core::StopImplementationQualificationDTO>
-        stop_implementation_qualifications,
-    std::span<const core::ControlledStopSubstitutionQualificationDTO>
-        controlled_stop_substitution_qualifications) {
+    const core::ControlDomainId& control_domain_id) {
   const auto& domain = require_domain(compiler_ir, control_domain_id);
   const auto& desired = require_desired_configuration(compiler_ir, control_domain_id);
   const auto& topology = require_topology(compiler_ir, domain).value();
   const auto& graph = compiler_ir.applicability().composition().graph();
-  const auto selects_domain_execution_runtime =
-      [&](const core::ProductId& product_id,
-          const core::ProductContractId& product_contract_id,
-          const core::ProductContractRevision& product_contract_revision) {
-        for (const auto& runtime_unit_id : domain.runtime_unit_ids) {
-          const auto runtime_unit = std::find_if(
-              graph.runtime_units.begin(), graph.runtime_units.end(),
-              [&](const auto& candidate) {
-                return candidate.runtime_unit_id == runtime_unit_id;
-              });
-          if (runtime_unit == graph.runtime_units.end()) {
-            fail_retained_bundle(
-                "control-domain product has no exact execution runtime unit");
-          }
-          const bool native_execution =
-              runtime_unit->runtime_profile_id.value() ==
-                  kNativeExecutionRuntimeProfileId &&
-              runtime_unit->runtime_profile_revision.value() ==
-                  native_execution_runtime_profile_revision() &&
-              product_id.value() ==
-                  native_execution_runtime_product_id(runtime_unit_id) &&
-              product_contract_id.value() ==
-                  kNativeExecutionRuntimeProductContractId &&
-              product_contract_revision ==
-                  native_execution_runtime_product_contract_revision();
-          const bool ros2_control_execution =
-              runtime_unit->runtime_profile_id.value() ==
-                  kRos2ControlExecutionRuntimeProfileId &&
-              runtime_unit->runtime_profile_revision.value() ==
-                  ros2_control_execution_runtime_profile_revision() &&
-              product_id.value() ==
-                  ros2_control_execution_runtime_product_id(runtime_unit_id) &&
-              product_contract_id.value() ==
-                  kRos2ControlExecutionRuntimeProductContractId &&
-              product_contract_revision ==
-                  ros2_control_execution_runtime_product_contract_revision();
-          if (native_execution || ros2_control_execution) {
-            return true;
-          }
-        }
-        return false;
-      };
-
   CanonicalValue::Array bindings;
   for (const auto& binding : graph.control_bindings) {
     if (binding.control_domain_id != control_domain_id) {
@@ -1137,60 +1045,6 @@ template <typename Stop>
         "control-domain product repeats a commissioned Stop interface");
   }
 
-  CanonicalValue::Array implementation_qualifications;
-  implementation_qualifications.reserve(
-      stop_implementation_qualifications.size());
-  for (const auto& qualification : stop_implementation_qualifications) {
-    if (!selects_domain_execution_runtime(
-            qualification.product_id, qualification.product_contract_id,
-            qualification.product_contract_revision)) {
-      fail_retained_bundle(
-          "Stop implementation qualification does not select an exact "
-          "control-domain execution runtime product");
-    }
-    implementation_qualifications.push_back(
-        stop_implementation_qualification_projection(qualification));
-  }
-  std::sort(implementation_qualifications.begin(),
-            implementation_qualifications.end(),
-            [](const auto& left, const auto& right) {
-              return canonical_json(left) < canonical_json(right);
-            });
-  if (std::adjacent_find(
-          implementation_qualifications.begin(),
-          implementation_qualifications.end()) !=
-      implementation_qualifications.end()) {
-    fail_retained_bundle(
-        "control-domain product repeats a Stop implementation qualification");
-  }
-
-  CanonicalValue::Array substitution_qualifications;
-  substitution_qualifications.reserve(
-      controlled_stop_substitution_qualifications.size());
-  for (const auto& qualification :
-       controlled_stop_substitution_qualifications) {
-    if (!selects_domain_execution_runtime(
-            qualification.product_id, qualification.product_contract_id,
-            qualification.product_contract_revision)) {
-      fail_retained_bundle(
-          "controlled Stop substitution qualification does not select an "
-          "exact control-domain execution runtime product");
-    }
-    substitution_qualifications.push_back(
-        controlled_stop_substitution_qualification_projection(qualification));
-  }
-  std::sort(substitution_qualifications.begin(),
-            substitution_qualifications.end(),
-            [](const auto& left, const auto& right) {
-              return canonical_json(left) < canonical_json(right);
-            });
-  if (std::adjacent_find(substitution_qualifications.begin(),
-                         substitution_qualifications.end()) !=
-      substitution_qualifications.end()) {
-    fail_retained_bundle(
-        "control-domain product repeats a controlled Stop substitution qualification");
-  }
-
   CanonicalValue::Array commissioned_rows;
   commissioned_rows.reserve(commissioned_stop_interfaces.size());
   for (const auto& commissioned : commissioned_stop_interfaces) {
@@ -1225,10 +1079,6 @@ template <typename Stop>
       {"activation_sets", CanonicalValue(std::move(activation_sets))},
       {"routes", CanonicalValue(std::move(routes))},
       {"stop_applicability", CanonicalValue(std::move(stop_applicability))},
-      {"stop_implementation_qualifications",
-       CanonicalValue(std::move(implementation_qualifications))},
-      {"controlled_stop_substitution_qualifications",
-       CanonicalValue(std::move(substitution_qualifications))},
       {"commissioned_stop_interfaces",
        CanonicalValue(std::move(commissioned_rows))},
       {"source_conformance", std::move(source_conformance)},
@@ -1285,15 +1135,9 @@ CanonicalValue stop_policy_applicability_projection(
 
 std::string emit_control_domain_control(
     const CompilerQualifiedCellIr& compiler_ir,
-    const core::ControlDomainId& control_domain_id,
-    std::span<const core::StopImplementationQualificationDTO>
-        stop_implementation_qualifications,
-    std::span<const core::ControlledStopSubstitutionQualificationDTO>
-        controlled_stop_substitution_qualifications) {
+    const core::ControlDomainId& control_domain_id) {
   const std::string bytes =
-      canonical_json(control_domain_projection(
-          compiler_ir, control_domain_id, stop_implementation_qualifications,
-          controlled_stop_substitution_qualifications));
+      canonical_json(control_domain_projection(compiler_ir, control_domain_id));
   const CanonicalValue parsed = parse_and_verify_control_domain_control(bytes);
   if (canonical_json(parsed) != bytes) {
     throw std::logic_error("control-domain control emitter produced noncanonical bytes");
@@ -1303,16 +1147,9 @@ std::string emit_control_domain_control(
 
 void require_control_domain_control_matches(std::string_view canonical_bytes,
                                             const CompilerQualifiedCellIr& compiler_ir,
-                                            const core::ControlDomainId& control_domain_id,
-                                            std::span<const core::StopImplementationQualificationDTO>
-                                                stop_implementation_qualifications,
-                                            std::span<const core::ControlledStopSubstitutionQualificationDTO>
-                                                controlled_stop_substitution_qualifications) {
+                                            const core::ControlDomainId& control_domain_id) {
   const CanonicalValue parsed = parse_and_verify_control_domain_control(canonical_bytes);
-  if (parsed != control_domain_projection(
-                    compiler_ir, control_domain_id,
-                    stop_implementation_qualifications,
-                    controlled_stop_substitution_qualifications)) {
+  if (parsed != control_domain_projection(compiler_ir, control_domain_id)) {
     fail_retained_bundle(
         "control-domain control artifact differs from the exact compiler "
         "projection");

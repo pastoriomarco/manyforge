@@ -3366,7 +3366,7 @@ export function parseProgramRuntimeControlProjection(
   );
   if (
     runtimeControls.programRunId !== programRunId
-    || recoveryOffer?.programRunId !== programRunId
+    || (recoveryOffer !== null && recoveryOffer.programRunId !== programRunId)
     || observationOverrideCandidate.programRunId !== programRunId
   ) {
     return fail(path, 'one exact Program-run identity');
@@ -3450,7 +3450,8 @@ export function parseCycleRecoveryActionResult(
     : parseCycleRecoveryOffer(record.recovery_offer, `${path}.recovery_offer`);
   if (
     run.capture.programRunId !== runtimeControls.programRunId
-    || recoveryOffer?.programRunId !== runtimeControls.programRunId
+    || (recoveryOffer !== null
+      && recoveryOffer.programRunId !== runtimeControls.programRunId)
     || run.ownerEpoch !== runtimeControls.ownerEpoch
     || run.runRevision !== runtimeControls.runRevision
   ) {

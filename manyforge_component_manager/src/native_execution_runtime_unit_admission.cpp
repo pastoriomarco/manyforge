@@ -79,7 +79,7 @@ struct RuntimeContractFacts final {
 [[nodiscard]] std::string_view OfferDigestForFamily(
     const std::string_view implementation_id) {
   const auto &offers =
-      manyforge::deployment::build_qualified_runtime_contract_registry()
+      manyforge::deployment::runtime_contract_declaration_registry()
           .package_manifest_set()
           .offers;
   const auto found = std::find_if(
@@ -87,7 +87,7 @@ struct RuntimeContractFacts final {
         return offer.runtime_implementation_id.value() == implementation_id;
       });
   if (found == offers.end()) {
-    Fail("execution runtime has no build-qualified contract offer");
+    Fail("execution runtime has no component-owned contract offer");
   }
   return found->offer_digest.value();
 }
@@ -249,7 +249,7 @@ VerifyNativeExecutionRuntimeUnitForHost(
   const auto *qualified =
       runtime_unit == bundle.value().cell_graph.runtime_units.end()
           ? nullptr
-          : manyforge::deployment::build_qualified_runtime_contract_registry()
+          : manyforge::deployment::runtime_contract_declaration_registry()
                 .find(runtime_unit->runtime_profile_id,
                       runtime_unit->runtime_profile_revision,
                       product->product_contract_id(),

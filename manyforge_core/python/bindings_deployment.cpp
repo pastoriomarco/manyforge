@@ -869,56 +869,17 @@ void register_deployment_candidate_bindings(py::module_& module) {
     return immutable_snapshot(registered_stop_command_definitions());
   });
 
-  // These rows are public read-only projections of build-qualified retained
-  // products. Python may inspect them but cannot manufacture authority.
-  py::class_<StopImplementationQualificationDTO>(
-      module, "StopImplementationQualificationDTO", py::is_final())
-      .def_readonly(
-          "registered_command_kind_id",
-          &StopImplementationQualificationDTO::registered_command_kind_id)
-      .def_readonly("provider_contract_ref",
-                    &StopImplementationQualificationDTO::provider_contract_ref)
-      .def_readonly("product_id",
-                    &StopImplementationQualificationDTO::product_id)
-      .def_readonly("product_contract_id",
-                    &StopImplementationQualificationDTO::product_contract_id)
-      .def_readonly(
-          "product_contract_revision",
-          &StopImplementationQualificationDTO::product_contract_revision)
-      .def_readonly("endpoint_role_id",
-                    &StopImplementationQualificationDTO::endpoint_role_id)
-      .def_readonly("invocation_lane_id",
-                    &StopImplementationQualificationDTO::invocation_lane_id)
-      .def_readonly(
-          "qualification_artifact_ref",
-          &StopImplementationQualificationDTO::qualification_artifact_ref)
-      .def(py::self == py::self)
-      .def(py::self != py::self);
-
-  py::class_<ControlledStopSubstitutionQualificationDTO>(
-      module, "ControlledStopSubstitutionQualificationDTO", py::is_final())
+  py::class_<ControlledStopSubstitutionContractDTO>(
+      module, "ControlledStopSubstitutionContractDTO", py::is_final())
       .def_readonly(
           "provider_contract_ref",
-          &ControlledStopSubstitutionQualificationDTO::provider_contract_ref)
-      .def_readonly("product_id",
-                    &ControlledStopSubstitutionQualificationDTO::product_id)
-      .def_readonly(
-          "product_contract_id",
-          &ControlledStopSubstitutionQualificationDTO::product_contract_id)
-      .def_readonly(
-          "product_contract_revision",
-          &ControlledStopSubstitutionQualificationDTO::
-              product_contract_revision)
+          &ControlledStopSubstitutionContractDTO::provider_contract_ref)
       .def_readonly(
           "requested_stop_mode",
-          &ControlledStopSubstitutionQualificationDTO::requested_stop_mode)
+          &ControlledStopSubstitutionContractDTO::requested_stop_mode)
       .def_readonly(
           "executed_stop_mode",
-          &ControlledStopSubstitutionQualificationDTO::executed_stop_mode)
-      .def_readonly(
-          "qualification_artifact_ref",
-          &ControlledStopSubstitutionQualificationDTO::
-              qualification_artifact_ref)
+          &ControlledStopSubstitutionContractDTO::executed_stop_mode)
       .def(py::self == py::self)
       .def(py::self != py::self);
 

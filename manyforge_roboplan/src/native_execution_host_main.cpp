@@ -150,7 +150,7 @@ constexpr auto kPlanningSceneSynchronizationRetryDelay =
   constexpr auto family =
       deployment::native_execution_runtime_contract::kImplementationId;
 #endif
-  const auto &offers = deployment::build_qualified_runtime_contract_registry()
+  const auto &offers = deployment::runtime_contract_declaration_registry()
                            .package_manifest_set()
                            .offers;
   const auto found =
@@ -4432,6 +4432,7 @@ struct Composition final {
   std::unique_ptr<RetainedNativeLifecycleProduct> cclc_lifecycle_product;
 #endif
   std::unique_ptr<deployment::CCLCRuntimeComposition> cclc_runtime;
+  bool direct_route_configuration_published{};
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
   std::unique_ptr<RetainedRos2ControlAdmissionOwner>
       ros2_control_admission_owner;
@@ -5531,6 +5532,74 @@ Ros2ControlCellSupervisorEpoch(const Composition &composition) {
 }
 #endif
 
+[[nodiscard]] std::vector<core::RuntimeParticipantBinding>
+PhysicalControlBindings(const Composition &composition) {
+  std::vector<core::RuntimeParticipantBinding> physical_bindings{
+      composition.runtime->motion_binding};
+  if (composition.runtime->gripper_binding.has_value()) {
+    physical_bindings.push_back(*composition.runtime->gripper_binding);
+  }
+  return physical_bindings;
+}
+
+[[nodiscard]] bool RetainedProductDeclaresLifecycle(
+    const Composition &composition,
+    const deployment::FilesystemVerifiedRetainedProviderManifestSource
+        &provider_manifest_source,
+    const std::vector<core::RuntimeParticipantBinding> &physical_bindings) {
+  // The ordinary maintained native products predate the lifecycle-qualified
+  // CCLC product and deliberately retain the generic native-control provider
+  // manifest.  They remain valid direct native runtimes, but have no lifecycle
+  // product to attach.  A lifecycle declaration is the sealed package-level
+  // opt-in; once one physical provider declares it, the product constructor
+  // below remains fail-closed for every desired domain and exact manifest.
+  std::set<std::pair<core::ProviderManifestId, core::ProviderManifestRevision>>
+      provider_manifest_keys;
+  bool lifecycle_product_declared = false;
+  for (const auto &binding : physical_bindings) {
+    Require(binding.value().control_path.has_value(),
+            "native CCLC eligibility has no exact control path");
+    const auto &path = *binding.value().control_path;
+    const auto key =
+        std::pair{path.provider_manifest_id, path.provider_manifest_revision};
+    if (!provider_manifest_keys.insert(key).second) {
+      continue;
+    }
+    const auto manifest = provider_manifest_source.get_verified(
+        {composition.bundle->retained_bundle_id(), path.provider_manifest_id,
+         path.provider_manifest_revision});
+    Require(manifest.has_value(),
+            "native CCLC eligibility cannot resolve the exact provider "
+            "manifest");
+    lifecycle_product_declared =
+        lifecycle_product_declared ||
+        manifest->value().lifecycle_plan_catalog.has_value();
+  }
+  return lifecycle_product_declared;
+}
+
+void PublishDirectNativeRoutes(Composition &composition,
+                               const std::filesystem::path &package_root) {
+  if (composition.direct_route_configuration_published ||
+      composition.cclc_runtime != nullptr) {
+    return;
+  }
+  const auto physical_bindings = PhysicalControlBindings(composition);
+  const deployment::FilesystemVerifiedRetainedProviderManifestSource
+      provider_manifest_source(package_root);
+  if (RetainedProductDeclaresLifecycle(composition, provider_manifest_source,
+                                      physical_bindings)) {
+    return;
+  }
+  auto published =
+      composition.runtime->PublishCurrentRetainedRouteConfigurations();
+  if (!published.ok()) {
+    Fail("direct native route publication failed: " +
+         published.error().message);
+  }
+  composition.direct_route_configuration_published = true;
+}
+
 void AttachRetainedNativeCCLC(Composition &composition,
                               const HostConfig &config,
                               ManagedKernelApplyFenceOwner &fence_owner) {
@@ -5577,41 +5646,9 @@ void AttachRetainedNativeCCLC(Composition &composition,
   auto provider_manifest_source = std::make_unique<
       deployment::FilesystemVerifiedRetainedProviderManifestSource>(
       config.package_root);
-  std::vector<core::RuntimeParticipantBinding> physical_bindings{
-      composition.runtime->motion_binding};
-  if (composition.runtime->gripper_binding.has_value()) {
-    physical_bindings.push_back(*composition.runtime->gripper_binding);
-  }
-
-  // The ordinary maintained native products predate the lifecycle-qualified
-  // CCLC product and deliberately retain the generic native-control provider
-  // manifest.  They remain valid direct native runtimes, but have no lifecycle
-  // product to attach.  A lifecycle declaration is the sealed package-level
-  // opt-in; once one physical provider declares it, the product constructor
-  // below remains fail-closed for every desired domain and exact manifest.
-  std::set<std::pair<core::ProviderManifestId, core::ProviderManifestRevision>>
-      provider_manifest_keys;
-  bool lifecycle_product_declared = false;
-  for (const auto &binding : physical_bindings) {
-    Require(binding.value().control_path.has_value(),
-            "native CCLC eligibility has no exact control path");
-    const auto &path = *binding.value().control_path;
-    const auto key =
-        std::pair{path.provider_manifest_id, path.provider_manifest_revision};
-    if (!provider_manifest_keys.insert(key).second) {
-      continue;
-    }
-    const auto manifest = provider_manifest_source->get_verified(
-        {composition.bundle->retained_bundle_id(), path.provider_manifest_id,
-         path.provider_manifest_revision});
-    Require(manifest.has_value(),
-            "native CCLC eligibility cannot resolve the exact provider "
-            "manifest");
-    lifecycle_product_declared =
-        lifecycle_product_declared ||
-        manifest->value().lifecycle_plan_catalog.has_value();
-  }
-  if (!lifecycle_product_declared) {
+  auto physical_bindings = PhysicalControlBindings(composition);
+  if (!RetainedProductDeclaresLifecycle(
+          composition, *provider_manifest_source, physical_bindings)) {
     return;
   }
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
@@ -5703,7 +5740,8 @@ void DetachRetainedCCLC(Composition &composition) {
 void TryAttachManagedCCLC(Composition &composition,
                           const ManagedRuntimeChildConfig &config,
                           ManagedKernelApplyFenceOwner &fence_owner) {
-  if (composition.cclc_runtime != nullptr) {
+  if (composition.cclc_runtime != nullptr ||
+      composition.direct_route_configuration_published) {
     return;
   }
   component_manager::SqliteActiveBundlePublicationStore publication_store(
@@ -5722,6 +5760,10 @@ void TryAttachManagedCCLC(Composition &composition,
   attachment_config.execution_run_root = config.execution_run_root;
   attachment_config.candidate_worker = config.candidate_worker;
   attachment_config.cell_id = config.cell_id;
+  PublishDirectNativeRoutes(composition, config.package_root);
+  if (composition.direct_route_configuration_published) {
+    return;
+  }
   AttachRetainedNativeCCLC(composition, attachment_config, fence_owner);
 }
 
@@ -6353,6 +6395,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                   std::move(detached_addressed_kernel);
               detached_owner_clock.reset();
               detached_owner_scheduler.reset();
+              PublishDirectNativeRoutes(*built, config.package_root);
               fence_owner.BindDisableHandoffKernel(
                   *built->runtime->addressed_kernel);
               active_managed_composition = std::move(built);
@@ -6689,6 +6732,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                 detached_owner_scheduler.reset();
               }
             }
+            PublishDirectNativeRoutes(*prepared, config.package_root);
             auto staged =
                 prepared->runtime->addressed_kernel
                     ->stage_current_runtime_configuration_facts_under_apply_fence(

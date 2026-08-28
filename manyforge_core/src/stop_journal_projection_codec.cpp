@@ -571,52 +571,24 @@ template <typename T, typename Decode>
           f[17], [](const V& v) { return did<SiteOverlayValueRef>(v, "site overlay value ref"); })};
 }
 
-[[nodiscard]] V implementation_qualification_value(const StopImplementationQualificationDTO& v) {
-  return arr({enc(v.registered_command_kind_id), contract_ref_value(v.provider_contract_ref),
-              enc(v.product_id), enc(v.product_contract_id), enc(v.product_contract_revision),
-              opt(v.endpoint_role_id, id_value), enc(v.invocation_lane_id),
-              artifact_value(v.qualification_artifact_ref)});
+[[nodiscard]] V substitution_contract_value(
+    const ControlledStopSubstitutionContractDTO& v) {
+  return arr({contract_ref_value(v.provider_contract_ref),
+              enc(v.requested_stop_mode), enc(v.executed_stop_mode)});
 }
 
-[[nodiscard]] StopImplementationQualificationDTO implementation_qualification_from(const V& v) {
-  const auto& f = exact(v, 8U, "implementation qualification");
-  return StopImplementationQualificationDTO{
-      did<RegisteredStopCommandKindId>(f[0], "registered command kind"),
-      contract_ref_from(f[1]),
-      did<ProductId>(f[2], "product ID"),
-      did<ProductContractId>(f[3], "product contract ID"),
-      did<ProductContractRevision>(f[4], "product contract revision"),
-      dopt<EndpointRoleId>(
-          f[5], [](const V& item) { return did<EndpointRoleId>(item, "endpoint role"); }),
-      did<StopInvocationLaneId>(f[6], "invocation lane"),
-      artifact_from(f[7])};
-}
-
-[[nodiscard]] V substitution_qualification_value(
-    const ControlledStopSubstitutionQualificationDTO& v) {
-  return arr({contract_ref_value(v.provider_contract_ref), enc(v.product_id),
-              enc(v.product_contract_id), enc(v.product_contract_revision),
-              enc(v.requested_stop_mode), enc(v.executed_stop_mode),
-              artifact_value(v.qualification_artifact_ref)});
-}
-
-[[nodiscard]] ControlledStopSubstitutionQualificationDTO substitution_qualification_from(
+[[nodiscard]] ControlledStopSubstitutionContractDTO substitution_contract_from(
     const V& v) {
-  const auto& f = exact(v, 7U, "substitution qualification");
-  return ControlledStopSubstitutionQualificationDTO{
+  const auto& f = exact(v, 3U, "substitution contract");
+  return ControlledStopSubstitutionContractDTO{
       contract_ref_from(f[0]),
-      did<ProductId>(f[1], "product ID"),
-      did<ProductContractId>(f[2], "product contract ID"),
-      did<ProductContractRevision>(f[3], "product contract revision"),
-      den<MotionControlledStopMode>(f[4], 2U, "requested Stop mode"),
-      den<MotionControlledStopMode>(f[5], 2U, "executed Stop mode"),
-      artifact_from(f[6])};
+      den<MotionControlledStopMode>(f[1], 2U, "requested Stop mode"),
+      den<MotionControlledStopMode>(f[2], 2U, "executed Stop mode")};
 }
 
 [[nodiscard]] V command_qualification_value(const ResolvedStopCommandQualificationDTO& v) {
   return arr({enc(v.stop_action_class),
-              opt(v.controlled_substitution_qualification, substitution_qualification_value),
-              opt(v.software_hard_implementation_qualification, implementation_qualification_value),
+              opt(v.controlled_substitution_contract, substitution_contract_value),
               opt(v.safety_system_request_action_class, [](const auto item) { return enc(item); }),
               opt(v.commissioned_stop_interface_id, id_value),
               opt(v.commissioned_stop_interface_revision, id_value),
@@ -624,27 +596,26 @@ template <typename T, typename Decode>
 }
 
 [[nodiscard]] ResolvedStopCommandQualificationDTO command_qualification_from(const V& v) {
-  const auto& f = exact(v, 7U, "command qualification");
+  const auto& f = exact(v, 6U, "command qualification");
   return ResolvedStopCommandQualificationDTO{
       den<StopActionClass>(f[0], 2U, "Stop action class"),
-      dopt<ControlledStopSubstitutionQualificationDTO>(f[1], substitution_qualification_from),
-      dopt<StopImplementationQualificationDTO>(f[2], implementation_qualification_from),
-      dopt<SafetySystemRequestActionClass>(f[3],
+      dopt<ControlledStopSubstitutionContractDTO>(f[1], substitution_contract_from),
+      dopt<SafetySystemRequestActionClass>(f[2],
                                            [](const V& item) {
                                              return den<SafetySystemRequestActionClass>(
                                                  item, 1U, "safety action class");
                                            }),
-      dopt<CommissionedStopInterfaceId>(f[4],
+      dopt<CommissionedStopInterfaceId>(f[3],
                                         [](const V& item) {
                                           return did<CommissionedStopInterfaceId>(
                                               item, "commissioned interface ID");
                                         }),
-      dopt<CommissionedStopInterfaceRevision>(f[5],
+      dopt<CommissionedStopInterfaceRevision>(f[4],
                                               [](const V& item) {
                                                 return did<CommissionedStopInterfaceRevision>(
                                                     item, "commissioned interface revision");
                                               }),
-      dopt<RetainedArtifactRefDTO>(f[6], artifact_from)};
+      dopt<RetainedArtifactRefDTO>(f[5], artifact_from)};
 }
 
 [[nodiscard]] V containment_command_value(const StopContainmentCommandDTO& v) {
@@ -1165,7 +1136,6 @@ template <typename T, typename Decode>
   return arr(
       {resolved_participant_stage_value(v.request), enc(v.attempt_disposition), enc(v.outcome),
        opt(v.actual_provider_contract_mode, [](const auto item) { return enc(item); }),
-       opt(v.actual_provider_contract_provenance, substitution_qualification_value),
        opt(v.recoverable_substitution_reason, [](const std::string& item) { return V(item); }),
        opt(v.controller_acknowledgement_sequence,
            [](const std::uint64_t item) { return V(static_cast<double>(item)); }),
@@ -1177,7 +1147,7 @@ template <typename T, typename Decode>
 }
 
 [[nodiscard]] ParticipantStopStageResultDTO stage_result_from(const V& v) {
-  const auto& f = exact(v, 12U, "participant Stop stage result");
+  const auto& f = exact(v, 11U, "participant Stop stage result");
   return ParticipantStopStageResultDTO{
       resolved_participant_stage_from(f[0]),
       den<StopStageAttemptDispositionDTO>(f[1], 2U, "attempt disposition"),
@@ -1187,16 +1157,15 @@ template <typename T, typename Decode>
                                        return den<MotionControlledStopMode>(item, 2U,
                                                                             "actual provider mode");
                                      }),
-      dopt<ControlledStopSubstitutionQualificationDTO>(f[4], substitution_qualification_from),
-      dopt<std::string>(f[5], [](const V& item) { return str(item, "substitution reason"); }),
-      dopt<std::uint64_t>(f[6],
+      dopt<std::string>(f[4], [](const V& item) { return str(item, "substitution reason"); }),
+      dopt<std::uint64_t>(f[5],
                           [](const V& item) { return u64(item, "acknowledgement sequence"); }),
-      dopt<RuntimeEpoch>(f[7],
+      dopt<RuntimeEpoch>(f[6],
                          [](const V& item) { return did<RuntimeEpoch>(item, "source epoch"); }),
-      dopt<std::uint64_t>(f[8], [](const V& item) { return u64(item, "source sequence"); }),
-      i64(f[9], "receiver elapsed duration"),
-      dvec<StopEvidenceItemDTO>(f[10], evidence_item_from, "stage evidence items"),
-      dopt<ErrorDTO>(f[11], error_from)};
+      dopt<std::uint64_t>(f[7], [](const V& item) { return u64(item, "source sequence"); }),
+      i64(f[8], "receiver elapsed duration"),
+      dvec<StopEvidenceItemDTO>(f[9], evidence_item_from, "stage evidence items"),
+      dopt<ErrorDTO>(f[10], error_from)};
 }
 
 [[nodiscard]] V selector_value(const StopSelectorDTO& v) {

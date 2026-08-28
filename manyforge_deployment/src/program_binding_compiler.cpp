@@ -1207,7 +1207,6 @@ compile_program_binding_contract(
             std::move(component_bindings), std::move(target_bindings),
             core::ProgramBindingProvenanceDTO{
                 current.compiler_contract_digest(),
-                current.compiler_build_digest(),
                 role_assignment_digest(role_assignment),
                 bundle.provenance.source_records,
                 std::move(resolved_records)}};

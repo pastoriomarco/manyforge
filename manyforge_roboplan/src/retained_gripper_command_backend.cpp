@@ -936,7 +936,6 @@ RetainedGripperCommandBackend::TranslateStopStage(
             std::nullopt,
             std::nullopt,
             std::nullopt,
-            std::nullopt,
             std::max<std::int64_t>(0, state_->clock->now() - started_at),
             {},
             error};
@@ -1091,7 +1090,6 @@ RetainedGripperCommandBackend::TranslateStopStage(
       stage,
       core::StopStageAttemptDispositionDTO::kDispatched,
       core::ParticipantStopStageOutcomeDTO::kFailed,
-      std::nullopt,
       std::nullopt,
       std::nullopt,
       std::nullopt,

@@ -1056,7 +1056,7 @@ void VerifyAdmissionMatchesQuery(const ReferenceRuntimeUnitAdmission &admission,
         return candidate.runtime_unit_id == plan.runtime_unit_id;
       });
   const auto *contract =
-      manyforge::deployment::build_qualified_runtime_contract_registry().find(
+      manyforge::deployment::runtime_contract_declaration_registry().find(
           runtime_unit.runtime_profile_id, runtime_unit.runtime_profile_revision,
           plan.product_contract_id, plan.product_contract_revision);
   std::vector<manyforge::core::RuntimeRoleId> roles{

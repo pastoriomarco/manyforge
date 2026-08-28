@@ -66,7 +66,6 @@ function controller(
           contact_grasp_bindings: [],
           provenance: {
             binding_compiler_contract_digest: `sha256:${'a'.repeat(64)}`,
-            binding_compiler_build_digest: `sha256:${'b'.repeat(64)}`,
             role_assignment_digest: `sha256:${'c'.repeat(64)}`,
             source_records: [],
             resolved_output_records: [],
@@ -117,6 +116,7 @@ function controller(
     refresh: vi.fn(),
     selectScenario: vi.fn(),
     clearScenarioSelection: vi.fn(),
+    dismissError: vi.fn(),
     run: vi.fn(),
     stop: vi.fn(),
     reset: vi.fn(),

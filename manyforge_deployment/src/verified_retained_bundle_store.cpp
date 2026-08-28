@@ -39,7 +39,6 @@
 #include "posix_durability_internal.hpp"
 #include "reference_runtime_unit_internal.hpp"
 #include "ros2_control_execution_runtime_unit_internal.hpp"
-#include "stop_qualification_evidence_internal.hpp"
 #include "verified_retained_bundle_internal.hpp"
 
 namespace manyforge::deployment {
@@ -1517,10 +1516,7 @@ void require_verified_product_artifacts(
     std::span<const QualifiedProviderManifest> provider_manifests = {}) {
   std::optional<std::string> runtime_manifest;
   std::optional<std::string> runtime_launchable;
-  std::optional<std::string> runtime_implementation_build_identity;
   std::optional<std::string> control_domain_control;
-  std::optional<std::string> stop_implementation_evidence;
-  std::optional<std::string> stop_substitution_evidence;
   std::optional<std::string> stop_commissioning_evidence;
   for (const auto &artifact : product.artifact_refs) {
     const std::string bytes = read_verified_raw_reference(
@@ -1546,24 +1542,6 @@ void require_verified_product_artifacts(
               "control-domain product has an incoherent primary artifact");
         }
         control_domain_control = bytes;
-      } else if (role ==
-                 core::kStopImplementationQualificationArtifactRole) {
-        if (artifact.media_type !=
-                core::kStopImplementationQualificationMediaType ||
-            stop_implementation_evidence.has_value()) {
-          detail::fail_retained_bundle(
-              "control-domain product has incoherent implementation evidence");
-        }
-        stop_implementation_evidence = bytes;
-      } else if (role ==
-                 core::kControlledStopSubstitutionQualificationArtifactRole) {
-        if (artifact.media_type !=
-                core::kControlledStopSubstitutionQualificationMediaType ||
-            stop_substitution_evidence.has_value()) {
-          detail::fail_retained_bundle(
-              "control-domain product has incoherent substitution evidence");
-        }
-        stop_substitution_evidence = bytes;
       } else if (role == core::kStopInterfaceCommissioningArtifactRole) {
         if (artifact.media_type != core::kStopInterfaceCommissioningMediaType ||
             stop_commissioning_evidence.has_value()) {
@@ -1628,22 +1606,6 @@ void require_verified_product_artifacts(
               "runtime-unit product has an incoherent launchable artifact");
         }
         runtime_launchable = bytes;
-      } else if ((native_execution || ros2_control_execution) &&
-                 artifact.artifact_role_id.value() ==
-                     (native_execution
-                          ? detail::kNativeExecutionRuntimeBuildIdentityArtifactRole
-                          : detail::kRos2ControlExecutionRuntimeBuildIdentityArtifactRole)) {
-        const std::string_view expected_media =
-            native_execution
-                ? detail::kNativeExecutionRuntimeBuildIdentityMediaType
-                : detail::kRos2ControlExecutionRuntimeBuildIdentityMediaType;
-        if (artifact.media_type != expected_media ||
-            runtime_implementation_build_identity.has_value()) {
-          detail::fail_retained_bundle(
-              "execution runtime product has an incoherent implementation "
-              "build identity");
-        }
-        runtime_implementation_build_identity = bytes;
       } else {
         detail::fail_retained_bundle("runtime-unit product has an unexpected artifact role");
       }
@@ -1657,78 +1619,12 @@ void require_verified_product_artifacts(
           "control-domain product is missing its envelope subject or primary "
           "artifact");
     }
-    std::vector<std::pair<core::ProductId, std::string>>
-        execution_build_identity_storage;
-    execution_build_identity_storage.reserve(
-        bundle.compiled_products.runtime_unit_products.size());
-    for (const auto& runtime_group :
-         bundle.compiled_products.runtime_unit_products) {
-      if (runtime_group.products.size() != 1U) {
-        detail::fail_retained_bundle(
-            "control readback found an incoherent runtime product group");
-      }
-      const auto& runtime_product = runtime_group.products.front();
-      const bool native_execution =
-          runtime_product.product_contract_id.value() ==
-              detail::kNativeExecutionRuntimeProductContractId &&
-          runtime_product.product_contract_revision ==
-              detail::native_execution_runtime_product_contract_revision();
-      const bool ros2_control_execution =
-          runtime_product.product_contract_id.value() ==
-              detail::kRos2ControlExecutionRuntimeProductContractId &&
-          runtime_product.product_contract_revision ==
-              detail::ros2_control_execution_runtime_product_contract_revision();
-      if (!native_execution && !ros2_control_execution) {
-        continue;
-      }
-      const std::string_view identity_role =
-          native_execution
-              ? detail::kNativeExecutionRuntimeBuildIdentityArtifactRole
-              : detail::kRos2ControlExecutionRuntimeBuildIdentityArtifactRole;
-      const std::string_view identity_media =
-          native_execution
-              ? detail::kNativeExecutionRuntimeBuildIdentityMediaType
-              : detail::kRos2ControlExecutionRuntimeBuildIdentityMediaType;
-      const auto identity_ref = std::find_if(
-          runtime_product.artifact_refs.begin(),
-          runtime_product.artifact_refs.end(), [&](const auto& artifact) {
-            return artifact.artifact_role_id.value() == identity_role;
-          });
-      if (identity_ref == runtime_product.artifact_refs.end()) {
-        continue;
-      }
-      if (identity_ref->media_type != identity_media) {
-        detail::fail_retained_bundle(
-            "execution runtime build identity has an incoherent media type");
-      }
-      execution_build_identity_storage.emplace_back(
-          runtime_product.product_id,
-          read_verified_raw_reference(
-              raw_data, identity_ref->content_addressed_store_key,
-              identity_ref->content_digest, identity_ref->byte_size,
-              "execution runtime implementation build identity"));
-    }
-    std::vector<detail::ExecutionRuntimeBuildIdentityArtifact>
-        execution_build_identities;
-    execution_build_identities.reserve(
-        execution_build_identity_storage.size());
-    for (const auto& [product_id, bytes] :
-         execution_build_identity_storage) {
-      execution_build_identities.push_back({product_id, bytes});
-    }
     detail::require_control_domain_control_matches_retained_bundle(
         detail::ControlDomainControlArtifactClosure{
             *control_domain_control,
-            stop_implementation_evidence.has_value()
-                ? std::optional<std::string_view>(*stop_implementation_evidence)
-                : std::nullopt,
-            stop_substitution_evidence.has_value()
-                ? std::optional<std::string_view>(*stop_substitution_evidence)
-                : std::nullopt,
             stop_commissioning_evidence.has_value()
                 ? std::optional<std::string_view>(*stop_commissioning_evidence)
-                : std::nullopt,
-            execution_build_identities},
+                : std::nullopt},
         bundle, *control_domain_subject, stop_policies, controller_topologies,
         provider_manifests);
   }
@@ -1743,24 +1639,15 @@ void require_verified_product_artifacts(
         product.product_contract_revision ==
             detail::native_execution_runtime_product_contract_revision()) {
       detail::require_native_execution_runtime_product_matches_retained_bundle(
-          *runtime_manifest, *runtime_launchable,
-          runtime_implementation_build_identity.has_value()
-              ? std::optional<std::string_view>(
-                    *runtime_implementation_build_identity)
-              : std::nullopt,
-          bundle,
+          *runtime_manifest, *runtime_launchable, bundle,
           *runtime_unit_subject);
     } else if (product.product_contract_id.value() ==
                    detail::kRos2ControlExecutionRuntimeProductContractId &&
                product.product_contract_revision ==
                    detail::ros2_control_execution_runtime_product_contract_revision()) {
       detail::require_ros2_control_execution_runtime_product_matches_retained_bundle(
-          *runtime_manifest, *runtime_launchable,
-          runtime_implementation_build_identity.has_value()
-              ? std::optional<std::string_view>(
-                    *runtime_implementation_build_identity)
-              : std::nullopt,
-          bundle, *runtime_unit_subject);
+          *runtime_manifest, *runtime_launchable, bundle,
+          *runtime_unit_subject);
     } else {
       detail::require_reference_runtime_product_matches_retained_bundle(
           *runtime_manifest, *runtime_launchable, bundle,
@@ -2651,39 +2538,6 @@ std::optional<VerifiedRetainedRuntimeUnitProduct> verify_runtime_unit_product(
   };
   const auto manifest = artifact_source.get_verified(manifest_query);
   const auto launchable = artifact_source.get_verified(launchable_query);
-  std::optional<VerifiedRetainedProductArtifact> implementation_build_identity;
-  if (native_execution || ros2_control_execution) {
-    const std::string_view build_identity_role =
-        native_execution
-            ? detail::kNativeExecutionRuntimeBuildIdentityArtifactRole
-            : detail::kRos2ControlExecutionRuntimeBuildIdentityArtifactRole;
-    const auto identity_ref = std::find_if(
-        product.artifact_refs.begin(), product.artifact_refs.end(),
-        [&](const auto& artifact) {
-          return artifact.artifact_role_id.value() == build_identity_role;
-        });
-    if (identity_ref != product.artifact_refs.end()) {
-      const RetainedProductArtifactQuery identity_query{
-          bundle.retained_bundle_id(),
-          product.product_id,
-          core::RetainedProductKind::kRuntimeUnitConfiguration,
-          core::ArtifactRoleId(std::string(build_identity_role)),
-      };
-      implementation_build_identity =
-          artifact_source.get_verified(identity_query);
-      if (!implementation_build_identity.has_value() ||
-          implementation_build_identity->query() != identity_query ||
-          implementation_build_identity->product_contract_id() !=
-              product.product_contract_id ||
-          implementation_build_identity->product_contract_revision() !=
-              product.product_contract_revision ||
-          implementation_build_identity->artifact_ref() != *identity_ref) {
-        detail::fail_retained_bundle(
-            "runtime-unit artifact source did not return the exact execution "
-            "build identity");
-      }
-    }
-  }
   if (!manifest.has_value() || !launchable.has_value() ||
       manifest->query() != manifest_query ||
       launchable->query() != launchable_query ||
@@ -2696,37 +2550,14 @@ std::optional<VerifiedRetainedRuntimeUnitProduct> verify_runtime_unit_product(
   }
   if (native_execution) {
     detail::require_native_execution_runtime_product_matches_retained_bundle(
-        manifest->bytes(), launchable->bytes(),
-        implementation_build_identity.has_value()
-            ? std::optional<std::string_view>(
-                  implementation_build_identity->bytes())
-            : std::nullopt,
-        bundle.value(),
-        runtime_unit_id);
+        manifest->bytes(), launchable->bytes(), bundle.value(), runtime_unit_id);
   } else if (ros2_control_execution) {
     detail::require_ros2_control_execution_runtime_product_matches_retained_bundle(
-        manifest->bytes(), launchable->bytes(),
-        implementation_build_identity.has_value()
-            ? std::optional<std::string_view>(
-                  implementation_build_identity->bytes())
-            : std::nullopt,
-        bundle.value(), runtime_unit_id);
+        manifest->bytes(), launchable->bytes(), bundle.value(), runtime_unit_id);
   } else {
     detail::require_reference_runtime_product_matches_retained_bundle(
         manifest->bytes(), launchable->bytes(), bundle.value(),
         runtime_unit_id);
-  }
-  std::optional<VerifiedRuntimeImplementationBuildIdentity>
-      verified_implementation_build_identity;
-  if (implementation_build_identity.has_value()) {
-    const auto identity = detail::parse_stop_implementation_build_identity(
-        implementation_build_identity->bytes());
-    verified_implementation_build_identity =
-        VerifiedRuntimeImplementationBuildIdentity{
-            identity.implementation_source_build_fingerprint,
-            identity.installed_target_id,
-            identity.installed_target_byte_size,
-            identity.installed_target_content_digest};
   }
   return VerifiedRetainedRuntimeUnitProduct(
       bundle.retained_bundle_id(), runtime_unit_id, product.product_id,
@@ -2792,7 +2623,6 @@ std::optional<VerifiedRetainedRuntimeUnitProduct> verify_runtime_unit_product(
       : ros2_control_execution
           ? detail::ros2_control_execution_runtime_retrieval_contract_revision()
           : detail::reference_runtime_retrieval_contract_revision(),
-      std::move(verified_implementation_build_identity),
       native_execution
           ? std::optional<core::ManagerLivenessPolicyDTO>(
                 native_execution_runtime_contract::manager_liveness_policy())

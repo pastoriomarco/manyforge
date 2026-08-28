@@ -624,16 +624,15 @@ NativePackageIdentity ReadNativePackageIdentity(
     throw std::runtime_error("native package identity lacks native product");
   }
   const auto *qualified =
-      deployment::build_qualified_runtime_contract_registry().find(
+      deployment::runtime_contract_declaration_registry().find(
           bundle->value().cell_graph.runtime_units.front().runtime_profile_id,
           bundle->value().cell_graph.runtime_units.front()
               .runtime_profile_revision,
           product->product_contract_id(),
           product->product_contract_revision());
-  if (qualified == nullptr ||
-      !product->implementation_build_identity().has_value()) {
+  if (qualified == nullptr) {
     throw std::runtime_error(
-        "native package identity lacks qualified offer/build identity");
+        "native package identity lacks its declared runtime offer");
   }
   std::ifstream stream(installed_host, std::ios::binary);
   const std::string bytes{std::istreambuf_iterator<char>(stream),
@@ -1856,11 +1855,11 @@ TEST(ManagerDaemonProcess,
 
 #if defined(MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST)
 TEST(ManagerDaemonProcess,
-     DistinctNativePackageUsesFreshManagerGenerationAfterCleanStop) {
+     CompatibleNativeReplacementUsesFreshEpochAfterCleanStop) {
   const auto fixture_a = ReadManagerApplyFixtureMetadata();
   const auto fixture_b = ReadManagerApplyFixtureMetadata(
       MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_METADATA);
-  ASSERT_NE(fixture_a.candidate_retained_bundle_id,
+  ASSERT_EQ(fixture_a.candidate_retained_bundle_id,
             fixture_b.candidate_retained_bundle_id);
 
   const std::filesystem::path package_a =
@@ -1951,28 +1950,14 @@ TEST(ManagerDaemonProcess,
                   deployment::native_execution_runtime_contract::
                       kLaunchEnvironmentContract)
                   .has_value());
-  ASSERT_TRUE(identity_a.product.implementation_build_identity().has_value());
-  ASSERT_TRUE(identity_b.product.implementation_build_identity().has_value());
   EXPECT_NE(identity_a.executable_digest, identity_b.executable_digest);
-  EXPECT_EQ(
-      identity_a.executable_digest,
-      identity_a.product.implementation_build_identity()
-          ->installed_target_content_digest.value());
-  EXPECT_EQ(
-      identity_b.executable_digest,
-      identity_b.product.implementation_build_identity()
-          ->installed_target_content_digest.value());
-  EXPECT_NE(identity_a.product.implementation_build_identity()
-                ->implementation_source_build_fingerprint,
-            identity_b.product.implementation_build_identity()
-                ->implementation_source_build_fingerprint);
-  EXPECT_NE(identity_a.product.product_identity(),
+  // Different compatible executables consume the same semantic package. Their
+  // release identity is diagnostic and no longer package admission authority.
+  EXPECT_EQ(identity_a.product.product_identity(),
             identity_b.product.product_identity());
-  // The same desired configuration is deliberately retained while bundle,
-  // product, executable, and source-build identities differ.
   EXPECT_EQ(identity_a.product.configuration_identity(),
             identity_b.product.configuration_identity());
-  EXPECT_NE(identity_a.bundle->retained_bundle_id(),
+  EXPECT_EQ(identity_a.bundle->retained_bundle_id(),
             identity_b.bundle->retained_bundle_id());
   EXPECT_EQ(identity_a.offer, identity_b.offer);
   EXPECT_EQ(identity_a.offer.offer_digest, identity_b.offer.offer_digest);

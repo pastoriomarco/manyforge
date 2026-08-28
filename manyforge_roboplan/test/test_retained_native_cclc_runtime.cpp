@@ -1308,11 +1308,10 @@ motion_operation(const core::RuntimeParticipantBinding &binding) {
 }
 
 TEST(RetainedNativeCCLCRuntime,
-     StopQualifiedProductPublishesRepositoryReadBackReadiness) {
+     RetainedProductPublishesRepositoryReadBackReadiness) {
   const std::filesystem::path fixture_root =
-      MANYFORGE_I7_STOP_QUALIFIED_FIXTURE_ROOT;
+      MANYFORGE_CCLC_READINESS_FIXTURE_ROOT;
   auto bundle = load_fixture_bundle(fixture_root);
-  ASSERT_EQ(bundle->value().desired_control_configurations.size(), 1U);
   auto runtime = make_runtime_context(*bundle);
   const auto catalog = make_prepare_catalog(*runtime.control_binding);
   FixedCatalogSource catalogs(catalog);

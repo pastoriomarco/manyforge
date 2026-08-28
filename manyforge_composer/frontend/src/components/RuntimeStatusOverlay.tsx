@@ -37,6 +37,7 @@ interface RuntimeStatusOverlayProps {
   connectionDetail: string;
   unacknowledgedAlarms?: number;
   activeAcknowledgedAlarms?: number;
+  clientErrorCount?: number;
   contextFacts?: string[];
   onOpenDetails?: () => void;
   onRetry?: () => void;
@@ -54,6 +55,7 @@ export function RuntimeStatusOverlay({
   connectionDetail,
   unacknowledgedAlarms = 0,
   activeAcknowledgedAlarms = 0,
+  clientErrorCount = 0,
   contextFacts = [],
   onOpenDetails,
   onRetry,
@@ -62,7 +64,8 @@ export function RuntimeStatusOverlay({
   const trigger = useRef<HTMLButtonElement>(null);
   const readiness = status?.readiness ?? (error ? 'offline' : 'waiting');
   const summaryLabel = status?.summaryLabel ?? (error ? 'Offline' : 'Waiting');
-  const alarmCount = unacknowledgedAlarms + activeAcknowledgedAlarms;
+  const alarmCount = unacknowledgedAlarms + activeAcknowledgedAlarms
+    + clientErrorCount;
   const sortedComponents = useMemo(
     () => [...(status?.components ?? [])].sort((left, right) =>
       left.label.localeCompare(right.label)),
@@ -109,6 +112,9 @@ export function RuntimeStatusOverlay({
               <span>{status.authorityLabel}</span>
               <span>{unacknowledgedAlarms} acknowledgement required</span>
               <span>{activeAcknowledgedAlarms} active acknowledged</span>
+              {clientErrorCount > 0 && (
+                <span>{clientErrorCount} Composer error acknowledgement required</span>
+              )}
               {contextFacts.map((fact) => <span key={fact}>{fact}</span>)}
             </div>
             <div className="runtime-capabilities">

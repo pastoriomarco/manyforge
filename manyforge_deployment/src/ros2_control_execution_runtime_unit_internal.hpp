@@ -6,7 +6,6 @@
 #include <manyforge_core/types/strong_id.hpp>
 #include <manyforge_deployment/canonical_value.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
-#include <optional>
 #include <string>
 #include <string_view>
 
@@ -33,12 +32,6 @@ inline constexpr std::string_view
 inline constexpr std::string_view
     kRos2ControlExecutionRuntimeLaunchDescriptorMediaType =
         "application/vnd.manyforge.installed-target-launch+json";
-inline constexpr std::string_view
-    kRos2ControlExecutionRuntimeBuildIdentityArtifactRole =
-        "implementation_build_identity";
-inline constexpr std::string_view
-    kRos2ControlExecutionRuntimeBuildIdentityMediaType =
-        "application/vnd.manyforge.stop-implementation-build-closure.v1+json";
 inline constexpr std::string_view kRos2ControlExecutionRuntimeProfileId =
     ros2_control_execution_runtime_contract::kRuntimeProfileId;
 inline constexpr std::string_view
@@ -128,7 +121,6 @@ void require_ros2_control_execution_runtime_manifest_matches(
 void require_ros2_control_execution_runtime_product_matches_retained_bundle(
     std::string_view manifest_bytes,
     std::string_view launch_descriptor_bytes,
-    std::optional<std::string_view> implementation_build_identity_bytes,
     const core::RetainedBundleDTO &retained_bundle,
     const core::RuntimeUnitId &runtime_unit_id);
 

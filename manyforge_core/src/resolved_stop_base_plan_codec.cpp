@@ -491,58 +491,14 @@ void validate_scope_widening(const ResolvedStopContainmentScopeDTO& previous,
   }
 }
 
-void validate_stop_implementation(const StopImplementationQualificationDTO& qualification,
-                                  const StopContainmentCommandDTO& command,
-                                  const ResolvedStopRuntimeTargetDTO& target) {
-  require_identifier(qualification.registered_command_kind_id.value(),
-                     "implementation registered command kind is invalid");
-  validate_contract_ref(qualification.provider_contract_ref);
-  require_identifier(qualification.product_id.value(), "implementation product ID is invalid");
-  require_identifier(qualification.product_contract_id.value(),
-                     "implementation product contract ID is invalid");
-  require_digest(qualification.product_contract_revision.value(),
-                 "implementation product contract revision is invalid");
-  require_identifier(qualification.invocation_lane_id.value(),
-                     "implementation invocation lane is invalid");
-  validate_artifact(qualification.qualification_artifact_ref);
-  if (qualification.qualification_artifact_ref.artifact_role_id.value() !=
-          kStopImplementationQualificationArtifactRole ||
-      qualification.qualification_artifact_ref.media_type !=
-          kStopImplementationQualificationMediaType ||
-      !command.registered_command_kind_id.has_value() ||
-      qualification.registered_command_kind_id != *command.registered_command_kind_id ||
+void validate_substitution(const ControlledStopSubstitutionContractDTO& contract,
+                           const StopContainmentCommandDTO& command) {
+  validate_contract_ref(contract.provider_contract_ref);
+  if (contract.requested_stop_mode != MotionControlledStopMode::kSoftOnPath ||
+      contract.executed_stop_mode != MotionControlledStopMode::kSpringBackHold ||
       !command.provider_contract_ref.has_value() ||
-      qualification.provider_contract_ref != *command.provider_contract_ref ||
-      qualification.product_id != target.product_id ||
-      qualification.product_contract_id != target.product_contract_id ||
-      qualification.product_contract_revision != target.product_contract_revision ||
-      qualification.endpoint_role_id != target.endpoint_role_id) {
-    fail("software-hard qualification does not match its command target");
-  }
-}
-
-void validate_substitution(const ControlledStopSubstitutionQualificationDTO& qualification,
-                           const StopContainmentCommandDTO& command,
-                           const ResolvedStopRuntimeTargetDTO& target) {
-  validate_contract_ref(qualification.provider_contract_ref);
-  require_identifier(qualification.product_id.value(), "substitution product ID is invalid");
-  require_identifier(qualification.product_contract_id.value(),
-                     "substitution product contract ID is invalid");
-  require_digest(qualification.product_contract_revision.value(),
-                 "substitution product contract revision is invalid");
-  validate_artifact(qualification.qualification_artifact_ref);
-  if (qualification.requested_stop_mode != MotionControlledStopMode::kSoftOnPath ||
-      qualification.executed_stop_mode != MotionControlledStopMode::kSpringBackHold ||
-      qualification.qualification_artifact_ref.artifact_role_id.value() !=
-          kControlledStopSubstitutionQualificationArtifactRole ||
-      qualification.qualification_artifact_ref.media_type !=
-          kControlledStopSubstitutionQualificationMediaType ||
-      !command.provider_contract_ref.has_value() ||
-      qualification.provider_contract_ref != *command.provider_contract_ref ||
-      qualification.product_id != target.product_id ||
-      qualification.product_contract_id != target.product_contract_id ||
-      qualification.product_contract_revision != target.product_contract_revision) {
-    fail("controlled substitution qualification does not match its target");
+      contract.provider_contract_ref != *command.provider_contract_ref) {
+    fail("controlled substitution contract does not match its command");
   }
 }
 
@@ -573,27 +529,21 @@ void validate_qualification(const ResolvedStopEscalationStageDTO& stage) {
       fail("registered Stop command does not match its qualified action class");
     }
   }
-  const bool software = required_action == StopActionClass::kSoftwareHard;
   const bool safety = required_action == StopActionClass::kSafetySystemRequest;
-  if (value.software_hard_implementation_qualification.has_value() != software ||
-      value.safety_system_request_action_class.has_value() != safety ||
+  if (value.safety_system_request_action_class.has_value() != safety ||
       value.commissioned_stop_interface_id.has_value() != safety ||
       value.commissioned_stop_interface_revision.has_value() != safety ||
       value.commissioning_evidence_artifact_ref.has_value() != safety) {
     fail("Stop command qualification conditional fields are invalid");
   }
-  if (value.controlled_substitution_qualification.has_value()) {
+  if (value.controlled_substitution_contract.has_value()) {
     if (stage.stage_kind != StopEscalationStageKind::kNominal ||
         stage.containment_command.command_kind !=
             StopContainmentCommandKind::kMotionControlledStop) {
       fail("controlled substitution is not on the nominal motion stage");
     }
-    validate_substitution(*value.controlled_substitution_qualification, stage.containment_command,
-                          stage.command_target);
-  }
-  if (software) {
-    validate_stop_implementation(*value.software_hard_implementation_qualification,
-                                 stage.containment_command, stage.command_target);
+    validate_substitution(*value.controlled_substitution_contract,
+                          stage.containment_command);
   }
   if (safety) {
     require_identifier(value.commissioned_stop_interface_id->value(),
@@ -939,45 +889,20 @@ void validate_plan(const ResolvedStopBasePlanDTO& plan) {
   return CanonicalValue(std::move(fields));
 }
 
-[[nodiscard]] CanonicalValue stop_implementation_value(
-    const StopImplementationQualificationDTO& value) {
-  CanonicalValue::Object fields{
-      {"registered_command_kind_id", CanonicalValue(value.registered_command_kind_id.value())},
-      {"provider_contract_ref", contract_value(value.provider_contract_ref)},
-      {"product_id", CanonicalValue(value.product_id.value())},
-      {"product_contract_id", CanonicalValue(value.product_contract_id.value())},
-      {"product_contract_revision", CanonicalValue(value.product_contract_revision.value())},
-      {"invocation_lane_id", CanonicalValue(value.invocation_lane_id.value())},
-      {"qualification_artifact_ref", artifact_value(value.qualification_artifact_ref)}};
-  if (value.endpoint_role_id.has_value()) {
-    fields.emplace_back("endpoint_role_id", CanonicalValue(value.endpoint_role_id->value()));
-  }
-  return CanonicalValue(std::move(fields));
-}
-
 [[nodiscard]] CanonicalValue substitution_value(
-    const ControlledStopSubstitutionQualificationDTO& value) {
+    const ControlledStopSubstitutionContractDTO& value) {
   return CanonicalValue(CanonicalValue::Object{
       {"provider_contract_ref", contract_value(value.provider_contract_ref)},
-      {"product_id", CanonicalValue(value.product_id.value())},
-      {"product_contract_id", CanonicalValue(value.product_contract_id.value())},
-      {"product_contract_revision", CanonicalValue(value.product_contract_revision.value())},
       {"requested_stop_mode", CanonicalValue(std::string(to_string(value.requested_stop_mode)))},
-      {"executed_stop_mode", CanonicalValue(std::string(to_string(value.executed_stop_mode)))},
-      {"qualification_artifact_ref", artifact_value(value.qualification_artifact_ref)}});
+      {"executed_stop_mode", CanonicalValue(std::string(to_string(value.executed_stop_mode)))}});
 }
 
 [[nodiscard]] CanonicalValue qualification_value(const ResolvedStopCommandQualificationDTO& value) {
   CanonicalValue::Object fields{
       {"stop_action_class", CanonicalValue(std::string(to_string(value.stop_action_class)))}};
-  if (value.controlled_substitution_qualification.has_value()) {
-    fields.emplace_back("controlled_substitution_qualification",
-                        substitution_value(*value.controlled_substitution_qualification));
-  }
-  if (value.software_hard_implementation_qualification.has_value()) {
-    fields.emplace_back(
-        "software_hard_implementation_qualification",
-        stop_implementation_value(*value.software_hard_implementation_qualification));
+  if (value.controlled_substitution_contract.has_value()) {
+    fields.emplace_back("controlled_substitution_contract",
+                        substitution_value(*value.controlled_substitution_contract));
   }
   if (value.safety_system_request_action_class.has_value()) {
     fields.emplace_back(

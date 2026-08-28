@@ -28,7 +28,7 @@ constexpr std::string_view kDigestThree =
 ManagedRow(const std::string &runtime_unit_id,
            std::vector<RuntimeUnitId> dependencies = {}) {
   const auto &registry =
-      manyforge::deployment::build_qualified_runtime_contract_registry();
+      manyforge::deployment::runtime_contract_declaration_registry();
   if (registry.contracts().empty()) {
     throw std::runtime_error("active runtime test registry is empty");
   }
@@ -468,7 +468,7 @@ TEST(ManagerActiveRuntimeCoordinator,
 }
 
 TEST(ManagerActiveRuntimeCoordinator,
-     UnregisteredRecoveryPlanRejectsBeforeAnyStartEffect) {
+     DiagnosticImplementationFamilyDoesNotBlockAnAdmittedSemanticContract) {
   auto plan = ThreeUnitPlan();
   plan.runtime_units.erase(plan.runtime_units.begin() + 1U,
                            plan.runtime_units.end());
@@ -484,14 +484,10 @@ TEST(ManagerActiveRuntimeCoordinator,
   ManagerActiveRuntimeCoordinator coordinator(source, ports, ports,
                                                [&now]() { return ++now; });
 
-  EXPECT_THROW(static_cast<void>(coordinator.Reconcile()),
-               ManagerActiveRuntimeCoordinatorError);
-  EXPECT_TRUE(ports.start_calls.empty());
-  EXPECT_TRUE(ports.events.empty() ||
-              std::none_of(ports.events.begin(), ports.events.end(),
-                           [](const auto &event) {
-                             return event.starts_with("start:");
-                           }));
+  EXPECT_EQ(coordinator.Reconcile().state,
+            ManagerActiveRuntimeConvergenceState::kConverged);
+  EXPECT_EQ(ports.start_calls["runtime.a"], 1);
+  static_cast<void>(coordinator.Shutdown());
 }
 
 TEST(ManagerActiveRuntimeCoordinator,

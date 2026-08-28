@@ -319,19 +319,15 @@ TEST(ProductContractRegistryTest,
   EXPECT_EQ(control->product_kind(),
             core::RetainedProductKind::kControlDomainControl);
   EXPECT_EQ(control->placement(), ProductPlacement::kControlDomain);
-  ASSERT_EQ(control->artifact_roles().size(), 4U);
+  ASSERT_EQ(control->artifact_roles().size(), 2U);
   EXPECT_EQ(control->artifact_roles().front().artifact_role_id.value(),
             "control_domain_control");
   EXPECT_EQ(control->artifact_roles().front().media_type,
             "application/vnd.manyforge.control-domain-control.v2+json");
   EXPECT_EQ(control->artifact_roles().front().cardinality,
             ProductArtifactCardinality::kRequiredExactlyOne);
-  const std::array<std::pair<std::string_view, std::string_view>, 3U>
+  const std::array<std::pair<std::string_view, std::string_view>, 1U>
       conditional_control_roles{{
-          {core::kControlledStopSubstitutionQualificationArtifactRole,
-           core::kControlledStopSubstitutionQualificationMediaType},
-          {core::kStopImplementationQualificationArtifactRole,
-           core::kStopImplementationQualificationMediaType},
           {core::kStopInterfaceCommissioningArtifactRole,
            core::kStopInterfaceCommissioningMediaType},
       }};
@@ -380,24 +376,18 @@ TEST(ProductContractRegistryTest,
   EXPECT_EQ(native_runtime->product_kind(),
             core::RetainedProductKind::kRuntimeUnitConfiguration);
   EXPECT_EQ(native_runtime->placement(), ProductPlacement::kRuntimeUnit);
-  ASSERT_EQ(native_runtime->artifact_roles().size(), 3U);
+  ASSERT_EQ(native_runtime->artifact_roles().size(), 2U);
   EXPECT_EQ(native_runtime->artifact_roles()[0].artifact_role_id.value(),
-            detail::kNativeExecutionRuntimeBuildIdentityArtifactRole);
-  EXPECT_EQ(native_runtime->artifact_roles()[0].media_type,
-            detail::kNativeExecutionRuntimeBuildIdentityMediaType);
-  EXPECT_EQ(native_runtime->artifact_roles()[0].cardinality,
-            ProductArtifactCardinality::kOptionalAtMostOne);
-  EXPECT_EQ(native_runtime->artifact_roles()[1].artifact_role_id.value(),
             detail::kNativeExecutionRuntimeLaunchDescriptorArtifactRole);
-  EXPECT_EQ(native_runtime->artifact_roles()[1].media_type,
+  EXPECT_EQ(native_runtime->artifact_roles()[0].media_type,
             detail::kNativeExecutionRuntimeLaunchDescriptorMediaType);
-  EXPECT_EQ(native_runtime->artifact_roles()[2].artifact_role_id.value(),
+  EXPECT_EQ(native_runtime->artifact_roles()[0].cardinality,
+            ProductArtifactCardinality::kRequiredExactlyOne);
+  EXPECT_EQ(native_runtime->artifact_roles()[1].artifact_role_id.value(),
             detail::kNativeExecutionRuntimeManifestArtifactRole);
-  EXPECT_EQ(native_runtime->artifact_roles()[2].media_type,
+  EXPECT_EQ(native_runtime->artifact_roles()[1].media_type,
             detail::kNativeExecutionRuntimeManifestMediaType);
   EXPECT_EQ(native_runtime->artifact_roles()[1].cardinality,
-            ProductArtifactCardinality::kRequiredExactlyOne);
-  EXPECT_EQ(native_runtime->artifact_roles()[2].cardinality,
             ProductArtifactCardinality::kRequiredExactlyOne);
   EXPECT_EQ(registry.find(native_runtime->product_contract_id(),
                           native_runtime->product_contract_revision()),
@@ -412,16 +402,10 @@ TEST(ProductContractRegistryTest,
   EXPECT_EQ(ros2_control_runtime->product_kind(),
             core::RetainedProductKind::kRuntimeUnitConfiguration);
   EXPECT_EQ(ros2_control_runtime->placement(), ProductPlacement::kRuntimeUnit);
-  ASSERT_EQ(ros2_control_runtime->artifact_roles().size(), 3U);
+  ASSERT_EQ(ros2_control_runtime->artifact_roles().size(), 2U);
   EXPECT_EQ(ros2_control_runtime->artifact_roles()[0].artifact_role_id.value(),
-            detail::kRos2ControlExecutionRuntimeBuildIdentityArtifactRole);
-  EXPECT_EQ(ros2_control_runtime->artifact_roles()[0].media_type,
-            detail::kRos2ControlExecutionRuntimeBuildIdentityMediaType);
-  EXPECT_EQ(ros2_control_runtime->artifact_roles()[0].cardinality,
-            ProductArtifactCardinality::kOptionalAtMostOne);
-  EXPECT_EQ(ros2_control_runtime->artifact_roles()[1].artifact_role_id.value(),
             detail::kRos2ControlExecutionRuntimeLaunchDescriptorArtifactRole);
-  EXPECT_EQ(ros2_control_runtime->artifact_roles()[2].artifact_role_id.value(),
+  EXPECT_EQ(ros2_control_runtime->artifact_roles()[1].artifact_role_id.value(),
             detail::kRos2ControlExecutionRuntimeManifestArtifactRole);
   EXPECT_EQ(registry.find(ros2_control_runtime->product_contract_id(),
                           ros2_control_runtime->product_contract_revision()),

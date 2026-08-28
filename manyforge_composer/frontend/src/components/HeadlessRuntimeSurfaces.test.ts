@@ -84,12 +84,24 @@ describe('headless Composer presentation adapters', () => {
       programCycleState: 'terminal_awaiting_reset',
       executionOwnerAvailable: true,
     });
+    const clientFailure = runtimeStatusView(runtime, {
+      unacknowledged: 0,
+      activeAcknowledged: 0,
+      programCycleState: 'idle_after_reset',
+      executionOwnerAvailable: true,
+      clientErrorCount: 1,
+    });
 
     expect(ready.readiness).toBe('ready');
     expect(terminal.readiness).toBe('degraded');
     expect(terminal.components).toContainEqual(expect.objectContaining({
       id: 'program_cycle',
       status: 'warning',
+    }));
+    expect(clientFailure.readiness).toBe('degraded');
+    expect(clientFailure.components).toContainEqual(expect.objectContaining({
+      id: 'composer_client_errors',
+      status: 'fault',
     }));
   });
 
@@ -272,6 +284,12 @@ describe('headless Composer presentation adapters', () => {
         error: 'Headless projection disconnected.',
         reconnect,
       },
+      clientErrors: [{
+        id: 'composer.program_runtime',
+        title: 'Program command or response failed',
+        message: 'Invalid response from /api/program/runs/program-run.1',
+      }],
+      onAcknowledgeClientError: vi.fn(),
     }));
 
     expect(html).toContain('Planner unavailable');
@@ -279,6 +297,8 @@ describe('headless Composer presentation adapters', () => {
     expect(html).toContain('ACTIVE — ACKNOWLEDGED · Reduced capability');
     expect(html).toContain('Messages / history');
     expect(html).toContain('Reconnect headless projection');
+    expect(html).toContain('COMPOSER ERROR — ACKNOWLEDGEMENT REQUIRED');
+    expect(html).toContain('Acknowledge message');
     expect(reconnect).not.toHaveBeenCalled();
   });
 });

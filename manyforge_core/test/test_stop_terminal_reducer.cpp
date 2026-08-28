@@ -155,7 +155,6 @@ inline constexpr char kDigestC[] =
                                        ParticipantStopStageOutcomeDTO::kSucceeded,
                                        std::nullopt,
                                        std::nullopt,
-                                       std::nullopt,
                                        3U,
                                        RuntimeEpoch("provider.epoch"),
                                        9U,

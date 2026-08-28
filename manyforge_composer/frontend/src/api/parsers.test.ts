@@ -5,6 +5,7 @@ import {
   parseAppliedProgramSelection,
   parseCapabilityCommandPreviewResponse,
   parseCatalogResponse,
+  parseCycleRecoveryActionResult,
   parseCurrentScenarioResponse,
   parseExecutionOwnerStatus,
   parseHealthResponse,
@@ -25,6 +26,7 @@ import {
   parseProgramWorkspaceTransitionResponse,
   parseProgramRunIndex,
   parseProgramRunStatus,
+  parseProgramRuntimeControlProjection,
   parseScenarioCatalogResponse,
   parseSceneRuntimeProjection,
   parseSceneMeshAssetMetadata,
@@ -526,6 +528,49 @@ describe('Program product projections', () => {
     };
   }
 
+  function runtimeControlsProjection(): Record<string, unknown> {
+    return {
+      schema_version: 'manyforge.program_runtime_control_projection.v1',
+      owner_id: 'program-runner.cell-a',
+      owner_epoch: 'program-runner.epoch.1',
+      program_run_id: 'program-run.1',
+      run_revision: 3,
+      runtime_controls: {
+        schema_version: 'manyforge.program_runtime_controls.v1',
+        program_run_id: 'program-run.1',
+        runtime_control_revision: 1,
+        recovery_fences: {
+          program_generation: 1,
+          deployment_generation: 1,
+          scene_admission_epoch: 1,
+          pose_source_apply_generation: 0,
+        },
+        has_active_runtime_overrides: false,
+        has_staged_runtime_overrides: false,
+        has_stale_runtime_overrides: false,
+        overrides: [],
+        promotion_proposals: [],
+        retry_counts: {},
+        audit: [],
+      },
+      recovery_offer: null,
+      observation_override_candidate: {
+        schema_version: 'manyforge.runtime_override_observation_candidate.v1',
+        available: false,
+        reason_code: 'program_attempt_not_held',
+        reason: 'No Program node attempt is currently held.',
+        program_run_id: 'program-run.1',
+        node_instance_id: null,
+        node_attempt_id: null,
+        node_id: null,
+        parameter_id: null,
+        value: null,
+        source_observation_id: null,
+        source_owner_generation: null,
+      },
+    };
+  }
+
   it('parses bounded scenarios and the exact Applied owner identity', () => {
     const catalog = parseScenarioCatalogResponse({
       api_version: 'manyforge.scenario_catalog.v1',
@@ -671,6 +716,33 @@ describe('Program product projections', () => {
       truncated: false,
       runs: [runStatus()],
     })).toThrow(/exact indexed owner/);
+  });
+
+  it('accepts exact runtime controls when no recovery action is offered', () => {
+    const projection = parseProgramRuntimeControlProjection(
+      runtimeControlsProjection(),
+    );
+
+    expect(projection.recoveryOffer).toBeNull();
+    expect(projection.programRunId).toBe('program-run.1');
+  });
+
+  it('accepts a completed recovery action with no subsequent offer', () => {
+    const result = parseCycleRecoveryActionResult({
+      schema_version: 'manyforge.cycle_recovery_result.v2',
+      request_id: 'request.1',
+      accepted: true,
+      action_id: 'acknowledge_and_continue',
+      cycle_resumed: true,
+      result_code: 'accepted',
+      owner_result: null,
+      run: runStatus(),
+      runtime_controls: runtimeControlsProjection(),
+      recovery_offer: null,
+    });
+
+    expect(result.recoveryOffer).toBeNull();
+    expect(result.run.capture.programRunId).toBe('program-run.1');
   });
 
   it('parses Composer Apply, Load, and Revert wrappers without trusting headless details', () => {

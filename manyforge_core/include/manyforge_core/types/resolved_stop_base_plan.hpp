@@ -53,8 +53,8 @@ struct ResolvedStopRuntimeTargetDTO final {
 
 struct ResolvedStopCommandQualificationDTO final {
   StopActionClass stop_action_class{StopActionClass::kControlled};
-  std::optional<ControlledStopSubstitutionQualificationDTO> controlled_substitution_qualification;
-  std::optional<StopImplementationQualificationDTO> software_hard_implementation_qualification;
+  std::optional<ControlledStopSubstitutionContractDTO>
+      controlled_substitution_contract;
   std::optional<SafetySystemRequestActionClass> safety_system_request_action_class;
   std::optional<CommissionedStopInterfaceId> commissioned_stop_interface_id;
   std::optional<CommissionedStopInterfaceRevision> commissioned_stop_interface_revision;

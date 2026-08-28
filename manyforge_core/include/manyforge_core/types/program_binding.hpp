@@ -154,7 +154,6 @@ struct ProgramContactGraspBindingDTO final {
 
 struct ProgramBindingProvenanceDTO final {
   ContentDigest binding_compiler_contract_digest;
-  ContentDigest binding_compiler_build_digest;
   ContentDigest role_assignment_digest;
   std::vector<RetainedSourceRecordDTO> source_records;
   std::vector<RetainedSourceRecordDTO> resolved_output_records;

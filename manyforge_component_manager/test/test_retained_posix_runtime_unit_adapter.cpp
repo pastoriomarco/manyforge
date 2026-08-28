@@ -115,7 +115,7 @@ Query(const RuntimePackage &package) {
         return candidate.runtime_unit_id == unit.runtime_unit_id;
       });
   const auto *qualified =
-      deployment::build_qualified_runtime_contract_registry().find(
+      deployment::runtime_contract_declaration_registry().find(
           unit.runtime_profile_id, unit.runtime_profile_revision,
           admission->product_contract_id(), admission->product_contract_revision());
   if (requirement == package.bundle->value().runtime_contract_requirements.end() ||

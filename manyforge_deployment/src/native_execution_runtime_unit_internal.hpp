@@ -6,7 +6,6 @@
 #include <manyforge_core/types/strong_id.hpp>
 #include <manyforge_deployment/canonical_value.hpp>
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
-#include <optional>
 #include <string>
 #include <string_view>
 
@@ -29,12 +28,6 @@ inline constexpr std::string_view
 inline constexpr std::string_view
     kNativeExecutionRuntimeLaunchDescriptorMediaType =
         "application/vnd.manyforge.installed-target-launch+json";
-inline constexpr std::string_view
-    kNativeExecutionRuntimeBuildIdentityArtifactRole =
-        "implementation_build_identity";
-inline constexpr std::string_view
-    kNativeExecutionRuntimeBuildIdentityMediaType =
-        "application/vnd.manyforge.stop-implementation-build-closure.v1+json";
 inline constexpr std::string_view kNativeExecutionRuntimeProfileId =
     native_execution_runtime_contract::kRuntimeProfileId;
 inline constexpr std::string_view kNativeExecutionRuntimeConfigurationSchemaId =
@@ -112,7 +105,6 @@ void require_native_execution_runtime_manifest_matches(
     const core::RuntimeUnitId &runtime_unit_id);
 void require_native_execution_runtime_product_matches_retained_bundle(
     std::string_view manifest_bytes, std::string_view launch_descriptor_bytes,
-    std::optional<std::string_view> implementation_build_identity_bytes,
     const core::RetainedBundleDTO &retained_bundle,
     const core::RuntimeUnitId &runtime_unit_id);
 

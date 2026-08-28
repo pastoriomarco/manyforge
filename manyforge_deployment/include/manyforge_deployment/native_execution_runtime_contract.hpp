@@ -95,9 +95,8 @@ require_configuration(const RetainedBundle &retained_bundle,
 [[nodiscard]] const core::ManagerLivenessPolicyDTO&
 manager_liveness_policy();
 
-/// Revision embedded independently in the retained descriptor and installed
-/// host for installed-target integrity and provenance. Runtime compatibility
-/// and child status correlation use the build-qualified contract offer.
+/// Diagnostic implementation revision embedded in the retained descriptor.
+/// Runtime compatibility uses the semantic contract offer, not this value.
 [[nodiscard]] std::string implementation_revision();
 
 } // namespace manyforge::deployment::native_execution_runtime_contract

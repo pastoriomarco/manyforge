@@ -2026,13 +2026,6 @@ BuildQualifiedRetentionAuthority::qualify_candidate(
 
 BuildQualifiedRetentionContext
 BuildQualifiedRetentionAuthority::qualify() {
-  return qualify({});
-}
-
-BuildQualifiedRetentionContext
-BuildQualifiedRetentionAuthority::qualify(
-    std::span<const StopQualificationEvidenceCandidate>
-        stop_evidence_candidates) {
   const auto node = qualify_candidate(
       BuildManifestKind::kNodeEnvironment,
       current_build_manifest_candidate(
@@ -2062,23 +2055,13 @@ BuildQualifiedRetentionAuthority::qualify(
       node, contract, build};
   return BuildQualifiedRetentionContext(
       retained_environment, contract->key().content_digest,
-      build->key().content_digest, std::move(manifests),
-      qualify_stop_evidence(stop_evidence_candidates));
+      build->key().content_digest, std::move(manifests));
 }
 
 BuildQualifiedRetentionContext
 BuildQualifiedRetentionAuthority::qualify_persisted(
     IBuildManifestRepository& repository) {
-  return qualify_persisted(repository, {});
-}
-
-BuildQualifiedRetentionContext
-BuildQualifiedRetentionAuthority::qualify_persisted(
-    IBuildManifestRepository& repository,
-    std::span<const StopQualificationEvidenceCandidate>
-        stop_evidence_candidates) {
-  const BuildQualifiedRetentionContext current =
-      qualify(stop_evidence_candidates);
+  const BuildQualifiedRetentionContext current = qualify();
   if (current.manifests().size() != 3U) {
     throw std::logic_error(
         "production retention authority omitted a required manifest");
@@ -2107,7 +2090,7 @@ BuildQualifiedRetentionAuthority::qualify_persisted(
       reloaded_manifests[2]->key().content_digest;
   return BuildQualifiedRetentionContext(
       retained_environment, compiler_contract_digest, compiler_build_digest,
-      std::move(reloaded_manifests), current.stop_evidence());
+      std::move(reloaded_manifests));
 }
 
 BuildQualifiedRetentionContext
@@ -2191,25 +2174,6 @@ BuildManifestTestAccess::qualify_candidates(
       retained_node_environment_from_manifest(*node),
       contract->key().content_digest, build->key().content_digest,
       std::move(manifests));
-}
-
-BuildQualifiedRetentionContext
-BuildManifestTestAccess::qualify_persisted_with_test_stop_build_identity(
-    IBuildManifestRepository& repository,
-    std::string_view canonical_build_identity_bytes) {
-  const auto current =
-      BuildQualifiedRetentionAuthority::qualify_persisted(repository);
-  std::vector<std::shared_ptr<const BuildQualifiedManifest>> manifests(
-      current.manifests().begin(), current.manifests().end());
-  std::vector<StopImplementationBuildIdentity> identities;
-  identities.push_back(parse_stop_implementation_build_identity(
-      canonical_build_identity_bytes));
-  BuildQualifiedStopEvidenceClosure stop_evidence(
-      std::nullopt, {}, std::nullopt, {}, std::move(identities));
-  return BuildQualifiedRetentionContext(
-      current.node_environment(), current.compiler_contract_digest(),
-      current.compiler_build_digest(), std::move(manifests),
-      std::move(stop_evidence));
 }
 
 std::shared_ptr<const RetainedBundle>

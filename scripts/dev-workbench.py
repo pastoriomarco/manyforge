@@ -18,14 +18,18 @@ import time
 from typing import Any, Callable, Sequence
 
 # `docker exec` does not inherit shell exports made by the container
-# entrypoint. Keep this start/status tool self-contained in a source mount.
-for _source_root in (
+# entrypoint. Keep this tool and every service it starts self-contained.
+_SOURCE_ROOTS = (
     "/workspace",
     "/workspace/manyforge_behavior",
     "/workspace/manyforge_ros",
-):
+)
+for _source_root in _SOURCE_ROOTS:
     if _source_root not in sys.path:
         sys.path.insert(0, _source_root)
+os.environ["PYTHONPATH"] = os.pathsep.join(
+    (*_SOURCE_ROOTS, os.environ.get("PYTHONPATH", ""))
+).rstrip(os.pathsep)
 
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
 
@@ -33,7 +37,9 @@ from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClien
 WORKSPACE = Path("/workspace")
 CACHE_ROOT = Path("/runner")
 BUILD_ROOT = CACHE_ROOT / "build"
-STATE_ROOT = Path("/tmp/manyforge-state")
+STATE_ROOT = Path(
+    os.environ.get("MANYFORGE_DEV_STATE_ROOT", "/tmp/manyforge-state")
+)
 HEADLESS_BUILD = BUILD_ROOT / "headless"
 SCENARIO_ROOT = CACHE_ROOT / "maintained-scenario-package"
 PACKAGE_ROOT = SCENARIO_ROOT / "retained-package"
@@ -245,6 +251,7 @@ def _load_scenario(scenario_id: str) -> dict[str, Any]:
         program = json.loads(program_path.read_text(encoding="utf-8"))
         graph = bundle["cell_graph"]
         runtime_units = graph["runtime_units"]
+        controllable_components = graph["controllable_components"]
     except (KeyError, OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
         raise WorkbenchError(
             f"maintained Scenario {scenario_id!r} is invalid: {error}"
@@ -261,6 +268,8 @@ def _load_scenario(scenario_id: str) -> dict[str, Any]:
         or not isinstance(runtime_units, list)
         or len(runtime_units) != 1
         or runtime_units[0].get("configuration", {}).get("mode") != "simulated"
+        or not isinstance(controllable_components, list)
+        or not controllable_components
     ):
         raise WorkbenchError(
             "maintained Scenario artifacts do not form one exact simulated tuple"
@@ -280,10 +289,25 @@ def _load_scenario(scenario_id: str) -> dict[str, Any]:
     _regular_file(
         NATIVE_CANDIDATE_WORKER, "candidate worker", executable=True
     )
+    component_ids = [
+        component.get("controllable_component_id")
+        if isinstance(component, dict)
+        else None
+        for component in controllable_components
+    ]
+    if (
+        any(not isinstance(item, str) or not item for item in component_ids)
+        or component_ids != sorted(component_ids)
+        or len(set(component_ids)) != len(component_ids)
+    ):
+        raise WorkbenchError(
+            "maintained Scenario controllable components are not canonical"
+        )
     return {
         "admission_filename": admission_filename,
         "build_profile": build_profile,
         "cell_id": graph["cell_id"],
+        "component_ids": component_ids,
         "deployment_artifact_id": row["deployment_artifact_id"],
         "deployment_revision": row["deployment_revision"],
         "graph_revision": graph["graph_revision"],
@@ -368,6 +392,288 @@ def _manager_projection_ready(
         and runtime.get("converged") is True
         and diff.get("converged") is True
     )
+
+
+def _active_configuration_matches(
+    active: object, desired: object
+) -> bool:
+    """Compare only the retained route fields; owner facts remain projections."""
+
+    if not isinstance(active, dict) or not isinstance(desired, dict):
+        return False
+    return active.get("state") == "reconciled" and all(
+        active.get(field) == desired.get(field)
+        for field in (
+            "control_domain_id",
+            "control_domain_revision",
+            "controller_topology_id",
+            "topology_revision",
+            "activation_set_id",
+            "binding_routes",
+        )
+    )
+
+
+def _expected_active_configuration(active: object) -> dict[str, Any]:
+    if active is None:
+        return {"presence": "absent"}
+    if not isinstance(active, dict):
+        raise WorkbenchError("CCLC active route is not an object")
+    identity = active.get("active_control_configuration_id")
+    generation = active.get("active_control_configuration_generation")
+    if not isinstance(identity, str) or not identity or type(generation) is not int:
+        raise WorkbenchError("CCLC active route identity is incomplete")
+    return {
+        "presence": "present",
+        "active_control_configuration_id": identity,
+        "active_control_configuration_generation": generation,
+    }
+
+
+def _lifecycle_expected_domains(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    domains = snapshot.get("domains")
+    if not isinstance(domains, list) or not domains:
+        raise WorkbenchError("CCLC component has no control domains")
+    expected: list[dict[str, Any]] = []
+    for domain in domains:
+        if not isinstance(domain, dict):
+            raise WorkbenchError("CCLC component contains an invalid control domain")
+        row = {
+            "control_domain_id": domain.get("control_domain_id"),
+            "control_domain_revision": domain.get("control_domain_revision"),
+            "controller_topology_id": domain.get("controller_topology_id"),
+            "topology_revision": domain.get("topology_revision"),
+            "expected_active_control_configuration": (
+                _expected_active_configuration(
+                    domain.get("active_control_configuration")
+                )
+            ),
+            "expected_control_bindings": domain.get("current_control_bindings"),
+        }
+        if any(
+            not isinstance(row[field], str) or not row[field]
+            for field in (
+                "control_domain_id",
+                "control_domain_revision",
+                "controller_topology_id",
+                "topology_revision",
+            )
+        ) or not isinstance(row["expected_control_bindings"], list):
+            raise WorkbenchError("CCLC control-domain identity is incomplete")
+        expected.append(row)
+    domain_ids = [row["control_domain_id"] for row in expected]
+    if domain_ids != sorted(domain_ids) or len(set(domain_ids)) != len(domain_ids):
+        raise WorkbenchError("CCLC control domains are not canonical")
+    return expected
+
+
+def _request_id(*parts: object) -> str:
+    digest = hashlib.sha256(
+        json.dumps(parts, separators=(",", ":"), ensure_ascii=True).encode()
+    ).hexdigest()[:32]
+    return f"development-scenario-start.{digest}"
+
+
+def _wait_for_cclc_terminal(
+    read_status: Callable[[str], dict[str, Any]],
+    transaction_id: object,
+    *,
+    label: str,
+    processes: Sequence[tuple[str, subprocess.Popen[bytes]]],
+) -> dict[str, Any]:
+    if not isinstance(transaction_id, str) or not transaction_id:
+        raise WorkbenchError(f"CCLC {label} omitted its transaction identity")
+    deadline = time.monotonic() + 20.0
+    while time.monotonic() < deadline:
+        for name, process in processes:
+            if process.poll() is not None:
+                raise WorkbenchError(
+                    f"{name} exited with status {process.returncode} while "
+                    f"waiting for CCLC {label}"
+                )
+        response = read_status(transaction_id)
+        status = response.get("status")
+        if status is None:
+            time.sleep(0.05)
+            continue
+        if not isinstance(status, dict):
+            raise WorkbenchError(f"CCLC {label} status is invalid")
+        result = status.get("terminal_result")
+        if result is None:
+            time.sleep(0.05)
+            continue
+        if result != "succeeded":
+            raise WorkbenchError(f"CCLC {label} failed: {result}")
+        return status
+    raise WorkbenchError(f"timed out waiting for CCLC {label}")
+
+
+def _converge_component(
+    client: HeadlessHttpClient,
+    component_id: str,
+    *,
+    scenario_id: str,
+    processes: Sequence[tuple[str, subprocess.Popen[bytes]]],
+) -> None:
+    """Bring one simulated Scenario component to its retained active route."""
+
+    snapshot = _wait_until(
+        f"CCLC component {component_id}",
+        lambda: client.cclc_component(component_id),
+        processes,
+        timeout_seconds=20.0,
+    )
+    owner = client.cclc_owner_identity().get("request_owner_epoch")
+    if not isinstance(owner, str) or not owner:
+        raise WorkbenchError("CCLC owner identity is unavailable")
+    for intent, expected_state in (("prepare", "prepared"), ("enable", "active")):
+        state = snapshot.get("component_lifecycle_state")
+        if state == "active" or state == expected_state:
+            continue
+        if state != ("declared" if intent == "prepare" else "prepared"):
+            raise WorkbenchError(
+                f"component {component_id} cannot start from lifecycle state {state!r}"
+            )
+        generation = snapshot.get("component_lifecycle_generation")
+        graph_revision = snapshot.get("graph_revision")
+        if type(generation) is not int or not isinstance(graph_revision, str):
+            raise WorkbenchError("CCLC component lifecycle fence is incomplete")
+        admission = client.authoring_admission().get("admission_generation")
+        if type(admission) is not int:
+            raise WorkbenchError("authoring admission generation is unavailable")
+        request_id = _request_id(
+            scenario_id, component_id, intent, graph_revision, generation
+        )
+        result = client.submit_component_lifecycle(
+            {
+                "request_context": {
+                    "request_id": request_id,
+                    "request_owner_epoch": owner,
+                    "source_label": "development_scenario_start",
+                    "correlation_id": scenario_id,
+                },
+                "controllable_component_id": component_id,
+                "intent": intent,
+                "expected_graph_revision": graph_revision,
+                "expected_component_lifecycle_generation": generation,
+                "expected_control_domains": _lifecycle_expected_domains(snapshot),
+                "reason": "start selected simulated development Scenario",
+                "confirmed": True,
+                "expected_admission_generation": admission,
+            }
+        )
+        acceptance = result.get("acceptance")
+        if not isinstance(acceptance, dict):
+            raise WorkbenchError(f"CCLC {intent} was not accepted")
+        _wait_for_cclc_terminal(
+            client.component_lifecycle_status,
+            acceptance.get("lifecycle_transaction_id"),
+            label=f"{component_id} {intent}",
+            processes=processes,
+        )
+        snapshot = client.cclc_component(component_id)
+        if snapshot.get("component_lifecycle_state") != expected_state:
+            raise WorkbenchError(
+                f"CCLC {component_id} did not become {expected_state}"
+            )
+
+    if snapshot.get("component_lifecycle_state") != "active":
+        raise WorkbenchError(f"CCLC component {component_id} is not active")
+    templates = client.cclc_route_templates(component_id)
+    rows = templates.get("templates")
+    if not isinstance(rows, list) or not rows:
+        raise WorkbenchError(f"CCLC component {component_id} has no route templates")
+    rows = sorted(
+        rows,
+        key=lambda row: row.get("desired_configuration", {}).get(
+            "control_domain_id", ""
+        ) if isinstance(row, dict) else "",
+    )
+    snapshot_domains = {
+        domain.get("control_domain_id"): domain
+        for domain in snapshot.get("domains", [])
+        if isinstance(domain, dict)
+    }
+    desired_rows = [
+        (
+            row,
+            row.get("desired_configuration")
+            if isinstance(row, dict)
+            else None,
+        )
+        for row in rows
+    ]
+    desired_domain_ids = [
+        desired.get("control_domain_id")
+        if isinstance(desired, dict)
+        else None
+        for _row, desired in desired_rows
+    ]
+    if desired_domain_ids != sorted(snapshot_domains):
+        raise WorkbenchError(
+            f"CCLC routes do not exactly cover component {component_id}"
+        )
+    for row, desired in desired_rows:
+        if not isinstance(row, dict) or not isinstance(desired, dict):
+            raise WorkbenchError(f"CCLC route for {component_id} is invalid")
+        domain_id = desired["control_domain_id"]
+        if _active_configuration_matches(
+            snapshot_domains[domain_id].get("active_control_configuration"),
+            desired,
+        ):
+            continue
+        request_id = _request_id(
+            scenario_id,
+            component_id,
+            domain_id,
+            templates.get("retained_bundle_id"),
+            templates.get("graph_revision"),
+            desired,
+            row.get("expected_active_control_configuration"),
+            row.get("component_expectations"),
+        )
+        result = client.submit_route_selection(
+            {
+                "request_context": {
+                    "request_id": request_id,
+                    "request_owner_epoch": owner,
+                    "source_label": "development_scenario_start",
+                    "correlation_id": scenario_id,
+                },
+                "expected_retained_bundle_id": templates.get(
+                    "retained_bundle_id"
+                ),
+                "expected_graph_revision": templates.get("graph_revision"),
+                "desired_configuration": desired,
+                "expected_active_control_configuration": row.get(
+                    "expected_active_control_configuration"
+                ),
+                "component_expectations": row.get("component_expectations"),
+                "confirmed": True,
+            }
+        )
+        acceptance = result.get("acceptance")
+        if not isinstance(acceptance, dict):
+            raise WorkbenchError(f"CCLC route {domain_id} was not accepted")
+        _wait_for_cclc_terminal(
+            client.route_selection_status,
+            acceptance.get("route_selection_transaction_id"),
+            label=f"route {domain_id}",
+            processes=processes,
+        )
+        snapshot = client.cclc_component(component_id)
+        snapshot_domains = {
+            domain.get("control_domain_id"): domain
+            for domain in snapshot.get("domains", [])
+            if isinstance(domain, dict)
+        }
+        if not _active_configuration_matches(
+            snapshot_domains.get(domain_id, {}).get(
+                "active_control_configuration"
+            ),
+            desired,
+        ):
+            raise WorkbenchError(f"CCLC route {domain_id} did not reconcile")
 
 
 def query_status(*, scenario_id: str | None, composer_port: int) -> dict[str, Any]:
@@ -571,10 +877,6 @@ class Workbench:
             with HeadlessHttpClient(base_url, timeout_seconds=0.5) as client:
                 admission = client.authoring_admission()
                 return admission if admission.get("authoring_allowed") is True else None
-
-        _wait_until(
-            "idle authoring admission", authoring_ready, self.processes
-        )
         composer_environment = os.environ.copy()
         composer_environment["MANYFORGE_CORS_ORIGINS"] = (
             f"http://localhost:{self.frontend_port},"
@@ -615,6 +917,17 @@ class Workbench:
             return result if result["ready"] else None
 
         _wait_until("exact current Scenario tuple", exact_status, self.processes)
+        with HeadlessHttpClient(base_url, timeout_seconds=1.0) as client:
+            for component_id in self.metadata["component_ids"]:
+                _converge_component(
+                    client,
+                    component_id,
+                    scenario_id=self.metadata["scenario_id"],
+                    processes=self.processes,
+                )
+        _wait_until(
+            "idle authoring admission", authoring_ready, self.processes
+        )
         vite_environment = os.environ.copy()
         vite_environment["MANYFORGE_COMPOSER_PROXY_TARGET"] = (
             f"http://127.0.0.1:{self.composer_port}"

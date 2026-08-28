@@ -337,8 +337,6 @@ build_headless_roboplan_producer_closure() {
         manyforge_native_execution_host
         manyforge_native_execution_host_pick_place_fixture
         manyforge_roboplan_candidate_worker
-        manyforge_run_native_stop_qualification
-        manyforge_run_native_stop_o1_4g_replacement_qualification
     )
     if ! cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" \
         --target "${producer_targets[@]}" -- -k; then
@@ -350,16 +348,7 @@ build_headless_roboplan_producer_closure() {
     for producer_input in \
         "$build/manyforge_native_execution_host" \
         "$build/manyforge_native_execution_host_pick_place_fixture" \
-        "$build/manyforge_roboplan_candidate_worker" \
-        "$build/manyforge_native_stop_qualification_runner" \
-        "$build/qualification/native_stop/implementation-build.json" \
-        "$build/qualification/native_stop/runner-contract.json" \
-        "$build/qualification/native_stop/implementation-evidence.json" \
-        "$build/qualification/native_stop/substitution-evidence.json" \
-        "$build/qualification/native_stop_o1_4g_replacement/implementation-build.json" \
-        "$build/qualification/native_stop_o1_4g_replacement/runner-contract.json" \
-        "$build/qualification/native_stop_o1_4g_replacement/implementation-evidence.json" \
-        "$build/qualification/native_stop_o1_4g_replacement/substitution-evidence.json"; do
+        "$build/manyforge_roboplan_candidate_worker"; do
         if [[ ! -f "$producer_input" ]]; then
             echo -e "${RED}  FAIL: RoboPlan producer closure did not create ${producer_input}${NC}"
             return 1

@@ -140,27 +140,9 @@ namespace {
            std::nullopt, std::nullopt, Contract()}};
 }
 
-[[nodiscard]] ControlledStopSubstitutionQualificationDTO Substitution() {
-  return {Contract(),
-          ProductId("runtime.product"),
-          ProductContractId("runtime.contract"),
-          ProductContractRevision(Digest('3')),
-          MotionControlledStopMode::kSoftOnPath,
-          MotionControlledStopMode::kSpringBackHold,
-          Artifact(std::string(kControlledStopSubstitutionQualificationArtifactRole),
-                   std::string(kControlledStopSubstitutionQualificationMediaType), '6')};
-}
-
-[[nodiscard]] StopImplementationQualificationDTO HardQualification() {
-  return {RegisteredStopCommandKindId("manyforge.stop.software_hard"),
-          Contract(),
-          ProductId("runtime.product"),
-          ProductContractId("runtime.contract"),
-          ProductContractRevision(Digest('3')),
-          EndpointRoleId("command.stop"),
-          StopInvocationLaneId("lane.hard"),
-          Artifact(std::string(kStopImplementationQualificationArtifactRole),
-                   std::string(kStopImplementationQualificationMediaType), '7')};
+[[nodiscard]] ControlledStopSubstitutionContractDTO Substitution() {
+  return {Contract(), MotionControlledStopMode::kSoftOnPath,
+          MotionControlledStopMode::kSpringBackHold};
 }
 
 [[nodiscard]] ResolvedStopEscalationStageDTO NominalStage() {
@@ -173,8 +155,8 @@ namespace {
           {StopBudgetPhaseId("phase.nominal.command"),
            StopContainmentCommandKind::kMotionControlledStop, Contract(), std::nullopt},
           std::move(parameters),
-          {StopActionClass::kControlled, Substitution(), std::nullopt, std::nullopt, std::nullopt,
-           std::nullopt, std::nullopt},
+          {StopActionClass::kControlled, Substitution(), std::nullopt,
+           std::nullopt, std::nullopt, std::nullopt},
           Target("command.stop", "command.stop"),
           ResolvedStopResourceContainmentScopeDTO{ActivationSetId("activation.main"),
                                                   {ResourceId("joint.1"), ResourceId("joint.2")}},
@@ -190,7 +172,7 @@ namespace {
           {StopBudgetPhaseId("phase.hard.command"), StopContainmentCommandKind::kRegistered,
            Contract(), RegisteredStopCommandKindId("manyforge.stop.software_hard")},
           JsonObjectDTO{},
-          {StopActionClass::kSoftwareHard, std::nullopt, HardQualification(), std::nullopt,
+          {StopActionClass::kSoftwareHard, std::nullopt, std::nullopt,
            std::nullopt, std::nullopt, std::nullopt},
           Target("command.stop", "command.stop"),
           ResolvedStopControllerSetContainmentScopeDTO{
@@ -208,7 +190,7 @@ namespace {
           {StopBudgetPhaseId("phase.safety.command"), StopContainmentCommandKind::kRegistered,
            Contract(), RegisteredStopCommandKindId("manyforge.stop.safety.protective_request")},
           JsonObjectDTO{},
-          {StopActionClass::kSafetySystemRequest, std::nullopt, std::nullopt,
+          {StopActionClass::kSafetySystemRequest, std::nullopt,
            SafetySystemRequestActionClass::kProtectiveStopRequest,
            CommissionedStopInterfaceId("stop.interface.protective"),
            CommissionedStopInterfaceRevision(Digest('5')),
@@ -267,7 +249,7 @@ namespace {
   auto candidate = Candidate();
   auto& nominal = candidate.escalation_stages.front();
   nominal.containment_command.provider_contract_ref = MotionContract();
-  nominal.command_qualification.controlled_substitution_qualification->provider_contract_ref =
+  nominal.command_qualification.controlled_substitution_contract->provider_contract_ref =
       MotionContract();
   JsonValueDTO::Array limits;
   for (const auto& resource : {std::string("joint.1"), std::string("joint.2")}) {
@@ -345,9 +327,9 @@ TEST(ResolvedStopBasePlanCodec, EmitsStableCanonicalBytesAndOwnIdentity) {
 
   // These two constants are the cross-language normalized-byte/ID golden.
   EXPECT_EQ(plan.resolved_stop_base_plan_id.value(),
-            "sha256:7925f1252ed74fc0e1e464aa56879e6f36eebd1bd43e5a2b14d867f64e46185a");
+            "sha256:ba4b37bfaa312d688ea229a4ba4d516fd2a519c3a9dc82e43e275366769a367a");
   EXPECT_EQ(content_identity::sha256_digest(encoded.value()),
-            "sha256:f7fd360e484c5e84e2a3feb30eb95f62d0a7fbe64f64f8215fadacdd46832e77");
+            "sha256:6580fa0212890c5f6714fffc367c7f2488e893e016acae5e7e68993458b0e819");
 }
 
 TEST(ResolvedStopBasePlanCodec, OwnIdIsOmittedAndEverySemanticJoinRotatesIt) {
@@ -394,7 +376,7 @@ TEST(ResolvedStopBasePlanCodec, DecodesOnlyTheExactCanonicalClosedWireObject) {
                                                       "\"source_sequence\":11.5,"))
                    .ok());
   EXPECT_FALSE(DecodeResolvedStopBasePlan(
-                   ReplaceOnce(encoded.value(), "\"resolved_stop_base_plan_id\":\"sha256:7925",
+                   ReplaceOnce(encoded.value(), "\"resolved_stop_base_plan_id\":\"sha256:ba4b",
                                "\"resolved_stop_base_plan_id\":\"sha256:0925"))
                    .ok());
   EXPECT_FALSE(
@@ -493,10 +475,6 @@ TEST(ResolvedStopBasePlanCodec, RejectsConditionalEndpointAndOverlayFields) {
   complete.site_overlay_value_ref = SiteOverlayValueRef("robot.service");
   EXPECT_TRUE(MakeResolvedStopBasePlan(std::move(complete_overlay)).ok());
 
-  auto mismatched_floor_product = Candidate();
-  mismatched_floor_product.escalation_stages.back().command_target.product_id =
-      ProductId("runtime.other");
-  EXPECT_FALSE(MakeResolvedStopBasePlan(std::move(mismatched_floor_product)).ok());
 }
 
 TEST(ResolvedStopBasePlanCodec, RejectsSourceAndQualificationConfusion) {
@@ -525,15 +503,9 @@ TEST(ResolvedStopBasePlanCodec, RejectsSourceAndQualificationConfusion) {
       .resolved_source.state_authority_class = StateAuthorityClass::kPredicted;
   EXPECT_FALSE(MakeResolvedStopBasePlan(std::move(wrong_authority)).ok());
 
-  auto missing_floor_evidence = Candidate();
-  missing_floor_evidence.escalation_stages.back()
-      .command_qualification.software_hard_implementation_qualification.reset();
-  EXPECT_FALSE(MakeResolvedStopBasePlan(std::move(missing_floor_evidence)).ok());
-
   auto false_controlled_floor = Candidate();
   false_controlled_floor.escalation_stages.back().command_qualification = {
       StopActionClass::kControlled,
-      std::nullopt,
       std::nullopt,
       std::nullopt,
       std::nullopt,
@@ -717,9 +689,9 @@ TEST(PreparedParticipantStopPlanCodec, FreezesProfileMappingAndDeploymentDefault
             std::string::npos);
   EXPECT_NE(encoded.value().find("\"parameter_source\":\"deployment_default\""), std::string::npos);
   EXPECT_EQ(content_identity::sha256_digest(encoded.value()),
-            "sha256:224ef0c92d079c2d0aea04d623eefaa6491698f5c125c32d5bad700cfc59f92d");
+            "sha256:d31024e63864c16891f69fe14b18745330220924a991a90acc6c93d498164d4a");
   EXPECT_EQ(plan.participant_stop_invocation_plan_digest.value(),
-            "sha256:310d4c2cb98928f33f75481ada8aa3b97fd1ec38cbec399ea3c46fed275c5a17");
+            "sha256:c7a5c39cf6ddb3f5a7aa6ea9e142cc0824a9f69e1f7285e74c479dbafdaa6f8f");
 }
 
 TEST(PreparedParticipantStopPlanCodec, KeepsOrdinaryAndScopePlansDistinctAndRejectsForgery) {
@@ -780,7 +752,7 @@ TEST(PreparedParticipantStopPlanCodec, RejectsPurposeCoverageAndSubstitutionConf
 
   auto unqualified_base = PreparedBasePlan();
   unqualified_base.escalation_stages.front()
-      .command_qualification.controlled_substitution_qualification.reset();
+      .command_qualification.controlled_substitution_contract.reset();
   auto made_unqualified = MakeResolvedStopBasePlan(std::move(unqualified_base));
   ASSERT_TRUE(made_unqualified.ok());
   EXPECT_FALSE(MakePreparedParticipantStopPlan(made_unqualified.value(), PreparedContext(),

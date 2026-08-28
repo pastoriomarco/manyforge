@@ -1618,12 +1618,8 @@ def test_public_stop_contract_dtos_are_typed_and_authority_rows_are_read_only():
     with pytest.raises(AttributeError):
         definitions[-1].stop_action_class = core.StopActionClass.kControlled
 
-    for authority_type in (
-        core.StopImplementationQualificationDTO,
-        core.ControlledStopSubstitutionQualificationDTO,
-    ):
-        with pytest.raises(TypeError):
-            authority_type()
+    with pytest.raises(TypeError):
+        core.ControlledStopSubstitutionContractDTO()
 
 
 def test_graph_dto_constructors_do_not_coerce_raw_strings_to_strong_ids():
@@ -2086,8 +2082,9 @@ def test_assistant_compiler_projection_is_exact_read_only_and_bounded():
         "tree_draft_change_node_kind",
         "tree_draft_delete_node",
         "tree_draft_insert_node",
-        "tree_draft_move_node",
-        "tree_draft_replace_subtree",
+            "tree_draft_move_node",
+            "tree_draft_rename_node",
+            "tree_draft_replace_subtree",
         "tree_draft_update_node_params",
         "tree_draft_wrap_node",
     ]

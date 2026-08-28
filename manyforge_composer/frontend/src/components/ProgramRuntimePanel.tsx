@@ -188,12 +188,6 @@ export function ProgramRuntimePanel({
           </span>
         </div>
       )}
-      {state.error && (
-        <div className="program-feedback error-state" role="alert">
-          <span>{state.error}</span>
-        </div>
-      )}
-
       {enabled && recoveryOffer !== null && (
         <section className="runtime-control-section" aria-labelledby="runtime-recovery-title">
           <div className="runtime-control-heading">
@@ -526,11 +520,6 @@ export function ProgramTransportControls({
 
   return (
     <>
-      {state.error && (
-        <div className="viewer-transport-feedback error-state" role="alert">
-          {state.error}
-        </div>
-      )}
       <div className="viewer-transport" aria-label="Program and motion controls">
         <button
           type="button"

@@ -158,10 +158,10 @@ def test_resolved_stop_base_plan_golden_is_shared_exactly_with_cpp() -> None:
 
     plan_id = mf.verify_resolved_stop_base_plan_canonical_bytes(canonical_bytes)
     assert plan_id == mf.ResolvedStopBasePlanId(
-        "sha256:7925f1252ed74fc0e1e464aa56879e6f36eebd1bd43e5a2b14d867f64e46185a"
+        "sha256:ba4b37bfaa312d688ea229a4ba4d516fd2a519c3a9dc82e43e275366769a367a"
     )
     assert hashlib.sha256(canonical_bytes).hexdigest() == (
-        "f7fd360e484c5e84e2a3feb30eb95f62d0a7fbe64f64f8215fadacdd46832e77"
+        "6580fa0212890c5f6714fffc367c7f2488e893e016acae5e7e68993458b0e819"
     )
 
     with pytest.raises(ValueError):

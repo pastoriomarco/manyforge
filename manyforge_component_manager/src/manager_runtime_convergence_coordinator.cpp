@@ -158,15 +158,13 @@ VerifyRuntimeProducts(
            runtime_unit.runtime_unit_id.value());
     }
     const auto *contract =
-        manyforge::deployment::build_qualified_runtime_contract_registry()
+        manyforge::deployment::runtime_contract_declaration_registry()
             .find(runtime_unit.runtime_profile_id,
                   runtime_unit.runtime_profile_revision,
                   product->product_contract_id(),
                   product->product_contract_revision());
-    if (contract == nullptr ||
-        requirement_row->requirement.runtime_implementation_id !=
-            contract->offer().runtime_implementation_id) {
-      Fail("runtime unit has no selected build-qualified contract offer: " +
+    if (contract == nullptr) {
+      Fail("runtime unit has no selected component contract offer: " +
            runtime_unit.runtime_unit_id.value());
     }
     const auto compatible = manyforge::core::CheckRuntimeContractCompatibility(
@@ -191,18 +189,14 @@ VerifyRuntimeProducts(
 [[nodiscard]] bool CompatibleRuntimeSuccessor(
     const RuntimeUnitConvergencePlanRowDTO &predecessor,
     const RuntimeUnitConvergencePlanRowDTO &candidate) {
-  // Product/configuration and executable-derived identities deliberately do
-  // not participate in predecessor/successor compatibility. Each bundle was
-  // already verified against its own exact product, bindings, endpoints, and
-  // configuration, and each requirement was independently admitted against
-  // the selected immutable package offer. Runtime reports must still match
-  // the exact candidate facts before staged readiness. This predicate owns
-  // only stable unit/lifecycle continuity and implementation-family
-  // compatibility; adapters retain independent launch-target integrity.
+  // Each bundle was already verified against its own exact product, bindings,
+  // endpoints, configuration, semantic requirement, and selected offer.
+  // Runtime reports must still match the exact candidate facts before staged
+  // readiness. Predecessor/successor continuity therefore owns only the stable
+  // runtime-unit and lifecycle placement; implementation family, product and
+  // executable identities are diagnostic/replacement facts, not compatibility.
   return predecessor.runtime_unit_id == candidate.runtime_unit_id &&
-         predecessor.lifecycle_control == candidate.lifecycle_control &&
-         predecessor.runtime_contract_requirement.runtime_implementation_id ==
-             candidate.runtime_contract_requirement.runtime_implementation_id;
+         predecessor.lifecycle_control == candidate.lifecycle_control;
 }
 
 [[nodiscard]] std::vector<RuntimeUnitConvergencePlanRowDTO> BuildCandidatePlan(
@@ -642,8 +636,6 @@ ManagerApplyRuntimeConvergenceCoordinator::ConvergeOrRecover(
     if (!query.valid()) {
       Fail("Manager produced an invalid runtime convergence query");
     }
-    RequireRuntimeContractAdmission(query.plan);
-
     ProcessPresenceObservation process =
         ObserveProcessSafely(process_port_, query);
     IngestObservedPresence(reducer, query, process);

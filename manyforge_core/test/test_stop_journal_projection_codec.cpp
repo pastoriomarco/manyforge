@@ -138,7 +138,6 @@ inline constexpr char kDigestB[] =
                                        ParticipantStopStageOutcomeDTO::kSucceeded,
                                        MotionControlledStopMode::kSoftOnPath,
                                        std::nullopt,
-                                       std::nullopt,
                                        3U,
                                        provider_runtime_epoch,
                                        9U,

@@ -11,9 +11,7 @@
 #include <array>
 #include <algorithm>
 #include <filesystem>
-#include <fstream>
 #include <iostream>
-#include <iterator>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -25,7 +23,6 @@
 #include "content_identity_internal.hpp"
 #include "lite6_controllable_retention_fixture.hpp"
 #include "retained_bundle_internal.hpp"
-#include "stop_qualification_evidence_internal.hpp"
 
 namespace {
 
@@ -35,78 +32,25 @@ namespace deployment = manyforge::deployment;
 constexpr std::string_view kZeroDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
-struct StopQualificationInputPaths final {
-  std::filesystem::path implementation_build;
-  std::filesystem::path installed_target;
-  std::filesystem::path runner_contract;
-  std::filesystem::path runner_executable;
-  std::filesystem::path implementation_evidence;
-  std::filesystem::path substitution_evidence;
-};
-
 struct Arguments final {
   std::filesystem::path package_root;
   std::filesystem::path metadata_path;
-  StopQualificationInputPaths stop_qualification;
   bool assistant_native;
 };
 
 [[nodiscard]] Arguments ParseArguments(const int argc, char **argv) {
-  if ((argc != 17 && argc != 19) ||
+  if ((argc != 5 && argc != 7) ||
       std::string_view(argv[1]) != "--package-root" ||
       std::string_view(argv[2]).empty() ||
       std::string_view(argv[3]) != "--metadata" ||
       std::string_view(argv[4]).empty() ||
-      std::string_view(argv[5]) != "--stop-implementation-build" ||
-      std::string_view(argv[6]).empty() ||
-      std::string_view(argv[7]) != "--stop-installed-target" ||
-      std::string_view(argv[8]).empty() ||
-      std::string_view(argv[9]) != "--stop-runner-contract" ||
-      std::string_view(argv[10]).empty() ||
-      std::string_view(argv[11]) != "--stop-runner-executable" ||
-      std::string_view(argv[12]).empty() ||
-      std::string_view(argv[13]) != "--stop-implementation-evidence" ||
-      std::string_view(argv[14]).empty() ||
-      std::string_view(argv[15]) != "--stop-substitution-evidence" ||
-      std::string_view(argv[16]).empty() ||
-      (argc == 19 && (std::string_view(argv[17]) != "--profile" ||
-                      std::string_view(argv[18]) != "assistant-native"))) {
+      (argc == 7 && (std::string_view(argv[5]) != "--profile" ||
+                     std::string_view(argv[6]) != "assistant-native"))) {
     throw std::invalid_argument(
         "usage: generate_manager_apply_package --package-root <path> "
-        "--metadata <path> --stop-implementation-build <path> "
-        "--stop-installed-target <path> --stop-runner-contract <path> "
-        "--stop-runner-executable <path> "
-        "--stop-implementation-evidence <path> "
-        "--stop-substitution-evidence <path> "
-        "[--profile assistant-native]");
+        "--metadata <path> [--profile assistant-native]");
   }
-  return {argv[2],
-          argv[4],
-          {argv[6], argv[8], argv[10], argv[12], argv[14], argv[16]},
-          argc == 19};
-}
-
-[[nodiscard]] std::string ReadExactFile(const std::filesystem::path &path) {
-  std::ifstream stream(path, std::ios::binary);
-  if (!stream) {
-    throw std::runtime_error("cannot read Manager Apply fixture input: " +
-                             path.string());
-  }
-  return {std::istreambuf_iterator<char>(stream),
-          std::istreambuf_iterator<char>()};
-}
-
-[[nodiscard]] std::string
-ReadQualificationDocument(const std::filesystem::path &path) {
-  auto bytes = ReadExactFile(path);
-  if (bytes.empty() ||
-      bytes.size() > deployment::detail::kMaxStopQualificationEvidenceBytes) {
-    throw std::runtime_error(
-        "Manager Apply native Stop qualification input violates its byte "
-        "bound: " +
-        path.string());
-  }
-  return bytes;
+  return {argv[2], argv[4], argc == 7};
 }
 
 [[nodiscard]] deployment::RetentionQualifiedDeployment CompileEmpty(
@@ -440,28 +384,6 @@ int main(int argc, char **argv) {
       throw std::logic_error(
           "Manager Apply fixture lacks its native runtime profile");
     }
-    const auto &qualification_paths = arguments.stop_qualification;
-    auto installed_target =
-        ReadExactFile(qualification_paths.installed_target);
-    auto runner_executable =
-        ReadExactFile(qualification_paths.runner_executable);
-    if (installed_target.empty() || runner_executable.empty()) {
-      throw std::runtime_error(
-          "Manager Apply native Stop executable input is empty");
-    }
-    const deployment::detail::StopQualificationEvidenceCandidate
-        stop_qualification(
-            ReadQualificationDocument(qualification_paths.implementation_build),
-            std::move(installed_target),
-            ReadQualificationDocument(qualification_paths.runner_contract),
-            std::move(runner_executable),
-            ReadQualificationDocument(
-                qualification_paths.implementation_evidence),
-            ReadQualificationDocument(
-                qualification_paths.substitution_evidence));
-    const std::span<
-        const deployment::detail::StopQualificationEvidenceCandidate>
-        stop_qualifications(&stop_qualification, 1U);
     const std::array<deployment::QualifiedRuntimeProfile, 1U> profiles{
         *source.native_execution_runtime_profile};
     const auto predecessor_source =
@@ -479,7 +401,7 @@ int main(int argc, char **argv) {
     auto predecessor = deployment::detail::RetainedBundleMaterializer::
         materialize_store_and_reload_production(
             CompileEmpty(predecessor_source, profiles), manifests, input_source,
-            {}, catalogs, raw_artifacts, bundles, stop_qualifications);
+            {}, catalogs, raw_artifacts, bundles);
     std::shared_ptr<const deployment::RetainedBundle> candidate;
     if (!arguments.assistant_native) {
       const auto candidate_source =
@@ -487,13 +409,12 @@ int main(int argc, char **argv) {
       candidate = deployment::detail::RetainedBundleMaterializer::
           materialize_store_and_reload_production(
               CompileEmpty(candidate_source, profiles), manifests, input_source,
-              {}, catalogs, raw_artifacts, bundles, stop_qualifications);
+              {}, catalogs, raw_artifacts, bundles);
     }
     auto physical_candidate = deployment::detail::RetainedBundleMaterializer::
         materialize_store_and_reload_production(
             source.qualified, manifests, input_source,
-            source.structural_preparations(), catalogs, raw_artifacts, bundles,
-            stop_qualifications);
+            source.structural_preparations(), catalogs, raw_artifacts, bundles);
     if (predecessor == nullptr || physical_candidate == nullptr ||
         (!arguments.assistant_native && candidate == nullptr) ||
         (candidate != nullptr &&

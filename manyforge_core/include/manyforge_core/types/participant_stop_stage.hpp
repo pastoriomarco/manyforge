@@ -119,9 +119,8 @@ struct ParticipantStopStageResultDTO final {
       StopStageAttemptDispositionDTO::kNotDispatched};
   ParticipantStopStageOutcomeDTO outcome{ParticipantStopStageOutcomeDTO::kFailed};
   std::optional<MotionControlledStopMode> actual_provider_contract_mode;
-  std::optional<ControlledStopSubstitutionQualificationDTO> actual_provider_contract_provenance;
-  /// Required exactly when the retained-qualified actual mode differs from
-  /// the prepared requested mode; forbidden otherwise.
+  /// Required exactly when an allowed actual mode differs from the prepared
+  /// requested mode; forbidden otherwise.
   std::optional<std::string> recoverable_substitution_reason;
   std::optional<std::uint64_t> controller_acknowledgement_sequence;
   std::optional<RuntimeEpoch> source_epoch;

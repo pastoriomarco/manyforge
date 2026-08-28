@@ -181,7 +181,6 @@ struct ExactFixture final {
                                        ParticipantStopStageOutcomeDTO::kSucceeded,
                                        MotionControlledStopMode::kSoftOnPath,
                                        std::nullopt,
-                                       std::nullopt,
                                        3U,
                                        RuntimeEpoch("provider.epoch"),
                                        9U,
@@ -368,17 +367,13 @@ TEST(ParticipantStopStageTest, RejectsFailureWithoutStableErrorOrTerminalEvidenc
   EXPECT_FALSE(ValidateResult(fixture, result).ok());
 }
 
-TEST(ParticipantStopStageTest, AllowsModeWithoutSubstitutionProvenanceButRejectsFalseProvenance) {
+TEST(ParticipantStopStageTest, RequiresAnExplainedDeclaredSubstitution) {
   const auto fixture = Fixture();
   auto result = Success(fixture.stage);
   EXPECT_TRUE(ValidateResult(fixture, result).ok());
 
   ASSERT_TRUE(fixture.base.escalation_stages.front()
-                  .command_qualification.controlled_substitution_qualification.has_value());
-  result.actual_provider_contract_provenance =
-      fixture.base.escalation_stages.front()
-          .command_qualification.controlled_substitution_qualification;
-  EXPECT_FALSE(ValidateResult(fixture, result).ok());
+                  .command_qualification.controlled_substitution_contract.has_value());
 
   result.actual_provider_contract_mode = MotionControlledStopMode::kSpringBackHold;
   result.recoverable_substitution_reason = "qualified_spring_back";

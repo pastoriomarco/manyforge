@@ -631,8 +631,6 @@ Result<void> ValidateParticipantStopStageResult(
   if (!known(result.attempt_disposition) || !known(result.outcome) ||
       result.receiver_elapsed_duration_ns < 0 ||
       result.receiver_elapsed_duration_ns > kMaximumStopDurationNs ||
-      (result.actual_provider_contract_provenance.has_value() &&
-       !result.actual_provider_contract_mode.has_value()) ||
       (result.recoverable_substitution_reason.has_value() &&
        !motion_interrupt_stop_profile_id_valid(*result.recoverable_substitution_reason)) ||
       result.source_epoch.has_value() != result.source_sequence.has_value() ||
@@ -653,14 +651,13 @@ Result<void> ValidateParticipantStopStageResult(
     return invalid("participant_stop_stage_result_source_epoch_invalid");
   }
   const auto expected_mode = requested_mode(*command);
-  if (!expected_mode.has_value() && (result.actual_provider_contract_mode.has_value() ||
-                                     result.actual_provider_contract_provenance.has_value() ||
-                                     result.recoverable_substitution_reason.has_value())) {
+  if (!expected_mode.has_value() &&
+      (result.actual_provider_contract_mode.has_value() ||
+       result.recoverable_substitution_reason.has_value())) {
     return invalid("participant_stop_stage_result_mode_not_defined");
   }
   if (result.attempt_disposition == StopStageAttemptDispositionDTO::kNotDispatched &&
       (result.actual_provider_contract_mode.has_value() ||
-       result.actual_provider_contract_provenance.has_value() ||
        result.recoverable_substitution_reason.has_value() ||
        result.controller_acknowledgement_sequence.has_value() || result.source_epoch.has_value())) {
     return invalid("participant_stop_stage_not_dispatched_evidence_invalid");
@@ -670,21 +667,20 @@ Result<void> ValidateParticipantStopStageResult(
       return invalid("participant_stop_stage_result_mode_invalid");
     }
     if (*result.actual_provider_contract_mode == *expected_mode) {
-      if (result.actual_provider_contract_provenance.has_value() ||
-          result.recoverable_substitution_reason.has_value()) {
+      if (result.recoverable_substitution_reason.has_value()) {
         return invalid("participant_stop_stage_unneeded_substitution_provenance");
       }
     } else {
-      const auto& qualification =
-          command->resolved_stage.command_qualification.controlled_substitution_qualification;
+      const auto& contract =
+          command->resolved_stage.command_qualification
+              .controlled_substitution_contract;
       const auto& profile = result.request.participant_stop_plan.participant_stop_profile;
-      if (!result.actual_provider_contract_provenance.has_value() ||
-          !result.recoverable_substitution_reason.has_value() || !qualification.has_value() ||
-          *result.actual_provider_contract_provenance != *qualification || !profile.has_value() ||
+      if (!result.recoverable_substitution_reason.has_value() ||
+          !contract.has_value() || !profile.has_value() ||
           profile->stop_mode != MotionInterruptStopMode::kSoftOnPath ||
           profile->recoverable_substitution_mode != MotionInterruptStopMode::kSpringBackHold ||
-          qualification->requested_stop_mode != *expected_mode ||
-          qualification->executed_stop_mode != *result.actual_provider_contract_mode) {
+          contract->requested_stop_mode != *expected_mode ||
+          contract->executed_stop_mode != *result.actual_provider_contract_mode) {
         return invalid("participant_stop_stage_substitution_unqualified");
       }
     }

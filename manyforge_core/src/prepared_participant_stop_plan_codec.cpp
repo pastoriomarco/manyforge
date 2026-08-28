@@ -577,8 +577,8 @@ Result<PreparedParticipantStopPlanDTO> MakePreparedParticipantStopPlan(
         fail("participant profile does not select the qualified motion contract");
       }
       if (context.participant_stop_profile->recoverable_substitution_mode.has_value() &&
-          !nominal.command_qualification.controlled_substitution_qualification.has_value()) {
-        fail("participant profile requests an unqualified substitution");
+          !nominal.command_qualification.controlled_substitution_contract.has_value()) {
+        fail("participant profile requests an unsupported substitution");
       }
       auto mapped = map_motion_interrupt_stop_profile_to_contract_parameters(
           *context.participant_stop_profile, context.node_category, resources,

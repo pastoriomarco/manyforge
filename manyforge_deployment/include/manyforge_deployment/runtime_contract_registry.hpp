@@ -32,12 +32,12 @@ struct RuntimeContractEndpointApiMapping final {
                          const RuntimeContractEndpointApiMapping&) = default;
 };
 
-/// One immutable build-qualified implementation/product declaration.
+/// One immutable component-owned implementation/product declaration.
 ///
 /// The declaration is code-owned and cannot be supplied by a deployment or
 /// runtime process.  Its offer is generated once and is used for both the
 /// package manifest-set and the embedded runtime manifest artifact.
-class BuildQualifiedRuntimeContract final {
+class RuntimeContractDeclaration final {
  public:
   [[nodiscard]] const core::RuntimeProfileId& runtime_profile_id()
       const noexcept {
@@ -68,7 +68,7 @@ class BuildQualifiedRuntimeContract final {
   }
 
  private:
-  BuildQualifiedRuntimeContract(
+  RuntimeContractDeclaration(
       core::RuntimeProfileId runtime_profile_id,
       core::RuntimeProfileRevision runtime_profile_revision,
       core::ProductContractId runtime_product_id,
@@ -87,17 +87,17 @@ class BuildQualifiedRuntimeContract final {
   std::vector<RuntimeContractEndpointApiMapping>
       source_endpoint_api_mappings_;
 
-  friend class BuildQualifiedRuntimeContractRegistry;
+  friend class RuntimeContractDeclarationRegistry;
 };
 
-/// Deployment-owned single source of maintained runtime offers.
-class BuildQualifiedRuntimeContractRegistry final {
+/// Generated aggregate of the component-owned runtime declarations.
+class RuntimeContractDeclarationRegistry final {
  public:
-  [[nodiscard]] std::span<const BuildQualifiedRuntimeContract> contracts()
+  [[nodiscard]] std::span<const RuntimeContractDeclaration> contracts()
       const noexcept {
     return contracts_;
   }
-  [[nodiscard]] const BuildQualifiedRuntimeContract* find(
+  [[nodiscard]] const RuntimeContractDeclaration* find(
       const core::RuntimeProfileId& runtime_profile_id,
       const core::RuntimeProfileRevision& runtime_profile_revision,
       const core::ProductContractId& runtime_product_id,
@@ -109,18 +109,18 @@ class BuildQualifiedRuntimeContractRegistry final {
   }
 
  private:
-  BuildQualifiedRuntimeContractRegistry();
-  [[nodiscard]] static std::vector<BuildQualifiedRuntimeContract> make_rows();
+  RuntimeContractDeclarationRegistry();
+  [[nodiscard]] static std::vector<RuntimeContractDeclaration> make_rows();
 
-  std::vector<BuildQualifiedRuntimeContract> contracts_;
+  std::vector<RuntimeContractDeclaration> contracts_;
   core::RuntimeContractManifestSetDTO package_manifest_set_;
 
-  friend const BuildQualifiedRuntimeContractRegistry&
-  build_qualified_runtime_contract_registry();
+  friend const RuntimeContractDeclarationRegistry&
+  runtime_contract_declaration_registry();
 };
 
-[[nodiscard]] const BuildQualifiedRuntimeContractRegistry&
-build_qualified_runtime_contract_registry();
+[[nodiscard]] const RuntimeContractDeclarationRegistry&
+runtime_contract_declaration_registry();
 
 namespace detail {
 
@@ -133,14 +133,14 @@ namespace detail {
 decode_runtime_contract_offer_projection(const CanonicalValue& value,
                                          std::string_view field);
 
-[[nodiscard]] const BuildQualifiedRuntimeContract&
+[[nodiscard]] const RuntimeContractDeclaration&
 require_runtime_contract(
     const core::RuntimeProfileId& runtime_profile_id,
     const core::RuntimeProfileRevision& runtime_profile_revision,
     const core::ProductContractId& runtime_product_id,
     const core::ProductContractRevision& runtime_product_revision);
 
-[[nodiscard]] const BuildQualifiedRuntimeContract&
+[[nodiscard]] const RuntimeContractDeclaration&
 require_runtime_contract_for_unit(const core::RuntimeUnitDTO& runtime_unit);
 
 [[nodiscard]] std::vector<core::RetainedRuntimeContractRequirementDTO>

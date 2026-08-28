@@ -64,7 +64,7 @@ inline constexpr std::size_t kMaxReferenceRuntimeLaunchableBytes = 4U * 1024U;
 /// Stable bundle-local product identity for one exact runtime unit.
 [[nodiscard]] std::string reference_runtime_product_id(const core::RuntimeUnitId& runtime_unit_id);
 
-/// Emit the exact build-qualified runtime manifest for the reference row.
+/// Emit the exact component-declared runtime manifest for the reference row.
 [[nodiscard]] std::string emit_reference_runtime_manifest(
     const CompilerQualifiedCellIr& compiler_ir, const core::RuntimeUnitId& runtime_unit_id);
 

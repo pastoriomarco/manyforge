@@ -123,7 +123,6 @@ export interface ProgramContactGraspBodyBinding {
 }
 export interface ProgramBindingProvenance {
   binding_compiler_contract_digest: string;
-  binding_compiler_build_digest: string;
   role_assignment_digest: string;
   source_records: ProgramBindingProvenanceRecord[];
   resolved_output_records: ProgramBindingProvenanceRecord[];

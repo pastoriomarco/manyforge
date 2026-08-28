@@ -19,7 +19,6 @@
 #include "build_manifest_internal.hpp"
 #include "content_identity_internal.hpp"
 #include "lite6_retained_consumer_fixture.hpp"
-#include "stop_qualification_evidence_internal.hpp"
 #include "verified_retained_bundle_internal.hpp"
 
 namespace manyforge::deployment {
@@ -56,204 +55,7 @@ private:
   std::filesystem::path path_;
 };
 
-[[nodiscard]] CanonicalValue replace_member(CanonicalValue value,
-                                            std::string_view name,
-                                            CanonicalValue replacement) {
-  auto object = value.as_object();
-  const auto found =
-      std::find_if(object.begin(), object.end(),
-                   [&](const auto &row) { return row.first == name; });
-  if (found == object.end()) {
-    throw std::logic_error("test canonical replacement target is absent");
-  }
-  found->second = std::move(replacement);
-  return CanonicalValue(std::move(object));
-}
-
-[[nodiscard]] CanonicalValue stop_build_input(std::string id,
-                                              std::string_view content) {
-  return CanonicalValue(CanonicalValue::Object{
-      {"input_id", CanonicalValue(std::move(id))},
-      {"content_digest", CanonicalValue(sha256_digest(content))},
-  });
-}
-
-struct TestStopBuildClosure final {
-  std::string bytes;
-  core::ContentDigest fingerprint;
-  std::string installed_target_bytes;
-};
-
-[[nodiscard]] TestStopBuildClosure make_stop_build_closure() {
-  const std::string target_bytes = "resolved-stop-plan-test-native-target";
-  CanonicalValue root(CanonicalValue::Object{
-      {"api_version", CanonicalValue(std::string(
-                          detail::kStopImplementationBuildClosureApiVersion))},
-      {"implementation_id", CanonicalValue("manyforge.native_execution_host")},
-      {"implementation_source_build_fingerprint",
-       CanonicalValue(std::string(kZeroDigest))},
-      {"source_inputs", CanonicalValue(CanonicalValue::Array{stop_build_input(
-                            "source:test", "source:resolved-stop-plan")})},
-      {"generated_semantic_inputs",
-       CanonicalValue(CanonicalValue::Array{
-           stop_build_input("semantic:test", "semantic:resolved-stop-plan")})},
-      {"build_inputs",
-       CanonicalValue(CanonicalValue::Array{
-           stop_build_input("abi:test", "abi:resolved-stop-plan"),
-           stop_build_input("compile:test", "compile:resolved-stop-plan"),
-           stop_build_input("link:test", "link:resolved-stop-plan"),
-           stop_build_input("toolchain:test", "toolchain:resolved-stop-plan"),
-       })},
-      {"installed_target",
-       CanonicalValue(CanonicalValue::Object{
-           {"installed_target_id",
-            CanonicalValue("manyforge_native_execution_host")},
-           {"byte_size",
-            CanonicalValue(static_cast<double>(target_bytes.size()))},
-           {"content_digest", CanonicalValue(sha256_digest(target_bytes))},
-       })},
-  });
-  const std::string fingerprint = detail::compute_content_identity(
-      root,
-      detail::ContentIdentitySpec{
-          .identity_domain = "stop-implementation-source-build-fingerprint",
-          .api_version =
-              std::string(detail::kStopImplementationBuildClosureApiVersion),
-          .own_field = "implementation_source_build_fingerprint",
-      });
-  root = replace_member(root, "implementation_source_build_fingerprint",
-                        CanonicalValue(fingerprint));
-  return {canonical_json(root), core::ContentDigest(fingerprint), target_bytes};
-}
-
-struct TestRunnerContract final {
-  std::string bytes;
-  core::ContentDigest digest;
-  std::string executable_bytes;
-};
-
-[[nodiscard]] TestRunnerContract make_runner_contract() {
-  const std::string executable_bytes = "resolved-stop-plan-test-runner";
-  CanonicalValue root(CanonicalValue::Object{
-      {"api_version", CanonicalValue(std::string(
-                          detail::kStopQualificationRunnerContractApiVersion))},
-      {"qualification_runner_contract_digest",
-       CanonicalValue(std::string(kZeroDigest))},
-      {"runner_id", CanonicalValue("manyforge.test.stop_runner")},
-      {"source_inputs",
-       CanonicalValue(CanonicalValue::Array{stop_build_input(
-           "source:test", "runner-source:resolved-stop-plan")})},
-      {"build_inputs",
-       CanonicalValue(CanonicalValue::Array{
-           stop_build_input("abi:test", "runner-abi:resolved-stop-plan"),
-           stop_build_input("compile:test",
-                            "runner-compile:resolved-stop-plan"),
-           stop_build_input("link:test", "runner-link:resolved-stop-plan"),
-           stop_build_input("toolchain:test",
-                            "runner-toolchain:resolved-stop-plan"),
-       })},
-      {"executable",
-       CanonicalValue(CanonicalValue::Object{
-           {"byte_size",
-            CanonicalValue(static_cast<double>(executable_bytes.size()))},
-           {"content_digest", CanonicalValue(sha256_digest(executable_bytes))},
-       })},
-      {"case_contract",
-       CanonicalValue(CanonicalValue::Object{
-           {"implementation_fault_cases",
-            CanonicalValue(CanonicalValue::Array{
-                CanonicalValue("nominal_provider_call_blocked"),
-                CanonicalValue("nominal_adapter_lock_blocked"),
-                CanonicalValue("nominal_result_wait_blocked"),
-            })},
-           {"controlled_substitution_cases",
-            CanonicalValue(CanonicalValue::Array{
-                CanonicalValue("selected_before_physical_dispatch"),
-                CanonicalValue("nominal_scope_preserved"),
-                CanonicalValue("nominal_stage_budget_preserved"),
-                CanonicalValue("requested_executed_reason_retained"),
-            })},
-       })},
-  });
-  const std::string digest = detail::compute_content_identity(
-      root, detail::ContentIdentitySpec{
-                .identity_domain = "stop-qualification-runner-contract-digest",
-                .api_version = std::string(
-                    detail::kStopQualificationRunnerContractApiVersion),
-                .own_field = "qualification_runner_contract_digest",
-            });
-  root = replace_member(root, "qualification_runner_contract_digest",
-                        CanonicalValue(digest));
-  return {canonical_json(root), core::ContentDigest(digest), executable_bytes};
-}
-
-[[nodiscard]] detail::StopQualificationEvidenceCandidate
-make_stop_evidence_candidate() {
-  const auto build = make_stop_build_closure();
-  const auto runner = make_runner_contract();
-  const auto product_revision =
-      detail::native_execution_runtime_product_contract_revision();
-  const detail::BuildQualifiedStopImplementationEvidenceEntry implementation{
-      "manyforge.native_execution_host",
-      build.fingerprint,
-      core::ProviderContractRefDTO{
-          core::ProviderContractRoleId("software_hard_stop"),
-          core::SchemaId("manyforge.value_schema.provider_contract.empty.v1"),
-          core::SchemaRevision("sha256:"
-                               "fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4b"
-                               "b9d548bf642b83270")},
-      core::ProductContractId("manyforge.native_execution_runtime_unit"),
-      product_revision,
-      core::RegisteredStopCommandKindId("manyforge.stop.software_hard"),
-      std::nullopt,
-      core::StopInvocationLaneId(
-          "manyforge.native_execution_host.focused_software_hard.v1"),
-      1'000'000U,
-      {{{detail::StopQualificationFaultCase::kNominalProviderCallBlocked, 100U},
-        {detail::StopQualificationFaultCase::kNominalAdapterLockBlocked, 200U},
-        {detail::StopQualificationFaultCase::kNominalResultWaitBlocked,
-         300U}}}};
-  const detail::BuildQualifiedControlledStopSubstitutionEvidenceEntry
-      substitution{
-          "manyforge.native_execution_host",
-          build.fingerprint,
-          core::ProviderContractRefDTO{
-              core::ProviderContractRoleId("stop_contract"),
-              core::SchemaId(
-                  std::string(core::kMotionControlledStopContractSchemaId)),
-              core::SchemaRevision(std::string(
-                  core::kMotionControlledStopContractSchemaRevision))},
-          core::ProductContractId("manyforge.native_execution_runtime_unit"),
-          product_revision,
-          core::MotionControlledStopMode::kSoftOnPath,
-          core::MotionControlledStopMode::kSpringBackHold,
-          {{detail::ControlledStopSubstitutionQualificationCase::
-                kSelectedBeforePhysicalDispatch,
-            detail::ControlledStopSubstitutionQualificationCase::
-                kNominalScopePreserved,
-            detail::ControlledStopSubstitutionQualificationCase::
-                kNominalStageBudgetPreserved,
-            detail::ControlledStopSubstitutionQualificationCase::
-                kRequestedExecutedReasonRetained}}};
-  return {
-      build.bytes,
-      build.installed_target_bytes,
-      runner.bytes,
-      runner.executable_bytes,
-      detail::emit_stop_implementation_qualification_evidence_package(
-          runner.digest,
-          std::span<
-              const detail::BuildQualifiedStopImplementationEvidenceEntry>(
-              &implementation, 1U)),
-      detail::emit_controlled_stop_substitution_qualification_evidence_package(
-          runner.digest,
-          std::span<const detail::
-                        BuildQualifiedControlledStopSubstitutionEvidenceEntry>(
-              &substitution, 1U)),
-  };
-}
-
-template <typename Range, typename Predicate>
+ template <typename Range, typename Predicate>
 [[nodiscard]] const typename Range::value_type &
 require_one(const Range &values, Predicate predicate,
             std::string_view description) {
@@ -643,12 +445,9 @@ private:
 TEST(ResolvedStopBasePlanResolverTest,
      ResolvesExactActiveProductAndPublishesOnlyAfterIndependentReadback) {
   ScopedTrustedRoot root;
-  const auto evidence = make_stop_evidence_candidate();
   const auto retained = test::
-      materialize_lite6_stop_qualified_native_motion_retained_consumer_fixture(
-          root.path(),
-          std::span<const detail::StopQualificationEvidenceCandidate>(&evidence,
-                                                                      1U));
+      materialize_lite6_stop_capable_native_motion_retained_consumer_fixture(
+          root.path());
   const FilesystemVerifiedRetainedProductArtifactSource source(root.path());
   const auto runtime = make_runtime_context(*retained.bundle);
   const auto expected = load_verified_controller_lifecycle_expected_domain(
@@ -667,13 +466,12 @@ TEST(ResolvedStopBasePlanResolverTest,
   EXPECT_EQ(plan.escalation_stages.front().stage_kind,
             core::StopEscalationStageKind::kNominal);
   EXPECT_TRUE(plan.escalation_stages.front()
-                  .command_qualification.controlled_substitution_qualification
+                  .command_qualification.controlled_substitution_contract
                   .has_value());
   EXPECT_EQ(plan.escalation_stages.back().stage_kind,
             core::StopEscalationStageKind::kSoftwareHard);
-  EXPECT_TRUE(plan.escalation_stages.back()
-                  .command_qualification
-                  .software_hard_implementation_qualification.has_value());
+  EXPECT_EQ(plan.escalation_stages.back().command_qualification.stop_action_class,
+            core::StopActionClass::kSoftwareHard);
 
   MemoryPlanRepository repository;
   auto readiness = store_and_verify_runtime_participant_stop_readiness(
@@ -694,12 +492,9 @@ TEST(ResolvedStopBasePlanResolverTest,
 TEST(ResolvedStopBasePlanResolverTest,
      RejectsExternalConfigurationOrRuntimeAuthorityDrift) {
   ScopedTrustedRoot root;
-  const auto evidence = make_stop_evidence_candidate();
   const auto retained = test::
-      materialize_lite6_stop_qualified_native_motion_retained_consumer_fixture(
-          root.path(),
-          std::span<const detail::StopQualificationEvidenceCandidate>(&evidence,
-                                                                      1U));
+      materialize_lite6_stop_capable_native_motion_retained_consumer_fixture(
+          root.path());
   const FilesystemVerifiedRetainedProductArtifactSource source(root.path());
   const auto runtime = make_runtime_context(*retained.bundle);
   const auto expected = load_verified_controller_lifecycle_expected_domain(
@@ -726,12 +521,9 @@ TEST(ResolvedStopBasePlanResolverTest,
 TEST(ResolvedStopBasePlanResolverTest,
      RebindsAndPublishesOneCompleteSelectedBindingBatch) {
   ScopedTrustedRoot root;
-  const auto evidence = make_stop_evidence_candidate();
   const auto retained = test::
-      materialize_lite6_stop_qualified_native_motion_retained_consumer_fixture(
-          root.path(),
-          std::span<const detail::StopQualificationEvidenceCandidate>(&evidence,
-                                                                      1U));
+      materialize_lite6_stop_capable_native_motion_retained_consumer_fixture(
+          root.path());
   const FilesystemVerifiedRetainedProductArtifactSource source(root.path());
   const auto runtime = make_runtime_context(*retained.bundle);
   const auto expected = load_verified_controller_lifecycle_expected_domain(
@@ -796,12 +588,9 @@ TEST(ResolvedStopBasePlanResolverTest,
 TEST(ResolvedStopBasePlanResolverTest,
      PublishesExactRouteReadinessAndRejectsKernelReadbackDrift) {
   ScopedTrustedRoot root;
-  const auto evidence = make_stop_evidence_candidate();
   const auto retained = test::
-      materialize_lite6_stop_qualified_native_motion_retained_consumer_fixture(
-          root.path(),
-          std::span<const detail::StopQualificationEvidenceCandidate>(&evidence,
-                                                                      1U));
+      materialize_lite6_stop_capable_native_motion_retained_consumer_fixture(
+          root.path());
   const FilesystemVerifiedRetainedProductArtifactSource source(root.path());
   const auto runtime = make_runtime_context(*retained.bundle);
   const auto expected = load_verified_controller_lifecycle_expected_domain(
@@ -859,12 +648,9 @@ TEST(ResolvedStopBasePlanResolverTest,
 TEST(ResolvedStopBasePlanResolverTest,
      RouteResolutionSelectsOnlyItsDomainSourceProjections) {
   ScopedTrustedRoot root;
-  const auto evidence = make_stop_evidence_candidate();
   const auto retained = test::
-      materialize_lite6_stop_qualified_native_motion_retained_consumer_fixture(
-          root.path(),
-          std::span<const detail::StopQualificationEvidenceCandidate>(&evidence,
-                                                                      1U));
+      materialize_lite6_stop_capable_native_motion_retained_consumer_fixture(
+          root.path());
   const FilesystemVerifiedRetainedProductArtifactSource source(root.path());
   const auto runtime = make_runtime_context(*retained.bundle);
   const auto expected = load_verified_controller_lifecycle_expected_domain(
@@ -932,12 +718,9 @@ TEST(ResolvedStopBasePlanResolverTest,
 TEST(ResolvedStopBasePlanResolverTest,
      PublishesUnreconciledTruthClosedAndRejectsUnsafeReceiptTime) {
   ScopedTrustedRoot root;
-  const auto evidence = make_stop_evidence_candidate();
   const auto retained = test::
-      materialize_lite6_stop_qualified_native_motion_retained_consumer_fixture(
-          root.path(),
-          std::span<const detail::StopQualificationEvidenceCandidate>(&evidence,
-                                                                      1U));
+      materialize_lite6_stop_capable_native_motion_retained_consumer_fixture(
+          root.path());
   const FilesystemVerifiedRetainedProductArtifactSource source(root.path());
   const auto runtime = make_runtime_context(*retained.bundle);
   const auto expected = load_verified_controller_lifecycle_expected_domain(

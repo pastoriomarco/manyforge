@@ -118,6 +118,13 @@ export default function App() {
     programController.state.workspace,
   );
   const robotControl = useRobotControl(headlessEnabled);
+  const clientErrors = useMemo(() => programRuntime.state.error === null
+    ? []
+    : [{
+        id: 'composer.program_runtime',
+        title: 'Program command or response failed',
+        message: programRuntime.state.error,
+      }], [programRuntime.state.error]);
   const runtimeView = useMemo(
     () => headlessSnapshot === null ? null : runtimeStatusView(
       headlessSnapshot.runtime,
@@ -126,9 +133,10 @@ export default function App() {
         activeAcknowledged: headlessSnapshot.alarms.activeAcknowledgedCount,
         programCycleState: headlessSnapshot.programCycle.state,
         executionOwnerAvailable: robotControl.state.status !== null,
+        clientErrorCount: clientErrors.length,
       },
     ),
-    [headlessSnapshot, robotControl.state.status],
+    [clientErrors.length, headlessSnapshot, robotControl.state.status],
   );
   const viewerWidthMax = Math.max(
     VIEWER_WIDTH_MIN,
@@ -326,6 +334,7 @@ export default function App() {
             connectionDetail={connectionDetail}
             unacknowledgedAlarms={headlessSnapshot?.alarms.unacknowledgedCount ?? 0}
             activeAcknowledgedAlarms={headlessSnapshot?.alarms.activeAcknowledgedCount ?? 0}
+            clientErrorCount={clientErrors.length}
             contextFacts={programRuntime.state.currentScenario?.currentScenario === null
               || programRuntime.state.currentScenario === null
               ? []
@@ -470,6 +479,8 @@ export default function App() {
         <HeadlessRuntimeSurfaces
           enabled={headlessEnabled}
           headlessStateSource={headlessStateSource}
+          clientErrors={clientErrors}
+          onAcknowledgeClientError={() => programRuntime.dismissError()}
         />
       </OverlayPanel>
       <OverlayPanel

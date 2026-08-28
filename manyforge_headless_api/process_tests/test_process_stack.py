@@ -244,7 +244,7 @@ class ProcessStack:
                     "--program-runner-url",
                     self.program_runner_url,
                     "--program-runner-timeout-s",
-                    "0.25",
+                    "8",
                 )
             )
         self.api = subprocess.Popen(
@@ -279,7 +279,7 @@ class ProcessStack:
                 "--owner-id",
                 "program-runner.process-test",
                 "--headless-timeout-s",
-                "0.25",
+                "8",
             ],
             stdout=self.log,
             stderr=subprocess.STDOUT,
@@ -1234,7 +1234,8 @@ def test_real_program_apply_reuses_active_deployment_and_survives_api_restart(
             with _composer_snapshot_stream(
                 stack, client_id="process-test-browser"
             ) as next_snapshot, HeadlessHttpClient(
-                stack.composer_url
+                stack.composer_url,
+                timeout_seconds=8.0,
             ) as composer, HeadlessHttpClient(stack.base_url) as client:
                 scenarios = client.scenarios()
                 assert [row["scenario_id"] for row in scenarios["scenarios"]] == [
@@ -1461,6 +1462,67 @@ def test_real_program_apply_reuses_active_deployment_and_survives_api_restart(
                 }
                 assert replay_applied["source"]["source_owner_epoch"] != (
                     first_applied["source"]["source_owner_epoch"]
+                )
+
+                started = client.program_run_start(
+                    {
+                        "request_id": "program-apply.process.run.1",
+                        "request_owner_epoch": "process-test-browser-restarted",
+                        "source_label": "program_apply_process_test",
+                        "correlation_id": "program-apply.process.run.1",
+                        "scenario_id": "program_apply_fixture",
+                        "scenario_catalog_revision": scenarios[
+                            "scenario_catalog_revision"
+                        ],
+                        "expected_applied_record_digest": replay_applied[
+                            "source"
+                        ]["record_digest"],
+                        "draft_program_revision": replay_applied[
+                            "program_revision"
+                        ],
+                        "expected_admission_generation": (
+                            _current_authoring_generation(client)
+                        ),
+                    }
+                )
+                program_run_id = started["capture"]["program_run_id"]
+                terminal = started
+                deadline = time.monotonic() + 10.0
+                while terminal["state"] in {"running", "stopping", "finalizing"}:
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(
+                            f"Program run did not settle: {terminal!r}"
+                        )
+                    time.sleep(0.01)
+                    terminal = client.program_run(program_run_id)
+                assert terminal["state"] == "succeeded"
+
+                cycle = client.program_cycle_status()
+                assert cycle["state"] == "terminal_awaiting_reset"
+                terminal_reference = cycle["terminal_or_settlement_reference"]
+                reset = client.program_cycle_reset(
+                    {
+                        "request_id": "program-apply.process.reset.1",
+                        "request_owner_epoch": "process-test-browser-restarted",
+                        "source_label": "program_apply_process_test",
+                        "correlation_id": "program-apply.process.run.1",
+                        "program_run_id": program_run_id,
+                        "expected_owner_epoch": cycle[
+                            "program_runner_owner_epoch"
+                        ],
+                        "expected_cycle_generation": cycle[
+                            "cycle_generation"
+                        ],
+                        "expected_claim_generation": cycle[
+                            "cycle_claim_generation"
+                        ],
+                        "terminal_reference": terminal_reference,
+                        "settlement_evidence_digest": terminal_reference,
+                    }
+                )
+                assert reset["program_run_id"] == program_run_id
+                assert client.program_cycle_status()["state"] == (
+                    "idle_after_reset"
                 )
             assert _plain_package_files(stack.package_root) == package_before
 

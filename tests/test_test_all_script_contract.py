@@ -207,25 +207,11 @@ def test_headless_selector_builds_producer_closure_before_native_headless(
         "  if [ \"$root\" = \"${MANYFORGE_BUILD_DIR}/roboplan\" ]; then\n"
         "    printf '%s\\n' producer-build >> \"$FAKE_LOG\"\n"
         "    printf 'producer-targets:%s\\n' \"$*\" >> \"$FAKE_LOG\"\n"
-        "    mkdir -p \"$root/qualification/native_stop\" \\\n"
-        "      \"$root/qualification/native_stop_o1_4g_replacement\"\n"
         "    for output in \\\n"
         "      manyforge_native_execution_host \\\n"
         "      manyforge_native_execution_host_pick_place_fixture \\\n"
-        "      manyforge_roboplan_candidate_worker \\\n"
-        "      manyforge_native_stop_qualification_runner; do\n"
+        "      manyforge_roboplan_candidate_worker; do\n"
         "      : > \"$root/$output\"\n"
-        "    done\n"
-        "    for output in \\\n"
-        "      native_stop/implementation-build.json \\\n"
-        "      native_stop/runner-contract.json \\\n"
-        "      native_stop/implementation-evidence.json \\\n"
-        "      native_stop/substitution-evidence.json \\\n"
-        "      native_stop_o1_4g_replacement/implementation-build.json \\\n"
-        "      native_stop_o1_4g_replacement/runner-contract.json \\\n"
-        "      native_stop_o1_4g_replacement/implementation-evidence.json \\\n"
-        "      native_stop_o1_4g_replacement/substitution-evidence.json; do\n"
-        "      : > \"$root/qualification/$output\"\n"
         "    done\n"
         "  elif [ \"$root\" = \"${MANYFORGE_BUILD_DIR}/headless\" ]; then\n"
         "    printf '%s\\n' headless-build >> \"$FAKE_LOG\"\n"
@@ -305,8 +291,7 @@ def test_headless_selector_builds_producer_closure_before_native_headless(
     producer_targets = next(
         event for event in events if event.startswith("producer-targets:")
     )
-    assert "manyforge_run_native_stop_qualification" in producer_targets
-    assert "manyforge_run_native_stop_o1_4g_replacement_qualification" in producer_targets
+    assert "stop_qualification" not in producer_targets
     assert "manyforge_roboplan_candidate_worker" in producer_targets
     headless_args = next(
         event for event in events if event.startswith("headless-args:")

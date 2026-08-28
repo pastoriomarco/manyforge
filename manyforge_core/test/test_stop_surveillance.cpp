@@ -153,7 +153,6 @@ inline constexpr char kDigestC[] =
                                        ParticipantStopStageOutcomeDTO::kFailed,
                                        MotionControlledStopMode::kSoftOnPath,
                                        std::nullopt,
-                                       std::nullopt,
                                        3U,
                                        RuntimeEpoch("provider.epoch"),
                                        9U,

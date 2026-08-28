@@ -1865,7 +1865,7 @@ public:
         started_at_(std::chrono::steady_clock::now()),
         package_generation_(
             config_.install_root,
-            deployment::build_qualified_runtime_contract_registry()
+            deployment::runtime_contract_declaration_registry()
                 .package_manifest_set()),
         daemon_lock_(config_.manager_run_root),
         admission_(deployment::FilesystemCanonicalEmptyRetainedBundleSource(
@@ -2866,7 +2866,7 @@ private:
 
   void RequireCurrentPackageGeneration() {
     package_generation_.RequireCurrent(
-        deployment::build_qualified_runtime_contract_registry()
+        deployment::runtime_contract_declaration_registry()
             .package_manifest_set());
   }
 

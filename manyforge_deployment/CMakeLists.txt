@@ -615,8 +615,8 @@ else()
     manyforge_deployment_runtime_contract_codec)
 endif()
 
-# Canonical projection/parsing, identity, exact build-evidence verification,
-# and retained-bundle readback. This private substrate cannot mint retention
+# Canonical projection/parsing, semantic contract verification, and retained-
+# bundle readback. This private substrate cannot mint retention
 # authority and is deliberately free of materializer, repository-writer,
 # package-generator, and admission-selection effects. The O1.4c runtime
 # contract boundary reuses Core's verified runtime-contract codec, either
@@ -655,7 +655,6 @@ add_library(manyforge_deployment_verification_core
   src/retained_runtime_policy.cpp
   src/scenario_apply_candidate_source.cpp
   src/stop_evidence_policy_codec.cpp
-  src/stop_qualification_evidence.cpp
   src/verified_retained_bundle.cpp
   src/verified_retained_bundle_store.cpp
 )
@@ -826,7 +825,6 @@ endif()
 # provenance and are not interpreted as current-reader compatibility profiles.
 add_library(manyforge_deployment
   src/build_manifest.cpp
-  src/stop_qualification_authority.cpp
   src/build_manifest_repository.cpp
   src/capability_definition_codec.cpp
   src/command_schema_codec.cpp
@@ -1522,12 +1520,11 @@ if(BUILD_TESTING)
       "ur5_roboplan=${MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_FIXTURE_ROOT}")
 
   add_test(
-    NAME MaintainedDeploymentOccurrenceCompilationRequiresStopQualification
+    NAME MaintainedDeploymentOccurrenceCompilation
     COMMAND
       "$<TARGET_FILE:manyforge_maintained_deployment_occurrences>"
       --check
       --workspace-root "${_MANYFORGE_WORKSPACE_ROOT}"
-      --stop-evidence-mode require-external-qualification
       --prepared
       "lite6_lite_gripper=${MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT}"
       --prepared

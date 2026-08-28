@@ -76,14 +76,10 @@ constexpr std::array<detail::QualifiedRetainedProductArtifactRole, 2U>
          detail::kPlanningResourceMapMediaType, true},
         {"urdf", "application/xml", true},
     }};
-constexpr std::array<detail::QualifiedRetainedProductArtifactRole, 4U>
+constexpr std::array<detail::QualifiedRetainedProductArtifactRole, 2U>
     kControlDomainControlArtifactRoles{{
         {detail::kControlDomainControlArtifactRole,
          detail::kControlDomainControlMediaType, true},
-        {core::kControlledStopSubstitutionQualificationArtifactRole,
-         core::kControlledStopSubstitutionQualificationMediaType, false},
-        {core::kStopImplementationQualificationArtifactRole,
-         core::kStopImplementationQualificationMediaType, false},
         {core::kStopInterfaceCommissioningArtifactRole,
          core::kStopInterfaceCommissioningMediaType, false},
     }};
@@ -94,19 +90,15 @@ constexpr std::array<detail::QualifiedRetainedProductArtifactRole, 2U>
         {detail::kReferenceRuntimeManifestArtifactRole,
          detail::kReferenceRuntimeManifestMediaType, true},
     }};
-constexpr std::array<detail::QualifiedRetainedProductArtifactRole, 3U>
+constexpr std::array<detail::QualifiedRetainedProductArtifactRole, 2U>
     kNativeExecutionRuntimeArtifactRoles{{
-        {detail::kNativeExecutionRuntimeBuildIdentityArtifactRole,
-         detail::kNativeExecutionRuntimeBuildIdentityMediaType, false},
         {detail::kNativeExecutionRuntimeLaunchDescriptorArtifactRole,
          detail::kNativeExecutionRuntimeLaunchDescriptorMediaType, true},
         {detail::kNativeExecutionRuntimeManifestArtifactRole,
          detail::kNativeExecutionRuntimeManifestMediaType, true},
     }};
-constexpr std::array<detail::QualifiedRetainedProductArtifactRole, 3U>
+constexpr std::array<detail::QualifiedRetainedProductArtifactRole, 2U>
     kRos2ControlExecutionRuntimeArtifactRoles{{
-        {detail::kRos2ControlExecutionRuntimeBuildIdentityArtifactRole,
-         detail::kRos2ControlExecutionRuntimeBuildIdentityMediaType, false},
         {detail::kRos2ControlExecutionRuntimeLaunchDescriptorArtifactRole,
          detail::kRos2ControlExecutionRuntimeLaunchDescriptorMediaType, true},
         {detail::kRos2ControlExecutionRuntimeManifestArtifactRole,
@@ -1665,7 +1657,7 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
             detail::ros2_control_execution_runtime_product_contract_revision();
     if (!reference && !native_execution && !ros2_control_execution) {
       detail::fail_retained_bundle(
-          "runtime-unit product has no exact build-qualified product row");
+          "runtime-unit product has no exact maintained product row");
     }
     runtime_unit_products.push_back(core::RetainedRuntimeUnitProductsDTO{
         core::RuntimeUnitId(runtime_unit_id),
@@ -1676,7 +1668,38 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
           verified_graph.graph(),
           applicability.value().capability_provider_bindings, {}, {},
           runtime_profiles, runtime_unit_products);
-  if (independently_derived_requirements != runtime_contract_requirements) {
+  const bool requirements_match =
+      independently_derived_requirements.size() ==
+          runtime_contract_requirements.size() &&
+      std::equal(
+          independently_derived_requirements.begin(),
+          independently_derived_requirements.end(),
+          runtime_contract_requirements.begin(),
+          [](const auto& derived, const auto& retained) {
+            // Implementation identity, catalog revisions, and the digest that
+            // includes them are diagnostic provenance. The semantic
+            // requirement is the exact runtime unit plus its derived API and
+            // immutable capability-ID sets.
+            const auto& derived_capabilities =
+                derived.requirement.required_capabilities;
+            const auto& retained_capabilities =
+                retained.requirement.required_capabilities;
+            return derived.runtime_unit_id == retained.runtime_unit_id &&
+                   derived.requirement.required_api_contract_ids ==
+                       retained.requirement.required_api_contract_ids &&
+                   derived_capabilities.size() ==
+                       retained_capabilities.size() &&
+                   std::equal(
+                       derived_capabilities.begin(),
+                       derived_capabilities.end(),
+                       retained_capabilities.begin(),
+                       [](const auto& derived_capability,
+                          const auto& retained_capability) {
+                         return derived_capability.capability_id ==
+                                retained_capability.capability_id;
+                       });
+          });
+  if (!requirements_match) {
     detail::fail_retained_bundle(
         "retained runtime-contract requirements differ from independent "
         "rederivation");

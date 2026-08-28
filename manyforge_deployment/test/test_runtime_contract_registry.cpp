@@ -9,6 +9,7 @@
 #include <manyforge_core/runtime_contract_manifest_codec.hpp>
 #include <manyforge_core/types/capability_definition.hpp>
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
+#include <manyforge_deployment/runtime_contract_capability_declarations.hpp>
 #include <manyforge_deployment/runtime_contract_registry.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 
@@ -16,7 +17,7 @@ namespace manyforge::deployment {
 namespace {
 
 TEST(RuntimeContractRegistry, PackageAndEmbeddedOffersAreOneExactValue) {
-  const auto& registry = build_qualified_runtime_contract_registry();
+  const auto& registry = runtime_contract_declaration_registry();
   ASSERT_EQ(registry.contracts().size(), 3U);
   ASSERT_EQ(registry.package_manifest_set().offers.size(),
             registry.contracts().size());
@@ -55,7 +56,7 @@ TEST(RuntimeContractRegistry, PackageAndEmbeddedOffersAreOneExactValue) {
 
 TEST(RuntimeContractRegistry,
      ExplicitMappingsCoverEveryMaintainedRuntimeOfferAndFamily) {
-  const auto& registry = build_qualified_runtime_contract_registry();
+  const auto& registry = runtime_contract_declaration_registry();
   std::vector<std::string> families;
   for (const auto& row : registry.contracts()) {
     ASSERT_TRUE(std::is_sorted(row.offer().provided_api_contract_ids.begin(),
@@ -80,23 +81,7 @@ TEST(RuntimeContractRegistry,
 
 TEST(RuntimeContractRegistry,
      NativeAndRos2ControlOffersIncludeCanonicalLogicalSceneCapabilities) {
-  const auto& registry = build_qualified_runtime_contract_registry();
-  const std::array<std::string_view, 14U> logical_scene_capability_ids{{
-      "collision.query.detailed",
-      "collision.query.pre_execution",
-      "observability.trace.scene",
-      "scene.edit.add",
-      "scene.edit.attach_detach",
-      "scene.edit.remove",
-      "scene.edit.update_pose",
-      "scene.edit.upsert",
-      "scene.object.query",
-      "scene.reference.resolve",
-      "scene.shape.box",
-      "scene.shape.cylinder",
-      "scene.shape.mesh",
-      "scene.shape.sphere",
-  }};
+  const auto& registry = runtime_contract_declaration_registry();
   const auto check_offer = [&](const auto& offer, std::size_t expected_size) {
     ASSERT_EQ(offer.provided_capabilities.size(), expected_size);
     EXPECT_TRUE(std::is_sorted(
@@ -108,7 +93,8 @@ TEST(RuntimeContractRegistry,
           return left.capability_definition_revision <
                  right.capability_definition_revision;
         }));
-    for (const auto capability_id : logical_scene_capability_ids) {
+    for (const auto capability_id :
+         runtime_contract_capabilities::kLogicalSceneServices) {
       const auto* descriptor =
           core::find_builtin_capability_definition(capability_id);
       ASSERT_NE(descriptor, nullptr);
@@ -144,7 +130,7 @@ TEST(RuntimeContractRegistry,
 
 TEST(RuntimeContractRegistry,
      ExactAndStrictSupersetOffersPassWhileMissingOfferFactsFail) {
-  const auto& registry = build_qualified_runtime_contract_registry();
+  const auto& registry = runtime_contract_declaration_registry();
   const auto row = std::find_if(
       registry.contracts().begin(), registry.contracts().end(),
       [](const auto& candidate) {
@@ -192,14 +178,19 @@ TEST(RuntimeContractRegistry,
                    missing_capability_offer.value(), exact.value())
                    .ok());
 
+  auto diagnostic_capabilities = row->offer().provided_capabilities;
+  ASSERT_FALSE(diagnostic_capabilities.empty());
+  diagnostic_capabilities.front().capability_definition_revision =
+      core::CapabilityDefinitionRevision(
+          "sha256:0000000000000000000000000000000000000000000000000000000000000000");
   const auto wrong_family_requirement = core::MakeRuntimeContractRequirement(
       core::RuntimeImplementationFamilyId("manyforge.wrong.family"),
       row->offer().provided_api_contract_ids,
-      row->offer().provided_capabilities);
+      std::move(diagnostic_capabilities));
   ASSERT_TRUE(wrong_family_requirement.ok());
-  EXPECT_FALSE(core::CheckRuntimeContractCompatibility(
-                   row->offer(), wrong_family_requirement.value())
-                   .ok());
+  EXPECT_TRUE(core::CheckRuntimeContractCompatibility(
+                  row->offer(), wrong_family_requirement.value())
+                  .ok());
 }
 
 }  // namespace

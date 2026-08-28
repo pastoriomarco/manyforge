@@ -18,8 +18,8 @@ using ProductContractRevision = StrongString<ProductContractRevisionTag>;
 struct ArtifactRoleIdTag final {};
 using ArtifactRoleId = StrongString<ArtifactRoleIdTag>;
 
-/// Exact five-field immutable artifact-reference value shared by retained
-/// products and the Stop qualification/commissioning contracts.
+/// Exact five-field immutable reference for retained content-addressed
+/// artifacts.
 struct RetainedArtifactRefDTO final {
   ArtifactRoleId artifact_role_id;
   std::string media_type;

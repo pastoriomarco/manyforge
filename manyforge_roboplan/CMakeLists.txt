@@ -462,17 +462,6 @@ if(BUILD_TESTING)
     include(GoogleTest)
     find_package(roboplan_example_models REQUIRED)
 
-    # The explicit Stop qualification target consumes exact target-scoped
-    # source/build closures. Request both File API objects during configure;
-    # neither query runs the qualifier nor changes ordinary product targets.
-    set(_MANYFORGE_CMAKE_FILE_API_QUERY_ROOT
-      "${CMAKE_BINARY_DIR}/.cmake/api/v1/query")
-    file(MAKE_DIRECTORY "${_MANYFORGE_CMAKE_FILE_API_QUERY_ROOT}")
-    file(WRITE
-      "${_MANYFORGE_CMAKE_FILE_API_QUERY_ROOT}/codemodel-v2" "")
-    file(WRITE
-      "${_MANYFORGE_CMAKE_FILE_API_QUERY_ROOT}/toolchains-v1" "")
-
     # Test-only variant of the exact native transport host. It joins the real
     # addressed C++ pick/place planning owner to deterministic subordinate
     # ports so the Python/headless/Behavior/Composer process path can be
@@ -671,252 +660,6 @@ if(BUILD_TESTING)
     target_link_libraries(test_native_stop_qualification_seams PRIVATE
       manyforge_roboplan_native_execution
       GTest::gtest_main)
-
-    # The runner links the exact production native backend and production
-    # StopControl scheduler. Its private probe can only observe/block nominal
-    # stages; the software-hard issue path itself has no qualification branch.
-    # EXCLUDE_FROM_ALL keeps evidence generation explicit and outside ordinary
-    # build, install, retained compilation, and materialization paths.
-    add_executable(manyforge_native_stop_qualification_runner
-      EXCLUDE_FROM_ALL
-      test/run_native_stop_qualification.cpp)
-    target_include_directories(
-      manyforge_native_stop_qualification_runner PRIVATE
-      "${CMAKE_CURRENT_SOURCE_DIR}/src"
-      "${CMAKE_CURRENT_SOURCE_DIR}/test"
-      "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/src")
-    target_compile_definitions(
-      manyforge_native_stop_qualification_runner PRIVATE
-      MANYFORGE_NATIVE_STOP_QUALIFICATION_REPETITIONS=16
-      MANYFORGE_NATIVE_STOP_ISSUE_BOUND_NS=50000000
-      MANYFORGE_NATIVE_STOP_NOMINAL_STAGE_BUDGET_NS=500000000)
-    target_link_libraries(
-      manyforge_native_stop_qualification_runner PRIVATE
-      manyforge_roboplan_native_execution
-      manyforge_roboplan_native_runtime_support
-      manyforge_deployment
-      manyforge_core
-      Threads::Threads)
-
-    set(_MANYFORGE_NATIVE_STOP_QUALIFICATION_ROOT
-      "${CMAKE_CURRENT_BINARY_DIR}/qualification/native_stop")
-    set(_MANYFORGE_NATIVE_STOP_BUILD_CLOSURE
-      "${_MANYFORGE_NATIVE_STOP_QUALIFICATION_ROOT}/implementation-build.json")
-    set(_MANYFORGE_NATIVE_STOP_RUNNER_CONTRACT
-      "${_MANYFORGE_NATIVE_STOP_QUALIFICATION_ROOT}/runner-contract.json")
-    set(_MANYFORGE_NATIVE_STOP_IMPLEMENTATION_EVIDENCE
-      "${_MANYFORGE_NATIVE_STOP_QUALIFICATION_ROOT}/implementation-evidence.json")
-    set(_MANYFORGE_NATIVE_STOP_SUBSTITUTION_EVIDENCE
-      "${_MANYFORGE_NATIVE_STOP_QUALIFICATION_ROOT}/substitution-evidence.json")
-    set(_MANYFORGE_NATIVE_STOP_CLOSURE_GENERATOR
-      "${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_native_stop_build_closure.py")
-    set(_MANYFORGE_NATIVE_STOP_CASE_CONTRACT
-      "${CMAKE_CURRENT_SOURCE_DIR}/resources/contracts/native_stop_qualification_case_contract.v1.json")
-    set(_MANYFORGE_NATIVE_STOP_SEMANTIC_INPUTS
-      "${CMAKE_CURRENT_SOURCE_DIR}/include/manyforge_roboplan/roboplan_execution_backend.hpp"
-      "${CMAKE_CURRENT_SOURCE_DIR}/src/roboplan_execution_backend.cpp"
-      "${CMAKE_CURRENT_SOURCE_DIR}/src/native_stop_qualification_probe.hpp"
-      "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_core/include/manyforge_core/types/stop_control.hpp"
-      "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_core/include/manyforge_core/execution_stop_support.hpp"
-      "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_core/src/execution_stop_support.cpp"
-      "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/include/manyforge_deployment/native_execution_runtime_contract.hpp"
-      "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/resources/closed_schema/value/manyforge.value_schema.provider_contract.empty.v1.yaml"
-      "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/resources/closed_schema/value/manyforge.value_schema.provider_contract.motion_controlled_stop.v1.yaml")
-    set(_MANYFORGE_NATIVE_STOP_SEMANTIC_ARGUMENTS)
-    foreach(_semantic_input IN LISTS _MANYFORGE_NATIVE_STOP_SEMANTIC_INPUTS)
-      list(APPEND _MANYFORGE_NATIVE_STOP_SEMANTIC_ARGUMENTS
-        --semantic-input "${_semantic_input}")
-    endforeach()
-    add_custom_command(
-      OUTPUT
-        "${_MANYFORGE_NATIVE_STOP_BUILD_CLOSURE}"
-        "${_MANYFORGE_NATIVE_STOP_RUNNER_CONTRACT}"
-      COMMAND "${CMAKE_COMMAND}" -E make_directory
-        "${_MANYFORGE_NATIVE_STOP_QUALIFICATION_ROOT}"
-      COMMAND
-        "${Python3_EXECUTABLE}"
-        "${_MANYFORGE_NATIVE_STOP_CLOSURE_GENERATOR}"
-        --source-root "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}"
-        --build-root "${CMAKE_BINARY_DIR}"
-        --implementation-target manyforge_native_execution_host
-        --implementation-id
-          manyforge.native_execution_host
-        --installed-target-id manyforge_native_execution_host
-        --installed-target "$<TARGET_FILE:manyforge_native_execution_host>"
-        --runner-target manyforge_native_stop_qualification_runner
-        --runner-executable
-          "$<TARGET_FILE:manyforge_native_stop_qualification_runner>"
-        --case-contract "${_MANYFORGE_NATIVE_STOP_CASE_CONTRACT}"
-        --runner-source-input
-          "${CMAKE_CURRENT_SOURCE_DIR}/test/native_stop_qualification_fixture.hpp"
-        --runner-source-input
-          "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/src/stop_qualification_evidence_internal.hpp"
-        ${_MANYFORGE_NATIVE_STOP_SEMANTIC_ARGUMENTS}
-        --implementation-output "${_MANYFORGE_NATIVE_STOP_BUILD_CLOSURE}"
-        --runner-output "${_MANYFORGE_NATIVE_STOP_RUNNER_CONTRACT}"
-      DEPENDS
-        manyforge_native_execution_host
-        manyforge_native_stop_qualification_runner
-        "${_MANYFORGE_NATIVE_STOP_CLOSURE_GENERATOR}"
-        "${_MANYFORGE_NATIVE_STOP_CASE_CONTRACT}"
-        "${CMAKE_CURRENT_SOURCE_DIR}/test/native_stop_qualification_fixture.hpp"
-        "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/src/stop_qualification_evidence_internal.hpp"
-        ${_MANYFORGE_NATIVE_STOP_SEMANTIC_INPUTS}
-      COMMAND_EXPAND_LISTS
-      VERBATIM)
-    add_custom_target(manyforge_native_stop_qualification_closure
-      DEPENDS
-        "${_MANYFORGE_NATIVE_STOP_BUILD_CLOSURE}"
-        "${_MANYFORGE_NATIVE_STOP_RUNNER_CONTRACT}")
-    add_custom_command(
-      OUTPUT
-        "${_MANYFORGE_NATIVE_STOP_IMPLEMENTATION_EVIDENCE}"
-        "${_MANYFORGE_NATIVE_STOP_SUBSTITUTION_EVIDENCE}"
-      COMMAND
-        "$<TARGET_FILE:manyforge_native_stop_qualification_runner>"
-        --implementation-build "${_MANYFORGE_NATIVE_STOP_BUILD_CLOSURE}"
-        --runner-contract "${_MANYFORGE_NATIVE_STOP_RUNNER_CONTRACT}"
-        --implementation-output
-          "${_MANYFORGE_NATIVE_STOP_IMPLEMENTATION_EVIDENCE}"
-        --substitution-output
-          "${_MANYFORGE_NATIVE_STOP_SUBSTITUTION_EVIDENCE}"
-      DEPENDS
-        manyforge_native_stop_qualification_runner
-        "${_MANYFORGE_NATIVE_STOP_BUILD_CLOSURE}"
-        "${_MANYFORGE_NATIVE_STOP_RUNNER_CONTRACT}"
-      VERBATIM)
-    add_custom_target(manyforge_run_native_stop_qualification
-      DEPENDS
-        "${_MANYFORGE_NATIVE_STOP_IMPLEMENTATION_EVIDENCE}"
-        "${_MANYFORGE_NATIVE_STOP_SUBSTITUTION_EVIDENCE}")
-
-    if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
-      # I9 exact ROS software-hard qualification. Like the native runner, this
-      # executable links the production backend and production StopControl
-      # scheduler. Its private observer can block only nominal provider stages;
-      # it cannot replace the software-hard issue or terminal implementation.
-      add_executable(manyforge_ros2_control_stop_qualification_runner
-        EXCLUDE_FROM_ALL
-        test/run_ros2_control_stop_qualification.cpp)
-      target_include_directories(
-        manyforge_ros2_control_stop_qualification_runner PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/test"
-        "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_ros2_control_execution/src"
-        "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/src")
-      target_compile_definitions(
-        manyforge_ros2_control_stop_qualification_runner PRIVATE
-        MANYFORGE_ROS2_CONTROL_STOP_QUALIFICATION_REPETITIONS=16
-        MANYFORGE_ROS2_CONTROL_STOP_ISSUE_BOUND_NS=50000000)
-      target_link_libraries(
-        manyforge_ros2_control_stop_qualification_runner PRIVATE
-        manyforge_ros2_control_execution
-        manyforge_roboplan_native_runtime_support
-        manyforge_deployment
-        manyforge_core
-        Threads::Threads)
-
-      set(_MANYFORGE_ROS2_CONTROL_STOP_QUALIFICATION_ROOT
-        "${CMAKE_CURRENT_BINARY_DIR}/qualification/ros2_control_stop")
-      set(_MANYFORGE_ROS2_CONTROL_STOP_BUILD_CLOSURE
-        "${_MANYFORGE_ROS2_CONTROL_STOP_QUALIFICATION_ROOT}/implementation-build.json")
-      set(_MANYFORGE_ROS2_CONTROL_STOP_RUNNER_CONTRACT
-        "${_MANYFORGE_ROS2_CONTROL_STOP_QUALIFICATION_ROOT}/runner-contract.json")
-      set(_MANYFORGE_ROS2_CONTROL_STOP_IMPLEMENTATION_EVIDENCE
-        "${_MANYFORGE_ROS2_CONTROL_STOP_QUALIFICATION_ROOT}/implementation-evidence.json")
-      set(_MANYFORGE_ROS2_CONTROL_STOP_CLOSURE_GENERATOR
-        "${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_ros2_control_stop_build_closure.py")
-      set(_MANYFORGE_ROS2_CONTROL_STOP_BASE_CLOSURE_GENERATOR
-        "${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_native_stop_build_closure.py")
-      set(_MANYFORGE_ROS2_CONTROL_STOP_CASE_CONTRACT
-        "${CMAKE_CURRENT_SOURCE_DIR}/resources/contracts/ros2_control_stop_qualification_case_contract.v1.json")
-      set(_MANYFORGE_ROS2_CONTROL_STOP_PROBE
-        "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_ros2_control_execution/src/ros2_control_stop_qualification_probe.hpp")
-      set(_MANYFORGE_ROS2_CONTROL_STOP_SEMANTIC_INPUTS
-        "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_ros2_control_execution/include/manyforge_ros2_control_execution/ros2_control_execution_backend.hpp"
-        "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_ros2_control_execution/src/ros2_control_execution_backend.cpp"
-        "${_MANYFORGE_ROS2_CONTROL_STOP_PROBE}"
-        "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_core/include/manyforge_core/types/stop_control.hpp"
-        "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_core/include/manyforge_core/execution_stop_support.hpp"
-        "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_core/src/execution_stop_support.cpp"
-        "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/include/manyforge_deployment/ros2_control_execution_runtime_contract.hpp"
-        "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/resources/closed_schema/value/manyforge.value_schema.provider_contract.empty.v1.yaml")
-      set(_MANYFORGE_ROS2_CONTROL_STOP_SEMANTIC_ARGUMENTS)
-      foreach(_semantic_input IN LISTS
-          _MANYFORGE_ROS2_CONTROL_STOP_SEMANTIC_INPUTS)
-        list(APPEND _MANYFORGE_ROS2_CONTROL_STOP_SEMANTIC_ARGUMENTS
-          --semantic-input "${_semantic_input}")
-      endforeach()
-      add_custom_command(
-        OUTPUT
-          "${_MANYFORGE_ROS2_CONTROL_STOP_BUILD_CLOSURE}"
-          "${_MANYFORGE_ROS2_CONTROL_STOP_RUNNER_CONTRACT}"
-        COMMAND "${CMAKE_COMMAND}" -E make_directory
-          "${_MANYFORGE_ROS2_CONTROL_STOP_QUALIFICATION_ROOT}"
-        COMMAND
-          "${Python3_EXECUTABLE}"
-          "${_MANYFORGE_ROS2_CONTROL_STOP_CLOSURE_GENERATOR}"
-          --source-root "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}"
-          --build-root "${CMAKE_BINARY_DIR}"
-          --implementation-target manyforge_ros2_control_execution_host
-          --implementation-id manyforge.ros2_control_execution_host
-          --installed-target-id manyforge_ros2_control_execution_host
-          --installed-target "$<TARGET_FILE:manyforge_ros2_control_execution_host>"
-          --runner-target manyforge_ros2_control_stop_qualification_runner
-          --runner-executable
-            "$<TARGET_FILE:manyforge_ros2_control_stop_qualification_runner>"
-          --case-contract "${_MANYFORGE_ROS2_CONTROL_STOP_CASE_CONTRACT}"
-          --runner-source-input
-            "${CMAKE_CURRENT_SOURCE_DIR}/test/ros2_control_stop_qualification_fixture.hpp"
-          --runner-source-input
-            "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/src/stop_qualification_evidence_internal.hpp"
-          --runner-source-input
-            "${_MANYFORGE_ROS2_CONTROL_STOP_CLOSURE_GENERATOR}"
-          ${_MANYFORGE_ROS2_CONTROL_STOP_SEMANTIC_ARGUMENTS}
-          --implementation-output
-            "${_MANYFORGE_ROS2_CONTROL_STOP_BUILD_CLOSURE}"
-          --runner-output
-            "${_MANYFORGE_ROS2_CONTROL_STOP_RUNNER_CONTRACT}"
-        DEPENDS
-          manyforge_ros2_control_execution_host
-          manyforge_ros2_control_stop_qualification_runner
-          "${_MANYFORGE_ROS2_CONTROL_STOP_CLOSURE_GENERATOR}"
-          "${_MANYFORGE_ROS2_CONTROL_STOP_BASE_CLOSURE_GENERATOR}"
-          "${_MANYFORGE_ROS2_CONTROL_STOP_CASE_CONTRACT}"
-          "${CMAKE_CURRENT_SOURCE_DIR}/test/ros2_control_stop_qualification_fixture.hpp"
-          "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/src/stop_qualification_evidence_internal.hpp"
-          ${_MANYFORGE_ROS2_CONTROL_STOP_SEMANTIC_INPUTS}
-        COMMAND_EXPAND_LISTS
-        VERBATIM)
-      add_custom_target(manyforge_ros2_control_stop_qualification_closure
-        DEPENDS
-          "${_MANYFORGE_ROS2_CONTROL_STOP_BUILD_CLOSURE}"
-          "${_MANYFORGE_ROS2_CONTROL_STOP_RUNNER_CONTRACT}")
-      add_custom_command(
-        OUTPUT "${_MANYFORGE_ROS2_CONTROL_STOP_IMPLEMENTATION_EVIDENCE}"
-        COMMAND
-          "$<TARGET_FILE:manyforge_ros2_control_stop_qualification_runner>"
-          --implementation-build
-            "${_MANYFORGE_ROS2_CONTROL_STOP_BUILD_CLOSURE}"
-          --runner-contract
-            "${_MANYFORGE_ROS2_CONTROL_STOP_RUNNER_CONTRACT}"
-          --implementation-output
-            "${_MANYFORGE_ROS2_CONTROL_STOP_IMPLEMENTATION_EVIDENCE}"
-        DEPENDS
-          manyforge_ros2_control_stop_qualification_runner
-          "${_MANYFORGE_ROS2_CONTROL_STOP_BUILD_CLOSURE}"
-          "${_MANYFORGE_ROS2_CONTROL_STOP_RUNNER_CONTRACT}"
-        VERBATIM)
-      add_custom_target(manyforge_run_ros2_control_stop_qualification
-        DEPENDS "${_MANYFORGE_ROS2_CONTROL_STOP_IMPLEMENTATION_EVIDENCE}")
-    endif()
-
-    add_test(
-      NAME native_stop_build_closure_generator
-      COMMAND "${Python3_EXECUTABLE}"
-        "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_generate_native_stop_build_closure.py")
-    set_tests_properties(native_stop_build_closure_generator PROPERTIES
-      ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1"
-      TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
     add_executable(test_managed_kernel_admission_gate
       test/test_managed_kernel_admission_gate.cpp)
@@ -1174,217 +917,8 @@ if(BUILD_TESTING)
     target_compile_definitions(test_managed_kernel_admission_gate PRIVATE
       MANYFORGE_I6_NATIVE_FIXTURE_ROOT="${_MANYFORGE_I6_NATIVE_EXECUTION_FIXTURE_ROOT}")
 
-    # L0.1 reuses the same native package generator through an uninstalled,
-    # explicitly non-authoritative build-identity fixture seam. This exercises
-    # the conditional product artifact and Manager launch check without pulling
-    # the explicit offline Stop qualification runner into an ordinary build.
-    set(_MANYFORGE_I7_BUILD_IDENTIFIED_NATIVE_EXECUTION_FIXTURE_ROOT
-      "${CMAKE_CURRENT_BINARY_DIR}/lite6_build_identified_native_execution_fixture")
-    set(_MANYFORGE_I7_BUILD_IDENTIFIED_NATIVE_EXECUTION_FIXTURE_MANIFEST
-      "${_MANYFORGE_I7_BUILD_IDENTIFIED_NATIVE_EXECUTION_FIXTURE_ROOT}/manifest.json")
-    add_custom_command(
-      OUTPUT
-        "${_MANYFORGE_I7_BUILD_IDENTIFIED_NATIVE_EXECUTION_FIXTURE_MANIFEST}"
-      COMMAND
-        "${CMAKE_COMMAND}" -E rm -rf
-        "${_MANYFORGE_I7_BUILD_IDENTIFIED_NATIVE_EXECUTION_FIXTURE_ROOT}"
-      COMMAND
-        "${CMAKE_COMMAND}" -E make_directory
-        "${_MANYFORGE_I7_BUILD_IDENTIFIED_NATIVE_EXECUTION_FIXTURE_ROOT}"
-      COMMAND
-        "$<TARGET_FILE:generate_lite6_native_execution_fixture_tool>"
-        --output-root
-        "${_MANYFORGE_I7_BUILD_IDENTIFIED_NATIVE_EXECUTION_FIXTURE_ROOT}"
-        --test-build-identity-target
-        "$<TARGET_FILE:manyforge_native_execution_host>"
-      DEPENDS
-        generate_lite6_native_execution_fixture_tool
-        manyforge_native_execution_host
-      VERBATIM)
-    add_custom_target(generate_lite6_build_identified_native_execution_fixture
-      DEPENDS
-        "${_MANYFORGE_I7_BUILD_IDENTIFIED_NATIVE_EXECUTION_FIXTURE_MANIFEST}")
-
-    # O1.4g replacement row: qualify a distinct runnable test target through
-    # the same native Stop machinery as production. The implementation closure
-    # and evidence therefore name the alternate target's actual sources,
-    # compile/link identity, and installed bytes.
-    set(_MANYFORGE_O1_4G_REPLACEMENT_NATIVE_EXECUTION_FIXTURE_ROOT
-      "${CMAKE_CURRENT_BINARY_DIR}/lite6_o1_4g_replacement_native_execution_fixture")
-    set(_MANYFORGE_O1_4G_REPLACEMENT_NATIVE_EXECUTION_FIXTURE_MANIFEST
-      "${_MANYFORGE_O1_4G_REPLACEMENT_NATIVE_EXECUTION_FIXTURE_ROOT}/manifest.json")
-    set(_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_QUALIFICATION_ROOT
-      "${CMAKE_CURRENT_BINARY_DIR}/qualification/native_stop_o1_4g_replacement")
-    set(_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_BUILD_CLOSURE
-      "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_QUALIFICATION_ROOT}/implementation-build.json")
-    set(_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_RUNNER_CONTRACT
-      "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_QUALIFICATION_ROOT}/runner-contract.json")
-    set(_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_IMPLEMENTATION_EVIDENCE
-      "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_QUALIFICATION_ROOT}/implementation-evidence.json")
-    set(_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_SUBSTITUTION_EVIDENCE
-      "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_QUALIFICATION_ROOT}/substitution-evidence.json")
-    add_custom_command(
-      OUTPUT
-        "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_BUILD_CLOSURE}"
-        "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_RUNNER_CONTRACT}"
-      COMMAND "${CMAKE_COMMAND}" -E make_directory
-        "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_QUALIFICATION_ROOT}"
-      COMMAND
-        "${Python3_EXECUTABLE}"
-        "${_MANYFORGE_NATIVE_STOP_CLOSURE_GENERATOR}"
-        --source-root "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}"
-        --build-root "${CMAKE_BINARY_DIR}"
-        --implementation-target
-          manyforge_native_execution_host_pick_place_fixture
-        --implementation-id
-          manyforge.native_execution_host
-        --installed-target-id manyforge_native_execution_host
-        --installed-target
-          "$<TARGET_FILE:manyforge_native_execution_host_pick_place_fixture>"
-        --runner-target manyforge_native_stop_qualification_runner
-        --runner-executable
-          "$<TARGET_FILE:manyforge_native_stop_qualification_runner>"
-        --case-contract "${_MANYFORGE_NATIVE_STOP_CASE_CONTRACT}"
-        --runner-source-input
-          "${CMAKE_CURRENT_SOURCE_DIR}/test/native_stop_qualification_fixture.hpp"
-        --runner-source-input
-          "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/src/stop_qualification_evidence_internal.hpp"
-        ${_MANYFORGE_NATIVE_STOP_SEMANTIC_ARGUMENTS}
-        --implementation-output
-          "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_BUILD_CLOSURE}"
-        --runner-output
-          "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_RUNNER_CONTRACT}"
-      DEPENDS
-        manyforge_native_execution_host_pick_place_fixture
-        manyforge_native_stop_qualification_runner
-        "${_MANYFORGE_NATIVE_STOP_CLOSURE_GENERATOR}"
-        "${_MANYFORGE_NATIVE_STOP_CASE_CONTRACT}"
-        "${CMAKE_CURRENT_SOURCE_DIR}/test/native_stop_qualification_fixture.hpp"
-        "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/src/stop_qualification_evidence_internal.hpp"
-        ${_MANYFORGE_NATIVE_STOP_SEMANTIC_INPUTS}
-      COMMAND_EXPAND_LISTS
-      VERBATIM)
-    add_custom_command(
-      OUTPUT
-        "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_IMPLEMENTATION_EVIDENCE}"
-        "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_SUBSTITUTION_EVIDENCE}"
-      COMMAND
-        "$<TARGET_FILE:manyforge_native_stop_qualification_runner>"
-        --implementation-build
-          "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_BUILD_CLOSURE}"
-        --runner-contract
-          "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_RUNNER_CONTRACT}"
-        --implementation-output
-          "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_IMPLEMENTATION_EVIDENCE}"
-        --substitution-output
-          "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_SUBSTITUTION_EVIDENCE}"
-      DEPENDS
-        manyforge_native_stop_qualification_runner
-        "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_BUILD_CLOSURE}"
-        "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_RUNNER_CONTRACT}"
-      VERBATIM)
-    add_custom_target(manyforge_run_native_stop_o1_4g_replacement_qualification
-      DEPENDS
-        "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_BUILD_CLOSURE}"
-        "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_RUNNER_CONTRACT}"
-        "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_IMPLEMENTATION_EVIDENCE}"
-        "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_SUBSTITUTION_EVIDENCE}")
-    add_custom_command(
-      OUTPUT
-        "${_MANYFORGE_O1_4G_REPLACEMENT_NATIVE_EXECUTION_FIXTURE_MANIFEST}"
-      COMMAND
-        "${CMAKE_COMMAND}" -E rm -rf
-        "${_MANYFORGE_O1_4G_REPLACEMENT_NATIVE_EXECUTION_FIXTURE_ROOT}"
-      COMMAND
-        "${CMAKE_COMMAND}" -E make_directory
-        "${_MANYFORGE_O1_4G_REPLACEMENT_NATIVE_EXECUTION_FIXTURE_ROOT}"
-      COMMAND
-        "$<TARGET_FILE:generate_lite6_native_execution_fixture_tool>"
-        --output-root
-        "${_MANYFORGE_O1_4G_REPLACEMENT_NATIVE_EXECUTION_FIXTURE_ROOT}"
-        --stop-implementation-build
-        "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_BUILD_CLOSURE}"
-        --stop-installed-target
-        "$<TARGET_FILE:manyforge_native_execution_host_pick_place_fixture>"
-        --stop-runner-contract
-        "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_RUNNER_CONTRACT}"
-        --stop-runner-executable
-        "$<TARGET_FILE:manyforge_native_stop_qualification_runner>"
-        --stop-implementation-evidence
-        "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_IMPLEMENTATION_EVIDENCE}"
-        --stop-substitution-evidence
-        "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_SUBSTITUTION_EVIDENCE}"
-      DEPENDS
-        generate_lite6_native_execution_fixture_tool
-        manyforge_native_execution_host_pick_place_fixture
-        manyforge_native_stop_qualification_runner
-        manyforge_run_native_stop_o1_4g_replacement_qualification
-        "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_BUILD_CLOSURE}"
-        "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_RUNNER_CONTRACT}"
-        "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_IMPLEMENTATION_EVIDENCE}"
-        "${_MANYFORGE_NATIVE_STOP_O1_4G_REPLACEMENT_SUBSTITUTION_EVIDENCE}"
-      VERBATIM)
-    add_custom_target(
-      generate_lite6_o1_4g_replacement_native_execution_fixture
-      DEPENDS
-        "${_MANYFORGE_O1_4G_REPLACEMENT_NATIVE_EXECUTION_FIXTURE_MANIFEST}")
-
-    # Explicit L0.1 evidence lane. Building this target runs the real bounded
-    # Stop qualifier once, then feeds its exact four canonical outputs plus
-    # the two executable byte subjects through the production retained
-    # materialize/store/full-readback path. It is intentionally neither ALL
-    # nor CTest and no ordinary fixture or test depends on it.
-    set(_MANYFORGE_I7_STOP_QUALIFIED_FIXTURE_ROOT
-      "${CMAKE_CURRENT_BINARY_DIR}/lite6_stop_qualified_native_execution_fixture")
-    set(_MANYFORGE_I7_STOP_QUALIFIED_FIXTURE_MANIFEST
-      "${_MANYFORGE_I7_STOP_QUALIFIED_FIXTURE_ROOT}/manifest.json")
-    add_custom_command(
-      OUTPUT "${_MANYFORGE_I7_STOP_QUALIFIED_FIXTURE_MANIFEST}"
-      COMMAND
-        "${CMAKE_COMMAND}" -E rm -rf
-        "${_MANYFORGE_I7_STOP_QUALIFIED_FIXTURE_ROOT}"
-      COMMAND
-        "${CMAKE_COMMAND}" -E make_directory
-        "${_MANYFORGE_I7_STOP_QUALIFIED_FIXTURE_ROOT}"
-      COMMAND
-        "$<TARGET_FILE:generate_lite6_native_execution_fixture_tool>"
-        --output-root "${_MANYFORGE_I7_STOP_QUALIFIED_FIXTURE_ROOT}"
-        --stop-implementation-build
-          "${_MANYFORGE_NATIVE_STOP_BUILD_CLOSURE}"
-        --stop-installed-target
-          "$<TARGET_FILE:manyforge_native_execution_host>"
-        --stop-runner-contract
-          "${_MANYFORGE_NATIVE_STOP_RUNNER_CONTRACT}"
-        --stop-runner-executable
-          "$<TARGET_FILE:manyforge_native_stop_qualification_runner>"
-        --stop-implementation-evidence
-          "${_MANYFORGE_NATIVE_STOP_IMPLEMENTATION_EVIDENCE}"
-        --stop-substitution-evidence
-          "${_MANYFORGE_NATIVE_STOP_SUBSTITUTION_EVIDENCE}"
-      DEPENDS
-        generate_lite6_native_execution_fixture_tool
-        manyforge_native_execution_host
-        manyforge_native_stop_qualification_runner
-        "${_MANYFORGE_NATIVE_STOP_BUILD_CLOSURE}"
-        "${_MANYFORGE_NATIVE_STOP_RUNNER_CONTRACT}"
-        "${_MANYFORGE_NATIVE_STOP_IMPLEMENTATION_EVIDENCE}"
-        "${_MANYFORGE_NATIVE_STOP_SUBSTITUTION_EVIDENCE}"
-        "${_MANYFORGE_ROBOPLAN_LITE6_FIXTURE_ROOT}/model.urdf"
-        "${_MANYFORGE_ROBOPLAN_LITE6_FIXTURE_ROOT}/model.srdf"
-        ${_MANYFORGE_ROBOPLAN_LITE6_RESOURCE_INPUTS}
-      VERBATIM)
-    add_custom_target(
-      manyforge_materialize_stop_qualified_native_execution_fixture
-      DEPENDS "${_MANYFORGE_I7_STOP_QUALIFIED_FIXTURE_MANIFEST}")
-    target_compile_definitions(test_retained_native_cclc_runtime PRIVATE
-      MANYFORGE_I7_STOP_QUALIFIED_FIXTURE_ROOT="${_MANYFORGE_I7_STOP_QUALIFIED_FIXTURE_ROOT}")
-    add_dependencies(test_retained_native_cclc_runtime
-      manyforge_materialize_stop_qualified_native_execution_fixture)
-
-    # L0.7 production-process fixture. It retains the same executable and
-    # Stop qualification evidence as the focused L0.1 packet, while adding
-    # the complete arm+gripper lifecycle catalogs, runnable Program products,
-    # and two-domain route configuration consumed by the generic native host.
+    # L0.7 production-process fixture with complete arm+gripper lifecycle
+    # catalogs, runnable Program products, and two-domain route configuration.
     set(_MANYFORGE_L07_NATIVE_CCLC_FIXTURE_ROOT
       "${CMAKE_CURRENT_BINARY_DIR}/lite6_native_cclc_product_fixture")
     set(_MANYFORGE_L07_NATIVE_CCLC_FIXTURE_MANIFEST
@@ -1401,32 +935,47 @@ if(BUILD_TESTING)
         "$<TARGET_FILE:generate_lite6_native_execution_fixture_tool>"
         --output-root "${_MANYFORGE_L07_NATIVE_CCLC_FIXTURE_ROOT}"
         --fixture-kind cclc-product
-        --stop-implementation-build
-          "${_MANYFORGE_NATIVE_STOP_BUILD_CLOSURE}"
-        --stop-installed-target
-          "$<TARGET_FILE:manyforge_native_execution_host>"
-        --stop-runner-contract
-          "${_MANYFORGE_NATIVE_STOP_RUNNER_CONTRACT}"
-        --stop-runner-executable
-          "$<TARGET_FILE:manyforge_native_stop_qualification_runner>"
-        --stop-implementation-evidence
-          "${_MANYFORGE_NATIVE_STOP_IMPLEMENTATION_EVIDENCE}"
-        --stop-substitution-evidence
-          "${_MANYFORGE_NATIVE_STOP_SUBSTITUTION_EVIDENCE}"
       DEPENDS
         generate_lite6_native_execution_fixture_tool
         manyforge_native_execution_host
-        manyforge_native_stop_qualification_runner
-        "${_MANYFORGE_NATIVE_STOP_BUILD_CLOSURE}"
-        "${_MANYFORGE_NATIVE_STOP_RUNNER_CONTRACT}"
-        "${_MANYFORGE_NATIVE_STOP_IMPLEMENTATION_EVIDENCE}"
-        "${_MANYFORGE_NATIVE_STOP_SUBSTITUTION_EVIDENCE}"
         "${_MANYFORGE_ROBOPLAN_LITE6_FIXTURE_ROOT}/model.urdf"
         "${_MANYFORGE_ROBOPLAN_LITE6_FIXTURE_ROOT}/model.srdf"
         ${_MANYFORGE_ROBOPLAN_LITE6_RESOURCE_INPUTS}
       VERBATIM)
     add_custom_target(generate_lite6_native_cclc_product_fixture ALL
       DEPENDS "${_MANYFORGE_L07_NATIVE_CCLC_FIXTURE_MANIFEST}")
+
+    # Focused single-domain fixture for the CCLC repository-readiness test.
+    # It exercises the ordinary retained product path without pulling the
+    # application fixture's independent gripper domain into that unit test.
+    set(_MANYFORGE_CCLC_READINESS_FIXTURE_ROOT
+      "${CMAKE_CURRENT_BINARY_DIR}/lite6_native_cclc_readiness_fixture")
+    set(_MANYFORGE_CCLC_READINESS_FIXTURE_MANIFEST
+      "${_MANYFORGE_CCLC_READINESS_FIXTURE_ROOT}/manifest.json")
+    add_custom_command(
+      OUTPUT "${_MANYFORGE_CCLC_READINESS_FIXTURE_MANIFEST}"
+      COMMAND
+        "${CMAKE_COMMAND}" -E rm -rf
+        "${_MANYFORGE_CCLC_READINESS_FIXTURE_ROOT}"
+      COMMAND
+        "${CMAKE_COMMAND}" -E make_directory
+        "${_MANYFORGE_CCLC_READINESS_FIXTURE_ROOT}"
+      COMMAND
+        "$<TARGET_FILE:generate_lite6_native_execution_fixture_tool>"
+        --output-root "${_MANYFORGE_CCLC_READINESS_FIXTURE_ROOT}"
+        --fixture-kind cclc-readiness
+      DEPENDS
+        generate_lite6_native_execution_fixture_tool
+        "${_MANYFORGE_ROBOPLAN_LITE6_FIXTURE_ROOT}/model.urdf"
+        "${_MANYFORGE_ROBOPLAN_LITE6_FIXTURE_ROOT}/model.srdf"
+        ${_MANYFORGE_ROBOPLAN_LITE6_RESOURCE_INPUTS}
+      VERBATIM)
+    add_custom_target(generate_lite6_native_cclc_readiness_fixture ALL
+      DEPENDS "${_MANYFORGE_CCLC_READINESS_FIXTURE_MANIFEST}")
+    add_dependencies(test_retained_native_cclc_runtime
+      generate_lite6_native_cclc_readiness_fixture)
+    target_compile_definitions(test_retained_native_cclc_runtime PRIVATE
+      MANYFORGE_CCLC_READINESS_FIXTURE_ROOT="${_MANYFORGE_CCLC_READINESS_FIXTURE_ROOT}")
 
     add_executable(test_retained_product_consumer
       src/product_backed_runtime_participant_resolver.cpp
@@ -1466,16 +1015,11 @@ if(BUILD_TESTING)
       test/test_retained_native_runtime_unit_adapter.cpp)
     add_dependencies(test_retained_native_runtime_unit_adapter
       generate_lite6_native_execution_fixture
-      generate_lite6_build_identified_native_execution_fixture
-      generate_lite6_o1_4g_replacement_native_execution_fixture
-      manyforge_run_native_stop_o1_4g_replacement_qualification
       manyforge_native_execution_host
       manyforge_roboplan_candidate_worker)
     target_compile_definitions(
       test_retained_native_runtime_unit_adapter PRIVATE
       MANYFORGE_I6_NATIVE_FIXTURE_ROOT="${_MANYFORGE_I6_NATIVE_EXECUTION_FIXTURE_ROOT}"
-      MANYFORGE_I7_BUILD_IDENTIFIED_NATIVE_FIXTURE_ROOT="${_MANYFORGE_I7_BUILD_IDENTIFIED_NATIVE_EXECUTION_FIXTURE_ROOT}"
-      MANYFORGE_O1_4G_REPLACEMENT_NATIVE_FIXTURE_ROOT="${_MANYFORGE_O1_4G_REPLACEMENT_NATIVE_EXECUTION_FIXTURE_ROOT}"
       MANYFORGE_NATIVE_PICK_PLACE_EXECUTION_TARGET="$<TARGET_FILE:manyforge_native_execution_host_pick_place_fixture>"
       MANYFORGE_NATIVE_EXECUTION_TARGET_ROOT="$<TARGET_FILE_DIR:manyforge_native_execution_host>")
     target_link_libraries(test_retained_native_runtime_unit_adapter PRIVATE

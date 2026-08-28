@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import importlib.util
 from pathlib import Path
 import socket
@@ -217,6 +218,173 @@ def test_startup_requires_the_existing_manager_baseline_to_be_fully_converged() 
         {**status, "status": {**status["status"], "manager_ready": False}},
         diff,
     ) is False
+
+
+class _LifecycleClient:
+    def __init__(self) -> None:
+        self.state = "declared"
+        self.generation = 1
+        self.active: dict[str, Any] | None = None
+        self.lifecycle_requests: list[dict[str, Any]] = []
+        self.route_requests: list[dict[str, Any]] = []
+
+    @staticmethod
+    def _bindings() -> list[dict[str, str]]:
+        return [
+            {
+                "control_binding_id": "binding.arm",
+                "control_binding_revision": "binding.revision.1",
+                "control_route_id": "route.arm",
+            }
+        ]
+
+    def _desired(self) -> dict[str, Any]:
+        return {
+            "control_domain_id": "domain.arm",
+            "control_domain_revision": "domain.revision.1",
+            "controller_topology_id": "topology.arm",
+            "topology_revision": "topology.revision.1",
+            "activation_set_id": "arm_direct",
+            "binding_routes": self._bindings(),
+        }
+
+    def cclc_component(self, component_id: str) -> dict[str, Any]:
+        assert component_id == "component.arm"
+        return {
+            "controllable_component_id": component_id,
+            "component_lifecycle_state": self.state,
+            "component_lifecycle_generation": self.generation,
+            "graph_revision": "graph.1",
+            "domains": [
+                {
+                    "control_domain_id": "domain.arm",
+                    "control_domain_revision": "domain.revision.1",
+                    "controller_topology_id": "topology.arm",
+                    "topology_revision": "topology.revision.1",
+                    "current_control_bindings": self._bindings(),
+                    "active_control_configuration": deepcopy(self.active),
+                }
+            ],
+        }
+
+    def cclc_owner_identity(self) -> dict[str, Any]:
+        return {"request_owner_epoch": "cclc-owner.1"}
+
+    def authoring_admission(self) -> dict[str, Any]:
+        return {"authoring_allowed": False, "admission_generation": 7}
+
+    def submit_component_lifecycle(
+        self, request: dict[str, Any]
+    ) -> dict[str, Any]:
+        self.lifecycle_requests.append(deepcopy(request))
+        return {
+            "acceptance": {
+                "lifecycle_transaction_id": f"lifecycle.{request['intent']}"
+            }
+        }
+
+    def component_lifecycle_status(
+        self, transaction_id: str
+    ) -> dict[str, Any]:
+        intent = transaction_id.removeprefix("lifecycle.")
+        self.state = "prepared" if intent == "prepare" else "active"
+        self.generation += 1
+        return {"status": {"terminal_result": "succeeded"}}
+
+    def cclc_route_templates(self, component_id: str) -> dict[str, Any]:
+        assert component_id == "component.arm"
+        return {
+            "retained_bundle_id": "bundle.1",
+            "graph_revision": "graph.1",
+            "templates": [
+                {
+                    "desired_configuration": self._desired(),
+                    "expected_active_control_configuration": (
+                        dev_workbench._expected_active_configuration(self.active)
+                    ),
+                    "component_expectations": [
+                        {
+                            "controllable_component_id": component_id,
+                            "expected_component_lifecycle_generation": (
+                                self.generation
+                            ),
+                            "expected_component_lifecycle_state": "active",
+                        }
+                    ],
+                }
+            ],
+        }
+
+    def submit_route_selection(
+        self, request: dict[str, Any]
+    ) -> dict[str, Any]:
+        self.route_requests.append(deepcopy(request))
+        return {
+            "acceptance": {
+                "route_selection_transaction_id": "route-selection.1"
+            }
+        }
+
+    def route_selection_status(self, transaction_id: str) -> dict[str, Any]:
+        assert transaction_id == "route-selection.1"
+        self.active = {
+            **self._desired(),
+            "active_control_configuration_id": "active-configuration.1",
+            "active_control_configuration_generation": 1,
+            "state": "reconciled",
+        }
+        return {"status": {"terminal_result": "succeeded"}}
+
+
+def test_simulated_scenario_start_converges_only_missing_lifecycle_and_routes() -> None:
+    client = _LifecycleClient()
+
+    dev_workbench._converge_component(
+        client,  # type: ignore[arg-type]
+        "component.arm",
+        scenario_id="scenario.1",
+        processes=[],
+    )
+
+    assert client.state == "active"
+    assert [row["intent"] for row in client.lifecycle_requests] == [
+        "prepare",
+        "enable",
+    ]
+    assert len(client.route_requests) == 1
+    assert client.route_requests[0]["desired_configuration"] == client._desired()
+
+    dev_workbench._converge_component(
+        client,  # type: ignore[arg-type]
+        "component.arm",
+        scenario_id="scenario.1",
+        processes=[],
+    )
+
+    assert len(client.lifecycle_requests) == 2
+    assert len(client.route_requests) == 1
+
+    first_request_id = client.route_requests[0]["request_context"]["request_id"]
+    client.active = {
+        **client.active,
+        "active_control_configuration_id": "active-configuration.2",
+        "active_control_configuration_generation": 2,
+        "activation_set_id": "different-route",
+    }
+
+    dev_workbench._converge_component(
+        client,  # type: ignore[arg-type]
+        "component.arm",
+        scenario_id="scenario.1",
+        processes=[],
+    )
+
+    assert len(client.lifecycle_requests) == 2
+    assert len(client.route_requests) == 2
+    assert (
+        client.route_requests[1]["request_context"]["request_id"]
+        != first_request_id
+    )
 
 
 def test_stale_socket_cleanup_removes_only_the_named_socket(tmp_path: Path) -> None:

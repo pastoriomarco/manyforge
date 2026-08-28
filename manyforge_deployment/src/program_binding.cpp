@@ -893,8 +893,6 @@ void normalize_and_validate(core::ProgramBindingDTO& value) {
   require_digest(
       value.provenance.binding_compiler_contract_digest.value(),
       "program_binding.provenance.binding_compiler_contract_digest");
-  require_digest(value.provenance.binding_compiler_build_digest.value(),
-                 "program_binding.provenance.binding_compiler_build_digest");
   require_digest(value.provenance.role_assignment_digest.value(),
                  "program_binding.provenance.role_assignment_digest");
   if (value.provenance.source_records.size() >
@@ -1591,9 +1589,8 @@ template <typename StrongType>
       "program_binding.provenance");
   require_exact_fields(
       provenance,
-      {"binding_compiler_contract_digest", "binding_compiler_build_digest",
-       "role_assignment_digest", "source_records",
-       "resolved_output_records"},
+      {"binding_compiler_contract_digest", "role_assignment_digest",
+       "source_records", "resolved_output_records"},
       "program_binding.provenance");
 
   core::ProgramBindingDTO result{
@@ -1636,10 +1633,6 @@ template <typename StrongType>
               require_member(provenance, "binding_compiler_contract_digest",
                              "program_binding.provenance"),
               "program_binding.provenance.binding_compiler_contract_digest"),
-          parse_digest<core::ContentDigest>(
-              require_member(provenance, "binding_compiler_build_digest",
-                             "program_binding.provenance"),
-              "program_binding.provenance.binding_compiler_build_digest"),
           parse_digest<core::ContentDigest>(
               require_member(provenance, "role_assignment_digest",
                              "program_binding.provenance"),
@@ -2195,9 +2188,6 @@ CanonicalValue program_binding_projection(
            {"binding_compiler_contract_digest",
             CanonicalValue(
                 value.provenance.binding_compiler_contract_digest.value())},
-           {"binding_compiler_build_digest",
-            CanonicalValue(
-                value.provenance.binding_compiler_build_digest.value())},
            {"role_assignment_digest",
             CanonicalValue(value.provenance.role_assignment_digest.value())},
            {"source_records",

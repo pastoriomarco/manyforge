@@ -186,9 +186,7 @@ CanonicalValue manifest_set_value(
     return false;
   }
   const auto* definition = find_builtin_capability_definition(value.capability_id);
-  return definition != nullptr &&
-         value.capability_definition_revision.value() ==
-             definition->capability_definition_revision;
+  return definition != nullptr;
 }
 
 [[nodiscard]] bool api_contract_ids_valid(
@@ -213,8 +211,7 @@ CanonicalValue manifest_set_value(
   return std::is_sorted(values.begin(), values.end(), capability_ref_less) &&
          std::adjacent_find(values.begin(), values.end(),
                             [](const auto& left, const auto& right) {
-                              return !capability_ref_less(left, right) &&
-                                     !capability_ref_less(right, left);
+                              return left.capability_id == right.capability_id;
                             }) == values.end();
 }
 
@@ -682,13 +679,6 @@ Result<void> CheckRuntimeContractCompatibility(
   if (!requirement_verified.ok()) {
     return Result<void>::Err(requirement_verified.error());
   }
-  if (offer.runtime_implementation_id !=
-      requirement.runtime_implementation_id) {
-    return Result<void>::Err(
-        ErrorDTO{"runtime_contract_incompatible",
-                 "runtime contract implementation families do not match",
-                 {{"reason", "runtime_implementation_family_mismatch"}}});
-  }
   for (const auto& required : requirement.required_api_contract_ids) {
     if (!std::binary_search(offer.provided_api_contract_ids.begin(),
                             offer.provided_api_contract_ids.end(), required)) {
@@ -700,17 +690,21 @@ Result<void> CheckRuntimeContractCompatibility(
     }
   }
   for (const auto& required : requirement.required_capabilities) {
-    if (!std::binary_search(offer.provided_capabilities.begin(),
-                            offer.provided_capabilities.end(), required,
-                            capability_ref_less)) {
+    const auto offered = std::lower_bound(
+        offer.provided_capabilities.begin(), offer.provided_capabilities.end(),
+        required.capability_id,
+        [](const RuntimeCapabilityContractRefDTO& candidate,
+           const CapabilityId& capability_id) {
+          return candidate.capability_id < capability_id;
+        });
+    if (offered == offer.provided_capabilities.end() ||
+        offered->capability_id != required.capability_id) {
       return Result<void>::Err(
           ErrorDTO{
               "runtime_contract_incompatible",
               "runtime contract offer is missing a required capability",
               {{"reason", "required_capability_missing"},
-               {"capability_id", required.capability_id.value()},
-               {"capability_definition_revision",
-                required.capability_definition_revision.value()}}});
+               {"capability_id", required.capability_id.value()}}});
     }
   }
   return Result<void>::Ok();

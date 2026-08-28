@@ -42,7 +42,6 @@
 #include "retained_bundle_internal.hpp"
 #include "retention_store_fixtures.hpp"
 #include "runtime_only_retention_fixture.hpp"
-#include "stop_qualification_evidence_internal.hpp"
 
 namespace {
 
@@ -115,14 +114,14 @@ namespace {
 constexpr std::string_view kZeroDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 constexpr std::string_view kExpectedNodeEnvironmentDigest =
-    "sha256:91f7611e48dcc5ac11bdb53e79baf023b3b9414fa4d91af04c3837e28fd9b54b";
+    "sha256:4b6ace22aaa8864d292935f39c125e70eff747d1ec9c96b817b35e99fc07b9e7";
 constexpr std::string_view kExpectedCompilerContractDigest =
-    "sha256:ae5bf4c0d2ada1ef111f5f40f29dab2b93e951f28ffbb129dbaa380f3e392b8d";
+    "sha256:c61e9319f89ff1696f7a656d9c4f2a059f69c191cfcc9014d1a29b15b12a10f6";
 #ifdef MANYFORGE_VERIFY_CANONICAL_EMPTY_RELEASE_GOLDEN
 constexpr std::string_view kExpectedReleaseCompilerBuildDigest =
-    "sha256:90955e1c80c9b805d398ec285f2a3a374658b13fe173c8ee0ada685cca06a0a9";
+    "sha256:9f1be1a330cad013dd2493ebedc984a0e50eb007d31d59eeadc0c03d39cf8578";
 constexpr std::string_view kExpectedReleaseCanonicalEmptyBundleId =
-    "sha256:e15d3c2aaef6389a7bd4ef5ffea7c5d8d487157aa3902f3ded25f96452aff180";
+    "sha256:298a0b9008a56beeb6b8a79ad3d9ec2cf59a8d81f79316d89308446c861920b3";
 #endif
 
 static_assert(!std::is_default_constructible_v<BuildQualifiedManifest>);
@@ -226,208 +225,6 @@ static_assert(!std::is_default_constructible_v<
   return reidentify(
       replace_member(root, name, CanonicalValue(std::move(replacement))),
       kind);
-}
-
-[[nodiscard]] CanonicalValue stop_build_input(std::string id,
-                                              std::string_view content) {
-  return CanonicalValue(CanonicalValue::Object{
-      {"input_id", CanonicalValue(std::move(id))},
-      {"content_digest", CanonicalValue(sha256_digest(content))},
-  });
-}
-
-struct TestStopBuildClosure final {
-  std::string bytes;
-  core::ContentDigest fingerprint;
-  std::string installed_target_bytes;
-};
-
-[[nodiscard]] TestStopBuildClosure make_test_stop_build_closure(
-    std::string_view variant) {
-  const std::string target_bytes = "test-native-target:" + std::string(variant);
-  CanonicalValue root(CanonicalValue::Object{
-      {"api_version",
-       CanonicalValue(std::string(
-           detail::kStopImplementationBuildClosureApiVersion))},
-      {"implementation_id",
-       CanonicalValue("manyforge.native_execution_host")},
-      {"implementation_source_build_fingerprint",
-       CanonicalValue(std::string(kZeroDigest))},
-      {"source_inputs",
-       CanonicalValue(CanonicalValue::Array{stop_build_input(
-           "source:test", "source:" + std::string(variant))})},
-      {"generated_semantic_inputs",
-       CanonicalValue(CanonicalValue::Array{stop_build_input(
-           "semantic:test", "semantic:" + std::string(variant))})},
-      {"build_inputs",
-       CanonicalValue(CanonicalValue::Array{
-           stop_build_input("abi:test", "abi:" + std::string(variant)),
-           stop_build_input("compile:test",
-                            "compile:" + std::string(variant)),
-           stop_build_input("link:test", "link:" + std::string(variant)),
-           stop_build_input("toolchain:test",
-                            "toolchain:" + std::string(variant)),
-       })},
-      {"installed_target",
-       CanonicalValue(CanonicalValue::Object{
-           {"installed_target_id",
-            CanonicalValue("manyforge_native_execution_host")},
-           {"byte_size",
-            CanonicalValue(static_cast<double>(target_bytes.size()))},
-           {"content_digest", CanonicalValue(sha256_digest(target_bytes))},
-       })},
-  });
-  const std::string fingerprint = detail::compute_content_identity(
-      root,
-      detail::ContentIdentitySpec{
-          .identity_domain =
-              "stop-implementation-source-build-fingerprint",
-          .api_version = std::string(
-              detail::kStopImplementationBuildClosureApiVersion),
-          .own_field = "implementation_source_build_fingerprint",
-      });
-  root = replace_member(root, "implementation_source_build_fingerprint",
-                        CanonicalValue(fingerprint));
-  return {canonical_json(root), core::ContentDigest(fingerprint),
-          target_bytes};
-}
-
-struct TestStopRunnerContract final {
-  std::string bytes;
-  core::ContentDigest digest;
-  std::string executable_bytes;
-};
-
-[[nodiscard]] TestStopRunnerContract make_test_stop_runner_contract(
-    std::string_view variant) {
-  const std::string executable_bytes =
-      "test-stop-runner:" + std::string(variant);
-  CanonicalValue root(CanonicalValue::Object{
-      {"api_version",
-       CanonicalValue(std::string(
-           detail::kStopQualificationRunnerContractApiVersion))},
-      {"qualification_runner_contract_digest",
-       CanonicalValue(std::string(kZeroDigest))},
-      {"runner_id", CanonicalValue("manyforge.test.stop_runner")},
-      {"source_inputs",
-       CanonicalValue(CanonicalValue::Array{stop_build_input(
-           "source:test", "runner-source:" + std::string(variant))})},
-      {"build_inputs",
-       CanonicalValue(CanonicalValue::Array{
-           stop_build_input("abi:test",
-                            "runner-abi:" + std::string(variant)),
-           stop_build_input("compile:test",
-                            "runner-compile:" + std::string(variant)),
-           stop_build_input("link:test",
-                            "runner-link:" + std::string(variant)),
-           stop_build_input("toolchain:test",
-                            "runner-toolchain:" + std::string(variant)),
-       })},
-      {"executable",
-       CanonicalValue(CanonicalValue::Object{
-           {"byte_size",
-            CanonicalValue(static_cast<double>(executable_bytes.size()))},
-           {"content_digest",
-            CanonicalValue(sha256_digest(executable_bytes))},
-       })},
-      {"case_contract",
-       CanonicalValue(CanonicalValue::Object{
-           {"implementation_fault_cases",
-            CanonicalValue(CanonicalValue::Array{
-                CanonicalValue("nominal_provider_call_blocked"),
-                CanonicalValue("nominal_adapter_lock_blocked"),
-                CanonicalValue("nominal_result_wait_blocked"),
-            })},
-           {"controlled_substitution_cases",
-            CanonicalValue(CanonicalValue::Array{
-                CanonicalValue("selected_before_physical_dispatch"),
-                CanonicalValue("nominal_scope_preserved"),
-                CanonicalValue("nominal_stage_budget_preserved"),
-                CanonicalValue("requested_executed_reason_retained"),
-            })},
-       })},
-  });
-  const std::string digest = detail::compute_content_identity(
-      root,
-      detail::ContentIdentitySpec{
-          .identity_domain = "stop-qualification-runner-contract-digest",
-          .api_version = std::string(
-              detail::kStopQualificationRunnerContractApiVersion),
-          .own_field = "qualification_runner_contract_digest",
-      });
-  root = replace_member(root, "qualification_runner_contract_digest",
-                        CanonicalValue(digest));
-  return {canonical_json(root), core::ContentDigest(digest),
-          executable_bytes};
-}
-
-[[nodiscard]] detail::StopQualificationEvidenceCandidate
-make_test_stop_evidence_candidate(std::string_view build_variant,
-                                  std::string_view runner_variant) {
-  const auto build = make_test_stop_build_closure(build_variant);
-  const auto runner = make_test_stop_runner_contract(runner_variant);
-  const core::ProductContractRevision product_revision{
-      std::string(kZeroDigest)};
-  const detail::BuildQualifiedStopImplementationEvidenceEntry
-      implementation{
-          "manyforge.native_execution_host",
-          build.fingerprint,
-          core::ProviderContractRefDTO{
-              core::ProviderContractRoleId("software_hard_stop"),
-              core::SchemaId(
-                  "manyforge.value_schema.provider_contract.empty.v1"),
-              core::SchemaRevision(
-                  "sha256:fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270")},
-          core::ProductContractId("manyforge.native_execution_runtime_unit"),
-          product_revision,
-          core::RegisteredStopCommandKindId("manyforge.stop.software_hard"),
-          std::nullopt,
-          core::StopInvocationLaneId("manyforge.test.software_hard"),
-          1'000'000U,
-          {{{detail::StopQualificationFaultCase::kNominalProviderCallBlocked,
-             100U},
-            {detail::StopQualificationFaultCase::kNominalAdapterLockBlocked,
-             200U},
-            {detail::StopQualificationFaultCase::kNominalResultWaitBlocked,
-             300U}}}};
-  const detail::BuildQualifiedControlledStopSubstitutionEvidenceEntry
-      substitution{
-          "manyforge.native_execution_host",
-          build.fingerprint,
-          core::ProviderContractRefDTO{
-              core::ProviderContractRoleId("stop_contract"),
-              core::SchemaId(std::string(
-                  core::kMotionControlledStopContractSchemaId)),
-              core::SchemaRevision(std::string(
-                  core::kMotionControlledStopContractSchemaRevision))},
-          core::ProductContractId("manyforge.native_execution_runtime_unit"),
-          product_revision,
-          core::MotionControlledStopMode::kSoftOnPath,
-          core::MotionControlledStopMode::kSpringBackHold,
-          {{detail::ControlledStopSubstitutionQualificationCase::
-                kSelectedBeforePhysicalDispatch,
-            detail::ControlledStopSubstitutionQualificationCase::
-                kNominalScopePreserved,
-            detail::ControlledStopSubstitutionQualificationCase::
-                kNominalStageBudgetPreserved,
-            detail::ControlledStopSubstitutionQualificationCase::
-                kRequestedExecutedReasonRetained}}};
-  return {
-      build.bytes,
-      build.installed_target_bytes,
-      runner.bytes,
-      runner.executable_bytes,
-      detail::emit_stop_implementation_qualification_evidence_package(
-          runner.digest,
-          std::span<const detail::
-                        BuildQualifiedStopImplementationEvidenceEntry>(
-              &implementation, 1U)),
-      detail::emit_controlled_stop_substitution_qualification_evidence_package(
-          runner.digest,
-          std::span<const detail::
-                        BuildQualifiedControlledStopSubstitutionEvidenceEntry>(
-              &substitution, 1U)),
-  };
 }
 
 [[nodiscard]] std::string empty_graph() {
@@ -1987,85 +1784,6 @@ TEST(BuildManifestAuthority,
           count_bounded.put_if_absent(context.manifests()[1])),
       BuildManifestError);
   EXPECT_EQ(count_bounded.size(), 1U);
-}
-
-TEST(BuildManifestAuthority,
-     ExactStopQualificationCandidateIsVerifiedAndSealed) {
-  const auto candidate =
-      make_test_stop_evidence_candidate("current", "current");
-  const auto context = detail::BuildQualifiedRetentionAuthority::qualify(
-      std::span<const detail::StopQualificationEvidenceCandidate>(
-          &candidate, 1U));
-
-  const auto& evidence = context.stop_evidence();
-  ASSERT_TRUE(
-      evidence.implementation_runner_contract_digest().has_value());
-  ASSERT_TRUE(
-      evidence.controlled_substitution_runner_contract_digest().has_value());
-  EXPECT_EQ(*evidence.implementation_runner_contract_digest(),
-            *evidence.controlled_substitution_runner_contract_digest());
-  EXPECT_EQ(evidence.implementation_entries().size(), 1U);
-  EXPECT_EQ(evidence.controlled_substitution_entries().size(), 1U);
-  EXPECT_EQ(evidence.implementation_build_identities().size(), 1U);
-}
-
-TEST(BuildManifestAuthority,
-     StopQualificationRejectsStaleInstalledTargetRunnerAndEvidence) {
-  auto stale_target =
-      make_test_stop_evidence_candidate("current", "current");
-  stale_target.installed_target_bytes.push_back('!');
-  EXPECT_THROW(
-      static_cast<void>(detail::BuildQualifiedRetentionAuthority::qualify(
-          std::span<const detail::StopQualificationEvidenceCandidate>(
-              &stale_target, 1U))),
-      RetainedBundleError);
-
-  auto stale_runner =
-      make_test_stop_evidence_candidate("current", "current");
-  stale_runner.qualification_runner_executable_bytes.push_back('!');
-  EXPECT_THROW(
-      static_cast<void>(detail::BuildQualifiedRetentionAuthority::qualify(
-          std::span<const detail::StopQualificationEvidenceCandidate>(
-              &stale_runner, 1U))),
-      RetainedBundleError);
-
-  auto current = make_test_stop_evidence_candidate("current", "current");
-  const auto stale =
-      make_test_stop_evidence_candidate("stale", "current");
-  current.implementation_qualification_package_bytes =
-      stale.implementation_qualification_package_bytes;
-  EXPECT_THROW(
-      static_cast<void>(detail::BuildQualifiedRetentionAuthority::qualify(
-          std::span<const detail::StopQualificationEvidenceCandidate>(
-              &current, 1U))),
-      RetainedBundleError);
-}
-
-TEST(BuildManifestAuthority,
-     StopQualificationRejectsMixedBuildAndRunnerClosures) {
-  auto build_a = make_test_stop_evidence_candidate("build-a", "runner");
-  auto build_b = make_test_stop_evidence_candidate("build-b", "runner");
-  build_a.controlled_substitution_package_bytes.reset();
-  build_b.implementation_qualification_package_bytes.reset();
-  const std::array mixed_build{build_a, build_b};
-  EXPECT_THROW(
-      static_cast<void>(detail::BuildQualifiedRetentionAuthority::qualify(
-          std::span<const detail::StopQualificationEvidenceCandidate>(
-              mixed_build))),
-      RetainedBundleError);
-
-  auto runner_a =
-      make_test_stop_evidence_candidate("shared-build", "runner-a");
-  auto runner_b =
-      make_test_stop_evidence_candidate("shared-build", "runner-b");
-  runner_a.controlled_substitution_package_bytes.reset();
-  runner_b.implementation_qualification_package_bytes.reset();
-  const std::array mixed_runner{runner_a, runner_b};
-  EXPECT_THROW(
-      static_cast<void>(detail::BuildQualifiedRetentionAuthority::qualify(
-          std::span<const detail::StopQualificationEvidenceCandidate>(
-              mixed_runner))),
-      RetainedBundleError);
 }
 
 }  // namespace

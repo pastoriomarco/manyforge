@@ -312,7 +312,7 @@ export function parseProgramBindingTransport(value: unknown, path: string): Prog
   });
   sorted(contacts, (row) => row.contact_policy_id as string, `${path}.contact_grasp_bindings`);
   const provenance = record(root.provenance, FIELDS.provenance, `${path}.provenance`);
-  ['binding_compiler_contract_digest', 'binding_compiler_build_digest', 'role_assignment_digest']
+  ['binding_compiler_contract_digest', 'role_assignment_digest']
     .forEach((field) => digest(provenance[field], `${path}.provenance.${field}`));
   ['source_records', 'resolved_output_records'].forEach((field) => {
     const records = array(provenance[field], `${path}.provenance.${field}`, 0, PROVENANCE_MAX_ROWS).map((item, i) => {

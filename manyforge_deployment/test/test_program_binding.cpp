@@ -239,7 +239,6 @@ struct BindingContext final {
       }},
       ProgramBindingProvenanceDTO{
           bundle.provenance.compiler_contract_digest,
-          bundle.provenance.compiler_build_digest,
           ContentDigest(sha256_digest("i6 exact role assignment")),
           bundle.provenance.source_records,
           bundle.provenance.source_records,

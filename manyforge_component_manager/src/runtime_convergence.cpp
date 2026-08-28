@@ -59,14 +59,14 @@ void VerifyRuntimeContractAdmission(
         "runtime convergence plan has no sealed contract-manifest admission");
   }
   const auto *contract =
-      manyforge::deployment::build_qualified_runtime_contract_registry().find(
+      manyforge::deployment::runtime_contract_declaration_registry().find(
           plan.runtime_profile_id, plan.runtime_profile_revision,
           plan.product_contract_id, plan.product_contract_revision);
   if (contract == nullptr ||
       contract->offer().offer_digest != plan.runtime_contract_offer_digest) {
     throw std::invalid_argument(
         "runtime convergence plan selected offer differs from the immutable "
-        "build-qualified registry");
+        "component declaration registry");
   }
   const auto compatible = manyforge::core::CheckRuntimeContractCompatibility(
       contract->offer(), plan.runtime_contract_requirement);

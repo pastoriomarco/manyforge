@@ -29,7 +29,7 @@ const FIELDS = {
   command_schema: ['command_schema_id', 'command_schema_revision'],
   contact: ['contact_policy_id', 'contact_policy_revision', 'runtime_object_id', 'allowed_body_bindings', 'max_penetration_m', 'terminal_window_start_fraction'],
   contact_body: ['component_role_id', 'target_role_id', 'controllable_component_id', 'command_target_id', 'model_role_id', 'collision_body_role_id', 'model_instance_id', 'model_revision', 'collision_body_ids'],
-  provenance: ['binding_compiler_contract_digest', 'binding_compiler_build_digest', 'role_assignment_digest', 'source_records', 'resolved_output_records'],
+  provenance: ['binding_compiler_contract_digest', 'role_assignment_digest', 'source_records', 'resolved_output_records'],
   provenance_record: ['record_kind', 'record_id', 'revision'],
 } as const;
 const MODIFICATION_VALUES = new Set(['forbidden', 'human_approval', 'llm_allowed']);
@@ -357,7 +357,7 @@ export function parseProgramBindingTransport(value: unknown, path: string): Prog
   });
   sorted(contacts, (row) => row.contact_policy_id as string, `${path}.contact_grasp_bindings`);
   const provenance = record(root.provenance, FIELDS.provenance, `${path}.provenance`);
-  ['binding_compiler_contract_digest', 'binding_compiler_build_digest', 'role_assignment_digest']
+  ['binding_compiler_contract_digest', 'role_assignment_digest']
     .forEach((field) => digest(provenance[field], `${path}.provenance.${field}`));
   ['source_records', 'resolved_output_records'].forEach((field) => {
     const records = array(provenance[field], `${path}.provenance.${field}`, 0, PROVENANCE_MAX_ROWS).map((item, i) => {

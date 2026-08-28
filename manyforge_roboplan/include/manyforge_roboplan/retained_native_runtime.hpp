@@ -264,6 +264,12 @@ struct RetainedNativeRuntime final
   ReadCurrentPublishedRouteConfiguration(
       const core::ControlDomainId &control_domain_id) const;
 
+  /// Publish the exact route facts already sealed into a direct native
+  /// runtime. Maintained products without a lifecycle owner call this once
+  /// after installation; lifecycle-managed products publish through CCLC.
+  [[nodiscard]] core::Result<void>
+  PublishCurrentRetainedRouteConfigurations();
+
 private:
   mutable std::mutex route_publication_mutex_;
 };

@@ -177,51 +177,24 @@ find_registered_stop_command_definition(
              : &*found;
 }
 
-inline constexpr std::string_view
-    kStopImplementationQualificationArtifactRole =
-        "stop_implementation_qualification_evidence";
-inline constexpr std::string_view
-    kStopImplementationQualificationMediaType =
-        "application/vnd.manyforge.stop-implementation-qualification-evidence.v1+json";
-inline constexpr std::string_view
-    kControlledStopSubstitutionQualificationArtifactRole =
-        "stop_controlled_substitution_qualification_evidence";
-inline constexpr std::string_view
-    kControlledStopSubstitutionQualificationMediaType =
-        "application/vnd.manyforge.stop-controlled-substitution-qualification-evidence.v1+json";
 inline constexpr std::string_view kStopInterfaceCommissioningArtifactRole =
     "stop_interface_commissioning_evidence";
 inline constexpr std::string_view kStopInterfaceCommissioningMediaType =
     "application/vnd.manyforge.stop-interface-commissioning-evidence.v1+json";
 
-struct StopImplementationQualificationDTO final {
-  RegisteredStopCommandKindId registered_command_kind_id;
+/// The sole closed semantic controlled-mode substitution supported by v1.
+/// This is runtime policy, not evidence that a binary or test report is
+/// qualified.
+struct ControlledStopSubstitutionContractDTO final {
   ProviderContractRefDTO provider_contract_ref;
-  ProductId product_id;
-  ProductContractId product_contract_id;
-  ProductContractRevision product_contract_revision;
-  std::optional<EndpointRoleId> endpoint_role_id;
-  StopInvocationLaneId invocation_lane_id;
-  RetainedArtifactRefDTO qualification_artifact_ref;
-
-  friend bool operator==(const StopImplementationQualificationDTO&,
-                         const StopImplementationQualificationDTO&) = default;
-};
-
-struct ControlledStopSubstitutionQualificationDTO final {
-  ProviderContractRefDTO provider_contract_ref;
-  ProductId product_id;
-  ProductContractId product_contract_id;
-  ProductContractRevision product_contract_revision;
   MotionControlledStopMode requested_stop_mode{
       MotionControlledStopMode::kSoftOnPath};
   MotionControlledStopMode executed_stop_mode{
       MotionControlledStopMode::kSpringBackHold};
-  RetainedArtifactRefDTO qualification_artifact_ref;
 
   friend bool operator==(
-      const ControlledStopSubstitutionQualificationDTO&,
-      const ControlledStopSubstitutionQualificationDTO&) = default;
+      const ControlledStopSubstitutionContractDTO&,
+      const ControlledStopSubstitutionContractDTO&) = default;
 };
 
 struct StopStageParametersDTO final {

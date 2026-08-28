@@ -604,17 +604,8 @@ struct PreparedPlanningCollisionProduct final {
   std::vector<PreparedSourceArtifact> source_artifacts;
 };
 
-inline constexpr std::string_view kNativeSoftwareHardInvocationLaneId =
-    "manyforge.native_execution_host.focused_software_hard.v1";
-inline constexpr std::string_view kRos2ControlSoftwareHardInvocationLaneId =
-    "manyforge.ros2_control_execution_host.focused_software_hard.v1";
-
-struct PreparedControlQualification final {
+struct PreparedControlArtifacts final {
   std::vector<detail::RetainedArtifactInput> conditional_artifacts;
-  std::vector<core::StopImplementationQualificationDTO>
-      implementation_qualifications;
-  std::vector<core::ControlledStopSubstitutionQualificationDTO>
-      substitution_qualifications;
 };
 
 [[nodiscard]] core::RetainedArtifactRefDTO
@@ -629,424 +620,60 @@ retained_artifact_ref(std::string_view role, std::string_view media_type,
       core::ArtifactRoleId(std::string(role)), std::string(media_type),
       static_cast<std::uint64_t>(bytes.size()), digest,
       core::ContentAddressedStoreKey(
-          detail::retained_store_key_for_digest(digest.value()))};
+      detail::retained_store_key_for_digest(digest.value()))};
 }
 
-[[nodiscard]] const core::ControlBindingDTO &
-require_control_binding(const core::CellGraphDTO &graph,
-                        const core::ControlBindingId &binding_id) {
-  const auto found =
-      std::find_if(graph.control_bindings.begin(), graph.control_bindings.end(),
-                   [&](const auto &binding) {
-                     return binding.control_binding_id == binding_id;
-                   });
-  if (found == graph.control_bindings.end()) {
-    detail::fail_retained_bundle(
-        "Stop qualification selected an unknown control binding");
-  }
-  return *found;
-}
-
-[[nodiscard]] const core::RuntimeUnitDTO &
-require_execution_runtime_for_binding(const core::CellGraphDTO &graph,
-                                      const core::ControlDomainDTO &domain,
-                                      const core::ControlBindingDTO &binding) {
-  const auto component = std::find_if(
-      graph.controllable_components.begin(),
-      graph.controllable_components.end(), [&](const auto &candidate) {
-        return candidate.controllable_component_id ==
-               binding.controllable_component_id;
-      });
-  if (component == graph.controllable_components.end()) {
-    detail::fail_retained_bundle(
-        "Stop qualification binding lost its controllable component");
-  }
-  const auto match = std::find_if(
-      graph.runtime_units.begin(), graph.runtime_units.end(),
-      [&](const auto &runtime_unit) {
-        return runtime_unit.runtime_unit_id == binding.provider_runtime_unit_id;
-      });
-  const bool native_execution =
-      match != graph.runtime_units.end() &&
-      match->runtime_profile_id.value() ==
-          detail::kNativeExecutionRuntimeProfileId &&
-      match->runtime_profile_revision.value() ==
-          detail::native_execution_runtime_profile_revision() &&
-      detail::native_execution_runtime_configuration_is_qualified(
-          match->configuration);
-  const bool ros2_control_execution =
-      match != graph.runtime_units.end() &&
-      match->runtime_profile_id.value() ==
-          detail::kRos2ControlExecutionRuntimeProfileId &&
-      match->runtime_profile_revision.value() ==
-          detail::ros2_control_execution_runtime_profile_revision() &&
-      detail::ros2_control_execution_runtime_configuration_is_qualified(
-          match->configuration);
-  if ((!native_execution && !ros2_control_execution) ||
-      std::find(domain.runtime_unit_ids.begin(), domain.runtime_unit_ids.end(),
-                binding.provider_runtime_unit_id) ==
-          domain.runtime_unit_ids.end() ||
-      std::find(component->runtime_unit_ids.begin(),
-                component->runtime_unit_ids.end(),
-                binding.provider_runtime_unit_id) ==
-          component->runtime_unit_ids.end()) {
-    detail::fail_retained_bundle(
-        "Stop qualification binding's explicit provider runtime does not "
-        "resolve one exact execution runtime product");
-  }
-  return *match;
-}
-
-[[nodiscard]] std::uint64_t
-command_phase_budget_ns(const core::StopDeadlineBudgetDTO &budget,
-                        const core::StopBudgetPhaseId &command_phase_id) {
-  std::int64_t previous = 0;
-  for (const auto &phase : budget.phases) {
-    if (phase.phase_id == command_phase_id) {
-      if (phase.deadline_offset_ns <= previous) {
-        detail::fail_retained_bundle(
-            "Stop command phase has no positive issue-time window");
-      }
-      return static_cast<std::uint64_t>(phase.deadline_offset_ns - previous);
-    }
-    previous = phase.deadline_offset_ns;
-  }
-  detail::fail_retained_bundle(
-      "Stop command phase is absent from its exact deadline budget");
-}
-
-[[nodiscard]] std::optional<std::string_view>
-normalized_parameter_text(const core::JsonObjectDTO &parameters,
-                          std::string_view field) {
-  const auto found = parameters.find(std::string(field));
-  if (found == parameters.end()) {
-    return std::nullopt;
-  }
-  const auto *text = std::get_if<std::string>(&found->second.value);
-  if (text == nullptr || text->empty()) {
-    detail::fail_retained_bundle(
-        "normalized Stop parameter has an invalid text field");
-  }
-  return *text;
-}
-
-[[nodiscard]] PreparedControlQualification prepare_control_qualification(
+[[nodiscard]] PreparedControlArtifacts prepare_control_artifacts(
     const RetentionQualifiedDeployment &qualified,
-    const detail::BuildQualifiedRetentionContext &context,
     const core::ControlDomainDTO &domain,
     const detail::ICompilerInputArtifactSource &input_source) {
-  const auto &graph =
-      qualified.compiler_ir().applicability().composition().graph();
-  const auto &stops =
-      qualified.compiler_ir().applicability().stop_applicability();
-  const auto &sealed = context.stop_evidence();
-  std::vector<detail::BuildQualifiedStopImplementationEvidenceEntry>
-      selected_implementation_entries;
-  std::vector<detail::BuildQualifiedControlledStopSubstitutionEvidenceEntry>
-      selected_substitution_entries;
-  struct PendingImplementation final {
-    const detail::BuildQualifiedStopImplementationEvidenceEntry *entry;
-    core::ProductId product_id;
-  };
-  struct PendingSubstitution final {
-    const detail::BuildQualifiedControlledStopSubstitutionEvidenceEntry *entry;
-    core::ProductId product_id;
-  };
-  std::vector<PendingImplementation> pending_implementation;
-  std::vector<PendingSubstitution> pending_substitution;
-  std::optional<core::RetainedArtifactRefDTO> commissioning_ref;
-  std::optional<std::string> commissioning_bytes;
-
-  for (const auto &stop_value : stops) {
+  std::optional<core::RetainedArtifactRefDTO> expected;
+  std::optional<std::string> bytes;
+  for (const auto &stop_value :
+       qualified.compiler_ir().applicability().stop_applicability()) {
     const auto *stop =
         std::get_if<LogicalStoppableApplicabilityTemplate>(&stop_value);
-    if (stop == nullptr ||
-        stop->control_domain_id != domain.control_domain_id) {
+    if (stop == nullptr || stop->control_domain_id != domain.control_domain_id) {
       continue;
     }
-    const auto &binding =
-        require_control_binding(graph, stop->control_binding_id);
-    const auto &runtime =
-        require_execution_runtime_for_binding(graph, domain, binding);
-    const bool ros2_control_execution =
-        runtime.runtime_profile_id.value() ==
-        detail::kRos2ControlExecutionRuntimeProfileId;
-    const std::string_view implementation_id =
-        ros2_control_execution
-            ? detail::kRos2ControlExecutionRuntimeImplementationId
-            : detail::kNativeExecutionRuntimeImplementationId;
-    const core::ProductContractId runtime_contract_id(std::string(
-        ros2_control_execution
-            ? detail::kRos2ControlExecutionRuntimeProductContractId
-            : detail::kNativeExecutionRuntimeProductContractId));
-    const core::ProductContractRevision runtime_contract_revision =
-        ros2_control_execution
-            ? detail::ros2_control_execution_runtime_product_contract_revision()
-            : detail::native_execution_runtime_product_contract_revision();
-    const std::string_view invocation_lane_id =
-        ros2_control_execution ? kRos2ControlSoftwareHardInvocationLaneId
-                               : kNativeSoftwareHardInvocationLaneId;
-    const core::ProductId runtime_product_id(
-        ros2_control_execution
-            ? detail::ros2_control_execution_runtime_product_id(
-                  runtime.runtime_unit_id)
-            : detail::native_execution_runtime_product_id(
-                  runtime.runtime_unit_id));
-
     for (const auto &stage : stop->escalation_stages) {
-      if (stage.stage_kind == core::StopEscalationStageKind::kSoftwareHard) {
-        if (!stage.containment_command.provider_contract_ref.has_value() ||
-            !stage.containment_command.registered_command_kind_id.has_value()) {
-          detail::fail_retained_bundle(
-              "software-hard stage lost its exact registered provider command");
-        }
-        const std::optional<core::EndpointRoleId> endpoint =
-            stage.provider_command_endpoint.has_value()
-                ? std::optional<core::EndpointRoleId>(
-                      stage.provider_command_endpoint->endpoint_role_id)
-                : std::nullopt;
-        const std::uint64_t issue_budget = command_phase_budget_ns(
-            stop->deadline_budget, stage.containment_command.command_phase_id);
-        const detail::BuildQualifiedStopImplementationEvidenceEntry *match =
-            nullptr;
-        for (const auto &candidate : sealed.implementation_entries()) {
-          if (candidate.implementation_id != implementation_id ||
-              candidate.provider_contract_ref !=
-                  *stage.containment_command.provider_contract_ref ||
-              candidate.product_contract_id != runtime_contract_id ||
-              candidate.product_contract_revision !=
-                  runtime_contract_revision ||
-              candidate.registered_command_kind_id !=
-                  *stage.containment_command.registered_command_kind_id ||
-              candidate.endpoint_role_id != endpoint ||
-              candidate.invocation_lane_id.value() != invocation_lane_id ||
-              candidate.qualified_issue_time_bound_ns > issue_budget) {
-            continue;
-          }
-          if (match != nullptr) {
-            detail::fail_retained_bundle(
-                "software-hard stage resolves more than one sealed "
-                "implementation qualification");
-          }
-          match = &candidate;
-        }
-        if (match == nullptr) {
-          detail::fail_retained_bundle(
-              "software-hard stage has no exact current build qualification");
-        }
-        if (std::find(selected_implementation_entries.begin(),
-                      selected_implementation_entries.end(),
-                      *match) == selected_implementation_entries.end()) {
-          selected_implementation_entries.push_back(*match);
-        }
-        const PendingImplementation pending{match, runtime_product_id};
-        if (std::find_if(pending_implementation.begin(),
-                         pending_implementation.end(), [&](const auto &value) {
-                           return *value.entry == *pending.entry &&
-                                  value.product_id == pending.product_id;
-                         }) == pending_implementation.end()) {
-          pending_implementation.push_back(pending);
-        }
+      if (!stage.commissioned_stop_interface.has_value()) {
+        continue;
       }
-
-      if (stage.default_contract_parameters.has_value() &&
-          normalized_parameter_text(*stage.default_contract_parameters,
-                                    "stop_mode") ==
-              std::optional<std::string_view>("soft_on_path") &&
-          normalized_parameter_text(*stage.default_contract_parameters,
-                                    "recoverable_substitution_mode") ==
-              std::optional<std::string_view>("spring_back_hold")) {
-        if (!stage.containment_command.provider_contract_ref.has_value()) {
-          detail::fail_retained_bundle("qualified controlled Stop substitution "
-                                       "lost its provider contract");
-        }
-        const detail::BuildQualifiedControlledStopSubstitutionEvidenceEntry
-            *match = nullptr;
-        for (const auto &candidate : sealed.controlled_substitution_entries()) {
-          if (candidate.implementation_id != implementation_id ||
-              candidate.provider_contract_ref !=
-                  *stage.containment_command.provider_contract_ref ||
-              candidate.product_contract_id != runtime_contract_id ||
-              candidate.product_contract_revision !=
-                  runtime_contract_revision ||
-              candidate.requested_stop_mode !=
-                  core::MotionControlledStopMode::kSoftOnPath ||
-              candidate.executed_stop_mode !=
-                  core::MotionControlledStopMode::kSpringBackHold) {
-            continue;
-          }
-          if (match != nullptr) {
-            detail::fail_retained_bundle(
-                "controlled Stop substitution resolves more than one sealed "
-                "qualification");
-          }
-          match = &candidate;
-        }
-        if (match == nullptr) {
-          detail::fail_retained_bundle("controlled Stop substitution has no "
-                                       "exact current build qualification");
-        }
-        if (std::find(selected_substitution_entries.begin(),
-                      selected_substitution_entries.end(),
-                      *match) == selected_substitution_entries.end()) {
-          selected_substitution_entries.push_back(*match);
-        }
-        const PendingSubstitution pending{match, runtime_product_id};
-        if (std::find_if(pending_substitution.begin(),
-                         pending_substitution.end(), [&](const auto &value) {
-                           return *value.entry == *pending.entry &&
-                                  value.product_id == pending.product_id;
-                         }) == pending_substitution.end()) {
-          pending_substitution.push_back(pending);
-        }
+      const auto &candidate = stage.commissioned_stop_interface
+                                  ->commissioning_evidence_artifact_ref;
+      if (expected.has_value() && *expected != candidate) {
+        detail::fail_retained_bundle(
+            "one control domain selects more than one commissioning evidence package");
       }
-
-      if (stage.commissioned_stop_interface.has_value()) {
-        const auto &candidate_ref = stage.commissioned_stop_interface
-                                        ->commissioning_evidence_artifact_ref;
-        if (commissioning_ref.has_value() &&
-            *commissioning_ref != candidate_ref) {
-          detail::fail_retained_bundle("one control domain selects more than "
-                                       "one commissioning evidence package");
-        }
-        const auto bytes = input_source.get_verified(
-            candidate_ref.content_addressed_store_key,
-            candidate_ref.content_digest, candidate_ref.byte_size);
-        if (!bytes.has_value() || bytes->empty() ||
-            static_cast<std::uint64_t>(bytes->size()) !=
-                candidate_ref.byte_size ||
-            sha256_digest(*bytes) != candidate_ref.content_digest.value()) {
-          detail::fail_retained_bundle("commissioned Stop evidence disappeared "
-                                       "before retention preflight");
-        }
-        commissioning_ref = candidate_ref;
-        commissioning_bytes = *bytes;
+      const auto loaded = input_source.get_verified(
+          candidate.content_addressed_store_key, candidate.content_digest,
+          candidate.byte_size);
+      if (!loaded.has_value() || loaded->empty() ||
+          static_cast<std::uint64_t>(loaded->size()) != candidate.byte_size ||
+          sha256_digest(*loaded) != candidate.content_digest.value()) {
+        detail::fail_retained_bundle(
+            "commissioned Stop evidence disappeared before retention preflight");
       }
+      expected = candidate;
+      bytes = *loaded;
     }
   }
-
-  PreparedControlQualification result;
-  std::sort(
-      selected_implementation_entries.begin(),
-      selected_implementation_entries.end(),
-      [](const auto &left, const auto &right) {
-        const auto key = [](const auto &value) {
-          return std::tuple{
-              value.implementation_id,
-              value.implementation_source_build_fingerprint.value(),
-              value.product_contract_id.value(),
-              value.product_contract_revision.value(),
-              value.provider_contract_ref.provider_contract_role_id.value(),
-              value.provider_contract_ref.contract_schema_id.value(),
-              value.provider_contract_ref.contract_schema_revision.value(),
-              value.registered_command_kind_id.value(),
-              value.endpoint_role_id.has_value() ? 1 : 0,
-              value.endpoint_role_id.has_value()
-                  ? value.endpoint_role_id->value()
-                  : std::string{},
-              value.invocation_lane_id.value()};
-        };
-        return key(left) < key(right);
-      });
-  std::sort(
-      selected_substitution_entries.begin(),
-      selected_substitution_entries.end(),
-      [](const auto &left, const auto &right) {
-        const auto key = [](const auto &value) {
-          return std::tuple{
-              value.implementation_id,
-              value.implementation_source_build_fingerprint.value(),
-              value.product_contract_id.value(),
-              value.product_contract_revision.value(),
-              value.provider_contract_ref.provider_contract_role_id.value(),
-              value.provider_contract_ref.contract_schema_id.value(),
-              value.provider_contract_ref.contract_schema_revision.value(),
-              static_cast<std::uint8_t>(value.requested_stop_mode),
-              static_cast<std::uint8_t>(value.executed_stop_mode)};
-        };
-        return key(left) < key(right);
-      });
-  std::optional<core::RetainedArtifactRefDTO> implementation_ref;
-  if (!selected_implementation_entries.empty()) {
-    if (!sealed.implementation_runner_contract_digest().has_value()) {
-      throw std::logic_error(
-          "sealed implementation evidence lost its runner contract");
-    }
-    std::string bytes =
-        detail::emit_stop_implementation_qualification_evidence_package(
-            *sealed.implementation_runner_contract_digest(),
-            selected_implementation_entries);
-    implementation_ref = retained_artifact_ref(
-        core::kStopImplementationQualificationArtifactRole,
-        core::kStopImplementationQualificationMediaType, bytes);
-    result.conditional_artifacts.push_back(detail::RetainedArtifactInput{
-        implementation_ref->artifact_role_id, implementation_ref->media_type,
-        std::move(bytes)});
-  }
-  std::optional<core::RetainedArtifactRefDTO> substitution_ref;
-  if (!selected_substitution_entries.empty()) {
-    if (!sealed.controlled_substitution_runner_contract_digest().has_value()) {
-      throw std::logic_error(
-          "sealed substitution evidence lost its runner contract");
-    }
-    std::string bytes = detail::
-        emit_controlled_stop_substitution_qualification_evidence_package(
-            *sealed.controlled_substitution_runner_contract_digest(),
-            selected_substitution_entries);
-    substitution_ref = retained_artifact_ref(
-        core::kControlledStopSubstitutionQualificationArtifactRole,
-        core::kControlledStopSubstitutionQualificationMediaType, bytes);
-    result.conditional_artifacts.push_back(detail::RetainedArtifactInput{
-        substitution_ref->artifact_role_id, substitution_ref->media_type,
-        std::move(bytes)});
-  }
-  if (commissioning_bytes.has_value()) {
-    const auto exact_ref = retained_artifact_ref(
+  PreparedControlArtifacts result;
+  if (bytes.has_value()) {
+    const auto exact = retained_artifact_ref(
         core::kStopInterfaceCommissioningArtifactRole,
-        core::kStopInterfaceCommissioningMediaType, *commissioning_bytes);
-    if (!commissioning_ref.has_value() || exact_ref != *commissioning_ref) {
-      detail::fail_retained_bundle("commissioning evidence reference differs "
-                                   "from the exact retained bytes");
+        core::kStopInterfaceCommissioningMediaType, *bytes);
+    if (!expected.has_value() || exact != *expected) {
+      detail::fail_retained_bundle(
+          "commissioning evidence reference differs from the exact retained bytes");
     }
     result.conditional_artifacts.push_back(detail::RetainedArtifactInput{
-        exact_ref.artifact_role_id, exact_ref.media_type,
-        std::move(*commissioning_bytes)});
+        exact.artifact_role_id, exact.media_type, std::move(*bytes)});
   }
-
-  for (const auto &pending : pending_implementation) {
-    if (!implementation_ref.has_value()) {
-      throw std::logic_error(
-          "software-hard qualification lost its retained package");
-    }
-    result.implementation_qualifications.push_back(
-        core::StopImplementationQualificationDTO{
-            pending.entry->registered_command_kind_id,
-            pending.entry->provider_contract_ref, pending.product_id,
-            pending.entry->product_contract_id,
-            pending.entry->product_contract_revision,
-            pending.entry->endpoint_role_id, pending.entry->invocation_lane_id,
-            *implementation_ref});
-  }
-  for (const auto &pending : pending_substitution) {
-    if (!substitution_ref.has_value()) {
-      throw std::logic_error(
-          "controlled Stop substitution lost its retained package");
-    }
-    result.substitution_qualifications.push_back(
-        core::ControlledStopSubstitutionQualificationDTO{
-            pending.entry->provider_contract_ref, pending.product_id,
-            pending.entry->product_contract_id,
-            pending.entry->product_contract_revision,
-            pending.entry->requested_stop_mode,
-            pending.entry->executed_stop_mode, *substitution_ref});
-  }
-  std::sort(result.conditional_artifacts.begin(),
-            result.conditional_artifacts.end(),
-            [](const auto &left, const auto &right) {
-              return left.artifact_role_id < right.artifact_role_id;
-            });
   return result;
 }
+
 
 template <typename Qualified>
 void require_exact_requalified_catalog_record(
@@ -1448,7 +1075,6 @@ void require_qualified_structural_subset_before_store(
 [[nodiscard]] PreparedPlanningCollisionProduct
 prepare_planning_collision_product_before_store(
     const RetentionQualifiedDeployment &qualified,
-    const detail::BuildQualifiedRetentionContext &retention_context,
     const detail::ICompilerInputArtifactSource &input_source,
     std::span<const BuildQualifiedStructuralModelPreparation>
         structural_model_preparations) {
@@ -1841,24 +1467,20 @@ prepare_planning_collision_product_before_store(
     control_domain_artifacts.reserve(
         composition.graph().control_domains.size());
     for (const auto &domain : composition.graph().control_domains) {
-      auto qualification = prepare_control_qualification(
-          qualified, retention_context, domain, input_source);
+      auto prepared =
+          prepare_control_artifacts(qualified, domain, input_source);
       std::string control_bytes = detail::emit_control_domain_control(
-          qualified.compiler_ir(), domain.control_domain_id,
-          qualification.implementation_qualifications,
-          qualification.substitution_qualifications);
+          qualified.compiler_ir(), domain.control_domain_id);
       detail::require_control_domain_control_matches(
-          control_bytes, qualified.compiler_ir(), domain.control_domain_id,
-          qualification.implementation_qualifications,
-          qualification.substitution_qualifications);
-      qualification.conditional_artifacts.push_back(
+          control_bytes, qualified.compiler_ir(), domain.control_domain_id);
+      prepared.conditional_artifacts.push_back(
           detail::RetainedArtifactInput{
               core::ArtifactRoleId(
                   std::string(detail::kControlDomainControlArtifactRole)),
               std::string(detail::kControlDomainControlMediaType),
               std::move(control_bytes)});
-      std::sort(qualification.conditional_artifacts.begin(),
-                qualification.conditional_artifacts.end(),
+      std::sort(prepared.conditional_artifacts.begin(),
+                prepared.conditional_artifacts.end(),
                 [](const auto &left, const auto &right) {
                   return left.artifact_role_id < right.artifact_role_id;
                 });
@@ -1869,48 +1491,15 @@ prepare_planning_collision_product_before_store(
           ProductPlacement::kControlDomain,
           qualified_control_contract.product_contract_id(),
           qualified_control_contract.product_contract_revision(),
-          qualification.conditional_artifacts);
+          prepared.conditional_artifacts);
       control_domain_artifacts.push_back(detail::PreparedControlDomainArtifact{
           domain.control_domain_id,
-          std::move(qualification.conditional_artifacts),
-          std::move(qualification.implementation_qualifications),
-          std::move(qualification.substitution_qualifications)});
+          std::move(prepared.conditional_artifacts)});
     }
     control_domain_contract = &qualified_control_contract;
   }
   std::vector<detail::PreparedRuntimeUnitArtifact> runtime_unit_artifacts;
   runtime_unit_artifacts.reserve(composition.graph().runtime_units.size());
-  std::set<std::string, std::less<>> qualified_runtime_product_ids;
-  for (const auto &artifact : control_domain_artifacts) {
-    for (const auto &qualification :
-         artifact.stop_implementation_qualifications) {
-      qualified_runtime_product_ids.insert(
-          qualification.product_id.value());
-    }
-    for (const auto &qualification :
-         artifact.controlled_stop_substitution_qualifications) {
-      qualified_runtime_product_ids.insert(
-          qualification.product_id.value());
-    }
-  }
-  std::map<std::string, const detail::StopImplementationBuildIdentity *,
-           std::less<>> stop_build_identities;
-  for (const auto &identity :
-       retention_context.stop_evidence().implementation_build_identities()) {
-    if (identity.implementation_id !=
-            detail::kNativeExecutionRuntimeImplementationId &&
-        identity.implementation_id !=
-            detail::kRos2ControlExecutionRuntimeImplementationId) {
-      continue;
-    }
-    if (!stop_build_identities.emplace(identity.implementation_id, &identity)
-             .second) {
-      throw std::logic_error(
-          "sealed Stop evidence repeats an execution implementation build "
-          "identity");
-    }
-  }
-  std::set<std::string, std::less<>> materialized_build_identity_product_ids;
   for (const auto &unit : composition.graph().runtime_units) {
     detail::PreparedRuntimeUnitKind kind;
     const BuildQualifiedProductContract *qualified_runtime_contract = nullptr;
@@ -1920,9 +1509,6 @@ prepare_planning_collision_product_before_store(
     std::string_view manifest_media_type;
     std::string_view launchable_role;
     std::string_view launchable_media_type;
-    std::string_view build_identity_role;
-    std::string_view build_identity_media_type;
-    std::optional<std::string> implementation_build_identity;
     core::ProductId product_id(std::string{});
     if (unit.runtime_profile_id.value() == detail::kReferenceRuntimeProfileId &&
         unit.runtime_profile_revision.value() ==
@@ -1971,19 +1557,6 @@ prepare_planning_collision_product_before_store(
           detail::kNativeExecutionRuntimeLaunchDescriptorMediaType;
       product_id = core::ProductId(
           detail::native_execution_runtime_product_id(unit.runtime_unit_id));
-      build_identity_role =
-          detail::kNativeExecutionRuntimeBuildIdentityArtifactRole;
-      build_identity_media_type =
-          detail::kNativeExecutionRuntimeBuildIdentityMediaType;
-      const auto identity = stop_build_identities.find(
-          std::string(detail::kNativeExecutionRuntimeImplementationId));
-      if (identity != stop_build_identities.end()) {
-        implementation_build_identity =
-            identity->second->canonical_build_closure_bytes;
-        if (qualified_runtime_product_ids.contains(product_id.value())) {
-          materialized_build_identity_product_ids.insert(product_id.value());
-        }
-      }
     } else if (unit.runtime_profile_id.value() ==
                    detail::kRos2ControlExecutionRuntimeProfileId &&
                unit.runtime_profile_revision.value() ==
@@ -2012,22 +1585,9 @@ prepare_planning_collision_product_before_store(
           detail::kRos2ControlExecutionRuntimeLaunchDescriptorArtifactRole;
       launchable_media_type =
           detail::kRos2ControlExecutionRuntimeLaunchDescriptorMediaType;
-      build_identity_role =
-          detail::kRos2ControlExecutionRuntimeBuildIdentityArtifactRole;
-      build_identity_media_type =
-          detail::kRos2ControlExecutionRuntimeBuildIdentityMediaType;
       product_id = core::ProductId(
           detail::ros2_control_execution_runtime_product_id(
               unit.runtime_unit_id));
-      const auto identity = stop_build_identities.find(
-          std::string(detail::kRos2ControlExecutionRuntimeImplementationId));
-      if (identity != stop_build_identities.end()) {
-        implementation_build_identity =
-            identity->second->canonical_build_closure_bytes;
-        if (qualified_runtime_product_ids.contains(product_id.value())) {
-          materialized_build_identity_product_ids.insert(product_id.value());
-        }
-      }
     } else {
       detail::fail_retained_bundle(
           "runtime unit selects no build-qualified retained runtime product");
@@ -2038,12 +1598,6 @@ prepare_planning_collision_product_before_store(
         {core::ArtifactRoleId(std::string(manifest_role)),
          std::string(manifest_media_type), manifest},
     };
-    if (implementation_build_identity.has_value()) {
-      runtime_inputs.push_back(detail::RetainedArtifactInput{
-          core::ArtifactRoleId(std::string(build_identity_role)),
-          std::string(build_identity_media_type),
-          *implementation_build_identity});
-    }
     std::sort(runtime_inputs.begin(), runtime_inputs.end(),
               [](const auto &left, const auto &right) {
                 return left.artifact_role_id < right.artifact_role_id;
@@ -2056,14 +1610,7 @@ prepare_planning_collision_product_before_store(
         runtime_inputs);
     runtime_unit_artifacts.push_back(detail::PreparedRuntimeUnitArtifact{
         unit.runtime_unit_id, std::move(manifest), std::move(launchable),
-        std::move(implementation_build_identity), kind,
-        qualified_runtime_contract});
-  }
-  if (materialized_build_identity_product_ids !=
-      qualified_runtime_product_ids) {
-    detail::fail_retained_bundle(
-        "Stop qualification names a runtime product outside the exact "
-        "retained runtime-unit set");
+        kind, qualified_runtime_contract});
   }
   std::vector<core::RetainedSchemaArtifactRefDTO> schema_artifacts;
   std::vector<core::CatalogRecordKind> schema_artifact_kinds;
@@ -2326,17 +1873,6 @@ void require_verified_current_bundle_artifacts(
         static_cast<void>(
             detail::parse_and_verify_control_domain_control(*bytes));
         saw_control = true;
-      } else if (artifact->artifact_role_id.value() ==
-                 core::kStopImplementationQualificationArtifactRole) {
-        static_cast<void>(
-            detail::parse_stop_implementation_qualification_evidence_package(
-                *bytes));
-      } else if (artifact->artifact_role_id.value() ==
-                 core::kControlledStopSubstitutionQualificationArtifactRole) {
-        static_cast<void>(
-            detail::
-                parse_controlled_stop_substitution_qualification_evidence_package(
-                    *bytes));
       }
     }
     if (!saw_control) {
@@ -2379,10 +1915,7 @@ void require_verified_current_bundle_artifacts(
     const auto &expected = prepared.runtime_unit_artifacts[index];
     if (group.runtime_unit_id != expected.runtime_unit_id ||
         group.products.size() != 1U ||
-        group.products.front().artifact_refs.size() !=
-            2U +
-                static_cast<std::size_t>(
-                    expected.implementation_build_identity_bytes.has_value())) {
+        group.products.front().artifact_refs.size() != 2U) {
       throw std::logic_error(
           "reloaded runtime-unit product has an incoherent subject or "
           "artifact set");
@@ -2401,13 +1934,8 @@ void require_verified_current_bundle_artifacts(
         : expected.kind == detail::PreparedRuntimeUnitKind::kNativeExecution
             ? detail::kNativeExecutionRuntimeLaunchDescriptorArtifactRole
             : detail::kRos2ControlExecutionRuntimeLaunchDescriptorArtifactRole;
-    const std::string_view build_identity_role =
-        expected.kind == detail::PreparedRuntimeUnitKind::kRos2ControlExecution
-            ? detail::kRos2ControlExecutionRuntimeBuildIdentityArtifactRole
-            : detail::kNativeExecutionRuntimeBuildIdentityArtifactRole;
     std::optional<std::string> manifest;
     std::optional<std::string> launchable;
-    std::optional<std::string> implementation_build_identity;
     for (const auto &artifact : product.artifact_refs) {
       const auto bytes = artifact_store.get_verified(
           artifact.content_addressed_store_key, artifact.content_digest,
@@ -2420,15 +1948,11 @@ void require_verified_current_bundle_artifacts(
         manifest = *bytes;
       } else if (artifact.artifact_role_id.value() == launchable_role) {
         launchable = *bytes;
-      } else if (artifact.artifact_role_id.value() == build_identity_role) {
-        implementation_build_identity = *bytes;
       }
     }
     if (!manifest.has_value() || !launchable.has_value() ||
         *manifest != expected.manifest_bytes ||
-        *launchable != expected.launchable_bytes ||
-        implementation_build_identity !=
-            expected.implementation_build_identity_bytes) {
+        *launchable != expected.launchable_bytes) {
       throw std::runtime_error(
           "reloaded runtime-unit product differs from its prepared bytes");
     }
@@ -2438,18 +1962,10 @@ void require_verified_current_bundle_artifacts(
     } else if (expected.kind ==
                detail::PreparedRuntimeUnitKind::kNativeExecution) {
       detail::require_native_execution_runtime_product_matches_retained_bundle(
-          *manifest, *launchable,
-          implementation_build_identity.has_value()
-              ? std::optional<std::string_view>(*implementation_build_identity)
-              : std::nullopt,
-          value, group.runtime_unit_id);
+          *manifest, *launchable, value, group.runtime_unit_id);
     } else {
       detail::require_ros2_control_execution_runtime_product_matches_retained_bundle(
-          *manifest, *launchable,
-          implementation_build_identity.has_value()
-              ? std::optional<std::string_view>(*implementation_build_identity)
-              : std::nullopt,
-          value, group.runtime_unit_id);
+          *manifest, *launchable, value, group.runtime_unit_id);
     }
   }
 }
@@ -2501,12 +2017,10 @@ void detail::require_pinocchio_family_mimic_profile(
 detail::BuildQualifiedRetentionContext::BuildQualifiedRetentionContext(
     core::RetainedNodeEnvironmentDTO node_environment,
     core::ContentDigest compiler_contract_digest,
-    core::ContentDigest compiler_build_digest,
-    BuildQualifiedStopEvidenceClosure stop_evidence)
+    core::ContentDigest compiler_build_digest)
     : node_environment_(std::move(node_environment)),
       compiler_contract_digest_(std::move(compiler_contract_digest)),
-      compiler_build_digest_(std::move(compiler_build_digest)),
-      stop_evidence_(std::move(stop_evidence)) {
+      compiler_build_digest_(std::move(compiler_build_digest)) {
   detail::require_retained_portable_identity(node_environment_.catalog_id,
                                              "node_environment.catalog_id");
   detail::require_retained_portable_identity(
@@ -2525,11 +2039,10 @@ detail::BuildQualifiedRetentionContext::BuildQualifiedRetentionContext(
     core::RetainedNodeEnvironmentDTO node_environment,
     core::ContentDigest compiler_contract_digest,
     core::ContentDigest compiler_build_digest,
-    std::vector<std::shared_ptr<const BuildQualifiedManifest>> manifests,
-    BuildQualifiedStopEvidenceClosure stop_evidence)
+    std::vector<std::shared_ptr<const BuildQualifiedManifest>> manifests)
     : BuildQualifiedRetentionContext(
           std::move(node_environment), std::move(compiler_contract_digest),
-          std::move(compiler_build_digest), std::move(stop_evidence)) {
+          std::move(compiler_build_digest)) {
   if (manifests.size() != 3U || manifests[0] == nullptr ||
       manifests[1] == nullptr || manifests[2] == nullptr ||
       manifests[0]->key().manifest_kind !=
@@ -2658,9 +2171,7 @@ detail::RetainedBundleMaterializer::materialize_prepared(
           "prepared control-domain product lost its required artifact");
     }
     detail::require_control_domain_control_matches(
-        control_input->bytes, qualified.compiler_ir(), input.control_domain_id,
-        input.stop_implementation_qualifications,
-        input.controlled_stop_substitution_qualifications);
+        control_input->bytes, qualified.compiler_ir(), input.control_domain_id);
     core::RetainedProductDTO product = detail::build_and_retain_product(
         core::ProductId(
             detail::control_domain_control_product_id(input.control_domain_id)),
@@ -2687,9 +2198,7 @@ detail::RetainedBundleMaterializer::materialize_prepared(
           "control-domain raw artifact vanished after verified retention");
     }
     detail::require_control_domain_control_matches(
-        *readback, qualified.compiler_ir(), input.control_domain_id,
-        input.stop_implementation_qualifications,
-        input.controlled_stop_substitution_qualifications);
+        *readback, qualified.compiler_ir(), input.control_domain_id);
     control_domain_products.push_back(core::RetainedControlDomainProductsDTO{
         input.control_domain_id,
         std::vector<core::RetainedProductDTO>{std::move(product)}});
@@ -2706,8 +2215,6 @@ detail::RetainedBundleMaterializer::materialize_prepared(
     std::string_view manifest_media_type;
     std::string_view launchable_role;
     std::string_view launchable_media_type;
-    std::string_view build_identity_role;
-    std::string_view build_identity_media_type;
     core::ProductId product_id(std::string{});
     switch (input.kind) {
     case detail::PreparedRuntimeUnitKind::kReference:
@@ -2742,10 +2249,6 @@ detail::RetainedBundleMaterializer::materialize_prepared(
           detail::kNativeExecutionRuntimeLaunchDescriptorMediaType;
       product_id = core::ProductId(
           detail::native_execution_runtime_product_id(input.runtime_unit_id));
-      build_identity_role =
-          detail::kNativeExecutionRuntimeBuildIdentityArtifactRole;
-      build_identity_media_type =
-          detail::kNativeExecutionRuntimeBuildIdentityMediaType;
       break;
     case detail::PreparedRuntimeUnitKind::kRos2ControlExecution:
       detail::require_ros2_control_execution_runtime_manifest_matches(
@@ -2767,10 +2270,6 @@ detail::RetainedBundleMaterializer::materialize_prepared(
       product_id = core::ProductId(
           detail::ros2_control_execution_runtime_product_id(
               input.runtime_unit_id));
-      build_identity_role =
-          detail::kRos2ControlExecutionRuntimeBuildIdentityArtifactRole;
-      build_identity_media_type =
-          detail::kRos2ControlExecutionRuntimeBuildIdentityMediaType;
       break;
     }
     std::vector<detail::RetainedArtifactInput> runtime_artifacts{
@@ -2779,12 +2278,6 @@ detail::RetainedBundleMaterializer::materialize_prepared(
         {core::ArtifactRoleId(std::string(manifest_role)),
          std::string(manifest_media_type), input.manifest_bytes},
     };
-    if (input.implementation_build_identity_bytes.has_value()) {
-      runtime_artifacts.push_back(detail::RetainedArtifactInput{
-          core::ArtifactRoleId(std::string(build_identity_role)),
-          std::string(build_identity_media_type),
-          *input.implementation_build_identity_bytes});
-    }
     std::sort(runtime_artifacts.begin(), runtime_artifacts.end(),
               [](const auto &left, const auto &right) {
                 return left.artifact_role_id < right.artifact_role_id;
@@ -2796,7 +2289,6 @@ detail::RetainedBundleMaterializer::materialize_prepared(
         artifact_store);
     std::optional<std::string> retained_manifest;
     std::optional<std::string> retained_launchable;
-    std::optional<std::string> retained_build_identity;
     for (const auto &artifact : product.artifact_refs) {
       const auto readback = artifact_store.get_verified(
           artifact.content_addressed_store_key, artifact.content_digest,
@@ -2809,14 +2301,11 @@ detail::RetainedBundleMaterializer::materialize_prepared(
         retained_manifest = *readback;
       } else if (artifact.artifact_role_id.value() == launchable_role) {
         retained_launchable = *readback;
-      } else if (artifact.artifact_role_id.value() == build_identity_role) {
-        retained_build_identity = *readback;
       }
     }
     if (!retained_manifest.has_value() || !retained_launchable.has_value() ||
         *retained_manifest != input.manifest_bytes ||
-        *retained_launchable != input.launchable_bytes ||
-        retained_build_identity != input.implementation_build_identity_bytes) {
+        *retained_launchable != input.launchable_bytes) {
       throw std::runtime_error(
           "runtime-unit product failed exact artifact read-back");
     }
@@ -2887,19 +2376,13 @@ detail::RetainedBundleMaterializer::materialize_store_and_reload_production(
         structural_model_preparations,
     ICatalogArtifactStore &catalog_artifact_store,
     IRawArtifactStore &artifact_store,
-    IRetainedBundleRepository &bundle_repository,
-    std::span<const StopQualificationEvidenceCandidate>
-        stop_evidence_candidates) {
-  const BuildQualifiedRetentionContext preflight_context =
-      BuildQualifiedRetentionAuthority::qualify(stop_evidence_candidates);
+    IRetainedBundleRepository &bundle_repository) {
   const PreparedPlanningCollisionProduct prepared =
       prepare_planning_collision_product_before_store(
-          qualified, preflight_context, input_artifact_source,
-          structural_model_preparations);
+          qualified, input_artifact_source, structural_model_preparations);
   require_runtime_contracts_before_store(qualified);
   const BuildQualifiedRetentionContext context =
-      BuildQualifiedRetentionAuthority::qualify_persisted(
-          manifest_repository, stop_evidence_candidates);
+      BuildQualifiedRetentionAuthority::qualify_persisted(manifest_repository);
   retain_prepared_inputs(prepared, input_artifact_source,
                          catalog_artifact_store, artifact_store);
   const auto bundle = materialize_prepared(
@@ -2940,8 +2423,7 @@ detail::RetainedBundleMaterializer::materialize(
     IRawArtifactStore &artifact_store) {
   const PreparedPlanningCollisionProduct prepared =
       prepare_planning_collision_product_before_store(
-          qualified, context, input_artifact_source,
-          structural_model_preparations);
+          qualified, input_artifact_source, structural_model_preparations);
   require_runtime_contracts_before_store(qualified);
   retain_prepared_inputs(prepared, input_artifact_source,
                          catalog_artifact_store, artifact_store);
