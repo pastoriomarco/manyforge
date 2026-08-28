@@ -651,33 +651,39 @@ def create_headless_router(
 
     @router.post("/api/scene/transactions")
     def scene_commit(body: ComposerSceneTransactionRequest):
-        if body.expected_draft_id is not None:
-            draft = state.draft_session.snapshot()
-            if (
-                draft["draft_id"] != body.expected_draft_id
-                or draft["draft_revision"] != body.expected_draft_revision
-            ):
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "code": "scene_transaction_draft_stale",
-                        "message": (
-                            "Scene edit does not identify the current authoritative Draft"
-                        ),
-                    },
-                )
         owner_request = SceneTransactionRequest.model_validate(
             body.model_dump(
                 mode="json",
                 exclude={"expected_draft_id", "expected_draft_revision"},
             )
         )
-        return _call_scene(
-            lambda: client.commit_scene_transaction(
-                owner_request.model_dump(mode="json")
-            ),
-            owner_request,
-        )
+
+        def commit_owner_scene():
+            return _call_scene(
+                lambda: client.commit_scene_transaction(
+                    owner_request.model_dump(mode="json")
+                ),
+                owner_request,
+            )
+
+        if body.expected_draft_id is None:
+            return commit_owner_scene()
+        try:
+            return state.draft_session.execute_if_current(
+                draft_id=body.expected_draft_id,
+                expected_revision=body.expected_draft_revision,
+                effect=commit_owner_scene,
+            )
+        except DraftSessionError as error:
+            raise HTTPException(
+                status_code=error.status_code,
+                detail={
+                    "code": "scene_transaction_draft_stale",
+                    "message": (
+                        "Scene edit does not identify the current authoritative Draft"
+                    ),
+                },
+            ) from error
 
     @router.get("/api/execution/alarms")
     def alarms(

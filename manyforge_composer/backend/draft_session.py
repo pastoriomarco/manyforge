@@ -9,7 +9,7 @@ from pathlib import Path
 import re
 import threading
 import uuid
-from typing import Any, Callable, NoReturn
+from typing import Any, Callable, NoReturn, TypeVar
 
 from manyforge_behavior.catalog import NodeCatalog
 from manyforge_behavior.canonical_artifact import (
@@ -86,6 +86,7 @@ _ASSISTANT_PROPOSAL_MUTATIONS = frozenset(
 )
 _PORTABLE_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_.-]*$")
 _PORTABLE_ID_MAX_BYTES = 128
+_T = TypeVar("_T")
 
 
 def _is_portable_id(value: Any) -> bool:
@@ -1055,6 +1056,31 @@ class ComposerDraftSession:
                     "receivedDraftRevision": expected_revision,
                 },
             )
+
+    def execute_if_current(
+        self,
+        *,
+        draft_id: str,
+        expected_revision: int,
+        effect: Callable[[], _T],
+    ) -> _T:
+        """Run one external owner effect while this Draft fence stays exact.
+
+        Scene authoring is committed by the logical-scene owner, not by this
+        session. Holding the existing Draft lock across that single call keeps
+        another Composer mutation from invalidating the checked Draft between
+        validation and the owner effect. The scene owner still owns admission,
+        replay, projection, rollback, and the resulting scene revision.
+        """
+
+        if not callable(effect):
+            raise TypeError("Draft-fenced effect must be callable")
+        with self._lock:
+            self._require_identity_locked(
+                draft_id=draft_id,
+                expected_revision=expected_revision,
+            )
+            return effect()
 
     def require_replace_allowed(
         self,

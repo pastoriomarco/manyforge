@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from pathlib import Path
+import threading
 
 import pytest
 
@@ -95,6 +96,76 @@ def _pick_macro_arguments() -> dict:
         "blackboard_key": "planning.pick_plan",
         "instance_prefix": "authored_pick",
     }
+
+
+def test_external_owner_effect_keeps_the_checked_draft_current() -> None:
+    session = ComposerDraftSession(_program())
+    draft = session.snapshot()
+    effect_entered = threading.Event()
+    release_effect = threading.Event()
+    mutation_started = threading.Event()
+    mutation_finished = threading.Event()
+    results: list[str] = []
+
+    def effect() -> str:
+        effect_entered.set()
+        assert release_effect.wait(timeout=2)
+        results.append("effect")
+        return "committed"
+
+    def run_effect() -> None:
+        assert session.execute_if_current(
+            draft_id=draft["draft_id"],
+            expected_revision=draft["draft_revision"],
+            effect=effect,
+        ) == "committed"
+
+    def mutate_draft() -> None:
+        mutation_started.set()
+        session.mutate(
+            tool_id="scene_draft_add_object",
+            arguments={"scene_resource": _box_resource("queued")},
+            expected_revision=draft["draft_revision"],
+            catalog=build_node_environment().catalog,
+            draft_id=draft["draft_id"],
+        )
+        results.append("mutation")
+        mutation_finished.set()
+
+    effect_thread = threading.Thread(target=run_effect)
+    mutation_thread = threading.Thread(target=mutate_draft)
+    effect_thread.start()
+    assert effect_entered.wait(timeout=2)
+    mutation_thread.start()
+    assert mutation_started.wait(timeout=2)
+    assert not mutation_finished.wait(timeout=0.05)
+    release_effect.set()
+    effect_thread.join(timeout=2)
+    mutation_thread.join(timeout=2)
+
+    assert not effect_thread.is_alive()
+    assert not mutation_thread.is_alive()
+    assert results == ["effect", "mutation"]
+    assert session.revision == draft["draft_revision"] + 1
+
+
+def test_stale_draft_never_runs_external_owner_effect() -> None:
+    session = ComposerDraftSession(_program())
+    called = False
+
+    def effect() -> None:
+        nonlocal called
+        called = True
+
+    with pytest.raises(DraftSessionError) as stale:
+        session.execute_if_current(
+            draft_id=session.draft_id,
+            expected_revision=session.revision + 1,
+            effect=effect,
+        )
+
+    assert stale.value.code == "composer_draft_revision_stale"
+    assert called is False
 
 
 def _node_policy_arguments(

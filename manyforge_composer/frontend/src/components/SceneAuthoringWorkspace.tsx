@@ -24,14 +24,22 @@ import { RobotControlPanelView } from './RobotControlPanel';
 import type { ViewerInspectorPanel } from './StructuralViewer';
 import {
   candidateTcpPoseInCell,
+  componentAttachmentFenceFromSnapshot,
+  editableProgramShapeFromObject,
   livePoseFromProgramResource,
+  logicalSceneShapeFromProgramShape,
   sceneOwnerFacts,
   sceneAttachTransaction,
+  sceneMutationFenceFromSnapshot,
+  sceneObjectMutationAvailability,
   sceneObjectTransformTransaction,
+  sceneObjectUpdateTransaction,
   sceneDetachTransaction,
   sceneDuplicateTransaction,
   scenePoseTransaction,
   sceneRemoveTransaction,
+  type ComponentAttachmentFenceResult,
+  type SceneObjectMutationAvailability,
   type SceneOwnerFacts,
 } from '../state/sceneAuthoring';
 import {
@@ -178,9 +186,6 @@ function objectEditReason(object: LogicalSceneObject): string | null {
   }
   if (object.provider_evidence !== null) {
     return 'This pose is provider-owned; Composer cannot replace provider evidence.';
-  }
-  if (object.collision_shapes.length === 0) {
-    return 'This object has no collision shape.';
   }
   return null;
 }
@@ -556,11 +561,13 @@ function AttachObjectControls({
   object,
   sourceModel,
   disabled,
+  attachmentFence,
   onAttach,
 }: {
   object: LogicalSceneObject;
   sourceModel: SourceModelProjection | null;
   disabled: boolean;
+  attachmentFence: ComponentAttachmentFenceResult;
   onAttach: (
     target: {
       componentId: string;
@@ -617,25 +624,13 @@ function AttachObjectControls({
       )}
       <button
         type="button"
-        disabled={disabled || selected === null || busy}
+        disabled={disabled || !attachmentFence.available || selected === null || busy}
+        title={attachmentFence.available ? undefined : attachmentFence.reason}
         onClick={() => {
-          if (selected === null) return;
+          if (selected === null || !attachmentFence.available) return;
           setBusy(true);
           setError(null);
-          void api.manager.graph().then(async (graph) => {
-            const raw = graph.cellGraph.component_attachments;
-            if (!Array.isArray(raw)) {
-              throw new Error('Manager graph omits component-attachment revisions.');
-            }
-            const revisions = raw.map((entry) => {
-              if (
-                entry === null || typeof entry !== 'object' || Array.isArray(entry)
-                || typeof entry.component_attachment_revision !== 'string'
-              ) throw new Error('Manager graph has an invalid component attachment.');
-              return entry.component_attachment_revision;
-            });
-            await onAttach(selected, [...new Set(revisions)].sort());
-          }).catch((reason: unknown) => {
+          void onAttach(selected, attachmentFence.revisions).catch((reason: unknown) => {
             setError(reason instanceof Error ? reason.message : 'Attach failed.');
           }).finally(() => setBusy(false));
         }}
@@ -724,6 +719,167 @@ function MeshResourceBrowser({
   );
 }
 
+function SceneShapeFields({
+  shape,
+  disabled,
+  onChange,
+}: {
+  shape: ProgramSceneResource['shape'];
+  disabled: boolean;
+  onChange: (shape: ProgramSceneResource['shape']) => void;
+}) {
+  const [meshBrowserOpen, setMeshBrowserOpen] = useState(false);
+  const setShapeType = (type: ProgramSceneResource['shape']['type']) => {
+    const next = type === 'box'
+      ? { type, box_dimensions_m: [0.1, 0.1, 0.1] as [number, number, number] }
+      : type === 'sphere'
+        ? { type, sphere_radius_m: 0.05 }
+        : type === 'cylinder'
+          ? { type, cylinder_radius_m: 0.05, cylinder_height_m: 0.1 }
+          : { type, mesh_resource_uri: '', mesh_scale: [1, 1, 1] as [number, number, number] };
+    setMeshBrowserOpen(false);
+    onChange(next);
+  };
+  const finite = (value: number, update: () => void) => {
+    if (Number.isFinite(value)) update();
+  };
+  return (
+    <div className="scene-shape-fields">
+      <label className="scene-shape-select">
+        <span>Shape</span>
+        <select
+          value={shape.type}
+          disabled={disabled}
+          onChange={(event) => setShapeType(
+            event.target.value as ProgramSceneResource['shape']['type'],
+          )}
+        >
+          <option value="box">Box</option>
+          <option value="sphere">Sphere</option>
+          <option value="cylinder">Cylinder</option>
+          <option value="mesh">Mesh</option>
+        </select>
+      </label>
+      {shape.type === 'box' && (
+        <div className="scene-pose-grid">
+          {(['Width', 'Depth', 'Height'] as const).map((label, index) => (
+            <label key={label}>
+              <span>{label} (m)</span>
+              <input
+                type="number"
+                min={0.000001}
+                step={0.001}
+                value={shape.box_dimensions_m[index]}
+                disabled={disabled}
+                onChange={(event) => finite(event.currentTarget.valueAsNumber, () => {
+                  const dimensions = [...shape.box_dimensions_m] as [number, number, number];
+                  dimensions[index] = event.currentTarget.valueAsNumber;
+                  onChange({ ...shape, box_dimensions_m: dimensions });
+                })}
+              />
+            </label>
+          ))}
+        </div>
+      )}
+      {shape.type === 'sphere' && (
+        <label className="scene-shape-select">
+          <span>Radius (m)</span>
+          <input
+            type="number"
+            min={0.000001}
+            step={0.001}
+            value={shape.sphere_radius_m}
+            disabled={disabled}
+            onChange={(event) => finite(event.currentTarget.valueAsNumber, () => {
+              onChange({ ...shape, sphere_radius_m: event.currentTarget.valueAsNumber });
+            })}
+          />
+        </label>
+      )}
+      {shape.type === 'cylinder' && (
+        <div className="scene-pose-grid">
+          {(['Radius', 'Height'] as const).map((label) => (
+            <label key={label}>
+              <span>{label} (m)</span>
+              <input
+                type="number"
+                min={0.000001}
+                step={0.001}
+                value={label === 'Radius'
+                  ? shape.cylinder_radius_m
+                  : shape.cylinder_height_m}
+                disabled={disabled}
+                onChange={(event) => finite(event.currentTarget.valueAsNumber, () => {
+                  onChange(label === 'Radius'
+                    ? { ...shape, cylinder_radius_m: event.currentTarget.valueAsNumber }
+                    : { ...shape, cylinder_height_m: event.currentTarget.valueAsNumber });
+                })}
+              />
+            </label>
+          ))}
+        </div>
+      )}
+      {shape.type === 'mesh' && (
+        <>
+          <label className="scene-shape-select">
+            <span>Mesh resource URI</span>
+            <input
+              type="text"
+              value={shape.mesh_resource_uri}
+              disabled={disabled}
+              required
+              placeholder="examples/cell/meshes/object.glb"
+              onChange={(event) => onChange({
+                ...shape,
+                mesh_resource_uri: event.target.value,
+              })}
+            />
+          </label>
+          <button
+            type="button"
+            className="quiet-button"
+            aria-expanded={meshBrowserOpen}
+            disabled={disabled}
+            onPointerDown={(event) => event.preventDefault()}
+            onClick={() => setMeshBrowserOpen((current) => !current)}
+          >
+            {meshBrowserOpen ? 'Close mesh browser' : 'Browse approved meshes'}
+          </button>
+          {meshBrowserOpen && (
+            <MeshResourceBrowser
+              onSelect={(resourceUri) => {
+                onChange({ ...shape, mesh_resource_uri: resourceUri });
+                setMeshBrowserOpen(false);
+              }}
+            />
+          )}
+          <div className="scene-pose-grid">
+            {(['Scale X', 'Scale Y', 'Scale Z'] as const).map((label, index) => (
+              <label key={label}>
+                <span>{label}</span>
+                <input
+                  type="number"
+                  min={0.000001}
+                  step={0.01}
+                  value={shape.mesh_scale?.[index] ?? 1}
+                  disabled={disabled}
+                  onChange={(event) => finite(event.currentTarget.valueAsNumber, () => {
+                    const scale = [
+                      ...(shape.mesh_scale ?? [1, 1, 1]),
+                    ] as [number, number, number];
+                    scale[index] = event.currentTarget.valueAsNumber;
+                    onChange({ ...shape, mesh_scale: scale });
+                  })}
+                />
+              </label>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 function ProgramSceneEditor({
   program,
   draftRevision,
@@ -744,7 +900,6 @@ function ProgramSceneEditor({
     (resource) => resource.scene_resource_id === selectedResourceId,
   ) ?? null;
   const [staged, setStaged] = useState<ProgramSceneResource | null>(selected);
-  const [meshBrowserOpen, setMeshBrowserOpen] = useState(false);
 
   useEffect(() => {
     setStaged(selected);
@@ -789,29 +944,6 @@ function ProgramSceneEditor({
       ...staged,
       pose: { ...staged.pose, orientation: { rpy_deg: rpy } },
     });
-  };
-  const setShapeType = (type: 'box' | 'sphere' | 'cylinder' | 'mesh') => {
-    if (staged === null) return;
-    const shape = type === 'box'
-      ? { type, box_dimensions_m: [0.1, 0.1, 0.1] as [number, number, number] }
-      : type === 'sphere'
-        ? { type, sphere_radius_m: 0.05 }
-        : type === 'cylinder'
-          ? { type, cylinder_radius_m: 0.05, cylinder_height_m: 0.1 }
-          : { type, mesh_resource_uri: '', mesh_scale: [1, 1, 1] as [number, number, number] };
-    setStaged({ ...staged, shape });
-  };
-  const setBoxDimension = (index: number, value: number) => {
-    if (staged?.shape.type !== 'box' || !Number.isFinite(value)) return;
-    const dimensions = [...staged.shape.box_dimensions_m] as [number, number, number];
-    dimensions[index] = value;
-    setStaged({ ...staged, shape: { ...staged.shape, box_dimensions_m: dimensions } });
-  };
-  const setMeshScale = (index: number, value: number) => {
-    if (staged?.shape.type !== 'mesh' || !Number.isFinite(value)) return;
-    const scale = [...(staged.shape.mesh_scale ?? [1, 1, 1])] as [number, number, number];
-    scale[index] = value;
-    setStaged({ ...staged, shape: { ...staged.shape, mesh_scale: scale } });
   };
   const addResource = (resource: ProgramSceneResource) => {
     onSelectResource(resource.scene_resource_id);
@@ -907,156 +1039,11 @@ function ProgramSceneEditor({
       </select>
       {staged !== null && (
         <>
-          <label className="scene-shape-select">
-            <span>Shape</span>
-            <select
-              value={staged.shape.type}
-              disabled={busy}
-              onChange={(event) => setShapeType(
-                event.target.value as 'box' | 'sphere' | 'cylinder' | 'mesh',
-              )}
-            >
-              <option value="box">Box</option>
-              <option value="sphere">Sphere</option>
-              <option value="cylinder">Cylinder</option>
-              <option value="mesh">Mesh</option>
-            </select>
-          </label>
-          {staged.shape.type === 'box' && (
-            <div className="scene-pose-grid">
-              {(['Width', 'Depth', 'Height'] as const).map((label, index) => (
-                <label key={label}>
-                  <span>{label} (m)</span>
-                  <input
-                    type="number"
-                    min={0.000001}
-                    step={0.001}
-                    value={staged.shape.type === 'box'
-                      ? staged.shape.box_dimensions_m[index]
-                      : 0}
-                    disabled={busy}
-                    onChange={(event) => setBoxDimension(index, event.currentTarget.valueAsNumber)}
-                  />
-                </label>
-              ))}
-            </div>
-          )}
-          {staged.shape.type === 'sphere' && (
-            <label className="scene-shape-select">
-              <span>Radius (m)</span>
-              <input
-                type="number"
-                min={0.000001}
-                step={0.001}
-                value={staged.shape.sphere_radius_m}
-                disabled={busy}
-                onChange={(event) => {
-                  const value = event.currentTarget.valueAsNumber;
-                  if (Number.isFinite(value) && staged.shape.type === 'sphere') {
-                    setStaged({ ...staged, shape: { ...staged.shape, sphere_radius_m: value } });
-                  }
-                }}
-              />
-            </label>
-          )}
-          {staged.shape.type === 'cylinder' && (
-            <div className="scene-pose-grid">
-              <label>
-                <span>Radius (m)</span>
-                <input
-                  type="number"
-                  min={0.000001}
-                  step={0.001}
-                  value={staged.shape.cylinder_radius_m}
-                  disabled={busy}
-                  onChange={(event) => {
-                    const value = event.currentTarget.valueAsNumber;
-                    if (Number.isFinite(value) && staged.shape.type === 'cylinder') {
-                      setStaged({ ...staged, shape: { ...staged.shape, cylinder_radius_m: value } });
-                    }
-                  }}
-                />
-              </label>
-              <label>
-                <span>Height (m)</span>
-                <input
-                  type="number"
-                  min={0.000001}
-                  step={0.001}
-                  value={staged.shape.cylinder_height_m}
-                  disabled={busy}
-                  onChange={(event) => {
-                    const value = event.currentTarget.valueAsNumber;
-                    if (Number.isFinite(value) && staged.shape.type === 'cylinder') {
-                      setStaged({ ...staged, shape: { ...staged.shape, cylinder_height_m: value } });
-                    }
-                  }}
-                />
-              </label>
-            </div>
-          )}
-          {staged.shape.type === 'mesh' && (
-            <>
-              <label className="scene-shape-select">
-                <span>Mesh resource URI</span>
-                <input
-                  type="text"
-                  value={staged.shape.mesh_resource_uri}
-                  disabled={busy}
-                  required
-                  placeholder="examples/cell/meshes/object.glb"
-                  onChange={(event) => {
-                    if (staged.shape.type === 'mesh') {
-                      setStaged({
-                        ...staged,
-                        shape: { ...staged.shape, mesh_resource_uri: event.target.value },
-                      });
-                    }
-                  }}
-                />
-              </label>
-              <button
-                type="button"
-                className="quiet-button"
-                aria-expanded={meshBrowserOpen}
-                onPointerDown={(event) => event.preventDefault()}
-                onClick={() => setMeshBrowserOpen((current) => !current)}
-              >
-                {meshBrowserOpen ? 'Close mesh browser' : 'Browse approved meshes'}
-              </button>
-              {meshBrowserOpen && (
-                <MeshResourceBrowser
-                  onSelect={(resourceUri) => {
-                    if (staged.shape.type !== 'mesh') return;
-                    setStaged({
-                      ...staged,
-                      shape: { ...staged.shape, mesh_resource_uri: resourceUri },
-                    });
-                    setMeshBrowserOpen(false);
-                  }}
-                />
-              )}
-              <div className="scene-pose-grid">
-                {(['Scale X', 'Scale Y', 'Scale Z'] as const).map((label, index) => (
-                  <label key={label}>
-                    <span>{label}</span>
-                    <input
-                      type="number"
-                      min={0.000001}
-                      step={0.01}
-                      value={staged.shape.type === 'mesh'
-                        ? staged.shape.mesh_scale?.[index] ?? 1
-                        : 1}
-                      disabled={busy}
-                      onChange={(event) => setMeshScale(
-                        index, event.currentTarget.valueAsNumber,
-                      )}
-                    />
-                  </label>
-                ))}
-              </div>
-            </>
-          )}
+          <SceneShapeFields
+            shape={staged.shape}
+            disabled={busy}
+            onChange={(shape) => setStaged({ ...staged, shape })}
+          />
           <label className="scene-shape-select">
             <span>Pose frame</span>
             <select
@@ -1436,6 +1423,12 @@ function SourceOccurrencePanel({
             Showing the first 128 sources; use owner diagnostics for the complete bounded set.
           </span>
         )}
+        {runtimeSources.length > 0 && (
+          <span className="muted">
+            These owner-issued pose sources are observation-only; the current source contract
+            advertises no mutation action.
+          </span>
+        )}
         {runtime !== null && (
           <details className="source-name-details">
             <summary>Runtime source diagnostics</summary>
@@ -1477,6 +1470,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   viewer,
   selection,
   livePose,
+  liveShape,
   selectionLocked,
   onSelect,
   ghost,
@@ -1518,6 +1512,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   viewer: ProgramViewerMetadata | undefined;
   selection: SceneSelection;
   livePose: LogicalScenePose | null;
+  liveShape: ProgramSceneResource['shape'] | null;
   selectionLocked: boolean;
   onSelect: (selection: SceneSelection) => void;
   ghost: Pose3Value | null;
@@ -1542,14 +1537,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
     expectedDraftIdentity: { ownerEpoch: string; generation: number },
   ) => Promise<boolean>;
   onEditSelection: (kind: 'owner_object' | 'program_resource', id: string) => void;
-  mutationAvailability: Record<string, {
-    duplicate: boolean;
-    remove: boolean;
-    detach: boolean;
-    transform: boolean;
-    reason: string | null;
-    detachReason: string | null;
-  }>;
+  mutationAvailability: Record<string, SceneObjectMutationAvailability>;
   hiddenSelectionKeys: ReadonlySet<string>;
   objectAxesSelectionKeys: ReadonlySet<string>;
   motionPreview: MotionPreviewReceipt | null;
@@ -1605,14 +1593,22 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
       (role) => viewer?.resource_role_visibility?.[role] === false,
     );
   });
-  const viewportObjects = visibleObjects.map((object) => (
-    object.scene_resource_id === selectedSceneResourceId
-      && selection?.kind === 'owner_object'
-      && object.placement.kind === 'cell_fixed'
-      && livePose !== null
-      ? { ...object, placement: { ...object.placement, pose_in_cell: livePose } }
-      : object
-  ));
+  const viewportObjects = visibleObjects.map((object) => {
+    if (
+      object.scene_resource_id !== selectedSceneResourceId
+      || selection?.kind !== 'owner_object'
+      || object.placement.kind !== 'cell_fixed'
+      || livePose === null
+    ) return object;
+    const stagedShape = liveShape === null
+      ? null
+      : logicalSceneShapeFromProgramShape(liveShape);
+    return {
+      ...object,
+      collision_shapes: stagedShape === null ? object.collision_shapes : [stagedShape],
+      placement: { ...object.placement, pose_in_cell: livePose },
+    };
+  });
   const runtimePresentation = runtimeScenePresentation(
     facts?.sceneRuntime ?? null,
     facts?.logicalScene ?? null,
@@ -1696,7 +1692,11 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
             remove: true,
             detach: false,
             transform: true,
-            reason: null,
+            shape: true,
+            duplicateReason: null,
+            removeReason: null,
+            transformReason: null,
+            shapeReason: null,
             detachReason: 'Program Draft resources are not carried runtime objects.',
           }]))
         : mutationAvailability}
@@ -1776,17 +1776,15 @@ export function SceneAuthoringWorkspace({
   const programWorkspace = programController.state.workspace;
   const program = programWorkspace?.draft.authoring ?? null;
   const draftRevision = programWorkspace?.draft.draftRevision ?? 0;
-  const admissionGeneration = headlessState.snapshot?.authoringAdmission.admissionGeneration ?? null;
   const draftId = programWorkspace?.draft.draftId ?? null;
-  const sceneMutationFence = useMemo(() => (
-    admissionGeneration === null || draftId === null
-      ? null
-      : {
-          admissionGeneration,
-          draftId,
-          draftRevision,
-        }
-  ), [admissionGeneration, draftId, draftRevision]);
+  const sceneMutationFenceResult = useMemo(() => sceneMutationFenceFromSnapshot(
+    headlessState.snapshot,
+    draftId,
+    draftRevision,
+  ), [draftId, draftRevision, headlessState.snapshot]);
+  const sceneMutationFence = sceneMutationFenceResult.available
+    ? sceneMutationFenceResult.fence
+    : null;
   const environmentValue = environment.status === 'ready' ? environment.data : null;
   const sourceValue = sourceModel.status === 'ready' ? sourceModel.data : null;
   const factsResult = useMemo(
@@ -1815,6 +1813,7 @@ export function SceneAuthoringWorkspace({
   const [activeSceneTool, setActiveSceneTool] = useState<SceneWorkspaceTool>('hierarchy');
   const [selection, setSelection] = useState<SceneSelection>(null);
   const [livePose, setLivePose] = useState<LogicalScenePose | null>(null);
+  const [liveShape, setLiveShape] = useState<ProgramSceneResource['shape'] | null>(null);
   const [selectionLocked, setSelectionLocked] = useState(false);
   const [hiddenSelectionKeys, setHiddenSelectionKeys] = useState<Set<string>>(
     () => new Set(),
@@ -1853,14 +1852,21 @@ export function SceneAuthoringWorkspace({
   const selectedObjectPoseKey = selectedObject?.placement.kind === 'cell_fixed'
     ? JSON.stringify(selectedObject.placement.pose_in_cell)
     : null;
+  const selectedObjectShapeKey = selectedObject === null
+    ? null
+    : JSON.stringify(editableProgramShapeFromObject(selectedObject));
   useEffect(() => {
     setLivePose(selectedObjectPoseKey === null
       ? null
       : JSON.parse(selectedObjectPoseKey) as LogicalScenePose);
+    setLiveShape(selectedObjectShapeKey === null
+      ? null
+      : JSON.parse(selectedObjectShapeKey) as ProgramSceneResource['shape'] | null);
     setCommitState({ kind: 'idle', message: null });
   }, [
     selectedOwnerObjectId,
     selectedObjectPoseKey,
+    selectedObjectShapeKey,
   ]);
 
   const viewer = program?.viewer;
@@ -1944,37 +1950,25 @@ export function SceneAuthoringWorkspace({
     }
   }, []);
 
-  const mutationAvailability = useMemo(() => Object.fromEntries(objects.map((object) => {
-    const attachment = facts?.logicalScene.snapshot?.carried_object_attachments.find(
-      (candidate) => candidate.scene_resource_id === object.scene_resource_id,
-    );
-    const writable = facts?.writeAvailable === true && sceneMutationFence !== null;
-    const runtimeWritable = facts?.runtimeWriteAvailable === true;
-    const fixed = object.placement.kind === 'cell_fixed';
-    const owned = object.provider_evidence === null;
-    const singleShape = object.collision_shapes.length === 1;
-    const reason = !writable
-      ? facts?.writeUnavailableReason ?? 'Scene authoring is unavailable.'
-      : !owned
-        ? 'This object is provider-owned.'
-        : attachment !== undefined
-          ? 'Detach the carried object before removing or transforming it.'
-          : !fixed
-            ? 'This placement is attachment-owned.'
-            : !singleShape
-              ? 'This operation requires one canonical collision shape.'
-              : null;
-    return [object.scene_resource_id, {
-      transform: reason === null,
-      duplicate: reason === null,
-      remove: writable && owned && attachment === undefined,
-      detach: runtimeWritable && attachment !== undefined,
-      reason,
-      detachReason: runtimeWritable
-        ? attachment === undefined ? 'This object is not carried.' : null
-        : facts?.runtimeWriteUnavailableReason ?? 'Runtime scene mutation is unavailable.',
-    }];
-  })), [facts, objects, sceneMutationFence]);
+  const mutationAvailability = useMemo<Record<string, SceneObjectMutationAvailability>>(
+    () => facts === null
+      ? {}
+      : Object.fromEntries(objects.map((object) => [
+          object.scene_resource_id,
+          sceneObjectMutationAvailability(facts, sceneMutationFence, object),
+        ])),
+    [facts, objects, sceneMutationFence],
+  );
+  const componentAttachmentFence = useMemo(
+    () => componentAttachmentFenceFromSnapshot(
+      headlessState.snapshot?.runtime ?? null,
+      facts?.logicalScene.access.active_projection ?? null,
+    ),
+    [facts?.logicalScene.access.active_projection, headlessState.snapshot?.runtime],
+  );
+  const selectedMutationAvailability = selectedOwnerObjectId === null
+    ? null
+    : mutationAvailability[selectedOwnerObjectId] ?? null;
 
   const commitTransform = useCallback(async (
     sceneResourceId: string,
@@ -2001,10 +1995,11 @@ export function SceneAuthoringWorkspace({
     const id = requestId();
     const accepted = await submitSceneTransaction(sceneObjectTransformTransaction(
       facts, sceneMutationFence, object, pose, scale, id,
+      sceneResourceId === selectedOwnerObjectId ? liveShape : null,
     ), id);
     if (accepted) setLivePose(pose);
     return accepted;
-  }, [facts, objects, sceneMutationFence, submitSceneTransaction]);
+  }, [facts, liveShape, objects, sceneMutationFence, selectedOwnerObjectId, submitSceneTransaction]);
 
   const duplicateObject = useCallback(async (sceneResourceId: string) => {
     const object = objects.find((candidate) => candidate.scene_resource_id === sceneResourceId);
@@ -2122,7 +2117,7 @@ export function SceneAuthoringWorkspace({
     }) !== null;
   }, [busyDraft, draftId, draftRevision, program?.scene, programController]);
 
-  const commitLivePose = async () => {
+  const commitLiveObject = async () => {
     if (
       facts === null
       || sceneMutationFence === null
@@ -2130,42 +2125,36 @@ export function SceneAuthoringWorkspace({
       || livePose === null
     ) return;
     const id = requestId();
-    const transaction = scenePoseTransaction(
-      facts,
-      sceneMutationFence,
-      selectedObject,
-      livePose,
-      id,
-    );
+    const originalShape = editableProgramShapeFromObject(selectedObject);
+    const shapeChanged = liveShape !== null
+      && JSON.stringify(liveShape) !== JSON.stringify(originalShape);
+    const transaction = shapeChanged
+      ? sceneObjectUpdateTransaction(
+          facts,
+          sceneMutationFence,
+          selectedObject,
+          livePose,
+          liveShape,
+          id,
+        )
+      : scenePoseTransaction(
+          facts,
+          sceneMutationFence,
+          selectedObject,
+          livePose,
+          id,
+        );
     if (transaction === null) {
       setCommitState({
         kind: 'error',
-        message: facts.writeUnavailableReason ?? editReason ?? 'The local pose is invalid.',
+        message: facts.writeUnavailableReason
+          ?? editReason
+          ?? (!sceneMutationFenceResult.available ? sceneMutationFenceResult.reason : null)
+          ?? 'The local object edit is invalid.',
       });
       return;
     }
-    setCommitState({ kind: 'busy', message: null });
-    try {
-      const response = await api.scene.commit(transaction);
-      if (response.request_id !== id) {
-        throw new Error('The scene owner returned a receipt for a different request.');
-      }
-      if (
-        response.request_owner_epoch
-        !== transaction.request_context.request_owner_epoch
-      ) {
-        throw new Error('The scene owner returned a receipt for a different owner epoch.');
-      }
-      setCommitState({
-        kind: 'success',
-        message: `Committed scene revision ${response.committed_projection_revision.scene_revision.revision_id}.`,
-      });
-    } catch (error) {
-      setCommitState({
-        kind: 'error',
-        message: error instanceof Error ? error.message : 'Scene commit failed.',
-      });
-    }
+    await submitSceneTransaction(transaction, id);
   };
 
   const ownerObjectControlSurface = objects.length === 0 ? undefined : (
@@ -2244,11 +2233,25 @@ export function SceneAuthoringWorkspace({
                   </label>
                 ))}
               </div>
+              {liveShape !== null && (
+                <SceneShapeFields
+                  shape={liveShape}
+                  disabled={selectedMutationAvailability?.shape !== true
+                    || commitState.kind === 'busy'}
+                  onChange={setLiveShape}
+                />
+              )}
             </>
           )}
-          {(editReason ?? facts.writeUnavailableReason) !== null && (
+          {(editReason ?? selectedMutationAvailability?.transformReason ?? null) !== null && (
             <p className="scene-contract-note warning-state">
-              {editReason ?? facts.writeUnavailableReason}
+              {editReason ?? selectedMutationAvailability?.transformReason}
+            </p>
+          )}
+          {selectedObject !== null && liveShape === null && (
+            <p className="scene-contract-note">
+              Shape editing is available only for an object with exactly one canonical shape;
+              pose editing remains independent.
             </p>
           )}
           {selectedObject !== null && (
@@ -2280,6 +2283,7 @@ export function SceneAuthoringWorkspace({
             <AttachObjectControls
               object={selectedObject}
               sourceModel={sourceValue}
+              attachmentFence={componentAttachmentFence}
               disabled={!facts.runtimeWriteAvailable
                 || selectedObject.provider_evidence !== null
                 || commitState.kind === 'busy'}
@@ -2290,15 +2294,22 @@ export function SceneAuthoringWorkspace({
             <button
               type="button"
               disabled={selectedObject === null || livePose === null || editReason !== null
-                || !facts.writeAvailable || commitState.kind === 'busy'}
-              onClick={() => void commitLivePose()}
-            >Commit current pose</button>
+                || selectedMutationAvailability?.transform !== true
+                || commitState.kind === 'busy'}
+              title={selectedMutationAvailability?.transformReason ?? undefined}
+              onClick={() => void commitLiveObject()}
+            >Commit object edit</button>
             <button
               type="button"
               disabled={selectedObject?.placement.kind !== 'cell_fixed' || commitState.kind === 'busy'}
-              onClick={() => setLivePose(selectedObject?.placement.kind === 'cell_fixed'
-                ? selectedObject.placement.pose_in_cell
-                : null)}
+              onClick={() => {
+                setLivePose(selectedObject?.placement.kind === 'cell_fixed'
+                  ? selectedObject.placement.pose_in_cell
+                  : null);
+                setLiveShape(selectedObject === null
+                  ? null
+                  : editableProgramShapeFromObject(selectedObject));
+              }}
             >Discard local edit</button>
             <button
               type="button"
@@ -2329,6 +2340,7 @@ export function SceneAuthoringWorkspace({
               disabled={selectedOwnerObjectId === null
                 || mutationAvailability[selectedOwnerObjectId]?.duplicate !== true
                 || commitState.kind === 'busy'}
+              title={selectedMutationAvailability?.duplicateReason ?? undefined}
               onClick={() => {
                 if (selectedOwnerObjectId !== null) void duplicateObject(selectedOwnerObjectId);
               }}
@@ -2338,6 +2350,7 @@ export function SceneAuthoringWorkspace({
               disabled={selectedOwnerObjectId === null
                 || mutationAvailability[selectedOwnerObjectId]?.detach !== true
                 || commitState.kind === 'busy'}
+              title={selectedMutationAvailability?.detachReason ?? undefined}
               onClick={() => {
                 if (selectedOwnerObjectId !== null) void detachObject(selectedOwnerObjectId);
               }}
@@ -2348,6 +2361,7 @@ export function SceneAuthoringWorkspace({
               disabled={selectedOwnerObjectId === null
                 || mutationAvailability[selectedOwnerObjectId]?.remove !== true
                 || commitState.kind === 'busy'}
+              title={selectedMutationAvailability?.removeReason ?? undefined}
               onClick={() => {
                 if (selectedOwnerObjectId !== null) void removeObject(selectedOwnerObjectId);
               }}
@@ -2377,6 +2391,7 @@ export function SceneAuthoringWorkspace({
       viewer={viewer}
       selection={selection}
       livePose={livePose}
+      liveShape={liveShape}
       selectionLocked={selectionLocked}
       onSelect={setSelection}
       ghost={ghost}

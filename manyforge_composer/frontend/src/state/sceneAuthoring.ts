@@ -6,7 +6,9 @@ import type {
   LogicalSceneObject,
   LogicalScenePose,
   LogicalSceneProjection,
+  LogicalSceneShape,
   NodeEnvironmentResponse,
+  ProjectionRevision,
   ProgramSceneResource,
   SceneRuntimeProjection,
   SceneTransactionOperation,
@@ -14,7 +16,7 @@ import type {
   SceneShapeRequest,
   SourceModelProjection,
 } from '../types/api';
-import type { HeadlessRuntimeSnapshot } from '../types/headless';
+import type { ComposerHeadlessState, HeadlessRuntimeSnapshot } from '../types/headless';
 import type { Pose3Value } from '../types/robotControl';
 import { quaternionFromRpyDegrees } from './robotControl';
 
@@ -124,10 +126,12 @@ export function sceneOwnerFacts(
         : runtimeOpen
           ? 'The logical-scene owner has fenced scene writes.'
           : `The scene runtime is ${sceneRuntime.state.state}.`,
-      runtimeWriteAvailable: runtimeOpen,
-      runtimeWriteUnavailableReason: runtimeOpen
+      runtimeWriteAvailable: writeAvailable,
+      runtimeWriteUnavailableReason: writeAvailable
         ? null
-        : `The scene runtime is ${sceneRuntime.state.state}.`,
+        : runtimeOpen
+          ? 'The logical-scene owner has fenced scene writes.'
+          : `The scene runtime is ${sceneRuntime.state.state}.`,
     },
   };
 }
@@ -143,7 +147,6 @@ export function editableLogicalSceneObject(
   if (
     object.placement.kind !== 'cell_fixed'
     || object.provider_evidence !== null
-    || object.collision_shapes.length === 0
   ) return null;
   return { object, pose: object.placement.pose_in_cell };
 }
@@ -152,6 +155,174 @@ export interface SceneMutationFence {
   admissionGeneration: number;
   draftId: string;
   draftRevision: number;
+}
+
+export type SceneMutationFenceResult =
+  | { available: true; fence: SceneMutationFence }
+  | { available: false; reason: string };
+
+export function sceneMutationFenceFromSnapshot(
+  snapshot: ComposerHeadlessState | null,
+  draftId: string | null,
+  draftRevision: number,
+): SceneMutationFenceResult {
+  if (snapshot === null) {
+    return { available: false, reason: 'The current Headless snapshot is unavailable.' };
+  }
+  if (!snapshot.authoringAdmission.authoringAllowed) {
+    return { available: false, reason: 'Scene authoring requires current Idle admission.' };
+  }
+  if (
+    draftId === null
+    || !draftId.trim()
+    || !Number.isSafeInteger(draftRevision)
+    || draftRevision < 0
+  ) {
+    return { available: false, reason: 'The current Program Draft identity is unavailable.' };
+  }
+  if (
+    snapshot.draftIdentity.draftId !== draftId
+    || snapshot.draftIdentity.draftRevision !== draftRevision
+  ) {
+    return {
+      available: false,
+      reason: 'Waiting for the Headless snapshot to observe this exact Program Draft.',
+    };
+  }
+  const admissionGeneration = snapshot.authoringAdmission.admissionGeneration;
+  if (!Number.isSafeInteger(admissionGeneration) || admissionGeneration < 1) {
+    return { available: false, reason: 'The authoring admission generation is unavailable.' };
+  }
+  return {
+    available: true,
+    fence: { admissionGeneration, draftId, draftRevision },
+  };
+}
+
+export type ComponentAttachmentFenceResult =
+  | { available: true; revisions: string[] }
+  | { available: false; reason: string };
+
+export function componentAttachmentFenceFromSnapshot(
+  runtime: HeadlessRuntimeSnapshot | null,
+  projection: ProjectionRevision | null,
+): ComponentAttachmentFenceResult {
+  if (runtime === null || !runtime.complete || projection === null) {
+    return { available: false, reason: 'The current Manager projection is unavailable.' };
+  }
+  const section = runtime.sections.manager;
+  if (
+    !section.available
+    || section.freshness !== 'fresh'
+    || section.knownGaps.length > 0
+    || section.payload === null
+    || section.sourceGeneration === null
+    || section.sourceOwnerEpoch === null
+  ) {
+    return { available: false, reason: 'The current Manager projection is incomplete or stale.' };
+  }
+  const active = section.payload.active;
+  if (active === null || typeof active !== 'object' || Array.isArray(active)) {
+    return { available: false, reason: 'The Manager has no active retained composition.' };
+  }
+  const activeRecord = active as Record<string, unknown>;
+  if (
+    activeRecord.retained_bundle_id !== projection.retained_bundle_id
+    || activeRecord.graph_revision !== projection.graph_revision
+  ) {
+    return { available: false, reason: 'The Manager and logical-scene projections disagree.' };
+  }
+  const cellGraph = activeRecord.cell_graph;
+  if (cellGraph === null || typeof cellGraph !== 'object' || Array.isArray(cellGraph)) {
+    return { available: false, reason: 'The Manager projection omits its active cell graph.' };
+  }
+  const attachments = (cellGraph as Record<string, unknown>).component_attachments;
+  if (!Array.isArray(attachments)) {
+    return { available: false, reason: 'The Manager projection omits component attachments.' };
+  }
+  const revisions: string[] = [];
+  for (const attachment of attachments) {
+    if (
+      attachment === null
+      || typeof attachment !== 'object'
+      || Array.isArray(attachment)
+    ) {
+      return { available: false, reason: 'The Manager projection has an invalid component attachment.' };
+    }
+    const revision = (attachment as Record<string, unknown>).component_attachment_revision;
+    if (typeof revision !== 'string' || !revision.trim()) {
+      return { available: false, reason: 'The Manager projection has an invalid component attachment.' };
+    }
+    revisions.push(revision);
+  }
+  return { available: true, revisions: [...new Set(revisions)].sort() };
+}
+
+export interface SceneObjectMutationAvailability {
+  duplicate: boolean;
+  remove: boolean;
+  detach: boolean;
+  transform: boolean;
+  shape: boolean;
+  duplicateReason: string | null;
+  removeReason: string | null;
+  detachReason: string | null;
+  transformReason: string | null;
+  shapeReason: string | null;
+}
+
+export function sceneObjectMutationAvailability(
+  facts: SceneOwnerFacts,
+  fence: SceneMutationFence | null,
+  object: LogicalSceneObject,
+): SceneObjectMutationAvailability {
+  const attachment = facts.logicalScene.snapshot?.carried_object_attachments.find(
+    (candidate) => candidate.scene_resource_id === object.scene_resource_id,
+  );
+  const authoredReason = !facts.writeAvailable
+    ? facts.writeUnavailableReason ?? 'Scene authoring is unavailable.'
+    : fence === null
+      ? 'The exact Program Draft and authoring admission are not current.'
+      : object.provider_evidence !== null
+        ? 'This object is provider-owned.'
+        : attachment !== undefined
+          ? 'Detach the carried object before changing its authored definition.'
+          : object.placement.kind !== 'cell_fixed'
+            ? 'This placement is attachment-owned.'
+            : null;
+  const singleShapeReason = authoredReason ?? (
+    object.collision_shapes.length === 1
+      ? null
+      : 'This operation requires exactly one canonical collision shape.'
+  );
+  const removeReason = !facts.writeAvailable
+    ? facts.writeUnavailableReason ?? 'Scene authoring is unavailable.'
+    : fence === null
+      ? 'The exact Program Draft and authoring admission are not current.'
+      : object.provider_evidence !== null
+        ? 'This object is provider-owned.'
+        : attachment !== undefined
+          ? 'Detach the carried object before removing it.'
+          : object.placement.kind !== 'cell_fixed'
+            ? 'Detach the carried object before removing it.'
+            : null;
+  const detachReason = !facts.runtimeWriteAvailable
+    ? facts.runtimeWriteUnavailableReason ?? 'Runtime scene mutation is unavailable.'
+    : attachment === undefined
+      ? 'This object is not carried.'
+      : null;
+  return {
+    transform: authoredReason === null,
+    shape: singleShapeReason === null,
+    duplicate: singleShapeReason === null,
+    remove: removeReason === null,
+    detach: detachReason === null,
+    transformReason: authoredReason,
+    shapeReason: singleShapeReason,
+    duplicateReason: singleShapeReason,
+    removeReason,
+    detachReason,
+  };
 }
 
 type RuntimeOwnedSceneOperation = Extract<
@@ -304,6 +475,158 @@ function scaledSceneShape(
   };
 }
 
+export function editableProgramShapeFromObject(
+  object: LogicalSceneObject,
+): ProgramSceneResource['shape'] | null {
+  if (object.collision_shapes.length !== 1) return null;
+  const shape = object.collision_shapes[0];
+  if (shape.type === 'box') {
+    return {
+      type: 'box',
+      box_dimensions_m: [
+        shape.dimensions_m.x,
+        shape.dimensions_m.y,
+        shape.dimensions_m.z,
+      ],
+    };
+  }
+  if (shape.type === 'sphere') {
+    return { type: 'sphere', sphere_radius_m: shape.radius_m };
+  }
+  if (shape.type === 'cylinder') {
+    return {
+      type: 'cylinder',
+      cylinder_radius_m: shape.radius_m,
+      cylinder_height_m: shape.height_m,
+    };
+  }
+  return {
+    type: 'mesh',
+    mesh_resource_uri: shape.resource_uri,
+    mesh_scale: [shape.scale.x, shape.scale.y, shape.scale.z],
+  };
+}
+
+export function logicalSceneShapeFromProgramShape(
+  shape: ProgramSceneResource['shape'],
+): LogicalSceneShape | null {
+  const positive = (value: number) => Number.isFinite(value) && value > 0;
+  if (shape.type === 'box') {
+    if (!shape.box_dimensions_m.every(positive)) return null;
+    return {
+      type: 'box',
+      dimensions_m: {
+        x: shape.box_dimensions_m[0],
+        y: shape.box_dimensions_m[1],
+        z: shape.box_dimensions_m[2],
+      },
+    };
+  }
+  if (shape.type === 'sphere') {
+    return positive(shape.sphere_radius_m)
+      ? { type: 'sphere', radius_m: shape.sphere_radius_m }
+      : null;
+  }
+  if (shape.type === 'cylinder') {
+    return positive(shape.cylinder_radius_m) && positive(shape.cylinder_height_m)
+      ? {
+          type: 'cylinder',
+          radius_m: shape.cylinder_radius_m,
+          height_m: shape.cylinder_height_m,
+        }
+      : null;
+  }
+  const scale = shape.mesh_scale ?? [1, 1, 1];
+  if (!shape.mesh_resource_uri.trim() || !scale.every(positive)) return null;
+  return {
+    type: 'mesh',
+    resource_uri: shape.mesh_resource_uri,
+    scale: { x: scale[0], y: scale[1], z: scale[2] },
+  };
+}
+
+function sceneShapeRequest(
+  shape: ProgramSceneResource['shape'],
+): SceneShapeRequest | null {
+  const logicalShape = logicalSceneShapeFromProgramShape(shape);
+  if (logicalShape === null) return null;
+  if (logicalShape.type === 'box') {
+    return {
+      type: 'box',
+      box_dimensions_m: {
+        x_m: logicalShape.dimensions_m.x,
+        y_m: logicalShape.dimensions_m.y,
+        z_m: logicalShape.dimensions_m.z,
+      },
+    };
+  }
+  if (logicalShape.type === 'sphere') {
+    return { type: 'sphere', sphere_radius_m: logicalShape.radius_m };
+  }
+  if (logicalShape.type === 'cylinder') {
+    return {
+      type: 'cylinder',
+      cylinder_radius_m: logicalShape.radius_m,
+      cylinder_height_m: logicalShape.height_m,
+    };
+  }
+  return {
+    type: 'mesh',
+    mesh_resource_uri: logicalShape.resource_uri,
+    mesh_scale: {
+      x_m: logicalShape.scale.x,
+      y_m: logicalShape.scale.y,
+      z_m: logicalShape.scale.z,
+    },
+  };
+}
+
+export function sceneObjectUpdateTransaction(
+  facts: SceneOwnerFacts,
+  fence: SceneMutationFence,
+  object: LogicalSceneObject,
+  pose: LogicalScenePose,
+  shape: ProgramSceneResource['shape'],
+  requestId: string,
+): SceneTransactionRequest | null {
+  const snapshot = facts.logicalScene.snapshot;
+  const requestedShape = sceneShapeRequest(shape);
+  const quaternion = pose.orientation_xyzw;
+  if (
+    editableLogicalSceneObject(object) === null
+    || object.collision_shapes.length !== 1
+    || snapshot === null
+    || requestedShape === null
+    || ![
+      pose.position_m.x,
+      pose.position_m.y,
+      pose.position_m.z,
+      ...quaternion,
+    ].every(Number.isFinite)
+    || Math.abs(Math.hypot(...quaternion) - 1) > 1e-6
+  ) return null;
+  return sceneTransaction(facts, fence, {
+    kind: 'upsert_object',
+    scene_resource_id: object.scene_resource_id,
+    shape: requestedShape,
+    pose: {
+      position_m: {
+        x_m: pose.position_m.x,
+        y_m: pose.position_m.y,
+        z_m: pose.position_m.z,
+      },
+      orientation: {
+        x: quaternion[0],
+        y: quaternion[1],
+        z: quaternion[2],
+        w: quaternion[3],
+      },
+    },
+    frame_ref: { kind: 'cell_frame', cell_id: snapshot.cell_id },
+    support_contacts: object.support_contacts,
+  }, requestId);
+}
+
 export function sceneObjectTransformTransaction(
   facts: SceneOwnerFacts,
   fence: SceneMutationFence,
@@ -311,12 +634,25 @@ export function sceneObjectTransformTransaction(
   pose: LogicalScenePose,
   scale: [number, number, number],
   requestId: string,
+  stagedShape: ProgramSceneResource['shape'] | null = null,
 ): SceneTransactionRequest | null {
   const scaleChanged = scale.some((value) => Math.abs(value - 1) > 1e-6);
-  if (!scaleChanged) {
+  const originalShape = editableProgramShapeFromObject(object);
+  const shapeChanged = stagedShape !== null
+    && JSON.stringify(stagedShape) !== JSON.stringify(originalShape);
+  if (!scaleChanged && !shapeChanged) {
     return scenePoseTransaction(facts, fence, object, pose, requestId);
   }
-  const shape = scaledSceneShape(object, scale);
+  const stagedLogicalShape = stagedShape === null
+    ? null
+    : logicalSceneShapeFromProgramShape(stagedShape);
+  if (stagedShape !== null && stagedLogicalShape === null) return null;
+  const shape = scaledSceneShape(
+    stagedLogicalShape === null
+      ? object
+      : { ...object, collision_shapes: [stagedLogicalShape] },
+    scale,
+  );
   const snapshot = facts.logicalScene.snapshot;
   if (
     editableLogicalSceneObject(object) === null

@@ -2,9 +2,14 @@ import { describe, expect, it } from 'vitest';
 
 import {
   candidateTcpPoseInCell,
+  componentAttachmentFenceFromSnapshot,
   editableLogicalSceneObject,
+  editableProgramShapeFromObject,
   livePoseFromProgramResource,
   programResourceWithLivePose,
+  sceneMutationFenceFromSnapshot,
+  sceneObjectMutationAvailability,
+  sceneObjectUpdateTransaction,
   scenePoseTransaction,
   sceneDuplicateTransaction,
   sceneDetachTransaction,
@@ -16,6 +21,7 @@ import type {
   SceneRuntimeProjection,
   SourceModelProjection,
 } from '../types/api';
+import type { ComposerHeadlessState, HeadlessRuntimeSnapshot } from '../types/headless';
 
 const object: LogicalSceneObject = {
   scene_resource_id: 'part',
@@ -95,6 +101,62 @@ function facts(): SceneOwnerFacts {
 }
 
 describe('scene authoring intents', () => {
+  it('forms an authored fence only from one current admitted Draft snapshot', () => {
+    const snapshot = {
+      authoringAdmission: { authoringAllowed: true, admissionGeneration: 7 },
+      draftIdentity: { draftId: 'draft-1', draftRevision: 4 },
+    } as ComposerHeadlessState;
+    expect(sceneMutationFenceFromSnapshot(snapshot, 'draft-1', 4)).toEqual({
+      available: true,
+      fence,
+    });
+    expect(sceneMutationFenceFromSnapshot(snapshot, 'draft-1', 5)).toMatchObject({
+      available: false,
+    });
+    expect(sceneMutationFenceFromSnapshot({
+      ...snapshot,
+      authoringAdmission: { authoringAllowed: false, admissionGeneration: 7 },
+    }, 'draft-1', 4)).toMatchObject({ available: false });
+  });
+
+  it('uses the exact current Manager snapshot as the attachment fence', () => {
+    const runtime = {
+      complete: true,
+      sections: {
+        manager: {
+          available: true,
+          freshness: 'fresh',
+          knownGaps: [],
+          sourceGeneration: 3,
+          sourceOwnerEpoch: 'manager-owner-1',
+          payload: {
+            active: {
+              retained_bundle_id: 'bundle-1',
+              graph_revision: 'graph-1',
+              cell_graph: {
+                component_attachments: [
+                  { component_attachment_revision: 'revision-b' },
+                  { component_attachment_revision: 'revision-a' },
+                ],
+              },
+            },
+          },
+        },
+      },
+    } as unknown as HeadlessRuntimeSnapshot;
+    expect(componentAttachmentFenceFromSnapshot(
+      runtime,
+      facts().logicalScene.access.active_projection,
+    )).toEqual({
+      available: true,
+      revisions: ['revision-a', 'revision-b'],
+    });
+    expect(componentAttachmentFenceFromSnapshot(runtime, {
+      ...facts().logicalScene.access.active_projection!,
+      graph_revision: 'other-graph',
+    })).toMatchObject({ available: false });
+  });
+
   it('commits exactly one current-revision, cell-framed pose update', () => {
     expect(scenePoseTransaction(facts(), fence, object, object.placement.kind === 'cell_fixed'
       ? object.placement.pose_in_cell
@@ -140,6 +202,50 @@ describe('scene authoring intents', () => {
       object.placement.kind === 'cell_fixed' ? object.placement.pose_in_cell : neverPose(),
       'request-2',
     )).toBeNull();
+  });
+
+  it('keeps pose editing independent from single-shape actions', () => {
+    const shapeless = { ...object, collision_shapes: [] };
+    expect(editableLogicalSceneObject(shapeless)).not.toBeNull();
+    expect(sceneObjectMutationAvailability(facts(), fence, shapeless)).toMatchObject({
+      transform: true,
+      shape: false,
+      duplicate: false,
+      remove: true,
+    });
+  });
+
+  it('commits one exact owner update for staged mesh, scale, and pose', () => {
+    const shape = editableProgramShapeFromObject({
+      ...object,
+      collision_shapes: [{
+        type: 'mesh',
+        resource_uri: 'package://part.glb',
+        scale: { x: 1, y: 2, z: 3 },
+      }],
+    });
+    expect(shape).not.toBeNull();
+    expect(sceneObjectUpdateTransaction(
+      facts(),
+      fence,
+      { ...object, collision_shapes: [{
+        type: 'mesh',
+        resource_uri: 'package://part.glb',
+        scale: { x: 1, y: 2, z: 3 },
+      }] },
+      object.placement.kind === 'cell_fixed'
+        ? object.placement.pose_in_cell
+        : neverPose(),
+      shape!,
+      'request-shape',
+    )?.operation).toMatchObject({
+      kind: 'upsert_object',
+      shape: {
+        type: 'mesh',
+        mesh_resource_uri: 'package://part.glb',
+        mesh_scale: { x_m: 1, y_m: 2, z_m: 3 },
+      },
+    });
   });
 
   it('builds owner-fenced duplicate and detach transactions without browser effects', () => {

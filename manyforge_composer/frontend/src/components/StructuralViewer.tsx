@@ -61,6 +61,7 @@ import type {
   Vector3Tuple,
 } from '../types/api';
 import type { Pose3Value } from '../types/robotControl';
+import type { SceneObjectMutationAvailability } from '../state/sceneAuthoring';
 import {
   classifyStructuralAssetFailure,
   normalizeQuaternion,
@@ -123,14 +124,7 @@ interface StructuralViewerProps {
   onDetachSceneResource?: (sceneResourceId: string) => Promise<boolean>;
   onEditSceneResource?: (sceneResourceId: string) => void;
   selectionLocked?: boolean;
-  sceneMutationAvailability?: Record<string, {
-    duplicate: boolean;
-    remove: boolean;
-    detach: boolean;
-    transform: boolean;
-    reason: string | null;
-    detachReason: string | null;
-  }>;
+  sceneMutationAvailability?: Record<string, SceneObjectMutationAvailability>;
   candidateTcpPose?: Pose3Value | null;
   candidateStale?: boolean;
   candidateTcpEditable?: boolean;
@@ -2307,13 +2301,13 @@ function StructuralViewerContent({
     && (selectedSceneResourceId === null || !editLockedObjectIds.has(selectedSceneResourceId))
     && selectedObject?.placement.kind === 'cell_fixed'
     && selectedObject.provider_evidence === null
-    && selectedObject.collision_shapes.length > 0
     && sceneMutationAvailability?.[selectedObject.scene_resource_id]?.transform === true;
   const candidateTransformEnabled = candidateTcpEditable
     && candidateTcpPose !== null
     && selectedObject === null;
   const generalTransformEnabled = transformBaseEnabled || candidateTransformEnabled;
   const scaleEnabled = transformBaseEnabled
+    && selectedObjectAvailability?.shape === true
     && supportsIndependentSceneScale(selectedObject);
   const transformEnabled = transformBaseEnabled
     && (transformMode !== 'scale' || scaleEnabled);
@@ -2716,7 +2710,7 @@ function StructuralViewerContent({
                 onDuplicateSceneResource === undefined
                 || contextAvailability?.duplicate !== true
               }
-              title={contextAvailability?.reason ?? undefined}
+              title={contextAvailability?.duplicateReason ?? undefined}
               onClick={() => {
                 void onDuplicateSceneResource?.(contextMenu.sceneResourceId);
                 setContextMenu(null);
@@ -2744,7 +2738,7 @@ function StructuralViewerContent({
                 onRemoveSceneResource === undefined
                 || contextAvailability?.remove !== true
               }
-              title={contextAvailability?.reason ?? undefined}
+              title={contextAvailability?.removeReason ?? undefined}
               onClick={() => {
                 void onRemoveSceneResource?.(contextMenu.sceneResourceId);
                 setContextMenu(null);
@@ -3031,7 +3025,7 @@ function StructuralViewerContent({
                 type="button"
                 disabled={onDuplicateSceneResource === undefined
                   || selectedObjectAvailability?.duplicate !== true}
-                title={selectedObjectAvailability?.reason ?? undefined}
+                title={selectedObjectAvailability?.duplicateReason ?? undefined}
                 onClick={() => { void onDuplicateSceneResource?.(selectedObject.scene_resource_id); }}
               >Duplicate</button>
               <button
@@ -3063,7 +3057,7 @@ function StructuralViewerContent({
                 className="danger-button"
                 disabled={onRemoveSceneResource === undefined
                   || selectedObjectAvailability?.remove !== true}
-                title={selectedObjectAvailability?.reason ?? undefined}
+                title={selectedObjectAvailability?.removeReason ?? undefined}
                 onClick={() => { void onRemoveSceneResource?.(selectedObject.scene_resource_id); }}
               >Remove</button>
             </div>
