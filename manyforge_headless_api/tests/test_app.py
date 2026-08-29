@@ -17,8 +17,10 @@ from manyforge_headless_api.app import TrustedPrincipal, _error_status, create_a
 from manyforge_headless_api.cell_admission import CellAdmissionError
 from manyforge_headless_api.models import (
     ManagerApplyRequest,
+    ProgramCycleResetRequest,
     SceneResourcePoseQuery,
     SceneTransactionRequest,
+    StopFaultRecoveryIntentRequest,
 )
 from manyforge_headless_api.native import HeadlessApiError, ViewerModelAsset
 from manyforge_headless_api.service import HeadlessService
@@ -908,8 +910,25 @@ class FakeExecution:
         self.requests: list[tuple[str, object]] = []
         self.principals: list[tuple[str, str | None]] = []
 
-    def status(self) -> dict[str, Any]:
+    def diagnostics(self) -> dict[str, Any]:
         return {"ok": True, "command": "status", "status": {}}
+
+    def identity(self) -> dict[str, Any]:
+        return {"ok": True, "command": "identity", "identity": {}}
+
+    def targets(self) -> dict[str, Any]:
+        return {"ok": True, "command": "targets", "targets": {}}
+
+    def control_state(self) -> dict[str, Any]:
+        return {"ok": True, "command": "control_state", "control_state": {}}
+
+    def observation(self) -> dict[str, Any]:
+        return {
+            "api_version": "manyforge.execution_command_response.v1",
+            "ok": True,
+            "command": "observation",
+            "observation": {"schema_version": "manyforge.execution_observation.v1"},
+        }
 
     def submit(
         self,
@@ -1135,7 +1154,7 @@ def _program_run_snapshot(*, state: str = "running") -> dict[str, Any]:
         graph_revision=digest_a,
     )
     return {
-        "schema_version": "manyforge.program_run_status.v1",
+        "schema_version": "manyforge.program_run_status.v2",
         "owner_id": "program-runner.cell-a",
         "owner_epoch": "program-runner.epoch.1",
         "run_revision": 1,
@@ -1165,6 +1184,8 @@ def _program_run_snapshot(*, state: str = "running") -> dict[str, Any]:
             ],
         },
         "tree_status": "running",
+        "node_status_revision": 1,
+        "node_statuses": {"root": "running"},
         "active_operation_count": 1,
         "reason_code": None,
         "message": "",
@@ -1240,8 +1261,147 @@ class FakeProgramRunner:
         self.calls.append(("stop", (program_run_id, copy.deepcopy(body))))
         return self._snapshot(state="stopping")
 
+    def stop_motion(
+        self,
+        program_run_id: str,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        self.calls.append(("motion_stop", (program_run_id, copy.deepcopy(body))))
+        return self._snapshot(state="running")
+
     def close(self) -> None:
         self.calls.append(("close", None))
+
+
+class _ResetProgramRunner(FakeProgramRunner):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cycle = {
+            "program_runner_owner_epoch": "program-runner.epoch.1",
+            "cycle_generation": 4,
+            "state": "terminal_awaiting_reset",
+            "program_run_id": "program-run.1",
+            "cycle_claim_generation": 22,
+            "terminal_or_settlement_reference": "sha256:" + "a" * 64,
+        }
+
+    def cycle_status(self) -> dict[str, Any]:
+        self.calls.append(("cycle_status", None))
+        return copy.deepcopy(self.cycle)
+
+    def reset_cycle(self, body: dict[str, Any]) -> dict[str, Any]:
+        self.calls.append(("reset_cycle", copy.deepcopy(body)))
+        return {
+            "schema_version": "manyforge.program_cycle_reset_result.v1",
+            "program_run_id": body["program_run_id"],
+            "reset_cycle_generation": body["expected_cycle_generation"],
+            "idle_cycle_generation": body["expected_cycle_generation"] + 1,
+            "settlement_reference": body["settlement_evidence_digest"],
+            "admission": {},
+            "runtime_controls": None,
+        }
+
+
+class _LatchedResetExecution(FakeExecution):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fault_reads = 0
+
+    def identity(self) -> dict[str, Any]:
+        self.requests.append(("identity", None))
+        return {
+            "ok": True,
+            "command": "identity",
+            "identity": {"owner_epoch": "native-owner.epoch.1"},
+        }
+
+    def stop_fault(self) -> dict[str, Any]:
+        self.requests.append(("stop_fault", None))
+        self.fault_reads += 1
+        if self.fault_reads > 1:
+            return {"ok": True, "command": "get_stop_fault", "stop_fault": None}
+        return {
+            "ok": True,
+            "command": "get_stop_fault",
+            "stop_fault": {
+                "configuration_expectations": [
+                    {
+                        "control_domain_id": "domain.arm",
+                        "active_control_configuration_id": "configuration.arm.1",
+                        "active_control_configuration_generation": 3,
+                    }
+                ],
+                "latch": {
+                    "latch_id": "stop-fault.1",
+                    "latch_generation": 1,
+                    "recovery_assessment_revision": 2,
+                    "stop_certificate": {
+                        "stop_certificate_id": "stop-certificate.1",
+                        "stop_certificate_revision": 1,
+                    },
+                    "cell_id": "cell.1",
+                    "retained_bundle_id": "sha256:" + "1" * 64,
+                    "graph_revision": "sha256:" + "2" * 64,
+                },
+            },
+        }
+
+
+def _cycle_reset_request() -> ProgramCycleResetRequest:
+    return ProgramCycleResetRequest.model_validate(
+        {
+            "request_id": "reset.1",
+            "request_owner_epoch": "composer.epoch.1",
+            "source_label": "composer",
+            "correlation_id": None,
+            "program_run_id": "program-run.1",
+            "expected_owner_epoch": "program-runner.epoch.1",
+            "expected_cycle_generation": 4,
+            "expected_claim_generation": 22,
+            "terminal_reference": "sha256:" + "a" * 64,
+            "settlement_evidence_digest": "sha256:" + "a" * 64,
+        }
+    )
+
+
+def test_program_cycle_reset_recovers_exact_stop_latch_before_cycle_release() -> None:
+    execution = _LatchedResetExecution()
+    runner = _ResetProgramRunner()
+    service = _service(
+        FakeCore(), FakeManager(), execution=execution, program_runner=runner
+    )
+
+    result = service.program_cycle_reset(_cycle_reset_request())
+
+    assert result["idle_cycle_generation"] == 5
+    assert [kind for kind, _request in execution.requests] == [
+        "stop_fault",
+        "identity",
+        "recover_stop_fault",
+        "stop_fault",
+    ]
+    recovery = execution.requests[2][1]
+    assert isinstance(recovery, StopFaultRecoveryIntentRequest)
+    assert recovery.request_context.request_owner_epoch == "native-owner.epoch.1"
+    assert [kind for kind, _request in runner.calls] == [
+        "cycle_status",
+        "reset_cycle",
+    ]
+
+
+def test_stale_program_cycle_reset_has_no_stop_recovery_effect() -> None:
+    execution = _LatchedResetExecution()
+    runner = _ResetProgramRunner()
+    runner.cycle["cycle_generation"] = 5
+    service = _service(
+        FakeCore(), FakeManager(), execution=execution, program_runner=runner
+    )
+
+    with pytest.raises(HeadlessApiError, match="exact terminal Program cycle"):
+        service.program_cycle_reset(_cycle_reset_request())
+
+    assert execution.requests == []
+    assert [kind for kind, _request in runner.calls] == ["cycle_status"]
 
 
 def _service(
@@ -1780,6 +1940,14 @@ def test_program_runner_surface_is_a_strict_thin_owner_projection() -> None:
             },
         )
         read = client.get("/api/program/runs/program-run.1")
+        motion_stopped = client.post(
+            "/api/program/runs/program-run.1/motion-stop",
+            json={
+                **stop_body,
+                "request_id": "request.motion-stop.1",
+                "reason": "ordinary operator motion Stop",
+            },
+        )
         stopped = client.post(
             "/api/program/runs/program-run.1/stop",
             json=stop_body,
@@ -1793,12 +1961,14 @@ def test_program_runner_surface_is_a_strict_thin_owner_projection() -> None:
         assert started.json()["capture"]["scenario_id"] == "cell-pick"
     assert prepared.json()["status"] == "prepared"
     assert read.json()["capture"]["program_run_id"] == "program-run.1"
+    assert motion_stopped.json()["state"] == "running"
     assert stopped.json()["state"] == "stopping"
     assert [call[0] for call in runner.calls] == [
         "runs",
         "start",
         "prepare_scene",
         "read",
+        "motion_stop",
         "stop",
     ]
 
@@ -2512,6 +2682,13 @@ def test_openapi_contains_no_condition_mutation_route() -> None:
     assert "/api/assistant/modes/{mode_id}" in paths
     assert "/api/assistant/modes/{mode_id}/context" in paths
     assert {
+        "/api/execution/diagnostics",
+        "/api/execution/identity",
+        "/api/execution/targets",
+        "/api/execution/control-state",
+        "/api/execution/observation",
+    }.issubset(paths)
+    assert {
         "/api/execution/operations/{operation_id}/pause",
         "/api/execution/operations/{operation_id}/resume",
         "/api/execution/operations/{operation_id}/reset",
@@ -2532,6 +2709,21 @@ def test_openapi_contains_no_condition_mutation_route() -> None:
     assert "/api/kernel/stop" not in paths
     assert "/api/cycle/stop" not in paths
     assert all("condition" not in path or "acknowledge" in path for path in paths)
+
+
+def test_execution_diagnostics_is_explicit_and_status_is_only_compatibility() -> None:
+    execution = FakeExecution()
+    app = create_app(service=_service(FakeCore(), FakeManager(), execution))
+    with TestClient(app) as client:
+        diagnostics = client.get("/api/execution/diagnostics")
+        compatibility = client.get("/api/execution/status")
+
+    assert diagnostics.status_code == 200
+    assert diagnostics.json() == compatibility.json() == {
+        "ok": True,
+        "command": "status",
+        "status": {},
+    }
 
 
 def test_motion_preview_is_a_thin_non_effectful_execution_route() -> None:
@@ -2681,7 +2873,7 @@ def test_capability_command_preview_is_a_thin_non_effectful_execution_route() ->
 
 def test_execution_missing_reference_is_a_public_not_found() -> None:
     class MissingExecution:
-        def status(self) -> dict[str, Any]:
+        def diagnostics(self) -> dict[str, Any]:
             raise AssertionError("not called")
 
         def submit(

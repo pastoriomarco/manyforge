@@ -325,6 +325,7 @@ class ExecutableProgramRun:
         self._attempt_source = ProgramRunAttemptSource(capture.program_run_id)
         self._ports = ports
         self._operator_stop_state = OperatorMotionStopState()
+        self._authored_nodes: dict[str, py_trees.behaviour.Behaviour] = {}
         root = self._build_node(
             program.tree,
             inherited_stop_policy="continue",
@@ -402,6 +403,7 @@ class ExecutableProgramRun:
                 node_instance_id=node.instance_id,
                 stop_state=self._operator_stop_state,
             )
+        self._authored_nodes[node.instance_id] = built
         return built
 
     @property
@@ -423,6 +425,22 @@ class ExecutableProgramRun:
     @property
     def status(self) -> py_trees.common.Status:
         return self._tree.root.status
+
+    @property
+    def node_statuses(self) -> Mapping[str, str]:
+        """Return exact authored-node phases from the current tree tick."""
+
+        with self._lock:
+            return MappingProxyType(
+                {
+                    instance_id: (
+                        "idle"
+                        if behaviour.status is py_trees.common.Status.INVALID
+                        else behaviour.status.name.lower()
+                    )
+                    for instance_id, behaviour in self._authored_nodes.items()
+                }
+            )
 
     def tick_once(self) -> py_trees.common.Status:
         """Advance at most one tree tick; scheduling remains the host's job."""

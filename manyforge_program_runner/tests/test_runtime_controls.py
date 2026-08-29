@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 import time
 
 import pytest
@@ -224,6 +224,44 @@ def test_operator_stop_recovery_uses_owner_fence_not_failure_retry_policy() -> N
         "enabled": False,
         "disabled_reason_code": "operator_stop_requires_owner_recovery",
     }
+
+
+def test_recovery_offer_projects_immutable_owner_facts_and_policy() -> None:
+    controls = ProgramRuntimeControls(_capture(), recovery_fences=_fences())
+    intervention = _intervention(policy_parameter="operator_stop_policy")
+    intervention.owner_assessment = MappingProxyType(
+        {
+            **intervention.owner_assessment,
+            "allowed_actions": ("retry_motion_from_current_state",),
+            "participants": (
+                MappingProxyType(
+                    {"operation_participant_id": "participant.1"}
+                ),
+            ),
+            "recovery_class": "ordinary_operator_stop",
+            "status": "retry_ready",
+        }
+    )
+    policy = MappingProxyType(
+        {
+            **_policy(),
+            "allowed_recovery_actions": ("intervention",),
+        }
+    )
+
+    offer = controls.recovery_offer(
+        cycle_generation=6,
+        owner_epoch="runner.epoch.1",
+        intervention=intervention,
+        policy=policy,
+    )
+
+    assert offer is not None
+    assert offer["participants"] == [
+        {"operation_participant_id": "participant.1"}
+    ]
+    assert offer["policy"]["allowed_recovery_actions"] == ["intervention"]
+    assert offer["primary_action"] == "retry_motion_from_current_state"
 
 
 def test_recovery_fence_shape_is_closed() -> None:

@@ -46,7 +46,7 @@ def test_recovery_fences_join_program_and_execution_owner_contracts() -> None:
     }
     execution = {
         "ok": True,
-        "status": {
+        "identity": {
             # This identifies the execution owner's direct-control surface,
             # not the scenario's Program Binding above.
             "program_binding_id": "sha256:" + "2" * 64,
@@ -68,7 +68,7 @@ def test_recovery_fences_join_program_and_execution_owner_contracts() -> None:
         "pose_source_apply_generation": 0,
     }
 
-    execution["status"]["graph_revision"] = _DIGEST_A
+    execution["identity"]["graph_revision"] = _DIGEST_A
     with pytest.raises(
         ProgramRunnerError,
         match="current owners did not provide exact recovery generations",
@@ -128,10 +128,10 @@ class _Headless:
         assert scenario_id == "cell-pick"
         return {"scenario_id": scenario_id, "program_revision": _DIGEST_A}
 
-    def execution_status(self) -> dict[str, Any]:
+    def execution_identity(self) -> dict[str, Any]:
         return {
             "ok": True,
-            "status": {
+            "identity": {
                 "program_binding_id": None,
                 "retained_bundle_id": None,
                 "graph_revision": None,
@@ -180,13 +180,15 @@ class _Snapshot:
             to_dict=lambda: deepcopy(capture),
         )
         self._value = {
-            "schema_version": "manyforge.program_run_status.v1",
+            "schema_version": "manyforge.program_run_status.v2",
             "owner_id": owner_id,
             "owner_epoch": owner_epoch,
             "run_revision": revision,
             "state": state,
             "capture": capture,
             "tree_status": "running",
+            "node_status_revision": revision,
+            "node_statuses": {"root": "running"},
             "active_operation_count": 1 if state in _ACTIVE_STATES else 0,
             "reason_code": None,
             "message": "",
@@ -311,6 +313,8 @@ class _Host:
         self.started = 0
         self.start_admissions: list[object] = []
         self.stop_calls: list[tuple[str, str | None]] = []
+        self.motion_stop_calls: list[tuple[str, str | None]] = []
+        self.reset_calls: list[str] = []
         self.shutdowns = 0
 
     def start(self) -> None:
@@ -336,15 +340,47 @@ class _Host:
         reason: str | None,
     ) -> _Snapshot:
         self.stop_calls.append((program_run_id, reason))
+        current = self.owner.rows.get(program_run_id)
         snapshot = _Snapshot(
             program_run_id,
             owner_id=self.owner_id,
             owner_epoch=self.owner_epoch,
             state="stopped",
-            revision=2,
+            revision=1 if current is None else current.run_revision + 1,
         )
         self.owner.rows[program_run_id] = snapshot
         return snapshot
+
+    def stop_motion(
+        self,
+        program_run_id: str,
+        *,
+        reason: str | None,
+    ) -> _Snapshot:
+        self.motion_stop_calls.append((program_run_id, reason))
+        current = self.owner.rows.get(program_run_id)
+        snapshot = _Snapshot(
+            program_run_id,
+            owner_id=self.owner_id,
+            owner_epoch=self.owner_epoch,
+            state="running",
+            revision=1 if current is None else current.run_revision + 1,
+        )
+        self.owner.rows[program_run_id] = snapshot
+        return snapshot
+
+    def reset_run(self, program_run_id: str) -> _Snapshot:
+        self.reset_calls.append(program_run_id)
+        return self.owner.rows.get(
+            program_run_id,
+            _Snapshot(
+                program_run_id,
+                owner_id=self.owner_id,
+                owner_epoch=self.owner_epoch,
+                state="stopped",
+                revision=2,
+            ),
+        )
 
     def shutdown(self) -> None:
         self.shutdowns += 1
@@ -407,6 +443,7 @@ class _Admission:
         self.releases: list[dict[str, Any]] = []
         self.reconciliations: list[dict[str, Any]] = []
         self.release_error: CellAdmissionError | None = None
+        self.reconcile_error: Exception | None = None
         self.inventory: dict[str, Any] = {
             "status": "unknown",
             "kernel_owner_epoch": "kernel.epoch.1",
@@ -434,6 +471,8 @@ class _Admission:
 
     def reconcile(self, reconciliation: dict[str, Any]) -> dict[str, Any]:
         self.reconciliations.append(deepcopy(reconciliation))
+        if self.reconcile_error is not None:
+            raise self.reconcile_error
         return {"admission_generation": 2}
 
     def recovery_inventory(self, *, owner_epoch: str) -> dict[str, Any]:
@@ -535,6 +574,100 @@ def test_manager_recovery_rotates_only_clean_idle_program_runner_owner(
         )
     )
     assert journal.read().owner_epoch == "runner.new"
+    runtime.shutdown()
+
+
+def test_manager_recovery_repairs_a_prior_local_first_partial_rotation(
+    tmp_path,
+) -> None:
+    runtime, journal, admission = _reconcile_runtime(
+        tmp_path,
+        journal_owner_epoch="runner.orphaned-successor",
+        runtime_owner_epoch="runner.current",
+        inventory={
+            "status": "unknown",
+            "kernel_owner_epoch": "kernel.1",
+            "held_claims": [],
+            "current_owner_epochs": [
+                {"owner_role": "program_runner", "owner_epoch": "runner.old"}
+            ],
+        },
+    )
+
+    runtime._reconcile_manager_liveness(  # noqa: SLF001
+        _DIGEST_A, "manager.1", "manager-owner.1"
+    )
+
+    assert len(admission.reconciliations) == 1
+    assert admission.reconciliations[0]["current_owner_epochs"] == [
+        {"owner_role": "program_runner", "owner_epoch": "runner.current"}
+    ]
+    assert journal.read().owner_epoch == "runner.current"
+    runtime.shutdown()
+
+
+def test_manager_recovery_finishes_a_prior_kernel_first_partial_rotation(
+    tmp_path,
+) -> None:
+    runtime, journal, admission = _reconcile_runtime(
+        tmp_path,
+        journal_owner_epoch="runner.old",
+        runtime_owner_epoch="runner.current",
+        inventory={
+            "status": "unknown",
+            "kernel_owner_epoch": "kernel.1",
+            "held_claims": [],
+            "current_owner_epochs": [
+                {"owner_role": "program_runner", "owner_epoch": "runner.current"}
+            ],
+        },
+    )
+
+    runtime._reconcile_manager_liveness(  # noqa: SLF001
+        _DIGEST_A, "manager.1", "manager-owner.1"
+    )
+
+    assert admission.reconciliations == []
+    assert journal.read().owner_epoch == "runner.current"
+    runtime.shutdown()
+
+
+def test_manager_recovery_does_not_advance_local_owner_before_kernel(
+    tmp_path,
+) -> None:
+    runtime, journal, admission = _reconcile_runtime(
+        tmp_path,
+        journal_owner_epoch="runner.old",
+        runtime_owner_epoch="runner.current",
+        inventory={
+            "status": "unknown",
+            "kernel_owner_epoch": "kernel.1",
+            "held_claims": [],
+            "current_owner_epochs": [
+                {"owner_role": "program_runner", "owner_epoch": "runner.old"}
+            ],
+        },
+    )
+    admission.reconcile_error = RuntimeError("Kernel reconciliation unavailable")
+
+    with pytest.raises(RuntimeError, match="Kernel reconciliation unavailable"):
+        runtime._reconcile_manager_liveness(  # noqa: SLF001
+            _DIGEST_A, "manager.1", "manager-owner.1"
+        )
+
+    prepared = journal.read()
+    assert prepared.owner_epoch == "runner.old"
+    assert prepared.reconciliation_required is True
+    assert prepared.reconciliation_evidence_digest == (
+        cell_admission_owner_epoch_reconciliation_evidence_digest(
+            "program_runner", "runner.current"
+        )
+    )
+    admission.reconcile_error = None
+    runtime._reconcile_manager_liveness(  # noqa: SLF001
+        _DIGEST_A, "manager.1", "manager-owner.1"
+    )
+    assert journal.read().owner_epoch == "runner.current"
     runtime.shutdown()
 
 
@@ -725,7 +858,7 @@ def _retain_no_effect_terminal(
     reference = ProgramRuntime._digest(settlement)  # noqa: SLF001
     journal.transition(
         expected_generation=retained.cycle_generation,
-        expected_states=("idle_after_reset",),
+        expected_states=("starting",),
         state="terminal_awaiting_reset",
         terminal_reference=reference,
         start_settlement=settlement,
@@ -1212,6 +1345,25 @@ def test_runtime_replays_exact_requests_and_keeps_one_active_product_run(
         )
     assert conflict.value.code == "program_run_request_conflict"
 
+    motion_stop = ProgramRunStopRequest.model_validate(
+        {
+            "request_id": "request.motion-stop.1",
+            "request_owner_epoch": "composer.epoch.1",
+            "source_label": "operator_ui",
+            "correlation_id": None,
+            "program_run_id": "program-run.1",
+            "expected_owner_epoch": runtime.owner_epoch,
+            "reason": "ordinary operator motion Stop",
+        }
+    )
+    motion_stopped = runtime.stop_motion("program-run.1", motion_stop)
+    assert runtime.stop_motion("program-run.1", motion_stop) == motion_stopped
+    assert motion_stopped["state"] == "running"
+    assert host.motion_stop_calls == [
+        ("program-run.1", "ordinary operator motion Stop")
+    ]
+    assert runtime.cycle_status()["state"] == "running"
+
     stop = ProgramRunStopRequest.model_validate(
         {
             "request_id": "request.stop.1",
@@ -1265,11 +1417,38 @@ def test_runtime_replays_exact_requests_and_keeps_one_active_product_run(
     reset_result = runtime.reset_cycle(reset)
     assert runtime.reset_cycle(reset) == reset_result
     assert len(admission.releases) == 1
+    assert host.reset_calls == ["program-run.1"]
     assert runtime.cycle_status()["state"] == "idle_after_reset"
 
     runtime.shutdown()
     assert host.shutdowns == 1
     assert host.stop_calls == [("program-run.1", "operator stop")]
+
+
+def test_cycle_status_projects_pending_acquire_as_starting(tmp_path) -> None:
+    journal = ProgramCycleJournal(
+        tmp_path / "cycle.sqlite3", owner_epoch="runner.1"
+    )
+    journal.begin_acquire(
+        expected_generation=1,
+        provisional_run_id="program-cycle.1",
+        evidence={"request_id": "request.start.1"},
+    )
+    runtime = ProgramRuntime(
+        ProgramRunnerConfig(
+            headless_url="http://headless.test", owner_epoch="runner.1"
+        ),
+        headless_client=_Headless(),  # type: ignore[arg-type]
+        admission_client=_Admission(),  # type: ignore[arg-type]
+        cycle_journal=journal,
+    )
+
+    status = runtime._cycle_status_core()  # noqa: SLF001
+
+    assert status["state"] == "starting"
+    assert status["program_run_id"] == "program-cycle.1"
+    assert status["cycle_claim_generation"] is None
+    runtime.shutdown()
 
 
 def test_runtime_controls_replay_and_restore_one_run_scoped_ledger(
@@ -1452,7 +1631,7 @@ def test_replacement_owner_remains_fail_closed_for_later_reconciliation_owner(
     )
     old.transition(
         expected_generation=1,
-        expected_states=("idle_after_reset",),
+        expected_states=("starting",),
         state="terminal_awaiting_reset",
         terminal_reference=_DIGEST_B,
     )
@@ -1530,7 +1709,7 @@ def test_restart_retries_containment_after_durable_loss_crash_window(
     )
     old.transition(
         expected_generation=1,
-        expected_states=("idle_after_reset",),
+        expected_states=("starting",),
         state="running",
         program_run_id="program-run.1",
     )
@@ -1947,7 +2126,7 @@ def test_acquire_success_before_claim_journal_failure_latches_reconciliation(
     assert failed.value.code == "program_cycle_reconciliation_required"
     assert len(admission.claims) == 1
     assert journal.read().reconciliation_required is True
-    assert journal.read().state == "idle_after_reset"
+    assert journal.read().state == "starting"
     assert journal.read().claim is None
     assert journal.read().acquisition_pending is not None
     runtime.shutdown()

@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { api } from '../api/client';
 import { useShellHeadlessState } from '../hooks/useHeadlessState';
 import type {
@@ -127,7 +127,7 @@ export function runtimeStatusView(
       id: 'composer_client_errors',
       label: 'Composer client errors',
       status: 'fault',
-      detail: `${context.clientErrorCount} acknowledgement required`,
+      detail: `${context.clientErrorCount} dismissal required`,
     });
   }
   if (context.programCycleState === 'terminal_awaiting_reset') {
@@ -157,7 +157,7 @@ export function runtimeStatusView(
     summaryLabel: readiness === 'ready'
       ? 'Application surfaces ready'
       : readiness === 'degraded'
-        ? 'Attention required'
+        ? 'Operational attention'
         : 'Headless sources incomplete',
     profileLabel: 'H0 projection',
     authorityLabel: 'source-owned facts',
@@ -215,6 +215,7 @@ interface HeadlessRuntimeSurfacesProps {
   headlessStateSource: HeadlessStateSource;
   clientErrors?: ClientOperationalError[];
   onAcknowledgeClientError?: (id: string) => void;
+  attentionRequest?: string | null;
 }
 
 interface HeadlessRuntimeSurfacesViewProps {
@@ -222,6 +223,7 @@ interface HeadlessRuntimeSurfacesViewProps {
   headlessState: HeadlessStateResult;
   clientErrors?: ClientOperationalError[];
   onAcknowledgeClientError?: (id: string) => void;
+  attentionRequest?: string | null;
 }
 
 export function HeadlessRuntimeSurfacesView({
@@ -229,6 +231,7 @@ export function HeadlessRuntimeSurfacesView({
   headlessState,
   clientErrors = [],
   onAcknowledgeClientError,
+  attentionRequest = null,
 }: HeadlessRuntimeSurfacesViewProps) {
   const { snapshot, error, reconnect } = headlessState;
   const [busyActivation, setBusyActivation] = useState<string | null>(null);
@@ -242,6 +245,9 @@ export function HeadlessRuntimeSurfacesView({
   const [historyDetail, setHistoryDetail] = useState<HistorianDetail | null>(null);
   const [historyDetailLoading, setHistoryDetailLoading] = useState(false);
   const [historyDetailError, setHistoryDetailError] = useState<string | null>(null);
+  useEffect(() => {
+    if (attentionRequest !== null) setMode('attention');
+  }, [attentionRequest]);
   useOperationalErrorMirror({
     source: 'composer.runtime_history',
     title: 'Runtime history request failed',
@@ -492,6 +498,7 @@ export function HeadlessRuntimeSurfaces({
   headlessStateSource,
   clientErrors = [],
   onAcknowledgeClientError,
+  attentionRequest = null,
 }: HeadlessRuntimeSurfacesProps) {
   const headlessState = useShellHeadlessState(headlessStateSource);
   return (
@@ -500,6 +507,7 @@ export function HeadlessRuntimeSurfaces({
       headlessState={headlessState}
       clientErrors={clientErrors}
       onAcknowledgeClientError={onAcknowledgeClientError}
+      attentionRequest={attentionRequest}
     />
   );
 }

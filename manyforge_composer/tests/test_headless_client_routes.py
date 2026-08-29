@@ -73,6 +73,28 @@ def _alarms() -> dict[str, Any]:
     }
 
 
+def _execution_observation() -> dict[str, Any]:
+    return {
+        "api_version": "manyforge.execution_command_response.v1",
+        "command": "observation",
+        "ok": True,
+        "observation": {
+            "schema_version": "manyforge.execution_observation.v1",
+            "owner_epoch": "execution.epoch.1",
+            "cell_id": "cell-a",
+            "retained_bundle_id": "bundle.1",
+            "graph_revision": "graph.1",
+            "controllable_component_id": "robot-a",
+            "command_target_id": "arm",
+            "source_epoch": "joint-source.1",
+            "source_sequence": 7,
+            "source_joint_names": ["joint1"],
+            "compiled_joint_names": ["robot-a__joint1"],
+            "positions_rad": [0.25],
+        },
+    }
+
+
 def _scene_body(
     *,
     request_id: str = "request.scene.1",
@@ -108,7 +130,7 @@ def _program_run_status(*, state: str = "running") -> dict[str, Any]:
     digest_b = "sha256:" + "b" * 64
     digest_c = "sha256:" + "c" * 64
     return {
-        "schema_version": "manyforge.program_run_status.v1",
+        "schema_version": "manyforge.program_run_status.v2",
         "owner_id": "program-runner.cell-a",
         "owner_epoch": "program-runner.epoch.1",
         "run_revision": 1,
@@ -136,6 +158,8 @@ def _program_run_status(*, state: str = "running") -> dict[str, Any]:
             ],
         },
         "tree_status": "running",
+        "node_status_revision": 1,
+        "node_statuses": {"root": "running"},
         "active_operation_count": 1,
         "reason_code": None,
         "message": "",
@@ -370,6 +394,8 @@ def headless_client() -> (
             }
         elif path == "/api/runtime":
             payload = _runtime()
+        elif path == "/api/execution/observation":
+            payload = _execution_observation()
         elif path == "/api/manager/status":
             payload = {
                 "schema_version": "manyforge.manager_status_projection.v1",
@@ -436,6 +462,8 @@ def headless_client() -> (
             payload = _program_run_status()
         elif path == "/api/program/runs/program-run.1/stop":
             payload = _program_run_status(state="stopping")
+        elif path == "/api/program/runs/program-run.1/motion-stop":
+            payload = _program_run_status(state="running")
         elif path == "/api/program/applied":
             if applied_program is None:
                 return httpx.Response(
@@ -1179,6 +1207,14 @@ def test_composer_program_routes_are_strict_stateless_forwarders(
         ).json()["runs"] == []
         started = composer.post("/api/program/runs", json=start)
         read = composer.get("/api/program/runs/program-run.1")
+        motion_stopped = composer.post(
+            "/api/program/runs/program-run.1/motion-stop",
+            json={
+                **stop,
+                "request_id": "request.program.motion-stop.1",
+                "reason": "ordinary operator motion Stop",
+            },
+        )
         stopped = composer.post(
             "/api/program/runs/program-run.1/stop",
             json=stop,
@@ -1190,6 +1226,7 @@ def test_composer_program_routes_are_strict_stateless_forwarders(
 
     assert started.status_code == 200
     assert read.json()["capture"]["program_run_id"] == "program-run.1"
+    assert motion_stopped.json()["state"] == "running"
     assert stopped.json()["state"] == "stopping"
     assert mismatch.status_code == 400
     forwarded = [
@@ -1201,6 +1238,7 @@ def test_composer_program_routes_are_strict_stateless_forwarders(
         "GET",
         "POST",
         "GET",
+        "POST",
         "POST",
     ]
 
@@ -1364,6 +1402,25 @@ def test_composer_operation_controls_are_strict_stateless_forwarders(
     assert forwarded[7]["body"] == recovery
     assert forwarded[8]["body"] == scale
     assert forwarded[9]["method"] == "GET"
+
+
+def test_composer_exposes_focused_execution_observation(
+    headless_client,
+) -> None:
+    client, requests, _node_environment = headless_client
+
+    with _composer(client) as composer:
+        response = composer.get("/api/execution/observation")
+
+    assert response.status_code == 200
+    assert response.json() == _execution_observation()
+    forwarded = [
+        item
+        for item in requests
+        if item["path"] == "/api/execution/observation"
+    ]
+    assert len(forwarded) == 1
+    assert forwarded[0]["method"] == "GET"
 
 
 def test_composer_preserves_recognized_malformed_stop_semantics(
@@ -2370,7 +2427,7 @@ def test_composer_preserves_manager_apply_success_receipt(
     assert response.json() == receipt
 
 
-def test_composer_websocket_streams_owner_snapshots_only(
+def test_composer_websocket_multiplexes_shell_and_bounded_observations(
     headless_client,
 ) -> None:
     client, requests, _node_environment = headless_client
@@ -2400,11 +2457,50 @@ def test_composer_websocket_streams_owner_snapshots_only(
                 "snapshot_sequence": 1,
                 "complete": True,
             }
+            observation = websocket.receive_json()
+            assert observation == {
+                "schema_version": "manyforge.execution_observation_frame.v1",
+                "owner_epoch": "execution.epoch.1",
+                "cell_id": "cell-a",
+                "retained_bundle_id": "bundle.1",
+                "graph_revision": "graph.1",
+                "controllable_component_id": "robot-a",
+                "command_target_id": "arm",
+                "source_epoch": "joint-source.1",
+                "source_sequence": 7,
+                "received_at_monotonic_us": observation[
+                    "received_at_monotonic_us"
+                ],
+                "source_joint_names": ["joint1"],
+                "compiled_joint_names": ["robot-a__joint1"],
+                "positions_rad": [0.25],
+            }
+            assert observation["received_at_monotonic_us"] > 0
+        viewer_status = composer.get("/api/scene/viewer/status")
+        assert viewer_status.status_code == 200
+        assert viewer_status.json() == {
+            "schema_version": "manyforge.execution_observation_stream_status.v1",
+            "source": {
+                "active": False,
+                "rate_limit_hz": 30.0,
+                "poll_count": viewer_status.json()["source"]["poll_count"],
+                "published_count": 1,
+                "error_count": 0,
+                "last_error": None,
+            },
+            "fanout": {
+                "client_count": 0,
+                "capacity_per_client": 1,
+                "replaced_frames_total": 0,
+            },
+        }
+        assert viewer_status.json()["source"]["poll_count"] >= 1
     assert {
         item["path"] for item in _without_authoring_owner_calls(requests)
     } == {
         "/api/runtime",
         "/api/execution/alarms",
+        "/api/execution/observation",
         "/api/cycle/status",
     }
     alarm_request = next(

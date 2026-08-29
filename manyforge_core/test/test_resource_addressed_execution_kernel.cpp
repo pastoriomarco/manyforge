@@ -88,6 +88,34 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     return next_execute_result;
   }
 
+  Result<void> adopt_certified_motion_stop(
+      const std::uint64_t execution_id,
+      const StopCertificateRefDTO& certificate) override {
+    ++certified_motion_stop_adoption_calls;
+    if (execution_id != next_execution_id || !certificate.locally_valid()) {
+      return Result<void>::Err(
+          ErrorDTO{"certified_motion_stop_execution_mismatch",
+                   "fake certified Stop identity is stale", {}});
+    }
+    {
+      std::lock_guard lock(status_mutex_);
+      status.state = ExecutionState::kStopped;
+      status.execution_id = execution_id;
+    }
+    recovery_assessment.control_command_epoch += 1U;
+    recovery_assessment.execution_id = execution_id;
+    recovery_assessment.execution_state = ExecutionState::kStopped;
+    recovery_assessment.recovery_class = RecoveryClass::kOrdinaryOperatorStop;
+    recovery_assessment.status = RecoveryAssessmentStatus::kRetryReady;
+    recovery_assessment.retry_admissible = true;
+    recovery_assessment.stop_certificate_id = certificate.stop_certificate_id.value();
+    recovery_assessment.stop_owner_generation = certificate.stop_generation.value();
+    recovery_assessment.backend_stop_confirmed = true;
+    recovery_assessment.allowed_actions = {RecoveryAction::kReplanFromStoppedState,
+                                           RecoveryAction::kResetCycle};
+    return Result<void>::Ok();
+  }
+
   Result<std::uint64_t> PrepareMotion(ResolvedPreparedMotionExecutionRequestDTO request) override {
     ++prepare_motion_calls;
     Trace("engine:prepare_motion");
@@ -769,6 +797,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   std::atomic<int> resume_calls{};
   std::atomic<int> reset_calls{};
   std::atomic<int> certified_reset_calls{};
+  std::atomic<int> certified_motion_stop_adoption_calls{};
   std::atomic<int> acknowledge_calls{};
   std::atomic<int> runtime_scale_calls{};
   mutable std::atomic<int> recovery_assessment_calls{};
@@ -3908,6 +3937,43 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(cell_stop.latest_terminal->result, certificate.value().result);
   EXPECT_FALSE(cell_stop.latest_terminal->executed_stages.empty());
   EXPECT_EQ(cell_stop.fault.has_value(), kernel.get_stop_fault_latch().has_value());
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     SuccessfulAddressedStopCommitsTheExactParticipantRecoveryFactOnce) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+
+  const auto operation = kernel.execute(motion_operation("request.stop-recovery-owner"));
+  ASSERT_TRUE(operation.ok()) << operation.error().message;
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  const auto stopped =
+      kernel.stop(stop_request("request.stop-recovery-owner.stop", operation.value(), 1U));
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    const auto state = kernel.get_operation_state(operation.value().operation_id);
+    return state.ok() && state.value().state == OperationStateKind::kStopped &&
+           engine.certified_motion_stop_adoption_calls.load() == 1;
+  }));
+
+  const auto recovery =
+      kernel.get_operation_recovery_assessment(operation.value().operation_id);
+  ASSERT_TRUE(recovery.ok()) << recovery.error().message;
+  EXPECT_EQ(recovery.value().assessment.recovery_class,
+            RecoveryClass::kOrdinaryOperatorStop);
+  EXPECT_EQ(recovery.value().assessment.status, RecoveryAssessmentStatus::kRetryReady);
+  EXPECT_TRUE(recovery.value().assessment.backend_stop_confirmed);
+  EXPECT_EQ(recovery.value().assessment.stop_certificate_id,
+            "stop-certificate." + stopped.value().stop_id.value());
+  EXPECT_EQ(engine.stop_calls, 1);
+  EXPECT_EQ(engine.certified_motion_stop_adoption_calls, 1);
 }
 
 TEST(ResourceAddressedExecutionKernelTest, UsesOneInjectedGateForTheActualSlotTableReservation) {

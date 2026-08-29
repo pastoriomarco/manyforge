@@ -10,6 +10,8 @@ import {
   parseHistorianPage,
   parseHistorianDetail,
   parseExecutionOwnerStatus,
+  parseExecutionIdentity,
+  parseExecutionControlStatus,
   parseManagerApplyResponse,
   parseManagerApplyStatusResponse,
   parseManagerDeploymentCandidatePreviewResponse,
@@ -100,6 +102,7 @@ import type {
   CapabilityCommandPreviewReceipt,
   DirectControlOperationIntent,
   ExecutionOwnerStatus,
+  ExecutionIdentity,
   MotionPreviewReceipt,
   OperationAcceptance,
   OperationObservation,
@@ -121,6 +124,27 @@ import type {
 } from '../types/cclc';
 
 const BASE_URL = import.meta.env.VITE_API_URL || '';
+
+interface ExecutionTargetsCache {
+  identity: string;
+  projection: unknown;
+}
+
+let executionTargetsCache: ExecutionTargetsCache | null = null;
+
+function executionProjectionIdentityKey(value: unknown): string | null {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+  const identity = (value as Record<string, unknown>).identity;
+  if (identity === null || typeof identity !== 'object' || Array.isArray(identity)) {
+    return null;
+  }
+  // Native responses use canonical JSON, so the exact owner/product identity
+  // has stable key order. This key is only a cache hint; the strict parser
+  // below still validates and compares both complete identities before use.
+  return JSON.stringify(identity);
+}
 
 export function resolveStructuralAssetUrl(path: string): string {
   if (/^https?:\/\//i.test(path) || path.startsWith('blob:')) {
@@ -620,6 +644,16 @@ export const api = {
       signal,
       { method: 'POST', body: JSON.stringify(body) },
     ),
+    stopMotion: (
+      programRunId: string,
+      body: Record<string, JsonValue>,
+      signal?: AbortSignal,
+    ): Promise<ProgramRunStatus> => requestJson(
+      `/api/program/runs/${encodeURIComponent(programRunId)}/motion-stop`,
+      parseProgramRunStatus,
+      signal,
+      { method: 'POST', body: JSON.stringify(body) },
+    ),
     resetCycle: (
       body: Record<string, JsonValue>,
       signal?: AbortSignal,
@@ -837,9 +871,44 @@ export const api = {
     ),
   },
   execution: {
-    status: (signal?: AbortSignal): Promise<ExecutionOwnerStatus> =>
+    identity: (signal?: AbortSignal): Promise<ExecutionIdentity> =>
       requestJson(
-        '/api/execution/status',
+        '/api/execution/identity',
+        parseExecutionIdentity,
+        signal,
+      ),
+    controlStatus: async (
+      signal?: AbortSignal,
+    ): Promise<ExecutionOwnerStatus> => {
+      const controlState = await requestJson(
+        '/api/execution/control-state',
+        (value) => value,
+        signal,
+      );
+      const controlIdentity = executionProjectionIdentityKey(controlState);
+      let targets = executionTargetsCache?.identity === controlIdentity
+        ? executionTargetsCache.projection
+        : null;
+      if (targets === null) {
+        targets = await requestJson(
+          '/api/execution/targets',
+          (value) => value,
+          signal,
+        );
+        const targetIdentity = executionProjectionIdentityKey(targets);
+        if (targetIdentity !== null && targetIdentity === controlIdentity) {
+          executionTargetsCache = {
+            identity: targetIdentity,
+            projection: targets,
+          };
+        }
+      }
+      return parseExecutionControlStatus(targets, controlState);
+    },
+    /** Explicit cold-path aggregate; ordinary UI flows use scoped views. */
+    diagnostics: (signal?: AbortSignal): Promise<ExecutionOwnerStatus> =>
+      requestJson(
+        '/api/execution/diagnostics',
         parseExecutionOwnerStatus,
         signal,
       ),

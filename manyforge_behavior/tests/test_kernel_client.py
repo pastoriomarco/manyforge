@@ -22,8 +22,8 @@ class FakeTransport:
         self.submitted: Mapping[str, Any] | None = None
         self.controls: list[tuple[str, str, Mapping[str, Any]]] = []
 
-    def execution_status(self) -> dict[str, Any]:
-        return {"ok": True, "status": {"owner_epoch": "epoch-1"}}
+    def execution_identity(self) -> dict[str, Any]:
+        return {"ok": True, "identity": {"owner_epoch": "epoch-1"}}
 
     def execute(self, body: Mapping[str, Any]) -> dict[str, Any]:
         self.submitted = body
@@ -143,7 +143,7 @@ def test_kernel_client_only_forwards_bounded_headless_operations() -> None:
     transport = FakeTransport()
     client = KernelClient(transport)
 
-    assert client.status()["status"]["owner_epoch"] == "epoch-1"
+    assert client.identity()["identity"]["owner_epoch"] == "epoch-1"
     assert client.execute({"program_id": "program-1"})["accepted"][
         "operation_id"
     ] == "operation-1"
@@ -183,11 +183,11 @@ def test_kernel_client_only_forwards_bounded_headless_operations() -> None:
 
 def test_malformed_success_and_legacy_stateful_mock_fail_closed() -> None:
     class BadTransport(FakeTransport):
-        def execution_status(self) -> dict[str, Any]:
+        def execution_identity(self) -> dict[str, Any]:
             return {"ok": False}
 
     with pytest.raises(KernelClientResponseError):
-        KernelClient(BadTransport()).status()
+        KernelClient(BadTransport()).identity()
     with pytest.raises(LegacyKernelMockUnavailableError):
         MockKernelClient()
 

@@ -12,7 +12,7 @@ import type {
   CCLCRouteTemplateSet,
   CCLCTransactionStatus,
 } from '../types/cclc';
-import type { ExecutionOwnerStatus } from '../types/robotControl';
+import type { ExecutionIdentity } from '../types/robotControl';
 
 const POLL_INTERVAL_MS = 250;
 let fallbackIdentitySequence = 0;
@@ -64,7 +64,7 @@ function requestContext(
 export function cclcRequestOwnerEpoch(
   owner: CCLCOwnerIdentity,
   snapshot: CCLCComponentSnapshot,
-  execution: ExecutionOwnerStatus,
+  execution: ExecutionIdentity,
 ): string {
   if (
     execution.graphRevision !== snapshot.graphRevision
@@ -171,7 +171,7 @@ export function useCCLC(
     const [owner, nextSnapshot, execution] = await Promise.all([
       api.cclc.owner(signal),
       api.cclc.component(identity, signal),
-      api.execution.status(signal),
+      api.execution.identity(signal),
     ]);
     const ownerEpoch = cclcRequestOwnerEpoch(owner, nextSnapshot, execution);
     let nextTemplates: CCLCRouteTemplateSet = {

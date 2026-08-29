@@ -97,6 +97,41 @@ public:
     }
     return result;
   }
+
+  static void install_prepared_goal_membership(
+      RoboPlanExecutionBackend &backend,
+      const core::ResolvedParticipantStopStageDTO &stage,
+      core::ContentDigest prepared_contract_digest,
+      core::ExecutionHandle handle) {
+    std::lock_guard<std::mutex> lock(backend.prepared_execution_mutex_);
+    backend.prepared_goals_.erase(stage.controller_goal_id);
+    backend.prepared_goals_.emplace(
+        stage.controller_goal_id,
+        RoboPlanExecutionBackend::PreparedGoalRecord{
+            stage.controller_goal_generation,
+            std::move(prepared_contract_digest),
+            stage.operation_id,
+            stage.operation_revision,
+            stage.participant_id,
+            stage.controllable_component_id,
+            stage.command_target_id,
+            stage.capability_id,
+            stage.control_domain_id,
+            stage.control_domain_revision,
+            stage.control_binding_id,
+            stage.control_binding_revision,
+            stage.controller_topology_id,
+            stage.topology_revision,
+            stage.control_route_id,
+            stage.active_control_configuration_id,
+            stage.active_control_configuration_generation,
+            stage.provider_runtime_epoch,
+            stage.resources,
+            stage.stop_evidence_policy_id,
+            stage.stop_evidence_policy_revision,
+            {stage.participant_stop_plan},
+            std::move(handle)});
+  }
 };
 
 } // namespace manyforge::roboplan_backend::detail

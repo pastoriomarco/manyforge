@@ -10,7 +10,7 @@ from typing import Any, Mapping, Protocol
 class HeadlessExecutionTransport(Protocol):
     """The bounded operation-addressed HTTP calls used by Behavior."""
 
-    def execution_status(self) -> dict[str, Any]: ...
+    def execution_identity(self) -> dict[str, Any]: ...
 
     def execute(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
@@ -143,7 +143,7 @@ class KernelClient:
 
     def __init__(self, transport: HeadlessExecutionTransport) -> None:
         for method in (
-            "execution_status",
+            "execution_identity",
             "execute",
             "operation",
             "pause_operation",
@@ -166,9 +166,9 @@ class KernelClient:
             )
         return value
 
-    def status(self) -> dict[str, Any]:
+    def identity(self) -> dict[str, Any]:
         return self._successful(
-            self._transport.execution_status(), label="status"
+            self._transport.execution_identity(), label="identity"
         )
 
     def execute(self, intent: Mapping[str, Any]) -> dict[str, Any]:

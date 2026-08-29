@@ -569,14 +569,18 @@ Result<void> ValidateProgramCycleStatus(const ProgramCycleStatusDTO& status) {
     return Invalid<void>("program_cycle_status_identity_invalid");
   }
   const bool idle = status.state == ProgramCycleStateDTO::kIdleAfterReset;
-  if (idle != (!status.program_run_id.has_value() &&
-               !status.cycle_claim_generation.has_value() &&
-               !status.terminal_or_settlement_reference.has_value()) ||
+  const bool pending_acquire =
+      status.state == ProgramCycleStateDTO::kStarting &&
+      !status.cycle_claim_generation.has_value();
+  if ((idle && (status.program_run_id.has_value() ||
+                status.cycle_claim_generation.has_value() ||
+                status.terminal_or_settlement_reference.has_value())) ||
       (!idle &&
        (!status.program_run_id.has_value() || status.program_run_id->empty() ||
-        !status.cycle_claim_generation.has_value() ||
-        !status.cycle_claim_generation->nonzero() ||
-        status.cycle_claim_generation->value() > kMaximumSafeCounter)) ||
+        (!pending_acquire &&
+         (!status.cycle_claim_generation.has_value() ||
+          !status.cycle_claim_generation->nonzero() ||
+          status.cycle_claim_generation->value() > kMaximumSafeCounter)))) ||
       (status.terminal_or_settlement_reference.has_value() &&
        !Digest(*status.terminal_or_settlement_reference)) ||
       (status.state == ProgramCycleStateDTO::kTerminalAwaitingReset &&

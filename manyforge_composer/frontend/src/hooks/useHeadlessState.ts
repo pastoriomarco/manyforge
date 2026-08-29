@@ -2,6 +2,10 @@ import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { resolveStructuralAssetUrl } from '../api/client';
 import { parseComposerHeadlessState } from '../api/parsers';
 import type { ComposerHeadlessState } from '../types/headless';
+import type {
+  ExecutionObservationFrame,
+  ExecutionObservationReader,
+} from '../types/viewerObservation';
 import {
   setViewerQualificationTransport,
   type ViewerQualificationTransportState,
@@ -9,6 +13,84 @@ import {
 
 const RECONNECT_DELAY_MS = 1000;
 export const HEADLESS_SHELL_PUBLICATION_MS = 100;
+
+const EXECUTION_OBSERVATION_SCHEMA = 'manyforge.execution_observation_frame.v1';
+
+export function parseExecutionObservationFrame(raw: unknown): ExecutionObservationFrame {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('Execution observation frame must be an object.');
+  }
+  const record = raw as Record<string, unknown>;
+  const expected = [
+    'cell_id',
+    'command_target_id',
+    'compiled_joint_names',
+    'controllable_component_id',
+    'graph_revision',
+    'owner_epoch',
+    'positions_rad',
+    'received_at_monotonic_us',
+    'retained_bundle_id',
+    'schema_version',
+    'source_epoch',
+    'source_joint_names',
+    'source_sequence',
+  ].sort();
+  if (Object.keys(record).sort().some((key, index) => key !== expected[index])
+    || Object.keys(record).length !== expected.length) {
+    throw new Error('Execution observation frame has an invalid shape.');
+  }
+  const text = (key: string): string => {
+    const value = record[key];
+    if (typeof value !== 'string' || value.length === 0) {
+      throw new Error(`Execution observation ${key} is invalid.`);
+    }
+    return value;
+  };
+  const integer = (key: string): number => {
+    const value = record[key];
+    if (!Number.isSafeInteger(value) || (value as number) < 0) {
+      throw new Error(`Execution observation ${key} is invalid.`);
+    }
+    return value as number;
+  };
+  const strings = (key: string): string[] => {
+    const value = record[key];
+    if (!Array.isArray(value) || value.length === 0 || value.length > 1024
+      || value.some((item) => typeof item !== 'string' || item.length === 0)
+      || new Set(value).size !== value.length) {
+      throw new Error(`Execution observation ${key} is invalid.`);
+    }
+    return [...value] as string[];
+  };
+  const sourceJointNames = strings('source_joint_names');
+  const compiledJointNames = strings('compiled_joint_names');
+  const rawPositions = record.positions_rad;
+  if (!Array.isArray(rawPositions)
+    || rawPositions.some((value) => typeof value !== 'number' || !Number.isFinite(value))
+    || rawPositions.length !== sourceJointNames.length
+    || compiledJointNames.length !== sourceJointNames.length) {
+    throw new Error('Execution observation joint vectors are invalid.');
+  }
+  if (record.schema_version !== EXECUTION_OBSERVATION_SCHEMA) {
+    throw new Error('Execution observation schema is unsupported.');
+  }
+  return Object.freeze({
+    schemaVersion: EXECUTION_OBSERVATION_SCHEMA,
+    ownerEpoch: text('owner_epoch'),
+    cellId: text('cell_id'),
+    retainedBundleId: text('retained_bundle_id'),
+    graphRevision: text('graph_revision'),
+    controllableComponentId: text('controllable_component_id'),
+    commandTargetId: text('command_target_id'),
+    sourceEpoch: text('source_epoch'),
+    sourceSequence: integer('source_sequence'),
+    receivedAtMonotonicUs: integer('received_at_monotonic_us'),
+    sourceJointNames,
+    compiledJointNames,
+    positionsRad: [...rawPositions] as number[],
+  });
+}
 
 export interface HeadlessStateResult {
   snapshot: ComposerHeadlessState | null;
@@ -203,7 +285,7 @@ export function getHeadlessStateQualificationSnapshot(): ViewerQualificationTran
  * One transport and two bounded delivery lanes for copied owner facts.
  * This source performs parsing, admission, and scheduling only.
  */
-export class HeadlessStateSource {
+export class HeadlessStateSource implements ExecutionObservationReader {
   private enabled = false;
   private disposed = false;
   private serial = 0;
@@ -211,7 +293,9 @@ export class HeadlessStateSource {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private shellTimer: ReturnType<typeof setTimeout> | null = null;
   private viewerFrame: number | ReturnType<typeof setTimeout> | null = null;
+  private observationFrame: number | ReturnType<typeof setTimeout> | null = null;
   private latest: ComposerHeadlessState | null = null;
+  private latestExecutionObservation: ExecutionObservationFrame | null = null;
   private presentedViewer: ComposerHeadlessState | null = null;
   private presentedFrame: RuntimeFrameIdentity | null = null;
   private latestError: string | null = null;
@@ -224,6 +308,7 @@ export class HeadlessStateSource {
   };
   private readonly shellListeners = new Set<Listener>();
   private readonly viewerListeners = new Set<Listener>();
+  private readonly executionObservationListeners = new Set<Listener>();
   constructor() {
     headlessSourceRecords.add(this.qualificationRecord);
     publishHeadlessQualification();
@@ -241,8 +326,14 @@ export class HeadlessStateSource {
     return () => this.viewerListeners.delete(listener);
   };
 
+  readonly subscribeExecutionObservation = (listener: Listener) => {
+    this.executionObservationListeners.add(listener);
+    return () => this.executionObservationListeners.delete(listener);
+  };
+
   readonly getShellSnapshot = () => this.shellResult;
   readonly getViewerSnapshot = () => this.viewerResult;
+  readonly getLatestExecutionObservation = () => this.latestExecutionObservation;
   readonly getPresentedRuntimeFrame = (): RuntimeFrameIdentity | null =>
     this.presentedFrame === null ? null : { ...this.presentedFrame };
 
@@ -267,6 +358,7 @@ export class HeadlessStateSource {
     this.stopConnection('Composer headless source disabled');
     this.cancelPublications();
     this.latest = null;
+    this.clearExecutionObservation();
     this.presentedViewer = null;
     this.presentedFrame = null;
     this.latestError = null;
@@ -292,6 +384,7 @@ export class HeadlessStateSource {
     this.cancelPublications();
     this.shellListeners.clear();
     this.viewerListeners.clear();
+    this.executionObservationListeners.clear();
     headlessSourceRecords.delete(this.qualificationRecord);
     publishHeadlessQualification();
   }
@@ -308,6 +401,7 @@ export class HeadlessStateSource {
     }
     socket?.close(1000, reason);
     this.latest = null;
+    this.clearExecutionObservation();
     this.presentedViewer = null;
     this.presentedFrame = null;
     this.publishImmediate(this.result());
@@ -337,6 +431,24 @@ export class HeadlessStateSource {
       try {
         const raw: unknown = JSON.parse(String(message.data));
         if (raw !== null && typeof raw === 'object' && !Array.isArray(raw)) {
+          if ((raw as Record<string, unknown>).schema_version
+            === EXECUTION_OBSERVATION_SCHEMA) {
+            const candidate = parseExecutionObservationFrame(raw);
+            const current = this.latestExecutionObservation;
+            if (
+              current !== null
+              && candidate.ownerEpoch === current.ownerEpoch
+              && candidate.sourceEpoch === current.sourceEpoch
+              && candidate.sourceSequence <= current.sourceSequence
+            ) {
+              this.publishError('Execution observation sequence regressed.');
+              socket.close(1002, 'non-monotonic execution observation');
+              return;
+            }
+            this.latestExecutionObservation = candidate;
+            this.scheduleExecutionObservation();
+            return;
+          }
           const errorValue = (raw as Record<string, unknown>).error;
           if (
             errorValue !== null
@@ -420,6 +532,7 @@ export class HeadlessStateSource {
     this.latestError = error;
     if (error !== null) {
       this.latest = null;
+      this.clearExecutionObservation();
       this.presentedViewer = null;
       this.presentedFrame = null;
     }
@@ -457,6 +570,29 @@ export class HeadlessStateSource {
     }
   }
 
+  private scheduleExecutionObservation(): void {
+    if (this.observationFrame !== null) return;
+    if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
+      this.observationFrame = window.requestAnimationFrame(
+        () => this.flushExecutionObservation(),
+      );
+    } else {
+      this.observationFrame = setTimeout(() => this.flushExecutionObservation(), 16);
+    }
+  }
+
+  private flushExecutionObservation(): void {
+    this.observationFrame = null;
+    for (const listener of this.executionObservationListeners) listener();
+  }
+
+  private clearExecutionObservation(): void {
+    if (this.latestExecutionObservation === null) return;
+    this.latestExecutionObservation = null;
+    this.cancelObservationFrame();
+    for (const listener of this.executionObservationListeners) listener();
+  }
+
   private flushViewer(): void {
     this.viewerFrame = null;
     this.viewerResult = this.result();
@@ -475,10 +611,23 @@ export class HeadlessStateSource {
     this.viewerFrame = null;
   }
 
+  private cancelObservationFrame(): void {
+    if (this.observationFrame === null) return;
+    if (typeof this.observationFrame === 'number'
+      && typeof window !== 'undefined'
+      && typeof window.cancelAnimationFrame === 'function') {
+      window.cancelAnimationFrame(this.observationFrame);
+    } else {
+      clearTimeout(this.observationFrame as ReturnType<typeof setTimeout>);
+    }
+    this.observationFrame = null;
+  }
+
   private cancelPublications(): void {
     if (this.shellTimer !== null) clearTimeout(this.shellTimer);
     this.shellTimer = null;
     this.cancelViewerFrame();
+    this.cancelObservationFrame();
   }
 }
 

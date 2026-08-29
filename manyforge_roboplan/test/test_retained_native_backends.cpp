@@ -1033,7 +1033,7 @@ TEST(RetainedGripperCommandBackendTest,
 }
 
 TEST(RetainedGripperCommandBackendTest,
-     InvalidationFencesQueuedGenerationUntilExplicitAuthorization) {
+     InvalidationFencesCommandsButKeepsObservedStateFresh) {
   auto binding = make_binding(CoordinateKind::kLinear);
   auto channel = std::make_shared<FakeRetainedStateChannel>(
       binding, std::vector<double>{0.0});
@@ -1045,13 +1045,16 @@ TEST(RetainedGripperCommandBackendTest,
       backend.command_gripper(gripper_request(binding, 0.02, 1.0));
   ASSERT_TRUE(first.accepted);
 
-  backend.invalidate_gripper_commands(GripperInvalidationReason::kReset);
+  backend.invalidate_gripper_commands(GripperInvalidationReason::kStop);
   clock.advance(1'000'000'000);
   scheduler.advance_to(clock.now());
   const auto reset = backend.get_gripper_status("gripper.target");
   EXPECT_EQ(reset.state, GripperCommandState::kIdle);
   EXPECT_NE(reset.generation, first.generation);
-  EXPECT_EQ(channel->publish_calls(), 0);
+  EXPECT_EQ(channel->publish_calls(), 1);
+  const auto observed_while_fenced = channel->current_state(clock.now());
+  ASSERT_TRUE(observed_while_fenced.ok());
+  EXPECT_EQ(observed_while_fenced.value().received_timestamp_ns, clock.now());
   const auto fenced_preflight =
       backend.validate_gripper_command(gripper_request(binding, 0.01, 0.0));
   ASSERT_FALSE(fenced_preflight.ok());
@@ -1204,7 +1207,7 @@ TEST(RetainedGripperCommandBackendTest,
   const auto calls_after_invalidation = channel->publish_calls();
   clock.advance(1'000'000'000);
   scheduler.advance_to(clock.now());
-  EXPECT_EQ(channel->publish_calls(), calls_after_invalidation);
+  EXPECT_EQ(channel->publish_calls(), calls_after_invalidation + 1);
   EXPECT_EQ(backend.get_gripper_status("gripper.target").state,
             GripperCommandState::kIdle);
 }

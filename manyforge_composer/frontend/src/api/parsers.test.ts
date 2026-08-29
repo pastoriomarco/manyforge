@@ -8,6 +8,8 @@ import {
   parseCycleRecoveryActionResult,
   parseCurrentScenarioResponse,
   parseDeploymentWorkspaceResponse,
+  parseExecutionControlStatus,
+  parseExecutionIdentity,
   parseExecutionOwnerStatus,
   parseHealthResponse,
   parseHeadlessRuntimeSnapshot,
@@ -548,7 +550,7 @@ describe('Program product projections', () => {
 
   function runStatus(state = 'running'): Record<string, unknown> {
     return {
-      schema_version: 'manyforge.program_run_status.v1',
+      schema_version: 'manyforge.program_run_status.v2',
       owner_id: 'program-runner.cell-a',
       owner_epoch: 'program-runner.epoch.1',
       run_revision: 3,
@@ -574,6 +576,8 @@ describe('Program product projections', () => {
         }],
       },
       tree_status: 'running',
+      node_status_revision: 2,
+      node_statuses: { root: 'running' },
       active_operation_count: 1,
       reason_code: null,
       message: '',
@@ -1920,6 +1924,64 @@ describe('addressed Robot Control parsers', () => {
     expect(status.observedMotion.currentTcpPose.position_m.z_m).toBe(0.4);
     expect(status.observedGripper?.position).toBe(0.02);
     expect(status.cellStopAction.expectedStopGeneration).toBe(4);
+
+    const identity = {
+      active_publication_generation: 1,
+      cell_id: 'cell-1',
+      graph_revision: 'sha256:graph',
+      gripper_command_schema_id: 'gripper.command_position',
+      gripper_command_schema_revision: exactRevision,
+      gripper_target_role_id: 'command_target',
+      motion_target_role_id: 'command_target',
+      owner_epoch: 'owner-1',
+      program_binding_id: 'sha256:binding',
+      program_id: 'manyforge.direct_control.motion',
+      program_revision: 'sha256:program',
+      retained_bundle_id: 'sha256:bundle',
+      scene_revision: sceneRevision,
+      schema_version: 'manyforge.execution_identity.v1',
+    };
+    expect(parseExecutionIdentity({
+      command: 'identity', identity, ok: true,
+      api_version: 'manyforge.execution_command_response.v1',
+    }).ownerEpoch).toBe('owner-1');
+    const {
+      observed_state: observedMotion,
+      ...motionTarget
+    } = structuredClone(response.status.direct_control);
+    const {
+      observed_state: observedGripper,
+      ...gripperTarget
+    } = structuredClone(response.status.direct_control_gripper);
+    const scoped = parseExecutionControlStatus(
+      {
+        api_version: 'manyforge.execution_command_response.v1',
+        command: 'targets',
+        identity,
+        ok: true,
+        targets: {
+          direct_control: motionTarget,
+          direct_control_gripper: gripperTarget,
+          schema_version: 'manyforge.execution_targets.v1',
+        },
+      },
+      {
+        api_version: 'manyforge.execution_command_response.v1',
+        command: 'control_state',
+        control_state: {
+          cell_stop_action: response.status.cell_stop_action,
+          observed_gripper: observedGripper,
+          observed_motion: observedMotion,
+          schema_version: 'manyforge.execution_control_state.v1',
+        },
+        identity,
+        ok: true,
+      },
+    );
+    expect(scoped.directControl.targetDescriptor).toEqual(
+      status.directControl.targetDescriptor,
+    );
+    expect(scoped.observedMotion.positionsRad).toEqual([0.2]);
 
     const stopped = structuredClone(response);
     Object.assign(stopped.status.cell_stop_action, {

@@ -29,6 +29,7 @@ import '@xyflow/react/dist/style.css';
 import {
   useComposerViewState,
   type LayoutDirection,
+  type NodePresentationStatus,
 } from '../store/composerStore';
 import type {
   CatalogEntry,
@@ -108,6 +109,7 @@ interface ProgramTreeCanvasProps {
   environment: NodeEnvironmentResponse | null;
   selectedId: string | null;
   invalidNodeIds: ReadonlySet<string>;
+  nodeStatuses?: Record<string, NodePresentationStatus>;
   busy: boolean;
   onSelect: (instanceId: string | null) => void;
   onMutate: (
@@ -179,6 +181,7 @@ export function ProgramTreeCanvas({
   environment,
   selectedId,
   invalidNodeIds,
+  nodeStatuses = {},
   busy,
   onSelect,
   onMutate,
@@ -391,7 +394,7 @@ export function ProgramTreeCanvas({
             childCount: row?.node.children.length ?? 0,
             hasParent: row?.parentId !== null,
             isRoot: row?.parentId === null,
-            status: view.nodeStatuses[node.id] ?? 'idle',
+            status: nodeStatuses[node.id] ?? 'idle',
             selected: selectedId === node.id,
             layoutDirection: view.layoutDirection,
             executionAvailable: nodeAvailability?.execution ?? false,
@@ -420,7 +423,7 @@ export function ProgramTreeCanvas({
       registerElement,
       selectedId,
       view.layoutDirection,
-      view.nodeStatuses,
+      nodeStatuses,
     ],
   );
   const graphEdges = useMemo<ProgramFlowEdge[]>(
@@ -432,10 +435,10 @@ export function ProgramTreeCanvas({
       data: {
         edgeStyle: view.edgeStyle,
         layoutDirection: view.layoutDirection,
-        targetStatus: view.nodeStatuses[edge.target] ?? 'idle',
+        targetStatus: nodeStatuses[edge.target] ?? 'idle',
       },
     })),
-    [edges, view.edgeStyle, view.layoutDirection, view.nodeStatuses],
+    [edges, nodeStatuses, view.edgeStyle, view.layoutDirection],
   );
   const positions = useMemo(
     () => new Map(graphNodes.map((node) => [node.id, node.position])),

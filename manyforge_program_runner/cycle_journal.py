@@ -1058,7 +1058,7 @@ class ProgramCycleJournal:
             changed = self._database.execute(
                 """
                 UPDATE program_cycle
-                SET program_run_id=?, acquisition_pending_json=?
+                SET state='starting', program_run_id=?, acquisition_pending_json=?
                 WHERE singleton=1 AND cycle_generation=?
                   AND state='idle_after_reset' AND claim_json IS NULL
                   AND acquisition_pending_json IS NULL
@@ -1082,7 +1082,7 @@ class ProgramCycleJournal:
                 UPDATE program_cycle
                 SET program_run_id=?, claim_json=?, acquisition_pending_json=NULL
                 WHERE singleton=1 AND cycle_generation=?
-                  AND state='idle_after_reset' AND claim_json IS NULL
+                  AND state='starting' AND claim_json IS NULL
                   AND acquisition_pending_json IS NOT NULL
                 """,
                 (
@@ -1101,7 +1101,7 @@ class ProgramCycleJournal:
                 """
                 UPDATE program_cycle SET reconciliation_required=1
                 WHERE singleton=1 AND cycle_generation=?
-                  AND state='idle_after_reset' AND claim_json IS NULL
+                  AND state='starting' AND claim_json IS NULL
                   AND acquisition_pending_json IS NOT NULL
                 """,
                 (expected_generation,),
@@ -1115,9 +1115,10 @@ class ProgramCycleJournal:
             changed = self._database.execute(
                 """
                 UPDATE program_cycle
-                SET program_run_id=NULL, acquisition_pending_json=NULL
+                SET state='idle_after_reset', program_run_id=NULL,
+                    acquisition_pending_json=NULL
                 WHERE singleton=1 AND cycle_generation=?
-                  AND state='idle_after_reset' AND claim_json IS NULL
+                  AND state='starting' AND claim_json IS NULL
                   AND acquisition_pending_json IS NOT NULL
                 """,
                 (expected_generation,),
@@ -1632,7 +1633,7 @@ class ProgramCycleJournal:
         evidence_digest: str,
         require_terminal_release: bool = True,
     ) -> None:
-        """Prepare an idempotent successor row for exact Kernel reconciliation."""
+        """Finalize the local successor after authoritative reconciliation."""
         with self._transaction():
             row = self._database.execute(
                 """
@@ -1667,6 +1668,59 @@ class ProgramCycleJournal:
                 WHERE singleton=1
                 """,
                 (owner_epoch, evidence_digest),
+            )
+
+    def prepare_liveness_reconciliation(
+        self,
+        *,
+        predecessor_owner_epoch: str,
+        evidence_digest: str,
+        require_terminal_release: bool = True,
+    ) -> None:
+        """Retain one replaceable intent without claiming the Kernel effect."""
+        if not _bounded_identity(predecessor_owner_epoch):
+            raise ValueError("predecessor owner epoch must be bounded identity text")
+        if (
+            not isinstance(evidence_digest, str)
+            or len(evidence_digest) != 71
+            or not evidence_digest.startswith("sha256:")
+            or any(
+                character not in "0123456789abcdef"
+                for character in evidence_digest[7:]
+            )
+        ):
+            raise ValueError("reconciliation evidence must be a SHA-256 digest")
+        with self._transaction():
+            row = self._database.execute(
+                """
+                SELECT state,acquisition_pending_json,release_intent_json
+                FROM program_cycle WHERE singleton=1
+                """
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("Program-cycle journal is corrupt")
+            if row[0] not in {"idle_after_reset", "terminal_awaiting_reset"}:
+                raise RuntimeError(
+                    "active Program cycle is not contained for reconciliation"
+                )
+            if row[1] is not None:
+                raise RuntimeError("unknown Program-cycle acquisition is unresolved")
+            if (
+                require_terminal_release
+                and row[0] == "terminal_awaiting_reset"
+                and row[2] is None
+            ):
+                raise RuntimeError(
+                    "terminal Program-cycle release is not durably retained"
+                )
+            self._database.execute(
+                """
+                UPDATE program_cycle
+                SET owner_epoch=?,reconciliation_required=1,
+                    reconciliation_evidence_digest=?
+                WHERE singleton=1
+                """,
+                (predecessor_owner_epoch, evidence_digest),
             )
 
     def complete_request(

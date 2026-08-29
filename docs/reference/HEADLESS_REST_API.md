@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py headless-rest
-  Last regenerated: 2026-08-27 20:40:11 UTC
+  Last regenerated: 2026-08-29 12:56:13 UTC
   Generator source: scripts/regen-public-contracts.py:gen_headless_rest_api
 -->
 
@@ -37,11 +37,16 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `GET` | `/api/execution/alarms/metrics` |  | Alarm Metrics |
 | `POST` | `/api/execution/alarms/{condition_id}/acknowledge` |  | Acknowledge Alarm |
 | `POST` | `/api/execution/capability-command-previews` |  | Execution Preview Capability Command |
+| `GET` | `/api/execution/control-state` |  | Execution Control State |
+| `GET` | `/api/execution/diagnostics` |  | Execution Diagnostics |
 | `POST` | `/api/execution/full-stop` |  | Execution Full Stop |
 | `GET` | `/api/execution/history` |  | History |
 | `GET` | `/api/execution/history/health` |  | Historian Health |
 | `POST` | `/api/execution/history/reconcile` |  | Historian Reconcile |
+| `GET` | `/api/execution/history/{sequence}` |  | History Detail |
+| `GET` | `/api/execution/identity` |  | Execution Identity |
 | `POST` | `/api/execution/motion-previews` |  | Execution Preview Motion |
+| `GET` | `/api/execution/observation` |  | Execution Observation |
 | `POST` | `/api/execution/operations` |  | Execution Submit |
 | `GET` | `/api/execution/operations/{operation_id}` |  | Execution Read |
 | `POST` | `/api/execution/operations/{operation_id}/acknowledge-completed` |  | Execution Acknowledge Completed |
@@ -59,9 +64,11 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `GET` | `/api/execution/stop-fault` |  | Execution Stop Fault |
 | `POST` | `/api/execution/stop-fault/recover` |  | Execution Recover Stop Fault |
 | `POST` | `/api/execution/stops` |  | Execution Stop |
+| `GET` | `/api/execution/targets` |  | Execution Targets |
 | `GET` | `/api/health` |  | Health |
 | `POST` | `/api/manager/apply` |  | Manager Apply |
 | `GET` | `/api/manager/apply/status` |  | Manager Apply Status |
+| `POST` | `/api/manager/deployment-candidates/preview` |  | Manager Deployment Candidate Preview |
 | `GET` | `/api/manager/diff` |  | Manager Diff |
 | `GET` | `/api/manager/graph` |  | Manager Graph |
 | `GET` | `/api/manager/status` |  | Manager Status |

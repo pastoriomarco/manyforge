@@ -430,7 +430,7 @@ KernelRecoveryAssessmentDTO build_recovery_assessment(
     assessment.observed_state_authority_profile = observed.authority_profile;
     assessment.observed_state_measured = observed.measured_authority;
     if (observed.freshness_budget_ns > 0 && observed.sampled_at_ns >= 0 &&
-        observed.sampled_at_ns <=
+        observed.sampled_at_ns <
             std::numeric_limits<std::int64_t>::max() -
                 observed.freshness_budget_ns) {
       assessment.observed_state_valid_until_ns =

@@ -64,8 +64,7 @@ export function RuntimeStatusOverlay({
   const trigger = useRef<HTMLButtonElement>(null);
   const readiness = status?.readiness ?? (error ? 'offline' : 'waiting');
   const summaryLabel = status?.summaryLabel ?? (error ? 'Offline' : 'Waiting');
-  const alarmCount = unacknowledgedAlarms + activeAcknowledgedAlarms
-    + clientErrorCount;
+  const alarmCount = unacknowledgedAlarms + clientErrorCount;
   const sortedComponents = useMemo(
     () => [...(status?.components ?? [])].sort((left, right) =>
       left.label.localeCompare(right.label)),
@@ -97,7 +96,10 @@ export function RuntimeStatusOverlay({
         returnFocusRef={trigger}
       >
         <div className="runtime-status-summary">
-          <span className={`component-dot status-${readiness}`} aria-hidden="true" />
+          <span
+            className={`component-dot status-${backendConnected ? 'healthy' : 'fault'}`}
+            aria-hidden="true"
+          />
           <div>
             <strong>{connectionLabel}</strong>
             <small>{connectionDetail}</small>
@@ -113,7 +115,7 @@ export function RuntimeStatusOverlay({
               <span>{unacknowledgedAlarms} acknowledgement required</span>
               <span>{activeAcknowledgedAlarms} active acknowledged</span>
               {clientErrorCount > 0 && (
-                <span>{clientErrorCount} Composer error acknowledgement required</span>
+                <span>{clientErrorCount} Composer error dismissal required</span>
               )}
               {contextFacts.map((fact) => <span key={fact}>{fact}</span>)}
             </div>

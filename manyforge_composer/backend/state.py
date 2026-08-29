@@ -56,6 +56,7 @@ from .deployment_artifacts import (
     load_deployment_artifact,
     save_deployment_artifact,
 )
+from .execution_observation_stream import ExecutionObservationSource
 
 if TYPE_CHECKING:
     from manyforge_headless_api.client import HeadlessHttpClient
@@ -141,6 +142,11 @@ class ComposerState:
             else list(allowed_deployment_write_roots)
         )
         self.headless_client = headless_client
+        self.execution_observation_source = (
+            ExecutionObservationSource(headless_client)
+            if headless_client is not None
+            else None
+        )
         authoring_state_root = authoring_state_root or os.environ.get(
             "MANYFORGE_COMPOSER_AUTHORING_STATE_ROOT"
         )

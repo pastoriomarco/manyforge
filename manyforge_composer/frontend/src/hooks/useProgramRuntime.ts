@@ -22,6 +22,7 @@ const ACTIVE_STATES = new Set([
   'intervention_required',
   'stopping',
 ]);
+export const PROGRAM_RUN_OBSERVATION_POLL_MS = 100;
 
 export function programRuntimeWakeKey(snapshot: ComposerHeadlessState | null): string {
   if (snapshot === null) return 'unavailable';
@@ -64,7 +65,7 @@ interface ProgramRuntimeState {
   selectedScenarioId: string | null;
   runnerAvailable: boolean;
   loading: boolean;
-  pending: 'run' | 'stop' | 'reset' | null;
+  pending: 'run' | 'motion-stop' | 'stop' | 'reset' | null;
   controlPending: string | null;
   error: string | null;
 }
@@ -223,6 +224,10 @@ export function useProgramRuntime(
   const wakeKey = programRuntimeWakeKey(snapshot);
   const snapshotAvailable = snapshot !== null;
   const cycleRunId = snapshot?.programCycle.programRunId ?? null;
+  const activeRunId = state.run !== null && ACTIVE_STATES.has(state.run.state)
+    ? state.run.capture.programRunId
+    : null;
+  const activeRunOwnerEpoch = activeRunId === null ? null : state.run?.ownerEpoch ?? null;
 
   const refresh = useCallback(async () => {
     if (!enabled || !snapshotAvailable) return;
@@ -407,6 +412,50 @@ export function useProgramRuntime(
   }, [enabled, refresh, snapshotAvailable, wakeKey]);
 
   useEffect(() => {
+    if (!enabled || activeRunId === null || activeRunOwnerEpoch === null) {
+      return undefined;
+    }
+    let current = true;
+    let timer: number | null = null;
+    let controller: AbortController | null = null;
+    const poll = () => {
+      if (!current) return;
+      controller = new AbortController();
+      void api.programs.read(activeRunId, controller.signal)
+        .then((run) => {
+          if (!current || run.ownerEpoch !== activeRunOwnerEpoch) return;
+          setState((previous) => {
+            const observed = previous.run;
+            if (
+              observed === null
+              || observed.capture.programRunId !== activeRunId
+              || observed.ownerEpoch !== activeRunOwnerEpoch
+              || (
+                observed.runRevision === run.runRevision
+                && observed.nodeStatusRevision === run.nodeStatusRevision
+              )
+            ) return previous;
+            return { ...previous, run };
+          });
+          if (ACTIVE_STATES.has(run.state)) {
+            timer = window.setTimeout(poll, PROGRAM_RUN_OBSERVATION_POLL_MS);
+          }
+        })
+        .catch(() => {
+          if (current && !controller?.signal.aborted) {
+            timer = window.setTimeout(poll, PROGRAM_RUN_OBSERVATION_POLL_MS);
+          }
+        });
+    };
+    timer = window.setTimeout(poll, 0);
+    return () => {
+      current = false;
+      if (timer !== null) window.clearTimeout(timer);
+      controller?.abort();
+    };
+  }, [activeRunId, activeRunOwnerEpoch, enabled]);
+
+  useEffect(() => {
     if (!enabled || !snapshotAvailable) return undefined;
     const onVisibility = () => {
       if (document.visibilityState === 'visible') void refresh();
@@ -520,6 +569,42 @@ export function useProgramRuntime(
           ...current,
           pending: null,
           error: errorMessage(reason, 'Program Stop was rejected.'),
+        }));
+      }
+    }
+  }, [state.pending, state.run, state.runnerAvailable]);
+
+  const stopMotion = useCallback(async () => {
+    if (
+      !state.run
+      || state.run.state !== 'running'
+      || !state.runnerAvailable
+      || state.pending !== null
+    ) return;
+    setState((current) => ({ ...current, pending: 'motion-stop', error: null }));
+    try {
+      const requestId = identity('program-motion-stop');
+      const status = await api.programs.stopMotion(
+        state.run.capture.programRunId,
+        {
+          request_id: requestId,
+          request_owner_epoch: callerEpoch.current,
+          source_label: 'operator_ui',
+          correlation_id: requestId,
+          program_run_id: state.run.capture.programRunId,
+          expected_owner_epoch: state.run.ownerEpoch,
+          reason: 'ordinary operator motion Stop',
+        },
+      );
+      if (mounted.current) {
+        setState((current) => ({ ...current, run: status, pending: null }));
+      }
+    } catch (reason) {
+      if (mounted.current) {
+        setState((current) => ({
+          ...current,
+          pending: null,
+          error: errorMessage(reason, 'Motion Stop was rejected.'),
         }));
       }
     }
@@ -799,6 +884,7 @@ export function useProgramRuntime(
     clearScenarioSelection,
     dismissError,
     run,
+    stopMotion,
     stop,
     reset,
     applyRecoveryAction,
@@ -825,6 +911,7 @@ export function useProgramRuntime(
     refresh,
     reset,
     run,
+    stopMotion,
     selectScenario,
     stageManualResult,
     stageObservationOverride,

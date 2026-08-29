@@ -105,6 +105,52 @@ def _page(owner_epoch: str, events: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def test_execution_client_uses_exact_focused_projection_commands(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    client = ExecutionCommandClient(tmp_path)
+    commands: list[dict[str, Any]] = []
+
+    def exchange(command: dict[str, Any]) -> dict[str, Any]:
+        commands.append(command)
+        return {
+            "api_version": "manyforge.execution_command_response.v1",
+            "command": command["command"],
+            "ok": True,
+        }
+
+    monkeypatch.setattr(client, "_exchange", exchange)
+    client.identity()
+    client.targets()
+    client.control_state()
+    client.observation()
+    client.diagnostics()
+
+    assert commands == [
+        {"api_version": "manyforge.execution_command.v1", "command": command}
+        for command in (
+            "identity",
+            "targets",
+            "control_state",
+            "observation",
+            "status",
+        )
+    ]
+
+    monkeypatch.setattr(
+        client,
+        "_exchange",
+        lambda _command: {
+            "api_version": "manyforge.execution_command_response.v1",
+            "command": "status",
+            "ok": True,
+        },
+    )
+    with pytest.raises(HeadlessApiError) as mismatched:
+        client.identity()
+    assert mismatched.value.code == "execution_command_response_invalid"
+
+
 def test_execution_client_validates_event_cursor_and_owner(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -355,6 +401,9 @@ def test_execution_client_projects_scoped_full_and_fault_recovery_commands(
         "get_stop_fault",
         "recover_stop_fault",
     ]
+    assert normal_commands[1]["request"]["request_context"][
+        "correlation_id"
+    ] is None
 
 
 def _direct_motion_request() -> OperationIntentRequest:
@@ -696,12 +745,12 @@ class _PagedExecution:
         self.fail = False
         self.event = _event(self.owner_epoch, 1)
 
-    def status(self) -> dict[str, Any]:
+    def identity(self) -> dict[str, Any]:
         return {
             "api_version": "manyforge.execution_command_response.v1",
-            "command": "status",
+            "command": "identity",
             "ok": True,
-            "status": {"owner_epoch": self.owner_epoch},
+            "identity": {"owner_epoch": self.owner_epoch},
         }
 
     def events(
@@ -728,12 +777,12 @@ class _IdleExecution:
         self.status_calls = 0
         self.events_calls = 0
 
-    def status(self) -> dict[str, Any]:
+    def identity(self) -> dict[str, Any]:
         self.status_calls += 1
         details = {"owner_epoch": self.owner_epoch} if self.include_epoch else {}
         return {
             "api_version": "manyforge.execution_command_response.v1",
-            "command": "status",
+            "command": "identity",
             "error": {
                 "code": "execution_owner_not_ready",
                 "details": details,
@@ -754,12 +803,12 @@ class _RetiringExecution(_PagedExecution):
         super().__init__()
         self.retired = False
 
-    def status(self) -> dict[str, Any]:
+    def identity(self) -> dict[str, Any]:
         if not self.retired:
-            return super().status()
+            return super().identity()
         return {
             "api_version": "manyforge.execution_command_response.v1",
-            "command": "status",
+            "command": "identity",
             "error": {
                 "code": "execution_owner_not_ready",
                 "details": {"owner_epoch": self.owner_epoch},

@@ -7,7 +7,7 @@ from manyforge_behavior.kernel_client import KernelClient
 
 def test_contract_requires_the_base_headless_transport_calls() -> None:
     class IncompleteTransport:
-        def execution_status(self):
+        def execution_identity(self):
             return {"ok": True}
 
     with pytest.raises(TypeError, match="execute"):
@@ -20,7 +20,7 @@ def test_contract_constructor_does_not_call_the_transport() -> None:
             raise AssertionError("transport was called during construction")
 
     class Transport:
-        execution_status = PoisonCallable()
+        execution_identity = PoisonCallable()
         execute = PoisonCallable()
         operation = PoisonCallable()
         pause_operation = PoisonCallable()

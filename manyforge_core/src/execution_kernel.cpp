@@ -9077,6 +9077,153 @@ std::uint64_t ExecutionKernel::bump_control_command_epoch() {
   return control_command_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
 }
 
+Result<void> ExecutionKernel::adopt_certified_motion_stop(
+    const std::uint64_t execution_id, const StopCertificateRefDTO& certificate) {
+  if (execution_id == 0U || !certificate.locally_valid()) {
+    return Result<void>::Err(
+        ErrorDTO{kErrorInvalidRequest,
+                 "Addressed Stop handoff is incomplete",
+                 {{"reason", "certified_motion_stop_handoff_invalid"}}});
+  }
+
+  std::shared_ptr<PreparedMotionSession> session;
+  {
+    std::lock_guard lock(prepared_motion_session_mutex_);
+    session = active_prepared_motion_session_;
+  }
+  if (!session) {
+    return Result<void>::Err(
+        ErrorDTO{kErrorMissingReference,
+                 "Addressed Stop names no resident prepared motion",
+                 {{"reason", "certified_motion_stop_session_missing"}}});
+  }
+
+  EventDeferralScope event_scope(*this);
+  std::unique_lock lifecycle_lock(lifecycle_mutex_);
+  {
+    std::lock_guard session_lock(session->mutex);
+    if (session->execution_id != execution_id ||
+        session->state != ResolvedPreparedMotionExecutionStateDTO::kDispatched) {
+      return Result<void>::Err(
+          ErrorDTO{kErrorMissingReference,
+                   "Addressed Stop names a stale prepared motion",
+                   {{"reason", "certified_motion_stop_execution_mismatch"},
+                    {"requested_execution_id", std::to_string(execution_id)},
+                    {"current_execution_id", std::to_string(session->execution_id)}}});
+    }
+  }
+
+  const auto before = sm_.status();
+  if (before.execution_id != execution_id) {
+    return Result<void>::Err(
+        ErrorDTO{kErrorMissingReference,
+                 "Addressed Stop does not match the current motion execution",
+                 {{"reason", "certified_motion_stop_execution_mismatch"},
+                  {"requested_execution_id", std::to_string(execution_id)},
+                  {"current_execution_id", std::to_string(before.execution_id)}}});
+  }
+  if (before.state == ExecutionState::kStopped) {
+    const auto assessment = get_recovery_assessment();
+    if (assessment.execution_id == execution_id &&
+        assessment.stop_certificate_id == certificate.stop_certificate_id.value() &&
+        assessment.recovery_class == RecoveryClass::kOrdinaryOperatorStop) {
+      return Result<void>::Ok();
+    }
+    return Result<void>::Err(
+        ErrorDTO{kErrorInvalidRequest,
+                 "A different Stop already owns the current motion terminal",
+                 {{"reason", "certified_motion_stop_certificate_conflict"}}});
+  }
+  if (before.state != ExecutionState::kExecuting && before.state != ExecutionState::kPaused &&
+      before.state != ExecutionState::kStopping) {
+    return Result<void>::Err(
+        ErrorDTO{kErrorInvalidRequest,
+                 "Addressed Stop cannot replace the current motion terminal",
+                 {{"reason", "certified_motion_stop_state_invalid"},
+                  {"state", to_string(before.state)}}});
+  }
+
+  bump_control_command_epoch();
+  invalidate_gripper_authority(GripperInvalidationReason::kStop);
+  revoke_runtime_collision_lookahead_clear_permits();
+  const auto stop_owner_generation = begin_operator_stop_owner_generation(execution_id);
+  const auto transition_from = before.state;
+  if (before.state != ExecutionState::kStopping) {
+    auto stopping = sm_.try_transition(ExecutionState::kStopping);
+    if (!stopping.ok()) {
+      return Result<void>::Err(stopping.error());
+    }
+    emit_event({KernelEventType::kStateTransition,
+                execution_id,
+                clock_.now(),
+                transition_from,
+                ExecutionState::kStopping,
+                std::nullopt,
+                {{"reason", "addressed_stop_containment_certified"}}});
+  }
+
+  KernelStopCertificateDTO local_certificate;
+  local_certificate.certificate_id = certificate.stop_certificate_id.value();
+  local_certificate.completion_result = StopCertificateOutcome::kSucceeded;
+  local_certificate.stop_owner = StopOwnerKind::kOperatorStopWorker;
+  local_certificate.stop_owner_generation = stop_owner_generation;
+  local_certificate.execution_id = execution_id;
+  local_certificate.control_command_epoch = control_command_epoch();
+  local_certificate.requested_stop_mode = "addressed_stop_plan";
+  local_certificate.executed_stop_mode = "addressed_stop_plan";
+  local_certificate.command_source = "addressed_execution_owner";
+  local_certificate.preemption_result = InterruptPreemptionResult::kNoneRequired;
+  local_certificate.backend_stop_confirmed = true;
+  local_certificate.completed_at_ns = clock_.now();
+  if (!publish_stop_certificate(std::move(local_certificate))) {
+    return Result<void>::Err(
+        ErrorDTO{kErrorInvariantViolation,
+                 "Addressed Stop evidence could not be retained locally",
+                 {{"reason", "certified_motion_stop_evidence_rejected"}}});
+  }
+  (void)publish_terminal_recovery_assessment_locked(
+      ExecutionState::kStopped, "addressed_stop_containment_certified");
+  const auto committed = commit_terminal(ExecutionState::kStopped,
+                                         "addressed_stop_containment_certified",
+                                         TerminalCommitter::Origin::kStopAuthority);
+  if (committed.committed != ExecutionState::kStopped) {
+    return Result<void>::Err(
+        ErrorDTO{kErrorInvariantViolation,
+                 "Addressed Stop lost local terminal authority",
+                 {{"reason", "certified_motion_stop_terminal_conflict"},
+                  {"state", to_string(committed.committed)}}});
+  }
+
+  stop_collision_monitoring(RuntimeCollisionMonitorRelease::kTerminalQuiesced);
+  auto snapshot = execution_backend_.get_execution_snapshot();
+  snapshot.timestamp_ns = clock_.now();
+  snapshot.execution_id = execution_id;
+  snapshot.state = ExecutionState::kStopped;
+  snapshot.error.reset();
+  publish_execution_snapshot(std::move(snapshot));
+  emit_event({KernelEventType::kStopIssued,
+              execution_id,
+              clock_.now(),
+              {},
+              {},
+              std::nullopt,
+              {{"reason", "addressed_stop_containment_certified"},
+               {"stop_id", certificate.stop_id.value()},
+               {"stop_generation", std::to_string(certificate.stop_generation.value())}}});
+  emit_event({KernelEventType::kStateTransition,
+              execution_id,
+              clock_.now(),
+              ExecutionState::kStopping,
+              ExecutionState::kStopped,
+              std::nullopt,
+              {{"reason", "addressed_stop_containment_certified"}}});
+  {
+    std::lock_guard metrics_lock(metrics_mutex_);
+    ++metrics_.stops_issued;
+  }
+  return Result<void>::Ok();
+}
+
 bool ExecutionKernel::control_command_epoch_matches(
     std::optional<std::uint64_t> expected_epoch) const {
   return !expected_epoch.has_value() ||

@@ -33,6 +33,10 @@ def test_program_runner_client_preserves_paths_queries_and_bodies() -> None:
             "program run:1",
             {"request_id": "request.2"},
         ) == {"ok": True}
+        assert client.stop_motion(
+            "program run:1",
+            {"request_id": "request.3"},
+        ) == {"ok": True}
     finally:
         raw.close()
 
@@ -41,6 +45,7 @@ def test_program_runner_client_preserves_paths_queries_and_bodies() -> None:
         "/api/program/runs",
         "/api/program/runs/program run:1",
         "/api/program/runs/program run:1/stop",
+        "/api/program/runs/program run:1/motion-stop",
     ]
     assert dict(requests[0].url.params) == {
         "active_only": "true",
@@ -48,6 +53,7 @@ def test_program_runner_client_preserves_paths_queries_and_bodies() -> None:
     }
     assert json.loads(requests[1].content) == {"request_id": "request.1"}
     assert json.loads(requests[3].content) == {"request_id": "request.2"}
+    assert json.loads(requests[4].content) == {"request_id": "request.3"}
 
 
 def test_program_runner_client_preserves_stable_remote_errors() -> None:

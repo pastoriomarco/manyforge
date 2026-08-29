@@ -12,7 +12,7 @@ import type {
   CCLCRequestContext,
   CCLCRouteTemplateSet,
 } from '../types/cclc';
-import type { ExecutionOwnerStatus } from '../types/robotControl';
+import type { ExecutionIdentity } from '../types/robotControl';
 
 const context: CCLCRequestContext = {
   request_id: 'request.1',
@@ -75,9 +75,23 @@ const templates: CCLCRouteTemplateSet = {
 
 const execution = {
   ownerEpoch: 'kernel-owner.1',
+  cellId: 'cell.1',
+  activePublicationGeneration: 1,
   graphRevision: snapshot.graphRevision,
   retainedBundleId: snapshot.retainedBundleId,
-} as ExecutionOwnerStatus;
+  sceneRevision: {
+    scene_id: 'scene.1',
+    revision_id: 1,
+    content_hash: 'sha256:scene',
+  },
+  programId: 'program.1',
+  programRevision: 'sha256:program',
+  programBindingId: 'sha256:binding',
+  motionTargetRoleId: 'arm',
+  gripperTargetRoleId: 'gripper',
+  gripperCommandSchemaId: 'gripper.command_position',
+  gripperCommandSchemaRevision: 'sha256:gripper',
+} satisfies ExecutionIdentity;
 
 afterEach(() => {
   vi.restoreAllMocks();

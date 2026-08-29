@@ -388,6 +388,10 @@ def test_client_uses_exact_program_selection_and_run_routes() -> None:
             "program run:1",
             {"request_id": "request.2"},
         )
+        client.program_run_motion_stop(
+            "program run:1",
+            {"request_id": "request.3"},
+        )
     finally:
         raw.close()
 
@@ -399,6 +403,7 @@ def test_client_uses_exact_program_selection_and_run_routes() -> None:
         "/api/program/runs",
         "/api/program/runs/program run:1",
         "/api/program/runs/program run:1/stop",
+        "/api/program/runs/program run:1/motion-stop",
     ]
     assert dict(requests[3].url.params) == {
         "active_only": "true",
@@ -406,6 +411,7 @@ def test_client_uses_exact_program_selection_and_run_routes() -> None:
     }
     assert json.loads(requests[4].read()) == {"request_id": "request.1"}
     assert json.loads(requests[6].read()) == {"request_id": "request.2"}
+    assert json.loads(requests[7].read()) == {"request_id": "request.3"}
 
 
 def test_client_rejects_rehashed_malformed_scenario_binding() -> None:

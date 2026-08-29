@@ -188,11 +188,11 @@ std::filesystem::path ExistingPrivateDirectory(std::filesystem::path path,
   struct stat after {};
   const bool valid =
       descriptor >= 0 && ::fstat(descriptor, &opened) == 0 &&
-      ::lstat(path.c_str(), &after) == 0 &&
-      opened.st_dev == before.st_dev && opened.st_ino == before.st_ino &&
-      after.st_dev == before.st_dev && after.st_ino == before.st_ino &&
-      S_ISDIR(opened.st_mode) && S_ISDIR(after.st_mode) &&
-      opened.st_uid == ::geteuid() && after.st_uid == ::geteuid() &&
+      ::lstat(path.c_str(), &after) == 0 && opened.st_dev == before.st_dev &&
+      opened.st_ino == before.st_ino && after.st_dev == before.st_dev &&
+      after.st_ino == before.st_ino && S_ISDIR(opened.st_mode) &&
+      S_ISDIR(after.st_mode) && opened.st_uid == ::geteuid() &&
+      after.st_uid == ::geteuid() &&
       (opened.st_mode & (S_IWGRP | S_IWOTH)) == 0 &&
       (after.st_mode & (S_IWGRP | S_IWOTH)) == 0 &&
       (opened.st_mode & (S_IRUSR | S_IWUSR | S_IXUSR)) ==
@@ -214,9 +214,9 @@ void RequireDisjointDirectories(const std::filesystem::path &left,
   Require(!error, std::string(labels) + " left directory is unavailable");
   const auto canonical_right = std::filesystem::canonical(right, error);
   Require(!error, std::string(labels) + " right directory is unavailable");
-  const auto mismatch = std::mismatch(
-      canonical_left.begin(), canonical_left.end(), canonical_right.begin(),
-      canonical_right.end());
+  const auto mismatch =
+      std::mismatch(canonical_left.begin(), canonical_left.end(),
+                    canonical_right.begin(), canonical_right.end());
   Require(mismatch.first != canonical_left.end() &&
               mismatch.second != canonical_right.end(),
           std::string(labels) + " must be disjoint directory trees");
@@ -232,9 +232,9 @@ void RequirePathOutsideDirectory(const std::filesystem::path &path,
   const auto canonical_path = canonical_parent / path.filename();
   const auto canonical_directory = std::filesystem::canonical(directory, error);
   Require(!error, std::string(labels) + " directory is unavailable");
-  const auto mismatch = std::mismatch(
-      canonical_directory.begin(), canonical_directory.end(),
-      canonical_path.begin(), canonical_path.end());
+  const auto mismatch =
+      std::mismatch(canonical_directory.begin(), canonical_directory.end(),
+                    canonical_path.begin(), canonical_path.end());
   Require(mismatch.first != canonical_directory.end() &&
               mismatch.second != canonical_path.end(),
           std::string(labels) +
@@ -246,8 +246,8 @@ std::filesystem::path ProspectiveDatabasePath(std::filesystem::path path,
   Require(!path.empty() && path.has_filename() && path.filename() != "." &&
               path.filename() != "..",
           std::string(label) + " path is invalid");
-  static_cast<void>(ExistingPrivateDirectory(
-      path.parent_path(), std::string(label) + " parent"));
+  static_cast<void>(ExistingPrivateDirectory(path.parent_path(),
+                                             std::string(label) + " parent"));
   const auto status = std::filesystem::symlink_status(path);
   Require(!std::filesystem::is_symlink(status),
           std::string(label) + " path cannot be a symlink");
@@ -420,8 +420,8 @@ enum class CommandKind {
   kShutdownRuntime,
 };
 
-[[nodiscard]] bool RequiresCurrentPackageGeneration(
-    const CommandKind command) noexcept {
+[[nodiscard]] bool
+RequiresCurrentPackageGeneration(const CommandKind command) noexcept {
   switch (command) {
   case CommandKind::kDeploymentCandidatePreview:
   case CommandKind::kApply:
@@ -537,8 +537,8 @@ void RequireExactObjectSize(const CanonicalValue &value, std::size_t size,
 std::uint64_t RequiredUnsigned(const CanonicalValue &value,
                                std::string_view label);
 
-CanonicalValue DeploymentCandidateReceiptPayload(
-    const DeploymentCandidateReceipt &receipt) {
+CanonicalValue
+DeploymentCandidateReceiptPayload(const DeploymentCandidateReceipt &receipt) {
   return CanonicalValue(CanonicalValue::Object{
       {"candidate_graph_revision",
        CanonicalValue(receipt.candidate_graph_revision.value())},
@@ -567,15 +567,15 @@ CanonicalValue DeploymentCandidateReceiptPayload(
   });
 }
 
-core::ContentDigest DeploymentCandidateReceiptDigest(
-    const DeploymentCandidateReceipt &receipt) {
-  return core::ContentDigest(content_identity::sha256_digest(
-      content_identity::canonical_json(
+core::ContentDigest
+DeploymentCandidateReceiptDigest(const DeploymentCandidateReceipt &receipt) {
+  return core::ContentDigest(
+      content_identity::sha256_digest(content_identity::canonical_json(
           DeploymentCandidateReceiptPayload(receipt))));
 }
 
-CanonicalValue DeploymentCandidateReceiptValue(
-    const DeploymentCandidateReceipt &receipt) {
+CanonicalValue
+DeploymentCandidateReceiptValue(const DeploymentCandidateReceipt &receipt) {
   auto payload = std::get<CanonicalValue::Object>(
       DeploymentCandidateReceiptPayload(receipt).storage());
   payload.emplace_back("receipt_digest",
@@ -583,15 +583,14 @@ CanonicalValue DeploymentCandidateReceiptValue(
   return CanonicalValue(std::move(payload));
 }
 
-DeploymentCandidateReceipt RequiredDeploymentCandidateReceipt(
-    const CanonicalValue &value) {
+DeploymentCandidateReceipt
+RequiredDeploymentCandidateReceipt(const CanonicalValue &value) {
   RequireExactObjectSize(value, 10U, "deployment candidate receipt");
   Require(RequiredString(value, "schema_version") ==
               "manyforge.manager_deployment_candidate_receipt.v1",
           "deployment candidate receipt schema is unsupported");
   const auto &expected = RequiredMember(value, "expected_current");
-  RequireExactObjectSize(expected, 2U,
-                         "deployment candidate expected current");
+  RequireExactObjectSize(expected, 2U, "deployment candidate expected current");
   DeploymentCandidateReceipt receipt{
       core::DeploymentArtifactId(
           RequiredString(value, "deployment_artifact_id")),
@@ -600,8 +599,7 @@ DeploymentCandidateReceipt RequiredDeploymentCandidateReceipt(
           RequiredString(value, "scenario_catalog_revision")),
       core::RetainedBundleId(
           RequiredString(value, "candidate_retained_bundle_id")),
-      core::GraphRevision(
-          RequiredString(value, "candidate_graph_revision")),
+      core::GraphRevision(RequiredString(value, "candidate_graph_revision")),
       core::RetainedBundleId(RequiredString(expected, "retained_bundle_id")),
       core::GraphRevision(RequiredString(expected, "graph_revision")),
       core::AdmissionGeneration(RequiredUnsigned(
@@ -610,16 +608,15 @@ DeploymentCandidateReceipt RequiredDeploymentCandidateReceipt(
       RequiredString(value, "manager_owner_epoch"),
       core::ContentDigest(RequiredString(value, "receipt_digest")),
   };
-  Require(core::IsExactLowercaseSha256Digest(
-              receipt.deployment_revision.value()) &&
-              core::IsExactLowercaseSha256Digest(
-                  receipt.scenario_catalog_revision.value()) &&
-              core::IsExactLowercaseSha256Digest(
-                  receipt.receipt_digest.value()) &&
-              content_identity::digest_equal(
-                  receipt.receipt_digest.value(),
-                  DeploymentCandidateReceiptDigest(receipt).value()),
-          "deployment candidate receipt identity is invalid");
+  Require(
+      core::IsExactLowercaseSha256Digest(receipt.deployment_revision.value()) &&
+          core::IsExactLowercaseSha256Digest(
+              receipt.scenario_catalog_revision.value()) &&
+          core::IsExactLowercaseSha256Digest(receipt.receipt_digest.value()) &&
+          content_identity::digest_equal(
+              receipt.receipt_digest.value(),
+              DeploymentCandidateReceiptDigest(receipt).value()),
+      "deployment candidate receipt identity is invalid");
   return receipt;
 }
 
@@ -682,10 +679,9 @@ RequiredProgramCycleStatus(const CanonicalValue &value) {
       std::holds_alternative<std::nullptr_t>(
           RequiredMember(value, "cycle_claim_generation").storage())
           ? std::nullopt
-          : std::optional<core::CellAdmissionClaimGeneration>(
-                RequiredUnsigned(
-                    RequiredMember(value, "cycle_claim_generation"),
-                    "Program Runner cycle claim generation"));
+          : std::optional<core::CellAdmissionClaimGeneration>(RequiredUnsigned(
+                RequiredMember(value, "cycle_claim_generation"),
+                "Program Runner cycle claim generation"));
   const auto terminal =
       OptionalString(value, "terminal_or_settlement_reference");
   core::ProgramCycleStatusDTO result{
@@ -706,8 +702,9 @@ RequiredProgramCycleStatus(const CanonicalValue &value) {
   return result;
 }
 
-CanonicalValue ExchangeProgramRunnerLivenessPacket(
-    const std::filesystem::path &path, const CanonicalValue &request) {
+CanonicalValue
+ExchangeProgramRunnerLivenessPacket(const std::filesystem::path &path,
+                                    const CanonicalValue &request) {
   const auto spelling = path.string();
   Require(!spelling.empty() && spelling.size() < sizeof(sockaddr_un::sun_path),
           "Program Runner liveness socket path is invalid");
@@ -786,8 +783,9 @@ CanonicalValue ExchangeProgramRunnerLivenessPacket(
   return decoded;
 }
 
-ProgramRunnerLivenessIdentity ProbeProgramRunnerLiveness(
-    const std::filesystem::path &path, const core::CellId &cell_id) {
+ProgramRunnerLivenessIdentity
+ProbeProgramRunnerLiveness(const std::filesystem::path &path,
+                           const core::CellId &cell_id) {
   const auto response = ExchangeProgramRunnerLivenessPacket(
       path, CanonicalValue(CanonicalValue::Object{
                 {"api_version",
@@ -806,13 +804,11 @@ ProgramRunnerLivenessIdentity ProbeProgramRunnerLiveness(
                   kProgramRunnerLivenessPolicyRevision &&
               RequiredString(response, "local_safe_state_contract_id") ==
                   kProgramRunnerLocalSafeStateContractId &&
-              RequiredString(response,
-                             "local_safe_state_contract_revision") ==
+              RequiredString(response, "local_safe_state_contract_revision") ==
                   kProgramRunnerLocalSafeStateContractRevision,
           "Program Runner liveness probe returned a foreign identity");
   return {
-      core::RuntimeUnitId(
-          RequiredString(response, "receiver_runtime_unit_id")),
+      core::RuntimeUnitId(RequiredString(response, "receiver_runtime_unit_id")),
       core::RuntimeEpoch(RequiredString(response, "receiver_runtime_epoch")),
       RequiredProgramCycleStatus(
           RequiredMember(response, "program_cycle_status"))};
@@ -825,112 +821,99 @@ ProgramRunnerLivenessRenewal RenewProgramRunnerLiveness(
     const std::uint64_t sequence,
     const core::ContentDigest &reconciliation_digest) {
   const auto response = ExchangeProgramRunnerLivenessPacket(
-      path, CanonicalValue(CanonicalValue::Object{
-                {"active_bundle_id",
-                 CanonicalValue(required_set.active_bundle_id.value())},
-                {"api_version",
-                 CanonicalValue(std::string(kProgramRunnerLivenessApiVersion))},
-                {"cell_id", CanonicalValue(required_set.cell_id.value())},
-                {"heartbeat_sequence",
-                 CanonicalValue(static_cast<double>(sequence))},
-                {"kind", CanonicalValue("heartbeat")},
-                {"manager_owner_epoch",
-                 CanonicalValue(required_set.manager_owner_epoch.value())},
-                {"manager_runtime_epoch",
-                 CanonicalValue(required_set.manager_runtime_epoch.value())},
-                {"manager_runtime_unit_id",
-                 CanonicalValue(required_set.manager_runtime_unit_id.value())},
-                {"receiver_runtime_epoch",
-                 CanonicalValue(receiver.runtime_epoch.value())},
-                {"receiver_runtime_unit_id",
-                 CanonicalValue(receiver.runtime_unit_id.value())},
-                {"reconciliation_digest",
-                 CanonicalValue(reconciliation_digest.value())},
-                {"required_runtime_set_digest",
-                 CanonicalValue(
-                     required_set.required_runtime_set_digest.value())},
-                {"runtime_policy_id",
-                 CanonicalValue(
-                     std::string(kProgramRunnerLivenessPolicyId))},
-                {"runtime_policy_revision",
-                 CanonicalValue(
-                     std::string(kProgramRunnerLivenessPolicyRevision))},
-            }));
+      path,
+      CanonicalValue(CanonicalValue::Object{
+          {"active_bundle_id",
+           CanonicalValue(required_set.active_bundle_id.value())},
+          {"api_version",
+           CanonicalValue(std::string(kProgramRunnerLivenessApiVersion))},
+          {"cell_id", CanonicalValue(required_set.cell_id.value())},
+          {"heartbeat_sequence", CanonicalValue(static_cast<double>(sequence))},
+          {"kind", CanonicalValue("heartbeat")},
+          {"manager_owner_epoch",
+           CanonicalValue(required_set.manager_owner_epoch.value())},
+          {"manager_runtime_epoch",
+           CanonicalValue(required_set.manager_runtime_epoch.value())},
+          {"manager_runtime_unit_id",
+           CanonicalValue(required_set.manager_runtime_unit_id.value())},
+          {"receiver_runtime_epoch",
+           CanonicalValue(receiver.runtime_epoch.value())},
+          {"receiver_runtime_unit_id",
+           CanonicalValue(receiver.runtime_unit_id.value())},
+          {"reconciliation_digest",
+           CanonicalValue(reconciliation_digest.value())},
+          {"required_runtime_set_digest",
+           CanonicalValue(required_set.required_runtime_set_digest.value())},
+          {"runtime_policy_id",
+           CanonicalValue(std::string(kProgramRunnerLivenessPolicyId))},
+          {"runtime_policy_revision",
+           CanonicalValue(std::string(kProgramRunnerLivenessPolicyRevision))},
+      }));
   RequireExactObjectSize(response, 23U, "Program Runner heartbeat ack");
   const auto local_age = RequiredNonnegativeUnsigned(
       RequiredMember(response, "local_heartbeat_age_ns"),
       "Program Runner local heartbeat age");
-  const auto receiver_status_sequence = RequiredUnsigned(
-      RequiredMember(response, "receiver_status_sequence"),
-      "Program Runner receiver status sequence");
+  const auto receiver_status_sequence =
+      RequiredUnsigned(RequiredMember(response, "receiver_status_sequence"),
+                       "Program Runner receiver status sequence");
   const auto fault_reference = OptionalString(response, "fault_reference");
-  Require(
-      RequiredString(response, "api_version") ==
-              kProgramRunnerLivenessApiVersion &&
-          RequiredString(response, "schema_version") ==
-              "manyforge.program_runner_liveness_status.v1" &&
-          RequiredString(response, "kind") == "heartbeat_ack" &&
-          RequiredString(response, "cell_id") ==
-              required_set.cell_id.value() &&
-          RequiredString(response, "active_bundle_id") ==
-              required_set.active_bundle_id.value() &&
-          RequiredString(response, "required_runtime_set_digest") ==
-              required_set.required_runtime_set_digest.value() &&
-          RequiredString(response, "receiver_runtime_unit_id") ==
-              receiver.runtime_unit_id.value() &&
-          RequiredString(response, "receiver_runtime_epoch") ==
-              receiver.runtime_epoch.value() &&
-          RequiredString(response, "manager_runtime_epoch") ==
-              required_set.manager_runtime_epoch.value() &&
-          RequiredString(response, "manager_runtime_unit_id") ==
-              required_set.manager_runtime_unit_id.value() &&
-          RequiredString(response, "manager_owner_epoch") ==
-              required_set.manager_owner_epoch.value() &&
-          RequiredString(response, "runtime_policy_id") ==
-              kProgramRunnerLivenessPolicyId &&
-          RequiredString(response, "runtime_policy_revision") ==
-              kProgramRunnerLivenessPolicyRevision &&
-          RequiredString(response, "local_safe_state_contract_id") ==
-              kProgramRunnerLocalSafeStateContractId &&
-          RequiredString(response, "local_safe_state_contract_revision") ==
-              kProgramRunnerLocalSafeStateContractRevision &&
-          RequiredUnsigned(
-              RequiredMember(response, "last_accepted_heartbeat_sequence"),
-              "Program Runner heartbeat sequence") == sequence &&
-          RequiredString(response, "state") == "current" &&
-          !RequiredBool(response, "command_fenced") &&
-          (!fault_reference.has_value() ||
-           (fault_reference->starts_with("sha256:") &&
-            fault_reference->size() == 71U)),
-      "Program Runner liveness acknowledgement is not exact");
+  Require(RequiredString(response, "api_version") ==
+                  kProgramRunnerLivenessApiVersion &&
+              RequiredString(response, "schema_version") ==
+                  "manyforge.program_runner_liveness_status.v1" &&
+              RequiredString(response, "kind") == "heartbeat_ack" &&
+              RequiredString(response, "cell_id") ==
+                  required_set.cell_id.value() &&
+              RequiredString(response, "active_bundle_id") ==
+                  required_set.active_bundle_id.value() &&
+              RequiredString(response, "required_runtime_set_digest") ==
+                  required_set.required_runtime_set_digest.value() &&
+              RequiredString(response, "receiver_runtime_unit_id") ==
+                  receiver.runtime_unit_id.value() &&
+              RequiredString(response, "receiver_runtime_epoch") ==
+                  receiver.runtime_epoch.value() &&
+              RequiredString(response, "manager_runtime_epoch") ==
+                  required_set.manager_runtime_epoch.value() &&
+              RequiredString(response, "manager_runtime_unit_id") ==
+                  required_set.manager_runtime_unit_id.value() &&
+              RequiredString(response, "manager_owner_epoch") ==
+                  required_set.manager_owner_epoch.value() &&
+              RequiredString(response, "runtime_policy_id") ==
+                  kProgramRunnerLivenessPolicyId &&
+              RequiredString(response, "runtime_policy_revision") ==
+                  kProgramRunnerLivenessPolicyRevision &&
+              RequiredString(response, "local_safe_state_contract_id") ==
+                  kProgramRunnerLocalSafeStateContractId &&
+              RequiredString(response, "local_safe_state_contract_revision") ==
+                  kProgramRunnerLocalSafeStateContractRevision &&
+              RequiredUnsigned(
+                  RequiredMember(response, "last_accepted_heartbeat_sequence"),
+                  "Program Runner heartbeat sequence") == sequence &&
+              RequiredString(response, "state") == "current" &&
+              !RequiredBool(response, "command_fenced") &&
+              (!fault_reference.has_value() ||
+               (fault_reference->starts_with("sha256:") &&
+                fault_reference->size() == 71U)),
+          "Program Runner liveness acknowledgement is not exact");
   core::ManagerLivenessObservationDTO observation{
-      {required_set.cell_id,
-       receiver.runtime_unit_id,
-       receiver.runtime_epoch,
-       required_set.manager_runtime_unit_id,
-       required_set.manager_runtime_epoch,
+      {required_set.cell_id, receiver.runtime_unit_id, receiver.runtime_epoch,
+       required_set.manager_runtime_unit_id, required_set.manager_runtime_epoch,
        required_set.manager_owner_epoch,
        core::RuntimePolicyId(std::string(kProgramRunnerLivenessPolicyId)),
        core::RuntimePolicyRevision(
            std::string(kProgramRunnerLivenessPolicyRevision)),
-       sequence,
-       receiver_status_sequence,
-       static_cast<std::int64_t>(local_age),
-       core::ManagerLivenessStateDTO::kCurrent,
-       false,
-       fault_reference.has_value()
-           ? std::optional<core::ContentDigest>(
-                 core::ContentDigest(*fault_reference))
-           : std::nullopt},
+       sequence, receiver_status_sequence, static_cast<std::int64_t>(local_age),
+       core::ManagerLivenessStateDTO::kCurrent, false,
+       fault_reference.has_value() ? std::optional<core::ContentDigest>(
+                                         core::ContentDigest(*fault_reference))
+                                   : std::nullopt},
       required_set.active_bundle_id,
       required_set.required_runtime_set_digest,
-      core::ContentDigest(
-          RequiredString(response, "receiver_status_digest"))};
+      core::ContentDigest(RequiredString(response, "receiver_status_digest"))};
   Require(core::ValidateManagerLivenessObservation(observation).ok(),
           "Program Runner liveness observation is malformed");
-  return {std::move(observation),
-          RequiredProgramCycleStatus(
-              RequiredMember(response, "program_cycle_status"))};
+  return {std::move(observation), RequiredProgramCycleStatus(RequiredMember(
+                                      response, "program_cycle_status"))};
 }
 
 std::uint64_t RequiredUnsigned(const CanonicalValue &value,
@@ -964,10 +947,8 @@ RequiredParentAuthoringClaim(const CanonicalValue &value) {
   RequireExactObjectSize(value, 4U, "parent authoring claim");
   const auto &intent_value = RequiredMember(value, "intent");
   RequireExactObjectSize(intent_value, 10U, "parent authoring claim intent");
-  Require(RequiredString(intent_value, "claim_kind") ==
-                  "authoring_mutation" &&
-              RequiredString(intent_value, "owner_role") ==
-                  "authoring_owner",
+  Require(RequiredString(intent_value, "claim_kind") == "authoring_mutation" &&
+              RequiredString(intent_value, "owner_role") == "authoring_owner",
           "parent claim is not an authoring-owner mutation claim");
   const auto &program_cycle =
       RequiredMember(intent_value, "program_cycle_evidence");
@@ -1003,9 +984,9 @@ RequiredParentAuthoringClaim(const CanonicalValue &value) {
           std::nullopt,
           std::nullopt,
       },
-      core::CellAdmissionClaimGeneration(RequiredUnsigned(
-          RequiredMember(value, "claim_generation"),
-          "parent claim_generation")),
+      core::CellAdmissionClaimGeneration(
+          RequiredUnsigned(RequiredMember(value, "claim_generation"),
+                           "parent claim_generation")),
       core::AdmissionGeneration(RequiredUnsigned(
           RequiredMember(value, "acquired_admission_generation"),
           "parent acquired_admission_generation")),
@@ -1037,8 +1018,7 @@ SceneRuntimeIdentity RequiredSceneRuntimeIdentity(const CanonicalValue &value) {
 core::ProjectionRevisionDTO
 RequiredProjectionRevision(const CanonicalValue &value) {
   RequireExactObjectSize(value, 3U, "projection revision");
-  const auto retained_bundle_id =
-      RequiredString(value, "retained_bundle_id");
+  const auto retained_bundle_id = RequiredString(value, "retained_bundle_id");
   const auto graph_revision = RequiredString(value, "graph_revision");
   Require(core::IsExactLowercaseSha256Digest(retained_bundle_id) &&
               core::IsExactLowercaseSha256Digest(graph_revision),
@@ -1139,15 +1119,13 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
           "command api_version is unsupported");
   const auto command = RequiredString(root, "command");
   if (command == "deployment_candidate_preview") {
-    RequireExactObjectSize(root, 7U,
-                           "deployment candidate preview command");
+    RequireExactObjectSize(root, 7U, "deployment candidate preview command");
     const auto deployment_revision =
         RequiredString(root, "deployment_revision");
     Require(core::IsExactLowercaseSha256Digest(deployment_revision),
             "candidate deployment_revision must be canonical SHA-256");
     const auto &expected = RequiredMember(root, "expected_current");
-    RequireExactObjectSize(expected, 2U,
-                           "candidate preview expected_current");
+    RequireExactObjectSize(expected, 2U, "candidate preview expected_current");
     ManagerCommand result{
         .kind = CommandKind::kDeploymentCandidatePreview,
         .request_owner_epoch = RequiredString(root, "request_owner_epoch"),
@@ -1156,10 +1134,10 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
         .deployment_revision = core::DeploymentRevision(deployment_revision),
         .expected_current_retained_bundle_id = core::RetainedBundleId(
             RequiredString(expected, "retained_bundle_id")),
-        .expected_current_graph_revision = core::GraphRevision(
-            RequiredString(expected, "graph_revision")),
-        .expected_admission_generation = core::AdmissionGeneration(
-            RequiredUnsigned(
+        .expected_current_graph_revision =
+            core::GraphRevision(RequiredString(expected, "graph_revision")),
+        .expected_admission_generation =
+            core::AdmissionGeneration(RequiredUnsigned(
                 RequiredMember(root, "expected_admission_generation"),
                 "candidate expected_admission_generation")),
     };
@@ -1226,8 +1204,8 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
     ManagerCommand result{.kind = CommandKind::kScenePoseQuery};
     result.expected_scene_projection = RequiredProjectionRevision(
         RequiredMember(root, "expected_projection_revision"));
-    result.scene_resource_ids = RequiredSceneResourceIds(
-        RequiredMember(root, "scene_resource_ids"));
+    result.scene_resource_ids =
+        RequiredSceneResourceIds(RequiredMember(root, "scene_resource_ids"));
     return result;
   }
   if (command == "scene_runtime_owner_read") {
@@ -1326,16 +1304,14 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
       core::GraphRevision(expected_graph_revision);
   if (admission_kind == "direct") {
     RequireExactObjectSize(admission_context, 2U, "direct admission context");
-    result.expected_admission_generation = core::AdmissionGeneration(
-        RequiredUnsigned(
-            RequiredMember(admission_context,
-                           "expected_admission_generation"),
+    result.expected_admission_generation =
+        core::AdmissionGeneration(RequiredUnsigned(
+            RequiredMember(admission_context, "expected_admission_generation"),
             "expected_admission_generation"));
   } else {
     Require(admission_kind == "parent_authoring_claim",
             "Apply admission context kind is unsupported");
-    RequireExactObjectSize(admission_context, 2U,
-                           "parent admission context");
+    RequireExactObjectSize(admission_context, 2U, "parent admission context");
     result.parent_authoring_claim = RequiredParentAuthoringClaim(
         RequiredMember(admission_context, "claim"));
   }
@@ -1368,19 +1344,17 @@ CanonicalValue ProjectionRevision(const core::ProjectionRevisionDTO &value) {
 
 CanonicalValue Pose(const core::Pose3DTO &value) {
   return CanonicalValue(CanonicalValue::Object{
-      {"orientation_xyzw",
-       CanonicalValue(CanonicalValue::Array{
-           CanonicalValue(value.orientation.x),
-           CanonicalValue(value.orientation.y),
-           CanonicalValue(value.orientation.z),
-           CanonicalValue(value.orientation.w),
-       })},
-      {"position_m",
-       CanonicalValue(CanonicalValue::Object{
-           {"x", CanonicalValue(value.position_m.x_m)},
-           {"y", CanonicalValue(value.position_m.y_m)},
-           {"z", CanonicalValue(value.position_m.z_m)},
-       })},
+      {"orientation_xyzw", CanonicalValue(CanonicalValue::Array{
+                               CanonicalValue(value.orientation.x),
+                               CanonicalValue(value.orientation.y),
+                               CanonicalValue(value.orientation.z),
+                               CanonicalValue(value.orientation.w),
+                           })},
+      {"position_m", CanonicalValue(CanonicalValue::Object{
+                         {"x", CanonicalValue(value.position_m.x_m)},
+                         {"y", CanonicalValue(value.position_m.y_m)},
+                         {"z", CanonicalValue(value.position_m.z_m)},
+                     })},
   });
 }
 
@@ -1431,9 +1405,8 @@ SceneRuntimeOwnerReadResponse(const std::string_view cell_id,
       {"api_version",
        CanonicalValue(std::string(kManagerCommandResponseApiVersion))},
       {"cell_id", CanonicalValue(std::string(cell_id))},
-      {"initialization_generation",
-       Unsigned(snapshot.initialization_generation,
-                "initialization generation")},
+      {"initialization_generation", Unsigned(snapshot.initialization_generation,
+                                             "initialization generation")},
       {"initialization_state",
        CanonicalValue(std::string(ToString(snapshot.state)))},
       {"ok", CanonicalValue(true)},
@@ -1571,10 +1544,10 @@ CanonicalValue CanonicalCodecValue(const std::string_view bytes,
   return parsed.root();
 }
 
-CanonicalValue SceneOwnerReadResponse(
-    const core::RequestOwnerEpoch &request_owner_epoch,
-    const core::ProjectionRevisionDTO &projection_revision,
-    const core::LogicalSceneSnapshotDTO &snapshot) {
+CanonicalValue
+SceneOwnerReadResponse(const core::RequestOwnerEpoch &request_owner_epoch,
+                       const core::ProjectionRevisionDTO &projection_revision,
+                       const core::LogicalSceneSnapshotDTO &snapshot) {
   Require(!request_owner_epoch.empty() && projection_revision.valid() &&
               snapshot.locally_valid() &&
               snapshot.revision == projection_revision.scene_revision,
@@ -1587,8 +1560,7 @@ CanonicalValue SceneOwnerReadResponse(
                            "logical-scene snapshot")},
       {"ok", CanonicalValue(true)},
       {"projection_revision", ProjectionRevision(projection_revision)},
-      {"request_owner_epoch",
-       CanonicalValue(request_owner_epoch.value())},
+      {"request_owner_epoch", CanonicalValue(request_owner_epoch.value())},
   });
 }
 
@@ -1688,14 +1660,15 @@ CanonicalValue ErrorResponse(const std::string_view code,
   });
 }
 
-CanonicalValue DetailedErrorResponse(
-    const std::string_view code, const std::string_view message,
-    const std::map<std::string, std::string> &details) {
+CanonicalValue
+DetailedErrorResponse(const std::string_view code,
+                      const std::string_view message,
+                      const std::map<std::string, std::string> &details) {
   return CanonicalValue(CanonicalValue::Object{
       {"api_version",
        CanonicalValue(std::string(kManagerCommandResponseApiVersion))},
       {"error", ErrorValue(core::ErrorDTO{std::string(code),
-                                           std::string(message), details})},
+                                          std::string(message), details})},
       {"ok", CanonicalValue(false)},
   });
 }
@@ -1781,36 +1754,33 @@ CanonicalValue DeploymentGraphDiff(const core::CellGraphDTO &current,
                                    const core::CellGraphDTO &candidate) {
   return CanonicalValue(CanonicalValue::Object{
       {"component_attachments",
-       DeploymentRecordDiff(
-           current.component_attachments, candidate.component_attachments,
-           [](const core::ComponentAttachmentEdgeDTO &record) {
-             return record.component_attachment_id.value();
-           })},
+       DeploymentRecordDiff(current.component_attachments,
+                            candidate.component_attachments,
+                            [](const core::ComponentAttachmentEdgeDTO &record) {
+                              return record.component_attachment_id.value();
+                            })},
       {"controllable_components",
-       DeploymentRecordDiff(
-           current.controllable_components,
-           candidate.controllable_components,
-           [](const core::ControllableComponentDTO &record) {
-             return record.controllable_component_id.value();
-           })},
+       DeploymentRecordDiff(current.controllable_components,
+                            candidate.controllable_components,
+                            [](const core::ControllableComponentDTO &record) {
+                              return record.controllable_component_id.value();
+                            })},
       {"control_bindings",
-       DeploymentRecordDiff(
-           current.control_bindings, candidate.control_bindings,
-           [](const core::ControlBindingDTO &record) {
-             return record.control_binding_id.value();
-           })},
+       DeploymentRecordDiff(current.control_bindings,
+                            candidate.control_bindings,
+                            [](const core::ControlBindingDTO &record) {
+                              return record.control_binding_id.value();
+                            })},
       {"control_domains",
-       DeploymentRecordDiff(
-           current.control_domains, candidate.control_domains,
-           [](const core::ControlDomainDTO &record) {
-             return record.control_domain_id.value();
-           })},
+       DeploymentRecordDiff(current.control_domains, candidate.control_domains,
+                            [](const core::ControlDomainDTO &record) {
+                              return record.control_domain_id.value();
+                            })},
       {"model_instances",
-       DeploymentRecordDiff(
-           current.model_instances, candidate.model_instances,
-           [](const core::ModelInstanceDTO &record) {
-             return record.model_instance_id.value();
-           })},
+       DeploymentRecordDiff(current.model_instances, candidate.model_instances,
+                            [](const core::ModelInstanceDTO &record) {
+                              return record.model_instance_id.value();
+                            })},
       {"runtime_units",
        DeploymentRecordDiff(current.runtime_units, candidate.runtime_units,
                             [](const core::RuntimeUnitDTO &record) {
@@ -1819,10 +1789,10 @@ CanonicalValue DeploymentGraphDiff(const core::CellGraphDTO &current,
   });
 }
 
-CanonicalValue DeploymentCandidatePreviewResponse(
-    const DeploymentCandidateReceipt &receipt,
-    const core::CellGraphDTO &current_graph,
-    const core::CellGraphDTO &candidate_graph) {
+CanonicalValue
+DeploymentCandidatePreviewResponse(const DeploymentCandidateReceipt &receipt,
+                                   const core::CellGraphDTO &current_graph,
+                                   const core::CellGraphDTO &candidate_graph) {
   return CanonicalValue(CanonicalValue::Object{
       {"api_version",
        CanonicalValue(std::string(kManagerCommandResponseApiVersion))},
@@ -1866,8 +1836,7 @@ ApplyResponse(const ManagerCommand &command,
 }
 
 CanonicalValue ApplyStatusResponse(
-    const core::ApplyId &apply_id,
-    const core::ApplyGeneration apply_generation,
+    const core::ApplyId &apply_id, const core::ApplyGeneration apply_generation,
     const std::optional<component_manager::PersistedManagerApplyTerminalOutcome>
         &terminal) {
   return CanonicalValue(CanonicalValue::Object{
@@ -1991,9 +1960,8 @@ public:
   explicit ManagerVerifiedPackageView(std::filesystem::path package_root)
       : bundles_(package_root), artifacts_(std::move(package_root)) {}
 
-  [[nodiscard]] std::shared_ptr<const deployment::RetainedBundle>
-  get_verified(
-      const core::RetainedBundleId& retained_bundle_id) const override {
+  [[nodiscard]] std::shared_ptr<const deployment::RetainedBundle> get_verified(
+      const core::RetainedBundleId &retained_bundle_id) const override {
     std::lock_guard lock(mutex_);
     const auto cached = bundles_by_id_.find(retained_bundle_id.value());
     if (cached != bundles_by_id_.end()) {
@@ -2003,17 +1971,18 @@ public:
     if (verified == nullptr) {
       return nullptr;
     }
-    return bundles_by_id_.emplace(retained_bundle_id.value(), std::move(verified))
+    return bundles_by_id_
+        .emplace(retained_bundle_id.value(), std::move(verified))
         .first->second;
   }
 
   [[nodiscard]] std::optional<deployment::VerifiedRetainedProductArtifact>
-  get_verified(const deployment::RetainedProductArtifactQuery& query) const
-      override {
+  get_verified(
+      const deployment::RetainedProductArtifactQuery &query) const override {
     std::lock_guard lock(mutex_);
-    const auto cached = std::find_if(
-        product_artifacts_.begin(), product_artifacts_.end(),
-        [&](const auto& entry) { return entry.first == query; });
+    const auto cached =
+        std::find_if(product_artifacts_.begin(), product_artifacts_.end(),
+                     [&](const auto &entry) { return entry.first == query; });
     if (cached != product_artifacts_.end()) {
       return cached->second;
     }
@@ -2026,30 +1995,30 @@ public:
   }
 
   [[nodiscard]] std::optional<deployment::VerifiedRetainedRuntimeUnitProduct>
-  runtime_unit_product(const deployment::RetainedBundle& bundle,
-                       const core::RuntimeUnitId& runtime_unit_id) const {
+  runtime_unit_product(const deployment::RetainedBundle &bundle,
+                       const core::RuntimeUnitId &runtime_unit_id) const {
     {
       std::lock_guard lock(mutex_);
-      const auto cached = std::find_if(
-          runtime_products_.begin(), runtime_products_.end(),
-          [&](const auto& product) {
-            return product.retained_bundle_id() ==
-                       bundle.retained_bundle_id() &&
-                   product.runtime_unit_id() == runtime_unit_id;
-          });
+      const auto cached =
+          std::find_if(runtime_products_.begin(), runtime_products_.end(),
+                       [&](const auto &product) {
+                         return product.retained_bundle_id() ==
+                                    bundle.retained_bundle_id() &&
+                                product.runtime_unit_id() == runtime_unit_id;
+                       });
       if (cached != runtime_products_.end()) {
         return *cached;
       }
     }
-    auto verified = deployment::verify_runtime_unit_product(
-        bundle, runtime_unit_id, *this);
+    auto verified =
+        deployment::verify_runtime_unit_product(bundle, runtime_unit_id, *this);
     if (!verified.has_value()) {
       return std::nullopt;
     }
     std::lock_guard lock(mutex_);
     const auto cached = std::find_if(
         runtime_products_.begin(), runtime_products_.end(),
-        [&](const auto& product) {
+        [&](const auto &product) {
           return product.retained_bundle_id() == bundle.retained_bundle_id() &&
                  product.runtime_unit_id() == runtime_unit_id;
         });
@@ -2096,10 +2065,9 @@ public:
   explicit ManagerDaemon(DaemonConfig config)
       : config_(ValidateConfig(std::move(config))),
         started_at_(std::chrono::steady_clock::now()),
-        package_generation_(
-            config_.install_root,
-            deployment::runtime_contract_declaration_registry()
-                .package_manifest_set()),
+        package_generation_(config_.install_root,
+                            deployment::runtime_contract_declaration_registry()
+                                .package_manifest_set()),
         daemon_lock_(config_.manager_run_root),
         admission_(deployment::FilesystemCanonicalEmptyRetainedBundleSource(
                        package_generation_.descriptor_bound_root(),
@@ -2123,15 +2091,16 @@ public:
             config_.authoring_transaction_journal),
         stores_(config_.manager_state_root, admission_),
         scene_owner_(config_.logical_scene_database, admission_,
-                     stores_.active_bundle_publication_store(), verified_package_,
-                     native_runtime_adapter_, native_runtime_adapter_),
+                     stores_.active_bundle_publication_store(),
+                     verified_package_, native_runtime_adapter_,
+                     native_runtime_adapter_),
         scene_runtime_pose_projector_(scene_owner_, admission_.cell_id()),
         plan_source_(stores_.active_bundle_publication_store(),
                      stores_.apply_journal(),
                      BuildBootstrapRuntimePlan(admission_, verified_package_)),
-        reference_runtime_adapter_(config_.execution_state_root,
-                                   config_.execution_run_root, verified_package_,
-                                   verified_package_, "linux", "posix.1-2017"),
+        reference_runtime_adapter_(
+            config_.execution_state_root, config_.execution_run_root,
+            verified_package_, verified_package_, "linux", "posix.1-2017"),
         runtime_adapter_router_(
             {{std::string(
                   component_manager::kRetainedPosixProcessAdapterContractId),
@@ -2139,29 +2108,27 @@ public:
              {std::string(deployment::native_execution_runtime_contract::
                               kProcessAdapterContractId),
               &native_runtime_adapter_, &native_runtime_adapter_}}),
-        active_runtime_(plan_source_, runtime_adapter_router_,
-                        runtime_adapter_router_,
-                        [this] { return ElapsedNs(); },
-                        [this] { RequireCurrentPackageGeneration(); }),
+        active_runtime_(
+            plan_source_, runtime_adapter_router_, runtime_adapter_router_,
+            [this] { return ElapsedNs(); },
+            [this] { RequireCurrentPackageGeneration(); }),
         manager_runtime_epoch_(RandomToken("manager-runtime-")),
         named_apply_(
             stores_.apply_journal(), plan_source_, verified_package_,
             verified_package_, stores_.active_bundle_publication_store(),
             scene_owner_, &scene_owner_, native_runtime_adapter_,
-            native_runtime_adapter_,
-            native_runtime_adapter_, runtime_adapter_router_,
-            runtime_adapter_router_, manager_runtime_epoch_, "linux",
+            native_runtime_adapter_, native_runtime_adapter_,
+            runtime_adapter_router_, runtime_adapter_router_,
+            manager_runtime_epoch_, "linux",
             {std::string(deployment::native_execution_runtime_contract::
                              kLaunchEnvironmentContract),
-             std::string(
-                 deployment::ros2_control_execution_runtime_contract::
-                     kLaunchEnvironmentContract)},
+             std::string(deployment::ros2_control_execution_runtime_contract::
+                             kLaunchEnvironmentContract)},
             [this] { return ElapsedNs(); },
             [] { return core::ApplyId(RandomToken("apply-")); },
             [this] { RequireCurrentPackageGeneration(); }),
-        scene_runtime_owner_(
-            [] { return HostMonotonicNs(); },
-            [] { return RandomToken("scene-init-"); }),
+        scene_runtime_owner_([] { return HostMonotonicNs(); },
+                             [] { return RandomToken("scene-init-"); }),
         manager_channel_(config_.projection_root,
                          std::string(kManagerSourceFileName)),
         scene_channel_(config_.projection_root,
@@ -2186,14 +2153,26 @@ public:
   int Run() {
     CommandSocket command_socket(config_.manager_run_root);
     StartNativeManagerLivenessLane();
+    auto next_reconciliation =
+        std::chrono::steady_clock::now() + config_.reconciliation_period;
     try {
       while (g_stop_requested == 0) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= next_reconciliation) {
+          TryPeriodicReconcile();
+          next_reconciliation =
+              std::chrono::steady_clock::now() + config_.reconciliation_period;
+          continue;
+        }
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                next_reconciliation - now);
         pollfd descriptor{command_socket.get(), POLLIN, 0};
         int ready = -1;
         do {
           ready = ::poll(
               &descriptor, 1,
-              static_cast<int>(config_.reconciliation_period.count()));
+              static_cast<int>(std::max<std::int64_t>(1, remaining.count())));
         } while (ready < 0 && errno == EINTR && g_stop_requested == 0);
         if (g_stop_requested != 0) {
           break;
@@ -2203,6 +2182,8 @@ public:
         }
         if (ready == 0) {
           TryPeriodicReconcile();
+          next_reconciliation =
+              std::chrono::steady_clock::now() + config_.reconciliation_period;
           continue;
         }
         if ((descriptor.revents & POLLIN) != 0 &&
@@ -2286,9 +2267,9 @@ private:
         DatabasePath(std::move(config.logical_scene_database));
     config.program_cycle_journal = ProspectiveDatabasePath(
         std::move(config.program_cycle_journal), "Program-cycle journal");
-    config.authoring_transaction_journal = ProspectiveDatabasePath(
-        std::move(config.authoring_transaction_journal),
-        "Composer authoring transaction journal");
+    config.authoring_transaction_journal =
+        ProspectiveDatabasePath(std::move(config.authoring_transaction_journal),
+                                "Composer authoring transaction journal");
     const std::array<const std::filesystem::path *, 4U> durable_paths{
         &config.logical_scene_database, &config.program_cycle_journal,
         &config.authoring_transaction_journal, &config.projection_root};
@@ -2304,9 +2285,9 @@ private:
       Require(config.program_runner_liveness_socket.is_absolute() &&
                   config.program_runner_liveness_socket.has_filename(),
               "Program Runner liveness socket path must be absolute");
-      static_cast<void>(ExistingDirectory(
-          config.program_runner_liveness_socket.parent_path(),
-          "Program Runner liveness socket parent"));
+      static_cast<void>(
+          ExistingDirectory(config.program_runner_liveness_socket.parent_path(),
+                            "Program Runner liveness socket parent"));
       std::error_code error;
       Require(std::filesystem::equivalent(
                   config.program_runner_liveness_socket.parent_path(),
@@ -2407,29 +2388,27 @@ private:
         named->apply_id, named->apply_generation);
     const auto activation = stores_.apply_journal().ReadActivationSelection(
         named->apply_id, named->apply_generation);
-    Require(intent.has_value() && stage.has_value() && activation.has_value() &&
-                intent->intent.candidate_retained_bundle_id ==
-                    active_publication.request.candidate_retained_bundle_id &&
-                intent->intent.candidate_graph_revision ==
-                    active_publication.request.candidate_graph_revision &&
-                activation->activation_selection
-                        .projection_stage_generation ==
-                    named->projection_stage_generation &&
-                activation->activation_selection
-                        .candidate_projection_revision ==
-                    active_publication.request
-                        .candidate_projection_revision &&
-                stage->scene_stage_intent.candidate_retained_bundle_id ==
-                    active_publication.request.candidate_retained_bundle_id &&
-                stage->scene_stage_intent.candidate_graph_revision ==
-                    active_publication.request.candidate_graph_revision &&
-                active_publication.request
-                        .expected_previous_publication_generation ==
-                    std::optional<core::ActiveBundlePublicationGeneration>{
-                        stage->scene_stage_intent
-                            .predecessor_publication_generation},
-            "unfinalized scene-runtime publication lacks its exact durable "
-            "predecessor evidence");
+    Require(
+        intent.has_value() && stage.has_value() && activation.has_value() &&
+            intent->intent.candidate_retained_bundle_id ==
+                active_publication.request.candidate_retained_bundle_id &&
+            intent->intent.candidate_graph_revision ==
+                active_publication.request.candidate_graph_revision &&
+            activation->activation_selection.projection_stage_generation ==
+                named->projection_stage_generation &&
+            activation->activation_selection.candidate_projection_revision ==
+                active_publication.request.candidate_projection_revision &&
+            stage->scene_stage_intent.candidate_retained_bundle_id ==
+                active_publication.request.candidate_retained_bundle_id &&
+            stage->scene_stage_intent.candidate_graph_revision ==
+                active_publication.request.candidate_graph_revision &&
+            active_publication.request
+                    .expected_previous_publication_generation ==
+                std::optional<core::ActiveBundlePublicationGeneration>{
+                    stage->scene_stage_intent
+                        .predecessor_publication_generation},
+        "unfinalized scene-runtime publication lacks its exact durable "
+        "predecessor evidence");
     return {intent->intent.expected_active_projection_revision,
             stage->scene_stage_intent.predecessor_publication_generation};
   }
@@ -2528,10 +2507,9 @@ private:
 
     const auto scene_generation = PublishLogicalScene(observed_at);
     const auto scene_runtime_generation = PublishSceneRuntime(observed_at);
-    const auto apply_inventory =
-        stores_.apply_journal().ReadStatusInventory();
+    const auto apply_inventory = stores_.apply_journal().ReadStatusInventory();
     const auto unsettled = static_cast<std::size_t>(std::count_if(
-        apply_inventory.begin(), apply_inventory.end(), [](const auto& status) {
+        apply_inventory.begin(), apply_inventory.end(), [](const auto &status) {
           return !status.terminal_outcome.has_value();
         }));
     Require(unsettled <= std::numeric_limits<std::uint32_t>::max(),
@@ -2543,17 +2521,16 @@ private:
   }
 
   core::CellAdmissionReadinessSnapshotDTO BuildCellAdmissionReadiness(
-      const component_manager::ManagerActiveRuntimeConvergenceResult& runtime,
-      const core::ProgramCycleStatusDTO& program_cycle_status,
-      const std::uint32_t unsettled_effect_count,
-      const bool forced_closed) {
+      const component_manager::ManagerActiveRuntimeConvergenceResult &runtime,
+      const core::ProgramCycleStatusDTO &program_cycle_status,
+      const std::uint32_t unsettled_effect_count, const bool forced_closed) {
     const auto component_total = runtime.plan.runtime_units.size();
     Require(component_total <= std::numeric_limits<std::uint32_t>::max(),
             "required runtime-unit count exceeds readiness capacity");
     std::uint32_t ready = 0U;
     std::uint32_t faults = 0U;
-    for (const auto& row : runtime.plan.runtime_units) {
-      const auto* observation =
+    for (const auto &row : runtime.plan.runtime_units) {
+      const auto *observation =
           runtime.observations.observation(row.runtime_unit_id.value());
       Require(observation != nullptr,
               "required runtime-unit observation is absent");
@@ -2583,7 +2560,7 @@ private:
   }
 
   void SubmitCellAdmissionReadiness(
-      const core::CellAdmissionReadinessSnapshotDTO& snapshot) {
+      const core::CellAdmissionReadinessSnapshotDTO &snapshot) {
     const auto updated =
         native_runtime_adapter_.UpdateCellAdmissionReadiness(snapshot);
     if (!updated.ok()) {
@@ -2595,14 +2572,14 @@ private:
   }
 
   void SubmitFailClosedReadiness(
-      const std::optional<core::ProgramCycleStatusDTO>& status =
+      const std::optional<core::ProgramCycleStatusDTO> &status =
           std::nullopt) noexcept {
-    const auto current = status.has_value()
-                             ? status
-                             : (last_submitted_readiness_.has_value()
-                                    ? last_submitted_readiness_
-                                          ->program_cycle_status
-                                    : std::nullopt);
+    const auto current =
+        status.has_value()
+            ? status
+            : (last_submitted_readiness_.has_value()
+                   ? last_submitted_readiness_->program_cycle_status
+                   : std::nullopt);
     if (!current.has_value()) {
       return;
     }
@@ -2620,8 +2597,8 @@ private:
   }
 
   [[nodiscard]] static bool SameNativeManagerLivenessIdentity(
-      const NativeManagerLivenessSnapshot& left,
-      const NativeManagerLivenessSnapshot& right) {
+      const NativeManagerLivenessSnapshot &left,
+      const NativeManagerLivenessSnapshot &right) {
     if (left.active_bundle == nullptr || right.active_bundle == nullptr ||
         left.runtime.plan.active_publication !=
             right.runtime.plan.active_publication ||
@@ -2632,18 +2609,18 @@ private:
             right.runtime.plan.runtime_units.size()) {
       return false;
     }
-    for (const auto& row : left.runtime.plan.runtime_units) {
+    for (const auto &row : left.runtime.plan.runtime_units) {
       const auto right_row = std::find_if(
           right.runtime.plan.runtime_units.begin(),
-          right.runtime.plan.runtime_units.end(), [&](const auto& candidate) {
+          right.runtime.plan.runtime_units.end(), [&](const auto &candidate) {
             return candidate.runtime_unit_id == row.runtime_unit_id &&
                    candidate.process_adapter_contract_id ==
                        row.process_adapter_contract_id &&
                    candidate.product_identity == row.product_identity;
           });
-      const auto* left_observation =
+      const auto *left_observation =
           left.runtime.observations.observation(row.runtime_unit_id.value());
-      const auto* right_observation =
+      const auto *right_observation =
           right.runtime.observations.observation(row.runtime_unit_id.value());
       if (right_row == right.runtime.plan.runtime_units.end() ||
           left_observation == nullptr || right_observation == nullptr ||
@@ -2655,8 +2632,8 @@ private:
     return true;
   }
 
-  void PublishNativeManagerLivenessSnapshot(
-      NativeManagerLivenessSnapshot snapshot) {
+  void
+  PublishNativeManagerLivenessSnapshot(NativeManagerLivenessSnapshot snapshot) {
     if (config_.program_runner_liveness_socket.empty()) {
       return;
     }
@@ -2664,8 +2641,8 @@ private:
     {
       std::lock_guard lock(manager_liveness_lane_mutex_);
       wake = !manager_liveness_snapshot_.has_value() ||
-             !SameNativeManagerLivenessIdentity(
-                 *manager_liveness_snapshot_, snapshot);
+             !SameNativeManagerLivenessIdentity(*manager_liveness_snapshot_,
+                                                snapshot);
       manager_liveness_snapshot_ = std::move(snapshot);
       manager_liveness_force_closed_ = false;
       if (manager_liveness_superseded_publication_.has_value() &&
@@ -2696,11 +2673,10 @@ private:
   }
 
   void TryRenewNativeManagerLiveness(
-      const NativeManagerLivenessSnapshot& snapshot,
-      const bool forced_closed,
+      const NativeManagerLivenessSnapshot &snapshot, const bool forced_closed,
       const std::uint64_t readiness_barrier) noexcept {
-    const auto& runtime = snapshot.runtime;
-    const auto& active_bundle = *snapshot.active_bundle;
+    const auto &runtime = snapshot.runtime;
+    const auto &active_bundle = *snapshot.active_bundle;
     const auto now_ns = ElapsedNs();
     if (!manager_liveness_retry_gate_.attempt_allowed(now_ns)) {
       return;
@@ -2710,12 +2686,11 @@ private:
       const auto runner = ProbeProgramRunnerLiveness(
           config_.program_runner_liveness_socket, admission_.cell_id());
       probed_cycle_status = runner.program_cycle_status;
-      const auto readiness =
-          BuildCellAdmissionReadiness(
-              runtime, *probed_cycle_status,
-              snapshot.unsettled_effect_count, forced_closed);
+      const auto probed_readiness = BuildCellAdmissionReadiness(
+          runtime, *probed_cycle_status, snapshot.unsettled_effect_count,
+          forced_closed);
       if (last_submitted_readiness_.has_value() &&
-          *last_submitted_readiness_ != readiness) {
+          *last_submitted_readiness_ != probed_readiness) {
         // Close first so a later renewal/submission failure cannot leave the
         // previous optimistic reduction installed.
         SubmitFailClosedReadiness(probed_cycle_status);
@@ -2725,16 +2700,15 @@ private:
       }
       std::vector<core::RequiredManagerLivenessReceiverDTO> native_receivers;
       native_receivers.reserve(runtime.plan.runtime_units.size());
-      const auto& retained_policy =
-          deployment::native_execution_runtime_contract::
-              manager_liveness_policy();
-      for (const auto& row : runtime.plan.runtime_units) {
+      const auto &retained_policy = deployment::
+          native_execution_runtime_contract::manager_liveness_policy();
+      for (const auto &row : runtime.plan.runtime_units) {
         if (row.process_adapter_contract_id !=
             deployment::native_execution_runtime_contract::
                 kProcessAdapterContractId) {
           continue;
         }
-        const auto* observation =
+        const auto *observation =
             runtime.observations.observation(row.runtime_unit_id.value());
         if (observation == nullptr || observation->runtime_epoch().empty()) {
           throw std::runtime_error(
@@ -2752,7 +2726,8 @@ private:
               "active native runtime has no exact retained liveness policy");
         }
         native_receivers.push_back(core::RequiredManagerLivenessReceiverDTO{
-            row.runtime_unit_id, core::RuntimeEpoch(observation->runtime_epoch()),
+            row.runtime_unit_id,
+            core::RuntimeEpoch(observation->runtime_epoch()),
             retained_policy.runtime_policy_id,
             retained_policy.runtime_policy_revision});
       }
@@ -2763,7 +2738,7 @@ private:
           core::RuntimePolicyRevision(
               std::string(kProgramRunnerLivenessPolicyRevision))});
       std::sort(receivers.begin(), receivers.end(),
-                [](const auto& left, const auto& right) {
+                [](const auto &left, const auto &right) {
                   return std::tie(left.runtime_unit_id, left.runtime_epoch,
                                   left.runtime_policy_id,
                                   left.runtime_policy_revision) <
@@ -2782,8 +2757,7 @@ private:
           core::RequestOwnerEpoch(manager_owner_epoch_),
           receivers};
       if (!core::ValidateManagerLivenessRequiredSet(required_set).ok() ||
-          manager_heartbeat_sequence_ >=
-              core::kMaximumManagerLivenessCounter) {
+          manager_heartbeat_sequence_ >= core::kMaximumManagerLivenessCounter) {
         throw std::runtime_error(
             "Manager cannot mint the exact native liveness required set");
       }
@@ -2808,8 +2782,7 @@ private:
         material.append(manager_runtime_epoch_.value());
         material.push_back('\0');
         material.append(manager_owner_epoch_);
-        for (const auto& observation :
-             runtime.observations.observations()) {
+        for (const auto &observation : runtime.observations.observations()) {
           material.push_back('\0');
           material.append(observation.runtime_unit_id());
           material.push_back('\0');
@@ -2830,7 +2803,7 @@ private:
       std::vector<component_manager::ManagerLivenessTransportRequestDTO>
           requests;
       requests.reserve(native_receivers.size());
-      for (const auto& receiver : native_receivers) {
+      for (const auto &receiver : native_receivers) {
         requests.push_back(
             {receiver.runtime_unit_id,
              runtime.plan.active_publication.publication_generation,
@@ -2841,16 +2814,15 @@ private:
       }
       const auto responses =
           requests.empty()
-              ? std::vector<
-                    core::ManagerLivenessObservationDTO>{}
+              ? std::vector<core::ManagerLivenessObservationDTO>{}
               : native_runtime_adapter_.RenewManagerLivenessBatch(requests);
       if (responses.size() != native_receivers.size()) {
         throw std::runtime_error(
             "native liveness batch returned the wrong receiver count");
       }
       for (std::size_t index = 0U; index < native_receivers.size(); ++index) {
-        const auto& receiver = native_receivers[index];
-        const auto& response = responses[index];
+        const auto &receiver = native_receivers[index];
+        const auto &response = responses[index];
         if (response.active_bundle_id != required_set.active_bundle_id ||
             response.required_runtime_set_digest != digest ||
             response.status.receiver_runtime_unit_id !=
@@ -2865,7 +2837,8 @@ private:
             response.status.last_accepted_heartbeat_sequence !=
                 manager_heartbeat_sequence_ ||
             (reconciliation.has_value() &&
-             (response.status.state != core::ManagerLivenessStateDTO::kCurrent ||
+             (response.status.state !=
+                  core::ManagerLivenessStateDTO::kCurrent ||
               response.status.command_fenced))) {
           throw std::runtime_error(
               "native liveness receiver returned foreign reconciliation "
@@ -2880,8 +2853,15 @@ private:
           config_.program_runner_liveness_socket, runner, required_set,
           manager_heartbeat_sequence_,
           reconciliation->reconciliation_evidence_digest);
-      Require(runner_renewal.program_cycle_status == *probed_cycle_status,
-              "Program cycle changed across one Manager liveness renewal");
+      // The Program Runner owns cycle progression. A Start or terminal event
+      // may legitimately occur between the preflight probe and this renewal;
+      // require the private receiver's exact process identity and publish the
+      // newer owner-issued status instead of treating ordinary progress as a
+      // liveness failure.
+      Require(IsCurrentProgramRunnerOwner(runner_renewal.program_cycle_status,
+                                          runner.runtime_epoch),
+              "Program cycle is not issued by the current Program Runner");
+      probed_cycle_status = runner_renewal.program_cycle_status;
       const auto published_runner =
           native_runtime_adapter_.Publish(runner_renewal.observation);
       if (!published_runner.ok()) {
@@ -2889,27 +2869,36 @@ private:
             "Kernel rejected Program Runner liveness observation: " +
             published_runner.error().message);
       }
+      const auto readiness = BuildCellAdmissionReadiness(
+          runtime, *probed_cycle_status, snapshot.unsettled_effect_count,
+          forced_closed);
+      if (last_submitted_readiness_.has_value() &&
+          *last_submitted_readiness_ != readiness &&
+          last_submitted_readiness_->program_cycle_status_current) {
+        SubmitFailClosedReadiness(probed_cycle_status);
+        Require(last_submitted_readiness_.has_value() &&
+                    !last_submitted_readiness_->program_cycle_status_current,
+                "Kernel could not be closed before owner renewal publication");
+      }
       if (!last_submitted_readiness_.has_value() ||
           *last_submitted_readiness_ != readiness) {
         {
           std::lock_guard lock(manager_liveness_lane_mutex_);
-          Require(forced_closed ||
-                      (readiness_barrier ==
-                           manager_liveness_readiness_barrier_ &&
-                       !manager_liveness_force_closed_),
+          Require(forced_closed || (readiness_barrier ==
+                                        manager_liveness_readiness_barrier_ &&
+                                    !manager_liveness_force_closed_),
                   "Manager liveness snapshot changed during renewal");
         }
         SubmitCellAdmissionReadiness(readiness);
       }
       manager_liveness_retry_gate_.RecordSuccess();
-    } catch (const component_manager::
-                 ManagerLivenessPublicationSuperseded&) {
+    } catch (const component_manager::ManagerLivenessPublicationSuperseded &) {
       SubmitFailClosedReadiness(probed_cycle_status);
       {
         std::lock_guard lock(manager_liveness_lane_mutex_);
         if (!manager_liveness_snapshot_.has_value() ||
-            !SameNativeManagerLivenessIdentity(
-                snapshot, *manager_liveness_snapshot_)) {
+            !SameNativeManagerLivenessIdentity(snapshot,
+                                               *manager_liveness_snapshot_)) {
           return;
         }
         manager_liveness_superseded_publication_ =
@@ -2919,13 +2908,13 @@ private:
       // the complete batch.  Preserve fail-closed readiness, but do not spend
       // the lease-expiry retry budget on this expected publication race.
       manager_liveness_retry_gate_.RecordSuccess();
-    } catch (const std::exception& error) {
+    } catch (const std::exception &error) {
       SubmitFailClosedReadiness(probed_cycle_status);
       {
         std::lock_guard lock(manager_liveness_lane_mutex_);
         if (manager_liveness_snapshot_.has_value() &&
-            !SameNativeManagerLivenessIdentity(
-                snapshot, *manager_liveness_snapshot_)) {
+            !SameNativeManagerLivenessIdentity(snapshot,
+                                               *manager_liveness_snapshot_)) {
           return;
         }
       }
@@ -2942,8 +2931,8 @@ private:
       {
         std::lock_guard lock(manager_liveness_lane_mutex_);
         if (manager_liveness_snapshot_.has_value() &&
-            !SameNativeManagerLivenessIdentity(
-                snapshot, *manager_liveness_snapshot_)) {
+            !SameNativeManagerLivenessIdentity(snapshot,
+                                               *manager_liveness_snapshot_)) {
           return;
         }
       }
@@ -2985,9 +2974,8 @@ private:
 
   void RunNativeManagerLivenessLane() noexcept {
     const auto heartbeat_period = std::chrono::nanoseconds(
-        deployment::native_execution_runtime_contract::
-            manager_liveness_policy()
-                .heartbeat_period_ns);
+        deployment::native_execution_runtime_contract::manager_liveness_policy()
+            .heartbeat_period_ns);
     std::unique_lock lock(manager_liveness_lane_mutex_);
     while (!manager_liveness_lane_stop_) {
       const auto snapshot = manager_liveness_snapshot_;
@@ -2997,10 +2985,9 @@ private:
       const auto readiness_barrier = manager_liveness_readiness_barrier_;
       const auto wake_generation = manager_liveness_wake_generation_;
       lock.unlock();
-      if (snapshot.has_value() &&
-          (!superseded_publication.has_value() ||
-           snapshot->runtime.plan.active_publication !=
-               *superseded_publication)) {
+      if (snapshot.has_value() && (!superseded_publication.has_value() ||
+                                   snapshot->runtime.plan.active_publication !=
+                                       *superseded_publication)) {
         if (!manager_liveness_attempted_publication_.has_value() ||
             *manager_liveness_attempted_publication_ !=
                 snapshot->runtime.plan.active_publication) {
@@ -3070,8 +3057,8 @@ private:
     } catch (const ManagerPackageGenerationRestartRequired &error) {
       TrySubmitFailClosedReadiness();
       PublishPackageRestartRequired();
-      std::cerr << "Manager daemon package generation changed: "
-                << error.what() << '\n';
+      std::cerr << "Manager daemon package generation changed: " << error.what()
+                << '\n';
     } catch (const std::exception &error) {
       TrySubmitFailClosedReadiness();
       std::cerr << "Manager daemon periodic reconciliation failed: "
@@ -3435,22 +3422,22 @@ private:
             return false;
           }
           const auto selection = candidate_source_.ResolveExact(
-              {*command.deployment_artifact_id,
-               *command.deployment_revision});
+              {*command.deployment_artifact_id, *command.deployment_revision});
           const auto current_bundle = verified_package_.get_verified(
               current_pointer.candidate_retained_bundle_id);
-          const auto candidate_bundle = verified_package_.get_verified(
-              selection.retained_bundle_id);
-          Require(current_bundle != nullptr && candidate_bundle != nullptr &&
-                      current_bundle->retained_bundle_id() ==
-                          current_pointer.candidate_retained_bundle_id &&
-                      current_bundle->value().cell_graph.graph_revision ==
-                          current_pointer.candidate_graph_revision &&
-                      candidate_bundle->retained_bundle_id() ==
-                          selection.retained_bundle_id &&
-                      candidate_bundle->value().cell_graph.cell_id ==
-                          current_bundle->value().cell_graph.cell_id,
-                  "candidate preview could not resolve exact compatible graphs");
+          const auto candidate_bundle =
+              verified_package_.get_verified(selection.retained_bundle_id);
+          Require(
+              current_bundle != nullptr && candidate_bundle != nullptr &&
+                  current_bundle->retained_bundle_id() ==
+                      current_pointer.candidate_retained_bundle_id &&
+                  current_bundle->value().cell_graph.graph_revision ==
+                      current_pointer.candidate_graph_revision &&
+                  candidate_bundle->retained_bundle_id() ==
+                      selection.retained_bundle_id &&
+                  candidate_bundle->value().cell_graph.cell_id ==
+                      current_bundle->value().cell_graph.cell_id,
+              "candidate preview could not resolve exact compatible graphs");
           DeploymentCandidateReceipt receipt{
               *command.deployment_artifact_id,
               *command.deployment_revision,
@@ -3464,9 +3451,9 @@ private:
               core::ContentDigest(""),
           };
           receipt.receipt_digest = DeploymentCandidateReceiptDigest(receipt);
-          const auto retained = std::find(
-              deployment_candidate_receipts_.begin(),
-              deployment_candidate_receipts_.end(), receipt);
+          const auto retained =
+              std::find(deployment_candidate_receipts_.begin(),
+                        deployment_candidate_receipts_.end(), receipt);
           if (retained == deployment_candidate_receipts_.end()) {
             if (deployment_candidate_receipts_.size() >=
                 kMaximumDeploymentCandidateReceipts) {
@@ -3475,11 +3462,10 @@ private:
             }
             deployment_candidate_receipts_.push_back(receipt);
           }
-          TrySendResponse(
-              client.get(),
-              DeploymentCandidatePreviewResponse(
-                  receipt, current_bundle->value().cell_graph,
-                  candidate_bundle->value().cell_graph));
+          TrySendResponse(client.get(),
+                          DeploymentCandidatePreviewResponse(
+                              receipt, current_bundle->value().cell_graph,
+                              candidate_bundle->value().cell_graph));
         } catch (const std::exception &error) {
           TrySendResponse(
               client.get(),
@@ -3505,8 +3491,7 @@ private:
                     command.source_label.has_value() &&
                     command.deployment_candidate_receipt.has_value(),
                 "decoded Apply command lacks its exact selection");
-        const auto &candidate_receipt =
-            *command.deployment_candidate_receipt;
+        const auto &candidate_receipt = *command.deployment_candidate_receipt;
         const auto receipt_admission_generation =
             command.expected_admission_generation.has_value()
                 ? *command.expected_admission_generation
@@ -3552,11 +3537,11 @@ private:
             }
             const auto active = plan_source_.ReadCurrentPlan();
             const auto &current_pointer = active.active_publication.request;
-            const auto selection = candidate_source_.ResolveExact(
-                {*command.deployment_artifact_id,
-                 *command.deployment_revision});
-            const auto candidate_bundle = verified_package_.get_verified(
-                selection.retained_bundle_id);
+            const auto selection =
+                candidate_source_.ResolveExact({*command.deployment_artifact_id,
+                                                *command.deployment_revision});
+            const auto candidate_bundle =
+                verified_package_.get_verified(selection.retained_bundle_id);
             if (current_pointer.candidate_retained_bundle_id !=
                     candidate_receipt.expected_current_retained_bundle_id ||
                 current_pointer.candidate_graph_revision !=
@@ -3568,11 +3553,11 @@ private:
                 candidate_bundle == nullptr ||
                 candidate_bundle->value().cell_graph.graph_revision !=
                     candidate_receipt.candidate_graph_revision) {
-              TrySendResponse(
-                  client.get(),
-                  ApplyErrorResponse(
-                      command, "deployment_candidate_receipt_stale",
-                      "Deployment candidate or current graph changed after preview"));
+              TrySendResponse(client.get(),
+                              ApplyErrorResponse(
+                                  command, "deployment_candidate_receipt_stale",
+                                  "Deployment candidate or current graph "
+                                  "changed after preview"));
               return false;
             }
           }
@@ -3641,10 +3626,9 @@ private:
         }
         const auto terminal = stores_.apply_journal().ReadTerminalOutcome(
             *command.apply_id, *command.apply_generation);
-        TrySendResponse(client.get(),
-                        ApplyStatusResponse(*command.apply_id,
-                                            *command.apply_generation,
-                                            terminal));
+        TrySendResponse(client.get(), ApplyStatusResponse(
+                                          *command.apply_id,
+                                          *command.apply_generation, terminal));
         return false;
       }
       case CommandKind::kSceneCommit: {
@@ -3675,11 +3659,10 @@ private:
       case CommandKind::kSceneCandidatePreview: {
         Require(command.scene_candidate_preview.has_value(),
                 "decoded scene candidate command lacks its request");
-        TrySendResponse(
-            client.get(),
-            SceneCandidatePreviewResponse(
-                scene_owner_.PreviewResolvedSceneCandidate(
-                    *command.scene_candidate_preview)));
+        TrySendResponse(client.get(),
+                        SceneCandidatePreviewResponse(
+                            scene_owner_.PreviewResolvedSceneCandidate(
+                                *command.scene_candidate_preview)));
         return false;
       }
       case CommandKind::kScenePoseQuery: {
@@ -4174,13 +4157,13 @@ DaemonConfig ParseArguments(const int argc, char **argv) {
       Fail("unknown or duplicate option " + std::string(option));
     }
   }
-  Require(install && manager && manager_run && execution_state &&
-              execution_run && scene &&
-              program_cycle && authoring && projection,
-          "--install-root, --manager-state-root, --manager-run-root, "
-          "--execution-state-root, --execution-run-root, "
-          "--logical-scene-database, --program-cycle-journal, "
-          "--authoring-transaction-journal, and --projection-root are required");
+  Require(
+      install && manager && manager_run && execution_state && execution_run &&
+          scene && program_cycle && authoring && projection,
+      "--install-root, --manager-state-root, --manager-run-root, "
+      "--execution-state-root, --execution-run-root, "
+      "--logical-scene-database, --program-cycle-journal, "
+      "--authoring-transaction-journal, and --projection-root are required");
   return config;
 }
 
@@ -4203,21 +4186,19 @@ void InstallSignalHandlers() {
 
 } // namespace
 
-std::string EncodeManagerStartupError(const manyforge::core::ErrorDTO& error) {
+std::string EncodeManagerStartupError(const manyforge::core::ErrorDTO &error) {
   manyforge::content_identity::CanonicalValue::Object details;
   details.reserve(error.details.size());
-  for (const auto& [key, value] : error.details) {
-    details.emplace_back(
-        key, manyforge::content_identity::CanonicalValue(value));
+  for (const auto &[key, value] : error.details) {
+    details.emplace_back(key,
+                         manyforge::content_identity::CanonicalValue(value));
   }
   return manyforge::content_identity::canonical_json(
       manyforge::content_identity::CanonicalValue(
           manyforge::content_identity::CanonicalValue::Object{
-              {"code",
-               manyforge::content_identity::CanonicalValue(error.code)},
+              {"code", manyforge::content_identity::CanonicalValue(error.code)},
               {"details",
-               manyforge::content_identity::CanonicalValue(
-                   std::move(details))},
+               manyforge::content_identity::CanonicalValue(std::move(details))},
               {"message",
                manyforge::content_identity::CanonicalValue(error.message)},
           }));
@@ -4231,10 +4212,8 @@ int main(int argc, char **argv) {
     manyforge::headless::ManagerDaemon daemon(
         manyforge::headless::ParseArguments(argc, argv));
     return daemon.Run();
-  } catch (const manyforge::component_manager::ManagerStateMarkerError&
-               error) {
-    std::cerr << manyforge::headless::EncodeManagerStartupError(
-                     error.error())
+  } catch (const manyforge::component_manager::ManagerStateMarkerError &error) {
+    std::cerr << manyforge::headless::EncodeManagerStartupError(error.error())
               << '\n';
     return 70;
   } catch (const std::exception &error) {

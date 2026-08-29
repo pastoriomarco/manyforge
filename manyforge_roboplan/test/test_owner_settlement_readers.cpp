@@ -22,8 +22,8 @@ class TemporaryDatabase final {
 public:
   TemporaryDatabase() {
     path_ = std::filesystem::temp_directory_path() /
-            ("manyforge-owner-settlement-" + std::to_string(::getpid()) +
-             "-" + std::to_string(++sequence_) + ".sqlite3");
+            ("manyforge-owner-settlement-" + std::to_string(::getpid()) + "-" +
+             std::to_string(++sequence_) + ".sqlite3");
     std::filesystem::remove(path_);
     if (sqlite3_open(path_.string().c_str(), &database_) != SQLITE_OK)
       throw std::runtime_error("open temporary SQLite database");
@@ -65,39 +65,34 @@ private:
   const std::string program_evidence =
       kind == "program_cycle"
           ? "{\"applied_program_revision\":\"" + std::string(kDigestA) +
-                "\",\"draft_program_revision\":\"" +
-                std::string(kDigestA) + "\"}"
+                "\",\"draft_program_revision\":\"" + std::string(kDigestA) +
+                "\"}"
           : "null";
   return "{\"accepted_at_ns\":1,\"acquired_admission_generation\":2,"
          "\"claim_generation\":3,\"intent\":{\"claim_kind\":\"" +
          std::string(kind) +
          "\",\"expected_admission_generation\":1,"
          "\"intervention_evidence\":null,\"owner_epoch\":\"" +
-         std::string(owner_epoch) + "\",\"owner_role\":\"" +
-         std::string(role) + "\",\"owner_transaction_id\":\"" +
-         std::string(transaction) +
+         std::string(owner_epoch) + "\",\"owner_role\":\"" + std::string(role) +
+         "\",\"owner_transaction_id\":\"" + std::string(transaction) +
          "\",\"program_cycle_evidence\":" + program_evidence +
-         ",\"request_id\":\"" +
-         std::string(request) + "\",\"request_payload_digest\":\"" +
-         std::string(kDigestA) +
+         ",\"request_id\":\"" + std::string(request) +
+         "\",\"request_payload_digest\":\"" + std::string(kDigestA) +
          "\",\"scope\":{\"configurations\":[],\"resources\":[]}}}";
 }
 
-[[nodiscard]] std::string ReleaseJson(std::string_view role,
-                                      std::string_view owner_epoch,
-                                      std::string_view transaction,
-                                      std::string_view request,
-                                      std::string_view settlement,
-                                      std::string_view evidence) {
+[[nodiscard]] std::string
+ReleaseJson(std::string_view role, std::string_view owner_epoch,
+            std::string_view transaction, std::string_view request,
+            std::string_view settlement, std::string_view evidence) {
   return "{\"acquired_admission_generation\":2,\"claim_generation\":3,"
-         "\"owner_epoch\":\"" + std::string(owner_epoch) +
-         "\",\"owner_role\":\"" + std::string(role) +
+         "\"owner_epoch\":\"" +
+         std::string(owner_epoch) + "\",\"owner_role\":\"" + std::string(role) +
          "\",\"owner_transaction_id\":\"" + std::string(transaction) +
          "\",\"request_id\":\"" + std::string(request) +
          "\",\"request_payload_digest\":\"" + std::string(kDigestA) +
-         "\",\"settlement\":{\"evidence_digest\":\"" +
-         std::string(evidence) + "\",\"settlement_kind\":\"" +
-         std::string(settlement) + "\"}}";
+         "\",\"settlement\":{\"evidence_digest\":\"" + std::string(evidence) +
+         "\",\"settlement_kind\":\"" + std::string(settlement) + "\"}}";
 }
 
 TEST(OwnerSettlementReaders,
@@ -110,11 +105,9 @@ TEST(OwnerSettlementReaders,
       "\"schema_version\":\"manyforge.prepared_program_scene.v1\"},"
       "\"program_run_id\":\"cycle.1\",\"schema_version\":"
       "\"manyforge.program_cycle_start_settlement.v1\"}";
-  const auto evidence =
-      content_identity::sha256_digest(start_settlement);
-  const auto release_json =
-      ReleaseJson("program_runner", "runner.1", "cycle.1", "start.1",
-                  "explicit_reset", evidence);
+  const auto evidence = content_identity::sha256_digest(start_settlement);
+  const auto release_json = ReleaseJson("program_runner", "runner.1", "cycle.1",
+                                        "start.1", "explicit_reset", evidence);
   const auto claim = DecodeCellAdmissionClaim(claim_json);
   const auto release = DecodeCellAdmissionClaimRelease(release_json);
   TemporaryDatabase fixture;
@@ -127,9 +120,9 @@ TEST(OwnerSettlementReaders,
       "release_intent_json TEXT,reconciliation_required INTEGER,"
       "acquisition_pending_json TEXT);");
   fixture.Exec("INSERT INTO program_cycle VALUES(1,'terminal_awaiting_reset',"
-               "'runner.1','cycle.1','" + claim_json + "','" + evidence +
-               "','" + start_settlement + "','" + release_json +
-               "',0,NULL)");
+               "'runner.1','cycle.1','" +
+               claim_json + "','" + evidence + "','" + start_settlement +
+               "','" + release_json + "',0,NULL)");
   fixture.Close();
   EXPECT_TRUE(
       ValidateProgramCycleSettlementReadOnly(fixture.path(), claim, release)
@@ -144,11 +137,12 @@ TEST(OwnerSettlementReaders,
       "terminal_reference TEXT,start_settlement_json TEXT,"
       "release_intent_json TEXT,reconciliation_required INTEGER,"
       "acquisition_pending_json TEXT); INSERT INTO program_cycle VALUES(1,"
-      "'terminal_awaiting_reset','runner.1','cycle.1','" + claim_json + "','" +
-      evidence + "','" + start_settlement + "',NULL,0,NULL)");
+      "'terminal_awaiting_reset','runner.1','cycle.1','" +
+      claim_json + "','" + evidence + "','" + start_settlement +
+      "',NULL,0,NULL)");
   missing_intent.Close();
   EXPECT_FALSE(ValidateProgramCycleSettlementReadOnly(missing_intent.path(),
-                                                       claim, release)
+                                                      claim, release)
                    .ok());
 }
 
@@ -156,15 +150,13 @@ TEST(OwnerSettlementReaders,
      ProgramResetJoinsTheExactRetainedTerminalRunSnapshot) {
   const auto claim_json = ClaimJson("program_cycle", "program_runner",
                                     "runner.1", "cycle.1", "start.1");
-  const std::string snapshot =
-      "{\"capture\":{\"program_run_id\":\"run.1\"},"
-      "\"run_revision\":2,\"state\":\"stopped\"}";
+  const std::string snapshot = "{\"capture\":{\"program_run_id\":\"run.1\"},"
+                               "\"run_revision\":2,\"state\":\"stopped\"}";
   const auto evidence = content_identity::sha256_digest(
       "{\"program_run_id\":\"run.1\",\"run_revision\":2,"
       "\"state\":\"stopped\"}");
-  const auto release_json =
-      ReleaseJson("program_runner", "runner.1", "cycle.1", "start.1",
-                  "explicit_reset", evidence);
+  const auto release_json = ReleaseJson("program_runner", "runner.1", "cycle.1",
+                                        "start.1", "explicit_reset", evidence);
   const auto claim = DecodeCellAdmissionClaim(claim_json);
   const auto release = DecodeCellAdmissionClaimRelease(release_json);
   TemporaryDatabase fixture;
@@ -179,10 +171,11 @@ TEST(OwnerSettlementReaders,
       "CREATE TABLE program_run_history(program_run_id TEXT PRIMARY KEY,"
       "run_revision INTEGER,snapshot_json TEXT,terminal INTEGER);");
   fixture.Exec("INSERT INTO program_cycle VALUES(1,'terminal_awaiting_reset',"
-               "'runner.1','run.1','" + claim_json + "','" + evidence +
-               "',NULL,'" + release_json + "',0,NULL);"
-               "INSERT INTO program_run_history VALUES('run.1',2,'" + snapshot +
-               "',1)");
+               "'runner.1','run.1','" +
+               claim_json + "','" + evidence + "',NULL,'" + release_json +
+               "',0,NULL);"
+               "INSERT INTO program_run_history VALUES('run.1',2,'" +
+               snapshot + "',1)");
   fixture.Close();
   EXPECT_TRUE(
       ValidateProgramCycleSettlementReadOnly(fixture.path(), claim, release)
@@ -195,27 +188,25 @@ TEST(OwnerSettlementReaders,
                                     "author.1", "author.tx.1", "author.tx.1");
   const std::string outcome =
       "{\"body\":{\"status\":\"saved\"},\"kind\":\"mapping\"}";
-  const std::string preimage =
-      "{\"outcome\":" + outcome +
-      ",\"owner_transaction_id\":\"author.tx.1\","
-      "\"settlement_kind\":\"owner_commit\"}";
+  const std::string preimage = "{\"outcome\":" + outcome +
+                               ",\"owner_transaction_id\":\"author.tx.1\","
+                               "\"settlement_kind\":\"owner_commit\"}";
   const auto evidence = content_identity::sha256_digest(preimage);
   const auto release_json =
-      ReleaseJson("authoring_owner", "author.1", "author.tx.1",
-                  "author.tx.1", "owner_commit", evidence);
+      ReleaseJson("authoring_owner", "author.1", "author.tx.1", "author.tx.1",
+                  "owner_commit", evidence);
   const auto claim = DecodeCellAdmissionClaim(claim_json);
   const auto release = DecodeCellAdmissionClaimRelease(release_json);
-  const std::string release_intent =
-      "{\"evidence_digest\":\"" + evidence +
-      "\",\"settlement_kind\":\"owner_commit\"}";
+  const std::string release_intent = "{\"evidence_digest\":\"" + evidence +
+                                     "\",\"settlement_kind\":\"owner_commit\"}";
   TemporaryDatabase fixture;
   fixture.Exec(
       "PRAGMA user_version=1; CREATE TABLE transactions(owner_transaction_id "
       "TEXT,owner_epoch TEXT,claim_json TEXT,effect_intent_json TEXT,"
       "outcome_json TEXT,post_image_json TEXT,release_intent_json TEXT,"
       "release_receipt_json TEXT); INSERT INTO transactions VALUES("
-      "'author.tx.1','author.1','" + claim_json +
-      "','{\"effect_class\":\"local\"}','" + outcome +
+      "'author.tx.1','author.1','" +
+      claim_json + "','{\"effect_class\":\"local\"}','" + outcome +
       "','{\"draft_revision\":2}','" + release_intent + "',NULL)");
   fixture.Close();
   EXPECT_TRUE(
@@ -227,13 +218,13 @@ TEST(OwnerSettlementReaders,
       "TEXT,owner_epoch TEXT,claim_json TEXT,effect_intent_json TEXT,"
       "outcome_json TEXT,post_image_json TEXT,release_intent_json TEXT,"
       "release_receipt_json TEXT); INSERT INTO transactions VALUES("
-      "'author.tx.1','author.1','" + claim_json +
-      "','{\"effect_class\":\"local\"}','" + outcome +
+      "'author.tx.1','author.1','" +
+      claim_json + "','{\"effect_class\":\"local\"}','" + outcome +
       "','{\"draft_revision\":2}','" + release_intent +
       "','{\"status\":\"released_exact\"}')");
   premature_receipt.Close();
   EXPECT_FALSE(ValidateAuthoringSettlementReadOnly(premature_receipt.path(),
-                                                    claim, release)
+                                                   claim, release)
                    .ok());
 }
 
@@ -259,30 +250,19 @@ TEST(OwnerSettlementReaders,
   ASSERT_TRUE(evidence.ok());
   core::CellAdmissionReconcileDTO reconcile{
       core::RequestOwnerEpoch("kernel.1"), {}, requested, evidence.value()};
-  EXPECT_TRUE(ValidateAuthoringOwnerReconciliationReadOnly(
-                  fixture.path(), {}, current, reconcile)
+  EXPECT_TRUE(ValidateAuthoringOwnerReconciliationReadOnly(fixture.path(), {},
+                                                           current, reconcile)
                   .ok());
 
   reconcile.reconciliation_evidence_digest =
       core::ContentDigest(std::string(kDigestA));
-  EXPECT_FALSE(ValidateAuthoringOwnerReconciliationReadOnly(
-                   fixture.path(), {}, current, reconcile)
+  EXPECT_FALSE(ValidateAuthoringOwnerReconciliationReadOnly(fixture.path(), {},
+                                                            current, reconcile)
                    .ok());
 }
 
 TEST(OwnerSettlementReaders,
      ProgramRunnerIdleRotationCannotBeAuthorizedByAuthoringJournal) {
-  TemporaryDatabase fixture;
-  fixture.Exec(
-      "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
-      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,1);"
-      "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
-      "owner_epoch TEXT,claim_json TEXT,release_intent_json TEXT,"
-      "terminal_reference TEXT,reconciliation_required INTEGER,"
-      "acquisition_pending_json TEXT);"
-      "INSERT INTO program_cycle VALUES(1,'idle_after_reset','runner.2',"
-      "NULL,NULL,NULL,0,NULL)");
-  fixture.Close();
   const std::vector<core::CellAdmissionCurrentOwnerEpochDTO> current{
       {core::CellAdmissionOwnerRoleDTO::kProgramRunner,
        core::RequestOwnerEpoch("runner.1")}};
@@ -294,32 +274,44 @@ TEST(OwnerSettlementReaders,
           core::CellAdmissionOwnerRoleDTO::kProgramRunner,
           core::RequestOwnerEpoch("runner.2"));
   ASSERT_TRUE(evidence.ok());
+  TemporaryDatabase fixture;
+  fixture.Exec(
+      "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
+      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,3);"
+      "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
+      "owner_epoch TEXT,claim_json TEXT,release_intent_json TEXT,"
+      "terminal_reference TEXT,reconciliation_required INTEGER,"
+      "acquisition_pending_json TEXT,reconciliation_evidence_digest TEXT);"
+      "INSERT INTO program_cycle VALUES(1,'idle_after_reset','runner.1',"
+      "NULL,NULL,NULL,1,NULL,'" +
+      evidence.value().value() + "')");
+  fixture.Close();
   const core::CellAdmissionReconcileDTO reconcile{
       core::RequestOwnerEpoch("kernel.1"), {}, requested, evidence.value()};
   EXPECT_TRUE(ValidateProgramRunnerOwnerReconciliationReadOnly(
                   fixture.path(), {}, current, reconcile)
                   .ok());
-  EXPECT_FALSE(ValidateAuthoringOwnerReconciliationReadOnly(
-                   fixture.path(), {}, current, reconcile)
+  EXPECT_FALSE(ValidateAuthoringOwnerReconciliationReadOnly(fixture.path(), {},
+                                                            current, reconcile)
                    .ok());
 
   const auto claim_json = ClaimJson("program_cycle", "program_runner",
                                     "runner.1", "cycle.1", "start.1");
   const auto claim = DecodeCellAdmissionClaim(claim_json);
-  const auto release_json =
-      ReleaseJson("program_runner", "runner.1", "cycle.1", "start.1",
-                  "explicit_reset", kDigestB);
+  const auto release_json = ReleaseJson("program_runner", "runner.1", "cycle.1",
+                                        "start.1", "explicit_reset", kDigestB);
   TemporaryDatabase terminal;
   terminal.Exec(
       "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
-      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,1);"
+      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,3);"
       "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
       "owner_epoch TEXT,claim_json TEXT,release_intent_json TEXT,"
       "terminal_reference TEXT,reconciliation_required INTEGER,"
-      "acquisition_pending_json TEXT);"
-      "INSERT INTO program_cycle VALUES(1,'terminal_awaiting_reset','runner.2','" +
+      "acquisition_pending_json TEXT,reconciliation_evidence_digest TEXT);"
+      "INSERT INTO program_cycle "
+      "VALUES(1,'terminal_awaiting_reset','runner.1','" +
       claim_json + "','" + release_json + "','" + std::string(kDigestB) +
-      "',0,NULL)");
+      "',1,NULL,'" + evidence.value().value() + "')");
   terminal.Close();
   const auto validation = ValidateProgramRunnerOwnerReconciliationReadOnly(
       terminal.path(), {}, current, reconcile);

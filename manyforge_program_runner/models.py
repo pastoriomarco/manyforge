@@ -46,12 +46,17 @@ class ProgramCycleStatusDTO(BaseModel):
     @model_validator(mode="after")
     def exact_state_shape(self) -> "ProgramCycleStatusDTO":
         idle = self.state == "idle_after_reset"
-        if idle != (
-            self.program_run_id is None
-            and self.cycle_claim_generation is None
-            and self.terminal_or_settlement_reference is None
-        ):
-            raise ValueError("Program cycle has the wrong Idle/non-Idle shape")
+        if idle:
+            if not (
+                self.program_run_id is None
+                and self.cycle_claim_generation is None
+                and self.terminal_or_settlement_reference is None
+            ):
+                raise ValueError("Program cycle has the wrong Idle shape")
+        elif self.program_run_id is None:
+            raise ValueError("active Program cycle requires its run identity")
+        elif self.cycle_claim_generation is None and self.state != "starting":
+            raise ValueError("acquired Program cycle requires its claim generation")
         if (
             self.state == "terminal_awaiting_reset"
             and self.terminal_or_settlement_reference is None

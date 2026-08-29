@@ -164,6 +164,7 @@ import type {
   ManualControlContracts,
   ManualControlGripperDescriptor,
   ManualControlMotionDescriptor,
+  ExecutionIdentity,
   ExecutionOwnerStatus,
   MotionPreviewReceipt,
   ObservedGripperTarget,
@@ -2971,6 +2972,8 @@ export function parseProgramRunStatus(value: unknown): ProgramRunStatus {
       'active_operation_count',
       'capture',
       'message',
+      'node_status_revision',
+      'node_statuses',
       'owner_epoch',
       'owner_id',
       'reason_code',
@@ -2982,8 +2985,8 @@ export function parseProgramRunStatus(value: unknown): ProgramRunStatus {
     path,
   );
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.program_run_status.v1') {
-    return fail(`${path}.schema_version`, 'manyforge.program_run_status.v1');
+  if (schemaVersion !== 'manyforge.program_run_status.v2') {
+    return fail(`${path}.schema_version`, 'manyforge.program_run_status.v2');
   }
   const state = stringAt(record.state, `${path}.state`) as ProgramRunStateName;
   if (!PROGRAM_RUN_STATES.has(state)) {
@@ -3048,6 +3051,26 @@ export function parseProgramRunStatus(value: unknown): ProgramRunStatus {
   const treeStatus = stringAt(record.tree_status, `${path}.tree_status`);
   if (!['invalid', 'running', 'success', 'failure'].includes(treeStatus)) {
     return fail(`${path}.tree_status`, 'a supported tree status');
+  }
+  const rawNodeStatuses = objectAt(record.node_statuses, `${path}.node_statuses`);
+  const nodeStatusEntries = Object.entries(rawNodeStatuses);
+  if (nodeStatusEntries.length > 100_000) {
+    return fail(`${path}.node_statuses`, 'at most 100000 authored-node statuses');
+  }
+  const nodeStatuses: ProgramRunStatus['nodeStatuses'] = {};
+  for (const [instanceId, rawStatus] of nodeStatusEntries) {
+    const status = stringAt(rawStatus, `${path}.node_statuses.${instanceId}`);
+    if (
+      instanceId.length === 0
+      || instanceId.length > 512
+      || !['idle', 'running', 'success', 'failure'].includes(status)
+    ) {
+      return fail(
+        `${path}.node_statuses.${instanceId}`,
+        'one bounded authored-node ID and supported presentation status',
+      );
+    }
+    nodeStatuses[instanceId] = status as ProgramRunStatus['nodeStatuses'][string];
   }
   const ownerId = stringAt(record.owner_id, `${path}.owner_id`);
   const ownerEpoch = stringAt(record.owner_epoch, `${path}.owner_epoch`);
@@ -3118,6 +3141,11 @@ export function parseProgramRunStatus(value: unknown): ProgramRunStatus {
       ownerIdentities,
     },
     treeStatus: treeStatus as ProgramRunStatus['treeStatus'],
+    nodeStatusRevision: positiveIntegerAt(
+      record.node_status_revision,
+      `${path}.node_status_revision`,
+    ),
+    nodeStatuses,
     activeOperationCount,
     reasonCode: nullableStringAt(record.reason_code, `${path}.reason_code`),
     message: stringAt(record.message, `${path}.message`),
@@ -6405,6 +6433,198 @@ function manualControlGripperDescriptorAt(
     namedPresets,
     contracts: manualControlContractsAt(record.contracts, `${path}.contracts`),
   };
+}
+
+function executionIdentityAt(value: unknown, path: string): ExecutionIdentity {
+  const identity = objectAt(value, path);
+  exactKeysAt(identity, [
+    'active_publication_generation',
+    'cell_id',
+    'graph_revision',
+    'gripper_command_schema_id',
+    'gripper_command_schema_revision',
+    'gripper_target_role_id',
+    'motion_target_role_id',
+    'owner_epoch',
+    'program_binding_id',
+    'program_id',
+    'program_revision',
+    'retained_bundle_id',
+    'scene_revision',
+    'schema_version',
+  ], path);
+  if (stringAt(identity.schema_version, `${path}.schema_version`)
+      !== 'manyforge.execution_identity.v1') {
+    return fail(`${path}.schema_version`, 'manyforge.execution_identity.v1');
+  }
+  return {
+    ownerEpoch: stringAt(identity.owner_epoch, `${path}.owner_epoch`),
+    cellId: stringAt(identity.cell_id, `${path}.cell_id`),
+    activePublicationGeneration: positiveIntegerAt(
+      identity.active_publication_generation,
+      `${path}.active_publication_generation`,
+    ),
+    graphRevision: stringAt(identity.graph_revision, `${path}.graph_revision`),
+    retainedBundleId: stringAt(
+      identity.retained_bundle_id,
+      `${path}.retained_bundle_id`,
+    ),
+    sceneRevision: sceneRevisionAt(
+      identity.scene_revision,
+      `${path}.scene_revision`,
+    ),
+    programId: stringAt(identity.program_id, `${path}.program_id`),
+    programRevision: stringAt(
+      identity.program_revision,
+      `${path}.program_revision`,
+    ),
+    programBindingId: stringAt(
+      identity.program_binding_id,
+      `${path}.program_binding_id`,
+    ),
+    motionTargetRoleId: stringAt(
+      identity.motion_target_role_id,
+      `${path}.motion_target_role_id`,
+    ),
+    gripperTargetRoleId: stringAt(
+      identity.gripper_target_role_id,
+      `${path}.gripper_target_role_id`,
+    ),
+    gripperCommandSchemaId: stringAt(
+      identity.gripper_command_schema_id,
+      `${path}.gripper_command_schema_id`,
+    ),
+    gripperCommandSchemaRevision: stringAt(
+      identity.gripper_command_schema_revision,
+      `${path}.gripper_command_schema_revision`,
+    ),
+  };
+}
+
+export function parseExecutionIdentity(value: unknown): ExecutionIdentity {
+  const envelope = objectAt(value, 'executionIdentity');
+  exactKeysAt(
+    envelope,
+    ['api_version', 'command', 'identity', 'ok'],
+    'executionIdentity',
+  );
+  if (
+    stringAt(envelope.api_version, 'executionIdentity.api_version')
+      !== 'manyforge.execution_command_response.v1'
+    || booleanAt(envelope.ok, 'executionIdentity.ok') !== true
+    || stringAt(envelope.command, 'executionIdentity.command') !== 'identity'
+  ) {
+    return fail('executionIdentity', 'a successful identity response');
+  }
+  return executionIdentityAt(envelope.identity, 'executionIdentity.identity');
+}
+
+export function parseExecutionControlStatus(
+  targetsValue: unknown,
+  controlValue: unknown,
+): ExecutionOwnerStatus {
+  const targetsEnvelope = objectAt(targetsValue, 'executionTargets');
+  exactKeysAt(
+    targetsEnvelope,
+    ['api_version', 'command', 'identity', 'ok', 'targets'],
+    'executionTargets',
+  );
+  if (
+    stringAt(targetsEnvelope.api_version, 'executionTargets.api_version')
+      !== 'manyforge.execution_command_response.v1'
+    || booleanAt(targetsEnvelope.ok, 'executionTargets.ok') !== true
+    || stringAt(targetsEnvelope.command, 'executionTargets.command') !== 'targets'
+  ) {
+    return fail('executionTargets', 'a successful targets response');
+  }
+  const controlEnvelope = objectAt(controlValue, 'executionControlState');
+  exactKeysAt(
+    controlEnvelope,
+    ['api_version', 'command', 'control_state', 'identity', 'ok'],
+    'executionControlState',
+  );
+  if (
+    stringAt(controlEnvelope.api_version, 'executionControlState.api_version')
+      !== 'manyforge.execution_command_response.v1'
+    || booleanAt(controlEnvelope.ok, 'executionControlState.ok') !== true
+    || stringAt(controlEnvelope.command, 'executionControlState.command')
+      !== 'control_state'
+  ) {
+    return fail('executionControlState', 'a successful control-state response');
+  }
+  const targetIdentity = executionIdentityAt(
+    targetsEnvelope.identity,
+    'executionTargets.identity',
+  );
+  const controlIdentity = executionIdentityAt(
+    controlEnvelope.identity,
+    'executionControlState.identity',
+  );
+  if (JSON.stringify(targetIdentity) !== JSON.stringify(controlIdentity)) {
+    return fail('executionControlStatus', 'matching owner/product identities');
+  }
+  const targets = objectAt(targetsEnvelope.targets, 'executionTargets.targets');
+  exactKeysAt(
+    targets,
+    ['direct_control', 'direct_control_gripper', 'schema_version'],
+    'executionTargets.targets',
+  );
+  if (stringAt(targets.schema_version, 'executionTargets.targets.schema_version')
+      !== 'manyforge.execution_targets.v1') {
+    return fail(
+      'executionTargets.targets.schema_version',
+      'manyforge.execution_targets.v1',
+    );
+  }
+  const control = objectAt(
+    controlEnvelope.control_state,
+    'executionControlState.control_state',
+  );
+  exactKeysAt(
+    control,
+    ['cell_stop_action', 'observed_gripper', 'observed_motion', 'schema_version'],
+    'executionControlState.control_state',
+  );
+  if (stringAt(
+    control.schema_version,
+    'executionControlState.control_state.schema_version',
+  ) !== 'manyforge.execution_control_state.v1') {
+    return fail(
+      'executionControlState.control_state.schema_version',
+      'manyforge.execution_control_state.v1',
+    );
+  }
+  const motionTarget = objectAt(
+    targets.direct_control,
+    'executionTargets.targets.direct_control',
+  );
+  const gripperTarget = objectAt(
+    targets.direct_control_gripper,
+    'executionTargets.targets.direct_control_gripper',
+  );
+  const identity = targetIdentity;
+  return parseExecutionOwnerStatus({
+    api_version: 'manyforge.execution_command_response.v1',
+    command: 'status',
+    ok: true,
+    status: {
+      active_publication_generation: identity.activePublicationGeneration,
+      cell_id: identity.cellId,
+      cell_stop_action: control.cell_stop_action,
+      direct_control: {
+        ...motionTarget,
+        observed_state: control.observed_motion,
+      },
+      direct_control_gripper: {
+        ...gripperTarget,
+        observed_state: control.observed_gripper,
+      },
+      graph_revision: identity.graphRevision,
+      owner_epoch: identity.ownerEpoch,
+      retained_bundle_id: identity.retainedBundleId,
+      scene_revision: identity.sceneRevision,
+    },
+  });
 }
 
 export function parseExecutionOwnerStatus(value: unknown): ExecutionOwnerStatus {

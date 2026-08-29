@@ -2484,6 +2484,20 @@ TEST(RetainedProductCrossConsumer,
       motion_value.command_target_id.value());
   ASSERT_TRUE(limits.ok()) << limits.error().message;
   EXPECT_EQ(limits.value().joint_names, joint_names.value());
+  ASSERT_EQ(limits.value().position_lower_rad.size(),
+            joint_names.value().size());
+  ASSERT_EQ(limits.value().position_upper_rad.size(),
+            joint_names.value().size());
+  ASSERT_EQ(limits.value().velocity_max_rad_s.size(),
+            joint_names.value().size());
+  EXPECT_TRUE(
+      std::all_of(limits.value().velocity_max_rad_s.begin(),
+                  limits.value().velocity_max_rad_s.end(),
+                  [](double value) { return std::abs(value - 3.14) < 1e-12; }));
+  // The qualified Lite6 URDF/SRDF source declares no acceleration limits.
+  // RoboPlan represents that internally with max-double sentinels; the typed
+  // ManyForge boundary must expose absence rather than a fictitious cap.
+  EXPECT_TRUE(limits.value().acceleration_max_rad_s2.empty());
   const auto base_frame = require_fixture_one(
       motion_value.frame_bindings,
       [](const auto &frame) { return frame.frame_role_id.value() == "base"; },
@@ -2517,6 +2531,19 @@ TEST(RetainedProductCrossConsumer,
       cancellation);
   ASSERT_TRUE(validation.valid)
       << (validation.error.has_value() ? validation.error->message : "");
+  auto over_speed_trajectory = stationary_trajectory;
+  over_speed_trajectory.waypoints.back().time_from_start_s = 0.1;
+  over_speed_trajectory.waypoints.back().positions_rad.front() = 1.0;
+  const auto over_speed_validation =
+      runtime->trajectory_validator->validate_non_collision(
+          over_speed_trajectory, core::ValidationOptionsDTO{0.0, {}, {}, false},
+          cancellation);
+  ASSERT_FALSE(over_speed_validation.valid);
+  ASSERT_TRUE(over_speed_validation.error.has_value());
+  EXPECT_EQ(over_speed_validation.error->details.at("reason"),
+            "trajectory_segment_velocity_limit_exceeded");
+  EXPECT_NEAR(std::stod(over_speed_validation.error->details.at("limit")), 3.14,
+              1e-12);
   const auto expanded =
       runtime->collision_trajectory_projector->expand_for_collision(
           stationary_trajectory, zero_arm_state);

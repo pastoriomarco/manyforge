@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <manyforge_collision/manyforge_collision_engine.hpp>
@@ -284,6 +285,16 @@ create_retained_native_runtime_participants(
     RetainedNativeRuntimeInput input, RetainedNativeRuntimeConfig config,
     std::shared_ptr<WallClock> shared_clock = {},
     std::shared_ptr<SimpleScheduler> shared_scheduler = {});
+
+/// Resolve current Stop-recovery facts for either a directly attached owner
+/// or the process-stable managed owner. This is one product-facts adapter;
+/// ownership of the Stop latch and its clear remains in Core.
+[[nodiscard]] core::Result<core::StopFaultRecoveryFactsDTO>
+build_retained_native_stop_recovery_facts(
+    RetainedNativeRuntime &runtime,
+    core::ResourceAddressedExecutionKernel &addressed_kernel,
+    core::IResourceOperationAdmissionGate *operation_admission_gate,
+    const core::StopStatusDTO &status, std::int64_t assessed_at_ns);
 
 /// Attach the sole stable addressed owner to one prepared participant set.
 /// The owner config is process-selected, not supplied by a Program or caller.

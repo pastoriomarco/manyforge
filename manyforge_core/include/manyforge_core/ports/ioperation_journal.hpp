@@ -94,8 +94,7 @@ struct RecoveredStopJournalStateDTO final {
 /// Trusted, internal reconciliation result.  The public reconcile DTO is only
 /// evidence input; this result is the exact authority consumed by Kernel and
 /// its mechanical journal.
-using CellAdmissionReconcileSettlementAuthorizationDTO =
-    CellAdmissionReconcileSettlementDTO;
+using CellAdmissionReconcileSettlementAuthorizationDTO = CellAdmissionReconcileSettlementDTO;
 
 struct CellAdmissionReconcileValidationDTO final {
   std::vector<CellAdmissionCurrentOwnerEpochDTO> current_owner_epochs;
@@ -111,6 +110,7 @@ struct OperationJournalRecoveryDTO final {
   std::optional<RequestOwnerEpoch> replaced_unclosed_owner_epoch;
   std::vector<ResourceId> unreconciled_resources;
   AdmissionGeneration cell_admission_generation_high_water{0U};
+  CellAdmissionClaimGeneration cell_claim_generation_high_water{0U};
   struct RecoveredCellAdmissionClaimDTO final {
     CellAdmissionClaimDTO claim;
     std::optional<CellAdmissionClaimReleaseDTO> release;
@@ -203,15 +203,17 @@ class IOperationJournal {
       const RequestOwnerEpoch&, const CellAdmissionClaimDTO&) {
     return Result<std::uint64_t>::Err(
         ErrorDTO{"operation_journal_cell_admission_unavailable",
-                 "the operation journal does not implement durable cell admission", {}});
+                 "the operation journal does not implement durable cell admission",
+                 {}});
   }
 
   [[nodiscard]] virtual Result<std::uint64_t> RecordCellAdmissionClaimReleased(
-      const RequestOwnerEpoch&, const CellAdmissionClaimDTO&,
-      const CellAdmissionClaimReleaseDTO&, AdmissionGeneration) {
+      const RequestOwnerEpoch&, const CellAdmissionClaimDTO&, const CellAdmissionClaimReleaseDTO&,
+      AdmissionGeneration) {
     return Result<std::uint64_t>::Err(
         ErrorDTO{"operation_journal_cell_admission_unavailable",
-                 "the operation journal does not implement durable cell admission", {}});
+                 "the operation journal does not implement durable cell admission",
+                 {}});
   }
 
   [[nodiscard]] virtual Result<std::uint64_t> RecordCellAdmissionClaimsReconciled(
@@ -219,14 +221,16 @@ class IOperationJournal {
       const CellAdmissionReconcileValidationDTO&, AdmissionGeneration) {
     return Result<std::uint64_t>::Err(
         ErrorDTO{"operation_journal_cell_admission_unavailable",
-                 "the operation journal does not implement durable cell admission", {}});
+                 "the operation journal does not implement durable cell admission",
+                 {}});
   }
 
   [[nodiscard]] virtual Result<std::uint64_t> RecordCellAdmissionGenerationAdvanced(
       const RequestOwnerEpoch&, AdmissionGeneration, AdmissionGeneration) {
     return Result<std::uint64_t>::Err(
         ErrorDTO{"operation_journal_cell_admission_unavailable",
-                 "the operation journal does not implement durable cell admission", {}});
+                 "the operation journal does not implement durable cell admission",
+                 {}});
   }
 };
 

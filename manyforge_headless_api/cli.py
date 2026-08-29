@@ -190,7 +190,15 @@ def _serve(args: argparse.Namespace) -> int:
         program_runner_url=args.program_runner_url,
         program_runner_timeout_seconds=args.program_runner_timeout_s,
     )
-    uvicorn.run(create_app(config), host=args.host, port=args.port)
+    # Internal request success is not a runtime event. Semantic owner state,
+    # warnings, failures, and journals remain observable without a log line
+    # for every high-rate observation sample.
+    uvicorn.run(
+        create_app(config),
+        host=args.host,
+        port=args.port,
+        access_log=False,
+    )
     return 0
 
 

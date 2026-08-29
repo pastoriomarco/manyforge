@@ -45,6 +45,8 @@ import {
 } from '../state/sceneAuthoring';
 import {
   candidateRobotPresentation,
+  createExecutionRobotPresentationReader,
+  executionRobotPresentation,
   runtimeScenePresentation,
 } from '../state/runtimeScenePresentation';
 import {
@@ -1564,6 +1566,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
     [environmentValue, headlessState.snapshot?.runtime, sourceValue],
   );
   const facts = factsResult.available ? factsResult.facts : null;
+  const readyManifest = manifest.status === 'ready' ? manifest.data : null;
   const objects = facts?.logicalScene.snapshot?.objects ?? [];
   const draftPreviewObjects = objects.length === 0
     ? (program?.scene ?? []).map(programScenePreviewObject).filter(
@@ -1572,10 +1575,10 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
     : [];
   const programDraftPreview = objects.length === 0 && draftPreviewObjects.length > 0;
   const candidateRobot = useMemo(() => (
-    motionPreview === null || manifest.status !== 'ready'
+    motionPreview === null || readyManifest === null
       ? null
-      : candidateRobotPresentation(motionPreview, manifest.data)
-  ), [manifest, motionPreview]);
+      : candidateRobotPresentation(motionPreview, readyManifest)
+  ), [motionPreview, readyManifest]);
   const selectedSceneResourceId = selection?.kind === 'owner_object'
     ? (programDraftPreview ? null : selection.id)
     : selection?.kind === 'program_resource'
@@ -1610,11 +1613,28 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
       placement: { ...object.placement, pose_in_cell: livePose },
     };
   });
-  const runtimePresentation = runtimeScenePresentation(
+  const sceneRuntimePresentation = runtimeScenePresentation(
     facts?.sceneRuntime ?? null,
     facts?.logicalScene ?? null,
     sourceValue,
-    manifest.status === 'ready' ? manifest.data : null,
+    readyManifest,
+  );
+  const executionPresentation = executionRobotPresentation(
+    robotControl.state.status,
+    sourceValue,
+    readyManifest,
+  );
+  const runtimePresentation = executionPresentation !== null
+    && sceneRuntimePresentation.measuredRobot === null
+    ? { ...sceneRuntimePresentation, measuredRobot: executionPresentation }
+    : sceneRuntimePresentation;
+  const executionObservationPresentation = useMemo(
+    () => createExecutionRobotPresentationReader(
+      source,
+      sourceValue,
+      readyManifest,
+    ),
+    [readyManifest, source, sourceValue],
   );
   const frameAxes = useMemo(() => {
     const seen = new Set<string>();
@@ -1707,6 +1727,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
       onEditCandidateTcpPose={onEditCandidatePose}
       candidateRobot={candidateRobot}
       runtimePresentation={runtimePresentation}
+      executionObservationPresentation={executionObservationPresentation}
       sceneOwnerIdentity={facts === null ? undefined : {
         ownerEpoch: facts.sourceOwnerEpoch,
         generation: facts.sourceGeneration,

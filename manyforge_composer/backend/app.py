@@ -506,7 +506,10 @@ def create_app(
 
         @app.websocket("/ws/state")
         async def headless_state_websocket(websocket: WebSocket) -> None:
-            if state.authoring_admission is None:
+            if (
+                state.authoring_admission is None
+                or state.execution_observation_source is None
+            ):
                 await websocket.close(code=1008)
                 return
             await serve_headless_state(
@@ -514,7 +517,13 @@ def create_app(
                 state.headless_client,
                 admission=state.authoring_admission,
                 draft_session=state.draft_session,
+                observation_source=state.execution_observation_source,
             )
+
+        @app.get("/api/scene/viewer/status")
+        async def execution_observation_stream_status() -> dict:
+            assert state.execution_observation_source is not None
+            return state.execution_observation_source.status()
 
     async def unavailable_api(
         unavailable_path: str,

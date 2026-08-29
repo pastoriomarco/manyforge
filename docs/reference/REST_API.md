@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py structural-rest
-  Last regenerated: 2026-08-27 18:29:21 UTC
+  Last regenerated: 2026-08-29 12:56:12 UTC
   Generator source: scripts/regen-public-contracts.py:gen_rest_api
 -->
 
@@ -33,15 +33,26 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `GET` | `/api/cclc/routes/transactions/{transaction_id}` | headless-runtime-client | Cclc Route Status |
 | `POST` | `/api/cycle/recovery-actions` | headless-runtime-client | Cycle Recovery Action |
 | `GET` | `/api/cycle/status` | headless-runtime-client | Program Cycle Status |
+| `POST` | `/api/deployment/discard` | composer-deployment-draft | Discard |
+| `POST` | `/api/deployment/draft/mutations` | composer-deployment-draft | Mutate Draft |
+| `POST` | `/api/deployment/open-draft` | composer-deployment-draft | Open Draft |
+| `POST` | `/api/deployment/revert` | composer-deployment-draft | Revert |
+| `POST` | `/api/deployment/save` | composer-deployment-draft | Save Draft |
+| `POST` | `/api/deployment/save-as` | composer-deployment-draft | Save Draft As |
+| `GET` | `/api/deployment/workspace` | composer-deployment-draft | Read Workspace |
 | `GET` | `/api/execution/alarms` | headless-runtime-client | Alarms |
 | `POST` | `/api/execution/alarms/acknowledge-all` | headless-runtime-client | Acknowledge All |
 | `GET` | `/api/execution/alarms/metrics` | headless-runtime-client | Alarm Metrics |
 | `POST` | `/api/execution/alarms/{condition_id}/acknowledge` | headless-runtime-client | Acknowledge Alarm |
 | `POST` | `/api/execution/capability-command-previews` | headless-runtime-client | Execution Preview Capability Command |
+| `GET` | `/api/execution/control-state` | headless-runtime-client | Execution Control State |
+| `GET` | `/api/execution/diagnostics` | headless-runtime-client | Execution Diagnostics |
 | `POST` | `/api/execution/full-stop` | headless-runtime-client | Execution Full Stop |
 | `GET` | `/api/execution/history` | headless-runtime-client | History |
 | `GET` | `/api/execution/history/health` | headless-runtime-client | Historian Health |
 | `POST` | `/api/execution/history/reconcile` | headless-runtime-client | Historian Reconcile |
+| `GET` | `/api/execution/history/{sequence}` | headless-runtime-client | Historian Detail |
+| `GET` | `/api/execution/identity` | headless-runtime-client | Execution Identity |
 | `POST` | `/api/execution/motion-previews` | headless-runtime-client | Execution Preview Motion |
 | `POST` | `/api/execution/operations` | headless-runtime-client | Execution Submit |
 | `GET` | `/api/execution/operations/{operation_id}` | headless-runtime-client | Execution Read |
@@ -60,10 +71,12 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `GET` | `/api/execution/stop-fault` | headless-runtime-client | Execution Stop Fault |
 | `POST` | `/api/execution/stop-fault/recover` | headless-runtime-client | Execution Recover Stop Fault |
 | `POST` | `/api/execution/stops` | headless-runtime-client | Execution Stop |
+| `GET` | `/api/execution/targets` | headless-runtime-client | Execution Targets |
 | `GET` | `/api/files/browse` | files | Browse Filesystem |
 | `GET` | `/api/health` |  | Health |
 | `POST` | `/api/manager/apply` | headless-runtime-client | Manager Apply |
 | `GET` | `/api/manager/apply/status` | headless-runtime-client | Manager Apply Status |
+| `POST` | `/api/manager/deployment-candidates/preview` | headless-runtime-client | Manager Deployment Candidate Preview |
 | `GET` | `/api/manager/diff` | headless-runtime-client | Manager Diff |
 | `GET` | `/api/manager/graph` | headless-runtime-client | Manager Graph |
 | `GET` | `/api/manager/status` | headless-runtime-client | Manager Status |
@@ -112,6 +125,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `GET` | `/api/scene/urdf/manifest` | structural-urdf | Get Manifest |
 | `GET` | `/api/scene/urdf/models/{model_key}/collision-meshes/{link_name}/{collision_index}` | structural-urdf | Get Model Collision Mesh |
 | `GET` | `/api/scene/urdf/models/{model_key}/meshes/{link_name}/{visual_index}` | structural-urdf | Get Model Mesh |
+| `GET` | `/api/scene/viewer/status` |  | Execution Observation Stream Status |
 | `GET` | `/api/source-model` | headless-runtime-client | Source Model |
 | `DELETE` | `/api/{unavailable_path}` |  | Unavailable Api |
 | `GET` | `/api/{unavailable_path}` |  | Unavailable Api |

@@ -37,7 +37,7 @@ describe('runtime status presentation shell', () => {
     expect(html).toContain('Warn');
   });
 
-  it('includes Composer client failures in the single attention count', () => {
+  it('counts only actionable alarm and Composer attention', () => {
     const html = renderToStaticMarkup(createElement(RuntimeStatusOverlay, {
       status: {
         readiness: 'degraded',
@@ -56,6 +56,6 @@ describe('runtime status presentation shell', () => {
       clientErrorCount: 1,
     }));
 
-    expect(html).toContain('runtime-status-count">3');
+    expect(html).toContain('runtime-status-count">2');
   });
 });

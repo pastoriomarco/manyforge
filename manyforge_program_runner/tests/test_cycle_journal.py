@@ -440,7 +440,7 @@ def test_acquire_response_loss_is_durably_owner_unknown(tmp_path) -> None:
 
     restarted = ProgramCycleJournal(path, owner_epoch="runner.new")
     record = restarted.read()
-    assert record.state == "idle_after_reset"
+    assert record.state == "starting"
     assert record.owner_epoch == "runner.old"
     assert record.claim is None
     assert record.acquisition_pending == acquire_intent
@@ -473,6 +473,41 @@ def test_terminal_record_cannot_be_rewritten(tmp_path) -> None:
     journal.close()
 
 
+def test_liveness_reconciliation_intent_is_durable_and_replaceable(tmp_path) -> None:
+    path = tmp_path / "cycle.sqlite3"
+    journal = ProgramCycleJournal(path, owner_epoch="runner.local")
+    first_digest = "sha256:" + "a" * 64
+    second_digest = "sha256:" + "b" * 64
+
+    journal.prepare_liveness_reconciliation(
+        predecessor_owner_epoch="runner.kernel-old",
+        evidence_digest=first_digest,
+    )
+    prepared = journal.read()
+    assert prepared.owner_epoch == "runner.kernel-old"
+    assert prepared.reconciliation_required is True
+    assert prepared.reconciliation_evidence_digest == first_digest
+
+    journal.prepare_liveness_reconciliation(
+        predecessor_owner_epoch="runner.kernel-current",
+        evidence_digest=second_digest,
+    )
+    replaced = journal.read()
+    assert replaced.owner_epoch == "runner.kernel-current"
+    assert replaced.reconciliation_required is True
+    assert replaced.reconciliation_evidence_digest == second_digest
+
+    journal.reconcile_liveness(
+        owner_epoch="runner.successor",
+        evidence_digest=second_digest,
+    )
+    finalized = journal.read()
+    assert finalized.owner_epoch == "runner.successor"
+    assert finalized.reconciliation_required is False
+    assert finalized.reconciliation_evidence_digest == second_digest
+    journal.close()
+
+
 @pytest.mark.parametrize("checkpoint", ["claim_journaled", "starting", "running"])
 def test_each_exact_post_acquire_crash_checkpoint_recovers_terminal(
     tmp_path, checkpoint: str
@@ -495,19 +530,17 @@ def test_each_exact_post_acquire_crash_checkpoint_recovers_terminal(
         provisional_run_id="program-cycle.1",
         claim=claim,
     )
-    if checkpoint != "claim_journaled":
+    if checkpoint == "running":
         journal.transition(
             expected_generation=1,
-            expected_states=("idle_after_reset",),
+            expected_states=("starting",),
             state=checkpoint,
         )
     journal.close()
 
     recovered = ProgramCycleJournal(path, owner_epoch="runner.stable")
     record = recovered.read()
-    assert record.state == (
-        "idle_after_reset" if checkpoint == "claim_journaled" else checkpoint
-    )
+    assert record.state == ("running" if checkpoint == "running" else "starting")
     assert record.claim == claim
     assert record.owner_epoch == "runner.stable"
     assert record.terminal_reference is None

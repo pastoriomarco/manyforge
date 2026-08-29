@@ -117,32 +117,27 @@ def test_status_command_reads_the_current_scenario_without_package_mutation(
     assert "another-native-scenario" in capsys.readouterr().out
 
 
-def test_existing_package_cache_does_not_snapshot_backend_binaries(
+def test_package_cache_contains_scenario_content_only(
     monkeypatch: Any, tmp_path: Path
 ) -> None:
     scenario_root = tmp_path / "maintained-scenario-package"
     package_root = scenario_root / "retained-package"
-    package_root.mkdir(parents=True)
-    native_host = scenario_root / "manyforge_native_execution_host"
-    candidate_worker = scenario_root / "manyforge_roboplan_candidate_worker"
-    for path, content in (
-        (native_host, b"native-host"),
-        (candidate_worker, b"candidate-worker"),
-    ):
-        path.write_bytes(content)
-        path.chmod(0o755)
-
+    qualified_root = tmp_path / "qualified"
+    qualified_package = qualified_root / "maintained-package"
+    qualified_package.mkdir(parents=True)
+    (qualified_package / "scenario.json").write_text("{}", encoding="utf-8")
     monkeypatch.setattr(dev_workbench, "SCENARIO_ROOT", scenario_root)
     monkeypatch.setattr(dev_workbench, "PACKAGE_ROOT", package_root)
-    monkeypatch.setattr(dev_workbench, "NATIVE_EXECUTION_HOST", native_host)
-    monkeypatch.setattr(
-        dev_workbench, "NATIVE_CANDIDATE_WORKER", candidate_worker
-    )
+    monkeypatch.setattr(dev_workbench, "CACHE_ROOT", tmp_path)
+    monkeypatch.setattr(dev_workbench, "_qualified_root", lambda: qualified_root)
 
     dev_workbench._import_package()
 
+    assert (package_root / "scenario.json").read_text(encoding="utf-8") == "{}"
     assert not (scenario_root / "manyforge_manager_daemon").exists()
     assert not (scenario_root / "headless-python").exists()
+    assert not (scenario_root / "manyforge_native_execution_host").exists()
+    assert not (scenario_root / "manyforge_roboplan_candidate_worker").exists()
 
 
 def test_backend_build_uses_current_source_and_only_production_targets(
@@ -185,6 +180,47 @@ def test_backend_build_uses_current_source_and_only_production_targets(
         "0",
     )
     assert "--parallel" in observed[1]
+    assert observed[1][observed[1].index("--parallel") + 1] == "3"
+
+
+def test_native_build_uses_current_source_and_only_runtime_targets(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    build = tmp_path / "roboplan"
+    native_host = build / "manyforge_native_execution_host"
+    candidate_worker = build / "manyforge_roboplan_candidate_worker"
+    observed: list[tuple[str, ...]] = []
+
+    def run(command: tuple[str, ...], **_kwargs: Any) -> None:
+        observed.append(command)
+        if command[0] == "cmake" and command[1] == "--build":
+            build.mkdir(parents=True, exist_ok=True)
+            for path in (native_host, candidate_worker):
+                path.write_bytes(b"current-native")
+                path.chmod(0o755)
+
+    monkeypatch.setattr(dev_workbench, "ROBOPLAN_BUILD", build)
+    monkeypatch.setattr(dev_workbench, "NATIVE_EXECUTION_HOST", native_host)
+    monkeypatch.setattr(
+        dev_workbench, "NATIVE_CANDIDATE_WORKER", candidate_worker
+    )
+    monkeypatch.setattr(dev_workbench, "_run", run)
+    monkeypatch.setenv("MANYFORGE_DEV_BUILD_JOBS", "3")
+
+    assert dev_workbench._ensure_current_native_backend() == (
+        native_host,
+        candidate_worker,
+    )
+
+    assert len(observed) == 2
+    assert "-DBUILD_TESTING=OFF" in observed[0]
+    assert observed[1][-5:] == (
+        "manyforge_native_execution_host",
+        "manyforge_roboplan_candidate_worker",
+        "--",
+        "-k",
+        "0",
+    )
     assert observed[1][observed[1].index("--parallel") + 1] == "3"
 
 
@@ -388,6 +424,48 @@ def test_simulated_scenario_start_converges_only_missing_lifecycle_and_routes() 
     )
 
 
+class _ControlManagementClient(_LifecycleClient):
+    def __init__(self, mode: str) -> None:
+        super().__init__()
+        self.mode = mode
+
+    def execution_identity(self) -> dict[str, object]:
+        return {"identity": {"control_management_mode": self.mode}}
+
+
+def test_direct_control_scenario_does_not_require_cclc() -> None:
+    client = _ControlManagementClient("direct")
+
+    mode = dev_workbench._converge_control_management(
+        client,  # type: ignore[arg-type]
+        ["component.arm"],
+        scenario_id="scenario.1",
+        processes=[],
+    )
+
+    assert mode == "direct"
+    assert client.lifecycle_requests == []
+    assert client.route_requests == []
+
+
+def test_lifecycle_control_scenario_converges_cclc() -> None:
+    client = _ControlManagementClient("component_lifecycle")
+
+    mode = dev_workbench._converge_control_management(
+        client,  # type: ignore[arg-type]
+        ["component.arm"],
+        scenario_id="scenario.1",
+        processes=[],
+    )
+
+    assert mode == "component_lifecycle"
+    assert [row["intent"] for row in client.lifecycle_requests] == [
+        "prepare",
+        "enable",
+    ]
+    assert len(client.route_requests) == 1
+
+
 def test_stale_socket_cleanup_removes_only_the_named_socket(tmp_path: Path) -> None:
     socket_path = tmp_path / "manager-command.sock"
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -452,8 +530,11 @@ def test_cleanup_uses_bounded_reverse_owner_order(monkeypatch: Any) -> None:
             )
         ),
     )
+    monkeypatch.setattr(workbench, "_stop_manager", lambda: observed.append("Manager"))
     monkeypatch.setattr(
-        workbench, "_shutdown_manager", lambda: observed.append("Manager")
+        workbench,
+        "_wait_for_program_runner_manager_expiry",
+        lambda: observed.append("Program runner fenced"),
     )
 
     workbench.close()
@@ -461,7 +542,8 @@ def test_cleanup_uses_bounded_reverse_owner_order(monkeypatch: Any) -> None:
     assert observed == [
         "Vite HMR",
         "Composer backend",
-        "Program runner",
-        "Manager",
         "Headless API",
+        "Manager",
+        "Program runner fenced",
+        "Program runner",
     ]

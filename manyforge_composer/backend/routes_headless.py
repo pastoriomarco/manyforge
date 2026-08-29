@@ -455,6 +455,28 @@ def create_headless_router(
             )
         )
 
+    @router.post("/api/program/runs/{program_run_id}/motion-stop")
+    def program_run_motion_stop(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        body: ProgramRunStopRequest,
+    ) -> dict[str, Any]:
+        if body.program_run_id != program_run_id:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "program_run_path_invalid",
+                    "message": (
+                        "Program-run identity in path and body must match"
+                    ),
+                },
+            )
+        return _call(
+            lambda: client.program_run_motion_stop(
+                program_run_id,
+                body.model_dump(mode="json"),
+            )
+        )
+
     @router.get("/api/assistant/modes")
     def assistant_modes() -> dict[str, Any]:
         return _call(client.assistant_modes)
@@ -491,9 +513,29 @@ def create_headless_router(
             lambda: client.manager_apply_status(apply_id, apply_generation)
         )
 
-    @router.get("/api/execution/status")
+    @router.get("/api/execution/diagnostics")
+    def execution_diagnostics() -> dict[str, Any]:
+        return _call(client.execution_diagnostics)
+
+    @router.get("/api/execution/status", deprecated=True)
     def execution_status() -> dict[str, Any]:
         return _call(client.execution_status)
+
+    @router.get("/api/execution/identity")
+    def execution_identity() -> dict[str, Any]:
+        return _call(client.execution_identity)
+
+    @router.get("/api/execution/targets")
+    def execution_targets() -> dict[str, Any]:
+        return _call(client.execution_targets)
+
+    @router.get("/api/execution/control-state")
+    def execution_control_state() -> dict[str, Any]:
+        return _call(client.execution_control_state)
+
+    @router.get("/api/execution/observation")
+    def execution_observation() -> dict[str, Any]:
+        return _call(client.execution_observation)
 
     @router.post("/api/execution/operations")
     def execution_submit(body: OperationIntentRequest) -> dict[str, Any]:

@@ -9,7 +9,7 @@ import {
   attentionAlarmsNewestFirst,
   runtimeStatusView,
 } from './components/HeadlessRuntimeSurfaces';
-import { RuntimeAttentionAlert } from './components/RuntimeAttentionAlert';
+import { RuntimeAttentionAutoOpen } from './components/RuntimeAttentionAutoOpen';
 import { ProgramDocumentControls } from './components/ProgramDocumentControls';
 import { OverlayPanel } from './components/OverlayPanel';
 import { PaneDivider } from './components/PaneDivider';
@@ -74,6 +74,7 @@ export default function App() {
     typeof window === 'undefined' ? 360 : Math.max(160, Math.floor((window.innerHeight - 52) / 2))
   ));
   const [globalPanel, setGlobalPanel] = useState<'runtime' | 'assistant' | null>(null);
+  const [runtimeAttentionRequest, setRuntimeAttentionRequest] = useState<string | null>(null);
   const [programInvalidEdit, setProgramInvalidEdit] = useState(false);
   const [programSettingsRequest, setProgramSettingsRequest] = useState(0);
   const [programRequirementCreated, setProgramRequirementCreated] = useState<{
@@ -123,7 +124,7 @@ export default function App() {
     headlessSnapshot,
     programController.state.workspace,
   );
-  const robotControl = useRobotControl(headlessEnabled);
+  const robotControl = useRobotControl(headlessEnabled, programRuntime.active);
   const operationalErrors = useOperationalErrors();
   useOperationalErrorMirror({
     source: 'composer.program_workspace',
@@ -181,15 +182,15 @@ export default function App() {
   const runtimeAttentionItems = useMemo(() => [
     ...attentionAlarmsNewestFirst(headlessSnapshot?.alarms.alarms ?? []).map((alarm) => ({
       identity: `backend:${alarm.activationId}`,
-      title: alarm.title,
-      source: 'backend' as const,
     })),
     ...clientErrors.map((error) => ({
       identity: `composer:${error.id}`,
-      title: error.title,
-      source: 'composer' as const,
     })),
   ], [clientErrors, headlessSnapshot]);
+  const openRuntimeAttention = useCallback((identity: string) => {
+    setRuntimeAttentionRequest(identity);
+    setGlobalPanel('runtime');
+  }, []);
   const runtimeView = useMemo(
     () => headlessSnapshot === null ? null : runtimeStatusView(
       headlessSnapshot.runtime,
@@ -544,10 +545,9 @@ export default function App() {
           </div>
         </aside>
       </div>
-      <RuntimeAttentionAlert
-        enabled={headlessSnapshot?.complete === true}
+      <RuntimeAttentionAutoOpen
         items={runtimeAttentionItems}
-        onOpen={() => setGlobalPanel('runtime')}
+        onOpen={openRuntimeAttention}
       />
       <OverlayPanel
         open={globalPanel === 'runtime'}
@@ -563,6 +563,7 @@ export default function App() {
           headlessStateSource={headlessStateSource}
           clientErrors={clientErrors}
           onAcknowledgeClientError={operationalErrors.dismiss}
+          attentionRequest={runtimeAttentionRequest}
         />
       </OverlayPanel>
       <OverlayPanel

@@ -66,6 +66,9 @@ class RecordingTransport:
     def execution_status(self) -> dict[str, Any]:
         return self.client.execution_status()
 
+    def execution_identity(self) -> dict[str, Any]:
+        return self.client.execution_identity()
+
     def execute(self, body: Mapping[str, Any]) -> dict[str, Any]:
         self.last_submission = copy.deepcopy(dict(body))
         return self.client.execute(body)
@@ -1126,6 +1129,10 @@ def test_reconciliation_gate_does_not_block_ordinary_accept_or_exact_read(
         assert not reconciliation_gate.exists()
 
         status = headless.execution_status()
+        identity = headless.execution_identity()
+        targets = headless.execution_targets()
+        control_state = headless.execution_control_state()
+        observation = headless.execution_observation()
         accepted = _runner_submission(
             runner,
             request_id="accept-while-reconciliation-gated",
@@ -1136,6 +1143,56 @@ def test_reconciliation_gate_does_not_block_ordinary_accept_or_exact_read(
         observed = runner.operation(operation_id)
 
         assert status["ok"] is True
+        assert identity["command"] == "identity"
+        assert identity["identity"]["schema_version"] == (
+            "manyforge.execution_identity.v1"
+        )
+        assert identity["identity"]["control_management_mode"] == "direct"
+        assert targets["command"] == "targets"
+        assert targets["targets"]["schema_version"] == (
+            "manyforge.execution_targets.v1"
+        )
+        assert control_state["command"] == "control_state"
+        assert control_state["control_state"]["schema_version"] == (
+            "manyforge.execution_control_state.v1"
+        )
+        assert targets["identity"] == control_state["identity"] == identity["identity"]
+        assert observation["ok"] is True
+        assert observation["command"] == "observation"
+        assert observation["observation"]["schema_version"] == (
+            "manyforge.execution_observation.v1"
+        )
+        assert observation["observation"]["source_joint_names"] == [
+            "joint1",
+            "joint2",
+            "joint3",
+            "joint4",
+            "joint5",
+            "joint6",
+        ]
+        assert len(observation["observation"]["positions_rad"]) == 6
+        encoded_sizes = {
+            name: len(
+                json.dumps(
+                    projection,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            )
+            for name, projection in {
+                "identity": identity,
+                "targets": targets,
+                "control_state": control_state,
+                "observation": observation,
+                "diagnostics": status,
+            }.items()
+        }
+        assert encoded_sizes["identity"] < encoded_sizes["diagnostics"]
+        assert encoded_sizes["targets"] < encoded_sizes["diagnostics"]
+        assert encoded_sizes["control_state"] < encoded_sizes["diagnostics"]
+        assert encoded_sizes["observation"] < 4 * 1024
+        assert encoded_sizes["observation"] < encoded_sizes["control_state"]
         assert observed["operation"]["operation_id"] == operation_id
         assert observed["operation"]["state"] in {"planning", "executing"}
         assert not reconciliation_gate.exists()

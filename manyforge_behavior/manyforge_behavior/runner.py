@@ -20,8 +20,8 @@ class OrchestratorRunner:
     def _selected_status(
         self, *, target_role_field: str, target_role_id: str
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        status_envelope = self._kernel.status()
-        status = status_envelope.get("status")
+        status_envelope = self._kernel.identity()
+        status = status_envelope.get("identity")
         if not isinstance(status, dict):
             raise KernelClientResponseError(
                 "headless execution status has no selected-owner projection"
@@ -272,7 +272,7 @@ class OrchestratorRunner:
         request_id: str,
         correlation_id: str | None,
     ) -> dict[str, str | None]:
-        status = self._kernel.status().get("status")
+        status = self._kernel.identity().get("identity")
         owner_epoch = status.get("owner_epoch") if isinstance(status, dict) else None
         if not isinstance(owner_epoch, str) or not owner_epoch:
             raise KernelClientResponseError(

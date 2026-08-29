@@ -9,6 +9,7 @@
 #include <manyforge_core/types/kernel_event.hpp>
 #include <manyforge_core/types/recovery.hpp>
 #include <manyforge_core/types/runtime_scale.hpp>
+#include <manyforge_core/types/stop_certificate.hpp>
 #include <optional>
 #include <string>
 
@@ -22,6 +23,18 @@ class IResolvedParticipantExecutionEngine {
   virtual ~IResolvedParticipantExecutionEngine() = default;
 
   virtual Result<std::uint64_t> execute(const ExecuteRequestDTO& request) = 0;
+  /// Commit the local terminal/recovery view of one exact motion execution
+  /// after the addressed owner has already stopped its exact controller goal.
+  /// This process-local handoff MUST NOT issue another backend Stop command.
+  virtual Result<void> adopt_certified_motion_stop(
+      std::uint64_t execution_id, const StopCertificateRefDTO& certificate) {
+    (void)execution_id;
+    (void)certificate;
+    return Result<void>::Err(
+        ErrorDTO{"certified_motion_stop_adoption_unavailable",
+                 "participant execution engine cannot adopt addressed Stop evidence",
+                 {{"reason", "certified_motion_stop_adoption_unavailable"}}});
+  }
   virtual PauseResultDTO pause() = 0;
   virtual ResumeResultDTO resume(std::optional<std::uint64_t> expected_epoch = std::nullopt) = 0;
   virtual ResetResultDTO reset(std::optional<std::uint64_t> expected_epoch = std::nullopt) = 0;

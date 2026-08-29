@@ -43,11 +43,12 @@ class _Transport:
         self.submissions: list[Mapping[str, Any]] = []
         self.controls: list[tuple[str, str, Mapping[str, Any]]] = []
         self.operations: dict[str, dict[str, Any]] = {}
+        self.resident: dict[str, bool] = {}
 
-    def execution_status(self) -> dict[str, Any]:
+    def execution_identity(self) -> dict[str, Any]:
         return {
             "ok": True,
-            "status": {
+            "identity": {
                 "owner_epoch": "kernel.epoch.7",
                 # The native owner may expose a direct-control status Program;
                 # production Program requests must use their captured context.
@@ -75,6 +76,7 @@ class _Transport:
             "active_stop_generation": None,
             "participants": [],
         }
+        self.resident[operation_id] = True
         return {
             "ok": True,
             "accepted": {
@@ -84,7 +86,11 @@ class _Transport:
         }
 
     def operation(self, operation_id: str) -> dict[str, Any]:
-        return {"ok": True, "operation": deepcopy(self.operations[operation_id])}
+        return {
+            "ok": True,
+            "operation": deepcopy(self.operations[operation_id]),
+            "resident": self.resident.get(operation_id, True),
+        }
 
     def _control(
         self, kind: str, operation_id: str, body: Mapping[str, Any]
@@ -107,7 +113,9 @@ class _Transport:
         return self._control("resume", operation_id, body)
 
     def reset_operation(self, operation_id: str, body: Mapping[str, Any]):
-        return self._control("reset", operation_id, body)
+        result = self._control("reset", operation_id, body)
+        self.resident[operation_id] = False
+        return result
 
     def acknowledge_completed_operation(
         self, operation_id: str, body: Mapping[str, Any]
@@ -363,6 +371,35 @@ def test_program_scope_stop_is_exact_and_not_repeated() -> None:
     ]
 
 
+def test_program_scope_reset_releases_terminal_residency_once() -> None:
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    started = port.operations.start(
+        "motion.move_to_pose", _identity(), _motion_inputs()
+    )
+    transport.operations[started.task_id].update(
+        {"state": "stopped", "operation_revision": 4}
+    )
+
+    # Program terminalization releases its captured context but preserves the
+    # exact operation identity needed by the later explicit Program Reset.
+    port.unbind("program-run.1")
+    first = port.scope.reset("program-run.1")
+    second = port.scope.reset("program-run.1")
+
+    assert first.state is ProgramRunScopeState.SETTLED
+    assert second == first
+    reset_calls = [item for item in transport.controls if item[0] == "reset"]
+    assert len(reset_calls) == 1
+    kind, operation_id, body = reset_calls[0]
+    assert (kind, operation_id) == ("reset", started.task_id)
+    assert body["expected_operation_revision"] == 4
+    assert body["request_context"]["request_owner_epoch"] == "kernel.epoch.7"
+    assert body["request_context"]["correlation_id"] == "program-run.1"
+    assert transport.resident[started.task_id] is False
+
+
 def test_failed_stop_submission_can_be_retried() -> None:
     class _OneStopFailureTransport(_Transport):
         def __init__(self) -> None:
@@ -417,9 +454,9 @@ def test_gripper_schema_comes_from_captured_program_binding() -> None:
 
 def test_stale_native_deployment_fails_before_dispatch() -> None:
     class _StaleTransport(_Transport):
-        def execution_status(self) -> dict[str, Any]:
-            result = super().execution_status()
-            result["status"]["graph_revision"] = _DIGEST_F
+        def execution_identity(self) -> dict[str, Any]:
+            result = super().execution_identity()
+            result["identity"]["graph_revision"] = _DIGEST_F
             return result
 
     transport = _StaleTransport()

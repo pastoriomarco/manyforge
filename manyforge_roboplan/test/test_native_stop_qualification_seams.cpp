@@ -107,6 +107,66 @@ private:
   const core::OperationId operation_id("operation.direct");
   const core::OperationRevision operation_revision(1U);
   const core::OperationParticipantId participant_id("participant.direct");
+  const auto binding = fixture::make_binding();
+  const auto &value = binding.value();
+  const auto &path = *value.control_path;
+  std::vector<core::ResourceId> resources;
+  resources.reserve(value.resources.size());
+  for (const auto &resource : value.resources) {
+    resources.push_back(resource.resource_id);
+  }
+  std::sort(resources.begin(), resources.end());
+  core::ResolvedStopRuntimeTargetDTO target{
+      path.provider_instance_id,
+      path.provider_manifest_id,
+      path.provider_manifest_revision,
+      path.provider_runtime_unit_id,
+      core::ProductId("product.native"),
+      core::ProductContractId("product.contract.native"),
+      core::ProductContractRevision("product-contract-revision"),
+      core::ContentDigest("runtime-target-digest"),
+      path.provider_runtime_epoch,
+      path.provider_runtime_epoch,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt};
+  core::ResolvedStopEscalationStageDTO resolved_command{
+      0U,
+      core::StopEscalationStageId("stage.cancel"),
+      core::StopEscalationStageKind::kNominal,
+      core::ContainmentGranularity::kResource,
+      core::StopContainmentCommandDTO{
+          core::StopBudgetPhaseId("command"),
+          core::StopContainmentCommandKind::kControllerGoalCancel, std::nullopt,
+          std::nullopt},
+      std::nullopt,
+      core::ResolvedStopCommandQualificationDTO{},
+      target,
+      core::ResolvedStopResourceContainmentScopeDTO{path.activation_set_id,
+                                                    resources},
+      core::StopEvidenceConjunction::kAllOf,
+      {core::ResolvedStopEvidenceRequirementDTO{
+          core::StopEvidenceRequirementDTO{
+              core::StopEvidenceItemId("goal.terminal"),
+              core::StopBudgetPhaseId("terminal"),
+              core::StopEvidenceRequirementKind::kControllerGoalTerminal,
+              std::nullopt, std::nullopt,
+              core::StopEvidenceSourceRequirementDTO{
+                  core::StopEvidenceSourceKind::kControllerGoalStatus,
+                  100'000'000,
+                  std::nullopt,
+                  {}},
+              core::StopEvidenceObservationDTO{
+                  core::StopEvidenceObservationKind::kPostCommandSample,
+                  std::nullopt}},
+          core::ResolvedStopEvidenceSourceDTO{
+              core::StopEvidenceSourceKind::kControllerGoalStatus, target,
+              std::nullopt, std::nullopt, std::nullopt}}}};
   return core::ResolvedParticipantStopStageDTO{
       core::StopId("stop.direct"),
       core::StopGeneration(1U),
@@ -115,42 +175,60 @@ private:
       participant_id,
       core::ControllerGoalId("goal.direct"),
       core::ControllerGoalGeneration(1U),
-      core::ControllableComponentId("robot.1"),
-      core::CommandTargetId("arm.target"),
-      core::CapabilityId("execution.trajectory.execute"),
-      core::ControlDomainId("domain.arm"),
-      core::ControlDomainRevision("domain-revision"),
-      core::ControlBindingId("binding.arm"),
-      core::ControlBindingRevision("binding-revision"),
-      core::ActiveControlConfigurationId("active.native"),
-      core::ActiveControlConfigurationGeneration(1U),
-      core::ControllerTopologyId("topology.native"),
-      core::TopologyRevision("topology-revision"),
-      core::ControlRouteId("route.native"),
+      value.controllable_component_id,
+      value.command_target_id,
+      value.capability_id,
+      path.control_domain_id,
+      path.control_domain_revision,
+      path.control_binding_id,
+      path.control_binding_revision,
+      path.active_control_configuration_id,
+      path.active_control_configuration_generation,
+      path.controller_topology_id,
+      path.topology_revision,
+      path.control_route_id,
       std::nullopt,
       std::nullopt,
-      core::RuntimeEpoch("runtime-epoch.1"),
-      {},
+      path.provider_runtime_epoch,
+      resources,
       core::ContainmentGranularity::kResource,
-      core::StopEvidencePolicyId("stop.native"),
-      core::StopEvidencePolicyRevision("stop-revision"),
+      path.stop_evidence_policy_id,
+      path.stop_evidence_policy_revision,
       core::PreparedParticipantStopPlanDTO{
           core::ContentDigest("plan.digest"),
           core::ResolvedStopBasePlanId("base.plan"),
           operation_id,
           operation_revision,
           participant_id,
-          core::ProgramId("program.direct"),
-          core::ProgramRevision("program.revision"),
-          core::ProgramBindingId("program.binding"),
+          value.program_id,
+          value.program_revision,
+          value.program_binding_id,
           core::ProgramRunId("program.run"),
           std::nullopt,
           core::ParticipantStopProfilePurposeDTO::kOrdinary,
           std::nullopt,
-          core::StopDeadlineBudgetDTO{1'000'000'000, 1, {}},
-          {}},
+          core::StopDeadlineBudgetDTO{
+              1'000'000'000,
+              100'000'000,
+              {{core::StopBudgetPhaseId("command"), 500'000'000},
+               {core::StopBudgetPhaseId("terminal"), 900'000'000}}},
+          {core::PreparedStopStageCommandDTO{std::move(resolved_command),
+                                             std::nullopt, std::nullopt}}},
       0U,
       core::ContentDigest("scope.digest")};
+}
+
+[[nodiscard]] core::RemainingStopBudgetDTO
+remaining_budget(const core::ResolvedParticipantStopStageDTO &stage) {
+  core::RemainingStopBudgetDTO budget{
+      stage.stop_id,
+      stage.stop_generation,
+      stage.participant_stop_plan.deadline_budget.outer_duration_ns,
+      {}};
+  for (const auto &phase : stage.participant_stop_plan.deadline_budget.phases) {
+    budget.phases.push_back({phase.phase_id, phase.deadline_offset_ns});
+  }
+  return budget;
 }
 
 TEST(NativeStopQualificationSeamTest,
@@ -217,6 +295,50 @@ TEST(NativeStopQualificationSeamTest,
   EXPECT_EQ(result.error->code, "stop_stage_superseded_before_dispatch");
   EXPECT_EQ(backend->get_execution_snapshot().state,
             core::ExecutionState::kIdle);
+}
+
+TEST(NativeStopQualificationSeamTest,
+     ExactPreparedGoalCancelStopsOnlyItsActiveNativeExecution) {
+  WallClock clock;
+  auto binding = fixture::make_binding();
+  auto channel = std::make_shared<fixture::StateChannel>(binding);
+  RecordingProbe probe;
+  auto backend = detail::NativeStopQualificationAccess::construct(
+      binding, channel, clock, RoboPlanExecutionBackendConfig{}, probe);
+  const auto stage = direct_stage_fixture();
+  auto execution =
+      backend->execute_trajectory(fixture::trajectory(binding, 5.0));
+  ASSERT_TRUE(wait_until_executing(*backend));
+  detail::NativeStopQualificationAccess::install_prepared_goal_membership(
+      *backend, stage, core::ContentDigest("prepared.direct"), execution);
+
+  const auto result = backend->TranslateStopStage(
+      stage, remaining_budget(stage), std::stop_token{});
+
+  EXPECT_EQ(result.attempt_disposition,
+            core::StopStageAttemptDispositionDTO::kDispatched);
+  EXPECT_EQ(result.outcome, core::ParticipantStopStageOutcomeDTO::kSucceeded);
+  ASSERT_EQ(result.evidence_items.size(), 1U);
+  EXPECT_EQ(result.evidence_items.front().state,
+            core::StopEvidenceItemStateDTO::kSatisfied);
+  ASSERT_TRUE(result.controller_acknowledgement_sequence.has_value());
+  EXPECT_EQ(backend->get_execution_snapshot().state,
+            core::ExecutionState::kStopped);
+
+  auto later_execution =
+      backend->execute_trajectory(fixture::trajectory(binding, 5.0));
+  ASSERT_TRUE(wait_until_executing(*backend));
+  const auto crossed = backend->TranslateStopStage(
+      stage, remaining_budget(stage), std::stop_token{});
+  EXPECT_EQ(crossed.attempt_disposition,
+            core::StopStageAttemptDispositionDTO::kNotDispatched);
+  EXPECT_EQ(crossed.outcome, core::ParticipantStopStageOutcomeDTO::kFailed);
+  ASSERT_TRUE(crossed.error.has_value());
+  EXPECT_EQ(crossed.error->details.at("reason"), "prepared_goal_not_active");
+  EXPECT_EQ(backend->get_execution_snapshot().state,
+            core::ExecutionState::kExecuting);
+  EXPECT_TRUE(backend->stop().accepted);
+  EXPECT_TRUE(later_execution.wait_for_completion(2'000'000'000LL));
 }
 
 TEST(NativeStopQualificationSeamTest,

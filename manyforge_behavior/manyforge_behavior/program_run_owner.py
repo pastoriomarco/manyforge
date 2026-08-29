@@ -40,10 +40,12 @@ from manyforge_behavior.program_runtime import (
 from manyforge_behavior.orchestration_values import ProgramValueError
 
 
-PROGRAM_RUN_STATUS_API: Final = "manyforge.program_run_status.v1"
+PROGRAM_RUN_STATUS_API: Final = "manyforge.program_run_status.v2"
 SCENARIO_PROGRAM_SELECTION_API: Final = "manyforge.scenario_program_selection.v2"
 APPLIED_PROGRAM_SELECTION_API: Final = "manyforge.applied_program_selection.v1"
 _MAX_RETAINED_RUNS: Final = 4_096
+_MAX_NODE_STATUSES: Final = 100_000
+_NODE_STATUSES: Final = frozenset({"idle", "running", "success", "failure"})
 
 
 class ProgramRunOwnerError(RuntimeError):
@@ -223,6 +225,8 @@ class ProgramRunSnapshot:
     state: ProgramRunState
     capture: ProgramRunCapture
     tree_status: str
+    node_status_revision: int
+    node_statuses: Mapping[str, str]
     active_operation_count: int | None
     reason_code: str | None
     message: str
@@ -243,6 +247,22 @@ class ProgramRunSnapshot:
             "failure",
         }:
             raise ValueError("tree_status is invalid")
+        if (
+            type(self.node_status_revision) is not int
+            or not 1 <= self.node_status_revision
+        ):
+            raise ValueError("node_status_revision must be positive")
+        if (
+            not isinstance(self.node_statuses, Mapping)
+            or len(self.node_statuses) > _MAX_NODE_STATUSES
+        ):
+            raise ValueError("node_statuses is outside its bound")
+        statuses: dict[str, str] = {}
+        for instance_id, status in self.node_statuses.items():
+            statuses[_text(instance_id, field="node status instance ID")] = status
+            if status not in _NODE_STATUSES:
+                raise ValueError("node_statuses contains an invalid status")
+        object.__setattr__(self, "node_statuses", MappingProxyType(statuses))
         if self.active_operation_count is not None and (
             type(self.active_operation_count) is not int
             or not 0 <= self.active_operation_count <= 4_096
@@ -265,6 +285,8 @@ class ProgramRunSnapshot:
             "state": self.state.value,
             "capture": self.capture.to_dict(),
             "tree_status": self.tree_status,
+            "node_status_revision": self.node_status_revision,
+            "node_statuses": dict(self.node_statuses),
             "active_operation_count": self.active_operation_count,
             "reason_code": self.reason_code,
             "message": self.message,
@@ -277,6 +299,8 @@ class _RunEntry:
     state: ProgramRunState = ProgramRunState.RUNNING
     revision: int = 1
     tree_status: str = "invalid"
+    node_status_revision: int = 1
+    node_statuses: Mapping[str, str] = field(default_factory=dict)
     active_operation_count: int | None = 0
     reason_code: str | None = None
     message: str = ""
@@ -337,6 +361,8 @@ class ProgramRunOwner:
             state=entry.state,
             capture=entry.run.capture,
             tree_status=entry.tree_status,
+            node_status_revision=entry.node_status_revision,
+            node_statuses=entry.node_statuses,
             active_operation_count=entry.active_operation_count,
             reason_code=entry.reason_code,
             message=entry.message,
@@ -487,7 +513,7 @@ class ProgramRunOwner:
                     ports=self._ports,
                     program_parameter_values=admission.program_parameter_values,
                 )
-                entry = _RunEntry(run=run)
+                entry = _RunEntry(run=run, node_statuses=run.node_statuses)
                 with self._lock:
                     if program_run_id in self._runs:
                         raise ProgramRunOwnerError(
@@ -902,8 +928,12 @@ class ProgramRunOwner:
                     # Kernel Stop has already had its independent priority path.
                     # Tree invalidation only prevents later orchestration effects.
                     run.stop()
+                    stopped_node_statuses = run.node_statuses
                 except Exception as exc:
                     scope_errors.append(exc)
+                    stopped_node_statuses = None
+            else:
+                stopped_node_statuses = None
             scope_fields: tuple[int | None, bool, str | None] | None = None
             if scope_snapshot is not None and not scope_errors:
                 try:
@@ -917,6 +947,16 @@ class ProgramRunOwner:
             finalize = False
             with self._lock:
                 entry = self._entry(program_run_id)
+                if (
+                    state_after_stop is ProgramRunState.STOPPED
+                    and stopped_node_statuses is not None
+                ):
+                    if entry.tree_status != "invalid":
+                        entry.tree_status = "invalid"
+                        entry.revision += 1
+                    if entry.node_statuses != stopped_node_statuses:
+                        entry.node_statuses = stopped_node_statuses
+                        entry.node_status_revision += 1
                 if scope_errors:
                     entry.active_operation_count = None
                     entry.reason_code = "program_run_scope_unknown"
@@ -961,6 +1001,84 @@ class ProgramRunOwner:
             reason_code=None,
             message="",
         )
+
+    def stop_motion(
+        self,
+        program_run_id: str,
+        *,
+        reason: str | None = None,
+    ) -> ProgramRunSnapshot:
+        """Stop current addressed work without terminating its Program run.
+
+        The Kernel scope already owns the exact operation identities.  Keeping
+        this command here avoids exposing those identities to the browser and
+        lets the normal tree tick turn the interrupted node into the authored
+        operator-Stop intervention.
+        """
+
+        if reason is not None:
+            _text(reason, field="reason", maximum_bytes=4_096)
+        with self._lock:
+            entry = self._entry(program_run_id)
+            transition_lock = entry.transition_lock
+        with transition_lock:
+            with self._lock:
+                entry = self._entry(program_run_id)
+                if entry.state is not ProgramRunState.RUNNING:
+                    raise ProgramRunOwnerError(
+                        "motion Stop requires a running Program"
+                    )
+            try:
+                scope_snapshot = self._scope.request_stop(program_run_id, reason)
+                active_count, _settled, scope_reason = self._scope_fields(
+                    scope_snapshot,
+                    program_run_id,
+                )
+            except Exception as exc:
+                raise ProgramRunOwnerOutcomeUnknownError(
+                    str(exc) or "Kernel motion Stop outcome is unknown"
+                ) from exc
+            if scope_reason is not None:
+                raise ProgramRunOwnerOutcomeUnknownError(
+                    "Kernel motion Stop outcome is unknown: " + scope_reason
+                )
+            with self._lock:
+                entry = self._entry(program_run_id)
+                if entry.state is not ProgramRunState.RUNNING:
+                    raise ProgramRunOwnerOutcomeUnknownError(
+                        "Program state changed while motion Stop was applied"
+                    )
+                entry.active_operation_count = active_count
+                entry.revision += 1
+                return self._snapshot(entry)
+
+    def reset_effects(self, program_run_id: str) -> ProgramRunSnapshot:
+        """Release terminal Kernel operations before Program-cycle Reset."""
+
+        with self._lock:
+            entry = self._entry(program_run_id)
+            transition_lock = entry.transition_lock
+        with transition_lock:
+            with self._lock:
+                entry = self._entry(program_run_id)
+                if entry.state not in {
+                    ProgramRunState.STOPPED,
+                    ProgramRunState.SUCCEEDED,
+                    ProgramRunState.FAILED,
+                }:
+                    raise ProgramRunOwnerError(
+                        "Program-run effects can be reset only after settlement"
+                    )
+            snapshot = self._scope.reset(program_run_id)
+            _active_count, settled, reason = self._scope_fields(
+                snapshot, program_run_id
+            )
+            if not settled:
+                raise ProgramRunOwnerError(
+                    reason or "Kernel Program-run scope did not reset"
+                )
+            with self._lock:
+                return self._snapshot(self._entry(program_run_id))
 
     def reconcile_stop(self, program_run_id: str) -> ProgramRunSnapshot:
         with self._lock:
@@ -1049,6 +1167,7 @@ class ProgramRunOwner:
 
             try:
                 tree_status = run.tick_once()
+                node_statuses = run.node_statuses
             except Exception as exc:
                 return self._begin_stop(
                     program_run_id,
@@ -1082,6 +1201,9 @@ class ProgramRunOwner:
                 if entry.tree_status != status_name:
                     entry.tree_status = status_name
                     entry.revision += 1
+                if entry.node_statuses != node_statuses:
+                    entry.node_statuses = node_statuses
+                    entry.node_status_revision += 1
                 if (
                     intervention is not None
                     and entry.state is ProgramRunState.RUNNING

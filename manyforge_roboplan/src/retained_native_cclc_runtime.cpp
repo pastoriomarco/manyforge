@@ -1,6 +1,7 @@
 #include <manyforge_roboplan/retained_native_cclc_runtime.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -118,7 +119,14 @@ exact_graph_binding(const core::RuntimeParticipantBindingDTO &physical,
   return true;
 }
 
-[[nodiscard]] core::Result<void> adopt_durable_route_configurations(
+struct RuntimeEpochRouteReconciliation final {
+  core::ControlDomainId control_domain_id;
+  core::ControllableComponentId controllable_component_id;
+  core::RuntimeEpoch source_runtime_epoch;
+};
+
+[[nodiscard]] core::Result<std::vector<RuntimeEpochRouteReconciliation>>
+adopt_durable_route_configurations(
     const deployment::CCLCRuntimeCompositionConfig &config,
     const deployment::RetainedBundle &retained_bundle,
     const deployment::IVerifiedRetainedProductArtifactSource &artifact_source,
@@ -138,7 +146,7 @@ exact_graph_binding(const core::RuntimeParticipantBindingDTO &physical,
       domain_ids.insert(binding->value().control_path->control_domain_id);
     }
     if (component_ids.empty() || domain_ids.empty()) {
-      return reject<void>(
+      return reject<std::vector<RuntimeEpochRouteReconciliation>>(
           "native_cclc_restart_scope_empty",
           "native CCLC restart adoption has no physical route scope");
     }
@@ -153,9 +161,11 @@ exact_graph_binding(const core::RuntimeParticipantBindingDTO &physical,
         std::vector<core::ControlDomainId>(domain_ids.begin(),
                                            domain_ids.end()));
     if (!facts.ok()) {
-      return core::Result<void>::Err(facts.error());
+      return core::Result<std::vector<RuntimeEpochRouteReconciliation>>::Err(
+          facts.error());
     }
 
+    std::vector<RuntimeEpochRouteReconciliation> reconciliations;
     core::FilesystemResolvedStopBasePlanRepository repository(
         config.run_root, config.maximum_resolved_stop_plan_count,
         config.maximum_resolved_stop_plan_bytes,
@@ -172,7 +182,7 @@ exact_graph_binding(const core::RuntimeParticipantBindingDTO &physical,
             return active_configuration_matches_desired(active, candidate);
           });
       if (desired == bundle.desired_control_configurations.end()) {
-        return reject<void>(
+        return reject<std::vector<RuntimeEpochRouteReconciliation>>(
             "native_cclc_restart_configuration_not_retained",
             "durable current route is absent from the active retained bundle");
       }
@@ -182,25 +192,29 @@ exact_graph_binding(const core::RuntimeParticipantBindingDTO &physical,
         auto published =
             runtime.PublishAndReadBackRouteConfiguration(active, {});
         if (!published.ok()) {
-          return core::Result<void>::Err(published.error());
+          return core::Result<std::vector<RuntimeEpochRouteReconciliation>>::
+              Err(published.error());
         }
         continue;
       }
       if (active.state !=
           core::ActiveControlConfigurationStateDTO::kReconciled) {
-        return reject<void>("native_cclc_restart_configuration_invalid",
-                            "durable current route has an unknown state");
+        return reject<std::vector<RuntimeEpochRouteReconciliation>>(
+            "native_cclc_restart_configuration_invalid",
+            "durable current route has an unknown state");
       }
 
       auto physical = runtime.ReadCurrentPhysicalParticipants(active);
       if (!physical.ok()) {
-        return core::Result<void>::Err(physical.error());
+        return core::Result<std::vector<RuntimeEpochRouteReconciliation>>::Err(
+            physical.error());
       }
       std::optional<core::RuntimeUnitId> current_source_unit;
       std::optional<core::RuntimeEpoch> current_source_epoch;
+      std::optional<core::ControllableComponentId> current_component_id;
       for (const auto &participant : physical.value()) {
         if (!participant.value().control_path.has_value()) {
-          return reject<void>(
+          return reject<std::vector<RuntimeEpochRouteReconciliation>>(
               "native_cclc_restart_source_missing",
               "durable current route has a participant without a control "
               "source");
@@ -209,18 +223,19 @@ exact_graph_binding(const core::RuntimeParticipantBindingDTO &physical,
         if (!current_source_unit.has_value()) {
           current_source_unit = path.provider_runtime_unit_id;
           current_source_epoch = path.provider_runtime_epoch;
+          current_component_id = participant.value().controllable_component_id;
         } else if (*current_source_unit != path.provider_runtime_unit_id ||
                    *current_source_epoch != path.provider_runtime_epoch) {
-          return reject<void>(
+          return reject<std::vector<RuntimeEpochRouteReconciliation>>(
               "native_cclc_restart_source_ambiguous",
-              "durable current route spans multiple current source "
-              "incarnations");
+              "durable current route spans multiple current source owners");
         }
       }
       if (!current_source_unit.has_value() ||
           !current_source_epoch.has_value() ||
+          !current_component_id.has_value() ||
           *current_source_unit != active.source_runtime_unit_id) {
-        return reject<void>(
+        return reject<std::vector<RuntimeEpochRouteReconciliation>>(
             "native_cclc_restart_source_mismatch",
             "durable current route belongs to another runtime unit");
       }
@@ -228,8 +243,12 @@ exact_graph_binding(const core::RuntimeParticipantBindingDTO &physical,
         auto adopted =
             runtime.AdoptAndReadBackRouteConfigurationPredecessor(active);
         if (!adopted.ok()) {
-          return core::Result<void>::Err(adopted.error());
+          return core::Result<std::vector<RuntimeEpochRouteReconciliation>>::
+              Err(adopted.error());
         }
+        reconciliations.push_back({active.control_domain_id,
+                                   *current_component_id,
+                                   *current_source_epoch});
         continue;
       }
 
@@ -244,7 +263,7 @@ exact_graph_binding(const core::RuntimeParticipantBindingDTO &physical,
             [](const auto &row) { return row.control_binding_id; });
         if (binding == nullptr || binding->control_binding_revision !=
                                       route.control_binding_revision) {
-          return reject<void>(
+          return reject<std::vector<RuntimeEpochRouteReconciliation>>(
               "native_cclc_restart_binding_not_retained",
               "durable current route has no exact retained binding");
         }
@@ -262,7 +281,7 @@ exact_graph_binding(const core::RuntimeParticipantBindingDTO &physical,
         if (fact == facts.value().components.end() ||
             !fact->durable_generation.has_value() ||
             !fact->current_state.has_value()) {
-          return reject<void>(
+          return reject<std::vector<RuntimeEpochRouteReconciliation>>(
               "native_cclc_restart_lifecycle_fact_missing",
               "durable current route has no complete lifecycle generation");
         }
@@ -275,22 +294,94 @@ exact_graph_binding(const core::RuntimeParticipantBindingDTO &physical,
               retained_bundle, artifact_source, expected, active,
               component_expectations, physical.value(), repository);
       if (!participants.ok()) {
-        return core::Result<void>::Err(participants.error());
+        return core::Result<std::vector<RuntimeEpochRouteReconciliation>>::Err(
+            participants.error());
       }
       auto published = runtime.PublishAndReadBackRouteConfiguration(
           active, std::move(participants.value()));
       if (!published.ok()) {
-        return core::Result<void>::Err(published.error());
+        return core::Result<std::vector<RuntimeEpochRouteReconciliation>>::Err(
+            published.error());
       }
     }
-    return core::Result<void>::Ok();
+    return core::Result<std::vector<RuntimeEpochRouteReconciliation>>::Ok(
+        std::move(reconciliations));
   } catch (const std::exception &error) {
-    return reject<void>("native_cclc_restart_adoption_failed", error.what());
+    return reject<std::vector<RuntimeEpochRouteReconciliation>>(
+        "native_cclc_restart_adoption_failed", error.what());
   } catch (...) {
-    return reject<void>(
+    return reject<std::vector<RuntimeEpochRouteReconciliation>>(
         "native_cclc_restart_adoption_failed",
         "durable current routes could not be adopted by the new Kernel");
   }
+}
+
+[[nodiscard]] core::Result<void> reconcile_runtime_epoch_routes(
+    deployment::CCLCRuntimeComposition &composition,
+    const std::vector<RuntimeEpochRouteReconciliation> &reconciliations) {
+  auto &port = composition.open_request_port();
+  const auto owner_epoch = port.ReadRequestOwnerEpoch();
+  for (std::size_t index = 0U; index < reconciliations.size(); ++index) {
+    const auto &required = reconciliations[index];
+    auto templates =
+        port.ReadRouteSelectionTemplates(required.controllable_component_id);
+    if (!templates.ok()) {
+      return core::Result<void>::Err(templates.error());
+    }
+    const auto selected = std::find_if(
+        templates.value().templates.begin(), templates.value().templates.end(),
+        [&](const auto &candidate) {
+          return candidate.desired_configuration.control_domain_id ==
+                 required.control_domain_id;
+        });
+    if (selected == templates.value().templates.end()) {
+      return reject<void>(
+          "native_cclc_restart_route_template_missing",
+          "current retained route has no owner-reconciliation template");
+    }
+    core::RouteSelectionIntentDTO intent{
+        {core::RequestId("native-owner-reconcile." +
+                         std::to_string(index + 1U)),
+         owner_epoch, "native_owner_restart", std::nullopt},
+        templates.value().retained_bundle_id,
+        templates.value().graph_revision,
+        selected->desired_configuration,
+        selected->expected_active_control_configuration,
+        selected->component_expectations,
+        {core::RequestTransportDTO::kInternal,
+         core::RequestAssuranceDTO::kUnverified, std::nullopt}};
+    auto submitted = port.SubmitRouteSelection(intent);
+    if (!submitted.ok()) {
+      return core::Result<void>::Err(submitted.error());
+    }
+    if (!submitted.value().acceptance.has_value()) {
+      return reject<void>(
+          "native_cclc_restart_route_acceptance_missing",
+          "runtime-owner reconciliation produced no route acceptance");
+    }
+    if (!composition.coordinator().DrainFor(std::chrono::seconds(5))) {
+      return reject<void>(
+          "native_cclc_restart_route_reconciliation_timeout",
+          "runtime-owner route reconciliation did not settle during startup");
+    }
+    auto status = port.LoadRouteSelectionStatus(
+        submitted.value().acceptance->route_selection_transaction_id);
+    if (!status.ok()) {
+      return core::Result<void>::Err(status.error());
+    }
+    if (!status.value().has_value() ||
+        status.value()->terminal_result !=
+            core::RouteSelectionTerminalResultDTO::kSucceeded ||
+        !status.value()->resulting_active_control_configuration.has_value() ||
+        status.value()
+                ->resulting_active_control_configuration
+                ->source_runtime_epoch != required.source_runtime_epoch) {
+      return reject<void>(
+          "native_cclc_restart_route_reconciliation_failed",
+          "runtime-owner route reconciliation did not publish current truth");
+    }
+  }
+  return core::Result<void>::Ok();
 }
 
 [[nodiscard]] bool provider_matches_component(
@@ -423,7 +514,8 @@ struct DerivedRuntimeClosure final {
       core::Result<std::shared_ptr<core::IControllerLifecyclePort>> port =
           core::Result<std::shared_ptr<core::IControllerLifecyclePort>>::Err(
               {"controller_lifecycle_port_unselected",
-               "no controller lifecycle product was selected", {}});
+               "no controller lifecycle product was selected",
+               {}});
       if (externally_managed_controller_snapshot_source) {
         auto external =
             RetainedExternallyManagedControllerLifecyclePort::Create(
@@ -431,26 +523,24 @@ struct DerivedRuntimeClosure final {
                 externally_managed_controller_snapshot_source, clock,
                 config.controller_observation_freshness_ns);
         if (external.ok()) {
-          port = core::Result<
-              std::shared_ptr<core::IControllerLifecyclePort>>::Ok(
-              std::move(external.value()));
+          port =
+              core::Result<std::shared_ptr<core::IControllerLifecyclePort>>::Ok(
+                  std::move(external.value()));
         } else {
-          port = core::Result<
-              std::shared_ptr<core::IControllerLifecyclePort>>::Err(
-              external.error());
+          port = core::Result<std::shared_ptr<core::IControllerLifecyclePort>>::
+              Err(external.error());
         }
       } else {
         auto native = RetainedNativeControllerLifecyclePort::Create(
             expected.sealed(), std::move(domain_bindings), clock,
             config.controller_observation_freshness_ns);
         if (native.ok()) {
-          port = core::Result<
-              std::shared_ptr<core::IControllerLifecyclePort>>::Ok(
-              std::move(native.value()));
+          port =
+              core::Result<std::shared_ptr<core::IControllerLifecyclePort>>::Ok(
+                  std::move(native.value()));
         } else {
-          port = core::Result<
-              std::shared_ptr<core::IControllerLifecyclePort>>::Err(
-              native.error());
+          port = core::Result<std::shared_ptr<core::IControllerLifecyclePort>>::
+              Err(native.error());
         }
       }
       if (!port.ok()) {
@@ -659,8 +749,7 @@ CreateRetainedNativeCCLCRuntime(
       std::move(value.controller_sources), std::move(value.brand_ports),
       std::move(value.controller_ports), std::move(value.source_projections),
       kernel_disable_handoff_port, kernel_cell_admission_port,
-      kernel_route_fence_port,
-      kernel_publication_owner, clock, scheduler,
+      kernel_route_fence_port, kernel_publication_owner, clock, scheduler,
       std::move(kernel_current_configuration_source));
 }
 
@@ -692,14 +781,14 @@ CreateRetainedNativeCCLCRuntime(
         "native CCLC requires the stable addressed owner, clock, and "
         "scheduler");
   }
-  const auto adopted = adopt_durable_route_configurations(
+  auto adopted = adopt_durable_route_configurations(
       config.composition, *retained_bundle, artifact_source, runtime);
   if (!adopted.ok()) {
     return core::Result<std::unique_ptr<deployment::CCLCRuntimeComposition>>::
         Err(adopted.error());
   }
   auto physical_bindings = runtime.control_binding_representatives;
-  return CreateRetainedNativeCCLCRuntime(
+  auto composition = CreateRetainedNativeCCLCRuntime(
       std::move(config), std::move(retained_bundle), active_publication_reader,
       std::move(expected_active_publication), artifact_source,
       lifecycle_catalog_source, std::move(brand_ports),
@@ -710,6 +799,16 @@ CreateRetainedNativeCCLCRuntime(
         return runtime.ReadCurrentPublishedRouteConfiguration(domain_id);
       },
       std::move(externally_managed_controller_snapshot_source));
+  if (!composition.ok()) {
+    return composition;
+  }
+  auto reconciled =
+      reconcile_runtime_epoch_routes(*composition.value(), adopted.value());
+  if (!reconciled.ok()) {
+    return core::Result<std::unique_ptr<deployment::CCLCRuntimeComposition>>::
+        Err(reconciled.error());
+  }
+  return composition;
 }
 
 } // namespace manyforge::roboplan_backend

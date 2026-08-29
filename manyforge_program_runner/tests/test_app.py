@@ -24,7 +24,7 @@ _DIGEST_C = "sha256:" + "c" * 64
 
 def _snapshot(*, state: str = "running") -> dict[str, Any]:
     return {
-        "schema_version": "manyforge.program_run_status.v1",
+        "schema_version": "manyforge.program_run_status.v2",
         "owner_id": "program-runner.cell-a",
         "owner_epoch": "program-runner.epoch.1",
         "run_revision": 1,
@@ -52,6 +52,8 @@ def _snapshot(*, state: str = "running") -> dict[str, Any]:
             ],
         },
         "tree_status": "running",
+        "node_status_revision": 1,
+        "node_statuses": {"root": "running"},
         "active_operation_count": 1,
         "reason_code": None,
         "message": "",
@@ -123,6 +125,14 @@ class FakeRuntime:
     ) -> dict[str, Any]:
         self.calls.append(("stop", (program_run_id, request)))
         return _snapshot(state="stopping")
+
+    def stop_motion(
+        self,
+        program_run_id: str,
+        request: ProgramRunStopRequest,
+    ) -> dict[str, Any]:
+        self.calls.append(("motion_stop", (program_run_id, request)))
+        return _snapshot(state="running")
 
     def reset_cycle(self, request: ProgramCycleResetRequest) -> dict[str, Any]:
         self.calls.append(("reset", request))
@@ -261,6 +271,16 @@ def test_private_surface_projects_owner_facts_and_manages_lifecycle() -> None:
             },
         )
         read = client.get("/api/program/runs/program-run.1")
+        motion_stopped = client.post(
+            "/api/program/runs/program-run.1/motion-stop",
+            json={
+                **_caller(),
+                "request_id": "request.motion-stop.1",
+                "program_run_id": "program-run.1",
+                "expected_owner_epoch": "program-runner.epoch.1",
+                "reason": "ordinary operator motion Stop",
+            },
+        )
         stopped = client.post(
             "/api/program/runs/program-run.1/stop",
             json={
@@ -279,12 +299,14 @@ def test_private_surface_projects_owner_facts_and_manages_lifecycle() -> None:
     assert index.json()["runs"][0]["capture"]["program_run_id"] == "program-run.1"
     assert started.status_code == 200
     assert read.status_code == 200
+    assert motion_stopped.json()["state"] == "running"
     assert stopped.json()["state"] == "stopping"
     assert runtime.calls[0] == ("runs", (True, 7))
     assert runtime.calls[1][0] == "start"
     assert runtime.calls[2][0] == "prepare_scene"
     assert runtime.calls[3] == ("read", "program-run.1")
-    assert runtime.calls[4][0] == "stop"
+    assert runtime.calls[4][0] == "motion_stop"
+    assert runtime.calls[5][0] == "stop"
     assert runtime.closed is True
 
 

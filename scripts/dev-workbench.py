@@ -41,10 +41,11 @@ STATE_ROOT = Path(
     os.environ.get("MANYFORGE_DEV_STATE_ROOT", "/tmp/manyforge-state")
 )
 HEADLESS_BUILD = BUILD_ROOT / "headless"
+ROBOPLAN_BUILD = BUILD_ROOT / "roboplan"
 SCENARIO_ROOT = CACHE_ROOT / "maintained-scenario-package"
 PACKAGE_ROOT = SCENARIO_ROOT / "retained-package"
-NATIVE_EXECUTION_HOST = SCENARIO_ROOT / "manyforge_native_execution_host"
-NATIVE_CANDIDATE_WORKER = SCENARIO_ROOT / "manyforge_roboplan_candidate_worker"
+NATIVE_EXECUTION_HOST = ROBOPLAN_BUILD / "manyforge_native_execution_host"
+NATIVE_CANDIDATE_WORKER = ROBOPLAN_BUILD / "manyforge_roboplan_candidate_worker"
 MANAGER_BINARY = HEADLESS_BUILD / "manyforge_manager_daemon"
 NODE_CATALOG = WORKSPACE / "manyforge_behavior/resources/node_catalog.yaml"
 NODE_ENVIRONMENT_MANIFEST = (
@@ -80,23 +81,12 @@ def _qualified_root() -> Path:
 
 
 def _import_package() -> None:
-    """Import one qualified package and its exact package-owned executables."""
+    """Import immutable Scenario content without caching backend executables."""
 
-    if (
-        PACKAGE_ROOT.is_dir()
-        and NATIVE_EXECUTION_HOST.is_file()
-        and NATIVE_CANDIDATE_WORKER.is_file()
-    ):
+    if PACKAGE_ROOT.is_dir():
         return
     qualified = _qualified_root()
     source_package = qualified / "maintained-package"
-    source_native = qualified / "native-install/manyforge_native_execution_host"
-    source_worker = qualified / "native-install/manyforge_roboplan_candidate_worker"
-    for path, label in (
-        (source_native, "qualified native execution host"),
-        (source_worker, "qualified candidate worker"),
-    ):
-        _regular_file(path, label, executable=True)
     if not source_package.is_dir():
         raise WorkbenchError(
             "the maintained package is unavailable; set "
@@ -111,12 +101,22 @@ def _import_package() -> None:
     temporary.mkdir(parents=True)
     try:
         shutil.copytree(source_package, temporary / "retained-package")
-        shutil.copy2(source_native, temporary / NATIVE_EXECUTION_HOST.name)
-        shutil.copy2(source_worker, temporary / NATIVE_CANDIDATE_WORKER.name)
         temporary.replace(SCENARIO_ROOT)
     except Exception:
         shutil.rmtree(temporary, ignore_errors=True)
         raise
+
+
+def _build_jobs() -> str:
+    jobs = os.environ.get("MANYFORGE_DEV_BUILD_JOBS", "").strip()
+    if not jobs:
+        # The native closure has several memory-heavy C++ translation units.
+        # Eight keeps ordinary development hosts responsive without serializing
+        # the build; callers may explicitly tune the shared limit.
+        jobs = str(min(8, max(1, os.cpu_count() or 1)))
+    if not jobs.isdecimal() or int(jobs) < 1:
+        raise WorkbenchError("MANYFORGE_DEV_BUILD_JOBS must be a positive integer")
+    return jobs
 
 
 def _ensure_current_backend() -> Path:
@@ -152,18 +152,13 @@ def _ensure_current_backend() -> Path:
                 f"-Dpybind11_DIR={pybind11_dir}",
             )
         )
-    jobs = os.environ.get("MANYFORGE_DEV_BUILD_JOBS", "").strip()
-    if not jobs:
-        jobs = str(max(1, os.cpu_count() or 1))
-    if not jobs.isdecimal() or int(jobs) < 1:
-        raise WorkbenchError("MANYFORGE_DEV_BUILD_JOBS must be a positive integer")
     _run(
         (
             "cmake",
             "--build",
             str(HEADLESS_BUILD),
             "--parallel",
-            jobs,
+            _build_jobs(),
             "--target",
             "manyforge_manager_daemon",
             "manyforge_headless_py",
@@ -180,6 +175,48 @@ def _ensure_current_backend() -> Path:
         )
     _regular_file(extensions[0], "current Headless Python extension")
     return extensions[0]
+
+
+def _ensure_current_native_backend() -> tuple[Path, Path]:
+    """Incrementally build the current workspace native execution owners."""
+
+    if not (ROBOPLAN_BUILD / "CMakeCache.txt").is_file():
+        _run(
+            (
+                "cmake",
+                "-G",
+                "Ninja",
+                "-S",
+                str(WORKSPACE / "manyforge_roboplan"),
+                "-B",
+                str(ROBOPLAN_BUILD),
+                "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
+                "-DBUILD_TESTING=OFF",
+                "-DMANYFORGE_BUILD_ROS2_CONTROL_RUNTIME=OFF",
+            )
+        )
+    _run(
+        (
+            "cmake",
+            "--build",
+            str(ROBOPLAN_BUILD),
+            "--parallel",
+            _build_jobs(),
+            "--target",
+            "manyforge_native_execution_host",
+            "manyforge_roboplan_candidate_worker",
+            "--",
+            "-k",
+            "0",
+        )
+    )
+    _regular_file(
+        NATIVE_EXECUTION_HOST, "current native execution host", executable=True
+    )
+    _regular_file(
+        NATIVE_CANDIDATE_WORKER, "current candidate worker", executable=True
+    )
+    return NATIVE_EXECUTION_HOST, NATIVE_CANDIDATE_WORKER
 
 
 def _regular_file(path: Path, label: str, *, executable: bool = False) -> None:
@@ -283,12 +320,6 @@ def _load_scenario(scenario_id: str) -> dict[str, Any]:
     # Composer parses this artifact and the backend Load Scenario command
     # compares its semantic Program revision with the retained selection.  Do
     # not add a stricter byte-format identity in the process launcher.
-    _regular_file(
-        NATIVE_EXECUTION_HOST, "native execution host", executable=True
-    )
-    _regular_file(
-        NATIVE_CANDIDATE_WORKER, "candidate worker", executable=True
-    )
     component_ids = [
         component.get("controllable_component_id")
         if isinstance(component, dict)
@@ -680,6 +711,43 @@ def _converge_component(
             raise WorkbenchError(f"CCLC route {domain_id} did not reconcile")
 
 
+def _converge_control_management(
+    client: HeadlessHttpClient,
+    component_ids: Sequence[str],
+    *,
+    scenario_id: str,
+    processes: Sequence[tuple[str, subprocess.Popen[bytes]]],
+) -> str:
+    """Converge only products that explicitly use component lifecycle control."""
+
+    def current_mode() -> str | None:
+        response = client.execution_identity()
+        identity = response.get("identity")
+        if not isinstance(identity, dict):
+            raise WorkbenchError("execution identity is unavailable")
+        mode = identity.get("control_management_mode")
+        if mode == "pending":
+            return None
+        if mode not in {"direct", "component_lifecycle"}:
+            raise WorkbenchError("execution control-management mode is invalid")
+        return mode
+
+    mode = _wait_until(
+        "execution control management", current_mode, processes,
+        timeout_seconds=30.0,
+    )
+    if mode == "direct":
+        return mode
+    for component_id in component_ids:
+        _converge_component(
+            client,
+            component_id,
+            scenario_id=scenario_id,
+            processes=processes,
+        )
+    return mode
+
+
 def query_status(*, scenario_id: str | None, composer_port: int) -> dict[str, Any]:
     """Read Composer's owner-derived current Scenario; retain no launcher copy."""
 
@@ -769,8 +837,9 @@ class Workbench:
                     f"required development port {port} is already in use"
                 )
         _import_package()
-        current_headless_extension = _ensure_current_backend()
         self.metadata = _load_scenario(self.scenario_id)
+        current_headless_extension = _ensure_current_backend()
+        current_native_targets = _ensure_current_native_backend()
         _regular_file(
             MANAGER_BINARY,
             "current Manager executable",
@@ -790,7 +859,7 @@ class Workbench:
         manager = installed / "manyforge_manager_daemon"
         shutil.copy2(MANAGER_BINARY, manager)
         _regular_file(manager, "installed Manager", executable=True)
-        for source in (NATIVE_EXECUTION_HOST, NATIVE_CANDIDATE_WORKER):
+        for source in current_native_targets:
             target = installed / source.name
             shutil.copy2(source, target)
             _regular_file(target, f"installed {source.name}", executable=True)
@@ -801,6 +870,66 @@ class Workbench:
         authoring_journal = (
             paths["composer_authoring"]
             / "composer-authoring-transactions.sqlite3"
+        )
+        # Bring up the two reconciliation services before Manager.  A new
+        # Manager must be able to reconcile the retained Program Runner owner
+        # on its first heartbeat; starting Manager first creates a needless
+        # dependency cycle in which its native child can expire while the
+        # Runner is still waiting for Headless cell-admission recovery.
+        self._spawn(
+            "Program runner",
+            (
+                sys.executable, "-m", "manyforge_program_runner",
+                "--host", "127.0.0.1", "--port", str(self.runner_port),
+                "--headless-url", f"http://127.0.0.1:{self.headless_port}",
+                "--execution-run-root", str(paths["execution_run"]),
+                "--cycle-journal-path", str(STATE_ROOT / "program-cycle.sqlite3"),
+                "--manager-liveness-socket", str(runner_socket),
+                "--cell-id", self.metadata["cell_id"],
+                "--owner-id", "program-runner.development-workbench",
+            ),
+        )
+        self._spawn(
+            "Headless API",
+            (
+                sys.executable, "-m", "manyforge_headless_api", "serve",
+                "--host", "127.0.0.1", "--port", str(self.headless_port),
+                "--projection-root", str(paths["publications"]),
+                "--install-root", str(PACKAGE_ROOT),
+                "--artifact-root", str(paths["artifacts"]),
+                "--program-selection-state-root", str(paths["program_selection"]),
+                "--node-catalog-path", str(NODE_CATALOG),
+                "--node-environment-manifest-path",
+                str(NODE_ENVIRONMENT_MANIFEST),
+                "--alarm-catalog-path", str(ALARM_CATALOG),
+                "--historian-database-path", str(STATE_ROOT / "history.sqlite3"),
+                "--manager-run-root", str(paths["manager_run"]),
+                "--execution-run-root", str(paths["execution_run"]),
+                "--cell-id", self.metadata["cell_id"],
+                "--owner-id", "headless-api.development-workbench",
+                "--freshness-ms", "2000",
+                "--manager-timeout-s", "15",
+                "--program-runner-url", f"http://127.0.0.1:{self.runner_port}",
+            ),
+        )
+        base_url = f"http://127.0.0.1:{self.headless_port}"
+
+        def reconciliation_services_ready() -> bool:
+            with HeadlessHttpClient(
+                f"http://127.0.0.1:{self.runner_port}", timeout_seconds=0.5
+            ) as client:
+                runner = client.request("GET", "/api/program/health")
+            with HeadlessHttpClient(base_url, timeout_seconds=0.5) as client:
+                api = client.runtime()
+            return bool(
+                runner.get("started") is True
+                and api.get("schema_version")
+            )
+
+        _wait_until(
+            "Program Runner and Headless reconciliation services",
+            reconciliation_services_ready,
+            self.processes,
         )
         self._spawn(
             "Manager",
@@ -825,45 +954,6 @@ class Workbench:
             manager_socket.is_socket,
             self.processes,
         )
-        self._spawn(
-            "Program runner",
-            (
-                sys.executable, "-m", "manyforge_program_runner",
-                "--host", "127.0.0.1", "--port", str(self.runner_port),
-                "--headless-url", f"http://127.0.0.1:{self.headless_port}",
-                "--execution-run-root", str(paths["execution_run"]),
-                "--cycle-journal-path", str(STATE_ROOT / "program-cycle.sqlite3"),
-                "--manager-liveness-socket", str(runner_socket),
-                "--cell-id", self.metadata["cell_id"],
-                "--owner-id", "program-runner.development-workbench",
-                "--headless-timeout-s", "1",
-            ),
-        )
-        self._spawn(
-            "Headless API",
-            (
-                sys.executable, "-m", "manyforge_headless_api", "serve",
-                "--host", "127.0.0.1", "--port", str(self.headless_port),
-                "--projection-root", str(paths["publications"]),
-                "--install-root", str(PACKAGE_ROOT),
-                "--artifact-root", str(paths["artifacts"]),
-                "--program-selection-state-root", str(paths["program_selection"]),
-                "--node-catalog-path", str(NODE_CATALOG),
-                "--node-environment-manifest-path",
-                str(NODE_ENVIRONMENT_MANIFEST),
-                "--alarm-catalog-path", str(ALARM_CATALOG),
-                "--historian-database-path", str(STATE_ROOT / "history.sqlite3"),
-                "--manager-run-root", str(paths["manager_run"]),
-                "--execution-run-root", str(paths["execution_run"]),
-                "--cell-id", self.metadata["cell_id"],
-                "--owner-id", "headless-api.development-workbench",
-                "--freshness-ms", "2000",
-                "--manager-timeout-s", "15",
-                "--program-runner-url", f"http://127.0.0.1:{self.runner_port}",
-                "--program-runner-timeout-s", "1",
-            ),
-        )
-        base_url = f"http://127.0.0.1:{self.headless_port}"
 
         def manager_ready() -> dict[str, Any] | None:
             with HeadlessHttpClient(base_url, timeout_seconds=0.5) as client:
@@ -929,13 +1019,12 @@ class Workbench:
 
         _wait_until("exact current Scenario tuple", exact_status, self.processes)
         with HeadlessHttpClient(base_url, timeout_seconds=1.0) as client:
-            for component_id in self.metadata["component_ids"]:
-                _converge_component(
-                    client,
-                    component_id,
-                    scenario_id=self.metadata["scenario_id"],
-                    processes=self.processes,
-                )
+            _converge_control_management(
+                client,
+                self.metadata["component_ids"],
+                scenario_id=self.metadata["scenario_id"],
+                processes=self.processes,
+            )
         _wait_until(
             "idle authoring admission", authoring_ready, self.processes
         )
@@ -999,6 +1088,58 @@ class Workbench:
         except (OSError, subprocess.TimeoutExpired, WorkbenchError):
             pass
 
+    def _stop_manager(self) -> None:
+        """Stop Manager before waiting for the Runner's short lease."""
+
+        self._shutdown_manager()
+        manager = next(
+            (process for name, process in self.processes if name == "Manager"),
+            None,
+        )
+        if manager is not None:
+            # The bounded command is preferred, but a failed command must not
+            # leave Manager renewing the lease until the container disappears.
+            self._terminate(manager)
+
+    def _wait_for_program_runner_manager_expiry(self) -> None:
+        """Let the runner durably observe Manager loss before it exits."""
+
+        runner = next(
+            (
+                process
+                for name, process in self.processes
+                if name == "Program runner"
+            ),
+            None,
+        )
+        if runner is None or runner.poll() is not None:
+            return
+
+        def manager_expired() -> bool:
+            with HeadlessHttpClient(
+                f"http://127.0.0.1:{self.runner_port}", timeout_seconds=0.2
+            ) as client:
+                status = client.request(
+                    "GET", "/api/program/liveness/status"
+                )
+            return bool(
+                status.get("state") == "expired"
+                and status.get("command_fenced") is True
+            )
+
+        try:
+            _wait_until(
+                "Program Runner Manager-loss retention",
+                manager_expired,
+                (("Program runner", runner),),
+                timeout_seconds=2.0,
+            )
+        except WorkbenchError:
+            # Cleanup remains bounded even if the runner is already unhealthy.
+            # Its next start will retain/fence the predecessor through the same
+            # watchdog before accepting a replacement Manager.
+            pass
+
     @staticmethod
     def _terminate(process: subprocess.Popen[bytes]) -> None:
         if process.poll() is not None:
@@ -1011,17 +1152,22 @@ class Workbench:
             process.wait(timeout=5)
 
     def close(self) -> None:
-        for name in ("Vite HMR", "Composer backend", "Program runner"):
+        for name in ("Vite HMR", "Composer backend", "Headless API"):
             for process_name, process in reversed(self.processes):
                 if process_name == name:
                     self._terminate(process)
-        self._shutdown_manager()
+        self._stop_manager()
+        self._wait_for_program_runner_manager_expiry()
+        for process_name, process in reversed(self.processes):
+            if process_name == "Program runner":
+                self._terminate(process)
         for name, process in reversed(self.processes):
             if name not in {
                 "Vite HMR",
                 "Composer backend",
                 "Program runner",
                 "Manager",
+                "Headless API",
             }:
                 self._terminate(process)
 

@@ -194,7 +194,7 @@ void run_tick(const std::shared_ptr<SharedState> &state,
       // surveillance and recovery never depend on a one-shot Reset sample.
       // An IScheduler callback is contractually not early; fail closed rather
       // than recurse if a test adapter violates that contract.
-      if (state->admission_blocked || now_ns < scheduled_deadline_ns ||
+      if (now_ns < scheduled_deadline_ns ||
           !runtime.status.current_position.has_value() ||
           !std::isfinite(*runtime.status.current_position)) {
         return;
@@ -271,13 +271,11 @@ void run_tick(const std::shared_ptr<SharedState> &state,
       if (projection.applied()) {
         runtime.terminal_projection_attempts = 0;
         schedule_again =
-            !state->admission_blocked &&
             runtime.status.state == core::GripperCommandState::kIdle;
       } else if (projection.status == RetainedStateProjectionStatus::kBusy &&
                  ++runtime.terminal_projection_attempts <
                      kTerminalProjectionRetryLimit) {
         schedule_again =
-            !state->admission_blocked &&
             runtime.status.state == core::GripperCommandState::kIdle;
       } else {
         state->admission_blocked = true;
@@ -787,6 +785,13 @@ void RetainedGripperCommandBackend::invalidate_gripper_commands(
     return;
   }
   std::vector<core::ScheduleHandle> handles;
+  struct HeartbeatTarget final {
+    std::string gripper_id;
+    std::uint64_t command_id{};
+    std::uint64_t generation{};
+    core::TimePoint first_deadline_ns{};
+  };
+  std::vector<HeartbeatTarget> heartbeat_targets;
   {
     std::lock_guard<std::mutex> lock(state_->mutex);
     state_->admission_blocked = true;
@@ -795,8 +800,11 @@ void RetainedGripperCommandBackend::invalidate_gripper_commands(
         reason == core::GripperInvalidationReason::kDeploymentSwap) {
       state_->closing = true;
     }
-    for (auto &[unused, runtime] : state_->runtimes) {
-      static_cast<void>(unused);
+    const auto keep_observing = !state_->closing;
+    const auto first_deadline_ns =
+        saturating_deadline(state_->clock->now(), state_->update_period_ns);
+    heartbeat_targets.reserve(keep_observing ? state_->runtimes.size() : 0U);
+    for (auto &[gripper_id, runtime] : state_->runtimes) {
       if (runtime.scheduled_handle.has_value()) {
         handles.push_back(*runtime.scheduled_handle);
         runtime.scheduled_handle.reset();
@@ -810,6 +818,11 @@ void RetainedGripperCommandBackend::invalidate_gripper_commands(
           core::GripperProjectionState::kNotRequired;
       runtime.status.projection_reason.clear();
       ++runtime.status.revision;
+      if (keep_observing && runtime.status.current_position.has_value()) {
+        heartbeat_targets.push_back(
+            HeartbeatTarget{gripper_id, runtime.status.command_id,
+                            runtime.status.generation, first_deadline_ns});
+      }
     }
   }
   for (const auto handle : handles) {
@@ -818,6 +831,13 @@ void RetainedGripperCommandBackend::invalidate_gripper_commands(
     } catch (...) {
       // Lifecycle invalidation is authoritative; callbacks are fenced.
     }
+  }
+  // Stop/reset closes command admission, not observed-state publication.
+  // Keeping this source fresh lets recovery verify rest without authorizing a
+  // command or depending on a one-shot Stop sample.
+  for (const auto &target : heartbeat_targets) {
+    (void)schedule_tick(state_, target.gripper_id, target.command_id,
+                        target.generation, target.first_deadline_ns);
   }
 }
 

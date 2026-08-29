@@ -15,6 +15,7 @@ from heapq import heapify, heappop, heappush
 import json
 import math
 from threading import RLock
+import time
 from typing import Any, Final, Protocol
 
 from manyforge_behavior.geometry import (
@@ -78,6 +79,8 @@ _MAX_CONTEXTS: Final = 4_096
 _MAX_TASKS: Final = 65_536
 _MAX_SCENE_INITIALIZATION_STALE_RETRIES: Final = 16
 _MAX_SCENE_NODE_STALE_RETRIES: Final = 16
+_PROGRAM_RESET_SETTLEMENT_TIMEOUT_S: Final = 5.0
+_PROGRAM_RESET_SETTLEMENT_POLL_S: Final = 0.01
 _AUTHORED_SCENE_OPERATIONS: Final = frozenset(
     {
         "add_object",
@@ -536,7 +539,6 @@ class NativeKernelProgramPort:
                 if task.identity.program_run_id == program_run_id
             )
         completed: list[_OperationTask] = []
-        terminal: list[_OperationTask] = []
         for task in tasks:
             _operation, snapshot = self._observation(task)
             if snapshot.state is OwnerTaskState.ACTIVE:
@@ -545,12 +547,10 @@ class NativeKernelProgramPort:
                 )
             if snapshot.state is OwnerTaskState.SUCCEEDED:
                 completed.append(task)
-            else:
-                terminal.append(task)
         # A sequence may settle between its final owner transition and the
-        # next tree tick. Consume successful evidence before dropping local
-        # task state; failed/interrupted native records have no acknowledge
-        # command and remain in the native historian.
+        # next tree tick. Consume successful evidence now. Interrupted/failed
+        # operations keep only their small identity row until Program Reset
+        # releases the corresponding resident Kernel operation.
         for task in completed:
             self._acknowledge_task(task.operation_id, task.identity)
         terminal_pick_place: list[_PickPlaceTask] = []
@@ -562,8 +562,6 @@ class NativeKernelProgramPort:
                 )
             terminal_pick_place.append(task)
         with self._lock:
-            for task in terminal:
-                self._tasks.pop(task.operation_id, None)
             for task in terminal_pick_place:
                 self._pick_place_tasks.pop(task.sequence_id, None)
             self._contexts.pop(program_run_id, None)
@@ -596,8 +594,8 @@ class NativeKernelProgramPort:
         return target
 
     def _owner_status(self, context: _BoundContext) -> tuple[str, dict[str, Any]]:
-        envelope = self._kernel.status()
-        status = _mapping(envelope.get("status"), field="execution status")
+        envelope = self._kernel.identity()
+        status = _mapping(envelope.get("identity"), field="execution identity")
         owner_epoch = _text(status.get("owner_epoch"), field="owner_epoch")
         if (
             status.get("graph_revision") != context.capture.graph_revision
@@ -1940,6 +1938,93 @@ class NativeKernelProgramPort:
             )
         return self._observe_scope(program_run_id)
 
+    @staticmethod
+    def _resettable_operation(
+        envelope: Mapping[str, Any],
+        task: _OperationTask,
+    ) -> tuple[Mapping[str, Any], bool]:
+        operation = _mapping(envelope.get("operation"), field="native operation")
+        if operation.get("operation_id") != task.operation_id:
+            raise ProductionPortError("native operation changed identity")
+        if operation.get("program_run_id") != task.identity.program_run_id:
+            raise ProductionPortError("native operation changed Program run")
+        resident = envelope.get("resident")
+        if type(resident) is not bool:
+            raise ProductionPortError("native operation residency is invalid")
+        return operation, resident
+
+    def _reset_scope(self, program_run_id: str) -> ProgramRunScopeSnapshot:
+        with self._lock:
+            tasks = tuple(
+                task
+                for task in self._tasks.values()
+                if task.identity.program_run_id == program_run_id
+            )
+        if not tasks:
+            return ProgramRunScopeSnapshot(
+                program_run_id,
+                ProgramRunScopeState.SETTLED,
+                0,
+            )
+
+        status = _mapping(
+            self._kernel.identity().get("identity"), field="execution identity"
+        )
+        owner_epoch = _text(status.get("owner_epoch"), field="owner_epoch")
+        for task in tasks:
+            operation, resident = self._resettable_operation(
+                self._kernel.operation(task.operation_id), task
+            )
+            if resident:
+                state = _text(operation.get("state"), field="operation state")
+                if state in _ACTIVE_STATES:
+                    raise ProductionPortError(
+                        "cannot reset a Program run with active native operations"
+                    )
+                revision = operation.get("operation_revision")
+                if type(revision) is not int or revision < 1:
+                    raise ProductionPortError(
+                        "native operation revision is invalid"
+                    )
+                self._kernel.reset(
+                    task.operation_id,
+                    {
+                        "request_context": {
+                            "request_id": _request_identity(
+                                "program-reset", program_run_id, task.operation_id
+                            ),
+                            "request_owner_epoch": owner_epoch,
+                            "source_label": "manyforge_behavior",
+                            "correlation_id": program_run_id,
+                        },
+                        "operation_id": task.operation_id,
+                        "expected_operation_revision": revision,
+                        "reason": "Program-cycle Reset released terminal work",
+                    },
+                )
+                deadline = (
+                    time.monotonic() + _PROGRAM_RESET_SETTLEMENT_TIMEOUT_S
+                )
+                while True:
+                    _operation, resident = self._resettable_operation(
+                        self._kernel.operation(task.operation_id), task
+                    )
+                    if not resident:
+                        break
+                    if time.monotonic() >= deadline:
+                        raise ProductionPortError(
+                            "native operation Reset did not settle"
+                        )
+                    time.sleep(_PROGRAM_RESET_SETTLEMENT_POLL_S)
+            with self._lock:
+                self._tasks.pop(task.operation_id, None)
+
+        return ProgramRunScopeSnapshot(
+            program_run_id,
+            ProgramRunScopeState.SETTLED,
+            0,
+        )
+
     def _observe_task(self, task_id: str) -> OwnerTaskSnapshot:
         _operation, snapshot = self._observation(self._task(task_id))
         return snapshot
@@ -2155,6 +2240,9 @@ class _NativeKernelProgramScopePort:
 
     def observe(self, program_run_id: str) -> ProgramRunScopeSnapshot:
         return self._owner._observe_scope(program_run_id)
+
+    def reset(self, program_run_id: str) -> ProgramRunScopeSnapshot:
+        return self._owner._reset_scope(program_run_id)
 
 
 class HeadlessSceneProgramPort:

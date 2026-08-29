@@ -282,6 +282,7 @@ class _ScopePort:
         self._events = events
         self.state = ProgramRunScopeState.SETTLED
         self.stop_requests = 0
+        self.reset_requests = 0
 
     def _snapshot(self, program_run_id: str) -> ProgramRunScopeSnapshot:
         if self.state is ProgramRunScopeState.SETTLED:
@@ -309,6 +310,11 @@ class _ScopePort:
         return self._snapshot(program_run_id)
 
     def observe(self, program_run_id: str) -> ProgramRunScopeSnapshot:
+        return self._snapshot(program_run_id)
+
+    def reset(self, program_run_id: str) -> ProgramRunScopeSnapshot:
+        self.reset_requests += 1
+        self._events.append("scope_reset")
         return self._snapshot(program_run_id)
 
 
@@ -454,6 +460,8 @@ def test_start_captures_the_exact_scenario_closure_before_the_first_tick() -> No
     started = owner.start(admission)
     assert started.state is ProgramRunState.RUNNING
     assert started.tree_status == "invalid"
+    assert started.node_status_revision == 1
+    assert set(started.node_statuses.values()) == {"idle"}
     assert task.starts == 0
     assert started.capture.scenario_id == "ur5-pick-place"
     assert started.capture.scenario_catalog_revision == _DIGEST_A
@@ -474,6 +482,8 @@ def test_start_captures_the_exact_scenario_closure_before_the_first_tick() -> No
 
     completed = owner.advance_once(started.capture.program_run_id)
     assert completed.state is ProgramRunState.SUCCEEDED
+    assert completed.node_status_revision == 2
+    assert set(completed.node_statuses.values()) == {"success"}
     assert completed.active_operation_count == 0
 
 
@@ -781,6 +791,33 @@ def test_failed_tree_projects_the_exact_focused_owner_failure() -> None:
     assert failed.message == ""
 
 
+def test_terminal_run_reset_releases_exact_kernel_scope() -> None:
+    owner, admission, _task, scope, events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
+    started = owner.start(admission)
+    completed = owner.advance_once(started.capture.program_run_id)
+    assert completed.state is ProgramRunState.SUCCEEDED
+
+    reset = owner.reset_effects(started.capture.program_run_id)
+
+    assert reset.state is ProgramRunState.SUCCEEDED
+    assert scope.reset_requests == 1
+    assert events[-1] == "scope_reset"
+
+
+def test_active_run_cannot_reset_kernel_scope() -> None:
+    owner, admission, _task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
+    started = owner.start(admission)
+
+    with pytest.raises(ProgramRunOwnerError, match="only after settlement"):
+        owner.reset_effects(started.capture.program_run_id)
+
+    assert scope.reset_requests == 0
+
+
 def test_authored_pause_requires_intervention_without_redispatch() -> None:
     interventions = ProgramInterventionRegistry(maximum_retained_runs=8)
     owner, admission, task, _scope, _events = _fixture(
@@ -887,6 +924,35 @@ def test_tick_host_keeps_only_operator_stop_intervention_observable() -> None:
     assert task.starts == 1
     assert host.advance_ready_once()[0].state is ProgramRunState.RUNNING
     assert task.starts == 2
+
+    host.stop_run(started.capture.program_run_id)
+    host.shutdown()
+
+
+def test_motion_stop_holds_the_current_node_without_terminating_the_run() -> None:
+    interventions = ProgramInterventionRegistry(maximum_retained_runs=8)
+    owner, admission, _task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE,
+        task_factory=_OperatorStopTaskPort,
+        interventions=interventions,
+    )
+    host = ProgramRunTickHost(owner, tick_interval_s=0.01)
+    started = host.start_run(admission)
+
+    assert host.advance_ready_once()[0].state is ProgramRunState.RUNNING
+    stopped = host.stop_motion(
+        started.capture.program_run_id,
+        reason="ordinary operator motion Stop",
+    )
+    assert stopped.state is ProgramRunState.RUNNING
+    assert stopped.tree_status == "running"
+    assert scope.stop_requests == 1
+
+    held = host.advance_ready_once()[0]
+    assert held.state is ProgramRunState.INTERVENTION_REQUIRED
+    intervention = interventions.read(started.capture.program_run_id)
+    assert intervention is not None
+    assert intervention.policy_parameter == "operator_stop_policy"
 
     host.stop_run(started.capture.program_run_id)
     host.shutdown()
@@ -1089,6 +1155,8 @@ def test_stop_reaches_kernel_scope_before_tree_invalidation_and_waits_for_proof(
     scope.state = ProgramRunScopeState.ACTIVE
     stopping = owner.stop(started.capture.program_run_id, reason="operator stop")
     assert stopping.state is ProgramRunState.STOPPING
+    assert stopping.tree_status == "invalid"
+    assert set(stopping.node_statuses.values()) == {"idle"}
     assert stopping.active_operation_count == 1
     assert events == ["leaf_start", "scope_stop", "leaf_cancel"]
     assert scope.stop_requests == 1
@@ -1101,6 +1169,8 @@ def test_stop_reaches_kernel_scope_before_tree_invalidation_and_waits_for_proof(
     assert still_observed.state is ProgramRunState.STOPPING
     stopped = owner.advance_once(started.capture.program_run_id)
     assert stopped.state is ProgramRunState.STOPPED
+    assert stopped.tree_status == "invalid"
+    assert set(stopped.node_statuses.values()) == {"idle"}
     assert stopped.active_operation_count == 0
 
     repeated = owner.stop(started.capture.program_run_id)
@@ -1208,11 +1278,15 @@ def test_program_run_snapshot_is_a_closed_serializable_owner_projection() -> Non
         "state",
         "capture",
         "tree_status",
+        "node_status_revision",
+        "node_statuses",
         "active_operation_count",
         "reason_code",
         "message",
     }
-    assert value["schema_version"] == "manyforge.program_run_status.v1"
+    assert value["schema_version"] == "manyforge.program_run_status.v2"
+    assert value["node_status_revision"] == 1
+    assert value["node_statuses"]
     assert value["capture"]["schema_version"] == ("manyforge.program_run_capture.v1")
 
 

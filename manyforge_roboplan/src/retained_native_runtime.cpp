@@ -1218,6 +1218,20 @@ create_retained_native_runtime_participants(
   runtime->stop_surveillance_policy = config.stop_surveillance_policy;
   runtime->participant_registrations = std::move(registrations);
   runtime->participant_resolver = std::move(participant_resolver);
+  runtime->stop_surveillance_owner =
+      std::make_unique<RetainedStopSurveillanceOwner>(
+          stop_surveillance_sources(
+              runtime->motion_binding,
+              readiness_for(runtime->participant_registrations,
+                            runtime->motion_binding),
+              runtime->motion_state_channel, runtime->gripper_binding,
+              runtime->gripper_binding.has_value()
+                  ? readiness_for(runtime->participant_registrations,
+                                  *runtime->gripper_binding)
+                  : std::nullopt,
+              runtime->gripper_state_channel,
+              runtime->participant_engine.get()),
+          runtime->clock.get());
   return runtime;
 }
 
@@ -2176,6 +2190,63 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
   }
 }
 
+core::Result<core::StopFaultRecoveryFactsDTO>
+build_retained_native_stop_recovery_facts(
+    RetainedNativeRuntime &runtime,
+    core::ResourceAddressedExecutionKernel &addressed_kernel,
+    core::IResourceOperationAdmissionGate *operation_admission_gate,
+    const core::StopStatusDTO &status, const std::int64_t assessed_at_ns) {
+  if (runtime.stop_surveillance_owner == nullptr ||
+      !status.fault_latch.has_value()) {
+    return core::Result<core::StopFaultRecoveryFactsDTO>::Err(core::ErrorDTO{
+        std::string(core::to_string(core::ErrorCode::kMissingReference)),
+        "native Stop recovery owner is unavailable",
+        {{"reason", "native_stop_recovery_owner_unavailable"}}});
+  }
+  auto facts =
+      runtime.stop_surveillance_owner->BuildRecoveryFacts(status,
+                                                          assessed_at_ns);
+  if (!facts.ok())
+    return facts;
+  const auto &latch = *status.fault_latch;
+  for (const auto &slot : addressed_kernel.resource_snapshot()) {
+    if (!std::binary_search(latch.captured_resources.begin(),
+                            latch.captured_resources.end(),
+                            slot.resource_id)) {
+      continue;
+    }
+    const bool unresolved =
+        slot.state ==
+            core::ResourceSlotState::kUnreconciledExternalOrOrphanGoal ||
+        slot.state == core::ResourceSlotState::kReserved ||
+        slot.state == core::ResourceSlotState::kDispatched ||
+        slot.state == core::ResourceSlotState::kStopping ||
+        (slot.state == core::ResourceSlotState::kTerminal &&
+         slot.stop_generation > latch.stop_generation);
+    if (unresolved) {
+      facts.value().fenced_or_orphan_resources.push_back(slot.resource_id);
+    }
+  }
+  if (operation_admission_gate != nullptr) {
+    auto fenced = operation_admission_gate->current_fenced_resources(
+        latch.captured_resources);
+    facts.value().fenced_or_orphan_resources.insert(
+        facts.value().fenced_or_orphan_resources.end(), fenced.begin(),
+        fenced.end());
+  }
+  auto &blocked = facts.value().fenced_or_orphan_resources;
+  std::sort(blocked.begin(), blocked.end());
+  blocked.erase(std::unique(blocked.begin(), blocked.end()), blocked.end());
+  if (core::stop_fault_recovery_facts_field_error(facts.value())
+          .has_value()) {
+    return core::Result<core::StopFaultRecoveryFactsDTO>::Err(core::ErrorDTO{
+        std::string(core::to_string(core::ErrorCode::kInvariantViolation)),
+        "native Stop recovery facts failed Kernel blocker join",
+        {{"reason", "native_stop_recovery_blocker_join_invalid"}}});
+  }
+  return facts;
+}
+
 void attach_retained_native_addressed_owner(
     const std::shared_ptr<RetainedNativeRuntime> &runtime,
     RetainedNativeAddressedOwnerConfig config) {
@@ -2183,6 +2254,7 @@ void attach_retained_native_addressed_owner(
       runtime->scheduler == nullptr ||
       runtime->participant_registrations.empty() ||
       runtime->participant_engine == nullptr ||
+      runtime->stop_surveillance_owner == nullptr ||
       runtime->operation_journal != nullptr ||
       runtime->addressed_kernel != nullptr ||
       config.request_owner_epoch.empty() || config.cell_id.empty() ||
@@ -2200,20 +2272,6 @@ void attach_retained_native_addressed_owner(
   try {
     std::optional<core::StopSurveillanceExecutionConfig>
         stop_surveillance_config;
-    runtime->stop_surveillance_owner =
-        std::make_unique<RetainedStopSurveillanceOwner>(
-            stop_surveillance_sources(
-                runtime->motion_binding,
-                readiness_for(runtime->participant_registrations,
-                              runtime->motion_binding),
-                runtime->motion_state_channel, runtime->gripper_binding,
-                runtime->gripper_binding.has_value()
-                    ? readiness_for(runtime->participant_registrations,
-                                    *runtime->gripper_binding)
-                    : std::nullopt,
-                runtime->gripper_state_channel,
-                runtime->participant_engine.get()),
-            runtime->clock.get());
     if (runtime->stop_surveillance_policy.has_value()) {
       stop_surveillance_config = core::StopSurveillanceExecutionConfig{
           runtime->stop_surveillance_owner.get(),
@@ -2225,9 +2283,7 @@ void attach_retained_native_addressed_owner(
         [runtime_owner, admission_gate](const core::StopStatusDTO &status,
                                         const std::int64_t assessed_at_ns)
         -> core::Result<core::StopFaultRecoveryFactsDTO> {
-      if (runtime_owner->stop_surveillance_owner == nullptr ||
-          runtime_owner->addressed_kernel == nullptr ||
-          !status.fault_latch.has_value()) {
+      if (runtime_owner->addressed_kernel == nullptr) {
         return core::Result<core::StopFaultRecoveryFactsDTO>::Err(
             core::ErrorDTO{
                 std::string(
@@ -2235,50 +2291,9 @@ void attach_retained_native_addressed_owner(
                 "native Stop recovery owner is unavailable",
                 {{"reason", "native_stop_recovery_owner_unavailable"}}});
       }
-      auto facts = runtime_owner->stop_surveillance_owner->BuildRecoveryFacts(
+      return build_retained_native_stop_recovery_facts(
+          *runtime_owner, *runtime_owner->addressed_kernel, admission_gate,
           status, assessed_at_ns);
-      if (!facts.ok())
-        return facts;
-      const auto &latch = *status.fault_latch;
-      for (const auto &slot :
-           runtime_owner->addressed_kernel->resource_snapshot()) {
-        if (!std::binary_search(latch.captured_resources.begin(),
-                                latch.captured_resources.end(),
-                                slot.resource_id)) {
-          continue;
-        }
-        const bool unresolved =
-            slot.state ==
-                core::ResourceSlotState::kUnreconciledExternalOrOrphanGoal ||
-            slot.state == core::ResourceSlotState::kReserved ||
-            slot.state == core::ResourceSlotState::kDispatched ||
-            slot.state == core::ResourceSlotState::kStopping ||
-            (slot.state == core::ResourceSlotState::kTerminal &&
-             slot.stop_generation > latch.stop_generation);
-        if (unresolved) {
-          facts.value().fenced_or_orphan_resources.push_back(slot.resource_id);
-        }
-      }
-      if (admission_gate != nullptr) {
-        auto fenced =
-            admission_gate->current_fenced_resources(latch.captured_resources);
-        facts.value().fenced_or_orphan_resources.insert(
-            facts.value().fenced_or_orphan_resources.end(), fenced.begin(),
-            fenced.end());
-      }
-      auto &blocked = facts.value().fenced_or_orphan_resources;
-      std::sort(blocked.begin(), blocked.end());
-      blocked.erase(std::unique(blocked.begin(), blocked.end()), blocked.end());
-      if (core::stop_fault_recovery_facts_field_error(facts.value())
-              .has_value()) {
-        return core::Result<core::StopFaultRecoveryFactsDTO>::Err(
-            core::ErrorDTO{
-                std::string(
-                    core::to_string(core::ErrorCode::kInvariantViolation)),
-                "native Stop recovery facts failed Kernel blocker join",
-                {{"reason", "native_stop_recovery_blocker_join_invalid"}}});
-      }
-      return facts;
     };
     core::ResourceAddressedExecutionKernelConfig addressed_config{
         std::move(config.request_owner_epoch), kernel_cell_id,
@@ -2307,7 +2322,6 @@ void attach_retained_native_addressed_owner(
     runtime->addressed_request_owner_epoch = kernel_request_owner_epoch;
     runtime->addressed_cell_id = kernel_cell_id;
   } catch (...) {
-    runtime->stop_surveillance_owner.reset();
     runtime->operation_journal.reset();
     throw;
   }

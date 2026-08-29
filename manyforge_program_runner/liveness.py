@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import errno
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import select
@@ -29,6 +30,9 @@ RENEWAL_INTERVAL_NS: Final = 250_000_000
 EXPIRY_TIMEOUT_NS: Final = 1_000_000_000
 MAXIMUM_PACKET_BYTES: Final = 16_384
 MAXIMUM_SEQUENCE: Final = 9_007_199_254_740_991
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class ProgramRunnerLivenessError(RuntimeError):
@@ -88,6 +92,7 @@ class ProgramRunnerLivenessReceiver:
         self._fenced = True
         self._fault_reference = retained.fault_reference
         self._predecessor_expired = retained.expired
+        self._last_rejection: str | None = None
 
     @staticmethod
     def _safe_run_root(metadata: os.stat_result) -> bool:
@@ -425,8 +430,16 @@ class ProgramRunnerLivenessReceiver:
                         raise ProgramRunnerLivenessError(
                             "liveness acknowledgement was truncated"
                         )
-                except Exception:
+                    self._last_rejection = None
+                except Exception as error:
                     # Strict rejection is intentionally response-free.
+                    rejection = f"{type(error).__name__}: {error}"
+                    if rejection != self._last_rejection:
+                        _LOGGER.warning(
+                            "Program Runner rejected Manager liveness: %s",
+                            rejection,
+                        )
+                        self._last_rejection = rejection
                     continue
 
     @staticmethod
@@ -489,18 +502,23 @@ class ProgramRunnerLivenessReceiver:
         ):
             raise ProgramRunnerLivenessError("malformed Program-cycle identity")
         idle = state == "idle_after_reset"
-        if idle != (
+        if idle and not (
             run_id is None and claim_generation is None and terminal is None
         ):
-            raise ProgramRunnerLivenessError("malformed Program-cycle state shape")
+            raise ProgramRunnerLivenessError("malformed idle Program cycle")
         if not idle and (
             not isinstance(run_id, str)
             or not run_id
             or len(run_id.encode("utf-8")) > 256
-            or type(claim_generation) is not int
+        ):
+            raise ProgramRunnerLivenessError("malformed Program-cycle run identity")
+        if not idle and claim_generation is None and state != "starting":
+            raise ProgramRunnerLivenessError("malformed unacquired Program cycle")
+        if claim_generation is not None and (
+            type(claim_generation) is not int
             or not 1 <= claim_generation <= MAXIMUM_SEQUENCE
         ):
-            raise ProgramRunnerLivenessError("malformed active Program cycle")
+            raise ProgramRunnerLivenessError("malformed Program-cycle claim")
         if terminal is not None and (
             not isinstance(terminal, str)
             or len(terminal) != 71

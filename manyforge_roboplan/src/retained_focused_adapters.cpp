@@ -228,7 +228,7 @@ RetainedRoboPlanKinematicsAdapter::forward_kinematics_batch(
     }
     return core::Result<std::map<std::string, core::Pose3DTO>>::Ok(
         std::move(result));
-  } catch (const std::exception& error) {
+  } catch (const std::exception &error) {
     return core::Result<std::map<std::string, core::Pose3DTO>>::Err(
         adapter_error(core::ErrorCode::kInvalidRequest, error.what(),
                       "forward_kinematics_batch_failed"));
@@ -237,51 +237,100 @@ RetainedRoboPlanKinematicsAdapter::forward_kinematics_batch(
 
 core::Result<core::JointLimitsDTO>
 RetainedRoboPlanKinematicsAdapter::joint_limits(
-    const std::string& component_id,
-    const std::string& command_target_id) const {
+    const std::string &component_id,
+    const std::string &command_target_id) const {
   if (component_id != binding_.value().controllable_component_id.value() ||
       command_target_id != binding_.value().command_target_id.value()) {
-    return core::Result<core::JointLimitsDTO>::Err(adapter_error(
-        core::ErrorCode::kInvalidRequest,
-        "Joint-limit query crosses its retained target",
-        "retained_joint_limits_binding_mismatch"));
+    return core::Result<core::JointLimitsDTO>::Err(
+        adapter_error(core::ErrorCode::kInvalidRequest,
+                      "Joint-limit query crosses its retained target",
+                      "retained_joint_limits_binding_mismatch"));
   }
   try {
     std::lock_guard<std::mutex> lock(*scene_mutex_);
     core::JointLimitsDTO limits;
     limits.joint_names = compiled_joint_names_;
-    if (auto position = scene_->getPositionLimitVectors(
-            compiled_group_name_, /*collapsed=*/false)) {
+    const auto expected_size = compiled_joint_names_.size();
+    if (auto position = scene_->getPositionLimitVectors(compiled_group_name_,
+                                                        /*collapsed=*/false)) {
+      if (static_cast<std::size_t>(position->first.size()) != expected_size ||
+          static_cast<std::size_t>(position->second.size()) != expected_size) {
+        throw std::runtime_error("retained position-limit dimension mismatch");
+      }
       limits.position_lower_rad.assign(position->first.data(),
                                        position->first.data() +
                                            position->first.size());
       limits.position_upper_rad.assign(position->second.data(),
                                        position->second.data() +
                                            position->second.size());
+      for (std::size_t index = 0U; index < expected_size; ++index) {
+        if (!std::isfinite(limits.position_lower_rad[index]) ||
+            !std::isfinite(limits.position_upper_rad[index]) ||
+            limits.position_lower_rad[index] >
+                limits.position_upper_rad[index]) {
+          throw std::runtime_error("retained position limits are invalid");
+        }
+      }
+    } else {
+      throw std::runtime_error("retained position limits are unavailable");
     }
-    if (auto velocity =
-            scene_->getVelocityLimitVectors(compiled_group_name_)) {
-      limits.velocity_max_rad_s.assign(
-          velocity->second.data(),
-          velocity->second.data() + velocity->second.size());
+    if (auto velocity = scene_->getVelocityLimitVectors(compiled_group_name_)) {
+      if (static_cast<std::size_t>(velocity->second.size()) != expected_size) {
+        throw std::runtime_error("retained velocity-limit dimension mismatch");
+      }
+      limits.velocity_max_rad_s.assign(velocity->second.data(),
+                                       velocity->second.data() +
+                                           velocity->second.size());
+      if (std::any_of(limits.velocity_max_rad_s.begin(),
+                      limits.velocity_max_rad_s.end(), [](double value) {
+                        return !std::isfinite(value) || value <= 0.0;
+                      })) {
+        throw std::runtime_error("retained velocity limits are invalid");
+      }
+    } else {
+      throw std::runtime_error("retained velocity limits are unavailable");
     }
     if (auto acceleration =
             scene_->getAccelerationLimitVectors(compiled_group_name_)) {
-      limits.acceleration_max_rad_s2.assign(
-          acceleration->second.data(),
-          acceleration->second.data() + acceleration->second.size());
+      std::vector<double> acceleration_values(acceleration->second.data(),
+                                              acceleration->second.data() +
+                                                  acceleration->second.size());
+      if (acceleration_values.size() != expected_size) {
+        throw std::runtime_error(
+            "retained acceleration-limit dimension mismatch");
+      }
+      const auto missing = [](double value) {
+        return value == std::numeric_limits<double>::max();
+      };
+      const bool any_missing = std::any_of(acceleration_values.begin(),
+                                           acceleration_values.end(), missing);
+      const bool all_missing = std::all_of(acceleration_values.begin(),
+                                           acceleration_values.end(), missing);
+      if (any_missing && !all_missing) {
+        throw std::runtime_error(
+            "retained acceleration limits are only partially declared");
+      }
+      if (!all_missing) {
+        if (std::any_of(acceleration_values.begin(), acceleration_values.end(),
+                        [](double value) {
+                          return !std::isfinite(value) || value <= 0.0;
+                        })) {
+          throw std::runtime_error("retained acceleration limits are invalid");
+        }
+        limits.acceleration_max_rad_s2 = std::move(acceleration_values);
+      }
     }
     return core::Result<core::JointLimitsDTO>::Ok(std::move(limits));
-  } catch (const std::exception& error) {
-    return core::Result<core::JointLimitsDTO>::Err(adapter_error(
-        core::ErrorCode::kInvalidRequest, error.what(),
-        "joint_limits_unavailable"));
+  } catch (const std::exception &error) {
+    return core::Result<core::JointLimitsDTO>::Err(
+        adapter_error(core::ErrorCode::kInvalidRequest, error.what(),
+                      "joint_limits_unavailable"));
   }
 }
 
 core::Result<std::vector<std::string>>
 RetainedRoboPlanKinematicsAdapter::group_joint_names(
-    const std::string& command_target_id) const {
+    const std::string &command_target_id) const {
   if (command_target_id != binding_.value().command_target_id.value()) {
     return core::Result<std::vector<std::string>>::Err(adapter_error(
         core::ErrorCode::kInvalidRequest,

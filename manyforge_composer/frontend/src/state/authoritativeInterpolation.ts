@@ -13,7 +13,7 @@ export const MAX_AUTHORITATIVE_INTERPOLATION_MS = 250;
 export interface AuthoritativeTransformFrame {
   streamIdentity: string;
   sourceSequence: number;
-  observedAtNs: number;
+  observedAtNs: number | null;
   positionM: Vector3Tuple;
   orientationXyzw: QuaternionXyzwTuple;
 }
@@ -67,8 +67,8 @@ export function authoritativeInterpolationDurationMs(
     || !Number.isSafeInteger(previous.sourceSequence)
     || !Number.isSafeInteger(next.sourceSequence)
     || next.sourceSequence <= previous.sourceSequence
-    || !Number.isFinite(previous.observedAtNs)
-    || !Number.isFinite(next.observedAtNs)
+    || previous.observedAtNs === null
+    || next.observedAtNs === null
     || next.observedAtNs <= previous.observedAtNs
   ) return 0;
 

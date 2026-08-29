@@ -96,7 +96,29 @@ def _fence(workspace: dict) -> dict:
     }
 
 
-def _motion_projection(*, sequence: int = 1) -> dict:
+def _motion_identity() -> dict:
+    return {
+        "owner_epoch": "owner-1",
+        "graph_revision": "graph-1",
+        "retained_bundle_id": "bundle-1",
+    }
+
+
+def _motion_targets_projection() -> dict:
+    return {
+        "ok": True,
+        "identity": _motion_identity(),
+        "targets": {
+            "direct_control": {
+                "target_role_id": "arm",
+                "controllable_component_id": "robot",
+                "command_target_id": "arm",
+            },
+        },
+    }
+
+
+def _motion_control_projection(*, sequence: int = 1) -> dict:
     names = [
         "shoulder_pan_joint",
         "shoulder_lift_joint",
@@ -106,24 +128,21 @@ def _motion_projection(*, sequence: int = 1) -> dict:
         "wrist_3_joint",
     ]
     return {
-        "status": {
-            "direct_control": {
-                "target_role_id": "arm",
-                "controllable_component_id": "robot",
-                "command_target_id": "arm",
-                "observed_state": {
-                    "complete": True,
-                    "current_tcp_pose": {
-                        "position_m": {"x_m": 0.1, "y_m": 0.2, "z_m": 0.3},
-                        "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
-                    },
-                    "positions_rad": [0.1, -1.1, 0.9, -1.4, -1.2, 0.3],
-                    "sequence": sequence,
-                    "source_epoch": "native-source",
-                    "source_joint_names": names,
+        "ok": True,
+        "identity": _motion_identity(),
+        "control_state": {
+            "observed_motion": {
+                "complete": True,
+                "current_tcp_pose": {
+                    "position_m": {"x_m": 0.1, "y_m": 0.2, "z_m": 0.3},
+                    "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
                 },
+                "positions_rad": [0.1, -1.1, 0.9, -1.4, -1.2, 0.3],
+                "sequence": sequence,
+                "source_epoch": "native-source",
+                "source_joint_names": names,
             }
-        }
+        },
     }
 
 
@@ -134,9 +153,12 @@ def test_observed_move_reads_one_exact_source_snapshot_under_the_claim(
         def __init__(self) -> None:
             self.reads = 0
 
-        def execution_status(self) -> dict:
+        def execution_targets(self) -> dict:
+            return _motion_targets_projection()
+
+        def execution_control_state(self) -> dict:
             self.reads += 1
-            return _motion_projection(sequence=self.reads)
+            return _motion_control_projection(sequence=self.reads)
 
         def program_applied(self) -> dict:
             return {}
@@ -184,8 +206,11 @@ def test_observed_move_reads_one_exact_source_snapshot_under_the_claim(
 
 def test_observed_move_is_one_revision_fenced_draft_mutation(tmp_path: Path) -> None:
     class Headless:
-        def execution_status(self) -> dict:
-            return _motion_projection()
+        def execution_targets(self) -> dict:
+            return _motion_targets_projection()
+
+        def execution_control_state(self) -> dict:
+            return _motion_control_projection()
 
         def program_applied(self) -> dict:
             return {}

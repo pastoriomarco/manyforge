@@ -305,6 +305,9 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   /// on a worker thread. Callers observe progress via get_status() and events.
   Result<uint64_t> execute(const ExecuteRequestDTO& request) override;
 
+  Result<void> adopt_certified_motion_stop(
+      std::uint64_t execution_id, const StopCertificateRefDTO& certificate) override;
+
   Result<std::uint64_t> PrepareMotion(ResolvedPreparedMotionExecutionRequestDTO request) override;
   Result<ResolvedPreparedMotionExecutionSnapshotDTO> ObservePreparedMotion(
       std::uint64_t execution_id) const override;

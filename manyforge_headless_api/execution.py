@@ -134,7 +134,15 @@ CAPABILITY_COMMAND_PREVIEW_RECEIPT_KEYS = frozenset(
 
 
 class ExecutionPort(Protocol):
-    def status(self) -> dict[str, Any]: ...
+    def diagnostics(self) -> dict[str, Any]: ...
+
+    def identity(self) -> dict[str, Any]: ...
+
+    def targets(self) -> dict[str, Any]: ...
+
+    def control_state(self) -> dict[str, Any]: ...
+
+    def observation(self) -> dict[str, Any]: ...
 
     def submit(
         self,
@@ -414,16 +422,36 @@ class ExecutionCommandClient:
             "principal_id": trusted_principal_id,
         }
 
-    def status(self) -> dict[str, Any]:
+    def _read_projection(self, command: str) -> dict[str, Any]:
         response = self._exchange(
-            {"api_version": EXECUTION_COMMAND_VERSION, "command": "status"}
+            {"api_version": EXECUTION_COMMAND_VERSION, "command": command}
         )
-        if response.get("ok") is True and response.get("command") != "status":
+        if response.get("ok") is True and response.get("command") != command:
             raise HeadlessApiError(
                 "execution_command_response_invalid",
-                "execution status response has the wrong command kind",
+                f"execution {command} response has the wrong command kind",
             )
         return response
+
+    def diagnostics(self) -> dict[str, Any]:
+        """Return the explicit aggregate diagnostic projection.
+
+        The retained native wire spelling remains ``status`` for compatibility;
+        ordinary runtime observers do not use it.
+        """
+        return self._read_projection("status")
+
+    def identity(self) -> dict[str, Any]:
+        return self._read_projection("identity")
+
+    def targets(self) -> dict[str, Any]:
+        return self._read_projection("targets")
+
+    def control_state(self) -> dict[str, Any]:
+        return self._read_projection("control_state")
+
+    def observation(self) -> dict[str, Any]:
+        return self._read_projection("observation")
 
     @staticmethod
     def _raise_error_response(response: dict[str, Any]) -> None:
@@ -1459,11 +1487,14 @@ class ExecutionCommandClient:
         self,
         request: StopFaultRecoveryIntentRequest,
     ) -> dict[str, Any]:
+        request_payload = request.model_dump(mode="json")
+        if request.reason is None:
+            request_payload.pop("reason")
         response = self._exchange(
             {
                 "api_version": EXECUTION_COMMAND_VERSION,
                 "command": "recover_stop_fault",
-                "request": request.model_dump(mode="json", exclude_none=True),
+                "request": request_payload,
             }
         )
         result = response.get("result")
@@ -1624,11 +1655,11 @@ class ExecutionEventPump:
         while not self._stop.is_set():
             try:
                 if owner_epoch is None:
-                    status_response = self._execution.status()
-                    if status_response.get("ok") is not True:
-                        idle_epoch = self._idle_owner_epoch(status_response)
+                    identity_response = self._execution.identity()
+                    if identity_response.get("ok") is not True:
+                        idle_epoch = self._idle_owner_epoch(identity_response)
                         if idle_epoch is None:
-                            ExecutionCommandClient._raise_error_response(status_response)
+                            ExecutionCommandClient._raise_error_response(identity_response)
                         if source_high_water_epoch != idle_epoch:
                             source_high_water_epoch = idle_epoch
                             source_high_water = 0
@@ -1639,7 +1670,7 @@ class ExecutionEventPump:
                         self._record_error(None)
                         self._stop.wait(self._poll_seconds)
                         continue
-                    status = status_response.get("status")
+                    status = identity_response.get("identity")
                     next_epoch = (
                         status.get("owner_epoch")
                         if isinstance(status, dict)

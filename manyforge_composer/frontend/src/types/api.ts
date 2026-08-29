@@ -460,13 +460,15 @@ export interface ProgramRunCapture {
 }
 
 export interface ProgramRunStatus {
-  schemaVersion: 'manyforge.program_run_status.v1';
+  schemaVersion: 'manyforge.program_run_status.v2';
   ownerId: string;
   ownerEpoch: string;
   runRevision: number;
   state: ProgramRunStateName;
   capture: ProgramRunCapture;
   treeStatus: 'invalid' | 'running' | 'success' | 'failure';
+  nodeStatusRevision: number;
+  nodeStatuses: Record<string, 'idle' | 'running' | 'success' | 'failure'>;
   activeOperationCount: number | null;
   reasonCode: string | null;
   message: string;

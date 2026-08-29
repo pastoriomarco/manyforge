@@ -19,9 +19,15 @@ struct ManagerCellAdmissionReadinessFacts final {
   std::uint32_t unsettled_effect_count{};
 };
 
+[[nodiscard]] inline bool IsCurrentProgramRunnerOwner(
+    const manyforge::core::ProgramCycleStatusDTO &status,
+    const manyforge::core::RuntimeEpoch &runtime_epoch) {
+  return status.program_runner_owner_epoch.value() == runtime_epoch.value();
+}
+
 [[nodiscard]] inline manyforge::core::CellAdmissionReadinessSnapshotDTO
 ReduceManagerCellAdmissionReadiness(
-    const ManagerCellAdmissionReadinessFacts& facts) {
+    const ManagerCellAdmissionReadinessFacts &facts) {
   return {
       facts.program_cycle_status_current,
       facts.program_cycle_status,

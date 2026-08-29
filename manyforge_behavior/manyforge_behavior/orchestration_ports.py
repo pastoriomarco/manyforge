@@ -388,7 +388,7 @@ class ProgramRunScopeSnapshot:
 
 
 class ProgramRunScopePort(Protocol):
-    """Stop and observe all Kernel operations attributed to one Program run."""
+    """Stop, reset, and observe Kernel operations for one Program run."""
 
     def request_stop(
         self,
@@ -397,6 +397,8 @@ class ProgramRunScopePort(Protocol):
     ) -> ProgramRunScopeSnapshot: ...
 
     def observe(self, program_run_id: str) -> ProgramRunScopeSnapshot: ...
+
+    def reset(self, program_run_id: str) -> ProgramRunScopeSnapshot: ...
 
 
 @dataclass(frozen=True, slots=True)

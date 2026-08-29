@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 import hashlib
 import json
+import time
 from typing import Any, Sequence
 
 import rfc8785
@@ -73,7 +74,7 @@ RUNTIME_SNAPSHOT_VERSION = "manyforge.headless_runtime_snapshot.v1"
 MANAGER_SOURCE_VERSION = "manyforge.manager_source.v1"
 PROGRAM_APPLY_RESULT_VERSION = "manyforge.program_apply_result.v2"
 PROGRAM_RUN_INDEX_VERSION = "manyforge.program_run_index.v1"
-PROGRAM_RUN_STATUS_VERSION = "manyforge.program_run_status.v1"
+PROGRAM_RUN_STATUS_VERSION = "manyforge.program_run_status.v2"
 PROGRAM_RUN_CAPTURE_VERSION = "manyforge.program_run_capture.v1"
 SOURCE_MODEL_CONTEXT_VERSION = "manyforge.source_model_context.v1"
 ASSISTANT_MODE_CONTEXT_VERSION = "manyforge.assistant_mode_context.v1"
@@ -329,8 +330,25 @@ class HeadlessService:
             )
         return self.execution
 
+    def execution_diagnostics(self) -> dict[str, Any]:
+        """Return the explicit, cold-path aggregate owner projection."""
+        return self._execution().diagnostics()
+
     def execution_status(self) -> dict[str, Any]:
-        return self._execution().status()
+        """Compatibility alias; product consumers use focused projections."""
+        return self.execution_diagnostics()
+
+    def execution_identity(self) -> dict[str, Any]:
+        return self._execution().identity()
+
+    def execution_targets(self) -> dict[str, Any]:
+        return self._execution().targets()
+
+    def execution_control_state(self) -> dict[str, Any]:
+        return self._execution().control_state()
+
+    def execution_observation(self) -> dict[str, Any]:
+        return self._execution().observation()
 
     def execution_submit(
         self,
@@ -796,6 +814,8 @@ class HeadlessService:
             "active_operation_count",
             "capture",
             "message",
+            "node_status_revision",
+            "node_statuses",
             "owner_epoch",
             "owner_id",
             "reason_code",
@@ -826,6 +846,7 @@ class HeadlessService:
         state = projection.get("state")
         active_count = projection.get("active_operation_count")
         reason = projection.get("reason_code")
+        node_statuses = projection.get("node_statuses")
         owner_identities = (
             capture.get("owner_identities") if isinstance(capture, dict) else None
         )
@@ -850,6 +871,15 @@ class HeadlessService:
             or state not in _PROGRAM_RUN_STATES
             or projection.get("tree_status")
             not in {"invalid", "running", "success", "failure"}
+            or type(projection.get("node_status_revision")) is not int
+            or not 1 <= projection["node_status_revision"] <= 9_007_199_254_740_991
+            or not isinstance(node_statuses, dict)
+            or len(node_statuses) > 100_000
+            or any(
+                not _bounded_text(instance_id, maximum_bytes=512)
+                or status not in {"idle", "running", "success", "failure"}
+                for instance_id, status in node_statuses.items()
+            )
             or (
                 active_count is not None
                 and (
@@ -1152,17 +1182,185 @@ class HeadlessService:
             expected_owner_epoch=request.expected_owner_epoch,
         )
 
+    def program_run_motion_stop(
+        self,
+        program_run_id: str,
+        request: ProgramRunStopRequest,
+    ) -> dict[str, Any]:
+        try:
+            projection = self._program_runner().stop_motion(
+                program_run_id,
+                request.model_dump(mode="json"),
+            )
+        except ProgramRunnerClientError as error:
+            raise self._runner_error(error) from error
+        return self._validate_program_run_snapshot(
+            projection,
+            expected_program_run_id=program_run_id,
+            expected_owner_epoch=request.expected_owner_epoch,
+        )
+
     def program_cycle_status(self) -> dict[str, Any]:
         try:
             return self._program_runner().cycle_status()
         except ProgramRunnerClientError as error:
             raise self._runner_error(error) from error
 
+    @staticmethod
+    def _require_owner_success(
+        response: dict[str, Any], *, fallback_code: str, fallback_message: str
+    ) -> dict[str, Any]:
+        if response.get("ok") is True:
+            return response
+        error = response.get("error")
+        if isinstance(error, dict):
+            code = error.get("code")
+            message = error.get("message")
+            if isinstance(code, str) and code and isinstance(message, str) and message:
+                raise HeadlessApiError(code, message)
+        raise HeadlessApiError(fallback_code, fallback_message)
+
+    def _recover_stop_fault_for_cycle_reset(
+        self, request: ProgramCycleResetRequest
+    ) -> None:
+        """Clear one exact owner-issued Stop latch before releasing its cycle.
+
+        Reset remains one operator command.  The HTTP/browser layer neither
+        guesses recovery facts nor coordinates multiple effects: Headless
+        reads the current execution owner's offer and returns it unchanged as
+        the exact recovery intent.  No active latch is the ordinary fast path.
+        """
+
+        execution = self._execution()
+        owner_epoch: str | None = None
+        for attempt in range(100):
+            fault_response = self._require_owner_success(
+                execution.stop_fault(),
+                fallback_code="program_cycle_reset_stop_recovery_unavailable",
+                fallback_message="Stop recovery state is unavailable",
+            )
+            offer = fault_response.get("stop_fault")
+            if offer is None:
+                return
+            if not isinstance(offer, dict):
+                raise HeadlessApiError(
+                    "program_cycle_reset_stop_recovery_invalid",
+                    "Stop recovery owner returned an invalid offer",
+                )
+            latch = offer.get("latch")
+            expectations = offer.get("configuration_expectations")
+            if not isinstance(latch, dict) or not isinstance(expectations, list):
+                raise HeadlessApiError(
+                    "program_cycle_reset_stop_recovery_invalid",
+                    "Stop recovery owner returned incomplete facts",
+                )
+            certificate = latch.get("stop_certificate")
+            if not isinstance(certificate, dict):
+                raise HeadlessApiError(
+                    "program_cycle_reset_stop_recovery_invalid",
+                    "Stop recovery offer has no exact Stop certificate",
+                )
+            if owner_epoch is None:
+                status_response = self._require_owner_success(
+                    execution.identity(),
+                    fallback_code="program_cycle_reset_stop_recovery_unavailable",
+                    fallback_message="Execution-owner identity is unavailable",
+                )
+                status = status_response.get("identity")
+                current_owner_epoch = (
+                    status.get("owner_epoch") if isinstance(status, dict) else None
+                )
+                if not isinstance(current_owner_epoch, str) or not current_owner_epoch:
+                    raise HeadlessApiError(
+                        "program_cycle_reset_stop_recovery_invalid",
+                        "Execution owner returned no current recovery identity",
+                    )
+                owner_epoch = current_owner_epoch
+            recovery_id = "program-reset-recovery-" + hashlib.sha256(
+                (
+                    request.request_owner_epoch
+                    + "\0"
+                    + request.request_id
+                    + "\0"
+                    + str(attempt)
+                ).encode("utf-8")
+            ).hexdigest()[:32]
+            recovery = StopFaultRecoveryIntentRequest.model_validate(
+                {
+                    "request_context": {
+                        "request_id": recovery_id,
+                        "request_owner_epoch": owner_epoch,
+                        "source_label": "headless_program_cycle_reset",
+                        "correlation_id": request.request_id,
+                    },
+                    "expected_latch_id": latch.get("latch_id"),
+                    "expected_latch_generation": latch.get("latch_generation"),
+                    "expected_recovery_assessment_revision": latch.get(
+                        "recovery_assessment_revision"
+                    ),
+                    "expected_stop_certificate_id": certificate.get(
+                        "stop_certificate_id"
+                    ),
+                    "expected_stop_certificate_revision": certificate.get(
+                        "stop_certificate_revision"
+                    ),
+                    "expected_cell_id": latch.get("cell_id"),
+                    "expected_retained_bundle_id": latch.get(
+                        "retained_bundle_id"
+                    ),
+                    "expected_graph_revision": latch.get("graph_revision"),
+                    "configuration_expectations": expectations,
+                    "reason": "operator requested Program cycle Reset",
+                }
+            )
+            recovered = self._require_owner_success(
+                execution.recover_stop_fault(recovery),
+                fallback_code="program_cycle_reset_stop_recovery_failed",
+                fallback_message="Execution owner rejected Stop recovery",
+            )
+            result = recovered.get("result")
+            if not isinstance(result, dict) or type(result.get("accepted")) is not bool:
+                raise HeadlessApiError(
+                    "program_cycle_reset_stop_recovery_invalid",
+                    "Stop recovery owner returned an invalid result",
+                )
+            if result["accepted"]:
+                # The next observation confirms that the latch actually
+                # disappeared; it also makes accepted recovery replay-safe.
+                continue
+            if attempt != 99:
+                time.sleep(0.05)
+        raise HeadlessApiError(
+            "program_cycle_reset_stop_recovery_pending",
+            "Stop recovery did not settle before the Reset deadline",
+        )
+
     def program_cycle_reset(
         self, request: ProgramCycleResetRequest
     ) -> dict[str, Any]:
         try:
-            return self._program_runner().reset_cycle(
+            runner = self._program_runner()
+            cycle = runner.cycle_status()
+            if (
+                cycle.get("state") != "terminal_awaiting_reset"
+                or cycle.get("program_runner_owner_epoch")
+                != request.expected_owner_epoch
+                or cycle.get("cycle_generation")
+                != request.expected_cycle_generation
+                or cycle.get("program_run_id") != request.program_run_id
+                or cycle.get("cycle_claim_generation")
+                != request.expected_claim_generation
+                or cycle.get("terminal_or_settlement_reference")
+                != request.terminal_reference
+                or request.settlement_evidence_digest
+                != request.terminal_reference
+            ):
+                raise HeadlessApiError(
+                    "program_cycle_reset_stale",
+                    "Reset does not identify the exact terminal Program cycle",
+                )
+            self._recover_stop_fault_for_cycle_reset(request)
+            return runner.reset_cycle(
                 request.model_dump(mode="json")
             )
         except ProgramRunnerClientError as error:

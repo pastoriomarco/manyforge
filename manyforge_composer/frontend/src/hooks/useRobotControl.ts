@@ -64,7 +64,10 @@ export interface RobotControlController {
   retry: () => void;
 }
 
-export function useRobotControl(enabled: boolean): RobotControlController {
+export function useRobotControl(
+  enabled: boolean,
+  observeProgramRun = false,
+): RobotControlController {
   const [state, dispatch] = useReducer(
     robotControlReducer,
     initialRobotControlState,
@@ -85,6 +88,7 @@ export function useRobotControl(enabled: boolean): RobotControlController {
   const runtimeScaleTimer = useRef<number | null>(null);
   const runtimeScaleAbort = useRef<AbortController | null>(null);
   const runtimeScaleFlush = useRef<() => void>(() => undefined);
+  const programRunWasObserved = useRef(false);
 
   useEffect(() => {
     if (!enabled) {
@@ -94,7 +98,7 @@ export function useRobotControl(enabled: boolean): RobotControlController {
     const controller = new AbortController();
     let current = true;
     dispatch({ type: 'load' });
-    void api.execution.status(controller.signal)
+    void api.execution.controlStatus(controller.signal)
       .then((status) => {
         if (current) dispatch({ type: 'status_resolved', status });
       })
@@ -111,6 +115,25 @@ export function useRobotControl(enabled: boolean): RobotControlController {
       controller.abort();
     };
   }, [enabled, reloadToken]);
+
+  useEffect(() => {
+    if (!enabled || !observeProgramRun) return;
+    programRunWasObserved.current = true;
+  }, [enabled, observeProgramRun]);
+
+  useEffect(() => {
+    if (!enabled) {
+      programRunWasObserved.current = false;
+      return undefined;
+    }
+    if (observeProgramRun || !programRunWasObserved.current) return undefined;
+    programRunWasObserved.current = false;
+    const controller = new AbortController();
+    void api.execution.controlStatus(controller.signal)
+      .then((status) => dispatch({ type: 'status_refreshed', status }))
+      .catch(() => undefined);
+    return () => controller.abort();
+  }, [enabled, observeProgramRun]);
 
   useEffect(() => {
     if (
@@ -228,7 +251,7 @@ export function useRobotControl(enabled: boolean): RobotControlController {
     if (!enabled || terminalOperation === null) return undefined;
     const controller = new AbortController();
     let current = true;
-    void api.execution.status(controller.signal)
+    void api.execution.controlStatus(controller.signal)
       .then((status) => {
         if (current) dispatch({ type: 'status_refreshed', status });
       })

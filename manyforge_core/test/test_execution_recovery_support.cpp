@@ -5,6 +5,8 @@
 
 #include <gtest/gtest.h>
 
+#include <limits>
+
 namespace manyforge::core {
 namespace {
 
@@ -462,6 +464,30 @@ TEST(RecoveryAssessmentTest,
   EXPECT_FALSE(assessment.observed_state_measured);
   EXPECT_EQ(assessment.observed_state_authority_profile,
             "native_predicted_v1");
+}
+
+TEST(RecoveryAssessmentTest,
+     UnboundedObservationFreshnessHasNoAbsoluteDeadline) {
+  auto capture = make_interrupted_capture(
+      InterruptPreemptionResult::kSucceeded, false, true);
+  ObservedStateEvidenceDTO observed;
+  observed.sequence = 1;
+  observed.complete = true;
+  observed.at_rest = true;
+  observed.sampled_at_ns = 123;
+  observed.freshness_budget_ns =
+      std::numeric_limits<std::int64_t>::max() - observed.sampled_at_ns;
+  observed.source_identity = "native_predicted_state";
+  observed.authority_profile = "retained_native_state_authority";
+  capture.observed_state = observed;
+  capture.observed_state_qualified = true;
+
+  const auto assessment =
+      build_recovery_assessment(capture, RecoveryReadinessPolicy{}, 0);
+
+  EXPECT_TRUE(assessment.observed_state_available);
+  EXPECT_TRUE(assessment.observed_state_fresh);
+  EXPECT_EQ(assessment.observed_state_valid_until_ns, 0);
 }
 
 TEST(RecoveryAssessmentTest, EquallySafeFactsDoNotChurnRevision) {

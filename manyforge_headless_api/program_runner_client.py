@@ -47,6 +47,12 @@ class ProgramRunnerPort(Protocol):
         body: Mapping[str, Any],
     ) -> dict[str, Any]: ...
 
+    def stop_motion(
+        self,
+        program_run_id: str,
+        body: Mapping[str, Any],
+    ) -> dict[str, Any]: ...
+
     def cycle_status(self) -> dict[str, Any]: ...
 
     def reset_cycle(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
@@ -221,6 +227,17 @@ class ProgramRunnerHttpClient:
         return self._request(
             "POST",
             f"{self._run_path(program_run_id)}/stop",
+            body=body,
+        )
+
+    def stop_motion(
+        self,
+        program_run_id: str,
+        body: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"{self._run_path(program_run_id)}/motion-stop",
             body=body,
         )
 

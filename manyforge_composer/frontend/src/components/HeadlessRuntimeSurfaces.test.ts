@@ -102,7 +102,9 @@ describe('headless Composer presentation adapters', () => {
     expect(clientFailure.components).toContainEqual(expect.objectContaining({
       id: 'composer_client_errors',
       status: 'fault',
+      detail: '1 dismissal required',
     }));
+    expect(terminal.summaryLabel).toBe('Operational attention');
   });
 
   it('maps only the four-state owner record into alarm presentation', () => {

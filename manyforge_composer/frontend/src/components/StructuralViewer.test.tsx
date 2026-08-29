@@ -5,6 +5,7 @@ import * as THREE from 'three';
 import { describe, expect, it } from 'vitest';
 
 import {
+  DEFAULT_COMPARISON_GHOST_VISIBLE,
   DEFAULT_WIREFRAME_VISIBLE,
   VIEWER_CLICK_MAX_DURATION_MS,
   VIEWER_CONTEXT_DRAG_THRESHOLD_PX,
@@ -71,6 +72,7 @@ describe('viewer failure isolation', () => {
     );
 
     expect(DEFAULT_WIREFRAME_VISIBLE).toBe(false);
+    expect(DEFAULT_COMPARISON_GHOST_VISIBLE).toBe(false);
     expect(source).toContain('<span>Wireframe overlays</span>');
     expect(source).toContain('wireframe={wireframe}');
     expect(source).toContain('depthWrite={!wireframe}');
@@ -89,7 +91,8 @@ describe('viewer failure isolation', () => {
     expect(css).toContain('.viewer-options-body');
     expect(source.match(/type="checkbox"/g)).toHaveLength(4);
     expect(source).toContain("toggleInspectorPanel('tools')");
-    expect(source).toContain('Measured-state overlay');
+    expect(source).toContain('Comparison ghost');
+    expect(source).toContain('disabled={!comparisonGhostAvailable}');
     expect(source).toContain('Model and source facts');
     expect(source).toContain('manifest.data.links.length} links · {manifest.data.joints.length} joints');
     expect(source).not.toContain('className="viewer-legend"');

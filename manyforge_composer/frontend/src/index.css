@@ -6907,54 +6907,6 @@ svg.viewer-camera-icon {
   font-size: 0.68rem;
 }
 
-.runtime-attention-alert {
-  position: fixed;
-  z-index: 95;
-  top: 3.4rem;
-  right: 1rem;
-  display: flex;
-  width: min(24rem, calc(100vw - 2rem));
-  align-items: center;
-  gap: 0.55rem;
-  padding: 0.45rem;
-  border: 1px solid #9b6b32;
-  border-radius: 0.55rem;
-  color: #f1dcc0;
-  background: rgb(39 29 15 / 96%);
-  box-shadow: 0 0.8rem 2rem rgb(0 0 0 / 35%);
-}
-
-.runtime-attention-dot {
-  width: 0.55rem;
-  height: 0.55rem;
-  flex: 0 0 auto;
-  border-radius: 50%;
-  background: #e0a84a;
-}
-
-.runtime-attention-open {
-  display: grid;
-  min-width: 0;
-  flex: 1 1 auto;
-  gap: 0.12rem;
-  padding: 0.15rem;
-  border: 0;
-  color: inherit;
-  background: transparent;
-  text-align: left;
-}
-
-.runtime-attention-open strong,
-.runtime-attention-open small {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.runtime-attention-open small {
-  color: #bca887;
-}
-
 .global-attention-count {
   display: inline-grid;
   min-width: 1.1rem;

@@ -596,6 +596,17 @@ class HeadlessHttpClient:
             body=body,
         )
 
+    def program_run_motion_stop(
+        self,
+        program_run_id: str,
+        body: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        return self.request(
+            "POST",
+            f"{self._program_run_path(program_run_id)}/motion-stop",
+            body=body,
+        )
+
     def program_runtime_controls(self, program_run_id: str) -> dict[str, Any]:
         return self.request(
             "GET", f"{self._program_run_path(program_run_id)}/runtime-controls"
@@ -713,8 +724,24 @@ class HeadlessHttpClient:
             params=(("apply_id", apply_id), ("apply_generation", apply_generation)),
         )
 
+    def execution_diagnostics(self) -> dict[str, Any]:
+        return self.request("GET", "/api/execution/diagnostics")
+
     def execution_status(self) -> dict[str, Any]:
+        """Compatibility alias for the aggregate diagnostic projection."""
         return self.request("GET", "/api/execution/status")
+
+    def execution_identity(self) -> dict[str, Any]:
+        return self.request("GET", "/api/execution/identity")
+
+    def execution_targets(self) -> dict[str, Any]:
+        return self.request("GET", "/api/execution/targets")
+
+    def execution_control_state(self) -> dict[str, Any]:
+        return self.request("GET", "/api/execution/control-state")
+
+    def execution_observation(self) -> dict[str, Any]:
+        return self.request("GET", "/api/execution/observation")
 
     def execute(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/execution/operations", body=body)

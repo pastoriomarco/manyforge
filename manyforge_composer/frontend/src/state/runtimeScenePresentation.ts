@@ -13,6 +13,11 @@ import type {
   Vector3Tuple,
 } from '../types/api';
 import type { MotionPreviewReceipt } from '../types/robotControl';
+import type { ExecutionOwnerStatus } from '../types/robotControl';
+import type {
+  ExecutionObservationFrame,
+  ExecutionObservationReader,
+} from '../types/viewerObservation';
 
 export interface RuntimeLinkTransform {
   position_m: Vector3Tuple;
@@ -24,8 +29,13 @@ export interface MeasuredRobotPresentation {
   sourceId: string;
   sourceEpoch: string;
   sourceSequence: number;
-  observedAtNs: number;
+  observedAtNs: number | null;
   linkTransforms: Record<string, RuntimeLinkTransform>;
+}
+
+export interface MeasuredRobotPresentationReader {
+  readMeasuredRobotPresentation: () => MeasuredRobotPresentation | null;
+  subscribeMeasuredRobotPresentation: (listener: () => void) => () => void;
 }
 
 export interface MeasuredPosePresentation {
@@ -55,6 +65,162 @@ export interface RuntimeScenePresentation {
 export interface CandidateRobotPresentation {
   receiptDigest: string;
   linkTransforms: Record<string, RuntimeLinkTransform>;
+}
+
+/**
+ * Project exact Execution-owner joint observations onto the retained model.
+ * This is the native-lane measured robot source; it never plans or infers a
+ * command and snaps rather than inventing a source timestamp.
+ */
+export function executionRobotPresentation(
+  status: ExecutionOwnerStatus | null,
+  sourceModel: SourceModelProjection | null,
+  manifest: SceneUrdfManifest | null,
+): MeasuredRobotPresentation | null {
+  if (
+    status === null
+    || sourceModel === null
+    || manifest === null
+    || !status.observedMotion.complete
+    || status.cellId !== sourceModel.cell_id
+    || status.cellId !== manifest.cell_id
+    || status.retainedBundleId !== sourceModel.retained_bundle_id
+    || status.retainedBundleId !== manifest.retained_bundle_id
+    || status.graphRevision !== sourceModel.graph_revision
+    || status.graphRevision !== manifest.graph_revision
+  ) return null;
+  const observed = status.observedMotion;
+  const descriptor = status.directControl.targetDescriptor;
+  const occurrence = sourceModel.occurrences.find(
+    (candidate) => candidate.component_id === observed.controllableComponentId,
+  );
+  if (
+    occurrence === undefined
+    || descriptor.controllableComponentId !== observed.controllableComponentId
+    || descriptor.commandTargetId !== observed.commandTargetId
+    || descriptor.joints.length !== observed.sourceJointNames.length
+    || observed.positionsRad.length !== observed.sourceJointNames.length
+  ) return null;
+  const occurrenceCoordinates = new Set(
+    occurrence.coordinates.map((coordinate) => coordinate.source_joint_name),
+  );
+  const positions = new Map<string, number>();
+  for (const [index, sourceJointName] of observed.sourceJointNames.entries()) {
+    const joint = descriptor.joints[index];
+    const position = observed.positionsRad[index];
+    if (
+      joint === undefined
+      || joint.sourceJointName !== sourceJointName
+      || !occurrenceCoordinates.has(sourceJointName)
+      || !Number.isFinite(position)
+      || positions.has(joint.compiledJointName)
+    ) return null;
+    positions.set(joint.compiledJointName, position);
+  }
+  const linkTransforms = measuredLinkTransforms(manifest, positions);
+  return linkTransforms === null ? null : {
+    objectId: observed.controllableComponentId,
+    sourceId: `execution:${observed.commandTargetId}`,
+    sourceEpoch: observed.sourceEpoch,
+    sourceSequence: observed.sequence,
+    observedAtNs: null,
+    linkTransforms,
+  };
+}
+
+/**
+ * Project one compact owner observation through the retained source/model map.
+ * The frame contains presentation facts only; every identity is checked again
+ * before it can move a retained Three.js link.
+ */
+export function executionObservationRobotPresentation(
+  frame: ExecutionObservationFrame | null,
+  sourceModel: SourceModelProjection | null,
+  manifest: SceneUrdfManifest | null,
+  observedAtNs: number | null,
+): MeasuredRobotPresentation | null {
+  if (
+    frame === null
+    || sourceModel === null
+    || manifest === null
+    || frame.cellId !== sourceModel.cell_id
+    || frame.cellId !== manifest.cell_id
+    || frame.retainedBundleId !== sourceModel.retained_bundle_id
+    || frame.retainedBundleId !== manifest.retained_bundle_id
+    || frame.graphRevision !== sourceModel.graph_revision
+    || frame.graphRevision !== manifest.graph_revision
+    || frame.sourceJointNames.length !== frame.compiledJointNames.length
+    || frame.sourceJointNames.length !== frame.positionsRad.length
+  ) return null;
+
+  const occurrence = sourceModel.occurrences.find(
+    (candidate) => candidate.component_id === frame.controllableComponentId,
+  );
+  const target = sourceModel.targets.find((candidate) => (
+    candidate.component_id === frame.controllableComponentId
+    && candidate.target_id === frame.commandTargetId
+  ));
+  if (occurrence === undefined || target === undefined) return null;
+  const commandableOrderMatches = target.model_groups.some((group) => (
+    group.commandable_source_joint_names.length === frame.sourceJointNames.length
+    && group.commandable_source_joint_names.every(
+      (name, index) => name === frame.sourceJointNames[index],
+    )
+  ));
+  if (!commandableOrderMatches) return null;
+
+  const occurrenceCoordinates = new Set(
+    occurrence.coordinates.map((coordinate) => coordinate.source_joint_name),
+  );
+  const compiledPositions = new Map<string, number>();
+  for (const [index, sourceJointName] of frame.sourceJointNames.entries()) {
+    const compiledJointName = frame.compiledJointNames[index];
+    const position = frame.positionsRad[index];
+    if (
+      compiledJointName === undefined
+      || !occurrenceCoordinates.has(sourceJointName)
+      || !Number.isFinite(position)
+      || compiledPositions.has(compiledJointName)
+    ) return null;
+    compiledPositions.set(compiledJointName, position);
+  }
+  const linkTransforms = measuredLinkTransforms(manifest, compiledPositions);
+  return linkTransforms === null ? null : {
+    objectId: frame.controllableComponentId,
+    sourceId: `execution:${frame.commandTargetId}`,
+    sourceEpoch: `${frame.ownerEpoch}:${frame.sourceEpoch}`,
+    sourceSequence: frame.sourceSequence,
+    observedAtNs,
+    linkTransforms,
+  };
+}
+
+/**
+ * Capacity-one render reader. Forward kinematics runs once per admitted owner
+ * sample, regardless of how many retained links consume that sample.
+ */
+export function createExecutionRobotPresentationReader(
+  reader: ExecutionObservationReader,
+  sourceModel: SourceModelProjection | null,
+  manifest: SceneUrdfManifest | null,
+): MeasuredRobotPresentationReader {
+  let cachedFrame: ExecutionObservationFrame | null | undefined;
+  let cachedPresentation: MeasuredRobotPresentation | null = null;
+  return {
+    readMeasuredRobotPresentation: () => {
+      const frame = reader.getLatestExecutionObservation();
+      if (frame === cachedFrame) return cachedPresentation;
+      cachedFrame = frame;
+      cachedPresentation = executionObservationRobotPresentation(
+        frame,
+        sourceModel,
+        manifest,
+        frame === null ? null : performance.now() * 1e6,
+      );
+      return cachedPresentation;
+    },
+    subscribeMeasuredRobotPresentation: reader.subscribeExecutionObservation,
+  };
 }
 
 const EMPTY_PRESENTATION: RuntimeScenePresentation = {

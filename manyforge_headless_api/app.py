@@ -672,6 +672,18 @@ def create_app(
             )
         return service.program_run_stop(program_run_id, request)
 
+    @app.post("/api/program/runs/{program_run_id}/motion-stop")
+    def program_run_motion_stop(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        request: ProgramRunStopRequest,
+    ) -> dict[str, Any]:
+        if request.program_run_id != program_run_id:
+            raise HeadlessApiError(
+                "program_run_path_invalid",
+                "Program-run identity in path and body must match",
+            )
+        return service.program_run_motion_stop(program_run_id, request)
+
     @app.get("/api/cycle/status")
     def program_cycle_status() -> dict[str, Any]:
         return service.program_cycle_status()
@@ -892,9 +904,29 @@ def create_app(
             )
         return JSONResponse(status_code=_error_status(code), content=response)
 
-    @app.get("/api/execution/status")
+    @app.get("/api/execution/diagnostics")
+    def execution_diagnostics() -> JSONResponse:
+        return execution_response(service.execution_diagnostics())
+
+    @app.get("/api/execution/status", deprecated=True)
     def execution_status() -> JSONResponse:
         return execution_response(service.execution_status())
+
+    @app.get("/api/execution/identity")
+    def execution_identity() -> JSONResponse:
+        return execution_response(service.execution_identity())
+
+    @app.get("/api/execution/targets")
+    def execution_targets() -> JSONResponse:
+        return execution_response(service.execution_targets())
+
+    @app.get("/api/execution/control-state")
+    def execution_control_state() -> JSONResponse:
+        return execution_response(service.execution_control_state())
+
+    @app.get("/api/execution/observation")
+    def execution_observation() -> JSONResponse:
+        return execution_response(service.execution_observation())
 
     @app.post("/api/execution/operations")
     def execution_submit(

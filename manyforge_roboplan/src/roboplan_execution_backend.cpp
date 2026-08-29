@@ -548,9 +548,10 @@ core::PrepareParticipantResultDTO RoboPlanExecutionBackend::Prepare(
           return !binding_error(alias).has_value();
         });
     if (matched == aliases->end()) {
-      field_error = core::prepared_participant_backend_physical_binding_field_error(
-          participant, *retained_binding,
-          core::PreparedParticipantPayloadKindDTO::kMotionExecution);
+      field_error =
+          core::prepared_participant_backend_physical_binding_field_error(
+              participant, *retained_binding,
+              core::PreparedParticipantPayloadKindDTO::kMotionExecution);
       if (field_error.has_value()) {
         return reject(std::string(*field_error));
       }
@@ -625,9 +626,10 @@ core::ExecutionHandle RoboPlanExecutionBackend::dispatch_prepared(
           return !binding_error(alias).has_value();
         });
     if (matched == aliases->end()) {
-      field_error = core::prepared_participant_backend_physical_binding_field_error(
-          participant, *retained_binding,
-          core::PreparedParticipantPayloadKindDTO::kMotionExecution);
+      field_error =
+          core::prepared_participant_backend_physical_binding_field_error(
+              participant, *retained_binding,
+              core::PreparedParticipantPayloadKindDTO::kMotionExecution);
       if (field_error.has_value()) {
         return rejected(std::string(*field_error));
       }
@@ -662,10 +664,38 @@ core::ExecutionHandle RoboPlanExecutionBackend::dispatch_prepared(
   handle.controller_goal_id = controller_goal_id;
   handle.controller_goal_generation = controller_goal_generation;
   handle.prepared_contract_digest = participant.prepared_contract_digest;
+  std::vector<core::PreparedParticipantStopPlanDTO> stop_plans;
+  stop_plans.push_back(participant.ordinary_stop_plan);
+  for (const auto &scope :
+       std::get<core::PreparedMotionExecutionDTO>(participant.payload)
+           .interrupt_scopes) {
+    stop_plans.push_back(scope.stop_plan);
+  }
   prepared_goals_.emplace(
       controller_goal_id,
       PreparedGoalRecord{controller_goal_generation,
-                         participant.prepared_contract_digest, handle});
+                         participant.prepared_contract_digest,
+                         participant.operation_id,
+                         participant.operation_revision,
+                         participant.participant_id,
+                         participant.controllable_component_id,
+                         participant.command_target_id,
+                         participant.capability_id,
+                         participant.control_domain_id,
+                         participant.control_domain_revision,
+                         participant.control_binding_id,
+                         participant.control_binding_revision,
+                         participant.controller_topology_id,
+                         participant.topology_revision,
+                         participant.control_route_id,
+                         participant.active_control_configuration_id,
+                         participant.active_control_configuration_generation,
+                         participant.control_provider.runtime_epoch,
+                         participant.resources,
+                         participant.stop_evidence_policy_id,
+                         participant.stop_evidence_policy_revision,
+                         std::move(stop_plans),
+                         handle});
   return handle;
 }
 
@@ -876,11 +906,12 @@ core::Result<void> RoboPlanExecutionBackend::RebindRoute(
         {{"reason", "native_motion_route_rebind_mismatch"}}});
   }
   if (program_aliases.size() > 64U ||
-      std::any_of(program_aliases.begin(), program_aliases.end(),
-                  [&](const auto &alias) {
-                    return !core::runtime_participant_binding_physically_contains(
-                        binding, alias);
-                  })) {
+      std::any_of(
+          program_aliases.begin(), program_aliases.end(),
+          [&](const auto &alias) {
+            return !core::runtime_participant_binding_physically_contains(
+                binding, alias);
+          })) {
     return core::Result<void>::Err(core::ErrorDTO{
         std::string(core::to_string(core::ErrorCode::kInvalidRequest)),
         "native execution Program aliases cross the physical backend",
@@ -1007,6 +1038,10 @@ void RoboPlanExecutionBackend::execution_worker(
                                                stopped_snapshot_ns);
     }
     state_.running.store(false, std::memory_order_release);
+    auto active_generation = execution_generation;
+    (void)active_execution_generation_.compare_exchange_strong(
+        active_generation, 0U, std::memory_order_acq_rel,
+        std::memory_order_acquire);
     state_.natural_completion_stop_requested.store(false,
                                                    std::memory_order_release);
     execution_cv_.notify_all();
@@ -1162,6 +1197,10 @@ void RoboPlanExecutionBackend::execution_worker(
   }
 
   state_.running.store(false);
+  auto active_generation = execution_generation;
+  (void)active_execution_generation_.compare_exchange_strong(
+      active_generation, 0U, std::memory_order_acq_rel,
+      std::memory_order_acquire);
   state_.pause_requested.store(false);
   state_.natural_completion_stop_requested.store(false,
                                                  std::memory_order_release);
@@ -1209,6 +1248,8 @@ core::ExecutionHandle RoboPlanExecutionBackend::execute_trajectory(
                                  [this]() { return get_execution_snapshot(); },
                                  0};
   }
+  active_execution_generation_.store(execution_generation,
+                                     std::memory_order_release);
   {
     std::lock_guard<std::mutex> lock(state_mutex_);
     state_.active_trajectory =
@@ -1422,38 +1463,119 @@ RoboPlanExecutionBackend::TranslateStopStage(
                                        clock_.now() - started_at);
   }
 
-  // Until exact prepared Dispatch binds ControllerGoalId/generation to the
-  // active native execution, goal-cancel evidence cannot be attributed
-  // truthfully. Fail before effect instead of echoing the caller's goal.
-  if (command.containment_command.command_kind ==
-      core::StopContainmentCommandKind::kControllerGoalCancel) {
+  std::optional<PreparedGoalRecord> prepared_goal;
+  {
+    std::lock_guard<std::mutex> lock(prepared_execution_mutex_);
+    const auto found = prepared_goals_.find(stage.controller_goal_id);
+    if (found != prepared_goals_.end()) {
+      prepared_goal = found->second;
+    }
+  }
+  if (!prepared_goal.has_value() ||
+      prepared_goal->generation != stage.controller_goal_generation) {
     return terminal_stop_stage_failure(
-        stage, "controller_goal_dispatch_membership_unavailable",
-        "native execution has no exact goal-bound dispatch membership",
+        stage, "resolved_stop_stage_dispatch_membership_unavailable",
+        "native Stop cannot prove this stage belongs to an admitted prepared "
+        "goal generation",
         clock_.now() - started_at);
   }
-  if (command.containment_command.command_kind !=
-          core::StopContainmentCommandKind::kRegistered ||
-      !command.containment_command.registered_command_kind_id.has_value() ||
-      command.containment_command.registered_command_kind_id->value() !=
-          "manyforge.stop.software_hard") {
+  const bool exact_participant =
+      prepared_goal->operation_id == stage.operation_id &&
+      prepared_goal->operation_revision == stage.operation_revision &&
+      prepared_goal->participant_id == stage.participant_id &&
+      prepared_goal->controllable_component_id ==
+          stage.controllable_component_id &&
+      prepared_goal->command_target_id == stage.command_target_id &&
+      prepared_goal->capability_id == stage.capability_id &&
+      prepared_goal->control_domain_id == stage.control_domain_id &&
+      prepared_goal->control_domain_revision == stage.control_domain_revision &&
+      prepared_goal->control_binding_id == stage.control_binding_id &&
+      prepared_goal->control_binding_revision ==
+          stage.control_binding_revision &&
+      prepared_goal->controller_topology_id == stage.controller_topology_id &&
+      prepared_goal->topology_revision == stage.topology_revision &&
+      prepared_goal->control_route_id == stage.control_route_id &&
+      prepared_goal->active_control_configuration_id ==
+          stage.active_control_configuration_id &&
+      prepared_goal->active_control_configuration_generation ==
+          stage.active_control_configuration_generation &&
+      prepared_goal->provider_runtime_epoch == stage.provider_runtime_epoch &&
+      prepared_goal->resources == stage.resources &&
+      prepared_goal->stop_evidence_policy_id == stage.stop_evidence_policy_id &&
+      prepared_goal->stop_evidence_policy_revision ==
+          stage.stop_evidence_policy_revision &&
+      std::find(prepared_goal->stop_plans.begin(),
+                prepared_goal->stop_plans.end(),
+                stage.participant_stop_plan) != prepared_goal->stop_plans.end();
+  if (!exact_participant) {
+    return terminal_stop_stage_failure(
+        stage, "resolved_stop_stage_dispatch_membership_mismatch",
+        "native Stop stage differs from its admitted prepared goal",
+        clock_.now() - started_at);
+  }
+
+  const bool controller_goal_cancel =
+      command.containment_command.command_kind ==
+      core::StopContainmentCommandKind::kControllerGoalCancel;
+  const bool software_hard =
+      command.containment_command.command_kind ==
+          core::StopContainmentCommandKind::kRegistered &&
+      command.containment_command.registered_command_kind_id.has_value() &&
+      command.containment_command.registered_command_kind_id->value() ==
+          "manyforge.stop.software_hard";
+  if (!controller_goal_cancel && !software_hard) {
     return terminal_stop_stage_failure(stage,
                                        "resolved_stop_command_not_supported",
-                                       "native exact Stop port supports only "
-                                       "its retained software-hard command",
+                                       "native exact Stop port supports "
+                                       "controller-goal cancel and its "
+                                       "retained software-hard command",
                                        clock_.now() - started_at);
+  }
+
+  const auto dispatch_generation = prepared_goal->handle.execution_generation;
+  const auto current_generation =
+      active_execution_generation_.load(std::memory_order_acquire);
+  const bool execution_running = state_.running.load(std::memory_order_acquire);
+  if (dispatch_generation == 0U || dispatch_generation != current_generation ||
+      !execution_running) {
+    auto failure = terminal_stop_stage_failure(
+        stage, "prepared_goal_not_active",
+        "native prepared goal no longer owns the active execution",
+        clock_.now() - started_at);
+    if (failure.error.has_value()) {
+      failure.error->details["prepared_execution_generation"] =
+          std::to_string(dispatch_generation);
+      failure.error->details["current_execution_generation"] =
+          std::to_string(current_generation);
+      failure.error->details["current_execution_activity"] =
+          execution_running ? "running" : "terminal_or_inactive";
+    }
+    return failure;
   }
 
   if (cancellation.stop_requested()) {
     return superseded_stop_stage(stage);
   }
-  const auto stopped = stop();
+  core::StopResultDTO stopped;
+  if (controller_goal_cancel) {
+    // Ordinary motion Stop cancels only this exact goal occurrence. It must
+    // not advance the independently latched software-hard generation.
+    state_.pause_requested.store(false, std::memory_order_release);
+    state_.natural_completion_stop_requested.store(false,
+                                                   std::memory_order_release);
+    worker_thread_.request_stop();
+    execution_cv_.notify_all();
+    stopped = core::StopResultDTO{true, std::nullopt};
+  } else {
+    stopped = stop();
+  }
   if (!stopped.accepted) {
     return terminal_stop_stage_failure(
-        stage, "software_hard_stop_not_dispatched",
-        stopped.error.has_value()
-            ? stopped.error->message
-            : "native software-hard Stop was not accepted",
+        stage,
+        software_hard ? "software_hard_stop_not_dispatched"
+                      : "controller_goal_cancel_not_dispatched",
+        stopped.error.has_value() ? stopped.error->message
+                                  : "native Stop command was not accepted",
         clock_.now() - started_at);
   }
 
@@ -1497,18 +1619,16 @@ RoboPlanExecutionBackend::TranslateStopStage(
                remaining_phase(budget, right.requirement.phase_id).value_or(-1);
       });
   if (terminal_phase == command.evidence_requirements.end()) {
-    return fail_after_dispatch(
-        "stop_evidence_requirements_missing",
-        "native software-hard stage has no evidence contract");
+    return fail_after_dispatch("stop_evidence_requirements_missing",
+                               "native Stop stage has no evidence contract");
   }
   const auto evidence_remaining =
       remaining_phase(budget, terminal_phase->requirement.phase_id);
   if (!evidence_remaining.has_value() || *evidence_remaining <= 0 ||
       started_at >
           std::numeric_limits<std::int64_t>::max() - *evidence_remaining) {
-    return fail_after_dispatch(
-        "stop_evidence_phase_expired",
-        "native software-hard evidence phase is already expired");
+    return fail_after_dispatch("stop_evidence_phase_expired",
+                               "native Stop evidence phase is already expired");
   }
   const auto evidence_deadline = started_at + *evidence_remaining;
   while (state_.running.load(std::memory_order_acquire) &&
@@ -1518,14 +1638,58 @@ RoboPlanExecutionBackend::TranslateStopStage(
         lock, std::chrono::nanoseconds(config_.execution_tick_period_ns));
   }
   if (cancellation.stop_requested()) {
-    return fail_after_dispatch(
-        "stop_stage_cancelled_after_dispatch",
-        "native software-hard evidence wait was superseded");
+    return fail_after_dispatch("stop_stage_cancelled_after_dispatch",
+                               "native Stop evidence wait was superseded");
   }
   if (state_.running.load(std::memory_order_acquire)) {
     return fail_after_dispatch(
         "stop_evidence_phase_expired",
-        "native software-hard execution did not settle in budget");
+        "native execution did not settle in Stop budget");
+  }
+
+  if (controller_goal_cancel) {
+    const auto terminal_snapshot = prepared_goal->handle.get_snapshot();
+    const auto now_ns = clock_.now();
+    if (terminal_snapshot.state != core::ExecutionState::kStopped ||
+        terminal_snapshot.sequence_number == 0U ||
+        terminal_snapshot.timestamp_ns > now_ns) {
+      return fail_after_dispatch(
+          "stop_goal_terminal_state_mismatch",
+          "native goal did not reach a valid Stopped terminal state");
+    }
+    const auto source_age_ns =
+        std::max<std::int64_t>(0, now_ns - terminal_snapshot.timestamp_ns);
+    result.evidence_items.reserve(command.evidence_requirements.size());
+    for (const auto &requirement : command.evidence_requirements) {
+      if (requirement.requirement.evidence_kind !=
+              core::StopEvidenceRequirementKind::kControllerGoalTerminal ||
+          requirement.resolved_source.source_kind !=
+              core::StopEvidenceSourceKind::kControllerGoalStatus ||
+          requirement.resolved_source.runtime_target.provider_runtime_epoch !=
+              path.provider_runtime_epoch ||
+          source_age_ns >
+              requirement.requirement.source_requirement.freshness_budget_ns) {
+        return fail_after_dispatch(
+            "stop_evidence_source_mismatch",
+            "native goal-terminal evidence differs from the retained source "
+            "contract");
+      }
+      result.evidence_items.push_back(core::StopEvidenceItemDTO{
+          requirement.requirement.evidence_item_id,
+          requirement.requirement.evidence_kind,
+          core::StopEvidenceItemStateDTO::kSatisfied,
+          requirement.resolved_source, path.provider_runtime_epoch,
+          terminal_snapshot.sequence_number, source_age_ns,
+          core::JsonValueDTO{true}, std::nullopt});
+    }
+    result.outcome = core::ParticipantStopStageOutcomeDTO::kSucceeded;
+    result.controller_acknowledgement_sequence =
+        terminal_snapshot.sequence_number;
+    result.source_epoch = path.provider_runtime_epoch;
+    result.source_sequence = terminal_snapshot.sequence_number;
+    result.receiver_elapsed_duration_ns =
+        std::max<std::int64_t>(0, clock_.now() - started_at);
+    return result;
   }
 
   const auto observed = state_channel_->current_state(clock_.now());

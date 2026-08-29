@@ -94,6 +94,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             create_app(runtime),
             host=args.host,
             port=args.port,
+            access_log=False,
         )
         return 0
     except (ProgramRunnerError, ValueError) as error:

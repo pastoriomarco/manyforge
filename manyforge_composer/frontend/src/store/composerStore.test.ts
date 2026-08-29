@@ -20,23 +20,8 @@ describe('composer view reducer', () => {
         edgeStyle: 'smoothstep',
       }),
     ).toEqual({
-      nodeStatuses: {},
       edgeStyle: 'smoothstep',
       layoutDirection: 'horizontal',
     });
-  });
-
-  it('updates one node without dropping other presentation statuses', () => {
-    const initial = {
-      ...INITIAL_COMPOSER_VIEW_STATE,
-      nodeStatuses: { node_a: 'running' as const },
-    };
-    expect(
-      composerViewReducer(initial, {
-        type: 'set_node_status',
-        nodeId: 'node_b',
-        status: 'success',
-      }).nodeStatuses,
-    ).toEqual({ node_a: 'running', node_b: 'success' });
   });
 });

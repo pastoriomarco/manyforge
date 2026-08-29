@@ -525,6 +525,9 @@ export function ProgramWorkspace({
             environment={nodeEnvironment}
             selectedId={selectedNodeId}
             invalidNodeIds={invalidNodeIds}
+            nodeStatuses={runtime.cycleState === 'idle_after_reset'
+              ? {}
+              : runtime.state.run?.nodeStatuses ?? {}}
             busy={authoringBusy}
             onSelect={selectNode}
             onMutate={mutate}

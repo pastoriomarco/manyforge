@@ -392,14 +392,19 @@ def _observed_move_arguments(
             status_code=503,
         )
     try:
-        projection = state.headless_client.execution_status()
+        targets_projection = state.headless_client.execution_targets()
+        control_projection = state.headless_client.execution_control_state()
     except HeadlessClientError as error:
         raise headless_client_http_exception(error) from error
-    status = projection.get("status")
-    direct = status.get("direct_control") if isinstance(status, dict) else None
-    observed = direct.get("observed_state") if isinstance(direct, dict) else None
+    targets = targets_projection.get("targets")
+    control = control_projection.get("control_state")
+    direct = targets.get("direct_control") if isinstance(targets, dict) else None
+    observed = control.get("observed_motion") if isinstance(control, dict) else None
     if (
-        not isinstance(direct, dict)
+        targets_projection.get("ok") is not True
+        or control_projection.get("ok") is not True
+        or targets_projection.get("identity") != control_projection.get("identity")
+        or not isinstance(direct, dict)
         or not isinstance(observed, dict)
         or observed.get("complete") is not True
         or type(observed.get("source_epoch")) is not str

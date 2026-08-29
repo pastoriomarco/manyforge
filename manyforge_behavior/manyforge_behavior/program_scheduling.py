@@ -287,6 +287,23 @@ class ProgramRunTickHost:
             self.schedule(program_run_id)
         return snapshot
 
+    def stop_motion(
+        self,
+        program_run_id: str,
+        *,
+        reason: str | None = None,
+    ) -> ProgramRunSnapshot:
+        """Stop addressed work while leaving the Program tree observable."""
+
+        snapshot = self._owner.stop_motion(program_run_id, reason=reason)
+        self.schedule(program_run_id)
+        return snapshot
+
+    def reset_run(self, program_run_id: str) -> ProgramRunSnapshot:
+        """Release the exact terminal run's resident owner effects."""
+
+        return self._owner.reset_effects(program_run_id)
+
     def resume_recovery(
         self,
         program_run_id: str,

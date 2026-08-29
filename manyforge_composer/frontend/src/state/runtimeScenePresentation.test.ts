@@ -8,12 +8,40 @@ import type {
   SceneUrdfManifest,
   SourceModelProjection,
 } from '../types/api';
-import type { MotionPreviewReceipt } from '../types/robotControl';
+import type { ExecutionOwnerStatus, MotionPreviewReceipt } from '../types/robotControl';
+import type { ExecutionObservationFrame } from '../types/viewerObservation';
 import {
   candidateRobotPresentation,
+  createExecutionRobotPresentationReader,
+  executionObservationRobotPresentation,
+  executionRobotPresentation,
   measuredLinkTransforms,
   runtimeScenePresentation,
 } from './runtimeScenePresentation';
+
+function executionStatus(): ExecutionOwnerStatus {
+  return {
+    cellId: 'cell-1',
+    graphRevision: 'graph-1',
+    retainedBundleId: 'bundle-1',
+    directControl: {
+      targetDescriptor: {
+        controllableComponentId: 'robot-1',
+        commandTargetId: 'arm',
+        joints: [{ sourceJointName: 'source-joint', compiledJointName: 'joint-1' }],
+      },
+    },
+    observedMotion: {
+      controllableComponentId: 'robot-1',
+      commandTargetId: 'arm',
+      sourceEpoch: 'native-1',
+      sequence: 4,
+      sourceJointNames: ['source-joint'],
+      positionsRad: [Math.PI / 2],
+      complete: true,
+    },
+  } as unknown as ExecutionOwnerStatus;
+}
 
 function joint(
   name: string,
@@ -88,7 +116,17 @@ function sourceModel(): SourceModelProjection {
     retained_bundle_id: 'bundle-1',
     occurrences: [{
       component_id: 'robot-1',
-      coordinates: [{ source_joint_name: 'joint-1' }],
+      coordinates: [
+        { source_joint_name: 'source-joint' },
+        { source_joint_name: 'joint-1' },
+      ],
+    }],
+    targets: [{
+      component_id: 'robot-1',
+      target_id: 'arm',
+      model_groups: [{
+        commandable_source_joint_names: ['source-joint'],
+      }],
     }],
   } as unknown as SourceModelProjection;
 }
@@ -214,6 +252,68 @@ function runtime(sources: SceneRuntimePoseSource[]): SceneRuntimeProjection {
 }
 
 describe('runtime scene presentation', () => {
+  it('projects exact native Execution-owner joints without inventing time', () => {
+    const presentation = executionRobotPresentation(
+      executionStatus(),
+      sourceModel(),
+      manifest(),
+    );
+
+    expect(presentation).toMatchObject({
+      objectId: 'robot-1',
+      sourceId: 'execution:arm',
+      sourceEpoch: 'native-1',
+      sourceSequence: 4,
+      observedAtNs: null,
+    });
+    expect(presentation?.linkTransforms.tip.position_m[0]).toBeCloseTo(1);
+    expect(presentation?.linkTransforms.tip.position_m[1]).toBeCloseTo(1);
+
+    const mismatched = executionStatus();
+    mismatched.graphRevision = 'another-graph';
+    expect(executionRobotPresentation(mismatched, sourceModel(), manifest())).toBeNull();
+  });
+
+  it('projects and caches compact owner observations once per frame', () => {
+    let frame: ExecutionObservationFrame | null = {
+      schemaVersion: 'manyforge.execution_observation_frame.v1',
+      ownerEpoch: 'owner-1',
+      cellId: 'cell-1',
+      retainedBundleId: 'bundle-1',
+      graphRevision: 'graph-1',
+      controllableComponentId: 'robot-1',
+      commandTargetId: 'arm',
+      sourceEpoch: 'native-1',
+      sourceSequence: 5,
+      receivedAtMonotonicUs: 123,
+      sourceJointNames: ['source-joint'],
+      compiledJointNames: ['joint-1'],
+      positionsRad: [Math.PI / 2],
+    };
+    const projected = executionObservationRobotPresentation(
+      frame, sourceModel(), manifest(), 2_000_000,
+    );
+    expect(projected).toMatchObject({
+      objectId: 'robot-1',
+      sourceSequence: 5,
+      observedAtNs: 2_000_000,
+    });
+    expect(projected?.linkTransforms.tip.position_m[1]).toBeCloseTo(1);
+
+    let reads = 0;
+    const reader = createExecutionRobotPresentationReader({
+      getLatestExecutionObservation: () => { reads += 1; return frame; },
+      subscribeExecutionObservation: () => () => undefined,
+    }, sourceModel(), manifest());
+    const first = reader.readMeasuredRobotPresentation();
+    const second = reader.readMeasuredRobotPresentation();
+    expect(first).toBe(second);
+    expect(reads).toBe(2);
+
+    frame = { ...frame, graphRevision: 'crossed-graph' };
+    expect(reader.readMeasuredRobotPresentation()).toBeNull();
+  });
+
   it('computes retained-model FK and exact measured object/TCP overlays', () => {
     const jointSource = baseSource({
       api_version: 'manyforge.ros_pose_observation.v1',

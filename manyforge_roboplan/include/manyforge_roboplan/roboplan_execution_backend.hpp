@@ -231,6 +231,10 @@ private:
   std::unique_ptr<core::ExecutionProgressPublication>
       execution_progress_publication_;
   std::atomic<std::uint64_t> next_execution_progress_generation_{1};
+  // Exact currently-running native execution occurrence. Prepared goal
+  // cancellation compares against this generation before it can affect the
+  // worker, so an old goal can never stop a later execution.
+  std::atomic<std::uint64_t> active_execution_generation_{0};
   std::vector<double> observed_at_rest_velocities_;
 
   mutable std::mutex execution_mutex_;
@@ -272,6 +276,31 @@ private:
   struct PreparedGoalRecord final {
     core::ControllerGoalGeneration generation;
     core::ContentDigest prepared_contract_digest;
+    // Retain only the Stop-visible projection of the prepared participant.
+    // Goal id/generation identifies the request, while these fields prove the
+    // requested Stop still belongs to the exact participant that was
+    // dispatched.
+    core::OperationId operation_id;
+    core::OperationRevision operation_revision;
+    core::OperationParticipantId participant_id;
+    core::ControllableComponentId controllable_component_id;
+    core::CommandTargetId command_target_id;
+    core::CapabilityId capability_id;
+    core::ControlDomainId control_domain_id;
+    core::ControlDomainRevision control_domain_revision;
+    core::ControlBindingId control_binding_id;
+    core::ControlBindingRevision control_binding_revision;
+    core::ControllerTopologyId controller_topology_id;
+    core::TopologyRevision topology_revision;
+    core::ControlRouteId control_route_id;
+    core::ActiveControlConfigurationId active_control_configuration_id;
+    core::ActiveControlConfigurationGeneration
+        active_control_configuration_generation;
+    core::RuntimeEpoch provider_runtime_epoch;
+    std::vector<core::ResourceId> resources;
+    core::StopEvidencePolicyId stop_evidence_policy_id;
+    core::StopEvidencePolicyRevision stop_evidence_policy_revision;
+    std::vector<core::PreparedParticipantStopPlanDTO> stop_plans;
     core::ExecutionHandle handle;
   };
   static constexpr std::size_t kPreparedReplayCapacity = 4096U;

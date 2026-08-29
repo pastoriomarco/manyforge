@@ -89,6 +89,16 @@ class ProgramRuntimeControlError(RuntimeError):
         self.code = code
 
 
+def _project_wire_value(value: Any) -> Any:
+    """Project immutable owner facts into ordinary JSON-compatible values."""
+
+    if isinstance(value, Mapping):
+        return {key: _project_wire_value(nested) for key, nested in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_project_wire_value(nested) for nested in value]
+    return deepcopy(value)
+
+
 def _digest(domain: str, value: Mapping[str, Any]) -> str:
     payload = domain.encode("utf-8") + b"\0" + rfc8785.dumps(dict(value))
     return "sha256:" + hashlib.sha256(payload).hexdigest()
@@ -595,10 +605,11 @@ class ProgramRuntimeControls:
             return None
         identity = intervention.identity
         owner = (
-            deepcopy(dict(intervention.owner_assessment))
+            _project_wire_value(intervention.owner_assessment)
             if intervention.owner_assessment is not None
             else None
         )
+        projected_policy = _project_wire_value(policy)
         owner_actions = (
             owner.get("allowed_actions", []) if isinstance(owner, dict) else []
         )
@@ -721,7 +732,7 @@ class ProgramRuntimeControls:
                 "enabled": manual_result_enabled,
                 "disabled_reason_code": manual_result_disabled_reason,
             },
-            "policy": deepcopy(dict(policy)),
+            "policy": projected_policy,
             "recovery_fences": deepcopy(self._recovery_fences),
         }
         offer_key = _digest("manyforge.cycle_recovery_offer.semantic.v2", material)
@@ -815,7 +826,7 @@ class ProgramRuntimeControls:
                     if isinstance(owner, dict)
                     else []
                 ),
-                "policy": deepcopy(dict(policy)),
+                "policy": deepcopy(projected_policy),
             }
             self._offer_key = offer_key
             self._offer = deepcopy(result)

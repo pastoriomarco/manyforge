@@ -10,17 +10,13 @@
 
 namespace manyforge::core {
 
-using CellAdmissionInterventionValidator =
-    std::function<Result<void>(const CellAdmissionClaimIntentDTO&,
-                               const std::optional<CellAdmissionClaimDTO>&)>;
+using CellAdmissionInterventionValidator = std::function<Result<void>(
+    const CellAdmissionClaimIntentDTO&, const std::optional<CellAdmissionClaimDTO>&)>;
 using CellAdmissionSettlementValidator =
-    std::function<Result<void>(const CellAdmissionClaimDTO&,
-                               const CellAdmissionClaimReleaseDTO&)>;
-using CellAdmissionReconcileValidator =
-    std::function<Result<CellAdmissionReconcileValidationDTO>(
-        const std::vector<CellAdmissionClaimDTO>&,
-        const std::vector<CellAdmissionCurrentOwnerEpochDTO>&,
-        const CellAdmissionReconcileDTO&)>;
+    std::function<Result<void>(const CellAdmissionClaimDTO&, const CellAdmissionClaimReleaseDTO&)>;
+using CellAdmissionReconcileValidator = std::function<Result<CellAdmissionReconcileValidationDTO>(
+    const std::vector<CellAdmissionClaimDTO>&,
+    const std::vector<CellAdmissionCurrentOwnerEpochDTO>&, const CellAdmissionReconcileDTO&)>;
 
 /// The sole focused cell-admission ledger composed inside Kernel. Kernel takes
 /// its shared admission mutex before this state mutex; Stop recognition and
@@ -39,8 +35,9 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
       std::vector<OperationJournalRecoveryDTO::RecoveredCellAdmissionMembershipDTO>
           recovered_membership = {},
       std::vector<CellAdmissionCurrentOwnerEpochDTO> recovered_current_owners = {},
-      std::optional<ManagerLivenessRequiredSetDTO> manager_liveness_required_set =
-          std::nullopt);
+      std::optional<ManagerLivenessRequiredSetDTO> manager_liveness_required_set = std::nullopt,
+      CellAdmissionClaimGeneration recovered_claim_generation_high_water =
+          CellAdmissionClaimGeneration(0U));
 
   [[nodiscard]] AuthoringAdmissionDTO GetAuthoringAdmission() const override;
   [[nodiscard]] Result<AuthoringAdmissionDTO> UpdateCellAdmissionReadiness(
@@ -51,15 +48,12 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
       const CellAdmissionClaimReleaseDTO& release) override;
   [[nodiscard]] Result<AuthoringAdmissionDTO> ReconcileCellAdmissionClaims(
       const CellAdmissionReconcileDTO& reconcile) override;
-  [[nodiscard]] Result<CellAdmissionRecoveryReceiptDTO>
-  GetCellAdmissionRecoveryReceipt(
+  [[nodiscard]] Result<CellAdmissionRecoveryReceiptDTO> GetCellAdmissionRecoveryReceipt(
       const CellAdmissionRecoveryReceiptQueryDTO& query) const override;
-  [[nodiscard]] Result<void> Publish(
-      const ManagerLivenessObservationDTO& observation) override;
+  [[nodiscard]] Result<void> Publish(const ManagerLivenessObservationDTO& observation) override;
   [[nodiscard]] Result<AuthoringAdmissionDTO> ReplaceManagerLivenessRequiredSet(
       const ManagerLivenessRequiredSetDTO& required_set);
-  [[nodiscard]] bool LatchManagerLivenessLoss(
-      const ManagerLivenessLossIntentDTO& intent) noexcept;
+  [[nodiscard]] bool LatchManagerLivenessLoss(const ManagerLivenessLossIntentDTO& intent) noexcept;
 
   [[nodiscard]] bool has_unresolved_claims() const;
 
@@ -74,8 +68,7 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
   [[nodiscard]] bool BaseReadinessLocked() const noexcept;
   [[nodiscard]] const Entry* FindReplayLocked(const CellAdmissionClaimIntentDTO& intent) const;
   [[nodiscard]] Entry* FindHeldLocked(CellAdmissionClaimGeneration generation);
-  [[nodiscard]] const Entry* ParentCycleLocked(
-      const CellAdmissionClaimIntentDTO& intent) const;
+  [[nodiscard]] const Entry* ParentCycleLocked(const CellAdmissionClaimIntentDTO& intent) const;
   [[nodiscard]] bool IsStaleOwnerLocked(const CellAdmissionClaimIntentDTO& intent) const;
   [[nodiscard]] Result<void> AdvanceGenerationLocked();
 

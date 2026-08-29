@@ -53,6 +53,12 @@ class ProgramRunnerApplicationPort(Protocol):
         request: ProgramRunStopRequest,
     ) -> dict[str, Any]: ...
 
+    def stop_motion(
+        self,
+        program_run_id: str,
+        request: ProgramRunStopRequest,
+    ) -> dict[str, Any]: ...
+
     def reset_cycle(self, request: ProgramCycleResetRequest) -> dict[str, Any]: ...
 
     def cycle_status(self) -> dict[str, Any]: ...
@@ -190,6 +196,18 @@ def create_app(runtime: ProgramRunnerApplicationPort) -> FastAPI:
                 "Program-run identity in path and body must match",
             )
         return runtime.stop_run(program_run_id, request)
+
+    @app.post("/api/program/runs/{program_run_id}/motion-stop")
+    def stop_motion(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        request: ProgramRunStopRequest,
+    ) -> dict[str, Any]:
+        if request.program_run_id != program_run_id:
+            raise ProgramRunnerError(
+                "program_run_path_invalid",
+                "Program-run identity in path and body must match",
+            )
+        return runtime.stop_motion(program_run_id, request)
 
     @app.get("/api/program/runs/{program_run_id}/runtime-controls")
     def read_runtime_controls(

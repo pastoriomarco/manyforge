@@ -7,6 +7,7 @@ import {
   HeadlessStateSource,
   admitHeadlessState,
   getHeadlessStateQualificationSnapshot,
+  parseExecutionObservationFrame,
   sameHeadlessProjection,
   sameViewerProjection,
   useHeadlessStateSource,
@@ -233,12 +234,91 @@ function wireState(generation: number): Record<string, unknown> {
   };
 }
 
+function wireObservation(sequence: number): Record<string, unknown> {
+  return {
+    schema_version: 'manyforge.execution_observation_frame.v1',
+    owner_epoch: 'execution-owner.1',
+    cell_id: 'cell-1',
+    retained_bundle_id: 'bundle-1',
+    graph_revision: 'graph-1',
+    controllable_component_id: 'robot-1',
+    command_target_id: 'arm',
+    source_epoch: 'joint-source.1',
+    source_sequence: sequence,
+    received_at_monotonic_us: 10_000 + sequence,
+    source_joint_names: ['joint1'],
+    compiled_joint_names: ['robot__joint1'],
+    positions_rad: [sequence / 100],
+  };
+}
+
 afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
 });
 
 describe('HeadlessStateSource delivery scheduling', () => {
+  it('strictly parses compact execution observations', () => {
+    expect(parseExecutionObservationFrame(wireObservation(2))).toMatchObject({
+      sourceSequence: 2,
+      positionsRad: [0.02],
+    });
+    const crossed = wireObservation(3);
+    crossed.compiled_joint_names = ['a', 'b'];
+    expect(() => parseExecutionObservationFrame(crossed)).toThrow(
+      /joint vectors/,
+    );
+  });
+
+  it('coalesces an observation burst without publishing React state lanes', () => {
+    const animationFrames: FrameRequestCallback[] = [];
+    class FakeWebSocket {
+      static instance: FakeWebSocket;
+      onopen: (() => void) | null = null;
+      onmessage: ((message: MessageEvent) => void) | null = null;
+      onerror: (() => void) | null = null;
+      onclose: (() => void) | null = null;
+      constructor(url: string) { void url; FakeWebSocket.instance = this; }
+      close(): void {}
+      send(value: unknown): void {
+        this.onmessage?.({ data: JSON.stringify(value) } as MessageEvent);
+      }
+    }
+    vi.stubGlobal('window', {
+      location: { href: 'http://composer.test/' },
+      requestAnimationFrame: (callback: FrameRequestCallback) => {
+        animationFrames.push(callback); return animationFrames.length;
+      },
+      cancelAnimationFrame: vi.fn(),
+    });
+    vi.stubGlobal('WebSocket', FakeWebSocket);
+
+    const source = new HeadlessStateSource();
+    let shellNotifications = 0;
+    let viewerNotifications = 0;
+    let observationNotifications = 0;
+    source.subscribeShell(() => { shellNotifications += 1; });
+    source.subscribeViewer(() => { viewerNotifications += 1; });
+    source.subscribeExecutionObservation(() => { observationNotifications += 1; });
+    source.setEnabled(true);
+    const shellBaseline = shellNotifications;
+    const viewerBaseline = viewerNotifications;
+    const observationBaseline = observationNotifications;
+    for (let sequence = 1; sequence <= 100; sequence += 1) {
+      FakeWebSocket.instance.send(wireObservation(sequence));
+    }
+    expect(animationFrames).toHaveLength(1);
+    expect(source.getLatestExecutionObservation()?.sourceSequence).toBe(100);
+    expect(shellNotifications).toBe(shellBaseline);
+    expect(viewerNotifications).toBe(viewerBaseline);
+    expect(observationNotifications).toBe(observationBaseline);
+    animationFrames[0]!(16);
+    expect(observationNotifications).toBe(observationBaseline + 1);
+    expect(shellNotifications).toBe(shellBaseline);
+    expect(viewerNotifications).toBe(viewerBaseline);
+    source.dispose();
+  });
+
   it('uses one read-only state endpoint without a client authority identity', () => {
     vi.useFakeTimers();
     const urls: string[] = [];

@@ -296,10 +296,29 @@ def test_probe_rejects_open_or_malformed_cycle_projection(tmp_path: Path):
         "cycle_claim_generation": None,
         "terminal_or_settlement_reference": None,
     }
-    with pytest.raises(ProgramRunnerLivenessError, match="state shape"):
+    with pytest.raises(ProgramRunnerLivenessError, match="run identity"):
         receiver._handle(  # noqa: SLF001
             {"api_version": API_VERSION, "cell_id": "cell", "kind": "probe"}
         )
+
+
+def test_probe_reports_pending_acquire_as_starting_without_a_claim(tmp_path: Path):
+    receiver, _clock, _losses, _reconciliations = _receiver(tmp_path)
+    receiver._cycle_status = lambda: {  # type: ignore[method-assign]  # noqa: SLF001
+        "program_runner_owner_epoch": "runner-owner",
+        "cycle_generation": 7,
+        "state": "starting",
+        "program_run_id": "program-cycle.7",
+        "cycle_claim_generation": None,
+        "terminal_or_settlement_reference": None,
+    }
+
+    response = receiver._handle(  # noqa: SLF001
+        {"api_version": API_VERSION, "cell_id": "cell", "kind": "probe"}
+    )
+
+    assert response["program_cycle_status"]["state"] == "starting"
+    assert response["program_cycle_status"]["cycle_claim_generation"] is None
 
 
 @pytest.mark.parametrize("packet", [b"{}", b"x" * 16_385])

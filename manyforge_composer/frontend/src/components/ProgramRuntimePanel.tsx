@@ -497,6 +497,10 @@ export function ProgramTransportControls({
   const motionPaused = robot.state.operation?.state === 'paused';
   const programActive = state.run?.state === 'running'
     || state.run?.state === 'intervention_required';
+  const programMotionRunning = state.run?.state === 'running';
+  const canStopMotion = enabled
+    && state.pending === null
+    && (programMotionRunning || motionActive);
   const canRun = enabled
     && state.runnerAvailable
     && state.applied !== null
@@ -585,13 +589,23 @@ export function ProgramTransportControls({
           <button
             type="button"
             className="danger-button transport-stop-primary"
-            disabled={!enabled || !motionActive || robot.state.phase === 'stopping'}
-            title={motionActive
-              ? 'Stop the exact active robot motion.'
-              : 'No addressed robot motion is active.'}
-            onClick={() => { void robot.stop(); }}
+            disabled={!canStopMotion || robot.state.phase === 'stopping'}
+            title={programMotionRunning
+              ? 'Stop addressed motion in the current Program without terminating its execution.'
+              : motionActive
+                ? 'Stop the exact active Robot Control motion.'
+                : 'No addressed robot motion is active.'}
+            onClick={() => {
+              if (programMotionRunning) {
+                void program.stopMotion();
+              } else {
+                void robot.stop();
+              }
+            }}
           >
-            {robot.state.phase === 'stopping' ? 'Stopping…' : 'Stop'}
+            {robot.state.phase === 'stopping' || state.pending === 'motion-stop'
+              ? 'Stopping…'
+              : 'Stop'}
           </button>
           <button
             type="button"

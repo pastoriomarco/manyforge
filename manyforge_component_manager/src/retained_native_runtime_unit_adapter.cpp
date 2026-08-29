@@ -1018,6 +1018,12 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     SendPacket(child.channel.get(), encoded, timeout);
     const auto packet = ReceivePacket(child.channel.get(), timeout);
     if (!packet.has_value()) {
+      // A late response on this untagged request/reply channel could otherwise
+      // be consumed as the reply to a later command.  Once a request times
+      // out, the stream is no longer usable: stop this exact child and let
+      // normal convergence create a fresh epoch.
+      child.channel.Reset();
+      StopChildNoThrow(child);
       Fail("native projection response timed out");
     }
     auto response = detail::DecodeNativeProjectionRpcResponse(*packet);
@@ -1120,6 +1126,8 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     const auto packet =
         ReceivePacket(found->second.channel.get(), kStatusTimeout);
     if (!packet.has_value()) {
+      found->second.channel.Reset();
+      StopChildNoThrow(found->second);
       Fail("managed Kernel Apply-fence response timed out");
     }
     auto response = detail::DecodeKernelApplyFenceRpcResponse(*packet);
@@ -1159,6 +1167,8 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     const auto packet =
         ReceivePacket(found->second.channel.get(), kStatusTimeout);
     if (!packet.has_value()) {
+      found->second.channel.Reset();
+      StopChildNoThrow(found->second);
       Fail("managed Kernel cell-admission response timed out");
     }
     const auto response = detail::DecodeKernelCellAdmissionRpcResponse(*packet);
@@ -1196,10 +1206,19 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     }
     const auto encoded =
         detail::EncodeSelectedRuntimeCompositionRpcRequest(request);
-    SendPacket(found->second.channel.get(), encoded, kStatusTimeout);
+    // On first convergence the child may be completing the bounded retained
+    // CCLC recovery before it can service the ordinary command channel.  This
+    // is cold composition work, not a steady-state status exchange.
+    SendPacket(found->second.channel.get(), encoded,
+               std::chrono::duration_cast<std::chrono::milliseconds>(
+                   kProjectionPreparationTimeout));
     const auto packet =
-        ReceivePacket(found->second.channel.get(), kStatusTimeout);
+        ReceivePacket(found->second.channel.get(),
+                      std::chrono::duration_cast<std::chrono::milliseconds>(
+                          kProjectionPreparationTimeout));
     if (!packet.has_value()) {
+      found->second.channel.Reset();
+      StopChildNoThrow(found->second);
       Fail("managed runtime-composition response timed out");
     }
     auto response =
@@ -1729,8 +1748,13 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     }
     SendPacket(found->second.channel.get(), "status", kStatusTimeout);
     const auto packet =
-        ReceivePacket(found->second.channel.get(), kStatusTimeout);
+        ReceivePacket(found->second.channel.get(),
+                      std::chrono::duration_cast<std::chrono::milliseconds>(
+                          kProjectionPreparationTimeout));
     if (!packet.has_value()) {
+      found->second.channel.Reset();
+      StopChildNoThrow(found->second);
+      EraseChild(found);
       return std::nullopt;
     }
     std::istringstream stream(*packet);

@@ -218,6 +218,22 @@ export interface ExecutionOwnerStatus {
   cellStopAction: CellStopActionStatus;
 }
 
+export interface ExecutionIdentity {
+  ownerEpoch: string;
+  cellId: string;
+  activePublicationGeneration: number;
+  graphRevision: string;
+  retainedBundleId: string;
+  sceneRevision: SceneRevisionValue;
+  programId: string;
+  programRevision: string;
+  programBindingId: string;
+  motionTargetRoleId: string;
+  gripperTargetRoleId: string;
+  gripperCommandSchemaId: string;
+  gripperCommandSchemaRevision: string;
+}
+
 export type DirectControlMotionSpec =
   | {
       kind: 'joint_goal';

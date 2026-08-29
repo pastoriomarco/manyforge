@@ -18,10 +18,10 @@ class RecordingTransport:
         self.submitted: Mapping[str, Any] | None = None
         self.controls: list[tuple[str, str, Mapping[str, Any]]] = []
 
-    def execution_status(self) -> dict[str, Any]:
+    def execution_identity(self) -> dict[str, Any]:
         return {
             "ok": True,
-            "status": {
+            "identity": {
                 "owner_epoch": "owner-epoch-7",
                 "program_id": "program-1",
                 "program_revision": "sha256:" + "1" * 64,
@@ -221,11 +221,11 @@ def test_runner_stop_is_attributed_fenced_and_exactly_replayable() -> None:
 
 
 def test_runner_rejects_an_incomplete_owner_projection_before_submission() -> None:
-    class IncompleteStatusTransport(RecordingTransport):
-        def execution_status(self) -> dict[str, Any]:
-            return {"ok": True, "status": {"owner_epoch": "owner-epoch-7"}}
+    class IncompleteIdentityTransport(RecordingTransport):
+        def execution_identity(self) -> dict[str, Any]:
+            return {"ok": True, "identity": {"owner_epoch": "owner-epoch-7"}}
 
-    transport = IncompleteStatusTransport()
+    transport = IncompleteIdentityTransport()
     runner = OrchestratorRunner(KernelClient(transport))
 
     with pytest.raises(KernelClientResponseError, match="incomplete"):

@@ -12,6 +12,12 @@ qualified_build_root=${MANYFORGE_DEV_QUALIFIED_BUILD_ROOT:-}
 scenario=
 started_container=false
 
+frontend_ready() {
+  docker exec "$container_name" python3 -c \
+    'import socket; socket.create_connection(("127.0.0.1", 3000), timeout=0.5).close()' \
+    >/dev/null 2>&1
+}
+
 cleanup_failed_start() {
   result=$?
   if [[ $result -ne 0 && "$started_container" == true ]]; then
@@ -45,7 +51,7 @@ case "$command" in
     [[ -n "$scenario" ]] || { usage; exit 64; }
     if docker inspect "$container_name" >/dev/null 2>&1; then
       if [[ $(docker inspect -f '{{.State.Running}}' "$container_name") == true ]]; then
-        if current=$(docker exec "$container_name" python3 scripts/dev-workbench.py status --scenario "$scenario" 2>/dev/null); then
+        if frontend_ready && current=$(docker exec "$container_name" python3 scripts/dev-workbench.py status --scenario "$scenario" 2>/dev/null); then
           echo "$current"
           echo "Development workbench is already running at http://localhost:3000"
           exit 0
@@ -93,7 +99,7 @@ case "$command" in
         docker logs --tail 200 "$container_name" >&2
         exit 69
       fi
-      if current=$(docker exec "$container_name" python3 scripts/dev-workbench.py status --scenario "$scenario" 2>/dev/null); then
+      if frontend_ready && current=$(docker exec "$container_name" python3 scripts/dev-workbench.py status --scenario "$scenario" 2>/dev/null); then
         echo "$current"
         echo "Development workbench: http://localhost:3000"
         started_container=false
