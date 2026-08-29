@@ -438,6 +438,11 @@ public:
     return Invoke([this]() { return core_->HistorianHealth(); });
   }
 
+  std::string HistoryDetail(const std::uint64_t sequence) {
+    py::gil_scoped_release release;
+    return Invoke([this, sequence]() { return core_->HistoryDetail(sequence); });
+  }
+
   std::string CommitProgramModelAttempt(std::string record_json) {
     py::gil_scoped_release release;
     return Invoke([this, record_json = std::move(record_json)]() mutable {
@@ -650,6 +655,8 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
            py::arg("components") = std::vector<std::string>{},
            py::arg("event_types") = std::vector<std::string>{},
            py::arg("before_sequence") = std::nullopt, py::arg("limit") = 1000U)
+      .def("history_detail", &HeadlessApiBridge::HistoryDetail,
+           py::arg("sequence"))
       .def("historian_health", &HeadlessApiBridge::HistorianHealth)
       .def("commit_program_model_attempt",
            &HeadlessApiBridge::CommitProgramModelAttempt,

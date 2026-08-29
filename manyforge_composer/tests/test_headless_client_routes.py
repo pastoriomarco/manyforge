@@ -2288,6 +2288,21 @@ def test_composer_preserves_headless_unavailability_code(
                 },
                 "reject_if_affected_busy": True,
                 "expected_admission_generation": 7,
+                "candidate_receipt": {
+                    "schema_version": "manyforge.manager_deployment_candidate_receipt.v1",
+                    "deployment_artifact_id": "deployment.1",
+                    "deployment_revision": "sha256:" + "a" * 64,
+                    "scenario_catalog_revision": "sha256:" + "b" * 64,
+                    "candidate_retained_bundle_id": "bundle.next",
+                    "candidate_graph_revision": "graph.next",
+                    "expected_current": {
+                        "graph_revision": "graph.1",
+                        "retained_bundle_id": "bundle.1",
+                    },
+                    "expected_admission_generation": 7,
+                    "manager_owner_epoch": "alarm.epoch.1",
+                    "receipt_digest": "sha256:" + "c" * 64,
+                },
             },
         )
     assert response.status_code == 503
@@ -2333,6 +2348,21 @@ def test_composer_preserves_manager_apply_success_receipt(
                 },
                 "reject_if_affected_busy": True,
                 "expected_admission_generation": 7,
+                "candidate_receipt": {
+                    "schema_version": "manyforge.manager_deployment_candidate_receipt.v1",
+                    "deployment_artifact_id": "deployment.3",
+                    "deployment_revision": "sha256:" + "a" * 64,
+                    "scenario_catalog_revision": "sha256:" + "b" * 64,
+                    "candidate_retained_bundle_id": "bundle.3",
+                    "candidate_graph_revision": "graph.3",
+                    "expected_current": {
+                        "graph_revision": "graph.2",
+                        "retained_bundle_id": "bundle.2",
+                    },
+                    "expected_admission_generation": 7,
+                    "manager_owner_epoch": "alarm.epoch.1",
+                    "receipt_digest": "sha256:" + "c" * 64,
+                },
             },
         )
 

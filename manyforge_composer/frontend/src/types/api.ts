@@ -370,6 +370,7 @@ export interface DeploymentWorkspaceResponse {
   };
   binding: ProgramBindingDocument | null;
   scenarioCandidates: DeploymentScenarioCandidate[];
+  savedScenarioCandidates: DeploymentScenarioCandidate[];
   unavailableReasons: string[];
 }
 
@@ -1128,6 +1129,46 @@ export interface DraftFenceRequest {
   requestId: string;
 }
 
+export interface ManagerDeploymentCandidateReceipt {
+  schema_version: 'manyforge.manager_deployment_candidate_receipt.v1';
+  deployment_artifact_id: string;
+  deployment_revision: string;
+  scenario_catalog_revision: string;
+  candidate_retained_bundle_id: string;
+  candidate_graph_revision: string;
+  expected_current: {
+    graph_revision: string;
+    retained_bundle_id: string;
+  };
+  expected_admission_generation: number;
+  manager_owner_epoch: string;
+  receipt_digest: string;
+}
+
+export interface ManagerDeploymentCandidatePreviewRequest {
+  deployment_artifact_id: string;
+  deployment_revision: string;
+  expected_current: {
+    graph_revision: string;
+    retained_bundle_id: string;
+  };
+  expected_admission_generation: number;
+  request_owner_epoch: string;
+}
+
+export interface ManagerDeploymentRecordDiff {
+  added: string[];
+  changed: string[];
+  removed: string[];
+}
+
+export interface ManagerDeploymentCandidatePreviewResponse {
+  apiVersion: 'manyforge.manager_command_response.v1';
+  candidateReceipt: ManagerDeploymentCandidateReceipt;
+  converged: boolean;
+  diff: Record<string, ManagerDeploymentRecordDiff>;
+}
+
 export interface ManagerApplyRequest {
   request_id: string;
   request_owner_epoch: string;
@@ -1140,6 +1181,8 @@ export interface ManagerApplyRequest {
     retained_bundle_id: string;
   };
   reject_if_affected_busy: true;
+  expected_admission_generation: number;
+  candidate_receipt: ManagerDeploymentCandidateReceipt;
 }
 
 export interface ManagerSourceMetadata {

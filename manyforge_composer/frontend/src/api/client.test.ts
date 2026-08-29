@@ -199,6 +199,24 @@ function managerApplyFixture(request: ManagerApplyRequest): Record<string, unkno
   };
 }
 
+function managerCandidateReceipt() {
+  return {
+    schema_version: 'manyforge.manager_deployment_candidate_receipt.v1' as const,
+    deployment_artifact_id: 'artifact-1',
+    deployment_revision: 'rev-2',
+    scenario_catalog_revision: `sha256:${'a'.repeat(64)}`,
+    candidate_retained_bundle_id: 'bundle-next',
+    candidate_graph_revision: 'graph-next',
+    expected_current: {
+      graph_revision: 'graph-9',
+      retained_bundle_id: 'bundle-9',
+    },
+    expected_admission_generation: 7,
+    manager_owner_epoch: 'owner.epoch.1',
+    receipt_digest: `sha256:${'b'.repeat(64)}`,
+  };
+}
+
 describe('structural API client', () => {
   it('uses the owner mode index and bridge-owned request status routes', async () => {
     const fetchMock = vi.fn()
@@ -580,6 +598,8 @@ describe('headless intent client', () => {
         retained_bundle_id: 'bundle-9',
       },
       reject_if_affected_busy: true,
+      expected_admission_generation: 7,
+      candidate_receipt: managerCandidateReceipt(),
     };
 
     const fetchMock = vi.fn()
@@ -634,6 +654,8 @@ describe('headless intent client', () => {
         retained_bundle_id: 'bundle-9',
       },
       reject_if_affected_busy: true,
+      expected_admission_generation: 7,
+      candidate_receipt: managerCandidateReceipt(),
     };
     const responsePayload = managerApplyFixture({
       ...request,
@@ -657,6 +679,8 @@ describe('headless intent client', () => {
       deployment_revision: 'rev-2',
       expected_current: { graph_revision: 'graph-9', retained_bundle_id: 'bundle-9' },
       reject_if_affected_busy: true,
+      expected_admission_generation: 7,
+      candidate_receipt: managerCandidateReceipt(),
     });
     delete payload.replay_status;
     delete payload.request_id;
@@ -741,5 +765,37 @@ describe('headless intent client', () => {
       }],
       confirmed: true,
     });
+  });
+
+  it('reads one exact typed historian detail by safe sequence', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response({
+      schema_version: 'manyforge.historian_detail.v1',
+      sequence: 7,
+      event: {
+        schema_version: 'manyforge.historian_event.v1',
+        event_id: 'event-1',
+        component: 'manyforge.execution',
+        event_type: 'operation_updated',
+        severity: 'INFO',
+        occurred_at_ns: 1,
+        occurred_at_wall: '2026-08-28T00:00:00Z',
+        payload: {},
+      },
+      sections: {
+        incident: { available: false, reason: 'not an incident', value: null },
+        execution_digest: { available: true, reason: null, value: { operation_id: 'op.1' } },
+        blackboard: { available: false, reason: 'not published', value: null },
+        latency: { available: false, reason: 'not published', value: null },
+      },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const detail = await api.history.detail(7);
+
+    expect(detail.sequence).toBe(7);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/execution/history/7');
+    await expect(api.history.detail(0)).rejects.toThrow(
+      'History sequence must be a positive safe integer',
+    );
   });
 });

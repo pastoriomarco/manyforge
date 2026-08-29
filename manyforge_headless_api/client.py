@@ -686,6 +686,13 @@ class HeadlessHttpClient:
             raise ValueError("assistant mode identity is invalid")
         return self.request("GET", f"/api/assistant/modes/{mode_id}/context")
 
+    def manager_deployment_candidate_preview(
+        self, body: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return self.request(
+            "POST", "/api/manager/deployment-candidates/preview", body=body
+        )
+
     def manager_apply(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/manager/apply", body=body)
 
@@ -929,6 +936,11 @@ class HeadlessHttpClient:
         params: Sequence[tuple[str, str | int]] = (),
     ) -> dict[str, Any]:
         return self.request("GET", "/api/execution/history", params=params)
+
+    def history_detail(self, sequence: int) -> dict[str, Any]:
+        if not 1 <= sequence <= 9_007_199_254_740_991:
+            raise ValueError("history sequence must be a positive safe integer")
+        return self.request("GET", f"/api/execution/history/{sequence}")
 
     def historian_health(self) -> dict[str, Any]:
         return self.request("GET", "/api/execution/history/health")

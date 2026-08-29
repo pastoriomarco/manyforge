@@ -8,9 +8,11 @@ import {
   parseHealthResponse,
   parseHeadlessRuntimeSnapshot,
   parseHistorianPage,
+  parseHistorianDetail,
   parseExecutionOwnerStatus,
   parseManagerApplyResponse,
   parseManagerApplyStatusResponse,
+  parseManagerDeploymentCandidatePreviewResponse,
   parseManagerDiffProjection,
   parseManagerGraphProjection,
   parseManagerStatusProjection,
@@ -54,6 +56,8 @@ import type {
   AppliedProgramSelection,
   CatalogResponse,
   ManagerApplyRequest,
+  ManagerDeploymentCandidatePreviewRequest,
+  ManagerDeploymentCandidatePreviewResponse,
   DraftFenceRequest,
   DraftMutationResponse,
   DeploymentWorkspaceResponse,
@@ -88,6 +92,7 @@ import type {
   AlarmMembership,
   HeadlessRuntimeSnapshot,
   HistorianPage,
+  HistorianDetail,
   OperatorAlarmRecord,
   OperatorAlarmSnapshot,
 } from '../types/headless';
@@ -556,6 +561,15 @@ export const api = {
       signal,
       { method: 'POST', body: JSON.stringify(fence) },
     ),
+    revert: (
+      fence: DraftFenceRequest,
+      signal?: AbortSignal,
+    ): Promise<DeploymentWorkspaceResponse> => requestJson(
+      '/api/deployment/revert',
+      parseDeploymentWorkspaceResponse,
+      signal,
+      { method: 'POST', body: JSON.stringify(fence) },
+    ),
   },
   programs: {
     scenarios: (signal?: AbortSignal): Promise<ScenarioCatalogResponse> =>
@@ -664,6 +678,15 @@ export const api = {
       '/api/manager/diff',
       parseManagerDiffProjection,
       signal,
+    ),
+    previewDeploymentCandidate: (
+      request: ManagerDeploymentCandidatePreviewRequest,
+      signal?: AbortSignal,
+    ): Promise<ManagerDeploymentCandidatePreviewResponse> => requestJson(
+      '/api/manager/deployment-candidates/preview',
+      parseManagerDeploymentCandidatePreviewResponse,
+      signal,
+      { method: 'POST', body: JSON.stringify(request) },
     ),
     apply: (
       request: ManagerApplyRequest,
@@ -1171,5 +1194,15 @@ export const api = {
         parseHistorianPage,
         signal,
       ),
+    detail: (sequence: number, signal?: AbortSignal): Promise<HistorianDetail> => {
+      if (!Number.isSafeInteger(sequence) || sequence < 1) {
+        return Promise.reject(new Error('History sequence must be a positive safe integer'));
+      }
+      return requestJson(
+        `/api/execution/history/${encodeURIComponent(String(sequence))}`,
+        parseHistorianDetail,
+        signal,
+      );
+    },
   },
 };

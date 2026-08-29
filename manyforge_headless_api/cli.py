@@ -295,9 +295,28 @@ def _request(args: argparse.Namespace) -> int:
             )
         elif args.command == "apply":
             admission = client.authoring_admission()
+            preview = client.manager_deployment_candidate_preview(
+                {
+                    "deployment_artifact_id": args.deployment_artifact_id,
+                    "deployment_revision": args.deployment_revision,
+                    "expected_current": {
+                        "graph_revision": args.expected_graph_revision,
+                        "retained_bundle_id": args.expected_retained_bundle_id,
+                    },
+                    "expected_admission_generation": admission[
+                        "admission_generation"
+                    ],
+                    "request_owner_epoch": args.request_owner_epoch,
+                }
+            )
+            if preview.get("ok") is not True:
+                value = preview
+                print(json.dumps(value, indent=2, sort_keys=True))
+                return 1
             value = client.manager_apply(
                 {
                     **_caller(args),
+                    "candidate_receipt": preview["candidate_receipt"],
                     "deployment_artifact_id": args.deployment_artifact_id,
                     "deployment_revision": args.deployment_revision,
                     "expected_current": {

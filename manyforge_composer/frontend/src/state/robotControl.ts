@@ -99,6 +99,7 @@ export type RobotControlAction =
   | { type: 'operation_poll_failed'; error: string }
   | { type: 'stop_started' }
   | { type: 'stop_rejected'; error: string }
+  | { type: 'dismiss_error' }
   | { type: 'revert' }
   | { type: 'clear' };
 
@@ -571,6 +572,8 @@ export function robotControlReducer(
       return state.operation !== null && state.phase === 'stopping'
         ? { ...state, phase: 'executing', error: action.error }
         : state;
+    case 'dismiss_error':
+      return state.error === null ? state : { ...state, error: null };
     case 'revert':
       if (robotControlHasActiveOperation(state)) return state;
       return {

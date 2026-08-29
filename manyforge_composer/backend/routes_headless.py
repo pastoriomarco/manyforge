@@ -16,6 +16,7 @@ from manyforge_headless_api.models import (
     FullStopIntentRequest,
     HistorianReconcileRequest,
     ManagerApplyRequest,
+    ManagerDeploymentCandidatePreviewRequest,
     OperationControlRequest,
     OperationIntentRequest,
     PickSequencePlanningRequest,
@@ -467,6 +468,16 @@ def create_headless_router(
     ) -> dict[str, Any]:
         return _call(lambda: client.assistant_mode(mode_id))
 
+    @router.post("/api/manager/deployment-candidates/preview")
+    def manager_deployment_candidate_preview(
+        body: ManagerDeploymentCandidatePreviewRequest,
+    ) -> dict[str, Any]:
+        return _call(
+            lambda: client.manager_deployment_candidate_preview(
+                body.model_dump()
+            )
+        )
+
     @router.post("/api/manager/apply")
     def manager_apply(body: ManagerApplyRequest) -> dict[str, Any]:
         return _call(lambda: client.manager_apply(body.model_dump()))
@@ -755,6 +766,12 @@ def create_headless_router(
     @router.get("/api/execution/history/health")
     def historian_health() -> dict[str, Any]:
         return _call(client.historian_health)
+
+    @router.get("/api/execution/history/{sequence}")
+    def historian_detail(
+        sequence: Annotated[int, Path(ge=1, le=9_007_199_254_740_991)],
+    ) -> dict[str, Any]:
+        return _call(lambda: client.history_detail(sequence))
 
     @router.post("/api/execution/history/reconcile")
     def historian_reconcile(body: HistorianReconcileRequest) -> dict[str, Any]:

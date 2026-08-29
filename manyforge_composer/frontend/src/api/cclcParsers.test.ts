@@ -72,6 +72,11 @@ describe('CCLC closed response parsers', () => {
       lifecycleGeneration: 4,
       lifecycleState: 'prepared',
       graphRevision: 'graph.1',
+      providers: [{
+        controlDomainId: 'domain.arm',
+        providerInstanceId: 'provider.arm',
+        providerRuntimeUnitId: 'runtime.arm',
+      }],
     });
 
     const torn = structuredClone(value);

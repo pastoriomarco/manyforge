@@ -17,6 +17,7 @@ function controller(): CCLCController {
       retainedBundleId: 'bundle.1',
       graphRevision: 'graph.1',
       domains: [],
+      providers: [],
     },
     routeTemplates: {
       componentId: 'component.arm',
@@ -26,12 +27,12 @@ function controller(): CCLCController {
     },
     transaction: null,
     pendingTransaction: null,
-    confirmed: false,
     busy: false,
     error: null,
     setComponentId: vi.fn(),
-    setConfirmed: vi.fn(),
     refresh: vi.fn(),
+    reconcileTransaction: vi.fn(),
+    dismissError: vi.fn(),
     submitLifecycle: vi.fn(),
     submitRoute: vi.fn(),
   };
@@ -41,13 +42,15 @@ describe('CCLC presentation', () => {
   it('shows owner facts while every mutation requires confirmation', () => {
     const html = renderToStaticMarkup(createElement(CCLCPanelView, {
       enabled: true,
+      mutationAvailable: true,
+      mutationUnavailableReason: null,
       controller: controller(),
     }));
     expect(html).toContain('component.arm');
     expect(html).toContain('prepared');
     expect(html).toContain('generation 4');
-    expect(html).toContain('Explicit confirmation');
-    expect(html).toContain('disabled=""');
-    expect(html).toContain('No client-side lifecycle state');
+    expect(html).toContain('Start / prepare');
+    expect(html).toContain('Connect / enable');
+    expect(html).toContain('Owner-issued state');
   });
 });

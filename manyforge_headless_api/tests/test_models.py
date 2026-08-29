@@ -474,6 +474,21 @@ def test_apply_rejects_unknown_identity_and_noncanonical_busy_policy() -> None:
         },
         "reject_if_affected_busy": False,
         "expected_admission_generation": 7,
+        "candidate_receipt": {
+            "schema_version": "manyforge.manager_deployment_candidate_receipt.v1",
+            "deployment_artifact_id": "deployment.1",
+            "deployment_revision": "sha256:" + "a" * 64,
+            "scenario_catalog_revision": "sha256:" + "b" * 64,
+            "candidate_retained_bundle_id": "bundle.2",
+            "candidate_graph_revision": "graph.2",
+            "expected_current": {
+                "graph_revision": "graph.1",
+                "retained_bundle_id": "bundle.1",
+            },
+            "expected_admission_generation": 7,
+            "manager_owner_epoch": "owner.1",
+            "receipt_digest": "sha256:" + "c" * 64,
+        },
     }
     with pytest.raises(ValidationError) as captured:
         ManagerApplyRequest.model_validate(body)

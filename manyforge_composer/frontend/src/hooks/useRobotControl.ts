@@ -56,6 +56,8 @@ export interface RobotControlController {
   stop: () => Promise<void>;
   fullStop: () => Promise<void>;
   dismissFullStopError: () => void;
+  dismissRuntimeScaleError: () => void;
+  dismissError: () => void;
   pause: () => Promise<void>;
   resume: () => Promise<void>;
   setRuntimeScale: (scale: number) => void;
@@ -540,6 +542,12 @@ export function useRobotControl(enabled: boolean): RobotControlController {
   const dismissFullStopError = useCallback(() => {
     setFullStopError(null);
   }, []);
+  const dismissRuntimeScaleError = useCallback(() => {
+    setRuntimeScaleError(null);
+  }, []);
+  const dismissError = useCallback(() => {
+    dispatch({ type: 'dismiss_error' });
+  }, []);
 
   return useMemo(() => ({
     state,
@@ -560,6 +568,8 @@ export function useRobotControl(enabled: boolean): RobotControlController {
     stop,
     fullStop,
     dismissFullStopError,
+    dismissRuntimeScaleError,
+    dismissError,
     pause,
     resume,
     setRuntimeScale,
@@ -587,5 +597,7 @@ export function useRobotControl(enabled: boolean): RobotControlController {
     stop,
     fullStop,
     dismissFullStopError,
+    dismissRuntimeScaleError,
+    dismissError,
   ]);
 }

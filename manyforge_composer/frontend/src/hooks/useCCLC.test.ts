@@ -27,6 +27,7 @@ const snapshot: CCLCComponentSnapshot = {
   lifecycleState: 'prepared',
   retainedBundleId: 'bundle.1',
   graphRevision: 'graph.1',
+  providers: [],
   domains: [{
     controlDomainId: 'domain.arm',
     controlDomainRevision: 'domain.revision.1',
@@ -125,12 +126,13 @@ describe('CCLC request projection', () => {
   });
 
   it('copies lifecycle compare-and-set truth from the owner snapshot', () => {
-    expect(lifecycleRequestFromSnapshot(snapshot, 'enable', context)).toEqual({
+    expect(lifecycleRequestFromSnapshot(snapshot, 'enable', context, 7)).toEqual({
       request_context: context,
       controllable_component_id: 'component.arm',
       intent: 'enable',
       expected_graph_revision: 'graph.1',
       expected_component_lifecycle_generation: 4,
+      expected_admission_generation: 7,
       expected_control_domains: [{
         control_domain_id: 'domain.arm',
         control_domain_revision: 'domain.revision.1',
@@ -153,18 +155,22 @@ describe('CCLC request projection', () => {
   });
 
   it('copies the exact selected retained route template', () => {
-    const request = routeRequestFromTemplate(templates, templates.templates[0]!, context);
+    const request = routeRequestFromTemplate(
+      templates, templates.templates[0]!, context, 7,
+    );
     expect(request.desired_configuration).toBe(
       templates.templates[0]!.desired_configuration,
     );
     expect(request.component_expectations).toBe(
       templates.templates[0]!.component_expectations,
     );
+    expect(request.expected_admission_generation).toBe(7);
     expect(request.confirmed).toBe(true);
     expect(() => routeRequestFromTemplate(
       templates,
       { ...templates.templates[0]! },
       context,
+      7,
     )).toThrow('current projection');
   });
 });

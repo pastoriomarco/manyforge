@@ -18,8 +18,8 @@ export interface OperatorAlarmView {
 interface OperatorAlarmPanelProps {
   alarm: OperatorAlarmView;
   busy?: boolean;
-  onAcknowledge: (alarm: OperatorAlarmView) => void;
-  onMinimize: () => void;
+  onAcknowledge?: (alarm: OperatorAlarmView) => void;
+  onMinimize?: () => void;
 }
 
 /**
@@ -65,15 +65,17 @@ export function OperatorAlarmPanel({
         />
       </details>
       <div className="operator-alarm-actions">
-        <button type="button" onClick={onMinimize}>Minimize</button>
-        <button
-          type="button"
-          disabled={busy}
-          onClick={() => onAcknowledge(alarm)}
-          title="Acknowledge this exact activation and revision; this does not clear the condition or resume motion."
-        >
-          Acknowledge alarm
-        </button>
+        {onMinimize && <button type="button" onClick={onMinimize}>Minimize</button>}
+        {onAcknowledge && (
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => onAcknowledge(alarm)}
+            title="Acknowledge this exact activation and revision; this does not clear the condition or resume motion."
+          >
+            Acknowledge alarm
+          </button>
+        )}
       </div>
     </div>
   );

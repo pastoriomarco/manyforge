@@ -293,12 +293,13 @@ describe('headless Composer presentation adapters', () => {
     }));
 
     expect(html).toContain('Planner unavailable');
-    expect(html).toContain('1 acknowledgement required');
-    expect(html).toContain('ACTIVE — ACKNOWLEDGED · Reduced capability');
-    expect(html).toContain('Messages / history');
+    expect(html).toContain('Attention 2');
+    expect(html).toContain('Active 1');
+    expect(html).toContain('>History</button>');
+    expect(html).not.toContain('ACTIVE — ACKNOWLEDGED · Reduced capability');
     expect(html).toContain('Reconnect headless projection');
-    expect(html).toContain('COMPOSER ERROR — ACKNOWLEDGEMENT REQUIRED');
-    expect(html).toContain('Acknowledge message');
+    expect(html).toContain('COMPOSER ERROR — DISMISSAL REQUIRED');
+    expect(html).toContain('Dismiss message');
     expect(reconnect).not.toHaveBeenCalled();
   });
 });

@@ -12,6 +12,7 @@ import rfc8785
 
 from .models import (
     ManagerApplyRequest,
+    ManagerDeploymentCandidatePreviewRequest,
     ProjectionRevisionRequest,
     SceneResourcePoseQuery,
     SceneTransactionRequest,
@@ -52,6 +53,10 @@ _SCENE_UPDATE_STATUSES = {"geometry_changed", "freshness_only", "no_op"}
 
 
 class ManagerPort(Protocol):
+    def preview_deployment_candidate(
+        self, request: ManagerDeploymentCandidatePreviewRequest
+    ) -> dict[str, Any]: ...
+
     def apply(self, request: ManagerApplyRequest) -> dict[str, Any]: ...
 
     def observe_apply(
@@ -169,11 +174,30 @@ class ManagerCommandClient:
             )
         return response
 
+    def preview_deployment_candidate(
+        self, request: ManagerDeploymentCandidatePreviewRequest
+    ) -> dict[str, Any]:
+        response = self._exchange(
+            {
+                "api_version": MANAGER_COMMAND_VERSION,
+                "command": "deployment_candidate_preview",
+                "deployment_artifact_id": request.deployment_artifact_id,
+                "deployment_revision": request.deployment_revision,
+                "expected_admission_generation": (
+                    request.expected_admission_generation
+                ),
+                "expected_current": request.expected_current.model_dump(),
+                "request_owner_epoch": request.request_owner_epoch,
+            }
+        )
+        return response
+
     def apply(self, request: ManagerApplyRequest) -> dict[str, Any]:
         response = self._exchange(
             {
                 "api_version": MANAGER_COMMAND_VERSION,
                 "command": "apply",
+                "candidate_receipt": request.candidate_receipt.model_dump(),
                 "correlation_id": request.correlation_id,
                 "deployment_artifact_id": request.deployment_artifact_id,
                 "deployment_revision": request.deployment_revision,

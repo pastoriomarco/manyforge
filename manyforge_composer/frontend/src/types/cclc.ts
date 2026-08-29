@@ -34,6 +34,16 @@ export interface CCLCComponentDomain {
   currentResources: string[];
 }
 
+export interface CCLCProviderOccurrence {
+  controlDomainId: string;
+  lifecyclePlanCatalogDigest: string;
+  providerInstanceId: string;
+  providerManifestId: string;
+  providerManifestRevision: string;
+  providerRuntimeEpoch: string;
+  providerRuntimeUnitId: string;
+}
+
 export interface CCLCComponentSnapshot {
   componentId: string;
   lifecycleGeneration: number;
@@ -41,6 +51,7 @@ export interface CCLCComponentSnapshot {
   retainedBundleId: string;
   graphRevision: string;
   domains: CCLCComponentDomain[];
+  providers: CCLCProviderOccurrence[];
 }
 
 export interface CCLCExpectedActiveConfiguration {
@@ -96,6 +107,7 @@ export interface CCLCLifecycleRequestBody {
   intent: CCLCLifecycleIntent;
   expected_graph_revision: string;
   expected_component_lifecycle_generation: number;
+  expected_admission_generation: number;
   expected_control_domains: Array<{
     control_domain_id: string;
     control_domain_revision: string;
@@ -114,6 +126,7 @@ export interface CCLCLifecycleRequestBody {
 
 export interface CCLCRouteRequestBody {
   request_context: CCLCRequestContext;
+  expected_admission_generation: number;
   expected_retained_bundle_id: string;
   expected_graph_revision: string;
   desired_configuration: CCLCDesiredConfiguration;

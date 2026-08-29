@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { api } from '../api/client';
 import { useShellHeadlessState } from '../hooks/useHeadlessState';
 import type {
@@ -10,6 +10,7 @@ import type {
   AlarmPriority,
   HeadlessRuntimeSnapshot,
   HistorianStoredEvent,
+  HistorianDetail,
   OperatorAlarmRecord,
 } from '../types/headless';
 import {
@@ -26,6 +27,7 @@ import type {
 } from './ExecutionHistoryPanel';
 import type { RuntimeStatusView } from './RuntimeStatusOverlay';
 import { KernelErrorPanel } from './KernelErrorPanel';
+import { useOperationalErrorMirror } from '../state/operationalErrors';
 
 export interface ClientOperationalError {
   id: string;
@@ -183,6 +185,7 @@ export function historianEventView(
   const conditionId = stored.event.payload.condition_id;
   return {
     id: `${stored.sequence}:${stored.event.eventId}`,
+    sequence: stored.sequence,
     timestampNs: stored.event.occurredAtNs,
     timestamp: stored.event.occurredAtWall,
     severity: stored.event.severity,
@@ -230,33 +233,40 @@ export function HeadlessRuntimeSurfacesView({
   const { snapshot, error, reconnect } = headlessState;
   const [busyActivation, setBusyActivation] = useState<string | null>(null);
   const [bulkBusy, setBulkBusy] = useState(false);
-  const [minimized, setMinimized] = useState<Set<string>>(() => new Set());
   const [bulkFence, setBulkFence] = useState<AlarmAcknowledgementFence | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
-  const [historyOpen, setHistoryOpen] = useState(false);
+  const [mode, setMode] = useState<'attention' | 'active' | 'history'>('attention');
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState<string | null>(null);
   const [historyEvents, setHistoryEvents] = useState<ExecutionHistoryEventView[]>([]);
+  const [historyDetail, setHistoryDetail] = useState<HistorianDetail | null>(null);
+  const [historyDetailLoading, setHistoryDetailLoading] = useState(false);
+  const [historyDetailError, setHistoryDetailError] = useState<string | null>(null);
+  useOperationalErrorMirror({
+    source: 'composer.runtime_history',
+    title: 'Runtime history request failed',
+    message: historyError,
+    onDismiss: () => setHistoryError(null),
+  });
+  useOperationalErrorMirror({
+    source: 'composer.runtime_history_detail',
+    title: 'Runtime history detail request failed',
+    message: historyDetailError,
+    onDismiss: () => setHistoryDetailError(null),
+  });
+  useOperationalErrorMirror({
+    source: 'composer.alarm_acknowledgement',
+    title: 'Alarm acknowledgement failed',
+    message: actionError,
+    onDismiss: () => setActionError(null),
+  });
   const attention = useMemo(
     () => attentionAlarmsNewestFirst(snapshot?.alarms.alarms ?? []),
     [snapshot],
   );
-  const panels = attention
-    .filter((alarm) => !minimized.has(alarm.activationId))
-    .slice(0, 3);
   const standing = snapshot?.alarms.alarms.filter((alarm) =>
     alarm.lifecycleState === 'active_acknowledged') ?? [];
-
-  useEffect(() => {
-    const currentActivationIds = new Set(
-      attention.map((alarm) => alarm.activationId),
-    );
-    setMinimized((current) => {
-      const retained = [...current].filter((activationId) =>
-        currentActivationIds.has(activationId));
-      return retained.length === current.size ? current : new Set(retained);
-    });
-  }, [attention]);
+  const attentionCount = attention.length + clientErrors.length;
 
   const loadHistory = async () => {
     setHistoryLoading(true);
@@ -268,6 +278,20 @@ export function HeadlessRuntimeSurfacesView({
       setHistoryError(actionErrorMessage(reason));
     } finally {
       setHistoryLoading(false);
+    }
+  };
+
+  const loadHistoryDetail = async (event: ExecutionHistoryEventView) => {
+    if (event.sequence === undefined) return;
+    setHistoryDetailLoading(true);
+    setHistoryDetailError(null);
+    try {
+      setHistoryDetail(await api.history.detail(event.sequence));
+    } catch (reason) {
+      setHistoryDetail(null);
+      setHistoryDetailError(actionErrorMessage(reason));
+    } finally {
+      setHistoryDetailLoading(false);
     }
   };
 
@@ -334,19 +358,64 @@ export function HeadlessRuntimeSurfacesView({
 
   if (!enabled) return null;
   return (
-    <>
-      <aside className="operator-alarm-stack" aria-label="Operator alarms">
-        {clientErrors.map((clientError) => (
+    <section className="runtime-observability-surface">
+      <nav className="runtime-observability-tabs" aria-label="Runtime observability sections">
+        <button
+          type="button"
+          className={mode === 'attention' ? 'active' : ''}
+          aria-pressed={mode === 'attention'}
+          onClick={() => setMode('attention')}
+        >
+          Attention{attentionCount > 0 ? ` ${attentionCount}` : ''}
+        </button>
+        <button
+          type="button"
+          className={mode === 'active' ? 'active' : ''}
+          aria-pressed={mode === 'active'}
+          onClick={() => setMode('active')}
+        >
+          Active{standing.length > 0 ? ` ${standing.length}` : ''}
+        </button>
+        <button
+          type="button"
+          className={mode === 'history' ? 'active' : ''}
+          aria-pressed={mode === 'history'}
+          onClick={() => {
+            setMode('history');
+            if (historyEvents.length === 0) void loadHistory();
+          }}
+        >History</button>
+      </nav>
+
+      {mode === 'attention' && (
+        <div className="runtime-observability-section" aria-label="Attention required">
+          <header className="runtime-observability-section-header">
+            <div>
+              <strong>Attention required</strong>
+              <small>Exact backend alarms and current Composer-session errors.</small>
+            </div>
+            {snapshot !== null && snapshot.alarms.unacknowledgedCount > 0 && (
+              <button
+                type="button"
+                disabled={bulkBusy || busyActivation !== null}
+                onClick={() => { void confirmBulk(); }}
+              >
+                {bulkFence === null ? 'Acknowledge all…' : 'Confirm exact set'}
+              </button>
+            )}
+          </header>
+          {attentionCount === 0 && <p className="muted">Nothing currently requires acknowledgement.</p>}
+          {clientErrors.map((clientError) => (
           <div className="operator-alarm-panel" key={clientError.id}>
             <details open>
               <summary>
-                COMPOSER ERROR — ACKNOWLEDGEMENT REQUIRED · {clientError.title}
+                COMPOSER ERROR — DISMISSAL REQUIRED · {clientError.title}
               </summary>
               <KernelErrorPanel
                 error={{ code: clientError.id, message: clientError.message }}
                 presentation={{
                   headline: clientError.title,
-                  hint: 'Acknowledge after reviewing this client-side command or response failure.',
+                  hint: 'Dismiss after reviewing this client-side command or response failure.',
                   severity: 'error',
                 }}
                 presentationKey={clientError.id}
@@ -358,79 +427,63 @@ export function HeadlessRuntimeSurfacesView({
                 type="button"
                 onClick={() => onAcknowledgeClientError?.(clientError.id)}
               >
-                Acknowledge message
+                Dismiss message
               </button>
             </div>
           </div>
         ))}
-        {panels.map((alarm) => (
+          {attention.map((alarm) => (
           <OperatorAlarmPanel
             key={alarm.activationId}
             alarm={operatorAlarmView(alarm)}
             busy={busyActivation === alarm.activationId}
             onAcknowledge={(value) => { void acknowledge(value); }}
-            onMinimize={() => setMinimized((current) => {
-              const next = new Set(current);
-              next.add(alarm.activationId);
-              return next;
-            })}
           />
-        ))}
-        {snapshot !== null && (
-          <div className="operator-alarm-summary" role="status">
-            <span>{snapshot.alarms.unacknowledgedCount} acknowledgement required</span>
-            <span>{snapshot.alarms.activeAcknowledgedCount} active acknowledged</span>
-            {standing.map((alarm) => (
-              <span
-                key={alarm.activationId}
-                className="standing-alarm-chip"
-                title={`${alarm.message} — ${alarm.operatorResponse}`}
-              >
-                ACTIVE — ACKNOWLEDGED · {alarm.title}
-              </span>
-            ))}
-            {minimized.size > 0 && (
-              <button type="button" onClick={() => setMinimized(new Set())}>
-                Restore {minimized.size} minimized
-              </button>
-            )}
-            {snapshot.alarms.unacknowledgedCount > 0 && (
-              <button
-                type="button"
-                disabled={bulkBusy || busyActivation !== null}
-                onClick={() => { void confirmBulk(); }}
-              >
-                {bulkFence === null ? 'Acknowledge all…' : 'Confirm exact set'}
-              </button>
-            )}
-            <button
-              type="button"
-              onClick={() => {
-                setHistoryOpen(true);
-                void loadHistory();
-              }}
-            >
-              Messages / history
-            </button>
-          </div>
-        )}
-        {actionError !== null && (
+          ))}
+          {actionError !== null && (
           <p className="error-state" role="alert">{actionError}</p>
-        )}
-        {error !== null && (
+          )}
+          {error !== null && (
           <button type="button" className="text-button" onClick={reconnect}>
             Reconnect headless projection
           </button>
-        )}
-      </aside>
+          )}
+        </div>
+      )}
+
+      {mode === 'active' && (
+        <div className="runtime-observability-section" aria-label="Active alarms">
+          <header className="runtime-observability-section-header">
+            <div>
+              <strong>Active conditions</strong>
+              <small>Standing owner-issued conditions already acknowledged by the operator.</small>
+            </div>
+          </header>
+          {standing.length === 0 && <p className="muted">No acknowledged alarm remains active.</p>}
+          {standing.map((alarm) => (
+            <OperatorAlarmPanel
+              key={alarm.activationId}
+              alarm={operatorAlarmView(alarm)}
+              busy={false}
+            />
+          ))}
+        </div>
+      )}
+
       <ExecutionHistoryPanel
-        open={historyOpen}
-        onClose={() => setHistoryOpen(false)}
+        open={mode === 'history'}
+        embedded
+        onClose={() => setMode('attention')}
+        onReload={() => { void loadHistory(); }}
         events={historyEvents}
         loading={historyLoading}
         error={historyError}
+        selectedDetail={historyDetail}
+        detailLoading={historyDetailLoading}
+        detailError={historyDetailError}
+        onSelectEvent={(event) => { void loadHistoryDetail(event); }}
       />
-    </>
+    </section>
   );
 }
 

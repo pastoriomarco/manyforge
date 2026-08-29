@@ -171,6 +171,10 @@ export function useDeploymentWorkspace(
       (requestFence) => api.deploymentWorkspace.discard(requestFence),
       'Deployment Draft changes discarded; Manager Applied was unchanged.',
     ),
+    revert: () => run(
+      (requestFence) => api.deploymentWorkspace.revert(requestFence),
+      'Saved Deployment restored to Draft and applied by Manager.',
+    ),
   }), [run]);
 
   return {
@@ -183,6 +187,7 @@ export function useDeploymentWorkspace(
     mutationUnavailableReason,
     refresh,
     clearFeedback: () => setFeedback(null),
+    dismissError: () => setError(null),
     ...actions,
   };
 }

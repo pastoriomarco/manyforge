@@ -13,6 +13,7 @@ import type { ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 
 import { api } from '../api/client';
+import { useOperationalErrorMirror } from '../state/operationalErrors';
 import { useShellHeadlessState, useViewerHeadlessState } from '../hooks/useHeadlessState';
 import type { HeadlessStateSource } from '../hooks/useHeadlessState';
 import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
@@ -1824,6 +1825,13 @@ export function SceneAuthoringWorkspace({
   const [commitState, setCommitState] = useState<
     { kind: 'idle' | 'busy' | 'success' | 'error'; message: string | null }
   >({ kind: 'idle', message: null });
+  const [commitOperationalError, setCommitOperationalError] = useState<string | null>(null);
+  useOperationalErrorMirror({
+    source: 'composer.scene_transaction',
+    title: 'Scene owner command or response failed',
+    message: commitOperationalError,
+    onDismiss: () => setCommitOperationalError(null),
+  });
 
   useEffect(() => {
     const occurrences = sourceValue?.occurrences ?? [];
@@ -1930,6 +1938,7 @@ export function SceneAuthoringWorkspace({
       return false;
     }
     setCommitState({ kind: 'busy', message: null });
+    setCommitOperationalError(null);
     try {
       const response = await api.scene.commit(transaction);
       if (
@@ -1942,10 +1951,12 @@ export function SceneAuthoringWorkspace({
       });
       return true;
     } catch (error) {
+      const message = error instanceof Error ? error.message : 'Scene commit failed.';
       setCommitState({
         kind: 'error',
-        message: error instanceof Error ? error.message : 'Scene commit failed.',
+        message,
       });
+      setCommitOperationalError(message);
       return false;
     }
   }, []);

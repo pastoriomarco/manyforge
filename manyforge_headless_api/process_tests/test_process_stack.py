@@ -589,8 +589,7 @@ def _assistant_stack(
             metadata["predecessor_retained_bundle_id"]
         )
         with HeadlessHttpClient(stack.base_url, timeout_seconds=20.0) as client:
-            apply_result = client.manager_apply(
-                {
+            apply_body = {
                     "request_id": "assistant-native.process.apply",
                     "request_owner_epoch": initial["source"][
                         "source_owner_epoch"
@@ -616,6 +615,21 @@ def _assistant_stack(
                         "admission_generation"
                     ],
                 }
+            preview = client.manager_deployment_candidate_preview(
+                {
+                    "deployment_artifact_id": apply_body[
+                        "deployment_artifact_id"
+                    ],
+                    "deployment_revision": apply_body["deployment_revision"],
+                    "expected_current": apply_body["expected_current"],
+                    "expected_admission_generation": apply_body[
+                        "expected_admission_generation"
+                    ],
+                    "request_owner_epoch": apply_body["request_owner_epoch"],
+                }
+            )
+            apply_result = client.manager_apply(
+                {**apply_body, "candidate_receipt": preview["candidate_receipt"]}
             )
             assert apply_result["ok"] is True
         deadline = time.monotonic() + 20
@@ -762,11 +776,15 @@ def _matching_assistant_context(
 
 
 def _apply_body(
+    client: HeadlessHttpClient,
     owner_epoch: str,
     request_id: str,
     admission_generation: int,
+    *,
+    preview_owner_epoch: str | None = None,
 ) -> dict:
-    return {
+    active = client.manager_status()["status"]["active"]
+    body = {
         "request_id": request_id,
         "request_owner_epoch": owner_epoch,
         "source_label": "process_test",
@@ -774,12 +792,22 @@ def _apply_body(
         "deployment_artifact_id": "candidate",
         "deployment_revision": "sha256:" + "a" * 64,
         "expected_current": {
-            "graph_revision": "current-graph",
-            "retained_bundle_id": "current-bundle",
+            "graph_revision": active["graph_revision"],
+            "retained_bundle_id": active["retained_bundle_id"],
         },
         "reject_if_affected_busy": True,
         "expected_admission_generation": admission_generation,
     }
+    preview = client.manager_deployment_candidate_preview(
+        {
+            "deployment_artifact_id": body["deployment_artifact_id"],
+            "deployment_revision": body["deployment_revision"],
+            "expected_current": body["expected_current"],
+            "expected_admission_generation": admission_generation,
+            "request_owner_epoch": preview_owner_epoch or owner_epoch,
+        }
+    )
+    return {**body, "candidate_receipt": preview["candidate_receipt"]}
 
 
 def _assistant_callback_body(
@@ -1607,12 +1635,13 @@ def test_manager_api_cli_and_replacements_preserve_headless_owners(
             with pytest.raises(HeadlessClientError) as unavailable:
                 client.manager_apply(
                     _apply_body(
+                        client,
                         first_epoch,
                         "request.1",
                         1,
                     )
                 )
-            assert unavailable.value.code == "kernel_owner_unavailable"
+            assert unavailable.value.code == "deployment_candidate_rejected"
 
         stack.start_composer()
         assert stack.wait_composer()["projection_owner_epoch"] == owner_identity[0]
@@ -1729,21 +1758,21 @@ def test_manager_api_cli_and_replacements_preserve_headless_owners(
             assert replacement_epoch != first_epoch
 
             with pytest.raises(HeadlessClientError) as stale:
-                client.manager_apply(
-                    _apply_body(
-                        first_epoch,
-                        "request.stale",
-                        1,
-                    )
+                _apply_body(
+                    client,
+                    first_epoch,
+                    "request.stale",
+                    1,
                 )
             assert stale.value.code == "stale_request_owner_epoch"
 
             with pytest.raises(HeadlessClientError) as unavailable:
                 client.manager_apply(
                     _apply_body(
+                        client,
                         replacement_epoch,
                         "request.replacement",
                         1,
                     )
                 )
-            assert unavailable.value.code == "kernel_owner_unavailable"
+            assert unavailable.value.code == "deployment_candidate_rejected"

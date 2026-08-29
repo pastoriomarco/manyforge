@@ -1,5 +1,7 @@
 import { useMemo, useState } from 'react';
 
+import type { HistorianDetail } from '../types/headless';
+
 export type HistorySeverityFilter = 'all' | 'info' | 'warning' | 'error';
 export type HistoryAlarmFilter =
   | 'all'
@@ -16,6 +18,7 @@ export type HistoryAlarmPhase =
 
 export interface ExecutionHistoryEventView {
   id: string;
+  sequence?: number;
   timestampNs: number;
   timestamp?: string | null;
   severity?: string | null;
@@ -93,6 +96,12 @@ interface ExecutionHistoryPanelProps {
   loading?: boolean;
   error?: string | null;
   currentExecutionId?: number;
+  embedded?: boolean;
+  onReload?: () => void;
+  selectedDetail?: HistorianDetail | null;
+  detailLoading?: boolean;
+  detailError?: string | null;
+  onSelectEvent?: (event: ExecutionHistoryEventView) => void;
 }
 
 /**
@@ -106,6 +115,12 @@ export function ExecutionHistoryPanel({
   loading = false,
   error = null,
   currentExecutionId,
+  embedded = false,
+  onReload,
+  selectedDetail = null,
+  detailLoading = false,
+  detailError = null,
+  onSelectEvent,
 }: ExecutionHistoryPanelProps) {
   const [severity, setSeverity] = useState<HistorySeverityFilter>('all');
   const [alarmView, setAlarmView] = useState<HistoryAlarmFilter>('all');
@@ -125,13 +140,19 @@ export function ExecutionHistoryPanel({
   if (!open) return null;
 
   return (
-    <section className="history-panel" aria-labelledby="history-title">
+    <section
+      className={`history-panel${embedded ? ' history-panel-embedded' : ''}`}
+      aria-labelledby="history-title"
+    >
       <header>
         <div>
           <p className="eyebrow">Authoritative event projection</p>
           <h2 id="history-title">Runtime history</h2>
         </div>
-        <button type="button" onClick={onClose}>Close</button>
+        <div className="button-row">
+          {onReload && <button type="button" onClick={onReload}>Refresh</button>}
+          {!embedded && <button type="button" onClick={onClose}>Close</button>}
+        </div>
       </header>
       <div className="history-filters">
         <label>
@@ -181,21 +202,46 @@ export function ExecutionHistoryPanel({
           <p className="muted">No events match these filters.</p>
         )}
         {filtered.map((event) => (
-          <article
+          <button
+            type="button"
             key={event.id}
-            className={`history-event severity-${historySeverityGroup(event.severity)}`}
+            className={`history-event severity-${historySeverityGroup(event.severity)}${
+              selectedDetail?.sequence === event.sequence ? ' selected' : ''
+            }`}
+            onClick={() => onSelectEvent?.(event)}
           >
             <header>
               <strong>{event.message || event.type}</strong>
               <time>{eventTime(event)}</time>
             </header>
             <small>{event.channel} · {event.type}</small>
-            {event.details !== undefined && (
-              <pre>{JSON.stringify(event.details, null, 2)}</pre>
-            )}
-          </article>
+          </button>
         ))}
       </div>
+      {(detailLoading || detailError !== null || selectedDetail !== null) && (
+        <section className="history-detail" aria-label="Selected history event detail">
+          {detailLoading && <p className="muted">Loading exact event detail…</p>}
+          {detailError && <p className="error-state" role="alert">{detailError}</p>}
+          {selectedDetail && (
+            <>
+              <header>
+                <strong>{selectedDetail.event.eventType.replaceAll('_', ' ')}</strong>
+                <code>sequence {selectedDetail.sequence}</code>
+              </header>
+              <div className="history-detail-sections">
+                {Object.entries(selectedDetail.sections).map(([name, section]) => (
+                  <details key={name} open={section.available}>
+                    <summary>{name.replaceAll(/([A-Z])/g, ' $1')}</summary>
+                    {section.available
+                      ? <pre>{JSON.stringify(section.value, null, 2)}</pre>
+                      : <p className="muted">{section.reason}</p>}
+                  </details>
+                ))}
+              </div>
+            </>
+          )}
+        </section>
+      )}
     </section>
   );
 }

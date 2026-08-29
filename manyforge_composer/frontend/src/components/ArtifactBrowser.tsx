@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api } from '../api/client';
 import { errorMessage } from '../state/structuralResource';
+import { useOperationalErrorMirror } from '../state/operationalErrors';
 import type {
   ArtifactKind,
   FileBrowserEntry,
@@ -32,6 +33,12 @@ export function ArtifactBrowser({
   const [selected, setSelected] = useState<FileBrowserEntry | null>(null);
   const [reloadToken, setReloadToken] = useState(0);
   const [state, setState] = useState<BrowserState>({ status: 'loading' });
+  useOperationalErrorMirror({
+    source: `composer.artifact_browser.${kind}`,
+    title: 'Artifact browser response failed',
+    message: state.status === 'error' ? state.message : null,
+    onDismiss: () => setReloadToken((current) => current + 1),
+  });
 
   useEffect(() => {
     const controller = new AbortController();

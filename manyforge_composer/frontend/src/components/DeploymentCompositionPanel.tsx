@@ -5,6 +5,7 @@ import { useDeploymentWorkspace } from '../hooks/useDeploymentWorkspace';
 import type {
   ManagerApplyRequest,
   ManagerApplyResponse,
+  ManagerDeploymentCandidatePreviewResponse,
   ManagerDiffProjection,
   ManagerGraphProjection,
   ManagerStatusProjection,
@@ -13,6 +14,7 @@ import type {
 } from '../types/api';
 import type { ComposerHeadlessState } from '../types/headless';
 import { CCLCPanel } from './CCLCPanel';
+import { useOperationalErrorMirror } from '../state/operationalErrors';
 import { DeploymentBindingProjection } from './DeploymentBindingProjection';
 import { DeploymentDocumentControls } from './DeploymentDocumentControls';
 import { DeploymentDocumentEditor } from './DeploymentDocumentEditor';
@@ -118,13 +120,27 @@ export function DeploymentCompositionPanel({
   snapshot,
 }: DeploymentCompositionPanelProps) {
   const deploymentController = useDeploymentWorkspace(enabled, snapshot);
+  useOperationalErrorMirror({
+    source: 'composer.deployment_workspace',
+    title: 'Deployment command or response failed',
+    message: deploymentController.error,
+    onDismiss: deploymentController.dismissError,
+  });
   const refreshDeploymentWorkspace = deploymentController.refresh;
   const [readModel, setReadModel] = useState<DeploymentReadModel | null>(null);
   const [selectedScenarioId, setSelectedScenarioId] = useState('');
-  const [previewedScenarioId, setPreviewedScenarioId] = useState<string | null>(null);
+  const [candidatePreview, setCandidatePreview] = useState<
+    ManagerDeploymentCandidatePreviewResponse | null
+  >(null);
   const [loading, setLoading] = useState(enabled);
   const [busy, setBusy] = useState<'preview' | 'apply' | null>(null);
   const [error, setError] = useState<string | null>(null);
+  useOperationalErrorMirror({
+    source: 'composer.manager_composition',
+    title: 'Manager preview or Apply failed',
+    message: error,
+    onDismiss: () => setError(null),
+  });
   const [feedback, setFeedback] = useState<string | null>(null);
   const [reloadToken, setReloadToken] = useState(0);
   const mountedRef = useRef(true);
@@ -155,7 +171,7 @@ export function DeploymentCompositionPanel({
       setLoading(false);
       setError(null);
       setFeedback(null);
-      setPreviewedScenarioId(null);
+      setCandidatePreview(null);
       return undefined;
     }
     const controller = new AbortController();
@@ -171,7 +187,7 @@ export function DeploymentCompositionPanel({
         if (controller.signal.aborted) return;
         setReadModel({ status, graph, diff, scenarios });
         setLoading(false);
-        setPreviewedScenarioId(null);
+        setCandidatePreview(null);
       })
       .catch((reason: unknown) => {
         if (controller.signal.aborted) return;
@@ -196,35 +212,73 @@ export function DeploymentCompositionPanel({
     : 'Manager projections are not loaded.';
   const canApply = readModel !== null
     && selectedScenario !== undefined
-    && previewedScenarioId === selectedScenarioId
+    && candidatePreview !== null
+    && candidatePreview.candidateReceipt.deployment_artifact_id
+      === selectedScenario.deploymentArtifactId
+    && candidatePreview.candidateReceipt.deployment_revision
+      === selectedScenario.deploymentRevision
+    && candidatePreview.candidateReceipt.expected_current.graph_revision
+      === readModel.graph.graphRevision
+    && candidatePreview.candidateReceipt.expected_current.retained_bundle_id
+      === readModel.graph.retainedBundleId
+    && snapshot !== null
+    && snapshot.authoringAdmission.authoringAllowed
+    && candidatePreview.candidateReceipt.expected_admission_generation
+      === snapshot.authoringAdmission.admissionGeneration
     && validationError === null
     && readModel.status.status.apply.mutationAvailable
     && readModel.status.source.sourceOwnerEpoch !== null
     && busy === null;
 
-  const preview = () => {
-    if (!readModel) return;
+  const preview = async () => {
+    if (!readModel || !selectedScenario || snapshot === null) return;
     setBusy('preview');
     setFeedback(null);
     const reason = previewValidation(readModel, selectedScenario);
     if (reason) {
-      setPreviewedScenarioId(null);
+      setCandidatePreview(null);
       setFeedback(reason);
-    } else {
-      setPreviewedScenarioId(selectedScenarioId);
-      setFeedback(
-        selectedScenarioId === ''
-          ? 'No deployment preset selected.'
-          : 'Preview is valid. Apply remains a separate deliberate action.',
-      );
+      setBusy(null);
+      return;
     }
-    setBusy(null);
+    try {
+      const result = await api.manager.previewDeploymentCandidate({
+        deployment_artifact_id: selectedScenario.deploymentArtifactId,
+        deployment_revision: selectedScenario.deploymentRevision,
+        expected_admission_generation:
+          snapshot.authoringAdmission.admissionGeneration,
+        expected_current: {
+          graph_revision: readModel.graph.graphRevision,
+          retained_bundle_id: readModel.graph.retainedBundleId,
+        },
+        request_owner_epoch: readModel.status.source.sourceOwnerEpoch!,
+      });
+      if (!mountedRef.current) return;
+      setCandidatePreview(result);
+      const changes = Object.values(result.diff).reduce(
+        (count, row) => count + row.added.length + row.changed.length
+          + row.removed.length,
+        0,
+      );
+      setFeedback(
+        result.converged
+          ? 'Manager validated this exact Deployment; it is already active.'
+          : `Manager validated this exact Deployment with ${changes} graph change${changes === 1 ? '' : 's'}.`,
+      );
+    } catch (reason: unknown) {
+      if (!mountedRef.current) return;
+      setCandidatePreview(null);
+      setError(errorMessage(reason));
+    } finally {
+      if (mountedRef.current) setBusy(null);
+    }
   };
 
   const apply = async () => {
     if (
       !readModel
       || !selectedScenario
+      || candidatePreview === null
       || !canApply
       || applyControllerRef.current !== null
     ) return;
@@ -242,6 +296,9 @@ export function DeploymentCompositionPanel({
         retained_bundle_id: readModel.graph.retainedBundleId,
       },
       reject_if_affected_busy: true,
+      expected_admission_generation:
+        candidatePreview.candidateReceipt.expected_admission_generation,
+      candidate_receipt: candidatePreview.candidateReceipt,
     };
     const controller = new AbortController();
     applyControllerRef.current = controller;
@@ -252,7 +309,7 @@ export function DeploymentCompositionPanel({
       const response = await api.manager.apply(request, controller.signal);
       if (!mountedRef.current || controller.signal.aborted) return;
       setFeedback(applyReceiptMessage(response));
-      setPreviewedScenarioId(null);
+      setCandidatePreview(null);
       refresh();
     } catch (reason: unknown) {
       if (!mountedRef.current || controller.signal.aborted) return;
@@ -356,7 +413,7 @@ export function DeploymentCompositionPanel({
               value={selectedScenarioId}
               onChange={(event) => {
                 setSelectedScenarioId(event.target.value);
-                setPreviewedScenarioId(null);
+                setCandidatePreview(null);
                 setFeedback(null);
               }}
               disabled={busy !== null}
@@ -381,8 +438,19 @@ export function DeploymentCompositionPanel({
           <div className="button-row">
             <button
               type="button"
-              disabled={busy !== null}
-              onClick={preview}
+              disabled={
+                busy !== null
+                || readModel === null
+                || selectedScenario === undefined
+                || snapshot === null
+                || readModel.status.source.sourceOwnerEpoch === null
+              }
+              title={snapshot === null
+                ? 'Current backend admission is unavailable.'
+                : selectedScenario === undefined
+                  ? 'Choose a Deployment candidate to validate.'
+                  : undefined}
+              onClick={() => { void preview(); }}
             >
               {busy === 'preview' ? 'Validating…' : 'Preview / Validate'}
             </button>
@@ -451,7 +519,17 @@ export function DeploymentCompositionPanel({
                 {componentIds.map((identity) => <code key={identity}>{identity}</code>)}
               </div>
             )}
-            <CCLCPanel enabled={enabled} componentIds={componentIds} />
+            <CCLCPanel
+              enabled={enabled}
+              componentIds={componentIds}
+              admissionGeneration={snapshot?.authoringAdmission.admissionGeneration ?? null}
+              mutationAvailable={snapshot?.authoringAdmission.authoringAllowed === true}
+              mutationUnavailableReason={snapshot === null
+                ? 'Current backend admission is unavailable.'
+                : snapshot.programCycle.state === 'terminal_awaiting_reset'
+                  ? 'Reset the completed Program cycle before changing lifecycle or routes.'
+                  : 'Lifecycle and route changes require current Idle admission.'}
+            />
           </section>
         </>
       )}

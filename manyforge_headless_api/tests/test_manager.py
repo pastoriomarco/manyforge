@@ -39,6 +39,21 @@ def _request() -> ManagerApplyRequest:
             },
             "reject_if_affected_busy": True,
             "expected_admission_generation": 7,
+            "candidate_receipt": {
+                "schema_version": "manyforge.manager_deployment_candidate_receipt.v1",
+                "deployment_artifact_id": "deployment.1",
+                "deployment_revision": "sha256:" + "a" * 64,
+                "scenario_catalog_revision": "sha256:" + "b" * 64,
+                "candidate_retained_bundle_id": "bundle.2",
+                "candidate_graph_revision": "graph.2",
+                "expected_current": {
+                    "graph_revision": "graph.1",
+                    "retained_bundle_id": "bundle.1",
+                },
+                "expected_admission_generation": 7,
+                "manager_owner_epoch": "client.epoch.1",
+                "receipt_digest": "sha256:" + "c" * 64,
+            },
         }
     )
 
@@ -133,6 +148,7 @@ def test_manager_client_uses_one_canonical_bounded_seqpacket(tmp_path: Path) -> 
     assert set(decoded) == {
         "api_version",
         "command",
+        "candidate_receipt",
         "correlation_id",
         "deployment_artifact_id",
         "deployment_revision",

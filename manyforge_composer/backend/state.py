@@ -505,6 +505,7 @@ class ComposerState:
         expected_catalog_revision: str | None,
         confirm_discard: bool,
         request_id: str,
+        expected_admission_generation: int,
     ) -> dict[str, Any]:
         """Preflight one exact Scenario before any owner effect is recorded."""
 
@@ -590,6 +591,33 @@ class ComposerState:
                 }
             ).removeprefix("sha256:")[:32]
         )
+        candidate_receipt: dict[str, Any] | None = None
+        if not manager_matches:
+            preview = self.headless_client.manager_deployment_candidate_preview(
+                {
+                    "deployment_artifact_id": selection[
+                        "deployment_artifact_id"
+                    ],
+                    "deployment_revision": selection["deployment_revision"],
+                    "expected_current": {
+                        "graph_revision": current_graph,
+                        "retained_bundle_id": current_bundle,
+                    },
+                    "expected_admission_generation": (
+                        expected_admission_generation
+                    ),
+                    "request_owner_epoch": manager_owner_epoch,
+                }
+            )
+            if preview.get("ok") is not True or not isinstance(
+                preview.get("candidate_receipt"), dict
+            ):
+                raise DraftSessionError(
+                    "scenario_load_deployment_candidate_rejected",
+                    "Manager rejected the selected Scenario Deployment",
+                    status_code=409,
+                )
+            candidate_receipt = deepcopy(preview["candidate_receipt"])
         return {
             "schema_version": "manyforge.composer_authoring_effect.v1",
             "operation_kind": "load_scenario",
@@ -614,6 +642,7 @@ class ComposerState:
                         "retained_bundle_id": current_bundle,
                     },
                     "reject_if_affected_busy": True,
+                    "candidate_receipt": candidate_receipt,
                 }
             ),
             "post_state": self._scenario_post_state(selection, pre_state, program),
@@ -703,6 +732,62 @@ class ComposerState:
             ),
         }
 
+    def apply_manager_deployment_candidate(
+        self, intent: dict[str, Any], claim: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Apply one retained Manager candidate and prove its terminal head."""
+
+        if self.headless_client is None:
+            raise AuthoringJournalError(
+                "manager_apply_unavailable",
+                "Manager-backed Deployment Apply is unavailable",
+            )
+        request = intent.get("manager_apply")
+        if not isinstance(request, dict):
+            raise AuthoringJournalError(
+                "manager_candidate_intent_invalid",
+                "retained Deployment candidate intent is incomplete",
+            )
+        response = self.headless_client.manager_apply(
+            {**deepcopy(request), "parent_authoring_claim": claim}
+        )
+        if response.get("ok") is not True:
+            raise AuthoringJournalError(
+                "manager_apply_rejected",
+                "Manager rejected the exact Deployment candidate",
+            )
+        deadline = time.monotonic() + _SCENARIO_LOAD_TIMEOUT_SECONDS
+        while response.get("state") != "succeeded":
+            if time.monotonic() >= deadline:
+                raise AuthoringJournalError(
+                    "manager_apply_convergence_timeout",
+                    "Manager did not finish Deployment Apply in time",
+                )
+            time.sleep(_SCENARIO_LOAD_POLL_SECONDS)
+            response = self.headless_client.manager_apply_status(
+                response["apply_id"], response["apply_generation"]
+            )
+            if response.get("ok") is not True:
+                raise AuthoringJournalError(
+                    "manager_apply_status_rejected",
+                    "Manager could not observe the retained Apply identity",
+                )
+        receipt = request.get("candidate_receipt")
+        status = self.headless_client.manager_status()
+        active = status.get("status", {}).get("active", {})
+        if (
+            not isinstance(receipt, dict)
+            or active.get("retained_bundle_id")
+            != receipt.get("candidate_retained_bundle_id")
+            or active.get("graph_revision")
+            != receipt.get("candidate_graph_revision")
+        ):
+            raise AuthoringJournalError(
+                "manager_apply_projection_mismatch",
+                "Manager terminal Apply did not publish the previewed candidate",
+            )
+        return response
+
     def load_scenario(
         self,
         envelope: AuthoringMutationEnvelope,
@@ -729,6 +814,9 @@ class ComposerState:
                     expected_catalog_revision=expected_catalog_revision,
                     confirm_discard=confirm_discard,
                     request_id=envelope.request_id,
+                    expected_admission_generation=(
+                        envelope.expected_admission_generation
+                    ),
                 )
             )
             return prepared
@@ -846,6 +934,10 @@ class ComposerState:
                 )
             self._restore_authoring_post_image(post_state)
             return self.deployment_draft_session.snapshot(), post_state
+        if kind == "revert_deployment":
+            result = self.apply_manager_deployment_candidate(intent, claim)
+            self._restore_authoring_post_image(post_state)
+            return result, post_state
         if kind == "save_program":
             try:
                 program = Program.from_dict(

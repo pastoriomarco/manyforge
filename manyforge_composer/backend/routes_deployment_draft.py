@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Literal, NoReturn
@@ -71,6 +72,10 @@ class SaveDeploymentAsRequest(_Fence):
 
 
 class DiscardDeploymentRequest(_Fence):
+    pass
+
+
+class RevertDeploymentRequest(_Fence):
     pass
 
 
@@ -154,6 +159,34 @@ def _workspace(state: ComposerState) -> dict[str, Any]:
         if row.get("deployment_artifact_id") == draft["deploymentArtifactId"]
         and row.get("deployment_revision") == draft_revision
     ]
+    retained = state.deployment_draft_session.retained_state()
+    saved_document = retained.get("saved_document")
+    saved_artifact_id = (
+        saved_document.get("deployment_artifact_id")
+        if isinstance(saved_document, dict)
+        else None
+    )
+    saved_revision = (
+        saved_document.get("deployment_revision")
+        if isinstance(saved_document, dict)
+        else None
+    )
+    saved_scenarios = [
+        {
+            "scenarioId": row.get("scenario_id"),
+            "scenarioCatalogRevision": scenario_catalog_revision,
+            "deploymentArtifactId": row.get("deployment_artifact_id"),
+            "deploymentRevision": row.get("deployment_revision"),
+            "retainedBundleId": row.get("retained_bundle_id"),
+            "programId": row.get("program_id"),
+            "programRevision": row.get("program_revision"),
+            "programBindingId": row.get("program_binding_id"),
+            "description": row.get("description"),
+        }
+        for row in scenarios
+        if row.get("deployment_artifact_id") == saved_artifact_id
+        and row.get("deployment_revision") == saved_revision
+    ]
     workspace.update(
         {
             "managerApplied": {
@@ -170,6 +203,7 @@ def _workspace(state: ComposerState) -> dict[str, Any]:
             },
             "binding": binding,
             "scenarioCandidates": matching_scenarios,
+            "savedScenarioCandidates": saved_scenarios,
             "unavailableReasons": unavailable,
         }
     )
@@ -400,6 +434,120 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             body,
             "discard_deployment_draft",
             prepare=lambda: {"effect_class": "local"},
+            validate=validate,
+            effect=effect,
+        )
+
+    @router.post("/api/deployment/revert")
+    def revert(body: RevertDeploymentRequest) -> dict[str, Any]:
+        if state.headless_client is None:
+            _raise(
+                DeploymentDraftError(
+                    "manager_apply_unavailable",
+                    "Deployment Revert requires the configured Manager",
+                    status_code=503,
+                )
+            )
+        retained = state.deployment_draft_session.retained_state()
+        saved = retained["saved_document"]
+        if not isinstance(saved, dict):
+            _raise(
+                DeploymentDraftError(
+                    "deployment_saved_unavailable",
+                    "Deployment has no Saved baseline",
+                    status_code=404,
+                )
+            )
+        saved_compiled = state.deployment_draft_session.preview_source(
+            json.dumps(saved, ensure_ascii=False, allow_nan=False)
+        )
+        workspace = _workspace(state)
+        candidates = workspace["savedScenarioCandidates"]
+        if not candidates:
+            _raise(
+                DeploymentDraftError(
+                    "deployment_saved_candidate_unavailable",
+                    "Saved Deployment has no current curated Apply candidate",
+                    status_code=409,
+                )
+            )
+        candidate = candidates[0]
+        manager_status = state.headless_client.manager_status()
+        active = manager_status["status"]["active"]
+        manager_epoch = manager_status["source"]["source_owner_epoch"]
+        preview = state.headless_client.manager_deployment_candidate_preview(
+            {
+                "deployment_artifact_id": candidate["deploymentArtifactId"],
+                "deployment_revision": candidate["deploymentRevision"],
+                "expected_current": {
+                    "graph_revision": active["graph_revision"],
+                    "retained_bundle_id": active["retained_bundle_id"],
+                },
+                "expected_admission_generation": (
+                    body.expected_admission_generation
+                ),
+                "request_owner_epoch": manager_epoch,
+            }
+        )
+        receipt = preview.get("candidate_receipt")
+        if preview.get("ok") is not True or not isinstance(receipt, dict):
+            _raise(
+                DeploymentDraftError(
+                    "deployment_saved_candidate_rejected",
+                    "Manager rejected the Saved Deployment candidate",
+                    status_code=409,
+                )
+            )
+        post_state = state.authoring_retained_state()
+        deployment_post = deepcopy(post_state["deployment"])
+        if deployment_post["document"] != saved:
+            deployment_post["draft_revision"] += 1
+        deployment_post["document"] = deepcopy(saved)
+        post_state["deployment"] = deployment_post
+        manager_request_id = "deployment-revert-" + hashlib.sha256(
+            f"{body.request_owner_epoch}:{body.request_id}".encode("utf-8")
+        ).hexdigest()[:32]
+        intent = {
+            "schema_version": "manyforge.composer_authoring_effect.v1",
+            "operation_kind": "revert_deployment",
+            "effect_class": "external",
+            "external_kind": "revert_deployment",
+            "manager_apply": {
+                "request_id": manager_request_id,
+                "request_owner_epoch": manager_epoch,
+                "source_label": "manyforge_composer_deployment_revert",
+                "correlation_id": body.request_id,
+                "deployment_artifact_id": candidate["deploymentArtifactId"],
+                "deployment_revision": candidate["deploymentRevision"],
+                "expected_current": receipt["expected_current"],
+                "reject_if_affected_busy": True,
+                "candidate_receipt": receipt,
+            },
+            "post_state": post_state,
+        }
+
+        def validate(_claim: dict[str, Any]) -> None:
+            current = state.deployment_draft_session.retained_state()
+            if current != retained:
+                raise DeploymentDraftError(
+                    "deployment_draft_stale",
+                    "Deployment Draft changed before Revert",
+                    status_code=409,
+                )
+
+        def effect(claim: dict[str, Any]) -> dict[str, Any]:
+            state.apply_manager_deployment_candidate(intent, claim)
+            state.deployment_draft_session.commit_compiled(
+                saved_compiled,
+                draft_id=body.draft_id,
+                expected_revision=body.expected_draft_revision,
+            )
+            return _workspace(state)
+
+        return execute(
+            body,
+            "revert_deployment",
+            prepare=lambda: intent,
             validate=validate,
             effect=effect,
         )

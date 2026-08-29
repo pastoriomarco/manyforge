@@ -622,6 +622,9 @@ def _converge_component(
             desired,
         ):
             continue
+        admission = client.authoring_admission().get("admission_generation")
+        if type(admission) is not int:
+            raise WorkbenchError("authoring admission generation is unavailable")
         request_id = _request_id(
             scenario_id,
             component_id,
@@ -640,6 +643,7 @@ def _converge_component(
                     "source_label": "development_scenario_start",
                     "correlation_id": scenario_id,
                 },
+                "expected_admission_generation": admission,
                 "expected_retained_bundle_id": templates.get(
                     "retained_bundle_id"
                 ),
@@ -877,6 +881,10 @@ class Workbench:
             with HeadlessHttpClient(base_url, timeout_seconds=0.5) as client:
                 admission = client.authoring_admission()
                 return admission if admission.get("authoring_allowed") is True else None
+
+        _wait_until(
+            "initial idle authoring admission", authoring_ready, self.processes
+        )
         composer_environment = os.environ.copy()
         composer_environment["MANYFORGE_CORS_ORIGINS"] = (
             f"http://localhost:{self.frontend_port},"

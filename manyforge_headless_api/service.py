@@ -29,6 +29,7 @@ from .models import (
     AcknowledgeAllAlarmsRequest,
     HistorianReconcileRequest,
     ManagerApplyRequest,
+    ManagerDeploymentCandidatePreviewRequest,
     AuthoringMutationContext,
     AuthoringMutationRecoveryRequest,
     AuthoringMutationSettlementRequest,
@@ -1219,6 +1220,28 @@ class HeadlessService:
             )
         return self.cclc.lifecycle_status(transaction_id)
 
+    def route_selection_submit(self, request: Any) -> dict[str, Any]:
+        if self.cclc is None:
+            raise HeadlessApiError(
+                "cclc_open_unavailable", "CCLC owner is not configured"
+            )
+        admission = self.authoring_admission()
+        if (
+            admission.get("authoring_allowed") is not True
+            or admission.get("admission_generation")
+            != request.expected_admission_generation
+        ):
+            raise HeadlessApiError(
+                "authoring_not_ready",
+                "route selection requires the current Idle admission generation",
+            )
+        payload = request.model_dump(
+            mode="json",
+            exclude={"confirmed", "expected_admission_generation"},
+            exclude_none=True,
+        )
+        return self.cclc.submit_route(payload)
+
     def _program_apply_manager_selection(
         self,
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
@@ -1690,6 +1713,9 @@ class HeadlessService:
             limit=limit,
         )
 
+    def history_detail(self, sequence: int) -> dict[str, Any]:
+        return self.core.history_detail(sequence)
+
     def historian_reconcile(
         self,
         request: HistorianReconcileRequest,
@@ -1706,6 +1732,11 @@ class HeadlessService:
             assurance=attribution.assurance,
             trusted_principal_id=attribution.principal_id,
         )
+
+    def manager_deployment_candidate_preview(
+        self, request: ManagerDeploymentCandidatePreviewRequest
+    ) -> dict[str, Any]:
+        return self.manager.preview_deployment_candidate(request)
 
     def manager_apply(self, request: ManagerApplyRequest) -> dict[str, Any]:
         return self.manager.apply(request)

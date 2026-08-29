@@ -106,6 +106,10 @@ public:
     return {{}, false, std::nullopt};
   }
 
+  std::optional<HistorianStoredEvent> Read(std::uint64_t) override {
+    return std::nullopt;
+  }
+
   void SetBlocked(const bool blocked) {
     std::lock_guard lock(mutex_);
     blocked_ = blocked;
@@ -190,12 +194,43 @@ TEST(EventHistorian, SqliteStoreIsIdempotentRetainedRestartableAndPaged) {
     ASSERT_EQ(filtered.events.size(), 1U);
     EXPECT_EQ(filtered.events.front().event.event_type,
               "operator_alarm_returned");
+
+    const auto exact = store.Read(4U);
+    ASSERT_TRUE(exact.has_value());
+    EXPECT_EQ(exact->sequence, 4U);
+    EXPECT_EQ(exact->event.event_id, Event(4U, "manyforge.scene",
+                                          "operator_alarm_returned")
+                                         .event_id);
+    EXPECT_FALSE(store.Read(2U).has_value());
   }
 
   SqliteEventHistoryStore reopened(path, 3U);
   const auto page = reopened.Query(HistorianQuery{});
   ASSERT_EQ(page.events.size(), 3U);
   EXPECT_EQ(page.events.front().event.event_id, Event(5U).event_id);
+}
+
+TEST(EventHistorian, DetailPublishesOnlyTypedSourceBackedSections) {
+  const auto event = MakeHistorianEvent(
+      "manyforge.execution", "operation_updated", "ERROR", 101,
+      "2026-08-05T00:00:00Z",
+      CanonicalValue(CanonicalValue::Object{
+          {"blackboard", CanonicalValue(CanonicalValue::Object{
+                             {"part_ready", CanonicalValue(true)},
+                         })},
+          {"duration_ns", CanonicalValue(1250.0)},
+          {"operation_id", CanonicalValue("operation.1")},
+          {"record_kind", CanonicalValue("observation")},
+          {"schema_version",
+           CanonicalValue("manyforge.operation_history_event.v1")},
+      }));
+  const auto encoded = content_identity::canonical_json(
+      HistorianDetailValue(HistorianStoredEvent{7U, event}));
+  EXPECT_NE(encoded.find("manyforge.historian_detail.v1"), std::string::npos);
+  EXPECT_NE(encoded.find("operation.1"), std::string::npos);
+  EXPECT_NE(encoded.find("part_ready"), std::string::npos);
+  EXPECT_NE(encoded.find("duration_ns"), std::string::npos);
+  EXPECT_NE(encoded.find("incident"), std::string::npos);
 }
 
 TEST(EventHistorian, SqliteStoreRejectsAliasForeignIdentityAndTamper) {

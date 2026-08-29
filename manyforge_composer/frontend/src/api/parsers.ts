@@ -25,6 +25,8 @@ import type {
   ManagerApplyReplayStatus,
   ManagerApplyResponse,
   ManagerApplyStatusResponse,
+  ManagerDeploymentCandidatePreviewResponse,
+  ManagerDeploymentRecordDiff,
   ManagerDiffProjection,
   ManagerGraphProjection,
   ManagerRuntimeProjection,
@@ -149,6 +151,7 @@ import type {
   HeadlessRuntimeSnapshot,
   HeadlessSourceSection,
   HistorianEvent,
+  HistorianDetail,
   HistorianPage,
   OperatorAlarmRecord,
   OperatorAlarmSnapshot,
@@ -1889,6 +1892,121 @@ export function parseManagerDiffProjection(
   };
 }
 
+export function parseManagerDeploymentCandidatePreviewResponse(
+  value: unknown,
+): ManagerDeploymentCandidatePreviewResponse {
+  const record = objectAt(value, 'managerDeploymentCandidatePreview');
+  exactKeysAt(
+    record,
+    ['api_version', 'candidate_receipt', 'converged', 'diff', 'ok'],
+    'managerDeploymentCandidatePreview',
+  );
+  if (record.ok !== true) {
+    return fail('managerDeploymentCandidatePreview.ok', 'true');
+  }
+  const apiVersion = stringAt(
+    record.api_version,
+    'managerDeploymentCandidatePreview.api_version',
+  );
+  if (apiVersion !== 'manyforge.manager_command_response.v1') {
+    return fail(
+      'managerDeploymentCandidatePreview.api_version',
+      'manyforge.manager_command_response.v1',
+    );
+  }
+  const receipt = objectAt(
+    record.candidate_receipt,
+    'managerDeploymentCandidatePreview.candidate_receipt',
+  );
+  exactKeysAt(
+    receipt,
+    [
+      'candidate_graph_revision',
+      'candidate_retained_bundle_id',
+      'deployment_artifact_id',
+      'deployment_revision',
+      'expected_admission_generation',
+      'expected_current',
+      'manager_owner_epoch',
+      'receipt_digest',
+      'scenario_catalog_revision',
+      'schema_version',
+    ],
+    'managerDeploymentCandidatePreview.candidate_receipt',
+  );
+  const schemaVersion = stringAt(
+    receipt.schema_version,
+    'managerDeploymentCandidatePreview.candidate_receipt.schema_version',
+  );
+  if (schemaVersion !== 'manyforge.manager_deployment_candidate_receipt.v1') {
+    return fail(
+      'managerDeploymentCandidatePreview.candidate_receipt.schema_version',
+      'manyforge.manager_deployment_candidate_receipt.v1',
+    );
+  }
+  const expected = objectAt(
+    receipt.expected_current,
+    'managerDeploymentCandidatePreview.candidate_receipt.expected_current',
+  );
+  exactKeysAt(
+    expected,
+    ['graph_revision', 'retained_bundle_id'],
+    'managerDeploymentCandidatePreview.candidate_receipt.expected_current',
+  );
+  const diff = objectAt(record.diff, 'managerDeploymentCandidatePreview.diff');
+  const recordKinds = [
+    'component_attachments',
+    'controllable_components',
+    'control_bindings',
+    'control_domains',
+    'model_instances',
+    'runtime_units',
+  ] as const;
+  exactKeysAt(diff, [...recordKinds], 'managerDeploymentCandidatePreview.diff');
+  const parsedDiff: Record<string, ManagerDeploymentRecordDiff> = {};
+  for (const kind of recordKinds) {
+    const row = objectAt(diff[kind], `managerDeploymentCandidatePreview.diff.${kind}`);
+    exactKeysAt(
+      row,
+      ['added', 'changed', 'removed'],
+      `managerDeploymentCandidatePreview.diff.${kind}`,
+    );
+    const strings = (field: 'added' | 'changed' | 'removed') => boundedArrayAt(
+      row[field],
+      `managerDeploymentCandidatePreview.diff.${kind}.${field}`,
+      4096,
+    ).map((item, index) => stringAt(
+      item,
+      `managerDeploymentCandidatePreview.diff.${kind}.${field}[${index}]`,
+    ));
+    parsedDiff[kind] = {
+      added: strings('added'),
+      changed: strings('changed'),
+      removed: strings('removed'),
+    };
+  }
+  return {
+    apiVersion,
+    candidateReceipt: {
+      schema_version: schemaVersion,
+      deployment_artifact_id: stringAt(receipt.deployment_artifact_id, 'candidateReceipt.deployment_artifact_id'),
+      deployment_revision: stringAt(receipt.deployment_revision, 'candidateReceipt.deployment_revision'),
+      scenario_catalog_revision: stringAt(receipt.scenario_catalog_revision, 'candidateReceipt.scenario_catalog_revision'),
+      candidate_retained_bundle_id: stringAt(receipt.candidate_retained_bundle_id, 'candidateReceipt.candidate_retained_bundle_id'),
+      candidate_graph_revision: stringAt(receipt.candidate_graph_revision, 'candidateReceipt.candidate_graph_revision'),
+      expected_current: {
+        graph_revision: stringAt(expected.graph_revision, 'candidateReceipt.expected_current.graph_revision'),
+        retained_bundle_id: stringAt(expected.retained_bundle_id, 'candidateReceipt.expected_current.retained_bundle_id'),
+      },
+      expected_admission_generation: positiveIntegerAt(receipt.expected_admission_generation, 'candidateReceipt.expected_admission_generation'),
+      manager_owner_epoch: stringAt(receipt.manager_owner_epoch, 'candidateReceipt.manager_owner_epoch'),
+      receipt_digest: stringAt(receipt.receipt_digest, 'candidateReceipt.receipt_digest'),
+    },
+    converged: booleanAt(record.converged, 'managerDeploymentCandidatePreview.converged'),
+    diff: parsedDiff,
+  };
+}
+
 export function parseManagerApplyResponse(value: unknown): ManagerApplyResponse {
   const record = objectAt(value, 'managerApply');
   exactKeysAt(
@@ -2298,7 +2416,8 @@ export function parseDeploymentWorkspaceResponse(
   const record = objectAt(value, path);
   exactKeysAt(record, [
     'schemaVersion', 'draft', 'saved', 'managerApplied', 'runAdmission',
-    'binding', 'scenarioCandidates', 'unavailableReasons',
+    'binding', 'scenarioCandidates', 'savedScenarioCandidates',
+    'unavailableReasons',
   ], path);
   const schemaVersion = stringAt(record.schemaVersion, `${path}.schemaVersion`);
   if (schemaVersion !== 'manyforge.composer_deployment_workspace.v1') {
@@ -2404,12 +2523,15 @@ export function parseDeploymentWorkspaceResponse(
       throw error;
     }
   }
-  const scenarioCandidates = boundedArrayAt(
-    record.scenarioCandidates,
-    `${path}.scenarioCandidates`,
+  const parseScenarioCandidates = (
+    value: unknown,
+    field: 'scenarioCandidates' | 'savedScenarioCandidates',
+  ) => boundedArrayAt(
+    value,
+    `${path}.${field}`,
     4096,
   ).map((candidate, index) => {
-    const candidatePath = `${path}.scenarioCandidates[${index}]`;
+    const candidatePath = `${path}.${field}[${index}]`;
     const row = objectAt(candidate, candidatePath);
     exactKeysAt(row, [
       'scenarioId', 'scenarioCatalogRevision', 'deploymentArtifactId',
@@ -2446,6 +2568,14 @@ export function parseDeploymentWorkspaceResponse(
       description: nullableStringAt(row.description, `${candidatePath}.description`),
     };
   });
+  const scenarioCandidates = parseScenarioCandidates(
+    record.scenarioCandidates,
+    'scenarioCandidates',
+  );
+  const savedScenarioCandidates = parseScenarioCandidates(
+    record.savedScenarioCandidates,
+    'savedScenarioCandidates',
+  );
   const scenarioIds = new Set<string>();
   for (const candidate of scenarioCandidates) {
     if (scenarioIds.has(candidate.scenarioId)) {
@@ -2461,6 +2591,14 @@ export function parseDeploymentWorkspaceResponse(
         'only exact matches for the current Deployment Draft',
       );
     }
+  }
+  if (savedScenarioCandidates.some(
+    (candidate) => candidate.deploymentRevision !== savedRevision,
+  )) {
+    return fail(
+      `${path}.savedScenarioCandidates`,
+      'only exact matches for the Saved Deployment',
+    );
   }
   if (
     binding !== null
@@ -2496,6 +2634,7 @@ export function parseDeploymentWorkspaceResponse(
     runAdmission: { ready: runReady, reason: runReason },
     binding,
     scenarioCandidates,
+    savedScenarioCandidates,
     unavailableReasons: stringArrayAt(
       record.unavailableReasons,
       `${path}.unavailableReasons`,
@@ -5913,6 +6052,52 @@ export function parseHistorianPage(value: unknown): HistorianPage {
       ? null
       : integerAt(record.next_before_sequence, 'history.next_before_sequence'),
     truncated: booleanAt(record.truncated, 'history.truncated'),
+  };
+}
+
+function historianDetailSectionAt(
+  value: unknown,
+  path: string,
+): HistorianDetail['sections']['incident'] {
+  const record = objectAt(value, path);
+  exactKeysAt(record, ['available', 'reason', 'value'], path);
+  const available = booleanAt(record.available, `${path}.available`);
+  const reason = record.reason === null ? null : stringAt(record.reason, `${path}.reason`);
+  if (available === (reason !== null) || available === (record.value === null)) {
+    return fail(path, 'one consistent available/reason/value union');
+  }
+  return { available, reason, value: record.value };
+}
+
+export function parseHistorianDetail(value: unknown): HistorianDetail {
+  const record = objectAt(value, 'historyDetail');
+  exactKeysAt(record, ['event', 'schema_version', 'sections', 'sequence'], 'historyDetail');
+  const schemaVersion = stringAt(record.schema_version, 'historyDetail.schema_version');
+  if (schemaVersion !== 'manyforge.historian_detail.v1') {
+    return fail('historyDetail.schema_version', 'manyforge.historian_detail.v1');
+  }
+  const sections = objectAt(record.sections, 'historyDetail.sections');
+  exactKeysAt(
+    sections,
+    ['blackboard', 'execution_digest', 'incident', 'latency'],
+    'historyDetail.sections',
+  );
+  return {
+    schemaVersion,
+    sequence: positiveIntegerAt(record.sequence, 'historyDetail.sequence'),
+    event: parseHistorianEvent(record.event, 'historyDetail.event'),
+    sections: {
+      incident: historianDetailSectionAt(sections.incident, 'historyDetail.sections.incident'),
+      executionDigest: historianDetailSectionAt(
+        sections.execution_digest,
+        'historyDetail.sections.execution_digest',
+      ),
+      blackboard: historianDetailSectionAt(
+        sections.blackboard,
+        'historyDetail.sections.blackboard',
+      ),
+      latency: historianDetailSectionAt(sections.latency, 'historyDetail.sections.latency'),
+    },
   };
 }
 

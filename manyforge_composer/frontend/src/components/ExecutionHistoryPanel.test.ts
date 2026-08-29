@@ -85,7 +85,7 @@ describe('execution history filtering', () => {
     }));
     const elapsedMs = performance.now() - started;
 
-    expect(markup.match(/<article/g)).toHaveLength(32);
+    expect(markup.match(/class="history-event /g)).toHaveLength(32);
     expect(markup).toContain('Retained event 1');
     expect(markup).toContain('Retained event 32');
     expect(elapsedMs).toBeLessThan(1000);

@@ -353,6 +353,7 @@ def test_simulated_scenario_start_converges_only_missing_lifecycle_and_routes() 
     ]
     assert len(client.route_requests) == 1
     assert client.route_requests[0]["desired_configuration"] == client._desired()
+    assert client.route_requests[0]["expected_admission_generation"] == 7
 
     dev_workbench._converge_component(
         client,  # type: ignore[arg-type]

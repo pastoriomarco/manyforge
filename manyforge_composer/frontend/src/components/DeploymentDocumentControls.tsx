@@ -5,7 +5,7 @@ import type { ArtifactKind, FileBrowserEntry } from '../types/api';
 import { ArtifactBrowser } from './ArtifactBrowser';
 import { OverlayPanel } from './OverlayPanel';
 
-type Action = 'open' | 'save_as' | 'discard';
+type Action = 'open' | 'save_as' | 'discard' | 'revert';
 
 export function DeploymentDocumentControls({
   controller,
@@ -69,6 +69,17 @@ export function DeploymentDocumentControls({
             disabled={!controller.mutationAvailable || controller.busy || !workspace?.draft.differsFromSaved}
             onClick={() => setAction('discard')}
           >Discard</button>
+          <button
+            type="button"
+            disabled={
+              !controller.mutationAvailable
+              || controller.busy
+              || workspace?.savedScenarioCandidates.length === 0
+              || workspace?.saved.deploymentRevision
+                === workspace?.managerApplied.deploymentRevision
+            }
+            onClick={() => setAction('revert')}
+          >Revert</button>
         </div>
       </div>
       {controller.mutationUnavailableReason && (
@@ -88,10 +99,10 @@ export function DeploymentDocumentControls({
       {action !== null && (
         <OverlayPanel
           open
-          title={action === 'open' ? 'Open Deployment as Draft' : action === 'save_as' ? 'Save Deployment As' : 'Discard Deployment changes?'}
+          title={action === 'open' ? 'Open Deployment as Draft' : action === 'save_as' ? 'Save Deployment As' : action === 'revert' ? 'Revert to Saved Deployment?' : 'Discard Deployment changes?'}
           titleId="deployment-document-dialog-title"
           onClose={close}
-          compact={action === 'discard'}
+          compact={action === 'discard' || action === 'revert'}
         >
           {action === 'open' && (
             <div className="program-document-dialog">
@@ -131,6 +142,12 @@ export function DeploymentDocumentControls({
             <div className="program-dialog-copy program-compact-confirmation">
               <p>Discard the unsaved Deployment Draft changes?</p>
               <button type="button" className="primary-action" onClick={() => { void complete(controller.discard); }}>Discard changes</button>
+            </div>
+          )}
+          {action === 'revert' && (
+            <div className="program-dialog-copy program-compact-confirmation">
+              <p>Replace Draft and Manager Applied with the Saved Deployment?</p>
+              <button type="button" className="primary-action" onClick={() => { void complete(controller.revert); }}>Revert to Saved</button>
             </div>
           )}
         </OverlayPanel>

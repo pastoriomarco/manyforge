@@ -227,6 +227,8 @@ public:
                        std::optional<std::string> reason, bool confirmed);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   HistoryPage(const HistorianQuery &query);
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
+  HistoryDetail(std::uint64_t sequence);
   [[nodiscard]] manyforge::content_identity::CanonicalValue HistorianHealth();
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   ReconcileHistorianHealth(std::uint64_t expected_health_generation,

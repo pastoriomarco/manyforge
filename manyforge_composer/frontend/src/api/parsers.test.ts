@@ -12,6 +12,7 @@ import {
   parseHealthResponse,
   parseHeadlessRuntimeSnapshot,
   parseHistorianPage,
+  parseHistorianDetail,
   parseManagerDiffProjection,
   parseManagerGraphProjection,
   parseManagerStatusProjection,
@@ -143,6 +144,17 @@ function deploymentWorkspaceFixture(): Record<string, unknown> {
     runAdmission: { ready: true, reason: null },
     binding: programBindingFixture('fixture-program', digestB, digestA),
     scenarioCandidates: [{
+      scenarioId: 'fixture',
+      scenarioCatalogRevision: digestB,
+      deploymentArtifactId: 'deployment.fixture',
+      deploymentRevision: digestA,
+      retainedBundleId: digestB,
+      programId: 'fixture-program',
+      programRevision: digestB,
+      programBindingId: digestA,
+      description: 'Fixture Scenario',
+    }],
+    savedScenarioCandidates: [{
       scenarioId: 'fixture',
       scenarioCatalogRevision: digestB,
       deploymentArtifactId: 'deployment.fixture',
@@ -1659,6 +1671,35 @@ describe('headless projection parsers', () => {
 
     expect(page.events[0]?.event.eventType).toBe('operator_alarm_activated');
     expect(page.events[0]?.sequence).toBe(7);
+  });
+
+  it('accepts typed exact historian detail availability unions', () => {
+    const detail = parseHistorianDetail({
+      schema_version: 'manyforge.historian_detail.v1',
+      sequence: 7,
+      event: {
+        schema_version: 'manyforge.historian_event.v1',
+        event_id: 'event-1',
+        component: 'manyforge.execution',
+        event_type: 'operation_updated',
+        severity: 'INFO',
+        occurred_at_ns: 123,
+        occurred_at_wall: '2026-08-05T12:00:00Z',
+        payload: {},
+      },
+      sections: {
+        incident: { available: false, reason: 'not an incident', value: null },
+        execution_digest: { available: true, reason: null, value: { operation_id: 'op.1' } },
+        blackboard: { available: false, reason: 'not published', value: null },
+        latency: { available: false, reason: 'not published', value: null },
+      },
+    });
+    expect(detail.sequence).toBe(7);
+    expect(detail.sections.executionDigest.available).toBe(true);
+    expect(() => parseHistorianDetail({
+      ...detail,
+      schema_version: 'manyforge.historian_detail.v1',
+    })).toThrow();
   });
 });
 

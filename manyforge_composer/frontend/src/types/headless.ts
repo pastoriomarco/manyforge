@@ -131,3 +131,22 @@ export interface HistorianPage {
   nextBeforeSequence: number | null;
   truncated: boolean;
 }
+
+export type HistorianDetailSectionName =
+  | 'incident'
+  | 'executionDigest'
+  | 'blackboard'
+  | 'latency';
+
+export interface HistorianDetailSection {
+  available: boolean;
+  reason: string | null;
+  value: unknown;
+}
+
+export interface HistorianDetail {
+  schemaVersion: 'manyforge.historian_detail.v1';
+  sequence: number;
+  event: HistorianEvent;
+  sections: Record<HistorianDetailSectionName, HistorianDetailSection>;
+}

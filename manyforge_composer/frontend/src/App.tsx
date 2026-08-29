@@ -6,8 +6,10 @@ import { AssistantOverlay } from './components/AssistantOverlay';
 import { DeploymentCompositionPanel } from './components/DeploymentCompositionPanel';
 import {
   HeadlessRuntimeSurfaces,
+  attentionAlarmsNewestFirst,
   runtimeStatusView,
 } from './components/HeadlessRuntimeSurfaces';
+import { RuntimeAttentionAlert } from './components/RuntimeAttentionAlert';
 import { ProgramDocumentControls } from './components/ProgramDocumentControls';
 import { OverlayPanel } from './components/OverlayPanel';
 import { PaneDivider } from './components/PaneDivider';
@@ -22,6 +24,10 @@ import { useProgramRuntime } from './hooks/useProgramRuntime';
 import { useProgramWorkspace } from './hooks/useProgramWorkspace';
 import { useRobotControl } from './hooks/useRobotControl';
 import { useStructuralResource } from './state/structuralResource';
+import {
+  useOperationalErrorMirror,
+  useOperationalErrors,
+} from './state/operationalErrors';
 
 function isNotFound(error: unknown): boolean {
   return error instanceof ApiError && error.status === 404;
@@ -118,18 +124,72 @@ export default function App() {
     programController.state.workspace,
   );
   const robotControl = useRobotControl(headlessEnabled);
-  const clientErrors = useMemo(() => [
-    ...(programRuntime.state.error === null ? [] : [{
-      id: 'composer.program_runtime',
-      title: 'Program command or response failed',
-      message: programRuntime.state.error,
-    }]),
-    ...(robotControl.fullStopError === null ? [] : [{
-      id: 'composer.full_cell_stop',
-      title: 'Full-cell Stop command failed',
-      message: robotControl.fullStopError,
-    }]),
-  ], [programRuntime.state.error, robotControl.fullStopError]);
+  const operationalErrors = useOperationalErrors();
+  useOperationalErrorMirror({
+    source: 'composer.program_workspace',
+    title: 'Program authoring command or response failed',
+    message: programController.state.error,
+    onDismiss: programController.clearFeedback,
+  });
+  useOperationalErrorMirror({
+    source: 'composer.program_runtime',
+    title: 'Program Run, Stop, or Reset failed',
+    message: programRuntime.state.error,
+    onDismiss: programRuntime.dismissError,
+  });
+  useOperationalErrorMirror({
+    source: 'composer.full_cell_stop',
+    title: 'Full-cell Stop command failed',
+    message: robotControl.fullStopError,
+    onDismiss: robotControl.dismissFullStopError,
+  });
+  useOperationalErrorMirror({
+    source: 'composer.runtime_scale',
+    title: 'Runtime velocity update failed',
+    message: robotControl.runtimeScaleError,
+    onDismiss: robotControl.dismissRuntimeScaleError,
+  });
+  const robotOperationalError = robotControl.state.error !== null
+    && !robotControl.state.error.startsWith('The authored ')
+    && !robotControl.state.error.startsWith('The stored ')
+    ? robotControl.state.error
+    : null;
+  useOperationalErrorMirror({
+    source: 'composer.robot_control',
+    title: 'Robot preview or operation command failed',
+    message: robotOperationalError,
+    onDismiss: robotControl.dismissError,
+  });
+  useOperationalErrorMirror({
+    source: 'composer.headless_projection',
+    title: 'Backend projection transport failed',
+    message: headlessState.error,
+  });
+  useOperationalErrorMirror({
+    source: 'composer.structural_manifest',
+    title: 'Viewer model response failed',
+    message: manifest.status === 'error' ? manifest.message : null,
+    onDismiss: retryManifest,
+  });
+  useOperationalErrorMirror({
+    source: 'composer.source_model',
+    title: 'Viewer source-model response failed',
+    message: sourceModel.status === 'error' ? sourceModel.message : null,
+    onDismiss: retrySourceModel,
+  });
+  const clientErrors = operationalErrors.errors;
+  const runtimeAttentionItems = useMemo(() => [
+    ...attentionAlarmsNewestFirst(headlessSnapshot?.alarms.alarms ?? []).map((alarm) => ({
+      identity: `backend:${alarm.activationId}`,
+      title: alarm.title,
+      source: 'backend' as const,
+    })),
+    ...clientErrors.map((error) => ({
+      identity: `composer:${error.id}`,
+      title: error.title,
+      source: 'composer' as const,
+    })),
+  ], [clientErrors, headlessSnapshot]);
   const runtimeView = useMemo(
     () => headlessSnapshot === null ? null : runtimeStatusView(
       headlessSnapshot.runtime,
@@ -321,7 +381,14 @@ export default function App() {
             aria-haspopup="dialog"
             aria-expanded={globalPanel === 'runtime'}
             onClick={() => setGlobalPanel('runtime')}
-          >Runtime / history</button>
+          >
+            Runtime / history
+            {clientErrors.length + (headlessSnapshot?.alarms.unacknowledgedCount ?? 0) > 0 && (
+              <span className="global-attention-count">
+                {clientErrors.length + (headlessSnapshot?.alarms.unacknowledgedCount ?? 0)}
+              </span>
+            )}
+          </button>
           <button
             ref={assistantButton}
             type="button"
@@ -477,11 +544,17 @@ export default function App() {
           </div>
         </aside>
       </div>
+      <RuntimeAttentionAlert
+        enabled={headlessSnapshot?.complete === true}
+        items={runtimeAttentionItems}
+        onOpen={() => setGlobalPanel('runtime')}
+      />
       <OverlayPanel
         open={globalPanel === 'runtime'}
         title="Runtime, alarms, and history"
         titleId="runtime-observability-title"
         kind="status"
+        panelClassName="runtime-observability-overlay"
         onClose={() => setGlobalPanel(null)}
         returnFocusRef={runtimeButton}
       >
@@ -489,13 +562,7 @@ export default function App() {
           enabled={headlessEnabled}
           headlessStateSource={headlessStateSource}
           clientErrors={clientErrors}
-          onAcknowledgeClientError={(id) => {
-            if (id === 'composer.full_cell_stop') {
-              robotControl.dismissFullStopError();
-            } else {
-              programRuntime.dismissError();
-            }
-          }}
+          onAcknowledgeClientError={operationalErrors.dismiss}
         />
       </OverlayPanel>
       <OverlayPanel

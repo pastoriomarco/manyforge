@@ -862,29 +862,94 @@ AuthoringAdmissionProjection ReadAuthoringAdmissionProjection(
 }
 
 std::string ApplyRequest(
+    const DaemonDirectory &directory,
     const std::string_view manager_owner_epoch,
     const std::uint64_t expected_admission_generation,
     const std::string_view deployment_artifact_id = "candidate",
     const std::string_view deployment_revision = kDeploymentRevision,
     const std::string_view expected_graph_revision = "current-graph",
     const std::string_view expected_retained_bundle_id = "current-bundle",
-    const std::string_view request_id = "request-1") {
-  return std::string("{\"admission_context\":{\"expected_admission_generation\":") +
-         std::to_string(expected_admission_generation) +
-         ",\"kind\":\"direct\"},\"api_version\":"
-         "\"manyforge.manager_command.v1\",\"command\":\"apply\",\"correlation_id\":"
-         "\"correlation-1\",\"deployment_artifact_id\":\"" +
-         std::string(deployment_artifact_id) + "\",\"deployment_revision\":\"" +
-         std::string(deployment_revision) +
-         "\",\"expected_current\":{\"graph_revision\":\"" +
-         std::string(expected_graph_revision) + "\",\"retained_bundle_id\":\"" +
-         std::string(expected_retained_bundle_id) +
-         "\"},\"reject_if_affected_busy\":true,\"request_id\":\"" +
-         std::string(request_id) +
-         "\","
-         "\"request_owner_epoch\":\"" +
-         std::string(manager_owner_epoch) +
-         "\",\"source_label\":\"manager-process-test\"}";
+    const std::string_view request_id = "request-1",
+    const std::string_view preview_owner_epoch = {},
+    const bool preview_only = false) {
+  using content_identity::CanonicalValue;
+  std::string resolved_graph_revision(expected_graph_revision);
+  std::string resolved_retained_bundle_id(expected_retained_bundle_id);
+  if (expected_graph_revision == "current-graph" ||
+      expected_retained_bundle_id == "current-bundle") {
+    AtomicSourceSnapshotChannel manager_source(directory.publication_root(),
+                                               "manager-source.json");
+    const auto current = manager_source.Read();
+    if (!current.has_value()) {
+      throw std::runtime_error(
+          "Manager current projection is unavailable in test setup");
+    }
+    const auto &active = RequiredMember(current->payload, "active");
+    if (expected_graph_revision == "current-graph") {
+      resolved_graph_revision = RequiredText(active, "graph_revision");
+    }
+    if (expected_retained_bundle_id == "current-bundle") {
+      resolved_retained_bundle_id =
+          RequiredText(active, "retained_bundle_id");
+    }
+  }
+  const auto owner = preview_owner_epoch.empty() ? manager_owner_epoch
+                                                  : preview_owner_epoch;
+  const auto expected = CanonicalValue(CanonicalValue::Object{
+      {"graph_revision", CanonicalValue(resolved_graph_revision)},
+      {"retained_bundle_id",
+       CanonicalValue(resolved_retained_bundle_id)},
+  });
+  const auto preview_request = content_identity::canonical_json(
+      CanonicalValue(CanonicalValue::Object{
+          {"api_version", CanonicalValue("manyforge.manager_command.v1")},
+          {"command", CanonicalValue("deployment_candidate_preview")},
+          {"deployment_artifact_id",
+           CanonicalValue(std::string(deployment_artifact_id))},
+          {"deployment_revision",
+           CanonicalValue(std::string(deployment_revision))},
+          {"expected_admission_generation",
+           CanonicalValue(
+               static_cast<double>(expected_admission_generation))},
+          {"expected_current", expected},
+          {"request_owner_epoch", CanonicalValue(std::string(owner))},
+      }));
+  const auto preview_response =
+      SendCommand(directory.socket_path(), preview_request);
+  if (preview_only) {
+    return preview_response;
+  }
+  const auto preview =
+      deployment::parse_strict_json_model_yaml(preview_response).root();
+  const auto *ok = std::get_if<bool>(&RequiredMember(preview, "ok").storage());
+  if (ok == nullptr || !*ok) {
+    throw std::runtime_error("Manager candidate preview failed in test setup");
+  }
+  return content_identity::canonical_json(CanonicalValue(
+      CanonicalValue::Object{
+          {"admission_context",
+           CanonicalValue(CanonicalValue::Object{
+               {"expected_admission_generation",
+                CanonicalValue(
+                    static_cast<double>(expected_admission_generation))},
+               {"kind", CanonicalValue("direct")},
+           })},
+          {"api_version", CanonicalValue("manyforge.manager_command.v1")},
+          {"candidate_receipt",
+           RequiredMember(preview, "candidate_receipt")},
+          {"command", CanonicalValue("apply")},
+          {"correlation_id", CanonicalValue("correlation-1")},
+          {"deployment_artifact_id",
+           CanonicalValue(std::string(deployment_artifact_id))},
+          {"deployment_revision",
+           CanonicalValue(std::string(deployment_revision))},
+          {"expected_current", expected},
+          {"reject_if_affected_busy", CanonicalValue(true)},
+          {"request_id", CanonicalValue(std::string(request_id))},
+          {"request_owner_epoch",
+           CanonicalValue(std::string(manager_owner_epoch))},
+          {"source_label", CanonicalValue("manager-process-test")},
+      }));
 }
 
 [[maybe_unused]] std::string ApplyStatusRequest(
@@ -1263,13 +1328,15 @@ TEST(ManagerDaemonProcess,
     first_scene_runtime_generation = scene_runtime_snapshot->source_generation;
 
     unavailable_response =
-        SendCommand(directory.socket_path(),
-                    ApplyRequest(first_manager_epoch, 1U));
+        ApplyRequest(directory, first_manager_epoch, 1U, "candidate",
+                     kDeploymentRevision, "current-graph", "current-bundle",
+                     "request-1", {}, true);
     EXPECT_EQ(
-        SendCommand(directory.socket_path(),
-                    ApplyRequest(first_manager_epoch, 1U)),
+        ApplyRequest(directory, first_manager_epoch, 1U, "candidate",
+                     kDeploymentRevision, "current-graph", "current-bundle",
+                     "request-1", {}, true),
         unavailable_response);
-    EXPECT_NE(unavailable_response.find("\"kernel_owner_unavailable\""),
+    EXPECT_NE(unavailable_response.find("\"deployment_candidate_rejected\""),
               std::string::npos);
     EXPECT_EQ(unavailable_response.find("\"state\":\"accepted\""),
               std::string::npos);
@@ -1362,8 +1429,9 @@ TEST(ManagerDaemonProcess,
                   .find("\"state\":\"open\""),
               std::string::npos);
     const auto stale_apply =
-        SendCommand(directory.socket_path(),
-                    ApplyRequest(first_manager_epoch, 1U));
+        ApplyRequest(directory, first_manager_epoch, 1U, "candidate",
+                     kDeploymentRevision, "current-graph", "current-bundle",
+                     "request-1", {}, true);
     EXPECT_NE(stale_apply.find("\"stale_request_owner_epoch\""),
               std::string::npos);
     const auto stale_generation = SendCommand(
@@ -1373,9 +1441,11 @@ TEST(ManagerDaemonProcess,
     EXPECT_NE(stale_generation.find("\"authoring_not_ready\""),
               std::string::npos);
     const auto replacement_unavailable =
-        SendCommand(directory.socket_path(),
-                    ApplyRequest(manager_snapshot->source_owner_epoch, 1U));
-    EXPECT_NE(replacement_unavailable.find("\"kernel_owner_unavailable\""),
+        ApplyRequest(directory, manager_snapshot->source_owner_epoch, 1U,
+                     "candidate", kDeploymentRevision, "current-graph",
+                     "current-bundle", "request-1", {}, true);
+    EXPECT_NE(replacement_unavailable.find(
+                  "\"deployment_candidate_rejected\""),
               std::string::npos);
 
     const auto shutdown =
@@ -1672,7 +1742,6 @@ TEST(ManagerDaemonProcess,
   const auto before = manager_source.Read();
   ASSERT_TRUE(before.has_value());
   const auto children_before_replacement = ReadDirectChildren(manager.pid());
-
   std::filesystem::rename(selected_root, displaced_root);
   ASSERT_TRUE(std::filesystem::create_directory(selected_root));
 
@@ -1695,13 +1764,13 @@ TEST(ManagerDaemonProcess,
             std::string::npos)
       << reconcile;
 
-  const auto apply = SendCommand(
-      directory.socket_path(),
-      ApplyRequest(before->source_owner_epoch, 1U));
+  const auto apply = ApplyRequest(
+      directory, before->source_owner_epoch, 1U, "candidate",
+      kDeploymentRevision, "current-graph", "current-bundle", "request-1",
+      {}, true);
   EXPECT_NE(apply.find("\"code\":\"full_stack_restart_required\""),
             std::string::npos)
       << apply;
-  EXPECT_NE(apply.find("\"request_id\":"), std::string::npos) << apply;
 
   const auto owner_read = SendCommand(
       directory.socket_path(),
@@ -1900,7 +1969,7 @@ TEST(ManagerDaemonProcess,
     manager_epoch_a = initial->source_owner_epoch;
     const auto admission = WaitForAuthoringAdmission(directory_a);
     const auto request = ApplyRequest(
-        manager_epoch_a, admission.admission_generation,
+        directory_a, manager_epoch_a, admission.admission_generation,
         fixture_a.physical_deployment_artifact_id,
         fixture_a.physical_deployment_revision,
         fixture_a.predecessor_graph_revision,
@@ -1977,7 +2046,7 @@ TEST(ManagerDaemonProcess,
     manager_epoch_b = initial->source_owner_epoch;
     const auto admission = WaitForAuthoringAdmission(directory_b);
     const auto request = ApplyRequest(
-        manager_epoch_b, admission.admission_generation,
+        directory_b, manager_epoch_b, admission.admission_generation,
         fixture_b.physical_deployment_artifact_id,
         fixture_b.physical_deployment_revision,
         fixture_b.predecessor_graph_revision,
@@ -2070,7 +2139,7 @@ TEST(ManagerDaemonProcess,
                   .find(fixture.predecessor_retained_bundle_id),
               std::string::npos);
     request = ApplyRequest(
-        first_manager_epoch,
+        directory, first_manager_epoch,
         WaitForAuthoringAdmission(directory).admission_generation,
         fixture.deployment_artifact_id,
         fixture.deployment_revision, fixture.predecessor_graph_revision,
@@ -2224,7 +2293,7 @@ TEST(ManagerDaemonProcess,
     ASSERT_TRUE(before.has_value());
     first_manager_epoch = before->source_owner_epoch;
     apply_request = ApplyRequest(
-        first_manager_epoch,
+        directory, first_manager_epoch,
         WaitForAuthoringAdmission(directory).admission_generation,
         fixture.physical_deployment_artifact_id,
         fixture.physical_deployment_revision,

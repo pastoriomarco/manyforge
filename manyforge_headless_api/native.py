@@ -279,6 +279,7 @@ class HeadlessCorePort(Protocol):
     def acknowledge_all(self, **kwargs: Any) -> dict[str, Any]: ...
 
     def history(self, **kwargs: Any) -> dict[str, Any]: ...
+    def history_detail(self, sequence: int) -> dict[str, Any]: ...
 
     def historian_health(self) -> dict[str, Any]: ...
 
@@ -765,6 +766,12 @@ class NativeHeadlessCore:
         return self._require_object(
             self._invoke("history", **kwargs),
             method="history",
+        )
+
+    def history_detail(self, sequence: int) -> dict[str, Any]:
+        return self._require_object(
+            self._invoke("history_detail", sequence),
+            method="history_detail",
         )
 
     def historian_health(self) -> dict[str, Any]:

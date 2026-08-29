@@ -27,6 +27,8 @@ inline constexpr std::string_view kHistorianEventSchemaVersion =
     "manyforge.historian_event.v1";
 inline constexpr std::string_view kHistorianPageSchemaVersion =
     "manyforge.historian_page.v1";
+inline constexpr std::string_view kHistorianDetailSchemaVersion =
+    "manyforge.historian_detail.v1";
 inline constexpr std::size_t kDefaultHistorianQueueCapacity = 1024U;
 inline constexpr std::size_t kDefaultHistorianRecordRetention = 100000U;
 inline constexpr std::size_t kMaximumHistorianPageSize = 10000U;
@@ -83,6 +85,8 @@ struct HistorianPage final {
 
 [[nodiscard]] manyforge::content_identity::CanonicalValue
 HistorianPageValue(const HistorianPage &page);
+[[nodiscard]] manyforge::content_identity::CanonicalValue
+HistorianDetailValue(const HistorianStoredEvent &stored);
 
 class IEventHistoryStore {
 public:
@@ -94,6 +98,8 @@ public:
   virtual ~IEventHistoryStore() = default;
   [[nodiscard]] virtual AppendStatus Append(const HistorianEvent &event) = 0;
   [[nodiscard]] virtual HistorianPage Query(const HistorianQuery &query) = 0;
+  [[nodiscard]] virtual std::optional<HistorianStoredEvent>
+  Read(std::uint64_t sequence) = 0;
 };
 
 class SqliteEventHistoryStore final : public IEventHistoryStore {
@@ -108,6 +114,8 @@ public:
 
   [[nodiscard]] AppendStatus Append(const HistorianEvent &event) override;
   [[nodiscard]] HistorianPage Query(const HistorianQuery &query) override;
+  [[nodiscard]] std::optional<HistorianStoredEvent>
+  Read(std::uint64_t sequence) override;
   void Close();
 
 private:

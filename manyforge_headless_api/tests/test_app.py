@@ -780,6 +780,26 @@ class FakeCore:
             "query": kwargs,
         }
 
+    def history_detail(self, sequence: int) -> dict[str, Any]:
+        return {
+            "schema_version": "manyforge.historian_detail.v1",
+            "sequence": sequence,
+            "event": {
+                "schema_version": "manyforge.historian_event.v1",
+                "event_id": "event-1",
+                "component": "manyforge.execution",
+                "event_type": "operation_updated",
+                "severity": "INFO",
+                "occurred_at_ns": 1,
+                "occurred_at_wall": "2026-08-28T00:00:00Z",
+                "payload": {},
+            },
+            "sections": {
+                name: {"available": False, "reason": "not published", "value": None}
+                for name in ("incident", "execution_digest", "blackboard", "latency")
+            },
+        }
+
     def historian_health(self) -> dict[str, Any]:
         return {
             "schema_version": "manyforge.historian_health.v1",
@@ -1249,6 +1269,76 @@ def _client(*, trusted: bool = False) -> tuple[TestClient, FakeCore, FakeManager
         trusted_principal_adapter=FakeTrustedAdapter() if trusted else None,
     )
     return TestClient(app), core, manager
+
+
+class FakeCCLC:
+    def __init__(self) -> None:
+        self.routes: list[dict[str, Any]] = []
+
+    def submit_route(self, request: dict[str, Any]) -> dict[str, Any]:
+        self.routes.append(copy.deepcopy(request))
+        return {
+            "transaction_id": "route.1",
+            "replay_status": "accepted_new",
+            "admission": None,
+        }
+
+
+def _route_selection_body(admission_generation: int) -> dict[str, Any]:
+    return {
+        "request_context": _caller(),
+        "expected_admission_generation": admission_generation,
+        "expected_retained_bundle_id": "bundle.1",
+        "expected_graph_revision": "graph.1",
+        "desired_configuration": {
+            "control_domain_id": "domain.arm",
+            "control_domain_revision": "domain.revision.1",
+            "controller_topology_id": "topology.arm",
+            "topology_revision": "topology.revision.1",
+            "activation_set_id": "activation.arm",
+            "binding_routes": [{
+                "control_binding_id": "binding.arm",
+                "control_binding_revision": "binding.revision.1",
+                "control_route_id": "route.normal",
+            }],
+        },
+        "expected_active_control_configuration": {
+            "presence": "absent",
+            "active_control_configuration_id": None,
+            "active_control_configuration_generation": None,
+        },
+        "component_expectations": [{
+            "controllable_component_id": "component.arm",
+            "expected_component_lifecycle_generation": 1,
+            "expected_component_lifecycle_state": "prepared",
+        }],
+        "confirmed": True,
+    }
+
+
+def test_route_selection_requires_current_idle_admission_at_backend_boundary() -> None:
+    core = FakeCore()
+    manager = FakeManager()
+    cclc = FakeCCLC()
+    app = create_app(
+        service=_service(core, manager, cclc=cclc),
+        cclc=cclc,  # type: ignore[arg-type]
+    )
+    with TestClient(app) as client:
+        stale = client.post(
+            "/api/cclc/routes/requests",
+            json=_route_selection_body(_ADMISSION_GENERATION + 1),
+        )
+        accepted = client.post(
+            "/api/cclc/routes/requests",
+            json=_route_selection_body(_ADMISSION_GENERATION),
+        )
+
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["code"] == "authoring_not_ready"
+    assert accepted.status_code == 200
+    assert len(cclc.routes) == 1
+    assert "expected_admission_generation" not in cclc.routes[0]
 
 
 @pytest.mark.parametrize(
@@ -2083,6 +2173,21 @@ def test_apply_is_forwarded_and_remains_typed_unavailable_before_i6() -> None:
                 },
                 "reject_if_affected_busy": True,
                 "expected_admission_generation": 7,
+                "candidate_receipt": {
+                    "schema_version": "manyforge.manager_deployment_candidate_receipt.v1",
+                    "deployment_artifact_id": "deployment.1",
+                    "deployment_revision": "sha256:" + "b" * 64,
+                    "scenario_catalog_revision": "sha256:" + "c" * 64,
+                    "candidate_retained_bundle_id": "bundle.2",
+                    "candidate_graph_revision": "graph.2",
+                    "expected_current": {
+                        "graph_revision": "graph.1",
+                        "retained_bundle_id": "bundle.1",
+                    },
+                    "expected_admission_generation": 7,
+                    "manager_owner_epoch": "client.epoch.1",
+                    "receipt_digest": "sha256:" + "d" * 64,
+                },
             },
         )
     assert response.status_code == 503
@@ -2373,6 +2478,23 @@ def test_query_cardinality_and_safe_integer_bounds_precede_native_conversion() -
     assert invalid_ordering.status_code == 422
     assert excessive_alarm_page.status_code == 422
     assert excessive_history_page.status_code == 422
+
+
+def test_history_detail_is_an_exact_bounded_read() -> None:
+    client, _core, _manager = _client()
+    with client:
+        response = client.get("/api/execution/history/7")
+        invalid = client.get("/api/execution/history/0")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["sequence"] == 7
+    assert set(response.json()["sections"]) == {
+        "blackboard",
+        "execution_digest",
+        "incident",
+        "latency",
+    }
+    assert invalid.status_code == 422
 
 
 def test_openapi_contains_no_condition_mutation_route() -> None:

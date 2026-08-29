@@ -14,7 +14,8 @@ describe('UI4 application and viewport composition', () => {
 
     expect(app.match(/<SceneAuthoringWorkspace/g)).toHaveLength(1);
     expect(app).toContain('className="global-surface-launchers"');
-    expect(app).toContain('>Runtime / history</button>');
+    expect(app).toContain('Runtime / history');
+    expect(app).toContain('global-attention-count');
     expect(app).toContain('>AI</button>');
     expect(app).not.toContain('className="live-controls-scroll"');
     expect(app).not.toContain('<details className="workbench-disclosure"');
@@ -81,7 +82,8 @@ describe('UI4 application and viewport composition', () => {
     const lifecycle = source('./CCLCPanel.tsx');
 
     expect(app).not.toContain('<CCLCPanel');
-    expect(deployment).toContain('<CCLCPanel enabled={enabled} componentIds={componentIds} />');
+    expect(deployment).toContain('<CCLCPanel');
+    expect(deployment).toContain('admissionGeneration={snapshot?.authoringAdmission.admissionGeneration ?? null}');
     expect(deployment).toContain('candidate.controllable_component_id');
     expect(lifecycle).toContain('<select');
     expect(lifecycle).not.toContain('placeholder="lite6-arm"');

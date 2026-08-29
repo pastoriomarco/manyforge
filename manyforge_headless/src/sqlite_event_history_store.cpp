@@ -476,6 +476,23 @@ public:
     return {std::move(events), truncated, next};
   }
 
+  std::optional<HistorianStoredEvent> Read(const std::uint64_t sequence) {
+    Require(sequence > 0U && sequence <= kMaximumSafeInteger,
+            "historian_query_invalid", "history detail sequence is invalid");
+    const auto page = Query(HistorianQuery{
+        .start_ns = std::nullopt,
+        .end_ns = std::nullopt,
+        .components = {},
+        .event_types = {},
+        .before_sequence = sequence + 1U,
+        .limit = 1U,
+    });
+    if (page.events.empty() || page.events.front().sequence != sequence) {
+      return std::nullopt;
+    }
+    return page.events.front();
+  }
+
   void Close() {
     std::lock_guard lock(mutex_);
     if (closed_) {
@@ -594,6 +611,11 @@ SqliteEventHistoryStore::Append(const HistorianEvent &event) {
 
 HistorianPage SqliteEventHistoryStore::Query(const HistorianQuery &query) {
   return impl_->Query(query);
+}
+
+std::optional<HistorianStoredEvent>
+SqliteEventHistoryStore::Read(const std::uint64_t sequence) {
+  return impl_->Read(sequence);
 }
 
 void SqliteEventHistoryStore::Close() { impl_->Close(); }

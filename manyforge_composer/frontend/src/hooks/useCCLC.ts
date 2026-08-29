@@ -23,12 +23,12 @@ export interface CCLCController {
   routeTemplates: CCLCRouteTemplateSet | null;
   transaction: CCLCTransactionStatus | null;
   pendingTransaction: { kind: 'lifecycle' | 'route'; id: string } | null;
-  confirmed: boolean;
   busy: boolean;
   error: string | null;
   setComponentId: (value: string) => void;
-  setConfirmed: (value: boolean) => void;
   refresh: () => Promise<void>;
+  reconcileTransaction: () => Promise<void>;
+  dismissError: () => void;
   submitLifecycle: (intent: CCLCLifecycleIntent) => Promise<void>;
   submitRoute: (template: CCLCRouteTemplate) => Promise<void>;
 }
@@ -85,6 +85,7 @@ export function lifecycleRequestFromSnapshot(
   snapshot: CCLCComponentSnapshot,
   intent: CCLCLifecycleIntent,
   context: CCLCRequestContext,
+  admissionGeneration: number,
 ): CCLCLifecycleRequestBody {
   return {
     request_context: context,
@@ -92,6 +93,7 @@ export function lifecycleRequestFromSnapshot(
     intent,
     expected_graph_revision: snapshot.graphRevision,
     expected_component_lifecycle_generation: snapshot.lifecycleGeneration,
+    expected_admission_generation: admissionGeneration,
     expected_control_domains: snapshot.domains.map((domain) => ({
       control_domain_id: domain.controlDomainId,
       control_domain_revision: domain.controlDomainRevision,
@@ -124,12 +126,14 @@ export function routeRequestFromTemplate(
   templates: CCLCRouteTemplateSet,
   template: CCLCRouteTemplate,
   context: CCLCRequestContext,
+  admissionGeneration: number,
 ): CCLCRouteRequestBody {
   if (!templates.templates.includes(template)) {
     throw new Error('route template is not from the current projection');
   }
   return {
     request_context: context,
+    expected_admission_generation: admissionGeneration,
     expected_retained_bundle_id: templates.retainedBundleId,
     expected_graph_revision: templates.graphRevision,
     desired_configuration: template.desired_configuration,
@@ -140,7 +144,10 @@ export function routeRequestFromTemplate(
   };
 }
 
-export function useCCLC(enabled: boolean): CCLCController {
+export function useCCLC(
+  enabled: boolean,
+  admissionGeneration: number | null,
+): CCLCController {
   const [componentId, setComponentIdValue] = useState('');
   const [snapshot, setSnapshot] = useState<CCLCComponentSnapshot | null>(null);
   const [routeTemplates, setRouteTemplates] = useState<CCLCRouteTemplateSet | null>(null);
@@ -148,7 +155,6 @@ export function useCCLC(enabled: boolean): CCLCController {
   const [pendingTransaction, setPendingTransaction] = useState<{
     kind: 'lifecycle' | 'route'; id: string;
   } | null>(null);
-  const [confirmed, setConfirmed] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -156,7 +162,6 @@ export function useCCLC(enabled: boolean): CCLCController {
     setComponentIdValue(value);
     setSnapshot(null);
     setRouteTemplates(null);
-    setConfirmed(false);
   }, []);
 
   const readCurrent = useCallback(async (signal?: AbortSignal) => {
@@ -202,21 +207,20 @@ export function useCCLC(enabled: boolean): CCLCController {
     }
   }, [readCurrent]);
 
-  const requireConfirmation = useCallback(() => {
-    if (!confirmed) throw new Error('Explicit confirmation is required');
-  }, [confirmed]);
-
   const submitLifecycle = useCallback(async (intent: CCLCLifecycleIntent) => {
     setBusy(true);
     setError(null);
     try {
-      requireConfirmation();
+      if (admissionGeneration === null) {
+        throw new Error('Current authoring admission is unavailable');
+      }
       const current = await readCurrent();
       const result = await api.cclc.submitLifecycle(
         lifecycleRequestFromSnapshot(
           current.snapshot,
           intent,
           requestContext(current.ownerEpoch, `lifecycle:${intent}`),
+          admissionGeneration,
         ),
       );
       if (result.transactionId === null) {
@@ -224,19 +228,20 @@ export function useCCLC(enabled: boolean): CCLCController {
       }
       setTransaction(result.status);
       setPendingTransaction({ kind: 'lifecycle', id: result.transactionId });
-      setConfirmed(false);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Lifecycle request failed');
     } finally {
       setBusy(false);
     }
-  }, [readCurrent, requireConfirmation]);
+  }, [admissionGeneration, readCurrent]);
 
   const submitRoute = useCallback(async (template: CCLCRouteTemplate) => {
     setBusy(true);
     setError(null);
     try {
-      requireConfirmation();
+      if (admissionGeneration === null) {
+        throw new Error('Current authoring admission is unavailable');
+      }
       const current = await readCurrent();
       const selected = current.templates.templates.find(
         (candidate) => candidate.desired_configuration.control_domain_id
@@ -253,6 +258,7 @@ export function useCCLC(enabled: boolean): CCLCController {
             current.ownerEpoch,
             `route:${selected.desired_configuration.control_domain_id}`,
           ),
+          admissionGeneration,
         ),
       );
       if (result.transactionId === null) {
@@ -260,13 +266,32 @@ export function useCCLC(enabled: boolean): CCLCController {
       }
       setTransaction(result.status);
       setPendingTransaction({ kind: 'route', id: result.transactionId });
-      setConfirmed(false);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Route request failed');
     } finally {
       setBusy(false);
     }
-  }, [readCurrent, requireConfirmation]);
+  }, [admissionGeneration, readCurrent]);
+
+  const reconcileTransaction = useCallback(async () => {
+    if (pendingTransaction === null) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const next = pendingTransaction.kind === 'lifecycle'
+        ? await api.cclc.lifecycleStatus(pendingTransaction.id)
+        : await api.cclc.routeStatus(pendingTransaction.id);
+      if (next === null) {
+        throw new Error('Accepted CCLC transaction has no retained status');
+      }
+      setTransaction(next);
+      if (next.terminalResult !== null) await readCurrent();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'CCLC reconciliation failed');
+    } finally {
+      setBusy(false);
+    }
+  }, [pendingTransaction, readCurrent]);
 
   useEffect(() => {
     if (!enabled || pendingTransaction === null || transaction?.terminalResult) {
@@ -287,6 +312,8 @@ export function useCCLC(enabled: boolean): CCLCController {
         setTransaction(next);
         if (next.terminalResult === null) {
           timeout = setTimeout(poll, POLL_INTERVAL_MS);
+        } else {
+          await readCurrent();
         }
       } catch (reason) {
         if (active) {
@@ -299,7 +326,7 @@ export function useCCLC(enabled: boolean): CCLCController {
       active = false;
       if (timeout !== null) clearTimeout(timeout);
     };
-  }, [enabled, pendingTransaction, transaction?.terminalResult]);
+  }, [enabled, pendingTransaction, readCurrent, transaction?.terminalResult]);
 
   return {
     componentId,
@@ -307,12 +334,12 @@ export function useCCLC(enabled: boolean): CCLCController {
     routeTemplates,
     transaction,
     pendingTransaction,
-    confirmed,
     busy,
     error,
     setComponentId,
-    setConfirmed,
     refresh,
+    reconcileTransaction,
+    dismissError: () => setError(null),
     submitLifecycle,
     submitRoute,
   };

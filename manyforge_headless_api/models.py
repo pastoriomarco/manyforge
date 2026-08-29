@@ -190,6 +190,56 @@ class ExpectedCurrentRequest(StrictRequest):
         )
 
 
+class ManagerDeploymentCandidateReceipt(StrictRequest):
+    schema_version: Literal[
+        "manyforge.manager_deployment_candidate_receipt.v1"
+    ]
+    deployment_artifact_id: str
+    deployment_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    scenario_catalog_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    candidate_retained_bundle_id: str
+    candidate_graph_revision: str
+    expected_current: ExpectedCurrentRequest
+    expected_admission_generation: Annotated[
+        int, Field(ge=1, le=9_007_199_254_740_991)
+    ]
+    manager_owner_epoch: str
+    receipt_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
+
+    @field_validator(
+        "deployment_artifact_id",
+        "candidate_retained_bundle_id",
+        "candidate_graph_revision",
+        "manager_owner_epoch",
+    )
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(
+            value,
+            label=info.field_name,
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+
+class ManagerDeploymentCandidatePreviewRequest(StrictRequest):
+    deployment_artifact_id: str
+    deployment_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    expected_current: ExpectedCurrentRequest
+    expected_admission_generation: Annotated[
+        int, Field(ge=1, le=9_007_199_254_740_991)
+    ]
+    request_owner_epoch: str
+
+    @field_validator("deployment_artifact_id", "request_owner_epoch")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(
+            value,
+            label=info.field_name,
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+
 class ManagerApplyRequest(CallerAttributionRequest):
     deployment_artifact_id: str
     deployment_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
@@ -199,6 +249,7 @@ class ManagerApplyRequest(CallerAttributionRequest):
         int | None, Field(ge=1, le=9_007_199_254_740_991)
     ] = None
     parent_authoring_claim: dict[str, Any] | None = None
+    candidate_receipt: ManagerDeploymentCandidateReceipt
 
     @field_validator("deployment_artifact_id")
     @classmethod
@@ -220,6 +271,20 @@ class ManagerApplyRequest(CallerAttributionRequest):
                 "exactly one direct admission generation or parent authoring "
                 "claim is required"
             )
+        expected_generation = self.expected_admission_generation
+        if expected_generation is not None and (
+            self.candidate_receipt.expected_admission_generation
+            != expected_generation
+        ):
+            raise ValueError("candidate receipt admission generation differs")
+        if (
+            self.candidate_receipt.deployment_artifact_id
+            != self.deployment_artifact_id
+            or self.candidate_receipt.deployment_revision
+            != self.deployment_revision
+            or self.candidate_receipt.expected_current != self.expected_current
+        ):
+            raise ValueError("candidate receipt does not match Apply selection")
         return self
 
 
@@ -2461,6 +2526,9 @@ class CCLCRouteComponentExpectationRequest(StrictRequest):
 
 class RouteSelectionRequest(StrictRequest):
     request_context: CallerAttributionRequest
+    expected_admission_generation: Annotated[
+        int, Field(ge=1, le=9_007_199_254_740_991)
+    ]
     expected_retained_bundle_id: str
     expected_graph_revision: str
     desired_configuration: CCLCDesiredControlConfigurationRequest

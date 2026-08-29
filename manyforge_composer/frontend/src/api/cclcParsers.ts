@@ -408,8 +408,6 @@ export function parseCCLCComponentSnapshot(value: unknown): CCLCComponentSnapsho
     'cclcComponent.domains',
     { nonempty: true },
   );
-  // Provider rows are not presentation data, but their bounded collection and
-  // exact object nature remain part of the transport contract.
   const providers = arrayAt(
     row.provider_occurrences,
     'cclcComponent.provider_occurrences',
@@ -424,9 +422,21 @@ export function parseCCLCComponentSnapshot(value: unknown): CCLCComponentSnapsho
       'provider_runtime_unit_id',
     ], path);
     Object.entries(candidate).forEach(([key, value]) => textAt(value, `${path}.${key}`));
-    return `${candidate.control_domain_id as string}\u0000${candidate.provider_instance_id as string}`;
+    return {
+      controlDomainId: candidate.control_domain_id as string,
+      lifecyclePlanCatalogDigest: candidate.lifecycle_plan_catalog_digest as string,
+      providerInstanceId: candidate.provider_instance_id as string,
+      providerManifestId: candidate.provider_manifest_id as string,
+      providerManifestRevision: candidate.provider_manifest_revision as string,
+      providerRuntimeEpoch: candidate.provider_runtime_epoch as string,
+      providerRuntimeUnitId: candidate.provider_runtime_unit_id as string,
+    };
   });
-  canonicalBy(providers, (provider) => provider, 'cclcComponent.provider_occurrences');
+  canonicalBy(
+    providers,
+    (provider) => `${provider.controlDomainId}\u0000${provider.providerInstanceId}`,
+    'cclcComponent.provider_occurrences',
+  );
   integerAt(row.publication_generation, 'cclcComponent.publication_generation');
   textAt(row.snapshot_digest, 'cclcComponent.snapshot_digest');
   textAt(row.active_public_pointer_digest, 'cclcComponent.active_public_pointer_digest');
@@ -443,6 +453,7 @@ export function parseCCLCComponentSnapshot(value: unknown): CCLCComponentSnapsho
     retainedBundleId: textAt(row.retained_bundle_id, 'cclcComponent.retained_bundle_id'),
     graphRevision: textAt(row.graph_revision, 'cclcComponent.graph_revision'),
     domains,
+    providers,
   };
 }
 

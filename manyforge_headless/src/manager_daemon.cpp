@@ -405,6 +405,7 @@ struct DaemonConfig final {
 };
 
 enum class CommandKind {
+  kDeploymentCandidatePreview,
   kApply,
   kApplyStatus,
   kSceneCommit,
@@ -422,6 +423,7 @@ enum class CommandKind {
 [[nodiscard]] bool RequiresCurrentPackageGeneration(
     const CommandKind command) noexcept {
   switch (command) {
+  case CommandKind::kDeploymentCandidatePreview:
   case CommandKind::kApply:
   case CommandKind::kSceneCommit:
   case CommandKind::kSceneCandidatePreview:
@@ -439,6 +441,24 @@ enum class CommandKind {
   }
   return true;
 }
+
+struct DeploymentCandidateReceipt final {
+  core::DeploymentArtifactId deployment_artifact_id;
+  core::DeploymentRevision deployment_revision;
+  core::ScenarioCatalogRevision scenario_catalog_revision;
+  core::RetainedBundleId candidate_retained_bundle_id;
+  core::GraphRevision candidate_graph_revision;
+  core::RetainedBundleId expected_current_retained_bundle_id;
+  core::GraphRevision expected_current_graph_revision;
+  core::AdmissionGeneration expected_admission_generation;
+  std::string manager_owner_epoch;
+  core::ContentDigest receipt_digest;
+
+  friend bool operator==(const DeploymentCandidateReceipt &,
+                         const DeploymentCandidateReceipt &) = default;
+};
+
+constexpr std::size_t kMaximumDeploymentCandidateReceipts = 256U;
 
 struct PoseObserverBinding final {
   std::string object_id;
@@ -467,6 +487,7 @@ struct ManagerCommand final {
   std::optional<core::GraphRevision> expected_current_graph_revision{};
   std::optional<core::AdmissionGeneration> expected_admission_generation{};
   std::optional<core::CellAdmissionClaimDTO> parent_authoring_claim{};
+  std::optional<DeploymentCandidateReceipt> deployment_candidate_receipt{};
   std::optional<core::ProjectionRevisionDTO> expected_scene_projection{};
   std::vector<core::SceneResourceId> scene_resource_ids{};
   std::optional<core::ResolvedSceneCandidatePreviewRequestDTO>
@@ -509,6 +530,97 @@ bool RequiredBool(const CanonicalValue &root, const std::string_view name) {
   Require(value != nullptr,
           "command field " + std::string(name) + " must be boolean");
   return *value;
+}
+
+void RequireExactObjectSize(const CanonicalValue &value, std::size_t size,
+                            std::string_view label);
+std::uint64_t RequiredUnsigned(const CanonicalValue &value,
+                               std::string_view label);
+
+CanonicalValue DeploymentCandidateReceiptPayload(
+    const DeploymentCandidateReceipt &receipt) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"candidate_graph_revision",
+       CanonicalValue(receipt.candidate_graph_revision.value())},
+      {"candidate_retained_bundle_id",
+       CanonicalValue(receipt.candidate_retained_bundle_id.value())},
+      {"deployment_artifact_id",
+       CanonicalValue(receipt.deployment_artifact_id.value())},
+      {"deployment_revision",
+       CanonicalValue(receipt.deployment_revision.value())},
+      {"expected_admission_generation",
+       CanonicalValue(
+           static_cast<double>(receipt.expected_admission_generation.value()))},
+      {"expected_current",
+       CanonicalValue(CanonicalValue::Object{
+           {"graph_revision",
+            CanonicalValue(receipt.expected_current_graph_revision.value())},
+           {"retained_bundle_id",
+            CanonicalValue(
+                receipt.expected_current_retained_bundle_id.value())},
+       })},
+      {"manager_owner_epoch", CanonicalValue(receipt.manager_owner_epoch)},
+      {"scenario_catalog_revision",
+       CanonicalValue(receipt.scenario_catalog_revision.value())},
+      {"schema_version",
+       CanonicalValue("manyforge.manager_deployment_candidate_receipt.v1")},
+  });
+}
+
+core::ContentDigest DeploymentCandidateReceiptDigest(
+    const DeploymentCandidateReceipt &receipt) {
+  return core::ContentDigest(content_identity::sha256_digest(
+      content_identity::canonical_json(
+          DeploymentCandidateReceiptPayload(receipt))));
+}
+
+CanonicalValue DeploymentCandidateReceiptValue(
+    const DeploymentCandidateReceipt &receipt) {
+  auto payload = std::get<CanonicalValue::Object>(
+      DeploymentCandidateReceiptPayload(receipt).storage());
+  payload.emplace_back("receipt_digest",
+                       CanonicalValue(receipt.receipt_digest.value()));
+  return CanonicalValue(std::move(payload));
+}
+
+DeploymentCandidateReceipt RequiredDeploymentCandidateReceipt(
+    const CanonicalValue &value) {
+  RequireExactObjectSize(value, 10U, "deployment candidate receipt");
+  Require(RequiredString(value, "schema_version") ==
+              "manyforge.manager_deployment_candidate_receipt.v1",
+          "deployment candidate receipt schema is unsupported");
+  const auto &expected = RequiredMember(value, "expected_current");
+  RequireExactObjectSize(expected, 2U,
+                         "deployment candidate expected current");
+  DeploymentCandidateReceipt receipt{
+      core::DeploymentArtifactId(
+          RequiredString(value, "deployment_artifact_id")),
+      core::DeploymentRevision(RequiredString(value, "deployment_revision")),
+      core::ScenarioCatalogRevision(
+          RequiredString(value, "scenario_catalog_revision")),
+      core::RetainedBundleId(
+          RequiredString(value, "candidate_retained_bundle_id")),
+      core::GraphRevision(
+          RequiredString(value, "candidate_graph_revision")),
+      core::RetainedBundleId(RequiredString(expected, "retained_bundle_id")),
+      core::GraphRevision(RequiredString(expected, "graph_revision")),
+      core::AdmissionGeneration(RequiredUnsigned(
+          RequiredMember(value, "expected_admission_generation"),
+          "deployment candidate admission generation")),
+      RequiredString(value, "manager_owner_epoch"),
+      core::ContentDigest(RequiredString(value, "receipt_digest")),
+  };
+  Require(core::IsExactLowercaseSha256Digest(
+              receipt.deployment_revision.value()) &&
+              core::IsExactLowercaseSha256Digest(
+                  receipt.scenario_catalog_revision.value()) &&
+              core::IsExactLowercaseSha256Digest(
+                  receipt.receipt_digest.value()) &&
+              content_identity::digest_equal(
+                  receipt.receipt_digest.value(),
+                  DeploymentCandidateReceiptDigest(receipt).value()),
+          "deployment candidate receipt identity is invalid");
+  return receipt;
 }
 
 std::optional<std::string> OptionalString(const CanonicalValue &root,
@@ -1026,6 +1138,33 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
   Require(RequiredString(root, "api_version") == kManagerCommandApiVersion,
           "command api_version is unsupported");
   const auto command = RequiredString(root, "command");
+  if (command == "deployment_candidate_preview") {
+    RequireExactObjectSize(root, 7U,
+                           "deployment candidate preview command");
+    const auto deployment_revision =
+        RequiredString(root, "deployment_revision");
+    Require(core::IsExactLowercaseSha256Digest(deployment_revision),
+            "candidate deployment_revision must be canonical SHA-256");
+    const auto &expected = RequiredMember(root, "expected_current");
+    RequireExactObjectSize(expected, 2U,
+                           "candidate preview expected_current");
+    ManagerCommand result{
+        .kind = CommandKind::kDeploymentCandidatePreview,
+        .request_owner_epoch = RequiredString(root, "request_owner_epoch"),
+        .deployment_artifact_id = core::DeploymentArtifactId(
+            RequiredString(root, "deployment_artifact_id")),
+        .deployment_revision = core::DeploymentRevision(deployment_revision),
+        .expected_current_retained_bundle_id = core::RetainedBundleId(
+            RequiredString(expected, "retained_bundle_id")),
+        .expected_current_graph_revision = core::GraphRevision(
+            RequiredString(expected, "graph_revision")),
+        .expected_admission_generation = core::AdmissionGeneration(
+            RequiredUnsigned(
+                RequiredMember(root, "expected_admission_generation"),
+                "candidate expected_admission_generation")),
+    };
+    return result;
+  }
   if (command == "reconcile") {
     RequireExactObjectSize(root, 2U, "reconcile command");
     return {CommandKind::kReconcile,
@@ -1152,7 +1291,7 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
     return result;
   }
   Require(command == "apply", "command kind is unsupported");
-  RequireExactObjectSize(root, 11U, "Apply command");
+  RequireExactObjectSize(root, 12U, "Apply command");
   const auto request_id = RequiredString(root, "request_id");
   const auto request_owner_epoch = RequiredString(root, "request_owner_epoch");
   const auto source_label = RequiredString(root, "source_label");
@@ -1179,6 +1318,8 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
   result.deployment_artifact_id =
       core::DeploymentArtifactId(deployment_artifact_id);
   result.deployment_revision = core::DeploymentRevision(deployment_revision);
+  result.deployment_candidate_receipt = RequiredDeploymentCandidateReceipt(
+      RequiredMember(root, "candidate_receipt"));
   result.expected_current_retained_bundle_id =
       core::RetainedBundleId(expected_retained_bundle_id);
   result.expected_current_graph_revision =
@@ -1598,6 +1739,98 @@ CanonicalValue ApplyUnavailableResponse(const ManagerCommand &command) {
       command, kKernelOwnerUnavailableReasonCode,
       "operational Apply requires one converged managed Kernel execution "
       "host");
+}
+
+template <typename Record, typename Identity>
+CanonicalValue DeploymentRecordDiff(const std::vector<Record> &current,
+                                    const std::vector<Record> &candidate,
+                                    Identity identity) {
+  std::map<std::string, const Record *> current_by_id;
+  std::map<std::string, const Record *> candidate_by_id;
+  for (const auto &record : current) {
+    current_by_id.emplace(std::string(identity(record)), &record);
+  }
+  for (const auto &record : candidate) {
+    candidate_by_id.emplace(std::string(identity(record)), &record);
+  }
+  CanonicalValue::Array added;
+  CanonicalValue::Array removed;
+  CanonicalValue::Array changed;
+  for (const auto &[id, record] : candidate_by_id) {
+    const auto present = current_by_id.find(id);
+    if (present == current_by_id.end()) {
+      added.emplace_back(id);
+    } else if (*present->second != *record) {
+      changed.emplace_back(id);
+    }
+  }
+  for (const auto &[id, record] : current_by_id) {
+    static_cast<void>(record);
+    if (!candidate_by_id.contains(id)) {
+      removed.emplace_back(id);
+    }
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"added", CanonicalValue(std::move(added))},
+      {"changed", CanonicalValue(std::move(changed))},
+      {"removed", CanonicalValue(std::move(removed))},
+  });
+}
+
+CanonicalValue DeploymentGraphDiff(const core::CellGraphDTO &current,
+                                   const core::CellGraphDTO &candidate) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"component_attachments",
+       DeploymentRecordDiff(
+           current.component_attachments, candidate.component_attachments,
+           [](const core::ComponentAttachmentEdgeDTO &record) {
+             return record.component_attachment_id.value();
+           })},
+      {"controllable_components",
+       DeploymentRecordDiff(
+           current.controllable_components,
+           candidate.controllable_components,
+           [](const core::ControllableComponentDTO &record) {
+             return record.controllable_component_id.value();
+           })},
+      {"control_bindings",
+       DeploymentRecordDiff(
+           current.control_bindings, candidate.control_bindings,
+           [](const core::ControlBindingDTO &record) {
+             return record.control_binding_id.value();
+           })},
+      {"control_domains",
+       DeploymentRecordDiff(
+           current.control_domains, candidate.control_domains,
+           [](const core::ControlDomainDTO &record) {
+             return record.control_domain_id.value();
+           })},
+      {"model_instances",
+       DeploymentRecordDiff(
+           current.model_instances, candidate.model_instances,
+           [](const core::ModelInstanceDTO &record) {
+             return record.model_instance_id.value();
+           })},
+      {"runtime_units",
+       DeploymentRecordDiff(current.runtime_units, candidate.runtime_units,
+                            [](const core::RuntimeUnitDTO &record) {
+                              return record.runtime_unit_id.value();
+                            })},
+  });
+}
+
+CanonicalValue DeploymentCandidatePreviewResponse(
+    const DeploymentCandidateReceipt &receipt,
+    const core::CellGraphDTO &current_graph,
+    const core::CellGraphDTO &candidate_graph) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"api_version",
+       CanonicalValue(std::string(kManagerCommandResponseApiVersion))},
+      {"candidate_receipt", DeploymentCandidateReceiptValue(receipt)},
+      {"converged", CanonicalValue(current_graph == candidate_graph)},
+      {"diff", DeploymentGraphDiff(current_graph, candidate_graph)},
+      {"ok", CanonicalValue(true)},
+  });
 }
 
 CanonicalValue
@@ -3172,6 +3405,88 @@ private:
         }
       }
       switch (command.kind) {
+      case CommandKind::kDeploymentCandidatePreview: {
+        Require(command.request_owner_epoch.has_value() &&
+                    command.deployment_artifact_id.has_value() &&
+                    command.deployment_revision.has_value() &&
+                    command.expected_current_retained_bundle_id.has_value() &&
+                    command.expected_current_graph_revision.has_value() &&
+                    command.expected_admission_generation.has_value(),
+                "decoded candidate preview lacks its exact selection");
+        if (*command.request_owner_epoch != manager_owner_epoch_) {
+          TrySendResponse(
+              client.get(),
+              ErrorResponse("stale_request_owner_epoch",
+                            "candidate preview targets a stale Manager owner"));
+          return false;
+        }
+        try {
+          const auto active = plan_source_.ReadCurrentPlan();
+          const auto &current_pointer = active.active_publication.request;
+          if (current_pointer.candidate_retained_bundle_id !=
+                  *command.expected_current_retained_bundle_id ||
+              current_pointer.candidate_graph_revision !=
+                  *command.expected_current_graph_revision) {
+            TrySendResponse(
+                client.get(),
+                ErrorResponse(
+                    "deployment_candidate_current_changed",
+                    "Manager current Deployment changed before preview"));
+            return false;
+          }
+          const auto selection = candidate_source_.ResolveExact(
+              {*command.deployment_artifact_id,
+               *command.deployment_revision});
+          const auto current_bundle = verified_package_.get_verified(
+              current_pointer.candidate_retained_bundle_id);
+          const auto candidate_bundle = verified_package_.get_verified(
+              selection.retained_bundle_id);
+          Require(current_bundle != nullptr && candidate_bundle != nullptr &&
+                      current_bundle->retained_bundle_id() ==
+                          current_pointer.candidate_retained_bundle_id &&
+                      current_bundle->value().cell_graph.graph_revision ==
+                          current_pointer.candidate_graph_revision &&
+                      candidate_bundle->retained_bundle_id() ==
+                          selection.retained_bundle_id &&
+                      candidate_bundle->value().cell_graph.cell_id ==
+                          current_bundle->value().cell_graph.cell_id,
+                  "candidate preview could not resolve exact compatible graphs");
+          DeploymentCandidateReceipt receipt{
+              *command.deployment_artifact_id,
+              *command.deployment_revision,
+              selection.scenario_catalog_revision,
+              selection.retained_bundle_id,
+              candidate_bundle->value().cell_graph.graph_revision,
+              *command.expected_current_retained_bundle_id,
+              *command.expected_current_graph_revision,
+              *command.expected_admission_generation,
+              manager_owner_epoch_,
+              core::ContentDigest(""),
+          };
+          receipt.receipt_digest = DeploymentCandidateReceiptDigest(receipt);
+          const auto retained = std::find(
+              deployment_candidate_receipts_.begin(),
+              deployment_candidate_receipts_.end(), receipt);
+          if (retained == deployment_candidate_receipts_.end()) {
+            if (deployment_candidate_receipts_.size() >=
+                kMaximumDeploymentCandidateReceipts) {
+              deployment_candidate_receipts_.erase(
+                  deployment_candidate_receipts_.begin());
+            }
+            deployment_candidate_receipts_.push_back(receipt);
+          }
+          TrySendResponse(
+              client.get(),
+              DeploymentCandidatePreviewResponse(
+                  receipt, current_bundle->value().cell_graph,
+                  candidate_bundle->value().cell_graph));
+        } catch (const std::exception &error) {
+          TrySendResponse(
+              client.get(),
+              ErrorResponse("deployment_candidate_rejected", error.what()));
+        }
+        return false;
+      }
       case CommandKind::kApply: {
         if (*command.request_owner_epoch != manager_owner_epoch_) {
           TrySendResponse(
@@ -3187,8 +3502,34 @@ private:
                     command.expected_current_graph_revision.has_value() &&
                     command.request_id.has_value() &&
                     command.request_owner_epoch.has_value() &&
-                    command.source_label.has_value(),
+                    command.source_label.has_value() &&
+                    command.deployment_candidate_receipt.has_value(),
                 "decoded Apply command lacks its exact selection");
+        const auto &candidate_receipt =
+            *command.deployment_candidate_receipt;
+        const auto receipt_admission_generation =
+            command.expected_admission_generation.has_value()
+                ? *command.expected_admission_generation
+                : command.parent_authoring_claim->intent
+                      .expected_admission_generation;
+        if (candidate_receipt.manager_owner_epoch != manager_owner_epoch_ ||
+            candidate_receipt.deployment_artifact_id !=
+                *command.deployment_artifact_id ||
+            candidate_receipt.deployment_revision !=
+                *command.deployment_revision ||
+            candidate_receipt.expected_current_retained_bundle_id !=
+                *command.expected_current_retained_bundle_id ||
+            candidate_receipt.expected_current_graph_revision !=
+                *command.expected_current_graph_revision ||
+            candidate_receipt.expected_admission_generation !=
+                receipt_admission_generation) {
+          TrySendResponse(
+              client.get(),
+              ApplyErrorResponse(
+                  command, "deployment_candidate_receipt_mismatch",
+                  "Apply does not match its exact candidate preview"));
+          return false;
+        }
         try {
           const auto existing = stores_.apply_journal().ReadRequest(
               core::RequestOwnerEpoch(*command.request_owner_epoch),
@@ -3196,6 +3537,44 @@ private:
           if (!existing.has_value() && !kernel_apply_available_) {
             TrySendResponse(client.get(), ApplyUnavailableResponse(command));
             return false;
+          }
+          if (!existing.has_value()) {
+            if (std::find(deployment_candidate_receipts_.begin(),
+                          deployment_candidate_receipts_.end(),
+                          candidate_receipt) ==
+                deployment_candidate_receipts_.end()) {
+              TrySendResponse(
+                  client.get(),
+                  ApplyErrorResponse(
+                      command, "deployment_candidate_receipt_unknown",
+                      "Apply receipt was not issued by this Manager owner"));
+              return false;
+            }
+            const auto active = plan_source_.ReadCurrentPlan();
+            const auto &current_pointer = active.active_publication.request;
+            const auto selection = candidate_source_.ResolveExact(
+                {*command.deployment_artifact_id,
+                 *command.deployment_revision});
+            const auto candidate_bundle = verified_package_.get_verified(
+                selection.retained_bundle_id);
+            if (current_pointer.candidate_retained_bundle_id !=
+                    candidate_receipt.expected_current_retained_bundle_id ||
+                current_pointer.candidate_graph_revision !=
+                    candidate_receipt.expected_current_graph_revision ||
+                selection.scenario_catalog_revision !=
+                    candidate_receipt.scenario_catalog_revision ||
+                selection.retained_bundle_id !=
+                    candidate_receipt.candidate_retained_bundle_id ||
+                candidate_bundle == nullptr ||
+                candidate_bundle->value().cell_graph.graph_revision !=
+                    candidate_receipt.candidate_graph_revision) {
+              TrySendResponse(
+                  client.get(),
+                  ApplyErrorResponse(
+                      command, "deployment_candidate_receipt_stale",
+                      "Deployment candidate or current graph changed after preview"));
+              return false;
+            }
           }
           const auto candidate_retained_bundle_id =
               existing.has_value()
@@ -3715,6 +4094,7 @@ private:
   std::optional<core::CellAdmissionReadinessSnapshotDTO>
       last_submitted_readiness_;
   std::map<std::string, PoseObserverSession> pose_observer_sessions_;
+  std::vector<DeploymentCandidateReceipt> deployment_candidate_receipts_;
   std::map<PoseObservationKey, PoseObservationReplay> pose_observation_replays_;
   std::optional<std::vector<core::ProjectionNativeRuntimeBindingDTO>>
       last_reconciled_native_runtime_bindings_;

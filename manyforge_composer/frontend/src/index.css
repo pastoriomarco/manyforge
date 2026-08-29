@@ -631,31 +631,6 @@ button:disabled {
   margin-bottom: 0.55rem;
 }
 
-.operator-alarm-stack {
-  position: fixed;
-  right: 1.5rem;
-  top: 5.5rem;
-  z-index: 45;
-  display: grid;
-  width: min(34rem, calc(100vw - 3rem));
-  max-height: calc(100vh - 8rem);
-  gap: 0.65rem;
-  overflow-y: auto;
-}
-
-.operator-alarm-summary {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.5rem;
-  align-items: center;
-  padding: 0.6rem;
-  border: 1px solid #53483a;
-  border-radius: 0.55rem;
-  color: #d9c7ac;
-  background: rgb(19 16 12 / 94%);
-  font-size: 0.72rem;
-}
-
 .standing-alarm-chip {
   padding: 0.2rem 0.45rem;
   border: 1px solid #7d673e;
@@ -5562,6 +5537,10 @@ svg.viewer-camera-icon {
   width: min(32rem, calc(100vw - 2rem));
 }
 
+.overlay-status .runtime-observability-overlay {
+  width: min(54rem, calc(100vw - 2rem));
+}
+
 .overlay-panel-header {
   display: flex;
   min-height: 2.6rem;
@@ -6799,6 +6778,226 @@ svg.viewer-camera-icon {
 
 .deployment-component-section .cclc-panel {
   margin: 0;
+}
+
+.runtime-observability-surface {
+  display: flex;
+  min-height: 18rem;
+  max-height: calc(100vh - 7rem);
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.runtime-observability-tabs {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 0.2rem;
+  padding: 0 0 0.6rem;
+  border-bottom: 1px solid #29404d;
+}
+
+.runtime-observability-tabs button {
+  border-color: transparent;
+  background: transparent;
+}
+
+.runtime-observability-tabs button.active {
+  border-color: #4e8998;
+  color: #dff9ff;
+  background: #12313c;
+}
+
+.runtime-observability-section {
+  display: grid;
+  min-height: 0;
+  gap: 0.55rem;
+  overflow-y: auto;
+  padding: 0.65rem 0.1rem 0.1rem;
+}
+
+.runtime-observability-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.runtime-observability-section-header > div {
+  display: grid;
+  gap: 0.18rem;
+}
+
+.runtime-observability-section-header small {
+  color: #829ba7;
+}
+
+.runtime-observability-surface .operator-alarm-panel {
+  box-shadow: none;
+}
+
+.history-panel.history-panel-embedded {
+  min-height: 0;
+  max-height: none;
+  flex: 1 1 auto;
+  margin-top: 0.65rem;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.history-panel-embedded > header,
+.history-panel-embedded .history-filters {
+  padding-right: 0.1rem;
+  padding-left: 0.1rem;
+}
+
+.history-panel-embedded .history-events {
+  padding-right: 0.1rem;
+  padding-left: 0.1rem;
+}
+
+.history-event {
+  display: block;
+  width: 100%;
+  color: inherit;
+  text-align: left;
+}
+
+.history-event.selected {
+  border-color: #66b8ca;
+  background: #102a35;
+}
+
+.history-detail {
+  flex: 0 0 auto;
+  max-height: 14rem;
+  overflow-y: auto;
+  padding: 0.7rem;
+  border-top: 1px solid #29404d;
+  background: #091720;
+}
+
+.history-detail > header {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.7rem;
+}
+
+.history-detail-sections {
+  display: grid;
+  gap: 0.35rem;
+  margin-top: 0.55rem;
+}
+
+.history-detail-sections details {
+  padding: 0.4rem 0.5rem;
+  border: 1px solid #29404d;
+  border-radius: 0.4rem;
+}
+
+.history-detail-sections summary {
+  cursor: pointer;
+  text-transform: capitalize;
+}
+
+.history-detail-sections pre {
+  overflow-x: auto;
+  margin: 0.45rem 0 0;
+  color: #a9c0ca;
+  font-size: 0.68rem;
+}
+
+.runtime-attention-alert {
+  position: fixed;
+  z-index: 95;
+  top: 3.4rem;
+  right: 1rem;
+  display: flex;
+  width: min(24rem, calc(100vw - 2rem));
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.45rem;
+  border: 1px solid #9b6b32;
+  border-radius: 0.55rem;
+  color: #f1dcc0;
+  background: rgb(39 29 15 / 96%);
+  box-shadow: 0 0.8rem 2rem rgb(0 0 0 / 35%);
+}
+
+.runtime-attention-dot {
+  width: 0.55rem;
+  height: 0.55rem;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: #e0a84a;
+}
+
+.runtime-attention-open {
+  display: grid;
+  min-width: 0;
+  flex: 1 1 auto;
+  gap: 0.12rem;
+  padding: 0.15rem;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  text-align: left;
+}
+
+.runtime-attention-open strong,
+.runtime-attention-open small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runtime-attention-open small {
+  color: #bca887;
+}
+
+.global-attention-count {
+  display: inline-grid;
+  min-width: 1.1rem;
+  height: 1.1rem;
+  margin-left: 0.3rem;
+  place-items: center;
+  border-radius: 999px;
+  color: #fff1d7;
+  background: #7a511b;
+  font-size: 0.58rem;
+}
+
+.cclc-current-state,
+.cclc-routes {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.cclc-provider-card,
+.cclc-route-row,
+.cclc-transaction {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid #29404d;
+  border-radius: 0.45rem;
+  background: #0b1a23;
+}
+
+.cclc-provider-card {
+  align-items: flex-start;
+  flex-direction: column;
+}
+
+.cclc-provider-card span {
+  color: #829ba7;
+}
+
+.cclc-lifecycle-actions {
+  flex-wrap: wrap;
+  justify-content: flex-start;
 }
 
 .overlay-panel .robot-control-panel,

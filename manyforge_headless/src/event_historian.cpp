@@ -217,6 +217,107 @@ CanonicalValue HistorianPageValue(const HistorianPage &page) {
   });
 }
 
+CanonicalValue HistorianDetailValue(const HistorianStoredEvent &stored) {
+  ValidateSafeInteger(stored.sequence, "history detail sequence");
+  ValidateEvent(stored.event);
+  const auto section = [](const bool available, std::string reason,
+                          CanonicalValue value) {
+    return CanonicalValue(CanonicalValue::Object{
+        {"available", CanonicalValue(available)},
+        {"reason", available ? CanonicalValue(nullptr)
+                             : CanonicalValue(std::move(reason))},
+        {"value", available ? std::move(value) : CanonicalValue(nullptr)},
+    });
+  };
+  const auto &event = stored.event;
+  const auto *schema = event.payload.is_object()
+                           ? event.payload.find_object_member("schema_version")
+                           : nullptr;
+  const auto *schema_text =
+      schema == nullptr ? nullptr : std::get_if<std::string>(&schema->storage());
+  const bool operation = schema_text != nullptr &&
+                         *schema_text == "manyforge.operation_history_event.v1";
+  const bool incident = event.component == "manyforge.alarm" ||
+                        event.severity == "WARN" || event.severity == "ERROR" ||
+                        event.severity == "CRITICAL";
+
+  CanonicalValue::Object execution;
+  if (operation) {
+    for (const auto name : {"effect_pending", "native_sequence",
+                            "native_sequence_gap", "operation_id",
+                            "operation_revision", "payload_digest",
+                            "record_kind", "request_id",
+                            "source_owner_epoch"}) {
+      if (const auto *value = event.payload.find_object_member(name);
+          value != nullptr) {
+        execution.emplace_back(name, *value);
+      }
+    }
+  }
+
+  const CanonicalValue *blackboard = nullptr;
+  if (event.payload.is_object()) {
+    blackboard = event.payload.find_object_member("blackboard");
+    if (blackboard == nullptr) {
+      const auto *journal = event.payload.find_object_member("journal_payload");
+      if (journal != nullptr && journal->is_object()) {
+        blackboard = journal->find_object_member("blackboard");
+      }
+    }
+  }
+
+  const CanonicalValue *latency = nullptr;
+  std::string latency_unit;
+  if (event.payload.is_object()) {
+    for (const auto &[name, unit] :
+         {std::pair{"latency_ms", "ms"}, std::pair{"latency_ns", "ns"},
+          std::pair{"duration_ns", "ns"}}) {
+      if (const auto *value = event.payload.find_object_member(name);
+          value != nullptr) {
+        latency = value;
+        latency_unit = unit;
+        break;
+      }
+    }
+  }
+
+  return CanonicalValue(CanonicalValue::Object{
+      {"event", HistorianEventValue(event)},
+      {"schema_version",
+       CanonicalValue(std::string(kHistorianDetailSchemaVersion))},
+      {"sections",
+       CanonicalValue(CanonicalValue::Object{
+           {"blackboard",
+            section(blackboard != nullptr,
+                    "This event source did not publish a blackboard snapshot.",
+                    blackboard == nullptr ? CanonicalValue(nullptr)
+                                          : *blackboard)},
+           {"execution_digest",
+            section(operation,
+                    "This event is not an execution or operation record.",
+                    CanonicalValue(std::move(execution)))},
+           {"incident",
+            section(incident, "This event is not an incident record.",
+                    CanonicalValue(CanonicalValue::Object{
+                        {"component", CanonicalValue(event.component)},
+                        {"event_id", CanonicalValue(event.event_id)},
+                        {"event_type", CanonicalValue(event.event_type)},
+                        {"severity", CanonicalValue(event.severity)},
+                    }))},
+           {"latency",
+            section(latency != nullptr,
+                    "This event source did not publish latency evidence.",
+                    latency == nullptr
+                        ? CanonicalValue(nullptr)
+                        : CanonicalValue(CanonicalValue::Object{
+                              {"unit", CanonicalValue(latency_unit)},
+                              {"value", *latency},
+                          }))},
+       })},
+      {"sequence", Number(stored.sequence, "history detail sequence")},
+  });
+}
+
 CanonicalValue AsyncHistorianHealthValue(const AsyncHistorianHealth &health) {
   return CanonicalValue(CanonicalValue::Object{
       {"accepted_count", Number(health.accepted_count, "accepted_count")},

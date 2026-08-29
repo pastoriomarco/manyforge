@@ -123,6 +123,31 @@ class _Headless:
         self.manager_target = True
         return {"ok": True, "state": "succeeded"}
 
+    def manager_deployment_candidate_preview(
+        self, body: dict[str, Any]
+    ) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "candidate_receipt": {
+                "schema_version": "manyforge.manager_deployment_candidate_receipt.v1",
+                "deployment_artifact_id": body["deployment_artifact_id"],
+                "deployment_revision": body["deployment_revision"],
+                "scenario_catalog_revision": self.selection[
+                    "scenario_catalog_revision"
+                ],
+                "candidate_retained_bundle_id": self.selection[
+                    "retained_bundle_id"
+                ],
+                "candidate_graph_revision": self.selection["graph_revision"],
+                "expected_current": deepcopy(body["expected_current"]),
+                "expected_admission_generation": body[
+                    "expected_admission_generation"
+                ],
+                "manager_owner_epoch": body["request_owner_epoch"],
+                "receipt_digest": "sha256:" + "8" * 64,
+            },
+        }
+
     def program_apply(self, body: dict[str, Any]) -> dict[str, Any]:
         self.program_apply_bodies.append(deepcopy(body))
         self.applied = _applied(self.selection)

@@ -24,6 +24,7 @@ from .models import (
     FullStopIntentRequest,
     HistorianReconcileRequest,
     ManagerApplyRequest,
+    ManagerDeploymentCandidatePreviewRequest,
     AuthoringMutationContext,
     AuthoringMutationRecoveryRequest,
     AuthoringMutationSettlementRequest,
@@ -573,11 +574,7 @@ def create_app(
                 "cclc_confirmation_required",
                 "route-selection request requires explicit confirmation",
             )
-        return cclc_port().submit_route(
-            body.model_dump(
-                mode="json", exclude={"confirmed"}, exclude_none=True
-            )
-        )
+        return service.route_selection_submit(body)
 
     @app.get("/api/cclc/routes/transactions/{transaction_id}")
     def cclc_route_status(
@@ -835,6 +832,22 @@ def create_app(
         ],
     ) -> dict[str, Any]:
         return service.assistant_mode_context(mode_id)
+
+    @app.post("/api/manager/deployment-candidates/preview")
+    def manager_deployment_candidate_preview(
+        request: ManagerDeploymentCandidatePreviewRequest,
+    ) -> JSONResponse:
+        response = service.manager_deployment_candidate_preview(request)
+        if response.get("ok") is True:
+            return JSONResponse(status_code=200, content=response)
+        error = response.get("error")
+        code = error.get("code") if isinstance(error, dict) else None
+        if not isinstance(code, str) or not code:
+            raise HeadlessApiError(
+                "manager_command_response_invalid",
+                "Manager candidate rejection has no stable error code",
+            )
+        return JSONResponse(status_code=_error_status(code), content=response)
 
     @app.post("/api/manager/apply")
     def manager_apply(request: ManagerApplyRequest) -> JSONResponse:
@@ -1227,6 +1240,12 @@ def create_app(
     @app.get("/api/execution/history/health")
     def historian_health() -> dict[str, Any]:
         return service.core.historian_health()
+
+    @app.get("/api/execution/history/{sequence}")
+    def history_detail(
+        sequence: Annotated[int, Path(ge=1, le=_MAXIMUM_SAFE_INTEGER)],
+    ) -> dict[str, Any]:
+        return service.history_detail(sequence)
 
     @app.post("/api/execution/history/reconcile")
     def historian_reconcile(

@@ -949,6 +949,20 @@ CanonicalValue HeadlessApiCore::HistoryPage(const HistorianQuery &query) {
   return HistorianPageValue(store->Query(query));
 }
 
+CanonicalValue HeadlessApiCore::HistoryDetail(const std::uint64_t sequence) {
+  std::shared_ptr<SqliteEventHistoryStore> store;
+  {
+    std::lock_guard lock(mutex_);
+    Require(!shutdown_, "headless_api_closed", "headless API core is closed");
+    SynchronizeHistorianHealthLocked();
+    store = history_store_;
+  }
+  const auto stored = store->Read(sequence);
+  Require(stored.has_value(), "historian_event_not_found",
+          "the requested history event is not retained");
+  return HistorianDetailValue(*stored);
+}
+
 CanonicalValue HeadlessApiCore::HistorianHealth() {
   std::lock_guard lock(mutex_);
   Require(!shutdown_, "headless_api_closed", "headless API core is closed");

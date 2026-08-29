@@ -11,6 +11,7 @@ import {
   reconcileAssistantRequest,
   shouldReconcileAssistantRequest,
 } from './assistantRequestRecovery';
+import { useOperationalErrorMirror } from '../state/operationalErrors';
 
 const ORIENTATION_FIELDS = [
   'orientation_from',
@@ -159,10 +160,20 @@ export function AssistantOverlay({
   const [transcript, setTranscript] = useState<TranscriptItem[]>([]);
   const [active, setActive] = useState<AssistantProviderStatus | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [operationalError, setOperationalError] = useState<string | null>(null);
   const [retryIntent, setRetryIntent] = useState<RetryIntent | null>(null);
   const [orientationFields, setOrientationFields] = useState<string[]>([
     ...ORIENTATION_FIELDS,
   ]);
+  useOperationalErrorMirror({
+    source: 'composer.assistant',
+    title: 'Assistant request or response failed',
+    message: operationalError ?? modeError,
+    onDismiss: () => {
+      setOperationalError(null);
+      setModeError(null);
+    },
+  });
 
   const loadModes = useCallback(() => {
     modeDiscovery.current?.abort();
@@ -211,6 +222,7 @@ export function AssistantOverlay({
   const finish = useCallback(async (status: AssistantProviderStatus) => {
     setActive(status);
     if (status.state === 'completed' && status.response) {
+      setOperationalError(null);
       const response = status.response;
       setTranscript((items) => appendTranscript(items, {
         id: `${status.requestId}.assistant`,
@@ -229,6 +241,7 @@ export function AssistantOverlay({
       return;
     }
     const detail = assistantFailureText(status);
+    setOperationalError(detail);
     setTranscript((items) => appendTranscript(items, {
       id: `${status.requestId}.error`,
       role: 'assistant',
@@ -258,13 +271,13 @@ export function AssistantOverlay({
       await finish(result.status);
       return;
     }
-    setNotice(
-      result.kind === 'not_found'
+    const detail = result.kind === 'not_found'
         ? `No bridge record was found for ${requestId}; recheck before retrying.`
         : result.kind === 'unreachable'
           ? `The bridge status is unreachable: ${result.detail}`
-          : 'The assistant result is still unknown; recheck before retrying.',
-    );
+          : 'The assistant result is still unknown; recheck before retrying.';
+    setNotice(detail);
+    setOperationalError(detail);
   }, [finish]);
 
   const send = useCallback(async (intent?: RetryIntent) => {
@@ -285,6 +298,7 @@ export function AssistantOverlay({
     };
     setInput('');
     setNotice(null);
+    setOperationalError(null);
     setRetryIntent({ message, mode });
     setTranscript((items) => appendTranscript(
       items,
@@ -336,7 +350,9 @@ export function AssistantOverlay({
       recovery.current = null;
       await finish(status);
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : 'Cancellation failed.');
+      const detail = error instanceof Error ? error.message : 'Cancellation failed.';
+      setNotice(detail);
+      setOperationalError(detail);
     }
   };
 
@@ -348,6 +364,7 @@ export function AssistantOverlay({
     setTranscript([]);
     setActive(null);
     setNotice(null);
+    setOperationalError(null);
     setRetryIntent(null);
   };
 
