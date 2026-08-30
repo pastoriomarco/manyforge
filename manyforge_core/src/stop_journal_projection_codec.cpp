@@ -571,18 +571,15 @@ template <typename T, typename Decode>
           f[17], [](const V& v) { return did<SiteOverlayValueRef>(v, "site overlay value ref"); })};
 }
 
-[[nodiscard]] V substitution_contract_value(
-    const ControlledStopSubstitutionContractDTO& v) {
-  return arr({contract_ref_value(v.provider_contract_ref),
-              enc(v.requested_stop_mode), enc(v.executed_stop_mode)});
+[[nodiscard]] V substitution_contract_value(const ControlledStopSubstitutionContractDTO& v) {
+  return arr({contract_ref_value(v.provider_contract_ref), enc(v.requested_stop_mode),
+              enc(v.executed_stop_mode)});
 }
 
-[[nodiscard]] ControlledStopSubstitutionContractDTO substitution_contract_from(
-    const V& v) {
+[[nodiscard]] ControlledStopSubstitutionContractDTO substitution_contract_from(const V& v) {
   const auto& f = exact(v, 3U, "substitution contract");
   return ControlledStopSubstitutionContractDTO{
-      contract_ref_from(f[0]),
-      den<MotionControlledStopMode>(f[1], 2U, "requested Stop mode"),
+      contract_ref_from(f[0]), den<MotionControlledStopMode>(f[1], 2U, "requested Stop mode"),
       den<MotionControlledStopMode>(f[2], 2U, "executed Stop mode")};
 }
 
@@ -1183,13 +1180,16 @@ template <typename T, typename Decode>
                                     enc(row.expected_graph_revision),
                                     enc(row.expected_component_lifecycle_generation)});
                       })});
-        } else {
+        } else if constexpr (std::is_same_v<T, StopResourceTargetDTO>) {
           return arr({V(2.0), vec(targets, [](const auto& row) {
                         return arr(
                             {enc(row.resource_id), enc(row.expected_graph_revision),
                              V(static_cast<double>(row.expected_operation_resource_generation)),
                              enc(row.expected_stop_generation)});
                       })});
+        } else {
+          return arr({V(3.0), vec(targets,
+                                  [](const auto& row) { return arr({enc(row.program_run_id)}); })});
         }
       },
       v);
@@ -1230,6 +1230,14 @@ template <typename T, typename Decode>
                                          did<StopGeneration>(row[3], "Stop generation")};
           },
           "resource Stop targets");
+    case 3U:
+      return dvec<StopProgramRunTargetDTO>(
+          f[1],
+          [](const V& item) {
+            const auto& row = exact(item, 1U, "Program-run Stop target");
+            return StopProgramRunTargetDTO{did<ProgramRunId>(row[0], "Program run ID")};
+          },
+          "Program-run Stop targets");
     default:
       bad("Stop selector has an unknown kind");
   }
@@ -1243,7 +1251,7 @@ template <typename T, typename Decode>
 [[nodiscard]] StopRequestedSelectorSnapshotDTO requested_selector_from(const V& v) {
   const auto& f = exact(v, 4U, "requested selector snapshot");
   return StopRequestedSelectorSnapshotDTO{
-      den<StopRequestedSelectorKindDTO>(f[0], 4U, "requested selector kind"),
+      den<StopRequestedSelectorKindDTO>(f[0], 5U, "requested selector kind"),
       did<ContentDigest>(f[1], "requested selector digest"),
       dopt<StopSelectorDTO>(f[2], selector_from),
       dopt<std::string>(f[3], [](const V& item) { return str(item, "malformed ingress reason"); })};
@@ -1295,11 +1303,12 @@ template <typename T, typename Decode>
               enc(v.controller_goal_generation), enc(v.active_control_configuration_id),
               enc(v.active_control_configuration_generation), enc(v.controller_topology_id),
               enc(v.topology_revision), enc(v.control_route_id), enc(v.provider_runtime_epoch),
-              vec(v.resources, id_value), enc(v.containment_granularity)});
+              vec(v.resources, id_value), enc(v.containment_granularity),
+              enc(v.terminal_settlement)});
 }
 
 [[nodiscard]] StopParticipantScopeFactsDTO participant_facts_from(const V& v) {
-  const auto& f = exact(v, 18U, "participant scope facts");
+  const auto& f = exact(v, 19U, "participant scope facts");
   return StopParticipantScopeFactsDTO{
       did<OperationRevision>(f[0], "accepted operation revision"),
       did<ControllableComponentId>(f[1], "component ID"),
@@ -1320,7 +1329,9 @@ template <typename T, typename Decode>
       dvec<ResourceId>(
           f[16], [](const V& item) { return did<ResourceId>(item, "resource ID"); },
           "scope resources"),
-      den<ContainmentGranularity>(f[17], 2U, "containment granularity")};
+      den<ContainmentGranularity>(f[17], 2U, "containment granularity"),
+      den<StopParticipantScopeFactsDTO::TerminalSettlementState>(
+          f[18], 3U, "participant terminal settlement")};
 }
 
 [[nodiscard]] V scope_facts_value(const StopScopeEntryFactsDTO& v) {

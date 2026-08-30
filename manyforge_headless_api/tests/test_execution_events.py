@@ -15,6 +15,7 @@ from manyforge_headless_api.execution import (
 from manyforge_headless_api.models import (
     FullStopIntentRequest,
     OperationIntentRequest,
+    ProgramRunStopIntentRequest,
     StopFaultRecoveryIntentRequest,
     StopIntentRequest,
 )
@@ -231,6 +232,100 @@ def test_execution_client_requires_backend_residency_projection(
     with pytest.raises(HeadlessApiError) as non_boolean:
         client.read("operation.1")
     assert non_boolean.value.code == "execution_command_response_invalid"
+
+
+def test_execution_client_uses_internal_attribution_for_program_run_stop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    request = ProgramRunStopIntentRequest.model_validate(
+        {
+            "request_context": {
+                "request_id": "program-stop.1",
+                "request_owner_epoch": "execution.epoch.1",
+                "source_label": "manyforge_behavior",
+                "correlation_id": "program-run.1",
+            },
+            "program_run_id": "program-run.1",
+            "reason": "operator motion Stop",
+        }
+    )
+    client = ExecutionCommandClient(
+        tmp_path,
+        attribution_transport="internal",
+    )
+    captured: dict[str, Any] = {}
+
+    def exchange(command: dict[str, Any]) -> dict[str, Any]:
+        captured.update(command)
+        return {
+            "api_version": "manyforge.execution_command_response.v1",
+            "command": "stop_program_run",
+            "ok": True,
+            "accepted": {
+                "request_id": request.request_context.request_id,
+            },
+        }
+
+    monkeypatch.setattr(client, "_exchange_control", exchange)
+    assert client.stop_program_run(request)["ok"] is True
+    assert captured == {
+        "api_version": "manyforge.execution_command.v1",
+        "attribution": {
+            "transport": "internal",
+            "assurance": "unverified",
+            "principal_id": None,
+        },
+        "command": "stop_program_run",
+        "request": request.model_dump(mode="json", exclude_none=True),
+    }
+
+    public_client = ExecutionCommandClient(tmp_path)
+    with pytest.raises(HeadlessApiError) as unavailable_publicly:
+        public_client.stop_program_run(request)
+    assert unavailable_publicly.value.code == (
+        "execution_request_attribution_invalid"
+    )
+
+
+def test_execution_client_reads_one_exact_internal_stop_status(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    client = ExecutionCommandClient(tmp_path, attribution_transport="internal")
+    captured: dict[str, Any] = {}
+
+    def exchange(command: dict[str, Any]) -> dict[str, Any]:
+        captured.update(command)
+        return {
+            "api_version": "manyforge.execution_command_response.v1",
+            "command": "read_stop",
+            "ok": True,
+            "stop_status": {
+                "request_id": "program-stop.1",
+                "schema_version": "manyforge.execution_stop_status.v1",
+                "state": "succeeded",
+                "stop_generation": 4,
+                "stop_id": "stop.1",
+            },
+        }
+
+    monkeypatch.setattr(client, "_exchange", exchange)
+    assert client.stop_status("stop.1")["stop_status"]["state"] == "succeeded"
+    assert captured == {
+        "api_version": "manyforge.execution_command.v1",
+        "attribution": {
+            "transport": "internal",
+            "assurance": "unverified",
+            "principal_id": None,
+        },
+        "command": "read_stop",
+        "stop_id": "stop.1",
+    }
+
+    with pytest.raises(HeadlessApiError) as unavailable_publicly:
+        ExecutionCommandClient(tmp_path).stop_status("stop.1")
+    assert unavailable_publicly.value.code == (
+        "execution_request_attribution_invalid"
+    )
 
 
 def test_execution_client_projects_scoped_full_and_fault_recovery_commands(

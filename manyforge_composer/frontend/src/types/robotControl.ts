@@ -222,6 +222,7 @@ export interface ExecutionIdentity {
   ownerEpoch: string;
   cellId: string;
   activePublicationGeneration: number;
+  controlManagementMode: 'pending' | 'direct' | 'component_lifecycle';
   graphRevision: string;
   retainedBundleId: string;
   sceneRevision: SceneRevisionValue;

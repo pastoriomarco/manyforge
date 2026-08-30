@@ -105,7 +105,7 @@ std::optional<std::string_view> stop_intent_field_error(const StopIntentDTO& int
             return "stop_component_target_invalid";
           }
           return std::nullopt;
-        } else {
+        } else if constexpr (std::is_same_v<Targets, std::vector<StopResourceTargetDTO>>) {
           if (!canonical_targets(targets, [](const auto& target) { return target.resource_id; })) {
             return "stop_resource_targets_not_canonical";
           }
@@ -114,6 +114,17 @@ std::optional<std::string_view> stop_intent_field_error(const StopIntentDTO& int
                        !bounded_identity(target.expected_graph_revision);
               })) {
             return "stop_resource_target_invalid";
+          }
+          return std::nullopt;
+        } else {
+          if (!canonical_targets(targets,
+                                 [](const auto& target) { return target.program_run_id; })) {
+            return "stop_program_run_targets_not_canonical";
+          }
+          if (std::any_of(targets.begin(), targets.end(), [](const auto& target) {
+                return !bounded_identity(target.program_run_id);
+              })) {
+            return "stop_program_run_target_invalid";
           }
           return std::nullopt;
         }

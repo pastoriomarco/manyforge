@@ -305,8 +305,8 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   /// on a worker thread. Callers observe progress via get_status() and events.
   Result<uint64_t> execute(const ExecuteRequestDTO& request) override;
 
-  Result<void> adopt_certified_motion_stop(
-      std::uint64_t execution_id, const StopCertificateRefDTO& certificate) override;
+  Result<AddressedParticipantStopSettlementDTO> settle_addressed_participant_stop(
+      const AddressedParticipantStopSettlementRequestDTO& request) override;
 
   Result<std::uint64_t> PrepareMotion(ResolvedPreparedMotionExecutionRequestDTO request) override;
   Result<ResolvedPreparedMotionExecutionSnapshotDTO> ObservePreparedMotion(
@@ -853,6 +853,15 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
                                               ExecutionState committed, const char* reason,
                                               std::optional<ErrorDTO> error = std::nullopt);
 
+  /// Convert an exact pre-dispatch cancellation into the participant's local
+  /// Stopped terminal before a cancelled planner/validator can be mistaken for
+  /// an execution failure. Returns true only after terminal outcome ownership
+  /// has been completed by this cancellation or a stronger terminal authority.
+  bool finalize_prepared_motion_cancellation_if_requested(
+      const std::shared_ptr<PreparedMotionSession>& prepared_session,
+      const ExecuteRequestDTO& request, std::uint64_t exec_id, ActiveMotionExecution& motion_state,
+      const char* reason);
+
   bool finalize_competing_terminal_authority(const ExecuteRequestDTO& request,
                                              std::uint64_t exec_id,
                                              ActiveMotionExecution& motion_state,
@@ -862,7 +871,8 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
       std::stop_token st, const ExecuteRequestDTO& request,
       const CollisionWorldLeaseInventory& projection_inventory, std::uint64_t exec_id,
       std::optional<TrajectoryDTO> cached_trajectory, bool cache_revalidation_candidate,
-      ExecutionState worker_entry_state, ActiveMotionExecution& motion_state);
+      ExecutionState worker_entry_state, ActiveMotionExecution& motion_state,
+      const std::shared_ptr<PreparedMotionSession>& prepared_session);
 
   ExecuteWorkerValidationPhaseResult execute_worker_validate_replan_phase(
       std::stop_token st, const ExecuteRequestDTO& request, std::uint64_t exec_id,
@@ -871,7 +881,8 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
       bool& cache_revalidation_candidate,
       CollisionWorldLeaseInventory& scene_snapshot_lease_inventory,
       const std::optional<SceneSnapshotLease>& scene_snapshot_lease,
-      ActiveMotionExecution& motion_state);
+      ActiveMotionExecution& motion_state,
+      const std::shared_ptr<PreparedMotionSession>& prepared_session);
 
   ExecuteWorkerDispatchPhaseResult execute_worker_dispatch_phase(
       const ExecuteRequestDTO& request, std::uint64_t exec_id, const TrajectoryDTO& trajectory,
@@ -996,6 +1007,16 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   // generation with an older execution during deferred stop admission.
   mutable std::mutex operator_stop_identity_mutex_;
   StopOwnerIdentityTracker operator_stop_identity_;
+  // Process-local reference to the addressed owner's aggregate Stop. This is
+  // recovery evidence only; the participant never publishes a second
+  // certificate for the same physical containment.
+  std::optional<AddressedMotionStopRecoveryEvidenceDTO>
+      addressed_motion_stop_recovery_evidence_;  // lifecycle-guarded
+  // Retain the exact process-local handoff result so replaying the same
+  // addressed request returns the same fact rather than resampling recovery
+  // state from a later lifecycle generation.
+  std::optional<AddressedParticipantStopSettlementDTO>
+      addressed_participant_stop_settlement_;  // lifecycle-guarded
   std::atomic<std::uint64_t> motion_trip_stop_generation_{0};
   std::atomic<bool> operator_stop_command_active_{false};
   mutable std::mutex runtime_collision_state_projection_mutex_;

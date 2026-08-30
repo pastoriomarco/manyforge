@@ -174,7 +174,8 @@ inline constexpr char kDigestB[] =
           stage.controller_goal_id, stage.controller_goal_generation,
           stage.active_control_configuration_id, stage.active_control_configuration_generation,
           stage.controller_topology_id, stage.topology_revision, stage.control_route_id,
-          stage.provider_runtime_epoch, stage.resources, stage.containment_granularity},
+          stage.provider_runtime_epoch, stage.resources, stage.containment_granularity,
+          StopParticipantScopeFactsDTO::TerminalSettlementState::kSettled},
       StopScopeEntryDispositionDTO::kStoppable,
       StopScopeDispatchStateDTO::kDispatched,
       stage.stop_evidence_policy_id,
@@ -349,6 +350,30 @@ TEST(StopJournalProjectionCodecTest, RoundTripsEveryEmbeddedTerminalStageFieldCa
   ASSERT_EQ(projection.certificate.attempted_stage_results.size(), 1U);
   ASSERT_FALSE(projection.certificate.attempted_stage_results.front()
                    .result.request.participant_stop_plan.stage_commands.empty());
+  const auto encoded = EncodeStopJournalTerminalProjection(projection);
+  ASSERT_TRUE(encoded.ok()) << encoded.error().message;
+  const auto decoded = DecodeStopJournalTerminalProjection(encoded.value());
+  ASSERT_TRUE(decoded.ok()) << decoded.error().message;
+  EXPECT_EQ(decoded.value(), projection);
+  const auto reencoded = EncodeStopJournalTerminalProjection(decoded.value());
+  ASSERT_TRUE(reencoded.ok());
+  EXPECT_EQ(reencoded.value(), encoded.value());
+}
+
+TEST(StopJournalProjectionCodecTest, RoundTripsInternalProgramRunSelectorCanonically) {
+  auto projection = TerminalProjection();
+  const StopRequestedSelectorSnapshotDTO selector{
+      StopRequestedSelectorKindDTO::kInternalProgramRun, ContentDigest(kDigestB),
+      StopSelectorDTO{std::vector<StopProgramRunTargetDTO>{
+          StopProgramRunTargetDTO{ProgramRunId("program-run.1")}}},
+      std::nullopt};
+  projection.stop_status.accepted.resolution_reason =
+      StopScopeResolutionReasonDTO::kExactCurrentScope;
+  projection.certificate.requested_selector = selector;
+  projection.certificate.resolution_reason = StopScopeResolutionReasonDTO::kExactCurrentScope;
+  projection.certificate.capture_history.front().resolution_reason =
+      StopScopeResolutionReasonDTO::kExactCurrentScope;
+
   const auto encoded = EncodeStopJournalTerminalProjection(projection);
   ASSERT_TRUE(encoded.ok()) << encoded.error().message;
   const auto decoded = DecodeStopJournalTerminalProjection(encoded.value());

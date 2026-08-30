@@ -301,6 +301,15 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::ApplyOrRecover(
   std::lock_guard lock(operation_mutex_);
   Require(request.valid(), "named Apply request is invalid");
 
+  if (const auto existing = apply_journal_.ReadRequest(
+          request.request_context.request_owner_epoch,
+          request.request_context.request_id);
+      existing.has_value()) {
+    Require(MatchesRequest(existing->intent, request),
+            "public request identity is already bound to another Apply");
+    return Continue(existing->intent, true);
+  }
+
   const auto candidate =
       LoadBundle(retained_bundle_source_, request.candidate_retained_bundle_id,
                  "candidate");
@@ -313,15 +322,6 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::ApplyOrRecover(
           "identity and revision");
   Require(candidate_value.cell_graph.cell_id == apply_journal_.cell_id(),
           "selected candidate belongs to another cell");
-
-  if (const auto existing = apply_journal_.ReadRequest(
-          request.request_context.request_owner_epoch,
-          request.request_context.request_id);
-      existing.has_value()) {
-    Require(MatchesRequest(existing->intent, request),
-            "public request identity is already bound to another Apply");
-    return Continue(existing->intent, true);
-  }
 
   const auto inventory = apply_journal_.ReadStatusInventory();
   for (const auto &status : inventory) {
@@ -362,6 +362,19 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
   Require(intent.valid() && intent.cell_id == apply_journal_.cell_id(),
           "durable Apply intent is invalid or belongs to another cell");
   const auto durable_intent = apply_journal_.EnsureIntent(intent).record;
+
+  if (const auto terminal = apply_journal_.ReadTerminalOutcome(
+          intent.apply_id, intent.apply_generation);
+      terminal.has_value()) {
+    // The durable terminal proves that both the configuration fence and the
+    // direct admission claim were already settled. Exact replay is a read;
+    // it must not depend on a surviving Kernel process or issue another
+    // settlement call.
+    return {intent.apply_id, intent.apply_generation,
+            ManagerNamedApplyResultState::kSucceeded, request_replayed,
+            terminal->terminal_outcome};
+  }
+
   const auto predecessor =
       LoadBundle(retained_bundle_source_,
                  intent.expected_active_projection_revision.retained_bundle_id,
@@ -369,15 +382,6 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
   const auto candidate =
       LoadBundle(retained_bundle_source_, intent.candidate_retained_bundle_id,
                  "candidate");
-
-  if (const auto terminal = apply_journal_.ReadTerminalOutcome(
-          intent.apply_id, intent.apply_generation);
-      terminal.has_value()) {
-    ReleaseDirectAdmission(durable_intent, *terminal, cell_admission_);
-    return {intent.apply_id, intent.apply_generation,
-            ManagerNamedApplyResultState::kSucceeded, request_replayed,
-            terminal->terminal_outcome};
-  }
 
   // The Apply intent is durable before this exact Kernel claim is acquired or
   // validated. Every external phase below therefore has one restart-stable

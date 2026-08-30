@@ -17,7 +17,12 @@ function shortIdentity(value: string | null): string {
   return value.length > 26 ? `${value.slice(0, 22)}…` : value;
 }
 
-function stateLabel(state: string): string {
+function stateLabel(state: string, ordinaryMotionStopped = false): string {
+  if (
+    ordinaryMotionStopped
+    && (state === 'running' || state === 'intervention_required')
+  ) return 'Stopped';
+  if (state === 'stopped') return 'Execution stopped';
   return state.replaceAll('_', ' ');
 }
 
@@ -138,7 +143,11 @@ export function ProgramRuntimePanel({
             <span>Owner-issued run state</span>
             <strong>
               {state.run
-                ? stateLabel(state.run.state)
+                ? stateLabel(
+                  state.run.state,
+                  state.controls?.recoveryOffer?.recoveryClass
+                    === 'ordinary_operator_stop',
+                )
                 : state.runnerAvailable
                   ? 'idle'
                   : 'unavailable'}

@@ -800,40 +800,6 @@ class HeadlessHttpClient:
     def operation(self, operation_id: str) -> dict[str, Any]:
         return self.request("GET", self._operation_path(operation_id))
 
-    @staticmethod
-    def _operation_recovery_path(operation_id: str) -> str:
-        if not operation_id or len(operation_id.encode("utf-8")) > 256:
-            raise ValueError("operation_id must be bounded non-empty text")
-        if "/" in operation_id or ".." in operation_id:
-            raise ValueError("operation_id is invalid for an HTTP path")
-        return (
-            "/api/private/program-runner/execution/operations/"
-            f"{quote(operation_id, safe='')}/recovery"
-        )
-
-    def operation_recovery(self, operation_id: str) -> dict[str, Any]:
-        return self.request("GET", self._operation_recovery_path(operation_id))
-
-    def apply_operation_recovery(
-        self,
-        operation_id: str,
-        expected_operation_revision: int,
-        body: Mapping[str, Any],
-    ) -> dict[str, Any]:
-        if (
-            type(expected_operation_revision) is not int
-            or not 1
-            <= expected_operation_revision
-            <= 9_007_199_254_740_991
-        ):
-            raise ValueError("expected operation revision is invalid")
-        return self.request(
-            "POST",
-            self._operation_recovery_path(operation_id),
-            params=(("expected_operation_revision", expected_operation_revision),),
-            body=body,
-        )
-
     def _operation_control(
         self,
         operation_id: str,

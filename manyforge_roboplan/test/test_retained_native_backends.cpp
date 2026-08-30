@@ -39,8 +39,7 @@ using namespace std::chrono_literals;
 
 [[nodiscard]] RuntimeParticipantBinding
 make_binding(CoordinateKind kind, std::string target = "gripper.target",
-             bool component_local = false,
-             std::string route = "route.native") {
+             bool component_local = false, std::string route = "route.native") {
   const bool angular = kind == CoordinateKind::kAngular;
   const std::vector<std::string> joints =
       angular ? std::vector<std::string>{"joint_1", "joint_2"}
@@ -249,21 +248,24 @@ public:
     return {RetainedStateProjectionStatus::kApplied, std::nullopt};
   }
 
-  RetainedStateProjectionResult publish_state_bounded(
-      std::span<const double> positions_si,
-      std::span<const double> velocities_si, std::int64_t source_timestamp_ns,
-      std::int64_t received_timestamp_ns, std::int64_t,
-      std::stop_token cancellation) override {
+  RetainedStateProjectionResult
+  publish_state_bounded(std::span<const double> positions_si,
+                        std::span<const double> velocities_si,
+                        std::int64_t source_timestamp_ns,
+                        std::int64_t received_timestamp_ns, std::int64_t,
+                        std::stop_token cancellation) override {
     if (cancellation.stop_requested()) {
       return {RetainedStateProjectionStatus::kFailed,
-              ErrorDTO{"invalid_request", "fake publication cancelled",
+              ErrorDTO{"invalid_request",
+                       "fake publication cancelled",
                        {{"reason", "fake_publication_cancelled"}}}};
     }
     {
       std::lock_guard lock(mutex_);
       if (block_publish_) {
         return {RetainedStateProjectionStatus::kFailed,
-                ErrorDTO{"invalid_request", "fake publication blocked",
+                ErrorDTO{"invalid_request",
+                         "fake publication blocked",
                          {{"reason", "fake_publication_deadline"}}}};
       }
     }
@@ -322,14 +324,16 @@ public:
                         std::stop_token cancellation) const override {
     if (cancellation.stop_requested()) {
       return Result<ObservedStateSnapshotDTO>::Err(
-          ErrorDTO{"invalid_request", "fake read cancelled",
+          ErrorDTO{"invalid_request",
+                   "fake read cancelled",
                    {{"reason", "fake_read_cancelled"}}});
     }
     {
       std::lock_guard lock(mutex_);
       if (block_read_) {
         return Result<ObservedStateSnapshotDTO>::Err(
-            ErrorDTO{"invalid_request", "fake read blocked",
+            ErrorDTO{"invalid_request",
+                     "fake read blocked",
                      {{"reason", "fake_read_deadline"}}});
       }
     }
@@ -396,11 +400,12 @@ public:
     return read_cv_.wait_for(lock, 2s, [&] { return read_entered_; });
   }
 
-  [[nodiscard]] bool wait_for_read_count(
-      const int count, const std::chrono::milliseconds timeout) const {
+  [[nodiscard]] bool
+  wait_for_read_count(const int count,
+                      const std::chrono::milliseconds timeout) const {
     std::unique_lock lock(mutex_);
-    return read_cv_.wait_for(
-        lock, timeout, [&] { return read_entered_count_ >= count; });
+    return read_cv_.wait_for(lock, timeout,
+                             [&] { return read_entered_count_ >= count; });
   }
 
   void release_read() {
@@ -532,7 +537,8 @@ gripper_limits(const RuntimeParticipantBinding &binding) {
 }
 
 [[nodiscard]] ResolvedParticipantStopStageDTO
-gripper_stop_stage(const RuntimeParticipantBinding &binding) {
+gripper_stop_stage(const RuntimeParticipantBinding &binding,
+                   const bool controller_goal_cancel = false) {
   const auto &value = binding.value();
   const auto &path = *value.control_path;
   const StopBudgetPhaseId command_phase("gripper.hard.command");
@@ -556,41 +562,71 @@ gripper_stop_stage(const RuntimeParticipantBinding &binding) {
       std::nullopt,
       std::nullopt,
       std::nullopt};
+  auto evidence_target = target;
+  if (controller_goal_cancel) {
+    evidence_target.endpoint_role_id.reset();
+    evidence_target.logical_endpoint_symbol.reset();
+  }
   const ResolvedStopEvidenceSourceDTO evidence_source{
-      StopEvidenceSourceKind::kBindingStateAuthority,
-      target,
-      path.state_authority_id,
-      path.state_authority_class,
+      controller_goal_cancel ? StopEvidenceSourceKind::kControllerGoalStatus
+                             : StopEvidenceSourceKind::kBindingStateAuthority,
+      evidence_target,
+      controller_goal_cancel ? std::optional<StateAuthorityId>{}
+                             : std::optional(path.state_authority_id),
+      controller_goal_cancel ? std::optional<StateAuthorityClass>{}
+                             : std::optional(path.state_authority_class),
       std::nullopt};
   const ResolvedStopEscalationStageDTO resolved_stage{
       0U,
-      StopEscalationStageId("stage.gripper.hard"),
-      StopEscalationStageKind::kSoftwareHard,
+      StopEscalationStageId(controller_goal_cancel ? "stage.gripper.cancel"
+                                                   : "stage.gripper.hard"),
+      controller_goal_cancel ? StopEscalationStageKind::kNominal
+                             : StopEscalationStageKind::kSoftwareHard,
       ContainmentGranularity::kResource,
       StopContainmentCommandDTO{
-          command_phase, StopContainmentCommandKind::kRegistered,
+          command_phase,
+          controller_goal_cancel
+              ? StopContainmentCommandKind::kControllerGoalCancel
+              : StopContainmentCommandKind::kRegistered,
           std::nullopt,
-          RegisteredStopCommandKindId("manyforge.stop.software_hard")},
+          controller_goal_cancel
+              ? std::optional<RegisteredStopCommandKindId>{}
+              : std::optional<
+                    RegisteredStopCommandKindId>{RegisteredStopCommandKindId(
+                    "manyforge.stop.software_hard")}},
       std::nullopt,
       ResolvedStopCommandQualificationDTO{},
       target,
       ResolvedStopResourceContainmentScopeDTO{path.activation_set_id,
-                                               resources},
+                                              resources},
       StopEvidenceConjunction::kAllOf,
       {ResolvedStopEvidenceRequirementDTO{
           StopEvidenceRequirementDTO{
-              StopEvidenceItemId("gripper.rest"),
+              StopEvidenceItemId(controller_goal_cancel
+                                     ? "gripper.goal-terminal"
+                                     : "gripper.rest"),
               StopBudgetPhaseId("gripper.hard.rest"),
-              StopEvidenceRequirementKind::kMotionRest,
-              std::nullopt,
-              std::nullopt,
+              controller_goal_cancel
+                  ? StopEvidenceRequirementKind::kControllerGoalTerminal
+                  : StopEvidenceRequirementKind::kMotionRest,
+              std::nullopt, std::nullopt,
               StopEvidenceSourceRequirementDTO{
-                  StopEvidenceSourceKind::kBindingStateAuthority,
+                  controller_goal_cancel
+                      ? StopEvidenceSourceKind::kControllerGoalStatus
+                      : StopEvidenceSourceKind::kBindingStateAuthority,
                   100'000'000,
-                  EndpointRoleId("state.stop"),
-                  {path.state_authority_class}},
+                  controller_goal_cancel
+                      ? std::optional<EndpointRoleId>{}
+                      : std::optional(EndpointRoleId("state.stop")),
+                  controller_goal_cancel
+                      ? std::vector<StateAuthorityClass>{}
+                      : std::vector{path.state_authority_class}},
               StopEvidenceObservationDTO{
-                  StopEvidenceObservationKind::kPostCommandDwell, 0}},
+                  controller_goal_cancel
+                      ? StopEvidenceObservationKind::kPostCommandSample
+                      : StopEvidenceObservationKind::kPostCommandDwell,
+                  controller_goal_cancel ? std::optional<std::int64_t>{}
+                                         : std::optional<std::int64_t>{0}}},
           evidence_source}}};
   const OperationId operation_id("operation.gripper.stop");
   const OperationRevision operation_revision(1U);
@@ -636,7 +672,8 @@ gripper_stop_stage(const RuntimeParticipantBinding &binding) {
           ParticipantStopProfilePurposeDTO::kOrdinary,
           std::nullopt,
           StopDeadlineBudgetDTO{
-              1'000'000, 100'000,
+              1'000'000,
+              100'000,
               {{command_phase, 500'000},
                {StopBudgetPhaseId("gripper.hard.rest"), 900'000}}},
           {PreparedStopStageCommandDTO{resolved_stage, std::nullopt,
@@ -646,11 +683,53 @@ gripper_stop_stage(const RuntimeParticipantBinding &binding) {
 }
 
 TEST(RetainedGripperCommandBackendTest,
+     ExactPreparedGoalCancelIsANominalContainedStop) {
+  const auto binding = make_binding(CoordinateKind::kLinear);
+  const auto stage = gripper_stop_stage(binding, true);
+  const RemainingStopBudgetDTO budget{
+      stage.stop_id,
+      stage.stop_generation,
+      1'000'000,
+      {{StopBudgetPhaseId("gripper.hard.command"), 500'000},
+       {StopBudgetPhaseId("gripper.hard.rest"), 900'000}}};
+  auto channel = std::make_shared<FakeRetainedStateChannel>(
+      binding, std::vector<double>{0.0});
+  FakeClock clock;
+  ManualScheduler scheduler;
+  RetainedGripperCommandBackend backend(
+      binding, channel, gripper_limits(binding), clock, scheduler);
+  auto request = gripper_request(binding, 0.02, 1.0);
+  request.addressed_identity = AddressedGripperCommandIdentityDTO{
+      stage.operation_id, stage.operation_revision, stage.participant_id,
+      stage.controller_goal_id, stage.controller_goal_generation};
+  const auto command = backend.command_gripper(request);
+  ASSERT_TRUE(command.accepted);
+
+  const auto result =
+      backend.TranslateStopStage(stage, budget, std::stop_token{});
+
+  EXPECT_EQ(result.attempt_disposition,
+            StopStageAttemptDispositionDTO::kDispatched);
+  EXPECT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded);
+  EXPECT_FALSE(result.error.has_value());
+  ASSERT_EQ(result.evidence_items.size(), 1U);
+  EXPECT_EQ(result.evidence_items.front().required_class,
+            StopEvidenceRequirementKind::kControllerGoalTerminal);
+  EXPECT_EQ(result.evidence_items.front().state,
+            StopEvidenceItemStateDTO::kSatisfied);
+  EXPECT_TRUE(result.controller_acknowledgement_sequence.has_value());
+  EXPECT_EQ(backend.get_gripper_status("gripper.target").state,
+            GripperCommandState::kIdle);
+}
+
+TEST(RetainedGripperCommandBackendTest,
      StopStageReadAndPublishBlockersReturnBoundedTerminalFailures) {
   const auto binding = make_binding(CoordinateKind::kLinear);
   const auto stage = gripper_stop_stage(binding);
   const RemainingStopBudgetDTO budget{
-      stage.stop_id, stage.stop_generation, 1'000'000,
+      stage.stop_id,
+      stage.stop_generation,
+      1'000'000,
       {{StopBudgetPhaseId("gripper.hard.command"), 500'000},
        {StopBudgetPhaseId("gripper.hard.rest"), 900'000}}};
   FakeClock clock;
@@ -684,8 +763,7 @@ TEST(RetainedGripperCommandBackendTest,
               StopStageAttemptDispositionDTO::kDispatched);
     EXPECT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kFailed);
     ASSERT_TRUE(result.error.has_value());
-    EXPECT_EQ(result.error->details.at("reason"),
-              "fake_publication_deadline");
+    EXPECT_EQ(result.error->details.at("reason"), "fake_publication_deadline");
   }
 }
 
@@ -697,33 +775,33 @@ TEST(RetainedObservedStateChannelTest,
   RetainedObservedStateChannel channel(
       binding, nullptr,
       RetainedObservedStateChannelConfig{
-          ObservedStateSourceKind::kPredictedState, "native.predicted", 0,
-          1U},
+          ObservedStateSourceKind::kPredictedState, "native.predicted", 0, 1U},
       &clock);
   const std::array<double, 1U> initial_position{0.0};
   const std::array<double, 1U> initial_velocity{0.0};
-  ASSERT_TRUE(channel
-                  .publish_state(initial_position, initial_velocity, 100, 100)
-                  .applied());
+  ASSERT_TRUE(
+      channel.publish_state(initial_position, initial_velocity, 100, 100)
+          .applied());
 
   std::promise<void> route_locked;
   std::promise<void> release_route;
   auto route_locked_future = route_locked.get_future();
   auto release_route_future = release_route.get_future();
-  std::thread holder([&channel, route_locked = std::move(route_locked),
-                      release_route_future = std::move(release_route_future)]() mutable {
-    auto route_lock =
-        RetainedObservedStateChannelTestAccess::lock_route(channel);
-    route_locked.set_value();
-    release_route_future.wait();
-  });
+  std::thread holder(
+      [&channel, route_locked = std::move(route_locked),
+       release_route_future = std::move(release_route_future)]() mutable {
+        auto route_lock =
+            RetainedObservedStateChannelTestAccess::lock_route(channel);
+        route_locked.set_value();
+        release_route_future.wait();
+      });
   route_locked_future.wait();
   const auto started = std::chrono::steady_clock::now();
   const std::array<double, 1U> next_position{0.1};
   const auto published = channel.publish_state_bounded(
       next_position, initial_velocity, 100, 100, 1'000, std::stop_token{});
-  const auto read = channel.current_state_bounded(
-      100, 1'000, std::stop_token{});
+  const auto read =
+      channel.current_state_bounded(100, 1'000, std::stop_token{});
   const auto elapsed = std::chrono::steady_clock::now() - started;
   release_route.set_value();
   holder.join();
@@ -745,8 +823,7 @@ TEST(RetainedObservedStateChannelTest,
   RetainedObservedStateChannel channel(
       binding, nullptr,
       RetainedObservedStateChannelConfig{
-          ObservedStateSourceKind::kPredictedState, "native.predicted", 0,
-          1U});
+          ObservedStateSourceKind::kPredictedState, "native.predicted", 0, 1U});
   const std::array<double, 1U> position{0.0};
   const std::array<double, 1U> velocity{0.0};
   ASSERT_TRUE(channel.publish_state(position, velocity, 100, 100).applied());
@@ -758,7 +835,8 @@ TEST(RetainedObservedStateChannelTest,
 
   const auto current = channel.current_state(102);
   ASSERT_TRUE(current.ok()) << current.error().message;
-  EXPECT_EQ(current.value().control_route_id, ControlRouteId("route.successor"));
+  EXPECT_EQ(current.value().control_route_id,
+            ControlRouteId("route.successor"));
   EXPECT_DOUBLE_EQ(
       std::get<LinearPositionDTO>(current.value().positions.front()).value_m,
       0.0);
@@ -796,14 +874,12 @@ TEST(RetainedExecutionStateSinkTest,
                channel, true}});
 
   const auto result = sink.apply_group_joint_position(
-      "gripper", "finger_joint", 0.02,
-      ExecutionStateUpdateMode::kBlocking);
+      "gripper", "finger_joint", 0.02, ExecutionStateUpdateMode::kBlocking);
 
   EXPECT_TRUE(result.applied());
   EXPECT_EQ(channel->publish_calls(), 1);
   EXPECT_EQ(channel->project_applied_calls(), 1);
-  EXPECT_DOUBLE_EQ(*sink.group_joint_position("gripper", "finger_joint"),
-                   0.02);
+  EXPECT_DOUBLE_EQ(*sink.group_joint_position("gripper", "finger_joint"), 0.02);
 }
 
 TEST(RetainedExecutionStateSinkTest,
@@ -856,8 +932,7 @@ TEST(RetainedExecutionStateSinkTest,
                channel, false}});
 
   EXPECT_EQ(sink.apply_group_joint_positions(
-                    "other", {0.1, 0.2},
-                    ExecutionStateUpdateMode::kBlocking)
+                    "other", {0.1, 0.2}, ExecutionStateUpdateMode::kBlocking)
                 .status,
             ExecutionStateSinkStatus::kInvalidGroup);
   EXPECT_EQ(sink.apply_group_joint_positions(
@@ -866,8 +941,7 @@ TEST(RetainedExecutionStateSinkTest,
             ExecutionStateSinkStatus::kInvalidPositions);
   channel->make_projection_busy(1);
   EXPECT_EQ(sink.apply_group_joint_positions(
-                    "arm", {0.1, 0.2},
-                    ExecutionStateUpdateMode::kBestEffort)
+                    "arm", {0.1, 0.2}, ExecutionStateUpdateMode::kBestEffort)
                 .status,
             ExecutionStateSinkStatus::kBusy);
 }

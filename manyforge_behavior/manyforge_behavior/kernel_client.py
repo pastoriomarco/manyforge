@@ -7,14 +7,20 @@ from enum import Enum
 from typing import Any, Mapping, Protocol
 
 
-class HeadlessExecutionTransport(Protocol):
-    """The bounded operation-addressed HTTP calls used by Behavior."""
+class ExecutionTransport(Protocol):
+    """Bounded operation-addressed calls to the execution owner."""
 
-    def execution_identity(self) -> dict[str, Any]: ...
+    def identity(self) -> dict[str, Any]: ...
 
-    def execute(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
+    def targets(self) -> dict[str, Any]: ...
 
-    def operation(self, operation_id: str) -> dict[str, Any]: ...
+    def control_state(self) -> dict[str, Any]: ...
+
+    def observation(self) -> dict[str, Any]: ...
+
+    def submit(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
+
+    def read(self, operation_id: str) -> dict[str, Any]: ...
 
     def operation_recovery(self, operation_id: str) -> dict[str, Any]: ...
 
@@ -25,43 +31,33 @@ class HeadlessExecutionTransport(Protocol):
         body: Mapping[str, Any],
     ) -> dict[str, Any]: ...
 
-    def pause_operation(
+    def pause(
         self, operation_id: str, body: Mapping[str, Any]
     ) -> dict[str, Any]: ...
 
-    def resume_operation(
+    def resume(
         self, operation_id: str, body: Mapping[str, Any]
     ) -> dict[str, Any]: ...
 
-    def reset_operation(
+    def reset(
         self, operation_id: str, body: Mapping[str, Any]
     ) -> dict[str, Any]: ...
 
-    def acknowledge_completed_operation(
+    def acknowledge_completed(
         self, operation_id: str, body: Mapping[str, Any]
     ) -> dict[str, Any]: ...
 
-    def stop_operations(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
+    def stop(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
-    def set_operation_runtime_scale(
+    def stop_program_run(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
+
+    def stop_status(self, stop_id: str) -> dict[str, Any]: ...
+
+    def set_runtime_scale(
         self, operation_id: str, body: Mapping[str, Any]
     ) -> dict[str, Any]: ...
 
-    def operation_runtime_scale(self, operation_id: str) -> dict[str, Any]: ...
-
-
-class HeadlessPickPlacePlanningTransport(Protocol):
-    """Optional stateless planning extension over the base execution client."""
-
-    def plan_pick(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
-
-    def plan_place(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
-
-    def start_pick(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
-
-    def start_place(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
-
-    def pick_place_sequence(self, sequence_id: str) -> dict[str, Any]: ...
+    def get_runtime_scale(self, operation_id: str) -> dict[str, Any]: ...
 
 
 class KernelClientResponseError(RuntimeError):
@@ -141,18 +137,18 @@ class ActionSpan:
 class KernelClient:
     """Stateless adapter; the C++ host remains the only execution owner."""
 
-    def __init__(self, transport: HeadlessExecutionTransport) -> None:
+    def __init__(self, transport: ExecutionTransport) -> None:
         for method in (
-            "execution_identity",
-            "execute",
-            "operation",
-            "pause_operation",
-            "resume_operation",
-            "reset_operation",
-            "acknowledge_completed_operation",
-            "stop_operations",
-            "set_operation_runtime_scale",
-            "operation_runtime_scale",
+            "identity",
+            "submit",
+            "read",
+            "pause",
+            "resume",
+            "reset",
+            "acknowledge_completed",
+            "stop",
+            "set_runtime_scale",
+            "get_runtime_scale",
         ):
             if not callable(getattr(transport, method, None)):
                 raise TypeError(f"execution transport has no callable {method}")
@@ -162,18 +158,31 @@ class KernelClient:
     def _successful(value: object, *, label: str) -> dict[str, Any]:
         if not isinstance(value, dict) or value.get("ok") is not True:
             raise KernelClientResponseError(
-                f"headless execution {label} did not return a successful envelope"
+                f"execution owner {label} did not return a successful envelope"
             )
         return value
 
     def identity(self) -> dict[str, Any]:
-        return self._successful(
-            self._transport.execution_identity(), label="identity"
-        )
+        return self._successful(self._transport.identity(), label="identity")
+
+    def targets(self) -> dict[str, Any]:
+        return self._projection("targets")
+
+    def control_state(self) -> dict[str, Any]:
+        return self._projection("control_state")
+
+    def observation(self) -> dict[str, Any]:
+        return self._projection("observation")
+
+    def _projection(self, method_name: str) -> dict[str, Any]:
+        method = getattr(self._transport, method_name, None)
+        if not callable(method):
+            raise TypeError(f"execution transport has no callable {method_name}")
+        return self._successful(method(), label=method_name.replace("_", " "))
 
     def execute(self, intent: Mapping[str, Any]) -> dict[str, Any]:
         return self._successful(
-            self._transport.execute(intent), label="submission"
+            self._transport.submit(intent), label="submission"
         )
 
     def plan_pick(self, intent: Mapping[str, Any]) -> dict[str, Any]:
@@ -205,10 +214,10 @@ class KernelClient:
         return self._successful(method(intent), label="place sequence start")
 
     def pick_place_sequence(self, sequence_id: str) -> dict[str, Any]:
-        method = getattr(self._transport, "pick_place_sequence", None)
+        method = getattr(self._transport, "read_pick_place_sequence", None)
         if not callable(method):
             raise TypeError(
-                "execution transport has no callable pick_place_sequence"
+                "execution transport has no callable read_pick_place_sequence"
             )
         return self._successful(
             method(sequence_id), label="pick/place sequence observation"
@@ -216,7 +225,7 @@ class KernelClient:
 
     def operation(self, operation_id: str) -> dict[str, Any]:
         try:
-            response = self._transport.operation(operation_id)
+            response = self._transport.read(operation_id)
         except Exception as exc:
             # Headless transports expose stable machine-readable error codes.
             # Map only owner availability on this exact read; every other
@@ -287,7 +296,7 @@ class KernelClient:
         self, operation_id: str, request: Mapping[str, Any]
     ) -> dict[str, Any]:
         return self._successful(
-            self._transport.pause_operation(operation_id, request),
+            self._transport.pause(operation_id, request),
             label="Pause",
         )
 
@@ -295,7 +304,7 @@ class KernelClient:
         self, operation_id: str, request: Mapping[str, Any]
     ) -> dict[str, Any]:
         return self._successful(
-            self._transport.resume_operation(operation_id, request),
+            self._transport.resume(operation_id, request),
             label="Resume",
         )
 
@@ -303,7 +312,7 @@ class KernelClient:
         self, operation_id: str, request: Mapping[str, Any]
     ) -> dict[str, Any]:
         return self._successful(
-            self._transport.reset_operation(operation_id, request),
+            self._transport.reset(operation_id, request),
             label="Reset",
         )
 
@@ -311,29 +320,57 @@ class KernelClient:
         self, operation_id: str, request: Mapping[str, Any]
     ) -> dict[str, Any]:
         return self._successful(
-            self._transport.acknowledge_completed_operation(
-                operation_id, request
-            ),
+            self._transport.acknowledge_completed(operation_id, request),
             label="completion acknowledgement",
         )
 
     def stop(self, request: Mapping[str, Any]) -> dict[str, Any]:
         return self._successful(
-            self._transport.stop_operations(request),
+            self._transport.stop(request),
             label="Stop",
         )
+
+    def stop_program_run(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        return self._successful(
+            self._transport.stop_program_run(request),
+            label="Program-run Stop",
+        )
+
+    def stop_status(self, stop_id: str) -> dict[str, Any]:
+        method = getattr(self._transport, "stop_status", None)
+        if not callable(method):
+            raise TypeError("execution transport has no callable stop_status")
+        response = self._successful(method(stop_id), label="Stop status")
+        status = response.get("stop_status")
+        if (
+            not isinstance(status, dict)
+            or status.get("stop_id") != stop_id
+            or status.get("state")
+            not in {
+                "accepted",
+                "stopping",
+                "certifying",
+                "succeeded",
+                "partial",
+                "failed",
+            }
+        ):
+            raise KernelClientResponseError(
+                "execution Stop status changed its aggregate identity"
+            )
+        return response
 
     def set_runtime_scale(
         self, operation_id: str, request: Mapping[str, Any]
     ) -> dict[str, Any]:
         return self._successful(
-            self._transport.set_operation_runtime_scale(operation_id, request),
+            self._transport.set_runtime_scale(operation_id, request),
             label="runtime-scale update",
         )
 
     def runtime_scale(self, operation_id: str) -> dict[str, Any]:
         return self._successful(
-            self._transport.operation_runtime_scale(operation_id),
+            self._transport.get_runtime_scale(operation_id),
             label="runtime-scale observation",
         )
 
@@ -351,7 +388,7 @@ class MockKernelClient:
 __all__ = [
     "ActionSpan",
     "ExecutionState",
-    "HeadlessExecutionTransport",
+    "ExecutionTransport",
     "KernelClient",
     "KernelOperationObservationUnavailableError",
     "KernelClientResponseError",

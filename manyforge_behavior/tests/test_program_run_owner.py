@@ -303,6 +303,7 @@ class _ScopePort:
     def request_stop(
         self,
         program_run_id: str,
+        _stop_request_id: str,
         _reason: str | None,
     ) -> ProgramRunScopeSnapshot:
         self.stop_requests += 1

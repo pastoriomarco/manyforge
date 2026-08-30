@@ -20,6 +20,7 @@ from .models import (
     Pose3Request,
     PickSequencePlanningRequest,
     PlaceSequencePlanningRequest,
+    ProgramRunStopIntentRequest,
     RuntimeScaleRequest,
     StopFaultRecoveryIntentRequest,
     StopIntentRequest,
@@ -167,15 +168,6 @@ class ExecutionPort(Protocol):
 
     def read(self, operation_id: str) -> dict[str, Any]: ...
 
-    def operation_recovery(self, operation_id: str) -> dict[str, Any]: ...
-
-    def apply_operation_recovery(
-        self,
-        operation_id: str,
-        expected_operation_revision: int,
-        request: OperationRecoveryActionRequest,
-    ) -> dict[str, Any]: ...
-
     def plan_pick(
         self,
         request: PickSequencePlanningRequest,
@@ -295,9 +287,17 @@ def _canonical_json(value: dict[str, Any]) -> bytes:
 class ExecutionCommandClient:
     """Forward intents and observations without caching execution truth."""
 
-    def __init__(self, run_root: Path, *, timeout_seconds: float = 10.0) -> None:
+    def __init__(
+        self,
+        run_root: Path,
+        *,
+        timeout_seconds: float = 10.0,
+        attribution_transport: str = "http",
+    ) -> None:
         if timeout_seconds <= 0 or timeout_seconds > 30:
             raise ValueError("execution timeout must be in (0, 30] seconds")
+        if attribution_transport not in {"http", "internal"}:
+            raise ValueError("execution attribution transport is unsupported")
         try:
             self._run_root = PinnedRunRoot(run_root)
         except PrivateTransportCapabilityError as error:
@@ -310,6 +310,7 @@ class ExecutionCommandClient:
             self._run_root.path / EXECUTION_CONTROL_SOCKET_FILE
         )
         self._timeout_seconds = timeout_seconds
+        self._attribution_transport = attribution_transport
 
     def _exchange_on(
         self, command: dict[str, Any], socket_path: Path
@@ -394,14 +395,106 @@ class ExecutionCommandClient:
             )
         return response
 
+    def stop_program_run(
+        self,
+        request: ProgramRunStopIntentRequest,
+    ) -> dict[str, Any]:
+        """Submit the private Program-owner selector on the Stop lane."""
+
+        if self._attribution_transport != "internal":
+            raise HeadlessApiError(
+                "execution_request_attribution_invalid",
+                "Program-run Stop is available only to the internal owner transport",
+            )
+        response = self._exchange_control(
+            {
+                "api_version": EXECUTION_COMMAND_VERSION,
+                "attribution": self._request_attribution(None),
+                "command": "stop_program_run",
+                "request": request.model_dump(mode="json", exclude_none=True),
+            }
+        )
+        accepted = response.get("accepted")
+        if response.get("ok") is True and (
+            response.get("command") != "stop_program_run"
+            or not isinstance(accepted, dict)
+            or accepted.get("request_id")
+            != request.request_context.request_id
+        ):
+            raise HeadlessApiError(
+                "execution_command_response_identity_mismatch",
+                "Program-run Stop acceptance does not match its request",
+            )
+        return response
+
+    def stop_status(self, stop_id: str) -> dict[str, Any]:
+        """Read one exact aggregate Stop result for the internal Program owner."""
+
+        if self._attribution_transport != "internal":
+            raise HeadlessApiError(
+                "execution_request_attribution_invalid",
+                "Stop-status read is available only to the internal owner transport",
+            )
+        if (
+            not stop_id
+            or unicodedata.normalize("NFC", stop_id) != stop_id
+            or len(stop_id.encode("utf-8")) > 2_048
+        ):
+            raise ValueError("Stop identity must be bounded non-empty NFC text")
+        response = self._exchange(
+            {
+                "api_version": EXECUTION_COMMAND_VERSION,
+                "attribution": self._request_attribution(None),
+                "command": "read_stop",
+                "stop_id": stop_id,
+            }
+        )
+        if response.get("ok") is not True:
+            return response
+        status = response.get("stop_status")
+        if (
+            response.get("command") != "read_stop"
+            or not isinstance(status, dict)
+            or set(status)
+            != {
+                "request_id",
+                "schema_version",
+                "state",
+                "stop_generation",
+                "stop_id",
+            }
+            or status.get("schema_version")
+            != "manyforge.execution_stop_status.v1"
+            or status.get("stop_id") != stop_id
+            or not isinstance(status.get("request_id"), str)
+            or not status["request_id"]
+            or status.get("state")
+            not in {
+                "accepted",
+                "stopping",
+                "certifying",
+                "succeeded",
+                "partial",
+                "failed",
+            }
+            or type(status.get("stop_generation")) is not int
+            or not 1 <= status["stop_generation"] <= MAXIMUM_SAFE_INTEGER
+        ):
+            raise HeadlessApiError(
+                "execution_command_response_invalid",
+                "native aggregate Stop status has an invalid envelope",
+            )
+        return response
+
     def _exchange(self, command: dict[str, Any]) -> dict[str, Any]:
         return self._exchange_on(command, self._socket_path)
 
     def _exchange_control(self, command: dict[str, Any]) -> dict[str, Any]:
         return self._exchange_on(command, self._control_socket_path)
 
-    @staticmethod
-    def _http_attribution(trusted_principal_id: str | None) -> dict[str, Any]:
+    def _request_attribution(
+        self, trusted_principal_id: str | None
+    ) -> dict[str, Any]:
         if trusted_principal_id is not None and (
             not trusted_principal_id
             or unicodedata.normalize("NFC", trusted_principal_id)
@@ -412,6 +505,17 @@ class ExecutionCommandClient:
                 "execution_request_attribution_invalid",
                 "trusted execution principal must be bounded non-empty NFC text",
             )
+        if self._attribution_transport == "internal":
+            if trusted_principal_id is not None:
+                raise HeadlessApiError(
+                    "execution_request_attribution_invalid",
+                    "internal execution requests cannot claim an external principal",
+                )
+            return {
+                "transport": "internal",
+                "assurance": "unverified",
+                "principal_id": None,
+            }
         return {
             "transport": "http",
             "assurance": (
@@ -469,6 +573,14 @@ class ExecutionCommandClient:
             "execution_command_response_invalid",
             "native execution owner returned an invalid error response",
         )
+
+    @classmethod
+    def require_success(cls, response: dict[str, Any]) -> dict[str, Any]:
+        """Raise the existing stable owner error for a direct typed caller."""
+
+        if response.get("ok") is not True:
+            cls._raise_error_response(response)
+        return response
 
     def events(
         self,
@@ -566,7 +678,7 @@ class ExecutionCommandClient:
         response = self._exchange(
             {
                 "api_version": EXECUTION_COMMAND_VERSION,
-                "attribution": self._http_attribution(trusted_principal_id),
+                "attribution": self._request_attribution(trusted_principal_id),
                 "command": "submit",
                 "operation": request.model_dump(mode="json"),
             }
@@ -593,7 +705,7 @@ class ExecutionCommandClient:
         response = self._exchange(
             {
                 "api_version": EXECUTION_COMMAND_VERSION,
-                "attribution": self._http_attribution(trusted_principal_id),
+                "attribution": self._request_attribution(trusted_principal_id),
                 "command": "preview_motion",
                 "operation": operation,
             }
@@ -719,7 +831,7 @@ class ExecutionCommandClient:
         response = self._exchange(
             {
                 "api_version": EXECUTION_COMMAND_VERSION,
-                "attribution": self._http_attribution(trusted_principal_id),
+                "attribution": self._request_attribution(trusted_principal_id),
                 "command": "preview_capability_command",
                 "operation": operation,
             }
@@ -963,7 +1075,7 @@ class ExecutionCommandClient:
         response = self._exchange(
             {
                 "api_version": EXECUTION_COMMAND_VERSION,
-                "attribution": self._http_attribution(trusted_principal_id),
+                "attribution": self._request_attribution(trusted_principal_id),
                 "command": command,
                 "intent": request.model_dump(mode="json"),
             }
@@ -1162,7 +1274,7 @@ class ExecutionCommandClient:
         response = self._exchange(
             {
                 "api_version": EXECUTION_COMMAND_VERSION,
-                "attribution": self._http_attribution(trusted_principal_id),
+                "attribution": self._request_attribution(trusted_principal_id),
                 "command": command,
                 "request": request.model_dump(mode="json"),
             }
@@ -1235,7 +1347,7 @@ class ExecutionCommandClient:
         response = self._exchange_control(
             {
                 "api_version": EXECUTION_COMMAND_VERSION,
-                "attribution": self._http_attribution(trusted_principal_id),
+                "attribution": self._request_attribution(trusted_principal_id),
                 "command": "stop",
                 "request": request.model_dump(mode="json", exclude_none=True),
             }
@@ -1262,7 +1374,7 @@ class ExecutionCommandClient:
         response = self._exchange_control(
             {
                 "api_version": EXECUTION_COMMAND_VERSION,
-                "attribution": self._http_attribution(trusted_principal_id),
+                "attribution": self._request_attribution(trusted_principal_id),
                 "command": "full_stop",
                 "request": request.model_dump(mode="json"),
             }
@@ -1292,7 +1404,7 @@ class ExecutionCommandClient:
         response = self._exchange_control(
             {
                 "api_version": EXECUTION_COMMAND_VERSION,
-                "attribution": self._http_attribution(trusted_principal_id),
+                "attribution": self._request_attribution(trusted_principal_id),
                 "command": "malformed_stop",
                 "reason": reason,
                 "recognized_route": recognized_route,
@@ -1520,7 +1632,7 @@ class ExecutionCommandClient:
         response = self._exchange(
             {
                 "api_version": EXECUTION_COMMAND_VERSION,
-                "attribution": self._http_attribution(trusted_principal_id),
+                "attribution": self._request_attribution(trusted_principal_id),
                 "command": "set_runtime_scale",
                 "request": request.model_dump(mode="json"),
             }

@@ -393,6 +393,7 @@ class ProgramRunScopePort(Protocol):
     def request_stop(
         self,
         program_run_id: str,
+        stop_request_id: str,
         reason: str | None,
     ) -> ProgramRunScopeSnapshot: ...
 

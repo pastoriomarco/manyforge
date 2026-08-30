@@ -2177,6 +2177,43 @@ class StopIntentRequest(StrictRequest):
         return self
 
 
+class ProgramRunStopIntentRequest(StrictRequest):
+    """Private exact Program-owner selector for one addressed Kernel."""
+
+    request_context: CallerAttributionRequest
+    program_run_id: str
+    reason: str | None = None
+
+    @field_validator("program_run_id")
+    @classmethod
+    def validate_program_run_id(cls, value: str) -> str:
+        return _bounded_nfc(
+            value,
+            label="program_run_id",
+            maximum_bytes=MAX_STOP_IDENTITY_BYTES,
+        )
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def normalize_reason(cls, value: object) -> str | None:
+        return StopIntentRequest.normalize_reason(value)
+
+    @model_validator(mode="after")
+    def validate_context(self) -> ProgramRunStopIntentRequest:
+        context = self.request_context
+        for label, value, maximum in (
+            ("request_id", context.request_id, MAX_STOP_IDENTITY_BYTES),
+            (
+                "request_owner_epoch",
+                context.request_owner_epoch,
+                MAX_STOP_IDENTITY_BYTES,
+            ),
+            ("source_label", context.source_label, MAX_IDENTITY_BYTES),
+        ):
+            _bounded_nfc(value, label=label, maximum_bytes=maximum)
+        return self
+
+
 class FullStopIntentRequest(StrictRequest):
     request_context: CallerAttributionRequest
     expected_stop_generation: Annotated[

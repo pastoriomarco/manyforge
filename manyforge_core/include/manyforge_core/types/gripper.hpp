@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <manyforge_core/types/error_code.hpp>
+#include <manyforge_core/types/strong_id.hpp>
 #include <optional>
 #include <string>
 #include <vector>
@@ -59,6 +60,20 @@ enum class GripperInvalidationReason {
   kShutdown,
 };
 
+/// Exact addressed-operation identity stamped only when a prepared command is
+/// released. Direct/manual gripper commands leave this absent. A Stop adapter
+/// uses it to reject a stale goal before cancelling a newer command.
+struct AddressedGripperCommandIdentityDTO final {
+  OperationId operation_id;
+  OperationRevision operation_revision;
+  OperationParticipantId participant_id;
+  ControllerGoalId controller_goal_id;
+  ControllerGoalGeneration controller_goal_generation;
+
+  friend bool operator==(const AddressedGripperCommandIdentityDTO&,
+                         const AddressedGripperCommandIdentityDTO&) = default;
+};
+
 struct GripperCommandRequestDTO {
   std::string gripper_id;
   std::string group_id;
@@ -78,6 +93,7 @@ struct GripperCommandRequestDTO {
   /// Owner-resolved terminal deadline for this private command. The native
   /// fixed-duration mechanism rejects a duration that cannot fit this bound.
   double completion_timeout_s = 1.0;
+  std::optional<AddressedGripperCommandIdentityDTO> addressed_identity = std::nullopt;
 };
 
 struct GripperCommandResultDTO {

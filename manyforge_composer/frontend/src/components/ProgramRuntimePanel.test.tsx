@@ -2,8 +2,50 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
-import type { ProgramRunStateName } from '../types/api';
+import type { CycleRecoveryOffer, ProgramRunStateName } from '../types/api';
 import { ProgramRuntimePanel } from './ProgramRuntimePanel';
+
+function ordinaryMotionStopOffer(): CycleRecoveryOffer {
+  return {
+    schemaVersion: 'manyforge.cycle_recovery_offer.v2',
+    offerId: `sha256:${'e'.repeat(64)}`,
+    offerRevision: 1,
+    generatedAtNs: 1,
+    validUntilNs: null,
+    kernelAssessmentRevision: 1,
+    controlCommandEpoch: 1,
+    operationId: 'operation.1',
+    operationRevision: 1,
+    programRunId: 'program-run.1',
+    programBindingId: `sha256:${'c'.repeat(64)}`,
+    nodeInstanceId: 'root',
+    nodeAttemptId: 'attempt.1',
+    participants: [],
+    graphRevision: `sha256:${'b'.repeat(64)}`,
+    retainedBundleId: `sha256:${'a'.repeat(64)}`,
+    cycleGeneration: 1,
+    programGeneration: 1,
+    deploymentGeneration: 1,
+    sceneAdmissionEpoch: 1,
+    poseSourceApplyGeneration: 1,
+    latchId: null,
+    stopId: 'stop.1',
+    stopGeneration: 1,
+    stopCertificateId: 'stop-certificate.1',
+    stopCertificateRevision: 1,
+    status: 'offered',
+    recoveryClass: 'ordinary_operator_stop',
+    actions: [],
+    manualResult: {
+      enabled: false,
+      disabledReasonCode: 'manual_result_not_available',
+    },
+    primaryAction: null,
+    reasonCode: 'ordinary_operator_stop',
+    evidenceRefs: [],
+    policy: {},
+  };
+}
 
 function controller(
   state: ProgramRunStateName = 'running',
@@ -192,5 +234,45 @@ describe('Program runtime projection', () => {
       <ProgramRuntimePanel enabled controller={unknownCount} />,
     );
     expect(unknownMarkup).toContain('<strong>unknown</strong>');
+  });
+
+  it('distinguishes ordinary Motion Stop from whole-Program Stop', () => {
+    const motionStopped = controller('running');
+    motionStopped.state.controls = {
+      recoveryOffer: ordinaryMotionStopOffer(),
+    } as unknown as NonNullable<ProgramRuntimeController['state']['controls']>;
+    const motionMarkup = renderToStaticMarkup(
+      <ProgramRuntimePanel enabled controller={motionStopped} />,
+    );
+    expect(motionMarkup).toContain('<strong>Stopped</strong>');
+
+    const settledMotionStop = controller('intervention_required');
+    settledMotionStop.state.controls = {
+      recoveryOffer: ordinaryMotionStopOffer(),
+    } as unknown as NonNullable<ProgramRuntimeController['state']['controls']>;
+    const settledMotionMarkup = renderToStaticMarkup(
+      <ProgramRuntimePanel enabled controller={settledMotionStop} />,
+    );
+    expect(settledMotionMarkup).toContain('<strong>Stopped</strong>');
+
+    const executionStopped = renderToStaticMarkup(
+      <ProgramRuntimePanel
+        enabled
+        controller={controller('stopped', 'terminal_awaiting_reset')}
+      />,
+    );
+    expect(executionStopped).toContain('<strong>Execution stopped</strong>');
+
+    const executionStoppedWithStaleOffer = controller(
+      'stopped',
+      'terminal_awaiting_reset',
+    );
+    executionStoppedWithStaleOffer.state.controls = {
+      recoveryOffer: ordinaryMotionStopOffer(),
+    } as unknown as NonNullable<ProgramRuntimeController['state']['controls']>;
+    const staleOfferMarkup = renderToStaticMarkup(
+      <ProgramRuntimePanel enabled controller={executionStoppedWithStaleOffer} />,
+    );
+    expect(staleOfferMarkup).toContain('<strong>Execution stopped</strong>');
   });
 });

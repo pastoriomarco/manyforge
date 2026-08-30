@@ -114,14 +114,14 @@ namespace {
 constexpr std::string_view kZeroDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 constexpr std::string_view kExpectedNodeEnvironmentDigest =
-    "sha256:4b6ace22aaa8864d292935f39c125e70eff747d1ec9c96b817b35e99fc07b9e7";
+    "sha256:5569e6f467d79c3f208d4be5177d5e8b00cf741c4c6f70d710514295a2152c10";
 constexpr std::string_view kExpectedCompilerContractDigest =
     "sha256:c61e9319f89ff1696f7a656d9c4f2a059f69c191cfcc9014d1a29b15b12a10f6";
 #ifdef MANYFORGE_VERIFY_CANONICAL_EMPTY_RELEASE_GOLDEN
 constexpr std::string_view kExpectedReleaseCompilerBuildDigest =
-    "sha256:9f1be1a330cad013dd2493ebedc984a0e50eb007d31d59eeadc0c03d39cf8578";
+    "sha256:f0389b80e6abd1acb91de7fae7edd7def166528ae13a09ef1a2309e4d70a44e4";
 constexpr std::string_view kExpectedReleaseCanonicalEmptyBundleId =
-    "sha256:298a0b9008a56beeb6b8a79ad3d9ec2cf59a8d81f79316d89308446c861920b3";
+    "sha256:e04797b42bfef725fe678c4fd89bdf537f2cb7193a6dfcf90d92582cde41828e";
 #endif
 
 static_assert(!std::is_default_constructible_v<BuildQualifiedManifest>);

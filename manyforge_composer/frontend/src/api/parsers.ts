@@ -6440,6 +6440,7 @@ function executionIdentityAt(value: unknown, path: string): ExecutionIdentity {
   exactKeysAt(identity, [
     'active_publication_generation',
     'cell_id',
+    'control_management_mode',
     'graph_revision',
     'gripper_command_schema_id',
     'gripper_command_schema_revision',
@@ -6457,6 +6458,16 @@ function executionIdentityAt(value: unknown, path: string): ExecutionIdentity {
       !== 'manyforge.execution_identity.v1') {
     return fail(`${path}.schema_version`, 'manyforge.execution_identity.v1');
   }
+  const controlManagementMode = stringAt(
+    identity.control_management_mode,
+    `${path}.control_management_mode`,
+  );
+  if (!['pending', 'direct', 'component_lifecycle'].includes(controlManagementMode)) {
+    return fail(
+      `${path}.control_management_mode`,
+      'pending, direct, or component_lifecycle',
+    );
+  }
   return {
     ownerEpoch: stringAt(identity.owner_epoch, `${path}.owner_epoch`),
     cellId: stringAt(identity.cell_id, `${path}.cell_id`),
@@ -6464,6 +6475,7 @@ function executionIdentityAt(value: unknown, path: string): ExecutionIdentity {
       identity.active_publication_generation,
       `${path}.active_publication_generation`,
     ),
+    controlManagementMode: controlManagementMode as ExecutionIdentity['controlManagementMode'],
     graphRevision: stringAt(identity.graph_revision, `${path}.graph_revision`),
     retainedBundleId: stringAt(
       identity.retained_bundle_id,

@@ -2173,14 +2173,16 @@ TEST(ManagerApplyFenceReleaseCoordinator,
 
 TEST(ManagerNamedApplyCoordinator,
      ComposesTheDurableI4PhasesAndReplaysWithoutDuplicateEffects) {
-  ScopedPackageRoot root;
-  auto package = MaterializeRuntimePackage(root.path());
+  ScopedPackageRoot package_root;
+  ScopedPackageRoot state_root;
+  auto package = MaterializeRuntimePackage(package_root.path());
   const auto intent_template = ApplyIntent(*package.bundle);
   const auto predecessor = PredecessorPublication(intent_template);
-  SqliteManagerApplyJournal journal(root.path() / "aggregate-apply.sqlite3",
-                                    package.bundle->value().cell_graph.cell_id);
+  SqliteManagerApplyJournal journal(
+      state_root.path() / "aggregate-apply.sqlite3",
+      package.bundle->value().cell_graph.cell_id);
   SqliteManagerApplyJournal independent_reader(
-      root.path() / "aggregate-apply.sqlite3",
+      state_root.path() / "aggregate-apply.sqlite3",
       package.bundle->value().cell_graph.cell_id);
   ScriptedPublicationStore publication_store(predecessor, &independent_reader);
   FixedActiveRuntimePlanSource active_plan_source(
@@ -2233,6 +2235,7 @@ TEST(ManagerNamedApplyCoordinator,
   EXPECT_EQ(publication_store.publish_calls, 1);
   EXPECT_EQ(scene_owner.finalize_calls, 1);
 
+  ASSERT_GT(std::filesystem::remove_all(package_root.path()), 0U);
   const auto replayed = coordinator.ApplyOrRecover(request);
   EXPECT_EQ(replayed.state, ManagerNamedApplyResultState::kSucceeded);
   EXPECT_TRUE(replayed.request_replayed);

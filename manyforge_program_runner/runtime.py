@@ -65,6 +65,7 @@ from manyforge_headless_api.cell_admission import (
     cell_admission_owner_epoch_reconciliation_evidence_digest,
 )
 from .cycle_journal import ProgramCycleJournal
+from .execution_transport import ProgramRunnerExecutionTransport
 from .liveness import (
     ProgramRunnerLivenessError,
     ProgramRunnerLivenessReceiver,
@@ -217,6 +218,7 @@ class ProgramRuntime:
         simulation_control: OwnerTaskPort | None = None,
         admission_client: CellAdmissionClient | None = None,
         cycle_journal: ProgramCycleJournal | None = None,
+        execution_transport: Any | None = None,
     ) -> None:
         if not isinstance(config, ProgramRunnerConfig):
             raise TypeError("Program runtime requires one ProgramRunnerConfig")
@@ -266,6 +268,16 @@ class ProgramRuntime:
             config.headless_url,
             timeout_seconds=config.headless_timeout_seconds,
         )
+        if execution_transport is None:
+            if config.execution_run_root is None:
+                raise ValueError(
+                    "Program runtime requires the private execution run root"
+                )
+            execution_transport = ProgramRunnerExecutionTransport(
+                config.execution_run_root,
+                timeout_seconds=min(config.headless_timeout_seconds, 30.0),
+            )
+        self._kernel = KernelClient(execution_transport)
         self._model_transport = model_transport
         self._snapshot_source = snapshot_source
         if simulation_control is not None and any(
@@ -285,7 +297,7 @@ class ProgramRuntime:
             )
         self._simulation_control = simulation_control
         self._environment = build_node_environment()
-        self._native = NativeKernelProgramPort(KernelClient(self._headless))
+        self._native = NativeKernelProgramPort(self._kernel)
         self._scene = HeadlessSceneProgramPort(self._headless)
         self._cclc = CCLCProgramTaskPort(
             self._headless,
@@ -957,8 +969,8 @@ class ProgramRuntime:
                 node_id=node_id,
             )
         try:
-            targets_projection = self._headless.execution_targets()
-            control_projection = self._headless.execution_control_state()
+            targets_projection = self._kernel.targets()
+            control_projection = self._kernel.control_state()
         except Exception as error:
             return self._runtime_override_candidate_unavailable(
                 program_run_id,
@@ -1753,7 +1765,7 @@ class ProgramRuntime:
                 )
                 recovery_fences = self._run_recovery_fences(
                     applied_after_claim,
-                    self._headless.execution_identity(),
+                    self._kernel.identity(),
                     scene_admission_epoch=generation,
                 )
                 release_scene_context()
@@ -2648,6 +2660,10 @@ class ProgramRuntime:
             snapshot = self._host.stop_run(
                 program_run_id,
                 reason=request.reason,
+                stop_request_id=(
+                    "execution:"
+                    f"{request.request_owner_epoch}:{request.request_id}"
+                ),
             )
             result = self._project_run(snapshot.to_dict())
         except ProgramRunOwnerError as error:
@@ -2746,6 +2762,10 @@ class ProgramRuntime:
             snapshot = self._host.stop_motion(
                 program_run_id,
                 reason=request.reason,
+                stop_request_id=(
+                    "motion:"
+                    f"{request.request_owner_epoch}:{request.request_id}"
+                ),
             )
             result = self._project_run(snapshot.to_dict())
         except ProgramRunOwnerOutcomeUnknownError as error:

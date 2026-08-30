@@ -18,7 +18,7 @@ class RecordingTransport:
         self.submitted: Mapping[str, Any] | None = None
         self.controls: list[tuple[str, str, Mapping[str, Any]]] = []
 
-    def execution_identity(self) -> dict[str, Any]:
+    def identity(self) -> dict[str, Any]:
         return {
             "ok": True,
             "identity": {
@@ -40,14 +40,14 @@ class RecordingTransport:
             },
         }
 
-    def execute(self, body: Mapping[str, Any]) -> dict[str, Any]:
+    def submit(self, body: Mapping[str, Any]) -> dict[str, Any]:
         self.submitted = body
         return {
             "ok": True,
             "accepted": {"operation_id": "operation-1"},
         }
 
-    def operation(self, operation_id: str) -> dict[str, Any]:
+    def read(self, operation_id: str) -> dict[str, Any]:
         return {
             "ok": True,
             "operation": {"operation_id": operation_id, "state": "completed"},
@@ -66,26 +66,26 @@ class RecordingTransport:
             },
         }
 
-    def pause_operation(self, operation_id, body):
+    def pause(self, operation_id, body):
         return self._control("pause", operation_id, body)
 
-    def resume_operation(self, operation_id, body):
+    def resume(self, operation_id, body):
         return self._control("resume", operation_id, body)
 
-    def reset_operation(self, operation_id, body):
+    def reset(self, operation_id, body):
         return self._control("reset", operation_id, body)
 
-    def acknowledge_completed_operation(self, operation_id, body):
+    def acknowledge_completed(self, operation_id, body):
         return self._control("acknowledge_completed", operation_id, body)
 
-    def stop_operations(self, body):
+    def stop(self, body):
         operation_id = body["operations"][0]["operation_id"]
         return self._control("stop", operation_id, body)
 
-    def set_operation_runtime_scale(self, operation_id, body):
+    def set_runtime_scale(self, operation_id, body):
         return self._control("runtime_scale", operation_id, body)
 
-    def operation_runtime_scale(self, operation_id):
+    def get_runtime_scale(self, operation_id):
         return {
             "ok": True,
             "runtime_scale": {"operation_id": operation_id},
@@ -222,7 +222,7 @@ def test_runner_stop_is_attributed_fenced_and_exactly_replayable() -> None:
 
 def test_runner_rejects_an_incomplete_owner_projection_before_submission() -> None:
     class IncompleteIdentityTransport(RecordingTransport):
-        def execution_identity(self) -> dict[str, Any]:
+        def identity(self) -> dict[str, Any]:
             return {"ok": True, "identity": {"owner_epoch": "owner-epoch-7"}}
 
     transport = IncompleteIdentityTransport()

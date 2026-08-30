@@ -186,3 +186,42 @@ def test_operator_stop_state_retains_parallel_attempts_until_each_is_resolved() 
 
     state.resolve("task.2")
     assert state.snapshot() == OperatorMotionStopSnapshot()
+
+
+def test_operator_stop_holds_only_the_authored_branch_while_parallel_continue_ticks() -> None:
+    class CountingNode(py_trees.behaviour.Behaviour):
+        def __init__(self, name: str) -> None:
+            super().__init__(name=name)
+            self.ticks = 0
+
+        def update(self) -> py_trees.common.Status:
+            self.ticks += 1
+            return py_trees.common.Status.RUNNING
+
+    held_child = CountingNode("held-child")
+    continue_child = CountingNode("continue-child")
+    state = OperatorMotionStopState()
+    held = OperatorMotionStopPolicy(
+        child=held_child,
+        node_instance_id="held",
+        stop_state=state,
+    )
+    parallel = py_trees.composites.Parallel(
+        name="root",
+        policy=py_trees.common.ParallelPolicy.SuccessOnAll(synchronise=False),
+        children=[held, continue_child],
+    )
+
+    list(parallel.tick())
+    assert held_child.ticks == 1
+    assert continue_child.ticks == 1
+
+    assert state.hold(
+        "task.held",
+        {"active_stop_id": "stop.1", "active_stop_generation": 1},
+    )
+    list(parallel.tick())
+
+    assert held_child.ticks == 1
+    assert held.status is py_trees.common.Status.RUNNING
+    assert continue_child.ticks == 2

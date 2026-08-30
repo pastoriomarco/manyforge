@@ -29,6 +29,7 @@ enum class StopRequestedSelectorKindDTO : std::uint8_t {
   kOrdinaryResources,
   kExplicitFull,
   kMalformedIngress,
+  kInternalProgramRun,
 };
 
 struct StopRequestedSelectorSnapshotDTO final {
@@ -89,6 +90,15 @@ struct StopParticipantScopeFactsDTO final {
   RuntimeEpoch provider_runtime_epoch;
   std::vector<ResourceId> resources;
   ContainmentGranularity containment_granularity{ContainmentGranularity::kResource};
+  /// Whether the participant execution owner committed the same terminal
+  /// occurrence after physical containment. Physical Stop evidence remains in
+  /// attempted_stage_results even when this handoff is still unsettled.
+  enum class TerminalSettlementState : std::uint8_t {
+    kNotRequired = 0,
+    kPending,
+    kSettled,
+    kContainedUnsettled,
+  } terminal_settlement{TerminalSettlementState::kPending};
 
   friend bool operator==(const StopParticipantScopeFactsDTO&,
                          const StopParticipantScopeFactsDTO&) = default;

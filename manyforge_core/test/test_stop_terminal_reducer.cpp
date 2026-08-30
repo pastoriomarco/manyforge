@@ -198,7 +198,8 @@ inline constexpr char kDigestC[] =
           stage.controller_goal_id, stage.controller_goal_generation,
           stage.active_control_configuration_id, stage.active_control_configuration_generation,
           stage.controller_topology_id, stage.topology_revision, stage.control_route_id,
-          stage.provider_runtime_epoch, stage.resources, ContainmentGranularity::kControllerSet},
+          stage.provider_runtime_epoch, stage.resources, ContainmentGranularity::kControllerSet,
+          StopParticipantScopeFactsDTO::TerminalSettlementState::kSettled},
       StopScopeEntryDispositionDTO::kStoppable,
       dispatch_state,
       stage.stop_evidence_policy_id,
@@ -269,6 +270,50 @@ TEST(StopTerminalReducerTest, DerivesNominalCertificateAndExactFlattenedEvidence
   EXPECT_FALSE(stop_certificate_field_error(reduced.value()).has_value());
 }
 
+TEST(StopTerminalReducerTest,
+     RetainsPhysicalContainmentButRefusesSuccessWhenParticipantIsUnsettled) {
+  auto input = Input();
+  auto& facts =
+      std::get<StopParticipantScopeFactsDTO>(input.newly_captured_scope_entries.front().facts);
+  facts.terminal_settlement =
+      StopParticipantScopeFactsDTO::TerminalSettlementState::kContainedUnsettled;
+  input.fault_latch_id = StopFaultLatchId("stop-fault.1");
+  input.fault_latch_generation = StopFaultLatchGeneration(1U);
+  input.terminal_error =
+      ErrorDTO{"participant_stop_settlement_failed", "participant terminal settlement failed", {}};
+
+  const auto reduced = ReduceStopTerminal(input);
+
+  ASSERT_TRUE(reduced.ok()) << reduced.error().message;
+  EXPECT_EQ(reduced.value().result, StopCertificateResultDTO::kPartial);
+  ASSERT_EQ(reduced.value().dispatched_stopped.size(), 1U);
+  EXPECT_EQ(reduced.value().dispatched_stopped.front(),
+            input.newly_captured_scope_entries.front().key);
+  ASSERT_EQ(reduced.value().unsettled.size(), 1U);
+  EXPECT_EQ(reduced.value().unsettled.front(), input.newly_captured_scope_entries.front().key);
+  EXPECT_TRUE(reduced.value().failed.empty());
+  EXPECT_EQ(reduced.value().terminal_error, input.terminal_error);
+  EXPECT_FALSE(stop_certificate_field_error(reduced.value()).has_value());
+}
+
+TEST(StopTerminalReducerTest, PendingParticipantSettlementFailsClosedAfterPhysicalContainment) {
+  auto input = Input();
+  auto& facts =
+      std::get<StopParticipantScopeFactsDTO>(input.newly_captured_scope_entries.front().facts);
+  facts.terminal_settlement = StopParticipantScopeFactsDTO::TerminalSettlementState::kPending;
+  input.fault_latch_id = StopFaultLatchId("stop-fault.1");
+  input.fault_latch_generation = StopFaultLatchGeneration(1U);
+
+  const auto reduced = ReduceStopTerminal(input);
+
+  ASSERT_TRUE(reduced.ok()) << reduced.error().message;
+  EXPECT_EQ(reduced.value().result, StopCertificateResultDTO::kPartial);
+  ASSERT_EQ(reduced.value().dispatched_stopped.size(), 1U);
+  ASSERT_EQ(reduced.value().unsettled.size(), 1U);
+  EXPECT_EQ(reduced.value().dispatched_stopped.front(), reduced.value().unsettled.front());
+  EXPECT_FALSE(stop_certificate_field_error(reduced.value()).has_value());
+}
+
 TEST(StopTerminalReducerTest, RejectsScopeThatDoesNotAdvanceBeyondPreparedOperationRevision) {
   auto input = Input();
   auto& facts =
@@ -291,6 +336,44 @@ TEST(StopTerminalReducerTest, PreDispatchCancellationSettlesWithoutEvaluatingPol
   EXPECT_EQ(reduced.value().pre_dispatch_cancelled.size(), 1U);
   EXPECT_TRUE(reduced.value().attempted_stage_results.empty());
   EXPECT_TRUE(reduced.value().evidence_items.empty());
+}
+
+TEST(StopTerminalReducerTest, PreDispatchCancellationNeedsNoSettlementWithoutAnInnerOccurrence) {
+  auto input = Input();
+  input.newly_captured_scope_entries.front().dispatch_state =
+      StopScopeDispatchStateDTO::kNeverDispatchedCancelled;
+  auto& facts =
+      std::get<StopParticipantScopeFactsDTO>(input.newly_captured_scope_entries.front().facts);
+  facts.terminal_settlement = StopParticipantScopeFactsDTO::TerminalSettlementState::kNotRequired;
+  input.newly_completed_stage_results.clear();
+
+  const auto reduced = ReduceStopTerminal(input);
+
+  ASSERT_TRUE(reduced.ok()) << reduced.error().message;
+  EXPECT_EQ(reduced.value().result, StopCertificateResultDTO::kSucceededNominal);
+  EXPECT_EQ(reduced.value().pre_dispatch_cancelled.size(), 1U);
+  EXPECT_TRUE(reduced.value().unsettled.empty());
+}
+
+TEST(StopTerminalReducerTest, PreDispatchCancellationCannotOutrunParticipantSettlement) {
+  auto input = Input();
+  input.newly_captured_scope_entries.front().dispatch_state =
+      StopScopeDispatchStateDTO::kNeverDispatchedCancelled;
+  auto& facts =
+      std::get<StopParticipantScopeFactsDTO>(input.newly_captured_scope_entries.front().facts);
+  facts.terminal_settlement = StopParticipantScopeFactsDTO::TerminalSettlementState::kPending;
+  input.newly_completed_stage_results.clear();
+  input.fault_latch_id = StopFaultLatchId("stop-fault.1");
+  input.fault_latch_generation = StopFaultLatchGeneration(1U);
+
+  const auto reduced = ReduceStopTerminal(input);
+
+  ASSERT_TRUE(reduced.ok()) << reduced.error().message;
+  EXPECT_EQ(reduced.value().result, StopCertificateResultDTO::kPartial);
+  ASSERT_EQ(reduced.value().pre_dispatch_cancelled.size(), 1U);
+  ASSERT_EQ(reduced.value().unsettled.size(), 1U);
+  EXPECT_EQ(reduced.value().pre_dispatch_cancelled.front(), reduced.value().unsettled.front());
+  EXPECT_TRUE(reduced.value().attempted_stage_results.empty());
 }
 
 TEST(StopTerminalReducerTest, StrongerStageRequiresLatchAndProducesEscalatedTruth) {

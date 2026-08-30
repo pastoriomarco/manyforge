@@ -24,7 +24,7 @@ namespace {
 }
 
 TEST(StopIntentTest, AcceptsEveryClosedSelectorAlternative) {
-  static_assert(std::variant_size_v<StopSelectorDTO> == 3U);
+  static_assert(std::variant_size_v<StopSelectorDTO> == 4U);
 
   const auto operation = operation_stop();
   EXPECT_FALSE(stop_intent_field_error(operation).has_value());
@@ -48,6 +48,14 @@ TEST(StopIntentTest, AcceptsEveryClosedSelectorAlternative) {
       {}};
   EXPECT_FALSE(stop_intent_field_error(resource).has_value());
   ASSERT_NE(std::get_if<std::vector<StopResourceTargetDTO>>(&resource.selector), nullptr);
+
+  const StopIntentDTO program_run{
+      request_context(),
+      std::vector<StopProgramRunTargetDTO>{{ProgramRunId("program-run.1")}},
+      std::nullopt,
+      {}};
+  EXPECT_FALSE(stop_intent_field_error(program_run).has_value());
+  ASSERT_NE(std::get_if<std::vector<StopProgramRunTargetDTO>>(&program_run.selector), nullptr);
 }
 
 TEST(StopIntentTest, RejectsEmptyUnsortedAndDuplicateSelectors) {

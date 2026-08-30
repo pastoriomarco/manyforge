@@ -1098,7 +1098,7 @@ template <typename StrongId>
                         "Stop expected component lifecycle generation")},
                 {"expected_graph_revision", CanonicalValue(target.expected_graph_revision.value())},
             });
-          } else {
+          } else if constexpr (std::is_same_v<Targets, std::vector<StopResourceTargetDTO>>) {
             rows.emplace_back(CanonicalValue::Object{
                 {"expected_graph_revision", CanonicalValue(target.expected_graph_revision.value())},
                 {"expected_operation_resource_generation",
@@ -1108,6 +1108,10 @@ template <typename StrongId>
                  Number(target.expected_stop_generation.value(), "Stop expected generation")},
                 {"resource_id", CanonicalValue(target.resource_id.value())},
             });
+          } else {
+            rows.emplace_back(CanonicalValue::Object{
+                {"program_run_id", CanonicalValue(target.program_run_id.value())},
+            });
           }
         }
         const char* kind = nullptr;
@@ -1115,8 +1119,10 @@ template <typename StrongId>
           kind = "operations";
         } else if constexpr (std::is_same_v<Targets, std::vector<StopComponentTargetDTO>>) {
           kind = "components";
-        } else {
+        } else if constexpr (std::is_same_v<Targets, std::vector<StopResourceTargetDTO>>) {
           kind = "resources";
+        } else {
+          kind = "program_runs";
         }
         return CanonicalValue(CanonicalValue::Object{
             {kind, CanonicalValue(std::move(rows))},

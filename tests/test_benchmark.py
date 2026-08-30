@@ -45,28 +45,28 @@ from manyforge_behavior.kernel_client import KernelClient
 
 
 class _Transport:
-    def execution_status(self):
-        return {"ok": True, "status": {}}
+    def identity(self):
+        return {"ok": True, "identity": {}}
 
-    def execute(self, body):
+    def submit(self, body):
         return {"ok": True, "accepted": {"request": body}}
 
-    def operation(self, operation_id):
+    def read(self, operation_id):
         return {"ok": True, "operation": {"operation_id": operation_id}}
 
-    def pause_operation(self, operation_id, body):
+    def pause(self, operation_id, body):
         return {"ok": True, "accepted": {"operation_id": operation_id, "request": body}}
 
-    resume_operation = pause_operation
-    reset_operation = pause_operation
-    acknowledge_completed_operation = pause_operation
-    set_operation_runtime_scale = pause_operation
+    resume = pause
+    reset = pause
+    acknowledge_completed = pause
+    set_runtime_scale = pause
 
-    def stop_operations(self, body):
+    def stop(self, body):
         operation_id = body["operations"][0]["operation_id"]
         return {"ok": True, "accepted": {"operation_id": operation_id, "request": body}}
 
-    def operation_runtime_scale(self, operation_id):
+    def get_runtime_scale(self, operation_id):
         return {"ok": True, "runtime_scale": {"operation_id": operation_id}}
 
 

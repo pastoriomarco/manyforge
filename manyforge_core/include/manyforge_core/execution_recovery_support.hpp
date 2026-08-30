@@ -1,10 +1,10 @@
 #pragma once
 
-#include <manyforge_core/types/recovery.hpp>
-#include <manyforge_core/observed_robot_state_publication.hpp>
-
 #include <cstdint>
 #include <deque>
+#include <manyforge_core/observed_robot_state_publication.hpp>
+#include <manyforge_core/types/recovery.hpp>
+#include <manyforge_core/types/stop_certificate.hpp>
 #include <map>
 #include <optional>
 #include <string>
@@ -13,15 +13,13 @@
 namespace manyforge::core {
 
 std::optional<ObservedStateEvidenceDTO> capture_observed_state_evidence(
-    const ObservedRobotStatePublication* publication,
-    std::int64_t now_ns,
+    const ObservedRobotStatePublication* publication, std::int64_t now_ns,
     double at_rest_velocity_threshold_rad_s);
 
-void apply_observed_state_to_stop_certificate(
-    const ObservedRobotStatePublication* publication,
-    std::int64_t observed_at_ns,
-    double at_rest_velocity_threshold_rad_s,
-    KernelStopCertificateDTO& certificate);
+void apply_observed_state_to_stop_certificate(const ObservedRobotStatePublication* publication,
+                                              std::int64_t observed_at_ns,
+                                              double at_rest_velocity_threshold_rad_s,
+                                              KernelStopCertificateDTO& certificate);
 
 /// Bounded, deterministic store of definitive stop certificates
 /// (spec/230 §3.7.1). NOT thread-safe: the owner guards it with a leaf
@@ -45,23 +43,18 @@ class RecoveryCertificateStore {
   /// record may be upgraded to succeeded; equivalent duplicates and any
   /// downgrade after success are ignored. Returns the assigned revision when
   /// published, or nullopt when coalesced.
-  std::optional<std::uint64_t> publish_owner_session_progress(
-      KernelStopCertificateDTO certificate);
+  std::optional<std::uint64_t> publish_owner_session_progress(KernelStopCertificateDTO certificate);
 
   /// Authoritative certificate for an owner kind, if any.
-  [[nodiscard]] std::optional<KernelStopCertificateDTO> authoritative(
-      StopOwnerKind kind) const;
+  [[nodiscard]] std::optional<KernelStopCertificateDTO> authoritative(StopOwnerKind kind) const;
 
   /// Exact-match authoritative lookup used by admission. Returns nullopt
   /// unless the authoritative certificate for `kind` matches every key.
   [[nodiscard]] std::optional<KernelStopCertificateDTO> find_authoritative(
-      StopOwnerKind kind,
-      std::uint64_t execution_id,
-      const std::string& latch_id,
+      StopOwnerKind kind, std::uint64_t execution_id, const std::string& latch_id,
       std::uint64_t stop_owner_generation) const;
 
-  [[nodiscard]] const std::deque<KernelStopCertificateDTO>& evidence_ring()
-      const {
+  [[nodiscard]] const std::deque<KernelStopCertificateDTO>& evidence_ring() const {
     return evidence_ring_;
   }
 
@@ -84,13 +77,25 @@ class StopOwnerIdentityTracker {
  public:
   std::uint64_t begin(std::uint64_t execution_id);
   std::uint64_t ensure(std::uint64_t execution_id);
-  [[nodiscard]] std::uint64_t generation_for_execution(
-      std::uint64_t execution_id) const;
+  [[nodiscard]] std::uint64_t generation_for_execution(std::uint64_t execution_id) const;
 
  private:
   std::uint64_t generation_counter_ = 0;
   std::uint64_t selected_generation_ = 0;
   std::uint64_t selected_execution_id_ = 0;
+};
+
+/// Participant-local recovery evidence for one aggregate addressed Stop.
+/// Unlike KernelStopCertificateDTO this is only a reference to the addressed
+/// owner's certificate identity and is never published as another certificate.
+struct AddressedMotionStopRecoveryEvidenceDTO final {
+  std::uint64_t execution_id{};
+  std::uint64_t stop_owner_generation{};
+  StopCertificateRefDTO aggregate_stop_certificate;
+  bool backend_stop_confirmed{};
+
+  friend bool operator==(const AddressedMotionStopRecoveryEvidenceDTO&,
+                         const AddressedMotionStopRecoveryEvidenceDTO&) = default;
 };
 
 /// One coherent capture of the authority facts an assessment is built from.
@@ -111,6 +116,7 @@ struct RecoveryAuthorityCapture {
   std::uint64_t operator_stop_owner_generation = 0;
   std::optional<KernelStopCertificateDTO> fault_preempt_certificate;
   std::optional<KernelStopCertificateDTO> operator_stop_certificate;
+  std::optional<AddressedMotionStopRecoveryEvidenceDTO> addressed_motion_stop_evidence;
   bool stop_fault_intervention_classified = false;
   /// Classified retryable pre-dispatch validation failure, if any.
   bool failed_validation_retryable = false;
@@ -141,26 +147,20 @@ class ObservedReadinessTracker {
  public:
   /// Feed one sample; returns true when the sample chain is currently
   /// qualified under `policy` evaluated at `now_ns`.
-  bool update(const ObservedStateEvidenceDTO& sample,
-              const std::string& expected_joint_order_token,
-              const RecoveryReadinessPolicy& policy,
-              std::int64_t now_ns);
+  bool update(const ObservedStateEvidenceDTO& sample, const std::string& expected_joint_order_token,
+              const RecoveryReadinessPolicy& policy, std::int64_t now_ns);
 
   /// Time-only re-evaluation (freshness expiry without new samples).
-  bool evaluate(const RecoveryReadinessPolicy& policy,
-                std::int64_t now_ns) const;
+  bool evaluate(const RecoveryReadinessPolicy& policy, std::int64_t now_ns) const;
 
   void reset();
 
-  [[nodiscard]] std::optional<ObservedStateEvidenceDTO> last_sample() const {
-    return last_sample_;
-  }
+  [[nodiscard]] std::optional<ObservedStateEvidenceDTO> last_sample() const { return last_sample_; }
 
  private:
   [[nodiscard]] bool sample_safe(const ObservedStateEvidenceDTO& sample,
                                  const std::string& expected_token,
-                                 const RecoveryReadinessPolicy& policy,
-                                 std::int64_t now_ns) const;
+                                 const RecoveryReadinessPolicy& policy, std::int64_t now_ns) const;
 
   std::optional<ObservedStateEvidenceDTO> last_sample_;
   std::uint64_t last_counted_sequence_ = 0;
@@ -170,17 +170,15 @@ class ObservedReadinessTracker {
 
 /// Pure construction of the assessment from one coherent capture. Performs
 /// no locking, no I/O, no backend/planner/engine calls.
-KernelRecoveryAssessmentDTO build_recovery_assessment(
-    const RecoveryAuthorityCapture& capture,
-    const RecoveryReadinessPolicy& policy,
-    std::uint64_t previous_revision);
+KernelRecoveryAssessmentDTO build_recovery_assessment(const RecoveryAuthorityCapture& capture,
+                                                      const RecoveryReadinessPolicy& policy,
+                                                      std::uint64_t previous_revision);
 
 /// True when two assessments differ in identity, authority, actionability,
 /// status, allowed actions, or reason — i.e. when publication must advance
 /// the revision. Equal admissibility facts do not churn.
-bool recovery_assessment_semantically_differs(
-    const KernelRecoveryAssessmentDTO& previous,
-    const KernelRecoveryAssessmentDTO& next);
+bool recovery_assessment_semantically_differs(const KernelRecoveryAssessmentDTO& previous,
+                                              const KernelRecoveryAssessmentDTO& next);
 
 /// Pure assessment + durable-record projection. The kernel remains the owner
 /// of coherent capture, publication locks, scheduling, and event emission;
@@ -192,10 +190,8 @@ struct RecoveryAssessmentPublication {
 };
 
 RecoveryAssessmentPublication prepare_recovery_assessment_publication(
-    const KernelRecoveryAssessmentDTO& previous,
-    const RecoveryAuthorityCapture& capture,
-    const RecoveryReadinessPolicy& policy,
-    std::string_view trigger);
+    const KernelRecoveryAssessmentDTO& previous, const RecoveryAuthorityCapture& capture,
+    const RecoveryReadinessPolicy& policy, std::string_view trigger);
 
 /// Structured admission decision for ApplyRecoveryAction. `admitted=false`
 /// carries the stable rejection reason; the caller guarantees no side
@@ -209,15 +205,13 @@ struct RecoveryAdmissionDecision {
 /// the assessment the caller just rebuilt from it. Compares pre-existing
 /// ids/revisions only; allocates nothing on the admit path.
 RecoveryAdmissionDecision evaluate_recovery_admission(
-    const KernelRecoveryActionRequestDTO& request,
-    const RecoveryAuthorityCapture& capture,
+    const KernelRecoveryActionRequestDTO& request, const RecoveryAuthorityCapture& capture,
     const KernelRecoveryAssessmentDTO& assessment);
 
 /// Rejection error construction (allocates; call after the authority lock
 /// is released or on the already-rejected path).
-ErrorDTO recovery_action_rejection_error(
-    const KernelRecoveryActionRequestDTO& request,
-    const KernelRecoveryAssessmentDTO& assessment,
-    std::string_view rejection_reason);
+ErrorDTO recovery_action_rejection_error(const KernelRecoveryActionRequestDTO& request,
+                                         const KernelRecoveryAssessmentDTO& assessment,
+                                         std::string_view rejection_reason);
 
 }  // namespace manyforge::core

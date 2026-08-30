@@ -421,6 +421,7 @@ class _PickPlaceTask:
     planning_result: Mapping[str, Any]
     snapshot: OwnerTaskSnapshot
     active_stop_operation_id: str | None = None
+    scope_stop_requested: bool = False
 
 
 class NativeKernelProgramPort:
@@ -433,6 +434,7 @@ class NativeKernelProgramPort:
         self._contexts: dict[str, _BoundContext] = {}
         self._tasks: dict[str, _OperationTask] = {}
         self._pick_place_tasks: dict[str, _PickPlaceTask] = {}
+        self._scope_stops: dict[str, tuple[str, int]] = {}
         self._lock = RLock()
         self.operations = _NativeKernelOperationTaskPort(self)
         self.pick_place = _NativePickPlaceTaskPort(self)
@@ -528,6 +530,7 @@ class NativeKernelProgramPort:
 
     def unbind(self, program_run_id: str) -> None:
         with self._lock:
+            has_scope_stop = program_run_id in self._scope_stops
             tasks = tuple(
                 task
                 for task in self._tasks.values()
@@ -538,6 +541,17 @@ class NativeKernelProgramPort:
                 for task in self._pick_place_tasks.values()
                 if task.identity.program_run_id == program_run_id
             )
+        if has_scope_stop:
+            scope = self._observe_scope(program_run_id)
+            if scope.state is not ProgramRunScopeState.SETTLED:
+                raise ProductionPortError(
+                    "cannot unbind a Program run before aggregate Stop settlement"
+                )
+            with self._lock:
+                for task in pick_place_tasks:
+                    self._pick_place_tasks.pop(task.sequence_id, None)
+                self._contexts.pop(program_run_id, None)
+            return
         completed: list[_OperationTask] = []
         for task in tasks:
             _operation, snapshot = self._observation(task)
@@ -1777,6 +1791,9 @@ class NativeKernelProgramPort:
                     ),
                 },
             }
+        if result.get("accepted") is True:
+            with self._lock:
+                self._scope_stops.pop(identity.program_run_id, None)
         return result
 
     def _task(self, task_id: str) -> _OperationTask:
@@ -1875,6 +1892,7 @@ class NativeKernelProgramPort:
 
     def _observe_scope(self, program_run_id: str) -> ProgramRunScopeSnapshot:
         with self._lock:
+            scope_stop = self._scope_stops.get(program_run_id)
             tasks = tuple(
                 task
                 for task in self._tasks.values()
@@ -1884,6 +1902,39 @@ class NativeKernelProgramPort:
                 task
                 for task in self._pick_place_tasks.values()
                 if task.identity.program_run_id == program_run_id
+            )
+        if scope_stop is not None:
+            stop_id, retained_count = scope_stop
+            try:
+                status = _mapping(
+                    self._kernel.stop_status(stop_id).get("stop_status"),
+                    field="aggregate Stop status",
+                )
+                state = _text(status.get("state"), field="Stop status state")
+            except Exception as exc:
+                return ProgramRunScopeSnapshot(
+                    program_run_id=program_run_id,
+                    state=ProgramRunScopeState.UNKNOWN,
+                    active_operation_count=None,
+                    reason_code=(str(exc) or type(exc).__name__)[:256],
+                )
+            if state in {"accepted", "stopping", "certifying"}:
+                return ProgramRunScopeSnapshot(
+                    program_run_id,
+                    ProgramRunScopeState.ACTIVE,
+                    retained_count,
+                )
+            if state == "succeeded":
+                return ProgramRunScopeSnapshot(
+                    program_run_id,
+                    ProgramRunScopeState.SETTLED,
+                    0,
+                )
+            return ProgramRunScopeSnapshot(
+                program_run_id=program_run_id,
+                state=ProgramRunScopeState.UNKNOWN,
+                active_operation_count=None,
+                reason_code=f"program_run_stop_{state}",
             )
         try:
             active_count = sum(
@@ -1915,8 +1966,10 @@ class NativeKernelProgramPort:
     def _request_stop(
         self,
         program_run_id: str,
+        stop_request_id: str,
         reason: str | None,
     ) -> ProgramRunScopeSnapshot:
+        _text(stop_request_id, field="stop_request_id", maximum_bytes=2_048)
         with self._lock:
             tasks = tuple(
                 task
@@ -1928,15 +1981,48 @@ class NativeKernelProgramPort:
                 for task in self._pick_place_tasks.values()
                 if task.identity.program_run_id == program_run_id
             )
-        for task in tasks:
-            self._cancel(task, reason)
-        for task in pick_place_tasks:
-            self._cancel_pick_place_task(
-                task.sequence_id,
-                task.identity,
-                reason=reason,
+        retained_count = len(tasks) + len(pick_place_tasks)
+        if retained_count == 0:
+            return ProgramRunScopeSnapshot(
+                program_run_id,
+                ProgramRunScopeState.SETTLED,
+                0,
             )
-        return self._observe_scope(program_run_id)
+        context = self._context(program_run_id)
+        owner_epoch, _scene = self._owner_status(context)
+        response = self._kernel.stop_program_run(
+            {
+                "request_context": {
+                    "request_id": _request_identity(
+                        "program-scope-stop",
+                        program_run_id,
+                        stop_request_id,
+                    ),
+                    "request_owner_epoch": owner_epoch,
+                    "source_label": "manyforge_behavior",
+                    "correlation_id": program_run_id,
+                },
+                "program_run_id": program_run_id,
+                "reason": reason,
+            }
+        )
+        accepted = _mapping(
+            response.get("accepted"), field="Program-run Stop acceptance"
+        )
+        stop_id = _text(accepted.get("stop_id"), field="stop_id")
+        with self._lock:
+            self._scope_stops[program_run_id] = (stop_id, retained_count)
+            for task in tasks:
+                task.stop_requested = True
+            for task in pick_place_tasks:
+                task.scope_stop_requested = True
+        # Acceptance fenced the exact Kernel-owned run scope. Settlement is a
+        # later observation; do not add a synchronous per-task read sweep here.
+        return ProgramRunScopeSnapshot(
+            program_run_id,
+            ProgramRunScopeState.ACTIVE,
+            retained_count,
+        )
 
     @staticmethod
     def _resettable_operation(
@@ -1961,6 +2047,13 @@ class NativeKernelProgramPort:
                 if task.identity.program_run_id == program_run_id
             )
         if not tasks:
+            with self._lock:
+                self._scope_stops.pop(program_run_id, None)
+                self._pick_place_tasks = {
+                    task_id: task
+                    for task_id, task in self._pick_place_tasks.items()
+                    if task.identity.program_run_id != program_run_id
+                }
             return ProgramRunScopeSnapshot(
                 program_run_id,
                 ProgramRunScopeState.SETTLED,
@@ -2019,6 +2112,14 @@ class NativeKernelProgramPort:
             with self._lock:
                 self._tasks.pop(task.operation_id, None)
 
+        with self._lock:
+            self._scope_stops.pop(program_run_id, None)
+            self._pick_place_tasks = {
+                task_id: task
+                for task_id, task in self._pick_place_tasks.items()
+                if task.identity.program_run_id != program_run_id
+            }
+
         return ProgramRunScopeSnapshot(
             program_run_id,
             ProgramRunScopeState.SETTLED,
@@ -2070,6 +2171,9 @@ class NativeKernelProgramPort:
             raise ProductionPortError(
                 "pick/place cancellation changed node attempt"
             )
+        with self._lock:
+            if task.scope_stop_requested:
+                return
         snapshot = self._observe_pick_place_task(task_id)
         if snapshot.state is not OwnerTaskState.ACTIVE:
             return
@@ -2234,9 +2338,14 @@ class _NativeKernelProgramScopePort:
     def request_stop(
         self,
         program_run_id: str,
+        stop_request_id: str,
         reason: str | None,
     ) -> ProgramRunScopeSnapshot:
-        return self._owner._request_stop(program_run_id, reason)
+        return self._owner._request_stop(
+            program_run_id,
+            stop_request_id,
+            reason,
+        )
 
     def observe(self, program_run_id: str) -> ProgramRunScopeSnapshot:
         return self._owner._observe_scope(program_run_id)

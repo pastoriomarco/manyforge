@@ -399,6 +399,15 @@ def _select_workspace_script(workspace: str) -> str:
     )
 
 
+OPEN_VIEWER_TOOLS_SCRIPT = """return (() => {
+  const button = [...document.querySelectorAll('.viewer-surface-launchers > button')]
+    .find((candidate) => candidate.textContent?.trim() === 'Tools');
+  if (button === undefined) return false;
+  if (button.getAttribute('aria-pressed') !== 'true') button.click();
+  return true;
+})();"""
+
+
 def _execute(driver: RawWebDriver, script: str) -> Any:
     value = driver.command("POST", "/execute/sync", {"script": script, "args": []})
     if value is None:
@@ -615,6 +624,8 @@ def collect_current_workbench(
             "connected workbench viewer and operations pane",
             timeout_s,
         )
+        if _execute(driver, OPEN_VIEWER_TOOLS_SCRIPT) is not True:
+            raise CollectorError("viewer Tools panel selection is unavailable")
         ready = _wait(
             driver,
             _viewer_ready,
@@ -673,6 +684,8 @@ def collect_current_workbench(
             "reloaded connected workbench viewer and operations pane",
             timeout_s,
         )
+        if _execute(driver, OPEN_VIEWER_TOOLS_SCRIPT) is not True:
+            raise CollectorError("reloaded viewer Tools panel selection is unavailable")
         reloaded = _wait(
             driver,
             lambda item: _viewer_ready(item)

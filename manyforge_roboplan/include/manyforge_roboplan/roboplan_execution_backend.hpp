@@ -193,6 +193,8 @@ private:
                               std::int64_t source_timestamp_ns = 0);
   void execution_worker(std::stop_token st, core::TrajectoryDTO trajectory,
                         std::uint64_t execution_generation);
+  void request_execution_worker_stop() noexcept;
+  void publish_execution_inactive() noexcept;
   core::ControlledStopResultDTO execute_controlled_stop_impl(
       const core::MotionInterruptStopProfileDTO &profile,
       std::stop_token stop_token, std::uint64_t hard_stop_request_generation);

@@ -84,7 +84,7 @@ class _Headless:
     """Construction-complete transport whose unused effects fail loudly."""
 
     _PORT_METHODS = {
-        "acknowledge_completed_operation",
+        "acknowledge_completed",
         "authoring_admission",
         "commit_scene_transaction",
         "cclc_component",
@@ -92,16 +92,18 @@ class _Headless:
         "cclc_route_templates",
         "component_lifecycle_status",
         "commit_program_model_attempt",
-        "execute",
+        "submit",
         "manager_graph",
-        "operation",
-        "operation_runtime_scale",
-        "pause_operation",
-        "reset_operation",
-        "resume_operation",
+        "read",
+        "get_runtime_scale",
+        "pause",
+        "reset",
+        "resume",
         "scene",
-        "set_operation_runtime_scale",
-        "stop_operations",
+        "set_runtime_scale",
+        "stop",
+        "stop_program_run",
+        "stop_status",
         "submit_component_lifecycle",
         "submit_route_selection",
         "route_selection_status",
@@ -128,7 +130,7 @@ class _Headless:
         assert scenario_id == "cell-pick"
         return {"scenario_id": scenario_id, "program_revision": _DIGEST_A}
 
-    def execution_identity(self) -> dict[str, Any]:
+    def identity(self) -> dict[str, Any]:
         return {
             "ok": True,
             "identity": {
@@ -338,6 +340,7 @@ class _Host:
         program_run_id: str,
         *,
         reason: str | None,
+        stop_request_id: str | None = None,
     ) -> _Snapshot:
         self.stop_calls.append((program_run_id, reason))
         current = self.owner.rows.get(program_run_id)
@@ -356,6 +359,7 @@ class _Host:
         program_run_id: str,
         *,
         reason: str | None,
+        stop_request_id: str | None = None,
     ) -> _Snapshot:
         self.motion_stop_calls.append((program_run_id, reason))
         current = self.owner.rows.get(program_run_id)
@@ -505,6 +509,7 @@ def _reconcile_runtime(
             cycle_journal_path=tmp_path / "cycle.sqlite3",
         ),
         headless_client=_Headless(),  # type: ignore[arg-type]
+        execution_transport=_Headless(),  # type: ignore[arg-type]
         admission_client=admission,  # type: ignore[arg-type]
         cycle_journal=journal,
     )
@@ -914,6 +919,7 @@ def test_applied_activation_prepares_scene_while_idle_without_run_claim(
             owner_epoch="runner.activation-scene.1",
         ),
         headless_client=_Headless(),  # type: ignore[arg-type]
+        execution_transport=_Headless(),  # type: ignore[arg-type]
         admission_client=admission,  # type: ignore[arg-type]
         cycle_journal=ProgramCycleJournal(
             tmp_path / "cycle.sqlite3", owner_epoch="runner.activation-scene.1"
@@ -987,6 +993,7 @@ def test_run_prepares_while_idle_then_only_verifies_after_claim(
             owner_epoch="runner.scene-order.1",
         ),
         headless_client=_Headless(),  # type: ignore[arg-type]
+        execution_transport=_Headless(),  # type: ignore[arg-type]
         admission_client=admission,  # type: ignore[arg-type]
         cycle_journal=ProgramCycleJournal(
             tmp_path / "cycle.sqlite3", owner_epoch="runner.scene-order.1"
@@ -1032,6 +1039,7 @@ def test_scene_preparation_failure_leaves_cycle_idle_without_claim(
             headless_url="http://headless.test", owner_epoch="runner.prepare-fail.1"
         ),
         headless_client=_Headless(),  # type: ignore[arg-type]
+        execution_transport=_Headless(),  # type: ignore[arg-type]
         admission_client=admission,  # type: ignore[arg-type]
         cycle_journal=ProgramCycleJournal(
             tmp_path / "cycle.sqlite3", owner_epoch="runner.prepare-fail.1"
@@ -1066,6 +1074,7 @@ def test_post_claim_scene_race_records_resettable_no_effect_settlement(
             headless_url="http://headless.test", owner_epoch="runner.scene-race.1"
         ),
         headless_client=_Headless(),  # type: ignore[arg-type]
+        execution_transport=_Headless(),  # type: ignore[arg-type]
         admission_client=admission,  # type: ignore[arg-type]
         cycle_journal=ProgramCycleJournal(
             tmp_path / "cycle.sqlite3", owner_epoch="runner.scene-race.1"
@@ -1137,6 +1146,7 @@ def test_host_start_without_a_result_retains_claim_for_reconciliation(
             owner_epoch="runner.start-unknown.1",
         ),
         headless_client=_Headless(),  # type: ignore[arg-type]
+        execution_transport=_Headless(),  # type: ignore[arg-type]
         admission_client=admission,  # type: ignore[arg-type]
         cycle_journal=journal,
     )
@@ -1226,6 +1236,7 @@ def test_repeated_concurrent_run_observation_is_strictly_read_only(
             owner_epoch="runner.observation",
         ),
         headless_client=_Headless(),  # type: ignore[arg-type]
+        execution_transport=_Headless(),  # type: ignore[arg-type]
         cycle_journal=journal,
     )
     runtime._owner = owner  # type: ignore[assignment]  # noqa: SLF001
@@ -1299,6 +1310,7 @@ def test_runtime_replays_exact_requests_and_keeps_one_active_product_run(
             owner_epoch="program-runner.epoch.1",
         ),
         headless_client=headless,  # type: ignore[arg-type]
+        execution_transport=headless,  # type: ignore[arg-type]
         admission_client=admission,  # type: ignore[arg-type]
         cycle_journal=ProgramCycleJournal(
             tmp_path / "cycle.sqlite3",
@@ -1378,9 +1390,16 @@ def test_runtime_replays_exact_requests_and_keeps_one_active_product_run(
     owner_stop = host.stop_run
 
     def stop_with_terminal_observer(
-        program_run_id: str, *, reason: str | None
+        program_run_id: str,
+        *,
+        reason: str | None,
+        stop_request_id: str | None = None,
     ) -> _Snapshot:
-        snapshot = owner_stop(program_run_id, reason=reason)
+        snapshot = owner_stop(
+            program_run_id,
+            reason=reason,
+            stop_request_id=stop_request_id,
+        )
         runtime._record_terminal_snapshot(snapshot)  # noqa: SLF001
         return snapshot
 
@@ -1420,9 +1439,25 @@ def test_runtime_replays_exact_requests_and_keeps_one_active_product_run(
     assert host.reset_calls == ["program-run.1"]
     assert runtime.cycle_status()["state"] == "idle_after_reset"
 
+    second = runtime.start_run(_start_request(request_id="request.start.after-reset"))
+    assert second["capture"]["program_run_id"] == "program-run.2"
+    assert runtime.cycle_status()["state"] == "running"
+    assert len(host.start_admissions) == 2
+    second_stop = ProgramRunStopRequest.model_validate(
+        {
+            **stop.model_dump(mode="json"),
+            "request_id": "request.stop.2",
+            "program_run_id": "program-run.2",
+        }
+    )
+    runtime.stop_run("program-run.2", second_stop)
+
     runtime.shutdown()
     assert host.shutdowns == 1
-    assert host.stop_calls == [("program-run.1", "operator stop")]
+    assert host.stop_calls == [
+        ("program-run.1", "operator stop"),
+        ("program-run.2", "operator stop"),
+    ]
 
 
 def test_cycle_status_projects_pending_acquire_as_starting(tmp_path) -> None:
@@ -1439,6 +1474,7 @@ def test_cycle_status_projects_pending_acquire_as_starting(tmp_path) -> None:
             headless_url="http://headless.test", owner_epoch="runner.1"
         ),
         headless_client=_Headless(),  # type: ignore[arg-type]
+        execution_transport=_Headless(),  # type: ignore[arg-type]
         admission_client=_Admission(),  # type: ignore[arg-type]
         cycle_journal=journal,
     )
@@ -1469,6 +1505,7 @@ def test_runtime_controls_replay_and_restore_one_run_scoped_ledger(
             owner_epoch=owner_epoch,
         ),
         headless_client=_Headless(),  # type: ignore[arg-type]
+        execution_transport=_Headless(),  # type: ignore[arg-type]
         admission_client=admission,  # type: ignore[arg-type]
         cycle_journal=ProgramCycleJournal(
             journal_path,
@@ -1579,6 +1616,7 @@ def test_runtime_controls_replay_and_restore_one_run_scoped_ledger(
             owner_epoch=owner_epoch,
         ),
         headless_client=_Headless(),  # type: ignore[arg-type]
+        execution_transport=_Headless(),  # type: ignore[arg-type]
         admission_client=admission,  # type: ignore[arg-type]
         cycle_journal=ProgramCycleJournal(
             journal_path,
@@ -1651,6 +1689,7 @@ def test_replacement_owner_remains_fail_closed_for_later_reconciliation_owner(
             cycle_journal_path=path,
         ),
         headless_client=_Headless(),  # type: ignore[arg-type]
+        execution_transport=_Headless(),  # type: ignore[arg-type]
         admission_client=admission,  # type: ignore[arg-type]
         cycle_journal=replacement,
     )
@@ -1743,6 +1782,7 @@ def test_restart_retries_containment_after_durable_loss_crash_window(
             cell_id="cell",
         ),
         headless_client=_Headless(),  # type: ignore[arg-type]
+        execution_transport=_Headless(),  # type: ignore[arg-type]
         admission_client=_Admission(),  # type: ignore[arg-type]
         cycle_journal=replacement,
     )
@@ -1817,6 +1857,7 @@ def test_explicit_release_rejection_remains_retryable_without_unknown_outcome(
             owner_epoch="runner.current",
         ),
         headless_client=_Headless(),  # type: ignore[arg-type]
+        execution_transport=_Headless(),  # type: ignore[arg-type]
         admission_client=admission,  # type: ignore[arg-type]
         cycle_journal=journal,
     )
@@ -1891,6 +1932,7 @@ def test_rejected_reset_replays_after_state_change_and_retains_capacity(
             maximum_replay_records=2,
         ),
         headless_client=_Headless(),  # type: ignore[arg-type]
+        execution_transport=_Headless(),  # type: ignore[arg-type]
         admission_client=admission,  # type: ignore[arg-type]
         cycle_journal=journal,
     )
@@ -1954,6 +1996,7 @@ def test_stop_retains_claim_until_exact_terminal_snapshot_is_observed(
             owner_epoch="program-runner.epoch.1",
         ),
         headless_client=headless,  # type: ignore[arg-type]
+        execution_transport=headless,  # type: ignore[arg-type]
         admission_client=admission,  # type: ignore[arg-type]
         cycle_journal=ProgramCycleJournal(
             tmp_path / "cycle.sqlite3",
@@ -1968,7 +2011,12 @@ def test_stop_retains_claim_until_exact_terminal_snapshot_is_observed(
     runtime.start()
     runtime.start_run(_start_request())
 
-    def delayed_stop(program_run_id: str, *, reason: str | None) -> _Snapshot:
+    def delayed_stop(
+        program_run_id: str,
+        *,
+        reason: str | None,
+        stop_request_id: str | None = None,
+    ) -> _Snapshot:
         host.stop_calls.append((program_run_id, reason))
         snapshot = _Snapshot(
             program_run_id,
@@ -2066,6 +2114,7 @@ def test_draft_applied_mismatch_is_replayed_without_native_acquire(
             headless_url="http://headless.test", owner_epoch="runner.1"
         ),
         headless_client=headless,  # type: ignore[arg-type]
+        execution_transport=headless,  # type: ignore[arg-type]
         admission_client=admission,  # type: ignore[arg-type]
         cycle_journal=journal,
     )
@@ -2117,6 +2166,7 @@ def test_acquire_success_before_claim_journal_failure_latches_reconciliation(
             headless_url="http://headless.test", owner_epoch="runner.1"
         ),
         headless_client=_Headless(),  # type: ignore[arg-type]
+        execution_transport=_Headless(),  # type: ignore[arg-type]
         admission_client=admission,  # type: ignore[arg-type]
         cycle_journal=journal,
     )
@@ -2158,6 +2208,7 @@ def test_native_acquire_rejection_replays_exact_error_without_second_call(
             headless_url="http://headless.test", owner_epoch="runner.1"
         ),
         headless_client=_Headless(),  # type: ignore[arg-type]
+        execution_transport=_Headless(),  # type: ignore[arg-type]
         admission_client=admission,  # type: ignore[arg-type]
         cycle_journal=ProgramCycleJournal(
             tmp_path / "cycle.sqlite3", owner_epoch="runner.1"
@@ -2201,6 +2252,7 @@ def test_stop_bypasses_transition_lock_and_full_ordinary_ledger(tmp_path) -> Non
             maximum_replay_records=1,
         ),
         headless_client=_Headless(),  # type: ignore[arg-type]
+        execution_transport=_Headless(),  # type: ignore[arg-type]
         admission_client=_Admission(),  # type: ignore[arg-type]
         cycle_journal=journal,
     )
@@ -2232,9 +2284,18 @@ def test_stop_bypasses_transition_lock_and_full_ordinary_ledger(tmp_path) -> Non
     completed = Event()
     original = host.stop_run
 
-    def observed_stop(program_run_id: str, *, reason: str | None) -> _Snapshot:
+    def observed_stop(
+        program_run_id: str,
+        *,
+        reason: str | None,
+        stop_request_id: str | None = None,
+    ) -> _Snapshot:
         reached.set()
-        return original(program_run_id, reason=reason)
+        return original(
+            program_run_id,
+            reason=reason,
+            stop_request_id=stop_request_id,
+        )
 
     host.stop_run = observed_stop  # type: ignore[method-assign]
 
@@ -2266,6 +2327,7 @@ def test_runtime_rejects_a_stale_applied_selection_before_tree_admission(
             owner_epoch="program-runner.test",
         ),
         headless_client=headless,  # type: ignore[arg-type]
+        execution_transport=headless,  # type: ignore[arg-type]
         admission_client=_Admission(),  # type: ignore[arg-type]
         cycle_journal=ProgramCycleJournal(
             tmp_path / "cycle.sqlite3",
@@ -2305,6 +2367,7 @@ def test_runtime_injects_and_closes_the_focused_simulation_owner() -> None:
     runtime = ProgramRuntime(
         ProgramRunnerConfig(headless_url="http://headless.test"),
         headless_client=_Headless(),  # type: ignore[arg-type]
+        execution_transport=_Headless(),  # type: ignore[arg-type]
         simulation_control=simulation,  # type: ignore[arg-type]
     )
 
@@ -2325,6 +2388,7 @@ def test_runtime_injects_and_closes_the_program_snapshot_source() -> None:
     runtime = ProgramRuntime(
         ProgramRunnerConfig(headless_url="http://headless.test"),
         headless_client=headless,  # type: ignore[arg-type]
+        execution_transport=headless,  # type: ignore[arg-type]
         model_transport=model,  # type: ignore[arg-type]
         snapshot_source=snapshot,  # type: ignore[arg-type]
     )

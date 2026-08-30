@@ -1928,6 +1928,7 @@ describe('addressed Robot Control parsers', () => {
     const identity = {
       active_publication_generation: 1,
       cell_id: 'cell-1',
+      control_management_mode: 'component_lifecycle',
       graph_revision: 'sha256:graph',
       gripper_command_schema_id: 'gripper.command_position',
       gripper_command_schema_revision: exactRevision,
@@ -1941,10 +1942,12 @@ describe('addressed Robot Control parsers', () => {
       scene_revision: sceneRevision,
       schema_version: 'manyforge.execution_identity.v1',
     };
-    expect(parseExecutionIdentity({
+    const parsedIdentity = parseExecutionIdentity({
       command: 'identity', identity, ok: true,
       api_version: 'manyforge.execution_command_response.v1',
-    }).ownerEpoch).toBe('owner-1');
+    });
+    expect(parsedIdentity.ownerEpoch).toBe('owner-1');
+    expect(parsedIdentity.controlManagementMode).toBe('component_lifecycle');
     const {
       observed_state: observedMotion,
       ...motionTarget

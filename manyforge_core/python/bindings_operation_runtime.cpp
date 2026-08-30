@@ -51,6 +51,7 @@ void register_operation_runtime_bindings(py::module_& module) {
              StopScopeResolutionReasonDTO::kKnownTerminalOrIdleNoEffect)
       .value("kMalformedOrdinaryIntent", StopScopeResolutionReasonDTO::kMalformedOrdinaryIntent)
       .value("kUnknownOperation", StopScopeResolutionReasonDTO::kUnknownOperation)
+      .value("kUnknownProgramRun", StopScopeResolutionReasonDTO::kUnknownProgramRun)
       .value("kUnknownComponent", StopScopeResolutionReasonDTO::kUnknownComponent)
       .value("kUnknownResource", StopScopeResolutionReasonDTO::kUnknownResource)
       .value("kRequestIdentityConflict", StopScopeResolutionReasonDTO::kRequestIdentityConflict)
@@ -113,6 +114,12 @@ void register_operation_runtime_bindings(py::module_& module) {
       .def(py::self == py::self)
       .def(py::self != py::self);
 
+  py::class_<StopProgramRunTargetDTO>(module, "StopProgramRunTargetDTO", py::is_final())
+      .def(py::init<ProgramRunId>(), py::arg("program_run_id"))
+      .def_readonly("program_run_id", &StopProgramRunTargetDTO::program_run_id)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+
   py::class_<StopIntentDTO>(module, "StopIntentDTO", py::is_final())
       .def_static(
           "for_operations",
@@ -143,6 +150,16 @@ void register_operation_runtime_bindings(py::module_& module) {
           },
           py::arg("request_context"), py::arg("resources"), py::arg("reason") = std::nullopt,
           py::arg("attribution") = RequestAttributionDTO{})
+      .def_static(
+          "for_program_runs",
+          [](PublicRequestContextDTO request_context,
+             std::vector<StopProgramRunTargetDTO> program_runs, std::optional<std::string> reason,
+             RequestAttributionDTO attribution) {
+            return make_stop_intent(std::move(request_context), std::move(program_runs),
+                                    std::move(reason), std::move(attribution));
+          },
+          py::arg("request_context"), py::arg("program_runs"), py::arg("reason") = std::nullopt,
+          py::arg("attribution") = RequestAttributionDTO{})
       .def_readonly("request_context", &StopIntentDTO::request_context)
       .def_readonly("reason", &StopIntentDTO::reason)
       .def_readonly("attribution", &StopIntentDTO::attribution)
@@ -155,7 +172,10 @@ void register_operation_runtime_bindings(py::module_& module) {
             if (std::holds_alternative<std::vector<StopComponentTargetDTO>>(value.selector)) {
               return std::string("components");
             }
-            return std::string("resources");
+            if (std::holds_alternative<std::vector<StopResourceTargetDTO>>(value.selector)) {
+              return std::string("resources");
+            }
+            return std::string("program_runs");
           })
       .def_property_readonly(
           "operations",
@@ -175,6 +195,12 @@ void register_operation_runtime_bindings(py::module_& module) {
                                    std::get_if<std::vector<StopResourceTargetDTO>>(&value.selector);
                                return rows == nullptr ? py::none() : py::cast(*rows);
                              })
+      .def_property_readonly(
+          "program_runs",
+          [](const StopIntentDTO& value) -> py::object {
+            const auto* rows = std::get_if<std::vector<StopProgramRunTargetDTO>>(&value.selector);
+            return rows == nullptr ? py::none() : py::cast(*rows);
+          })
       .def("field_error",
            [](const StopIntentDTO& value) {
              const auto error = stop_intent_field_error(value);

@@ -77,6 +77,7 @@ const execution = {
   ownerEpoch: 'kernel-owner.1',
   cellId: 'cell.1',
   activePublicationGeneration: 1,
+  controlManagementMode: 'component_lifecycle',
   graphRevision: snapshot.graphRevision,
   retainedBundleId: snapshot.retainedBundleId,
   sceneRevision: {

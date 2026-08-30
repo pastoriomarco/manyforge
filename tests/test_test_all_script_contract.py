@@ -188,7 +188,23 @@ def test_roboplan_suite_qualifies_only_the_retained_product_consumer() -> None:
     assert body.index("if ! cmake --build") < body.index(
         'require_ctest_tests "manyforge_roboplan"'
     )
+    assert body.index('cd "$build"') < body.index(
+        'require_ctest_tests "manyforge_roboplan"'
+    )
     assert body.count("ctest --output-on-failure") == 1
+
+
+def test_headless_required_process_cases_name_the_current_semantic_tests() -> None:
+    source = _TEST_ALL.read_text(encoding="utf-8")
+    body = source.split("run_headless_cpp_tests() {", 1)[1].split(
+        "run_headless_python_tests() {", 1
+    )[0]
+
+    assert (
+        "ManagerDaemonProcess.CompatibleNativeReplacementUsesFreshEpochAfterCleanStop"
+        in body
+    )
+    assert "DistinctNativePackageUsesFreshManagerGenerationAfterCleanStop" not in body
 
 
 def test_headless_selector_builds_producer_closure_before_native_headless(
@@ -243,7 +259,7 @@ def test_headless_selector_builds_producer_closure_before_native_headless(
         "  printf '%s\\n' 'Test #1: ManagerDaemonProcess.RejectsPreManifestRootWithTypedStartupErrorBeforeIngress'\n"
         "  if [ \"${FAKE_CTEST_OMIT_NATIVE:-0}\" != 1 ]; then\n"
         "    printf '%s\\n' \\\n"
-        "      'Test #2: ManagerDaemonProcess.DistinctNativePackageUsesFreshManagerGenerationAfterCleanStop' \\\n"
+            "      'Test #2: ManagerDaemonProcess.CompatibleNativeReplacementUsesFreshEpochAfterCleanStop' \\\n"
         "      'Test #3: ManagerDaemonProcess.RuntimeOnlyNamedApplyUsesTheRealManagedFenceAndSurvivesReplacement' \\\n"
         "      'Test #4: ManagerDaemonProcess.PhysicalCompositionReopensAfterChildAndManagerReplacement'\n"
         "  fi\n"

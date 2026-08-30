@@ -42,7 +42,6 @@ from .models import (
     RuntimeOverridePromotionRequest,
     RuntimeOverrideStageRequest,
     OperationControlRequest,
-    OperationRecoveryActionRequest,
     OperationIntentRequest,
     PickSequencePlanningRequest,
     PlaceSequencePlanningRequest,
@@ -966,34 +965,6 @@ def create_app(
         operation_id: Annotated[str, Path(min_length=1, max_length=256)],
     ) -> JSONResponse:
         return execution_response(service.execution_read(operation_id))
-
-    @app.get(
-        "/api/private/program-runner/execution/operations/{operation_id}/recovery"
-    )
-    def execution_operation_recovery(
-        operation_id: Annotated[str, Path(min_length=1, max_length=256)],
-    ) -> JSONResponse:
-        return execution_response(
-            service.execution_operation_recovery(operation_id)
-        )
-
-    @app.post(
-        "/api/private/program-runner/execution/operations/{operation_id}/recovery"
-    )
-    def execution_apply_operation_recovery(
-        operation_id: Annotated[str, Path(min_length=1, max_length=256)],
-        expected_operation_revision: Annotated[
-            int, Query(ge=1, le=9_007_199_254_740_991)
-        ],
-        body: OperationRecoveryActionRequest,
-    ) -> JSONResponse:
-        return execution_response(
-            service.execution_apply_operation_recovery(
-                operation_id,
-                expected_operation_revision,
-                body,
-            )
-        )
 
     @app.post("/api/execution/pick-place/plans/pick")
     def execution_plan_pick(

@@ -89,6 +89,7 @@ struct RetainedGripperCommandBackend::SharedState {
     std::optional<core::ScheduleHandle> scheduled_handle;
     std::uint64_t schedule_generation{};
     int terminal_projection_attempts{};
+    std::optional<core::AddressedGripperCommandIdentityDTO> addressed_identity;
   };
 
   std::shared_ptr<IRetainedObservedStateChannel> state_channel;
@@ -664,6 +665,7 @@ core::GripperCommandResultDTO RetainedGripperCommandBackend::command_gripper(
     runtime.started_at_ns = state_->clock->now();
     runtime.deadline_ns = saturating_deadline(runtime.started_at_ns,
                                               duration_ns(request.duration_s));
+    runtime.addressed_identity = request.addressed_identity;
     first_deadline =
         request.duration_s <= 0.0
             ? runtime.started_at_ns
@@ -1053,20 +1055,132 @@ RetainedGripperCommandBackend::TranslateStopStage(
   const auto stage_deadline_ns = std::min(
       saturating_deadline(started_at, budget.remaining_outer_duration_ns),
       saturating_deadline(started_at, phase->remaining_deadline_offset_ns));
-  if (command.containment_command.command_kind ==
-      core::StopContainmentCommandKind::kControllerGoalCancel) {
-    return failure("controller_goal_dispatch_membership_unavailable",
-                   "native gripper execution has no exact goal-bound "
-                   "dispatch membership");
-  }
-  if (command.containment_command.command_kind !=
-          core::StopContainmentCommandKind::kRegistered ||
-      !command.containment_command.registered_command_kind_id.has_value() ||
-      command.containment_command.registered_command_kind_id->value() !=
-          "manyforge.stop.software_hard") {
+  const bool controller_goal_cancel =
+      command.containment_command.command_kind ==
+      core::StopContainmentCommandKind::kControllerGoalCancel;
+  const bool software_hard =
+      command.containment_command.command_kind ==
+          core::StopContainmentCommandKind::kRegistered &&
+      command.containment_command.registered_command_kind_id.has_value() &&
+      command.containment_command.registered_command_kind_id->value() ==
+          "manyforge.stop.software_hard";
+  if (!controller_goal_cancel && !software_hard) {
     return failure("resolved_stop_stage_command_mismatch",
-                   "native gripper Stop does not name its registered "
-                   "software-hard command");
+                   "native gripper Stop does not name goal cancel or its "
+                   "registered software-hard command");
+  }
+  std::optional<core::AddressedGripperCommandIdentityDTO> addressed_identity;
+  std::optional<core::GripperCommandStatusDTO> addressed_status;
+  if (controller_goal_cancel) {
+    {
+      std::lock_guard<std::mutex> lock(state_->mutex);
+      const auto current =
+          state_->runtimes.find(stage.command_target_id.value());
+      if (current != state_->runtimes.end()) {
+        addressed_identity = current->second.addressed_identity;
+        addressed_status = current->second.status;
+      }
+    }
+    const bool exact_goal =
+        addressed_identity.has_value() && addressed_status.has_value() &&
+        addressed_identity->operation_id == stage.operation_id &&
+        addressed_identity->operation_revision == stage.operation_revision &&
+        addressed_identity->participant_id == stage.participant_id &&
+        addressed_identity->controller_goal_id == stage.controller_goal_id &&
+        addressed_identity->controller_goal_generation ==
+            stage.controller_goal_generation &&
+        addressed_status->state != core::GripperCommandState::kFailed &&
+        addressed_status->command_id != 0U &&
+        addressed_status->generation != 0U && addressed_status->revision != 0U;
+    if (!exact_goal) {
+      return failure(
+          "controller_goal_dispatch_membership_unavailable",
+          "native gripper Stop cannot prove exact prepared-goal membership");
+    }
+  }
+
+  core::ParticipantStopStageResultDTO result{
+      stage,
+      core::StopStageAttemptDispositionDTO::kDispatched,
+      core::ParticipantStopStageOutcomeDTO::kFailed,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::max<std::int64_t>(0, state_->clock->now() - started_at),
+      {},
+      std::nullopt};
+  const auto fail_after_dispatch = [&](std::string reason,
+                                       std::string message) {
+    result.error = core::ErrorDTO{core::kErrorMotionInterruptBackendStopFailed,
+                                  std::move(message),
+                                  {{"reason", std::move(reason)}}};
+    result.evidence_items.clear();
+    result.evidence_items.reserve(command.evidence_requirements.size());
+    for (const auto &requirement : command.evidence_requirements) {
+      result.evidence_items.push_back({requirement.requirement.evidence_item_id,
+                                       requirement.requirement.evidence_kind,
+                                       core::StopEvidenceItemStateDTO::kMissing,
+                                       requirement.resolved_source,
+                                       std::nullopt, std::nullopt, std::nullopt,
+                                       std::nullopt, result.error});
+    }
+    return result;
+  };
+
+  if (controller_goal_cancel) {
+    invalidate_gripper_commands(core::GripperInvalidationReason::kStop);
+    std::optional<core::AddressedGripperCommandIdentityDTO> terminal_identity;
+    std::optional<core::GripperCommandStatusDTO> terminal_status;
+    {
+      std::lock_guard<std::mutex> lock(state_->mutex);
+      const auto current =
+          state_->runtimes.find(stage.command_target_id.value());
+      if (current != state_->runtimes.end()) {
+        terminal_identity = current->second.addressed_identity;
+        terminal_status = current->second.status;
+      }
+    }
+    const bool exact_terminal =
+        terminal_identity == addressed_identity &&
+        terminal_status.has_value() &&
+        terminal_status->command_id == addressed_status->command_id &&
+        terminal_status->state == core::GripperCommandState::kIdle &&
+        terminal_status->generation > addressed_status->generation &&
+        terminal_status->revision > addressed_status->revision;
+    if (!exact_terminal) {
+      return fail_after_dispatch(
+          "stop_goal_terminal_state_mismatch",
+          "native gripper goal did not reach its exact cancelled terminal");
+    }
+    result.evidence_items.reserve(command.evidence_requirements.size());
+    for (const auto &requirement : command.evidence_requirements) {
+      if (requirement.requirement.evidence_kind !=
+              core::StopEvidenceRequirementKind::kControllerGoalTerminal ||
+          requirement.resolved_source.source_kind !=
+              core::StopEvidenceSourceKind::kControllerGoalStatus ||
+          requirement.resolved_source.runtime_target.provider_runtime_epoch !=
+              path.provider_runtime_epoch) {
+        return fail_after_dispatch("stop_evidence_source_mismatch",
+                                   "native gripper goal-terminal evidence "
+                                   "differs from its retained source");
+      }
+      result.evidence_items.push_back(
+          {requirement.requirement.evidence_item_id,
+           requirement.requirement.evidence_kind,
+           core::StopEvidenceItemStateDTO::kSatisfied,
+           requirement.resolved_source, path.provider_runtime_epoch,
+           terminal_status->generation, 0, core::JsonValueDTO{true},
+           std::nullopt});
+    }
+    result.controller_acknowledgement_sequence = terminal_status->generation;
+    result.source_epoch = path.provider_runtime_epoch;
+    result.source_sequence = terminal_status->generation;
+    result.outcome = core::ParticipantStopStageOutcomeDTO::kSucceeded;
+    result.receiver_elapsed_duration_ns =
+        std::max<std::int64_t>(0, state_->clock->now() - started_at);
+    return result;
   }
 
   const auto before_now_ns = state_->clock->now();
@@ -1106,35 +1220,6 @@ RetainedGripperCommandBackend::TranslateStopStage(
       positions, velocities, projection_time, projection_time,
       stage_deadline_ns, cancellation);
 
-  core::ParticipantStopStageResultDTO result{
-      stage,
-      core::StopStageAttemptDispositionDTO::kDispatched,
-      core::ParticipantStopStageOutcomeDTO::kFailed,
-      std::nullopt,
-      std::nullopt,
-      std::nullopt,
-      std::nullopt,
-      std::nullopt,
-      std::max<std::int64_t>(0, state_->clock->now() - started_at),
-      {},
-      std::nullopt};
-  const auto fail_after_dispatch = [&](std::string reason,
-                                       std::string message) {
-    result.error = core::ErrorDTO{core::kErrorMotionInterruptBackendStopFailed,
-                                  std::move(message),
-                                  {{"reason", std::move(reason)}}};
-    result.evidence_items.clear();
-    result.evidence_items.reserve(command.evidence_requirements.size());
-    for (const auto &requirement : command.evidence_requirements) {
-      result.evidence_items.push_back({requirement.requirement.evidence_item_id,
-                                       requirement.requirement.evidence_kind,
-                                       core::StopEvidenceItemStateDTO::kMissing,
-                                       requirement.resolved_source,
-                                       std::nullopt, std::nullopt, std::nullopt,
-                                       std::nullopt, result.error});
-    }
-    return result;
-  };
   if (!projected.applied()) {
     return fail_after_dispatch(
         projection_reason(projected),
@@ -1155,10 +1240,10 @@ RetainedGripperCommandBackend::TranslateStopStage(
   const auto observed = state_->state_channel->current_state_bounded(
       observed_now_ns, stage_deadline_ns, cancellation);
   if (!observed.ok()) {
-    return fail_after_dispatch(
-        cancellation.stop_requested() ? "stop_evidence_observation_cancelled"
-                                      : "stop_evidence_source_unavailable",
-        observed.error().message);
+    return fail_after_dispatch(cancellation.stop_requested()
+                                   ? "stop_evidence_observation_cancelled"
+                                   : "stop_evidence_source_unavailable",
+                               observed.error().message);
   }
   if (!observed.value().velocities.has_value() ||
       observed.value().resources != exact_resources ||

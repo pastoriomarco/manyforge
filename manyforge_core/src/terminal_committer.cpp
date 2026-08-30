@@ -2,10 +2,8 @@
 
 namespace manyforge::core {
 
-TerminalCommitter::TerminalCommitter(ExecutionStateMachine& sm,
-                                     Probe stop_requested,
-                                     Probe fault_latch_active,
-                                     Probe trip_stop_active)
+TerminalCommitter::TerminalCommitter(ExecutionStateMachine& sm, Probe stop_requested,
+                                     Probe fault_latch_active, Probe trip_stop_active)
     : sm_(sm),
       stop_requested_(std::move(stop_requested)),
       fault_latch_active_(std::move(fault_latch_active)),
@@ -27,8 +25,8 @@ bool TerminalCommitter::is_terminal(ExecutionState state) {
 ExecutionState TerminalCommitter::decide(const CommitRequest& request,
                                          ExecutionState current) const {
   const ExecutionState proposed = request.proposed;
-  const bool stop_owner = request.origin == Origin::kStopAuthority ||
-                          request.origin == Origin::kMotionTrip;
+  const bool stop_owner =
+      request.origin == Origin::kStopAuthority || request.origin == Origin::kMotionTrip;
   const bool trip_owner = request.origin == Origin::kMotionTrip;
   // Deterministic authority priority (spec/230): a safety authority
   // asserted at commit time outranks a NORMAL terminal proposal.
@@ -36,8 +34,7 @@ ExecutionState TerminalCommitter::decide(const CommitRequest& request,
   //   InterventionRequired > Interrupted (fault latch) > Stopped (operator)
   //   > Failed > Completed.
   if (proposed == ExecutionState::kInterventionRequired ||
-      proposed == ExecutionState::kInterrupted ||
-      proposed == ExecutionState::kStopped) {
+      proposed == ExecutionState::kInterrupted || proposed == ExecutionState::kStopped) {
     return proposed;
   }
   // Commits from kStopping are the stop/trip authority CONCLUDING its own
@@ -67,11 +64,27 @@ ExecutionState TerminalCommitter::decide(const CommitRequest& request,
   return proposed;
 }
 
-TerminalCommitter::CommitOutcome TerminalCommitter::commit(
-    const CommitRequest& request) {
+TerminalCommitter::CommitOutcome TerminalCommitter::commit(const CommitRequest& request) {
   std::lock_guard<std::mutex> lock(commit_mutex_);
   CommitOutcome outcome;
-  const ExecutionState current = sm_.status().state;
+  ExecutionState current = sm_.status().state;
+  outcome.previous = current;
+
+  // A Stop authority may arrive only after another owner has already proved
+  // physical containment. Serialize its Executing/Paused -> Stopping ->
+  // Stopped local settlement here so a concurrent natural terminal cannot
+  // enter between those two transitions. No backend effect is issued here.
+  if (request.origin == Origin::kStopAuthority && request.proposed == ExecutionState::kStopped &&
+      (current == ExecutionState::kExecuting || current == ExecutionState::kPaused)) {
+    auto stopping = sm_.try_transition(ExecutionState::kStopping);
+    if (!stopping.ok()) {
+      outcome.committed = sm_.status().state;
+      outcome.overrode = outcome.committed != request.proposed;
+      outcome.accepted = false;
+      return outcome;
+    }
+    current = ExecutionState::kStopping;
+  }
   ExecutionState decided = decide(request, current);
   if (current == decided) {
     outcome.committed = decided;

@@ -2212,7 +2212,8 @@ TEST(ManagerDaemonProcess,
                                         "maintained.scenario-catalog.yaml"));
     const auto replayed = SendCommand(directory.socket_path(), request);
     EXPECT_NE(replayed.find("\"replay_status\":\"replayed_exact\""),
-              std::string::npos);
+              std::string::npos)
+        << replayed;
 
     component_manager::SqliteManagerApplyJournal journal(
         directory.manager_root() /

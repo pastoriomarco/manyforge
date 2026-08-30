@@ -7,6 +7,7 @@
 #include <manyforge_core/types/execution_status.hpp>
 #include <manyforge_core/types/gripper.hpp>
 #include <manyforge_core/types/kernel_event.hpp>
+#include <manyforge_core/types/participant_stop_stage.hpp>
 #include <manyforge_core/types/recovery.hpp>
 #include <manyforge_core/types/runtime_scale.hpp>
 #include <manyforge_core/types/stop_certificate.hpp>
@@ -14,6 +15,37 @@
 #include <string>
 
 namespace manyforge::core {
+
+/// Exact process-local handoff after the addressed owner has proved either
+/// physical containment for one dispatched participant or effect-free
+/// cancellation behind the coordinated dispatch barrier. The aggregate Stop
+/// certificate identity is reserved by the addressed owner; the participant
+/// records only this reference and MUST NOT issue another Stop or certificate.
+struct AddressedParticipantStopSettlementRequestDTO final {
+  std::uint64_t execution_id{};
+  StopCertificateRefDTO aggregate_stop_certificate;
+  /// Carries the exact addressed operation/participant/goal identity in both
+  /// cases. For effect-free cancellation it has kNotDispatched disposition,
+  /// successful outcome, no evidence items, and is never retained as a
+  /// physical Stop-stage attempt.
+  ParticipantStopStageResultDTO containment;
+  OperationParticipantPayloadKind payload_kind{OperationParticipantPayloadKind::kMotion};
+  bool effect_prevented_before_dispatch{};
+};
+
+/// Participant-owned terminal fact returned synchronously to the addressed
+/// reducer.  Repeating the exact request returns the same fact; a conflicting
+/// Stop identity is rejected without changing the participant terminal.
+struct AddressedParticipantStopSettlementDTO final {
+  std::uint64_t execution_id{};
+  StopCertificateRefDTO aggregate_stop_certificate;
+  OperationId operation_id;
+  OperationParticipantId participant_id;
+  ControllerGoalId controller_goal_id;
+  ControllerGoalGeneration controller_goal_generation;
+  ExecutionState terminal_state{ExecutionState::kIdle};
+  KernelRecoveryAssessmentDTO recovery_assessment;
+};
 
 /// Subordinate single-participant execution mechanism used by the addressed
 /// Kernel owner. It does not resolve Program roles, select a robot/group, or
@@ -23,17 +55,18 @@ class IResolvedParticipantExecutionEngine {
   virtual ~IResolvedParticipantExecutionEngine() = default;
 
   virtual Result<std::uint64_t> execute(const ExecuteRequestDTO& request) = 0;
-  /// Commit the local terminal/recovery view of one exact motion execution
-  /// after the addressed owner has already stopped its exact controller goal.
-  /// This process-local handoff MUST NOT issue another backend Stop command.
-  virtual Result<void> adopt_certified_motion_stop(
-      std::uint64_t execution_id, const StopCertificateRefDTO& certificate) {
-    (void)execution_id;
-    (void)certificate;
-    return Result<void>::Err(
-        ErrorDTO{"certified_motion_stop_adoption_unavailable",
-                 "participant execution engine cannot adopt addressed Stop evidence",
-                 {{"reason", "certified_motion_stop_adoption_unavailable"}}});
+  /// Commit and return the local terminal/recovery fact for one exact
+  /// participant after the addressed owner has already contained its exact
+  /// dispatched goal or proved that dispatch never occurred. This
+  /// process-local handoff MUST NOT issue another backend Stop command or
+  /// publish another Stop certificate.
+  virtual Result<AddressedParticipantStopSettlementDTO> settle_addressed_participant_stop(
+      const AddressedParticipantStopSettlementRequestDTO& request) {
+    (void)request;
+    return Result<AddressedParticipantStopSettlementDTO>::Err(
+        ErrorDTO{"addressed_participant_stop_settlement_unavailable",
+                 "participant execution engine cannot settle addressed Stop evidence",
+                 {{"reason", "addressed_participant_stop_settlement_unavailable"}}});
   }
   virtual PauseResultDTO pause() = 0;
   virtual ResumeResultDTO resume(std::optional<std::uint64_t> expected_epoch = std::nullopt) = 0;
@@ -73,16 +106,11 @@ class IResolvedParticipantExecutionEngine {
                                      std::uint64_t expected_generation) = 0;
 
   virtual ExecutionStatus get_status() const = 0;
-  virtual KernelRecoveryAssessmentDTO get_recovery_assessment() const {
-    return {};
-  }
+  virtual KernelRecoveryAssessmentDTO get_recovery_assessment() const { return {}; }
   virtual KernelRecoveryActionResultDTO apply_recovery_action(
       const KernelRecoveryActionRequestDTO& request) {
     return KernelRecoveryActionResultDTO{
-        request.request_id,
-        request.action,
-        false,
-        get_recovery_assessment(),
+        request.request_id, request.action, false, get_recovery_assessment(),
         ErrorDTO{"recovery_unavailable",
                  "participant execution engine does not expose recovery",
                  {{"reason", "recovery_port_unavailable"}}}};

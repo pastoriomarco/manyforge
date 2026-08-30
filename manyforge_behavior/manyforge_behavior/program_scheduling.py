@@ -278,8 +278,13 @@ class ProgramRunTickHost:
         program_run_id: str,
         *,
         reason: str | None = None,
+        stop_request_id: str | None = None,
     ) -> ProgramRunSnapshot:
-        snapshot = self._owner.stop(program_run_id, reason=reason)
+        snapshot = self._owner.stop(
+            program_run_id,
+            reason=reason,
+            stop_request_id=stop_request_id,
+        )
         if snapshot.state in {
             ProgramRunState.STOPPING,
             ProgramRunState.FINALIZING,
@@ -292,10 +297,15 @@ class ProgramRunTickHost:
         program_run_id: str,
         *,
         reason: str | None = None,
+        stop_request_id: str | None = None,
     ) -> ProgramRunSnapshot:
         """Stop addressed work while leaving the Program tree observable."""
 
-        snapshot = self._owner.stop_motion(program_run_id, reason=reason)
+        snapshot = self._owner.stop_motion(
+            program_run_id,
+            reason=reason,
+            stop_request_id=stop_request_id,
+        )
         self.schedule(program_run_id)
         return snapshot
 

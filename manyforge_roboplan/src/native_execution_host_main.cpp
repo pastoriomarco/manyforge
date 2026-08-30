@@ -1893,6 +1893,23 @@ DecodeStopIntent(const CanonicalValue &value,
       std::move(selector), std::move(reason), attribution};
 }
 
+[[nodiscard]] core::StopIntentDTO
+DecodeProgramRunStopIntent(const CanonicalValue &value,
+                           const core::RequestAttributionDTO &attribution) {
+  Require(value.is_object() && (value.as_object().size() == 2U ||
+                                value.as_object().size() == 3U),
+          "Program-run Stop intent has an unknown or missing field");
+  std::optional<std::string> reason;
+  if (value.find_object_member("reason") != nullptr) {
+    reason = OptionalBoundedText(value, "reason", kMaximumReasonBytes);
+  }
+  return core::StopIntentDTO{
+      DecodeRequestContext(Member(value, "request_context")),
+      std::vector<core::StopProgramRunTargetDTO>{core::StopProgramRunTargetDTO{
+          core::ProgramRunId(Text(value, "program_run_id"))}},
+      std::move(reason), attribution};
+}
+
 [[nodiscard]] core::FullStopIntentDTO
 DecodeFullStopIntent(const CanonicalValue &value,
                      const core::RequestAttributionDTO &attribution) {
@@ -1988,14 +2005,14 @@ DecodeOperationRecoveryRequest(const CanonicalValue &value) {
   return core::KernelRecoveryActionRequestDTO{
       Text(value, "request_id"),
       DecodeRecoveryAction(Text(value, "action")),
-      Text(value, "principal_id"),
+      Text(value, "principal_id", true),
       Counter(value, "expected_assessment_revision", 1U),
       Counter(value, "expected_control_command_epoch", 0U),
       Counter(value, "expected_execution_id", 1U),
-      Text(value, "expected_latch_id"),
-      Text(value, "expected_stop_certificate_id"),
+      Text(value, "expected_latch_id", true),
+      Text(value, "expected_stop_certificate_id", true),
       Counter(value, "expected_stop_owner_generation", 0U),
-      Text(value, "reason")};
+      Text(value, "reason", true)};
 }
 
 enum class CommandKind {
@@ -2009,6 +2026,7 @@ enum class CommandKind {
   kPreviewCapabilityCommand,
   kSubmit,
   kRead,
+  kReadStop,
   kGetOperationRecovery,
   kApplyOperationRecovery,
   kPause,
@@ -2016,6 +2034,7 @@ enum class CommandKind {
   kReset,
   kAcknowledgeCompleted,
   kStop,
+  kStopProgramRun,
   kFullStop,
   kMalformedStop,
   kGetStopFault,
@@ -2043,6 +2062,7 @@ struct Command final {
   std::optional<core::OperationIntentDTO> operation;
   std::optional<core::ContentDigest> operation_digest;
   std::optional<core::OperationId> operation_id;
+  std::optional<core::StopId> stop_id;
   std::optional<core::OperationControlRequestDTO> control;
   std::optional<core::OperationRevision> expected_operation_revision;
   std::optional<core::KernelRecoveryActionRequestDTO> operation_recovery;
@@ -2110,6 +2130,19 @@ struct Command final {
     RequireExactObjectSize(root, 3U, "read command");
     Command decoded{CommandKind::kRead};
     decoded.operation_id = core::OperationId(Text(root, "operation_id"));
+    return decoded;
+  }
+  if (command == "read_stop") {
+    RequireExactObjectSize(root, 4U, "Stop-status read command");
+    const auto attribution =
+        DecodeRequestAttribution(Member(root, "attribution"));
+    Require(attribution.transport == core::RequestTransportDTO::kInternal &&
+                attribution.assurance ==
+                    core::RequestAssuranceDTO::kUnverified &&
+                !attribution.principal_id.has_value(),
+            "Stop-status read requires internal unverified attribution");
+    Command decoded{CommandKind::kReadStop};
+    decoded.stop_id = core::StopId(Text(root, "stop_id"));
     return decoded;
   }
   if (command == "get_operation_recovery") {
@@ -2214,6 +2247,20 @@ struct Command final {
         DecodeRequestAttribution(Member(root, "attribution"));
     Command decoded{CommandKind::kStop};
     decoded.stop = DecodeStopIntent(Member(root, "request"), attribution);
+    return decoded;
+  }
+  if (command == "stop_program_run") {
+    RequireExactObjectSize(root, 4U, "Program-run Stop command");
+    const auto attribution =
+        DecodeRequestAttribution(Member(root, "attribution"));
+    Require(attribution.transport == core::RequestTransportDTO::kInternal &&
+                attribution.assurance ==
+                    core::RequestAssuranceDTO::kUnverified &&
+                !attribution.principal_id.has_value(),
+            "Program-run Stop requires internal unverified attribution");
+    Command decoded{CommandKind::kStopProgramRun};
+    decoded.stop =
+        DecodeProgramRunStopIntent(Member(root, "request"), attribution);
     return decoded;
   }
   if (command == "full_stop") {
@@ -2987,6 +3034,25 @@ StopAcceptedValue(const core::StopAcceptedDTO &value) {
 }
 
 [[nodiscard]] std::string_view
+StopStatusStateName(const core::StopStatusStateDTO state) noexcept {
+  switch (state) {
+  case core::StopStatusStateDTO::kAccepted:
+    return "accepted";
+  case core::StopStatusStateDTO::kStopping:
+    return "stopping";
+  case core::StopStatusStateDTO::kCertifying:
+    return "certifying";
+  case core::StopStatusStateDTO::kSucceeded:
+    return "succeeded";
+  case core::StopStatusStateDTO::kPartial:
+    return "partial";
+  case core::StopStatusStateDTO::kFailed:
+    return "failed";
+  }
+  return "unknown";
+}
+
+[[nodiscard]] std::string_view
 StopFaultTriggerName(const core::StopFaultTriggerDTO trigger) noexcept {
   switch (trigger) {
   case core::StopFaultTriggerDTO::kScopePromotion:
@@ -3069,6 +3135,18 @@ StopCertificateRefValue(const core::StopCertificateRefDTO &value) {
       {"stop_generation",
        CanonicalValue(static_cast<double>(value.stop_generation.value()))},
       {"stop_id", CanonicalValue(value.stop_id.value())},
+  });
+}
+
+[[nodiscard]] CanonicalValue
+StopStatusSummaryValue(const core::StopStatusDTO &value) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"request_id", CanonicalValue(value.accepted.request_id.value())},
+      {"schema_version", CanonicalValue("manyforge.execution_stop_status.v1")},
+      {"state", CanonicalValue(std::string(StopStatusStateName(value.state)))},
+      {"stop_generation", CanonicalValue(static_cast<double>(
+                              value.accepted.stop_generation.value()))},
+      {"stop_id", CanonicalValue(value.accepted.stop_id.value())},
   });
 }
 
@@ -8525,8 +8603,9 @@ private:
 
   [[nodiscard]] CanonicalValue ExecuteStop(const Command &command,
                                            Composition &composition) {
-    const bool ordinary =
-        command.kind == CommandKind::kStop && command.stop.has_value();
+    const bool ordinary = (command.kind == CommandKind::kStop ||
+                           command.kind == CommandKind::kStopProgramRun) &&
+                          command.stop.has_value();
     const bool full =
         command.kind == CommandKind::kFullStop && command.full_stop.has_value();
     const bool malformed = command.kind == CommandKind::kMalformedStop &&
@@ -8560,7 +8639,11 @@ private:
     return CanonicalValue(CanonicalValue::Object{
         {"accepted", StopAcceptedValue(result.value())},
         {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-        {"command", CanonicalValue(full ? "full_stop" : "stop")},
+        {"command",
+         CanonicalValue(full ? "full_stop"
+                        : command.kind == CommandKind::kStopProgramRun
+                            ? "stop_program_run"
+                            : "stop")},
         {"ok", CanonicalValue(true)},
     });
   }
@@ -8601,7 +8684,26 @@ private:
           {"ok", CanonicalValue(true)},
       });
     }
+    if (command.kind == CommandKind::kReadStop) {
+      const auto status =
+          composition.runtime->addressed_kernel->get_stop_status(
+              *command.stop_id);
+      if (!status.ok()) {
+        return CanonicalValue(CanonicalValue::Object{
+            {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+            {"error", ErrorValue(status.error())},
+            {"ok", CanonicalValue(false)},
+        });
+      }
+      return CanonicalValue(CanonicalValue::Object{
+          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+          {"command", CanonicalValue("read_stop")},
+          {"ok", CanonicalValue(true)},
+          {"stop_status", StopStatusSummaryValue(status.value())},
+      });
+    }
     if (command.kind == CommandKind::kStop ||
+        command.kind == CommandKind::kStopProgramRun ||
         command.kind == CommandKind::kFullStop ||
         command.kind == CommandKind::kMalformedStop) {
       return ExecuteStop(command, composition);
@@ -8609,6 +8711,7 @@ private:
     const bool read_only = command.kind == CommandKind::kObservation ||
                            command.kind == CommandKind::kGetStopFault ||
                            command.kind == CommandKind::kRead ||
+                           command.kind == CommandKind::kReadStop ||
                            command.kind == CommandKind::kGetOperationRecovery ||
                            command.kind == CommandKind::kGetRuntimeScale ||
                            command.kind == CommandKind::kReadPickPlaceSequence;
@@ -9020,9 +9123,11 @@ private:
       case CommandKind::kPreviewCapabilityCommand:
       case CommandKind::kSubmit:
       case CommandKind::kRead:
+      case CommandKind::kReadStop:
       case CommandKind::kGetOperationRecovery:
       case CommandKind::kApplyOperationRecovery:
       case CommandKind::kStop:
+      case CommandKind::kStopProgramRun:
       case CommandKind::kFullStop:
       case CommandKind::kMalformedStop:
       case CommandKind::kGetStopFault:

@@ -1,9 +1,8 @@
 #pragma once
 
+#include <functional>
 #include <manyforge_core/state_machine.hpp>
 #include <manyforge_core/types/execution_status.hpp>
-
-#include <functional>
 #include <mutex>
 #include <string>
 
@@ -49,6 +48,8 @@ class TerminalCommitter {
   };
 
   struct CommitOutcome {
+    /// State observed at this serialized terminal decision boundary.
+    ExecutionState previous{ExecutionState::kIdle};
     /// The terminal actually committed (authority-decided; may differ
     /// from `proposed`). Callers publishing snapshots/events for this
     /// commit MUST use this state, not the proposed one.
@@ -61,9 +62,7 @@ class TerminalCommitter {
     constexpr bool ok() const { return accepted; }
   };
 
-  TerminalCommitter(ExecutionStateMachine& sm,
-                    Probe stop_requested,
-                    Probe fault_latch_active,
+  TerminalCommitter(ExecutionStateMachine& sm, Probe stop_requested, Probe fault_latch_active,
                     Probe trip_stop_active);
 
   /// Decide-and-commit under the commit lock. The committer, not the
@@ -75,8 +74,7 @@ class TerminalCommitter {
   static bool is_terminal(ExecutionState state);
 
  private:
-  ExecutionState decide(const CommitRequest& request,
-                        ExecutionState current) const;
+  ExecutionState decide(const CommitRequest& request, ExecutionState current) const;
 
   ExecutionStateMachine& sm_;
   Probe stop_requested_;

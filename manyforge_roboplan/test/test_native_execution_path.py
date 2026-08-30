@@ -30,6 +30,7 @@ from manyforge_headless_api.execution import ExecutionCommandClient
 from manyforge_headless_api.models import (
     OperationControlRequest,
     OperationIntentRequest,
+    ProgramRunStopIntentRequest,
 )
 from manyforge_headless_api.native import HeadlessApiError
 from manyforge_headless_api.service import HeadlessService
@@ -66,10 +67,10 @@ class RecordingTransport:
     def execution_status(self) -> dict[str, Any]:
         return self.client.execution_status()
 
-    def execution_identity(self) -> dict[str, Any]:
+    def identity(self) -> dict[str, Any]:
         return self.client.execution_identity()
 
-    def execute(self, body: Mapping[str, Any]) -> dict[str, Any]:
+    def submit(self, body: Mapping[str, Any]) -> dict[str, Any]:
         self.last_submission = copy.deepcopy(dict(body))
         return self.client.execute(body)
 
@@ -85,41 +86,41 @@ class RecordingTransport:
     def start_place(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.client.start_place(body)
 
-    def pick_place_sequence(self, sequence_id: str) -> dict[str, Any]:
+    def read_pick_place_sequence(self, sequence_id: str) -> dict[str, Any]:
         return self.client.pick_place_sequence(sequence_id)
 
-    def operation(self, operation_id: str) -> dict[str, Any]:
+    def read(self, operation_id: str) -> dict[str, Any]:
         return self.client.operation(operation_id)
 
-    def pause_operation(
+    def pause(
         self, operation_id: str, body: Mapping[str, Any]
     ) -> dict[str, Any]:
         return self.client.pause_operation(operation_id, body)
 
-    def resume_operation(
+    def resume(
         self, operation_id: str, body: Mapping[str, Any]
     ) -> dict[str, Any]:
         return self.client.resume_operation(operation_id, body)
 
-    def reset_operation(
+    def reset(
         self, operation_id: str, body: Mapping[str, Any]
     ) -> dict[str, Any]:
         return self.client.reset_operation(operation_id, body)
 
-    def acknowledge_completed_operation(
+    def acknowledge_completed(
         self, operation_id: str, body: Mapping[str, Any]
     ) -> dict[str, Any]:
         return self.client.acknowledge_completed_operation(operation_id, body)
 
-    def stop_operations(self, body: Mapping[str, Any]) -> dict[str, Any]:
+    def stop(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.client.stop_operations(body)
 
-    def set_operation_runtime_scale(
+    def set_runtime_scale(
         self, operation_id: str, body: Mapping[str, Any]
     ) -> dict[str, Any]:
         return self.client.set_operation_runtime_scale(operation_id, body)
 
-    def operation_runtime_scale(self, operation_id: str) -> dict[str, Any]:
+    def get_runtime_scale(self, operation_id: str) -> dict[str, Any]:
         return self.client.operation_runtime_scale(operation_id)
 
 
@@ -169,6 +170,22 @@ def _expected_active_configuration(
         "active_control_configuration_generation": active[
             "active_control_configuration_generation"
         ],
+    }
+
+
+def _stable_active_configuration(
+    active: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in active.items()
+        if key
+        not in {
+            "active_control_configuration_generation",
+            "active_control_configuration_id",
+            "source_runtime_epoch",
+            "source_sequence",
+        }
     }
 
 
@@ -327,6 +344,54 @@ def _wait_for_cclc_component(execution_run_root: Path) -> dict[str, Any]:
     raise RuntimeError(f"native CCLC socket did not become ready: {last_error}")
 
 
+def _cclc_active_routes_are_current(snapshot: Mapping[str, Any]) -> bool:
+    if snapshot.get("component_lifecycle_state") != "active":
+        return False
+    provider_epochs = {
+        (
+            row.get("control_domain_id"),
+            row.get("provider_runtime_unit_id"),
+        ): row.get("provider_runtime_epoch")
+        for row in snapshot.get("provider_occurrences", [])
+        if isinstance(row, Mapping)
+    }
+    domains = snapshot.get("domains", [])
+    return bool(domains) and all(
+        isinstance(domain, Mapping)
+        and isinstance(
+            active := domain.get("active_control_configuration"), Mapping
+        )
+        and provider_epochs.get(
+            (
+                domain.get("control_domain_id"),
+                active.get("source_runtime_unit_id"),
+            )
+        )
+        == active.get("source_runtime_epoch")
+        for domain in domains
+    )
+
+
+def _wait_for_current_cclc_routes(
+    execution_run_root: Path,
+) -> dict[str, Any]:
+    client = CCLCOpenRequestClient(execution_run_root, timeout_seconds=1.0)
+    deadline = time.monotonic() + 10.0
+    last_snapshot: dict[str, Any] | None = None
+    while time.monotonic() < deadline:
+        try:
+            last_snapshot = client.component_snapshot("lite6_arm")
+            if _cclc_active_routes_are_current(last_snapshot):
+                return last_snapshot
+        except HeadlessApiError:
+            pass
+        time.sleep(0.01)
+    raise RuntimeError(
+        "native CCLC routes did not reconcile to the current provider: "
+        f"{last_snapshot}"
+    )
+
+
 def _start_host(
     fixture_root: Path,
     execution_state_root: Path,
@@ -397,13 +462,17 @@ def _start_host(
                 f"native execution host exited during startup: {detail}"
             )
         try:
-            response = client.status()
+            response = client.identity()
             if response.get("ok") is True:
                 if manifest.get("cclc_product") is True and qualify_cclc:
                     try:
-                        _qualify_native_cclc_product(
-                            execution_run_root,
+                        snapshot = _wait_for_cclc_component(
+                            execution_run_root
                         )
+                        if snapshot.get("component_lifecycle_state") == "active":
+                            _wait_for_current_cclc_routes(execution_run_root)
+                        else:
+                            _qualify_native_cclc_product(execution_run_root)
                     except Exception as error:
                         _stop_host(process)
                         detail = (
@@ -505,9 +574,13 @@ def _run_native_benchmark_move(
 ) -> float:
     """Measure one complete addressed plan/execute/release cycle."""
 
-    status = client.status()["status"]
+    identity = client.identity()["identity"]
+    targets = client.targets()
+    assert targets["identity"] == identity
+    direct = targets["targets"]["direct_control"]
     operation = _direct_control_joint_operation(
-        status,
+        identity,
+        direct,
         request_id=request_id,
         positions_rad=positions_rad,
     )
@@ -538,7 +611,7 @@ def _run_native_benchmark_move(
         {
             "request_context": {
                 "request_id": f"ack-{request_id}",
-                "request_owner_epoch": status["owner_epoch"],
+                "request_owner_epoch": identity["owner_epoch"],
                 "source_label": "n7_b_native_benchmark",
                 "correlation_id": "n7-b-historical-benchmark",
             },
@@ -805,18 +878,18 @@ def _planning_operation(
 
 
 def _direct_control_joint_operation(
-    status: dict[str, Any],
+    identity: dict[str, Any],
+    direct: dict[str, Any],
     *,
     request_id: str,
     positions_rad: list[float],
 ) -> dict[str, Any]:
-    direct = status["direct_control"]
     joint_names = [joint["source_joint_name"] for joint in direct["joints"]]
     assert len(joint_names) == len(positions_rad)
     return {
         "request_context": {
             "request_id": request_id,
-            "request_owner_epoch": status["owner_epoch"],
+            "request_owner_epoch": identity["owner_epoch"],
             "source_label": "composer_ui",
             "correlation_id": None,
         },
@@ -824,9 +897,9 @@ def _direct_control_joint_operation(
         "program_revision": direct["program_revision"],
         "program_binding_id": direct["program_binding_id"],
         "program_run_id": direct["program_run_id"],
-        "expected_graph_revision": status["graph_revision"],
-        "expected_retained_bundle_id": status["retained_bundle_id"],
-        "expected_scene_revision": status["scene_revision"],
+        "expected_graph_revision": identity["graph_revision"],
+        "expected_retained_bundle_id": identity["retained_bundle_id"],
+        "expected_scene_revision": identity["scene_revision"],
         "participants": [
             {
                 "component_role_id": direct["component_role_id"],
@@ -920,6 +993,7 @@ def _direct_control_motion_operation(
 ) -> dict[str, Any]:
     operation = _direct_control_joint_operation(
         status,
+        status["direct_control"],
         request_id=request_id,
         positions_rad=[
             float(value)
@@ -1147,7 +1221,9 @@ def test_reconciliation_gate_does_not_block_ordinary_accept_or_exact_read(
         assert identity["identity"]["schema_version"] == (
             "manyforge.execution_identity.v1"
         )
-        assert identity["identity"]["control_management_mode"] == "direct"
+        assert identity["identity"]["control_management_mode"] == (
+            "component_lifecycle"
+        )
         assert targets["command"] == "targets"
         assert targets["targets"]["schema_version"] == (
             "manyforge.execution_targets.v1"
@@ -1251,6 +1327,164 @@ def test_reconciliation_exception_uses_caught_host_failure_path(
         _stop_host(process)
 
 
+def test_internal_program_run_stop_uses_one_exact_priority_request(
+    tmp_path: Path,
+) -> None:
+    built_fixture = _required_path("MANYFORGE_I6_NATIVE_FIXTURE_ROOT")
+    fixture_root = tmp_path / "fixture"
+    shutil.copytree(built_fixture, fixture_root)
+    manifest = json.loads((fixture_root / "manifest.json").read_text("utf-8"))
+    execution_state_root = tmp_path / "execution-state"
+    execution_run_root = tmp_path / "execution-run"
+    execution_state_root.mkdir()
+    execution_run_root.mkdir()
+    process = _start_host(
+        fixture_root,
+        execution_state_root,
+        execution_run_root,
+        manifest,
+    )
+    client = ExecutionCommandClient(
+        execution_run_root,
+        timeout_seconds=5.0,
+        attribution_transport="internal",
+    )
+
+    try:
+        identity = client.identity()["identity"]
+        direct = client.targets()["targets"]["direct_control"]
+        current = [
+            float(value)
+            for value in client.observation()["observation"]["positions_rad"]
+        ]
+        goal = list(current)
+        first_joint = direct["joints"][0]
+        goal[0] = min(
+            float(first_joint["max_position_rad"]),
+            max(
+                float(first_joint["min_position_rad"]),
+                goal[0] + 0.2,
+            ),
+        )
+        operation = _direct_control_joint_operation(
+            identity,
+            direct,
+            request_id="program-run-stop.operation",
+            positions_rad=goal,
+        )
+        operation["program_run_id"] = "program-run.stop-process-test"
+        accepted = client.submit(
+            OperationIntentRequest.model_validate(operation),
+            trusted_principal_id=None,
+        )["accepted"]
+        request = ProgramRunStopIntentRequest.model_validate(
+            {
+                "request_context": {
+                    "request_id": "program-run-stop.request",
+                    "request_owner_epoch": identity["owner_epoch"],
+                    "source_label": "manyforge_behavior",
+                    "correlation_id": "program-run.stop-process-test",
+                },
+                "program_run_id": "program-run.stop-process-test",
+                "reason": "process-test Program scope Stop",
+            }
+        )
+
+        stopped = client.stop_program_run(request)
+        replay = client.stop_program_run(request)
+        assert stopped["accepted"]["request_id"] == (
+            request.request_context.request_id
+        )
+        assert replay["accepted"]["stop_id"] == stopped["accepted"]["stop_id"]
+        assert replay["accepted"]["replay_status"] == "replayed_exact"
+
+        deadline = time.monotonic() + 10.0
+        stop_status: dict[str, Any] = {}
+        while time.monotonic() < deadline:
+            stop_status = client.stop_status(stopped["accepted"]["stop_id"])
+            if stop_status["stop_status"]["state"] in {
+                "succeeded",
+                "partial",
+                "failed",
+            }:
+                break
+            time.sleep(0.01)
+        assert stop_status["stop_status"]["state"] == "succeeded"
+        observed = client.read(accepted["operation_id"])
+        assert observed["operation"]["state"] == "stopped"
+
+        event_deadline = time.monotonic() + 5.0
+        stop_events: list[dict[str, Any]] = []
+        while time.monotonic() < event_deadline:
+            stop_events = [
+                event
+                for event in client.events(identity["owner_epoch"], 0)[
+                    "events"
+                ]
+                if event.get("request_id")
+                == request.request_context.request_id
+            ]
+            if stop_events:
+                break
+            time.sleep(0.01)
+        assert stop_events
+
+        recovery = client.operation_recovery(accepted["operation_id"])
+        assessment = recovery["recovery_assessment"]
+        assert assessment["latch_id"] in {None, ""}
+        assert "reset_cycle" in assessment["allowed_actions"]
+        reset = client.reset(
+            OperationControlRequest.model_validate(
+                {
+                    "request_context": {
+                        "request_id": "program-run-stop.reset",
+                        "request_owner_epoch": identity["owner_epoch"],
+                        "source_label": "manyforge_behavior",
+                        "correlation_id": "program-run.stop-process-test",
+                    },
+                    "operation_id": accepted["operation_id"],
+                    "expected_operation_revision": recovery[
+                        "operation_revision"
+                    ],
+                    "reason": "process-test Program-cycle Reset",
+                }
+            ),
+            trusted_principal_id=None,
+        )
+        assert reset["accepted"]["control"] == "reset"
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if client.read(accepted["operation_id"])["resident"] is False:
+                break
+            time.sleep(0.01)
+        assert client.read(accepted["operation_id"])["resident"] is False
+
+        next_operation = _direct_control_joint_operation(
+            identity,
+            direct,
+            request_id="program-run-stop.next-operation",
+            positions_rad=current,
+        )
+        next_operation["program_run_id"] = "program-run.stop-process-test.next"
+        next_accepted = client.submit(
+            OperationIntentRequest.model_validate(next_operation),
+            trusted_principal_id=None,
+        )["accepted"]
+        deadline = time.monotonic() + 20.0
+        next_terminal: dict[str, Any] = {}
+        while time.monotonic() < deadline:
+            next_terminal = client.read(next_accepted["operation_id"])[
+                "operation"
+            ]
+            if next_terminal["state"] in TERMINAL_STATES:
+                break
+            time.sleep(0.01)
+        assert next_terminal["state"] == "completed", next_terminal
+    finally:
+        _stop_host(process)
+
+
 def test_pick_place_planning_crosses_real_cpp_owner_and_thin_clients(
     tmp_path: Path,
 ) -> None:
@@ -1299,7 +1533,7 @@ def test_pick_place_planning_crosses_real_cpp_owner_and_thin_clients(
     composer = HeadlessHttpClient("http://composer.test", client=raw_composer)
 
     try:
-        owner_epoch = native.status()["status"]["owner_epoch"]
+        owner_epoch = native.identity()["identity"]["owner_epoch"]
         before = native.events(owner_epoch, 0)["events"]
 
         pick = behavior.plan_pick(_pick_planning_request())["planning_result"]
@@ -1626,6 +1860,7 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
         direct_positions[0] = 0.03
         direct_intent = _direct_control_joint_operation(
             first_status,
+            first_status["direct_control"],
             request_id="composer-direct-preview",
             positions_rad=direct_positions,
         )
@@ -1967,6 +2202,9 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
             reason="release stopped gripper operation",
             correlation_id="n5-process-test",
         )
+        # A certified nominal Stop followed by exact operation Reset is the
+        # complete normal cycle. It must not fabricate an intervention latch
+        # or require a second recovery command for the same physical Stop.
         gripper_recovery = _recover_active_stop_fault(
             headless,
             owner_epoch=first_status["owner_epoch"],
@@ -1974,9 +2212,7 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
             correlation_id="n5-process-test",
             reason="operator verified post-Stop gripper truth",
         )
-        assert gripper_recovery is not None
-        assert gripper_recovery["accepted"] is True
-        assert gripper_recovery["latch"]["state"] == "cleared"
+        assert gripper_recovery is None
         assert headless.stop_fault()["stop_fault"] is None
 
         controlled = _runner_submission(
@@ -2071,7 +2307,7 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
         }
         stop_accepted = runner.stop_operation(**stop_arguments)
         stopped = _wait_terminal(runner, controlled_id)["operation"]
-        assert stopped["state"] == "stopped"
+        assert stopped["state"] == "stopped", json.dumps(stopped, sort_keys=True)
         assert stopped["active_stop_id"] == stop_accepted["accepted"]["stop_id"]
         projected_stop = headless.execution_status()["status"][
             "cell_stop_action"
@@ -2130,6 +2366,9 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
             reason="release first stopped operation",
             correlation_id="n4-public-control-test",
         )
+        # Exact nominal motion containment settles directly to reset-ready
+        # Stopped. It must not fabricate an intervention latch or require a
+        # second recovery acknowledgement for the same physical Stop.
         controlled_recovery = _recover_active_stop_fault(
             headless,
             owner_epoch=first_status["owner_epoch"],
@@ -2137,9 +2376,8 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
             correlation_id="n4-public-control-test",
             reason="operator verified post-Stop motion truth",
         )
-        assert controlled_recovery is not None
-        assert controlled_recovery["accepted"] is True
-        assert controlled_recovery["latch"]["state"] == "cleared"
+        assert controlled_recovery is None
+        assert headless.stop_fault()["stop_fault"] is None
         malformed_operation = _runner_submission(
             runner,
             request_id="native-malformed-stop-operation",
@@ -2216,7 +2454,7 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
         assert len(clear_rows) == 1
         durable_clear = json.loads(clear_rows[0][0])
         assert durable_clear[0] == (
-            "manyforge.internal.stop-journal-fault-clear-projection.v1"
+            "manyforge.internal.stop-journal-fault-clear-projection.v2"
         )
         assert durable_clear[2][0] == recovered_result["request_id"]
 
@@ -2358,12 +2596,9 @@ def test_addressed_native_benchmark_preserves_historical_measurements(
     ]
 
     try:
-        initial_status = native.status()["status"]
         origin = [
             float(value)
-            for value in initial_status["direct_control"]["observed_state"][
-                "positions_rad"
-            ]
+            for value in native.observation()["observation"]["positions_rad"]
         ]
 
         _run_native_benchmark_move(
@@ -2506,6 +2741,7 @@ def test_slow_preview_cannot_delay_the_standard_stop_path(tmp_path: Path) -> Non
         positions[0] = 0.03
         intent = _direct_control_joint_operation(
             status,
+            status["direct_control"],
             request_id="blocked-direct-preview",
             positions_rad=positions,
         )
@@ -2685,21 +2921,34 @@ def test_planning_stop_and_active_host_replacement_are_bounded(
             cclc_after_loss["component_lifecycle_generation"]
             == cclc_before_loss["component_lifecycle_generation"]
         )
-        assert [
-            (
-                domain["control_domain_id"],
-                domain["current_control_bindings"],
-                domain["active_control_configuration"],
-            )
-            for domain in cclc_after_loss["domains"]
-        ] == [
-            (
-                domain["control_domain_id"],
-                domain["current_control_bindings"],
-                domain["active_control_configuration"],
-            )
+        before_domains = {
+            domain["control_domain_id"]: domain
             for domain in cclc_before_loss["domains"]
-        ]
+        }
+        after_domains = {
+            domain["control_domain_id"]: domain
+            for domain in cclc_after_loss["domains"]
+        }
+        assert after_domains.keys() == before_domains.keys()
+        for domain_id, before_domain in before_domains.items():
+            after_domain = after_domains[domain_id]
+            assert after_domain["current_control_bindings"] == (
+                before_domain["current_control_bindings"]
+            )
+            before_active = before_domain["active_control_configuration"]
+            after_active = after_domain["active_control_configuration"]
+            assert _stable_active_configuration(after_active) == (
+                _stable_active_configuration(before_active)
+            )
+            assert after_active[
+                "active_control_configuration_generation"
+            ] > before_active["active_control_configuration_generation"]
+            assert after_active["active_control_configuration_id"] != (
+                before_active["active_control_configuration_id"]
+            )
+            assert after_active["source_runtime_epoch"] != (
+                before_active["source_runtime_epoch"]
+            )
         provider_epochs_before = {
             (
                 row["control_domain_id"],

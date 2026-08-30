@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py headless-rest
-  Last regenerated: 2026-08-29 12:56:13 UTC
+  Last regenerated: 2026-08-29 23:30:32 UTC
   Generator source: scripts/regen-public-contracts.py:gen_headless_rest_api
 -->
 
@@ -73,8 +73,6 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `GET` | `/api/manager/graph` |  | Manager Graph |
 | `GET` | `/api/manager/status` |  | Manager Status |
 | `GET` | `/api/node-environment` |  | Node Environment |
-| `GET` | `/api/private/program-runner/execution/operations/{operation_id}/recovery` |  | Execution Operation Recovery |
-| `POST` | `/api/private/program-runner/execution/operations/{operation_id}/recovery` |  | Execution Apply Operation Recovery |
 | `GET` | `/api/program/applied` |  | Program Applied |
 | `POST` | `/api/program/apply` |  | Program Apply |
 | `POST` | `/api/program/authoring-transactions` |  | Acquire Authoring Transaction |
@@ -88,6 +86,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `GET` | `/api/program/runs/{program_run_id}` |  | Program Run Read |
 | `POST` | `/api/program/runs/{program_run_id}/blackboard-values` |  | Write Runtime Blackboard |
 | `POST` | `/api/program/runs/{program_run_id}/manual-result` |  | Stage Manual Result |
+| `POST` | `/api/program/runs/{program_run_id}/motion-stop` |  | Program Run Motion Stop |
 | `GET` | `/api/program/runs/{program_run_id}/runtime-controls` |  | Program Runtime Controls |
 | `POST` | `/api/program/runs/{program_run_id}/runtime-overrides` |  | Stage Runtime Override |
 | `POST` | `/api/program/runs/{program_run_id}/runtime-overrides/activate` |  | Activate Runtime Override |

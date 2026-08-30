@@ -22,6 +22,7 @@ inline constexpr std::size_t kMaximumStopScopeMembershipRows = 65536U;
 /// complete current component/resource closure.
 struct StopScopeOperationSnapshotDTO final {
   OperationId operation_id;
+  ProgramRunId program_run_id;
   OperationRevision operation_revision;
   StopGeneration stop_generation;
   OperationStateKind state{OperationStateKind::kResolving};

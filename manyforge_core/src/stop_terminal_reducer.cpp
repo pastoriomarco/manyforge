@@ -114,6 +114,7 @@ template <typename Identity>
       return disposition == StopResolutionDispositionDTO::kAlreadyTerminalNoEffect;
     case StopScopeResolutionReasonDTO::kMalformedOrdinaryIntent:
     case StopScopeResolutionReasonDTO::kUnknownOperation:
+    case StopScopeResolutionReasonDTO::kUnknownProgramRun:
     case StopScopeResolutionReasonDTO::kUnknownComponent:
     case StopScopeResolutionReasonDTO::kUnknownResource:
     case StopScopeResolutionReasonDTO::kRequestIdentityConflict:
@@ -147,6 +148,8 @@ template <typename Identity>
       return ordinary(1U);
     case StopRequestedSelectorKindDTO::kOrdinaryResources:
       return ordinary(2U);
+    case StopRequestedSelectorKindDTO::kInternalProgramRun:
+      return ordinary(3U);
     case StopRequestedSelectorKindDTO::kExplicitFull:
       return !snapshot.selector.has_value() && !snapshot.malformed_ingress_reason.has_value();
     case StopRequestedSelectorKindDTO::kMalformedIngress:
@@ -209,6 +212,9 @@ template <typename Identity>
          bounded_identity(facts.provider_runtime_epoch) && !facts.resources.empty() &&
          facts.resources.size() <= kMaximumStopSelectorTargets &&
          granularity_rank(facts.containment_granularity).has_value() &&
+         static_cast<std::uint8_t>(facts.terminal_settlement) <=
+             static_cast<std::uint8_t>(
+                 StopParticipantScopeFactsDTO::TerminalSettlementState::kContainedUnsettled) &&
          canonical_identities(facts.resources);
 }
 
@@ -505,6 +511,22 @@ struct DerivedTerminal final {
                      {}});
       }
       derived.pre_dispatch_cancelled.push_back(entry.key);
+      const auto* participant_facts = std::get_if<StopParticipantScopeFactsDTO>(&entry.facts);
+      const bool participant_settled_or_absent =
+          participant_facts != nullptr &&
+          (participant_facts->terminal_settlement ==
+               StopParticipantScopeFactsDTO::TerminalSettlementState::kSettled ||
+           participant_facts->terminal_settlement ==
+               StopParticipantScopeFactsDTO::TerminalSettlementState::kNotRequired);
+      if (!participant_settled_or_absent) {
+        // Closing the dispatch barrier proves absence of a physical effect;
+        // it does not let the addressed owner invent the subordinate's local
+        // terminal/recovery fact. Aggregate success waits for that exact
+        // process-local settlement just as it does after physical containment.
+        // kNotRequired is reserved for the narrower case where no subordinate
+        // execution identity was ever created.
+        derived.unsettled.push_back(entry.key);
+      }
       continue;
     }
 
@@ -532,7 +554,7 @@ struct DerivedTerminal final {
                    {}});
     }
 
-    bool settled = false;
+    bool physically_contained = false;
     bool explicit_failure = entry.disposition == StopScopeEntryDispositionDTO::kNotStoppable;
     std::optional<std::size_t> prior_superseded_late_stage;
     for (const auto& attempt : attempts) {
@@ -550,22 +572,31 @@ struct DerivedTerminal final {
       prior_superseded_late_stage = stage_index;
     }
     if (entry.disposition == StopScopeEntryDispositionDTO::kStoppable && latest != nullptr) {
-      settled = latest->result.outcome == ParticipantStopStageOutcomeDTO::kSucceeded &&
-                !latest->result.error.has_value() &&
-                std::all_of(latest->result.evidence_items.begin(),
-                            latest->result.evidence_items.end(), [](const auto& evidence) {
-                              return evidence.state == StopEvidenceItemStateDTO::kSatisfied;
-                            });
-      explicit_failure =
-          !settled && (latest->result.outcome == ParticipantStopStageOutcomeDTO::kPartial ||
-                       latest->result.outcome == ParticipantStopStageOutcomeDTO::kFailed);
-      if (settled && latest->result.request.stage_index > 0U) {
+      physically_contained =
+          latest->result.outcome == ParticipantStopStageOutcomeDTO::kSucceeded &&
+          !latest->result.error.has_value() &&
+          std::all_of(latest->result.evidence_items.begin(), latest->result.evidence_items.end(),
+                      [](const auto& evidence) {
+                        return evidence.state == StopEvidenceItemStateDTO::kSatisfied;
+                      });
+      explicit_failure = !physically_contained &&
+                         (latest->result.outcome == ParticipantStopStageOutcomeDTO::kPartial ||
+                          latest->result.outcome == ParticipantStopStageOutcomeDTO::kFailed);
+      if (physically_contained && latest->result.request.stage_index > 0U) {
         used_stronger_stage = true;
       }
     }
-    if (settled) {
+    const auto* participant_facts = std::get_if<StopParticipantScopeFactsDTO>(&entry.facts);
+    const bool participant_settled =
+        participant_facts == nullptr ||
+        participant_facts->terminal_settlement ==
+            StopParticipantScopeFactsDTO::TerminalSettlementState::kNotRequired ||
+        participant_facts->terminal_settlement ==
+            StopParticipantScopeFactsDTO::TerminalSettlementState::kSettled;
+    if (physically_contained) {
       derived.dispatched_stopped.push_back(entry.key);
-    } else {
+    }
+    if (!physically_contained || !participant_settled) {
       derived.unsettled.push_back(entry.key);
       if (explicit_failure) {
         derived.failed.push_back(entry.key);

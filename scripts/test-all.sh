@@ -384,6 +384,7 @@ run_roboplan_tests() {
         FAIL=$((FAIL + 1))
         return
     fi
+    cd "$build"
     if ! require_ctest_tests "manyforge_roboplan"; then
         FAIL=$((FAIL + 1))
     elif ctest --output-on-failure --timeout "$CTEST_TEST_TIMEOUT_S"; then
@@ -402,7 +403,7 @@ run_headless_cpp_tests() {
     build_manyforge_headless "$build" "$native_execution_host"
     cd "$build"
     if ! require_ctest_tests "manyforge_headless" \
-        "ManagerDaemonProcess.DistinctNativePackageUsesFreshManagerGenerationAfterCleanStop" \
+        "ManagerDaemonProcess.CompatibleNativeReplacementUsesFreshEpochAfterCleanStop" \
         "ManagerDaemonProcess.RuntimeOnlyNamedApplyUsesTheRealManagedFenceAndSurvivesReplacement" \
         "ManagerDaemonProcess.PhysicalCompositionReopensAfterChildAndManagerReplacement"; then
         FAIL=$((FAIL + 1))

@@ -786,6 +786,8 @@ struct ExecutionKernel::PreparedCapabilityCommandSession final {
   std::optional<ControllerGoalId> controller_goal_id;
   std::optional<ControllerGoalGeneration> controller_goal_generation;
   std::optional<GripperCommandResultDTO> dispatch_result;
+  std::optional<AddressedParticipantStopSettlementDTO> stop_settlement;
+  bool stop_recovery_consumed{};
   std::optional<ErrorDTO> error;
 };
 
@@ -1959,17 +1961,14 @@ ProjectionLeaseBindingDTO ExecutionKernel::RetainedSceneSnapshotLease::binding()
   return inventory_.projection_binding;
 }
 
-Result<std::optional<ProjectionRevisionDTO>>
-ExecutionKernel::synchronize_scene_before_planning() {
+Result<std::optional<ProjectionRevisionDTO>> ExecutionKernel::synchronize_scene_before_planning() {
   if (planning_scene_synchronizer_ == nullptr) {
     return Result<std::optional<ProjectionRevisionDTO>>::Ok(std::nullopt);
   }
   try {
-    auto synchronized =
-        planning_scene_synchronizer_->SynchronizeBeforePlanning();
+    auto synchronized = planning_scene_synchronizer_->SynchronizeBeforePlanning();
     if (!synchronized.ok()) {
-      return Result<std::optional<ProjectionRevisionDTO>>::Err(
-          synchronized.error());
+      return Result<std::optional<ProjectionRevisionDTO>>::Err(synchronized.error());
     }
     if (!synchronized.value().valid()) {
       return Result<std::optional<ProjectionRevisionDTO>>::Err(
@@ -1977,14 +1976,12 @@ ExecutionKernel::synchronize_scene_before_planning() {
                    "Planning-scene synchronization returned an invalid projection",
                    {{"reason", "planning_scene_synchronization_invalid"}}});
     }
-    return Result<std::optional<ProjectionRevisionDTO>>::Ok(
-        std::move(synchronized.value()));
+    return Result<std::optional<ProjectionRevisionDTO>>::Ok(std::move(synchronized.value()));
   } catch (const std::exception& error) {
     return Result<std::optional<ProjectionRevisionDTO>>::Err(ErrorDTO{
         kErrorExecutionRejected,
         "Planning-scene synchronization raised an exception",
-        {{"reason", "planning_scene_synchronization_exception"},
-         {"exception", error.what()}}});
+        {{"reason", "planning_scene_synchronization_exception"}, {"exception", error.what()}}});
   } catch (...) {
     return Result<std::optional<ProjectionRevisionDTO>>::Err(
         ErrorDTO{kErrorExecutionRejected,
@@ -4336,8 +4333,7 @@ ExecutionKernel::apply_runtime_collision_lookahead_authority(
 
   result.stop_authority_signalled = addressed_owner_handoff || !interrupt.rejected;
   result.authority_rejected = !addressed_owner_handoff && interrupt.rejected;
-  result.authority_rejection_reason =
-      result.authority_rejected ? interrupt.reason : std::string{};
+  result.authority_rejection_reason = result.authority_rejected ? interrupt.reason : std::string{};
   return RuntimeCollisionLookaheadAuthorityDisposition::kAccepted;
 }
 
@@ -4553,6 +4549,45 @@ bool ExecutionKernel::finalize_overridden_terminal_authority(
   return true;
 }
 
+bool ExecutionKernel::finalize_prepared_motion_cancellation_if_requested(
+    const std::shared_ptr<PreparedMotionSession>& prepared_session,
+    const ExecuteRequestDTO& request, const std::uint64_t exec_id,
+    ActiveMotionExecution& motion_state, const char* reason) {
+  if (!prepared_session) {
+    return false;
+  }
+  {
+    std::lock_guard lock(prepared_session->mutex);
+    if (!prepared_session->cancel_requested) {
+      return false;
+    }
+  }
+
+  const auto previous = sm_.status().state;
+  const auto committed = commit_terminal(ExecutionState::kStopped, "terminal_commit");
+  if (committed.committed != ExecutionState::kStopped) {
+    return finalize_overridden_terminal_authority(request, exec_id, motion_state,
+                                                  committed.committed, reason);
+  }
+  auto stopped_snapshot = get_execution_snapshot();
+  stopped_snapshot.timestamp_ns = clock_.now();
+  stopped_snapshot.execution_id = exec_id;
+  stopped_snapshot.move_id = request.move_id;
+  stopped_snapshot.state = ExecutionState::kStopped;
+  stopped_snapshot.error.reset();
+  publish_execution_snapshot(std::move(stopped_snapshot));
+  emit_event({KernelEventType::kStateTransition,
+              exec_id,
+              clock_.now(),
+              previous,
+              ExecutionState::kStopped,
+              std::nullopt,
+              {{"reason", reason}}});
+  finalize_motion_execution_outcome(motion_state, MotionExecutionTerminalCause::kStopped,
+                                    std::nullopt, std::nullopt, reason);
+  return true;
+}
+
 bool ExecutionKernel::finalize_competing_terminal_authority(const ExecuteRequestDTO& request,
                                                             std::uint64_t exec_id,
                                                             ActiveMotionExecution& motion_state,
@@ -4700,12 +4735,19 @@ ExecutionKernel::ExecuteWorkerPlanPhaseResult ExecutionKernel::execute_worker_pl
     std::stop_token st, const ExecuteRequestDTO& request,
     const CollisionWorldLeaseInventory& projection_inventory, std::uint64_t exec_id,
     std::optional<TrajectoryDTO> cached_trajectory, bool cache_revalidation_candidate,
-    ExecutionState worker_entry_state, ActiveMotionExecution& motion_state) {
+    ExecutionState worker_entry_state, ActiveMotionExecution& motion_state,
+    const std::shared_ptr<PreparedMotionSession>& prepared_session) {
   ExecuteWorkerPlanPhaseResult result;
 
   if (st.stop_requested()) {
     finalize_motion_execution_outcome(motion_state, MotionExecutionTerminalCause::kStopped,
                                       std::nullopt, std::nullopt, "early_stop_requested");
+    result.status = ExecuteWorkerPhaseStatus::kTerminal;
+    return result;
+  }
+  if (finalize_prepared_motion_cancellation_if_requested(
+          prepared_session, request, exec_id, motion_state,
+          "prepared_motion_cancelled_before_planning")) {
     result.status = ExecuteWorkerPhaseStatus::kTerminal;
     return result;
   }
@@ -4716,6 +4758,12 @@ ExecutionKernel::ExecuteWorkerPlanPhaseResult ExecutionKernel::execute_worker_pl
   if (cache_hit) {
     auto cached_request = make_plan_request(request, projection_inventory, 0U, nullptr);
     if (!cached_request.ok()) {
+      if (finalize_prepared_motion_cancellation_if_requested(
+              prepared_session, request, exec_id, motion_state,
+              "prepared_motion_cancelled_during_cached_plan_validation")) {
+        result.status = ExecuteWorkerPhaseStatus::kTerminal;
+        return result;
+      }
       const auto error = cached_request.error();
       emit_event(make_error_raised_event(exec_id, clock_.now(), error));
       sm_.set_last_error(error_code_from_dto(error));
@@ -4766,6 +4814,15 @@ ExecutionKernel::ExecuteWorkerPlanPhaseResult ExecutionKernel::execute_worker_pl
   // external callbacks remain deferred until after it is released.
   EventDeferralScope event_scope(*this);
   std::unique_lock<std::mutex> planning_result_lock(planning_result_mutex_);
+
+  if (finalize_prepared_motion_cancellation_if_requested(
+          prepared_session, request, exec_id, motion_state,
+          "prepared_motion_cancelled_during_planning")) {
+    planning_result_lock.unlock();
+    event_scope.flush();
+    result.status = ExecuteWorkerPhaseStatus::kTerminal;
+    return result;
+  }
 
   if (planning_reset_requested_.load(std::memory_order_acquire)) {
     // Reset owns the state transition and backend reset. The planner cancel can
@@ -4969,7 +5026,8 @@ ExecutionKernel::execute_worker_validate_replan_phase(
     bool& cache_revalidation_candidate,
     CollisionWorldLeaseInventory& scene_snapshot_lease_inventory,
     const std::optional<SceneSnapshotLease>& scene_snapshot_lease,
-    ActiveMotionExecution& motion_state) {
+    ActiveMotionExecution& motion_state,
+    const std::shared_ptr<PreparedMotionSession>& prepared_session) {
   ExecuteWorkerValidationPhaseResult phase_result;
   const int max_authoritative_validation_attempts =
       std::max(cache_revalidation_candidate ? 2 : 1,
@@ -4989,6 +5047,12 @@ ExecutionKernel::execute_worker_validate_replan_phase(
 
     val_result = validate_trajectory(trajectory, request, scene_snapshot_lease_inventory,
                                      scene_snapshot_lease);
+    if (finalize_prepared_motion_cancellation_if_requested(
+            prepared_session, request, exec_id, motion_state,
+            "prepared_motion_cancelled_during_validation")) {
+      phase_result.status = ExecuteWorkerPhaseStatus::kTerminal;
+      return phase_result;
+    }
     if (val_result.ok()) {
       break;
     }
@@ -5098,6 +5162,13 @@ ExecutionKernel::execute_worker_validate_replan_phase(
         replan_timeout_ns > 0 && (clock_.now() - replan_start_ns) >= replan_timeout_ns;
     if (replan_timeout_handle != 0) {
       scheduler_.cancel(replan_timeout_handle);
+    }
+
+    if (finalize_prepared_motion_cancellation_if_requested(
+            prepared_session, request, exec_id, motion_state,
+            "prepared_motion_cancelled_during_validation_replan")) {
+      phase_result.status = ExecuteWorkerPhaseStatus::kTerminal;
+      return phase_result;
     }
 
     const auto preserve_replan_terminal_authority = [&](const std::string& reason) -> bool {
@@ -5963,33 +6034,28 @@ ExecutionKernel::ExecuteWorkerDispatchPhaseResult ExecutionKernel::execute_worke
   if (phase_result.execution_handle.execution_generation == 0 &&
       phase_result.execution_handle.get_snapshot) {
     auto rejected_snapshot = phase_result.execution_handle.get_snapshot();
-    const bool backend_rejected =
-        rejected_snapshot.state == ExecutionState::kFailed ||
-        rejected_snapshot.state == ExecutionState::kInterventionRequired;
+    const bool backend_rejected = rejected_snapshot.state == ExecutionState::kFailed ||
+                                  rejected_snapshot.state == ExecutionState::kInterventionRequired;
     if (backend_rejected) {
       auto dispatch_error = rejected_snapshot.error.value_or(
           ErrorDTO{kErrorExecutionRejected,
                    "Execution backend rejected dispatch without an error",
                    {{"reason", "backend_dispatch_rejected_without_error"}}});
-      dispatch_error.details.try_emplace("dispatch_boundary",
-                                         "execution_backend_handle");
+      dispatch_error.details.try_emplace("dispatch_boundary", "execution_backend_handle");
       dispatch_error.details.try_emplace("execution_generation", "0");
-      stop_collision_monitoring(
-          RuntimeCollisionMonitorRelease::kFailClosedTerminal,
-          motion_state.runtime_collision_protection_generation);
+      stop_collision_monitoring(RuntimeCollisionMonitorRelease::kFailClosedTerminal,
+                                motion_state.runtime_collision_protection_generation);
       sm_.set_last_error(error_code_from_dto(dispatch_error));
       const auto previous_state = sm_.status().state;
       const auto requested_terminal =
           rejected_snapshot.state == ExecutionState::kInterventionRequired
               ? ExecutionState::kInterventionRequired
               : ExecutionState::kFailed;
-      auto terminal_commit =
-          commit_terminal(requested_terminal, "terminal_commit");
+      auto terminal_commit = commit_terminal(requested_terminal, "terminal_commit");
       if (terminal_commit.committed != requested_terminal &&
           finalize_overridden_terminal_authority(
               request, exec_id, motion_state, terminal_commit.committed,
-              "backend_dispatch_rejection_overridden_by_terminal_authority",
-              dispatch_error)) {
+              "backend_dispatch_rejection_overridden_by_terminal_authority", dispatch_error)) {
         phase_result.status = ExecuteWorkerPhaseStatus::kTerminal;
         return phase_result;
       }
@@ -6017,9 +6083,8 @@ ExecutionKernel::ExecuteWorkerDispatchPhaseResult ExecutionKernel::execute_worke
         std::lock_guard<std::mutex> metrics_lock(metrics_mutex_);
         metrics_.executions_failed++;
       }
-      finalize_motion_execution_outcome(
-          motion_state, MotionExecutionTerminalCause::kFailed,
-          dispatch_error, std::nullopt, "backend_dispatch_rejected");
+      finalize_motion_execution_outcome(motion_state, MotionExecutionTerminalCause::kFailed,
+                                        dispatch_error, std::nullopt, "backend_dispatch_rejected");
       phase_result.status = ExecuteWorkerPhaseStatus::kTerminal;
       return phase_result;
     }
@@ -6583,7 +6648,7 @@ void ExecutionKernel::async_execute_worker(
 
     auto plan_phase = execute_worker_plan_phase(
         st, request, retained_scene.inventory(), exec_id, std::move(cached_trajectory),
-        cache_revalidation_candidate, worker_entry_state, motion_state);
+        cache_revalidation_candidate, worker_entry_state, motion_state, prepared_session);
     if (plan_phase.status == ExecuteWorkerPhaseStatus::kTerminal) {
       return;
     }
@@ -6594,7 +6659,7 @@ void ExecutionKernel::async_execute_worker(
     auto validation_phase = execute_worker_validate_replan_phase(
         st, request, exec_id, trajectory, plan_phase.plan_request, plan_phase.planning_result,
         active_trajectory_from_cache, cache_revalidation_candidate,
-        retained_scene.mutable_inventory(), scene_snapshot_lease, motion_state);
+        retained_scene.mutable_inventory(), scene_snapshot_lease, motion_state, prepared_session);
     if (validation_phase.status == ExecuteWorkerPhaseStatus::kTerminal) {
       return;
     }
@@ -6603,8 +6668,8 @@ void ExecutionKernel::async_execute_worker(
 
     std::shared_ptr<const PreparedOperationParticipantDTO> prepared_participant;
     if (prepared_session) {
-      auto prepared = make_and_prepare_motion_participant(
-          request, trajectory, plan_phase, validation_phase, prepared_session);
+      auto prepared = make_and_prepare_motion_participant(request, trajectory, plan_phase,
+                                                          validation_phase, prepared_session);
       bool cancelled = false;
       if (prepared.ok()) {
         std::lock_guard lock(prepared_session->mutex);
@@ -6625,27 +6690,12 @@ void ExecutionKernel::async_execute_worker(
       prepared_session->changed.notify_all();
 
       if (!prepared.ok() || cancelled) {
-        const auto previous = sm_.status().state;
         if (cancelled) {
-          const auto committed = commit_terminal(ExecutionState::kStopped, "terminal_commit");
-          auto stopped_snapshot = get_execution_snapshot();
-          stopped_snapshot.timestamp_ns = clock_.now();
-          stopped_snapshot.execution_id = exec_id;
-          stopped_snapshot.move_id = request.move_id;
-          stopped_snapshot.state = committed.committed;
-          stopped_snapshot.error.reset();
-          publish_execution_snapshot(std::move(stopped_snapshot));
-          emit_event({KernelEventType::kStateTransition,
-                      exec_id,
-                      clock_.now(),
-                      previous,
-                      committed.committed,
-                      std::nullopt,
-                      {{"reason", "prepared_motion_cancelled_pre_dispatch"}}});
-          finalize_motion_execution_outcome(motion_state, MotionExecutionTerminalCause::kStopped,
-                                            std::nullopt, std::nullopt,
-                                            "prepared_motion_cancelled_pre_dispatch");
+          (void)finalize_prepared_motion_cancellation_if_requested(
+              prepared_session, request, exec_id, motion_state,
+              "prepared_motion_cancelled_pre_dispatch");
         } else {
+          const auto previous = sm_.status().state;
           const auto error = prepared.error();
           sm_.set_last_error(error_code_from_dto(error));
           const auto committed = commit_terminal(ExecutionState::kFailed, "terminal_commit");
@@ -6693,25 +6743,9 @@ void ExecutionKernel::async_execute_worker(
         }
       }
       if (cancelled) {
-        const auto previous = sm_.status().state;
-        const auto committed = commit_terminal(ExecutionState::kStopped, "terminal_commit");
-        auto stopped_snapshot = get_execution_snapshot();
-        stopped_snapshot.timestamp_ns = clock_.now();
-        stopped_snapshot.execution_id = exec_id;
-        stopped_snapshot.move_id = request.move_id;
-        stopped_snapshot.state = committed.committed;
-        stopped_snapshot.error.reset();
-        publish_execution_snapshot(std::move(stopped_snapshot));
-        emit_event({KernelEventType::kStateTransition,
-                    exec_id,
-                    clock_.now(),
-                    previous,
-                    committed.committed,
-                    std::nullopt,
-                    {{"reason", "prepared_motion_cancelled_before_dispatch"}}});
-        finalize_motion_execution_outcome(motion_state, MotionExecutionTerminalCause::kStopped,
-                                          std::nullopt, std::nullopt,
-                                          "prepared_motion_cancelled_before_dispatch");
+        (void)finalize_prepared_motion_cancellation_if_requested(
+            prepared_session, request, exec_id, motion_state,
+            "prepared_motion_cancelled_before_dispatch");
         return;
       }
     }
@@ -7482,8 +7516,8 @@ void ExecutionKernel::async_execute_worker(
                 resume_validation.value().collision_policy_revision,
                 resume_validation.value().collision_decision};
             auto prepared = make_and_prepare_motion_participant(
-                resume_request, resumed_trajectory, resume_plan_phase,
-                resume_validation_phase, prepared_session);
+                resume_request, resumed_trajectory, resume_plan_phase, resume_validation_phase,
+                prepared_session);
             if (!prepared.ok()) {
               fail_resume_closed(prepared.error(), "resume backend preparation failed",
                                  "resume_backend_preparation_failed", false, false);
@@ -8398,7 +8432,13 @@ Result<GripperCommandResultDTO> ExecutionKernel::DispatchPreparedCapabilityComma
 
   GripperCommandResultDTO dispatched;
   try {
-    dispatched = command_gripper(session->authority.command_request);
+    auto command_request = session->authority.command_request;
+    command_request.addressed_identity =
+        AddressedGripperCommandIdentityDTO{session->authority.participant->operation_id,
+                                           session->authority.participant->operation_revision,
+                                           session->authority.participant->participant_id,
+                                           controller_goal_id, controller_goal_generation};
+    dispatched = command_gripper(command_request);
   } catch (const std::exception& exception) {
     dispatched = GripperCommandResultDTO{
         false, 0U, 0U,
@@ -9077,13 +9117,143 @@ std::uint64_t ExecutionKernel::bump_control_command_epoch() {
   return control_command_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
 }
 
-Result<void> ExecutionKernel::adopt_certified_motion_stop(
-    const std::uint64_t execution_id, const StopCertificateRefDTO& certificate) {
-  if (execution_id == 0U || !certificate.locally_valid()) {
-    return Result<void>::Err(
+Result<AddressedParticipantStopSettlementDTO> ExecutionKernel::settle_addressed_participant_stop(
+    const AddressedParticipantStopSettlementRequestDTO& request) {
+  const auto& containment = request.containment;
+  const auto& stop = request.aggregate_stop_certificate;
+  const auto dispatched_containment_complete =
+      !request.effect_prevented_before_dispatch &&
+      containment.outcome == ParticipantStopStageOutcomeDTO::kSucceeded &&
+      !containment.error.has_value() &&
+      containment.attempt_disposition != StopStageAttemptDispositionDTO::kNotDispatched &&
+      std::all_of(
+          containment.evidence_items.begin(), containment.evidence_items.end(),
+          [](const auto& item) { return item.state == StopEvidenceItemStateDTO::kSatisfied; });
+  const auto no_effect_cancellation_complete =
+      request.effect_prevented_before_dispatch &&
+      containment.outcome == ParticipantStopStageOutcomeDTO::kSucceeded &&
+      !containment.error.has_value() &&
+      containment.attempt_disposition == StopStageAttemptDispositionDTO::kNotDispatched &&
+      !containment.actual_provider_contract_mode.has_value() &&
+      !containment.recoverable_substitution_reason.has_value() &&
+      !containment.controller_acknowledgement_sequence.has_value() &&
+      !containment.source_epoch.has_value() && !containment.source_sequence.has_value() &&
+      containment.evidence_items.empty();
+  if (request.execution_id == 0U || !stop.locally_valid() ||
+      (!dispatched_containment_complete && !no_effect_cancellation_complete) ||
+      containment.request.stop_id != stop.stop_id ||
+      containment.request.stop_generation != stop.stop_generation) {
+    return Result<AddressedParticipantStopSettlementDTO>::Err(
         ErrorDTO{kErrorInvalidRequest,
-                 "Addressed Stop handoff is incomplete",
-                 {{"reason", "certified_motion_stop_handoff_invalid"}}});
+                 "Addressed Stop settlement handoff is incomplete",
+                 {{"reason", "addressed_participant_stop_settlement_handoff_invalid"}}});
+  }
+
+  // Capability commands share the addressed owner's physical Stop and
+  // certificate, but own a distinct local command lifecycle. Settle that
+  // lifecycle directly instead of routing it through the motion FSM.
+  std::shared_ptr<PreparedCapabilityCommandSession> command_session;
+  {
+    std::lock_guard lock(prepared_command_session_mutex_);
+    if (active_prepared_command_session_ &&
+        active_prepared_command_session_->preparation_id == request.execution_id) {
+      command_session = active_prepared_command_session_;
+    }
+  }
+  if (request.payload_kind == OperationParticipantPayloadKind::kCapabilityCommand &&
+      command_session) {
+    std::lock_guard session_lock(command_session->mutex);
+    const auto& participant = command_session->authority.participant;
+    const auto& stage = containment.request;
+    const bool exact_participant = participant && participant->operation_id == stage.operation_id &&
+                                   participant->participant_id == stage.participant_id &&
+                                   participant->operation_revision == stage.operation_revision;
+    const bool exact_dispatch =
+        !request.effect_prevented_before_dispatch && exact_participant &&
+        command_session->state == ResolvedPreparedCapabilityCommandStateDTO::kDispatched &&
+        command_session->dispatch_result.has_value() &&
+        command_session->dispatch_result->accepted &&
+        !command_session->dispatch_result->error.has_value() &&
+        command_session->controller_goal_id == stage.controller_goal_id &&
+        command_session->controller_goal_generation == stage.controller_goal_generation;
+    const bool exact_no_effect =
+        request.effect_prevented_before_dispatch && exact_participant &&
+        command_session->state == ResolvedPreparedCapabilityCommandStateDTO::kCancelledPreDispatch;
+    if (!exact_dispatch && !exact_no_effect) {
+      return Result<AddressedParticipantStopSettlementDTO>::Err(
+          ErrorDTO{kErrorMissingReference,
+                   "Addressed Stop names a stale prepared capability command",
+                   {{"reason", "addressed_participant_stop_execution_mismatch"},
+                    {"requested_execution_id", std::to_string(request.execution_id)},
+                    {"current_execution_id", std::to_string(command_session->preparation_id)}}});
+    }
+    if (!request.effect_prevented_before_dispatch) {
+      const auto valid_containment = ValidateParticipantStopStageResult(
+          containment, command_session->authority.stop_readiness.value().resolved_stop_base_plan,
+          command_session->authority.binding,
+          command_session->authority.retained_default_stop_limits,
+          command_session->authority.stop_node_category, participant->resources);
+      if (!valid_containment.ok()) {
+        return Result<AddressedParticipantStopSettlementDTO>::Err(valid_containment.error());
+      }
+    }
+    if (command_session->stop_settlement.has_value()) {
+      if (command_session->stop_settlement->aggregate_stop_certificate == stop &&
+          command_session->stop_settlement->operation_id == stage.operation_id &&
+          command_session->stop_settlement->participant_id == stage.participant_id &&
+          command_session->stop_settlement->controller_goal_id == stage.controller_goal_id &&
+          command_session->stop_settlement->controller_goal_generation ==
+              stage.controller_goal_generation) {
+        return Result<AddressedParticipantStopSettlementDTO>::Ok(*command_session->stop_settlement);
+      }
+      return Result<AddressedParticipantStopSettlementDTO>::Err(
+          ErrorDTO{kErrorInvalidRequest,
+                   "A different Stop already owns the capability-command terminal",
+                   {{"reason", "addressed_participant_stop_identity_conflict"}}});
+    }
+
+    if (!request.effect_prevented_before_dispatch) {
+      const auto& dispatched = *command_session->dispatch_result;
+      auto reset = reset_gripper(command_session->authority.command_request.gripper_id,
+                                 dispatched.command_id, dispatched.generation);
+      if (!reset.ok()) {
+        return Result<AddressedParticipantStopSettlementDTO>::Err(reset.error());
+      }
+    }
+
+    KernelRecoveryAssessmentDTO assessment;
+    assessment.assessment_revision = 1U;
+    assessment.assessed_at_ns = clock_.now();
+    assessment.control_command_epoch = bump_control_command_epoch();
+    assessment.execution_id = request.execution_id;
+    assessment.execution_state = ExecutionState::kStopped;
+    assessment.recovery_class = RecoveryClass::kOrdinaryOperatorStop;
+    assessment.status = RecoveryAssessmentStatus::kRetryReady;
+    assessment.source_id = request.effect_prevented_before_dispatch
+                               ? "addressed_participant_cancelled_before_dispatch"
+                               : "addressed_participant_stop";
+    assessment.stop_owner_generation = stop.stop_generation.value();
+    assessment.backend_stop_confirmed = true;
+    assessment.stop_certificate_id = stop.stop_certificate_id.value();
+    assessment.stop_certificate_revision = stop.stop_certificate_revision.value();
+    assessment.retry_admissible = true;
+    assessment.allowed_actions = {RecoveryAction::kReplanFromStoppedState,
+                                  RecoveryAction::kResetCycle};
+    assessment.reason_code = reason_codes::kRecoveryStopCertified;
+    assessment.evidence_refs = {stop.stop_certificate_id.value(), stop.stop_id.value()};
+    command_session->stop_recovery_consumed = false;
+    command_session->stop_settlement = AddressedParticipantStopSettlementDTO{
+        request.execution_id,     stop,
+        stage.operation_id,       stage.participant_id,
+        stage.controller_goal_id, stage.controller_goal_generation,
+        ExecutionState::kStopped, std::move(assessment)};
+    return Result<AddressedParticipantStopSettlementDTO>::Ok(*command_session->stop_settlement);
+  }
+  if (request.payload_kind == OperationParticipantPayloadKind::kCapabilityCommand) {
+    return Result<AddressedParticipantStopSettlementDTO>::Err(
+        ErrorDTO{kErrorMissingReference,
+                 "Addressed Stop names no resident prepared capability command",
+                 {{"reason", "addressed_participant_stop_command_session_missing"}}});
   }
 
   std::shared_ptr<PreparedMotionSession> session;
@@ -9092,136 +9262,193 @@ Result<void> ExecutionKernel::adopt_certified_motion_stop(
     session = active_prepared_motion_session_;
   }
   if (!session) {
-    return Result<void>::Err(
+    return Result<AddressedParticipantStopSettlementDTO>::Err(
         ErrorDTO{kErrorMissingReference,
                  "Addressed Stop names no resident prepared motion",
-                 {{"reason", "certified_motion_stop_session_missing"}}});
+                 {{"reason", "addressed_motion_stop_session_missing"}}});
   }
 
   EventDeferralScope event_scope(*this);
   std::unique_lock lifecycle_lock(lifecycle_mutex_);
   {
     std::lock_guard session_lock(session->mutex);
-    if (session->execution_id != execution_id ||
-        session->state != ResolvedPreparedMotionExecutionStateDTO::kDispatched) {
-      return Result<void>::Err(
+    const auto& binding = session->authority.execution_request.binding;
+    const bool expected_session_state =
+        request.effect_prevented_before_dispatch
+            ? session->state == ResolvedPreparedMotionExecutionStateDTO::kCancelledPreDispatch
+            : session->state == ResolvedPreparedMotionExecutionStateDTO::kDispatched;
+    if (session->execution_id != request.execution_id || !expected_session_state ||
+        containment.request.operation_id != binding.operation_id ||
+        containment.request.participant_id != binding.participant_id ||
+        containment.request.controller_goal_id != binding.controller_goal_id ||
+        containment.request.controller_goal_generation != binding.controller_goal_generation) {
+      return Result<AddressedParticipantStopSettlementDTO>::Err(
           ErrorDTO{kErrorMissingReference,
                    "Addressed Stop names a stale prepared motion",
-                   {{"reason", "certified_motion_stop_execution_mismatch"},
-                    {"requested_execution_id", std::to_string(execution_id)},
+                   {{"reason", "addressed_motion_stop_execution_mismatch"},
+                    {"requested_execution_id", std::to_string(request.execution_id)},
                     {"current_execution_id", std::to_string(session->execution_id)}}});
+    }
+    if (!request.effect_prevented_before_dispatch) {
+      const auto valid_containment = ValidateParticipantStopStageResult(
+          containment, session->authority.stop_readiness.value().resolved_stop_base_plan,
+          session->authority.binding, session->authority.retained_default_stop_limits,
+          session->authority.stop_node_category, binding.resources);
+      if (!valid_containment.ok()) {
+        return Result<AddressedParticipantStopSettlementDTO>::Err(valid_containment.error());
+      }
     }
   }
 
   const auto before = sm_.status();
-  if (before.execution_id != execution_id) {
-    return Result<void>::Err(
+  if (before.execution_id != request.execution_id) {
+    return Result<AddressedParticipantStopSettlementDTO>::Err(
         ErrorDTO{kErrorMissingReference,
                  "Addressed Stop does not match the current motion execution",
-                 {{"reason", "certified_motion_stop_execution_mismatch"},
-                  {"requested_execution_id", std::to_string(execution_id)},
+                 {{"reason", "addressed_motion_stop_execution_mismatch"},
+                  {"requested_execution_id", std::to_string(request.execution_id)},
                   {"current_execution_id", std::to_string(before.execution_id)}}});
   }
+  const auto make_settlement = [&](KernelRecoveryAssessmentDTO assessment) {
+    return AddressedParticipantStopSettlementDTO{request.execution_id,
+                                                 stop,
+                                                 containment.request.operation_id,
+                                                 containment.request.participant_id,
+                                                 containment.request.controller_goal_id,
+                                                 containment.request.controller_goal_generation,
+                                                 ExecutionState::kStopped,
+                                                 std::move(assessment)};
+  };
   if (before.state == ExecutionState::kStopped) {
-    const auto assessment = get_recovery_assessment();
-    if (assessment.execution_id == execution_id &&
-        assessment.stop_certificate_id == certificate.stop_certificate_id.value() &&
-        assessment.recovery_class == RecoveryClass::kOrdinaryOperatorStop) {
-      return Result<void>::Ok();
+    if (addressed_participant_stop_settlement_.has_value() &&
+        addressed_participant_stop_settlement_->execution_id == request.execution_id &&
+        addressed_participant_stop_settlement_->aggregate_stop_certificate == stop) {
+      return Result<AddressedParticipantStopSettlementDTO>::Ok(
+          *addressed_participant_stop_settlement_);
     }
-    return Result<void>::Err(
+    if (addressed_participant_stop_settlement_.has_value() ||
+        (addressed_motion_stop_recovery_evidence_.has_value() &&
+         (addressed_motion_stop_recovery_evidence_->execution_id != request.execution_id ||
+          addressed_motion_stop_recovery_evidence_->aggregate_stop_certificate != stop))) {
+      return Result<AddressedParticipantStopSettlementDTO>::Err(
+          ErrorDTO{kErrorInvalidRequest,
+                   "A different Stop already owns the current motion terminal",
+                   {{"reason", "addressed_motion_stop_identity_conflict"}}});
+    }
+
+    bump_control_command_epoch();
+    invalidate_gripper_authority(GripperInvalidationReason::kStop);
+    revoke_runtime_collision_lookahead_clear_permits();
+    const auto stop_owner_generation = begin_operator_stop_owner_generation(request.execution_id);
+    // For a pre-dispatch cancellation, true means the participant backend
+    // confirmed effect containment by preserving the dispatch fence; the
+    // request's kNotDispatched disposition retains the distinction from a
+    // physical Stop command in immutable aggregate history.
+    addressed_motion_stop_recovery_evidence_ = AddressedMotionStopRecoveryEvidenceDTO{
+        request.execution_id, stop_owner_generation, stop, true};
+    auto assessment = refresh_recovery_assessment_locked(
+        request.effect_prevented_before_dispatch ? "addressed_cancelled_before_dispatch_settlement"
+                                                 : "addressed_stopped_participant_settlement");
+    if (assessment.execution_id != request.execution_id ||
+        assessment.execution_state != ExecutionState::kStopped ||
+        assessment.recovery_class != RecoveryClass::kOrdinaryOperatorStop ||
+        assessment.status != RecoveryAssessmentStatus::kRetryReady ||
+        !assessment.retry_admissible || !assessment.backend_stop_confirmed ||
+        assessment.stop_certificate_id != stop.stop_certificate_id.value() ||
+        assessment.stop_certificate_revision != stop.stop_certificate_revision.value() ||
+        assessment.stop_owner_generation != stop_owner_generation) {
+      addressed_motion_stop_recovery_evidence_.reset();
+      (void)refresh_recovery_assessment_locked("addressed_stopped_settlement_rejected");
+      return Result<AddressedParticipantStopSettlementDTO>::Err(
+          ErrorDTO{kErrorInvariantViolation,
+                   "Addressed Stop local recovery settlement is incomplete",
+                   {{"reason", "addressed_motion_stop_recovery_settlement_invalid"}}});
+    }
+    addressed_participant_stop_settlement_ = make_settlement(std::move(assessment));
+    return Result<AddressedParticipantStopSettlementDTO>::Ok(
+        *addressed_participant_stop_settlement_);
+  }
+  if (request.effect_prevented_before_dispatch) {
+    return Result<AddressedParticipantStopSettlementDTO>::Err(
         ErrorDTO{kErrorInvalidRequest,
-                 "A different Stop already owns the current motion terminal",
-                 {{"reason", "certified_motion_stop_certificate_conflict"}}});
+                 "Pre-dispatch cancellation has not reached its local terminal",
+                 {{"reason", "addressed_participant_stop_settlement_not_ready"},
+                  {"state", to_string(before.state)}}});
   }
   if (before.state != ExecutionState::kExecuting && before.state != ExecutionState::kPaused &&
-      before.state != ExecutionState::kStopping) {
-    return Result<void>::Err(
-        ErrorDTO{kErrorInvalidRequest,
-                 "Addressed Stop cannot replace the current motion terminal",
-                 {{"reason", "certified_motion_stop_state_invalid"},
-                  {"state", to_string(before.state)}}});
+      before.state != ExecutionState::kStopping && before.state != ExecutionState::kCompleted) {
+    return Result<AddressedParticipantStopSettlementDTO>::Err(ErrorDTO{
+        kErrorInvalidRequest,
+        "Addressed Stop cannot replace the current motion terminal",
+        {{"reason", "addressed_motion_stop_state_invalid"}, {"state", to_string(before.state)}}});
   }
 
   bump_control_command_epoch();
   invalidate_gripper_authority(GripperInvalidationReason::kStop);
   revoke_runtime_collision_lookahead_clear_permits();
-  const auto stop_owner_generation = begin_operator_stop_owner_generation(execution_id);
-  const auto transition_from = before.state;
-  if (before.state != ExecutionState::kStopping) {
-    auto stopping = sm_.try_transition(ExecutionState::kStopping);
-    if (!stopping.ok()) {
-      return Result<void>::Err(stopping.error());
-    }
-    emit_event({KernelEventType::kStateTransition,
-                execution_id,
-                clock_.now(),
-                transition_from,
-                ExecutionState::kStopping,
-                std::nullopt,
-                {{"reason", "addressed_stop_containment_certified"}}});
-  }
-
-  KernelStopCertificateDTO local_certificate;
-  local_certificate.certificate_id = certificate.stop_certificate_id.value();
-  local_certificate.completion_result = StopCertificateOutcome::kSucceeded;
-  local_certificate.stop_owner = StopOwnerKind::kOperatorStopWorker;
-  local_certificate.stop_owner_generation = stop_owner_generation;
-  local_certificate.execution_id = execution_id;
-  local_certificate.control_command_epoch = control_command_epoch();
-  local_certificate.requested_stop_mode = "addressed_stop_plan";
-  local_certificate.executed_stop_mode = "addressed_stop_plan";
-  local_certificate.command_source = "addressed_execution_owner";
-  local_certificate.preemption_result = InterruptPreemptionResult::kNoneRequired;
-  local_certificate.backend_stop_confirmed = true;
-  local_certificate.completed_at_ns = clock_.now();
-  if (!publish_stop_certificate(std::move(local_certificate))) {
-    return Result<void>::Err(
-        ErrorDTO{kErrorInvariantViolation,
-                 "Addressed Stop evidence could not be retained locally",
-                 {{"reason", "certified_motion_stop_evidence_rejected"}}});
-  }
-  (void)publish_terminal_recovery_assessment_locked(
-      ExecutionState::kStopped, "addressed_stop_containment_certified");
-  const auto committed = commit_terminal(ExecutionState::kStopped,
-                                         "addressed_stop_containment_certified",
-                                         TerminalCommitter::Origin::kStopAuthority);
-  if (committed.committed != ExecutionState::kStopped) {
-    return Result<void>::Err(
+  const auto stop_owner_generation = begin_operator_stop_owner_generation(request.execution_id);
+  addressed_motion_stop_recovery_evidence_ = AddressedMotionStopRecoveryEvidenceDTO{
+      request.execution_id, stop_owner_generation, stop, true};
+  const auto committed =
+      commit_terminal(ExecutionState::kStopped, "addressed_stop_participant_settlement",
+                      TerminalCommitter::Origin::kStopAuthority);
+  if (committed.committed != ExecutionState::kStopped ||
+      committed.previous == ExecutionState::kStopped) {
+    addressed_motion_stop_recovery_evidence_.reset();
+    addressed_participant_stop_settlement_.reset();
+    (void)refresh_recovery_assessment_locked("addressed_stop_participant_settlement_rejected");
+    return Result<AddressedParticipantStopSettlementDTO>::Err(
         ErrorDTO{kErrorInvariantViolation,
                  "Addressed Stop lost local terminal authority",
-                 {{"reason", "certified_motion_stop_terminal_conflict"},
+                 {{"reason", "addressed_motion_stop_terminal_conflict"},
                   {"state", to_string(committed.committed)}}});
+  }
+
+  if (committed.previous == ExecutionState::kExecuting ||
+      committed.previous == ExecutionState::kPaused) {
+    emit_event({KernelEventType::kStateTransition,
+                request.execution_id,
+                clock_.now(),
+                committed.previous,
+                ExecutionState::kStopping,
+                std::nullopt,
+                {{"reason", "addressed_stop_participant_settlement"}}});
   }
 
   stop_collision_monitoring(RuntimeCollisionMonitorRelease::kTerminalQuiesced);
   auto snapshot = execution_backend_.get_execution_snapshot();
   snapshot.timestamp_ns = clock_.now();
-  snapshot.execution_id = execution_id;
+  snapshot.execution_id = request.execution_id;
   snapshot.state = ExecutionState::kStopped;
   snapshot.error.reset();
   publish_execution_snapshot(std::move(snapshot));
-  emit_event({KernelEventType::kStopIssued,
-              execution_id,
-              clock_.now(),
-              {},
-              {},
-              std::nullopt,
-              {{"reason", "addressed_stop_containment_certified"},
-               {"stop_id", certificate.stop_id.value()},
-               {"stop_generation", std::to_string(certificate.stop_generation.value())}}});
   emit_event({KernelEventType::kStateTransition,
-              execution_id,
+              request.execution_id,
               clock_.now(),
-              ExecutionState::kStopping,
+              committed.previous == ExecutionState::kCompleted ? ExecutionState::kCompleted
+                                                               : ExecutionState::kStopping,
               ExecutionState::kStopped,
               std::nullopt,
-              {{"reason", "addressed_stop_containment_certified"}}});
-  {
-    std::lock_guard metrics_lock(metrics_mutex_);
-    ++metrics_.stops_issued;
+              {{"reason", "addressed_stop_participant_settlement"},
+               {"stop_id", stop.stop_id.value()},
+               {"stop_generation", std::to_string(stop.stop_generation.value())}}});
+  auto assessment =
+      refresh_recovery_assessment_locked("addressed_stop_participant_settlement_terminal");
+  if (assessment.execution_id != request.execution_id ||
+      assessment.execution_state != ExecutionState::kStopped ||
+      assessment.recovery_class != RecoveryClass::kOrdinaryOperatorStop ||
+      assessment.status != RecoveryAssessmentStatus::kRetryReady || !assessment.retry_admissible ||
+      !assessment.backend_stop_confirmed ||
+      assessment.stop_certificate_id != stop.stop_certificate_id.value() ||
+      assessment.stop_certificate_revision != stop.stop_certificate_revision.value() ||
+      assessment.stop_owner_generation != stop_owner_generation) {
+    return Result<AddressedParticipantStopSettlementDTO>::Err(
+        ErrorDTO{kErrorInvariantViolation,
+                 "Addressed Stop local recovery settlement is incomplete",
+                 {{"reason", "addressed_motion_stop_recovery_settlement_invalid"}}});
   }
-  return Result<void>::Ok();
+  addressed_participant_stop_settlement_ = make_settlement(std::move(assessment));
+  return Result<AddressedParticipantStopSettlementDTO>::Ok(*addressed_participant_stop_settlement_);
 }
 
 bool ExecutionKernel::control_command_epoch_matches(
@@ -9747,6 +9974,8 @@ ResetResultDTO ExecutionKernel::reset(std::optional<std::uint64_t> expected_epoc
       recovery_freshness_deadline_handle_ = 0;
       recovery_freshness_deadline_ns_ = 0;
     }
+    addressed_motion_stop_recovery_evidence_.reset();
+    addressed_participant_stop_settlement_.reset();
     recovery_readiness_tracker_.reset();
     (void)refresh_recovery_assessment_locked("reset_accepted");
     authorize_gripper_authority();
@@ -10050,11 +10279,20 @@ ResetResultDTO ExecutionKernel::reset_after_certified_containment(
               ExecutionState::kIdle,
               std::nullopt,
               {{"reason", "reset_after_certified_containment"}}});
+  if (recovery_freshness_deadline_handle_ != 0) {
+    scheduler_.cancel(recovery_freshness_deadline_handle_);
+    recovery_freshness_deadline_handle_ = 0;
+    recovery_freshness_deadline_ns_ = 0;
+  }
+  addressed_motion_stop_recovery_evidence_.reset();
+  addressed_participant_stop_settlement_.reset();
+  recovery_readiness_tracker_.reset();
   planning_reset_requested_.store(false, std::memory_order_release);
   lifecycle_stop_requested_while_busy_.store(false, std::memory_order_seq_cst);
   lifecycle_stop_requested_event_emitted_.store(false, std::memory_order_seq_cst);
   lifecycle_reset_requested_while_busy_.store(false, std::memory_order_release);
   operator_stop_worker_.clear_errors();
+  (void)refresh_recovery_assessment_locked("certified_containment_reset_accepted");
   authorize_gripper_authority();
   return ResetResultDTO{true, std::nullopt};
 }
@@ -10319,6 +10557,17 @@ Result<void> ExecutionKernel::apply_retry_after_scene_repair_locked(const std::s
 }
 
 KernelRecoveryAssessmentDTO ExecutionKernel::get_recovery_assessment() const {
+  std::shared_ptr<PreparedCapabilityCommandSession> command_session;
+  {
+    std::lock_guard lock(prepared_command_session_mutex_);
+    command_session = active_prepared_command_session_;
+  }
+  if (command_session) {
+    std::lock_guard session_lock(command_session->mutex);
+    if (command_session->stop_settlement.has_value() && !command_session->stop_recovery_consumed) {
+      return command_session->stop_settlement->recovery_assessment;
+    }
+  }
   std::lock_guard<std::mutex> lock(recovery_assessment_mutex_);
   return recovery_assessment_;
 }
@@ -10455,6 +10704,7 @@ RecoveryAuthorityCapture ExecutionKernel::capture_recovery_authority_locked() {
     capture.operator_stop_certificate =
         recovery_certificates_.authoritative(StopOwnerKind::kOperatorStopWorker);
   }
+  capture.addressed_motion_stop_evidence = addressed_motion_stop_recovery_evidence_;
   if (status.state == ExecutionState::kInterventionRequired) {
     std::optional<ErrorDTO> intervention_error = operator_stop_worker_.intervention_error();
     if (!intervention_error.has_value()) {
@@ -10658,6 +10908,68 @@ void ExecutionKernel::schedule_recovery_observation_poll_locked(
 
 KernelRecoveryActionResultDTO ExecutionKernel::apply_recovery_action(
     const KernelRecoveryActionRequestDTO& request) {
+  std::shared_ptr<PreparedCapabilityCommandSession> command_session;
+  {
+    std::lock_guard lock(prepared_command_session_mutex_);
+    command_session = active_prepared_command_session_;
+  }
+  if (command_session) {
+    std::optional<KernelRecoveryAssessmentDTO> addressed_assessment;
+    std::optional<KernelRecoveryAssessmentDTO> resulting_assessment;
+    std::optional<ErrorDTO> rejection;
+    {
+      std::lock_guard session_lock(command_session->mutex);
+      if (command_session->stop_settlement.has_value() &&
+          !command_session->stop_recovery_consumed) {
+        addressed_assessment = command_session->stop_settlement->recovery_assessment;
+        RecoveryAuthorityCapture capture;
+        capture.control_command_epoch = addressed_assessment->control_command_epoch;
+        const auto decision = evaluate_recovery_admission(request, capture, *addressed_assessment);
+        if (!decision.admitted) {
+          rejection = recovery_action_rejection_error(request, *addressed_assessment,
+                                                      decision.rejection_reason);
+        } else {
+          command_session->stop_recovery_consumed = true;
+          KernelRecoveryAssessmentDTO next;
+          next.assessment_revision = addressed_assessment->assessment_revision + 1U;
+          next.assessed_at_ns = clock_.now();
+          next.control_command_epoch = bump_control_command_epoch();
+          next.execution_state = ExecutionState::kIdle;
+          next.recovery_class = RecoveryClass::kNone;
+          next.status = RecoveryAssessmentStatus::kUnavailable;
+          next.reason_code = reason_codes::kRecoveryNoneActive;
+          resulting_assessment = std::move(next);
+        }
+      }
+    }
+    if (addressed_assessment.has_value()) {
+      KernelEvent event;
+      event.execution_id = addressed_assessment->execution_id;
+      event.timestamp_ns = clock_.now();
+      event.details = {
+          {"request_id", request.request_id},
+          {"action", recovery_action_name(request.action)},
+          {"principal_id", request.principal_id},
+          {"assessment_revision", std::to_string(addressed_assessment->assessment_revision)},
+          {"stop_certificate_id", addressed_assessment->stop_certificate_id}};
+      if (rejection.has_value()) {
+        event.type = KernelEventType::kRecoveryActionRejected;
+        event.error = rejection;
+        event.details.insert(rejection->details.begin(), rejection->details.end());
+        emit_event(std::move(event));
+        return KernelRecoveryActionResultDTO{request.request_id, request.action, false,
+                                             *addressed_assessment, std::move(rejection)};
+      }
+      event.type = KernelEventType::kRecoveryActionAccepted;
+      event.from_state = ExecutionState::kStopped;
+      event.to_state = ExecutionState::kIdle;
+      event.details["backend_reset_performed"] = "false";
+      event.details["reason_code"] = "recovery_action_accepted";
+      emit_event(std::move(event));
+      return KernelRecoveryActionResultDTO{request.request_id, request.action, true,
+                                           *resulting_assessment, std::nullopt};
+    }
+  }
   return apply_recovery_action_impl(request);
 }
 
@@ -10769,6 +11081,8 @@ KernelRecoveryActionResultDTO ExecutionKernel::apply_recovery_action_impl(
       if (!reset_result.ok()) {
         return reject(std::string("stop_policy_reset_rejected"));
       }
+      addressed_motion_stop_recovery_evidence_.reset();
+      addressed_participant_stop_settlement_.reset();
       const auto prev_execution_id = capture.execution_id;
       sm_.set_execution_id(0);
       active_correlation_.clear_move_id();

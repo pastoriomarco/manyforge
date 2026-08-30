@@ -99,11 +99,17 @@ template <typename StrongId>
                           bounded_identity(target.expected_graph_revision) &&
                           target.expected_component_lifecycle_generation.nonzero();
                  });
-        } else {
+        } else if constexpr (std::is_same_v<Targets, std::vector<StopResourceTargetDTO>>) {
           return canonical_rows(targets, [](const auto& target) { return target.resource_id; }) &&
                  std::all_of(targets.begin(), targets.end(), [](const auto& target) {
                    return bounded_identity(target.resource_id) &&
                           bounded_identity(target.expected_graph_revision);
+                 });
+        } else {
+          return canonical_rows(targets,
+                                [](const auto& target) { return target.program_run_id; }) &&
+                 std::all_of(targets.begin(), targets.end(), [](const auto& target) {
+                   return bounded_identity(target.program_run_id);
                  });
         }
       },
@@ -120,9 +126,11 @@ template <typename StrongId>
                    safe_counter(target.expected_stop_generation);
           } else if constexpr (std::is_same_v<Targets, std::vector<StopComponentTargetDTO>>) {
             return safe_counter(target.expected_component_lifecycle_generation);
-          } else {
+          } else if constexpr (std::is_same_v<Targets, std::vector<StopResourceTargetDTO>>) {
             return target.expected_operation_resource_generation <= kMaximumIJsonInteger &&
                    safe_counter(target.expected_stop_generation);
+          } else {
+            return true;
           }
         });
       },
@@ -149,7 +157,7 @@ template <typename StrongId>
                 {"expected_component_lifecycle_generation",
                  canonical_unsigned(target.expected_component_lifecycle_generation.value())},
                 {"expected_graph_revision", canonical_identity(target.expected_graph_revision)}});
-          } else {
+          } else if constexpr (std::is_same_v<Targets, std::vector<StopResourceTargetDTO>>) {
             rows.emplace_back(CanonicalValue::Object{
                 {"expected_graph_revision", canonical_identity(target.expected_graph_revision)},
                 {"expected_operation_resource_generation",
@@ -157,6 +165,9 @@ template <typename StrongId>
                 {"expected_stop_generation",
                  canonical_unsigned(target.expected_stop_generation.value())},
                 {"resource_id", canonical_identity(target.resource_id)}});
+          } else {
+            rows.emplace_back(CanonicalValue::Object{
+                {"program_run_id", canonical_identity(target.program_run_id)}});
           }
         }
         if constexpr (std::is_same_v<Targets, std::vector<StopOperationTargetDTO>>) {
@@ -167,9 +178,13 @@ template <typename StrongId>
           return CanonicalValue(
               CanonicalValue::Object{{"selector_kind", CanonicalValue("components")},
                                      {"targets", CanonicalValue(std::move(rows))}});
-        } else {
+        } else if constexpr (std::is_same_v<Targets, std::vector<StopResourceTargetDTO>>) {
           return CanonicalValue(
               CanonicalValue::Object{{"selector_kind", CanonicalValue("resources")},
+                                     {"targets", CanonicalValue(std::move(rows))}});
+        } else {
+          return CanonicalValue(
+              CanonicalValue::Object{{"selector_kind", CanonicalValue("program_runs")},
                                      {"targets", CanonicalValue(std::move(rows))}});
         }
       },
@@ -355,6 +370,7 @@ void canonicalize_diagnostics(std::vector<StopScopeStaleDiagnosticDTO>& diagnost
     case StopScopeResolutionReasonDTO::kKnownTerminalOrIdleNoEffect:
     case StopScopeResolutionReasonDTO::kMalformedOrdinaryIntent:
     case StopScopeResolutionReasonDTO::kUnknownOperation:
+    case StopScopeResolutionReasonDTO::kUnknownProgramRun:
     case StopScopeResolutionReasonDTO::kUnknownComponent:
     case StopScopeResolutionReasonDTO::kUnknownResource:
     case StopScopeResolutionReasonDTO::kRequestIdentityConflict:
@@ -380,6 +396,7 @@ void canonicalize_diagnostics(std::vector<StopScopeStaleDiagnosticDTO>& diagnost
     case StopResolutionDispositionDTO::kPromotedToFull:
       return reason == StopScopeResolutionReasonDTO::kMalformedOrdinaryIntent ||
              reason == StopScopeResolutionReasonDTO::kUnknownOperation ||
+             reason == StopScopeResolutionReasonDTO::kUnknownProgramRun ||
              reason == StopScopeResolutionReasonDTO::kUnknownComponent ||
              reason == StopScopeResolutionReasonDTO::kUnknownResource ||
              reason == StopScopeResolutionReasonDTO::kRequestIdentityConflict ||
@@ -395,6 +412,7 @@ void canonicalize_diagnostics(std::vector<StopScopeStaleDiagnosticDTO>& diagnost
     case StopScopeResolutionReasonDTO::kExplicitFullStop:
     case StopScopeResolutionReasonDTO::kMalformedOrdinaryIntent:
     case StopScopeResolutionReasonDTO::kUnknownOperation:
+    case StopScopeResolutionReasonDTO::kUnknownProgramRun:
     case StopScopeResolutionReasonDTO::kUnknownComponent:
     case StopScopeResolutionReasonDTO::kUnknownResource:
     case StopScopeResolutionReasonDTO::kRequestIdentityConflict:
@@ -647,6 +665,7 @@ std::optional<std::string_view> stop_scope_snapshot_field_error(
 
   for (const auto& operation : snapshot.operations) {
     if (!bounded_identity(operation.operation_id) || !operation.operation_revision.nonzero() ||
+        !bounded_identity(operation.program_run_id) ||
         !safe_counter(operation.operation_revision) || !safe_counter(operation.stop_generation) ||
         !known_operation_state(operation.state)) {
       return "stop_scope_operation_invalid";
@@ -759,7 +778,7 @@ Result<StopScopeResolutionDTO> resolve_stop_scope(const StopIntentDTO& intent,
                                                 capture);
             }
           }
-        } else {
+        } else if constexpr (std::is_same_v<Targets, std::vector<StopResourceTargetDTO>>) {
           for (const auto& target : targets) {
             const auto* resource = find_resource(snapshot, target.resource_id);
             if (resource == nullptr) {
@@ -782,6 +801,22 @@ Result<StopScopeResolutionDTO> resolve_stop_scope(const StopIntentDTO& intent,
               }
             }
             capture_effect_uncertain_resource(owner_index, *resource, capture);
+          }
+        } else {
+          for (const auto& target : targets) {
+            bool known = false;
+            for (const auto& operation : snapshot.operations) {
+              if (operation.program_run_id != target.program_run_id) {
+                continue;
+              }
+              known = true;
+              if (requires_containment(operation)) {
+                capture_operation(operation, capture);
+              }
+            }
+            if (!known) {
+              unresolved_reason = StopScopeResolutionReasonDTO::kUnknownProgramRun;
+            }
           }
         }
       },

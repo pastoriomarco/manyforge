@@ -9,11 +9,11 @@ namespace manyforge::core {
 inline constexpr std::string_view kStopJournalAcceptanceProjectionApiVersion =
     "manyforge.internal.stop-journal-acceptance-projection.v1";
 inline constexpr std::string_view kStopJournalTerminalProjectionApiVersion =
-    "manyforge.internal.stop-journal-terminal-projection.v1";
+    "manyforge.internal.stop-journal-terminal-projection.v2";
 inline constexpr std::string_view kStopJournalSurveillanceProjectionApiVersion =
     "manyforge.internal.stop-journal-surveillance-projection.v1";
 inline constexpr std::string_view kStopJournalFaultClearProjectionApiVersion =
-    "manyforge.internal.stop-journal-fault-clear-projection.v1";
+    "manyforge.internal.stop-journal-fault-clear-projection.v2";
 
 /// Closed structural payload retained beside a Stop-acceptance journal row.
 /// It is deliberately independent of live repositories and process memory so

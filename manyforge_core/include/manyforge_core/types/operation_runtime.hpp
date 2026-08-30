@@ -98,6 +98,15 @@ struct StopOperationTargetDTO final {
   friend bool operator==(const StopOperationTargetDTO&, const StopOperationTargetDTO&) = default;
 };
 
+/// Internal Program-owner selector. Public transports do not expose this
+/// alternative; the addressed Kernel expands it atomically from its current
+/// operation table so a phase transition cannot escape Program Stop.
+struct StopProgramRunTargetDTO final {
+  ProgramRunId program_run_id;
+
+  friend bool operator==(const StopProgramRunTargetDTO&, const StopProgramRunTargetDTO&) = default;
+};
+
 struct StopComponentTargetDTO final {
   ControllableComponentId controllable_component_id;
   GraphRevision expected_graph_revision;
@@ -117,7 +126,7 @@ struct StopResourceTargetDTO final {
 
 using StopSelectorDTO =
     std::variant<std::vector<StopOperationTargetDTO>, std::vector<StopComponentTargetDTO>,
-                 std::vector<StopResourceTargetDTO>>;
+                 std::vector<StopResourceTargetDTO>, std::vector<StopProgramRunTargetDTO>>;
 
 /// Kernel-owned classification of the public Stop selector after bounded
 /// resolution against the current cell snapshot. Stale caller metadata is
@@ -157,6 +166,7 @@ enum class StopScopeResolutionReasonDTO {
   kOverlappingStopTransactions,
   kEmergencyReserveCoalesced,
   kExplicitFullStop,
+  kUnknownProgramRun,
 };
 
 [[nodiscard]] constexpr std::string_view to_string(StopScopeResolutionReasonDTO reason) noexcept {
@@ -171,6 +181,8 @@ enum class StopScopeResolutionReasonDTO {
       return "malformed_ordinary_intent";
     case StopScopeResolutionReasonDTO::kUnknownOperation:
       return "unknown_operation";
+    case StopScopeResolutionReasonDTO::kUnknownProgramRun:
+      return "unknown_program_run";
     case StopScopeResolutionReasonDTO::kUnknownComponent:
       return "unknown_component";
     case StopScopeResolutionReasonDTO::kUnknownResource:

@@ -22,10 +22,10 @@ class FakeTransport:
         self.submitted: Mapping[str, Any] | None = None
         self.controls: list[tuple[str, str, Mapping[str, Any]]] = []
 
-    def execution_identity(self) -> dict[str, Any]:
+    def identity(self) -> dict[str, Any]:
         return {"ok": True, "identity": {"owner_epoch": "epoch-1"}}
 
-    def execute(self, body: Mapping[str, Any]) -> dict[str, Any]:
+    def submit(self, body: Mapping[str, Any]) -> dict[str, Any]:
         self.submitted = body
         return {"ok": True, "accepted": {"operation_id": "operation-1"}}
 
@@ -57,13 +57,13 @@ class FakeTransport:
             "sequence_status": {"kind": "place", "sequence_id": "place-1"},
         }
 
-    def pick_place_sequence(self, sequence_id: str) -> dict[str, Any]:
+    def read_pick_place_sequence(self, sequence_id: str) -> dict[str, Any]:
         return {
             "ok": True,
             "sequence_status": {"sequence_id": sequence_id, "phase": "completed"},
         }
 
-    def operation(self, operation_id: str) -> dict[str, Any]:
+    def read(self, operation_id: str) -> dict[str, Any]:
         return {
             "ok": True,
             "operation": {"operation_id": operation_id, "state": "completed"},
@@ -75,26 +75,26 @@ class FakeTransport:
         self.controls.append((kind, operation_id, body))
         return {"ok": True, "accepted": {"operation_id": operation_id}}
 
-    def pause_operation(self, operation_id, body):
+    def pause(self, operation_id, body):
         return self._control("pause", operation_id, body)
 
-    def resume_operation(self, operation_id, body):
+    def resume(self, operation_id, body):
         return self._control("resume", operation_id, body)
 
-    def reset_operation(self, operation_id, body):
+    def reset(self, operation_id, body):
         return self._control("reset", operation_id, body)
 
-    def acknowledge_completed_operation(self, operation_id, body):
+    def acknowledge_completed(self, operation_id, body):
         return self._control("acknowledge_completed", operation_id, body)
 
-    def stop_operations(self, body):
+    def stop(self, body):
         operation_id = body["operations"][0]["operation_id"]
         return self._control("stop", operation_id, body)
 
-    def set_operation_runtime_scale(self, operation_id, body):
+    def set_runtime_scale(self, operation_id, body):
         return self._control("runtime_scale", operation_id, body)
 
-    def operation_runtime_scale(self, operation_id):
+    def get_runtime_scale(self, operation_id):
         return {
             "ok": True,
             "runtime_scale": {"operation_id": operation_id, "effective_scale": 1.0},
@@ -183,7 +183,7 @@ def test_kernel_client_only_forwards_bounded_headless_operations() -> None:
 
 def test_malformed_success_and_legacy_stateful_mock_fail_closed() -> None:
     class BadTransport(FakeTransport):
-        def execution_identity(self) -> dict[str, Any]:
+        def identity(self) -> dict[str, Any]:
             return {"ok": False}
 
     with pytest.raises(KernelClientResponseError):
@@ -197,7 +197,7 @@ def test_only_exact_operation_owner_unavailability_is_typed_for_retry() -> None:
         code = "execution_owner_unavailable"
 
     class UnavailableObservationTransport(FakeTransport):
-        def operation(self, operation_id: str) -> dict[str, Any]:
+        def read(self, operation_id: str) -> dict[str, Any]:
             raise OwnerUnavailableError("HTTP 503")
 
     client = KernelClient(UnavailableObservationTransport())
@@ -205,7 +205,7 @@ def test_only_exact_operation_owner_unavailability_is_typed_for_retry() -> None:
         client.operation("operation-1")
 
     class MalformedObservationTransport(FakeTransport):
-        def operation(self, operation_id: str) -> dict[str, Any]:
+        def read(self, operation_id: str) -> dict[str, Any]:
             return {"ok": False}
 
     with pytest.raises(KernelClientResponseError):

@@ -1,10 +1,10 @@
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_roboplan/retained_stop_surveillance_owner.hpp>
 #include <map>
-#include <limits>
 #include <set>
 #include <stdexcept>
 #include <stop_token>
@@ -365,11 +365,10 @@ observe_current_quiescence(const RetainedStopSurveillanceSourceInput &source,
         "native_no_active_goal_source_missing",
         "native current-resource proof has no goal-activity source");
   }
-  auto observed =
-      read_deadline_ns >= 0
-          ? source.state_channel->current_state_bounded(
-                assessed_at_ns, read_deadline_ns, std::stop_token{})
-          : source.state_channel->current_state(assessed_at_ns);
+  auto observed = read_deadline_ns >= 0
+                      ? source.state_channel->current_state_bounded(
+                            assessed_at_ns, read_deadline_ns, std::stop_token{})
+                      : source.state_channel->current_state(assessed_at_ns);
   if (!observed.ok()) {
     return core::Result<CurrentQuiescenceObservation>::Err(observed.error());
   }
@@ -440,16 +439,14 @@ observe_current_quiescence_after_refresh(
     const std::vector<core::ResourceId> &resources,
     const std::int64_t assessed_at_ns, core::IClock *clock) {
   const auto deadline_for = [](const std::int64_t assessed) {
-    return assessed >
-                   std::numeric_limits<std::int64_t>::max() -
-                       kRetainedNativeReconciliationFreshnessBudgetNs
+    return assessed > std::numeric_limits<std::int64_t>::max() -
+                          kRetainedNativeReconciliationFreshnessBudgetNs
                ? std::numeric_limits<std::int64_t>::max()
                : assessed + kRetainedNativeReconciliationFreshnessBudgetNs;
   };
   auto assessed = assessed_at_ns;
-  auto observed =
-      observe_current_quiescence(source, resources, assessed,
-                                 deadline_for(assessed));
+  auto observed = observe_current_quiescence(source, resources, assessed,
+                                             deadline_for(assessed));
   if (observed.ok() || !quiescence_refreshable(observed.error())) {
     if (!observed.ok()) {
       return core::Result<RefreshedCurrentQuiescenceObservation>::Err(
@@ -457,10 +454,10 @@ observe_current_quiescence_after_refresh(
     }
     return core::Result<RefreshedCurrentQuiescenceObservation>::Ok(
         RefreshedCurrentQuiescenceObservation{std::move(observed.value()),
-                                               assessed});
+                                              assessed});
   }
-  if (!source.state_channel->wait_for_fresh_state(
-          std::chrono::nanoseconds(kRetainedNativeReconciliationFreshnessBudgetNs))) {
+  if (!source.state_channel->wait_for_fresh_state(std::chrono::nanoseconds(
+          kRetainedNativeReconciliationFreshnessBudgetNs))) {
     return core::Result<RefreshedCurrentQuiescenceObservation>::Err(
         observed.error());
   }
@@ -475,7 +472,7 @@ observe_current_quiescence_after_refresh(
   }
   return core::Result<RefreshedCurrentQuiescenceObservation>::Ok(
       RefreshedCurrentQuiescenceObservation{std::move(observed.value()),
-                                             assessed});
+                                            assessed});
 }
 
 [[nodiscard]] std::optional<SelectedSource>
@@ -571,8 +568,8 @@ using MotionRestRequirement = std::pair<core::StopEvidenceRequirementDTO,
                                         core::ResolvedStopEvidenceSourceDTO>;
 
 [[nodiscard]] std::vector<MotionRestRequirement>
-latest_motion_rest_requirements(const core::StopStatusDTO &status,
-                                const core::StopScopeEntryKeyDTO &scope_key) {
+recovery_motion_rest_requirements(const core::StopStatusDTO &status,
+                                  const core::StopScopeEntryKeyDTO &scope_key) {
   const core::StopAttemptedStageResultDTO *selected = nullptr;
   for (const auto &attempt : status.attempted_stage_results) {
     if (attempt.scope_key == scope_key &&
@@ -585,12 +582,14 @@ latest_motion_rest_requirements(const core::StopStatusDTO &status,
   }
   if (selected == nullptr)
     return {};
-  std::vector<MotionRestRequirement> result;
-  for (const auto &command :
-       selected->result.request.participant_stop_plan.stage_commands) {
-    if (command.resolved_stage.stage_index !=
-        selected->result.request.stage_index)
-      continue;
+
+  const auto &commands =
+      selected->result.request.participant_stop_plan.stage_commands;
+  const auto collect = [&commands](const std::size_t stage_index) {
+    std::vector<MotionRestRequirement> result;
+    if (stage_index >= commands.size())
+      return result;
+    const auto &command = commands[stage_index];
     for (const auto &requirement :
          command.resolved_stage.evidence_requirements) {
       if (requirement.requirement.evidence_kind ==
@@ -601,8 +600,27 @@ latest_motion_rest_requirements(const core::StopStatusDTO &status,
                             requirement.resolved_source);
       }
     }
+    return result;
+  };
+
+  const auto selected_index = selected->result.request.stage_index;
+  auto result = collect(selected_index);
+  if (!result.empty())
+    return result;
+
+  // A promoted or malformed Stop can retain a fault latch after an exact
+  // nominal goal-cancel has already succeeded. Goal-terminal evidence proves
+  // that command settled, but it is not a physical-rest observation with
+  // which to clear the latch. Sample the first later, already-qualified rest
+  // contract from the same immutable participant plan only as a fresh recovery
+  // observation. This does not execute or certify that escalation stage.
+  for (auto stage_index = selected_index + 1U; stage_index < commands.size();
+       ++stage_index) {
+    result = collect(stage_index);
+    if (!result.empty())
+      return result;
   }
-  return result;
+  return {};
 }
 
 } // namespace
@@ -756,7 +774,7 @@ RetainedStopSurveillanceOwner::BuildRecoveryFacts(
       if (participant == nullptr)
         continue;
       const auto requirements =
-          latest_motion_rest_requirements(status, scope.key);
+          recovery_motion_rest_requirements(status, scope.key);
       if (requirements.empty())
         continue;
       std::set<core::ResourceId> assigned_resources;
@@ -1032,9 +1050,8 @@ RetainedStopSurveillanceOwner::BuildOrphanResourceReconciliationFacts(
       auto refreshed = std::move(observed.value());
       effective_assessed_at_ns =
           std::max(effective_assessed_at_ns, refreshed.assessed_at_ns);
-      pending.push_back(PendingObservation{
-          source_index, selected_resources,
-          std::move(refreshed.observation)});
+      pending.push_back(PendingObservation{source_index, selected_resources,
+                                           std::move(refreshed.observation)});
     }
 
     std::vector<core::OrphanResourceReconciliationFactDTO> facts;
@@ -1066,11 +1083,9 @@ RetainedStopSurveillanceOwner::BuildOrphanResourceReconciliationFacts(
             path.provider_runtime_epoch,
             core::StopFaultRecoveryResourceFactDTO{
                 resource, core::StopFaultRecoveryResourceStateDTO::kSettled,
-                observed.snapshot.source_epoch,
-                observed.snapshot.sequence,
-                source_age_ns,
-                kRetainedNativeReconciliationFreshnessBudgetNs, std::nullopt,
-                std::nullopt},
+                observed.snapshot.source_epoch, observed.snapshot.sequence,
+                source_age_ns, kRetainedNativeReconciliationFreshnessBudgetNs,
+                std::nullopt, std::nullopt},
             observed.no_active_goal_evidence_digest,
             observed.configuration_evidence_digest};
         fact.settlement.evidence_digest = current_resource_evidence_digest(

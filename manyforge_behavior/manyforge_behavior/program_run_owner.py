@@ -884,6 +884,7 @@ class ProgramRunOwner:
         state_after_stop: ProgramRunState,
         reason_code: str | None,
         message: str,
+        stop_request_id: str | None = None,
     ) -> ProgramRunSnapshot:
         with self._lock:
             transition_lock = self._entry(program_run_id).transition_lock
@@ -921,7 +922,11 @@ class ProgramRunOwner:
             scope_errors: list[Exception] = []
             if issue_stop:
                 try:
-                    scope_snapshot = self._scope.request_stop(program_run_id, reason)
+                    scope_snapshot = self._scope.request_stop(
+                        program_run_id,
+                        stop_request_id or f"owner-transition:{uuid4().hex}",
+                        reason,
+                    )
                 except Exception as exc:  # fail closed; status remains stopping
                     scope_errors.append(exc)
                 try:
@@ -991,12 +996,14 @@ class ProgramRunOwner:
         program_run_id: str,
         *,
         reason: str | None = None,
+        stop_request_id: str | None = None,
     ) -> ProgramRunSnapshot:
         if reason is not None:
             _text(reason, field="reason", maximum_bytes=4_096)
         return self._begin_stop(
             program_run_id,
             reason=reason,
+            stop_request_id=stop_request_id or f"owner-stop:{uuid4().hex}",
             state_after_stop=ProgramRunState.STOPPED,
             reason_code=None,
             message="",
@@ -1007,6 +1014,7 @@ class ProgramRunOwner:
         program_run_id: str,
         *,
         reason: str | None = None,
+        stop_request_id: str | None = None,
     ) -> ProgramRunSnapshot:
         """Stop current addressed work without terminating its Program run.
 
@@ -1029,7 +1037,11 @@ class ProgramRunOwner:
                         "motion Stop requires a running Program"
                     )
             try:
-                scope_snapshot = self._scope.request_stop(program_run_id, reason)
+                scope_snapshot = self._scope.request_stop(
+                    program_run_id,
+                    stop_request_id or f"owner-motion-stop:{uuid4().hex}",
+                    reason,
+                )
                 active_count, _settled, scope_reason = self._scope_fields(
                     scope_snapshot,
                     program_run_id,

@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
+
 #include <manyforge_core/state_machine.hpp>
+#include <manyforge_core/terminal_committer.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
 #include <thread>
 #include <utility>
@@ -13,8 +15,8 @@ class StateMachineTest : public ::testing::Test {
   FakeClock clock;
   std::vector<std::pair<ExecutionState, ExecutionState>> transitions;
   ExecutionStateMachine sm{clock, [this](ExecutionState from, ExecutionState to) {
-    transitions.emplace_back(from, to);
-  }};
+                             transitions.emplace_back(from, to);
+                           }};
 };
 
 // --- Initial state ---
@@ -214,12 +216,95 @@ TEST_F(StateMachineTest, StoppedToAnyInvalid) {
   EXPECT_FALSE(sm.try_transition(ExecutionState::kExecuting).ok());
 }
 
-TEST_F(StateMachineTest, CompletedToAnyInvalid) {
+TEST_F(StateMachineTest, CompletedAdmitsOnlyLateWinningStopOrIntervention) {
   (void)sm.try_transition(ExecutionState::kPlanning);
   (void)sm.try_transition(ExecutionState::kValidating);
   (void)sm.try_transition(ExecutionState::kExecuting);
   (void)sm.try_transition(ExecutionState::kCompleted);
   EXPECT_FALSE(sm.try_transition(ExecutionState::kPlanning).ok());
+  EXPECT_TRUE(sm.try_transition(ExecutionState::kStopped).ok());
+}
+
+TEST(StateMachineTerminalAuthority, ContainedStopSerializesExecutingThroughStoppingToStopped) {
+  FakeClock clock;
+  std::vector<std::pair<ExecutionState, ExecutionState>> transitions;
+  ExecutionStateMachine sm{
+      clock, [&](ExecutionState from, ExecutionState to) { transitions.emplace_back(from, to); }};
+  ASSERT_TRUE(sm.try_transition(ExecutionState::kPlanning).ok());
+  ASSERT_TRUE(sm.try_transition(ExecutionState::kValidating).ok());
+  ASSERT_TRUE(sm.try_transition(ExecutionState::kExecuting).ok());
+  transitions.clear();
+  TerminalCommitter committer{sm, [] { return false; }, [] { return false; }, [] { return false; }};
+
+  const auto outcome = committer.commit(
+      {ExecutionState::kStopped, "contained_stop", TerminalCommitter::Origin::kStopAuthority});
+
+  EXPECT_TRUE(outcome.ok());
+  EXPECT_EQ(outcome.previous, ExecutionState::kExecuting);
+  EXPECT_EQ(outcome.committed, ExecutionState::kStopped);
+  EXPECT_EQ(sm.status().state, ExecutionState::kStopped);
+  EXPECT_EQ(transitions, (std::vector<std::pair<ExecutionState, ExecutionState>>{
+                             {ExecutionState::kExecuting, ExecutionState::kStopping},
+                             {ExecutionState::kStopping, ExecutionState::kStopped}}));
+}
+
+TEST(StateMachineTerminalAuthority, ContainedStopSerializesPausedThroughStoppingToStopped) {
+  FakeClock clock;
+  std::vector<std::pair<ExecutionState, ExecutionState>> transitions;
+  ExecutionStateMachine sm{
+      clock, [&](ExecutionState from, ExecutionState to) { transitions.emplace_back(from, to); }};
+  ASSERT_TRUE(sm.try_transition(ExecutionState::kPlanning).ok());
+  ASSERT_TRUE(sm.try_transition(ExecutionState::kValidating).ok());
+  ASSERT_TRUE(sm.try_transition(ExecutionState::kExecuting).ok());
+  ASSERT_TRUE(sm.try_transition(ExecutionState::kStopping).ok());
+  ASSERT_TRUE(sm.try_transition(ExecutionState::kPaused).ok());
+  transitions.clear();
+  TerminalCommitter committer{sm, [] { return false; }, [] { return false; }, [] { return false; }};
+
+  const auto outcome = committer.commit(
+      {ExecutionState::kStopped, "contained_stop", TerminalCommitter::Origin::kStopAuthority});
+
+  EXPECT_TRUE(outcome.ok());
+  EXPECT_EQ(outcome.previous, ExecutionState::kPaused);
+  EXPECT_EQ(outcome.committed, ExecutionState::kStopped);
+  EXPECT_EQ(sm.status().state, ExecutionState::kStopped);
+  EXPECT_EQ(transitions, (std::vector<std::pair<ExecutionState, ExecutionState>>{
+                             {ExecutionState::kPaused, ExecutionState::kStopping},
+                             {ExecutionState::kStopping, ExecutionState::kStopped}}));
+}
+
+TEST(StateMachineTerminalAuthority, ContainedStopWinsAfterConcurrentNaturalCompletion) {
+  FakeClock clock;
+  std::vector<std::pair<ExecutionState, ExecutionState>> transitions;
+  ExecutionStateMachine sm{
+      clock, [&](ExecutionState from, ExecutionState to) { transitions.emplace_back(from, to); }};
+  ASSERT_TRUE(sm.try_transition(ExecutionState::kPlanning).ok());
+  ASSERT_TRUE(sm.try_transition(ExecutionState::kValidating).ok());
+  ASSERT_TRUE(sm.try_transition(ExecutionState::kExecuting).ok());
+  TerminalCommitter committer{sm, [] { return false; }, [] { return false; }, [] { return false; }};
+
+  const auto completed = committer.commit(
+      {ExecutionState::kCompleted, "natural_completion", TerminalCommitter::Origin::kGeneric});
+  ASSERT_TRUE(completed.ok());
+  ASSERT_EQ(completed.committed, ExecutionState::kCompleted);
+  transitions.clear();
+
+  const auto stopped = committer.commit(
+      {ExecutionState::kStopped, "contained_stop", TerminalCommitter::Origin::kStopAuthority});
+
+  EXPECT_TRUE(stopped.ok());
+  EXPECT_EQ(stopped.previous, ExecutionState::kCompleted);
+  EXPECT_EQ(stopped.committed, ExecutionState::kStopped);
+  EXPECT_EQ(sm.status().state, ExecutionState::kStopped);
+  EXPECT_EQ(transitions, (std::vector<std::pair<ExecutionState, ExecutionState>>{
+                             {ExecutionState::kCompleted, ExecutionState::kStopped}}));
+
+  const auto stale_completion = committer.commit(
+      {ExecutionState::kCompleted, "late_natural_completion", TerminalCommitter::Origin::kGeneric});
+  EXPECT_FALSE(stale_completion.ok());
+  EXPECT_EQ(stale_completion.previous, ExecutionState::kStopped);
+  EXPECT_EQ(stale_completion.committed, ExecutionState::kStopped);
+  EXPECT_EQ(sm.status().state, ExecutionState::kStopped);
 }
 
 TEST_F(StateMachineTest, FailedToAnyInvalid) {
@@ -428,9 +513,8 @@ TEST_F(StateMachineTest, ConcurrentTransitionsDontCorrupt) {
 
   std::vector<std::jthread> threads;
   for (int i = 0; i < 10; ++i) {
-    threads.emplace_back([&shared_sm]() {
-      (void)shared_sm.try_transition(ExecutionState::kCompleted);
-    });
+    threads.emplace_back(
+        [&shared_sm]() { (void)shared_sm.try_transition(ExecutionState::kCompleted); });
   }
   for (auto& thread : threads) {
     thread.join();
@@ -467,8 +551,7 @@ TEST(StateMachineTerminalAuthority, NormalTerminalCannotOverwriteSafetyTerminal)
   {
     manyforge::core::ExecutionStateMachine sm{clock};
     ASSERT_TRUE(sm.try_transition(ExecutionState::kPlanning).ok());
-    ASSERT_TRUE(
-        sm.try_transition(ExecutionState::kInterventionRequired).ok());
+    ASSERT_TRUE(sm.try_transition(ExecutionState::kInterventionRequired).ok());
     EXPECT_FALSE(sm.try_transition(ExecutionState::kCompleted).ok());
     EXPECT_FALSE(sm.try_transition(ExecutionState::kStopped).ok());
     EXPECT_FALSE(sm.try_transition(ExecutionState::kFailed).ok());

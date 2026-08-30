@@ -23,6 +23,7 @@ namespace {
       20U,
       StopGeneration(7U),
       {StopScopeOperationSnapshotDTO{OperationId("operation.a"),
+                                     ProgramRunId("program-run.a"),
                                      OperationRevision(3U),
                                      StopGeneration(4U),
                                      OperationStateKind::kExecuting,
@@ -31,6 +32,7 @@ namespace {
                                      {ControllableComponentId("robot.a")},
                                      {ResourceId("robot.a.joint.1")}},
        StopScopeOperationSnapshotDTO{OperationId("operation.b"),
+                                     ProgramRunId("program-run.b"),
                                      OperationRevision(5U),
                                      StopGeneration(6U),
                                      OperationStateKind::kPaused,
@@ -52,6 +54,14 @@ namespace {
                                                {OperationId("operation.a"), OperationRevision(3U),
                                                 StopGeneration(4U)}}) {
   return StopIntentDTO{request_context(), std::move(targets), std::nullopt, {}};
+}
+
+[[nodiscard]] StopIntentDTO program_run_stop(std::string program_run_id = "program-run.a") {
+  return StopIntentDTO{request_context(),
+                       std::vector<StopProgramRunTargetDTO>{
+                           StopProgramRunTargetDTO{ProgramRunId(std::move(program_run_id))}},
+                       std::nullopt,
+                       {}};
 }
 
 [[nodiscard]] StopIntentDTO component_stop(
@@ -169,6 +179,7 @@ TEST(StopScopeResolverTest, ComponentAndResourceSelectorsExpandCoordinatedOperat
   auto snapshot = independent_snapshot();
   snapshot.operations = {StopScopeOperationSnapshotDTO{
       OperationId("operation.ab"),
+      ProgramRunId("program-run.a"),
       OperationRevision(8U),
       StopGeneration(2U),
       OperationStateKind::kDispatching,
@@ -266,6 +277,20 @@ TEST(StopScopeResolverTest, KnownTerminalAndIdleTargetsAreIdempotentNoEffect) {
   ASSERT_TRUE(resource.ok());
   EXPECT_EQ(resource.value().disposition, StopResolutionDispositionDTO::kAlreadyTerminalNoEffect);
   EXPECT_FALSE(resource.value().full_stop);
+}
+
+TEST(StopScopeResolverTest, InternalProgramRunSelectorCapturesOnlyCurrentRun) {
+  const auto snapshot = independent_snapshot();
+  const auto selected = resolve_stop_scope(program_run_stop(), snapshot);
+  ASSERT_TRUE(selected.ok()) << selected.error().message;
+  EXPECT_EQ(selected.value().disposition, StopResolutionDispositionDTO::kExact);
+  EXPECT_FALSE(selected.value().full_stop);
+  EXPECT_EQ(selected.value().operations, std::vector<OperationId>{OperationId("operation.a")});
+
+  const auto unknown = resolve_stop_scope(program_run_stop("program-run.unknown"), snapshot);
+  ASSERT_TRUE(unknown.ok()) << unknown.error().message;
+  EXPECT_EQ(unknown.value().disposition, StopResolutionDispositionDTO::kPromotedToFull);
+  EXPECT_EQ(unknown.value().reason, StopScopeResolutionReasonDTO::kUnknownProgramRun);
 }
 
 TEST(StopScopeResolverTest, UnknownOrMalformedOrdinaryScopePromotesToCurrentFullCapture) {

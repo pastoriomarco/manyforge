@@ -49,7 +49,6 @@ from .models import (
     RuntimeOverrideStageRequest,
     FullStopIntentRequest,
     OperationControlRequest,
-    OperationRecoveryActionRequest,
     OperationIntentRequest,
     PickSequencePlanningRequest,
     PlaceSequencePlanningRequest,
@@ -379,23 +378,6 @@ class HeadlessService:
 
     def execution_read(self, operation_id: str) -> dict[str, Any]:
         return self._execution().read(operation_id)
-
-    def execution_operation_recovery(
-        self, operation_id: str
-    ) -> dict[str, Any]:
-        return self._execution().operation_recovery(operation_id)
-
-    def execution_apply_operation_recovery(
-        self,
-        operation_id: str,
-        expected_operation_revision: int,
-        request: OperationRecoveryActionRequest,
-    ) -> dict[str, Any]:
-        return self._execution().apply_operation_recovery(
-            operation_id,
-            expected_operation_revision,
-            request,
-        )
 
     def execution_plan_pick(
         self,

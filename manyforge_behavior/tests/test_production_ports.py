@@ -44,8 +44,11 @@ class _Transport:
         self.controls: list[tuple[str, str, Mapping[str, Any]]] = []
         self.operations: dict[str, dict[str, Any]] = {}
         self.resident: dict[str, bool] = {}
+        self.operation_reads = 0
+        self.stop_status_reads = 0
+        self.stop_states: dict[str, str] = {}
 
-    def execution_identity(self) -> dict[str, Any]:
+    def identity(self) -> dict[str, Any]:
         return {
             "ok": True,
             "identity": {
@@ -65,7 +68,7 @@ class _Transport:
             },
         }
 
-    def execute(self, body: Mapping[str, Any]) -> dict[str, Any]:
+    def submit(self, body: Mapping[str, Any]) -> dict[str, Any]:
         self.submissions.append(deepcopy(body))
         operation_id = f"operation-{len(self.submissions)}"
         self.operations[operation_id] = {
@@ -85,7 +88,8 @@ class _Transport:
             },
         }
 
-    def operation(self, operation_id: str) -> dict[str, Any]:
+    def read(self, operation_id: str) -> dict[str, Any]:
+        self.operation_reads += 1
         return {
             "ok": True,
             "operation": deepcopy(self.operations[operation_id]),
@@ -106,32 +110,56 @@ class _Transport:
             },
         }
 
-    def pause_operation(self, operation_id: str, body: Mapping[str, Any]):
+    def pause(self, operation_id: str, body: Mapping[str, Any]):
         return self._control("pause", operation_id, body)
 
-    def resume_operation(self, operation_id: str, body: Mapping[str, Any]):
+    def resume(self, operation_id: str, body: Mapping[str, Any]):
         return self._control("resume", operation_id, body)
 
-    def reset_operation(self, operation_id: str, body: Mapping[str, Any]):
+    def reset(self, operation_id: str, body: Mapping[str, Any]):
         result = self._control("reset", operation_id, body)
         self.resident[operation_id] = False
         return result
 
-    def acknowledge_completed_operation(
+    def acknowledge_completed(
         self, operation_id: str, body: Mapping[str, Any]
     ):
         return self._control("acknowledge", operation_id, body)
 
-    def stop_operations(self, body: Mapping[str, Any]):
+    def stop(self, body: Mapping[str, Any]):
         operation_id = body["operations"][0]["operation_id"]
         return self._control("stop", operation_id, body)
 
-    def set_operation_runtime_scale(
+    def stop_program_run(self, body: Mapping[str, Any]):
+        self.controls.append(
+            ("stop_program_run", body["program_run_id"], deepcopy(body))
+        )
+        stop_id = f"scope-stop-{len(self.stop_states) + 1}"
+        self.stop_states[stop_id] = "stopping"
+        return {
+            "ok": True,
+            "accepted": {
+                "request_id": body["request_context"]["request_id"],
+                "stop_id": stop_id,
+            },
+        }
+
+    def stop_status(self, stop_id: str):
+        self.stop_status_reads += 1
+        return {
+            "ok": True,
+            "stop_status": {
+                "stop_id": stop_id,
+                "state": self.stop_states[stop_id],
+            },
+        }
+
+    def set_runtime_scale(
         self, operation_id: str, body: Mapping[str, Any]
     ):
         return self._control("scale", operation_id, body)
 
-    def operation_runtime_scale(self, operation_id: str):
+    def get_runtime_scale(self, operation_id: str):
         return {"ok": True, "runtime_scale": {"operation_id": operation_id}}
 
 
@@ -292,7 +320,7 @@ def test_accepted_operation_owner_unavailability_has_exact_task_port_type() -> N
         code = "execution_owner_unavailable"
 
     class _UnavailableTransport(_Transport):
-        def operation(self, operation_id: str) -> dict[str, Any]:
+        def read(self, operation_id: str) -> dict[str, Any]:
             raise OwnerUnavailableError("HTTP 503")
 
     transport = _UnavailableTransport()
@@ -344,7 +372,7 @@ def test_native_context_cleanup_consumes_settled_tasks_but_refuses_active_work()
         )
 
 
-def test_program_scope_stop_is_exact_and_not_repeated() -> None:
+def test_program_scope_stop_is_one_exact_batch_without_operation_reads() -> None:
     transport = _Transport()
     port = NativeKernelProgramPort(KernelClient(transport))
     port.bind(_context())
@@ -354,21 +382,35 @@ def test_program_scope_stop_is_exact_and_not_repeated() -> None:
     transport.operations[started.task_id].update(
         {"state": "executing", "operation_revision": 3}
     )
+    second = port.operations.start(
+        "motion.move_to_pose", _identity("second"), _motion_inputs()
+    )
+    transport.operations[second.task_id].update(
+        {"state": "executing", "operation_revision": 4}
+    )
+    reads_before_stop = transport.operation_reads
 
-    first = port.scope.request_stop("program-run.1", "Program Stop")
-    port.scope.request_stop("program-run.1", "Program Stop")
+    first = port.scope.request_stop(
+        "program-run.1", "execution:caller.1:request.1", "Program Stop"
+    )
 
     assert first.state is ProgramRunScopeState.ACTIVE
-    stop_calls = [item for item in transport.controls if item[0] == "stop"]
+    assert first.active_operation_count == 2
+    assert transport.operation_reads == reads_before_stop
+    stop_calls = [
+        item for item in transport.controls if item[0] == "stop_program_run"
+    ]
     assert len(stop_calls) == 1
     body = stop_calls[0][2]
-    assert body["operations"] == [
-        {
-            "operation_id": started.task_id,
-            "expected_operation_revision": 3,
-            "expected_stop_generation": 0,
-        }
-    ]
+    assert body["program_run_id"] == "program-run.1"
+    assert body["request_context"]["correlation_id"] == "program-run.1"
+    assert port.scope.observe("program-run.1").state is ProgramRunScopeState.ACTIVE
+    assert transport.operation_reads == reads_before_stop
+    assert transport.stop_status_reads == 1
+    transport.stop_states["scope-stop-1"] = "succeeded"
+    assert port.scope.observe("program-run.1").state is ProgramRunScopeState.SETTLED
+    assert transport.operation_reads == reads_before_stop
+    assert transport.stop_status_reads == 2
 
 
 def test_program_scope_reset_releases_terminal_residency_once() -> None:
@@ -406,11 +448,11 @@ def test_failed_stop_submission_can_be_retried() -> None:
             super().__init__()
             self.fail_next_stop = True
 
-        def stop_operations(self, body: Mapping[str, Any]):
+        def stop_program_run(self, body: Mapping[str, Any]):
             if self.fail_next_stop:
                 self.fail_next_stop = False
                 raise RuntimeError("temporary Stop transport failure")
-            return super().stop_operations(body)
+            return super().stop_program_run(body)
 
     transport = _OneStopFailureTransport()
     port = NativeKernelProgramPort(KernelClient(transport))
@@ -423,10 +465,14 @@ def test_failed_stop_submission_can_be_retried() -> None:
     )
 
     with pytest.raises(RuntimeError, match="temporary Stop"):
-        port.scope.request_stop("program-run.1", "Program Stop")
-    port.scope.request_stop("program-run.1", "Program Stop")
+        port.scope.request_stop(
+            "program-run.1", "execution:caller.1:request.1", "Program Stop"
+        )
+    port.scope.request_stop(
+        "program-run.1", "execution:caller.1:request.1", "Program Stop"
+    )
 
-    assert [item[0] for item in transport.controls] == ["stop"]
+    assert [item[0] for item in transport.controls] == ["stop_program_run"]
 
 
 def test_gripper_schema_comes_from_captured_program_binding() -> None:
@@ -454,8 +500,8 @@ def test_gripper_schema_comes_from_captured_program_binding() -> None:
 
 def test_stale_native_deployment_fails_before_dispatch() -> None:
     class _StaleTransport(_Transport):
-        def execution_identity(self) -> dict[str, Any]:
-            result = super().execution_identity()
+        def identity(self) -> dict[str, Any]:
+            result = super().identity()
             result["identity"]["graph_revision"] = _DIGEST_F
             return result
 
@@ -581,7 +627,7 @@ class _PickPlaceTransport(_Transport):
             "sequence_status": deepcopy(status),
         }
 
-    def pick_place_sequence(self, sequence_id: str) -> dict[str, Any]:
+    def read_pick_place_sequence(self, sequence_id: str) -> dict[str, Any]:
         return {
             "ok": True,
             "sequence_status": deepcopy(self.sequence_statuses[sequence_id]),

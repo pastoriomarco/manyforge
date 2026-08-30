@@ -7,10 +7,10 @@ from manyforge_behavior.kernel_client import KernelClient
 
 def test_contract_requires_the_base_headless_transport_calls() -> None:
     class IncompleteTransport:
-        def execution_identity(self):
+        def identity(self):
             return {"ok": True}
 
-    with pytest.raises(TypeError, match="execute"):
+    with pytest.raises(TypeError, match="submit"):
         KernelClient(IncompleteTransport())  # type: ignore[arg-type]
 
 
@@ -20,16 +20,16 @@ def test_contract_constructor_does_not_call_the_transport() -> None:
             raise AssertionError("transport was called during construction")
 
     class Transport:
-        execution_identity = PoisonCallable()
-        execute = PoisonCallable()
-        operation = PoisonCallable()
-        pause_operation = PoisonCallable()
-        resume_operation = PoisonCallable()
-        reset_operation = PoisonCallable()
-        acknowledge_completed_operation = PoisonCallable()
-        stop_operations = PoisonCallable()
-        set_operation_runtime_scale = PoisonCallable()
-        operation_runtime_scale = PoisonCallable()
+        identity = PoisonCallable()
+        submit = PoisonCallable()
+        read = PoisonCallable()
+        pause = PoisonCallable()
+        resume = PoisonCallable()
+        reset = PoisonCallable()
+        acknowledge_completed = PoisonCallable()
+        stop = PoisonCallable()
+        set_runtime_scale = PoisonCallable()
+        get_runtime_scale = PoisonCallable()
 
     client = KernelClient(Transport())
     with pytest.raises(TypeError, match="plan_pick"):

@@ -424,7 +424,6 @@ enum class CommandKind {
 RequiresCurrentPackageGeneration(const CommandKind command) noexcept {
   switch (command) {
   case CommandKind::kDeploymentCandidatePreview:
-  case CommandKind::kApply:
   case CommandKind::kSceneCommit:
   case CommandKind::kSceneCandidatePreview:
   case CommandKind::kSceneRuntimeObserverOpen:
@@ -433,6 +432,7 @@ RequiresCurrentPackageGeneration(const CommandKind command) noexcept {
   case CommandKind::kReconcile:
     return true;
   case CommandKind::kSceneOwnerRead:
+  case CommandKind::kApply:
   case CommandKind::kApplyStatus:
   case CommandKind::kScenePoseQuery:
   case CommandKind::kSceneRuntimeOwnerRead:
@@ -3519,6 +3519,9 @@ private:
           const auto existing = stores_.apply_journal().ReadRequest(
               core::RequestOwnerEpoch(*command.request_owner_epoch),
               core::RequestId(*command.request_id));
+          if (!existing.has_value()) {
+            RequireCurrentPackageGeneration();
+          }
           if (!existing.has_value() && !kernel_apply_available_) {
             TrySendResponse(client.get(), ApplyUnavailableResponse(command));
             return false;
@@ -3602,9 +3605,7 @@ private:
         } catch (const ManagerPackageGenerationRestartRequired &error) {
           PublishPackageRestartRequired();
           TrySendResponse(client.get(),
-                          DetailedErrorResponse(error.error().code,
-                                                error.error().message,
-                                                error.error().details));
+                          ApplyDetailedErrorResponse(command, error.error()));
         } catch (const std::exception &error) {
           TrySendResponse(
               client.get(),
