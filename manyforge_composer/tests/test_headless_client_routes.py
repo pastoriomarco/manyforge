@@ -464,6 +464,20 @@ def headless_client() -> (
             payload = _program_run_status(state="stopping")
         elif path == "/api/program/runs/program-run.1/motion-stop":
             payload = _program_run_status(state="running")
+        elif path == "/api/program/runs/program-run.1/full-stop":
+            payload = _program_run_status(state="full_stopping")
+        elif path == "/api/program/runs/program-run.1/resume-full-stop":
+            payload = _program_run_status(state="running")
+        elif path == "/api/program/runs/program-run.1/reset":
+            payload = {
+                "schema_version": "manyforge.program_cycle_reset_result.v1",
+                "program_run_id": "program-run.1",
+                "reset_cycle_generation": 4,
+                "idle_cycle_generation": 5,
+                "settlement_reference": "sha256:" + "d" * 64,
+                "admission": {},
+                "runtime_controls": None,
+            }
         elif path == "/api/program/applied":
             if applied_program is None:
                 return httpx.Response(
@@ -1215,6 +1229,38 @@ def test_composer_program_routes_are_strict_stateless_forwarders(
                 "reason": "ordinary operator motion Stop",
             },
         )
+        full_stopped = composer.post(
+            "/api/program/runs/program-run.1/full-stop",
+            json={
+                **stop,
+                "request_id": "request.program.full-stop.1",
+                "reason": "ordinary operator Full Stop",
+            },
+        )
+        resumed = composer.post(
+            "/api/program/runs/program-run.1/resume-full-stop",
+            json={
+                **_caller(),
+                "request_id": "request.program.resume-full-stop.1",
+                "program_run_id": "program-run.1",
+                "expected_owner_epoch": "program-runner.epoch.1",
+                "expected_run_revision": 1,
+                "reason": "operator Run after Full Stop",
+            },
+        )
+        reset = composer.post(
+            "/api/program/runs/program-run.1/reset",
+            json={
+                **_caller(),
+                "request_id": "request.program.reset-full-stop.1",
+                "program_run_id": "program-run.1",
+                "expected_owner_epoch": "program-runner.epoch.1",
+                "expected_run_revision": 1,
+                "expected_cycle_generation": 4,
+                "expected_claim_generation": 7,
+                "reason": "operator Reset discarded Full Stop",
+            },
+        )
         stopped = composer.post(
             "/api/program/runs/program-run.1/stop",
             json=stop,
@@ -1227,6 +1273,9 @@ def test_composer_program_routes_are_strict_stateless_forwarders(
     assert started.status_code == 200
     assert read.json()["capture"]["program_run_id"] == "program-run.1"
     assert motion_stopped.json()["state"] == "running"
+    assert full_stopped.json()["state"] == "full_stopping"
+    assert resumed.json()["state"] == "running"
+    assert reset.json()["idle_cycle_generation"] == 5
     assert stopped.json()["state"] == "stopping"
     assert mismatch.status_code == 400
     forwarded = [
@@ -1238,6 +1287,9 @@ def test_composer_program_routes_are_strict_stateless_forwarders(
         "GET",
         "POST",
         "GET",
+        "POST",
+        "POST",
+        "POST",
         "POST",
         "POST",
     ]
@@ -2486,6 +2538,12 @@ def test_composer_websocket_multiplexes_shell_and_bounded_observations(
                 "poll_count": viewer_status.json()["source"]["poll_count"],
                 "published_count": 1,
                 "error_count": 0,
+                "last_poll_duration_us": viewer_status.json()["source"][
+                    "last_poll_duration_us"
+                ],
+                "max_poll_duration_us": viewer_status.json()["source"][
+                    "max_poll_duration_us"
+                ],
                 "last_error": None,
             },
             "fanout": {
@@ -2495,6 +2553,10 @@ def test_composer_websocket_multiplexes_shell_and_bounded_observations(
             },
         }
         assert viewer_status.json()["source"]["poll_count"] >= 1
+        assert viewer_status.json()["source"]["last_poll_duration_us"] >= 0
+        assert viewer_status.json()["source"]["max_poll_duration_us"] >= (
+            viewer_status.json()["source"]["last_poll_duration_us"]
+        )
     assert {
         item["path"] for item in _without_authoring_owner_calls(requests)
     } == {

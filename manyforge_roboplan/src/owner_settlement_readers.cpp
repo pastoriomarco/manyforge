@@ -520,14 +520,14 @@ ValidateProgramRunnerOwnerReconciliationReadOnly(
     if (!metadata.Step() || metadata.Integer(0) != 3 || metadata.Step())
       throw std::runtime_error("Program-cycle journal schema differs");
     Statement row(database.get(),
-                  "SELECT state,owner_epoch,claim_json,release_intent_json,"
-                  "terminal_reference,"
+                  "SELECT state,owner_epoch,program_run_id,claim_json,"
+                  "release_intent_json,terminal_reference,start_settlement_json,"
                   "reconciliation_required,acquisition_pending_json,"
                   "reconciliation_evidence_digest "
                   "FROM program_cycle WHERE singleton=1");
     if (!row.Step() || row.Text(1) != replacement.predecessor.value() ||
-        row.Integer(5) != 1 || !row.IsNull(6) || row.IsNull(7) ||
-        row.Text(7) != reconcile.reconciliation_evidence_digest.value())
+        row.Integer(7) != 1 || !row.IsNull(8) || row.IsNull(9) ||
+        row.Text(9) != reconcile.reconciliation_evidence_digest.value())
       throw std::runtime_error(
           "Program-cycle reconciliation intent is not exact");
 
@@ -535,27 +535,49 @@ ValidateProgramRunnerOwnerReconciliationReadOnly(
         reconcile.current_owner_epochs, {}};
     const auto state = row.Text(0);
     if (state == "idle_after_reset") {
-      if (!row.IsNull(2) || !row.IsNull(3) || !row.IsNull(4))
+      if (!row.IsNull(2) || !row.IsNull(3) || !row.IsNull(4) ||
+          !row.IsNull(5) || !row.IsNull(6))
         throw std::runtime_error("idle Program-cycle retains a claim");
     } else if (state == "terminal_awaiting_reset") {
-      if (row.IsNull(2) || row.IsNull(3))
+      if (row.IsNull(2) || row.IsNull(3) || row.IsNull(5))
         throw std::runtime_error("terminal Program-cycle evidence is absent");
-      const auto claim = DecodeCellAdmissionClaim(row.Text(2));
-      const auto release = DecodeCellAdmissionClaimRelease(row.Text(3));
-      if (claim.intent.owner_epoch != replacement.predecessor ||
-          !ExactReleaseIdentity(claim, release) ||
-          claim.intent.claim_kind !=
+      const auto claim = DecodeCellAdmissionClaim(row.Text(3));
+      if (claim.intent.claim_kind !=
               core::CellAdmissionClaimKindDTO::kProgramCycle ||
           claim.intent.owner_role !=
-              core::CellAdmissionOwnerRoleDTO::kProgramRunner ||
-          release.settlement.settlement_kind !=
-              core::CellAdmissionSettlementKindDTO::kExplicitReset ||
-          row.IsNull(4) ||
-          row.Text(4) != release.settlement.evidence_digest.value())
+              core::CellAdmissionOwnerRoleDTO::kProgramRunner)
         throw std::runtime_error("terminal Program-cycle evidence differs");
-      if (std::find(held_claims.begin(), held_claims.end(), claim) !=
-          held_claims.end())
-        throw std::runtime_error("released Program-cycle remains held");
+      const auto evidence_matches =
+          row.IsNull(6)
+              ? ProgramTerminalSnapshotMatches(database.get(), row.Text(2),
+                                               row.Text(5))
+              : ProgramStartSettlementMatches(row.Text(6), claim, row.Text(2),
+                                              row.Text(5));
+      if (!evidence_matches)
+        throw std::runtime_error("terminal Program-cycle outcome differs");
+
+      const bool claim_is_held =
+          std::find(held_claims.begin(), held_claims.end(), claim) !=
+          held_claims.end();
+      if (!row.IsNull(4)) {
+        const auto release = DecodeCellAdmissionClaimRelease(row.Text(4));
+        if (!ExactReleaseIdentity(claim, release) ||
+            release.settlement.settlement_kind !=
+                core::CellAdmissionSettlementKindDTO::kExplicitReset ||
+            row.Text(5) != release.settlement.evidence_digest.value() ||
+            claim_is_held)
+          throw std::runtime_error("released Program-cycle evidence differs");
+      } else if (claim_is_held) {
+        if (claim.intent.owner_epoch != replacement.predecessor)
+          throw std::runtime_error("held Program-cycle owner differs");
+        validation.settlements.push_back(
+            {claim, core::CellAdmissionOwnerRoleDTO::kProgramRunner,
+             replacement.successor,
+             core::CellAdmissionSettlementKindDTO::kReconciled,
+             reconcile.reconciliation_evidence_digest});
+      } else if (claim.intent.owner_epoch == replacement.predecessor) {
+        throw std::runtime_error("terminal Program-cycle settlement is absent");
+      }
     } else {
       throw std::runtime_error("active Program-cycle cannot rotate");
     }

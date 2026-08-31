@@ -42,6 +42,7 @@ from manyforge_behavior.program_run_owner import (
     ProgramRunOwner,
     ProgramRunOwnerError,
     ProgramRunOwnerOutcomeUnknownError,
+    ProgramRunState,
     build_applied_program_run_admission,
 )
 from manyforge_behavior.program_scheduling import (
@@ -70,7 +71,12 @@ from .liveness import (
     ProgramRunnerLivenessError,
     ProgramRunnerLivenessReceiver,
 )
-from .models import ProgramCycleResetRequest, ProgramCycleStatusDTO
+from .models import (
+    ProgramCycleResetRequest,
+    ProgramCycleStatusDTO,
+    ProgramFullStopResetRequest,
+    ProgramFullStopResumeRequest,
+)
 from .models import (
     CycleRecoveryActionRequest,
     ManualResultStageRequest,
@@ -467,6 +473,57 @@ class ProgramRuntime:
                 and isinstance(claim.get("intent"), dict)
                 and claim["intent"].get("owner_role") == "program_runner"
             ]
+            current_reconciliation_digest = (
+                cell_admission_owner_epoch_reconciliation_evidence_digest(
+                    "program_runner", self.owner_epoch
+                )
+            )
+
+            def reconciled_receipt_is_exact(successor: str) -> bool:
+                if cycle.claim is None:
+                    return False
+                evidence = (
+                    cell_admission_owner_epoch_reconciliation_evidence_digest(
+                        "program_runner", successor
+                    )
+                )
+                return bool(
+                    receipt.get("status") == "reconciled_exact"
+                    and receipt.get("matched_claim") == cycle.claim
+                    and receipt.get("matched_release") is None
+                    and receipt.get("matched_reconcile_settlement")
+                    == {
+                        "predecessor_claim": cycle.claim,
+                        "successor_owner_role": "program_runner",
+                        "successor_owner_epoch": successor,
+                        "settlement_predicate": "reconciled",
+                        "reconciliation_evidence_digest": evidence,
+                    }
+                )
+
+            def unknown_receipt_is_exact() -> bool:
+                return bool(
+                    receipt.get("status") == "unknown"
+                    and receipt.get("matched_claim") is None
+                    and receipt.get("matched_release") is None
+                    and receipt.get("matched_reconcile_settlement") is None
+                )
+
+            def require_terminal_evidence() -> Mapping[str, Any]:
+                claim = cycle.claim
+                intent = claim.get("intent") if isinstance(claim, Mapping) else None
+                if (
+                    not isinstance(claim, Mapping)
+                    or not isinstance(intent, Mapping)
+                    or intent.get("owner_role") != "program_runner"
+                    or intent.get("claim_kind") != "program_cycle"
+                    or not self._cycle_terminal_evidence_is_exact(journal, cycle)
+                ):
+                    raise RuntimeError(
+                        "terminal Program-cycle evidence is not exact"
+                    )
+                return intent
+
             if not program_owners:
                 if (
                     held_program_claims
@@ -482,11 +539,7 @@ class ProgramRuntime:
                 ):
                     journal.reconcile_liveness(
                         owner_epoch=self.owner_epoch,
-                        evidence_digest=(
-                            cell_admission_owner_epoch_reconciliation_evidence_digest(
-                                "program_runner", self.owner_epoch
-                            )
-                        ),
+                        evidence_digest=current_reconciliation_digest,
                         require_terminal_release=False,
                     )
             elif len(program_owners) != 1:
@@ -496,50 +549,106 @@ class ProgramRuntime:
                     cycle.owner_epoch != self.owner_epoch
                     or cycle.reconciliation_required
                 ):
+                    if cycle.state == "terminal_awaiting_reset":
+                        intent = require_terminal_evidence()
+                        if cycle.release_intent is not None:
+                            if (
+                                held_program_claims
+                                or receipt.get("status") != "released_exact"
+                                or receipt.get("matched_claim") != cycle.claim
+                                or receipt.get("matched_release")
+                                != cycle.release_intent
+                            ):
+                                raise RuntimeError(
+                                    "terminal Program-cycle release is not exact"
+                                )
+                        elif intent.get("owner_epoch") == self.owner_epoch:
+                            if (
+                                held_program_claims != [cycle.claim]
+                                or receipt.get("status") != "held_exact"
+                                or receipt.get("matched_claim") != cycle.claim
+                            ):
+                                raise RuntimeError(
+                                    "terminal Program-cycle claim is not exact"
+                                )
+                        elif not (
+                            reconciled_receipt_is_exact(self.owner_epoch)
+                            or (
+                                not held_program_claims
+                                and unknown_receipt_is_exact()
+                                and cycle.reconciliation_evidence_digest
+                                == current_reconciliation_digest
+                            )
+                        ):
+                            raise RuntimeError(
+                                "terminal Program-cycle reconciliation settlement "
+                                "is not exact"
+                            )
                     journal.reconcile_liveness(
                         owner_epoch=self.owner_epoch,
-                        evidence_digest=(
-                            cell_admission_owner_epoch_reconciliation_evidence_digest(
-                                "program_runner", self.owner_epoch
-                            )
-                        ),
+                        evidence_digest=current_reconciliation_digest,
                         require_terminal_release=False,
                     )
             else:
                 predecessor = program_owners[0].get("owner_epoch")
-                if (
-                    not isinstance(predecessor, str)
-                    or not predecessor
-                    or held_program_claims
-                ):
+                if not isinstance(predecessor, str) or not predecessor:
                     raise RuntimeError(
                         "predecessor Program Runner ownership is unresolved"
                     )
                 if cycle.state == "terminal_awaiting_reset":
-                    if (
-                        cycle.claim is None
-                        or cycle.release_intent is None
-                        or receipt.get("status")
-                        not in {"released_exact", "reconciled_exact"}
-                        or receipt.get("matched_claim") != cycle.claim
-                        or receipt.get("matched_release")
-                        != cycle.release_intent
-                    ):
-                        raise RuntimeError(
-                            "terminal predecessor release is not exactly recovered"
+                    intent = require_terminal_evidence()
+                    if cycle.release_intent is not None:
+                        if (
+                            held_program_claims
+                            or receipt.get("status") != "released_exact"
+                            or receipt.get("matched_claim") != cycle.claim
+                            or receipt.get("matched_release")
+                            != cycle.release_intent
+                        ):
+                            raise RuntimeError(
+                                "terminal predecessor release is not exact"
+                            )
+                    elif held_program_claims:
+                        if (
+                            held_program_claims != [cycle.claim]
+                            or receipt.get("status") != "held_exact"
+                            or receipt.get("matched_claim") != cycle.claim
+                            or intent.get("owner_epoch") != predecessor
+                        ):
+                            raise RuntimeError(
+                                "terminal predecessor claim is not exact"
+                            )
+                    else:
+                        predecessor_digest = (
+                            cell_admission_owner_epoch_reconciliation_evidence_digest(
+                                "program_runner", predecessor
+                            )
                         )
-                elif cycle.claim is not None:
-                    raise RuntimeError(
-                        "idle predecessor retains a Program-cycle claim"
-                    )
-                reconciliation_digest = (
-                    cell_admission_owner_epoch_reconciliation_evidence_digest(
-                        "program_runner", self.owner_epoch
-                    )
-                )
+                        local_predecessor_is_exact = bool(
+                            cycle.owner_epoch == predecessor
+                            and intent.get("owner_epoch") != predecessor
+                            and (
+                                cycle.reconciliation_required
+                                or cycle.reconciliation_evidence_digest
+                                == predecessor_digest
+                            )
+                        )
+                        if (
+                            not local_predecessor_is_exact
+                            or not (
+                                reconciled_receipt_is_exact(predecessor)
+                                or unknown_receipt_is_exact()
+                            )
+                        ):
+                            raise RuntimeError(
+                                "terminal predecessor settlement is not exact"
+                            )
+                elif cycle.claim is not None or held_program_claims:
+                    raise RuntimeError("idle predecessor retains a Program-cycle claim")
                 journal.prepare_liveness_reconciliation(
                     predecessor_owner_epoch=predecessor,
-                    evidence_digest=reconciliation_digest,
+                    evidence_digest=current_reconciliation_digest,
+                    require_terminal_release=False,
                 )
                 successor_owners = [
                     (
@@ -558,7 +667,7 @@ class ProgramRuntime:
                         "retained_claims": held,
                         "current_owner_epochs": successor_owners,
                         "reconciliation_evidence_digest": (
-                            reconciliation_digest
+                            current_reconciliation_digest
                         ),
                     }
                 )
@@ -569,7 +678,8 @@ class ProgramRuntime:
                 # write without inventing another recovery state.
                 journal.reconcile_liveness(
                     owner_epoch=self.owner_epoch,
-                    evidence_digest=reconciliation_digest,
+                    evidence_digest=current_reconciliation_digest,
+                    require_terminal_release=False,
                 )
             journal.retain_liveness_manager(
                 manager_runtime_epoch=manager_runtime_epoch,
@@ -2479,7 +2589,86 @@ class ProgramRuntime:
                         else 2
                     )
                 )
-                if request.action_id == "retry_runtime_step":
+                if request.action_id == "reset_cycle":
+                    effect_started = True
+                    terminal = self._host.stop_run(
+                        program_run_id,
+                        reason=(
+                            request.reason
+                            or "operator Reset after ordinary motion Stop"
+                        ),
+                        stop_request_id=self._digest(
+                            {
+                                "kind": "operator_stop_reset_program_stop",
+                                "request_owner_epoch": (
+                                    request.request_owner_epoch
+                                ),
+                                "request_id": request.request_id,
+                                "program_run_id": program_run_id,
+                            }
+                        ),
+                    )
+                    if getattr(terminal.state, "value", terminal.state) not in {
+                        ProgramRunState.STOPPED.value,
+                        ProgramRunState.SUCCEEDED.value,
+                        ProgramRunState.FAILED.value,
+                    }:
+                        raise ProgramRunOwnerOutcomeUnknownError(
+                            "motion-stopped tree did not settle for Reset"
+                        )
+                    projected_terminal = self._project_run(terminal.to_dict())
+                    self._record_terminal_snapshot(projected_terminal)
+                    settled_cycle = journal.read()
+                    settled_claim = settled_cycle.claim
+                    terminal_reference = settled_cycle.terminal_reference
+                    if (
+                        settled_cycle.state != "terminal_awaiting_reset"
+                        or settled_cycle.cycle_generation
+                        != cycle.cycle_generation
+                        or settled_cycle.program_run_id != program_run_id
+                        or not isinstance(settled_claim, Mapping)
+                        or type(settled_claim.get("claim_generation")) is not int
+                        or not isinstance(terminal_reference, str)
+                    ):
+                        raise ProgramRunOwnerOutcomeUnknownError(
+                            "motion-stopped Reset settlement was not retained"
+                        )
+                    reset_request = ProgramCycleResetRequest.model_validate(
+                        {
+                            "request_id": self._digest(
+                                {
+                                    "kind": "operator_stop_reset_cycle",
+                                    "request_owner_epoch": (
+                                        request.request_owner_epoch
+                                    ),
+                                    "request_id": request.request_id,
+                                    "program_run_id": program_run_id,
+                                }
+                            ),
+                            "request_owner_epoch": request.request_owner_epoch,
+                            "source_label": request.source_label,
+                            "correlation_id": (
+                                request.correlation_id or request.request_id
+                            ),
+                            "program_run_id": program_run_id,
+                            "expected_owner_epoch": self.owner_epoch,
+                            "expected_cycle_generation": (
+                                settled_cycle.cycle_generation
+                            ),
+                            "expected_claim_generation": settled_claim[
+                                "claim_generation"
+                            ],
+                            "terminal_reference": terminal_reference,
+                            "settlement_evidence_digest": terminal_reference,
+                        }
+                    )
+                    reset_result = self.reset_cycle(reset_request)
+                    owner_result = {
+                        "program_stop": projected_terminal,
+                        "cycle_reset": reset_result,
+                    }
+                    snapshot = terminal
+                elif request.action_id == "retry_runtime_step":
                     effect_started = True
                     snapshot = self._host.resume_recovery(
                         program_run_id,
@@ -2803,6 +2992,292 @@ class ProgramRuntime:
             retained.settled.set()
         raise outcome
 
+    def full_stop(
+        self,
+        program_run_id: str,
+        request: ProgramRunStopRequest,
+    ) -> dict[str, Any]:
+        """Contain one Program run, then preserve its quiesced tree."""
+
+        if not isinstance(request, ProgramRunStopRequest):
+            raise TypeError("full_stop requires one ProgramRunStopRequest")
+        if self._closed or not self._started:
+            raise ProgramRunnerError(
+                "program_runner_unavailable",
+                "Program runner is not started",
+            )
+        if request.program_run_id != program_run_id:
+            raise ProgramRunnerError(
+                "program_run_path_invalid",
+                "Program-run identity in path and body must match",
+            )
+        if request.expected_owner_epoch != self.owner_epoch:
+            raise ProgramRunnerError(
+                "program_run_owner_stale",
+                "Program-run owner epoch changed before Full Stop",
+            )
+
+        intent = request.model_dump(mode="json")
+        key = ("full", request.request_owner_epoch, request.request_id)
+        retained: _EmergencyStopRecord | None = None
+        owns_record = False
+        with self._stop_replay_lock:
+            resident = self._stop_replay.get(key)
+            if resident is not None and resident.intent == intent:
+                retained = resident
+            elif resident is None and len(self._stop_replay) < (
+                self.config.maximum_replay_records
+            ):
+                retained = _EmergencyStopRecord(intent, Event())
+                self._stop_replay[key] = retained
+                owns_record = True
+
+        if retained is not None and not owns_record:
+            retained.settled.wait()
+            if retained.result is not None:
+                return deepcopy(retained.result)
+            if retained.error is not None:
+                raise ProgramRunnerError(
+                    retained.error.code,
+                    str(retained.error),
+                )
+            raise ProgramRunnerError(
+                "program_full_stop_outcome_unknown",
+                "resident Full Stop outcome is unavailable",
+            )
+
+        try:
+            snapshot = self._host.full_stop(
+                program_run_id,
+                reason=request.reason,
+                stop_request_id=(
+                    "full:"
+                    f"{request.request_owner_epoch}:{request.request_id}"
+                ),
+            )
+            result = self._project_run(snapshot.to_dict())
+        except ProgramRunOwnerOutcomeUnknownError as error:
+            outcome = ProgramRunnerError(
+                "program_full_stop_outcome_unknown",
+                str(error),
+            )
+        except ProgramRunOwnerError as error:
+            outcome = ProgramRunnerError(
+                "program_full_stop_invalid",
+                str(error),
+            )
+        except ProgramSchedulingError as error:
+            outcome = self._runner_error(error)
+        except ProgramRunnerError as error:
+            outcome = error
+        except Exception as error:
+            outcome = ProgramRunnerError(
+                "program_full_stop_outcome_unknown",
+                str(error) or type(error).__name__,
+            )
+        else:
+            try:
+                _admission, journal = self._require_cycle_owner()
+                journal.retain_run_snapshot(result)
+            except Exception:
+                pass
+            if retained is not None:
+                retained.result = deepcopy(result)
+                retained.settled.set()
+            return result
+
+        if retained is not None:
+            retained.error = outcome
+            retained.settled.set()
+        raise outcome
+
+    def resume_full_stop(
+        self,
+        program_run_id: str,
+        request: ProgramFullStopResumeRequest,
+    ) -> dict[str, Any]:
+        """Resume one exact preserved tree through fresh-state recovery."""
+
+        if not isinstance(request, ProgramFullStopResumeRequest):
+            raise TypeError(
+                "resume_full_stop requires one ProgramFullStopResumeRequest"
+            )
+        if request.program_run_id != program_run_id:
+            raise ProgramRunnerError(
+                "program_run_path_invalid",
+                "Program-run identity in path and body must match",
+            )
+
+        def effect() -> dict[str, Any]:
+            snapshot = self._host.resume_full_stop(
+                program_run_id,
+                request_id=request.request_id,
+                reason=request.reason,
+            )
+            return {
+                "state": getattr(snapshot.state, "value", snapshot.state),
+                "run_revision": snapshot.run_revision,
+            }
+
+        result = self._control_effect(
+            request,
+            kind="resume_full_stop",
+            effect=effect,
+        )
+        run = result.get("run")
+        if not isinstance(run, Mapping):
+            raise ProgramRunnerError(
+                "program_runner_response_invalid",
+                "Full Stop resume omitted its Program-run result",
+            )
+        return self._project_run(run)
+
+    def discard_full_stop(
+        self,
+        program_run_id: str,
+        request: ProgramFullStopResetRequest,
+    ) -> dict[str, Any]:
+        """Discard one preserved tree as the first phase of one Reset."""
+
+        if not isinstance(request, ProgramFullStopResetRequest):
+            raise TypeError(
+                "discard_full_stop requires one ProgramFullStopResetRequest"
+            )
+        if request.program_run_id != program_run_id:
+            raise ProgramRunnerError(
+                "program_run_path_invalid",
+                "Program-run identity in path and body must match",
+            )
+        if self._closed or not self._started:
+            raise ProgramRunnerError(
+                "program_runner_unavailable",
+                "Program runner is not started",
+            )
+        self._require_manager_current()
+        with self._transition_lock:
+            self._require_manager_current()
+            _admission, journal = self._require_cycle_owner()
+            cycle = journal.read()
+            try:
+                record = journal.record_request(
+                    owner_epoch=request.request_owner_epoch,
+                    request_id=request.request_id,
+                    kind="discard_full_stop",
+                    intent=request.model_dump(mode="json"),
+                    cycle_generation=cycle.cycle_generation,
+                )
+            except (ValueError, OverflowError) as error:
+                raise ProgramRunnerError(
+                    (
+                        "program_run_request_ledger_full"
+                        if isinstance(error, OverflowError)
+                        else "program_run_request_conflict"
+                    ),
+                    str(error),
+                ) from error
+            replay = self._ordinary_replay(record)
+            if replay is not None:
+                return self._project_run(replay)
+
+            def reject(error: ProgramRunnerError) -> NoReturn:
+                self._retain_rejection(
+                    journal,
+                    owner_epoch=request.request_owner_epoch,
+                    request_id=request.request_id,
+                    error=error,
+                )
+                raise error
+
+            claim = cycle.claim
+            if (
+                request.expected_owner_epoch != self.owner_epoch
+                or cycle.owner_epoch != self.owner_epoch
+                or cycle.reconciliation_required
+                or cycle.state != "running"
+                or cycle.program_run_id != program_run_id
+                or cycle.cycle_generation
+                != request.expected_cycle_generation
+                or not isinstance(claim, Mapping)
+                or claim.get("claim_generation")
+                != request.expected_claim_generation
+            ):
+                reject(
+                    ProgramRunnerError(
+                        "program_full_stop_reset_stale",
+                        "Reset does not identify the current Full-stopped cycle",
+                    )
+                )
+            try:
+                live = self._owner.read(program_run_id)
+            except ProgramRunOwnerError as error:
+                reject(ProgramRunnerError("program_run_not_found", str(error)))
+            if (
+                getattr(live.state, "value", live.state)
+                != ProgramRunState.FULL_STOPPED.value
+                or live.run_revision != request.expected_run_revision
+            ):
+                reject(
+                    ProgramRunnerError(
+                        "program_full_stop_reset_stale",
+                        "Reset does not identify the exact Full-stopped tree",
+                    )
+                )
+
+            effect_started = False
+            try:
+                effect_started = True
+                terminal = self._host.stop_run(
+                    program_run_id,
+                    reason=request.reason or "operator Reset discarded Full Stop",
+                    stop_request_id=(
+                        "full-stop-reset:"
+                        f"{request.request_owner_epoch}:{request.request_id}"
+                    ),
+                )
+                if getattr(terminal.state, "value", terminal.state) not in {
+                    ProgramRunState.STOPPED.value,
+                    ProgramRunState.SUCCEEDED.value,
+                    ProgramRunState.FAILED.value,
+                }:
+                    raise ProgramRunOwnerOutcomeUnknownError(
+                        "Full-stopped tree did not settle for Reset"
+                    )
+                result = self._project_run(terminal.to_dict())
+                self._record_terminal_snapshot(result)
+                settled_cycle = journal.read()
+                if (
+                    settled_cycle.state != "terminal_awaiting_reset"
+                    or settled_cycle.program_run_id != program_run_id
+                ):
+                    raise ProgramRunOwnerOutcomeUnknownError(
+                        "Full-stopped Reset settlement was not retained"
+                    )
+                journal.complete_control_request(
+                    owner_epoch=request.request_owner_epoch,
+                    request_id=request.request_id,
+                    result=result,
+                    run_snapshot=result,
+                )
+                return result
+            except Exception as error:
+                if effect_started:
+                    try:
+                        journal.require_reconciliation(
+                            expected_generation=cycle.cycle_generation
+                        )
+                    except Exception:
+                        pass
+                    raise ProgramRunnerError(
+                        "program_cycle_reconciliation_required",
+                        str(error) or type(error).__name__,
+                    ) from error
+                reject(
+                    ProgramRunnerError(
+                        "program_full_stop_reset_failed",
+                        str(error) or type(error).__name__,
+                    )
+                )
+
     def reset_cycle(self, request: ProgramCycleResetRequest) -> dict[str, Any]:
         if not isinstance(request, ProgramCycleResetRequest):
             raise TypeError("reset_cycle requires one ProgramCycleResetRequest")
@@ -2893,6 +3368,20 @@ class ProgramRuntime:
                     "evidence_digest": request.settlement_evidence_digest,
                 },
             }
+            reconciliation_digest = (
+                cell_admission_owner_epoch_reconciliation_evidence_digest(
+                    "program_runner", self.owner_epoch
+                )
+            )
+            claim_was_reconciled = bool(
+                cycle.release_intent is None
+                and intent.get("owner_epoch") != cycle.owner_epoch
+                and cycle.reconciliation_evidence_digest
+                == reconciliation_digest
+            )
+            run_owner_was_replaced = bool(
+                intent.get("owner_epoch") != cycle.owner_epoch
+            )
             if (
                 cycle.reconciliation_required
                 or cycle.owner_epoch != self.owner_epoch
@@ -2903,9 +3392,80 @@ class ProgramRuntime:
                         "Reset cannot settle an unreconciled Program-cycle owner",
                     )
                 )
+            if claim_was_reconciled:
+                try:
+                    receipt = admission.recovery_receipt(
+                        {
+                            "intent": claim["intent"],
+                            "expected_claim": claim,
+                            "expected_release": None,
+                        }
+                    )
+                    program_owners = [
+                        owner
+                        for owner in receipt.get("current_owner_epochs", [])
+                        if isinstance(owner, Mapping)
+                        and owner.get("owner_role") == "program_runner"
+                    ]
+                    held_program_claims = [
+                        retained_claim
+                        for retained_claim in receipt.get("held_claims", [])
+                        if isinstance(retained_claim, Mapping)
+                        and isinstance(retained_claim.get("intent"), Mapping)
+                        and retained_claim["intent"].get("owner_role")
+                        == "program_runner"
+                    ]
+                    expected_settlement = {
+                        "predecessor_claim": claim,
+                        "successor_owner_role": "program_runner",
+                        "successor_owner_epoch": self.owner_epoch,
+                        "settlement_predicate": "reconciled",
+                        "reconciliation_evidence_digest": reconciliation_digest,
+                    }
+                    receipt_is_exact = bool(
+                        program_owners
+                        == [
+                            {
+                                "owner_role": "program_runner",
+                                "owner_epoch": self.owner_epoch,
+                            }
+                        ]
+                        and not held_program_claims
+                        and (
+                            (
+                                receipt.get("status") == "reconciled_exact"
+                                and receipt.get("matched_claim") == claim
+                                and receipt.get("matched_release") is None
+                                and receipt.get("matched_reconcile_settlement")
+                                == expected_settlement
+                            )
+                            or (
+                                receipt.get("status") == "unknown"
+                                and receipt.get("matched_claim") is None
+                                and receipt.get("matched_release") is None
+                                and receipt.get("matched_reconcile_settlement")
+                                is None
+                            )
+                        )
+                    )
+                    if not receipt_is_exact:
+                        raise RuntimeError(
+                            "reconciled Program-cycle claim is not exact"
+                        )
+                    released = admission.get()
+                except Exception as error:
+                    reject(
+                        ProgramRunnerError(
+                            "program_cycle_reconciliation_required",
+                            str(error) or type(error).__name__,
+                        )
+                    )
             if journal.read_run_snapshot(request.program_run_id) is not None:
                 try:
-                    self._host.reset_run(request.program_run_id)
+                    if run_owner_was_replaced:
+                        self._host.reset_retained_run(request.program_run_id)
+                    else:
+                        self._host.reset_run(request.program_run_id)
                 except (ProgramRunOwnerError, ProgramSchedulingError) as error:
                     reject(
                         ProgramRunnerError(
@@ -2920,46 +3480,47 @@ class ProgramRuntime:
                             str(error) or type(error).__name__,
                         )
                     )
-            try:
-                journal.remember_release_intent(
-                    expected_generation=cycle.cycle_generation,
-                    claim_generation=claim["claim_generation"],
-                    release=release,
-                )
-            except Exception as error:
-                reject(
-                    ProgramRunnerError(
-                        "program_cycle_journal_invalid",
-                        "Program-cycle release intent was not durably retained",
+            if not claim_was_reconciled:
+                try:
+                    journal.remember_release_intent(
+                        expected_generation=cycle.cycle_generation,
+                        claim_generation=claim["claim_generation"],
+                        release=release,
                     )
-                )
-            try:
-                released = admission.release(release)
-            except CellAdmissionError as error:
-                if error.outcome_unknown:
+                except Exception as error:
+                    reject(
+                        ProgramRunnerError(
+                            "program_cycle_journal_invalid",
+                            "Program-cycle release intent was not durably retained",
+                        )
+                    )
+                try:
+                    released = admission.release(release)
+                except CellAdmissionError as error:
+                    if error.outcome_unknown:
+                        journal.require_reconciliation(
+                            expected_generation=cycle.cycle_generation
+                        )
+                        reject(ProgramRunnerError(error.code, str(error)))
+                    # An explicit release rejection is no-effect and retryable.
+                    try:
+                        journal.cancel_request(
+                            owner_epoch=request.request_owner_epoch,
+                            request_id=request.request_id,
+                        )
+                    except Exception:
+                        pass
+                    raise ProgramRunnerError(error.code, str(error)) from error
+                except Exception:
                     journal.require_reconciliation(
                         expected_generation=cycle.cycle_generation
                     )
-                    reject(ProgramRunnerError(error.code, str(error)))
-                # An explicit release rejection is no-effect and retryable.
-                try:
-                    journal.cancel_request(
-                        owner_epoch=request.request_owner_epoch,
-                        request_id=request.request_id,
+                    reject(
+                        ProgramRunnerError(
+                            "program_cycle_reconciliation_required",
+                            "Program-cycle release outcome is unresolved",
+                        )
                     )
-                except Exception:
-                    pass
-                raise ProgramRunnerError(error.code, str(error)) from error
-            except Exception:
-                journal.require_reconciliation(
-                    expected_generation=cycle.cycle_generation
-                )
-                reject(
-                    ProgramRunnerError(
-                        "program_cycle_reconciliation_required",
-                        "Program-cycle release outcome is unresolved",
-                    )
-                )
             controls = self._optional_controls(request.program_run_id)
             if controls is not None:
                 controls.mark_reset()

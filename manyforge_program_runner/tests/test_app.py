@@ -8,6 +8,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from manyforge_headless_api.models import (
+    ProgramFullStopResumeRequest,
+    ProgramFullStopResetRequest,
     ProgramRunStartRequest,
     ProgramRunStopRequest,
     ProgramScenePreparationRequest,
@@ -133,6 +135,30 @@ class FakeRuntime:
     ) -> dict[str, Any]:
         self.calls.append(("motion_stop", (program_run_id, request)))
         return _snapshot(state="running")
+
+    def full_stop(
+        self,
+        program_run_id: str,
+        request: ProgramRunStopRequest,
+    ) -> dict[str, Any]:
+        self.calls.append(("full_stop", (program_run_id, request)))
+        return _snapshot(state="full_stopping")
+
+    def resume_full_stop(
+        self,
+        program_run_id: str,
+        request: ProgramFullStopResumeRequest,
+    ) -> dict[str, Any]:
+        self.calls.append(("resume_full_stop", (program_run_id, request)))
+        return _snapshot(state="running")
+
+    def discard_full_stop(
+        self,
+        program_run_id: str,
+        request: ProgramFullStopResetRequest,
+    ) -> dict[str, Any]:
+        self.calls.append(("discard_full_stop", (program_run_id, request)))
+        return _snapshot(state="stopped")
 
     def reset_cycle(self, request: ProgramCycleResetRequest) -> dict[str, Any]:
         self.calls.append(("reset", request))
@@ -281,6 +307,40 @@ def test_private_surface_projects_owner_facts_and_manages_lifecycle() -> None:
                 "reason": "ordinary operator motion Stop",
             },
         )
+        full_stopped = client.post(
+            "/api/program/runs/program-run.1/full-stop",
+            json={
+                **_caller(),
+                "request_id": "request.full-stop.1",
+                "program_run_id": "program-run.1",
+                "expected_owner_epoch": "program-runner.epoch.1",
+                "reason": "ordinary operator Full Stop",
+            },
+        )
+        resumed = client.post(
+            "/api/program/runs/program-run.1/resume-full-stop",
+            json={
+                **_caller(),
+                "request_id": "request.resume-full-stop.1",
+                "program_run_id": "program-run.1",
+                "expected_owner_epoch": "program-runner.epoch.1",
+                "expected_run_revision": 1,
+                "reason": "operator Run after Full Stop",
+            },
+        )
+        discarded = client.post(
+            "/api/program/runs/program-run.1/discard-full-stop",
+            json={
+                **_caller(),
+                "request_id": "request.discard-full-stop.1",
+                "program_run_id": "program-run.1",
+                "expected_owner_epoch": "program-runner.epoch.1",
+                "expected_run_revision": 1,
+                "expected_cycle_generation": 4,
+                "expected_claim_generation": 7,
+                "reason": "operator Reset discarded Full Stop",
+            },
+        )
         stopped = client.post(
             "/api/program/runs/program-run.1/stop",
             json={
@@ -300,13 +360,19 @@ def test_private_surface_projects_owner_facts_and_manages_lifecycle() -> None:
     assert started.status_code == 200
     assert read.status_code == 200
     assert motion_stopped.json()["state"] == "running"
+    assert full_stopped.json()["state"] == "full_stopping"
+    assert resumed.json()["state"] == "running"
+    assert discarded.json()["state"] == "stopped"
     assert stopped.json()["state"] == "stopping"
     assert runtime.calls[0] == ("runs", (True, 7))
     assert runtime.calls[1][0] == "start"
     assert runtime.calls[2][0] == "prepare_scene"
     assert runtime.calls[3] == ("read", "program-run.1")
     assert runtime.calls[4][0] == "motion_stop"
-    assert runtime.calls[5][0] == "stop"
+    assert runtime.calls[5][0] == "full_stop"
+    assert runtime.calls[6][0] == "resume_full_stop"
+    assert runtime.calls[7][0] == "discard_full_stop"
+    assert runtime.calls[8][0] == "stop"
     assert runtime.closed is True
 
 

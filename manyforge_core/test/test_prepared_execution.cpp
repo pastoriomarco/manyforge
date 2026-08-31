@@ -89,7 +89,8 @@ namespace {
       StopEvidencePolicyId("stop.evidence"),
       StopEvidencePolicyRevision(Digest('1')),
       std::move(stop_plan),
-      std::move(payload)};
+      std::move(payload),
+      std::nullopt};
 }
 
 TEST(PreparedExecutionTest, PrepareResultPreservesExactParticipantIdentity) {

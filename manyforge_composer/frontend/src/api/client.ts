@@ -29,6 +29,7 @@ import {
   parseProgramWorkspaceTransitionResponse,
   parseCurrentScenarioResponse,
   parseProgramCycleResetResult,
+  parseProgramCycleStatus,
   parseProgramRuntimeControlProjection,
   parseProgramRuntimeControlResult,
   parseCycleRecoveryActionResult,
@@ -76,6 +77,7 @@ import type {
   ProgramWorkspaceTransitionResponse,
   CurrentScenarioResponse,
   ProgramCycleResetResult,
+  ProgramCycleStatus,
   ProgramRuntimeControlProjection,
   ProgramRuntimeControlResult,
   CycleRecoveryActionResult,
@@ -654,6 +656,36 @@ export const api = {
       signal,
       { method: 'POST', body: JSON.stringify(body) },
     ),
+    fullStop: (
+      programRunId: string,
+      body: Record<string, JsonValue>,
+      signal?: AbortSignal,
+    ): Promise<ProgramRunStatus> => requestJson(
+      `/api/program/runs/${encodeURIComponent(programRunId)}/full-stop`,
+      parseProgramRunStatus,
+      signal,
+      { method: 'POST', body: JSON.stringify(body) },
+    ),
+    resumeFullStop: (
+      programRunId: string,
+      body: Record<string, JsonValue>,
+      signal?: AbortSignal,
+    ): Promise<ProgramRunStatus> => requestJson(
+      `/api/program/runs/${encodeURIComponent(programRunId)}/resume-full-stop`,
+      parseProgramRunStatus,
+      signal,
+      { method: 'POST', body: JSON.stringify(body) },
+    ),
+    resetFullStop: (
+      programRunId: string,
+      body: Record<string, JsonValue>,
+      signal?: AbortSignal,
+    ): Promise<ProgramCycleResetResult> => requestJson(
+      `/api/program/runs/${encodeURIComponent(programRunId)}/reset`,
+      parseProgramCycleResetResult,
+      signal,
+      { method: 'POST', body: JSON.stringify(body) },
+    ),
     resetCycle: (
       body: Record<string, JsonValue>,
       signal?: AbortSignal,
@@ -662,6 +694,11 @@ export const api = {
       parseProgramCycleResetResult,
       signal,
       { method: 'POST', body: JSON.stringify(body) },
+    ),
+    cycleStatus: (signal?: AbortSignal): Promise<ProgramCycleStatus> => requestJson(
+      '/api/cycle/status',
+      parseProgramCycleStatus,
+      signal,
     ),
     runtimeControls: (
       programRunId: string,
@@ -886,6 +923,9 @@ export const api = {
         signal,
       );
       const controlIdentity = executionProjectionIdentityKey(controlState);
+      if (executionTargetsCache?.identity !== controlIdentity) {
+        executionTargetsCache = null;
+      }
       let targets = executionTargetsCache?.identity === controlIdentity
         ? executionTargetsCache.projection
         : null;
@@ -895,15 +935,22 @@ export const api = {
           (value) => value,
           signal,
         );
-        const targetIdentity = executionProjectionIdentityKey(targets);
-        if (targetIdentity !== null && targetIdentity === controlIdentity) {
-          executionTargetsCache = {
-            identity: targetIdentity,
-            projection: targets,
-          };
-        }
       }
-      return parseExecutionControlStatus(targets, controlState);
+      const status = parseExecutionControlStatus(targets, controlState);
+      const targetIdentity = executionProjectionIdentityKey(targets);
+      if (
+        executionTargetsCache === null
+        && targetIdentity !== null
+        && targetIdentity === controlIdentity
+      ) {
+        // Only a complete, strictly parsed target projection is stable enough
+        // to reuse. A malformed response must be retried, never made sticky.
+        executionTargetsCache = {
+          identity: targetIdentity,
+          projection: targets,
+        };
+      }
+      return status;
     },
     /** Explicit cold-path aggregate; ordinary UI flows use scoped views. */
     diagnostics: (signal?: AbortSignal): Promise<ExecutionOwnerStatus> =>

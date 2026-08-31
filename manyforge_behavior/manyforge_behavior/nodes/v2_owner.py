@@ -398,6 +398,35 @@ class OwnerTaskAdapter(_OwnerAdapter):
         except Exception as exc:
             self._record_failure("owner_request_failed", str(exc))
 
+    def reconcile_full_stop_task(self) -> str:
+        """Observe accepted Program-scope work without ticking the tree.
+
+        Only the task families captured by ``ProgramRunScopePort`` take part.
+        Unrelated asynchronous owners remain preserved and are not advanced by
+        Full Stop settlement.
+        """
+
+        if self._owner_port_name not in {"kernel_operations", "pick_place"}:
+            return "unaffected"
+        if self._task is None:
+            return "inactive"
+        self.observe_while_operator_stop_held()
+        task = self._task
+        if task is None:
+            return "inactive"
+        if task.state is OwnerTaskState.ACTIVE:
+            return "active"
+        assessment = task.metadata.get("recovery_assessment")
+        if (
+            task.state is OwnerTaskState.INTERRUPTED
+            and isinstance(assessment, Mapping)
+            and assessment.get("recovery_class") == "ordinary_operator_stop"
+        ):
+            return "held"
+        if task.state is OwnerTaskState.SUCCEEDED:
+            return "settled"
+        return "unrecoverable"
+
     def terminate(self, new_status: py_trees.common.Status) -> None:
         if (
             new_status is py_trees.common.Status.INVALID

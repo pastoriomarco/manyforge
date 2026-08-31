@@ -21,6 +21,10 @@ A fresh workbench cache also needs an existing qualified build root containing `
 The launcher imports these immutable products and compiles only stale current
 Manager/Headless production targets in the same qualified development image.
 It does not regenerate the package or rerun tests or proofs.
+The selected package must contain the same Deployment revision as the matching
+workspace example. If retained scenario contracts change, refresh the qualified
+package cache; the launcher rejects the stale package instead of silently
+combining it with current execution owners.
 
 ## Start, inspect, and stop
 

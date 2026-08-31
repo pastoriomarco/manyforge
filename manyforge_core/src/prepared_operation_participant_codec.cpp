@@ -650,6 +650,75 @@ template <class Id>
           std::move(stop.value())};
 }
 
+[[nodiscard]] CanonicalValue runtime_motion_speed_limit_value(
+    const RuntimeMotionSpeedLimitDTO& value) {
+  CanonicalValue::Object fields{
+      {"maximum_tcp_linear_speed_mps", CanonicalValue(value.maximum_tcp_linear_speed_mps)}};
+  std::visit(
+      [&](const auto& scope) {
+        using Scope = std::decay_t<decltype(scope)>;
+        if constexpr (std::is_same_v<Scope, RuntimePolicyCellScopeDTO>) {
+          fields.emplace_back("scope_kind", CanonicalValue("cell"));
+        } else {
+          fields.emplace_back("command_target_id", CanonicalValue(scope.command_target_id.value()));
+          fields.emplace_back("controllable_component_id",
+                              CanonicalValue(scope.controllable_component_id.value()));
+          fields.emplace_back("scope_kind", CanonicalValue("command_target"));
+        }
+      },
+      value.scope);
+  return CanonicalValue(std::move(fields));
+}
+
+[[nodiscard]] RuntimeMotionSpeedLimitDTO parse_runtime_motion_speed_limit(
+    const CanonicalValue& value) {
+  const auto scope_kind = text(member(value, "scope_kind"));
+  RuntimePolicyMotionScopeDTO scope = RuntimePolicyCellScopeDTO{};
+  if (scope_kind == "cell") {
+    exact(value, {"maximum_tcp_linear_speed_mps", "scope_kind"});
+  } else if (scope_kind == "command_target") {
+    exact(value, {"command_target_id", "controllable_component_id", "maximum_tcp_linear_speed_mps",
+                  "scope_kind"});
+    scope = RuntimePolicyCommandTargetScopeDTO{
+        ControllableComponentId(text(member(value, "controllable_component_id"))),
+        CommandTargetId(text(member(value, "command_target_id")))};
+  } else {
+    fail("runtime_policy_motion_scope_invalid");
+  }
+  return {std::move(scope), finite_number(member(value, "maximum_tcp_linear_speed_mps"))};
+}
+
+[[nodiscard]] CanonicalValue runtime_policy_ref_value(const PreparedRuntimePolicyRefDTO& value) {
+  const auto& source = value.source_artifact;
+  return CanonicalValue(CanonicalValue::Object{
+      {"source_artifact",
+       CanonicalValue(CanonicalValue::Object{
+           {"content_addressed_store_key",
+            CanonicalValue(source.content_addressed_store_key.value())},
+           {"content_digest", CanonicalValue(source.content_digest.value())},
+           {"runtime_policy_id", CanonicalValue(source.record_id.value())},
+           {"runtime_policy_revision", CanonicalValue(source.record_revision.value())},
+           {"schema_id", CanonicalValue(source.schema_id.value())},
+           {"schema_revision", CanonicalValue(source.schema_revision.value())}})},
+      {"selected_motion_speed_limit",
+       runtime_motion_speed_limit_value(value.selected_motion_speed_limit)}});
+}
+
+[[nodiscard]] PreparedRuntimePolicyRefDTO parse_runtime_policy_ref(const CanonicalValue& value) {
+  exact(value, {"selected_motion_speed_limit", "source_artifact"});
+  const auto& source = member(value, "source_artifact");
+  exact(source, {"content_addressed_store_key", "content_digest", "runtime_policy_id",
+                 "runtime_policy_revision", "schema_id", "schema_revision"});
+  return {RuntimePolicyCatalogRecordRefDTO{
+              RuntimePolicyId(text(member(source, "runtime_policy_id"))),
+              RuntimePolicyRevision(text(member(source, "runtime_policy_revision"))),
+              SchemaId(text(member(source, "schema_id"))),
+              SchemaRevision(text(member(source, "schema_revision"))),
+              ContentDigest(text(member(source, "content_digest"))),
+              ContentAddressedStoreKey(text(member(source, "content_addressed_store_key")))},
+          parse_runtime_motion_speed_limit(member(value, "selected_motion_speed_limit"))};
+}
+
 [[nodiscard]] CanonicalValue motion_payload_value(
     const PreparedMotionExecutionDTO& value, const ResolvedStopBasePlanDTO& base,
     std::span<const RuntimeResourceBindingDTO> resources,
@@ -659,24 +728,18 @@ template <class Id>
     scopes.push_back(motion_scope_value(scope, base, resources, defaults));
   CanonicalValue::Object fields{
       {"move_id", CanonicalValue(value.move_id.value())},
-      {"plan_request",
-       embedded(EncodePreparedPlanRequest(value.plan_request),
-                "prepared_plan_request_encoding_invalid")},
+      {"plan_request", embedded(EncodePreparedPlanRequest(value.plan_request),
+                                "prepared_plan_request_encoding_invalid")},
       {"trajectory", embedded(EncodePreparedTrajectory(value.trajectory),
                               "prepared_trajectory_encoding_invalid")},
       {"start_state", embedded(EncodePreparedControlledState(value.start_state),
                                "prepared_start_state_encoding_invalid")},
-      {"planning_evidence",
-       embedded(EncodePreparedMotionPlanningEvidence(value.planning_evidence),
-                "prepared_planning_evidence_encoding_invalid")},
+      {"planning_evidence", embedded(EncodePreparedMotionPlanningEvidence(value.planning_evidence),
+                                     "prepared_planning_evidence_encoding_invalid")},
       {"validation_evidence",
        embedded(EncodePreparedMotionValidationEvidence(value.validation_evidence),
                 "prepared_validation_evidence_encoding_invalid")},
-      {"runtime_policy",
-       CanonicalValue(CanonicalValue::Object{
-           {"runtime_policy_id", CanonicalValue(value.runtime_policy.runtime_policy_id.value())},
-           {"runtime_policy_revision",
-            CanonicalValue(value.runtime_policy.runtime_policy_revision.value())}})},
+      {"runtime_policy", runtime_policy_ref_value(value.runtime_policy)},
       {"interrupt_scopes", CanonicalValue(std::move(scopes))},
       {"execution_timeout_s", CanonicalValue(value.execution_timeout_s)}};
   if (value.contact_policy) {
@@ -721,11 +784,7 @@ template <class Id>
         ContactPolicyId(text(member(ref, "contact_policy_id"))),
         ContactPolicyRevision(text(member(ref, "contact_policy_revision")))};
   }
-  const auto& policy = member(value, "runtime_policy");
-  exact(policy, {"runtime_policy_id", "runtime_policy_revision"});
-  PreparedRuntimePolicyRefDTO runtime_policy{
-      RuntimePolicyId(text(member(policy, "runtime_policy_id"))),
-      RuntimePolicyRevision(text(member(policy, "runtime_policy_revision")))};
+  auto runtime_policy = parse_runtime_policy_ref(member(value, "runtime_policy"));
   const auto& scopes = member(value, "interrupt_scopes");
   if (!scopes.is_array() || scopes.as_array().size() > kMaximumScopes)
     fail("interrupt_scopes_invalid");
@@ -800,6 +859,12 @@ template <class Id>
        embedded(EncodePreparedParticipantStopPlan(base, value.ordinary_stop_plan, resources,
                                                   defaults, node_category),
                 "prepared_ordinary_stop_plan_encoding_invalid")}};
+  if (value.fault_stop_plan.has_value()) {
+    fields.emplace_back("fault_stop_plan", embedded(EncodePreparedParticipantStopPlan(
+                                                        base, *value.fault_stop_plan, resources,
+                                                        defaults, node_category),
+                                                    "prepared_fault_stop_plan_encoding_invalid"));
+  }
   if (value.capability_provider)
     fields.emplace_back("capability_provider",
                         capability_provider_value(*value.capability_provider));
@@ -981,6 +1046,16 @@ void validate_motion_payload(const PreparedMotionExecutionDTO& motion,
                              const RuntimeParticipantStopReadinessDTO& readiness,
                              const RuntimeParticipantPolicySelectionDTO& runtime_policy,
                              std::span<const HardStopResourceLimitDTO> defaults) {
+  const auto metrics_valid = [](const std::vector<double>& values) {
+    return std::all_of(values.begin(), values.end(), [](const double item) {
+      return std::isfinite(item) && item >= 0.0;
+    });
+  };
+  const auto* trajectory_metrics =
+      motion.validation_evidence.noncollision_result.trajectory_metrics
+          ? &*motion.validation_evidence.noncollision_result.trajectory_metrics
+          : nullptr;
+  const auto trajectory_width = motion.trajectory.joint_names.size();
   if (!std::isfinite(motion.execution_timeout_s) || motion.execution_timeout_s <= 0.0 ||
       motion.move_id.empty() || motion.plan_request.move_id != motion.move_id ||
       motion.plan_request.operation_id != enclosing.operation_id ||
@@ -1018,14 +1093,28 @@ void validate_motion_payload(const PreparedMotionExecutionDTO& motion,
       motion.plan_request.provider_runtime_epoch != enclosing.control_provider.runtime_epoch ||
       motion.plan_request.resources != enclosing.resources ||
       motion.start_state != motion.plan_request.start_state ||
-      motion.runtime_policy.runtime_policy_id != runtime_policy.policy.runtime_policy_id ||
-      motion.runtime_policy.runtime_policy_revision !=
-          runtime_policy.policy.runtime_policy_revision ||
+      motion.runtime_policy.source_artifact != runtime_policy.source_artifact ||
+      motion.runtime_policy.selected_motion_speed_limit !=
+          runtime_policy.selected_motion_speed_limit ||
       !motion.plan_request.speed_profile.max_tcp_linear_speed_mps.has_value() ||
       !std::isfinite(*motion.plan_request.speed_profile.max_tcp_linear_speed_mps) ||
       *motion.plan_request.speed_profile.max_tcp_linear_speed_mps <= 0.0 ||
       *motion.plan_request.speed_profile.max_tcp_linear_speed_mps >
           runtime_policy.effective_maximum_tcp_linear_speed_mps ||
+      trajectory_metrics == nullptr || motion.trajectory.waypoints.empty() ||
+      !std::isfinite(trajectory_metrics->trajectory_duration_s) ||
+      trajectory_metrics->trajectory_duration_s !=
+          motion.trajectory.waypoints.back().time_from_start_s ||
+      trajectory_metrics->peak_abs_joint_velocity_rad_s.size() != trajectory_width ||
+      !metrics_valid(trajectory_metrics->peak_abs_joint_velocity_rad_s) ||
+      (!trajectory_metrics->peak_abs_joint_acceleration_rad_s2.empty() &&
+       trajectory_metrics->peak_abs_joint_acceleration_rad_s2.size() != trajectory_width) ||
+      !metrics_valid(trajectory_metrics->peak_abs_joint_acceleration_rad_s2) ||
+      !trajectory_metrics->peak_tcp_linear_speed_mps.has_value() ||
+      !std::isfinite(*trajectory_metrics->peak_tcp_linear_speed_mps) ||
+      *trajectory_metrics->peak_tcp_linear_speed_mps < 0.0 ||
+      *trajectory_metrics->peak_tcp_linear_speed_mps >
+          *motion.plan_request.speed_profile.max_tcp_linear_speed_mps + 1.0e-8 ||
       motion.plan_request.retained_collision_world ||
       motion.plan_request.retained_collision_policy) {
     fail("motion_payload_join_invalid");
@@ -1103,7 +1192,9 @@ void validate_motion_payload(const PreparedMotionExecutionDTO& motion,
     const RuntimeParticipantStopReadinessDTO& readiness,
     std::span<const HardStopResourceLimitDTO> defaults, MotionInterruptNodeCategory node_category) {
   const bool capability_provider = value.find_object_member("capability_provider") != nullptr;
-  const std::size_t expected_fields = capability_provider ? 43U : 42U;
+  const bool fault_stop_plan = value.find_object_member("fault_stop_plan") != nullptr;
+  const std::size_t expected_fields = 42U + static_cast<std::size_t>(capability_provider) +
+                                      static_cast<std::size_t>(fault_stop_plan);
   if (!value.is_object() || value.as_object().size() != expected_fields)
     fail("participant_fields_invalid");
   for (const auto name : {"api_version",
@@ -1155,6 +1246,14 @@ void validate_motion_payload(const PreparedMotionExecutionDTO& motion,
       content_identity::canonical_json(member(value, "ordinary_stop_plan")),
       readiness.resolved_stop_base_plan, binding_resource_span(binding), defaults, node_category);
   if (!ordinary.ok()) fail("ordinary_stop_plan_invalid");
+  std::optional<PreparedParticipantStopPlanDTO> fault;
+  if (fault_stop_plan) {
+    auto decoded = DecodePreparedParticipantStopPlan(
+        content_identity::canonical_json(member(value, "fault_stop_plan")),
+        readiness.resolved_stop_base_plan, binding_resource_span(binding), defaults, node_category);
+    if (!decoded.ok()) fail("fault_stop_plan_invalid");
+    fault = std::move(decoded.value());
+  }
   const auto& payload = member(value, "payload");
   if (!payload.is_object() || payload.as_object().size() != 1U) fail("payload_tag_invalid");
   PreparedParticipantPayloadDTO parsed_payload =
@@ -1210,7 +1309,8 @@ void validate_motion_payload(const PreparedMotionExecutionDTO& motion,
           StopEvidencePolicyId(text(member(value, "stop_evidence_policy_id"))),
           StopEvidencePolicyRevision(text(member(value, "stop_evidence_policy_revision"))),
           std::move(ordinary.value()),
-          std::move(parsed_payload)};
+          std::move(parsed_payload),
+          std::move(fault)};
 }
 
 }  // namespace
@@ -1301,6 +1401,12 @@ Result<PreparedOperationParticipantDTO> MakePreparedOperationParticipant(
       candidate.endpoint_contract = PreparedParticipantFocusedPortDTO{receiver.runtime_unit_id};
     }
 
+    if (candidate.ordinary_stop_plan.participant_stop_profile_purpose !=
+            ParticipantStopProfilePurposeDTO::kOrdinary &&
+        candidate.ordinary_stop_plan.participant_stop_profile_purpose !=
+            ParticipantStopProfilePurposeDTO::kOperator) {
+      fail("ordinary_stop_plan_purpose_invalid");
+    }
     PreparedParticipantStopPlanContextDTO ordinary_context{
         candidate.operation_id,
         candidate.operation_revision,
@@ -1309,8 +1415,8 @@ Result<PreparedOperationParticipantDTO> MakePreparedOperationParticipant(
         candidate.program_revision,
         candidate.program_binding_id,
         candidate.program_run_id,
-        std::nullopt,
-        ParticipantStopProfilePurposeDTO::kOrdinary,
+        candidate.ordinary_stop_plan.participant_stop_profile,
+        candidate.ordinary_stop_plan.participant_stop_profile_purpose,
         std::nullopt,
         node_category};
     auto ordinary = MakePreparedParticipantStopPlan(
@@ -1318,6 +1424,27 @@ Result<PreparedOperationParticipantDTO> MakePreparedOperationParticipant(
         binding_resource_span(binding), retained_default_limits);
     if (!ordinary.ok()) fail("ordinary_stop_plan_make_failed");
     candidate.ordinary_stop_plan = std::move(ordinary.value());
+
+    if (candidate.fault_stop_plan.has_value()) {
+      const auto& fault = *candidate.fault_stop_plan;
+      if (!std::holds_alternative<PreparedMotionExecutionDTO>(candidate.payload) ||
+          fault.operation_id != candidate.operation_id ||
+          fault.operation_revision != candidate.operation_revision ||
+          fault.participant_id != candidate.participant_id ||
+          fault.program_id != candidate.program_id ||
+          fault.program_revision != candidate.program_revision ||
+          fault.program_binding_id != candidate.program_binding_id ||
+          fault.program_run_id != candidate.program_run_id ||
+          fault.participant_stop_profile_purpose != ParticipantStopProfilePurposeDTO::kFault ||
+          fault.motion_interrupt_scope_id.has_value() ||
+          !fault.participant_stop_profile.has_value() ||
+          !VerifyPreparedParticipantStopPlan(readiness.resolved_stop_base_plan, fault,
+                                             binding_resource_span(binding),
+                                             retained_default_limits, node_category)
+               .ok()) {
+        fail("fault_stop_plan_invalid");
+      }
+    }
 
     if (auto* command = std::get_if<PreparedCapabilityCommandDTO>(&candidate.payload)) {
       validate_command_payload(*command, binding);

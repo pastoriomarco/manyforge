@@ -55,7 +55,10 @@ describe('UI4 application and viewport composition', () => {
     expect(transport).toContain('program.applyRecoveryAction(operatorStopResumeAction)');
     expect(transport).toContain('transport-stop-primary');
     expect(transport).toContain('transport-stop-disclosure');
-    expect(transport).toContain('Stop Execution');
+    expect(transport).toContain('Full Stop');
+    expect(transport).toContain('program.fullStop()');
+    expect(transport).toContain('program.resumeFullStop()');
+    expect(transport).toContain('Cell Full Stop');
     expect(transport).toMatch(/transport-stop-group[\s\S]*transport-stop-primary[\s\S]*transport-stop-disclosure[\s\S]*transport-stop-menu/);
     expect(transport).not.toContain("motionPaused ? robot.resume() : robot.pause()");
     expect(transport).toContain("robot.fullStop()");

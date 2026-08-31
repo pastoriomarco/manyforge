@@ -290,7 +290,9 @@ CanonicalValue OperationJournalPayload(
                                     : CanonicalValue(nullptr);
   return CanonicalValue(CanonicalValue::Object{
       {"api_version", CanonicalValue("manyforge.operation_journal_record.v1")},
-      {"effect_pending", CanonicalValue(record_kind != "state_observed")},
+      {"effect_pending",
+       CanonicalValue(record_kind != "state_observed" &&
+                      record_kind != "operation_prepared")},
       {"intent", CanonicalValue(CanonicalValue::Object{})},
       {"operation_state",
        CanonicalValue(CanonicalValue::Object{
@@ -342,6 +344,186 @@ StopAcceptanceProjectionPayload(const std::string &owner_epoch,
                      {"value", CanonicalValue(CanonicalValue::Object{})},
                  })},
       {"record_kind", CanonicalValue("stop_acceptance_projected")},
+  });
+}
+
+CanonicalValue
+StopTerminalProjectionPayload(const std::string &owner_epoch,
+                              const std::string &result = "succeeded_nominal",
+                              const std::string &state = "succeeded",
+                              const bool stop_fault = false) {
+  const auto fault_latch =
+      stop_fault
+          ? CanonicalValue(CanonicalValue::Object{
+                {"captured_operation_count", CanonicalValue(1.0)},
+                {"captured_resource_count", CanonicalValue(1.0)},
+                {"cell_id", CanonicalValue(std::string(kCellId))},
+                {"latch_generation", CanonicalValue(1.0)},
+                {"latch_id", CanonicalValue("stop-fault.test.1")},
+                {"persistence_degraded", CanonicalValue(false)},
+                {"reason_code", CanonicalValue("stop_escalated")},
+                {"recovery_assessment_revision", CanonicalValue(1.0)},
+                {"recovery_status",
+                 CanonicalValue("waiting_for_observation")},
+                {"state", CanonicalValue("latched")},
+                {"stop_certificate",
+                 CanonicalValue(CanonicalValue::Object{
+                     {"stop_certificate_id",
+                      CanonicalValue("stop-certificate.test.1")},
+                     {"stop_certificate_revision", CanonicalValue(1.0)},
+                     {"stop_generation", CanonicalValue(1.0)},
+                     {"stop_id", CanonicalValue("stop.test.1")},
+                 })},
+                {"stop_generation", CanonicalValue(1.0)},
+                {"stop_id", CanonicalValue("stop.test.1")},
+                {"trigger", CanonicalValue("escalated")},
+            })
+          : CanonicalValue(nullptr);
+  return CanonicalValue(CanonicalValue::Object{
+      {"acceptance", CanonicalValue(CanonicalValue::Object{
+                         {"accepted_at_ns", CanonicalValue(100.0)},
+                         {"request_id", CanonicalValue("stop-request.1")},
+                         {"stop_generation", CanonicalValue(1.0)},
+                         {"stop_id", CanonicalValue("stop.test.1")},
+                     })},
+      {"acceptance_to_terminal_latency_ns", CanonicalValue(1000.0)},
+      {"api_version", CanonicalValue("manyforge.stop_terminal_projection.v1")},
+      {"attempted_stage_count", CanonicalValue(1.0)},
+      {"attempted_stages",
+       CanonicalValue(CanonicalValue::Array{
+           CanonicalValue(CanonicalValue::Object{
+               {"actual_stop_mode", CanonicalValue("soft_on_path")},
+               {"outcome", CanonicalValue("succeeded")},
+               {"profile",
+                CanonicalValue(CanonicalValue::Object{
+                    {"profile_id", CanonicalValue("operator_soft_on_path")},
+                })},
+           }),
+       })},
+      {"certificate_evidence",
+       CanonicalValue(CanonicalValue::Array{
+           CanonicalValue(CanonicalValue::Object{
+               {"evidence_item_id", CanonicalValue("motion-rest")},
+               {"state", CanonicalValue("satisfied")},
+           }),
+       })},
+      {"certificate_evidence_count", CanonicalValue(1.0)},
+      {"completed_at_ns", CanonicalValue(1100.0)},
+      {"details_truncated", CanonicalValue(false)},
+      {"durable_projection_digest", CanonicalValue(Digest('8'))},
+      {"escalated", CanonicalValue(result == "succeeded_escalated")},
+      {"fault_latch", fault_latch},
+      {"hard_stop_floor_used", CanonicalValue(false)},
+      {"owner_epoch", CanonicalValue(owner_epoch)},
+      {"participant_settlement",
+       CanonicalValue(CanonicalValue::Array{
+           CanonicalValue(CanonicalValue::Object{
+               {"terminal_settlement", CanonicalValue("settled")},
+           }),
+       })},
+      {"participant_settlement_count", CanonicalValue(1.0)},
+      {"record_kind", CanonicalValue("stop_terminal_projected")},
+      {"request_id", CanonicalValue("stop-request.1")},
+      {"result", CanonicalValue(result)},
+      {"state", CanonicalValue(state)},
+      {"stop_certificate_id", CanonicalValue("stop-certificate.test.1")},
+      {"stop_certificate_revision", CanonicalValue(1.0)},
+      {"stop_generation", CanonicalValue(1.0)},
+      {"stop_id", CanonicalValue("stop.test.1")},
+  });
+}
+
+CanonicalValue StopFaultClearProjectionPayload(
+    const std::string &owner_epoch) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"api_version",
+       CanonicalValue("manyforge.stop_fault_clear_projection.v1")},
+      {"fault_latch",
+       CanonicalValue(CanonicalValue::Object{
+           {"captured_operation_count", CanonicalValue(1.0)},
+           {"captured_resource_count", CanonicalValue(1.0)},
+           {"cell_id", CanonicalValue(std::string(kCellId))},
+           {"latch_generation", CanonicalValue(1.0)},
+           {"latch_id", CanonicalValue("stop-fault.test.1")},
+           {"persistence_degraded", CanonicalValue(false)},
+           {"reason_code", CanonicalValue("stop_fault_recovery_cleared")},
+           {"recovery_assessment_revision", CanonicalValue(2.0)},
+           {"recovery_status", CanonicalValue("cleared")},
+           {"state", CanonicalValue("cleared")},
+           {"stop_certificate",
+            CanonicalValue(CanonicalValue::Object{
+                {"stop_certificate_id",
+                 CanonicalValue("stop-certificate.test.1")},
+                {"stop_certificate_revision", CanonicalValue(1.0)},
+                {"stop_generation", CanonicalValue(1.0)},
+                {"stop_id", CanonicalValue("stop.test.1")},
+            })},
+           {"stop_generation", CanonicalValue(1.0)},
+           {"stop_id", CanonicalValue("stop.test.1")},
+           {"trigger", CanonicalValue("escalated")},
+       })},
+      {"owner_epoch", CanonicalValue(owner_epoch)},
+      {"record_kind", CanonicalValue("stop_fault_cleared")},
+      {"request_id", CanonicalValue("stop-fault-reset.test.1")},
+      {"result",
+       CanonicalValue(CanonicalValue::Object{
+           {"accepted", CanonicalValue(true)},
+           {"error", CanonicalValue(nullptr)},
+           {"replay_status", CanonicalValue("accepted_new")},
+           {"request_id", CanonicalValue("stop-fault-reset.test.1")},
+       })},
+      {"stop_certificate_id",
+       CanonicalValue("stop-certificate.test.1")},
+      {"stop_certificate_revision", CanonicalValue(1.0)},
+      {"stop_generation", CanonicalValue(1.0)},
+      {"stop_id", CanonicalValue("stop.test.1")},
+  });
+}
+
+CanonicalValue CurrentStopFaultLatch() {
+  return CanonicalValue(CanonicalValue::Object{
+      {"captured_operation_ids",
+       CanonicalValue(CanonicalValue::Array{
+           CanonicalValue("operation.test.1"),
+       })},
+      {"captured_resources",
+       CanonicalValue(CanonicalValue::Array{
+           CanonicalValue("resource.arm.a"),
+       })},
+      {"cell_id", CanonicalValue(std::string(kCellId))},
+      {"clear_projection",
+       CanonicalValue(CanonicalValue::Object{
+           {"error", CanonicalValue(nullptr)},
+           {"retry_generation", CanonicalValue(nullptr)},
+           {"state", CanonicalValue("not_applicable")},
+       })},
+      {"evidence_refs", CanonicalValue(CanonicalValue::Array{})},
+      {"graph_revision", CanonicalValue(Digest('6'))},
+      {"latch_generation", CanonicalValue(1.0)},
+      {"latch_id", CanonicalValue("stop-fault.test.1")},
+      {"persistence_degraded", CanonicalValue(false)},
+      {"reason_code", CanonicalValue("stop_escalated")},
+      {"recovery_assessment_revision", CanonicalValue(1.0)},
+      {"recovery_status", CanonicalValue("waiting_for_observation")},
+      {"retained_bundle_id", CanonicalValue(Digest('7'))},
+      {"state", CanonicalValue("latched")},
+      {"stop_certificate",
+       CanonicalValue(CanonicalValue::Object{
+           {"stop_certificate_id",
+            CanonicalValue("stop-certificate.test.1")},
+           {"stop_certificate_revision", CanonicalValue(1.0)},
+           {"stop_generation", CanonicalValue(1.0)},
+           {"stop_id", CanonicalValue("stop.test.1")},
+       })},
+      {"stop_generation", CanonicalValue(1.0)},
+      {"stop_id", CanonicalValue("stop.test.1")},
+      {"terminal_projection",
+       CanonicalValue(CanonicalValue::Object{
+           {"error", CanonicalValue(nullptr)},
+           {"retry_generation", CanonicalValue(nullptr)},
+           {"state", CanonicalValue("recorded")},
+       })},
+      {"trigger", CanonicalValue("escalated")},
   });
 }
 
@@ -505,26 +687,26 @@ TEST(HeadlessApiCore,
   HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
 
   static_cast<void>(core.RuntimeSnapshot());
-  static_cast<void>(core.CompleteOperationEventSnapshot(
-      "execution-host.epoch.idle", 0U));
+  static_cast<void>(
+      core.CompleteOperationEventSnapshot("execution-host.epoch.idle", 0U));
 
   const auto alarms = core.AlarmSnapshot();
   EXPECT_TRUE(Array(alarms, "alarms").empty());
   EXPECT_TRUE(std::get<bool>(Member(alarms, "reconciled").storage()));
   const auto &domains = Array(alarms, "domains");
   ASSERT_EQ(domains.size(), 2U);
-  const auto motion = std::find_if(
-      domains.begin(), domains.end(),
-      [](const auto &domain) { return Text(domain, "domain") == "motion"; });
+  const auto motion =
+      std::find_if(domains.begin(), domains.end(), [](const auto &domain) {
+        return Text(domain, "domain") == "motion";
+      });
   ASSERT_NE(motion, domains.end());
   EXPECT_TRUE(std::get<bool>(Member(*motion, "reconciled").storage()));
-  const auto runtime_health = std::find_if(
-      domains.begin(), domains.end(), [](const auto &domain) {
+  const auto runtime_health =
+      std::find_if(domains.begin(), domains.end(), [](const auto &domain) {
         return Text(domain, "domain") == "runtime_health";
       });
   ASSERT_NE(runtime_health, domains.end());
-  EXPECT_TRUE(
-      std::get<bool>(Member(*runtime_health, "reconciled").storage()));
+  EXPECT_TRUE(std::get<bool>(Member(*runtime_health, "reconciled").storage()));
 }
 
 TEST(HeadlessApiCore,
@@ -612,6 +794,39 @@ TEST(HeadlessApiCore,
 }
 
 TEST(HeadlessApiCore,
+     RestartWithOnlyStaleRetainedSourcesDoesNotFabricateProviderCondition) {
+  TemporaryDirectory directory;
+  PublishHealthySources(directory, "open");
+  auto wall_time = std::make_shared<std::int64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count() +
+      1'000'000'000LL);
+  auto monotonic = std::make_shared<std::int64_t>(1000);
+  const auto clocks = [wall_time, monotonic]() {
+    return HeadlessApiCoreClocks{
+        [wall_time]() { return *wall_time; },
+        [monotonic]() { return ++*monotonic; },
+        []() { return "2026-08-05T00:00:00Z"; },
+    };
+  };
+  {
+    HeadlessApiCore core(Config(directory, "api.epoch.1"), clocks());
+    EXPECT_TRUE(
+        std::get<bool>(Member(core.RuntimeSnapshot(), "complete").storage()));
+    EXPECT_TRUE(Array(core.AlarmSnapshot(), "alarms").empty());
+  }
+
+  *wall_time += 20'000'000'000LL;
+  HeadlessApiCore replacement(Config(directory, "api.epoch.2"), clocks());
+  EXPECT_FALSE(std::get<bool>(
+      Member(replacement.RuntimeSnapshot(), "complete").storage()));
+  const auto alarms = replacement.AlarmSnapshot();
+  EXPECT_TRUE(Array(alarms, "alarms").empty());
+  EXPECT_FALSE(std::get<bool>(Member(alarms, "reconciled").storage()));
+}
+
+TEST(HeadlessApiCore,
      IndependentlyProjectsTheManagerSelectedNodeEnvironmentWithStableIdentity) {
   TemporaryDirectory directory;
   PublishHealthySources(directory, "open");
@@ -677,8 +892,7 @@ TEST(HeadlessApiCore,
 
   const auto context = core.SourceModelContext();
   EXPECT_EQ(context.as_object().size(), 3U);
-  EXPECT_EQ(Text(context, "schema_version"),
-            kSourceModelContextSchemaVersion);
+  EXPECT_EQ(Text(context, "schema_version"), kSourceModelContextSchemaVersion);
   const auto &environment = Member(context, "node_environment");
   const auto &source_model = Member(context, "source_model");
   EXPECT_EQ(Text(environment, "schema_version"),
@@ -691,10 +905,8 @@ TEST(HeadlessApiCore,
             Text(source_model, "graph_revision"));
 
   constexpr std::array<std::string_view, 5> kSelectionFields{
-      "selection_projection_generation",
-      "selection_source_content_digest",
-      "selection_source_generation",
-      "selection_source_owner_epoch",
+      "selection_projection_generation", "selection_source_content_digest",
+      "selection_source_generation",     "selection_source_owner_epoch",
       "selection_source_owner_id",
   };
   const auto &environment_source = Member(environment, "source");
@@ -877,9 +1089,9 @@ TEST(HeadlessApiCore,
   const auto prepared = core.PrepareProgramApply(
       selection.scenario_id, selection.scenario_catalog_revision.value(),
       content_identity::canonical_json(selection.normalized_program_root));
-  const auto applied = core.CommitProgramApply(
-      content_identity::canonical_json(prepared), std::nullopt,
-      "authoring.epoch.1", "request.1");
+  const auto applied =
+      core.CommitProgramApply(content_identity::canonical_json(prepared),
+                              std::nullopt, "authoring.epoch.1", "request.1");
   EXPECT_EQ(Text(applied, "program_revision"),
             selection.program_revision.value());
 
@@ -900,8 +1112,8 @@ TEST(HeadlessApiCore,
   try {
     static_cast<void>(core.CommitProgramApply(
         content_identity::canonical_json(prepared),
-        Text(Member(applied, "source"), "record_digest"),
-        "authoring.epoch.1", "request.2"));
+        Text(Member(applied, "source"), "record_digest"), "authoring.epoch.1",
+        "request.2"));
     FAIL() << "a new Program Apply committed without a fresh Manager";
   } catch (const OperatorAlarmError &error) {
     EXPECT_EQ(error.code(), "program_apply_deployment_not_active");
@@ -1212,6 +1424,35 @@ TEST(HeadlessApiCore,
 }
 
 TEST(HeadlessApiCore,
+     PreparedOperationEvidenceIsAcceptedAsAHistoryFactWithoutRaisingAnAlarm) {
+  TemporaryDirectory directory;
+  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+  const std::string source_epoch = "execution-host.epoch.prepared";
+  const auto prepared = OperationJournalPayload(
+      source_epoch, "operation_prepared", "prepared", CanonicalValue(nullptr));
+  const auto prepared_json = content_identity::canonical_json(prepared);
+  const auto ingested = core.IngestOperationEvent(
+      source_epoch, 1U, "operation_prepared", std::nullopt, "operation.test.1", 1U,
+      100U, "2026-08-07T10:00:00.000000001Z", false, prepared,
+      content_identity::sha256_digest(prepared_json));
+  EXPECT_EQ(Text(ingested, "status"), "ingested");
+  EXPECT_TRUE(Array(core.AlarmSnapshot(), "alarms").empty());
+
+  HistorianQuery query;
+  query.components.insert("manyforge.runtime");
+  query.event_types.insert("operation_prepared");
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  while (Array(core.HistoryPage(query), "events").empty() &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  const auto page = core.HistoryPage(query);
+  ASSERT_EQ(Array(page, "events").size(), 1U);
+  EXPECT_EQ(Member(Member(Array(page, "events").front(), "event"), "event_type"),
+            CanonicalValue("operation_prepared"));
+}
+
+TEST(HeadlessApiCore,
      GlobalStopAcceptanceProjectionKeepsPairedNullOperationIdentity) {
   TemporaryDirectory directory;
   HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
@@ -1257,6 +1498,56 @@ TEST(HeadlessApiCore,
           source_epoch, 2U, "state_observed", std::nullopt, std::nullopt,
           std::nullopt, 101U, "2026-08-07T10:00:00.000000002Z", false,
           projection, projection_digest)),
+      OperatorAlarmError);
+}
+
+TEST(HeadlessApiCore,
+     GlobalStopTerminalProjectionPublishesCausalHistoryAndLatency) {
+  TemporaryDirectory directory;
+  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+  const std::string source_epoch = "execution-host.epoch.stop";
+  const auto projection = StopTerminalProjectionPayload(source_epoch);
+  const auto projection_json = content_identity::canonical_json(projection);
+  const auto projection_digest =
+      content_identity::sha256_digest(projection_json);
+
+  const auto ingested = core.IngestOperationEvent(
+      source_epoch, 2U, "stop_terminal_projected", std::nullopt, std::nullopt,
+      std::nullopt, 1100U, "2026-08-07T10:00:01.000000001Z", false, projection,
+      projection_digest);
+  EXPECT_EQ(Text(ingested, "status"), "ingested");
+
+  HistorianQuery query;
+  query.components.insert("manyforge.runtime");
+  query.event_types.insert("stop_terminal_projected");
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  while (Array(core.HistoryPage(query), "events").empty() &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  const auto page = core.HistoryPage(query);
+  ASSERT_EQ(Array(page, "events").size(), 1U);
+  const auto &stored = Array(page, "events").front();
+  const auto &history_event = Member(stored, "event");
+  EXPECT_EQ(Text(history_event, "event_type"), "stop_terminal_projected");
+  EXPECT_EQ(Text(history_event, "severity"), "INFO");
+  const auto &history_payload = Member(history_event, "payload");
+  EXPECT_EQ(Unsigned(history_payload, "duration_ns"), 1000U);
+  EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(
+      Member(history_payload, "operation_id").storage()));
+  EXPECT_EQ(Member(history_payload, "journal_payload"), projection);
+
+  const auto detail = core.HistoryDetail(Unsigned(stored, "sequence"));
+  const auto &latency = Member(Member(detail, "sections"), "latency");
+  EXPECT_TRUE(std::get<bool>(Member(latency, "available").storage()));
+  EXPECT_EQ(Text(Member(latency, "value"), "unit"), "ns");
+  EXPECT_EQ(Unsigned(Member(latency, "value"), "value"), 1000U);
+
+  EXPECT_THROW(
+      static_cast<void>(core.IngestOperationEvent(
+          source_epoch, 3U, "stop_terminal_projected", std::nullopt,
+          "operation.test.1", 1U, 1101U, "2026-08-07T10:00:01.000000002Z",
+          false, projection, projection_digest)),
       OperatorAlarmError);
 }
 
@@ -1318,6 +1609,100 @@ TEST(HeadlessApiCore,
   EXPECT_EQ(Text(returned, "lifecycle_state"), "returned_unacknowledged");
   EXPECT_EQ(Text(Member(returned, "details"), "reason"),
             "operation_reset_accepted");
+}
+
+TEST(HeadlessApiCore,
+     LatchedStopFaultDrivesExactAcknowledgeableAlarmUntilDurableClear) {
+  TemporaryDirectory directory;
+  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+  const std::string source_epoch = "execution-host.epoch.stop-fault";
+  const auto terminal = StopTerminalProjectionPayload(
+      source_epoch, "succeeded_escalated", "succeeded", true);
+  const auto terminal_digest = content_identity::sha256_digest(
+      content_identity::canonical_json(terminal));
+
+  static_cast<void>(core.IngestOperationEvent(
+      source_epoch, 1U, "stop_terminal_projected", std::nullopt,
+      std::nullopt, std::nullopt, 1100U,
+      "2026-08-07T10:00:01.000000001Z", false, terminal,
+      terminal_digest));
+  static_cast<void>(core.CompleteOperationEventSnapshot(source_epoch, 1U));
+
+  const auto active_snapshot = core.AlarmSnapshot();
+  const auto &active = OnlyAlarm(active_snapshot);
+  EXPECT_EQ(Text(active, "definition_id"), "manyforge.motion.stop_fault");
+  EXPECT_EQ(Text(active, "lifecycle_state"), "active_unacknowledged");
+  EXPECT_EQ(Text(active, "priority"), "high");
+  EXPECT_TRUE(
+      std::get<bool>(Member(active, "requires_motion_attention").storage()));
+  EXPECT_EQ(Text(Member(active, "subject"), "subject_id"), kCellId);
+  EXPECT_EQ(Text(Member(active, "correlations"), "latch_id"),
+            "stop-fault.test.1");
+  EXPECT_EQ(Text(Member(active, "correlations"), "stop_certificate_id"),
+            "stop-certificate.test.1");
+  EXPECT_EQ(Text(Member(Member(active, "details"), "fault_latch"),
+                 "reason_code"),
+            "stop_escalated");
+
+  const auto cleared = StopFaultClearProjectionPayload(source_epoch);
+  const auto cleared_digest = content_identity::sha256_digest(
+      content_identity::canonical_json(cleared));
+  static_cast<void>(core.IngestOperationEvent(
+      source_epoch, 2U, "stop_fault_cleared", "stop-fault-reset.test.1",
+      std::nullopt, std::nullopt, 1200U,
+      "2026-08-07T10:00:01.000000002Z", false, cleared,
+      cleared_digest));
+  static_cast<void>(core.CompleteOperationEventSnapshot(source_epoch, 2U));
+
+  const auto returned_snapshot = core.AlarmSnapshot();
+  const auto &returned = OnlyAlarm(returned_snapshot);
+  EXPECT_EQ(Text(returned, "definition_id"), "manyforge.motion.stop_fault");
+  EXPECT_EQ(Text(returned, "lifecycle_state"), "returned_unacknowledged");
+  EXPECT_EQ(Text(Member(returned, "details"), "record_kind"),
+            "stop_fault_cleared");
+
+  HistorianQuery query;
+  query.components.insert("manyforge.runtime");
+  query.event_types.insert("stop_fault_cleared");
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  while (Array(core.HistoryPage(query), "events").empty() &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  EXPECT_EQ(Array(core.HistoryPage(query), "events").size(), 1U);
+}
+
+TEST(HeadlessApiCore,
+     CurrentStopFaultSnapshotReannunciatesAfterOwnerRestartAndClearsExactly) {
+  TemporaryDirectory directory;
+  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+  const std::string source_epoch = "execution-host.epoch.stop-fault-snapshot";
+
+  static_cast<void>(core.CompleteOperationEventSnapshot(
+      source_epoch, 0U, CurrentStopFaultLatch()));
+  const auto active_snapshot = core.AlarmSnapshot();
+  const auto &active = OnlyAlarm(active_snapshot);
+  EXPECT_EQ(Text(active, "definition_id"), "manyforge.motion.stop_fault");
+  EXPECT_EQ(Text(active, "lifecycle_state"), "active_unacknowledged");
+  EXPECT_EQ(Text(Member(active, "subject"), "subject_id"), kCellId);
+  EXPECT_EQ(Text(Member(active, "correlations"), "latch_id"),
+            "stop-fault.test.1");
+  EXPECT_EQ(Text(Member(active, "details"), "record_kind"),
+            "current_stop_fault_snapshot");
+  const auto activation_id = Text(active, "activation_id");
+
+  static_cast<void>(core.CompleteOperationEventSnapshot(
+      source_epoch, 0U, CurrentStopFaultLatch()));
+  const auto repeated_snapshot = core.AlarmSnapshot();
+  EXPECT_EQ(Text(OnlyAlarm(repeated_snapshot), "activation_id"), activation_id);
+
+  static_cast<void>(core.CompleteOperationEventSnapshot(
+      source_epoch, 0U, CanonicalValue(nullptr)));
+  const auto returned_snapshot = core.AlarmSnapshot();
+  const auto &returned = OnlyAlarm(returned_snapshot);
+  EXPECT_EQ(Text(returned, "lifecycle_state"), "returned_unacknowledged");
+  EXPECT_EQ(Text(Member(returned, "details"), "reason"),
+            "stop_fault_context_retired");
 }
 
 TEST(HeadlessApiCore,

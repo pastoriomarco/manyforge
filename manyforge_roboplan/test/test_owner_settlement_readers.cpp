@@ -95,6 +95,17 @@ ReleaseJson(std::string_view role, std::string_view owner_epoch,
          "\",\"settlement_kind\":\"" + std::string(settlement) + "\"}}";
 }
 
+[[nodiscard]] std::string
+ProgramStartSettlementJson(std::string_view claim_json,
+                           std::string_view program_run_id) {
+  return "{\"claim\":" + std::string(claim_json) +
+         ",\"kind\":\"proven_no_effect\",\"prepared_scene\":{"
+         "\"schema_version\":\"manyforge.prepared_program_scene.v1\"},"
+         "\"program_run_id\":\"" + std::string(program_run_id) +
+         "\",\"schema_version\":"
+         "\"manyforge.program_cycle_start_settlement.v1\"}";
+}
+
 TEST(OwnerSettlementReaders,
      ProgramResetRequiresExactDurableTerminalClaimAndReleaseIntent) {
   const auto claim_json = ClaimJson("program_cycle", "program_runner",
@@ -279,11 +290,12 @@ TEST(OwnerSettlementReaders,
       "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
       "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,3);"
       "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
-      "owner_epoch TEXT,claim_json TEXT,release_intent_json TEXT,"
-      "terminal_reference TEXT,reconciliation_required INTEGER,"
+      "owner_epoch TEXT,program_run_id TEXT,claim_json TEXT,"
+      "release_intent_json TEXT,terminal_reference TEXT,"
+      "start_settlement_json TEXT,reconciliation_required INTEGER,"
       "acquisition_pending_json TEXT,reconciliation_evidence_digest TEXT);"
       "INSERT INTO program_cycle VALUES(1,'idle_after_reset','runner.1',"
-      "NULL,NULL,NULL,1,NULL,'" +
+      "NULL,NULL,NULL,NULL,NULL,1,NULL,'" +
       evidence.value().value() + "')");
   fixture.Close();
   const core::CellAdmissionReconcileDTO reconcile{
@@ -298,20 +310,26 @@ TEST(OwnerSettlementReaders,
   const auto claim_json = ClaimJson("program_cycle", "program_runner",
                                     "runner.1", "cycle.1", "start.1");
   const auto claim = DecodeCellAdmissionClaim(claim_json);
+  const auto start_settlement =
+      ProgramStartSettlementJson(claim_json, "cycle.1");
+  const auto terminal_evidence =
+      content_identity::sha256_digest(start_settlement);
   const auto release_json = ReleaseJson("program_runner", "runner.1", "cycle.1",
-                                        "start.1", "explicit_reset", kDigestB);
+                                        "start.1", "explicit_reset",
+                                        terminal_evidence);
   TemporaryDatabase terminal;
   terminal.Exec(
       "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
       "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,3);"
       "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
-      "owner_epoch TEXT,claim_json TEXT,release_intent_json TEXT,"
-      "terminal_reference TEXT,reconciliation_required INTEGER,"
+      "owner_epoch TEXT,program_run_id TEXT,claim_json TEXT,"
+      "release_intent_json TEXT,terminal_reference TEXT,"
+      "start_settlement_json TEXT,reconciliation_required INTEGER,"
       "acquisition_pending_json TEXT,reconciliation_evidence_digest TEXT);"
       "INSERT INTO program_cycle "
-      "VALUES(1,'terminal_awaiting_reset','runner.1','" +
-      claim_json + "','" + release_json + "','" + std::string(kDigestB) +
-      "',1,NULL,'" + evidence.value().value() + "')");
+      "VALUES(1,'terminal_awaiting_reset','runner.1','cycle.1','" +
+      claim_json + "','" + release_json + "','" + terminal_evidence + "','" +
+      start_settlement + "',1,NULL,'" + evidence.value().value() + "')");
   terminal.Close();
   const auto validation = ValidateProgramRunnerOwnerReconciliationReadOnly(
       terminal.path(), {}, current, reconcile);
@@ -322,6 +340,62 @@ TEST(OwnerSettlementReaders,
   held_reconcile.retained_claims = {claim};
   EXPECT_FALSE(ValidateProgramRunnerOwnerReconciliationReadOnly(
                    terminal.path(), {claim}, current, held_reconcile)
+                   .ok());
+}
+
+TEST(OwnerSettlementReaders,
+     ProgramRunnerTerminalHeldClaimAuthorizesOneExactSuccessorSettlement) {
+  const auto claim_json = ClaimJson("program_cycle", "program_runner",
+                                    "runner.1", "cycle.1", "start.1");
+  const auto claim = DecodeCellAdmissionClaim(claim_json);
+  const auto start_settlement =
+      ProgramStartSettlementJson(claim_json, "cycle.1");
+  const auto terminal_evidence =
+      content_identity::sha256_digest(start_settlement);
+  const std::vector<core::CellAdmissionCurrentOwnerEpochDTO> current{
+      {core::CellAdmissionOwnerRoleDTO::kProgramRunner,
+       core::RequestOwnerEpoch("runner.1")}};
+  const std::vector<core::CellAdmissionCurrentOwnerEpochDTO> requested{
+      {core::CellAdmissionOwnerRoleDTO::kProgramRunner,
+       core::RequestOwnerEpoch("runner.2")}};
+  const auto evidence =
+      core::CellAdmissionOwnerEpochReconciliationEvidenceDigest(
+          core::CellAdmissionOwnerRoleDTO::kProgramRunner,
+          core::RequestOwnerEpoch("runner.2"));
+  ASSERT_TRUE(evidence.ok());
+  TemporaryDatabase terminal;
+  terminal.Exec(
+      "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
+      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,3);"
+      "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
+      "owner_epoch TEXT,program_run_id TEXT,claim_json TEXT,"
+      "release_intent_json TEXT,terminal_reference TEXT,"
+      "start_settlement_json TEXT,reconciliation_required INTEGER,"
+      "acquisition_pending_json TEXT,reconciliation_evidence_digest TEXT);"
+      "INSERT INTO program_cycle "
+      "VALUES(1,'terminal_awaiting_reset','runner.1','cycle.1','" +
+      claim_json + "',NULL,'" + terminal_evidence + "','" + start_settlement +
+      "',1,NULL,'" + evidence.value().value() + "')");
+  const core::CellAdmissionReconcileDTO reconcile{
+      core::RequestOwnerEpoch("kernel.1"), {claim}, requested, evidence.value()};
+
+  const auto validation = ValidateProgramRunnerOwnerReconciliationReadOnly(
+      terminal.path(), {claim}, current, reconcile);
+
+  ASSERT_TRUE(validation.ok());
+  ASSERT_EQ(validation.value().settlements.size(), 1U);
+  EXPECT_EQ(validation.value().settlements.front(),
+            (core::CellAdmissionReconcileSettlementDTO{
+                claim, core::CellAdmissionOwnerRoleDTO::kProgramRunner,
+                core::RequestOwnerEpoch("runner.2"),
+                core::CellAdmissionSettlementKindDTO::kReconciled,
+                evidence.value()}));
+
+  terminal.Exec("UPDATE program_cycle SET terminal_reference='" +
+                std::string(kDigestB) + "'");
+  terminal.Close();
+  EXPECT_FALSE(ValidateProgramRunnerOwnerReconciliationReadOnly(
+                   terminal.path(), {claim}, current, reconcile)
                    .ok());
 }
 } // namespace

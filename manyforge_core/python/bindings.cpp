@@ -524,10 +524,28 @@ PYBIND11_MODULE(manyforge_core_py, m) {
             .format(v.max_tcp_linear_speed_mps, v.tcp_frame, v.base_frame, v.run_collision_checks);
       });
 
+  py::class_<manyforge::core::TrajectoryValidationMetricsDTO>(
+      m, "TrajectoryValidationMetricsDTO")
+      .def(py::init<>())
+      .def_readwrite(
+          "trajectory_duration_s",
+          &manyforge::core::TrajectoryValidationMetricsDTO::trajectory_duration_s)
+      .def_readwrite(
+          "peak_abs_joint_velocity_rad_s",
+          &manyforge::core::TrajectoryValidationMetricsDTO::peak_abs_joint_velocity_rad_s)
+      .def_readwrite(
+          "peak_abs_joint_acceleration_rad_s2",
+          &manyforge::core::TrajectoryValidationMetricsDTO::peak_abs_joint_acceleration_rad_s2)
+      .def_readwrite(
+          "peak_tcp_linear_speed_mps",
+          &manyforge::core::TrajectoryValidationMetricsDTO::peak_tcp_linear_speed_mps);
+
   py::class_<manyforge::core::ValidationResultDTO>(m, "ValidationResultDTO")
       .def(py::init<>())
       .def_readwrite("valid", &manyforge::core::ValidationResultDTO::valid)
       .def_readwrite("error", &manyforge::core::ValidationResultDTO::error)
+      .def_readwrite("trajectory_metrics",
+                     &manyforge::core::ValidationResultDTO::trajectory_metrics)
       .def("__repr__", [](const manyforge::core::ValidationResultDTO& v) {
         return py::str("ValidationResultDTO(valid={})").format(v.valid);
       });

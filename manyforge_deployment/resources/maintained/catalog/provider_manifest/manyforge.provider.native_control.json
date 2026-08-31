@@ -116,8 +116,27 @@
         ],
         "evidence_kind": "motion_rest"
       }
+    },
+    {
+      "provider_contract_ref": {
+        "contract_schema_id": "manyforge.value_schema.provider_contract.motion_controlled_stop.v1",
+        "contract_schema_revision": "sha256:afbbcda3b81eabff2bbdffb5658fb1fcd3331cde896cadf0681793a2f9db90dd",
+        "provider_contract_role_id": "stop_contract"
+      },
+      "stop_command_support": {
+        "command_endpoint_role_ids": [
+          "command"
+        ],
+        "command_kind": "motion_controlled_stop"
+      },
+      "stop_evidence_support": {
+        "evidence_endpoint_role_ids": [
+          "state"
+        ],
+        "evidence_kind": "motion_rest"
+      }
     }
   ],
   "provider_manifest_id": "manyforge.provider.native_control",
-  "provider_manifest_revision": "sha256:d1c03f762af34a90ac3d3d5071432c9a4a27ee26dc2a9e7b06c422089c49018d"
+  "provider_manifest_revision": "sha256:003643de1fa843f7224f28cb1984125753725a1aa7f0f344eed15b792491bebe"
 }

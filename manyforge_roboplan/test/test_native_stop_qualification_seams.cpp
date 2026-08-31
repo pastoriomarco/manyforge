@@ -62,6 +62,14 @@ public:
     return found == events_.end() ? std::string{} : found->second;
   }
 
+  [[nodiscard]] std::size_t
+  count(detail::NativeStopQualificationEvent event) const {
+    std::lock_guard lock(mutex_);
+    return static_cast<std::size_t>(
+        std::count_if(events_.begin(), events_.end(),
+                      [event](const auto &row) { return row.first == event; }));
+  }
+
   void release() {
     {
       std::lock_guard lock(mutex_);
@@ -218,6 +226,77 @@ private:
       core::ContentDigest("scope.digest")};
 }
 
+[[nodiscard]] core::ResolvedParticipantStopStageDTO controlled_stage_fixture() {
+  auto stage = direct_stage_fixture();
+  auto &plan = stage.participant_stop_plan;
+  auto &prepared = plan.stage_commands.front();
+  auto &command = prepared.resolved_stage;
+  const auto binding = fixture::make_binding();
+  const auto &value = binding.value();
+  const auto &path = *value.control_path;
+  const core::ProviderContractRefDTO contract{
+      core::ProviderContractRoleId("stop_contract"),
+      core::SchemaId(std::string(core::kMotionControlledStopContractSchemaId)),
+      core::SchemaRevision(
+          std::string(core::kMotionControlledStopContractSchemaRevision))};
+  core::JsonValueDTO::Array limits;
+  for (const auto &resource : value.resources) {
+    limits.emplace_back(core::JsonObjectDTO{
+        {"resource_id", core::JsonValueDTO{resource.resource_id.value()}},
+        {"max_deceleration",
+         core::JsonValueDTO{core::JsonObjectDTO{
+             {"coordinate_kind", core::JsonValueDTO{"angular_rad_s2"}},
+             {"value_rad_s2", core::JsonValueDTO{4.0}},
+         }}},
+        {"settle_velocity_threshold",
+         core::JsonValueDTO{core::JsonObjectDTO{
+             {"coordinate_kind", core::JsonValueDTO{"angular_rad_s"}},
+             {"value_rad_s", core::JsonValueDTO{0.01}},
+         }}},
+    });
+  }
+  core::JsonObjectDTO parameters{
+      {"stop_mode", core::JsonValueDTO{"soft_on_path"}},
+      {"deceleration_time_s", core::JsonValueDTO{1.0}},
+      {"per_resource_limits", core::JsonValueDTO{std::move(limits)}},
+      {"allow_natural_completion_on_short_path", core::JsonValueDTO{true}},
+  };
+  command.stop_escalation_stage_id =
+      core::StopEscalationStageId("motion_controlled_stop");
+  command.containment_command = core::StopContainmentCommandDTO{
+      core::StopBudgetPhaseId("command"),
+      core::StopContainmentCommandKind::kMotionControlledStop, contract,
+      std::nullopt};
+  command.default_contract_parameters = parameters;
+  command.evidence_requirements = {core::ResolvedStopEvidenceRequirementDTO{
+      core::StopEvidenceRequirementDTO{
+          core::StopEvidenceItemId("controlled.rest"),
+          core::StopBudgetPhaseId("terminal"),
+          core::StopEvidenceRequirementKind::kMotionRest, contract,
+          std::nullopt,
+          core::StopEvidenceSourceRequirementDTO{
+              core::StopEvidenceSourceKind::kBindingStateAuthority,
+              100'000'000,
+              core::EndpointRoleId("state"),
+              {core::StateAuthorityClass::kPredicted}},
+          core::StopEvidenceObservationDTO{
+              core::StopEvidenceObservationKind::kPostCommandDwell,
+              10'000'000}},
+      core::ResolvedStopEvidenceSourceDTO{
+          core::StopEvidenceSourceKind::kBindingStateAuthority,
+          command.command_target, path.state_authority_id,
+          path.state_authority_class, contract}}};
+  prepared.validated_contract_parameters = std::move(parameters);
+  prepared.parameter_source =
+      core::StopStageParameterSourceDTO::kDeploymentDefault;
+  plan.deadline_budget = core::StopDeadlineBudgetDTO{
+      3'000'000'000,
+      200'000'000,
+      {{core::StopBudgetPhaseId("command"), 300'000'000},
+       {core::StopBudgetPhaseId("terminal"), 1'750'000'000}}};
+  return stage;
+}
+
 [[nodiscard]] core::RemainingStopBudgetDTO
 remaining_budget(const core::ResolvedParticipantStopStageDTO &stage) {
   core::RemainingStopBudgetDTO budget{
@@ -339,6 +418,202 @@ TEST(NativeStopQualificationSeamTest,
             core::ExecutionState::kExecuting);
   EXPECT_TRUE(backend->stop().accepted);
   EXPECT_TRUE(later_execution.wait_for_completion(2'000'000'000LL));
+}
+
+TEST(NativeStopQualificationSeamTest,
+     ExactPreparedArmStageExecutesOneSecondControlledStopExactlyOnce) {
+  WallClock clock;
+  auto binding = fixture::make_binding(/*distinct_compiled_joint_names=*/true);
+  auto channel = std::make_shared<fixture::StateChannel>(binding);
+  RoboPlanExecutionBackendConfig config;
+  config.soft_on_path_max_jerk_rad_s3 = {
+      {"compiled.robot.joint_1", 1'000'000.0},
+      {"compiled.robot.joint_2", 1'000'000.0}};
+  RecordingProbe probe;
+  auto backend = detail::NativeStopQualificationAccess::construct(
+      binding, channel, clock, config, probe);
+  const auto stage = controlled_stage_fixture();
+  auto execution =
+      backend->execute_trajectory(fixture::trajectory(binding, 5.0));
+  ASSERT_TRUE(wait_until_executing(*backend, 0.05));
+  detail::NativeStopQualificationAccess::install_prepared_goal_membership(
+      *backend, stage, core::ContentDigest("prepared.controlled"), execution);
+
+  const auto started = std::chrono::steady_clock::now();
+  const auto result = backend->TranslateStopStage(
+      stage, remaining_budget(stage), std::stop_token{});
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+
+  EXPECT_EQ(result.attempt_disposition,
+            core::StopStageAttemptDispositionDTO::kDispatched);
+  EXPECT_EQ(result.outcome, core::ParticipantStopStageOutcomeDTO::kSucceeded);
+  EXPECT_EQ(result.actual_provider_contract_mode,
+            core::MotionControlledStopMode::kSoftOnPath);
+  EXPECT_FALSE(result.recoverable_substitution_reason.has_value());
+  ASSERT_EQ(result.evidence_items.size(), 1U);
+  const auto *evidence = std::get_if<core::JsonObjectDTO>(
+      &result.evidence_items.front().evidence->value);
+  ASSERT_NE(evidence, nullptr);
+  EXPECT_EQ(std::get<std::string>(evidence->at("profile_id").value),
+            "operator_soft_on_path");
+  EXPECT_EQ(
+      probe.count(detail::NativeStopQualificationEvent::kNominalProviderEntry),
+      1U);
+  EXPECT_EQ(
+      probe.count(detail::NativeStopQualificationEvent::kPhysicalDispatch), 1U);
+  EXPECT_GE(elapsed, 900ms);
+  EXPECT_LT(elapsed, 1500ms);
+  EXPECT_EQ(backend->get_execution_snapshot().state,
+            core::ExecutionState::kStopped);
+  EXPECT_TRUE(execution.wait_for_completion(2'000'000'000LL));
+}
+
+TEST(NativeStopQualificationSeamTest,
+     NearEndpointNaturalCompletionUsesTheOriginalGoalWithoutReplacement) {
+  core::FakeClock clock;
+  auto binding = fixture::make_binding();
+  auto channel = std::make_shared<fixture::StateChannel>(binding);
+  RoboPlanExecutionBackendConfig config;
+  config.soft_on_path_stop_traj_delta_s = 0.02;
+  config.soft_on_path_sample_period_s = 0.01;
+  config.soft_on_path_max_jerk_rad_s3 = {{"joint_1", 1'000'000.0},
+                                         {"joint_2", 1'000'000.0}};
+  RecordingProbe probe;
+  auto backend = detail::NativeStopQualificationAccess::construct(
+      binding, channel, clock, config, probe);
+  auto stage = controlled_stage_fixture();
+  auto &parameters =
+      *stage.participant_stop_plan.stage_commands.front()
+           .validated_contract_parameters;
+  parameters["deceleration_time_s"] = core::JsonValueDTO{0.15};
+  stage.participant_stop_plan.stage_commands.front()
+      .resolved_stage.default_contract_parameters = parameters;
+
+  auto execution =
+      backend->execute_trajectory(fixture::trajectory(binding, 1.0));
+  ASSERT_TRUE(probe.wait_for(
+      detail::NativeStopQualificationEvent::kExecutionLoopArmed));
+  clock.advance(950'000'000);
+  ASSERT_TRUE(wait_until_executing(*backend, 0.94));
+  detail::NativeStopQualificationAccess::install_prepared_goal_membership(
+      *backend, stage, core::ContentDigest("prepared.natural"), execution);
+
+  auto stopped = std::async(std::launch::async, [&] {
+    return backend->TranslateStopStage(
+        stage, remaining_budget(stage), std::stop_token{});
+  });
+  ASSERT_TRUE(probe.wait_for(
+      detail::NativeStopQualificationEvent::kNominalResultWaitEnter));
+  EXPECT_EQ(probe.first_detail(
+                detail::NativeStopQualificationEvent::kNominalResultWaitEnter),
+            "natural_completion");
+  clock.advance(100'000'000);
+  const auto completion_deadline = std::chrono::steady_clock::now() + 2s;
+  while (stopped.wait_for(0ms) != std::future_status::ready &&
+         std::chrono::steady_clock::now() < completion_deadline) {
+    clock.advance(10'000'000);
+    std::this_thread::sleep_for(1ms);
+  }
+  ASSERT_EQ(stopped.wait_for(0ms), std::future_status::ready);
+  const auto result = stopped.get();
+
+  EXPECT_EQ(result.attempt_disposition,
+            core::StopStageAttemptDispositionDTO::kDispatched);
+  EXPECT_EQ(result.outcome, core::ParticipantStopStageOutcomeDTO::kSucceeded);
+  EXPECT_EQ(result.actual_provider_contract_mode,
+            core::MotionControlledStopMode::kSoftOnPath);
+  EXPECT_EQ(
+      probe.count(detail::NativeStopQualificationEvent::kPhysicalDispatch), 0U);
+  EXPECT_EQ(backend->get_execution_snapshot().state,
+            core::ExecutionState::kCompleted);
+  EXPECT_TRUE(execution.wait_for_completion(2'000'000'000LL));
+}
+
+TEST(NativeStopQualificationSeamTest,
+     RuntimeScaleChangeIsDeferredUntilTheControlledStopFinishes) {
+  WallClock clock;
+  auto binding = fixture::make_binding();
+  auto channel = std::make_shared<fixture::StateChannel>(binding);
+  RoboPlanExecutionBackendConfig config;
+  config.soft_on_path_max_jerk_rad_s3 = {{"joint_1", 1'000'000.0},
+                                         {"joint_2", 1'000'000.0}};
+  RecordingProbe probe(
+      detail::NativeStopQualificationEvent::kPhysicalDispatch);
+  auto backend = detail::NativeStopQualificationAccess::construct(
+      binding, channel, clock, config, probe);
+  auto execution =
+      backend->execute_trajectory(fixture::trajectory(binding, 5.0));
+  ASSERT_TRUE(wait_until_executing(*backend));
+
+  auto stopped = std::async(std::launch::async, [&] {
+    return backend->execute_controlled_stop(
+        fixture::soft_profile(binding, 0.30));
+  });
+  const bool reached_dispatch = probe.wait_for(
+      detail::NativeStopQualificationEvent::kPhysicalDispatch);
+  if (!reached_dispatch) {
+    probe.release();
+  }
+  ASSERT_TRUE(reached_dispatch);
+
+  backend->set_runtime_velocity_scale(0.25);
+  EXPECT_DOUBLE_EQ(backend->runtime_velocity_scale_status().commanded_scale,
+                   1.0);
+  probe.release();
+  ASSERT_EQ(stopped.wait_for(2s), std::future_status::ready);
+  const auto result = stopped.get();
+
+  ASSERT_TRUE(result.accepted);
+  EXPECT_TRUE(result.backend_stop_confirmed);
+  EXPECT_DOUBLE_EQ(backend->runtime_velocity_scale_status().commanded_scale,
+                   0.25);
+  EXPECT_EQ(backend->get_execution_snapshot().state,
+            core::ExecutionState::kStopped);
+  EXPECT_TRUE(execution.wait_for_completion(2'000'000'000LL));
+}
+
+TEST(NativeStopQualificationSeamTest,
+     NonRestingAddressedStateFailsTheControlledStopEvidenceContract) {
+  WallClock clock;
+  auto binding = fixture::make_binding();
+  auto channel = std::make_shared<fixture::StateChannel>(binding);
+  channel->force_observed_velocities({0.5, -0.5});
+  RoboPlanExecutionBackendConfig config;
+  config.soft_on_path_max_jerk_rad_s3 = {{"joint_1", 1'000'000.0},
+                                         {"joint_2", 1'000'000.0}};
+  RecordingProbe probe;
+  auto backend = detail::NativeStopQualificationAccess::construct(
+      binding, channel, clock, config, probe);
+  auto stage = controlled_stage_fixture();
+  auto &plan = stage.participant_stop_plan;
+  auto &parameters =
+      *plan.stage_commands.front().validated_contract_parameters;
+  parameters["deceleration_time_s"] = core::JsonValueDTO{0.05};
+  plan.stage_commands.front().resolved_stage.default_contract_parameters =
+      parameters;
+  plan.deadline_budget = core::StopDeadlineBudgetDTO{
+      500'000'000,
+      50'000'000,
+      {{core::StopBudgetPhaseId("command"), 100'000'000},
+       {core::StopBudgetPhaseId("terminal"), 250'000'000}}};
+
+  auto execution =
+      backend->execute_trajectory(fixture::trajectory(binding, 5.0));
+  ASSERT_TRUE(wait_until_executing(*backend));
+  detail::NativeStopQualificationAccess::install_prepared_goal_membership(
+      *backend, stage, core::ContentDigest("prepared.non-resting"), execution);
+
+  const auto result = backend->TranslateStopStage(
+      stage, remaining_budget(stage), std::stop_token{});
+
+  EXPECT_EQ(result.attempt_disposition,
+            core::StopStageAttemptDispositionDTO::kDispatched);
+  EXPECT_EQ(result.outcome, core::ParticipantStopStageOutcomeDTO::kFailed);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->details.at("reason"), "stop_evidence_not_at_rest");
+  EXPECT_EQ(backend->get_execution_snapshot().state,
+            core::ExecutionState::kStopped);
+  EXPECT_TRUE(execution.wait_for_completion(2'000'000'000LL));
 }
 
 TEST(NativeStopQualificationSeamTest,

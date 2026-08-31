@@ -17,6 +17,15 @@ namespace {
   return "sha256:" + std::string(64U, value);
 }
 
+[[nodiscard]] RuntimePolicyCatalogRecordRefDTO PolicyReference(const RuntimePolicyDTO& policy) {
+  return {policy.runtime_policy_id,
+          policy.runtime_policy_revision,
+          SchemaId(std::string(kRuntimePolicyApiVersion)),
+          SchemaRevision(Digest('3')),
+          ContentDigest(Digest('4')),
+          ContentAddressedStoreKey("catalog/runtime-policy/runtime.policy.json")};
+}
+
 [[nodiscard]] ResolvedStopBasePlanDTO BasePlan() {
   const auto path =
       std::filesystem::path(__FILE__).parent_path() / "golden" / "resolved_stop_base_plan.v1.json";
@@ -206,14 +215,15 @@ struct SealedInputs final {
   if (!readiness.ok()) throw std::logic_error(readiness.error().message);
   std::optional<RuntimeParticipantPolicySelection> runtime_policy;
   if (!command) {
-    auto selected = verify_runtime_participant_policy_selection(
-        RuntimePolicyDTO{RuntimePolicyId("runtime.policy"),
-                         RuntimePolicyRevision(Digest('2')),
-                         std::nullopt,
-                         {},
-                         {RuntimeMotionSpeedLimitDTO{RuntimePolicyCellScopeDTO{}, 0.5}},
-                         {}},
-        binding);
+    RuntimePolicyDTO policy{RuntimePolicyId("runtime.policy"),
+                            RuntimePolicyRevision(Digest('2')),
+                            std::nullopt,
+                            {},
+                            {RuntimeMotionSpeedLimitDTO{RuntimePolicyCellScopeDTO{}, 0.5}},
+                            {}};
+    const auto policy_reference = PolicyReference(policy);
+    auto selected =
+        verify_runtime_participant_policy_selection(policy_reference, std::move(policy), binding);
     if (!selected.ok()) throw std::logic_error(selected.error().message);
     runtime_policy = std::move(selected.value());
   }
@@ -302,7 +312,8 @@ struct SealedInputs final {
           path.stop_evidence_policy_id,
           path.stop_evidence_policy_revision,
           std::move(stop.value()),
-          std::move(payload)};
+          std::move(payload),
+          std::nullopt};
 }
 
 [[nodiscard]] PreparedMotionExecutionDTO MotionPayload(const SealedInputs& inputs) {
@@ -419,10 +430,15 @@ struct SealedInputs final {
           trajectory,
           state,
           {PlanResultDTO{trajectory, std::nullopt, projection}, 0U, planner_binding},
-          {ValidationRevision("validation.1"), ValidationResultDTO{true, std::nullopt}, world,
+          {ValidationRevision("validation.1"),
+           ValidationResultDTO{
+               true, std::nullopt,
+               TrajectoryValidationMetricsDTO{1.0, {0.5, 0.5}, {0.0, 0.0}, 0.1}},
+           world,
            CollisionPolicyRevision{1U, Digest('1')}, decision},
           std::nullopt,
-          {RuntimePolicyId("runtime.policy"), RuntimePolicyRevision(Digest('2'))},
+          {inputs.runtime_policy->value().source_artifact,
+           inputs.runtime_policy->value().selected_motion_speed_limit},
           {},
           3.0};
 }
@@ -462,10 +478,37 @@ TEST(PreparedOperationParticipantCodecTest, SealsAndRoundTripsBothPayloadTags) {
       motion.value(), motion_inputs.binding, motion_inputs.readiness,
       &*motion_inputs.runtime_policy, {}, MotionInterruptNodeCategory::kGeneric);
   ASSERT_TRUE(motion_bytes.ok()) << motion_bytes.error().message;
-  EXPECT_TRUE(DecodePreparedOperationParticipant(
-                  motion_bytes.value(), motion_inputs.binding, motion_inputs.readiness,
-                  &*motion_inputs.runtime_policy, {}, MotionInterruptNodeCategory::kGeneric)
-                  .ok());
+  const auto motion_decoded = DecodePreparedOperationParticipant(
+      motion_bytes.value(), motion_inputs.binding, motion_inputs.readiness,
+      &*motion_inputs.runtime_policy, {}, MotionInterruptNodeCategory::kGeneric);
+  ASSERT_TRUE(motion_decoded.ok()) << motion_decoded.error().message;
+  const auto& decoded_payload =
+      std::get<PreparedMotionExecutionDTO>(motion_decoded.value().payload);
+  EXPECT_EQ(decoded_payload.move_id.value(), "move.1");
+  ASSERT_TRUE(decoded_payload.validation_evidence.noncollision_result
+                  .trajectory_metrics.has_value());
+  const auto& metrics = *decoded_payload.validation_evidence.noncollision_result
+                             .trajectory_metrics;
+  EXPECT_DOUBLE_EQ(metrics.trajectory_duration_s, 1.0);
+  EXPECT_EQ(metrics.peak_abs_joint_velocity_rad_s,
+            (std::vector<double>{0.5, 0.5}));
+  EXPECT_EQ(metrics.peak_abs_joint_acceleration_rad_s2,
+            (std::vector<double>{0.0, 0.0}));
+  ASSERT_TRUE(metrics.peak_tcp_linear_speed_mps.has_value());
+  EXPECT_DOUBLE_EQ(*metrics.peak_tcp_linear_speed_mps, 0.1);
+  EXPECT_EQ(decoded_payload.runtime_policy.source_artifact.record_id.value(),
+            "runtime.policy");
+  EXPECT_EQ(
+      decoded_payload.runtime_policy.source_artifact.record_revision.value(),
+      Digest('2'));
+  EXPECT_EQ(decoded_payload.runtime_policy.source_artifact
+                .content_addressed_store_key.value(),
+            "catalog/runtime-policy/runtime.policy.json");
+  EXPECT_TRUE(std::holds_alternative<RuntimePolicyCellScopeDTO>(
+      decoded_payload.runtime_policy.selected_motion_speed_limit.scope));
+  EXPECT_DOUBLE_EQ(decoded_payload.runtime_policy.selected_motion_speed_limit
+                       .maximum_tcp_linear_speed_mps,
+                   0.5);
 }
 
 TEST(PreparedOperationParticipantCodecTest, RejectsSelfAttestedClaimsAndDigestForgery) {
@@ -528,20 +571,19 @@ TEST(PreparedOperationParticipantCodecTest,
   auto physical = verify_runtime_participant_binding(std::move(physical_value));
   ASSERT_TRUE(physical.ok()) << physical.error().message;
 
-  EXPECT_EQ(prepared_participant_backend_binding_field_error(
-                made.value(), physical.value(),
-                PreparedParticipantPayloadKindDTO::kMotionExecution),
-            "prepared_participant_backend_program_id_mismatch");
-  EXPECT_FALSE(prepared_participant_backend_physical_binding_field_error(
-                   made.value(), physical.value(),
-                   PreparedParticipantPayloadKindDTO::kMotionExecution)
-                   .has_value());
+  EXPECT_EQ(
+      prepared_participant_backend_binding_field_error(
+          made.value(), physical.value(), PreparedParticipantPayloadKindDTO::kMotionExecution),
+      "prepared_participant_backend_program_id_mismatch");
+  EXPECT_FALSE(
+      prepared_participant_backend_physical_binding_field_error(
+          made.value(), physical.value(), PreparedParticipantPayloadKindDTO::kMotionExecution)
+          .has_value());
 
   auto crossed = made.value();
   crossed.control_route_id = ControlRouteId("route.other");
   EXPECT_EQ(prepared_participant_backend_physical_binding_field_error(
-                crossed, physical.value(),
-                PreparedParticipantPayloadKindDTO::kMotionExecution),
+                crossed, physical.value(), PreparedParticipantPayloadKindDTO::kMotionExecution),
             "prepared_participant_backend_control_route_id_mismatch");
 }
 
@@ -558,13 +600,33 @@ TEST(PreparedOperationParticipantCodecTest,
   EXPECT_EQ(missing.error().details.at("reason"), "runtime_policy_selection_required");
 
   auto foreign = candidate;
-  std::get<PreparedMotionExecutionDTO>(foreign.payload).runtime_policy.runtime_policy_revision =
-      RuntimePolicyRevision(Digest('0'));
+  std::get<PreparedMotionExecutionDTO>(foreign.payload)
+      .runtime_policy.source_artifact.record_revision = RuntimePolicyRevision(Digest('0'));
   auto foreign_result = MakePreparedOperationParticipant(std::move(foreign), inputs.binding,
                                                          inputs.readiness, &*inputs.runtime_policy,
                                                          {}, MotionInterruptNodeCategory::kGeneric);
   ASSERT_FALSE(foreign_result.ok());
   EXPECT_EQ(foreign_result.error().details.at("reason"), "motion_payload_join_invalid");
+
+  auto wrong_source = candidate;
+  std::get<PreparedMotionExecutionDTO>(wrong_source.payload)
+      .runtime_policy.source_artifact.content_addressed_store_key =
+      ContentAddressedStoreKey("catalog/runtime-policy/other.json");
+  auto wrong_source_result = MakePreparedOperationParticipant(
+      std::move(wrong_source), inputs.binding, inputs.readiness, &*inputs.runtime_policy, {},
+      MotionInterruptNodeCategory::kGeneric);
+  ASSERT_FALSE(wrong_source_result.ok());
+  EXPECT_EQ(wrong_source_result.error().details.at("reason"), "motion_payload_join_invalid");
+
+  auto wrong_scope = candidate;
+  std::get<PreparedMotionExecutionDTO>(wrong_scope.payload)
+      .runtime_policy.selected_motion_speed_limit.scope = RuntimePolicyCommandTargetScopeDTO{
+      ControllableComponentId("robot.1"), CommandTargetId("other")};
+  auto wrong_scope_result = MakePreparedOperationParticipant(
+      std::move(wrong_scope), inputs.binding, inputs.readiness, &*inputs.runtime_policy, {},
+      MotionInterruptNodeCategory::kGeneric);
+  ASSERT_FALSE(wrong_scope_result.ok());
+  EXPECT_EQ(wrong_scope_result.error().details.at("reason"), "motion_payload_join_invalid");
 
   auto weaker = candidate;
   std::get<PreparedMotionExecutionDTO>(weaker.payload)

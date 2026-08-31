@@ -309,10 +309,58 @@ class ProgramRunTickHost:
         self.schedule(program_run_id)
         return snapshot
 
+    def full_stop(
+        self,
+        program_run_id: str,
+        *,
+        reason: str | None = None,
+        stop_request_id: str | None = None,
+    ) -> ProgramRunSnapshot:
+        """Contain the run and remove its preserved tree from scheduling."""
+
+        snapshot = self._owner.full_stop(
+            program_run_id,
+            reason=reason,
+            stop_request_id=stop_request_id,
+        )
+        if snapshot.state is ProgramRunState.FULL_STOPPING:
+            self.schedule(program_run_id)
+        return snapshot
+
+    def resume_full_stop(
+        self,
+        program_run_id: str,
+        *,
+        request_id: str,
+        reason: str | None = None,
+    ) -> ProgramRunSnapshot:
+        """Recover the frozen occurrence before making it schedulable."""
+
+        with self._condition:
+            self._raise_if_unavailable()
+            if (
+                program_run_id not in self._scheduled
+                and len(self._scheduled) >= self._maximum_scheduled_runs
+            ):
+                raise ProgramSchedulingError("scheduled Program-run set is full")
+            snapshot = self._owner.resume_full_stop(
+                program_run_id,
+                request_id=request_id,
+                reason=reason,
+            )
+            self._scheduled.add(program_run_id)
+            self._condition.notify_all()
+            return snapshot
+
     def reset_run(self, program_run_id: str) -> ProgramRunSnapshot:
         """Release the exact terminal run's resident owner effects."""
 
         return self._owner.reset_effects(program_run_id)
+
+    def reset_retained_run(self, program_run_id: str) -> None:
+        """Reset a proven terminal run whose behavior-tree owner rotated."""
+
+        self._owner.reset_retained_effects(program_run_id)
 
     def resume_recovery(
         self,
@@ -353,6 +401,7 @@ class ProgramRunTickHost:
     def _requires_advance(self, snapshot: ProgramRunSnapshot) -> bool:
         if snapshot.state in {
             ProgramRunState.RUNNING,
+            ProgramRunState.FULL_STOPPING,
             ProgramRunState.STOPPING,
             ProgramRunState.FINALIZING,
         }:
@@ -407,6 +456,8 @@ class ProgramRunTickHost:
                 if snapshot.state not in {
                     ProgramRunState.RUNNING,
                     ProgramRunState.INTERVENTION_REQUIRED,
+                    ProgramRunState.FULL_STOPPING,
+                    ProgramRunState.FULL_STOPPED,
                     ProgramRunState.STOPPING,
                     ProgramRunState.FINALIZING,
                 }:

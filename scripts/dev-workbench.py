@@ -238,6 +238,37 @@ def _remove_stale_socket(path: Path, label: str) -> None:
     path.unlink()
 
 
+def _require_current_workspace_deployment(
+    scenario: dict[str, Any],
+) -> Path:
+    """Reject an imported package that predates its current source contract."""
+
+    deployment_path = (
+        WORKSPACE
+        / "examples"
+        / f"{scenario['deployment_artifact_id']}.deployment.yaml"
+    )
+    _regular_file(deployment_path, "matching workspace Deployment")
+    try:
+        deployment = json.loads(deployment_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise WorkbenchError(
+            "matching workspace Deployment is invalid: "
+            f"{deployment_path}: {error}"
+        ) from error
+    if (
+        deployment.get("deployment_artifact_id")
+        != scenario["deployment_artifact_id"]
+        or deployment.get("deployment_revision")
+        != scenario["deployment_revision"]
+    ):
+        raise WorkbenchError(
+            "imported maintained Scenario package is stale relative to its "
+            "workspace Deployment; refresh the qualified package cache"
+        )
+    return deployment_path
+
+
 def _load_scenario(scenario_id: str) -> dict[str, Any]:
     catalog_path = PACKAGE_ROOT / "maintained.scenario-catalog.yaml"
     _regular_file(catalog_path, "maintained Scenario catalog")
@@ -317,6 +348,7 @@ def _load_scenario(scenario_id: str) -> dict[str, Any]:
         WORKSPACE / "examples" / f"{program['program_id']}.program.yaml"
     )
     _regular_file(workspace_program, "matching workspace Program")
+    _require_current_workspace_deployment(row)
     # Composer parses this artifact and the backend Load Scenario command
     # compares its semantic Program revision with the retained selection.  Do
     # not add a stricter byte-format identity in the process launcher.
@@ -780,6 +812,18 @@ def query_status(*, scenario_id: str | None, composer_port: int) -> dict[str, An
     }
 
 
+def _startup_cycle_state(client: HeadlessHttpClient) -> str:
+    """Accept only contained startup states; terminal state remains resettable."""
+
+    cycle = client.program_cycle_status()
+    state = cycle.get("state")
+    if state not in {"idle_after_reset", "terminal_awaiting_reset"}:
+        raise WorkbenchError(
+            f"Program cycle is not contained at startup: {state!r}"
+        )
+    return state
+
+
 class Workbench:
     def __init__(
         self,
@@ -967,14 +1011,20 @@ class Workbench:
             "fresh converged Manager baseline", manager_ready, self.processes
         )
 
+        with HeadlessHttpClient(base_url, timeout_seconds=1.0) as client:
+            startup_cycle_state = _startup_cycle_state(client)
+
         def authoring_ready() -> dict[str, Any] | None:
             with HeadlessHttpClient(base_url, timeout_seconds=0.5) as client:
                 admission = client.authoring_admission()
                 return admission if admission.get("authoring_allowed") is True else None
 
-        _wait_until(
-            "initial idle authoring admission", authoring_ready, self.processes
-        )
+        if startup_cycle_state == "idle_after_reset":
+            _wait_until(
+                "initial idle authoring admission",
+                authoring_ready,
+                self.processes,
+            )
         composer_environment = os.environ.copy()
         composer_environment["MANYFORGE_CORS_ORIGINS"] = (
             f"http://localhost:{self.frontend_port},"
@@ -988,16 +1038,18 @@ class Workbench:
             WORKSPACE / "examples"
         )
         print("starting Composer backend", flush=True)
+        composer_command = [
+            sys.executable, "-m", "manyforge_composer",
+            "--host", "127.0.0.1", "--port", str(self.composer_port),
+            "--program-path", self.metadata["program_path"],
+            "--headless-api-url", base_url,
+            "--headless-api-timeout-s", "20",
+            "--authoring-state-root", str(paths["composer_authoring"]),
+        ]
+        if startup_cycle_state == "idle_after_reset":
+            composer_command.extend(("--startup-scenario", self.scenario_id))
         composer = subprocess.Popen(
-            (
-                sys.executable, "-m", "manyforge_composer",
-                "--host", "127.0.0.1", "--port", str(self.composer_port),
-                "--program-path", self.metadata["program_path"],
-                "--headless-api-url", base_url,
-                "--headless-api-timeout-s", "20",
-                "--authoring-state-root", str(paths["composer_authoring"]),
-                "--startup-scenario", self.scenario_id,
-            ),
+            composer_command,
             env=composer_environment,
         )
         self.processes.append(("Composer backend", composer))
@@ -1018,16 +1070,17 @@ class Workbench:
             return result if result["ready"] else None
 
         _wait_until("exact current Scenario tuple", exact_status, self.processes)
-        with HeadlessHttpClient(base_url, timeout_seconds=1.0) as client:
-            _converge_control_management(
-                client,
-                self.metadata["component_ids"],
-                scenario_id=self.metadata["scenario_id"],
-                processes=self.processes,
+        if startup_cycle_state == "idle_after_reset":
+            with HeadlessHttpClient(base_url, timeout_seconds=1.0) as client:
+                _converge_control_management(
+                    client,
+                    self.metadata["component_ids"],
+                    scenario_id=self.metadata["scenario_id"],
+                    processes=self.processes,
+                )
+            _wait_until(
+                "idle authoring admission", authoring_ready, self.processes
             )
-        _wait_until(
-            "idle authoring admission", authoring_ready, self.processes
-        )
         vite_environment = os.environ.copy()
         vite_environment["MANYFORGE_COMPOSER_PROXY_TARGET"] = (
             f"http://127.0.0.1:{self.composer_port}"

@@ -247,7 +247,9 @@ public:
       std::string payload_digest);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   CompleteOperationEventSnapshot(std::string source_owner_epoch,
-                                 std::uint64_t through_source_sequence);
+                                 std::uint64_t through_source_sequence,
+                                 std::optional<manyforge::content_identity::CanonicalValue>
+                                     current_stop_fault = std::nullopt);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   MarkOperationEventSourceUnknown(std::string source_owner_epoch);
   void Shutdown();
@@ -305,6 +307,14 @@ private:
       std::uint64_t native_sequence, std::string_view payload_digest,
       std::int64_t occurred_at_ns, std::string_view occurred_at_wall,
       std::string_view raw_event_id);
+  void ReconcileStopFaultLocked(
+      const manyforge::content_identity::CanonicalValue &journal_payload,
+      std::string_view record_kind, std::uint64_t native_sequence,
+      std::string_view payload_digest, std::int64_t occurred_at_ns,
+      std::string_view occurred_at_wall, std::string_view raw_event_id);
+  void ObserveCurrentStopFaultLocked(
+      const manyforge::content_identity::CanonicalValue &fault_latch,
+      std::uint64_t native_sequence);
   void RegisterAdapterEpochLocked(AdapterCursor &cursor,
                                   std::string source_epoch);
   [[nodiscard]] AlarmMutation SubmitAdapterUpdateLocked(
@@ -352,6 +362,7 @@ private:
   RuntimeSnapshotAggregator runtime_aggregator_;
   AlarmLifecycleOwner alarm_owner_;
   AdapterCursor runtime_health_adapter_;
+  bool runtime_health_baseline_observed_{};
   AdapterCursor scene_adapter_;
   AdapterCursor operation_adapter_;
   std::uint64_t operation_native_sequence_{};
@@ -360,6 +371,8 @@ private:
   std::set<std::string> observed_operation_faults_;
   std::map<std::string, AlarmSubject> active_runtime_collisions_;
   std::set<std::string> observed_runtime_collisions_;
+  std::map<std::string, AlarmSubject> active_stop_faults_;
+  std::set<std::string> observed_stop_faults_;
   mutable std::mutex mutex_;
   std::map<std::string, ReplayEntry> replay_;
   std::uint64_t node_environment_generation_{};

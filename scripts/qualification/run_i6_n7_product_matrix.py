@@ -558,7 +558,7 @@ def qualify_scenario(
                 readiness_deadline = time.monotonic() + 25.0
                 while True:
                     try:
-                        client.execution_status()
+                        client.execution_diagnostics()
                         break
                     except HeadlessClientError:
                         if time.monotonic() >= readiness_deadline:

@@ -188,6 +188,15 @@ template <typename Available, typename Selected, typename Matches>
 [[nodiscard]] bool stop_plan_matches_participant(
     const PreparedOperationParticipantDTO& participant) noexcept {
   const auto& stop_plan = participant.ordinary_stop_plan;
+  const bool ordinary_plan =
+      stop_plan.participant_stop_profile_purpose ==
+          ParticipantStopProfilePurposeDTO::kOrdinary &&
+      !stop_plan.participant_stop_profile.has_value();
+  const bool operator_plan =
+      std::holds_alternative<PreparedMotionExecutionDTO>(participant.payload) &&
+      stop_plan.participant_stop_profile_purpose ==
+          ParticipantStopProfilePurposeDTO::kOperator &&
+      stop_plan.participant_stop_profile.has_value();
   return stop_plan.operation_id == participant.operation_id &&
          stop_plan.operation_revision == participant.operation_revision &&
          stop_plan.participant_id == participant.participant_id &&
@@ -195,9 +204,7 @@ template <typename Available, typename Selected, typename Matches>
          stop_plan.program_revision == participant.program_revision &&
          stop_plan.program_binding_id == participant.program_binding_id &&
          stop_plan.program_run_id == participant.program_run_id &&
-         stop_plan.participant_stop_profile_purpose ==
-             ParticipantStopProfilePurposeDTO::kOrdinary &&
-         !stop_plan.participant_stop_profile.has_value() &&
+         (ordinary_plan || operator_plan) &&
          !stop_plan.motion_interrupt_scope_id.has_value();
 }
 

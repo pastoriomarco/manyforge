@@ -286,7 +286,7 @@ export function sceneObjectMutationAvailability(
       : object.provider_evidence !== null
         ? 'This object is provider-owned.'
         : attachment !== undefined
-          ? 'Detach the carried object before changing its authored definition.'
+          ? 'Set the Attached object to Detached before changing its authored definition.'
           : object.placement.kind !== 'cell_fixed'
             ? 'This placement is attachment-owned.'
             : null;
@@ -302,14 +302,14 @@ export function sceneObjectMutationAvailability(
       : object.provider_evidence !== null
         ? 'This object is provider-owned.'
         : attachment !== undefined
-          ? 'Detach the carried object before removing it.'
+          ? 'Set the Attached object to Detached before removing it.'
           : object.placement.kind !== 'cell_fixed'
-            ? 'Detach the carried object before removing it.'
+            ? 'Set the Attached object to Detached before removing it.'
             : null;
   const detachReason = !facts.runtimeWriteAvailable
     ? facts.runtimeWriteUnavailableReason ?? 'Runtime scene mutation is unavailable.'
     : attachment === undefined
-      ? 'This object is not carried.'
+      ? 'This object is already Detached.'
       : null;
   return {
     transform: authoredReason === null,

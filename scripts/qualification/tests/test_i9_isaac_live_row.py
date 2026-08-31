@@ -1081,7 +1081,7 @@ def test_cclc_startup_uses_fresh_owner_templates_and_full_binding_sets(
                 ],
             }
 
-        def execution_status(self):
+        def execution_diagnostics(self):
             self.execution_status_calls += 1
             ready = self.execution_status_calls >= 3
             return {

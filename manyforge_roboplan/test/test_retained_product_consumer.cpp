@@ -1601,7 +1601,7 @@ TEST(RetainedProductRoboPlanConsumer,
   EXPECT_EQ(reopened_scene_facts, first_scene_facts);
   EXPECT_FALSE(std::filesystem::exists(reopened_stage_root));
 
-  // Removing a selected staged file must make a fresh real Scene load fail.
+  // Removing a selected collision mesh must make a fresh real Scene load fail.
   // If Pinocchio/RoboPlan searched an ambient ROS/package location, this
   // could incorrectly keep succeeding.
   std::filesystem::path incomplete_stage_root;
@@ -1615,8 +1615,20 @@ TEST(RetainedProductRoboPlanConsumer,
           const std::string package_uri =
               "package://" + std::string(resource.logical_uri().substr(
                                  std::string_view("asset://").size()));
-          return stage.loader_urdf_bytes().find(package_uri) !=
-                 std::string_view::npos;
+          const auto urdf = stage.loader_urdf_bytes();
+          std::size_t position = 0U;
+          while ((position = urdf.find(package_uri, position)) !=
+                 std::string_view::npos) {
+            const auto collision_start = urdf.rfind("<collision", position);
+            const auto collision_end = urdf.rfind("</collision>", position);
+            if (collision_start != std::string_view::npos &&
+                (collision_end == std::string_view::npos ||
+                 collision_start > collision_end)) {
+              return true;
+            }
+            position += package_uri.size();
+          }
+          return false;
         });
     ASSERT_NE(selected, reopened.resources().end());
     const std::filesystem::path selected_path =
@@ -1899,11 +1911,10 @@ TEST(
       stage.srdf_path(), stage.package_paths(),
       arm_target->model_groups.front().compiled_group_name);
 
-  EXPECT_THROW(
-      static_cast<void>(RetainedSceneFrameResolver::create_verified(
-          collision_model, *materialized.bundle, model_map, retained,
-          local_runtime_unit_id, local_runtime_epoch, {})),
-      std::invalid_argument);
+  EXPECT_THROW(static_cast<void>(RetainedSceneFrameResolver::create_verified(
+                   collision_model, *materialized.bundle, model_map, retained,
+                   local_runtime_unit_id, local_runtime_epoch, {})),
+               std::invalid_argument);
 
   const std::shared_ptr<const core::IObservedStateProvider> arm_provider(
       arm_channel, arm_channel->addressed_publication());
@@ -1911,11 +1922,9 @@ TEST(
       gripper_channel, gripper_channel->addressed_publication());
   const std::vector<RetainedSceneFrameStateSourceInput> provided_state_sources{
       {arm_channel->query_context(),
-       core::ObservedStateSourceKind::kPredictedState,
-       arm_provider},
+       core::ObservedStateSourceKind::kPredictedState, arm_provider},
       {gripper_channel->query_context(),
-       core::ObservedStateSourceKind::kPredictedState,
-       gripper_provider}};
+       core::ObservedStateSourceKind::kPredictedState, gripper_provider}};
   auto resolver = RetainedSceneFrameResolver::create_verified(
       collision_model, *materialized.bundle, model_map, retained,
       local_runtime_unit_id, local_runtime_epoch, provided_state_sources);
@@ -2100,8 +2109,7 @@ TEST(
       captured.value().kinematic_state_path_views.begin(),
       captured.value().kinematic_state_path_views.end(),
       [](const auto &view) { return !view.resource_states.empty(); });
-  ASSERT_NE(captured_view,
-            captured.value().kinematic_state_path_views.end());
+  ASSERT_NE(captured_view, captured.value().kinematic_state_path_views.end());
   for (const auto &view : captured.value().kinematic_state_path_views) {
     for (const auto &resource : view.resource_states) {
       EXPECT_EQ(resource.publication_received_timestamp_ns, 20);
@@ -2383,8 +2391,7 @@ TEST(RetainedProductCrossConsumer,
             state_sources.reserve(channels.size());
             for (const auto &channel : channels) {
               state_sources.push_back(RetainedSceneFrameStateSourceInput{
-                  channel->query_context(),
-                  channel->source_kind(),
+                  channel->query_context(), channel->source_kind(),
                   std::shared_ptr<const core::IObservedStateProvider>(
                       channel, channel->addressed_publication())});
             }
@@ -2397,6 +2404,7 @@ TEST(RetainedProductCrossConsumer,
           {},
           &admission_gate,
           runtime_policy->value(),
+          runtime_policy->reference(),
           {},
           {},
           {},
@@ -2420,7 +2428,16 @@ TEST(RetainedProductCrossConsumer,
             runtime_policy->value());
   EXPECT_DOUBLE_EQ(motion_registration->runtime_policy->value()
                        .effective_maximum_tcp_linear_speed_mps,
-                   0.5);
+                   0.15);
+  EXPECT_EQ(motion_registration->runtime_policy->value().source_artifact,
+            runtime_policy->reference());
+  ASSERT_TRUE(std::holds_alternative<core::RuntimePolicyCommandTargetScopeDTO>(
+      motion_registration->runtime_policy->value()
+          .selected_motion_speed_limit.scope));
+  EXPECT_DOUBLE_EQ(
+      motion_registration->runtime_policy->value()
+          .selected_motion_speed_limit.maximum_tcp_linear_speed_mps,
+      0.15);
   ASSERT_NE(runtime->motion_state_channel, nullptr);
   ASSERT_NE(runtime->gripper_state_channel, nullptr);
   const auto initial_motion_state =
@@ -2493,11 +2510,13 @@ TEST(RetainedProductCrossConsumer,
   EXPECT_TRUE(
       std::all_of(limits.value().velocity_max_rad_s.begin(),
                   limits.value().velocity_max_rad_s.end(),
-                  [](double value) { return std::abs(value - 3.14) < 1e-12; }));
-  // The qualified Lite6 URDF/SRDF source declares no acceleration limits.
-  // RoboPlan represents that internally with max-double sentinels; the typed
-  // ManyForge boundary must expose absence rather than a fictitious cap.
-  EXPECT_TRUE(limits.value().acceleration_max_rad_s2.empty());
+                  [](double value) { return std::abs(value - 2.14) < 1e-12; }));
+  ASSERT_EQ(limits.value().acceleration_max_rad_s2.size(),
+            joint_names.value().size());
+  EXPECT_TRUE(
+      std::all_of(limits.value().acceleration_max_rad_s2.begin(),
+                  limits.value().acceleration_max_rad_s2.end(),
+                  [](double value) { return std::abs(value - 10.0) < 1e-12; }));
   const auto base_frame = require_fixture_one(
       motion_value.frame_bindings,
       [](const auto &frame) { return frame.frame_role_id.value() == "base"; },
@@ -2531,6 +2550,58 @@ TEST(RetainedProductCrossConsumer,
       cancellation);
   ASSERT_TRUE(validation.valid)
       << (validation.error.has_value() ? validation.error->message : "");
+  ASSERT_TRUE(validation.trajectory_metrics.has_value());
+  EXPECT_DOUBLE_EQ(validation.trajectory_metrics->trajectory_duration_s, 1.0);
+  EXPECT_EQ(validation.trajectory_metrics->peak_abs_joint_velocity_rad_s,
+            std::vector<double>(joint_names.value().size(), 0.0));
+  EXPECT_TRUE(
+      validation.trajectory_metrics->peak_abs_joint_acceleration_rad_s2.empty());
+  EXPECT_FALSE(
+      validation.trajectory_metrics->peak_tcp_linear_speed_mps.has_value());
+
+  auto measured_trajectory = stationary_trajectory;
+  measured_trajectory.waypoints = {
+      core::TrajectoryWaypointDTO{
+          0.0, std::vector<double>(joint_names.value().size(), 0.0),
+          std::vector<double>(joint_names.value().size(), 0.0),
+          std::vector<double>(joint_names.value().size(), 0.0)},
+      core::TrajectoryWaypointDTO{
+          0.5, std::vector<double>(joint_names.value().size(), 0.0),
+          std::vector<double>(joint_names.value().size(), 0.0),
+          std::vector<double>(joint_names.value().size(), 0.0)},
+      core::TrajectoryWaypointDTO{
+          1.0, std::vector<double>(joint_names.value().size(), 0.0),
+          std::vector<double>(joint_names.value().size(), 0.0),
+          std::vector<double>(joint_names.value().size(), 0.0)}};
+  measured_trajectory.waypoints[1].positions_rad[0] = 0.01;
+  measured_trajectory.waypoints[2].positions_rad[0] = 0.02;
+  measured_trajectory.waypoints[1].velocities_rad_s[0] = 0.02;
+  measured_trajectory.waypoints[2].velocities_rad_s[0] = 0.02;
+  measured_trajectory.waypoints[1].accelerations_rad_s2[0] = 0.03;
+  const auto measured_validation =
+      runtime->trajectory_validator->validate_non_collision(
+          measured_trajectory,
+          core::ValidationOptionsDTO{0.15, tcp_frame.compiled_frame_name,
+                                     base_frame.compiled_frame_name, false},
+          cancellation);
+  ASSERT_TRUE(measured_validation.valid)
+      << (measured_validation.error.has_value()
+              ? measured_validation.error->message
+              : "");
+  ASSERT_TRUE(measured_validation.trajectory_metrics.has_value());
+  const auto &measured_metrics = *measured_validation.trajectory_metrics;
+  EXPECT_DOUBLE_EQ(measured_metrics.trajectory_duration_s, 1.0);
+  ASSERT_EQ(measured_metrics.peak_abs_joint_velocity_rad_s.size(),
+            joint_names.value().size());
+  EXPECT_NEAR(measured_metrics.peak_abs_joint_velocity_rad_s[0], 0.02,
+              1.0e-12);
+  ASSERT_EQ(measured_metrics.peak_abs_joint_acceleration_rad_s2.size(),
+            joint_names.value().size());
+  EXPECT_NEAR(measured_metrics.peak_abs_joint_acceleration_rad_s2[0], 0.03,
+              1.0e-12);
+  ASSERT_TRUE(measured_metrics.peak_tcp_linear_speed_mps.has_value());
+  EXPECT_GT(*measured_metrics.peak_tcp_linear_speed_mps, 0.0);
+  EXPECT_LE(*measured_metrics.peak_tcp_linear_speed_mps, 0.15);
   auto over_speed_trajectory = stationary_trajectory;
   over_speed_trajectory.waypoints.back().time_from_start_s = 0.1;
   over_speed_trajectory.waypoints.back().positions_rad.front() = 1.0;
@@ -2542,7 +2613,7 @@ TEST(RetainedProductCrossConsumer,
   ASSERT_TRUE(over_speed_validation.error.has_value());
   EXPECT_EQ(over_speed_validation.error->details.at("reason"),
             "trajectory_segment_velocity_limit_exceeded");
-  EXPECT_NEAR(std::stod(over_speed_validation.error->details.at("limit")), 3.14,
+  EXPECT_NEAR(std::stod(over_speed_validation.error->details.at("limit")), 2.14,
               1e-12);
   const auto expanded =
       runtime->collision_trajectory_projector->expand_for_collision(
@@ -3134,9 +3205,9 @@ TEST(RetainedProductCrossConsumer,
       core::SceneObjectProviderEvidenceDTO{
           core::ProviderInstanceId("isaac.pose.observer"),
           core::ProviderManifestId("manyforge.provider.logical_scene"),
-          core::ProviderManifestRevision(
-              "sha256:"
-              "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+          core::ProviderManifestRevision("sha256:"
+                                         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                                         "bbbbbbbbbbbbbbbbbbbbbbbbbbb"),
           "sha256:"
           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
           7U, kReceiverTimestampNs, kRawSourceTimestampNs, 10'000'000'000});
@@ -3169,12 +3240,11 @@ TEST(RetainedProductCrossConsumer,
   const auto publication_inventory =
       projection->current_scene_snapshot_lease_inventory();
   ASSERT_TRUE(publication_inventory.has_value());
-  EXPECT_EQ(publication_inventory->captured_at_ns,
-            kReceiverTimestampNs + 10);
+  EXPECT_EQ(publication_inventory->captured_at_ns, kReceiverTimestampNs + 10);
   ASSERT_EQ(publication_inventory->bundle.body_freshness.size(), 1U);
-  EXPECT_EQ(publication_inventory->bundle.body_freshness.front()
-                .source_timestamp_ns,
-            kReceiverTimestampNs);
+  EXPECT_EQ(
+      publication_inventory->bundle.body_freshness.front().source_timestamp_ns,
+      kReceiverTimestampNs);
   ASSERT_EQ(publication_inventory->live_objects.size(), 1U);
   EXPECT_EQ(publication_inventory->live_objects.front().source_timestamp_ns,
             kReceiverTimestampNs);
@@ -3868,10 +3938,9 @@ TEST(
   const auto predecessor_lease = projection->RetainProjection(
       predecessor_revision,
       core::ProjectionLeaseId("command-fenced-predecessor-lease"));
-  ASSERT_TRUE(predecessor_lease.ok())
-      << predecessor_lease.error().message;
-  const auto predecessor_frame = projection->ResolveSceneFrame(
-      core::SceneFrameResolutionQueryDTO{
+  ASSERT_TRUE(predecessor_lease.ok()) << predecessor_lease.error().message;
+  const auto predecessor_frame =
+      projection->ResolveSceneFrame(core::SceneFrameResolutionQueryDTO{
           core::CellSceneFrameRefDTO{core::CellId(std::string(cell_id))},
           predecessor_lease.value().projection_binding});
   ASSERT_FALSE(predecessor_frame.ok());
@@ -3934,8 +4003,8 @@ TEST(
       candidate_revision,
       core::ProjectionLeaseId("command-fenced-candidate-lease"));
   ASSERT_TRUE(candidate_lease.ok()) << candidate_lease.error().message;
-  const auto candidate_frame = projection->ResolveSceneFrame(
-      core::SceneFrameResolutionQueryDTO{
+  const auto candidate_frame =
+      projection->ResolveSceneFrame(core::SceneFrameResolutionQueryDTO{
           core::CellSceneFrameRefDTO{core::CellId(std::string(cell_id))},
           candidate_lease.value().projection_binding});
   ASSERT_FALSE(candidate_frame.ok());

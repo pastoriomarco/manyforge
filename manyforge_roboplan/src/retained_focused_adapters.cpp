@@ -525,6 +525,9 @@ RoboPlanTrajectoryValidator::validate_non_collision(
   };
 
   constexpr double kLimitTolerance = 1e-8;
+  std::vector<double> peak_joint_velocity(trajectory.joint_names.size(), 0.0);
+  std::vector<double> peak_joint_acceleration(trajectory.joint_names.size(), 0.0);
+  bool joint_acceleration_measured = false;
   double previous_time = -1.0;
   for (std::size_t waypoint_index = 0;
        waypoint_index < trajectory.waypoints.size(); ++waypoint_index) {
@@ -610,6 +613,8 @@ RoboPlanTrajectoryValidator::validate_non_collision(
         }
         const double velocity_limit =
             velocity_limits_rad_s_[model_joint_index];
+        peak_joint_velocity[joint_index] =
+            std::max(peak_joint_velocity[joint_index], std::abs(velocity));
         if (std::abs(velocity) > velocity_limit + kLimitTolerance) {
           return validation_error(
               core::ErrorCode::kValidationLimitsViolation,
@@ -636,6 +641,9 @@ RoboPlanTrajectoryValidator::validate_non_collision(
         }
         const double acceleration_limit =
             acceleration_limits_rad_s2_[model_joint_index];
+        peak_joint_acceleration[joint_index] = std::max(
+            peak_joint_acceleration[joint_index], std::abs(acceleration));
+        joint_acceleration_measured = true;
         if (std::abs(acceleration) >
             acceleration_limit + kLimitTolerance) {
           return validation_error(
@@ -659,6 +667,8 @@ RoboPlanTrajectoryValidator::validate_non_collision(
         const double segment_velocity = delta / segment_duration;
         const double velocity_limit =
             velocity_limits_rad_s_[model_joint_index];
+        peak_joint_velocity[joint_index] = std::max(
+            peak_joint_velocity[joint_index], std::abs(segment_velocity));
         if (std::abs(segment_velocity) >
             velocity_limit + kLimitTolerance) {
           return validation_error(
@@ -689,6 +699,9 @@ RoboPlanTrajectoryValidator::validate_non_collision(
               acceleration_interval;
           const double acceleration_limit =
               acceleration_limits_rad_s2_[model_joint_index];
+          peak_joint_acceleration[joint_index] = std::max(
+              peak_joint_acceleration[joint_index], std::abs(acceleration));
+          joint_acceleration_measured = true;
           if (std::abs(acceleration) >
               acceleration_limit + kLimitTolerance) {
             return validation_error(
@@ -707,6 +720,7 @@ RoboPlanTrajectoryValidator::validate_non_collision(
     previous_time = waypoint.time_from_start_s;
   }
 
+  std::optional<double> peak_tcp_linear_speed_mps;
   if (options.max_tcp_linear_speed_mps > 0.0 &&
       !options.tcp_frame.empty() && trajectory.waypoints.size() >= 2) {
     const auto speed_started = std::chrono::steady_clock::now();
@@ -755,6 +769,7 @@ RoboPlanTrajectoryValidator::validate_non_collision(
         previous_position = tcp_position;
         have_previous = true;
       }
+      peak_tcp_linear_speed_mps = max_speed;
       if (max_speed >
           options.max_tcp_linear_speed_mps + kLimitTolerance) {
         const auto speed_duration_ns =
@@ -793,7 +808,13 @@ RoboPlanTrajectoryValidator::validate_non_collision(
     }
   }
 
-  return core::ValidationResultDTO{true, std::nullopt};
+  core::TrajectoryValidationMetricsDTO metrics{
+      trajectory.waypoints.back().time_from_start_s,
+      std::move(peak_joint_velocity),
+      joint_acceleration_measured ? std::move(peak_joint_acceleration)
+                                  : std::vector<double>{},
+      peak_tcp_linear_speed_mps};
+  return core::ValidationResultDTO{true, std::nullopt, std::move(metrics)};
 }
 
 core::Result<core::TrajectoryDTO>

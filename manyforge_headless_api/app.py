@@ -33,6 +33,8 @@ from .models import (
     ProgramModelAttemptRequest,
     ProgramRunStartRequest,
     ProgramRunStopRequest,
+    ProgramFullStopResetRequest,
+    ProgramFullStopResumeRequest,
     ProgramScenePreparationRequest,
     ProgramCycleResetRequest,
     CycleRecoveryActionRequest,
@@ -682,6 +684,42 @@ def create_app(
                 "Program-run identity in path and body must match",
             )
         return service.program_run_motion_stop(program_run_id, request)
+
+    @app.post("/api/program/runs/{program_run_id}/full-stop")
+    def program_run_full_stop(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        request: ProgramRunStopRequest,
+    ) -> dict[str, Any]:
+        if request.program_run_id != program_run_id:
+            raise HeadlessApiError(
+                "program_run_path_invalid",
+                "Program-run identity in path and body must match",
+            )
+        return service.program_run_full_stop(program_run_id, request)
+
+    @app.post("/api/program/runs/{program_run_id}/resume-full-stop")
+    def program_run_resume_full_stop(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        request: ProgramFullStopResumeRequest,
+    ) -> dict[str, Any]:
+        if request.program_run_id != program_run_id:
+            raise HeadlessApiError(
+                "program_run_path_invalid",
+                "Program-run identity in path and body must match",
+            )
+        return service.program_run_resume_full_stop(program_run_id, request)
+
+    @app.post("/api/program/runs/{program_run_id}/reset")
+    def program_run_reset_full_stop(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        request: ProgramFullStopResetRequest,
+    ) -> dict[str, Any]:
+        if request.program_run_id != program_run_id:
+            raise HeadlessApiError(
+                "program_run_path_invalid",
+                "Program-run identity in path and body must match",
+            )
+        return service.program_run_reset_full_stop(program_run_id, request)
 
     @app.get("/api/cycle/status")
     def program_cycle_status() -> dict[str, Any]:

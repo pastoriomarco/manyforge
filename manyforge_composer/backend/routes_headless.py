@@ -28,6 +28,8 @@ from manyforge_headless_api.models import (
     StopFaultRecoveryIntentRequest,
     ProgramRunStartRequest,
     ProgramRunStopRequest,
+    ProgramFullStopResetRequest,
+    ProgramFullStopResumeRequest,
     ProgramCycleResetRequest,
     CycleRecoveryActionRequest,
     ManualResultStageRequest,
@@ -472,6 +474,72 @@ def create_headless_router(
             )
         return _call(
             lambda: client.program_run_motion_stop(
+                program_run_id,
+                body.model_dump(mode="json"),
+            )
+        )
+
+    @router.post("/api/program/runs/{program_run_id}/full-stop")
+    def program_run_full_stop(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        body: ProgramRunStopRequest,
+    ) -> dict[str, Any]:
+        if body.program_run_id != program_run_id:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "program_run_path_invalid",
+                    "message": (
+                        "Program-run identity in path and body must match"
+                    ),
+                },
+            )
+        return _call(
+            lambda: client.program_run_full_stop(
+                program_run_id,
+                body.model_dump(mode="json"),
+            )
+        )
+
+    @router.post("/api/program/runs/{program_run_id}/resume-full-stop")
+    def program_run_resume_full_stop(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        body: ProgramFullStopResumeRequest,
+    ) -> dict[str, Any]:
+        if body.program_run_id != program_run_id:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "program_run_path_invalid",
+                    "message": (
+                        "Program-run identity in path and body must match"
+                    ),
+                },
+            )
+        return _call(
+            lambda: client.program_run_resume_full_stop(
+                program_run_id,
+                body.model_dump(mode="json"),
+            )
+        )
+
+    @router.post("/api/program/runs/{program_run_id}/reset")
+    def program_run_reset_full_stop(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        body: ProgramFullStopResetRequest,
+    ) -> dict[str, Any]:
+        if body.program_run_id != program_run_id:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "program_run_path_invalid",
+                    "message": (
+                        "Program-run identity in path and body must match"
+                    ),
+                },
+            )
+        return _call(
+            lambda: client.program_run_reset_full_stop(
                 program_run_id,
                 body.model_dump(mode="json"),
             )

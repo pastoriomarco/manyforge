@@ -413,6 +413,52 @@ def test_known_rejection_replays_and_unresolved_request_never_reexecutes(
     journal.close()
 
 
+def test_every_runtime_request_kind_survives_owner_restart(tmp_path) -> None:
+    path = tmp_path / "cycle.sqlite3"
+    journal = ProgramCycleJournal(path, owner_epoch="runner.1")
+    kinds = (
+        "start",
+        "reset",
+        "runtime_override_stage",
+        "runtime_override_activate",
+        "runtime_override_clear",
+        "runtime_override_promote",
+        "runtime_blackboard_write",
+        "manual_result_stage",
+        "recovery_action",
+        "resume_full_stop",
+        "discard_full_stop",
+    )
+    for index, kind in enumerate(kinds):
+        assert journal.record_request(
+            owner_epoch="operator.1",
+            request_id=f"request.{index}",
+            kind=kind,
+            intent={"kind": kind},
+            cycle_generation=1,
+        ).disposition == "new"
+    with pytest.raises(ValueError, match="kind is unsupported"):
+        journal.record_request(
+            owner_epoch="operator.1",
+            request_id="request.invalid",
+            kind="unknown_control",
+            intent={"kind": "unknown_control"},
+            cycle_generation=1,
+        )
+    journal.close()
+
+    restarted = ProgramCycleJournal(path, owner_epoch="runner.2")
+    for index, kind in enumerate(kinds):
+        assert restarted.record_request(
+            owner_epoch="operator.1",
+            request_id=f"request.{index}",
+            kind=kind,
+            intent={"kind": kind},
+            cycle_generation=1,
+        ).disposition == "in_progress"
+    restarted.close()
+
+
 def test_acquire_response_loss_is_durably_owner_unknown(tmp_path) -> None:
     path = tmp_path / "cycle.sqlite3"
     journal = ProgramCycleJournal(path, owner_epoch="runner.old")

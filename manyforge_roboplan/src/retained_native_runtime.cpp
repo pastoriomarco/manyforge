@@ -1,10 +1,11 @@
+#include "retained_native_runtime_internal.hpp"
 #include <algorithm>
 #include <cmath>
+#include <iterator>
 #include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
+#include <manyforge_core/motion_interrupt/stop_profile_mapper.hpp>
 #include <manyforge_roboplan/retained_native_runtime.hpp>
-#include "retained_native_runtime_internal.hpp"
-#include <iterator>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -279,6 +280,61 @@ retained_default_stop_limits(
   return result;
 }
 
+struct RetainedControlledStopProfiles final {
+  core::MotionInterruptStopProfileDTO operator_profile;
+  core::MotionInterruptStopProfileDTO fault_profile;
+};
+
+[[nodiscard]] std::optional<RetainedControlledStopProfiles>
+retained_controlled_stop_profiles(
+    const core::RuntimeParticipantBinding &binding,
+    const std::optional<core::RuntimeParticipantStopReadiness> &readiness) {
+  if (!readiness.has_value()) {
+    return std::nullopt;
+  }
+  const auto &stages =
+      readiness->value().resolved_stop_base_plan.escalation_stages;
+  const auto controlled =
+      std::find_if(stages.begin(), stages.end(), [](const auto &stage) {
+        return stage.containment_command.command_kind ==
+               core::StopContainmentCommandKind::kMotionControlledStop;
+      });
+  if (controlled == stages.end()) {
+    return std::nullopt;
+  }
+  if (std::count_if(
+          stages.begin(), stages.end(),
+          [](const auto &stage) {
+            return stage.containment_command.command_kind ==
+                   core::StopContainmentCommandKind::kMotionControlledStop;
+          }) != 1 ||
+      !controlled->default_contract_parameters.has_value()) {
+    throw std::invalid_argument(
+        "retained motion Stop plan has no single exact controlled profile");
+  }
+  auto decoded =
+      core::map_motion_controlled_stop_contract_parameters_to_profile(
+          *controlled->default_contract_parameters, binding.value().resources,
+          "operator_soft_on_path");
+  if (!decoded.ok()) {
+    throw std::invalid_argument(decoded.error().message);
+  }
+  auto operator_profile = std::move(decoded.value());
+  auto fault_profile = operator_profile;
+  fault_profile.profile_id = "fault_spring_back_hold";
+  fault_profile.stop_mode = core::MotionInterruptStopMode::kSpringBackHold;
+  fault_profile.allow_natural_completion_on_short_path = false;
+  fault_profile.recoverable_substitution_mode.reset();
+  if (const auto error =
+          core::motion_interrupt_stop_profile_field_error(fault_profile);
+      !error.empty()) {
+    throw std::invalid_argument("retained fault Stop profile is invalid: " +
+                                error);
+  }
+  return RetainedControlledStopProfiles{std::move(operator_profile),
+                                        std::move(fault_profile)};
+}
+
 [[nodiscard]] core::RuntimeParticipantExecutionRegistration
 runtime_registration(
     core::RuntimeParticipantBinding binding,
@@ -286,7 +342,11 @@ runtime_registration(
     core::IResolvedParticipantExecutionEngine *engine,
     core::IControlDomainExecutionPort *stop_execution_port,
     const std::optional<core::RuntimeParticipantPolicySelection>
-        &runtime_policy) {
+        &runtime_policy,
+    std::optional<core::MotionInterruptStopProfileDTO>
+        default_operator_stop_profile = std::nullopt,
+    std::optional<core::MotionInterruptStopProfileDTO>
+        default_fault_stop_profile = std::nullopt) {
   if (runtime_policy.has_value() &&
       (runtime_policy->value().controllable_component_id !=
            binding.value().controllable_component_id ||
@@ -294,6 +354,22 @@ runtime_registration(
            binding.value().command_target_id)) {
     throw std::invalid_argument(
         "runtime policy selection crosses its participant binding");
+  }
+  if (const auto retained_profiles =
+          retained_controlled_stop_profiles(binding, readiness);
+      retained_profiles.has_value()) {
+    if (default_operator_stop_profile.has_value() &&
+        *default_operator_stop_profile != retained_profiles->operator_profile) {
+      throw std::invalid_argument(
+          "runtime operator Stop profile differs from retained Stop authority");
+    }
+    if (default_fault_stop_profile.has_value() &&
+        *default_fault_stop_profile != retained_profiles->fault_profile) {
+      throw std::invalid_argument(
+          "runtime fault Stop profile differs from retained Stop authority");
+    }
+    default_operator_stop_profile = retained_profiles->operator_profile;
+    default_fault_stop_profile = retained_profiles->fault_profile;
   }
   auto defaults = retained_default_stop_limits(binding, readiness);
   return core::RuntimeParticipantExecutionRegistration{
@@ -304,8 +380,9 @@ runtime_registration(
       engine,
       stop_execution_port,
       runtime_policy,
-      dynamic_cast<core::IResolvedPreparedParticipantExecutionEngine *>(
-          engine)};
+      dynamic_cast<core::IResolvedPreparedParticipantExecutionEngine *>(engine),
+      std::move(default_operator_stop_profile),
+      std::move(default_fault_stop_profile)};
 }
 
 [[nodiscard]] std::optional<core::RuntimeParticipantPolicySelection>
@@ -743,10 +820,11 @@ make_kernel_participant_resolver(
     }
     try {
       return core::Result<core::RuntimeParticipantExecutionRegistration>::Ok(
-          runtime_registration(std::move(binding.value()),
-                               physical->stop_readiness, physical->engine,
-                               physical->stop_execution_port,
-                               physical->runtime_policy));
+          runtime_registration(
+              std::move(binding.value()), physical->stop_readiness,
+              physical->engine, physical->stop_execution_port,
+              physical->runtime_policy, physical->default_operator_stop_profile,
+              physical->default_fault_stop_profile));
     } catch (const std::exception &exception) {
       return route_publication_error<
           core::RuntimeParticipantExecutionRegistration>(
@@ -776,8 +854,8 @@ create_retained_native_runtime_participants(
     std::shared_ptr<WallClock> shared_clock,
     std::shared_ptr<SimpleScheduler> shared_scheduler) {
   if ((shared_clock == nullptr) != (shared_scheduler == nullptr)) {
-    throw std::invalid_argument(
-        "native runtime clock and scheduler capabilities must be supplied together");
+    throw std::invalid_argument("native runtime clock and scheduler "
+                                "capabilities must be supplied together");
   }
   if (!input.scene || !input.scene_mutex || !input.state_projector ||
       !input.collision_publisher || !input.planner ||
@@ -796,6 +874,33 @@ create_retained_native_runtime_participants(
             [](const double value) { return !std::isfinite(value); })))) {
     throw std::invalid_argument(
         "native runtime composition input is incomplete or unbounded");
+  }
+  const auto controlled_stop_profiles = retained_controlled_stop_profiles(
+      input.motion_binding, input.motion_stop_readiness);
+  std::optional<core::MotionInterruptStopProfileDTO>
+      motion_operator_stop_profile;
+  std::optional<core::MotionInterruptStopProfileDTO> motion_fault_stop_profile;
+  if (controlled_stop_profiles.has_value()) {
+    if (config.kernel.operator_stop_profile &&
+        *config.kernel.operator_stop_profile !=
+            controlled_stop_profiles->operator_profile) {
+      throw std::invalid_argument(
+          "Kernel operator Stop profile differs from retained Stop authority");
+    }
+    if (config.kernel.default_fault_stop_profile &&
+        *config.kernel.default_fault_stop_profile !=
+            controlled_stop_profiles->fault_profile) {
+      throw std::invalid_argument(
+          "Kernel fault Stop profile differs from retained Stop authority");
+    }
+    config.kernel.operator_stop_profile =
+        std::make_shared<core::MotionInterruptStopProfileDTO>(
+            controlled_stop_profiles->operator_profile);
+    config.kernel.default_fault_stop_profile =
+        std::make_shared<core::MotionInterruptStopProfileDTO>(
+            controlled_stop_profiles->fault_profile);
+    motion_operator_stop_profile = controlled_stop_profiles->operator_profile;
+    motion_fault_stop_profile = controlled_stop_profiles->fault_profile;
   }
   const auto current_inventory =
       input.collision_publisher->current_scene_snapshot_lease_inventory();
@@ -841,12 +946,11 @@ create_retained_native_runtime_participants(
                same_backend_owner(*input.gripper_binding, candidate));
   };
   const auto contains_exact_representative = [&](const auto &binding) {
-    return std::count_if(
-               input.control_binding_representatives.begin(),
-               input.control_binding_representatives.end(),
-               [&](const auto &candidate) {
-                 return candidate.value() == binding.value();
-               }) == 1;
+    return std::count_if(input.control_binding_representatives.begin(),
+                         input.control_binding_representatives.end(),
+                         [&](const auto &candidate) {
+                           return candidate.value() == binding.value();
+                         }) == 1;
   };
   if (registration_count > core::kMaxOperationParticipants ||
       input.control_binding_representatives.size() >
@@ -911,9 +1015,16 @@ create_retained_native_runtime_participants(
                           projection_revision);
 
   std::optional<core::RuntimeParticipantPolicySelection> motion_runtime_policy;
+  if (input.runtime_policy.has_value() !=
+      input.runtime_policy_source_artifact.has_value()) {
+    throw std::invalid_argument(
+        "native runtime policy value and source artifact must be retained "
+        "together");
+  }
   if (input.runtime_policy.has_value()) {
     auto sealed = core::verify_runtime_participant_policy_selection(
-        *input.runtime_policy, input.motion_binding);
+        *input.runtime_policy_source_artifact, *input.runtime_policy,
+        input.motion_binding);
     if (!sealed.ok()) {
       throw std::invalid_argument(
           "native runtime policy does not seal against the exact motion "
@@ -929,6 +1040,8 @@ create_retained_native_runtime_participants(
   runtime->gripper_binding_aliases = std::move(input.gripper_binding_aliases);
   runtime->control_binding_representatives =
       std::move(input.control_binding_representatives);
+  runtime->motion_operator_stop_profile = motion_operator_stop_profile;
+  runtime->motion_fault_stop_profile = motion_fault_stop_profile;
   runtime->participant_resolver_factory =
       std::move(input.participant_resolver_factory);
   runtime->scene = std::move(input.scene);
@@ -1019,30 +1132,26 @@ create_retained_native_runtime_participants(
         *runtime->clock, *runtime->scheduler);
     runtime->execution = std::move(selected.execution);
     runtime->gripper = std::move(selected.gripper);
-    runtime->gripper_stop_execution_port =
-        selected.gripper_stop_execution_port;
-    runtime->rebind_motion_route =
-        std::move(selected.rebind_motion_route);
-    runtime->rebind_gripper_route =
-        std::move(selected.rebind_gripper_route);
+    runtime->gripper_stop_execution_port = selected.gripper_stop_execution_port;
+    runtime->rebind_motion_route = std::move(selected.rebind_motion_route);
+    runtime->rebind_gripper_route = std::move(selected.rebind_gripper_route);
   } else {
     auto native_execution = std::make_shared<RoboPlanExecutionBackend>(
         runtime->motion_binding, runtime->motion_state_channel, *runtime->clock,
         *runtime->scheduler, std::move(config.execution));
     runtime->execution = native_execution;
     runtime->rebind_motion_route =
-        [native_execution](core::RuntimeParticipantBinding binding,
-                           std::vector<core::RuntimeParticipantBinding>
-                               program_aliases) {
+        [native_execution](
+            core::RuntimeParticipantBinding binding,
+            std::vector<core::RuntimeParticipantBinding> program_aliases) {
           return native_execution->RebindRoute(std::move(binding),
                                                std::move(program_aliases));
         };
     if (runtime->gripper_binding.has_value()) {
-      auto native_gripper =
-          std::make_shared<RetainedGripperCommandBackend>(
-              *runtime->gripper_binding, runtime->gripper_state_channel,
-              runtime->gripper_position_limits, *runtime->clock,
-              *runtime->scheduler, config.gripper_update_period_ns);
+      auto native_gripper = std::make_shared<RetainedGripperCommandBackend>(
+          *runtime->gripper_binding, runtime->gripper_state_channel,
+          runtime->gripper_position_limits, *runtime->clock,
+          *runtime->scheduler, config.gripper_update_period_ns);
       runtime->gripper = native_gripper;
       runtime->gripper_stop_execution_port = native_gripper.get();
       runtime->rebind_gripper_route =
@@ -1160,8 +1269,7 @@ create_retained_native_runtime_participants(
   registrations.reserve(runtime->control_binding_representatives.size() +
                         runtime->motion_binding_aliases.size() +
                         runtime->gripper_binding_aliases.size());
-  for (const auto &representative :
-       runtime->control_binding_representatives) {
+  for (const auto &representative : runtime->control_binding_representatives) {
     const bool motion_owner =
         same_backend_owner(runtime->motion_binding, representative);
     const bool primary = representative.value() ==
@@ -1177,12 +1285,17 @@ create_retained_native_runtime_participants(
                            runtime->execution.get())
                      : runtime->gripper_stop_execution_port,
         representative_runtime_policy(primary, motion_owner,
-                                      motion_runtime_policy)));
+                                      motion_runtime_policy),
+        motion_owner ? motion_operator_stop_profile
+                     : std::optional<core::MotionInterruptStopProfileDTO>{},
+        motion_owner ? motion_fault_stop_profile
+                     : std::optional<core::MotionInterruptStopProfileDTO>{}));
   }
   for (const auto &alias : runtime->motion_binding_aliases) {
     registrations.push_back(runtime_registration(
         alias, input.motion_stop_readiness, runtime->participant_engine.get(),
-        runtime->execution.get(), motion_runtime_policy));
+        runtime->execution.get(), motion_runtime_policy,
+        motion_operator_stop_profile, motion_fault_stop_profile));
   }
   for (const auto &alias : runtime->gripper_binding_aliases) {
     registrations.push_back(runtime_registration(
@@ -1191,15 +1304,15 @@ create_retained_native_runtime_participants(
   }
   std::vector<core::RuntimeParticipantExecutionRegistration>
       physical_registrations;
-  physical_registrations.push_back(
-      runtime_registration(runtime->motion_binding, input.motion_stop_readiness,
-                           runtime->participant_engine.get(),
-                           runtime->execution.get(), motion_runtime_policy));
+  physical_registrations.push_back(runtime_registration(
+      runtime->motion_binding, input.motion_stop_readiness,
+      runtime->participant_engine.get(), runtime->execution.get(),
+      motion_runtime_policy, motion_operator_stop_profile,
+      motion_fault_stop_profile));
   if (runtime->gripper_binding.has_value()) {
     physical_registrations.push_back(runtime_registration(
         *runtime->gripper_binding, input.gripper_stop_readiness,
-        runtime->participant_engine.get(),
-        runtime->gripper_stop_execution_port,
+        runtime->participant_engine.get(), runtime->gripper_stop_execution_port,
         std::nullopt));
   }
   auto binding_resolver = std::move(input.participant_resolver);
@@ -1511,8 +1624,7 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
                        control_binding_representatives.end(),
                        [&](const auto &candidate) {
                          return represents_binding(
-                             candidate,
-                             value.control_path->control_binding_id,
+                             candidate, value.control_path->control_binding_id,
                              value.control_path->control_binding_revision);
                        }) != control_binding_representatives.end()) {
         return route_publication_error<
@@ -1520,11 +1632,9 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
             "route_publication_physical_binding_mismatch",
             "route readiness participant has no sole control representative");
       }
-      const bool primary_motion =
-          current->value() == motion_binding.value();
-      const bool primary_gripper =
-          gripper_binding.has_value() &&
-          current->value() == gripper_binding->value();
+      const bool primary_motion = current->value() == motion_binding.value();
+      const bool primary_gripper = gripper_binding.has_value() &&
+                                   current->value() == gripper_binding->value();
       const auto index = static_cast<std::size_t>(
           std::distance(control_binding_representatives.begin(), current));
       if (primary_motion) {
@@ -1534,8 +1644,7 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
       }
       readiness_by_binding.at(value.control_path->control_binding_id) =
           std::move(participant.stop_readiness);
-      next_representatives[index] =
-          std::move(participant.participant_binding);
+      next_representatives[index] = std::move(participant.participant_binding);
     }
     if (supplied_bindings.size() != configuration.binding_routes.size() ||
         std::any_of(configuration.binding_routes.begin(),
@@ -1588,7 +1697,8 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
         physical_registrations;
     physical_registrations.push_back(runtime_registration(
         next_motion, motion_readiness, participant_engine.get(),
-        execution.get(), motion_runtime_policy));
+        execution.get(), motion_runtime_policy, motion_operator_stop_profile,
+        motion_fault_stop_profile));
     if (next_gripper.has_value()) {
       physical_registrations.push_back(runtime_registration(
           *next_gripper, gripper_readiness, participant_engine.get(),
@@ -1599,8 +1709,7 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
                           next_motion_aliases.size() +
                           next_gripper_aliases.size());
     for (const auto &representative : next_representatives) {
-      const bool motion_owner =
-          same_backend_owner(next_motion, representative);
+      const bool motion_owner = same_backend_owner(next_motion, representative);
       const bool gripper_owner =
           next_gripper.has_value() &&
           same_backend_owner(*next_gripper, representative);
@@ -1620,12 +1729,17 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
                              execution.get())
                        : gripper_stop_execution_port,
           representative_runtime_policy(primary, motion_owner,
-                                        motion_runtime_policy)));
+                                        motion_runtime_policy),
+          motion_owner ? motion_operator_stop_profile
+                       : std::optional<core::MotionInterruptStopProfileDTO>{},
+          motion_owner ? motion_fault_stop_profile
+                       : std::optional<core::MotionInterruptStopProfileDTO>{}));
     }
     for (const auto &alias : next_motion_aliases) {
       registrations.push_back(runtime_registration(
           alias, motion_readiness, participant_engine.get(), execution.get(),
-          motion_runtime_policy));
+          motion_runtime_policy, motion_operator_stop_profile,
+          motion_fault_stop_profile));
     }
     for (const auto &alias : next_gripper_aliases) {
       registrations.push_back(runtime_registration(
@@ -1668,15 +1782,15 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
         if (gripper_rebound && old_gripper.has_value() && gripper != nullptr) {
           const auto now_ns = clock->now();
           if (gripper_state_channel->RebindRoute(*old_gripper, now_ns).ok()) {
-            static_cast<void>(rebind_gripper_route(*old_gripper,
-                                                   gripper_state_channel));
+            static_cast<void>(
+                rebind_gripper_route(*old_gripper, gripper_state_channel));
           }
         }
         if (motion_rebound && execution != nullptr) {
           const auto now_ns = clock->now();
           if (motion_state_channel->RebindRoute(old_motion, now_ns).ok()) {
-            static_cast<void>(rebind_motion_route(old_motion,
-                                                  motion_binding_aliases));
+            static_cast<void>(
+                rebind_motion_route(old_motion, motion_binding_aliases));
           }
         }
       } catch (...) {
@@ -1724,8 +1838,7 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
             rebound.error().message);
       }
       gripper_rebound = true;
-      rebound =
-          rebind_gripper_route(*next_gripper, gripper_state_channel);
+      rebound = rebind_gripper_route(*next_gripper, gripper_state_channel);
       if (!rebound.ok()) {
         rollback_physical_route();
         return route_publication_error<
@@ -1873,8 +1986,8 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
         current != nullptr) {
       motion_runtime_policy = current->runtime_policy;
     }
-    for (std::size_t index = 0U;
-         index < control_binding_representatives.size(); ++index) {
+    for (std::size_t index = 0U; index < control_binding_representatives.size();
+         ++index) {
       const auto &representative = control_binding_representatives[index];
       const auto *current = current_registration(representative);
       if (current == nullptr ||
@@ -1935,7 +2048,8 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
         physical_registrations;
     physical_registrations.push_back(runtime_registration(
         next_motion, motion_readiness, participant_engine.get(),
-        execution.get(), motion_runtime_policy));
+        execution.get(), motion_runtime_policy, motion_operator_stop_profile,
+        motion_fault_stop_profile));
     if (next_gripper.has_value()) {
       physical_registrations.push_back(runtime_registration(
           *next_gripper, gripper_readiness, participant_engine.get(),
@@ -1946,8 +2060,7 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
                           next_motion_aliases.size() +
                           next_gripper_aliases.size());
     for (const auto &representative : next_representatives) {
-      const bool motion_owner =
-          same_backend_owner(next_motion, representative);
+      const bool motion_owner = same_backend_owner(next_motion, representative);
       const bool gripper_owner =
           next_gripper.has_value() &&
           same_backend_owner(*next_gripper, representative);
@@ -1967,12 +2080,17 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
                              execution.get())
                        : gripper_stop_execution_port,
           representative_runtime_policy(primary, motion_owner,
-                                        motion_runtime_policy)));
+                                        motion_runtime_policy),
+          motion_owner ? motion_operator_stop_profile
+                       : std::optional<core::MotionInterruptStopProfileDTO>{},
+          motion_owner ? motion_fault_stop_profile
+                       : std::optional<core::MotionInterruptStopProfileDTO>{}));
     }
     for (const auto &alias : next_motion_aliases) {
       registrations.push_back(runtime_registration(
           alias, motion_readiness, participant_engine.get(), execution.get(),
-          motion_runtime_policy));
+          motion_runtime_policy, motion_operator_stop_profile,
+          motion_fault_stop_profile));
     }
     for (const auto &alias : next_gripper_aliases) {
       registrations.push_back(runtime_registration(
@@ -2015,15 +2133,15 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
             gripper_state_channel != nullptr) {
           const auto now_ns = clock->now();
           if (gripper_state_channel->RebindRoute(*old_gripper, now_ns).ok()) {
-            static_cast<void>(rebind_gripper_route(*old_gripper,
-                                                   gripper_state_channel));
+            static_cast<void>(
+                rebind_gripper_route(*old_gripper, gripper_state_channel));
           }
         }
         if (motion_rebound) {
           const auto now_ns = clock->now();
           if (motion_state_channel->RebindRoute(old_motion, now_ns).ok()) {
-            static_cast<void>(rebind_motion_route(old_motion,
-                                                  motion_binding_aliases));
+            static_cast<void>(
+                rebind_motion_route(old_motion, motion_binding_aliases));
           }
         }
       } catch (...) {
@@ -2063,8 +2181,7 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
             rebound.error());
       }
       gripper_rebound = true;
-      rebound =
-          rebind_gripper_route(*next_gripper, gripper_state_channel);
+      rebound = rebind_gripper_route(*next_gripper, gripper_state_channel);
       if (!rebound.ok()) {
         rollback();
         return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
@@ -2203,16 +2320,14 @@ build_retained_native_stop_recovery_facts(
         "native Stop recovery owner is unavailable",
         {{"reason", "native_stop_recovery_owner_unavailable"}}});
   }
-  auto facts =
-      runtime.stop_surveillance_owner->BuildRecoveryFacts(status,
-                                                          assessed_at_ns);
+  auto facts = runtime.stop_surveillance_owner->BuildRecoveryFacts(
+      status, assessed_at_ns);
   if (!facts.ok())
     return facts;
   const auto &latch = *status.fault_latch;
   for (const auto &slot : addressed_kernel.resource_snapshot()) {
     if (!std::binary_search(latch.captured_resources.begin(),
-                            latch.captured_resources.end(),
-                            slot.resource_id)) {
+                            latch.captured_resources.end(), slot.resource_id)) {
       continue;
     }
     const bool unresolved =
@@ -2237,8 +2352,7 @@ build_retained_native_stop_recovery_facts(
   auto &blocked = facts.value().fenced_or_orphan_resources;
   std::sort(blocked.begin(), blocked.end());
   blocked.erase(std::unique(blocked.begin(), blocked.end()), blocked.end());
-  if (core::stop_fault_recovery_facts_field_error(facts.value())
-          .has_value()) {
+  if (core::stop_fault_recovery_facts_field_error(facts.value()).has_value()) {
     return core::Result<core::StopFaultRecoveryFactsDTO>::Err(core::ErrorDTO{
         std::string(core::to_string(core::ErrorCode::kInvariantViolation)),
         "native Stop recovery facts failed Kernel blocker join",
@@ -2296,13 +2410,16 @@ void attach_retained_native_addressed_owner(
           status, assessed_at_ns);
     };
     core::ResourceAddressedExecutionKernelConfig addressed_config{
-        std::move(config.request_owner_epoch), kernel_cell_id,
+        std::move(config.request_owner_epoch),
+        kernel_cell_id,
         config.request_replay_capacity,
         std::move(runtime->participant_resolver),
         config.operation_admission_gate,
         std::move(config.graph_revision),
         std::move(config.cell_stop_deadline_budget),
-        core::kMaximumEmergencyStopCorrelationEntries, 0U, 0U,
+        core::kMaximumEmergencyStopCorrelationEntries,
+        0U,
+        0U,
         std::move(stop_surveillance_config),
         std::move(recovery_facts_resolver)};
     addressed_config.cell_admission_claim_capacity = 1024U;

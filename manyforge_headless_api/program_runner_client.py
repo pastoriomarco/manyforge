@@ -53,6 +53,24 @@ class ProgramRunnerPort(Protocol):
         body: Mapping[str, Any],
     ) -> dict[str, Any]: ...
 
+    def full_stop(
+        self,
+        program_run_id: str,
+        body: Mapping[str, Any],
+    ) -> dict[str, Any]: ...
+
+    def resume_full_stop(
+        self,
+        program_run_id: str,
+        body: Mapping[str, Any],
+    ) -> dict[str, Any]: ...
+
+    def discard_full_stop(
+        self,
+        program_run_id: str,
+        body: Mapping[str, Any],
+    ) -> dict[str, Any]: ...
+
     def cycle_status(self) -> dict[str, Any]: ...
 
     def reset_cycle(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
@@ -238,6 +256,39 @@ class ProgramRunnerHttpClient:
         return self._request(
             "POST",
             f"{self._run_path(program_run_id)}/motion-stop",
+            body=body,
+        )
+
+    def full_stop(
+        self,
+        program_run_id: str,
+        body: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"{self._run_path(program_run_id)}/full-stop",
+            body=body,
+        )
+
+    def resume_full_stop(
+        self,
+        program_run_id: str,
+        body: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"{self._run_path(program_run_id)}/resume-full-stop",
+            body=body,
+        )
+
+    def discard_full_stop(
+        self,
+        program_run_id: str,
+        body: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"{self._run_path(program_run_id)}/discard-full-stop",
             body=body,
         )
 

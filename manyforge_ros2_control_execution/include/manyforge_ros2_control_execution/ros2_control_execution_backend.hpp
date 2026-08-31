@@ -201,9 +201,9 @@ public:
   struct DeferredRosExecutorStartTag {};
   using ObservedRobotStatePublishWriter =
       std::function<core::ObservedRobotStatePublishResult(
-          core::ObservedRobotStateSourceKind,
-          std::span<const std::string>, std::span<const double>,
-          std::span<const double>, std::int64_t, std::int64_t)>;
+          core::ObservedRobotStateSourceKind, std::span<const std::string>,
+          std::span<const double>, std::span<const double>, std::int64_t,
+          std::int64_t)>;
 
   Ros2ControlExecutionBackend(
       std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
@@ -517,9 +517,9 @@ public:
         [this](std::int64_t timeout_ns) {
           std::unique_lock<std::mutex> lock(execution_mutex_);
           if (timeout_ns > 0) {
-            return execution_cv_.wait_for(
-                lock, std::chrono::nanoseconds(timeout_ns),
-                [this]() { return terminal_; });
+            return execution_cv_.wait_for(lock,
+                                          std::chrono::nanoseconds(timeout_ns),
+                                          [this]() { return terminal_; });
           }
           return terminal_;
         },
@@ -532,30 +532,29 @@ public:
     prepared_goals_.erase(stage.controller_goal_id);
     prepared_goals_.emplace(
         stage.controller_goal_id,
-        PreparedGoalRecord{
-            stage.controller_goal_generation,
-            std::move(prepared_contract_digest),
-            stage.operation_id,
-            stage.operation_revision,
-            stage.participant_id,
-            stage.controllable_component_id,
-            stage.command_target_id,
-            stage.capability_id,
-            stage.control_domain_id,
-            stage.control_domain_revision,
-            stage.control_binding_id,
-            stage.control_binding_revision,
-            stage.controller_topology_id,
-            stage.topology_revision,
-            stage.control_route_id,
-            stage.active_control_configuration_id,
-            stage.active_control_configuration_generation,
-            stage.provider_runtime_epoch,
-            stage.resources,
-            stage.stop_evidence_policy_id,
-            stage.stop_evidence_policy_revision,
-            {stage.participant_stop_plan},
-            std::move(handle)});
+        PreparedGoalRecord{stage.controller_goal_generation,
+                           std::move(prepared_contract_digest),
+                           stage.operation_id,
+                           stage.operation_revision,
+                           stage.participant_id,
+                           stage.controllable_component_id,
+                           stage.command_target_id,
+                           stage.capability_id,
+                           stage.control_domain_id,
+                           stage.control_domain_revision,
+                           stage.control_binding_id,
+                           stage.control_binding_revision,
+                           stage.controller_topology_id,
+                           stage.topology_revision,
+                           stage.control_route_id,
+                           stage.active_control_configuration_id,
+                           stage.active_control_configuration_generation,
+                           stage.provider_runtime_epoch,
+                           stage.resources,
+                           stage.stop_evidence_policy_id,
+                           stage.stop_evidence_policy_revision,
+                           {stage.participant_stop_plan},
+                           std::move(handle)});
   }
 
   void testing_store_action_feedback_sample(
@@ -674,8 +673,7 @@ public:
   }
 
   bool testing_publish_observed_metadata_for_generation(
-      core::ExecutionState state,
-      std::uint64_t expected_running_generation) {
+      core::ExecutionState state, std::uint64_t expected_running_generation) {
     return publish_observed_metadata(state, 0.0, std::nullopt,
                                      expected_running_generation);
   }
@@ -872,6 +870,9 @@ private:
   core::StopResultDTO stop_if_running_generation(
       std::optional<std::uint64_t> expected_running_generation,
       bool observe_software_hard_issue = false);
+  core::ControlledStopResultDTO execute_controlled_stop_impl(
+      const core::MotionInterruptStopProfileDTO &profile,
+      std::stop_token stop_token);
   core::ExecutionHandle
   dispatch_prepared(const core::PreparedOperationParticipantDTO &participant,
                     const core::ControllerGoalId &controller_goal_id,
@@ -892,13 +893,12 @@ private:
                                std::int64_t source_timestamp_ns,
                                std::int64_t received_timestamp_ns) noexcept;
   [[nodiscard]] core::ObservedRobotStatePublishResult
-  publish_addressed_state(
-      core::ObservedRobotStateSourceKind source,
-      std::span<const std::string> source_joint_names,
-      std::span<const double> positions,
-      std::span<const double> velocities,
-      std::int64_t source_timestamp_ns,
-      std::int64_t received_timestamp_ns) noexcept;
+  publish_addressed_state(core::ObservedRobotStateSourceKind source,
+                          std::span<const std::string> source_joint_names,
+                          std::span<const double> positions,
+                          std::span<const double> velocities,
+                          std::int64_t source_timestamp_ns,
+                          std::int64_t received_timestamp_ns) noexcept;
   core::ObservedRobotStatePublishResult publish_authored_robot_state(
       std::span<const double> positions, std::span<const double> velocities,
       std::int64_t source_timestamp_ns,
@@ -1377,9 +1377,9 @@ private:
   void
   on_managed_fjt_terminal_result(const GoalHandleFJT::WrappedResult &result,
                                  std::uint64_t generation);
-  void observe_stop_qualification(
-      detail::Ros2ControlStopQualificationEvent event,
-      std::string_view detail_text) const;
+  void
+  observe_stop_qualification(detail::Ros2ControlStopQualificationEvent event,
+                             std::string_view detail_text) const;
 
   mutable std::mutex managed_fjt_mutex_;
   std::condition_variable_any managed_fjt_cv_;

@@ -100,7 +100,8 @@ class SqliteOperationJournal final : public IOperationJournal {
 
   [[nodiscard]] Result<std::uint64_t> RecordOperationState(
       const RequestOwnerEpoch& owner_epoch, const OperationStateDTO& state,
-      const RuntimeScaleStatusDTO* scale_status, const char* transition_reason) override;
+      const RuntimeScaleStatusDTO* scale_status, const char* transition_reason,
+      std::span<const PreparedMotionDiagnosticsDTO> prepared_motion_diagnostics = {}) override;
 
   [[nodiscard]] Result<std::uint64_t> RecordCellAdmissionClaimAcquired(
       const RequestOwnerEpoch& owner_epoch, const CellAdmissionClaimDTO& claim) override;

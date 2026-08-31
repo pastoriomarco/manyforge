@@ -9,6 +9,7 @@
 #include <manyforge_component_manager/durable_store_set.hpp>
 #include <manyforge_core/build_owned_lifecycle_plan_catalog_source.hpp>
 #include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
+#include <manyforge_core/motion_interrupt/stop_profile_mapper.hpp>
 #include <manyforge_core/prepared_operation_participant_codec.hpp>
 #include <manyforge_core/prepared_participant_stop_plan_codec.hpp>
 #include <manyforge_core/resource_addressed_execution_kernel.hpp>
@@ -428,8 +429,8 @@ class KernelPorts final : public core::ICCLCKernelDisableHandoffPort,
                           public core::ICCLCKernelRouteConfigurationFencePort,
                           public core::IKernelCellAdmissionPort {
 public:
-  [[nodiscard]] core::AuthoringAdmissionDTO GetAuthoringAdmission()
-      const override {
+  [[nodiscard]] core::AuthoringAdmissionDTO
+  GetAuthoringAdmission() const override {
     return {true, core::AdmissionGeneration(7U)};
   }
   [[nodiscard]] core::Result<core::AuthoringAdmissionDTO>
@@ -862,6 +863,12 @@ public:
     return execute_count_;
   }
 
+  [[nodiscard]] std::shared_ptr<const core::PreparedOperationParticipantDTO>
+  prepared_participant() const noexcept {
+    return prepared_snapshot_.has_value() ? prepared_snapshot_->participant
+                                          : nullptr;
+  }
+
 private:
   template <typename Value>
   [[nodiscard]] static core::Result<Value> Unsupported() {
@@ -1026,11 +1033,17 @@ private:
         {std::move(planning_result), 0U,
          request.binding.planner_capability_binding},
         {ValidationRevision("validation.native.readiness"),
-         ValidationResultDTO{true, std::nullopt}, world,
+         ValidationResultDTO{
+             true, std::nullopt,
+             TrajectoryValidationMetricsDTO{
+                 trajectory.waypoints.back().time_from_start_s,
+                 std::vector<double>(trajectory.joint_names.size(), 0.5),
+                 std::vector<double>(trajectory.joint_names.size(), 0.0), 0.1}},
+         world,
          CollisionPolicyRevision{1U, Sha('d')}, decision},
         std::move(contact_policy),
-        {authority.runtime_policy.value().policy.runtime_policy_id,
-         authority.runtime_policy.value().policy.runtime_policy_revision},
+        {authority.runtime_policy.value().source_artifact,
+         authority.runtime_policy.value().selected_motion_speed_limit},
         std::move(scopes),
         request.timeouts.execution_timeout_s};
 
@@ -1091,7 +1104,11 @@ private:
         control.stop_evidence_policy_id,
         control.stop_evidence_policy_revision,
         *authority.ordinary_stop_plan,
-        std::move(payload)};
+        std::move(payload),
+        authority.fault_stop_plan
+            ? std::optional<
+                  PreparedParticipantStopPlanDTO>{*authority.fault_stop_plan}
+            : std::nullopt};
     return MakePreparedOperationParticipant(
         std::move(candidate), authority.binding, authority.stop_readiness,
         &authority.runtime_policy, authority.retained_default_stop_limits,
@@ -1111,13 +1128,16 @@ private:
 class PublicationOwner final
     : public deployment::IRouteConfigurationKernelPublicationOwner {
 public:
-  PublicationOwner(core::RuntimeParticipantBinding binding,
-                   std::filesystem::path journal_path, core::CellId cell_id,
-                   core::FakeClock &clock,
-                   core::RuntimePolicyDTO runtime_policy)
+  PublicationOwner(
+      core::RuntimeParticipantBinding binding,
+      std::filesystem::path journal_path, core::CellId cell_id,
+      core::FakeClock &clock, core::RuntimePolicyDTO runtime_policy,
+      core::RuntimePolicyCatalogRecordRefDTO runtime_policy_source_artifact)
       : binding_(std::move(binding)), journal_path_(std::move(journal_path)),
         cell_id_(std::move(cell_id)), clock_(clock),
-        runtime_policy_(std::move(runtime_policy)) {}
+        runtime_policy_(std::move(runtime_policy)),
+        runtime_policy_source_artifact_(
+            std::move(runtime_policy_source_artifact)) {}
 
   [[nodiscard]] core::Result<std::vector<core::RuntimeParticipantBinding>>
   ReadCurrentPhysicalParticipants(
@@ -1151,11 +1171,41 @@ public:
       }
     }
     auto runtime_policy = core::verify_runtime_participant_policy_selection(
-        runtime_policy_, participants.front().participant_binding);
+        runtime_policy_source_artifact_, runtime_policy_,
+        participants.front().participant_binding);
     if (!runtime_policy.ok()) {
       return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
           runtime_policy.error());
     }
+    const auto &base_plan =
+        participants.front().stop_readiness.value().resolved_stop_base_plan;
+    const auto controlled = std::find_if(
+        base_plan.escalation_stages.begin(), base_plan.escalation_stages.end(),
+        [](const auto &stage) {
+          return stage.containment_command.command_kind ==
+                 core::StopContainmentCommandKind::kMotionControlledStop;
+        });
+    if (controlled == base_plan.escalation_stages.end() ||
+        !controlled->default_contract_parameters.has_value()) {
+      return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
+          {"invalid_fixture",
+           "retained CCLC fixture has no exact controlled Stop profile",
+           {}});
+    }
+    auto operator_profile =
+        core::map_motion_controlled_stop_contract_parameters_to_profile(
+            *controlled->default_contract_parameters,
+            participants.front().participant_binding.value().resources,
+            "operator_soft_on_path");
+    if (!operator_profile.ok()) {
+      return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
+          operator_profile.error());
+    }
+    auto fault_profile = operator_profile.value();
+    fault_profile.profile_id = "fault_spring_back_hold";
+    fault_profile.stop_mode = core::MotionInterruptStopMode::kSpringBackHold;
+    fault_profile.allow_natural_completion_on_short_path = false;
+    fault_profile.recoverable_substitution_mode.reset();
     core::RuntimeParticipantExecutionRegistration registration{
         participants.front().participant_binding,
         participants.front().stop_readiness,
@@ -1164,7 +1214,9 @@ public:
         &engine_,
         &engine_,
         std::move(runtime_policy.value()),
-        &engine_};
+        &engine_,
+        std::move(operator_profile.value()),
+        std::move(fault_profile)};
     if (kernel_ == nullptr) {
       journal_ = std::make_unique<core::SqliteOperationJournal>(journal_path_,
                                                                 cell_id_);
@@ -1220,12 +1272,18 @@ public:
     return engine_.execute_count();
   }
 
+  [[nodiscard]] std::shared_ptr<const core::PreparedOperationParticipantDTO>
+  prepared_participant() const noexcept {
+    return engine_.prepared_participant();
+  }
+
 private:
   core::RuntimeParticipantBinding binding_;
   std::filesystem::path journal_path_;
   core::CellId cell_id_;
   core::FakeClock &clock_;
   core::RuntimePolicyDTO runtime_policy_;
+  core::RuntimePolicyCatalogRecordRefDTO runtime_policy_source_artifact_;
   core::ManualScheduler scheduler_;
   mutable std::mutex mutex_;
   std::vector<deployment::VerifiedRouteReadinessParticipant> participants_;
@@ -1307,6 +1365,61 @@ motion_operation(const core::RuntimeParticipantBinding &binding) {
           core::OperationCoordinationPolicy::kIndependent};
 }
 
+void ExpectExactControlledStopPlan(
+    const core::PreparedParticipantStopPlanDTO &plan,
+    std::span<const core::RuntimeResourceBindingDTO> resources,
+    core::ParticipantStopProfilePurposeDTO expected_purpose,
+    std::string_view expected_profile_id,
+    core::MotionInterruptStopMode expected_mode,
+    bool expected_natural_completion) {
+  EXPECT_EQ(plan.participant_stop_profile_purpose, expected_purpose);
+  ASSERT_TRUE(plan.participant_stop_profile.has_value());
+  const auto &profile = *plan.participant_stop_profile;
+  EXPECT_EQ(profile.profile_id, expected_profile_id);
+  EXPECT_EQ(profile.stop_mode, expected_mode);
+  ASSERT_TRUE(profile.deceleration_time_s.has_value());
+  EXPECT_DOUBLE_EQ(*profile.deceleration_time_s, 1.0);
+  EXPECT_EQ(profile.allow_natural_completion_on_short_path,
+            expected_natural_completion);
+  EXPECT_FALSE(profile.recoverable_substitution_mode.has_value());
+  EXPECT_TRUE(profile.require_backend_confirmation);
+  ASSERT_EQ(profile.per_joint_max_deceleration.size(), 6U);
+  for (const auto &[joint, limit] : profile.per_joint_max_deceleration) {
+    (void)joint;
+    const auto *angular = std::get_if<core::AngularAccelerationDTO>(&limit);
+    ASSERT_NE(angular, nullptr);
+    EXPECT_DOUBLE_EQ(angular->value_rad_s2, 4.0);
+  }
+
+  ASSERT_EQ(plan.deadline_budget.outer_duration_ns, 3'000'000'000);
+  ASSERT_EQ(plan.stage_commands.size(), 2U);
+  const auto &nominal = plan.stage_commands.front();
+  EXPECT_EQ(nominal.resolved_stage.stage_kind,
+            core::StopEscalationStageKind::kNominal);
+  EXPECT_EQ(nominal.resolved_stage.containment_command.command_kind,
+            core::StopContainmentCommandKind::kMotionControlledStop);
+  EXPECT_EQ(nominal.parameter_source,
+            core::StopStageParameterSourceDTO::kParticipantProfileMapping);
+  ASSERT_TRUE(nominal.validated_contract_parameters.has_value());
+  const auto decoded =
+      core::map_motion_controlled_stop_contract_parameters_to_profile(
+          *nominal.validated_contract_parameters, resources,
+          expected_profile_id);
+  ASSERT_TRUE(decoded.ok()) << decoded.error().message;
+  EXPECT_EQ(decoded.value(), profile);
+
+  const auto &hard = plan.stage_commands.back();
+  EXPECT_EQ(hard.resolved_stage.stage_kind,
+            core::StopEscalationStageKind::kSoftwareHard);
+  EXPECT_EQ(hard.resolved_stage.containment_command.command_kind,
+            core::StopContainmentCommandKind::kRegistered);
+  ASSERT_TRUE(hard.resolved_stage.containment_command.registered_command_kind_id
+                  .has_value());
+  EXPECT_EQ(hard.resolved_stage.containment_command.registered_command_kind_id
+                ->value(),
+            "manyforge.stop.software_hard");
+}
+
 TEST(RetainedNativeCCLCRuntime,
      RetainedProductPublishesRepositoryReadBackReadiness) {
   const std::filesystem::path fixture_root =
@@ -1377,7 +1490,8 @@ TEST(RetainedNativeCCLCRuntime,
   clock.set(1'000);
   PublicationOwner publication_owner(
       runtime.binding, state.path() / "operation-journal.sqlite3",
-      bundle->value().cell_graph.cell_id, clock, runtime_policy->value());
+      bundle->value().cell_graph.cell_id, clock, runtime_policy->value(),
+      runtime_policy->reference());
   core::ManualScheduler scheduler;
 
   auto composition = CreateRetainedNativeCCLCRuntime(
@@ -1471,6 +1585,21 @@ TEST(RetainedNativeCCLCRuntime,
       << accepted.error().message
       << "; reason=" << accepted.error().details.at("reason");
   EXPECT_EQ(publication_owner.execute_count(), 1U);
+  const auto prepared = publication_owner.prepared_participant();
+  ASSERT_NE(prepared, nullptr);
+  EXPECT_EQ(prepared->stop_evidence_policy_id.value(),
+            "lite6_motion_controlled_stop");
+  EXPECT_EQ(prepared->resources.size(), 6U);
+  ExpectExactControlledStopPlan(
+      prepared->ordinary_stop_plan, runtime.binding.value().resources,
+      core::ParticipantStopProfilePurposeDTO::kOperator,
+      "operator_soft_on_path", core::MotionInterruptStopMode::kSoftOnPath,
+      true);
+  ASSERT_TRUE(prepared->fault_stop_plan.has_value());
+  ExpectExactControlledStopPlan(
+      *prepared->fault_stop_plan, runtime.binding.value().resources,
+      core::ParticipantStopProfilePurposeDTO::kFault, "fault_spring_back_hold",
+      core::MotionInterruptStopMode::kSpringBackHold, false);
 }
 
 } // namespace

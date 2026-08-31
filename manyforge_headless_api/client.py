@@ -607,6 +607,39 @@ class HeadlessHttpClient:
             body=body,
         )
 
+    def program_run_full_stop(
+        self,
+        program_run_id: str,
+        body: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        return self.request(
+            "POST",
+            f"{self._program_run_path(program_run_id)}/full-stop",
+            body=body,
+        )
+
+    def program_run_resume_full_stop(
+        self,
+        program_run_id: str,
+        body: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        return self.request(
+            "POST",
+            f"{self._program_run_path(program_run_id)}/resume-full-stop",
+            body=body,
+        )
+
+    def program_run_reset_full_stop(
+        self,
+        program_run_id: str,
+        body: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        return self.request(
+            "POST",
+            f"{self._program_run_path(program_run_id)}/reset",
+            body=body,
+        )
+
     def program_runtime_controls(self, program_run_id: str) -> dict[str, Any]:
         return self.request(
             "GET", f"{self._program_run_path(program_run_id)}/runtime-controls"

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <manyforge_core/runtime_participant_binding.hpp>
+#include <manyforge_core/types/catalog.hpp>
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/motion_interrupt.hpp>
 #include <manyforge_core/types/runtime_policy.hpp>
@@ -20,7 +21,9 @@ namespace manyforge::core {
 struct RuntimeParticipantPolicySelectionDTO final {
   ControllableComponentId controllable_component_id;
   CommandTargetId command_target_id;
+  RuntimePolicyCatalogRecordRefDTO source_artifact;
   RuntimePolicyDTO policy;
+  RuntimeMotionSpeedLimitDTO selected_motion_speed_limit;
   double effective_maximum_tcp_linear_speed_mps{};
 
   friend bool operator==(const RuntimeParticipantPolicySelectionDTO&,
@@ -46,13 +49,15 @@ class RuntimeParticipantPolicySelection final {
   std::shared_ptr<const RuntimeParticipantPolicySelectionDTO> value_;
 
   friend Result<RuntimeParticipantPolicySelection> verify_runtime_participant_policy_selection(
-      RuntimePolicyDTO, const RuntimeParticipantBinding&);
+      RuntimePolicyCatalogRecordRefDTO, RuntimePolicyDTO,
+      const RuntimeParticipantBinding&);
 };
 
 /// Seal one already-qualified retained runtime policy against one exact
 /// participant binding and derive the effective cell/target speed ceiling.
 [[nodiscard]] Result<RuntimeParticipantPolicySelection> verify_runtime_participant_policy_selection(
-    RuntimePolicyDTO policy, const RuntimeParticipantBinding& participant);
+    RuntimePolicyCatalogRecordRefDTO source_artifact, RuntimePolicyDTO policy,
+    const RuntimeParticipantBinding& participant);
 
 /// Apply the sealed runtime ceiling to an already public-boundary-validated
 /// speed profile. The result always carries a finite positive maximum.

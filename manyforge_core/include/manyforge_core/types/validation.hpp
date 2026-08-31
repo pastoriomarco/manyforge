@@ -22,10 +22,38 @@ struct ValidationOptionsDTO {
   bool run_collision_checks = true;
 };
 
+/// Compact measurements made while validating the exact accepted trajectory.
+///
+/// Joint vectors use the trajectory's ordered joint names.  An empty
+/// acceleration vector means that neither authored derivatives nor enough
+/// trajectory segments were available to measure acceleration.  TCP speed is
+/// absent when no exact TCP/base-frame speed check was requested.
+struct TrajectoryValidationMetricsDTO final {
+  double trajectory_duration_s{};
+  std::vector<double> peak_abs_joint_velocity_rad_s;
+  std::vector<double> peak_abs_joint_acceleration_rad_s2;
+  std::optional<double> peak_tcp_linear_speed_mps;
+
+  friend bool operator==(const TrajectoryValidationMetricsDTO&,
+                         const TrajectoryValidationMetricsDTO&) = default;
+};
+
 /// Validation result (spec §3.8)
 struct ValidationResultDTO {
+  ValidationResultDTO() = default;
+  ValidationResultDTO(
+      bool valid_, std::optional<ErrorDTO> error_,
+      std::optional<TrajectoryValidationMetricsDTO> trajectory_metrics_ =
+          std::nullopt)
+      : valid(valid_),
+        error(std::move(error_)),
+        trajectory_metrics(std::move(trajectory_metrics_)) {}
+
   bool valid = false;
   std::optional<ErrorDTO> error;  // present when valid is false; absent on success
+  /// Present on successful trajectory validation.  This is evidence about the
+  /// exact accepted trajectory, not a second policy or execution authority.
+  std::optional<TrajectoryValidationMetricsDTO> trajectory_metrics;
 };
 
 /// Collision check request (spec §3.8)

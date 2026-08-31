@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import copy
 from functools import lru_cache
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Sequence
 
 import pytest
+import rfc8785
 from fastapi.testclient import TestClient
 
 from manyforge_behavior.canonical_artifact import compute_content_identity
@@ -18,6 +20,7 @@ from manyforge_headless_api.cell_admission import CellAdmissionError
 from manyforge_headless_api.models import (
     ManagerApplyRequest,
     ProgramCycleResetRequest,
+    ProgramFullStopResetRequest,
     SceneResourcePoseQuery,
     SceneTransactionRequest,
     StopFaultRecoveryIntentRequest,
@@ -1269,6 +1272,30 @@ class FakeProgramRunner:
         self.calls.append(("motion_stop", (program_run_id, copy.deepcopy(body))))
         return self._snapshot(state="running")
 
+    def full_stop(
+        self,
+        program_run_id: str,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        self.calls.append(("full_stop", (program_run_id, copy.deepcopy(body))))
+        return self._snapshot(state="full_stopping")
+
+    def resume_full_stop(
+        self,
+        program_run_id: str,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        self.calls.append(("resume_full_stop", (program_run_id, copy.deepcopy(body))))
+        return self._snapshot(state="running")
+
+    def discard_full_stop(
+        self,
+        program_run_id: str,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        self.calls.append(("discard_full_stop", (program_run_id, copy.deepcopy(body))))
+        return self._snapshot(state="stopped")
+
     def close(self) -> None:
         self.calls.append(("close", None))
 
@@ -1402,6 +1429,85 @@ def test_stale_program_cycle_reset_has_no_stop_recovery_effect() -> None:
 
     assert execution.requests == []
     assert [kind for kind, _request in runner.calls] == ["cycle_status"]
+
+
+class _FullStoppedResetProgramRunner(_ResetProgramRunner):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cycle.update(
+            {
+                "state": "running",
+                "terminal_or_settlement_reference": None,
+            }
+        )
+
+    def discard_full_stop(
+        self,
+        program_run_id: str,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        terminal = self._snapshot(state="stopped")
+        self.calls.append(
+            ("discard_full_stop", (program_run_id, copy.deepcopy(body)))
+        )
+        reference = "sha256:" + hashlib.sha256(
+            rfc8785.dumps(
+                {
+                    "program_run_id": program_run_id,
+                    "run_revision": terminal["run_revision"],
+                    "state": terminal["state"],
+                }
+            )
+        ).hexdigest()
+        self.cycle.update(
+            {
+                "state": "terminal_awaiting_reset",
+                "terminal_or_settlement_reference": reference,
+            }
+        )
+        return terminal
+
+
+def test_full_stopped_reset_is_one_public_command_with_exact_inner_settlement() -> None:
+    execution = _LatchedResetExecution()
+    runner = _FullStoppedResetProgramRunner()
+    service = _service(
+        FakeCore(), FakeManager(), execution=execution, program_runner=runner
+    )
+    request = ProgramFullStopResetRequest.model_validate(
+        {
+            "request_id": "reset-full-stop.1",
+            "request_owner_epoch": "composer.epoch.1",
+            "source_label": "composer",
+            "correlation_id": None,
+            "program_run_id": "program-run.1",
+            "expected_owner_epoch": "program-runner.epoch.1",
+            "expected_run_revision": 1,
+            "expected_cycle_generation": 4,
+            "expected_claim_generation": 22,
+            "reason": "operator Reset discarded Full Stop",
+        }
+    )
+
+    result = service.program_run_reset_full_stop("program-run.1", request)
+
+    assert result["idle_cycle_generation"] == 5
+    assert [kind for kind, _value in runner.calls] == [
+        "discard_full_stop",
+        "cycle_status",
+        "reset_cycle",
+    ]
+    reset_body = runner.calls[-1][1]
+    assert reset_body["terminal_reference"] == (
+        runner.cycle["terminal_or_settlement_reference"]
+    )
+    assert reset_body["request_id"].startswith("program-full-stop-reset-")
+    assert [kind for kind, _value in execution.requests] == [
+        "stop_fault",
+        "identity",
+        "recover_stop_fault",
+        "stop_fault",
+    ]
 
 
 def _service(
@@ -1948,6 +2054,25 @@ def test_program_runner_surface_is_a_strict_thin_owner_projection() -> None:
                 "reason": "ordinary operator motion Stop",
             },
         )
+        full_stopped = client.post(
+            "/api/program/runs/program-run.1/full-stop",
+            json={
+                **stop_body,
+                "request_id": "request.full-stop.1",
+                "reason": "ordinary operator Full Stop",
+            },
+        )
+        resumed = client.post(
+            "/api/program/runs/program-run.1/resume-full-stop",
+            json={
+                **_caller(),
+                "request_id": "request.resume-full-stop.1",
+                "program_run_id": "program-run.1",
+                "expected_owner_epoch": "program-runner.epoch.1",
+                "expected_run_revision": 1,
+                "reason": "operator Run after Full Stop",
+            },
+        )
         stopped = client.post(
             "/api/program/runs/program-run.1/stop",
             json=stop_body,
@@ -1962,6 +2087,8 @@ def test_program_runner_surface_is_a_strict_thin_owner_projection() -> None:
     assert prepared.json()["status"] == "prepared"
     assert read.json()["capture"]["program_run_id"] == "program-run.1"
     assert motion_stopped.json()["state"] == "running"
+    assert full_stopped.json()["state"] == "full_stopping"
+    assert resumed.json()["state"] == "running"
     assert stopped.json()["state"] == "stopping"
     assert [call[0] for call in runner.calls] == [
         "runs",
@@ -1969,6 +2096,8 @@ def test_program_runner_surface_is_a_strict_thin_owner_projection() -> None:
         "prepare_scene",
         "read",
         "motion_stop",
+        "full_stop",
+        "resume_full_stop",
         "stop",
     ]
 

@@ -7,6 +7,7 @@ captured ManyMove runtime ``robot_description`` / ``robot_description_semantic``
 Only vendoring-level deltas are allowed:
 
 * mesh URI rewrite to ``package://manyforge_example_models/...``;
+* model dynamics normalized from the pinned MoveIt ``joint_limits.yaml``;
 * the additional ``closed`` SRDF group-state alias for ManyForge UI language.
 """
 
@@ -14,11 +15,14 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import sys
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
+
+import yaml
 
 
 ARM_JOINTS = ("joint1", "joint2", "joint3", "joint4", "joint5", "joint6")
@@ -31,6 +35,12 @@ EXPECTED_XARM_REPO = "https://github.com/pastoriomarco/xarm_ros2"
 EXPECTED_XARM_BRANCH = "jazzy_no_gazebo"
 EXPECTED_XARM_COMMIT = "012731afb9ef1d4289ec45112e8d083ab59a5c1e"
 EXPECTED_RUNTIME_OWNER_NODE = "/move_group"
+MOVEIT_JOINT_LIMITS_RELATIVE_PATH = Path(
+    "upstream_source/xarm_moveit_config/config/lite6/joint_limits.yaml"
+)
+EXPECTED_MOVEIT_JOINT_LIMITS_SHA256 = (
+    "73368cad488a238ba6c4bc72e679a2ae7e39cef3c7aecb83e50d6037255d927c"
+)
 EXPECTED_LAUNCH_COMMAND = [
     "ros2",
     "launch",
@@ -132,10 +142,79 @@ def joint_signature(root: ET.Element, name: str) -> dict[str, object] | None:
         "axis": dict(axis.attrib) if axis is not None else {},
         "limit": {
             key: limit.attrib.get(key)
-            for key in ("lower", "upper", "velocity")
+            for key in ("lower", "upper")
             if limit is not None and key in limit.attrib
         },
     }
+
+
+def validate_moveit_joint_dynamics(
+    snapshot: ET.Element, snapshot_dir: Path, report: Report
+) -> None:
+    source = snapshot_dir / MOVEIT_JOINT_LIMITS_RELATIVE_PATH
+    report.require(source.is_file(), "owned Lite6 MoveIt joint-limit source is missing")
+    if not source.is_file():
+        return
+    data = source.read_bytes()
+    digest = hashlib.sha256(data).hexdigest()
+    report.require(
+        digest == EXPECTED_MOVEIT_JOINT_LIMITS_SHA256,
+        "owned Lite6 MoveIt joint-limit source does not match the pinned xArm commit",
+    )
+    try:
+        payload = yaml.safe_load(data)
+    except yaml.YAMLError as exc:
+        report.failures.append(f"owned Lite6 MoveIt joint limits are invalid YAML: {exc}")
+        return
+    limits = payload.get("joint_limits") if isinstance(payload, dict) else None
+    report.require(
+        isinstance(limits, dict) and set(limits) == set(ARM_JOINTS),
+        "owned Lite6 MoveIt joint limits must cover exactly joint1..joint6",
+    )
+    if not isinstance(limits, dict) or set(limits) != set(ARM_JOINTS):
+        return
+
+    normalized: dict[str, tuple[float, float]] = {}
+    for name in ARM_JOINTS:
+        row = limits[name]
+        valid = (
+            isinstance(row, dict)
+            and row.get("has_velocity_limits") is True
+            and row.get("has_acceleration_limits") is True
+            and isinstance(row.get("max_velocity"), (int, float))
+            and not isinstance(row.get("max_velocity"), bool)
+            and isinstance(row.get("max_acceleration"), (int, float))
+            and not isinstance(row.get("max_acceleration"), bool)
+            and float(row["max_velocity"]) > 0.0
+            and float(row["max_acceleration"]) > 0.0
+        )
+        report.require(valid, f"owned MoveIt dynamics for {name} are incomplete")
+        if not valid:
+            continue
+        normalized[name] = (
+            float(row["max_velocity"]),
+            float(row["max_acceleration"]),
+        )
+        item = joint(snapshot, name)
+        limit = item.find("limit") if item is not None else None
+        try:
+            velocity = float(limit.attrib["velocity"]) if limit is not None else None
+            acceleration = (
+                float(limit.attrib["acceleration"]) if limit is not None else None
+            )
+        except (KeyError, ValueError):
+            velocity = None
+            acceleration = None
+        report.require(
+            velocity == normalized[name][0],
+            f"snapshot arm joint {name} does not use its MoveIt velocity limit",
+        )
+        report.require(
+            acceleration == normalized[name][1],
+            f"snapshot arm joint {name} does not use its MoveIt acceleration limit",
+        )
+    report.facts["moveit_joint_limits_sha256"] = digest
+    report.facts["normalized_arm_joint_dynamics"] = normalized
 
 
 def mimic_map(root: ET.Element) -> dict[str, str]:
@@ -334,6 +413,10 @@ def validate_urdf(runtime: ET.Element, snapshot: ET.Element, snapshot_dir: Path,
     snapshot_links = link_names(snapshot)
     report.facts["runtime_link_count"] = len(runtime_links)
     report.facts["snapshot_link_count"] = len(snapshot_links)
+    report.require(
+        snapshot.attrib.get("version") == "1.2",
+        "canonical snapshot must declare URDF version 1.2 for acceleration limits",
+    )
 
     report.require("base_link" not in snapshot_links, "canonical snapshot must not add base_link alias")
     report.require(
@@ -352,6 +435,8 @@ def validate_urdf(runtime: ET.Element, snapshot: ET.Element, snapshot_dir: Path,
             runtime_sig == snapshot_sig,
             f"snapshot arm joint {name} does not match runtime signature",
         )
+
+    validate_moveit_joint_dynamics(snapshot, snapshot_dir, report)
 
     runtime_mimic = mimic_map(runtime)
     snapshot_mimic = mimic_map(snapshot)

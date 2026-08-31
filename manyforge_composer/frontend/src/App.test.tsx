@@ -127,6 +127,13 @@ describe('Composer shell continuity', () => {
     expect(appSource).toContain('<ProgramDocumentControls');
     expect(appSource).toContain('<DeploymentCompositionPanel');
     expect(appSource).toContain('<RuntimeStatusOverlay');
+    expect(appSource).toContain('error={headlessState.error}');
+    expect(appSource).not.toContain("source: 'composer.headless_projection'");
+    expect(appSource).toContain('expanded={runtimePanelExpanded}');
+    expect(appSource).toMatch(
+      /const openRuntimeAttention[\s\S]*setRuntimePanelExpanded\(false\)[\s\S]*setGlobalPanel\('runtime'\)/,
+    );
+    expect(appSource).not.toContain('panelClassName="runtime-observability-overlay"');
     expect(controlsSource).toContain('<ArtifactBrowser lockedKind="program"');
     expect(controlsSource).toContain('Its Deployment will not change.');
     expect(controlsSource).not.toContain('Update Draft');

@@ -294,6 +294,11 @@ class FakeRouteSnapshotSource final : public ICCLCRouteSelectionCurrentSnapshotS
     active_configuration_ = std::move(configuration);
   }
 
+  void SetRuntimeEpoch(RuntimeEpoch runtime_epoch) {
+    std::lock_guard lock(mutex_);
+    runtime_epoch_ = std::move(runtime_epoch);
+  }
+
   [[nodiscard]] Result<RouteSelectionCurrentSnapshot> ReadCurrentRouteSelectionSnapshot(
       const RetainedBundleId& bundle_id, const GraphRevision& graph_revision,
       const DesiredControlConfigurationDTO& desired) const override {
@@ -302,6 +307,7 @@ class FakeRouteSnapshotSource final : public ICCLCRouteSelectionCurrentSnapshotS
     {
       std::lock_guard lock(mutex_);
       snapshot.active_control_configuration = active_configuration_;
+      snapshot.expected_controller_domain.source_runtime_epoch = runtime_epoch_;
     }
     if (snapshot.retained_bundle_id != bundle_id || snapshot.graph_revision != graph_revision ||
         snapshot.expected_controller_domain.desired_configuration != desired) {
@@ -317,6 +323,7 @@ class FakeRouteSnapshotSource final : public ICCLCRouteSelectionCurrentSnapshotS
   mutable std::atomic<std::size_t> read_count_{0U};
   mutable std::mutex mutex_;
   std::optional<ActiveControlConfigurationDTO> active_configuration_;
+  RuntimeEpoch runtime_epoch_{"runtime-epoch.1"};
 };
 
 class FakeControllerPort final : public IControllerLifecyclePort {
@@ -403,9 +410,16 @@ class FakeRouteFencePort final : public ICCLCKernelRouteConfigurationFencePort {
   void ReconcileAcquireAsAccepted(bool value) noexcept {
     reconcile_acquire_as_accepted_.store(value);
   }
+  void ReconcileAcquireAsNotSeen(bool value) noexcept {
+    reconcile_acquire_as_not_seen_.store(value);
+  }
   void LoseReleaseResponse(bool value) noexcept { lose_release_response_.store(value); }
   void ReconcileReleaseAsReleased(bool value) noexcept {
     reconcile_release_as_released_.store(value);
+  }
+  void SetFenceCurrentConfiguration(
+      ExpectedActiveControlConfigurationDTO configuration) {
+    status_current_configuration_ = std::move(configuration);
   }
 
   [[nodiscard]] Result<RouteConfigurationFenceAdmissionSnapshotDTO>
@@ -445,6 +459,11 @@ class FakeRouteFencePort final : public ICCLCKernelRouteConfigurationFencePort {
   ReconcileRouteConfigurationFenceAcquireAttempt(
       const RouteConfigurationFenceIntentDTO& intent) const override {
     ++acquire_reconciliation_count_;
+    if (reconcile_acquire_as_not_seen_.load()) {
+      return Result<RouteConfigurationFenceAcquireAttemptReconciliationDTO>::Ok(
+          {intent, RouteConfigurationFenceAcquireAttemptDispositionDTO::kNotSeen,
+           std::nullopt, std::nullopt, std::nullopt});
+    }
     if (!reconcile_acquire_as_accepted_.load() || !accepted_.has_value() ||
         !accepted_->matches(intent)) {
       return Result<RouteConfigurationFenceAcquireAttemptReconciliationDTO>::Err(
@@ -472,10 +491,12 @@ class FakeRouteFencePort final : public ICCLCKernelRouteConfigurationFencePort {
       return Result<RouteConfigurationFenceStatusDTO>::Err(
           ErrorDTO{"route_fence_missing", "route fence is not held", {}});
     }
-    const ExpectedActiveControlConfigurationDTO current{
-        ExpectedActiveControlConfigurationPresenceDTO::kPresent,
-        accepted_->candidate_active_control_configuration_id,
-        accepted_->candidate_active_control_configuration_generation};
+    const ExpectedActiveControlConfigurationDTO current =
+        status_current_configuration_.value_or(
+            ExpectedActiveControlConfigurationDTO{
+                ExpectedActiveControlConfigurationPresenceDTO::kPresent,
+                accepted_->candidate_active_control_configuration_id,
+                accepted_->candidate_active_control_configuration_generation});
     RouteConfigurationFenceReconciliationEvidenceDTO evidence{
         {RuntimeUnitId("runtime.kernel"), RuntimeEpoch("kernel-epoch.1"),
          RequestOwnerEpoch("kernel-owner.1"), ContentDigest(Sha('b')),
@@ -571,10 +592,13 @@ class FakeRouteFencePort final : public ICCLCKernelRouteConfigurationFencePort {
   mutable std::atomic<std::size_t> release_reconciliation_count_{0U};
   std::atomic<bool> lose_acquire_response_{false};
   std::atomic<bool> reconcile_acquire_as_accepted_{false};
+  std::atomic<bool> reconcile_acquire_as_not_seen_{false};
   std::atomic<bool> lose_release_response_{false};
   std::atomic<bool> reconcile_release_as_released_{false};
   std::optional<RouteConfigurationFenceAcceptedDTO> accepted_;
   std::optional<RouteConfigurationFenceReleasedDTO> release_receipt_;
+  std::optional<ExpectedActiveControlConfigurationDTO>
+      status_current_configuration_;
   std::mutex mutex_;
   std::condition_variable acquired_;
   std::condition_variable release_called_;
@@ -957,6 +981,267 @@ TEST(RouteSelectionCoordinator,
     EXPECT_EQ(route_fence.release_count(), 1U);
     EXPECT_EQ(controller->dispatch_count(), 0U);
     EXPECT_EQ(publisher.publication_count(), 1U);
+    EXPECT_TRUE(coordinator.accepting_new_requests());
+    EXPECT_TRUE(reservations.snapshot().empty());
+  }
+}
+
+TEST(RouteSelectionCoordinator,
+     ReplacementSettlesFenceOnlyRouteWhenControllerSourceEpochChanged) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(
+      temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
+      8U);
+  CCLCDomainReservationTable reservations;
+  UnusedComponentSnapshotSource component_snapshots;
+  UnusedCatalogSource catalogs;
+  UnusedBrandResolver brand_resolver;
+  UnusedDisablePort disable_port;
+  FakeRouteSnapshotSource route_snapshots;
+  auto controller = std::make_shared<FakeControllerPort>();
+  FakeControllerResolver controller_resolver(controller);
+  FakeRouteFencePort route_fence;
+  route_fence.LoseAcquireResponse(true);
+  FakePublicationPort publisher(journal);
+  FakeClock clock;
+  clock.set(100);
+  std::optional<RouteSelectionTransactionId> transaction_id;
+
+  {
+    WaitableManualScheduler scheduler;
+    ComponentLifecycleCoordinatorRouteServices route_services{
+        &route_snapshots, &controller_resolver, &route_fence, &publisher};
+    ComponentLifecycleCoordinator coordinator(
+        Config(RequestOwnerEpoch("cclc-owner.1")), journal, reservations,
+        component_snapshots, catalogs, brand_resolver, disable_port, clock,
+        scheduler, nullptr, route_services);
+    ASSERT_TRUE(coordinator.Start().ok());
+    const auto accepted = coordinator.SubmitRouteSelection(
+        Intent(RequestOwnerEpoch("cclc-owner.1")));
+    ASSERT_TRUE(accepted.ok())
+        << accepted.error().code << ": " << accepted.error().message;
+    ASSERT_TRUE(accepted.value().acceptance.has_value());
+    transaction_id =
+        accepted.value().acceptance->route_selection_transaction_id;
+    ASSERT_TRUE(route_fence.WaitForAcquire(std::chrono::seconds(2)));
+    EXPECT_FALSE(coordinator.DrainFor(std::chrono::milliseconds(100)));
+  }
+
+  route_snapshots.SetRuntimeEpoch(RuntimeEpoch("runtime-epoch.2"));
+  route_fence.LoseAcquireResponse(false);
+  route_fence.ReconcileAcquireAsAccepted(true);
+  route_fence.SetFenceCurrentConfiguration(
+      {ExpectedActiveControlConfigurationPresenceDTO::kAbsent, std::nullopt,
+       std::nullopt});
+  {
+    WaitableManualScheduler scheduler;
+    ComponentLifecycleCoordinatorRouteServices route_services{
+        &route_snapshots, &controller_resolver, &route_fence, &publisher};
+    ComponentLifecycleCoordinator coordinator(
+        Config(RequestOwnerEpoch("cclc-owner.2")), journal, reservations,
+        component_snapshots, catalogs, brand_resolver, disable_port, clock,
+        scheduler, nullptr, route_services);
+    const auto started = coordinator.Start();
+    ASSERT_TRUE(started.ok())
+        << started.error().code << ": " << started.error().message;
+    ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
+    ASSERT_TRUE(transaction_id.has_value());
+    const auto status = coordinator.LoadRouteSelectionStatus(*transaction_id);
+    ASSERT_TRUE(status.ok());
+    ASSERT_TRUE(status.value().has_value());
+    EXPECT_EQ(status.value()->phase,
+              RouteSelectionTransactionPhaseDTO::kFailed);
+    EXPECT_EQ(status.value()->effect, RouteSelectionEffectDTO::kKnownNoEffect);
+    EXPECT_EQ(status.value()->terminal_result,
+              RouteSelectionTerminalResultDTO::kFailedKnownNoEffect);
+    ASSERT_TRUE(status.value()->error.has_value());
+    EXPECT_EQ(status.value()->error->details.at("reason"),
+              "controller_source_replaced_before_transition");
+    EXPECT_EQ(status.value()->status_owner_epoch,
+              RequestOwnerEpoch("cclc-owner.2"));
+    EXPECT_EQ(route_fence.acquire_count(), 1U);
+    EXPECT_EQ(route_fence.acquire_reconciliation_count(), 2U);
+    EXPECT_EQ(route_fence.release_count(), 1U);
+    EXPECT_EQ(controller->observe_count(), 0U);
+    EXPECT_EQ(controller->dispatch_count(), 0U);
+    EXPECT_EQ(publisher.publication_count(), 0U);
+    EXPECT_TRUE(coordinator.accepting_new_requests());
+    EXPECT_TRUE(reservations.snapshot().empty());
+  }
+}
+
+TEST(RouteSelectionCoordinator,
+     ReplacementProvesFenceOnlyRouteNotSeenAfterControllerSourceChanged) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(
+      temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
+      8U);
+  CCLCDomainReservationTable reservations;
+  UnusedComponentSnapshotSource component_snapshots;
+  UnusedCatalogSource catalogs;
+  UnusedBrandResolver brand_resolver;
+  UnusedDisablePort disable_port;
+  FakeRouteSnapshotSource route_snapshots;
+  auto controller = std::make_shared<FakeControllerPort>();
+  FakeControllerResolver controller_resolver(controller);
+  FakeRouteFencePort route_fence;
+  route_fence.LoseAcquireResponse(true);
+  FakePublicationPort publisher(journal);
+  FakeClock clock;
+  clock.set(100);
+  std::optional<RouteSelectionTransactionId> transaction_id;
+
+  {
+    WaitableManualScheduler scheduler;
+    ComponentLifecycleCoordinatorRouteServices route_services{
+        &route_snapshots, &controller_resolver, &route_fence, &publisher};
+    ComponentLifecycleCoordinator coordinator(
+        Config(RequestOwnerEpoch("cclc-owner.1")), journal, reservations,
+        component_snapshots, catalogs, brand_resolver, disable_port, clock,
+        scheduler, nullptr, route_services);
+    ASSERT_TRUE(coordinator.Start().ok());
+    const auto accepted = coordinator.SubmitRouteSelection(
+        Intent(RequestOwnerEpoch("cclc-owner.1")));
+    ASSERT_TRUE(accepted.ok());
+    ASSERT_TRUE(accepted.value().acceptance.has_value());
+    transaction_id =
+        accepted.value().acceptance->route_selection_transaction_id;
+    ASSERT_TRUE(route_fence.WaitForAcquire(std::chrono::seconds(2)));
+  }
+
+  route_snapshots.SetRuntimeEpoch(RuntimeEpoch("runtime-epoch.2"));
+  route_fence.LoseAcquireResponse(false);
+  route_fence.ReconcileAcquireAsNotSeen(true);
+  {
+    WaitableManualScheduler scheduler;
+    ComponentLifecycleCoordinatorRouteServices route_services{
+        &route_snapshots, &controller_resolver, &route_fence, &publisher};
+    ComponentLifecycleCoordinator coordinator(
+        Config(RequestOwnerEpoch("cclc-owner.2")), journal, reservations,
+        component_snapshots, catalogs, brand_resolver, disable_port, clock,
+        scheduler, nullptr, route_services);
+    const auto started = coordinator.Start();
+    ASSERT_TRUE(started.ok())
+        << started.error().code << ": " << started.error().message;
+    ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
+    ASSERT_TRUE(transaction_id.has_value());
+    const auto status = coordinator.LoadRouteSelectionStatus(*transaction_id);
+    ASSERT_TRUE(status.ok());
+    ASSERT_TRUE(status.value().has_value());
+    EXPECT_EQ(status.value()->phase,
+              RouteSelectionTransactionPhaseDTO::kFailed);
+    EXPECT_EQ(status.value()->terminal_result,
+              RouteSelectionTerminalResultDTO::kFailedKnownNoEffect);
+    EXPECT_EQ(route_fence.release_count(), 0U);
+    EXPECT_EQ(controller->observe_count(), 0U);
+    EXPECT_EQ(publisher.publication_count(), 0U);
+    EXPECT_TRUE(coordinator.accepting_new_requests());
+  }
+}
+
+TEST(RouteSelectionCoordinator,
+     ReplacementReconcilesFenceOnlyReleaseAfterControllerSourceChanged) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(
+      temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
+      8U);
+  CCLCDomainReservationTable reservations;
+  UnusedComponentSnapshotSource component_snapshots;
+  UnusedCatalogSource catalogs;
+  UnusedBrandResolver brand_resolver;
+  UnusedDisablePort disable_port;
+  FakeRouteSnapshotSource route_snapshots;
+  auto controller = std::make_shared<FakeControllerPort>();
+  FakeControllerResolver controller_resolver(controller);
+  FakeRouteFencePort route_fence;
+  route_fence.LoseAcquireResponse(true);
+  FakePublicationPort publisher(journal);
+  FakeClock clock;
+  clock.set(100);
+  std::optional<RouteSelectionTransactionId> transaction_id;
+
+  {
+    WaitableManualScheduler scheduler;
+    ComponentLifecycleCoordinatorRouteServices route_services{
+        &route_snapshots, &controller_resolver, &route_fence, &publisher};
+    ComponentLifecycleCoordinator coordinator(
+        Config(RequestOwnerEpoch("cclc-owner.1")), journal, reservations,
+        component_snapshots, catalogs, brand_resolver, disable_port, clock,
+        scheduler, nullptr, route_services);
+    ASSERT_TRUE(coordinator.Start().ok());
+    const auto accepted = coordinator.SubmitRouteSelection(
+        Intent(RequestOwnerEpoch("cclc-owner.1")));
+    ASSERT_TRUE(accepted.ok());
+    ASSERT_TRUE(accepted.value().acceptance.has_value());
+    transaction_id =
+        accepted.value().acceptance->route_selection_transaction_id;
+    ASSERT_TRUE(route_fence.WaitForAcquire(std::chrono::seconds(2)));
+  }
+
+  route_snapshots.SetRuntimeEpoch(RuntimeEpoch("runtime-epoch.2"));
+  route_fence.LoseAcquireResponse(false);
+  route_fence.ReconcileAcquireAsAccepted(true);
+  route_fence.SetFenceCurrentConfiguration(
+      {ExpectedActiveControlConfigurationPresenceDTO::kAbsent, std::nullopt,
+       std::nullopt});
+  route_fence.LoseReleaseResponse(true);
+  {
+    WaitableManualScheduler scheduler;
+    ComponentLifecycleCoordinatorRouteServices route_services{
+        &route_snapshots, &controller_resolver, &route_fence, &publisher};
+    ComponentLifecycleCoordinator coordinator(
+        Config(RequestOwnerEpoch("cclc-owner.2")), journal, reservations,
+        component_snapshots, catalogs, brand_resolver, disable_port, clock,
+        scheduler, nullptr, route_services);
+    const auto started = coordinator.Start();
+    ASSERT_TRUE(started.ok())
+        << started.error().code << ": " << started.error().message;
+    ASSERT_TRUE(route_fence.WaitForRelease(std::chrono::seconds(2)));
+    EXPECT_FALSE(coordinator.DrainFor(std::chrono::milliseconds(100)));
+    ASSERT_TRUE(transaction_id.has_value());
+    const auto unresolved =
+        coordinator.LoadRouteSelectionStatus(*transaction_id);
+    ASSERT_TRUE(unresolved.ok());
+    ASSERT_TRUE(unresolved.value().has_value());
+    EXPECT_EQ(unresolved.value()->phase,
+              RouteSelectionTransactionPhaseDTO::kOutcomeUnknown);
+  }
+
+  route_fence.LoseReleaseResponse(false);
+  route_fence.ReconcileReleaseAsReleased(true);
+  {
+    WaitableManualScheduler scheduler;
+    ComponentLifecycleCoordinatorRouteServices route_services{
+        &route_snapshots, &controller_resolver, &route_fence, &publisher};
+    ComponentLifecycleCoordinator coordinator(
+        Config(RequestOwnerEpoch("cclc-owner.3")), journal, reservations,
+        component_snapshots, catalogs, brand_resolver, disable_port, clock,
+        scheduler, nullptr, route_services);
+    const auto started = coordinator.Start();
+    ASSERT_TRUE(started.ok())
+        << started.error().code << ": " << started.error().message;
+    ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
+    ASSERT_TRUE(transaction_id.has_value());
+    const auto status = coordinator.LoadRouteSelectionStatus(*transaction_id);
+    ASSERT_TRUE(status.ok());
+    ASSERT_TRUE(status.value().has_value());
+    EXPECT_EQ(status.value()->phase,
+              RouteSelectionTransactionPhaseDTO::kFailed);
+    EXPECT_EQ(status.value()->effect,
+              RouteSelectionEffectDTO::kKnownNoEffect);
+    EXPECT_EQ(status.value()->terminal_result,
+              RouteSelectionTerminalResultDTO::kFailedKnownNoEffect);
+    ASSERT_TRUE(status.value()->error.has_value());
+    EXPECT_EQ(status.value()->error->details.at("reason"),
+              "controller_source_replaced_before_transition");
+    EXPECT_EQ(status.value()->status_owner_epoch,
+              RequestOwnerEpoch("cclc-owner.3"));
+    EXPECT_EQ(route_fence.acquire_count(), 1U);
+    EXPECT_EQ(route_fence.release_count(), 1U);
+    EXPECT_EQ(route_fence.release_reconciliation_count(), 2U);
+    EXPECT_EQ(controller->observe_count(), 0U);
+    EXPECT_EQ(controller->dispatch_count(), 0U);
+    EXPECT_EQ(publisher.publication_count(), 0U);
     EXPECT_TRUE(coordinator.accepting_new_requests());
     EXPECT_TRUE(reservations.snapshot().empty());
   }

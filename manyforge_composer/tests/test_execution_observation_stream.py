@@ -93,14 +93,27 @@ def test_source_is_demand_bound_change_only_and_capacity_one(
         for _ in range(200):
             if source.status()["fanout"]["replaced_frames_total"] > 0:
                 break
-            await asyncio.sleep(0)
+            # The source performs the synchronous owner read through
+            # ``to_thread``. Give that worker a bounded scheduling opportunity
+            # instead of exhausting this loop before it can publish.
+            await asyncio.sleep(0.001)
         status = source.status()
         assert status["source"]["poll_count"] >= 3
         assert status["source"]["published_count"] < status["source"]["poll_count"]
+        assert status["source"]["last_poll_duration_us"] >= 0
+        assert status["source"]["max_poll_duration_us"] >= (
+            status["source"]["last_poll_duration_us"]
+        )
         assert status["fanout"]["replaced_frames_total"] > 0
         assert subscription.queue.qsize() == 1
         latest = subscription.queue.get_nowait()
-        assert latest["source_sequence"] == status["source"]["poll_count"]
+        # The poll counter is incremented before the owner read and may include
+        # one in-flight call. In this fixture the second completed poll is the
+        # sole unchanged frame, so the latest completed source sequence is one
+        # greater than the number of published frames.
+        assert latest["source_sequence"] == (
+            status["source"]["published_count"] + 1
+        )
 
         second = source.subscribe()
         assert second.queue.get_nowait()["source_sequence"] == latest["source_sequence"]
@@ -145,6 +158,45 @@ def test_source_rejects_changed_state_at_the_same_source_sequence(
         assert status["last_error"]["message"] == (
             "execution observation changed without advancing its source sequence"
         )
+        source.unsubscribe(subscription)
+
+    asyncio.run(exercise())
+
+
+def test_source_accepts_a_fresh_restart_epoch_with_a_lower_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Client:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def execution_observation(self) -> dict[str, Any]:
+            self.calls += 1
+            response = _status(
+                sequence=50 if self.calls == 1 else 1,
+                position=0.1 if self.calls == 1 else 0.2,
+            )
+            if self.calls > 1:
+                response["observation"]["owner_epoch"] = "execution-owner.2"
+                response["observation"]["source_epoch"] = "joint-source.2"
+            return response
+
+    async def exercise() -> None:
+        monkeypatch.setattr(stream, "_OBSERVATION_PERIOD_S", 0.0)
+        source = stream.ExecutionObservationSource(Client())  # type: ignore[arg-type]
+        subscription = source.subscribe()
+        for _ in range(200):
+            if source.status()["source"]["published_count"] >= 2:
+                break
+            await asyncio.sleep(0.001)
+        status = source.status()["source"]
+        assert status["published_count"] == 2
+        assert status["error_count"] == 0
+        latest = subscription.queue.get_nowait()
+        assert latest["owner_epoch"] == "execution-owner.2"
+        assert latest["source_epoch"] == "joint-source.2"
+        assert latest["source_sequence"] == 1
+        assert latest["positions_rad"] == [0.2, -0.2]
         source.unsubscribe(subscription)
 
     asyncio.run(exercise())

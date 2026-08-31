@@ -122,6 +122,58 @@ TEST(SoftOnPathStopPlannerTest,
   EXPECT_NEAR(final_wp.positions_rad.at(0), 0.3375, 1e-9);
 }
 
+TEST(SoftOnPathStopPlannerTest,
+     OneSecondOperatorCurveHasExactMidpointAndEndpointDerivatives) {
+  auto profile = soft_profile(1.0);
+  auto state = measured_state_1d(0.2, 0.5);
+  SoftOnPathPlannerConfig config;
+  config.stop_traj_delta_s = 0.05;
+  config.sample_period_s = 0.05;
+
+  auto planned = plan_soft_on_path_stop(
+      linear_trajectory_1d(), profile, state, config);
+
+  ASSERT_TRUE(planned.ok()) << planned.error().message;
+  const auto& plan = planned.value();
+  EXPECT_NEAR(plan.effective_ramp_s, 0.95, 1e-9);
+
+  const auto midpoint_it = std::find_if(
+      plan.replacement_trajectory.waypoints.begin(),
+      plan.replacement_trajectory.waypoints.end(),
+      [](const TrajectoryWaypointDTO& waypoint) {
+        return std::abs(waypoint.time_from_start_s - 0.5) < 1e-9;
+      });
+  ASSERT_NE(midpoint_it, plan.replacement_trajectory.waypoints.end());
+
+  // The first 50 ms continues the accepted command. At wall-time midpoint,
+  // the 950 ms minimum-jerk ramp is therefore at r = 450 / 950 = 9 / 19.
+  const double r = 9.0 / 19.0;
+  const double r2 = r * r;
+  const double r3 = r2 * r;
+  const double r4 = r2 * r2;
+  const double r5 = r4 * r;
+  const double r6 = r5 * r;
+  const double position_factor = r - 2.5 * r4 + 3.0 * r5 - r6;
+  const double velocity_factor = 1.0 - 10.0 * r3 + 15.0 * r4 - 6.0 * r5;
+  const double acceleration_factor =
+      -30.0 * r2 + 60.0 * r3 - 30.0 * r4;
+  const double handoff_position = 0.2 + 0.5 * 0.05;
+
+  EXPECT_NEAR(midpoint_it->positions_rad.at(0),
+              handoff_position + 0.5 * 0.95 * position_factor, 1e-9);
+  EXPECT_NEAR(midpoint_it->velocities_rad_s.at(0),
+              0.5 * velocity_factor, 1e-9);
+  EXPECT_NEAR(midpoint_it->accelerations_rad_s2.at(0),
+              (0.5 / 0.95) * acceleration_factor, 1e-9);
+
+  const auto& endpoint = plan.replacement_trajectory.waypoints.back();
+  EXPECT_NEAR(endpoint.time_from_start_s, 1.0, 1e-9);
+  EXPECT_NEAR(endpoint.positions_rad.at(0),
+              handoff_position + 0.5 * 0.95 * 0.5, 1e-9);
+  EXPECT_NEAR(endpoint.velocities_rad_s.at(0), 0.0, 1e-9);
+  EXPECT_NEAR(endpoint.accelerations_rad_s2.at(0), 0.0, 1e-9);
+}
+
 TEST(SpringBackOnPathStopPlannerTest, BuildsTwoPhaseOnPathReturnToTripCursor) {
   auto profile = spring_back_profile(1.0);
   auto state = measured_state_1d(0.2, 0.5);

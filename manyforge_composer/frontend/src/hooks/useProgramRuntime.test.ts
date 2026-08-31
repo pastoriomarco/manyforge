@@ -1,20 +1,34 @@
 import { readFileSync } from 'node:fs';
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { api } from '../api/client';
 import type {
   AppliedProgramSelection,
+  ProgramRunStatus,
   ProgramWorkspaceResponse,
   ScenarioCatalogResponse,
 } from '../types/api';
 import type { ComposerHeadlessState } from '../types/headless';
 import {
   buildProgramResetRequest,
+  buildProgramFullStopResetRequest,
   buildProgramStartRequest,
+  controlPendingAfterProjection,
+  observeProgramCommandFailure,
+  programCommandFailureMessage,
+  programPendingAfterProjection,
+  programMotionStopSettled,
+  programRunNeedsObservationPoll,
   programRuntimeWakeKey,
+  programTerminalFailureMessage,
   retainedScenarioSelection,
   scenarioSelectionAfterRequest,
 } from './useProgramRuntime';
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 const digest = (character: string) => `sha256:${character.repeat(64)}`;
 
@@ -136,6 +150,8 @@ describe('Program runtime idle selection', () => {
     expect(refresh).not.toContain('api.programs.start');
     expect(refresh).not.toContain('applyDraft');
     expect(refresh).toContain('api.programs.currentScenario()');
+    expect(refresh).toContain('pending: programPendingAfterProjection(');
+    expect(refresh).toContain('cycleDebugProjection');
   });
 
   it('retains only a still-available explicit operator selection', () => {
@@ -147,6 +163,249 @@ describe('Program runtime idle selection', () => {
     const selected = scenarioSelectionAfterRequest(null, catalog, 'applied');
     expect(selected).toBe('applied');
     expect(scenarioSelectionAfterRequest(selected, catalog, null)).toBeNull();
+  });
+});
+
+describe('Program command settlement', () => {
+  it('re-reads the current cycle, exact run, and recovery after rejection', async () => {
+    const run = {
+      ownerEpoch: 'runner.epoch.current',
+      state: 'intervention_required',
+      runRevision: 9,
+      treeStatus: 'failure',
+      capture: { programRunId: 'run-current' },
+      nodeStatuses: { 'node.move': 'failure' },
+      activeOperationCount: 0,
+      reasonCode: 'owner_request_failed',
+      message: 'new motion admission is closed by an active Stop fault',
+    } as unknown as ProgramRunStatus;
+    const cycle = {
+      programRunnerOwnerEpoch: 'runner.epoch.current',
+      cycleGeneration: 8,
+      state: 'terminal_awaiting_reset',
+      programRunId: 'run-current',
+      cycleClaimGeneration: 14,
+    } as unknown as Awaited<ReturnType<typeof api.programs.cycleStatus>>;
+    const controls = {
+      ownerEpoch: 'runner.epoch.current',
+      programRunId: 'run-current',
+      recoveryOffer: {
+        recoveryClass: 'stop_fault_intervention',
+        status: 'reset_required',
+        offerRevision: 4,
+        nodeInstanceId: 'node.move',
+        operationId: 'operation-current',
+        reasonCode: 'active_stop_fault_requires_reset',
+        actions: [{ actionId: 'reset_cycle', enabled: true }],
+      },
+    } as unknown as Awaited<ReturnType<typeof api.programs.runtimeControls>>;
+    const cycleStatus = vi.spyOn(api.programs, 'cycleStatus')
+      .mockResolvedValue(cycle);
+    const read = vi.spyOn(api.programs, 'read').mockResolvedValue(run);
+    const runtimeControls = vi.spyOn(api.programs, 'runtimeControls')
+      .mockResolvedValue(controls);
+
+    const diagnostic = await observeProgramCommandFailure(
+      new Error('Run request failed'),
+      'Program Run was rejected.',
+      'program-run-start.request-7',
+      null,
+      null,
+      null,
+    );
+
+    expect(cycleStatus).toHaveBeenCalledOnce();
+    expect(read).toHaveBeenCalledWith('run-current');
+    expect(runtimeControls).toHaveBeenCalledWith('run-current');
+    expect(diagnostic.run).toBe(run);
+    expect(diagnostic.controls).toBe(controls);
+    expect(diagnostic.message).toContain('Request program-run-start.request-7.');
+    expect(diagnostic.message).toContain(
+      'Observed cycle: terminal_awaiting_reset, generation 8',
+    );
+    expect(diagnostic.message).toContain(
+      'Observed recovery stop_fault_intervention: reset_required',
+    );
+    expect(diagnostic.message).toContain('Allowed actions: reset_cycle.');
+    expect(diagnostic.message).toContain(
+      'Current status was re-read after the failed request.',
+    );
+  });
+
+  it('keeps exact request and current owner projections in command failures', () => {
+    const run = {
+      ownerEpoch: 'runner.epoch.1',
+      state: 'intervention_required',
+      runRevision: 7,
+      treeStatus: 'running',
+      capture: { programRunId: 'run-1' },
+      nodeStatuses: { 'node.move': 'failure' },
+      activeOperationCount: 0,
+      reasonCode: 'operation_stopped',
+      message: 'The exact operation stopped before motion began.',
+    } as unknown as ProgramRunStatus;
+    const controls = {
+      recoveryOffer: {
+        recoveryClass: 'stop_fault_intervention',
+        status: 'reset_required',
+        offerRevision: 3,
+        nodeInstanceId: 'node.move',
+        operationId: 'operation-1',
+        reasonCode: 'active_stop_fault_requires_reset',
+        actions: [{ actionId: 'reset_cycle', enabled: true }],
+      },
+    } as Parameters<typeof programCommandFailureMessage>[4];
+    const { snapshot } = admissionFixtures();
+    const message = programCommandFailureMessage(
+      new Error('new motion admission is closed'),
+      'Run failed.',
+      'program-run-start.fixture',
+      run,
+      controls,
+      {
+        ...snapshot,
+        programCycle: {
+          ...snapshot.programCycle,
+          state: 'running',
+          cycleGeneration: 4,
+        },
+      },
+    );
+    expect(message).toContain('Request program-run-start.fixture.');
+    expect(message).toContain('run-1: intervention_required, revision 7');
+    expect(message).toContain('cycle: running, generation 4');
+    expect(message).toContain(
+      'recovery stop_fault_intervention: reset_required, offer revision 3',
+    );
+  });
+
+  it('turns an asynchronously observed terminal failure into one detailed error', () => {
+    const run = {
+      ownerEpoch: 'runner.epoch.1',
+      state: 'failed',
+      runRevision: 11,
+      treeStatus: 'failure',
+      capture: { programRunId: 'run-background-failure' },
+      nodeStatuses: { 'node.move': 'failure' },
+      activeOperationCount: 0,
+      reasonCode: 'owner_request_failed',
+      message: 'planning failed after the Run request had returned',
+    } as unknown as ProgramRunStatus;
+    const message = programTerminalFailureMessage(run, null, {
+      programRunnerOwnerEpoch: 'runner.epoch.1',
+      cycleGeneration: 12,
+      state: 'terminal_awaiting_reset',
+      programRunId: 'run-background-failure',
+      cycleClaimGeneration: 22,
+    });
+    expect(message).toContain('Program execution failed.');
+    expect(message).toContain('run-background-failure: failed, revision 11');
+    expect(message).toContain('Run reason: owner_request_failed.');
+    expect(message).toContain('Current nodes: node.move=failure.');
+    expect(programTerminalFailureMessage({ ...run, state: 'running' }, null, null))
+      .toBeNull();
+  });
+
+  it('keeps Motion Stop pending through acceptance and clears it only on exact evidence', () => {
+    const run = {
+      ownerEpoch: 'runner.epoch.1',
+      state: 'running',
+      capture: { programRunId: 'run-1' },
+    } as ProgramRunStatus;
+    const settled = {
+      ownerEpoch: 'runner.epoch.1',
+      programRunId: 'run-1',
+      recoveryOffer: {
+        programRunId: 'run-1',
+        recoveryClass: 'ordinary_operator_stop',
+        status: 'retry_ready',
+        stopId: 'stop-1',
+        stopGeneration: 1,
+        stopCertificateId: 'certificate-1',
+        stopCertificateRevision: 1,
+      },
+    } as unknown as NonNullable<
+      Parameters<typeof programPendingAfterProjection>[2]
+    >;
+
+    expect(programPendingAfterProjection('motion-stop', run, null)).toBe(
+      'motion-stop',
+    );
+    expect(programPendingAfterProjection(
+      'motion-stop',
+      run,
+      { ...settled, ownerEpoch: 'runner.epoch.stale' },
+    )).toBe('motion-stop');
+    expect(programPendingAfterProjection('motion-stop', run, settled)).toBeNull();
+    expect(programRunNeedsObservationPoll(run, settled)).toBe(false);
+    expect(programRunNeedsObservationPoll(run, null)).toBe(true);
+    expect(programPendingAfterProjection(
+      'motion-stop',
+      { ...run, state: 'stopped' },
+      null,
+    )).toBeNull();
+    expect(programPendingAfterProjection('run', run, settled)).toBe('run');
+    expect(programPendingAfterProjection('run', run, settled, {
+      programRunnerOwnerEpoch: 'runner.epoch.1',
+      cycleGeneration: 4,
+      state: 'running',
+      programRunId: 'run-1',
+      cycleClaimGeneration: 8,
+    })).toBeNull();
+    expect(programPendingAfterProjection('reset', null, null, {
+      programRunnerOwnerEpoch: 'runner.epoch.1',
+      cycleGeneration: 5,
+      state: 'idle_after_reset',
+      programRunId: null,
+      cycleClaimGeneration: null,
+    })).toBeNull();
+
+    const resetOnly = {
+      ...settled,
+      recoveryOffer: {
+        ...settled.recoveryOffer,
+        recoveryClass: 'stop_fault_intervention',
+        status: 'reset_required',
+      },
+    } as unknown as NonNullable<
+      Parameters<typeof programMotionStopSettled>[1]
+    >;
+    expect(programMotionStopSettled(run, resetOnly)).toBe(true);
+    expect(programPendingAfterProjection('motion-stop', run, resetOnly)).toBeNull();
+    expect(programRunNeedsObservationPoll(run, resetOnly)).toBe(false);
+  });
+
+  it('keeps Resume disabled until the exact recovery offer changes', () => {
+    const run = {
+      ownerEpoch: 'runner.epoch.1',
+      state: 'running',
+      capture: { programRunId: 'run-1' },
+    } as unknown as ProgramRunStatus;
+    const retainedOffer = {
+      ownerEpoch: 'runner.epoch.1',
+      programRunId: 'run-1',
+      recoveryOffer: { offerId: 'offer-1', offerRevision: 3 },
+    } as unknown as NonNullable<
+      Parameters<typeof controlPendingAfterProjection>[1]
+    >;
+    expect(controlPendingAfterProjection(
+      'recovery:replan_from_stopped_state',
+      retainedOffer,
+      retainedOffer,
+      run,
+    )).toBe('recovery:replan_from_stopped_state');
+    expect(controlPendingAfterProjection(
+      'recovery:replan_from_stopped_state',
+      retainedOffer,
+      { ...retainedOffer, recoveryOffer: null },
+      run,
+    )).toBeNull();
+    expect(controlPendingAfterProjection(
+      'override:activate:one',
+      retainedOffer,
+      retainedOffer,
+      run,
+    )).toBe('override:activate:one');
   });
 });
 
@@ -220,6 +479,49 @@ describe('Program runtime authority requests', () => {
         },
       },
       'composer-program-owner.fixture', 'reset.fixture',
+    )).toBeNull();
+  });
+
+  it('resets a Full-stopped tree with exact run and cycle fences', () => {
+    const { snapshot } = admissionFixtures();
+    const fullStoppedSnapshot = {
+      ...snapshot,
+      programCycle: {
+        ...snapshot.programCycle,
+        state: 'running' as const,
+        programRunId: 'run-1',
+        cycleClaimGeneration: 12,
+      },
+    };
+    const run = {
+      state: 'full_stopped',
+      ownerEpoch: 'runner.epoch.1',
+      runRevision: 9,
+      capture: { programRunId: 'run-1' },
+    } as ProgramRunStatus;
+
+    expect(buildProgramFullStopResetRequest(
+      fullStoppedSnapshot,
+      run,
+      'composer-program-owner.fixture',
+      'reset-full-stop.fixture',
+    )).toEqual({
+      request_id: 'reset-full-stop.fixture',
+      request_owner_epoch: 'composer-program-owner.fixture',
+      source_label: 'operator_ui',
+      correlation_id: 'reset-full-stop.fixture',
+      program_run_id: 'run-1',
+      expected_owner_epoch: 'runner.epoch.1',
+      expected_run_revision: 9,
+      expected_cycle_generation: 3,
+      expected_claim_generation: 12,
+      reason: 'operator Reset discarded Full Stop',
+    });
+    expect(buildProgramFullStopResetRequest(
+      fullStoppedSnapshot,
+      { ...run, state: 'running' },
+      'composer-program-owner.fixture',
+      'reset-full-stop.fixture',
     )).toBeNull();
   });
 });

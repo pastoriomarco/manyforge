@@ -4736,6 +4736,13 @@ svg.viewer-camera-icon {
   border-left: 1px solid #203542;
 }
 
+/* The portaled Program and Viewer sections share the central slot's edge.
+ * Do not retain the Program grid's legacy extra border, which shifts only its
+ * inset active/header accent by one pixel. */
+.program-inspector.central-inspector-section {
+  border-left: 0;
+}
+
 .program-subpanel-header {
   display: flex;
   min-height: 2.4rem;
@@ -6209,6 +6216,12 @@ svg.viewer-camera-icon {
   font-size: 0.7rem;
 }
 
+.viewer-surface-launchers > button[aria-pressed='true'] {
+  border-color: #68cadd;
+  color: #dffaff;
+  background: #153c49;
+}
+
 .viewer-options {
   margin-left: 0;
 }
@@ -6226,7 +6239,7 @@ svg.viewer-camera-icon {
   align-items: center;
   gap: 0.35rem;
   padding: 0.3rem;
-  overflow-x: auto;
+  overflow: visible;
   border: 1px solid #365463;
   border-radius: 0.55rem;
   background: rgb(8 23 32 / 94%);
@@ -6275,22 +6288,33 @@ svg.viewer-camera-icon {
   background: #12382f;
 }
 
+.viewer-transport .transport-run {
+  width: 9rem;
+  min-width: 9rem;
+}
+
 .transport-stop-group {
   position: relative;
   display: flex;
+  width: 7.5rem;
+  min-width: 7.5rem;
   height: var(--viewer-transport-control-height);
 }
 
 .viewer-transport .transport-stop-primary {
+  min-width: 0;
+  flex: 1 1 auto;
   border-radius: 0.35rem 0 0 0.35rem;
 }
 
 .viewer-transport .transport-stop-disclosure {
-  min-width: 2.1rem;
-  padding-right: 0.45rem;
-  padding-left: 0.45rem;
+  width: 1.45rem;
+  min-width: 1.45rem;
+  padding-right: 0;
+  padding-left: 0;
   border-left-width: 0;
   border-radius: 0 0.35rem 0.35rem 0;
+  font-size: 0.68rem;
 }
 
 .transport-stop-menu {
@@ -6318,6 +6342,11 @@ svg.viewer-camera-icon {
   border-color: #7a643c;
   color: #ead39d;
   background: #382b17;
+}
+
+.viewer-transport .transport-reset {
+  width: 6.25rem;
+  min-width: 6.25rem;
 }
 
 .transport-velocity {
@@ -6782,10 +6811,72 @@ svg.viewer-camera-icon {
 
 .runtime-observability-surface {
   display: flex;
-  min-height: 18rem;
-  max-height: calc(100vh - 7rem);
+  position: fixed;
+  z-index: 110;
+  top: 3.15rem;
+  right: 0.75rem;
+  width: min(48rem, calc(100vw - 1.5rem));
+  max-height: calc(100vh - 3.9rem);
   flex-direction: column;
   overflow: hidden;
+  border: 1px solid #426171;
+  border-radius: 0.55rem;
+  color: #dbe8ee;
+  background: #0a1720;
+  box-shadow: 0 0.8rem 2.4rem rgb(0 0 0 / 42%);
+}
+
+.runtime-observability-rail {
+  display: flex;
+  min-height: 2.45rem;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0.3rem 0.38rem 0.3rem 0.7rem;
+  background: #10232d;
+}
+
+.runtime-observability-rail > strong {
+  flex: 0 0 auto;
+  font-size: 0.78rem;
+}
+
+.runtime-observability-rail-summary {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  color: #e0b6ad;
+  font-size: 0.72rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runtime-observability-rail-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.runtime-observability-rail-actions > button:not(.icon-button) {
+  min-height: 1.8rem;
+  padding: 0.2rem 0.55rem;
+  font-size: 0.68rem;
+}
+
+.runtime-observability-rail-actions .icon-button {
+  width: 1.9rem;
+  height: 1.9rem;
+}
+
+.runtime-observability-details {
+  display: flex;
+  min-height: 18rem;
+  flex: 1 1 auto;
+  flex-direction: column;
+  overflow: hidden;
+  padding: 0.65rem 0.75rem 0.75rem;
+  border-top: 1px solid #29404d;
 }
 
 .runtime-observability-tabs {

@@ -201,12 +201,24 @@ def test_recovery_offer_is_stable_policy_filtered_and_generation_fenced() -> Non
 
 def test_operator_stop_recovery_uses_owner_fence_not_failure_retry_policy() -> None:
     controls = ProgramRuntimeControls(_capture(), recovery_fences=_fences())
-    intervention = _intervention(policy_parameter="operator_stop_policy")
+    intervention = _intervention(
+        acknowledged=True,
+        policy_parameter="operator_stop_policy",
+    )
     intervention.owner_assessment["allowed_actions"] = [
-        "replan_from_stopped_state"
+        "replan_from_stopped_state",
+        "reset_cycle",
     ]
-    intervention.owner_assessment["recovery_class"] = "ordinary_operator_stop"
-    intervention.owner_assessment["status"] = "retry_ready"
+    intervention.owner_assessment.update(
+        {
+            "backend_stop_confirmed": True,
+            "execution_state": "Stopped",
+            "recovery_class": "ordinary_operator_stop",
+            "retry_admissible": True,
+            "status": "retry_ready",
+            "stop_owner_generation": 3,
+        }
+    )
     offer = controls.recovery_offer(
         cycle_generation=6,
         owner_epoch="runner.epoch.1",
@@ -220,10 +232,123 @@ def test_operator_stop_recovery_uses_owner_fence_not_failure_retry_policy() -> N
         if row["action_id"] == "replan_from_stopped_state"
     )
     assert action["enabled"] is True
+    reset = next(
+        row for row in offer["actions"] if row["action_id"] == "reset_cycle"
+    )
+    assert reset == {
+        "action_id": "reset_cycle",
+        "label_key": "recovery.reset_cycle",
+        "requires_confirmation": True,
+        "performs_backend_reset": True,
+        "enabled": True,
+        "disabled_reason_code": None,
+    }
     assert offer["manual_result"] == {
         "enabled": False,
         "disabled_reason_code": "operator_stop_requires_owner_recovery",
     }
+
+
+def test_operator_stop_reset_waits_for_proven_non_moving_state() -> None:
+    controls = ProgramRuntimeControls(_capture(), recovery_fences=_fences())
+    intervention = _intervention(policy_parameter="operator_stop_policy")
+    intervention.owner_assessment["allowed_actions"] = [
+        "replan_from_stopped_state",
+        "reset_cycle",
+    ]
+
+    offer = controls.recovery_offer(
+        cycle_generation=6,
+        owner_epoch="runner.epoch.1",
+        intervention=intervention,
+        policy={**_policy(), "allow_intervention": False, "max_retries": 0},
+    )
+
+    assert offer is not None
+    reset = next(
+        row for row in offer["actions"] if row["action_id"] == "reset_cycle"
+    )
+    assert reset["enabled"] is False
+    assert reset["disabled_reason_code"] == (
+        "operator_stop_not_physically_settled"
+    )
+
+    intervention.owner_assessment.update(
+        {
+            "backend_stop_confirmed": True,
+            "execution_state": "Stopped",
+            "recovery_class": "ordinary_operator_stop",
+            "retry_admissible": True,
+            "status": "retry_ready",
+            "stop_owner_generation": 3,
+            "observed_state_valid_until_ns": time.monotonic_ns() - 1,
+        }
+    )
+    expired = controls.recovery_offer(
+        cycle_generation=6,
+        owner_epoch="runner.epoch.1",
+        intervention=intervention,
+        policy={**_policy(), "allow_intervention": False, "max_retries": 0},
+    )
+    assert expired is not None
+    expired_reset = next(
+        row
+        for row in expired["actions"]
+        if row["action_id"] == "reset_cycle"
+    )
+    assert expired_reset["enabled"] is False
+    assert expired_reset["disabled_reason_code"] == (
+        "recovery_owner_observation_expired"
+    )
+
+
+def test_released_operator_stop_projects_no_stale_offer() -> None:
+    controls = ProgramRuntimeControls(_capture(), recovery_fences=_fences())
+    intervention = _intervention(policy_parameter="operator_stop_policy")
+    intervention.owner_assessment.update(
+        {
+            "allowed_actions": [],
+            "recovery_class": "none",
+            "status": "unavailable",
+            "stop_id": "",
+            "stop_generation": 0,
+            "stop_certificate_id": "",
+            "stop_certificate_revision": 0,
+        }
+    )
+
+    assert controls.recovery_offer(
+        cycle_generation=6,
+        owner_epoch="runner.epoch.1",
+        intervention=intervention,
+        policy={**_policy(), "allow_intervention": False, "max_retries": 0},
+    ) is None
+
+
+def test_recovery_offer_normalizes_absent_stop_identity_to_null() -> None:
+    controls = ProgramRuntimeControls(_capture(), recovery_fences=_fences())
+    intervention = _intervention()
+    intervention.owner_assessment.update(
+        {
+            "stop_id": "",
+            "stop_generation": 0,
+            "stop_certificate_id": "",
+            "stop_certificate_revision": 0,
+        }
+    )
+
+    offer = controls.recovery_offer(
+        cycle_generation=6,
+        owner_epoch="runner.epoch.1",
+        intervention=intervention,
+        policy=_policy(),
+    )
+
+    assert offer is not None
+    assert offer["stop_id"] is None
+    assert offer["stop_generation"] is None
+    assert offer["stop_certificate_id"] is None
+    assert offer["stop_certificate_revision"] is None
 
 
 def test_recovery_offer_projects_immutable_owner_facts_and_policy() -> None:

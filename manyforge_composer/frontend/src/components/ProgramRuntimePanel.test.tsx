@@ -1,9 +1,11 @@
+import { readFileSync } from 'node:fs';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
+import type { RobotControlController } from '../hooks/useRobotControl';
 import type { CycleRecoveryOffer, ProgramRunStateName } from '../types/api';
-import { ProgramRuntimePanel } from './ProgramRuntimePanel';
+import { ProgramRuntimePanel, ProgramTransportControls } from './ProgramRuntimePanel';
 
 function ordinaryMotionStopOffer(): CycleRecoveryOffer {
   return {
@@ -33,18 +35,61 @@ function ordinaryMotionStopOffer(): CycleRecoveryOffer {
     stopGeneration: 1,
     stopCertificateId: 'stop-certificate.1',
     stopCertificateRevision: 1,
-    status: 'offered',
+    status: 'retry_ready',
     recoveryClass: 'ordinary_operator_stop',
-    actions: [],
+    actions: [{
+      actionId: 'replan_from_stopped_state',
+      labelKey: 'recovery.replan_from_stopped_state',
+      requiresConfirmation: false,
+      performsBackendReset: false,
+      enabled: true,
+      disabledReasonCode: null,
+    }, {
+      actionId: 'reset_cycle',
+      labelKey: 'recovery.reset_cycle',
+      requiresConfirmation: true,
+      performsBackendReset: true,
+      enabled: true,
+      disabledReasonCode: null,
+    }],
     manualResult: {
       enabled: false,
       disabledReasonCode: 'manual_result_not_available',
     },
-    primaryAction: null,
+    primaryAction: 'replan_from_stopped_state',
     reasonCode: 'ordinary_operator_stop',
     evidenceRefs: [],
     policy: {},
   };
+}
+
+function ordinaryMotionStopControls(): NonNullable<
+  ProgramRuntimeController['state']['controls']
+> {
+  return {
+    ownerEpoch: 'program-runner.epoch.1',
+    programRunId: 'program-run.1',
+    recoveryOffer: ordinaryMotionStopOffer(),
+  } as unknown as NonNullable<ProgramRuntimeController['state']['controls']>;
+}
+
+function robotController(): RobotControlController {
+  return {
+    state: {
+      phase: 'ready',
+      operation: null,
+      status: null,
+    },
+    controlPending: null,
+    runtimeScaleStatus: null,
+    runtimeScaleError: null,
+    runtimeScaleDraft: 1,
+    runtimeScalePending: false,
+    fullStopError: null,
+    resume: vi.fn(),
+    stop: vi.fn(),
+    setRuntimeScale: vi.fn(),
+  } as unknown as RobotControlController;
 }
 
 function controller(
@@ -155,7 +200,10 @@ function controller(
       error: null,
     },
     cycleState,
-    active: ['running', 'intervention_required', 'stopping', 'finalizing']
+    active: [
+      'running', 'intervention_required', 'full_stopping', 'full_stopped',
+      'stopping', 'finalizing',
+    ]
       .includes(state),
     refresh: vi.fn(),
     selectScenario: vi.fn(),
@@ -163,6 +211,8 @@ function controller(
     dismissError: vi.fn(),
     run: vi.fn(),
     stopMotion: vi.fn(),
+    fullStop: vi.fn(),
+    resumeFullStop: vi.fn(),
     stop: vi.fn(),
     reset: vi.fn(),
     applyRecoveryAction: vi.fn(),
@@ -190,7 +240,7 @@ describe('Program runtime projection', () => {
     expect(markup).not.toContain('Selection for the next Run');
     expect(markup).toContain('Captured run Program');
     expect(markup).toContain('immutable for this run');
-    expect(markup).toContain('Stop Execution');
+    expect(markup).toContain('Program Stop');
     expect(markup).not.toContain('Stop all');
     expect(markup).toContain('never sends Stop implicitly');
   });
@@ -213,6 +263,17 @@ describe('Program runtime projection', () => {
     expect(terminal).toMatch(/disabled=""[^>]*>Run Applied Program/);
     expect(terminal).toContain('Reset Program cycle');
     expect(resetIdle).not.toMatch(/disabled=""[^>]*>Run Applied Program/);
+  });
+
+  it('offers the same Run recovery from Full Stop in the detailed panel', () => {
+    const fullStopped = controller('full_stopped');
+    const markup = renderToStaticMarkup(
+      <ProgramRuntimePanel enabled controller={fullStopped} />,
+    );
+
+    expect(markup).toContain('>Run</button>');
+    expect(markup).not.toMatch(/disabled=""[^>]*>Run<\/button>/);
+    expect(markup).toContain('Reset Program cycle');
   });
 
   it('never turns an unavailable or unknown owner fact into idle or zero work', () => {
@@ -238,18 +299,14 @@ describe('Program runtime projection', () => {
 
   it('distinguishes ordinary Motion Stop from whole-Program Stop', () => {
     const motionStopped = controller('running');
-    motionStopped.state.controls = {
-      recoveryOffer: ordinaryMotionStopOffer(),
-    } as unknown as NonNullable<ProgramRuntimeController['state']['controls']>;
+    motionStopped.state.controls = ordinaryMotionStopControls();
     const motionMarkup = renderToStaticMarkup(
       <ProgramRuntimePanel enabled controller={motionStopped} />,
     );
     expect(motionMarkup).toContain('<strong>Stopped</strong>');
 
     const settledMotionStop = controller('intervention_required');
-    settledMotionStop.state.controls = {
-      recoveryOffer: ordinaryMotionStopOffer(),
-    } as unknown as NonNullable<ProgramRuntimeController['state']['controls']>;
+    settledMotionStop.state.controls = ordinaryMotionStopControls();
     const settledMotionMarkup = renderToStaticMarkup(
       <ProgramRuntimePanel enabled controller={settledMotionStop} />,
     );
@@ -261,18 +318,85 @@ describe('Program runtime projection', () => {
         controller={controller('stopped', 'terminal_awaiting_reset')}
       />,
     );
-    expect(executionStopped).toContain('<strong>Execution stopped</strong>');
+    expect(executionStopped).toContain('<strong>Stopped</strong>');
+
+    const fullStopped = renderToStaticMarkup(
+      <ProgramRuntimePanel enabled controller={controller('full_stopped')} />,
+    );
+    expect(fullStopped).toContain('<strong>Stopped</strong>');
 
     const executionStoppedWithStaleOffer = controller(
       'stopped',
       'terminal_awaiting_reset',
     );
-    executionStoppedWithStaleOffer.state.controls = {
-      recoveryOffer: ordinaryMotionStopOffer(),
-    } as unknown as NonNullable<ProgramRuntimeController['state']['controls']>;
+    executionStoppedWithStaleOffer.state.controls = ordinaryMotionStopControls();
     const staleOfferMarkup = renderToStaticMarkup(
       <ProgramRuntimePanel enabled controller={executionStoppedWithStaleOffer} />,
     );
-    expect(staleOfferMarkup).toContain('<strong>Execution stopped</strong>');
+    expect(staleOfferMarkup).toContain('<strong>Stopped</strong>');
+  });
+
+  it('offers Resume and Reset, but not another Stop, after ordinary Motion Stop', () => {
+    const motionStopped = controller('intervention_required');
+    motionStopped.state.controls = ordinaryMotionStopControls();
+
+    const markup = renderToStaticMarkup(
+      <ProgramTransportControls
+        enabled
+        program={motionStopped}
+        robot={robotController()}
+      />,
+    );
+
+    expect(markup).toMatch(/class="transport-run"[^>]*>Resume Motion<\/button>/);
+    expect(markup).not.toMatch(/class="transport-run"[^>]*disabled=/);
+    expect(markup).toMatch(
+      /class="danger-button transport-stop-primary"[^>]*disabled=""[^>]*>Stopped<\/button>/,
+    );
+    expect(markup).toMatch(/class="transport-reset meaningful"[^>]*>Reset<\/button>/);
+    expect(markup).not.toMatch(/class="transport-reset meaningful"[^>]*disabled=/);
+  });
+
+  it('shows stable in-flight and Running labels while preventing repeated commands', () => {
+    const starting = controller('succeeded', 'idle_after_reset');
+    starting.state.pending = 'run';
+    const startingMarkup = renderToStaticMarkup(
+      <ProgramTransportControls enabled program={starting} robot={robotController()} />,
+    );
+    expect(startingMarkup).toMatch(
+      /class="transport-run"[^>]*disabled=""[^>]*>Starting<\/button>/,
+    );
+
+    const running = controller('running');
+    const runningMarkup = renderToStaticMarkup(
+      <ProgramTransportControls enabled program={running} robot={robotController()} />,
+    );
+    expect(runningMarkup).toMatch(
+      /class="transport-run"[^>]*disabled=""[^>]*>Running<\/button>/,
+    );
+
+    running.state.pending = 'motion-stop';
+    const stoppingMarkup = renderToStaticMarkup(
+      <ProgramTransportControls enabled program={running} robot={robotController()} />,
+    );
+    expect(stoppingMarkup).toMatch(
+      /class="danger-button transport-stop-primary"[^>]*disabled=""[^>]*>Stopping<\/button>/,
+    );
+    expect(stoppingMarkup).toMatch(
+      /class="transport-run"[^>]*disabled=""[^>]*>Running<\/button>/,
+    );
+  });
+
+  it('keeps fixed transport geometry and lets the Full Stop menu escape the bar', () => {
+    const css = readFileSync(new URL('../index.css', import.meta.url), 'utf8');
+    const transport = css.slice(
+      css.indexOf('.viewer-transport {'),
+      css.indexOf('.transport-velocity {'),
+    );
+    expect(transport).toContain('overflow: visible;');
+    expect(transport).toContain('width: 9rem;');
+    expect(transport).toContain('width: 7.5rem;');
+    expect(transport).toContain('width: 1.45rem;');
+    expect(transport).toContain('width: 6.25rem;');
   });
 });

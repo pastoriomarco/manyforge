@@ -403,6 +403,34 @@ class ProgramRunControlRequest(CallerAttributionRequest):
         )
 
 
+class ProgramFullStopResumeRequest(ProgramRunControlRequest):
+    """Resume one exact tree preserved by Program Full Stop."""
+
+    reason: str | None = None
+
+    @field_validator("reason")
+    @classmethod
+    def validate_resume_reason(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _bounded_nfc(
+            value,
+            label="reason",
+            maximum_bytes=MAX_PROGRAM_RUN_REASON_BYTES,
+        )
+
+
+class ProgramFullStopResetRequest(ProgramFullStopResumeRequest):
+    """Discard one exact Full-stopped tree and reset its Program cycle."""
+
+    expected_cycle_generation: Annotated[
+        int, Field(ge=1, le=9_007_199_254_740_991)
+    ]
+    expected_claim_generation: Annotated[
+        int, Field(ge=1, le=9_007_199_254_740_991)
+    ]
+
+
 class RuntimeOverrideStageRequest(ProgramRunControlRequest):
     node_instance_id: str
     node_attempt_id: str

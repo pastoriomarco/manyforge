@@ -1,6 +1,6 @@
 schema_version: manyforge.operator_alarm_catalog.v1
-catalog_version: 2.0.0
-descriptor_digest: sha256:8742de67090238e86bc90d0ac0bc6a2dae9463873c8a362ea255709f6d563d3a
+catalog_version: 2.1.0
+descriptor_digest: sha256:ae77823d45902f15070203e28fd579d3b74e64bc457072cdc2c55fdd83c3d4e6
 definitions:
   - definition_id: manyforge.motion.runtime_collision
     version: 2
@@ -47,6 +47,33 @@ definitions:
     scope_fields: [subject_kind, subject_id, resource_ids]
     set_authority: manyforge.kernel.operation_condition
     clear_authority: manyforge.kernel.operation_condition
+    adapter_id: manyforge.alarm_adapter.kernel_condition
+    runtime_modes:
+      - program
+      - direct_control
+    acknowledgement_required: true
+    acknowledgement_reason_required: false
+    requires_motion_attention: true
+    max_evidence_refs: 32
+
+  - definition_id: manyforge.motion.stop_fault
+    version: 1
+    title: Motion Stop requires recovery
+    message_template: "Stop recovery required for {subject_id}"
+    alarm_class: motion
+    priority: high
+    priority_rationale: >-
+      Motion admission remains closed because an exact Stop outcome escalated,
+      became uncertain, or otherwise requires explicit recovery.
+    consequence: >-
+      New motion cannot be admitted until the latched Stop condition is reset
+      against its exact certificate and current runtime context.
+    operator_response: >-
+      Review the Stop reason, latch, and certificate, acknowledge attention,
+      then use Reset when the runtime offers that exact recovery action.
+    scope_fields: [subject_kind, subject_id, resource_ids]
+    set_authority: manyforge.kernel.stop_fault_condition
+    clear_authority: manyforge.kernel.stop_fault_condition
     adapter_id: manyforge.alarm_adapter.kernel_condition
     runtime_modes:
       - program

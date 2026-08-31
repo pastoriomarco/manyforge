@@ -431,6 +431,8 @@ export interface AppliedProgramSelection {
 export type ProgramRunStateName =
   | 'running'
   | 'intervention_required'
+  | 'full_stopping'
+  | 'full_stopped'
   | 'stopping'
   | 'finalizing'
   | 'stopped'
@@ -481,6 +483,18 @@ export interface ProgramRunIndex {
   activeOnly: boolean;
   truncated: boolean;
   runs: ProgramRunStatus[];
+}
+
+export interface ProgramCycleStatus {
+  programRunnerOwnerEpoch: string;
+  cycleGeneration: number;
+  state: 'idle_after_reset' | 'starting' | 'running' | 'stopping'
+    | 'terminal_awaiting_reset';
+  programRunId: string | null;
+  cycleClaimGeneration: number | null;
+  terminalOrSettlementReference: string | null;
+  runtimeControlRevision: number | null;
+  recoveryOffer: CycleRecoveryOffer | null;
 }
 
 export type RuntimeOverrideStatus = 'staged' | 'active' | 'cleared' | 'stale';

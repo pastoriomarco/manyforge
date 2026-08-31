@@ -91,6 +91,110 @@ def _stop_projection_event(
         "request_id": "stop-request.1",
         "sequence": sequence,
     }
+
+
+def _stop_terminal_event(owner_epoch: str, sequence: int) -> dict[str, Any]:
+    payload = {
+        "acceptance": {
+            "accepted_at_ns": 100,
+            "request_id": "stop-request.1",
+            "stop_generation": 1,
+            "stop_id": "stop.1",
+        },
+        "acceptance_to_terminal_latency_ns": 1_000_000_000,
+        "api_version": "manyforge.stop_terminal_projection.v1",
+        "attempted_stage_count": 1,
+        "attempted_stages": [],
+        "certificate_evidence": [],
+        "certificate_evidence_count": 1,
+        "completed_at_ns": 1_000_000_100,
+        "details_truncated": True,
+        "durable_projection_digest": "sha256:" + "8" * 64,
+        "escalated": False,
+        "fault_latch": None,
+        "hard_stop_floor_used": False,
+        "owner_epoch": owner_epoch,
+        "participant_settlement": [],
+        "participant_settlement_count": 1,
+        "record_kind": "stop_terminal_projected",
+        "request_id": "stop-request.1",
+        "result": "succeeded_nominal",
+        "state": "succeeded",
+        "stop_certificate_id": "stop-certificate.1",
+        "stop_certificate_revision": 1,
+        "stop_generation": 1,
+        "stop_id": "stop.1",
+    }
+    canonical = rfc8785.dumps(payload)
+    return {
+        "effect_pending": False,
+        "occurred_at_ns": 100 + sequence,
+        "occurred_at_wall": f"2026-08-07T10:00:01.00000000{sequence}Z",
+        "operation_id": None,
+        "operation_revision": None,
+        "owner_epoch": owner_epoch,
+        "payload": payload,
+        "payload_digest": f"sha256:{hashlib.sha256(canonical).hexdigest()}",
+        "record_kind": "stop_terminal_projected",
+        "request_id": None,
+        "sequence": sequence,
+    }
+
+
+def _stop_fault_clear_event(owner_epoch: str, sequence: int) -> dict[str, Any]:
+    payload = {
+        "api_version": "manyforge.stop_fault_clear_projection.v1",
+        "fault_latch": {
+            "captured_operation_count": 1,
+            "captured_resource_count": 1,
+            "cell_id": "cell.test",
+            "latch_generation": 1,
+            "latch_id": "stop-fault.1",
+            "persistence_degraded": False,
+            "reason_code": "stop_fault_recovery_cleared",
+            "recovery_assessment_revision": 2,
+            "recovery_status": "cleared",
+            "state": "cleared",
+            "stop_certificate": {
+                "stop_certificate_id": "stop-certificate.1",
+                "stop_certificate_revision": 1,
+                "stop_generation": 1,
+                "stop_id": "stop.1",
+            },
+            "stop_generation": 1,
+            "stop_id": "stop.1",
+            "trigger": "escalated",
+        },
+        "owner_epoch": owner_epoch,
+        "record_kind": "stop_fault_cleared",
+        "request_id": "stop-fault-reset.1",
+        "result": {
+            "accepted": True,
+            "error": None,
+            "replay_status": "accepted_new",
+            "request_id": "stop-fault-reset.1",
+        },
+        "stop_certificate_id": "stop-certificate.1",
+        "stop_certificate_revision": 1,
+        "stop_generation": 1,
+        "stop_id": "stop.1",
+    }
+    canonical = rfc8785.dumps(payload)
+    return {
+        "effect_pending": False,
+        "occurred_at_ns": 100 + sequence,
+        "occurred_at_wall": f"2026-08-07T10:00:01.00000000{sequence}Z",
+        "operation_id": None,
+        "operation_revision": None,
+        "owner_epoch": owner_epoch,
+        "payload": payload,
+        "payload_digest": f"sha256:{hashlib.sha256(canonical).hexdigest()}",
+        "record_kind": "stop_fault_cleared",
+        "request_id": "stop-fault-reset.1",
+        "sequence": sequence,
+    }
+
+
 def _page(owner_epoch: str, events: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "api_version": "manyforge.execution_command_response.v1",
@@ -207,6 +311,50 @@ def test_execution_client_accepts_only_paired_null_stop_projection_identity(
     with pytest.raises(HeadlessApiError) as unattributed:
         client.events(owner_epoch, 0)
     assert unattributed.value.code == "execution_command_response_invalid"
+
+
+def test_execution_client_accepts_stop_terminal_as_stop_scoped_fact(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    client = ExecutionCommandClient(tmp_path)
+    owner_epoch = "execution-host.epoch.stop"
+    terminal = _stop_terminal_event(owner_epoch, 1)
+    monkeypatch.setattr(
+        client, "_exchange", lambda _command: _page(owner_epoch, [terminal])
+    )
+    page = client.events(owner_epoch, 0)
+    assert page["events"][0]["record_kind"] == "stop_terminal_projected"
+    assert page["events"][0]["request_id"] is None
+    assert page["events"][0]["operation_id"] is None
+
+    terminal["request_id"] = "stop-request.1"
+    with pytest.raises(HeadlessApiError) as invalid_request_identity:
+        client.events(owner_epoch, 0)
+    assert invalid_request_identity.value.code == (
+        "execution_command_response_invalid"
+    )
+
+
+def test_execution_client_accepts_stop_fault_clear_as_request_scoped_fact(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    client = ExecutionCommandClient(tmp_path)
+    owner_epoch = "execution-host.epoch.stop"
+    cleared = _stop_fault_clear_event(owner_epoch, 1)
+    monkeypatch.setattr(
+        client, "_exchange", lambda _command: _page(owner_epoch, [cleared])
+    )
+    page = client.events(owner_epoch, 0)
+    assert page["events"][0]["record_kind"] == "stop_fault_cleared"
+    assert page["events"][0]["request_id"] == "stop-fault-reset.1"
+    assert page["events"][0]["operation_id"] is None
+
+    cleared["request_id"] = None
+    with pytest.raises(HeadlessApiError) as invalid_request_identity:
+        client.events(owner_epoch, 0)
+    assert invalid_request_identity.value.code == (
+        "execution_command_response_invalid"
+    )
 
 
 def test_execution_client_requires_backend_residency_projection(
@@ -839,6 +987,8 @@ class _PagedExecution:
         self.owner_epoch = "execution-host.epoch.pump"
         self.fail = False
         self.event = _event(self.owner_epoch, 1)
+        self.stop_fault_offer: dict[str, Any] | None = None
+        self.stop_fault_calls = 0
 
     def identity(self) -> dict[str, Any]:
         return {
@@ -864,6 +1014,15 @@ class _PagedExecution:
             "schema_version": "manyforge.execution_event_page.v1",
         }
 
+    def stop_fault(self) -> dict[str, Any]:
+        self.stop_fault_calls += 1
+        return {
+            "api_version": "manyforge.execution_command_response.v1",
+            "command": "get_stop_fault",
+            "ok": True,
+            "stop_fault": self.stop_fault_offer,
+        }
+
 
 class _IdleExecution:
     def __init__(self, *, include_epoch: bool = True) -> None:
@@ -871,6 +1030,7 @@ class _IdleExecution:
         self.include_epoch = include_epoch
         self.status_calls = 0
         self.events_calls = 0
+        self.stop_fault_calls = 0
 
     def identity(self) -> dict[str, Any]:
         self.status_calls += 1
@@ -891,6 +1051,15 @@ class _IdleExecution:
     ) -> dict[str, Any]:
         self.events_calls += 1
         raise AssertionError("idle owner must not be queried for events")
+
+    def stop_fault(self) -> dict[str, Any]:
+        self.stop_fault_calls += 1
+        return {
+            "api_version": "manyforge.execution_command_response.v1",
+            "command": "get_stop_fault",
+            "ok": True,
+            "stop_fault": None,
+        }
 
 
 class _RetiringExecution(_PagedExecution):
@@ -956,6 +1125,7 @@ def test_event_pump_reconciles_typed_idle_owner_without_querying_events() -> Non
     assert execution.status_calls >= 1
     assert execution.events_calls == 0
     assert core.completed_calls[0] == {
+        "current_stop_fault_json": "null",
         "source_owner_epoch": execution.owner_epoch,
         "through_source_sequence": 0,
     }
@@ -981,6 +1151,32 @@ def test_event_pump_reconciles_idle_after_owner_retirement_at_event_high_water()
         "source_owner_epoch": execution.owner_epoch,
         "through_source_sequence": 1,
     }
+
+
+def test_event_pump_supplies_fresh_current_stop_fault_condition() -> None:
+    core = _RecordingCore()
+    execution = _PagedExecution()
+    latch = {"cell_id": "cell.test", "latch_id": "stop-fault.test.1"}
+    execution.stop_fault_offer = {
+        "configuration_expectations": [],
+        "latch": latch,
+    }
+    pump = ExecutionEventPump(  # type: ignore[arg-type]
+        core,
+        execution,
+        poll_seconds=0.01,
+        condition_poll_seconds=0.05,
+        page_limit=1,
+    )
+    pump.start()
+    assert core.completed.wait(timeout=1.0)
+    pump.shutdown()
+
+    assert pump.last_error is None
+    assert execution.stop_fault_calls >= 1
+    assert core.completed_calls[0]["current_stop_fault_json"] == (
+        rfc8785.dumps(latch).decode("utf-8")
+    )
 
 
 def test_event_pump_rejects_untyped_idle_owner_response() -> None:
@@ -1017,6 +1213,30 @@ def test_event_pump_preserves_global_stop_projection_null_identity() -> None:
     assert core.ingested[0]["record_kind"] == "stop_acceptance_projected"
     assert core.ingested[0]["operation_id"] is None
     assert core.ingested[0]["operation_revision"] is None
+
+
+def test_event_pump_preserves_terminal_stop_projection_and_digest() -> None:
+    core = _RecordingCore()
+    execution = _PagedExecution()
+    execution.event = _stop_terminal_event(execution.owner_epoch, 1)
+    pump = ExecutionEventPump(  # type: ignore[arg-type]
+        core, execution, poll_seconds=0.01, page_limit=1
+    )
+    pump.start()
+    assert core.completed.wait(timeout=1.0)
+    pump.shutdown()
+
+    assert pump.last_error is None
+    assert len(core.ingested) == 1
+    assert core.ingested[0]["record_kind"] == "stop_terminal_projected"
+    assert core.ingested[0]["request_id"] is None
+    assert core.ingested[0]["operation_id"] is None
+    assert core.ingested[0]["payload_json"] == rfc8785.dumps(
+        execution.event["payload"]
+    ).decode("utf-8")
+    assert core.ingested[0]["payload_digest"] == execution.event[
+        "payload_digest"
+    ]
 
 
 def test_event_pump_marks_a_lost_current_source_unknown() -> None:

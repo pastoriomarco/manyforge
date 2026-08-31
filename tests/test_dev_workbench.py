@@ -7,6 +7,8 @@ import socket
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location(
@@ -117,6 +119,27 @@ def test_status_command_reads_the_current_scenario_without_package_mutation(
     assert "another-native-scenario" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize(
+    "state", ["idle_after_reset", "terminal_awaiting_reset"]
+)
+def test_startup_accepts_contained_idle_and_resettable_terminal_cycles(
+    state: str,
+) -> None:
+    client = SimpleNamespace(program_cycle_status=lambda: {"state": state})
+
+    assert dev_workbench._startup_cycle_state(client) == state
+
+
+def test_startup_rejects_an_uncontained_program_cycle() -> None:
+    client = SimpleNamespace(program_cycle_status=lambda: {"state": "running"})
+
+    with pytest.raises(
+        dev_workbench.WorkbenchError,
+        match="Program cycle is not contained at startup",
+    ):
+        dev_workbench._startup_cycle_state(client)
+
+
 def test_package_cache_contains_scenario_content_only(
     monkeypatch: Any, tmp_path: Path
 ) -> None:
@@ -138,6 +161,31 @@ def test_package_cache_contains_scenario_content_only(
     assert not (scenario_root / "headless-python").exists()
     assert not (scenario_root / "manyforge_native_execution_host").exists()
     assert not (scenario_root / "manyforge_roboplan_candidate_worker").exists()
+
+
+def test_scenario_load_rejects_a_stale_workspace_deployment(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    workspace = tmp_path / "workspace"
+    deployment = workspace / "examples/example.deployment.yaml"
+    deployment.parent.mkdir(parents=True)
+    deployment.write_text(
+        '{"deployment_artifact_id":"example",'
+        '"deployment_revision":"sha256:' + ('1' * 64) + '"}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(dev_workbench, "WORKSPACE", workspace)
+
+    with pytest.raises(
+        dev_workbench.WorkbenchError,
+        match="package is stale relative to its workspace Deployment",
+    ):
+        dev_workbench._require_current_workspace_deployment(
+            {
+                "deployment_artifact_id": "example",
+                "deployment_revision": "sha256:" + ("2" * 64),
+            }
+        )
 
 
 def test_backend_build_uses_current_source_and_only_production_targets(

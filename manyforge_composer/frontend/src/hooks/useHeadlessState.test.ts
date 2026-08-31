@@ -319,6 +319,56 @@ describe('HeadlessStateSource delivery scheduling', () => {
     source.dispose();
   });
 
+  it('replaces a restarted owner epoch and ignores frames from the retired socket', () => {
+    const animationFrames: FrameRequestCallback[] = [];
+    class FakeWebSocket {
+      static instances: FakeWebSocket[] = [];
+      onopen: (() => void) | null = null;
+      onmessage: ((message: MessageEvent) => void) | null = null;
+      onerror: (() => void) | null = null;
+      onclose: (() => void) | null = null;
+      constructor(url: string) { void url; FakeWebSocket.instances.push(this); }
+      close(): void {}
+      send(value: unknown): void {
+        this.onmessage?.({ data: JSON.stringify(value) } as MessageEvent);
+      }
+    }
+    vi.stubGlobal('window', {
+      location: { href: 'http://composer.test/' },
+      requestAnimationFrame: (callback: FrameRequestCallback) => {
+        animationFrames.push(callback); return animationFrames.length;
+      },
+      cancelAnimationFrame: vi.fn(),
+    });
+    vi.stubGlobal('WebSocket', FakeWebSocket);
+
+    const source = new HeadlessStateSource();
+    source.setEnabled(true);
+    const firstSocket = FakeWebSocket.instances[0]!;
+    firstSocket.send(wireObservation(50));
+    animationFrames.shift()!(16);
+    expect(source.getLatestExecutionObservation()?.sourceSequence).toBe(50);
+
+    source.reconnect();
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    const restarted = wireObservation(1);
+    restarted.owner_epoch = 'execution-owner.2';
+    restarted.source_epoch = 'joint-source.2';
+    FakeWebSocket.instances[1]!.send(restarted);
+    animationFrames.shift()!(32);
+    expect(source.getLatestExecutionObservation()).toMatchObject({
+      ownerEpoch: 'execution-owner.2',
+      sourceEpoch: 'joint-source.2',
+      sourceSequence: 1,
+    });
+
+    firstSocket.send(wireObservation(51));
+    expect(animationFrames).toHaveLength(0);
+    expect(source.getLatestExecutionObservation()?.ownerEpoch)
+      .toBe('execution-owner.2');
+    source.dispose();
+  });
+
   it('uses one read-only state endpoint without a client authority identity', () => {
     vi.useFakeTimers();
     const urls: string[] = [];

@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import * as THREE from 'three';
 
 import type {
   LogicalSceneProjection,
@@ -8,9 +9,14 @@ import type {
   SceneUrdfManifest,
   SourceModelProjection,
 } from '../types/api';
-import type { ExecutionOwnerStatus, MotionPreviewReceipt } from '../types/robotControl';
+import type {
+  ExecutionOwnerStatus,
+  ManualControlMotionDescriptor,
+  MotionPreviewReceipt,
+} from '../types/robotControl';
 import type { ExecutionObservationFrame } from '../types/viewerObservation';
 import {
+  attachedScenePresentation,
   candidateRobotPresentation,
   createExecutionRobotPresentationReader,
   executionObservationRobotPresentation,
@@ -116,19 +122,91 @@ function sourceModel(): SourceModelProjection {
     retained_bundle_id: 'bundle-1',
     occurrences: [{
       component_id: 'robot-1',
+      model_instance_id: 'model-instance-1',
+      model_revision: 'model-revision-1',
       coordinates: [
         { source_joint_name: 'source-joint' },
         { source_joint_name: 'joint-1' },
       ],
     }],
-    targets: [{
-      component_id: 'robot-1',
-      target_id: 'arm',
-      model_groups: [{
-        commandable_source_joint_names: ['source-joint'],
-      }],
-    }],
+    targets: [
+      {
+        component_id: 'robot-1',
+        target_id: 'arm',
+        frames: [{
+          frame_kind: 'component_model_frame',
+          frame_role_id: 'tcp',
+          model_instance_id: 'model-instance-1',
+          source_link_name: 'tip',
+        }],
+        model_groups: [{
+          commandable_source_joint_names: ['source-joint'],
+        }],
+      },
+      {
+        component_id: 'robot-1',
+        target_id: 'gripper',
+        frames: [{
+          frame_kind: 'component_model_frame',
+          frame_role_id: 'tcp',
+          model_instance_id: 'model-instance-1',
+          source_link_name: 'tip',
+        }],
+        model_groups: [{
+          commandable_source_joint_names: [],
+        }],
+      },
+    ],
   } as unknown as SourceModelProjection;
+}
+
+function motionDescriptor(): ManualControlMotionDescriptor {
+  return {
+    schemaVersion: 'manyforge.manual_control_motion_descriptor.v1',
+    controllableComponentId: 'robot-1',
+    commandTargetId: 'arm',
+    frames: [{
+      frameRoleId: 'tcp',
+      compiledFrameName: 'tip',
+      modelInstanceId: 'model-instance-1',
+      modelRevision: 'model-revision-1',
+    }],
+    joints: [{
+      sourceJointName: 'source-joint',
+      compiledJointName: 'joint-1',
+      unit: 'rad',
+    }],
+  } as unknown as ManualControlMotionDescriptor;
+}
+
+function attachedLogicalScene(): LogicalSceneProjection {
+  const scene = logicalScene();
+  const snapshot = scene.snapshot;
+  if (snapshot === null) throw new Error('fixture must have a snapshot');
+  snapshot.objects[0].placement = {
+    kind: 'carried',
+    carried_object_attachment_id: 'attachment-1',
+    carried_object_attachment_revision: 'attachment-revision-1',
+  };
+  snapshot.carried_object_attachments = [{
+    carried_object_attachment_id: 'attachment-1',
+    carried_object_attachment_revision: 'attachment-revision-1',
+    scene_resource_id: 'part',
+    controllable_component_id: 'robot-1',
+    command_target_id: 'gripper',
+    carrier_frame_ref: {
+      kind: 'component',
+      controllable_component_id: 'robot-1',
+      model_instance_id: 'model-instance-1',
+      frame_role_id: 'gripper_tcp',
+    },
+    pose_in_carrier_frame: {
+      position_m: { x: 0.01, y: -0.02, z: 0.03 },
+      orientation_xyzw: [0, 0, 0, 1],
+    },
+    touch_body_roles: ['tool'],
+  }];
+  return scene;
 }
 
 function logicalScene(): LogicalSceneProjection {
@@ -291,7 +369,7 @@ describe('runtime scene presentation', () => {
       positionsRad: [Math.PI / 2],
     };
     const projected = executionObservationRobotPresentation(
-      frame, sourceModel(), manifest(), 2_000_000,
+      frame, sourceModel(), manifest(), motionDescriptor(), 2_000_000,
     );
     expect(projected).toMatchObject({
       objectId: 'robot-1',
@@ -304,11 +382,14 @@ describe('runtime scene presentation', () => {
     const reader = createExecutionRobotPresentationReader({
       getLatestExecutionObservation: () => { reads += 1; return frame; },
       subscribeExecutionObservation: () => () => undefined,
-    }, sourceModel(), manifest());
+    }, sourceModel(), manifest(), motionDescriptor());
     const first = reader.readMeasuredRobotPresentation();
     const second = reader.readMeasuredRobotPresentation();
     expect(first).toBe(second);
     expect(reads).toBe(2);
+
+    frame = { ...frame, compiledJointNames: ['fixed-tip'] };
+    expect(reader.readMeasuredRobotPresentation()).toBeNull();
 
     frame = { ...frame, graphRevision: 'crossed-graph' };
     expect(reader.readMeasuredRobotPresentation()).toBeNull();
@@ -388,6 +469,156 @@ describe('runtime scene presentation', () => {
       unknown: 1,
       buffered: 0,
     });
+  });
+
+  it('joins a gripper-carried object to the exact shared model frame and excludes a duplicate pose overlay', () => {
+    const scene = attachedLogicalScene();
+    const joined = attachedScenePresentation(
+      scene,
+      sourceModel(),
+      manifest(),
+      motionDescriptor(),
+    );
+    expect(joined.diagnostics).toEqual([]);
+    expect(joined.objects).toHaveLength(1);
+    expect(joined.objects[0]).toMatchObject({
+      attachmentId: 'attachment-1',
+      attachmentRevision: 'attachment-revision-1',
+      carrierComponentId: 'robot-1',
+      commandTargetId: 'gripper',
+      carrierFrameRoleId: 'gripper_tcp',
+      carrierCompiledFrameName: 'tip',
+      poseInCarrierFrame: {
+        position_m: { x: 0.01, y: -0.02, z: 0.03 },
+      },
+    });
+
+    const presentation = runtimeScenePresentation(
+      runtime([baseSource(posePayload('simulation_entity_pose'), {
+        eligible: true,
+        object_id: 'part',
+        policy_id: 'continuous_unattached',
+      })]),
+      scene,
+      sourceModel(),
+      manifest(),
+      motionDescriptor(),
+    );
+    expect(presentation.attachedObjects).toHaveLength(1);
+    expect(presentation.measuredObjects).toEqual([]);
+    expect(presentation.attachmentDiagnostics).toEqual([]);
+  });
+
+  it('follows the exact carrier transform and detaches at the same cell pose without a jump', () => {
+    const scene = attachedLogicalScene();
+    const attached = attachedScenePresentation(
+      scene,
+      sourceModel(),
+      manifest(),
+      motionDescriptor(),
+    ).objects[0];
+    expect(attached).toBeDefined();
+
+    const cellPose = (positionRad: number) => {
+      const frame: ExecutionObservationFrame = {
+        schemaVersion: 'manyforge.execution_observation_frame.v1',
+        ownerEpoch: 'owner-1',
+        cellId: 'cell-1',
+        retainedBundleId: 'bundle-1',
+        graphRevision: 'graph-1',
+        controllableComponentId: 'robot-1',
+        commandTargetId: 'arm',
+        sourceEpoch: 'native-1',
+        sourceSequence: positionRad === 0 ? 1 : 2,
+        receivedAtMonotonicUs: 123,
+        sourceJointNames: ['source-joint'],
+        compiledJointNames: ['joint-1'],
+        positionsRad: [positionRad],
+      };
+      const robot = executionObservationRobotPresentation(
+        frame, sourceModel(), manifest(), motionDescriptor(), 2_000_000,
+      );
+      const carrier = robot?.linkTransforms[attached!.carrierCompiledFrameName];
+      expect(carrier).toBeDefined();
+      const carrierMatrix = new THREE.Matrix4().compose(
+        new THREE.Vector3(...carrier!.position_m),
+        new THREE.Quaternion(...carrier!.orientation_xyzw),
+        new THREE.Vector3(1, 1, 1),
+      );
+      const relative = attached!.poseInCarrierFrame;
+      const objectMatrix = new THREE.Matrix4().compose(
+        new THREE.Vector3(
+          relative.position_m.x,
+          relative.position_m.y,
+          relative.position_m.z,
+        ),
+        new THREE.Quaternion(...relative.orientation_xyzw),
+        new THREE.Vector3(1, 1, 1),
+      );
+      const position = new THREE.Vector3();
+      const orientation = new THREE.Quaternion();
+      carrierMatrix.multiply(objectMatrix).decompose(
+        position, orientation, new THREE.Vector3(),
+      );
+      return { position, orientation };
+    };
+
+    const initial = cellPose(0);
+    expect(initial.position.toArray()).toEqual([2.01, -0.02, 0.03]);
+    const followed = cellPose(Math.PI / 2);
+    expect(followed.position.x).toBeCloseTo(1.02);
+    expect(followed.position.y).toBeCloseTo(1.01);
+    expect(followed.position.z).toBeCloseTo(0.03);
+
+    const detached = logicalScene();
+    const detachedSnapshot = detached.snapshot;
+    if (detachedSnapshot === null) throw new Error('fixture must have a snapshot');
+    const detachedPose = detachedSnapshot.objects[0].placement;
+    if (detachedPose.kind !== 'cell_fixed') throw new Error('fixture must be cell fixed');
+    detachedPose.pose_in_cell = {
+      position_m: {
+        x: followed.position.x,
+        y: followed.position.y,
+        z: followed.position.z,
+      },
+      orientation_xyzw: followed.orientation.toArray(),
+    };
+    expect(attachedScenePresentation(
+      detached, sourceModel(), manifest(), motionDescriptor(),
+    ).objects).toEqual([]);
+    expect(detachedPose.pose_in_cell.position_m).toEqual({
+      x: followed.position.x,
+      y: followed.position.y,
+      z: followed.position.z,
+    });
+    expect(detachedPose.pose_in_cell.orientation_xyzw)
+      .toEqual(followed.orientation.toArray());
+  });
+
+  it('reports crossed and orphaned attachment identities without inventing a pose', () => {
+    const scene = attachedLogicalScene();
+    const snapshot = scene.snapshot;
+    if (snapshot === null) throw new Error('fixture must have a snapshot');
+    const placement = snapshot.objects[0].placement;
+    if (placement.kind !== 'carried') throw new Error('fixture must be carried');
+    placement.carried_object_attachment_revision = 'crossed-revision';
+    snapshot.carried_object_attachments.push({
+      ...snapshot.carried_object_attachments[0],
+      carried_object_attachment_id: 'attachment-orphan',
+      scene_resource_id: 'orphan',
+    });
+
+    const joined = attachedScenePresentation(
+      scene,
+      sourceModel(),
+      manifest(),
+      motionDescriptor(),
+    );
+    expect(joined.objects).toEqual([]);
+    expect(joined.diagnostics.map((item) => item.code)).toEqual([
+      'attachment_orphaned',
+      'attachment_identity_mismatch',
+    ]);
   });
 
   it('fails closed instead of cross-driving an unkeyed multi-occurrence viewer', () => {

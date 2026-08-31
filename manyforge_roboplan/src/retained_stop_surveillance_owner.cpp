@@ -25,6 +25,10 @@ inline constexpr std::string_view kConfigurationEvidenceDomain =
     "stop-fault-recovery-configuration-evidence-digest";
 inline constexpr std::string_view kConfigurationEvidenceApiVersion =
     "manyforge.stop-fault-recovery-configuration-evidence.v1";
+inline constexpr std::string_view kSuccessorConfigurationEvidenceDomain =
+    "stop-fault-recovery-successor-configuration-evidence-digest";
+inline constexpr std::string_view kSuccessorConfigurationEvidenceApiVersion =
+    "manyforge.stop-fault-recovery-successor-configuration-evidence.v1";
 inline constexpr std::string_view kCurrentResourceEvidenceDomain =
     "native-current-resource-evidence-digest";
 inline constexpr std::string_view kCurrentResourceEvidenceApiVersion =
@@ -279,9 +283,289 @@ resource_evidence_digest(const core::StopSurveillanceObservationQueryDTO &query,
 }
 
 struct SelectedSource final {
-  std::shared_ptr<IRetainedObservedStateChannel> channel;
+  RetainedStopSurveillanceSourceInput source;
   RetainedStopSurveillanceObservationSource observation;
 };
+
+[[nodiscard]] bool is_exact_runtime_successor(
+    core::ResolvedStopEvidenceSourceDTO current,
+    const core::ResolvedStopEvidenceSourceDTO &predecessor) {
+  // A runtime-owner replacement changes only the two runtime epochs in a
+  // resolved physical source. Every semantic authority, product, endpoint,
+  // route, and contract identity must remain exact.
+  current.runtime_target.provider_runtime_epoch =
+      predecessor.runtime_target.provider_runtime_epoch;
+  current.runtime_target.runtime_unit_epoch =
+      predecessor.runtime_target.runtime_unit_epoch;
+  return current == predecessor;
+}
+
+[[nodiscard]] const core::StopAttemptedStageResultDTO *
+latest_authoritative_attempt(
+    const core::StopStatusDTO &status,
+    const core::StopScopeEntryKeyDTO &scope_key) noexcept {
+  const core::StopAttemptedStageResultDTO *selected = nullptr;
+  for (const auto &attempt : status.attempted_stage_results) {
+    if (attempt.scope_key == scope_key &&
+        attempt.authority ==
+            core::StopStageResultAuthorityDTO::kAuthoritative &&
+        (selected == nullptr ||
+         selected->result_sequence < attempt.result_sequence)) {
+      selected = &attempt;
+    }
+  }
+  return selected;
+}
+
+[[nodiscard]] core::ActivationSetId containment_activation_set(
+    const core::ResolvedStopContainmentScopeDTO &scope) {
+  return std::visit(
+      [](const auto &value) { return value.activation_set_id; }, scope);
+}
+
+[[nodiscard]] bool provider_target_stably_matches(
+    const core::ResolvedStopRuntimeTargetDTO &predecessor,
+    const core::RuntimeCapabilityProviderPathDTO &current,
+    const core::RuntimeParticipantBindingDTO &binding) noexcept {
+  return predecessor.provider_instance_id == current.provider_instance_id &&
+         predecessor.provider_manifest_id == current.provider_manifest_id &&
+         predecessor.provider_manifest_revision ==
+             current.provider_manifest_revision &&
+         predecessor.runtime_unit_id == current.provider_runtime_unit_id &&
+         std::count_if(binding.runtime_unit_epochs.begin(),
+                       binding.runtime_unit_epochs.end(),
+                       [&](const auto &row) {
+                         return row.runtime_unit_id ==
+                                    current.provider_runtime_unit_id &&
+                                row.runtime_epoch ==
+                                    current.provider_runtime_epoch;
+                       }) == 1;
+}
+
+[[nodiscard]] bool provider_target_stably_matches(
+    const core::ResolvedStopRuntimeTargetDTO &predecessor,
+    const core::RuntimeControlPathDTO &current,
+    const core::RuntimeParticipantBindingDTO &binding) noexcept {
+  return predecessor.provider_instance_id == current.provider_instance_id &&
+         predecessor.provider_manifest_id == current.provider_manifest_id &&
+         predecessor.provider_manifest_revision ==
+             current.provider_manifest_revision &&
+         predecessor.runtime_unit_id == current.provider_runtime_unit_id &&
+         std::count_if(binding.runtime_unit_epochs.begin(),
+                       binding.runtime_unit_epochs.end(),
+                       [&](const auto &row) {
+                         return row.runtime_unit_id ==
+                                    current.provider_runtime_unit_id &&
+                                row.runtime_epoch ==
+                                    current.provider_runtime_epoch;
+                       }) == 1;
+}
+
+[[nodiscard]] bool successor_binding_matches_terminal_participant(
+    const RetainedStopSurveillanceSourceInput &source,
+    const core::StopParticipantScopeFactsDTO &participant,
+    const core::StopAttemptedStageResultDTO &attempt,
+    const core::StopFaultLatchDTO &latch) {
+  const auto &binding = source.binding.value();
+  if (!binding.control_path.has_value() ||
+      binding.retained_bundle_id != latch.retained_bundle_id ||
+      binding.graph_revision != latch.graph_revision ||
+      binding.controllable_component_id !=
+          participant.controllable_component_id ||
+      binding.command_target_id != participant.command_target_id ||
+      binding.capability_id != participant.capability_id ||
+      binding_resources(source.binding) != participant.resources) {
+    return false;
+  }
+  const auto &path = *binding.control_path;
+  const auto &stage = attempt.result.request;
+  if (stage.participant_stop_plan.stage_commands.size() <= stage.stage_index) {
+    return false;
+  }
+  const auto &command =
+      stage.participant_stop_plan.stage_commands[stage.stage_index]
+          .resolved_stage;
+  if (path.control_domain_id != participant.control_domain_id ||
+      path.control_domain_revision != participant.control_domain_revision ||
+      path.control_binding_id != participant.control_binding_id ||
+      path.control_binding_revision != participant.control_binding_revision ||
+      path.controller_topology_id != participant.controller_topology_id ||
+      path.topology_revision != participant.topology_revision ||
+      path.control_route_id != participant.control_route_id ||
+      path.activation_set_id !=
+          containment_activation_set(command.containment_scope) ||
+      path.stop_evidence_policy_id != stage.stop_evidence_policy_id ||
+      path.stop_evidence_policy_revision !=
+          stage.stop_evidence_policy_revision ||
+      path.containment_granularity != participant.containment_granularity ||
+      path.active_control_configuration_generation.value() <=
+          participant.active_control_configuration_generation.value() ||
+      path.active_control_configuration_id ==
+          participant.active_control_configuration_id) {
+    return false;
+  }
+
+  const core::RuntimeCapabilityProviderPathDTO *selected_provider = nullptr;
+  if (stage.capability_provider_binding_id.has_value()) {
+    const auto matches = [&](const auto &candidate) {
+      return candidate.capability_provider_binding_id ==
+                 *stage.capability_provider_binding_id &&
+             candidate.capability_provider_binding_revision ==
+                 *stage.capability_provider_binding_revision;
+    };
+    if (binding.capability_provider_path.has_value() &&
+        matches(*binding.capability_provider_path)) {
+      selected_provider = &*binding.capability_provider_path;
+    }
+    const auto supporting = std::find_if(
+        binding.supporting_capability_provider_paths.begin(),
+        binding.supporting_capability_provider_paths.end(), matches);
+    if (selected_provider == nullptr &&
+        supporting != binding.supporting_capability_provider_paths.end()) {
+      selected_provider = &*supporting;
+    }
+    if (selected_provider == nullptr ||
+        !provider_target_stably_matches(command.command_target,
+                                        *selected_provider, binding)) {
+      return false;
+    }
+  } else if (!provider_target_stably_matches(command.command_target, path,
+                                              binding)) {
+    return false;
+  }
+
+  // Where the immutable Stop plan carries a physical observation source, the
+  // current source must be its exact successor. Only runtime epochs may
+  // change; product, endpoint, authority, and contract identities stay exact.
+  bool predecessor_observation_present = false;
+  bool successor_observation_present = false;
+  for (const auto &requirement : command.evidence_requirements) {
+    if (requirement.resolved_source.source_kind !=
+        core::StopEvidenceSourceKind::kBindingStateAuthority) {
+      continue;
+    }
+    predecessor_observation_present = true;
+    successor_observation_present =
+        successor_observation_present ||
+        std::any_of(source.observation_sources.begin(),
+                    source.observation_sources.end(), [&](const auto &current) {
+                      return current.evidence_requirement ==
+                                 requirement.requirement &&
+                             is_exact_runtime_successor(
+                                 current.resolved_source,
+                                 requirement.resolved_source);
+                    });
+  }
+  return !predecessor_observation_present || successor_observation_present;
+}
+
+struct SuccessorConfigurationMatch final {
+  const core::StopScopeEntryDTO *scope{};
+  const core::StopAttemptedStageResultDTO *attempt{};
+  const RetainedStopSurveillanceSourceInput *source{};
+};
+
+[[nodiscard]] std::optional<core::ContentDigest>
+successor_configuration_evidence_digest(
+    const core::StopStatusDTO &status,
+    const std::vector<RetainedStopSurveillanceSourceInput> &sources,
+    const core::StopFaultLatchDTO &latch,
+    const core::StopFaultRecoveryConfigurationExpectationDTO &expectation) {
+  std::vector<SuccessorConfigurationMatch> matches;
+  std::optional<core::ActiveControlConfigurationId> successor_id;
+  std::optional<core::ActiveControlConfigurationGeneration>
+      successor_generation;
+  for (const auto &scope : status.scope_entries) {
+    const auto *participant =
+        std::get_if<core::StopParticipantScopeFactsDTO>(&scope.facts);
+    if (participant == nullptr ||
+        participant->control_domain_id != expectation.control_domain_id) {
+      continue;
+    }
+    if (participant->active_control_configuration_id !=
+            expectation.active_control_configuration_id ||
+        participant->active_control_configuration_generation !=
+            expectation.active_control_configuration_generation) {
+      return std::nullopt;
+    }
+    const auto *attempt = latest_authoritative_attempt(status, scope.key);
+    if (attempt == nullptr) {
+      return std::nullopt;
+    }
+    const RetainedStopSurveillanceSourceInput *selected = nullptr;
+    for (const auto &source : sources) {
+      if (!successor_binding_matches_terminal_participant(
+              source, *participant, *attempt, latch)) {
+        continue;
+      }
+      if (selected != nullptr) {
+        return std::nullopt;
+      }
+      selected = &source;
+    }
+    if (selected == nullptr) {
+      return std::nullopt;
+    }
+    const auto &path = *selected->binding.value().control_path;
+    if ((successor_id.has_value() &&
+         *successor_id != path.active_control_configuration_id) ||
+        (successor_generation.has_value() &&
+         *successor_generation !=
+             path.active_control_configuration_generation)) {
+      return std::nullopt;
+    }
+    successor_id = path.active_control_configuration_id;
+    successor_generation = path.active_control_configuration_generation;
+    matches.push_back({&scope, attempt, selected});
+  }
+  if (matches.empty() || !successor_id.has_value() ||
+      !successor_generation.has_value()) {
+    return std::nullopt;
+  }
+
+  CanonicalValue::Array participant_rows;
+  participant_rows.reserve(matches.size());
+  for (const auto &match : matches) {
+    const auto &scope_key =
+        std::get<core::StopParticipantScopeKeyDTO>(match.scope->key.subject);
+    const auto &stage = match.attempt->result.request;
+    const auto &path = *match.source->binding.value().control_path;
+    participant_rows.emplace_back(CanonicalValue::Object{
+        {"control_binding_id", CanonicalValue(path.control_binding_id.value())},
+        {"control_binding_revision",
+         CanonicalValue(path.control_binding_revision.value())},
+        {"control_route_id", CanonicalValue(path.control_route_id.value())},
+        {"current_provider_runtime_epoch",
+         CanonicalValue(path.provider_runtime_epoch.value())},
+        {"operation_id", CanonicalValue(scope_key.operation_id.value())},
+        {"participant_id", CanonicalValue(scope_key.participant_id.value())},
+        {"predecessor_provider_runtime_epoch",
+         CanonicalValue(stage.provider_runtime_epoch.value())},
+        {"resolved_stop_scope_policy_digest",
+         CanonicalValue(stage.resolved_stop_scope_policy_digest.value())},
+    });
+  }
+  const CanonicalValue value(CanonicalValue::Object{
+      {"control_domain_id",
+       CanonicalValue(expectation.control_domain_id.value())},
+      {"current_active_control_configuration_generation",
+       CanonicalValue(std::to_string(successor_generation->value()))},
+      {"current_active_control_configuration_id",
+       CanonicalValue(successor_id->value())},
+      {"graph_revision", CanonicalValue(latch.graph_revision.value())},
+      {"participants", CanonicalValue(std::move(participant_rows))},
+      {"predecessor_active_control_configuration_generation",
+       CanonicalValue(std::to_string(
+           expectation.active_control_configuration_generation.value()))},
+      {"predecessor_active_control_configuration_id",
+       CanonicalValue(expectation.active_control_configuration_id.value())},
+      {"retained_bundle_id",
+       CanonicalValue(latch.retained_bundle_id.value())},
+  });
+  return core::ContentDigest(content_identity::framed_sha256(
+      kSuccessorConfigurationEvidenceDomain,
+      kSuccessorConfigurationEvidenceApiVersion, value));
+}
 
 [[nodiscard]] bool snapshot_matches_context(
     const core::ObservedStateSnapshotDTO &snapshot,
@@ -337,6 +621,48 @@ struct RefreshedCurrentQuiescenceObservation final {
   CurrentQuiescenceObservation observation;
   std::int64_t assessed_at_ns{};
 };
+
+[[nodiscard]] core::ContentDigest successor_resource_evidence_digest(
+    const core::StopSurveillanceObservationQueryDTO &query,
+    const RetainedStopSurveillanceSourceInput &source,
+    const CurrentQuiescenceObservation &observed,
+    const core::ResourceId &resource) {
+  const auto &binding = source.binding.value();
+  const auto &path = *binding.control_path;
+  const CanonicalValue value(CanonicalValue::Object{
+      {"active_control_configuration_generation",
+       CanonicalValue(std::to_string(
+           path.active_control_configuration_generation.value()))},
+      {"active_control_configuration_id",
+       CanonicalValue(path.active_control_configuration_id.value())},
+      {"current_provider_runtime_epoch",
+       CanonicalValue(path.provider_runtime_epoch.value())},
+      {"current_source_epoch",
+       CanonicalValue(observed.snapshot.source_epoch.value())},
+      {"current_source_sequence",
+       CanonicalValue(std::to_string(observed.snapshot.sequence))},
+      {"no_active_goal_evidence_digest",
+       CanonicalValue(observed.no_active_goal_evidence_digest.value())},
+      {"predecessor_provider_runtime_epoch",
+       CanonicalValue(query.resolved_source.runtime_target
+                          .provider_runtime_epoch.value())},
+      {"resource_id", CanonicalValue(resource.value())},
+      {"scope_origin_stop_generation",
+       CanonicalValue(
+           std::to_string(query.scope_key.origin_stop_generation.value()))},
+      {"scope_origin_stop_id",
+       CanonicalValue(query.scope_key.origin_stop_id.value())},
+      {"stop_certificate_id",
+       CanonicalValue(query.stop_certificate.stop_certificate_id.value())},
+      {"stop_certificate_revision",
+       CanonicalValue(std::to_string(
+           query.stop_certificate.stop_certificate_revision.value()))},
+  });
+  return core::ContentDigest(content_identity::framed_sha256(
+      kResourceEvidenceDomain, "manyforge.stop-fault-recovery-successor-"
+                               "resource-evidence.v1",
+      value));
+}
 
 [[nodiscard]] bool quiescence_refreshable(const core::ErrorDTO &failure) {
   if (failure.code.rfind("native_current_resource_", 0U) == 0U ||
@@ -488,7 +814,28 @@ select_source(const std::vector<RetainedStopSurveillanceSourceInput> &sources,
       }
       if (result.has_value())
         return std::nullopt;
-      result = SelectedSource{source.state_channel, observation};
+      result = SelectedSource{source, observation};
+    }
+  }
+  return result;
+}
+
+
+[[nodiscard]] std::optional<SelectedSource> select_successor_source(
+    const std::vector<RetainedStopSurveillanceSourceInput> &sources,
+    const core::StopEvidenceRequirementDTO &requirement,
+    const core::ResolvedStopEvidenceSourceDTO &predecessor) {
+  std::optional<SelectedSource> result;
+  for (const auto &source : sources) {
+    for (const auto &observation : source.observation_sources) {
+      if (observation.evidence_requirement != requirement ||
+          !is_exact_runtime_successor(observation.resolved_source,
+                                      predecessor)) {
+        continue;
+      }
+      if (result.has_value())
+        return std::nullopt;
+      result = SelectedSource{source, observation};
     }
   }
   return result;
@@ -497,14 +844,15 @@ select_source(const std::vector<RetainedStopSurveillanceSourceInput> &sources,
 [[nodiscard]] core::StopSurveillanceObservationSampleDTO
 observe_selected(const core::StopSurveillanceObservationQueryDTO &query,
                  const SelectedSource &selected) {
-  auto observed = selected.channel->current_state(query.evaluation_time_ns);
+  auto observed =
+      selected.source.state_channel->current_state(query.evaluation_time_ns);
   if (!observed.ok()) {
     return unavailable_sample(
         query, core::StopSurveillanceSourceAvailabilityDTO::kUnavailable,
         "stop_surveillance_source_unavailable", observed.error().message);
   }
   const auto &snapshot = observed.value();
-  const auto &context = selected.channel->query_context();
+  const auto &context = selected.source.state_channel->query_context();
   if (!core::validate_observed_state_snapshot(snapshot,
                                               query.evaluation_time_ns)
            .ok() ||
@@ -570,16 +918,7 @@ using MotionRestRequirement = std::pair<core::StopEvidenceRequirementDTO,
 [[nodiscard]] std::vector<MotionRestRequirement>
 recovery_motion_rest_requirements(const core::StopStatusDTO &status,
                                   const core::StopScopeEntryKeyDTO &scope_key) {
-  const core::StopAttemptedStageResultDTO *selected = nullptr;
-  for (const auto &attempt : status.attempted_stage_results) {
-    if (attempt.scope_key == scope_key &&
-        attempt.authority ==
-            core::StopStageResultAuthorityDTO::kAuthoritative &&
-        (selected == nullptr ||
-         selected->result_sequence < attempt.result_sequence)) {
-      selected = &attempt;
-    }
-  }
+  const auto *selected = latest_authoritative_attempt(status, scope_key);
   if (selected == nullptr)
     return {};
 
@@ -756,6 +1095,7 @@ RetainedStopSurveillanceOwner::BuildRecoveryFacts(
 
     std::map<core::ResourceId, core::StopFaultRecoveryResourceFactDTO>
         resource_facts;
+    auto effective_assessed_at_ns = assessed_at_ns;
     for (const auto &resource : latch.captured_resources) {
       resource_facts.emplace(
           resource,
@@ -782,11 +1122,78 @@ RetainedStopSurveillanceOwner::BuildRecoveryFacts(
       for (const auto &requirement : requirements) {
         const core::StopSurveillanceObservationQueryDTO query{
             *status.stop_certificate, scope.key, requirement.first,
-            requirement.second, assessed_at_ns};
-        const auto selected =
+            requirement.second, effective_assessed_at_ns};
+        auto selected =
             select_source(sources, requirement.first, requirement.second);
+        bool successor = false;
+        if (!selected.has_value()) {
+          selected = select_successor_source(
+              sources, requirement.first, requirement.second);
+          successor = selected.has_value();
+        }
         if (!selected.has_value())
           continue;
+        if (successor) {
+          auto current = observe_current_quiescence_after_refresh(
+              selected->source, selected->observation.observed_resources,
+              effective_assessed_at_ns, clock_);
+          if (current.ok()) {
+            effective_assessed_at_ns = std::max(
+                effective_assessed_at_ns, current.value().assessed_at_ns);
+          }
+          for (const auto &resource :
+               selected->observation.observed_resources) {
+            if (!std::binary_search(participant->resources.begin(),
+                                    participant->resources.end(), resource)) {
+              continue;
+            }
+            auto found = resource_facts.find(resource);
+            if (found == resource_facts.end())
+              continue;
+            if (ambiguous_resources.contains(resource))
+              continue;
+            if (!assigned_resources.insert(resource).second) {
+              ambiguous_resources.insert(resource);
+              found->second = core::StopFaultRecoveryResourceFactDTO{
+                  resource,
+                  core::StopFaultRecoveryResourceStateDTO::kUnavailable,
+                  std::nullopt,
+                  std::nullopt,
+                  std::nullopt,
+                  std::nullopt,
+                  std::nullopt,
+                  error("stop_recovery_source_ambiguous",
+                        "multiple native rest predicates cover one resource")};
+              continue;
+            }
+            if (!current.ok()) {
+              found->second = core::StopFaultRecoveryResourceFactDTO{
+                  resource,
+                  core::StopFaultRecoveryResourceStateDTO::kUnavailable,
+                  std::nullopt,
+                  std::nullopt,
+                  std::nullopt,
+                  std::nullopt,
+                  std::nullopt,
+                  current.error()};
+              continue;
+            }
+            const auto &observed = current.value().observation;
+            found->second = core::StopFaultRecoveryResourceFactDTO{
+                resource,
+                core::StopFaultRecoveryResourceStateDTO::kSettled,
+                observed.snapshot.source_epoch,
+                observed.snapshot.sequence,
+                observed.source_age_ns,
+                std::min(requirement.first.source_requirement
+                             .freshness_budget_ns,
+                         kRetainedNativeReconciliationFreshnessBudgetNs),
+                successor_resource_evidence_digest(
+                    query, selected->source, observed, resource),
+                std::nullopt};
+          }
+          continue;
+        }
         const auto sample = observe_selected(query, *selected);
         for (const auto &resource : selected->observation.observed_resources) {
           if (!std::binary_search(participant->resources.begin(),
@@ -883,7 +1290,8 @@ RetainedStopSurveillanceOwner::BuildRecoveryFacts(
         configuration_facts;
     configuration_facts.reserve(expectations.size());
     for (const auto &[domain, expectation] : expectations) {
-      const bool reconciled =
+      std::optional<core::ContentDigest> evidence;
+      const bool exact =
           std::any_of(sources.begin(), sources.end(), [&](const auto &source) {
             const auto &value = source.binding.value();
             return value.retained_bundle_id == latch.retained_bundle_id &&
@@ -896,12 +1304,15 @@ RetainedStopSurveillanceOwner::BuildRecoveryFacts(
                            ->active_control_configuration_generation ==
                        expectation.active_control_configuration_generation;
           });
+      if (exact) {
+        evidence = configuration_evidence_digest(
+            expectation, latch.retained_bundle_id, latch.graph_revision);
+      } else {
+        evidence = successor_configuration_evidence_digest(
+            status, sources, latch, expectation);
+      }
       configuration_facts.push_back(core::StopFaultRecoveryConfigurationFactDTO{
-          expectation, reconciled,
-          reconciled ? std::optional(configuration_evidence_digest(
-                           expectation, latch.retained_bundle_id,
-                           latch.graph_revision))
-                     : std::nullopt});
+          expectation, evidence.has_value(), std::move(evidence)});
     }
 
     std::vector<core::StopFaultRecoveryResourceFactDTO> external_facts;
@@ -953,7 +1364,7 @@ RetainedStopSurveillanceOwner::BuildRecoveryFacts(
       static_cast<void>(resource);
       resources.push_back(std::move(fact));
     }
-    core::StopFaultRecoveryFactsDTO facts{assessed_at_ns,
+    core::StopFaultRecoveryFactsDTO facts{effective_assessed_at_ns,
                                           latch.cell_id,
                                           latch.retained_bundle_id,
                                           latch.graph_revision,

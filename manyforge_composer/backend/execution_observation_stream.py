@@ -199,6 +199,8 @@ class ExecutionObservationSource:
         self._published = 0
         self._replaced = 0
         self._errors = 0
+        self._last_poll_duration_us = 0
+        self._max_poll_duration_us = 0
         self._last_error: dict[str, str] | None = None
 
     def subscribe(self) -> ExecutionObservationSubscription:
@@ -235,6 +237,8 @@ class ExecutionObservationSource:
                 "poll_count": self._polls,
                 "published_count": self._published,
                 "error_count": self._errors,
+                "last_poll_duration_us": self._last_poll_duration_us,
+                "max_poll_duration_us": self._max_poll_duration_us,
                 "last_error": (
                     None if self._last_error is None else dict(self._last_error)
                 ),
@@ -305,6 +309,11 @@ class ExecutionObservationSource:
                         "message": str(error)[:512],
                     }
                 elapsed = time.monotonic() - started
+                elapsed_us = max(0, round(elapsed * 1_000_000))
+                self._last_poll_duration_us = elapsed_us
+                self._max_poll_duration_us = max(
+                    self._max_poll_duration_us, elapsed_us
+                )
                 period = (
                     _OBSERVATION_ERROR_PERIOD_S
                     if failed

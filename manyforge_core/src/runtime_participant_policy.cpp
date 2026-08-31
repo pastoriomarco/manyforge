@@ -77,8 +77,15 @@ using MotionScopeKey = std::tuple<std::string_view, std::string_view, std::strin
 }  // namespace
 
 Result<RuntimeParticipantPolicySelection> verify_runtime_participant_policy_selection(
-    RuntimePolicyDTO policy, const RuntimeParticipantBinding& participant) {
-  if (!bounded_id(policy.runtime_policy_id) ||
+    RuntimePolicyCatalogRecordRefDTO source_artifact, RuntimePolicyDTO policy,
+    const RuntimeParticipantBinding& participant) {
+  if (source_artifact.record_id != policy.runtime_policy_id ||
+      source_artifact.record_revision != policy.runtime_policy_revision ||
+      source_artifact.schema_id.value() != kRuntimePolicyApiVersion ||
+      !IsExactLowercaseSha256Digest(source_artifact.schema_revision.value()) ||
+      !IsExactLowercaseSha256Digest(source_artifact.content_digest.value()) ||
+      source_artifact.content_addressed_store_key.empty() ||
+      !bounded_id(policy.runtime_policy_id) ||
       !IsExactLowercaseSha256Digest(policy.runtime_policy_revision.value()) ||
       (policy.description.has_value() &&
        !bounded_nfc(*policy.description, kMaxRuntimePolicyDescriptionBytes, true)) ||
@@ -109,6 +116,8 @@ Result<RuntimeParticipantPolicySelection> verify_runtime_participant_policy_sele
 
   std::optional<double> cell_limit;
   std::optional<double> exact_target_limit;
+  std::optional<RuntimeMotionSpeedLimitDTO> cell_limit_row;
+  std::optional<RuntimeMotionSpeedLimitDTO> exact_target_limit_row;
   for (const auto& limit : policy.motion_speed_limits) {
     if (!std::isfinite(limit.maximum_tcp_linear_speed_mps) ||
         limit.maximum_tcp_linear_speed_mps <= 0.0 || limit.maximum_tcp_linear_speed_mps > 1000.0) {
@@ -118,6 +127,7 @@ Result<RuntimeParticipantPolicySelection> verify_runtime_participant_policy_sele
     }
     if (std::holds_alternative<RuntimePolicyCellScopeDTO>(limit.scope)) {
       cell_limit = limit.maximum_tcp_linear_speed_mps;
+      cell_limit_row = limit;
       continue;
     }
     const auto& target = std::get<RuntimePolicyCommandTargetScopeDTO>(limit.scope);
@@ -128,6 +138,7 @@ Result<RuntimeParticipantPolicySelection> verify_runtime_participant_policy_sele
     }
     if (matches(limit.scope, participant.value())) {
       exact_target_limit = limit.maximum_tcp_linear_speed_mps;
+      exact_target_limit_row = limit;
     }
   }
   if (cell_limit.has_value() && exact_target_limit.has_value() &&
@@ -171,10 +182,14 @@ Result<RuntimeParticipantPolicySelection> verify_runtime_participant_policy_sele
           ? (exact_target_limit.has_value() ? std::min(*cell_limit, *exact_target_limit)
                                             : *cell_limit)
           : *exact_target_limit;
+  const auto& selected_limit = exact_target_limit_row.has_value()
+                                   ? *exact_target_limit_row
+                                   : *cell_limit_row;
   return Result<RuntimeParticipantPolicySelection>::Ok(
       RuntimeParticipantPolicySelection(RuntimeParticipantPolicySelectionDTO{
-          participant.value().controllable_component_id, participant.value().command_target_id,
-          std::move(policy), effective}));
+          participant.value().controllable_component_id,
+          participant.value().command_target_id, std::move(source_artifact),
+          std::move(policy), selected_limit, effective}));
 }
 
 Result<SpeedProfileDTO> apply_runtime_participant_motion_speed_policy(

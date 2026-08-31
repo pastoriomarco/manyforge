@@ -152,9 +152,9 @@ constexpr std::array<Scenario, 12U> kScenarios{{
   return result;
 }
 
-[[nodiscard]] std::string read_bounded_plain_file(
-    const std::filesystem::path &path, std::uintmax_t maximum_bytes,
-    std::string_view label) {
+[[nodiscard]] std::string
+read_bounded_plain_file(const std::filesystem::path &path,
+                        std::uintmax_t maximum_bytes, std::string_view label) {
   if (std::filesystem::is_symlink(path) ||
       !std::filesystem::is_regular_file(path)) {
     throw std::invalid_argument(std::string(label) +
@@ -174,9 +174,9 @@ constexpr std::array<Scenario, 12U> kScenarios{{
   stream.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
   if (stream.gcount() != static_cast<std::streamsize>(bytes.size()) ||
       stream.peek() != std::char_traits<char>::eof()) {
-    throw std::runtime_error(std::string(label) +
-                             " changed during its bounded read: " +
-                             path.string());
+    throw std::runtime_error(
+        std::string(label) +
+        " changed during its bounded read: " + path.string());
   }
   return bytes;
 }
@@ -624,11 +624,10 @@ materialize_scenarios(const std::filesystem::path &root,
         });
     const auto runtime_policies = select_catalog_values(
         catalog.runtime_policies, selected_records, [](const auto &value) {
-          return CatalogKey{
-              static_cast<std::uint8_t>(
-                  core::CatalogRecordKind::kRuntimePolicy),
-              value.value().runtime_policy_id.value(),
-              value.value().runtime_policy_revision.value()};
+          return CatalogKey{static_cast<std::uint8_t>(
+                                core::CatalogRecordKind::kRuntimePolicy),
+                            value.value().runtime_policy_id.value(),
+                            value.value().runtime_policy_revision.value()};
         });
     const auto stop_policies = select_catalog_values(
         catalog.stop_policies, selected_records, [](const auto &value) {
@@ -702,10 +701,9 @@ materialize_scenarios(const std::filesystem::path &root,
     }
     const auto applicability = deployment::qualify_cell_applicability(
         composition, verified.applicability_inputs(), profiles,
-        runtime_policies, command_schemas,
-        capabilities, contracts, topologies, manifests, stop_policies,
-        selected_value_schemas, selected_commissioning_evidence,
-        selected_overlay);
+        runtime_policies, command_schemas, capabilities, contracts, topologies,
+        manifests, stop_policies, selected_value_schemas,
+        selected_commissioning_evidence, selected_overlay);
     const auto qualified = deployment::qualify_deployment_for_retention(
         verified, deployment::compile_cell_ir(applicability));
 
@@ -1179,11 +1177,12 @@ void stage_program_scene_assets(
   if (scene == nullptr) {
     return;
   }
-  for (const auto &resource : require_array(*scene, "maintained Program scene")) {
+  for (const auto &resource :
+       require_array(*scene, "maintained Program scene")) {
     const auto &shape = require_member(resource, "shape", "scene resource");
-    const auto &type = require_text(
-        require_member(shape, "type", "scene resource shape"),
-        "scene resource shape.type");
+    const auto &type =
+        require_text(require_member(shape, "type", "scene resource shape"),
+                     "scene resource shape.type");
     if (type != "mesh") {
       continue;
     }
@@ -1574,6 +1573,15 @@ qualify_catalog(const std::filesystem::path &root,
         make_reference<core::ProviderManifestCatalogRecordRefDTO>(bytes);
     auto manifest = deployment::resolve_and_qualify_provider_manifest(
         reference, reference.content_addressed_store_key, bytes);
+    const auto has_contract_role = [&manifest](std::string_view role_id) {
+      return std::any_of(manifest.value().provider_contracts.begin(),
+                         manifest.value().provider_contracts.end(),
+                         [role_id](const auto &contract) {
+                           return contract.provider_contract_ref
+                                      .provider_contract_role_id.value() ==
+                                  role_id;
+                         });
+    };
     if (manifest.value().provider_manifest_id.value() == "lite6_arm_provider") {
       if (found_lite6_arm_lifecycle_manifest ||
           !manifest.value().lifecycle_plan_catalog.has_value() ||
@@ -1581,7 +1589,9 @@ qualify_catalog(const std::filesystem::path &root,
                   .lifecycle_plan_catalog->catalog_api_version.value() !=
               core::kBrandLifecyclePlanCatalogApiVersion ||
           manifest.value().offered_capabilities.size() != 15U ||
-          manifest.value().provider_contracts.size() != 1U) {
+          manifest.value().provider_contracts.size() != 2U ||
+          !has_contract_role("software_hard_stop") ||
+          !has_contract_role("stop_contract")) {
         throw std::logic_error(
             "maintained Lite6 arm lifecycle provider manifest is not exact");
       }
@@ -1594,9 +1604,10 @@ qualify_catalog(const std::filesystem::path &root,
                   .lifecycle_plan_catalog->catalog_api_version.value() !=
               core::kBrandLifecyclePlanCatalogApiVersion ||
           manifest.value().offered_capabilities.size() != 7U ||
-          manifest.value().provider_contracts.size() != 1U) {
-        throw std::logic_error(
-            "maintained Lite6 gripper lifecycle provider manifest is not exact");
+          manifest.value().provider_contracts.size() != 1U ||
+          !has_contract_role("software_hard_stop")) {
+        throw std::logic_error("maintained Lite6 gripper lifecycle provider "
+                               "manifest is not exact");
       }
       found_lite6_gripper_lifecycle_manifest = true;
     } else if (manifest.value().provider_manifest_id.value() ==
@@ -1607,7 +1618,9 @@ qualify_catalog(const std::filesystem::path &root,
                   .lifecycle_plan_catalog->catalog_api_version.value() !=
               core::kBrandLifecyclePlanCatalogApiVersion ||
           manifest.value().offered_capabilities.size() != 27U ||
-          manifest.value().provider_contracts.size() != 1U) {
+          manifest.value().provider_contracts.size() != 2U ||
+          !has_contract_role("software_hard_stop") ||
+          !has_contract_role("stop_contract")) {
         throw std::logic_error(
             "maintained ROS control lifecycle provider manifest is not exact");
       }
@@ -1637,7 +1650,7 @@ qualify_catalog(const std::filesystem::path &root,
     insert_reference(result, reference);
   }
 
-  for (const auto &path : source_files(catalog_root / "runtime_policy", 2U)) {
+  for (const auto &path : source_files(catalog_root / "runtime_policy", 12U)) {
     const std::string bytes = read_file(path);
     const auto reference =
         make_reference<core::RuntimePolicyCatalogRecordRefDTO>(bytes);
@@ -1650,7 +1663,7 @@ qualify_catalog(const std::filesystem::path &root,
   }
 
   for (const auto &path :
-       source_files(catalog_root / "stop_evidence_policy", 1U)) {
+       source_files(catalog_root / "stop_evidence_policy", 2U)) {
     const std::string bytes = read_file(path);
     const auto reference =
         make_reference<core::StopEvidencePolicyCatalogRecordRefDTO>(bytes);
@@ -1768,8 +1781,8 @@ qualify_catalog(const std::filesystem::path &root,
     result.model_assets.push_back(std::move(verified));
     result.structural_preparations.push_back(std::move(preparation));
   }
-  if (result.records.size() != 72U || result.runtime_profiles.size() != 2U ||
-      result.runtime_policies.size() != 2U) {
+  if (result.records.size() != 83U || result.runtime_profiles.size() != 2U ||
+      result.runtime_policies.size() != 12U) {
     throw std::logic_error("maintained exact catalog closure is incomplete");
   }
   return result;
@@ -1838,8 +1851,8 @@ void verify_scenarios(const std::filesystem::path &root,
     }
     const std::size_t expected_catalog_count =
         (scenario.ros2_control_execution
-             ? 53U
-             : (scenario.family_id == "lite6_lite_gripper" ? 55U : 49U)) +
+             ? 54U
+             : (scenario.family_id == "lite6_lite_gripper" ? 56U : 50U)) +
         2U * external_manifest_ids.size();
     if (verified.catalog_records().size() != expected_catalog_count) {
       throw std::invalid_argument(
@@ -1856,9 +1869,8 @@ void verify_scenarios(const std::filesystem::path &root,
             std::string(scenario.source) + " (kind " +
             std::to_string(static_cast<std::uint8_t>(
                 core::catalog_record_kind(reference))) +
-            ", id " + core::catalog_record_id_value(reference) +
-            ", revision " + core::catalog_record_revision_value(reference) +
-            ")");
+            ", id " + core::catalog_record_id_value(reference) + ", revision " +
+            core::catalog_record_revision_value(reference) + ")");
       }
     }
 
@@ -1871,6 +1883,53 @@ void verify_scenarios(const std::filesystem::path &root,
       throw std::invalid_argument("maintained scenario has an incomplete "
                                   "component/runtime/capability closure: " +
                                   std::string(scenario.source));
+    }
+    if (applicability.retained_policy_records.size() != 1U) {
+      throw std::invalid_argument(
+          "maintained scenario does not select one exact runtime policy: " +
+          std::string(scenario.source));
+    }
+    const auto *runtime_policy_ref =
+        std::get_if<core::RuntimePolicyCatalogRecordRefDTO>(
+            &applicability.retained_policy_records.front());
+    const auto selected_policy =
+        runtime_policy_ref == nullptr
+            ? catalog.runtime_policies.end()
+            : std::find_if(catalog.runtime_policies.begin(),
+                           catalog.runtime_policies.end(),
+                           [runtime_policy_ref](const auto &policy) {
+                             return policy.reference() == *runtime_policy_ref;
+                           });
+    if (selected_policy == catalog.runtime_policies.end() ||
+        selected_policy->value().motion_speed_limits.size() != 2U) {
+      throw std::invalid_argument(
+          "maintained scenario runtime policy is absent or incomplete: " +
+          std::string(scenario.source));
+    }
+    std::optional<double> cell_speed_limit;
+    std::optional<double> target_speed_limit;
+    for (const auto &limit : selected_policy->value().motion_speed_limits) {
+      if (std::holds_alternative<core::RuntimePolicyCellScopeDTO>(
+              limit.scope)) {
+        cell_speed_limit = limit.maximum_tcp_linear_speed_mps;
+        continue;
+      }
+      const auto &target =
+          std::get<core::RuntimePolicyCommandTargetScopeDTO>(limit.scope);
+      if (target.controllable_component_id ==
+              graph.controllable_components.front().controllable_component_id &&
+          target.command_target_id.value() == "arm") {
+        target_speed_limit = limit.maximum_tcp_linear_speed_mps;
+      }
+    }
+    const double expected_target_speed_limit =
+        scenario.family_id == "lite6_lite_gripper" ? 0.15 : 0.25;
+    if (cell_speed_limit != std::optional<double>{0.5} ||
+        target_speed_limit !=
+            std::optional<double>{expected_target_speed_limit}) {
+      throw std::invalid_argument(
+          "maintained scenario has the wrong exact target speed policy: " +
+          std::string(scenario.source));
     }
     const auto &runtime = graph.runtime_units.front();
     if (runtime.runtime_profile_id.value() != expected_runtime_profile_id) {
@@ -1895,19 +1954,19 @@ void verify_scenarios(const std::filesystem::path &root,
                            core::JsonValueDTO{-1.57}, core::JsonValueDTO{0.0}};
     }
     const bool mesh_heavy_isaac_runtime =
-        scenario.source == std::string_view(
-                               "examples/isaac_manipulator_scene_light_"
-                               "assistant.deployment.yaml") ||
-        scenario.source == std::string_view(
-                               "examples/isaac_manipulator_scene_light_"
-                               "ros2_control.deployment.yaml") ||
-        scenario.source == std::string_view(
-                               "examples/isaac_manipulator_scene_light_"
-                               "ros2_control_collision.deployment.yaml");
+        scenario.source ==
+            std::string_view("examples/isaac_manipulator_scene_light_"
+                             "assistant.deployment.yaml") ||
+        scenario.source ==
+            std::string_view("examples/isaac_manipulator_scene_light_"
+                             "ros2_control.deployment.yaml") ||
+        scenario.source ==
+            std::string_view("examples/isaac_manipulator_scene_light_"
+                             "ros2_control_collision.deployment.yaml");
     const bool assistant_isaac_runtime =
-        scenario.source == std::string_view(
-                               "examples/isaac_manipulator_scene_light_"
-                               "assistant.deployment.yaml");
+        scenario.source ==
+        std::string_view("examples/isaac_manipulator_scene_light_"
+                         "assistant.deployment.yaml");
     core::JsonObjectDTO expected_runtime_configuration{
         {"collision_monitor_period_ms",
          core::JsonValueDTO{mesh_heavy_isaac_runtime ? 100.0 : 50.0}},
@@ -1932,20 +1991,19 @@ void verify_scenarios(const std::filesystem::path &root,
           "runtime_collision_lookahead_cycle_budget_ms",
           core::JsonValueDTO{350.0});
       expected_runtime_configuration.emplace(
-          "runtime_collision_lookahead_max_samples",
-          core::JsonValueDTO{32.0});
+          "runtime_collision_lookahead_max_samples", core::JsonValueDTO{32.0});
       expected_runtime_configuration.emplace(
           "runtime_collision_lookahead_query_budget_ms",
           core::JsonValueDTO{75.0});
-      expected_runtime_configuration.emplace(
-          "runtime_collision_lookahead_s", core::JsonValueDTO{2.0});
+      expected_runtime_configuration.emplace("runtime_collision_lookahead_s",
+                                             core::JsonValueDTO{2.0});
       expected_runtime_configuration.emplace(
           "runtime_collision_lookahead_workers", core::JsonValueDTO{4.0});
       expected_runtime_configuration.emplace(
           "runtime_dynamic_body_max_age_cap_ms",
           core::JsonValueDTO{assistant_isaac_runtime ? 1500.0 : 1000.0});
-      expected_runtime_configuration.emplace(
-          "validation_collision_workers", core::JsonValueDTO{4.0});
+      expected_runtime_configuration.emplace("validation_collision_workers",
+                                             core::JsonValueDTO{4.0});
     }
     if (runtime.configuration != expected_runtime_configuration) {
       throw std::invalid_argument(
@@ -2056,8 +2114,8 @@ int main(int argc, char **argv) {
         qualify_catalog(root, input_source, families);
     verify_scenarios(root, catalog);
     TemporaryPackage package(options.package_root);
-    const auto products = materialize_scenarios(
-        root, catalog, input_source, package.path());
+    const auto products =
+        materialize_scenarios(root, catalog, input_source, package.path());
     const auto bindings =
         verify_program_bindings(root, products, package.path());
     publish_and_verify_scenario_catalog(root, products, bindings,

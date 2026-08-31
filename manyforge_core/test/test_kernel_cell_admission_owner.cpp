@@ -71,7 +71,8 @@ class AdmissionJournal final : public IOperationJournal {
     return Result<std::uint64_t>::Err(ErrorCode::kInternalError);
   }
   Result<std::uint64_t> RecordOperationState(const RequestOwnerEpoch&, const OperationStateDTO&,
-                                             const RuntimeScaleStatusDTO*, const char*) override {
+                                             const RuntimeScaleStatusDTO*, const char*,
+                                             std::span<const PreparedMotionDiagnosticsDTO>) override {
     return Result<std::uint64_t>::Err(ErrorCode::kInternalError);
   }
   Result<std::uint64_t> RecordCellAdmissionClaimAcquired(const RequestOwnerEpoch&,

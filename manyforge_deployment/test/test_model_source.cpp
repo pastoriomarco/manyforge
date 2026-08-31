@@ -496,7 +496,7 @@ void replace_once(std::string& value, std::string_view before,
 [[nodiscard]] Fixture complete_ir_fixture() {
   Fixture fixture;
   blob_for(fixture, fixture.urdf_uri).bytes =
-      "<robot name=\"test_robot\">"
+      "<robot name=\"test_robot\" version=\"1.2\">"
       "<material name=\"Steel\"><color rgba=\"0.125 0.25 0.5 1\"/>"
       "<texture filename=\"asset://test_robot/textures/steel.png\"/>"
       "</material>"
@@ -529,7 +529,7 @@ void replace_once(std::string& value, std::string_view before,
       "<calibration rising=\"0.1\" falling=\"-0.2\" "
       "reference_position=\"0.3\"/><dynamics damping=\"0.4\" "
       "friction=\"0.5\"/><limit lower=\"-2\" upper=\"2\" "
-      "effort=\"10\" velocity=\"1.5\"/>"
+      "effort=\"10\" velocity=\"1.5\" acceleration=\"4\"/>"
       "<safety_controller soft_lower_limit=\"-1.5\" "
       "soft_upper_limit=\"1.5\" k_position=\"2\" k_velocity=\"3\"/>"
       "</joint>"
@@ -803,6 +803,8 @@ TEST(ModelSource,
 
   ASSERT_EQ(verified.verified_artifacts().size(), 20U);
   EXPECT_EQ(source.urdf().robot_name, "lite6_lite_gripper");
+  EXPECT_EQ(source.urdf().version_major, 1U);
+  EXPECT_EQ(source.urdf().version_minor, 2U);
   EXPECT_EQ(source.semantic_index().root_link_name, "world");
   ASSERT_EQ(source.urdf().links.size(), 13U);
   ASSERT_EQ(source.urdf().joints.size(), 12U);
@@ -822,6 +824,15 @@ TEST(ModelSource,
   EXPECT_EQ(left_finger.mimic->joint_name, "right_finger_joint");
   EXPECT_DOUBLE_EQ(left_finger.mimic->multiplier, 1.0);
   EXPECT_DOUBLE_EQ(left_finger.mimic->offset, 0.0);
+
+  for (const std::string_view joint_name :
+       {"joint1", "joint2", "joint3", "joint4", "joint5", "joint6"}) {
+    const auto& arm_joint = named(source.urdf().joints, joint_name);
+    ASSERT_TRUE(arm_joint.limit.has_value());
+    EXPECT_DOUBLE_EQ(arm_joint.limit->velocity, 2.14);
+    ASSERT_TRUE(arm_joint.limit->acceleration.has_value());
+    EXPECT_DOUBLE_EQ(*arm_joint.limit->acceleration, 10.0);
+  }
 
   ASSERT_TRUE(source.srdf().has_value());
   const auto& srdf = *source.srdf();
@@ -863,6 +874,8 @@ TEST(ModelSource, RetainsEverySupportedRecordAndCanonicalRoundTrips) {
   const auto verified = verify(fixture);
   const auto& source = verified.source_ir();
 
+  EXPECT_EQ(source.urdf().version_major, 1U);
+  EXPECT_EQ(source.urdf().version_minor, 2U);
   ASSERT_EQ(source.urdf().materials.size(), 1U);
   const auto& steel = source.urdf().materials.front();
   ASSERT_TRUE(steel.name.has_value());
@@ -921,6 +934,8 @@ TEST(ModelSource, RetainsEverySupportedRecordAndCanonicalRoundTrips) {
   EXPECT_DOUBLE_EQ(joint1.dynamics->friction, 0.5);
   ASSERT_TRUE(joint1.limit.has_value());
   EXPECT_DOUBLE_EQ(joint1.limit->upper, 2.0);
+  ASSERT_TRUE(joint1.limit->acceleration.has_value());
+  EXPECT_DOUBLE_EQ(*joint1.limit->acceleration, 4.0);
   ASSERT_TRUE(joint1.safety_controller.has_value());
   EXPECT_DOUBLE_EQ(joint1.safety_controller->k_velocity, 3.0);
   const auto& joint2 = named(source.urdf().joints, "joint2");
@@ -1768,6 +1783,17 @@ TEST(ModelSource, RejectsInvalidRetainedUrdfAndSrdfSemantics) {
   expect_urdf_rejected(
       "lower=\"-3\" upper=\"3\"",
       "lower=\"4\" upper=\"3\"", "lower limit exceeds");
+  expect_urdf_rejected(
+      "velocity=\"1\"/>",
+      "velocity=\"1\" acceleration=\"0\"/>",
+      "acceleration limit must be positive");
+  expect_urdf_rejected(
+      "velocity=\"1\"/>",
+      "velocity=\"1\" acceleration=\"2\"/>",
+      "acceleration limits require URDF version 1.2");
+  expect_urdf_rejected("<robot name=\"test_robot\">",
+                       "<robot name=\"test_robot\" version=\"1.3\">",
+                       "unsupported URDF version");
   expect_urdf_rejected(
       "<limit lower=\"-3\"",
       "<dynamics damping=\"-1\"/><limit lower=\"-3\"",

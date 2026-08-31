@@ -754,6 +754,12 @@ struct ExecutionKernel::PlanningSuccess final {
   PlanResultDTO result;
 };
 
+enum class PreparedMotionDispatchGate : std::uint8_t {
+  kOpen = 0,
+  kFencedBeforeDispatch,
+  kCommitted,
+};
+
 struct ExecutionKernel::PreparedMotionSession final {
   explicit PreparedMotionSession(ResolvedPreparedMotionExecutionRequestDTO supplied)
       : authority(std::move(supplied)) {}
@@ -767,6 +773,8 @@ struct ExecutionKernel::PreparedMotionSession final {
   std::shared_ptr<const PreparedOperationParticipantDTO> participant;
   std::optional<PrepareParticipantResultDTO> backend_prepare_result;
   std::optional<ErrorDTO> error;
+  std::atomic<PreparedMotionDispatchGate> dispatch_gate{
+      PreparedMotionDispatchGate::kOpen};
   bool dispatch_requested{};
   bool cancel_requested{};
   bool resume_cycle{};
@@ -4285,6 +4293,8 @@ ExecutionKernel::apply_runtime_collision_lookahead_authority(
     const auto state = sm_.status().state;
     if (!runtime_collision_protection_.active ||
         runtime_collision_protection_.execution_id != result.execution_id ||
+        addressed_stop_fence_execution_id_.load(std::memory_order_acquire) ==
+            result.execution_id ||
         (state != ExecutionState::kExecuting && state != ExecutionState::kPaused) ||
         motion_trip_stop_.active() || operator_stop_worker_.active() ||
         fault_preempt_stop_active()) {
@@ -4324,6 +4334,14 @@ ExecutionKernel::apply_runtime_collision_lookahead_authority(
   }
 
   if (addressed_owner_handoff) {
+    // The synchronous handoff may itself linearize an addressed Stop. Check
+    // its process-local fence again before installing the fallback interrupt:
+    // a result admitted just before Stop acceptance belongs to the replaced
+    // trajectory and must not compete with the accepted Stop terminal.
+    if (addressed_stop_fence_execution_id_.load(std::memory_order_acquire) ==
+        result.execution_id) {
+      return RuntimeCollisionLookaheadAuthorityDisposition::kStale;
+    }
     // Retain the inner collision latch as a fail-closed fallback when no
     // addressed subscriber accepts the handoff. When an addressed Stop has
     // already moved the inner engine out of an interruptible phase, this is
@@ -6416,8 +6434,8 @@ ExecutionKernel::make_and_prepare_motion_participant(
                                         plan_phase.plan_request->planner_capability_binding},
       *validation_phase.validation_evidence,
       std::move(contact_policy),
-      PreparedRuntimePolicyRefDTO{authority.runtime_policy.value().policy.runtime_policy_id,
-                                  authority.runtime_policy.value().policy.runtime_policy_revision},
+      PreparedRuntimePolicyRefDTO{authority.runtime_policy.value().source_artifact,
+                                  authority.runtime_policy.value().selected_motion_speed_limit},
       std::move(prepared_scopes),
       request.timeouts.execution_timeout_s};
 
@@ -6483,7 +6501,10 @@ ExecutionKernel::make_and_prepare_motion_participant(
       path.stop_evidence_policy_id,
       path.stop_evidence_policy_revision,
       *authority.ordinary_stop_plan,
-      std::move(payload)};
+      std::move(payload),
+      authority.fault_stop_plan
+          ? std::optional<PreparedParticipantStopPlanDTO>{*authority.fault_stop_plan}
+          : std::nullopt};
 
   auto made = MakePreparedOperationParticipant(
       std::move(candidate), authority.binding, authority.stop_readiness, &authority.runtime_policy,
@@ -6494,6 +6515,13 @@ ExecutionKernel::make_and_prepare_motion_participant(
   if (made.value().ordinary_stop_plan != *authority.ordinary_stop_plan) {
     return reject("prepared_motion_ordinary_stop_plan_mismatch",
                   "Prepared participant changed the owner-issued ordinary Stop plan");
+  }
+  if (made.value().fault_stop_plan !=
+      (authority.fault_stop_plan
+           ? std::optional<PreparedParticipantStopPlanDTO>{*authority.fault_stop_plan}
+           : std::nullopt)) {
+    return reject("prepared_motion_fault_stop_plan_mismatch",
+                  "Prepared participant changed the owner-issued fault Stop plan");
   }
 
   std::shared_ptr<const PreparedOperationParticipantDTO> participant;
@@ -6737,6 +6765,15 @@ void ExecutionKernel::async_execute_worker(
         }
         cancelled = prepared_session->cancel_requested || st.stop_requested() ||
                     stop_policy_.stop_requested();
+        if (!cancelled) {
+          auto expected = PreparedMotionDispatchGate::kOpen;
+          if (!prepared_session->dispatch_gate.compare_exchange_strong(
+                  expected, PreparedMotionDispatchGate::kCommitted,
+                  std::memory_order_acq_rel, std::memory_order_acquire)) {
+            cancelled = expected ==
+                        PreparedMotionDispatchGate::kFencedBeforeDispatch;
+          }
+        }
         if (cancelled) {
           prepared_session->cancel_requested = true;
           prepared_session->state = ResolvedPreparedMotionExecutionStateDTO::kCancelledPreDispatch;
@@ -7560,6 +7597,16 @@ void ExecutionKernel::async_execute_worker(
               }
               cancelled = prepared_session->cancel_requested || st.stop_requested() ||
                           stop_policy_.stop_requested();
+              if (!cancelled) {
+                auto expected = PreparedMotionDispatchGate::kOpen;
+                if (!prepared_session->dispatch_gate.compare_exchange_strong(
+                        expected, PreparedMotionDispatchGate::kCommitted,
+                        std::memory_order_acq_rel,
+                        std::memory_order_acquire)) {
+                  cancelled = expected ==
+                              PreparedMotionDispatchGate::kFencedBeforeDispatch;
+                }
+              }
               if (cancelled) {
                 prepared_session->cancel_requested = true;
                 prepared_session->state =
@@ -8014,6 +8061,24 @@ Result<std::uint64_t> ExecutionKernel::PrepareMotion(
                        {{"reason", "ordinary_stop_plan_identity_mismatch"}}}
             : verified_stop.error());
   }
+  if (request.fault_stop_plan) {
+    const auto verified_fault = VerifyPreparedParticipantStopPlan(
+        request.stop_readiness.value().resolved_stop_base_plan, *request.fault_stop_plan,
+        binding.resources, request.retained_default_stop_limits, request.stop_node_category);
+    if (!verified_fault.ok() || request.fault_stop_plan->operation_id != resolved.operation_id ||
+        request.fault_stop_plan->operation_revision != request.operation_revision ||
+        request.fault_stop_plan->participant_id != resolved.participant_id ||
+        request.fault_stop_plan->program_run_id != resolved.program_run_id ||
+        request.fault_stop_plan->participant_stop_profile_purpose !=
+            ParticipantStopProfilePurposeDTO::kFault ||
+        request.fault_stop_plan->motion_interrupt_scope_id.has_value()) {
+      return Result<std::uint64_t>::Err(
+          verified_fault.ok() ? ErrorDTO{kErrorInvalidRequest,
+                                         "Prepared fault Stop plan crosses execution identity",
+                                         {{"reason", "fault_stop_plan_identity_mismatch"}}}
+                              : verified_fault.error());
+    }
+  }
 
   std::shared_ptr<PreparedMotionSession> session;
   try {
@@ -8129,7 +8194,16 @@ Result<void> ExecutionKernel::PrepareResumeMotion(const std::uint64_t execution_
       request.ordinary_stop_plan->operation_id != request.operation_id ||
       request.ordinary_stop_plan->operation_revision != request.operation_revision ||
       request.ordinary_stop_plan->participant_id != request.participant_id ||
-      request.ordinary_stop_plan->program_run_id != prior_binding.program_run_id) {
+      request.ordinary_stop_plan->program_run_id != prior_binding.program_run_id ||
+      static_cast<bool>(request.fault_stop_plan) != static_cast<bool>(prior.fault_stop_plan) ||
+      (request.fault_stop_plan &&
+       (request.fault_stop_plan->operation_id != request.operation_id ||
+        request.fault_stop_plan->operation_revision != request.operation_revision ||
+        request.fault_stop_plan->participant_id != request.participant_id ||
+        request.fault_stop_plan->program_run_id != prior_binding.program_run_id ||
+        request.fault_stop_plan->participant_stop_profile_purpose !=
+            ParticipantStopProfilePurposeDTO::kFault ||
+        request.fault_stop_plan->motion_interrupt_scope_id.has_value()))) {
     return Result<void>::Err(
         ErrorDTO{kErrorInvalidRequest,
                  "Prepared Resume does not advance the resident participant authority",
@@ -8142,20 +8216,33 @@ Result<void> ExecutionKernel::PrepareResumeMotion(const std::uint64_t execution_
   if (!verified_stop.ok()) {
     return Result<void>::Err(verified_stop.error());
   }
+  if (request.fault_stop_plan) {
+    const auto verified_fault = VerifyPreparedParticipantStopPlan(
+        prior.stop_readiness.value().resolved_stop_base_plan, *request.fault_stop_plan,
+        prior.binding.value().resources, prior.retained_default_stop_limits,
+        prior.stop_node_category);
+    if (!verified_fault.ok()) {
+      return Result<void>::Err(verified_fault.error());
+    }
+  }
 
   ResolvedPreparedMotionExecutionRequestDTO updated = prior;
   updated.operation_revision = request.operation_revision;
   updated.execution_request.binding.controller_goal_id = std::move(request.controller_goal_id);
   updated.execution_request.binding.controller_goal_generation = request.controller_goal_generation;
   updated.ordinary_stop_plan = std::move(request.ordinary_stop_plan);
+  updated.fault_stop_plan = std::move(request.fault_stop_plan);
   auto transition = stop_policy_.request_resume();
   if (!transition.ok()) {
     return Result<void>::Err(transition.error());
   }
+  addressed_stop_fence_execution_id_.store(0U, std::memory_order_release);
   session->authority = std::move(updated);
   session->participant.reset();
   session->backend_prepare_result.reset();
   session->error.reset();
+  session->dispatch_gate.store(PreparedMotionDispatchGate::kOpen,
+                               std::memory_order_release);
   session->dispatch_requested = false;
   session->cancel_requested = false;
   session->resume_cycle = true;
@@ -8606,6 +8693,7 @@ Result<uint64_t> ExecutionKernel::execute_impl(
 
   terminal_stop_authority_asserted_.store(false, std::memory_order_release);
   terminal_fault_authority_asserted_.store(false, std::memory_order_release);
+  addressed_stop_fence_execution_id_.store(0U, std::memory_order_release);
   uint64_t exec_id = next_execution_id_++;
   auto prev_state = sm_.status().state;
   sm_.set_execution_id(exec_id);
@@ -9117,6 +9205,53 @@ std::uint64_t ExecutionKernel::bump_control_command_epoch() {
   return control_command_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
 }
 
+AddressedParticipantStopFenceDisposition
+ExecutionKernel::fence_addressed_participant_stop(
+    const std::uint64_t execution_id) noexcept {
+  if (execution_id == 0U) {
+    return AddressedParticipantStopFenceDisposition::kUnknown;
+  }
+  addressed_stop_fence_execution_id_.store(execution_id, std::memory_order_release);
+  revoke_runtime_collision_lookahead_clear_permits();
+
+  std::shared_ptr<PreparedMotionSession> session;
+  {
+    std::lock_guard lock(prepared_motion_session_mutex_);
+    session = active_prepared_motion_session_;
+  }
+  if (!session || session->execution_id != execution_id) {
+    return AddressedParticipantStopFenceDisposition::kUnknown;
+  }
+
+  auto expected = PreparedMotionDispatchGate::kOpen;
+  if (session->dispatch_gate.compare_exchange_strong(
+          expected, PreparedMotionDispatchGate::kFencedBeforeDispatch,
+          std::memory_order_acq_rel, std::memory_order_acquire)) {
+    {
+      std::lock_guard session_lock(session->mutex);
+      session->cancel_requested = true;
+      session->state =
+          ResolvedPreparedMotionExecutionStateDTO::kCancelledPreDispatch;
+    }
+    session->changed.notify_all();
+    try {
+      request_active_planning_cancel();
+      request_active_validation_cancel(
+          "addressed_stop_fenced_before_dispatch");
+    } catch (...) {
+      // The dispatch fence is already committed. Cancellation wakeups are
+      // best-effort here and must not turn a noexcept Stop fence into process
+      // termination.
+    }
+    return AddressedParticipantStopFenceDisposition::
+        kEffectPreventedBeforeDispatch;
+  }
+  return expected == PreparedMotionDispatchGate::kFencedBeforeDispatch
+             ? AddressedParticipantStopFenceDisposition::
+                   kEffectPreventedBeforeDispatch
+             : AddressedParticipantStopFenceDisposition::kDispatchCommitted;
+}
+
 Result<AddressedParticipantStopSettlementDTO> ExecutionKernel::settle_addressed_participant_stop(
     const AddressedParticipantStopSettlementRequestDTO& request) {
   const auto& containment = request.containment;
@@ -9377,10 +9512,25 @@ Result<AddressedParticipantStopSettlementDTO> ExecutionKernel::settle_addressed_
   }
   if (before.state != ExecutionState::kExecuting && before.state != ExecutionState::kPaused &&
       before.state != ExecutionState::kStopping && before.state != ExecutionState::kCompleted) {
+    std::map<std::string, std::string> details{
+        {"reason", "addressed_motion_stop_state_invalid"}, {"state", to_string(before.state)}};
+    if (const auto latch = interrupt_manager_.active_latch(); latch.has_value()) {
+      details["active_interrupt_latch_id"] = latch->latch_id;
+      details["active_interrupt_source_id"] = latch->source_id;
+      details["active_interrupt_policy_id"] = latch->policy_id;
+      const auto metadata =
+          project_interrupt_structured_value_to_text(latch->signal_snapshot.metadata);
+      for (const auto key : {"surface", "contact_a", "contact_b", "reason",
+                             "lookahead_result_status", "lookahead_reason"}) {
+        if (const auto value = metadata.find(key); value != metadata.end()) {
+          details[std::string("active_interrupt_") + key] = value->second;
+        }
+      }
+    }
     return Result<AddressedParticipantStopSettlementDTO>::Err(ErrorDTO{
         kErrorInvalidRequest,
         "Addressed Stop cannot replace the current motion terminal",
-        {{"reason", "addressed_motion_stop_state_invalid"}, {"state", to_string(before.state)}}});
+        std::move(details)});
   }
 
   bump_control_command_epoch();
@@ -9976,6 +10126,7 @@ ResetResultDTO ExecutionKernel::reset(std::optional<std::uint64_t> expected_epoc
     }
     addressed_motion_stop_recovery_evidence_.reset();
     addressed_participant_stop_settlement_.reset();
+    addressed_stop_fence_execution_id_.store(0U, std::memory_order_release);
     recovery_readiness_tracker_.reset();
     (void)refresh_recovery_assessment_locked("reset_accepted");
     authorize_gripper_authority();
@@ -10286,6 +10437,7 @@ ResetResultDTO ExecutionKernel::reset_after_certified_containment(
   }
   addressed_motion_stop_recovery_evidence_.reset();
   addressed_participant_stop_settlement_.reset();
+  addressed_stop_fence_execution_id_.store(0U, std::memory_order_release);
   recovery_readiness_tracker_.reset();
   planning_reset_requested_.store(false, std::memory_order_release);
   lifecycle_stop_requested_while_busy_.store(false, std::memory_order_seq_cst);
@@ -11083,6 +11235,7 @@ KernelRecoveryActionResultDTO ExecutionKernel::apply_recovery_action_impl(
       }
       addressed_motion_stop_recovery_evidence_.reset();
       addressed_participant_stop_settlement_.reset();
+      addressed_stop_fence_execution_id_.store(0U, std::memory_order_release);
       const auto prev_execution_id = capture.execution_id;
       sm_.set_execution_id(0);
       active_correlation_.clear_move_id();

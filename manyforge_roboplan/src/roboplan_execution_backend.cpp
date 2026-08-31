@@ -1,6 +1,8 @@
 #include <manyforge_roboplan/roboplan_execution_backend.hpp>
 
+#include <manyforge_core/execution_stop_support.hpp>
 #include <manyforge_core/motion_interrupt/soft_on_path_stop_planner.hpp>
+#include <manyforge_core/motion_interrupt/stop_profile_mapper.hpp>
 #include <manyforge_core/trajectory/trajectory_sampler.hpp>
 
 #include "native_stop_qualification_probe.hpp"
@@ -10,6 +12,7 @@
 #include <cmath>
 #include <limits>
 #include <map>
+#include <numeric>
 #include <stdexcept>
 #include <string_view>
 #include <thread>
@@ -671,6 +674,9 @@ core::ExecutionHandle RoboPlanExecutionBackend::dispatch_prepared(
   handle.prepared_contract_digest = participant.prepared_contract_digest;
   std::vector<core::PreparedParticipantStopPlanDTO> stop_plans;
   stop_plans.push_back(participant.ordinary_stop_plan);
+  if (participant.fault_stop_plan.has_value()) {
+    stop_plans.push_back(*participant.fault_stop_plan);
+  }
   for (const auto &scope :
        std::get<core::PreparedMotionExecutionDTO>(participant.payload)
            .interrupt_scopes) {
@@ -1468,9 +1474,9 @@ RoboPlanExecutionBackend::TranslateStopStage(
     exact_resources.push_back(resource.resource_id);
   }
   std::sort(exact_resources.begin(), exact_resources.end());
-  const auto &command =
-      stage.participant_stop_plan.stage_commands[stage.stage_index]
-          .resolved_stage;
+  const auto &prepared_command =
+      stage.participant_stop_plan.stage_commands[stage.stage_index];
+  const auto &command = prepared_command.resolved_stage;
   const auto command_remaining =
       remaining_phase(budget, command.containment_command.command_phase_id);
   if (stage.resources != exact_resources ||
@@ -1560,13 +1566,55 @@ RoboPlanExecutionBackend::TranslateStopStage(
       command.containment_command.registered_command_kind_id.has_value() &&
       command.containment_command.registered_command_kind_id->value() ==
           "manyforge.stop.software_hard";
-  if (!controller_goal_cancel && !software_hard) {
-    return terminal_stop_stage_failure(stage,
-                                       "resolved_stop_command_not_supported",
-                                       "native exact Stop port supports "
-                                       "controller-goal cancel and its "
-                                       "retained software-hard command",
-                                       clock_.now() - started_at);
+  const bool motion_controlled_stop =
+      command.containment_command.command_kind ==
+      core::StopContainmentCommandKind::kMotionControlledStop;
+  if (!controller_goal_cancel && !motion_controlled_stop && !software_hard) {
+    return terminal_stop_stage_failure(
+        stage, "resolved_stop_command_not_supported",
+        "native exact Stop port supports "
+        "controlled arm Stop, controller-goal "
+        "cancel, and retained software-hard Stop",
+        clock_.now() - started_at);
+  }
+
+  std::optional<core::MotionInterruptStopProfileDTO> controlled_profile;
+  if (motion_controlled_stop) {
+    const auto &contract = command.containment_command.provider_contract_ref;
+    if (!contract.has_value() ||
+        contract->contract_schema_id.value() !=
+            core::kMotionControlledStopContractSchemaId ||
+        contract->contract_schema_revision.value() !=
+            core::kMotionControlledStopContractSchemaRevision ||
+        !prepared_command.validated_contract_parameters.has_value() ||
+        !prepared_command.parameter_source.has_value()) {
+      return terminal_stop_stage_failure(
+          stage, "motion_controlled_stop_contract_invalid",
+          "native controlled Stop has no exact prepared provider contract",
+          clock_.now() - started_at);
+    }
+    std::string profile_id = "operator_soft_on_path";
+    if (*prepared_command.parameter_source ==
+        core::StopStageParameterSourceDTO::kParticipantProfileMapping) {
+      if (!stage.participant_stop_plan.participant_stop_profile.has_value()) {
+        return terminal_stop_stage_failure(
+            stage, "motion_controlled_stop_profile_missing",
+            "native controlled Stop has no prepared participant profile",
+            clock_.now() - started_at);
+      }
+      profile_id =
+          stage.participant_stop_plan.participant_stop_profile->profile_id;
+    }
+    auto decoded =
+        core::map_motion_controlled_stop_contract_parameters_to_profile(
+            *prepared_command.validated_contract_parameters, binding.resources,
+            profile_id);
+    if (!decoded.ok()) {
+      return terminal_stop_stage_failure(
+          stage, decoded.error().details.at("reason"), decoded.error().message,
+          clock_.now() - started_at);
+    }
+    controlled_profile = std::move(decoded.value());
   }
 
   const auto dispatch_generation = prepared_goal->handle.execution_generation;
@@ -1593,25 +1641,6 @@ RoboPlanExecutionBackend::TranslateStopStage(
   if (cancellation.stop_requested()) {
     return superseded_stop_stage(stage);
   }
-  core::StopResultDTO stopped;
-  if (controller_goal_cancel) {
-    // Ordinary motion Stop cancels only this exact goal occurrence. It must
-    // not advance the independently latched software-hard generation.
-    request_execution_worker_stop();
-    stopped = core::StopResultDTO{true, std::nullopt};
-  } else {
-    stopped = stop();
-  }
-  if (!stopped.accepted) {
-    return terminal_stop_stage_failure(
-        stage,
-        software_hard ? "software_hard_stop_not_dispatched"
-                      : "controller_goal_cancel_not_dispatched",
-        stopped.error.has_value() ? stopped.error->message
-                                  : "native Stop command was not accepted",
-        clock_.now() - started_at);
-  }
-
   core::ParticipantStopStageResultDTO result{
       stage,
       core::StopStageAttemptDispositionDTO::kDispatched,
@@ -1624,25 +1653,94 @@ RoboPlanExecutionBackend::TranslateStopStage(
       0,
       {},
       std::nullopt};
-  const auto fail_after_dispatch = [&](std::string reason,
-                                       std::string message) {
-    result.receiver_elapsed_duration_ns =
-        std::max<std::int64_t>(0, clock_.now() - started_at);
-    result.error = core::ErrorDTO{core::kErrorMotionInterruptBackendStopFailed,
-                                  std::move(message),
-                                  {{"reason", std::move(reason)}}};
-    result.evidence_items.clear();
-    result.evidence_items.reserve(command.evidence_requirements.size());
-    for (const auto &requirement : command.evidence_requirements) {
-      result.evidence_items.push_back(core::StopEvidenceItemDTO{
-          requirement.requirement.evidence_item_id,
-          requirement.requirement.evidence_kind,
-          core::StopEvidenceItemStateDTO::kMissing, requirement.resolved_source,
-          std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-          result.error});
+  const auto fail_after_dispatch =
+      [&](std::string reason, std::string message,
+          std::map<std::string, std::string> details = {}) {
+        result.receiver_elapsed_duration_ns =
+            std::max<std::int64_t>(0, clock_.now() - started_at);
+        details.insert_or_assign("reason", std::move(reason));
+        result.error =
+            core::ErrorDTO{core::kErrorMotionInterruptBackendStopFailed,
+                           std::move(message), std::move(details)};
+        result.evidence_items.clear();
+        result.evidence_items.reserve(command.evidence_requirements.size());
+        for (const auto &requirement : command.evidence_requirements) {
+          result.evidence_items.push_back(core::StopEvidenceItemDTO{
+              requirement.requirement.evidence_item_id,
+              requirement.requirement.evidence_kind,
+              core::StopEvidenceItemStateDTO::kMissing,
+              requirement.resolved_source, std::nullopt, std::nullopt,
+              std::nullopt, std::nullopt, result.error});
+        }
+        return result;
+      };
+
+  std::optional<core::ControlledStopResultDTO> controlled_outcome;
+  if (motion_controlled_stop) {
+    controlled_outcome =
+        execute_controlled_stop(*controlled_profile, cancellation);
+    if (const auto invalid = core::controlled_stop_result_field_error(
+            *controlled_profile, *controlled_outcome);
+        invalid.has_value()) {
+      return fail_after_dispatch(
+          "motion_controlled_stop_result_invalid",
+          "native controlled Stop returned an invalid result: " + *invalid);
     }
-    return result;
-  };
+    if (!controlled_outcome->accepted) {
+      result.attempt_disposition =
+          core::StopStageAttemptDispositionDTO::kNotDispatched;
+      return fail_after_dispatch(
+          controlled_outcome->error.has_value() &&
+                  controlled_outcome->error->details.contains("reason")
+              ? controlled_outcome->error->details.at("reason")
+              : "motion_controlled_stop_not_dispatched",
+          controlled_outcome->error.has_value()
+              ? controlled_outcome->error->message
+              : "native controlled Stop was not accepted",
+          controlled_outcome->error.has_value()
+              ? controlled_outcome->error->details
+              : std::map<std::string, std::string>{});
+    }
+    result.actual_provider_contract_mode = core::provider_contract_stop_mode(
+        controlled_outcome->executed_stop_mode);
+    if (controlled_outcome->executed_stop_mode !=
+        controlled_profile->stop_mode) {
+      result.recoverable_substitution_reason =
+          controlled_outcome->fallback_reason;
+    }
+    if (!controlled_outcome->backend_stop_confirmed) {
+      return fail_after_dispatch(
+          controlled_outcome->error.has_value() &&
+                  controlled_outcome->error->details.contains("reason")
+              ? controlled_outcome->error->details.at("reason")
+              : "motion_controlled_stop_not_confirmed",
+          controlled_outcome->error.has_value()
+              ? controlled_outcome->error->message
+              : "native controlled Stop was not confirmed",
+          controlled_outcome->error.has_value()
+              ? controlled_outcome->error->details
+              : std::map<std::string, std::string>{});
+    }
+  } else {
+    core::StopResultDTO stopped;
+    if (controller_goal_cancel) {
+      // Gripper-like goal Stop cancels only this exact occurrence. It must not
+      // advance the independently latched software-hard generation.
+      request_execution_worker_stop();
+      stopped = core::StopResultDTO{true, std::nullopt};
+    } else {
+      stopped = stop();
+    }
+    if (!stopped.accepted) {
+      return terminal_stop_stage_failure(
+          stage,
+          software_hard ? "software_hard_stop_not_dispatched"
+                        : "controller_goal_cancel_not_dispatched",
+          stopped.error.has_value() ? stopped.error->message
+                                    : "native Stop command was not accepted",
+          clock_.now() - started_at);
+    }
+  }
 
   const auto terminal_phase = std::min_element(
       command.evidence_requirements.begin(),
@@ -1664,6 +1762,13 @@ RoboPlanExecutionBackend::TranslateStopStage(
                                "native Stop evidence phase is already expired");
   }
   const auto evidence_deadline = started_at + *evidence_remaining;
+  const auto minimum_dwell_ns = std::accumulate(
+      command.evidence_requirements.begin(),
+      command.evidence_requirements.end(), std::int64_t{0},
+      [](const std::int64_t current, const auto &requirement) {
+        return std::max(current, requirement.requirement.observation_semantics
+                                     .minimum_dwell_ns.value_or(0));
+      });
   while (state_.running.load(std::memory_order_acquire) &&
          !cancellation.stop_requested() && clock_.now() < evidence_deadline) {
     std::unique_lock lock(execution_mutex_);
@@ -1683,6 +1788,109 @@ RoboPlanExecutionBackend::TranslateStopStage(
   result.evidence_items.reserve(command.evidence_requirements.size());
   std::optional<core::ExecutionSnapshot> terminal_snapshot;
   std::optional<core::ObservedStateSnapshotDTO> rest_snapshot;
+  const auto exact_rest = [&](const core::ObservedStateSnapshotDTO &observed) {
+    if (!observed.velocities.has_value() ||
+        observed.resources != stage.resources ||
+        observed.velocities->size() != observed.resources.size() ||
+        observed.source_epoch != path.provider_runtime_epoch ||
+        observed.sequence == 0U ||
+        observed.received_timestamp_ns > clock_.now()) {
+      return false;
+    }
+    for (std::size_t index = 0U; index < observed.resources.size(); ++index) {
+      double threshold = 0.0;
+      if (controlled_profile.has_value()) {
+        const auto resource = std::find_if(
+            binding.resources.begin(), binding.resources.end(),
+            [&](const auto &candidate) {
+              return candidate.resource_id == observed.resources[index];
+            });
+        if (resource == binding.resources.end() ||
+            !resource->source_joint_name.has_value() ||
+            !controlled_profile->per_joint_settle_velocity_threshold
+                 .has_value()) {
+          return false;
+        }
+        const auto configured =
+            controlled_profile->per_joint_settle_velocity_threshold->find(
+                *resource->source_joint_name);
+        if (configured ==
+            controlled_profile->per_joint_settle_velocity_threshold->end()) {
+          return false;
+        }
+        const auto same_coordinate_kind =
+            (*observed.velocities)[index].index() == configured->second.index();
+        if (!same_coordinate_kind) {
+          return false;
+        }
+        threshold = std::visit(
+            [](const auto &value) {
+              if constexpr (requires { value.value_rad_s; }) {
+                return value.value_rad_s;
+              } else {
+                return value.value_m_s;
+              }
+            },
+            configured->second);
+      }
+      const auto velocity = std::visit(
+          [](const auto &value) {
+            if constexpr (requires { value.value_rad_s; }) {
+              return value.value_rad_s;
+            } else {
+              return value.value_m_s;
+            }
+          },
+          (*observed.velocities)[index]);
+      if (!std::isfinite(velocity) || std::abs(velocity) > threshold) {
+        return false;
+      }
+    }
+    return true;
+  };
+  if (std::any_of(command.evidence_requirements.begin(),
+                  command.evidence_requirements.end(), [](const auto &row) {
+                    return row.requirement.evidence_kind ==
+                           core::StopEvidenceRequirementKind::kMotionRest;
+                  })) {
+    std::int64_t rest_started_at = 0;
+    bool rest_started = false;
+    while (!cancellation.stop_requested() && clock_.now() < evidence_deadline) {
+      auto observed = state_channel_->current_state(clock_.now());
+      if (!observed.ok()) {
+        return fail_after_dispatch("stop_evidence_source_unavailable",
+                                   observed.error().message);
+      }
+      if (exact_rest(observed.value())) {
+        if (!rest_started) {
+          rest_started_at = clock_.now();
+          rest_started = true;
+        }
+        rest_snapshot = std::move(observed.value());
+        if (clock_.now() - rest_started_at >= minimum_dwell_ns) {
+          break;
+        }
+      } else {
+        rest_started = false;
+        rest_started_at = 0;
+        rest_snapshot.reset();
+      }
+      std::unique_lock lock(execution_mutex_);
+      execution_cv_.wait_for(
+          lock, std::chrono::nanoseconds(config_.execution_tick_period_ns));
+    }
+    if (cancellation.stop_requested()) {
+      return fail_after_dispatch(
+          "stop_stage_cancelled_after_dispatch",
+          "native Stop rest-evidence wait was superseded");
+    }
+    if (!rest_started || !rest_snapshot.has_value() ||
+        clock_.now() - rest_started_at < minimum_dwell_ns) {
+      return fail_after_dispatch(
+          "stop_evidence_not_at_rest",
+          "native addressed state did not prove bounded exact rest");
+    }
+  }
   for (const auto &requirement : command.evidence_requirements) {
     std::uint64_t source_sequence = 0U;
     std::int64_t source_age_ns = 0;
@@ -1715,34 +1923,11 @@ RoboPlanExecutionBackend::TranslateStopStage(
     }
     case core::StopEvidenceRequirementKind::kMotionRest: {
       if (!rest_snapshot.has_value()) {
-        auto observed = state_channel_->current_state(clock_.now());
-        if (!observed.ok()) {
-          return fail_after_dispatch("stop_evidence_source_unavailable",
-                                     observed.error().message);
-        }
-        rest_snapshot = std::move(observed.value());
+        return fail_after_dispatch("stop_evidence_source_unavailable",
+                                   "native rest observation is absent");
       }
       const auto now_ns = clock_.now();
-      const auto at_rest =
-          rest_snapshot->velocities.has_value() &&
-          rest_snapshot->resources == stage.resources &&
-          rest_snapshot->source_epoch == path.provider_runtime_epoch &&
-          rest_snapshot->sequence != 0U &&
-          rest_snapshot->received_timestamp_ns <= now_ns &&
-          std::all_of(
-              rest_snapshot->velocities->begin(),
-              rest_snapshot->velocities->end(), [](const auto &value) {
-                return std::visit(
-                    [](const auto &velocity) {
-                      if constexpr (requires { velocity.value_rad_s; }) {
-                        return std::abs(velocity.value_rad_s) <= 0.0;
-                      } else {
-                        return std::abs(velocity.value_m_s) <= 0.0;
-                      }
-                    },
-                    value);
-              });
-      if (!at_rest) {
+      if (!exact_rest(*rest_snapshot)) {
         return fail_after_dispatch(
             "stop_evidence_not_at_rest",
             "native addressed state does not prove exact rest");
@@ -1774,12 +1959,19 @@ RoboPlanExecutionBackend::TranslateStopStage(
       return fail_after_dispatch("stop_evidence_source_stale",
                                  "native Stop evidence is stale");
     }
+    core::JsonValueDTO evidence =
+        controlled_outcome.has_value()
+            ? core::motion_controlled_stop_evidence(
+                  *controlled_profile, *controlled_outcome,
+                  stage.stop_evidence_policy_revision.value(),
+                  core::to_string(*prepared_command.parameter_source))
+            : core::JsonValueDTO{true};
     result.evidence_items.push_back(core::StopEvidenceItemDTO{
         requirement.requirement.evidence_item_id,
         requirement.requirement.evidence_kind,
         core::StopEvidenceItemStateDTO::kSatisfied, requirement.resolved_source,
         path.provider_runtime_epoch, source_sequence, source_age_ns,
-        core::JsonValueDTO{true}, std::nullopt});
+        std::move(evidence), std::nullopt});
     result.source_epoch = path.provider_runtime_epoch;
     result.source_sequence =
         std::max(result.source_sequence.value_or(0U), source_sequence);
@@ -1798,9 +1990,27 @@ core::ControlledStopResultDTO RoboPlanExecutionBackend::execute_controlled_stop(
 core::ControlledStopResultDTO RoboPlanExecutionBackend::execute_controlled_stop(
     const core::MotionInterruptStopProfileDTO &profile,
     std::stop_token stop_token) {
+  const auto retained_binding = binding_.load(std::memory_order_acquire);
+  auto projected =
+      core::project_motion_interrupt_stop_profile_to_compiled_resources(
+          profile, retained_binding->value().resources);
+  if (!projected.ok()) {
+    core::ControlledStopResultDTO rejected;
+    rejected.executed_stop_mode = profile.stop_mode;
+    rejected.accepted = false;
+    rejected.backend_stop_confirmed = false;
+    auto details = projected.error().details;
+    details.emplace("projection_error_code", projected.error().code);
+    rejected.error = core::ErrorDTO{
+        std::string(core::kErrorMotionInterruptBackendStopFailed),
+        "native controlled Stop could not project its portable joint scope: " +
+            projected.error().message,
+        std::move(details)};
+    return rejected;
+  }
   const auto hard_stop_request_generation =
       active_execution_hard_stop_generation_.load(std::memory_order_acquire);
-  return execute_controlled_stop_impl(profile, stop_token,
+  return execute_controlled_stop_impl(projected.value(), stop_token,
                                       hard_stop_request_generation);
 }
 
@@ -2449,9 +2659,8 @@ core::PauseResultDTO RoboPlanExecutionBackend::pause() {
     std::lock_guard<std::mutex> lock(execution_mutex_);
     if (!state_.running.load(std::memory_order_acquire)) {
       return core::PauseResultDTO{
-          false,
-          core::ErrorDTO{core::kErrorInvalidRequest,
-                         "No execution in flight", {}}};
+          false, core::ErrorDTO{
+                     core::kErrorInvalidRequest, "No execution in flight", {}}};
     }
     state_.pause_requested.store(true, std::memory_order_release);
     state_.natural_completion_stop_requested.store(false,

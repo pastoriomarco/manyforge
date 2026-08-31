@@ -88,6 +88,25 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     return next_execute_result;
   }
 
+  AddressedParticipantStopFenceDisposition fence_addressed_participant_stop(
+      const std::uint64_t execution_id) noexcept override {
+    addressed_stop_fence_execution_id.store(execution_id, std::memory_order_release);
+    ++addressed_stop_fence_calls;
+    Trace("engine:fence_addressed_stop");
+    if (defer_prepared_dispatch_effect) {
+      std::lock_guard lock(prepared_motion_mutex_);
+      if (prepared_snapshot && prepared_snapshot->execution_id == execution_id &&
+          prepared_snapshot->state ==
+              ResolvedPreparedMotionExecutionStateDTO::kDispatchRequested) {
+        prepared_snapshot->state =
+            ResolvedPreparedMotionExecutionStateDTO::kCancelledPreDispatch;
+        return AddressedParticipantStopFenceDisposition::
+            kEffectPreventedBeforeDispatch;
+      }
+    }
+    return AddressedParticipantStopFenceDisposition::kDispatchCommitted;
+  }
+
   Result<AddressedParticipantStopSettlementDTO> settle_addressed_participant_stop(
       const AddressedParticipantStopSettlementRequestDTO& request) override {
     ++participant_stop_settlement_calls;
@@ -200,8 +219,14 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
                                           "fake prepared dispatch identity mismatch",
                                           {{"reason", "prepared_dispatch_mismatch"}}});
       }
-      prepared_snapshot->state = ResolvedPreparedMotionExecutionStateDTO::kDispatched;
+      prepared_snapshot->state = defer_prepared_dispatch_effect
+                                     ? ResolvedPreparedMotionExecutionStateDTO::
+                                           kDispatchRequested
+                                     : ResolvedPreparedMotionExecutionStateDTO::kDispatched;
       execution_request = last_prepared_request->execution_request;
+    }
+    if (defer_prepared_dispatch_effect) {
+      return Result<void>::Ok();
     }
     auto dispatched = execute(*execution_request);
     if (prepared_dispatch_event_error.has_value()) {
@@ -233,6 +258,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
       last_prepared_request->execution_request.binding.controller_goal_generation =
           request.controller_goal_generation;
       last_prepared_request->ordinary_stop_plan = std::move(request.ordinary_stop_plan);
+      last_prepared_request->fault_stop_plan = std::move(request.fault_stop_plan);
       prepared_snapshot = ResolvedPreparedMotionExecutionSnapshotDTO{
           execution_id,
           ResolvedPreparedMotionExecutionStateDTO::kPreparing,
@@ -477,12 +503,18 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
                                                    {{"reason", "controller_stop_rejected"}}}))});
     }
     ++stop_calls;
+    const auto actual_stop_mode =
+        stage.participant_stop_plan.participant_stop_profile.has_value() &&
+                stage.participant_stop_plan.participant_stop_profile->stop_mode ==
+                    MotionInterruptStopMode::kSpringBackHold
+            ? MotionControlledStopMode::kSpringBackHold
+            : MotionControlledStopMode::kSoftOnPath;
     auto result = ParticipantStopStageResultDTO{stage,
                                                 StopStageAttemptDispositionDTO::kDispatched,
                                                 next_stop_result.accepted
                                                     ? ParticipantStopStageOutcomeDTO::kSucceeded
                                                     : ParticipantStopStageOutcomeDTO::kFailed,
-                                                MotionControlledStopMode::kSoftOnPath,
+                                                actual_stop_mode,
                                                 std::nullopt,
                                                 1U,
                                                 stage.provider_runtime_epoch,
@@ -827,6 +859,8 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   std::atomic<int> resume_calls{};
   std::atomic<int> reset_calls{};
   std::atomic<int> certified_reset_calls{};
+  std::atomic<int> addressed_stop_fence_calls{};
+  std::atomic<std::uint64_t> addressed_stop_fence_execution_id{};
   std::atomic<int> participant_stop_settlement_calls{};
   std::atomic<int> acknowledge_calls{};
   std::atomic<int> runtime_scale_calls{};
@@ -849,6 +883,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   mutable std::mutex prepared_command_mutex_;
   std::optional<KernelEvent> event_during_execute;
   bool defer_prepare_completion{};
+  bool defer_prepared_dispatch_effect{};
   bool defer_resume_prepare_completion{};
   ExecutionState prepared_cancel_terminal_state{ExecutionState::kStopped};
   std::optional<ErrorDTO> prepare_failure;
@@ -1028,11 +1063,18 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
         trajectory,
         start,
         {std::move(planning_result), 0U, request.binding.planner_capability_binding},
-        {ValidationRevision("validation.test"), ValidationResultDTO{true, std::nullopt}, world,
+        {ValidationRevision("validation.test"),
+         ValidationResultDTO{
+             true, std::nullopt,
+             TrajectoryValidationMetricsDTO{
+                 trajectory.waypoints.back().time_from_start_s,
+                 std::vector<double>(trajectory.joint_names.size(), 0.5),
+                 std::vector<double>(trajectory.joint_names.size(), 0.0), 0.1}},
+         world,
          CollisionPolicyRevision{1U, Digest('d')}, decision},
         std::move(contact_policy),
-        {authority.runtime_policy.value().policy.runtime_policy_id,
-         authority.runtime_policy.value().policy.runtime_policy_revision},
+        {authority.runtime_policy.value().source_artifact,
+         authority.runtime_policy.value().selected_motion_speed_limit},
         std::move(scopes),
         request.timeouts.execution_timeout_s};
 
@@ -1092,7 +1134,10 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
         control.stop_evidence_policy_id,
         control.stop_evidence_policy_revision,
         *authority.ordinary_stop_plan,
-        std::move(payload)};
+        std::move(payload),
+        authority.fault_stop_plan
+            ? std::optional<PreparedParticipantStopPlanDTO>{*authority.fault_stop_plan}
+            : std::nullopt};
     return MakePreparedOperationParticipant(std::move(candidate), authority.binding,
                                             authority.stop_readiness, &authority.runtime_policy,
                                             authority.retained_default_stop_limits,
@@ -1363,7 +1408,8 @@ class FakeOperationJournal final : public IOperationJournal {
   Result<std::uint64_t> RecordOperationState(const RequestOwnerEpoch&,
                                              const OperationStateDTO& state,
                                              const RuntimeScaleStatusDTO*,
-                                             const char* transition_reason) override {
+                                             const char* transition_reason,
+                                             std::span<const PreparedMotionDiagnosticsDTO>) override {
     return Record(std::string("state:") + transition_reason, state);
   }
 
@@ -1610,6 +1656,25 @@ ManagerLivenessRequiredSetDTO EmptyManagerLivenessSet() {
     resources.push_back(resource.resource_id);
   }
   for (auto& stage : plan.escalation_stages) {
+    if (stage.stage_index == 0U) {
+      auto select_controlled_stop_contract = [](ProviderContractRefDTO& ref) {
+        ref.contract_schema_id = SchemaId(std::string(kMotionControlledStopContractSchemaId));
+        ref.contract_schema_revision =
+            SchemaRevision(std::string(kMotionControlledStopContractSchemaRevision));
+      };
+      if (stage.containment_command.provider_contract_ref.has_value()) {
+        select_controlled_stop_contract(*stage.containment_command.provider_contract_ref);
+      }
+      if (stage.command_qualification.controlled_substitution_contract.has_value()) {
+        select_controlled_stop_contract(
+            stage.command_qualification.controlled_substitution_contract->provider_contract_ref);
+      }
+      for (auto& requirement : stage.evidence_requirements) {
+        if (requirement.requirement.provider_contract_ref.has_value()) {
+          select_controlled_stop_contract(*requirement.requirement.provider_contract_ref);
+        }
+      }
+    }
     std::visit([&](auto& scope) { scope.activation_set_id = control.activation_set_id; },
                stage.containment_scope);
     const auto capability_target =
@@ -1729,17 +1794,47 @@ ManagerLivenessRequiredSetDTO EmptyManagerLivenessSet() {
                                   ? CoordinateVelocityDTO{AngularVelocityDTO{0.02}}
                                   : CoordinateVelocityDTO{LinearVelocityDTO{0.02}}});
   }
-  auto runtime_policy = verify_runtime_participant_policy_selection(
-      RuntimePolicyDTO{RuntimePolicyId("runtime.test"),
-                       RuntimePolicyRevision(test_digest('d')),
-                       std::nullopt,
-                       {},
-                       {RuntimeMotionSpeedLimitDTO{RuntimePolicyCellScopeDTO{}, 0.5}},
-                       {}},
-      participant);
+  RuntimePolicyDTO policy{RuntimePolicyId("runtime.test"),
+                          RuntimePolicyRevision(test_digest('d')),
+                          std::nullopt,
+                          {},
+                          {RuntimeMotionSpeedLimitDTO{RuntimePolicyCellScopeDTO{}, 0.5}},
+                          {}};
+  RuntimePolicyCatalogRecordRefDTO policy_reference{
+      policy.runtime_policy_id,
+      policy.runtime_policy_revision,
+      SchemaId(std::string(kRuntimePolicyApiVersion)),
+      SchemaRevision(test_digest('e')),
+      ContentDigest(test_digest('f')),
+      ContentAddressedStoreKey("catalog/runtime-policy/runtime.test.json")};
+  auto runtime_policy = verify_runtime_participant_policy_selection(std::move(policy_reference),
+                                                                    std::move(policy), participant);
   if (!runtime_policy.ok()) {
     throw std::logic_error(runtime_policy.error().message + ": " +
                            runtime_policy.error().details.at("reason"));
+  }
+  std::optional<MotionInterruptStopProfileDTO> operator_stop_profile;
+  std::optional<MotionInterruptStopProfileDTO> fault_stop_profile;
+  if (participant.value().capability_id.value() == "execution.trajectory.execute") {
+    MotionInterruptStopProfileDTO profile;
+    profile.profile_id = "operator_soft_on_path";
+    profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
+    profile.deceleration_time_s = 1.0;
+    profile.allow_natural_completion_on_short_path = true;
+    profile.require_backend_confirmation = true;
+    for (const auto& resource : participant.value().resources) {
+      if (resource.coordinate_kind != CoordinateKind::kAngular ||
+          !resource.source_joint_name.has_value()) {
+        throw std::logic_error("test arm fault profile requires angular resources");
+      }
+      profile.per_joint_max_deceleration.emplace(*resource.source_joint_name,
+                                                 AngularAccelerationDTO{4.0});
+    }
+    operator_stop_profile = profile;
+    profile.profile_id = "fault_spring_back_hold";
+    profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
+    profile.allow_natural_completion_on_short_path = false;
+    fault_stop_profile = std::move(profile);
   }
   return RuntimeParticipantExecutionRegistration{
       participant,
@@ -1749,15 +1844,19 @@ ManagerLivenessRequiredSetDTO EmptyManagerLivenessSet() {
       &engine,
       dynamic_cast<IControlDomainExecutionPort*>(&engine),
       std::move(runtime_policy.value()),
-      dynamic_cast<IResolvedPreparedParticipantExecutionEngine*>(&engine)};
+      dynamic_cast<IResolvedPreparedParticipantExecutionEngine*>(&engine),
+      std::move(operator_stop_profile),
+      std::move(fault_stop_profile)};
 }
 
 [[nodiscard]] RuntimeParticipantExecutionRegistration unqualified_registration(
     const RuntimeParticipantBinding& participant, IResolvedParticipantExecutionEngine& engine) {
   return RuntimeParticipantExecutionRegistration{
-      participant, std::nullopt,
-      {},          MotionInterruptNodeCategory::kGeneric,
-      &engine,     dynamic_cast<IControlDomainExecutionPort*>(&engine)};
+      participant,  std::nullopt,
+      {},           MotionInterruptNodeCategory::kGeneric,
+      &engine,      dynamic_cast<IControlDomainExecutionPort*>(&engine),
+      std::nullopt, nullptr,
+      std::nullopt, std::nullopt};
 }
 
 [[nodiscard]] ActiveControlConfigurationDTO route_configuration_for(
@@ -2368,7 +2467,8 @@ TEST(ResourceAddressedExecutionKernelTest,
                                              CellId("cell.test"), 8U});
 
   const auto accepted = kernel.execute(motion_operation("request.motion.held-prepare"));
-  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message << ": "
+                             << accepted.error().details.at("reason");
   EXPECT_EQ(engine.prepare_motion_calls, 1);
   EXPECT_EQ(engine.dispatch_prepared_motion_calls, 0);
   EXPECT_EQ(engine.execute_calls, 0);
@@ -2963,6 +3063,49 @@ TEST(ResourceAddressedExecutionKernelTest,
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
+     StopAtPreparedDispatchHandoffPreventsEffectWithoutEscalation) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  engine.defer_prepared_dispatch_effect = true;
+  const auto binding =
+      make_binding("arm", "arm", "execution.trajectory.execute",
+                   CoordinateKind::kAngular);
+  ResourceAddressedExecutionKernel kernel(
+      {registration(binding, engine)}, clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+
+  const auto accepted =
+      kernel.execute(motion_operation("request.motion.dispatch-handoff"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_EQ(engine.dispatch_prepared_motion_calls, 1);
+  ASSERT_EQ(engine.execute_calls, 0);
+
+  const auto stopped = kernel.stop(
+      stop_request("request.stop.dispatch-handoff", accepted.value(), 1U));
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(stopped.value().stop_id);
+    return status.ok() && status.value().state == StopStatusStateDTO::kSucceeded;
+  }));
+
+  EXPECT_EQ(engine.cancel_prepared_motion_calls, 1);
+  EXPECT_EQ(engine.translate_stop_stage_calls.load(), 0);
+  EXPECT_EQ(engine.execute_calls, 0);
+  EXPECT_FALSE(kernel.get_stop_fault_latch().has_value());
+  const auto status = kernel.get_stop_status(stopped.value().stop_id);
+  ASSERT_TRUE(status.ok());
+  ASSERT_TRUE(status.value().stop_certificate.has_value());
+  const auto certificate = kernel.get_stop_certificate(
+      status.value().stop_certificate->stop_certificate_id);
+  ASSERT_TRUE(certificate.ok()) << certificate.error().message;
+  ASSERT_EQ(certificate.value().scope_entries.size(), 1U);
+  EXPECT_EQ(certificate.value().scope_entries.front().dispatch_state,
+            StopScopeDispatchStateDTO::kNeverDispatchedCancelled);
+  EXPECT_TRUE(certificate.value().attempted_stage_results.empty());
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
      RuntimeCollisionUsesTheAddressedStopOwnerAndDeclaredCoordinatedScopeExactlyOnce) {
   FakeClock clock;
   ManualScheduler scheduler;
@@ -2977,7 +3120,8 @@ TEST(ResourceAddressedExecutionKernelTest,
 
   const auto accepted =
       kernel.execute(coordinated_motion_operation("request.motion.coordinated.collision"));
-  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message << ": "
+                             << accepted.error().details.at("reason");
   first_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
   second_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
 
@@ -2994,6 +3138,18 @@ TEST(ResourceAddressedExecutionKernelTest,
            second_engine.translate_stop_stage_calls.load() == 1;
   }));
   ASSERT_TRUE(stop_id.has_value());
+  ASSERT_TRUE(first_engine.last_stop_stage.has_value());
+  ASSERT_TRUE(second_engine.last_stop_stage.has_value());
+  for (const auto* stage : {&*first_engine.last_stop_stage, &*second_engine.last_stop_stage}) {
+    ASSERT_TRUE(stage->participant_stop_plan.participant_stop_profile.has_value());
+    EXPECT_EQ(stage->participant_stop_plan.participant_stop_profile->profile_id,
+              "fault_spring_back_hold");
+    EXPECT_EQ(stage->participant_stop_plan.participant_stop_profile->stop_mode,
+              MotionInterruptStopMode::kSpringBackHold);
+    EXPECT_EQ(stage->participant_stop_plan.participant_stop_profile_purpose,
+              ParticipantStopProfilePurposeDTO::kFault);
+    EXPECT_FALSE(stage->participant_stop_plan.motion_interrupt_scope_id.has_value());
+  }
   ASSERT_TRUE(wait_until([&] {
     const auto status = kernel.get_stop_status(*stop_id);
     return status.ok() && status.value().state == StopStatusStateDTO::kSucceeded;
@@ -4065,6 +4221,8 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto stopped =
       kernel.stop(stop_request("request.stop-terminal-owner.stop", operation.value(), 1U));
   ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+  EXPECT_EQ(engine.addressed_stop_fence_calls, 1);
+  EXPECT_EQ(engine.addressed_stop_fence_execution_id, engine.next_execution_id);
 
   engine.emit_transition(ExecutionState::kExecuting, ExecutionState::kCompleted);
   const auto state = kernel.get_operation_state(operation.value().operation_id);
@@ -5154,7 +5312,8 @@ TEST(ResourceAddressedExecutionKernelTest,
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
   const auto executed = kernel.execute(motion_operation("request.settlement.first"));
-  ASSERT_TRUE(executed.ok()) << executed.error().message;
+  ASSERT_TRUE(executed.ok()) << executed.error().message << ": "
+                             << executed.error().details.at("reason");
   engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kCompleted);
 
   std::promise<void> acknowledgement_entered_promise;
@@ -5214,7 +5373,8 @@ TEST(ResourceAddressedExecutionKernelTest,
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
   const auto executed = kernel.execute(motion_operation());
-  ASSERT_TRUE(executed.ok()) << executed.error().message;
+  ASSERT_TRUE(executed.ok()) << executed.error().message << ": "
+                             << executed.error().details.at("reason");
   engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
 
   const auto paused = kernel.pause(control_request("request.pause.1", executed.value(), 1U));
@@ -5980,7 +6140,8 @@ TEST(ResourceAddressedExecutionKernelTest,
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
   const auto executed = kernel.execute(motion_operation());
-  ASSERT_TRUE(executed.ok()) << executed.error().message;
+  ASSERT_TRUE(executed.ok()) << executed.error().message << ": "
+                             << executed.error().details.at("reason");
   engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
 
   const auto first_request =
@@ -6068,6 +6229,18 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(stage_started);
   ASSERT_TRUE(replay.ok()) << replay.error().message;
   ASSERT_TRUE(wait_until([&] { return engine.stop_calls.load() == 1; }));
+  ASSERT_TRUE(engine.last_stop_stage.has_value());
+  ASSERT_TRUE(engine.last_stop_stage->participant_stop_plan.participant_stop_profile.has_value());
+  const auto& operator_profile =
+      *engine.last_stop_stage->participant_stop_plan.participant_stop_profile;
+  EXPECT_EQ(operator_profile.profile_id, "operator_soft_on_path");
+  EXPECT_EQ(operator_profile.stop_mode, MotionInterruptStopMode::kSoftOnPath);
+  EXPECT_EQ(operator_profile.deceleration_time_s, std::optional<double>{1.0});
+  EXPECT_TRUE(operator_profile.allow_natural_completion_on_short_path);
+  EXPECT_EQ(operator_profile.per_joint_max_deceleration.at("joint_1"),
+            CoordinateAccelerationDTO{AngularAccelerationDTO{4.0}});
+  EXPECT_EQ(engine.last_stop_stage->participant_stop_plan.participant_stop_profile_purpose,
+            ParticipantStopProfilePurposeDTO::kOperator);
   EXPECT_EQ(stopped.value().stop_generation, StopGeneration(1U));
   ASSERT_EQ(stopped.value().affected_operation_revisions.size(), 1U);
   EXPECT_EQ(
@@ -7421,6 +7594,7 @@ void VerifyStopFaultRecoveryMotionAdmission(const bool latch_manager_liveness_lo
   const auto cleared_offer = kernel.get_stop_fault_recovery_offer();
   ASSERT_TRUE(cleared_offer.ok()) << cleared_offer.error().message;
   EXPECT_FALSE(cleared_offer.value().has_value());
+  EXPECT_FALSE(kernel.cell_stop_action_projection().fault.has_value());
 
   auto admitted_intent = motion_operation("request.surveillance.admitted");
   admitted_intent.program_binding_id = unaffected_binding.value().program_binding_id;
@@ -7437,6 +7611,26 @@ void VerifyStopFaultRecoveryMotionAdmission(const bool latch_manager_liveness_lo
   } else {
     ASSERT_TRUE(admitted.ok()) << admitted.error().message;
     EXPECT_EQ(unaffected_engine.execute_calls, 1);
+
+    // A cleared Stop-fault latch remains retained as history. It must never
+    // contaminate recovery for a later ordinary Stop or turn that operation
+    // into Reset-only intervention.
+    const auto ordinary_stop = kernel.stop(
+        stop_request("request.surveillance.admitted.stop", admitted.value(), 1U));
+    ASSERT_TRUE(ordinary_stop.ok()) << ordinary_stop.error().message;
+    ASSERT_TRUE(wait_until([&] {
+      const auto state = kernel.get_operation_state(admitted.value().operation_id);
+      return state.ok() && state.value().state == OperationStateKind::kStopped;
+    }));
+    const auto ordinary_recovery =
+        kernel.get_operation_recovery_assessment(admitted.value().operation_id);
+    ASSERT_TRUE(ordinary_recovery.ok()) << ordinary_recovery.error().message;
+    EXPECT_EQ(ordinary_recovery.value().assessment.recovery_class,
+              RecoveryClass::kOrdinaryOperatorStop);
+    EXPECT_EQ(ordinary_recovery.value().assessment.status,
+              RecoveryAssessmentStatus::kRetryReady);
+    EXPECT_TRUE(ordinary_recovery.value().assessment.retry_admissible);
+    EXPECT_FALSE(kernel.cell_stop_action_projection().fault.has_value());
   }
 }
 

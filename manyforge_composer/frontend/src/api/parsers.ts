@@ -48,6 +48,7 @@ import type {
   ProgramSceneShape,
   ProgramTreeNode,
   ProgramRunIndex,
+  ProgramCycleStatus,
   ProgramRunStateName,
   ProgramRunStatus,
   CycleRecoveryAction,
@@ -140,6 +141,60 @@ export function parseProgramCycleResetResult(value: unknown): ProgramCycleResetR
     ),
     admission: objectAt(record.admission, 'programCycleReset.admission') as Record<string, JsonValue>,
     runtimeControls,
+  };
+}
+
+export function parseProgramCycleStatus(value: unknown): ProgramCycleStatus {
+  const record = objectAt(value, 'programCycleStatus');
+  exactKeysAt(record, [
+    'program_runner_owner_epoch', 'cycle_generation', 'state', 'program_run_id',
+    'cycle_claim_generation', 'terminal_or_settlement_reference',
+    'runtime_control_revision', 'recovery_offer',
+  ], 'programCycleStatus');
+  const state = stringAt(record.state, 'programCycleStatus.state');
+  if (!['idle_after_reset', 'starting', 'running', 'stopping',
+    'terminal_awaiting_reset'].includes(state)) {
+    return fail('programCycleStatus.state', 'a supported Program cycle state');
+  }
+  return {
+    programRunnerOwnerEpoch: stringAt(
+      record.program_runner_owner_epoch,
+      'programCycleStatus.program_runner_owner_epoch',
+    ),
+    cycleGeneration: positiveIntegerAt(
+      record.cycle_generation,
+      'programCycleStatus.cycle_generation',
+    ),
+    state: state as ProgramCycleStatus['state'],
+    programRunId: nullableStringAt(
+      record.program_run_id,
+      'programCycleStatus.program_run_id',
+    ),
+    cycleClaimGeneration: record.cycle_claim_generation === null
+      ? null
+      : positiveIntegerAt(
+        record.cycle_claim_generation,
+        'programCycleStatus.cycle_claim_generation',
+      ),
+    terminalOrSettlementReference:
+      record.terminal_or_settlement_reference === null
+        ? null
+        : digestAt(
+          record.terminal_or_settlement_reference,
+          'programCycleStatus.terminal_or_settlement_reference',
+        ),
+    runtimeControlRevision: record.runtime_control_revision === null
+      ? null
+      : positiveIntegerAt(
+        record.runtime_control_revision,
+        'programCycleStatus.runtime_control_revision',
+      ),
+    recoveryOffer: record.recovery_offer === null
+      ? null
+      : parseCycleRecoveryOffer(
+        record.recovery_offer,
+        'programCycleStatus.recovery_offer',
+      ),
   };
 }
 import type {
@@ -2956,6 +3011,8 @@ export function parseAppliedProgramSelection(value: unknown): AppliedProgramSele
 const PROGRAM_RUN_STATES = new Set<ProgramRunStateName>([
   'running',
   'intervention_required',
+  'full_stopping',
+  'full_stopped',
   'stopping',
   'finalizing',
   'stopped',
@@ -3175,6 +3232,8 @@ export function parseProgramRunIndex(value: unknown): ProgramRunIndex {
     || (activeOnly && ![
       'running',
       'intervention_required',
+      'full_stopping',
+      'full_stopped',
       'stopping',
       'finalizing',
     ].includes(run.state))

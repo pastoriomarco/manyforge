@@ -1174,7 +1174,10 @@ if(BUILD_TESTING)
       PROPERTIES
         ENVIRONMENT
           "PYTHONPATH=${_MANYFORGE_WORKSPACE_ROOT}/manyforge_behavior:${_MANYFORGE_WORKSPACE_ROOT};LD_LIBRARY_PATH=${_LIB_PATHS};MANYFORGE_NATIVE_EXECUTION_HOST=$<TARGET_FILE:manyforge_native_execution_host_admission_fixture>;MANYFORGE_NATIVE_PRODUCTION_EXECUTION_HOST=$<TARGET_FILE:manyforge_native_execution_host>;MANYFORGE_NATIVE_PICK_PLACE_FIXTURE_HOST=$<TARGET_FILE:manyforge_native_execution_host_pick_place_fixture>;MANYFORGE_ROBOPLAN_CANDIDATE_WORKER=$<TARGET_FILE:manyforge_roboplan_candidate_worker>;MANYFORGE_ROBOPLAN_FAKE_WORKER=$<TARGET_FILE:fake_process_candidate_worker>;MANYFORGE_I6_NATIVE_FIXTURE_ROOT=${_MANYFORGE_L07_NATIVE_CCLC_FIXTURE_ROOT}"
-        TIMEOUT 60)
+        # This process test intentionally executes many sequential, model-
+        # limited trajectories. Keep its harness deadline independent from
+        # the much shorter per-operation execution deadlines it verifies.
+        TIMEOUT 180)
 
   endif()
 endif()

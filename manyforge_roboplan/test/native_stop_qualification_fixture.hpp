@@ -5,8 +5,8 @@
 #include <manyforge_core/types/trajectory_dto.hpp>
 #include <manyforge_roboplan/retained_observed_state_channel.hpp>
 
-#include <cstddef>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -20,14 +20,21 @@
 
 namespace manyforge::roboplan_backend::qualification_fixture {
 
-[[nodiscard]] inline core::RuntimeParticipantBinding make_binding() {
-  const std::vector<std::string> joints{"joint_1", "joint_2"};
+[[nodiscard]] inline core::RuntimeParticipantBinding
+make_binding(bool distinct_compiled_joint_names = false) {
+  const std::vector<std::string> source_joints{"joint_1", "joint_2"};
+  const std::vector<std::string> compiled_joints =
+      distinct_compiled_joint_names
+          ? std::vector<std::string>{"compiled.robot.joint_1",
+                                     "compiled.robot.joint_2"}
+          : source_joints;
   std::vector<core::RuntimeResourceBindingDTO> resources;
-  for (std::size_t index = 0U; index < joints.size(); ++index) {
+  for (std::size_t index = 0U; index < source_joints.size(); ++index) {
     resources.push_back(core::RuntimeResourceBindingDTO{
         core::ResourceRoleId("arm_joints"),
         core::ResourceId("resource.joint." + std::to_string(index + 1U)),
-        joints[index], joints[index], core::CoordinateKind::kAngular});
+        source_joints[index], compiled_joints[index],
+        core::CoordinateKind::kAngular});
   }
   core::RuntimeParticipantBindingDTO value{
       core::ProgramId("program.native.stop_qualification"),
@@ -49,7 +56,7 @@ namespace manyforge::roboplan_backend::qualification_fixture {
                                         core::ModelRevision("model-revision")}},
       {core::RuntimeModelGroupBindingDTO{core::ModelGroupRoleId("arm_group"),
                                          core::ModelInstanceId("robot.model"),
-                                         "arm", joints}},
+                                         "arm", compiled_joints}},
       {core::ProgramFrameRoleBindingDTO{
            core::FrameRoleId("base"), core::ModelInstanceId("robot.model"),
            core::ModelRevision("model-revision"), "base"},
@@ -201,6 +208,17 @@ public:
   core::Result<core::ObservedStateSnapshotDTO>
   current_state(std::int64_t) const override {
     std::lock_guard lock(mutex_);
+    auto observed_velocities = state_.velocities;
+    if (forced_observed_velocities_.has_value()) {
+      observed_velocities.emplace();
+      observed_velocities->reserve(forced_observed_velocities_->size());
+      for (std::size_t index = 0U;
+           index < forced_observed_velocities_->size(); ++index) {
+        observed_velocities->push_back(tagged_velocity(
+            context_.coordinate_kinds[index],
+            (*forced_observed_velocities_)[index]));
+      }
+    }
     return core::Result<core::ObservedStateSnapshotDTO>::Ok(
         core::ObservedStateSnapshotDTO{
             context_.controllable_component_id,
@@ -221,7 +239,7 @@ public:
             sequence_,
             context_.joint_names,
             state_.positions,
-            state_.velocities,
+            std::move(observed_velocities),
             "qualification.native.state",
             source_epoch_,
             core::ObservedStateSourceKind::kPredictedState,
@@ -239,11 +257,12 @@ public:
                         std::stop_token cancellation) const override {
     if (cancellation.stop_requested() ||
         (deadline_ns >= 0 && now_ns >= deadline_ns)) {
-      return core::Result<core::ObservedStateSnapshotDTO>::Err(
-          core::ErrorDTO{"invalid_request", "qualification state unavailable",
-                         {{"reason", cancellation.stop_requested()
-                                        ? "retained_state_read_cancelled"
-                                        : "retained_state_read_deadline_expired"}}});
+      return core::Result<core::ObservedStateSnapshotDTO>::Err(core::ErrorDTO{
+          "invalid_request",
+          "qualification state unavailable",
+          {{"reason", cancellation.stop_requested()
+                          ? "retained_state_read_cancelled"
+                          : "retained_state_read_deadline_expired"}}});
     }
     return current_state(now_ns);
   }
@@ -285,6 +304,15 @@ public:
     refresh_source_on_wait_ = enabled;
   }
 
+  void force_observed_velocities(std::vector<double> velocities) {
+    if (velocities.size() != context_.coordinate_kinds.size()) {
+      throw std::invalid_argument(
+          "forced qualification velocities have the wrong shape");
+    }
+    std::lock_guard lock(mutex_);
+    forced_observed_velocities_ = std::move(velocities);
+  }
+
   bool wait_for_fresh_state(std::chrono::nanoseconds) const override {
     std::lock_guard lock(mutex_);
     if (!refresh_source_on_wait_) {
@@ -316,6 +344,7 @@ private:
   mutable std::int64_t received_timestamp_ns_{};
   mutable core::RuntimeEpoch source_epoch_{context_.runtime_epoch};
   bool refresh_source_on_wait_{};
+  std::optional<std::vector<double>> forced_observed_velocities_;
 };
 
 [[nodiscard]] inline core::TrajectoryDTO

@@ -103,6 +103,40 @@ class ScopedTemporaryDirectory final {
       std::nullopt};
 }
 
+[[nodiscard]] OperationStateDTO PreparedMotionState(std::string operation_id,
+                                                    std::int64_t updated_at_ns) {
+  const OperationId id(std::move(operation_id));
+  return OperationStateDTO{
+      id,
+      OperationRevision(1U),
+      ProgramBindingId("program-binding"),
+      ProgramRunId("run.1"),
+      OperationCoordinationPolicy::kIndependent,
+      OperationStateKind::kPrepared,
+      {OperationParticipantStateDTO{
+          OperationParticipantId(id.value() + ":participant:1"),
+          ControllerGoalId(id.value() + ":controller-goal:1"),
+          ControllerGoalGeneration(1U),
+          ControllableComponentId("robot.1"),
+          CommandTargetId("arm"),
+          CapabilityId("execution.trajectory.execute"),
+          ControlDomainId("domain.arm"),
+          ControlDomainRevision("domain-revision"),
+          ControlBindingId("binding.arm"),
+          ControlBindingRevision("binding-revision"),
+          std::nullopt,
+          std::nullopt,
+          OperationParticipantPayloadKind::kMotion,
+          OperationStateKind::kPrepared,
+          0.0,
+          {ResourceId("robot.joint1")},
+          std::nullopt}},
+      updated_at_ns,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt};
+}
+
 [[nodiscard]] OperationAcceptedDTO Acceptance(const OperationIntentDTO& intent,
                                               const OperationStateDTO& state) {
   return OperationAcceptedDTO{
@@ -379,16 +413,94 @@ class ScopedTemporaryDirectory final {
   return checkpoint;
 }
 
-TEST(SqliteOperationJournalTest,
-     EmptyRuntimeOwnerEpochCanStartAndCloseWithoutResourceRows) {
+TEST(SqliteOperationJournalTest, EmptyRuntimeOwnerEpochCanStartAndCloseWithoutResourceRows) {
   ScopedTemporaryDirectory directory;
-  SqliteOperationJournal journal(directory.path() / "operation.sqlite3",
-                                 CellId("cell.test"));
+  SqliteOperationJournal journal(directory.path() / "operation.sqlite3", CellId("cell.test"));
   const RequestOwnerEpoch epoch("execution-host.empty.1");
   const auto recovery = journal.BeginOwnerEpoch(epoch, 1, 8U, {});
   ASSERT_TRUE(recovery.ok()) << recovery.error().message;
   EXPECT_TRUE(recovery.value().unreconciled_resources.empty());
   EXPECT_TRUE(journal.CloseOwnerEpoch(epoch, 2).ok());
+}
+
+TEST(SqliteOperationJournalTest,
+     PreparedMotionStateRetainsBoundedMetricsAndExactRuntimePolicyProvenance) {
+  ScopedTemporaryDirectory directory;
+  SqliteOperationJournal journal(directory.path() / "operation.sqlite3", CellId("cell.test"));
+  const RequestOwnerEpoch epoch("execution-host.prepared.1");
+  ASSERT_TRUE(journal.BeginOwnerEpoch(epoch, 1, 8U, {ResourceId("robot.joint1")}).ok());
+  const auto state = PreparedMotionState("operation:prepared:1", 10);
+
+  const auto missing =
+      journal.RecordOperationState(epoch, state, nullptr, "subordinate_motion_prepared");
+  ASSERT_FALSE(missing.ok());
+  EXPECT_EQ(missing.error().code, "operation_journal_record_invalid");
+
+  const std::vector<PreparedMotionDiagnosticsDTO> diagnostics{
+      PreparedMotionDiagnosticsDTO{
+          state.participants.front().participant_id,
+          Digest('1'),
+          MoveId("move.pick"),
+          {"joint1"},
+          TrajectoryValidationMetricsDTO{2.5, {0.4}, {1.2}, 0.15},
+          PreparedRuntimePolicyRefDTO{
+              RuntimePolicyCatalogRecordRefDTO{
+                  RuntimePolicyId("manyforge.runtime_motion.cell"),
+                  RuntimePolicyRevision(Digest('2').value()),
+                  SchemaId("manyforge.runtime_policy.v1"),
+                  SchemaRevision(Digest('3').value()),
+                  Digest('4'),
+                  ContentAddressedStoreKey("catalog/runtime-policy/cell/record")},
+              RuntimeMotionSpeedLimitDTO{
+                  RuntimePolicyCommandTargetScopeDTO{ControllableComponentId("robot.1"),
+                                                     CommandTargetId("arm")},
+                  0.15}}}};
+  const auto recorded = journal.RecordOperationState(
+      epoch, state, nullptr, "subordinate_motion_prepared", diagnostics);
+  ASSERT_TRUE(recorded.ok()) << recorded.error().message;
+
+  auto observed = state;
+  observed.operation_revision = OperationRevision(2U);
+  observed.state = OperationStateKind::kExecuting;
+  observed.participants.front().state = OperationStateKind::kExecuting;
+  observed.participants.front().progress = 0.25;
+  observed.updated_at_ns = 11;
+  ASSERT_TRUE(journal
+                  .RecordOperationState(epoch, observed, nullptr,
+                                        "subordinate_state_observed")
+                  .ok());
+
+  const auto page = journal.ReadEvents(epoch, 0U, kMaximumOperationJournalEventPage);
+  ASSERT_TRUE(page.ok()) << page.error().message;
+  ASSERT_EQ(page.value().events.size(), 2U);
+  EXPECT_EQ(page.value().events.front().record_kind, "operation_prepared");
+  const auto& payload = page.value().events.front().payload_json;
+  EXPECT_NE(payload.find("\"prepared_motion_diagnostics\":[{"), std::string::npos);
+  EXPECT_NE(payload.find("\"move_id\":\"move.pick\""), std::string::npos);
+  EXPECT_NE(payload.find("\"trajectory_duration_s\":2.5"), std::string::npos);
+  EXPECT_NE(payload.find("\"peak_abs_joint_velocity_rad_s\":[0.4]"), std::string::npos);
+  EXPECT_NE(payload.find("\"peak_abs_joint_acceleration_rad_s2\":[1.2]"),
+            std::string::npos);
+  EXPECT_NE(payload.find("\"peak_tcp_linear_speed_mps\":0.15"), std::string::npos);
+  EXPECT_NE(payload.find("\"runtime_policy_id\":\"manyforge.runtime_motion.cell\""),
+            std::string::npos);
+  EXPECT_NE(payload.find("\"content_addressed_store_key\":"
+                         "\"catalog/runtime-policy/cell/record\""),
+            std::string::npos);
+  EXPECT_NE(payload.find("\"scope_kind\":\"command_target\""), std::string::npos);
+  EXPECT_NE(payload.find("\"maximum_tcp_linear_speed_mps\":0.15"), std::string::npos);
+
+  const auto reopened = [&]() {
+    journal.Close();
+    SqliteOperationJournal recovered(directory.path() / "operation.sqlite3", CellId("cell.test"));
+    return recovered.ReadEvents(epoch, 0U, kMaximumOperationJournalEventPage);
+  }();
+  ASSERT_TRUE(reopened.ok()) << reopened.error().message;
+  ASSERT_EQ(reopened.value().events.size(), 2U);
+  EXPECT_EQ(reopened.value().events.front().record_kind, "operation_prepared");
+  EXPECT_NE(reopened.value().events.front().payload_json.find(
+                "\"prepared_motion_diagnostics\":[{"),
+            std::string::npos);
 }
 
 TEST(SqliteOperationJournalTest, StopTerminalProjectionIsAtomicReplaySafeAndRecoveredAfterRestart) {
@@ -425,17 +537,16 @@ TEST(SqliteOperationJournalTest, StopTerminalProjectionIsAtomicReplaySafeAndReco
     const auto operational =
         journal.ReadOperationalEvents(epoch, 0U, kMaximumOperationJournalEventPage);
     ASSERT_TRUE(operational.ok()) << operational.error().message;
-    ASSERT_EQ(operational.value().events.size(), 1U);
-    EXPECT_EQ(operational.value().events.front().record_kind,
-              "stop_acceptance_projected");
+    ASSERT_EQ(operational.value().events.size(), 2U);
+    EXPECT_EQ(operational.value().events.front().record_kind, "stop_acceptance_projected");
+    EXPECT_EQ(operational.value().events.back().record_kind, "stop_terminal_projected");
+    EXPECT_EQ(operational.value().events.back().sequence, *first.journal_sequence);
     EXPECT_FALSE(operational.value().has_more);
 
-    const auto forensic =
-        journal.ReadEvents(epoch, 0U, kMaximumOperationJournalEventPage);
+    const auto forensic = journal.ReadEvents(epoch, 0U, kMaximumOperationJournalEventPage);
     ASSERT_TRUE(forensic.ok()) << forensic.error().message;
     ASSERT_EQ(forensic.value().events.size(), 2U);
-    EXPECT_EQ(forensic.value().events.back().record_kind,
-              "stop_terminal_projected");
+    EXPECT_EQ(forensic.value().events.back().record_kind, "stop_terminal_projected");
     const auto replay = journal.RecordStopTerminal(epoch, terminal->stop_status,
                                                    terminal->certificate, terminal->fault_latch);
     EXPECT_EQ(replay.state, StopForensicProjectionStateDTO::kRecorded);
@@ -1110,34 +1221,29 @@ TEST(SqliteOperationJournalTest,
   auto entered = entered_promise.get_future();
   std::promise<void> release_promise;
   auto release = release_promise.get_future().share();
-  SqliteOperationJournal journal(
-      database, CellId("cell.1"), 8U, {},
-      [&](const std::string_view operation) {
-        if (operation == "cell_admission_acquire") {
-          entered_promise.set_value();
-          release.wait();
-        }
-      });
+  SqliteOperationJournal journal(database, CellId("cell.1"), 8U, {},
+                                 [&](const std::string_view operation) {
+                                   if (operation == "cell_admission_acquire") {
+                                     entered_promise.set_value();
+                                     release.wait();
+                                   }
+                                 });
   auto recovery = journal.BeginOwnerEpoch(epoch, 1, 8U, inventory);
   ASSERT_TRUE(recovery.ok());
   const CellAdmissionClaimDTO claim{
-      CellAdmissionClaimIntentDTO{
-          CellAdmissionClaimKindDTO::kAuthoringMutation,
-          CellAdmissionOwnerRoleDTO::kAuthoringOwner,
-          RequestOwnerEpoch("authoring.owner.1"),
-          "transaction.1",
-          RequestId("request.cell-claim.1"),
-          Digest('e'),
-          recovery.value().cell_admission_generation_high_water,
-          {},
-          std::nullopt,
-          std::nullopt},
-      CellAdmissionClaimGeneration(1U),
-      recovery.value().cell_admission_generation_high_water,
-      2};
-  auto admission = std::async(std::launch::async, [&] {
-    return journal.RecordCellAdmissionClaimAcquired(epoch, claim);
-  });
+      CellAdmissionClaimIntentDTO{CellAdmissionClaimKindDTO::kAuthoringMutation,
+                                  CellAdmissionOwnerRoleDTO::kAuthoringOwner,
+                                  RequestOwnerEpoch("authoring.owner.1"),
+                                  "transaction.1",
+                                  RequestId("request.cell-claim.1"),
+                                  Digest('e'),
+                                  recovery.value().cell_admission_generation_high_water,
+                                  {},
+                                  std::nullopt,
+                                  std::nullopt},
+      CellAdmissionClaimGeneration(1U), recovery.value().cell_admission_generation_high_water, 2};
+  auto admission = std::async(
+      std::launch::async, [&] { return journal.RecordCellAdmissionClaimAcquired(epoch, claim); });
   entered.wait();
 
   const FullStopIntentDTO intent{

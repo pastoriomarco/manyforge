@@ -1392,7 +1392,7 @@ void require_empty_scalar_element(
       }
       saw_limit = true;
       require_empty_scalar_element(
-          child, {"lower", "upper", "effort", "velocity"});
+          child, {"lower", "upper", "effort", "velocity", "acceleration"});
       UrdfLimitIr limit;
       limit.authored_lower = parse_optional_scalar(child, "lower");
       limit.authored_upper = parse_optional_scalar(child, "upper");
@@ -1409,11 +1409,15 @@ void require_empty_scalar_element(
       }
       limit.effort = *effort;
       limit.velocity = *velocity;
+      limit.acceleration = parse_optional_scalar(child, "acceleration");
       if (limit.lower > limit.upper) {
         fail("URDF joint lower limit exceeds its upper limit");
       }
       if (limit.effort < 0.0 || limit.velocity < 0.0) {
         fail("URDF joint effort and velocity limits must not be negative");
+      }
+      if (limit.acceleration.has_value() && *limit.acceleration <= 0.0) {
+        fail("URDF joint acceleration limit must be positive");
       }
       joint.limit = std::move(limit);
     } else if (child.name == "mimic") {
@@ -1496,6 +1500,16 @@ void require_empty_scalar_element(
 
 void validate_urdf_semantics(ParseAccumulator& accumulator) {
   auto& ir = accumulator.urdf;
+  if (ir.version_major != 1U || ir.version_minor > 2U) {
+    fail("unsupported URDF version; supported versions are 1.0 through 1.2");
+  }
+  if (ir.version_minor < 2U &&
+      std::any_of(ir.joints.begin(), ir.joints.end(), [](const auto& joint) {
+        return joint.limit.has_value() &&
+               joint.limit->acceleration.has_value();
+      })) {
+    fail("URDF joint acceleration limits require URDF version 1.2");
+  }
   std::unordered_set<std::string> links;
   for (const auto& link : ir.links) {
     if (!links.emplace(link.name).second) {
@@ -1631,8 +1645,18 @@ void parse_urdf(const XmlNode& root, ParseAccumulator& accumulator) {
   if (root.name != "robot") {
     fail("URDF root element must be <robot>");
   }
-  require_allowed_attributes(root, {"name"}, {"name"});
+  require_allowed_attributes(root, {"name", "version"}, {"name"});
   accumulator.urdf.robot_name = require_symbol_attribute(root, "name");
+  if (const auto* version = find_attribute(root, "version");
+      version != nullptr) {
+    if (*version == "1.1") {
+      accumulator.urdf.version_minor = 1U;
+    } else if (*version == "1.2") {
+      accumulator.urdf.version_minor = 2U;
+    } else if (*version != "1.0") {
+      fail("unsupported URDF version; supported versions are 1.0 through 1.2");
+    }
+  }
   for (const auto& child : root.children) {
     if (child.name == "link") {
       accumulator.urdf.links.push_back(parse_link(child, accumulator));
@@ -2715,6 +2739,10 @@ void emit_joint(std::string& output, const UrdfJointIr& joint) {
     append_number_attribute(output, "effort", joint.limit->effort);
     append_number_attribute(output, "velocity",
                             joint.limit->velocity);
+    if (joint.limit->acceleration.has_value()) {
+      append_number_attribute(output, "acceleration",
+                              *joint.limit->acceleration);
+    }
     output.append("/>");
   }
   if (joint.mimic.has_value()) {
@@ -2748,6 +2776,11 @@ void emit_joint(std::string& output, const UrdfJointIr& joint) {
 [[nodiscard]] std::string emit_urdf_document(const UrdfDocumentIr& urdf) {
   std::string output{"<robot"};
   append_attribute(output, "name", urdf.robot_name);
+  if (urdf.version_major != 1U || urdf.version_minor != 0U) {
+    append_attribute(output, "version",
+                     std::to_string(urdf.version_major) + "." +
+                         std::to_string(urdf.version_minor));
+  }
   output.push_back('>');
   const auto materials = sorted_references(
       urdf.materials,

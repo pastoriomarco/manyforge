@@ -6,6 +6,7 @@ import {
   attentionAlarmsNewestFirst,
   historianEventView,
   operatorAlarmView,
+  runtimeAttentionSummary,
   runtimeStatusView,
 } from './HeadlessRuntimeSurfaces';
 import type {
@@ -29,6 +30,19 @@ function source() {
 }
 
 describe('headless Composer presentation adapters', () => {
+  it('keeps automatic attention to one concise summary line', () => {
+    expect(runtimeAttentionSummary([], [])).toBe('No messages require attention');
+    expect(runtimeAttentionSummary([], [{
+      id: 'composer.error.1',
+      title: 'Program command failed',
+      message: 'Exact response mismatch.',
+    }])).toBe('Program command failed');
+    expect(runtimeAttentionSummary([], [
+      { id: 'composer.error.1', title: 'First', message: 'First detail' },
+      { id: 'composer.error.2', title: 'Second', message: 'Second detail' },
+    ])).toBe('2 messages require attention');
+  });
+
   it('never presents an H0 projection as execution or robot readiness', () => {
     const runtime: HeadlessRuntimeSnapshot = {
       schemaVersion: 'manyforge.headless_runtime_snapshot.v1',
@@ -301,7 +315,26 @@ describe('headless Composer presentation adapters', () => {
     expect(html).not.toContain('ACTIVE — ACKNOWLEDGED · Reduced capability');
     expect(html).toContain('Reconnect headless projection');
     expect(html).toContain('COMPOSER ERROR — DISMISSAL REQUIRED');
-    expect(html).toContain('Dismiss message');
+    expect(html).toContain('Invalid response from /api/program/runs/program-run.1');
+    expect(html).toContain('Acknowledge message');
+    expect(html).toContain('Acknowledge all');
     expect(reconnect).not.toHaveBeenCalled();
+
+    const collapsed = renderToStaticMarkup(createElement(HeadlessRuntimeSurfacesView, {
+      enabled: true,
+      headlessState: { snapshot, error: null, reconnect },
+      clientErrors: [{
+        id: 'composer.program_runtime',
+        title: 'Program command or response failed',
+        message: 'Invalid response from /api/program/runs/program-run.1',
+      }],
+      expanded: false,
+      onExpandedChange: vi.fn(),
+      onClose: vi.fn(),
+    }));
+    expect(collapsed).toContain('2 messages require attention');
+    expect(collapsed).toContain('Acknowledge all');
+    expect(collapsed).not.toContain('Runtime observability sections');
+    expect(collapsed).not.toContain('Planner unavailable');
   });
 });

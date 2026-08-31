@@ -1353,6 +1353,8 @@ void expect_checked_in_lite6_and_ur_mixed_composition_matrix() {
       mixed_graph, source_values({&ur_source, &lite6_source}),
       type_values({&ur_type, &lite6_type}));
 
+  EXPECT_EQ(mixed.flattened_urdf().version_major, 1U);
+  EXPECT_EQ(mixed.flattened_urdf().version_minor, 2U);
   const auto lite6_materials =
       summarize_visual_materials(lite6_source.value.source_ir().urdf());
   const auto flattened_materials =

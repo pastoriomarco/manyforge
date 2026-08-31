@@ -562,6 +562,8 @@ void add_reference(
   result.robot_name = symbols.require(
       model.model_instance_id, OccurrenceSymbolKind::kRobot, {},
       source.robot_name);
+  result.version_major = source.version_major;
+  result.version_minor = source.version_minor;
   result.materials.reserve(source.materials.size());
   for (std::size_t index = 0; index < source.materials.size(); ++index) {
     result.materials.push_back(rewrite_material(
@@ -1696,6 +1698,10 @@ CompositionQualifiedCellIr compose_cell_occurrences(
     auto rewritten = rewrite_urdf_occurrence(
         *model, source.urdf(), symbols, references,
         resource_uris->second);
+    flattened_urdf.version_major =
+        std::max(flattened_urdf.version_major, rewritten.version_major);
+    flattened_urdf.version_minor =
+        std::max(flattened_urdf.version_minor, rewritten.version_minor);
     require_room(flattened_urdf.materials.size(), rewritten.materials.size(),
                  kMaxCompositionSymbols, "flattened material");
     flattened_urdf.materials.insert(

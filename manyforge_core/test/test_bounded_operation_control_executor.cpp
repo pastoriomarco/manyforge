@@ -301,6 +301,7 @@ class Receiver final : public IOperationControlEffectCompletionReceiver {
                                              OperationParticipantId("participant.resume"),
                                              ControllerGoalId("goal.resume"),
                                              ControllerGoalGeneration(2U),
+                                             {},
                                              {}});
   return OperationControlEffectRequest{&engine,
                                        authority->operation_id,

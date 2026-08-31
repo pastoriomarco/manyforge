@@ -1048,6 +1048,141 @@ template <typename StrongId>
   });
 }
 
+[[nodiscard]] CanonicalValue PreparedRuntimePolicyValue(
+    const PreparedRuntimePolicyRefDTO& policy) {
+  const auto& source = policy.source_artifact;
+  CanonicalValue::Object selected{
+      {"maximum_tcp_linear_speed_mps",
+       CanonicalValue(policy.selected_motion_speed_limit.maximum_tcp_linear_speed_mps)}};
+  std::visit(
+      [&](const auto& scope) {
+        using Scope = std::decay_t<decltype(scope)>;
+        if constexpr (std::is_same_v<Scope, RuntimePolicyCellScopeDTO>) {
+          selected.emplace_back("scope_kind", CanonicalValue("cell"));
+        } else {
+          selected.emplace_back("command_target_id",
+                                CanonicalValue(scope.command_target_id.value()));
+          selected.emplace_back("controllable_component_id",
+                                CanonicalValue(scope.controllable_component_id.value()));
+          selected.emplace_back("scope_kind", CanonicalValue("command_target"));
+        }
+      },
+      policy.selected_motion_speed_limit.scope);
+  return CanonicalValue(CanonicalValue::Object{
+      {"source_artifact",
+       CanonicalValue(CanonicalValue::Object{
+           {"content_addressed_store_key",
+            CanonicalValue(source.content_addressed_store_key.value())},
+           {"content_digest", CanonicalValue(source.content_digest.value())},
+           {"runtime_policy_id", CanonicalValue(source.record_id.value())},
+           {"runtime_policy_revision", CanonicalValue(source.record_revision.value())},
+           {"schema_id", CanonicalValue(source.schema_id.value())},
+           {"schema_revision", CanonicalValue(source.schema_revision.value())}})},
+      {"selected_motion_speed_limit", CanonicalValue(std::move(selected))}});
+}
+
+[[nodiscard]] CanonicalValue PreparedMotionDiagnosticsValue(
+    const OperationStateDTO& state,
+    const std::span<const PreparedMotionDiagnosticsDTO> diagnostics) {
+  CanonicalValue::Array rows;
+  rows.reserve(diagnostics.size());
+  std::set<OperationParticipantId> participant_ids;
+  for (const auto& diagnostic : diagnostics) {
+    const auto state_row = std::find_if(
+        state.participants.begin(), state.participants.end(), [&](const auto& candidate) {
+          return candidate.participant_id == diagnostic.participant_id;
+        });
+    const auto& metrics = diagnostic.trajectory_metrics;
+    const bool acceleration_shape_valid =
+        metrics.peak_abs_joint_acceleration_rad_s2.empty() ||
+        metrics.peak_abs_joint_acceleration_rad_s2.size() == diagnostic.joint_names.size();
+    const auto finite_nonnegative = [](const double value) {
+      return std::isfinite(value) && value >= 0.0;
+    };
+    Require(state_row != state.participants.end() &&
+                state_row->payload_kind == OperationParticipantPayloadKind::kMotion &&
+                state_row->state == OperationStateKind::kPrepared &&
+                participant_ids.insert(diagnostic.participant_id).second &&
+                !diagnostic.prepared_contract_digest.empty() && !diagnostic.move_id.empty() &&
+                !diagnostic.joint_names.empty() &&
+                diagnostic.joint_names.size() == state_row->resources.size() &&
+                diagnostic.joint_names.size() ==
+                    metrics.peak_abs_joint_velocity_rad_s.size() &&
+                acceleration_shape_valid && finite_nonnegative(metrics.trajectory_duration_s) &&
+                std::all_of(metrics.peak_abs_joint_velocity_rad_s.begin(),
+                            metrics.peak_abs_joint_velocity_rad_s.end(), finite_nonnegative) &&
+                std::all_of(metrics.peak_abs_joint_acceleration_rad_s2.begin(),
+                            metrics.peak_abs_joint_acceleration_rad_s2.end(), finite_nonnegative) &&
+                (!metrics.peak_tcp_linear_speed_mps.has_value() ||
+                 finite_nonnegative(*metrics.peak_tcp_linear_speed_mps)),
+            "operation_journal_record_invalid",
+            "prepared-motion diagnostics do not match the exact prepared participant");
+    std::set<std::string> joint_names;
+    Require(std::all_of(diagnostic.joint_names.begin(), diagnostic.joint_names.end(),
+                        [&](const auto& name) {
+                          return !name.empty() && joint_names.insert(name).second;
+                        }),
+            "operation_journal_record_invalid",
+            "prepared-motion diagnostics contain invalid joint names");
+
+    const auto& source = diagnostic.runtime_policy.source_artifact;
+    const auto& selected = diagnostic.runtime_policy.selected_motion_speed_limit;
+    bool scope_matches = false;
+    std::visit(
+        [&](const auto& scope) {
+          using Scope = std::decay_t<decltype(scope)>;
+          if constexpr (std::is_same_v<Scope, RuntimePolicyCellScopeDTO>) {
+            scope_matches = true;
+          } else {
+            scope_matches = scope.controllable_component_id ==
+                                state_row->controllable_component_id &&
+                            scope.command_target_id == state_row->command_target_id;
+          }
+        },
+        selected.scope);
+    Require(!source.record_id.empty() && !source.record_revision.empty() &&
+                !source.schema_id.empty() && !source.schema_revision.empty() &&
+                !source.content_digest.empty() && !source.content_addressed_store_key.empty() &&
+                std::isfinite(selected.maximum_tcp_linear_speed_mps) &&
+                selected.maximum_tcp_linear_speed_mps > 0.0 && scope_matches,
+            "operation_journal_record_invalid",
+            "prepared-motion diagnostics contain invalid runtime-policy provenance");
+
+    CanonicalValue::Array names;
+    names.reserve(diagnostic.joint_names.size());
+    for (const auto& name : diagnostic.joint_names) {
+      names.emplace_back(name);
+    }
+    const auto numeric_array = [](const std::vector<double>& values) {
+      CanonicalValue::Array result;
+      result.reserve(values.size());
+      for (const auto value : values) {
+        result.emplace_back(value);
+      }
+      return CanonicalValue(std::move(result));
+    };
+    rows.emplace_back(CanonicalValue::Object{
+        {"joint_names", CanonicalValue(std::move(names))},
+        {"move_id", CanonicalValue(diagnostic.move_id.value())},
+        {"participant_id", CanonicalValue(diagnostic.participant_id.value())},
+        {"prepared_contract_digest",
+         CanonicalValue(diagnostic.prepared_contract_digest.value())},
+        {"runtime_policy", PreparedRuntimePolicyValue(diagnostic.runtime_policy)},
+        {"trajectory_metrics",
+         CanonicalValue(CanonicalValue::Object{
+             {"peak_abs_joint_acceleration_rad_s2",
+              numeric_array(metrics.peak_abs_joint_acceleration_rad_s2)},
+             {"peak_abs_joint_velocity_rad_s",
+              numeric_array(metrics.peak_abs_joint_velocity_rad_s)},
+             {"peak_tcp_linear_speed_mps",
+              metrics.peak_tcp_linear_speed_mps.has_value()
+                  ? CanonicalValue(*metrics.peak_tcp_linear_speed_mps)
+                  : CanonicalValue(nullptr)},
+             {"trajectory_duration_s", CanonicalValue(metrics.trajectory_duration_s)}})}});
+  }
+  return CanonicalValue(std::move(rows));
+}
+
 [[nodiscard]] CanonicalValue ControlRequestValue(const OperationControlRequestDTO& request) {
   return CanonicalValue(CanonicalValue::Object{
       {"expected_operation_revision",
@@ -2428,7 +2563,9 @@ class SqliteOperationJournal::Impl final {
   std::uint64_t RecordOperationState(const RequestOwnerEpoch& owner_epoch,
                                      const OperationStateDTO& state,
                                      const RuntimeScaleStatusDTO* scale_status,
-                                     const char* transition_reason);
+                                     const char* transition_reason,
+                                     std::span<const PreparedMotionDiagnosticsDTO>
+                                         prepared_motion_diagnostics);
 
   std::uint64_t RecordCellAdmissionClaimAcquired(const RequestOwnerEpoch& owner_epoch,
                                                  const CellAdmissionClaimDTO& claim);
@@ -2641,6 +2778,20 @@ std::uint64_t SqliteOperationJournal::Impl::Append(const RequestOwnerEpoch& owne
     coalesce.Bind(2, static_cast<std::int64_t>(sequence));
     Require(!coalesce.Step(), "operation_journal_corrupt",
             "operation journal state coalescing returned an unexpected row");
+  }
+  if (!request_id.has_value() &&
+      (record_kind == "state_observed" || record_kind == "operation_prepared")) {
+    Statement coalesce_prepared(
+        database_,
+        "DELETE FROM journal_records WHERE operation_id=? AND request_id IS NULL "
+        "AND record_kind='operation_prepared' AND sequence<>("
+        "SELECT MAX(sequence) FROM journal_records WHERE operation_id=? "
+        "AND request_id IS NULL AND record_kind='operation_prepared') "
+        "AND sequence NOT IN (SELECT snapshot_sequence FROM operation_snapshots)");
+    coalesce_prepared.Bind(1, state.operation_id.value());
+    coalesce_prepared.Bind(2, state.operation_id.value());
+    Require(!coalesce_prepared.Step(), "operation_journal_corrupt",
+            "operation journal prepared-evidence coalescing returned an unexpected row");
   }
   transaction.Commit();
   return bounded_sequence;
@@ -2972,7 +3123,9 @@ OperationJournalEventPageDTO SqliteOperationJournal::Impl::ReadEvents(
                         "payload_json,payload_digest FROM journal_records "
                         "WHERE owner_epoch=? AND sequence>? AND record_kind IN "
                         "('operation_accepted','control_accepted','stop_acceptance_projected',"
-                        "'runtime_scale_accepted','state_observed','host_replaced') "
+                        "'stop_terminal_projected','runtime_scale_accepted','operation_prepared',"
+                        "'state_observed',"
+                        "'host_replaced') "
                         "ORDER BY sequence LIMIT ?"
                       : "SELECT sequence,record_kind,request_id,operation_id,"
                         "operation_revision,occurred_at_ns,occurred_at_wall,effect_pending,"
@@ -3779,19 +3932,39 @@ std::uint64_t SqliteOperationJournal::Impl::RecordRuntimeScaleAccepted(
 
 std::uint64_t SqliteOperationJournal::Impl::RecordOperationState(
     const RequestOwnerEpoch& owner_epoch, const OperationStateDTO& state,
-    const RuntimeScaleStatusDTO* scale_status, const char* transition_reason) {
-  Require(transition_reason != nullptr && transition_reason[0] != '\0' &&
+    const RuntimeScaleStatusDTO* scale_status, const char* transition_reason,
+    const std::span<const PreparedMotionDiagnosticsDTO> prepared_motion_diagnostics) {
+  const std::string_view reason = transition_reason == nullptr ? "" : transition_reason;
+  const auto motion_participant_count = static_cast<std::size_t>(std::count_if(
+      state.participants.begin(), state.participants.end(), [](const auto& participant) {
+        return participant.payload_kind == OperationParticipantPayloadKind::kMotion;
+      }));
+  const bool exact_motion_prepared = reason == "subordinate_motion_prepared";
+  const bool coordinated_prepared = reason == "coordinated_prepare_barrier_complete";
+  const bool prepared_diagnostics_expected =
+      exact_motion_prepared || (coordinated_prepared && motion_participant_count != 0U);
+  Require(!reason.empty() &&
               (scale_status == nullptr ||
                (scale_status->operation_id == state.operation_id &&
                 scale_status->operation_revision == state.operation_revision &&
-                state.runtime_scale_generation == scale_status->runtime_scale_generation)),
+                state.runtime_scale_generation == scale_status->runtime_scale_generation)) &&
+              prepared_diagnostics_expected == !prepared_motion_diagnostics.empty() &&
+              (!prepared_diagnostics_expected ||
+               prepared_motion_diagnostics.size() == motion_participant_count),
           "operation_journal_record_invalid",
           "operation state observation is missing exact transition evidence");
-  return Append(owner_epoch, "state_observed", std::nullopt,
-                RecordValue("state_observed", owner_epoch,
-                            CanonicalValue(CanonicalValue::Object{
-                                {"transition_reason", CanonicalValue(transition_reason)},
-                            }),
+  CanonicalValue::Object intent{
+      {"transition_reason", CanonicalValue(std::string(reason))},
+  };
+  if (!prepared_motion_diagnostics.empty()) {
+    intent.emplace_back("prepared_motion_diagnostics",
+                        PreparedMotionDiagnosticsValue(state, prepared_motion_diagnostics));
+  }
+  const std::string_view record_kind =
+      prepared_diagnostics_expected ? "operation_prepared" : "state_observed";
+  return Append(owner_epoch, record_kind, std::nullopt,
+                RecordValue(record_kind, owner_epoch,
+                            CanonicalValue(std::move(intent)),
                             CanonicalValue(nullptr), state, scale_status, false),
                 state, state.updated_at_ns, false, "current");
 }
@@ -4577,9 +4750,11 @@ Result<std::uint64_t> SqliteOperationJournal::RecordRuntimeScaleAccepted(
 
 Result<std::uint64_t> SqliteOperationJournal::RecordOperationState(
     const RequestOwnerEpoch& owner_epoch, const OperationStateDTO& state,
-    const RuntimeScaleStatusDTO* scale_status, const char* transition_reason) {
+    const RuntimeScaleStatusDTO* scale_status, const char* transition_reason,
+    const std::span<const PreparedMotionDiagnosticsDTO> prepared_motion_diagnostics) {
   return AsResult<std::uint64_t>([&] {
-    return impl_->RecordOperationState(owner_epoch, state, scale_status, transition_reason);
+    return impl_->RecordOperationState(owner_epoch, state, scale_status, transition_reason,
+                                       prepared_motion_diagnostics);
   });
 }
 

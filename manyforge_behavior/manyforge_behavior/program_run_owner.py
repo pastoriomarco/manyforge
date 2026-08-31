@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
+from hashlib import sha256
 from threading import RLock
 from types import MappingProxyType
 from typing import Any, Final
@@ -59,6 +60,8 @@ class ProgramRunOwnerOutcomeUnknownError(ProgramRunOwnerError):
 class ProgramRunState(Enum):
     RUNNING = "running"
     INTERVENTION_REQUIRED = "intervention_required"
+    FULL_STOPPING = "full_stopping"
+    FULL_STOPPED = "full_stopped"
     STOPPING = "stopping"
     FINALIZING = "finalizing"
     STOPPED = "stopped"
@@ -865,6 +868,8 @@ class ProgramRunOwner:
         active_states = {
             ProgramRunState.RUNNING,
             ProgramRunState.INTERVENTION_REQUIRED,
+            ProgramRunState.FULL_STOPPING,
+            ProgramRunState.FULL_STOPPED,
             ProgramRunState.STOPPING,
             ProgramRunState.FINALIZING,
         }
@@ -900,11 +905,19 @@ class ProgramRunOwner:
                 if entry.state is ProgramRunState.FINALIZING:
                     reconcile_finalize = True
                     issue_stop = False
+                    observe_existing_stop = False
+                    invalidate_tree = False
                     run = entry.run
                 else:
                     reconcile_finalize = False
+                    transitioning_from_full_stop = entry.state in {
+                        ProgramRunState.FULL_STOPPING,
+                        ProgramRunState.FULL_STOPPED,
+                    }
                     issue_stop = not entry.stop_requested
-                    if issue_stop:
+                    observe_existing_stop = transitioning_from_full_stop
+                    invalidate_tree = issue_stop or transitioning_from_full_stop
+                    if issue_stop or transitioning_from_full_stop:
                         entry.stop_requested = True
                         entry.state = ProgramRunState.STOPPING
                         entry.state_after_stop = state_after_stop
@@ -929,6 +942,12 @@ class ProgramRunOwner:
                     )
                 except Exception as exc:  # fail closed; status remains stopping
                     scope_errors.append(exc)
+            elif observe_existing_stop:
+                try:
+                    scope_snapshot = self._scope.observe(program_run_id)
+                except Exception as exc:
+                    scope_errors.append(exc)
+            if invalidate_tree:
                 try:
                     # Kernel Stop has already had its independent priority path.
                     # Tree invalidation only prevents later orchestration effects.
@@ -1064,6 +1083,307 @@ class ProgramRunOwner:
                 entry.revision += 1
                 return self._snapshot(entry)
 
+    def _complete_full_stop(self, program_run_id: str) -> ProgramRunSnapshot:
+        """Freeze a physically settled run without invalidating its tree."""
+
+        with self._lock:
+            entry = self._entry(program_run_id)
+            if entry.state is not ProgramRunState.FULL_STOPPING:
+                return self._snapshot(entry)
+            run = entry.run
+        try:
+            active, _held, unrecoverable = run.reconcile_full_stop_tasks()
+        except Exception as error:
+            with self._lock:
+                entry = self._entry(program_run_id)
+                entry.active_operation_count = None
+                entry.reason_code = "program_full_stop_task_state_unknown"
+                entry.message = str(error) or type(error).__name__
+                return self._snapshot(entry)
+        with self._lock:
+            entry = self._entry(program_run_id)
+            if entry.state is not ProgramRunState.FULL_STOPPING:
+                return self._snapshot(entry)
+            if active:
+                entry.active_operation_count = active
+                entry.reason_code = "program_full_stop_task_observation_pending"
+                entry.message = (
+                    "Full Stop settled physically while accepted Program work "
+                    "is still becoming observable"
+                )
+                return self._snapshot(entry)
+            entry.state = ProgramRunState.FULL_STOPPED
+            entry.active_operation_count = 0
+            if unrecoverable:
+                entry.reason_code = "program_full_stop_resume_unavailable"
+                entry.message = (
+                    "Full Stop settled, but one or more preserved tasks do not "
+                    "offer fresh current-state recovery; Reset remains available"
+                )
+            else:
+                entry.reason_code = None
+                entry.message = ""
+            entry.revision += 1
+            return self._snapshot(entry)
+
+    def full_stop(
+        self,
+        program_run_id: str,
+        *,
+        reason: str | None = None,
+        stop_request_id: str | None = None,
+    ) -> ProgramRunSnapshot:
+        """Contain the exact run, then preserve its quiesced tree for Run."""
+
+        if reason is not None:
+            _text(reason, field="reason", maximum_bytes=4_096)
+        with self._lock:
+            transition_lock = self._entry(program_run_id).transition_lock
+        with transition_lock:
+            with self._lock:
+                entry = self._entry(program_run_id)
+                if entry.state in {
+                    ProgramRunState.STOPPED,
+                    ProgramRunState.SUCCEEDED,
+                    ProgramRunState.FAILED,
+                    ProgramRunState.FINALIZING,
+                    ProgramRunState.STOPPING,
+                }:
+                    return self._snapshot(entry)
+                if entry.state is ProgramRunState.FULL_STOPPED:
+                    return self._snapshot(entry)
+                if entry.state is ProgramRunState.FULL_STOPPING:
+                    reconcile = True
+                elif entry.state in {
+                    ProgramRunState.RUNNING,
+                    ProgramRunState.INTERVENTION_REQUIRED,
+                }:
+                    reconcile = False
+                    entry.state = ProgramRunState.FULL_STOPPING
+                    entry.stop_requested = True
+                    entry.reason_code = None
+                    entry.message = ""
+                    entry.revision += 1
+                else:
+                    raise ProgramRunOwnerError(
+                        "Full Stop requires a current Program run"
+                    )
+            if reconcile:
+                return self.reconcile_full_stop(program_run_id)
+            try:
+                scope = self._scope.request_stop(
+                    program_run_id,
+                    stop_request_id or f"owner-full-stop:{uuid4().hex}",
+                    reason,
+                )
+                active_count, settled, scope_reason = self._scope_fields(
+                    scope, program_run_id
+                )
+            except Exception as error:
+                with self._lock:
+                    entry = self._entry(program_run_id)
+                    entry.active_operation_count = None
+                    entry.reason_code = "program_run_scope_unknown"
+                    entry.message = str(error) or type(error).__name__
+                    return self._snapshot(entry)
+            with self._lock:
+                entry = self._entry(program_run_id)
+                entry.active_operation_count = active_count
+                if scope_reason is not None:
+                    entry.reason_code = scope_reason
+                    entry.message = "Kernel Program-run scope is unknown"
+                    settled = False
+            return (
+                self._complete_full_stop(program_run_id)
+                if settled
+                else self.read(program_run_id)
+            )
+
+    def reconcile_full_stop(self, program_run_id: str) -> ProgramRunSnapshot:
+        with self._lock:
+            entry = self._entry(program_run_id)
+            if entry.state is not ProgramRunState.FULL_STOPPING:
+                return self._snapshot(entry)
+            transition_lock = entry.transition_lock
+        with transition_lock:
+            with self._lock:
+                entry = self._entry(program_run_id)
+                if entry.state is not ProgramRunState.FULL_STOPPING:
+                    return self._snapshot(entry)
+            try:
+                scope = self._scope.observe(program_run_id)
+                active_count, settled, scope_reason = self._scope_fields(
+                    scope, program_run_id
+                )
+            except Exception as error:
+                with self._lock:
+                    entry = self._entry(program_run_id)
+                    entry.active_operation_count = None
+                    entry.reason_code = "program_run_scope_unknown"
+                    entry.message = str(error) or type(error).__name__
+                    return self._snapshot(entry)
+            with self._lock:
+                entry = self._entry(program_run_id)
+                entry.active_operation_count = active_count
+                if scope_reason is not None:
+                    entry.reason_code = scope_reason
+                    entry.message = "Kernel Program-run scope is unknown"
+                    settled = False
+            return (
+                self._complete_full_stop(program_run_id)
+                if settled
+                else self.read(program_run_id)
+            )
+
+    def resume_full_stop(
+        self,
+        program_run_id: str,
+        *,
+        request_id: str,
+        reason: str | None = None,
+    ) -> ProgramRunSnapshot:
+        """Recover every held occurrence, then schedule only fresh attempts."""
+
+        _text(request_id, field="request_id", maximum_bytes=512)
+        if reason is not None:
+            _text(reason, field="reason", maximum_bytes=4_096)
+        with self._lock:
+            transition_lock = self._entry(program_run_id).transition_lock
+        with transition_lock:
+            with self._lock:
+                entry = self._entry(program_run_id)
+                if entry.state is ProgramRunState.FULL_STOPPING:
+                    raise ProgramRunOwnerError("Full Stop is still settling")
+                if entry.state is not ProgramRunState.FULL_STOPPED:
+                    raise ProgramRunOwnerError(
+                        "Run requires the exact preserved Full Stop occurrence"
+                    )
+                run = entry.run
+                maximum_recoveries = len(entry.node_statuses) + 1
+            interventions = self._ports.program_interventions
+            for _index in range(maximum_recoveries):
+                active, held, unrecoverable = run.reconcile_full_stop_tasks()
+                if active:
+                    raise ProgramRunOwnerOutcomeUnknownError(
+                        "Full Stop task settlement is not yet observable"
+                    )
+                if unrecoverable:
+                    raise ProgramRunOwnerError(
+                        "preserved Full Stop work has no fresh-state recovery"
+                    )
+                intervention = (
+                    None
+                    if interventions is None
+                    else interventions.read(program_run_id)
+                )
+                if held == 0:
+                    if intervention is not None:
+                        raise ProgramRunOwnerOutcomeUnknownError(
+                            "Full Stop recovery registry and held tasks disagree"
+                        )
+                    break
+                if (
+                    intervention is None
+                    or intervention.policy_parameter != "operator_stop_policy"
+                    or intervention.owner_port_name is None
+                    or intervention.owner_task_id is None
+                ):
+                    raise ProgramRunOwnerOutcomeUnknownError(
+                        "Full Stop lost an exact stopped task identity"
+                    )
+                owner_port = getattr(
+                    self._ports, intervention.owner_port_name, None
+                )
+                recover = getattr(owner_port, "recover", None)
+                if not callable(recover):
+                    raise ProgramRunOwnerError(
+                        "preserved Full Stop task does not support fresh-state recovery"
+                    )
+                recovery_request_id = "full-stop-resume:" + sha256(
+                    (
+                        request_id
+                        + ":"
+                        + intervention.owner_task_id
+                    ).encode("utf-8")
+                ).hexdigest()
+                result = recover(
+                    intervention.owner_task_id,
+                    intervention.identity,
+                    action="replan_from_stopped_state",
+                    request_id=recovery_request_id,
+                    reason=reason,
+                )
+                if not isinstance(result, Mapping) or type(
+                    result.get("accepted")
+                ) is not bool:
+                    raise ProgramRunOwnerOutcomeUnknownError(
+                        "Full Stop owner recovery returned an invalid result"
+                    )
+                if result["accepted"] is not True:
+                    error = result.get("error")
+                    message = (
+                        error.get("message")
+                        if isinstance(error, Mapping)
+                        and isinstance(error.get("message"), str)
+                        else "fresh current-state recovery was rejected"
+                    )
+                    raise ProgramRunOwnerError(message)
+                try:
+                    interventions.resolve(
+                        intervention.identity,
+                        action="retry",
+                    )
+                    run.reconcile_full_stop_tasks()
+                except Exception as error:
+                    raise ProgramRunOwnerOutcomeUnknownError(
+                        "accepted Full Stop recovery was not joined to its tree"
+                    ) from error
+            else:
+                raise ProgramRunOwnerOutcomeUnknownError(
+                    "Full Stop recovery exceeded the captured Program-node bound"
+                )
+            if run.operator_stop_held:
+                raise ProgramRunOwnerOutcomeUnknownError(
+                    "Full Stop recovery left an unresolved held task"
+                )
+            released = self._scope.release_stop(program_run_id)
+            active_count, settled, scope_reason = self._scope_fields(
+                released, program_run_id
+            )
+            if not settled or scope_reason is not None:
+                raise ProgramRunOwnerOutcomeUnknownError(
+                    scope_reason or "Full Stop handoff did not release"
+                )
+            with self._lock:
+                entry = self._entry(program_run_id)
+                if entry.state is not ProgramRunState.FULL_STOPPED:
+                    raise ProgramRunOwnerOutcomeUnknownError(
+                        "Program state changed during Full Stop recovery"
+                    )
+                entry.state = ProgramRunState.RUNNING
+                entry.stop_requested = False
+                entry.active_operation_count = active_count
+                entry.reason_code = None
+                entry.message = ""
+                entry.revision += 1
+                return self._snapshot(entry)
+
+    def _reset_scope_effects(self, program_run_id: str) -> None:
+        snapshot = self._scope.reset(program_run_id)
+        _active_count, settled, reason = self._scope_fields(
+            snapshot, program_run_id
+        )
+        if not settled:
+            raise ProgramRunOwnerError(
+                reason or "Kernel Program-run scope did not reset"
+            )
+
+    def reset_retained_effects(self, program_run_id: str) -> None:
+        """Reset a durably terminal run after its resident tree owner rotated."""
+
+        _text(program_run_id, field="program_run_id")
+        self._reset_scope_effects(program_run_id)
+
     def reset_effects(self, program_run_id: str) -> ProgramRunSnapshot:
         """Release terminal Kernel operations before Program-cycle Reset."""
 
@@ -1081,14 +1401,7 @@ class ProgramRunOwner:
                     raise ProgramRunOwnerError(
                         "Program-run effects can be reset only after settlement"
                     )
-            snapshot = self._scope.reset(program_run_id)
-            _active_count, settled, reason = self._scope_fields(
-                snapshot, program_run_id
-            )
-            if not settled:
-                raise ProgramRunOwnerError(
-                    reason or "Kernel Program-run scope did not reset"
-                )
+            self._reset_scope_effects(program_run_id)
             with self._lock:
                 return self._snapshot(self._entry(program_run_id))
 
@@ -1146,9 +1459,15 @@ class ProgramRunOwner:
                 entry = self._entry(program_run_id)
                 if entry.state is ProgramRunState.STOPPING:
                     reconcile_stop = True
+                    reconcile_full_stop = False
+                    reconcile_finalize = False
+                elif entry.state is ProgramRunState.FULL_STOPPING:
+                    reconcile_stop = False
+                    reconcile_full_stop = True
                     reconcile_finalize = False
                 elif entry.state is ProgramRunState.FINALIZING:
                     reconcile_stop = False
+                    reconcile_full_stop = False
                     reconcile_finalize = True
                 elif entry.state is ProgramRunState.INTERVENTION_REQUIRED:
                     intervention_port = self._ports.program_interventions
@@ -1164,16 +1483,20 @@ class ProgramRunOwner:
                     ):
                         return self._snapshot(entry)
                     reconcile_stop = False
+                    reconcile_full_stop = False
                     reconcile_finalize = False
                     run = entry.run
                 elif entry.state is not ProgramRunState.RUNNING:
                     return self._snapshot(entry)
                 else:
                     reconcile_stop = False
+                    reconcile_full_stop = False
                     reconcile_finalize = False
                     run = entry.run
             if reconcile_stop:
                 return self.reconcile_stop(program_run_id)
+            if reconcile_full_stop:
+                return self.reconcile_full_stop(program_run_id)
             if reconcile_finalize:
                 return self._reconcile_finalizing(program_run_id)
 

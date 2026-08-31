@@ -6,6 +6,7 @@ import hashlib
 import math
 import socket
 import threading
+import time
 from pathlib import Path
 from typing import Any, Protocol
 import unicodedata
@@ -42,7 +43,10 @@ OPERATION_EVENT_KINDS = frozenset(
         "operation_accepted",
         "control_accepted",
         "stop_acceptance_projected",
+        "stop_terminal_projected",
+        "stop_fault_cleared",
         "runtime_scale_accepted",
+        "operation_prepared",
         "state_observed",
         "host_replaced",
     }
@@ -52,13 +56,22 @@ OPERATION_EVENT_KINDS = frozenset(
 def _valid_operation_event_identity(event: dict[str, Any]) -> bool:
     operation_id = event.get("operation_id")
     operation_revision = event.get("operation_revision")
-    if event.get("record_kind") == "stop_acceptance_projected":
+    if event.get("record_kind") in {
+        "stop_acceptance_projected",
+        "stop_fault_cleared",
+    }:
         request_id = event.get("request_id")
         return (
             operation_id is None
             and operation_revision is None
             and isinstance(request_id, str)
             and bool(request_id)
+        )
+    if event.get("record_kind") == "stop_terminal_projected":
+        return (
+            operation_id is None
+            and operation_revision is None
+            and event.get("request_id") is None
         )
     return (
         isinstance(operation_id, str)
@@ -1686,15 +1699,21 @@ class ExecutionEventPump:
         execution: ExecutionPort,
         *,
         poll_seconds: float = 0.1,
+        condition_poll_seconds: float = 0.5,
         page_limit: int = 16,
     ) -> None:
         if not 0.01 <= poll_seconds <= 5.0:
             raise ValueError("operation event polling period is outside [0.01, 5]")
+        if not 0.05 <= condition_poll_seconds <= 5.0:
+            raise ValueError(
+                "operation condition polling period is outside [0.05, 5]"
+            )
         if not 1 <= page_limit <= 16:
             raise ValueError("operation event page limit is outside [1, 16]")
         self._core = core
         self._execution = execution
         self._poll_seconds = poll_seconds
+        self._condition_poll_seconds = condition_poll_seconds
         self._page_limit = page_limit
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -1764,6 +1783,28 @@ class ExecutionEventPump:
         after_sequence = 0
         source_high_water_epoch: str | None = None
         source_high_water = 0
+        condition_cursor: tuple[str, int] | None = None
+        next_condition_poll_at = 0.0
+
+        def condition_snapshot_kwargs(
+            source_owner_epoch: str, through_source_sequence: int
+        ) -> dict[str, str]:
+            nonlocal condition_cursor, next_condition_poll_at
+            now = time.monotonic()
+            cursor = (source_owner_epoch, through_source_sequence)
+            if cursor == condition_cursor and now < next_condition_poll_at:
+                return {}
+            response = ExecutionCommandClient.require_success(
+                self._execution.stop_fault()
+            )
+            offer = response["stop_fault"]
+            latch = offer["latch"] if isinstance(offer, dict) else None
+            condition_cursor = cursor
+            next_condition_poll_at = now + self._condition_poll_seconds
+            return {
+                "current_stop_fault_json": _canonical_json(latch).decode("utf-8")
+            }
+
         while not self._stop.is_set():
             try:
                 if owner_epoch is None:
@@ -1778,6 +1819,9 @@ class ExecutionEventPump:
                         self._core.complete_operation_event_snapshot(
                             source_owner_epoch=idle_epoch,
                             through_source_sequence=source_high_water,
+                            **condition_snapshot_kwargs(
+                                idle_epoch, source_high_water
+                            ),
                         )
                         self._record_error(None)
                         self._stop.wait(self._poll_seconds)
@@ -1830,6 +1874,7 @@ class ExecutionEventPump:
                     self._core.complete_operation_event_snapshot(
                         source_owner_epoch=owner_epoch,
                         through_source_sequence=after_sequence,
+                        **condition_snapshot_kwargs(owner_epoch, after_sequence),
                     )
                     self._record_error(None)
                     self._stop.wait(self._poll_seconds)

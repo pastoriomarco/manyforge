@@ -305,6 +305,9 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   /// on a worker thread. Callers observe progress via get_status() and events.
   Result<uint64_t> execute(const ExecuteRequestDTO& request) override;
 
+  AddressedParticipantStopFenceDisposition fence_addressed_participant_stop(
+      std::uint64_t execution_id) noexcept override;
+
   Result<AddressedParticipantStopSettlementDTO> settle_addressed_participant_stop(
       const AddressedParticipantStopSettlementRequestDTO& request) override;
 
@@ -1017,6 +1020,11 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   // state from a later lifecycle generation.
   std::optional<AddressedParticipantStopSettlementDTO>
       addressed_participant_stop_settlement_;  // lifecycle-guarded
+  // Exact process-local eligibility fence installed synchronously by the
+  // addressed owner after Stop acceptance and before physical Stop dispatch.
+  // It prevents late work from the replaced trajectory from competing with
+  // the aggregate Stop terminal; it is not containment evidence.
+  std::atomic<std::uint64_t> addressed_stop_fence_execution_id_{0};
   std::atomic<std::uint64_t> motion_trip_stop_generation_{0};
   std::atomic<bool> operator_stop_command_active_{false};
   mutable std::mutex runtime_collision_state_projection_mutex_;

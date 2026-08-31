@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from hashlib import sha256
 from heapq import heapify, heappop, heappush
 import json
@@ -408,7 +408,12 @@ class _OperationTask:
     identity: NodeAttemptIdentity
     node_id: str
     operation_id: str
+    request_owner_epoch: str
     stop_requested: bool = False
+    # A successful observation is immutable until its exact acknowledgement.
+    # Retain only the revision needed by that next command so acknowledge does
+    # not repeat both the operation read and owner-identity read on every node.
+    completed_revision: int | None = field(default=None, compare=False)
 
 
 @dataclass(slots=True)
@@ -1598,7 +1603,7 @@ class NativeKernelProgramPort:
         )
         with self._lock:
             current = self._tasks.get(operation_id)
-            task = _OperationTask(identity, node_id, operation_id)
+            task = _OperationTask(identity, node_id, operation_id, owner_epoch)
             if current is not None and current != task:
                 raise ProductionPortError("native operation identity was reused")
             if current is None:
@@ -1711,19 +1716,17 @@ class NativeKernelProgramPort:
             raise ProductionPortError("native operation has an unknown state")
         return operation, snapshot
 
-    def _recover_task(
+    def _apply_operation_recovery(
         self,
-        task_id: str,
+        operation_id: str,
         identity: NodeAttemptIdentity,
+        operation: Mapping[str, Any],
+        snapshot: OwnerTaskSnapshot,
         *,
         action: str,
         request_id: str,
         reason: str | None,
     ) -> Mapping[str, Any]:
-        task = self._task(task_id)
-        if task.identity != identity:
-            raise ProductionPortError("operation recovery changed node attempt")
-        operation, snapshot = self._observation(task)
         if snapshot.state not in {
             OwnerTaskState.FAILED,
             OwnerTaskState.INTERRUPTED,
@@ -1735,7 +1738,7 @@ class NativeKernelProgramPort:
             raise ProductionPortError("operation recovery identity is incomplete")
         try:
             result = self._kernel.recover(
-                task.operation_id,
+                operation_id,
                 revision,
                 {
                     "request_id": request_id,
@@ -1763,6 +1766,7 @@ class NativeKernelProgramPort:
             if code not in {
                 "operation_recovery_invalid",
                 "operation_recovery_stale",
+                "operation_recovery_blocked_by_stop_fault",
                 "request_id_conflict",
                 "request_ledger_full",
             }:
@@ -1795,6 +1799,29 @@ class NativeKernelProgramPort:
             with self._lock:
                 self._scope_stops.pop(identity.program_run_id, None)
         return result
+
+    def _recover_task(
+        self,
+        task_id: str,
+        identity: NodeAttemptIdentity,
+        *,
+        action: str,
+        request_id: str,
+        reason: str | None,
+    ) -> Mapping[str, Any]:
+        task = self._task(task_id)
+        if task.identity != identity:
+            raise ProductionPortError("operation recovery changed node attempt")
+        operation, snapshot = self._observation(task)
+        return self._apply_operation_recovery(
+            task.operation_id,
+            identity,
+            operation,
+            snapshot,
+            action=action,
+            request_id=request_id,
+            reason=reason,
+        )
 
     def _task(self, task_id: str) -> _OperationTask:
         with self._lock:
@@ -1863,14 +1890,17 @@ class NativeKernelProgramPort:
         task = self._task(task_id)
         if task.identity != identity:
             raise ProductionPortError("operation acknowledgement changed node attempt")
-        operation, snapshot = self._observation(task)
-        if snapshot.state is not OwnerTaskState.SUCCEEDED:
-            raise ProductionPortError("only a completed operation can be acknowledged")
-        revision = operation.get("operation_revision")
+        with self._lock:
+            revision = task.completed_revision
+        if revision is None:
+            operation, snapshot = self._observation(task)
+            if snapshot.state is not OwnerTaskState.SUCCEEDED:
+                raise ProductionPortError(
+                    "only a completed operation can be acknowledged"
+                )
+            revision = operation.get("operation_revision")
         if type(revision) is not int or revision < 1:
             raise ProductionPortError("native operation revision is invalid")
-        context = self._context(identity.program_run_id)
-        owner_epoch, _scene = self._owner_status(context)
         self._kernel.acknowledge_completed(
             task.operation_id,
             {
@@ -1878,7 +1908,7 @@ class NativeKernelProgramPort:
                     "request_id": _request_identity(
                         "program-ack", identity.program_run_id, task.operation_id
                     ),
-                    "request_owner_epoch": owner_epoch,
+                    "request_owner_epoch": task.request_owner_epoch,
                     "source_label": "manyforge_behavior",
                     "correlation_id": identity.program_run_id,
                 },
@@ -1971,6 +2001,7 @@ class NativeKernelProgramPort:
     ) -> ProgramRunScopeSnapshot:
         _text(stop_request_id, field="stop_request_id", maximum_bytes=2_048)
         with self._lock:
+            scope_stop = self._scope_stops.get(program_run_id)
             tasks = tuple(
                 task
                 for task in self._tasks.values()
@@ -1981,6 +2012,12 @@ class NativeKernelProgramPort:
                 for task in self._pick_place_tasks.values()
                 if task.identity.program_run_id == program_run_id
             )
+        if scope_stop is not None:
+            # Motion Stop and Full Stop share the same physical containment
+            # transaction.  Full Stop may quiesce the preserved tree after a
+            # Motion Stop, but it must never dispatch a second Stop against
+            # work that is already fenced or settled.
+            return self._observe_scope(program_run_id)
         retained_count = len(tasks) + len(pick_place_tasks)
         if retained_count == 0:
             return ProgramRunScopeSnapshot(
@@ -2126,8 +2163,39 @@ class NativeKernelProgramPort:
             0,
         )
 
+    def _release_scope_stop(
+        self, program_run_id: str
+    ) -> ProgramRunScopeSnapshot:
+        """Forget only a proved terminal Stop handoff before fresh attempts."""
+
+        with self._lock:
+            scope_stop = self._scope_stops.get(program_run_id)
+        if scope_stop is not None:
+            stop_id, _retained_count = scope_stop
+            status = _mapping(
+                self._kernel.stop_status(stop_id).get("stop_status"),
+                field="aggregate Stop status",
+            )
+            if status.get("state") != "succeeded":
+                raise ProductionPortError(
+                    "Program-run Stop cannot be released before settlement"
+                )
+            with self._lock:
+                if self._scope_stops.get(program_run_id) == scope_stop:
+                    self._scope_stops.pop(program_run_id, None)
+        return self._observe_scope(program_run_id)
+
     def _observe_task(self, task_id: str) -> OwnerTaskSnapshot:
-        _operation, snapshot = self._observation(self._task(task_id))
+        task = self._task(task_id)
+        operation, snapshot = self._observation(task)
+        if snapshot.state is OwnerTaskState.SUCCEEDED:
+            revision = operation.get("operation_revision")
+            if type(revision) is not int or revision < 1:
+                raise ProductionPortError("native operation revision is invalid")
+            with self._lock:
+                current = self._tasks.get(task_id)
+                if current is task:
+                    current.completed_revision = revision
         return snapshot
 
     def _pick_place_task(self, task_id: str) -> _PickPlaceTask:
@@ -2152,12 +2220,113 @@ class NativeKernelProgramPort:
             field="sequence_status",
         )
         snapshot = self._sequence_snapshot(task, status)
+        if task.scope_stop_requested and snapshot.state in {
+            OwnerTaskState.FAILED,
+            OwnerTaskState.INTERRUPTED,
+        }:
+            operation_id = status.get("active_operation_id")
+            if isinstance(operation_id, str) and operation_id:
+                envelope = self._kernel.operation(operation_id)
+                operation = dict(
+                    _mapping(envelope.get("operation"), field="operation")
+                )
+                if (
+                    operation.get("operation_id") != operation_id
+                    or operation.get("program_run_id")
+                    != task.identity.program_run_id
+                ):
+                    raise ProductionPortError(
+                        "pick/place stopped operation changed identity"
+                    )
+                if operation.get("state") in _INTERRUPTED_STATES:
+                    assessment = self._recovery_assessment(
+                        operation, operation_id
+                    )
+                    if (
+                        assessment is not None
+                        and assessment.get("recovery_class")
+                        == "ordinary_operator_stop"
+                    ):
+                        metadata = dict(snapshot.metadata)
+                        metadata.update(
+                            {
+                                "active_operation_id": operation_id,
+                                "recovery_assessment": assessment,
+                                "authored_failure_policy": "pause_for_operator",
+                                "authored_failure_policy_parameter": (
+                                    "operator_stop_policy"
+                                ),
+                            }
+                        )
+                        stop_id = operation.get("active_stop_id")
+                        stop_generation = operation.get(
+                            "active_stop_generation"
+                        )
+                        if (
+                            isinstance(stop_id, str)
+                            and stop_id
+                            and type(stop_generation) is int
+                            and stop_generation > 0
+                        ):
+                            metadata["active_stop_id"] = stop_id
+                            metadata["active_stop_generation"] = stop_generation
+                        snapshot = OwnerTaskSnapshot(
+                            task_id=task.sequence_id,
+                            state=OwnerTaskState.INTERRUPTED,
+                            metadata=metadata,
+                            reason_code=(
+                                f"operation_{operation.get('state')}"
+                            ),
+                            message="native pick/place sequence was interrupted",
+                        )
         with self._lock:
             current = self._pick_place_tasks.get(task.sequence_id)
             if current is not task:
                 raise ProductionPortError("pick/place task changed during observation")
             task.snapshot = snapshot
             return task.snapshot
+
+    def _recover_pick_place_task(
+        self,
+        task_id: str,
+        identity: NodeAttemptIdentity,
+        *,
+        action: str,
+        request_id: str,
+        reason: str | None,
+    ) -> Mapping[str, Any]:
+        task = self._pick_place_task(task_id)
+        if task.identity != identity:
+            raise ProductionPortError(
+                "pick/place recovery changed node attempt"
+            )
+        snapshot = self._observe_pick_place_task(task_id)
+        operation_id = snapshot.metadata.get("active_operation_id")
+        if (
+            snapshot.state is not OwnerTaskState.INTERRUPTED
+            or not isinstance(operation_id, str)
+            or not operation_id
+        ):
+            raise ProductionPortError("pick/place recovery is not current")
+        operation = dict(
+            _mapping(
+                self._kernel.operation(operation_id).get("operation"),
+                field="operation",
+            )
+        )
+        result = self._apply_operation_recovery(
+            operation_id,
+            identity,
+            operation,
+            snapshot,
+            action=action,
+            request_id=request_id,
+            reason=reason,
+        )
+        if result.get("accepted") is True:
+            with self._lock:
+                self._pick_place_tasks.pop(task_id, None)
+        return result
 
     def _cancel_pick_place_task(
         self,
@@ -2328,6 +2497,23 @@ class _NativePickPlaceTaskPort:
     def acknowledge(self, task_id: str, identity: NodeAttemptIdentity) -> None:
         self._owner._acknowledge_pick_place_task(task_id, identity)
 
+    def recover(
+        self,
+        task_id: str,
+        identity: NodeAttemptIdentity,
+        *,
+        action: str,
+        request_id: str,
+        reason: str | None,
+    ) -> Mapping[str, Any]:
+        return self._owner._recover_pick_place_task(
+            task_id,
+            identity,
+            action=action,
+            request_id=request_id,
+            reason=reason,
+        )
+
 
 class _NativeKernelProgramScopePort:
     """Unambiguous ProgramRunScopePort view over one native Program client."""
@@ -2349,6 +2535,9 @@ class _NativeKernelProgramScopePort:
 
     def observe(self, program_run_id: str) -> ProgramRunScopeSnapshot:
         return self._owner._observe_scope(program_run_id)
+
+    def release_stop(self, program_run_id: str) -> ProgramRunScopeSnapshot:
+        return self._owner._release_scope_stop(program_run_id)
 
     def reset(self, program_run_id: str) -> ProgramRunScopeSnapshot:
         return self._owner._reset_scope(program_run_id)

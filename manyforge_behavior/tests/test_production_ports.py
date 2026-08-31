@@ -305,11 +305,14 @@ def test_completed_operation_is_acknowledged_with_exact_revision() -> None:
     observed = port.operations.observe(started.task_id)
     assert isinstance(observed, OwnerTaskSnapshot)
     assert observed.state is OwnerTaskState.SUCCEEDED
+    reads_after_terminal_observation = transport.operation_reads
     port.operations.acknowledge(started.task_id, identity)
 
     kind, operation_id, body = transport.controls[-1]
     assert (kind, operation_id) == ("acknowledge", started.task_id)
     assert body["expected_operation_revision"] == 7
+    assert transport.operation_reads == reads_after_terminal_observation
+    assert body["request_context"]["request_owner_epoch"] == "kernel.epoch.7"
     scope = port.scope.observe("program-run.1")
     assert isinstance(scope, ProgramRunScopeSnapshot)
     assert scope.state is ProgramRunScopeState.SETTLED
@@ -411,6 +414,40 @@ def test_program_scope_stop_is_one_exact_batch_without_operation_reads() -> None
     assert port.scope.observe("program-run.1").state is ProgramRunScopeState.SETTLED
     assert transport.operation_reads == reads_before_stop
     assert transport.stop_status_reads == 2
+
+
+def test_program_scope_reuses_one_physical_stop_for_full_stop_quiescence() -> None:
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    started = port.operations.start(
+        "motion.move_to_pose", _identity(), _motion_inputs()
+    )
+    transport.operations[started.task_id].update(
+        {"state": "executing", "operation_revision": 3}
+    )
+
+    first = port.scope.request_stop(
+        "program-run.1", "motion:caller.1:request.1", "Motion Stop"
+    )
+    repeated = port.scope.request_stop(
+        "program-run.1", "full:caller.1:request.2", "Full Stop"
+    )
+
+    assert first.state is ProgramRunScopeState.ACTIVE
+    assert repeated.state is ProgramRunScopeState.ACTIVE
+    assert [
+        item[0] for item in transport.controls
+        if item[0] == "stop_program_run"
+    ] == ["stop_program_run"]
+    transport.stop_states["scope-stop-1"] = "succeeded"
+    assert port.scope.request_stop(
+        "program-run.1", "full:caller.1:request.2", "Full Stop"
+    ).state is ProgramRunScopeState.SETTLED
+    assert [
+        item[0] for item in transport.controls
+        if item[0] == "stop_program_run"
+    ] == ["stop_program_run"]
 
 
 def test_program_scope_reset_releases_terminal_residency_once() -> None:
@@ -857,6 +894,103 @@ def test_native_motion_stop_projects_exact_operator_recovery_policy() -> None:
         == "operator_stop_policy"
     )
     port.unbind("program-run.1")
+
+
+def test_full_stopped_pick_place_recovers_exact_active_operation_for_run() -> None:
+    transport = _PickPlaceTransport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    identity = _identity("full-stop-pick")
+    started = port.pick_place.start(
+        "motion.pick_object", identity, _pick_inputs()
+    )
+    operation_id = transport.sequence_statuses[started.task_id][
+        "active_operation_id"
+    ]
+    assert isinstance(operation_id, str)
+
+    port.scope.request_stop(
+        "program-run.1", "full:caller.1:request.1", "Full Stop"
+    )
+    transport.stop_states["scope-stop-1"] = "succeeded"
+    transport.operations[operation_id].update(
+        {
+            "state": "stopped",
+            "operation_revision": 2,
+            "active_stop_id": "scope-stop-1",
+            "active_stop_generation": 1,
+        }
+    )
+    transport.sequence_statuses[started.task_id].update(
+        {
+            "phase": "intervention_required",
+            "terminal_error": {
+                "code": "operation_stopped",
+                "message": "Full Stop contained the active phase",
+            },
+        }
+    )
+    transport.operation_recovery = lambda exact_operation_id: {
+        "ok": True,
+        "operation_revision": 2,
+        "participants": [{"operation_participant_id": "participant.arm"}],
+        "recovery_assessment": {
+            "recovery_class": "ordinary_operator_stop",
+            "assessment_revision": 3,
+            "control_command_epoch": "control.epoch.1",
+            "execution_id": "execution.1",
+            "latch_id": "latch.1",
+            "stop_certificate_id": "certificate.1",
+            "stop_owner_generation": 1,
+        },
+        "stop_generation": 1,
+        "stop_id": "scope-stop-1",
+    }
+    recoveries: list[tuple[str, int, Mapping[str, Any]]] = []
+
+    def recover(
+        exact_operation_id: str,
+        expected_revision: int,
+        body: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        recoveries.append(
+            (exact_operation_id, expected_revision, deepcopy(body))
+        )
+        return {
+            "ok": True,
+            "result": {
+                "request_id": body["request_id"],
+                "action": body["action"],
+                "accepted": True,
+                "resulting_assessment": {
+                    "recovery_class": "recovered",
+                },
+            },
+        }
+
+    transport.apply_operation_recovery = recover
+
+    observed = port.pick_place.observe(started.task_id)
+    assert observed.state is OwnerTaskState.INTERRUPTED
+    assert observed.metadata["active_operation_id"] == operation_id
+    assert observed.metadata["authored_failure_policy_parameter"] == (
+        "operator_stop_policy"
+    )
+    result = port.pick_place.recover(
+        started.task_id,
+        identity,
+        action="replan_from_stopped_state",
+        request_id="resume-full-stop.1",
+        reason="operator Run after Full Stop",
+    )
+    assert result["accepted"] is True
+    assert recoveries[0][0:2] == (operation_id, 2)
+    assert recoveries[0][2]["action"] == "replan_from_stopped_state"
+    assert port.scope.observe(
+        "program-run.1"
+    ).state is ProgramRunScopeState.SETTLED
+    with pytest.raises(ProductionPortError, match="not retained"):
+        port.pick_place.observe(started.task_id)
 
 
 def test_place_intent_preserves_authored_pose_and_has_no_grasp_exception() -> None:

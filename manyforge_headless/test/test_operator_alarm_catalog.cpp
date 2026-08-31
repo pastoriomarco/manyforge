@@ -86,11 +86,11 @@ std::string Redigest(std::string source) {
 TEST(OperatorAlarmCatalog, LoadsThePackagedDigestVerifiedClosedCatalog) {
   const auto catalog = OperatorAlarmCatalog::Load(PackagedCatalog());
   EXPECT_EQ(catalog.schema_version(), "manyforge.operator_alarm_catalog.v1");
-  EXPECT_EQ(catalog.catalog_version(), "2.0.0");
+  EXPECT_EQ(catalog.catalog_version(), "2.1.0");
   EXPECT_EQ(catalog.descriptor_digest(),
             "sha256:"
-            "8742de67090238e86bc90d0ac0bc6a2dae9463873c8a362ea255709f6d563d3a");
-  ASSERT_EQ(catalog.definitions().size(), 6U);
+            "ae77823d45902f15070203e28fd579d3b74e64bc457072cdc2c55fdd83c3d4e6");
+  ASSERT_EQ(catalog.definitions().size(), 7U);
   const auto *collision = catalog.Find("manyforge.motion.runtime_collision");
   ASSERT_NE(collision, nullptr);
   EXPECT_EQ(collision->priority, "critical");
@@ -105,7 +105,7 @@ TEST(OperatorAlarmCatalog,
   const auto parsed = deployment::parse_strict_json_model_yaml(source);
   const auto canonical_json = content_identity::canonical_json(parsed.root());
   EXPECT_EQ(OperatorAlarmCatalog::Decode(canonical_json).definitions().size(),
-            6U);
+            7U);
 
   auto tampered = source;
   const auto title = tampered.find("Runtime collision stop");

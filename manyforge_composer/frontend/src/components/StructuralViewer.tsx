@@ -15,12 +15,10 @@ import { createPortal } from 'react-dom';
 import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import type { ThreeEvent } from '@react-three/fiber';
 import {
-  Bounds,
   Grid,
   OrbitControls,
   PerspectiveCamera,
   TransformControls,
-  useBounds,
   useGLTF,
 } from '@react-three/drei';
 import * as THREE from 'three';
@@ -45,6 +43,7 @@ import type {
 } from '../state/authoritativeInterpolation';
 import type { StructuralResourceState } from '../state/structuralResource';
 import type {
+  AttachedObjectPresentation,
   CandidateRobotPresentation,
   MeasuredRobotPresentationReader,
   RuntimeScenePresentation,
@@ -434,11 +433,13 @@ function disposeOwnedMaterials(root: THREE.Object3D): void {
 
 function SceneObjectMeshAsset({
   url,
+  attached,
   measured,
   selected,
   wireframe,
 }: {
   url: string;
+  attached: boolean;
   measured: boolean;
   selected: boolean;
   wireframe: boolean;
@@ -454,20 +455,24 @@ function SceneObjectMeshAsset({
         : [mesh.material];
       const materials = sources.map((source) => {
         const material = source.clone() as THREE.MeshStandardMaterial;
-        material.color?.set(measured ? '#43d7ec' : selected ? '#65d3f2' : '#8c6fe0');
-        material.emissive?.set(measured ? '#0c5060' : selected ? '#144c62' : '#251a48');
+        material.color?.set(
+          attached ? '#5fa84a' : measured ? '#43d7ec' : selected ? '#65d3f2' : '#8c6fe0',
+        );
+        material.emissive?.set(
+          attached ? '#173d16' : measured ? '#0c5060' : selected ? '#144c62' : '#251a48',
+        );
         material.transparent = true;
-        material.opacity = measured ? 0.55 : selected ? 0.9 : 0.82;
+        material.opacity = attached ? 0.85 : measured ? 0.55 : selected ? 0.9 : 0.82;
         material.wireframe = wireframe;
         material.depthWrite = !wireframe;
         material.side = THREE.DoubleSide;
         return material;
       });
       mesh.material = Array.isArray(mesh.material) ? materials : materials[0];
-      mesh.renderOrder = measured ? 16 : selected ? 12 : 8;
+      mesh.renderOrder = attached ? 13 : measured ? 16 : selected ? 12 : 8;
     });
     return root;
-  }, [gltf.scene, measured, selected, wireframe]);
+  }, [attached, gltf.scene, measured, selected, wireframe]);
   useEffect(() => () => disposeOwnedMaterials(clone), [clone]);
   return <primitive object={clone} />;
 }
@@ -476,6 +481,7 @@ function SceneObjectMesh({
   shape,
   ownerIdentity,
   draftIdentity,
+  attached = false,
   measured,
   selected,
   wireframe,
@@ -483,6 +489,7 @@ function SceneObjectMesh({
   shape: Extract<LogicalSceneShape, { type: 'mesh' }>;
   ownerIdentity?: NonNullable<StructuralViewerProps['sceneOwnerIdentity']>;
   draftIdentity?: NonNullable<StructuralViewerProps['programDraftIdentity']>;
+  attached?: boolean;
   measured: boolean;
   selected: boolean;
   wireframe: boolean;
@@ -570,6 +577,7 @@ function SceneObjectMesh({
         <Suspense fallback={null}>
           <SceneObjectMeshAsset
             url={url}
+            attached={attached}
             measured={measured}
             selected={selected}
             wireframe={wireframe}
@@ -824,11 +832,75 @@ function RetainedNeutralModel({
   );
 }
 
+export function AttachedLogicalSceneObject({
+  presentation,
+  selected,
+  axesVisible,
+  axesSizeM,
+  wireframe,
+  ownerIdentity,
+  onSelect,
+}: {
+  presentation: AttachedObjectPresentation;
+  selected: boolean;
+  axesVisible: boolean;
+  axesSizeM: number;
+  wireframe: boolean;
+  ownerIdentity: StructuralViewerProps['sceneOwnerIdentity'];
+  onSelect: (event: ThreeEvent<MouseEvent>, sceneResourceId: string) => void;
+}) {
+  const object = presentation.object;
+  const pose = presentation.poseInCarrierFrame;
+  return (
+    <group
+      name={`scene:${object.scene_resource_id}`}
+      position={[pose.position_m.x, pose.position_m.y, pose.position_m.z]}
+      quaternion={normalizeQuaternion(pose.orientation_xyzw)}
+      onClick={(event) => onSelect(event, object.scene_resource_id)}
+    >
+      {object.collision_shapes.map((shape, index) => shape.type === 'mesh'
+        ? ownerIdentity === undefined ? null : (
+            <SceneObjectMesh
+              key={`attached:${object.scene_resource_id}:${index}`}
+              shape={shape}
+              ownerIdentity={ownerIdentity}
+              attached
+              measured={false}
+              selected={selected}
+              wireframe={wireframe}
+            />
+          )
+        : (
+            <mesh
+              key={`attached:${object.scene_resource_id}:${index}`}
+              rotation={shape.type === 'cylinder' ? [Math.PI / 2, 0, 0] : undefined}
+              renderOrder={13}
+            >
+              <LogicalShapeGeometry shape={shape} />
+              <meshStandardMaterial
+                color="#5fa84a"
+                emissive="#173d16"
+                transparent
+                opacity={0.85}
+                wireframe={wireframe}
+                depthWrite={!wireframe}
+              />
+            </mesh>
+          ))}
+      {(selected || axesVisible) && (
+        <axesHelper args={[axesSizeM]} raycast={ignoreViewerRaycast} />
+      )}
+    </group>
+  );
+}
+
 function MeasuredRuntimeModel({
   manifest,
   presentation,
   livePresentation,
+  attachedObjects,
   collisionsVisible,
+  wireframe,
   materializationStartedAtMs,
   onMaterialized,
   ownerIdentity,
@@ -836,13 +908,18 @@ function MeasuredRuntimeModel({
   frameAxesByLink,
   frameAxesSizeM,
   selectedStructureName,
+  selectedSceneResourceId,
+  objectAxesVisibleIds,
   onSelect,
+  onSelectSceneResource,
   onAssetError,
 }: {
   manifest: SceneUrdfManifest;
   presentation: NonNullable<RuntimeScenePresentation['measuredRobot']>;
   livePresentation?: MeasuredRobotPresentationReader;
+  attachedObjects: AttachedObjectPresentation[];
   collisionsVisible: boolean;
+  wireframe: boolean;
   materializationStartedAtMs: { current: number | null };
   onMaterialized: (durationMs: number) => void;
   ownerIdentity: StructuralViewerProps['sceneOwnerIdentity'];
@@ -850,7 +927,13 @@ function MeasuredRuntimeModel({
   frameAxesByLink: ReadonlySet<string>;
   frameAxesSizeM: number;
   selectedStructureName: string | null;
+  selectedSceneResourceId: string | null;
+  objectAxesVisibleIds: ReadonlySet<string>;
   onSelect: (event: ThreeEvent<MouseEvent>, structureName: string) => void;
+  onSelectSceneResource: (
+    event: ThreeEvent<MouseEvent>,
+    sceneResourceId: string,
+  ) => void;
   onAssetError: (error: Error) => void;
 }) {
   const reported = useRef(false);
@@ -872,13 +955,20 @@ function MeasuredRuntimeModel({
             link={link}
             presentation={presentation}
             livePresentation={livePresentation}
+            attachedObjects={attachedObjects.filter(
+              (object) => object.carrierCompiledFrameName === link.name,
+            )}
             ownerIdentity={ownerIdentity}
             latestFrameAppliers={latestFrameAppliers}
             collisionsVisible={collisionsVisible}
+            wireframe={wireframe}
             frameAxesVisible={selectedStructureName === link.name
               || frameAxesByLink.has(link.name)}
             frameAxesSizeM={frameAxesSizeM}
+            selectedSceneResourceId={selectedSceneResourceId}
+            objectAxesVisibleIds={objectAxesVisibleIds}
             onSelect={onSelect}
+            onSelectSceneResource={onSelectSceneResource}
             onAssetError={onAssetError}
           />
         );
@@ -892,24 +982,37 @@ function MeasuredRuntimeLink({
   link,
   presentation,
   livePresentation,
+  attachedObjects,
   ownerIdentity,
   latestFrameAppliers,
   collisionsVisible,
+  wireframe,
   frameAxesVisible,
   frameAxesSizeM,
+  selectedSceneResourceId,
+  objectAxesVisibleIds,
   onSelect,
+  onSelectSceneResource,
   onAssetError,
 }: {
   manifestModelKey: string;
   link: SceneUrdfManifest['links'][number];
   presentation: NonNullable<RuntimeScenePresentation['measuredRobot']>;
   livePresentation?: MeasuredRobotPresentationReader;
+  attachedObjects: AttachedObjectPresentation[];
   ownerIdentity: StructuralViewerProps['sceneOwnerIdentity'];
   latestFrameAppliers: Set<() => void>;
   collisionsVisible: boolean;
+  wireframe: boolean;
   frameAxesVisible: boolean;
   frameAxesSizeM: number;
+  selectedSceneResourceId: string | null;
+  objectAxesVisibleIds: ReadonlySet<string>;
   onSelect: (event: ThreeEvent<MouseEvent>, structureName: string) => void;
+  onSelectSceneResource: (
+    event: ThreeEvent<MouseEvent>,
+    sceneResourceId: string,
+  ) => void;
   onAssetError: (error: Error) => void;
 }) {
   const initialTransform = presentation.linkTransforms[link.name];
@@ -975,6 +1078,18 @@ function MeasuredRuntimeLink({
         {frameAxesVisible && (
           <axesHelper args={[frameAxesSizeM]} raycast={ignoreViewerRaycast} />
         )}
+        {attachedObjects.map((object) => (
+          <AttachedLogicalSceneObject
+            key={`${object.attachmentId}:${object.attachmentRevision}`}
+            presentation={object}
+            selected={selectedSceneResourceId === object.object.scene_resource_id}
+            axesVisible={objectAxesVisibleIds.has(object.object.scene_resource_id)}
+            axesSizeM={frameAxesSizeM}
+            wireframe={wireframe}
+            ownerIdentity={ownerIdentity}
+            onSelect={onSelectSceneResource}
+          />
+        ))}
       </group>
     </AuthoritativeTransformGroup>
   );
@@ -1304,7 +1419,7 @@ function MeasuredLogicalSceneObjects({
     <group name="owner-measured-scene">
       {presentation.measuredObjects.map((measurement) => {
         const object = objectById.get(measurement.objectId);
-        if (object === undefined) return null;
+        if (object === undefined || object.placement.kind !== 'cell_fixed') return null;
         return (
           <AuthoritativeTransformGroup
             key={`measured-scene:${measurement.objectId}`}
@@ -1751,6 +1866,17 @@ export function frameableContentBounds(root: THREE.Object3D): THREE.Box3 {
   return bounds;
 }
 
+function clipCameraToBounds(
+  camera: THREE.PerspectiveCamera,
+  bounds: THREE.Box3,
+): void {
+  const sphere = bounds.getBoundingSphere(new THREE.Sphere());
+  const distance = camera.position.distanceTo(sphere.center);
+  camera.near = Math.max(0.001, distance / 1_000);
+  camera.far = Math.max(100, distance + sphere.radius * 20);
+  camera.updateProjectionMatrix();
+}
+
 function CameraCommand({
   request,
   defaultPresentation,
@@ -1760,19 +1886,22 @@ function CameraCommand({
   defaultPresentation: RetainedCameraPresentation;
   onPresentation: (presentation: RetainedCameraPresentation) => void;
 }) {
-  const bounds = useBounds();
   const { camera, controls, scene, invalidate } = useThree();
   const processed = useRef(0);
   useEffect(() => {
     if (request.id === 0 || processed.current === request.id) return;
     processed.current = request.id;
     const frameContent = scene.getObjectByName('viewer-frame-content');
+    const perspective = camera as THREE.PerspectiveCamera;
     if (request.kind === 'reset') {
       camera.position.fromArray(defaultPresentation.camera.position);
       const orbit = controls as { target?: THREE.Vector3; update?: () => void } | null;
       orbit?.target?.fromArray(defaultPresentation.camera.target);
       if (frameContent !== undefined) {
-        bounds.refresh(frameableContentBounds(frameContent)).clip();
+        const contentBounds = frameableContentBounds(frameContent);
+        if (!contentBounds.isEmpty()) {
+          clipCameraToBounds(perspective, contentBounds);
+        }
       }
       orbit?.update?.();
       onPresentation(defaultPresentation);
@@ -1791,12 +1920,10 @@ function CameraCommand({
       ? frameContent === undefined ? null : frameableContentBounds(frameContent)
       : new THREE.Box3().setFromObject(framedObject);
     if (framedBounds === null || framedBounds.isEmpty()) return;
-    bounds.refresh(framedBounds);
     const orbit = controls as { target?: THREE.Vector3; update?: () => void } | null;
     const currentTarget = orbit?.target ?? new THREE.Vector3(...defaultPresentation.camera.target);
-    const perspective = camera as THREE.PerspectiveCamera;
     const presentation = framedCameraPresentation(
-      bounds.getSize().box,
+      framedBounds,
       {
         position: [camera.position.x, camera.position.y, camera.position.z],
         target: [currentTarget.x, currentTarget.y, currentTarget.z],
@@ -1806,12 +1933,11 @@ function CameraCommand({
     );
     camera.position.fromArray(presentation.camera.position);
     orbit?.target?.fromArray(presentation.camera.target);
-    bounds.clip();
+    clipCameraToBounds(perspective, framedBounds);
     orbit?.update?.();
     onPresentation(presentation);
     invalidate();
   }, [
-    bounds,
     camera,
     controls,
     defaultPresentation,
@@ -2181,17 +2307,17 @@ function ViewerCanvas({
         target={selectedCamera.target}
       />
       <CaptureCameraPresentation store={cameraPresentation} />
-      <Bounds clip margin={1.25}>
-        <CameraCommand
-          request={cameraCommand}
-          defaultPresentation={{
-            camera: {
-              position: [...DEFAULT_VIEWER_CAMERA.position],
-              target: [...DEFAULT_VIEWER_CAMERA.target],
-            },
-          }}
-          onPresentation={captureCameraPresentation}
-        />
+      <CameraCommand
+        request={cameraCommand}
+        defaultPresentation={{
+          camera: {
+            position: [...DEFAULT_VIEWER_CAMERA.position],
+            target: [...DEFAULT_VIEWER_CAMERA.target],
+          },
+        }}
+        onPresentation={captureCameraPresentation}
+      />
+      <group name="viewer-frame-content">
         {manifest !== null && (
           <AssetErrorBoundary
             resetKey={manifest.model_key}
@@ -2217,7 +2343,9 @@ function ViewerCanvas({
                     manifest={manifest}
                     presentation={runtimePresentation.measuredRobot}
                     livePresentation={executionObservationPresentation}
+                    attachedObjects={runtimePresentation.attachedObjects}
                     collisionsVisible={collisionsVisible}
+                    wireframe={wireframeVisible}
                     materializationStartedAtMs={materializationStartedAtMs}
                     onMaterialized={onModelMaterialized}
                     ownerIdentity={sceneOwnerIdentity}
@@ -2225,7 +2353,10 @@ function ViewerCanvas({
                     frameAxesByLink={frameAxesByLink}
                     frameAxesSizeM={viewer?.frame_gizmo_size_m ?? 0.1}
                     selectedStructureName={selectedStructureName}
+                    selectedSceneResourceId={selectedSceneResourceId}
+                    objectAxesVisibleIds={objectAxesVisibleIds}
                     onSelect={selectStructure}
+                    onSelectSceneResource={selectSceneResource}
                     onAssetError={onIsolatedAssetError}
                   />
                 )}
@@ -2290,7 +2421,7 @@ function ViewerCanvas({
           />
         )}
         {pointCloudFrame !== null && <PointCloudPoints frame={pointCloudFrame} />}
-      </Bounds>
+      </group>
       {viewerFrameIdentity !== undefined && (
         <BoundSnapshotResponder
           frameIdentity={viewerFrameIdentity}
@@ -2829,7 +2960,7 @@ function StructuralViewerContent({
                 void onDetachSceneResource?.(contextMenu.sceneResourceId);
                 setContextMenu(null);
               }}
-            >Detach carried object</button>
+            >Detach Attached object</button>
             <button
               type="button"
               role="menuitem"

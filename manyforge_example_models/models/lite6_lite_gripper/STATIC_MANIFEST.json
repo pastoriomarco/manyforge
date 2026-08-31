@@ -2,8 +2,8 @@
   "files": [
     {
       "path": "README.md",
-      "sha256": "953be0645d23f164aeddd7124a0d5cc155db8de3de025e0b1a7fe61d834cea4f",
-      "size_bytes": 2347
+      "sha256": "88ed752af50dd058eddf643759f45614a020d4c7bc336c179a69e633b10cfe59",
+      "size_bytes": 2988
     },
     {
       "path": "licenses/xarm_ros2.LICENSE",
@@ -17,8 +17,8 @@
     },
     {
       "path": "lite6_lite_gripper.urdf",
-      "sha256": "f1a93780f8986665e960a8acf09d7f9d90e9ceb2ef904e2634ada5b45087cfef",
-      "size_bytes": 19604
+      "sha256": "448485049362a14643f3a6418cee4a9e2119bc86509f0a127607aad54803b641",
+      "size_bytes": 19738
     },
     {
       "path": "meshes/gripper/lite/collision/gripper_lite_body.stl",
@@ -109,9 +109,14 @@
       "path": "meshes/lite6/visual/link_base.stl",
       "sha256": "84f69488a1de60c76c23f83b1759ed76e9235bd56b4b98b4c997c24c18ba7b42",
       "size_bytes": 231884
+    },
+    {
+      "path": "upstream_source/xarm_moveit_config/config/lite6/joint_limits.yaml",
+      "sha256": "73368cad488a238ba6c4bc72e679a2ae7e39cef3c7aecb83e50d6037255d927c",
+      "size_bytes": 1075
     }
   ],
-  "generated_at_utc": "2026-06-26T11:45:56+00:00",
+  "generated_at_utc": "2026-08-30T16:20:59+00:00",
   "schema": "manyforge.lite6_static_model_manifest.v1",
   "source": {
     "arguments": {
@@ -124,6 +129,11 @@
     },
     "branch": "jazzy_no_gazebo",
     "commit": "012731afb9ef1d4289ec45112e8d083ab59a5c1e",
+    "moveit_joint_limits": {
+      "owned_snapshot_path": "upstream_source/xarm_moveit_config/config/lite6/joint_limits.yaml",
+      "sha256": "73368cad488a238ba6c4bc72e679a2ae7e39cef3c7aecb83e50d6037255d927c",
+      "upstream_path": "xarm_moveit_config/config/lite6/joint_limits.yaml"
+    },
     "repository": "https://github.com/pastoriomarco/xarm_ros2",
     "semantic_source": "xarm_moveit_config/srdf/_lite6_macro.srdf.xacro",
     "source_urdf": "/home/tndlux/workspaces/dev_ws/src/manyforge/manyforge_example_models/models/lite6_lite_gripper/manymove_runtime_capture/manymove_lite6_runtime.urdf"

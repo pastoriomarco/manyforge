@@ -65,7 +65,9 @@ class RecordingTransport:
         self.last_submission: dict[str, Any] | None = None
 
     def execution_status(self) -> dict[str, Any]:
-        return self.client.execution_status()
+        # KernelClient retains its semantic method name, but the transport uses
+        # the explicit cold-path aggregate rather than the deprecated alias.
+        return self.client.execution_diagnostics()
 
     def identity(self) -> dict[str, Any]:
         return self.client.execution_identity()
@@ -605,7 +607,9 @@ def _run_native_benchmark_move(
     elapsed_seconds = time.perf_counter() - started_at
     projection = terminal.get("operation")
     assert isinstance(projection, dict), terminal
-    assert projection["state"] == "completed", terminal
+    assert projection["state"] == "completed", json.dumps(
+        terminal, indent=2, sort_keys=True
+    )
 
     acknowledgment = OperationControlRequest.model_validate(
         {
@@ -925,6 +929,10 @@ def _direct_control_joint_operation(
                         "acceleration_scale": 1.0,
                         "max_tcp_linear_speed_mps": None,
                     },
+                    "timeouts": {
+                        "planning_timeout_s": 2.0,
+                        "execution_timeout_s": 10.0,
+                    },
                 },
             }
         ],
@@ -1202,7 +1210,7 @@ def test_reconciliation_gate_does_not_block_ordinary_accept_or_exact_read(
         assert reconciliation_marker.exists()
         assert not reconciliation_gate.exists()
 
-        status = headless.execution_status()
+        status = headless.execution_diagnostics()
         identity = headless.execution_identity()
         targets = headless.execution_targets()
         control_state = headless.execution_control_state()
@@ -1264,10 +1272,14 @@ def test_reconciliation_gate_does_not_block_ordinary_accept_or_exact_read(
                 "diagnostics": status,
             }.items()
         }
+        assert encoded_sizes["identity"] < 2 * 1024
+        assert encoded_sizes["targets"] < 16 * 1024
+        assert encoded_sizes["control_state"] < 4 * 1024
+        assert encoded_sizes["observation"] < 2 * 1024
+        assert encoded_sizes["diagnostics"] < 32 * 1024
         assert encoded_sizes["identity"] < encoded_sizes["diagnostics"]
         assert encoded_sizes["targets"] < encoded_sizes["diagnostics"]
         assert encoded_sizes["control_state"] < encoded_sizes["diagnostics"]
-        assert encoded_sizes["observation"] < 4 * 1024
         assert encoded_sizes["observation"] < encoded_sizes["control_state"]
         assert observed["operation"]["operation_id"] == operation_id
         assert observed["operation"]["state"] in {"planning", "executing"}
@@ -1681,7 +1693,7 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
             "pick_place_execution_owner_unavailable"
         )
 
-        first_status = headless.execution_status()["status"]
+        first_status = headless.execution_diagnostics()["status"]
         assert first_status["program_binding_id"] == manifest["program_binding_id"]
         assert first_status["retained_bundle_id"] == manifest["retained_bundle_id"]
         assert first_status["gripper_target_role_id"] == "gripper"
@@ -1742,7 +1754,8 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
         )
         assert all(
             joint["min_position_rad"] <= joint["max_position_rad"]
-            and joint["max_velocity_rad_s"] > 0.0
+            and joint["max_velocity_rad_s"] == pytest.approx(2.14)
+            and joint["max_acceleration_rad_s2"] == pytest.approx(10.0)
             for joint in direct["joints"]
         )
         motion_descriptor = direct["target_descriptor"]
@@ -1759,6 +1772,11 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
             joint["source_joint_name"]
             for joint in motion_descriptor["joints"]
         ] == manifest["source_joint_names"]
+        assert all(
+            joint["max_velocity_rad_s"] == pytest.approx(2.14)
+            and joint["max_acceleration_rad_s2"] == pytest.approx(10.0)
+            for joint in motion_descriptor["joints"]
+        )
         assert {frame["frame_role_id"] for frame in motion_descriptor["frames"]} >= {
             "base",
             "tcp",
@@ -1767,6 +1785,9 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
             direct["operation_capability_id"]
         )
         assert motion_descriptor["contracts"]["supporting_providers"]
+        assert motion_descriptor["contracts"]["control_path"][
+            "stop_evidence_policy_id"
+        ] == "lite6_motion_controlled_stop"
 
         direct_gripper = first_status["direct_control_gripper"]
         assert direct_gripper["program_id"] == (
@@ -1813,6 +1834,9 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
             "command_schema_id": direct_gripper["command_schema_id"],
             "command_schema_revision": direct_gripper["command_schema_revision"],
         }
+        assert gripper_descriptor["contracts"]["control_path"][
+            "stop_evidence_policy_id"
+        ] == "lite6_controller_goal_terminal_stop"
 
         native = ExecutionCommandClient(execution_run_root, timeout_seconds=2.0)
         before_preview_events = native.events(first_status["owner_epoch"], 0)[
@@ -1844,7 +1868,7 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
         assert native.events(first_status["owner_epoch"], 0)["events"] == (
             before_preview_events
         )
-        after_gripper_preview = headless.execution_status()["status"]
+        after_gripper_preview = headless.execution_diagnostics()["status"]
         after_gripper_observed = next(
             target
             for target in after_gripper_preview["observed_targets"]
@@ -1919,7 +1943,7 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
         assert native.events(first_status["owner_epoch"], 0)["events"] == (
             before_preview_events
         )
-        after_preview_status = headless.execution_status()["status"]
+        after_preview_status = headless.execution_diagnostics()["status"]
         after_preview_arm = next(
             target
             for target in after_preview_status["observed_targets"]
@@ -1962,7 +1986,7 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
             },
         )
 
-        relative_status = headless.execution_status()["status"]
+        relative_status = headless.execution_diagnostics()["status"]
         relative_direct = relative_status["direct_control"]
         relative_start_pose = relative_direct["observed_state"][
             "current_tcp_pose"
@@ -1988,7 +2012,7 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
             "operation"
         ]
         assert relative_terminal["state"] == "completed", relative_terminal
-        relative_end_pose = headless.execution_status()["status"][
+        relative_end_pose = headless.execution_diagnostics()["status"][
             "direct_control"
         ]["observed_state"]["current_tcp_pose"]
         assert _translation_error_m(
@@ -2077,7 +2101,7 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
 
         composer_projection = composer.operation(operation_id)
         assert composer_projection["operation"] == terminal["operation"]
-        assert composer.execution_status()["status"]["owner_epoch"] == (
+        assert composer.execution_diagnostics()["status"]["owner_epoch"] == (
             first_status["owner_epoch"]
         )
 
@@ -2148,7 +2172,7 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
             "capability_command"
         )
         assert composer.operation(gripper_id)["operation"] == gripper_terminal
-        gripper_status = headless.execution_status()["status"]
+        gripper_status = headless.execution_diagnostics()["status"]
         gripper_observed = next(
             target
             for target in gripper_status["observed_targets"]
@@ -2219,7 +2243,10 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
             runner,
             request_id="n4-controlled-operation",
             joint_names=("joint1",),
-            positions=(0.75,),
+            # Keep enough path after Pause/Resume for this test to exercise the
+            # one-second replacement Stop trajectory rather than the separately
+            # qualified short-path natural-completion policy.
+            positions=(1.5,),
         )
         controlled_id = controlled["accepted"]["operation_id"]
         executing = _wait_state(runner, controlled_id, {"executing"})[
@@ -2294,6 +2321,9 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
         assert resumed_state["operation_revision"] == resumed["accepted"][
             "operation_revision_after_acceptance"
         ]
+        before_controlled_stop = {
+            "operation": resumed_state,
+        }
 
         stop_arguments = {
             "request_id": "stop-controlled-operation",
@@ -2305,32 +2335,75 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
             "reason": "exercise historical operator Stop",
             "correlation_id": "n4-public-control-test",
         }
+        stop_requested_at = time.monotonic()
         stop_accepted = runner.stop_operation(**stop_arguments)
+        stop_acceptance_elapsed_s = time.monotonic() - stop_requested_at
+        stop_replay = runner.stop_operation(**stop_arguments)
+        assert stop_replay["accepted"]["stop_id"] == stop_accepted["accepted"][
+            "stop_id"
+        ]
+        assert stop_replay["accepted"]["stop_generation"] == stop_accepted[
+            "accepted"
+        ]["stop_generation"]
+        assert stop_replay["accepted"]["replay_status"] == "replayed_exact"
         stopped = _wait_terminal(runner, controlled_id)["operation"]
+        stop_settlement_elapsed_s = time.monotonic() - stop_requested_at
         assert stopped["state"] == "stopped", json.dumps(stopped, sort_keys=True)
         assert stopped["active_stop_id"] == stop_accepted["accepted"]["stop_id"]
-        projected_stop = headless.execution_status()["status"][
+        assert stop_acceptance_elapsed_s < 0.5
+        projected_stop = headless.execution_diagnostics()["status"][
             "cell_stop_action"
         ]
+        assert 0.9 <= stop_settlement_elapsed_s < 1.75, json.dumps(
+            {
+                "before_stop": before_controlled_stop,
+                "stop": projected_stop,
+            },
+            sort_keys=True,
+        )
         assert projected_stop["expected_stop_generation"] == (
             stop_accepted["accepted"]["stop_generation"]
         )
         assert projected_stop["latest_terminal"]["certificate"]["stop_id"] == (
             stop_accepted["accepted"]["stop_id"]
         )
-        assert projected_stop["latest_terminal"]["executed_stages"]
-        with sqlite3.connect(
-            execution_state_root / "operation-journal.sqlite3"
-        ) as database:
-            durable_stop = database.execute(
-                "SELECT sequence,payload_json FROM journal_records "
-                "WHERE request_id = ? AND record_kind = "
-                "'stop_acceptance_projected' AND stop_id = ?",
-                (
-                    "stop-controlled-operation",
-                    stop_accepted["accepted"]["stop_id"],
-                ),
-            ).fetchone()
+        terminal = projected_stop["latest_terminal"]
+        assert terminal["result"] == "succeeded_nominal"
+        assert terminal["escalated"] is False
+        assert terminal["hard_stop_floor_used"] is False
+        assert len(terminal["executed_stages"]) == 1
+        controlled_stage = terminal["executed_stages"][0]
+        assert controlled_stage["action_class"] == "controlled"
+        assert controlled_stage["executed_mode"] == "soft_on_path"
+        assert controlled_stage["stage_id"] == "nominal"
+        assert controlled_stage["stage_index"] == 0
+        assert controlled_stage["outcome"] == "succeeded"
+        assert controlled_stage["substitution_reason"] is None
+        durable_stop = None
+        durable_terminal = None
+        projection_deadline = time.monotonic() + 5.0
+        while time.monotonic() < projection_deadline:
+            with sqlite3.connect(
+                execution_state_root / "operation-journal.sqlite3"
+            ) as database:
+                durable_stop = database.execute(
+                    "SELECT sequence,payload_json FROM journal_records "
+                    "WHERE request_id = ? AND record_kind = "
+                    "'stop_acceptance_projected' AND stop_id = ?",
+                    (
+                        "stop-controlled-operation",
+                        stop_accepted["accepted"]["stop_id"],
+                    ),
+                ).fetchone()
+                durable_terminal = database.execute(
+                    "SELECT sequence,payload_digest FROM journal_records "
+                    "WHERE record_kind='stop_terminal_projected' AND stop_id=? "
+                    "ORDER BY sequence DESC LIMIT 1",
+                    (stop_accepted["accepted"]["stop_id"],),
+                ).fetchone()
+            if durable_stop is not None and durable_terminal is not None:
+                break
+            time.sleep(0.01)
         assert durable_stop is not None
         durable_stop_sequence = int(durable_stop[0])
         durable_stop_payload = json.loads(durable_stop[1])
@@ -2353,6 +2426,59 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
         assert durable_stop_event["operation_id"] is None
         assert durable_stop_event["operation_revision"] is None
         assert durable_stop_event["payload"] == durable_stop_payload
+        assert durable_terminal is not None
+        terminal_page = native.events(
+            first_status["owner_epoch"], int(durable_terminal[0]) - 1, limit=1
+        )
+        assert len(terminal_page["events"]) == 1
+        terminal_event = terminal_page["events"][0]
+        assert terminal_event["record_kind"] == "stop_terminal_projected"
+        assert terminal_event["request_id"] is None
+        assert terminal_event["operation_id"] is None
+        assert terminal_event["operation_revision"] is None
+        terminal_history = terminal_event["payload"]
+        assert terminal_history["api_version"] == (
+            "manyforge.stop_terminal_projection.v1"
+        )
+        assert terminal_history["durable_projection_digest"] == (
+            durable_terminal[1]
+        )
+        assert terminal_history["details_truncated"] is False
+        assert terminal_history["request_id"] == "stop-controlled-operation"
+        assert terminal_history["result"] == "succeeded_nominal"
+        assert terminal_history["state"] == "succeeded"
+        assert 900_000_000 <= terminal_history[
+            "acceptance_to_terminal_latency_ns"
+        ] < 1_750_000_000
+        assert terminal_history["attempted_stage_count"] == 1
+        terminal_attempt = terminal_history["attempted_stages"][0]
+        assert terminal_attempt["stage"]["command_kind"] == (
+            "motion_controlled_stop"
+        )
+        assert terminal_attempt["profile"] is not None
+        assert terminal_attempt["profile"]["profile_id"] == (
+            "operator_soft_on_path"
+        )
+        assert terminal_attempt["profile"]["stop_mode"] == "soft_on_path"
+        assert terminal_attempt["actual_stop_mode"] == "soft_on_path"
+        # The deployment owns the retained profile, while the exact prepared
+        # participant command records the participant-specific mapping that
+        # produced its executable parameters.
+        assert terminal_attempt["profile_source"] == (
+            "participant_profile_mapping"
+        )
+        assert terminal_attempt["outcome"] == "succeeded"
+        assert any(
+            item["evidence"] is not None
+            and item["evidence"].get("requested_stop_mode") == "soft_on_path"
+            and item["evidence"].get("actual_stop_mode") == "soft_on_path"
+            and item["evidence"].get("backend_stop_confirmed") is True
+            for item in terminal_attempt["evidence_items"]
+        )
+        assert terminal_history["participant_settlement_count"] == 1
+        assert terminal_history["participant_settlement"][0]["facts"][
+            "terminal_settlement"
+        ] == "settled"
 
         # Exercise the complete recognized-malformed ingress and durable
         # recovery boundary through the production HTTP/native/SQLite path.
@@ -2447,16 +2573,35 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
             execution_state_root / "operation-journal.sqlite3"
         ) as database:
             clear_rows = database.execute(
-                "SELECT payload_json FROM journal_records "
+                "SELECT sequence,payload_json FROM journal_records "
                 "WHERE record_kind='stop_fault_cleared' AND stop_id=?",
                 (malformed_acceptance["stop_id"],),
             ).fetchall()
         assert len(clear_rows) == 1
-        durable_clear = json.loads(clear_rows[0][0])
+        durable_clear = json.loads(clear_rows[0][1])
         assert durable_clear[0] == (
             "manyforge.internal.stop-journal-fault-clear-projection.v2"
         )
         assert durable_clear[2][0] == recovered_result["request_id"]
+        clear_page = native.events(
+            first_status["owner_epoch"], int(clear_rows[0][0]) - 1, limit=1
+        )
+        assert len(clear_page["events"]) == 1
+        clear_event = clear_page["events"][0]
+        assert clear_event["record_kind"] == "stop_fault_cleared"
+        assert clear_event["request_id"] == recovered_result["request_id"]
+        assert clear_event["operation_id"] is None
+        assert clear_event["operation_revision"] is None
+        clear_history = clear_event["payload"]
+        assert clear_history["api_version"] == (
+            "manyforge.stop_fault_clear_projection.v1"
+        )
+        assert clear_history["fault_latch"]["latch_id"] == (
+            recovered_result["latch"]["latch_id"]
+        )
+        assert clear_history["fault_latch"]["state"] == "cleared"
+        assert clear_history["fault_latch"]["recovery_status"] == "cleared"
+        assert clear_history["result"]["accepted"] is True
 
         # N7-b exercises the largest maintained page through the real
         # SOCK_SEQPACKET boundary. The preceding maintained workflow has
@@ -2496,7 +2641,7 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
             execution_run_root.stat().st_ino,
         ) == run_root_identity
         assert (execution_run_root / "execution-command.sock").is_socket()
-        restarted = headless.execution_status()["status"]
+        restarted = headless.execution_diagnostics()["status"]
         assert restarted["owner_epoch"] != first_status["owner_epoch"]
         with pytest.raises(HeadlessClientError) as stale:
             headless.execute(stale_submission)
@@ -2731,7 +2876,7 @@ def test_slow_preview_cannot_delay_the_standard_stop_path(tmp_path: Path) -> Non
     preview_thread: threading.Thread | None = None
 
     try:
-        status = headless.execution_status()["status"]
+        status = headless.execution_diagnostics()["status"]
         positions = [
             float(position)
             for position in status["direct_control"]["observed_state"][
@@ -2839,7 +2984,7 @@ def test_planning_stop_and_active_host_replacement_are_bounded(
     runner = OrchestratorRunner(KernelClient(recording))
 
     try:
-        first_epoch = headless.execution_status()["status"]["owner_epoch"]
+        first_epoch = headless.execution_diagnostics()["status"]["owner_epoch"]
         cclc_owner_before_loss = CCLCOpenRequestClient(
             execution_run_root, timeout_seconds=5.0
         ).owner_identity()["request_owner_epoch"]
@@ -2913,7 +3058,7 @@ def test_planning_stop_and_active_host_replacement_are_bounded(
             fake_worker_marker=marker,
             qualify_cclc=False,
         )
-        restarted = headless.execution_status()["status"]
+        restarted = headless.execution_diagnostics()["status"]
         assert restarted["owner_epoch"] != first_epoch
         cclc_after_loss = _wait_for_cclc_component(execution_run_root)
         assert cclc_after_loss["component_lifecycle_state"] == "active"
@@ -3102,7 +3247,7 @@ def test_active_gripper_host_replacement_reconciles_and_reopens_inventory(
     runner = OrchestratorRunner(KernelClient(recording))
 
     try:
-        first_epoch = headless.execution_status()["status"]["owner_epoch"]
+        first_epoch = headless.execution_diagnostics()["status"]["owner_epoch"]
         accepted = _gripper_submission(
             runner,
             request_id="active-gripper-host-loss",
@@ -3123,7 +3268,7 @@ def test_active_gripper_host_replacement_reconciles_and_reopens_inventory(
             execution_run_root,
             manifest,
         )
-        restarted = headless.execution_status()["status"]
+        restarted = headless.execution_diagnostics()["status"]
         assert restarted["owner_epoch"] != first_epoch
         orphan = runner.operation(operation_id)["operation"]
         assert orphan["state"] == "intervention_required"

@@ -1157,7 +1157,7 @@ def _wait_for_ros2_control_lifecycle_readiness(
     last: object = None
     last_transport: object = None
     while time.monotonic() < deadline:
-        response = client.execution_status()
+        response = client.execution_diagnostics()
         status = response.get("status") if isinstance(response, dict) else None
         if (
             not isinstance(response, dict)
@@ -1204,7 +1204,7 @@ def _prepare_and_select_cclc_routes(
     selection; every mutable expectation below comes from a fresh CCLC read.
     """
 
-    execution = client.execution_status()
+    execution = client.execution_diagnostics()
     execution_status = execution.get("status")
     execution_owner_epoch = (
         execution_status.get("owner_epoch")
@@ -2167,7 +2167,7 @@ def _observe_run_evidence(
     client: HeadlessHttpClient,
     spec: ScenarioSpec,
 ) -> None:
-    _record_execution_evidence(evidence, spec, client.execution_status())
+    _record_execution_evidence(evidence, spec, client.execution_diagnostics())
     scene = client.scene()
     _record_scene_evidence(evidence, scene)
     if "object_motion_observed" not in spec.required_checks:

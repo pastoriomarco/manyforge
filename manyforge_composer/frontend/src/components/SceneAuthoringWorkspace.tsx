@@ -185,7 +185,7 @@ function programComponentFrameOptions(
 
 function objectEditReason(object: LogicalSceneObject): string | null {
   if (object.placement.kind === 'carried') {
-    return 'Carried-object placement is attachment-owned and cannot be edited here.';
+    return 'Attached-object placement is attachment-owned and cannot be edited here.';
   }
   if (object.provider_evidence !== null) {
     return 'This pose is provider-owned; Composer cannot replace provider evidence.';
@@ -383,7 +383,7 @@ function SceneHierarchy({
           <h3>Scene hierarchy</h3>
         </div>
         <span className="scene-hierarchy-count">
-          {objects.length} objects · {attachments.length} carried
+          {objects.length} objects · {attachments.length} Attached
         </span>
       </div>
       <input
@@ -416,7 +416,7 @@ function SceneHierarchy({
                   <strong>{object.scene_resource_id}</strong>
                   <span>{attachment === undefined
                     ? object.placement.kind
-                    : `carried by ${attachment.controllable_component_id} / ${attachment.carrier_frame_ref.frame_role_id}`}</span>
+                    : `Attached to ${attachment.controllable_component_id} / ${attachment.carrier_frame_ref.frame_role_id}`}</span>
                 </button>
                 <label title="Show this object in the viewport">
                   <input
@@ -1618,6 +1618,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
     facts?.logicalScene ?? null,
     sourceValue,
     readyManifest,
+    robotControl.state.status?.directControl.targetDescriptor ?? null,
   );
   const executionPresentation = executionRobotPresentation(
     robotControl.state.status,
@@ -1633,8 +1634,9 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
       source,
       sourceValue,
       readyManifest,
+      robotControl.state.status?.directControl.targetDescriptor ?? null,
     ),
-    [readyManifest, source, sourceValue],
+    [readyManifest, robotControl.state.status, source, sourceValue],
   );
   const frameAxes = useMemo(() => {
     const seen = new Set<string>();
@@ -1718,7 +1720,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
             removeReason: null,
             transformReason: null,
             shapeReason: null,
-            detachReason: 'Program Draft resources are not carried runtime objects.',
+            detachReason: 'Program Draft resources are not runtime Attached objects.',
           }]))
         : mutationAvailability}
       candidateTcpPose={ghost}
@@ -1828,8 +1830,9 @@ export function SceneAuthoringWorkspace({
       facts?.logicalScene ?? null,
       sourceValue,
       manifest.status === 'ready' ? manifest.data : null,
+      robotControl.state.status?.directControl.targetDescriptor ?? null,
     ).status,
-    [facts, manifest, sourceValue],
+    [facts, manifest, robotControl.state.status, sourceValue],
   );
   const [selectedOccurrenceId, setSelectedOccurrenceId] = useState<string | null>(null);
   const [activeSceneTool, setActiveSceneTool] = useState<SceneWorkspaceTool>('hierarchy');

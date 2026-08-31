@@ -1042,14 +1042,35 @@ void require_qualified_structural_subset_before_store(
   const auto &urdf = composition.flattened_urdf();
   const auto &srdf = composition.flattened_srdf();
   const auto &frame_paths = composition.frame_paths();
-  if (cell_frame.cell_id != graph.cell_id || urdf.robot_name.empty() ||
-      urdf.links.empty() ||
-      urdf.links.front().name != cell_frame.compiled_frame_name ||
-      srdf.robot_name != urdf.robot_name || frame_paths.empty() ||
-      composition.model_occurrences().size() != graph.model_instances.size()) {
+  const std::string_view incoherent_reason = [&]() -> std::string_view {
+    if (cell_frame.cell_id != graph.cell_id) {
+      return "cell identity differs";
+    }
+    if (urdf.robot_name.empty()) {
+      return "flattened URDF has no robot name";
+    }
+    if (urdf.links.empty()) {
+      return "flattened URDF has no cell frame";
+    }
+    if (urdf.links.front().name != cell_frame.compiled_frame_name) {
+      return "flattened URDF does not begin with the cell frame";
+    }
+    if (srdf.robot_name != urdf.robot_name) {
+      return "flattened URDF and SRDF identities differ";
+    }
+    if (frame_paths.empty()) {
+      return "flattened model has no frame paths";
+    }
+    if (composition.model_occurrences().size() !=
+        graph.model_instances.size()) {
+      return "model occurrence count differs from the graph";
+    }
+    return {};
+  }();
+  if (!incoherent_reason.empty()) {
     detail::fail_retained_bundle(
         "structural compiler IR does not contain a coherent flattened "
-        "planning/collision model");
+        "planning/collision model: " + std::string(incoherent_reason));
   }
   if (graph.model_instances.empty()) {
     const auto *path_cell_frame = frame_paths.size() == 1U

@@ -1,7 +1,9 @@
 import * as THREE from 'three';
 
 import type {
+  CarriedObjectAttachment,
   LogicalSceneProjection,
+  LogicalSceneObject,
   QuaternionXyzwTuple,
   SceneRuntimeGoodObservationPayload,
   SceneRuntimeObservationPose,
@@ -13,7 +15,10 @@ import type {
   Vector3Tuple,
 } from '../types/api';
 import type { MotionPreviewReceipt } from '../types/robotControl';
-import type { ExecutionOwnerStatus } from '../types/robotControl';
+import type {
+  ExecutionOwnerStatus,
+  ManualControlMotionDescriptor,
+} from '../types/robotControl';
 import type {
   ExecutionObservationFrame,
   ExecutionObservationReader,
@@ -52,6 +57,8 @@ export interface RuntimeScenePresentation {
   measuredRobot: MeasuredRobotPresentation | null;
   measuredTcp: MeasuredPosePresentation | null;
   measuredObjects: MeasuredPosePresentation[];
+  attachedObjects: AttachedObjectPresentation[];
+  attachmentDiagnostics: AttachmentPresentationDiagnostic[];
   status: {
     total: number;
     freshGood: number;
@@ -60,6 +67,33 @@ export interface RuntimeScenePresentation {
     buffered: number;
     warnings: string[];
   };
+}
+
+export interface AttachedObjectPresentation {
+  object: LogicalSceneObject;
+  attachmentId: string;
+  attachmentRevision: string;
+  carrierComponentId: string;
+  commandTargetId: string;
+  carrierFrameRoleId: string;
+  carrierCompiledFrameName: string;
+  poseInCarrierFrame: CarriedObjectAttachment['pose_in_carrier_frame'];
+}
+
+export interface AttachmentPresentationDiagnostic {
+  code:
+    | 'attachment_missing'
+    | 'attachment_ambiguous'
+    | 'attachment_identity_mismatch'
+    | 'carrier_descriptor_unavailable'
+    | 'carrier_target_mismatch'
+    | 'carrier_frame_missing'
+    | 'carrier_frame_ambiguous'
+    | 'carrier_model_mismatch'
+    | 'carrier_viewer_link_missing'
+    | 'attachment_orphaned';
+  sceneResourceId: string;
+  message: string;
 }
 
 export interface CandidateRobotPresentation {
@@ -137,6 +171,7 @@ export function executionObservationRobotPresentation(
   frame: ExecutionObservationFrame | null,
   sourceModel: SourceModelProjection | null,
   manifest: SceneUrdfManifest | null,
+  descriptor: ManualControlMotionDescriptor | null,
   observedAtNs: number | null,
 ): MeasuredRobotPresentation | null {
   if (
@@ -151,6 +186,10 @@ export function executionObservationRobotPresentation(
     || frame.graphRevision !== manifest.graph_revision
     || frame.sourceJointNames.length !== frame.compiledJointNames.length
     || frame.sourceJointNames.length !== frame.positionsRad.length
+    || descriptor === null
+    || descriptor.controllableComponentId !== frame.controllableComponentId
+    || descriptor.commandTargetId !== frame.commandTargetId
+    || descriptor.joints.length !== frame.sourceJointNames.length
   ) return null;
 
   const occurrence = sourceModel.occurrences.find(
@@ -176,8 +215,12 @@ export function executionObservationRobotPresentation(
   for (const [index, sourceJointName] of frame.sourceJointNames.entries()) {
     const compiledJointName = frame.compiledJointNames[index];
     const position = frame.positionsRad[index];
+    const describedJoint = descriptor.joints[index];
     if (
       compiledJointName === undefined
+      || describedJoint === undefined
+      || describedJoint.sourceJointName !== sourceJointName
+      || describedJoint.compiledJointName !== compiledJointName
       || !occurrenceCoordinates.has(sourceJointName)
       || !Number.isFinite(position)
       || compiledPositions.has(compiledJointName)
@@ -203,6 +246,7 @@ export function createExecutionRobotPresentationReader(
   reader: ExecutionObservationReader,
   sourceModel: SourceModelProjection | null,
   manifest: SceneUrdfManifest | null,
+  descriptor: ManualControlMotionDescriptor | null,
 ): MeasuredRobotPresentationReader {
   let cachedFrame: ExecutionObservationFrame | null | undefined;
   let cachedPresentation: MeasuredRobotPresentation | null = null;
@@ -215,6 +259,7 @@ export function createExecutionRobotPresentationReader(
         frame,
         sourceModel,
         manifest,
+        descriptor,
         frame === null ? null : performance.now() * 1e6,
       );
       return cachedPresentation;
@@ -227,6 +272,8 @@ const EMPTY_PRESENTATION: RuntimeScenePresentation = {
   measuredRobot: null,
   measuredTcp: null,
   measuredObjects: [],
+  attachedObjects: [],
+  attachmentDiagnostics: [],
   status: {
     total: 0,
     freshGood: 0,
@@ -236,6 +283,206 @@ const EMPTY_PRESENTATION: RuntimeScenePresentation = {
     warnings: [],
   },
 };
+
+interface AttachedScenePresentationResult {
+  objects: AttachedObjectPresentation[];
+  diagnostics: AttachmentPresentationDiagnostic[];
+}
+
+function attachmentDiagnostic(
+  code: AttachmentPresentationDiagnostic['code'],
+  sceneResourceId: string,
+  message: string,
+): AttachmentPresentationDiagnostic {
+  return { code, sceneResourceId, message };
+}
+
+/**
+ * Join one owner attachment to one exact retained target/frame/viewer link.
+ * No source or compiled name is guessed: a missing or crossed join remains a
+ * visible diagnostic and the object is not rendered at an invented pose.
+ */
+export function attachedScenePresentation(
+  logicalScene: LogicalSceneProjection | null,
+  sourceModel: SourceModelProjection | null,
+  manifest: SceneUrdfManifest | null,
+  descriptor: ManualControlMotionDescriptor | null,
+): AttachedScenePresentationResult {
+  const snapshot = logicalScene?.snapshot;
+  if (snapshot === null || snapshot === undefined) {
+    return { objects: [], diagnostics: [] };
+  }
+  const objects: AttachedObjectPresentation[] = [];
+  const diagnostics: AttachmentPresentationDiagnostic[] = [];
+  const referencedAttachments = new Set<string>();
+  const viewerLinks = new Set(manifest?.links.map((link) => link.name) ?? []);
+
+  for (const object of snapshot.objects) {
+    if (object.placement.kind !== 'carried') continue;
+    const placement = object.placement;
+    const matches = snapshot.carried_object_attachments.filter(
+      (attachment) => attachment.carried_object_attachment_id
+        === placement.carried_object_attachment_id,
+    );
+    if (matches.length === 0) {
+      diagnostics.push(attachmentDiagnostic(
+        'attachment_missing',
+        object.scene_resource_id,
+        `Attached object ${object.scene_resource_id} has no matching owner attachment.`,
+      ));
+      continue;
+    }
+    if (matches.length !== 1) {
+      diagnostics.push(attachmentDiagnostic(
+        'attachment_ambiguous',
+        object.scene_resource_id,
+        `Attached object ${object.scene_resource_id} has an ambiguous owner attachment.`,
+      ));
+      continue;
+    }
+    const attachment = matches[0];
+    referencedAttachments.add(attachment.carried_object_attachment_id);
+    if (
+      attachment.carried_object_attachment_revision
+        !== placement.carried_object_attachment_revision
+      || attachment.scene_resource_id !== object.scene_resource_id
+      || attachment.carrier_frame_ref.controllable_component_id
+        !== attachment.controllable_component_id
+    ) {
+      diagnostics.push(attachmentDiagnostic(
+        'attachment_identity_mismatch',
+        object.scene_resource_id,
+        `Attached object ${object.scene_resource_id} crosses its owner identity or revision.`,
+      ));
+      continue;
+    }
+    if (descriptor === null || sourceModel === null || manifest === null) {
+      diagnostics.push(attachmentDiagnostic(
+        'carrier_descriptor_unavailable',
+        object.scene_resource_id,
+        `Attached object ${object.scene_resource_id} is waiting for its retained carrier descriptor.`,
+      ));
+      continue;
+    }
+    if (descriptor.controllableComponentId !== attachment.controllable_component_id) {
+      diagnostics.push(attachmentDiagnostic(
+        'carrier_target_mismatch',
+        object.scene_resource_id,
+        `Attached object ${object.scene_resource_id} does not address the displayed carrier component.`,
+      ));
+      continue;
+    }
+    const sourceTargets = sourceModel.targets.filter((target) => (
+      target.component_id === attachment.controllable_component_id
+      && target.target_id === attachment.command_target_id
+    ));
+    if (sourceTargets.length !== 1) {
+      diagnostics.push(attachmentDiagnostic(
+        sourceTargets.length === 0 ? 'carrier_frame_missing' : 'carrier_frame_ambiguous',
+        object.scene_resource_id,
+        `Attached object ${object.scene_resource_id} has no singular retained carrier target.`,
+      ));
+      continue;
+    }
+    const sourceFrames = sourceTargets[0].frames.filter((frame) => (
+      frame.model_instance_id === attachment.carrier_frame_ref.model_instance_id
+      && frame.source_link_name !== null
+    ));
+    const descriptorTargets = sourceModel.targets.filter((target) => (
+      target.component_id === descriptor.controllableComponentId
+      && target.target_id === descriptor.commandTargetId
+    ));
+    if (sourceFrames.length === 0 || descriptorTargets.length !== 1) {
+      diagnostics.push(attachmentDiagnostic(
+        sourceFrames.length === 0 || descriptorTargets.length === 0
+          ? 'carrier_frame_missing'
+          : 'carrier_frame_ambiguous',
+        object.scene_resource_id,
+        `Attached object ${object.scene_resource_id} has no singular retained carrier frame.`,
+      ));
+      continue;
+    }
+    const descriptorFrames = descriptor.frames.filter((frame) => {
+      if (frame.modelInstanceId !== attachment.carrier_frame_ref.model_instance_id) {
+        return false;
+      }
+      const descriptorSourceFrames = descriptorTargets[0].frames.filter((sourceFrame) => (
+        sourceFrame.frame_role_id === frame.frameRoleId
+        && sourceFrame.model_instance_id === frame.modelInstanceId
+        && sourceFrame.source_link_name !== null
+      ));
+      return descriptorSourceFrames.length === 1 && sourceFrames.some((sourceFrame) => (
+        sourceFrame.model_instance_id === descriptorSourceFrames[0].model_instance_id
+        && sourceFrame.source_link_name === descriptorSourceFrames[0].source_link_name
+      ));
+    });
+    const uniqueDescriptorFrames = [...new Map(descriptorFrames.map((frame) => [
+      `${frame.modelInstanceId}\u0000${frame.modelRevision}\u0000${frame.compiledFrameName}`,
+      frame,
+    ])).values()];
+    if (uniqueDescriptorFrames.length !== 1) {
+      diagnostics.push(attachmentDiagnostic(
+        uniqueDescriptorFrames.length === 0
+          ? 'carrier_frame_missing'
+          : 'carrier_frame_ambiguous',
+        object.scene_resource_id,
+        `Attached object ${object.scene_resource_id} has no singular retained carrier frame.`,
+      ));
+      continue;
+    }
+    const carrierFrame = uniqueDescriptorFrames[0];
+    const occurrence = sourceModel.occurrences.filter((candidate) => (
+      candidate.component_id === attachment.controllable_component_id
+      && candidate.model_instance_id === attachment.carrier_frame_ref.model_instance_id
+    ));
+    if (
+      occurrence.length !== 1
+      || occurrence[0].model_revision !== carrierFrame.modelRevision
+    ) {
+      diagnostics.push(attachmentDiagnostic(
+        'carrier_model_mismatch',
+        object.scene_resource_id,
+        `Attached object ${object.scene_resource_id} crosses its retained carrier model revision.`,
+      ));
+      continue;
+    }
+    if (!viewerLinks.has(carrierFrame.compiledFrameName)) {
+      diagnostics.push(attachmentDiagnostic(
+        'carrier_viewer_link_missing',
+        object.scene_resource_id,
+        `Attached object ${object.scene_resource_id} carrier frame is absent from the active viewer model.`,
+      ));
+      continue;
+    }
+    objects.push({
+      object,
+      attachmentId: attachment.carried_object_attachment_id,
+      attachmentRevision: attachment.carried_object_attachment_revision,
+      carrierComponentId: attachment.controllable_component_id,
+      commandTargetId: attachment.command_target_id,
+      carrierFrameRoleId: attachment.carrier_frame_ref.frame_role_id,
+      carrierCompiledFrameName: carrierFrame.compiledFrameName,
+      poseInCarrierFrame: attachment.pose_in_carrier_frame,
+    });
+  }
+
+  for (const attachment of snapshot.carried_object_attachments) {
+    if (referencedAttachments.has(attachment.carried_object_attachment_id)) continue;
+    diagnostics.push(attachmentDiagnostic(
+      'attachment_orphaned',
+      attachment.scene_resource_id,
+      `Owner attachment ${attachment.carried_object_attachment_id} has no matching Attached object.`,
+    ));
+  }
+  objects.sort((left, right) => left.object.scene_resource_id.localeCompare(
+    right.object.scene_resource_id,
+  ));
+  diagnostics.sort((left, right) => (
+    left.sceneResourceId.localeCompare(right.sceneResourceId)
+    || left.code.localeCompare(right.code)
+  ));
+  return { objects, diagnostics };
+}
 
 type GoodObservationSource = Extract<
   SceneRuntimePoseSource,
@@ -284,6 +531,7 @@ export function runtimeScenePresentation(
   logicalScene: LogicalSceneProjection | null,
   sourceModel: SourceModelProjection | null,
   manifest: SceneUrdfManifest | null,
+  motionDescriptor: ManualControlMotionDescriptor | null = null,
 ): RuntimeScenePresentation {
   if (
     sceneRuntime === null
@@ -294,6 +542,13 @@ export function runtimeScenePresentation(
   ) return EMPTY_PRESENTATION;
 
   const warnings: string[] = [];
+  const attached = attachedScenePresentation(
+    logicalScene,
+    sourceModel,
+    manifest,
+    motionDescriptor,
+  );
+  warnings.push(...attached.diagnostics.map((diagnostic) => diagnostic.message));
   const identity = sceneRuntime.state.runtime_identity;
   const projection = logicalScene.access.active_projection;
   if (
@@ -371,10 +626,14 @@ export function runtimeScenePresentation(
   const sceneObjectIds = new Set(
     logicalScene.snapshot.objects.map((object) => object.scene_resource_id),
   );
+  const attachedObjectIds = new Set(
+    attached.objects.map((object) => object.object.scene_resource_id),
+  );
   const objectSources = fresh.filter(
     (source): source is PoseObservationSource => isPoseObservation(source)
       && source.eligible
-      && sceneObjectIds.has(source.object_id),
+      && sceneObjectIds.has(source.object_id)
+      && !attachedObjectIds.has(source.object_id),
   );
   const measuredObjects: MeasuredPosePresentation[] = [];
   for (const objectId of [...new Set(objectSources.map((source) => source.object_id))]
@@ -420,6 +679,8 @@ export function runtimeScenePresentation(
     measuredRobot,
     measuredTcp,
     measuredObjects,
+    attachedObjects: attached.objects,
+    attachmentDiagnostics: attached.diagnostics,
     status: {
       total: sources.length,
       freshGood: fresh.length,

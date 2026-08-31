@@ -146,6 +146,8 @@ _REQUEST_KINDS: Final = frozenset(
         "runtime_blackboard_write",
         "manual_result_stage",
         "recovery_action",
+        "resume_full_stop",
+        "discard_full_stop",
     }
 )
 _TERMINAL_RUN_STATES: Final = frozenset({"stopped", "succeeded", "failed"})
@@ -1221,6 +1223,8 @@ class ProgramCycleJournal:
         intent: Mapping[str, Any],
         cycle_generation: int,
     ) -> RequestRecord:
+        if kind not in _REQUEST_KINDS:
+            raise ValueError("Program-cycle request kind is unsupported")
         encoded = self._dump(intent)
         with self._transaction():
             current = self._database.execute(

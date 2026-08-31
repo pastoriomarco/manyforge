@@ -344,6 +344,7 @@ struct UrdfLimitIr final {
   double upper = 0.0;
   double effort = 0.0;
   double velocity = 0.0;
+  std::optional<double> acceleration;
 
   friend bool operator==(const UrdfLimitIr&, const UrdfLimitIr&) = default;
 };
@@ -393,6 +394,8 @@ struct UrdfDocumentIr final {
   std::vector<UrdfMaterialIr> materials;
   std::vector<UrdfLinkIr> links;
   std::vector<UrdfJointIr> joints;
+  std::uint32_t version_major = 1U;
+  std::uint32_t version_minor = 0U;
 
   friend bool operator==(const UrdfDocumentIr&, const UrdfDocumentIr&) =
       default;

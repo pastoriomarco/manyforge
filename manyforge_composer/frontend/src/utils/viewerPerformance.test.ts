@@ -3,25 +3,20 @@ import {
   VIEWER_QUALIFICATION_GLOBAL,
   VIEWER_QUALIFICATION_QUERY_KEY,
   connectViewerQualification,
-  getAutomaticViewerRateHz,
-  getViewerRatePreferenceHz,
   isSoftwareRenderer,
   recordViewerModelBuild,
   recordViewerReactCommit,
   recordViewerRenderFrame,
   recordViewerRenderWork,
   selectViewerPresentationProfile,
-  setViewerRatePreferenceHz,
   startViewerPerformanceMonitoring,
   stopViewerPerformanceMonitoring,
-  subscribeViewerRatePreference,
   takeViewerPerformanceWindow,
 } from './viewerPerformance';
 
 describe('viewer presentation and performance', () => {
   afterEach(() => {
     stopViewerPerformanceMonitoring();
-    setViewerRatePreferenceHz(null);
     vi.unstubAllGlobals();
   });
 
@@ -61,25 +56,6 @@ describe('viewer presentation and performance', () => {
     expect(second.modelBuilds).toBe(0);
     expect(second.renderedFrames).toBe(0);
     expect(second.renderIntervalP95Ms).toBeNull();
-  });
-
-  it('retains the bounded browser-local cadence preference without claiming it is applied', () => {
-    let notifications = 0;
-    const unsubscribe = subscribeViewerRatePreference(() => {
-      notifications += 1;
-    });
-
-    expect(getAutomaticViewerRateHz()).toBe(15);
-    expect(getViewerRatePreferenceHz()).toBeNull();
-    setViewerRatePreferenceHz(10);
-    expect(getViewerRatePreferenceHz()).toBe(10);
-    expect(notifications).toBe(1);
-    expect(() => setViewerRatePreferenceHz(31)).toThrow(RangeError);
-
-    unsubscribe();
-    setViewerRatePreferenceHz(null);
-    expect(getViewerRatePreferenceHz()).toBeNull();
-    expect(notifications).toBe(1);
   });
 
   it('installs one frozen qualification object only for the exact URL opt-in', () => {

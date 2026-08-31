@@ -10,7 +10,7 @@ import { ProgramSchemaValueEditor } from './ProgramSchemaValueEditor';
 
 const entry: CatalogEntry = {
   id: 'scene.attach_carried_object',
-  name: 'Attach carried object',
+  name: 'Attach object',
   category: 'scene',
   description: '',
   stability: 'stable',

@@ -584,8 +584,7 @@ TEST(ManagedKernelAdmissionGate,
       scope.resources, ActiveConfigurations(), {});
   ASSERT_TRUE(staged.ok()) << staged.error().message;
   const auto observation = gate.Observe(scope);
-  EXPECT_EQ(observation.active_control_configurations,
-            ActiveConfigurations());
+  EXPECT_EQ(observation.active_control_configurations, ActiveConfigurations());
   EXPECT_TRUE(
       observation.route_published_active_control_configurations.empty());
   const core::ExpectedActiveControlConfigurationDTO absent{
@@ -609,8 +608,9 @@ TEST(ManagedKernelRouteFenceOwner,
       scope.resources, std::vector<core::DomainActiveControlConfigurationDTO>{},
       gate.shared_admission_mutex());
   gate.BindResourceTable(table);
-  ASSERT_TRUE(table->reconfigure_runtime_inventory(
-                       scope.resources, ActiveConfigurations(), {})
+  ASSERT_TRUE(table
+                  ->reconfigure_runtime_inventory(scope.resources,
+                                                  ActiveConfigurations(), {})
                   .ok());
   ManagedKernelApplyFenceOwner owner(fixture.Config("staged-route"), gate);
 
@@ -618,8 +618,7 @@ TEST(ManagedKernelRouteFenceOwner,
   query.expected_active_control_configuration = {
       core::ExpectedActiveControlConfigurationPresenceDTO::kAbsent,
       std::nullopt, std::nullopt};
-  const auto snapshot =
-      owner.ObserveRouteConfigurationFenceAdmission(query);
+  const auto snapshot = owner.ObserveRouteConfigurationFenceAdmission(query);
   ASSERT_TRUE(snapshot.ok()) << snapshot.error().message;
   EXPECT_EQ(snapshot.value().current_active_control_configuration,
             query.expected_active_control_configuration);
@@ -627,8 +626,8 @@ TEST(ManagedKernelRouteFenceOwner,
   const auto intent = RouteIntent(snapshot.value());
   const auto accepted = owner.AcquireRouteConfigurationFence(intent);
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
-  const auto held =
-      owner.ObserveRouteConfigurationFenceStatus(RouteStatusQuery(accepted.value()));
+  const auto held = owner.ObserveRouteConfigurationFenceStatus(
+      RouteStatusQuery(accepted.value()));
   ASSERT_TRUE(held.ok()) << held.error().message;
   EXPECT_EQ(held.value().evidence.current_active_control_configuration,
             query.expected_active_control_configuration);
@@ -840,8 +839,11 @@ TEST(ManagedKernelDisableFenceOwner,
       fixture.state_root.path() / "operation-journal.sqlite3",
       fixture.bundle->value().cell_graph.cell_id, 32U);
   core::RuntimeParticipantExecutionRegistration registration{
-      binding, std::nullopt, {}, core::MotionInterruptNodeCategory::kGeneric,
-      &engine, nullptr};
+      binding,      std::nullopt,
+      {},           core::MotionInterruptNodeCategory::kGeneric,
+      &engine,      nullptr,
+      std::nullopt, nullptr,
+      std::nullopt, std::nullopt};
   core::ResourceAddressedExecutionKernel kernel(
       {std::move(registration)}, clock, scheduler, journal,
       core::ResourceAddressedExecutionKernelConfig{

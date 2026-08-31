@@ -456,6 +456,37 @@ class ExecutableProgramRun:
             self._tree.tick()
             return self._tree.root.status
 
+    def reconcile_full_stop_tasks(self) -> tuple[int, int, int]:
+        """Observe only accepted Program-scope tasks while the tree is frozen.
+
+        The result is ``(active, held, unrecoverable)``. Repeating this after
+        one exact retry resolution consumes that resolution and exposes the
+        next parallel held task without ticking or submitting new work.
+        """
+
+        with self._lock:
+            active = 0
+            held = 0
+            unrecoverable = 0
+            for behaviour in self._tree.root.iterate():
+                reconcile = getattr(behaviour, "reconcile_full_stop_task", None)
+                if not callable(reconcile):
+                    continue
+                state = reconcile()
+                if state == "active":
+                    active += 1
+                elif state == "held":
+                    held += 1
+                elif state == "unrecoverable":
+                    unrecoverable += 1
+            return active, held, unrecoverable
+
+    @property
+    def operator_stop_held(self) -> bool:
+        """Whether an exact Program task still owns an operator Stop hold."""
+
+        return self._operator_stop_state.snapshot().held
+
     def terminal_failure(self) -> tuple[str, str]:
         """Return the exact focused-owner failure at a failed tree tip."""
 

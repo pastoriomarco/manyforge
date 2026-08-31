@@ -25,8 +25,9 @@ Generation-time source:
 - Repository: https://github.com/pastoriomarco/xarm_ros2
 - Branch: `jazzy_no_gazebo`
 - Commit: `012731afb9ef1d4289ec45112e8d083ab59a5c1e`
-- Generated at: `2026-06-26T11:45:56+00:00`
+- Generated at: `2026-08-30T16:20:59+00:00`
 - Semantic source: `xarm_moveit_config/srdf/_lite6_macro.srdf.xacro`
+- Model dynamics source: `xarm_moveit_config/config/lite6/joint_limits.yaml`
 - Arguments: `prefix=''`, `robot_type=lite`, `dof=6`, `add_gripper=true`,
   `limited=true`, `ros2_control_plugin=isaac`
 
@@ -42,8 +43,16 @@ Notes:
   `package://manyforge_example_models/models/lite6_lite_gripper/...`.
 - The canonical URDF preserves the expanded ManyMove runtime tags, including
   Gazebo, ros2_control, transmission, and mimic tags after package URI rewrite.
-- Arm joint limits are normalized to ManyMove's default Lite6
-  `limited=true` runtime bounds before qualification.
+- Arm position limits are normalized to ManyMove's default Lite6
+  `limited=true` runtime bounds. The MoveIt planning envelope is then combined
+  conservatively with the expanded URDF and materialized once in the owned
+  canonical URDF: `2.14` rad/s and `10.0` rad/s^2 for each arm
+  joint. The canonical document declares URDF 1.2 so independent consumers
+  recognize the standard acceleration attribute. The pinned raw MoveIt input is retained at:
+  `upstream_source/xarm_moveit_config/config/lite6/joint_limits.yaml`.
+  Historical native ManyForge
+  did not load that YAML directly; current lanes consume its normalized model
+  meaning through the same retained model adapter.
 - The xarm fixed base mesh link remains `link_base`; no `base_link` alias is
   inserted into the canonical model.
 - `STATIC_MANIFEST.json` records the generated URDF/SRDF/license/mesh file

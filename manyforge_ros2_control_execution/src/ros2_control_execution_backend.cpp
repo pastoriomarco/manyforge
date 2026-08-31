@@ -17,13 +17,14 @@
 #include <utility>
 
 #include <lifecycle_msgs/msg/state.hpp>
-#include <manyforge_core/motion_interrupt/soft_on_path_stop_planner.hpp>
 #include <manyforge_core/execution_stop_support.hpp>
+#include <manyforge_core/motion_interrupt/soft_on_path_stop_planner.hpp>
+#include <manyforge_core/motion_interrupt/stop_profile_mapper.hpp>
 #include <manyforge_core/trajectory/trajectory_sampler.hpp>
 #include <manyforge_core/types/error_code.hpp>
 
-#include "scene_projection_worker.hpp"
 #include "ros2_control_stop_qualification_probe.hpp"
+#include "scene_projection_worker.hpp"
 
 namespace manyforge::ros2_control_execution {
 
@@ -68,8 +69,7 @@ bool would_regress_settled_snapshot(
 }
 
 bool is_ascii_alpha(const char value) noexcept {
-  return (value >= 'A' && value <= 'Z') ||
-         (value >= 'a' && value <= 'z');
+  return (value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z');
 }
 
 bool is_ascii_digit(const char value) noexcept {
@@ -98,10 +98,10 @@ bool is_absolute_ros_namespace(const std::string_view value) noexcept {
   std::size_t token_begin = 1U;
   while (token_begin < value.size()) {
     const auto token_end = value.find('/', token_begin);
-    const auto token = value.substr(
-        token_begin, token_end == std::string_view::npos
-                         ? std::string_view::npos
-                         : token_end - token_begin);
+    const auto token =
+        value.substr(token_begin, token_end == std::string_view::npos
+                                      ? std::string_view::npos
+                                      : token_end - token_begin);
     if (!is_ros_name_token(token)) {
       return false;
     }
@@ -147,9 +147,9 @@ bool same_execution_environment(const DispatchAuthorityPin &expected,
              observed.execution_backend_component_epoch;
 }
 
-std::map<std::string, std::string> execution_environment_change_details(
-    const DispatchAuthorityPin &planning,
-    const DispatchAuthorityPin &dispatch) {
+std::map<std::string, std::string>
+execution_environment_change_details(const DispatchAuthorityPin &planning,
+                                     const DispatchAuthorityPin &dispatch) {
   std::map<std::string, std::string> details{
       {"phase", "planning_to_dispatch_environment_pin"},
       {"reason", "execution_environment_epoch_changed"},
@@ -162,13 +162,13 @@ std::map<std::string, std::string> execution_environment_change_details(
       {"dispatch_admission_snapshot_generation",
        std::to_string(dispatch.admission_snapshot_generation)}};
   std::string changed_dimensions;
-  const auto append_dimension = [&changed_dimensions](
-                                    const std::string_view dimension) {
-    if (!changed_dimensions.empty()) {
-      changed_dimensions.push_back(',');
-    }
-    changed_dimensions.append(dimension);
-  };
+  const auto append_dimension =
+      [&changed_dimensions](const std::string_view dimension) {
+        if (!changed_dimensions.empty()) {
+          changed_dimensions.push_back(',');
+        }
+        changed_dimensions.append(dimension);
+      };
   const auto append_string_change =
       [&details, &append_dimension](const std::string_view dimension,
                                     const std::string &planning_value,
@@ -409,12 +409,17 @@ unresolved_stop_stage_result(const core::ResolvedParticipantStopStageDTO &stage,
   const core::ErrorDTO error{
       std::move(code), std::move(message), {{"reason", std::move(reason)}}};
   core::ParticipantStopStageResultDTO result{
-      stage,        core::StopStageAttemptDispositionDTO::kNotDispatched,
-      outcome,      std::nullopt,
-      std::nullopt, std::nullopt,
-      std::nullopt, std::nullopt,
-      std::nullopt, 0,
-      {},           error};
+      stage,
+      core::StopStageAttemptDispositionDTO::kNotDispatched,
+      outcome,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      0,
+      {},
+      error};
   if (stage.stage_index >= stage.participant_stop_plan.stage_commands.size()) {
     return result;
   }
@@ -582,10 +587,10 @@ Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
     std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
     std::string group_name, core::IClock &clock, core::IScheduler &scheduler,
     Ros2ControlExecutionBackendConfig config)
-    : Ros2ControlExecutionBackend(
-          true, &addressed_state_publication, {},
-          std::move(execution_state_sink), std::move(group_name), clock,
-          scheduler, std::move(config)) {}
+    : Ros2ControlExecutionBackend(true, &addressed_state_publication, {},
+                                  std::move(execution_state_sink),
+                                  std::move(group_name), clock, scheduler,
+                                  std::move(config)) {}
 
 Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
     bool defer_ros_executor_start,
@@ -596,9 +601,8 @@ Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
     Ros2ControlExecutionBackendConfig config)
     : execution_state_sink_(std::move(execution_state_sink)),
       group_name_(std::move(group_name)), clock_(clock), scheduler_(scheduler),
-      config_(std::move(config)),
-      execution_backend_component_epoch_(
-          new_component_epoch("execution-backend")),
+      config_(std::move(config)), execution_backend_component_epoch_(
+                                      new_component_epoch("execution-backend")),
       addressed_state_writer_(std::move(addressed_state_writer)) {
   if (!execution_state_sink_) {
     throw std::invalid_argument("execution state sink must not be null");
@@ -935,9 +939,10 @@ core::PrepareParticipantResultDTO Ros2ControlExecutionBackend::Prepare(
           return !binding_error(alias).has_value();
         });
     if (matched == aliases->end()) {
-      field_error = core::prepared_participant_backend_physical_binding_field_error(
-          participant, *retained_binding,
-          core::PreparedParticipantPayloadKindDTO::kMotionExecution);
+      field_error =
+          core::prepared_participant_backend_physical_binding_field_error(
+              participant, *retained_binding,
+              core::PreparedParticipantPayloadKindDTO::kMotionExecution);
       if (field_error.has_value()) {
         return reject(std::string(*field_error));
       }
@@ -1018,9 +1023,10 @@ core::ExecutionHandle Ros2ControlExecutionBackend::dispatch_prepared(
           return !binding_error(alias).has_value();
         });
     if (matched == aliases->end()) {
-      field_error = core::prepared_participant_backend_physical_binding_field_error(
-          participant, *retained_binding,
-          core::PreparedParticipantPayloadKindDTO::kMotionExecution);
+      field_error =
+          core::prepared_participant_backend_physical_binding_field_error(
+              participant, *retained_binding,
+              core::PreparedParticipantPayloadKindDTO::kMotionExecution);
       if (field_error.has_value()) {
         return rejected(std::string(*field_error));
       }
@@ -1057,6 +1063,9 @@ core::ExecutionHandle Ros2ControlExecutionBackend::dispatch_prepared(
   handle.prepared_contract_digest = participant.prepared_contract_digest;
   std::vector<core::PreparedParticipantStopPlanDTO> stop_plans;
   stop_plans.push_back(participant.ordinary_stop_plan);
+  if (participant.fault_stop_plan.has_value()) {
+    stop_plans.push_back(*participant.fault_stop_plan);
+  }
   for (const auto &scope :
        std::get<core::PreparedMotionExecutionDTO>(participant.payload)
            .interrupt_scopes) {
@@ -1323,11 +1332,10 @@ void Ros2ControlExecutionBackend::publish_observed_robot_state(
     ordered_positions = &remapped_positions;
     ordered_velocities = &remapped_velocities;
   }
-  if (publication == observed_state_publication_ &&
-      addressed_state_writer_) {
-    (void)publish_addressed_state(
-        source, config_.required_joints, *ordered_positions,
-        *ordered_velocities, source_timestamp_ns, received_timestamp_ns);
+  if (publication == observed_state_publication_ && addressed_state_writer_) {
+    (void)publish_addressed_state(source, config_.required_joints,
+                                  *ordered_positions, *ordered_velocities,
+                                  source_timestamp_ns, received_timestamp_ns);
   } else {
     (void)publication->publish(source, config_.required_joints,
                                *ordered_positions, *ordered_velocities,
@@ -1345,9 +1353,9 @@ Ros2ControlExecutionBackend::publish_addressed_state(
     const std::int64_t received_timestamp_ns) noexcept {
   if (addressed_state_writer_) {
     try {
-      return addressed_state_writer_(
-          source, source_joint_names, positions, velocities,
-          source_timestamp_ns, received_timestamp_ns);
+      return addressed_state_writer_(source, source_joint_names, positions,
+                                     velocities, source_timestamp_ns,
+                                     received_timestamp_ns);
     } catch (...) {
       return {false, false, false, 0, "addressed_state_writer_failed"};
     }
@@ -1423,9 +1431,9 @@ Ros2ControlExecutionBackend::publish_authored_robot_state(
         const auto previous = authored_active_last_publication_ns_.exchange(
             received_timestamp_ns, std::memory_order_acq_rel);
         if (previous > 0 && received_timestamp_ns >= previous) {
-          atomic_max(authored_active_interarrival_max_ns_,
-                     static_cast<std::uint64_t>(received_timestamp_ns -
-                                                previous));
+          atomic_max(
+              authored_active_interarrival_max_ns_,
+              static_cast<std::uint64_t>(received_timestamp_ns - previous));
         }
       }
       if (invalidate_before_publish) {
@@ -1449,8 +1457,8 @@ void Ros2ControlExecutionBackend::initialize_ros() {
   context_->init(argc, argv);
   rclcpp::NodeOptions options;
   options.context(context_);
-  node_ = std::make_shared<rclcpp::Node>(
-      config_.node_name, config_.node_namespace, options);
+  node_ = std::make_shared<rclcpp::Node>(config_.node_name,
+                                         config_.node_namespace, options);
 
   action_callback_group_ = node_->create_callback_group(
       rclcpp::CallbackGroupType::MutuallyExclusive);
@@ -2670,8 +2678,7 @@ bool Ros2ControlExecutionBackend::end_controlled_stop_runtime_scale_freeze() {
   return applied_deferred_scale;
 }
 
-core::Result<void>
-Ros2ControlExecutionBackend::command_sim_initial_state(
+core::Result<void> Ros2ControlExecutionBackend::command_sim_initial_state(
     std::string phase, const bool only_if_gate_closed) {
   if (!is_commanded_sim_mode()) {
     return core::Result<void>::Ok();
@@ -3778,9 +3785,9 @@ bool Ros2ControlExecutionBackend::publish_snapshot(
     }
     const auto publication_generation = expected_running_generation.value_or(
         running_generation_.load(std::memory_order_acquire));
-    if (would_regress_settled_snapshot(
-            state, snapshot_.state, publication_generation,
-            snapshot_execution_generation_)) {
+    if (would_regress_settled_snapshot(state, snapshot_.state,
+                                       publication_generation,
+                                       snapshot_execution_generation_)) {
       return false;
     }
     snapshot_.timestamp_ns = now_ns;
@@ -3907,9 +3914,9 @@ bool Ros2ControlExecutionBackend::publish_observed_snapshot(
       expected_running_generation) {
     return false;
   }
-  if (would_regress_settled_snapshot(
-          state, snapshot_.state, expected_running_generation,
-          snapshot_execution_generation_)) {
+  if (would_regress_settled_snapshot(state, snapshot_.state,
+                                     expected_running_generation,
+                                     snapshot_execution_generation_)) {
     return false;
   }
   if (snapshot_.state_source == "observed_ros2" &&
@@ -3941,9 +3948,9 @@ bool Ros2ControlExecutionBackend::publish_observed_metadata(
       expected_running_generation) {
     return false;
   }
-  if (would_regress_settled_snapshot(
-          state, snapshot_.state, expected_running_generation,
-          snapshot_execution_generation_)) {
+  if (would_regress_settled_snapshot(state, snapshot_.state,
+                                     expected_running_generation,
+                                     snapshot_execution_generation_)) {
     return false;
   }
   snapshot_.timestamp_ns = clock_.now();
@@ -4005,8 +4012,7 @@ bool Ros2ControlExecutionBackend::complete_forced_managed_stop_execution(
     terminal_snapshot = get_execution_snapshot();
     terminal_ = true;
     set_running_locked(false);
-    terminal_generation =
-        running_generation_.load(std::memory_order_acquire);
+    terminal_generation = running_generation_.load(std::memory_order_acquire);
     stop_requested_ = false;
     natural_completion_stop_requested_ = false;
     pause_requested_ = false;
@@ -4024,9 +4030,9 @@ bool Ros2ControlExecutionBackend::complete_forced_managed_stop_execution(
           "commanded_sim_forced_managed_stop", terminal_generation,
           SnapshotPublicationAuthority::kBackendAuthored);
     } else {
-      (void)publish_observed_metadata(
-          core::ExecutionState::kStopped, terminal_snapshot.progress,
-          std::nullopt, terminal_generation);
+      (void)publish_observed_metadata(core::ExecutionState::kStopped,
+                                      terminal_snapshot.progress, std::nullopt,
+                                      terminal_generation);
     }
   }
   if (!terminal_snapshot.joint_positions_rad.empty()) {
@@ -5496,13 +5502,13 @@ core::ExecutionHandle Ros2ControlExecutionBackend::execute_trajectory(
                                      *decision.pin))) {
       execution_admission_dispatch_rejections_total_.fetch_add(
           1, std::memory_order_relaxed);
-      auto details = planning_environment_authority_.has_value()
-                         ? execution_environment_change_details(
-                               *planning_environment_authority_, *decision.pin)
-                         : std::map<std::string, std::string>{
-                               {"phase",
-                                "planning_to_dispatch_environment_pin"},
-                               {"reason", "planning_environment_pin_missing"}};
+      auto details =
+          planning_environment_authority_.has_value()
+              ? execution_environment_change_details(
+                    *planning_environment_authority_, *decision.pin)
+              : std::map<std::string, std::string>{
+                    {"phase", "planning_to_dispatch_environment_pin"},
+                    {"reason", "planning_environment_pin_missing"}};
       fail_execution(
           "Execution environment changed between planning and dispatch",
           core::ErrorCode::kExecutionRejected,
@@ -6153,8 +6159,7 @@ core::StopResultDTO Ros2ControlExecutionBackend::stop() {
 void Ros2ControlExecutionBackend::observe_stop_qualification(
     const detail::Ros2ControlStopQualificationEvent event,
     const std::string_view detail_text) const {
-  auto *const probe =
-      stop_qualification_probe_.load(std::memory_order_acquire);
+  auto *const probe = stop_qualification_probe_.load(std::memory_order_acquire);
   if (probe != nullptr) {
     probe->observe(event, detail_text);
   }
@@ -6273,6 +6278,7 @@ Ros2ControlExecutionBackend::TranslateStopStage(
     const core::RemainingStopBudgetDTO &budget,
     const std::stop_token cancellation) {
   const auto started_at = clock_.now();
+  const auto steady_started_at = std::chrono::steady_clock::now();
   if (cancellation.stop_requested()) {
     return unresolved_stop_stage_result(
         stage, core::ParticipantStopStageOutcomeDTO::kSupersededNoEffect,
@@ -6290,9 +6296,8 @@ Ros2ControlExecutionBackend::TranslateStopStage(
   };
   const auto remaining_phase = [&](const core::StopBudgetPhaseId &phase_id) {
     const auto found = std::find_if(
-        budget.phases.begin(), budget.phases.end(), [&](const auto &phase) {
-          return phase.phase_id == phase_id;
-        });
+        budget.phases.begin(), budget.phases.end(),
+        [&](const auto &phase) { return phase.phase_id == phase_id; });
     return found == budget.phases.end()
                ? std::optional<std::int64_t>{}
                : std::optional(found->remaining_deadline_offset_ns);
@@ -6309,16 +6314,17 @@ Ros2ControlExecutionBackend::TranslateStopStage(
 
   const auto retained_binding =
       prepared_participant_binding_.load(std::memory_order_acquire);
-  if (!retained_binding || !retained_binding->value().control_path.has_value()) {
+  if (!retained_binding ||
+      !retained_binding->value().control_path.has_value()) {
     return failure_before_effect(
         "resolved_stop_stage_binding_unavailable",
         "ros2_control Stop stage has no retained execution binding");
   }
   const auto &binding = retained_binding->value();
   const auto &path = *binding.control_path;
-  const auto &command =
-      stage.participant_stop_plan.stage_commands[stage.stage_index]
-          .resolved_stage;
+  const auto &prepared_command =
+      stage.participant_stop_plan.stage_commands[stage.stage_index];
+  const auto &command = prepared_command.resolved_stage;
   const auto command_remaining =
       remaining_phase(command.containment_command.command_phase_id);
   std::vector<core::ResourceId> exact_resources;
@@ -6355,8 +6361,7 @@ Ros2ControlExecutionBackend::TranslateStopStage(
           path.provider_manifest_id ||
       command.command_target.provider_manifest_revision !=
           path.provider_manifest_revision ||
-      command.command_target.runtime_unit_id !=
-          path.provider_runtime_unit_id ||
+      command.command_target.runtime_unit_id != path.provider_runtime_unit_id ||
       command.command_target.provider_runtime_epoch !=
           path.provider_runtime_epoch ||
       !command_remaining.has_value() || *command_remaining <= 0) {
@@ -6393,7 +6398,8 @@ Ros2ControlExecutionBackend::TranslateStopStage(
       prepared_goal->control_domain_id == stage.control_domain_id &&
       prepared_goal->control_domain_revision == stage.control_domain_revision &&
       prepared_goal->control_binding_id == stage.control_binding_id &&
-      prepared_goal->control_binding_revision == stage.control_binding_revision &&
+      prepared_goal->control_binding_revision ==
+          stage.control_binding_revision &&
       prepared_goal->controller_topology_id == stage.controller_topology_id &&
       prepared_goal->topology_revision == stage.topology_revision &&
       prepared_goal->control_route_id == stage.control_route_id &&
@@ -6401,17 +6407,14 @@ Ros2ControlExecutionBackend::TranslateStopStage(
           stage.active_control_configuration_id &&
       prepared_goal->active_control_configuration_generation ==
           stage.active_control_configuration_generation &&
-      prepared_goal->provider_runtime_epoch ==
-          stage.provider_runtime_epoch &&
+      prepared_goal->provider_runtime_epoch == stage.provider_runtime_epoch &&
       prepared_goal->resources == stage.resources &&
-      prepared_goal->stop_evidence_policy_id ==
-          stage.stop_evidence_policy_id &&
+      prepared_goal->stop_evidence_policy_id == stage.stop_evidence_policy_id &&
       prepared_goal->stop_evidence_policy_revision ==
           stage.stop_evidence_policy_revision &&
       std::find(prepared_goal->stop_plans.begin(),
                 prepared_goal->stop_plans.end(),
-                stage.participant_stop_plan) !=
-          prepared_goal->stop_plans.end();
+                stage.participant_stop_plan) != prepared_goal->stop_plans.end();
   if (!exact_participant) {
     return failure_before_effect(
         "resolved_stop_stage_dispatch_membership_mismatch",
@@ -6427,20 +6430,58 @@ Ros2ControlExecutionBackend::TranslateStopStage(
       command.containment_command.registered_command_kind_id.has_value() &&
       command.containment_command.registered_command_kind_id->value() ==
           "manyforge.stop.software_hard";
-  if (!controller_goal_cancel && !software_hard) {
+  const bool motion_controlled_stop =
+      command.containment_command.command_kind ==
+      core::StopContainmentCommandKind::kMotionControlledStop;
+  if (!controller_goal_cancel && !motion_controlled_stop && !software_hard) {
     return failure_before_effect(
         "resolved_stop_command_not_supported",
-        "ros2_control exact Stop port supports controller-goal cancel and "
-        "its retained software-hard command");
+        "ros2_control exact Stop port supports controlled arm Stop, "
+        "controller-goal cancel, and retained software-hard Stop");
+  }
+
+  std::optional<core::MotionInterruptStopProfileDTO> controlled_profile;
+  if (motion_controlled_stop) {
+    const auto &contract = command.containment_command.provider_contract_ref;
+    if (!contract.has_value() ||
+        contract->contract_schema_id.value() !=
+            core::kMotionControlledStopContractSchemaId ||
+        contract->contract_schema_revision.value() !=
+            core::kMotionControlledStopContractSchemaRevision ||
+        !prepared_command.validated_contract_parameters.has_value() ||
+        !prepared_command.parameter_source.has_value()) {
+      return failure_before_effect(
+          "motion_controlled_stop_contract_invalid",
+          "ros2_control controlled Stop has no exact prepared contract");
+    }
+    std::string profile_id = "operator_soft_on_path";
+    if (*prepared_command.parameter_source ==
+        core::StopStageParameterSourceDTO::kParticipantProfileMapping) {
+      if (!stage.participant_stop_plan.participant_stop_profile.has_value()) {
+        return failure_before_effect(
+            "motion_controlled_stop_profile_missing",
+            "ros2_control controlled Stop has no prepared participant profile");
+      }
+      profile_id =
+          stage.participant_stop_plan.participant_stop_profile->profile_id;
+    }
+    auto decoded =
+        core::map_motion_controlled_stop_contract_parameters_to_profile(
+            *prepared_command.validated_contract_parameters, binding.resources,
+            profile_id);
+    if (!decoded.ok()) {
+      return failure_before_effect(decoded.error().details.at("reason"),
+                                   decoded.error().message);
+    }
+    controlled_profile = std::move(decoded.value());
   }
 
   const auto dispatch_generation = prepared_goal->handle.execution_generation;
   const auto current_generation =
       running_generation_.load(std::memory_order_acquire);
-  const bool execution_running =
-      running_flag_.load(std::memory_order_acquire);
-  if (dispatch_generation == 0U ||
-      current_generation != dispatch_generation || !execution_running) {
+  const bool execution_running = running_flag_.load(std::memory_order_acquire);
+  if (dispatch_generation == 0U || current_generation != dispatch_generation ||
+      !execution_running) {
     auto failure = failure_before_effect(
         "prepared_goal_not_active",
         "ros2_control prepared goal no longer owns the active execution");
@@ -6462,18 +6503,6 @@ Ros2ControlExecutionBackend::TranslateStopStage(
         "stop_stage_superseded_before_dispatch");
   }
 
-  const auto stopped =
-      stop_if_running_generation(dispatch_generation, software_hard);
-  if (!stopped.accepted) {
-    const auto reason = stopped.error.has_value() &&
-                                stopped.error->details.contains("reason")
-                            ? stopped.error->details.at("reason")
-                            : "stop_command_not_dispatched";
-    return failure_before_effect(
-        reason, stopped.error.has_value()
-                    ? stopped.error->message
-                    : "ros2_control Stop command was not accepted");
-  }
   core::ParticipantStopStageResultDTO result{
       stage,
       core::StopStageAttemptDispositionDTO::kDispatched,
@@ -6483,32 +6512,101 @@ Ros2ControlExecutionBackend::TranslateStopStage(
       std::nullopt,
       std::nullopt,
       std::nullopt,
-      std::nullopt,
       0,
       {},
       std::nullopt};
-  const auto fail_after_dispatch = [&](std::string reason,
-                                       std::string message) {
-    result.receiver_elapsed_duration_ns =
-        std::max<std::int64_t>(0, clock_.now() - started_at);
-    result.error = core::ErrorDTO{
-        std::string(core::kErrorMotionInterruptBackendStopFailed),
-        std::move(message), {{"reason", std::move(reason)}}};
-    result.evidence_items.clear();
-    result.evidence_items.reserve(command.evidence_requirements.size());
-    for (const auto &requirement : command.evidence_requirements) {
-      result.evidence_items.push_back(core::StopEvidenceItemDTO{
-          requirement.requirement.evidence_item_id,
-          requirement.requirement.evidence_kind,
-          core::StopEvidenceItemStateDTO::kMissing,
-          requirement.resolved_source,
-          std::nullopt,
-          std::nullopt,
-          std::nullopt,
-          std::nullopt,
-          result.error});
+  const auto fail_after_dispatch =
+      [&](std::string reason, std::string message,
+          std::map<std::string, std::string> details = {}) {
+        result.receiver_elapsed_duration_ns =
+            std::max<std::int64_t>(0, clock_.now() - started_at);
+        details.insert_or_assign("reason", std::move(reason));
+        result.error = core::ErrorDTO{
+            std::string(core::kErrorMotionInterruptBackendStopFailed),
+            std::move(message), std::move(details)};
+        result.evidence_items.clear();
+        result.evidence_items.reserve(command.evidence_requirements.size());
+        for (const auto &requirement : command.evidence_requirements) {
+          result.evidence_items.push_back(core::StopEvidenceItemDTO{
+              requirement.requirement.evidence_item_id,
+              requirement.requirement.evidence_kind,
+              core::StopEvidenceItemStateDTO::kMissing,
+              requirement.resolved_source, std::nullopt, std::nullopt,
+              std::nullopt, std::nullopt, result.error});
+        }
+        return result;
+      };
+
+  std::optional<core::ControlledStopResultDTO> controlled_outcome;
+  if (motion_controlled_stop) {
+    controlled_outcome =
+        execute_controlled_stop(*controlled_profile, cancellation);
+    if (const auto invalid = core::controlled_stop_result_field_error(
+            *controlled_profile, *controlled_outcome);
+        invalid.has_value()) {
+      return fail_after_dispatch(
+          "motion_controlled_stop_result_invalid",
+          "ros2_control controlled Stop returned an invalid result: " +
+              *invalid);
     }
-    return result;
+    if (!controlled_outcome->accepted) {
+      result.attempt_disposition =
+          core::StopStageAttemptDispositionDTO::kNotDispatched;
+      return fail_after_dispatch(
+          controlled_outcome->error.has_value() &&
+                  controlled_outcome->error->details.contains("reason")
+              ? controlled_outcome->error->details.at("reason")
+              : "motion_controlled_stop_not_dispatched",
+          controlled_outcome->error.has_value()
+              ? controlled_outcome->error->message
+              : "ros2_control controlled Stop was not accepted",
+          controlled_outcome->error.has_value()
+              ? controlled_outcome->error->details
+              : std::map<std::string, std::string>{});
+    }
+    result.actual_provider_contract_mode = core::provider_contract_stop_mode(
+        controlled_outcome->executed_stop_mode);
+    if (controlled_outcome->executed_stop_mode !=
+        controlled_profile->stop_mode) {
+      result.recoverable_substitution_reason =
+          controlled_outcome->fallback_reason;
+    }
+    if (!controlled_outcome->backend_stop_confirmed) {
+      return fail_after_dispatch(
+          controlled_outcome->error.has_value() &&
+                  controlled_outcome->error->details.contains("reason")
+              ? controlled_outcome->error->details.at("reason")
+              : "motion_controlled_stop_not_confirmed",
+          controlled_outcome->error.has_value()
+              ? controlled_outcome->error->message
+              : "ros2_control controlled Stop was not confirmed",
+          controlled_outcome->error.has_value()
+              ? controlled_outcome->error->details
+              : std::map<std::string, std::string>{});
+    }
+  } else {
+    const auto stopped =
+        stop_if_running_generation(dispatch_generation, software_hard);
+    if (!stopped.accepted) {
+      const auto reason =
+          stopped.error.has_value() && stopped.error->details.contains("reason")
+              ? stopped.error->details.at("reason")
+              : "stop_command_not_dispatched";
+      return failure_before_effect(
+          reason, stopped.error.has_value()
+                      ? stopped.error->message
+                      : "ros2_control Stop command was not accepted");
+    }
+  }
+
+  const auto stage_evidence = [&]() -> core::JsonValueDTO {
+    if (!controlled_outcome.has_value()) {
+      return core::JsonValueDTO{true};
+    }
+    return core::motion_controlled_stop_evidence(
+        *controlled_profile, *controlled_outcome,
+        stage.stop_evidence_policy_revision.value(),
+        core::to_string(*prepared_command.parameter_source));
   };
 
   if (command.evidence_requirements.empty()) {
@@ -6528,14 +6626,19 @@ Ros2ControlExecutionBackend::TranslateStopStage(
     evidence_remaining_ns = std::min(evidence_remaining_ns, *phase);
     minimum_dwell_ns = std::max(
         minimum_dwell_ns,
-        requirement.requirement.observation_semantics.minimum_dwell_ns
-            .value_or(0));
+        requirement.requirement.observation_semantics.minimum_dwell_ns.value_or(
+            0));
   }
-  if (evidence_remaining_ns <= 0) {
+  const auto receiver_elapsed =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - steady_started_at)
+          .count();
+  if (evidence_remaining_ns <= receiver_elapsed) {
     return fail_after_dispatch(
         "stop_evidence_phase_expired",
         "ros2_control Stop evidence has no remaining receiver budget");
   }
+  evidence_remaining_ns -= receiver_elapsed;
 
   const auto evidence_started_at = std::chrono::steady_clock::now();
   const auto evidence_deadline =
@@ -6596,8 +6699,7 @@ Ros2ControlExecutionBackend::TranslateStopStage(
           requirement.resolved_source.runtime_target.provider_runtime_epoch !=
               path.provider_runtime_epoch ||
           source_age_ns >
-              requirement.requirement.source_requirement
-                  .freshness_budget_ns) {
+              requirement.requirement.source_requirement.freshness_budget_ns) {
         return fail_after_dispatch(
             "stop_evidence_source_mismatch",
             "ros2_control goal-terminal evidence differs from the retained "
@@ -6607,11 +6709,8 @@ Ros2ControlExecutionBackend::TranslateStopStage(
           requirement.requirement.evidence_item_id,
           requirement.requirement.evidence_kind,
           core::StopEvidenceItemStateDTO::kSatisfied,
-          requirement.resolved_source,
-          path.provider_runtime_epoch,
-          terminal_snapshot.sequence_number,
-          source_age_ns,
-          core::JsonValueDTO{true},
+          requirement.resolved_source, path.provider_runtime_epoch,
+          terminal_snapshot.sequence_number, source_age_ns, stage_evidence(),
           std::nullopt});
     }
     result.controller_acknowledgement_sequence =
@@ -6636,24 +6735,46 @@ Ros2ControlExecutionBackend::TranslateStopStage(
       auto observed = observed_state_publication_->acquire(now_ns);
       bool exact_rest = false;
       if (observed && observed.complete() && observed.velocities_complete() &&
-          std::equal(observed.joint_names().begin(),
-                     observed.joint_names().end(),
-                     config_.required_joints.begin(),
-                     config_.required_joints.end()) &&
+          std::equal(
+              observed.joint_names().begin(), observed.joint_names().end(),
+              config_.required_joints.begin(), config_.required_joints.end()) &&
           observed.received_timestamp_ns() <= now_ns) {
         const auto expected_profile =
             path.state_authority_class == core::StateAuthorityClass::kMeasured
                 ? core::ObservedRobotStateAuthorityProfile::kMeasured
                 : core::ObservedRobotStateAuthorityProfile::
                       kCommandedSimulation;
-        exact_rest = observed.authority_profile() == expected_profile &&
-                     std::all_of(observed.velocities_rad_s().begin(),
-                                 observed.velocities_rad_s().end(),
-                                 [](double velocity) {
-                                   return std::isfinite(velocity) &&
-                                          std::abs(velocity) <=
-                                              core::kDefaultSettleVelocityThresholdRadS;
-                                 });
+        exact_rest = observed.authority_profile() == expected_profile;
+        for (std::size_t index = 0U;
+             exact_rest && index < observed.velocities_rad_s().size();
+             ++index) {
+          double threshold = core::kDefaultSettleVelocityThresholdRadS;
+          if (controlled_profile.has_value()) {
+            if (!controlled_profile->per_joint_settle_velocity_threshold
+                     .has_value() ||
+                index >= config_.required_joints.size()) {
+              exact_rest = false;
+              break;
+            }
+            const auto configured =
+                controlled_profile->per_joint_settle_velocity_threshold->find(
+                    config_.required_joints[index]);
+            const auto *angular =
+                configured == controlled_profile
+                                  ->per_joint_settle_velocity_threshold->end()
+                    ? nullptr
+                    : std::get_if<core::AngularVelocityDTO>(
+                          &configured->second);
+            if (angular == nullptr) {
+              exact_rest = false;
+              break;
+            }
+            threshold = angular->value_rad_s;
+          }
+          const auto velocity = observed.velocities_rad_s()[index];
+          exact_rest =
+              std::isfinite(velocity) && std::abs(velocity) <= threshold;
+        }
         if (exact_rest) {
           if (!rest_tracking) {
             rest_started_at = std::chrono::steady_clock::now();
@@ -6671,8 +6792,8 @@ Ros2ControlExecutionBackend::TranslateStopStage(
                      std::chrono::nanoseconds(minimum_dwell_ns)) {
         break;
       }
-      const auto remaining = evidence_deadline -
-                             std::chrono::steady_clock::now();
+      const auto remaining =
+          evidence_deadline - std::chrono::steady_clock::now();
       if (remaining <= std::chrono::steady_clock::duration::zero()) {
         break;
       }
@@ -6690,8 +6811,8 @@ Ros2ControlExecutionBackend::TranslateStopStage(
     }
 
     const auto now_ns = clock_.now();
-    const auto source_age_ns = std::max<std::int64_t>(
-        0, now_ns - rest->received_timestamp_ns);
+    const auto source_age_ns =
+        std::max<std::int64_t>(0, now_ns - rest->received_timestamp_ns);
     result.evidence_items.reserve(command.evidence_requirements.size());
     for (const auto &requirement : command.evidence_requirements) {
       if (requirement.requirement.evidence_kind !=
@@ -6705,8 +6826,7 @@ Ros2ControlExecutionBackend::TranslateStopStage(
           requirement.resolved_source.state_authority_class !=
               std::optional(path.state_authority_class) ||
           source_age_ns >
-              requirement.requirement.source_requirement
-                  .freshness_budget_ns) {
+              requirement.requirement.source_requirement.freshness_budget_ns) {
         return fail_after_dispatch(
             "stop_evidence_source_mismatch",
             "ros2_control rest evidence differs from the retained state "
@@ -6716,12 +6836,8 @@ Ros2ControlExecutionBackend::TranslateStopStage(
           requirement.requirement.evidence_item_id,
           requirement.requirement.evidence_kind,
           core::StopEvidenceItemStateDTO::kSatisfied,
-          requirement.resolved_source,
-          path.provider_runtime_epoch,
-          rest->sequence,
-          source_age_ns,
-          core::JsonValueDTO{true},
-          std::nullopt});
+          requirement.resolved_source, path.provider_runtime_epoch,
+          rest->sequence, source_age_ns, stage_evidence(), std::nullopt});
     }
     result.source_epoch = path.provider_runtime_epoch;
     result.source_sequence = rest->sequence;
@@ -6741,6 +6857,34 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
 
 core::ControlledStopResultDTO
 Ros2ControlExecutionBackend::execute_controlled_stop(
+    const core::MotionInterruptStopProfileDTO &profile,
+    std::stop_token stop_token) {
+  if (config_.prepared_participant_binding.has_value()) {
+    auto projected =
+        core::project_motion_interrupt_stop_profile_to_compiled_resources(
+            profile, config_.prepared_participant_binding->value().resources);
+    if (!projected.ok()) {
+      core::ControlledStopResultDTO rejected;
+      rejected.executed_stop_mode = profile.stop_mode;
+      rejected.accepted = false;
+      rejected.backend_stop_confirmed = false;
+      auto details = projected.error().details;
+      details.emplace("projection_error_code", projected.error().code);
+      rejected.error = core::ErrorDTO{
+          std::string(core::kErrorMotionInterruptBackendStopFailed),
+          "ros2_control controlled Stop could not project its portable joint "
+          "scope: " +
+              projected.error().message,
+          std::move(details)};
+      return rejected;
+    }
+    return execute_controlled_stop_impl(projected.value(), stop_token);
+  }
+  return execute_controlled_stop_impl(profile, stop_token);
+}
+
+core::ControlledStopResultDTO
+Ros2ControlExecutionBackend::execute_controlled_stop_impl(
     const core::MotionInterruptStopProfileDTO &profile,
     std::stop_token stop_token) {
   observe_stop_qualification(
@@ -6958,7 +7102,7 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
             core::motion_interrupt_deceleration_time_or_default(
                 substituted_profile);
         auto substituted =
-            execute_controlled_stop(substituted_profile, stop_token);
+            execute_controlled_stop_impl(substituted_profile, stop_token);
         substituted.executed_stop_mode =
             core::MotionInterruptStopMode::kSpringBackHold;
         substituted.fallback_reason = reason;
@@ -8675,8 +8819,7 @@ void Ros2ControlExecutionBackend::configure_gripper_action(
                 if (!runtime || !msg) {
                   return;
                 }
-                const auto &observed_joint =
-                    runtime->config.state_joint_name;
+                const auto &observed_joint = runtime->config.state_joint_name;
                 if (observed_joint.empty()) {
                   return;
                 }
@@ -10327,16 +10470,14 @@ void Ros2ControlExecutionBackend::on_managed_fjt_terminal_result(
     }
     if (forced_managed_stop_generation_ == generation &&
         forced_managed_stop_execution_generation_.has_value()) {
-      forced_execution_generation =
-          forced_managed_stop_execution_generation_;
+      forced_execution_generation = forced_managed_stop_execution_generation_;
     }
     forced_managed_stop_execution_generation_.reset();
     forced_managed_stop_generation_.reset();
     managed_fjt_cv_.notify_all();
   }
   if (forced_execution_generation.has_value()) {
-    (void)complete_forced_managed_stop_execution(
-        *forced_execution_generation);
+    (void)complete_forced_managed_stop_execution(*forced_execution_generation);
   }
 }
 

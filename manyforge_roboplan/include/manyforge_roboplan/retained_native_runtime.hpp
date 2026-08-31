@@ -48,7 +48,8 @@ struct RetainedNativeRuntimeConfig final {
   /// Process-owned monitoring policy. Public operation/caller payloads never
   /// select or override these cadences.
   std::optional<core::StopSurveillancePolicyDTO> stop_surveillance_policy;
-  core::CellAdmissionInterventionValidator cell_admission_intervention_validator;
+  core::CellAdmissionInterventionValidator
+      cell_admission_intervention_validator;
   core::CellAdmissionSettlementValidator cell_admission_settlement_validator;
   core::CellAdmissionReconcileValidator cell_admission_reconcile_validator;
   std::optional<core::ManagerLivenessRequiredSetDTO>
@@ -66,22 +67,21 @@ struct RetainedNativeAddressedOwnerConfig final {
   core::IResourceOperationAdmissionGate *operation_admission_gate{};
   core::GraphRevision graph_revision;
   std::optional<core::StopDeadlineBudgetDTO> cell_stop_deadline_budget;
-  core::CellAdmissionInterventionValidator cell_admission_intervention_validator;
+  core::CellAdmissionInterventionValidator
+      cell_admission_intervention_validator;
   core::CellAdmissionSettlementValidator cell_admission_settlement_validator;
   core::CellAdmissionReconcileValidator cell_admission_reconcile_validator;
   std::optional<core::ManagerLivenessRequiredSetDTO>
       manager_liveness_required_set;
 };
 
-using RetainedMotionBackendRouteRebinder =
-    std::function<core::Result<void>(
-        core::RuntimeParticipantBinding,
-        std::vector<core::RuntimeParticipantBinding>)>;
+using RetainedMotionBackendRouteRebinder = std::function<core::Result<void>(
+    core::RuntimeParticipantBinding,
+    std::vector<core::RuntimeParticipantBinding>)>;
 
-using RetainedGripperBackendRouteRebinder =
-    std::function<core::Result<void>(
-        core::RuntimeParticipantBinding,
-        std::shared_ptr<IRetainedObservedStateChannel>)>;
+using RetainedGripperBackendRouteRebinder = std::function<core::Result<void>(
+    core::RuntimeParticipantBinding,
+    std::shared_ptr<IRetainedObservedStateChannel>)>;
 
 /// One exact execution adapter set selected by a retained runtime product.
 /// The two interface pointers may alias the same dual-role adapter; shared
@@ -94,13 +94,12 @@ struct RetainedRuntimeBackendSet final {
   RetainedGripperBackendRouteRebinder rebind_gripper_route;
 };
 
-using RetainedRuntimeBackendFactory =
-    std::function<RetainedRuntimeBackendSet(
-        const core::RuntimeParticipantBinding &,
-        const std::optional<core::RuntimeParticipantBinding> &,
-        const std::shared_ptr<RetainedObservedStateChannel> &,
-        const std::shared_ptr<RetainedObservedStateChannel> &, core::IClock &,
-        core::IScheduler &)>;
+using RetainedRuntimeBackendFactory = std::function<RetainedRuntimeBackendSet(
+    const core::RuntimeParticipantBinding &,
+    const std::optional<core::RuntimeParticipantBinding> &,
+    const std::shared_ptr<RetainedObservedStateChannel> &,
+    const std::shared_ptr<RetainedObservedStateChannel> &, core::IClock &,
+    core::IScheduler &)>;
 
 using RetainedReferenceResolverFactory =
     std::function<std::shared_ptr<core::IReferencePoseResolver>(
@@ -157,11 +156,13 @@ struct RetainedNativeRuntimeInput final {
   /// Exact Deployment-qualified retained runtime policy. Absence is
   /// observable and keeps motion admission closed.
   std::optional<core::RuntimePolicyDTO> runtime_policy{};
+  /// Exact retained catalog artifact that supplied `runtime_policy`.
+  std::optional<core::RuntimePolicyCatalogRecordRefDTO>
+      runtime_policy_source_artifact{};
   /// Optional product-selected state authority. Empty preserves the native
   /// predicted-state channel. A controller-backed simulation supplies its
   /// exact commanded source set here before constructing the sole writer.
-  std::optional<RetainedObservedStateChannelConfig>
-      motion_state_channel_config;
+  std::optional<RetainedObservedStateChannelConfig> motion_state_channel_config;
   std::optional<RetainedObservedStateChannelConfig>
       gripper_state_channel_config;
   /// Optional retained-product execution adapter factory. Empty preserves the
@@ -196,10 +197,12 @@ struct RetainedNativeRuntime final
   std::optional<core::RuntimeParticipantBinding> gripper_binding;
   std::vector<core::RuntimeParticipantBinding> motion_binding_aliases;
   std::vector<core::RuntimeParticipantBinding> gripper_binding_aliases;
-  std::vector<core::RuntimeParticipantBinding>
-      control_binding_representatives;
+  std::vector<core::RuntimeParticipantBinding> control_binding_representatives;
   std::optional<core::StopDeadlineBudgetDTO> cell_stop_deadline_budget;
   std::optional<core::StopSurveillancePolicyDTO> stop_surveillance_policy;
+  std::optional<core::MotionInterruptStopProfileDTO>
+      motion_operator_stop_profile;
+  std::optional<core::MotionInterruptStopProfileDTO> motion_fault_stop_profile;
   std::optional<core::RequestOwnerEpoch> addressed_request_owner_epoch;
   std::optional<core::CellId> addressed_cell_id;
   std::shared_ptr<roboplan::Scene> scene;
@@ -268,8 +271,7 @@ struct RetainedNativeRuntime final
   /// Publish the exact route facts already sealed into a direct native
   /// runtime. Maintained products without a lifecycle owner call this once
   /// after installation; lifecycle-managed products publish through CCLC.
-  [[nodiscard]] core::Result<void>
-  PublishCurrentRetainedRouteConfigurations();
+  [[nodiscard]] core::Result<void> PublishCurrentRetainedRouteConfigurations();
 
 private:
   mutable std::mutex route_publication_mutex_;

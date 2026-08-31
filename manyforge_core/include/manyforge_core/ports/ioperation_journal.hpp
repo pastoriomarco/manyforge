@@ -8,7 +8,9 @@
 #include <manyforge_core/types/cell_admission.hpp>
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/operation_runtime.hpp>
+#include <manyforge_core/types/prepared_operation_diagnostics.hpp>
 #include <optional>
+#include <span>
 #include <string>
 #include <variant>
 #include <vector>
@@ -197,7 +199,8 @@ class IOperationJournal {
 
   [[nodiscard]] virtual Result<std::uint64_t> RecordOperationState(
       const RequestOwnerEpoch& owner_epoch, const OperationStateDTO& state,
-      const RuntimeScaleStatusDTO* scale_status, const char* transition_reason) = 0;
+      const RuntimeScaleStatusDTO* scale_status, const char* transition_reason,
+      std::span<const PreparedMotionDiagnosticsDTO> prepared_motion_diagnostics = {}) = 0;
 
   [[nodiscard]] virtual Result<std::uint64_t> RecordCellAdmissionClaimAcquired(
       const RequestOwnerEpoch&, const CellAdmissionClaimDTO&) {

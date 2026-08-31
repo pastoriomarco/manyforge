@@ -1,10 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import nativeBindingFixture from '../../../../manyforge_deployment/resources/program_binding_lite6_native.fixture.json';
 import { ApiError, api, resolveStructuralAssetUrl } from './client';
+import * as parserModule from './parsers';
 import type { DraftFenceRequest, ManagerApplyRequest } from '../types/api';
 import type { OperatorAlarmRecord } from '../types/headless';
 
 afterEach(() => {
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
 
@@ -362,6 +364,56 @@ describe('structural API client', () => {
     await expect(api.health.get()).rejects.toThrow(
       'Invalid response from /api/health',
     );
+  });
+
+  it('never retains a malformed execution-target projection', async () => {
+    const identity = { owner_epoch: 'malformed-target-owner' };
+    const fetchMock = vi.fn().mockImplementation((input: string) => response(
+      input.endsWith('/control-state')
+        ? { identity }
+        : { identity, targets: { malformed: true } },
+    ));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(api.execution.controlStatus()).rejects.toThrow();
+    await expect(api.execution.controlStatus()).rejects.toThrow();
+
+    expect(fetchMock.mock.calls.map(([input]) => input)).toEqual([
+      '/api/execution/control-state',
+      '/api/execution/targets',
+      '/api/execution/control-state',
+      '/api/execution/targets',
+    ]);
+  });
+
+  it('reuses validated targets only for the exact control identity', async () => {
+    const ownerA = { owner_epoch: 'validated-target-owner-a' };
+    const ownerB = { owner_epoch: 'validated-target-owner-b' };
+    const parsed = { marker: 'strictly-validated' } as unknown as ReturnType<
+      typeof parserModule.parseExecutionControlStatus
+    >;
+    const parserSpy = vi.spyOn(parserModule, 'parseExecutionControlStatus')
+      .mockReturnValue(parsed);
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response({ identity: ownerA }))
+      .mockResolvedValueOnce(response({ identity: ownerA, targets: {} }))
+      .mockResolvedValueOnce(response({ identity: ownerA }))
+      .mockResolvedValueOnce(response({ identity: ownerB }))
+      .mockResolvedValueOnce(response({ identity: ownerB, targets: {} }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    expect(await api.execution.controlStatus()).toBe(parsed);
+    expect(await api.execution.controlStatus()).toBe(parsed);
+    expect(await api.execution.controlStatus()).toBe(parsed);
+
+    expect(parserSpy).toHaveBeenCalledTimes(3);
+    expect(fetchMock.mock.calls.map(([input]) => input)).toEqual([
+      '/api/execution/control-state',
+      '/api/execution/targets',
+      '/api/execution/control-state',
+      '/api/execution/control-state',
+      '/api/execution/targets',
+    ]);
   });
 
   it('submits one exact revision-fenced Draft mutation', async () => {

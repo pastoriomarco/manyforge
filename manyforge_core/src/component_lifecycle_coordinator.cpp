@@ -105,6 +105,15 @@ ScopeExit(Function) -> ScopeExit<Function>;
       std::move(components)});
 }
 
+[[nodiscard]] bool ControllerSourceEpochOnlyChanged(
+    const ControllerLifecycleObservationQueryDTO& accepted,
+    const ControllerLifecycleObservationQueryDTO& current) {
+  auto normalized = accepted;
+  normalized.source_runtime_epoch = current.source_runtime_epoch;
+  return accepted.source_runtime_epoch != current.source_runtime_epoch &&
+         normalized == current;
+}
+
 class FixedWorkerPool final {
  public:
   explicit FixedWorkerPool(std::size_t capacity) : capacity_(capacity) {}
@@ -1129,6 +1138,7 @@ class ComponentLifecycleCoordinator::Impl final {
     std::int64_t effective_deadline_ns{};
     bool recovering{};
     bool scheduled{};
+    bool controller_source_replaced_before_transition{};
   };
 
   [[nodiscard]] Result<CCLCLifecycleRequestResultDTO> ReplayResult(
@@ -1962,29 +1972,35 @@ class ComponentLifecycleCoordinator::Impl final {
 
   void PublishAndReleaseRoute(const std::shared_ptr<RouteRuntimeState>& runtime,
                               std::stop_token cancellation) noexcept {
+    const bool abandon_replaced_source =
+        runtime->controller_source_replaced_before_transition;
     if (cancellation.stop_requested() ||
-        !runtime->status.resulting_active_control_configuration.has_value()) {
+        (!abandon_replaced_source &&
+         !runtime->status.resulting_active_control_configuration.has_value())) {
       return;
     }
-    Result<RouteReadinessPublicationReceiptDTO> publication =
-        Result<RouteReadinessPublicationReceiptDTO>::Err(coordinator_error(
-            "route_readiness_publication_failed",
-            "the route readiness publication raised an exception", "publication_exception"));
-    try {
-      publication = route_services_->configuration_publication_port->PublishAndReadBack(
-          runtime->status.acceptance, runtime->snapshot.expected_controller_domain(),
-          *runtime->status.resulting_active_control_configuration);
-    } catch (...) {
-    }
-    if (!publication.ok()) {
-      ScheduleRoute(runtime);
-      return;
-    }
-    const auto verified_receipt =
-        VerifyRouteReadinessPublicationReceipt(runtime->status, publication.value());
-    if (!verified_receipt.ok()) {
-      ScheduleRoute(runtime);
-      return;
+    if (!abandon_replaced_source) {
+      Result<RouteReadinessPublicationReceiptDTO> publication =
+          Result<RouteReadinessPublicationReceiptDTO>::Err(coordinator_error(
+              "route_readiness_publication_failed",
+              "the route readiness publication raised an exception",
+              "publication_exception"));
+      try {
+        publication = route_services_->configuration_publication_port->PublishAndReadBack(
+            runtime->status.acceptance, runtime->snapshot.expected_controller_domain(),
+            *runtime->status.resulting_active_control_configuration);
+      } catch (...) {
+      }
+      if (!publication.ok()) {
+        ScheduleRoute(runtime);
+        return;
+      }
+      const auto verified_receipt =
+          VerifyRouteReadinessPublicationReceipt(runtime->status, publication.value());
+      if (!verified_receipt.ok()) {
+        ScheduleRoute(runtime);
+        return;
+      }
     }
 
     const auto& accepted_fence = *runtime->status.accepted_fence;
@@ -2010,8 +2026,16 @@ class ComponentLifecycleCoordinator::Impl final {
     if (!next_effect.has_value()) {
       return;
     }
-    const auto& configuration = *runtime->status.resulting_active_control_configuration;
-    const auto release_configuration = ExpectedConfiguration(configuration);
+    const auto release_configuration = ExpectedConfiguration(
+        abandon_replaced_source
+            ? runtime->snapshot.value().active_control_configuration
+            : runtime->status.resulting_active_control_configuration);
+    if (abandon_replaced_source &&
+        held.value().evidence.current_active_control_configuration !=
+            release_configuration) {
+      ScheduleRoute(runtime);
+      return;
+    }
     const RouteConfigurationFenceReleaseRequestDTO request{
         {RequestId("cclc.route.release." +
                    std::to_string(
@@ -2032,6 +2056,13 @@ class ComponentLifecycleCoordinator::Impl final {
                             RouteSelectionTransactionPhaseDTO::kReleasingFence)) {
       CloseAdmission();
       return;
+    }
+    if (abandon_replaced_source) {
+      prepared_status.effect = RouteSelectionEffectDTO::kKnownNoEffect;
+      prepared_status.error = coordinator_error(
+          "route_selection_controller_source_replaced",
+          "the controller source changed before any controller transition",
+          "controller_source_replaced_before_transition");
     }
     const CCLCRouteEffectAttemptDTO prepared{
         runtime->status.acceptance.route_selection_transaction_id,
@@ -2104,20 +2135,33 @@ class ComponentLifecycleCoordinator::Impl final {
       }
     }
 
+    const bool reconciled_configuration =
+        !abandon_replaced_source &&
+        runtime->status.resulting_active_control_configuration->state ==
+            ActiveControlConfigurationStateDTO::kReconciled;
     auto terminal_status = runtime->status;
-    if (!AdvanceRouteStatus(runtime, terminal_status,
-                            configuration.state == ActiveControlConfigurationStateDTO::kReconciled
-                                ? RouteSelectionTransactionPhaseDTO::kSucceeded
-                                : RouteSelectionTransactionPhaseDTO::kFailed)) {
+    if (!AdvanceRouteStatus(
+            runtime, terminal_status,
+            reconciled_configuration
+                ? RouteSelectionTransactionPhaseDTO::kSucceeded
+                : RouteSelectionTransactionPhaseDTO::kFailed)) {
       CloseAdmission();
       return;
     }
     terminal_status.released_fence = effect_result.receipt;
     terminal_status.remaining_duration_ns = 0;
     terminal_status.reconciliation_required = false;
-    if (configuration.state == ActiveControlConfigurationStateDTO::kReconciled) {
+    if (reconciled_configuration) {
       terminal_status.terminal_result = RouteSelectionTerminalResultDTO::kSucceeded;
       terminal_status.error.reset();
+    } else if (abandon_replaced_source) {
+      terminal_status.effect = RouteSelectionEffectDTO::kKnownNoEffect;
+      terminal_status.terminal_result =
+          RouteSelectionTerminalResultDTO::kFailedKnownNoEffect;
+      terminal_status.error = coordinator_error(
+          "route_selection_controller_source_replaced",
+          "the controller source changed before any controller transition",
+          "controller_source_replaced_before_transition");
     } else {
       terminal_status.effect = RouteSelectionEffectDTO::kPartialEffectObserved;
       terminal_status.terminal_result = RouteSelectionTerminalResultDTO::kFailedPartialEffect;
@@ -2237,6 +2281,13 @@ class ComponentLifecycleCoordinator::Impl final {
       runtimes.reserve(recovery.interrupted_route_selections.size());
       restored_reservations.reserve(recovery.interrupted_route_selections.size());
       for (const auto& status : recovery.interrupted_route_selections) {
+        const auto unresolved =
+            std::find_if(recovery.unresolved_route_effect_attempts.begin(),
+                         recovery.unresolved_route_effect_attempts.end(),
+                         [&](const auto& attempt) {
+                           return attempt.route_selection_transaction_id ==
+                                  status.acceptance.route_selection_transaction_id;
+                         });
         Result<RouteSelectionCurrentSnapshot> snapshot = Result<RouteSelectionCurrentSnapshot>::Err(
             coordinator_error("route_selection_recovery_snapshot_failed",
                               "the route recovery snapshot source raised an exception",
@@ -2247,9 +2298,30 @@ class ComponentLifecycleCoordinator::Impl final {
               status.acceptance.accepted_graph_revision, status.acceptance.desired_configuration);
         } catch (...) {
         }
-        if (!snapshot.ok() || MakeControllerLifecycleObservationQuery(
-                                  snapshot.value().expected_controller_domain().value()) !=
-                                  status.acceptance.controller_lifecycle_observation_query) {
+        const auto current_controller_query =
+            snapshot.ok()
+                ? std::optional<ControllerLifecycleObservationQueryDTO>(
+                      MakeControllerLifecycleObservationQuery(
+                          snapshot.value().expected_controller_domain().value()))
+                : std::nullopt;
+        const bool before_controller_transition =
+            !status.controller_observation.has_value() &&
+            !status.controller_reconciliation.has_value() &&
+            !status.controller_transition_plan.has_value() &&
+            status.controller_transition_results.empty() &&
+            !status.resulting_active_control_configuration.has_value() &&
+            (unresolved == recovery.unresolved_route_effect_attempts.end() ||
+             unresolved->effect_kind !=
+                 CCLCRouteEffectKindDTO::kControllerLifecycleTransition);
+        const bool controller_source_replaced_before_transition =
+            current_controller_query.has_value() && before_controller_transition &&
+            ControllerSourceEpochOnlyChanged(
+                status.acceptance.controller_lifecycle_observation_query,
+                *current_controller_query);
+        if (!snapshot.ok() ||
+            (*current_controller_query !=
+                 status.acceptance.controller_lifecycle_observation_query &&
+             !controller_source_replaced_before_transition)) {
           for (const auto& restored : restored_reservations) {
             static_cast<void>(domain_reservations_.release(restored.first, restored.second));
           }
@@ -2295,6 +2367,8 @@ class ComponentLifecycleCoordinator::Impl final {
         auto runtime = std::make_shared<RouteRuntimeState>(status, std::move(snapshot.value()),
                                                            std::nullopt, std::move(domains));
         runtime->recovering = true;
+        runtime->controller_source_replaced_before_transition =
+            controller_source_replaced_before_transition;
         runtime->effective_deadline_ns = clock_.now();
         const auto effect_watermark =
             std::find_if(recovery.route_effect_sequence_watermarks.begin(),
@@ -2306,12 +2380,6 @@ class ComponentLifecycleCoordinator::Impl final {
           throw std::runtime_error("missing route effect watermark");
         }
         runtime->effect_sequence = effect_watermark->highest_effect_sequence;
-        const auto unresolved =
-            std::find_if(recovery.unresolved_route_effect_attempts.begin(),
-                         recovery.unresolved_route_effect_attempts.end(), [&](const auto& attempt) {
-                           return attempt.route_selection_transaction_id ==
-                                  status.acceptance.route_selection_transaction_id;
-                         });
         if (unresolved != recovery.unresolved_route_effect_attempts.end()) {
           runtime->unresolved_recovery_effect = *unresolved;
         }
@@ -2476,6 +2544,11 @@ class ComponentLifecycleCoordinator::Impl final {
         PublishAndReleaseRoute(runtime, cancellation);
         return;
       }
+      if (runtime->controller_source_replaced_before_transition &&
+          runtime->status.accepted_fence.has_value()) {
+        PublishAndReleaseRoute(runtime, cancellation);
+        return;
+      }
       ReconcileRecoveredControllerTruth(runtime, cancellation, std::nullopt);
       return;
     }
@@ -2531,7 +2604,15 @@ class ComponentLifecycleCoordinator::Impl final {
       }
       successor.accepted_fence = result.acceptance;
       successor.reconciliation_required = false;
-      successor.error.reset();
+      if (runtime->controller_source_replaced_before_transition) {
+        successor.effect = RouteSelectionEffectDTO::kKnownNoEffect;
+        successor.error = coordinator_error(
+            "route_selection_controller_source_replaced",
+            "the controller source changed before any controller transition",
+            "controller_source_replaced_before_transition");
+      } else {
+        successor.error.reset();
+      }
     } else {
       if (!AdvanceRouteStatus(runtime, successor, RouteSelectionTransactionPhaseDTO::kFailed)) {
         CloseAdmission();
@@ -2551,7 +2632,11 @@ class ComponentLifecycleCoordinator::Impl final {
       return;
     }
     if (result.disposition == RouteConfigurationFenceAcquireEffectDispositionDTO::kAccepted) {
-      ReconcileRecoveredControllerTruth(runtime, cancellation, std::nullopt);
+      if (runtime->controller_source_replaced_before_transition) {
+        PublishAndReleaseRoute(runtime, cancellation);
+      } else {
+        ReconcileRecoveredControllerTruth(runtime, cancellation, std::nullopt);
+      }
     } else {
       CompleteRoute(runtime);
     }
@@ -2677,24 +2762,43 @@ class ComponentLifecycleCoordinator::Impl final {
       return;
     }
 
-    const auto& configuration = *runtime->status.resulting_active_control_configuration;
+    const bool abandon_replaced_source =
+        runtime->controller_source_replaced_before_transition;
+    if (!abandon_replaced_source &&
+        !runtime->status.resulting_active_control_configuration.has_value()) {
+      CloseAdmission();
+      return;
+    }
+    const bool reconciled_configuration =
+        !abandon_replaced_source &&
+        runtime->status.resulting_active_control_configuration->state ==
+            ActiveControlConfigurationStateDTO::kReconciled;
     RouteConfigurationFenceReleaseEffectResultDTO result{
         request, RouteConfigurationFenceReleaseEffectDispositionDTO::kReleased,
         reconciled.value().receipt};
     auto terminal = runtime->status;
-    if (!AdvanceRouteStatus(runtime, terminal,
-                            configuration.state == ActiveControlConfigurationStateDTO::kReconciled
-                                ? RouteSelectionTransactionPhaseDTO::kSucceeded
-                                : RouteSelectionTransactionPhaseDTO::kFailed)) {
+    if (!AdvanceRouteStatus(
+            runtime, terminal,
+            reconciled_configuration
+                ? RouteSelectionTransactionPhaseDTO::kSucceeded
+                : RouteSelectionTransactionPhaseDTO::kFailed)) {
       CloseAdmission();
       return;
     }
     terminal.released_fence = result.receipt;
     terminal.reconciliation_required = false;
     terminal.remaining_duration_ns = 0;
-    if (configuration.state == ActiveControlConfigurationStateDTO::kReconciled) {
+    if (reconciled_configuration) {
       terminal.terminal_result = RouteSelectionTerminalResultDTO::kSucceeded;
       terminal.error.reset();
+    } else if (abandon_replaced_source) {
+      terminal.effect = RouteSelectionEffectDTO::kKnownNoEffect;
+      terminal.terminal_result =
+          RouteSelectionTerminalResultDTO::kFailedKnownNoEffect;
+      terminal.error = coordinator_error(
+          "route_selection_controller_source_replaced",
+          "the controller source changed before any controller transition",
+          "controller_source_replaced_before_transition");
     } else {
       terminal.effect = RouteSelectionEffectDTO::kPartialEffectObserved;
       terminal.terminal_result = RouteSelectionTerminalResultDTO::kFailedPartialEffect;

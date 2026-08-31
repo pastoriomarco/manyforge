@@ -216,6 +216,9 @@ interface HeadlessRuntimeSurfacesProps {
   clientErrors?: ClientOperationalError[];
   onAcknowledgeClientError?: (id: string) => void;
   attentionRequest?: string | null;
+  expanded?: boolean;
+  onExpandedChange?: (expanded: boolean) => void;
+  onClose?: () => void;
 }
 
 interface HeadlessRuntimeSurfacesViewProps {
@@ -224,6 +227,31 @@ interface HeadlessRuntimeSurfacesViewProps {
   clientErrors?: ClientOperationalError[];
   onAcknowledgeClientError?: (id: string) => void;
   attentionRequest?: string | null;
+  expanded?: boolean;
+  onExpandedChange?: (expanded: boolean) => void;
+  onClose?: () => void;
+}
+
+interface RuntimeAttentionFence {
+  alarmFence: AlarmAcknowledgementFence | null;
+  clientErrorIds: string[];
+}
+
+function sameIdentities(left: string[], right: string[]): boolean {
+  if (left.length !== right.length) return false;
+  const expected = [...left].sort();
+  const current = [...right].sort();
+  return expected.every((value, index) => value === current[index]);
+}
+
+export function runtimeAttentionSummary(
+  alarms: OperatorAlarmRecord[],
+  clientErrors: ClientOperationalError[],
+): string {
+  const count = alarms.length + clientErrors.length;
+  if (count === 0) return 'No messages require attention';
+  if (count > 1) return `${count} messages require attention`;
+  return clientErrors[0]?.title ?? alarms[0]?.title ?? 'Attention required';
 }
 
 export function HeadlessRuntimeSurfacesView({
@@ -232,11 +260,14 @@ export function HeadlessRuntimeSurfacesView({
   clientErrors = [],
   onAcknowledgeClientError,
   attentionRequest = null,
+  expanded = true,
+  onExpandedChange,
+  onClose,
 }: HeadlessRuntimeSurfacesViewProps) {
   const { snapshot, error, reconnect } = headlessState;
   const [busyActivation, setBusyActivation] = useState<string | null>(null);
   const [bulkBusy, setBulkBusy] = useState(false);
-  const [bulkFence, setBulkFence] = useState<AlarmAcknowledgementFence | null>(null);
+  const [bulkFence, setBulkFence] = useState<RuntimeAttentionFence | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [mode, setMode] = useState<'attention' | 'active' | 'history'>('attention');
   const [historyLoading, setHistoryLoading] = useState(false);
@@ -273,6 +304,10 @@ export function HeadlessRuntimeSurfacesView({
   const standing = snapshot?.alarms.alarms.filter((alarm) =>
     alarm.lifecycleState === 'active_acknowledged') ?? [];
   const attentionCount = attention.length + clientErrors.length;
+  const attentionSummary = runtimeAttentionSummary(attention, clientErrors);
+  useEffect(() => {
+    if (attentionCount < 2) setBulkFence(null);
+  }, [attentionCount]);
 
   const loadHistory = async () => {
     setHistoryLoading(true);
@@ -324,39 +359,53 @@ export function HeadlessRuntimeSurfacesView({
   };
 
   const confirmBulk = async () => {
-    if (snapshot === null) return;
-    const members = snapshot.alarms.unacknowledgedMembership;
+    const members = snapshot?.alarms.unacknowledgedMembership ?? [];
+    const clientErrorIds = clientErrors.map((error) => error.id);
     if (bulkFence === null) {
-      setBulkFence(acknowledgementFence(
-        snapshot.alarms.ownerEpoch,
-        snapshot.alarms.generation,
-        members,
-      ));
+      setBulkFence({
+        alarmFence: snapshot === null || members.length === 0
+          ? null
+          : acknowledgementFence(
+              snapshot.alarms.ownerEpoch,
+              snapshot.alarms.generation,
+              members,
+            ),
+        clientErrorIds,
+      });
       setActionError(null);
       return;
     }
-    if (!acknowledgementFenceMatches(
-      bulkFence,
-      snapshot.alarms.ownerEpoch,
-      snapshot.alarms.generation,
-      members,
-    )) {
+    const alarmSetChanged = bulkFence.alarmFence !== null && (
+      snapshot === null
+      || !acknowledgementFenceMatches(
+        bulkFence.alarmFence,
+        snapshot.alarms.ownerEpoch,
+        snapshot.alarms.generation,
+        members,
+      )
+    );
+    if (alarmSetChanged || !sameIdentities(bulkFence.clientErrorIds, clientErrorIds)) {
       setBulkFence(null);
-      setActionError('The alarm set changed. Review it before confirming again.');
+      setActionError('The attention set changed. Review it before confirming again.');
+      onExpandedChange?.(true);
       return;
     }
     setBulkBusy(true);
     setActionError(null);
     try {
-      await api.alarms.acknowledgeAll(
-        snapshot.alarms.ownerEpoch,
-        snapshot.alarms.generation,
-        members,
-        requestId(),
-      );
+      if (bulkFence.alarmFence !== null && snapshot !== null) {
+        await api.alarms.acknowledgeAll(
+          snapshot.alarms.ownerEpoch,
+          snapshot.alarms.generation,
+          members,
+          requestId(),
+        );
+      }
+      bulkFence.clientErrorIds.forEach((id) => onAcknowledgeClientError?.(id));
       setBulkFence(null);
     } catch (reason) {
       setActionError(actionErrorMessage(reason));
+      onExpandedChange?.(true);
     } finally {
       setBulkBusy(false);
     }
@@ -364,7 +413,51 @@ export function HeadlessRuntimeSurfacesView({
 
   if (!enabled) return null;
   return (
-    <section className="runtime-observability-surface">
+    <section
+      className={`runtime-observability-surface ${expanded ? 'expanded' : 'collapsed'}`}
+      role="dialog"
+      aria-modal="false"
+      aria-label="Runtime, alarms, and history"
+    >
+      <header className="runtime-observability-rail">
+        <strong>Runtime / history</strong>
+        <span className="runtime-observability-rail-summary" aria-live="polite">
+          {attentionSummary}
+        </span>
+        <div className="runtime-observability-rail-actions">
+          {attentionCount > 1 && (
+            <button
+              type="button"
+              disabled={bulkBusy || busyActivation !== null}
+              title="Acknowledge the exact current alarm set and dismiss the exact current Composer messages. This does not change execution."
+              onClick={() => { void confirmBulk(); }}
+            >
+              {bulkFence === null ? 'Acknowledge all' : 'Confirm all'}
+            </button>
+          )}
+          <button
+            type="button"
+            className="icon-button"
+            aria-label={expanded ? 'Collapse runtime details' : 'Expand runtime details'}
+            aria-expanded={expanded}
+            title={expanded ? 'Collapse runtime details' : 'Expand runtime details'}
+            onClick={() => onExpandedChange?.(!expanded)}
+          >
+            {expanded ? '⌃' : '⌄'}
+          </button>
+          {onClose && (
+            <button
+              type="button"
+              className="icon-button"
+              aria-label="Close runtime messages"
+              title="Close runtime messages"
+              onClick={onClose}
+            >×</button>
+          )}
+        </div>
+      </header>
+      {expanded && (
+      <div className="runtime-observability-details">
       <nav className="runtime-observability-tabs" aria-label="Runtime observability sections">
         <button
           type="button"
@@ -400,20 +493,11 @@ export function HeadlessRuntimeSurfacesView({
               <strong>Attention required</strong>
               <small>Exact backend alarms and current Composer-session errors.</small>
             </div>
-            {snapshot !== null && snapshot.alarms.unacknowledgedCount > 0 && (
-              <button
-                type="button"
-                disabled={bulkBusy || busyActivation !== null}
-                onClick={() => { void confirmBulk(); }}
-              >
-                {bulkFence === null ? 'Acknowledge all…' : 'Confirm exact set'}
-              </button>
-            )}
           </header>
           {attentionCount === 0 && <p className="muted">Nothing currently requires acknowledgement.</p>}
           {clientErrors.map((clientError) => (
           <div className="operator-alarm-panel" key={clientError.id}>
-            <details open>
+            <details>
               <summary>
                 COMPOSER ERROR — DISMISSAL REQUIRED · {clientError.title}
               </summary>
@@ -421,7 +505,7 @@ export function HeadlessRuntimeSurfacesView({
                 error={{ code: clientError.id, message: clientError.message }}
                 presentation={{
                   headline: clientError.title,
-                  hint: 'Dismiss after reviewing this client-side command or response failure.',
+                  hint: clientError.message,
                   severity: 'error',
                 }}
                 presentationKey={clientError.id}
@@ -433,7 +517,7 @@ export function HeadlessRuntimeSurfacesView({
                 type="button"
                 onClick={() => onAcknowledgeClientError?.(clientError.id)}
               >
-                Dismiss message
+                Acknowledge message
               </button>
             </div>
           </div>
@@ -489,6 +573,8 @@ export function HeadlessRuntimeSurfacesView({
         detailError={historyDetailError}
         onSelectEvent={(event) => { void loadHistoryDetail(event); }}
       />
+      </div>
+      )}
     </section>
   );
 }
@@ -499,8 +585,21 @@ export function HeadlessRuntimeSurfaces({
   clientErrors = [],
   onAcknowledgeClientError,
   attentionRequest = null,
+  expanded = true,
+  onExpandedChange,
+  onClose,
 }: HeadlessRuntimeSurfacesProps) {
   const headlessState = useShellHeadlessState(headlessStateSource);
+  useEffect(() => {
+    if (onClose === undefined) return undefined;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      onClose();
+    };
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, [onClose]);
   return (
     <HeadlessRuntimeSurfacesView
       enabled={enabled}
@@ -508,6 +607,9 @@ export function HeadlessRuntimeSurfaces({
       clientErrors={clientErrors}
       onAcknowledgeClientError={onAcknowledgeClientError}
       attentionRequest={attentionRequest}
+      expanded={expanded}
+      onExpandedChange={onExpandedChange}
+      onClose={onClose}
     />
   );
 }

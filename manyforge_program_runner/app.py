@@ -10,6 +10,8 @@ from fastapi.responses import JSONResponse
 
 from manyforge_headless_api.app import RequestBodyLimitMiddleware
 from manyforge_headless_api.models import (
+    ProgramFullStopResetRequest,
+    ProgramFullStopResumeRequest,
     ProgramRunStartRequest,
     ProgramRunStopRequest,
 )
@@ -57,6 +59,24 @@ class ProgramRunnerApplicationPort(Protocol):
         self,
         program_run_id: str,
         request: ProgramRunStopRequest,
+    ) -> dict[str, Any]: ...
+
+    def full_stop(
+        self,
+        program_run_id: str,
+        request: ProgramRunStopRequest,
+    ) -> dict[str, Any]: ...
+
+    def resume_full_stop(
+        self,
+        program_run_id: str,
+        request: ProgramFullStopResumeRequest,
+    ) -> dict[str, Any]: ...
+
+    def discard_full_stop(
+        self,
+        program_run_id: str,
+        request: ProgramFullStopResetRequest,
     ) -> dict[str, Any]: ...
 
     def reset_cycle(self, request: ProgramCycleResetRequest) -> dict[str, Any]: ...
@@ -208,6 +228,42 @@ def create_app(runtime: ProgramRunnerApplicationPort) -> FastAPI:
                 "Program-run identity in path and body must match",
             )
         return runtime.stop_motion(program_run_id, request)
+
+    @app.post("/api/program/runs/{program_run_id}/full-stop")
+    def full_stop(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        request: ProgramRunStopRequest,
+    ) -> dict[str, Any]:
+        if request.program_run_id != program_run_id:
+            raise ProgramRunnerError(
+                "program_run_path_invalid",
+                "Program-run identity in path and body must match",
+            )
+        return runtime.full_stop(program_run_id, request)
+
+    @app.post("/api/program/runs/{program_run_id}/resume-full-stop")
+    def resume_full_stop(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        request: ProgramFullStopResumeRequest,
+    ) -> dict[str, Any]:
+        if request.program_run_id != program_run_id:
+            raise ProgramRunnerError(
+                "program_run_path_invalid",
+                "Program-run identity in path and body must match",
+            )
+        return runtime.resume_full_stop(program_run_id, request)
+
+    @app.post("/api/program/runs/{program_run_id}/discard-full-stop")
+    def discard_full_stop(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        request: ProgramFullStopResetRequest,
+    ) -> dict[str, Any]:
+        if request.program_run_id != program_run_id:
+            raise ProgramRunnerError(
+                "program_run_path_invalid",
+                "Program-run identity in path and body must match",
+            )
+        return runtime.discard_full_stop(program_run_id, request)
 
     @app.get("/api/program/runs/{program_run_id}/runtime-controls")
     def read_runtime_controls(

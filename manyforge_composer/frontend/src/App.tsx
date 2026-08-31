@@ -74,6 +74,7 @@ export default function App() {
     typeof window === 'undefined' ? 360 : Math.max(160, Math.floor((window.innerHeight - 52) / 2))
   ));
   const [globalPanel, setGlobalPanel] = useState<'runtime' | 'assistant' | null>(null);
+  const [runtimePanelExpanded, setRuntimePanelExpanded] = useState(false);
   const [runtimeAttentionRequest, setRuntimeAttentionRequest] = useState<string | null>(null);
   const [programInvalidEdit, setProgramInvalidEdit] = useState(false);
   const [programSettingsRequest, setProgramSettingsRequest] = useState(0);
@@ -140,7 +141,7 @@ export default function App() {
   });
   useOperationalErrorMirror({
     source: 'composer.full_cell_stop',
-    title: 'Full-cell Stop command failed',
+    title: 'Cell Full Stop command failed',
     message: robotControl.fullStopError,
     onDismiss: robotControl.dismissFullStopError,
   });
@@ -160,11 +161,6 @@ export default function App() {
     title: 'Robot preview or operation command failed',
     message: robotOperationalError,
     onDismiss: robotControl.dismissError,
-  });
-  useOperationalErrorMirror({
-    source: 'composer.headless_projection',
-    title: 'Backend projection transport failed',
-    message: headlessState.error,
   });
   useOperationalErrorMirror({
     source: 'composer.structural_manifest',
@@ -189,6 +185,10 @@ export default function App() {
   ], [clientErrors, headlessSnapshot]);
   const openRuntimeAttention = useCallback((identity: string) => {
     setRuntimeAttentionRequest(identity);
+    // New operator attention always opens as the compact one-line rail. The
+    // operator may expand it deliberately without execution being obscured by
+    // an automatic client-error or alarm presentation.
+    setRuntimePanelExpanded(false);
     setGlobalPanel('runtime');
   }, []);
   const runtimeView = useMemo(
@@ -306,7 +306,12 @@ export default function App() {
     }
   }, [programInspectorMinimized, programInspectorState.active, viewerInspectorMinimized]);
   const openRuntimeDetails = useCallback(() => {
+    setRuntimePanelExpanded(true);
     setGlobalPanel('runtime');
+  }, []);
+  const closeRuntimePanel = useCallback(() => {
+    setGlobalPanel(null);
+    setRuntimePanelExpanded(false);
   }, []);
 
   const connectedProjection = headlessEnabled
@@ -381,7 +386,10 @@ export default function App() {
             type="button"
             aria-haspopup="dialog"
             aria-expanded={globalPanel === 'runtime'}
-            onClick={() => setGlobalPanel('runtime')}
+            onClick={() => {
+              setRuntimePanelExpanded(false);
+              setGlobalPanel('runtime');
+            }}
           >
             Runtime / history
             {clientErrors.length + (headlessSnapshot?.alarms.unacknowledgedCount ?? 0) > 0 && (
@@ -539,7 +547,7 @@ export default function App() {
                 onViewerInspectorMinimizedChange={setViewerInspectorMinimized}
                 onViewerInspectorMaximize={maximizeViewerInspector}
                 onViewerInspectorPanelChange={setViewerInspectorPanel}
-                onOpenRuntimeHistory={() => setGlobalPanel('runtime')}
+                onOpenRuntimeHistory={openRuntimeDetails}
               />
             </div>
           </div>
@@ -549,23 +557,18 @@ export default function App() {
         items={runtimeAttentionItems}
         onOpen={openRuntimeAttention}
       />
-      <OverlayPanel
-        open={globalPanel === 'runtime'}
-        title="Runtime, alarms, and history"
-        titleId="runtime-observability-title"
-        kind="status"
-        panelClassName="runtime-observability-overlay"
-        onClose={() => setGlobalPanel(null)}
-        returnFocusRef={runtimeButton}
-      >
+      {globalPanel === 'runtime' && (
         <HeadlessRuntimeSurfaces
           enabled={headlessEnabled}
           headlessStateSource={headlessStateSource}
           clientErrors={clientErrors}
           onAcknowledgeClientError={operationalErrors.dismiss}
           attentionRequest={runtimeAttentionRequest}
+          expanded={runtimePanelExpanded}
+          onExpandedChange={setRuntimePanelExpanded}
+          onClose={closeRuntimePanel}
         />
-      </OverlayPanel>
+      )}
       <OverlayPanel
         open={globalPanel === 'assistant'}
         title="AI assistant"

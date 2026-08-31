@@ -613,6 +613,16 @@ class ProgramRuntimeControls:
         owner_actions = (
             owner.get("allowed_actions", []) if isinstance(owner, dict) else []
         )
+        if (
+            intervention.policy_parameter == "operator_stop_policy"
+            and isinstance(owner, dict)
+            and owner.get("recovery_class") == "none"
+            and owner.get("status") == "unavailable"
+        ):
+            # Program scheduling can retain its prior intervention for one
+            # tick after the addressed owner releases an ordinary Stop. That
+            # stale internal row is not another operator recovery offer.
+            return None
         valid_until_ns = (
             owner.get("observed_state_valid_until_ns")
             if isinstance(owner, dict)
@@ -710,14 +720,56 @@ class ProgramRuntimeControls:
                     "disabled_reason_code": None,
                 }
             )
+        operator_stop_settled = (
+            isinstance(owner, dict)
+            and owner.get("recovery_class")
+            in {"ordinary_operator_stop", "stop_fault_intervention"}
+            and owner.get("status") in {"retry_ready", "reset_required"}
+            and owner.get("execution_state") == "Stopped"
+            and owner.get("backend_stop_confirmed") is True
+            and isinstance(owner.get("stop_certificate_id"), str)
+            and bool(owner["stop_certificate_id"])
+            and type(owner.get("stop_certificate_revision")) is int
+            and owner["stop_certificate_revision"] > 0
+            and type(owner.get("stop_owner_generation")) is int
+            and owner["stop_owner_generation"] > 0
+            and "reset_cycle" in owner_actions
+        )
+        stop_fault_reset_required = (
+            isinstance(owner, dict)
+            and owner.get("recovery_class") == "stop_fault_intervention"
+            and owner.get("status") == "reset_required"
+            and owner.get("retry_admissible") is False
+        )
+        held_reset_enabled = (
+            operator_stop_recovery
+            and observation_current
+            and operator_stop_settled
+            and (
+                owner.get("retry_admissible") is True
+                or stop_fault_reset_required
+            )
+        )
         actions.append(
             {
                 "action_id": "reset_cycle",
                 "label_key": "recovery.reset_cycle",
                 "requires_confirmation": True,
                 "performs_backend_reset": True,
-                "enabled": False,
-                "disabled_reason_code": "cycle_not_terminal",
+                "enabled": held_reset_enabled,
+                "disabled_reason_code": (
+                    None
+                    if held_reset_enabled
+                    else (
+                        "recovery_owner_observation_expired"
+                        if operator_stop_recovery and not observation_current
+                        else (
+                            "operator_stop_not_physically_settled"
+                            if operator_stop_recovery
+                            else "cycle_not_terminal"
+                        )
+                    )
+                ),
             }
         )
         material = {
@@ -781,11 +833,17 @@ class ProgramRuntimeControls:
                     else None
                 ),
                 "stop_id": (
-                    owner.get("stop_id") if isinstance(owner, dict) else None
+                    owner.get("stop_id")
+                    if isinstance(owner, dict)
+                    and isinstance(owner.get("stop_id"), str)
+                    and bool(owner["stop_id"])
+                    else None
                 ),
                 "stop_generation": (
                     owner.get("stop_generation")
                     if isinstance(owner, dict)
+                    and type(owner.get("stop_generation")) is int
+                    and owner["stop_generation"] > 0
                     else None
                 ),
                 "stop_certificate_id": (
@@ -797,6 +855,8 @@ class ProgramRuntimeControls:
                 "stop_certificate_revision": (
                     owner.get("stop_certificate_revision")
                     if isinstance(owner, dict)
+                    and type(owner.get("stop_certificate_revision")) is int
+                    and owner["stop_certificate_revision"] > 0
                     else None
                 ),
                 "status": (

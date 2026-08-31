@@ -24,7 +24,7 @@ from manyforge_behavior.node_registry import build_node_registry
 
 CATALOG_PATH = Path(__file__).parent.parent / "resources" / "node_catalog.yaml"
 EXPECTED_CATALOG_DIGEST = (
-    "sha256:1dbe03c29ef0f0195ff31204df5b8613c2c064821848c8baa269dd6a8b640dca"
+    "sha256:cf249e13ee06142852da23b53d48f3bf6fa5bbc1ec92e548327ef9146afee6fe"
 )
 
 
@@ -161,7 +161,15 @@ def test_catalog_schema_retains_semantic_role_and_validates_defaults() -> None:
 def test_catalog_projects_declared_semantic_scope_for_fields_and_array_items() -> None:
     catalog = NodeCatalog(CATALOG_PATH)
     attach = catalog.get("scene.attach_carried_object")
+    detach = catalog.get("scene.detach_carried_object")
     parameters = {parameter.id: parameter for parameter in attach.parameters}
+
+    # ``carried`` is the internal owner/API placement kind.  The operator
+    # vocabulary remains the historical Attached/Detached workflow.
+    assert attach.name == "Attach object"
+    assert detach.name == "Detach object"
+    assert "Attached" in detach.description
+    assert "Detached" in detach.description
 
     carrier_schema = catalog.schema_registry.to_json_schema(
         parameters["carrier_frame_role"].schema

@@ -35,7 +35,11 @@ namespace {
   decision.severity = CollisionDecisionSeverity::kNone;
   decision.action = CollisionDecisionAction::kDispatch;
   decision.collision_world_revision = world;
-  return {ValidationRevision("validation.3"), ValidationResultDTO{true, std::nullopt}, world,
+  return {ValidationRevision("validation.3"),
+          ValidationResultDTO{
+              true, std::nullopt,
+              TrajectoryValidationMetricsDTO{1.0, {0.5}, {0.0}, 0.02}},
+          world,
           CollisionPolicyRevision{5U, Digest('b')}, std::move(decision)};
 }
 
@@ -53,6 +57,16 @@ TEST(PreparedMotionEvidenceCodecTest, RoundTripsAcceptedPlanningAndValidationEvi
   const auto decoded_validation = DecodePreparedMotionValidationEvidence(validation.value());
   ASSERT_TRUE(decoded_validation.ok()) << decoded_validation.error().message;
   EXPECT_EQ(decoded_validation.value().collision_world_revision.revision_id, 3U);
+  ASSERT_TRUE(decoded_validation.value().noncollision_result.trajectory_metrics.has_value());
+  EXPECT_EQ(decoded_validation.value().noncollision_result.trajectory_metrics->
+                peak_abs_joint_velocity_rad_s,
+            (std::vector<double>{0.5}));
+  EXPECT_EQ(decoded_validation.value().noncollision_result.trajectory_metrics->
+                peak_abs_joint_acceleration_rad_s2,
+            (std::vector<double>{0.0}));
+  EXPECT_DOUBLE_EQ(*decoded_validation.value().noncollision_result.trajectory_metrics->
+                        peak_tcp_linear_speed_mps,
+                   0.02);
   EXPECT_EQ(EncodePreparedMotionValidationEvidence(decoded_validation.value()).value(),
             validation.value());
 }
@@ -71,6 +85,10 @@ TEST(PreparedMotionEvidenceCodecTest, RejectsFailureEvidenceAndClosedShapeViolat
   auto mismatched = Validation();
   mismatched.collision_decision.collision_world_revision->revision_id += 1U;
   EXPECT_FALSE(EncodePreparedMotionValidationEvidence(mismatched).ok());
+
+  auto missing_metrics = Validation();
+  missing_metrics.noncollision_result.trajectory_metrics.reset();
+  EXPECT_FALSE(EncodePreparedMotionValidationEvidence(missing_metrics).ok());
 }
 
 }  // namespace

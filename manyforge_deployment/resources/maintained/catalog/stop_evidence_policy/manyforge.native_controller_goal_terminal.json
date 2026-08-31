@@ -2,23 +2,23 @@
   "api_version": "manyforge.stop_evidence_policy.v2",
   "containment_granularity": "resource",
   "deadline_budget": {
-    "kernel_completion_reserve_ns": 100000000,
-    "outer_duration_ns": 2000000000,
+    "kernel_completion_reserve_ns": 200000000,
+    "outer_duration_ns": 3000000000,
     "phases": [
       {
-        "deadline_offset_ns": 500000000,
+        "deadline_offset_ns": 300000000,
         "phase_id": "command"
       },
       {
-        "deadline_offset_ns": 1000000000,
+        "deadline_offset_ns": 1750000000,
         "phase_id": "terminal"
       },
       {
-        "deadline_offset_ns": 1200000000,
+        "deadline_offset_ns": 1900000000,
         "phase_id": "hard_command"
       },
       {
-        "deadline_offset_ns": 1900000000,
+        "deadline_offset_ns": 2700000000,
         "phase_id": "hard_terminal"
       }
     ]
@@ -101,5 +101,5 @@
     }
   ],
   "stop_evidence_policy_id": "manyforge.native_controller_goal_terminal",
-  "stop_evidence_policy_revision": "sha256:9b3069be646fd588348435498cedcfe1e4471b6604a0cba15565b7d59ee4809d"
+  "stop_evidence_policy_revision": "sha256:3a1acc2b605b1c114069f3cac8ca56d35f9a64644ef4f5ca5f8b5ba811263cc8"
 }

@@ -54,6 +54,33 @@ void exact(const CanonicalValue& value, std::initializer_list<std::string_view> 
   return value.as_bool();
 }
 
+[[nodiscard]] double finite_number(const CanonicalValue& value) {
+  if (!value.is_number() || !std::isfinite(value.as_number())) {
+    fail("finite_number_required");
+  }
+  return value.as_number();
+}
+
+[[nodiscard]] CanonicalValue numbers(const std::vector<double>& values) {
+  CanonicalValue::Array result;
+  result.reserve(values.size());
+  for (const double value : values) {
+    if (!std::isfinite(value)) fail("finite_number_required");
+    result.emplace_back(value);
+  }
+  return CanonicalValue(std::move(result));
+}
+
+[[nodiscard]] std::vector<double> number_array(const CanonicalValue& value) {
+  if (!value.is_array()) fail("array_required");
+  std::vector<double> result;
+  result.reserve(value.as_array().size());
+  for (const auto& item : value.as_array()) {
+    result.push_back(finite_number(item));
+  }
+  return result;
+}
+
 [[nodiscard]] std::uint64_t unsigned_integer(const CanonicalValue& value, bool nonzero = false) {
   if (!value.is_number() || value.as_number() < (nonzero ? 1.0 : 0.0) ||
       value.as_number() > kMaximumSafeInteger ||
@@ -225,15 +252,51 @@ void require_digest(std::string_view value, std::string reason) {
 
 [[nodiscard]] CanonicalValue validation_value(const PreparedMotionValidationEvidenceDTO& value) {
   if (!portable_identifier(value.validation_revision.value()) || !value.noncollision_result.valid ||
-      value.noncollision_result.error || !value.collision_decision.collision_world_revision ||
+      value.noncollision_result.error || !value.noncollision_result.trajectory_metrics ||
+      !value.collision_decision.collision_world_revision ||
       !same_revision(*value.collision_decision.collision_world_revision,
                      value.collision_world_revision)) {
     fail("accepted_validation_evidence_required");
   }
+  const auto& metrics = *value.noncollision_result.trajectory_metrics;
+  const auto metrics_valid = [](const std::vector<double>& values) {
+    return std::all_of(values.begin(), values.end(), [](const double item) {
+      return std::isfinite(item) && item >= 0.0;
+    });
+  };
+  if (!std::isfinite(metrics.trajectory_duration_s) ||
+      metrics.trajectory_duration_s < 0.0 ||
+      metrics.peak_abs_joint_velocity_rad_s.empty() ||
+      !metrics_valid(metrics.peak_abs_joint_velocity_rad_s) ||
+      (!metrics.peak_abs_joint_acceleration_rad_s2.empty() &&
+       metrics.peak_abs_joint_acceleration_rad_s2.size() !=
+           metrics.peak_abs_joint_velocity_rad_s.size()) ||
+      !metrics_valid(metrics.peak_abs_joint_acceleration_rad_s2) ||
+      (metrics.peak_tcp_linear_speed_mps.has_value() &&
+       (!std::isfinite(*metrics.peak_tcp_linear_speed_mps) ||
+        *metrics.peak_tcp_linear_speed_mps < 0.0))) {
+    fail("trajectory_validation_metrics_invalid");
+  }
+  const CanonicalValue metrics_value(CanonicalValue::Object{
+      {"peak_abs_joint_acceleration_rad_s2",
+       metrics.peak_abs_joint_acceleration_rad_s2.empty()
+           ? CanonicalValue(nullptr)
+           : numbers(metrics.peak_abs_joint_acceleration_rad_s2)},
+      {"peak_abs_joint_velocity_rad_s",
+       numbers(metrics.peak_abs_joint_velocity_rad_s)},
+      {"peak_tcp_linear_speed_mps",
+       metrics.peak_tcp_linear_speed_mps.has_value()
+           ? CanonicalValue(*metrics.peak_tcp_linear_speed_mps)
+           : CanonicalValue(nullptr)},
+      {"trajectory_duration_s",
+       CanonicalValue(metrics.trajectory_duration_s)},
+  });
   return CanonicalValue(CanonicalValue::Object{
       {"validation_revision", CanonicalValue(value.validation_revision.value())},
       {"noncollision_result",
-       CanonicalValue(CanonicalValue::Object{{"valid", CanonicalValue(true)}})},
+       CanonicalValue(CanonicalValue::Object{
+           {"trajectory_metrics", metrics_value},
+           {"valid", CanonicalValue(true)}})},
       {"collision_world_revision", revision_value(value.collision_world_revision)},
       {"collision_policy_revision", revision_value(value.collision_policy_revision)},
       {"collision_decision", decision_value(value.collision_decision)}});
@@ -245,10 +308,42 @@ void require_digest(std::string_view value, std::string reason) {
   const auto validation_revision = text(member(value, "validation_revision"));
   if (!portable_identifier(validation_revision)) fail("validation_revision_invalid");
   const auto& noncollision = member(value, "noncollision_result");
-  exact(noncollision, {"valid"});
+  exact(noncollision, {"trajectory_metrics", "valid"});
   if (!boolean(member(noncollision, "valid"))) fail("accepted_noncollision_result_required");
+  const auto& metrics_value = member(noncollision, "trajectory_metrics");
+  exact(metrics_value,
+        {"peak_abs_joint_acceleration_rad_s2", "peak_abs_joint_velocity_rad_s",
+         "peak_tcp_linear_speed_mps", "trajectory_duration_s"});
+  const auto& acceleration_value =
+      member(metrics_value, "peak_abs_joint_acceleration_rad_s2");
+  const auto& tcp_value = member(metrics_value, "peak_tcp_linear_speed_mps");
+  TrajectoryValidationMetricsDTO metrics{
+      finite_number(member(metrics_value, "trajectory_duration_s")),
+      number_array(member(metrics_value, "peak_abs_joint_velocity_rad_s")),
+      acceleration_value.is_null() ? std::vector<double>{}
+                                   : number_array(acceleration_value),
+      tcp_value.is_null()
+          ? std::nullopt
+          : std::optional<double>{finite_number(tcp_value)}};
+  const auto metrics_valid = [](const std::vector<double>& values) {
+    return std::all_of(values.begin(), values.end(), [](const double item) {
+      return item >= 0.0;
+    });
+  };
+  if (metrics.trajectory_duration_s < 0.0 ||
+      metrics.peak_abs_joint_velocity_rad_s.empty() ||
+      !metrics_valid(metrics.peak_abs_joint_velocity_rad_s) ||
+      (!metrics.peak_abs_joint_acceleration_rad_s2.empty() &&
+       metrics.peak_abs_joint_acceleration_rad_s2.size() !=
+           metrics.peak_abs_joint_velocity_rad_s.size()) ||
+      !metrics_valid(metrics.peak_abs_joint_acceleration_rad_s2) ||
+      (metrics.peak_tcp_linear_speed_mps.has_value() &&
+       *metrics.peak_tcp_linear_speed_mps < 0.0)) {
+    fail("trajectory_validation_metrics_invalid");
+  }
   PreparedMotionValidationEvidenceDTO result{
-      ValidationRevision(validation_revision), ValidationResultDTO{true, std::nullopt},
+      ValidationRevision(validation_revision),
+      ValidationResultDTO{true, std::nullopt, std::move(metrics)},
       parse_world_revision(member(value, "collision_world_revision")),
       parse_policy_revision(member(value, "collision_policy_revision")),
       parse_decision(member(value, "collision_decision"))};

@@ -1,5 +1,5 @@
 <?xml version='1.0' encoding='utf-8'?>
-<robot name="manyforge_isaac_lite6_topic_based">
+<robot name="manyforge_isaac_lite6_topic_based" version="1.2">
   <material name="Black">
     <color rgba="0.0 0.0 0.0 1.0" />
   </material>
@@ -114,7 +114,7 @@
     <parent link="link_base" />
     <child link="link1" />
     <axis xyz="0 0 1" />
-    <limit effort="50.0" lower="-3.1101767270538954" upper="3.1101767270538954" velocity="3.14" />
+    <limit effort="50.0" lower="-3.1101767270538954" upper="3.1101767270538954" velocity="2.14" acceleration="10.0" />
     <dynamics damping="1.0" friction="1.0" />
   </joint>
   <link name="link2">
@@ -142,7 +142,7 @@
     <parent link="link1" />
     <child link="link2" />
     <axis xyz="0 0 1" />
-    <limit effort="50.0" lower="-2.61799" upper="2.61799" velocity="3.14" />
+    <limit effort="50.0" lower="-2.61799" upper="2.61799" velocity="2.14" acceleration="10.0" />
     <dynamics damping="1.0" friction="1.0" />
   </joint>
   <link name="link3">
@@ -170,7 +170,7 @@
     <parent link="link2" />
     <child link="link3" />
     <axis xyz="0 0 1" />
-    <limit effort="32.0" lower="-0.061087" upper="3.1101767270538954" velocity="3.14" />
+    <limit effort="32.0" lower="-0.061087" upper="3.1101767270538954" velocity="2.14" acceleration="10.0" />
     <dynamics damping="1.0" friction="1.0" />
   </joint>
   <link name="link4">
@@ -198,7 +198,7 @@
     <parent link="link3" />
     <child link="link4" />
     <axis xyz="0 0 1" />
-    <limit effort="32.0" lower="-3.1101767270538954" upper="3.1101767270538954" velocity="3.14" />
+    <limit effort="32.0" lower="-3.1101767270538954" upper="3.1101767270538954" velocity="2.14" acceleration="10.0" />
     <dynamics damping="1.0" friction="1.0" />
   </joint>
   <link name="link5">
@@ -226,7 +226,7 @@
     <parent link="link4" />
     <child link="link5" />
     <axis xyz="0 0 1" />
-    <limit effort="32.0" lower="-2.1642" upper="2.1642" velocity="3.14" />
+    <limit effort="32.0" lower="-2.1642" upper="2.1642" velocity="2.14" acceleration="10.0" />
     <dynamics damping="1.0" friction="1.0" />
   </joint>
   <link name="link6">
@@ -254,7 +254,7 @@
     <parent link="link5" />
     <child link="link6" />
     <axis xyz="0 0 1" />
-    <limit effort="20.0" lower="-3.1101767270538954" upper="3.1101767270538954" velocity="3.14" />
+    <limit effort="20.0" lower="-3.1101767270538954" upper="3.1101767270538954" velocity="2.14" acceleration="10.0" />
     <dynamics damping="1.0" friction="1.0" />
   </joint>
   <transmission name="tran1">

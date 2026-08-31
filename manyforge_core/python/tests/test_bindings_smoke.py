@@ -245,9 +245,21 @@ def test_plan_result_dto():
 def test_validation_result_dto():
     """Test ValidationResultDTO creation and attributes."""
     import manyforge_core_py
-    
+
     r = manyforge_core_py.ValidationResultDTO()
     assert r.valid is False
+    assert r.trajectory_metrics is None
+
+    metrics = manyforge_core_py.TrajectoryValidationMetricsDTO()
+    metrics.trajectory_duration_s = 1.25
+    metrics.peak_abs_joint_velocity_rad_s = [0.4, 0.5]
+    metrics.peak_abs_joint_acceleration_rad_s2 = [1.0, 1.5]
+    metrics.peak_tcp_linear_speed_mps = 0.15
+    r.trajectory_metrics = metrics
+    assert r.trajectory_metrics.trajectory_duration_s == 1.25
+    assert r.trajectory_metrics.peak_abs_joint_velocity_rad_s == [0.4, 0.5]
+    assert r.trajectory_metrics.peak_abs_joint_acceleration_rad_s2 == [1.0, 1.5]
+    assert r.trajectory_metrics.peak_tcp_linear_speed_mps == 0.15
 
 
 def test_collision_check_result_dto():

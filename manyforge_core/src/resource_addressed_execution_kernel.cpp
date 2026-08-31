@@ -24,6 +24,11 @@
 namespace manyforge::core {
 namespace {
 
+[[nodiscard]] bool is_active_stop_fault_latch(
+    const std::optional<StopFaultLatchDTO>& latch) noexcept {
+  return latch.has_value() && latch->state != StopFaultLatchStateDTO::kCleared;
+}
+
 [[nodiscard]] ErrorDTO error(std::string code, std::string message, std::string reason) {
   return ErrorDTO{std::move(code), std::move(message), {{"reason", std::move(reason)}}};
 }
@@ -310,7 +315,9 @@ derive_route_readiness_projection(
          left.retained_default_stop_limits == right.retained_default_stop_limits &&
          left.stop_node_category == right.stop_node_category && left.engine == right.engine &&
          left.stop_execution_port == right.stop_execution_port &&
-         left.prepared_motion_engine == right.prepared_motion_engine;
+         left.prepared_motion_engine == right.prepared_motion_engine &&
+         left.default_operator_stop_profile == right.default_operator_stop_profile &&
+         left.default_fault_stop_profile == right.default_fault_stop_profile;
 }
 
 [[nodiscard]] std::set<ControlDomainId> changed_registration_domains(
@@ -994,6 +1001,71 @@ select_disable_active_configurations(
   return Result<GripperCommandRequestDTO>::Ok(std::move(request));
 }
 
+[[nodiscard]] Result<std::optional<PreparedParticipantStopPlanDTO>>
+make_runtime_fault_stop_plan(
+    const RuntimeParticipantStopReadiness& readiness,
+    const std::optional<MotionInterruptStopProfileDTO>& profile,
+    const RuntimeParticipantBindingDTO& binding,
+    std::span<const HardStopResourceLimitDTO> retained_default_stop_limits,
+    const MotionInterruptNodeCategory node_category,
+    const OperationId& operation_id,
+    const OperationRevision operation_revision,
+    const OperationParticipantId& participant_id, const ProgramId& program_id,
+    const ProgramRevision& program_revision,
+    const ProgramBindingId& program_binding_id,
+    const ProgramRunId& program_run_id) {
+  if (!profile.has_value()) {
+    return Result<std::optional<PreparedParticipantStopPlanDTO>>::Ok(
+        std::nullopt);
+  }
+  PreparedParticipantStopPlanContextDTO context{
+      operation_id,
+      operation_revision,
+      participant_id,
+      program_id,
+      program_revision,
+      program_binding_id,
+      program_run_id,
+      *profile,
+      ParticipantStopProfilePurposeDTO::kFault,
+      std::nullopt,
+      node_category};
+  auto prepared = MakePreparedParticipantStopPlan(
+      readiness.value().resolved_stop_base_plan, std::move(context),
+      binding.resources, retained_default_stop_limits);
+  if (!prepared.ok()) {
+    return Result<std::optional<PreparedParticipantStopPlanDTO>>::Err(
+        prepared.error());
+  }
+  return Result<std::optional<PreparedParticipantStopPlanDTO>>::Ok(
+      std::move(prepared.value()));
+}
+
+[[nodiscard]] bool prepared_fault_stop_plan_matches(
+    const std::optional<PreparedParticipantStopPlanDTO>& product,
+    const std::shared_ptr<const PreparedParticipantStopPlanDTO>& authority) {
+  return authority ? product == std::optional<PreparedParticipantStopPlanDTO>{*authority}
+                   : !product.has_value();
+}
+
+[[nodiscard]] Result<PreparedMotionDiagnosticsDTO> prepared_motion_diagnostics(
+    const PreparedOperationParticipantDTO& participant) {
+  const auto* motion = std::get_if<PreparedMotionExecutionDTO>(&participant.payload);
+  if (motion == nullptr ||
+      !motion->validation_evidence.noncollision_result.trajectory_metrics.has_value()) {
+    return reject<PreparedMotionDiagnosticsDTO>(
+        "prepared motion is missing accepted-trajectory diagnostics",
+        "prepared_motion_diagnostics_missing", ErrorCode::kInvariantViolation);
+  }
+  return Result<PreparedMotionDiagnosticsDTO>::Ok(PreparedMotionDiagnosticsDTO{
+      participant.participant_id,
+      participant.prepared_contract_digest,
+      motion->move_id,
+      motion->trajectory.joint_names,
+      *motion->validation_evidence.noncollision_result.trajectory_metrics,
+      motion->runtime_policy});
+}
+
 [[nodiscard]] Result<PreparedOperationParticipantDTO> build_prepared_capability_command_participant(
     const OperationIntentDTO& intent, const CapabilityCommandIntentDTO& command,
     const RuntimeParticipantBinding& sealed_binding,
@@ -1078,7 +1150,8 @@ select_disable_active_configurations(
       control.stop_evidence_policy_id,
       control.stop_evidence_policy_revision,
       ordinary_stop_plan,
-      std::move(payload)};
+      std::move(payload),
+      std::nullopt};
   return MakePreparedOperationParticipant(std::move(candidate), sealed_binding, readiness, nullptr,
                                           retained_default_stop_limits, stop_node_category);
 }
@@ -1269,7 +1342,10 @@ struct ActiveOperationParticipant final {
   std::optional<RuntimeParticipantPolicySelection> runtime_policy;
   std::vector<HardStopResourceLimitDTO> retained_default_stop_limits;
   MotionInterruptNodeCategory stop_node_category{MotionInterruptNodeCategory::kGeneric};
+  std::optional<MotionInterruptStopProfileDTO> default_operator_stop_profile;
   std::shared_ptr<const PreparedParticipantStopPlanDTO> ordinary_stop_plan;
+  std::optional<MotionInterruptStopProfileDTO> default_fault_stop_profile;
+  std::shared_ptr<const PreparedParticipantStopPlanDTO> fault_stop_plan;
   std::optional<PreparedOperationParticipantDTO> prepared_participant;
   IResolvedParticipantExecutionEngine* engine{};
   IResolvedPreparedParticipantExecutionEngine* prepared_motion_engine{};
@@ -1301,6 +1377,7 @@ struct PendingPreparedResume final {
   ControllerGoalId prior_controller_goal_id;
   ControllerGoalGeneration prior_controller_goal_generation{0U};
   std::shared_ptr<const PreparedParticipantStopPlanDTO> prior_stop_plan;
+  std::shared_ptr<const PreparedParticipantStopPlanDTO> prior_fault_stop_plan;
   std::shared_ptr<const ResolvedPreparedMotionResumeRequestDTO> authority;
   std::shared_ptr<const PreparedOperationParticipantDTO> participant;
   std::shared_ptr<std::atomic_bool> cancellation_requested;
@@ -4104,8 +4181,13 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
                                                      intent.program_revision,
                                                      intent.program_binding_id,
                                                      intent.program_run_id,
-                                                     std::nullopt,
-                                                     ParticipantStopProfilePurposeDTO::kOrdinary,
+                                                     payload_kind == OperationParticipantPayloadKind::kMotion
+                                                         ? resolved.value().default_operator_stop_profile
+                                                         : std::optional<MotionInterruptStopProfileDTO>{},
+                                                     payload_kind == OperationParticipantPayloadKind::kMotion &&
+                                                             resolved.value().default_operator_stop_profile.has_value()
+                                                         ? ParticipantStopProfilePurposeDTO::kOperator
+                                                         : ParticipantStopProfilePurposeDTO::kOrdinary,
                                                      std::nullopt,
                                                      resolved.value().stop_node_category};
   auto ordinary_stop_plan = MakePreparedParticipantStopPlan(
@@ -4113,6 +4195,18 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
       binding.resources, resolved.value().retained_default_stop_limits);
   if (!ordinary_stop_plan.ok()) {
     return Result<OperationAcceptedDTO>::Err(ordinary_stop_plan.error());
+  }
+  auto fault_stop_plan = make_runtime_fault_stop_plan(
+      *resolved.value().stop_readiness,
+      payload_kind == OperationParticipantPayloadKind::kMotion
+          ? resolved.value().default_fault_stop_profile
+          : std::optional<MotionInterruptStopProfileDTO>{},
+      binding, resolved.value().retained_default_stop_limits,
+      resolved.value().stop_node_category, operation_id, operation_revision,
+      participant_id, intent.program_id, intent.program_revision,
+      intent.program_binding_id, intent.program_run_id);
+  if (!fault_stop_plan.ok()) {
+    return Result<OperationAcceptedDTO>::Err(fault_stop_plan.error());
   }
 
   std::optional<PreparedOperationParticipantDTO> prepared_command_product;
@@ -4129,12 +4223,18 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
   }
 
   std::shared_ptr<const PreparedParticipantStopPlanDTO> retained_stop_plan;
+  std::shared_ptr<const PreparedParticipantStopPlanDTO> retained_fault_stop_plan;
   std::shared_ptr<const PreparedOperationParticipantDTO> retained_command_product;
   std::map<OperationId, std::unique_ptr<ActiveOperation>>::node_type prepared_operation;
   ReplayEntry prepared_replay{intent, accepted};
   try {
     retained_stop_plan = std::make_shared<const PreparedParticipantStopPlanDTO>(
         std::move(ordinary_stop_plan.value()));
+    if (fault_stop_plan.value().has_value()) {
+      retained_fault_stop_plan =
+          std::make_shared<const PreparedParticipantStopPlanDTO>(
+              std::move(*fault_stop_plan.value()));
+    }
     if (prepared_command_product.has_value()) {
       retained_command_product = std::make_shared<const PreparedOperationParticipantDTO>(
           std::move(*prepared_command_product));
@@ -4149,7 +4249,10 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
                                                     resolved.value().runtime_policy,
                                                     resolved.value().retained_default_stop_limits,
                                                     resolved.value().stop_node_category,
+                                                    resolved.value().default_operator_stop_profile,
                                                     retained_stop_plan,
+                                                    resolved.value().default_fault_stop_profile,
+                                                    retained_fault_stop_plan,
                                                     std::nullopt,
                                                     engine,
                                                     resolved.value().prepared_motion_engine,
@@ -4320,7 +4423,8 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
         *resolved.value().runtime_policy,
         resolved.value().retained_default_stop_limits,
         resolved.value().stop_node_category,
-        retained_stop_plan};
+        retained_stop_plan,
+        retained_fault_stop_plan};
     auto prepared_execution =
         resolved.value().prepared_motion_engine->PrepareMotion(std::move(prepare_request));
     if (!prepared_execution.ok()) {
@@ -4479,6 +4583,7 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
     std::optional<GripperCommandRequestDTO> command_request;
     std::shared_ptr<const PreparedOperationParticipantDTO> prepared_command_product;
     std::shared_ptr<const PreparedParticipantStopPlanDTO> stop_plan;
+    std::shared_ptr<const PreparedParticipantStopPlanDTO> fault_stop_plan;
   };
 
   if (next_operation_id_ == 0U || next_operation_id_ == std::numeric_limits<std::uint64_t>::max()) {
@@ -4604,8 +4709,13 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
                                                        intent.program_revision,
                                                        intent.program_binding_id,
                                                        intent.program_run_id,
-                                                       std::nullopt,
-                                                       ParticipantStopProfilePurposeDTO::kOrdinary,
+                                                       payload_kind == OperationParticipantPayloadKind::kMotion
+                                                           ? registration.default_operator_stop_profile
+                                                           : std::optional<MotionInterruptStopProfileDTO>{},
+                                                       payload_kind == OperationParticipantPayloadKind::kMotion &&
+                                                               registration.default_operator_stop_profile.has_value()
+                                                           ? ParticipantStopProfilePurposeDTO::kOperator
+                                                           : ParticipantStopProfilePurposeDTO::kOrdinary,
                                                        std::nullopt,
                                                        registration.stop_node_category};
     auto stop_plan = MakePreparedParticipantStopPlan(
@@ -4614,11 +4724,29 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
     if (!stop_plan.ok()) {
       return Result<OperationAcceptedDTO>::Err(stop_plan.error());
     }
+    auto fault_stop_plan = make_runtime_fault_stop_plan(
+        *registration.stop_readiness,
+        payload_kind == OperationParticipantPayloadKind::kMotion
+            ? registration.default_fault_stop_profile
+            : std::optional<MotionInterruptStopProfileDTO>{},
+        binding, registration.retained_default_stop_limits,
+        registration.stop_node_category, operation_id, operation_revision,
+        participant_id, intent.program_id, intent.program_revision,
+        intent.program_binding_id, intent.program_run_id);
+    if (!fault_stop_plan.ok()) {
+      return Result<OperationAcceptedDTO>::Err(fault_stop_plan.error());
+    }
     std::shared_ptr<const PreparedParticipantStopPlanDTO> retained_stop_plan;
+    std::shared_ptr<const PreparedParticipantStopPlanDTO> retained_fault_stop_plan;
     std::shared_ptr<const PreparedOperationParticipantDTO> prepared_command_product;
     try {
       retained_stop_plan =
           std::make_shared<const PreparedParticipantStopPlanDTO>(std::move(stop_plan.value()));
+      if (fault_stop_plan.value().has_value()) {
+        retained_fault_stop_plan =
+            std::make_shared<const PreparedParticipantStopPlanDTO>(
+                std::move(*fault_stop_plan.value()));
+      }
       if (payload_kind == OperationParticipantPayloadKind::kCapabilityCommand) {
         auto prepared = build_prepared_capability_command_participant(
             intent, std::get<CapabilityCommandIntentDTO>(participant_intent.payload),
@@ -4670,7 +4798,10 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
                                    registration.runtime_policy,
                                    registration.retained_default_stop_limits,
                                    registration.stop_node_category,
+                                   registration.default_operator_stop_profile,
                                    retained_stop_plan,
+                                   registration.default_fault_stop_profile,
+                                   retained_fault_stop_plan,
                                    std::nullopt,
                                    registration.engine,
                                    registration.prepared_motion_engine,
@@ -4694,7 +4825,8 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
     admissions.push_back(PreparedAdmission{std::move(registration), payload_kind,
                                            std::move(motion_request), std::move(command_request),
                                            std::move(prepared_command_product),
-                                           std::move(retained_stop_plan)});
+                                           std::move(retained_stop_plan),
+                                           std::move(retained_fault_stop_plan)});
   }
 
   std::sort(reservation_rows.begin(), reservation_rows.end(),
@@ -4879,7 +5011,8 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
                 *admission.motion_request, operation_revision, admission.registration.binding,
                 *admission.registration.stop_readiness, *admission.registration.runtime_policy,
                 admission.registration.retained_default_stop_limits,
-                admission.registration.stop_node_category, admission.stop_plan});
+                admission.registration.stop_node_category, admission.stop_plan,
+                admission.fault_stop_plan});
       }
       return admission.registration.prepared_motion_engine->PrepareCapabilityCommand(
           ResolvedPreparedCapabilityCommandExecutionRequestDTO{
@@ -5180,8 +5313,10 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
               prior_plan.program_revision,
               prior_plan.program_binding_id,
               prior_plan.program_run_id,
-              std::nullopt,
-              ParticipantStopProfilePurposeDTO::kOrdinary,
+              participant.default_operator_stop_profile,
+              participant.default_operator_stop_profile.has_value()
+                  ? ParticipantStopProfilePurposeDTO::kOperator
+                  : ParticipantStopProfilePurposeDTO::kOrdinary,
               std::nullopt,
               participant.stop_node_category};
           auto stop_plan = MakePreparedParticipantStopPlan(
@@ -5190,13 +5325,34 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
           if (!stop_plan.ok()) {
             return Result<OperationControlAcceptedDTO>::Err(stop_plan.error());
           }
+          auto fault_stop_plan = make_runtime_fault_stop_plan(
+              participant.stop_readiness,
+              participant.default_fault_stop_profile,
+              participant.binding.value(),
+              participant.retained_default_stop_limits,
+              participant.stop_node_category, request.operation_id,
+              next_revision, participant_state.participant_id,
+              prior_plan.program_id, prior_plan.program_revision,
+              prior_plan.program_binding_id, prior_plan.program_run_id);
+          if (!fault_stop_plan.ok()) {
+            return Result<OperationControlAcceptedDTO>::Err(
+                fault_stop_plan.error());
+          }
           try {
             auto retained_plan = std::make_shared<const PreparedParticipantStopPlanDTO>(
                 std::move(stop_plan.value()));
+            std::shared_ptr<const PreparedParticipantStopPlanDTO>
+                retained_fault_plan;
+            if (fault_stop_plan.value().has_value()) {
+              retained_fault_plan =
+                  std::make_shared<const PreparedParticipantStopPlanDTO>(
+                      std::move(*fault_stop_plan.value()));
+            }
             prepared_resume = std::make_shared<const ResolvedPreparedMotionResumeRequestDTO>(
                 ResolvedPreparedMotionResumeRequestDTO{
                     request.operation_id, next_revision, participant_state.participant_id,
-                    next_goal_id, next_goal_generation, std::move(retained_plan)});
+                    next_goal_id, next_goal_generation, std::move(retained_plan),
+                    std::move(retained_fault_plan)});
             cancellation_requested = std::make_shared<std::atomic_bool>(false);
           } catch (...) {
             return reject<OperationControlAcceptedDTO>(
@@ -5281,6 +5437,7 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
                                   participant_state->controller_goal_id,
                                   participant_state->controller_goal_generation,
                                   participant->ordinary_stop_plan,
+                                  participant->fault_stop_plan,
                                   target.prepared_resume,
                                   {},
                                   target.cancellation_requested,
@@ -6267,7 +6424,7 @@ Result<StopStatusDTO> ResourceAddressedExecutionKernel::get_stop_status(
 CellStopActionProjectionDTO ResourceAddressedExecutionKernel::cell_stop_action_projection() const {
   std::lock_guard state_lock(state_mutex_);
   CellStopActionProjectionDTO projection{cell_stop_generation_, std::nullopt, std::nullopt};
-  if (active_stop_fault_latch_.has_value()) {
+  if (is_active_stop_fault_latch(active_stop_fault_latch_)) {
     const auto& latch = *active_stop_fault_latch_;
     projection.fault = CellStopFaultSummaryDTO{
         latch.latch_id,        latch.latch_generation, latch.state,           latch.trigger,
@@ -6448,7 +6605,7 @@ Result<StopFaultRecoveryResultDTO> ResourceAddressedExecutionKernel::recover_sto
           error("request_ledger_full", "operation replay ledger reached its fixed bound",
                 "request_ledger_full"));
     }
-    if (!active_stop_fault_latch_.has_value() ||
+    if (!is_active_stop_fault_latch(active_stop_fault_latch_) ||
         active_stop_fault_latch_->latch_id != intent.expected_latch_id ||
         active_stop_fault_latch_->latch_generation != intent.expected_latch_generation ||
         !active_stop_fault_latch_->stop_certificate.has_value()) {
@@ -6586,6 +6743,10 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop(
     full = &*malformed_full;
   }
   const auto& context = ordinary != nullptr ? ordinary->request_context : full->request_context;
+  const bool runtime_collision_containment =
+      ordinary != nullptr &&
+      ordinary->reason == std::optional<std::string>{"runtime_collision_fault"} &&
+      ordinary->request_context.source_label == "kernel.runtime_collision";
   const auto& attribution = ordinary != nullptr ? ordinary->attribution : full->attribution;
   if (!attribution.locally_valid()) {
     return reject<StopAcceptedDTO>("Stop ingress attribution is invalid",
@@ -7157,12 +7318,15 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop(
           if (!participant_selected(operation_id, participant.slot_owner.participant_id)) {
             continue;
           }
-          if (participant.ordinary_stop_plan == nullptr) {
+          const auto& selected_stop_plan =
+              runtime_collision_containment ? participant.fault_stop_plan
+                                            : participant.ordinary_stop_plan;
+          if (selected_stop_plan == nullptr) {
             return reject<StopAcceptedDTO>("resolved Stop participant has no prepared plan",
                                            "stop_participant_plan_missing",
                                            ErrorCode::kInvariantViolation);
           }
-          plans.push_back(*participant.ordinary_stop_plan);
+          plans.push_back(*selected_stop_plan);
           owner_rows.push_back(ResourceSlotStopFenceOwnerDTO{participant.slot_owner,
                                                              participant.resources, next_revision});
         }
@@ -7232,6 +7396,31 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop(
         motion_admission_closed_ = true;
         return Result<StopAcceptedDTO>::Err(fenced.error());
       }
+      // The resource/operation Stop fence is now linearized. Install the
+      // matching process-local participant fence before publishing any
+      // physical Stop stage so late work from the replaced trajectory cannot
+      // win a competing inner terminal. This seam is non-blocking and has no
+      // physical effect; containment still belongs exclusively to StopControl.
+      for (const auto& affected : affected_revisions) {
+        auto* operation = find_active_operation_locked(affected.operation_id);
+        if (operation == nullptr) {
+          continue;
+        }
+        for (auto& participant : operation->participants) {
+          if (!participant_selected(affected.operation_id,
+                                    participant.slot_owner.participant_id) ||
+              participant.payload_kind != OperationParticipantPayloadKind::kMotion ||
+              participant.engine == nullptr || participant.preparation_id == 0U) {
+            continue;
+          }
+          const auto fence = participant.engine->fence_addressed_participant_stop(
+              participant.preparation_id);
+          participant.stop_cancelled_pre_dispatch =
+              participant.stop_cancelled_pre_dispatch ||
+              fence == AddressedParticipantStopFenceDisposition::
+                           kEffectPreventedBeforeDispatch;
+        }
+      }
       for (const auto& affected : affected_revisions) {
         auto* operation = find_active_operation_locked(affected.operation_id);
         if (operation == nullptr) {
@@ -7256,10 +7445,11 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop(
             continue;
           }
           participant.stop_cancelled_pre_dispatch =
-              participant.payload_kind == OperationParticipantPayloadKind::kMotion
+              participant.stop_cancelled_pre_dispatch ||
+              (participant.payload_kind == OperationParticipantPayloadKind::kMotion
                   ? !participant.prepared_dispatch_released
                   : (!participant.prepared_dispatch_released &&
-                     participant.slot_state == ResourceSlotState::kReserved);
+                     participant.slot_state == ResourceSlotState::kReserved));
         }
         // Stop owns the public terminal from acceptance through aggregate
         // settlement. A participant that never crossed the dispatch barrier
@@ -8366,7 +8556,11 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
                                     participant_state.participant_id)) {
               continue;
             }
-            if (active_participant.ordinary_stop_plan == nullptr ||
+            const auto& selected_active_stop_plan =
+                runtime_collision_containment
+                    ? active_participant.fault_stop_plan
+                    : active_participant.ordinary_stop_plan;
+            if (selected_active_stop_plan == nullptr ||
                 active_participant.slot_owner.participant_id != participant_state.participant_id) {
               motion_admission_closed_ = true;
               continue;
@@ -8384,10 +8578,15 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
                 undispatched_resume = &*found;
               }
             }
-            const auto& stop_plan =
-                undispatched_resume != nullptr && undispatched_resume->prior_stop_plan
-                    ? *undispatched_resume->prior_stop_plan
-                    : *active_participant.ordinary_stop_plan;
+            const std::shared_ptr<const PreparedParticipantStopPlanDTO> prior_stop_plan =
+                undispatched_resume == nullptr
+                    ? nullptr
+                    : runtime_collision_containment
+                          ? undispatched_resume->prior_fault_stop_plan
+                          : undispatched_resume->prior_stop_plan;
+            const auto& stop_plan = prior_stop_plan
+                                        ? *prior_stop_plan
+                                        : *selected_active_stop_plan;
             const auto& stop_goal_id = undispatched_resume != nullptr
                                            ? undispatched_resume->prior_controller_goal_id
                                            : participant_state.controller_goal_id;
@@ -9667,6 +9866,28 @@ ResourceAddressedExecutionKernel::get_operation_recovery_assessment(
           "operation changed while its recovery assessment was read", "operation_recovery_stale",
           ErrorCode::kStaleGeneration);
     }
+    if (is_active_stop_fault_latch(active_stop_fault_latch_)) {
+      const auto& latch = *active_stop_fault_latch_;
+      // A participant may be physically stopped and locally retry-ready while
+      // the addressed cell owner has retained a stronger Stop-fault latch.
+      // Publish the composed truth: motion is settled, but only Program Reset
+      // may clear the exact outer latch.  Never offer Resume that the same
+      // owner would subsequently reject at motion admission.
+      ++assessment.assessment_revision;
+      assessment.recovery_class = RecoveryClass::kStopFaultIntervention;
+      assessment.status = RecoveryAssessmentStatus::kResetRequired;
+      assessment.latch_id = latch.latch_id.value();
+      assessment.stop_owner_generation = latch.stop_generation.value();
+      assessment.retry_admissible = false;
+      assessment.allowed_actions = {RecoveryAction::kResetCycle};
+      assessment.reason_code = "active_stop_fault_requires_reset";
+      if (latch.stop_certificate.has_value()) {
+        assessment.stop_certificate_id =
+            latch.stop_certificate->stop_certificate_id.value();
+        assessment.stop_certificate_revision =
+            latch.stop_certificate->stop_certificate_revision.value();
+      }
+    }
   }
   return Result<OperationRecoveryProjectionDTO>::Ok(
       OperationRecoveryProjectionDTO{revision, std::move(stop_id), std::move(stop_generation),
@@ -9729,6 +9950,13 @@ ResourceAddressedExecutionKernel::apply_operation_recovery_action(
       return reject<KernelRecoveryActionResultDTO>(
           "operation recovery fence is stale or unsupported", "operation_recovery_stale",
           ErrorCode::kStaleGeneration);
+    }
+    if (is_active_stop_fault_latch(active_stop_fault_latch_)) {
+      return Result<KernelRecoveryActionResultDTO>::Err(ErrorDTO{
+          "operation_recovery_blocked_by_stop_fault",
+          "Program Reset is required before motion can resume",
+          {{"reason", "active_stop_fault_requires_reset"},
+           {"latch_id", active_stop_fault_latch_->latch_id.value()}}});
     }
     if (operation_recovery_replay_ledger_.size() >= config_.request_replay_capacity) {
       return reject<KernelRecoveryActionResultDTO>(
@@ -10149,6 +10377,8 @@ Result<void> ResourceAddressedExecutionKernel::advance_prepared_resume(
       product.operation_revision != target->authority->operation_revision ||
       product.participant_id != target->authority->participant_id ||
       product.ordinary_stop_plan != *target->authority->ordinary_stop_plan ||
+      !prepared_fault_stop_plan_matches(product.fault_stop_plan,
+                                        target->authority->fault_stop_plan) ||
       prepare_participant_result_field_error(*snapshot.value().backend_prepare_result, product)
           .has_value()) {
     return fail_and_contain(error(std::string(to_string(ErrorCode::kInvariantViolation)),
@@ -10317,6 +10547,7 @@ Result<void> ResourceAddressedExecutionKernel::advance_prepared_resume(
             // runs under state_mutex_.
             const auto resumed_at_ns = clock_.now();
             active->ordinary_stop_plan = dispatch.authority->ordinary_stop_plan;
+            active->fault_stop_plan = dispatch.authority->fault_stop_plan;
             active->prepared_participant = *dispatch.participant;
             active->motion_request->binding.controller_goal_id =
                 dispatch.authority->controller_goal_id;
@@ -10400,6 +10631,7 @@ Result<void> ResourceAddressedExecutionKernel::advance_prepared_motion(
     std::vector<HardStopResourceLimitDTO> retained_default_stop_limits;
     MotionInterruptNodeCategory stop_node_category{MotionInterruptNodeCategory::kGeneric};
     std::shared_ptr<const PreparedParticipantStopPlanDTO> ordinary_stop_plan;
+    std::shared_ptr<const PreparedParticipantStopPlanDTO> fault_stop_plan;
   };
   std::optional<Target> target;
   {
@@ -10419,7 +10651,8 @@ Result<void> ResourceAddressedExecutionKernel::advance_prepared_motion(
                           participant->subordinate_id, participant->binding,
                           participant->stop_readiness, participant->runtime_policy,
                           participant->retained_default_stop_limits,
-                          participant->stop_node_category, participant->ordinary_stop_plan});
+                          participant->stop_node_category, participant->ordinary_stop_plan,
+                          participant->fault_stop_plan});
   }
 
   const auto release_claim = [&]() {
@@ -10500,6 +10733,8 @@ Result<void> ResourceAddressedExecutionKernel::advance_prepared_motion(
       target->retained_default_stop_limits, target->stop_node_category);
   if (!verified.ok() ||
       snapshot.value().participant->ordinary_stop_plan != *target->ordinary_stop_plan ||
+      !prepared_fault_stop_plan_matches(snapshot.value().participant->fault_stop_plan,
+                                        target->fault_stop_plan) ||
       prepare_participant_result_field_error(*snapshot.value().backend_prepare_result,
                                              *snapshot.value().participant)
           .has_value()) {
@@ -10598,6 +10833,27 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
           row.state = OperationStateKind::kPrepared;
         }
         prepared_state.updated_at_ns = clock_.now();
+        std::vector<PreparedMotionDiagnosticsDTO> motion_diagnostics;
+        motion_diagnostics.reserve(operation->participants.size());
+        for (const auto& candidate : operation->participants) {
+          if (candidate.payload_kind != OperationParticipantPayloadKind::kMotion) {
+            continue;
+          }
+          if (!candidate.prepared_participant.has_value()) {
+            return reject<void>("prepared barrier lost one motion participant product",
+                                "prepared_motion_product_missing",
+                                ErrorCode::kInvariantViolation);
+          }
+          auto diagnostic = prepared_motion_diagnostics(*candidate.prepared_participant);
+          if (!diagnostic.ok()) {
+            return Result<void>::Err(diagnostic.error());
+          }
+          motion_diagnostics.push_back(std::move(diagnostic.value()));
+        }
+        std::sort(motion_diagnostics.begin(), motion_diagnostics.end(),
+                  [](const auto& left, const auto& right) {
+                    return left.participant_id < right.participant_id;
+                  });
         auto durable = journal_.RecordOperationState(
             config_.request_owner_epoch, prepared_state,
             operation->runtime_scale_status.has_value() ? &*operation->runtime_scale_status
@@ -10606,7 +10862,8 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
                                                             OperationParticipantPayloadKind::kMotion
                                                         ? "subordinate_motion_prepared"
                                                         : "subordinate_command_prepared")
-                                                 : "coordinated_prepare_barrier_complete");
+                                                 : "coordinated_prepare_barrier_complete",
+            motion_diagnostics);
         if (!durable.ok()) {
           return Result<void>::Err(durable.error());
         }

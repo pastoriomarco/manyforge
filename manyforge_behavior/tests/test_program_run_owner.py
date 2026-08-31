@@ -155,6 +155,7 @@ class _OperatorStopTaskPort(_TaskPort):
     def __init__(self, events: list[str]) -> None:
         super().__init__(events, OwnerTaskState.ACTIVE)
         self.observations = 0
+        self.recoveries: list[tuple[str, str]] = []
 
     def observe(self, task_id: str) -> OwnerTaskSnapshot:
         self.observations += 1
@@ -174,6 +175,26 @@ class _OperatorStopTaskPort(_TaskPort):
             reason_code="operation_stopped",
             message="native operation was stopped",
         )
+
+    def recover(
+        self,
+        task_id: str,
+        _identity: NodeAttemptIdentity,
+        *,
+        action: str,
+        request_id: str,
+        reason: str | None,
+    ) -> dict[str, Any]:
+        assert action == "replan_from_stopped_state"
+        assert reason is None or isinstance(reason, str)
+        self.recoveries.append((task_id, request_id))
+        return {
+            "request_id": request_id,
+            "action": action,
+            "accepted": True,
+            "resulting_assessment": {"status": "resume_ready"},
+            "error": None,
+        }
 
 
 class _MalformedOperatorStopTaskPort(_OperatorStopTaskPort):
@@ -282,6 +303,7 @@ class _ScopePort:
         self._events = events
         self.state = ProgramRunScopeState.SETTLED
         self.stop_requests = 0
+        self.release_requests = 0
         self.reset_requests = 0
 
     def _snapshot(self, program_run_id: str) -> ProgramRunScopeSnapshot:
@@ -311,6 +333,11 @@ class _ScopePort:
         return self._snapshot(program_run_id)
 
     def observe(self, program_run_id: str) -> ProgramRunScopeSnapshot:
+        return self._snapshot(program_run_id)
+
+    def release_stop(self, program_run_id: str) -> ProgramRunScopeSnapshot:
+        self.release_requests += 1
+        self._events.append("scope_stop_release")
         return self._snapshot(program_run_id)
 
     def reset(self, program_run_id: str) -> ProgramRunScopeSnapshot:
@@ -959,6 +986,87 @@ def test_motion_stop_holds_the_current_node_without_terminating_the_run() -> Non
     host.shutdown()
 
 
+def test_full_stop_preserves_tree_and_run_recovers_a_fresh_attempt() -> None:
+    interventions = ProgramInterventionRegistry(maximum_retained_runs=8)
+    context = _ContextPort([])
+    owner, admission, task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE,
+        task_factory=_OperatorStopTaskPort,
+        context_port=context,
+        interventions=interventions,
+    )
+    host = ProgramRunTickHost(owner, tick_interval_s=0.01)
+    started = host.start_run(admission)
+    program_run_id = started.capture.program_run_id
+
+    running = host.advance_ready_once()[0]
+    assert running.state is ProgramRunState.RUNNING
+    assert running.tree_status == "running"
+    assert task.starts == 1
+
+    stopped = host.full_stop(
+        program_run_id,
+        reason="ordinary operator Full Stop",
+        stop_request_id="full-stop.1",
+    )
+
+    assert stopped.state is ProgramRunState.FULL_STOPPED
+    assert stopped.tree_status == "running"
+    assert scope.stop_requests == 1
+    assert task.cancels == 0
+    assert context.unbound == []
+    assert interventions.read(program_run_id) is not None
+
+    resumed = host.resume_full_stop(
+        program_run_id,
+        request_id="run-after-full-stop.1",
+    )
+
+    assert resumed.state is ProgramRunState.RUNNING
+    assert task.starts == 1
+    assert len(task.recoveries) == 1
+    assert scope.release_requests == 1
+    assert interventions.read(program_run_id) is None
+    assert host.advance_ready_once()[0].state is ProgramRunState.RUNNING
+    assert task.starts == 2
+
+    host.stop_run(program_run_id)
+    host.shutdown()
+
+
+def test_full_stop_waits_for_scope_settlement_before_freezing_the_tree() -> None:
+    interventions = ProgramInterventionRegistry(maximum_retained_runs=8)
+    owner, admission, task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE,
+        task_factory=_OperatorStopTaskPort,
+        interventions=interventions,
+    )
+    host = ProgramRunTickHost(owner, tick_interval_s=0.01)
+    started = host.start_run(admission)
+    program_run_id = started.capture.program_run_id
+    assert host.advance_ready_once()[0].state is ProgramRunState.RUNNING
+    scope.state = ProgramRunScopeState.ACTIVE
+
+    stopping = host.full_stop(program_run_id)
+
+    assert stopping.state is ProgramRunState.FULL_STOPPING
+    assert task.cancels == 0
+    assert host.advance_ready_once()[0].state is ProgramRunState.FULL_STOPPING
+
+    scope.state = ProgramRunScopeState.SETTLED
+    stopped = host.advance_ready_once()[0]
+    assert stopped.state is ProgramRunState.FULL_STOPPED
+    assert task.cancels == 0
+
+    terminal = host.stop_run(program_run_id)
+    assert terminal.state is ProgramRunState.STOPPED
+    # Physical settlement already belongs to the adopted Full Stop. Program
+    # Stop only invalidates/releases the preserved tree; it does not issue a
+    # redundant task cancellation.
+    assert task.cancels == 0
+    host.shutdown()
+
+
 def test_operator_stop_without_exact_identity_fails_before_held_tree_progress() -> None:
     interventions = ProgramInterventionRegistry(maximum_retained_runs=8)
     owner, admission, task, _scope, _events = _fixture(
@@ -1263,6 +1371,17 @@ def test_unknown_kernel_scope_never_reports_stopped_and_recovers_cleanly() -> No
     assert stopped.active_operation_count == 0
     assert stopped.reason_code is None
     assert stopped.message == ""
+
+
+def test_retained_terminal_scope_can_reset_without_rebuilding_its_tree() -> None:
+    owner, _admission, _task, scope, events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
+
+    owner.reset_retained_effects("program-run.retained")
+
+    assert scope.reset_requests == 1
+    assert events == ["scope_reset"]
 
 
 def test_program_run_snapshot_is_a_closed_serializable_owner_projection() -> None:

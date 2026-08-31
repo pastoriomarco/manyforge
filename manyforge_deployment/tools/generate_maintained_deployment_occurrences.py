@@ -50,6 +50,12 @@ EMPTY_PROVIDER_CONTRACT_SCHEMA_ID: Final = (
 EMPTY_PROVIDER_CONTRACT_SCHEMA_REVISION: Final = (
     "sha256:fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270"
 )
+MOTION_CONTROLLED_STOP_SCHEMA_ID: Final = (
+    "manyforge.value_schema.provider_contract.motion_controlled_stop.v1"
+)
+MOTION_CONTROLLED_STOP_SCHEMA_REVISION: Final = (
+    "sha256:afbbcda3b81eabff2bbdffb5658fb1fcd3331cde896cadf0681793a2f9db90dd"
+)
 LIFECYCLE_CATALOG_API_VERSION: Final = "manyforge.brand_lifecycle_plan_catalog.v1"
 LITE6_LIFECYCLE_PROVIDER_ID: Final = "lite6_arm_provider"
 LITE6_GRIPPER_LIFECYCLE_PROVIDER_ID: Final = "lite6_gripper_provider"
@@ -838,6 +844,28 @@ def software_hard_provider_contract() -> dict[str, Any]:
     }
 
 
+def motion_controlled_stop_provider_contract_ref() -> dict[str, str]:
+    return {
+        "provider_contract_role_id": "stop_contract",
+        "contract_schema_id": MOTION_CONTROLLED_STOP_SCHEMA_ID,
+        "contract_schema_revision": MOTION_CONTROLLED_STOP_SCHEMA_REVISION,
+    }
+
+
+def motion_controlled_stop_provider_contract() -> dict[str, Any]:
+    return {
+        "provider_contract_ref": motion_controlled_stop_provider_contract_ref(),
+        "stop_command_support": {
+            "command_kind": "motion_controlled_stop",
+            "command_endpoint_role_ids": ["command"],
+        },
+        "stop_evidence_support": {
+            "evidence_kind": "motion_rest",
+            "evidence_endpoint_role_ids": ["state"],
+        },
+    }
+
+
 def provider_manifest(
     provider_id: str,
     capability_ids: tuple[str, ...],
@@ -847,7 +875,14 @@ def provider_manifest(
 ) -> dict[str, Any]:
     provider_contracts: list[dict[str, Any]] = []
     if include_native_stop_support:
-        provider_contracts.append(software_hard_provider_contract())
+        provider_contracts.extend(
+            [motion_controlled_stop_provider_contract(), software_hard_provider_contract()]
+        )
+        provider_contracts.sort(
+            key=lambda row: row["provider_contract_ref"][
+                "provider_contract_role_id"
+            ]
+        )
     value = {
         "api_version": "manyforge.provider_manifest.v1",
         "provider_manifest_id": provider_id,
@@ -1251,6 +1286,8 @@ def lite6_gripper_lifecycle_product() -> tuple[dict[str, Any], dict[str, Any]]:
 def native_lite6_provider_manifest(
     lifecycle_manifest: dict[str, Any],
     capability_ids: tuple[str, ...],
+    *,
+    include_motion_controlled_stop: bool,
 ) -> dict[str, Any]:
     lifecycle_capabilities = {
         offer["capability_id"]: offer
@@ -1265,12 +1302,18 @@ def native_lite6_provider_manifest(
         for capability_id in capability_ids
     )
     offered_capabilities.sort(key=lambda row: row["capability_id"])
+    provider_contracts = [software_hard_provider_contract()]
+    if include_motion_controlled_stop:
+        provider_contracts.append(motion_controlled_stop_provider_contract())
+    provider_contracts.sort(
+        key=lambda row: row["provider_contract_ref"]["provider_contract_role_id"]
+    )
     return revisioned_document(
         {
             "api_version": "manyforge.provider_manifest.v1",
             "provider_manifest_id": lifecycle_manifest["provider_manifest_id"],
             "offered_capabilities": offered_capabilities,
-            "provider_contracts": [software_hard_provider_contract()],
+            "provider_contracts": provider_contracts,
             "lifecycle_plan_catalog": copy.deepcopy(
                 lifecycle_manifest["lifecycle_plan_catalog"]
             ),
@@ -1380,7 +1423,15 @@ def ros2_control_provider_manifest(
                 }
                 for capability_id in sorted(endpoint_roles)
             ],
-            "provider_contracts": [software_hard_provider_contract()],
+            "provider_contracts": sorted(
+                [
+                    motion_controlled_stop_provider_contract(),
+                    software_hard_provider_contract(),
+                ],
+                key=lambda row: row["provider_contract_ref"][
+                    "provider_contract_role_id"
+                ],
+            ),
             "lifecycle_plan_catalog": {
                 "catalog_api_version": LIFECYCLE_CATALOG_API_VERSION,
                 "semantic_digest": semantic_digest,
@@ -1408,28 +1459,27 @@ def lite6_lifecycle_identity_header(
     ).encode("utf-8")
 
 
-def stop_policy() -> dict[str, Any]:
+def cell_controlled_stop_deadline_budget() -> dict[str, Any]:
+    """One outer transaction envelope shared by every cell participant."""
+    return {
+        "outer_duration_ns": 3_000_000_000,
+        "kernel_completion_reserve_ns": 200_000_000,
+        "phases": [
+            {"phase_id": "command", "deadline_offset_ns": 300_000_000},
+            {"phase_id": "terminal", "deadline_offset_ns": 1_750_000_000},
+            {"phase_id": "hard_command", "deadline_offset_ns": 1_900_000_000},
+            {"phase_id": "hard_terminal", "deadline_offset_ns": 2_700_000_000},
+        ],
+    }
+
+
+def controller_goal_cancel_stop_policy() -> dict[str, Any]:
     value = {
         "api_version": "manyforge.stop_evidence_policy.v2",
         "stop_evidence_policy_id": "manyforge.native_controller_goal_terminal",
         "disposition": "stoppable",
         "containment_granularity": "resource",
-        "deadline_budget": {
-            "outer_duration_ns": 2_000_000_000,
-            "kernel_completion_reserve_ns": 100_000_000,
-            "phases": [
-                {"phase_id": "command", "deadline_offset_ns": 500_000_000},
-                {"phase_id": "terminal", "deadline_offset_ns": 1_000_000_000},
-                {
-                    "phase_id": "hard_command",
-                    "deadline_offset_ns": 1_200_000_000,
-                },
-                {
-                    "phase_id": "hard_terminal",
-                    "deadline_offset_ns": 1_900_000_000,
-                },
-            ],
-        },
+        "deadline_budget": cell_controlled_stop_deadline_budget(),
         "escalation_stages": [
             {
                 "stop_escalation_stage_id": "nominal_controller_goal_cancel",
@@ -1453,6 +1503,100 @@ def stop_policy() -> dict[str, Any]:
                         },
                         "observation_semantics": {
                             "observation_kind": "post_command_sample"
+                        },
+                    }
+                ],
+            },
+            {
+                "stop_escalation_stage_id": "software_hard",
+                "stage_kind": "software_hard",
+                "containment_granularity": "resource",
+                "containment_command": {
+                    "command_phase_id": "hard_command",
+                    "command": {
+                        "command_kind": "registered",
+                        "provider_contract_ref": software_hard_provider_contract_ref(),
+                        "registered_command_kind_id": "manyforge.stop.software_hard",
+                    },
+                },
+                "evidence_conjunction": "all_of",
+                "evidence_requirements": [
+                    {
+                        "evidence_item_id": "hard_rest",
+                        "phase_id": "hard_terminal",
+                        "evidence": {
+                            "evidence_kind": "motion_rest",
+                            "provider_contract_ref": software_hard_provider_contract_ref(),
+                        },
+                        "source_requirement": {
+                            "source_kind": "binding_state_authority",
+                            "freshness_budget_ns": 100_000_000,
+                            "state_endpoint_role_id": "state",
+                            "allowed_authority_classes": [
+                                "commanded",
+                                "measured",
+                                "predicted",
+                            ],
+                        },
+                        "observation_semantics": {
+                            "observation_kind": "post_command_dwell",
+                            "minimum_dwell_ns": 10_000_000,
+                        },
+                    }
+                ],
+            },
+        ],
+    }
+    return revisioned_document(
+        value,
+        domain="catalog-record-revision/stop_evidence_policy",
+        api_version="manyforge.stop_evidence_policy.v2",
+        revision_field="stop_evidence_policy_revision",
+    )
+
+
+def motion_controlled_stop_policy() -> dict[str, Any]:
+    controlled_ref = motion_controlled_stop_provider_contract_ref()
+    value = {
+        "api_version": "manyforge.stop_evidence_policy.v2",
+        "stop_evidence_policy_id": "manyforge.arm_motion_controlled_stop",
+        "disposition": "stoppable",
+        "containment_granularity": "resource",
+        "deadline_budget": cell_controlled_stop_deadline_budget(),
+        "escalation_stages": [
+            {
+                "stop_escalation_stage_id": "motion_controlled_stop",
+                "stage_kind": "nominal",
+                "containment_granularity": "resource",
+                "containment_command": {
+                    "command_phase_id": "command",
+                    "command": {
+                        "command_kind": "motion_controlled_stop",
+                        "provider_contract_ref": controlled_ref,
+                    },
+                },
+                "evidence_conjunction": "all_of",
+                "evidence_requirements": [
+                    {
+                        "evidence_item_id": "controlled_rest",
+                        "phase_id": "terminal",
+                        "evidence": {
+                            "evidence_kind": "motion_rest",
+                            "provider_contract_ref": controlled_ref,
+                        },
+                        "source_requirement": {
+                            "source_kind": "binding_state_authority",
+                            "freshness_budget_ns": 100_000_000,
+                            "state_endpoint_role_id": "state",
+                            "allowed_authority_classes": [
+                                "commanded",
+                                "measured",
+                                "predicted",
+                            ],
+                        },
+                        "observation_semantics": {
+                            "observation_kind": "post_command_dwell",
+                            "minimum_dwell_ns": 10_000_000,
                         },
                     }
                 ],
@@ -1559,17 +1703,64 @@ def ros2_control_runtime_profile() -> dict[str, Any]:
     )
 
 
-def native_runtime_policy() -> dict[str, Any]:
+def deployment_runtime_policy(
+    deployment: dict[str, Any], *, ros2_control: bool
+) -> dict[str, Any]:
+    speed_inputs = [
+        row
+        for row in deployment["policy_restoration_inputs"]
+        if row["kind"] == "target_tcp_linear_speed_limit"
+    ]
+    if len(speed_inputs) != 1:
+        raise GenerationError(
+            f"deployment {deployment['deployment_source']} must retain one exact "
+            "target TCP speed limit"
+        )
+    source = speed_inputs[0]
+    target_role_id = source["target_role_id"]
+    target_ids = {
+        assignment["target_roles"][target_role_id]["command_target_id"]
+        for assignment in deployment["program_role_assignments"]
+    }
+    component_ids = {
+        assignment["component_roles"][
+            assignment["target_roles"][target_role_id]["component_role"]
+        ]
+        for assignment in deployment["program_role_assignments"]
+    }
+    if target_ids != {"arm"} or component_ids != {
+        deployment["component_occurrence_id"]
+    }:
+        raise GenerationError(
+            f"deployment {deployment['deployment_source']} has an ambiguous "
+            "target TCP speed-limit scope"
+        )
+    policy_id = (
+        "manyforge.runtime_motion." + deployment["deployment_artifact_id"]
+    )
     value = {
         "api_version": "manyforge.runtime_policy.v1",
-        "runtime_policy_id": "manyforge.native_motion",
-        "description": "Maintained native motion safety policy",
+        "runtime_policy_id": policy_id,
+        "description": (
+            "Maintained "
+            + ("ros2_control" if ros2_control else "native")
+            + " motion policy for "
+            + deployment["deployment_artifact_id"]
+        ),
         "interrupt_policy_ids": [],
         "motion_speed_limits": [
             {
                 "scope_kind": "cell",
                 "maximum_tcp_linear_speed_mps": 0.5,
-            }
+            },
+            {
+                "scope_kind": "command_target",
+                "controllable_component_id": deployment[
+                    "component_occurrence_id"
+                ],
+                "command_target_id": "arm",
+                "maximum_tcp_linear_speed_mps": source["maximum_speed_mps"],
+            },
         ],
         "open_loop_grasp_acknowledgements": [],
     }
@@ -1579,30 +1770,6 @@ def native_runtime_policy() -> dict[str, Any]:
         api_version="manyforge.runtime_policy.v1",
         revision_field="runtime_policy_revision",
     )
-
-
-def ros2_control_runtime_policy() -> dict[str, Any]:
-    value = {
-        "api_version": "manyforge.runtime_policy.v1",
-        "runtime_policy_id": "manyforge.ros2_control_motion",
-        "description": "Maintained Isaac ros2_control motion safety policy",
-        "interrupt_policy_ids": [],
-        "motion_speed_limits": [
-            {
-                "scope_kind": "cell",
-                "maximum_tcp_linear_speed_mps": 0.5,
-            }
-        ],
-        "open_loop_grasp_acknowledgements": [],
-    }
-    return revisioned_document(
-        value,
-        domain="catalog-record-revision/runtime_policy",
-        api_version="manyforge.runtime_policy.v1",
-        revision_field="runtime_policy_revision",
-    )
-
-
 def catalog_sources(
     root: Path,
     description: dict[str, Any],
@@ -1715,10 +1882,14 @@ def catalog_sources(
         )
     )
     native_arm_manifest = native_lite6_provider_manifest(
-        lifecycle_manifest, native_arm_capabilities
+        lifecycle_manifest,
+        native_arm_capabilities,
+        include_motion_controlled_stop=True,
     )
     native_gripper_manifest = native_lite6_provider_manifest(
-        gripper_lifecycle_manifest, native_gripper_capabilities
+        gripper_lifecycle_manifest,
+        native_gripper_capabilities,
+        include_motion_controlled_stop=False,
     )
     manifests = {
         "control": provider_manifest(
@@ -1769,20 +1940,23 @@ def catalog_sources(
             canonical_output=(key in ("lite6_arm", "lite6_gripper")),
         )
 
-    policy = stop_policy()
-    sources["stop"] = generated_catalog_document(
-        root=root,
-        relative_path=(
-            "manyforge_deployment/resources/maintained/catalog/"
-            f"stop_evidence_policy/{policy['stop_evidence_policy_id']}.json"
-        ),
-        kind="stop_evidence_policy",
-        record_id=policy["stop_evidence_policy_id"],
-        record_revision=policy["stop_evidence_policy_revision"],
-        schema_id="manyforge.stop_evidence_policy.v2",
-        schema_revision=schemas["stop_evidence_policy"],
-        value=policy,
-    )
+    for key, policy in (
+        ("stop:arm", motion_controlled_stop_policy()),
+        ("stop:goal_cancel", controller_goal_cancel_stop_policy()),
+    ):
+        sources[key] = generated_catalog_document(
+            root=root,
+            relative_path=(
+                "manyforge_deployment/resources/maintained/catalog/"
+                f"stop_evidence_policy/{policy['stop_evidence_policy_id']}.json"
+            ),
+            kind="stop_evidence_policy",
+            record_id=policy["stop_evidence_policy_id"],
+            record_revision=policy["stop_evidence_policy_revision"],
+            schema_id="manyforge.stop_evidence_policy.v2",
+            schema_revision=schemas["stop_evidence_policy"],
+            value=policy,
+        )
 
     runtime = native_runtime_profile()
     sources["runtime"] = generated_catalog_document(
@@ -1816,37 +1990,34 @@ def catalog_sources(
         canonical_output=True,
     )
 
-    runtime_policy = native_runtime_policy()
-    sources["runtime_policy"] = generated_catalog_document(
-        root=root,
-        relative_path=(
-            "manyforge_deployment/resources/maintained/catalog/"
-            f"runtime_policy/{runtime_policy['runtime_policy_id']}.json"
-        ),
-        kind="runtime_policy",
-        record_id=runtime_policy["runtime_policy_id"],
-        record_revision=runtime_policy["runtime_policy_revision"],
-        schema_id="manyforge.runtime_policy.v1",
-        schema_revision=schemas["runtime_policy"],
-        value=runtime_policy,
-        canonical_output=True,
-    )
-
-    ros_runtime_policy = ros2_control_runtime_policy()
-    sources["runtime_policy:ros2_control"] = generated_catalog_document(
-        root=root,
-        relative_path=(
-            "manyforge_deployment/resources/maintained/catalog/"
-            f"runtime_policy/{ros_runtime_policy['runtime_policy_id']}.json"
-        ),
-        kind="runtime_policy",
-        record_id=ros_runtime_policy["runtime_policy_id"],
-        record_revision=ros_runtime_policy["runtime_policy_revision"],
-        schema_id="manyforge.runtime_policy.v1",
-        schema_revision=schemas["runtime_policy"],
-        value=ros_runtime_policy,
-        canonical_output=True,
-    )
+    runtime_profiles_by_id = {
+        profile["runtime_restoration_profile_id"]: profile
+        for profile in description["runtime_restoration_profiles"]
+    }
+    for deployment in description["deployments"]:
+        restoration = runtime_profiles_by_id[
+            deployment["runtime_restoration_profile_id"]
+        ]
+        runtime_policy = deployment_runtime_policy(
+            deployment,
+            ros2_control="ros2_control_runtime" in restoration,
+        )
+        sources[
+            f"runtime_policy:{deployment['deployment_artifact_id']}"
+        ] = generated_catalog_document(
+            root=root,
+            relative_path=(
+                "manyforge_deployment/resources/maintained/catalog/"
+                f"runtime_policy/{runtime_policy['runtime_policy_id']}.json"
+            ),
+            kind="runtime_policy",
+            record_id=runtime_policy["runtime_policy_id"],
+            record_revision=runtime_policy["runtime_policy_revision"],
+            schema_id="manyforge.runtime_policy.v1",
+            schema_revision=schemas["runtime_policy"],
+            value=runtime_policy,
+            canonical_output=True,
+        )
 
     component_references: dict[str, dict[str, str]] = {}
     for family in description["model_families"]:
@@ -1958,7 +2129,8 @@ def graph_and_applicability(
     component_ref = refs[f"component:{family_id}"]
     model_ref = refs[f"model:{family_id}"]
     runtime_ref = refs[f"runtime{':ros2_control' if ros2_control else ''}"]
-    stop_ref = refs["stop"]
+    arm_stop_ref = refs["stop:arm"]
+    goal_cancel_stop_ref = refs["stop:goal_cancel"]
     control_ref = refs[
         "provider:ros2_control" if ros2_control else "provider:control"
     ]
@@ -2004,6 +2176,7 @@ def graph_and_applicability(
         ("arm", ARM_CAPABILITIES, arm_resources),
         ("gripper", GRIPPER_CAPABILITIES, gripper_resources),
     ):
+        stop_ref = arm_stop_ref if target == "arm" else goal_cancel_stop_ref
         target_control_ref = (
             refs[f"provider:lite6_{target}"]
             if native_lite6_lifecycle
@@ -2228,8 +2401,88 @@ def graph_and_applicability(
     return graph, desired, provider_bindings
 
 
+def operator_stop_contract_parameters(
+    family: dict[str, Any],
+    runtime_restoration_profile: dict[str, Any],
+    binding: dict[str, Any],
+) -> dict[str, Any]:
+    profile = runtime_restoration_profile["stop_profiles"][
+        "operator_stop_profile"
+    ]
+    if (
+        profile["profile_id"] != "operator_soft_on_path"
+        or profile["stop_mode"] != "soft_on_path"
+        or profile.get("require_backend_confirmation", True) is not True
+    ):
+        raise GenerationError(
+            "maintained ordinary arm Stop must select operator_soft_on_path "
+            "with backend confirmation"
+        )
+    source_joints = source_joint_names(family, "arm_joints")
+    resources = binding["resource_bindings"]
+    acceleration = profile["per_joint_max_deceleration_rad_s2"]
+    if family["model_family_id"] == LITE6_NATIVE_MODEL_FAMILY_ID:
+        expected_acceleration = {joint: 4.0 for joint in source_joints}
+        fault_profile = runtime_restoration_profile["stop_profiles"][
+            "default_fault_stop_profile"
+        ]
+        if (
+            profile.get("deceleration_time_s") != 1.0
+            or profile.get("allow_natural_completion_on_short_path") is not True
+            or "recoverable_substitution_mode" in profile
+            or acceleration != expected_acceleration
+            or fault_profile.get("profile_id") != "fault_spring_back_hold"
+            or fault_profile.get("stop_mode") != "spring_back_hold"
+            or fault_profile.get("deceleration_time_s") != 1.0
+            or fault_profile.get("per_joint_max_deceleration_rad_s2")
+            != expected_acceleration
+            or fault_profile.get("require_backend_confirmation", True) is not True
+        ):
+            raise GenerationError(
+                "Lite6 retained Stop profiles differ from the qualified "
+                "operator_soft_on_path/fault_spring_back_hold contract"
+            )
+    if len(source_joints) != len(resources) or any(
+        joint not in acceleration for joint in source_joints
+    ):
+        raise GenerationError(
+            "operator Stop acceleration limits do not cover the exact arm scope"
+        )
+    resource_limits = [
+        {
+            "resource_id": resource["resource_id"],
+            "max_deceleration": {
+                "coordinate_kind": "angular_rad_s2",
+                "value_rad_s2": acceleration[joint],
+            },
+            "settle_velocity_threshold": {
+                "coordinate_kind": "angular_rad_s",
+                "value_rad_s": 0.01,
+            },
+        }
+        for joint, resource in zip(source_joints, resources, strict=True)
+    ]
+    resource_limits.sort(key=lambda row: row["resource_id"])
+    result = {
+        "stop_mode": "soft_on_path",
+        "deceleration_time_s": profile["deceleration_time_s"],
+        "per_resource_limits": resource_limits,
+        "allow_natural_completion_on_short_path": profile[
+            "allow_natural_completion_on_short_path"
+        ],
+    }
+    if "recoverable_substitution_mode" in profile:
+        result["recoverable_substitution_mode"] = profile[
+            "recoverable_substitution_mode"
+        ]
+    return result
+
+
 def stop_policy_projection(
-    graph: dict[str, Any], runtime_policy_ref: dict[str, str]
+    graph: dict[str, Any],
+    runtime_policy_ref: dict[str, str],
+    family: dict[str, Any],
+    runtime_restoration_profile: dict[str, Any],
 ) -> dict[str, Any]:
     domains = {
         row["control_domain_id"]: row for row in graph["control_domains"]
@@ -2238,6 +2491,39 @@ def stop_policy_projection(
     for binding in graph["control_bindings"]:
         domain = domains[binding["control_domain_id"]]
         for route_id in binding["legal_control_route_ids"]:
+            if binding["command_target_id"] == "arm":
+                stop_stage_parameters.append(
+                    {
+                        "control_domain_id": binding["control_domain_id"],
+                        "control_domain_revision": domain[
+                            "control_domain_revision"
+                        ],
+                        "control_binding_id": binding["control_binding_id"],
+                        "control_binding_revision": binding[
+                            "control_binding_revision"
+                        ],
+                        "controller_topology_id": binding[
+                            "controller_topology_id"
+                        ],
+                        "topology_revision": binding["topology_revision"],
+                        "control_route_id": route_id,
+                        "stop_evidence_policy_id": binding[
+                            "stop_evidence_policy_id"
+                        ],
+                        "stop_evidence_policy_revision": binding[
+                            "stop_evidence_policy_revision"
+                        ],
+                        "stop_escalation_stage_id": "motion_controlled_stop",
+                        "provider_contract_ref": (
+                            motion_controlled_stop_provider_contract_ref()
+                        ),
+                        "default_contract_parameters": (
+                            operator_stop_contract_parameters(
+                                family, runtime_restoration_profile, binding
+                            )
+                        ),
+                    }
+                )
             stop_stage_parameters.append(
                 {
                     "control_domain_id": binding["control_domain_id"],
@@ -2458,12 +2744,9 @@ def deployment_candidate(
         ),
         *( [] if ros2_control else ["provider:planning"] ),
         ("runtime:ros2_control" if ros2_control else "runtime"),
-        (
-            "runtime_policy:ros2_control"
-            if ros2_control
-            else "runtime_policy"
-        ),
-        "stop",
+        f"runtime_policy:{deployment['deployment_artifact_id']}",
+        "stop:arm",
+        "stop:goal_cancel",
         f"topology:{key_prefix}arm",
         f"topology:{key_prefix}gripper",
     }
@@ -2505,11 +2788,9 @@ def deployment_candidate(
         "capability_provider_bindings": provider_bindings,
         "policies": stop_policy_projection(
             graph,
-            refs[
-                "runtime_policy:ros2_control"
-                if ros2_control
-                else "runtime_policy"
-            ],
+            refs[f"runtime_policy:{deployment['deployment_artifact_id']}"],
+            family,
+            runtime_restoration_profile,
         ),
         "compatibility": copy.deepcopy(deployment["compatibility"]),
     }

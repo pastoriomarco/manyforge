@@ -517,7 +517,7 @@ export function useRobotControl(
       );
       setReloadToken((current) => current + 1);
     } catch (error: unknown) {
-      setFullStopError(errorMessage(error, 'Full-cell Stop was rejected.'));
+      setFullStopError(errorMessage(error, 'Full Stop was rejected.'));
     } finally {
       setFullStopPending(false);
     }

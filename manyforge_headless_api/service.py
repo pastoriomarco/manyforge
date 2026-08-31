@@ -39,6 +39,8 @@ from .models import (
     ProgramModelAttemptRequest,
     ProgramRunStartRequest,
     ProgramRunStopRequest,
+    ProgramFullStopResetRequest,
+    ProgramFullStopResumeRequest,
     ProgramScenePreparationRequest,
     ProgramCycleResetRequest,
     CycleRecoveryActionRequest,
@@ -81,6 +83,8 @@ _PROGRAM_RUN_STATES = frozenset(
     {
         "running",
         "intervention_required",
+        "full_stopping",
+        "full_stopped",
         "stopping",
         "finalizing",
         "stopped",
@@ -89,7 +93,14 @@ _PROGRAM_RUN_STATES = frozenset(
     }
 )
 _ACTIVE_PROGRAM_RUN_STATES = frozenset(
-    {"running", "intervention_required", "stopping", "finalizing"}
+    {
+        "running",
+        "intervention_required",
+        "full_stopping",
+        "full_stopped",
+        "stopping",
+        "finalizing",
+    }
 )
 def _bounded_text(value: object, *, maximum_bytes: int) -> bool:
     return (
@@ -1181,6 +1192,103 @@ class HeadlessService:
             expected_program_run_id=program_run_id,
             expected_owner_epoch=request.expected_owner_epoch,
         )
+
+    def program_run_full_stop(
+        self,
+        program_run_id: str,
+        request: ProgramRunStopRequest,
+    ) -> dict[str, Any]:
+        try:
+            projection = self._program_runner().full_stop(
+                program_run_id,
+                request.model_dump(mode="json"),
+            )
+        except ProgramRunnerClientError as error:
+            raise self._runner_error(error) from error
+        return self._validate_program_run_snapshot(
+            projection,
+            expected_program_run_id=program_run_id,
+            expected_owner_epoch=request.expected_owner_epoch,
+        )
+
+    def program_run_resume_full_stop(
+        self,
+        program_run_id: str,
+        request: ProgramFullStopResumeRequest,
+    ) -> dict[str, Any]:
+        try:
+            projection = self._program_runner().resume_full_stop(
+                program_run_id,
+                request.model_dump(mode="json"),
+            )
+        except ProgramRunnerClientError as error:
+            raise self._runner_error(error) from error
+        return self._validate_program_run_snapshot(
+            projection,
+            expected_program_run_id=program_run_id,
+            expected_owner_epoch=request.expected_owner_epoch,
+        )
+
+    def program_run_reset_full_stop(
+        self,
+        program_run_id: str,
+        request: ProgramFullStopResetRequest,
+    ) -> dict[str, Any]:
+        """Expose Reset as one command while the Program owner discards first."""
+
+        try:
+            runner = self._program_runner()
+            projection = runner.discard_full_stop(
+                program_run_id,
+                request.model_dump(mode="json"),
+            )
+            terminal = self._validate_program_run_snapshot(
+                projection,
+                expected_program_run_id=program_run_id,
+                expected_owner_epoch=request.expected_owner_epoch,
+            )
+            if terminal.get("state") not in {"stopped", "succeeded", "failed"}:
+                raise HeadlessApiError(
+                    "program_full_stop_reset_unsettled",
+                    "Full-stopped Program tree did not settle for Reset",
+                )
+            reference = "sha256:" + hashlib.sha256(
+                rfc8785.dumps(
+                    {
+                        "program_run_id": program_run_id,
+                        "run_revision": terminal["run_revision"],
+                        "state": terminal["state"],
+                    }
+                )
+            ).hexdigest()
+            reset_request_id = "program-full-stop-reset-" + hashlib.sha256(
+                (
+                    request.request_owner_epoch
+                    + "\0"
+                    + request.request_id
+                ).encode("utf-8")
+            ).hexdigest()
+            reset = ProgramCycleResetRequest.model_validate(
+                {
+                    "request_id": reset_request_id,
+                    "request_owner_epoch": request.request_owner_epoch,
+                    "source_label": request.source_label,
+                    "correlation_id": request.request_id,
+                    "program_run_id": program_run_id,
+                    "expected_owner_epoch": request.expected_owner_epoch,
+                    "expected_cycle_generation": (
+                        request.expected_cycle_generation
+                    ),
+                    "expected_claim_generation": (
+                        request.expected_claim_generation
+                    ),
+                    "terminal_reference": reference,
+                    "settlement_evidence_digest": reference,
+                }
+            )
+            return self.program_cycle_reset(reset)
+        except ProgramRunnerClientError as error:
+            raise self._runner_error(error) from error
 
     def program_cycle_status(self) -> dict[str, Any]:
         try:

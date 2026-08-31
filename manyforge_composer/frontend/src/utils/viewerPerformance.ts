@@ -1,10 +1,6 @@
 import type { WebGLRenderer } from 'three';
 
 const MAX_RENDER_INTERVAL_SAMPLES = 512;
-const DEFAULT_REQUESTED_RATE_HZ = 15;
-const VIEWER_RATE_STORAGE_KEY = 'manyforge.viewer.requested-rate-hz.v1';
-export const VIEWER_RATE_OPTIONS_HZ = [2, 5, 10, 15, 30] as const;
-export const VIEWER_MAX_REQUESTED_RATE_HZ = 30;
 const SOFTWARE_RENDERER_TOKENS = [
   'llvmpipe',
   'softpipe',
@@ -113,69 +109,6 @@ export interface ViewerQualificationObject {
   snapshot: () => ViewerQualificationSnapshot;
   take: () => ViewerQualificationSnapshot;
   reset: () => void;
-}
-
-/*
- * Browser-local presentation preference retained from source blob
- * 24e7e692df7864293d4572c0ef3fe6e876b9de6f and test blob
- * a02c7500c92219c1cf857edade687af214b9bda7. The old renderer-profile lease and
- * ViewerClientDiagnosticsControlV1 publication are intentionally absent: I9
- * supplies the future data-plane client.  Persisting an operator's local
- * cadence choice does not assert that an unavailable runtime has applied it.
- */
-function loadViewerRatePreference(): number | null {
-  if (typeof window === 'undefined') return null;
-  try {
-    const raw = window.localStorage.getItem(VIEWER_RATE_STORAGE_KEY);
-    if (raw === null || raw === 'auto') return null;
-    const rate = Number(raw);
-    return Number.isFinite(rate) && rate > 0 && rate <= VIEWER_MAX_REQUESTED_RATE_HZ
-      ? rate
-      : null;
-  } catch {
-    return null;
-  }
-}
-
-let requestedRatePreferenceHz = loadViewerRatePreference();
-const ratePreferenceListeners = new Set<() => void>();
-
-export function getAutomaticViewerRateHz(): number {
-  return DEFAULT_REQUESTED_RATE_HZ;
-}
-
-export function getViewerRatePreferenceHz(): number | null {
-  return requestedRatePreferenceHz;
-}
-
-export function setViewerRatePreferenceHz(rateHz: number | null): void {
-  if (
-    rateHz !== null
-    && (!Number.isFinite(rateHz) || rateHz <= 0 || rateHz > VIEWER_MAX_REQUESTED_RATE_HZ)
-  ) {
-    throw new RangeError(
-      `Viewer update rate must be greater than 0 and at most ${VIEWER_MAX_REQUESTED_RATE_HZ} Hz`,
-    );
-  }
-  if (requestedRatePreferenceHz === rateHz) return;
-  requestedRatePreferenceHz = rateHz;
-  try {
-    if (typeof window !== 'undefined') {
-      if (rateHz === null) {
-        window.localStorage.removeItem(VIEWER_RATE_STORAGE_KEY);
-      } else {
-        window.localStorage.setItem(VIEWER_RATE_STORAGE_KEY, String(rateHz));
-      }
-    }
-  } catch {
-    // Storage can be disabled by browser policy. Keep the page-local choice.
-  }
-  for (const listener of ratePreferenceListeners) listener();
-}
-
-export function subscribeViewerRatePreference(listener: () => void): () => void {
-  ratePreferenceListeners.add(listener);
-  return () => ratePreferenceListeners.delete(listener);
 }
 
 function newWindow(nowMs = performance.now()): ViewerMetricWindow {

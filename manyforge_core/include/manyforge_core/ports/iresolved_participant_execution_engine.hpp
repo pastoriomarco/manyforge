@@ -47,6 +47,16 @@ struct AddressedParticipantStopSettlementDTO final {
   KernelRecoveryAssessmentDTO recovery_assessment;
 };
 
+/// Result of the exact process-local Stop fence at the subordinate dispatch
+/// handoff.  This is deliberately smaller than a Stop result: it says only
+/// whether the addressed owner prevented the physical effect before dispatch
+/// committed, or must continue with the prepared physical Stop cascade.
+enum class AddressedParticipantStopFenceDisposition : std::uint8_t {
+  kUnknown = 0,
+  kEffectPreventedBeforeDispatch,
+  kDispatchCommitted,
+};
+
 /// Subordinate single-participant execution mechanism used by the addressed
 /// Kernel owner. It does not resolve Program roles, select a robot/group, or
 /// reserve resources; those responsibilities remain outside this port.
@@ -55,6 +65,16 @@ class IResolvedParticipantExecutionEngine {
   virtual ~IResolvedParticipantExecutionEngine() = default;
 
   virtual Result<std::uint64_t> execute(const ExecuteRequestDTO& request) = 0;
+  /// Close lower-priority participant work as soon as the addressed owner has
+  /// linearized an exact Stop, before it publishes the physical Stop stages.
+  /// This process-local, non-blocking fence does not issue a backend command,
+  /// claim containment, or publish a terminal. The addressed owner remains
+  /// responsible for the physical result and aggregate certificate.
+  virtual AddressedParticipantStopFenceDisposition fence_addressed_participant_stop(
+      std::uint64_t execution_id) noexcept {
+    (void)execution_id;
+    return AddressedParticipantStopFenceDisposition::kUnknown;
+  }
   /// Commit and return the local terminal/recovery fact for one exact
   /// participant after the addressed owner has already contained its exact
   /// dispatched goal or proved that dispatch never occurred. This

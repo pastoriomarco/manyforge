@@ -49,6 +49,14 @@ _STATIC_MANIFEST_VALIDATOR_SCRIPT = (
 _MODEL_EXPORT_SCRIPT = (
     _REPO_ROOT / "scripts" / "models" / "export_lite6_lite_gripper_model.py"
 )
+_OWNED_MOVEIT_JOINT_LIMITS_PATH = (
+    _MODEL_DIR
+    / "upstream_source"
+    / "xarm_moveit_config"
+    / "config"
+    / "lite6"
+    / "joint_limits.yaml"
+)
 _ISAAC_ROS2_CONTROL_URDF_PATH = (
     _REPO_ROOT
     / "manyforge_ros_bringup"
@@ -62,6 +70,9 @@ _LIMITED_ARM_BOUNDS = {
     "joint4": ("-3.1101767270538954", "3.1101767270538954"),
     "joint5": ("-2.1642", "2.1642"),
     "joint6": ("-3.1101767270538954", "3.1101767270538954"),
+}
+_ARM_JOINT_DYNAMICS = {
+    f"joint{index}": (2.14, 10.0) for index in range(1, 7)
 }
 
 # Narrowed from historical test_deployment.py blob
@@ -96,6 +107,7 @@ def test_lite6_lite_gripper_model_bundle_is_self_contained() -> None:
     assert "<mimic" in urdf_text
 
     root = ET.parse(urdf_path).getroot()
+    assert root.attrib.get("version") == "1.2"
     mesh_refs = [
         mesh.attrib["filename"]
         for mesh in root.iter("mesh")
@@ -113,6 +125,9 @@ def test_lite6_lite_gripper_model_bundle_is_self_contained() -> None:
         assert limit is not None
         assert limit.attrib.get("lower") == lower
         assert limit.attrib.get("upper") == upper
+        velocity, acceleration = _ARM_JOINT_DYNAMICS[joint_name]
+        assert float(limit.attrib["velocity"]) == velocity
+        assert float(limit.attrib["acceleration"]) == acceleration
     assert root.find("./link[@name='base_link']") is None
     assert root.find("./joint[@name='base_link_to_link_base']") is None
     left_finger = root.find("./joint[@name='left_finger_joint']")
@@ -172,11 +187,32 @@ def test_lite6_lite_gripper_model_bundle_is_self_contained() -> None:
     assert manifest["source"]["commit"] == (
         "012731afb9ef1d4289ec45112e8d083ab59a5c1e"
     )
+    assert manifest["source"]["moveit_joint_limits"] == {
+        "owned_snapshot_path": (
+            "upstream_source/xarm_moveit_config/config/lite6/joint_limits.yaml"
+        ),
+        "sha256": (
+            "73368cad488a238ba6c4bc72e679a2ae7e39cef3c7aecb83e50d6037255d927c"
+        ),
+        "upstream_path": "xarm_moveit_config/config/lite6/joint_limits.yaml",
+    }
+    moveit_limits = yaml.safe_load(
+        _OWNED_MOVEIT_JOINT_LIMITS_PATH.read_text(encoding="utf-8")
+    )["joint_limits"]
+    assert set(moveit_limits) == set(_ARM_JOINT_DYNAMICS)
+    for joint_name, (velocity, acceleration) in _ARM_JOINT_DYNAMICS.items():
+        assert moveit_limits[joint_name] == {
+            "has_velocity_limits": True,
+            "max_velocity": velocity,
+            "has_acceleration_limits": True,
+            "max_acceleration": acceleration,
+        }
     expected_paths = {
         "README.md",
         "licenses/xarm_ros2.LICENSE",
         "lite6_lite_gripper.srdf",
         "lite6_lite_gripper.urdf",
+        "upstream_source/xarm_moveit_config/config/lite6/joint_limits.yaml",
     } | {ref.removeprefix(prefix) for ref in mesh_refs}
     manifest_entries = manifest["files"]
     assert {entry["path"] for entry in manifest_entries} == expected_paths
@@ -224,7 +260,7 @@ def test_lite6_static_manifest_validator_accepts_and_rejects_drift(
     )
     accepted_report = json.loads(accepted.stdout)
     assert accepted_report["passed"] is True
-    assert accepted_report["file_count"] == 22
+    assert accepted_report["file_count"] == 23
 
     copied_model = tmp_path / "lite6_lite_gripper"
     shutil.copytree(
@@ -434,6 +470,7 @@ def test_lite6_exported_readme_preserves_the_current_unavailable_boundary(
         Path("/historical/xarm_ros2"),
         Path("/historical/manymove_lite6_runtime.urdf"),
         "2026-06-26T11:45:56+00:00",
+        _ARM_JOINT_DYNAMICS,
     )
 
     readme = (tmp_path / "README.md").read_text(encoding="utf-8")

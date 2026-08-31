@@ -297,6 +297,9 @@ struct QualifiedControlCatalog final {
   std::optional<QualifiedRuntimeProfile> native_execution_runtime_profile;
   std::optional<QualifiedRuntimeProfile> ros2_control_execution_runtime_profile;
   std::optional<QualifiedRuntimePolicy> native_runtime_policy;
+  /// Aggregate arm/tool fixtures retain a goal-cancel policy for the gripper
+  /// when the arm selects the independently qualified controlled-Stop policy.
+  std::optional<QualifiedStopEvidencePolicy> gripper_stop;
 };
 
 struct AssistantOverlayFixture final {
@@ -449,9 +452,12 @@ assistant_source(const bool composer_draft_enabled = false) {
 qualify_control_catalog(bool chained, bool native_motion = false,
                         bool stoppable = false,
                         std::string_view containment_granularity = "resource",
-                        bool qualified_soft_to_spring_substitution = false,
+                        bool qualified_motion_controlled_stop = false,
                         std::string_view lifecycle_semantic_digest = {},
-                        bool ros2_control_execution = false) {
+                        bool ros2_control_execution = false,
+                        bool controlled_stop_deadline_envelope = false) {
+  const bool expanded_stop_deadline =
+      qualified_motion_controlled_stop || controlled_stop_deadline_envelope;
   const std::string_view primary_capability_id =
       native_motion ? "execution.trajectory.execute" : "state.observed.current";
   const auto *descriptor =
@@ -639,10 +645,19 @@ qualify_control_catalog(bool chained, bool native_motion = false,
              CanonicalValue("Qualified Lite6 native motion policy")},
             {"interrupt_policy_ids", CanonicalValue(CanonicalValue::Array{})},
             {"motion_speed_limits",
-             CanonicalValue(
-                 CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+             CanonicalValue(CanonicalValue::Array{
+                 CanonicalValue(CanonicalValue::Object{
                      {"scope_kind", CanonicalValue("cell")},
                      {"maximum_tcp_linear_speed_mps", CanonicalValue(0.5)},
+                 }),
+                 CanonicalValue(CanonicalValue::Object{
+                     {"scope_kind", CanonicalValue("command_target")},
+                     {"controllable_component_id",
+                      CanonicalValue(
+                          std::string(kLite6ControllableComponentId))},
+                     {"command_target_id",
+                      CanonicalValue(std::string(kLite6ArmTargetId))},
+                     {"maximum_tcp_linear_speed_mps", CanonicalValue(0.15)},
                  })})},
             {"open_loop_grasp_acknowledgements",
              CanonicalValue(CanonicalValue::Array{})},
@@ -932,23 +947,22 @@ qualify_control_catalog(bool chained, bool native_motion = false,
       topology_ref, topology_key, topology_bytes,
       std::span<const QualifiedControlInterfaceContract>(&contract, 1U));
 
-  const auto stop_provider_contract_ref =
-      [qualified_soft_to_spring_substitution] {
-        return CanonicalValue(CanonicalValue::Object{
-            {"provider_contract_role_id", CanonicalValue("stop_contract")},
-            {"contract_schema_id",
-             CanonicalValue(
-                 qualified_soft_to_spring_substitution
-                     ? std::string(core::kMotionControlledStopContractSchemaId)
-                     : "manyforge.value_schema.provider_contract.empty.v1")},
-            {"contract_schema_revision",
-             CanonicalValue(
-                 qualified_soft_to_spring_substitution
-                     ? std::string(
-                           core::kMotionControlledStopContractSchemaRevision)
-                     : std::string(kEmptyProviderContractSchemaRevision))},
-        });
-      };
+  const auto stop_provider_contract_ref = [qualified_motion_controlled_stop] {
+    return CanonicalValue(CanonicalValue::Object{
+        {"provider_contract_role_id", CanonicalValue("stop_contract")},
+        {"contract_schema_id",
+         CanonicalValue(
+             qualified_motion_controlled_stop
+                 ? std::string(core::kMotionControlledStopContractSchemaId)
+                 : "manyforge.value_schema.provider_contract.empty.v1")},
+        {"contract_schema_revision",
+         CanonicalValue(
+             qualified_motion_controlled_stop
+                 ? std::string(
+                       core::kMotionControlledStopContractSchemaRevision)
+                 : std::string(kEmptyProviderContractSchemaRevision))},
+    });
+  };
   const auto software_hard_contract_ref = [] {
     return CanonicalValue(CanonicalValue::Object{
         {"provider_contract_role_id", CanonicalValue("software_hard_stop")},
@@ -968,7 +982,7 @@ qualify_control_catalog(bool chained, bool native_motion = false,
              {"evidence_endpoint_role_ids", text_array({"state"})},
          })},
     };
-    if (qualified_soft_to_spring_substitution) {
+    if (qualified_motion_controlled_stop) {
       nominal_contract.emplace_back(
           "stop_command_support",
           CanonicalValue(CanonicalValue::Object{
@@ -1102,14 +1116,13 @@ qualify_control_catalog(bool chained, bool native_motion = false,
         planner_provider_ref, planner_provider_key, *planner_provider_bytes);
   }
 
-  const std::string stop_policy_id = !stoppable ? "lite6_not_stoppable"
-                                     : qualified_soft_to_spring_substitution
-                                         ? "lite6_qualified_soft_to_spring_stop"
-                                     : native_motion
-                                         ? "lite6_controller_goal_terminal_stop"
+  const std::string stop_policy_id =
+      !stoppable                         ? "lite6_not_stoppable"
+      : qualified_motion_controlled_stop ? "lite6_motion_controlled_stop"
+      : native_motion                    ? "lite6_controller_goal_terminal_stop"
                                          : "lite6_binding_state_stop";
   const CanonicalValue nominal_evidence_requirement =
-      qualified_soft_to_spring_substitution || !native_motion
+      qualified_motion_controlled_stop || !native_motion
           ? CanonicalValue(CanonicalValue::Object{
                 {"evidence_item_id", CanonicalValue("nominal_rest")},
                 {"phase_id", CanonicalValue("nominal_terminal")},
@@ -1170,25 +1183,37 @@ qualify_control_catalog(bool chained, bool native_motion = false,
          CanonicalValue(std::string(containment_granularity))},
         {"deadline_budget",
          CanonicalValue(CanonicalValue::Object{
-             {"outer_duration_ns", CanonicalValue(1'000'000'000.0)},
-             {"kernel_completion_reserve_ns", CanonicalValue(100'000'000.0)},
+             {"outer_duration_ns",
+              CanonicalValue(expanded_stop_deadline ? 3'000'000'000.0
+                                                    : 1'000'000'000.0)},
+             {"kernel_completion_reserve_ns",
+              CanonicalValue(expanded_stop_deadline ? 200'000'000.0
+                                                    : 100'000'000.0)},
              {"phases",
               CanonicalValue(CanonicalValue::Array{
                   CanonicalValue(CanonicalValue::Object{
                       {"phase_id", CanonicalValue("nominal_command")},
-                      {"deadline_offset_ns", CanonicalValue(100'000'000.0)},
+                      {"deadline_offset_ns",
+                       CanonicalValue(expanded_stop_deadline ? 300'000'000.0
+                                                             : 100'000'000.0)},
                   }),
                   CanonicalValue(CanonicalValue::Object{
                       {"phase_id", CanonicalValue("nominal_terminal")},
-                      {"deadline_offset_ns", CanonicalValue(300'000'000.0)},
+                      {"deadline_offset_ns",
+                       CanonicalValue(expanded_stop_deadline ? 1'750'000'000.0
+                                                             : 300'000'000.0)},
                   }),
                   CanonicalValue(CanonicalValue::Object{
                       {"phase_id", CanonicalValue("hard_command")},
-                      {"deadline_offset_ns", CanonicalValue(500'000'000.0)},
+                      {"deadline_offset_ns",
+                       CanonicalValue(expanded_stop_deadline ? 1'900'000'000.0
+                                                             : 500'000'000.0)},
                   }),
                   CanonicalValue(CanonicalValue::Object{
                       {"phase_id", CanonicalValue("hard_terminal")},
-                      {"deadline_offset_ns", CanonicalValue(800'000'000.0)},
+                      {"deadline_offset_ns",
+                       CanonicalValue(expanded_stop_deadline ? 2'700'000'000.0
+                                                             : 800'000'000.0)},
                   }),
               })},
          })},
@@ -1203,7 +1228,7 @@ qualify_control_catalog(bool chained, bool native_motion = false,
                   CanonicalValue(CanonicalValue::Object{
                       {"command_phase_id", CanonicalValue("nominal_command")},
                       {"command",
-                       qualified_soft_to_spring_substitution
+                       qualified_motion_controlled_stop
                            ? CanonicalValue(CanonicalValue::Object{
                                  {"command_kind",
                                   CanonicalValue("motion_controlled_stop")},
@@ -1371,6 +1396,7 @@ qualify_control_catalog(bool chained, bool native_motion = false,
       std::move(native_execution_runtime_profile),
       std::move(ros2_control_execution_runtime_profile),
       std::move(native_runtime_policy),
+      std::nullopt,
   };
 }
 
@@ -2061,6 +2087,9 @@ make_graph(const Lite6StructuralRetentionFixture &structural,
       const auto &gripper_contract = *catalog.gripper_contract;
       const auto &gripper_topology = *catalog.gripper_topology;
       const auto &gripper_provider = *catalog.gripper_provider;
+      const auto &gripper_stop = catalog.gripper_stop.has_value()
+                                     ? *catalog.gripper_stop
+                                     : catalog.stop;
       domains.emplace_back(CanonicalValue::Object{
           {"control_domain_id",
            CanonicalValue(std::string(kLite6GripperDomainId))},
@@ -2130,10 +2159,10 @@ make_graph(const Lite6StructuralRetentionFixture &structural,
            CanonicalValue(native_motion ? "predicted" : "measured")},
           {"stop_evidence_policy_id",
            CanonicalValue(
-               catalog.stop.value().stop_evidence_policy_id.value())},
+               gripper_stop.value().stop_evidence_policy_id.value())},
           {"stop_evidence_policy_revision",
            CanonicalValue(
-               catalog.stop.value().stop_evidence_policy_revision.value())},
+               gripper_stop.value().stop_evidence_policy_revision.value())},
           {"containment_granularity", CanonicalValue("resource")},
       });
     }
@@ -2178,7 +2207,7 @@ make_applicability_inputs(
     const QualifiedRuntimePolicy *runtime_policy,
     const AssistantOverlayFixture *assistant_overlay,
     const bool composer_draft_enabled = false, const bool stoppable = false,
-    const bool qualified_soft_to_spring_substitution = false) {
+    const bool qualified_motion_controlled_stop = false) {
   CanonicalValue::Array desired_configurations;
   desired_configurations.reserve(graph.graph().control_domains.size());
   for (const auto &domain : graph.graph().control_domains) {
@@ -2346,7 +2375,8 @@ make_applicability_inputs(
               "Lite6 Stop parameter binding has no exact control domain");
         }
         for (const auto &route_id : binding.legal_control_route_ids) {
-          if (qualified_soft_to_spring_substitution) {
+          if (qualified_motion_controlled_stop &&
+              binding.command_target_id.value() == kLite6ArmTargetId) {
             CanonicalValue::Array resource_limits;
             resource_limits.reserve(binding.resource_bindings.size());
             for (const auto &resource : binding.resource_bindings) {
@@ -2397,13 +2427,11 @@ make_applicability_inputs(
                 {"default_contract_parameters",
                  CanonicalValue(CanonicalValue::Object{
                      {"stop_mode", CanonicalValue("soft_on_path")},
-                     {"deceleration_time_s", CanonicalValue(0.25)},
+                     {"deceleration_time_s", CanonicalValue(1.0)},
                      {"per_resource_limits",
                       CanonicalValue(std::move(resource_limits))},
                      {"allow_natural_completion_on_short_path",
-                      CanonicalValue(false)},
-                     {"recoverable_substitution_mode",
-                      CanonicalValue("spring_back_hold")},
+                      CanonicalValue(true)},
                  })},
             });
           }
@@ -2509,7 +2537,7 @@ make_lite6_controllable_retention_fixture(
     bool native_motion = false, std::string_view cell_id = {},
     bool composer_draft_enabled = false, bool stoppable = false,
     std::string_view containment_granularity = "resource",
-    bool qualified_soft_to_spring_substitution = false,
+    bool qualified_motion_controlled_stop = false,
     std::string_view arm_lifecycle_semantic_digest = {},
     std::string_view gripper_lifecycle_semantic_digest = {},
     bool ros2_control_execution = false) {
@@ -2528,18 +2556,33 @@ make_lite6_controllable_retention_fixture(
     throw std::logic_error(
         "ros2_control execution fixture requires one direct addressed arm");
   }
-  if (qualified_soft_to_spring_substitution &&
-      (!stoppable || !native_motion || chained || aggregate_gripper ||
-       instance_count != 1U)) {
+  if (qualified_motion_controlled_stop &&
+      (!stoppable || !native_motion || chained || instance_count != 1U)) {
     throw std::logic_error(
-        "qualified soft-to-spring fixture requires one direct stoppable "
-        "native arm");
+        "qualified controlled-Stop fixture requires one direct stoppable "
+        "arm");
   }
   auto structural = make_lite6_structural_retention_fixture();
   auto catalog = fixture_detail::qualify_control_catalog(
       chained, native_motion, stoppable, containment_granularity,
-      qualified_soft_to_spring_substitution, arm_lifecycle_semantic_digest,
-      ros2_control_execution);
+      qualified_motion_controlled_stop, arm_lifecycle_semantic_digest,
+      ros2_control_execution, qualified_motion_controlled_stop);
+  if (aggregate_gripper && stoppable && qualified_motion_controlled_stop) {
+    auto gripper_stop_catalog = fixture_detail::qualify_control_catalog(
+        false, true, true, "resource", false, {}, false, true);
+    const auto stop_key =
+        gripper_stop_catalog.stop.reference().content_addressed_store_key;
+    const auto artifact = std::find_if(
+        gripper_stop_catalog.artifacts.begin(),
+        gripper_stop_catalog.artifacts.end(),
+        [&](const auto &candidate) { return candidate.store_key == stop_key; });
+    if (artifact == gripper_stop_catalog.artifacts.end()) {
+      throw std::logic_error(
+          "controlled arm fixture has no separate gripper Stop artifact");
+    }
+    catalog.artifacts.push_back(*artifact);
+    catalog.gripper_stop = std::move(gripper_stop_catalog.stop);
+  }
   if (aggregate_gripper) {
     catalog = fixture_detail::add_aggregate_gripper_catalog(
         std::move(catalog), stoppable, gripper_lifecycle_semantic_digest);
@@ -2560,7 +2603,7 @@ make_lite6_controllable_retention_fixture(
           ? &*catalog.native_runtime_policy
           : nullptr,
       assistant_overlay.has_value() ? &*assistant_overlay : nullptr,
-      composer_draft_enabled, stoppable, qualified_soft_to_spring_substitution);
+      composer_draft_enabled, stoppable, qualified_motion_controlled_stop);
 
   std::vector<core::CatalogRecordRefDTO> catalog_records{
       structural.catalog_reference,       catalog.capability.reference(),
@@ -2574,6 +2617,9 @@ make_lite6_controllable_retention_fixture(
     catalog_records.push_back(catalog.gripper_contract->reference());
     catalog_records.push_back(catalog.gripper_topology->reference());
     catalog_records.push_back(catalog.gripper_provider->reference());
+  }
+  if (catalog.gripper_stop.has_value()) {
+    catalog_records.push_back(catalog.gripper_stop->reference());
   }
   for (const auto &planner_capability : catalog.planner_capabilities) {
     catalog_records.push_back(planner_capability.reference());
@@ -2693,7 +2739,10 @@ make_lite6_controllable_retention_fixture(
   if (!catalog.planner_capabilities.empty()) {
     providers.push_back(*catalog.planner_provider);
   }
-  const std::array<QualifiedStopEvidencePolicy, 1U> stop_policies{catalog.stop};
+  std::vector<QualifiedStopEvidencePolicy> stop_policies{catalog.stop};
+  if (catalog.gripper_stop.has_value()) {
+    stop_policies.push_back(*catalog.gripper_stop);
+  }
   std::vector<QualifiedRuntimePolicy> runtime_policies;
   if (catalog.native_runtime_policy.has_value()) {
     runtime_policies.push_back(*catalog.native_runtime_policy);
@@ -2812,7 +2861,7 @@ make_lite6_native_cclc_product_retention_fixture(
     std::string_view arm_lifecycle_semantic_digest,
     std::string_view gripper_lifecycle_semantic_digest) {
   return make_lite6_controllable_retention_fixture(
-      false, false, 1U, true, true, {}, false, true, "resource", false,
+      false, false, 1U, true, true, {}, false, true, "resource", true,
       arm_lifecycle_semantic_digest, gripper_lifecycle_semantic_digest);
 }
 
@@ -2821,7 +2870,7 @@ make_lite6_native_cclc_assistant_product_retention_fixture(
     std::string_view arm_lifecycle_semantic_digest,
     std::string_view gripper_lifecycle_semantic_digest) {
   return make_lite6_controllable_retention_fixture(
-      false, true, 1U, true, true, {}, true, true, "resource", false,
+      false, true, 1U, true, true, {}, true, true, "resource", true,
       arm_lifecycle_semantic_digest, gripper_lifecycle_semantic_digest);
 }
 
@@ -2853,14 +2902,14 @@ make_two_lite6_same_type_native_motion_retention_fixture_for_cell(
 
 [[nodiscard]] inline Lite6ControllableRetentionFixture
 make_lite6_native_motion_arm_gripper_aggregate_retention_fixture() {
-  return make_lite6_controllable_retention_fixture(false, false, 1U, true,
-                                                   true);
+  return make_lite6_controllable_retention_fixture(
+      false, false, 1U, true, true, {}, false, true, "resource", true);
 }
 
 [[nodiscard]] inline Lite6ControllableRetentionFixture
 make_lite6_native_motion_arm_gripper_aggregate_assistant_retention_fixture() {
-  return make_lite6_controllable_retention_fixture(false, true, 1U, true, true,
-                                                   {}, true);
+  return make_lite6_controllable_retention_fixture(
+      false, true, 1U, true, true, {}, true, true, "resource", true);
 }
 
 class Lite6ControllableCompilerInputArtifactSource final

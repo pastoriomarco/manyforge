@@ -8,7 +8,7 @@
 api_version: manyforge.node_catalog.v2
 content_version: 1.1.0
 catalog_id: manyforge_builtin
-catalog_digest: sha256:1dbe03c29ef0f0195ff31204df5b8613c2c064821848c8baa269dd6a8b640dca
+catalog_digest: sha256:cf249e13ee06142852da23b53d48f3bf6fa5bbc1ec92e548327ef9146afee6fe
 
 schema_types:
   coordinate_position:
@@ -1281,7 +1281,7 @@ entries:
     observability: {event_family: manyforge.program.node}
 
   - id: scene.attach_carried_object
-    name: Attach carried object
+    name: Attach object
     category: scene
     description: Attach a scene resource to a declared carrier target and frame role.
     stability: stable
@@ -1330,9 +1330,9 @@ entries:
     observability: {event_family: manyforge.program.node}
 
   - id: scene.detach_carried_object
-    name: Detach carried object
+    name: Detach object
     category: scene
-    description: Detach a scene-owned carried-object attachment.
+    description: Set a scene-owned Attached object to Detached at its current pose.
     stability: stable
     tags: [scene, attachment]
     profiles: {min_program_profile: composable-cell-v1}

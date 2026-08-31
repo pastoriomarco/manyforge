@@ -73,6 +73,15 @@ struct RuntimeParticipantExecutionRegistration final {
   /// Exact two-phase motion preparation boundary. Motion registrations must
   /// provide it; capability-command registrations leave it absent.
   IResolvedPreparedParticipantExecutionEngine* prepared_motion_engine{};
+
+  /// Optional deployment-owned operator profile prepared into every exact
+  /// ordinary motion Stop plan. Non-motion participants leave it absent.
+  std::optional<MotionInterruptStopProfileDTO> default_operator_stop_profile;
+
+  /// Optional deployment-owned fault profile used to prepare a second exact
+  /// Stop plan for runtime-collision containment. It is sealed with the same
+  /// operation/goal as the ordinary plan and never selected by caller input.
+  std::optional<MotionInterruptStopProfileDTO> default_fault_stop_profile;
 };
 
 using RuntimeParticipantAdmissionResolver =

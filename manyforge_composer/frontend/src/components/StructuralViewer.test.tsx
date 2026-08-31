@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 
 import { renderToStaticMarkup } from 'react-dom/server';
 import * as THREE from 'three';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   DEFAULT_COMPARISON_GHOST_VISIBLE,
@@ -14,9 +14,11 @@ import {
   supportsIndependentSceneScale,
   viewerClickWithinDuration,
   viewerContextWasDragged,
+  AttachedLogicalSceneObject,
   ViewerFailureBoundary,
 } from './StructuralViewer';
 import type { LogicalSceneObject } from '../types/api';
+import type { AttachedObjectPresentation } from '../state/runtimeScenePresentation';
 
 function sceneObject(
   shape: LogicalSceneObject['collision_shapes'][number],
@@ -123,7 +125,15 @@ describe('viewer failure isolation', () => {
     expect(source).toContain("else if (inspectorPanel !== 'object') return;");
     expect(css).toMatch(/\.viewer-header-controls\s*\{[^}]*flex:\s*1 1 auto/s);
     expect(css).toMatch(/\.viewer-surface-launchers\s*\{[^}]*margin-left:\s*auto/s);
+    expect(source.match(/aria-pressed=\{inspectorPanel ===/g)).toHaveLength(3);
+    expect(css).toMatch(
+      /\.viewer-surface-launchers > button\[aria-pressed='true'\]\s*\{[^}]*border-color:\s*#68cadd;[^}]*background:\s*#153c49;/s,
+    );
+    expect(css).toMatch(
+      /\.program-inspector\.central-inspector-section\s*\{[^}]*border-left:\s*0;/s,
+    );
     expect(source).toContain('className="viewer-camera-icon"');
+    expect(source).toContain('<group name="viewer-frame-content">');
   });
 
   it('frames content without changing the current viewing direction', () => {
@@ -179,7 +189,7 @@ describe('viewer failure isolation', () => {
     expect(source).not.toContain('onPointerMissed=');
     expect(source).not.toContain('new THREE.Raycaster()');
     expect(source).toContain("const ignoreViewerRaycast: THREE.Object3D['raycast']");
-    expect(source.match(/raycast=\{ignoreViewerRaycast\}/g)).toHaveLength(5);
+    expect(source.match(/raycast=\{ignoreViewerRaycast\}/g)).toHaveLength(6);
     expect(source).not.toContain('transformRevision');
     expect(source).not.toContain('markTransformChange');
     expect(source).toContain('transformEnabled={transformEnabled && objectEditorActive}');
@@ -236,6 +246,95 @@ describe('viewer failure isolation', () => {
     expect(source.match(/onSelect={selectSceneResource}/g)).toHaveLength(2);
   });
 
+  it('nests each attached object under its exact measured carrier link', () => {
+    const source = readFileSync(
+      new URL('./StructuralViewer.tsx', import.meta.url),
+      'utf8',
+    );
+    const measuredLinkStart = source.indexOf('function MeasuredRuntimeLink');
+    const measuredLinkEnd = source.indexOf('function CandidateRobotGhost');
+    const measuredLink = source.slice(measuredLinkStart, measuredLinkEnd);
+
+    expect(measuredLink).toContain('<AuthoritativeTransformGroup');
+    expect(measuredLink).toContain('attachedObjects.map((object) => (');
+    expect(measuredLink).toContain('<AttachedLogicalSceneObject');
+    expect(source).toContain(
+      '(object) => object.carrierCompiledFrameName === link.name',
+    );
+    expect(source).toContain('position={[pose.position_m.x, pose.position_m.y, pose.position_m.z]}');
+    expect(source).toContain('quaternion={normalizeQuaternion(pose.orientation_xyzw)}');
+    expect(source).toContain('color="#5fa84a"');
+    expect(source).toContain('opacity={0.85}');
+    expect(source).toContain("object.placement.kind !== 'cell_fixed'");
+  });
+
+  it('mounts an Attached primitive at its exact carrier-relative pose and semantic style', () => {
+    const object = sceneObject({ type: 'sphere', radius_m: 0.02 });
+    const presentation: AttachedObjectPresentation = {
+      object,
+      attachmentId: 'attachment-1',
+      attachmentRevision: 'attachment-revision-1',
+      carrierComponentId: 'robot-1',
+      commandTargetId: 'arm',
+      carrierFrameRoleId: 'tcp',
+      carrierCompiledFrameName: 'tool0',
+      poseInCarrierFrame: {
+        position_m: { x: 0.01, y: -0.02, z: 0.03 },
+        orientation_xyzw: [0, 0, 0, 1],
+      },
+    };
+
+    // react-dom/server does not know React Three Fiber's intrinsic elements;
+    // suppress only that renderer mismatch while still exercising the real
+    // component tree and its emitted transform/material attributes.
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    let markup = '';
+    try {
+      markup = renderToStaticMarkup(
+        <AttachedLogicalSceneObject
+          presentation={presentation}
+          selected={false}
+          axesVisible={false}
+          axesSizeM={0.05}
+          wireframe={false}
+          ownerIdentity={undefined}
+          onSelect={() => undefined}
+        />,
+      );
+    } finally {
+      consoleError.mockRestore();
+    }
+
+    expect(markup).toContain('name="scene:part"');
+    expect(markup).toContain('position="0.01,-0.02,0.03"');
+    expect(markup).toContain('quaternion="0,0,0,1"');
+    expect(markup).toContain('color="#5fa84a"');
+    expect(markup).toContain('opacity="0.85"');
+  });
+
+  it('uses Attached and Detached as operator terms while retaining carried as an internal kind', () => {
+    const viewer = readFileSync(
+      new URL('./StructuralViewer.tsx', import.meta.url),
+      'utf8',
+    );
+    const workspace = readFileSync(
+      new URL('./SceneAuthoringWorkspace.tsx', import.meta.url),
+      'utf8',
+    );
+    const authoring = readFileSync(
+      new URL('../state/sceneAuthoring.ts', import.meta.url),
+      'utf8',
+    );
+
+    expect(viewer).toContain('Detach Attached object');
+    expect(workspace).toContain('Attached-object placement');
+    expect(workspace).toContain('objects.length} objects · {attachments.length} Attached');
+    expect(workspace).toContain('`Attached to ${attachment.controllable_component_id}');
+    expect(authoring).toContain('Set the Attached object to Detached');
+    expect(viewer).not.toContain('Detach carried object');
+    expect(workspace).not.toContain('carried-object placement');
+  });
+
   it('retains wheel camera presentation without React state commits', () => {
     const source = readFileSync(
       new URL('./StructuralViewer.tsx', import.meta.url),
@@ -253,21 +352,24 @@ describe('viewer failure isolation', () => {
     expect(source).not.toContain('setCameraPresentation(presentation)');
   });
 
-  it('starts from Reset and frames robot, scene, measured overlays, and point clouds on demand', () => {
+  it('frames robot, scene, measured overlays, and point clouds directly on demand', () => {
     const source = readFileSync(
       new URL('./StructuralViewer.tsx', import.meta.url),
       'utf8',
     );
-    const bounds = source.indexOf('<Bounds');
-    const boundsEnd = source.indexOf('</Bounds>', bounds);
+    const content = source.indexOf('<group name="viewer-frame-content">');
+    const contentEnd = source.indexOf('</group>', content);
 
-    expect(bounds).toBeGreaterThan(0);
-    expect(source.indexOf('<RetainedNeutralModel', bounds)).toBeLessThan(boundsEnd);
-    expect(source.indexOf('<LogicalSceneObjects', bounds)).toBeLessThan(boundsEnd);
-    expect(source.indexOf('<MeasuredLogicalSceneObjects', bounds)).toBeLessThan(boundsEnd);
-    expect(source.indexOf('<PointCloudPoints', bounds)).toBeLessThan(boundsEnd);
+    expect(content).toBeGreaterThan(0);
+    expect(source.indexOf('<RetainedNeutralModel', content)).toBeLessThan(contentEnd);
+    expect(source.indexOf('<LogicalSceneObjects', content)).toBeLessThan(contentEnd);
+    expect(source.indexOf('<MeasuredLogicalSceneObjects', content)).toBeLessThan(contentEnd);
+    expect(source.indexOf('<PointCloudPoints', content)).toBeLessThan(contentEnd);
     expect(source).toContain('viewer-stage viewer-fallback-stage');
-    expect(source).toContain('<Bounds clip margin={1.25}>');
+    expect(source).not.toContain('<Bounds');
+    expect(source).not.toContain('useBounds');
+    expect(source).toContain('framedCameraPresentation(\n      framedBounds,');
+    expect(source).toContain('clipCameraToBounds(perspective, framedBounds)');
     expect(source).not.toContain('fit={camera === null');
     expect(source).toContain('position: [...DEFAULT_VIEWER_CAMERA.position]');
     expect(source).toContain('target: [...DEFAULT_VIEWER_CAMERA.target]');

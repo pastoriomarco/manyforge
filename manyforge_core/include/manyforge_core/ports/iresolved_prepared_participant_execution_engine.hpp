@@ -30,6 +30,7 @@ struct ResolvedPreparedMotionExecutionRequestDTO final {
   std::vector<HardStopResourceLimitDTO> retained_default_stop_limits;
   MotionInterruptNodeCategory stop_node_category{MotionInterruptNodeCategory::kGeneric};
   std::shared_ptr<const PreparedParticipantStopPlanDTO> ordinary_stop_plan;
+  std::shared_ptr<const PreparedParticipantStopPlanDTO> fault_stop_plan;
 };
 
 /// Owner-minted authority for one fresh Resume of an already-dispatched
@@ -43,6 +44,7 @@ struct ResolvedPreparedMotionResumeRequestDTO final {
   ControllerGoalId controller_goal_id;
   ControllerGoalGeneration controller_goal_generation{0U};
   std::shared_ptr<const PreparedParticipantStopPlanDTO> ordinary_stop_plan;
+  std::shared_ptr<const PreparedParticipantStopPlanDTO> fault_stop_plan;
 };
 
 enum class ResolvedPreparedMotionExecutionStateDTO : std::uint8_t {

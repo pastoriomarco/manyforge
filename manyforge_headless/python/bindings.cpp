@@ -525,12 +525,36 @@ public:
 
   std::string
   CompleteOperationEventSnapshot(std::string source_owner_epoch,
-                                 const std::uint64_t through_source_sequence) {
+                                 const std::uint64_t through_source_sequence,
+                                 std::optional<std::string>
+                                     current_stop_fault_json) {
     py::gil_scoped_release release;
     return Invoke([this, source_owner_epoch = std::move(source_owner_epoch),
-                   through_source_sequence]() mutable {
+                   through_source_sequence,
+                   current_stop_fault_json =
+                       std::move(current_stop_fault_json)]() mutable {
+      std::optional<CanonicalValue> current_stop_fault;
+      if (current_stop_fault_json.has_value()) {
+        try {
+          current_stop_fault = deployment::parse_strict_json_model_yaml(
+                                   *current_stop_fault_json)
+                                   .root();
+        } catch (const std::exception &error) {
+          throw OperatorAlarmError(
+              "headless_operation_event_invalid",
+              "current Stop-fault condition is not strict JSON: " +
+                  std::string(error.what()));
+        }
+        if (content_identity::canonical_json(*current_stop_fault) !=
+            *current_stop_fault_json) {
+          throw OperatorAlarmError(
+              "headless_operation_event_invalid",
+              "current Stop-fault condition is not canonical JSON");
+        }
+      }
       return core_->CompleteOperationEventSnapshot(
-          std::move(source_owner_epoch), through_source_sequence);
+          std::move(source_owner_epoch), through_source_sequence,
+          std::move(current_stop_fault));
     });
   }
 
@@ -679,7 +703,8 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
            py::arg("payload_digest"))
       .def("complete_operation_event_snapshot",
            &HeadlessApiBridge::CompleteOperationEventSnapshot,
-           py::arg("source_owner_epoch"), py::arg("through_source_sequence"))
+           py::arg("source_owner_epoch"), py::arg("through_source_sequence"),
+           py::arg("current_stop_fault_json") = std::nullopt)
       .def("mark_operation_event_source_unknown",
            &HeadlessApiBridge::MarkOperationEventSourceUnknown,
            py::arg("source_owner_epoch"))

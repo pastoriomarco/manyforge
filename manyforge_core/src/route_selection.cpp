@@ -703,6 +703,11 @@ bool RouteSelectionStatusDTO::locally_valid() const noexcept {
 
   const bool early_phase = phase == RouteSelectionTransactionPhaseDTO::kAccepted ||
                            phase == RouteSelectionTransactionPhaseDTO::kAcquiringFence;
+  const bool fence_only_known_no_controller_effect =
+      effect == RouteSelectionEffectDTO::kKnownNoEffect && accepted_fence.has_value() &&
+      !controller_observation.has_value() && !controller_reconciliation.has_value() &&
+      !controller_transition_plan.has_value() && controller_transition_results.empty() &&
+      !resulting_active_control_configuration.has_value();
   if (early_phase &&
       (controller_observation.has_value() || controller_reconciliation.has_value() ||
        controller_transition_plan.has_value() || !controller_transition_results.empty() ||
@@ -717,7 +722,8 @@ bool RouteSelectionStatusDTO::locally_valid() const noexcept {
   if ((phase == RouteSelectionTransactionPhaseDTO::kVerifying ||
        phase == RouteSelectionTransactionPhaseDTO::kPublishing ||
        phase == RouteSelectionTransactionPhaseDTO::kReleasingFence) &&
-      (!controller_observation.has_value() || !controller_reconciliation.has_value())) {
+      (!controller_observation.has_value() || !controller_reconciliation.has_value()) &&
+      !fence_only_known_no_controller_effect) {
     return false;
   }
   if (phase == RouteSelectionTransactionPhaseDTO::kObserving ||

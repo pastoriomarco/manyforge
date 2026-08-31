@@ -5,8 +5,8 @@
 #include <manyforge_ros2_control_execution/ros2_control_execution_backend.hpp>
 #undef MANYFORGE_ROS2_CONTROL_EXECUTION_TESTING
 
-#include "../src/scene_projection_worker.hpp"
 #include "../src/ros2_control_stop_qualification_probe.hpp"
+#include "../src/scene_projection_worker.hpp"
 
 #include <control_msgs/action/follow_joint_trajectory.hpp>
 #include <controller_manager_msgs/msg/controller_manager_activity.hpp>
@@ -50,6 +50,25 @@ public:
   }
 
   void cancel(core::ScheduleHandle) override {}
+};
+
+class CountingStopProbe final
+    : public detail::IRos2ControlStopQualificationProbe {
+public:
+  void observe(detail::Ros2ControlStopQualificationEvent event,
+               std::string_view) override {
+    if (event ==
+        detail::Ros2ControlStopQualificationEvent::kNominalProviderEntry) {
+      nominal_entries_.fetch_add(1U, std::memory_order_relaxed);
+    }
+  }
+
+  [[nodiscard]] std::uint64_t nominal_entries() const noexcept {
+    return nominal_entries_.load(std::memory_order_relaxed);
+  }
+
+private:
+  std::atomic<std::uint64_t> nominal_entries_{0U};
 };
 
 std::string unique_suffix() {
@@ -160,7 +179,8 @@ core::ResolvedParticipantStopStageDTO direct_stage_fixture() {
   const auto binding = motion_binding("program.direct");
   const auto &value = binding.value();
   const auto &path = *value.control_path;
-  const std::vector<core::ResourceId> resources{value.resources.front().resource_id};
+  const std::vector<core::ResourceId> resources{
+      value.resources.front().resource_id};
   core::ResolvedStopRuntimeTargetDTO target{
       path.provider_instance_id,
       path.provider_manifest_id,
@@ -187,8 +207,7 @@ core::ResolvedParticipantStopStageDTO direct_stage_fixture() {
       core::ContainmentGranularity::kResource,
       core::StopContainmentCommandDTO{
           core::StopBudgetPhaseId("command"),
-          core::StopContainmentCommandKind::kControllerGoalCancel,
-          std::nullopt,
+          core::StopContainmentCommandKind::kControllerGoalCancel, std::nullopt,
           std::nullopt},
       std::nullopt,
       core::ResolvedStopCommandQualificationDTO{},
@@ -201,8 +220,7 @@ core::ResolvedParticipantStopStageDTO direct_stage_fixture() {
               core::StopEvidenceItemId("goal.terminal"),
               core::StopBudgetPhaseId("terminal"),
               core::StopEvidenceRequirementKind::kControllerGoalTerminal,
-              std::nullopt,
-              std::nullopt,
+              std::nullopt, std::nullopt,
               core::StopEvidenceSourceRequirementDTO{
                   core::StopEvidenceSourceKind::kControllerGoalStatus,
                   100'000'000,
@@ -212,11 +230,8 @@ core::ResolvedParticipantStopStageDTO direct_stage_fixture() {
                   core::StopEvidenceObservationKind::kPostCommandSample,
                   std::nullopt}},
           core::ResolvedStopEvidenceSourceDTO{
-              core::StopEvidenceSourceKind::kControllerGoalStatus,
-              target,
-              std::nullopt,
-              std::nullopt,
-              std::nullopt}}}};
+              core::StopEvidenceSourceKind::kControllerGoalStatus, target,
+              std::nullopt, std::nullopt, std::nullopt}}}};
   return core::ResolvedParticipantStopStageDTO{
       core::StopId("stop.direct"),
       core::StopGeneration(1U),
@@ -277,12 +292,10 @@ core::ResolvedParticipantStopStageDTO software_hard_stage_fixture() {
   command.stage_kind = core::StopEscalationStageKind::kSoftwareHard;
   command.containment_command = core::StopContainmentCommandDTO{
       core::StopBudgetPhaseId("hard_command"),
-      core::StopContainmentCommandKind::kRegistered,
-      std::nullopt,
+      core::StopContainmentCommandKind::kRegistered, std::nullopt,
       core::RegisteredStopCommandKindId("manyforge.stop.software_hard")};
   auto &evidence = command.evidence_requirements.front();
-  evidence.requirement.evidence_item_id =
-      core::StopEvidenceItemId("hard.rest");
+  evidence.requirement.evidence_item_id = core::StopEvidenceItemId("hard.rest");
   evidence.requirement.phase_id = core::StopBudgetPhaseId("hard_terminal");
   evidence.requirement.evidence_kind =
       core::StopEvidenceRequirementKind::kMotionRest;
@@ -292,9 +305,8 @@ core::ResolvedParticipantStopStageDTO software_hard_stage_fixture() {
           100'000'000,
           std::nullopt,
           {core::StateAuthorityClass::kCommanded}};
-  evidence.requirement.observation_semantics =
-      core::StopEvidenceObservationDTO{
-          core::StopEvidenceObservationKind::kPostCommandDwell, 10'000'000};
+  evidence.requirement.observation_semantics = core::StopEvidenceObservationDTO{
+      core::StopEvidenceObservationKind::kPostCommandDwell, 10'000'000};
   const auto binding = motion_binding("program.direct");
   const auto &path = *binding.value().control_path;
   evidence.resolved_source.source_kind =
@@ -307,15 +319,85 @@ core::ResolvedParticipantStopStageDTO software_hard_stage_fixture() {
   return stage;
 }
 
+core::ResolvedParticipantStopStageDTO controlled_stage_fixture() {
+  auto stage = direct_stage_fixture();
+  auto &plan = stage.participant_stop_plan;
+  auto &prepared = plan.stage_commands.front();
+  auto &command = prepared.resolved_stage;
+  const auto binding = motion_binding("program.direct");
+  const auto &value = binding.value();
+  const auto &path = *value.control_path;
+  const core::ProviderContractRefDTO contract{
+      core::ProviderContractRoleId("stop_contract"),
+      core::SchemaId(std::string(core::kMotionControlledStopContractSchemaId)),
+      core::SchemaRevision(
+          std::string(core::kMotionControlledStopContractSchemaRevision))};
+  core::JsonValueDTO::Array limits;
+  limits.emplace_back(core::JsonObjectDTO{
+      {"resource_id",
+       core::JsonValueDTO{value.resources.front().resource_id.value()}},
+      {"max_deceleration",
+       core::JsonValueDTO{core::JsonObjectDTO{
+           {"coordinate_kind", core::JsonValueDTO{"angular_rad_s2"}},
+           {"value_rad_s2", core::JsonValueDTO{4.0}},
+       }}},
+      {"settle_velocity_threshold",
+       core::JsonValueDTO{core::JsonObjectDTO{
+           {"coordinate_kind", core::JsonValueDTO{"angular_rad_s"}},
+           {"value_rad_s", core::JsonValueDTO{0.01}},
+       }}},
+  });
+  core::JsonObjectDTO parameters{
+      {"stop_mode", core::JsonValueDTO{"soft_on_path"}},
+      {"deceleration_time_s", core::JsonValueDTO{1.0}},
+      {"per_resource_limits", core::JsonValueDTO{std::move(limits)}},
+      {"allow_natural_completion_on_short_path", core::JsonValueDTO{true}},
+  };
+  command.stop_escalation_stage_id =
+      core::StopEscalationStageId("stage.controlled");
+  command.containment_command = core::StopContainmentCommandDTO{
+      core::StopBudgetPhaseId("command"),
+      core::StopContainmentCommandKind::kMotionControlledStop, contract,
+      std::nullopt};
+  command.default_contract_parameters = parameters;
+  command.evidence_requirements = {core::ResolvedStopEvidenceRequirementDTO{
+      core::StopEvidenceRequirementDTO{
+          core::StopEvidenceItemId("controlled.rest"),
+          core::StopBudgetPhaseId("terminal"),
+          core::StopEvidenceRequirementKind::kMotionRest, contract,
+          std::nullopt,
+          core::StopEvidenceSourceRequirementDTO{
+              core::StopEvidenceSourceKind::kBindingStateAuthority,
+              100'000'000,
+              core::EndpointRoleId("state"),
+              {core::StateAuthorityClass::kCommanded}},
+          core::StopEvidenceObservationDTO{
+              core::StopEvidenceObservationKind::kPostCommandDwell,
+              10'000'000}},
+      core::ResolvedStopEvidenceSourceDTO{
+          core::StopEvidenceSourceKind::kBindingStateAuthority,
+          command.command_target, path.state_authority_id,
+          path.state_authority_class, contract}}};
+  prepared.validated_contract_parameters = std::move(parameters);
+  prepared.parameter_source =
+      core::StopStageParameterSourceDTO::kDeploymentDefault;
+  plan.deadline_budget = core::StopDeadlineBudgetDTO{
+      3'000'000'000,
+      200'000'000,
+      {{core::StopBudgetPhaseId("command"), 300'000'000},
+       {core::StopBudgetPhaseId("terminal"), 1'750'000'000}}};
+  return stage;
+}
+
 core::RemainingStopBudgetDTO
 remaining_budget(const core::ResolvedParticipantStopStageDTO &stage) {
   core::RemainingStopBudgetDTO budget{
-      stage.stop_id, stage.stop_generation,
-      stage.participant_stop_plan.deadline_budget.outer_duration_ns, {}};
-  for (const auto &phase :
-       stage.participant_stop_plan.deadline_budget.phases) {
-    budget.phases.push_back(
-        {phase.phase_id, phase.deadline_offset_ns});
+      stage.stop_id,
+      stage.stop_generation,
+      stage.participant_stop_plan.deadline_budget.outer_duration_ns,
+      {}};
+  for (const auto &phase : stage.participant_stop_plan.deadline_budget.phases) {
+    budget.phases.push_back({phase.phase_id, phase.deadline_offset_ns});
   }
   return budget;
 }
@@ -1080,8 +1162,7 @@ private:
       if (conflicting_claim_) {
         controller_manager_msgs::msg::NamedLifecycleState conflict;
         conflict.name = "conflicting_controller";
-        conflict.state.id =
-            lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE;
+        conflict.state.id = lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE;
         conflict.state.label = "active";
         activity.controllers.push_back(std::move(conflict));
       }
@@ -1343,13 +1424,12 @@ TEST(Ros2ControlExecutionBackendTest,
                                                {0.0}));
   backend.testing_install_prepared_goal_membership(
       stage, core::ContentDigest("prepared.direct"));
-  const auto result = backend.TranslateStopStage(
-      stage, remaining_budget(stage), std::stop_token{});
+  const auto result = backend.TranslateStopStage(stage, remaining_budget(stage),
+                                                 std::stop_token{});
 
   EXPECT_EQ(result.attempt_disposition,
             core::StopStageAttemptDispositionDTO::kDispatched);
-  EXPECT_EQ(result.outcome,
-            core::ParticipantStopStageOutcomeDTO::kSucceeded);
+  EXPECT_EQ(result.outcome, core::ParticipantStopStageOutcomeDTO::kSucceeded);
   ASSERT_EQ(result.evidence_items.size(), 1U);
   EXPECT_EQ(result.evidence_items.front().state,
             core::StopEvidenceItemStateDTO::kSatisfied);
@@ -1366,8 +1446,7 @@ TEST(Ros2ControlExecutionBackendTest,
             core::StopStageAttemptDispositionDTO::kNotDispatched);
   EXPECT_EQ(crossed.outcome, core::ParticipantStopStageOutcomeDTO::kFailed);
   ASSERT_TRUE(crossed.error.has_value());
-  EXPECT_EQ(crossed.error->details.at("reason"),
-            "prepared_goal_not_active");
+  EXPECT_EQ(crossed.error->details.at("reason"), "prepared_goal_not_active");
   EXPECT_EQ(backend.get_execution_snapshot().state,
             core::ExecutionState::kExecuting);
   EXPECT_TRUE(backend.stop().accepted);
@@ -1390,17 +1469,16 @@ TEST(Ros2ControlExecutionBackendTest,
   const auto stage = software_hard_stage_fixture();
 
   backend.testing_set_running_state(true);
-  ASSERT_TRUE(backend.testing_publish_snapshot(core::ExecutionState::kStopping,
-                                               {0.0}));
+  ASSERT_TRUE(
+      backend.testing_publish_snapshot(core::ExecutionState::kStopping, {0.0}));
   backend.testing_install_prepared_goal_membership(
       stage, core::ContentDigest("prepared.software_hard"));
-  const auto result = backend.TranslateStopStage(
-      stage, remaining_budget(stage), std::stop_token{});
+  const auto result = backend.TranslateStopStage(stage, remaining_budget(stage),
+                                                 std::stop_token{});
 
   EXPECT_EQ(result.attempt_disposition,
             core::StopStageAttemptDispositionDTO::kDispatched);
-  EXPECT_EQ(result.outcome,
-            core::ParticipantStopStageOutcomeDTO::kSucceeded);
+  EXPECT_EQ(result.outcome, core::ParticipantStopStageOutcomeDTO::kSucceeded);
   ASSERT_EQ(result.evidence_items.size(), 1U);
   EXPECT_EQ(result.evidence_items.front().required_class,
             core::StopEvidenceRequirementKind::kMotionRest);
@@ -1410,6 +1488,45 @@ TEST(Ros2ControlExecutionBackendTest,
   ASSERT_TRUE(result.source_sequence.has_value());
   EXPECT_EQ(backend.get_execution_snapshot().state,
             core::ExecutionState::kStopped);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     ExactPreparedControlledStageProjectsSourceScopeAndInvokesProviderOnce) {
+  auto config = base_config();
+  config.execution_state_source_mode = "commanded_sim";
+  config.initial_joint_positions_rad = {0.0};
+  config.prepared_participant_binding = motion_binding("program.direct");
+  config.transport_joint_names = {"source_joint_1"};
+  config.enable_soft_on_path_path_ramp = true;
+  config.soft_on_path_max_jerk_rad_s3 = {{"joint_1", 1'000'000.0}};
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  clock.set(1'000'000'000);
+  core::ManualScheduler scheduler;
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
+      scheduler, std::move(config));
+  CountingStopProbe probe;
+  detail::Ros2ControlStopQualificationAccess::install_probe(backend, probe);
+  const auto stage = controlled_stage_fixture();
+
+  backend.testing_set_running_state(true);
+  ASSERT_TRUE(backend.testing_publish_snapshot(core::ExecutionState::kExecuting,
+                                               {0.0}));
+  backend.testing_install_prepared_goal_membership(
+      stage, core::ContentDigest("prepared.controlled"));
+  const auto result = backend.TranslateStopStage(stage, remaining_budget(stage),
+                                                 std::stop_token{});
+
+  EXPECT_EQ(result.attempt_disposition,
+            core::StopStageAttemptDispositionDTO::kNotDispatched);
+  EXPECT_EQ(result.outcome, core::ParticipantStopStageOutcomeDTO::kFailed);
+  ASSERT_TRUE(result.error.has_value());
+  // Reaching the provider's observed-state gate proves the source-addressed
+  // retained profile was projected to the compiled controller scope first.
+  EXPECT_EQ(result.error->details.at("reason"),
+            "controlled_stop_no_observed_state");
+  EXPECT_EQ(probe.nominal_entries(), 1U);
 }
 
 TEST(Ros2ControlExecutionBackendTest,
@@ -1434,8 +1551,8 @@ TEST(Ros2ControlExecutionBackendTest,
   backend.testing_begin_managed_fjt_terminal_session(managed_generation,
                                                      goal_id);
   detail::Ros2ControlStopQualificationAccess::
-      arm_forced_managed_terminal_for_test(
-          backend, execution_generation - 1U, managed_generation);
+      arm_forced_managed_terminal_for_test(backend, execution_generation - 1U,
+                                           managed_generation);
   Ros2ControlExecutionBackend::TestingGoalHandleFJT::WrappedResult stale;
   stale.goal_id = goal_id;
   stale.code = rclcpp_action::ResultCode::CANCELED;
@@ -1449,8 +1566,8 @@ TEST(Ros2ControlExecutionBackendTest,
   backend.testing_begin_managed_fjt_terminal_session(managed_generation + 1U,
                                                      replacement_goal_id);
   detail::Ros2ControlStopQualificationAccess::
-      arm_forced_managed_terminal_for_test(
-          backend, execution_generation, managed_generation + 1U);
+      arm_forced_managed_terminal_for_test(backend, execution_generation,
+                                           managed_generation + 1U);
   Ros2ControlExecutionBackend::TestingGoalHandleFJT::WrappedResult current;
   current.goal_id = replacement_goal_id;
   current.code = rclcpp_action::ResultCode::CANCELED;
@@ -1494,19 +1611,22 @@ TEST(Ros2ControlExecutionBackendTest,
 }
 
 TEST(Ros2ControlExecutionBackendTest,
-     CurrentSpringStopProfilePassesAdapterShapeGateBeforeStateRead) {
+     PortableSpringProfileProjectsToCompiledScopeBeforeStateRead) {
   auto sink = std::make_shared<RecordingExecutionStateSink>();
   core::FakeClock clock;
   core::ManualScheduler scheduler;
+  auto config = base_config();
+  config.prepared_participant_binding = motion_binding("program.direct");
+  config.transport_joint_names = {"source_joint_1"};
   Ros2ControlExecutionBackend backend(
       Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
-      scheduler, base_config());
+      scheduler, std::move(config));
 
   core::MotionInterruptStopProfileDTO profile;
   profile.profile_id = "spring.profile";
   profile.stop_mode = core::MotionInterruptStopMode::kSpringBackHold;
   profile.per_joint_max_deceleration = {
-      {"joint_1", core::AngularAccelerationDTO{1.0}}};
+      {"source_joint_1", core::AngularAccelerationDTO{1.0}}};
   const auto result = backend.execute_controlled_stop(profile);
   ASSERT_TRUE(result.error.has_value());
   EXPECT_EQ(result.error->details.at("reason"),
@@ -1643,8 +1763,7 @@ TEST(Ros2ControlExecutionBackendTest,
   const auto after_replay = backend.controller_binding_snapshot();
   ASSERT_TRUE(after_replay.has_value());
   EXPECT_TRUE(after_replay->valid);
-  EXPECT_EQ(after_replay->activity_generation,
-            admitted->activity_generation);
+  EXPECT_EQ(after_replay->activity_generation, admitted->activity_generation);
 }
 
 TEST(Ros2ControlExecutionBackendTest,
@@ -1720,8 +1839,8 @@ TEST(Ros2ControlExecutionBackendTest,
   const std::string controller_manager =
       "/manyforge_binding_refresh_grace_" + suffix + "/controller_manager";
   auto config = base_config();
-  config.action_name = "/manyforge_binding_refresh_grace_" + suffix +
-                       "/follow_joint_trajectory";
+  config.action_name =
+      "/manyforge_binding_refresh_grace_" + suffix + "/follow_joint_trajectory";
   config.joint_state_topic =
       "/manyforge_binding_refresh_grace_" + suffix + "/joint_states";
   config.controller_state_topic =
@@ -1738,8 +1857,9 @@ TEST(Ros2ControlExecutionBackendTest,
   ASSERT_TRUE(manager.wait_for_activity_subscription());
 
   const auto initial = wait_for_binding_snapshot(
-      backend,
-      [](const ControllerBindingSnapshot &candidate) { return candidate.valid; });
+      backend, [](const ControllerBindingSnapshot &candidate) {
+        return candidate.valid;
+      });
   ASSERT_TRUE(initial.has_value());
   const auto failures_before = backend.controller_progress_metrics()
                                    .controller_binding_refresh_failures_total;
@@ -1750,7 +1870,8 @@ TEST(Ros2ControlExecutionBackendTest,
   const auto failure_deadline = std::chrono::steady_clock::now() + 2s;
   while (std::chrono::steady_clock::now() < failure_deadline &&
          backend.controller_progress_metrics()
-                 .controller_binding_refresh_failures_total == failures_before) {
+                 .controller_binding_refresh_failures_total ==
+             failures_before) {
     std::this_thread::sleep_for(10ms);
   }
   ASSERT_GT(backend.controller_progress_metrics()
@@ -2113,10 +2234,8 @@ TEST(Ros2ControlExecutionBackendTest,
             "execution_environment_epoch_changed");
   EXPECT_EQ(terminal.error->details.at("changed_dimensions"),
             "lifecycle_generation,transport_owner_component_epoch");
-  EXPECT_EQ(terminal.error->details.at("planning_lifecycle_generation"),
-            "1");
-  EXPECT_EQ(terminal.error->details.at("dispatch_lifecycle_generation"),
-            "2");
+  EXPECT_EQ(terminal.error->details.at("planning_lifecycle_generation"), "1");
+  EXPECT_EQ(terminal.error->details.at("dispatch_lifecycle_generation"), "2");
   EXPECT_EQ(
       terminal.error->details.at("planning_transport_owner_component_epoch"),
       "owner-epoch-1");
@@ -2629,22 +2748,20 @@ TEST(Ros2ControlExecutionBackendTest,
   for (const std::string invalid_name : {"", "node/name", "9node"}) {
     auto config = base_config();
     config.node_name = invalid_name;
-    EXPECT_THROW(
-        (Ros2ControlExecutionBackend(
-            Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink,
-            "arm", clock, scheduler, config)),
-        std::invalid_argument);
+    EXPECT_THROW((Ros2ControlExecutionBackend(
+                     Ros2ControlExecutionBackend::TestingNoRosStartupTag{},
+                     sink, "arm", clock, scheduler, config)),
+                 std::invalid_argument);
   }
   for (const std::string invalid_namespace :
        {"", "manyforge/robot", "/manyforge/robot/", "/manyforge/robot.1",
         "/manyforge//robot"}) {
     auto config = base_config();
     config.node_namespace = invalid_namespace;
-    EXPECT_THROW(
-        (Ros2ControlExecutionBackend(
-            Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink,
-            "arm", clock, scheduler, config)),
-        std::invalid_argument);
+    EXPECT_THROW((Ros2ControlExecutionBackend(
+                     Ros2ControlExecutionBackend::TestingNoRosStartupTag{},
+                     sink, "arm", clock, scheduler, config)),
+                 std::invalid_argument);
   }
 }
 
@@ -2734,8 +2851,8 @@ TEST(Ros2ControlExecutionBackendTest,
   Ros2ControlExecutionBackend backend(
       Ros2ControlExecutionBackend::DeferredRosExecutorStartTag{}, sink, "arm",
       clock, scheduler, base_config());
-  auto gripper = isaac_gripper_config(
-      "/manyforge_gripper_source_command_" + suffix);
+  auto gripper =
+      isaac_gripper_config("/manyforge_gripper_source_command_" + suffix);
   gripper.state_topic = state_topic;
   gripper.command_joint_names = {"right_finger_joint"};
   gripper.state_joint_name = "right_finger_joint";
@@ -2775,8 +2892,7 @@ TEST(Ros2ControlExecutionBackendTest,
   EXPECT_FALSE(readiness.command_path_ready);
   EXPECT_FALSE(readiness.ready);
   EXPECT_EQ(readiness.reason_codes,
-            std::vector<std::string>{
-                "gripper_command_subscriber_unavailable"});
+            std::vector<std::string>{"gripper_command_subscriber_unavailable"});
 }
 
 TEST(Ros2ControlExecutionBackendTest,
@@ -2876,11 +2992,11 @@ TEST(Ros2ControlExecutionBackendTest,
       Ros2ControlExecutionBackend::DeferredRosExecutorStartTag{}, sink, "arm",
       clock, scheduler, base_config());
   backend.configure_gripper_action(
-      "tool", isaac_gripper_config("/manyforge_resolved_gripper_" +
-                                    unique_suffix()));
+      "tool",
+      isaac_gripper_config("/manyforge_resolved_gripper_" + unique_suffix()));
 
-  const auto request = make_gripper_request(
-      0.0, 0.2, 0.0, "resolved_binding", "goal_fenced_target_reached");
+  const auto request = make_gripper_request(0.0, 0.2, 0.0, "resolved_binding",
+                                            "goal_fenced_target_reached");
   EXPECT_TRUE(backend.validate_gripper_command(request).ok());
 
   const auto accepted = backend.command_gripper(request);
