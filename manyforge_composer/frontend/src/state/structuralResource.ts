@@ -13,11 +13,16 @@ export type StructuralResourceAction<T> =
   | { type: 'reject'; message: string };
 
 export function structuralResourceReducer<T>(
-  _state: StructuralResourceState<T>,
+  state: StructuralResourceState<T>,
   action: StructuralResourceAction<T>,
 ): StructuralResourceState<T> {
   switch (action.type) {
     case 'load':
+      // A refresh of an already coherent structural projection must not turn
+      // that projection into a momentary absence. Exact-identity consumers
+      // continue to validate the retained value while the replacement read is
+      // in flight, and resolve/reject still publishes the read's real result.
+      if (state.status === 'ready' || state.status === 'loading') return state;
       return { status: 'loading' };
     case 'resolve':
       return { status: 'ready', data: action.data };

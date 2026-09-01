@@ -47,6 +47,9 @@ _CATALOG_API_VERSION: Final = "manyforge.node_catalog.v2"
 _IDENTIFIER_RE: Final = re.compile(r"^[a-z][a-z0-9_.-]*$")
 _MAX_PROGRAM_ROLES: Final = 4096
 _MAX_PROGRAM_DECLARATIONS: Final = 100_000
+_PROGRAM_MOTION_CEILINGS: Final = frozenset(
+    {"velocity_scale", "acceleration_scale", "max_tcp_linear_speed_mps"}
+)
 
 
 class ProgramValidationError(ValueError):
@@ -1738,12 +1741,17 @@ def _validate_viewer(value: Any, *, path: str) -> None:
                 "frame_role_visibility",
                 "frame_gizmo_size_m",
                 "resource_role_visibility",
+                "scene_resource_axes_visibility",
                 "object_axes_gizmo_size_m",
             }
         ),
         path=path,
     )
-    for field_name in ("frame_role_visibility", "resource_role_visibility"):
+    for field_name in (
+        "frame_role_visibility",
+        "resource_role_visibility",
+        "scene_resource_axes_visibility",
+    ):
         if field_name not in row:
             continue
         visibility = _program_mapping(row[field_name], path=f"{path}.{field_name}")
@@ -1764,6 +1772,7 @@ def _validate_viewer_references(
     path: str,
     target_roles: Mapping[str, dict[str, Any]],
     scene_resource_roles: set[str],
+    scene_resource_ids: set[str],
 ) -> None:
     row = _program_mapping(value, path=path)
     declared_frame_roles = {
@@ -1779,6 +1788,7 @@ def _validate_viewer_references(
     for field_name, declared in (
         ("frame_role_visibility", declared_frame_roles),
         ("resource_role_visibility", declared_resource_roles),
+        ("scene_resource_axes_visibility", scene_resource_ids),
     ):
         for role in _program_mapping(
             row.get(field_name, {}), path=f"{path}.{field_name}"
@@ -3401,6 +3411,34 @@ def _validate_program_tree(
                 destination_schema=catalog_parameter.schema,
             )
 
+    for parameter_id in sorted(_PROGRAM_MOTION_CEILINGS & set(catalog_parameters)):
+        declaration = context.parameters.get(parameter_id)
+        if declaration is None:
+            continue
+        ceiling = declaration.default
+        if type(ceiling) not in {int, float} or not math.isfinite(float(ceiling)):
+            _program_error(
+                f"program.parameters.{parameter_id}.default",
+                "must be one finite global motion ceiling",
+            )
+        if parameter_id in parameters:
+            value = parameters[parameter_id]
+            if type(value) not in {int, float} or float(value) > float(ceiling):
+                _program_error(
+                    f"{path}.parameters.{parameter_id}",
+                    f"must not exceed Program {parameter_id}={float(ceiling):g}",
+                )
+            continue
+        source = value_sources.get(parameter_id)
+        if source != {
+            "kind": "program_parameter",
+            "reference": parameter_id,
+        }:
+            _program_error(
+                f"{path}.value_sources.{parameter_id}",
+                f"must default to the Program {parameter_id} parameter",
+            )
+
     _validate_node_capabilities(entry, parameters, path=path, context=context)
     _validate_catalog_blackboard_bindings(entry, parameters, path=path, context=context)
     _validate_node_cross_fields(node_id, parameters, path=path, context=context)
@@ -3549,6 +3587,7 @@ def _validate_program_document(
             path=f"{source}.viewer",
             target_roles=target_roles,
             scene_resource_roles=scene_resource_roles,
+            scene_resource_ids=scene_resource_ids,
         )
     parameters = _validate_parameters(
         root.get("parameters", []),

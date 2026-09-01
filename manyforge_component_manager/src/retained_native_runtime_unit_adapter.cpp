@@ -829,13 +829,20 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
        std::vector<std::string> selected_launch_environment_contracts,
        std::filesystem::path logical_scene_database,
        std::filesystem::path program_cycle_journal,
-       std::filesystem::path authoring_transaction_journal)
+       std::filesystem::path authoring_transaction_journal,
+       std::filesystem::path candidate_package_root)
       : target_root_path(
             NormalizedPlainDirectory(std::move(trusted_installed_target_root),
                                      "trusted installed-target root")),
         package_root_path(NormalizedPlainDirectory(
             std::move(trusted_package_root), "trusted retained-package root")),
         package_root_fd(OpenPinnedPackageRoot(package_root_path)),
+        candidate_package_root_path(
+            candidate_package_root.empty()
+                ? std::filesystem::path{}
+                : NormalizedPlainDirectory(
+                      std::move(candidate_package_root),
+                      "candidate retained-package root")),
         manager_state_root_path(NormalizedPlainDirectory(
             std::move(manager_state_root), "Manager state root")),
         manager_run_root_path(NormalizedPlainDirectory(
@@ -871,6 +878,15 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     for (const auto *typed_root : typed_roots) {
       RequireDisjointDirectories(target_root_path, *typed_root);
       RequireDisjointDirectories(package_root_path, *typed_root);
+      if (!candidate_package_root_path.empty()) {
+        RequireDisjointDirectories(candidate_package_root_path, *typed_root);
+      }
+    }
+    if (!candidate_package_root_path.empty()) {
+      RequireDisjointDirectories(package_root_path,
+                                 candidate_package_root_path);
+      candidate_package_root_fd =
+          OpenPinnedPackageRoot(candidate_package_root_path);
     }
     const std::array<const std::filesystem::path *, 3U> durable_paths{
         &logical_scene_database_path, &program_cycle_journal_path,
@@ -1590,7 +1606,8 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     }
     if (pid == 0) {
       EnterChild(parent, channels[1].get(), liveness_channels[1].get(),
-                 exec_pipe[1].get(), target.get(), package_root_fd.get(),
+                 exec_pipe[1].get(), target.get(),
+                 PackageRootFd(bundle.retained_bundle_id()),
                  argv.data());
     }
 
@@ -1641,6 +1658,39 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
       throw;
     }
     return child;
+  }
+
+  [[nodiscard]] int PackageRootFd(
+      const manyforge::core::RetainedBundleId &retained_bundle_id) const {
+    const auto &digest = retained_bundle_id.value();
+    if (digest.size() != 71U || !digest.starts_with("sha256:")) {
+      return package_root_fd.get();
+    }
+    const auto contains_bundle = [&](const std::filesystem::path &root,
+                                     std::string_view label) {
+      const auto path = root / "retained-bundles" / "sha256" /
+                        (digest.substr(7U) + ".json");
+      std::error_code error;
+      const auto status = std::filesystem::symlink_status(path, error);
+      if (error == std::errc::no_such_file_or_directory ||
+          status.type() == std::filesystem::file_type::not_found) {
+        return false;
+      }
+      if (error) {
+        Fail("could not inspect " + std::string(label) +
+             " retained bundle: " + error.message());
+      }
+      return true;
+    };
+
+    if (contains_bundle(package_root_path, "installed")) {
+      return package_root_fd.get();
+    }
+    if (!candidate_package_root_path.empty() &&
+        contains_bundle(candidate_package_root_path, "authored")) {
+      return candidate_package_root_fd.get();
+    }
+    return package_root_fd.get();
   }
 
   [[nodiscard]] ProcessPresenceObservation
@@ -1791,6 +1841,8 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
   std::filesystem::path target_root_path;
   std::filesystem::path package_root_path;
   UniqueFd package_root_fd;
+  std::filesystem::path candidate_package_root_path;
+  UniqueFd candidate_package_root_fd;
   std::filesystem::path manager_state_root_path;
   std::filesystem::path manager_run_root_path;
   std::filesystem::path execution_state_root_path;
@@ -2013,7 +2065,8 @@ RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
     std::string operating_system, std::string launch_environment_contract,
     std::filesystem::path logical_scene_database,
     std::filesystem::path program_cycle_journal,
-    std::filesystem::path authoring_transaction_journal)
+    std::filesystem::path authoring_transaction_journal,
+    std::filesystem::path candidate_package_root)
     : RetainedNativeRuntimeUnitAdapter(
           std::move(trusted_installed_target_root),
           std::move(trusted_package_root), std::move(manager_state_root),
@@ -2022,7 +2075,8 @@ RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
           std::move(operating_system),
           std::vector<std::string>{std::move(launch_environment_contract)},
           std::move(logical_scene_database), std::move(program_cycle_journal),
-          std::move(authoring_transaction_journal)) {}
+          std::move(authoring_transaction_journal),
+          std::move(candidate_package_root)) {}
 
 RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
     std::filesystem::path trusted_installed_target_root,
@@ -2038,7 +2092,8 @@ RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
     std::vector<std::string> launch_environment_contracts,
     std::filesystem::path logical_scene_database,
     std::filesystem::path program_cycle_journal,
-    std::filesystem::path authoring_transaction_journal)
+    std::filesystem::path authoring_transaction_journal,
+    std::filesystem::path candidate_package_root)
     : impl_(std::make_shared<Impl>(
           std::move(trusted_installed_target_root),
           std::move(trusted_package_root), std::move(manager_state_root),
@@ -2046,7 +2101,8 @@ RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
           std::move(execution_run_root), bundle_source, artifact_source,
           std::move(operating_system), std::move(launch_environment_contracts),
           std::move(logical_scene_database), std::move(program_cycle_journal),
-          std::move(authoring_transaction_journal))) {}
+          std::move(authoring_transaction_journal),
+          std::move(candidate_package_root))) {}
 
 RetainedNativeRuntimeUnitAdapter::~RetainedNativeRuntimeUnitAdapter() = default;
 

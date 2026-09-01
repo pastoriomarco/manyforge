@@ -746,6 +746,13 @@ TEST(SqliteOperationJournalTest,
         std::count_if(events.value().events.begin(), events.value().events.end(),
                       [](const auto& event) { return event.record_kind == "stop_fault_cleared"; }),
         1);
+    const auto operational_events =
+        journal.ReadOperationalEvents(epoch, first.value() - 1U,
+                                      kMaximumOperationJournalEventPage);
+    ASSERT_TRUE(operational_events.ok()) << operational_events.error().message;
+    ASSERT_EQ(operational_events.value().events.size(), 1U);
+    EXPECT_EQ(operational_events.value().events.front().sequence, first.value());
+    EXPECT_EQ(operational_events.value().events.front().record_kind, "stop_fault_cleared");
     ASSERT_TRUE(journal.CloseOwnerEpoch(epoch, 100).ok());
     expected_status = resulting_status;
     expected_certificate = terminal.certificate;

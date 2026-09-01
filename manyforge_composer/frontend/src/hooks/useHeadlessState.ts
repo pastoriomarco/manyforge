@@ -5,6 +5,8 @@ import type { ComposerHeadlessState } from '../types/headless';
 import type {
   ExecutionObservationFrame,
   ExecutionObservationReader,
+  ExecutionObservationTransportPhase,
+  ExecutionObservationTransportStatus,
 } from '../types/viewerObservation';
 import {
   setViewerQualificationTransport,
@@ -121,9 +123,9 @@ export function admitHeadlessState(
   return { accepted: true, reason: null };
 }
 
-function websocketUrl(): string {
+function websocketUrl(path: '/ws/state' | '/ws/scene/viewer'): string {
   const resolved = new URL(
-    resolveStructuralAssetUrl('/ws/state'),
+    resolveStructuralAssetUrl(path),
     window.location.href,
   );
   resolved.protocol = resolved.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -179,6 +181,10 @@ export function sameHeadlessProjection(
     )
     && current.alarms.ownerEpoch === candidate.alarms.ownerEpoch
     && current.alarms.generation === candidate.alarms.generation
+    && sameComponentOverviewPresentation(
+      current.componentOverview,
+      candidate.componentOverview,
+    )
     && current.authoringAdmission.authoringAllowed
       === candidate.authoringAdmission.authoringAllowed
     && current.authoringAdmission.admissionGeneration
@@ -200,6 +206,62 @@ export function sameHeadlessProjection(
       === candidate.programCycle.recoveryOffer?.offerRevision
     && current.draftIdentity.draftId === candidate.draftIdentity.draftId
     && current.draftIdentity.draftRevision === candidate.draftIdentity.draftRevision;
+}
+
+export function sameComponentOverviewPresentation(
+  current: ComposerHeadlessState['componentOverview'],
+  candidate: ComposerHeadlessState['componentOverview'],
+): boolean {
+  const currentBasis = current.basis;
+  const candidateBasis = candidate.basis;
+  return current.readiness === candidate.readiness
+    && current.summaryLabel === candidate.summaryLabel
+    && current.profileLabel === candidate.profileLabel
+    && current.authorityLabel === candidate.authorityLabel
+    && current.userMessage === candidate.userMessage
+    && sameStrings(current.capabilities, candidate.capabilities)
+    && current.components.length === candidate.components.length
+    && current.components.every((component, index) => {
+      const next = candidate.components[index];
+      return next !== undefined
+        && component.id === next.id
+        && component.label === next.label
+        && component.status === next.status
+        && component.detail === next.detail
+        && component.required === next.required
+        && sameStrings(component.requiredFor, next.requiredFor)
+        && component.ownerId === next.ownerId
+        && component.ownerEpoch === next.ownerEpoch
+        && component.generation === next.generation
+        && component.reasonCode === next.reasonCode
+        && component.scope === next.scope
+        && sameStrings(component.contributorIds, next.contributorIds);
+    })
+    && currentBasis.runtimeProjectionOwnerEpoch
+      === candidateBasis.runtimeProjectionOwnerEpoch
+    // The aggregate runtime generation is a transport heartbeat when every
+    // identified contributor below is unchanged.  It remains retained in the
+    // latest source frame for diagnostics but must not wake the shell/viewer.
+    && currentBasis.managerSourceOwnerEpoch === candidateBasis.managerSourceOwnerEpoch
+    && currentBasis.logicalSceneSourceOwnerEpoch
+      === candidateBasis.logicalSceneSourceOwnerEpoch
+    && currentBasis.logicalSceneSourceGeneration
+      === candidateBasis.logicalSceneSourceGeneration
+    && currentBasis.sceneRuntimeSourceOwnerEpoch
+      === candidateBasis.sceneRuntimeSourceOwnerEpoch
+    && currentBasis.sceneRuntimeSourceGeneration
+      === candidateBasis.sceneRuntimeSourceGeneration
+    && currentBasis.alarmOwnerEpoch === candidateBasis.alarmOwnerEpoch
+    && currentBasis.alarmGeneration === candidateBasis.alarmGeneration
+    && currentBasis.alarmStateRevision === candidateBasis.alarmStateRevision
+    && currentBasis.admissionGeneration === candidateBasis.admissionGeneration
+    && currentBasis.programRunnerOwnerEpoch === candidateBasis.programRunnerOwnerEpoch
+    && currentBasis.programCycleGeneration === candidateBasis.programCycleGeneration
+    && currentBasis.appliedProgramOwnerEpoch === candidateBasis.appliedProgramOwnerEpoch
+    && currentBasis.appliedProgramGeneration === candidateBasis.appliedProgramGeneration
+    && currentBasis.executionOwnerEpoch === candidateBasis.executionOwnerEpoch
+    && currentBasis.executionPublicationGeneration
+      === candidateBasis.executionPublicationGeneration;
 }
 
 function sameStrings(current: string[], candidate: string[]): boolean {
@@ -265,7 +327,7 @@ function headlessQualificationSnapshot(): ViewerQualificationTransportState {
   );
   const activeSockets = activeSources.filter((record) => record.socketActive).length;
   return {
-    socketPath: '/ws/state',
+    socketPath: '/ws/scene/viewer',
     sourceCount: activeSources.length,
     activeSockets,
     socketCreations: headlessSocketCreations,
@@ -282,7 +344,7 @@ export function getHeadlessStateQualificationSnapshot(): ViewerQualificationTran
 }
 
 /**
- * One transport and two bounded delivery lanes for copied owner facts.
+ * One low-rate shell transport plus one isolated bounded viewer transport.
  * This source performs parsing, admission, and scheduling only.
  */
 export class HeadlessStateSource implements ExecutionObservationReader {
@@ -291,6 +353,9 @@ export class HeadlessStateSource implements ExecutionObservationReader {
   private serial = 0;
   private socket: WebSocket | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private observationSerial = 0;
+  private observationSocket: WebSocket | null = null;
+  private observationReconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private shellTimer: ReturnType<typeof setTimeout> | null = null;
   private viewerFrame: number | ReturnType<typeof setTimeout> | null = null;
   private observationFrame: number | ReturnType<typeof setTimeout> | null = null;
@@ -299,6 +364,10 @@ export class HeadlessStateSource implements ExecutionObservationReader {
   private presentedViewer: ComposerHeadlessState | null = null;
   private presentedFrame: RuntimeFrameIdentity | null = null;
   private latestError: string | null = null;
+  private observationTransportStatus: ExecutionObservationTransportStatus = {
+    phase: 'disabled',
+    message: null,
+  };
   private shellResult: HeadlessStateResult;
   private viewerResult: HeadlessStateResult;
   private readonly qualificationRecord: HeadlessSourceQualificationRecord = {
@@ -309,6 +378,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
   private readonly shellListeners = new Set<Listener>();
   private readonly viewerListeners = new Set<Listener>();
   private readonly executionObservationListeners = new Set<Listener>();
+  private readonly observationTransportListeners = new Set<Listener>();
   constructor() {
     headlessSourceRecords.add(this.qualificationRecord);
     publishHeadlessQualification();
@@ -334,6 +404,12 @@ export class HeadlessStateSource implements ExecutionObservationReader {
   readonly getShellSnapshot = () => this.shellResult;
   readonly getViewerSnapshot = () => this.viewerResult;
   readonly getLatestExecutionObservation = () => this.latestExecutionObservation;
+  readonly getExecutionObservationTransportStatus = () =>
+    this.observationTransportStatus;
+  readonly subscribeExecutionObservationTransport = (listener: Listener) => {
+    this.observationTransportListeners.add(listener);
+    return () => this.observationTransportListeners.delete(listener);
+  };
   readonly getPresentedRuntimeFrame = (): RuntimeFrameIdentity | null =>
     this.presentedFrame === null ? null : { ...this.presentedFrame };
 
@@ -356,6 +432,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     this.enabled = enabled;
     this.qualificationRecord.enabled = enabled;
     this.stopConnection('Composer headless source disabled');
+    this.stopObservationConnection('Composer viewer source disabled');
     this.cancelPublications();
     this.latest = null;
     this.clearExecutionObservation();
@@ -363,9 +440,15 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     this.presentedFrame = null;
     this.latestError = null;
     if (enabled) {
+      this.publishObservationTransportStatus(
+        'connecting',
+        'Connecting the live measured-state viewer.',
+      );
       this.connect();
+      this.connectObservation();
     } else {
-      this.publishImmediate(null);
+      this.publishObservationTransportStatus('disabled', null);
+      this.publishImmediate();
     }
     publishHeadlessQualification();
   }
@@ -373,7 +456,13 @@ export class HeadlessStateSource implements ExecutionObservationReader {
   readonly reconnect = (): void => {
     if (!this.enabled || this.disposed) return;
     this.stopConnection('Composer client reconnect');
+    this.stopObservationConnection('Composer client reconnect');
+    this.publishObservationTransportStatus(
+      'reconnecting',
+      'Reconnecting the live measured-state viewer.',
+    );
     this.connect();
+    this.connectObservation();
   };
 
   dispose(): void {
@@ -381,10 +470,13 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     this.enabled = false;
     this.qualificationRecord.enabled = false;
     this.stopConnection('Composer client unmounted');
+    this.stopObservationConnection('Composer client unmounted');
     this.cancelPublications();
     this.shellListeners.clear();
     this.viewerListeners.clear();
     this.executionObservationListeners.clear();
+    this.publishObservationTransportStatus('disabled', null);
+    this.observationTransportListeners.clear();
     headlessSourceRecords.delete(this.qualificationRecord);
     publishHeadlessQualification();
   }
@@ -395,25 +487,34 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     this.reconnectTimer = null;
     const socket = this.socket;
     this.socket = null;
+    socket?.close(1000, reason);
+    this.latest = null;
+    this.presentedViewer = null;
+    this.presentedFrame = null;
+    this.publishImmediate();
+  }
+
+  private stopObservationConnection(reason: string): void {
+    this.observationSerial += 1;
+    if (this.observationReconnectTimer !== null) {
+      clearTimeout(this.observationReconnectTimer);
+    }
+    this.observationReconnectTimer = null;
+    const socket = this.observationSocket;
+    this.observationSocket = null;
     if (socket !== null) {
       this.qualificationRecord.socketActive = false;
       publishHeadlessQualification();
     }
     socket?.close(1000, reason);
-    this.latest = null;
     this.clearExecutionObservation();
-    this.presentedViewer = null;
-    this.presentedFrame = null;
-    this.publishImmediate(this.result());
   }
 
   private connect(): void {
     if (!this.enabled || this.disposed) return;
     const serial = ++this.serial;
-    const socket = new WebSocket(websocketUrl());
+    const socket = new WebSocket(websocketUrl('/ws/state'));
     this.socket = socket;
-    headlessSocketCreations += 1;
-    publishHeadlessQualification();
     socket.onopen = () => {
       if (
         serial !== this.serial
@@ -421,34 +522,12 @@ export class HeadlessStateSource implements ExecutionObservationReader {
         || !this.enabled
         || this.disposed
       ) return;
-      this.qualificationRecord.socketActive = true;
-      const activeSockets = headlessQualificationSnapshot().activeSockets;
-      headlessMaxActiveSockets = Math.max(headlessMaxActiveSockets, activeSockets);
-      publishHeadlessQualification();
     };
     socket.onmessage = (message) => {
       if (serial !== this.serial) return;
       try {
         const raw: unknown = JSON.parse(String(message.data));
         if (raw !== null && typeof raw === 'object' && !Array.isArray(raw)) {
-          if ((raw as Record<string, unknown>).schema_version
-            === EXECUTION_OBSERVATION_SCHEMA) {
-            const candidate = parseExecutionObservationFrame(raw);
-            const current = this.latestExecutionObservation;
-            if (
-              current !== null
-              && candidate.ownerEpoch === current.ownerEpoch
-              && candidate.sourceEpoch === current.sourceEpoch
-              && candidate.sourceSequence <= current.sourceSequence
-            ) {
-              this.publishError('Execution observation sequence regressed.');
-              socket.close(1002, 'non-monotonic execution observation');
-              return;
-            }
-            this.latestExecutionObservation = candidate;
-            this.scheduleExecutionObservation();
-            return;
-          }
           const errorValue = (raw as Record<string, unknown>).error;
           if (
             errorValue !== null
@@ -487,22 +566,107 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     };
     socket.onerror = () => {
       if (serial !== this.serial || this.socket !== socket) return;
-      this.qualificationRecord.socketActive = false;
-      publishHeadlessQualification();
       this.publishError('Headless WebSocket transport failed.');
     };
     socket.onclose = () => {
       if (serial !== this.serial || !this.enabled || this.disposed) return;
       if (this.socket === socket) {
         this.socket = null;
-        this.qualificationRecord.socketActive = false;
-        publishHeadlessQualification();
       }
       if (this.latestError === null) {
         this.publishError('Headless projection disconnected.');
       }
       this.reconnectTimer = setTimeout(() => {
         if (serial === this.serial) this.connect();
+      }, RECONNECT_DELAY_MS);
+    };
+  }
+
+  private connectObservation(): void {
+    if (!this.enabled || this.disposed) return;
+    const serial = ++this.observationSerial;
+    const socket = new WebSocket(websocketUrl('/ws/scene/viewer'));
+    this.observationSocket = socket;
+    headlessSocketCreations += 1;
+    publishHeadlessQualification();
+    socket.onopen = () => {
+      if (
+        serial !== this.observationSerial
+        || this.observationSocket !== socket
+        || !this.enabled
+        || this.disposed
+      ) return;
+      this.qualificationRecord.socketActive = true;
+      const activeSockets = headlessQualificationSnapshot().activeSockets;
+      headlessMaxActiveSockets = Math.max(headlessMaxActiveSockets, activeSockets);
+      publishHeadlessQualification();
+      this.publishObservationTransportStatus(
+        'waiting',
+        'Waiting for the first current measured-state sample.',
+      );
+    };
+    socket.onmessage = (message) => {
+      if (serial !== this.observationSerial) return;
+      try {
+        const candidate = parseExecutionObservationFrame(
+          JSON.parse(String(message.data)) as unknown,
+        );
+        const current = this.latestExecutionObservation;
+        if (
+          current !== null
+          && candidate.ownerEpoch === current.ownerEpoch
+          && candidate.sourceEpoch === current.sourceEpoch
+          && candidate.sourceSequence <= current.sourceSequence
+        ) {
+          this.clearExecutionObservation();
+          socket.close(1002, 'non-monotonic execution observation');
+          return;
+        }
+        this.latestExecutionObservation = candidate;
+        this.publishObservationTransportStatus('live', null);
+        this.scheduleExecutionObservation();
+      } catch {
+        this.publishObservationTransportStatus(
+          'reconnecting',
+          'The live measured-state viewer received an invalid sample and is reconnecting.',
+        );
+        this.clearExecutionObservation();
+        socket.close(1002, 'invalid execution observation');
+      }
+    };
+    socket.onerror = () => {
+      if (
+        serial !== this.observationSerial
+        || this.observationSocket !== socket
+      ) return;
+      this.qualificationRecord.socketActive = false;
+      publishHeadlessQualification();
+      this.publishObservationTransportStatus(
+        'reconnecting',
+        'The live measured-state viewer transport failed and is reconnecting.',
+      );
+      this.clearExecutionObservation();
+    };
+    socket.onclose = () => {
+      if (
+        serial !== this.observationSerial
+        || !this.enabled
+        || this.disposed
+      ) return;
+      if (this.observationSocket === socket) {
+        this.observationSocket = null;
+        this.qualificationRecord.socketActive = false;
+        publishHeadlessQualification();
+      }
+      if (this.observationTransportStatus.phase !== 'reconnecting') {
+        this.publishObservationTransportStatus(
+          'reconnecting',
+          'The live measured-state viewer disconnected and is reconnecting.',
+        );
+      }
+      this.clearExecutionObservation();
+      this.observationReconnectTimer = setTimeout(() => {
+        if (serial === this.observationSerial) this.connectObservation();
       }, RECONNECT_DELAY_MS);
     };
   }
@@ -529,25 +693,31 @@ export class HeadlessStateSource implements ExecutionObservationReader {
   }
 
   private publishError(error: string | null): void {
+    // Commands must lose authority immediately, but a transport interruption
+    // must not reinterpret the last coherent owner scene as an empty scene.
+    // Keep the structural viewer snapshot. The independently bounded viewer
+    // transport owns dynamic-observation validity and reconnects separately.
+    const retainedViewerSnapshot = error === null
+      ? null
+      : this.viewerResult.snapshot;
     this.latestError = error;
     if (error !== null) {
       this.latest = null;
-      this.clearExecutionObservation();
       this.presentedViewer = null;
       this.presentedFrame = null;
     }
     this.cancelPublications();
-    this.publishImmediate(this.result());
+    this.publishImmediate(retainedViewerSnapshot);
   }
 
-  private publishImmediate(result: HeadlessStateResult | null): void {
-    const next = result ?? {
-      snapshot: this.latest,
-      error: this.latestError,
-      reconnect: this.reconnect,
-    };
+  private publishImmediate(
+    viewerSnapshot: ComposerHeadlessState | null = this.latest,
+  ): void {
+    const next = this.result();
     this.shellResult = next;
-    this.viewerResult = next;
+    this.viewerResult = viewerSnapshot === this.latest
+      ? next
+      : { ...next, snapshot: viewerSnapshot };
     for (const listener of this.shellListeners) listener();
     for (const listener of this.viewerListeners) listener();
   }
@@ -591,6 +761,18 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     this.latestExecutionObservation = null;
     this.cancelObservationFrame();
     for (const listener of this.executionObservationListeners) listener();
+  }
+
+  private publishObservationTransportStatus(
+    phase: ExecutionObservationTransportPhase,
+    message: string | null,
+  ): void {
+    if (
+      this.observationTransportStatus.phase === phase
+      && this.observationTransportStatus.message === message
+    ) return;
+    this.observationTransportStatus = Object.freeze({ phase, message });
+    for (const listener of this.observationTransportListeners) listener();
   }
 
   private flushViewer(): void {
@@ -661,5 +843,15 @@ export function useViewerHeadlessState(
     active ? source.subscribeViewer : () => () => undefined,
     active ? source.getViewerSnapshot : () => inactive.current,
     active ? source.getViewerSnapshot : () => inactive.current,
+  );
+}
+
+export function useExecutionObservationTransport(
+  source: HeadlessStateSource,
+): ExecutionObservationTransportStatus {
+  return useSyncExternalStore(
+    source.subscribeExecutionObservationTransport,
+    source.getExecutionObservationTransportStatus,
+    source.getExecutionObservationTransportStatus,
   );
 }

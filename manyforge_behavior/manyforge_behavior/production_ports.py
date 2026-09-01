@@ -27,12 +27,14 @@ from manyforge_behavior.kernel_client import (
     ExecutionState,
     KernelClient,
     KernelOperationObservationUnavailableError,
+    KernelOperationSettlementPendingError,
 )
 from manyforge_behavior.orchestration_ports import (
     NodeAttemptIdentity,
     OwnerInvocationResult,
     OwnerNodeInputs,
     OwnerTaskObservationUnavailableError,
+    OwnerTaskSettlementPendingError,
     OwnerTaskSnapshot,
     OwnerTaskState,
     ProgramRunPortContext,
@@ -77,8 +79,9 @@ _MOTION_NODE_IDS: Final = frozenset(
 )
 _MAX_CONTEXTS: Final = 4_096
 _MAX_TASKS: Final = 65_536
-_MAX_SCENE_INITIALIZATION_STALE_RETRIES: Final = 16
 _MAX_SCENE_NODE_STALE_RETRIES: Final = 16
+_SCENE_INITIALIZATION_SETTLEMENT_TIMEOUT_S: Final = 2.0
+_SCENE_INITIALIZATION_SETTLEMENT_POLL_S: Final = 0.01
 _PROGRAM_RESET_SETTLEMENT_TIMEOUT_S: Final = 5.0
 _PROGRAM_RESET_SETTLEMENT_POLL_S: Final = 0.01
 _AUTHORED_SCENE_OPERATIONS: Final = frozenset(
@@ -1603,7 +1606,12 @@ class NativeKernelProgramPort:
         )
         with self._lock:
             current = self._tasks.get(operation_id)
-            task = _OperationTask(identity, node_id, operation_id, owner_epoch)
+            task = _OperationTask(
+                identity,
+                node_id,
+                operation_id,
+                owner_epoch,
+            )
             if current is not None and current != task:
                 raise ProductionPortError("native operation identity was reused")
             if current is None:
@@ -1901,22 +1909,27 @@ class NativeKernelProgramPort:
             revision = operation.get("operation_revision")
         if type(revision) is not int or revision < 1:
             raise ProductionPortError("native operation revision is invalid")
-        self._kernel.acknowledge_completed(
-            task.operation_id,
-            {
-                "request_context": {
-                    "request_id": _request_identity(
-                        "program-ack", identity.program_run_id, task.operation_id
-                    ),
-                    "request_owner_epoch": task.request_owner_epoch,
-                    "source_label": "manyforge_behavior",
-                    "correlation_id": identity.program_run_id,
+        try:
+            self._kernel.acknowledge_completed(
+                task.operation_id,
+                {
+                    "request_context": {
+                        "request_id": _request_identity(
+                            "program-ack", identity.program_run_id, task.operation_id
+                        ),
+                        "request_owner_epoch": task.request_owner_epoch,
+                        "source_label": "manyforge_behavior",
+                        "correlation_id": identity.program_run_id,
+                    },
+                    "operation_id": task.operation_id,
+                    "expected_operation_revision": revision,
+                    "reason": "Program node consumed completed evidence",
                 },
-                "operation_id": task.operation_id,
-                "expected_operation_revision": revision,
-                "reason": "Program node consumed completed evidence",
-            },
-        )
+            )
+        except KernelOperationSettlementPendingError as error:
+            raise OwnerTaskSettlementPendingError(
+                "operation completion is still settling"
+            ) from error
         with self._lock:
             self._tasks.pop(task.operation_id, None)
 
@@ -2889,6 +2902,12 @@ class HeadlessSceneProgramPort:
                     "authoring-admission owner omitted its current generation"
                 )
             body["expected_admission_generation"] = generation
+            # A no-effect stale-admission rejection is durably replayed by the
+            # logical-scene owner. Include the observed generation so a later
+            # retry cannot be trapped behind that obsolete outcome.
+            body["request_context"]["request_id"] = _request_identity(
+                "scene-admission", request_id, str(generation)
+            )
         response = self._scene.commit(body)
         committed = dict(
             _mapping(
@@ -3148,6 +3167,40 @@ class HeadlessSceneProgramPort:
         return f"sha256:{sha256(encoded).hexdigest()}"
 
     @staticmethod
+    def _object_matches_operation(
+        view: _SceneView,
+        operation: Mapping[str, Any],
+    ) -> bool:
+        scene_resource_id = _text(
+            operation.get("scene_resource_id"), field="scene_resource_id"
+        )
+        current = view.objects.get(scene_resource_id)
+        if current is None or (
+            list(_sequence(current.get("collision_shapes"), field="collision_shapes"))
+            != [operation.get("shape")]
+            or list(
+                _sequence(
+                    current.get("support_contacts", ()),
+                    field="support_contacts",
+                )
+            )
+            != operation.get("support_contacts")
+            or current.get("provider_evidence") is not None
+        ):
+            return False
+        frame_ref = _mapping(operation.get("frame_ref"), field="frame_ref")
+        # Cell-frame intent has the same normalized representation in the
+        # owner snapshot. Component-frame intent is resolved by the native
+        # owner, so only an owner-issued prepared proof can compare it.
+        if frame_ref.get("kind") != "cell_frame":
+            return False
+        return current.get("placement") == {
+            "kind": "cell_fixed",
+            "cell_id": view.cell_id,
+            "pose_in_cell": operation.get("pose"),
+        }
+
+    @staticmethod
     def _scene_matches_operations(
         view: _SceneView,
         operations: Sequence[Mapping[str, Any]],
@@ -3158,37 +3211,13 @@ class HeadlessSceneProgramPort:
             _text(operation.get("scene_resource_id"), field="scene_resource_id")
             for operation in operations
         )
-        if tuple(view.objects) != tuple(sorted(expected_ids)):
-            return False
-        for operation in operations:
-            scene_resource_id = str(operation["scene_resource_id"])
-            current = view.objects[scene_resource_id]
-            if (
-                list(_sequence(current.get("collision_shapes"), field="collision_shapes"))
-                != [operation.get("shape")]
-                or list(
-                    _sequence(
-                        current.get("support_contacts", ()),
-                        field="support_contacts",
-                    )
-                )
-                != operation.get("support_contacts")
-                or current.get("provider_evidence") is not None
-            ):
-                return False
-            frame_ref = _mapping(operation.get("frame_ref"), field="frame_ref")
-            # Cell-frame intent has the same normalized representation in the
-            # owner snapshot. Component-frame intent is resolved by the native
-            # owner, so only an owner-issued prepared proof can compare it.
-            if frame_ref.get("kind") != "cell_frame":
-                return False
-            if current.get("placement") != {
-                "kind": "cell_fixed",
-                "cell_id": view.cell_id,
-                "pose_in_cell": operation.get("pose"),
-            }:
-                return False
-        return True
+        return bool(
+            tuple(view.objects) == tuple(sorted(expected_ids))
+            and all(
+                HeadlessSceneProgramPort._object_matches_operation(view, operation)
+                for operation in operations
+            )
+        )
 
     @staticmethod
     def _proof(
@@ -3319,7 +3348,11 @@ class HeadlessSceneProgramPort:
         def commit(operation: Mapping[str, Any], coordinate: str) -> None:
             nonlocal expected, ordinal
             ordinal += 1
-            for attempt in range(_MAX_SCENE_INITIALIZATION_STALE_RETRIES):
+            attempt = 0
+            deadline = (
+                time.monotonic() + _SCENE_INITIALIZATION_SETTLEMENT_TIMEOUT_S
+            )
+            while True:
                 try:
                     expected, _response = self._commit(
                         context=parsed,
@@ -3337,19 +3370,26 @@ class HeadlessSceneProgramPort:
                     )
                     return
                 except Exception as error:
-                    if getattr(error, "code", None) != "stale_revision":
+                    code = getattr(error, "code", None)
+                    if code not in {
+                        "stale_revision",
+                        "stale_generation",
+                        "authoring_not_ready",
+                    }:
                         raise
-                    if attempt + 1 == _MAX_SCENE_INITIALIZATION_STALE_RETRIES:
+                    if time.monotonic() >= deadline:
                         raise ProductionPortError(
-                            "logical-scene initialization could not acquire a "
-                            "stable revision"
+                            "logical-scene initialization could not acquire "
+                            "stable scene and authoring revisions"
                         ) from error
+                    time.sleep(_SCENE_INITIALIZATION_SETTLEMENT_POLL_S)
                     refreshed = self._read_view(parsed)
                     if refreshed.request_owner_epoch != view.request_owner_epoch:
                         raise ProductionPortError(
                             "logical-scene owner changed during initialization"
                         ) from error
                     expected = refreshed.projection_revision
+                    attempt += 1
 
         for attachment in view.attachments:
             attachment_id = _text(
@@ -3379,7 +3419,29 @@ class HeadlessSceneProgramPort:
                 },
                 f"detach:{attachment_id}",
             )
+        if view.attachments:
+            refreshed = self._read_view(parsed)
+            if refreshed.request_owner_epoch != view.request_owner_epoch:
+                raise ProductionPortError(
+                    "logical-scene owner changed during initialization"
+                )
+            view = refreshed
+            expected = view.projection_revision
+
+        desired_ids = {
+            str(operation["scene_resource_id"]) for operation in operations
+        }
+        for operation in operations:
+            if self._object_matches_operation(view, operation):
+                continue
+            scene_resource_id = str(operation["scene_resource_id"])
+            replacement = dict(operation)
+            if scene_resource_id in view.objects:
+                replacement["kind"] = "upsert_object"
+            commit(replacement, f"upsert:{scene_resource_id}")
         for scene_resource_id in self._removal_order(view.objects):
+            if scene_resource_id in desired_ids:
+                continue
             commit(
                 {
                     "kind": "remove_object",
@@ -3387,9 +3449,6 @@ class HeadlessSceneProgramPort:
                 },
                 f"remove:{scene_resource_id}",
             )
-        for operation in operations:
-            scene_resource_id = str(operation["scene_resource_id"])
-            commit(operation, f"add:{scene_resource_id}")
         verified = self._read_view(parsed)
         if (
             verified.request_owner_epoch != view.request_owner_epoch

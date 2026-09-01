@@ -6,6 +6,7 @@
 #include <limits>
 #include <set>
 #include <string>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 
@@ -725,8 +726,21 @@ require_configuration(const RetainedBundle &retained_bundle,
   const auto *mode = std::get_if<std::string>(&require_member("mode").value);
   const auto *positions = std::get_if<core::JsonValueDTO::Array>(
       &require_member("initial_joint_positions_rad").value);
+  const auto *motion_target_limits = std::get_if<core::JsonValueDTO::Array>(
+      &require_member("motion_target_limits").value);
+  const auto *direct_control_joint_limits =
+      std::get_if<core::JsonValueDTO::Array>(
+          &require_member("direct_control_joint_limits").value);
+  const auto gripper_configurations_member =
+      unit.configuration.find("gripper_target_configurations");
+  const auto *gripper_target_configurations =
+      gripper_configurations_member == unit.configuration.end()
+          ? nullptr
+          : std::get_if<core::JsonValueDTO::Array>(
+                &gripper_configurations_member->second.value);
   if (mode == nullptr || *mode != "simulated" || positions == nullptr ||
-      positions->empty()) {
+      positions->empty() || motion_target_limits == nullptr ||
+      motion_target_limits->empty() || direct_control_joint_limits == nullptr) {
     throw RetainedBundleError(
         "native runtime configuration has an unsupported mode or initial "
         "state");
@@ -745,6 +759,232 @@ require_configuration(const RetainedBundle &retained_bundle,
           "native runtime configuration has an invalid initial joint state");
     }
     result.initial_joint_positions_rad.push_back(*number);
+  }
+  result.motion_target_limits.reserve(motion_target_limits->size());
+  for (const auto &entry : *motion_target_limits) {
+    const auto *object = std::get_if<core::JsonObjectDTO>(&entry.value);
+    if (object == nullptr || object->size() != 3U) {
+      throw RetainedBundleError(
+          "native runtime configuration has an invalid motion target limit");
+    }
+    const auto component = object->find("controllable_component_id");
+    const auto target = object->find("command_target_id");
+    const auto limit = object->find("maximum_tcp_linear_speed_mps");
+    if (component == object->end() || target == object->end() ||
+        limit == object->end()) {
+      throw RetainedBundleError(
+          "native runtime configuration has an incomplete motion target limit");
+    }
+    const auto *component_id = std::get_if<std::string>(&component->second.value);
+    const auto *target_id = std::get_if<std::string>(&target->second.value);
+    const auto *maximum = std::get_if<double>(&limit->second.value);
+    if (component_id == nullptr || component_id->empty() || target_id == nullptr ||
+        target_id->empty() || maximum == nullptr || !std::isfinite(*maximum) ||
+        *maximum <= 0.0 || *maximum > 1000.0) {
+      throw RetainedBundleError(
+          "native runtime configuration has an invalid motion target limit value");
+    }
+    result.motion_target_limits.push_back(Configuration::MotionTargetLimit{
+        core::ControllableComponentId(*component_id),
+        core::CommandTargetId(*target_id), *maximum});
+  }
+  std::sort(result.motion_target_limits.begin(), result.motion_target_limits.end(),
+            [](const auto &left, const auto &right) {
+              return std::tie(left.controllable_component_id,
+                              left.command_target_id) <
+                     std::tie(right.controllable_component_id,
+                              right.command_target_id);
+            });
+  if (std::adjacent_find(
+          result.motion_target_limits.begin(), result.motion_target_limits.end(),
+          [](const auto &left, const auto &right) {
+            return left.controllable_component_id ==
+                       right.controllable_component_id &&
+                   left.command_target_id == right.command_target_id;
+          }) != result.motion_target_limits.end()) {
+    throw RetainedBundleError(
+        "native runtime configuration repeats a motion target limit");
+  }
+  result.direct_control_joint_limits.reserve(
+      direct_control_joint_limits->size());
+  for (const auto &entry : *direct_control_joint_limits) {
+    const auto *object = std::get_if<core::JsonObjectDTO>(&entry.value);
+    if (object == nullptr || object->size() < 4U || object->size() > 6U) {
+      throw RetainedBundleError(
+          "native runtime configuration has an invalid direct-control joint limit");
+    }
+    const auto component = object->find("controllable_component_id");
+    const auto target = object->find("command_target_id");
+    const auto joint = object->find("source_joint_name");
+    if (component == object->end() || target == object->end() ||
+        joint == object->end()) {
+      throw RetainedBundleError(
+          "native runtime configuration has an incomplete direct-control joint limit");
+    }
+    const auto *component_id =
+        std::get_if<std::string>(&component->second.value);
+    const auto *target_id = std::get_if<std::string>(&target->second.value);
+    const auto *source_joint_name =
+        std::get_if<std::string>(&joint->second.value);
+    if (component_id == nullptr || component_id->empty() ||
+        target_id == nullptr || target_id->empty() ||
+        source_joint_name == nullptr || source_joint_name->empty()) {
+      throw RetainedBundleError(
+          "native runtime configuration has an invalid direct-control joint identity");
+    }
+    const auto optional_positive = [&](const std::string_view name) {
+      const auto found = object->find(name);
+      if (found == object->end()) {
+        return std::optional<double>{};
+      }
+      const auto *value = std::get_if<double>(&found->second.value);
+      if (value == nullptr || !std::isfinite(*value) || *value <= 0.0) {
+        throw RetainedBundleError(
+            "native runtime configuration has an invalid direct-control joint limit value");
+      }
+      return std::optional<double>{*value};
+    };
+    const auto velocity = optional_positive("max_velocity_rad_s");
+    const auto acceleration = optional_positive("max_acceleration_rad_s2");
+    const auto jerk = optional_positive("max_jerk_rad_s3");
+    if (!velocity.has_value() && !acceleration.has_value() &&
+        !jerk.has_value()) {
+      throw RetainedBundleError(
+          "native runtime configuration has an empty direct-control joint limit");
+    }
+    result.direct_control_joint_limits.push_back(
+        Configuration::DirectControlJointLimit{
+            core::ControllableComponentId(*component_id),
+            core::CommandTargetId(*target_id), *source_joint_name, velocity,
+            acceleration, jerk});
+  }
+  std::sort(result.direct_control_joint_limits.begin(),
+            result.direct_control_joint_limits.end(),
+            [](const auto &left, const auto &right) {
+              return std::tie(left.controllable_component_id,
+                              left.command_target_id,
+                              left.source_joint_name) <
+                     std::tie(right.controllable_component_id,
+                              right.command_target_id,
+                              right.source_joint_name);
+            });
+  if (std::adjacent_find(
+          result.direct_control_joint_limits.begin(),
+          result.direct_control_joint_limits.end(),
+          [](const auto &left, const auto &right) {
+            return left.controllable_component_id ==
+                       right.controllable_component_id &&
+                   left.command_target_id == right.command_target_id &&
+                   left.source_joint_name == right.source_joint_name;
+          }) != result.direct_control_joint_limits.end()) {
+    throw RetainedBundleError(
+        "native runtime configuration repeats a direct-control joint limit");
+  }
+  if (gripper_configurations_member != unit.configuration.end() &&
+      gripper_target_configurations == nullptr) {
+    throw RetainedBundleError(
+        "native runtime configuration has invalid gripper target configurations");
+  }
+  if (gripper_target_configurations != nullptr) {
+    result.gripper_target_configurations.reserve(
+        gripper_target_configurations->size());
+    for (const auto &entry : *gripper_target_configurations) {
+      const auto *object = std::get_if<core::JsonObjectDTO>(&entry.value);
+      if (object == nullptr || object->size() != 12U) {
+        throw RetainedBundleError(
+            "native runtime configuration has an invalid gripper target configuration");
+      }
+      const auto string_member = [&](const std::string_view name) -> std::string {
+        const auto found = object->find(name);
+        if (found == object->end()) {
+          throw RetainedBundleError(
+              "native runtime configuration has an incomplete gripper target configuration");
+        }
+        const auto *value = std::get_if<std::string>(&found->second.value);
+        if (value == nullptr || value->empty()) {
+          throw RetainedBundleError(
+              "native runtime configuration has an invalid gripper target string");
+        }
+        return *value;
+      };
+      const auto string_array_member =
+          [&](const std::string_view name, const bool require_nonempty) {
+            const auto found = object->find(name);
+            const auto *values = found == object->end()
+                                     ? nullptr
+                                     : std::get_if<core::JsonValueDTO::Array>(
+                                           &found->second.value);
+            if (values == nullptr || (require_nonempty && values->empty())) {
+              throw RetainedBundleError(
+                  "native runtime configuration has an invalid gripper target list");
+            }
+            std::vector<std::string> result_values;
+            result_values.reserve(values->size());
+            for (const auto &value : *values) {
+              const auto *text = std::get_if<std::string>(&value.value);
+              if (text == nullptr || text->empty()) {
+                throw RetainedBundleError(
+                    "native runtime configuration has an invalid gripper target list item");
+              }
+              result_values.push_back(*text);
+            }
+            if (!std::is_sorted(result_values.begin(), result_values.end()) ||
+                std::adjacent_find(result_values.begin(), result_values.end()) !=
+                    result_values.end()) {
+              throw RetainedBundleError(
+                  "native runtime configuration has a noncanonical gripper target list");
+            }
+            return result_values;
+          };
+      const auto duration = object->find("command_duration_s");
+      const auto *duration_s =
+          duration == object->end()
+              ? nullptr
+              : std::get_if<double>(&duration->second.value);
+      const auto component_id = string_member("controllable_component_id");
+      const auto target_id = string_member("command_target_id");
+      const auto actuation_kind = string_member("actuation_kind");
+      if (duration_s == nullptr || !std::isfinite(*duration_s) ||
+          *duration_s <= 0.0 || *duration_s > 60.0 ||
+          (actuation_kind != "position_commanded" &&
+           actuation_kind != "pneumatic")) {
+        throw RetainedBundleError(
+            "native runtime configuration has invalid gripper target semantics");
+      }
+      result.gripper_target_configurations.push_back(
+          Configuration::GripperTargetConfiguration{
+              core::ControllableComponentId(component_id),
+              core::CommandTargetId(target_id),
+              string_member("description"),
+              actuation_kind,
+              string_member("open_state_ref"),
+              string_member("closed_state_ref"),
+              *duration_s,
+              string_array_member("touch_links", true),
+              string_member("mount_frame"),
+              string_member("attach_frame"),
+              string_member("tcp_frame"),
+              string_array_member("auxiliary_frames", false)});
+    }
+    std::sort(result.gripper_target_configurations.begin(),
+              result.gripper_target_configurations.end(),
+              [](const auto &left, const auto &right) {
+                return std::tie(left.controllable_component_id,
+                                left.command_target_id) <
+                       std::tie(right.controllable_component_id,
+                                right.command_target_id);
+              });
+    if (std::adjacent_find(
+            result.gripper_target_configurations.begin(),
+            result.gripper_target_configurations.end(),
+            [](const auto &left, const auto &right) {
+              return left.controllable_component_id ==
+                         right.controllable_component_id &&
+                     left.command_target_id == right.command_target_id;
+            }) != result.gripper_target_configurations.end()) {
+      throw RetainedBundleError(
+          "native runtime configuration repeats a gripper target configuration");
+    }
   }
   if (result.execution_tick_hz == 0U ||
       !(result.collision_monitor_period_ms > 0.0)) {

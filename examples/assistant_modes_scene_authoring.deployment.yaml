@@ -413,7 +413,7 @@
       "capability_definition_revision": "sha256:c99e2dc6d89129ca1d1d4a44d561d878b786df610d1ff241f6e09b5b100edb28",
       "capability_id": "model.kinematics.fk",
       "capability_provider_binding_id": "ur10e_robot.arm.model-kinematics-fk.provider",
-      "capability_provider_binding_revision": "sha256:ba3be73eb6c8ef5398bc271ce41bab0d4fa5e7de0ac8be1dc9febfd04cf9450b",
+      "capability_provider_binding_revision": "sha256:a57b90e3d204a3565352f10fd2dcc478ded49763eba27bf4cfc8e77c0a0bbb28",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -430,7 +430,7 @@
         "command_target_id": "arm",
         "component_type_revision": "sha256:76a01c6d886bd98b4e451dce0e97cc6e6935bbad51440998118961c724f0d681",
         "control_binding_id": "ur10e_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:03543069db439871902e5c8a7b58597c28f35e3d20aad98e34361935d46e45d5",
+        "control_binding_revision": "sha256:feea1b9fd7f11e66755f731628a34d3b81c47ee997ffd7abb55ab2e5bf50e980",
         "controllable_component_id": "ur10e_robot"
       }
     },
@@ -438,7 +438,7 @@
       "capability_definition_revision": "sha256:4212f32bfc7e9b04cb11db023da86b9a8f75531b5d775674d559631d93b65053",
       "capability_id": "model.limits.joint",
       "capability_provider_binding_id": "ur10e_robot.arm.model-limits-joint.provider",
-      "capability_provider_binding_revision": "sha256:72509c35623662f7f04dd0e851bd0e1e787c433c98b35db99ec9b6e48b5e010c",
+      "capability_provider_binding_revision": "sha256:056e9fc29bdd35370065ee397f89895a43cfeed693a893fddb1616230c8b5e6c",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -455,7 +455,7 @@
         "command_target_id": "arm",
         "component_type_revision": "sha256:76a01c6d886bd98b4e451dce0e97cc6e6935bbad51440998118961c724f0d681",
         "control_binding_id": "ur10e_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:03543069db439871902e5c8a7b58597c28f35e3d20aad98e34361935d46e45d5",
+        "control_binding_revision": "sha256:feea1b9fd7f11e66755f731628a34d3b81c47ee997ffd7abb55ab2e5bf50e980",
         "controllable_component_id": "ur10e_robot"
       }
     },
@@ -463,7 +463,7 @@
       "capability_definition_revision": "sha256:be53c54ff0aa662db108113e9273e847e790d1b6f0adbba591d50f2237134a00",
       "capability_id": "planning.motion.cartesian_path",
       "capability_provider_binding_id": "ur10e_robot.arm.planning-motion-cartesian_path.provider",
-      "capability_provider_binding_revision": "sha256:cde447322ffbd997a41a69aed259afaa6d8672cf55524304a66c96186a09d100",
+      "capability_provider_binding_revision": "sha256:befd2b55a4ef7033bd1f9e0ed6da5f018826dbcc646dd659968dd02873ed9d17",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -480,7 +480,7 @@
         "command_target_id": "arm",
         "component_type_revision": "sha256:76a01c6d886bd98b4e451dce0e97cc6e6935bbad51440998118961c724f0d681",
         "control_binding_id": "ur10e_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:03543069db439871902e5c8a7b58597c28f35e3d20aad98e34361935d46e45d5",
+        "control_binding_revision": "sha256:feea1b9fd7f11e66755f731628a34d3b81c47ee997ffd7abb55ab2e5bf50e980",
         "controllable_component_id": "ur10e_robot"
       }
     },
@@ -488,7 +488,7 @@
       "capability_definition_revision": "sha256:0f6cb2fda7e1d05f20a5867203b84c0e0427440f4b11657941a907c2e2a23dce",
       "capability_id": "planning.motion.joint_goal",
       "capability_provider_binding_id": "ur10e_robot.arm.planning-motion-joint_goal.provider",
-      "capability_provider_binding_revision": "sha256:a9c0ad9b4866031ae6b087c2e9492cf7c37b3856060a3b6a16c2bb92c744d16d",
+      "capability_provider_binding_revision": "sha256:951120922b2c3829fdb3fa50decaa7457b7f64311bc8ea740435f73873ace65c",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -505,7 +505,7 @@
         "command_target_id": "arm",
         "component_type_revision": "sha256:76a01c6d886bd98b4e451dce0e97cc6e6935bbad51440998118961c724f0d681",
         "control_binding_id": "ur10e_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:03543069db439871902e5c8a7b58597c28f35e3d20aad98e34361935d46e45d5",
+        "control_binding_revision": "sha256:feea1b9fd7f11e66755f731628a34d3b81c47ee997ffd7abb55ab2e5bf50e980",
         "controllable_component_id": "ur10e_robot"
       }
     },
@@ -513,7 +513,7 @@
       "capability_definition_revision": "sha256:422c7d9025d46e0fc660705a4f05171a235279872f91c820e952cf16792b8148",
       "capability_id": "planning.motion.pose_goal",
       "capability_provider_binding_id": "ur10e_robot.arm.planning-motion-pose_goal.provider",
-      "capability_provider_binding_revision": "sha256:9e7ee9c6f32901e7b4bd97e5cc438c559bc4f2fff2196ca33c79ee569500b1b1",
+      "capability_provider_binding_revision": "sha256:0193e9cb3aee5aeff729c42da334a65c361e02ea78edc5a9a9909c683889f007",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -530,7 +530,7 @@
         "command_target_id": "arm",
         "component_type_revision": "sha256:76a01c6d886bd98b4e451dce0e97cc6e6935bbad51440998118961c724f0d681",
         "control_binding_id": "ur10e_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:03543069db439871902e5c8a7b58597c28f35e3d20aad98e34361935d46e45d5",
+        "control_binding_revision": "sha256:feea1b9fd7f11e66755f731628a34d3b81c47ee997ffd7abb55ab2e5bf50e980",
         "controllable_component_id": "ur10e_robot"
       }
     },
@@ -538,7 +538,7 @@
       "capability_definition_revision": "sha256:14c53dad299a42d6604eac14240d015e22a4bc1adb363fb252111e62a2d2ad90",
       "capability_id": "planning.profile.balanced",
       "capability_provider_binding_id": "ur10e_robot.arm.planning-profile-balanced.provider",
-      "capability_provider_binding_revision": "sha256:6dfc84113335e946bc4fef2bb28edd91803927d73f2c67c9b2a43a3e4ef20b24",
+      "capability_provider_binding_revision": "sha256:d4d56c64764a228ef9feb78fb6e2d256fa9651edb7fb008ffc231d75be34dbdc",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -555,7 +555,7 @@
         "command_target_id": "arm",
         "component_type_revision": "sha256:76a01c6d886bd98b4e451dce0e97cc6e6935bbad51440998118961c724f0d681",
         "control_binding_id": "ur10e_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:03543069db439871902e5c8a7b58597c28f35e3d20aad98e34361935d46e45d5",
+        "control_binding_revision": "sha256:feea1b9fd7f11e66755f731628a34d3b81c47ee997ffd7abb55ab2e5bf50e980",
         "controllable_component_id": "ur10e_robot"
       }
     },
@@ -563,7 +563,7 @@
       "capability_definition_revision": "sha256:e0f578ef9af205b3c7c184fb1124ffb4fe3c35874b5e993358b43a2dc43d2674",
       "capability_id": "planning.profile.first_feasible",
       "capability_provider_binding_id": "ur10e_robot.arm.planning-profile-first_feasible.provider",
-      "capability_provider_binding_revision": "sha256:71381fb1442609eb66e738bf1353ccfb5d72d1c803116b6ffaf84bd536f03265",
+      "capability_provider_binding_revision": "sha256:28f48865879c71ae71bbebca8ab8e78ca4c903bd57053b178e96d07d76201132",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -580,7 +580,7 @@
         "command_target_id": "arm",
         "component_type_revision": "sha256:76a01c6d886bd98b4e451dce0e97cc6e6935bbad51440998118961c724f0d681",
         "control_binding_id": "ur10e_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:03543069db439871902e5c8a7b58597c28f35e3d20aad98e34361935d46e45d5",
+        "control_binding_revision": "sha256:feea1b9fd7f11e66755f731628a34d3b81c47ee997ffd7abb55ab2e5bf50e980",
         "controllable_component_id": "ur10e_robot"
       }
     },
@@ -588,7 +588,7 @@
       "capability_definition_revision": "sha256:7f570672270455207d5fb8eb210cd1dd22a99d7909421cf0dc8036c32e4beffb",
       "capability_id": "planning.profile.quality_bounded",
       "capability_provider_binding_id": "ur10e_robot.arm.planning-profile-quality_bounded.provider",
-      "capability_provider_binding_revision": "sha256:132c2c2608fa1eced0154bf0dc54f57d4a3c0bf23587375957848c0e459c6d63",
+      "capability_provider_binding_revision": "sha256:d3653b6c0fc4c31da9f28b15d95cca61cd65eb46d34dc717d0473c6f9723942c",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -605,7 +605,7 @@
         "command_target_id": "arm",
         "component_type_revision": "sha256:76a01c6d886bd98b4e451dce0e97cc6e6935bbad51440998118961c724f0d681",
         "control_binding_id": "ur10e_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:03543069db439871902e5c8a7b58597c28f35e3d20aad98e34361935d46e45d5",
+        "control_binding_revision": "sha256:feea1b9fd7f11e66755f731628a34d3b81c47ee997ffd7abb55ab2e5bf50e980",
         "controllable_component_id": "ur10e_robot"
       }
     },
@@ -613,7 +613,7 @@
       "capability_definition_revision": "sha256:1fde55ff59f977844d1e42a115df0e66305953803e7f2830fec4821e3cd36385",
       "capability_id": "planning.trajectory.time_parameterized",
       "capability_provider_binding_id": "ur10e_robot.arm.planning-trajectory-time_parameterized.provider",
-      "capability_provider_binding_revision": "sha256:7f3ccd499956eaae3fdcd2bb012bd59db47d453e8e1b33efbdb075e66d4a0452",
+      "capability_provider_binding_revision": "sha256:c0a0451c1bf1ee898d151003ce83f4077b50491242da591e6fa021b1c3dc3166",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -630,7 +630,7 @@
         "command_target_id": "arm",
         "component_type_revision": "sha256:76a01c6d886bd98b4e451dce0e97cc6e6935bbad51440998118961c724f0d681",
         "control_binding_id": "ur10e_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:03543069db439871902e5c8a7b58597c28f35e3d20aad98e34361935d46e45d5",
+        "control_binding_revision": "sha256:feea1b9fd7f11e66755f731628a34d3b81c47ee997ffd7abb55ab2e5bf50e980",
         "controllable_component_id": "ur10e_robot"
       }
     },
@@ -638,7 +638,7 @@
       "capability_definition_revision": "sha256:3cd04895527038906ddcb9c6ca9fd87f4535eba41e5014b04917c66603f26653",
       "capability_id": "validation.trajectory.non_collision",
       "capability_provider_binding_id": "ur10e_robot.arm.validation-trajectory-non_collision.provider",
-      "capability_provider_binding_revision": "sha256:ba6bec237e71b6d2895bbc7519b40c659be03301141752ebccd31646f8ff401b",
+      "capability_provider_binding_revision": "sha256:d44ede921aa91084bcd74f0cdf7c72f6dfe971fec81e55ed31534cb8f9ec566c",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -655,7 +655,7 @@
         "command_target_id": "arm",
         "component_type_revision": "sha256:76a01c6d886bd98b4e451dce0e97cc6e6935bbad51440998118961c724f0d681",
         "control_binding_id": "ur10e_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:03543069db439871902e5c8a7b58597c28f35e3d20aad98e34361935d46e45d5",
+        "control_binding_revision": "sha256:feea1b9fd7f11e66755f731628a34d3b81c47ee997ffd7abb55ab2e5bf50e980",
         "controllable_component_id": "ur10e_robot"
       }
     },
@@ -1172,11 +1172,11 @@
         "schema_revision": "sha256:330a7505c585d69b231a1322bffbcd71775a1070c3a519a1ef7eb013ed5b5e9f"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.native_execution_runtime/084f58063ad1f86f694607a8df5ffeb4be05012dd15c6a723528d8224c1eac76",
-        "content_digest": "sha256:fa458ad895aae1d79b4d2e16813c0f017969d2569023bde3ec3bdd5797270c2c",
+        "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.native_execution_runtime/9dad700cd4de7b0e710533b098a76769625394b9d991dfdfa1ad607c873e735b",
+        "content_digest": "sha256:17aca7346ba0168c9b3c80a5a1d013cd5b5158e67218ce904520a1e0e9a0fdf9",
         "record_id": "manyforge.native_execution_runtime",
         "record_kind": "runtime_profile",
-        "record_revision": "sha256:084f58063ad1f86f694607a8df5ffeb4be05012dd15c6a723528d8224c1eac76",
+        "record_revision": "sha256:9dad700cd4de7b0e710533b098a76769625394b9d991dfdfa1ad607c873e735b",
         "schema_id": "manyforge.runtime_profile.v1",
         "schema_revision": "sha256:c254afa8c2bfcc803f12a7af63b1f09a8ee804b1ffa2a65b7361ad9309b87ae7"
       },
@@ -1214,7 +1214,7 @@
     ]
   },
   "deployment_artifact_id": "ur10e_robotiq_assistant_modes_scene_authoring",
-  "deployment_revision": "sha256:c434684e6f745a1d882304e97fdeb0e57036d6c23ea5acee2638e275127137cd",
+  "deployment_revision": "sha256:ea19597345c67504c262b24c4e4da4b4f39c97e133f8a319fe3ce5173512dc82",
   "description": "Local deployment fixture for assistant-mode catalog plumbing on the UR10e + Robotiq 2F-140 preview stack. It keeps the deterministic scene-authoring provider enabled while declaring the finite tools visible to query and composer-assistant requests.",
   "desired_control_configurations": [
     {
@@ -1262,7 +1262,7 @@
         },
         {
           "control_binding_id": "ur10e_robot.arm.execution-trajectory-execute",
-          "control_binding_revision": "sha256:03543069db439871902e5c8a7b58597c28f35e3d20aad98e34361935d46e45d5",
+          "control_binding_revision": "sha256:feea1b9fd7f11e66755f731628a34d3b81c47ee997ffd7abb55ab2e5bf50e980",
           "control_route_id": "arm_position"
         },
         {
@@ -1821,7 +1821,7 @@
         "command_target_id": "arm",
         "containment_granularity": "resource",
         "control_binding_id": "ur10e_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:03543069db439871902e5c8a7b58597c28f35e3d20aad98e34361935d46e45d5",
+        "control_binding_revision": "sha256:feea1b9fd7f11e66755f731628a34d3b81c47ee997ffd7abb55ab2e5bf50e980",
         "control_domain_id": "ur10e_robot.arm.control",
         "control_interface_contract_id": "manyforge.native_arm_position",
         "control_interface_revision": "sha256:97090c00547d4d84fabf4912bcc9c3ae310faf9b4c425322fa988848b9a0edc3",
@@ -1869,6 +1869,17 @@
             "state_endpoint_role_ids": [
               "state"
             ]
+          }
+        ],
+        "runtime_scale_route_qualifications": [
+          {
+            "acknowledgement_kind": "applied_state",
+            "applied_state_endpoint_role_id": "state",
+            "command_endpoint_role_id": "command",
+            "control_route_id": "arm_position",
+            "freshness_budget_ns": 100000000,
+            "maximum_slew_per_second": 4,
+            "scaling_domain_id": "ur10e_robot.arm.runtime_scale"
           }
         ],
         "state_authority_class": "predicted",
@@ -2088,6 +2099,7 @@
       {
         "configuration": {
           "collision_monitor_period_ms": 50,
+          "direct_control_joint_limits": [],
           "execution_tick_hz": 100,
           "initial_joint_positions_rad": [
             0,
@@ -2098,11 +2110,18 @@
             0
           ],
           "mode": "simulated",
+          "motion_target_limits": [
+            {
+              "command_target_id": "arm",
+              "controllable_component_id": "ur10e_robot",
+              "maximum_tcp_linear_speed_mps": 0.25
+            }
+          ],
           "planner_rng_seed": 12345
         },
         "dependency_runtime_unit_ids": [],
         "runtime_profile_id": "manyforge.native_execution_runtime",
-        "runtime_profile_revision": "sha256:084f58063ad1f86f694607a8df5ffeb4be05012dd15c6a723528d8224c1eac76",
+        "runtime_profile_revision": "sha256:9dad700cd4de7b0e710533b098a76769625394b9d991dfdfa1ad607c873e735b",
         "runtime_unit_id": "ur10e_robot.native_execution"
       }
     ]
@@ -2996,7 +3015,7 @@
       },
       {
         "control_binding_id": "ur10e_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:03543069db439871902e5c8a7b58597c28f35e3d20aad98e34361935d46e45d5",
+        "control_binding_revision": "sha256:feea1b9fd7f11e66755f731628a34d3b81c47ee997ffd7abb55ab2e5bf50e980",
         "control_domain_id": "ur10e_robot.arm.control",
         "control_domain_revision": "sha256:6533ecc6a36ed9888882a4ebaa2c6cd111b3835dca4607ee2e2a929323cf1a31",
         "control_route_id": "arm_position",
@@ -3086,7 +3105,7 @@
       },
       {
         "control_binding_id": "ur10e_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:03543069db439871902e5c8a7b58597c28f35e3d20aad98e34361935d46e45d5",
+        "control_binding_revision": "sha256:feea1b9fd7f11e66755f731628a34d3b81c47ee997ffd7abb55ab2e5bf50e980",
         "control_domain_id": "ur10e_robot.arm.control",
         "control_domain_revision": "sha256:6533ecc6a36ed9888882a4ebaa2c6cd111b3835dca4607ee2e2a929323cf1a31",
         "control_route_id": "arm_position",

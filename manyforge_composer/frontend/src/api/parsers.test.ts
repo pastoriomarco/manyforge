@@ -20,7 +20,8 @@ import {
   parseManagerStatusProjection,
   parseOperatorAlarmSnapshot,
   parseOperationObservation,
-  parseOperationRuntimeScaleStatus,
+  parseRuntimeScaleControlAccepted,
+  parseRuntimeScaleControlStatus,
   parseMotionPreviewResponse,
   parseNodeEnvironmentResponse,
   parseLogicalSceneProjection,
@@ -30,6 +31,7 @@ import {
   parseProgramWorkspaceTransitionResponse,
   parseProgramRunIndex,
   parseProgramRunStatus,
+  parseProgramCycleResetResult,
   parseProgramRuntimeControlProjection,
   parseScenarioCatalogResponse,
   parseSceneRuntimeProjection,
@@ -302,7 +304,7 @@ function structuralManifestFixture(): Record<string, unknown> {
 
 function sourceModelFixture(): Record<string, unknown> {
   return {
-    schema_version: 'manyforge.source_model_projection.v1',
+    schema_version: 'manyforge.source_model_projection.v2',
     cell_id: 'cell-a',
     retained_bundle_id: 'bundle-1',
     graph_revision: 'graph-1',
@@ -586,7 +588,7 @@ describe('Program product projections', () => {
 
   function runtimeControlsProjection(): Record<string, unknown> {
     return {
-      schema_version: 'manyforge.program_runtime_control_projection.v1',
+      schema_version: 'manyforge.program_runtime_control_projection.v2',
       owner_id: 'program-runner.cell-a',
       owner_epoch: 'program-runner.epoch.1',
       program_run_id: 'program-run.1',
@@ -799,6 +801,39 @@ describe('Program product projections', () => {
 
     expect(result.recoveryOffer).toBeNull();
     expect(result.run.capture.programRunId).toBe('program-run.1');
+  });
+
+  it('parses the exact post-Reset admission fence', () => {
+    const result = parseProgramCycleResetResult({
+      schema_version: 'manyforge.program_cycle_reset_result.v1',
+      program_run_id: 'program-run.1',
+      reset_cycle_generation: 8,
+      idle_cycle_generation: 9,
+      settlement_reference: digestA,
+      admission: {
+        admission_generation: 12,
+        authoring_allowed: false,
+      },
+      runtime_controls: null,
+    });
+
+    expect(result.admission).toEqual({
+      admissionGeneration: 12,
+      authoringAllowed: false,
+    });
+    expect(() => parseProgramCycleResetResult({
+      schema_version: 'manyforge.program_cycle_reset_result.v1',
+      program_run_id: 'program-run.1',
+      reset_cycle_generation: 8,
+      idle_cycle_generation: 9,
+      settlement_reference: digestA,
+      admission: {
+        admission_generation: 12,
+        authoring_allowed: false,
+        ignored: true,
+      },
+      runtime_controls: null,
+    })).toThrow(/exactly \[admission_generation, authoring_allowed\]/);
   });
 
   it('parses Composer Apply, Load, and Revert wrappers without trusting headless details', () => {
@@ -1031,12 +1066,22 @@ describe('Program workspace parsers', () => {
       frame_role_visibility: {},
       frame_gizmo_size_m: 0.1,
       resource_role_visibility: {},
+      scene_resource_axes_visibility: { part: true },
       object_axes_gizmo_size_m: 0.15,
     };
 
     const parsed = parseProgramWorkspaceResponse(fixture);
     expect(parsed.draft.program?.scene?.[0]?.shape.type).toBe('sphere');
     expect(parsed.draft.program?.viewer?.object_axes_gizmo_size_m).toBe(0.15);
+    expect(parsed.draft.program?.viewer?.scene_resource_axes_visibility).toEqual({
+      part: true,
+    });
+
+    (program.viewer as Record<string, unknown>).scene_resource_axes_visibility = { absent: true };
+    expect(() => parseProgramWorkspaceResponse(fixture)).toThrow(
+      'a declared Program scene resource',
+    );
+    (program.viewer as Record<string, unknown>).scene_resource_axes_visibility = { part: true };
 
     ((program.scene as Record<string, unknown>[])[0].shape as Record<string, unknown>).radius = 1;
     expect(() => parseProgramWorkspaceResponse(fixture)).toThrow(
@@ -1735,30 +1780,70 @@ describe('addressed Robot Control parsers', () => {
     expect(() => parseOperationObservation(missing)).toThrow();
   });
 
-  it('retains the exact owner runtime-scale fence and support state', () => {
-    const status = parseOperationRuntimeScaleStatus({
+  it('parses the persistent runtime-scale control without making its operation evidence routable', () => {
+    const selector = {
+      component_role_id: 'robot',
+      program_binding_id: 'binding-program-1',
+      target_role_id: 'arm',
+    };
+    const status = parseRuntimeScaleControlStatus({
+      api_version: 'manyforge.execution_command_response.v1',
+      command: 'get_runtime_scale_control',
       ok: true,
-      command: 'get_runtime_scale',
-      runtime_scale: {
-        operation_id: 'operation-1',
-        operation_revision: 5,
-        runtime_scale_generation: 2,
-        requested_scale: 0.5,
+      runtime_scale_control: {
+        active_control_configuration_generation: 1,
+        active_control_configuration_id: 'active-1',
+        active_operation_id: 'operation-1',
+        active_operation_revision: 5,
+        active_operation_scale_generation: 2,
+        application_state: 'applied',
+        control_binding_id: 'binding-1',
+        control_binding_revision: 'revision-1',
+        control_domain_id: 'domain-1',
+        control_domain_revision: 'revision-1',
+        control_generation: 3,
         effective_scale: 0.45,
-        state: 'applied',
-        updated_at_ns: 123,
-        participants: [{ supported: true }],
+        frozen: false,
+        reason: null,
+        requested_scale: 0.5,
+        scaling_domain_id: 'scale-1',
+        selector,
+        supported: true,
       },
     });
-
     expect(status).toMatchObject({
-      operationId: 'operation-1',
-      operationRevision: 5,
-      runtimeScaleGeneration: 2,
+      selector: {
+        componentRoleId: 'robot',
+        programBindingId: 'binding-program-1',
+        targetRoleId: 'arm',
+      },
+      controlGeneration: 3,
       requestedScale: 0.5,
-      effectiveScale: 0.45,
-      state: 'applied',
-      supported: true,
+      activeOperationId: 'operation-1',
+      activeOperationScaleGeneration: 2,
+    });
+
+    const accepted = parseRuntimeScaleControlAccepted({
+      accepted: {
+        accepted_at_ns: 123,
+        active_operation_id: 'operation-1',
+        active_operation_revision: 5,
+        active_operation_scale_generation: 3,
+        control_generation: 4,
+        replay_status: 'accepted_new',
+        request_id: 'request-scale-1',
+        requested_scale: 0.25,
+        selector,
+      },
+      api_version: 'manyforge.execution_command_response.v1',
+      command: 'set_runtime_scale_control',
+      ok: true,
+    });
+    expect(accepted).toMatchObject({
+      requestId: 'request-scale-1',
+      controlGeneration: 4,
+      requestedScale: 0.25,
+      activeOperationId: 'operation-1',
     });
   });
 
@@ -1837,7 +1922,7 @@ describe('addressed Robot Control parsers', () => {
             max_acceleration_rad_s2: null,
           }],
           target_descriptor: {
-            schema_version: 'manyforge.manual_control_motion_descriptor.v1',
+            schema_version: 'manyforge.manual_control_motion_descriptor.v3',
             controllable_component_id: 'robot-a',
             command_target_id: 'arm',
             component_role_id: 'controlled_component',
@@ -1855,6 +1940,18 @@ describe('addressed Robot Control parsers', () => {
               max_acceleration_rad_s2: null,
               unit: 'rad',
             }],
+            operational_joint_limits: [{
+              source_joint_name: 'joint1',
+              model_max_velocity_rad_s: 2,
+              model_max_acceleration_rad_s2: null,
+              deployment_max_velocity_rad_s: 1.5,
+              deployment_max_acceleration_rad_s2: 2.5,
+              deployment_max_jerk_rad_s3: 10,
+              effective_max_velocity_rad_s: 1.5,
+              effective_max_acceleration_rad_s2: 2.5,
+              effective_max_jerk_rad_s3: 10,
+            }],
+            operational_limit: null,
             contracts,
           },
         },
@@ -1885,22 +1982,44 @@ describe('addressed Robot Control parsers', () => {
           },
           target_role_id: 'command_target',
           target_descriptor: {
-            schema_version: 'manyforge.manual_control_gripper_descriptor.v1',
+            schema_version: 'manyforge.manual_control_gripper_descriptor.v2',
             controllable_component_id: 'robot-a',
             command_target_id: 'gripper',
             component_role_id: 'controlled_component',
             target_role_id: 'command_target',
+            description: 'Test gripper',
+            command_kind: 'gripper_position',
+            actuation_kind: 'position_commanded',
+            transport_kind: 'resolved_binding',
+            control_interface_contract_id: 'interface-1',
+            state_authority_id: 'state.gripper',
+            state_authority_class: 'measured',
+            completion_policy: 'goal_fenced_target_reached',
+            grasp_confirmation_policy: 'binding_feedback_required',
+            source_group_name: 'gripper',
             source_coordinate_name: 'finger_joint',
             source_kind: 'model_role',
             coordinate_kind: 'linear_m',
             unit: 'm',
             min_position: 0,
             max_position: 0.04,
+            open_state_ref: 'open',
+            closed_state_ref: 'closed',
+            command_duration_s: 0.5,
+            touch_links: ['finger_link'],
+            mount_frame: 'tool0',
+            attach_frame: 'tool0',
+            tcp_frame: 'tool0',
+            auxiliary_frames: [],
             mimic_followers: [],
             named_presets: [{
               name: 'open',
               master_position: 0.04,
               coordinates: [{ source_coordinate_name: 'finger_joint', position: 0.04 }],
+            }, {
+              name: 'closed',
+              master_position: 0,
+              coordinates: [{ source_coordinate_name: 'finger_joint', position: 0 }],
             }],
             contracts: {
               ...contracts,
@@ -1924,6 +2043,13 @@ describe('addressed Robot Control parsers', () => {
     expect(status.observedMotion.currentTcpPose.position_m.z_m).toBe(0.4);
     expect(status.observedGripper?.position).toBe(0.02);
     expect(status.cellStopAction.expectedStopGeneration).toBe(4);
+    expect(status.directControl.targetDescriptor.operationalJointLimits[0])
+      .toMatchObject({
+        deploymentMaxVelocityRadS: 1.5,
+        effectiveMaxVelocityRadS: 1.5,
+        effectiveMaxAccelerationRadS2: 2.5,
+        effectiveMaxJerkRadS3: 10,
+      });
 
     const identity = {
       active_publication_generation: 1,
@@ -1975,7 +2101,32 @@ describe('addressed Robot Control parsers', () => {
           cell_stop_action: response.status.cell_stop_action,
           observed_gripper: observedGripper,
           observed_motion: observedMotion,
-          schema_version: 'manyforge.execution_control_state.v1',
+          resident_operations: [],
+          runtime_scale_control: {
+            active_control_configuration_generation: 1,
+            active_control_configuration_id: 'active-1',
+            active_operation_id: null,
+            active_operation_revision: null,
+            active_operation_scale_generation: null,
+            application_state: null,
+            control_binding_id: 'binding-1',
+            control_binding_revision: exactRevision,
+            control_domain_id: 'domain-1',
+            control_domain_revision: exactRevision,
+            control_generation: 0,
+            effective_scale: null,
+            frozen: false,
+            reason: null,
+            requested_scale: 1,
+            scaling_domain_id: 'scale-1',
+            selector: {
+              component_role_id: 'controlled_component',
+              program_binding_id: 'sha256:binding',
+              target_role_id: 'command_target',
+            },
+            supported: true,
+          },
+          schema_version: 'manyforge.execution_control_state.v3',
         },
         identity,
         ok: true,
@@ -2055,6 +2206,13 @@ describe('addressed Robot Control parsers', () => {
     crossedDescriptor.status.direct_control.target_descriptor.frames.reverse();
     expect(() => parseExecutionOwnerStatus(crossedDescriptor)).toThrow(
       /exact addressed targets/,
+    );
+
+    const dishonestLimit = structuredClone(response);
+    dishonestLimit.status.direct_control.target_descriptor
+      .operational_joint_limits[0].effective_max_velocity_rad_s = 2;
+    expect(() => parseExecutionOwnerStatus(dishonestLimit)).toThrow(
+      /exact conservative Deployment\/model minimum/,
     );
   });
 

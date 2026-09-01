@@ -18,3 +18,15 @@ export interface ExecutionObservationReader {
   getLatestExecutionObservation: () => ExecutionObservationFrame | null;
   subscribeExecutionObservation: (listener: () => void) => () => void;
 }
+
+export type ExecutionObservationTransportPhase =
+  | 'disabled'
+  | 'connecting'
+  | 'waiting'
+  | 'live'
+  | 'reconnecting';
+
+export interface ExecutionObservationTransportStatus {
+  phase: ExecutionObservationTransportPhase;
+  message: string | null;
+}

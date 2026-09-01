@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from manyforge_behavior.node_availability import AvailabilityFact
 from manyforge_behavior.program_run_owner import ProgramRunOwnerError
 from manyforge_headless_api.models import (
     CycleRecoveryActionRequest,
@@ -32,7 +33,10 @@ from manyforge_headless_api.cell_admission import (
     cell_admission_owner_epoch_reconciliation_evidence_digest,
 )
 from manyforge_program_runner.cycle_journal import ProgramCycleJournal
-from manyforge_program_runner.models import ProgramCycleResetRequest
+from manyforge_program_runner.models import (
+    ProgramCycleResetRequest,
+    ProgramNodeAvailabilityRequest,
+)
 
 
 _DIGEST_A = "sha256:" + "a" * 64
@@ -105,12 +109,10 @@ class _Headless:
         "submit",
         "manager_graph",
         "read",
-        "get_runtime_scale",
         "pause",
         "reset",
         "resume",
         "scene",
-        "set_runtime_scale",
         "stop",
         "stop_program_run",
         "stop_status",
@@ -898,8 +900,10 @@ def test_manager_recovery_rotates_exactly_released_terminal_predecessor(
 
 
 def test_manager_recovery_reconciles_terminal_held_claim_then_reset_is_explicit(
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
+    _bypass_reset_scene_preparation(monkeypatch)
     runtime, journal, admission = _reconcile_runtime(
         tmp_path,
         journal_owner_epoch="runner.old",
@@ -1238,6 +1242,16 @@ def _bypass_scene_preparation(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+def _bypass_reset_scene_preparation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep lifecycle-only tests independent from Applied-scene fixtures."""
+
+    monkeypatch.setattr(
+        ProgramRuntime,
+        "_prepare_scene_after_reset",
+        lambda _self, _request: None,
+    )
+
+
 class _PreparedRunAdmission:
     def __init__(self) -> None:
         self.program = SimpleNamespace(to_dict=lambda: {"scene": []})
@@ -1455,6 +1469,7 @@ def test_post_claim_scene_race_records_resettable_no_effect_settlement(
     assert runtime._digest(retained.start_settlement) == (  # noqa: SLF001
         status["terminal_or_settlement_reference"]
     )
+    _bypass_reset_scene_preparation(monkeypatch)
     reset = ProgramCycleResetRequest.model_validate(
         {
             "request_id": "request.reset.scene-race",
@@ -2356,8 +2371,10 @@ def test_restart_retries_containment_after_durable_loss_crash_window(
 
 
 def test_explicit_release_rejection_remains_retryable_without_unknown_outcome(
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
+    _bypass_reset_scene_preparation(monkeypatch)
     path = tmp_path / "cycle.sqlite3"
     journal = ProgramCycleJournal(path, owner_epoch="runner.current")
     intent = {
@@ -2430,9 +2447,92 @@ def test_explicit_release_rejection_remains_retryable_without_unknown_outcome(
     runtime.shutdown()
 
 
-def test_rejected_reset_replays_after_state_change_and_retains_capacity(
+def test_reset_opens_idle_then_converges_scene_and_exact_replay_finishes_it(
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
+    events: list[str] = []
+
+    class OrderedAdmission(_Admission):
+        def release(self, release: dict[str, Any]) -> dict[str, Any]:
+            result = super().release(release)
+            events.append("release")
+            return result
+
+    journal = ProgramCycleJournal(
+        tmp_path / "cycle.sqlite3", owner_epoch="runner.reset-scene.1"
+    )
+    claim = _program_cycle_claim("runner.reset-scene.1")
+    terminal_reference = _retain_terminal_cycle(journal, claim)
+    admission = OrderedAdmission()
+    runtime = ProgramRuntime(
+        ProgramRunnerConfig(
+            headless_url="http://headless.test",
+            owner_epoch="runner.reset-scene.1",
+        ),
+        headless_client=_Headless(),  # type: ignore[arg-type]
+        execution_transport=_Headless(),  # type: ignore[arg-type]
+        admission_client=admission,  # type: ignore[arg-type]
+        cycle_journal=journal,
+    )
+    published = journal.publish_reset
+
+    def publish_reset(**kwargs: Any) -> None:
+        published(**kwargs)
+        assert journal.read().state == "idle_after_reset"
+        events.append("idle")
+
+    monkeypatch.setattr(journal, "publish_reset", publish_reset)
+    contexts: list[str] = []
+
+    def prepare_scene(
+        *, expected_record_digest: str | None, context_id: str
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        assert expected_record_digest is None
+        assert journal.read().state == "idle_after_reset"
+        contexts.append(context_id)
+        events.append(f"scene:{len(contexts)}")
+        if len(contexts) == 1:
+            raise RuntimeError("logical scene owner temporarily unavailable")
+        return ({}, {})
+
+    monkeypatch.setattr(runtime, "_prepare_current_applied_scene", prepare_scene)
+    request = ProgramCycleResetRequest.model_validate(
+        {
+            "request_id": "reset.scene.1",
+            "request_owner_epoch": "composer.1",
+            "source_label": "operator_ui",
+            "correlation_id": None,
+            "program_run_id": "program-cycle.1",
+            "expected_owner_epoch": runtime.owner_epoch,
+            "expected_cycle_generation": 1,
+            "expected_claim_generation": 1,
+            "terminal_reference": terminal_reference,
+            "settlement_evidence_digest": terminal_reference,
+        }
+    )
+    runtime.start()
+
+    with pytest.raises(ProgramRunnerError) as failed:
+        runtime.reset_cycle(request)
+    assert failed.value.code == "program_cycle_reset_scene_preparation_failed"
+    assert events == ["release", "idle", "scene:1"]
+    assert journal.read().state == "idle_after_reset"
+
+    replay = runtime.reset_cycle(request)
+
+    assert replay["idle_cycle_generation"] == 2
+    assert events == ["release", "idle", "scene:1", "scene:2"]
+    assert len(admission.releases) == 1
+    assert contexts[0] == contexts[1]
+    runtime.shutdown()
+
+
+def test_rejected_reset_replays_after_state_change_and_retains_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    _bypass_reset_scene_preparation(monkeypatch)
     journal = ProgramCycleJournal(
         tmp_path / "cycle.sqlite3",
         owner_epoch="runner.current",
@@ -2899,6 +2999,155 @@ def test_runtime_rejects_a_stale_applied_selection_before_tree_admission(
     assert stale.value.code == "program_run_applied_selection_stale"
     assert host.start_admissions == []
     assert headless.selection_reads == 0
+    runtime.shutdown()
+
+
+def test_node_availability_uses_supplied_exact_facts_without_headless_callback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    headless = _Headless()
+    runtime = ProgramRuntime(
+        ProgramRunnerConfig(
+            headless_url="http://headless.test",
+            owner_epoch="program-runner.test",
+        ),
+        headless_client=headless,  # type: ignore[arg-type]
+        execution_transport=headless,  # type: ignore[arg-type]
+        admission_client=_Admission(),  # type: ignore[arg-type]
+        cycle_journal=ProgramCycleJournal(
+            tmp_path / "cycle.sqlite3",
+            owner_epoch="program-runner.test",
+        ),
+    )
+    captured: dict[str, Any] = {}
+    root = SimpleNamespace(node_id="root", children=())
+    admitted = SimpleNamespace(
+        applied_record_digest=_DIGEST_B,
+        graph_revision=_DIGEST_A,
+        program_binding_id=_DIGEST_B,
+        retained_bundle_id=_DIGEST_A,
+        scenario_id="cell-pick",
+        readiness=object(),
+        program=SimpleNamespace(
+            program_id="program.1",
+            program_revision=_DIGEST_A,
+            tree=root,
+        ),
+    )
+
+    def admit(applied: object, selection: object, **kwargs: object) -> object:
+        captured.update(
+            applied=applied,
+            selection=selection,
+            kwargs=kwargs,
+        )
+        return admitted
+
+    availability = {
+        "schema_version": "manyforge.node_execution_availability.v1",
+        "environment_digest": runtime._environment.environment_digest,  # noqa: SLF001
+        "program_binding_id": _DIGEST_B,
+        "required_node_ids": ["root"],
+        "portable_authoring_available": True,
+        "execution_available": True,
+        "reason_codes": [],
+        "implementations": [],
+    }
+    monkeypatch.setattr(
+        "manyforge_program_runner.runtime.build_applied_program_run_admission",
+        admit,
+    )
+    monkeypatch.setattr(
+        "manyforge_program_runner.runtime.project_node_execution_availability",
+        lambda *_args, **_kwargs: availability,
+    )
+    request = ProgramNodeAvailabilityRequest.model_validate(
+        {
+            "applied": {
+                "scenario_id": "cell-pick",
+                "scenario_catalog_revision": _DIGEST_A,
+                "retained_bundle_id": _DIGEST_A,
+                "graph_revision": _DIGEST_A,
+                "source": {
+                    "record_digest": _DIGEST_B,
+                    "source_generation": 7,
+                },
+            },
+            "selection": {
+                "scenario_id": "cell-pick",
+                "program_revision": _DIGEST_A,
+            },
+        }
+    )
+    monkeypatch.setattr(
+        runtime._kernel,  # noqa: SLF001
+        "identity",
+        lambda: {
+            "ok": True,
+            "identity": {
+                "retained_bundle_id": _DIGEST_A,
+                "graph_revision": _DIGEST_A,
+                "active_publication_generation": 3,
+                "scene_revision": {"revision_id": 2},
+            },
+        },
+    )
+
+    runtime.start()
+    result = runtime.node_availability(request)
+
+    assert captured["applied"] is request.applied
+    assert captured["selection"] is request.selection
+    assert captured["kwargs"] == {
+        "expected_scenario_id": "cell-pick",
+        "expected_scenario_catalog_revision": _DIGEST_A,
+        "environment": runtime._environment,  # noqa: SLF001
+        "owner_availability": runtime._owner_availability,  # noqa: SLF001
+    }
+    assert result["availability"] == availability
+    assert result["source"]["program_revision"] == _DIGEST_A
+    assert headless.applied_reads == 0
+    assert headless.selection_reads == 0
+    runtime.shutdown()
+
+
+def test_node_availability_marks_only_native_ports_unavailable_without_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = ProgramRuntime(
+        ProgramRunnerConfig(headless_url="http://headless.test"),
+        headless_client=_Headless(),  # type: ignore[arg-type]
+        execution_transport=_Headless(),  # type: ignore[arg-type]
+    )
+    monkeypatch.setattr(
+        runtime._kernel,  # noqa: SLF001
+        "identity",
+        lambda: (_ for _ in ()).throw(ConnectionError("owner absent")),
+    )
+
+    availability = runtime._current_node_owner_availability(  # noqa: SLF001
+        {
+            "retained_bundle_id": _DIGEST_A,
+            "graph_revision": _DIGEST_A,
+            "source": {"source_generation": 1},
+        },
+        admission_generation=1,
+    )
+
+    for port_name in (
+        "gripper_status",
+        "kernel_controls",
+        "kernel_operations",
+        "model_queries",
+        "pick_place",
+    ):
+        assert availability[port_name] == AvailabilityFact(
+            False,
+            ("program_execution_owner_unavailable",),
+        )
+    assert availability["scene_transactions"] == AvailabilityFact(True)
+    assert availability["cclc_lifecycle"] == AvailabilityFact(True)
     runtime.shutdown()
 
 

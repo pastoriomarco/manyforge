@@ -3,6 +3,7 @@ import {
   parseAppliedProgramSelection,
   parseCapabilityCommandPreviewResponse,
   parseDraftMutationResponse,
+  parseDeploymentCandidateOperationResponse,
   parseDeploymentWorkspaceResponse,
   parseFileBrowserResponse,
   parseHealthResponse,
@@ -23,7 +24,8 @@ import {
   parseObjectResponse,
   parseOperationAcceptance,
   parseOperationObservation,
-  parseOperationRuntimeScaleStatus,
+  parseRuntimeScaleControlAccepted,
+  parseRuntimeScaleControlStatus,
   parseOperatorAlarmSnapshot,
   parseProgramWorkspaceResponse,
   parseProgramWorkspaceTransitionResponse,
@@ -63,6 +65,8 @@ import type {
   ManagerDeploymentCandidatePreviewResponse,
   DraftFenceRequest,
   DraftMutationResponse,
+  DeploymentControlledStopProfile,
+  DeploymentCandidateOperationResponse,
   DeploymentWorkspaceResponse,
   FileBrowserResponse,
   HealthResponse,
@@ -108,7 +112,8 @@ import type {
   MotionPreviewReceipt,
   OperationAcceptance,
   OperationObservation,
-  OperationRuntimeScaleStatus,
+  RuntimeScaleControlAccepted,
+  RuntimeScaleControlStatus,
 } from '../types/robotControl';
 import type {
   AssistantModeIndex,
@@ -124,6 +129,28 @@ import type {
   CCLCRouteTemplateSet,
   CCLCTransactionStatus,
 } from '../types/cclc';
+
+export interface HistorianListQuery {
+  startNs?: number;
+  endNs?: number;
+  components?: string[];
+  eventTypes?: string[];
+  beforeSequence?: number;
+  limit?: number;
+}
+
+export function historianListPath(query: HistorianListQuery = {}): string {
+  const parameters = new URLSearchParams();
+  parameters.set('limit', String(query.limit ?? 32));
+  if (query.startNs !== undefined) parameters.set('start_ns', String(query.startNs));
+  if (query.endNs !== undefined) parameters.set('end_ns', String(query.endNs));
+  if (query.beforeSequence !== undefined) {
+    parameters.set('before_sequence', String(query.beforeSequence));
+  }
+  for (const component of query.components ?? []) parameters.append('components', component);
+  for (const eventType of query.eventTypes ?? []) parameters.append('event_types', eventType);
+  return `/api/execution/history?${parameters.toString()}`;
+}
 
 const BASE_URL = import.meta.env.VITE_API_URL || '';
 
@@ -555,6 +582,39 @@ export const api = {
         body: JSON.stringify({ ...fence, path, operation, value }),
       },
     ),
+    updateControlledStop: (
+      fence: DraftFenceRequest,
+      profile: DeploymentControlledStopProfile,
+      signal?: AbortSignal,
+    ): Promise<DeploymentWorkspaceResponse> => requestJson(
+      '/api/deployment/draft/controlled-stop',
+      parseDeploymentWorkspaceResponse,
+      signal,
+      {
+        method: 'POST',
+        body: JSON.stringify({ ...fence, profile }),
+      },
+    ),
+    updateMotionTargetLimit: (
+      fence: DraftFenceRequest,
+      controllableComponentId: string,
+      commandTargetId: string,
+      maximumTcpLinearSpeedMps: number,
+      signal?: AbortSignal,
+    ): Promise<DeploymentWorkspaceResponse> => requestJson(
+      '/api/deployment/draft/motion-target-limit',
+      parseDeploymentWorkspaceResponse,
+      signal,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          ...fence,
+          controllable_component_id: controllableComponentId,
+          command_target_id: commandTargetId,
+          maximum_tcp_linear_speed_mps: maximumTcpLinearSpeedMps,
+        }),
+      },
+    ),
     save: (
       fence: DraftFenceRequest,
       signal?: AbortSignal,
@@ -593,6 +653,24 @@ export const api = {
     ): Promise<DeploymentWorkspaceResponse> => requestJson(
       '/api/deployment/revert',
       parseDeploymentWorkspaceResponse,
+      signal,
+      { method: 'POST', body: JSON.stringify(fence) },
+    ),
+    previewDraft: (
+      fence: DraftFenceRequest,
+      signal?: AbortSignal,
+    ): Promise<DeploymentCandidateOperationResponse> => requestJson(
+      '/api/deployment/draft/preview',
+      parseDeploymentCandidateOperationResponse,
+      signal,
+      { method: 'POST', body: JSON.stringify(fence) },
+    ),
+    applyDraft: (
+      fence: DraftFenceRequest,
+      signal?: AbortSignal,
+    ): Promise<DeploymentCandidateOperationResponse> => requestJson(
+      '/api/deployment/draft/apply',
+      parseDeploymentCandidateOperationResponse,
       signal,
       { method: 'POST', body: JSON.stringify(fence) },
     ),
@@ -1138,28 +1216,14 @@ export const api = {
         }),
       },
     ),
-    runtimeScale: (
-      operationId: string,
-      signal?: AbortSignal,
-    ): Promise<OperationRuntimeScaleStatus> => requestJson(
-      `/api/execution/operations/${encodeURIComponent(operationId)}/runtime-scale`,
-      (value) => {
-        const status = parseOperationRuntimeScaleStatus(value);
-        if (status.operationId !== operationId) {
-          throw new Error('runtime-scale observation does not match its request');
-        }
-        return status;
-      },
-      signal,
-    ),
-    setRuntimeScale: (
+    acknowledgeCompleted: (
       ownerEpoch: string,
-      status: OperationRuntimeScaleStatus,
-      scale: number,
+      operationId: string,
+      operationRevision: number,
       requestId: string,
       signal?: AbortSignal,
     ): Promise<Record<string, unknown>> => requestJson(
-      `/api/execution/operations/${encodeURIComponent(status.operationId)}/runtime-scale`,
+      `/api/execution/operations/${encodeURIComponent(operationId)}/acknowledge-completed`,
       parseObjectResponse,
       signal,
       {
@@ -1171,9 +1235,77 @@ export const api = {
             source_label: 'composer_ui',
             correlation_id: null,
           },
-          operation_id: status.operationId,
-          expected_operation_revision: status.operationRevision,
-          expected_runtime_scale_generation: status.runtimeScaleGeneration,
+          operation_id: operationId,
+          expected_operation_revision: operationRevision,
+          reason: 'settle completed Robot Control operation',
+        }),
+      },
+    ),
+    resetOperation: (
+      ownerEpoch: string,
+      operationId: string,
+      operationRevision: number,
+      requestId: string,
+      signal?: AbortSignal,
+    ): Promise<Record<string, unknown>> => requestJson(
+      `/api/execution/operations/${encodeURIComponent(operationId)}/reset`,
+      parseObjectResponse,
+      signal,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          request_context: {
+            request_id: requestId,
+            request_owner_epoch: ownerEpoch,
+            source_label: 'composer_ui',
+            correlation_id: null,
+          },
+          operation_id: operationId,
+          expected_operation_revision: operationRevision,
+          reason: 'settle terminal Robot Control operation',
+        }),
+      },
+    ),
+    runtimeScaleControl: (
+      selector: RuntimeScaleControlStatus['selector'],
+      signal?: AbortSignal,
+    ): Promise<RuntimeScaleControlStatus> => {
+      const query = new URLSearchParams({
+        program_binding_id: selector.programBindingId,
+        component_role_id: selector.componentRoleId,
+        target_role_id: selector.targetRoleId,
+      });
+      return requestJson(
+        `/api/execution/runtime-scale-control?${query.toString()}`,
+        parseRuntimeScaleControlStatus,
+        signal,
+      );
+    },
+    setRuntimeScaleControl: (
+      ownerEpoch: string,
+      status: RuntimeScaleControlStatus,
+      scale: number,
+      requestId: string,
+      signal?: AbortSignal,
+    ): Promise<RuntimeScaleControlAccepted> => requestJson(
+      '/api/execution/runtime-scale-control',
+      parseRuntimeScaleControlAccepted,
+      signal,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          request_context: {
+            request_id: requestId,
+            request_owner_epoch: ownerEpoch,
+            source_label: 'composer_ui',
+            correlation_id: null,
+          },
+          selector: {
+            program_binding_id: status.selector.programBindingId,
+            component_role_id: status.selector.componentRoleId,
+            target_role_id: status.selector.targetRoleId,
+          },
+          expected_control_generation: status.controlGeneration,
           scale,
         }),
       },
@@ -1304,9 +1436,12 @@ export const api = {
     ),
   },
   history: {
-    list: (limit = 32, signal?: AbortSignal): Promise<HistorianPage> =>
+    list: (
+      query: HistorianListQuery = {},
+      signal?: AbortSignal,
+    ): Promise<HistorianPage> =>
       requestJson(
-        `/api/execution/history?limit=${encodeURIComponent(String(limit))}`,
+        historianListPath(query),
         parseHistorianPage,
         signal,
       ),

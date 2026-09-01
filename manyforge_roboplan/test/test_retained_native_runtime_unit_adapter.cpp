@@ -682,6 +682,36 @@ TEST(RetainedNativeRuntimeUnitAdapter,
 }
 
 TEST(RetainedNativeRuntimeUnitAdapter,
+     PartialAuthoredDuplicateCannotShadowInstalledChildPackage) {
+  NativeFixture fixture;
+  ScopedTemporaryRoot authored;
+  const auto bundle_filename =
+      fixture.bundle->retained_bundle_id().value().substr(7U) + ".json";
+  const auto authored_bundle_directory =
+      authored.path() / "retained-bundles" / "sha256";
+  ASSERT_TRUE(std::filesystem::create_directories(authored_bundle_directory));
+  ASSERT_TRUE(std::filesystem::copy_file(
+      fixture.root / "retained-package" / "retained-bundles" / "sha256" /
+          bundle_filename,
+      authored_bundle_directory / bundle_filename));
+
+  auto adapter = component_manager::RetainedNativeRuntimeUnitAdapter(
+      MANYFORGE_NATIVE_EXECUTION_TARGET_ROOT,
+      fixture.root / "retained-package", fixture.manager_state_root.path(),
+      fixture.manager_run_root.path(), fixture.execution_state_root.path(),
+      fixture.execution_run_root.path(), fixture.bundle_source,
+      fixture.artifact_source, std::string(contract::kOperatingSystem),
+      std::string(contract::kLaunchEnvironmentContract), {}, {}, {},
+      authored.path());
+
+  const auto started = adapter.EnsureRunning(*fixture.query);
+  ASSERT_EQ(started.state(),
+            component_manager::ProcessPresenceState::kPresent);
+  EXPECT_EQ(adapter.EnsureStopped(*fixture.query).state(),
+            component_manager::ProcessPresenceState::kAbsent);
+}
+
+TEST(RetainedNativeRuntimeUnitAdapter,
      ManagedChildReadsThePinnedPackageAfterPathReplacement) {
   NativeFixture fixture;
   ScopedTemporaryRoot package_parent;

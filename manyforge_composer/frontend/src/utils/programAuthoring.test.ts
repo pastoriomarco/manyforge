@@ -10,6 +10,7 @@ import type {
 import {
   collectProgramBindingCandidates,
   collectProgramParameterUsages,
+  deriveProgramMotionConfiguration,
   nextProgramInstanceId,
   programDiagnosticNodeId,
   programSemanticChoices,
@@ -282,5 +283,113 @@ describe('Program parameter binding continuity', () => {
       'blackboard_key',
     )).toBe('scene_selection_result');
     expect(programSemanticExpectedAccess(semanticEntry, 'output_key')).toBe('write');
+  });
+
+  it('derives motion settings from catalog-field bindings with arbitrary parameter names', () => {
+    const motionEntry: CatalogEntry = {
+      ...entry,
+      parameters: [
+        parameter('velocity_scale', 'number'),
+        parameter('acceleration_scale', 'number'),
+        parameter('max_tcp_linear_speed_mps', 'number'),
+      ],
+    };
+    const program = {
+      api_version: 'manyforge.program.v1',
+      program_id: 'bound_motion',
+      program_profile: 'composable-cell-v1',
+      name: 'Bound motion',
+      catalog: {
+        api_version: 'manyforge.node_catalog.v2',
+        content_version: '1.1.0',
+      },
+      component_roles: {},
+      target_roles: {},
+      parameters: [
+        { ...declaration, parameter_id: 'cycle_velocity', default: 0.35 },
+        { ...declaration, parameter_id: 'cycle_acceleration', default: 0.7 },
+        { ...declaration, parameter_id: 'cycle_tcp_cap', default: 0.12 },
+      ],
+      schema_version: 'manyforge.composer_authoring_forest.v1',
+      forest: [tree({
+        value_sources: {
+          velocity_scale: {
+            kind: 'program_parameter',
+            reference: 'cycle_velocity',
+          },
+          acceleration_scale: {
+            kind: 'program_parameter',
+            reference: 'cycle_acceleration',
+          },
+          max_tcp_linear_speed_mps: {
+            kind: 'program_parameter',
+            reference: 'cycle_tcp_cap',
+          },
+        },
+      })],
+      positions: {},
+    } satisfies ProgramAuthoringDocument;
+
+    expect(deriveProgramMotionConfiguration(program, [motionEntry])).toEqual({
+      available: true,
+      configuration: {
+        bindings: {
+          velocity_scale: 'cycle_velocity',
+          acceleration_scale: 'cycle_acceleration',
+          max_tcp_linear_speed_mps: 'cycle_tcp_cap',
+        },
+        values: {
+          velocity_scale: 0.35,
+          acceleration_scale: 0.7,
+          max_tcp_linear_speed_mps: 0.12,
+        },
+        usageCounts: {
+          velocity_scale: 1,
+          acceleration_scale: 1,
+          max_tcp_linear_speed_mps: 1,
+        },
+        applicableCounts: {
+          velocity_scale: 1,
+          acceleration_scale: 1,
+          max_tcp_linear_speed_mps: 1,
+        },
+      },
+    });
+  });
+
+  it('reports a missing binding instead of inventing motion defaults', () => {
+    const motionEntry: CatalogEntry = {
+      ...entry,
+      parameters: [
+        parameter('velocity_scale', 'number'),
+        parameter('acceleration_scale', 'number'),
+        parameter('max_tcp_linear_speed_mps', 'number'),
+      ],
+    };
+    const program = {
+      api_version: 'manyforge.program.v1',
+      program_id: 'incomplete_motion',
+      program_profile: 'composable-cell-v1',
+      name: 'Incomplete motion',
+      catalog: {
+        api_version: 'manyforge.node_catalog.v2',
+        content_version: '1.1.0',
+      },
+      component_roles: {},
+      target_roles: {},
+      parameters: [declaration],
+      schema_version: 'manyforge.composer_authoring_forest.v1',
+      forest: [tree({
+        value_sources: {
+          velocity_scale: { kind: 'program_parameter', reference: 'vscale' },
+        },
+      })],
+      positions: {},
+    } satisfies ProgramAuthoringDocument;
+
+    expect(deriveProgramMotionConfiguration(program, [motionEntry])).toEqual({
+      available: false,
+      reason: 'No acceleration_scale field is bound to a Program parameter.',
+    });
   });
 });

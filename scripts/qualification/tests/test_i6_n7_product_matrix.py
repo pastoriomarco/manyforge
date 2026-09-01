@@ -123,7 +123,7 @@ def test_authoring_apply_uses_one_exact_current_browser_barrier(
         "draft": {"draftId": "draft.1", "draftRevision": 7},
     }
     snapshot = {
-        "schema_version": "manyforge.composer_headless_state.v1",
+        "schema_version": "manyforge.composer_headless_state.v2",
         "complete": True,
         "receiver_epoch": "receiver.1",
         "snapshot_sequence": 9,

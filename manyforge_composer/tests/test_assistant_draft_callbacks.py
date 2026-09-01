@@ -114,7 +114,7 @@ def _node_environment() -> VerifiedActiveNodeEnvironment:
 
 def _source_model(node_environment: VerifiedActiveNodeEnvironment):
     projection = {
-        "schema_version": "manyforge.source_model_projection.v1",
+        "schema_version": "manyforge.source_model_projection.v2",
         "cell_id": "cell-a",
         "retained_bundle_id": "bundle.1",
         "graph_revision": "graph.1",
@@ -129,7 +129,7 @@ def _source_model(node_environment: VerifiedActiveNodeEnvironment):
     }
     projection["source"]["source_content_digest"] = _framed(
         "manyforge-source-model-projection-semantic",
-        "manyforge.source_model_projection.v1",
+        "manyforge.source_model_projection.v2",
         {key: value for key, value in projection.items() if key != "source"},
     )
     return verify_active_source_model(

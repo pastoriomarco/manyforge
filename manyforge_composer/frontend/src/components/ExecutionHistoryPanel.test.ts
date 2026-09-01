@@ -11,6 +11,7 @@ const events: ExecutionHistoryEventView[] = [
   {
     id: '1', timestampNs: 1, severity: 'INFO', channel: 'execution',
     message: 'Motion started', executionId: 7, type: 'execute_started',
+    programRunId: 'run-1', operationId: 'operation-1',
   },
   {
     id: '2', timestampNs: 2, severity: 'WARN', channel: 'runtime',
@@ -64,6 +65,19 @@ describe('execution history filtering', () => {
     })).toEqual([]);
   });
 
+  it('filters exact time, Program-run, and operation identities', () => {
+    expect(filterExecutionHistoryEvents(events, {
+      severity: 'all',
+      eventType: '',
+      channel: '',
+      search: '',
+      startNs: 1,
+      endNs: 1,
+      programRunId: 'run-1',
+      operationId: 'operation-1',
+    }).map((event) => event.id)).toEqual(['1']);
+  });
+
   it('renders the largest supported public history page within the presentation budget', () => {
     const page = Array.from({ length: 32 }, (_, index): ExecutionHistoryEventView => ({
       id: `event-${index + 1}`,
@@ -82,12 +96,18 @@ describe('execution history filtering', () => {
       onClose: vi.fn(),
       events: page,
       currentExecutionId: 42,
+      onReload: vi.fn(),
+      onLoadOlder: vi.fn(),
+      hasOlder: true,
     }));
     const elapsedMs = performance.now() - started;
 
     expect(markup.match(/class="history-event /g)).toHaveLength(32);
     expect(markup).toContain('Retained event 1');
     expect(markup).toContain('Retained event 32');
+    expect(markup).toContain('Program run');
+    expect(markup).toContain('Operation');
+    expect(markup).toContain('Load older events');
     expect(elapsedMs).toBeLessThan(1000);
   });
 });

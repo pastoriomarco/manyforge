@@ -41,6 +41,7 @@ export type RobotControlPhase =
   | 'approving'
   | 'executing'
   | 'stopping'
+  | 'settling'
   | 'completed'
   | 'stopped'
   | 'failed'
@@ -97,6 +98,8 @@ export type RobotControlAction =
   | { type: 'approve_rejected'; error: string }
   | { type: 'operation_observed'; operation: OperationObservation }
   | { type: 'operation_poll_failed'; error: string }
+  | { type: 'operation_settlement_started' }
+  | { type: 'operation_settlement_failed'; error: string }
   | { type: 'stop_started' }
   | { type: 'stop_rejected'; error: string }
   | { type: 'dismiss_error' }
@@ -136,7 +139,8 @@ export function robotControlHasActiveOperation(
 ): boolean {
   return state.phase === 'approving'
     || state.phase === 'executing'
-    || state.phase === 'stopping';
+    || state.phase === 'stopping'
+    || state.phase === 'settling';
 }
 
 function arraysEqual<T>(left: T[], right: T[]): boolean {
@@ -267,6 +271,22 @@ function phaseForOperation(operation: OperationObservation): RobotControlPhase {
   return operation.state as RobotControlPhase;
 }
 
+function phaseForObservedOperation(
+  currentPhase: RobotControlPhase,
+  operation: OperationObservation,
+): RobotControlPhase {
+  // A poll that was already in flight when Stop was pressed may still carry
+  // the preceding executing revision.  It cannot revoke the locally pending
+  // exact Stop request.  Only the Stop response (stop_rejected) or a newer
+  // owner projection that has entered stopping/terminal state settles it.
+  if (currentPhase === 'stopping'
+    && !operationStateIsTerminal(operation.state)
+    && operation.state !== 'stopping') {
+    return 'stopping';
+  }
+  return phaseForOperation(operation);
+}
+
 function draftFromStatus(status: ExecutionOwnerStatus) {
   return {
     draftPositionsRad: [...status.observedMotion.positionsRad],
@@ -280,28 +300,84 @@ function resolveStatus(
   status: ExecutionOwnerStatus,
   initialize: boolean,
 ): RobotControlState {
+  const projected = status.residentOperations;
+  const projectedOperation = projected.length === 1 ? projected[0] : null;
+  const projectionError = projected.length > 1
+    ? 'More than one direct-control operation is resident; Robot Control will not guess which operation to own.'
+    : null;
+  const resolvedPhase = projectionError !== null
+    ? 'blocked'
+    : projectedOperation === null
+      ? 'idle'
+      : phaseForOperation(projectedOperation);
+  const resolvedOperation = projectionError === null ? projectedOperation : null;
   if (state.status !== null && state.status.ownerEpoch !== status.ownerEpoch) {
     return {
       ...initialRobotControlState,
       status,
-      phase: 'idle',
+      phase: resolvedPhase,
       ...draftFromStatus(status),
       generation: state.generation + 1,
-      error: 'The execution owner restarted. The prior preview was discarded.',
+      operation: resolvedOperation,
+      error: projectionError
+        ?? 'The execution owner restarted. The prior preview was discarded.',
     };
   }
   if (initialize || state.status === null) {
     return {
       ...state,
       status,
-      phase: 'idle',
+      phase: resolvedPhase,
       ...draftFromStatus(status),
       intent: null,
       preview: null,
       ghost: null,
       ghostStale: false,
+      operation: resolvedOperation,
+      error: projectionError,
+    };
+  }
+  if (projectionError !== null) {
+    return {
+      ...state,
+      status,
+      phase: 'blocked',
       operation: null,
-      error: null,
+      error: projectionError,
+    };
+  }
+  if (projectedOperation !== null) {
+    if (state.operation !== null
+      && state.operation.operationId !== projectedOperation.operationId) {
+      return {
+        ...state,
+        status,
+        phase: 'blocked',
+        error: 'The execution owner projected a different resident direct-control operation; Robot Control will not cross the operation identity.',
+      };
+    }
+    return {
+      ...state,
+      status,
+      phase: phaseForObservedOperation(state.phase, projectedOperation),
+      operation: projectedOperation,
+      ...(operationStateIsTerminal(projectedOperation.state)
+        ? draftFromStatus(status)
+        : {}),
+    };
+  }
+  if (state.operation !== null && operationStateIsTerminal(state.operation.state)) {
+    return {
+      ...state,
+      status,
+      phase: 'idle',
+      ...draftFromStatus(status),
+      operation: null,
+      intent: null,
+      preview: null,
+      ghost: null,
+      ghostStale: false,
+      error: state.error,
     };
   }
   const operationSettled = state.operation !== null
@@ -555,22 +631,42 @@ export function robotControlReducer(
       ) return state;
       return {
         ...state,
-        phase: phaseForOperation(action.operation),
+        phase: phaseForObservedOperation(state.phase, action.operation),
         operation: action.operation,
         ghostStale: state.ghost !== null,
-        error: action.operation.terminalError,
+        error: action.operation.terminalError ?? state.error,
       };
     case 'operation_poll_failed':
       return robotControlHasActiveOperation(state)
         ? { ...state, error: action.error }
+        : state;
+    case 'operation_settlement_started':
+      return state.operation !== null
+        && operationStateIsTerminal(state.operation.state)
+        && state.operation.resident
+        ? { ...state, phase: 'settling' }
+        : state;
+    case 'operation_settlement_failed':
+      return state.phase === 'settling'
+        ? {
+            ...state,
+            phase: state.operation === null
+              ? 'blocked'
+              : phaseForOperation(state.operation),
+            error: action.error,
+          }
         : state;
     case 'stop_started':
       return state.operation !== null && robotControlHasActiveOperation(state)
         ? { ...state, phase: 'stopping', error: null }
         : state;
     case 'stop_rejected':
-      return state.operation !== null && state.phase === 'stopping'
-        ? { ...state, phase: 'executing', error: action.error }
+      return state.operation !== null
+        ? {
+            ...state,
+            phase: phaseForOperation(state.operation),
+            error: action.error,
+          }
         : state;
     case 'dismiss_error':
       return state.error === null ? state : { ...state, error: null };
@@ -633,6 +729,30 @@ function buildMotionIntent(
   if (requestId.trim() === '') {
     throw new Error('Robot Control request identity must not be empty.');
   }
+  const operationalJointLimits = Object.fromEntries(
+    status.directControl.targetDescriptor.operationalJointLimits.flatMap((limit) => {
+      if (
+        limit.deploymentMaxVelocityRadS === null
+        && limit.deploymentMaxAccelerationRadS2 === null
+        && limit.deploymentMaxJerkRadS3 === null
+      ) return [];
+      return [[limit.sourceJointName, {
+        ...(limit.deploymentMaxVelocityRadS === null
+          ? {}
+          : { max_velocity_rad_s: limit.effectiveMaxVelocityRadS }),
+        ...(limit.deploymentMaxAccelerationRadS2 === null
+          || limit.effectiveMaxAccelerationRadS2 === null
+          ? {}
+          : { max_acceleration_rad_s2: limit.effectiveMaxAccelerationRadS2 }),
+        ...(limit.deploymentMaxJerkRadS3 === null
+          || limit.effectiveMaxJerkRadS3 === null
+          ? {}
+          : { max_jerk_rad_s3: limit.effectiveMaxJerkRadS3 }),
+      }]];
+    }),
+  );
+  const targetTcpLimit = status.directControl.targetDescriptor.operationalLimit
+    ?.effectiveMaximumTcpLinearSpeedMps ?? null;
   const payload: MotionParticipantPayload = {
     kind: 'motion',
     move_id: `robot-control-${requestId}`,
@@ -646,7 +766,9 @@ function buildMotionIntent(
     speed_profile: {
       velocity_scale: 1,
       acceleration_scale: 1,
-      max_tcp_linear_speed_mps: motion.kind === 'joint_goal' ? null : 0.1,
+      max_tcp_linear_speed_mps: motion.kind === 'joint_goal'
+        ? null
+        : targetTcpLimit === null ? 0.1 : Math.min(0.1, targetTcpLimit),
     },
     timeouts: {
       planning_timeout_s: 2,
@@ -659,7 +781,7 @@ function buildMotionIntent(
     offset_reference: null,
     motion,
     contact_policy_id: null,
-    per_joint_dynamics_limits: {},
+    per_joint_dynamics_limits: operationalJointLimits,
     motion_interrupt_scopes: [],
     runtime_object_bindings: [],
   };
@@ -783,6 +905,9 @@ export function buildGripperCommandIntent(
   if (commandSchema === null) {
     throw new Error('The addressed gripper command schema is unavailable.');
   }
+  if (descriptor.commandDurationS === null) {
+    throw new Error('The addressed gripper command duration is not configured.');
+  }
   const coordinate = descriptor.coordinateKind === 'angular_rad'
     ? { kind: 'angular_rad' as const, value_rad: position }
     : { kind: 'linear_m' as const, value_m: position };
@@ -817,7 +942,7 @@ export function buildGripperCommandIntent(
         completion_timeout_s: 2,
         caller_options: [{
           option_id: 'command_duration_s',
-          value_s: status.observedGripper === null ? 0 : 0.5,
+          value_s: descriptor.commandDurationS,
         }],
       },
     }],

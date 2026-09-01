@@ -30,4 +30,15 @@ describe('structuralResourceReducer', () => {
       message: 'Authorization failed.',
     });
   });
+
+  it('retains one coherent structural value while its replacement is read', () => {
+    const ready: StructuralResourceState<string> = {
+      status: 'ready',
+      data: 'coherent-owner-projection',
+    };
+    expect(structuralResourceReducer(ready, {
+      type: 'load',
+    })).toBe(ready);
+    expect(structuralResourceReducer(loading, { type: 'load' })).toBe(loading);
+  });
 });

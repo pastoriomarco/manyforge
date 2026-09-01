@@ -162,7 +162,7 @@ function sourceModel(): SourceModelProjection {
 
 function motionDescriptor(): ManualControlMotionDescriptor {
   return {
-    schemaVersion: 'manyforge.manual_control_motion_descriptor.v1',
+    schemaVersion: 'manyforge.manual_control_motion_descriptor.v3',
     controllableComponentId: 'robot-1',
     commandTargetId: 'arm',
     frames: [{
@@ -176,6 +176,8 @@ function motionDescriptor(): ManualControlMotionDescriptor {
       compiledJointName: 'joint-1',
       unit: 'rad',
     }],
+    operationalJointLimits: [],
+    operationalLimit: null,
   } as unknown as ManualControlMotionDescriptor;
 }
 
@@ -386,6 +388,7 @@ describe('runtime scene presentation', () => {
     const first = reader.readMeasuredRobotPresentation();
     const second = reader.readMeasuredRobotPresentation();
     expect(first).toBe(second);
+    expect(first?.observedAtNs).toBe(123_000);
     expect(reads).toBe(2);
 
     frame = { ...frame, compiledJointNames: ['fixed-tip'] };

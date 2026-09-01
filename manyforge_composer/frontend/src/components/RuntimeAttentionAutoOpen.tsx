@@ -11,6 +11,14 @@ export function unpresentedRuntimeAttention(
   return items.filter((item) => !presented.has(item.identity));
 }
 
+export function shouldCloseAutomaticRuntimeAttention(
+  automatic: boolean,
+  activePanel: 'runtime' | 'assistant' | null,
+  attentionCount: number,
+): boolean {
+  return automatic && activePanel === 'runtime' && attentionCount === 0;
+}
+
 /**
  * Opens the one runtime/alarms surface once for each new acknowledgement- or
  * dismissal-required item. Ordinary warning state is deliberately absent.

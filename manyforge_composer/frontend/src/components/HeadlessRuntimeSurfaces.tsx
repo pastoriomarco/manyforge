@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../api/client';
+import type { HistorianListQuery } from '../api/client';
 import { useShellHeadlessState } from '../hooks/useHeadlessState';
 import type {
   HeadlessStateResult,
@@ -8,7 +9,6 @@ import type {
 import type {
   AlarmLifecycleState,
   AlarmPriority,
-  HeadlessRuntimeSnapshot,
   HistorianStoredEvent,
   HistorianDetail,
   OperatorAlarmRecord,
@@ -25,9 +25,9 @@ import type {
   ExecutionHistoryEventView,
   HistoryAlarmPhase,
 } from './ExecutionHistoryPanel';
-import type { RuntimeStatusView } from './RuntimeStatusOverlay';
 import { KernelErrorPanel } from './KernelErrorPanel';
 import { useOperationalErrorMirror } from '../state/operationalErrors';
+import { OverlayPanel } from './OverlayPanel';
 
 export interface ClientOperationalError {
   id: string;
@@ -90,91 +90,40 @@ export function operatorAlarmView(alarm: OperatorAlarmRecord): OperatorAlarmView
   };
 }
 
-export function runtimeStatusView(
-  runtime: HeadlessRuntimeSnapshot,
-  context: {
-    unacknowledged: number;
-    activeAcknowledged: number;
-    programCycleState?: string;
-    executionOwnerAvailable?: boolean;
-    clientErrorCount?: number;
-  } = {
-    unacknowledged: 0,
-    activeAcknowledged: 0,
-  },
-): RuntimeStatusView {
-  const components = Object.entries(runtime.sections).map(([id, section]) => ({
-    id,
-    label: id.replaceAll(/([A-Z])/g, ' $1').replaceAll('_', ' '),
-    status: section.freshness === 'fresh'
-      ? 'healthy'
-      : section.freshness === 'stale' ? 'fault' : 'error',
-    detail: section.knownGaps.length > 0
-      ? section.knownGaps.join(', ')
-      : `${section.freshness} source generation ${section.sourceGeneration ?? 'unknown'}`,
-  }));
-  const alarmCount = context.unacknowledged + context.activeAcknowledged;
-  if (alarmCount > 0) {
-    components.push({
-      id: 'operator_alarms',
-      label: 'operator alarms',
-      status: context.unacknowledged > 0 ? 'fault' : 'warning',
-      detail: `${context.unacknowledged} acknowledgement required · ${context.activeAcknowledged} active acknowledged`,
-    });
-  }
-  if ((context.clientErrorCount ?? 0) > 0) {
-    components.push({
-      id: 'composer_client_errors',
-      label: 'Composer client errors',
-      status: 'fault',
-      detail: `${context.clientErrorCount} dismissal required`,
-    });
-  }
-  if (context.programCycleState === 'terminal_awaiting_reset') {
-    components.push({
-      id: 'program_cycle',
-      label: 'Program cycle',
-      status: 'warning',
-      detail: 'terminal; Reset is required before the next Run',
-    });
-  }
-  components.push({
-    id: 'execution_owner',
-    label: 'Execution owner',
-    status: context.executionOwnerAvailable === true ? 'healthy' : 'warning',
-    detail: context.executionOwnerAvailable === true
-      ? 'current addressed execution contract available'
-      : 'execution readiness is not asserted by the H0 runtime projection',
-  });
-  const sourcesDegraded = components.some((component) => (
-    component.status !== 'healthy'
-  ));
-  const readiness = !runtime.complete
-    ? 'offline'
-    : sourcesDegraded ? 'degraded' : 'ready';
-  return {
-    readiness,
-    summaryLabel: readiness === 'ready'
-      ? 'Application surfaces ready'
-      : readiness === 'degraded'
-        ? 'Operational attention'
-        : 'Headless sources incomplete',
-    profileLabel: 'H0 projection',
-    authorityLabel: 'source-owned facts',
-    userMessage: readiness === 'ready'
-      ? 'Current runtime and addressed execution-owner projections are available.'
-      : runtime.complete
-        ? 'One or more current backend, execution-owner, cycle, or alarm contributors requires attention.'
-        : `Missing or stale sources: ${runtime.reasons.join(', ') || 'unknown'}.`,
-    capabilities: ['runtime observation', 'scene status', 'alarm/history'],
-    components,
-  };
-}
-
 function alarmPhase(eventType: string): HistoryAlarmPhase {
   if (eventType === 'operator_alarm_activated') return 'activation';
   if (eventType === 'operator_alarm_returned') return 'return';
   if (eventType === 'operator_alarm_acknowledged') return 'acknowledgement';
+  return null;
+}
+
+const PROGRAM_RUN_ID_FIELDS = new Set(['program_run_id', 'programRunId']);
+const OPERATION_ID_FIELDS = new Set(['operation_id', 'operationId']);
+
+export function nestedHistorianIdentity(
+  value: unknown,
+  names: ReadonlySet<string>,
+): string | null {
+  const pending: Array<{ value: unknown; depth: number }> = [{ value, depth: 0 }];
+  let visited = 0;
+  while (pending.length > 0 && visited < 2_048) {
+    const current = pending.pop();
+    if (current === undefined) break;
+    visited += 1;
+    if (current.depth > 12 || current.value === null || typeof current.value !== 'object') {
+      continue;
+    }
+    if (Array.isArray(current.value)) {
+      for (const child of current.value) {
+        pending.push({ value: child, depth: current.depth + 1 });
+      }
+      continue;
+    }
+    for (const [name, child] of Object.entries(current.value as Record<string, unknown>)) {
+      if (names.has(name) && typeof child === 'string' && child.trim()) return child;
+      pending.push({ value: child, depth: current.depth + 1 });
+    }
+  }
   return null;
 }
 
@@ -195,6 +144,14 @@ export function historianEventView(
       : readableType,
     type: stored.event.eventType,
     alarmPhase: alarmPhase(stored.event.eventType),
+    programRunId: nestedHistorianIdentity(
+      stored.event.payload,
+      PROGRAM_RUN_ID_FIELDS,
+    ),
+    operationId: nestedHistorianIdentity(
+      stored.event.payload,
+      OPERATION_ID_FIELDS,
+    ),
     details: stored.event.payload,
   };
 }
@@ -273,9 +230,13 @@ export function HeadlessRuntimeSurfacesView({
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState<string | null>(null);
   const [historyEvents, setHistoryEvents] = useState<ExecutionHistoryEventView[]>([]);
+  const [historyQuery, setHistoryQuery] = useState<HistorianListQuery>({ limit: 64 });
+  const [historyNextBefore, setHistoryNextBefore] = useState<number | null>(null);
+  const [historyHasOlder, setHistoryHasOlder] = useState(false);
   const [historyDetail, setHistoryDetail] = useState<HistorianDetail | null>(null);
   const [historyDetailLoading, setHistoryDetailLoading] = useState(false);
   const [historyDetailError, setHistoryDetailError] = useState<string | null>(null);
+  const acknowledgeAllButton = useRef<HTMLButtonElement>(null);
   useEffect(() => {
     if (attentionRequest !== null) setMode('attention');
   }, [attentionRequest]);
@@ -305,16 +266,38 @@ export function HeadlessRuntimeSurfacesView({
     alarm.lifecycleState === 'active_acknowledged') ?? [];
   const attentionCount = attention.length + clientErrors.length;
   const attentionSummary = runtimeAttentionSummary(attention, clientErrors);
+  const singleClientError = attentionCount === 1 ? clientErrors[0] : undefined;
+  const singleAlarm = attentionCount === 1 ? attention[0] : undefined;
+  const attentionSeverity = clientErrors.length > 0 || attention.some(
+    (alarm) => alarm.priority === 'critical' || alarm.priority === 'high',
+  ) ? 'error' : 'warning';
   useEffect(() => {
     if (attentionCount < 2) setBulkFence(null);
   }, [attentionCount]);
 
-  const loadHistory = async () => {
+  const loadHistory = async (
+    query: HistorianListQuery = historyQuery,
+    append = false,
+  ) => {
     setHistoryLoading(true);
     setHistoryError(null);
     try {
-      const page = await api.history.list();
-      setHistoryEvents(page.events.map(historianEventView));
+      const effectiveQuery = {
+        ...query,
+        ...(append && historyNextBefore !== null
+          ? { beforeSequence: historyNextBefore }
+          : { beforeSequence: undefined }),
+      };
+      const page = await api.history.list(effectiveQuery);
+      const incoming = page.events.map(historianEventView);
+      setHistoryEvents((current) => append
+        ? [...current, ...incoming.filter((event) => (
+            !current.some((existing) => existing.id === event.id)
+          ))]
+        : incoming);
+      setHistoryQuery(query);
+      setHistoryNextBefore(page.nextBeforeSequence);
+      setHistoryHasOlder(page.truncated && page.nextBeforeSequence !== null);
     } catch (reason) {
       setHistoryError(actionErrorMessage(reason));
     } finally {
@@ -358,23 +341,26 @@ export function HeadlessRuntimeSurfacesView({
     }
   };
 
-  const confirmBulk = async () => {
+  const requestBulkConfirmation = () => {
     const members = snapshot?.alarms.unacknowledgedMembership ?? [];
     const clientErrorIds = clientErrors.map((error) => error.id);
-    if (bulkFence === null) {
-      setBulkFence({
-        alarmFence: snapshot === null || members.length === 0
-          ? null
-          : acknowledgementFence(
-              snapshot.alarms.ownerEpoch,
-              snapshot.alarms.generation,
-              members,
-            ),
-        clientErrorIds,
-      });
-      setActionError(null);
-      return;
-    }
+    setBulkFence({
+      alarmFence: snapshot === null || members.length === 0
+        ? null
+        : acknowledgementFence(
+            snapshot.alarms.ownerEpoch,
+            snapshot.alarms.generation,
+            members,
+          ),
+      clientErrorIds,
+    });
+    setActionError(null);
+  };
+
+  const confirmBulk = async () => {
+    if (bulkFence === null) return;
+    const members = snapshot?.alarms.unacknowledgedMembership ?? [];
+    const clientErrorIds = clientErrors.map((error) => error.id);
     const alarmSetChanged = bulkFence.alarmFence !== null && (
       snapshot === null
       || !acknowledgementFenceMatches(
@@ -414,7 +400,9 @@ export function HeadlessRuntimeSurfacesView({
   if (!enabled) return null;
   return (
     <section
-      className={`runtime-observability-surface ${expanded ? 'expanded' : 'collapsed'}`}
+      className={`runtime-observability-surface ${expanded ? 'expanded' : 'collapsed'}${
+        attentionCount > 0 ? ` has-attention attention-${attentionSeverity}` : ''
+      }`}
       role="dialog"
       aria-modal="false"
       aria-label="Runtime, alarms, and history"
@@ -425,14 +413,35 @@ export function HeadlessRuntimeSurfacesView({
           {attentionSummary}
         </span>
         <div className="runtime-observability-rail-actions">
-          {attentionCount > 1 && (
+          {singleClientError !== undefined && onAcknowledgeClientError !== undefined && (
             <button
               type="button"
               disabled={bulkBusy || busyActivation !== null}
-              title="Acknowledge the exact current alarm set and dismiss the exact current Composer messages. This does not change execution."
-              onClick={() => { void confirmBulk(); }}
+              title="Acknowledge this Composer message. This does not change execution."
+              onClick={() => onAcknowledgeClientError(singleClientError.id)}
             >
-              {bulkFence === null ? 'Acknowledge all' : 'Confirm all'}
+              Acknowledge
+            </button>
+          )}
+          {singleAlarm !== undefined && (
+            <button
+              type="button"
+              disabled={bulkBusy || busyActivation === singleAlarm.activationId}
+              title="Acknowledge this exact alarm activation and revision. This does not clear the condition or resume motion."
+              onClick={() => { void acknowledge(operatorAlarmView(singleAlarm)); }}
+            >
+              Acknowledge
+            </button>
+          )}
+          {attentionCount > 1 && (
+            <button
+              ref={acknowledgeAllButton}
+              type="button"
+              disabled={bulkBusy || busyActivation !== null}
+              title="Acknowledge the exact current alarm set and dismiss the exact current Composer messages. This does not change execution."
+              onClick={requestBulkConfirmation}
+            >
+              Acknowledge all
             </button>
           )}
           <button
@@ -564,7 +573,9 @@ export function HeadlessRuntimeSurfacesView({
         open={mode === 'history'}
         embedded
         onClose={() => setMode('attention')}
-        onReload={() => { void loadHistory(); }}
+        onReload={(query) => { void loadHistory(query); }}
+        onLoadOlder={() => { void loadHistory(historyQuery, true); }}
+        hasOlder={historyHasOlder}
         events={historyEvents}
         loading={historyLoading}
         error={historyError}
@@ -575,6 +586,37 @@ export function HeadlessRuntimeSurfacesView({
       />
       </div>
       )}
+      <OverlayPanel
+        open={bulkFence !== null}
+        title="Confirm acknowledge all"
+        titleId="runtime-acknowledge-all-confirmation-title"
+        compact
+        onClose={() => setBulkFence(null)}
+        returnFocusRef={acknowledgeAllButton}
+      >
+        <div className="program-dialog-copy runtime-bulk-confirmation">
+          <p>
+            Acknowledge the exact current set of {attentionCount} attention messages?
+          </p>
+          <p>
+            Active backend conditions remain active. Composer messages are dismissed.
+            This does not resume motion or otherwise change execution.
+          </p>
+          <div className="program-dialog-actions">
+            <button type="button" disabled={bulkBusy} onClick={() => setBulkFence(null)}>
+              Cancel
+            </button>
+            <button
+              type="button"
+              className="primary-action"
+              disabled={bulkBusy}
+              onClick={() => { void confirmBulk(); }}
+            >
+              {bulkBusy ? 'Acknowledging' : 'Acknowledge all'}
+            </button>
+          </div>
+        </div>
+      </OverlayPanel>
     </section>
   );
 }

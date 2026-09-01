@@ -31,6 +31,7 @@ import type { PointCloudFrame } from '../api/pointcloudObserverClient';
 import { usePointCloudFrame } from '../hooks/usePointCloudFrame';
 import { SnapshotResponder } from './SnapshotResponder';
 import {
+  MAX_AUTHORITATIVE_INTERPOLATION_MS,
   applyAuthoritativeTransformTransition,
   authoritativeInterpolationDurationMs,
   createAuthoritativeTransformTransition,
@@ -61,6 +62,7 @@ import type {
   Vector3Tuple,
 } from '../types/api';
 import type { Pose3Value } from '../types/robotControl';
+import type { ExecutionObservationTransportStatus } from '../types/viewerObservation';
 import type { SceneObjectMutationAvailability } from '../state/sceneAuthoring';
 import {
   classifyStructuralAssetFailure,
@@ -129,9 +131,12 @@ interface StructuralViewerProps {
   candidateStale?: boolean;
   candidateTcpEditable?: boolean;
   onEditCandidateTcpPose?: (pose: Pose3Value) => void;
+  candidateTcpTransformMode?: 'translate' | 'rotate';
+  candidateTcpTransformSpace?: 'local' | 'world';
   candidateRobot?: CandidateRobotPresentation | null;
   runtimePresentation?: RuntimeScenePresentation;
   executionObservationPresentation?: MeasuredRobotPresentationReader;
+  executionObservationTransport?: ExecutionObservationTransportStatus;
   sceneOwnerIdentity?: {
     ownerEpoch: string;
     generation: number;
@@ -148,13 +153,31 @@ interface StructuralViewerProps {
   viewer?: ProgramViewerMetadata;
   frameAxes?: Array<{
     linkName: string;
-    frameRoleId: string;
+    sourceLinkName: string;
+    sourceJointName: string | null;
+    viewerJointName: string | null;
+    componentId: string | null;
+    modelInstanceId: string | null;
+    frameRoleIds: string[];
+    defaultVisible: boolean;
+    poseAvailable: boolean;
   }>;
   objectAxesVisibleIds?: string[];
+  objectAxesRows?: Array<{
+    sceneResourceId: string;
+    attached: boolean;
+    poseAvailable: boolean;
+    persistent: boolean;
+    defaultVisible: boolean;
+    sourceLabel: string;
+  }>;
+  onObjectAxesVisibleIdsChange?: (ids: string[]) => void;
+  onAxesSizesCommit?: (frameSizeM: number, objectSizeM: number) => void;
   robotControlSurface?: ReactNode;
   robotControlBlocked?: boolean;
   objectControlSurface?: ReactNode;
   transportControls?: ReactNode;
+  runtimeOverlay?: ReactNode;
   inspectorTarget?: HTMLElement | null;
   inspectorMinimized?: boolean;
   onInspectorMinimizedChange?: (minimized: boolean) => void;
@@ -183,6 +206,59 @@ interface ViewerFailureBoundaryState {
 
 export const DEFAULT_WIREFRAME_VISIBLE = false;
 export const DEFAULT_COMPARISON_GHOST_VISIBLE = false;
+
+export type SceneObjectAppearance =
+  | 'authoritative'
+  | 'draft'
+  | 'attached'
+  | 'comparison';
+
+export function sceneObjectMaterial(
+  appearance: SceneObjectAppearance,
+  selected: boolean,
+): {
+  color: string;
+  emissive: string;
+  opacity: number;
+  transparent: boolean;
+  renderOrder: number;
+} {
+  if (selected) return {
+    color: '#65d3f2',
+    emissive: '#144c62',
+    opacity: 1,
+    transparent: false,
+    renderOrder: 12,
+  };
+  if (appearance === 'attached') return {
+    color: '#5fa84a',
+    emissive: '#173d16',
+    opacity: 0.85,
+    transparent: true,
+    renderOrder: 13,
+  };
+  if (appearance === 'draft') return {
+    color: '#e4ac55',
+    emissive: '#573411',
+    opacity: 0.62,
+    transparent: true,
+    renderOrder: 14,
+  };
+  if (appearance === 'comparison') return {
+    color: '#43d7ec',
+    emissive: '#0c5060',
+    opacity: 0.45,
+    transparent: true,
+    renderOrder: 16,
+  };
+  return {
+    color: '#8c6fe0',
+    emissive: '#251a48',
+    opacity: 1,
+    transparent: false,
+    renderOrder: 8,
+  };
+}
 
 export function supportsIndependentSceneScale(
   object: LogicalSceneObject | null,
@@ -246,6 +322,21 @@ function authoritativeStreamIdentity(
     ownerIdentity?.ownerEpoch ?? 'unbound-owner',
     ownerIdentity?.generation ?? -1,
     ...parts,
+  ]);
+}
+
+function measuredRobotStreamIdentity(
+  manifestModelKey: string,
+  presentation: NonNullable<RuntimeScenePresentation['measuredRobot']>,
+): string {
+  // The logical-scene generation is intentionally absent. Robot motion is
+  // owned by the exact execution observation stream and retained model; a
+  // scene attachment/revision must not restart or snap that motion stream.
+  return JSON.stringify([
+    manifestModelKey,
+    presentation.objectId,
+    presentation.sourceId,
+    presentation.sourceEpoch,
   ]);
 }
 
@@ -433,17 +524,19 @@ function disposeOwnedMaterials(root: THREE.Object3D): void {
 
 function SceneObjectMeshAsset({
   url,
-  attached,
-  measured,
+  appearance,
   selected,
   wireframe,
 }: {
   url: string;
-  attached: boolean;
-  measured: boolean;
+  appearance: SceneObjectAppearance;
   selected: boolean;
   wireframe: boolean;
 }) {
+  const presentation = useMemo(
+    () => sceneObjectMaterial(appearance, selected),
+    [appearance, selected],
+  );
   const gltf = useGLTF(resolveStructuralAssetUrl(url));
   const clone = useMemo(() => {
     const root = gltf.scene.clone(true);
@@ -455,24 +548,20 @@ function SceneObjectMeshAsset({
         : [mesh.material];
       const materials = sources.map((source) => {
         const material = source.clone() as THREE.MeshStandardMaterial;
-        material.color?.set(
-          attached ? '#5fa84a' : measured ? '#43d7ec' : selected ? '#65d3f2' : '#8c6fe0',
-        );
-        material.emissive?.set(
-          attached ? '#173d16' : measured ? '#0c5060' : selected ? '#144c62' : '#251a48',
-        );
-        material.transparent = true;
-        material.opacity = attached ? 0.85 : measured ? 0.55 : selected ? 0.9 : 0.82;
+        material.color?.set(presentation.color);
+        material.emissive?.set(presentation.emissive);
+        material.transparent = presentation.transparent || wireframe;
+        material.opacity = presentation.opacity;
         material.wireframe = wireframe;
-        material.depthWrite = !wireframe;
+        material.depthWrite = !material.transparent;
         material.side = THREE.DoubleSide;
         return material;
       });
       mesh.material = Array.isArray(mesh.material) ? materials : materials[0];
-      mesh.renderOrder = attached ? 13 : measured ? 16 : selected ? 12 : 8;
+      mesh.renderOrder = presentation.renderOrder;
     });
     return root;
-  }, [attached, gltf.scene, measured, selected, wireframe]);
+  }, [gltf.scene, presentation, wireframe]);
   useEffect(() => () => disposeOwnedMaterials(clone), [clone]);
   return <primitive object={clone} />;
 }
@@ -481,16 +570,14 @@ function SceneObjectMesh({
   shape,
   ownerIdentity,
   draftIdentity,
-  attached = false,
-  measured,
+  appearance = 'authoritative',
   selected,
   wireframe,
 }: {
   shape: Extract<LogicalSceneShape, { type: 'mesh' }>;
   ownerIdentity?: NonNullable<StructuralViewerProps['sceneOwnerIdentity']>;
   draftIdentity?: NonNullable<StructuralViewerProps['programDraftIdentity']>;
-  attached?: boolean;
-  measured: boolean;
+  appearance?: SceneObjectAppearance;
   selected: boolean;
   wireframe: boolean;
 }) {
@@ -577,8 +664,7 @@ function SceneObjectMesh({
         <Suspense fallback={null}>
           <SceneObjectMeshAsset
             url={url}
-            attached={attached}
-            measured={measured}
+            appearance={appearance}
             selected={selected}
             wireframe={wireframe}
           />
@@ -864,28 +950,19 @@ export function AttachedLogicalSceneObject({
               key={`attached:${object.scene_resource_id}:${index}`}
               shape={shape}
               ownerIdentity={ownerIdentity}
-              attached
-              measured={false}
+              appearance="attached"
               selected={selected}
               wireframe={wireframe}
             />
           )
         : (
-            <mesh
+            <SceneObjectPrimitive
               key={`attached:${object.scene_resource_id}:${index}`}
-              rotation={shape.type === 'cylinder' ? [Math.PI / 2, 0, 0] : undefined}
-              renderOrder={13}
-            >
-              <LogicalShapeGeometry shape={shape} />
-              <meshStandardMaterial
-                color="#5fa84a"
-                emissive="#173d16"
-                transparent
-                opacity={0.85}
-                wireframe={wireframe}
-                depthWrite={!wireframe}
-              />
-            </mesh>
+              shape={shape}
+              appearance="attached"
+              selected={selected}
+              wireframe={wireframe}
+            />
           ))}
       {(selected || axesVisible) && (
         <axesHelper args={[axesSizeM]} raycast={ignoreViewerRaycast} />
@@ -907,12 +984,14 @@ function MeasuredRuntimeModel({
   latestFrameAppliers,
   frameAxesByLink,
   frameAxesSizeM,
+  objectAxesSizeM,
   selectedStructureName,
   selectedSceneResourceId,
   objectAxesVisibleIds,
   onSelect,
   onSelectSceneResource,
   onAssetError,
+  softwareRenderer,
 }: {
   manifest: SceneUrdfManifest;
   presentation: NonNullable<RuntimeScenePresentation['measuredRobot']>;
@@ -926,6 +1005,7 @@ function MeasuredRuntimeModel({
   latestFrameAppliers: Set<() => void>;
   frameAxesByLink: ReadonlySet<string>;
   frameAxesSizeM: number;
+  objectAxesSizeM: number;
   selectedStructureName: string | null;
   selectedSceneResourceId: string | null;
   objectAxesVisibleIds: ReadonlySet<string>;
@@ -935,8 +1015,24 @@ function MeasuredRuntimeModel({
     sceneResourceId: string,
   ) => void;
   onAssetError: (error: Error) => void;
+  softwareRenderer: boolean;
 }) {
   const reported = useRef(false);
+  const linkGroups = useMemo(() => new Map(
+    manifest.links.map((link) => [
+      link.name,
+      { current: null as THREE.Group | null },
+    ]),
+  ), [manifest]);
+  const attachedObjectsByLink = useMemo(() => {
+    const result = new Map<string, AttachedObjectPresentation[]>();
+    for (const object of attachedObjects) {
+      const current = result.get(object.carrierCompiledFrameName) ?? [];
+      current.push(object);
+      result.set(object.carrierCompiledFrameName, current);
+    }
+    return result;
+  }, [attachedObjects]);
   useEffect(() => {
     const startedAtMs = materializationStartedAtMs.current;
     if (reported.current || startedAtMs === null) return;
@@ -945,26 +1041,33 @@ function MeasuredRuntimeModel({
   }, [materializationStartedAtMs, onMaterialized]);
   return (
     <group name={`owner-measured-robot:${presentation.objectId}`}>
+      <MeasuredRobotFrameDriver
+        manifestModelKey={manifest.model_key}
+        linkGroups={linkGroups}
+        presentation={presentation}
+        livePresentation={livePresentation}
+        latestFrameAppliers={latestFrameAppliers}
+        interpolationDurationMs={softwareRenderer
+          ? 0
+          : MAX_AUTHORITATIVE_INTERPOLATION_MS}
+      />
       {manifest.links.map((link) => {
         const transform = presentation.linkTransforms[link.name];
         if (transform === undefined) return null;
         return (
           <MeasuredRuntimeLink
             key={`measured:${manifest.model_key}:${link.name}`}
-            manifestModelKey={manifest.model_key}
             link={link}
-            presentation={presentation}
-            livePresentation={livePresentation}
-            attachedObjects={attachedObjects.filter(
-              (object) => object.carrierCompiledFrameName === link.name,
-            )}
+            initialTransform={transform}
+            groupRef={linkGroups.get(link.name)!}
+            attachedObjects={attachedObjectsByLink.get(link.name) ?? []}
             ownerIdentity={ownerIdentity}
-            latestFrameAppliers={latestFrameAppliers}
             collisionsVisible={collisionsVisible}
             wireframe={wireframe}
             frameAxesVisible={selectedStructureName === link.name
               || frameAxesByLink.has(link.name)}
             frameAxesSizeM={frameAxesSizeM}
+            objectAxesSizeM={objectAxesSizeM}
             selectedSceneResourceId={selectedSceneResourceId}
             objectAxesVisibleIds={objectAxesVisibleIds}
             onSelect={onSelect}
@@ -977,35 +1080,215 @@ function MeasuredRuntimeModel({
   );
 }
 
-function MeasuredRuntimeLink({
+/**
+ * One measured-robot data-plane consumer. It applies every link from the same
+ * admitted owner sample before one demand-render wake, so links cannot tear or
+ * race one another and slower shell projections cannot overwrite live motion.
+ */
+function MeasuredRobotFrameDriver({
   manifestModelKey,
-  link,
+  linkGroups,
   presentation,
   livePresentation,
+  latestFrameAppliers,
+  interpolationDurationMs,
+}: {
+  manifestModelKey: string;
+  linkGroups: ReadonlyMap<string, { current: THREE.Group | null }>;
+  presentation: NonNullable<RuntimeScenePresentation['measuredRobot']>;
+  livePresentation?: MeasuredRobotPresentationReader;
+  latestFrameAppliers: Set<() => void>;
+  interpolationDurationMs: number;
+}) {
+  const previous = useRef(new Map<string, AuthoritativeTransformFrame>());
+  const active = useRef(new Map<string, AuthoritativeTransformTransition>());
+  const acceptedLiveFrame = useRef(false);
+  const continuationTimer = useRef<number | null>(null);
+  const invalidate = useThree((state) => state.invalidate);
+  const wake = useCallback(() => {
+    if (continuationTimer.current !== null) {
+      window.clearTimeout(continuationTimer.current);
+      continuationTimer.current = null;
+    }
+    invalidate();
+  }, [invalidate]);
+
+  const acceptPresentation = useCallback((
+    next: NonNullable<RuntimeScenePresentation['measuredRobot']>,
+  ) => {
+    // Admit the robot as one coherent batch. A partial transform set must not
+    // move a subset of links and visually invent a torn robot state.
+    for (const [linkName, target] of linkGroups) {
+      if (target.current !== null && next.linkTransforms[linkName] === undefined) {
+        return;
+      }
+    }
+
+    const streamIdentity = measuredRobotStreamIdentity(manifestModelKey, next);
+    let changed = false;
+    for (const [linkName, target] of linkGroups) {
+      const group = target.current;
+      const transform = next.linkTransforms[linkName];
+      if (group === null || transform === undefined) continue;
+      const frame: AuthoritativeTransformFrame = {
+        streamIdentity: `${streamIdentity}:${linkName}`,
+        sourceSequence: next.sourceSequence,
+        observedAtNs: next.observedAtNs,
+        positionM: transform.position_m,
+        orientationXyzw: transform.orientation_xyzw,
+      };
+      const prior = previous.current.get(linkName) ?? null;
+      if (prior !== null && sameAuthoritativeTransformFrame(prior, frame)) continue;
+      if (
+        prior !== null
+        && authoritativeInterpolationDurationMs(prior, frame) > 0
+        && sameAuthoritativeTransformPose(prior, frame)
+      ) {
+        previous.current.set(linkName, frame);
+        continue;
+      }
+      const transition = interpolationDurationMs > 0
+        ? createAuthoritativeTransformTransition(
+          prior,
+          frame,
+          group.position,
+          group.quaternion,
+          performance.now(),
+        )
+        : null;
+      previous.current.set(linkName, frame);
+      if (transition === null) {
+        const orientation = normalizeQuaternion(frame.orientationXyzw);
+        group.position.set(...frame.positionM);
+        group.quaternion.set(...orientation);
+        active.current.delete(linkName);
+      } else {
+        // Old main's proven robot presentation used one fixed 50 ms hardware
+        // transition. Source timestamps still decide eligibility; the fixed
+        // visual window avoids turning transport jitter into varying speed.
+        transition.durationMs = interpolationDurationMs;
+        active.current.set(linkName, transition);
+      }
+      changed = true;
+    }
+    if (changed) wake();
+  }, [interpolationDurationMs, linkGroups, manifestModelKey, wake]);
+
+  const acceptLatestLivePresentation = useCallback(() => {
+    const current = livePresentation?.readMeasuredRobotPresentation() ?? null;
+    if (current === null) return false;
+    acceptedLiveFrame.current = true;
+    acceptPresentation(current);
+    return true;
+  }, [acceptPresentation, livePresentation]);
+
+  const applyLatestFrame = useCallback(() => {
+    acceptLatestLivePresentation();
+    if (active.current.size === 0) return;
+    for (const [linkName, transition] of active.current) {
+      const group = linkGroups.get(linkName)?.current ?? null;
+      if (group === null) continue;
+      group.position.copy(transition.toPosition);
+      group.quaternion.copy(transition.toQuaternion);
+    }
+    active.current.clear();
+    wake();
+  }, [acceptLatestLivePresentation, linkGroups, wake]);
+
+  useLayoutEffect(() => {
+    previous.current.clear();
+    active.current.clear();
+    acceptedLiveFrame.current = false;
+  }, [linkGroups, manifestModelKey]);
+
+  useLayoutEffect(() => {
+    // The slower structural/runtime projection is bootstrap-only after the
+    // dedicated observation stream has supplied its first exact frame.
+    if (!acceptLatestLivePresentation() && !acceptedLiveFrame.current) {
+      acceptPresentation(presentation);
+    }
+  }, [acceptLatestLivePresentation, acceptPresentation, presentation]);
+
+  useLayoutEffect(() => {
+    if (livePresentation === undefined) return undefined;
+    const apply = () => { acceptLatestLivePresentation(); };
+    apply();
+    return livePresentation.subscribeMeasuredRobotPresentation(apply);
+  }, [acceptLatestLivePresentation, livePresentation]);
+
+  useLayoutEffect(() => {
+    latestFrameAppliers.add(applyLatestFrame);
+    return () => {
+      latestFrameAppliers.delete(applyLatestFrame);
+    };
+  }, [applyLatestFrame, latestFrameAppliers]);
+
+  useEffect(() => () => {
+    if (continuationTimer.current !== null) {
+      window.clearTimeout(continuationTimer.current);
+      continuationTimer.current = null;
+    }
+  }, []);
+
+  useFrame(() => {
+    if (active.current.size === 0) return;
+    const nowMs = performance.now();
+    let pending = false;
+    for (const [linkName, transition] of active.current) {
+      const group = linkGroups.get(linkName)?.current ?? null;
+      if (group === null) {
+        active.current.delete(linkName);
+        continue;
+      }
+      if (applyAuthoritativeTransformTransition(
+        transition,
+        nowMs,
+        group.position,
+        group.quaternion,
+      )) active.current.delete(linkName);
+      else pending = true;
+    }
+    if (pending && continuationTimer.current === null) {
+      continuationTimer.current = window.setTimeout(() => {
+        continuationTimer.current = null;
+        invalidate();
+      }, 1_000 / 60);
+    }
+  }, -1_000);
+
+  return null;
+}
+
+function MeasuredRuntimeLink({
+  link,
+  initialTransform,
+  groupRef,
   attachedObjects,
   ownerIdentity,
-  latestFrameAppliers,
   collisionsVisible,
   wireframe,
   frameAxesVisible,
   frameAxesSizeM,
+  objectAxesSizeM,
   selectedSceneResourceId,
   objectAxesVisibleIds,
   onSelect,
   onSelectSceneResource,
   onAssetError,
 }: {
-  manifestModelKey: string;
   link: SceneUrdfManifest['links'][number];
-  presentation: NonNullable<RuntimeScenePresentation['measuredRobot']>;
-  livePresentation?: MeasuredRobotPresentationReader;
+  initialTransform: {
+    position_m: Vector3Tuple;
+    orientation_xyzw: QuaternionXyzwTuple;
+  };
+  groupRef: { current: THREE.Group | null };
   attachedObjects: AttachedObjectPresentation[];
   ownerIdentity: StructuralViewerProps['sceneOwnerIdentity'];
-  latestFrameAppliers: Set<() => void>;
   collisionsVisible: boolean;
   wireframe: boolean;
   frameAxesVisible: boolean;
   frameAxesSizeM: number;
+  objectAxesSizeM: number;
   selectedSceneResourceId: string | null;
   objectAxesVisibleIds: ReadonlySet<string>;
   onSelect: (event: ThreeEvent<MouseEvent>, structureName: string) => void;
@@ -1015,49 +1298,12 @@ function MeasuredRuntimeLink({
   ) => void;
   onAssetError: (error: Error) => void;
 }) {
-  const initialTransform = presentation.linkTransforms[link.name];
-  const liveFrame = useMemo(() => livePresentation === undefined ? undefined : ({
-    read: (): AuthoritativeTransformFrame | null => {
-      const current = livePresentation.readMeasuredRobotPresentation();
-      const transform = current?.linkTransforms[link.name];
-      if (current === null || transform === undefined) return null;
-      return {
-        streamIdentity: authoritativeStreamIdentity(
-          ownerIdentity,
-          'robot',
-          manifestModelKey,
-          current.objectId,
-          current.sourceId,
-          current.sourceEpoch,
-          link.name,
-        ),
-        sourceSequence: current.sourceSequence,
-        observedAtNs: current.observedAtNs,
-        positionM: transform.position_m,
-        orientationXyzw: transform.orientation_xyzw,
-      };
-    },
-    subscribe: livePresentation.subscribeMeasuredRobotPresentation,
-  }), [livePresentation, link.name, manifestModelKey, ownerIdentity]);
-  if (initialTransform === undefined) return null;
   return (
-    <AuthoritativeTransformGroup
+    <group
+      ref={groupRef}
       name={`measured:${link.name}`}
-      streamIdentity={authoritativeStreamIdentity(
-        ownerIdentity,
-        'robot',
-        manifestModelKey,
-        presentation.objectId,
-        presentation.sourceId,
-        presentation.sourceEpoch,
-        link.name,
-      )}
-      sourceSequence={presentation.sourceSequence}
-      observedAtNs={presentation.observedAtNs}
-      positionM={initialTransform.position_m}
-      orientationXyzw={initialTransform.orientation_xyzw}
-      liveFrame={liveFrame}
-      latestFrameAppliers={latestFrameAppliers}
+      position={initialTransform.position_m}
+      quaternion={normalizeQuaternion(initialTransform.orientation_xyzw)}
       onClick={(event) => onSelect(event, link.name)}
     >
       <group>
@@ -1084,14 +1330,14 @@ function MeasuredRuntimeLink({
             presentation={object}
             selected={selectedSceneResourceId === object.object.scene_resource_id}
             axesVisible={objectAxesVisibleIds.has(object.object.scene_resource_id)}
-            axesSizeM={frameAxesSizeM}
+            axesSizeM={objectAxesSizeM}
             wireframe={wireframe}
             ownerIdentity={ownerIdentity}
             onSelect={onSelectSceneResource}
           />
         ))}
       </group>
-    </AuthoritativeTransformGroup>
+    </group>
   );
 }
 
@@ -1172,6 +1418,36 @@ function LogicalShapeGeometry({ shape }: { shape: LogicalSceneShape }) {
     );
   }
   return null;
+}
+
+function SceneObjectPrimitive({
+  shape,
+  appearance,
+  selected,
+  wireframe,
+}: {
+  shape: Exclude<LogicalSceneShape, { type: 'mesh' }>;
+  appearance: SceneObjectAppearance;
+  selected: boolean;
+  wireframe: boolean;
+}) {
+  const material = sceneObjectMaterial(appearance, selected);
+  return (
+    <mesh
+      rotation={shape.type === 'cylinder' ? [Math.PI / 2, 0, 0] : undefined}
+      renderOrder={material.renderOrder}
+    >
+      <LogicalShapeGeometry shape={shape} />
+      <meshStandardMaterial
+        color={material.color}
+        emissive={material.emissive}
+        transparent={material.transparent || wireframe}
+        opacity={material.opacity}
+        wireframe={wireframe}
+        depthWrite={!material.transparent && !wireframe}
+      />
+    </mesh>
+  );
 }
 
 type SceneTransformMode = 'translate' | 'rotate' | 'scale';
@@ -1305,6 +1581,7 @@ function EditableLogicalSceneObject({
 
 function LogicalSceneObjects({
   objects,
+  appearance,
   selectedSceneResourceId,
   onSelect,
   axesSizeM,
@@ -1321,6 +1598,7 @@ function LogicalSceneObjects({
   onContextPointerDown,
 }: {
   objects: LogicalSceneObject[];
+  appearance: Extract<SceneObjectAppearance, 'authoritative' | 'draft'>;
   selectedSceneResourceId: string | null;
   onSelect: (event: ThreeEvent<MouseEvent>, sceneResourceId: string) => void;
   axesSizeM: number;
@@ -1340,7 +1618,7 @@ function LogicalSceneObjects({
   ) => void;
 }) {
   return (
-    <group name="owner-logical-scene">
+    <group name={appearance === 'draft' ? 'program-draft-scene' : 'owner-logical-scene'}>
       {objects.map((object) => {
         if (object.placement.kind !== 'cell_fixed') return null;
         const selected = selectedSceneResourceId === object.scene_resource_id;
@@ -1365,28 +1643,20 @@ function LogicalSceneObjects({
                     shape={shape}
                     ownerIdentity={ownerIdentity}
                     draftIdentity={draftIdentity}
-                    measured={false}
+                    appearance={appearance}
                     selected={selected}
                     wireframe={wireframe}
                   />
                 )
               : (
-                  <mesh
+                  <SceneObjectPrimitive
                     // Three cylinders use Y as their long axis; scene shapes use Z.
-                    rotation={shape.type === 'cylinder' ? [Math.PI / 2, 0, 0] : undefined}
                     key={`${object.scene_resource_id}:${index}`}
-                    renderOrder={selected ? 12 : 8}
-                  >
-                    <LogicalShapeGeometry shape={shape} />
-                    <meshStandardMaterial
-                      color={selected ? '#65d3f2' : '#8c6fe0'}
-                      emissive={selected ? '#144c62' : '#251a48'}
-                      transparent
-                      opacity={selected ? 0.9 : 0.82}
-                      wireframe={wireframe}
-                      depthWrite={!wireframe}
-                    />
-                  </mesh>
+                    shape={shape}
+                    appearance={appearance}
+                    selected={selected}
+                    wireframe={wireframe}
+                  />
                 ))}
             {(selected || objectAxesVisibleIds.has(object.scene_resource_id))
               && <axesHelper args={[axesSizeM]} raycast={ignoreViewerRaycast} />}
@@ -1397,12 +1667,15 @@ function LogicalSceneObjects({
   );
 }
 
-function MeasuredLogicalSceneObjects({
+function ObservedLogicalSceneObjects({
   objects,
   presentation,
   wireframe,
   ownerIdentity,
   latestFrameAppliers,
+  selectedSceneResourceId,
+  objectAxesVisibleIds,
+  axesSizeM,
   onSelect,
 }: {
   objects: LogicalSceneObject[];
@@ -1410,20 +1683,24 @@ function MeasuredLogicalSceneObjects({
   wireframe: boolean;
   ownerIdentity: StructuralViewerProps['sceneOwnerIdentity'];
   latestFrameAppliers: Set<() => void>;
+  selectedSceneResourceId: string | null;
+  objectAxesVisibleIds: ReadonlySet<string>;
+  axesSizeM: number;
   onSelect: (event: ThreeEvent<MouseEvent>, sceneResourceId: string) => void;
 }) {
   const objectById = new Map(
     objects.map((object) => [object.scene_resource_id, object]),
   );
   return (
-    <group name="owner-measured-scene">
+    <group name="owner-observed-scene">
       {presentation.measuredObjects.map((measurement) => {
         const object = objectById.get(measurement.objectId);
         if (object === undefined || object.placement.kind !== 'cell_fixed') return null;
+        const selected = selectedSceneResourceId === measurement.objectId;
         return (
           <AuthoritativeTransformGroup
-            key={`measured-scene:${measurement.objectId}`}
-            name={`measured-scene:${measurement.objectId}`}
+            key={`observed-scene:${measurement.objectId}`}
+            name={`observed-scene:${measurement.objectId}`}
             streamIdentity={authoritativeStreamIdentity(
               ownerIdentity,
               'scene-object',
@@ -1443,31 +1720,26 @@ function MeasuredLogicalSceneObjects({
               {object.collision_shapes.map((shape, index) => shape.type === 'mesh'
                 ? ownerIdentity === undefined ? null : (
                     <SceneObjectMesh
-                      key={`measured-scene:${measurement.objectId}:${index}`}
+                      key={`observed-scene:${measurement.objectId}:${index}`}
                       shape={shape}
                       ownerIdentity={ownerIdentity}
-                      measured
-                      selected={false}
+                      appearance="authoritative"
+                      selected={selected}
                       wireframe={wireframe}
                     />
                   )
                 : (
-                    <mesh
-                      key={`measured-scene:${measurement.objectId}:${index}`}
-                      rotation={shape.type === 'cylinder' ? [Math.PI / 2, 0, 0] : undefined}
-                      renderOrder={16}
-                    >
-                      <LogicalShapeGeometry shape={shape} />
-                      <meshStandardMaterial
-                        color="#43d7ec"
-                        emissive="#0c5060"
-                        transparent
-                        opacity={0.55}
-                        wireframe={wireframe}
-                        depthWrite={!wireframe}
-                      />
-                    </mesh>
+                    <SceneObjectPrimitive
+                      key={`observed-scene:${measurement.objectId}:${index}`}
+                      shape={shape}
+                      appearance="authoritative"
+                      selected={selected}
+                      wireframe={wireframe}
+                    />
                   ))}
+              {(selected || objectAxesVisibleIds.has(measurement.objectId)) && (
+                <axesHelper args={[axesSizeM]} raycast={ignoreViewerRaycast} />
+              )}
             </group>
           </AuthoritativeTransformGroup>
         );
@@ -1555,8 +1827,8 @@ function CandidateTcpGhost({
         <mesh renderOrder={20}>
           <sphereGeometry args={[Math.max(axesSizeM * 0.08, 0.006), 18, 12]} />
           <meshStandardMaterial
-            color={stale ? '#e0a45c' : '#74e3b2'}
-            emissive={stale ? '#5a3216' : '#164f3d'}
+            color={stale ? '#ef766f' : '#b7a2ff'}
+            emissive={stale ? '#621d22' : '#38236f'}
             transparent
             opacity={0.82}
             depthWrite={false}
@@ -1649,9 +1921,9 @@ function MeasuredTcpMarker({
         <meshStandardMaterial
           color="#43d7ec"
           emissive="#0c5060"
-          transparent
-          opacity={0.88}
-          depthWrite={false}
+          transparent={false}
+          opacity={1}
+          depthWrite
         />
       </mesh>
       <axesHelper args={[axesSizeM]} raycast={ignoreViewerRaycast} />
@@ -1839,6 +2111,7 @@ export function frameableContentBounds(root: THREE.Object3D): THREE.Box3 {
       !object.visible
       || (object as THREE.Object3D & { isTransformControls?: boolean })
         .isTransformControls === true
+      || object.type === 'AxesHelper'
     ) return;
     const bounded = object as THREE.Object3D & {
       boundingBox?: THREE.Box3 | null;
@@ -1879,10 +2152,12 @@ function clipCameraToBounds(
 
 function CameraCommand({
   request,
+  contentRevision,
   defaultPresentation,
   onPresentation,
 }: {
   request: CameraCommandRequest;
+  contentRevision: string;
   defaultPresentation: RetainedCameraPresentation;
   onPresentation: (presentation: RetainedCameraPresentation) => void;
 }) {
@@ -1890,7 +2165,6 @@ function CameraCommand({
   const processed = useRef(0);
   useEffect(() => {
     if (request.id === 0 || processed.current === request.id) return;
-    processed.current = request.id;
     const frameContent = scene.getObjectByName('viewer-frame-content');
     const perspective = camera as THREE.PerspectiveCamera;
     if (request.kind === 'reset') {
@@ -1906,19 +2180,21 @@ function CameraCommand({
       orbit?.update?.();
       onPresentation(defaultPresentation);
       invalidate();
+      processed.current = request.id;
       return;
     }
     let framedObject: THREE.Object3D | undefined;
     if (request.kind === 'frame_selection' && request.target !== null) {
       framedObject = request.target.kind === 'scene_resource'
         ? scene.getObjectByName(`scene:${request.target.id}`)
+          ?? scene.getObjectByName(`observed-scene:${request.target.id}`)
         : scene.getObjectByName(`measured:${request.target.id}`)
           ?? scene.getObjectByName(`link:${request.target.id}`);
       if (framedObject === undefined) return;
     }
     const framedBounds = framedObject === undefined
       ? frameContent === undefined ? null : frameableContentBounds(frameContent)
-      : new THREE.Box3().setFromObject(framedObject);
+      : frameableContentBounds(framedObject);
     if (framedBounds === null || framedBounds.isEmpty()) return;
     const orbit = controls as { target?: THREE.Vector3; update?: () => void } | null;
     const currentTarget = orbit?.target ?? new THREE.Vector3(...defaultPresentation.camera.target);
@@ -1937,8 +2213,10 @@ function CameraCommand({
     orbit?.update?.();
     onPresentation(presentation);
     invalidate();
+    processed.current = request.id;
   }, [
     camera,
+    contentRevision,
     controls,
     defaultPresentation,
     invalidate,
@@ -2009,6 +2287,7 @@ function ViewerCanvas({
   onAssetError,
   onIsolatedAssetError,
   sceneObjects,
+  programDraftPreview,
   selectedSceneResourceId,
   onSelectSceneResource,
   selectedStructureName,
@@ -2017,6 +2296,8 @@ function ViewerCanvas({
   candidateStale,
   candidateTcpEditable,
   onEditCandidateTcpPose,
+  candidateTcpTransformMode,
+  candidateTcpTransformSpace,
   candidateRobot,
   runtimePresentation,
   executionObservationPresentation,
@@ -2029,6 +2310,7 @@ function ViewerCanvas({
   frameAxes,
   objectAxesVisibleIds,
   cameraPresentation,
+  cameraContentRevision,
   onModelMaterialized,
   onViewerCommit,
   transformMode,
@@ -2047,6 +2329,7 @@ function ViewerCanvas({
   onAssetError: (error: Error) => void;
   onIsolatedAssetError: (error: Error) => void;
   sceneObjects: LogicalSceneObject[];
+  programDraftPreview: boolean;
   selectedSceneResourceId: string | null;
   onSelectSceneResource: (sceneResourceId: string | null) => void;
   selectedStructureName: string | null;
@@ -2055,6 +2338,8 @@ function ViewerCanvas({
   candidateStale: boolean;
   candidateTcpEditable: boolean;
   onEditCandidateTcpPose: (pose: Pose3Value) => void;
+  candidateTcpTransformMode: 'translate' | 'rotate';
+  candidateTcpTransformSpace: 'local' | 'world';
   candidateRobot: CandidateRobotPresentation | null;
   runtimePresentation: RuntimeScenePresentation | undefined;
   executionObservationPresentation: MeasuredRobotPresentationReader | undefined;
@@ -2067,6 +2352,7 @@ function ViewerCanvas({
   frameAxes: NonNullable<StructuralViewerProps['frameAxes']>;
   objectAxesVisibleIds: ReadonlySet<string>;
   cameraPresentation: RetainedCameraPresentationStore;
+  cameraContentRevision: string;
   onModelMaterialized: (durationMs: number) => void;
   onViewerCommit: (
     id: string,
@@ -2095,6 +2381,12 @@ function ViewerCanvas({
     ...selectViewerPresentationProfile(false, devicePixelRatio),
   }));
   const retainedCameraPresentation = cameraPresentation.read();
+  const observedSceneResourceIds = useMemo(
+    () => new Set(
+      runtimePresentation?.measuredObjects.map((item) => item.objectId) ?? [],
+    ),
+    [runtimePresentation?.measuredObjects],
+  );
   const selectedCamera = retainedCameraPresentation.camera;
   const captureCameraPresentation = useCallback((
     presentation: RetainedCameraPresentation,
@@ -2309,6 +2601,7 @@ function ViewerCanvas({
       <CaptureCameraPresentation store={cameraPresentation} />
       <CameraCommand
         request={cameraCommand}
+        contentRevision={cameraContentRevision}
         defaultPresentation={{
           camera: {
             position: [...DEFAULT_VIEWER_CAMERA.position],
@@ -2352,19 +2645,24 @@ function ViewerCanvas({
                     latestFrameAppliers={latestFrameAppliers}
                     frameAxesByLink={frameAxesByLink}
                     frameAxesSizeM={viewer?.frame_gizmo_size_m ?? 0.1}
+                    objectAxesSizeM={viewer?.object_axes_gizmo_size_m ?? 0.1}
                     selectedStructureName={selectedStructureName}
                     selectedSceneResourceId={selectedSceneResourceId}
                     objectAxesVisibleIds={objectAxesVisibleIds}
                     onSelect={selectStructure}
                     onSelectSceneResource={selectSceneResource}
                     onAssetError={onIsolatedAssetError}
+                    softwareRenderer={renderer.software}
                   />
                 )}
             </Suspense>
           </AssetErrorBoundary>
         )}
         <LogicalSceneObjects
-          objects={sceneObjects}
+          objects={sceneObjects.filter(
+            (object) => !observedSceneResourceIds.has(object.scene_resource_id),
+          )}
+          appearance={programDraftPreview ? 'draft' : 'authoritative'}
           selectedSceneResourceId={selectedSceneResourceId}
           onSelect={selectSceneResource}
           axesSizeM={viewer?.object_axes_gizmo_size_m ?? 0.1}
@@ -2381,12 +2679,15 @@ function ViewerCanvas({
           onContextPointerDown={registerContextPointer}
         />
         {runtimePresentation !== undefined && (
-          <MeasuredLogicalSceneObjects
+          <ObservedLogicalSceneObjects
             objects={sceneObjects}
             presentation={runtimePresentation}
             wireframe={wireframeVisible}
             ownerIdentity={sceneOwnerIdentity}
             latestFrameAppliers={latestFrameAppliers}
+            selectedSceneResourceId={selectedSceneResourceId}
+            objectAxesVisibleIds={objectAxesVisibleIds}
+            axesSizeM={viewer?.object_axes_gizmo_size_m ?? 0.1}
             onSelect={selectSceneResource}
           />
         )}
@@ -2399,20 +2700,19 @@ function ViewerCanvas({
             latestFrameAppliers={latestFrameAppliers}
           />
         )}
-        {candidateTcpPose !== null && (
+        {candidateTcpPose !== null && robotEditorActive && (
           <CandidateTcpGhost
             pose={candidateTcpPose}
             stale={candidateStale}
             axesSizeM={viewer?.frame_gizmo_size_m ?? 0.1}
-            editable={candidateTcpEditable && robotEditorActive
-              && transformMode !== 'scale'}
-            transformMode={transformMode === 'rotate' ? 'rotate' : 'translate'}
-            transformSpace={transformSpace}
+            editable={candidateTcpEditable && robotEditorActive}
+            transformMode={candidateTcpTransformMode}
+            transformSpace={candidateTcpTransformSpace}
             onEdit={onEditCandidateTcpPose}
             onTransformDraggingChange={setTransformDragging}
           />
         )}
-        {manifest !== null && candidateRobot !== null && (
+        {manifest !== null && candidateRobot !== null && robotEditorActive && (
           <CandidateRobotGhost
             manifest={manifest}
             presentation={candidateRobot}
@@ -2458,9 +2758,12 @@ function StructuralViewerContent({
   candidateStale = false,
   candidateTcpEditable = false,
   onEditCandidateTcpPose = () => undefined,
+  candidateTcpTransformMode = 'translate',
+  candidateTcpTransformSpace = 'world',
   candidateRobot = null,
   runtimePresentation,
   executionObservationPresentation,
+  executionObservationTransport,
   sceneOwnerIdentity,
   viewerFrameIdentity,
   readViewerFrameIdentity,
@@ -2468,10 +2771,14 @@ function StructuralViewerContent({
   viewer,
   frameAxes = [],
   objectAxesVisibleIds = [],
+  objectAxesRows = [],
+  onObjectAxesVisibleIdsChange,
+  onAxesSizesCommit,
   robotControlSurface,
   robotControlBlocked = false,
   objectControlSurface,
   transportControls,
+  runtimeOverlay,
   inspectorTarget = null,
   inspectorMinimized = false,
   onInspectorMinimizedChange,
@@ -2483,11 +2790,20 @@ function StructuralViewerContent({
     DEFAULT_WIREFRAME_VISIBLE,
   );
   const [pointCloudVisible, setPointCloudVisible] = useState(false);
-  const [comparisonGhostVisible, setComparisonGhostVisible] = useState(
-    DEFAULT_COMPARISON_GHOST_VISIBLE,
+  const [sessionFrameAxes, setSessionFrameAxes] = useState<Set<string>>(
+    () => new Set(frameAxes.filter((frame) => (
+      frame.defaultVisible && frame.poseAvailable
+    )).map((frame) => frame.linkName)),
+  );
+  const [frameAxesSizeM, setFrameAxesSizeM] = useState(
+    viewer?.frame_gizmo_size_m ?? 0.1,
+  );
+  const [objectAxesSizeM, setObjectAxesSizeM] = useState(
+    viewer?.object_axes_gizmo_size_m ?? 0.1,
   );
   const [assetError, setAssetError] = useState<Error | null>(null);
   const [assetWarning, setAssetWarning] = useState<string | null>(null);
+  const [materializationGeneration, setMaterializationGeneration] = useState(0);
   const [transformMode, setTransformMode] = useState<SceneTransformMode>('translate');
   const [transformSpace, setTransformSpace] = useState<SceneTransformSpace>('world');
   const [cameraCommand, setCameraCommand] = useState<CameraCommandRequest>({
@@ -2563,9 +2879,57 @@ function StructuralViewerContent({
     () => new Set(objectAxesVisibleIds),
     [objectAxesVisibleIds],
   );
+  const presentedObjectAxesRows = objectAxesRows.length > 0
+    ? objectAxesRows
+    : sceneObjects.map((object) => ({
+        sceneResourceId: object.scene_resource_id,
+        attached: object.placement.kind === 'carried',
+        poseAvailable: true,
+        persistent: false,
+        defaultVisible: false,
+        sourceLabel: programDraftPreview ? 'Program Draft' : 'owner scene',
+      }));
+  const modelIdentity = manifest.status === 'ready' ? manifest.data.model_key : null;
+  const defaultFrameAxesKey = frameAxes
+    .filter((frame) => frame.defaultVisible && frame.poseAvailable)
+    .map((frame) => frame.linkName)
+    .sort()
+    .join('\u0000');
+  const modelAxisRows = (() => {
+    if (manifest.status !== 'ready') return [];
+    const viewerLinks = new Set(manifest.data.links.map((link) => link.name));
+    const viewerJoints = new Map(manifest.data.joints.map((joint) => [joint.name, joint]));
+    return frameAxes.map((frame) => {
+      const joint = frame.viewerJointName === null
+        ? null
+        : viewerJoints.get(frame.viewerJointName) ?? null;
+      return {
+        ...frame,
+        poseAvailable: frame.poseAvailable
+          && viewerLinks.has(frame.linkName)
+          && (frame.viewerJointName === null
+            || (joint !== null && joint.child_link === frame.linkName)),
+      };
+    });
+  })();
+  useEffect(() => {
+    setSessionFrameAxes(new Set(
+      defaultFrameAxesKey === '' ? [] : defaultFrameAxesKey.split('\u0000'),
+    ));
+  }, [defaultFrameAxesKey, modelIdentity]);
+  useEffect(() => {
+    setFrameAxesSizeM(viewer?.frame_gizmo_size_m ?? 0.1);
+    setObjectAxesSizeM(viewer?.object_axes_gizmo_size_m ?? 0.1);
+  }, [viewer?.frame_gizmo_size_m, viewer?.object_axes_gizmo_size_m]);
+  const presentedFrameAxes = frameAxes
+    .filter((frame) => sessionFrameAxes.has(frame.linkName))
+    .sort((left, right) => left.sourceLinkName.localeCompare(right.sourceLinkName));
   // Runtime measured state is the primary robot pose, not an optional ghost.
   // The current projection has no second passive comparison-pose contract.
   const comparisonGhostAvailable = false;
+  const auxiliaryViewerSourcesActive = programDraftPreview
+    || candidateTcpPose !== null
+    || candidateRobot !== null;
   const presentedRuntime = runtimePresentation;
   const camera = useMemo(
     () => parseViewerCameraQuery(
@@ -2614,20 +2978,6 @@ function StructuralViewerContent({
       0,
     )
     + (candidateTcpPose === null ? 0 : 1)
-    + (presentedRuntime?.measuredRobot === null
-      || presentedRuntime?.measuredRobot === undefined
-      ? 0
-      : visualCount)
-    + (presentedRuntime?.measuredObjects.reduce(
-      (total, measurement) => {
-        const object = sceneObjects.find(
-          (candidate) => candidate.scene_resource_id === measurement.objectId,
-        );
-        return total + (object?.collision_shapes.filter((shape) => (
-          shape.type !== 'mesh' || sceneOwnerIdentity !== undefined
-        )).length ?? 0);
-      }, 0,
-    ) ?? 0)
     + (presentedRuntime?.measuredTcp === null
       || presentedRuntime?.measuredTcp === undefined ? 0 : 1)
     + (candidateRobot === null ? 0 : visualCount);
@@ -2638,7 +2988,12 @@ function StructuralViewerContent({
   );
   const reportModelMaterialized = useCallback((durationMs: number) => {
     recordViewerModelBuild(durationMs);
+    setMaterializationGeneration((current) => current + 1);
   }, []);
+  const cameraContentRevision = `${modelIdentity ?? 'no-model'}:${materializationGeneration}:${visibleGeometryCount}:${sceneObjects
+    .map((object) => object.scene_resource_id)
+    .sort()
+    .join(',')}`;
   const reportAssetError = useCallback((error: Error) => {
     reportViewerQualificationError(error);
     setAssetError(error);
@@ -2827,14 +3182,34 @@ function StructuralViewerContent({
             >Object</button>
             <button
               type="button"
+              className={auxiliaryViewerSourcesActive ? 'viewer-source-active' : undefined}
               aria-pressed={inspectorPanel === 'tools'}
+              aria-label={auxiliaryViewerSourcesActive
+                ? 'Viewer tools; non-primary presentation source visible'
+                : 'Viewer tools'}
+              title={auxiliaryViewerSourcesActive
+                ? 'Viewer tools · non-primary presentation source visible'
+                : 'Viewer tools'}
               onClick={() => toggleInspectorPanel('tools')}
             >Tools</button>
           </div>
         </div>
       </header>
 
-      <div className="viewer-stage" role="img" aria-label="Scene authoring viewport">
+      <div
+        className="viewer-stage"
+        role="img"
+        aria-label="Scene authoring viewport"
+        data-scene-presentation={programDraftPreview ? 'program-draft' : 'owner'}
+        data-scene-object-count={sceneObjects.length}
+      >
+        {runtimeOverlay}
+        {executionObservationTransport?.phase === 'reconnecting' && (
+          <div className="viewer-observation-status" role="status">
+            <strong>Live robot view reconnecting</strong>
+            <span>{executionObservationTransport.message}</span>
+          </div>
+        )}
         {viewerActive && (
           visibleGeometryCount > 0
           || viewerFrameIdentity !== undefined
@@ -2847,6 +3222,7 @@ function StructuralViewerContent({
               onAssetError={reportAssetError}
               onIsolatedAssetError={reportIsolatedAssetError}
               sceneObjects={sceneObjects}
+              programDraftPreview={programDraftPreview}
               selectedSceneResourceId={selectedSceneResourceId}
               onSelectSceneResource={onSelectSceneResource}
               selectedStructureName={selectedStructureName}
@@ -2855,6 +3231,8 @@ function StructuralViewerContent({
               candidateStale={candidateStale}
               candidateTcpEditable={candidateTransformEnabled}
               onEditCandidateTcpPose={onEditCandidateTcpPose}
+              candidateTcpTransformMode={candidateTcpTransformMode}
+              candidateTcpTransformSpace={candidateTcpTransformSpace}
               candidateRobot={candidateRobot}
               runtimePresentation={presentedRuntime}
               executionObservationPresentation={executionObservationPresentation}
@@ -2863,10 +3241,15 @@ function StructuralViewerContent({
               viewerFrameIdentity={viewerFrameIdentity}
               readViewerFrameIdentity={readViewerFrameIdentity}
               pointCloudFrame={pointCloud.frame}
-              viewer={viewer}
-              frameAxes={frameAxes}
+              frameAxes={presentedFrameAxes}
               objectAxesVisibleIds={objectAxesVisible}
+              viewer={{
+                ...viewer,
+                frame_gizmo_size_m: frameAxesSizeM,
+                object_axes_gizmo_size_m: objectAxesSizeM,
+              }}
               cameraPresentation={cameraPresentation}
+              cameraContentRevision={cameraContentRevision}
               onModelMaterialized={reportModelMaterialized}
               onViewerCommit={reportViewerCommit}
               transformMode={transformMode}
@@ -3041,25 +3424,6 @@ function StructuralViewerContent({
           </div>
         )}
 
-        {manifest.status === 'ready'
-          && assetError === null
-          && visibleGeometryCount > 0
-          && (programDraftPreview
-            || candidateTcpPose !== null
-            || candidateRobot !== null
-            || presentedRuntime?.measuredRobot != null
-            || (presentedRuntime?.measuredObjects.length ?? 0) > 0
-            || presentedRuntime?.measuredTcp != null) && (
-            <div className="viewer-overlay-legend" aria-label="Non-live viewer overlays">
-              {programDraftPreview && <span>Draft scene objects · preview only</span>}
-              {(candidateTcpPose !== null || candidateRobot !== null)
-                && <span>Motion preview</span>}
-              {(presentedRuntime?.measuredRobot != null
-                || (presentedRuntime?.measuredObjects.length ?? 0) > 0
-                || presentedRuntime?.measuredTcp != null)
-                && <span>Measured state</span>}
-            </div>
-          )}
         {transportControls}
       </div>
 
@@ -3121,6 +3485,29 @@ function StructuralViewerContent({
                 )
               ) : inspectorPanel === 'tools' ? (
                 <div className="viewer-options-body">
+                  {auxiliaryViewerSourcesActive && (
+                    <div className="viewer-active-sources" aria-label="Visible non-primary sources">
+                      <strong>Visible non-primary sources</strong>
+                      {programDraftPreview && (
+                        <span>
+                          <i className="viewer-source-swatch draft" aria-hidden="true" />
+                          <span>
+                            <b>Program Draft scene</b>
+                            Preview only; this is not the current owner scene or execution state.
+                          </span>
+                        </span>
+                      )}
+                      {(candidateTcpPose !== null || candidateRobot !== null) && (
+                        <span>
+                          <i className="viewer-source-swatch candidate" aria-hidden="true" />
+                          <span>
+                            <b>Motion candidate</b>
+                            The validated no-motion preview owned by Robot Control.
+                          </span>
+                        </span>
+                      )}
+                    </div>
+                  )}
                   <label className="toggle-control">
                     <input
                       type="checkbox"
@@ -3151,13 +3538,188 @@ function StructuralViewerContent({
                   <label className="toggle-control">
                     <input
                       type="checkbox"
-                      checked={comparisonGhostVisible}
+                      checked={DEFAULT_COMPARISON_GHOST_VISIBLE}
                       disabled={!comparisonGhostAvailable}
-                      onChange={(event) => setComparisonGhostVisible(event.target.checked)}
+                      readOnly
                       title="No independent comparison pose is available."
                     />
                     <span>Comparison ghost</span>
                   </label>
+                  <details className="viewer-axes-section" open>
+                    <summary>Frames and joints</summary>
+                    <div className="viewer-axes-actions">
+                      <button
+                        type="button"
+                        onClick={() => setSessionFrameAxes(new Set(
+                          modelAxisRows.filter((row) => row.poseAvailable)
+                            .map((row) => row.linkName),
+                        ))}
+                      >Show all</button>
+                      <button
+                        type="button"
+                        onClick={() => setSessionFrameAxes(new Set())}
+                      >Hide all</button>
+                      <button
+                        type="button"
+                        onClick={() => setSessionFrameAxes(new Set(
+                          modelAxisRows.filter((row) => (
+                            row.defaultVisible && row.poseAvailable
+                          )).map((row) => row.linkName),
+                        ))}
+                      >Reset visibility</button>
+                    </div>
+                    <label className="viewer-axes-size">
+                      <span>Axes size</span>
+                      <input
+                        type="range"
+                        min={0.02}
+                        max={1}
+                        step={0.01}
+                        value={frameAxesSizeM}
+                        onChange={(event) => setFrameAxesSizeM(event.currentTarget.valueAsNumber)}
+                        onPointerUp={(event) => onAxesSizesCommit?.(
+                          event.currentTarget.valueAsNumber,
+                          objectAxesSizeM,
+                        )}
+                        onKeyUp={(event) => onAxesSizesCommit?.(
+                          event.currentTarget.valueAsNumber,
+                          objectAxesSizeM,
+                        )}
+                      />
+                      <output>{frameAxesSizeM.toFixed(2)} m</output>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const reset = viewer?.frame_gizmo_size_m ?? 0.1;
+                          setFrameAxesSizeM(reset);
+                          onAxesSizesCommit?.(reset, objectAxesSizeM);
+                        }}
+                      >Reset size</button>
+                    </label>
+                    <div className="viewer-axes-list">
+                      {modelAxisRows.map((row) => (
+                        <label
+                          key={row.linkName}
+                          className={row.poseAvailable ? undefined : 'unavailable'}
+                          title={row.poseAvailable
+                            ? [
+                                row.componentId ?? 'cell',
+                                row.modelInstanceId,
+                                row.frameRoleIds.length > 0
+                                  ? `roles ${row.frameRoleIds.join(', ')}` : null,
+                              ].filter(Boolean).join(' · ')
+                            : 'No exact pose exists in the current retained viewer model.'}
+                        >
+                          <input
+                            type="checkbox"
+                            disabled={!row.poseAvailable}
+                            checked={sessionFrameAxes.has(row.linkName)}
+                            onChange={(event) => setSessionFrameAxes((current) => {
+                              const next = new Set(current);
+                              if (event.target.checked) next.add(row.linkName);
+                              else next.delete(row.linkName);
+                              return next;
+                            })}
+                          />
+                          <span>
+                            <strong>{row.sourceLinkName}</strong>
+                            <small>{row.sourceJointName === null
+                              ? 'link frame'
+                              : `joint ${row.sourceJointName}`}</small>
+                          </span>
+                        </label>
+                      ))}
+                    </div>
+                  </details>
+                  <details className="viewer-axes-section" open>
+                    <summary>Object axes</summary>
+                    <div className="viewer-axes-actions">
+                      <button
+                        type="button"
+                        onClick={() => onObjectAxesVisibleIdsChange?.(
+                          presentedObjectAxesRows.filter((row) => row.poseAvailable)
+                            .map((row) => row.sceneResourceId),
+                        )}
+                      >Show all</button>
+                      <button
+                        type="button"
+                        onClick={() => onObjectAxesVisibleIdsChange?.([])}
+                      >Hide all</button>
+                      <button
+                        type="button"
+                        onClick={() => onObjectAxesVisibleIdsChange?.(
+                          presentedObjectAxesRows.filter((row) => (
+                            row.defaultVisible && row.poseAvailable
+                          )).map((row) => row.sceneResourceId),
+                        )}
+                      >Reset visibility</button>
+                    </div>
+                    <label className="viewer-axes-size">
+                      <span>Axes size</span>
+                      <input
+                        type="range"
+                        min={0.02}
+                        max={1}
+                        step={0.01}
+                        value={objectAxesSizeM}
+                        onChange={(event) => setObjectAxesSizeM(event.currentTarget.valueAsNumber)}
+                        onPointerUp={(event) => onAxesSizesCommit?.(
+                          frameAxesSizeM,
+                          event.currentTarget.valueAsNumber,
+                        )}
+                        onKeyUp={(event) => onAxesSizesCommit?.(
+                          frameAxesSizeM,
+                          event.currentTarget.valueAsNumber,
+                        )}
+                      />
+                      <output>{objectAxesSizeM.toFixed(2)} m</output>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const reset = viewer?.object_axes_gizmo_size_m ?? 0.1;
+                          setObjectAxesSizeM(reset);
+                          onAxesSizesCommit?.(frameAxesSizeM, reset);
+                        }}
+                      >Reset size</button>
+                    </label>
+                    <div className="viewer-axes-list">
+                      {presentedObjectAxesRows.map((row) => (
+                        <label
+                          key={row.sceneResourceId}
+                          className={row.poseAvailable ? undefined : 'unavailable'}
+                          title={row.poseAvailable
+                            ? row.persistent
+                              ? 'Stored in the Program Draft.'
+                              : 'Session presentation only.'
+                            : 'The object is hidden, so its axes have no visible pose.'}
+                        >
+                          <input
+                            type="checkbox"
+                            disabled={!row.poseAvailable}
+                            checked={objectAxesVisible.has(row.sceneResourceId)}
+                            onChange={(event) => {
+                              const next = new Set(objectAxesVisible);
+                              if (event.target.checked) next.add(row.sceneResourceId);
+                              else next.delete(row.sceneResourceId);
+                              onObjectAxesVisibleIdsChange?.([...next].sort());
+                            }}
+                          />
+                          <span>
+                            <strong>{row.sceneResourceId}</strong>
+                            <small>{[
+                              row.attached ? 'Attached' : null,
+                              row.persistent
+                                ? 'Program Draft setting'
+                                : `${row.sourceLabel} session setting`,
+                            ].filter(Boolean).join(' · ')}</small>
+                          </span>
+                        </label>
+                      ))}
+                      {presentedObjectAxesRows.length === 0 && (
+                        <span className="muted">No current objects</span>
+                      )}
+                    </div>
+                  </details>
                   <div className="viewer-options-actions">
                     <button
                       type="button"
@@ -3170,13 +3732,6 @@ function StructuralViewerContent({
                       Reload model
                     </button>
                   </div>
-                  {programDraftPreview && (
-                    <p className="viewer-source-explanation">
-                      <strong>Draft scene objects are a preview, not live.</strong>
-                      The backend reports no current scene objects, so editable
-                      Program Draft geometry is shown for authoring only.
-                    </p>
-                  )}
                   {pointCloud.frame !== null && (
                     <span
                       className="status-pill"
@@ -3193,7 +3748,7 @@ function StructuralViewerContent({
                       <span>Model <code>{manifest.data.model_key}</code></span>
                       <span>Bundle <code>{manifest.data.retained_bundle_id}</code></span>
                       <span>Retained model <strong>neutral coordinates</strong></span>
-                      <span>Measured overlay <strong>{runtimePresentation === undefined
+                      <span>Owner observation <strong>{runtimePresentation === undefined
                         ? 'unavailable'
                         : `${runtimePresentation.status.freshGood} fresh / ${runtimePresentation.status.total} sources`}</strong></span>
                       <span>Scene overlay <strong>owner-issued</strong></span>
@@ -3333,6 +3888,7 @@ export function StructuralViewer(props: StructuralViewerProps) {
   const fallback = (
     <section className="panel viewer-panel" aria-labelledby="viewer-failure-title">
       <div className="viewer-stage viewer-fallback-stage">
+        {props.runtimeOverlay}
         <div className="viewer-state error-state" role="alert">
           <strong id="viewer-failure-title">3D viewer isolated</strong>
           <span>

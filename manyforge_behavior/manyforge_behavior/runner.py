@@ -414,32 +414,5 @@ class OrchestratorRunner:
         }
         return self._kernel.stop(request)
 
-    def set_operation_runtime_scale(
-        self,
-        *,
-        request_id: str,
-        operation_id: str,
-        expected_operation_revision: int,
-        expected_runtime_scale_generation: int,
-        scale: float,
-        correlation_id: str | None = None,
-    ) -> dict[str, Any]:
-        request = {
-            "request_context": self._request_context(
-                request_id=request_id,
-                correlation_id=correlation_id,
-            ),
-            "operation_id": operation_id,
-            "expected_operation_revision": expected_operation_revision,
-            "expected_runtime_scale_generation": (
-                expected_runtime_scale_generation
-            ),
-            "scale": scale,
-        }
-        return self._kernel.set_runtime_scale(operation_id, request)
-
-    def operation_runtime_scale(self, operation_id: str) -> dict[str, Any]:
-        return self._kernel.runtime_scale(operation_id)
-
 
 __all__ = ["OrchestratorRunner"]

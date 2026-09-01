@@ -7,14 +7,16 @@ import { DeploymentCompositionPanel } from './components/DeploymentCompositionPa
 import {
   HeadlessRuntimeSurfaces,
   attentionAlarmsNewestFirst,
-  runtimeStatusView,
 } from './components/HeadlessRuntimeSurfaces';
-import { RuntimeAttentionAutoOpen } from './components/RuntimeAttentionAutoOpen';
+import {
+  RuntimeAttentionAutoOpen,
+  shouldCloseAutomaticRuntimeAttention,
+} from './components/RuntimeAttentionAutoOpen';
 import { ProgramDocumentControls } from './components/ProgramDocumentControls';
 import { OverlayPanel } from './components/OverlayPanel';
 import { PaneDivider } from './components/PaneDivider';
 import { ProgramWorkspace } from './components/ProgramWorkspace';
-import { RuntimeStatusOverlay } from './components/RuntimeStatusOverlay';
+import { runtimeStatusPresentation } from './components/runtimeStatus';
 import { SceneAuthoringWorkspace } from './components/SceneAuthoringWorkspace';
 import {
   useHeadlessStateSource,
@@ -23,6 +25,7 @@ import {
 import { useProgramRuntime } from './hooks/useProgramRuntime';
 import { useProgramWorkspace } from './hooks/useProgramWorkspace';
 import { useRobotControl } from './hooks/useRobotControl';
+import { nodeEnvironmentRefreshKey } from './state/nodeEnvironmentRefresh';
 import { useStructuralResource } from './state/structuralResource';
 import {
   useOperationalErrorMirror,
@@ -48,7 +51,7 @@ function clamp(value: number, min: number, max: number): number {
 export default function App() {
   const [activeWorkspace, setActiveWorkspace] = useState<'program' | 'scene' | 'deployment'>('program');
   const [viewerWidth, setViewerWidth] = useState(() => (
-    typeof window === 'undefined' ? 640 : Math.round(window.innerWidth * 0.4)
+    typeof window === 'undefined' ? 640 : Math.round(window.innerWidth * 0.45)
   ));
   const [inspectorWidth, setInspectorWidth] = useState(320);
   const [workbenchWidth, setWorkbenchWidth] = useState(() => (
@@ -76,8 +79,10 @@ export default function App() {
   const [globalPanel, setGlobalPanel] = useState<'runtime' | 'assistant' | null>(null);
   const [runtimePanelExpanded, setRuntimePanelExpanded] = useState(false);
   const [runtimeAttentionRequest, setRuntimeAttentionRequest] = useState<string | null>(null);
+  const [runtimePanelAutomatic, setRuntimePanelAutomatic] = useState(false);
   const [programInvalidEdit, setProgramInvalidEdit] = useState(false);
   const [programSettingsRequest, setProgramSettingsRequest] = useState(0);
+  const [componentOverviewRequest, setComponentOverviewRequest] = useState(0);
   const [programRequirementCreated, setProgramRequirementCreated] = useState<{
     sequence: number;
     id: string;
@@ -95,6 +100,12 @@ export default function App() {
   const [health, retryHealth] = useStructuralResource(api.health.get, {
     failureMessage: 'Could not read the Composer structural boundary.',
   });
+  const [structuralMode, setStructuralMode] = useState<
+    'headless_client' | 'structural_only' | null
+  >(null);
+  const [assistantConfigured, setAssistantConfigured] = useState(false);
+  const structuralRetryAttempt = useRef(0);
+  const headlessEnabled = structuralMode === 'headless_client';
   const [catalog, retryCatalog] = useStructuralResource(api.catalog.list, {
     failureMessage: 'Could not read the immutable v2 node catalog.',
   });
@@ -105,27 +116,69 @@ export default function App() {
   });
   const [nodeEnvironment, retryNodeEnvironment] = useStructuralResource(
     api.nodes.environment,
-    { failureMessage: 'Could not read the active v2 node environment.' },
+    {
+      enabled: headlessEnabled,
+      disabledMessage: 'Node-environment facts require a connected headless owner.',
+      failureMessage: 'Could not read the active v2 node environment.',
+    },
   );
-  const headlessEnabled = health.status === 'ready'
-    && health.data.mode === 'headless_client';
+  const nodeEnvironmentWakeKey = useRef<string | null>(null);
+  useEffect(() => {
+    if (health.status === 'ready') {
+      structuralRetryAttempt.current = 0;
+      setStructuralMode(health.data.mode);
+      setAssistantConfigured(
+        health.data.components.assistant_bridge === 'configured',
+      );
+      return undefined;
+    }
+    if (health.status === 'loading' || structuralMode !== null) return undefined;
+    const attempt = structuralRetryAttempt.current;
+    structuralRetryAttempt.current += 1;
+    const timer = window.setTimeout(
+      retryHealth,
+      Math.min(1_000 * 2 ** attempt, 8_000),
+    );
+    return () => window.clearTimeout(timer);
+  }, [health, retryHealth, structuralMode]);
   const [sourceModel, retrySourceModel] = useStructuralResource(api.sourceModel.get, {
     enabled: headlessEnabled,
     disabledMessage: 'Source-model facts require a connected headless owner.',
     failureMessage: 'Could not read the verified active source-model projection.',
   });
-  const assistantEnabled = headlessEnabled
-    && health.data.components.assistant_bridge === 'configured';
+  const assistantEnabled = headlessEnabled && assistantConfigured;
   const headlessStateSource = useHeadlessStateSource(headlessEnabled);
   const headlessState = useShellHeadlessState(headlessStateSource);
   const headlessSnapshot = headlessState.snapshot;
+  useEffect(() => {
+    if (!headlessEnabled) {
+      nodeEnvironmentWakeKey.current = null;
+      return;
+    }
+    if (headlessSnapshot === null) return;
+    const key = nodeEnvironmentRefreshKey(headlessSnapshot);
+    if (nodeEnvironmentWakeKey.current === null) {
+      nodeEnvironmentWakeKey.current = key;
+      return;
+    }
+    if (nodeEnvironmentWakeKey.current === key) return;
+    nodeEnvironmentWakeKey.current = key;
+    retryNodeEnvironment();
+  }, [headlessEnabled, headlessSnapshot, retryNodeEnvironment]);
   const programController = useProgramWorkspace(headlessSnapshot);
   const programRuntime = useProgramRuntime(
     headlessEnabled,
     headlessSnapshot,
     programController.state.workspace,
   );
-  const robotControl = useRobotControl(headlessEnabled, programRuntime.active);
+  const robotControl = useRobotControl(
+    headlessEnabled,
+    programRuntime.active,
+    ['motion-stop', 'full-stop'].includes(programRuntime.state.pending ?? '')
+      || ['stopping', 'full_stopping'].includes(
+        programRuntime.state.run?.state ?? '',
+      ),
+  );
   const operationalErrors = useOperationalErrors();
   useOperationalErrorMirror({
     source: 'composer.program_workspace',
@@ -189,21 +242,22 @@ export default function App() {
     // operator may expand it deliberately without execution being obscured by
     // an automatic client-error or alarm presentation.
     setRuntimePanelExpanded(false);
+    setRuntimePanelAutomatic(true);
     setGlobalPanel('runtime');
   }, []);
-  const runtimeView = useMemo(
-    () => headlessSnapshot === null ? null : runtimeStatusView(
-      headlessSnapshot.runtime,
-      {
-        unacknowledged: headlessSnapshot.alarms.unacknowledgedCount,
-        activeAcknowledged: headlessSnapshot.alarms.activeAcknowledgedCount,
-        programCycleState: headlessSnapshot.programCycle.state,
-        executionOwnerAvailable: robotControl.state.status !== null,
-        clientErrorCount: clientErrors.length,
-      },
-    ),
-    [clientErrors.length, headlessSnapshot, robotControl.state.status],
-  );
+  useEffect(() => {
+    if (shouldCloseAutomaticRuntimeAttention(
+      runtimePanelAutomatic,
+      globalPanel,
+      runtimeAttentionItems.length,
+    )) {
+      setGlobalPanel(null);
+      setRuntimePanelExpanded(false);
+      setRuntimeAttentionRequest(null);
+      setRuntimePanelAutomatic(false);
+    }
+  }, [globalPanel, runtimeAttentionItems.length, runtimePanelAutomatic]);
+  const runtimeView = headlessSnapshot?.componentOverview ?? null;
   const viewerWidthMax = Math.max(
     VIEWER_WIDTH_MIN,
     Math.min(
@@ -307,11 +361,19 @@ export default function App() {
   }, [programInspectorMinimized, programInspectorState.active, viewerInspectorMinimized]);
   const openRuntimeDetails = useCallback(() => {
     setRuntimePanelExpanded(true);
+    setRuntimePanelAutomatic(false);
+    setRuntimeAttentionRequest(null);
     setGlobalPanel('runtime');
   }, []);
   const closeRuntimePanel = useCallback(() => {
     setGlobalPanel(null);
     setRuntimePanelExpanded(false);
+    setRuntimeAttentionRequest(null);
+    setRuntimePanelAutomatic(false);
+  }, []);
+  const setRuntimePanelExpansion = useCallback((expanded: boolean) => {
+    setRuntimePanelExpanded(expanded);
+    if (expanded) setRuntimePanelAutomatic(false);
   }, []);
 
   const connectedProjection = headlessEnabled
@@ -328,6 +390,17 @@ export default function App() {
         : health.status === 'ready'
           ? health.data.runtimeAvailability?.message ?? 'Structural Composer mode'
           : 'Reading backend status…');
+  const deploymentStatus = runtimeStatusPresentation({
+    status: runtimeView,
+    backendConnected: connectedProjection,
+    error: headlessState.error,
+    connectionDetail,
+    unacknowledgedAlarms: headlessSnapshot?.alarms.unacknowledgedCount ?? 0,
+    clientErrorCount: clientErrors.length,
+  });
+  const deploymentTitle = programInvalidEdit
+    ? `Review or discard the invalid Program field edit first. Component status: ${deploymentStatus.accessibleLabel}. ${deploymentStatus.detail}`
+    : `${deploymentStatus.accessibleLabel}. ${deploymentStatus.detail}`;
 
   return (
     <main className="app-shell">
@@ -360,18 +433,49 @@ export default function App() {
           <button
             type="button"
             data-workspace="deployment"
-            className={activeWorkspace === 'deployment' ? 'active' : ''}
+            className={`deployment-status-button readiness-${deploymentStatus.readiness}${
+              activeWorkspace === 'deployment' ? ' active' : ''
+            }`}
             aria-pressed={activeWorkspace === 'deployment'}
+            aria-label={`Deployment — ${deploymentStatus.accessibleLabel}. Live status feed ${
+              deploymentStatus.backendConnected ? 'connected' : 'unavailable'
+            }. ${deploymentStatus.attentionCount > 0
+              ? `${deploymentStatus.attentionCount} attention ${
+                  deploymentStatus.attentionCount === 1 ? 'item' : 'items'
+                }. `
+              : ''}${deploymentStatus.detail}`}
+            data-backend-connected={deploymentStatus.backendConnected}
             disabled={programInvalidEdit}
-            title={programInvalidEdit ? 'Review or discard the invalid Program field edit first.' : undefined}
-            onClick={() => setActiveWorkspace('deployment')}
+            title={deploymentTitle}
+            onClick={() => {
+              setActiveWorkspace('deployment');
+              setComponentOverviewRequest((current) => current + 1);
+            }}
           >
-            Deployment
+            <span>Deployment</span>
+            <span
+              className={`deployment-status-indicator${
+                deploymentStatus.attentionCount > 0 ? ' has-attention' : ''
+              }`}
+              aria-hidden="true"
+              title={`${deploymentStatus.backendConnected
+                ? 'Live status feed connected'
+                : 'Live status feed unavailable'}${deploymentStatus.attentionCount > 0
+                ? ` · ${deploymentStatus.attentionCount} attention ${
+                    deploymentStatus.attentionCount === 1 ? 'item' : 'items'
+                  }`
+                : ''}`}
+            >
+              {deploymentStatus.attentionCount > 0
+                ? deploymentStatus.attentionCount
+                : ''}
+            </span>
           </button>
         </nav>
         <ProgramDocumentControls
           controller={programController}
           runtime={programRuntime}
+          catalogEntries={catalog.status === 'ready' ? catalog.data.entries : []}
           localInvalidEdit={programInvalidEdit}
           settingsRequest={programSettingsRequest}
           onProgramRequirementCreated={(kind, id) => setProgramRequirementCreated((current) => ({
@@ -388,6 +492,8 @@ export default function App() {
             aria-expanded={globalPanel === 'runtime'}
             onClick={() => {
               setRuntimePanelExpanded(false);
+              setRuntimePanelAutomatic(false);
+              setRuntimeAttentionRequest(null);
               setGlobalPanel('runtime');
             }}
           >
@@ -407,26 +513,6 @@ export default function App() {
             title={assistantEnabled ? 'Open the AI assistant.' : 'The assistant bridge is unavailable.'}
             onClick={() => setGlobalPanel('assistant')}
           >AI</button>
-          <RuntimeStatusOverlay
-            status={runtimeView}
-            backendConnected={connectedProjection}
-            error={headlessState.error}
-            connectionLabel={connectionLabel}
-            connectionDetail={connectionDetail}
-            unacknowledgedAlarms={headlessSnapshot?.alarms.unacknowledgedCount ?? 0}
-            activeAcknowledgedAlarms={headlessSnapshot?.alarms.activeAcknowledgedCount ?? 0}
-            clientErrorCount={clientErrors.length}
-            contextFacts={programRuntime.state.currentScenario?.currentScenario === null
-              || programRuntime.state.currentScenario === null
-              ? []
-              : [
-                  `Scenario ${programRuntime.state.currentScenario.currentScenario.scenarioId}`,
-                  `Deployment ${programRuntime.state.currentScenario.currentScenario.deploymentRevision}`,
-                  `Program ${programRuntime.state.currentScenario.currentScenario.programRevision}`,
-                ]}
-            onRetry={retryHealth}
-            onOpenDetails={openRuntimeDetails}
-          />
         </div>
       </header>
 
@@ -466,6 +552,39 @@ export default function App() {
               <DeploymentCompositionPanel
                 enabled={headlessEnabled}
                 snapshot={headlessSnapshot}
+                sourceModel={sourceModel}
+                motionDescriptor={
+                  robotControl.state.status?.directControl.targetDescriptor ?? null
+                }
+                gripperDescriptor={
+                  robotControl.state.status?.directControlGripper.targetDescriptor ?? null
+                }
+                componentOverview={{
+                  request: componentOverviewRequest,
+                  status: runtimeView,
+                  backendConnected: connectedProjection,
+                  connectionLabel,
+                  connectionDetail,
+                  contextFacts: programRuntime.state.currentScenario?.currentScenario === null
+                    || programRuntime.state.currentScenario === null
+                    ? []
+                    : [
+                        `Scenario ${programRuntime.state.currentScenario.currentScenario.scenarioId}`,
+                        `Deployment ${programRuntime.state.currentScenario.currentScenario.deploymentRevision}`,
+                        `Program ${programRuntime.state.currentScenario.currentScenario.programRevision}`,
+                      ],
+                  unacknowledgedAlarms:
+                    headlessSnapshot?.alarms.unacknowledgedCount ?? 0,
+                  activeAcknowledgedAlarms:
+                    headlessSnapshot?.alarms.activeAcknowledgedCount ?? 0,
+                  clientErrorCount: clientErrors.length,
+                  error: headlessState.error,
+                  onReconnect: () => {
+                    headlessState.reconnect();
+                    if (structuralMode === null) retryHealth();
+                  },
+                  onOpenRuntimeHistory: openRuntimeDetails,
+                }}
               />
             </div>
           )}
@@ -548,6 +667,18 @@ export default function App() {
                 onViewerInspectorMaximize={maximizeViewerInspector}
                 onViewerInspectorPanelChange={setViewerInspectorPanel}
                 onOpenRuntimeHistory={openRuntimeDetails}
+                runtimeOverlay={globalPanel === 'runtime' ? (
+                  <HeadlessRuntimeSurfaces
+                    enabled={headlessEnabled}
+                    headlessStateSource={headlessStateSource}
+                    clientErrors={clientErrors}
+                    onAcknowledgeClientError={operationalErrors.dismiss}
+                    attentionRequest={runtimeAttentionRequest}
+                    expanded={runtimePanelExpanded}
+                    onExpandedChange={setRuntimePanelExpansion}
+                    onClose={closeRuntimePanel}
+                  />
+                ) : undefined}
               />
             </div>
           </div>
@@ -557,18 +688,6 @@ export default function App() {
         items={runtimeAttentionItems}
         onOpen={openRuntimeAttention}
       />
-      {globalPanel === 'runtime' && (
-        <HeadlessRuntimeSurfaces
-          enabled={headlessEnabled}
-          headlessStateSource={headlessStateSource}
-          clientErrors={clientErrors}
-          onAcknowledgeClientError={operationalErrors.dismiss}
-          attentionRequest={runtimeAttentionRequest}
-          expanded={runtimePanelExpanded}
-          onExpandedChange={setRuntimePanelExpanded}
-          onClose={closeRuntimePanel}
-        />
-      )}
       <OverlayPanel
         open={globalPanel === 'assistant'}
         title="AI assistant"

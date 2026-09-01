@@ -8,7 +8,10 @@ import { normalizeQuaternion } from '../utils/structuralTransforms';
  * source gap must converge to the newest authoritative sample rather than
  * extending a visual trajectory into an unobserved future.
  */
-export const MAX_AUTHORITATIVE_INTERPOLATION_MS = 250;
+// Keep delayed samples responsive. Old main's hardware viewer established
+// 50 ms as the useful upper bound; longer source gaps snap toward current
+// authority within that same short window rather than replaying old motion.
+export const MAX_AUTHORITATIVE_INTERPOLATION_MS = 50;
 
 export interface AuthoritativeTransformFrame {
   streamIdentity: string;

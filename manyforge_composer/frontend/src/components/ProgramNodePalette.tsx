@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Ref } from 'react';
 
 import type {
@@ -6,6 +6,7 @@ import type {
   JsonValue,
   NodeEnvironmentResponse,
   ProgramAuthoringDocument,
+  DraftMutationResponse,
   ProgramTreeNode,
 } from '../types/api';
 import { flattenProgramForest } from '../utils/programAuthoring';
@@ -31,22 +32,46 @@ interface ProgramNodePaletteProps {
   catalogIdentity: ProgramCatalogIdentity | null;
   environment: NodeEnvironmentResponse | null;
   busy: boolean;
-  onMutate: (mutation: string, args: Record<string, JsonValue>) => void;
+  onMutate: (
+    mutation: string,
+    args: Record<string, JsonValue>,
+  ) => Promise<DraftMutationResponse | null>;
+  onSelect?: (instanceId: string) => void;
   onCollapse?: () => void;
   collapseButtonRef?: Ref<HTMLButtonElement>;
   onViewChange?: (view: 'nodes' | 'params') => void;
 }
 
-function executionNote(
+interface NodeExecutionAvailability {
+  available: boolean;
+  note: string;
+}
+
+function executionAvailability(
   entry: CatalogEntry,
   environment: NodeEnvironmentResponse | null,
-): string {
+): NodeExecutionAvailability {
   const rows = environment?.implementations.filter((row) => row.nodeId === entry.id) ?? [];
-  if (rows.some((row) => row.executionAvailable)) return 'Execution available';
+  if (rows.some((row) => row.executionAvailable)) {
+    const requiredInputs = entry.parameters.filter(
+      (parameter) => parameter.required && !parameter.hasDefault,
+    ).length;
+    return {
+      available: true,
+      note: requiredInputs > 0
+        ? `Executable when configured · ${requiredInputs} required input${requiredInputs === 1 ? '' : 's'}`
+        : 'Execution available for the current binding',
+    };
+  }
   const gates = [...new Set(rows.flatMap((row) => row.restorationGates))];
-  return gates.length > 0
-    ? `Authoring only · execution gate ${gates.join(', ')}`
-    : 'Authoring only · execution unavailable';
+  const reasons = [...new Set(rows.flatMap((row) => row.reasonCodes))];
+  const boundedReason = reasons[0]?.replaceAll('_', ' ') ?? 'no current execution offer';
+  return {
+    available: false,
+    note: gates.length > 0
+      ? `Authorable · unavailable until ${gates.join(', ')} · ${boundedReason}`
+      : `Authorable · unavailable · ${boundedReason}`,
+  };
 }
 
 function authoringAvailable(
@@ -59,6 +84,33 @@ function authoringAvailable(
     .some((row) => row.authoringAvailable);
 }
 
+function categoryLabel(category: string): string {
+  return category.split(/[_-]+/).filter(Boolean).map((part) => (
+    part.length <= 2
+      ? part.toLocaleUpperCase()
+      : `${part[0]?.toLocaleUpperCase() ?? ''}${part.slice(1).toLocaleLowerCase()}`
+  )).join(' ');
+}
+
+export function defaultCollapsedCatalogCategories(
+  entries: CatalogEntry[],
+  environment: NodeEnvironmentResponse | null,
+): Set<string> {
+  if (environment === null) return new Set();
+  const availabilityByCategory = new Map<string, boolean[]>();
+  for (const entry of entries) {
+    availabilityByCategory.set(entry.category, [
+      ...(availabilityByCategory.get(entry.category) ?? []),
+      executionAvailability(entry, environment).available,
+    ]);
+  }
+  return new Set([...availabilityByCategory.entries()]
+    .filter(([, availability]) => (
+      availability.length > 0 && availability.every((available) => !available)
+    ))
+    .map(([category]) => category));
+}
+
 export function ProgramNodePalette({
   roots,
   program,
@@ -67,6 +119,7 @@ export function ProgramNodePalette({
   environment,
   busy,
   onMutate,
+  onSelect,
   onCollapse,
   collapseButtonRef,
   onViewChange,
@@ -75,10 +128,30 @@ export function ProgramNodePalette({
   const [error, setError] = useState<string | null>(null);
   const [infoOpen, setInfoOpen] = useState(false);
   const [collapsedCategories, setCollapsedCategories] = useState<Set<string>>(
-    () => new Set(),
+    () => defaultCollapsedCatalogCategories(catalogEntries, environment),
   );
+  const categoryOverrides = useRef(new Set<string>());
+  const defaultAvailabilityKey = useRef<string | null>(null);
   const infoButton = useRef<HTMLButtonElement>(null);
   const closeInfo = useCallback(() => setInfoOpen(false), []);
+  useEffect(() => {
+    if (environment === null) return;
+    const key = `${environment.environmentDigest}\u0000${catalogEntries
+      .map((entry) => entry.id).sort().join('\u0000')}`;
+    if (defaultAvailabilityKey.current === key) return;
+    defaultAvailabilityKey.current = key;
+    const defaults = defaultCollapsedCatalogCategories(catalogEntries, environment);
+    const categories = new Set(catalogEntries.map((entry) => entry.category));
+    setCollapsedCategories((current) => {
+      const next = new Set(current);
+      for (const category of categories) {
+        if (categoryOverrides.current.has(category)) continue;
+        if (defaults.has(category)) next.add(category);
+        else next.delete(category);
+      }
+      return next;
+    });
+  }, [catalogEntries, environment]);
   const flat = useMemo(() => flattenProgramForest(roots), [roots]);
   const catalog = useMemo(
     () => new Map(catalogEntries.map((entry) => [entry.id, entry])),
@@ -99,7 +172,7 @@ export function ProgramNodePalette({
   const grouped = [...byCategory.entries()]
     .sort(([left], [right]) => left.localeCompare(right));
 
-  const addDetached = useCallback((activation: ProgramPaletteActivation) => {
+  const addDetached = useCallback(async (activation: ProgramPaletteActivation) => {
     if (busy) return;
     const entry = catalog.get(activation.catalogId);
     if (!entry) {
@@ -115,9 +188,13 @@ export function ProgramNodePalette({
       flat.map((row) => row.node.instance_id),
       roots.length,
     );
-    onMutate(mutation.mutation, mutation.args);
-    setError(null);
-  }, [busy, catalog, environment, flat, onMutate, roots.length]);
+    const response = await onMutate(mutation.mutation, mutation.args);
+    if (response !== null) {
+      const node = mutation.args.node as Record<string, JsonValue>;
+      onSelect?.(String(node.instance_id));
+      setError(null);
+    }
+  }, [busy, catalog, environment, flat, onMutate, onSelect, roots.length]);
 
   return (
     <section className="program-palette" aria-labelledby="program-palette-title">
@@ -190,31 +267,42 @@ export function ProgramNodePalette({
           const collapsed = collapsedCategories.has(category);
           return (
           <section key={category}>
-            <button
-              type="button"
-              className="program-palette-category"
-              aria-expanded={!collapsed}
-              onClick={() => setCollapsedCategories((current) => {
-                const next = new Set(current);
-                if (next.has(category)) next.delete(category);
-                else next.add(category);
-                return next;
-              })}
-            >
-              <span aria-hidden="true">{collapsed ? '›' : '⌄'}</span>
-              <strong>{category}</strong>
-              <small>{entries.length}</small>
-            </button>
-            {!collapsed && entries.map((entry) => (
-              <NodePaletteItem
-                key={entry.id}
-                entry={entry}
-                disabled={busy || !authoringAvailable(entry, environment)}
-                onActivate={addDetached}
-                executionNote={executionNote(entry, environment)}
-                allowDrag
-              />
-            ))}
+            <header className="program-palette-category">
+              <strong>{categoryLabel(category)}</strong>
+              <div>
+                <small>{entries.length}</small>
+                <button
+                  type="button"
+                  className="icon-button program-palette-category-toggle"
+                  aria-label={`${collapsed ? 'Expand' : 'Collapse'} ${categoryLabel(category)} nodes`}
+                  aria-expanded={!collapsed}
+                  title={`${collapsed ? 'Expand' : 'Collapse'} ${categoryLabel(category)} nodes`}
+                  onClick={() => setCollapsedCategories((current) => {
+                    categoryOverrides.current.add(category);
+                    const next = new Set(current);
+                    if (next.has(category)) next.delete(category);
+                    else next.add(category);
+                    return next;
+                  })}
+                >
+                  {collapsed ? '⌃' : '⌄'}
+                </button>
+              </div>
+            </header>
+            {!collapsed && entries.map((entry) => {
+              const execution = executionAvailability(entry, environment);
+              return (
+                <NodePaletteItem
+                  key={entry.id}
+                  entry={entry}
+                  disabled={busy || !authoringAvailable(entry, environment)}
+                  onActivate={addDetached}
+                  executionNote={execution.note}
+                  executionAvailable={execution.available}
+                  allowDrag
+                />
+              );
+            })}
           </section>
           );
         })}

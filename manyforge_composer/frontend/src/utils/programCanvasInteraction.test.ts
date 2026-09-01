@@ -8,11 +8,14 @@ import {
 } from './authoringGraph';
 import {
   programCanvasKeyIntent,
+  programChangeKindMutation,
   programDeleteMutation,
   programDetachedInsertionMutation,
+  programInsertionMutation,
   programMoveMutation,
   programPaletteClickIntent,
   programPaletteDragData,
+  programWrapMutation,
   readProgramPaletteDrag,
 } from './programCanvasInteraction';
 
@@ -81,6 +84,39 @@ describe('Program canvas interaction intents', () => {
       0,
       { x: 12, y: 34 },
     ).args.position).toEqual({ x: 12, y: 34 });
+  });
+
+  it('maps explicit child, sibling, wrapper, and compatible-kind choices atomically', () => {
+    expect(programInsertionMutation(leaf, [], {
+      kind: 'child', parentInstanceId: 'sequence', index: 2,
+    }).args).toMatchObject({
+      parent_instance_id: 'sequence',
+      index: 2,
+      node: { node_id: 'move', instance_id: 'move' },
+    });
+    expect(programInsertionMutation(leaf, ['move'], {
+      kind: 'after', siblingInstanceId: 'wait',
+    }).args).toMatchObject({
+      after_instance_id: 'wait',
+      node: { node_id: 'move', instance_id: 'move_2' },
+    });
+    expect(programWrapMutation({ ...leaf, id: 'retry' }, [], 'move')).toEqual({
+      mutation: 'tree_draft_wrap_node',
+      args: {
+        target_instance_id: 'move',
+        wrapper: {
+          node_id: 'retry', instance_id: 'retry', parameters: {},
+        },
+      },
+    });
+    expect(programChangeKindMutation(leaf, 'wait', ['duration_s'])).toEqual({
+      mutation: 'tree_draft_change_node_kind',
+      args: {
+        instance_id: 'wait',
+        replacement: { node_id: 'move', parameters: {} },
+        parameters_mode: 'strict',
+      },
+    });
   });
 
   it('maps a valid connection to one exact atomic move', () => {

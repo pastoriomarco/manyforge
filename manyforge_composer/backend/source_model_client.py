@@ -1,4 +1,4 @@
-"""Independent verification of source-local robot authoring facts."""
+"""Independent verification of source robot facts and exact viewer bindings."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from .state import ComposerState
 
 
-_PROJECTION_VERSION = "manyforge.source_model_projection.v1"
+_PROJECTION_VERSION = "manyforge.source_model_projection.v2"
 _CONTEXT_VERSION = "manyforge.source_model_context.v1"
 _PROJECTION_IDENTITY_DOMAIN = "manyforge-source-model-projection-semantic"
 _PROJECTION_FIELDS = {
@@ -39,13 +39,13 @@ _PROJECTION_FIELDS = {
 _OCCURRENCE_FIELDS = {
     "component_id",
     "coordinates",
+    "links",
     "model_asset_id",
     "model_instance_id",
     "model_revision",
     "model_role_id",
     "source_model_name",
     "source_robot_name",
-    "source_link_names",
     "srdf_end_effectors",
     "srdf_group_states",
     "srdf_groups",
@@ -59,6 +59,9 @@ _COORDINATE_FIELDS = {
     "source_joint_name",
     "source_parent_link_name",
     "unit",
+    "viewer_child_link_name",
+    "viewer_joint_name",
+    "viewer_parent_link_name",
 }
 _TARGET_FIELDS = {
     "collision_bodies",
@@ -273,6 +276,7 @@ def _occurrences(value: Any) -> dict[str, dict[str, Any]]:
             _text(row[field], f"{path}.{field}")
 
         joint_names: list[str] = []
+        viewer_joint_names: list[str] = []
         coordinate_rows: list[dict[str, Any]] = []
         expected_index = 0
         for coordinate_index, raw_coordinate in enumerate(
@@ -293,6 +297,12 @@ def _occurrences(value: Any) -> dict[str, dict[str, Any]]:
             )
             assert joint_name is not None
             joint_names.append(joint_name)
+            viewer_joint_name = _text(
+                coordinate["viewer_joint_name"],
+                f"{coordinate_path}.viewer_joint_name",
+            )
+            assert viewer_joint_name is not None
+            viewer_joint_names.append(viewer_joint_name)
             coordinate_rows.append(coordinate)
             joint_type = _text(
                 coordinate["joint_type"], f"{coordinate_path}.joint_type"
@@ -307,23 +317,54 @@ def _occurrences(value: Any) -> dict[str, dict[str, Any]]:
                 or _COORDINATE_CONTRACTS[joint_type] != (coordinate_kind, unit)
             ):
                 raise _invalid(f"{coordinate_path} has inconsistent URDF semantics")
-        if len(joint_names) != len(set(joint_names)):
-            raise _invalid(f"{path}.coordinates contain duplicate source joints")
+        if (
+            len(joint_names) != len(set(joint_names))
+            or len(viewer_joint_names) != len(set(viewer_joint_names))
+        ):
+            raise _invalid(f"{path}.coordinates contain duplicate joint bindings")
 
-        link_names = _text_array(
-            row["source_link_names"], f"{path}.source_link_names"
-        )
-        if link_names != sorted(link_names):
-            raise _invalid(f"{path}.source_link_names are not canonical-sorted")
+        link_names: list[str] = []
+        viewer_link_names: list[str] = []
+        for link_index, raw_link in enumerate(_array(row["links"], f"{path}.links")):
+            link_path = f"{path}.links[{link_index}]"
+            link = _object(raw_link, link_path)
+            _closed(link, {"source_link_name", "viewer_link_name"}, link_path)
+            source_link_name = _text(
+                link["source_link_name"], f"{link_path}.source_link_name"
+            )
+            viewer_link_name = _text(
+                link["viewer_link_name"], f"{link_path}.viewer_link_name"
+            )
+            assert source_link_name is not None and viewer_link_name is not None
+            link_names.append(source_link_name)
+            viewer_link_names.append(viewer_link_name)
+        if (
+            link_names != sorted(link_names)
+            or len(link_names) != len(set(link_names))
+            or len(viewer_link_names) != len(set(viewer_link_names))
+        ):
+            raise _invalid(f"{path}.links are not canonical unique bindings")
 
         joint_name_set = set(joint_names)
         link_name_set = set(link_names)
+        source_to_viewer = dict(zip(link_names, viewer_link_names, strict=True))
         for coordinate_index, coordinate in enumerate(coordinate_rows):
             coordinate_path = f"{path}.coordinates[{coordinate_index}]"
             for field in ("source_parent_link_name", "source_child_link_name"):
                 link_name = _text(coordinate[field], f"{coordinate_path}.{field}")
                 if link_name not in link_name_set:
                     raise _invalid(f"{coordinate_path}.{field} names an unknown link")
+            for field in ("viewer_parent_link_name", "viewer_child_link_name"):
+                _text(coordinate[field], f"{coordinate_path}.{field}")
+            if (
+                coordinate["viewer_parent_link_name"]
+                != source_to_viewer[coordinate["source_parent_link_name"]]
+                or coordinate["viewer_child_link_name"]
+                != source_to_viewer[coordinate["source_child_link_name"]]
+            ):
+                raise _invalid(
+                    f"{coordinate_path} crosses its exact source/viewer link binding"
+                )
             mimic = coordinate["mimic"]
             if mimic is not None:
                 mimic_row = _object(mimic, f"{coordinate_path}.mimic")
@@ -558,7 +599,10 @@ def _targets(value: Any, occurrences: dict[str, dict[str, Any]]) -> None:
             source_links = _text_array(
                 group["source_link_names"], f"{group_path}.source_link_names"
             )
-            if not set(source_links).issubset(set(occurrence["source_link_names"])):
+            occurrence_links = {
+                item["source_link_name"] for item in occurrence["links"]
+            }
+            if not set(source_links).issubset(occurrence_links):
                 raise _invalid(f"{group_path} contains an unknown source link")
 
         frame_roles: set[str] = set()
@@ -614,7 +658,9 @@ def _targets(value: Any, occurrences: dict[str, dict[str, Any]]) -> None:
                         occurrence = occurrences.get(instance_id)
                         if (
                             occurrence is None
-                            or link_name not in occurrence["source_link_names"]
+                            or link_name not in {
+                                link["source_link_name"] for link in occurrence["links"]
+                            }
                         ):
                             raise _invalid(
                                 f"{item_path} names an unknown source occurrence/link"
@@ -642,7 +688,9 @@ def _targets(value: Any, occurrences: dict[str, dict[str, Any]]) -> None:
                     )
                     occurrence = occurrences.get(instance_id)
                     if occurrence is None or not set(links).issubset(
-                        set(occurrence["source_link_names"])
+                        {
+                            link["source_link_name"] for link in occurrence["links"]
+                        }
                     ):
                         raise _invalid(
                             f"{item_path} names an unknown source occurrence/link"

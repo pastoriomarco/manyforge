@@ -7,6 +7,8 @@ import type {
   CatalogResponse,
   CurrentScenarioResponse,
   DraftMutationResponse,
+  DeploymentCandidateCompilation,
+  DeploymentCandidateOperationResponse,
   DeploymentWorkspaceResponse,
   ProgramDraftProjection,
   ProgramDraftApplicability,
@@ -124,6 +126,10 @@ export function parseProgramCycleResetResult(value: unknown): ProgramCycleResetR
   if (runtimeControls !== null && runtimeControls.programRunId !== programRunId) {
     return fail('programCycleReset', 'one exact Program-run identity');
   }
+  const admission = objectAt(record.admission, 'programCycleReset.admission');
+  exactKeysAt(admission, [
+    'admission_generation', 'authoring_allowed',
+  ], 'programCycleReset.admission');
   return {
     schemaVersion,
     programRunId,
@@ -139,7 +145,16 @@ export function parseProgramCycleResetResult(value: unknown): ProgramCycleResetR
       record.settlement_reference,
       'programCycleReset.settlement_reference',
     ),
-    admission: objectAt(record.admission, 'programCycleReset.admission') as Record<string, JsonValue>,
+    admission: {
+      admissionGeneration: positiveIntegerAt(
+        admission.admission_generation,
+        'programCycleReset.admission.admission_generation',
+      ),
+      authoringAllowed: booleanAt(
+        admission.authoring_allowed,
+        'programCycleReset.admission.authoring_allowed',
+      ),
+    },
     runtimeControls,
   };
 }
@@ -202,6 +217,7 @@ import type {
   AlarmMembership,
   AlarmPriority,
   AlarmSubject,
+  ComponentOverviewProjection,
   ComposerHeadlessState,
   HeadlessRuntimeSnapshot,
   HeadlessSourceSection,
@@ -226,7 +242,8 @@ import type {
   ObservedMotionTarget,
   OperationAcceptance,
   OperationObservation,
-  OperationRuntimeScaleStatus,
+  RuntimeScaleControlAccepted,
+  RuntimeScaleControlStatus,
   OperationStateName,
   ResourceSourceKind,
   SceneRevisionValue,
@@ -1213,6 +1230,7 @@ function parseProgramViewerMetadata(
       'frame_role_visibility',
       'frame_gizmo_size_m',
       'resource_role_visibility',
+      'scene_resource_axes_visibility',
       'object_axes_gizmo_size_m',
     ],
     path,
@@ -1234,6 +1252,12 @@ function parseProgramViewerMetadata(
     viewer.resource_role_visibility = booleanRecordAt(
       record.resource_role_visibility,
       `${path}.resource_role_visibility`,
+    );
+  }
+  if (record.scene_resource_axes_visibility !== undefined) {
+    viewer.scene_resource_axes_visibility = booleanRecordAt(
+      record.scene_resource_axes_visibility,
+      `${path}.scene_resource_axes_visibility`,
     );
   }
   if (record.object_axes_gizmo_size_m !== undefined) {
@@ -1435,6 +1459,19 @@ export function parseProgramDocument(value: unknown, path = 'program'): ProgramD
       if (!declared.has(role)) {
         return fail(`${path}.viewer.${field}.${role}`, 'a declared Program role');
       }
+    }
+  }
+  const declaredSceneResources = new Set(
+    (result.scene ?? []).map((resource) => resource.scene_resource_id),
+  );
+  for (const sceneResourceId of Object.keys(
+    result.viewer?.scene_resource_axes_visibility ?? {},
+  )) {
+    if (!declaredSceneResources.has(sceneResourceId)) {
+      return fail(
+        `${path}.viewer.scene_resource_axes_visibility.${sceneResourceId}`,
+        'a declared Program scene resource',
+      );
     }
   }
   return result;
@@ -2698,6 +2735,163 @@ export function parseDeploymentWorkspaceResponse(
   };
 }
 
+function parseDeploymentCandidateIdentity(
+  value: unknown,
+  path: string,
+  withSchema: boolean,
+): DeploymentCandidateCompilation {
+  const record = objectAt(value, path);
+  exactKeysAt(record, [
+    ...(withSchema ? ['schema_version'] : []),
+    'scenario_id', 'scenario_catalog_revision', 'deployment_artifact_id',
+    'deployment_revision', 'retained_bundle_id', 'graph_revision',
+    'program_id', 'program_revision', 'program_binding_id',
+  ], path);
+  if (withSchema && stringAt(record.schema_version, `${path}.schema_version`)
+    !== 'manyforge.deployment_candidate_compilation.v1') {
+    return fail(
+      `${path}.schema_version`,
+      'manyforge.deployment_candidate_compilation.v1',
+    );
+  }
+  return {
+    schemaVersion: 'manyforge.deployment_candidate_compilation.v1',
+    scenarioId: stringAt(record.scenario_id, `${path}.scenario_id`),
+    scenarioCatalogRevision: digestAt(
+      record.scenario_catalog_revision,
+      `${path}.scenario_catalog_revision`,
+    ),
+    deploymentArtifactId: stringAt(
+      record.deployment_artifact_id,
+      `${path}.deployment_artifact_id`,
+    ),
+    deploymentRevision: digestAt(
+      record.deployment_revision,
+      `${path}.deployment_revision`,
+    ),
+    retainedBundleId: digestAt(
+      record.retained_bundle_id,
+      `${path}.retained_bundle_id`,
+    ),
+    graphRevision: digestAt(record.graph_revision, `${path}.graph_revision`),
+    programId: stringAt(record.program_id, `${path}.program_id`),
+    programRevision: digestAt(
+      record.program_revision,
+      `${path}.program_revision`,
+    ),
+    programBindingId: digestAt(
+      record.program_binding_id,
+      `${path}.program_binding_id`,
+    ),
+  };
+}
+
+export function parseDeploymentCandidateOperationResponse(
+  value: unknown,
+): DeploymentCandidateOperationResponse {
+  const path = 'deploymentCandidateOperation';
+  const record = objectAt(value, path);
+  exactKeysAt(record, ['schemaVersion', 'workspace', 'result'], path);
+  const schemaVersion = stringAt(record.schemaVersion, `${path}.schemaVersion`);
+  if (schemaVersion !== 'manyforge.composer_deployment_candidate_operation.v1') {
+    return fail(
+      `${path}.schemaVersion`,
+      'manyforge.composer_deployment_candidate_operation.v1',
+    );
+  }
+  const workspace = parseDeploymentWorkspaceResponse(record.workspace);
+  const resultRecord = objectAt(record.result, `${path}.result`);
+  exactKeysAt(resultRecord, [
+    'status', 'compilation', 'candidate_preview', 'manager_apply', 'selection',
+  ], `${path}.result`);
+  const status = stringAt(resultRecord.status, `${path}.result.status`);
+  if (status !== 'previewed' && status !== 'applied') {
+    return fail(`${path}.result.status`, 'previewed or applied');
+  }
+  const compilation = parseDeploymentCandidateIdentity(
+    resultRecord.compilation,
+    `${path}.result.compilation`,
+    true,
+  );
+  const selection = parseDeploymentCandidateIdentity(
+    resultRecord.selection,
+    `${path}.result.selection`,
+    false,
+  );
+  const identityFields: Array<keyof Omit<
+    DeploymentCandidateCompilation,
+    'schemaVersion'
+  >> = [
+    'scenarioId', 'scenarioCatalogRevision', 'deploymentArtifactId',
+    'deploymentRevision', 'retainedBundleId', 'graphRevision', 'programId',
+    'programRevision', 'programBindingId',
+  ];
+  if (identityFields.some((field) => selection[field] !== compilation[field])) {
+    return fail(`${path}.result.selection`, 'the exact compiled candidate identity');
+  }
+  if (
+    workspace.draft.deploymentArtifactId !== compilation.deploymentArtifactId
+    || workspace.draft.deploymentRevision !== compilation.deploymentRevision
+  ) {
+    return fail(`${path}.workspace`, 'the exact compiled Deployment Draft');
+  }
+  const candidatePreview = resultRecord.candidate_preview === null
+    ? null
+    : parseManagerDeploymentCandidatePreviewResponse(
+      resultRecord.candidate_preview,
+    );
+  const managerApply = resultRecord.manager_apply === null
+    ? null
+    : parseManagerApplyResponse(resultRecord.manager_apply);
+  if (
+    candidatePreview !== null
+    && (
+      candidatePreview.candidateReceipt.deployment_artifact_id
+        !== compilation.deploymentArtifactId
+      || candidatePreview.candidateReceipt.deployment_revision
+        !== compilation.deploymentRevision
+      || candidatePreview.candidateReceipt.candidate_retained_bundle_id
+        !== compilation.retainedBundleId
+      || candidatePreview.candidateReceipt.candidate_graph_revision
+        !== compilation.graphRevision
+    )
+  ) {
+    return fail(`${path}.result.candidate_preview`, 'the compiled candidate');
+  }
+  if (
+    status === 'applied'
+    && workspace.managerApplied.deploymentRevision
+      !== compilation.deploymentRevision
+  ) {
+    return fail(`${path}.workspace.managerApplied`, 'the applied candidate');
+  }
+  const selectionWithoutSchema: Omit<
+    DeploymentCandidateCompilation,
+    'schemaVersion'
+  > = {
+    scenarioId: selection.scenarioId,
+    scenarioCatalogRevision: selection.scenarioCatalogRevision,
+    deploymentArtifactId: selection.deploymentArtifactId,
+    deploymentRevision: selection.deploymentRevision,
+    retainedBundleId: selection.retainedBundleId,
+    graphRevision: selection.graphRevision,
+    programId: selection.programId,
+    programRevision: selection.programRevision,
+    programBindingId: selection.programBindingId,
+  };
+  return {
+    schemaVersion,
+    workspace,
+    result: {
+      status,
+      compilation,
+      candidatePreview,
+      managerApply,
+      selection: selectionWithoutSchema,
+    },
+  };
+}
+
 export function parseScenarioCatalogResponse(value: unknown): ScenarioCatalogResponse {
   const record = objectAt(value, 'scenarioCatalog');
   exactKeysAt(
@@ -3788,10 +3982,10 @@ export function parseProgramRuntimeControlProjection(
     'observation_override_candidate',
   ], path);
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.program_runtime_control_projection.v1') {
+  if (schemaVersion !== 'manyforge.program_runtime_control_projection.v2') {
     return fail(
       `${path}.schema_version`,
-      'manyforge.program_runtime_control_projection.v1',
+      'manyforge.program_runtime_control_projection.v2',
     );
   }
   const programRunId = stringAt(record.program_run_id, `${path}.program_run_id`);
@@ -4204,6 +4398,9 @@ function parseSourceModelCoordinate(
       'source_joint_name',
       'source_parent_link_name',
       'unit',
+      'viewer_child_link_name',
+      'viewer_joint_name',
+      'viewer_parent_link_name',
     ],
     path,
   );
@@ -4239,6 +4436,15 @@ function parseSourceModelCoordinate(
       `${path}.source_parent_link_name`,
     ),
     unit: stringAt(record.unit, `${path}.unit`),
+    viewer_child_link_name: stringAt(
+      record.viewer_child_link_name,
+      `${path}.viewer_child_link_name`,
+    ),
+    viewer_joint_name: stringAt(record.viewer_joint_name, `${path}.viewer_joint_name`),
+    viewer_parent_link_name: stringAt(
+      record.viewer_parent_link_name,
+      `${path}.viewer_parent_link_name`,
+    ),
   };
 }
 
@@ -4300,13 +4506,13 @@ function parseSourceModelOccurrence(
     [
       'component_id',
       'coordinates',
+      'links',
       'model_asset_id',
       'model_instance_id',
       'model_revision',
       'model_role_id',
       'source_model_name',
       'source_robot_name',
-      'source_link_names',
       'srdf_end_effectors',
       'srdf_group_states',
       'srdf_groups',
@@ -4318,19 +4524,53 @@ function parseSourceModelOccurrence(
   if (coordinates.some((item, index) => item.source_joint_index !== index)) {
     return fail(`${path}.coordinates`, 'source-indexed coordinates in source order');
   }
+  const links = boundedArrayAt(record.links, `${path}.links`, 100_000)
+    .map((item, index) => {
+      const linkPath = `${path}.links[${index}]`;
+      const link = objectAt(item, linkPath);
+      exactKeysAt(link, ['source_link_name', 'viewer_link_name'], linkPath);
+      return {
+        source_link_name: stringAt(link.source_link_name, `${linkPath}.source_link_name`),
+        viewer_link_name: stringAt(link.viewer_link_name, `${linkPath}.viewer_link_name`),
+      };
+    });
+  if (
+    new Set(links.map((link) => link.source_link_name)).size !== links.length
+    || new Set(links.map((link) => link.viewer_link_name)).size !== links.length
+    || [...links].sort((left, right) => (
+      left.source_link_name < right.source_link_name ? -1
+        : left.source_link_name > right.source_link_name ? 1 : 0
+    )).some((link, index) => link !== links[index])
+  ) {
+    return fail(`${path}.links`, 'canonical unique source/viewer link bindings');
+  }
+  const viewerLinkBySource = new Map(
+    links.map((link) => [link.source_link_name, link.viewer_link_name]),
+  );
+  if (
+    new Set(coordinates.map((coordinate) => coordinate.source_joint_name)).size
+      !== coordinates.length
+    || new Set(coordinates.map((coordinate) => coordinate.viewer_joint_name)).size
+      !== coordinates.length
+    || coordinates.some((coordinate) => (
+      viewerLinkBySource.get(coordinate.source_parent_link_name)
+        !== coordinate.viewer_parent_link_name
+      || viewerLinkBySource.get(coordinate.source_child_link_name)
+        !== coordinate.viewer_child_link_name
+    ))
+  ) {
+    return fail(`${path}.coordinates`, 'exact unique source/viewer coordinate bindings');
+  }
   return {
     component_id: nullableStringAt(record.component_id, `${path}.component_id`),
     coordinates,
+    links,
     model_asset_id: stringAt(record.model_asset_id, `${path}.model_asset_id`),
     model_instance_id: stringAt(record.model_instance_id, `${path}.model_instance_id`),
     model_revision: stringAt(record.model_revision, `${path}.model_revision`),
     model_role_id: nullableStringAt(record.model_role_id, `${path}.model_role_id`),
     source_model_name: stringAt(record.source_model_name, `${path}.source_model_name`),
     source_robot_name: stringAt(record.source_robot_name, `${path}.source_robot_name`),
-    source_link_names: canonicalStringArrayAt(
-      record.source_link_names,
-      `${path}.source_link_names`,
-    ),
     srdf_end_effectors: boundedArrayAt(
       record.srdf_end_effectors,
       `${path}.srdf_end_effectors`,
@@ -4492,8 +4732,8 @@ export function parseSourceModelProjection(value: unknown): SourceModelProjectio
     'sourceModel',
   );
   const schemaVersion = stringAt(record.schema_version, 'sourceModel.schema_version');
-  if (schemaVersion !== 'manyforge.source_model_projection.v1') {
-    return fail('sourceModel.schema_version', 'manyforge.source_model_projection.v1');
+  if (schemaVersion !== 'manyforge.source_model_projection.v2') {
+    return fail('sourceModel.schema_version', 'manyforge.source_model_projection.v2');
   }
   const source = objectAt(record.source, 'sourceModel.source');
   exactKeysAt(
@@ -6015,12 +6255,140 @@ export function parseOperatorAlarmSnapshot(
   };
 }
 
+function parseComponentOverviewProjection(
+  value: unknown,
+  path: string,
+): ComponentOverviewProjection {
+  const record = objectAt(value, path);
+  exactKeysAt(record, [
+    'schema_version', 'overview_revision', 'readiness', 'summary_label',
+    'profile_label', 'authority_label', 'user_message', 'capabilities',
+    'components', 'basis',
+  ], path);
+  const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
+  if (schemaVersion !== 'manyforge.component_overview.v1') {
+    return fail(`${path}.schema_version`, 'manyforge.component_overview.v1');
+  }
+  const readiness = stringAt(record.readiness, `${path}.readiness`);
+  if (!['ready', 'waiting', 'degraded', 'fault', 'offline'].includes(readiness)) {
+    return fail(`${path}.readiness`, 'a supported Component Overview readiness');
+  }
+  const componentStatuses = new Set([
+    'healthy', 'waiting', 'warning', 'fault', 'offline',
+  ]);
+  const components = arrayAt(record.components, `${path}.components`).map(
+    (valueAtIndex, index) => {
+      const componentPath = `${path}.components[${index}]`;
+      const component = objectAt(valueAtIndex, componentPath);
+      exactKeysAt(component, [
+        'id', 'label', 'status', 'detail', 'required', 'required_for',
+        'owner_id', 'owner_epoch', 'generation', 'reason_code', 'scope',
+        'contributor_ids',
+      ], componentPath);
+      const status = stringAt(component.status, `${componentPath}.status`);
+      if (!componentStatuses.has(status)) {
+        return fail(`${componentPath}.status`, 'a supported component status');
+      }
+      return {
+        id: stringAt(component.id, `${componentPath}.id`),
+        label: stringAt(component.label, `${componentPath}.label`),
+        status: status as ComponentOverviewProjection['components'][number]['status'],
+        detail: stringAt(component.detail, `${componentPath}.detail`),
+        required: booleanAt(component.required, `${componentPath}.required`),
+        requiredFor: stringArrayAt(component.required_for, `${componentPath}.required_for`),
+        ownerId: nullableStringAt(component.owner_id, `${componentPath}.owner_id`),
+        ownerEpoch: nullableStringAt(component.owner_epoch, `${componentPath}.owner_epoch`),
+        generation: component.generation === null
+          ? null : integerAt(component.generation, `${componentPath}.generation`),
+        reasonCode: nullableStringAt(component.reason_code, `${componentPath}.reason_code`),
+        scope: stringAt(component.scope, `${componentPath}.scope`),
+        contributorIds: stringArrayAt(
+          component.contributor_ids,
+          `${componentPath}.contributor_ids`,
+        ),
+      };
+    },
+  );
+  const basisPath = `${path}.basis`;
+  const basis = objectAt(record.basis, basisPath);
+  const basisKeys = [
+    'runtime_projection_owner_epoch', 'runtime_projection_generation',
+    'manager_source_owner_epoch', 'logical_scene_source_owner_epoch',
+    'logical_scene_source_generation', 'scene_runtime_source_owner_epoch',
+    'scene_runtime_source_generation', 'alarm_owner_epoch', 'alarm_generation',
+    'alarm_state_revision', 'admission_generation', 'program_runner_owner_epoch',
+    'program_cycle_generation', 'applied_program_owner_epoch',
+    'applied_program_generation', 'execution_owner_epoch',
+    'execution_publication_generation',
+  ];
+  exactKeysAt(basis, basisKeys, basisPath);
+  const nullableGeneration = (name: string): number | null => (
+    basis[name] === null ? null : integerAt(basis[name], `${basisPath}.${name}`)
+  );
+  return {
+    schemaVersion,
+    overviewRevision: digestAt(record.overview_revision, `${path}.overview_revision`),
+    readiness: readiness as ComponentOverviewProjection['readiness'],
+    summaryLabel: stringAt(record.summary_label, `${path}.summary_label`),
+    profileLabel: stringAt(record.profile_label, `${path}.profile_label`),
+    authorityLabel: stringAt(record.authority_label, `${path}.authority_label`),
+    userMessage: stringAt(record.user_message, `${path}.user_message`),
+    capabilities: stringArrayAt(record.capabilities, `${path}.capabilities`),
+    components,
+    basis: {
+      runtimeProjectionOwnerEpoch: nullableStringAt(
+        basis.runtime_projection_owner_epoch,
+        `${basisPath}.runtime_projection_owner_epoch`,
+      ),
+      runtimeProjectionGeneration: nullableGeneration('runtime_projection_generation'),
+      managerSourceOwnerEpoch: nullableStringAt(
+        basis.manager_source_owner_epoch,
+        `${basisPath}.manager_source_owner_epoch`,
+      ),
+      logicalSceneSourceOwnerEpoch: nullableStringAt(
+        basis.logical_scene_source_owner_epoch,
+        `${basisPath}.logical_scene_source_owner_epoch`,
+      ),
+      logicalSceneSourceGeneration: nullableGeneration('logical_scene_source_generation'),
+      sceneRuntimeSourceOwnerEpoch: nullableStringAt(
+        basis.scene_runtime_source_owner_epoch,
+        `${basisPath}.scene_runtime_source_owner_epoch`,
+      ),
+      sceneRuntimeSourceGeneration: nullableGeneration('scene_runtime_source_generation'),
+      alarmOwnerEpoch: nullableStringAt(
+        basis.alarm_owner_epoch,
+        `${basisPath}.alarm_owner_epoch`,
+      ),
+      alarmGeneration: nullableGeneration('alarm_generation'),
+      alarmStateRevision: nullableGeneration('alarm_state_revision'),
+      admissionGeneration: nullableGeneration('admission_generation'),
+      programRunnerOwnerEpoch: nullableStringAt(
+        basis.program_runner_owner_epoch,
+        `${basisPath}.program_runner_owner_epoch`,
+      ),
+      programCycleGeneration: nullableGeneration('program_cycle_generation'),
+      appliedProgramOwnerEpoch: nullableStringAt(
+        basis.applied_program_owner_epoch,
+        `${basisPath}.applied_program_owner_epoch`,
+      ),
+      appliedProgramGeneration: nullableGeneration('applied_program_generation'),
+      executionOwnerEpoch: nullableStringAt(
+        basis.execution_owner_epoch,
+        `${basisPath}.execution_owner_epoch`,
+      ),
+      executionPublicationGeneration: nullableGeneration(
+        'execution_publication_generation',
+      ),
+    },
+  };
+}
+
 export function parseComposerHeadlessState(
   value: unknown,
 ): ComposerHeadlessState {
   const record = objectAt(value, 'headlessState');
   exactKeysAt(record, [
-    'schema_version', 'runtime', 'alarms', 'authoring_admission',
+    'schema_version', 'runtime', 'alarms', 'component_overview', 'authoring_admission',
     'program_cycle', 'draft_identity', 'receiver_epoch',
     'snapshot_sequence', 'complete',
   ], 'headlessState');
@@ -6028,10 +6396,10 @@ export function parseComposerHeadlessState(
     record.schema_version,
     'headlessState.schema_version',
   );
-  if (schemaVersion !== 'manyforge.composer_headless_state.v1') {
+  if (schemaVersion !== 'manyforge.composer_headless_state.v2') {
     return fail(
       'headlessState.schema_version',
-      'manyforge.composer_headless_state.v1',
+      'manyforge.composer_headless_state.v2',
     );
   }
   const admission = objectAt(record.authoring_admission, 'headlessState.authoring_admission');
@@ -6056,6 +6424,10 @@ export function parseComposerHeadlessState(
     complete: true,
     runtime: parseHeadlessRuntimeSnapshot(record.runtime),
     alarms: parseOperatorAlarmSnapshot(record.alarms),
+    componentOverview: parseComponentOverviewProjection(
+      record.component_overview,
+      'headlessState.component_overview',
+    ),
     authoringAdmission: {
       authoringAllowed: booleanAt(admission.authoring_allowed, 'headlessState.authoring_admission.authoring_allowed'),
       admissionGeneration: positiveIntegerAt(admission.admission_generation, 'headlessState.authoring_admission.admission_generation'),
@@ -6314,13 +6686,53 @@ function manualControlMotionDescriptorAt(
   const record = objectAt(value, path);
   exactKeysAt(record, [
     'command_target_id', 'component_role_id', 'contracts',
-    'controllable_component_id', 'frames', 'joints', 'schema_version',
-    'target_role_id',
+    'controllable_component_id', 'frames', 'joints', 'operational_joint_limits',
+    'operational_limit', 'schema_version', 'target_role_id',
   ], path);
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.manual_control_motion_descriptor.v1') {
+  if (schemaVersion !== 'manyforge.manual_control_motion_descriptor.v3') {
     return fail(`${path}.schema_version`, 'the supported motion descriptor');
   }
+  const operationalLimit = record.operational_limit === null
+    ? null
+    : (() => {
+        const limitPath = `${path}.operational_limit`;
+        const limit = objectAt(record.operational_limit, limitPath);
+        exactKeysAt(limit, [
+          'catalog_policy_maximum_tcp_linear_speed_mps',
+          'deployment_maximum_tcp_linear_speed_mps',
+          'effective_maximum_tcp_linear_speed_mps', 'policy_id',
+          'policy_revision', 'selected_scope', 'source_content_digest',
+        ], limitPath);
+        const selectedScope = stringAt(limit.selected_scope, `${limitPath}.selected_scope`);
+        if (selectedScope !== 'cell' && selectedScope !== 'command_target') {
+          return fail(`${limitPath}.selected_scope`, 'cell or command_target');
+        }
+        return {
+          catalogPolicyMaximumTcpLinearSpeedMps: positiveNumberAt(
+            limit.catalog_policy_maximum_tcp_linear_speed_mps,
+            `${limitPath}.catalog_policy_maximum_tcp_linear_speed_mps`,
+          ),
+          deploymentMaximumTcpLinearSpeedMps:
+            limit.deployment_maximum_tcp_linear_speed_mps === null
+              ? null
+              : positiveNumberAt(
+                  limit.deployment_maximum_tcp_linear_speed_mps,
+                  `${limitPath}.deployment_maximum_tcp_linear_speed_mps`,
+                ),
+          effectiveMaximumTcpLinearSpeedMps: positiveNumberAt(
+            limit.effective_maximum_tcp_linear_speed_mps,
+            `${limitPath}.effective_maximum_tcp_linear_speed_mps`,
+          ),
+          policyId: stringAt(limit.policy_id, `${limitPath}.policy_id`),
+          policyRevision: digestAt(limit.policy_revision, `${limitPath}.policy_revision`),
+          selectedScope: selectedScope as 'cell' | 'command_target',
+          sourceContentDigest: digestAt(
+            limit.source_content_digest,
+            `${limitPath}.source_content_digest`,
+          ),
+        };
+      })();
   const frames = boundedArrayAt(record.frames, `${path}.frames`, 256).map((item, index) => {
     const itemPath = `${path}.frames[${index}]`;
     const frame = objectAt(item, itemPath);
@@ -6374,6 +6786,90 @@ function manualControlMotionDescriptorAt(
       return fail(`${path}.joints[${index}]`, 'ordered finite limits');
     }
   }
+  const operationalJointLimits = boundedArrayAt(
+    record.operational_joint_limits,
+    `${path}.operational_joint_limits`,
+    1024,
+  ).map((item, index) => {
+    const itemPath = `${path}.operational_joint_limits[${index}]`;
+    const limit = objectAt(item, itemPath);
+    exactKeysAt(limit, [
+      'deployment_max_acceleration_rad_s2', 'deployment_max_jerk_rad_s3',
+      'deployment_max_velocity_rad_s', 'effective_max_acceleration_rad_s2',
+      'effective_max_jerk_rad_s3', 'effective_max_velocity_rad_s',
+      'model_max_acceleration_rad_s2', 'model_max_velocity_rad_s',
+      'source_joint_name',
+    ], itemPath);
+    const result = {
+      sourceJointName: stringAt(limit.source_joint_name, `${itemPath}.source_joint_name`),
+      modelMaxVelocityRadS: positiveNumberAt(
+        limit.model_max_velocity_rad_s,
+        `${itemPath}.model_max_velocity_rad_s`,
+      ),
+      modelMaxAccelerationRadS2: nullableNumberAt(
+        limit.model_max_acceleration_rad_s2,
+        `${itemPath}.model_max_acceleration_rad_s2`,
+      ),
+      deploymentMaxVelocityRadS: nullableNumberAt(
+        limit.deployment_max_velocity_rad_s,
+        `${itemPath}.deployment_max_velocity_rad_s`,
+      ),
+      deploymentMaxAccelerationRadS2: nullableNumberAt(
+        limit.deployment_max_acceleration_rad_s2,
+        `${itemPath}.deployment_max_acceleration_rad_s2`,
+      ),
+      deploymentMaxJerkRadS3: nullableNumberAt(
+        limit.deployment_max_jerk_rad_s3,
+        `${itemPath}.deployment_max_jerk_rad_s3`,
+      ),
+      effectiveMaxVelocityRadS: positiveNumberAt(
+        limit.effective_max_velocity_rad_s,
+        `${itemPath}.effective_max_velocity_rad_s`,
+      ),
+      effectiveMaxAccelerationRadS2: nullableNumberAt(
+        limit.effective_max_acceleration_rad_s2,
+        `${itemPath}.effective_max_acceleration_rad_s2`,
+      ),
+      effectiveMaxJerkRadS3: nullableNumberAt(
+        limit.effective_max_jerk_rad_s3,
+        `${itemPath}.effective_max_jerk_rad_s3`,
+      ),
+    };
+    for (const [name, value] of Object.entries(result)) {
+      if (name !== 'sourceJointName' && value !== null && typeof value === 'number' && value <= 0) {
+        return fail(itemPath, 'positive dynamics limits');
+      }
+    }
+    const expectedVelocity = result.deploymentMaxVelocityRadS === null
+      ? result.modelMaxVelocityRadS
+      : Math.min(result.modelMaxVelocityRadS, result.deploymentMaxVelocityRadS);
+    const expectedAcceleration = result.modelMaxAccelerationRadS2 === null
+      ? result.deploymentMaxAccelerationRadS2
+      : result.deploymentMaxAccelerationRadS2 === null
+        ? result.modelMaxAccelerationRadS2
+        : Math.min(
+            result.modelMaxAccelerationRadS2,
+            result.deploymentMaxAccelerationRadS2,
+          );
+    if (
+      result.effectiveMaxVelocityRadS !== expectedVelocity
+      || result.effectiveMaxAccelerationRadS2 !== expectedAcceleration
+      || result.effectiveMaxJerkRadS3 !== result.deploymentMaxJerkRadS3
+    ) {
+      return fail(itemPath, 'the exact conservative Deployment/model minimum');
+    }
+    return result;
+  });
+  if (
+    operationalJointLimits.length !== joints.length
+    || operationalJointLimits.some((limit, index) => (
+      limit.sourceJointName !== joints[index]?.sourceJointName
+      || limit.modelMaxVelocityRadS !== joints[index]?.maxVelocityRadS
+      || limit.modelMaxAccelerationRadS2 !== joints[index]?.maxAccelerationRadS2
+    ))
+  ) {
+    return fail(`${path}.operational_joint_limits`, 'limits joined conservatively to each source joint');
+  }
   return {
     schemaVersion,
     controllableComponentId: stringAt(record.controllable_component_id, `${path}.controllable_component_id`),
@@ -6382,6 +6878,8 @@ function manualControlMotionDescriptorAt(
     targetRoleId: stringAt(record.target_role_id, `${path}.target_role_id`),
     frames,
     joints,
+    operationalJointLimits,
+    operationalLimit,
     contracts: manualControlContractsAt(record.contracts, `${path}.contracts`),
   };
 }
@@ -6392,13 +6890,19 @@ function manualControlGripperDescriptorAt(
 ): ManualControlGripperDescriptor {
   const record = objectAt(value, path);
   exactKeysAt(record, [
-    'command_target_id', 'component_role_id', 'contracts',
-    'controllable_component_id', 'coordinate_kind', 'max_position',
-    'mimic_followers', 'min_position', 'named_presets', 'schema_version',
-    'source_coordinate_name', 'source_kind', 'target_role_id', 'unit',
+    'actuation_kind', 'attach_frame', 'auxiliary_frames', 'closed_state_ref',
+    'command_duration_s', 'command_kind', 'command_target_id',
+    'component_role_id', 'completion_policy', 'contracts',
+    'control_interface_contract_id', 'controllable_component_id',
+    'coordinate_kind', 'description', 'grasp_confirmation_policy',
+    'max_position', 'mimic_followers', 'min_position', 'mount_frame',
+    'named_presets', 'open_state_ref', 'schema_version',
+    'source_coordinate_name', 'source_group_name', 'source_kind',
+    'state_authority_class', 'state_authority_id', 'target_role_id',
+    'tcp_frame', 'touch_links', 'transport_kind', 'unit',
   ], path);
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.manual_control_gripper_descriptor.v1') {
+  if (schemaVersion !== 'manyforge.manual_control_gripper_descriptor.v2') {
     return fail(`${path}.schema_version`, 'the supported gripper descriptor');
   }
   const coordinateKind = stringAt(record.coordinate_kind, `${path}.coordinate_kind`);
@@ -6444,6 +6948,83 @@ function manualControlGripperDescriptorAt(
   });
   const minPosition = nullableNumberAt(record.min_position, `${path}.min_position`);
   const maxPosition = nullableNumberAt(record.max_position, `${path}.max_position`);
+  const description = nullableStringAt(record.description, `${path}.description`);
+  const actuationKind = nullableStringAt(record.actuation_kind, `${path}.actuation_kind`);
+  const commandDurationS = nullableNumberAt(record.command_duration_s, `${path}.command_duration_s`);
+  const openStateRef = nullableStringAt(record.open_state_ref, `${path}.open_state_ref`);
+  const closedStateRef = nullableStringAt(record.closed_state_ref, `${path}.closed_state_ref`);
+  const sourceGroupName = nullableStringAt(record.source_group_name, `${path}.source_group_name`);
+  const mountFrame = nullableStringAt(record.mount_frame, `${path}.mount_frame`);
+  const attachFrame = nullableStringAt(record.attach_frame, `${path}.attach_frame`);
+  const tcpFrame = nullableStringAt(record.tcp_frame, `${path}.tcp_frame`);
+  const controlInterfaceContractId = nullableStringAt(
+    record.control_interface_contract_id,
+    `${path}.control_interface_contract_id`,
+  );
+  const stateAuthorityId = nullableStringAt(record.state_authority_id, `${path}.state_authority_id`);
+  const stateAuthorityClass = nullableStringAt(
+    record.state_authority_class,
+    `${path}.state_authority_class`,
+  );
+  const strings = (raw: unknown, field: string) => boundedArrayAt(
+    raw,
+    `${path}.${field}`,
+    256,
+  ).map((item, index) => {
+    const result = stringAt(item, `${path}.${field}[${index}]`);
+    if (result.trim() === '') return fail(`${path}.${field}[${index}]`, 'a non-empty source name');
+    return result;
+  });
+  const touchLinks = strings(record.touch_links, 'touch_links');
+  const auxiliaryFrames = strings(record.auxiliary_frames, 'auxiliary_frames');
+  const contracts = manualControlContractsAt(record.contracts, `${path}.contracts`);
+  const commandKind = stringAt(record.command_kind, `${path}.command_kind`);
+  const transportKind = stringAt(record.transport_kind, `${path}.transport_kind`);
+  const completionPolicy = stringAt(record.completion_policy, `${path}.completion_policy`);
+  const graspConfirmationPolicy = stringAt(
+    record.grasp_confirmation_policy,
+    `${path}.grasp_confirmation_policy`,
+  );
+  if (
+    commandKind !== 'gripper_position'
+    || transportKind !== 'resolved_binding'
+    || completionPolicy !== 'goal_fenced_target_reached'
+    || graspConfirmationPolicy !== 'binding_feedback_required'
+    || (actuationKind !== null
+      && actuationKind !== 'position_commanded'
+      && actuationKind !== 'pneumatic')
+    || (stateAuthorityClass !== null
+      && stateAuthorityClass !== 'measured'
+      && stateAuthorityClass !== 'commanded'
+      && stateAuthorityClass !== 'predicted')
+  ) {
+    return fail(path, 'the exact qualified gripper command semantics');
+  }
+  const authoredValues = [
+    description, actuationKind, commandDurationS, openStateRef, closedStateRef,
+    sourceGroupName, mountFrame, attachFrame, tcpFrame,
+  ];
+  const configured = authoredValues.some((item) => item !== null)
+    || touchLinks.length > 0
+    || auxiliaryFrames.length > 0;
+  if (
+    (configured && (
+      authoredValues.some((item) => item === null)
+      || description?.trim() === ''
+      || commandDurationS === null
+      || commandDurationS <= 0
+      || commandDurationS > 60
+      || touchLinks.length === 0
+      || !namedPresets.some((preset) => preset.name === openStateRef)
+      || !namedPresets.some((preset) => preset.name === closedStateRef)
+    ))
+    || new Set(touchLinks).size !== touchLinks.length
+    || new Set(auxiliaryFrames).size !== auxiliaryFrames.length
+    || (stateAuthorityId === null) !== (stateAuthorityClass === null)
+    || controlInterfaceContractId !== (contracts.controlPath?.controlInterfaceContractId ?? null)
+  ) {
+    return fail(path, 'one complete, internally consistent gripper configuration');
+  }
   if (
     (sourceKind === 'model_role'
       && (minPosition === null || maxPosition === null || minPosition > maxPosition))
@@ -6482,15 +7063,33 @@ function manualControlGripperDescriptorAt(
     commandTargetId: stringAt(record.command_target_id, `${path}.command_target_id`),
     componentRoleId: stringAt(record.component_role_id, `${path}.component_role_id`),
     targetRoleId: stringAt(record.target_role_id, `${path}.target_role_id`),
+    description,
+    commandKind,
+    actuationKind: actuationKind as ManualControlGripperDescriptor['actuationKind'],
+    transportKind,
+    controlInterfaceContractId,
+    stateAuthorityId,
+    stateAuthorityClass: stateAuthorityClass as ManualControlGripperDescriptor['stateAuthorityClass'],
+    completionPolicy,
+    graspConfirmationPolicy,
+    sourceGroupName,
     sourceCoordinateName: stringAt(record.source_coordinate_name, `${path}.source_coordinate_name`),
     sourceKind: sourceKind as ResourceSourceKind,
     coordinateKind: coordinateKind as CoordinateKind,
     unit: unit as 'rad' | 'm',
     minPosition,
     maxPosition,
+    openStateRef,
+    closedStateRef,
+    commandDurationS,
+    touchLinks,
+    mountFrame,
+    attachFrame,
+    tcpFrame,
+    auxiliaryFrames,
     mimicFollowers,
     namedPresets,
-    contracts: manualControlContractsAt(record.contracts, `${path}.contracts`),
+    contracts,
   };
 }
 
@@ -6653,16 +7252,23 @@ export function parseExecutionControlStatus(
   );
   exactKeysAt(
     control,
-    ['cell_stop_action', 'observed_gripper', 'observed_motion', 'schema_version'],
+    [
+      'cell_stop_action',
+      'observed_gripper',
+      'observed_motion',
+      'resident_operations',
+      'runtime_scale_control',
+      'schema_version',
+    ],
     'executionControlState.control_state',
   );
   if (stringAt(
     control.schema_version,
     'executionControlState.control_state.schema_version',
-  ) !== 'manyforge.execution_control_state.v1') {
+  ) !== 'manyforge.execution_control_state.v3') {
     return fail(
       'executionControlState.control_state.schema_version',
-      'manyforge.execution_control_state.v1',
+      'manyforge.execution_control_state.v3',
     );
   }
   const motionTarget = objectAt(
@@ -6674,7 +7280,49 @@ export function parseExecutionControlStatus(
     'executionTargets.targets.direct_control_gripper',
   );
   const identity = targetIdentity;
-  return parseExecutionOwnerStatus({
+  const allowedProgramRuns = new Set([
+    stringAt(
+      motionTarget.program_run_id,
+      'executionTargets.targets.direct_control.program_run_id',
+    ),
+    stringAt(
+      gripperTarget.program_run_id,
+      'executionTargets.targets.direct_control_gripper.program_run_id',
+    ),
+  ]);
+  const residentOperations = arrayAt(
+    control.resident_operations,
+    'executionControlState.control_state.resident_operations',
+  ).map((value, index) => {
+    const operation = objectAt(
+      value,
+      `executionControlState.control_state.resident_operations[${index}]`,
+    );
+    const programRunId = stringAt(
+      operation.program_run_id,
+      `executionControlState.control_state.resident_operations[${index}].program_run_id`,
+    );
+    if (!allowedProgramRuns.has(programRunId)) {
+      return fail(
+        `executionControlState.control_state.resident_operations[${index}].program_run_id`,
+        'one of the exact direct-control Program runs',
+      );
+    }
+    return parseOperationObservation({
+      command: 'read',
+      ok: true,
+      operation,
+      resident: true,
+    });
+  });
+  if (new Set(residentOperations.map((operation) => operation.operationId)).size
+    !== residentOperations.length) {
+    return fail(
+      'executionControlState.control_state.resident_operations',
+      'unique operation identities',
+    );
+  }
+  const status = parseExecutionOwnerStatus({
     api_version: 'manyforge.execution_command_response.v1',
     command: 'status',
     ok: true,
@@ -6696,6 +7344,28 @@ export function parseExecutionControlStatus(
       scene_revision: identity.sceneRevision,
     },
   });
+  const runtimeScaleControl = runtimeScaleControlStatusAt(
+    control.runtime_scale_control,
+    'executionControlState.control_state.runtime_scale_control',
+  );
+  if (
+    runtimeScaleControl.selector.programBindingId
+      !== status.directControl.programBindingId
+    || runtimeScaleControl.selector.componentRoleId
+      !== status.directControl.componentRoleId
+    || runtimeScaleControl.selector.targetRoleId
+      !== status.directControl.targetRoleId
+  ) {
+    return fail(
+      'executionControlState.control_state.runtime_scale_control.selector',
+      'the exact direct-control motion target',
+    );
+  }
+  return {
+    ...status,
+    residentOperations,
+    runtimeScaleControl,
+  };
 }
 
 export function parseExecutionOwnerStatus(value: unknown): ExecutionOwnerStatus {
@@ -7319,6 +7989,8 @@ export function parseExecutionOwnerStatus(value: unknown): ExecutionOwnerStatus 
     },
     observedMotion,
     observedGripper,
+    residentOperations: [],
+    runtimeScaleControl: null,
     cellStopAction: {
       available: cellStopAvailable,
       unavailableReason: cellStopUnavailableReason,
@@ -7874,77 +8546,257 @@ const RUNTIME_SCALE_STATES = new Set([
   'failed',
 ]);
 
-export function parseOperationRuntimeScaleStatus(
+function runtimeScaleControlSelectorAt(
   value: unknown,
-): OperationRuntimeScaleStatus {
-  const envelope = objectAt(value, 'operationRuntimeScale');
+  path: string,
+): RuntimeScaleControlStatus['selector'] {
+  const selector = objectAt(value, path);
+  exactKeysAt(
+    selector,
+    ['component_role_id', 'program_binding_id', 'target_role_id'],
+    path,
+  );
+  return {
+    componentRoleId: stringAt(selector.component_role_id, `${path}.component_role_id`),
+    programBindingId: stringAt(selector.program_binding_id, `${path}.program_binding_id`),
+    targetRoleId: stringAt(selector.target_role_id, `${path}.target_role_id`),
+  };
+}
+
+function nullableNonnegativeIntegerAt(
+  value: unknown,
+  path: string,
+): number | null {
+  if (value === null) return null;
+  const result = integerAt(value, path);
+  return result >= 0 ? result : fail(path, 'a nonnegative integer or null');
+}
+
+function runtimeScaleControlStatusAt(
+  value: unknown,
+  path: string,
+): RuntimeScaleControlStatus {
+  const status = objectAt(value, path);
+  exactKeysAt(status, [
+    'active_control_configuration_generation',
+    'active_control_configuration_id',
+    'active_operation_id',
+    'active_operation_revision',
+    'active_operation_scale_generation',
+    'application_state',
+    'control_binding_id',
+    'control_binding_revision',
+    'control_domain_id',
+    'control_domain_revision',
+    'control_generation',
+    'effective_scale',
+    'frozen',
+    'reason',
+    'requested_scale',
+    'scaling_domain_id',
+    'selector',
+    'supported',
+  ], path);
+  const controlGeneration = integerAt(
+    status.control_generation,
+    `${path}.control_generation`,
+  );
+  const requestedScale = numberAt(status.requested_scale, `${path}.requested_scale`);
+  const effectiveScale = nullableNumberAt(status.effective_scale, `${path}.effective_scale`);
   if (
-    booleanAt(envelope.ok, 'operationRuntimeScale.ok') !== true
-    || stringAt(envelope.command, 'operationRuntimeScale.command') !== 'get_runtime_scale'
+    controlGeneration < 0
+    || requestedScale < 0 || requestedScale > 1
+    || (effectiveScale !== null && (effectiveScale < 0 || effectiveScale > 1))
   ) {
-    return fail('operationRuntimeScale', 'a successful runtime-scale response');
+    return fail(path, 'nonnegative generations and scales within [0, 1]');
   }
-  const status = objectAt(
-    envelope.runtime_scale,
-    'operationRuntimeScale.runtime_scale',
+  const applicationState = nullableStringAt(
+    status.application_state,
+    `${path}.application_state`,
   );
-  const operationRevision = integerAt(
-    status.operation_revision,
-    'operationRuntimeScale.runtime_scale.operation_revision',
-  );
-  const runtimeScaleGeneration = integerAt(
-    status.runtime_scale_generation,
-    'operationRuntimeScale.runtime_scale.runtime_scale_generation',
-  );
-  const requestedScale = numberAt(
-    status.requested_scale,
-    'operationRuntimeScale.runtime_scale.requested_scale',
-  );
-  const effectiveScale = numberAt(
-    status.effective_scale,
-    'operationRuntimeScale.runtime_scale.effective_scale',
-  );
-  const state = stringAt(
-    status.state,
-    'operationRuntimeScale.runtime_scale.state',
-  );
-  const participants = arrayAt(
-    status.participants,
-    'operationRuntimeScale.runtime_scale.participants',
-  );
-  if (operationRevision < 1) {
-    return fail('operationRuntimeScale.runtime_scale.operation_revision', 'positive');
+  if (applicationState !== null && !RUNTIME_SCALE_STATES.has(applicationState)) {
+    return fail(`${path}.application_state`, 'a known runtime-scale state or null');
   }
-  if (runtimeScaleGeneration < 0) {
-    return fail('operationRuntimeScale.runtime_scale.runtime_scale_generation', 'nonnegative');
+  let reason: string | null = null;
+  if (status.reason !== null) {
+    const error = objectAt(status.reason, `${path}.reason`);
+    exactKeysAt(error, ['code', 'details', 'message'], `${path}.reason`);
+    objectAt(error.details, `${path}.reason.details`);
+    stringAt(error.code, `${path}.reason.code`);
+    reason = stringAt(error.message, `${path}.reason.message`);
   }
-  if (
-    requestedScale < 0 || requestedScale > 1
-    || effectiveScale < 0 || effectiveScale > 1
-  ) {
-    return fail('operationRuntimeScale.runtime_scale', 'bounded to scales within [0, 1]');
-  }
-  if (!RUNTIME_SCALE_STATES.has(state)) {
-    return fail('operationRuntimeScale.runtime_scale.state', 'a known runtime-scale state');
+  const controlDomainId = nullableStringAt(
+    status.control_domain_id,
+    `${path}.control_domain_id`,
+  );
+  const controlDomainRevision = nullableStringAt(
+    status.control_domain_revision,
+    `${path}.control_domain_revision`,
+  );
+  const controlBindingId = nullableStringAt(
+    status.control_binding_id,
+    `${path}.control_binding_id`,
+  );
+  const controlBindingRevision = nullableStringAt(
+    status.control_binding_revision,
+    `${path}.control_binding_revision`,
+  );
+  const scalingDomainId = nullableStringAt(
+    status.scaling_domain_id,
+    `${path}.scaling_domain_id`,
+  );
+  const activeControlConfigurationId = nullableStringAt(
+    status.active_control_configuration_id,
+    `${path}.active_control_configuration_id`,
+  );
+  const activeControlConfigurationGeneration = nullableNonnegativeIntegerAt(
+    status.active_control_configuration_generation,
+    `${path}.active_control_configuration_generation`,
+  );
+  const resolvedScope = [
+    controlDomainId,
+    controlDomainRevision,
+    controlBindingId,
+    controlBindingRevision,
+    scalingDomainId,
+    activeControlConfigurationId,
+    activeControlConfigurationGeneration,
+  ];
+  const supported = booleanAt(status.supported, `${path}.supported`);
+  if (supported !== resolvedScope.every((item) => item !== null)) {
+    return fail(path, 'support truth consistent with one complete resolved control scope');
   }
   return {
-    operationId: stringAt(
-      status.operation_id,
-      'operationRuntimeScale.runtime_scale.operation_id',
-    ),
-    operationRevision,
-    runtimeScaleGeneration,
+    selector: runtimeScaleControlSelectorAt(status.selector, `${path}.selector`),
+    controlGeneration,
     requestedScale,
+    supported,
+    frozen: booleanAt(status.frozen, `${path}.frozen`),
+    controlDomainId,
+    controlDomainRevision,
+    controlBindingId,
+    controlBindingRevision,
+    scalingDomainId,
+    activeControlConfigurationId,
+    activeControlConfigurationGeneration,
+    activeOperationId: nullableStringAt(
+      status.active_operation_id,
+      `${path}.active_operation_id`,
+    ),
+    activeOperationRevision: nullableNonnegativeIntegerAt(
+      status.active_operation_revision,
+      `${path}.active_operation_revision`,
+    ),
+    activeOperationScaleGeneration: nullableNonnegativeIntegerAt(
+      status.active_operation_scale_generation,
+      `${path}.active_operation_scale_generation`,
+    ),
     effectiveScale,
-    state: state as OperationRuntimeScaleStatus['state'],
-    supported: participants.length > 0 && participants.every((participant, index) => (
-      booleanAt(
-        objectAt(
-          participant,
-          `operationRuntimeScale.runtime_scale.participants[${index}]`,
-        ).supported,
-        `operationRuntimeScale.runtime_scale.participants[${index}].supported`,
-      )
-    )),
+    applicationState: applicationState as RuntimeScaleControlStatus['applicationState'],
+    reason,
+  };
+}
+
+export function parseRuntimeScaleControlStatus(
+  value: unknown,
+): RuntimeScaleControlStatus {
+  const envelope = objectAt(value, 'runtimeScaleControl');
+  exactKeysAt(
+    envelope,
+    ['api_version', 'command', 'ok', 'runtime_scale_control'],
+    'runtimeScaleControl',
+  );
+  if (
+    booleanAt(envelope.ok, 'runtimeScaleControl.ok') !== true
+    || stringAt(envelope.command, 'runtimeScaleControl.command')
+      !== 'get_runtime_scale_control'
+  ) {
+    return fail('runtimeScaleControl', 'a successful control-scope response');
+  }
+  return runtimeScaleControlStatusAt(
+    envelope.runtime_scale_control,
+    'runtimeScaleControl.runtime_scale_control',
+  );
+}
+
+export function parseRuntimeScaleControlAccepted(
+  value: unknown,
+): RuntimeScaleControlAccepted {
+  const envelope = objectAt(value, 'runtimeScaleControlAcceptance');
+  exactKeysAt(
+    envelope,
+    ['accepted', 'api_version', 'command', 'ok'],
+    'runtimeScaleControlAcceptance',
+  );
+  if (
+    booleanAt(envelope.ok, 'runtimeScaleControlAcceptance.ok') !== true
+    || stringAt(envelope.command, 'runtimeScaleControlAcceptance.command')
+      !== 'set_runtime_scale_control'
+  ) {
+    return fail(
+      'runtimeScaleControlAcceptance',
+      'a successful control-scope acceptance',
+    );
+  }
+  const accepted = objectAt(
+    envelope.accepted,
+    'runtimeScaleControlAcceptance.accepted',
+  );
+  exactKeysAt(accepted, [
+    'accepted_at_ns',
+    'active_operation_id',
+    'active_operation_revision',
+    'active_operation_scale_generation',
+    'control_generation',
+    'replay_status',
+    'request_id',
+    'requested_scale',
+    'selector',
+  ], 'runtimeScaleControlAcceptance.accepted');
+  const controlGeneration = integerAt(
+    accepted.control_generation,
+    'runtimeScaleControlAcceptance.accepted.control_generation',
+  );
+  const requestedScale = numberAt(
+    accepted.requested_scale,
+    'runtimeScaleControlAcceptance.accepted.requested_scale',
+  );
+  if (controlGeneration < 1 || requestedScale < 0 || requestedScale > 1) {
+    return fail(
+      'runtimeScaleControlAcceptance.accepted',
+      'a positive generation and scale within [0, 1]',
+    );
+  }
+  stringAt(
+    accepted.replay_status,
+    'runtimeScaleControlAcceptance.accepted.replay_status',
+  );
+  numberAt(
+    accepted.accepted_at_ns,
+    'runtimeScaleControlAcceptance.accepted.accepted_at_ns',
+  );
+  return {
+    requestId: stringAt(
+      accepted.request_id,
+      'runtimeScaleControlAcceptance.accepted.request_id',
+    ),
+    selector: runtimeScaleControlSelectorAt(
+      accepted.selector,
+      'runtimeScaleControlAcceptance.accepted.selector',
+    ),
+    requestedScale,
+    controlGeneration,
+    activeOperationId: nullableStringAt(
+      accepted.active_operation_id,
+      'runtimeScaleControlAcceptance.accepted.active_operation_id',
+    ),
+    activeOperationRevision: nullableNonnegativeIntegerAt(
+      accepted.active_operation_revision,
+      'runtimeScaleControlAcceptance.accepted.active_operation_revision',
+    ),
+    activeOperationScaleGeneration: nullableNonnegativeIntegerAt(
+      accepted.active_operation_scale_generation,
+      'runtimeScaleControlAcceptance.accepted.active_operation_scale_generation',
+    ),
   };
 }

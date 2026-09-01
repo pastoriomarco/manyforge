@@ -35,7 +35,7 @@ inline constexpr std::string_view kNativeExecutionRuntimeConfigurationSchemaId =
 inline constexpr std::string_view
     kNativeExecutionRuntimeConfigurationSchemaRevision =
         "sha256:"
-        "c20bf40303bddd213d8db77b7075c0fe224e00928f4e6bda3cbfd7ebba880d6e";
+        "4be97ca6314af96d083a37a6aed9ef5976ed0e63c02d69ac790377edeb6804fb";
 inline constexpr std::string_view kNativeExecutionRuntimeRoleId =
     native_execution_runtime_contract::kRuntimeRoleId;
 inline constexpr std::string_view kNativeExecutionRuntimeStatusEndpointRoleId =

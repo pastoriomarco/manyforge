@@ -143,11 +143,13 @@ _RUNTIME_RESTORATION_SOURCE_FIELDS: Final = {
     "default_fault_stop_profile": (
         "adapters.execution.config.default_fault_stop_profile"
     ),
+    "direct_control_joint_limits": "robot_config.robot_control_joint_limits",
     "execution_tick_hz": "adapters.execution.config.execution_tick_hz",
     "initial_joint_positions_rad": (
         "adapters.execution.config.initial_joint_positions_rad"
     ),
     "mode": "adapters.execution.config.mode",
+    "motion_target_limits": "robot_config.global_max_tcp_linear_speed_mps",
     "operator_stop_profile": "adapters.execution.config.operator_stop_profile",
     "planner_rng_seed": "adapters.planning.config.rng_seed",
 }
@@ -242,22 +244,22 @@ _EXPECTED_RUNTIME_RESTORATION_PROFILE_DIGESTS: Final = {
         "5465175c487df3cc2cc34ef714b3372550bec75396cbb24809f3a5140dab9ed1"
     ),
     "lite6_native_simulated_v0": (
-        "35e27129b5cf16c680c8722c93524d9d83d8b9ec0b8a9baf5735df5449e1a611"
+        "0f7aebf916e5dda449405bd2a52ea2554a495dea510ef787312978a1b85490ce"
     ),
     "ur10e_robotiq_assistant_isaac_commanded_v0": (
         "c334ba022f55d83199ef995747d778016d498753cbf28dec99d22bc9de6f7330"
     ),
     "ur10e_robotiq_assistant_native_simulated_v0": (
-        "61ec7a2ea3346234e83d457a1ba24833d729de141750c15214c4997657842f69"
+        "949f67583115adac7f31eba35ee68ae4e9fbbfeee94289cce0a14cf52b93f615"
     ),
     "ur10e_robotiq_isaac_commanded_v0": (
         "8f1205f803354b32c887ee9db8ef98ab3a599e30cb5b22dbfb0aad4e83b7c3a8"
     ),
     "ur10e_robotiq_native_simulated_v0": (
-        "acdbd2176ce72be69ab0d995aab56eb0b43a23f105d65920e5463d3bc42ab43b"
+        "abd8e7b067258f09067267a94eb02613e1dfa7907c5a92e0afbd147c01ce5347"
     ),
     "ur5_native_simulated_v0": (
-        "5fa7f58a5abc5f9bc22a1f48dae3e8c8006b44c24140ab9954321a50b9b73f55"
+        "4657afd224d18c83d40955e4cd7a2c1f556c83934e568e775255b4ced385c85b"
     ),
 }
 _EXPECTED_RUNTIME_RESTORATION_PROFILE_FAMILIES: Final = {
@@ -1839,6 +1841,11 @@ def validate(source: Path, root: Path) -> None:
             if is_ros2_control
             else _RUNTIME_RESTORATION_SOURCE_FIELDS
         )
+        if profile_id == "lite6_native_simulated_v0":
+            expected_source_fields = {
+                **expected_source_fields,
+                "gripper_target_configurations": "grippers",
+            }
         if profile["source_fields"] != expected_source_fields:
             raise SourceDescriptionError(
                 f"{path}.source_fields changes the pinned I0 field mapping"

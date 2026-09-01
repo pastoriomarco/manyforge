@@ -4,6 +4,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <optional>
 
 #include <manyforge_core/types/retained_product.hpp>
 #include <manyforge_core/types/strong_id.hpp>
@@ -74,7 +75,10 @@ struct ScenarioProgramSelection final {
 class FilesystemScenarioApplyCandidateSource final {
 public:
   FilesystemScenarioApplyCandidateSource(std::filesystem::path package_root,
-                                         std::string catalog_name);
+                                         std::string catalog_name,
+                                         std::optional<std::filesystem::path>
+                                             candidate_package_root =
+                                                 std::nullopt);
 
   [[nodiscard]] ScenarioApplyCandidateSelection
   ResolveExact(const ScenarioApplyCandidateQuery &query) const;
@@ -88,11 +92,39 @@ public:
   [[nodiscard]] ScenarioProgramSelection
   LoadExactProgramSelection(std::string_view scenario_id) const;
 
-  [[nodiscard]] const std::filesystem::path &catalog_path() const noexcept;
+  /// Resolve one Scenario from the exact immutable catalog revision named by
+  /// an addressed request.  Candidate publication never changes the meaning
+  /// of the unqualified lookup above.
+  [[nodiscard]] ScenarioProgramSelection LoadExactProgramSelectionForCatalog(
+      std::string_view scenario_id,
+      const manyforge::core::ScenarioCatalogRevision
+          &scenario_catalog_revision) const;
+
+  /// Return the Scenario occurrence whose retained Deployment is the exact
+  /// active Manager selection, or no value when this Scenario names another
+  /// Deployment in every qualified catalog.
+  [[nodiscard]] std::optional<ScenarioProgramSelection>
+  TryLoadExactProgramSelectionForActive(
+      std::string_view scenario_id,
+      const manyforge::core::RetainedBundleId &retained_bundle_id,
+      const manyforge::core::GraphRevision &graph_revision) const;
+
+  [[nodiscard]] std::filesystem::path catalog_path() const;
+
+  [[nodiscard]] std::filesystem::path catalog_path_for_revision(
+      const manyforge::core::ScenarioCatalogRevision
+          &scenario_catalog_revision) const;
 
 private:
+  [[nodiscard]] ScenarioProgramSelection LoadExactProgramSelectionFrom(
+      std::string_view scenario_id,
+      const std::filesystem::path &catalog_path) const;
+  [[nodiscard]] std::optional<std::filesystem::path>
+  candidate_catalog_path() const;
+
   std::filesystem::path package_root_;
-  std::filesystem::path catalog_path_;
+  std::optional<std::filesystem::path> candidate_package_root_;
+  std::string catalog_name_;
 };
 
 } // namespace manyforge::deployment

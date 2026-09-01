@@ -23,6 +23,8 @@ export interface BtNodePresentation {
   selected: boolean;
   layoutDirection: LayoutDirection;
   executionAvailable?: boolean;
+  executionDisposition?: 'executable' | 'configuration_required' | 'unavailable';
+  executionReason?: string;
   invalid?: boolean;
 }
 
@@ -95,10 +97,12 @@ export function BtNode({
       aria-pressed={node.selected}
       aria-label={`${node.label} Program node`}
       title={node.invalid
-        ? 'This node has incomplete or invalid authored fields.'
-        : node.executionAvailable
-          ? 'Execution implementation available'
-          : 'Authorable here; execution remains unavailable at its restoration gate'}
+        ? 'This node needs valid required configuration before execution.'
+        : node.executionDisposition === 'executable'
+          ? 'Executable for the exact current Applied Program and Binding.'
+          : node.executionDisposition === 'configuration_required'
+            ? 'Execution implementation is available; complete the required node configuration.'
+            : `Authorable here; execution unavailable${node.executionReason ? `: ${node.executionReason}` : '.'}`}
       onClick={() => onSelect?.(node.id)}
       onFocus={() => onFocus?.(node.id)}
       onKeyDown={(event) => {
@@ -140,10 +144,12 @@ export function BtNode({
         />
       )}
       <span
-        className={`node-availability-dot ${node.executionAvailable ? 'execution-ready' : 'authoring-only'}`}
-        aria-label={node.executionAvailable
+        className={`node-availability-dot ${node.executionDisposition ?? (node.executionAvailable ? 'executable' : 'unavailable')}`}
+        aria-label={node.executionDisposition === 'executable'
           ? 'Execution available'
-          : 'Authoring only'}
+          : node.executionDisposition === 'configuration_required'
+            ? 'Configuration required'
+            : 'Execution unavailable'}
       />
     </div>
   );

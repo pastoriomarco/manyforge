@@ -6,8 +6,6 @@ import asyncio
 
 import pytest
 
-from manyforge_composer.backend.routes_viewer import create_viewer_router
-from manyforge_composer.backend.security import SecurityConfig
 from manyforge_composer.backend.viewer_data_plane import (
     BoundedViewerFanout,
     ViewerDemandRegistry,
@@ -232,13 +230,11 @@ def test_visual_pose_composition_round_trips_without_runtime_or_fk_owner() -> No
     ) == child_in_parent
 
 
-def test_viewer_factories_fail_before_state_or_process_effects() -> None:
+def test_unavailable_worker_factories_fail_before_state_or_process_effects() -> None:
     class PoisonState:
         def __getattribute__(self, name: str) -> object:
             raise AssertionError(f"state was accessed: {name}")
 
-    with pytest.raises(RuntimeError, match="composable_cell_viewer_client_unavailable"):
-        create_viewer_router(PoisonState(), SecurityConfig())  # type: ignore[arg-type]
     with pytest.raises(RuntimeError, match="composable_cell_viewer_worker_unavailable"):
         ViewerWorkerSupervisor()
     with pytest.raises(

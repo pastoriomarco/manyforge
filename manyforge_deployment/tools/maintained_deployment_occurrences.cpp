@@ -63,9 +63,18 @@ namespace core = manyforge::core;
 namespace deployment = manyforge::deployment;
 
 struct Options final {
+  enum class Mode { kCheck, kCompileCandidate };
+
+  Mode mode{Mode::kCheck};
   std::filesystem::path workspace_root;
   std::optional<std::filesystem::path> package_root;
   std::map<std::string, std::filesystem::path, std::less<>> prepared_roots;
+  std::filesystem::path base_package_root;
+  std::filesystem::path candidate_package_root;
+  std::filesystem::path candidate_deployment_path;
+  std::filesystem::path candidate_program_path;
+  std::string candidate_scenario_id;
+  std::string expected_scenario_catalog_revision;
 };
 
 struct Scenario final {
@@ -105,14 +114,25 @@ constexpr std::array<Scenario, 12U> kScenarios{{
 }};
 
 [[nodiscard]] Options parse_options(int argc, char **argv) {
-  if (argc < 3 || std::string_view(argv[1]) != "--check") {
+  if (argc < 3 || (std::string_view(argv[1]) != "--check" &&
+                   std::string_view(argv[1]) != "--compile-candidate")) {
     throw std::invalid_argument(
-        "usage: manyforge_maintained_deployment_occurrences --check "
+        "usage: manyforge_maintained_deployment_occurrences "
+        "(--check | --compile-candidate) "
         "--workspace-root <manyforge-root> "
         "[--package-root <empty-output-directory>] "
+        "[--base-package-root <installed-package> "
+        "--candidate-package-root <writable-package> "
+        "--candidate-deployment <deployment-file> "
+        "--candidate-program <program-file> "
+        "--scenario-id <canonical-scenario-id> "
+        "--expected-scenario-catalog-revision <sha256>] "
         "--prepared <family-id>=<directory> [--prepared ...]");
   }
   Options result;
+  result.mode = std::string_view(argv[1]) == "--check"
+                    ? Options::Mode::kCheck
+                    : Options::Mode::kCompileCandidate;
   for (int index = 2; index < argc;) {
     const std::string_view option(argv[index]);
     if (index + 1 >= argc) {
@@ -127,6 +147,41 @@ constexpr std::array<Scenario, 12U> kScenarios{{
     }
     if (option == "--package-root" && !result.package_root.has_value()) {
       result.package_root = value;
+      index += 2;
+      continue;
+    }
+    if (option == "--base-package-root" &&
+        result.base_package_root.empty()) {
+      result.base_package_root = value;
+      index += 2;
+      continue;
+    }
+    if (option == "--candidate-package-root" &&
+        result.candidate_package_root.empty()) {
+      result.candidate_package_root = value;
+      index += 2;
+      continue;
+    }
+    if (option == "--candidate-deployment" &&
+        result.candidate_deployment_path.empty()) {
+      result.candidate_deployment_path = value;
+      index += 2;
+      continue;
+    }
+    if (option == "--candidate-program" &&
+        result.candidate_program_path.empty()) {
+      result.candidate_program_path = value;
+      index += 2;
+      continue;
+    }
+    if (option == "--scenario-id" && result.candidate_scenario_id.empty()) {
+      result.candidate_scenario_id = value;
+      index += 2;
+      continue;
+    }
+    if (option == "--expected-scenario-catalog-revision" &&
+        result.expected_scenario_catalog_revision.empty()) {
+      result.expected_scenario_catalog_revision = value;
       index += 2;
       continue;
     }
@@ -148,6 +203,28 @@ constexpr std::array<Scenario, 12U> kScenarios{{
   if (result.workspace_root.empty() || result.prepared_roots.size() != 3U) {
     throw std::invalid_argument("maintained qualification requires one "
                                 "workspace root and three prepared families");
+  }
+  if (result.mode == Options::Mode::kCheck) {
+    if (!result.base_package_root.empty() ||
+        !result.candidate_package_root.empty() ||
+        !result.candidate_deployment_path.empty() ||
+        !result.candidate_program_path.empty() ||
+        !result.candidate_scenario_id.empty() ||
+        !result.expected_scenario_catalog_revision.empty()) {
+      throw std::invalid_argument(
+          "candidate compilation options are invalid in --check mode");
+    }
+  } else if (result.package_root.has_value() ||
+             result.base_package_root.empty() ||
+             result.candidate_package_root.empty() ||
+             result.candidate_deployment_path.empty() ||
+             result.candidate_program_path.empty() ||
+             result.candidate_scenario_id.empty() ||
+             !deployment::is_sha256_digest(
+                 result.expected_scenario_catalog_revision)) {
+    throw std::invalid_argument(
+        "candidate compilation requires exact source, destination, "
+        "Deployment, Scenario, and expected-catalog inputs");
   }
   return result;
 }
@@ -527,7 +604,15 @@ void verify_gripper_resource_semantics(
 materialize_scenarios(const std::filesystem::path &root,
                       const QualifiedCatalogClosure &catalog,
                       const ExactCompilerInputSource &input_source,
-                      const std::filesystem::path &package_root) {
+                      const std::filesystem::path &package_root,
+                      std::span<const Scenario> scenarios = kScenarios,
+                      const std::optional<std::filesystem::path>
+                          &deployment_override = std::nullopt,
+                      const bool publish_canonical_empty = true) {
+  if (deployment_override.has_value() && scenarios.size() != 1U) {
+    throw std::invalid_argument(
+        "one candidate Deployment override requires one Scenario");
+  }
   const std::string overlay_bytes = read_file(
       root / "manyforge_deployment/resources/maintained/site_overlays/"
              "manyforge_local_examples.site_overlay.json");
@@ -539,7 +624,7 @@ materialize_scenarios(const std::filesystem::path &root,
       package_root);
   std::map<std::string, ScenarioProduct, std::less<>> result;
 
-  for (const auto &scenario : kScenarios) {
+  for (const auto &scenario : scenarios) {
     const std::string expected_runtime_profile_id =
         scenario.ros2_control_execution
             ? "manyforge.ros2_control_execution_runtime"
@@ -557,7 +642,9 @@ materialize_scenarios(const std::filesystem::path &root,
     }
     const auto verified = deployment::verify_deployment_artifact_revision(
         deployment::parse_strict_json_model_yaml(
-            read_file(root / scenario.source)),
+            read_file(deployment_override.has_value()
+                          ? *deployment_override
+                          : root / scenario.source)),
         envelope_profiles);
     std::set<CatalogKey> selected_records;
     for (const auto &reference : verified.catalog_records()) {
@@ -738,54 +825,61 @@ materialize_scenarios(const std::filesystem::path &root,
           "scenario model map cannot be independently reloaded");
     }
 
-    const auto empty_deployment =
-        deployment::detail::derive_cell_scoped_canonical_empty_deployment(
-            verified, profiles);
-    const auto empty_composition = deployment::compose_cell_occurrences(
-        empty_deployment.graph(),
-        std::span<const deployment::SourceVerifiedModelAsset>{},
-        std::span<const deployment::QualifiedComponentType>{});
-    const auto empty_overlay = deployment::select_site_overlay_for_deployment(
-        empty_deployment.applicability_inputs().value().site_overlay_ref,
-        empty_deployment.applicability_inputs().value().external_resources,
-        nullptr);
-    const auto empty_applicability = deployment::qualify_cell_applicability(
-        empty_composition, empty_deployment.applicability_inputs(), profiles,
-        std::span<const deployment::QualifiedRuntimePolicy>{},
-        std::span<const deployment::QualifiedCommandSchema>{},
-        std::span<const deployment::QualifiedCapabilityDefinition>{},
-        std::span<const deployment::QualifiedControlInterfaceContract>{},
-        std::span<const deployment::QualifiedControllerTopology>{},
-        std::span<const deployment::QualifiedProviderManifest>{},
-        std::span<const deployment::QualifiedStopEvidencePolicy>{},
-        std::span<const deployment::BuildQualifiedValueSchemaEntry>{},
-        std::span<const deployment::QualifiedCommissioningEvidenceRef>{},
-        empty_overlay);
-    const auto empty_qualified = deployment::qualify_deployment_for_retention(
-        empty_deployment, deployment::compile_cell_ir(empty_applicability));
-    const auto empty_bundle = deployment::detail::RetainedBundleMaterializer::
-        materialize_store_and_reload_production(
-            empty_qualified, manifest_repository, input_source, {},
-            catalog_store, raw_store, bundle_repository);
-    if (empty_bundle == nullptr ||
-        empty_bundle->value().cell_graph.runtime_units !=
-            bundle->value().cell_graph.runtime_units ||
-        empty_bundle->value().compiled_products.runtime_unit_products !=
-            bundle->value().compiled_products.runtime_unit_products) {
-      throw std::logic_error(
-          "cell-scoped canonical predecessor does not retain the candidate's "
-          "exact execution host product");
-    }
-    const auto admission_filename =
-        deployment::cell_scoped_canonical_empty_admission_filename(
-            verified.cell_id());
-    const auto admission =
-        deployment::detail::publish_cell_scoped_canonical_empty_admission(
-            package_root, admission_filename, *empty_bundle);
-    if (admission.cell_id() != verified.cell_id() ||
-        admission.retained_bundle_id() != empty_bundle->retained_bundle_id()) {
-      throw std::logic_error(
-          "cell-scoped canonical predecessor did not reload exactly");
+    std::filesystem::path admission_filename;
+    if (publish_canonical_empty) {
+      const auto empty_deployment =
+          deployment::detail::derive_cell_scoped_canonical_empty_deployment(
+              verified, profiles);
+      const auto empty_composition = deployment::compose_cell_occurrences(
+          empty_deployment.graph(),
+          std::span<const deployment::SourceVerifiedModelAsset>{},
+          std::span<const deployment::QualifiedComponentType>{});
+      const auto empty_overlay = deployment::select_site_overlay_for_deployment(
+          empty_deployment.applicability_inputs().value().site_overlay_ref,
+          empty_deployment.applicability_inputs().value().external_resources,
+          nullptr);
+      const auto empty_applicability = deployment::qualify_cell_applicability(
+          empty_composition, empty_deployment.applicability_inputs(), profiles,
+          std::span<const deployment::QualifiedRuntimePolicy>{},
+          std::span<const deployment::QualifiedCommandSchema>{},
+          std::span<const deployment::QualifiedCapabilityDefinition>{},
+          std::span<const deployment::QualifiedControlInterfaceContract>{},
+          std::span<const deployment::QualifiedControllerTopology>{},
+          std::span<const deployment::QualifiedProviderManifest>{},
+          std::span<const deployment::QualifiedStopEvidencePolicy>{},
+          std::span<const deployment::BuildQualifiedValueSchemaEntry>{},
+          std::span<const deployment::QualifiedCommissioningEvidenceRef>{},
+          empty_overlay);
+      const auto empty_qualified =
+          deployment::qualify_deployment_for_retention(
+              empty_deployment,
+              deployment::compile_cell_ir(empty_applicability));
+      const auto empty_bundle =
+          deployment::detail::RetainedBundleMaterializer::
+              materialize_store_and_reload_production(
+                  empty_qualified, manifest_repository, input_source, {},
+                  catalog_store, raw_store, bundle_repository);
+      if (empty_bundle == nullptr ||
+          empty_bundle->value().cell_graph.runtime_units !=
+              bundle->value().cell_graph.runtime_units ||
+          empty_bundle->value().compiled_products.runtime_unit_products !=
+              bundle->value().compiled_products.runtime_unit_products) {
+        throw std::logic_error(
+            "cell-scoped canonical predecessor does not retain the "
+            "candidate's exact execution host product");
+      }
+      admission_filename =
+          deployment::cell_scoped_canonical_empty_admission_filename(
+              verified.cell_id());
+      const auto admission =
+          deployment::detail::publish_cell_scoped_canonical_empty_admission(
+              package_root, admission_filename, *empty_bundle);
+      if (admission.cell_id() != verified.cell_id() ||
+          admission.retained_bundle_id() !=
+              empty_bundle->retained_bundle_id()) {
+        throw std::logic_error(
+            "cell-scoped canonical predecessor did not reload exactly");
+      }
     }
     verify_gripper_resource_semantics(scenario, verified.graph().graph(),
                                       *model_map);
@@ -1978,6 +2072,62 @@ void verify_scenarios(const std::filesystem::path &root,
              scenario.ros2_control_execution ? "commanded_sim" : "simulated")}},
         {"planner_rng_seed", core::JsonValueDTO{12345.0}},
     };
+    if (!scenario.ros2_control_execution) {
+      expected_runtime_configuration.emplace(
+          "direct_control_joint_limits",
+          core::JsonValueDTO{core::JsonValueDTO::Array{}});
+      expected_runtime_configuration.emplace(
+          "motion_target_limits",
+          core::JsonValueDTO{core::JsonValueDTO::Array{core::JsonValueDTO{
+              core::JsonObjectDTO{
+                  {"command_target_id", core::JsonValueDTO{std::string("arm")}},
+                  {"controllable_component_id",
+                   core::JsonValueDTO{graph.controllable_components.front()
+                                          .controllable_component_id.value()}},
+                  {"maximum_tcp_linear_speed_mps",
+                   core::JsonValueDTO{expected_target_speed_limit}}}}}});
+      if (scenario.family_id ==
+          std::string_view("lite6_lite_gripper")) {
+        expected_runtime_configuration.emplace(
+            "gripper_target_configurations",
+            core::JsonValueDTO{core::JsonValueDTO::Array{core::JsonValueDTO{
+                core::JsonObjectDTO{
+                    {"actuation_kind",
+                     core::JsonValueDTO{std::string("position_commanded")}},
+                    {"attach_frame",
+                     core::JsonValueDTO{std::string("link_tcp")}},
+                    {"auxiliary_frames",
+                     core::JsonValueDTO{core::JsonValueDTO::Array{
+                         core::JsonValueDTO{
+                             std::string("lite_gripper_base_link")}}}},
+                    {"closed_state_ref",
+                     core::JsonValueDTO{std::string("closed")}},
+                    {"command_duration_s", core::JsonValueDTO{0.8}},
+                    {"command_target_id",
+                     core::JsonValueDTO{std::string("gripper")}},
+                    {"controllable_component_id",
+                     core::JsonValueDTO{graph.controllable_components.front()
+                                            .controllable_component_id.value()}},
+                    {"description",
+                     core::JsonValueDTO{std::string(
+                         "Native simulated UFACTORY lite pneumatic gripper.")}},
+                    {"mount_frame",
+                     core::JsonValueDTO{std::string("link_eef")}},
+                    {"open_state_ref",
+                     core::JsonValueDTO{std::string("open")}},
+                    {"tcp_frame",
+                     core::JsonValueDTO{std::string("link_tcp")}},
+                    {"touch_links",
+                     core::JsonValueDTO{core::JsonValueDTO::Array{
+                         core::JsonValueDTO{
+                             std::string("lite_gripper_base_link")},
+                         core::JsonValueDTO{
+                             std::string("lite_gripper_left_finger")},
+                         core::JsonValueDTO{
+                             std::string("lite_gripper_right_finger")}}}},
+                }}}});
+      }
+    }
     if (scenario.ros2_control_execution) {
       expected_runtime_configuration.emplace(
           "isaac_profile",
@@ -2013,8 +2163,44 @@ void verify_scenarios(const std::filesystem::path &root,
 
     std::set<std::string> historical_capabilities;
     std::optional<core::ProviderInstanceId> ros2_control_provider_instance;
+    std::size_t native_runtime_scale_binding_count = 0U;
     for (const auto &binding : graph.control_bindings) {
       historical_capabilities.insert(binding.capability_id.value());
+      if (!scenario.ros2_control_execution) {
+        const bool trajectory_binding =
+            binding.command_target_id.value() == "arm" &&
+            binding.capability_id.value() == "execution.trajectory.execute";
+        if (trajectory_binding) {
+          if (binding.runtime_scale_route_qualifications.size() != 1U) {
+            throw std::invalid_argument(
+                "native trajectory binding does not retain one exact runtime-scale route: " +
+                std::string(scenario.source));
+          }
+          const auto &qualification =
+              binding.runtime_scale_route_qualifications.front();
+          if (qualification.control_route_id.value() != "arm_position" ||
+              qualification.scaling_domain_id.value() !=
+                  graph.controllable_components.front()
+                          .controllable_component_id.value() +
+                      ".arm.runtime_scale" ||
+              qualification.command_endpoint_role_id.value() != "command" ||
+              qualification.applied_state_endpoint_role_id.value() != "state" ||
+              qualification.coordinated_barrier_id.has_value() ||
+              qualification.acknowledgement_kind !=
+                  core::RuntimeScaleAcknowledgementKind::kAppliedState ||
+              qualification.maximum_slew_per_second != 4.0 ||
+              qualification.freshness_budget_ns != 100'000'000) {
+            throw std::invalid_argument(
+                "native trajectory binding has the wrong runtime-scale qualification: " +
+                std::string(scenario.source));
+          }
+          ++native_runtime_scale_binding_count;
+        } else if (!binding.runtime_scale_route_qualifications.empty()) {
+          throw std::invalid_argument(
+              "native non-trajectory binding unexpectedly advertises runtime scaling: " +
+              std::string(scenario.source));
+        }
+      }
       if (scenario.ros2_control_execution) {
         if (binding.state_authority_class !=
                 core::StateAuthorityClass::kCommanded ||
@@ -2033,6 +2219,12 @@ void verify_scenarios(const std::filesystem::path &root,
               "Isaac scenario splits one physical ROS provider occurrence");
         }
       }
+    }
+    if (!scenario.ros2_control_execution &&
+        native_runtime_scale_binding_count != 1U) {
+      throw std::invalid_argument(
+          "native scenario does not select exactly one runtime-scale binding: " +
+          std::string(scenario.source));
     }
     for (const auto &binding : applicability.capability_provider_bindings) {
       if (!binding.capability_id.value().starts_with("assistant.")) {
@@ -2097,6 +2289,247 @@ void verify_scenarios(const std::filesystem::path &root,
   }
 }
 
+[[nodiscard]] const Scenario &candidate_scenario_definition(
+    const std::filesystem::path &workspace_root,
+    const std::string_view scenario_id) {
+  const auto assignments = deployment::parse_strict_json_model_yaml(read_file(
+      workspace_root / "manyforge_deployment/resources/maintained/"
+                       "maintained_program_role_assignments.v1.json"));
+  const auto &rows = require_array(
+      require_member(assignments.root(), "assignments", "role assignments"),
+      "role assignments.assignments");
+  const deployment::CanonicalValue *selected = nullptr;
+  for (const auto &row : rows) {
+    if (require_text(require_member(row, "scenario_id", "role assignment"),
+                     "role assignment.scenario_id") == scenario_id) {
+      if (selected != nullptr) {
+        throw std::invalid_argument(
+            "candidate Scenario identity is duplicated");
+      }
+      selected = &row;
+    }
+  }
+  if (selected == nullptr) {
+    throw std::invalid_argument(
+        "candidate Scenario is not a maintained compiler input");
+  }
+  const auto &deployment_source = require_text(
+      require_member(*selected, "deployment_source", "role assignment"),
+      "role assignment.deployment_source");
+  const auto found = std::find_if(
+      kScenarios.begin(), kScenarios.end(), [&](const auto &scenario) {
+        return scenario.source == deployment_source;
+      });
+  if (found == kScenarios.end()) {
+    throw std::logic_error(
+        "candidate Scenario has no maintained Deployment definition");
+  }
+  return *found;
+}
+
+[[nodiscard]] core::ProgramRoleAssignmentDTO
+assignment_from(const deployment::ProgramBinding &binding) {
+  core::ProgramRoleAssignmentDTO result;
+  result.component_roles.reserve(
+      binding.value().component_role_bindings.size());
+  for (const auto &row : binding.value().component_role_bindings) {
+    result.component_roles.push_back(core::ProgramComponentRoleAssignmentDTO{
+        row.component_role_id, row.controllable_component_id});
+  }
+  result.target_roles.reserve(binding.value().target_role_bindings.size());
+  for (const auto &row : binding.value().target_role_bindings) {
+    result.target_roles.push_back(core::ProgramTargetRoleAssignmentDTO{
+        row.target_role_id, row.command_target_id});
+  }
+  return result;
+}
+
+[[nodiscard]] deployment::ScenarioCatalogRowDTO &require_scenario_row(
+    std::vector<deployment::ScenarioCatalogRowDTO> &rows,
+    const std::string_view scenario_id) {
+  auto found = std::find_if(rows.begin(), rows.end(), [&](const auto &row) {
+    return row.scenario_id == scenario_id;
+  });
+  if (found == rows.end()) {
+    throw std::invalid_argument(
+        "candidate source catalog has no exact Scenario row");
+  }
+  return *found;
+}
+
+[[nodiscard]] deployment::CanonicalValue compile_candidate(
+    const Options &options, const QualifiedCatalogClosure &catalog,
+    const ExactCompilerInputSource &input_source) {
+  const auto candidate_catalog_path =
+      options.candidate_package_root / "maintained.scenario-catalog.yaml";
+  const bool has_candidate_catalog =
+      std::filesystem::is_regular_file(candidate_catalog_path) &&
+      !std::filesystem::is_symlink(candidate_catalog_path);
+  const auto publication_expected = [&]()
+      -> std::optional<core::ScenarioCatalogRevision> {
+    if (!has_candidate_catalog) {
+      return std::nullopt;
+    }
+    const auto current = deployment::verify_scenario_catalog_artifact(
+        read_file(candidate_catalog_path));
+    if (current == nullptr) {
+      throw std::logic_error(
+          "candidate publication catalog did not independently verify");
+    }
+    return current->revision();
+  }();
+  const deployment::FilesystemScenarioApplyCandidateSource source(
+      options.base_package_root, "maintained",
+      options.candidate_package_root);
+  const core::ScenarioCatalogRevision expected_catalog_revision(
+      options.expected_scenario_catalog_revision);
+  const auto source_catalog = deployment::verify_scenario_catalog_artifact(
+      read_file(source.catalog_path_for_revision(expected_catalog_revision)));
+  if (source_catalog == nullptr) {
+    throw std::logic_error(
+        "candidate source catalog did not independently verify");
+  }
+  const auto source_selection = source.LoadExactProgramSelectionForCatalog(
+      options.candidate_scenario_id, expected_catalog_revision);
+  const auto candidate_bundle_path =
+      options.candidate_package_root / "retained-bundles" / "sha256" /
+      (source_selection.retained_bundle_id.value().substr(7U) + ".json");
+  const auto &source_package_root =
+      std::filesystem::exists(candidate_bundle_path)
+          ? options.candidate_package_root
+          : options.base_package_root;
+  const auto &scenario = candidate_scenario_definition(
+      options.workspace_root, options.candidate_scenario_id);
+  const std::array<Scenario, 1U> selected_scenarios{scenario};
+  const auto products = materialize_scenarios(
+      options.workspace_root, catalog, input_source,
+      options.candidate_package_root, selected_scenarios,
+      options.candidate_deployment_path, false);
+  const auto product = products.find(std::string(scenario.source));
+  if (product == products.end()) {
+    throw std::logic_error(
+        "candidate compiler did not materialize its selected Deployment");
+  }
+  const auto &candidate = product->second;
+  if (candidate.deployment_artifact_id !=
+      source_selection.deployment_artifact_id) {
+    throw std::invalid_argument(
+        "candidate Deployment changes its addressed artifact identity");
+  }
+
+  const deployment::FilesystemVerifiedRetainedBundleSource source_bundles(
+      source_package_root);
+  const auto source_bundle =
+      source_bundles.get_verified(source_selection.retained_bundle_id);
+  if (source_bundle == nullptr) {
+    throw std::logic_error(
+        "candidate source retained bundle is unavailable");
+  }
+  const deployment::FilesystemVerifiedRetainedModelMapSource source_maps(
+      source_package_root);
+  const auto source_model_map = source_maps.get_verified(
+      deployment::RetainedModelMapQuery{
+          source_selection.retained_bundle_id,
+          source_bundle->value()
+              .compiled_products.symbol_role_maps.front()
+              .product_id});
+  if (!source_model_map.has_value()) {
+    throw std::logic_error(
+        "candidate source model map is unavailable");
+  }
+  const deployment::FilesystemVerifiedProgramBindingSource source_bindings(
+      source_package_root);
+  const auto baseline = source_bindings.get_verified(
+      source_selection.program_binding_id, *source_bundle,
+      *source_model_map);
+  if (baseline == nullptr) {
+    throw std::logic_error(
+        "candidate source Program Binding is unavailable");
+  }
+
+  const auto program_bytes = read_file(options.candidate_program_path);
+  const auto program = deployment::verify_program_binding_contract(
+      program_bytes, *candidate.bundle);
+  deployment::verify_scenario_program_admission(
+      program->normalized_program_root(), candidate.bundle->value(),
+      candidate.deployment_compatibility, source_selection.assistant_mode,
+      source_selection.typed_parameter_overrides);
+  deployment::FilesystemCatalogArtifactStore candidate_catalog_store(
+      options.candidate_package_root);
+  const auto binding = deployment::compile_program_binding(
+      *program, assignment_from(*baseline), *candidate.bundle,
+      candidate.model_map, candidate_catalog_store);
+  deployment::FilesystemProgramRepository program_repository(
+      options.candidate_package_root);
+  deployment::FilesystemProgramBindingRepository binding_repository(
+      options.candidate_package_root);
+  static_cast<void>(
+      program_repository.put_if_absent(program, *candidate.bundle));
+  static_cast<void>(binding_repository.put_if_absent(
+      binding, *candidate.bundle, candidate.model_map));
+
+  auto rows = source_catalog->rows();
+  auto &row = require_scenario_row(rows, options.candidate_scenario_id);
+  row.deployment_artifact_id = candidate.deployment_artifact_id;
+  row.deployment_revision = candidate.deployment_revision;
+  row.retained_bundle_id = candidate.bundle->retained_bundle_id();
+  row.program_binding_id = binding->program_binding_id();
+  row.deployment_compatibility = candidate.deployment_compatibility;
+  const auto authored_catalog = deployment::build_scenario_catalog(rows);
+
+  deployment::FilesystemScenarioCatalogRepository repository(
+      options.candidate_package_root, "maintained");
+  const auto published =
+      repository.compare_and_set(publication_expected, authored_catalog);
+  if (published == deployment::ScenarioCatalogPublishResult::kRevisionConflict) {
+    throw std::runtime_error(
+        "candidate scenario catalog changed during publication");
+  }
+  const auto reloaded = repository.get_verified();
+  if (reloaded == nullptr ||
+      reloaded->revision() != authored_catalog->revision() ||
+      reloaded->rows() != authored_catalog->rows()) {
+    throw std::runtime_error(
+        "candidate scenario catalog did not reopen exactly");
+  }
+  const deployment::FilesystemScenarioApplyCandidateSource reopened(
+      options.candidate_package_root, "maintained");
+  const auto exact =
+      reopened.LoadExactProgramSelection(options.candidate_scenario_id);
+  if (!exact.valid() ||
+      exact.deployment_revision != candidate.deployment_revision ||
+      exact.retained_bundle_id != candidate.bundle->retained_bundle_id() ||
+      exact.program_binding_id != binding->program_binding_id()) {
+    throw std::runtime_error(
+        "candidate scenario selection did not reopen exactly");
+  }
+
+  return deployment::CanonicalValue(deployment::CanonicalValue::Object{
+      {"deployment_artifact_id",
+       deployment::CanonicalValue(candidate.deployment_artifact_id.value())},
+      {"deployment_revision",
+       deployment::CanonicalValue(candidate.deployment_revision.value())},
+      {"graph_revision",
+       deployment::CanonicalValue(
+           candidate.bundle->value().cell_graph.graph_revision.value())},
+      {"program_binding_id",
+       deployment::CanonicalValue(binding->program_binding_id().value())},
+      {"program_id",
+       deployment::CanonicalValue(program->value().program_id.value())},
+      {"program_revision",
+       deployment::CanonicalValue(program->value().program_revision.value())},
+      {"retained_bundle_id",
+       deployment::CanonicalValue(
+           candidate.bundle->retained_bundle_id().value())},
+      {"scenario_catalog_revision",
+       deployment::CanonicalValue(reloaded->revision().value())},
+      {"scenario_id",
+       deployment::CanonicalValue(options.candidate_scenario_id)},
+      {"schema_version", deployment::CanonicalValue(
+                             "manyforge.deployment_candidate_compilation.v1")},
+  });
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -2112,6 +2545,21 @@ int main(int argc, char **argv) {
     ExactCompilerInputSource input_source;
     const QualifiedCatalogClosure catalog =
         qualify_catalog(root, input_source, families);
+    if (options.mode == Options::Mode::kCompileCandidate) {
+      options.base_package_root =
+          std::filesystem::canonical(options.base_package_root);
+      options.candidate_deployment_path =
+          std::filesystem::canonical(options.candidate_deployment_path);
+      options.candidate_program_path =
+          std::filesystem::canonical(options.candidate_program_path);
+      std::filesystem::create_directories(options.candidate_package_root);
+      options.candidate_package_root =
+          std::filesystem::canonical(options.candidate_package_root);
+      std::cout << deployment::canonical_json(
+                       compile_candidate(options, catalog, input_source))
+                << '\n';
+      return 0;
+    }
     verify_scenarios(root, catalog);
     TemporaryPackage package(options.package_root);
     const auto products =

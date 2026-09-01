@@ -22,7 +22,8 @@ from .models import (
     PickSequencePlanningRequest,
     PlaceSequencePlanningRequest,
     ProgramRunStopIntentRequest,
-    RuntimeScaleRequest,
+    RuntimeScaleControlRequest,
+    RuntimeScaleControlSelectorRequest,
     StopFaultRecoveryIntentRequest,
     StopIntentRequest,
 )
@@ -35,6 +36,7 @@ from .private_transport import (
 
 EXECUTION_SOCKET_FILE = "execution-command.sock"
 EXECUTION_CONTROL_SOCKET_FILE = "execution-control.sock"
+EXECUTION_OBSERVATION_SOCKET_FILE = "execution-observation.sock"
 EXECUTION_COMMAND_VERSION = "manyforge.execution_command.v1"
 EXECUTION_RESPONSE_VERSION = "manyforge.execution_command_response.v1"
 MAXIMUM_SAFE_INTEGER = 9_007_199_254_740_991
@@ -269,14 +271,16 @@ class ExecutionPort(Protocol):
         request: StopFaultRecoveryIntentRequest,
     ) -> dict[str, Any]: ...
 
-    def set_runtime_scale(
+    def set_runtime_scale_control(
         self,
-        request: RuntimeScaleRequest,
+        request: RuntimeScaleControlRequest,
         *,
         trusted_principal_id: str | None,
     ) -> dict[str, Any]: ...
 
-    def get_runtime_scale(self, operation_id: str) -> dict[str, Any]: ...
+    def get_runtime_scale_control(
+        self, selector: RuntimeScaleControlSelectorRequest
+    ) -> dict[str, Any]: ...
 
     def events(
         self,
@@ -295,6 +299,20 @@ def _canonical_json(value: dict[str, Any]) -> bytes:
             "execution_command_invalid",
             f"execution command is not canonically encodable: {exc}",
         ) from exc
+
+
+def _sparse_request_with_complete_context(request: Any) -> dict[str, Any]:
+    """Keep optional request fields sparse without weakening context shape.
+
+    Stop selectors deliberately omit unused selector kinds and an absent
+    reason, while the native public-request decoder requires all four context
+    fields (including a null correlation identity).  A model-wide
+    ``exclude_none`` incorrectly removed that required nested field.
+    """
+
+    payload = request.model_dump(mode="json", exclude_none=True)
+    payload["request_context"] = request.request_context.model_dump(mode="json")
+    return payload
 
 
 class ExecutionCommandClient:
@@ -321,6 +339,9 @@ class ExecutionCommandClient:
         self._socket_path = self._run_root.path / EXECUTION_SOCKET_FILE
         self._control_socket_path = (
             self._run_root.path / EXECUTION_CONTROL_SOCKET_FILE
+        )
+        self._observation_socket_path = (
+            self._run_root.path / EXECUTION_OBSERVATION_SOCKET_FILE
         )
         self._timeout_seconds = timeout_seconds
         self._attribution_transport = attribution_transport
@@ -424,7 +445,7 @@ class ExecutionCommandClient:
                 "api_version": EXECUTION_COMMAND_VERSION,
                 "attribution": self._request_attribution(None),
                 "command": "stop_program_run",
-                "request": request.model_dump(mode="json", exclude_none=True),
+                "request": _sparse_request_with_complete_context(request),
             }
         )
         accepted = response.get("accepted")
@@ -539,16 +560,35 @@ class ExecutionCommandClient:
             "principal_id": trusted_principal_id,
         }
 
-    def _read_projection(self, command: str) -> dict[str, Any]:
-        response = self._exchange(
-            {"api_version": EXECUTION_COMMAND_VERSION, "command": command}
-        )
+    @staticmethod
+    def _validate_projection_response(
+        command: str, response: dict[str, Any]
+    ) -> dict[str, Any]:
         if response.get("ok") is True and response.get("command") != command:
             raise HeadlessApiError(
                 "execution_command_response_invalid",
                 f"execution {command} response has the wrong command kind",
             )
         return response
+
+    def _read_projection_on(
+        self, command: str, socket_path: Path
+    ) -> dict[str, Any]:
+        return self._validate_projection_response(
+            command,
+            self._exchange_on(
+                {"api_version": EXECUTION_COMMAND_VERSION, "command": command},
+                socket_path,
+            ),
+        )
+
+    def _read_projection(self, command: str) -> dict[str, Any]:
+        return self._validate_projection_response(
+            command,
+            self._exchange(
+                {"api_version": EXECUTION_COMMAND_VERSION, "command": command}
+            ),
+        )
 
     def diagnostics(self) -> dict[str, Any]:
         """Return the explicit aggregate diagnostic projection.
@@ -568,7 +608,9 @@ class ExecutionCommandClient:
         return self._read_projection("control_state")
 
     def observation(self) -> dict[str, Any]:
-        return self._read_projection("observation")
+        return self._read_projection_on(
+            "observation", self._observation_socket_path
+        )
 
     @staticmethod
     def _raise_error_response(response: dict[str, Any]) -> None:
@@ -1362,7 +1404,7 @@ class ExecutionCommandClient:
                 "api_version": EXECUTION_COMMAND_VERSION,
                 "attribution": self._request_attribution(trusted_principal_id),
                 "command": "stop",
-                "request": request.model_dump(mode="json", exclude_none=True),
+                "request": _sparse_request_with_complete_context(request),
             }
         )
         accepted = response.get("accepted")
@@ -1636,9 +1678,9 @@ class ExecutionCommandClient:
             )
         return response
 
-    def set_runtime_scale(
+    def set_runtime_scale_control(
         self,
-        request: RuntimeScaleRequest,
+        request: RuntimeScaleControlRequest,
         *,
         trusted_principal_id: str | None,
     ) -> dict[str, Any]:
@@ -1646,46 +1688,45 @@ class ExecutionCommandClient:
             {
                 "api_version": EXECUTION_COMMAND_VERSION,
                 "attribution": self._request_attribution(trusted_principal_id),
-                "command": "set_runtime_scale",
+                "command": "set_runtime_scale_control",
                 "request": request.model_dump(mode="json"),
             }
         )
         accepted = response.get("accepted")
+        selector = request.selector.model_dump(mode="json")
         if response.get("ok") is True and (
-            response.get("command") != "set_runtime_scale"
+            response.get("command") != "set_runtime_scale_control"
             or not isinstance(accepted, dict)
             or accepted.get("request_id")
             != request.request_context.request_id
-            or accepted.get("operation_id") != request.operation_id
-            or accepted.get("operation_revision")
-            != request.expected_operation_revision
+            or accepted.get("selector") != selector
             or accepted.get("requested_scale") != request.scale
         ):
             raise HeadlessApiError(
                 "execution_command_response_identity_mismatch",
-                "runtime-scale acceptance does not match its request",
+                "runtime-scale control acceptance does not match its request",
             )
         return response
 
-    def get_runtime_scale(self, operation_id: str) -> dict[str, Any]:
-        if not operation_id or len(operation_id.encode("utf-8")) > 256:
-            raise ValueError("operation_id must be bounded non-empty text")
+    def get_runtime_scale_control(
+        self, selector: RuntimeScaleControlSelectorRequest
+    ) -> dict[str, Any]:
         response = self._exchange(
             {
                 "api_version": EXECUTION_COMMAND_VERSION,
-                "command": "get_runtime_scale",
-                "operation_id": operation_id,
+                "command": "get_runtime_scale_control",
+                "selector": selector.model_dump(mode="json"),
             }
         )
-        status = response.get("runtime_scale")
+        status = response.get("runtime_scale_control")
         if response.get("ok") is True and (
-            response.get("command") != "get_runtime_scale"
+            response.get("command") != "get_runtime_scale_control"
             or not isinstance(status, dict)
-            or status.get("operation_id") != operation_id
+            or status.get("selector") != selector.model_dump(mode="json")
         ):
             raise HeadlessApiError(
                 "execution_command_response_identity_mismatch",
-                "runtime-scale observation does not match the requested operation",
+                "runtime-scale control observation does not match its selector",
             )
         return response
 

@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py structural-rest
-  Last regenerated: 2026-08-29 12:56:12 UTC
+  Last regenerated: 2026-09-01 21:18:57 UTC
   Generator source: scripts/regen-public-contracts.py:gen_rest_api
 -->
 
@@ -31,10 +31,15 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `GET` | `/api/cclc/owner` | headless-runtime-client | Cclc Owner Identity |
 | `POST` | `/api/cclc/routes/requests` | headless-runtime-client | Cclc Route Submit |
 | `GET` | `/api/cclc/routes/transactions/{transaction_id}` | headless-runtime-client | Cclc Route Status |
+| `GET` | `/api/component-overview` | headless-runtime-client | Component Overview |
 | `POST` | `/api/cycle/recovery-actions` | headless-runtime-client | Cycle Recovery Action |
 | `GET` | `/api/cycle/status` | headless-runtime-client | Program Cycle Status |
 | `POST` | `/api/deployment/discard` | composer-deployment-draft | Discard |
+| `POST` | `/api/deployment/draft/apply` | composer-deployment-draft | Apply Authored Candidate |
+| `POST` | `/api/deployment/draft/controlled-stop` | composer-deployment-draft | Update Controlled Stop |
+| `POST` | `/api/deployment/draft/motion-target-limit` | composer-deployment-draft | Update Motion Target Limit |
 | `POST` | `/api/deployment/draft/mutations` | composer-deployment-draft | Mutate Draft |
+| `POST` | `/api/deployment/draft/preview` | composer-deployment-draft | Preview Authored Candidate |
 | `POST` | `/api/deployment/open-draft` | composer-deployment-draft | Open Draft |
 | `POST` | `/api/deployment/revert` | composer-deployment-draft | Revert |
 | `POST` | `/api/deployment/save` | composer-deployment-draft | Save Draft |
@@ -54,19 +59,20 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `GET` | `/api/execution/history/{sequence}` | headless-runtime-client | Historian Detail |
 | `GET` | `/api/execution/identity` | headless-runtime-client | Execution Identity |
 | `POST` | `/api/execution/motion-previews` | headless-runtime-client | Execution Preview Motion |
+| `GET` | `/api/execution/observation` | headless-runtime-client | Execution Observation |
 | `POST` | `/api/execution/operations` | headless-runtime-client | Execution Submit |
 | `GET` | `/api/execution/operations/{operation_id}` | headless-runtime-client | Execution Read |
 | `POST` | `/api/execution/operations/{operation_id}/acknowledge-completed` | headless-runtime-client | Execution Acknowledge Completed |
 | `POST` | `/api/execution/operations/{operation_id}/pause` | headless-runtime-client | Execution Pause |
 | `POST` | `/api/execution/operations/{operation_id}/reset` | headless-runtime-client | Execution Reset |
 | `POST` | `/api/execution/operations/{operation_id}/resume` | headless-runtime-client | Execution Resume |
-| `GET` | `/api/execution/operations/{operation_id}/runtime-scale` | headless-runtime-client | Execution Get Runtime Scale |
-| `POST` | `/api/execution/operations/{operation_id}/runtime-scale` | headless-runtime-client | Execution Set Runtime Scale |
 | `POST` | `/api/execution/pick-place/plans/pick` | headless-runtime-client | Execution Plan Pick |
 | `POST` | `/api/execution/pick-place/plans/place` | headless-runtime-client | Execution Plan Place |
 | `POST` | `/api/execution/pick-place/sequences/pick` | headless-runtime-client | Execution Start Pick |
 | `POST` | `/api/execution/pick-place/sequences/place` | headless-runtime-client | Execution Start Place |
 | `GET` | `/api/execution/pick-place/sequences/{sequence_id}` | headless-runtime-client | Execution Pick Place Sequence |
+| `GET` | `/api/execution/runtime-scale-control` | headless-runtime-client | Execution Get Runtime Scale Control |
+| `POST` | `/api/execution/runtime-scale-control` | headless-runtime-client | Execution Set Runtime Scale Control |
 | `GET` | `/api/execution/status` | headless-runtime-client | Execution Status |
 | `GET` | `/api/execution/stop-fault` | headless-runtime-client | Execution Stop Fault |
 | `POST` | `/api/execution/stop-fault/recover` | headless-runtime-client | Execution Recover Stop Fault |
@@ -99,7 +105,11 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `POST` | `/api/program/runs` | headless-runtime-client | Program Run Start |
 | `GET` | `/api/program/runs/{program_run_id}` | headless-runtime-client | Program Run Read |
 | `POST` | `/api/program/runs/{program_run_id}/blackboard-values` | headless-runtime-client | Write Runtime Blackboard |
+| `POST` | `/api/program/runs/{program_run_id}/full-stop` | headless-runtime-client | Program Run Full Stop |
 | `POST` | `/api/program/runs/{program_run_id}/manual-result` | headless-runtime-client | Stage Manual Result |
+| `POST` | `/api/program/runs/{program_run_id}/motion-stop` | headless-runtime-client | Program Run Motion Stop |
+| `POST` | `/api/program/runs/{program_run_id}/reset` | headless-runtime-client | Program Run Reset Full Stop |
+| `POST` | `/api/program/runs/{program_run_id}/resume-full-stop` | headless-runtime-client | Program Run Resume Full Stop |
 | `GET` | `/api/program/runs/{program_run_id}/runtime-controls` | headless-runtime-client | Program Runtime Controls |
 | `POST` | `/api/program/runs/{program_run_id}/runtime-overrides` | headless-runtime-client | Stage Runtime Override |
 | `POST` | `/api/program/runs/{program_run_id}/runtime-overrides/activate` | headless-runtime-client | Activate Runtime Override |
@@ -125,7 +135,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `GET` | `/api/scene/urdf/manifest` | structural-urdf | Get Manifest |
 | `GET` | `/api/scene/urdf/models/{model_key}/collision-meshes/{link_name}/{collision_index}` | structural-urdf | Get Model Collision Mesh |
 | `GET` | `/api/scene/urdf/models/{model_key}/meshes/{link_name}/{visual_index}` | structural-urdf | Get Model Mesh |
-| `GET` | `/api/scene/viewer/status` |  | Execution Observation Stream Status |
+| `GET` | `/api/scene/viewer/status` | headless-viewer-observation-client | Viewer Status |
 | `GET` | `/api/source-model` | headless-runtime-client | Source Model |
 | `DELETE` | `/api/{unavailable_path}` |  | Unavailable Api |
 | `GET` | `/api/{unavailable_path}` |  | Unavailable Api |

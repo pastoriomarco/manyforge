@@ -118,6 +118,33 @@ TEST(RuntimeParticipantPolicy, SealsExactTargetAndAppliesMinimumCeiling) {
   EXPECT_EQ(applied.value().max_tcp_linear_speed_mps, 0.1);
 }
 
+TEST(RuntimeParticipantPolicy, DeploymentCeilingOnlyTightensWithoutRelabelingPolicy) {
+  const auto participant = binding();
+  auto source = policy();
+  const auto source_reference = policy_reference(source);
+  auto selected = verify_runtime_participant_policy_selection(
+      source_reference, std::move(source), participant);
+  ASSERT_TRUE(selected.ok()) << selected.error().message;
+  const auto original = selected.value().value();
+
+  auto tightened = apply_deployment_motion_speed_ceiling(selected.value(), 0.1);
+  ASSERT_TRUE(tightened.ok()) << tightened.error().message;
+  EXPECT_DOUBLE_EQ(
+      tightened.value().value().effective_maximum_tcp_linear_speed_mps, 0.1);
+  EXPECT_EQ(tightened.value().value().source_artifact,
+            original.source_artifact);
+  EXPECT_EQ(tightened.value().value().policy, original.policy);
+  EXPECT_EQ(tightened.value().value().selected_motion_speed_limit,
+            original.selected_motion_speed_limit);
+
+  auto weaker = apply_deployment_motion_speed_ceiling(selected.value(), 0.4);
+  ASSERT_TRUE(weaker.ok()) << weaker.error().message;
+  EXPECT_DOUBLE_EQ(weaker.value().value().effective_maximum_tcp_linear_speed_mps,
+                   0.25);
+  EXPECT_FALSE(apply_deployment_motion_speed_ceiling(selected.value(), 0.0).ok());
+  EXPECT_FALSE(apply_deployment_motion_speed_ceiling(selected.value(), 1000.1).ok());
+}
+
 TEST(RuntimeParticipantPolicy, RejectsUnmatchedAndWeakeningTargetScopes) {
   const auto participant = binding();
   auto unmatched = policy();

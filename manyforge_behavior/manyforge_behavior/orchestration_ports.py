@@ -308,6 +308,10 @@ class OwnerTaskPort(Protocol):
     ) -> None: ...
 
 
+class OwnerTaskSettlementPendingError(RuntimeError):
+    """A terminal task is waiting for its owner to settle an accepted effect."""
+
+
 @dataclass(frozen=True, slots=True)
 class OwnerInvocationResult:
     succeeded: bool
@@ -529,6 +533,7 @@ __all__ = [
     "OwnerInvocationResult",
     "OwnerTaskPort",
     "OwnerTaskObservationUnavailableError",
+    "OwnerTaskSettlementPendingError",
     "OwnerTaskSnapshot",
     "OwnerTaskState",
     "ProgramRunScopePort",

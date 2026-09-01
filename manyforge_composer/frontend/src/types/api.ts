@@ -175,6 +175,7 @@ export interface ProgramViewerMetadata {
   frame_role_visibility?: Record<string, boolean>;
   frame_gizmo_size_m?: number;
   resource_role_visibility?: Record<string, boolean>;
+  scene_resource_axes_visibility?: Record<string, boolean>;
   object_axes_gizmo_size_m?: number;
 }
 
@@ -372,6 +373,48 @@ export interface DeploymentWorkspaceResponse {
   scenarioCandidates: DeploymentScenarioCandidate[];
   savedScenarioCandidates: DeploymentScenarioCandidate[];
   unavailableReasons: string[];
+}
+
+export interface DeploymentCandidateCompilation {
+  schemaVersion: 'manyforge.deployment_candidate_compilation.v1';
+  scenarioId: string;
+  scenarioCatalogRevision: string;
+  deploymentArtifactId: string;
+  deploymentRevision: string;
+  retainedBundleId: string;
+  graphRevision: string;
+  programId: string;
+  programRevision: string;
+  programBindingId: string;
+}
+
+export interface DeploymentCandidateOperationResponse {
+  schemaVersion: 'manyforge.composer_deployment_candidate_operation.v1';
+  workspace: DeploymentWorkspaceResponse;
+  result: {
+    status: 'previewed' | 'applied';
+    compilation: DeploymentCandidateCompilation;
+    candidatePreview: ManagerDeploymentCandidatePreviewResponse | null;
+    managerApply: ManagerApplyResponse | null;
+    selection: Omit<DeploymentCandidateCompilation, 'schemaVersion'>;
+  };
+}
+
+export interface DeploymentControlledStopProfile {
+  stop_mode: 'soft_on_path' | 'spring_back_hold';
+  deceleration_time_s: number;
+  allow_natural_completion_on_short_path: boolean;
+  per_resource_limits: Array<{
+    resource_id: string;
+    max_deceleration: {
+      coordinate_kind: string;
+      value: number;
+    };
+    settle_velocity_threshold: {
+      coordinate_kind: string;
+      value: number;
+    };
+  }>;
 }
 
 export interface ScenarioCatalogEntry {
@@ -632,7 +675,7 @@ export interface RuntimeOverrideObservationCandidate {
 }
 
 export interface ProgramRuntimeControlProjection {
-  schemaVersion: 'manyforge.program_runtime_control_projection.v1';
+  schemaVersion: 'manyforge.program_runtime_control_projection.v2';
   ownerId: string;
   ownerEpoch: string;
   programRunId: string;
@@ -738,6 +781,9 @@ export interface SourceModelCoordinate {
   source_joint_name: string;
   source_parent_link_name: string;
   unit: string;
+  viewer_child_link_name: string;
+  viewer_joint_name: string;
+  viewer_parent_link_name: string;
 }
 
 export interface SourceModelSrdfGroup {
@@ -754,13 +800,16 @@ export interface SourceModelSrdfGroup {
 export interface SourceModelOccurrence {
   component_id: string | null;
   coordinates: SourceModelCoordinate[];
+  links: Array<{
+    source_link_name: string;
+    viewer_link_name: string;
+  }>;
   model_asset_id: string;
   model_instance_id: string;
   model_revision: string;
   model_role_id: string | null;
   source_model_name: string;
   source_robot_name: string;
-  source_link_names: string[];
   srdf_end_effectors: Array<{
     source_end_effector_name: string;
     source_group_name: string;
@@ -800,7 +849,7 @@ export interface SourceModelTarget {
 }
 
 export interface SourceModelProjection {
-  schema_version: 'manyforge.source_model_projection.v1';
+  schema_version: 'manyforge.source_model_projection.v2';
   cell_id: string;
   retained_bundle_id: string;
   graph_revision: string;
@@ -1362,7 +1411,10 @@ export interface ProgramCycleResetResult {
   resetCycleGeneration: number;
   idleCycleGeneration: number;
   settlementReference: string;
-  admission: Record<string, JsonValue>;
+  admission: {
+    admissionGeneration: number;
+    authoringAllowed: boolean;
+  };
   runtimeControls: ProgramRuntimeControlsSnapshot | null;
 }
 

@@ -240,6 +240,25 @@ class ManagerDeploymentCandidatePreviewRequest(StrictRequest):
         )
 
 
+class DeploymentCandidateCompilationRequest(StrictRequest):
+    scenario_id: Annotated[
+        str,
+        Field(min_length=1, max_length=128, pattern=r"^[a-z][a-z0-9_.-]*$"),
+    ]
+    expected_scenario_catalog_revision: Annotated[
+        str, Field(pattern=SHA256_PATTERN)
+    ]
+    deployment: dict[str, Any]
+    program: dict[str, Any]
+    authoring_claim: dict[str, Any]
+
+    @model_validator(mode="after")
+    def require_deployment_object(self) -> "DeploymentCandidateCompilationRequest":
+        if not self.deployment or not self.program:
+            raise ValueError("deployment and program must be non-empty objects")
+        return self
+
+
 class ManagerApplyRequest(CallerAttributionRequest):
     deployment_artifact_id: str
     deployment_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
@@ -2347,25 +2366,32 @@ class StopFaultRecoveryIntentRequest(StrictRequest):
         return self
 
 
-class RuntimeScaleRequest(StrictRequest):
+class RuntimeScaleControlSelectorRequest(StrictRequest):
+    program_binding_id: str
+    component_role_id: str
+    target_role_id: str
+
+    @field_validator(
+        "program_binding_id",
+        "component_role_id",
+        "target_role_id",
+    )
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(
+            value,
+            label=info.field_name,
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+
+class RuntimeScaleControlRequest(StrictRequest):
     request_context: CallerAttributionRequest
-    operation_id: str
-    expected_operation_revision: Annotated[
-        int, Field(ge=1, le=9_007_199_254_740_991)
-    ]
-    expected_runtime_scale_generation: Annotated[
+    selector: RuntimeScaleControlSelectorRequest
+    expected_control_generation: Annotated[
         int, Field(ge=0, le=9_007_199_254_740_991)
     ]
     scale: Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
-
-    @field_validator("operation_id")
-    @classmethod
-    def validate_operation_id(cls, value: str) -> str:
-        return _bounded_nfc(
-            value,
-            label="operation_id",
-            maximum_bytes=MAX_IDENTITY_BYTES,
-        )
 
 
 class HistorianReconcileRequest(CallerAttributionRequest):

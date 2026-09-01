@@ -200,6 +200,9 @@ CanonicalValue CoordinateValue(const deployment::VerifiedRetainedModelMap& model
       {"source_joint_name", CanonicalValue(coordinate.source_joint_name)},
       {"source_parent_link_name", CanonicalValue(parent.source_target.source_name)},
       {"unit", CanonicalValue(CoordinateUnit(coordinate.unit))},
+      {"viewer_child_link_name", CanonicalValue(child.compiled_target_name)},
+      {"viewer_joint_name", CanonicalValue(coordinate.compiled_joint_name)},
+      {"viewer_parent_link_name", CanonicalValue(parent.compiled_target_name)},
   });
 }
 
@@ -301,13 +304,13 @@ CanonicalValue OccurrenceValue(const deployment::VerifiedRetainedModelMap& model
   CanonicalValue::Array groups;
   CanonicalValue::Array group_states;
   CanonicalValue::Array end_effectors;
-  std::vector<std::string> source_links;
+  std::vector<std::pair<std::string, std::string>> viewer_links;
   for (const auto& symbol : model_map.symbols()) {
     if (symbol.source.model_instance_id != occurrence.model_instance_id) {
       continue;
     }
     if (symbol.source.kind == deployment::OccurrenceSymbolKind::kLink) {
-      source_links.push_back(symbol.source.source_name);
+      viewer_links.emplace_back(symbol.source.source_name, symbol.compiled_name);
     } else if (symbol.source.kind == deployment::OccurrenceSymbolKind::kSrdfGroup) {
       groups.emplace_back(SrdfGroupValue(model_map, symbol));
     } else if (symbol.source.kind == deployment::OccurrenceSymbolKind::kSrdfGroupState) {
@@ -315,6 +318,15 @@ CanonicalValue OccurrenceValue(const deployment::VerifiedRetainedModelMap& model
     } else if (symbol.source.kind == deployment::OccurrenceSymbolKind::kSrdfEndEffector) {
       end_effectors.emplace_back(SrdfEndEffectorValue(model_map, symbol));
     }
+  }
+  std::sort(viewer_links.begin(), viewer_links.end());
+  CanonicalValue::Array links;
+  links.reserve(viewer_links.size());
+  for (const auto& [source_name, viewer_name] : viewer_links) {
+    links.emplace_back(CanonicalValue::Object{
+        {"source_link_name", CanonicalValue(source_name)},
+        {"viewer_link_name", CanonicalValue(viewer_name)},
+    });
   }
 
   return CanonicalValue(CanonicalValue::Object{
@@ -330,7 +342,7 @@ CanonicalValue OccurrenceValue(const deployment::VerifiedRetainedModelMap& model
                             : CanonicalValue(nullptr)},
       {"source_model_name", CanonicalValue(source_model.source.source_name)},
       {"source_robot_name", CanonicalValue(source_robot.source.source_name)},
-      {"source_link_names", TextArray(source_links)},
+      {"links", CanonicalValue(std::move(links))},
       {"srdf_end_effectors", CanonicalValue(std::move(end_effectors))},
       {"srdf_group_states", CanonicalValue(std::move(group_states))},
       {"srdf_groups", CanonicalValue(std::move(groups))},
@@ -477,8 +489,11 @@ CanonicalValue TargetValue(const deployment::VerifiedRetainedModelMap& model_map
 
 }  // namespace
 
-ActiveSourceModelProjection::ActiveSourceModelProjection(std::filesystem::path package_root)
-    : model_maps_(std::move(package_root)) {}
+ActiveSourceModelProjection::ActiveSourceModelProjection(
+    std::filesystem::path package_root,
+    std::optional<std::filesystem::path> candidate_package_root)
+    : model_maps_(std::move(package_root),
+                  std::move(candidate_package_root)) {}
 
 CanonicalValue ActiveSourceModelProjection::Project(
     const deployment::RetainedBundle& active_bundle) const {

@@ -14,7 +14,7 @@ from manyforge_headless_api.models import (
     OperationParticipantRequest,
     PickSequencePlanningRequest,
     PlaceSequencePlanningRequest,
-    RuntimeScaleRequest,
+    RuntimeScaleControlRequest,
     SceneTransactionRequest,
     StopIntentRequest,
 )
@@ -559,18 +559,25 @@ def test_operation_mutations_are_strict_bounded_and_generation_fenced() -> None:
             }
         )
 
-    scale = {
+    scale_control = {
         "request_context": context,
-        "operation_id": "operation-1",
-        "expected_operation_revision": 1,
-        "expected_runtime_scale_generation": 0,
-        "scale": 0.0,
+        "selector": {
+            "program_binding_id": "binding-1",
+            "component_role_id": "robot",
+            "target_role_id": "arm",
+        },
+        "expected_control_generation": 0,
+        "scale": 0.4,
     }
-    assert RuntimeScaleRequest.model_validate(scale).scale == 0.0
+    assert RuntimeScaleControlRequest.model_validate(scale_control).scale == 0.4
     with pytest.raises(ValidationError):
-        RuntimeScaleRequest.model_validate({**scale, "scale": float("nan")})
+        RuntimeScaleControlRequest.model_validate(
+            {**scale_control, "expected_control_generation": -1}
+        )
     with pytest.raises(ValidationError):
-        RuntimeScaleRequest.model_validate({**scale, "scale": 1.0001})
+        RuntimeScaleControlRequest.model_validate(
+            {**scale_control, "selector": {"program_binding_id": "binding-1"}}
+        )
 
 
 def test_gripper_command_requires_unit_tags_and_matching_nonnegative_effort() -> None:

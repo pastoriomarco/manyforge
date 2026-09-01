@@ -117,14 +117,6 @@ class RecordingTransport:
     def stop(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.client.stop_operations(body)
 
-    def set_runtime_scale(
-        self, operation_id: str, body: Mapping[str, Any]
-    ) -> dict[str, Any]:
-        return self.client.set_operation_runtime_scale(operation_id, body)
-
-    def get_runtime_scale(self, operation_id: str) -> dict[str, Any]:
-        return self.client.operation_runtime_scale(operation_id)
-
 
 def _required_path(name: str) -> Path:
     value = os.environ.get(name)
@@ -682,26 +674,29 @@ def _wait_state(
     )
 
 
-def _wait_runtime_scale_applied(
+def _wait_runtime_scale_control_applied(
     client: HeadlessHttpClient,
-    operation_id: str,
+    selector: Mapping[str, str],
     generation: int,
     scale: float,
+    *,
+    active_operation_id: str | None,
 ) -> dict[str, Any]:
     deadline = time.monotonic() + 5.0
     last: dict[str, Any] = {}
     while time.monotonic() < deadline:
-        last = client.operation_runtime_scale(operation_id)
-        status = last.get("runtime_scale")
+        last = client.runtime_scale_control(selector)
+        status = last.get("runtime_scale_control")
         if (
             isinstance(status, dict)
-            and status.get("runtime_scale_generation") == generation
-            and status.get("state") == "applied"
+            and status.get("control_generation") == generation
+            and status.get("application_state") == "applied"
+            and status.get("active_operation_id") == active_operation_id
             and abs(float(status.get("effective_scale", -1.0)) - scale) <= 1e-9
         ):
             return last
         time.sleep(0.005)
-    raise RuntimeError(f"runtime scale was not applied: {last}")
+    raise RuntimeError(f"runtime-scale control was not applied: {last}")
 
 
 def _recover_active_stop_fault(
@@ -1222,6 +1217,7 @@ def test_reconciliation_gate_does_not_block_ordinary_accept_or_exact_read(
             positions=(0.1,),
         )
         operation_id = accepted["accepted"]["operation_id"]
+        resident_control_state = headless.execution_control_state()
         observed = runner.operation(operation_id)
 
         assert status["ok"] is True
@@ -1238,8 +1234,16 @@ def test_reconciliation_gate_does_not_block_ordinary_accept_or_exact_read(
         )
         assert control_state["command"] == "control_state"
         assert control_state["control_state"]["schema_version"] == (
-            "manyforge.execution_control_state.v1"
+            "manyforge.execution_control_state.v3"
         )
+        assert control_state["control_state"]["resident_operations"] == []
+        resident_operations = resident_control_state["control_state"][
+            "resident_operations"
+        ]
+        # This fixture submission belongs to the independent test Program run,
+        # not either direct-control Program run, so the scoped projection must
+        # not leak it into Robot Control recovery.
+        assert resident_operations == []
         assert targets["identity"] == control_state["identity"] == identity["identity"]
         assert observation["ok"] is True
         assert observation["command"] == "observation"
@@ -1335,6 +1339,7 @@ def test_reconciliation_exception_uses_caught_host_failure_path(
         assert process.poll() == 70
         assert not (execution_run_root / "execution-command.sock").exists()
         assert not (execution_run_root / "execution-control.sock").exists()
+        assert not (execution_run_root / "execution-observation.sock").exists()
     finally:
         _stop_host(process)
 
@@ -1760,7 +1765,7 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
         )
         motion_descriptor = direct["target_descriptor"]
         assert motion_descriptor["schema_version"] == (
-            "manyforge.manual_control_motion_descriptor.v1"
+            "manyforge.manual_control_motion_descriptor.v3"
         )
         assert motion_descriptor["controllable_component_id"] == direct[
             "controllable_component_id"
@@ -1776,6 +1781,44 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
             joint["max_velocity_rad_s"] == pytest.approx(2.14)
             and joint["max_acceleration_rad_s2"] == pytest.approx(10.0)
             for joint in motion_descriptor["joints"]
+        )
+        assert [
+            limit["source_joint_name"]
+            for limit in motion_descriptor["operational_joint_limits"]
+        ] == manifest["source_joint_names"]
+        operational_limits = motion_descriptor["operational_joint_limits"]
+        assert all(
+            limit["model_max_velocity_rad_s"] == pytest.approx(2.14)
+            and limit["model_max_acceleration_rad_s2"] == pytest.approx(10.0)
+            for limit in operational_limits
+        )
+        assert operational_limits[0]["source_joint_name"] == "joint1"
+        assert operational_limits[0]["deployment_max_velocity_rad_s"] == (
+            pytest.approx(1.5)
+        )
+        assert operational_limits[0]["deployment_max_acceleration_rad_s2"] == (
+            pytest.approx(2.5)
+        )
+        assert operational_limits[0]["deployment_max_jerk_rad_s3"] == (
+            pytest.approx(10.0)
+        )
+        assert operational_limits[0]["effective_max_velocity_rad_s"] == (
+            pytest.approx(1.5)
+        )
+        assert operational_limits[0]["effective_max_acceleration_rad_s2"] == (
+            pytest.approx(2.5)
+        )
+        assert operational_limits[0]["effective_max_jerk_rad_s3"] == (
+            pytest.approx(10.0)
+        )
+        assert all(
+            limit["deployment_max_velocity_rad_s"] is None
+            and limit["deployment_max_acceleration_rad_s2"] is None
+            and limit["deployment_max_jerk_rad_s3"] is None
+            and limit["effective_max_velocity_rad_s"] == pytest.approx(2.14)
+            and limit["effective_max_acceleration_rad_s2"] == pytest.approx(10.0)
+            and limit["effective_max_jerk_rad_s3"] is None
+            for limit in operational_limits[1:]
         )
         assert {frame["frame_role_id"] for frame in motion_descriptor["frames"]} >= {
             "base",
@@ -1806,8 +1849,37 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
         )
         gripper_descriptor = direct_gripper["target_descriptor"]
         assert gripper_descriptor["schema_version"] == (
-            "manyforge.manual_control_gripper_descriptor.v1"
+            "manyforge.manual_control_gripper_descriptor.v2"
         )
+        assert gripper_descriptor["description"] == (
+            "Native simulated UFACTORY lite pneumatic gripper."
+        )
+        assert gripper_descriptor["command_kind"] == "gripper_position"
+        assert gripper_descriptor["actuation_kind"] == "position_commanded"
+        assert gripper_descriptor["transport_kind"] == "resolved_binding"
+        assert gripper_descriptor["state_authority_class"] == "predicted"
+        assert gripper_descriptor["state_authority_id"]
+        assert gripper_descriptor["completion_policy"] == (
+            "goal_fenced_target_reached"
+        )
+        assert gripper_descriptor["grasp_confirmation_policy"] == (
+            "binding_feedback_required"
+        )
+        assert gripper_descriptor["source_group_name"] == "lite_gripper"
+        assert gripper_descriptor["command_duration_s"] == pytest.approx(0.8)
+        assert gripper_descriptor["open_state_ref"] == "open"
+        assert gripper_descriptor["closed_state_ref"] == "closed"
+        assert gripper_descriptor["touch_links"] == [
+            "lite_gripper_base_link",
+            "lite_gripper_left_finger",
+            "lite_gripper_right_finger",
+        ]
+        assert gripper_descriptor["mount_frame"] == "link_eef"
+        assert gripper_descriptor["attach_frame"] == "link_tcp"
+        assert gripper_descriptor["tcp_frame"] == "link_tcp"
+        assert gripper_descriptor["auxiliary_frames"] == [
+            "lite_gripper_base_link"
+        ]
         assert gripper_descriptor["source_coordinate_name"] == (
             direct_gripper["resource"]["source_coordinate_name"]
         )
@@ -1897,6 +1969,22 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
         assert "trajectory" not in receipt
         assert "compiled" not in receipt
         assert "providers" not in receipt
+        # A settled preview must release its exact collision-projection lease.
+        # The retained publisher has a fixed capacity of 64; 65 distinct
+        # requests therefore prove the host does not leak one lease per
+        # preview before Robot Control can be used again.
+        for preview_index in range(65):
+            repeated_intent = copy.deepcopy(direct_intent)
+            repeated_intent["request_context"]["request_id"] = (
+                f"composer-direct-preview-retention-{preview_index}"
+            )
+            repeated_receipt = composer.preview_motion(repeated_intent)[
+                "preview_receipt"
+            ]
+            assert repeated_receipt["commit_eligible"] is True
+            assert repeated_receipt["final_positions_rad"] == pytest.approx(
+                direct_positions
+            )
         pose_intent = _direct_control_motion_operation(
             first_status,
             request_id="composer-direct-pose-preview",
@@ -2252,31 +2340,50 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
         executing = _wait_state(runner, controlled_id, {"executing"})[
             "operation"
         ]
-        scaled = runner.set_operation_runtime_scale(
-            request_id="scale-controlled-operation",
-            operation_id=controlled_id,
-            expected_operation_revision=executing["operation_revision"],
-            expected_runtime_scale_generation=(
-                executing["runtime_scale_generation"] or 0
-            ),
-            scale=0.5,
-            correlation_id="n4-public-control-test",
+        projected_scale_control = composer.execution_control_state()[
+            "control_state"
+        ]["runtime_scale_control"]
+        scale_selector = projected_scale_control["selector"]
+        assert scale_selector == {
+            "program_binding_id": first_status["program_binding_id"],
+            "component_role_id": "robot",
+            "target_role_id": "arm",
+        }
+        initial_scale_control = composer.runtime_scale_control(scale_selector)[
+            "runtime_scale_control"
+        ]
+        assert initial_scale_control["supported"] is True
+        scaled = composer.set_runtime_scale_control(
+            {
+                "request_context": {
+                    "request_id": "scale-controlled-scope",
+                    "request_owner_epoch": first_status["owner_epoch"],
+                    "source_label": "composer_ui",
+                    "correlation_id": "n4-public-control-test",
+                },
+                "selector": scale_selector,
+                "expected_control_generation": initial_scale_control[
+                    "control_generation"
+                ],
+                "scale": 0.5,
+            }
         )
-        assert scaled["accepted"]["runtime_scale_generation"] == 1
-        scale_status = _wait_runtime_scale_applied(
+        assert scaled["accepted"]["control_generation"] == (
+            initial_scale_control["control_generation"] + 1
+        )
+        assert scaled["accepted"]["active_operation_id"] == controlled_id
+        scale_status = _wait_runtime_scale_control_applied(
             composer,
-            controlled_id,
-            scaled["accepted"]["runtime_scale_generation"],
+            scale_selector,
+            scaled["accepted"]["control_generation"],
             0.5,
+            active_operation_id=controlled_id,
         )
-        assert scale_status["runtime_scale"]["requested_scale"] == 0.5
-        assert scale_status["runtime_scale"]["effective_scale"] == 0.5
-        scale_participant = scale_status["runtime_scale"]["participants"][0]
-        assert scale_participant["commanded_scale"] == 0.5
-        assert scale_participant["applied_scale"] == 0.5
-        assert scale_participant["controller_goal_id"] == executing[
-            "participants"
-        ][0]["controller_goal_id"]
+        assert scale_status["runtime_scale_control"]["requested_scale"] == 0.5
+        assert scale_status["runtime_scale_control"]["effective_scale"] == 0.5
+        assert scale_status["runtime_scale_control"][
+            "active_operation_scale_generation"
+        ] == 1
 
         paused = composer.pause_operation(
             controlled_id,
@@ -2492,6 +2599,13 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
             reason="release first stopped operation",
             correlation_id="n4-public-control-test",
         )
+        persisted_scale_control = composer.runtime_scale_control(scale_selector)[
+            "runtime_scale_control"
+        ]
+        assert persisted_scale_control["control_generation"] == scaled[
+            "accepted"
+        ]["control_generation"]
+        assert persisted_scale_control["requested_scale"] == 0.5
         # Exact nominal motion containment settles directly to reset-ready
         # Stopped. It must not fabricate an intervention latch or require a
         # second recovery acknowledgement for the same physical Stop.
@@ -2630,6 +2744,7 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
             execution_run_root.stat().st_ino,
         ) == run_root_identity
         assert not (execution_run_root / "execution-command.sock").exists()
+        assert not (execution_run_root / "execution-observation.sock").exists()
         process = _start_host(
             fixture_root, execution_state_root, execution_run_root, manifest
         )
@@ -2641,6 +2756,7 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
             execution_run_root.stat().st_ino,
         ) == run_root_identity
         assert (execution_run_root / "execution-command.sock").is_socket()
+        assert (execution_run_root / "execution-observation.sock").is_socket()
         restarted = headless.execution_diagnostics()["status"]
         assert restarted["owner_epoch"] != first_status["owner_epoch"]
         with pytest.raises(HeadlessClientError) as stale:
@@ -2707,6 +2823,33 @@ def test_cell_admission_crosses_real_execution_seqpacket_surface(
             },
             "ok": False,
         }
+        observation_only = client._exchange_on(
+            get, execution_run_root / "execution-observation.sock"
+        )
+        assert observation_only == {
+            "api_version": "manyforge.execution_command_response.v1",
+            "command": "cell_admission_get",
+            "error": {
+                "code": "execution_observation_command_unsupported",
+                "details": {},
+                "message": (
+                    "the independent observation socket accepts only observation"
+                ),
+            },
+            "ok": False,
+        }
+        wrong_observation_command = client._exchange_on(
+            {
+                "api_version": "manyforge.execution_command.v1",
+                "command": "identity",
+            },
+            execution_run_root / "execution-observation.sock",
+        )
+        assert wrong_observation_command["ok"] is False
+        assert wrong_observation_command["error"]["code"] == (
+            "execution_observation_command_unsupported"
+        )
+        assert client.observation()["command"] == "observation"
         assert process.poll() is None
     finally:
         _stop_host(process)

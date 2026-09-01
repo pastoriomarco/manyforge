@@ -7,11 +7,9 @@ import {
   historianEventView,
   operatorAlarmView,
   runtimeAttentionSummary,
-  runtimeStatusView,
 } from './HeadlessRuntimeSurfaces';
 import type {
   ComposerHeadlessState,
-  HeadlessRuntimeSnapshot,
   HistorianStoredEvent,
   OperatorAlarmRecord,
 } from '../types/headless';
@@ -41,84 +39,6 @@ describe('headless Composer presentation adapters', () => {
       { id: 'composer.error.1', title: 'First', message: 'First detail' },
       { id: 'composer.error.2', title: 'Second', message: 'Second detail' },
     ])).toBe('2 messages require attention');
-  });
-
-  it('never presents an H0 projection as execution or robot readiness', () => {
-    const runtime: HeadlessRuntimeSnapshot = {
-      schemaVersion: 'manyforge.headless_runtime_snapshot.v1',
-      complete: true,
-      projectionGeneration: 2,
-      projectionOwnerEpoch: 'projection-epoch',
-      projectionOwnerId: 'headless-api',
-      reasons: [],
-      unavailableSections: [],
-      sections: {
-        manager: source(),
-        logicalScene: source(),
-        sceneRuntime: source(),
-      },
-    };
-
-    const view = runtimeStatusView(runtime);
-
-    expect(view.readiness).toBe('degraded');
-    expect(view.profileLabel).toBe('H0 projection');
-    expect(view.components).toContainEqual(expect.objectContaining({
-      id: 'execution_owner',
-      status: 'warning',
-    }));
-    expect(view.capabilities).not.toContain('robot ready');
-  });
-
-  it('reports ready only when runtime and addressed execution-owner projections are present', () => {
-    const runtime: HeadlessRuntimeSnapshot = {
-      schemaVersion: 'manyforge.headless_runtime_snapshot.v1',
-      complete: true,
-      projectionGeneration: 2,
-      projectionOwnerEpoch: 'projection-epoch',
-      projectionOwnerId: 'headless-api',
-      reasons: [],
-      unavailableSections: [],
-      sections: {
-        manager: source(),
-        logicalScene: source(),
-        sceneRuntime: source(),
-      },
-    };
-
-    const ready = runtimeStatusView(runtime, {
-      unacknowledged: 0,
-      activeAcknowledged: 0,
-      programCycleState: 'idle_after_reset',
-      executionOwnerAvailable: true,
-    });
-    const terminal = runtimeStatusView(runtime, {
-      unacknowledged: 0,
-      activeAcknowledged: 0,
-      programCycleState: 'terminal_awaiting_reset',
-      executionOwnerAvailable: true,
-    });
-    const clientFailure = runtimeStatusView(runtime, {
-      unacknowledged: 0,
-      activeAcknowledged: 0,
-      programCycleState: 'idle_after_reset',
-      executionOwnerAvailable: true,
-      clientErrorCount: 1,
-    });
-
-    expect(ready.readiness).toBe('ready');
-    expect(terminal.readiness).toBe('degraded');
-    expect(terminal.components).toContainEqual(expect.objectContaining({
-      id: 'program_cycle',
-      status: 'warning',
-    }));
-    expect(clientFailure.readiness).toBe('degraded');
-    expect(clientFailure.components).toContainEqual(expect.objectContaining({
-      id: 'composer_client_errors',
-      status: 'fault',
-      detail: '1 dismissal required',
-    }));
-    expect(terminal.summaryLabel).toBe('Operational attention');
   });
 
   it('maps only the four-state owner record into alarm presentation', () => {
@@ -193,7 +113,15 @@ describe('headless Composer presentation adapters', () => {
         severity: 'INFO',
         occurredAtNs: 100,
         occurredAtWall: '2026-08-05T12:00:00Z',
-        payload: { condition_id: 'condition-1' },
+        payload: {
+          condition_id: 'condition-1',
+          journal_payload: {
+            operation_state: {
+              program_run_id: 'program-run-1',
+              operation_id: 'operation-1',
+            },
+          },
+        },
       },
     };
 
@@ -201,7 +129,8 @@ describe('headless Composer presentation adapters', () => {
 
     expect(view.alarmPhase).toBe('acknowledgement');
     expect(view.message).toContain('condition-1');
-    expect(view.details).toEqual({ condition_id: 'condition-1' });
+    expect(view.programRunId).toBe('program-run-1');
+    expect(view.operationId).toBe('operation-1');
   });
 
   it('presents owner status, attention and standing alarms, history access, and reconnect together', () => {
@@ -239,8 +168,38 @@ describe('headless Composer presentation adapters', () => {
       requiresMotionAttention: false,
     };
     const snapshot: ComposerHeadlessState = {
-      schemaVersion: 'manyforge.composer_headless_state.v1',
+      schemaVersion: 'manyforge.composer_headless_state.v2',
       complete: true,
+      componentOverview: {
+        schemaVersion: 'manyforge.component_overview.v1',
+        overviewRevision: `sha256:${'a'.repeat(64)}`,
+        readiness: 'ready',
+        summaryLabel: 'Application surfaces ready',
+        profileLabel: 'native',
+        authorityLabel: 'owner-issued scoped facts',
+        userMessage: 'Current.',
+        capabilities: [],
+        components: [],
+        basis: {
+          runtimeProjectionOwnerEpoch: null,
+          runtimeProjectionGeneration: null,
+          managerSourceOwnerEpoch: null,
+          logicalSceneSourceOwnerEpoch: null,
+          logicalSceneSourceGeneration: null,
+          sceneRuntimeSourceOwnerEpoch: null,
+          sceneRuntimeSourceGeneration: null,
+          alarmOwnerEpoch: null,
+          alarmGeneration: null,
+          alarmStateRevision: null,
+          admissionGeneration: null,
+          programRunnerOwnerEpoch: null,
+          programCycleGeneration: null,
+          appliedProgramOwnerEpoch: null,
+          appliedProgramGeneration: null,
+          executionOwnerEpoch: null,
+          executionPublicationGeneration: null,
+        },
+      },
       authoringAdmission: { authoringAllowed: true, admissionGeneration: 1 },
       programCycle: {
         programRunnerOwnerEpoch: 'runner.epoch.1',
@@ -336,5 +295,39 @@ describe('headless Composer presentation adapters', () => {
     expect(collapsed).toContain('Acknowledge all');
     expect(collapsed).not.toContain('Runtime observability sections');
     expect(collapsed).not.toContain('Planner unavailable');
+
+    const singleClientFailure = renderToStaticMarkup(createElement(HeadlessRuntimeSurfacesView, {
+      enabled: true,
+      headlessState: {
+        snapshot: {
+          ...snapshot,
+          alarms: {
+            ...snapshot.alarms,
+            liveCount: 1,
+            unacknowledgedCount: 0,
+            activeCount: 1,
+            motionAttentionCount: 0,
+            unacknowledgedMembership: [],
+            alarms: [standingAlarm],
+          },
+        },
+        error: null,
+        reconnect,
+      },
+      clientErrors: [{
+        id: 'composer.source_model',
+        title: 'Viewer source-model response failed',
+        message: 'Projection contract mismatch.',
+      }],
+      onAcknowledgeClientError: vi.fn(),
+      expanded: false,
+      onExpandedChange: vi.fn(),
+    }));
+    expect(singleClientFailure).toContain(
+      'runtime-observability-surface collapsed has-attention attention-error',
+    );
+    expect(singleClientFailure).toContain('Viewer source-model response failed');
+    expect(singleClientFailure).toContain('>Acknowledge</button>');
+    expect(singleClientFailure).not.toContain('Acknowledge all');
   });
 });

@@ -161,5 +161,58 @@ TEST(ScenarioApplyCandidateSourceTest,
                ScenarioApplyCandidateError);
 }
 
+TEST(ScenarioApplyCandidateSourceTest,
+     KeepsActiveCatalogMeaningSeparateFromPublishedCandidates) {
+  TemporaryDirectory active_root;
+  TemporaryDirectory candidate_root;
+  const auto active_row = row("alpha", '1');
+  const auto candidate_row = row("alpha", '4');
+  const auto active_catalog = build_scenario_catalog({active_row});
+  const auto candidate_catalog = build_scenario_catalog({candidate_row});
+  {
+    FilesystemScenarioCatalogRepository repository(active_root.path(),
+                                                   "maintained");
+    ASSERT_EQ(repository.compare_and_set(std::nullopt, active_catalog),
+              ScenarioCatalogPublishResult::kPublished);
+  }
+  {
+    FilesystemScenarioCatalogRepository repository(candidate_root.path(),
+                                                   "maintained");
+    ASSERT_EQ(repository.compare_and_set(std::nullopt, candidate_catalog),
+              ScenarioCatalogPublishResult::kPublished);
+  }
+
+  FilesystemScenarioApplyCandidateSource source(
+      active_root.path(), "maintained", candidate_root.path());
+
+  // Unqualified observation always means the installed/active catalog. A
+  // newly compiled candidate cannot silently become the current Scenario.
+  EXPECT_EQ(source.LoadVerifiedCatalog(), active_catalog->normalized_root());
+  EXPECT_EQ(source.catalog_path(),
+            active_root.path() / "maintained.scenario-catalog.yaml");
+  EXPECT_EQ(source.catalog_path_for_revision(active_catalog->revision()),
+            active_root.path() / "maintained.scenario-catalog.yaml");
+  EXPECT_EQ(source.catalog_path_for_revision(candidate_catalog->revision()),
+            candidate_root.path() / "maintained.scenario-catalog.yaml");
+
+  // Addressed candidate lookup can select the candidate, while an exact
+  // active query that is absent from it falls back to the installed catalog.
+  const auto selected_candidate = source.ResolveExact({
+      candidate_row.deployment_artifact_id,
+      candidate_row.deployment_revision,
+  });
+  EXPECT_EQ(selected_candidate.scenario_catalog_revision,
+            candidate_catalog->revision());
+  EXPECT_EQ(selected_candidate.retained_bundle_id,
+            candidate_row.retained_bundle_id);
+  const auto selected_active = source.ResolveExact({
+      active_row.deployment_artifact_id,
+      active_row.deployment_revision,
+  });
+  EXPECT_EQ(selected_active.scenario_catalog_revision,
+            active_catalog->revision());
+  EXPECT_EQ(selected_active.retained_bundle_id, active_row.retained_bundle_id);
+}
+
 }  // namespace
 }  // namespace manyforge::deployment

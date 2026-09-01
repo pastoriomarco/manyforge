@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -21,6 +21,15 @@ from manyforge_headless_api.models import (
 
 
 _DIGEST = r"^sha256:[0-9a-f]{64}$"
+
+
+class ProgramNodeAvailabilityRequest(BaseModel):
+    """Exact current inputs supplied by Headless for one readiness reduction."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    applied: dict[str, Any]
+    selection: dict[str, Any]
 
 
 class ProgramCycleStatusDTO(BaseModel):
@@ -72,6 +81,7 @@ __all__ = [
     "ManualResultStageRequest",
     "ProgramCycleResetRequest",
     "ProgramCycleStatusDTO",
+    "ProgramNodeAvailabilityRequest",
     "ProgramFullStopResetRequest",
     "ProgramFullStopResumeRequest",
     "ProgramScenePreparationRequest",

@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { validateSnapshotRequest } from './SnapshotResponder';
 
@@ -18,5 +19,19 @@ describe('snapshot request presentation adapter', () => {
       timeoutMs: 2_000,
       requiredFrame: { ownerEpoch: 'owner.1', generation: 7 },
     })).toContain('qualified bounds');
+  });
+
+  it('keeps one observer subscription while presented-frame callbacks advance', () => {
+    const source = readFileSync(
+      new URL('./SnapshotResponder.tsx', import.meta.url),
+      'utf8',
+    );
+    expect(source).toContain('uploadRef.current = upload');
+    expect(source).toContain('ensureFrameRef.current = ensureFrame');
+    expect(source).toContain('applyFrameRef.current = applyFrame');
+    expect(source).toContain('}, [store, subscribe]);');
+    expect(source).not.toContain(
+      '[applyFrame, ensureFrame, store, subscribe, upload]',
+    );
   });
 });

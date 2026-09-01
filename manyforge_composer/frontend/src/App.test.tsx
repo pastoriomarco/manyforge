@@ -19,9 +19,12 @@ describe('Composer shell continuity', () => {
     expect(markup).toContain('aria-label="Workbench sections"');
     expect(markup).toContain('>Program</button>');
     expect(markup).toContain('>Scene</button>');
-    expect(markup).toContain('>Deployment</button>');
+    expect(markup).toContain('data-workspace="deployment"');
+    expect(markup).toContain('data-backend-connected="false"');
+    expect(markup).toContain('Live status feed unavailable');
+    expect(markup).toContain('>Deployment</span>');
     expect(markup).toContain('aria-label="Program document controls"');
-    expect(markup).toContain('class="runtime-status-overlay"');
+    expect(markup).toContain('deployment-status-button readiness-waiting');
     expect(workspace).toBeGreaterThan(0);
     expect(commands).toBeGreaterThan(workspace);
     expect(viewer).toBeGreaterThan(commands);
@@ -33,7 +36,8 @@ describe('Composer shell continuity', () => {
     expect(markup).not.toContain('Artifacts · Program / Deployment');
     expect(markup).not.toContain('Headless runtime truth is connected');
     expect(markup).not.toContain('class="app-footer"');
-    expect(markup.match(/class="runtime-status-overlay"/g)).toHaveLength(1);
+    expect(markup.match(/data-workspace="deployment"/g)).toHaveLength(1);
+    expect(markup).not.toContain('runtime-status-overlay');
     expect(markup.match(/role="separator"/g)).toHaveLength(3);
     expect(elapsedMs).toBeLessThan(2000);
   });
@@ -86,6 +90,14 @@ describe('Composer shell continuity', () => {
     expect(css).toMatch(/\.program-inspector-scroll\s*\{[\s\S]*?overflow-y: auto;/);
     expect(css).toContain('.workbench-inspector');
     expect(css).toContain('.central-inspector-slot');
+    expect(source).toContain('Math.round(window.innerWidth * 0.45)');
+    expect(css).toMatch(/\.viewer-transport\s*\{[\s\S]*?flex-wrap: wrap;/);
+    expect(css).toMatch(
+      /\.viewer-transport\s*\{[\s\S]*?width: min\(40rem, calc\(100% - 1\.2rem\)\);/,
+    );
+    expect(css).not.toMatch(
+      /\.viewer-transport \.transport-velocity\s*\{\s*display: none;/,
+    );
     expect(css).toContain('--inspector-control-height: 1.9rem');
     expect(css).toContain('.central-inspector-header > strong');
     expect(css).toContain("input:not([type='checkbox']):not([type='range'])");
@@ -126,8 +138,10 @@ describe('Composer shell continuity', () => {
 
     expect(appSource).toContain('<ProgramDocumentControls');
     expect(appSource).toContain('<DeploymentCompositionPanel');
-    expect(appSource).toContain('<RuntimeStatusOverlay');
-    expect(appSource).toContain('error={headlessState.error}');
+    expect(appSource).toContain('runtimeStatusPresentation({');
+    expect(appSource).toContain('className={`deployment-status-button readiness-');
+    expect(appSource).not.toContain('<RuntimeStatusOverlay');
+    expect(appSource).toContain('error: headlessState.error');
     expect(appSource).not.toContain("source: 'composer.headless_projection'");
     expect(appSource).toContain('expanded={runtimePanelExpanded}');
     expect(appSource).toMatch(

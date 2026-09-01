@@ -4,13 +4,14 @@
 #include <filesystem>
 #include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 
 namespace manyforge::headless {
 
 inline constexpr std::string_view kSourceModelProjectionApiVersion =
-    "manyforge.source_model_projection.v1";
+    "manyforge.source_model_projection.v2";
 inline constexpr std::uint64_t kMaximumSourceModelProjectionBytes = 64ULL * 1024ULL * 1024ULL;
 
 class SourceModelProjectionError : public std::runtime_error {
@@ -25,7 +26,10 @@ class SourceModelProjectionError : public std::runtime_error {
 /// control routes, and Program-Binding construction never cross this boundary.
 class ActiveSourceModelProjection final {
  public:
-  explicit ActiveSourceModelProjection(std::filesystem::path package_root);
+  explicit ActiveSourceModelProjection(
+      std::filesystem::path package_root,
+      std::optional<std::filesystem::path> candidate_package_root =
+          std::nullopt);
 
   [[nodiscard]] manyforge::content_identity::CanonicalValue Project(
       const manyforge::deployment::RetainedBundle& active_bundle) const;

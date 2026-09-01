@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 import pytest
@@ -71,6 +72,23 @@ def test_project_execution_observation_is_exact_and_compact() -> None:
         )
 
 
+def test_encode_execution_observation_frame_is_one_canonical_payload() -> None:
+    frame = stream.project_execution_observation(
+        _status(), received_at_monotonic_us=123_456
+    )
+
+    encoded = stream.encode_execution_observation_frame(frame)
+
+    assert json.loads(encoded) == frame
+    assert " " not in encoded
+    assert encoded.startswith('{"cell_id":"cell-1",')
+
+
+def test_each_completed_observation_anchors_the_next_deadline() -> None:
+    assert stream._next_poll_deadline(0.1, 10.05) == pytest.approx(10.15)
+    assert stream._next_poll_deadline(0.25, 10.15) == pytest.approx(10.4)
+
+
 def test_source_is_demand_bound_change_only_and_capacity_one(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -85,7 +103,7 @@ def test_source_is_demand_bound_change_only_and_capacity_one(
             return _status(sequence=self.calls, position=float(self.calls))
 
     async def exercise() -> None:
-        monkeypatch.setattr(stream, "_OBSERVATION_PERIOD_S", 0.0)
+        monkeypatch.setattr(stream, "_OBSERVATION_PERIOD_S", 0.001)
         client = Client()
         source = stream.ExecutionObservationSource(client)  # type: ignore[arg-type]
         assert client.calls == 0
@@ -93,9 +111,8 @@ def test_source_is_demand_bound_change_only_and_capacity_one(
         for _ in range(200):
             if source.status()["fanout"]["replaced_frames_total"] > 0:
                 break
-            # The source performs the synchronous owner read through
-            # ``to_thread``. Give that worker a bounded scheduling opportunity
-            # instead of exhausting this loop before it can publish.
+            # The owner sampler is a dedicated thread. Give the event loop a
+            # bounded scheduling opportunity to drain its capacity-one ingress.
             await asyncio.sleep(0.001)
         status = source.status()
         assert status["source"]["poll_count"] >= 3
@@ -106,17 +123,20 @@ def test_source_is_demand_bound_change_only_and_capacity_one(
         )
         assert status["fanout"]["replaced_frames_total"] > 0
         assert subscription.queue.qsize() == 1
-        latest = subscription.queue.get_nowait()
-        # The poll counter is incremented before the owner read and may include
-        # one in-flight call. In this fixture the second completed poll is the
-        # sole unchanged frame, so the latest completed source sequence is one
-        # greater than the number of published frames.
-        assert latest["source_sequence"] == (
-            status["source"]["published_count"] + 1
-        )
+        latest_payload = subscription.queue.get_nowait()
+        latest = json.loads(latest_payload)
+        assert latest["source_sequence"] <= client.calls
+        assert latest["positions_rad"] == [
+            float(latest["source_sequence"]),
+            -float(latest["source_sequence"]),
+        ]
+        assert status["source"]["ingress_replaced_frames"] >= 0
+        assert status["source"]["ingress_schedule_failures"] == 0
 
         second = source.subscribe()
-        assert second.queue.get_nowait()["source_sequence"] == latest["source_sequence"]
+        second_payload = second.queue.get_nowait()
+        assert second_payload is latest_payload
+        assert json.loads(second_payload)["source_sequence"] == latest["source_sequence"]
         source.unsubscribe(second)
         source.unsubscribe(subscription)
         await asyncio.sleep(0)
@@ -143,14 +163,13 @@ def test_source_rejects_changed_state_at_the_same_source_sequence(
         monkeypatch.setattr(stream, "_OBSERVATION_ERROR_PERIOD_S", 0.0)
         source = stream.ExecutionObservationSource(Client())  # type: ignore[arg-type]
         subscription = source.subscribe()
-        first = await subscription.queue.get()
+        first = json.loads(await subscription.queue.get())
         assert first["positions_rad"] == [1.0, -1.0]
         for _ in range(200):
             if source.status()["source"]["error_count"] > 0:
                 break
-            # The source uses ``to_thread`` around the synchronous owner
-            # client. Give that worker a bounded scheduling opportunity rather
-            # than spinning the event loop faster than the thread can run.
+            # Give the dedicated owner-sampling thread a bounded scheduling
+            # opportunity rather than spinning the event loop.
             await asyncio.sleep(0.001)
         status = source.status()["source"]
         assert status["published_count"] == 1
@@ -182,7 +201,7 @@ def test_source_accepts_a_fresh_restart_epoch_with_a_lower_sequence(
             return response
 
     async def exercise() -> None:
-        monkeypatch.setattr(stream, "_OBSERVATION_PERIOD_S", 0.0)
+        monkeypatch.setattr(stream, "_OBSERVATION_PERIOD_S", 0.001)
         source = stream.ExecutionObservationSource(Client())  # type: ignore[arg-type]
         subscription = source.subscribe()
         for _ in range(200):
@@ -192,7 +211,7 @@ def test_source_accepts_a_fresh_restart_epoch_with_a_lower_sequence(
         status = source.status()["source"]
         assert status["published_count"] == 2
         assert status["error_count"] == 0
-        latest = subscription.queue.get_nowait()
+        latest = json.loads(subscription.queue.get_nowait())
         assert latest["owner_epoch"] == "execution-owner.2"
         assert latest["source_epoch"] == "joint-source.2"
         assert latest["source_sequence"] == 1

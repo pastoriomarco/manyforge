@@ -1432,7 +1432,7 @@ TEST(RetainedBundleMaterializer,
       retained_liveness.runtime_policy_revision.value());
   EXPECT_EQ(
       canonical_json(member(parsed_manifest, "configuration")),
-      R"({"collision_monitor_period_ms":50,"execution_tick_hz":100,"initial_joint_positions_rad":[0,0,1.57,0,0,0],"mode":"simulated","planner_rng_seed":12345})");
+      R"({"collision_monitor_period_ms":50,"direct_control_joint_limits":[{"command_target_id":"arm","controllable_component_id":"lite6_arm","max_acceleration_rad_s2":2.5,"max_jerk_rad_s3":10,"max_velocity_rad_s":1.5,"source_joint_name":"joint1"}],"execution_tick_hz":100,"initial_joint_positions_rad":[0,0,1.57,0,0,0],"mode":"simulated","motion_target_limits":[{"command_target_id":"arm","controllable_component_id":"lite6_arm","maximum_tcp_linear_speed_mps":0.15}],"planner_rng_seed":12345})");
   EXPECT_NO_THROW(
       detail::require_native_execution_runtime_product_matches_retained_bundle(
           manifest, launch_descriptor, bundle->value(), group.runtime_unit_id));
@@ -1444,6 +1444,24 @@ TEST(RetainedBundleMaterializer,
             (std::vector<double>{0.0, 0.0, 1.57, 0.0, 0.0, 0.0}));
   EXPECT_EQ(runtime_configuration.execution_tick_hz, 100U);
   EXPECT_DOUBLE_EQ(runtime_configuration.collision_monitor_period_ms, 50.0);
+  ASSERT_EQ(runtime_configuration.direct_control_joint_limits.size(), 1U);
+  const auto &joint_limit =
+      runtime_configuration.direct_control_joint_limits.front();
+  EXPECT_EQ(joint_limit.controllable_component_id,
+            core::ControllableComponentId("lite6_arm"));
+  EXPECT_EQ(joint_limit.command_target_id, core::CommandTargetId("arm"));
+  EXPECT_EQ(joint_limit.source_joint_name, "joint1");
+  EXPECT_EQ(joint_limit.max_velocity_rad_s, 1.5);
+  EXPECT_EQ(joint_limit.max_acceleration_rad_s2, 2.5);
+  EXPECT_EQ(joint_limit.max_jerk_rad_s3, 10.0);
+  ASSERT_EQ(runtime_configuration.motion_target_limits.size(), 1U);
+  EXPECT_EQ(runtime_configuration.motion_target_limits.front().controllable_component_id,
+            core::ControllableComponentId("lite6_arm"));
+  EXPECT_EQ(runtime_configuration.motion_target_limits.front().command_target_id,
+            core::CommandTargetId("arm"));
+  EXPECT_DOUBLE_EQ(runtime_configuration.motion_target_limits.front()
+                       .maximum_tcp_linear_speed_mps,
+                   0.15);
   const std::string changed_configuration = replace_once(
       manifest, "\"execution_tick_hz\":100", "\"execution_tick_hz\":99");
   EXPECT_NO_THROW(static_cast<void>(

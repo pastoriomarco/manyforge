@@ -107,7 +107,7 @@ const applied: AppliedProgramSelection = {
 };
 
 const sourceModel: SourceModelProjection = {
-  schema_version: 'manyforge.source_model_projection.v1',
+  schema_version: 'manyforge.source_model_projection.v2',
   cell_id: 'cell',
   retained_bundle_id: 'sha256:bundle',
   graph_revision: 'sha256:graph',

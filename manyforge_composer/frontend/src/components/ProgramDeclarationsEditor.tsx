@@ -68,6 +68,31 @@ function parseJson(text: string, label: string): JsonValue {
   }
 }
 
+type ScalarParameterType = 'bool' | 'float64' | 'int64' | 'string';
+
+function isScalarParameterType(value: string): value is ScalarParameterType {
+  return value === 'bool' || value === 'float64' || value === 'int64' || value === 'string';
+}
+
+function defaultForParameterType(value: string): JsonValue {
+  if (value === 'bool') return false;
+  if (value === 'float64' || value === 'int64') return 0;
+  if (value === 'string') return '';
+  if (value === 'string_list') return [];
+  return null;
+}
+
+function constraintObject(text: string): Record<string, JsonValue> {
+  try {
+    const value = JSON.parse(text) as JsonValue;
+    return value !== null && typeof value === 'object' && !Array.isArray(value)
+      ? value as Record<string, JsonValue>
+      : {};
+  } catch {
+    return {};
+  }
+}
+
 export function ProgramDeclarationsEditor({
   embedded = false,
   selection = null,
@@ -126,6 +151,10 @@ export function ProgramDeclarationsEditor({
   const selectedKey = selection?.kind === 'key'
     ? keys.find((row) => row.key === selection.id) ?? null
     : null;
+  const parameterConstraints = useMemo(
+    () => constraintObject(constraintsText),
+    [constraintsText],
+  );
   const selectedDiagnosticPrefix = selection?.kind === 'parameter'
     ? `program.parameters[${parameters.findIndex((row) => row.parameter_id === selection.id)}]`
     : selection?.kind === 'namespace'
@@ -136,6 +165,23 @@ export function ProgramDeclarationsEditor({
   const selectedDiagnostics = selectedDiagnosticPrefix === null
     ? []
     : diagnostics.filter((diagnostic) => diagnostic.path.startsWith(selectedDiagnosticPrefix));
+  const scalarDefault = useMemo(() => {
+    try {
+      return JSON.parse(defaultText) as JsonValue;
+    } catch {
+      return defaultForParameterType(parameterType);
+    }
+  }, [defaultText, parameterType]);
+  const minimumConstraint = 'min_inclusive' in parameterConstraints
+    ? 'min_inclusive'
+    : 'min_exclusive' in parameterConstraints
+      ? 'min_exclusive'
+      : '';
+  const maximumConstraint = 'max_inclusive' in parameterConstraints
+    ? 'max_inclusive'
+    : 'max_exclusive' in parameterConstraints
+      ? 'max_exclusive'
+      : '';
   const parameterDirty = selectedParameter !== null && (
     parameterId !== selectedParameter.parameter_id
     || parameterType !== selectedParameter.type
@@ -158,10 +204,28 @@ export function ProgramDeclarationsEditor({
   );
   const parameterIssue = (): { message: string; target: string } | null => {
     try {
-      parseJson(defaultText, 'Default');
+      const defaultValue = parseJson(defaultText, 'Default');
       const constraints = parseJson(constraintsText, 'Constraints');
       if (constraints === null || typeof constraints !== 'object' || Array.isArray(constraints)) {
         return { message: 'Constraints must be one JSON object.', target: 'program-parameter-constraints' };
+      }
+      if (
+        (parameterType === 'bool' && typeof defaultValue !== 'boolean')
+        || (parameterType === 'float64' && (
+          typeof defaultValue !== 'number' || !Number.isFinite(defaultValue)
+        ))
+        || (parameterType === 'int64' && (
+          typeof defaultValue !== 'number' || !Number.isSafeInteger(defaultValue)
+        ))
+        || (parameterType === 'string' && typeof defaultValue !== 'string')
+        || (parameterType === 'string_list' && (
+          !Array.isArray(defaultValue) || defaultValue.some((item) => typeof item !== 'string')
+        ))
+      ) {
+        return {
+          message: `Default must match ${parameterType}.`,
+          target: 'program-parameter-default',
+        };
       }
       if (!parameterId.trim()) {
         return { message: 'Parameter ID is required.', target: 'program-parameter-id' };
@@ -221,6 +285,31 @@ export function ProgramDeclarationsEditor({
       : [],
     [catalogEntries, roots, selectedParameter],
   );
+
+  const updateConstraint = (name: string, value: JsonValue | undefined) => {
+    const next = { ...parameterConstraints };
+    if (value === undefined) delete next[name];
+    else next[name] = value;
+    setConstraintsText(JSON.stringify(next, null, 2));
+    clearError();
+  };
+
+  const updateNumericConstraint = (name: string, text: string) => {
+    if (text.trim() === '') {
+      updateConstraint(name, undefined);
+      return;
+    }
+    const parsed = parameterType === 'int64' ? Number.parseInt(text, 10) : Number(text);
+    if (!Number.isFinite(parsed)) return;
+    updateConstraint(name, parsed);
+  };
+
+  const changeParameterType = (nextType: string) => {
+    setParameterType(nextType);
+    setDefaultText(JSON.stringify(defaultForParameterType(nextType), null, 2));
+    setConstraintsText('{}');
+    clearError();
+  };
 
   const editParameter = useCallback((parameter: ProgramParameterDeclaration) => {
     setParameterId(parameter.parameter_id);
@@ -529,10 +618,144 @@ export function ProgramDeclarationsEditor({
             if (selectedParameter && !busy) saveParameter(false);
           }}>
             <label>Parameter ID<input id="program-parameter-id" value={parameterId} aria-invalid={errorTarget === 'program-parameter-id'} title={errorTarget === 'program-parameter-id' ? error ?? undefined : undefined} onChange={(event) => setParameterId(event.target.value)} /></label>
-            <label>Type<select value={parameterType} onChange={(event) => setParameterType(event.target.value)}>{PROGRAM_TYPES.map((type) => <option key={type}>{type}</option>)}</select></label>
+            <label>Type<select value={parameterType} onChange={(event) => changeParameterType(event.target.value)}>{PROGRAM_TYPES.map((type) => <option key={type}>{type}</option>)}</select></label>
             <label>Runtime mutability<select value={mutability} onChange={(event) => setMutability(event.target.value as typeof mutability)}><option value="immutable">immutable</option><option value="before_run">before run</option><option value="between_operations">between operations</option></select></label>
-            <label>Default (strict JSON)<textarea id="program-parameter-default" rows={3} value={defaultText} aria-invalid={errorTarget === 'program-parameter-default'} title={errorTarget === 'program-parameter-default' ? error ?? undefined : undefined} onChange={(event) => setDefaultText(event.target.value)} spellCheck={false} /></label>
-            <label>Constraints (strict JSON)<textarea id="program-parameter-constraints" rows={3} value={constraintsText} aria-invalid={errorTarget === 'program-parameter-constraints'} title={errorTarget === 'program-parameter-constraints' ? error ?? undefined : undefined} onChange={(event) => setConstraintsText(event.target.value)} spellCheck={false} /></label>
+            {parameterType === 'bool' && (
+              <label>
+                Default
+                <select
+                  id="program-parameter-default"
+                  value={scalarDefault === true ? 'true' : 'false'}
+                  aria-invalid={errorTarget === 'program-parameter-default'}
+                  title={errorTarget === 'program-parameter-default' ? error ?? undefined : undefined}
+                  onChange={(event) => setDefaultText(event.target.value)}
+                >
+                  <option value="true">True</option>
+                  <option value="false">False</option>
+                </select>
+              </label>
+            )}
+            {(parameterType === 'float64' || parameterType === 'int64') && (
+              <>
+                <label>
+                  Default
+                  <input
+                    id="program-parameter-default"
+                    type="number"
+                    step={parameterType === 'int64' ? '1' : 'any'}
+                    value={typeof scalarDefault === 'number' ? scalarDefault : ''}
+                    aria-invalid={errorTarget === 'program-parameter-default'}
+                    title={errorTarget === 'program-parameter-default' ? error ?? undefined : undefined}
+                    onChange={(event) => setDefaultText(event.currentTarget.value)}
+                  />
+                </label>
+                <fieldset
+                  id="program-parameter-constraints"
+                  className="program-parameter-constraints"
+                  aria-invalid={errorTarget === 'program-parameter-constraints'}
+                  title={errorTarget === 'program-parameter-constraints' ? error ?? undefined : undefined}
+                >
+                  <legend>Numeric constraints</legend>
+                  <label>
+                    Minimum
+                    <span>
+                      <select
+                        aria-label="Minimum bound kind"
+                        value={minimumConstraint}
+                        onChange={(event) => {
+                          const next = event.currentTarget.value;
+                          const current = minimumConstraint
+                            ? parameterConstraints[minimumConstraint]
+                            : 0;
+                          const constraints = { ...parameterConstraints };
+                          delete constraints.min_inclusive;
+                          delete constraints.min_exclusive;
+                          if (next) constraints[next] = current ?? 0;
+                          setConstraintsText(JSON.stringify(constraints, null, 2));
+                        }}
+                      >
+                        <option value="">None</option>
+                        <option value="min_inclusive">Inclusive (≥)</option>
+                        <option value="min_exclusive">Exclusive (&gt;)</option>
+                      </select>
+                      <input
+                        aria-label="Minimum bound"
+                        type="number"
+                        step={parameterType === 'int64' ? '1' : 'any'}
+                        value={minimumConstraint ? String(parameterConstraints[minimumConstraint] ?? '') : ''}
+                        disabled={!minimumConstraint}
+                        onChange={(event) => minimumConstraint
+                          && updateNumericConstraint(minimumConstraint, event.currentTarget.value)}
+                      />
+                    </span>
+                  </label>
+                  <label>
+                    Maximum
+                    <span>
+                      <select
+                        aria-label="Maximum bound kind"
+                        value={maximumConstraint}
+                        onChange={(event) => {
+                          const next = event.currentTarget.value;
+                          const current = maximumConstraint
+                            ? parameterConstraints[maximumConstraint]
+                            : 0;
+                          const constraints = { ...parameterConstraints };
+                          delete constraints.max_inclusive;
+                          delete constraints.max_exclusive;
+                          if (next) constraints[next] = current ?? 0;
+                          setConstraintsText(JSON.stringify(constraints, null, 2));
+                        }}
+                      >
+                        <option value="">None</option>
+                        <option value="max_inclusive">Inclusive (≤)</option>
+                        <option value="max_exclusive">Exclusive (&lt;)</option>
+                      </select>
+                      <input
+                        aria-label="Maximum bound"
+                        type="number"
+                        step={parameterType === 'int64' ? '1' : 'any'}
+                        value={maximumConstraint ? String(parameterConstraints[maximumConstraint] ?? '') : ''}
+                        disabled={!maximumConstraint}
+                        onChange={(event) => maximumConstraint
+                          && updateNumericConstraint(maximumConstraint, event.currentTarget.value)}
+                      />
+                    </span>
+                  </label>
+                </fieldset>
+              </>
+            )}
+            {parameterType === 'string' && (
+              <>
+                <label>
+                  Default
+                  <input
+                    id="program-parameter-default"
+                    type="text"
+                    value={typeof scalarDefault === 'string' ? scalarDefault : ''}
+                    aria-invalid={errorTarget === 'program-parameter-default'}
+                    title={errorTarget === 'program-parameter-default' ? error ?? undefined : undefined}
+                    onChange={(event) => setDefaultText(JSON.stringify(event.currentTarget.value))}
+                  />
+                </label>
+                <fieldset
+                  id="program-parameter-constraints"
+                  className="program-parameter-constraints"
+                  aria-invalid={errorTarget === 'program-parameter-constraints'}
+                  title={errorTarget === 'program-parameter-constraints' ? error ?? undefined : undefined}
+                >
+                  <legend>Length constraints</legend>
+                  <label>Minimum length<input type="number" min="0" step="1" value={String(parameterConstraints.min_length ?? '')} onChange={(event) => updateNumericConstraint('min_length', event.currentTarget.value)} /></label>
+                  <label>Maximum length<input type="number" min="0" step="1" value={String(parameterConstraints.max_length ?? '')} onChange={(event) => updateNumericConstraint('max_length', event.currentTarget.value)} /></label>
+                </fieldset>
+              </>
+            )}
+            {!isScalarParameterType(parameterType) && (
+              <>
+                <label>Default value<textarea id="program-parameter-default" rows={3} value={defaultText} aria-invalid={errorTarget === 'program-parameter-default'} title={errorTarget === 'program-parameter-default' ? error ?? undefined : undefined} onChange={(event) => setDefaultText(event.target.value)} spellCheck={false} /></label>
+                <label>Advanced constraints<textarea id="program-parameter-constraints" rows={3} value={constraintsText} aria-invalid={errorTarget === 'program-parameter-constraints'} title={errorTarget === 'program-parameter-constraints' ? error ?? undefined : undefined} onChange={(event) => setConstraintsText(event.target.value)} spellCheck={false} /></label>
+              </>
+            )}
             <label>Description<input value={parameterDescription} onChange={(event) => setParameterDescription(event.target.value)} /></label>
             {!selectedParameter && <button type="button" disabled={busy} onClick={() => saveParameter()}>Add parameter</button>}
             {!showNavigation && selectedParameter && (

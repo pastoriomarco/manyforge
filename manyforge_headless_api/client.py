@@ -330,6 +330,9 @@ class HeadlessHttpClient:
     def runtime(self) -> dict[str, Any]:
         return self.request("GET", "/api/runtime")
 
+    def component_overview(self) -> dict[str, Any]:
+        return self.request("GET", "/api/component-overview")
+
     def authoring_admission(self) -> dict[str, Any]:
         return self.request("GET", "/api/cell/authoring-admission")
 
@@ -737,6 +740,13 @@ class HeadlessHttpClient:
             "POST", "/api/manager/deployment-candidates/preview", body=body
         )
 
+    def compile_deployment_candidate(
+        self, body: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return self.request(
+            "POST", "/api/manager/deployment-candidates/compile", body=body
+        )
+
     def manager_apply(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/manager/apply", body=body)
 
@@ -891,14 +901,27 @@ class HeadlessHttpClient:
             "POST", "/api/execution/stop-fault/recover", body=body
         )
 
-    def set_operation_runtime_scale(
-        self, operation_id: str, body: Mapping[str, Any]
+    def set_runtime_scale_control(
+        self, body: Mapping[str, Any]
     ) -> dict[str, Any]:
-        return self._operation_control(operation_id, "runtime-scale", body)
-
-    def operation_runtime_scale(self, operation_id: str) -> dict[str, Any]:
         return self.request(
-            "GET", f"{self._operation_path(operation_id)}/runtime-scale"
+            "POST", "/api/execution/runtime-scale-control", body=body
+        )
+
+    def runtime_scale_control(
+        self, selector: Mapping[str, str]
+    ) -> dict[str, Any]:
+        expected = {
+            "program_binding_id",
+            "component_role_id",
+            "target_role_id",
+        }
+        if set(selector) != expected or any(not selector[key] for key in expected):
+            raise ValueError("runtime-scale control selector is incomplete")
+        return self.request(
+            "GET",
+            "/api/execution/runtime-scale-control",
+            params=tuple((key, selector[key]) for key in sorted(expected)),
         )
 
     def scene(self) -> dict[str, Any]:

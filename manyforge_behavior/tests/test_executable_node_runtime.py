@@ -34,6 +34,7 @@ from manyforge_behavior.orchestration_ports import (
     OwnerInvocationResult,
     OwnerNodeInputs,
     OwnerTaskObservationUnavailableError,
+    OwnerTaskSettlementPendingError,
     OwnerTaskSnapshot,
     OwnerTaskState,
 )
@@ -450,6 +451,57 @@ def test_accepted_task_retries_only_typed_observation_unavailability() -> None:
     assert adapter.update() is py_trees.common.Status.SUCCESS
     assert len(task.starts) == 1
     assert task.observations == ["task-1", "task-1"]
+    assert task.acknowledgements == [("task-1", task.starts[0][1])]
+
+
+def test_terminal_task_remains_running_while_owner_settlement_is_pending() -> None:
+    class _SettlingTaskPort(_TaskPort):
+        def __init__(self) -> None:
+            super().__init__((OwnerTaskState.SUCCEEDED,))
+            self.acknowledgement_attempts = 0
+
+        def acknowledge(
+            self,
+            task_id: str,
+            identity: NodeAttemptIdentity,
+        ) -> None:
+            self.acknowledgement_attempts += 1
+            if self.acknowledgement_attempts == 1:
+                raise OwnerTaskSettlementPendingError("still settling")
+            super().acknowledge(task_id, identity)
+
+    document = _minimal_document()
+    document["tree"] = {
+        "node_id": "simulation.reset",
+        "instance_id": "reset_sim",
+        "parameters": {},
+        "children": [],
+    }
+    catalog = _catalog()
+    program = Program.from_dict(_identified(document), catalog)
+    task = _SettlingTaskPort()
+    adapter = build_executable_node_resolver(
+        build_node_environment()
+    ).instantiate(
+        build_node_environment().registry.record("simulation.reset"),
+        NodeAdapterBuildContext(
+            name="reset_sim",
+            node_instance_id="reset_sim",
+            parameters={},
+            input_resolver=NodeAttemptInputResolver(
+                program=program,
+                catalog=catalog,
+                value_store=ProgramValueStore.from_program(program),
+            ),
+            attempt_source=ProgramRunAttemptSource("run.simulation"),
+            ports=NodeAdapterPorts(simulator_control=task),
+        ),
+    )
+
+    adapter.initialise()
+    assert adapter.update() is py_trees.common.Status.RUNNING
+    assert adapter.update() is py_trees.common.Status.SUCCESS
+    assert task.acknowledgement_attempts == 2
     assert task.acknowledgements == [("task-1", task.starts[0][1])]
 
 

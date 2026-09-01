@@ -390,6 +390,7 @@ private:
 
 struct DaemonConfig final {
   std::filesystem::path install_root;
+  std::filesystem::path candidate_package_root;
   std::filesystem::path canonical_empty_admission_filename{
       "canonical-empty-admission.json"};
   std::filesystem::path manager_state_root;
@@ -1957,8 +1958,13 @@ class ManagerVerifiedPackageView final
     : public deployment::IVerifiedRetainedBundleSource,
       public deployment::IVerifiedRetainedProductArtifactSource {
 public:
-  explicit ManagerVerifiedPackageView(std::filesystem::path package_root)
-      : bundles_(package_root), artifacts_(std::move(package_root)) {}
+  explicit ManagerVerifiedPackageView(
+      std::filesystem::path package_root,
+      std::optional<std::filesystem::path> candidate_package_root =
+          std::nullopt)
+      : bundles_(package_root, candidate_package_root),
+        artifacts_(std::move(package_root),
+                   std::move(candidate_package_root)) {}
 
   [[nodiscard]] std::shared_ptr<const deployment::RetainedBundle> get_verified(
       const core::RetainedBundleId &retained_bundle_id) const override {
@@ -2073,9 +2079,16 @@ public:
                        package_generation_.descriptor_bound_root(),
                        config_.canonical_empty_admission_filename)
                        .load_verified()),
-        verified_package_(package_generation_.descriptor_bound_root()),
+        verified_package_(
+            package_generation_.descriptor_bound_root(),
+            config_.candidate_package_root.empty()
+                ? std::nullopt
+                : std::optional(config_.candidate_package_root)),
         candidate_source_(package_generation_.descriptor_bound_root(),
-                          "maintained"),
+                          "maintained",
+                          config_.candidate_package_root.empty()
+                              ? std::nullopt
+                              : std::optional(config_.candidate_package_root)),
         native_runtime_adapter_(
             InstalledTargetRoot(), package_generation_.descriptor_bound_root(),
             config_.manager_state_root, config_.manager_run_root,
@@ -2088,7 +2101,8 @@ public:
                     deployment::ros2_control_execution_runtime_contract::
                         kLaunchEnvironmentContract)},
             config_.logical_scene_database, config_.program_cycle_journal,
-            config_.authoring_transaction_journal),
+            config_.authoring_transaction_journal,
+            config_.candidate_package_root),
         stores_(config_.manager_state_root, admission_),
         scene_owner_(config_.logical_scene_database, admission_,
                      stores_.active_bundle_publication_store(),
@@ -2144,10 +2158,14 @@ public:
     RequireCurrentPackageGeneration();
     EnsureBootstrap();
     RequireCurrentPackageGeneration();
+    // Native children are directly owned by this Manager process and therefore
+    // never survive its restart. Recreate the runtime selected by the durable
+    // public pointer before replaying an incomplete Apply that must query its
+    // Kernel-held admission claim or fence.
+    static_cast<void>(ReconcileAndPublish());
     if (TryRecoverIncompleteApply()) {
       static_cast<void>(ReconcileAndPublish());
     }
-    static_cast<void>(ReconcileAndPublish());
   }
 
   int Run() {
@@ -2240,6 +2258,20 @@ private:
         std::filesystem::canonical(config.install_root, install_root_error);
     Require(!install_root_error && config.install_root.is_absolute(),
             "install root could not be canonicalized");
+    if (!config.candidate_package_root.empty()) {
+      config.candidate_package_root = ExistingDirectory(
+          std::move(config.candidate_package_root),
+          "candidate package root");
+      std::error_code candidate_root_error;
+      config.candidate_package_root = std::filesystem::canonical(
+          config.candidate_package_root, candidate_root_error);
+      Require(!candidate_root_error &&
+                  config.candidate_package_root.is_absolute(),
+              "candidate package root could not be canonicalized");
+      RequireDisjointDirectories(config.install_root,
+                                 config.candidate_package_root,
+                                 "installed/candidate package capabilities");
+    }
     config.manager_state_root = ExistingPrivateDirectory(
         std::move(config.manager_state_root), "Manager state root");
     config.manager_run_root = ExistingPrivateDirectory(
@@ -2260,6 +2292,10 @@ private:
     for (const auto *typed_root : typed_roots) {
       RequireDisjointDirectories(config.install_root, *typed_root,
                                  "install/runtime capabilities");
+      if (!config.candidate_package_root.empty()) {
+        RequireDisjointDirectories(config.candidate_package_root, *typed_root,
+                                   "candidate/runtime capabilities");
+      }
     }
     config.projection_root = ExistingPrivateDirectory(
         std::move(config.projection_root), "projection root");
@@ -4101,6 +4137,7 @@ std::uint64_t ParsePeriod(const std::string_view value) {
 DaemonConfig ParseArguments(const int argc, char **argv) {
   DaemonConfig config;
   bool install = false;
+  bool candidate_package = false;
   bool admission = false;
   bool manager = false;
   bool manager_run = false;
@@ -4119,6 +4156,9 @@ DaemonConfig ParseArguments(const int argc, char **argv) {
     if (option == "--install-root" && !install) {
       config.install_root = value;
       install = true;
+    } else if (option == "--candidate-package-root" && !candidate_package) {
+      config.candidate_package_root = value;
+      candidate_package = true;
     } else if (option == "--canonical-empty-admission-filename" && !admission) {
       config.canonical_empty_admission_filename = value;
       admission = true;

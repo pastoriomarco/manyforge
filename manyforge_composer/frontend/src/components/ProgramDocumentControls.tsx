@@ -8,7 +8,7 @@ import {
 
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
 import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
-import type { ArtifactKind, FileBrowserEntry } from '../types/api';
+import type { ArtifactKind, CatalogEntry, FileBrowserEntry } from '../types/api';
 import { ArtifactBrowser } from './ArtifactBrowser';
 import { OverlayPanel } from './OverlayPanel';
 import { ProgramSettingsEditor } from './ProgramSettingsEditor';
@@ -25,6 +25,7 @@ type ProgramAction =
 interface ProgramDocumentControlsProps {
   controller: ProgramWorkspaceController;
   runtime: ProgramRuntimeController;
+  catalogEntries?: CatalogEntry[];
   localInvalidEdit?: boolean;
   settingsRequest?: number;
   onProgramRequirementCreated?: (
@@ -53,6 +54,7 @@ function actionTitle(action: ProgramAction): string {
 export function ProgramDocumentControls({
   controller,
   runtime,
+  catalogEntries = [],
   localInvalidEdit = false,
   settingsRequest = 0,
   onProgramRequirementCreated,
@@ -262,6 +264,7 @@ export function ProgramDocumentControls({
         {authoring && (
           <ProgramSettingsEditor
             program={authoring}
+            catalogEntries={catalogEntries}
             candidateRevision={workspace?.draft.programRevision ?? null}
             busy={authoringBusy}
             runtime={runtime}

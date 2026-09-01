@@ -12,6 +12,12 @@ import rfc8785
 from fastapi.testclient import TestClient
 
 from manyforge_behavior.canonical_artifact import compute_content_identity
+from manyforge_behavior.executable_node_resolver import build_executable_node_resolver
+from manyforge_behavior.node_availability import (
+    AvailabilityFact,
+    NodeExecutionReadiness,
+    project_node_execution_availability,
+)
 from manyforge_behavior.node_environment import build_node_environment
 from manyforge_behavior.program import Program
 
@@ -26,6 +32,7 @@ from manyforge_headless_api.models import (
     StopFaultRecoveryIntentRequest,
 )
 from manyforge_headless_api.native import HeadlessApiError, ViewerModelAsset
+from manyforge_headless_api.program_runner_client import ProgramRunnerClientError
 from manyforge_headless_api.service import HeadlessService
 
 
@@ -498,7 +505,7 @@ class FakeCore:
 
     def source_model_projection(self) -> dict[str, Any]:
         return {
-            "schema_version": "manyforge.source_model_projection.v1",
+            "schema_version": "manyforge.source_model_projection.v2",
             "retained_bundle_id": "bundle.1",
             "graph_revision": "graph.1",
             "occurrences": [],
@@ -1126,19 +1133,25 @@ class FakeExecution:
             "result": {"accepted": True},
         }
 
-    def set_runtime_scale(
+    def set_runtime_scale_control(
         self, request: object, *, trusted_principal_id: str | None
     ) -> dict[str, Any]:
-        self.requests.append(("set_runtime_scale", request))
-        self.principals.append(("set_runtime_scale", trusted_principal_id))
-        return {"ok": True, "command": "set_runtime_scale", "accepted": {}}
-
-    def get_runtime_scale(self, operation_id: str) -> dict[str, Any]:
-        self.requests.append(("get_runtime_scale", operation_id))
+        self.requests.append(("set_runtime_scale_control", request))
+        self.principals.append(
+            ("set_runtime_scale_control", trusted_principal_id)
+        )
         return {
             "ok": True,
-            "command": "get_runtime_scale",
-            "runtime_scale": {"operation_id": operation_id},
+            "command": "set_runtime_scale_control",
+            "accepted": {},
+        }
+
+    def get_runtime_scale_control(self, selector: object) -> dict[str, Any]:
+        self.requests.append(("get_runtime_scale_control", selector))
+        return {
+            "ok": True,
+            "command": "get_runtime_scale_control",
+            "runtime_scale_control": {},
         }
 
 
@@ -1215,6 +1228,12 @@ class FakeProgramRunner:
         self.active = active
         self.node_environment_digest = node_environment_digest
         self.calls: list[tuple[str, Any]] = []
+
+    def node_availability(self, body: dict[str, Any]) -> dict[str, Any]:
+        raise ProgramRunnerClientError(
+            "program_node_availability_unavailable",
+            "fixture does not publish node availability",
+        )
 
     def _snapshot(self, *, state: str = "running") -> dict[str, Any]:
         snapshot = _program_run_snapshot(state=state)
@@ -1298,6 +1317,101 @@ class FakeProgramRunner:
 
     def close(self) -> None:
         self.calls.append(("close", None))
+
+
+class _NodeAvailabilityRunner(FakeProgramRunner):
+    def __init__(self, projection: dict[str, Any]) -> None:
+        super().__init__()
+        self.projection = projection
+
+    def node_availability(self, body: dict[str, Any]) -> dict[str, Any]:
+        self.calls.append(("node_availability", copy.deepcopy(body)))
+        return copy.deepcopy(self.projection)
+
+
+def _node_availability_fixture(
+    applied: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    environment = build_node_environment()
+    resolver = build_executable_node_resolver(environment)
+    dispositions = resolver.dispositions
+    readiness = NodeExecutionReadiness(
+        program_binding_id=applied["program_binding_id"],
+        binding_by_node={
+            disposition.row.node_id: AvailabilityFact(True)
+            for disposition in dispositions
+        },
+        owner_by_port={
+            disposition.owner_port_name: AvailabilityFact(True)
+            for disposition in dispositions
+            if disposition.owner_port_name is not None
+        },
+    )
+    required: set[str] = set()
+
+    def collect(node: dict[str, Any]) -> None:
+        required.add(node["node_id"])
+        for child in node.get("children", []):
+            collect(child)
+
+    collect(applied["program"]["tree"])
+    availability = project_node_execution_availability(
+        resolver,
+        readiness,
+        required_node_ids=tuple(sorted(required)),
+    )
+    core_implementations = []
+    for row in availability["implementations"]:
+        core = {key: copy.deepcopy(value) for key, value in row.items() if key != "owner_port_name"}
+        core["binding_available"] = False
+        core["execution_available"] = False
+        core["reason_codes"] = ["program_binding_unselected"]
+        core_implementations.append(core)
+    core_projection = {
+        "schema_version": "manyforge.node_environment_projection.v2",
+        "retained_bundle_id": applied["retained_bundle_id"],
+        "graph_revision": applied["graph_revision"],
+        "environment_digest": environment.manifest.environment_digest,
+        "availability": {
+            "binding_context": "unselected",
+            "execution_available": False,
+            "implementations": core_implementations,
+            "manager_runtime_converged": True,
+            "portable_authoring_available": True,
+            "reason_codes": ["program_binding_unselected"],
+            "restoration_gates": [],
+        },
+        "source": {
+            "available": True,
+            "freshness": "fresh",
+            "known_gaps": [],
+        },
+    }
+    source = {
+        "admission_generation": 7,
+        "applied_record_digest": applied["source"]["record_digest"],
+        "cycle_generation": 11,
+        "graph_revision": applied["graph_revision"],
+        "node_environment_digest": environment.manifest.environment_digest,
+        "owner_epoch": "program-runner.epoch.1",
+        "owner_id": "program-runner",
+        "program_binding_id": applied["program_binding_id"],
+        "program_id": applied["program_id"],
+        "program_revision": applied["program_revision"],
+        "retained_bundle_id": applied["retained_bundle_id"],
+        "scenario_id": applied["scenario_id"],
+    }
+    runner_projection = {
+        "schema_version": "manyforge.program_node_availability.v1",
+        "availability": availability,
+        "source": {
+            **source,
+            "content_digest": "sha256:" + hashlib.sha256(
+                rfc8785.dumps({"availability": availability, **source})
+            ).hexdigest(),
+        },
+    }
+    return core_projection, runner_projection
 
 
 class _ResetProgramRunner(FakeProgramRunner):
@@ -1431,6 +1545,32 @@ def test_stale_program_cycle_reset_has_no_stop_recovery_effect() -> None:
     assert [kind for kind, _request in runner.calls] == ["cycle_status"]
 
 
+def test_successor_idle_reset_replay_is_forwarded_without_stop_recovery() -> None:
+    execution = _LatchedResetExecution()
+    runner = _ResetProgramRunner()
+    runner.cycle.update(
+        {
+            "cycle_generation": 5,
+            "state": "idle_after_reset",
+            "program_run_id": None,
+            "cycle_claim_generation": None,
+            "terminal_or_settlement_reference": None,
+        }
+    )
+    service = _service(
+        FakeCore(), FakeManager(), execution=execution, program_runner=runner
+    )
+
+    result = service.program_cycle_reset(_cycle_reset_request())
+
+    assert result["idle_cycle_generation"] == 5
+    assert execution.requests == []
+    assert [kind for kind, _request in runner.calls] == [
+        "cycle_status",
+        "reset_cycle",
+    ]
+
+
 class _FullStoppedResetProgramRunner(_ResetProgramRunner):
     def __init__(self) -> None:
         super().__init__()
@@ -1516,6 +1656,7 @@ def _service(
     execution: object | None = None,
     program_runner: object | None = None,
     cclc: object | None = None,
+    deployment_compiler: object | None = None,
 ) -> HeadlessService:
     return HeadlessService(
         core,
@@ -1524,6 +1665,7 @@ def _service(
         program_runner=program_runner,  # type: ignore[arg-type]
         cell_admission=FakeCellAdmission(),
         cclc=cclc,
+        deployment_compiler=deployment_compiler,  # type: ignore[arg-type]
     )
 
 
@@ -1535,6 +1677,64 @@ def _client(*, trusted: bool = False) -> tuple[TestClient, FakeCore, FakeManager
         trusted_principal_adapter=FakeTrustedAdapter() if trusted else None,
     )
     return TestClient(app), core, manager
+
+
+class FakeDeploymentCompiler:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def compile(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(copy.deepcopy(kwargs))
+        return {
+            "schema_version": "manyforge.deployment_candidate_compilation.v1",
+            "scenario_id": kwargs["scenario_id"],
+            "scenario_catalog_revision": kwargs[
+                "expected_scenario_catalog_revision"
+            ],
+            "deployment_artifact_id": "cell_a",
+            "deployment_revision": "sha256:" + "1" * 64,
+            "retained_bundle_id": "sha256:" + "2" * 64,
+            "graph_revision": "sha256:" + "3" * 64,
+            "program_id": "program_a",
+            "program_revision": "sha256:" + "4" * 64,
+            "program_binding_id": "sha256:" + "5" * 64,
+        }
+
+
+def test_deployment_candidate_compilation_requires_and_replays_exact_claim() -> None:
+    core = FakeCore()
+    manager = FakeManager()
+    compiler = FakeDeploymentCompiler()
+    client = TestClient(
+        create_app(service=_service(core, manager, deployment_compiler=compiler))
+    )
+    body = {
+        "scenario_id": "cell_a",
+        "expected_scenario_catalog_revision": "sha256:" + "6" * 64,
+        "deployment": {"api_version": "manyforge.deployment.v1"},
+        "program": {"api_version": "manyforge.program.v2"},
+        "authoring_claim": _authoring_claim(),
+    }
+
+    response = client.post(
+        "/api/manager/deployment-candidates/compile", json=body
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["compilation"]["scenario_id"] == "cell_a"
+    assert compiler.calls == [{
+        "scenario_id": "cell_a",
+        "expected_scenario_catalog_revision": "sha256:" + "6" * 64,
+        "deployment": {"api_version": "manyforge.deployment.v1"},
+        "program": {"api_version": "manyforge.program.v2"},
+    }]
+
+    body["authoring_claim"] = {"intent": {"claim_kind": "not-authoring"}}
+    rejected = client.post(
+        "/api/manager/deployment-candidates/compile", json=body
+    )
+    assert rejected.status_code == 409
+    assert rejected.json()["detail"]["code"] == "authoring_not_ready"
 
 
 class FakeCCLC:
@@ -1664,7 +1864,7 @@ def test_runtime_manager_scene_alarm_history_and_health_are_thin_reads() -> None
             "manyforge.node_environment_projection.v2"
         )
         assert context["source_model"]["schema_version"] == (
-            "manyforge.source_model_projection.v1"
+            "manyforge.source_model_projection.v2"
         )
         scenarios = client.get("/api/scenarios").json()
         assert scenarios["api_version"] == "manyforge.scenario_catalog.v1"
@@ -1732,12 +1932,71 @@ def test_runtime_manager_scene_alarm_history_and_health_are_thin_reads() -> None
         assert health["status_scope"] == "headless_projection"
         assert health["headless_projection_ready"] is True
         assert "ready" not in health
-        assert health["robot_readiness"] == {
-            "available": False,
-            "state": None,
-            "source_owner_id": None,
-            "reason_code": "robot_readiness_owner_unavailable",
-        }
+        assert "robot_readiness" not in health
+        overview = client.get("/api/component-overview").json()
+        assert overview["schema_version"] == "manyforge.component_overview.v1"
+        assert overview["readiness"] == "degraded"
+        assert overview["overview_revision"].startswith("sha256:")
+        assert next(
+            row for row in overview["components"] if row["id"] == "observe_render"
+        )["status"] == "healthy"
+
+
+def test_node_environment_joins_only_the_exact_applied_runner_offer() -> None:
+    core = FakeCore()
+    applied = _applied_projection(_program_document())
+    core.applied_program = copy.deepcopy(applied)
+    core_projection, runner_projection = _node_availability_fixture(applied)
+    core.node_environment_projection = lambda: copy.deepcopy(core_projection)  # type: ignore[method-assign]
+    runner = _NodeAvailabilityRunner(runner_projection)
+    service = _service(core, FakeManager(), program_runner=runner)
+
+    projected = service.node_environment()
+
+    assert projected["availability"]["binding_context"] == "applied"
+    assert projected["availability"]["execution_available"] is True
+    required = set(runner_projection["availability"]["required_node_ids"])
+    used = {
+        row["node_id"]: row
+        for row in projected["availability"]["implementations"]
+        if row["node_id"] in required
+    }
+    assert set(used) == required
+    assert all(row["execution_available"] for row in used.values())
+    assert runner.calls == [("node_availability", {
+        "applied": applied,
+        "selection": core.scenario_program_selection(applied["scenario_id"]),
+    })]
+
+
+def test_node_environment_rejects_a_stale_runner_applied_identity() -> None:
+    core = FakeCore()
+    applied = _applied_projection(_program_document())
+    core.applied_program = copy.deepcopy(applied)
+    core_projection, runner_projection = _node_availability_fixture(applied)
+    core.node_environment_projection = lambda: copy.deepcopy(core_projection)  # type: ignore[method-assign]
+    runner_projection["source"]["program_revision"] = "sha256:" + "f" * 64
+    source = {
+        key: value
+        for key, value in runner_projection["source"].items()
+        if key != "content_digest"
+    }
+    runner_projection["source"]["content_digest"] = "sha256:" + hashlib.sha256(
+        rfc8785.dumps({
+            "availability": runner_projection["availability"],
+            **source,
+        })
+    ).hexdigest()
+    service = _service(
+        core,
+        FakeManager(),
+        program_runner=_NodeAvailabilityRunner(runner_projection),
+    )
+
+    with pytest.raises(HeadlessApiError) as stale:
+        service.node_environment()
+
+    assert stale.value.code == "program_runner_response_invalid"
 
 
 def test_manager_status_and_diff_preserve_offer_digest_fields() -> None:
@@ -2822,7 +3081,7 @@ def test_openapi_contains_no_condition_mutation_route() -> None:
         "/api/execution/operations/{operation_id}/resume",
         "/api/execution/operations/{operation_id}/reset",
         "/api/execution/operations/{operation_id}/acknowledge-completed",
-        "/api/execution/operations/{operation_id}/runtime-scale",
+        "/api/execution/runtime-scale-control",
         "/api/execution/motion-previews",
         "/api/execution/capability-command-previews",
         "/api/execution/stops",
@@ -3034,7 +3293,7 @@ def test_execution_missing_reference_is_a_public_not_found() -> None:
     assert response.json()["error"]["code"] == "missing_reference"
 
 
-def test_operation_controls_and_scale_are_thin_revision_fenced_routes() -> None:
+def test_operation_controls_and_scale_control_are_thin_fenced_routes() -> None:
     execution = FakeExecution()
     app = create_app(
         service=_service(FakeCore(), FakeManager(), execution)
@@ -3062,12 +3321,15 @@ def test_operation_controls_and_scale_are_thin_revision_fenced_routes() -> None:
         ],
         "reason": "operator Stop",
     }
-    scale = {
+    scale_control = {
         "request_context": context,
-        "operation_id": "operation-1",
-        "expected_operation_revision": 3,
-        "expected_runtime_scale_generation": 0,
-        "scale": 0.25,
+        "selector": {
+            "program_binding_id": "binding-1",
+            "component_role_id": "robot",
+            "target_role_id": "arm",
+        },
+        "expected_control_generation": 0,
+        "scale": 0.4,
     }
 
     with TestClient(app) as client:
@@ -3079,12 +3341,12 @@ def test_operation_controls_and_scale_are_thin_revision_fenced_routes() -> None:
             assert response.status_code == 200, response.text
         assert client.post("/api/execution/stops", json=stop).status_code == 200
         assert client.post(
-            "/api/execution/operations/operation-1/runtime-scale", json=scale
+            "/api/execution/runtime-scale-control", json=scale_control
         ).status_code == 200
-        observed = client.get(
-            "/api/execution/operations/operation-1/runtime-scale"
-        )
-        assert observed.json()["runtime_scale"]["operation_id"] == "operation-1"
+        assert client.get(
+            "/api/execution/runtime-scale-control",
+            params=scale_control["selector"],
+        ).status_code == 200
 
     assert [kind for kind, _request in execution.requests] == [
         "pause",
@@ -3092,8 +3354,8 @@ def test_operation_controls_and_scale_are_thin_revision_fenced_routes() -> None:
         "reset",
         "acknowledge_completed",
         "stop",
-        "set_runtime_scale",
-        "get_runtime_scale",
+        "set_runtime_scale_control",
+        "get_runtime_scale_control",
     ]
     assert execution.principals == [
         ("pause", None),
@@ -3101,7 +3363,7 @@ def test_operation_controls_and_scale_are_thin_revision_fenced_routes() -> None:
         ("reset", None),
         ("acknowledge_completed", None),
         ("stop", None),
-        ("set_runtime_scale", None),
+        ("set_runtime_scale_control", None),
     ]
 
 
@@ -3262,12 +3524,15 @@ def test_operation_control_paths_accept_bounded_stop_and_promote_mixed_scope() -
             },
         )
         invalid_scale = client.post(
-            "/api/execution/operations/operation-1/runtime-scale",
+            "/api/execution/runtime-scale-control",
             json={
                 "request_context": context,
-                "operation_id": "operation-1",
-                "expected_operation_revision": 1,
-                "expected_runtime_scale_generation": 0,
+                "selector": {
+                    "program_binding_id": "binding-1",
+                    "component_role_id": "robot",
+                    "target_role_id": "arm",
+                },
+                "expected_control_generation": 0,
                 "scale": 1.01,
             },
         )

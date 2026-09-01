@@ -17,7 +17,11 @@ import type {
 import { ProgramDeclarationsEditor } from './ProgramDeclarationsEditor';
 import { ProgramContactPolicyEditor } from './ProgramContactPolicyEditor';
 import { ProgramDocumentControls } from './ProgramDocumentControls';
-import { ProgramNodePalette } from './ProgramNodePalette';
+import { NodePaletteItem } from './NodePaletteItem';
+import {
+  ProgramNodePalette,
+  defaultCollapsedCatalogCategories,
+} from './ProgramNodePalette';
 import {
   buildProgramParameterMutation,
   ProgramPropertyEditor,
@@ -277,9 +281,66 @@ describe('Program authoring panels', () => {
       />,
     );
 
-    expect(markup).toContain('Authoring only · execution gate N7');
-    expect(markup).toContain('draggable="true"');
-    expect(markup).not.toContain('Authoring is currently unavailable');
+    expect(defaultCollapsedCatalogCategories([sequence, timer], environment))
+      .toEqual(new Set(['control_flow', 'logic']));
+    expect(markup).toContain('aria-label="Expand Control Flow nodes"');
+    expect(markup).not.toContain('node-palette-row');
+
+    const unavailableItem = renderToStaticMarkup(
+      <NodePaletteItem
+        entry={sequence}
+        executionAvailable={false}
+        executionNote="Authorable · unavailable until N7"
+        allowDrag
+      />,
+    );
+    expect(unavailableItem).not.toContain('Authorable · unavailable until N7');
+    expect(unavailableItem).toContain('node-info-button execution-unavailable');
+    expect(unavailableItem).toContain('execution unavailable');
+    expect(unavailableItem).toContain('draggable="true"');
+    expect(markup).toContain('<strong>Control Flow</strong>');
+    expect(unavailableItem).toContain('Sequence; double-click or drag to add');
+    expect(unavailableItem).not.toContain('sequence · composite');
+    expect(unavailableItem).not.toContain('Authoring is currently unavailable');
+  });
+
+  it('marks executable catalog information without an inline status sentence', () => {
+    const executableEnvironment: NodeEnvironmentResponse = {
+      ...environment,
+      executionAvailable: true,
+      reasonCodes: [],
+      restorationGates: [],
+      implementations: environment.implementations.map((row) => ({
+        ...row,
+        executionAvailable: true,
+        reasonCodes: [],
+        restorationGates: [],
+      })),
+    };
+    const markup = renderToStaticMarkup(
+      <ProgramNodePalette
+        roots={[tree]}
+        catalogEntries={[sequence, timer]}
+        catalogIdentity={null}
+        environment={executableEnvironment}
+        busy={false}
+        onMutate={vi.fn()}
+      />,
+    );
+
+    expect(defaultCollapsedCatalogCategories([
+      sequence,
+      { ...timer, category: sequence.category },
+    ], {
+      ...executableEnvironment,
+      implementations: executableEnvironment.implementations.map((row) => (
+        row.nodeId === timer.id ? { ...row, executionAvailable: false } : row
+      )),
+    })).toEqual(new Set());
+    expect(markup).toContain('node-info-button execution-available');
+    expect(markup).toContain('execution available');
+    expect(markup).not.toContain('Execution available for the current binding');
+    expect(markup).not.toContain('Executable when configured');
   });
 
   it('exposes templates and contact policy authoring as Draft-only surfaces', () => {
@@ -601,6 +662,10 @@ describe('Program authoring panels', () => {
     const elapsedMs = performance.now() - started;
 
     expect(markup.match(/data-node-id=/g)).toHaveLength(513);
+    expect(markup).toContain('Add child');
+    expect(markup).toContain('Add after');
+    expect(markup).toContain('>Wrap</button>');
+    expect(markup).toContain('Change type');
     expect(elapsedMs).toBeLessThan(2_000);
   });
 
@@ -672,6 +737,7 @@ describe('Program authoring panels', () => {
         selectedScenarioId: null,
         runnerAvailable: false,
         loading: false,
+        observationError: null,
         pending: null,
         controlPending: null,
         error: null,
@@ -856,6 +922,7 @@ describe('Program authoring panels', () => {
         selectedScenarioId: 'qualified',
         runnerAvailable: true,
         loading: false,
+        observationError: null,
         pending: null,
         controlPending: null,
         error: null,

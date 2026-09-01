@@ -17,6 +17,18 @@ export interface DirectControlJoint {
   maxAccelerationRadS2: number | null;
 }
 
+export interface DirectControlOperationalJointLimit {
+  sourceJointName: string;
+  modelMaxVelocityRadS: number;
+  modelMaxAccelerationRadS2: number | null;
+  deploymentMaxVelocityRadS: number | null;
+  deploymentMaxAccelerationRadS2: number | null;
+  deploymentMaxJerkRadS3: number | null;
+  effectiveMaxVelocityRadS: number;
+  effectiveMaxAccelerationRadS2: number | null;
+  effectiveMaxJerkRadS3: number | null;
+}
+
 export interface ManualControlProviderContract {
   capabilityId: string;
   capabilityDefinitionRevision: string;
@@ -47,7 +59,7 @@ export interface ManualControlContracts {
 }
 
 export interface ManualControlMotionDescriptor {
-  schemaVersion: 'manyforge.manual_control_motion_descriptor.v1';
+  schemaVersion: 'manyforge.manual_control_motion_descriptor.v3';
   controllableComponentId: string;
   commandTargetId: string;
   componentRoleId: string;
@@ -59,21 +71,49 @@ export interface ManualControlMotionDescriptor {
     modelRevision: string;
   }>;
   joints: Array<DirectControlJoint & { compiledJointName: string; unit: 'rad' }>;
+  operationalJointLimits: DirectControlOperationalJointLimit[];
+  operationalLimit: {
+    catalogPolicyMaximumTcpLinearSpeedMps: number;
+    deploymentMaximumTcpLinearSpeedMps: number | null;
+    effectiveMaximumTcpLinearSpeedMps: number;
+    policyId: string;
+    policyRevision: string;
+    selectedScope: 'cell' | 'command_target';
+    sourceContentDigest: string;
+  } | null;
   contracts: ManualControlContracts;
 }
 
 export interface ManualControlGripperDescriptor {
-  schemaVersion: 'manyforge.manual_control_gripper_descriptor.v1';
+  schemaVersion: 'manyforge.manual_control_gripper_descriptor.v2';
   controllableComponentId: string;
   commandTargetId: string;
   componentRoleId: string;
   targetRoleId: string;
+  description: string | null;
+  commandKind: 'gripper_position';
+  actuationKind: 'position_commanded' | 'pneumatic' | null;
+  transportKind: 'resolved_binding';
+  controlInterfaceContractId: string | null;
+  stateAuthorityId: string | null;
+  stateAuthorityClass: 'measured' | 'commanded' | 'predicted' | null;
+  completionPolicy: 'goal_fenced_target_reached';
+  graspConfirmationPolicy: 'binding_feedback_required';
+  sourceGroupName: string | null;
   sourceCoordinateName: string;
   sourceKind: ResourceSourceKind;
   coordinateKind: CoordinateKind;
   unit: 'rad' | 'm';
   minPosition: number | null;
   maxPosition: number | null;
+  openStateRef: string | null;
+  closedStateRef: string | null;
+  commandDurationS: number | null;
+  touchLinks: string[];
+  mountFrame: string | null;
+  attachFrame: string | null;
+  tcpFrame: string | null;
+  auxiliaryFrames: string[];
   mimicFollowers: Array<{
     sourceCoordinateName: string;
     compiledCoordinateName: string;
@@ -215,7 +255,9 @@ export interface ExecutionOwnerStatus {
   directControlGripper: DirectControlGripperStatus;
   observedMotion: ObservedMotionTarget;
   observedGripper: ObservedGripperTarget | null;
+  residentOperations: OperationObservation[];
   cellStopAction: CellStopActionStatus;
+  runtimeScaleControl: RuntimeScaleControlStatus | null;
 }
 
 export interface ExecutionIdentity {
@@ -284,7 +326,11 @@ export interface MotionParticipantPayload {
   offset_reference: null;
   motion: DirectControlMotionSpec;
   contact_policy_id: null;
-  per_joint_dynamics_limits: Record<string, never>;
+  per_joint_dynamics_limits: Record<string, {
+    max_velocity_rad_s?: number;
+    max_acceleration_rad_s2?: number;
+    max_jerk_rad_s3?: number;
+  }>;
   motion_interrupt_scopes: [];
   runtime_object_bindings: [];
 }
@@ -428,13 +474,40 @@ export type RuntimeScaleApplicationState =
   | 'rejected'
   | 'failed';
 
-/** Exact owner observation used to fence one operation-scoped scale update. */
-export interface OperationRuntimeScaleStatus {
-  operationId: string;
-  operationRevision: number;
-  runtimeScaleGeneration: number;
+export interface RuntimeScaleControlSelector {
+  programBindingId: string;
+  componentRoleId: string;
+  targetRoleId: string;
+}
+
+/** Persistent owner setting; exact operation fields are observation only. */
+export interface RuntimeScaleControlStatus {
+  selector: RuntimeScaleControlSelector;
+  controlGeneration: number;
   requestedScale: number;
-  effectiveScale: number;
-  state: RuntimeScaleApplicationState;
   supported: boolean;
+  frozen: boolean;
+  controlDomainId: string | null;
+  controlDomainRevision: string | null;
+  controlBindingId: string | null;
+  controlBindingRevision: string | null;
+  scalingDomainId: string | null;
+  activeControlConfigurationId: string | null;
+  activeControlConfigurationGeneration: number | null;
+  activeOperationId: string | null;
+  activeOperationRevision: number | null;
+  activeOperationScaleGeneration: number | null;
+  effectiveScale: number | null;
+  applicationState: RuntimeScaleApplicationState | null;
+  reason: string | null;
+}
+
+export interface RuntimeScaleControlAccepted {
+  requestId: string;
+  selector: RuntimeScaleControlSelector;
+  requestedScale: number;
+  controlGeneration: number;
+  activeOperationId: string | null;
+  activeOperationRevision: number | null;
+  activeOperationScaleGeneration: number | null;
 }

@@ -21,7 +21,8 @@ from manyforge_headless_api.models import (
     OperationIntentRequest,
     PickSequencePlanningRequest,
     PlaceSequencePlanningRequest,
-    RuntimeScaleRequest,
+    RuntimeScaleControlRequest,
+    RuntimeScaleControlSelectorRequest,
     RouteSelectionRequest,
     SceneTransactionRequest,
     StopIntentRequest,
@@ -161,6 +162,10 @@ def create_headless_router(
     @router.get("/api/runtime")
     def runtime() -> dict[str, Any]:
         return _call(client.runtime)
+
+    @router.get("/api/component-overview")
+    def component_overview() -> dict[str, Any]:
+        return _call(client.component_overview)
 
     @router.get("/api/manager/status")
     def manager_status() -> dict[str, Any]:
@@ -748,23 +753,28 @@ def create_headless_router(
             )
         )
 
-    @router.post("/api/execution/operations/{operation_id}/runtime-scale")
-    def execution_set_runtime_scale(
-        operation_id: Annotated[str, Path(min_length=1, max_length=256)],
-        body: RuntimeScaleRequest,
+    @router.post("/api/execution/runtime-scale-control")
+    def execution_set_runtime_scale_control(
+        body: RuntimeScaleControlRequest,
     ) -> dict[str, Any]:
-        require_matching_operation(operation_id, body.operation_id)
         return _call(
-            lambda: client.set_operation_runtime_scale(
-                operation_id, body.model_dump()
-            )
+            lambda: client.set_runtime_scale_control(body.model_dump(mode="json"))
         )
 
-    @router.get("/api/execution/operations/{operation_id}/runtime-scale")
-    def execution_get_runtime_scale(
-        operation_id: Annotated[str, Path(min_length=1, max_length=256)],
+    @router.get("/api/execution/runtime-scale-control")
+    def execution_get_runtime_scale_control(
+        program_binding_id: Annotated[str, Query(min_length=1, max_length=256)],
+        component_role_id: Annotated[str, Query(min_length=1, max_length=256)],
+        target_role_id: Annotated[str, Query(min_length=1, max_length=256)],
     ) -> dict[str, Any]:
-        return _call(lambda: client.operation_runtime_scale(operation_id))
+        selector = RuntimeScaleControlSelectorRequest(
+            program_binding_id=program_binding_id,
+            component_role_id=component_role_id,
+            target_role_id=target_role_id,
+        )
+        return _call(
+            lambda: client.runtime_scale_control(selector.model_dump(mode="json"))
+        )
 
     @router.get("/api/scene")
     def scene() -> dict[str, Any]:

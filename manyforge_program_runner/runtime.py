@@ -27,7 +27,10 @@ from manyforge_behavior.executable_node_resolver import (
     build_executable_node_resolver,
 )
 from manyforge_behavior.kernel_client import KernelClient
-from manyforge_behavior.node_availability import AvailabilityFact
+from manyforge_behavior.node_availability import (
+    AvailabilityFact,
+    project_node_execution_availability,
+)
 from manyforge_behavior.node_environment import build_node_environment
 from manyforge_behavior.orchestration_ports import (
     CompositeProgramRunContextPort,
@@ -72,14 +75,13 @@ from .liveness import (
     ProgramRunnerLivenessReceiver,
 )
 from .models import (
+    CycleRecoveryActionRequest,
+    ManualResultStageRequest,
     ProgramCycleResetRequest,
     ProgramCycleStatusDTO,
     ProgramFullStopResetRequest,
     ProgramFullStopResumeRequest,
-)
-from .models import (
-    CycleRecoveryActionRequest,
-    ManualResultStageRequest,
+    ProgramNodeAvailabilityRequest,
     RuntimeBlackboardWriteRequest,
     RuntimeOverrideActionRequest,
     RuntimeOverridePromotionRequest,
@@ -765,6 +767,39 @@ class ProgramRuntime:
             for port_name in expected
         }
 
+    def _current_node_owner_availability(
+        self,
+        applied: Mapping[str, Any],
+        *,
+        admission_generation: int,
+    ) -> dict[str, AvailabilityFact]:
+        """Join configured ports to the current exact native owner identity."""
+
+        availability = dict(self._owner_availability)
+        native_ports = {
+            "gripper_status",
+            "kernel_controls",
+            "kernel_operations",
+            "model_queries",
+            "pick_place",
+        }.intersection(availability)
+        if not native_ports:
+            return availability
+        try:
+            self._run_recovery_fences(
+                applied,
+                self._kernel.identity(),
+                scene_admission_epoch=admission_generation,
+            )
+        except Exception:
+            unavailable = AvailabilityFact(
+                False,
+                ("program_execution_owner_unavailable",),
+            )
+            for port_name in native_ports:
+                availability[port_name] = unavailable
+        return availability
+
     @staticmethod
     def _headless_error(error: HeadlessClientError) -> ProgramRunnerError:
         return ProgramRunnerError(error.code, str(error))
@@ -1433,6 +1468,120 @@ class ProgramRuntime:
     ) -> None:
         self._scene.verify_initial_scene(context, initial_scene, proof)
 
+    def _prepare_current_applied_scene(
+        self,
+        *,
+        expected_record_digest: str | None,
+        context_id: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Converge and verify one exact Applied Program scene.
+
+        This is the single idempotent primitive shared by activation and Reset.
+        It owns no cycle transition and always releases its temporary scene
+        context; callers decide when their exact lifecycle fence permits it.
+        """
+
+        applied = self._headless.program_applied()
+        source = applied.get("source")
+        if (
+            not isinstance(source, Mapping)
+            or not isinstance(source.get("record_digest"), str)
+            or (
+                expected_record_digest is not None
+                and source.get("record_digest") != expected_record_digest
+            )
+        ):
+            raise ProgramRunnerError(
+                "program_run_applied_selection_stale",
+                "Applied Program changed before scene preparation",
+            )
+        scenario_id = applied.get("scenario_id")
+        scenario_catalog_revision = applied.get("scenario_catalog_revision")
+        if not isinstance(scenario_id, str) or not isinstance(
+            scenario_catalog_revision, str
+        ):
+            raise ProgramRunnerError(
+                "program_run_applied_selection_stale",
+                "Applied Program omitted its Scenario identity",
+            )
+        live = self._headless.scenario_program_selection(scenario_id)
+        try:
+            run_admission = build_applied_program_run_admission(
+                applied,
+                live,
+                expected_scenario_id=scenario_id,
+                expected_scenario_catalog_revision=scenario_catalog_revision,
+                environment=self._environment,
+                owner_availability=self._owner_availability,
+            )
+            context, initial_scene, proof = self._prepare_run_scene(
+                run_admission, context_id
+            )
+            self._verify_run_scene(context, initial_scene, proof)
+            if self._headless.program_applied() != applied:
+                raise ProgramRunnerError(
+                    "program_run_applied_selection_stale",
+                    "Applied Program changed during scene preparation",
+                )
+            return deepcopy(applied), deepcopy(proof)
+        finally:
+            self._scene.release(context_id)
+
+    def _prepare_scene_after_reset(
+        self, request: ProgramCycleResetRequest
+    ) -> None:
+        """Converge the current Applied scene after Reset has opened Idle.
+
+        Authored-scene commits deliberately require positive Idle authoring
+        admission, so this step runs after the exact cycle claim is released
+        and Idle is durably published.  The caller still holds the Program
+        transition lock, which prevents a new Run from overtaking it.  The
+        preparation primitive is idempotent, so an exact Reset replay can
+        safely finish this step after a crash or transient owner failure.
+        """
+
+        context_id = (
+            "program-reset-scene."
+            + self._digest(
+                {
+                    "request_id": request.request_id,
+                    "request_owner_epoch": request.request_owner_epoch,
+                    "program_run_id": request.program_run_id,
+                    "reset_cycle_generation": request.expected_cycle_generation,
+                    "terminal_reference": request.terminal_reference,
+                }
+            )[7:39]
+        )
+        try:
+            self._prepare_current_applied_scene(
+                expected_record_digest=None,
+                context_id=context_id,
+            )
+        except ProgramRunnerError as error:
+            raise ProgramRunnerError(
+                "program_cycle_reset_scene_preparation_failed",
+                str(error),
+                details={"cause_code": error.code},
+            ) from error
+        except HeadlessClientError as error:
+            raise ProgramRunnerError(
+                "program_cycle_reset_scene_preparation_failed",
+                str(error),
+                details={"cause_code": error.code},
+            ) from error
+        except (ProgramRunOwnerError, ProgramSchedulingError) as error:
+            cause = self._runner_error(error)
+            raise ProgramRunnerError(
+                "program_cycle_reset_scene_preparation_failed",
+                str(cause),
+                details={"cause_code": cause.code},
+            ) from error
+        except Exception as error:
+            raise ProgramRunnerError(
+                "program_cycle_reset_scene_preparation_failed",
+                str(error) or type(error).__name__,
+            ) from error
+
     def prepare_applied_scene(
         self, request: ProgramScenePreparationRequest
     ) -> dict[str, Any]:
@@ -1472,27 +1621,6 @@ class ProgramRuntime:
                     "stale_generation",
                     "authoring admission changed before scene preparation",
                 )
-            applied = self._headless.program_applied()
-            source = applied.get("source")
-            if (
-                not isinstance(source, Mapping)
-                or source.get("record_digest")
-                != request.expected_applied_record_digest
-            ):
-                raise ProgramRunnerError(
-                    "program_run_applied_selection_stale",
-                    "Applied Program changed before scene preparation",
-                )
-            scenario_id = applied.get("scenario_id")
-            scenario_catalog_revision = applied.get("scenario_catalog_revision")
-            if not isinstance(scenario_id, str) or not isinstance(
-                scenario_catalog_revision, str
-            ):
-                raise ProgramRunnerError(
-                    "program_run_applied_selection_stale",
-                    "Applied Program omitted its Scenario identity",
-                )
-            live = self._headless.scenario_program_selection(scenario_id)
             context_id = (
                 "program-scene."
                 + self._digest(
@@ -1506,23 +1634,10 @@ class ProgramRuntime:
                 )[7:39]
             )
             try:
-                run_admission = build_applied_program_run_admission(
-                    applied,
-                    live,
-                    expected_scenario_id=scenario_id,
-                    expected_scenario_catalog_revision=scenario_catalog_revision,
-                    environment=self._environment,
-                    owner_availability=self._owner_availability,
+                applied, proof = self._prepare_current_applied_scene(
+                    expected_record_digest=request.expected_applied_record_digest,
+                    context_id=context_id,
                 )
-                context, initial_scene, proof = self._prepare_run_scene(
-                    run_admission, context_id
-                )
-                self._verify_run_scene(context, initial_scene, proof)
-                if self._headless.program_applied() != applied:
-                    raise ProgramRunnerError(
-                        "program_run_applied_selection_stale",
-                        "Applied Program changed during scene preparation",
-                    )
                 resulting_generation = self._admission_generation(
                     admission_client.get()
                 )
@@ -1545,8 +1660,6 @@ class ProgramRuntime:
                     "program_scene_preparation_failed",
                     str(error) or type(error).__name__,
                 ) from error
-            finally:
-                self._scene.release(context_id)
 
     def start(self) -> None:
         if self._closed:
@@ -1574,6 +1687,86 @@ class ProgramRuntime:
             "assistant_model_transport_available": self._assistant is not None,
             "assistant_snapshot_source_available": self._snapshot_source is not None,
             "simulation_control_available": self._simulation_control is not None,
+        }
+
+    def node_availability(
+        self, request: ProgramNodeAvailabilityRequest
+    ) -> dict[str, Any]:
+        """Project the exact availability already enforced by Run admission."""
+
+        if self._closed or not self._started:
+            raise ProgramRunnerError(
+                "program_runner_unavailable",
+                "Program runner is not started",
+            )
+        self._require_manager_current()
+        admission_client, journal = self._require_cycle_owner()
+        admission_generation = self._admission_generation(admission_client.get())
+        cycle = journal.read()
+        try:
+            applied = request.applied
+            scenario_id = applied.get("scenario_id")
+            scenario_revision = applied.get("scenario_catalog_revision")
+            if not isinstance(scenario_id, str) or not isinstance(
+                scenario_revision, str
+            ):
+                raise ProgramRunOwnerError(
+                    "Applied Program omitted its Scenario identity"
+                )
+            live = request.selection
+            owner_availability = self._current_node_owner_availability(
+                applied,
+                admission_generation=admission_generation,
+            )
+            admitted = build_applied_program_run_admission(
+                applied,
+                live,
+                expected_scenario_id=scenario_id,
+                expected_scenario_catalog_revision=scenario_revision,
+                environment=self._environment,
+                owner_availability=owner_availability,
+            )
+            required_node_ids: set[str] = set()
+
+            def collect(node: Any) -> None:
+                required_node_ids.add(node.node_id)
+                for child in node.children:
+                    collect(child)
+
+            collect(admitted.program.tree)
+            availability = project_node_execution_availability(
+                build_executable_node_resolver(self._environment),
+                admitted.readiness,
+                required_node_ids=tuple(sorted(required_node_ids)),
+            )
+        except (ProgramRunOwnerError, TypeError, ValueError) as error:
+            raise ProgramRunnerError(
+                "program_node_availability_incompatible",
+                str(error) or type(error).__name__,
+            ) from error
+        source_value = {
+            "admission_generation": admission_generation,
+            "applied_record_digest": admitted.applied_record_digest,
+            "cycle_generation": cycle.cycle_generation,
+            "graph_revision": admitted.graph_revision,
+            "node_environment_digest": self._environment.environment_digest,
+            "owner_epoch": self.owner_epoch,
+            "owner_id": self.owner_id,
+            "program_binding_id": admitted.program_binding_id,
+            "program_id": admitted.program.program_id,
+            "program_revision": admitted.program.program_revision,
+            "retained_bundle_id": admitted.retained_bundle_id,
+            "scenario_id": admitted.scenario_id,
+        }
+        return {
+            "schema_version": "manyforge.program_node_availability.v1",
+            "source": {
+                **source_value,
+                "content_digest": self._digest(
+                    {"availability": availability, **source_value}
+                ),
+            },
+            "availability": availability,
         }
 
     def liveness_status(self) -> dict[str, Any]:
@@ -2026,7 +2219,7 @@ class ProgramRuntime:
         controls = self._controls(program_run_id)
         cycle = self._journal.read() if self._journal is not None else None
         return {
-            "schema_version": "manyforge.program_runtime_control_projection.v1",
+            "schema_version": "manyforge.program_runtime_control_projection.v2",
             "owner_id": self.owner_id,
             "owner_epoch": self.owner_epoch,
             "program_run_id": program_run_id,
@@ -3309,6 +3502,10 @@ class ProgramRuntime:
                 ) from error
             replay = self._ordinary_replay(record)
             if replay is not None:
+                # The durable Reset may have completed before its post-Reset
+                # scene activation. Replaying the exact request therefore
+                # rechecks the idempotent activation before reporting success.
+                self._prepare_scene_after_reset(request)
                 return replay
             def reject(error: ProgramRunnerError) -> NoReturn:
                 self._retain_rejection(
@@ -3556,6 +3753,7 @@ class ProgramRuntime:
                         "released Program-cycle claim was not durably settled",
                     )
                 )
+            self._prepare_scene_after_reset(request)
             return result
 
     def shutdown(self) -> None:

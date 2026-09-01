@@ -215,6 +215,7 @@ def test_execution_client_uses_exact_focused_projection_commands(
 ) -> None:
     client = ExecutionCommandClient(tmp_path)
     commands: list[dict[str, Any]] = []
+    observation_paths: list[Path] = []
 
     def exchange(command: dict[str, Any]) -> dict[str, Any]:
         commands.append(command)
@@ -224,7 +225,14 @@ def test_execution_client_uses_exact_focused_projection_commands(
             "ok": True,
         }
 
+    def exchange_observation(
+        command: dict[str, Any], socket_path: Path
+    ) -> dict[str, Any]:
+        observation_paths.append(socket_path)
+        return exchange(command)
+
     monkeypatch.setattr(client, "_exchange", exchange)
+    monkeypatch.setattr(client, "_exchange_on", exchange_observation)
     client.identity()
     client.targets()
     client.control_state()
@@ -241,6 +249,7 @@ def test_execution_client_uses_exact_focused_projection_commands(
             "status",
         )
     ]
+    assert observation_paths == [tmp_path / "execution-observation.sock"]
 
     monkeypatch.setattr(
         client,
@@ -543,6 +552,7 @@ def test_execution_client_projects_scoped_full_and_fault_recovery_commands(
         "components",
         "request_context",
     }
+    assert control_commands[0]["request"]["request_context"] == context
     assert control_commands[2]["command"] == "malformed_stop"
 
     latch = {

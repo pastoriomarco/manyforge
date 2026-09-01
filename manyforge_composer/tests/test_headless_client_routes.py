@@ -4,6 +4,7 @@ import asyncio
 import copy
 import json
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -23,6 +24,7 @@ from manyforge_behavior.node_environment import build_node_environment
 from manyforge_composer.backend import headless_ws
 from manyforge_composer.backend.app import create_app
 from manyforge_composer.backend.headless_ws import serve_headless_state
+from manyforge_composer.backend.routes_viewer import create_viewer_router
 from manyforge_composer.backend.security import SecurityConfig
 from manyforge_composer.backend.state import ComposerState
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
@@ -54,11 +56,30 @@ def _binding_for_program(program: dict[str, Any]) -> dict[str, Any]:
 
 
 def _runtime() -> dict[str, Any]:
+    def section(owner: str, generation: int) -> dict[str, Any]:
+        return {
+            "available": True,
+            "freshness": "fresh",
+            "known_gaps": [],
+            "payload": {},
+            "source_generation": generation,
+            "source_owner_epoch": f"{owner}.epoch.1",
+            "source_owner_id": owner,
+        }
+
     return {
         "schema_version": "manyforge.headless_runtime_snapshot.v1",
         "complete": True,
         "projection_owner_epoch": "projection.epoch.1",
+        "projection_owner_id": "headless.owner",
         "projection_generation": 4,
+        "reasons": [],
+        "unavailable_sections": [],
+        "sections": {
+            "manager": section("manager", 1),
+            "logical_scene": section("logical-scene", 2),
+            "scene_runtime": section("scene-runtime", 3),
+        },
     }
 
 
@@ -70,6 +91,60 @@ def _alarms() -> dict[str, Any]:
         "state_revision": 5,
         "alarms": [],
         "unacknowledged_membership": [],
+    }
+
+
+def _component_overview() -> dict[str, Any]:
+    runtime = _runtime()
+    alarms = _alarms()
+    sections = runtime["sections"]
+    return {
+        "schema_version": "manyforge.component_overview.v1",
+        "overview_revision": "sha256:" + "a" * 64,
+        "readiness": "ready",
+        "summary_label": "Application surfaces ready",
+        "profile_label": "native",
+        "authority_label": "owner-issued scoped facts",
+        "user_message": "Current owner facts are ready.",
+        "capabilities": [
+            "Observe / Render",
+            "Plan / Preview",
+            "Execute / Control",
+        ],
+        "components": [],
+        "basis": {
+            "runtime_projection_owner_epoch": runtime[
+                "projection_owner_epoch"
+            ],
+            "runtime_projection_generation": runtime[
+                "projection_generation"
+            ],
+            "manager_source_owner_epoch": sections["manager"][
+                "source_owner_epoch"
+            ],
+            "logical_scene_source_owner_epoch": sections["logical_scene"][
+                "source_owner_epoch"
+            ],
+            "logical_scene_source_generation": sections["logical_scene"][
+                "source_generation"
+            ],
+            "scene_runtime_source_owner_epoch": sections["scene_runtime"][
+                "source_owner_epoch"
+            ],
+            "scene_runtime_source_generation": sections["scene_runtime"][
+                "source_generation"
+            ],
+            "alarm_owner_epoch": alarms["owner_epoch"],
+            "alarm_generation": alarms["generation"],
+            "alarm_state_revision": alarms["state_revision"],
+            "admission_generation": 7,
+            "program_runner_owner_epoch": None,
+            "program_cycle_generation": None,
+            "applied_program_owner_epoch": None,
+            "applied_program_generation": None,
+            "execution_owner_epoch": None,
+            "execution_publication_generation": None,
+        },
     }
 
 
@@ -260,7 +335,7 @@ def headless_client() -> (
         },
     }
     source_model = {
-        "schema_version": "manyforge.source_model_projection.v1",
+        "schema_version": "manyforge.source_model_projection.v2",
         "cell_id": "cell-a",
         "retained_bundle_id": "bundle.1",
         "graph_revision": "graph.1",
@@ -292,7 +367,7 @@ def headless_client() -> (
             (
                 CONTENT_IDENTITY_PREFIX,
                 b"manyforge-source-model-projection-semantic",
-                b"manyforge.source_model_projection.v1",
+                b"manyforge.source_model_projection.v2",
                 canonical_json_bytes(
                     {key: value for key, value in source_model.items() if key != "source"}
                 ),
@@ -329,12 +404,7 @@ def headless_client() -> (
                 "status_scope": "headless_projection",
                 "status": "degraded",
                 "headless_projection_ready": False,
-                "robot_readiness": {
-                    "available": False,
-                    "state": None,
-                    "source_owner_id": None,
-                    "reason_code": "robot_readiness_owner_unavailable",
-                },
+                "components": {},
             }
         elif path == "/api/cell/authoring-admission":
             payload = {
@@ -394,6 +464,8 @@ def headless_client() -> (
             }
         elif path == "/api/runtime":
             payload = _runtime()
+        elif path == "/api/component-overview":
+            payload = _component_overview()
         elif path == "/api/execution/observation":
             payload = _execution_observation()
         elif path == "/api/manager/status":
@@ -726,6 +798,7 @@ def headless_client() -> (
             "/api/execution/full-stop",
             "/api/execution/stop-fault",
             "/api/execution/stop-fault/recover",
+            "/api/execution/runtime-scale-control",
         } or path.startswith("/api/execution/operations/"):
             payload = {
                 "api_version": "manyforge.execution_command_response.v1",
@@ -1118,8 +1191,11 @@ def test_composer_projects_headless_reads_without_local_runtime_state(
         assert health["components"]["headless_projection"] == "degraded"
         assert health["headless"]["headless_projection_ready"] is False
         assert "ready" not in health["headless"]
-        assert health["headless"]["robot_readiness"]["available"] is False
+        assert "robot_readiness" not in health["headless"]
         assert composer.get("/api/runtime").json() == _runtime()
+        assert composer.get("/api/component-overview").json() == (
+            _component_overview()
+        )
         assert composer.get("/api/manager/status").status_code == 200
         assert composer.get("/api/manager/graph").status_code == 200
         assert composer.get("/api/manager/diff").status_code == 200
@@ -1131,7 +1207,7 @@ def test_composer_projects_headless_reads_without_local_runtime_state(
             {"mode": "composer-assistant"}
         ]
         assert composer.get("/api/source-model").json()["schema_version"] == (
-            "manyforge.source_model_projection.v1"
+            "manyforge.source_model_projection.v2"
         )
         catalog = composer.get("/api/catalog").json()
         assert catalog["environmentDigest"] == node_environment["environment_digest"]
@@ -1171,7 +1247,7 @@ def test_composer_source_model_uses_one_coherent_context_request(
 
     assert response.status_code == 200
     assert response.json()["schema_version"] == (
-        "manyforge.source_model_projection.v1"
+        "manyforge.source_model_projection.v2"
     )
     assert [
         item["path"]
@@ -1354,11 +1430,14 @@ def test_composer_operation_controls_are_strict_stateless_forwarders(
         ],
         "reason": "operator Stop",
     }
-    scale = {
+    scale_control = {
         "request_context": context,
-        "operation_id": "operation-1",
-        "expected_operation_revision": 3,
-        "expected_runtime_scale_generation": 0,
+        "selector": {
+            "program_binding_id": "binding-1",
+            "component_role_id": "robot",
+            "target_role_id": "arm",
+        },
+        "expected_control_generation": 0,
         "scale": 0.5,
     }
     full_stop = {
@@ -1412,13 +1491,14 @@ def test_composer_operation_controls_are_strict_stateless_forwarders(
         )
         assert (
             composer.post(
-                "/api/execution/operations/operation-1/runtime-scale", json=scale
+                "/api/execution/runtime-scale-control", json=scale_control
             ).status_code
             == 200
         )
         assert (
             composer.get(
-                "/api/execution/operations/operation-1/runtime-scale"
+                "/api/execution/runtime-scale-control",
+                params=scale_control["selector"],
             ).status_code
             == 200
         )
@@ -1434,6 +1514,7 @@ def test_composer_operation_controls_are_strict_stateless_forwarders(
         or item["path"] == "/api/execution/full-stop"
         or item["path"].startswith("/api/execution/stop-fault")
         or item["path"].startswith("/api/execution/operations/")
+        or item["path"] == "/api/execution/runtime-scale-control"
     ]
     assert [item["path"].rsplit("/", 1)[-1] for item in forwarded] == [
         "pause",
@@ -1444,15 +1525,15 @@ def test_composer_operation_controls_are_strict_stateless_forwarders(
         "full-stop",
         "stop-fault",
         "recover",
-        "runtime-scale",
-        "runtime-scale",
+        "runtime-scale-control",
+        "runtime-scale-control",
     ]
     assert forwarded[0]["body"] == control
     assert forwarded[4]["body"] == stop
     assert forwarded[5]["body"] == full_stop
     assert forwarded[6]["method"] == "GET"
     assert forwarded[7]["body"] == recovery
-    assert forwarded[8]["body"] == scale
+    assert forwarded[8]["body"] == scale_control
     assert forwarded[9]["method"] == "GET"
 
 
@@ -2479,7 +2560,7 @@ def test_composer_preserves_manager_apply_success_receipt(
     assert response.json() == receipt
 
 
-def test_composer_websocket_multiplexes_shell_and_bounded_observations(
+def test_composer_uses_separate_shell_and_bounded_viewer_observation_sockets(
     headless_client,
 ) -> None:
     client, requests, _node_environment = headless_client
@@ -2490,9 +2571,10 @@ def test_composer_websocket_multiplexes_shell_and_bounded_observations(
         with composer.websocket_connect("/ws/state") as websocket:
             payload = websocket.receive_json()
             assert payload == {
-                "schema_version": "manyforge.composer_headless_state.v1",
+                "schema_version": "manyforge.composer_headless_state.v2",
                 "runtime": _runtime(),
                 "alarms": _alarms(),
+                "component_overview": _component_overview(),
                 "authoring_admission": {
                     "authoring_allowed": True,
                     "admission_generation": 7,
@@ -2509,6 +2591,7 @@ def test_composer_websocket_multiplexes_shell_and_bounded_observations(
                 "snapshot_sequence": 1,
                 "complete": True,
             }
+        with composer.websocket_connect("/ws/scene/viewer") as websocket:
             observation = websocket.receive_json()
             assert observation == {
                 "schema_version": "manyforge.execution_observation_frame.v1",
@@ -2545,6 +2628,8 @@ def test_composer_websocket_multiplexes_shell_and_bounded_observations(
                     "max_poll_duration_us"
                 ],
                 "last_error": None,
+                "ingress_replaced_frames": 0,
+                "ingress_schedule_failures": 0,
             },
             "fanout": {
                 "client_count": 0,
@@ -2561,6 +2646,7 @@ def test_composer_websocket_multiplexes_shell_and_bounded_observations(
         item["path"] for item in _without_authoring_owner_calls(requests)
     } == {
         "/api/runtime",
+        "/api/component-overview",
         "/api/execution/alarms",
         "/api/execution/observation",
         "/api/cycle/status",
@@ -2569,6 +2655,153 @@ def test_composer_websocket_multiplexes_shell_and_bounded_observations(
         item for item in requests if item["path"] == "/api/execution/alarms"
     )
     assert alarm_request["query"] == "limit=32&ordering=attention_newest"
+
+
+def test_slow_shell_read_does_not_block_dedicated_viewer_observation_lane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release_second_shell = threading.Event()
+    second_shell_started = threading.Event()
+
+    class RecordingWebSocket:
+        def __init__(self) -> None:
+            self.shell_sent = asyncio.Event()
+            self.observation_sent = asyncio.Event()
+            self.disconnected = asyncio.Event()
+
+        async def accept(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+        async def receive(self) -> dict[str, str]:
+            await self.disconnected.wait()
+            return {"type": "websocket.disconnect"}
+
+        async def send_text(self, message: str) -> None:
+            payload = json.loads(message)
+            if payload["schema_version"] == "manyforge.composer_headless_state.v2":
+                self.shell_sent.set()
+            elif payload["schema_version"] == "manyforge.execution_observation_frame.v1":
+                self.observation_sent.set()
+
+    class SnapshotClient:
+        def __init__(self) -> None:
+            self.runtime_calls = 0
+
+        def runtime(self) -> dict[str, Any]:
+            self.runtime_calls += 1
+            if self.runtime_calls == 2:
+                second_shell_started.set()
+                if not release_second_shell.wait(timeout=2):
+                    raise RuntimeError("test did not release the slow shell read")
+            return _runtime()
+
+        def alarms(self, *, limit: int, ordering: str) -> dict[str, Any]:
+            assert limit == 32
+            assert ordering == "attention_newest"
+            return _alarms()
+
+        def authoring_admission(self) -> dict[str, Any]:
+            return {"authoring_allowed": True, "admission_generation": 7}
+
+        def program_cycle_status(self) -> dict[str, Any]:
+            return {"state": "idle"}
+
+        def component_overview(self) -> dict[str, Any]:
+            return _component_overview()
+
+    class Admission:
+        mutation_ready = True
+        receiver_epoch = "composer-snapshot.test"
+
+    class Subscription:
+        def __init__(self) -> None:
+            self.queue: asyncio.Queue[str] = asyncio.Queue(maxsize=1)
+
+    class ObservationSource:
+        def __init__(self) -> None:
+            self.subscription: Subscription | None = None
+            self.unsubscribed = False
+
+        def subscribe(self) -> Subscription:
+            self.subscription = Subscription()
+            return self.subscription
+
+        def unsubscribe(self, subscription: Subscription) -> None:
+            assert subscription is self.subscription
+            self.unsubscribed = True
+
+    frame = {
+        "schema_version": "manyforge.execution_observation_frame.v1",
+        "owner_epoch": "execution.epoch.1",
+        "cell_id": "cell-a",
+        "retained_bundle_id": "bundle.1",
+        "graph_revision": "graph.1",
+        "controllable_component_id": "robot-a",
+        "command_target_id": "arm",
+        "source_epoch": "joint-source.1",
+        "source_sequence": 8,
+        "received_at_monotonic_us": 123,
+        "source_joint_names": ["joint1"],
+        "compiled_joint_names": ["robot-a__joint1"],
+        "positions_rad": [0.5],
+    }
+
+    async def exercise() -> None:
+        shell_websocket = RecordingWebSocket()
+        viewer_websocket = RecordingWebSocket()
+        source = ObservationSource()
+        shell_task = asyncio.create_task(
+            serve_headless_state(
+                shell_websocket,  # type: ignore[arg-type]
+                SnapshotClient(),  # type: ignore[arg-type]
+                admission=Admission(),  # type: ignore[arg-type]
+                draft_session=ComposerState().draft_session,
+            )
+        )
+
+        class ViewerState:
+            execution_observation_source = source
+
+        viewer_router = create_viewer_router(
+            ViewerState(),  # type: ignore[arg-type]
+            SecurityConfig(),
+        )
+        viewer_endpoint = next(
+            route.endpoint
+            for route in viewer_router.routes
+            if getattr(route, "path", None) == "/ws/scene/viewer"
+        )
+        viewer_task = asyncio.create_task(
+            viewer_endpoint(viewer_websocket)  # type: ignore[arg-type]
+        )
+        try:
+            await asyncio.wait_for(shell_websocket.shell_sent.wait(), timeout=1)
+            assert await asyncio.to_thread(second_shell_started.wait, 1)
+            assert source.subscription is not None
+            source.subscription.queue.put_nowait(
+                json.dumps(frame, separators=(",", ":"), sort_keys=True)
+            )
+            await asyncio.wait_for(
+                viewer_websocket.observation_sent.wait(), timeout=0.2
+            )
+            assert not shell_websocket.observation_sent.is_set()
+            assert not release_second_shell.is_set()
+        finally:
+            release_second_shell.set()
+            shell_task.cancel()
+            viewer_task.cancel()
+            for task in (shell_task, viewer_task):
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        assert source.unsubscribed is True
+
+    monkeypatch.setattr(headless_ws, "POLL_INTERVAL_SECONDS", 0.01)
+    asyncio.run(exercise())
 
 
 def test_composer_websocket_stream_is_read_only_transport(
@@ -2606,6 +2839,9 @@ def test_composer_websocket_stream_is_read_only_transport(
 
         def program_cycle_status(self) -> dict[str, Any]:
             return {"state": "idle"}
+
+        def component_overview(self) -> dict[str, Any]:
+            return _component_overview()
 
     monkeypatch.setattr(headless_ws, "POLL_INTERVAL_SECONDS", 0)
     asyncio.run(
@@ -2653,6 +2889,9 @@ def test_composer_websocket_skips_unchanged_owner_revisions(
 
         def program_cycle_status(self) -> dict[str, Any]:
             return {"state": "idle"}
+
+        def component_overview(self) -> dict[str, Any]:
+            return _component_overview()
 
     class Admission:
         mutation_ready = True
@@ -2730,7 +2969,7 @@ def test_composer_websocket_deduplicates_an_unchanged_owner_failure(
     assert websocket.accepted is True
     assert [json.loads(message) for message in websocket.messages] == [
         {
-            "schema_version": "manyforge.composer_headless_state.v1",
+            "schema_version": "manyforge.composer_headless_state.v2",
             "runtime": None,
             "alarms": None,
             "error": {
@@ -2775,6 +3014,9 @@ def test_composer_websocket_reports_an_oversized_projection_once(
         def program_cycle_status(self) -> dict[str, Any]:
             return {"state": "idle"}
 
+        def component_overview(self) -> dict[str, Any]:
+            return _component_overview()
+
     class Admission:
         mutation_ready = True
         receiver_epoch = "composer-snapshot.test"
@@ -2803,7 +3045,7 @@ def test_composer_websocket_reports_an_oversized_projection_once(
 
     assert [json.loads(message) for message in websocket.messages] == [
         {
-            "schema_version": "manyforge.composer_headless_state.v1",
+            "schema_version": "manyforge.composer_headless_state.v2",
             "runtime": None,
             "alarms": None,
             "error": {

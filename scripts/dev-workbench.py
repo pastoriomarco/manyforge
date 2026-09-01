@@ -42,10 +42,19 @@ STATE_ROOT = Path(
 )
 HEADLESS_BUILD = BUILD_ROOT / "headless"
 ROBOPLAN_BUILD = BUILD_ROOT / "roboplan"
-SCENARIO_ROOT = CACHE_ROOT / "maintained-scenario-package"
+DEPLOYMENT_AUTHORING_BUILD = BUILD_ROOT / "deployment-authoring"
+SCENARIO_ROOT = Path(
+    os.environ.get(
+        "MANYFORGE_DEV_SCENARIO_ROOT",
+        str(CACHE_ROOT / "maintained-scenario-package"),
+    )
+)
 PACKAGE_ROOT = SCENARIO_ROOT / "retained-package"
 NATIVE_EXECUTION_HOST = ROBOPLAN_BUILD / "manyforge_native_execution_host"
 NATIVE_CANDIDATE_WORKER = ROBOPLAN_BUILD / "manyforge_roboplan_candidate_worker"
+DEPLOYMENT_COMPILER = (
+    DEPLOYMENT_AUTHORING_BUILD / "manyforge_maintained_deployment_occurrences"
+)
 MANAGER_BINARY = HEADLESS_BUILD / "manyforge_manager_daemon"
 NODE_CATALOG = WORKSPACE / "manyforge_behavior/resources/node_catalog.yaml"
 NODE_ENVIRONMENT_MANIFEST = (
@@ -90,7 +99,7 @@ def _import_package() -> None:
     if not source_package.is_dir():
         raise WorkbenchError(
             "the maintained package is unavailable; set "
-            "MANYFORGE_DEV_QUALIFIED_BUILD_ROOT to an existing qualified build root"
+            "MANYFORGE_DEV_QUALIFIED_ROOT to an existing qualified package root"
         )
     if SCENARIO_ROOT.exists():
         raise WorkbenchError(
@@ -217,6 +226,57 @@ def _ensure_current_native_backend() -> tuple[Path, Path]:
         NATIVE_CANDIDATE_WORKER, "current candidate worker", executable=True
     )
     return NATIVE_EXECUTION_HOST, NATIVE_CANDIDATE_WORKER
+
+
+def _ensure_deployment_compiler() -> tuple[Path, tuple[tuple[str, Path], ...]]:
+    """Build the maintained compiler and its exact normalized model inputs."""
+
+    if not (DEPLOYMENT_AUTHORING_BUILD / "CMakeCache.txt").is_file():
+        _run(
+            (
+                "cmake",
+                "-G",
+                "Ninja",
+                "-S",
+                str(WORKSPACE / "manyforge_deployment"),
+                "-B",
+                str(DEPLOYMENT_AUTHORING_BUILD),
+                "-DCMAKE_BUILD_TYPE=Release",
+                "-DBUILD_TESTING=ON",
+            )
+        )
+    _run(
+        (
+            "cmake",
+            "--build",
+            str(DEPLOYMENT_AUTHORING_BUILD),
+            "--parallel",
+            _build_jobs(),
+            "--target",
+            "manyforge_maintained_deployment_occurrences",
+            "--",
+            "-k",
+            "0",
+        )
+    )
+    _regular_file(DEPLOYMENT_COMPILER, "Deployment compiler", executable=True)
+    prepared = tuple(
+        (
+            family_id,
+            DEPLOYMENT_AUTHORING_BUILD / "generated" / directory,
+        )
+        for family_id, directory in (
+            ("lite6_lite_gripper", "lite6_lite_gripper_structural"),
+            ("ur10e_robotiq_2f_140", "ur10e_robotiq_2f_140_structural"),
+            ("ur5_roboplan", "ur5_roboplan_structural"),
+        )
+    )
+    for family_id, root in prepared:
+        if not root.is_dir() or root.is_symlink():
+            raise WorkbenchError(
+                f"prepared Deployment model is unavailable for {family_id}: {root}"
+            )
+    return DEPLOYMENT_COMPILER, prepared
 
 
 def _regular_file(path: Path, label: str, *, executable: bool = False) -> None:
@@ -884,6 +944,7 @@ class Workbench:
         self.metadata = _load_scenario(self.scenario_id)
         current_headless_extension = _ensure_current_backend()
         current_native_targets = _ensure_current_native_backend()
+        deployment_compiler, prepared_models = _ensure_deployment_compiler()
         _regular_file(
             MANAGER_BINARY,
             "current Manager executable",
@@ -954,6 +1015,16 @@ class Workbench:
                 "--freshness-ms", "2000",
                 "--manager-timeout-s", "15",
                 "--program-runner-url", f"http://127.0.0.1:{self.runner_port}",
+                "--deployment-compiler", str(deployment_compiler),
+                "--deployment-compiler-workspace-root", str(WORKSPACE),
+                *(
+                    argument
+                    for family_id, prepared_root in prepared_models
+                    for argument in (
+                        "--deployment-compiler-prepared",
+                        f"{family_id}={prepared_root}",
+                    )
+                ),
             ),
         )
         base_url = f"http://127.0.0.1:{self.headless_port}"
@@ -980,6 +1051,7 @@ class Workbench:
             (
                 str(manager),
                 "--install-root", str(PACKAGE_ROOT),
+                "--candidate-package-root", str(paths["artifacts"]),
                 "--manager-state-root", str(paths["manager_state"]),
                 "--manager-run-root", str(paths["manager_run"]),
                 "--execution-state-root", str(paths["execution_state"]),
@@ -1019,12 +1091,6 @@ class Workbench:
                 admission = client.authoring_admission()
                 return admission if admission.get("authoring_allowed") is True else None
 
-        if startup_cycle_state == "idle_after_reset":
-            _wait_until(
-                "initial idle authoring admission",
-                authoring_ready,
-                self.processes,
-            )
         composer_environment = os.environ.copy()
         composer_environment["MANYFORGE_CORS_ORIGINS"] = (
             f"http://localhost:{self.frontend_port},"
@@ -1038,6 +1104,11 @@ class Workbench:
             WORKSPACE / "examples"
         )
         print("starting Composer backend", flush=True)
+        # Composer owns recovery of its durable authoring transactions. Start
+        # it once the current Manager/Kernel baseline is reachable, even when
+        # an interrupted prior transaction still holds authoring admission;
+        # waiting for admission first would prevent the sole recovery owner
+        # from ever running.
         composer_command = [
             sys.executable, "-m", "manyforge_composer",
             "--host", "127.0.0.1", "--port", str(self.composer_port),

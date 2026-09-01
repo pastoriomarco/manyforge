@@ -22,6 +22,7 @@ from .deployment_artifacts import (
     save_deployment_artifact,
 )
 from .deployment_draft import CompiledDeploymentDocument, DeploymentDraftError
+from .draft_session import DraftSessionError
 from .state import ComposerState
 
 
@@ -62,6 +63,16 @@ class UpdateDeploymentRequest(_Fence):
     value: Any = None
 
 
+class UpdateControlledStopRequest(_Fence):
+    profile: dict[str, Any]
+
+
+class UpdateMotionTargetLimitRequest(_Fence):
+    controllable_component_id: str = Field(min_length=1, max_length=256)
+    command_target_id: str = Field(min_length=1, max_length=256)
+    maximum_tcp_linear_speed_mps: float = Field(gt=0.0, le=1000.0)
+
+
 class SaveDeploymentRequest(_Fence):
     pass
 
@@ -79,6 +90,14 @@ class RevertDeploymentRequest(_Fence):
     pass
 
 
+class PreviewDeploymentCandidateRequest(_Fence):
+    pass
+
+
+class ApplyDeploymentCandidateRequest(_Fence):
+    pass
+
+
 def _raise(error: Exception) -> NoReturn:
     if isinstance(error, DeploymentDraftError):
         raise HTTPException(
@@ -87,6 +106,11 @@ def _raise(error: Exception) -> NoReturn:
         ) from error
     if isinstance(error, HeadlessClientError):
         raise headless_client_http_exception(error) from error
+    if isinstance(error, DraftSessionError):
+        raise HTTPException(
+            status_code=error.status_code,
+            detail={"code": error.code, "message": str(error)},
+        ) from error
     raise error
 
 
@@ -220,6 +244,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
         prepare,
         effect,
         validate=None,
+        after_release=None,
     ):
         coordinator = state.authoring_admission
         if coordinator is None:
@@ -241,6 +266,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                 validate_under_claim=validate,
                 effect=effect,
                 post_image=state.authoring_retained_state,
+                after_release=after_release,
             )
         except Exception as error:
             _raise(error)
@@ -308,6 +334,70 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
         return execute(
             body,
             "mutate_deployment_draft",
+            prepare=lambda: {"effect_class": "local"},
+            validate=validate,
+            effect=effect,
+        )
+
+    @router.post("/api/deployment/draft/controlled-stop")
+    def update_controlled_stop(body: UpdateControlledStopRequest) -> dict[str, Any]:
+        prepared: dict[str, CompiledDeploymentDocument] = {}
+
+        def validate(_claim: dict[str, Any]) -> None:
+            prepared["compiled"] = (
+                state.deployment_draft_session.preview_controlled_stop_update(
+                    body.profile,
+                    draft_id=body.draft_id,
+                    expected_revision=body.expected_draft_revision,
+                )
+            )
+
+        def effect(_claim: dict[str, Any]) -> dict[str, Any]:
+            state.deployment_draft_session.commit_compiled(
+                prepared["compiled"],
+                draft_id=body.draft_id,
+                expected_revision=body.expected_draft_revision,
+            )
+            return _workspace(state)
+
+        return execute(
+            body,
+            "mutate_deployment_controlled_stop",
+            prepare=lambda: {"effect_class": "local"},
+            validate=validate,
+            effect=effect,
+        )
+
+    @router.post("/api/deployment/draft/motion-target-limit")
+    def update_motion_target_limit(
+        body: UpdateMotionTargetLimitRequest,
+    ) -> dict[str, Any]:
+        prepared: dict[str, CompiledDeploymentDocument] = {}
+
+        def validate(_claim: dict[str, Any]) -> None:
+            prepared["compiled"] = (
+                state.deployment_draft_session.preview_motion_target_limit_update(
+                    controllable_component_id=body.controllable_component_id,
+                    command_target_id=body.command_target_id,
+                    maximum_tcp_linear_speed_mps=(
+                        body.maximum_tcp_linear_speed_mps
+                    ),
+                    draft_id=body.draft_id,
+                    expected_revision=body.expected_draft_revision,
+                )
+            )
+
+        def effect(_claim: dict[str, Any]) -> dict[str, Any]:
+            state.deployment_draft_session.commit_compiled(
+                prepared["compiled"],
+                draft_id=body.draft_id,
+                expected_revision=body.expected_draft_revision,
+            )
+            return _workspace(state)
+
+        return execute(
+            body,
+            "mutate_deployment_motion_target_limit",
             prepare=lambda: {"effect_class": "local"},
             validate=validate,
             effect=effect,
@@ -551,5 +641,189 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             validate=validate,
             effect=effect,
         )
+
+    def authored_candidate(
+        body: PreviewDeploymentCandidateRequest
+        | ApplyDeploymentCandidateRequest,
+        *,
+        apply: bool,
+    ) -> dict[str, Any]:
+        if state.headless_client is None:
+            _raise(
+                DeploymentDraftError(
+                    "deployment_candidate_unavailable",
+                    "Deployment preview and Apply require the configured Manager",
+                    status_code=503,
+                )
+            )
+
+        def manager_current() -> tuple[str, str]:
+            try:
+                bundle, graph, _epoch = state._manager_current(
+                    state.headless_client.manager_status()
+                )
+                return bundle, graph
+            except DraftSessionError as error:
+                raise DeploymentDraftError(
+                    error.code, str(error), status_code=error.status_code
+                ) from error
+
+        state.deployment_draft_session.require_current(
+            body.draft_id, body.expected_draft_revision
+        )
+        deployment_state = state.deployment_draft_session.retained_state()
+        deployment = deployment_state.get("document")
+        if not isinstance(deployment, dict):
+            _raise(
+                DeploymentDraftError(
+                    "deployment_draft_unavailable",
+                    "Open a Deployment Draft before previewing it",
+                    status_code=404,
+                )
+            )
+        current_projection = state.current_scenario()
+        current = current_projection.get("current_scenario")
+        if current_projection.get("ready") is not True or not isinstance(
+            current, dict
+        ):
+            _raise(
+                DeploymentDraftError(
+                    "deployment_current_scenario_unavailable",
+                    "Deployment preview requires one exact current Scenario",
+                    status_code=409,
+                )
+            )
+        if deployment_state["document"].get("deployment_artifact_id") != current.get(
+            "deployment_artifact_id"
+        ):
+            _raise(
+                DeploymentDraftError(
+                    "deployment_candidate_artifact_mismatch",
+                    "The Deployment Draft addresses another artifact; load its "
+                    "Scenario before previewing it",
+                    status_code=409,
+                )
+            )
+        applied = state.headless_client.program_applied()
+        program = applied.get("program")
+        source = applied.get("source")
+        record_digest = (
+            source.get("record_digest") if isinstance(source, dict) else None
+        )
+        if not isinstance(program, dict) or not isinstance(record_digest, str):
+            _raise(
+                DeploymentDraftError(
+                    "deployment_applied_program_unavailable",
+                    "Deployment preview requires the exact current Applied Program",
+                    status_code=409,
+                )
+            )
+        current_bundle, current_graph = manager_current()
+        pre_state = state.authoring_retained_state()
+        intent = {
+            "schema_version": "manyforge.composer_authoring_effect.v1",
+            "operation_kind": (
+                "apply_deployment_candidate"
+                if apply
+                else "preview_deployment_candidate"
+            ),
+            "effect_class": "external",
+            "external_kind": (
+                "deployment_candidate_apply"
+                if apply
+                else "deployment_candidate_preview"
+            ),
+            "scenario_id": current["scenario_id"],
+            "expected_scenario_catalog_revision": current[
+                "scenario_catalog_revision"
+            ],
+            "deployment": deepcopy(deployment),
+            "program": deepcopy(program),
+            "expected_applied_record_digest": record_digest,
+            "expected_manager_current": {
+                "retained_bundle_id": current_bundle,
+                "graph_revision": current_graph,
+            },
+            "expected_admission_generation": body.expected_admission_generation,
+            "manager_request_id": "deployment-candidate-manager-"
+            + hashlib.sha256(
+                f"{body.request_owner_epoch}:{body.request_id}".encode("utf-8")
+            ).hexdigest()[:32],
+            "correlation_id": body.request_id,
+            "post_state": pre_state,
+        }
+
+        def validate(_claim: dict[str, Any]) -> None:
+            state.deployment_draft_session.require_current(
+                body.draft_id, body.expected_draft_revision
+            )
+            if state.deployment_draft_session.retained_state() != deployment_state:
+                raise DeploymentDraftError(
+                    "deployment_draft_stale",
+                    "Deployment Draft changed before candidate compilation",
+                    status_code=409,
+                )
+            latest_current = state.current_scenario().get("current_scenario")
+            latest_applied = state.headless_client.program_applied()
+            latest_source = latest_applied.get("source")
+            latest_digest = (
+                latest_source.get("record_digest")
+                if isinstance(latest_source, dict)
+                else None
+            )
+            latest_bundle, latest_graph = manager_current()
+            if (
+                latest_current != current
+                or latest_applied.get("program") != program
+                or latest_digest != record_digest
+                or (latest_bundle, latest_graph)
+                != (current_bundle, current_graph)
+            ):
+                raise DeploymentDraftError(
+                    "deployment_candidate_source_changed",
+                    "Current Scenario, Applied Program, or Manager selection "
+                    "changed before candidate compilation",
+                    status_code=409,
+                )
+
+        def effect(claim: dict[str, Any]) -> dict[str, Any]:
+            result = state.execute_authored_deployment_candidate(
+                intent, claim, apply=apply
+            )
+            return {
+                "schemaVersion": (
+                    "manyforge.composer_deployment_candidate_operation.v1"
+                ),
+                "workspace": _workspace(state),
+                "result": result,
+            }
+
+        return execute(
+            body,
+            intent["operation_kind"],
+            prepare=lambda: intent,
+            validate=validate,
+            effect=effect,
+            after_release=(
+                lambda: state.prepare_current_applied_scene(
+                    request_owner_epoch=body.request_owner_epoch,
+                    request_id=body.request_id,
+                )
+                if apply
+                else None
+            ),
+        )
+
+    @router.post("/api/deployment/draft/preview")
+    def preview_authored_candidate(
+        body: PreviewDeploymentCandidateRequest,
+    ) -> dict[str, Any]:
+        return authored_candidate(body, apply=False)
+
+    @router.post("/api/deployment/draft/apply")
+    def apply_authored_candidate(
+        body: ApplyDeploymentCandidateRequest,
+    ) -> dict[str, Any]:
+        return authored_candidate(body, apply=True)
 
     return router

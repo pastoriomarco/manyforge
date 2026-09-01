@@ -62,6 +62,8 @@ export function OperationalErrorProvider({ children }: { children: ReactNode }) 
       }
       sequence.current += 1;
       const next = new Map(current);
+      // Reinsert an updated source so the exposed order remains newest-first.
+      next.delete(source);
       next.set(source, {
         id: `${source}:${sequence.current}`,
         source,
@@ -93,7 +95,7 @@ export function OperationalErrorProvider({ children }: { children: ReactNode }) 
     callback?.();
   }, [records]);
   const value = useMemo<OperationalErrorRegistry>(() => ({
-    errors: [...records.values()], report, clear, dismiss,
+    errors: [...records.values()].reverse(), report, clear, dismiss,
   }), [clear, dismiss, records, report]);
   return (
     <OperationalErrorContext.Provider value={value}>

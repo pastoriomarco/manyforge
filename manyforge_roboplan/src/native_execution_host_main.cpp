@@ -120,6 +120,8 @@ constexpr std::string_view kResponseApiVersion =
     "manyforge.execution_command_response.v1";
 constexpr std::string_view kSocketFileName = "execution-command.sock";
 constexpr std::string_view kControlSocketFileName = "execution-control.sock";
+constexpr std::string_view kObservationSocketFileName =
+    "execution-observation.sock";
 constexpr std::string_view kManagerSocketFileName = "manager-command.sock";
 constexpr std::string_view kManagerCommandApiVersion =
     "manyforge.manager_command.v1";
@@ -1965,20 +1967,28 @@ DecodeStopFaultRecoveryIntent(const CanonicalValue &value) {
       std::move(reason)};
 }
 
-[[nodiscard]] core::RuntimeScaleRequestDTO
-DecodeRuntimeScaleRequest(const CanonicalValue &value,
-                          const core::RequestAttributionDTO &attribution) {
-  RequireExactObjectSize(value, 5U, "runtime-scale request");
+[[nodiscard]] core::RuntimeScaleControlSelectorDTO
+DecodeRuntimeScaleControlSelector(const CanonicalValue &value) {
+  RequireExactObjectSize(value, 3U, "runtime-scale control selector");
+  return core::RuntimeScaleControlSelectorDTO{
+      core::ProgramBindingId(Text(value, "program_binding_id")),
+      core::ComponentRoleId(Text(value, "component_role_id")),
+      core::TargetRoleId(Text(value, "target_role_id"))};
+}
+
+[[nodiscard]] core::RuntimeScaleControlRequestDTO
+DecodeRuntimeScaleControlRequest(
+    const CanonicalValue &value,
+    const core::RequestAttributionDTO &attribution) {
+  RequireExactObjectSize(value, 4U, "runtime-scale control request");
   const double scale = Number(value, "scale");
   Require(scale >= 0.0 && scale <= 1.0,
           "runtime scale must be in the closed interval [0, 1]");
-  return core::RuntimeScaleRequestDTO{
+  return core::RuntimeScaleControlRequestDTO{
       DecodeRequestContext(Member(value, "request_context")),
-      core::OperationId(Text(value, "operation_id")),
-      core::OperationRevision(
-          Counter(value, "expected_operation_revision", 1U)),
-      core::RuntimeScaleGeneration(
-          Counter(value, "expected_runtime_scale_generation", 0U)),
+      DecodeRuntimeScaleControlSelector(Member(value, "selector")),
+      core::RuntimeScaleControlGeneration(
+          Counter(value, "expected_control_generation", 0U)),
       scale,
       attribution};
 }
@@ -2043,13 +2053,19 @@ enum class CommandKind {
   kMalformedStop,
   kGetStopFault,
   kRecoverStopFault,
-  kSetRuntimeScale,
-  kGetRuntimeScale,
+  kSetRuntimeScaleControl,
+  kGetRuntimeScaleControl,
   kPlanPick,
   kPlanPlace,
   kStartPick,
   kStartPlace,
   kReadPickPlaceSequence,
+};
+
+enum class CommandLane {
+  kOrdinary,
+  kStop,
+  kObservation,
 };
 
 struct MalformedStopCommand final {
@@ -2074,7 +2090,9 @@ struct Command final {
   std::optional<core::FullStopIntentDTO> full_stop;
   std::optional<MalformedStopCommand> malformed_stop;
   std::optional<core::StopFaultRecoveryIntentDTO> stop_fault_recovery;
-  std::optional<core::RuntimeScaleRequestDTO> runtime_scale;
+  std::optional<core::RuntimeScaleControlRequestDTO> runtime_scale_control;
+  std::optional<core::RuntimeScaleControlSelectorDTO>
+      runtime_scale_control_selector;
   std::optional<core::RequestOwnerEpoch> event_owner_epoch{};
   std::uint64_t after_sequence{};
   std::size_t event_limit{};
@@ -2165,10 +2183,12 @@ struct Command final {
         DecodeOperationRecoveryRequest(Member(root, "request"));
     return decoded;
   }
-  if (command == "get_runtime_scale") {
-    RequireExactObjectSize(root, 3U, "runtime-scale read command");
-    Command decoded{CommandKind::kGetRuntimeScale};
-    decoded.operation_id = core::OperationId(Text(root, "operation_id"));
+  if (command == "get_runtime_scale_control") {
+    RequireExactObjectSize(root, 3U,
+                           "runtime-scale control read command");
+    Command decoded{CommandKind::kGetRuntimeScaleControl};
+    decoded.runtime_scale_control_selector =
+        DecodeRuntimeScaleControlSelector(Member(root, "selector"));
     return decoded;
   }
   if (command == "submit") {
@@ -2300,13 +2320,13 @@ struct Command final {
         DecodeStopFaultRecoveryIntent(Member(root, "request"));
     return decoded;
   }
-  if (command == "set_runtime_scale") {
-    RequireExactObjectSize(root, 4U, "runtime-scale command");
+  if (command == "set_runtime_scale_control") {
+    RequireExactObjectSize(root, 4U, "runtime-scale control command");
     const auto attribution =
         DecodeRequestAttribution(Member(root, "attribution"));
-    Command decoded{CommandKind::kSetRuntimeScale};
-    decoded.runtime_scale =
-        DecodeRuntimeScaleRequest(Member(root, "request"), attribution);
+    Command decoded{CommandKind::kSetRuntimeScaleControl};
+    decoded.runtime_scale_control = DecodeRuntimeScaleControlRequest(
+        Member(root, "request"), attribution);
     return decoded;
   }
   CommandKind kind;
@@ -4246,106 +4266,108 @@ RecoveryActionResultValue(const core::KernelRecoveryActionResultDTO &value) {
   });
 }
 
-[[nodiscard]] CanonicalValue
-RuntimeScaleAcceptedValue(const core::RuntimeScaleAcceptedDTO &value) {
+[[nodiscard]] CanonicalValue RuntimeScaleControlSelectorValue(
+    const core::RuntimeScaleControlSelectorDTO &value) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"component_role_id", CanonicalValue(value.component_role_id.value())},
+      {"program_binding_id",
+       CanonicalValue(value.program_binding_id.value())},
+      {"target_role_id", CanonicalValue(value.target_role_id.value())},
+  });
+}
+
+[[nodiscard]] CanonicalValue RuntimeScaleControlAcceptedValue(
+    const core::RuntimeScaleControlAcceptedDTO &value) {
   return CanonicalValue(CanonicalValue::Object{
       {"accepted_at_ns",
        CanonicalValue(static_cast<double>(value.accepted_at_ns))},
-      {"operation_id", CanonicalValue(value.operation_id.value())},
-      {"operation_revision",
-       CanonicalValue(static_cast<double>(value.operation_revision.value()))},
+      {"active_operation_id",
+       value.active_operation_id.has_value()
+           ? CanonicalValue(value.active_operation_id->value())
+           : CanonicalValue(nullptr)},
+      {"active_operation_revision",
+       value.active_operation_revision.has_value()
+           ? CanonicalValue(static_cast<double>(
+                 value.active_operation_revision->value()))
+           : CanonicalValue(nullptr)},
+      {"active_operation_scale_generation",
+       value.active_operation_scale_generation.has_value()
+           ? CanonicalValue(static_cast<double>(
+                 value.active_operation_scale_generation->value()))
+           : CanonicalValue(nullptr)},
+      {"control_generation",
+       CanonicalValue(static_cast<double>(value.control_generation.value()))},
       {"replay_status",
        CanonicalValue(std::string(core::to_string(value.replay_status)))},
       {"request_id", CanonicalValue(value.request_id.value())},
       {"requested_scale", CanonicalValue(value.requested_scale)},
-      {"runtime_scale_generation",
-       CanonicalValue(
-           static_cast<double>(value.runtime_scale_generation.value()))},
+      {"selector", RuntimeScaleControlSelectorValue(value.selector)},
   });
 }
 
-[[nodiscard]] CanonicalValue
-RuntimeScaleStatusValue(const core::RuntimeScaleStatusDTO &value) {
-  CanonicalValue::Array participants;
-  participants.reserve(value.participants.size());
-  for (const auto &participant : value.participants) {
-    CanonicalValue::Array resources;
-    resources.reserve(participant.resources.size());
-    for (const auto &resource : participant.resources) {
-      resources.emplace_back(resource.value());
-    }
-    participants.emplace_back(CanonicalValue::Object{
-        {"accepted_generation", CanonicalValue(static_cast<double>(
-                                    participant.accepted_generation.value()))},
-        {"acknowledgement_sequence",
-         CanonicalValue(
-             static_cast<double>(participant.acknowledgement_sequence))},
-        {"acknowledgement_source_epoch",
-         CanonicalValue(participant.acknowledgement_source_epoch.value())},
-        {"acknowledgement_timestamp_ns",
-         CanonicalValue(
-             static_cast<double>(participant.acknowledgement_timestamp_ns))},
-        {"active_control_configuration_generation",
-         CanonicalValue(static_cast<double>(
-             participant.active_control_configuration_generation.value()))},
-        {"active_control_configuration_id",
-         CanonicalValue(participant.active_control_configuration_id.value())},
-        {"applied_scale", CanonicalValue(participant.applied_scale)},
-        {"capability_id", CanonicalValue(participant.capability_id.value())},
-        {"commanded_scale", CanonicalValue(participant.commanded_scale)},
-        {"command_target_id",
-         CanonicalValue(participant.command_target_id.value())},
-        {"controllable_component_id",
-         CanonicalValue(participant.controllable_component_id.value())},
-        {"control_binding_id",
-         CanonicalValue(participant.control_binding_id.value())},
-        {"control_binding_revision",
-         CanonicalValue(participant.control_binding_revision.value())},
-        {"control_domain_id",
-         CanonicalValue(participant.control_domain_id.value())},
-        {"control_domain_revision",
-         CanonicalValue(participant.control_domain_revision.value())},
-        {"control_route_id",
-         CanonicalValue(participant.control_route_id.value())},
-        {"controller_goal_generation",
-         CanonicalValue(static_cast<double>(
-             participant.controller_goal_generation.value()))},
-        {"controller_goal_id",
-         CanonicalValue(participant.controller_goal_id.value())},
-        {"controller_topology_id",
-         CanonicalValue(participant.controller_topology_id.value())},
-        {"coordinated_barrier_id",
-         participant.coordinated_barrier_id.has_value()
-             ? CanonicalValue(participant.coordinated_barrier_id->value())
-             : CanonicalValue(nullptr)},
-        {"error", participant.error.has_value() ? ErrorValue(*participant.error)
-                                                : CanonicalValue(nullptr)},
-        {"participant_id", CanonicalValue(participant.participant_id.value())},
-        {"resources", CanonicalValue(std::move(resources))},
-        {"scaling_domain_id",
-         CanonicalValue(participant.scaling_domain_id.value())},
-        {"state",
-         CanonicalValue(std::string(core::to_string(participant.state)))},
-        {"supported", CanonicalValue(participant.supported)},
-        {"topology_revision",
-         CanonicalValue(participant.topology_revision.value())},
-        {"virtual_trajectory_time_s",
-         CanonicalValue(participant.virtual_trajectory_time_s)},
-    });
-  }
+[[nodiscard]] CanonicalValue RuntimeScaleControlStatusValue(
+    const core::RuntimeScaleControlStatusDTO &value) {
   return CanonicalValue(CanonicalValue::Object{
-      {"effective_scale", CanonicalValue(value.effective_scale)},
-      {"operation_id", CanonicalValue(value.operation_id.value())},
-      {"operation_revision",
-       CanonicalValue(static_cast<double>(value.operation_revision.value()))},
-      {"participants", CanonicalValue(std::move(participants))},
+      {"active_control_configuration_generation",
+       value.active_control_configuration_generation.has_value()
+           ? CanonicalValue(static_cast<double>(
+                 value.active_control_configuration_generation->value()))
+           : CanonicalValue(nullptr)},
+      {"active_control_configuration_id",
+       value.active_control_configuration_id.has_value()
+           ? CanonicalValue(value.active_control_configuration_id->value())
+           : CanonicalValue(nullptr)},
+      {"active_operation_id",
+       value.active_operation_id.has_value()
+           ? CanonicalValue(value.active_operation_id->value())
+           : CanonicalValue(nullptr)},
+      {"active_operation_revision",
+       value.active_operation_revision.has_value()
+           ? CanonicalValue(static_cast<double>(
+                 value.active_operation_revision->value()))
+           : CanonicalValue(nullptr)},
+      {"active_operation_scale_generation",
+       value.active_operation_scale_generation.has_value()
+           ? CanonicalValue(static_cast<double>(
+                 value.active_operation_scale_generation->value()))
+           : CanonicalValue(nullptr)},
+      {"application_state",
+       value.application_state.has_value()
+           ? CanonicalValue(std::string(core::to_string(
+                 *value.application_state)))
+           : CanonicalValue(nullptr)},
+      {"control_binding_id",
+       value.control_binding_id.has_value()
+           ? CanonicalValue(value.control_binding_id->value())
+           : CanonicalValue(nullptr)},
+      {"control_binding_revision",
+       value.control_binding_revision.has_value()
+           ? CanonicalValue(value.control_binding_revision->value())
+           : CanonicalValue(nullptr)},
+      {"control_domain_id",
+       value.control_domain_id.has_value()
+           ? CanonicalValue(value.control_domain_id->value())
+           : CanonicalValue(nullptr)},
+      {"control_domain_revision",
+       value.control_domain_revision.has_value()
+           ? CanonicalValue(value.control_domain_revision->value())
+           : CanonicalValue(nullptr)},
+      {"control_generation",
+       CanonicalValue(static_cast<double>(value.control_generation.value()))},
+      {"effective_scale",
+       value.effective_scale.has_value()
+           ? CanonicalValue(*value.effective_scale)
+           : CanonicalValue(nullptr)},
+      {"frozen", CanonicalValue(value.frozen)},
+      {"reason", value.reason.has_value() ? ErrorValue(*value.reason)
+                                           : CanonicalValue(nullptr)},
       {"requested_scale", CanonicalValue(value.requested_scale)},
-      {"runtime_scale_generation",
-       CanonicalValue(
-           static_cast<double>(value.runtime_scale_generation.value()))},
-      {"state", CanonicalValue(std::string(core::to_string(value.state)))},
-      {"updated_at_ns",
-       CanonicalValue(static_cast<double>(value.updated_at_ns))},
+      {"scaling_domain_id",
+       value.scaling_domain_id.has_value()
+           ? CanonicalValue(value.scaling_domain_id->value())
+           : CanonicalValue(nullptr)},
+      {"selector", RuntimeScaleControlSelectorValue(value.selector)},
+      {"supported", CanonicalValue(value.supported)},
   });
 }
 
@@ -5465,11 +5487,36 @@ struct ManualControlDescriptors final {
   CanonicalValue gripper;
 };
 
+[[nodiscard]] CanonicalValue
+CanonicalNullableNumber(const std::optional<double> &value) {
+  if (!value.has_value()) {
+    return CanonicalValue(nullptr);
+  }
+  return CanonicalValue(value.value());
+}
+
+[[nodiscard]] CanonicalValue
+CanonicalNullableText(const std::optional<std::string> &value) {
+  if (!value.has_value()) {
+    return CanonicalValue(nullptr);
+  }
+  return CanonicalValue(*value);
+}
+
 [[nodiscard]] ManualControlDescriptors BuildManualControlDescriptors(
     const core::RuntimeParticipantBinding &motion_binding,
     const core::RuntimeParticipantBinding &gripper_binding,
     const core::JointLimitsDTO &motion_limits,
     const std::optional<RetainedGripperPositionLimits> &gripper_limits,
+    const std::optional<core::RuntimeParticipantPolicySelection>
+        &motion_runtime_policy,
+    const std::optional<double> &deployment_maximum_tcp_linear_speed_mps,
+    const std::vector<deployment::native_execution_runtime_contract::
+                          Configuration::DirectControlJointLimit>
+        &direct_control_joint_limits,
+    const std::vector<deployment::native_execution_runtime_contract::
+                          Configuration::GripperTargetConfiguration>
+        &gripper_target_configurations,
     const deployment::VerifiedRetainedModelMap &model_map,
     const deployment::ParsedModelDocuments &documents) {
   const auto &motion = motion_binding.value();
@@ -5520,6 +5567,101 @@ struct ManualControlDescriptors final {
         {"unit", CanonicalValue("rad")},
     });
   }
+  CanonicalValue operational_limit(nullptr);
+  if (motion_runtime_policy.has_value()) {
+    const auto &selected = motion_runtime_policy->value();
+    const bool target_scoped = std::holds_alternative<
+        core::RuntimePolicyCommandTargetScopeDTO>(
+        selected.selected_motion_speed_limit.scope);
+    operational_limit = CanonicalValue(CanonicalValue::Object{
+        {"catalog_policy_maximum_tcp_linear_speed_mps",
+         CanonicalValue(
+             selected.selected_motion_speed_limit.maximum_tcp_linear_speed_mps)},
+        {"deployment_maximum_tcp_linear_speed_mps",
+         deployment_maximum_tcp_linear_speed_mps.has_value()
+             ? CanonicalValue(*deployment_maximum_tcp_linear_speed_mps)
+             : CanonicalValue(nullptr)},
+        {"effective_maximum_tcp_linear_speed_mps",
+         CanonicalValue(selected.effective_maximum_tcp_linear_speed_mps)},
+        {"policy_id", CanonicalValue(selected.policy.runtime_policy_id.value())},
+        {"policy_revision",
+         CanonicalValue(selected.policy.runtime_policy_revision.value())},
+        {"selected_scope", CanonicalValue(target_scoped ? "command_target" : "cell")},
+        {"source_content_digest",
+         CanonicalValue(selected.source_artifact.content_digest.value())},
+    });
+  }
+  CanonicalValue::Array operational_joint_limits;
+  operational_joint_limits.reserve(motion.resources.size());
+  for (std::size_t index = 0U; index < motion.resources.size(); ++index) {
+    const auto &resource = motion.resources[index];
+    const auto authored = std::find_if(
+        direct_control_joint_limits.begin(), direct_control_joint_limits.end(),
+        [&](const auto &candidate) {
+          return candidate.controllable_component_id ==
+                     motion.controllable_component_id &&
+                 candidate.command_target_id == motion.command_target_id &&
+                 resource.source_joint_name.has_value() &&
+                 candidate.source_joint_name == *resource.source_joint_name;
+        });
+    std::optional<double> authored_velocity;
+    std::optional<double> authored_acceleration;
+    std::optional<double> authored_jerk;
+    if (authored != direct_control_joint_limits.end()) {
+      authored_velocity = authored->max_velocity_rad_s;
+      authored_acceleration = authored->max_acceleration_rad_s2;
+      authored_jerk = authored->max_jerk_rad_s3;
+    }
+    const auto model_acceleration =
+        motion_limits.acceleration_max_rad_s2.empty()
+            ? std::optional<double>{}
+            : std::optional<double>{
+                  motion_limits.acceleration_max_rad_s2[index]};
+    auto effective_acceleration = model_acceleration;
+    if (authored_acceleration.has_value() &&
+        (!effective_acceleration.has_value() ||
+         authored_acceleration.value() < effective_acceleration.value())) {
+      effective_acceleration = authored_acceleration;
+    }
+    auto effective_velocity = motion_limits.velocity_max_rad_s[index];
+    if (authored_velocity.has_value()) {
+      effective_velocity =
+          std::min(effective_velocity, authored_velocity.value());
+    }
+    operational_joint_limits.emplace_back(CanonicalValue::Object{
+        {"deployment_max_acceleration_rad_s2",
+         CanonicalNullableNumber(authored_acceleration)},
+        {"deployment_max_jerk_rad_s3",
+         CanonicalNullableNumber(authored_jerk)},
+        {"deployment_max_velocity_rad_s",
+         CanonicalNullableNumber(authored_velocity)},
+        {"effective_max_acceleration_rad_s2",
+         CanonicalNullableNumber(effective_acceleration)},
+        {"effective_max_jerk_rad_s3",
+         CanonicalNullableNumber(authored_jerk)},
+        {"effective_max_velocity_rad_s",
+         CanonicalValue(effective_velocity)},
+        {"model_max_acceleration_rad_s2",
+         CanonicalNullableNumber(model_acceleration)},
+        {"model_max_velocity_rad_s",
+         CanonicalValue(motion_limits.velocity_max_rad_s[index])},
+        {"source_joint_name", CanonicalValue(*resource.source_joint_name)},
+    });
+  }
+  for (const auto &authored : direct_control_joint_limits) {
+    if (authored.controllable_component_id != motion.controllable_component_id ||
+        authored.command_target_id != motion.command_target_id) {
+      continue;
+    }
+    Require(std::any_of(
+                motion.resources.begin(), motion.resources.end(),
+                [&](const auto &resource) {
+                  return resource.source_joint_name.has_value() &&
+                         *resource.source_joint_name ==
+                             authored.source_joint_name;
+                }),
+            "direct-control joint limit names an unknown source joint");
+  }
   CanonicalValue motion_descriptor(CanonicalValue::Object{
       {"command_target_id", CanonicalValue(motion.command_target_id.value())},
       {"component_role_id", CanonicalValue(motion.component_role_id.value())},
@@ -5528,8 +5670,11 @@ struct ManualControlDescriptors final {
        CanonicalValue(motion.controllable_component_id.value())},
       {"frames", CanonicalValue(std::move(frames))},
       {"joints", CanonicalValue(std::move(joints))},
+      {"operational_joint_limits",
+       CanonicalValue(std::move(operational_joint_limits))},
+      {"operational_limit", std::move(operational_limit)},
       {"schema_version",
-       CanonicalValue("manyforge.manual_control_motion_descriptor.v1")},
+       CanonicalValue("manyforge.manual_control_motion_descriptor.v3")},
       {"target_role_id", CanonicalValue(motion.target_role_id.value())},
   });
 
@@ -5564,6 +5709,8 @@ struct ManualControlDescriptors final {
   }
 
   std::map<std::string, CanonicalValue> named_presets;
+  std::optional<core::ModelInstanceId> gripper_model_instance_id;
+  std::optional<std::string> source_group_name;
   if (documents.srdf.has_value() && resource.source_joint_name.has_value()) {
     const auto group = std::find_if(
         gripper.model_groups.begin(), gripper.model_groups.end(),
@@ -5585,6 +5732,18 @@ struct ManualControlDescriptors final {
                          candidate.expanded_compiled_joint_names.end();
                 }) == gripper.model_groups.end(),
         "manual-control gripper resource has no unique retained group");
+    const auto source_group = std::find_if(
+        model_map.symbols().begin(), model_map.symbols().end(),
+        [&](const auto &symbol) {
+          return symbol.source.model_instance_id == group->model_instance_id &&
+                 symbol.source.kind ==
+                     deployment::OccurrenceSymbolKind::kSrdfGroup &&
+                 symbol.compiled_name == group->compiled_group_name;
+        });
+    Require(source_group != model_map.symbols().end(),
+            "manual-control gripper group has no retained source identity");
+    gripper_model_instance_id = group->model_instance_id;
+    source_group_name = source_group->source.source_name;
     std::map<std::string, std::string> source_state_names;
     for (const auto &symbol : model_map.symbols()) {
       if (symbol.source.model_instance_id != group->model_instance_id ||
@@ -5652,16 +5811,110 @@ struct ManualControlDescriptors final {
     presets.emplace_back(std::move(entry.second));
   }
 
+  const auto authored_configuration = std::find_if(
+      gripper_target_configurations.begin(),
+      gripper_target_configurations.end(), [&](const auto &candidate) {
+        return candidate.controllable_component_id ==
+                   gripper.controllable_component_id &&
+               candidate.command_target_id == gripper.command_target_id;
+      });
+  const auto has_authored_configuration =
+      authored_configuration != gripper_target_configurations.end();
+  if (has_authored_configuration) {
+    Require(gripper_model_instance_id.has_value() &&
+                source_group_name.has_value(),
+            "authored gripper configuration has no exact retained model group");
+    Require(named_presets.contains(authored_configuration->open_state_ref) &&
+                named_presets.contains(
+                    authored_configuration->closed_state_ref),
+            "authored gripper state reference is not a retained SRDF preset");
+    const auto require_source_link = [&](const std::string &source_name,
+                                         const std::string_view field) {
+      Require(
+          std::count_if(
+              model_map.symbols().begin(), model_map.symbols().end(),
+              [&](const auto &symbol) {
+                return symbol.source.model_instance_id ==
+                           *gripper_model_instance_id &&
+                       symbol.source.kind ==
+                           deployment::OccurrenceSymbolKind::kLink &&
+                       symbol.source.source_name == source_name;
+              }) == 1,
+          "authored gripper " + std::string(field) +
+              " is not one exact retained source link");
+    };
+    require_source_link(authored_configuration->mount_frame, "mount frame");
+    require_source_link(authored_configuration->attach_frame, "attach frame");
+    require_source_link(authored_configuration->tcp_frame, "TCP frame");
+    for (const auto &link : authored_configuration->touch_links) {
+      require_source_link(link, "touch link");
+    }
+    for (const auto &frame : authored_configuration->auxiliary_frames) {
+      require_source_link(frame, "auxiliary frame");
+    }
+  }
+  CanonicalValue::Array touch_links;
+  CanonicalValue::Array auxiliary_frames;
+  std::optional<std::string> description;
+  std::optional<std::string> actuation_kind;
+  std::optional<std::string> open_state_ref;
+  std::optional<std::string> closed_state_ref;
+  std::optional<double> command_duration_s;
+  std::optional<std::string> mount_frame;
+  std::optional<std::string> attach_frame;
+  std::optional<std::string> tcp_frame;
+  if (has_authored_configuration) {
+    description = authored_configuration->description;
+    actuation_kind = authored_configuration->actuation_kind;
+    open_state_ref = authored_configuration->open_state_ref;
+    closed_state_ref = authored_configuration->closed_state_ref;
+    command_duration_s = authored_configuration->command_duration_s;
+    mount_frame = authored_configuration->mount_frame;
+    attach_frame = authored_configuration->attach_frame;
+    tcp_frame = authored_configuration->tcp_frame;
+    touch_links.reserve(authored_configuration->touch_links.size());
+    for (const auto &link : authored_configuration->touch_links) {
+      touch_links.emplace_back(link);
+    }
+    auxiliary_frames.reserve(authored_configuration->auxiliary_frames.size());
+    for (const auto &frame : authored_configuration->auxiliary_frames) {
+      auxiliary_frames.emplace_back(frame);
+    }
+  }
+
+  std::optional<std::string> state_authority_id;
+  std::optional<std::string> state_authority_class;
+  std::optional<std::string> control_interface_contract_id;
+  if (gripper.control_path.has_value()) {
+    state_authority_id = gripper.control_path->state_authority_id.value();
+    state_authority_class =
+        std::string(core::to_string(gripper.control_path->state_authority_class));
+    control_interface_contract_id =
+        gripper.control_path->control_interface_contract_id.value();
+  }
+
   const auto coordinate_kind =
       resource.coordinate_kind == core::CoordinateKind::kAngular ? "angular_rad"
                                                                  : "linear_m";
   CanonicalValue gripper_descriptor(CanonicalValue::Object{
+      {"actuation_kind", CanonicalNullableText(actuation_kind)},
+      {"attach_frame", CanonicalNullableText(attach_frame)},
+      {"auxiliary_frames", CanonicalValue(std::move(auxiliary_frames))},
+      {"closed_state_ref", CanonicalNullableText(closed_state_ref)},
       {"command_target_id", CanonicalValue(gripper.command_target_id.value())},
+      {"command_duration_s", CanonicalNullableNumber(command_duration_s)},
+      {"command_kind", CanonicalValue("gripper_position")},
       {"component_role_id", CanonicalValue(gripper.component_role_id.value())},
+      {"completion_policy", CanonicalValue("goal_fenced_target_reached")},
+      {"control_interface_contract_id",
+       CanonicalNullableText(control_interface_contract_id)},
       {"contracts", ManualControlContractValue(gripper)},
       {"controllable_component_id",
        CanonicalValue(gripper.controllable_component_id.value())},
       {"coordinate_kind", CanonicalValue(coordinate_kind)},
+      {"description", CanonicalNullableText(description)},
+      {"grasp_confirmation_policy",
+       CanonicalValue("binding_feedback_required")},
       {"mimic_followers", CanonicalValue(std::move(followers))},
       {"max_position", gripper_limits.has_value()
                            ? CanonicalValue(gripper_limits->upper_position)
@@ -5669,17 +5922,25 @@ struct ManualControlDescriptors final {
       {"min_position", gripper_limits.has_value()
                            ? CanonicalValue(gripper_limits->lower_position)
                            : CanonicalValue(nullptr)},
+      {"mount_frame", CanonicalNullableText(mount_frame)},
       {"named_presets", CanonicalValue(std::move(presets))},
+      {"open_state_ref", CanonicalNullableText(open_state_ref)},
       {"schema_version",
-       CanonicalValue("manyforge.manual_control_gripper_descriptor.v1")},
+       CanonicalValue("manyforge.manual_control_gripper_descriptor.v2")},
       {"source_coordinate_name",
        CanonicalValue(resource.source_joint_name.has_value()
                           ? *resource.source_joint_name
                           : resource.compiled_resource_name)},
+      {"source_group_name", CanonicalNullableText(source_group_name)},
       {"source_kind", CanonicalValue(resource.source_joint_name.has_value()
                                          ? "model_role"
                                          : "component_local")},
+      {"state_authority_class", CanonicalNullableText(state_authority_class)},
+      {"state_authority_id", CanonicalNullableText(state_authority_id)},
       {"target_role_id", CanonicalValue(gripper.target_role_id.value())},
+      {"tcp_frame", CanonicalNullableText(tcp_frame)},
+      {"touch_links", CanonicalValue(std::move(touch_links))},
+      {"transport_kind", CanonicalValue("resolved_binding")},
       {"unit", CanonicalValue(coordinate_kind == std::string_view("angular_rad")
                                   ? "rad"
                                   : "m")},
@@ -6242,6 +6503,25 @@ BuildProductComposition(CompositionBuildInput input) {
       deployment::native_execution_runtime_contract::require_configuration(
           *input.bundle, *local_runtime_unit_id);
 #endif
+  std::optional<double> deployment_motion_target_limit;
+#if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+  const auto motion_limit = std::find_if(
+      retained_runtime_configuration.motion_target_limits.begin(),
+      retained_runtime_configuration.motion_target_limits.end(),
+      [&](const auto &candidate) {
+        return candidate.controllable_component_id ==
+                   direct_control_motion_binding.value()
+                       .value()
+                       .controllable_component_id &&
+               candidate.command_target_id ==
+                   direct_control_motion_binding.value().value().command_target_id;
+      });
+  Require(motion_limit !=
+              retained_runtime_configuration.motion_target_limits.end(),
+          "native Deployment has no limit for the exact motion target");
+  deployment_motion_target_limit =
+      motion_limit->maximum_tcp_linear_speed_mps;
+#endif
   Require(retained_runtime_configuration.initial_joint_positions_rad.size() ==
               direct_control_motion_binding.value().value().resources.size(),
           "native execution initial state differs from the exact motion "
@@ -6426,6 +6706,8 @@ BuildProductComposition(CompositionBuildInput input) {
       {}};
   runtime_input.control_binding_representatives =
       std::move(control_binding_representatives);
+  runtime_input.deployment_maximum_tcp_linear_speed_mps =
+      deployment_motion_target_limit;
   if (input.planner_scene_projection != nullptr) {
     runtime_input.planning_scene_synchronizer =
         std::make_shared<ManagerPlanningSceneSynchronizer>(
@@ -6600,6 +6882,10 @@ BuildProductComposition(CompositionBuildInput input) {
       direct_control_motion_binding.value(),
       direct_control_gripper_binding.value(),
       direct_control_joint_limits.value(), runtime->gripper_position_limits,
+      runtime->motion_runtime_policy,
+      runtime->deployment_maximum_tcp_linear_speed_mps,
+      retained_runtime_configuration.direct_control_joint_limits,
+      retained_runtime_configuration.gripper_target_configurations,
       input.model_map, manual_control_documents);
   auto composition = std::make_unique<Composition>(
       std::move(input.bundle), std::move(input.status_program),
@@ -8674,11 +8960,15 @@ public:
         composition_access_(composition_access),
         manager_liveness_admission_(manager_liveness_admission),
         host_lock_(run_root), command_socket_(run_root, kSocketFileName),
-        control_socket_(run_root, kControlSocketFileName) {}
+        control_socket_(run_root, kControlSocketFileName),
+        observation_socket_(run_root, kObservationSocketFileName) {}
 
   int Run(const std::stop_token stop_token = {}) {
     std::jthread control_thread(
         [this](std::stop_token stop_token) { RunControlLane(stop_token); });
+    std::jthread observation_thread([this](std::stop_token stop_token) {
+      RunObservationLane(stop_token);
+    });
     std::jthread reconciliation_thread([this](std::stop_token stop_token) {
       RunReconciliationLane(stop_token);
     });
@@ -8699,7 +8989,7 @@ public:
         FailErrno("poll execution command socket");
       }
       if ((descriptor.revents & POLLIN) != 0) {
-        HandleOneClient(command_socket_, false);
+        HandleOneClient(command_socket_, CommandLane::kOrdinary);
       }
       if ((descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
         Fail("execution command socket became unavailable");
@@ -8710,8 +9000,10 @@ public:
     }
     reconciliation_thread.request_stop();
     control_thread.request_stop();
+    observation_thread.request_stop();
     reconciliation_thread.join();
     control_thread.join();
+    observation_thread.join();
     if (reconciliation_lane_failed_.load(std::memory_order_acquire)) {
       std::exception_ptr failure;
       {
@@ -9314,6 +9606,41 @@ private:
   [[nodiscard]] CanonicalValue
   ControlStateResponse(Composition &composition) const {
     const auto current = ReadCurrentControlState(composition);
+    const core::RuntimeParticipantBindingDTO *motion_binding =
+        &composition.direct_control_motion_binding.value();
+    if (composition.program_binding != nullptr) {
+      const auto selected = std::find_if(
+          composition.runtime->motion_binding_aliases.begin(),
+          composition.runtime->motion_binding_aliases.end(),
+          [&](const auto &candidate) {
+            return candidate.value().program_binding_id ==
+                       composition.program_binding->program_binding_id() &&
+                   candidate.value().target_role_id ==
+                       composition.status_motion_target_role_id;
+          });
+      Require(selected != composition.runtime->motion_binding_aliases.end(),
+              "selected Program Binding has no runtime-scale motion alias");
+      motion_binding = &selected->value();
+    }
+    const core::RuntimeScaleControlSelectorDTO runtime_scale_selector{
+        motion_binding->program_binding_id, motion_binding->component_role_id,
+        motion_binding->target_role_id};
+    const auto runtime_scale_control =
+        composition.runtime->addressed_kernel->get_runtime_scale_control(
+            runtime_scale_selector);
+    if (!runtime_scale_control.ok()) {
+      Fail("runtime-scale control projection failed: " +
+           runtime_scale_control.error().message);
+    }
+    const auto resident_operations =
+        composition.runtime->addressed_kernel->get_resident_operations(
+            {direct_control_program_run_id_,
+             direct_control_gripper_program_run_id_});
+    CanonicalValue::Array resident_operation_values;
+    resident_operation_values.reserve(resident_operations.size());
+    for (const auto &operation : resident_operations) {
+      resident_operation_values.push_back(OperationStateValue(operation));
+    }
     return CanonicalValue(CanonicalValue::Object{
         {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
         {"command", CanonicalValue("control_state")},
@@ -9328,8 +9655,12 @@ private:
                   current.gripper.has_value() ? &*current.gripper : nullptr)},
              {"observed_motion",
               DirectControlObservedValue(composition, current.motion)},
+             {"resident_operations",
+              CanonicalValue(std::move(resident_operation_values))},
+             {"runtime_scale_control",
+              RuntimeScaleControlStatusValue(runtime_scale_control.value())},
              {"schema_version",
-              CanonicalValue("manyforge.execution_control_state.v1")},
+              CanonicalValue("manyforge.execution_control_state.v3")},
          })},
         {"identity", IdentityValue(composition)},
         {"ok", CanonicalValue(true)},
@@ -9517,7 +9848,8 @@ private:
                            command.kind == CommandKind::kRead ||
                            command.kind == CommandKind::kReadStop ||
                            command.kind == CommandKind::kGetOperationRecovery ||
-                           command.kind == CommandKind::kGetRuntimeScale ||
+                           command.kind ==
+                               CommandKind::kGetRuntimeScaleControl ||
                            command.kind == CommandKind::kReadPickPlaceSequence;
     const auto liveness_command =
         read_only
@@ -9681,8 +10013,12 @@ private:
         preview_intent.expected_scene_revision =
             synchronized.value().scene_revision;
       }
+      const auto preview_lease_id = core::ProjectionLeaseId{
+          "motion-preview." +
+          preview_intent.request_context.request_id.value()};
       auto inventory = composition.runtime->collision_publisher
-                           ->retain_scene_snapshot_lease_inventory();
+                           ->retain_scene_snapshot_lease_inventory(
+                               preview_lease_id);
       if (!inventory.has_value()) {
         return ErrorResponse(
             "motion_preview_projection_unavailable",
@@ -9849,10 +10185,10 @@ private:
           {"ok", CanonicalValue(true)},
       });
     }
-    if (command.kind == CommandKind::kGetRuntimeScale) {
+    if (command.kind == CommandKind::kGetRuntimeScaleControl) {
       const auto status =
-          composition.runtime->addressed_kernel->get_runtime_scale(
-              *command.operation_id);
+          composition.runtime->addressed_kernel->get_runtime_scale_control(
+              *command.runtime_scale_control_selector);
       if (!status.ok()) {
         return CanonicalValue(CanonicalValue::Object{
             {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
@@ -9862,15 +10198,16 @@ private:
       }
       return CanonicalValue(CanonicalValue::Object{
           {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-          {"command", CanonicalValue("get_runtime_scale")},
+          {"command", CanonicalValue("get_runtime_scale_control")},
           {"ok", CanonicalValue(true)},
-          {"runtime_scale", RuntimeScaleStatusValue(status.value())},
+          {"runtime_scale_control",
+           RuntimeScaleControlStatusValue(status.value())},
       });
     }
-    if (command.kind == CommandKind::kSetRuntimeScale) {
+    if (command.kind == CommandKind::kSetRuntimeScaleControl) {
       const auto result =
-          composition.runtime->addressed_kernel->set_runtime_scale(
-              *command.runtime_scale);
+          composition.runtime->addressed_kernel->set_runtime_scale_control(
+              *command.runtime_scale_control);
       if (!result.ok()) {
         return CanonicalValue(CanonicalValue::Object{
             {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
@@ -9879,9 +10216,9 @@ private:
         });
       }
       return CanonicalValue(CanonicalValue::Object{
-          {"accepted", RuntimeScaleAcceptedValue(result.value())},
+          {"accepted", RuntimeScaleControlAcceptedValue(result.value())},
           {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-          {"command", CanonicalValue("set_runtime_scale")},
+          {"command", CanonicalValue("set_runtime_scale_control")},
           {"ok", CanonicalValue(true)},
       });
     }
@@ -9936,8 +10273,8 @@ private:
       case CommandKind::kMalformedStop:
       case CommandKind::kGetStopFault:
       case CommandKind::kRecoverStopFault:
-      case CommandKind::kSetRuntimeScale:
-      case CommandKind::kGetRuntimeScale:
+      case CommandKind::kSetRuntimeScaleControl:
+      case CommandKind::kGetRuntimeScaleControl:
       case CommandKind::kPlanPick:
       case CommandKind::kPlanPlace:
       case CommandKind::kStartPick:
@@ -10055,12 +10392,30 @@ private:
         return;
       }
       if ((descriptor.revents & POLLIN) != 0) {
-        HandleOneClient(control_socket_, true);
+        HandleOneClient(control_socket_, CommandLane::kStop);
       }
     }
   }
 
-  void HandleOneClient(const CommandSocket &socket, bool stop_only) noexcept {
+  void RunObservationLane(std::stop_token stop_token) noexcept {
+    while (!stop_token.stop_requested()) {
+      pollfd descriptor{observation_socket_.get(), POLLIN, 0};
+      int ready = -1;
+      do {
+        ready = ::poll(&descriptor, 1, kReconcilePeriodMilliseconds);
+      } while (ready < 0 && errno == EINTR && !stop_token.stop_requested());
+      if (stop_token.stop_requested() || ready < 0 ||
+          (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+        return;
+      }
+      if ((descriptor.revents & POLLIN) != 0) {
+        HandleOneClient(observation_socket_, CommandLane::kObservation);
+      }
+    }
+  }
+
+  void HandleOneClient(const CommandSocket &socket,
+                       const CommandLane lane) noexcept {
     try {
       FileDescriptor client(::accept4(socket.get(), nullptr, nullptr,
                                       SOCK_CLOEXEC | SOCK_NONBLOCK));
@@ -10122,12 +10477,18 @@ private:
                 "execution_owner_not_ready",
                 "the managed execution owner has no active physical product",
                 {{"owner_epoch", owner_epoch_.value()}});
-          } else if (cell_admission.has_value() && stop_only) {
+          } else if (cell_admission.has_value() &&
+                     lane != CommandLane::kOrdinary) {
+            const bool stop_lane = lane == CommandLane::kStop;
             response = detail::CellAdmissionResponseValue(
                 cell_admission->command,
                 core::ErrorDTO{
-                    "execution_control_command_unsupported",
-                    "the independent Stop control socket accepts only Stop",
+                    stop_lane ? "execution_control_command_unsupported"
+                              : "execution_observation_command_unsupported",
+                    stop_lane
+                        ? "the independent Stop control socket accepts only Stop"
+                        : "the independent observation socket accepts only "
+                          "observation",
                     {}});
           } else if (cell_admission.has_value()) {
             auto *const owner = composition_access_.addressed_kernel;
@@ -10139,9 +10500,18 @@ private:
                     *owner, *cell_admission));
           } else {
             const auto command = DecodeCommand(bytes);
-            response = stop_only
-                           ? ExecuteStop(command, *composition_access_.current)
-                           : Execute(command, *composition_access_.current);
+            if (lane == CommandLane::kObservation &&
+                command.kind != CommandKind::kObservation) {
+              response = ErrorResponse(
+                  "execution_observation_command_unsupported",
+                  "the independent observation socket accepts only "
+                  "observation");
+            } else {
+              response = lane == CommandLane::kStop
+                             ? ExecuteStop(command,
+                                           *composition_access_.current)
+                             : Execute(command, *composition_access_.current);
+            }
           }
         } catch (const std::exception &error) {
           response =
@@ -10193,6 +10563,7 @@ private:
   HostLock host_lock_;
   CommandSocket command_socket_;
   CommandSocket control_socket_;
+  CommandSocket observation_socket_;
   std::atomic<bool> control_socket_failed_{false};
   std::atomic<bool> reconciliation_lane_failed_{false};
   mutable std::mutex reconcile_error_mutex_;

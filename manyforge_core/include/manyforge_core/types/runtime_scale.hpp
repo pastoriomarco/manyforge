@@ -17,6 +17,69 @@ enum class RuntimeScaleApplicationState {
   kFailed,
 };
 
+/// Public selector for one operator runtime-velocity setting. The Kernel joins
+/// these portable Program identities to the current exact control/scaling
+/// domain; callers never supply controller or route identities.
+struct RuntimeScaleControlSelectorDTO final {
+  ProgramBindingId program_binding_id;
+  ComponentRoleId component_role_id;
+  TargetRoleId target_role_id;
+
+  friend bool operator==(const RuntimeScaleControlSelectorDTO&,
+                         const RuntimeScaleControlSelectorDTO&) = default;
+};
+
+/// Owner-scoped HMI setting. It persists across operations and Program Reset
+/// for the current owner epoch; any live operation is selected by the Kernel.
+struct RuntimeScaleControlRequestDTO final {
+  PublicRequestContextDTO request_context;
+  RuntimeScaleControlSelectorDTO selector;
+  RuntimeScaleControlGeneration expected_control_generation;
+  double scale{1.0};
+  /// Receiving-adapter provenance. Public payloads cannot populate this field.
+  RequestAttributionDTO attribution{};
+
+  friend bool operator==(const RuntimeScaleControlRequestDTO&,
+                         const RuntimeScaleControlRequestDTO&) = default;
+};
+
+struct RuntimeScaleControlAcceptedDTO final {
+  RequestId request_id;
+  RequestReplayStatusDTO replay_status;
+  RuntimeScaleControlSelectorDTO selector;
+  double requested_scale{1.0};
+  RuntimeScaleControlGeneration control_generation;
+  std::optional<OperationId> active_operation_id;
+  std::optional<OperationRevision> active_operation_revision;
+  std::optional<RuntimeScaleGeneration> active_operation_scale_generation;
+  std::int64_t accepted_at_ns{};
+};
+
+/// Owner projection consumed by a stable command-bar control. Exact resolved
+/// identities prove scope and support; optional operation fields are
+/// observation only and never become client-side routing authority.
+struct RuntimeScaleControlStatusDTO final {
+  RuntimeScaleControlSelectorDTO selector;
+  RuntimeScaleControlGeneration control_generation;
+  double requested_scale{1.0};
+  bool supported{};
+  bool frozen{};
+  std::optional<ControlDomainId> control_domain_id;
+  std::optional<ControlDomainRevision> control_domain_revision;
+  std::optional<ControlBindingId> control_binding_id;
+  std::optional<ControlBindingRevision> control_binding_revision;
+  std::optional<ScalingDomainId> scaling_domain_id;
+  std::optional<ActiveControlConfigurationId> active_control_configuration_id;
+  std::optional<ActiveControlConfigurationGeneration>
+      active_control_configuration_generation;
+  std::optional<OperationId> active_operation_id;
+  std::optional<OperationRevision> active_operation_revision;
+  std::optional<RuntimeScaleGeneration> active_operation_scale_generation;
+  std::optional<double> effective_scale;
+  std::optional<RuntimeScaleApplicationState> application_state;
+  std::optional<ErrorDTO> reason;
+};
+
 [[nodiscard]] constexpr const char* to_string(
     RuntimeScaleApplicationState state) noexcept {
   switch (state) {

@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <manyforge_core/types/manager_liveness.hpp>
 #include <manyforge_core/types/strong_id.hpp>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -71,10 +72,52 @@ inline constexpr std::string_view kManagerLivenessLocalSafeContractId =
 /// use this projection instead of reparsing a manifest or accepting launch-
 /// time replacements for product-owned runtime semantics.
 struct Configuration final {
+  struct MotionTargetLimit final {
+    core::ControllableComponentId controllable_component_id;
+    core::CommandTargetId command_target_id;
+    double maximum_tcp_linear_speed_mps{};
+
+    friend bool operator==(const MotionTargetLimit &,
+                           const MotionTargetLimit &) = default;
+  };
+
+  struct DirectControlJointLimit final {
+    core::ControllableComponentId controllable_component_id;
+    core::CommandTargetId command_target_id;
+    std::string source_joint_name;
+    std::optional<double> max_velocity_rad_s;
+    std::optional<double> max_acceleration_rad_s2;
+    std::optional<double> max_jerk_rad_s3;
+
+    friend bool operator==(const DirectControlJointLimit &,
+                           const DirectControlJointLimit &) = default;
+  };
+
+  struct GripperTargetConfiguration final {
+    core::ControllableComponentId controllable_component_id;
+    core::CommandTargetId command_target_id;
+    std::string description;
+    std::string actuation_kind;
+    std::string open_state_ref;
+    std::string closed_state_ref;
+    double command_duration_s{};
+    std::vector<std::string> touch_links;
+    std::string mount_frame;
+    std::string attach_frame;
+    std::string tcp_frame;
+    std::vector<std::string> auxiliary_frames;
+
+    friend bool operator==(const GripperTargetConfiguration &,
+                           const GripperTargetConfiguration &) = default;
+  };
+
   std::uint32_t planner_rng_seed{};
   std::vector<double> initial_joint_positions_rad;
   std::uint32_t execution_tick_hz{};
   double collision_monitor_period_ms{};
+  std::vector<MotionTargetLimit> motion_target_limits;
+  std::vector<DirectControlJointLimit> direct_control_joint_limits;
+  std::vector<GripperTargetConfiguration> gripper_target_configurations;
 
   friend bool operator==(const Configuration &,
                          const Configuration &) = default;

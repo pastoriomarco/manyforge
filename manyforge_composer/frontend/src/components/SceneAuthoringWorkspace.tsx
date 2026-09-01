@@ -14,7 +14,11 @@ import { createPortal } from 'react-dom';
 
 import { api } from '../api/client';
 import { useOperationalErrorMirror } from '../state/operationalErrors';
-import { useShellHeadlessState, useViewerHeadlessState } from '../hooks/useHeadlessState';
+import {
+  useExecutionObservationTransport,
+  useShellHeadlessState,
+  useViewerHeadlessState,
+} from '../hooks/useHeadlessState';
 import type { HeadlessStateSource } from '../hooks/useHeadlessState';
 import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
@@ -22,8 +26,13 @@ import type { RobotControlController } from '../hooks/useRobotControl';
 import { ProgramTransportControls } from './ProgramRuntimePanel';
 import { ProgramContactPolicyEditor } from './ProgramContactPolicyEditor';
 import { RobotControlPanelView } from './RobotControlPanel';
+import type {
+  RobotTcpTransformMode,
+  RobotTcpTransformSpace,
+} from './RobotControlPanel';
 import type { ViewerInspectorPanel } from './StructuralViewer';
 import {
+  candidateTcpPoseFromCell,
   candidateTcpPoseInCell,
   componentAttachmentFenceFromSnapshot,
   editableProgramShapeFromObject,
@@ -33,6 +42,7 @@ import {
   sceneAttachTransaction,
   sceneMutationFenceFromSnapshot,
   sceneObjectMutationAvailability,
+  sceneOwnerPresentation,
   sceneObjectTransformTransaction,
   sceneObjectUpdateTransaction,
   sceneDetachTransaction,
@@ -42,6 +52,7 @@ import {
   type ComponentAttachmentFenceResult,
   type SceneObjectMutationAvailability,
   type SceneOwnerFacts,
+  type RetainedSceneOwnerPresentation,
 } from '../state/sceneAuthoring';
 import {
   candidateRobotPresentation,
@@ -55,6 +66,7 @@ import {
 } from '../state/robotControl';
 import type { StructuralResourceState } from '../state/structuralResource';
 import {
+  programDraftPreviewActive,
   programViewerMetadata,
   viewerPresentationDraftFromProgram,
   viewerPresentationDraftReducer,
@@ -77,6 +89,7 @@ import type {
   SourceModelOccurrence,
 } from '../types/api';
 import type { MotionPreviewReceipt, Pose3Value } from '../types/robotControl';
+import type { PoseTuple } from '../utils/poseTransforms';
 
 const StructuralViewer = lazy(async () => {
   const module = await import('./StructuralViewer');
@@ -102,6 +115,7 @@ interface SceneAuthoringWorkspaceProps {
   onViewerInspectorMaximize?: () => void;
   onViewerInspectorPanelChange?: (panel: ViewerInspectorPanel) => void;
   onOpenRuntimeHistory?: () => void;
+  runtimeOverlay?: ReactNode;
 }
 
 const EMPTY_PROGRAM_RESOURCES: ProgramSceneResource[] = [];
@@ -1368,7 +1382,9 @@ function SourceOccurrencePanel({
             <summary>Source-local URDF/SRDF names</summary>
             <dl>
               <dt>Links</dt>
-              <dd><code>{boundedNames(occurrence.source_link_names)}</code></dd>
+              <dd><code>{boundedNames(
+                occurrence.links.map((link) => link.source_link_name),
+              )}</code></dd>
               <dt>Joints</dt>
               <dd><code>{boundedNames(
                 occurrence.coordinates.map((coordinate) => coordinate.source_joint_name),
@@ -1465,6 +1481,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   active,
   source,
   sourceValue,
+  controlBasePoseInCell,
   environmentValue,
   manifest,
   onRetry,
@@ -1480,6 +1497,10 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   ghostStale,
   candidatePoseEditable,
   onEditCandidatePose,
+  tcpTransformMode,
+  tcpTransformSpace,
+  onTcpTransformModeChange,
+  onTcpTransformSpaceChange,
   onCommitTransform,
   onDuplicate,
   onRemove,
@@ -1491,6 +1512,8 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   mutationAvailability,
   hiddenSelectionKeys,
   objectAxesSelectionKeys,
+  onObjectAxesVisibleIdsChange,
+  onAxesSizesCommit,
   motionPreview,
   programController,
   programRuntime,
@@ -1503,10 +1526,12 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   onInspectorMaximize,
   onInspectorPanelChange,
   onOpenRuntimeHistory,
+  runtimeOverlay,
 }: {
   active: boolean;
   source: HeadlessStateSource;
   sourceValue: SourceModelProjection | null;
+  controlBasePoseInCell: PoseTuple | null;
   environmentValue: NodeEnvironmentResponse | null;
   manifest: StructuralResourceState<SceneUrdfManifest>;
   onRetry: () => void;
@@ -1522,6 +1547,10 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   ghostStale: boolean;
   candidatePoseEditable: boolean;
   onEditCandidatePose: (pose: Pose3Value) => void;
+  tcpTransformMode: RobotTcpTransformMode;
+  tcpTransformSpace: RobotTcpTransformSpace;
+  onTcpTransformModeChange: (mode: RobotTcpTransformMode) => void;
+  onTcpTransformSpaceChange: (space: RobotTcpTransformSpace) => void;
   onCommitTransform: (
     sceneResourceId: string,
     pose: LogicalScenePose,
@@ -1543,6 +1572,8 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   mutationAvailability: Record<string, SceneObjectMutationAvailability>;
   hiddenSelectionKeys: ReadonlySet<string>;
   objectAxesSelectionKeys: ReadonlySet<string>;
+  onObjectAxesVisibleIdsChange: (ids: string[], draftPreview: boolean) => void;
+  onAxesSizesCommit: (frameSizeM: number, objectSizeM: number) => void;
   motionPreview: MotionPreviewReceipt | null;
   programController: ProgramWorkspaceController;
   programRuntime: ProgramRuntimeController;
@@ -1555,8 +1586,10 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   onInspectorMaximize?: () => void;
   onInspectorPanelChange?: (panel: ViewerInspectorPanel) => void;
   onOpenRuntimeHistory?: () => void;
+  runtimeOverlay?: ReactNode;
 }) {
   const headlessState = useViewerHeadlessState(source, active);
+  const observationTransport = useExecutionObservationTransport(source);
   const factsResult = useMemo(
     () => sceneOwnerFacts(
       headlessState.snapshot?.runtime ?? null,
@@ -1566,14 +1599,44 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
     [environmentValue, headlessState.snapshot?.runtime, sourceValue],
   );
   const facts = factsResult.available ? factsResult.facts : null;
+  const productIdentity = sourceValue === null
+    ? null
+    : `${sourceValue.retained_bundle_id}\u0000${sourceValue.graph_revision}`;
+  const resetPresentationHeld = programRuntime.state.pending === 'reset';
+  const [retainedPresentation, setRetainedPresentation] = useState<
+    RetainedSceneOwnerPresentation | null
+  >(null);
+  const presentationFacts = sceneOwnerPresentation(
+    resetPresentationHeld ? null : facts,
+    retainedPresentation,
+    productIdentity,
+  );
+  useLayoutEffect(() => {
+    if (!resetPresentationHeld && facts !== null && productIdentity !== null) {
+      setRetainedPresentation((current) => (
+        current?.productIdentity === productIdentity
+        && current.facts.sourceGeneration === facts.sourceGeneration
+        && current.facts.sourceOwnerEpoch === facts.sourceOwnerEpoch
+        && current.facts.runtimeSourceGeneration === facts.runtimeSourceGeneration
+        && current.facts.runtimeSourceOwnerEpoch === facts.runtimeSourceOwnerEpoch
+          ? current
+          : { productIdentity, facts }
+      ));
+    }
+  }, [facts, productIdentity, resetPresentationHeld]);
   const readyManifest = manifest.status === 'ready' ? manifest.data : null;
-  const objects = facts?.logicalScene.snapshot?.objects ?? [];
-  const draftPreviewObjects = objects.length === 0
+  const objects = presentationFacts?.logicalScene.snapshot?.objects ?? [];
+  const ownerSceneKnown = presentationFacts !== null;
+  const draftPreviewObjects = ownerSceneKnown && objects.length === 0
     ? (program?.scene ?? []).map(programScenePreviewObject).filter(
         (object): object is LogicalSceneObject => object !== null,
       )
     : [];
-  const programDraftPreview = objects.length === 0 && draftPreviewObjects.length > 0;
+  const programDraftPreview = programDraftPreviewActive(
+    ownerSceneKnown,
+    objects.length,
+    draftPreviewObjects.length,
+  );
   const candidateRobot = useMemo(() => (
     motionPreview === null || readyManifest === null
       ? null
@@ -1614,8 +1677,8 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
     };
   });
   const sceneRuntimePresentation = runtimeScenePresentation(
-    facts?.sceneRuntime ?? null,
-    facts?.logicalScene ?? null,
+    presentationFacts?.sceneRuntime ?? null,
+    presentationFacts?.logicalScene ?? null,
     sourceValue,
     readyManifest,
     robotControl.state.status?.directControl.targetDescriptor ?? null,
@@ -1639,22 +1702,81 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
     [readyManifest, robotControl.state.status, source, sourceValue],
   );
   const frameAxes = useMemo(() => {
-    const seen = new Set<string>();
-    return (sourceValue?.targets ?? []).flatMap((target) => target.frames)
-      .filter((frame) => (
-        frame.source_link_name !== null
-        && viewer?.frame_role_visibility?.[frame.frame_role_id] !== false
-      ))
-      .flatMap((frame) => {
-        const identity = `${frame.source_link_name}\u0000${frame.frame_role_id}`;
-        if (seen.has(identity) || frame.source_link_name === null) return [];
-        seen.add(identity);
-        return [{
-          linkName: frame.source_link_name,
-          frameRoleId: frame.frame_role_id,
-        }];
+    if (sourceValue === null || readyManifest === null) return [];
+    const rolesBySourceLink = new Map<string, string[]>();
+    const cellRoles = new Set<string>();
+    for (const target of sourceValue.targets) {
+      for (const frame of target.frames) {
+        if (frame.frame_kind === 'cell_frame') {
+          cellRoles.add(frame.frame_role_id);
+          continue;
+        }
+        if (frame.model_instance_id === null || frame.source_link_name === null) continue;
+        const key = `${frame.model_instance_id}\u0000${frame.source_link_name}`;
+        const roles = rolesBySourceLink.get(key) ?? [];
+        if (!roles.includes(frame.frame_role_id)) roles.push(frame.frame_role_id);
+        rolesBySourceLink.set(key, roles.sort());
+      }
+    }
+    const viewerLinks = new Set(readyManifest.links.map((link) => link.name));
+    const viewerJoints = new Map(readyManifest.joints.map((joint) => [joint.name, joint]));
+    const modelRows = sourceValue.occurrences.flatMap((occurrence) => {
+      const coordinateBySourceChild = new Map(occurrence.coordinates.map(
+        (coordinate) => [coordinate.source_child_link_name, coordinate],
+      ));
+      return occurrence.links.map((link) => {
+        const coordinate = coordinateBySourceChild.get(link.source_link_name) ?? null;
+        const roles = rolesBySourceLink.get(
+          `${occurrence.model_instance_id}\u0000${link.source_link_name}`,
+        ) ?? [];
+        const viewerJoint = coordinate === null
+          ? null
+          : viewerJoints.get(coordinate.viewer_joint_name) ?? null;
+        return {
+          linkName: link.viewer_link_name,
+          sourceLinkName: link.source_link_name,
+          sourceJointName: coordinate?.source_joint_name ?? null,
+          viewerJointName: coordinate?.viewer_joint_name ?? null,
+          componentId: occurrence.component_id,
+          modelInstanceId: occurrence.model_instance_id,
+          frameRoleIds: roles,
+          defaultVisible: roles.some(
+            (role) => viewer?.frame_role_visibility?.[role] !== false,
+          ),
+          poseAvailable: viewerLinks.has(link.viewer_link_name)
+            && (coordinate === null || (
+              viewerJoint?.child_link === coordinate.viewer_child_link_name
+              && coordinate.viewer_child_link_name === link.viewer_link_name
+            )),
+        };
       });
-  }, [sourceValue, viewer?.frame_role_visibility]);
+    });
+    const sourceLinks = new Set(modelRows.map((row) => row.linkName));
+    const currentCellRoles = [...cellRoles].sort();
+    return [
+      ...(sourceLinks.has(readyManifest.root_link) ? [] : [{
+        linkName: readyManifest.root_link,
+        sourceLinkName: 'Cell frame',
+        sourceJointName: null,
+        viewerJointName: null,
+        componentId: null,
+        modelInstanceId: null,
+        frameRoleIds: currentCellRoles,
+        defaultVisible: currentCellRoles.some(
+          (role) => viewer?.frame_role_visibility?.[role] !== false,
+        ),
+        poseAvailable: true,
+      }]),
+      ...modelRows,
+    ];
+  }, [readyManifest, sourceValue, viewer?.frame_role_visibility]);
+  const sourceFrameNames = useMemo(
+    () => Object.fromEntries(frameAxes.map((frame) => [
+      frame.linkName,
+      frame.sourceLinkName,
+    ])),
+    [frameAxes],
+  );
   useLayoutEffect(() => {
     source.markViewerPresented(headlessState.snapshot);
   }, [headlessState.snapshot, source]);
@@ -1727,9 +1849,12 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
       candidateStale={ghostStale}
       candidateTcpEditable={candidatePoseEditable}
       onEditCandidateTcpPose={onEditCandidatePose}
+      candidateTcpTransformMode={tcpTransformMode}
+      candidateTcpTransformSpace={tcpTransformSpace}
       candidateRobot={candidateRobot}
       runtimePresentation={runtimePresentation}
       executionObservationPresentation={executionObservationPresentation}
+      executionObservationTransport={observationTransport}
       sceneOwnerIdentity={facts === null ? undefined : {
         ownerEpoch: facts.sourceOwnerEpoch,
         generation: facts.sourceGeneration,
@@ -1739,7 +1864,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
         generation: headlessState.snapshot.runtime.projectionGeneration,
       } : undefined}
       readViewerFrameIdentity={source.getPresentedRuntimeFrame}
-      pointCloudCellId={facts?.logicalScene.snapshot?.cell_id}
+      pointCloudCellId={presentationFacts?.logicalScene.snapshot?.cell_id}
       viewer={viewer}
       frameAxes={frameAxes}
       objectAxesVisibleIds={viewportObjects.flatMap((object) => {
@@ -1748,12 +1873,41 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
           ? [object.scene_resource_id]
           : [];
       })}
+      objectAxesRows={(objects.length === 0 ? draftPreviewObjects : objects).map(
+        (object) => {
+          const persistent = (program?.scene ?? []).some(
+            (resource) => resource.scene_resource_id === object.scene_resource_id,
+          );
+          return {
+            sceneResourceId: object.scene_resource_id,
+            attached: object.placement.kind === 'carried',
+            poseAvailable: visibleObjects.some(
+              (visible) => visible.scene_resource_id === object.scene_resource_id,
+            ),
+            persistent,
+            defaultVisible: persistent
+              && viewer?.scene_resource_axes_visibility?.[object.scene_resource_id] === true,
+            sourceLabel: programDraftPreview ? 'Program Draft' : 'owner scene',
+          };
+        },
+      )}
+      onObjectAxesVisibleIdsChange={(ids) => onObjectAxesVisibleIdsChange(
+        ids,
+        programDraftPreview,
+      )}
+      onAxesSizesCommit={onAxesSizesCommit}
       robotControlSurface={(
         <RobotControlPanelView
           enabled={runtimeEnabled}
           controller={robotControl}
           program={programRuntime}
           draft={programController}
+          sourceFrameNames={sourceFrameNames}
+          controlBasePoseInCell={controlBasePoseInCell}
+          tcpTransformMode={tcpTransformMode}
+          tcpTransformSpace={tcpTransformSpace}
+          onTcpTransformModeChange={onTcpTransformModeChange}
+          onTcpTransformSpaceChange={onTcpTransformSpaceChange}
         />
       )}
       robotControlBlocked={robotControl.state.phase === 'blocked'}
@@ -1771,6 +1925,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
           onOpenRuntimeHistory={onOpenRuntimeHistory}
         />
       )}
+      runtimeOverlay={runtimeOverlay}
     />
     </Suspense>
   );
@@ -1795,10 +1950,12 @@ export function SceneAuthoringWorkspace({
   onViewerInspectorMaximize,
   onViewerInspectorPanelChange,
   onOpenRuntimeHistory,
+  runtimeOverlay,
 }: SceneAuthoringWorkspaceProps) {
   const headlessState = useShellHeadlessState(headlessStateSource);
   const programWorkspace = programController.state.workspace;
   const program = programWorkspace?.draft.authoring ?? null;
+  const viewer = program?.viewer;
   const draftRevision = programWorkspace?.draft.draftRevision ?? 0;
   const draftId = programWorkspace?.draft.draftId ?? null;
   const sceneMutationFenceResult = useMemo(() => sceneMutationFenceFromSnapshot(
@@ -1846,6 +2003,24 @@ export function SceneAuthoringWorkspace({
   const [objectAxesSelectionKeys, setObjectAxesSelectionKeys] = useState<Set<string>>(
     () => new Set(),
   );
+  const stableProgramSceneIds = useMemo(
+    () => new Set(
+      (program?.scene ?? []).map((resource) => resource.scene_resource_id),
+    ),
+    [program?.scene],
+  );
+  const stableProgramAxesKey = useMemo(
+    () => [...stableProgramSceneIds].sort().map((sceneResourceId) => (
+      `${sceneResourceId}:${viewer?.scene_resource_axes_visibility?.[sceneResourceId] === true}`
+    )).join('\u0000'),
+    [stableProgramSceneIds, viewer?.scene_resource_axes_visibility],
+  );
+  const [tcpTransformMode, setTcpTransformMode] = useState<RobotTcpTransformMode>(
+    'translate',
+  );
+  const [tcpTransformSpace, setTcpTransformSpace] = useState<RobotTcpTransformSpace>(
+    'world',
+  );
   const [commitState, setCommitState] = useState<
     { kind: 'idle' | 'busy' | 'success' | 'error'; message: string | null }
   >({ kind: 'idle', message: null });
@@ -1863,6 +2038,36 @@ export function SceneAuthoringWorkspace({
       setSelectedOccurrenceId(occurrences[0]?.model_instance_id ?? null);
     }
   }, [selectedOccurrenceId, sourceValue]);
+  useEffect(() => {
+    setObjectAxesSelectionKeys((current) => {
+      const next = new Set(current);
+      for (const sceneResourceId of stableProgramSceneIds) {
+        for (const kind of ['program_resource', 'owner_object'] as const) {
+          const key = `${kind}:${sceneResourceId}`;
+          if (viewer?.scene_resource_axes_visibility?.[sceneResourceId] === true) {
+            next.add(key);
+          } else {
+            next.delete(key);
+          }
+        }
+      }
+      return next;
+    });
+  }, [stableProgramAxesKey, stableProgramSceneIds, viewer?.scene_resource_axes_visibility]);
+  const currentAxesIdentityKey = useMemo(() => [
+    ...objects.map((object) => `owner_object:${object.scene_resource_id}`),
+    ...(program?.scene ?? []).map(
+      (resource) => `program_resource:${resource.scene_resource_id}`,
+    ),
+  ].sort().join('\u0000'), [objects, program?.scene]);
+  useEffect(() => {
+    const currentIdentities = new Set(
+      currentAxesIdentityKey === '' ? [] : currentAxesIdentityKey.split('\u0000'),
+    );
+    setObjectAxesSelectionKeys((current) => new Set(
+      [...current].filter((key) => currentIdentities.has(key)),
+    ));
+  }, [currentAxesIdentityKey]);
   useEffect(() => {
     if (selection === null || selection.kind === 'structure') return;
     const exists = selection.kind === 'owner_object'
@@ -1901,28 +2106,95 @@ export function SceneAuthoringWorkspace({
     selectedObjectShapeKey,
   ]);
 
-  const viewer = program?.viewer;
   const directControl = robotControl.state.status?.directControl ?? null;
+  const controlManifest = manifest.status === 'ready' ? manifest.data : null;
+  const observedRobotForControl = useMemo(() => executionRobotPresentation(
+    robotControl.state.status,
+    sourceValue,
+    controlManifest,
+  ), [controlManifest, robotControl.state.status, sourceValue]);
+  const baseDescriptor = directControl?.targetDescriptor.frames.find(
+    (frame) => frame.frameRoleId === directControl.baseFrameRoleId,
+  ) ?? null;
+  const baseTransform = baseDescriptor === null
+    ? null
+    : observedRobotForControl?.linkTransforms[baseDescriptor.compiledFrameName] ?? null;
+  const candidateViewerBase = useMemo(() => (
+    baseDescriptor === null || baseTransform === null
+      ? null
+      : {
+        modelInstanceId: baseDescriptor.modelInstanceId,
+        viewerLinkName: baseDescriptor.compiledFrameName,
+        poseInCell: {
+          position_m: {
+            x_m: baseTransform.position_m[0],
+            y_m: baseTransform.position_m[1],
+            z_m: baseTransform.position_m[2],
+          },
+          orientation: {
+            x: baseTransform.orientation_xyzw[0],
+            y: baseTransform.orientation_xyzw[1],
+            z: baseTransform.orientation_xyzw[2],
+            w: baseTransform.orientation_xyzw[3],
+          },
+        },
+      }
+  ), [baseDescriptor, baseTransform]);
+  const controlBasePoseInCell = useMemo<PoseTuple | null>(() => (
+    candidateViewerBase === null
+      ? null
+      : {
+          position: [
+            candidateViewerBase.poseInCell.position_m.x_m,
+            candidateViewerBase.poseInCell.position_m.y_m,
+            candidateViewerBase.poseInCell.position_m.z_m,
+          ],
+          quaternion: [
+            candidateViewerBase.poseInCell.orientation.x,
+            candidateViewerBase.poseInCell.orientation.y,
+            candidateViewerBase.poseInCell.orientation.z,
+            candidateViewerBase.poseInCell.orientation.w,
+          ],
+        }
+  ), [candidateViewerBase]);
   const tcpRole = directControl?.tcpFrameRoleId ?? null;
   const ghostVisible = tcpRole === null
     || viewer?.frame_role_visibility?.[tcpRole] !== false;
   const previewGhost = robotControl.state.ghost;
-  const cellGhost = previewGhost === null
+  const tcpDraftMode = robotControl.state.mode === 'pose_goal'
+    || robotControl.state.mode === 'cartesian_path'
+    || (robotControl.state.mode === 'move_to'
+      && robotControl.state.moveToKind !== 'joint');
+  const candidateTcp = previewGhost?.finalTcpPose
+    ?? (tcpDraftMode ? robotControl.state.draftPose : null);
+  const cellGhost = candidateTcp === null
     ? null
     : candidateTcpPoseInCell(
         sourceValue,
         directControl?.controllableComponentId ?? null,
         directControl?.commandTargetId ?? null,
         directControl?.baseFrameRoleId ?? null,
-        previewGhost.finalTcpPose,
+        candidateTcp,
+        candidateViewerBase,
       );
-  const ghost = ghostVisible && cellGhost?.available
+  const ghost = tcpDraftMode && ghostVisible && cellGhost?.available
     ? cellGhost.pose
     : null;
   const candidatePoseEditable = ghost !== null
     && (robotControl.state.mode === 'pose_goal'
       || robotControl.state.mode === 'cartesian_path')
     && !robotControlHasActiveOperation(robotControl.state);
+  const editCandidatePoseInCell = useCallback((pose: Pose3Value) => {
+    const local = candidateTcpPoseFromCell(
+      sourceValue,
+      directControl?.controllableComponentId ?? null,
+      directControl?.commandTargetId ?? null,
+      directControl?.baseFrameRoleId ?? null,
+      pose,
+      candidateViewerBase,
+    );
+    if (local.available) robotControl.editPose(local.pose);
+  }, [candidateViewerBase, directControl, robotControl, sourceValue]);
   const busyDraft = programController.state.status === 'loading'
     || (programController.state.status === 'ready'
       && programController.state.pendingAction !== null);
@@ -2418,6 +2690,7 @@ export function SceneAuthoringWorkspace({
       active={viewerActive}
       source={headlessStateSource}
       sourceValue={sourceValue}
+      controlBasePoseInCell={controlBasePoseInCell}
       environmentValue={environmentValue}
       manifest={manifest}
       onRetry={onRetryManifest}
@@ -2432,7 +2705,11 @@ export function SceneAuthoringWorkspace({
       ghost={ghost}
       ghostStale={robotControl.state.ghostStale}
       candidatePoseEditable={candidatePoseEditable}
-      onEditCandidatePose={robotControl.editPose}
+      onEditCandidatePose={editCandidatePoseInCell}
+      tcpTransformMode={tcpTransformMode}
+      tcpTransformSpace={tcpTransformSpace}
+      onTcpTransformModeChange={setTcpTransformMode}
+      onTcpTransformSpaceChange={setTcpTransformSpace}
       onCommitTransform={commitTransform}
       onDuplicate={duplicateObject}
       onRemove={removeObject}
@@ -2447,6 +2724,50 @@ export function SceneAuthoringWorkspace({
       mutationAvailability={mutationAvailability}
       hiddenSelectionKeys={hiddenSelectionKeys}
       objectAxesSelectionKeys={objectAxesSelectionKeys}
+      onObjectAxesVisibleIdsChange={(ids, draftPreview) => {
+        const kind = draftPreview ? 'program_resource' : 'owner_object';
+        const currentObjectIds = new Set(
+          (draftPreview ? program?.scene ?? [] : objects)
+            .map((object) => object.scene_resource_id),
+        );
+        const selected = new Set(ids);
+        setObjectAxesSelectionKeys((current) => {
+          const next = new Set([...current].filter((key) => {
+            const prefix = `${kind}:`;
+            return !key.startsWith(prefix)
+              || !currentObjectIds.has(key.slice(prefix.length));
+          }));
+          for (const identity of selected) next.add(`${kind}:${identity}`);
+          return next;
+        });
+        if (program === null || !programController.mutationAvailable) return;
+        const presentation = viewerPresentationDraftFromProgram(program.viewer);
+        let changed = false;
+        for (const sceneResourceId of currentObjectIds) {
+          if (!stableProgramSceneIds.has(sceneResourceId)) continue;
+          const visible = selected.has(sceneResourceId);
+          if (presentation.sceneResourceAxesVisibility[sceneResourceId] !== visible) {
+            presentation.sceneResourceAxesVisibility[sceneResourceId] = visible;
+            changed = true;
+          }
+        }
+        if (changed) {
+          void programController.mutate('viewer_draft_replace', {
+            viewer: programViewerMetadata(presentation) as unknown as JsonValue,
+          });
+        }
+      }}
+      onAxesSizesCommit={(frameSizeM, objectSizeM) => {
+        if (program === null || !programController.mutationAvailable) return;
+        const presentation = viewerPresentationDraftFromProgram(program.viewer);
+        void programController.mutate('viewer_draft_replace', {
+          viewer: programViewerMetadata({
+            ...presentation,
+            frameGizmoSizeM: frameSizeM,
+            objectAxesGizmoSizeM: objectSizeM,
+          }) as unknown as JsonValue,
+        });
+      }}
       motionPreview={previewGhost}
       programController={programController}
       programRuntime={programRuntime}
@@ -2459,6 +2780,7 @@ export function SceneAuthoringWorkspace({
       onInspectorMaximize={onViewerInspectorMaximize}
       onInspectorPanelChange={onViewerInspectorPanelChange}
       onOpenRuntimeHistory={onOpenRuntimeHistory}
+      runtimeOverlay={runtimeOverlay}
     />
   );
 

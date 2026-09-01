@@ -30,6 +30,7 @@ export function readProgramPaletteDrag(
 export type ProgramDraftMutation = {
   mutation:
     | 'tree_draft_insert_node'
+    | 'tree_draft_change_node_kind'
     | 'tree_draft_wrap_node'
     | 'tree_draft_move_node'
     | 'tree_draft_delete_node';
@@ -42,18 +43,93 @@ export function programDetachedInsertionMutation(
   index: number,
   position?: { x: number; y: number },
 ): ProgramDraftMutation {
+  return programInsertionMutation(entry, existingInstanceIds, {
+    kind: 'root',
+    index,
+    position,
+  });
+}
+
+export type ProgramInsertionPlacement =
+  | {
+      kind: 'root';
+      index: number;
+      position?: { x: number; y: number };
+    }
+  | { kind: 'child'; parentInstanceId: string; index: number }
+  | { kind: 'after'; siblingInstanceId: string };
+
+export function programInsertionMutation(
+  entry: CatalogEntry,
+  existingInstanceIds: string[],
+  placement: ProgramInsertionPlacement,
+): ProgramDraftMutation {
   const instanceId = nextProgramInstanceId(entry.id, existingInstanceIds);
+  let placementArgs: Record<string, JsonValue>;
+  if (placement.kind === 'root') {
+    placementArgs = {
+      index: placement.index,
+      ...(placement.position === undefined ? {} : { position: placement.position }),
+    };
+  } else if (placement.kind === 'child') {
+    placementArgs = {
+      parent_instance_id: placement.parentInstanceId,
+      index: placement.index,
+    };
+  } else {
+    placementArgs = { after_instance_id: placement.siblingInstanceId };
+  }
   return {
     mutation: 'tree_draft_insert_node',
     args: {
-      index,
+      ...placementArgs,
       node: {
         node_id: entry.id,
         instance_id: instanceId,
         parameters: catalogDefaultParameters(entry),
         children: [],
       },
-      ...(position === undefined ? {} : { position }),
+    },
+  };
+}
+
+export function programWrapMutation(
+  entry: CatalogEntry,
+  existingInstanceIds: string[],
+  targetInstanceId: string,
+): ProgramDraftMutation {
+  return {
+    mutation: 'tree_draft_wrap_node',
+    args: {
+      target_instance_id: targetInstanceId,
+      wrapper: {
+        node_id: entry.id,
+        instance_id: nextProgramInstanceId(entry.id, existingInstanceIds),
+        parameters: catalogDefaultParameters(entry),
+      },
+    },
+  };
+}
+
+export function programChangeKindMutation(
+  entry: CatalogEntry,
+  instanceId: string,
+  retainedParameterNames: Iterable<string>,
+): ProgramDraftMutation {
+  const retained = new Set(retainedParameterNames);
+  const defaults = catalogDefaultParameters(entry);
+  const parameters = Object.fromEntries(
+    Object.entries(defaults).filter(([name]) => !retained.has(name)),
+  );
+  return {
+    mutation: 'tree_draft_change_node_kind',
+    args: {
+      instance_id: instanceId,
+      replacement: {
+        node_id: entry.id,
+        parameters,
+      },
+      parameters_mode: 'strict',
     },
   };
 }

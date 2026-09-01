@@ -600,6 +600,9 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
       const ResolvedRuntimeScaleCommandDTO& command) override {
     ++runtime_scale_calls;
     Trace("engine:set_runtime_scale");
+    if (runtime_scale_effect_hook) {
+      runtime_scale_effect_hook();
+    }
     if (!runtime_scale.supported) {
       return Result<ResolvedRuntimeScaleAcceptedDTO>::Err(
           ErrorDTO{std::string(to_string(ErrorCode::kUnsupportedCapability)),
@@ -899,6 +902,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   std::function<void()> dispatch_prepared_command_hook;
   std::function<void()> translate_stop_stage_hook;
   std::function<void()> participant_stop_settlement_hook;
+  std::function<void()> runtime_scale_effect_hook;
   mutable std::function<void()> recovery_assessment_hook;
   std::function<void()> recovery_action_hook;
   bool throw_during_recovery_assessment{};
@@ -2061,6 +2065,21 @@ ManagerLivenessRequiredSetDTO EmptyManagerLivenessSet() {
   return std::move(sealed.value());
 }
 
+[[nodiscard]] RuntimeParticipantBinding same_control_scope_program_alias(
+    const RuntimeParticipantBinding& source) {
+  auto value = source.value();
+  value.program_id = ProgramId("program.direct-control");
+  value.program_revision = ProgramRevision(test_digest('2'));
+  value.program_binding_id = ProgramBindingId(test_digest('3'));
+  value.component_role_id = ComponentRoleId("controlled_component");
+  value.target_role_id = TargetRoleId("command_target");
+  auto sealed = verify_runtime_participant_binding(std::move(value));
+  if (!sealed.ok()) {
+    throw std::logic_error(sealed.error().message);
+  }
+  return std::move(sealed.value());
+}
+
 [[nodiscard]] RuntimeParticipantBinding second_same_type_occurrence(
     const RuntimeParticipantBinding& source) {
   auto value = source.value();
@@ -2293,6 +2312,28 @@ ManagerLivenessRequiredSetDTO EmptyManagerLivenessSet() {
       OperationCoordinationPolicy::kIndependent};
 }
 
+TEST(ResourceAddressedExecutionKernelTest,
+     ProjectsResidentOperationsOnlyForExactProgramRunIdentities) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal,
+      ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
+                                             CellId("cell.test"), 8U});
+
+  const auto accepted = kernel.execute(motion_operation("request.resident-projection"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  EXPECT_TRUE(kernel.get_resident_operations({ProgramRunId("other.run")}).empty());
+  const auto projected = kernel.get_resident_operations({ProgramRunId("run.1")});
+  ASSERT_EQ(projected.size(), 1U);
+  EXPECT_EQ(projected.front().operation_id, accepted.value().operation_id);
+  EXPECT_EQ(projected.front().program_run_id, ProgramRunId("run.1"));
+}
+
 [[nodiscard]] OperationIntentDTO candidate_motion_operation(
     std::string request_id = "request.motion.candidate") {
   auto operation = motion_operation(std::move(request_id));
@@ -2404,6 +2445,25 @@ ManagerLivenessRequiredSetDTO EmptyManagerLivenessSet() {
                               "test", std::nullopt},
       accepted.operation_id, OperationRevision(expected_revision),
       RuntimeScaleGeneration(expected_generation), scale};
+}
+
+[[nodiscard]] RuntimeScaleControlSelectorDTO runtime_scale_control_selector(
+    std::string component_role = "robot", std::string target_role = "arm") {
+  return RuntimeScaleControlSelectorDTO{
+      ProgramBindingId(test_digest('1')),
+      ComponentRoleId(std::move(component_role)),
+      TargetRoleId(std::move(target_role))};
+}
+
+[[nodiscard]] RuntimeScaleControlRequestDTO runtime_scale_control_request(
+    std::string request_id, std::uint64_t expected_generation, double scale) {
+  return RuntimeScaleControlRequestDTO{
+      PublicRequestContextDTO{RequestId(std::move(request_id)),
+                              RequestOwnerEpoch("kernel.epoch.1"), "test",
+                              std::nullopt},
+      runtime_scale_control_selector(),
+      RuntimeScaleControlGeneration(expected_generation),
+      scale};
 }
 
 TEST(ResourceAddressedExecutionKernelTest, ResolvesPortableMotionAndReservesExactResource) {
@@ -6125,6 +6185,321 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(slots.front().owner->operation_id, executed.value().operation_id);
   EXPECT_EQ(slots.front().owner->participant_id, participant.participant_id);
   EXPECT_EQ(slots.front().owner->control_binding_id, participant.control_binding_id);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     RuntimeScaleControlPersistsAcrossOperationsWithoutClientRebinding) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  clock.set(1234);
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute",
+                       CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
+
+  const auto initial =
+      kernel.get_runtime_scale_control(runtime_scale_control_selector());
+  ASSERT_TRUE(initial.ok()) << initial.error().message;
+  EXPECT_TRUE(initial.value().supported);
+  EXPECT_FALSE(initial.value().frozen);
+  EXPECT_EQ(initial.value().control_generation,
+            RuntimeScaleControlGeneration(0U));
+  EXPECT_DOUBLE_EQ(initial.value().requested_scale, 1.0);
+  EXPECT_FALSE(initial.value().active_operation_id.has_value());
+
+  const auto request =
+      runtime_scale_control_request("request.scale.control.1", 0U, 0.4);
+  const auto configured = kernel.set_runtime_scale_control(request);
+  ASSERT_TRUE(configured.ok()) << configured.error().message;
+  EXPECT_EQ(configured.value().control_generation,
+            RuntimeScaleControlGeneration(1U));
+  EXPECT_DOUBLE_EQ(configured.value().requested_scale, 0.4);
+  EXPECT_FALSE(configured.value().active_operation_id.has_value());
+  EXPECT_EQ(engine.runtime_scale_calls, 0);
+
+  const auto replay = kernel.set_runtime_scale_control(request);
+  ASSERT_TRUE(replay.ok()) << replay.error().message;
+  EXPECT_EQ(replay.value().replay_status,
+            RequestReplayStatusDTO::kReplayedExact);
+  EXPECT_EQ(engine.runtime_scale_calls, 0);
+  auto conflicting_request = request;
+  conflicting_request.scale = 0.5;
+  const auto conflict = kernel.set_runtime_scale_control(conflicting_request);
+  ASSERT_FALSE(conflict.ok());
+  EXPECT_EQ(conflict.error().code, "request_id_conflict");
+  EXPECT_EQ(engine.runtime_scale_calls, 0);
+
+  const auto first = kernel.execute(
+      motion_operation("request.scale.control.first-operation"));
+  ASSERT_TRUE(first.ok()) << first.error().message;
+  ASSERT_TRUE(engine.last_execute.has_value());
+  ASSERT_TRUE(engine.last_execute->initial_runtime_scale.has_value());
+  EXPECT_DOUBLE_EQ(
+      engine.last_execute->initial_runtime_scale->requested_scale, 0.4);
+  ASSERT_TRUE(engine.last_runtime_scale_command.has_value());
+  EXPECT_DOUBLE_EQ(engine.last_runtime_scale_command->requested_scale, 0.4);
+
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kCompleted);
+  const auto acknowledged = kernel.acknowledge_completed(control_request(
+      "request.scale.control.first-ack", first.value(), 1U));
+  ASSERT_TRUE(acknowledged.ok()) << acknowledged.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    const auto slots = kernel.resource_snapshot();
+    return !slots.empty() && slots.front().state == ResourceSlotState::kFree;
+  }));
+
+  const auto between =
+      kernel.get_runtime_scale_control(runtime_scale_control_selector());
+  ASSERT_TRUE(between.ok()) << between.error().message;
+  EXPECT_EQ(between.value().control_generation,
+            RuntimeScaleControlGeneration(1U));
+  EXPECT_DOUBLE_EQ(between.value().requested_scale, 0.4);
+  EXPECT_FALSE(between.value().active_operation_id.has_value());
+
+  const auto second = kernel.execute(
+      motion_operation("request.scale.control.second-operation"));
+  ASSERT_TRUE(second.ok()) << second.error().message;
+  ASSERT_TRUE(engine.last_execute.has_value());
+  EXPECT_DOUBLE_EQ(
+      engine.last_execute->initial_runtime_scale->requested_scale, 0.4);
+  const auto active =
+      kernel.get_runtime_scale_control(runtime_scale_control_selector());
+  ASSERT_TRUE(active.ok()) << active.error().message;
+  EXPECT_EQ(active.value().active_operation_id, second.value().operation_id);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     RuntimeScaleControlRetimesTheCurrentOperationAndKeepsOneScopeGeneration) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute",
+                       CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
+  const auto executed =
+      kernel.execute(motion_operation("request.scale.control.live-operation"));
+  ASSERT_TRUE(executed.ok()) << executed.error().message;
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+
+  const auto accepted = kernel.set_runtime_scale_control(
+      runtime_scale_control_request("request.scale.control.live", 0U, 0.25));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  EXPECT_EQ(accepted.value().active_operation_id, executed.value().operation_id);
+  EXPECT_EQ(accepted.value().control_generation,
+            RuntimeScaleControlGeneration(1U));
+  ASSERT_TRUE(accepted.value().active_operation_scale_generation.has_value());
+  EXPECT_EQ(*accepted.value().active_operation_scale_generation,
+            RuntimeScaleGeneration(1U));
+  ASSERT_TRUE(engine.last_runtime_scale_command.has_value());
+  EXPECT_DOUBLE_EQ(engine.last_runtime_scale_command->requested_scale, 0.25);
+
+  const auto status =
+      kernel.get_runtime_scale_control(runtime_scale_control_selector());
+  ASSERT_TRUE(status.ok()) << status.error().message;
+  EXPECT_EQ(status.value().control_generation,
+            RuntimeScaleControlGeneration(1U));
+  EXPECT_DOUBLE_EQ(status.value().requested_scale, 0.25);
+  EXPECT_DOUBLE_EQ(*status.value().effective_scale, 0.25);
+  EXPECT_EQ(status.value().application_state,
+            RuntimeScaleApplicationState::kApplied);
+
+  const auto stale = kernel.set_runtime_scale_control(
+      runtime_scale_control_request("request.scale.control.stale", 0U, 0.5));
+  ASSERT_FALSE(stale.ok());
+  EXPECT_EQ(stale.error().details.at("reason"),
+            "runtime_scale_control_generation_stale");
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     RuntimeScaleControlAppliesAcrossProgramAndDirectControlAliases) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  const auto program_binding =
+      make_binding("arm", "arm", "execution.trajectory.execute",
+                   CoordinateKind::kAngular);
+  const auto direct_control_binding =
+      same_control_scope_program_alias(program_binding);
+  ResourceAddressedExecutionKernel kernel(
+      {registration(program_binding, engine),
+       registration(direct_control_binding, engine)},
+      clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
+
+  const auto configured = kernel.set_runtime_scale_control(
+      runtime_scale_control_request("request.scale.control.shared", 0U, 0.4));
+  ASSERT_TRUE(configured.ok()) << configured.error().message;
+  const RuntimeScaleControlSelectorDTO direct_selector{
+      direct_control_binding.value().program_binding_id,
+      direct_control_binding.value().component_role_id,
+      direct_control_binding.value().target_role_id};
+  const auto shared_projection =
+      kernel.get_runtime_scale_control(direct_selector);
+  ASSERT_TRUE(shared_projection.ok()) << shared_projection.error().message;
+  EXPECT_EQ(shared_projection.value().control_generation,
+            RuntimeScaleControlGeneration(1U));
+  EXPECT_DOUBLE_EQ(shared_projection.value().requested_scale, 0.4);
+
+  auto direct = motion_operation("request.scale.control.direct");
+  direct.program_id = direct_control_binding.value().program_id;
+  direct.program_revision = direct_control_binding.value().program_revision;
+  direct.program_binding_id =
+      direct_control_binding.value().program_binding_id;
+  direct.participants.front().component_role_id =
+      direct_control_binding.value().component_role_id;
+  direct.participants.front().target_role_id =
+      direct_control_binding.value().target_role_id;
+  const auto executed = kernel.execute(direct);
+  ASSERT_TRUE(executed.ok()) << executed.error().message;
+  ASSERT_TRUE(engine.last_execute.has_value());
+  ASSERT_TRUE(engine.last_execute->initial_runtime_scale.has_value());
+  EXPECT_DOUBLE_EQ(engine.last_execute->initial_runtime_scale->requested_scale,
+                   0.4);
+
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  const auto status =
+      kernel.get_runtime_scale_control(runtime_scale_control_selector());
+  ASSERT_TRUE(status.ok()) << status.error().message;
+  EXPECT_EQ(status.value().active_operation_id, executed.value().operation_id);
+
+  const auto retimed = kernel.set_runtime_scale_control(
+      runtime_scale_control_request("request.scale.control.shared.live", 1U,
+                                    0.25));
+  ASSERT_TRUE(retimed.ok()) << retimed.error().message;
+  EXPECT_EQ(retimed.value().active_operation_id, executed.value().operation_id);
+  ASSERT_TRUE(engine.last_runtime_scale_command.has_value());
+  EXPECT_DOUBLE_EQ(engine.last_runtime_scale_command->requested_scale, 0.25);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     RuntimeScaleControlNeverDelaysStopAndCannotUndoItsFence) {
+  using namespace std::chrono_literals;
+
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute",
+                       CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
+  const auto executed =
+      kernel.execute(motion_operation("request.scale.control.stop-race"));
+  ASSERT_TRUE(executed.ok()) << executed.error().message;
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+
+  std::promise<void> scale_entered_promise;
+  auto scale_entered = scale_entered_promise.get_future();
+  std::promise<void> release_scale_promise;
+  const auto release_scale = release_scale_promise.get_future().share();
+  engine.runtime_scale_effect_hook = [&] {
+    scale_entered_promise.set_value();
+    release_scale.wait();
+  };
+  auto scale_future = std::async(std::launch::async, [&] {
+    return kernel.set_runtime_scale_control(runtime_scale_control_request(
+        "request.scale.control.stop-race.update", 0U, 0.4));
+  });
+  ASSERT_EQ(scale_entered.wait_for(10s), std::future_status::ready);
+
+  auto stop_future = std::async(std::launch::async, [&] {
+    return kernel.stop(stop_request("request.scale.control.stop-race.stop",
+                                    executed.value(), 1U));
+  });
+  const bool stop_was_not_delayed =
+      stop_future.wait_for(250ms) == std::future_status::ready;
+  release_scale_promise.set_value();
+  ASSERT_TRUE(stop_was_not_delayed)
+      << "an in-flight runtime-scale provider call delayed Stop acceptance";
+
+  const auto stopped = stop_future.get();
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+  const auto scaled = scale_future.get();
+  ASSERT_TRUE(scaled.ok()) << scaled.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    const auto state = kernel.get_operation_state(executed.value().operation_id);
+    return state.ok() && state.value().state == OperationStateKind::kStopped;
+  }));
+  const auto terminal = kernel.get_operation_state(executed.value().operation_id);
+  ASSERT_TRUE(terminal.ok()) << terminal.error().message;
+  EXPECT_EQ(terminal.value().state, OperationStateKind::kStopped);
+  EXPECT_EQ(terminal.value().active_stop_id, stopped.value().stop_id);
+
+  const auto setting =
+      kernel.get_runtime_scale_control(runtime_scale_control_selector());
+  ASSERT_TRUE(setting.ok()) << setting.error().message;
+  EXPECT_EQ(setting.value().control_generation,
+            RuntimeScaleControlGeneration(1U));
+  EXPECT_DOUBLE_EQ(setting.value().requested_scale, 0.4);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     RuntimeScaleControlSurvivesStoppedResetAndSeedsTheNextMove) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute",
+                       CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
+
+  const auto configured = kernel.set_runtime_scale_control(
+      runtime_scale_control_request("request.scale.control.before-reset", 0U,
+                                    0.35));
+  ASSERT_TRUE(configured.ok()) << configured.error().message;
+  const auto first =
+      kernel.execute(motion_operation("request.scale.control.reset.first"));
+  ASSERT_TRUE(first.ok()) << first.error().message;
+  ASSERT_TRUE(engine.last_execute.has_value());
+  EXPECT_DOUBLE_EQ(engine.last_execute->initial_runtime_scale->requested_scale,
+                   0.35);
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+
+  const auto stopped = kernel.stop(stop_request(
+      "request.scale.control.reset.stop", first.value(), 1U));
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    const auto state = kernel.get_operation_state(first.value().operation_id);
+    return state.ok() && state.value().state == OperationStateKind::kStopped;
+  }));
+  const auto stopped_state = kernel.get_operation_state(first.value().operation_id);
+  ASSERT_TRUE(stopped_state.ok()) << stopped_state.error().message;
+  const auto reset = kernel.reset(control_request(
+      "request.scale.control.reset.release", first.value(),
+      stopped_state.value().operation_revision.value()));
+  ASSERT_TRUE(reset.ok()) << reset.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    return kernel.resource_snapshot().front().state == ResourceSlotState::kFree;
+  }));
+
+  const auto between =
+      kernel.get_runtime_scale_control(runtime_scale_control_selector());
+  ASSERT_TRUE(between.ok()) << between.error().message;
+  EXPECT_EQ(between.value().control_generation,
+            RuntimeScaleControlGeneration(1U));
+  EXPECT_DOUBLE_EQ(between.value().requested_scale, 0.35);
+  EXPECT_FALSE(between.value().active_operation_id.has_value());
+
+  const auto second =
+      kernel.execute(motion_operation("request.scale.control.reset.second"));
+  ASSERT_TRUE(second.ok()) << second.error().message;
+  ASSERT_TRUE(engine.last_execute.has_value());
+  ASSERT_TRUE(engine.last_execute->initial_runtime_scale.has_value());
+  EXPECT_DOUBLE_EQ(engine.last_execute->initial_runtime_scale->requested_scale,
+                   0.35);
 }
 
 TEST(ResourceAddressedExecutionKernelTest,

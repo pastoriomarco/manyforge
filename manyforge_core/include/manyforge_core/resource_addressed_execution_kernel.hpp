@@ -372,6 +372,10 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       const RuntimeScaleRequestDTO& request);
   [[nodiscard]] Result<RuntimeScaleStatusDTO> get_runtime_scale(
       const OperationId& operation_id) const;
+  [[nodiscard]] Result<RuntimeScaleControlAcceptedDTO> set_runtime_scale_control(
+      const RuntimeScaleControlRequestDTO& request);
+  [[nodiscard]] Result<RuntimeScaleControlStatusDTO> get_runtime_scale_control(
+      const RuntimeScaleControlSelectorDTO& selector) const;
 
   [[nodiscard]] AuthoringAdmissionDTO GetAuthoringAdmission() const override;
   [[nodiscard]] Result<AuthoringAdmissionDTO> UpdateCellAdmissionReadiness(
@@ -401,6 +405,12 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   /// resident operation from retained history.
   [[nodiscard]] Result<OperationReadProjectionDTO> get_operation_projection(
       const OperationId& operation_id) const;
+
+  /// Coherent, deterministic projection of every still-resident operation
+  /// owned by one of the exact Program-run identities. This lets a successor
+  /// client recover an operation without guessing its owner-minted identity.
+  [[nodiscard]] std::vector<OperationStateDTO> get_resident_operations(
+      const std::vector<ProgramRunId>& program_run_ids) const;
 
   [[nodiscard]] Result<OperationRecoveryProjectionDTO>
   get_operation_recovery_assessment(const OperationId& operation_id) const;
@@ -503,6 +513,9 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   struct StopReplayEntry;
   struct FullStopReplayEntry;
   struct RuntimeScaleReplayEntry;
+  struct RuntimeScaleControlReplayEntry;
+  struct RuntimeScaleControlSetting;
+  struct RuntimeScaleControlResolution;
   struct ActiveOperation;
   struct StopTransaction;
   struct StopTerminalRecord;
@@ -560,6 +573,13 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] Result<void> apply_runtime_scale_status(
       IResolvedParticipantExecutionEngine* engine,
       const ResolvedRuntimeScaleStatusDTO& resolved_status);
+  [[nodiscard]] Result<RuntimeScaleAcceptedDTO> set_runtime_scale_impl(
+      const RuntimeScaleRequestDTO& request, bool retain_public_replay);
+  [[nodiscard]] Result<RuntimeScaleControlResolution>
+  resolve_runtime_scale_control_locked(
+      const RuntimeScaleControlSelectorDTO& selector) const;
+  [[nodiscard]] double runtime_scale_setting_for_binding_locked(
+      const RuntimeParticipantBindingDTO& binding) const noexcept;
   void ProgressStop(StopControlWorkToken token) noexcept override;
   void StageAttemptCompleted(StopStageAttemptHandle handle) noexcept override;
   void OperationControlEffectCompleted(BoundedOperationControlExecutor& executor,
@@ -607,6 +627,9 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   std::vector<StopReplayEntry> stop_replay_ledger_;
   std::vector<FullStopReplayEntry> full_stop_replay_ledger_;
   std::vector<RuntimeScaleReplayEntry> runtime_scale_replay_ledger_;
+  std::vector<RuntimeScaleControlReplayEntry>
+      runtime_scale_control_replay_ledger_;
+  std::vector<RuntimeScaleControlSetting> runtime_scale_control_settings_;
   struct StopFaultRecoveryReplayEntry;
   std::vector<StopFaultRecoveryReplayEntry> stop_fault_recovery_replay_ledger_;
   struct OperationRecoveryReplayEntry;

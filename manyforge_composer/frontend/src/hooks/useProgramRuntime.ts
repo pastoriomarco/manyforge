@@ -31,7 +31,10 @@ const POLLED_STATES = new Set([
   'full_stopping',
   'stopping',
 ]);
-export const PROGRAM_RUN_OBSERVATION_POLL_MS = 100;
+// This is operator presentation, never an execution clock. The normative
+// reference cadence is 500 ms; faster per-browser polling only duplicates
+// owner reads and competes with the high-rate viewer observer plane.
+export const PROGRAM_RUN_OBSERVATION_POLL_MS = 500;
 
 type ProgramCycleDebugProjection = Pick<ProgramCycleStatus,
   | 'programRunnerOwnerEpoch'
@@ -39,7 +42,15 @@ type ProgramCycleDebugProjection = Pick<ProgramCycleStatus,
   | 'state'
   | 'programRunId'
   | 'cycleClaimGeneration'
->;
+> & {
+  admissionGeneration?: number;
+  authoringAllowed?: boolean;
+};
+
+export interface ProgramResetAdmissionFence {
+  admissionGeneration: number;
+  allowEqual: boolean;
+}
 
 export function programCurrentStatusSummary(
   run: ProgramRunStatus | null,
@@ -177,7 +188,6 @@ export function programRuntimeWakeKey(snapshot: ComposerHeadlessState | null): s
       ? active.graph_revision : 'no-graph-revision',
     snapshot.authoringAdmission.admissionGeneration,
     snapshot.programCycle.programRunnerOwnerEpoch,
-    snapshot.programCycle.cycleGeneration,
     snapshot.programCycle.state,
     snapshot.programCycle.runtimeControlRevision ?? 'no-runtime-controls',
     snapshot.programCycle.recoveryOffer?.offerId ?? 'no-recovery-offer',
@@ -209,6 +219,7 @@ interface ProgramRuntimeState {
   selectedScenarioId: string | null;
   runnerAvailable: boolean;
   loading: boolean;
+  observationError: string | null;
   pending: ProgramPendingCommand;
   controlPending: string | null;
   error: string | null;
@@ -223,6 +234,7 @@ const INITIAL_STATE: ProgramRuntimeState = {
   selectedScenarioId: null,
   runnerAvailable: false,
   loading: true,
+  observationError: null,
   pending: null,
   controlPending: null,
   error: null,
@@ -353,7 +365,12 @@ export function programPendingAfterProjection(
   run: ProgramRunStatus | null,
   controls: ProgramRuntimeControlProjection | null,
   cycle: ProgramCycleDebugProjection | null = null,
+  responsePending: ProgramPendingCommand = null,
+  resetAdmissionFence: ProgramResetAdmissionFence | null = null,
 ): ProgramPendingCommand {
+  // Owner projection may overtake the exact HTTP response. Keep the pressed
+  // command disabled until both halves of that same operation have settled.
+  if (pending !== null && responsePending === pending) return pending;
   if (pending === 'motion-stop') {
     if (programMotionStopSettled(run, controls)) return null;
     if (
@@ -371,7 +388,22 @@ export function programPendingAfterProjection(
       : pending;
   }
   if (pending === 'reset') {
-    return cycle?.state === 'idle_after_reset' ? null : pending;
+    if (cycle?.state !== 'idle_after_reset') return pending;
+    // A Reset first publishes Idle, then prepares the authored scene under
+    // short authoring claims. Do not expose Run against the crossed, older
+    // admission projection. The exact Reset response supplies the fence; a
+    // response that was already authoring-ready may settle at equality.
+    if (resetAdmissionFence === null) return null;
+    if (cycle.authoringAllowed !== true) return pending;
+    const generation = cycle.admissionGeneration;
+    if (generation === undefined) return pending;
+    return (
+      generation > resetAdmissionFence.admissionGeneration
+      || (
+        resetAdmissionFence.allowEqual
+        && generation === resetAdmissionFence.admissionGeneration
+      )
+    ) ? null : pending;
   }
   if (pending === 'stop') {
     return run !== null
@@ -517,10 +549,16 @@ export function useProgramRuntime(
   workspace: ProgramWorkspaceResponse | null = null,
 ) {
   const [state, setState] = useState<ProgramRuntimeState>(INITIAL_STATE);
+  const stateRef = useRef(state);
+  stateRef.current = state;
   const mounted = useRef(true);
   const refreshing = useRef(false);
   const refreshQueued = useRef(false);
+  const observationRetryAttempt = useRef(0);
+  const [observationRetrySequence, setObservationRetrySequence] = useState(0);
   const commandSequence = useRef(0);
+  const programResponsePending = useRef<ProgramPendingCommand>(null);
+  const resetAdmissionFence = useRef<ProgramResetAdmissionFence | null>(null);
   const catalogCache = useRef<ScenarioCatalogResponse | null>(null);
   const requestedWakeKey = useRef<string | null>(null);
   const observedRunId = useRef<string | null>(null);
@@ -531,7 +569,6 @@ export function useProgramRuntime(
   ));
   const wakeKey = programRuntimeWakeKey(snapshot);
   const snapshotAvailable = snapshot !== null;
-  const cycleRunId = snapshot?.programCycle.programRunId ?? null;
   const cycleDebugProjection = useMemo<ProgramCycleDebugProjection | null>(
     () => snapshot === null ? null : {
       programRunnerOwnerEpoch: snapshot.programCycle.programRunnerOwnerEpoch,
@@ -539,15 +576,13 @@ export function useProgramRuntime(
       state: snapshot.programCycle.state,
       programRunId: snapshot.programCycle.programRunId,
       cycleClaimGeneration: snapshot.programCycle.cycleClaimGeneration,
+      admissionGeneration: snapshot.authoringAdmission.admissionGeneration,
+      authoringAllowed: snapshot.authoringAdmission.authoringAllowed,
     },
-    [
-      snapshot?.programCycle.cycleClaimGeneration,
-      snapshot?.programCycle.cycleGeneration,
-      snapshot?.programCycle.programRunId,
-      snapshot?.programCycle.programRunnerOwnerEpoch,
-      snapshot?.programCycle.state,
-    ],
+    [snapshot],
   );
+  const cycleDebugProjectionRef = useRef(cycleDebugProjection);
+  cycleDebugProjectionRef.current = cycleDebugProjection;
   const recoverySettlementPending = state.controlPending?.startsWith('recovery:') === true;
   const activeRunId = recoverySettlementPending
     || programRunNeedsObservationPoll(state.run, state.controls)
@@ -625,7 +660,8 @@ export function useProgramRuntime(
         if (run !== null) {
           observedRunId.current = run.capture.programRunId;
         } else {
-          const retainedRunId = cycleRunId ?? observedRunId.current;
+          const retainedRunId = cycleDebugProjectionRef.current?.programRunId
+            ?? observedRunId.current;
           if (retainedRunId === null) {
             run = null;
           } else {
@@ -665,8 +701,15 @@ export function useProgramRuntime(
         refreshQueued.current = true;
         return;
       }
+      const observationError = errors.length > 0
+        ? [...new Set(errors)].join(' ')
+        : null;
+      if (observationError === null) {
+        observationRetryAttempt.current = 0;
+      }
 
       setState((current) => {
+        const currentCycle = cycleDebugProjectionRef.current;
         const nextCatalog = catalog ?? current.catalog;
         const controlPending = controlPendingAfterProjection(
           current.controlPending,
@@ -689,6 +732,7 @@ export function useProgramRuntime(
           ),
           runnerAvailable,
           loading: false,
+          observationError,
           // Most command markers are completed by their own response. Motion
           // Stop is deliberately different: acceptance starts containment,
           // while only the exact owner recovery projection proves Stopped.
@@ -696,22 +740,22 @@ export function useProgramRuntime(
             current.pending,
             run,
             controls,
-            cycleDebugProjection,
+            currentCycle,
+            programResponsePending.current,
+            resetAdmissionFence.current,
           ),
           controlPending,
           // Automatic owner refresh must not erase a command rejection before
           // the operator can see it. The next explicit command clears it.
-          error: errors.length > 0
-            ? [...new Set(errors)].join(' ')
-            : current.error ?? (
-              cycleDebugProjection?.state !== 'idle_after_reset'
-                ? programTerminalFailureMessage(
-                  run,
-                  controls,
-                  cycleDebugProjection,
-                )
-                : null
-            ),
+          error: current.error ?? (
+            currentCycle?.state !== 'idle_after_reset'
+              ? programTerminalFailureMessage(
+                run,
+                controls,
+                currentCycle,
+              )
+              : null
+          ),
         };
         return current.catalog?.scenarioCatalogRevision
             === next.catalog?.scenarioCatalogRevision
@@ -723,12 +767,16 @@ export function useProgramRuntime(
           && current.selectedScenarioId === next.selectedScenarioId
           && current.runnerAvailable === next.runnerAvailable
           && current.loading === next.loading
+          && current.observationError === next.observationError
           && current.pending === next.pending
           && current.controlPending === next.controlPending
           && current.error === next.error
           ? current
           : next;
       });
+      if (observationError !== null) {
+        setObservationRetrySequence((current) => current + 1);
+      }
     } finally {
       refreshing.current = false;
       if (refreshQueued.current) {
@@ -736,7 +784,28 @@ export function useProgramRuntime(
         queueMicrotask(() => { void refresh(); });
       }
     }
-  }, [cycleDebugProjection, cycleRunId, enabled, snapshotAvailable]);
+  }, [enabled, snapshotAvailable]);
+
+  useEffect(() => {
+    if (
+      !enabled
+      || !snapshotAvailable
+      || state.observationError === null
+    ) return undefined;
+    const attempt = Math.min(observationRetryAttempt.current, 4);
+    observationRetryAttempt.current = Math.min(attempt + 1, 4);
+    const timer = window.setTimeout(
+      () => { void refresh(); },
+      Math.min(500 * 2 ** attempt, 8_000),
+    );
+    return () => window.clearTimeout(timer);
+  }, [
+    enabled,
+    observationRetrySequence,
+    refresh,
+    snapshotAvailable,
+    state.observationError,
+  ]);
 
   useEffect(() => {
     mounted.current = true;
@@ -750,10 +819,13 @@ export function useProgramRuntime(
   useEffect(() => {
     if (!enabled) {
       setState(INITIAL_STATE);
+      programResponsePending.current = null;
+      resetAdmissionFence.current = null;
       observedRunId.current = null;
       observedOwnerEpoch.current = null;
       catalogCache.current = null;
       requestedWakeKey.current = null;
+      observationRetryAttempt.current = 0;
       return;
     }
     if (!snapshotAvailable) {
@@ -784,6 +856,7 @@ export function useProgramRuntime(
           const run = runResult.value;
           if (!current || run.ownerEpoch !== activeRunOwnerEpoch) return;
           setState((previous) => {
+            const currentCycle = cycleDebugProjectionRef.current;
             const observed = previous.run;
             const controls = controlsResult.status === 'fulfilled'
               && controlsResult.value.ownerEpoch === activeRunOwnerEpoch
@@ -793,7 +866,9 @@ export function useProgramRuntime(
               previous.pending,
               run,
               controls,
-              cycleDebugProjection,
+              currentCycle,
+              programResponsePending.current,
+              resetAdmissionFence.current,
             );
             const controlPending = controlPendingAfterProjection(
               previous.controlPending,
@@ -822,7 +897,7 @@ export function useProgramRuntime(
               error: previous.error ?? programTerminalFailureMessage(
                 run,
                 controls,
-                cycleDebugProjection,
+                currentCycle,
               ),
             };
           });
@@ -849,8 +924,7 @@ export function useProgramRuntime(
       controller?.abort();
     };
   }, [
-    activeRunId, activeRunOwnerEpoch, cycleDebugProjection, enabled,
-    recoverySettlementPending,
+    activeRunId, activeRunOwnerEpoch, enabled, recoverySettlementPending,
   ]);
 
   useEffect(() => {
@@ -892,6 +966,8 @@ export function useProgramRuntime(
 
   const beginProgramCommand = useCallback((pending: Exclude<ProgramPendingCommand, null>) => {
     commandSequence.current += 1;
+    programResponsePending.current = pending;
+    if (pending !== 'reset') resetAdmissionFence.current = null;
     setState((current) => ({ ...current, pending, error: null }));
   }, []);
 
@@ -906,13 +982,17 @@ export function useProgramRuntime(
     requestId: string,
     pendingKind: 'program' | 'control',
   ) => {
+    if (pendingKind === 'program') {
+      programResponsePending.current = null;
+      resetAdmissionFence.current = null;
+    }
     const diagnostic = await observeProgramCommandFailure(
       reason,
       fallback,
       requestId,
-      state.run,
-      state.controls,
-      cycleDebugProjection,
+      stateRef.current.run,
+      stateRef.current.controls,
+      cycleDebugProjectionRef.current,
     );
     if (!mounted.current) return;
     const diagnosticControls = diagnostic.run !== null
@@ -928,7 +1008,7 @@ export function useProgramRuntime(
       controlPending: pendingKind === 'control' ? null : current.controlPending,
       error: diagnostic.message,
     }));
-  }, [cycleDebugProjection, state.controls, state.run]);
+  }, []);
 
   const run = useCallback(async () => {
     const requestId = identity('program-run-start');
@@ -940,6 +1020,7 @@ export function useProgramRuntime(
     beginProgramCommand('run');
     try {
       const status = await api.programs.start(request);
+      programResponsePending.current = null;
       observedRunId.current = status.capture.programRunId;
       observedOwnerEpoch.current = status.ownerEpoch;
       if (mounted.current) {
@@ -951,7 +1032,7 @@ export function useProgramRuntime(
             current.pending,
             status,
             null,
-            cycleDebugProjection,
+            cycleDebugProjectionRef.current,
           ),
         }));
       }
@@ -961,7 +1042,7 @@ export function useProgramRuntime(
       );
     }
   }, [
-    beginProgramCommand, cycleDebugProjection, recordCommandFailure, snapshot,
+    beginProgramCommand, recordCommandFailure, snapshot,
     state.applied, state.pending, state.runnerAvailable, workspace,
   ]);
 
@@ -976,14 +1057,17 @@ export function useProgramRuntime(
     if (request === null) return;
     beginProgramCommand('reset');
     try {
-      if (fullStopRequest !== null && state.run !== null) {
-        await api.programs.resetFullStop(
+      const result = fullStopRequest !== null && state.run !== null
+        ? await api.programs.resetFullStop(
           state.run.capture.programRunId,
           fullStopRequest,
-        );
-      } else {
-        await api.programs.resetCycle(request);
-      }
+        )
+        : await api.programs.resetCycle(request);
+      resetAdmissionFence.current = {
+        admissionGeneration: result.admission.admissionGeneration,
+        allowEqual: result.admission.authoringAllowed,
+      };
+      programResponsePending.current = null;
       await refresh();
     } catch (reason) {
       await recordCommandFailure(
@@ -1015,6 +1099,7 @@ export function useProgramRuntime(
           reason: 'ordinary operator Program Stop',
         },
       );
+      programResponsePending.current = null;
       if (mounted.current) {
         setState((current) => ({
           ...current,
@@ -1023,7 +1108,7 @@ export function useProgramRuntime(
             current.pending,
             status,
             current.controls,
-            cycleDebugProjection,
+            cycleDebugProjectionRef.current,
           ),
         }));
       }
@@ -1033,7 +1118,7 @@ export function useProgramRuntime(
       );
     }
   }, [
-    beginProgramCommand, cycleDebugProjection, recordCommandFailure,
+    beginProgramCommand, recordCommandFailure,
     state.pending, state.run, state.runnerAvailable,
   ]);
 
@@ -1059,6 +1144,7 @@ export function useProgramRuntime(
           reason: 'ordinary operator motion Stop',
         },
       );
+      programResponsePending.current = null;
       if (mounted.current) {
         setState((current) => ({
           ...current,
@@ -1067,7 +1153,7 @@ export function useProgramRuntime(
             current.pending,
             status,
             current.controls,
-            cycleDebugProjection,
+            cycleDebugProjectionRef.current,
           ),
         }));
       }
@@ -1077,7 +1163,7 @@ export function useProgramRuntime(
       );
     }
   }, [
-    beginProgramCommand, cycleDebugProjection, recordCommandFailure,
+    beginProgramCommand, recordCommandFailure,
     state.pending, state.run, state.runnerAvailable,
   ]);
 
@@ -1103,6 +1189,7 @@ export function useProgramRuntime(
           reason: 'ordinary operator Full Stop',
         },
       );
+      programResponsePending.current = null;
       if (mounted.current) {
         setState((current) => ({
           ...current,
@@ -1111,7 +1198,7 @@ export function useProgramRuntime(
             current.pending,
             status,
             current.controls,
-            cycleDebugProjection,
+            cycleDebugProjectionRef.current,
           ),
         }));
       }
@@ -1121,7 +1208,7 @@ export function useProgramRuntime(
       );
     }
   }, [
-    beginProgramCommand, cycleDebugProjection, recordCommandFailure,
+    beginProgramCommand, recordCommandFailure,
     state.pending, state.run, state.runnerAvailable,
   ]);
 
@@ -1148,6 +1235,7 @@ export function useProgramRuntime(
           reason: 'operator Run after Full Stop',
         },
       );
+      programResponsePending.current = null;
       if (mounted.current) {
         setState((current) => ({
           ...current,
@@ -1156,7 +1244,7 @@ export function useProgramRuntime(
             current.pending,
             status,
             current.controls,
-            cycleDebugProjection,
+            cycleDebugProjectionRef.current,
           ),
         }));
       }
@@ -1166,7 +1254,7 @@ export function useProgramRuntime(
       );
     }
   }, [
-    beginProgramCommand, cycleDebugProjection, recordCommandFailure,
+    beginProgramCommand, recordCommandFailure,
     state.pending, state.run, state.runnerAvailable,
   ]);
 

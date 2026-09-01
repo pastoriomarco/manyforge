@@ -48,6 +48,7 @@ describe('authoritative viewer interpolation', () => {
   });
 
   it('caps long gaps and treats exact duplicate frames as unchanged', () => {
+    expect(MAX_AUTHORITATIVE_INTERPOLATION_MS).toBe(50);
     const previous = frame();
     const next = frame({
       sourceSequence: 2,
@@ -97,7 +98,7 @@ describe('authoritative viewer interpolation', () => {
 
     expect(applyAuthoritativeTransformTransition(
       transition,
-      550,
+      525,
       position,
       quaternion,
     )).toBe(false);

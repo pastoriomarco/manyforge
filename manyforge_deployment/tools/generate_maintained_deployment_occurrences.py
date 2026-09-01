@@ -36,7 +36,7 @@ NATIVE_RUNTIME_CONFIGURATION_SCHEMA_ID: Final = (
     "manyforge.value_schema.runtime.native_execution.v1"
 )
 NATIVE_RUNTIME_CONFIGURATION_SCHEMA_REVISION: Final = (
-    "sha256:c20bf40303bddd213d8db77b7075c0fe224e00928f4e6bda3cbfd7ebba880d6e"
+    "sha256:4be97ca6314af96d083a37a6aed9ef5976ed0e63c02d69ac790377edeb6804fb"
 )
 ROS2_CONTROL_RUNTIME_CONFIGURATION_SCHEMA_ID: Final = (
     "manyforge.value_schema.runtime.ros2_control_execution.v1"
@@ -2192,8 +2192,7 @@ def graph_and_applicability(
         for capability_id in capabilities:
             if CAPABILITIES[capability_id][2] != "control_binding":
                 continue
-            bindings.append(
-                {
+            binding = {
                     "control_binding_id": control_binding_id(
                         occurrence, target, capability_id
                     ),
@@ -2233,7 +2232,23 @@ def graph_and_applicability(
                     "stop_evidence_policy_revision": stop_ref["record_revision"],
                     "containment_granularity": "resource",
                 }
-            )
+            if (
+                not ros2_control
+                and target == "arm"
+                and capability_id == "execution.trajectory.execute"
+            ):
+                binding["runtime_scale_route_qualifications"] = [
+                    {
+                        "control_route_id": "arm_position",
+                        "scaling_domain_id": f"{occurrence}.arm.runtime_scale",
+                        "command_endpoint_role_id": "command",
+                        "applied_state_endpoint_role_id": "state",
+                        "acknowledgement_kind": "applied_state",
+                        "maximum_slew_per_second": 4.0,
+                        "freshness_budget_ns": 100_000_000,
+                    }
+                ]
+            bindings.append(binding)
     bindings.sort(key=lambda row: row["control_binding_id"])
 
     graph = {

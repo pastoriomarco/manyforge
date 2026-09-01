@@ -28,8 +28,6 @@ def test_contract_constructor_does_not_call_the_transport() -> None:
         reset = PoisonCallable()
         acknowledge_completed = PoisonCallable()
         stop = PoisonCallable()
-        set_runtime_scale = PoisonCallable()
-        get_runtime_scale = PoisonCallable()
 
     client = KernelClient(Transport())
     with pytest.raises(TypeError, match="plan_pick"):

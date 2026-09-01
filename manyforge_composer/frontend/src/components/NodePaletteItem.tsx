@@ -20,6 +20,7 @@ interface NodePaletteItemProps {
   disabled?: boolean;
   onActivate?: (activation: ProgramPaletteActivation) => void;
   executionNote?: string;
+  executionAvailable?: boolean;
   allowDrag?: boolean;
 }
 
@@ -28,6 +29,7 @@ export function NodePaletteItem({
   disabled = false,
   onActivate,
   executionNote,
+  executionAvailable,
   allowDrag = false,
 }: NodePaletteItemProps) {
   const [infoOpen, setInfoOpen] = useState(false);
@@ -45,6 +47,7 @@ export function NodePaletteItem({
     event.dataTransfer.setDragImage(ghost, 60, 18);
     window.setTimeout(() => ghost.remove(), 0);
   };
+  const activate = () => onActivate?.(programPaletteClickIntent(entry));
   const titleId = `node-info-${entry.id.replaceAll(/[^A-Za-z0-9_-]/g, '-')}`;
 
   return (
@@ -53,27 +56,31 @@ export function NodePaletteItem({
         type="button"
         draggable={!disabled && allowDrag}
         onDragStart={onDragStart}
-        onClick={() => onActivate?.(programPaletteClickIntent(entry))}
+        onDoubleClick={activate}
+        onKeyDown={(event) => {
+          if (event.key !== 'Enter' && event.key !== ' ') return;
+          event.preventDefault();
+          activate();
+        }}
         disabled={disabled}
         className={`node-palette-item${disabled ? ' disabled' : ''}${allowDrag ? ' draggable' : ''}`}
-        title={disabled ? 'Authoring is currently unavailable' : `Add ${entry.name}`}
+        aria-label={disabled ? entry.name : `${entry.name}; double-click or drag to add`}
+        title={disabled
+          ? 'Authoring is currently unavailable'
+          : `Double-click or drag to add ${entry.name}`}
       >
         <span className="node-palette-icon" aria-hidden="true">
           {KIND_ICONS[entry.kind] || '●'}
         </span>
         <span className="node-palette-copy">
           <strong>{entry.name}</strong>
-          <small>{entry.id} · {entry.kind}</small>
-          {executionNote && (
-            <small className="node-palette-availability">{executionNote}</small>
-          )}
         </span>
       </button>
       <button
         ref={infoButton}
         type="button"
-        className="icon-button node-info-button"
-        aria-label={`Information about ${entry.name}`}
+        className={`icon-button node-info-button${executionAvailable === true ? ' execution-available' : ''}${executionAvailable === false ? ' execution-unavailable' : ''}`}
+        aria-label={`Information about ${entry.name}${executionAvailable === true ? '; execution available' : ''}${executionAvailable === false ? '; execution unavailable' : ''}`}
         title={`Information about ${entry.name}`}
         onClick={() => setInfoOpen(true)}
       >
@@ -90,6 +97,14 @@ export function NodePaletteItem({
         <div className="node-information">
           <p>{entry.description}</p>
           <dl>
+            {executionNote && (
+              <div>
+                <dt>Current availability</dt>
+                <dd className={executionAvailable ? 'node-execution-available' : 'node-execution-unavailable'}>
+                  {executionNote}
+                </dd>
+              </div>
+            )}
             <div><dt>Stable ID</dt><dd><code>{entry.id}</code></dd></div>
             <div><dt>Category</dt><dd>{entry.category}</dd></div>
             <div><dt>Kind</dt><dd>{entry.kind}</dd></div>

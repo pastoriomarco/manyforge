@@ -77,12 +77,22 @@ export function SnapshotResponder({
   applyFrame,
 }: SnapshotResponderProps) {
   const store = useStore();
+  const uploadRef = useRef(upload);
+  const ensureFrameRef = useRef(ensureFrame);
+  const applyFrameRef = useRef(applyFrame);
   const targetRef = useRef<WebGLRenderTarget | null>(null);
   const pixelsRef = useRef<{
     bytes: Uint8Array<ArrayBuffer>;
     clamped: Uint8ClampedArray<ArrayBuffer>;
   } | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  // Snapshot capture callbacks follow the newest presented owner frame, but
+  // changing that frame must not tear down the one observer transport. Keep
+  // the subscription lifecycle tied only to its actual transport function.
+  uploadRef.current = upload;
+  ensureFrameRef.current = ensureFrame;
+  applyFrameRef.current = applyFrame;
 
   useEffect(() => {
     let active = true;
@@ -167,21 +177,23 @@ export function SnapshotResponder({
     const handle = async (request: SnapshotRequestView) => {
       try {
         const deadlineMs = performance.now() + request.timeoutMs;
-        const observedFrame = await ensureFrame(
+        const observedFrame = await ensureFrameRef.current(
           request.requiredFrame,
           request.timeoutMs,
         );
         if (observedFrame === null) {
           throw new Error('Required viewer frame is unavailable');
         }
-        applyFrame?.();
+        applyFrameRef.current?.();
         const blob = await capture(request, deadlineMs);
-        if (active) await upload(request.requestId, blob, observedFrame);
+        if (active) {
+          await uploadRef.current(request.requestId, blob, observedFrame);
+        }
       } catch (error) {
         console.warn('snapshot capture failed', error);
         if (active) {
           try {
-            await upload(request.requestId, null, null);
+            await uploadRef.current(request.requestId, null, null);
           } catch (uploadError) {
             console.warn('snapshot failure report could not be uploaded', uploadError);
           }
@@ -200,7 +212,7 @@ export function SnapshotResponder({
       pixelsRef.current = null;
       canvasRef.current = null;
     };
-  }, [applyFrame, ensureFrame, store, subscribe, upload]);
+  }, [store, subscribe]);
 
   return null;
 }

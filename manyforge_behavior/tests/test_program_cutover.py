@@ -595,6 +595,7 @@ def test_program_accepts_ordered_free_text_parameter_defaults() -> None:
         ("undeclared_value_source", "names no Program parameter"),
         ("empty_blackboard_fields", "must not be empty"),
         ("unknown_viewer_role", "does not name a declared role"),
+        ("unknown_viewer_scene_resource", "does not name a declared role"),
         ("unknown_scene_policy", "undeclared collision policies"),
         ("inapplicable_constraint", "numeric constraints are unsupported"),
     ),
@@ -643,6 +644,10 @@ def test_translated_historical_program_negative_corpus(
         }
     elif mutation == "unknown_viewer_role":
         document["viewer"] = {"frame_role_visibility": {"unknown": True}}
+    elif mutation == "unknown_viewer_scene_resource":
+        document["viewer"] = {
+            "scene_resource_axes_visibility": {"unknown": True}
+        }
     elif mutation == "unknown_scene_policy":
         document["scene"][0]["collision_policy_ids"] = ["missing_policy"]
     elif mutation == "inapplicable_constraint":

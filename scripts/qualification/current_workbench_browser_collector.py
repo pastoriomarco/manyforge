@@ -192,8 +192,10 @@ def _validate_qualification(value: object) -> dict[str, Any]:
         {"socketPath", "sourceCount", "activeSockets", "socketCreations", "maxActiveSockets"},
         "headless transport",
     )
-    if headless["socketPath"] != "/ws/state":
-        raise CollectorError("qualification did not observe the shared /ws/state socket")
+    if headless["socketPath"] != "/ws/scene/viewer":
+        raise CollectorError(
+            "qualification did not observe the dedicated viewer socket"
+        )
     for key in ("sourceCount", "activeSockets", "socketCreations", "maxActiveSockets"):
         _number(headless[key], f"headless.{key}", integer=True)
     if not isinstance(status["errors"], list) or len(status["errors"]) > 16:
@@ -376,7 +378,7 @@ OBSERVATION_SCRIPT = f"""return (() => {{
         : false;
   return {{
     qualification: q === undefined ? null : q.snapshot(),
-    connected: document.querySelector('.runtime-status-button[data-backend-connected="true"]') !== null,
+    connected: document.querySelector('.deployment-status-button[data-backend-connected="true"]') !== null,
     operationsPanePresent: operations !== null && pane !== null,
     operationsCollapsed: shell?.classList.contains('commands-collapsed') === true,
     viewerPresent: pane?.querySelector('.viewer-panel') !== null,
@@ -405,6 +407,17 @@ OPEN_VIEWER_TOOLS_SCRIPT = """return (() => {
   if (button === undefined) return false;
   if (button.getAttribute('aria-pressed') !== 'true') button.click();
   return true;
+})();"""
+IDLE_CONTROL_READY_SCRIPT = """return (() => {
+  const run = document.querySelector('.viewer-transport .transport-run');
+  const velocity = document.querySelector('.viewer-transport .transport-velocity input');
+  const loadingNotice = [...document.querySelectorAll('.program-workspace-notice')]
+    .some((notice) => /Loading|Reading the Program workspace/i.test(notice.textContent ?? ''));
+  return run instanceof HTMLButtonElement
+    && !run.disabled
+    && velocity instanceof HTMLInputElement
+    && !velocity.disabled
+    && !loadingNotice;
 })();"""
 
 
@@ -446,6 +459,19 @@ def _wait_for_qualification(driver: RawWebDriver, timeout_s: float) -> None:
         time.sleep(POLL_INTERVAL_S)
 
 
+def _wait_for_idle_controls(driver: RawWebDriver, timeout_s: float) -> None:
+    """Require automatic owner-proven Idle readiness without an operator retry."""
+    deadline = time.monotonic() + min(timeout_s, WAIT_TIMEOUT_S)
+    while True:
+        if _execute(driver, IDLE_CONTROL_READY_SCRIPT) is True:
+            return
+        if time.monotonic() >= deadline:
+            raise CollectorError(
+                "timed out waiting for automatic native Idle controls readiness"
+            )
+        time.sleep(POLL_INTERVAL_S)
+
+
 def _url_with_opt_in(composer_url: str) -> str:
     parsed = urlsplit(composer_url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -476,12 +502,12 @@ def _require_ready(observation: _Observation) -> None:
     if status["canvasCount"] != 1:
         raise CollectorError("qualification requires exactly one viewer Canvas")
     if (
-        status["headless"]["socketPath"] != "/ws/state"
+        status["headless"]["socketPath"] != "/ws/scene/viewer"
         or status["headless"]["sourceCount"] != 1
         or status["headless"]["activeSockets"] != 1
         or status["headless"]["maxActiveSockets"] != 1
     ):
-        raise CollectorError("qualification requires exactly one active HeadlessStateSource socket")
+        raise CollectorError("qualification requires exactly one active viewer-observation socket")
     if status["wireframeDefault"] is not False or status["wireframeVisible"] is not False:
         raise CollectorError("qualification requires the solid wireframe default")
     if not status["model"]["ready"] or status["model"]["geometryCount"] <= 0:
@@ -633,6 +659,7 @@ def collect_current_workbench(
             timeout_s,
         )
         _require_ready(ready)
+        _wait_for_idle_controls(driver, timeout_s)
         initial = _topology(ready)
 
         warmup_windows = _collect_windows(driver, WARMUP_SAMPLE_COUNT)
@@ -694,6 +721,7 @@ def collect_current_workbench(
             timeout_s,
         )
         _require_ready(reloaded)
+        _wait_for_idle_controls(driver, timeout_s)
         reload_topology = _topology(reloaded)
         if reload_topology["maxActiveSockets"] != 1:
             raise CollectorError("reload accumulated duplicate active sockets")
@@ -746,6 +774,7 @@ def collect_current_workbench(
                 "focused-idle persistent viewer across Program/Scene/Deployment",
                 "one Canvas and one shared shell HeadlessStateSource socket",
                 "solid rendering, bounded browser timings, and reload topology",
+                "automatic native Idle Run and velocity readiness without operator retry",
             ],
             "excluded": [
                 "Isaac/ROS/controller-manager",

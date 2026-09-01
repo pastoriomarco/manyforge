@@ -80,6 +80,31 @@ export function DeploymentDocumentControls({
             }
             onClick={() => setAction('revert')}
           >Revert</button>
+          <span className="deployment-document-action-divider" aria-hidden="true" />
+          <button
+            type="button"
+            disabled={
+              !controller.mutationAvailable
+              || controller.busy
+              || !workspace?.draft.document
+            }
+            onClick={() => { void controller.previewDraft(); }}
+          >Preview Draft</button>
+          <button
+            type="button"
+            className="primary-action"
+            disabled={
+              !controller.mutationAvailable
+              || controller.busy
+              || controller.candidate === null
+              || controller.candidate.compilation.deploymentRevision
+                !== workspace?.draft.deploymentRevision
+            }
+            title={controller.candidate === null
+              ? 'Preview this exact Draft before applying it.'
+              : undefined}
+            onClick={() => { void controller.applyDraft(); }}
+          >Apply Draft</button>
         </div>
       </div>
       {controller.mutationUnavailableReason && (
@@ -87,6 +112,17 @@ export function DeploymentDocumentControls({
       )}
       {!workspace?.runAdmission.ready && workspace?.runAdmission.reason && (
         <div className="deployment-run-gate" role="status">{workspace.runAdmission.reason}. Run remains disabled until Manager Applied matches this Draft.</div>
+      )}
+      {controller.candidate !== null && (
+        <div className="deployment-candidate-summary" role="status">
+          <strong>Preview valid</strong>
+          <span>
+            {controller.candidate.candidatePreview?.converged
+              ? 'No Manager graph changes.'
+              : 'Exact candidate is ready for deliberate Apply.'}
+          </span>
+          <code>{controller.candidate.compilation.deploymentRevision}</code>
+        </div>
       )}
       {controller.error && <div className="panel-state error-state" role="alert">{controller.error}</div>}
       {controller.feedback && (

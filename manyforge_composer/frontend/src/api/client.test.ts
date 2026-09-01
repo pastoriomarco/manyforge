@@ -850,4 +850,27 @@ describe('headless intent client', () => {
       'History sequence must be a positive safe integer',
     );
   });
+
+  it('carries bounded historian time, component, type, and page filters', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response({
+      schema_version: 'manyforge.historian_page.v1',
+      events: [],
+      next_before_sequence: null,
+      truncated: false,
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await api.history.list({
+      startNs: 10,
+      endNs: 20,
+      components: ['manyforge.runtime'],
+      eventTypes: ['operation_completed'],
+      beforeSequence: 7,
+      limit: 64,
+    });
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      '/api/execution/history?limit=64&start_ns=10&end_ns=20&before_sequence=7&components=manyforge.runtime&event_types=operation_completed',
+    );
+  });
 });

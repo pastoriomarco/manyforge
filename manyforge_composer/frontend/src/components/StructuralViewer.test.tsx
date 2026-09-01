@@ -11,6 +11,7 @@ import {
   VIEWER_CONTEXT_DRAG_THRESHOLD_PX,
   frameableContentBounds,
   framedCameraPresentation,
+  sceneObjectMaterial,
   supportsIndependentSceneScale,
   viewerClickWithinDuration,
   viewerContextWasDragged,
@@ -77,10 +78,32 @@ describe('viewer failure isolation', () => {
     expect(DEFAULT_COMPARISON_GHOST_VISIBLE).toBe(false);
     expect(source).toContain('<span>Wireframe overlays</span>');
     expect(source).toContain('wireframe={wireframe}');
-    expect(source).toContain('depthWrite={!wireframe}');
+    expect(source).toContain('depthWrite={!material.transparent && !wireframe}');
     expect(source).toContain(
       'setViewerQualificationWireframeDefault(DEFAULT_WIREFRAME_VISIBLE)',
     );
+  });
+
+  it('keeps authoritative, Draft, comparison, and candidate sources visually distinct', () => {
+    const source = readFileSync(
+      new URL('./StructuralViewer.tsx', import.meta.url),
+      'utf8',
+    );
+    const authoritative = sceneObjectMaterial('authoritative', false);
+    const draft = sceneObjectMaterial('draft', false);
+    const comparison = sceneObjectMaterial('comparison', false);
+
+    expect(authoritative).toMatchObject({ opacity: 1, transparent: false });
+    expect(draft).toMatchObject({ color: '#e4ac55', opacity: 0.62, transparent: true });
+    expect(comparison).toMatchObject({ color: '#43d7ec', opacity: 0.45, transparent: true });
+    expect(new Set([authoritative.color, draft.color, comparison.color]).size).toBe(3);
+    expect(source).toContain("appearance={programDraftPreview ? 'draft' : 'authoritative'}");
+    expect(source).toContain("data-scene-presentation={programDraftPreview ? 'program-draft' : 'owner'}");
+    expect(source).toContain("(object) => !observedSceneResourceIds.has(object.scene_resource_id)");
+    expect(source).toContain('<ObservedLogicalSceneObjects');
+    expect(source).toContain('viewer-source-swatch candidate');
+    expect(source).not.toContain('Measured state');
+    expect(source).not.toContain('Non-live viewer overlays');
   });
 
   it('keeps viewer layers in one bounded inspector panel at narrow widths', () => {
@@ -91,7 +114,7 @@ describe('viewer failure isolation', () => {
     );
 
     expect(css).toContain('.viewer-options-body');
-    expect(source.match(/type="checkbox"/g)).toHaveLength(4);
+    expect(source.match(/type="checkbox"/g)).toHaveLength(6);
     expect(source).toContain("toggleInspectorPanel('tools')");
     expect(source).toContain('Comparison ghost');
     expect(source).toContain('disabled={!comparisonGhostAvailable}');
@@ -157,7 +180,7 @@ describe('viewer failure isolation', () => {
     expect(newDirection.distanceTo(oldDirection)).toBeLessThan(1e-12);
   });
 
-  it('excludes transform interaction helpers from frame-all bounds', () => {
+  it('excludes transform and axes helpers from semantic framing bounds', () => {
     const content = new THREE.Group();
     content.add(new THREE.Mesh(new THREE.BoxGeometry(2, 2, 2)));
     const transformHelper = new THREE.Group() as THREE.Group & {
@@ -166,6 +189,7 @@ describe('viewer failure isolation', () => {
     transformHelper.isTransformControls = true;
     transformHelper.add(new THREE.Mesh(new THREE.BoxGeometry(1_000, 1_000, 1_000)));
     content.add(transformHelper);
+    content.add(new THREE.AxesHelper(2_000));
 
     const size = frameableContentBounds(content).getSize(new THREE.Vector3());
 
@@ -189,7 +213,7 @@ describe('viewer failure isolation', () => {
     expect(source).not.toContain('onPointerMissed=');
     expect(source).not.toContain('new THREE.Raycaster()');
     expect(source).toContain("const ignoreViewerRaycast: THREE.Object3D['raycast']");
-    expect(source.match(/raycast=\{ignoreViewerRaycast\}/g)).toHaveLength(6);
+    expect(source.match(/raycast=\{ignoreViewerRaycast\}/g)).toHaveLength(7);
     expect(source).not.toContain('transformRevision');
     expect(source).not.toContain('markTransformChange');
     expect(source).toContain('transformEnabled={transformEnabled && objectEditorActive}');
@@ -246,25 +270,46 @@ describe('viewer failure isolation', () => {
     expect(source.match(/onSelect={selectSceneResource}/g)).toHaveLength(2);
   });
 
-  it('nests each attached object under its exact measured carrier link', () => {
+  it('drives the measured robot once and nests each Attached object under its carrier', () => {
     const source = readFileSync(
       new URL('./StructuralViewer.tsx', import.meta.url),
       'utf8',
     );
+    const driverStart = source.indexOf('function MeasuredRobotFrameDriver');
     const measuredLinkStart = source.indexOf('function MeasuredRuntimeLink');
     const measuredLinkEnd = source.indexOf('function CandidateRobotGhost');
+    const driver = source.slice(driverStart, measuredLinkStart);
     const measuredLink = source.slice(measuredLinkStart, measuredLinkEnd);
 
-    expect(measuredLink).toContain('<AuthoritativeTransformGroup');
+    expect(driver).toContain('livePresentation.subscribeMeasuredRobotPresentation(apply)');
+    expect(driver.match(/subscribeMeasuredRobotPresentation/g)).toHaveLength(1);
+    expect(driver).toContain('for (const [linkName, target] of linkGroups)');
+    expect(driver).toContain('if (!acceptLatestLivePresentation() && !acceptedLiveFrame.current)');
+    expect(driver).toContain('useFrame(() => {');
+    expect(driver).toContain('}, -1_000);');
+    expect(driver).toContain('continuationTimer.current = window.setTimeout');
+    expect(driver).toContain('}, 1_000 / 60);');
+    expect(measuredLink).not.toContain('<AuthoritativeTransformGroup');
+    expect(measuredLink).toContain('ref={groupRef}');
     expect(measuredLink).toContain('attachedObjects.map((object) => (');
     expect(measuredLink).toContain('<AttachedLogicalSceneObject');
     expect(source).toContain(
-      '(object) => object.carrierCompiledFrameName === link.name',
+      'const current = result.get(object.carrierCompiledFrameName) ?? []',
+    );
+    expect(source).toContain(
+      'attachedObjects={attachedObjectsByLink.get(link.name) ?? []}',
     );
     expect(source).toContain('position={[pose.position_m.x, pose.position_m.y, pose.position_m.z]}');
     expect(source).toContain('quaternion={normalizeQuaternion(pose.orientation_xyzw)}');
-    expect(source).toContain('color="#5fa84a"');
-    expect(source).toContain('opacity={0.85}');
+    expect(source).toContain('appearance="attached"');
+    expect(source).toContain('axesSizeM={objectAxesSizeM}');
+    expect(source).toMatch(
+      /<MeasuredRuntimeModel[\s\S]*?objectAxesSizeM=\{viewer\?\.object_axes_gizmo_size_m \?\? 0\.1\}/,
+    );
+    expect(sceneObjectMaterial('attached', false)).toMatchObject({
+      color: '#5fa84a',
+      opacity: 0.85,
+    });
     expect(source).toContain("object.placement.kind !== 'cell_fixed'");
   });
 
@@ -363,7 +408,7 @@ describe('viewer failure isolation', () => {
     expect(content).toBeGreaterThan(0);
     expect(source.indexOf('<RetainedNeutralModel', content)).toBeLessThan(contentEnd);
     expect(source.indexOf('<LogicalSceneObjects', content)).toBeLessThan(contentEnd);
-    expect(source.indexOf('<MeasuredLogicalSceneObjects', content)).toBeLessThan(contentEnd);
+    expect(source.indexOf('<ObservedLogicalSceneObjects', content)).toBeLessThan(contentEnd);
     expect(source.indexOf('<PointCloudPoints', content)).toBeLessThan(contentEnd);
     expect(source).toContain('viewer-stage viewer-fallback-stage');
     expect(source).not.toContain('<Bounds');
@@ -418,10 +463,12 @@ describe('viewer failure isolation', () => {
 
     expect(viewer).toContain('candidateTcpEditable');
     expect(viewer).toContain('onEditCandidateTcpPose');
-    expect(viewer).toContain("transformMode === 'rotate' ? 'rotate' : 'translate'");
+    expect(viewer).toContain('candidateTcpTransformMode');
+    expect(viewer).toContain('candidateTcpTransformSpace');
     expect(workspace).toContain("robotControl.state.mode === 'pose_goal'");
     expect(workspace).toContain("robotControl.state.mode === 'cartesian_path'");
-    expect(workspace).toContain('onEditCandidatePose={robotControl.editPose}');
+    expect(workspace).toContain('onEditCandidatePose={editCandidatePoseInCell}');
+    expect(workspace).toContain('candidateTcpPoseFromCell(');
   });
 
   it('suspends only viewer observers while retaining outer presentation state', () => {

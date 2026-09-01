@@ -175,6 +175,56 @@ read_verified_bundle_entry(
   return bundle;
 }
 
+[[nodiscard]] std::optional<std::filesystem::path>
+normalize_candidate_package_root(
+    std::optional<std::filesystem::path> candidate_package_root) {
+  if (!candidate_package_root.has_value()) {
+    return std::nullopt;
+  }
+  return posix::normalize_existing_plain_root(
+      *candidate_package_root, kPosixErrors, kTrustedRootMessages);
+}
+
+[[nodiscard]] const std::filesystem::path &select_package_root(
+    const std::filesystem::path &installed_package_root,
+    const std::optional<std::filesystem::path> &candidate_package_root,
+    const core::RetainedBundleId &retained_bundle_id) {
+  const auto hex = detail::retained_digest_hex(retained_bundle_id.value());
+  if (!hex.has_value()) {
+    return installed_package_root;
+  }
+  const auto contains_bundle = [&](const std::filesystem::path &root,
+                                   std::string_view label) {
+    const auto path = root / "retained-bundles" / "sha256" /
+                      (std::string(*hex) + ".json");
+    std::error_code error;
+    const auto status = std::filesystem::symlink_status(path, error);
+    if (error == std::errc::no_such_file_or_directory ||
+        status.type() == std::filesystem::file_type::not_found) {
+      return false;
+    }
+    if (error) {
+      throw std::filesystem::filesystem_error(
+          "cannot inspect " + std::string(label) + " retained bundle", path,
+          error);
+    }
+    return true;
+  };
+
+  // An installed bundle is the authoritative package for its immutable
+  // identity. A writable authored package is consulted only for identities
+  // that do not exist in the installation; a duplicate cache entry must not
+  // shadow an installed bundle with a partial artifact closure.
+  if (contains_bundle(installed_package_root, "installed")) {
+    return installed_package_root;
+  }
+  if (candidate_package_root.has_value() &&
+      contains_bundle(*candidate_package_root, "authored")) {
+    return *candidate_package_root;
+  }
+  return installed_package_root;
+}
+
 [[nodiscard]] std::string read_verified_raw_reference(
     const std::filesystem::path& raw_data,
     const core::ContentAddressedStoreKey& key,
@@ -2291,9 +2341,12 @@ FilesystemVerifiedProgramBindingSource::get_verified(
 
 FilesystemVerifiedRetainedBundleSource::
     FilesystemVerifiedRetainedBundleSource(
-        std::filesystem::path trusted_package_root)
+        std::filesystem::path trusted_package_root,
+        std::optional<std::filesystem::path> candidate_package_root)
     : trusted_package_root_(posix::normalize_existing_plain_root(
-          trusted_package_root, kPosixErrors, kTrustedRootMessages)) {
+          trusted_package_root, kPosixErrors, kTrustedRootMessages)),
+      candidate_package_root_(normalize_candidate_package_root(
+          std::move(candidate_package_root))) {
   (void)require_read_only_retention_paths(trusted_package_root_);
 }
 
@@ -2302,7 +2355,9 @@ FilesystemVerifiedRetainedBundleSource::get_verified(
     const core::RetainedBundleId& retained_bundle_id) const {
   const std::filesystem::path current_root =
       require_unchanged_trusted_root(
-          trusted_package_root_, "read-only retained-bundle");
+          select_package_root(trusted_package_root_, candidate_package_root_,
+                              retained_bundle_id),
+          "read-only retained-bundle");
   const ReadOnlyRetentionPaths paths =
       require_read_only_retention_paths(current_root);
   const auto bundle =
@@ -2317,9 +2372,12 @@ FilesystemVerifiedRetainedBundleSource::get_verified(
 
 FilesystemVerifiedRetainedProductArtifactSource::
     FilesystemVerifiedRetainedProductArtifactSource(
-        std::filesystem::path trusted_package_root)
+        std::filesystem::path trusted_package_root,
+        std::optional<std::filesystem::path> candidate_package_root)
     : trusted_package_root_(posix::normalize_existing_plain_root(
-          trusted_package_root, kPosixErrors, kTrustedRootMessages)) {
+          trusted_package_root, kPosixErrors, kTrustedRootMessages)),
+      candidate_package_root_(normalize_candidate_package_root(
+          std::move(candidate_package_root))) {
   (void)require_read_only_retention_paths(trusted_package_root_);
 }
 
@@ -2383,7 +2441,9 @@ FilesystemVerifiedRetainedProductArtifactSource::get_verified(
     const RetainedProductArtifactQuery& query) const {
   const std::filesystem::path current_root =
       require_unchanged_trusted_root(
-          trusted_package_root_, "read-only retained-product");
+          select_package_root(trusted_package_root_, candidate_package_root_,
+                              query.retained_bundle_id),
+          "read-only retained-product");
   const ReadOnlyRetentionPaths paths =
       require_read_only_retention_paths(current_root);
   const auto bundle =
@@ -2646,9 +2706,12 @@ verify_reference_runtime_unit_product(
 
 FilesystemVerifiedRetainedModelMapSource::
     FilesystemVerifiedRetainedModelMapSource(
-        std::filesystem::path trusted_package_root)
+        std::filesystem::path trusted_package_root,
+        std::optional<std::filesystem::path> candidate_package_root)
     : trusted_package_root_(posix::normalize_existing_plain_root(
-          trusted_package_root, kPosixErrors, kTrustedRootMessages)) {
+          trusted_package_root, kPosixErrors, kTrustedRootMessages)),
+      candidate_package_root_(normalize_candidate_package_root(
+          std::move(candidate_package_root))) {
   (void)require_read_only_retention_paths(trusted_package_root_);
 }
 
@@ -2657,7 +2720,9 @@ FilesystemVerifiedRetainedModelMapSource::get_verified(
     const RetainedModelMapQuery& query) const {
   const std::filesystem::path current_root =
       require_unchanged_trusted_root(
-          trusted_package_root_, "read-only retained model-map");
+          select_package_root(trusted_package_root_, candidate_package_root_,
+                              query.retained_bundle_id),
+          "read-only retained model-map");
   const ReadOnlyRetentionPaths paths =
       require_read_only_retention_paths(current_root);
   const auto bundle = read_verified_bundle_entry(
@@ -2809,9 +2874,12 @@ FilesystemVerifiedRetainedPlanningModelSource::get_verified(
 
 FilesystemVerifiedRetainedViewerModelSource::
     FilesystemVerifiedRetainedViewerModelSource(
-        std::filesystem::path trusted_package_root)
+        std::filesystem::path trusted_package_root,
+        std::optional<std::filesystem::path> candidate_package_root)
     : trusted_package_root_(posix::normalize_existing_plain_root(
-          trusted_package_root, kPosixErrors, kTrustedRootMessages)) {
+          trusted_package_root, kPosixErrors, kTrustedRootMessages)),
+      candidate_package_root_(normalize_candidate_package_root(
+          std::move(candidate_package_root))) {
   (void)require_read_only_retention_paths(trusted_package_root_);
 }
 
@@ -2819,7 +2887,9 @@ std::optional<VerifiedRetainedViewerModel>
 FilesystemVerifiedRetainedViewerModelSource::get_verified(
     const RetainedViewerModelQuery &query) const {
   const std::filesystem::path current_root = require_unchanged_trusted_root(
-      trusted_package_root_, "read-only retained viewer-model");
+      select_package_root(trusted_package_root_, candidate_package_root_,
+                          query.retained_bundle_id),
+      "read-only retained viewer-model");
   const ReadOnlyRetentionPaths paths =
       require_read_only_retention_paths(current_root);
   const auto bundle =

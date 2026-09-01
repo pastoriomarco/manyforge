@@ -21,7 +21,7 @@ TEST(SourceModelProjection, CanonicalEmptyBundleHasAClosedEmptyProjection) {
 
   const auto value = projection.Project(admission.retained_bundle());
   const auto bytes = content_identity::canonical_json(value);
-  EXPECT_NE(bytes.find("\"schema_version\":\"manyforge.source_model_projection.v1\""),
+  EXPECT_NE(bytes.find("\"schema_version\":\"manyforge.source_model_projection.v2\""),
             std::string::npos);
   EXPECT_NE(bytes.find("\"model_map_contract\":null"), std::string::npos);
   EXPECT_NE(bytes.find("\"model_map_product_id\":null"), std::string::npos);
@@ -32,7 +32,7 @@ TEST(SourceModelProjection, CanonicalEmptyBundleHasAClosedEmptyProjection) {
   EXPECT_EQ(bytes.find("control_binding"), std::string::npos);
 }
 
-TEST(SourceModelProjection, RetainedBundleProjectsSourceLocalOccurrenceAndTargetFactsOnly) {
+TEST(SourceModelProjection, RetainedBundleProjectsSourceFactsAndExactViewerBindings) {
   const auto bundle = test::LoadAssistantAuthoringBundle();
   const ActiveSourceModelProjection projection(MANYFORGE_HEADLESS_TEST_ASSISTANT_PACKAGE_ROOT);
 
@@ -49,7 +49,9 @@ TEST(SourceModelProjection, RetainedBundleProjectsSourceLocalOccurrenceAndTarget
   EXPECT_NE(bytes.find("\"mimic\":{\"multiplier\":1,\"offset\":0,"
                        "\"source_joint_name\":\"right_finger_joint\"}"),
             std::string::npos);
-  EXPECT_NE(bytes.find("\"source_link_names\":["), std::string::npos);
+  EXPECT_NE(bytes.find("\"links\":["), std::string::npos);
+  EXPECT_NE(bytes.find("\"viewer_joint_name\":"), std::string::npos);
+  EXPECT_NE(bytes.find("\"viewer_link_name\":"), std::string::npos);
   EXPECT_NE(bytes.find("\"link_base\""), std::string::npos);
   EXPECT_NE(bytes.find("\"source_group_name\":\"lite6\""), std::string::npos);
   EXPECT_NE(bytes.find("\"commandable_source_joint_names\":[\"joint1\",\"joint2\","

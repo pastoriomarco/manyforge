@@ -84,11 +84,72 @@ export interface OperatorAlarmSnapshot {
   truncated: boolean;
 }
 
+export type ComponentOverviewReadiness =
+  | 'ready'
+  | 'waiting'
+  | 'degraded'
+  | 'fault'
+  | 'offline';
+
+export type ComponentOverviewComponentStatus =
+  | 'healthy'
+  | 'waiting'
+  | 'warning'
+  | 'fault'
+  | 'offline';
+
+export interface ComponentOverviewComponent {
+  id: string;
+  label: string;
+  status: ComponentOverviewComponentStatus;
+  detail: string;
+  required: boolean;
+  requiredFor: string[];
+  ownerId: string | null;
+  ownerEpoch: string | null;
+  generation: number | null;
+  reasonCode: string | null;
+  scope: string;
+  contributorIds: string[];
+}
+
+export interface ComponentOverviewProjection {
+  schemaVersion: 'manyforge.component_overview.v1';
+  overviewRevision: string;
+  readiness: ComponentOverviewReadiness;
+  summaryLabel: string;
+  profileLabel: string;
+  authorityLabel: string;
+  userMessage: string;
+  capabilities: string[];
+  components: ComponentOverviewComponent[];
+  basis: {
+    runtimeProjectionOwnerEpoch: string | null;
+    runtimeProjectionGeneration: number | null;
+    managerSourceOwnerEpoch: string | null;
+    logicalSceneSourceOwnerEpoch: string | null;
+    logicalSceneSourceGeneration: number | null;
+    sceneRuntimeSourceOwnerEpoch: string | null;
+    sceneRuntimeSourceGeneration: number | null;
+    alarmOwnerEpoch: string | null;
+    alarmGeneration: number | null;
+    alarmStateRevision: number | null;
+    admissionGeneration: number | null;
+    programRunnerOwnerEpoch: string | null;
+    programCycleGeneration: number | null;
+    appliedProgramOwnerEpoch: string | null;
+    appliedProgramGeneration: number | null;
+    executionOwnerEpoch: string | null;
+    executionPublicationGeneration: number | null;
+  };
+}
+
 export interface ComposerHeadlessState {
-  schemaVersion: 'manyforge.composer_headless_state.v1';
+  schemaVersion: 'manyforge.composer_headless_state.v2';
   complete: true;
   runtime: HeadlessRuntimeSnapshot;
   alarms: OperatorAlarmSnapshot;
+  componentOverview: ComponentOverviewProjection;
   authoringAdmission: {
     authoringAllowed: boolean;
     admissionGeneration: number;

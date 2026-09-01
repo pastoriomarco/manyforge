@@ -195,6 +195,7 @@ function controller(
       selectedScenarioId: null,
       runnerAvailable: true,
       loading: false,
+      observationError: null,
       pending: null,
       controlPending: null,
       error: null,
@@ -385,6 +386,44 @@ describe('Program runtime projection', () => {
     expect(stoppingMarkup).toMatch(
       /class="transport-run"[^>]*disabled=""[^>]*>Running<\/button>/,
     );
+  });
+
+  it('keeps the persistent velocity control available while Run is starting', () => {
+    const starting = controller('succeeded', 'idle_after_reset');
+    starting.state.pending = 'run';
+    const robot = robotController();
+    robot.runtimeScaleStatus = {
+      selector: {
+        programBindingId: `sha256:${'c'.repeat(64)}`,
+        componentRoleId: 'controlled_component',
+        targetRoleId: 'command_target',
+      },
+      controlGeneration: 2,
+      requestedScale: 0.5,
+      supported: true,
+      frozen: false,
+      controlDomainId: 'domain-1',
+      controlDomainRevision: `sha256:${'d'.repeat(64)}`,
+      controlBindingId: 'binding-1',
+      controlBindingRevision: `sha256:${'e'.repeat(64)}`,
+      scalingDomainId: 'scaling-1',
+      activeControlConfigurationId: 'active-1',
+      activeControlConfigurationGeneration: 1,
+      activeOperationId: null,
+      activeOperationRevision: null,
+      activeOperationScaleGeneration: null,
+      effectiveScale: null,
+      applicationState: null,
+      reason: null,
+    };
+    robot.runtimeScaleDraft = 0.5;
+
+    const markup = renderToStaticMarkup(
+      <ProgramTransportControls enabled program={starting} robot={robot} />,
+    );
+
+    expect(markup).toMatch(/type="range"[^>]*value="0.5"/);
+    expect(markup).not.toMatch(/type="range"[^>]*disabled=/);
   });
 
   it('keeps fixed transport geometry and lets the Full Stop menu escape the bar', () => {

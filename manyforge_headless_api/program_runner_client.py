@@ -33,6 +33,10 @@ class ProgramRunnerClientError(RuntimeError):
 
 
 class ProgramRunnerPort(Protocol):
+    def node_availability(
+        self, body: Mapping[str, Any]
+    ) -> dict[str, Any]: ...
+
     def runs(self, *, active_only: bool, limit: int) -> dict[str, Any]: ...
 
     def start_run(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
@@ -225,6 +229,9 @@ class ProgramRunnerHttpClient:
                 ("limit", limit),
             ),
         )
+
+    def node_availability(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return self._request("POST", "/api/program/node-availability", body=body)
 
     def start_run(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self._request("POST", "/api/program/runs", body=body)

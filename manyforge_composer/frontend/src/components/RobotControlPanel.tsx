@@ -6,6 +6,7 @@ import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
 import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
 import {
   isCapabilityCommandReceipt,
+  operationStateIsTerminal,
   quaternionFromRpyDegrees,
   robotControlHasActiveOperation,
   rpyDegreesFromQuaternion,
@@ -16,9 +17,14 @@ import type {
 } from '../state/robotControl';
 import type { Pose3Value } from '../types/robotControl';
 import type { ProgramTreeNode } from '../types/api';
-import { computeCartesianMoveDraft } from '../utils/moveTo';
+import {
+  boundProgramTargetRoleIds,
+  canonicalProgramPose,
+  computeCartesianMoveDraft,
+  resolveStoredProgramPose,
+} from '../utils/moveTo';
 import type { CartesianMoveDraftOptions } from '../utils/moveTo';
-import type { PoseTuple } from '../utils/poseTransforms';
+import { relativePose, type PoseTuple } from '../utils/poseTransforms';
 import { flattenProgramForest } from '../utils/programAuthoring';
 import { DraftTextInput } from './common/DraftInputs';
 
@@ -51,6 +57,7 @@ function phaseLabel(phase: RobotControlPhase): string {
     case 'approving': return 'Submitting';
     case 'executing': return 'Executing';
     case 'stopping': return 'Stopping';
+    case 'settling': return 'Settling';
     case 'completed': return 'Completed';
     case 'stopped': return 'Stopped';
     case 'failed': return 'Failed';
@@ -62,20 +69,31 @@ function phaseLabel(phase: RobotControlPhase): string {
 
 const MODE_LABELS: Array<[RobotControlMode, string]> = [
   ['joint', 'Joint'],
-  ['pose_goal', 'Pose'],
+  ['pose_goal', 'Pose plan'],
   ['move_to', 'Move To'],
-  ['cartesian_path', 'Cartesian'],
+  ['cartesian_path', 'Cartesian path'],
   ['gripper', 'Gripper'],
+];
+
+const MOVE_SOURCE_GROUPS: Array<[MoveToSource['group'], string]> = [
+  ['current', 'Current state'],
+  ['object', 'Objects'],
+  ['frame', 'Frames'],
+  ['stored', 'Stored moves'],
 ];
 
 interface MoveToSource {
   id: string;
   label: string;
   kind: 'pose' | 'joint';
+  group: 'current' | 'object' | 'frame' | 'stored';
   pose?: PoseTuple;
   positionsRad?: number[];
   node?: ProgramTreeNode;
 }
+
+export type RobotTcpTransformMode = 'translate' | 'rotate';
+export type RobotTcpTransformSpace = 'local' | 'world';
 
 function observedPose(pose: Pose3Value): PoseTuple {
   return {
@@ -89,33 +107,15 @@ function observedPose(pose: Pose3Value): PoseTuple {
   };
 }
 
-function poseValue(value: unknown): PoseTuple | null {
+function cellPoseValue(value: unknown): PoseTuple | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const pose = value as Record<string, unknown>;
   const frame = pose.frame_ref;
-  const position = pose.position_m;
-  const orientation = pose.orientation;
   if (
     !frame || typeof frame !== 'object' || Array.isArray(frame)
     || (frame as Record<string, unknown>).kind !== 'cell_frame'
-    || !Array.isArray(position) || position.length !== 3
-    || !orientation || typeof orientation !== 'object' || Array.isArray(orientation)
   ) return null;
-  const orientationRecord = orientation as Record<string, unknown>;
-  let quaternion: [number, number, number, number] | null = null;
-  if (Array.isArray(orientationRecord.xyzw) && orientationRecord.xyzw.length === 4) {
-    quaternion = orientationRecord.xyzw.map(Number) as [number, number, number, number];
-  } else if (Array.isArray(orientationRecord.rpy_deg) && orientationRecord.rpy_deg.length === 3) {
-    const rpy = orientationRecord.rpy_deg.map(Number);
-    const converted = quaternionFromRpyDegrees(rpy[0] ?? 0, rpy[1] ?? 0, rpy[2] ?? 0);
-    quaternion = [converted.x, converted.y, converted.z, converted.w];
-  }
-  const numericPosition = position.map(Number) as [number, number, number];
-  return quaternion !== null
-    && numericPosition.every(Number.isFinite)
-    && quaternion.every(Number.isFinite)
-    ? { position: numericPosition, quaternion }
-    : null;
+  return canonicalProgramPose(value);
 }
 
 function poseTarget(tuple: PoseTuple): Pose3Value {
@@ -164,6 +164,13 @@ function RobotNumberInput({
   onCommit: (value: number) => void;
   pending?: boolean;
 }) {
+  const displayValue = value === null
+    ? null
+    : value === 0
+      ? '0'
+      : Math.abs(value) < 1e-4 || Math.abs(value) >= 1e5
+        ? value.toExponential(6).replace(/\.0+(?=e)/, '').replace(/(\.\d*?)0+(?=e)/, '$1')
+        : value.toPrecision(9).replace(/\.0+$/, '').replace(/(\.\d*?)0+$/, '$1');
   return (
     <DraftTextInput
       aria-label={label}
@@ -173,7 +180,8 @@ function RobotNumberInput({
       step={step}
       shiftStepMultiplier={10}
       commitNativeStep
-      value={value}
+      value={displayValue}
+      title={value === null ? undefined : `Exact value: ${String(value)}`}
       disabled={disabled}
       className={pending ? 'robot-control-target-pending' : undefined}
       dirtyClassName="robot-control-target-pending"
@@ -227,16 +235,29 @@ export function RobotControlPanelView({
   controller,
   program,
   draft,
+  tcpTransformMode = 'translate',
+  tcpTransformSpace = 'world',
+  sourceFrameNames = {},
+  controlBasePoseInCell = null,
+  onTcpTransformModeChange = () => undefined,
+  onTcpTransformSpaceChange = () => undefined,
 }: {
   enabled: boolean;
   controller: RobotControlController;
   program?: ProgramRuntimeController;
   draft?: ProgramWorkspaceController;
+  tcpTransformMode?: RobotTcpTransformMode;
+  tcpTransformSpace?: RobotTcpTransformSpace;
+  sourceFrameNames?: Readonly<Record<string, string>>;
+  controlBasePoseInCell?: PoseTuple | null;
+  onTcpTransformModeChange?: (mode: RobotTcpTransformMode) => void;
+  onTcpTransformSpaceChange?: (space: RobotTcpTransformSpace) => void;
 }) {
   const [angularStepDeg, setAngularStepDeg] = useState(5);
   const [linearStepM, setLinearStepM] = useState(0.01);
   const [coordinateStep, setCoordinateStep] = useState(0.01);
   const [moveSourceId, setMoveSourceId] = useState('');
+  const [storedMoveId, setStoredMoveId] = useState('');
   const [moveOptions, setMoveOptions] = useState<CartesianMoveDraftOptions>({
     orientationMode: 'keep-current',
     offsetXyzM: [0, 0, 0],
@@ -252,6 +273,10 @@ export function RobotControlPanelView({
     approve,
     revert,
     stop,
+    controlPending,
+    pause,
+    resume,
+    reset,
     retry,
   } = controller;
   const status = state.status;
@@ -271,6 +296,7 @@ export function RobotControlPanelView({
     === 'override:stage-observation';
   const rpy = rpyDegreesFromQuaternion(state.draftPose.orientation);
   const authoring = draft?.state.workspace?.draft.authoring ?? null;
+  const appliedBinding = program?.state.applied?.programBinding ?? null;
   const moveSources = useMemo<MoveToSource[]>(() => {
     if (status === null) return [];
     const planningCapabilities = status.directControl.targetDescriptor.contracts
@@ -278,37 +304,87 @@ export function RobotControlPanelView({
     const poseAvailable = planningCapabilities.includes('planning.motion.pose_goal');
     const jointAvailable = planningCapabilities.includes('planning.motion.joint_goal');
     const sources: MoveToSource[] = [];
-    if (poseAvailable) {
-      sources.push({
-        id: 'observed:tcp',
-        label: `Current ${status.directControl.targetRoleId} TCP`,
-        kind: 'pose',
-        pose: observedPose(status.observedMotion.currentTcpPose),
-      });
+    const boundTargetRoles = new Set(boundProgramTargetRoleIds(
+      appliedBinding,
+      status.directControl.controllableComponentId,
+      status.directControl.commandTargetId,
+    ));
+    const frameRolePoses = new Map<string, PoseTuple>([
+      [status.directControl.baseFrameRoleId, {
+        position: [0, 0, 0],
+        quaternion: [0, 0, 0, 1],
+      }],
+      [status.directControl.tcpFrameRoleId, observedPose(
+        status.observedMotion.currentTcpPose,
+      )],
+    ]);
+    const sceneResourcePoses = new Map<string, PoseTuple>();
+    if (controlBasePoseInCell !== null) {
       for (const resource of authoring?.scene ?? []) {
-        const pose = poseValue(resource.pose);
-        if (pose !== null) {
-          sources.push({
-            id: `scene:${resource.scene_resource_id}`,
-            label: `Object · ${resource.scene_resource_id}`,
-            kind: 'pose',
-            pose,
-          });
+        const cellPose = cellPoseValue(resource.pose);
+        if (cellPose !== null) {
+          sceneResourcePoses.set(
+            resource.scene_resource_id,
+            relativePose(cellPose, controlBasePoseInCell),
+          );
         }
       }
     }
-    for (const { node } of flattenProgramForest(authoring?.forest ?? [])) {
-      if (node.parameters.target_role !== status.directControl.targetRoleId) {
-        continue;
-      }
-      if (poseAvailable && node.node_id === 'motion.move_to_pose') {
-        const pose = poseValue(node.parameters.goal);
+    if (poseAvailable) {
+      sources.push({
+        id: 'observed:tcp',
+        label: `Current ${status.directControl.commandTargetId} TCP`,
+        kind: 'pose',
+        group: 'current',
+        pose: observedPose(status.observedMotion.currentTcpPose),
+      });
+      for (const frame of status.directControl.targetDescriptor.frames) {
+        const pose = frame.frameRoleId === status.directControl.baseFrameRoleId
+          ? {
+              position: [0, 0, 0] as [number, number, number],
+              quaternion: [0, 0, 0, 1] as [number, number, number, number],
+            }
+          : frame.frameRoleId === status.directControl.tcpFrameRoleId
+            ? observedPose(status.observedMotion.currentTcpPose)
+            : null;
         if (pose !== null) sources.push({
-          id: `node:${node.instance_id}`,
-          label: `Stored pose · ${node.instance_id}`,
+          id: `frame:${frame.frameRoleId}`,
+          label: `Frame · ${frame.frameRoleId} · ${
+            sourceFrameNames[frame.compiledFrameName] ?? 'source name unavailable'
+          }`,
           kind: 'pose',
+          group: 'frame',
           pose,
-          node,
+        });
+      }
+      for (const [sceneResourceId, pose] of sceneResourcePoses) {
+        sources.push({
+          id: `scene:${sceneResourceId}`,
+          label: `Object · ${sceneResourceId}`,
+          kind: 'pose',
+          group: 'object',
+          pose,
+        });
+      }
+    }
+    for (const { node } of flattenProgramForest(authoring?.forest ?? [])) {
+      const programTargetRole = node.parameters.target_role;
+      if (typeof programTargetRole !== 'string'
+        || !boundTargetRoles.has(programTargetRole)) continue;
+      if (poseAvailable && node.node_id === 'motion.move_to_pose') {
+        const pose = resolveStoredProgramPose(node.parameters, {
+          programTargetRoleId: programTargetRole,
+          baseFrameRoleId: status.directControl.baseFrameRoleId,
+          sceneResourcePoses,
+          frameRolePoses,
+        });
+        if (pose !== null) sources.push({
+            id: `node:${node.instance_id}`,
+            label: `Stored pose · ${node.instance_id}`,
+            kind: 'pose',
+            group: 'stored',
+            pose,
+            node,
         });
       } else if (jointAvailable && node.node_id === 'motion.move_to_joint_target') {
         const goal = node.parameters.goal;
@@ -346,6 +422,7 @@ export function RobotControlPanelView({
             id: `node:${node.instance_id}`,
             label: `Stored joints · ${node.instance_id}`,
             kind: 'joint',
+            group: 'stored',
             positionsRad: positions,
             node,
           });
@@ -353,7 +430,25 @@ export function RobotControlPanelView({
       }
     }
     return sources;
-  }, [authoring, status]);
+  }, [
+    appliedBinding,
+    authoring,
+    controlBasePoseInCell,
+    sourceFrameNames,
+    status,
+  ]);
+
+  const eligibleStoredMoves = useMemo(() => moveSources.filter((source) => (
+    source.node !== undefined
+    && (state.mode === 'joint'
+      ? source.kind === 'joint'
+      : state.mode === 'pose_goal' || state.mode === 'cartesian_path'
+        ? source.kind === 'pose'
+        : false)
+  )), [moveSources, state.mode]);
+  const selectedStoredMove = eligibleStoredMoves.find(
+    (source) => source.id === storedMoveId,
+  );
 
   const applyMoveSource = (
     sourceId: string,
@@ -375,6 +470,14 @@ export function RobotControlPanelView({
     editPose(poseTarget(target));
   };
   const selectedMoveSource = moveSources.find((row) => row.id === moveSourceId);
+
+  const saveObservedIntoStoredMove = () => {
+    if (selectedStoredMove?.node === undefined) return;
+    void draft?.mutate('program_draft_store_observed_move', {
+      instance_id: selectedStoredMove.node.instance_id,
+      observed_kind: selectedStoredMove.kind === 'joint' ? 'joint' : 'tcp_pose',
+    });
+  };
 
   const modeAvailable = (mode: RobotControlMode): boolean => {
     if (status === null || mode === 'gripper') return status !== null;
@@ -527,6 +630,51 @@ export function RobotControlPanelView({
                 onChange={setCoordinateStep}
               />
             )}
+            {(state.mode === 'pose_goal' || state.mode === 'cartesian_path') && (
+              <div className="robot-control-tcp-tools" aria-label="TCP transform controls">
+                <label>
+                  <span>Frame</span>
+                  <select
+                    aria-label="TCP target frame"
+                    value={status.directControl.baseFrameRoleId}
+                    disabled
+                    title="The current direct-control contract permits this logical base frame."
+                  >
+                    <option value={status.directControl.baseFrameRoleId}>
+                      {status.directControl.baseFrameRoleId}
+                    </option>
+                  </select>
+                </label>
+                <span className="robot-control-segment" role="group" aria-label="TCP gizmo mode">
+                  <button
+                    type="button"
+                    aria-pressed={tcpTransformMode === 'translate'}
+                    disabled={active}
+                    onClick={() => onTcpTransformModeChange('translate')}
+                  >Translate</button>
+                  <button
+                    type="button"
+                    aria-pressed={tcpTransformMode === 'rotate'}
+                    disabled={active}
+                    onClick={() => onTcpTransformModeChange('rotate')}
+                  >Rotate</button>
+                </span>
+                <span className="robot-control-segment" role="group" aria-label="TCP gizmo coordinates">
+                  <button
+                    type="button"
+                    aria-pressed={tcpTransformSpace === 'local'}
+                    disabled={active}
+                    onClick={() => onTcpTransformSpaceChange('local')}
+                  >Local</button>
+                  <button
+                    type="button"
+                    aria-pressed={tcpTransformSpace === 'world'}
+                    disabled={active}
+                    onClick={() => onTcpTransformSpaceChange('world')}
+                  >World</button>
+                </span>
+              </div>
+            )}
           </div>
 
           <div className="robot-control-body">
@@ -552,6 +700,9 @@ export function RobotControlPanelView({
                             {formatDegrees(joint.minPositionRad)}° to{' '}
                             {formatDegrees(joint.maxPositionRad)}° · max{' '}
                             {formatDegrees(joint.maxVelocityRadS)}°/s
+                            {joint.maxAccelerationRadS2 === null
+                              ? ' · acceleration not declared'
+                              : ` · ${formatDegrees(joint.maxAccelerationRadS2)}°/s²`}
                           </span>
                         </span>
                         <span className="robot-control-joint-inputs">
@@ -609,9 +760,16 @@ export function RobotControlPanelView({
                           }}
                         >
                           <option value="">Choose a source</option>
-                          {moveSources.map((source) => (
-                            <option key={source.id} value={source.id}>{source.label}</option>
-                          ))}
+                          {MOVE_SOURCE_GROUPS.map(([group, label]) => {
+                            const rows = moveSources.filter((source) => source.group === group);
+                            return rows.length === 0 ? null : (
+                              <optgroup key={group} label={label}>
+                                {rows.map((source) => (
+                                  <option key={source.id} value={source.id}>{source.label}</option>
+                                ))}
+                              </optgroup>
+                            );
+                          })}
                         </select>
                       </label>
                       {selectedMoveSource?.kind !== 'joint' && (
@@ -727,10 +885,17 @@ export function RobotControlPanelView({
                     </label>
                   ))}
                   <p className="robot-control-limits robot-control-pose-note">
-                    Absolute TCP target in logical{' '}
-                    <code>{status.directControl.targetDescriptor.frames.find(
-                      (frame) => frame.frameRoleId === status.directControl.baseFrameRoleId,
-                    )?.compiledFrameName ?? status.directControl.baseFrameRoleId}</code>.{' '}
+                    Absolute TCP target in{' '}
+                    <code>{(() => {
+                      const base = status.directControl.targetDescriptor.frames.find(
+                        (frame) => frame.frameRoleId === status.directControl.baseFrameRoleId,
+                      );
+                      return base === undefined
+                        ? status.directControl.baseFrameRoleId
+                        : `${base.frameRoleId} · ${
+                            sourceFrameNames[base.compiledFrameName] ?? 'source name unavailable'
+                          }`;
+                    })()}</code>.{' '}
                     {state.mode === 'cartesian_path'
                       ? 'The current owner-issued TCP pose is the explicit first waypoint.'
                       : state.mode === 'move_to'
@@ -743,6 +908,37 @@ export function RobotControlPanelView({
 
               {state.mode === 'gripper' && (
                 <div className="robot-control-gripper-editor">
+                <dl className="robot-control-gripper-facts">
+                  <div>
+                    <dt>State authority</dt>
+                    <dd>
+                      {status.observedGripper === null
+                        ? 'No current gripper observation'
+                        : `${status.observedGripper.sourceEpoch} · ${status.observedGripper.complete ? 'complete' : 'partial'}`}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Command</dt>
+                    <dd>{status.directControlGripper.operationCapabilityId}</dd>
+                  </div>
+                  <div>
+                    <dt>Transport</dt>
+                    <dd>
+                      {status.directControlGripper.targetDescriptor.contracts.controlPath
+                        ?.controlInterfaceContractId ?? 'provider-owned capability command'}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Completion / grasp</dt>
+                    <dd>
+                      owner-observed coordinate settlement · grasp confirmation{' '}
+                      {status.directControlGripper.targetDescriptor.contracts.supportingProviders
+                        .some((provider) => provider.capabilityId.includes('grasp'))
+                        ? 'offered'
+                        : 'not offered'}
+                    </dd>
+                  </div>
+                </dl>
                 {status.directControlGripper.targetDescriptor.namedPresets.length > 0 && (
                   <label className="robot-control-preset">
                     <span>Named preset</span>
@@ -811,7 +1007,70 @@ export function RobotControlPanelView({
                     </span>
                   </span>
                 </label>
+                {status.directControlGripper.targetDescriptor.mimicFollowers.length > 0 && (
+                  <details className="robot-control-mimic">
+                    <summary>
+                      {status.directControlGripper.targetDescriptor.mimicFollowers.length}{' '}
+                      mimic follower{status.directControlGripper.targetDescriptor.mimicFollowers.length === 1 ? '' : 's'}
+                    </summary>
+                    <ul>
+                      {status.directControlGripper.targetDescriptor.mimicFollowers.map((follower) => (
+                        <li key={follower.compiledCoordinateName}>
+                          <code>{follower.sourceCoordinateName}</code>{' '}
+                          = master × {follower.multiplier} + {follower.offset}
+                        </li>
+                      ))}
+                    </ul>
+                  </details>
+                )}
                 </div>
+              )}
+
+              {(state.mode === 'joint'
+                || state.mode === 'pose_goal'
+                || state.mode === 'cartesian_path') && (
+                <fieldset className="robot-control-stored-move">
+                  <legend>Apply observed state to a stored move</legend>
+                  <label>
+                    <span>Eligible Program Draft move</span>
+                    <select
+                      value={selectedStoredMove === undefined ? '' : storedMoveId}
+                      disabled={active || eligibleStoredMoves.length === 0}
+                      onChange={(event) => setStoredMoveId(event.currentTarget.value)}
+                    >
+                      <option value="">Choose a stored move</option>
+                      {eligibleStoredMoves.map((source) => (
+                        <option key={source.id} value={source.id}>{source.label}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <div className="robot-control-stored-actions">
+                    <button
+                      type="button"
+                      disabled={
+                        overrideCandidate?.available !== true
+                        || program?.state.controlPending !== null
+                      }
+                      title={overrideCandidate?.reason
+                        ?? 'Stage the exact source-owned observation for the held Program attempt.'}
+                      onClick={() => program?.stageObservationOverride()}
+                    >
+                      {overridePending ? 'Staging' : 'Stage as runtime override'}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={
+                        active
+                        || !draft?.mutationAvailable
+                        || selectedStoredMove?.node === undefined
+                      }
+                      title="Save the exact source-owned current joints or TCP pose into this Program Draft move."
+                      onClick={saveObservedIntoStoredMove}
+                    >
+                      Save to Program Draft
+                    </button>
+                  </div>
+                </fieldset>
               )}
             </div>
 
@@ -889,6 +1148,35 @@ export function RobotControlPanelView({
                     {state.operation.state} ·{' '}
                     {Math.round(state.operation.progress * 100)}%
                   </span>
+                  <div className="robot-control-operation-actions">
+                    <button
+                      type="button"
+                      disabled={state.operation.state !== 'executing' || controlPending !== null}
+                      onClick={() => { void pause(); }}
+                    >
+                      {controlPending === 'pause' ? 'Pausing' : 'Pause'}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={state.operation.state !== 'paused' || controlPending !== null}
+                      onClick={() => { void resume(); }}
+                    >
+                      {controlPending === 'resume' ? 'Resuming' : 'Resume'}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={
+                        !state.operation.resident
+                        || !operationStateIsTerminal(state.operation.state)
+                        || state.phase === 'settling'
+                        || controlPending !== null
+                      }
+                      title="Release this exact terminal direct operation after the owner has certified containment."
+                      onClick={() => { void reset(); }}
+                    >
+                      {controlPending === 'reset' ? 'Resetting' : 'Reset operation'}
+                    </button>
+                  </div>
                 </div>
               )}
 
@@ -903,22 +1191,6 @@ export function RobotControlPanelView({
             data-testid="robot-control-candidate-footer"
           >
             <div className="robot-control-actions">
-              <button
-                type="button"
-                disabled={
-                  overrideCandidate?.available !== true
-                  || program?.state.controlPending !== null
-                }
-                title={
-                  overrideCandidate?.available === true
-                    ? 'Stage this exact owner-observed Robot snapshot for the held Program attempt.'
-                    : overrideCandidate?.reason
-                      ?? 'No exact held Program attempt and Robot observation are available.'
-                }
-                onClick={() => program?.stageObservationOverride()}
-              >
-                {overridePending ? 'Staging…' : 'Stage snapshot'}
-              </button>
               <button
                 className="approve-button"
                 type="button"

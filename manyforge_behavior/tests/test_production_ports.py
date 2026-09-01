@@ -154,14 +154,6 @@ class _Transport:
             },
         }
 
-    def set_runtime_scale(
-        self, operation_id: str, body: Mapping[str, Any]
-    ):
-        return self._control("scale", operation_id, body)
-
-    def get_runtime_scale(self, operation_id: str):
-        return {"ok": True, "runtime_scale": {"operation_id": operation_id}}
-
 
 def _context() -> ProgramRunPortContext:
     return ProgramRunPortContext(
@@ -1396,16 +1388,16 @@ def test_scene_initialization_adds_pick_resources_last() -> None:
 
     assert [request["operation"]["kind"] for request in transport.submissions] == [
         "detach_carried_object_at_current_pose",
-        "remove_object",
-        "remove_object",
         "add_object",
         "add_object",
+        "remove_object",
+        "remove_object",
     ]
     assert [
         request["operation"].get("scene_resource_id")
         for request in transport.submissions[1:]
-    ] == ["old-part", "old-support", "table", "graspable"]
-    table = transport.submissions[-2]["operation"]
+    ] == ["table", "graspable", "old-part", "old-support"]
+    table = transport.submissions[1]["operation"]
     assert table["frame_ref"] == {
         "kind": "component_frame",
         "controllable_component_id": "robot.1",
@@ -1438,7 +1430,7 @@ def test_scene_initialization_forwards_authored_support_contact_policy() -> None
     add_operations = [
         request["operation"]
         for request in transport.submissions
-        if request["operation"]["kind"] == "add_object"
+        if request["operation"]["kind"] in {"add_object", "upsert_object"}
     ]
     assert [operation["scene_resource_id"] for operation in add_operations] == [
         "table",
@@ -1488,6 +1480,74 @@ def test_scene_initialization_retries_concurrent_pose_revision_without_losing_sh
         transport.rejected_requests[0]["request_context"]["request_id"]
         != transport.submissions[0]["request_context"]["request_id"]
     )
+
+
+def test_scene_initialization_retries_no_effect_admission_race_with_new_identity(
+) -> None:
+    class _AdmissionNotReady(RuntimeError):
+        code = "authoring_not_ready"
+
+    class _AdmissionRaceTransport(_SceneTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.rejected_requests: list[dict[str, Any]] = []
+
+        def commit_scene_transaction(
+            self, body: Mapping[str, Any]
+        ) -> dict[str, Any]:
+            if not self.rejected_requests:
+                self.rejected_requests.append(deepcopy(dict(body)))
+                self.admission_generation += 1
+                raise _AdmissionNotReady("Idle admission projection advanced")
+            return super().commit_scene_transaction(body)
+
+    transport = _AdmissionRaceTransport()
+    port = HeadlessSceneProgramPort(transport)
+
+    port.prepare_initial_scene(_scene_context(), [_authored_scene()[0]])
+
+    assert len(transport.rejected_requests) == 1
+    assert len(transport.submissions) == 1
+    rejected = transport.rejected_requests[0]
+    committed = transport.submissions[0]
+    assert rejected["expected_admission_generation"] == 1
+    assert committed["expected_admission_generation"] == 2
+    assert (
+        rejected["request_context"]["request_id"]
+        != committed["request_context"]["request_id"]
+    )
+
+
+def test_scene_initialization_upserts_only_the_changed_authored_object() -> None:
+    transport = _SceneTransport()
+    scene = [_authored_scene()[0]]
+    port = HeadlessSceneProgramPort(transport)
+    port.prepare_initial_scene(_scene_context(), scene)
+    transport.submissions.clear()
+    transport.objects["graspable"]["placement"]["pose_in_cell"]["position_m"] = {
+        "x_m": 0.8,
+        "y_m": 0.1,
+        "z_m": 0.4,
+    }
+    revision_id = transport.revision["scene_revision"]["revision_id"] + 1
+    transport.revision["scene_revision"] = {
+        "scene_id": _DIGEST_D,
+        "revision_id": revision_id,
+        "content_hash": "sha256:" + f"{revision_id:064x}"[-64:],
+    }
+
+    port.prepare_initial_scene(_scene_context(), scene)
+
+    assert len(transport.submissions) == 1
+    assert transport.submissions[0]["operation"]["kind"] == "upsert_object"
+    assert (
+        transport.submissions[0]["operation"]["scene_resource_id"]
+        == "graspable"
+    )
+    assert transport.objects["graspable"]["placement"]["pose_in_cell"] == {
+        "position_m": {"x_m": 0.3, "y_m": 0.0, "z_m": 0.2},
+        "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+    }
 
 
 def test_exact_cell_frame_initial_scene_is_a_read_only_fast_path() -> None:

@@ -12,6 +12,7 @@ from manyforge_behavior.kernel_client import (
     KernelClient,
     KernelClientResponseError,
     KernelOperationObservationUnavailableError,
+    KernelOperationSettlementPendingError,
     LegacyKernelMockUnavailableError,
     MockKernelClient,
 )
@@ -91,15 +92,6 @@ class FakeTransport:
         operation_id = body["operations"][0]["operation_id"]
         return self._control("stop", operation_id, body)
 
-    def set_runtime_scale(self, operation_id, body):
-        return self._control("runtime_scale", operation_id, body)
-
-    def get_runtime_scale(self, operation_id):
-        return {
-            "ok": True,
-            "runtime_scale": {"operation_id": operation_id, "effective_scale": 1.0},
-        }
-
 
 def test_execution_state_vocabulary_is_the_native_owner_vocabulary() -> None:
     assert {state.value for state in ExecutionState} == {
@@ -169,16 +161,7 @@ def test_kernel_client_only_forwards_bounded_headless_operations() -> None:
         "operations": [{"operation_id": "operation-1"}],
     }
     assert client.stop(stop_request)["accepted"]["operation_id"] == "operation-1"
-    assert client.set_runtime_scale("operation-1", request)["accepted"][
-        "operation_id"
-    ] == "operation-1"
-    assert client.runtime_scale("operation-1")["runtime_scale"][
-        "effective_scale"
-    ] == 1.0
-    assert transport.controls == [
-        ("stop", "operation-1", stop_request),
-        ("runtime_scale", "operation-1", request),
-    ]
+    assert transport.controls == [("stop", "operation-1", stop_request)]
 
 
 def test_malformed_success_and_legacy_stateful_mock_fail_closed() -> None:
@@ -210,3 +193,28 @@ def test_only_exact_operation_owner_unavailability_is_typed_for_retry() -> None:
 
     with pytest.raises(KernelClientResponseError):
         KernelClient(MalformedObservationTransport()).operation("operation-1")
+
+
+def test_only_exact_in_flight_effect_is_typed_as_settlement_pending() -> None:
+    class EffectInFlightError(RuntimeError):
+        code = "invalid_state_transition"
+        details = {"reason": "operation_effect_in_flight"}
+
+    class SettlingTransport(FakeTransport):
+        def acknowledge_completed(self, operation_id, body):
+            raise EffectInFlightError("subordinate effect is still settling")
+
+    client = KernelClient(SettlingTransport())
+    with pytest.raises(KernelOperationSettlementPendingError):
+        client.acknowledge_completed(
+            "operation-1", {"expected_operation_revision": 2}
+        )
+
+    class RejectedTransport(FakeTransport):
+        def acknowledge_completed(self, operation_id, body):
+            raise RuntimeError("permanent rejection")
+
+    with pytest.raises(RuntimeError, match="permanent rejection"):
+        KernelClient(RejectedTransport()).acknowledge_completed(
+            "operation-1", {"expected_operation_revision": 2}
+        )

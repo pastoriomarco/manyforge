@@ -151,8 +151,9 @@ provider_contract_role_id(const CanonicalValue &declaration) {
   });
 }
 
-[[nodiscard]] inline CanonicalValue native_execution_configuration() {
-  return CanonicalValue(CanonicalValue::Object{
+[[nodiscard]] inline CanonicalValue native_execution_configuration(
+    std::string_view controllable_component_id, bool include_gripper) {
+  CanonicalValue::Object configuration{
       {"mode", CanonicalValue("simulated")},
       {"planner_rng_seed", CanonicalValue(12345.0)},
       {"initial_joint_positions_rad", CanonicalValue(CanonicalValue::Array{
@@ -165,7 +166,58 @@ provider_contract_role_id(const CanonicalValue &declaration) {
                                       })},
       {"execution_tick_hz", CanonicalValue(100.0)},
       {"collision_monitor_period_ms", CanonicalValue(50.0)},
-  });
+      {"direct_control_joint_limits",
+       CanonicalValue(CanonicalValue::Array{CanonicalValue(
+           CanonicalValue::Object{
+               {"controllable_component_id",
+                CanonicalValue(std::string(controllable_component_id))},
+               {"command_target_id",
+                CanonicalValue(std::string(kLite6ArmTargetId))},
+               {"source_joint_name", CanonicalValue("joint1")},
+               {"max_velocity_rad_s", CanonicalValue(1.5)},
+               {"max_acceleration_rad_s2", CanonicalValue(2.5)},
+               {"max_jerk_rad_s3", CanonicalValue(10.0)},
+           })})},
+      {"motion_target_limits",
+       CanonicalValue(CanonicalValue::Array{CanonicalValue(
+           CanonicalValue::Object{
+               {"controllable_component_id",
+                CanonicalValue(std::string(controllable_component_id))},
+               {"command_target_id",
+                CanonicalValue(std::string(kLite6ArmTargetId))},
+               {"maximum_tcp_linear_speed_mps", CanonicalValue(0.15)},
+           })})},
+  };
+  if (include_gripper) {
+    configuration.emplace_back(
+        "gripper_target_configurations",
+        CanonicalValue(CanonicalValue::Array{CanonicalValue(
+            CanonicalValue::Object{
+                {"actuation_kind", CanonicalValue("position_commanded")},
+                {"attach_frame", CanonicalValue("link_tcp")},
+                {"auxiliary_frames",
+                 CanonicalValue(CanonicalValue::Array{
+                     CanonicalValue("lite_gripper_base_link")})},
+                {"closed_state_ref", CanonicalValue("closed")},
+                {"command_duration_s", CanonicalValue(0.8)},
+                {"command_target_id",
+                 CanonicalValue(std::string(kLite6GripperTargetId))},
+                {"controllable_component_id",
+                 CanonicalValue(std::string(controllable_component_id))},
+                {"description",
+                 CanonicalValue(
+                     "Native simulated UFACTORY lite pneumatic gripper.")},
+                {"mount_frame", CanonicalValue("link_eef")},
+                {"open_state_ref", CanonicalValue("open")},
+                {"tcp_frame", CanonicalValue("link_tcp")},
+                {"touch_links",
+                 CanonicalValue(CanonicalValue::Array{
+                     CanonicalValue("lite_gripper_base_link"),
+                     CanonicalValue("lite_gripper_left_finger"),
+                     CanonicalValue("lite_gripper_right_finger")})},
+            })}));
+  }
+  return CanonicalValue(std::move(configuration));
 }
 
 [[nodiscard]] inline CanonicalValue ros2_control_execution_configuration() {
@@ -1976,7 +2028,8 @@ make_graph(const Lite6StructuralRetentionFixture &structural,
          CanonicalValue(CanonicalValue::Array{})},
         {"configuration", ros2_control_execution
                               ? ros2_control_execution_configuration()
-                              : native_execution_configuration()},
+                              : native_execution_configuration(component_id,
+                                                               aggregate)},
     });
     components.emplace_back(CanonicalValue::Object{
         {"controllable_component_id", CanonicalValue(component_id)},

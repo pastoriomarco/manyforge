@@ -66,13 +66,95 @@ def _document() -> dict[str, Any]:
     }
 
 
+def _focused_document() -> dict[str, Any]:
+    document = _document()
+    document["graph"]["runtime_units"] = [
+        {
+            "runtime_unit_id": "robot.native_execution",
+            "configuration": {
+                "mode": "simulated",
+                "execution_tick_hz": 100,
+                "collision_monitor_period_ms": 50,
+                "planner_rng_seed": 12345,
+                "initial_joint_positions_rad": [0.0, 1.0],
+                "motion_target_limits": [
+                    {
+                        "controllable_component_id": "robot",
+                        "command_target_id": "arm",
+                        "maximum_tcp_linear_speed_mps": 0.15,
+                    }
+                ],
+            },
+        }
+    ]
+    stop_parameters = {
+        "allow_natural_completion_on_short_path": True,
+        "deceleration_time_s": 1.0,
+        "per_resource_limits": [
+            {
+                "resource_id": "robot.arm.coordinate.000000",
+                "max_deceleration": {
+                    "coordinate_kind": "angular_rad_s2",
+                    "value_rad_s2": 4.0,
+                },
+                "settle_velocity_threshold": {
+                    "coordinate_kind": "angular_rad_s",
+                    "value_rad_s": 0.01,
+                },
+            }
+        ],
+        "stop_mode": "soft_on_path",
+    }
+    document["policies"] = {
+        "stop_stage_parameters": [
+            {
+                "control_binding_id": "route-a",
+                "stop_escalation_stage_id": "motion_controlled_stop",
+                "provider_contract_ref": {
+                    "provider_contract_role_id": "stop_contract"
+                },
+                "default_contract_parameters": deepcopy(stop_parameters),
+            },
+            {
+                "control_binding_id": "route-b",
+                "stop_escalation_stage_id": "motion_controlled_stop",
+                "provider_contract_ref": {
+                    "provider_contract_role_id": "stop_contract"
+                },
+                "default_contract_parameters": deepcopy(stop_parameters),
+            },
+            {
+                "control_binding_id": "route-a",
+                "stop_escalation_stage_id": "software_hard",
+                "provider_contract_ref": {
+                    "provider_contract_role_id": "software_hard_stop"
+                },
+                "default_contract_parameters": {},
+            },
+        ]
+    }
+    return document
+
+
 class _Coordinator:
-    def execute(self, _envelope, *, prepare_effect, validate_under_claim, effect, post_image, **_kwargs):
+    def execute(
+        self,
+        _envelope,
+        *,
+        prepare_effect,
+        validate_under_claim,
+        effect,
+        post_image,
+        after_release=None,
+        **_kwargs,
+    ):
         prepare_effect()
         if validate_under_claim is not None:
             validate_under_claim({"claim": "test"})
         result = effect({"claim": "test"})
         post_image()
+        if after_release is not None:
+            after_release()
         return result
 
 
@@ -204,6 +286,248 @@ def test_invalid_or_stale_deployment_mutation_never_changes_the_draft(
     assert client.get("/api/deployment/workspace").json()["draft"]["document"][
         "name"
     ] == "Current"
+
+
+def test_authored_deployment_preview_then_apply_preserves_the_exact_program(
+    tmp_path: Path,
+) -> None:
+    client, state = _client(tmp_path)
+    source = tmp_path / "cell_a.deployment.yaml"
+    source.write_text(json.dumps(_document()), encoding="utf-8")
+    initial = client.get("/api/deployment/workspace").json()
+    opened = client.post(
+        "/api/deployment/open-draft",
+        json=_request(
+            initial, path=str(source), confirmDiscard=False, kind="open"
+        ),
+    ).json()
+    base_revision = opened["draft"]["deploymentRevision"]
+    edited = client.post(
+        "/api/deployment/draft/mutations",
+        json=_request(opened, path=["name"], value="Authored", kind="edit"),
+    ).json()
+    candidate_revision = edited["draft"]["deploymentRevision"]
+    assert candidate_revision != base_revision
+    program = {
+        "api_version": "manyforge.program.v2",
+        "program_id": "program_a",
+        "program_revision": "sha256:" + "7" * 64,
+    }
+    current = {
+        "scenario_id": "cell_a",
+        "scenario_catalog_revision": "sha256:" + "6" * 64,
+        "deployment_artifact_id": "cell_a",
+        "deployment_revision": base_revision,
+        "retained_bundle_id": "sha256:" + "2" * 64,
+        "graph_revision": "sha256:" + "3" * 64,
+        "program_id": "program_a",
+        "program_revision": program["program_revision"],
+        "program_binding_id": "sha256:" + "5" * 64,
+    }
+
+    class CandidateHeadless(_Headless):
+        def program_applied(self):
+            return {
+                **current,
+                "program": deepcopy(program),
+                "source": {"record_digest": "sha256:" + "8" * 64},
+            }
+
+        def manager_status(self):
+            return {
+                "source": {
+                    "available": True,
+                    "freshness": "fresh",
+                    "known_gaps": [],
+                    "source_owner_epoch": "manager.epoch.1",
+                },
+                "status": {
+                    "manager_ready": True,
+                    "active": {
+                        "retained_bundle_id": current["retained_bundle_id"],
+                        "graph_revision": current["graph_revision"],
+                    },
+                },
+            }
+
+    state.headless_client = CandidateHeadless()  # type: ignore[assignment]
+    state.current_scenario = lambda: {  # type: ignore[method-assign]
+        "ready": True,
+        "current_scenario": deepcopy(current),
+        "unavailable_reasons": [],
+    }
+    effects: list[tuple[dict[str, Any], bool]] = []
+
+    def execute_candidate(intent, _claim, *, apply):
+        effects.append((deepcopy(intent), apply))
+        compilation = {
+            "schema_version": "manyforge.deployment_candidate_compilation.v1",
+            "scenario_id": current["scenario_id"],
+            "scenario_catalog_revision": "sha256:" + "9" * 64,
+            "deployment_artifact_id": "cell_a",
+            "deployment_revision": candidate_revision,
+            "retained_bundle_id": "sha256:" + "a" * 64,
+            "graph_revision": edited["draft"]["graphRevision"],
+            "program_id": "program_a",
+            "program_revision": program["program_revision"],
+            "program_binding_id": "sha256:" + "b" * 64,
+        }
+        if apply:
+            current.update({
+                key: value
+                for key, value in compilation.items()
+                if key != "schema_version"
+            })
+        return {
+            "status": "applied" if apply else "previewed",
+            "compilation": compilation,
+            "candidate_preview": None,
+            "manager_apply": None,
+            "selection": {
+                key: value
+                for key, value in compilation.items()
+                if key != "schema_version"
+            },
+        }
+
+    state.execute_authored_deployment_candidate = execute_candidate  # type: ignore[method-assign]
+    prepared: list[tuple[str, str]] = []
+    state.prepare_current_applied_scene = lambda **kwargs: prepared.append(  # type: ignore[method-assign]
+        (kwargs["request_owner_epoch"], kwargs["request_id"])
+    )
+
+    preview = client.post(
+        "/api/deployment/draft/preview",
+        json=_request(edited, kind="preview"),
+    )
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["result"]["status"] == "previewed"
+    assert current["deployment_revision"] == base_revision
+    assert effects[-1][0]["program"] == program
+    assert effects[-1][0]["deployment"] == edited["draft"]["document"]
+    assert prepared == []
+
+    applied = client.post(
+        "/api/deployment/draft/apply",
+        json=_request(edited, kind="apply"),
+    )
+    assert applied.status_code == 200, applied.text
+    assert applied.json()["result"]["status"] == "applied"
+    assert applied.json()["workspace"]["runAdmission"]["ready"] is True
+    assert current["program_revision"] == program["program_revision"]
+    assert prepared == [("browser-test", "request-2-apply")]
+
+
+def test_focused_motion_target_limit_updates_one_exact_target_atomically(
+    tmp_path: Path,
+) -> None:
+    client, _state = _client(tmp_path)
+    source = tmp_path / "cell_a.deployment.yaml"
+    source.write_text(json.dumps(_focused_document()), encoding="utf-8")
+    initial = client.get("/api/deployment/workspace").json()
+    opened = client.post(
+        "/api/deployment/open-draft",
+        json=_request(initial, path=str(source), confirmDiscard=False, kind="open"),
+    ).json()
+
+    updated = client.post(
+        "/api/deployment/draft/motion-target-limit",
+        json=_request(
+            opened,
+            controllable_component_id="robot",
+            command_target_id="arm",
+            maximum_tcp_linear_speed_mps=0.1,
+            kind="target-limit",
+        ),
+    )
+    assert updated.status_code == 200, updated.text
+    current = updated.json()
+    assert current["draft"]["document"]["graph"]["runtime_units"][0][
+        "configuration"
+    ]["motion_target_limits"][0]["maximum_tcp_linear_speed_mps"] == 0.1
+    assert current["draft"]["revision"] == opened["draft"]["revision"] + 1
+
+    rejected = client.post(
+        "/api/deployment/draft/motion-target-limit",
+        json=_request(
+            current,
+            controllable_component_id="other",
+            command_target_id="arm",
+            maximum_tcp_linear_speed_mps=0.05,
+            kind="wrong-target",
+        ),
+    )
+    assert rejected.status_code == 409
+    assert rejected.json()["detail"]["code"] == (
+        "deployment_motion_target_limit_scope_mismatch"
+    )
+    assert client.get("/api/deployment/workspace").json()["draft"] == current["draft"]
+
+
+def test_focused_controlled_stop_updates_all_derived_routes_and_not_hard_stop(
+    tmp_path: Path,
+) -> None:
+    client, _state = _client(tmp_path)
+    source = tmp_path / "cell_a.deployment.yaml"
+    source.write_text(json.dumps(_focused_document()), encoding="utf-8")
+    initial = client.get("/api/deployment/workspace").json()
+    opened = client.post(
+        "/api/deployment/open-draft",
+        json=_request(initial, path=str(source), confirmDiscard=False, kind="open"),
+    ).json()
+    profile = {
+        "stop_mode": "spring_back_hold",
+        "deceleration_time_s": 1.25,
+        "allow_natural_completion_on_short_path": False,
+        "per_resource_limits": [
+            {
+                "resource_id": "robot.arm.coordinate.000000",
+                "max_deceleration": {
+                    "coordinate_kind": "angular_rad_s2",
+                    "value": 3.5,
+                },
+                "settle_velocity_threshold": {
+                    "coordinate_kind": "angular_rad_s",
+                    "value": 0.02,
+                },
+            }
+        ],
+    }
+    updated = client.post(
+        "/api/deployment/draft/controlled-stop",
+        json=_request(opened, profile=profile, kind="controlled-stop"),
+    )
+    assert updated.status_code == 200, updated.text
+    rows = updated.json()["draft"]["document"]["policies"][
+        "stop_stage_parameters"
+    ]
+    controlled = [
+        row for row in rows
+        if row["stop_escalation_stage_id"] == "motion_controlled_stop"
+    ]
+    assert len(controlled) == 2
+    assert all(
+        row["default_contract_parameters"] == {
+            "allow_natural_completion_on_short_path": False,
+            "deceleration_time_s": 1.25,
+            "per_resource_limits": [
+                {
+                    "resource_id": "robot.arm.coordinate.000000",
+                    "max_deceleration": {
+                        "coordinate_kind": "angular_rad_s2",
+                        "value_rad_s2": 3.5,
+                    },
+                    "settle_velocity_threshold": {
+                        "coordinate_kind": "angular_rad_s",
+                        "value_rad_s": 0.02,
+                    },
+                }
+            ],
+            "stop_mode": "spring_back_hold",
+        }
+        for row in controlled
+    )
+    assert rows[2]["default_contract_parameters"] == {}
 
 
 def test_deployment_artifacts_remain_confined_and_save_as_requires_overwrite(

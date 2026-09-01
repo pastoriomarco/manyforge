@@ -396,7 +396,7 @@ def _authoring_apply_body(
         workspace.get("schemaVersion")
         != "manyforge.composer_program_workspace.v1"
         or snapshot.get("schema_version")
-        != "manyforge.composer_headless_state.v1"
+        != "manyforge.composer_headless_state.v2"
         or not client_id
         or not isinstance(draft, dict)
         or not isinstance(admission, dict)

@@ -459,6 +459,7 @@ export function ProgramWorkspace({
             environment={nodeEnvironment}
             busy={authoringBusy}
             onMutate={mutate}
+            onSelect={(instanceId) => selectNode(instanceId)}
             onCollapse={() => setPaletteCollapsed(true)}
             collapseButtonRef={paletteCollapseButton}
             onViewChange={changeToolView}

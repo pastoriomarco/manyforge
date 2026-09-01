@@ -1032,6 +1032,17 @@ create_retained_native_runtime_participants(
           sealed.error().message);
     }
     motion_runtime_policy = std::move(sealed.value());
+    if (input.deployment_maximum_tcp_linear_speed_mps.has_value()) {
+      auto tightened = core::apply_deployment_motion_speed_ceiling(
+          *motion_runtime_policy,
+          *input.deployment_maximum_tcp_linear_speed_mps);
+      if (!tightened.ok()) {
+        throw std::invalid_argument(
+            "native Deployment motion ceiling is invalid: " +
+            tightened.error().message);
+      }
+      motion_runtime_policy = std::move(tightened.value());
+    }
   }
 
   auto runtime = std::make_shared<RetainedNativeRuntime>(input.motion_binding,
@@ -1042,6 +1053,9 @@ create_retained_native_runtime_participants(
       std::move(input.control_binding_representatives);
   runtime->motion_operator_stop_profile = motion_operator_stop_profile;
   runtime->motion_fault_stop_profile = motion_fault_stop_profile;
+  runtime->motion_runtime_policy = motion_runtime_policy;
+  runtime->deployment_maximum_tcp_linear_speed_mps =
+      input.deployment_maximum_tcp_linear_speed_mps;
   runtime->participant_resolver_factory =
       std::move(input.participant_resolver_factory);
   runtime->scene = std::move(input.scene);

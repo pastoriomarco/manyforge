@@ -28,6 +28,7 @@ from .manager import ManagerPort
 from .models import (
     AcknowledgeAlarmRequest,
     AcknowledgeAllAlarmsRequest,
+    DeploymentCandidateCompilationRequest,
     HistorianReconcileRequest,
     ManagerApplyRequest,
     ManagerDeploymentCandidatePreviewRequest,
@@ -54,13 +55,15 @@ from .models import (
     OperationIntentRequest,
     PickSequencePlanningRequest,
     PlaceSequencePlanningRequest,
-    RuntimeScaleRequest,
+    RuntimeScaleControlRequest,
+    RuntimeScaleControlSelectorRequest,
     SceneResourcePoseQuery,
     SceneTransactionRequest,
     StopIntentRequest,
     StopFaultRecoveryIntentRequest,
 )
 from .cell_admission import CellAdmissionError
+from .component_overview import build_component_overview
 from .native import HeadlessApiError, HeadlessCorePort, ViewerModelAsset
 from .program_runner_client import ProgramRunnerClientError, ProgramRunnerPort
 from .program_binding_transport import ProgramBindingTransportError
@@ -143,6 +146,7 @@ class HeadlessService:
         program_runner: ProgramRunnerPort | None = None,
         cell_admission: Any | None = None,
         cclc: Any | None = None,
+        deployment_compiler: Any | None = None,
     ) -> None:
         self.core = core
         self.manager = manager
@@ -150,6 +154,7 @@ class HeadlessService:
         self.program_runner = program_runner
         self.cell_admission = cell_admission
         self.cclc = cclc
+        self.deployment_compiler = deployment_compiler
 
     def _cell_admission(self) -> Any:
         if self.cell_admission is None:
@@ -509,19 +514,19 @@ class HeadlessService:
     ) -> dict[str, Any]:
         return self._execution().recover_stop_fault(request)
 
-    def execution_set_runtime_scale(
+    def execution_set_runtime_scale_control(
         self,
-        request: RuntimeScaleRequest,
+        request: RuntimeScaleControlRequest,
         attribution: TrustedAttribution,
     ) -> dict[str, Any]:
-        return self._execution().set_runtime_scale(
+        return self._execution().set_runtime_scale_control(
             request, trusted_principal_id=attribution.principal_id
         )
 
-    def execution_get_runtime_scale(
-        self, operation_id: str
+    def execution_get_runtime_scale_control(
+        self, selector: RuntimeScaleControlSelectorRequest
     ) -> dict[str, Any]:
-        return self._execution().get_runtime_scale(operation_id)
+        return self._execution().get_runtime_scale_control(selector)
 
     def runtime(self) -> dict[str, Any]:
         snapshot = self.core.runtime_snapshot()
@@ -531,6 +536,53 @@ class HeadlessService:
                 "runtime snapshot version is unsupported",
             )
         return snapshot
+
+    def component_overview(self) -> dict[str, Any]:
+        """Return one read-only reduction over current identified owner facts."""
+
+        projections: dict[str, dict[str, Any] | None] = {}
+        errors: dict[str, dict[str, Any]] = {}
+
+        def capture(name: str, callback) -> None:
+            try:
+                value = callback()
+                if not isinstance(value, dict):
+                    raise HeadlessApiError(
+                        f"{name}_projection_invalid",
+                        f"{name.replace('_', ' ')} projection is not an object",
+                    )
+                projections[name] = value
+            except HeadlessApiError as error:
+                projections[name] = None
+                errors[name] = {
+                    "code": error.code,
+                    "message": str(error),
+                }
+
+        capture("runtime", self.runtime)
+        capture(
+            "alarms",
+            lambda: self.alarms(limit=32, ordering="attention_newest"),
+        )
+        capture("authoring_admission", self.authoring_admission)
+        capture("program_cycle", self.program_cycle_status)
+        capture("applied_program", self.program_applied)
+        capture("source_model", self.source_model)
+        capture("execution_identity", self.execution_identity)
+        capture("execution_targets", self.execution_targets)
+        capture("execution_control", self.execution_control_state)
+        return build_component_overview(
+            runtime=projections["runtime"],
+            alarms=projections["alarms"],
+            authoring_admission=projections["authoring_admission"],
+            program_cycle=projections["program_cycle"],
+            applied_program=projections["applied_program"],
+            source_model=projections["source_model"],
+            execution_identity_response=projections["execution_identity"],
+            execution_targets_response=projections["execution_targets"],
+            execution_control_response=projections["execution_control"],
+            errors=errors,
+        )
 
     def scene_resource_poses(
         self,
@@ -632,6 +684,180 @@ class HeadlessService:
                 "node_environment_projection_invalid",
                 "native core returned an unsupported node environment projection",
             )
+        if self.program_runner is None:
+            return projection
+        try:
+            applied = self.program_applied()
+            scenario_id = applied.get("scenario_id")
+            if not isinstance(scenario_id, str):
+                raise HeadlessApiError(
+                    "program_applied_selection_invalid",
+                    "Applied Program omitted its Scenario identity",
+                )
+            selection = self.scenario_program_selection(scenario_id)
+        except HeadlessApiError as error:
+            # Catalog authoring is independent of an Applied Program. Never
+            # join a Runner offer when the local Applied identity is absent.
+            if error.code == "program_applied_selection_not_found":
+                return projection
+            raise
+        try:
+            runner_projection = self.program_runner.node_availability(
+                {"applied": applied, "selection": selection}
+            )
+        except ProgramRunnerClientError:
+            # The immutable catalog remains authorable while the independent
+            # Runner is absent or incompatible. Its existing unavailable
+            # projection is already fail-closed and carries no false claim.
+            return projection
+        if (
+            not isinstance(runner_projection, dict)
+            or set(runner_projection) != {"availability", "schema_version", "source"}
+            or runner_projection.get("schema_version")
+            != "manyforge.program_node_availability.v1"
+            or not isinstance(runner_projection.get("source"), dict)
+            or not isinstance(runner_projection.get("availability"), dict)
+        ):
+            raise HeadlessApiError(
+                "program_runner_response_invalid",
+                "Program runner returned an invalid node-availability projection",
+            )
+        runner_source = runner_projection["source"]
+        runner_availability = runner_projection["availability"]
+        applied_source = applied.get("source")
+        core_availability = projection.get("availability")
+        implementations = runner_availability.get("implementations")
+        core_implementations = (
+            core_availability.get("implementations")
+            if isinstance(core_availability, dict)
+            else None
+        )
+        source_without_digest = {
+            key: value
+            for key, value in runner_source.items()
+            if key != "content_digest"
+        }
+        try:
+            expected_availability_digest = (
+                "sha256:"
+                + hashlib.sha256(
+                    rfc8785.dumps(
+                        {
+                            "availability": runner_availability,
+                            **source_without_digest,
+                        }
+                    )
+                ).hexdigest()
+            )
+        except (rfc8785.CanonicalizationError, TypeError, ValueError):
+            expected_availability_digest = None
+        if (
+            set(runner_source)
+            != {
+                "admission_generation",
+                "applied_record_digest",
+                "content_digest",
+                "cycle_generation",
+                "graph_revision",
+                "node_environment_digest",
+                "owner_epoch",
+                "owner_id",
+                "program_binding_id",
+                "program_id",
+                "program_revision",
+                "retained_bundle_id",
+                "scenario_id",
+            }
+            or runner_source.get("node_environment_digest")
+            != projection.get("environment_digest")
+            or runner_source.get("retained_bundle_id")
+            != projection.get("retained_bundle_id")
+            or runner_source.get("graph_revision")
+            != projection.get("graph_revision")
+            or runner_source.get("content_digest")
+            != expected_availability_digest
+            or not isinstance(applied_source, dict)
+            or any(
+                runner_source.get(field) != applied.get(field)
+                for field in (
+                    "graph_revision",
+                    "node_environment_digest",
+                    "program_binding_id",
+                    "program_id",
+                    "program_revision",
+                    "retained_bundle_id",
+                    "scenario_id",
+                )
+            )
+            or runner_source.get("applied_record_digest")
+            != applied_source.get("record_digest")
+            or type(runner_source.get("admission_generation")) is not int
+            or type(runner_source.get("cycle_generation")) is not int
+            or runner_availability.get("schema_version")
+            != "manyforge.node_execution_availability.v1"
+            or runner_availability.get("environment_digest")
+            != projection.get("environment_digest")
+            or runner_availability.get("program_binding_id")
+            != runner_source.get("program_binding_id")
+            or not isinstance(implementations, list)
+            or not isinstance(core_implementations, list)
+            or len(implementations) != len(core_implementations)
+        ):
+            raise HeadlessApiError(
+                "program_runner_response_invalid",
+                "Program node availability does not identify the active environment",
+            )
+        projected_rows: list[dict[str, Any]] = []
+        for runner_row, core_row in zip(implementations, core_implementations):
+            if (
+                not isinstance(runner_row, dict)
+                or not isinstance(core_row, dict)
+                or any(
+                    runner_row.get(field) != core_row.get(field)
+                    for field in (
+                        "adapter_build_qualified",
+                        "authoring_available",
+                        "engine_id",
+                        "executable_package_id",
+                        "implementation_id",
+                        "implementation_identity_resolved",
+                        "node_id",
+                        "restoration_gates",
+                    )
+                )
+            ):
+                raise HeadlessApiError(
+                    "program_runner_response_invalid",
+                    "Program node availability disagrees with the active registry",
+                )
+            projected_rows.append(
+                {
+                    field: runner_row[field]
+                    for field in core_row
+                }
+            )
+        projection["availability"] = {
+            "binding_context": "applied",
+            "execution_available": runner_availability.get(
+                "execution_available"
+            ),
+            "implementations": projected_rows,
+            "manager_runtime_converged": core_availability.get(
+                "manager_runtime_converged"
+            ),
+            "portable_authoring_available": runner_availability.get(
+                "portable_authoring_available"
+            ),
+            "reason_codes": runner_availability.get("reason_codes"),
+            "restoration_gates": sorted(
+                {
+                    gate
+                    for row in projected_rows
+                    for gate in row.get("restoration_gates", [])
+                    if isinstance(gate, str)
+                }
+            ),
+        }
         return projection
 
     def source_model(self) -> dict[str, Any]:
@@ -639,7 +865,7 @@ class HeadlessService:
         source = projection.get("source")
         if (
             projection.get("schema_version")
-            != "manyforge.source_model_projection.v1"
+            != "manyforge.source_model_projection.v2"
             or not isinstance(source, dict)
         ):
             raise HeadlessApiError(
@@ -660,7 +886,7 @@ class HeadlessService:
             or context["node_environment"].get("schema_version")
             != "manyforge.node_environment_projection.v2"
             or context["source_model"].get("schema_version")
-            != "manyforge.source_model_projection.v1"
+            != "manyforge.source_model_projection.v2"
         ):
             raise HeadlessApiError(
                 "source_model_context_invalid",
@@ -689,7 +915,7 @@ class HeadlessService:
             or context["node_environment"].get("schema_version")
             != "manyforge.node_environment_projection.v2"
             or context["source_model"].get("schema_version")
-            != "manyforge.source_model_projection.v1"
+            != "manyforge.source_model_projection.v2"
         ):
             raise HeadlessApiError(
                 "assistant_mode_context_invalid",
@@ -1431,28 +1657,36 @@ class HeadlessService:
         try:
             runner = self._program_runner()
             cycle = runner.cycle_status()
-            if (
-                cycle.get("state") != "terminal_awaiting_reset"
-                or cycle.get("program_runner_owner_epoch")
-                != request.expected_owner_epoch
-                or cycle.get("cycle_generation")
-                != request.expected_cycle_generation
-                or cycle.get("program_run_id") != request.program_run_id
-                or cycle.get("cycle_claim_generation")
-                != request.expected_claim_generation
-                or cycle.get("terminal_or_settlement_reference")
-                != request.terminal_reference
-                or request.settlement_evidence_digest
-                != request.terminal_reference
-            ):
+            exact_terminal = bool(
+                cycle.get("state") == "terminal_awaiting_reset"
+                and cycle.get("program_runner_owner_epoch")
+                == request.expected_owner_epoch
+                and cycle.get("cycle_generation")
+                == request.expected_cycle_generation
+                and cycle.get("program_run_id") == request.program_run_id
+                and cycle.get("cycle_claim_generation")
+                == request.expected_claim_generation
+                and cycle.get("terminal_or_settlement_reference")
+                == request.terminal_reference
+                and request.settlement_evidence_digest
+                == request.terminal_reference
+            )
+            exact_idle_successor = bool(
+                cycle.get("state") == "idle_after_reset"
+                and cycle.get("cycle_generation")
+                == request.expected_cycle_generation + 1
+            )
+            if not exact_terminal and not exact_idle_successor:
                 raise HeadlessApiError(
                     "program_cycle_reset_stale",
                     "Reset does not identify the exact terminal Program cycle",
                 )
-            self._recover_stop_fault_for_cycle_reset(request)
-            return runner.reset_cycle(
-                request.model_dump(mode="json")
-            )
+            if exact_terminal:
+                self._recover_stop_fault_for_cycle_reset(request)
+            # The Program Runner owns the durable request ledger. Forward an
+            # exact successor-Idle replay so it can finish post-Reset scene
+            # convergence after a no-effect transient or process failure.
+            return runner.reset_cycle(request.model_dump(mode="json"))
         except ProgramRunnerClientError as error:
             raise self._runner_error(error) from error
 
@@ -2026,6 +2260,46 @@ class HeadlessService:
     ) -> dict[str, Any]:
         return self.manager.preview_deployment_candidate(request)
 
+    def compile_deployment_candidate(
+        self, request: DeploymentCandidateCompilationRequest
+    ) -> dict[str, Any]:
+        if self.deployment_compiler is None:
+            raise HeadlessApiError(
+                "deployment_candidate_compiler_unavailable",
+                "Deployment candidate compilation is not configured",
+            )
+        claim = request.authoring_claim
+        intent = claim.get("intent") if isinstance(claim, dict) else None
+        if (
+            not isinstance(intent, dict)
+            or intent.get("claim_kind") != "authoring_mutation"
+            or intent.get("owner_role") != "authoring_owner"
+        ):
+            raise HeadlessApiError(
+                "authoring_not_ready",
+                "Deployment candidate compilation requires an exact held "
+                "authoring claim",
+            )
+        try:
+            replay = self._cell_admission().acquire(intent)
+        except CellAdmissionError as error:
+            raise self._admission_error(error) from error
+        if replay != claim:
+            raise HeadlessApiError(
+                "stale_generation",
+                "Deployment candidate authoring claim is no longer exact",
+            )
+        return {
+            "compilation": self.deployment_compiler.compile(
+                scenario_id=request.scenario_id,
+                expected_scenario_catalog_revision=(
+                    request.expected_scenario_catalog_revision
+                ),
+                deployment=request.deployment,
+                program=request.program,
+            )
+        }
+
     def manager_apply(self, request: ManagerApplyRequest) -> dict[str, Any]:
         return self.manager.apply(request)
 
@@ -2097,12 +2371,6 @@ class HeadlessService:
             "status_scope": "headless_projection",
             "status": "ready" if projection_ready else "degraded",
             "headless_projection_ready": projection_ready,
-            "robot_readiness": {
-                "available": False,
-                "state": None,
-                "source_owner_id": None,
-                "reason_code": "robot_readiness_owner_unavailable",
-            },
             "components": {
                 "runtime_projection": {
                     "complete": runtime.get("complete"),

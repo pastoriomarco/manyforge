@@ -20,9 +20,12 @@ import type {
 import { firstCatalogParameterValidationMessage } from '../utils/catalogParameterValidation';
 import {
   catalogFieldAcceptsValueSource,
+  deriveProgramMotionConfiguration,
   flattenProgramForest,
+  PROGRAM_MOTION_FIELDS,
   programDiagnosticNodeId,
   resolveProgramParameterLiteralValue,
+  type ProgramMotionField,
 } from '../utils/programAuthoring';
 import {
   programSourceJointInventory,
@@ -63,6 +66,10 @@ interface ProgramPropertyEditorProps {
 interface SourceChoice {
   label: string;
   source: ProgramValueSource;
+}
+
+function isProgramMotionField(field: string): field is ProgramMotionField {
+  return PROGRAM_MOTION_FIELDS.includes(field as ProgramMotionField);
 }
 
 export type ProgramParameterTransition =
@@ -114,8 +121,26 @@ function sourceChoices(
   fieldName: string,
   parameters: ProgramParameterDeclaration[],
   keys: BlackboardKeyDeclaration[],
+  preferredProgramParameterId: string | null,
 ): SourceChoice[] {
   const result: SourceChoice[] = [];
+  const programMotionDefault = preferredProgramParameterId === null
+    ? undefined
+    : parameters.find(
+      (parameter) => parameter.parameter_id === preferredProgramParameterId,
+    );
+  if (
+    programMotionDefault
+    && catalogFieldAcceptsValueSource(entry, fieldName, programMotionDefault.type)
+  ) {
+    return [{
+      label: `Program limit · ${programMotionDefault.parameter_id}`,
+      source: {
+        kind: 'program_parameter',
+        reference: programMotionDefault.parameter_id,
+      },
+    }];
+  }
   for (const parameter of parameters) {
     if (catalogFieldAcceptsValueSource(entry, fieldName, parameter.type)) {
       result.push({
@@ -167,6 +192,13 @@ export function ProgramPropertyEditor({
 }: ProgramPropertyEditorProps) {
   const programParameters = program.parameters ?? [];
   const blackboardKeys = program.blackboard?.keys ?? [];
+  const motionConfiguration = useMemo(
+    () => deriveProgramMotionConfiguration(program, catalogEntries),
+    [catalogEntries, program],
+  );
+  const motionBindings = motionConfiguration.available
+    ? motionConfiguration.configuration.bindings
+    : null;
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [discardEpoch, setDiscardEpoch] = useState(0);
   const selected = useMemo(
@@ -267,7 +299,19 @@ export function ProgramPropertyEditor({
   };
 
   const commitLiteral = (parameter: CatalogParameter, value: JsonValue) => {
-    const message = firstCatalogParameterValidationMessage(parameter, value);
+    const motionBinding = isProgramMotionField(parameter.id)
+      ? motionBindings?.[parameter.id] ?? null
+      : null;
+    const ceiling = motionBinding !== null
+      ? programParameters.find((row) => row.parameter_id === motionBinding)?.default
+      : undefined;
+    const ceilingMessage = typeof ceiling === 'number'
+      && typeof value === 'number'
+      && value > ceiling
+      ? `${parameter.id}=${value} exceeds Program ${parameter.id}=${ceiling}.`
+      : null;
+    const message = ceilingMessage
+      ?? firstCatalogParameterValidationMessage(parameter, value);
     if (message) {
       setErrors((current) => ({ ...current, [parameter.id]: message }));
       return;
@@ -281,6 +325,16 @@ export function ProgramPropertyEditor({
   };
 
   const removeLiteral = (parameter: CatalogParameter) => {
+    const motionBinding = isProgramMotionField(parameter.id)
+      ? motionBindings?.[parameter.id] ?? null
+      : null;
+    if (motionBinding !== null) {
+      applyTransition(parameter.id, {
+        kind: 'source',
+        source: { kind: 'program_parameter', reference: motionBinding },
+      });
+      return;
+    }
     applyTransition(parameter.id, { kind: 'clear' });
   };
 
@@ -429,6 +483,9 @@ export function ProgramPropertyEditor({
             parameter.id,
             programParameters,
             blackboardKeys,
+            isProgramMotionField(parameter.id)
+              ? motionBindings?.[parameter.id] ?? null
+              : null,
           );
           const hasLiteral = Object.prototype.hasOwnProperty.call(
             selected.parameters,
@@ -576,7 +633,10 @@ export function ProgramPropertyEditor({
                   disabled={busy || selected.parameters[parameter.id] === undefined}
                   onClick={() => removeLiteral(parameter)}
                 >
-                  Use catalog default / omit
+                  {isProgramMotionField(parameter.id)
+                    && motionBindings?.[parameter.id] !== undefined
+                    ? 'Use Program limit'
+                    : 'Use catalog default / omit'}
                 </button>
               )}
             </div>

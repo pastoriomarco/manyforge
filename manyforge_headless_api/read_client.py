@@ -24,7 +24,7 @@ READ_OPERATION_SCHEMAS: Final = MappingProxyType(
         "manager_graph": "manyforge.manager_graph_projection.v1",
         "manager_diff": "manyforge.manager_diff_projection.v1",
         "node_environment": "manyforge.node_environment_projection.v2",
-        "source_model": "manyforge.source_model_projection.v1",
+        "source_model": "manyforge.source_model_projection.v2",
         "scene": "manyforge.scene_projection.v1",
         "alarms": "manyforge.operator_alarm_snapshot.v2",
         "alarm_metrics": "manyforge.operator_alarm_metrics.v1",

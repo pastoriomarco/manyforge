@@ -21,6 +21,7 @@ from .models import (
     AcknowledgeAlarmRequest,
     AcknowledgeAllAlarmsRequest,
     ComponentLifecycleRequest,
+    DeploymentCandidateCompilationRequest,
     FullStopIntentRequest,
     HistorianReconcileRequest,
     ManagerApplyRequest,
@@ -47,7 +48,8 @@ from .models import (
     OperationIntentRequest,
     PickSequencePlanningRequest,
     PlaceSequencePlanningRequest,
-    RuntimeScaleRequest,
+    RuntimeScaleControlRequest,
+    RuntimeScaleControlSelectorRequest,
     RouteSelectionRequest,
     SceneResourcePoseQuery,
     SceneTransactionRequest,
@@ -58,6 +60,7 @@ from .native import (
     HeadlessApiConfig,
     HeadlessApiError,
     MAX_PROGRAM_APPLY_REQUEST_BYTES,
+    MAX_DEPLOYMENT_CANDIDATE_REQUEST_BYTES,
     MAX_PROGRAM_MODEL_ATTEMPT_BYTES,
     NativeHeadlessCore,
     ViewerModelAsset,
@@ -66,6 +69,7 @@ from .native import (
 from .service import HeadlessService, TrustedAttribution
 from .program_runner_client import ProgramRunnerHttpClient
 from .cell_admission import CellAdmissionClient
+from .deployment_compiler import DeploymentCandidateCompiler
 
 
 _REQUEST_ID_PATTERN = re.compile(r"[^A-Za-z0-9._-]")
@@ -263,6 +267,7 @@ def _error_status(code: str) -> int:
         "program_run_already_active",
         "authoring_not_ready",
         "program_run_draft_applied_mismatch",
+        "deployment_candidate_compiler_busy",
     }:
         return 409
     if (
@@ -354,6 +359,17 @@ def create_app(
                 config.program_runner_url,
                 timeout_seconds=config.program_runner_timeout_seconds,
             )
+        deployment_compiler = None
+        if config.deployment_compiler_path is not None:
+            assert config.deployment_compiler_workspace_root is not None
+            deployment_compiler = DeploymentCandidateCompiler(
+                executable=config.deployment_compiler_path,
+                workspace_root=config.deployment_compiler_workspace_root,
+                installed_package_root=config.install_root,
+                candidate_package_root=config.artifact_root,
+                prepared_roots=config.deployment_compiler_prepared_roots,
+                timeout_seconds=config.deployment_compiler_timeout_seconds,
+            )
         service = HeadlessService(
             core,
             manager,
@@ -364,6 +380,7 @@ def create_app(
                 timeout_seconds=config.execution_timeout_seconds,
             ),
             cclc=cclc,
+            deployment_compiler=deployment_compiler,
         )
         event_execution = ExecutionCommandClient(
             config.execution_run_root,
@@ -422,6 +439,9 @@ def create_app(
         maximum_bytes=maximum_body,
         path_maximum_bytes={
             "/api/program/apply": MAX_PROGRAM_APPLY_REQUEST_BYTES,
+            "/api/manager/deployment-candidates/compile": (
+                MAX_DEPLOYMENT_CANDIDATE_REQUEST_BYTES
+            ),
             "/api/program/model-attempts": MAX_PROGRAM_MODEL_ATTEMPT_BYTES,
         },
         recognized_stop_paths=frozenset(
@@ -494,6 +514,10 @@ def create_app(
     @app.get("/api/runtime")
     def runtime() -> dict[str, Any]:
         return service.runtime()
+
+    @app.get("/api/component-overview")
+    def component_overview() -> dict[str, Any]:
+        return service.component_overview()
 
     @app.get("/api/cell/authoring-admission")
     def authoring_admission() -> dict[str, Any]:
@@ -898,6 +922,12 @@ def create_app(
             )
         return JSONResponse(status_code=_error_status(code), content=response)
 
+    @app.post("/api/manager/deployment-candidates/compile")
+    def compile_deployment_candidate(
+        request: DeploymentCandidateCompilationRequest,
+    ) -> dict[str, Any]:
+        return service.compile_deployment_candidate(request)
+
     @app.post("/api/manager/apply")
     def manager_apply(request: ManagerApplyRequest) -> JSONResponse:
         response = service.manager_apply(request)
@@ -1152,25 +1182,30 @@ def create_app(
     ) -> JSONResponse:
         return execution_response(service.execution_recover_stop_fault(body))
 
-    @app.post("/api/execution/operations/{operation_id}/runtime-scale")
-    def execution_set_runtime_scale(
-        operation_id: Annotated[str, Path(min_length=1, max_length=256)],
-        body: RuntimeScaleRequest,
+    @app.post("/api/execution/runtime-scale-control")
+    def execution_set_runtime_scale_control(
+        body: RuntimeScaleControlRequest,
         request: Request,
     ) -> JSONResponse:
-        require_matching_operation(operation_id, body.operation_id)
         return execution_response(
-            service.execution_set_runtime_scale(
+            service.execution_set_runtime_scale_control(
                 body, _trusted_attribution(request, trusted_principal_adapter)
             )
         )
 
-    @app.get("/api/execution/operations/{operation_id}/runtime-scale")
-    def execution_get_runtime_scale(
-        operation_id: Annotated[str, Path(min_length=1, max_length=256)],
+    @app.get("/api/execution/runtime-scale-control")
+    def execution_get_runtime_scale_control(
+        program_binding_id: Annotated[str, Query(min_length=1, max_length=256)],
+        component_role_id: Annotated[str, Query(min_length=1, max_length=256)],
+        target_role_id: Annotated[str, Query(min_length=1, max_length=256)],
     ) -> JSONResponse:
+        selector = RuntimeScaleControlSelectorRequest(
+            program_binding_id=program_binding_id,
+            component_role_id=component_role_id,
+            target_role_id=target_role_id,
+        )
         return execution_response(
-            service.execution_get_runtime_scale(operation_id)
+            service.execution_get_runtime_scale_control(selector)
         )
 
     @app.get("/api/scene")

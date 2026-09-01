@@ -3,16 +3,24 @@ import { useEffect, useMemo, useState, type KeyboardEvent } from 'react';
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
 import type {
   JsonValue,
+  CatalogEntry,
   DraftMutationResponse,
   ProgramAuthoringDiagnostic,
   ProgramAuthoringDocument,
 } from '../types/api';
+import {
+  deriveProgramMotionConfiguration,
+  flattenProgramForest,
+  PROGRAM_MOTION_FIELDS,
+  type ProgramMotionValues,
+} from '../utils/programAuthoring';
 
 const LANES = ['manyforge-only', 'isaac-sim', 'real-robot'] as const;
 const PORTABLE_ID = /^[a-z][a-z0-9_.-]*$/;
 
 interface ProgramSettingsEditorProps {
   program: ProgramAuthoringDocument;
+  catalogEntries: CatalogEntry[];
   candidateRevision: string | null;
   busy: boolean;
   runtime: ProgramRuntimeController;
@@ -53,8 +61,16 @@ function initialCompatibility(program: ProgramAuthoringDocument) {
   };
 }
 
+type MotionDefaults = ProgramMotionValues;
+
+interface MotionHistory {
+  before: JsonValue;
+  after: JsonValue;
+}
+
 export function ProgramSettingsEditor({
   program,
+  catalogEntries,
   candidateRevision,
   busy,
   runtime,
@@ -63,6 +79,13 @@ export function ProgramSettingsEditor({
   onRoleCreated,
   diagnostics = [],
 }: ProgramSettingsEditorProps) {
+  const motionConfiguration = useMemo(
+    () => deriveProgramMotionConfiguration(program, catalogEntries),
+    [catalogEntries, program],
+  );
+  const appliedMotion = motionConfiguration.available
+    ? motionConfiguration.configuration.values
+    : null;
   const [name, setName] = useState(program.name);
   const [description, setDescription] = useState(program.description ?? '');
   const [compatibility, setCompatibility] = useState(() => initialCompatibility(program));
@@ -79,6 +102,14 @@ export function ProgramSettingsEditor({
   const [targetResourceRoles, setTargetResourceRoles] = useState('');
   const [targetCollisionRoles, setTargetCollisionRoles] = useState('');
   const [targetModelRoles, setTargetModelRoles] = useState('');
+  const [motion, setMotion] = useState<MotionDefaults | null>(appliedMotion);
+  const [motionHistory, setMotionHistory] = useState<MotionHistory | null>(null);
+  const [motionRedo, setMotionRedo] = useState<MotionHistory | null>(null);
+  const [motionConflict, setMotionConflict] = useState<{
+    values: MotionDefaults;
+    count: number;
+  } | null>(null);
+  const [motionError, setMotionError] = useState<string | null>(null);
 
   useEffect(() => {
     setName(program.name);
@@ -97,7 +128,10 @@ export function ProgramSettingsEditor({
     setTargetResourceRoles('');
     setTargetCollisionRoles('');
     setTargetModelRoles('');
-  }, [program]);
+    setMotion(appliedMotion);
+    setMotionConflict(null);
+    setMotionError(null);
+  }, [appliedMotion, program]);
   useEffect(() => {
     onInvalidChange?.(error !== null);
     return () => onInvalidChange?.(false);
@@ -266,6 +300,84 @@ export function ProgramSettingsEditor({
       setErrorTarget('program-target-role-id');
     }
   };
+  const motionDirty = motion !== null && appliedMotion !== null
+    && PROGRAM_MOTION_FIELDS.some((field) => (
+    Math.abs(
+      motion[field]
+      - appliedMotion[field],
+    ) > 1e-12
+    ));
+  const motionConflictCount = (values: MotionDefaults): number => (
+    flattenProgramForest(program.forest).reduce((count, { node }) => (
+      count + PROGRAM_MOTION_FIELDS.filter((field) => {
+        const value = node.parameters[field];
+        return typeof value === 'number'
+          && value > values[field];
+      }).length
+    ), 0)
+  );
+  const performMotionUpdate = async (
+    values: MotionDefaults,
+    conflictResolution: 'reject' | 'reduce',
+  ) => {
+    if (!motionConfiguration.available) {
+      setMotionError(motionConfiguration.reason);
+      return;
+    }
+    const response = await onMutate('program_draft_update_motion_defaults', {
+      mode: 'update',
+      velocity_scale: values.velocity_scale,
+      acceleration_scale: values.acceleration_scale,
+      max_tcp_linear_speed_mps: values.max_tcp_linear_speed_mps,
+      parameter_bindings: motionConfiguration.configuration.bindings,
+      conflict_resolution: conflictResolution,
+    });
+    if (!response) return;
+    const before = response.details.previous_config;
+    const after = response.details.current_config;
+    if (before !== undefined && after !== undefined) {
+      setMotionHistory({ before, after });
+      setMotionRedo(null);
+    }
+    setMotionConflict(null);
+    setMotionError(null);
+  };
+  const submitMotion = () => {
+    if (busy || !motionDirty || motion === null) return;
+    if (
+      !Number.isFinite(motion.velocity_scale)
+      || motion.velocity_scale <= 0
+      || motion.velocity_scale > 1
+      || !Number.isFinite(motion.acceleration_scale)
+      || motion.acceleration_scale <= 0
+      || motion.acceleration_scale > 1
+      || !Number.isFinite(motion.max_tcp_linear_speed_mps)
+      || motion.max_tcp_linear_speed_mps <= 0
+    ) {
+      setMotionError('Velocity and acceleration scales must be in (0, 1]; TCP speed must be positive.');
+      return;
+    }
+    const count = motionConflictCount(motion);
+    if (count > 0) {
+      setMotionConflict({ values: motion, count });
+      return;
+    }
+    void performMotionUpdate(motion, 'reject');
+  };
+  const restoreMotion = async (history: MotionHistory, direction: 'undo' | 'redo') => {
+    const response = await onMutate('program_draft_update_motion_defaults', {
+      mode: 'restore',
+      config: direction === 'undo' ? history.before : history.after,
+    });
+    if (!response) return;
+    if (direction === 'undo') {
+      setMotionHistory(null);
+      setMotionRedo(history);
+    } else {
+      setMotionHistory(history);
+      setMotionRedo(null);
+    }
+  };
 
   return (
     <form className="program-settings-editor" onSubmit={(event) => {
@@ -326,6 +438,106 @@ export function ProgramSettingsEditor({
           Description
           <textarea rows={3} value={description} disabled={busy} onChange={(event) => setDescription(event.target.value)} />
         </label>
+      </section>
+
+      <section className="program-settings-section program-motion-defaults">
+        <h3>Program motion limits</h3>
+        <p>
+          These are portable Program ceilings. Motion nodes default to them;
+          lower per-node values remain valid. The live command-bar Velocity
+          control further scales current and subsequent compatible moves for
+          the addressed target without changing these Program values.
+        </p>
+        {motionError && <p className="program-settings-error" role="alert">{motionError}</p>}
+        {!motionConfiguration.available || motion === null ? (
+          <p className="program-settings-error" role="status">
+            Program-wide motion controls are unavailable. {motionConfiguration.available
+              ? 'The current values could not be read.'
+              : motionConfiguration.reason}
+          </p>
+        ) : (
+          <>
+            <dl className="program-settings-facts program-motion-bindings">
+              {PROGRAM_MOTION_FIELDS.map((field) => (
+                <div key={field}>
+                  <dt>{field}</dt>
+                  <dd>
+                    <code>{motionConfiguration.configuration.bindings[field]}</code>
+                    {' · '}{motionConfiguration.configuration.usageCounts[field]}
+                    /{motionConfiguration.configuration.applicableCounts[field]} bound nodes
+                  </dd>
+                </div>
+              ))}
+            </dl>
+            <div className="program-motion-default-grid">
+              <label>
+                Global velocity scale
+                <input
+                  aria-label="Program global velocity scale"
+                  type="number"
+                  min="0.01"
+                  max="1"
+                  step="0.01"
+                  value={motion.velocity_scale}
+                  disabled={busy}
+                  onChange={(event) => setMotion((current) => current === null ? null : ({
+                    ...current,
+                    velocity_scale: event.currentTarget.valueAsNumber,
+                  }))}
+                />
+              </label>
+              <label>
+                Global acceleration scale
+                <input
+                  aria-label="Program global acceleration scale"
+                  type="number"
+                  min="0.01"
+                  max="1"
+                  step="0.01"
+                  value={motion.acceleration_scale}
+                  disabled={busy}
+                  onChange={(event) => setMotion((current) => current === null ? null : ({
+                    ...current,
+                    acceleration_scale: event.currentTarget.valueAsNumber,
+                  }))}
+                />
+              </label>
+              <label>
+                Maximum TCP linear speed
+                <span className="program-motion-number">
+                  <input
+                    aria-label="Program maximum TCP linear speed"
+                    type="number"
+                    min="0.001"
+                    step="0.001"
+                    value={motion.max_tcp_linear_speed_mps}
+                    disabled={busy}
+                    onChange={(event) => setMotion((current) => current === null ? null : ({
+                      ...current,
+                      max_tcp_linear_speed_mps: event.currentTarget.valueAsNumber,
+                    }))}
+                  />
+                  <span>m/s</span>
+                </span>
+              </label>
+            </div>
+            <div className="program-motion-actions">
+              <button type="button" disabled={busy || !motionDirty} onClick={submitMotion}>
+                Update motion limits
+              </button>
+              <button
+                type="button"
+                disabled={busy || motionHistory === null}
+                onClick={() => motionHistory && void restoreMotion(motionHistory, 'undo')}
+              >Undo</button>
+              <button
+                type="button"
+                disabled={busy || motionRedo === null}
+                onClick={() => motionRedo && void restoreMotion(motionRedo, 'redo')}
+              >Redo</button>
+            </div>
+          </>
+        )}
       </section>
 
       <section className={`program-settings-section${compatibilityDiagnostic ? ' backend-invalid' : ''}`} title={compatibilityDiagnostic?.message}>
@@ -452,6 +664,36 @@ export function ProgramSettingsEditor({
           </div>
         </details>
       </section>
+
+      {motionConflict && (
+        <div className="program-motion-conflict-backdrop" role="presentation">
+          <section
+            className="program-motion-conflict"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="program-motion-conflict-title"
+          >
+            <h3 id="program-motion-conflict-title">Node limits exceed the new Program ceiling</h3>
+            <p>
+              {motionConflict.count} node {motionConflict.count === 1 ? 'value is' : 'values are'}
+              {' '}higher than the proposed global limit.
+            </p>
+            <div>
+              <button
+                type="button"
+                onClick={() => void performMotionUpdate(motionConflict.values, 'reduce')}
+              >Reduce node limits</button>
+              <button
+                type="button"
+                onClick={() => {
+                  setMotion(appliedMotion);
+                  setMotionConflict(null);
+                }}
+              >Discard new setting</button>
+            </div>
+          </section>
+        </div>
+      )}
 
     </form>
   );

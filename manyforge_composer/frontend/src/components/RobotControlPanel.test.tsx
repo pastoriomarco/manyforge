@@ -38,7 +38,7 @@ const controller = vi.hoisted(() => ({
           maxAccelerationRadS2: 3,
         }],
         targetDescriptor: {
-          schemaVersion: 'manyforge.manual_control_motion_descriptor.v1',
+          schemaVersion: 'manyforge.manual_control_motion_descriptor.v3',
           controllableComponentId: 'robot-1', commandTargetId: 'arm',
           componentRoleId: 'controlled_component', targetRoleId: 'command_target',
           frames: [
@@ -46,6 +46,14 @@ const controller = vi.hoisted(() => ({
             { frameRoleId: 'tcp', compiledFrameName: 'tool0', modelInstanceId: 'robot-model', modelRevision: 'sha256:model' },
           ],
           joints: [{ sourceJointName: 'joint_1', compiledJointName: 'robot__joint_1', unit: 'rad', minPositionRad: -1, maxPositionRad: 1, maxVelocityRadS: 2, maxAccelerationRadS2: 3 }],
+          operationalJointLimits: [{
+            sourceJointName: 'joint_1', modelMaxVelocityRadS: 2,
+            modelMaxAccelerationRadS2: 3, deploymentMaxVelocityRadS: null,
+            deploymentMaxAccelerationRadS2: null, deploymentMaxJerkRadS3: null,
+            effectiveMaxVelocityRadS: 2, effectiveMaxAccelerationRadS2: 3,
+            effectiveMaxJerkRadS3: null,
+          }],
+          operationalLimit: null,
           contracts: {
             operationCapabilityId: 'execution.trajectory.execute', operationCapabilityDefinitionRevision: 'sha256:execution',
             commandSchema: null, controlPath: null,
@@ -71,8 +79,16 @@ const controller = vi.hoisted(() => ({
         minPosition: 0,
         maxPosition: 0.04,
         targetDescriptor: {
-          schemaVersion: 'manyforge.manual_control_gripper_descriptor.v1',
+          schemaVersion: 'manyforge.manual_control_gripper_descriptor.v2',
           controllableComponentId: 'robot-1', commandTargetId: 'gripper', componentRoleId: 'controlled_component', targetRoleId: 'command_target',
+          description: 'Test gripper', commandKind: 'gripper_position',
+          actuationKind: 'position_commanded', transportKind: 'resolved_binding',
+          controlInterfaceContractId: null, stateAuthorityId: null,
+          stateAuthorityClass: null, completionPolicy: 'goal_fenced_target_reached',
+          graspConfirmationPolicy: 'binding_feedback_required', sourceGroupName: 'gripper',
+          openStateRef: 'open', closedStateRef: 'open', commandDurationS: 0.5,
+          touchLinks: ['finger_link'], mountFrame: 'tool0', attachFrame: 'tool0',
+          tcpFrame: 'tool0', auxiliaryFrames: [],
           sourceCoordinateName: 'finger_joint', sourceKind: 'model_role', coordinateKind: 'linear_m', unit: 'm', minPosition: 0, maxPosition: 0.04,
           mimicFollowers: [], namedPresets: [{ name: 'open', masterPosition: 0.04, coordinates: [{ sourceCoordinateName: 'finger_joint', position: 0.04 }] }],
           contracts: {
@@ -145,6 +161,7 @@ const controller = vi.hoisted(() => ({
   dismissFullStopError: vi.fn(),
   pause: vi.fn(),
   resume: vi.fn(),
+  reset: vi.fn(),
   setRuntimeScale: vi.fn(),
   retry: vi.fn(),
 }));
@@ -179,5 +196,39 @@ describe('RobotControlPanel layout', () => {
     expect(markup).toContain('>Stop operation</button>');
     expect(markup).toContain('title="Discard only the local no-motion preview."');
     expect(markup).not.toContain('Revert only discards the local preview.');
+  });
+
+  it('renders exact-operation Pause, Resume, and eligible Reset controls', () => {
+    const state = controller.state as unknown as Record<string, unknown>;
+    state.phase = 'executing';
+    state.operation = {
+      operationId: 'operation-1',
+      operationRevision: 4,
+      resident: true,
+      state: 'executing',
+      progress: 0.4,
+      activeStopId: null,
+      activeStopGeneration: null,
+      terminalError: null,
+    };
+    let markup = renderToStaticMarkup(<RobotControlPanel enabled />);
+    expect(markup).toMatch(/<button type="button">Pause<\/button>/);
+    expect(markup).toMatch(/<button type="button" disabled="">Resume<\/button>/);
+    expect(markup).toContain('Reset operation');
+
+    state.phase = 'completed';
+    state.operation = {
+      ...(state.operation as Record<string, unknown>),
+      state: 'failed',
+      progress: 1,
+      terminalError: 'contained failure',
+    };
+    markup = renderToStaticMarkup(<RobotControlPanel enabled />);
+    expect(markup).toMatch(
+      /title="Release this exact terminal direct operation[^>]*>Reset operation<\/button>/,
+    );
+
+    state.phase = 'ready';
+    state.operation = null;
   });
 });

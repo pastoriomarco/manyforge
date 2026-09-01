@@ -129,6 +129,12 @@ export function ProgramRuntimePanel({
         </div>
       )}
 
+      {enabled && state.observationError !== null && (
+        <div className="program-feedback" role="status">
+          Runtime facts are reconnecting automatically: {state.observationError}
+        </div>
+      )}
+
       {enabled && (
         <div className="program-runtime-grid">
           <div className="program-runtime-fact">
@@ -581,14 +587,16 @@ export function ProgramTransportControls({
       || (motionStopSettled && operatorStopResetAction !== null)
     );
   const velocityAvailable = enabled
+    && (state.pending === null || state.pending === 'run')
+    && !['stopping', 'full_stopping'].includes(state.run?.state ?? '')
+    && robot.state.phase !== 'stopping'
+    && !robot.fullStopPending
     && robot.runtimeScaleStatus !== null
     && robot.runtimeScaleStatus.supported
-    && (robot.state.operation?.state === 'executing'
-      || robot.state.operation?.state === 'paused');
+    && !robot.runtimeScaleStatus.frozen;
   const velocityReason = robot.runtimeScaleError
-    ?? (motionActive
-      ? 'The exact active operation does not currently advertise qualified runtime-scale control.'
-      : 'Runtime velocity is available only while an addressed motion operation is active.');
+    ?? robot.runtimeScaleStatus?.reason
+    ?? 'The addressed target does not currently expose qualified runtime velocity control.';
   const fullCellStop = robot.state.status?.cellStopAction ?? null;
   const fullStopReason = fullCellStop === null
     ? 'The current execution owner status is unavailable.'
@@ -745,7 +753,10 @@ export function ProgramTransportControls({
             : 'Reset'}
         </button>
         <span className="viewer-tool-separator" aria-hidden="true" />
-        <label className="transport-velocity" title={velocityAvailable ? 'Scale the exact active operation.' : velocityReason}>
+        <label className="transport-velocity" title={velocityAvailable
+          ? 'Scale current and subsequent moves for this addressed target.'
+          : velocityReason}
+        >
           <span>Velocity</span>
           <input
             type="range"
@@ -781,9 +792,10 @@ export function ProgramTransportControls({
       >
         <ProgramRuntimePanel enabled={enabled} controller={program} />
         <p className="panel-intro transport-unavailable-reason">
-          Runtime velocity is operation-scoped. The slider keeps only the latest
-          pending value, re-reads the owner's applied value, and drops pending
-          input when Stop begins.
+          Runtime velocity is retained for this addressed robot target across
+          current and subsequent moves. The slider keeps only the latest pending
+          value, reconciles the owner&apos;s applied value, and drops pending input
+          when Stop begins.
           {!velocityAvailable && <> Currently unavailable: {velocityReason}</>}
         </p>
         <section className="runtime-detail-group" aria-label="Cell Full Stop">

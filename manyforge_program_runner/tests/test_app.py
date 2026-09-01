@@ -15,7 +15,10 @@ from manyforge_headless_api.models import (
     ProgramScenePreparationRequest,
 )
 from manyforge_program_runner.app import create_app
-from manyforge_program_runner.models import ProgramCycleResetRequest
+from manyforge_program_runner.models import (
+    ProgramCycleResetRequest,
+    ProgramNodeAvailabilityRequest,
+)
 from manyforge_program_runner.runtime import ProgramRunnerError
 
 
@@ -86,6 +89,16 @@ class FakeRuntime:
             "simulation_control_available": False,
         }
 
+    def node_availability(
+        self, request: ProgramNodeAvailabilityRequest
+    ) -> dict[str, Any]:
+        self.calls.append(("node_availability", request))
+        return {
+            "schema_version": "manyforge.program_node_availability.v1",
+            "source": {},
+            "availability": {},
+        }
+
     def runs(self, *, active_only: bool, limit: int) -> dict[str, Any]:
         self.calls.append(("runs", (active_only, limit)))
         return {
@@ -96,7 +109,6 @@ class FakeRuntime:
             "truncated": False,
             "runs": [_snapshot()],
         }
-
     def start_run(self, request: ProgramRunStartRequest) -> dict[str, Any]:
         self.calls.append(("start", request))
         return _snapshot()
@@ -227,6 +239,20 @@ def _caller() -> dict[str, Any]:
         "source_label": "operator_ui",
         "correlation_id": None,
     }
+
+
+def test_node_availability_is_a_read_only_runner_projection() -> None:
+    runtime = FakeRuntime()
+    body = {"applied": {"program_id": "program_a"}, "selection": {"scenario_id": "cell_a"}}
+    with TestClient(create_app(runtime)) as client:
+        response = client.post("/api/program/node-availability", json=body)
+
+    assert response.status_code == 200
+    assert response.json()["schema_version"] == (
+        "manyforge.program_node_availability.v1"
+    )
+    assert runtime.calls[0][0] == "node_availability"
+    assert runtime.calls[0][1].model_dump() == body
 
 
 def test_reset_is_an_explicit_strict_cycle_transition() -> None:

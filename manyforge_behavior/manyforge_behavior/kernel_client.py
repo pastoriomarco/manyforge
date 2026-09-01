@@ -53,12 +53,6 @@ class ExecutionTransport(Protocol):
 
     def stop_status(self, stop_id: str) -> dict[str, Any]: ...
 
-    def set_runtime_scale(
-        self, operation_id: str, body: Mapping[str, Any]
-    ) -> dict[str, Any]: ...
-
-    def get_runtime_scale(self, operation_id: str) -> dict[str, Any]: ...
-
 
 class KernelClientResponseError(RuntimeError):
     """Raised when a transport returns a successful but malformed projection."""
@@ -66,6 +60,10 @@ class KernelClientResponseError(RuntimeError):
 
 class KernelOperationObservationUnavailableError(RuntimeError):
     """An exact operation read could not reach the native owner temporarily."""
+
+
+class KernelOperationSettlementPendingError(RuntimeError):
+    """A terminal operation still has one accepted subordinate effect in flight."""
 
 
 class LegacyKernelMockUnavailableError(RuntimeError):
@@ -147,8 +145,6 @@ class KernelClient:
             "reset",
             "acknowledge_completed",
             "stop",
-            "set_runtime_scale",
-            "get_runtime_scale",
         ):
             if not callable(getattr(transport, method, None)):
                 raise TypeError(f"execution transport has no callable {method}")
@@ -319,9 +315,25 @@ class KernelClient:
     def acknowledge_completed(
         self, operation_id: str, request: Mapping[str, Any]
     ) -> dict[str, Any]:
+        try:
+            response = self._transport.acknowledge_completed(
+                operation_id, request
+            )
+        except Exception as error:
+            details = getattr(error, "details", None)
+            if (
+                getattr(error, "code", None) == "operation_effect_in_flight"
+                or (
+                    isinstance(details, Mapping)
+                    and details.get("reason") == "operation_effect_in_flight"
+                )
+            ):
+                raise KernelOperationSettlementPendingError(
+                    "operation completion is waiting for a subordinate effect"
+                ) from error
+            raise
         return self._successful(
-            self._transport.acknowledge_completed(operation_id, request),
-            label="completion acknowledgement",
+            response, label="completion acknowledgement"
         )
 
     def stop(self, request: Mapping[str, Any]) -> dict[str, Any]:
@@ -360,20 +372,6 @@ class KernelClient:
             )
         return response
 
-    def set_runtime_scale(
-        self, operation_id: str, request: Mapping[str, Any]
-    ) -> dict[str, Any]:
-        return self._successful(
-            self._transport.set_runtime_scale(operation_id, request),
-            label="runtime-scale update",
-        )
-
-    def runtime_scale(self, operation_id: str) -> dict[str, Any]:
-        return self._successful(
-            self._transport.get_runtime_scale(operation_id),
-            label="runtime-scale observation",
-        )
-
 
 class MockKernelClient:
     """Removed stateful semantic mock; tests fake the thin HTTP transport."""
@@ -391,6 +389,7 @@ __all__ = [
     "ExecutionTransport",
     "KernelClient",
     "KernelOperationObservationUnavailableError",
+    "KernelOperationSettlementPendingError",
     "KernelClientResponseError",
     "LegacyKernelMockUnavailableError",
     "MockKernelClient",

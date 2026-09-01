@@ -106,17 +106,10 @@ private:
                      std::string_view request_owner_epoch,
                      std::string_view request_id);
 
+  std::filesystem::path install_root_;
+  std::filesystem::path artifact_root_;
   manyforge::deployment::FilesystemScenarioApplyCandidateSource
       scenario_source_;
-  manyforge::deployment::FilesystemVerifiedRetainedBundleSource bundle_source_;
-  manyforge::deployment::FilesystemVerifiedRetainedModelMapSource
-      model_map_source_;
-  manyforge::deployment::FilesystemVerifiedCatalogArtifactSource
-      catalog_source_;
-  manyforge::deployment::FilesystemVerifiedRawArtifactSource
-      raw_artifact_source_;
-  manyforge::deployment::FilesystemVerifiedProgramBindingSource
-      baseline_binding_source_;
   manyforge::deployment::FilesystemRawArtifactStore raw_artifact_store_;
   manyforge::deployment::FilesystemCatalogArtifactStore catalog_store_;
   manyforge::deployment::FilesystemRetainedBundleRepository bundle_repository_;

@@ -1,0 +1,212 @@
+import { renderToStaticMarkup } from 'react-dom/server';
+import { describe, expect, it, vi } from 'vitest';
+
+import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorkspace';
+import { DeploymentFocusedEditor } from './DeploymentFocusedEditor';
+
+const digest = `sha256:${'1'.repeat(64)}`;
+
+function controller(): DeploymentWorkspaceController {
+  return {
+    workspace: {
+      schemaVersion: 'manyforge.composer_deployment_workspace.v1',
+      draft: {
+        id: 'deployment-draft-1',
+        revision: 1,
+        document: {
+          api_version: 'manyforge.deployment.v1',
+          deployment_artifact_id: 'cell-a',
+          deployment_revision: digest,
+          cell_id: 'cell-a',
+          name: 'Cell A',
+          graph: {
+            runtime_units: [{
+              runtime_unit_id: 'robot.native_execution',
+              configuration: {
+                mode: 'simulated',
+                execution_tick_hz: 100,
+                collision_monitor_period_ms: 50,
+                planner_rng_seed: 12345,
+                initial_joint_positions_rad: [0, 1.57],
+                direct_control_joint_limits: [],
+                gripper_target_configurations: [{
+                  controllable_component_id: 'robot',
+                  command_target_id: 'gripper',
+                  description: 'Native test gripper',
+                  actuation_kind: 'position_commanded',
+                  open_state_ref: 'open',
+                  closed_state_ref: 'closed',
+                  command_duration_s: 0.8,
+                  touch_links: ['finger_link'],
+                  mount_frame: 'tool0',
+                  attach_frame: 'tool0',
+                  tcp_frame: 'tool0',
+                  auxiliary_frames: [],
+                }],
+                motion_target_limits: [{
+                  controllable_component_id: 'robot',
+                  command_target_id: 'arm',
+                  maximum_tcp_linear_speed_mps: 0.15,
+                }],
+              },
+            }],
+          },
+          policies: {
+            stop_stage_parameters: [{
+              stop_escalation_stage_id: 'motion_controlled_stop',
+              provider_contract_ref: { provider_contract_role_id: 'stop_contract' },
+              default_contract_parameters: {
+                stop_mode: 'soft_on_path',
+                deceleration_time_s: 1,
+                allow_natural_completion_on_short_path: true,
+                per_resource_limits: [{
+                  resource_id: 'robot.arm.coordinate.000000',
+                  max_deceleration: {
+                    coordinate_kind: 'angular_rad_s2',
+                    value_rad_s2: 4,
+                  },
+                  settle_velocity_threshold: {
+                    coordinate_kind: 'angular_rad_s',
+                    value_rad_s: 0.01,
+                  },
+                }],
+              },
+            }],
+          },
+        },
+        deploymentArtifactId: 'cell-a',
+        deploymentRevision: digest,
+        graphRevision: digest,
+        differsFromSaved: false,
+      },
+      saved: { path: '/workspace/cell-a.deployment.yaml', deploymentRevision: digest },
+      managerApplied: { deploymentRevision: digest, scenarioId: 'cell-a' },
+      runAdmission: { ready: true, reason: null },
+      binding: null,
+      scenarioCandidates: [],
+      savedScenarioCandidates: [],
+      unavailableReasons: [],
+    },
+    loading: false,
+    busy: false,
+    error: null,
+    feedback: null,
+    candidate: null,
+    mutationAvailable: true,
+    mutationUnavailableReason: null,
+    refresh: vi.fn(),
+    clearFeedback: vi.fn(),
+    dismissError: vi.fn(),
+    open: vi.fn(),
+    mutate: vi.fn(),
+    updateControlledStop: vi.fn(),
+    updateMotionTargetLimit: vi.fn(),
+    revert: vi.fn(),
+    save: vi.fn(),
+    saveAs: vi.fn(),
+    discard: vi.fn(),
+    previewDraft: vi.fn(),
+    applyDraft: vi.fn(),
+  };
+}
+
+describe('DeploymentFocusedEditor', () => {
+  it('presents canonical target, native runtime, and normalized Stop inputs', () => {
+    const markup = renderToStaticMarkup(
+      <DeploymentFocusedEditor
+        controller={controller()}
+        sourceModel={{ status: 'loading' }}
+        motionDescriptor={{
+          schemaVersion: 'manyforge.manual_control_motion_descriptor.v3',
+          controllableComponentId: 'robot',
+          commandTargetId: 'arm',
+          componentRoleId: 'robot',
+          targetRoleId: 'arm',
+          frames: [],
+          joints: [{
+            sourceJointName: 'joint1', compiledJointName: 'robot__joint1', unit: 'rad',
+            minPositionRad: -1, maxPositionRad: 1, maxVelocityRadS: 2,
+            maxAccelerationRadS2: 3,
+          }],
+          operationalJointLimits: [{
+            sourceJointName: 'joint1', modelMaxVelocityRadS: 2,
+            modelMaxAccelerationRadS2: 3, deploymentMaxVelocityRadS: null,
+            deploymentMaxAccelerationRadS2: null, deploymentMaxJerkRadS3: null,
+            effectiveMaxVelocityRadS: 2, effectiveMaxAccelerationRadS2: 3,
+            effectiveMaxJerkRadS3: null,
+          }],
+          operationalLimit: {
+            catalogPolicyMaximumTcpLinearSpeedMps: 0.2,
+            deploymentMaximumTcpLinearSpeedMps: 0.15,
+            effectiveMaximumTcpLinearSpeedMps: 0.15,
+            policyId: 'policy', policyRevision: digest,
+            selectedScope: 'command_target', sourceContentDigest: digest,
+          },
+          contracts: {
+            operationCapabilityId: 'execution.trajectory.execute',
+            operationCapabilityDefinitionRevision: digest,
+            commandSchema: null, controlPath: null, supportingProviders: [],
+          },
+        }}
+        gripperDescriptor={null}
+      />,
+    );
+
+    expect(markup).toContain('Robot model and target limits');
+    expect(markup).toContain('Maximum TCP linear speed');
+    expect(markup).toContain('value="0.15"');
+    expect(markup).toContain('Native runtime configuration');
+    expect(markup).toContain('Execution cadence');
+    expect(markup).toContain('Initial joint state');
+    expect(markup).toContain('Robot Control joint caps');
+    expect(markup).toContain('Maximum acceleration');
+    expect(markup).toContain('Controlled Stop');
+    expect(markup).toContain('Soft on path');
+    expect(markup).toContain('Update Controlled Stop Draft');
+    expect(markup).toContain('No current addressed gripper descriptor is available.');
+  });
+
+  it('joins one authored gripper row to exact owner semantics', () => {
+    const markup = renderToStaticMarkup(
+      <DeploymentFocusedEditor
+        controller={controller()}
+        sourceModel={{ status: 'loading' }}
+        motionDescriptor={null}
+        gripperDescriptor={{
+          schemaVersion: 'manyforge.manual_control_gripper_descriptor.v2',
+          controllableComponentId: 'robot', commandTargetId: 'gripper',
+          componentRoleId: 'robot', targetRoleId: 'gripper',
+          description: 'Native test gripper', commandKind: 'gripper_position',
+          actuationKind: 'position_commanded', transportKind: 'resolved_binding',
+          controlInterfaceContractId: 'native.gripper',
+          stateAuthorityId: 'native.predicted', stateAuthorityClass: 'predicted',
+          completionPolicy: 'goal_fenced_target_reached',
+          graspConfirmationPolicy: 'binding_feedback_required',
+          sourceGroupName: 'gripper', sourceCoordinateName: 'finger_joint',
+          sourceKind: 'model_role', coordinateKind: 'linear_m', unit: 'm',
+          minPosition: 0, maxPosition: 0.04,
+          openStateRef: 'open', closedStateRef: 'closed', commandDurationS: 0.8,
+          touchLinks: ['finger_link'], mountFrame: 'tool0', attachFrame: 'tool0',
+          tcpFrame: 'tool0', auxiliaryFrames: [], mimicFollowers: [],
+          namedPresets: [
+            { name: 'closed', masterPosition: 0, coordinates: [] },
+            { name: 'open', masterPosition: 0.04, coordinates: [] },
+          ],
+          contracts: {
+            operationCapabilityId: 'tool.gripper.command',
+            operationCapabilityDefinitionRevision: digest,
+            commandSchema: { commandSchemaId: 'gripper.command_position', commandSchemaRevision: digest },
+            controlPath: null, supportingProviders: [],
+          },
+        }}
+      />,
+    );
+
+    expect(markup).toContain('Deployment-owned tool inputs');
+    expect(markup).toContain('Native test gripper');
+    expect(markup).toContain('goal fenced target reached');
+    expect(markup).toContain('binding feedback required');
+    expect(markup).toContain('Update gripper Draft');
+    expect(markup).toContain('finger_link');
+  });
+});

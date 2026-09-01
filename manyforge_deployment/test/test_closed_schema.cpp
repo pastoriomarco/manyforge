@@ -676,7 +676,7 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
   EXPECT_EQ(qualified_count, 11U);
   EXPECT_EQ(registry.qualification_registry_digest().value(),
             "sha256:"
-            "50b5f0670b82edbc106cf413030af6481bb4390a7d8fee2dedfeb3686fd7adb5");
+            "04144f5a593b5cce338e44207f017d0c1c045605cc89c2284b3ee1e189176122");
   EXPECT_NE(
       registry.find_qualified_value_schema(
           core::SchemaId("manyforge.value_schema.provider_contract.empty.v1"),
@@ -701,8 +701,8 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
       registry.find_qualified_value_schema(
           core::SchemaId("manyforge.value_schema.runtime.native_execution.v1"),
           core::SchemaRevision("sha256:"
-                               "c20bf40303bddd213d8db77b7075c0fe224e00928f4e6bd"
-                               "a3cbfd7ebba880d6e")),
+                               "bbdbef03855e2e09015386168c37a590d0e22ca51dcbfb539"
+                               "0ff1ab645f4e28a")),
       nullptr);
   EXPECT_EQ(registry.find_qualified_value_schema(
                 core::SchemaId("manyforge.none.v1"),
@@ -768,7 +768,7 @@ TEST(ClosedSchema,
       core::SchemaId("manyforge.value_schema.runtime.native_execution.v1"),
       core::SchemaRevision(
           "sha256:"
-          "c20bf40303bddd213d8db77b7075c0fe224e00928f4e6bda3cbfd7ebba880d6e"));
+          "4be97ca6314af96d083a37a6aed9ef5976ed0e63c02d69ac790377edeb6804fb"));
   ASSERT_NE(schema, nullptr);
 
   const CanonicalValue valid = value_object({
@@ -784,6 +784,44 @@ TEST(ClosedSchema,
                                       })},
       {"execution_tick_hz", CanonicalValue(100.0)},
       {"collision_monitor_period_ms", CanonicalValue(50.0)},
+      {"motion_target_limits",
+       CanonicalValue(CanonicalValue::Array{CanonicalValue(
+           CanonicalValue::Object{
+               {"controllable_component_id", CanonicalValue("robot")},
+               {"command_target_id", CanonicalValue("arm")},
+               {"maximum_tcp_linear_speed_mps", CanonicalValue(0.15)},
+           })})},
+      {"direct_control_joint_limits",
+       CanonicalValue(CanonicalValue::Array{CanonicalValue(
+           CanonicalValue::Object{
+               {"controllable_component_id", CanonicalValue("robot")},
+               {"command_target_id", CanonicalValue("arm")},
+               {"source_joint_name", CanonicalValue("joint1")},
+               {"max_velocity_rad_s", CanonicalValue(1.5)},
+               {"max_acceleration_rad_s2", CanonicalValue(2.5)},
+               {"max_jerk_rad_s3", CanonicalValue(10.0)},
+           })})},
+      {"gripper_target_configurations",
+       CanonicalValue(CanonicalValue::Array{CanonicalValue(
+           CanonicalValue::Object{
+               {"actuation_kind", CanonicalValue("position_commanded")},
+               {"attach_frame", CanonicalValue("tool_tcp")},
+               {"auxiliary_frames",
+                CanonicalValue(CanonicalValue::Array{
+                    CanonicalValue("tool_base")})},
+               {"closed_state_ref", CanonicalValue("closed")},
+               {"command_duration_s", CanonicalValue(0.8)},
+               {"command_target_id", CanonicalValue("gripper")},
+               {"controllable_component_id", CanonicalValue("robot")},
+               {"description", CanonicalValue("Test gripper")},
+               {"mount_frame", CanonicalValue("tool_mount")},
+               {"open_state_ref", CanonicalValue("open")},
+               {"tcp_frame", CanonicalValue("tool_tcp")},
+               {"touch_links",
+                CanonicalValue(CanonicalValue::Array{
+                    CanonicalValue("left_finger"),
+                    CanonicalValue("right_finger")})},
+           })})},
   });
   const auto normalized =
       validate_and_normalize_build_qualified_value(*schema, valid);

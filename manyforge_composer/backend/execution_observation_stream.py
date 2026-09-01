@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Final
@@ -163,6 +165,18 @@ def project_execution_observation(
     }
 
 
+def encode_execution_observation_frame(frame: dict[str, Any]) -> str:
+    """Encode one validated frame once for immutable multi-client fanout."""
+
+    return json.dumps(
+        frame,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
 def _render_signature(frame: dict[str, Any]) -> tuple[Any, ...]:
     return (
         frame["owner_epoch"],
@@ -178,9 +192,19 @@ def _render_signature(frame: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
+def _next_poll_deadline(
+    period_s: float,
+    now: float,
+) -> float:
+    # Match old main's proven viewer scheduler: a completed observation anchors
+    # the next admission. Response-time variation therefore cannot bunch two
+    # visual samples or create catch-up load against the execution owner.
+    return now + period_s
+
+
 @dataclass(eq=False)
 class ExecutionObservationSubscription:
-    queue: asyncio.Queue[dict[str, Any]]
+    queue: asyncio.Queue[str]
 
 
 class ExecutionObservationSource:
@@ -189,12 +213,17 @@ class ExecutionObservationSource:
     def __init__(self, client: HeadlessHttpClient) -> None:
         self._client = client
         self._subscriptions: set[ExecutionObservationSubscription] = set()
-        self._task: asyncio.Task[None] | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._last_render_signature: tuple[Any, ...] | None = None
-        self._last_frame: dict[str, Any] | None = None
-        self._last_source_identity: tuple[str, str] | None = None
-        self._last_source_sequence: int | None = None
+        self._last_payload: str | None = None
+        self._worker: threading.Thread | None = None
+        self._worker_stop: threading.Event | None = None
+        self._worker_generation = 0
+        self._metrics_lock = threading.Lock()
+        self._ingress_lock = threading.Lock()
+        self._ingress_pending: tuple[int, str] | None = None
+        self._ingress_drain_scheduled = False
+        self._ingress_replacements = 0
+        self._ingress_schedule_failures = 0
         self._polls = 0
         self._published = 0
         self._replaced = 0
@@ -208,40 +237,63 @@ class ExecutionObservationSource:
         if self._loop is not None and self._loop is not loop:
             if self._subscriptions:
                 raise RuntimeError("execution observation source crossed event loops")
-            self._task = None
         self._loop = loop
         subscription = ExecutionObservationSubscription(asyncio.Queue(maxsize=1))
         self._subscriptions.add(subscription)
-        if self._last_frame is not None:
-            subscription.queue.put_nowait(self._last_frame)
-        if self._task is None or self._task.done():
-            self._task = loop.create_task(self._run())
+        if self._last_payload is not None:
+            subscription.queue.put_nowait(self._last_payload)
+        if (
+            self._worker is None
+            or not self._worker.is_alive()
+            or self._worker_stop is None
+            or self._worker_stop.is_set()
+        ):
+            self._start_worker()
         return subscription
 
     def unsubscribe(self, subscription: ExecutionObservationSubscription) -> None:
         self._subscriptions.discard(subscription)
-        if not self._subscriptions and self._task is not None:
-            self._task.cancel()
-            self._task = None
-            self._last_render_signature = None
-            self._last_frame = None
-            self._last_source_identity = None
-            self._last_source_sequence = None
+        if not self._subscriptions:
+            if self._worker_stop is not None:
+                self._worker_stop.set()
+            self._worker = None
+            self._worker_stop = None
+            self._last_payload = None
+            with self._ingress_lock:
+                self._ingress_pending = None
 
     def status(self) -> dict[str, Any]:
+        with self._metrics_lock:
+            polls = self._polls
+            published = self._published
+            errors = self._errors
+            last_poll_duration_us = self._last_poll_duration_us
+            max_poll_duration_us = self._max_poll_duration_us
+            last_error = (
+                None if self._last_error is None else dict(self._last_error)
+            )
+        with self._ingress_lock:
+            ingress_replacements = self._ingress_replacements
+            ingress_schedule_failures = self._ingress_schedule_failures
         return {
             "schema_version": "manyforge.execution_observation_stream_status.v1",
             "source": {
-                "active": self._task is not None and not self._task.done(),
-                "rate_limit_hz": OBSERVATION_RATE_HZ,
-                "poll_count": self._polls,
-                "published_count": self._published,
-                "error_count": self._errors,
-                "last_poll_duration_us": self._last_poll_duration_us,
-                "max_poll_duration_us": self._max_poll_duration_us,
-                "last_error": (
-                    None if self._last_error is None else dict(self._last_error)
+                "active": bool(
+                    self._subscriptions
+                    and self._worker is not None
+                    and self._worker.is_alive()
+                    and self._worker_stop is not None
+                    and not self._worker_stop.is_set()
                 ),
+                "rate_limit_hz": OBSERVATION_RATE_HZ,
+                "poll_count": polls,
+                "published_count": published,
+                "error_count": errors,
+                "last_poll_duration_us": last_poll_duration_us,
+                "max_poll_duration_us": max_poll_duration_us,
+                "last_error": last_error,
+                "ingress_replaced_frames": ingress_replacements,
+                "ingress_schedule_failures": ingress_schedule_failures,
             },
             "fanout": {
                 "client_count": len(self._subscriptions),
@@ -250,48 +302,71 @@ class ExecutionObservationSource:
             },
         }
 
-    async def _run(self) -> None:
-        try:
-            while self._subscriptions:
-                started = time.monotonic()
-                failed = False
-                try:
+    def _start_worker(self) -> None:
+        self._worker_generation += 1
+        generation = self._worker_generation
+        stop = threading.Event()
+        worker = threading.Thread(
+            target=self._run_worker,
+            args=(generation, stop),
+            name="manyforge-viewer-observation",
+            daemon=True,
+        )
+        self._worker_stop = stop
+        self._worker = worker
+        worker.start()
+
+    def _run_worker(self, generation: int, stop: threading.Event) -> None:
+        """Sample one read-only owner view outside the ASGI event loop."""
+
+        last_render_signature: tuple[Any, ...] | None = None
+        last_source_identity: tuple[str, str] | None = None
+        last_source_sequence: int | None = None
+        next_poll_at = time.monotonic()
+        while not stop.is_set():
+            started = time.monotonic()
+            failed = False
+            try:
+                with self._metrics_lock:
                     self._polls += 1
-                    response = await asyncio.to_thread(
-                        self._client.execution_observation
+                response = self._client.execution_observation()
+                frame = project_execution_observation(
+                    response,
+                    received_at_monotonic_us=int(time.monotonic() * 1_000_000),
+                )
+                source_identity = (frame["owner_epoch"], frame["source_epoch"])
+                source_sequence = frame["source_sequence"]
+                if (
+                    last_source_identity == source_identity
+                    and last_source_sequence is not None
+                    and source_sequence < last_source_sequence
+                ):
+                    raise ExecutionObservationProjectionError(
+                        "execution observation sequence regressed within one source epoch"
                     )
-                    frame = project_execution_observation(
-                        response,
-                        received_at_monotonic_us=int(time.monotonic() * 1_000_000),
+                signature = _render_signature(frame)
+                if (
+                    last_source_identity == source_identity
+                    and last_source_sequence == source_sequence
+                    and last_render_signature is not None
+                    and signature != last_render_signature
+                ):
+                    raise ExecutionObservationProjectionError(
+                        "execution observation changed without advancing its source sequence"
                     )
-                    source_identity = (frame["owner_epoch"], frame["source_epoch"])
-                    source_sequence = frame["source_sequence"]
-                    if (
-                        self._last_source_identity == source_identity
-                        and self._last_source_sequence is not None
-                        and source_sequence < self._last_source_sequence
-                    ):
-                        raise ExecutionObservationProjectionError(
-                            "execution observation sequence regressed within one source epoch"
-                        )
-                    signature = _render_signature(frame)
-                    if (
-                        self._last_source_identity == source_identity
-                        and self._last_source_sequence == source_sequence
-                        and self._last_render_signature is not None
-                        and signature != self._last_render_signature
-                    ):
-                        raise ExecutionObservationProjectionError(
-                            "execution observation changed without advancing its source sequence"
-                        )
-                    self._last_source_identity = source_identity
-                    self._last_source_sequence = source_sequence
-                    if signature != self._last_render_signature:
-                        self._last_render_signature = signature
-                        self._publish(frame)
+                last_source_identity = source_identity
+                last_source_sequence = source_sequence
+                if signature != last_render_signature:
+                    last_render_signature = signature
+                    self._offer_from_worker(
+                        generation,
+                        encode_execution_observation_frame(frame),
+                    )
+                with self._metrics_lock:
                     self._last_error = None
-                except (HeadlessClientError, ExecutionObservationProjectionError) as error:
-                    failed = True
+            except (HeadlessClientError, ExecutionObservationProjectionError) as error:
+                failed = True
+                with self._metrics_lock:
                     self._errors += 1
                     self._last_error = {
                         "code": getattr(
@@ -301,31 +376,74 @@ class ExecutionObservationSource:
                         ),
                         "message": str(error)[:512],
                     }
-                except Exception as error:  # keep this optional presentation source alive
-                    failed = True
+            except Exception as error:  # keep this optional presentation source alive
+                failed = True
+                with self._metrics_lock:
                     self._errors += 1
                     self._last_error = {
                         "code": "execution_observation_source_failed",
                         "message": str(error)[:512],
                     }
-                elapsed = time.monotonic() - started
-                elapsed_us = max(0, round(elapsed * 1_000_000))
+            elapsed = time.monotonic() - started
+            elapsed_us = max(0, round(elapsed * 1_000_000))
+            with self._metrics_lock:
                 self._last_poll_duration_us = elapsed_us
                 self._max_poll_duration_us = max(
                     self._max_poll_duration_us, elapsed_us
                 )
-                period = (
-                    _OBSERVATION_ERROR_PERIOD_S
-                    if failed
-                    else _OBSERVATION_PERIOD_S
-                )
-                await asyncio.sleep(max(0.0, period - elapsed))
-        except asyncio.CancelledError:
-            pass
+            period = (
+                _OBSERVATION_ERROR_PERIOD_S
+                if failed
+                else _OBSERVATION_PERIOD_S
+            )
+            now = time.monotonic()
+            next_poll_at = _next_poll_deadline(period, now)
+            stop.wait(max(0.0, next_poll_at - now))
 
-    def _publish(self, frame: dict[str, Any]) -> None:
-        self._published += 1
-        self._last_frame = frame
+    def _offer_from_worker(
+        self,
+        generation: int,
+        payload: str,
+    ) -> None:
+        loop = self._loop
+        if loop is None or loop.is_closed() or generation != self._worker_generation:
+            return
+        schedule = False
+        with self._ingress_lock:
+            if generation != self._worker_generation:
+                return
+            if self._ingress_pending is not None:
+                self._ingress_replacements += 1
+            self._ingress_pending = (generation, payload)
+            if not self._ingress_drain_scheduled:
+                self._ingress_drain_scheduled = True
+                schedule = True
+        if not schedule:
+            return
+        try:
+            loop.call_soon_threadsafe(self._drain_ingress)
+        except RuntimeError:
+            with self._ingress_lock:
+                self._ingress_pending = None
+                self._ingress_drain_scheduled = False
+                self._ingress_schedule_failures += 1
+
+    def _drain_ingress(self) -> None:
+        while True:
+            with self._ingress_lock:
+                pending = self._ingress_pending
+                self._ingress_pending = None
+                if pending is None:
+                    self._ingress_drain_scheduled = False
+                    return
+            generation, payload = pending
+            if generation == self._worker_generation and self._subscriptions:
+                self._publish(payload)
+
+    def _publish(self, payload: str) -> None:
+        with self._metrics_lock:
+            self._published += 1
+        self._last_payload = payload
         for subscription in tuple(self._subscriptions):
             if subscription.queue.full():
                 try:
@@ -333,7 +451,7 @@ class ExecutionObservationSource:
                     self._replaced += 1
                 except asyncio.QueueEmpty:
                     pass
-            subscription.queue.put_nowait(frame)
+            subscription.queue.put_nowait(payload)
 
 
 __all__ = [
@@ -342,5 +460,6 @@ __all__ = [
     "ExecutionObservationSubscription",
     "OBSERVATION_FRAME_SCHEMA",
     "OBSERVATION_RATE_HZ",
+    "encode_execution_observation_frame",
     "project_execution_observation",
 ]

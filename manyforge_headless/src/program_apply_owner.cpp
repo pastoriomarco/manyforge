@@ -506,14 +506,13 @@ ProgramSelectionOwner::ProgramSelectionOwner(
     std::filesystem::path install_root, std::filesystem::path artifact_root,
     std::filesystem::path owner_state_root, std::string owner_id,
     std::string owner_epoch)
-    : scenario_source_(install_root, "maintained"),
-      bundle_source_(install_root), model_map_source_(install_root),
-      catalog_source_(install_root), raw_artifact_source_(install_root),
-      baseline_binding_source_(install_root),
-      raw_artifact_store_(artifact_root), catalog_store_(artifact_root),
-      bundle_repository_(artifact_root), program_repository_(artifact_root),
-      binding_repository_(artifact_root), artifact_bundle_source_(artifact_root),
-      artifact_model_map_source_(artifact_root),
+    : install_root_(std::move(install_root)),
+      artifact_root_(std::move(artifact_root)),
+      scenario_source_(install_root_, "maintained", artifact_root_),
+      raw_artifact_store_(artifact_root_), catalog_store_(artifact_root_),
+      bundle_repository_(artifact_root_), program_repository_(artifact_root_),
+      binding_repository_(artifact_root_), artifact_bundle_source_(artifact_root_),
+      artifact_model_map_source_(artifact_root_),
       owner_state_(std::move(owner_state_root),
                    std::string(kProgramSelectionOwnerStateFile)),
       source_owner_id_(std::move(owner_id)),
@@ -538,23 +537,45 @@ CanonicalValue ProgramSelectionOwner::Prepare(
             content_identity::is_sha256_digest(active_graph_revision),
         "program_apply_request_invalid",
         "Program Apply expected or active identity is invalid");
-    const auto scenario =
-        scenario_source_.LoadExactProgramSelection(scenario_id);
-    Require(scenario.scenario_catalog_revision.value() ==
-                expected_scenario_catalog_revision,
-            "program_apply_scenario_catalog_stale",
-            "Program Apply targets a stale scenario-catalog revision");
+    const auto scenario = scenario_source_.LoadExactProgramSelectionForCatalog(
+        scenario_id, core::ScenarioCatalogRevision(
+                         std::string(expected_scenario_catalog_revision)));
     Require(scenario.retained_bundle_id.value() == active_retained_bundle_id &&
                 scenario.graph_revision.value() == active_graph_revision,
             "program_apply_deployment_not_active",
             "Program Apply target deployment is not the fresh active Manager "
             "selection");
+    const auto candidate_bundle_path =
+        artifact_root_ / "retained-bundles" / "sha256" /
+        (scenario.retained_bundle_id.value().substr(7U) + ".json");
+    std::error_code candidate_error;
+    const auto candidate_status =
+        std::filesystem::symlink_status(candidate_bundle_path, candidate_error);
+    Require(candidate_error == std::errc::no_such_file_or_directory ||
+                !candidate_error,
+            "program_apply_bundle_invalid",
+            "Program Apply candidate bundle could not be inspected");
+    const auto &source_root =
+        !candidate_error &&
+                candidate_status.type() != std::filesystem::file_type::not_found
+            ? artifact_root_
+            : install_root_;
+    const deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
+        source_root);
+    const deployment::FilesystemVerifiedRetainedModelMapSource
+        model_map_source(source_root);
+    const deployment::FilesystemVerifiedCatalogArtifactSource catalog_source(
+        source_root);
+    const deployment::FilesystemVerifiedRawArtifactSource raw_artifact_source(
+        source_root);
+    const deployment::FilesystemVerifiedProgramBindingSource
+        baseline_binding_source(source_root);
     const auto bundle =
-        bundle_source_.get_verified(scenario.retained_bundle_id);
+        bundle_source.get_verified(scenario.retained_bundle_id);
     Require(bundle != nullptr, "program_apply_bundle_invalid",
             "Program Apply retained bundle is absent or unverifiable");
-    auto model_map = LoadModelMap(*bundle, model_map_source_);
-    const auto baseline = baseline_binding_source_.get_verified(
+    auto model_map = LoadModelMap(*bundle, model_map_source);
+    const auto baseline = baseline_binding_source.get_verified(
         scenario.program_binding_id, *bundle, model_map);
     Require(baseline != nullptr, "program_apply_baseline_binding_invalid",
             "Program Apply occurrence has no verified baseline binding");
@@ -583,7 +604,7 @@ CanonicalValue ProgramSelectionOwner::Prepare(
       try {
         return deployment::compile_program_binding(
             *program, AssignmentFrom(*baseline), *bundle, model_map,
-            catalog_source_);
+            catalog_source);
       } catch (const deployment::ProgramBindingCompilerError &error) {
         Fail("program_apply_binding_invalid",
              "Program Apply binding is invalid: " + std::string(error.what()));
@@ -608,7 +629,7 @@ CanonicalValue ProgramSelectionOwner::Prepare(
     for (const auto &record : bundle->value().catalogs.records) {
       std::visit(
           [&](const auto &reference) {
-            const auto bytes = catalog_source_.get_verified(
+            const auto bytes = catalog_source.get_verified(
                 reference.content_addressed_store_key,
                 reference.content_digest);
             Require(bytes.has_value(), "program_apply_bundle_invalid",
@@ -620,7 +641,7 @@ CanonicalValue ProgramSelectionOwner::Prepare(
           record);
     }
     const auto copy_raw = [&](const auto &reference) {
-      const auto bytes = raw_artifact_source_.get_verified(
+      const auto bytes = raw_artifact_source.get_verified(
           reference.content_addressed_store_key, reference.content_digest,
           reference.byte_size);
       Require(bytes.has_value(), "program_apply_bundle_invalid",
@@ -634,7 +655,7 @@ CanonicalValue ProgramSelectionOwner::Prepare(
               "Program Apply raw artifact reopened under another identity");
     };
     for (const auto &schema : bundle->value().catalogs.schema_artifacts) {
-      const auto bytes = raw_artifact_source_.get_verified(
+      const auto bytes = raw_artifact_source.get_verified(
           schema.content_addressed_store_key, schema.content_digest);
       Require(bytes.has_value(), "program_apply_bundle_invalid",
               "Program Apply schema-artifact closure is unavailable");

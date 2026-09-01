@@ -14,6 +14,7 @@ from manyforge_behavior.orchestration_ports import (
     OwnerNodeInputs,
     OwnerTaskObservationUnavailableError,
     OwnerTaskPort,
+    OwnerTaskSettlementPendingError,
     OwnerTaskSnapshot,
     OwnerTaskState,
     ProgramInterventionPort,
@@ -258,6 +259,8 @@ class OwnerTaskAdapter(_OwnerAdapter):
                     return py_trees.common.Status.FAILURE
                 try:
                     self._port.acknowledge(task.task_id, self._identity)
+                except OwnerTaskSettlementPendingError:
+                    return py_trees.common.Status.RUNNING
                 except Exception as exc:
                     self._record_failure("owner_acknowledgement_failed", str(exc))
                     return py_trees.common.Status.FAILURE

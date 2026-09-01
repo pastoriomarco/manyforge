@@ -1994,6 +1994,50 @@ TEST(FilesystemVerifiedRetainedViewerModelSourceTest,
 }
 
 TEST(FilesystemVerifiedRetainedViewerModelSourceTest,
+     PartialAuthoredDuplicateCannotShadowInstalledBundle) {
+  ScopedTrustedRoot installed;
+  ScopedTrustedRoot authored;
+  const auto materialized =
+      materialize_durable_lite6_bundle(installed.path());
+  ASSERT_TRUE(
+      materialized.bundle->value().compiled_products.viewer_model.has_value());
+  const auto &viewer =
+      *materialized.bundle->value().compiled_products.viewer_model;
+
+  const auto authored_bundle =
+      bundle_path(authored.path(), materialized.bundle->retained_bundle_id());
+  std::filesystem::create_directories(authored_bundle.parent_path());
+  write_file(authored_bundle, materialized.bundle->canonical_bytes());
+
+  const FilesystemVerifiedRetainedViewerModelSource source(
+      installed.path(), authored.path());
+  const auto loaded = source.get_verified(
+      {materialized.bundle->retained_bundle_id(), viewer.product_id});
+  ASSERT_TRUE(loaded.has_value());
+  EXPECT_FALSE(loaded->resources().empty());
+}
+
+TEST(FilesystemVerifiedRetainedBundleSourceTest,
+     AuthoredPackageProvidesGenuinelyNewBundleIdentity) {
+  ScopedTrustedRoot installed;
+  ScopedTrustedRoot authored;
+  const auto installed_bundle =
+      materialize_durable_bundle(installed.path(), "installed_bundle");
+  const auto authored_bundle =
+      materialize_durable_bundle(authored.path(), "authored_bundle");
+  ASSERT_NE(installed_bundle->retained_bundle_id(),
+            authored_bundle->retained_bundle_id());
+
+  const FilesystemVerifiedRetainedBundleSource source(installed.path(),
+                                                       authored.path());
+  const auto loaded = source.get_verified(
+      authored_bundle->retained_bundle_id());
+  ASSERT_NE(loaded, nullptr);
+  EXPECT_EQ(loaded->retained_bundle_id(),
+            authored_bundle->retained_bundle_id());
+}
+
+TEST(FilesystemVerifiedRetainedViewerModelSourceTest,
      UnknownCoordinatesAndCorruptViewerClosureFailClosed) {
   ScopedTrustedRoot root;
   const auto materialized = materialize_durable_lite6_bundle(root.path());

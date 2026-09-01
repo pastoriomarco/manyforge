@@ -20,6 +20,7 @@ from .models import (
     CycleRecoveryActionRequest,
     ManualResultStageRequest,
     ProgramCycleResetRequest,
+    ProgramNodeAvailabilityRequest,
     ProgramScenePreparationRequest,
     RuntimeBlackboardWriteRequest,
     RuntimeOverrideActionRequest,
@@ -38,6 +39,10 @@ class ProgramRunnerApplicationPort(Protocol):
     def shutdown(self) -> None: ...
 
     def health(self) -> dict[str, Any]: ...
+
+    def node_availability(
+        self, request: ProgramNodeAvailabilityRequest
+    ) -> dict[str, Any]: ...
 
     def runs(self, *, active_only: bool, limit: int) -> dict[str, Any]: ...
 
@@ -181,6 +186,12 @@ def create_app(runtime: ProgramRunnerApplicationPort) -> FastAPI:
     @app.get("/api/program/health")
     def health() -> dict[str, Any]:
         return runtime.health()
+
+    @app.post("/api/program/node-availability")
+    def node_availability(
+        request: ProgramNodeAvailabilityRequest,
+    ) -> dict[str, Any]:
+        return runtime.node_availability(request)
 
     @app.get("/api/program/runs")
     def runs(

@@ -5,6 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass
 import json
+import math
 from pathlib import Path
 import threading
 from typing import Any, Callable, NoReturn, Sequence
@@ -186,6 +187,243 @@ def _edit_at_path(
     return candidate
 
 
+def _edit_controlled_stop_profile(
+    document: dict[str, Any], profile: dict[str, Any]
+) -> dict[str, Any]:
+    """Replace one normalized operator Stop profile across derived route rows.
+
+    Deployment compilation still validates every expanded row.  This focused
+    mutation prevents the browser from editing those compiler-expanded copies
+    independently or leaving them inconsistent.
+    """
+
+    expected = {
+        "allow_natural_completion_on_short_path",
+        "deceleration_time_s",
+        "per_resource_limits",
+        "stop_mode",
+    }
+    if not isinstance(profile, dict) or set(profile) != expected:
+        _fail(
+            "deployment_controlled_stop_invalid",
+            "Controlled Stop profile has an invalid shape",
+        )
+    if profile["stop_mode"] not in {"soft_on_path", "spring_back_hold"}:
+        _fail(
+            "deployment_controlled_stop_invalid",
+            "Controlled Stop mode is not supported by the current contract",
+        )
+    if type(profile["allow_natural_completion_on_short_path"]) is not bool:
+        _fail(
+            "deployment_controlled_stop_invalid",
+            "Controlled Stop natural-completion choice must be boolean",
+        )
+    deceleration = profile["deceleration_time_s"]
+    if (
+        type(deceleration) not in {int, float}
+        or not math.isfinite(float(deceleration))
+        or not 0.0 < float(deceleration) <= 60.0
+    ):
+        _fail(
+            "deployment_controlled_stop_invalid",
+            "Controlled Stop deceleration time must be in (0, 60] seconds",
+        )
+    limits = profile["per_resource_limits"]
+    if not isinstance(limits, list) or not 1 <= len(limits) <= 256:
+        _fail(
+            "deployment_controlled_stop_invalid",
+            "Controlled Stop requires a bounded per-resource limit set",
+        )
+    by_resource: dict[str, dict[str, Any]] = {}
+    for row in limits:
+        if not isinstance(row, dict) or set(row) != {
+            "max_deceleration",
+            "resource_id",
+            "settle_velocity_threshold",
+        }:
+            _fail(
+                "deployment_controlled_stop_invalid",
+                "Controlled Stop resource limit has an invalid shape",
+            )
+        resource_id = row["resource_id"]
+        if not isinstance(resource_id, str) or not resource_id or resource_id in by_resource:
+            _fail(
+                "deployment_controlled_stop_invalid",
+                "Controlled Stop resource identities must be nonempty and unique",
+            )
+        for field in ("max_deceleration", "settle_velocity_threshold"):
+            value = row[field]
+            if not isinstance(value, dict) or set(value) != {
+                "coordinate_kind",
+                "value",
+            }:
+                _fail(
+                    "deployment_controlled_stop_invalid",
+                    f"Controlled Stop {field.replace('_', ' ')} has an invalid shape",
+                )
+            number = value["value"]
+            if (
+                not isinstance(value["coordinate_kind"], str)
+                or type(number) not in {int, float}
+                or not math.isfinite(float(number))
+                or float(number) < 0.0
+                or (field == "max_deceleration" and float(number) <= 0.0)
+            ):
+                _fail(
+                    "deployment_controlled_stop_invalid",
+                    f"Controlled Stop {field.replace('_', ' ')} is invalid",
+                )
+        by_resource[resource_id] = deepcopy(row)
+
+    policies = document.get("policies")
+    rows = policies.get("stop_stage_parameters") if isinstance(policies, dict) else None
+    if not isinstance(rows, list):
+        _fail(
+            "deployment_controlled_stop_unavailable",
+            "Deployment has no Controlled Stop parameter inventory",
+            status_code=409,
+        )
+    candidate = deepcopy(document)
+    candidate_rows = candidate["policies"]["stop_stage_parameters"]
+    updated = 0
+    expected_resource_ids = set(by_resource)
+    for row in candidate_rows:
+        if not isinstance(row, dict) or row.get("stop_escalation_stage_id") != "motion_controlled_stop":
+            continue
+        provider = row.get("provider_contract_ref")
+        if not isinstance(provider, dict) or provider.get("provider_contract_role_id") != "stop_contract":
+            continue
+        current = row.get("default_contract_parameters")
+        current_limits = current.get("per_resource_limits") if isinstance(current, dict) else None
+        if not isinstance(current_limits, list) or {
+            item.get("resource_id")
+            for item in current_limits
+            if isinstance(item, dict)
+        } != expected_resource_ids:
+            _fail(
+                "deployment_controlled_stop_scope_mismatch",
+                "Controlled Stop resource scope differs across derived route rows",
+                status_code=409,
+            )
+        materialized_limits: list[dict[str, Any]] = []
+        for current_limit in current_limits:
+            resource_id = current_limit["resource_id"]
+            replacement = deepcopy(by_resource[resource_id])
+            for field in ("max_deceleration", "settle_velocity_threshold"):
+                existing = current_limit.get(field)
+                requested = replacement[field]
+                if (
+                    not isinstance(existing, dict)
+                    or existing.get("coordinate_kind") != requested["coordinate_kind"]
+                ):
+                    _fail(
+                        "deployment_controlled_stop_scope_mismatch",
+                        "Controlled Stop coordinate kind differs from the compiled route",
+                        status_code=409,
+                    )
+                value_field = next(
+                    (name for name in existing if name.startswith("value_")),
+                    None,
+                )
+                if value_field is None:
+                    _fail(
+                        "deployment_controlled_stop_scope_mismatch",
+                        "Controlled Stop coordinate value field is unavailable",
+                        status_code=409,
+                    )
+                requested_number = requested["value"]
+                replacement[field] = {
+                    "coordinate_kind": requested["coordinate_kind"],
+                    value_field: float(requested_number),
+                }
+            materialized_limits.append(replacement)
+        row["default_contract_parameters"] = {
+            "allow_natural_completion_on_short_path": profile[
+                "allow_natural_completion_on_short_path"
+            ],
+            "deceleration_time_s": float(deceleration),
+            "per_resource_limits": materialized_limits,
+            "stop_mode": profile["stop_mode"],
+        }
+        updated += 1
+    if updated == 0:
+        _fail(
+            "deployment_controlled_stop_unavailable",
+            "Deployment has no editable Controlled Stop stage",
+            status_code=409,
+        )
+    return candidate
+
+
+def _edit_motion_target_limit(
+    document: dict[str, Any],
+    *,
+    controllable_component_id: str,
+    command_target_id: str,
+    maximum_tcp_linear_speed_mps: float,
+) -> dict[str, Any]:
+    """Edit one exact Deployment-owned target ceiling.
+
+    The immutable catalog runtime policy remains untouched.  Runtime combines
+    this authored ceiling with that policy conservatively after both sources
+    have been independently verified.
+    """
+
+    if (
+        not isinstance(controllable_component_id, str)
+        or not controllable_component_id
+        or not isinstance(command_target_id, str)
+        or not command_target_id
+        or not math.isfinite(maximum_tcp_linear_speed_mps)
+        or not 0.0 < maximum_tcp_linear_speed_mps <= 1000.0
+    ):
+        _fail(
+            "deployment_motion_target_limit_invalid",
+            "Target motion limit identity or value is invalid",
+        )
+    candidate = deepcopy(document)
+    graph = candidate.get("graph")
+    runtime_units = graph.get("runtime_units") if isinstance(graph, dict) else None
+    if not isinstance(runtime_units, list):
+        _fail(
+            "deployment_motion_target_limit_unavailable",
+            "Deployment has no runtime-unit target limit inventory",
+            status_code=409,
+        )
+    matches: list[dict[str, Any]] = []
+    for runtime_unit in runtime_units:
+        configuration = (
+            runtime_unit.get("configuration")
+            if isinstance(runtime_unit, dict)
+            else None
+        )
+        limits = (
+            configuration.get("motion_target_limits")
+            if isinstance(configuration, dict)
+            else None
+        )
+        if not isinstance(limits, list):
+            continue
+        for row in limits:
+            if (
+                isinstance(row, dict)
+                and row.get("controllable_component_id")
+                == controllable_component_id
+                and row.get("command_target_id") == command_target_id
+            ):
+                matches.append(row)
+    if len(matches) != 1:
+        _fail(
+            "deployment_motion_target_limit_scope_mismatch",
+            "Deployment must contain exactly one limit for the addressed motion target",
+            status_code=409,
+        )
+    matches[0]["maximum_tcp_linear_speed_mps"] = float(
+        maximum_tcp_linear_speed_mps
+    )
+    return candidate
+
+
 class DeploymentDraftSession:
     """Own one optional exact Deployment Draft and Saved baseline."""
 
@@ -257,6 +495,51 @@ class DeploymentDraftSession:
                     status_code=404,
                 )
             candidate = _edit_at_path(self._compiled.document, path, value, operation)
+        return self._compiler(_source(candidate))
+
+    def preview_controlled_stop_update(
+        self,
+        profile: dict[str, Any],
+        *,
+        draft_id: str,
+        expected_revision: int,
+    ) -> CompiledDeploymentDocument:
+        with self._lock:
+            self._require_current(draft_id, expected_revision)
+            if self._compiled is None:
+                _fail(
+                    "deployment_draft_unavailable",
+                    "open a Deployment artifact before editing",
+                    status_code=404,
+                )
+            candidate = _edit_controlled_stop_profile(
+                self._compiled.document, profile
+            )
+        return self._compiler(_source(candidate))
+
+    def preview_motion_target_limit_update(
+        self,
+        *,
+        controllable_component_id: str,
+        command_target_id: str,
+        maximum_tcp_linear_speed_mps: float,
+        draft_id: str,
+        expected_revision: int,
+    ) -> CompiledDeploymentDocument:
+        with self._lock:
+            self._require_current(draft_id, expected_revision)
+            if self._compiled is None:
+                _fail(
+                    "deployment_draft_unavailable",
+                    "open a Deployment artifact before editing",
+                    status_code=404,
+                )
+            candidate = _edit_motion_target_limit(
+                self._compiled.document,
+                controllable_component_id=controllable_component_id,
+                command_target_id=command_target_id,
+                maximum_tcp_linear_speed_mps=maximum_tcp_linear_speed_mps,
+            )
         return self._compiler(_source(candidate))
 
     def commit_compiled(

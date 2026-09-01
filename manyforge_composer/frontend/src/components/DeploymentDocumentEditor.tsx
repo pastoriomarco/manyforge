@@ -22,12 +22,19 @@ interface ScalarEditorProps {
   path: Array<string | number>;
   value: string | number | boolean | null;
   controller: DeploymentWorkspaceController;
+  forceReadOnly?: boolean;
 }
 
-function ScalarEditor({ field, path, value, controller }: ScalarEditorProps) {
+function ScalarEditor({
+  field,
+  path,
+  value,
+  controller,
+  forceReadOnly = false,
+}: ScalarEditorProps) {
   const [draft, setDraft] = useState(value === null ? '' : String(value));
   const [invalid, setInvalid] = useState(false);
-  const readOnly = GENERATED_FIELDS.has(field);
+  const readOnly = forceReadOnly || GENERATED_FIELDS.has(field);
   useEffect(() => {
     setDraft(value === null ? '' : String(value));
     setInvalid(false);
@@ -113,6 +120,7 @@ interface ValueEditorProps {
   controller: DeploymentWorkspaceController;
   depth?: number;
   allowRemove?: boolean;
+  readOnly?: boolean;
 }
 
 function ValueEditor({
@@ -122,9 +130,18 @@ function ValueEditor({
   controller,
   depth = 0,
   allowRemove = false,
+  readOnly = false,
 }: ValueEditorProps) {
   if (value === null || typeof value !== 'object') {
-    return <ScalarEditor field={name} path={path} value={value} controller={controller} />;
+    return (
+      <ScalarEditor
+        field={name}
+        path={path}
+        value={value}
+        controller={controller}
+        forceReadOnly={readOnly}
+      />
+    );
   }
   if (Array.isArray(value)) {
     return (
@@ -141,8 +158,9 @@ function ValueEditor({
                 controller={controller}
                 depth={depth + 1}
                 allowRemove
+                readOnly={readOnly}
               />
-              <div className="deployment-row-actions">
+              {!readOnly && <div className="deployment-row-actions">
                 <button
                   type="button"
                   disabled={!controller.mutationAvailable || controller.busy}
@@ -158,7 +176,7 @@ function ValueEditor({
                 >
                   Remove
                 </button>
-              </div>
+              </div>}
             </div>
           ))}
         </div>
@@ -180,6 +198,7 @@ function ValueEditor({
             value={entry}
             controller={controller}
             depth={depth + 1}
+            readOnly={readOnly}
           />
         ))}
       </div>
@@ -205,8 +224,10 @@ const IDENTITY_FIELDS = [
 
 export function DeploymentDocumentEditor({
   controller,
+  readOnly = false,
 }: {
   controller: DeploymentWorkspaceController;
+  readOnly?: boolean;
 }) {
   const document = controller.workspace?.draft.document ?? null;
   const [section, setSection] = useState<string>('identity');
@@ -246,6 +267,7 @@ export function DeploymentDocumentEditor({
           path={activeSection === 'identity' ? [] : [activeSection]}
           value={selected}
           controller={controller}
+          readOnly={readOnly}
         />
       )}
     </section>

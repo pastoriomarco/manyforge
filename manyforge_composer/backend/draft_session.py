@@ -69,6 +69,7 @@ OPERATOR_DRAFT_MUTATIONS = (
     "program_draft_expand_authoring_macro",
     "program_draft_remove_contact_policies",
     "program_draft_replace_roles",
+    "program_draft_update_motion_defaults",
     "program_draft_replace_support_contacts",
     "program_draft_store_observed_move",
     "program_draft_store_observed_scene_resource",
@@ -78,6 +79,11 @@ OPERATOR_DRAFT_MUTATIONS = (
     "viewer_draft_replace",
 )
 _NODE_POLICY_MUTATION = "program_draft_update_node_policies"
+_PROGRAM_MOTION_DEFAULTS = (
+    "velocity_scale",
+    "acceleration_scale",
+    "max_tcp_linear_speed_mps",
+)
 _ASSISTANT_PROPOSAL_MUTATIONS = frozenset(
     {
         "scene_draft_upsert_objects",
@@ -1513,6 +1519,7 @@ class ComposerDraftSession:
             "program_draft_upsert_parameters": self._parameters_upsert,
             "program_draft_remove_parameters": self._parameters_remove,
             "program_draft_replace_roles": self._program_roles_replace,
+            "program_draft_update_motion_defaults": self._program_motion_defaults_update,
             "program_draft_update_settings": self._program_settings_update,
             _NODE_POLICY_MUTATION: self._node_policies_update,
             "blackboard_draft_upsert_namespaces": self._namespaces_upsert,
@@ -2229,6 +2236,323 @@ class ComposerDraftSession:
         return {"updated": True}
 
     @staticmethod
+    def _program_motion_nodes(
+        document: dict[str, Any], catalog: NodeCatalog
+    ) -> list[tuple[dict[str, Any], tuple[str, ...]]]:
+        result: list[tuple[dict[str, Any], tuple[str, ...]]] = []
+        pending = list(reversed(document["forest"]))
+        while pending:
+            node = pending.pop()
+            entry = catalog.get(node["node_id"])
+            available = {parameter.id for parameter in entry.parameters}
+            fields = tuple(
+                field for field in _PROGRAM_MOTION_DEFAULTS if field in available
+            )
+            if fields:
+                result.append((node, fields))
+            pending.extend(reversed(node.get("children", [])))
+        return result
+
+    @classmethod
+    def _program_motion_binding_ids(
+        cls,
+        document: dict[str, Any],
+        catalog: NodeCatalog,
+    ) -> dict[str, str]:
+        """Resolve semantic motion fields from actual Program bindings."""
+
+        declarations = {
+            row.get("parameter_id"): row
+            for row in document.get("parameters", [])
+            if type(row) is dict and type(row.get("parameter_id")) is str
+        }
+        references: dict[str, set[str]] = {
+            field: set() for field in _PROGRAM_MOTION_DEFAULTS
+        }
+        for node, fields in cls._program_motion_nodes(document, catalog):
+            sources = node.get("value_sources", {})
+            if type(sources) is not dict:
+                continue
+            for field in fields:
+                source = sources.get(field)
+                if (
+                    type(source) is dict
+                    and source.get("kind") == "program_parameter"
+                    and type(source.get("reference")) is str
+                ):
+                    references[field].add(source["reference"])
+        resolved: dict[str, str] = {}
+        for field, candidates in references.items():
+            if len(candidates) != 1:
+                continue
+            reference = next(iter(candidates))
+            declaration = declarations.get(reference)
+            if (
+                type(declaration) is dict
+                and declaration.get("type") in {"float64", "int64"}
+                and type(declaration.get("default")) in {int, float}
+                and not isinstance(declaration.get("default"), bool)
+            ):
+                resolved[field] = reference
+        return resolved
+
+    @classmethod
+    def _program_motion_config(
+        cls, document: dict[str, Any], catalog: NodeCatalog
+    ) -> dict[str, Any]:
+        bindings = cls._program_motion_binding_ids(document, catalog)
+        declarations_by_id = {
+            row["parameter_id"]: row for row in document["parameters"]
+        }
+        declarations = {
+            field: deepcopy(declarations_by_id[reference])
+            for field, reference in bindings.items()
+        }
+        nodes: list[dict[str, Any]] = []
+        for node, fields in cls._program_motion_nodes(document, catalog):
+            parameters = node.get("parameters", {})
+            sources = node.get("value_sources", {})
+            values: dict[str, Any] = {}
+            for field in fields:
+                if field in parameters:
+                    values[field] = {
+                        "kind": "literal",
+                        "value": deepcopy(parameters[field]),
+                    }
+                elif field in sources:
+                    values[field] = {
+                        "kind": "source",
+                        "value": deepcopy(sources[field]),
+                    }
+                else:
+                    values[field] = {"kind": "omitted"}
+            nodes.append({"instance_id": node["instance_id"], "values": values})
+        return {
+            "bindings": bindings,
+            "declarations": declarations,
+            "nodes": nodes,
+        }
+
+    @classmethod
+    def _restore_program_motion_config(
+        cls,
+        document: dict[str, Any],
+        config: Any,
+        catalog: NodeCatalog,
+    ) -> None:
+        if type(config) is not dict or set(config) != {
+            "bindings", "declarations", "nodes"
+        }:
+            _error("draft_arguments_invalid", "motion restore config is invalid")
+        bindings = config["bindings"]
+        declarations = config["declarations"]
+        rows = config["nodes"]
+        if (
+            type(bindings) is not dict
+            or type(declarations) is not dict
+            or type(rows) is not list
+            or set(bindings) != set(_PROGRAM_MOTION_DEFAULTS)
+            or set(declarations) != set(_PROGRAM_MOTION_DEFAULTS)
+            or any(type(value) is not str or not value for value in bindings.values())
+            or len(set(bindings.values())) != len(bindings)
+        ):
+            _error("draft_arguments_invalid", "motion restore config is invalid")
+        current_bindings = cls._program_motion_binding_ids(document, catalog)
+        replaced_ids = {*current_bindings.values(), *bindings.values()}
+        retained = [
+            row
+            for row in document["parameters"]
+            if row.get("parameter_id") not in replaced_ids
+        ]
+        for field in _PROGRAM_MOTION_DEFAULTS:
+            declaration = declarations[field]
+            if (
+                type(declaration) is not dict
+                or declaration.get("parameter_id") != bindings[field]
+            ):
+                _error(
+                    "draft_arguments_invalid",
+                    "motion restore declaration changed binding identity",
+                )
+            retained.append(deepcopy(declaration))
+        document["parameters"] = sorted(retained, key=lambda row: row["parameter_id"])
+
+        current = cls._program_motion_nodes(document, catalog)
+        by_id = {
+            row.get("instance_id"): row
+            for row in rows
+            if type(row) is dict and type(row.get("instance_id")) is str
+        }
+        if len(by_id) != len(rows) or set(by_id) != {
+            node["instance_id"] for node, _fields in current
+        }:
+            _error("draft_arguments_invalid", "motion restore node scope is stale")
+        for node, fields in current:
+            row = by_id[node["instance_id"]]
+            if set(row) != {"instance_id", "values"} or type(row["values"]) is not dict:
+                _error("draft_arguments_invalid", "motion restore node row is invalid")
+            if set(row["values"]) != set(fields):
+                _error("draft_arguments_invalid", "motion restore fields changed")
+            parameters = node.setdefault("parameters", {})
+            sources = deepcopy(node.get("value_sources", {}))
+            for field in fields:
+                value = row["values"][field]
+                if type(value) is not dict or value.get("kind") not in {
+                    "literal", "source", "omitted"
+                }:
+                    _error("draft_arguments_invalid", "motion restore value is invalid")
+                parameters.pop(field, None)
+                sources.pop(field, None)
+                if value["kind"] == "literal" and set(value) == {"kind", "value"}:
+                    parameters[field] = deepcopy(value["value"])
+                elif value["kind"] == "source" and set(value) == {"kind", "value"}:
+                    sources[field] = deepcopy(value["value"])
+                elif value != {"kind": "omitted"}:
+                    _error("draft_arguments_invalid", "motion restore value is invalid")
+            if sources:
+                node["value_sources"] = sources
+            else:
+                node.pop("value_sources", None)
+        if cls._program_motion_binding_ids(document, catalog) != bindings:
+            _error(
+                "draft_arguments_invalid",
+                "motion restore bindings do not match the restored nodes",
+            )
+
+    @classmethod
+    def _program_motion_defaults_update(
+        cls,
+        document: dict[str, Any],
+        arguments: dict[str, Any],
+        catalog: NodeCatalog,
+    ) -> dict[str, Any]:
+        previous = cls._program_motion_config(document, catalog)
+        mode = arguments.get("mode")
+        if mode == "restore":
+            if set(arguments) != {"mode", "config"}:
+                _error("draft_arguments_invalid", "motion restore arguments are invalid")
+            cls._restore_program_motion_config(document, arguments["config"], catalog)
+            return {
+                "previous_config": previous,
+                "current_config": cls._program_motion_config(document, catalog),
+            }
+        if mode != "update" or set(arguments) != {
+            "mode",
+            "velocity_scale",
+            "acceleration_scale",
+            "max_tcp_linear_speed_mps",
+            "parameter_bindings",
+            "conflict_resolution",
+        }:
+            _error("draft_arguments_invalid", "motion-default arguments are invalid")
+        values = {
+            "velocity_scale": arguments["velocity_scale"],
+            "acceleration_scale": arguments["acceleration_scale"],
+            "max_tcp_linear_speed_mps": arguments["max_tcp_linear_speed_mps"],
+        }
+        if any(type(value) not in {int, float} or not math.isfinite(float(value)) for value in values.values()):
+            _error("draft_arguments_invalid", "motion defaults must be finite numbers")
+        if not 0.0 < float(values["velocity_scale"]) <= 1.0:
+            _error("draft_arguments_invalid", "velocity scale must be in (0, 1]")
+        if not 0.0 < float(values["acceleration_scale"]) <= 1.0:
+            _error("draft_arguments_invalid", "acceleration scale must be in (0, 1]")
+        if not float(values["max_tcp_linear_speed_mps"]) > 0.0:
+            _error("draft_arguments_invalid", "TCP linear-speed cap must be positive")
+        resolution = arguments["conflict_resolution"]
+        if resolution not in {"reject", "reduce"}:
+            _error("draft_arguments_invalid", "motion conflict resolution is invalid")
+        requested_bindings = arguments["parameter_bindings"]
+        actual_bindings = cls._program_motion_binding_ids(document, catalog)
+        if (
+            type(requested_bindings) is not dict
+            or set(requested_bindings) != set(_PROGRAM_MOTION_DEFAULTS)
+            or any(
+                type(reference) is not str or not reference
+                for reference in requested_bindings.values()
+            )
+            or len(set(requested_bindings.values())) != len(requested_bindings)
+        ):
+            _error(
+                "draft_arguments_invalid",
+                "motion parameter bindings must identify three distinct Program parameters",
+            )
+        if requested_bindings != actual_bindings:
+            _error(
+                "program_motion_binding_stale",
+                "Program motion controls do not match the current catalog-field bindings",
+                status_code=409,
+                detail={
+                    "actual_bindings": actual_bindings,
+                    "requested_bindings": requested_bindings,
+                },
+            )
+
+        conflicts: list[dict[str, Any]] = []
+        motion_nodes = cls._program_motion_nodes(document, catalog)
+        for node, fields in motion_nodes:
+            parameters = node.get("parameters", {})
+            sources = node.get("value_sources", {})
+            for field in fields:
+                literal = parameters.get(field)
+                source = sources.get(field)
+                if literal is not None and (
+                    type(literal) not in {int, float}
+                    or float(literal) > float(values[field])
+                ):
+                    conflicts.append({
+                        "instance_id": node["instance_id"],
+                        "field": field,
+                        "current_value": deepcopy(literal),
+                        "new_ceiling": float(values[field]),
+                    })
+                if source is not None and source != {
+                    "kind": "program_parameter",
+                    "reference": actual_bindings[field],
+                }:
+                    _error(
+                        "program_motion_source_conflict",
+                        f"{node['instance_id']}.{field} uses another dynamic source",
+                        status_code=409,
+                    )
+        if conflicts and resolution == "reject":
+            _error(
+                "program_motion_limit_conflict",
+                "One or more node motion limits exceed the proposed Program ceiling",
+                status_code=409,
+                detail={"message": "Node motion limits exceed the proposed Program ceiling.", "conflicts": conflicts},
+            )
+
+        by_id = {row["parameter_id"]: row for row in document["parameters"]}
+        for field, reference in actual_bindings.items():
+            declaration = deepcopy(by_id[reference])
+            declaration["default"] = float(values[field])
+            by_id[reference] = declaration
+        document["parameters"] = [by_id[key] for key in sorted(by_id)]
+
+        conflict_keys = {(row["instance_id"], row["field"]) for row in conflicts}
+        for node, fields in motion_nodes:
+            parameters = node.setdefault("parameters", {})
+            sources = deepcopy(node.get("value_sources", {}))
+            for field in fields:
+                if (node["instance_id"], field) in conflict_keys:
+                    parameters[field] = float(values[field])
+                    sources.pop(field, None)
+                elif field not in parameters and field not in sources:
+                    sources[field] = {
+                        "kind": "program_parameter",
+                        "reference": actual_bindings[field],
+                    }
+            if sources:
+                node["value_sources"] = sources
+            else:
+                node.pop("value_sources", None)
+        return {
+            "reduced_node_fields": conflicts,
+            "previous_config": previous,
+            "current_config": cls._program_motion_config(document, catalog),
+        }
+
+    @staticmethod
     def _node_policies_update(
         document: dict[str, Any],
         arguments: dict[str, Any],
@@ -2400,10 +2724,28 @@ class ComposerDraftSession:
         return forest
 
     def _tree_insert(
-        self, document: dict[str, Any], arguments: dict[str, Any], _catalog: NodeCatalog
+        self, document: dict[str, Any], arguments: dict[str, Any], catalog: NodeCatalog
     ) -> dict[str, Any]:
         tree = self._tree(document)
         node = deepcopy(arguments["node"])
+        motion_bindings = self._program_motion_binding_ids(document, catalog)
+        entry = catalog.get(node["node_id"])
+        motion_fields = {
+            parameter.id
+            for parameter in entry.parameters
+            if parameter.id in _PROGRAM_MOTION_DEFAULTS
+            and parameter.id in motion_bindings
+        }
+        if motion_fields:
+            parameters = node.setdefault("parameters", {})
+            sources = deepcopy(node.get("value_sources", {}))
+            for field in sorted(motion_fields):
+                parameters.pop(field, None)
+                sources[field] = {
+                    "kind": "program_parameter",
+                    "reference": motion_bindings[field],
+                }
+            node["value_sources"] = sources
         if _tree_ref(tree, node["instance_id"]) is not None:
             _error(
                 "draft_node_exists",

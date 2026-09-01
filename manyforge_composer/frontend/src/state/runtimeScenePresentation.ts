@@ -260,7 +260,7 @@ export function createExecutionRobotPresentationReader(
         sourceModel,
         manifest,
         descriptor,
-        frame === null ? null : performance.now() * 1e6,
+        frame === null ? null : frame.receivedAtMonotonicUs * 1_000,
       );
       return cachedPresentation;
     },

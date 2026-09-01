@@ -24,6 +24,9 @@ _PROGRAM_PATH = _REPOSITORY_ROOT / "examples" / "pick_and_place_minimal.program.
 _PICK_PROGRAM_PATH = (
     _REPOSITORY_ROOT / "examples" / "trocar_lite6_foundationpose_pick.program.yaml"
 )
+_LITE6_PROGRAM_PATH = (
+    _REPOSITORY_ROOT / "examples" / "lite6_lite_gripper_pick_and_place.program.yaml"
+)
 
 
 def _program(*, metadata: dict | None = None) -> Program:
@@ -57,6 +60,25 @@ def _program_with_instance_id(instance_id: str) -> Program:
 
 def _pick_program() -> Program:
     return Program(_PICK_PROGRAM_PATH, build_node_environment().catalog)
+
+
+def _lite6_program_with_literal_tcp_limit(limit_mps: float = 0.14) -> Program:
+    catalog = build_node_environment().catalog
+    document = Program(_LITE6_PROGRAM_PATH, catalog).to_dict()
+    move = next(
+        child
+        for child in document["tree"]["children"]
+        if child["instance_id"] == "move_to_rest"
+    )
+    move["parameters"]["max_tcp_linear_speed_mps"] = limit_mps
+    move["value_sources"].pop("max_tcp_linear_speed_mps")
+    document["program_revision"] = compute_content_identity(
+        document,
+        own_field="program_revision",
+        identity_domain="program-revision",
+        api_version="manyforge.program.v1",
+    )
+    return Program.from_dict(document, catalog)
 
 
 def _box_resource(identity: str) -> dict:
@@ -343,7 +365,12 @@ def test_store_observed_move_updates_only_selected_node(
             }
         ),
     }
-    node.pop("value_sources", None)
+    node["value_sources"] = {
+        "velocity_scale": {
+            "kind": "program_parameter",
+            "reference": "velocity_scale",
+        },
+    }
     document["program_revision"] = compute_content_identity(
         document,
         own_field="program_revision",
@@ -1541,6 +1568,229 @@ def test_program_role_requirements_replace_through_one_operator_mutation() -> No
         )
     assert invalid.value.code == "draft_arguments_invalid"
     assert session.snapshot() == retained
+
+
+def test_program_motion_defaults_are_one_atomic_portable_draft_update() -> None:
+    session = ComposerDraftSession(_lite6_program_with_literal_tcp_limit())
+    initial_revision = session.revision
+    bindings = {
+        "velocity_scale": "velocity_scale",
+        "acceleration_scale": "acceleration_scale",
+        "max_tcp_linear_speed_mps": "max_tcp_linear_speed_mps",
+    }
+
+    with pytest.raises(DraftSessionError) as conflict:
+        _mutate(
+            session,
+            "program_draft_update_motion_defaults",
+            {
+                "mode": "update",
+                "velocity_scale": 0.35,
+                "acceleration_scale": 0.7,
+                "max_tcp_linear_speed_mps": 0.1,
+                "parameter_bindings": bindings,
+                "conflict_resolution": "reject",
+            },
+        )
+    assert conflict.value.code == "program_motion_limit_conflict"
+    assert session.revision == initial_revision
+
+    updated = _mutate(
+        session,
+        "program_draft_update_motion_defaults",
+        {
+            "mode": "update",
+            "velocity_scale": 0.35,
+            "acceleration_scale": 0.7,
+            "max_tcp_linear_speed_mps": 0.1,
+            "parameter_bindings": bindings,
+            "conflict_resolution": "reduce",
+        },
+    )
+    authoring = updated.snapshot["authoring"]
+    declarations = {
+        row["parameter_id"]: row for row in authoring["parameters"]
+    }
+    assert declarations["velocity_scale"]["default"] == 0.35
+    assert declarations["acceleration_scale"]["default"] == 0.7
+    assert declarations["max_tcp_linear_speed_mps"]["default"] == 0.1
+    move = next(
+        child
+        for child in authoring["forest"][0]["children"]
+        if child["instance_id"] == "move_to_rest"
+    )
+    assert move["parameters"]["max_tcp_linear_speed_mps"] == 0.1
+    assert "max_tcp_linear_speed_mps" not in move.get("value_sources", {})
+    assert updated.details["reduced_node_fields"] == [{
+        "instance_id": "move_to_rest",
+        "field": "max_tcp_linear_speed_mps",
+        "current_value": 0.14,
+        "new_ceiling": 0.1,
+    }]
+
+    restored = _mutate(
+        session,
+        "program_draft_update_motion_defaults",
+        {"mode": "restore", "config": updated.details["previous_config"]},
+    )
+    restored_move = next(
+        child
+        for child in restored.snapshot["authoring"]["forest"][0]["children"]
+        if child["instance_id"] == "move_to_rest"
+    )
+    assert restored_move["parameters"]["max_tcp_linear_speed_mps"] == 0.14
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("velocity_scale", 0.0),
+        ("velocity_scale", 1.01),
+        ("acceleration_scale", 0.0),
+        ("acceleration_scale", 1.01),
+        ("max_tcp_linear_speed_mps", 0.0),
+    ],
+)
+def test_program_motion_defaults_reject_invalid_values_without_mutation(
+    field: str,
+    value: float,
+) -> None:
+    session = ComposerDraftSession(_lite6_program_with_literal_tcp_limit())
+    initial_revision = session.revision
+    arguments = {
+        "mode": "update",
+        "velocity_scale": 0.4,
+        "acceleration_scale": 1.0,
+        "max_tcp_linear_speed_mps": 0.15,
+        "parameter_bindings": {
+            "velocity_scale": "velocity_scale",
+            "acceleration_scale": "acceleration_scale",
+            "max_tcp_linear_speed_mps": "max_tcp_linear_speed_mps",
+        },
+        "conflict_resolution": "reject",
+    }
+    arguments[field] = value
+
+    with pytest.raises(DraftSessionError) as invalid:
+        _mutate(session, "program_draft_update_motion_defaults", arguments)
+
+    assert invalid.value.code == "draft_arguments_invalid"
+    assert session.revision == initial_revision
+
+
+def test_new_motion_node_defaults_to_program_motion_references() -> None:
+    catalog = build_node_environment().catalog
+    program = Program(_LITE6_PROGRAM_PATH, catalog)
+    document = program.to_dict()
+    node = deepcopy(document["tree"]["children"][1])
+    node["instance_id"] = "new_program_limited_move"
+    sources = node.setdefault("value_sources", {})
+    for field, value in (
+        ("velocity_scale", 0.9),
+        ("acceleration_scale", 0.8),
+        ("max_tcp_linear_speed_mps", 0.14),
+    ):
+        sources.pop(field, None)
+        node["parameters"][field] = value
+    session = ComposerDraftSession(program)
+
+    inserted = _mutate(
+        session,
+        "tree_draft_insert_node",
+        {"parent_instance_id": "@root", "node": node},
+    )
+
+    authored = next(
+        child
+        for child in inserted.snapshot["authoring"]["forest"][0]["children"]
+        if child["instance_id"] == "new_program_limited_move"
+    )
+    for field in (
+        "velocity_scale",
+        "acceleration_scale",
+        "max_tcp_linear_speed_mps",
+    ):
+        assert field not in authored["parameters"]
+        assert authored["value_sources"][field] == {
+            "kind": "program_parameter",
+            "reference": field,
+        }
+
+
+def test_motion_settings_and_insert_follow_catalog_field_bindings_not_parameter_names() -> None:
+    catalog = build_node_environment().catalog
+    document = Program(_LITE6_PROGRAM_PATH, catalog).to_dict()
+    aliases = {
+        "velocity_scale": "cycle_velocity",
+        "acceleration_scale": "cycle_acceleration",
+        "max_tcp_linear_speed_mps": "cycle_tcp_cap",
+    }
+    for declaration in document["parameters"]:
+        parameter_id = declaration["parameter_id"]
+        if parameter_id in aliases:
+            declaration["parameter_id"] = aliases[parameter_id]
+
+    pending = [document["tree"]]
+    while pending:
+        current = pending.pop()
+        for source in current.get("value_sources", {}).values():
+            reference = source.get("reference")
+            if source.get("kind") == "program_parameter" and reference in aliases:
+                source["reference"] = aliases[reference]
+        pending.extend(current.get("children", []))
+    document["program_revision"] = compute_content_identity(
+        document,
+        own_field="program_revision",
+        identity_domain="program-revision",
+        api_version="manyforge.program.v1",
+    )
+    session = ComposerDraftSession(Program.from_dict(document, catalog))
+
+    updated = _mutate(
+        session,
+        "program_draft_update_motion_defaults",
+        {
+            "mode": "update",
+            "velocity_scale": 0.3,
+            "acceleration_scale": 0.6,
+            "max_tcp_linear_speed_mps": 0.12,
+            "parameter_bindings": aliases,
+            "conflict_resolution": "reject",
+        },
+    )
+    declarations = {
+        row["parameter_id"]: row["default"]
+        for row in updated.snapshot["authoring"]["parameters"]
+    }
+    assert declarations["cycle_velocity"] == 0.3
+    assert declarations["cycle_acceleration"] == 0.6
+    assert declarations["cycle_tcp_cap"] == 0.12
+    assert not set(aliases).intersection(declarations)
+
+    node = deepcopy(updated.snapshot["authoring"]["forest"][0]["children"][1])
+    node["instance_id"] = "new_aliased_program_limited_move"
+    node["parameters"].update({
+        "velocity_scale": 0.9,
+        "acceleration_scale": 0.8,
+        "max_tcp_linear_speed_mps": 0.14,
+    })
+    node.pop("value_sources", None)
+    inserted = _mutate(
+        session,
+        "tree_draft_insert_node",
+        {"parent_instance_id": "@root", "node": node},
+    )
+    authored = next(
+        child
+        for child in inserted.snapshot["authoring"]["forest"][0]["children"]
+        if child["instance_id"] == "new_aliased_program_limited_move"
+    )
+    for field, reference in aliases.items():
+        assert field not in authored["parameters"]
+        assert authored["value_sources"][field] == {
+            "kind": "program_parameter",
+            "reference": reference,
+        }
 
 
 def test_authoring_forest_retains_incomplete_topology_until_it_derives_a_program() -> None:

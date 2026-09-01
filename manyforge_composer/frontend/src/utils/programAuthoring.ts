@@ -38,6 +38,31 @@ export interface BlackboardUsage extends ProgramParameterUsage {
   field: string | null;
 }
 
+export const PROGRAM_MOTION_FIELDS = [
+  'velocity_scale',
+  'acceleration_scale',
+  'max_tcp_linear_speed_mps',
+] as const;
+
+export type ProgramMotionField = typeof PROGRAM_MOTION_FIELDS[number];
+
+export interface ProgramMotionValues {
+  velocity_scale: number;
+  acceleration_scale: number;
+  max_tcp_linear_speed_mps: number;
+}
+
+export interface ProgramMotionConfiguration {
+  bindings: Record<ProgramMotionField, string>;
+  values: ProgramMotionValues;
+  usageCounts: Record<ProgramMotionField, number>;
+  applicableCounts: Record<ProgramMotionField, number>;
+}
+
+export type ProgramMotionConfigurationResult =
+  | { available: true; configuration: ProgramMotionConfiguration }
+  | { available: false; reason: string };
+
 export interface ProgramSemanticChoice {
   value: string;
   label: string;
@@ -49,6 +74,112 @@ export type ProgramSemanticCreateTarget =
   | 'program_parameter'
   | 'program_requirements'
   | 'scene_resource';
+
+/**
+ * Resolve Program-wide motion semantics from the exact catalog fields and
+ * their authored Program-parameter sources. Parameter IDs are deliberately
+ * not part of this contract: a Program may call its velocity parameter
+ * `cycle_speed` as long as motion-node velocity_scale fields bind to it.
+ */
+export function deriveProgramMotionConfiguration(
+  program: ProgramAuthoringDocument,
+  entries: CatalogEntry[],
+): ProgramMotionConfigurationResult {
+  if (entries.length === 0) {
+    return {
+      available: false,
+      reason: 'The node catalog is unavailable, so motion bindings cannot be identified.',
+    };
+  }
+  const catalog = new Map(entries.map((entry) => [entry.id, entry]));
+  const references = new Map<ProgramMotionField, Set<string>>(
+    PROGRAM_MOTION_FIELDS.map((field) => [field, new Set<string>()]),
+  );
+  const usageCounts = Object.fromEntries(
+    PROGRAM_MOTION_FIELDS.map((field) => [field, 0]),
+  ) as Record<ProgramMotionField, number>;
+  const applicableCounts = Object.fromEntries(
+    PROGRAM_MOTION_FIELDS.map((field) => [field, 0]),
+  ) as Record<ProgramMotionField, number>;
+  const unknownNodes = new Set<string>();
+
+  for (const { node } of flattenProgramForest(program.forest)) {
+    const entry = catalog.get(node.node_id);
+    if (!entry) {
+      unknownNodes.add(node.node_id);
+      continue;
+    }
+    const fields = new Set(entry.parameters.map((parameter) => parameter.id));
+    for (const field of PROGRAM_MOTION_FIELDS) {
+      if (!fields.has(field)) continue;
+      applicableCounts[field] += 1;
+      const source = node.value_sources?.[field];
+      if (source?.kind !== 'program_parameter') continue;
+      references.get(field)?.add(source.reference);
+      usageCounts[field] += 1;
+    }
+  }
+
+  if (unknownNodes.size > 0) {
+    return {
+      available: false,
+      reason: `Catalog definitions are missing for ${[...unknownNodes].sort().join(', ')}.`,
+    };
+  }
+  const missingFields = PROGRAM_MOTION_FIELDS.filter(
+    (field) => applicableCounts[field] === 0,
+  );
+  if (missingFields.length > 0) {
+    return {
+      available: false,
+      reason: `This Program has no catalog motion fields for ${missingFields.join(', ')}.`,
+    };
+  }
+
+  const bindings = {} as Record<ProgramMotionField, string>;
+  for (const field of PROGRAM_MOTION_FIELDS) {
+    const candidates = references.get(field) ?? new Set<string>();
+    if (candidates.size !== 1) {
+      return {
+        available: false,
+        reason: candidates.size === 0
+          ? `No ${field} field is bound to a Program parameter.`
+          : `${field} fields use more than one Program parameter.`,
+      };
+    }
+    bindings[field] = [...candidates][0];
+  }
+  if (new Set(Object.values(bindings)).size !== PROGRAM_MOTION_FIELDS.length) {
+    return {
+      available: false,
+      reason: 'Velocity, acceleration, and TCP ceilings must use distinct Program parameters.',
+    };
+  }
+
+  const declarations = new Map(
+    (program.parameters ?? []).map((parameter) => [parameter.parameter_id, parameter]),
+  );
+  const values = {} as ProgramMotionValues;
+  for (const field of PROGRAM_MOTION_FIELDS) {
+    const declaration = declarations.get(bindings[field]);
+    if (
+      declaration === undefined
+      || !['float64', 'int64'].includes(declaration.type)
+      || typeof declaration.default !== 'number'
+      || !Number.isFinite(declaration.default)
+    ) {
+      return {
+        available: false,
+        reason: `${field} is not bound to a finite numeric Program parameter.`,
+      };
+    }
+    values[field] = declaration.default;
+  }
+  return {
+    available: true,
+    configuration: { bindings, values, usageCounts, applicableCounts },
+  };
+}
 
 function jsonRecord(value: JsonValue | undefined): Record<string, JsonValue> | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value)

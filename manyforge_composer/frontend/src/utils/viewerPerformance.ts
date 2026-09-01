@@ -66,7 +66,7 @@ const MAX_QUALIFICATION_ERRORS = 16;
 const MAX_QUALIFICATION_ERROR_LENGTH = 240;
 
 export interface ViewerQualificationTransportState {
-  socketPath: '/ws/state';
+  socketPath: '/ws/scene/viewer';
   sourceCount: number;
   activeSockets: number;
   socketCreations: number;
@@ -194,7 +194,7 @@ let qualificationRenderer:
   (ViewerRendererInspection & ViewerPresentationProfile) | null = null;
 let qualificationWireframeDefault = false;
 let qualificationTransport: ViewerQualificationTransportState = {
-  socketPath: '/ws/state',
+  socketPath: '/ws/scene/viewer',
   sourceCount: 0,
   activeSockets: 0,
   socketCreations: 0,
@@ -265,7 +265,7 @@ export function setViewerQualificationTransport(
   transport: ViewerQualificationTransportState,
 ): void {
   qualificationTransport = {
-    socketPath: '/ws/state',
+    socketPath: transport.socketPath,
     sourceCount: Math.min(1_000_000, Math.max(0, Math.trunc(transport.sourceCount))),
     activeSockets: Math.min(1_000_000, Math.max(0, Math.trunc(transport.activeSockets))),
     socketCreations: Math.min(

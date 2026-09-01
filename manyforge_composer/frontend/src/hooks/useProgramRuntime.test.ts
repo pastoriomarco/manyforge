@@ -125,6 +125,13 @@ describe('Program runtime idle selection', () => {
     })).toBe(programRuntimeWakeKey(snapshot));
     expect(programRuntimeWakeKey({
       ...snapshot,
+      programCycle: {
+        ...snapshot.programCycle,
+        cycleGeneration: 99,
+      },
+    })).toBe(programRuntimeWakeKey(snapshot));
+    expect(programRuntimeWakeKey({
+      ...snapshot,
       authoringAdmission: {
         ...snapshot.authoringAdmission,
         admissionGeneration: 8,
@@ -352,13 +359,50 @@ describe('Program command settlement', () => {
       programRunId: 'run-1',
       cycleClaimGeneration: 8,
     })).toBeNull();
-    expect(programPendingAfterProjection('reset', null, null, {
+    const idleCycle = {
       programRunnerOwnerEpoch: 'runner.epoch.1',
       cycleGeneration: 5,
       state: 'idle_after_reset',
       programRunId: null,
       cycleClaimGeneration: null,
-    })).toBeNull();
+      admissionGeneration: 12,
+      authoringAllowed: true,
+    } as const;
+    expect(programPendingAfterProjection(
+      'run', run, settled, {
+        ...idleCycle,
+        cycleGeneration: 4,
+        state: 'running',
+        programRunId: 'run-1',
+        cycleClaimGeneration: 8,
+      }, 'run',
+    )).toBe('run');
+    expect(programPendingAfterProjection(
+      'reset', null, null, idleCycle, 'reset',
+    )).toBe('reset');
+    expect(programPendingAfterProjection(
+      'reset', null, null, idleCycle,
+    )).toBeNull();
+    expect(programPendingAfterProjection(
+      'reset', null, null,
+      { ...idleCycle, authoringAllowed: false },
+      null,
+      { admissionGeneration: 12, allowEqual: false },
+    )).toBe('reset');
+    expect(programPendingAfterProjection(
+      'reset', null, null, idleCycle, null,
+      { admissionGeneration: 12, allowEqual: false },
+    )).toBe('reset');
+    expect(programPendingAfterProjection(
+      'reset', null, null,
+      { ...idleCycle, admissionGeneration: 13 },
+      null,
+      { admissionGeneration: 12, allowEqual: false },
+    )).toBeNull();
+    expect(programPendingAfterProjection(
+      'reset', null, null, idleCycle, null,
+      { admissionGeneration: 12, allowEqual: true },
+    )).toBeNull();
 
     const resetOnly = {
       ...settled,

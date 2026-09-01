@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py headless-rest
-  Last regenerated: 2026-08-29 23:30:32 UTC
+  Last regenerated: 2026-09-01 21:18:58 UTC
   Generator source: scripts/regen-public-contracts.py:gen_headless_rest_api
 -->
 
@@ -30,6 +30,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `POST` | `/api/cclc/routes/requests` |  | Cclc Route Submit |
 | `GET` | `/api/cclc/routes/transactions/{transaction_id}` |  | Cclc Route Status |
 | `GET` | `/api/cell/authoring-admission` |  | Authoring Admission |
+| `GET` | `/api/component-overview` |  | Component Overview |
 | `POST` | `/api/cycle/recovery-actions` |  | Cycle Recovery Action |
 | `GET` | `/api/cycle/status` |  | Program Cycle Status |
 | `GET` | `/api/execution/alarms` |  | Alarms |
@@ -53,13 +54,13 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `POST` | `/api/execution/operations/{operation_id}/pause` |  | Execution Pause |
 | `POST` | `/api/execution/operations/{operation_id}/reset` |  | Execution Reset |
 | `POST` | `/api/execution/operations/{operation_id}/resume` |  | Execution Resume |
-| `GET` | `/api/execution/operations/{operation_id}/runtime-scale` |  | Execution Get Runtime Scale |
-| `POST` | `/api/execution/operations/{operation_id}/runtime-scale` |  | Execution Set Runtime Scale |
 | `POST` | `/api/execution/pick-place/plans/pick` |  | Execution Plan Pick |
 | `POST` | `/api/execution/pick-place/plans/place` |  | Execution Plan Place |
 | `POST` | `/api/execution/pick-place/sequences/pick` |  | Execution Start Pick |
 | `POST` | `/api/execution/pick-place/sequences/place` |  | Execution Start Place |
 | `GET` | `/api/execution/pick-place/sequences/{sequence_id}` |  | Execution Pick Place Sequence |
+| `GET` | `/api/execution/runtime-scale-control` |  | Execution Get Runtime Scale Control |
+| `POST` | `/api/execution/runtime-scale-control` |  | Execution Set Runtime Scale Control |
 | `GET` | `/api/execution/status` |  | Execution Status |
 | `GET` | `/api/execution/stop-fault` |  | Execution Stop Fault |
 | `POST` | `/api/execution/stop-fault/recover` |  | Execution Recover Stop Fault |
@@ -68,6 +69,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `GET` | `/api/health` |  | Health |
 | `POST` | `/api/manager/apply` |  | Manager Apply |
 | `GET` | `/api/manager/apply/status` |  | Manager Apply Status |
+| `POST` | `/api/manager/deployment-candidates/compile` |  | Compile Deployment Candidate |
 | `POST` | `/api/manager/deployment-candidates/preview` |  | Manager Deployment Candidate Preview |
 | `GET` | `/api/manager/diff` |  | Manager Diff |
 | `GET` | `/api/manager/graph` |  | Manager Graph |
@@ -85,8 +87,11 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `POST` | `/api/program/runs` |  | Program Run Start |
 | `GET` | `/api/program/runs/{program_run_id}` |  | Program Run Read |
 | `POST` | `/api/program/runs/{program_run_id}/blackboard-values` |  | Write Runtime Blackboard |
+| `POST` | `/api/program/runs/{program_run_id}/full-stop` |  | Program Run Full Stop |
 | `POST` | `/api/program/runs/{program_run_id}/manual-result` |  | Stage Manual Result |
 | `POST` | `/api/program/runs/{program_run_id}/motion-stop` |  | Program Run Motion Stop |
+| `POST` | `/api/program/runs/{program_run_id}/reset` |  | Program Run Reset Full Stop |
+| `POST` | `/api/program/runs/{program_run_id}/resume-full-stop` |  | Program Run Resume Full Stop |
 | `GET` | `/api/program/runs/{program_run_id}/runtime-controls` |  | Program Runtime Controls |
 | `POST` | `/api/program/runs/{program_run_id}/runtime-overrides` |  | Stage Runtime Override |
 | `POST` | `/api/program/runs/{program_run_id}/runtime-overrides/activate` |  | Activate Runtime Override |

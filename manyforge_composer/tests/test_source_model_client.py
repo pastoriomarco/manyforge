@@ -68,7 +68,7 @@ def _seal(payload: dict) -> dict:
             (
                 CONTENT_IDENTITY_PREFIX,
                 b"manyforge-source-model-projection-semantic",
-                b"manyforge.source_model_projection.v1",
+                b"manyforge.source_model_projection.v2",
                 canonical_json_bytes(semantic),
             )
         )
@@ -78,7 +78,7 @@ def _seal(payload: dict) -> dict:
 
 def _projection() -> dict:
     return _seal({
-        "schema_version": "manyforge.source_model_projection.v1",
+        "schema_version": "manyforge.source_model_projection.v2",
         "cell_id": "cell-a",
         "retained_bundle_id": "bundle.1",
         "graph_revision": "graph.1",
@@ -100,6 +100,9 @@ def _projection() -> dict:
                         "source_joint_name": "joint_1",
                         "source_parent_link_name": "base_link",
                         "unit": "radians",
+                        "viewer_child_link_name": "viewer__link1",
+                        "viewer_joint_name": "viewer__joint_1",
+                        "viewer_parent_link_name": "viewer__base_link",
                     },
                     {
                         "coordinate_kind": "angular",
@@ -110,6 +113,23 @@ def _projection() -> dict:
                         "source_joint_name": "joint_2",
                         "source_parent_link_name": "link1",
                         "unit": "radians",
+                        "viewer_child_link_name": "viewer__link2",
+                        "viewer_joint_name": "viewer__joint_2",
+                        "viewer_parent_link_name": "viewer__link1",
+                    },
+                ],
+                "links": [
+                    {
+                        "source_link_name": "base_link",
+                        "viewer_link_name": "viewer__base_link",
+                    },
+                    {
+                        "source_link_name": "link1",
+                        "viewer_link_name": "viewer__link1",
+                    },
+                    {
+                        "source_link_name": "link2",
+                        "viewer_link_name": "viewer__link2",
                     },
                 ],
                 "model_asset_id": "lite6",
@@ -118,7 +138,6 @@ def _projection() -> dict:
                 "model_role_id": "arm_model",
                 "source_model_name": "lite6",
                 "source_robot_name": "lite6",
-                "source_link_names": ["base_link", "link1", "link2"],
                 "srdf_end_effectors": [
                     {
                         "source_end_effector_name": "lite_gripper",
@@ -185,7 +204,7 @@ def _projection() -> dict:
     })
 
 
-def test_source_projection_preserves_source_local_semantics_only() -> None:
+def test_source_projection_preserves_source_semantics_and_exact_viewer_binding() -> None:
     verified = verify_active_source_model(
         _projection(),
         node_environment=_node_environment(),
@@ -195,6 +214,10 @@ def test_source_projection_preserves_source_local_semantics_only() -> None:
     assert [
         coordinate["source_joint_name"] for coordinate in occurrence["coordinates"]
     ] == ["joint_1", "joint_2"]
+    assert occurrence["links"][1] == {
+        "source_link_name": "link1",
+        "viewer_link_name": "viewer__link1",
+    }
     assert verified.payload["targets"][0]["model_groups"][0][
         "source_group_name"
     ] == "lite6"

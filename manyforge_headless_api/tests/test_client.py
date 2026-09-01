@@ -111,7 +111,7 @@ def _sized_context_payload(size: int, *, native: bool = False) -> bytes:
         b'{"schema_version":"manyforge.source_model_context.v1",'
         b'"node_environment":{"schema_version":"manyforge.'
         b'node_environment_projection.v2"},'
-        b'"source_model":{"schema_version":"manyforge.source_model_projection.v1",'
+        b'"source_model":{"schema_version":"manyforge.source_model_projection.v2",'
         b'"padding":"'
     )
     suffix = b'"}}' + (b"}" if native else b"")
@@ -153,6 +153,33 @@ def test_client_returns_bounded_strict_json_object() -> None:
         raw.close()
 
 
+def test_client_uses_the_component_overview_route() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={"schema_version": "manyforge.component_overview.v1"},
+            request=request,
+        )
+
+    raw = httpx.Client(
+        base_url="http://headless.test",
+        transport=httpx.MockTransport(handler),
+    )
+    client = HeadlessHttpClient("http://unused.test", client=raw)
+    try:
+        assert client.component_overview()["schema_version"] == (
+            "manyforge.component_overview.v1"
+        )
+    finally:
+        raw.close()
+    assert [request.url.path for request in requests] == [
+        "/api/component-overview"
+    ]
+
+
 def test_client_uses_the_dedicated_node_environment_route() -> None:
     requests: list[httpx.Request] = []
 
@@ -176,6 +203,41 @@ def test_client_uses_the_dedicated_node_environment_route() -> None:
     assert [request.url.path for request in requests] == ["/api/node-environment"]
 
 
+def test_client_sends_runtime_scale_selector_as_query_parameters() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "api_version": "manyforge.execution_api.v1",
+                "command": "get_runtime_scale_control",
+                "ok": True,
+                "runtime_scale_control": {},
+            },
+            request=request,
+        )
+
+    raw = httpx.Client(
+        base_url="http://headless.test",
+        transport=httpx.MockTransport(handler),
+    )
+    client = HeadlessHttpClient("http://unused.test", client=raw)
+    selector = {
+        "program_binding_id": "sha256:" + "a" * 64,
+        "component_role_id": "robot",
+        "target_role_id": "arm",
+    }
+    try:
+        assert client.runtime_scale_control(selector)["ok"] is True
+    finally:
+        raw.close()
+    assert len(requests) == 1
+    assert requests[0].url.path == "/api/execution/runtime-scale-control"
+    assert dict(requests[0].url.params) == selector
+
+
 def test_client_uses_the_dedicated_source_model_route() -> None:
     requests: list[httpx.Request] = []
 
@@ -183,7 +245,7 @@ def test_client_uses_the_dedicated_source_model_route() -> None:
         requests.append(request)
         return httpx.Response(
             200,
-            json={"schema_version": "manyforge.source_model_projection.v1"},
+            json={"schema_version": "manyforge.source_model_projection.v2"},
             request=request,
         )
 
@@ -193,7 +255,7 @@ def test_client_uses_the_dedicated_source_model_route() -> None:
     )
     client = HeadlessHttpClient("http://unused.test", client=raw)
     try:
-        assert client.source_model()["schema_version"].endswith("projection.v1")
+        assert client.source_model()["schema_version"].endswith("projection.v2")
     finally:
         raw.close()
     assert [request.url.path for request in requests] == ["/api/source-model"]

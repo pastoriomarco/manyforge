@@ -68,6 +68,7 @@ _AUTHORING_MUTATIONS = frozenset(
         "blackboard_draft_upsert_namespaces",
         "program_draft_remove_parameters",
         "program_draft_upsert_parameters",
+        "program_draft_update_motion_defaults",
         "scene_draft_add_object",
         "scene_draft_remove_objects",
         "scene_draft_update_object",

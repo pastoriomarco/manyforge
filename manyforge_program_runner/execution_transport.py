@@ -16,7 +16,6 @@ from manyforge_headless_api.models import (
     PickSequencePlanningRequest,
     PlaceSequencePlanningRequest,
     ProgramRunStopIntentRequest,
-    RuntimeScaleRequest,
     StopIntentRequest,
 )
 from manyforge_headless_api.native import HeadlessApiError
@@ -112,17 +111,6 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
         return super().stop_program_run(
             self._request(ProgramRunStopIntentRequest, body)
         )
-
-    def set_runtime_scale(
-        self, operation_id: str, body: Mapping[str, Any]
-    ) -> dict[str, Any]:
-        request = self._request(RuntimeScaleRequest, body)
-        if request.operation_id != operation_id:
-            raise HeadlessApiError(
-                "execution_operation_path_invalid",
-                "operation identity and request body must match",
-            )
-        return super().set_runtime_scale(request, trusted_principal_id=None)
 
     def _pick_place(
         self,

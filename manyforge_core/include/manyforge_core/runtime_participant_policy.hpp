@@ -51,6 +51,9 @@ class RuntimeParticipantPolicySelection final {
   friend Result<RuntimeParticipantPolicySelection> verify_runtime_participant_policy_selection(
       RuntimePolicyCatalogRecordRefDTO, RuntimePolicyDTO,
       const RuntimeParticipantBinding&);
+  friend Result<RuntimeParticipantPolicySelection>
+  apply_deployment_motion_speed_ceiling(
+      const RuntimeParticipantPolicySelection&, double);
 };
 
 /// Seal one already-qualified retained runtime policy against one exact
@@ -58,6 +61,14 @@ class RuntimeParticipantPolicySelection final {
 [[nodiscard]] Result<RuntimeParticipantPolicySelection> verify_runtime_participant_policy_selection(
     RuntimePolicyCatalogRecordRefDTO source_artifact, RuntimePolicyDTO policy,
     const RuntimeParticipantBinding& participant);
+
+/// Add one independently authored Deployment ceiling without changing the
+/// identity or contents of the immutable runtime-policy artifact.  The result
+/// can only tighten the catalog-selected ceiling.
+[[nodiscard]] Result<RuntimeParticipantPolicySelection>
+apply_deployment_motion_speed_ceiling(
+    const RuntimeParticipantPolicySelection& selection,
+    double deployment_maximum_tcp_linear_speed_mps);
 
 /// Apply the sealed runtime ceiling to an already public-boundary-validated
 /// speed profile. The result always carries a finite positive maximum.

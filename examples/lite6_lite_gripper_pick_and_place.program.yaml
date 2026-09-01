@@ -1,6 +1,6 @@
 api_version: manyforge.program.v1
 program_id: lite6_lite_gripper_pick_and_place
-program_revision: sha256:3569bdaa98278af447084b31f2e2f920e4b760e8c60ce803de1a18aac78ee7f2
+program_revision: sha256:da458e0bae5d281f6573be2080a173953a00016139ddf6a84bf839e01244675e
 program_profile: composable-cell-v1
 name: lite6_lite_gripper_pick_and_place
 description: >-
@@ -96,6 +96,18 @@ scene:
       position_m: [0.0, -0.15, 0.1]
       orientation: {rpy_deg: [0.0, 0.0, 0.0]}
 parameters:
+  - parameter_id: acceleration_scale
+    type: float64
+    default: 1.0
+    constraints: {min_exclusive: 0.0, max_inclusive: 1.0}
+    runtime_mutability: before_run
+    description: Acceleration scale for all Lite6 pick-and-place moves.
+  - parameter_id: max_tcp_linear_speed_mps
+    type: float64
+    default: 0.15
+    constraints: {min_exclusive: 0.0}
+    runtime_mutability: before_run
+    description: Maximum TCP linear speed for all Lite6 pick-and-place moves.
   - parameter_id: velocity_scale
     type: float64
     default: 0.4
@@ -131,6 +143,12 @@ tree:
         planning_timeout_s: 10.0
         execution_timeout_s: 30.0
       value_sources:
+        acceleration_scale:
+          kind: program_parameter
+          reference: acceleration_scale
+        max_tcp_linear_speed_mps:
+          kind: program_parameter
+          reference: max_tcp_linear_speed_mps
         velocity_scale:
           kind: program_parameter
           reference: velocity_scale
@@ -150,6 +168,12 @@ tree:
         planning_timeout_s: 10.0
         execution_timeout_s: 30.0
       value_sources:
+        acceleration_scale:
+          kind: program_parameter
+          reference: acceleration_scale
+        max_tcp_linear_speed_mps:
+          kind: program_parameter
+          reference: max_tcp_linear_speed_mps
         velocity_scale:
           kind: program_parameter
           reference: velocity_scale
@@ -169,6 +193,12 @@ tree:
         planning_timeout_s: 10.0
         execution_timeout_s: 30.0
       value_sources:
+        acceleration_scale:
+          kind: program_parameter
+          reference: acceleration_scale
+        max_tcp_linear_speed_mps:
+          kind: program_parameter
+          reference: max_tcp_linear_speed_mps
         velocity_scale:
           kind: program_parameter
           reference: velocity_scale
@@ -203,6 +233,12 @@ tree:
         planning_timeout_s: 10.0
         execution_timeout_s: 30.0
       value_sources:
+        acceleration_scale:
+          kind: program_parameter
+          reference: acceleration_scale
+        max_tcp_linear_speed_mps:
+          kind: program_parameter
+          reference: max_tcp_linear_speed_mps
         velocity_scale:
           kind: program_parameter
           reference: velocity_scale
@@ -220,6 +256,12 @@ tree:
         planning_timeout_s: 10.0
         execution_timeout_s: 30.0
       value_sources:
+        acceleration_scale:
+          kind: program_parameter
+          reference: acceleration_scale
+        max_tcp_linear_speed_mps:
+          kind: program_parameter
+          reference: max_tcp_linear_speed_mps
         velocity_scale:
           kind: program_parameter
           reference: velocity_scale
@@ -237,6 +279,12 @@ tree:
         planning_timeout_s: 10.0
         execution_timeout_s: 30.0
       value_sources:
+        acceleration_scale:
+          kind: program_parameter
+          reference: acceleration_scale
+        max_tcp_linear_speed_mps:
+          kind: program_parameter
+          reference: max_tcp_linear_speed_mps
         velocity_scale:
           kind: program_parameter
           reference: velocity_scale
@@ -268,6 +316,12 @@ tree:
         planning_timeout_s: 10.0
         execution_timeout_s: 30.0
       value_sources:
+        acceleration_scale:
+          kind: program_parameter
+          reference: acceleration_scale
+        max_tcp_linear_speed_mps:
+          kind: program_parameter
+          reference: max_tcp_linear_speed_mps
         velocity_scale:
           kind: program_parameter
           reference: velocity_scale
@@ -288,6 +342,12 @@ tree:
         planning_timeout_s: 10.0
         execution_timeout_s: 30.0
       value_sources:
+        acceleration_scale:
+          kind: program_parameter
+          reference: acceleration_scale
+        max_tcp_linear_speed_mps:
+          kind: program_parameter
+          reference: max_tcp_linear_speed_mps
         velocity_scale:
           kind: program_parameter
           reference: velocity_scale

@@ -12,7 +12,6 @@ from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClien
 
 from .authoring_admission import AuthoringAdmissionCoordinator
 from .draft_session import ComposerDraftSession
-from .execution_observation_stream import ExecutionObservationSource
 
 
 POLL_INTERVAL_SECONDS = 0.25
@@ -49,9 +48,79 @@ def _projection_key(
 ) -> tuple[Any, ...]:
     """Return the owner revisions that can change the browser projection."""
 
+    sections = runtime.get("sections")
+    sections = sections if isinstance(sections, dict) else {}
+    manager = sections.get("manager")
+    manager = manager if isinstance(manager, dict) else {}
+    manager_payload = manager.get("payload")
+    manager_payload = manager_payload if isinstance(manager_payload, dict) else {}
+    active = manager_payload.get("active")
+    active = active if isinstance(active, dict) else {}
+    manager_runtime = manager_payload.get("runtime")
+    manager_runtime = manager_runtime if isinstance(manager_runtime, dict) else {}
+
+    def runtime_units(name: str) -> tuple[str, ...]:
+        rows = manager_runtime.get(name)
+        if not isinstance(rows, list):
+            return ()
+        stable_rows = []
+        retained_fields = (
+            "runtime_unit_id",
+            "selected_runtime_contract_offer_digest",
+            "observed_runtime_contract_offer_digest",
+            "observed_configuration_identity",
+            "observed_product_identity",
+            "converged",
+            "derived_state",
+            "runtime_epoch",
+            "process_presence",
+            "source_health",
+            "source_phase",
+            "command_surface_state",
+            "critical_progress_sequence",
+            "reason_codes",
+            "ready_runtime_role_ids",
+        )
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            stable_rows.append(
+                json.dumps(
+                    {field: row.get(field) for field in retained_fields if field in row},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+        return tuple(sorted(stable_rows))
+
+    def source_key(name: str, *, include_generation: bool) -> tuple[Any, ...]:
+        section = sections.get(name)
+        section = section if isinstance(section, dict) else {}
+        return (
+            section.get("available"),
+            section.get("freshness"),
+            tuple(section.get("known_gaps", ())),
+            section.get("source_owner_id"),
+            section.get("source_owner_epoch"),
+            section.get("source_generation") if include_generation else None,
+            section.get("source_content_digest") if include_generation else None,
+        )
+
     return (
         runtime.get("projection_owner_epoch"),
-        runtime.get("projection_generation"),
+        runtime.get("projection_owner_id"),
+        runtime.get("complete"),
+        tuple(runtime.get("reasons", ())),
+        tuple(runtime.get("unavailable_sections", ())),
+        source_key("manager", include_generation=False),
+        active.get("graph_revision"),
+        active.get("retained_bundle_id"),
+        manager_payload.get("manager_ready"),
+        manager_runtime.get("converged"),
+        runtime_units("desired_units"),
+        runtime_units("observed_units"),
+        source_key("logical_scene", include_generation=True),
+        source_key("scene_runtime", include_generation=True),
         alarms.get("owner_epoch"),
         alarms.get("generation"),
         alarms.get("state_revision"),
@@ -79,24 +148,72 @@ def _projection_key(
     )
 
 
+def _overview_matches_snapshot(
+    overview: dict[str, Any],
+    runtime: dict[str, Any],
+    alarms: dict[str, Any],
+    authoring: dict[str, Any],
+    cycle: dict[str, Any],
+) -> bool:
+    """Reject a reducer result that crossed a meaningful owner revision."""
+
+    if overview.get("schema_version") != "manyforge.component_overview.v1":
+        return False
+    basis = overview.get("basis")
+    sections = runtime.get("sections")
+    if not isinstance(basis, dict) or not isinstance(sections, dict):
+        return False
+
+    def source(name: str) -> dict[str, Any]:
+        value = sections.get(name)
+        return value if isinstance(value, dict) else {}
+
+    expected = {
+        "runtime_projection_owner_epoch": runtime.get("projection_owner_epoch"),
+        "manager_source_owner_epoch": source("manager").get("source_owner_epoch"),
+        "logical_scene_source_owner_epoch": source("logical_scene").get(
+            "source_owner_epoch"
+        ),
+        "logical_scene_source_generation": source("logical_scene").get(
+            "source_generation"
+        ),
+        "scene_runtime_source_owner_epoch": source("scene_runtime").get(
+            "source_owner_epoch"
+        ),
+        "scene_runtime_source_generation": source("scene_runtime").get(
+            "source_generation"
+        ),
+        "alarm_owner_epoch": alarms.get("owner_epoch"),
+        "alarm_generation": alarms.get("generation"),
+        "alarm_state_revision": alarms.get("state_revision"),
+        "admission_generation": authoring.get("admission_generation"),
+        "program_runner_owner_epoch": cycle.get("program_runner_owner_epoch"),
+        "program_cycle_generation": cycle.get("cycle_generation"),
+    }
+    return all(basis.get(name) == value for name, value in expected.items())
+
+
 async def serve_headless_state(
     websocket: WebSocket,
     client: HeadlessHttpClient,
     *,
     admission: AuthoringAdmissionCoordinator,
     draft_session: ComposerDraftSession,
-    observation_source: ExecutionObservationSource | None = None,
 ) -> None:
-    """Publish fresh owner projections independently for one browser."""
+    """Publish the low-rate shell/control projection for one browser."""
 
     await websocket.accept()
     sequence = 0
     last_error_message: str | None = None
     last_projection_key: tuple[Any, ...] | None = None
-    observation_subscription = (
-        observation_source.subscribe() if observation_source is not None else None
-    )
     next_shell_at = 0.0
+
+    async def send(encoded: str) -> None:
+        await asyncio.wait_for(
+            websocket.send_text(encoded),
+            timeout=SEND_TIMEOUT_SECONDS,
+        )
+
     try:
         while True:
             now = time.monotonic()
@@ -120,11 +237,19 @@ async def serve_headless_state(
                         runtime, alarms, authoring, cycle, draft
                     )
                     if projection_key != last_projection_key:
+                        overview = await asyncio.to_thread(client.component_overview)
+                        if not _overview_matches_snapshot(
+                            overview, runtime, alarms, authoring, cycle
+                        ):
+                            raise ValueError(
+                                "Component Overview crossed an owner revision"
+                            )
                         sequence += 1
                         payload = {
-                            "schema_version": "manyforge.composer_headless_state.v1",
+                            "schema_version": "manyforge.composer_headless_state.v2",
                             "runtime": runtime,
                             "alarms": alarms,
+                            "component_overview": overview,
                             "authoring_admission": authoring,
                             "program_cycle": cycle,
                             "draft_identity": {
@@ -136,10 +261,7 @@ async def serve_headless_state(
                             "complete": True,
                         }
                         encoded = _encode(payload)
-                        await asyncio.wait_for(
-                            websocket.send_text(encoded),
-                            timeout=SEND_TIMEOUT_SECONDS,
-                        )
+                        await send(encoded)
                         last_projection_key = projection_key
                     last_error_message = None
                 except (HeadlessClientError, KeyError, TypeError, ValueError) as error:
@@ -147,7 +269,7 @@ async def serve_headless_state(
                     error_message = _encode(
                         {
                             "schema_version": (
-                                "manyforge.composer_headless_state.v1"
+                                "manyforge.composer_headless_state.v2"
                             ),
                             "runtime": None,
                             "alarms": None,
@@ -162,32 +284,13 @@ async def serve_headless_state(
                         }
                     )
                     if error_message != last_error_message:
-                        await asyncio.wait_for(
-                            websocket.send_text(error_message),
-                            timeout=SEND_TIMEOUT_SECONDS,
-                        )
+                        await send(error_message)
                         last_error_message = error_message
 
             delay = max(0.0, next_shell_at - time.monotonic())
-            if observation_subscription is None:
-                await asyncio.sleep(delay)
-                continue
-            try:
-                frame = await asyncio.wait_for(
-                    observation_subscription.queue.get(),
-                    timeout=delay,
-                )
-            except asyncio.TimeoutError:
-                continue
-            await asyncio.wait_for(
-                websocket.send_text(_encode(frame)),
-                timeout=SEND_TIMEOUT_SECONDS,
-            )
+            await asyncio.sleep(delay)
     except (WebSocketDisconnect, asyncio.TimeoutError):
         pass
-    finally:
-        if observation_source is not None and observation_subscription is not None:
-            observation_source.unsubscribe(observation_subscription)
 
 
 __all__ = ["serve_headless_state"]

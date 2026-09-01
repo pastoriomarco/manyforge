@@ -888,7 +888,9 @@ class FilesystemVerifiedRetainedBundleSource final
     : public IVerifiedRetainedBundleSource {
  public:
   explicit FilesystemVerifiedRetainedBundleSource(
-      std::filesystem::path trusted_package_root);
+      std::filesystem::path trusted_package_root,
+      std::optional<std::filesystem::path> candidate_package_root =
+          std::nullopt);
   ~FilesystemVerifiedRetainedBundleSource() override = default;
 
   FilesystemVerifiedRetainedBundleSource(
@@ -905,6 +907,7 @@ class FilesystemVerifiedRetainedBundleSource final
 
  private:
   std::filesystem::path trusted_package_root_;
+  std::optional<std::filesystem::path> candidate_package_root_;
 };
 
 /// Filesystem-backed exact retained-product artifact point reader.
@@ -918,7 +921,9 @@ class FilesystemVerifiedRetainedProductArtifactSource final
     : public IVerifiedRetainedProductArtifactSource {
  public:
   explicit FilesystemVerifiedRetainedProductArtifactSource(
-      std::filesystem::path trusted_package_root);
+      std::filesystem::path trusted_package_root,
+      std::optional<std::filesystem::path> candidate_package_root =
+          std::nullopt);
   ~FilesystemVerifiedRetainedProductArtifactSource() override = default;
 
   FilesystemVerifiedRetainedProductArtifactSource(
@@ -935,6 +940,7 @@ class FilesystemVerifiedRetainedProductArtifactSource final
 
  private:
   std::filesystem::path trusted_package_root_;
+  std::optional<std::filesystem::path> candidate_package_root_;
 };
 
 class FilesystemVerifiedRetainedProviderManifestSource final
@@ -960,7 +966,9 @@ class FilesystemVerifiedRetainedModelMapSource final
     : public IVerifiedRetainedModelMapSource {
  public:
   explicit FilesystemVerifiedRetainedModelMapSource(
-      std::filesystem::path trusted_package_root);
+      std::filesystem::path trusted_package_root,
+      std::optional<std::filesystem::path> candidate_package_root =
+          std::nullopt);
   ~FilesystemVerifiedRetainedModelMapSource() override = default;
 
   FilesystemVerifiedRetainedModelMapSource(
@@ -977,6 +985,7 @@ class FilesystemVerifiedRetainedModelMapSource final
 
  private:
   std::filesystem::path trusted_package_root_;
+  std::optional<std::filesystem::path> candidate_package_root_;
 };
 
 /// Filesystem-backed exact retained planning-model point reader.
@@ -1020,7 +1029,9 @@ class FilesystemVerifiedRetainedViewerModelSource final
     : public IVerifiedRetainedViewerModelSource {
 public:
   explicit FilesystemVerifiedRetainedViewerModelSource(
-      std::filesystem::path trusted_package_root);
+      std::filesystem::path trusted_package_root,
+      std::optional<std::filesystem::path> candidate_package_root =
+          std::nullopt);
   ~FilesystemVerifiedRetainedViewerModelSource() override = default;
 
   FilesystemVerifiedRetainedViewerModelSource(
@@ -1037,6 +1048,7 @@ public:
 
 private:
   std::filesystem::path trusted_package_root_;
+  std::optional<std::filesystem::path> candidate_package_root_;
 };
 
 }  // namespace manyforge::deployment

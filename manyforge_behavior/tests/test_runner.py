@@ -82,15 +82,6 @@ class RecordingTransport:
         operation_id = body["operations"][0]["operation_id"]
         return self._control("stop", operation_id, body)
 
-    def set_runtime_scale(self, operation_id, body):
-        return self._control("runtime_scale", operation_id, body)
-
-    def get_runtime_scale(self, operation_id):
-        return {
-            "ok": True,
-            "runtime_scale": {"operation_id": operation_id},
-        }
-
 
 def test_runner_submits_source_joint_names_against_exact_owner_selection() -> None:
     transport = RecordingTransport()

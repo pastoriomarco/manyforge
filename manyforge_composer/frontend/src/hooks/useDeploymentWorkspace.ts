@@ -4,6 +4,8 @@ import { api, ApiError } from '../api/client';
 import { errorMessage } from '../state/structuralResource';
 import type {
   DeploymentWorkspaceResponse,
+  DeploymentCandidateOperationResponse,
+  DeploymentControlledStopProfile,
   DraftFenceRequest,
   JsonValue,
 } from '../types/api';
@@ -37,6 +39,9 @@ export function useDeploymentWorkspace(
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
+  const [candidate, setCandidate] = useState<
+    DeploymentCandidateOperationResponse['result'] | null
+  >(null);
   const mounted = useRef(true);
   const inFlight = useRef(false);
   const refreshSequence = useRef(0);
@@ -54,6 +59,7 @@ export function useDeploymentWorkspace(
       const next = await api.deploymentWorkspace.get();
       if (mounted.current && sequence === refreshSequence.current) {
         setWorkspace(next);
+        setCandidate(null);
       }
       return next;
     } catch (reason: unknown) {
@@ -77,6 +83,7 @@ export function useDeploymentWorkspace(
       setLoading(false);
       setError(null);
       setFeedback(null);
+      setCandidate(null);
     }
     return () => { mounted.current = false; };
   }, [enabled, refresh]);
@@ -115,6 +122,7 @@ export function useDeploymentWorkspace(
     setBusy(true);
     setError(null);
     setFeedback(null);
+    setCandidate(null);
     try {
       const next = await operation(requestFence);
       if (mounted.current) {
@@ -122,11 +130,52 @@ export function useDeploymentWorkspace(
         // must not replace the newer owner-issued post-image when it arrives.
         refreshSequence.current += 1;
         setWorkspace(next);
+        setCandidate(null);
         setFeedback(message);
       }
       return next;
     } catch (reason: unknown) {
       const message = errorMessage(reason, 'Deployment authoring request failed.');
+      if (isStaleDraftError(reason)) {
+        const latest = await refresh();
+        if (mounted.current && latest !== null) setError(message);
+      } else if (mounted.current) {
+        setError(message);
+      }
+      return null;
+    } finally {
+      inFlight.current = false;
+      if (mounted.current) setBusy(false);
+    }
+  }, [fence, refresh]);
+
+  const runCandidate = useCallback(async (
+    operation: (
+      requestFence: DraftFenceRequest,
+    ) => Promise<DeploymentCandidateOperationResponse>,
+    message: string,
+  ) => {
+    const requestFence = fence();
+    if (requestFence === null || inFlight.current) return null;
+    inFlight.current = true;
+    setBusy(true);
+    setError(null);
+    setFeedback(null);
+    setCandidate(null);
+    try {
+      const response = await operation(requestFence);
+      if (mounted.current) {
+        refreshSequence.current += 1;
+        setWorkspace(response.workspace);
+        setCandidate(response.result.status === 'previewed' ? response.result : null);
+        setFeedback(message);
+      }
+      return response;
+    } catch (reason: unknown) {
+      const message = errorMessage(
+        reason,
+        'Deployment candidate request failed.',
+      );
       if (isStaleDraftError(reason)) {
         const latest = await refresh();
         if (mounted.current && latest !== null) setError(message);
@@ -157,6 +206,25 @@ export function useDeploymentWorkspace(
       ),
       'Deployment Draft updated; Manager Applied was unchanged.',
     ),
+    updateControlledStop: (profile: DeploymentControlledStopProfile) => run(
+      (requestFence) => api.deploymentWorkspace.updateControlledStop(
+        requestFence, profile,
+      ),
+      'Controlled Stop Draft updated atomically; Manager Applied was unchanged.',
+    ),
+    updateMotionTargetLimit: (
+      controllableComponentId: string,
+      commandTargetId: string,
+      maximumTcpLinearSpeedMps: number,
+    ) => run(
+      (requestFence) => api.deploymentWorkspace.updateMotionTargetLimit(
+        requestFence,
+        controllableComponentId,
+        commandTargetId,
+        maximumTcpLinearSpeedMps,
+      ),
+      'Target motion cap Draft updated; Manager Applied was unchanged.',
+    ),
     save: () => run(
       (requestFence) => api.deploymentWorkspace.save(requestFence),
       'Deployment Draft saved; Manager Applied was unchanged.',
@@ -175,7 +243,15 @@ export function useDeploymentWorkspace(
       (requestFence) => api.deploymentWorkspace.revert(requestFence),
       'Saved Deployment restored to Draft and applied by Manager.',
     ),
-  }), [run]);
+    previewDraft: () => runCandidate(
+      (requestFence) => api.deploymentWorkspace.previewDraft(requestFence),
+      'Deployment Draft compiled and validated; Manager Applied was unchanged.',
+    ),
+    applyDraft: () => runCandidate(
+      (requestFence) => api.deploymentWorkspace.applyDraft(requestFence),
+      'Deployment Draft compiled, applied by Manager, and rebound to the current Program.',
+    ),
+  }), [run, runCandidate]);
 
   return {
     workspace,
@@ -183,6 +259,7 @@ export function useDeploymentWorkspace(
     busy,
     error,
     feedback,
+    candidate,
     mutationAvailable,
     mutationUnavailableReason,
     refresh,

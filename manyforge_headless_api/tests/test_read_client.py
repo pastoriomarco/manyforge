@@ -17,7 +17,7 @@ SCHEMAS = {
     "/api/manager/graph": "manyforge.manager_graph_projection.v1",
     "/api/manager/diff": "manyforge.manager_diff_projection.v1",
     "/api/node-environment": "manyforge.node_environment_projection.v2",
-    "/api/source-model": "manyforge.source_model_projection.v1",
+    "/api/source-model": "manyforge.source_model_projection.v2",
     "/api/scene": "manyforge.scene_projection.v1",
     "/api/execution/alarms": "manyforge.operator_alarm_snapshot.v2",
     "/api/execution/alarms/metrics": "manyforge.operator_alarm_metrics.v1",
@@ -53,7 +53,7 @@ def test_read_client_exposes_only_the_closed_h0_observation_set() -> None:
             "projection.v2"
         )
         assert reader.invoke("source_model")["schema_version"].endswith(
-            "projection.v1"
+            "projection.v2"
         )
         assert "manager_apply" not in reader.operations()
         assert "acknowledge_alarm" not in reader.operations()

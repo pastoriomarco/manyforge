@@ -63,7 +63,7 @@ function statusFixture(ownerEpoch = 'execution-owner-1'): ExecutionOwnerStatus {
         },
       ],
       targetDescriptor: {
-        schemaVersion: 'manyforge.manual_control_motion_descriptor.v1',
+        schemaVersion: 'manyforge.manual_control_motion_descriptor.v3',
         controllableComponentId: 'robot-a',
         commandTargetId: 'arm',
         componentRoleId: 'controlled_component',
@@ -76,6 +76,23 @@ function statusFixture(ownerEpoch = 'execution-owner-1'): ExecutionOwnerStatus {
           { sourceJointName: 'joint1', compiledJointName: 'robot__joint1', unit: 'rad', minPositionRad: -1, maxPositionRad: 1, maxVelocityRadS: 2, maxAccelerationRadS2: 3 },
           { sourceJointName: 'joint2', compiledJointName: 'robot__joint2', unit: 'rad', minPositionRad: -2, maxPositionRad: 2, maxVelocityRadS: 2, maxAccelerationRadS2: null },
         ],
+        operationalJointLimits: [
+          {
+            sourceJointName: 'joint1', modelMaxVelocityRadS: 2,
+            modelMaxAccelerationRadS2: 3, deploymentMaxVelocityRadS: 1.5,
+            deploymentMaxAccelerationRadS2: 2.5, deploymentMaxJerkRadS3: 10,
+            effectiveMaxVelocityRadS: 1.5, effectiveMaxAccelerationRadS2: 2.5,
+            effectiveMaxJerkRadS3: 10,
+          },
+          {
+            sourceJointName: 'joint2', modelMaxVelocityRadS: 2,
+            modelMaxAccelerationRadS2: null, deploymentMaxVelocityRadS: null,
+            deploymentMaxAccelerationRadS2: null, deploymentMaxJerkRadS3: null,
+            effectiveMaxVelocityRadS: 2, effectiveMaxAccelerationRadS2: null,
+            effectiveMaxJerkRadS3: null,
+          },
+        ],
+        operationalLimit: null,
         contracts: {
           operationCapabilityId: 'execution.trajectory.execute',
           operationCapabilityDefinitionRevision: 'sha256:execution',
@@ -114,9 +131,17 @@ function statusFixture(ownerEpoch = 'execution-owner-1'): ExecutionOwnerStatus {
       minPosition: 0,
       maxPosition: 0.04,
       targetDescriptor: {
-        schemaVersion: 'manyforge.manual_control_gripper_descriptor.v1',
+        schemaVersion: 'manyforge.manual_control_gripper_descriptor.v2',
         controllableComponentId: 'robot-a', commandTargetId: 'gripper',
         componentRoleId: 'controlled_component', targetRoleId: 'command_target',
+        description: 'Test gripper', commandKind: 'gripper_position',
+        actuationKind: 'position_commanded', transportKind: 'resolved_binding',
+        controlInterfaceContractId: null, stateAuthorityId: null,
+        stateAuthorityClass: null, completionPolicy: 'goal_fenced_target_reached',
+        graspConfirmationPolicy: 'binding_feedback_required',
+        sourceGroupName: 'gripper', openStateRef: 'open', closedStateRef: 'closed',
+        commandDurationS: 0.5, touchLinks: ['finger_link'], mountFrame: 'tool0',
+        attachFrame: 'tool0', tcpFrame: 'tool0', auxiliaryFrames: [],
         sourceCoordinateName: 'finger_joint', sourceKind: 'model_role',
         coordinateKind: 'linear_m', unit: 'm', minPosition: 0, maxPosition: 0.04,
         mimicFollowers: [], namedPresets: [],
@@ -150,6 +175,8 @@ function statusFixture(ownerEpoch = 'execution-owner-1'): ExecutionOwnerStatus {
       coordinateKind: 'linear_m',
       complete: true,
     },
+    residentOperations: [],
+    runtimeScaleControl: null,
     cellStopAction: {
       available: true,
       unavailableReason: null,
@@ -278,6 +305,13 @@ describe('addressed Robot Control state', () => {
       kind: 'joint_goal',
       joint_names: ['joint1', 'joint2'],
       positions_rad: [0.2, -0.4],
+    });
+    expect(participant.payload.per_joint_dynamics_limits).toEqual({
+      joint1: {
+        max_velocity_rad_s: 1.5,
+        max_acceleration_rad_s2: 2.5,
+        max_jerk_rad_s3: 10,
+      },
     });
   });
 
@@ -438,7 +472,49 @@ describe('addressed Robot Control state', () => {
       .toBe('stopping');
   });
 
-  it('settles from owner-issued operation state and then permits Revert', () => {
+  it('keeps Stop pending across an older execution poll and retains rejection', () => {
+    const ready = readyState();
+    const approving = robotControlReducer(ready, { type: 'approve_started' });
+    const executing = robotControlReducer(approving, {
+      type: 'approve_resolved',
+      acceptance: {
+        requestId: 'request-1',
+        operationId: 'operation-1',
+        operationRevision: 1,
+      },
+    });
+    const stopping = robotControlReducer(executing, { type: 'stop_started' });
+    const racedPoll = robotControlReducer(stopping, {
+      type: 'operation_observed',
+      operation: {
+        ...stopping.operation!,
+        operationRevision: 2,
+        state: 'executing',
+        progress: 0.2,
+      },
+    });
+    expect(racedPoll.phase).toBe('stopping');
+
+    const rejected = robotControlReducer(racedPoll, {
+      type: 'stop_rejected',
+      error: 'Stop request was rejected.',
+    });
+    expect(rejected.phase).toBe('executing');
+    expect(rejected.error).toBe('Stop request was rejected.');
+
+    const laterPoll = robotControlReducer(rejected, {
+      type: 'operation_observed',
+      operation: {
+        ...rejected.operation!,
+        operationRevision: 3,
+        state: 'executing',
+        progress: 0.3,
+      },
+    });
+    expect(laterPoll.error).toBe('Stop request was rejected.');
+  });
+
+  it('keeps a resident terminal operation until exact owner settlement', () => {
     const ready = readyState();
     const approving = robotControlReducer(ready, { type: 'approve_started' });
     let state = robotControlReducer(approving, {
@@ -471,6 +547,7 @@ describe('addressed Robot Control state', () => {
       ...observed.observedGripper!,
       position: 0.031,
     };
+    observed.residentOperations = [state.operation!];
     state = robotControlReducer(state, {
       type: 'status_refreshed',
       status: observed,
@@ -478,10 +555,58 @@ describe('addressed Robot Control state', () => {
     expect(state.draftPositionsRad).toEqual([0.24, 0.49]);
     expect(state.draftGripperPosition).toBe(0.031);
 
-    const reverted = robotControlReducer(state, { type: 'revert' });
-    expect(reverted.phase).toBe('idle');
-    expect(reverted.operation).toBeNull();
-    expect(reverted.ghost).toBeNull();
+    state = robotControlReducer(state, { type: 'operation_settlement_started' });
+    expect(state.phase).toBe('settling');
+    const settledStatus = statusFixture();
+    settledStatus.observedMotion.positionsRad = [0.24, 0.49];
+    state = robotControlReducer(state, {
+      type: 'status_refreshed',
+      status: settledStatus,
+    });
+    expect(state.phase).toBe('idle');
+    expect(state.operation).toBeNull();
+    expect(state.ghost).toBeNull();
+  });
+
+  it('recovers the exact resident operation on a fresh client load', () => {
+    const status = statusFixture();
+    status.residentOperations = [{
+      operationId: 'operation-recovered',
+      operationRevision: 4,
+      resident: true,
+      state: 'executing',
+      progress: 0.5,
+      activeStopId: null,
+      activeStopGeneration: null,
+      terminalError: null,
+    }];
+    const recovered = robotControlReducer(initialRobotControlState, {
+      type: 'status_resolved',
+      status,
+    });
+    expect(recovered.phase).toBe('executing');
+    expect(recovered.operation).toEqual(status.residentOperations[0]);
+  });
+
+  it('fails closed instead of choosing among multiple resident operations', () => {
+    const status = statusFixture();
+    status.residentOperations = ['one', 'two'].map((operationId) => ({
+      operationId,
+      operationRevision: 1,
+      resident: true,
+      state: 'completed' as const,
+      progress: 1,
+      activeStopId: null,
+      activeStopGeneration: null,
+      terminalError: null,
+    }));
+    const blocked = robotControlReducer(initialRobotControlState, {
+      type: 'status_resolved',
+      status,
+    });
+    expect(blocked.phase).toBe('blocked');
+    expect(blocked.operation).toBeNull();
+    expect(blocked.error).toContain('More than one');
   });
 
   it('invalidates all local preview and operation state on owner restart', () => {
@@ -687,6 +812,6 @@ describe('addressed Robot Control state', () => {
     const payload = intent.participants[0].payload;
     expect(payload.kind).toBe('capability_command');
     if (payload.kind !== 'capability_command') return;
-    expect(payload.caller_options[0].value_s).toBe(0);
+    expect(payload.caller_options[0].value_s).toBe(0.5);
   });
 });

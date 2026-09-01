@@ -30,6 +30,7 @@ from .routes_deployment_draft import create_deployment_draft_router
 from .routes_filesystem import create_filesystem_router
 from .routes_nodes import create_nodes_router
 from .routes_urdf import create_urdf_router
+from .routes_viewer import create_viewer_router
 from .security import SecurityConfig
 from .state import (
     RUNTIME_UNAVAILABLE_MESSAGE,
@@ -376,12 +377,6 @@ def create_app(
                         "status_scope": "headless_projection",
                         "status": "unavailable",
                         "headless_projection_ready": False,
-                        "robot_readiness": {
-                            "available": False,
-                            "state": None,
-                            "source_owner_id": None,
-                            "reason_code": "robot_readiness_owner_unavailable",
-                        },
                         "error": {"code": error.code, "message": str(error)},
                     },
                     "runtimeAvailability": {
@@ -470,6 +465,10 @@ def create_app(
             create_snapshot_router(state, security),
             tags=["headless-viewer-snapshot-client"],
         )
+        app.include_router(
+            create_viewer_router(state, security),
+            tags=["headless-viewer-observation-client"],
+        )
 
         @app.exception_handler(RequestValidationError)
         async def recognized_stop_validation_handler(
@@ -506,10 +505,7 @@ def create_app(
 
         @app.websocket("/ws/state")
         async def headless_state_websocket(websocket: WebSocket) -> None:
-            if (
-                state.authoring_admission is None
-                or state.execution_observation_source is None
-            ):
+            if state.authoring_admission is None:
                 await websocket.close(code=1008)
                 return
             await serve_headless_state(
@@ -517,13 +513,7 @@ def create_app(
                 state.headless_client,
                 admission=state.authoring_admission,
                 draft_session=state.draft_session,
-                observation_source=state.execution_observation_source,
             )
-
-        @app.get("/api/scene/viewer/status")
-        async def execution_observation_stream_status() -> dict:
-            assert state.execution_observation_source is not None
-            return state.execution_observation_source.status()
 
     async def unavailable_api(
         unavailable_path: str,

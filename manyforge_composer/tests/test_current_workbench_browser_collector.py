@@ -70,7 +70,7 @@ def _snapshot(
             "devicePixelRatio": 1.0,
         },
         "headless": {
-            "socketPath": "/ws/state",
+            "socketPath": "/ws/scene/viewer",
             "sourceCount": 1,
             "activeSockets": 1,
             "socketCreations": 1,
@@ -162,6 +162,8 @@ class _FakeDriver:
                 return snapshot
             if script == collector.OPEN_VIEWER_TOOLS_SCRIPT:
                 return True
+            if script == collector.IDLE_CONTROL_READY_SCRIPT:
+                return True
             for workspace in ("program", "scene", "deployment"):
                 if script == collector._select_workspace_script(workspace):
                     self.active_workspace = workspace
@@ -188,7 +190,7 @@ def test_collector_cleans_up_exact_session_on_success_and_uses_exact_opt_in() ->
     assert driver.deleted is True
     assert f"{collector.QUALIFICATION_QUERY_KEY}=1" == result["optIn"]
     assert result["topology"]["initial"]["canvasCount"] == 1
-    assert result["topology"]["initial"]["socketPath"] == "/ws/state"
+    assert result["topology"]["initial"]["socketPath"] == "/ws/scene/viewer"
     assert set(result["topology"]["workspaces"]) == {"program", "scene", "deployment"}
     assert all(
         topology["canvasCount"] == 1
@@ -199,14 +201,19 @@ def test_collector_cleans_up_exact_session_on_success_and_uses_exact_opt_in() ->
         assert driver.scripts.count(collector._select_workspace_script(workspace)) == 1
     assert driver.scripts.count(collector.QUALIFICATION_READY_SCRIPT) == 2
     assert driver.scripts.count(collector.OPEN_VIEWER_TOOLS_SCRIPT) == 2
+    assert driver.scripts.count(collector.IDLE_CONTROL_READY_SCRIPT) == 2
     assert result["longTasks"] == {"supported": False, "count": None}
 
 
 def test_live_observation_uses_the_single_integrated_runtime_status_entry() -> None:
-    assert '.runtime-status-button[data-backend-connected="true"]' in collector.OBSERVATION_SCRIPT
+    assert '.deployment-status-button[data-backend-connected="true"]' in collector.OBSERVATION_SCRIPT
+    assert '.runtime-status-button' not in collector.OBSERVATION_SCRIPT
     assert ".header-boundary" not in collector.OBSERVATION_SCRIPT
     assert 'input[aria-label="Wireframe overlays"]' in collector.OBSERVATION_SCRIPT
     assert ".viewer-surface-launchers > button" in collector.OPEN_VIEWER_TOOLS_SCRIPT
+    assert ".viewer-transport .transport-run" in collector.IDLE_CONTROL_READY_SCRIPT
+    assert ".viewer-transport .transport-velocity input" in collector.IDLE_CONTROL_READY_SCRIPT
+    assert "Loading" in collector.IDLE_CONTROL_READY_SCRIPT
 
 
 def test_collector_sets_and_proves_viewport_and_writes_bounded_screenshot(

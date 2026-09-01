@@ -8,10 +8,44 @@ import {
   admitHeadlessState,
   getHeadlessStateQualificationSnapshot,
   parseExecutionObservationFrame,
+  sameComponentOverviewPresentation,
   sameHeadlessProjection,
   sameViewerProjection,
   useHeadlessStateSource,
 } from './useHeadlessState';
+
+function componentOverview(): ComposerHeadlessState['componentOverview'] {
+  return {
+    schemaVersion: 'manyforge.component_overview.v1',
+    overviewRevision: `sha256:${'a'.repeat(64)}`,
+    readiness: 'ready',
+    summaryLabel: 'Application surfaces ready',
+    profileLabel: 'native',
+    authorityLabel: 'owner-issued scoped facts',
+    userMessage: 'Current.',
+    capabilities: ['Observe / Render', 'Plan / Preview', 'Execute / Control'],
+    components: [],
+    basis: {
+      runtimeProjectionOwnerEpoch: null,
+      runtimeProjectionGeneration: null,
+      managerSourceOwnerEpoch: null,
+      logicalSceneSourceOwnerEpoch: null,
+      logicalSceneSourceGeneration: null,
+      sceneRuntimeSourceOwnerEpoch: null,
+      sceneRuntimeSourceGeneration: null,
+      alarmOwnerEpoch: null,
+      alarmGeneration: null,
+      alarmStateRevision: null,
+      admissionGeneration: null,
+      programRunnerOwnerEpoch: null,
+      programCycleGeneration: null,
+      appliedProgramOwnerEpoch: null,
+      appliedProgramGeneration: null,
+      executionOwnerEpoch: null,
+      executionPublicationGeneration: null,
+    },
+  };
+}
 
 function state(
   runtimeEpoch: string,
@@ -21,8 +55,9 @@ function state(
   alarmStateRevision = alarmGeneration,
 ): ComposerHeadlessState {
   return {
-    schemaVersion: 'manyforge.composer_headless_state.v1',
+    schemaVersion: 'manyforge.composer_headless_state.v2',
     complete: true,
+    componentOverview: componentOverview(),
     authoringAdmission: { authoringAllowed: true, admissionGeneration: 1 },
     programCycle: {
       programRunnerOwnerEpoch: 'runner.epoch.1',
@@ -122,6 +157,27 @@ describe('Headless owner-frame admission', () => {
     expect(sameViewerProjection(current, next)).toBe(true);
   });
 
+  it('suppresses aggregate Overview heartbeats but publishes semantic changes', () => {
+    const current = state('receiver.epoch.1', 2);
+    const next = structuredClone(current);
+    next.componentOverview.overviewRevision = `sha256:${'b'.repeat(64)}`;
+    next.componentOverview.basis.runtimeProjectionGeneration = 3;
+    expect(sameComponentOverviewPresentation(
+      current.componentOverview,
+      next.componentOverview,
+    )).toBe(true);
+    expect(sameHeadlessProjection(current, next)).toBe(true);
+    expect(sameViewerProjection(current, next)).toBe(true);
+
+    next.componentOverview.readiness = 'degraded';
+    next.componentOverview.summaryLabel = 'Some functional scopes unavailable';
+    expect(sameComponentOverviewPresentation(
+      current.componentOverview,
+      next.componentOverview,
+    )).toBe(false);
+    expect(sameHeadlessProjection(current, next)).toBe(false);
+  });
+
   it('does not publish Manager observation heartbeats as UI or viewer changes', () => {
     const current = state('receiver.epoch.1', 2);
     const heartbeat = structuredClone(current);
@@ -184,7 +240,37 @@ function wireState(generation: number): Record<string, unknown> {
     receiver_age_ns: 1,
   };
   return {
-    schema_version: 'manyforge.composer_headless_state.v1',
+    schema_version: 'manyforge.composer_headless_state.v2',
+    component_overview: {
+      schema_version: 'manyforge.component_overview.v1',
+      overview_revision: `sha256:${'a'.repeat(64)}`,
+      readiness: 'ready',
+      summary_label: 'Application surfaces ready',
+      profile_label: 'native',
+      authority_label: 'owner-issued scoped facts',
+      user_message: 'Current.',
+      capabilities: ['Observe / Render', 'Plan / Preview', 'Execute / Control'],
+      components: [],
+      basis: {
+        runtime_projection_owner_epoch: null,
+        runtime_projection_generation: null,
+        manager_source_owner_epoch: null,
+        logical_scene_source_owner_epoch: null,
+        logical_scene_source_generation: null,
+        scene_runtime_source_owner_epoch: null,
+        scene_runtime_source_generation: null,
+        alarm_owner_epoch: null,
+        alarm_generation: null,
+        alarm_state_revision: null,
+        admission_generation: null,
+        program_runner_owner_epoch: null,
+        program_cycle_generation: null,
+        applied_program_owner_epoch: null,
+        applied_program_generation: null,
+        execution_owner_epoch: null,
+        execution_publication_generation: null,
+      },
+    },
     authoring_admission: { admission_generation: 1, authoring_allowed: true },
     program_cycle: {
       program_runner_owner_epoch: 'runner.epoch.1',
@@ -307,6 +393,9 @@ describe('HeadlessStateSource delivery scheduling', () => {
     for (let sequence = 1; sequence <= 100; sequence += 1) {
       FakeWebSocket.instance.send(wireObservation(sequence));
     }
+    expect(source.getExecutionObservationTransportStatus()).toEqual({
+      phase: 'live', message: null,
+    });
     expect(animationFrames).toHaveLength(1);
     expect(source.getLatestExecutionObservation()?.sourceSequence).toBe(100);
     expect(shellNotifications).toBe(shellBaseline);
@@ -323,11 +412,12 @@ describe('HeadlessStateSource delivery scheduling', () => {
     const animationFrames: FrameRequestCallback[] = [];
     class FakeWebSocket {
       static instances: FakeWebSocket[] = [];
+      readonly url: string;
       onopen: (() => void) | null = null;
       onmessage: ((message: MessageEvent) => void) | null = null;
       onerror: (() => void) | null = null;
       onclose: (() => void) | null = null;
-      constructor(url: string) { void url; FakeWebSocket.instances.push(this); }
+      constructor(url: string) { this.url = url; FakeWebSocket.instances.push(this); }
       close(): void {}
       send(value: unknown): void {
         this.onmessage?.({ data: JSON.stringify(value) } as MessageEvent);
@@ -344,17 +434,21 @@ describe('HeadlessStateSource delivery scheduling', () => {
 
     const source = new HeadlessStateSource();
     source.setEnabled(true);
-    const firstSocket = FakeWebSocket.instances[0]!;
+    const firstSocket = FakeWebSocket.instances.find(
+      (socket) => new URL(socket.url).pathname === '/ws/scene/viewer',
+    )!;
     firstSocket.send(wireObservation(50));
     animationFrames.shift()!(16);
     expect(source.getLatestExecutionObservation()?.sourceSequence).toBe(50);
 
     source.reconnect();
-    expect(FakeWebSocket.instances).toHaveLength(2);
+    expect(FakeWebSocket.instances).toHaveLength(4);
     const restarted = wireObservation(1);
     restarted.owner_epoch = 'execution-owner.2';
     restarted.source_epoch = 'joint-source.2';
-    FakeWebSocket.instances[1]!.send(restarted);
+    FakeWebSocket.instances.filter(
+      (socket) => new URL(socket.url).pathname === '/ws/scene/viewer',
+    )[1]!.send(restarted);
     animationFrames.shift()!(32);
     expect(source.getLatestExecutionObservation()).toMatchObject({
       ownerEpoch: 'execution-owner.2',
@@ -369,7 +463,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     source.dispose();
   });
 
-  it('uses one read-only state endpoint without a client authority identity', () => {
+  it('uses separate read-only shell and viewer endpoints without client authority', () => {
     vi.useFakeTimers();
     const urls: string[] = [];
     class FakeWebSocket {
@@ -389,10 +483,13 @@ describe('HeadlessStateSource delivery scheduling', () => {
     const source = new HeadlessStateSource();
     source.setEnabled(true);
     source.reconnect();
-    expect(urls).toHaveLength(2);
+    expect(urls).toHaveLength(4);
     expect(new URL(urls[0]!).pathname).toBe('/ws/state');
     expect(new URL(urls[0]!).search).toBe('');
-    expect(urls[1]).toBe(urls[0]);
+    expect(new URL(urls[1]!).pathname).toBe('/ws/scene/viewer');
+    expect(new URL(urls[1]!).search).toBe('');
+    expect(urls[2]).toBe(urls[0]);
+    expect(urls[3]).toBe(urls[1]);
     source.dispose();
   });
 
@@ -400,14 +497,13 @@ describe('HeadlessStateSource delivery scheduling', () => {
     vi.useFakeTimers();
     const animationFrames: FrameRequestCallback[] = [];
     class FakeWebSocket {
-      static instance: FakeWebSocket;
+      static shell: FakeWebSocket;
       onopen: (() => void) | null = null;
       onmessage: ((message: MessageEvent) => void) | null = null;
       onerror: (() => void) | null = null;
       onclose: (() => void) | null = null;
       constructor(url: string) {
-        void url;
-        FakeWebSocket.instance = this;
+        if (new URL(url).pathname === '/ws/state') FakeWebSocket.shell = this;
       }
       close(): void {}
       send(value: unknown): void {
@@ -430,12 +526,12 @@ describe('HeadlessStateSource delivery scheduling', () => {
     second.authoring_admission = {
       admission_generation: 2, authoring_allowed: true,
     };
-    FakeWebSocket.instance.send(first);
+    FakeWebSocket.shell.send(first);
     expect(animationFrames).toHaveLength(1);
     animationFrames[0]!(16);
     vi.advanceTimersByTime(HEADLESS_SHELL_PUBLICATION_MS);
     const viewerBaseline = source.getViewerSnapshot();
-    FakeWebSocket.instance.send(second);
+    FakeWebSocket.shell.send(second);
     expect(animationFrames).toHaveLength(1);
     vi.advanceTimersByTime(HEADLESS_SHELL_PUBLICATION_MS);
     expect(source.getViewerSnapshot()).toBe(viewerBaseline);
@@ -449,12 +545,14 @@ describe('HeadlessStateSource delivery scheduling', () => {
     vi.useFakeTimers();
     const animationFrames: FrameRequestCallback[] = [];
     class FakeWebSocket {
-      static instance: FakeWebSocket;
+      static shell: FakeWebSocket;
       onopen: (() => void) | null = null;
       onmessage: ((message: MessageEvent) => void) | null = null;
       onerror: (() => void) | null = null;
       onclose: (() => void) | null = null;
-      constructor(url: string) { void url; FakeWebSocket.instance = this; }
+      constructor(url: string) {
+        if (new URL(url).pathname === '/ws/state') FakeWebSocket.shell = this;
+      }
       close(): void {}
       send(value: unknown): void {
         this.onmessage?.({ data: JSON.stringify(value) } as MessageEvent);
@@ -472,7 +570,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     const source = new HeadlessStateSource();
     source.setEnabled(true);
     const first = wireState(1);
-    FakeWebSocket.instance.send(first);
+    FakeWebSocket.shell.send(first);
     animationFrames[0]!(16);
     const presented = source.getViewerSnapshot().snapshot;
     source.markViewerPresented(presented);
@@ -486,7 +584,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     heartbeatRuntime.projection_generation = 2;
     const sections = heartbeatRuntime.sections as Record<string, Record<string, unknown>>;
     sections.manager = { ...sections.manager, source_generation: 2 };
-    FakeWebSocket.instance.send(heartbeat);
+    FakeWebSocket.shell.send(heartbeat);
     expect(animationFrames).toHaveLength(1);
     expect(source.getPresentedRuntimeFrame()).toEqual({
       ownerEpoch: 'runtime.epoch.1', generation: 2,
@@ -503,7 +601,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
       ...sceneSections.logical_scene,
       source_generation: 2,
     };
-    FakeWebSocket.instance.send(sceneChange);
+    FakeWebSocket.shell.send(sceneChange);
     expect(animationFrames).toHaveLength(2);
     expect(source.getPresentedRuntimeFrame()?.generation).toBe(2);
     animationFrames[1]!(32);
@@ -514,7 +612,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     source.dispose();
   });
 
-  it('keeps one socket and coalesces a 100-frame burst by delivery lane', () => {
+  it('keeps one socket per plane and coalesces a shell burst by delivery lane', () => {
     vi.useFakeTimers();
     const animationFrames: FrameRequestCallback[] = [];
     class FakeWebSocket {
@@ -557,15 +655,20 @@ describe('HeadlessStateSource delivery scheduling', () => {
     source.subscribeShell(() => { shellNotifications += 1; });
     source.setEnabled(true);
 
-    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(FakeWebSocket.instances).toHaveLength(2);
     expect(getHeadlessStateQualificationSnapshot()).toEqual(
       expect.objectContaining({
         sourceCount: 1,
         activeSockets: 0,
       }),
     );
-    const socket = FakeWebSocket.instances[0]!;
-    socket.open();
+    const shellSocket = FakeWebSocket.instances.find(
+      (socket) => new URL(socket.url).pathname === '/ws/state',
+    )!;
+    const viewerSocket = FakeWebSocket.instances.find(
+      (socket) => new URL(socket.url).pathname === '/ws/scene/viewer',
+    )!;
+    viewerSocket.open();
     expect(getHeadlessStateQualificationSnapshot()).toEqual(
       expect.objectContaining({
         activeSockets: 1,
@@ -575,7 +678,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     const viewerBaseline = viewerNotifications;
     const shellBaseline = shellNotifications;
     for (let generation = 1; generation <= 100; generation += 1) {
-      socket.sendFrame(wireState(generation));
+      shellSocket.sendFrame(wireState(generation));
     }
     expect(animationFrames).toHaveLength(1);
     expect(source.getViewerSnapshot().error).toBeNull();
@@ -590,7 +693,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     vi.advanceTimersByTime(1);
     expect(shellNotifications).toBe(shellBaseline + 1);
     expect(source.getShellSnapshot().snapshot?.runtime.projectionGeneration).toBe(100);
-    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(FakeWebSocket.instances).toHaveLength(2);
     source.dispose();
     expect(getHeadlessStateQualificationSnapshot().activeSockets).toBe(0);
   });
@@ -599,13 +702,14 @@ describe('HeadlessStateSource delivery scheduling', () => {
     vi.useFakeTimers();
     class FakeWebSocket {
       static instances: FakeWebSocket[] = [];
+      readonly url: string;
       onopen: (() => void) | null = null;
       onmessage: ((message: MessageEvent) => void) | null = null;
       onerror: (() => void) | null = null;
       onclose: (() => void) | null = null;
 
       constructor(url: string) {
-        void url;
+        this.url = url;
         FakeWebSocket.instances.push(this);
       }
 
@@ -632,7 +736,10 @@ describe('HeadlessStateSource delivery scheduling', () => {
     const source = new HeadlessStateSource();
     const initialCreations = getHeadlessStateQualificationSnapshot().socketCreations;
     source.setEnabled(true);
-    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(source.getExecutionObservationTransportStatus()).toMatchObject({
+      phase: 'connecting',
+    });
+    expect(FakeWebSocket.instances).toHaveLength(2);
     expect(getHeadlessStateQualificationSnapshot()).toEqual(
       expect.objectContaining({
         activeSockets: 0,
@@ -640,15 +747,27 @@ describe('HeadlessStateSource delivery scheduling', () => {
       }),
     );
 
-    FakeWebSocket.instances[0]!.open();
+    const firstViewer = FakeWebSocket.instances.find(
+      (socket) => new URL(socket.url).pathname === '/ws/scene/viewer',
+    )!;
+    firstViewer.open();
+    expect(source.getExecutionObservationTransportStatus()).toMatchObject({
+      phase: 'waiting',
+    });
     expect(getHeadlessStateQualificationSnapshot().activeSockets).toBe(1);
-    FakeWebSocket.instances[0]!.fail();
+    firstViewer.fail();
+    expect(source.getExecutionObservationTransportStatus()).toMatchObject({
+      phase: 'reconnecting',
+    });
     expect(getHeadlessStateQualificationSnapshot().activeSockets).toBe(0);
 
     vi.advanceTimersByTime(1000);
-    expect(FakeWebSocket.instances).toHaveLength(2);
+    expect(FakeWebSocket.instances).toHaveLength(3);
     expect(getHeadlessStateQualificationSnapshot().activeSockets).toBe(0);
-    FakeWebSocket.instances[1]!.open();
+    FakeWebSocket.instances[2]!.open();
+    expect(source.getExecutionObservationTransportStatus()).toMatchObject({
+      phase: 'waiting',
+    });
     expect(getHeadlessStateQualificationSnapshot()).toEqual(
       expect.objectContaining({
         activeSockets: 1,
@@ -656,12 +775,67 @@ describe('HeadlessStateSource delivery scheduling', () => {
       }),
     );
     source.dispose();
+    expect(source.getExecutionObservationTransportStatus()).toEqual({
+      phase: 'disabled', message: null,
+    });
     expect(getHeadlessStateQualificationSnapshot().activeSockets).toBe(0);
+  });
+
+  it('fails shell authority closed while retaining coherent viewer structure', () => {
+    vi.useFakeTimers();
+    const animationFrames: FrameRequestCallback[] = [];
+    class FakeWebSocket {
+      static shell: FakeWebSocket;
+      onopen: (() => void) | null = null;
+      onmessage: ((message: MessageEvent) => void) | null = null;
+      onerror: (() => void) | null = null;
+      onclose: (() => void) | null = null;
+
+      constructor(url: string) {
+        if (new URL(url).pathname === '/ws/state') FakeWebSocket.shell = this;
+      }
+
+      close(): void {}
+
+      send(value: unknown): void {
+        this.onmessage?.({ data: JSON.stringify(value) } as MessageEvent);
+      }
+    }
+    vi.stubGlobal('window', {
+      location: { href: 'http://composer.test/' },
+      requestAnimationFrame: (callback: FrameRequestCallback) => {
+        animationFrames.push(callback);
+        return animationFrames.length;
+      },
+      cancelAnimationFrame: vi.fn(),
+    });
+    vi.stubGlobal('WebSocket', FakeWebSocket);
+
+    const source = new HeadlessStateSource();
+    source.setEnabled(true);
+    FakeWebSocket.shell.send(wireState(7));
+    animationFrames.shift()!(16);
+    const coherent = source.getViewerSnapshot().snapshot;
+    expect(coherent?.runtime.projectionGeneration).toBe(7);
+    source.markViewerPresented(coherent);
+
+    FakeWebSocket.shell.onerror?.();
+
+    expect(source.getShellSnapshot()).toMatchObject({
+      snapshot: null,
+      error: 'Headless WebSocket transport failed.',
+    });
+    expect(source.getViewerSnapshot()).toMatchObject({
+      snapshot: coherent,
+      error: 'Headless WebSocket transport failed.',
+    });
+    expect(source.getPresentedRuntimeFrame()).toBeNull();
+    source.dispose();
   });
 });
 
 describe('useHeadlessStateSource lifecycle', () => {
-  it('keeps one live socket through the StrictMode probe and none after unmount', async () => {
+  it('keeps one live socket per plane through StrictMode and none after unmount', async () => {
     vi.useFakeTimers();
     class FakeWebSocket {
       static instances: FakeWebSocket[] = [];
@@ -764,19 +938,22 @@ describe('useHeadlessStateSource lifecycle', () => {
       root.render(createElement(StrictMode, null, createElement(Harness)));
     });
 
-    expect(FakeWebSocket.instances).toHaveLength(2);
-    expect(FakeWebSocket.instances[0]?.active).toBe(false);
-    expect(FakeWebSocket.instances.filter((socket) => socket.active)).toHaveLength(1);
-    FakeWebSocket.instances[1]?.open();
-    FakeWebSocket.instances[1]?.sendFrame(wireState(1));
+    expect(FakeWebSocket.instances).toHaveLength(4);
+    expect(FakeWebSocket.instances.slice(0, 2).every((socket) => !socket.active))
+      .toBe(true);
+    expect(FakeWebSocket.instances.filter((socket) => socket.active)).toHaveLength(2);
+    const activeShell = FakeWebSocket.instances.find(
+      (socket) => socket.active && new URL(socket.url).pathname === '/ws/state',
+    );
+    activeShell?.open();
+    activeShell?.sendFrame(wireState(1));
     expect(vi.getTimerCount()).toBe(2);
 
     await act(async () => root.unmount());
-    expect(FakeWebSocket.instances[1]?.active).toBe(false);
     expect(FakeWebSocket.instances.filter((socket) => socket.active)).toHaveLength(0);
     expect(vi.getTimerCount()).toBe(0);
 
     vi.advanceTimersByTime(10_000);
-    expect(FakeWebSocket.instances).toHaveLength(2);
+    expect(FakeWebSocket.instances).toHaveLength(4);
   });
 });

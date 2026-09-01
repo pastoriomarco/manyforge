@@ -483,8 +483,10 @@ HeadlessApiCore::HeadlessApiCore(HeadlessApiCoreConfig config,
           config_.historian_database_path)),
       package_root_descriptor_(
           std::make_unique<PackageRootDescriptor>(config_.install_root)),
-      retained_bundle_source_(package_root_descriptor_->root()),
-      scenario_catalog_source_(package_root_descriptor_->root(), "maintained"),
+      retained_bundle_source_(package_root_descriptor_->root(),
+                              config_.artifact_root),
+      scenario_catalog_source_(package_root_descriptor_->root(), "maintained",
+                               config_.artifact_root),
       program_selection_owner_(
           package_root_descriptor_->root(), config_.artifact_root,
           config_.program_selection_state_root,
@@ -495,8 +497,10 @@ HeadlessApiCore::HeadlessApiCore(HeadlessApiCoreConfig config,
       node_environment_projection_(package_root_descriptor_->root() / ".",
                                    config_.node_catalog_path,
                                    config_.node_environment_manifest_path),
-      source_model_projection_(package_root_descriptor_->root()),
-      viewer_model_source_(package_root_descriptor_->root()),
+      source_model_projection_(package_root_descriptor_->root(),
+                               config_.artifact_root),
+      viewer_model_source_(package_root_descriptor_->root(),
+                           config_.artifact_root),
       history_store_(std::make_shared<SqliteEventHistoryStore>(
           config_.historian_database_path, config_.historian_record_retention)),
       historian_(history_store_, config_.historian_queue_capacity),
@@ -635,9 +639,12 @@ HeadlessApiCore::ScenarioProgramSelection(const std::string_view scenario_id) {
       "scenario_program_selection_unavailable",
       "Manager has not converged the active retained bundle");
 
-  const auto selection = [&]() -> deployment::ScenarioProgramSelection {
+  const auto selected = [&]()
+      -> std::optional<deployment::ScenarioProgramSelection> {
     try {
-      return scenario_catalog_source_.LoadExactProgramSelection(scenario_id);
+      return scenario_catalog_source_.TryLoadExactProgramSelectionForActive(
+          scenario_id, core::RetainedBundleId(active_bundle_id),
+          core::GraphRevision(active_graph_revision));
     } catch (const deployment::ScenarioApplyCandidateError &error) {
       CoreFail("scenario_program_selection_unavailable", error.what());
     } catch (const deployment::ScenarioCatalogError &error) {
@@ -646,11 +653,9 @@ HeadlessApiCore::ScenarioProgramSelection(const std::string_view scenario_id) {
       CoreFail("scenario_program_selection_invalid", error.what());
     }
   }();
-  Require(selection.retained_bundle_id.value() == active_bundle_id &&
-              selection.graph_revision.value() == active_graph_revision,
-          "scenario_program_selection_not_applied",
+  Require(selected.has_value(), "scenario_program_selection_not_applied",
           "scenario Program selection names another active deployment");
-
+  const auto &selection = *selected;
   const auto environment = NodeEnvironmentProjectionLocked(runtime);
   const auto &package_environment =
       RequiredMember(environment, "package_environment");
@@ -690,6 +695,28 @@ HeadlessApiCore::ScenarioLoadSelection(const std::string_view scenario_id) {
   std::lock_guard lock(mutex_);
   Require(!shutdown_, "headless_api_closed", "headless API core is closed");
   try {
+    const auto runtime = RefreshLocked();
+    const auto &manager_section = RequiredSection(runtime.root, "manager");
+    if (SectionFresh(manager_section)) {
+      const auto &manager_payload = RequiredMember(manager_section, "payload");
+      if (manager_payload.is_object() &&
+          RequiredBool(manager_payload, "manager_ready") &&
+          RequiredBool(RequiredMember(manager_payload, "runtime"),
+                       "converged")) {
+        const auto &active = RequiredMember(manager_payload, "active");
+        auto selected =
+            scenario_catalog_source_.TryLoadExactProgramSelectionForActive(
+                scenario_id,
+                core::RetainedBundleId(
+                    RequiredString(active, "retained_bundle_id")),
+                core::GraphRevision(
+                    RequiredString(active, "graph_revision")));
+        if (selected.has_value()) {
+          return ScenarioSelectionProjection(
+              *selected, CanonicalValue(CanonicalValue::Array{}));
+        }
+      }
+    }
     return ScenarioSelectionProjection(
         scenario_catalog_source_.LoadExactProgramSelection(scenario_id),
         CanonicalValue(CanonicalValue::Array{}));

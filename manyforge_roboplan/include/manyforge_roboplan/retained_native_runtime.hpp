@@ -178,6 +178,9 @@ struct RetainedNativeRuntimeInput final {
   /// owner shape.
   std::vector<core::RuntimeParticipantBinding>
       control_binding_representatives{};
+  /// Independent Deployment-authored cap for this exact motion target.  It
+  /// tightens, but never relabels or weakens, the immutable runtime policy.
+  std::optional<double> deployment_maximum_tcp_linear_speed_mps{};
 };
 
 /// Owning native composition root. Destruction order is deliberate: the public
@@ -229,6 +232,12 @@ struct RetainedNativeRuntime final
   RetainedMotionBackendRouteRebinder rebind_motion_route;
   RetainedGripperBackendRouteRebinder rebind_gripper_route;
   std::optional<RetainedGripperPositionLimits> gripper_position_limits;
+  /// Exact Deployment-selected runtime policy sealed against this motion
+  /// target. Retained for focused observability; it is immutable and does not
+  /// grant a second policy owner.
+  std::optional<core::RuntimeParticipantPolicySelection>
+      motion_runtime_policy;
+  std::optional<double> deployment_maximum_tcp_linear_speed_mps;
 
   std::shared_ptr<core::ICollisionWorldSnapshotPublisher> collision_publisher;
   std::shared_ptr<core::ICollisionQueryEngine> runtime_collision_engine;

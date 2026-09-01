@@ -794,6 +794,176 @@ class ComposerState:
             )
         return response
 
+    def execute_authored_deployment_candidate(
+        self,
+        intent: dict[str, Any],
+        claim: dict[str, Any],
+        *,
+        apply: bool,
+    ) -> dict[str, Any]:
+        """Compile one Draft, then preview or select its exact closure."""
+
+        if self.headless_client is None:
+            raise AuthoringJournalError(
+                "deployment_candidate_unavailable",
+                "Deployment candidate compilation requires Headless",
+            )
+        compiled_response = self.headless_client.compile_deployment_candidate(
+            {
+                "scenario_id": intent["scenario_id"],
+                "expected_scenario_catalog_revision": intent[
+                    "expected_scenario_catalog_revision"
+                ],
+                "deployment": deepcopy(intent["deployment"]),
+                "program": deepcopy(intent["program"]),
+                "authoring_claim": claim,
+            }
+        )
+        compilation = compiled_response.get("compilation")
+        if not isinstance(compilation, dict):
+            raise AuthoringJournalError(
+                "deployment_candidate_compiler_response_invalid",
+                "Deployment candidate compilation omitted its exact result",
+            )
+        status = self.headless_client.manager_status()
+        current_bundle, current_graph, manager_epoch = self._manager_current(
+            status
+        )
+        manager_receipt: dict[str, Any] | None = None
+        preview: dict[str, Any] | None = None
+        if not self._manager_matches_scenario(
+            status, self.headless_client.manager_diff(), compilation
+        ):
+            expected_current = intent["expected_manager_current"]
+            if expected_current != {
+                "retained_bundle_id": current_bundle,
+                "graph_revision": current_graph,
+            }:
+                raise AuthoringJournalError(
+                    "deployment_candidate_manager_state_changed",
+                    "Manager selection changed before Deployment candidate "
+                    "preview",
+                )
+            preview = self.headless_client.manager_deployment_candidate_preview(
+                {
+                    "deployment_artifact_id": compilation[
+                        "deployment_artifact_id"
+                    ],
+                    "deployment_revision": compilation["deployment_revision"],
+                    "expected_current": {
+                        "graph_revision": current_graph,
+                        "retained_bundle_id": current_bundle,
+                    },
+                    "expected_admission_generation": intent[
+                        "expected_admission_generation"
+                    ],
+                    "request_owner_epoch": manager_epoch,
+                }
+            )
+            receipt = preview.get("candidate_receipt")
+            if preview.get("ok") is not True or not isinstance(receipt, dict):
+                raise AuthoringJournalError(
+                    "deployment_candidate_rejected",
+                    "Manager rejected the compiled Deployment candidate",
+                )
+            if apply:
+                manager_receipt = self.apply_manager_deployment_candidate(
+                    {
+                        "manager_apply": {
+                            "request_id": intent["manager_request_id"],
+                            "request_owner_epoch": manager_epoch,
+                            "source_label": (
+                                "manyforge_composer_deployment_apply"
+                            ),
+                            "correlation_id": intent["correlation_id"],
+                            "deployment_artifact_id": compilation[
+                                "deployment_artifact_id"
+                            ],
+                            "deployment_revision": compilation[
+                                "deployment_revision"
+                            ],
+                            "expected_current": receipt["expected_current"],
+                            "reject_if_affected_busy": True,
+                            "candidate_receipt": receipt,
+                        }
+                    },
+                    claim,
+                )
+
+        if apply:
+            deadline = time.monotonic() + _SCENARIO_LOAD_TIMEOUT_SECONDS
+            while not self._manager_matches_scenario(
+                self.headless_client.manager_status(),
+                self.headless_client.manager_diff(),
+                compilation,
+            ):
+                if time.monotonic() >= deadline:
+                    raise AuthoringJournalError(
+                        "deployment_candidate_convergence_timeout",
+                        "Manager did not converge the authored Deployment",
+                    )
+                time.sleep(_SCENARIO_LOAD_POLL_SECONDS)
+            selection = self.headless_client.scenario_load_selection(
+                intent["scenario_id"]
+            )
+            correspondences = {
+                "scenario_catalog_revision": "scenario_catalog_revision",
+                "deployment_artifact_id": "deployment_artifact_id",
+                "deployment_revision": "deployment_revision",
+                "retained_bundle_id": "retained_bundle_id",
+                "graph_revision": "graph_revision",
+                "program_id": "program_id",
+                "program_revision": "program_revision",
+                "program_binding_id": "program_binding_id",
+            }
+            if any(
+                selection.get(selection_field)
+                != compilation.get(compilation_field)
+                for selection_field, compilation_field in correspondences.items()
+            ) or selection.get("program") != intent["program"]:
+                raise AuthoringJournalError(
+                    "deployment_candidate_selection_mismatch",
+                    "applied Deployment candidate did not reopen as one exact "
+                    "Scenario closure",
+                )
+            applied = self._optional_applied()
+            if applied is None or not applied_program_matches_scenario_selection(
+                applied, selection
+            ):
+                self.headless_client.program_apply(
+                    {
+                        "scenario_id": selection["scenario_id"],
+                        "scenario_catalog_revision": selection[
+                            "scenario_catalog_revision"
+                        ],
+                        "program": deepcopy(intent["program"]),
+                        "expected_applied_record_digest": intent[
+                            "expected_applied_record_digest"
+                        ],
+                        "authoring_claim": claim,
+                    }
+                )
+            applied = self.headless_client.program_applied()
+            if not applied_program_matches_scenario_selection(
+                applied, selection
+            ):
+                raise AuthoringJournalError(
+                    "deployment_candidate_program_mismatch",
+                    "Program Apply did not bind the current Program to the "
+                    "authored Deployment",
+                )
+            self._restore_authoring_post_image(deepcopy(intent["post_state"]))
+
+        return {
+            "status": "applied" if apply else "previewed",
+            "compilation": compilation,
+            "candidate_preview": preview,
+            "manager_apply": manager_receipt,
+            "selection": {
+                field: compilation[field] for field in _CURRENT_SCENARIO_FIELDS
+            },
+        }
+
     def load_scenario(
         self,
         envelope: AuthoringMutationEnvelope,
@@ -943,6 +1113,17 @@ class ComposerState:
         if kind == "revert_deployment":
             result = self.apply_manager_deployment_candidate(intent, claim)
             self._restore_authoring_post_image(post_state)
+            return result, post_state
+        if kind in {
+            "deployment_candidate_preview",
+            "deployment_candidate_apply",
+        }:
+            applied = kind == "deployment_candidate_apply"
+            result = self.execute_authored_deployment_candidate(
+                intent, claim, apply=applied
+            )
+            if applied:
+                self._restore_authoring_post_image(post_state)
             return result, post_state
         if kind == "save_program":
             try:

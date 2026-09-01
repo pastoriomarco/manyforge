@@ -73,6 +73,14 @@ def _parser() -> argparse.ArgumentParser:
     serve.add_argument("--cclc-timeout-s", type=float, default=5.0)
     serve.add_argument("--program-runner-url")
     serve.add_argument("--program-runner-timeout-s", type=float, default=30.0)
+    serve.add_argument("--deployment-compiler", type=Path)
+    serve.add_argument("--deployment-compiler-workspace-root", type=Path)
+    serve.add_argument(
+        "--deployment-compiler-prepared", action="append", default=[]
+    )
+    serve.add_argument(
+        "--deployment-compiler-timeout-s", type=float, default=120.0
+    )
 
     for name in (
         "health",
@@ -170,6 +178,14 @@ def _caller(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _serve(args: argparse.Namespace) -> int:
+    prepared_roots: list[tuple[str, Path]] = []
+    for item in args.deployment_compiler_prepared:
+        family_id, separator, root = item.partition("=")
+        if not separator or not family_id or not root:
+            raise ValueError(
+                "--deployment-compiler-prepared requires family-id=/absolute/path"
+            )
+        prepared_roots.append((family_id, Path(root)))
     config = HeadlessApiConfig(
         projection_root=args.projection_root,
         install_root=args.install_root,
@@ -189,6 +205,14 @@ def _serve(args: argparse.Namespace) -> int:
         cclc_timeout_seconds=args.cclc_timeout_s,
         program_runner_url=args.program_runner_url,
         program_runner_timeout_seconds=args.program_runner_timeout_s,
+        deployment_compiler_path=args.deployment_compiler,
+        deployment_compiler_workspace_root=(
+            args.deployment_compiler_workspace_root
+        ),
+        deployment_compiler_prepared_roots=tuple(sorted(prepared_roots)),
+        deployment_compiler_timeout_seconds=(
+            args.deployment_compiler_timeout_s
+        ),
     )
     # Internal request success is not a runtime event. Semantic owner state,
     # warnings, failures, and journals remain observable without a log line

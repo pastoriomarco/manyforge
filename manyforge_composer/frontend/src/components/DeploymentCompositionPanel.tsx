@@ -18,10 +18,38 @@ import { useOperationalErrorMirror } from '../state/operationalErrors';
 import { DeploymentBindingProjection } from './DeploymentBindingProjection';
 import { DeploymentDocumentControls } from './DeploymentDocumentControls';
 import { DeploymentDocumentEditor } from './DeploymentDocumentEditor';
+import { DeploymentFocusedEditor } from './DeploymentFocusedEditor';
+import { ComponentOverview } from './ComponentOverview';
+import type { RuntimeStatusView } from './runtimeStatus';
+import type { StructuralResourceState } from '../state/structuralResource';
+import type { SourceModelProjection } from '../types/api';
+import type {
+  ManualControlGripperDescriptor,
+  ManualControlMotionDescriptor,
+} from '../types/robotControl';
+
+export interface ComponentOverviewInput {
+  request: number;
+  status: RuntimeStatusView | null;
+  backendConnected: boolean;
+  connectionLabel: string;
+  connectionDetail: string;
+  contextFacts: string[];
+  unacknowledgedAlarms: number;
+  activeAcknowledgedAlarms: number;
+  clientErrorCount: number;
+  error: string | null;
+  onReconnect: () => void;
+  onOpenRuntimeHistory: () => void;
+}
 
 interface DeploymentCompositionPanelProps {
   enabled: boolean;
   snapshot: ComposerHeadlessState | null;
+  componentOverview: ComponentOverviewInput;
+  sourceModel: StructuralResourceState<SourceModelProjection>;
+  motionDescriptor: ManualControlMotionDescriptor | null;
+  gripperDescriptor: ManualControlGripperDescriptor | null;
 }
 
 interface DeploymentReadModel {
@@ -118,6 +146,10 @@ function applyReceiptMessage(response: ManagerApplyResponse): string {
 export function DeploymentCompositionPanel({
   enabled,
   snapshot,
+  componentOverview,
+  sourceModel,
+  motionDescriptor,
+  gripperDescriptor,
 }: DeploymentCompositionPanelProps) {
   const deploymentController = useDeploymentWorkspace(enabled, snapshot);
   useOperationalErrorMirror({
@@ -348,6 +380,8 @@ export function DeploymentCompositionPanel({
         Program and Manager Applied state. Manager Apply remains deliberate.
       </p>
 
+      <ComponentOverview {...componentOverview} />
+
       <DeploymentDocumentControls controller={deploymentController} />
       {deploymentController.workspace !== null && (
         <DeploymentBindingProjection workspace={deploymentController.workspace} />
@@ -355,7 +389,21 @@ export function DeploymentCompositionPanel({
       {deploymentController.loading ? (
         <div className="panel-state" role="status">Reading Deployment Draft…</div>
       ) : (
-        <DeploymentDocumentEditor controller={deploymentController} />
+        <>
+          <DeploymentFocusedEditor
+            controller={deploymentController}
+            sourceModel={sourceModel}
+            motionDescriptor={motionDescriptor}
+            gripperDescriptor={gripperDescriptor}
+          />
+          <details className="deployment-advanced-document">
+            <summary>Advanced compiled Deployment artifact</summary>
+            <p className="field-help">
+              Generated identities and compiler-expanded policy rows are read-only here.
+            </p>
+            <DeploymentDocumentEditor controller={deploymentController} readOnly />
+          </details>
+        </>
       )}
 
       <details className="deployment-manager-boundary">

@@ -398,6 +398,41 @@ ResolveCatalog(const std::string_view bytes,
   };
 }
 
+[[nodiscard]] std::optional<ScenarioApplyCandidateSelection>
+TryResolveCatalog(const std::string_view bytes,
+                  const ScenarioApplyCandidateQuery &query) {
+  auto catalog = VerifyCatalog(bytes);
+  std::optional<core::RetainedBundleId> selected_bundle;
+  const auto &rows =
+      Array(Member(catalog.root, "scenarios", "$"), "$.scenarios");
+  for (const auto &row : rows) {
+    const auto &artifact_id =
+        Text(Member(row, "deployment_artifact_id", "$.scenarios[]"),
+             "$.scenarios[].deployment_artifact_id");
+    const auto &deployment_revision =
+        Text(Member(row, "deployment_revision", "$.scenarios[]"),
+             "$.scenarios[].deployment_revision");
+    if (artifact_id == query.deployment_artifact_id.value() &&
+        deployment_revision == query.deployment_revision.value()) {
+      const core::RetainedBundleId candidate(
+          Text(Member(row, "retained_bundle_id", "$.scenarios[]"),
+               "$.scenarios[].retained_bundle_id"));
+      Require(!selected_bundle.has_value() || *selected_bundle == candidate,
+              "scenario Apply catalog maps one deployment revision to "
+              "multiple retained bundles");
+      selected_bundle = candidate;
+    }
+  }
+  if (!selected_bundle.has_value()) {
+    return std::nullopt;
+  }
+  return ScenarioApplyCandidateSelection{
+      query,
+      std::move(catalog.revision),
+      std::move(*selected_bundle),
+  };
+}
+
 } // namespace
 
 bool ScenarioApplyCandidateQuery::valid() const noexcept {
@@ -448,34 +483,91 @@ bool ScenarioProgramSelection::valid() const noexcept {
 }
 
 FilesystemScenarioApplyCandidateSource::FilesystemScenarioApplyCandidateSource(
-    std::filesystem::path package_root, std::string catalog_name)
-    : package_root_(ExistingRoot(std::move(package_root))) {
-  Require(IsIdentifier(catalog_name), "scenario Apply catalog name is invalid");
-  catalog_path_ =
-      package_root_ / (std::move(catalog_name) + ".scenario-catalog.yaml");
+    std::filesystem::path package_root, std::string catalog_name,
+    std::optional<std::filesystem::path> candidate_package_root)
+    : package_root_(ExistingRoot(std::move(package_root))),
+      candidate_package_root_(
+          candidate_package_root.has_value()
+              ? std::optional(ExistingRoot(std::move(*candidate_package_root)))
+              : std::nullopt),
+      catalog_name_(std::move(catalog_name)) {
+  Require(IsIdentifier(catalog_name_),
+          "scenario Apply catalog name is invalid");
 }
 
 ScenarioApplyCandidateSelection
 FilesystemScenarioApplyCandidateSource::ResolveExact(
     const ScenarioApplyCandidateQuery &query) const {
   Require(query.valid(), "scenario Apply candidate query is invalid");
-  auto result = ResolveCatalog(
-      ReadExactArtifact(catalog_path_, "scenario Apply catalog"), query);
+  if (const auto candidate = candidate_catalog_path();
+      candidate.has_value()) {
+    auto result = TryResolveCatalog(
+        ReadExactArtifact(*candidate, "candidate scenario Apply catalog"),
+        query);
+    if (result.has_value()) {
+      Require(result->valid(),
+              "scenario Apply candidate selection is invalid");
+      return *result;
+    }
+  }
+  auto result = ResolveCatalog(ReadExactArtifact(
+                                   catalog_path(), "scenario Apply catalog"),
+                               query);
   Require(result.valid(), "scenario Apply candidate selection is invalid");
   return result;
 }
 
 CanonicalValue
 FilesystemScenarioApplyCandidateSource::LoadVerifiedCatalog() const {
-  return VerifyCatalog(ReadExactArtifact(catalog_path_, "scenario catalog"))
+  return VerifyCatalog(ReadExactArtifact(catalog_path(), "scenario catalog"))
       .root;
 }
 
 ScenarioProgramSelection
 FilesystemScenarioApplyCandidateSource::LoadExactProgramSelection(
     const std::string_view scenario_id) const {
+  return LoadExactProgramSelectionFrom(scenario_id, catalog_path());
+}
+
+ScenarioProgramSelection
+FilesystemScenarioApplyCandidateSource::LoadExactProgramSelectionForCatalog(
+    const std::string_view scenario_id,
+    const core::ScenarioCatalogRevision &scenario_catalog_revision) const {
+  return LoadExactProgramSelectionFrom(
+      scenario_id, catalog_path_for_revision(scenario_catalog_revision));
+}
+
+std::optional<ScenarioProgramSelection>
+FilesystemScenarioApplyCandidateSource::
+    TryLoadExactProgramSelectionForActive(
+        const std::string_view scenario_id,
+        const core::RetainedBundleId &retained_bundle_id,
+        const core::GraphRevision &graph_revision) const {
+  Require(is_sha256_digest(retained_bundle_id.value()) &&
+              is_sha256_digest(graph_revision.value()),
+          "active Scenario selection identity is invalid");
+  if (const auto candidate = candidate_catalog_path();
+      candidate.has_value()) {
+    auto selection = LoadExactProgramSelectionFrom(scenario_id, *candidate);
+    if (selection.retained_bundle_id == retained_bundle_id &&
+        selection.graph_revision == graph_revision) {
+      return selection;
+    }
+  }
+  auto selection = LoadExactProgramSelectionFrom(scenario_id, catalog_path());
+  if (selection.retained_bundle_id == retained_bundle_id &&
+      selection.graph_revision == graph_revision) {
+    return selection;
+  }
+  return std::nullopt;
+}
+
+ScenarioProgramSelection
+FilesystemScenarioApplyCandidateSource::LoadExactProgramSelectionFrom(
+    const std::string_view scenario_id,
+    const std::filesystem::path &selected_catalog_path) const {
   const auto catalog =
-      VerifyCatalog(ReadExactArtifact(catalog_path_, "scenario catalog"));
+      VerifyCatalog(ReadExactArtifact(selected_catalog_path, "scenario catalog"));
   const auto &row = ExactScenario(catalog.root, scenario_id);
   const auto &row_scenario_id = Text(
       Member(row, "scenario_id", "$.scenarios[]"), "$.scenarios[].scenario_id");
@@ -499,7 +591,20 @@ FilesystemScenarioApplyCandidateSource::LoadExactProgramSelection(
   const auto &typed_parameter_overrides =
       Member(row, "typed_parameter_overrides", "$.scenarios[]");
 
-  const FilesystemVerifiedRetainedBundleSource bundle_source(package_root_);
+  const auto selected_package_root = [&]() -> const std::filesystem::path & {
+    if (!candidate_package_root_.has_value()) {
+      return package_root_;
+    }
+    const auto candidate_bundle =
+        DigestPath(*candidate_package_root_, "retained-bundles",
+                   retained_bundle_id.value());
+    std::error_code error;
+    const bool exists = std::filesystem::exists(candidate_bundle, error);
+    Require(!error, "candidate retained-bundle lookup failed");
+    return exists ? *candidate_package_root_ : package_root_;
+  }();
+  const FilesystemVerifiedRetainedBundleSource bundle_source(
+      selected_package_root);
   const auto bundle = bundle_source.get_verified(retained_bundle_id);
   Require(bundle != nullptr,
           "scenario retained bundle is absent or unverifiable");
@@ -512,7 +617,7 @@ FilesystemScenarioApplyCandidateSource::LoadExactProgramSelection(
   const auto node_environment_digest =
       bundle->value().catalogs.node_environment.environment_digest;
   const FilesystemVerifiedRetainedModelMapSource model_map_source(
-      package_root_);
+      selected_package_root);
   const auto model_map = model_map_source.get_verified(RetainedModelMapQuery{
       retained_bundle_id,
       bundle->value().compiled_products.symbol_role_maps.front().product_id,
@@ -521,7 +626,8 @@ FilesystemScenarioApplyCandidateSource::LoadExactProgramSelection(
           "scenario retained model map is absent or unverifiable");
 
   const auto binding_bytes = ReadExactArtifact(
-      DigestPath(package_root_, "program-bindings", program_binding_id.value()),
+      DigestPath(selected_package_root, "program-bindings",
+                 program_binding_id.value()),
       "scenario Program Binding");
   const auto binding =
       reload_verified_program_binding(binding_bytes, *bundle, *model_map);
@@ -533,7 +639,7 @@ FilesystemScenarioApplyCandidateSource::LoadExactProgramSelection(
           "scenario Program Binding differs from its retained closure");
 
   const auto program_bytes =
-      ReadExactArtifact(DigestPath(package_root_, "programs",
+      ReadExactArtifact(DigestPath(selected_package_root, "programs",
                                    binding->value().program_revision.value()),
                         "scenario Program");
   const auto program = verify_program_binding_contract(program_bytes, *bundle);
@@ -587,9 +693,49 @@ FilesystemScenarioApplyCandidateSource::LoadExactProgramSelection(
   return result;
 }
 
-const std::filesystem::path &
-FilesystemScenarioApplyCandidateSource::catalog_path() const noexcept {
-  return catalog_path_;
+std::filesystem::path
+FilesystemScenarioApplyCandidateSource::catalog_path() const {
+  return package_root_ / (catalog_name_ + ".scenario-catalog.yaml");
+}
+
+std::optional<std::filesystem::path>
+FilesystemScenarioApplyCandidateSource::candidate_catalog_path() const {
+  if (!candidate_package_root_.has_value()) {
+    return std::nullopt;
+  }
+  const auto candidate =
+      *candidate_package_root_ / (catalog_name_ + ".scenario-catalog.yaml");
+  std::error_code error;
+  const bool exists = std::filesystem::exists(candidate, error);
+  Require(!error, "candidate scenario-catalog lookup failed");
+  if (!exists) {
+    return std::nullopt;
+  }
+  Require(std::filesystem::is_regular_file(candidate, error) && !error &&
+              !std::filesystem::is_symlink(candidate, error) && !error,
+          "candidate scenario catalog is not one plain file");
+  return candidate;
+}
+
+std::filesystem::path
+FilesystemScenarioApplyCandidateSource::catalog_path_for_revision(
+    const core::ScenarioCatalogRevision &scenario_catalog_revision) const {
+  Require(is_sha256_digest(scenario_catalog_revision.value()),
+          "scenario catalog revision is invalid");
+  if (const auto candidate = candidate_catalog_path();
+      candidate.has_value()) {
+    const auto verified = VerifyCatalog(
+        ReadExactArtifact(*candidate, "candidate scenario catalog"));
+    if (verified.revision == scenario_catalog_revision) {
+      return *candidate;
+    }
+  }
+  const auto base = catalog_path();
+  const auto verified =
+      VerifyCatalog(ReadExactArtifact(base, "scenario catalog"));
+  Require(verified.revision == scenario_catalog_revision,
+          "scenario catalog has no exact requested revision");
+  return base;
 }
 
 } // namespace manyforge::deployment

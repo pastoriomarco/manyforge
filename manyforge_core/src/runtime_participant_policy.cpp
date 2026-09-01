@@ -209,6 +209,28 @@ Result<SpeedProfileDTO> apply_runtime_participant_motion_speed_policy(
   return Result<SpeedProfileDTO>::Ok(std::move(requested));
 }
 
+Result<RuntimeParticipantPolicySelection>
+apply_deployment_motion_speed_ceiling(
+    const RuntimeParticipantPolicySelection& selection,
+    const double deployment_maximum_tcp_linear_speed_mps) {
+  if (!std::isfinite(deployment_maximum_tcp_linear_speed_mps) ||
+      deployment_maximum_tcp_linear_speed_mps <= 0.0 ||
+      deployment_maximum_tcp_linear_speed_mps > 1000.0 ||
+      !std::isfinite(
+          selection.value().effective_maximum_tcp_linear_speed_mps) ||
+      selection.value().effective_maximum_tcp_linear_speed_mps <= 0.0) {
+    return invalid<RuntimeParticipantPolicySelection>(
+        "Deployment motion ceiling is outside the closed finite range",
+        "deployment_motion_limit_value_invalid");
+  }
+  auto value = selection.value();
+  value.effective_maximum_tcp_linear_speed_mps =
+      std::min(value.effective_maximum_tcp_linear_speed_mps,
+               deployment_maximum_tcp_linear_speed_mps);
+  return Result<RuntimeParticipantPolicySelection>::Ok(
+      RuntimeParticipantPolicySelection(std::move(value)));
+}
+
 Result<void> validate_runtime_participant_interrupt_policy_selection(
     const RuntimeParticipantPolicySelection& selection,
     std::span<const MotionInterruptScopeDTO> scopes) {

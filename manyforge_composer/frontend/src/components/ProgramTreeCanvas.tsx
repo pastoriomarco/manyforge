@@ -53,9 +53,12 @@ import {
 import {
   isProgramCanvasFormTarget,
   programCanvasKeyIntent,
+  programChangeKindMutation,
   programDeleteMutation,
   programDetachedInsertionMutation,
+  programInsertionMutation,
   programMoveMutation,
+  programWrapMutation,
   readProgramPaletteDrag,
 } from '../utils/programCanvasInteraction';
 import { BtNode, type BtNodePresentation } from './BtNode';
@@ -71,6 +74,12 @@ const NODE_MIN_WIDTH = 156;
 const NODE_MAX_WIDTH = 288;
 const NODE_BASE_HEIGHT = 70;
 const STAGE_PADDING = 48;
+
+function acceptsChildCount(entry: CatalogEntry | undefined, count: number): boolean {
+  return entry !== undefined
+    && count >= entry.childrenMin
+    && (entry.childrenMax < 0 || count <= entry.childrenMax);
+}
 
 function estimatedNodeSize(label: string, catalogId: string): { width: number; height: number } {
   const width = Math.min(
@@ -223,12 +232,21 @@ export function ProgramTreeCanvas({
     [catalogEntries],
   );
   const availability = useMemo(() => {
-    const result = new Map<string, { authoring: boolean; execution: boolean }>();
+    const result = new Map<string, {
+      authoring: boolean;
+      execution: boolean;
+      reasons: string[];
+    }>();
     for (const row of environment?.implementations ?? []) {
-      const previous = result.get(row.nodeId) ?? { authoring: false, execution: false };
+      const previous = result.get(row.nodeId) ?? {
+        authoring: false,
+        execution: false,
+        reasons: [],
+      };
       result.set(row.nodeId, {
         authoring: previous.authoring || row.authoringAvailable,
         execution: previous.execution || row.executionAvailable,
+        reasons: [...new Set([...previous.reasons, ...row.reasonCodes])].sort(),
       });
     }
     return result;
@@ -303,6 +321,7 @@ export function ProgramTreeCanvas({
     [flat],
   );
   const selectedRow = flat.find((row) => row.node.instance_id === selectedId) ?? null;
+  const [topologyCatalogId, setTopologyCatalogId] = useState('');
   const authoringDisabled = busy || environment?.portableAuthoringAvailable !== true;
 
   useEffect(() => {
@@ -374,6 +393,18 @@ export function ProgramTreeCanvas({
       const row = flatById.get(node.id);
       const entry = catalog.get(row?.node.node_id ?? '');
       const nodeAvailability = availability.get(row?.node.node_id ?? '');
+      const configurationRequired = entry?.parameters.some((parameter) => (
+        parameter.required
+        && !parameter.hasDefault
+        && row !== undefined
+        && !Object.prototype.hasOwnProperty.call(row.node.parameters, parameter.id)
+        && !Object.prototype.hasOwnProperty.call(row.node.value_sources ?? {}, parameter.id)
+      )) ?? false;
+      const executionDisposition = configurationRequired
+        ? 'configuration_required' as const
+        : nodeAvailability?.execution
+          ? 'executable' as const
+          : 'unavailable' as const;
       return {
         id: node.id,
         type: 'programNode',
@@ -398,6 +429,8 @@ export function ProgramTreeCanvas({
             selected: selectedId === node.id,
             layoutDirection: view.layoutDirection,
             executionAvailable: nodeAvailability?.execution ?? false,
+            executionDisposition,
+            executionReason: nodeAvailability?.reasons[0]?.replaceAll('_', ' '),
             invalid: invalidNodeIds.has(node.id),
           },
           onSelect,
@@ -697,6 +730,92 @@ export function ProgramTreeCanvas({
     }
   };
 
+  const topologyEntries = catalogEntries.filter(
+    (entry) => availability.get(entry.id)?.authoring === true,
+  );
+  const topologyEntry = catalog.get(topologyCatalogId);
+  const selectedNodeEntry = selectedRow === null
+    ? undefined
+    : catalog.get(selectedRow.node.node_id);
+  const selectedParentRow = selectedRow?.parentId === null
+    || selectedRow?.parentId === undefined
+    ? null
+    : flatById.get(selectedRow.parentId) ?? null;
+  const selectedParentEntry = selectedParentRow === null
+    ? undefined
+    : catalog.get(selectedParentRow.node.node_id);
+  const childInsertionAvailable = selectedRow !== null
+    && acceptsChildCount(selectedNodeEntry, selectedRow.node.children.length + 1);
+  const siblingInsertionAvailable = selectedRow !== null
+    && (selectedParentRow === null || acceptsChildCount(
+      selectedParentEntry,
+      selectedParentRow.node.children.length + 1,
+    ));
+  const wrapperAvailable = acceptsChildCount(topologyEntry, 1);
+  const retainedParameterNames = selectedRow === null
+    ? []
+    : [
+        ...Object.keys(selectedRow.node.parameters),
+        ...Object.keys(selectedRow.node.value_sources ?? {}),
+      ];
+  const replacementParameterNames = new Set(
+    topologyEntry?.parameters.map((parameter) => parameter.id) ?? [],
+  );
+  const kindReplacementAvailable = selectedRow !== null
+    && topologyEntry !== undefined
+    && topologyEntry.id !== selectedRow.node.node_id
+    && acceptsChildCount(topologyEntry, selectedRow.node.children.length)
+    && retainedParameterNames.every((name) => replacementParameterNames.has(name));
+
+  const insertTopologyNode = async (kind: 'child' | 'after') => {
+    if (selectedRow === null || topologyEntry === undefined || authoringDisabled) return;
+    const mutation = programInsertionMutation(
+      topologyEntry,
+      flat.map((row) => row.node.instance_id),
+      kind === 'child'
+        ? {
+            kind: 'child',
+            parentInstanceId: selectedRow.node.instance_id,
+            index: selectedRow.node.children.length,
+          }
+        : { kind: 'after', siblingInstanceId: selectedRow.node.instance_id },
+    );
+    const accepted = await onMutate(mutation.mutation, mutation.args);
+    if (accepted === null) return;
+    const node = mutation.args.node as Record<string, JsonValue>;
+    onSelect(String(node.instance_id));
+    showCanvasMessage(
+      `${topologyEntry.name} inserted ${kind === 'child' ? 'as a child' : 'after the selected node'}. Complete any required inputs in Properties.`,
+      'info',
+    );
+  };
+
+  const wrapSelected = async () => {
+    if (selectedRow === null || topologyEntry === undefined || authoringDisabled) return;
+    const mutation = programWrapMutation(
+      topologyEntry,
+      flat.map((row) => row.node.instance_id),
+      selectedRow.node.instance_id,
+    );
+    const accepted = await onMutate(mutation.mutation, mutation.args);
+    if (accepted === null) return;
+    const wrapper = mutation.args.wrapper as Record<string, JsonValue>;
+    onSelect(String(wrapper.instance_id));
+    showCanvasMessage(`${topologyEntry.name} now wraps the selected subtree.`, 'info');
+  };
+
+  const changeSelectedKind = async () => {
+    if (selectedRow === null || topologyEntry === undefined || authoringDisabled) return;
+    const mutation = programChangeKindMutation(
+      topologyEntry,
+      selectedRow.node.instance_id,
+      retainedParameterNames,
+    );
+    const accepted = await onMutate(mutation.mutation, mutation.args);
+    if (accepted === null) return;
+    showCanvasMessage(`Node type changed to ${topologyEntry.name} without dropping parameters.`, 'info');
+  };
+
   return (
     <section className="program-tree-surface" aria-label="Program tree canvas">
       <h3 className="sr-only">Program tree canvas</h3>
@@ -793,6 +912,59 @@ export function ProgramTreeCanvas({
             className="program-tree-actions"
             aria-label={`Topology actions for ${selectedRow.node.instance_id}`}
           >
+            <label className="inline-select-label program-topology-node-type">
+              Node type
+              <select
+                value={topologyCatalogId}
+                disabled={authoringDisabled || topologyEntries.length === 0}
+                onChange={(event) => setTopologyCatalogId(event.target.value)}
+              >
+                <option value="">Choose a node type</option>
+                {topologyEntries.map((entry) => (
+                  <option key={entry.id} value={entry.id}>{entry.name}</option>
+                ))}
+              </select>
+            </label>
+            <button
+              type="button"
+              disabled={authoringDisabled || topologyEntry === undefined || !childInsertionAvailable}
+              title={childInsertionAvailable
+                ? 'Insert the chosen type as the final child and open its Properties.'
+                : 'The selected node cannot accept another child.'}
+              onClick={() => { void insertTopologyNode('child'); }}
+            >
+              Add child
+            </button>
+            <button
+              type="button"
+              disabled={authoringDisabled || topologyEntry === undefined || !siblingInsertionAvailable}
+              title={siblingInsertionAvailable
+                ? 'Insert the chosen type immediately after the selected node.'
+                : 'The selected node parent cannot accept another child.'}
+              onClick={() => { void insertTopologyNode('after'); }}
+            >
+              Add after
+            </button>
+            <button
+              type="button"
+              disabled={authoringDisabled || topologyEntry === undefined || !wrapperAvailable}
+              title={wrapperAvailable
+                ? 'Wrap the selected subtree atomically with the chosen type.'
+                : 'Choose a node type that accepts exactly one initial child.'}
+              onClick={() => { void wrapSelected(); }}
+            >
+              Wrap
+            </button>
+            <button
+              type="button"
+              disabled={authoringDisabled || !kindReplacementAvailable}
+              title={kindReplacementAvailable
+                ? 'Change type while retaining every compatible authored parameter and all children.'
+                : 'Choose another type compatible with the current children and authored parameters.'}
+              onClick={() => { void changeSelectedKind(); }}
+            >
+              Change type
+            </button>
             <button
               type="button"
               disabled={
