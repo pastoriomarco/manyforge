@@ -51,6 +51,10 @@ class ExecutionTransport(Protocol):
 
     def stop_program_run(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
+    def release_program_run_stop_fence(
+        self, program_run_id: str, stop_id: str, stop_generation: int
+    ) -> dict[str, Any]: ...
+
     def stop_status(self, stop_id: str) -> dict[str, Any]: ...
 
 
@@ -346,6 +350,16 @@ class KernelClient:
         return self._successful(
             self._transport.stop_program_run(request),
             label="Program-run Stop",
+        )
+
+    def release_program_run_stop_fence(
+        self, program_run_id: str, stop_id: str, stop_generation: int
+    ) -> dict[str, Any]:
+        return self._successful(
+            self._transport.release_program_run_stop_fence(
+                program_run_id, stop_id, stop_generation
+            ),
+            label="Program-run Stop release",
         )
 
     def stop_status(self, stop_id: str) -> dict[str, Any]:

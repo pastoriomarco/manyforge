@@ -255,8 +255,12 @@ function authoringSnapshot(
       programRunId: null,
       cycleClaimGeneration: null,
       terminalOrSettlementReference: null,
+      runRevision: null,
+      nodeStatusRevision: null,
       runtimeControlRevision: null,
       recoveryOffer: null,
+      run: null,
+      runtimeControls: null,
     },
     draftIdentity: {
       draftId: current.draft.draftId,

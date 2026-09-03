@@ -25,8 +25,8 @@ numeric_source_kind(const core::ObservedStateSourceKind source) noexcept {
   return core::ObservedRobotStateSourceKind::kJointState;
 }
 
-[[nodiscard]] core::ObservedStateSourceKind
-addressed_source_kind(const core::ObservedRobotStateSourceKind source) noexcept {
+[[nodiscard]] core::ObservedStateSourceKind addressed_source_kind(
+    const core::ObservedRobotStateSourceKind source) noexcept {
   switch (source) {
   case core::ObservedRobotStateSourceKind::kActionFeedback:
     return core::ObservedStateSourceKind::kActionFeedback;
@@ -81,10 +81,8 @@ publication_config(const core::RuntimeParticipantBinding &binding,
         "authority");
   }
   return core::AddressedObservedStatePublicationConfig{
-      std::move(context.value()),
-      std::move(sources),
-      config.authority_generation,
-      256U};
+      std::move(context.value()), std::move(sources),
+      config.authority_generation, 256U};
 }
 
 [[nodiscard]] core::ErrorDTO channel_error(std::string reason,
@@ -119,6 +117,7 @@ RetainedObservedStateChannel::RetainedObservedStateChannel(
       config_(std::move(config)), clock_(clock),
       publication_(publication_config(initial_binding_, config_)),
       projection_context_(publication_.query_context()),
+      last_render_positions_(publication_.query_context().resources.size()),
       current_binding_(&initial_binding_) {
   retained_route_bindings_.reserve(4096U);
   if (!projector_) {
@@ -182,6 +181,7 @@ core::Result<void> RetainedObservedStateChannel::RebindRoute(
                 std::move(binding)));
         current_binding_.store(retained_route_bindings_.back().get(),
                                std::memory_order_release);
+        notify_render_change();
       }
       return core::Result<void>::Ok();
     }
@@ -212,6 +212,7 @@ core::Result<void> RetainedObservedStateChannel::RebindRoute(
     // new route and must not be stranded behind the recovery freshness gate.
     fresh_state_required_.store(false, std::memory_order_release);
     fresh_sample_generation_.fetch_add(1U, std::memory_order_acq_rel);
+    notify_render_change();
     fresh_state_cv_.notify_all();
     return core::Result<void>::Ok();
   } catch (const std::exception &) {
@@ -294,6 +295,7 @@ RetainedStateProjectionResult RetainedObservedStateChannel::publish_state(
   }
   fresh_state_required_.store(false, std::memory_order_release);
   fresh_sample_generation_.fetch_add(1U, std::memory_order_acq_rel);
+  record_render_positions(context.joint_names, positions_si);
   fresh_state_cv_.notify_all();
   return {RetainedStateProjectionStatus::kApplied, std::nullopt};
 }
@@ -314,12 +316,14 @@ RetainedObservedStateChannel::publish_adapter_state(
       published.velocities_complete) {
     fresh_state_required_.store(false, std::memory_order_release);
     fresh_sample_generation_.fetch_add(1U, std::memory_order_acq_rel);
+    record_render_positions(source_joint_names, positions_si);
     fresh_state_cv_.notify_all();
   }
   return published;
 }
 
-RetainedStateProjectionResult RetainedObservedStateChannel::publish_state_bounded(
+RetainedStateProjectionResult
+RetainedObservedStateChannel::publish_state_bounded(
     const std::span<const double> positions_si,
     const std::span<const double> velocities_si,
     const std::int64_t source_timestamp_ns,
@@ -334,14 +338,14 @@ RetainedStateProjectionResult RetainedObservedStateChannel::publish_state_bounde
     return now >= deadline_ns || received_timestamp_ns >= deadline_ns;
   };
   if (cancellation.stop_requested() || is_expired()) {
-    return {RetainedStateProjectionStatus::kFailed,
-            channel_error(
-                cancellation.stop_requested()
-                    ? "retained_state_publication_cancelled"
-                    : "retained_state_publication_deadline_expired",
-                cancellation.stop_requested()
-                    ? "native state publication was cancelled"
-                    : "native state publication missed its deadline")};
+    return {
+        RetainedStateProjectionStatus::kFailed,
+        channel_error(cancellation.stop_requested()
+                          ? "retained_state_publication_cancelled"
+                          : "retained_state_publication_deadline_expired",
+                      cancellation.stop_requested()
+                          ? "native state publication was cancelled"
+                          : "native state publication missed its deadline")};
   }
   std::unique_lock route_lock(route_rebind_mutex_, std::try_to_lock);
   if (!route_lock.owns_lock()) {
@@ -350,14 +354,14 @@ RetainedStateProjectionResult RetainedObservedStateChannel::publish_state_bounde
                           "native state publication route is busy")};
   }
   if (cancellation.stop_requested() || is_expired()) {
-    return {RetainedStateProjectionStatus::kFailed,
-            channel_error(
-                cancellation.stop_requested()
-                    ? "retained_state_publication_cancelled"
-                    : "retained_state_publication_deadline_expired",
-                cancellation.stop_requested()
-                    ? "native state publication was cancelled"
-                    : "native state publication missed its deadline")};
+    return {
+        RetainedStateProjectionStatus::kFailed,
+        channel_error(cancellation.stop_requested()
+                          ? "retained_state_publication_cancelled"
+                          : "retained_state_publication_deadline_expired",
+                      cancellation.stop_requested()
+                          ? "native state publication was cancelled"
+                          : "native state publication missed its deadline")};
   }
   const auto &context = publication_.query_context();
   if (positions_si.size() != context.resources.size() ||
@@ -371,37 +375,39 @@ RetainedStateProjectionResult RetainedObservedStateChannel::publish_state_bounde
       config_.source_kind, context.joint_names, positions_si, velocities_si,
       source_timestamp_ns, received_timestamp_ns);
   if (cancellation.stop_requested() || is_expired()) {
-    return {RetainedStateProjectionStatus::kFailed,
-            channel_error(
-                cancellation.stop_requested()
-                    ? "retained_state_publication_cancelled"
-                    : "retained_state_publication_deadline_expired",
-                cancellation.stop_requested()
-                    ? "native state publication was cancelled"
-                    : "native state publication missed its deadline")};
+    return {
+        RetainedStateProjectionStatus::kFailed,
+        channel_error(cancellation.stop_requested()
+                          ? "retained_state_publication_cancelled"
+                          : "retained_state_publication_deadline_expired",
+                      cancellation.stop_requested()
+                          ? "native state publication was cancelled"
+                          : "native state publication missed its deadline")};
   }
   if (!published.published || !published.complete ||
       !published.velocities_complete) {
     const std::string reason = published.reason == nullptr
                                    ? "retained_state_publication_failed"
                                    : published.reason;
-    return {publication_backpressured(reason)
-                ? RetainedStateProjectionStatus::kBusy
-                : RetainedStateProjectionStatus::kFailed,
-            channel_error(reason, "native state publication was not committed")};
+    return {
+        publication_backpressured(reason)
+            ? RetainedStateProjectionStatus::kBusy
+            : RetainedStateProjectionStatus::kFailed,
+        channel_error(reason, "native state publication was not committed")};
   }
   fresh_state_required_.store(false, std::memory_order_release);
   fresh_sample_generation_.fetch_add(1U, std::memory_order_acq_rel);
+  record_render_positions(context.joint_names, positions_si);
   fresh_state_cv_.notify_all();
   if (cancellation.stop_requested() || is_expired()) {
-    return {RetainedStateProjectionStatus::kFailed,
-            channel_error(
-                cancellation.stop_requested()
-                    ? "retained_state_publication_cancelled"
-                    : "retained_state_publication_deadline_expired",
-                cancellation.stop_requested()
-                    ? "native state publication was cancelled"
-                    : "native state publication missed its deadline")};
+    return {
+        RetainedStateProjectionStatus::kFailed,
+        channel_error(cancellation.stop_requested()
+                          ? "retained_state_publication_cancelled"
+                          : "retained_state_publication_deadline_expired",
+                      cancellation.stop_requested()
+                          ? "native state publication was cancelled"
+                          : "native state publication missed its deadline")};
   }
   return {RetainedStateProjectionStatus::kApplied, std::nullopt};
 }
@@ -449,9 +455,8 @@ RetainedObservedStateChannel::current_state_bounded(
   };
   if (cancellation.stop_requested() || is_expired()) {
     return core::Result<core::ObservedStateSnapshotDTO>::Err(channel_error(
-        cancellation.stop_requested()
-            ? "retained_state_read_cancelled"
-            : "retained_state_read_deadline_expired",
+        cancellation.stop_requested() ? "retained_state_read_cancelled"
+                                      : "retained_state_read_deadline_expired",
         cancellation.stop_requested()
             ? "native state read was cancelled"
             : "native state read missed its deadline"));
@@ -463,11 +468,11 @@ RetainedObservedStateChannel::current_state_bounded(
   }
   if (cancellation.stop_requested() || is_expired()) {
     return core::Result<core::ObservedStateSnapshotDTO>::Err(channel_error(
+        cancellation.stop_requested() ? "retained_state_read_cancelled"
+                                      : "retained_state_read_deadline_expired",
         cancellation.stop_requested()
-            ? "retained_state_read_cancelled"
-            : "retained_state_read_deadline_expired",
-        cancellation.stop_requested() ? "native state read was cancelled"
-                                      : "native state read missed its deadline"));
+            ? "native state read was cancelled"
+            : "native state read missed its deadline"));
   }
   if (fresh_state_required_.load(std::memory_order_acquire)) {
     return core::Result<core::ObservedStateSnapshotDTO>::Err(channel_error(
@@ -478,11 +483,11 @@ RetainedObservedStateChannel::current_state_bounded(
       publication_.current_state(publication_.query_context(), now_ns);
   if (cancellation.stop_requested() || is_expired()) {
     return core::Result<core::ObservedStateSnapshotDTO>::Err(channel_error(
+        cancellation.stop_requested() ? "retained_state_read_cancelled"
+                                      : "retained_state_read_deadline_expired",
         cancellation.stop_requested()
-            ? "retained_state_read_cancelled"
-            : "retained_state_read_deadline_expired",
-        cancellation.stop_requested() ? "native state read was cancelled"
-                                      : "native state read missed its deadline"));
+            ? "native state read was cancelled"
+            : "native state read missed its deadline"));
   }
   return result;
 }
@@ -491,9 +496,9 @@ core::Result<core::ControlledStateDTO>
 RetainedObservedStateChannel::current_controlled_state() const {
   std::lock_guard route_lock(route_rebind_mutex_);
   if (fresh_state_required_.load(std::memory_order_acquire)) {
-    return core::Result<core::ControlledStateDTO>::Err(
-        channel_error("retained_state_fresh_sample_unavailable",
-                      "native route state requires a fresh current-binding sample"));
+    return core::Result<core::ControlledStateDTO>::Err(channel_error(
+        "retained_state_fresh_sample_unavailable",
+        "native route state requires a fresh current-binding sample"));
   }
   const auto &context = publication_.query_context();
   auto current = publication_.publication(context.control_binding_id,
@@ -534,6 +539,58 @@ bool RetainedObservedStateChannel::wait_for_fresh_state(
   return fresh_state_cv_.wait_for(lock, timeout, [this] {
     return !fresh_state_required_.load(std::memory_order_acquire);
   });
+}
+
+bool RetainedObservedStateChannel::wait_for_render_change(
+    const std::uint64_t after_generation,
+    const std::chrono::nanoseconds timeout) const {
+  std::unique_lock lock(fresh_state_mutex_);
+  return fresh_state_cv_.wait_for(lock, timeout, [this, after_generation] {
+    return render_change_generation_.load(std::memory_order_acquire) !=
+           after_generation;
+  });
+}
+
+void RetainedObservedStateChannel::record_render_positions(
+    const std::span<const std::string> source_joint_names,
+    const std::span<const double> positions_si) {
+  const auto &canonical_names = publication_.query_context().joint_names;
+  if (source_joint_names.size() != positions_si.size() ||
+      canonical_names.size() != last_render_positions_.size()) {
+    return;
+  }
+  bool changed = !render_positions_valid_;
+  for (std::size_t canonical_index = 0U;
+       canonical_index < canonical_names.size(); ++canonical_index) {
+    const auto source =
+        std::find(source_joint_names.begin(), source_joint_names.end(),
+                  canonical_names[canonical_index]);
+    if (source == source_joint_names.end()) {
+      return;
+    }
+    const auto source_index = static_cast<std::size_t>(
+        std::distance(source_joint_names.begin(), source));
+    changed = changed || last_render_positions_[canonical_index] !=
+                             positions_si[source_index];
+  }
+  for (std::size_t canonical_index = 0U;
+       canonical_index < canonical_names.size(); ++canonical_index) {
+    const auto source =
+        std::find(source_joint_names.begin(), source_joint_names.end(),
+                  canonical_names[canonical_index]);
+    const auto source_index = static_cast<std::size_t>(
+        std::distance(source_joint_names.begin(), source));
+    last_render_positions_[canonical_index] = positions_si[source_index];
+  }
+  render_positions_valid_ = true;
+  if (changed) {
+    notify_render_change();
+  }
+}
+
+void RetainedObservedStateChannel::notify_render_change() noexcept {
+  render_change_generation_.fetch_add(1U, std::memory_order_acq_rel);
+  fresh_state_cv_.notify_all();
 }
 
 } // namespace manyforge::roboplan_backend

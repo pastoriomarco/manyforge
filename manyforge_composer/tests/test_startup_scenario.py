@@ -231,9 +231,14 @@ def test_startup_load_activates_deployment_then_program(
         lambda value: value,
     )
 
-    result = _state(headless, coordinator, program=program).load_startup_scenario(
-        selection["scenario_id"]
+    state = _state(headless, coordinator, program=program)
+    state._active_authoring_catalog = (  # type: ignore[method-assign]
+        lambda: (_ for _ in ()).throw(
+            AssertionError("admitted Scenario load re-read transient availability")
+        )
     )
+
+    result = state.load_startup_scenario(selection["scenario_id"])
 
     assert result["status"] == "loaded"
     assert coordinator.executions[0]["operation_kind"] == "load_scenario"
@@ -251,6 +256,37 @@ def test_startup_load_activates_deployment_then_program(
     assert headless.program_apply_bodies[0]["program"] == selection["program"]
     assert result["workspace"]["saved"]["matchesDraft"] is True
     assert result["workspace"]["applied"]["matchesDraft"] is True
+
+
+def test_startup_load_waits_for_reconciled_authoring_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    program = Program(str(_PROGRAM_PATH), build_node_environment().catalog)
+    selection = _selection(program.to_dict())
+    headless = _Headless(selection)
+    coordinator = _Coordinator()
+    admissions = [
+        {"authoring_allowed": False, "admission_generation": 7},
+        {"authoring_allowed": False, "admission_generation": 8},
+        {"authoring_allowed": True, "admission_generation": 9},
+    ]
+    sleeps: list[float] = []
+    headless.authoring_admission = (  # type: ignore[method-assign]
+        lambda: admissions.pop(0) if len(admissions) > 1 else admissions[0]
+    )
+    monkeypatch.setattr("manyforge_composer.backend.state.time.sleep", sleeps.append)
+    monkeypatch.setattr(
+        "manyforge_composer.backend.state.validate_program_apply_result",
+        lambda value: value,
+    )
+
+    result = _state(headless, coordinator, program=program).load_startup_scenario(
+        selection["scenario_id"]
+    )
+
+    assert result["status"] == "loaded"
+    assert sleeps == [0.1, 0.1]
+    assert coordinator.executions[0]["envelope"].expected_admission_generation == 9
 
 
 def test_startup_load_is_effect_idempotent_when_scenario_is_already_current() -> None:

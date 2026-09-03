@@ -432,3 +432,27 @@ def test_raw_webdriver_http_session_cleanup_and_unsupported_response() -> None:
         server.shutdown()
         server.server_close()
         thread.join(timeout=1.0)
+
+
+def test_raw_webdriver_accepts_an_isolated_firefox_session() -> None:
+    _WebDriverHandler.requests.clear()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _WebDriverHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        driver = _REAL_RAW_WEBDRIVER(f"http://127.0.0.1:{server.server_port}")
+        assert driver.create_session(
+            firefox_args=("-headless", "-no-remote"),
+        ) == "http-session"
+        request = next(
+            body
+            for method, path, body in _WebDriverHandler.requests
+            if method == "POST" and path == "/session"
+        )
+        assert request is not None
+        options = request["capabilities"]["alwaysMatch"]["moz:firefoxOptions"]
+        assert options["args"] == ["-headless", "-no-remote"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=1.0)

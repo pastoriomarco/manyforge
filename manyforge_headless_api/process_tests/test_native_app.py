@@ -284,7 +284,23 @@ def test_http_owner_restart_reannunciates_from_fresh_source_observation(
 
     with TestClient(create_app(_config(tmp_path, "api.epoch.2"))) as replacement:
         _wait_runtime(replacement, complete=False)
-        snapshot, replacement_alarm = _wait_provider_alarm(replacement)
+        unknown = replacement.get("/api/execution/alarms").json()
+        assert unknown["alarms"] == []
+        assert unknown["reconciled"] is False
+
+        # A replacement owner must not manufacture a new acknowledgement
+        # obligation from retained sources that were already stale when it
+        # started. Reannunciation becomes authoritative only after this owner
+        # observes one fresh complete source set and then observes its loss.
+        replacement_manager = _start_manager(tmp_path)
+        try:
+            assert _wait_runtime(replacement, complete=True)["complete"] is True
+            assert replacement.get("/api/execution/alarms").json()["alarms"] == []
+            _stop_manager(replacement_manager)
+            assert _wait_runtime(replacement, complete=False)["complete"] is False
+            snapshot, replacement_alarm = _wait_provider_alarm(replacement)
+        finally:
+            _stop_manager(replacement_manager)
         assert snapshot["owner_epoch"] == "api.epoch.2"
         assert replacement_alarm["activation_id"] != first_alarm["activation_id"]
         assert replacement_alarm["lifecycle_state"] == "active_unacknowledged"

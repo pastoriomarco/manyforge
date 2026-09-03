@@ -1,4 +1,4 @@
-import type { CycleRecoveryOffer } from './api';
+import type { ProgramCycleStatus } from './api';
 
 export type SourceFreshness = 'fresh' | 'stale' | 'unavailable';
 
@@ -154,17 +154,7 @@ export interface ComposerHeadlessState {
     authoringAllowed: boolean;
     admissionGeneration: number;
   };
-  programCycle: {
-    programRunnerOwnerEpoch: string;
-    cycleGeneration: number;
-    state: 'idle_after_reset' | 'starting' | 'running' | 'stopping'
-      | 'terminal_awaiting_reset';
-    programRunId: string | null;
-    cycleClaimGeneration: number | null;
-    terminalOrSettlementReference: string | null;
-    runtimeControlRevision: number | null;
-    recoveryOffer: CycleRecoveryOffer | null;
-  };
+  programCycle: ProgramCycleStatus;
   draftIdentity: { draftId: string; draftRevision: number };
   receiverEpoch: string;
   snapshotSequence: number;

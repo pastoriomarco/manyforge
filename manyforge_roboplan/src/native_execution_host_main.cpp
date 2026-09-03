@@ -1237,6 +1237,20 @@ std::optional<double> OptionalNumber(const CanonicalValue &root,
   return *value;
 }
 
+std::optional<std::uint64_t> OptionalCounter(const CanonicalValue &root,
+                                             const std::string_view name,
+                                             const std::uint64_t minimum) {
+  const auto value = OptionalNumber(root, name);
+  if (!value.has_value()) {
+    return std::nullopt;
+  }
+  Require(*value >= static_cast<double>(minimum) &&
+              std::floor(*value) == *value && *value <= kMaximumSafeInteger,
+          "command field " + std::string(name) +
+              " must be null or one safe unsigned integer");
+  return static_cast<std::uint64_t>(*value);
+}
+
 std::optional<std::string> OptionalText(const CanonicalValue &root,
                                         std::string_view name) {
   const auto &member = Member(root, name);
@@ -1989,8 +2003,7 @@ DecodeRuntimeScaleControlRequest(
       DecodeRuntimeScaleControlSelector(Member(value, "selector")),
       core::RuntimeScaleControlGeneration(
           Counter(value, "expected_control_generation", 0U)),
-      scale,
-      attribution};
+      scale, attribution};
 }
 
 [[nodiscard]] core::RecoveryAction
@@ -2049,6 +2062,7 @@ enum class CommandKind {
   kAcknowledgeCompleted,
   kStop,
   kStopProgramRun,
+  kReleaseProgramRunStopFence,
   kFullStop,
   kMalformedStop,
   kGetStopFault,
@@ -2083,6 +2097,8 @@ struct Command final {
   std::optional<core::ContentDigest> operation_digest;
   std::optional<core::OperationId> operation_id;
   std::optional<core::StopId> stop_id;
+  std::optional<core::ProgramRunId> program_run_id;
+  std::optional<core::StopGeneration> stop_generation;
   std::optional<core::OperationControlRequestDTO> control;
   std::optional<core::OperationRevision> expected_operation_revision;
   std::optional<core::KernelRecoveryActionRequestDTO> operation_recovery;
@@ -2096,6 +2112,10 @@ struct Command final {
   std::optional<core::RequestOwnerEpoch> event_owner_epoch{};
   std::uint64_t after_sequence{};
   std::size_t event_limit{};
+  std::optional<core::RequestOwnerEpoch> observation_after_owner_epoch;
+  std::optional<std::string> observation_after_source_epoch;
+  std::optional<std::uint64_t> observation_after_source_sequence;
+  bool observation_cursor_supplied{};
   std::optional<core::PickSequencePlanningIntentDTO> pick_planning;
   std::optional<core::PlaceSequencePlanningIntentDTO> place_planning;
   std::optional<std::string> pick_place_sequence_id;
@@ -2133,8 +2153,31 @@ struct Command final {
     return Command{CommandKind::kControlState};
   }
   if (command == "observation") {
-    RequireExactObjectSize(root, 2U, "observation command");
-    return Command{CommandKind::kObservation};
+    Require(root.as_object().size() == 2U || root.as_object().size() == 5U,
+            "observation command has an unexpected field count");
+    Command decoded{CommandKind::kObservation};
+    if (root.as_object().size() == 5U) {
+      decoded.observation_cursor_supplied = true;
+      const auto owner_epoch = OptionalText(root, "after_owner_epoch");
+      const auto source_epoch = OptionalText(root, "after_source_epoch");
+      const auto source_sequence =
+          OptionalCounter(root, "after_source_sequence", 0U);
+      const bool initial = !owner_epoch.has_value() &&
+                           !source_epoch.has_value() &&
+                           !source_sequence.has_value();
+      const bool complete = owner_epoch.has_value() &&
+                            source_epoch.has_value() &&
+                            source_sequence.has_value();
+      Require(initial || complete,
+              "observation cursor must be wholly null or complete");
+      if (complete) {
+        decoded.observation_after_owner_epoch =
+            core::RequestOwnerEpoch(*owner_epoch);
+        decoded.observation_after_source_epoch = *source_epoch;
+        decoded.observation_after_source_sequence = *source_sequence;
+      }
+    }
+    return decoded;
   }
   if (command == "events") {
     RequireExactObjectSize(root, 5U, "events command");
@@ -2184,8 +2227,7 @@ struct Command final {
     return decoded;
   }
   if (command == "get_runtime_scale_control") {
-    RequireExactObjectSize(root, 3U,
-                           "runtime-scale control read command");
+    RequireExactObjectSize(root, 3U, "runtime-scale control read command");
     Command decoded{CommandKind::kGetRuntimeScaleControl};
     decoded.runtime_scale_control_selector =
         DecodeRuntimeScaleControlSelector(Member(root, "selector"));
@@ -2287,6 +2329,23 @@ struct Command final {
         DecodeProgramRunStopIntent(Member(root, "request"), attribution);
     return decoded;
   }
+  if (command == "release_program_run_stop_fence") {
+    RequireExactObjectSize(root, 6U,
+                           "Program-run Stop fence release command");
+    const auto attribution =
+        DecodeRequestAttribution(Member(root, "attribution"));
+    Require(attribution.transport == core::RequestTransportDTO::kInternal &&
+                attribution.assurance ==
+                    core::RequestAssuranceDTO::kUnverified &&
+                !attribution.principal_id.has_value(),
+            "Program-run Stop fence release requires internal attribution");
+    Command decoded{CommandKind::kReleaseProgramRunStopFence};
+    decoded.program_run_id = core::ProgramRunId(Text(root, "program_run_id"));
+    decoded.stop_id = core::StopId(Text(root, "stop_id"));
+    decoded.stop_generation = core::StopGeneration(
+        Counter(root, "stop_generation", 1U));
+    return decoded;
+  }
   if (command == "full_stop") {
     RequireExactObjectSize(root, 4U, "Full Stop command");
     const auto attribution =
@@ -2325,8 +2384,8 @@ struct Command final {
     const auto attribution =
         DecodeRequestAttribution(Member(root, "attribution"));
     Command decoded{CommandKind::kSetRuntimeScaleControl};
-    decoded.runtime_scale_control = DecodeRuntimeScaleControlRequest(
-        Member(root, "request"), attribution);
+    decoded.runtime_scale_control =
+        DecodeRuntimeScaleControlRequest(Member(root, "request"), attribution);
     return decoded;
   }
   CommandKind kind;
@@ -3832,8 +3891,8 @@ StopHistoryFaultValue(const std::optional<core::StopFaultLatchDTO> &fault) {
     return CanonicalValue(nullptr);
   }
   return CanonicalValue(CanonicalValue::Object{
-      {"captured_operation_count",
-       CanonicalValue(static_cast<double>(fault->captured_operation_ids.size()))},
+      {"captured_operation_count", CanonicalValue(static_cast<double>(
+                                       fault->captured_operation_ids.size()))},
       {"captured_resource_count",
        CanonicalValue(static_cast<double>(fault->captured_resources.size()))},
       {"cell_id", CanonicalValue(fault->cell_id.value())},
@@ -3843,8 +3902,8 @@ StopHistoryFaultValue(const std::optional<core::StopFaultLatchDTO> &fault) {
       {"persistence_degraded", CanonicalValue(fault->persistence_degraded)},
       {"reason_code", CanonicalValue(fault->reason_code)},
       {"recovery_assessment_revision",
-       CanonicalValue(static_cast<double>(
-           fault->recovery_assessment_revision))},
+       CanonicalValue(
+           static_cast<double>(fault->recovery_assessment_revision))},
       {"recovery_status",
        CanonicalValue(
            std::string(StopFaultRecoveryStatusName(fault->recovery_status)))},
@@ -3963,8 +4022,7 @@ StopHistoryFaultValue(const std::optional<core::StopFaultLatchDTO> &fault) {
                                  : CanonicalValue(CanonicalValue::Array{})},
       {"failed_count",
        CanonicalValue(static_cast<double>(certificate.failed.size()))},
-      {"fault_latch",
-       StopHistoryFaultValue(projection.fault_latch)},
+      {"fault_latch", StopHistoryFaultValue(projection.fault_latch)},
       {"hard_stop_floor_used", CanonicalValue(hard_stop_floor_used)},
       {"owner_epoch", CanonicalValue(std::string(source_owner_epoch))},
       {"participant_settlement",
@@ -4033,10 +4091,11 @@ StopHistoryFaultValue(const std::optional<core::StopFaultLatchDTO> &fault) {
     const std::string_view source_owner_epoch) {
   const auto &result = projection.recovery_result;
   const auto &latch = result.latch;
-  Require(result.accepted && !result.error.has_value() &&
-              latch.state == core::StopFaultLatchStateDTO::kCleared &&
-              latch.stop_certificate.has_value(),
-          "durable Stop fault-clear projection is not a successful exact clear");
+  Require(
+      result.accepted && !result.error.has_value() &&
+          latch.state == core::StopFaultLatchStateDTO::kCleared &&
+          latch.stop_certificate.has_value(),
+      "durable Stop fault-clear projection is not a successful exact clear");
   return CanonicalValue(CanonicalValue::Object{
       {"api_version",
        CanonicalValue("manyforge.stop_fault_clear_projection.v1")},
@@ -4270,8 +4329,7 @@ RecoveryActionResultValue(const core::KernelRecoveryActionResultDTO &value) {
     const core::RuntimeScaleControlSelectorDTO &value) {
   return CanonicalValue(CanonicalValue::Object{
       {"component_role_id", CanonicalValue(value.component_role_id.value())},
-      {"program_binding_id",
-       CanonicalValue(value.program_binding_id.value())},
+      {"program_binding_id", CanonicalValue(value.program_binding_id.value())},
       {"target_role_id", CanonicalValue(value.target_role_id.value())},
   });
 }
@@ -4287,8 +4345,8 @@ RecoveryActionResultValue(const core::KernelRecoveryActionResultDTO &value) {
            : CanonicalValue(nullptr)},
       {"active_operation_revision",
        value.active_operation_revision.has_value()
-           ? CanonicalValue(static_cast<double>(
-                 value.active_operation_revision->value()))
+           ? CanonicalValue(
+                 static_cast<double>(value.active_operation_revision->value()))
            : CanonicalValue(nullptr)},
       {"active_operation_scale_generation",
        value.active_operation_scale_generation.has_value()
@@ -4323,19 +4381,18 @@ RecoveryActionResultValue(const core::KernelRecoveryActionResultDTO &value) {
            : CanonicalValue(nullptr)},
       {"active_operation_revision",
        value.active_operation_revision.has_value()
-           ? CanonicalValue(static_cast<double>(
-                 value.active_operation_revision->value()))
+           ? CanonicalValue(
+                 static_cast<double>(value.active_operation_revision->value()))
            : CanonicalValue(nullptr)},
       {"active_operation_scale_generation",
        value.active_operation_scale_generation.has_value()
            ? CanonicalValue(static_cast<double>(
                  value.active_operation_scale_generation->value()))
            : CanonicalValue(nullptr)},
-      {"application_state",
-       value.application_state.has_value()
-           ? CanonicalValue(std::string(core::to_string(
-                 *value.application_state)))
-           : CanonicalValue(nullptr)},
+      {"application_state", value.application_state.has_value()
+                                ? CanonicalValue(std::string(core::to_string(
+                                      *value.application_state)))
+                                : CanonicalValue(nullptr)},
       {"control_binding_id",
        value.control_binding_id.has_value()
            ? CanonicalValue(value.control_binding_id->value())
@@ -4354,13 +4411,12 @@ RecoveryActionResultValue(const core::KernelRecoveryActionResultDTO &value) {
            : CanonicalValue(nullptr)},
       {"control_generation",
        CanonicalValue(static_cast<double>(value.control_generation.value()))},
-      {"effective_scale",
-       value.effective_scale.has_value()
-           ? CanonicalValue(*value.effective_scale)
-           : CanonicalValue(nullptr)},
+      {"effective_scale", value.effective_scale.has_value()
+                              ? CanonicalValue(*value.effective_scale)
+                              : CanonicalValue(nullptr)},
       {"frozen", CanonicalValue(value.frozen)},
       {"reason", value.reason.has_value() ? ErrorValue(*value.reason)
-                                           : CanonicalValue(nullptr)},
+                                          : CanonicalValue(nullptr)},
       {"requested_scale", CanonicalValue(value.requested_scale)},
       {"scaling_domain_id",
        value.scaling_domain_id.has_value()
@@ -4473,10 +4529,9 @@ OperationEventPageValue(const core::OperationJournalEventPageDTO &page) {
           core::DecodeStopJournalFaultClearProjection(event.payload_json);
       Require(cleared.ok(),
               "durable Stop fault-clear projection could not be decoded: " +
-                  (cleared.ok() ? std::string{}
-                                : cleared.error().message));
-      payload = StopFaultClearHistoryProjectionValue(
-          cleared.value(), event.owner_epoch.value());
+                  (cleared.ok() ? std::string{} : cleared.error().message));
+      payload = StopFaultClearHistoryProjectionValue(cleared.value(),
+                                                     event.owner_epoch.value());
       payload_digest = content_identity::sha256_digest(
           content_identity::canonical_json(payload));
     } else {
@@ -5570,23 +5625,25 @@ CanonicalNullableText(const std::optional<std::string> &value) {
   CanonicalValue operational_limit(nullptr);
   if (motion_runtime_policy.has_value()) {
     const auto &selected = motion_runtime_policy->value();
-    const bool target_scoped = std::holds_alternative<
-        core::RuntimePolicyCommandTargetScopeDTO>(
-        selected.selected_motion_speed_limit.scope);
+    const bool target_scoped =
+        std::holds_alternative<core::RuntimePolicyCommandTargetScopeDTO>(
+            selected.selected_motion_speed_limit.scope);
     operational_limit = CanonicalValue(CanonicalValue::Object{
         {"catalog_policy_maximum_tcp_linear_speed_mps",
-         CanonicalValue(
-             selected.selected_motion_speed_limit.maximum_tcp_linear_speed_mps)},
+         CanonicalValue(selected.selected_motion_speed_limit
+                            .maximum_tcp_linear_speed_mps)},
         {"deployment_maximum_tcp_linear_speed_mps",
          deployment_maximum_tcp_linear_speed_mps.has_value()
              ? CanonicalValue(*deployment_maximum_tcp_linear_speed_mps)
              : CanonicalValue(nullptr)},
         {"effective_maximum_tcp_linear_speed_mps",
          CanonicalValue(selected.effective_maximum_tcp_linear_speed_mps)},
-        {"policy_id", CanonicalValue(selected.policy.runtime_policy_id.value())},
+        {"policy_id",
+         CanonicalValue(selected.policy.runtime_policy_id.value())},
         {"policy_revision",
          CanonicalValue(selected.policy.runtime_policy_revision.value())},
-        {"selected_scope", CanonicalValue(target_scoped ? "command_target" : "cell")},
+        {"selected_scope",
+         CanonicalValue(target_scoped ? "command_target" : "cell")},
         {"source_content_digest",
          CanonicalValue(selected.source_artifact.content_digest.value())},
     });
@@ -5631,16 +5688,13 @@ CanonicalNullableText(const std::optional<std::string> &value) {
     operational_joint_limits.emplace_back(CanonicalValue::Object{
         {"deployment_max_acceleration_rad_s2",
          CanonicalNullableNumber(authored_acceleration)},
-        {"deployment_max_jerk_rad_s3",
-         CanonicalNullableNumber(authored_jerk)},
+        {"deployment_max_jerk_rad_s3", CanonicalNullableNumber(authored_jerk)},
         {"deployment_max_velocity_rad_s",
          CanonicalNullableNumber(authored_velocity)},
         {"effective_max_acceleration_rad_s2",
          CanonicalNullableNumber(effective_acceleration)},
-        {"effective_max_jerk_rad_s3",
-         CanonicalNullableNumber(authored_jerk)},
-        {"effective_max_velocity_rad_s",
-         CanonicalValue(effective_velocity)},
+        {"effective_max_jerk_rad_s3", CanonicalNullableNumber(authored_jerk)},
+        {"effective_max_velocity_rad_s", CanonicalValue(effective_velocity)},
         {"model_max_acceleration_rad_s2",
          CanonicalNullableNumber(model_acceleration)},
         {"model_max_velocity_rad_s",
@@ -5649,17 +5703,17 @@ CanonicalNullableText(const std::optional<std::string> &value) {
     });
   }
   for (const auto &authored : direct_control_joint_limits) {
-    if (authored.controllable_component_id != motion.controllable_component_id ||
+    if (authored.controllable_component_id !=
+            motion.controllable_component_id ||
         authored.command_target_id != motion.command_target_id) {
       continue;
     }
-    Require(std::any_of(
-                motion.resources.begin(), motion.resources.end(),
-                [&](const auto &resource) {
-                  return resource.source_joint_name.has_value() &&
-                         *resource.source_joint_name ==
-                             authored.source_joint_name;
-                }),
+    Require(std::any_of(motion.resources.begin(), motion.resources.end(),
+                        [&](const auto &resource) {
+                          return resource.source_joint_name.has_value() &&
+                                 *resource.source_joint_name ==
+                                     authored.source_joint_name;
+                        }),
             "direct-control joint limit names an unknown source joint");
   }
   CanonicalValue motion_descriptor(CanonicalValue::Object{
@@ -5824,22 +5878,21 @@ CanonicalNullableText(const std::optional<std::string> &value) {
     Require(gripper_model_instance_id.has_value() &&
                 source_group_name.has_value(),
             "authored gripper configuration has no exact retained model group");
-    Require(named_presets.contains(authored_configuration->open_state_ref) &&
-                named_presets.contains(
-                    authored_configuration->closed_state_ref),
-            "authored gripper state reference is not a retained SRDF preset");
+    Require(
+        named_presets.contains(authored_configuration->open_state_ref) &&
+            named_presets.contains(authored_configuration->closed_state_ref),
+        "authored gripper state reference is not a retained SRDF preset");
     const auto require_source_link = [&](const std::string &source_name,
                                          const std::string_view field) {
       Require(
-          std::count_if(
-              model_map.symbols().begin(), model_map.symbols().end(),
-              [&](const auto &symbol) {
-                return symbol.source.model_instance_id ==
-                           *gripper_model_instance_id &&
-                       symbol.source.kind ==
-                           deployment::OccurrenceSymbolKind::kLink &&
-                       symbol.source.source_name == source_name;
-              }) == 1,
+          std::count_if(model_map.symbols().begin(), model_map.symbols().end(),
+                        [&](const auto &symbol) {
+                          return symbol.source.model_instance_id ==
+                                     *gripper_model_instance_id &&
+                                 symbol.source.kind ==
+                                     deployment::OccurrenceSymbolKind::kLink &&
+                                 symbol.source.source_name == source_name;
+                        }) == 1,
           "authored gripper " + std::string(field) +
               " is not one exact retained source link");
     };
@@ -5887,8 +5940,8 @@ CanonicalNullableText(const std::optional<std::string> &value) {
   std::optional<std::string> control_interface_contract_id;
   if (gripper.control_path.has_value()) {
     state_authority_id = gripper.control_path->state_authority_id.value();
-    state_authority_class =
-        std::string(core::to_string(gripper.control_path->state_authority_class));
+    state_authority_class = std::string(
+        core::to_string(gripper.control_path->state_authority_class));
     control_interface_contract_id =
         gripper.control_path->control_interface_contract_id.value();
   }
@@ -6505,22 +6558,23 @@ BuildProductComposition(CompositionBuildInput input) {
 #endif
   std::optional<double> deployment_motion_target_limit;
 #if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
-  const auto motion_limit = std::find_if(
-      retained_runtime_configuration.motion_target_limits.begin(),
-      retained_runtime_configuration.motion_target_limits.end(),
-      [&](const auto &candidate) {
-        return candidate.controllable_component_id ==
-                   direct_control_motion_binding.value()
-                       .value()
-                       .controllable_component_id &&
-               candidate.command_target_id ==
-                   direct_control_motion_binding.value().value().command_target_id;
-      });
+  const auto motion_limit =
+      std::find_if(retained_runtime_configuration.motion_target_limits.begin(),
+                   retained_runtime_configuration.motion_target_limits.end(),
+                   [&](const auto &candidate) {
+                     return candidate.controllable_component_id ==
+                                direct_control_motion_binding.value()
+                                    .value()
+                                    .controllable_component_id &&
+                            candidate.command_target_id ==
+                                direct_control_motion_binding.value()
+                                    .value()
+                                    .command_target_id;
+                   });
   Require(motion_limit !=
               retained_runtime_configuration.motion_target_limits.end(),
           "native Deployment has no limit for the exact motion target");
-  deployment_motion_target_limit =
-      motion_limit->maximum_tcp_linear_speed_mps;
+  deployment_motion_target_limit = motion_limit->maximum_tcp_linear_speed_mps;
 #endif
   Require(retained_runtime_configuration.initial_joint_positions_rad.size() ==
               direct_control_motion_binding.value().value().resources.size(),
@@ -8966,9 +9020,8 @@ public:
   int Run(const std::stop_token stop_token = {}) {
     std::jthread control_thread(
         [this](std::stop_token stop_token) { RunControlLane(stop_token); });
-    std::jthread observation_thread([this](std::stop_token stop_token) {
-      RunObservationLane(stop_token);
-    });
+    std::jthread observation_thread(
+        [this](std::stop_token stop_token) { RunObservationLane(stop_token); });
     std::jthread reconciliation_thread([this](std::stop_token stop_token) {
       RunReconciliationLane(stop_token);
     });
@@ -9667,11 +9720,25 @@ private:
     });
   }
 
-  [[nodiscard]] CanonicalValue
-  ObservationResponse(Composition &composition) const {
+  struct ObservationProjection final {
+    CanonicalValue response;
+    std::shared_ptr<RetainedObservedStateChannel> channel;
+    std::string source_epoch;
+    std::uint64_t source_sequence{};
+    std::uint64_t change_generation{};
+  };
+
+  [[nodiscard]] ObservationProjection
+  BuildObservationProjection(Composition &composition) const {
+    auto channel = composition.runtime->motion_state_channel;
+    Require(channel != nullptr,
+            "selected motion observation has no retained state channel");
+    // Read the wake generation before the snapshot. A publication between
+    // these two reads is either visible in the snapshot or makes the later
+    // wait predicate immediately true, so a change cannot be missed.
+    const auto change_generation = channel->render_change_generation();
     const auto observed =
-        composition.runtime->motion_state_channel->current_state(
-            composition.runtime->clock->now());
+        channel->current_state(composition.runtime->clock->now());
     if (!observed.ok()) {
       Fail("selected motion observation is unavailable: " +
            observed.error().message);
@@ -9705,7 +9772,7 @@ private:
       positions_rad.emplace_back(position->value_rad);
     }
     const auto &bundle = *composition.bundle;
-    return CanonicalValue(CanonicalValue::Object{
+    auto response = CanonicalValue(CanonicalValue::Object{
         {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
         {"command", CanonicalValue("observation")},
         {"observation",
@@ -9734,6 +9801,77 @@ private:
          })},
         {"ok", CanonicalValue(true)},
     });
+    return ObservationProjection{std::move(response), std::move(channel),
+                                 state.source_epoch.value(), state.sequence,
+                                 change_generation};
+  }
+
+  [[nodiscard]] CanonicalValue
+  ObservationResponse(Composition &composition) const {
+    return BuildObservationProjection(composition).response;
+  }
+
+  [[nodiscard]] CanonicalValue
+  ObservationResponseAfter(const Command &command, const int client_fd,
+                           const std::stop_token stop_token) const {
+    while (!stop_token.stop_requested()) {
+      std::optional<ObservationProjection> projection;
+      {
+        // Keep the composition alive only while taking one immutable current
+        // projection. Waiting never holds the Manager reconfiguration fence.
+        std::shared_lock composition_lock(composition_access_.mutex);
+        if (composition_access_.current == nullptr) {
+          return ErrorResponse(
+              "execution_owner_not_ready",
+              "the managed execution owner has no active physical product",
+              {{"owner_epoch", owner_epoch_.value()}});
+        }
+        projection.emplace(
+            BuildObservationProjection(*composition_access_.current));
+      }
+      auto current = std::move(*projection);
+      if (!command.observation_after_owner_epoch.has_value() ||
+          command.observation_after_owner_epoch->value() !=
+              owner_epoch_.value() ||
+          *command.observation_after_source_epoch != current.source_epoch ||
+          *command.observation_after_source_sequence <
+              current.source_sequence) {
+        return std::move(current.response);
+      }
+      if (*command.observation_after_source_sequence >
+          current.source_sequence) {
+        return ErrorResponse(
+            "execution_observation_cursor_invalid",
+            "the observation cursor is ahead of the current owner source");
+      }
+
+      while (!stop_token.stop_requested() &&
+             !current.channel->wait_for_render_change(
+                 current.change_generation, std::chrono::seconds(1))) {
+        // The bounded wake is only a disconnect/shutdown check. A timeout
+        // performs no owner read, projection, shaping, or encoding; only a
+        // real source-generation change returns to the projection path.
+        pollfd peer{client_fd, 0, 0};
+        int peer_state = -1;
+        do {
+          peer_state = ::poll(&peer, 1, 0);
+        } while (peer_state < 0 && errno == EINTR &&
+                 !stop_token.stop_requested());
+        if (peer_state < 0 ||
+            (peer.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+          Fail("execution observation client disconnected");
+        }
+        if ((peer.revents & POLLIN) != 0) {
+          char byte{};
+          const auto count =
+              ::recv(client_fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+          if (count == 0) {
+            Fail("execution observation client disconnected");
+          }
+        }
+      }
+    }
+    Fail("execution observation source stopped");
   }
 
   [[nodiscard]] CanonicalValue ExecuteStop(const Command &command,
@@ -9843,14 +9981,14 @@ private:
         command.kind == CommandKind::kMalformedStop) {
       return ExecuteStop(command, composition);
     }
-    const bool read_only = command.kind == CommandKind::kObservation ||
-                           command.kind == CommandKind::kGetStopFault ||
-                           command.kind == CommandKind::kRead ||
-                           command.kind == CommandKind::kReadStop ||
-                           command.kind == CommandKind::kGetOperationRecovery ||
-                           command.kind ==
-                               CommandKind::kGetRuntimeScaleControl ||
-                           command.kind == CommandKind::kReadPickPlaceSequence;
+    const bool read_only =
+        command.kind == CommandKind::kObservation ||
+        command.kind == CommandKind::kGetStopFault ||
+        command.kind == CommandKind::kRead ||
+        command.kind == CommandKind::kReadStop ||
+        command.kind == CommandKind::kGetOperationRecovery ||
+        command.kind == CommandKind::kGetRuntimeScaleControl ||
+        command.kind == CommandKind::kReadPickPlaceSequence;
     const auto liveness_command =
         read_only
             ? component_manager::detail::ManagerLivenessCommandClass::kReadOnly
@@ -10016,9 +10154,9 @@ private:
       const auto preview_lease_id = core::ProjectionLeaseId{
           "motion-preview." +
           preview_intent.request_context.request_id.value()};
-      auto inventory = composition.runtime->collision_publisher
-                           ->retain_scene_snapshot_lease_inventory(
-                               preview_lease_id);
+      auto inventory =
+          composition.runtime->collision_publisher
+              ->retain_scene_snapshot_lease_inventory(preview_lease_id);
       if (!inventory.has_value()) {
         return ErrorResponse(
             "motion_preview_projection_unavailable",
@@ -10242,6 +10380,26 @@ private:
           {"result", RecoveryActionResultValue(result.value())},
       });
     }
+    if (command.kind == CommandKind::kReleaseProgramRunStopFence) {
+      const auto result =
+          composition.runtime->addressed_kernel
+              ->release_program_run_stop_fence(*command.program_run_id,
+                                               *command.stop_id,
+                                               *command.stop_generation);
+      if (!result.ok()) {
+        return CanonicalValue(CanonicalValue::Object{
+            {"api_version",
+             CanonicalValue(std::string(kResponseApiVersion))},
+            {"error", ErrorValue(result.error())},
+            {"ok", CanonicalValue(false)},
+        });
+      }
+      return CanonicalValue(CanonicalValue::Object{
+          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+          {"command", CanonicalValue("release_program_run_stop_fence")},
+          {"ok", CanonicalValue(true)},
+      });
+    }
     const auto control_result =
         [&]() -> core::Result<core::OperationControlAcceptedDTO> {
       switch (command.kind) {
@@ -10269,6 +10427,7 @@ private:
       case CommandKind::kApplyOperationRecovery:
       case CommandKind::kStop:
       case CommandKind::kStopProgramRun:
+      case CommandKind::kReleaseProgramRunStopFence:
       case CommandKind::kFullStop:
       case CommandKind::kMalformedStop:
       case CommandKind::kGetStopFault:
@@ -10409,13 +10568,14 @@ private:
         return;
       }
       if ((descriptor.revents & POLLIN) != 0) {
-        HandleOneClient(observation_socket_, CommandLane::kObservation);
+        HandleOneClient(observation_socket_, CommandLane::kObservation,
+                        stop_token);
       }
     }
   }
 
-  void HandleOneClient(const CommandSocket &socket,
-                       const CommandLane lane) noexcept {
+  void HandleOneClient(const CommandSocket &socket, const CommandLane lane,
+                       const std::stop_token stop_token = {}) noexcept {
     try {
       FileDescriptor client(::accept4(socket.get(), nullptr, nullptr,
                                       SOCK_CLOEXEC | SOCK_NONBLOCK));
@@ -10431,124 +10591,145 @@ private:
                            &peer_size) == 0 &&
                   peer_size == sizeof(peer) && peer.uid == ::geteuid(),
               "execution command client is not the same user");
-      pollfd inbound{client.get(), POLLIN, 0};
-      int packet_ready = -1;
-      do {
-        packet_ready = ::poll(&inbound, 1, kClientPacketDeadlineMilliseconds);
-      } while (packet_ready < 0 && errno == EINTR);
-      Require(packet_ready > 0 && (inbound.revents & POLLIN) != 0,
-              "execution command client did not send a packet in time");
-      std::array<char, kMaximumPacketBytes> buffer{};
-      iovec vector{buffer.data(), buffer.size()};
-      msghdr message{};
-      message.msg_iov = &vector;
-      message.msg_iovlen = 1U;
-      ssize_t count = -1;
-      do {
-        count = ::recvmsg(client.get(), &message, 0);
-      } while (count < 0 && errno == EINTR);
-      CanonicalValue response;
-      std::optional<std::string> cell_admission_command;
-      if (count <= 0 || (message.msg_flags & MSG_TRUNC) != 0) {
-        response =
-            ErrorResponse("execution_command_invalid",
-                          "execution command packet is empty or oversized");
-      } else {
-        try {
-          const auto bytes =
-              std::string_view(buffer.data(), static_cast<std::size_t>(count));
-          for (const auto candidate :
-               {"cell_admission_get", "cell_admission_update_readiness",
-                "cell_admission_acquire", "cell_admission_release",
-                "cell_admission_reconcile",
-                "cell_admission_recovery_receipt"}) {
-            if (bytes.find(std::string("\"command\":\"") + candidate + "\"") !=
-                std::string_view::npos) {
-              cell_admission_command = candidate;
-              break;
-            }
-          }
-          const auto cell_admission =
-              detail::TryDecodeCellAdmissionCommand(bytes);
-          std::shared_lock composition_lock(composition_access_.mutex);
-          if (composition_access_.current == nullptr &&
-              !cell_admission.has_value()) {
-            response = ErrorResponse(
-                "execution_owner_not_ready",
-                "the managed execution owner has no active physical product",
-                {{"owner_epoch", owner_epoch_.value()}});
-          } else if (cell_admission.has_value() &&
-                     lane != CommandLane::kOrdinary) {
-            const bool stop_lane = lane == CommandLane::kStop;
-            response = detail::CellAdmissionResponseValue(
-                cell_admission->command,
-                core::ErrorDTO{
-                    stop_lane ? "execution_control_command_unsupported"
-                              : "execution_observation_command_unsupported",
-                    stop_lane
-                        ? "the independent Stop control socket accepts only Stop"
-                        : "the independent observation socket accepts only "
-                          "observation",
-                    {}});
-          } else if (cell_admission.has_value()) {
-            auto *const owner = composition_access_.addressed_kernel;
-            Require(owner != nullptr,
-                    "stable addressed execution Kernel is not installed");
-            response = detail::CellAdmissionResponseValue(
-                cell_admission->command,
-                component_manager::detail::DispatchKernelCellAdmissionRpc(
-                    *owner, *cell_admission));
-          } else {
-            const auto command = DecodeCommand(bytes);
-            if (lane == CommandLane::kObservation &&
-                command.kind != CommandKind::kObservation) {
-              response = ErrorResponse(
-                  "execution_observation_command_unsupported",
-                  "the independent observation socket accepts only "
-                  "observation");
-            } else {
-              response = lane == CommandLane::kStop
-                             ? ExecuteStop(command,
-                                           *composition_access_.current)
-                             : Execute(command, *composition_access_.current);
-            }
-          }
-        } catch (const std::exception &error) {
+      bool first_packet = true;
+      while (!stop_token.stop_requested()) {
+        pollfd inbound{client.get(), POLLIN, 0};
+        int packet_ready = -1;
+        do {
+          packet_ready =
+              ::poll(&inbound, 1,
+                     first_packet ? kClientPacketDeadlineMilliseconds : 1'000);
+        } while (packet_ready < 0 && errno == EINTR);
+        if (lane == CommandLane::kObservation && !first_packet &&
+            packet_ready == 0) {
+          continue;
+        }
+        Require(packet_ready > 0 && (inbound.revents & POLLIN) != 0,
+                "execution command client did not send a packet in time");
+        first_packet = false;
+        std::array<char, kMaximumPacketBytes> buffer{};
+        iovec vector{buffer.data(), buffer.size()};
+        msghdr message{};
+        message.msg_iov = &vector;
+        message.msg_iovlen = 1U;
+        ssize_t count = -1;
+        do {
+          count = ::recvmsg(client.get(), &message, 0);
+        } while (count < 0 && errno == EINTR);
+        CanonicalValue response;
+        std::optional<std::string> cell_admission_command;
+        if (count <= 0 || (message.msg_flags & MSG_TRUNC) != 0) {
           response =
+              ErrorResponse("execution_command_invalid",
+                            "execution command packet is empty or oversized");
+        } else {
+          try {
+            const auto bytes = std::string_view(
+                buffer.data(), static_cast<std::size_t>(count));
+            for (const auto candidate :
+                 {"cell_admission_get", "cell_admission_update_readiness",
+                  "cell_admission_acquire", "cell_admission_release",
+                  "cell_admission_reconcile",
+                  "cell_admission_recovery_receipt"}) {
+              if (bytes.find(std::string("\"command\":\"") + candidate +
+                             "\"") != std::string_view::npos) {
+                cell_admission_command = candidate;
+                break;
+              }
+            }
+            const auto cell_admission =
+                detail::TryDecodeCellAdmissionCommand(bytes);
+            std::shared_lock composition_lock(composition_access_.mutex);
+            if (composition_access_.current == nullptr &&
+                !cell_admission.has_value()) {
+              response = ErrorResponse(
+                  "execution_owner_not_ready",
+                  "the managed execution owner has no active physical product",
+                  {{"owner_epoch", owner_epoch_.value()}});
+            } else if (cell_admission.has_value() &&
+                       lane != CommandLane::kOrdinary) {
+              const bool stop_lane = lane == CommandLane::kStop;
+              response = detail::CellAdmissionResponseValue(
+                  cell_admission->command,
+                  core::ErrorDTO{
+                      stop_lane ? "execution_control_command_unsupported"
+                                : "execution_observation_command_unsupported",
+                      stop_lane
+                          ? "the independent Stop control socket accepts only "
+                            "Stop"
+                          : "the independent observation socket accepts only "
+                            "observation",
+                      {}});
+            } else if (cell_admission.has_value()) {
+              auto *const owner = composition_access_.addressed_kernel;
+              Require(owner != nullptr,
+                      "stable addressed execution Kernel is not installed");
+              response = detail::CellAdmissionResponseValue(
+                  cell_admission->command,
+                  component_manager::detail::DispatchKernelCellAdmissionRpc(
+                      *owner, *cell_admission));
+            } else {
+              const auto command = DecodeCommand(bytes);
+              if (lane == CommandLane::kObservation &&
+                  command.kind != CommandKind::kObservation) {
+                response = ErrorResponse(
+                    "execution_observation_command_unsupported",
+                    "the independent observation socket accepts only "
+                    "observation");
+              } else {
+                if (lane == CommandLane::kObservation &&
+                    command.observation_cursor_supplied) {
+                  composition_lock.unlock();
+                  response = ObservationResponseAfter(command, client.get(),
+                                                      stop_token);
+                } else {
+                  response =
+                      lane == CommandLane::kStop
+                          ? ExecuteStop(command, *composition_access_.current)
+                          : Execute(command, *composition_access_.current);
+                }
+              }
+            }
+          } catch (const std::exception &error) {
+            response =
+                cell_admission_command.has_value()
+                    ? detail::CellAdmissionResponseValue(
+                          *cell_admission_command,
+                          core::ErrorDTO{
+                              "execution_command_invalid", error.what(), {}})
+                    : ErrorResponse("execution_command_invalid", error.what());
+          }
+        }
+        auto bytes = content_identity::canonical_json(response);
+        if (bytes.empty() || bytes.size() > kMaximumResponseBytes) {
+          const core::ErrorDTO error{
+              "execution_command_response_oversized",
+              "execution owner result exceeds the bounded private transport",
+              {}};
+          bytes = content_identity::canonical_json(
               cell_admission_command.has_value()
-                  ? detail::CellAdmissionResponseValue(
-                        *cell_admission_command,
-                        core::ErrorDTO{
-                            "execution_command_invalid", error.what(), {}})
-                  : ErrorResponse("execution_command_invalid", error.what());
+                  ? detail::CellAdmissionResponseValue(*cell_admission_command,
+                                                       error)
+                  : ErrorResponse(error.code, error.message));
+        }
+        pollfd outbound{client.get(), POLLOUT, 0};
+        int response_ready = -1;
+        do {
+          response_ready =
+              ::poll(&outbound, 1, kClientPacketDeadlineMilliseconds);
+        } while (response_ready < 0 && errno == EINTR);
+        Require(response_ready > 0 && (outbound.revents & POLLOUT) != 0,
+                "execution command client did not accept a response in time");
+        ssize_t sent = -1;
+        do {
+          sent = ::send(client.get(), bytes.data(), bytes.size(), MSG_NOSIGNAL);
+        } while (sent < 0 && errno == EINTR);
+        Require(sent == static_cast<ssize_t>(bytes.size()),
+                "execution command response was not sent atomically");
+        if (lane != CommandLane::kObservation) {
+          return;
         }
       }
-      auto bytes = content_identity::canonical_json(response);
-      if (bytes.empty() || bytes.size() > kMaximumResponseBytes) {
-        const core::ErrorDTO error{
-            "execution_command_response_oversized",
-            "execution owner result exceeds the bounded private transport",
-            {}};
-        bytes = content_identity::canonical_json(
-            cell_admission_command.has_value()
-                ? detail::CellAdmissionResponseValue(*cell_admission_command,
-                                                     error)
-                : ErrorResponse(error.code, error.message));
-      }
-      pollfd outbound{client.get(), POLLOUT, 0};
-      int response_ready = -1;
-      do {
-        response_ready =
-            ::poll(&outbound, 1, kClientPacketDeadlineMilliseconds);
-      } while (response_ready < 0 && errno == EINTR);
-      Require(response_ready > 0 && (outbound.revents & POLLOUT) != 0,
-              "execution command client did not accept a response in time");
-      ssize_t sent = -1;
-      do {
-        sent = ::send(client.get(), bytes.data(), bytes.size(), MSG_NOSIGNAL);
-      } while (sent < 0 && errno == EINTR);
-      Require(sent == static_cast<ssize_t>(bytes.size()),
-              "execution command response was not sent atomically");
     } catch (...) {
       // A malformed/disappearing private client cannot retire the sole owner.
     }

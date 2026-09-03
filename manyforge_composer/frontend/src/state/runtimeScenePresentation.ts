@@ -41,6 +41,9 @@ export interface MeasuredRobotPresentation {
 export interface MeasuredRobotPresentationReader {
   readMeasuredRobotPresentation: () => MeasuredRobotPresentation | null;
   subscribeMeasuredRobotPresentation: (listener: () => void) => () => void;
+  markMeasuredRobotPresentationApplied: (
+    presentation: MeasuredRobotPresentation,
+  ) => void;
 }
 
 export interface MeasuredPosePresentation {
@@ -265,6 +268,15 @@ export function createExecutionRobotPresentationReader(
       return cachedPresentation;
     },
     subscribeMeasuredRobotPresentation: reader.subscribeExecutionObservation,
+    markMeasuredRobotPresentationApplied: (presentation) => {
+      if (
+        cachedFrame !== null
+        && cachedFrame !== undefined
+        && cachedPresentation === presentation
+      ) {
+        reader.markExecutionObservationApplied(cachedFrame);
+      }
+    },
   };
 }
 

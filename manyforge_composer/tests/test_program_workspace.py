@@ -16,6 +16,9 @@ from manyforge_behavior.program import Program
 from manyforge_composer.backend import program_artifacts
 from manyforge_composer.backend.app import create_app
 from manyforge_composer.backend.draft_session import DraftSessionError
+from manyforge_composer.backend.execution_observation_stream import (
+    ExecutionObservationSource,
+)
 from manyforge_composer.backend.program_artifacts import (
     ProgramArtifactError,
     load_program_artifact,
@@ -166,6 +169,9 @@ def test_observed_move_reads_one_exact_source_snapshot_under_the_claim(
     program = Program(_SOURCE_PROGRAM, build_node_environment().catalog)
     state = _enable_authoring(ComposerState(program=program))
     state.headless_client = Headless()  # type: ignore[assignment]
+    state.execution_observation_source = ExecutionObservationSource(
+        state.headless_client  # type: ignore[arg-type]
+    )
     workspace = state.draft_session.workspace_snapshot()
     client = TestClient(
         create_app(
@@ -218,6 +224,9 @@ def test_observed_move_is_one_revision_fenced_draft_mutation(tmp_path: Path) -> 
     program = Program(_SOURCE_PROGRAM, build_node_environment().catalog)
     state = _enable_authoring(ComposerState(program=program))
     state.headless_client = Headless()  # type: ignore[assignment]
+    state.execution_observation_source = ExecutionObservationSource(
+        state.headless_client  # type: ignore[arg-type]
+    )
     workspace = state.draft_session.workspace_snapshot()
     client = TestClient(
         create_app(

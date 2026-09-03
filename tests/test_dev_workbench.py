@@ -188,6 +188,66 @@ def test_scenario_load_rejects_a_stale_workspace_deployment(
         )
 
 
+def test_scenario_load_rejects_a_stale_workspace_node_environment(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    manifest = tmp_path / "node_environment_manifest.yaml"
+    manifest.write_text(
+        '{"catalog":{"catalog_digest":"sha256:'
+        + ("1" * 64)
+        + '","catalog_id":"manyforge_builtin","content_version":"1.1.0"},'
+        '"environment_digest":"sha256:'
+        + ("2" * 64)
+        + '"}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(dev_workbench, "NODE_ENVIRONMENT_MANIFEST", manifest)
+
+    with pytest.raises(
+        dev_workbench.WorkbenchError,
+        match="package is stale relative to its workspace node environment",
+    ):
+        dev_workbench._require_current_workspace_node_environment(
+            {
+                "node_environment": {
+                    "catalog_digest": "sha256:" + ("1" * 64),
+                    "catalog_id": "manyforge_builtin",
+                    "content_version": "1.1.0",
+                    "environment_digest": "sha256:" + ("3" * 64),
+                }
+            }
+        )
+
+
+def test_scenario_load_accepts_the_exact_workspace_node_environment(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    manifest = tmp_path / "node_environment_manifest.yaml"
+    expected = {
+        "catalog_digest": "sha256:" + ("1" * 64),
+        "catalog_id": "manyforge_builtin",
+        "content_version": "1.1.0",
+        "environment_digest": "sha256:" + ("2" * 64),
+    }
+    manifest.write_text(
+        '{"catalog":{"catalog_digest":"'
+        + expected["catalog_digest"]
+        + '","catalog_id":"manyforge_builtin","content_version":"1.1.0"},'
+        '"environment_digest":"'
+        + expected["environment_digest"]
+        + '"}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(dev_workbench, "NODE_ENVIRONMENT_MANIFEST", manifest)
+
+    assert (
+        dev_workbench._require_current_workspace_node_environment(
+            {"node_environment": expected}
+        )
+        == manifest
+    )
+
+
 def test_backend_build_uses_current_source_and_only_production_targets(
     monkeypatch: Any, tmp_path: Path
 ) -> None:

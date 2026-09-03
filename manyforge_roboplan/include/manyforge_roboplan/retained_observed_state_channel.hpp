@@ -2,13 +2,13 @@
 
 #include <atomic>
 #include <chrono>
-#include <cstdint>
 #include <condition_variable>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <span>
-#include <string>
 #include <stop_token>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -26,8 +26,7 @@ struct RetainedObservedStateChannelConfig final {
 
   RetainedObservedStateChannelConfig(
       core::ObservedStateSourceKind selected_source_kind,
-      std::string selected_source_id,
-      std::int64_t selected_freshness_budget_ns,
+      std::string selected_source_id, std::int64_t selected_freshness_budget_ns,
       std::uint64_t selected_authority_generation,
       std::vector<core::ObservedRobotStateSourceConfig>
           selected_source_precedence = {})
@@ -72,9 +71,9 @@ public:
   /// not wait past deadline_ns or rely on worker abandonment.
   [[nodiscard]] virtual RetainedStateProjectionResult publish_state_bounded(
       std::span<const double> positions_si,
-      std::span<const double> velocities_si,
-      std::int64_t source_timestamp_ns, std::int64_t received_timestamp_ns,
-      std::int64_t deadline_ns, std::stop_token cancellation) {
+      std::span<const double> velocities_si, std::int64_t source_timestamp_ns,
+      std::int64_t received_timestamp_ns, std::int64_t deadline_ns,
+      std::stop_token cancellation) {
     if (cancellation.stop_requested() ||
         (deadline_ns >= 0 && received_timestamp_ns >= deadline_ns)) {
       return {RetainedStateProjectionStatus::kFailed,
@@ -83,19 +82,22 @@ public:
                   cancellation.stop_requested()
                       ? "retained state publication was cancelled"
                       : "retained state publication missed its deadline",
-                  {{"reason", cancellation.stop_requested()
-                                 ? "retained_state_publication_cancelled"
-                                 : "retained_state_publication_deadline_expired"}}}};
+                  {{"reason",
+                    cancellation.stop_requested()
+                        ? "retained_state_publication_cancelled"
+                        : "retained_state_publication_deadline_expired"}}}};
     }
     static_cast<void>(positions_si);
     static_cast<void>(velocities_si);
     static_cast<void>(source_timestamp_ns);
     static_cast<void>(received_timestamp_ns);
-    return {RetainedStateProjectionStatus::kFailed,
-            core::ErrorDTO{
-                "invalid_request", "bounded retained state publication is "
-                                   "not available",
-                {{"reason", "retained_state_bounded_publication_unavailable"}}}};
+    return {
+        RetainedStateProjectionStatus::kFailed,
+        core::ErrorDTO{
+            "invalid_request",
+            "bounded retained state publication is "
+            "not available",
+            {{"reason", "retained_state_bounded_publication_unavailable"}}}};
   }
   [[nodiscard]] virtual RetainedStateProjectionResult
   project_latest(std::int64_t now_ns, RetainedStateProjectionMode mode) = 0;
@@ -110,21 +112,20 @@ public:
                         std::stop_token cancellation) const {
     if (cancellation.stop_requested() ||
         (deadline_ns >= 0 && now_ns >= deadline_ns)) {
-      return core::Result<core::ObservedStateSnapshotDTO>::Err(
-          core::ErrorDTO{
-              "invalid_request",
-              cancellation.stop_requested()
-                  ? "retained state read was cancelled"
-                  : "retained state read missed its deadline",
-              {{"reason", cancellation.stop_requested()
-                             ? "retained_state_read_cancelled"
-                             : "retained_state_read_deadline_expired"}}});
+      return core::Result<core::ObservedStateSnapshotDTO>::Err(core::ErrorDTO{
+          "invalid_request",
+          cancellation.stop_requested()
+              ? "retained state read was cancelled"
+              : "retained state read missed its deadline",
+          {{"reason", cancellation.stop_requested()
+                          ? "retained_state_read_cancelled"
+                          : "retained_state_read_deadline_expired"}}});
     }
     static_cast<void>(now_ns);
-    return core::Result<core::ObservedStateSnapshotDTO>::Err(
-        core::ErrorDTO{
-            "invalid_request", "bounded retained state read is not available",
-            {{"reason", "retained_state_bounded_read_unavailable"}}});
+    return core::Result<core::ObservedStateSnapshotDTO>::Err(core::ErrorDTO{
+        "invalid_request",
+        "bounded retained state read is not available",
+        {{"reason", "retained_state_bounded_read_unavailable"}}});
   }
   [[nodiscard]] virtual core::Result<core::ControlledStateDTO>
   current_controlled_state() const = 0;
@@ -134,8 +135,26 @@ public:
   addressed_publication() const noexcept = 0;
   /// Wait for a source-owned sample after a route rebind. The default keeps
   /// older focused sources fail-closed rather than fabricating freshness.
-  [[nodiscard]] virtual bool wait_for_fresh_state(
-      std::chrono::nanoseconds timeout) const {
+  [[nodiscard]] virtual bool
+  wait_for_fresh_state(std::chrono::nanoseconds timeout) const {
+    static_cast<void>(timeout);
+    return false;
+  }
+  /// Monotonic, process-local wake identity for render-only latest-state
+  /// consumers. Repeated freshness samples at identical coordinates do not
+  /// advance it. It is not a robot-state sequence or a durable cursor.
+  [[nodiscard]] virtual std::uint64_t
+  render_change_generation() const noexcept {
+    return 0U;
+  }
+  /// Wait until visible coordinates or their route advance beyond
+  /// ``after_generation``.
+  /// Implementations perform no state read, projection, encoding, or fanout
+  /// while waiting.  The default keeps focused fake channels non-blocking.
+  [[nodiscard]] virtual bool
+  wait_for_render_change(std::uint64_t after_generation,
+                         std::chrono::nanoseconds timeout) const {
+    static_cast<void>(after_generation);
     static_cast<void>(timeout);
     return false;
   }
@@ -147,8 +166,7 @@ public:
   RetainedObservedStateChannel(
       core::RuntimeParticipantBinding binding,
       std::shared_ptr<RetainedKinematicStateProjector> projector,
-      RetainedObservedStateChannelConfig config,
-      core::IClock *clock = nullptr);
+      RetainedObservedStateChannelConfig config, core::IClock *clock = nullptr);
 
   RetainedObservedStateChannel(const RetainedObservedStateChannel &) = delete;
   RetainedObservedStateChannel &
@@ -187,18 +205,17 @@ public:
   /// this path also clears the channel's route-freshness gate and wakes
   /// bounded recovery readers.
   [[nodiscard]] core::ObservedRobotStatePublishResult
-  publish_adapter_state(
-      core::ObservedRobotStateSourceKind source,
-      std::span<const std::string> source_joint_names,
-      std::span<const double> positions_si,
-      std::span<const double> velocities_si,
-      std::int64_t source_timestamp_ns,
-      std::int64_t received_timestamp_ns);
+  publish_adapter_state(core::ObservedRobotStateSourceKind source,
+                        std::span<const std::string> source_joint_names,
+                        std::span<const double> positions_si,
+                        std::span<const double> velocities_si,
+                        std::int64_t source_timestamp_ns,
+                        std::int64_t received_timestamp_ns);
   [[nodiscard]] RetainedStateProjectionResult publish_state_bounded(
       std::span<const double> positions_si,
-      std::span<const double> velocities_si,
-      std::int64_t source_timestamp_ns, std::int64_t received_timestamp_ns,
-      std::int64_t deadline_ns, std::stop_token cancellation) override;
+      std::span<const double> velocities_si, std::int64_t source_timestamp_ns,
+      std::int64_t received_timestamp_ns, std::int64_t deadline_ns,
+      std::stop_token cancellation) override;
   [[nodiscard]] RetainedStateProjectionResult
   project_latest(std::int64_t now_ns,
                  RetainedStateProjectionMode mode) override;
@@ -210,8 +227,15 @@ public:
                         std::stop_token cancellation) const override;
   [[nodiscard]] core::Result<core::ControlledStateDTO>
   current_controlled_state() const override;
-  [[nodiscard]] bool wait_for_fresh_state(
-      std::chrono::nanoseconds timeout) const override;
+  [[nodiscard]] bool
+  wait_for_fresh_state(std::chrono::nanoseconds timeout) const override;
+  [[nodiscard]] std::uint64_t
+  render_change_generation() const noexcept override {
+    return render_change_generation_.load(std::memory_order_acquire);
+  }
+  [[nodiscard]] bool
+  wait_for_render_change(std::uint64_t after_generation,
+                         std::chrono::nanoseconds timeout) const override;
 
   [[nodiscard]] const core::RuntimeParticipantBinding &
   binding() const noexcept {
@@ -255,9 +279,16 @@ private:
   mutable std::condition_variable fresh_state_cv_;
   std::atomic<bool> fresh_state_required_{};
   std::atomic<std::uint64_t> fresh_sample_generation_{};
+  std::atomic<std::uint64_t> render_change_generation_{};
+  std::vector<double> last_render_positions_;
+  bool render_positions_valid_{};
   std::vector<std::unique_ptr<const core::RuntimeParticipantBinding>>
       retained_route_bindings_;
   std::atomic<const core::RuntimeParticipantBinding *> current_binding_;
+
+  void record_render_positions(std::span<const std::string> source_joint_names,
+                               std::span<const double> positions_si);
+  void notify_render_change() noexcept;
 };
 
 } // namespace manyforge::roboplan_backend

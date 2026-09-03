@@ -384,6 +384,7 @@ describe('runtime scene presentation', () => {
     const reader = createExecutionRobotPresentationReader({
       getLatestExecutionObservation: () => { reads += 1; return frame; },
       subscribeExecutionObservation: () => () => undefined,
+      markExecutionObservationApplied: () => undefined,
     }, sourceModel(), manifest(), motionDescriptor());
     const first = reader.readMeasuredRobotPresentation();
     const second = reader.readMeasuredRobotPresentation();

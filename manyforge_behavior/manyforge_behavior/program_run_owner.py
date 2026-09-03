@@ -316,6 +316,7 @@ class _RunEntry:
     state_after_finalize_message: str = ""
     resources_released: bool = False
     transition_lock: RLock = field(default_factory=RLock, repr=False)
+    motion_stop_lock: RLock = field(default_factory=RLock, repr=False)
 
 
 class ProgramRunOwner:
@@ -454,7 +455,12 @@ class ProgramRunOwner:
                 entry.revision += 1
                 return self._snapshot(entry)
 
-    def start(self, admission: ProgramRunAdmission) -> ProgramRunSnapshot:
+    def start(
+        self,
+        admission: ProgramRunAdmission,
+        *,
+        program_run_id: str | None = None,
+    ) -> ProgramRunSnapshot:
         if not isinstance(admission, ProgramRunAdmission):
             raise TypeError("start requires one exact Program-run admission")
         with self._lock:
@@ -463,16 +469,20 @@ class ProgramRunOwner:
                 >= self._maximum_retained_runs
             ):
                 raise ProgramRunOwnerError("Program-run retention is full")
-            program_run_id = _text(
-                self._run_id_factory(),
+            admitted_program_run_id = _text(
+                (
+                    self._run_id_factory()
+                    if program_run_id is None
+                    else program_run_id
+                ),
                 field="program_run_id",
             )
             if (
-                program_run_id in self._runs
-                or program_run_id in self._starting_run_ids
+                admitted_program_run_id in self._runs
+                or admitted_program_run_id in self._starting_run_ids
             ):
                 raise ProgramRunOwnerError("Program-run identity was reused")
-            self._starting_run_ids.add(program_run_id)
+            self._starting_run_ids.add(admitted_program_run_id)
         owner_identities = tuple(
             sorted(
                 (
@@ -487,7 +497,7 @@ class ProgramRunOwner:
             )
         )
         capture = ProgramRunCapture(
-            program_run_id=program_run_id,
+            program_run_id=admitted_program_run_id,
             applied_record_digest=admission.applied_record_digest,
             scenario_id=admission.scenario_id,
             scenario_catalog_revision=admission.scenario_catalog_revision,
@@ -518,19 +528,19 @@ class ProgramRunOwner:
                 )
                 entry = _RunEntry(run=run, node_statuses=run.node_statuses)
                 with self._lock:
-                    if program_run_id in self._runs:
+                    if admitted_program_run_id in self._runs:
                         raise ProgramRunOwnerError(
                             "Program-run identity was reused"
                         )
-                    self._runs[program_run_id] = entry
+                    self._runs[admitted_program_run_id] = entry
                     return self._snapshot(entry)
             except Exception:
                 if context_bound and context_port is not None:
-                    context_port.unbind(program_run_id)
+                    context_port.unbind(admitted_program_run_id)
                 raise
         finally:
             with self._lock:
-                self._starting_run_ids.discard(program_run_id)
+                self._starting_run_ids.discard(admitted_program_run_id)
 
     def read(self, program_run_id: str) -> ProgramRunSnapshot:
         """Return the current owner projection without advancing lifecycle."""
@@ -1040,7 +1050,9 @@ class ProgramRunOwner:
         The Kernel scope already owns the exact operation identities.  Keeping
         this command here avoids exposing those identities to the browser and
         lets the normal tree tick turn the interrupted node into the authored
-        operator-Stop intervention.
+        operator-Stop intervention. If Stop lands between operations, preserve
+        the existing tree at that boundary instead; otherwise a successful
+        empty-scope Stop could be followed by a newly submitted operation.
         """
 
         if reason is not None:
@@ -1048,17 +1060,21 @@ class ProgramRunOwner:
         with self._lock:
             entry = self._entry(program_run_id)
             transition_lock = entry.transition_lock
-        with transition_lock:
+            motion_stop_lock = entry.motion_stop_lock
+        with motion_stop_lock:
             with self._lock:
                 entry = self._entry(program_run_id)
                 if entry.state is not ProgramRunState.RUNNING:
                     raise ProgramRunOwnerError(
                         "motion Stop requires a running Program"
                     )
+            stop_identity = (
+                stop_request_id or f"owner-motion-stop:{uuid4().hex}"
+            )
             try:
                 scope_snapshot = self._scope.request_stop(
                     program_run_id,
-                    stop_request_id or f"owner-motion-stop:{uuid4().hex}",
+                    stop_identity,
                     reason,
                 )
                 active_count, _settled, scope_reason = self._scope_fields(
@@ -1080,8 +1096,24 @@ class ProgramRunOwner:
                         "Program state changed while motion Stop was applied"
                     )
                 entry.active_operation_count = active_count
+                if active_count == 0:
+                    # The Kernel fence now owns the boundary. A first Execute
+                    # still crossing the ordinary lane will be rejected there;
+                    # the Program thread never needs to join that lane before
+                    # acknowledging Stop.
+                    entry.state = ProgramRunState.FULL_STOPPING
+                    entry.stop_requested = True
+                    entry.reason_code = None
+                    entry.message = ""
                 entry.revision += 1
-                return self._snapshot(entry)
+                preserve_boundary = entry.state is ProgramRunState.FULL_STOPPING
+                snapshot = self._snapshot(entry)
+            if not preserve_boundary or not transition_lock.acquire(blocking=False):
+                return snapshot
+            try:
+                return self._complete_full_stop(program_run_id)
+            finally:
+                transition_lock.release()
 
     def _complete_full_stop(self, program_run_id: str) -> ProgramRunSnapshot:
         """Freeze a physically settled run without invalidating its tree."""

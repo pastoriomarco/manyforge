@@ -21,7 +21,12 @@ from manyforge_behavior.node_availability import (
 from manyforge_behavior.node_environment import build_node_environment
 from manyforge_behavior.program import Program
 
-from manyforge_headless_api.app import TrustedPrincipal, _error_status, create_app
+from manyforge_headless_api.app import (
+    TrustedPrincipal,
+    _error_status,
+    _execution_observation_cursor,
+    create_app,
+)
 from manyforge_headless_api.cell_admission import CellAdmissionError
 from manyforge_headless_api.models import (
     ManagerApplyRequest,
@@ -3074,8 +3079,8 @@ def test_openapi_contains_no_condition_mutation_route() -> None:
         "/api/execution/identity",
         "/api/execution/targets",
         "/api/execution/control-state",
-        "/api/execution/observation",
     }.issubset(paths)
+    assert "/api/execution/observation" not in paths
     assert {
         "/api/execution/operations/{operation_id}/pause",
         "/api/execution/operations/{operation_id}/resume",
@@ -3112,6 +3117,100 @@ def test_execution_diagnostics_is_explicit_and_status_is_only_compatibility() ->
         "command": "status",
         "status": {},
     }
+
+
+def test_execution_observation_websocket_proxies_one_persistent_credited_session() -> None:
+    class ObservationSession:
+        def __init__(self) -> None:
+            self.cursors: list[dict[str, Any] | None] = []
+            self.entered = 0
+            self.closed = False
+
+        def __enter__(self) -> "ObservationSession":
+            self.entered += 1
+            return self
+
+        def next(
+            self,
+            cursor: dict[str, Any] | None,
+            _cancelled: object,
+        ) -> dict[str, Any]:
+            self.cursors.append(copy.deepcopy(cursor))
+            return {
+                "api_version": "manyforge.execution_command_response.v1",
+                "command": "observation",
+                "observation": {
+                    "schema_version": "manyforge.execution_observation.v1",
+                    "source_sequence": len(self.cursors),
+                },
+                "ok": True,
+            }
+
+        def close(self) -> None:
+            self.closed = True
+
+    session = ObservationSession()
+    execution = FakeExecution()
+    execution.open_observation_session = lambda: session  # type: ignore[attr-defined]
+    app = create_app(service=_service(FakeCore(), FakeManager(), execution))
+    first_credit = {
+        "last_applied": None,
+        "schema_version": "manyforge.execution_observation_credit.v1",
+    }
+    applied_cursor = {
+        "owner_epoch": "owner-1",
+        "source_epoch": "source-1",
+        "source_sequence": 1,
+    }
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws/execution/observations") as socket:
+            socket.send_json(first_credit)
+            assert socket.receive_json()["observation"]["source_sequence"] == 1
+            socket.send_json(
+                {
+                    "last_applied": applied_cursor,
+                    "schema_version": (
+                        "manyforge.execution_observation_credit.v1"
+                    ),
+                }
+            )
+            assert socket.receive_json()["observation"]["source_sequence"] == 2
+
+    assert session.entered == 1
+    assert session.cursors == [None, applied_cursor]
+    assert session.closed is True
+
+
+@pytest.mark.parametrize(
+    "credit",
+    [
+        {},
+        {
+            "last_applied": None,
+            "schema_version": "manyforge.execution_observation_credit.v1",
+            "unexpected": True,
+        },
+        {
+            "last_applied": {
+                "owner_epoch": "owner-1",
+                "source_epoch": "source-1",
+                "source_sequence": True,
+            },
+            "schema_version": "manyforge.execution_observation_credit.v1",
+        },
+    ],
+)
+def test_execution_observation_credit_parser_rejects_non_exact_messages(
+    credit: dict[str, Any],
+) -> None:
+    with pytest.raises((RuntimeError, ValueError)):
+        _execution_observation_cursor(json.dumps(credit))
+
+
+def test_execution_observation_credit_parser_rejects_oversized_messages() -> None:
+    with pytest.raises(ValueError, match="oversized"):
+        _execution_observation_cursor(" " * 4_097)
 
 
 def test_motion_preview_is_a_thin_non_effectful_execution_route() -> None:

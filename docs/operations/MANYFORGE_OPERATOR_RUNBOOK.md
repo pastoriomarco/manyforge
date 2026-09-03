@@ -285,7 +285,7 @@ failure reasons. In particular:
 
 The implemented Isaac profile is a laptop-owned outer lifecycle around the
 source-matched Orin runtime. It is intentionally still a live-qualification
-gate. The laptop starts `/home/tndlux/isaac-sim/isaac-sim.sh` headless with
+gate. The laptop starts `${HOME}/isaac-sim/isaac-sim.sh` headless with
 `isaacsim.ros2.bridge` and `isaacsim.ros2.sim_control`; SSH starts the retained
 ROS bridge and native ManyForge operator on Orin. The bridge barrier loads and
 reads back the retained UR10 world, verifies the five
@@ -300,8 +300,8 @@ remote path and digest. The command shape is:
 python3 -m manyforge_operator \
   --state-root "$STATE_ROOT" --instance-id isaac --json \
   start --profile isaac --source-root "$MANYFORGE_ROOT" \
-  --isaac-executable /home/tndlux/isaac-sim/isaac-sim.sh \
-  --world-path /home/tndlux/workspaces/isaac_ros-dev/src/isaac_sim_custom_examples/Scenario/IsaacManipulator/UniversalRobots/isaac_manipulator_scene_light.usda \
+  --isaac-executable "${HOME}/isaac-sim/isaac-sim.sh" \
+  --world-path "${HOME}/workspaces/isaac_ros-dev/src/isaac_sim_custom_examples/Scenario/IsaacManipulator/UniversalRobots/isaac_manipulator_scene_light.usda" \
   --local-ros-setup-script /opt/ros/jazzy/setup.bash \
   --local-ros-environment-script "$MANYFORGE_ROOT/config/ros/isaac_i9.env.sh" \
   --remote-target tndlux@192.168.1.68 \

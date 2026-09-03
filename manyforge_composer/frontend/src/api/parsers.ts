@@ -164,14 +164,15 @@ export function parseProgramCycleStatus(value: unknown): ProgramCycleStatus {
   exactKeysAt(record, [
     'program_runner_owner_epoch', 'cycle_generation', 'state', 'program_run_id',
     'cycle_claim_generation', 'terminal_or_settlement_reference',
-    'runtime_control_revision', 'recovery_offer',
+    'run_revision', 'node_status_revision',
+    'runtime_control_revision', 'recovery_offer', 'run', 'runtime_controls',
   ], 'programCycleStatus');
   const state = stringAt(record.state, 'programCycleStatus.state');
   if (!['idle_after_reset', 'starting', 'running', 'stopping',
     'terminal_awaiting_reset'].includes(state)) {
     return fail('programCycleStatus.state', 'a supported Program cycle state');
   }
-  return {
+  const parsed: ProgramCycleStatus = {
     programRunnerOwnerEpoch: stringAt(
       record.program_runner_owner_epoch,
       'programCycleStatus.program_runner_owner_epoch',
@@ -198,6 +199,15 @@ export function parseProgramCycleStatus(value: unknown): ProgramCycleStatus {
           record.terminal_or_settlement_reference,
           'programCycleStatus.terminal_or_settlement_reference',
         ),
+    runRevision: record.run_revision === null
+      ? null
+      : positiveIntegerAt(record.run_revision, 'programCycleStatus.run_revision'),
+    nodeStatusRevision: record.node_status_revision === null
+      ? null
+      : positiveIntegerAt(
+        record.node_status_revision,
+        'programCycleStatus.node_status_revision',
+      ),
     runtimeControlRevision: record.runtime_control_revision === null
       ? null
       : positiveIntegerAt(
@@ -210,7 +220,44 @@ export function parseProgramCycleStatus(value: unknown): ProgramCycleStatus {
         record.recovery_offer,
         'programCycleStatus.recovery_offer',
       ),
+    run: record.run === null ? null : parseProgramRunStatus(record.run),
+    runtimeControls: record.runtime_controls === null
+      ? null
+      : parseProgramRuntimeControlProjection(record.runtime_controls),
   };
+  if (parsed.run === null) {
+    if (parsed.runRevision !== null || parsed.nodeStatusRevision !== null) {
+      return fail('programCycleStatus.run', 'the advertised run revisions');
+    }
+  } else if (
+    parsed.run.capture.programRunId !== parsed.programRunId
+    || parsed.run.ownerEpoch !== parsed.programRunnerOwnerEpoch
+    || parsed.run.runRevision !== parsed.runRevision
+    || parsed.run.nodeStatusRevision !== parsed.nodeStatusRevision
+  ) {
+    return fail('programCycleStatus.run', 'the exact advertised run projection');
+  }
+  if (parsed.runtimeControls === null) {
+    if (parsed.runtimeControlRevision !== null) {
+      return fail(
+        'programCycleStatus.runtimeControls',
+        'the advertised runtime-control revision',
+      );
+    }
+  } else if (
+    parsed.run === null
+    || parsed.runtimeControls.programRunId !== parsed.programRunId
+    || parsed.runtimeControls.ownerEpoch !== parsed.programRunnerOwnerEpoch
+    || parsed.runtimeControls.runRevision !== parsed.runRevision
+    || parsed.runtimeControls.runtimeControls.runtimeControlRevision
+      !== parsed.runtimeControlRevision
+  ) {
+    return fail(
+      'programCycleStatus.runtimeControls',
+      'the exact advertised runtime-control projection',
+    );
+  }
+  return parsed;
 }
 import type {
   AlarmLifecycleState,
@@ -6404,17 +6451,6 @@ export function parseComposerHeadlessState(
   }
   const admission = objectAt(record.authoring_admission, 'headlessState.authoring_admission');
   exactKeysAt(admission, ['admission_generation', 'authoring_allowed'], 'headlessState.authoring_admission');
-  const cycle = objectAt(record.program_cycle, 'headlessState.program_cycle');
-  exactKeysAt(cycle, [
-    'program_runner_owner_epoch', 'cycle_generation', 'state', 'program_run_id',
-    'cycle_claim_generation', 'terminal_or_settlement_reference',
-    'runtime_control_revision', 'recovery_offer',
-  ], 'headlessState.program_cycle');
-  const cycleState = stringAt(cycle.state, 'headlessState.program_cycle.state');
-  if (!['idle_after_reset', 'starting', 'running', 'stopping',
-    'terminal_awaiting_reset'].includes(cycleState)) {
-    return fail('headlessState.program_cycle.state', 'a supported Program cycle state');
-  }
   const draft = objectAt(record.draft_identity, 'headlessState.draft_identity');
   exactKeysAt(draft, ['draft_id', 'draft_revision'], 'headlessState.draft_identity');
   const complete = booleanAt(record.complete, 'headlessState.complete');
@@ -6432,26 +6468,7 @@ export function parseComposerHeadlessState(
       authoringAllowed: booleanAt(admission.authoring_allowed, 'headlessState.authoring_admission.authoring_allowed'),
       admissionGeneration: positiveIntegerAt(admission.admission_generation, 'headlessState.authoring_admission.admission_generation'),
     },
-    programCycle: {
-      programRunnerOwnerEpoch: stringAt(cycle.program_runner_owner_epoch, 'headlessState.program_cycle.program_runner_owner_epoch'),
-      cycleGeneration: positiveIntegerAt(cycle.cycle_generation, 'headlessState.program_cycle.cycle_generation'),
-      state: cycleState as ComposerHeadlessState['programCycle']['state'],
-      programRunId: nullableStringAt(cycle.program_run_id, 'headlessState.program_cycle.program_run_id'),
-      cycleClaimGeneration: cycle.cycle_claim_generation === null ? null : positiveIntegerAt(cycle.cycle_claim_generation, 'headlessState.program_cycle.cycle_claim_generation'),
-      terminalOrSettlementReference: cycle.terminal_or_settlement_reference === null ? null : digestAt(cycle.terminal_or_settlement_reference, 'headlessState.program_cycle.terminal_or_settlement_reference'),
-      runtimeControlRevision: cycle.runtime_control_revision === null
-        ? null
-        : positiveIntegerAt(
-          cycle.runtime_control_revision,
-          'headlessState.program_cycle.runtime_control_revision',
-        ),
-      recoveryOffer: cycle.recovery_offer === null
-        ? null
-        : parseCycleRecoveryOffer(
-          cycle.recovery_offer,
-          'headlessState.program_cycle.recovery_offer',
-        ),
-    },
+    programCycle: parseProgramCycleStatus(record.program_cycle),
     draftIdentity: {
       draftId: stringAt(draft.draft_id, 'headlessState.draft_identity.draft_id'),
       draftRevision: integerAt(draft.draft_revision, 'headlessState.draft_identity.draft_revision'),

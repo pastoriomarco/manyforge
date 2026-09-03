@@ -616,6 +616,11 @@ std::optional<std::string_view> stop_scope_snapshot_field_error(
       !canonical_rows(snapshot.operations, [](const auto& row) { return row.operation_id; })) {
     return "stop_scope_operations_not_canonical";
   }
+  if (snapshot.known_program_runs.size() >
+          kMaximumStopScopeSnapshotProgramRuns ||
+      !canonical_id_set(snapshot.known_program_runs)) {
+    return "stop_scope_program_runs_not_canonical";
+  }
   if (snapshot.components.size() > kMaximumStopScopeSnapshotComponents ||
       !canonical_rows(snapshot.components,
                       [](const auto& row) { return row.controllable_component_id; })) {
@@ -804,7 +809,9 @@ Result<StopScopeResolutionDTO> resolve_stop_scope(const StopIntentDTO& intent,
           }
         } else {
           for (const auto& target : targets) {
-            bool known = false;
+            bool known = std::binary_search(snapshot.known_program_runs.begin(),
+                                            snapshot.known_program_runs.end(),
+                                            target.program_run_id);
             for (const auto& operation : snapshot.operations) {
               if (operation.program_run_id != target.program_run_id) {
                 continue;

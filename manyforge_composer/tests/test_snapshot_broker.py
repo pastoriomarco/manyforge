@@ -34,6 +34,7 @@ def test_snapshot_without_observer_fails_immediately_and_boundedly() -> None:
     assert time.monotonic() - started < 0.1
     assert broker.status() == {
         "observer_bound": False,
+        "observer_count": 0,
         "pending_count": 0,
         "requests_total": 1,
         "completed_total": 0,
@@ -83,6 +84,44 @@ def test_snapshot_sender_receives_owner_bound_request_and_capture_identity() -> 
     assert capture.observed_generation == OWNER_GENERATION + 1
     assert broker.status()["completed_total"] == 1
     assert broker.status()["deliveries_rejected_total"] == 1
+
+
+def test_snapshot_broker_keeps_multiple_browsers_without_reconnect_churn() -> None:
+    broker = _broker()
+    first_requests = []
+    second_requests = []
+    first_sender = first_requests.append
+    second_sender = second_requests.append
+    broker.bind_sender(first_sender)
+    broker.bind_sender(second_sender)
+
+    assert broker.status()["observer_count"] == 2
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        capture = pool.submit(
+            broker.capture_sync,
+            64,
+            64,
+            "jpeg",
+            timeout_s=0.2,
+        )
+        deadline = time.monotonic() + 0.1
+        while not second_requests and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert first_requests == []
+        assert len(second_requests) == 1
+        request = second_requests[0]
+        assert broker.deliver(
+            request.request_id,
+            JPEG,
+            observed_owner_epoch=OWNER_EPOCH,
+            observed_generation=OWNER_GENERATION,
+        )
+        assert capture.result(timeout=0.2) is not None
+
+    broker.unbind_sender(first_sender)
+    assert broker.status()["observer_count"] == 1
+    assert broker.has_observer() is True
 
 
 def test_snapshot_rejects_cross_owner_or_regressed_frame_without_settling() -> None:

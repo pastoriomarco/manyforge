@@ -4199,6 +4199,82 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(second_engine.stop_calls.load(), 1);
 }
 
+TEST(ResourceAddressedExecutionKernelTest,
+     ProgramRunStopClosesKnownIdleRunUntilExactSuccessfulRelease) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernelConfig config{
+      RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute",
+                       CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal, std::move(config));
+  const CellAdmissionReadinessSnapshotDTO ready{
+      true,
+      ProgramCycleStatusDTO{RequestOwnerEpoch("program.owner"), 1U,
+                            ProgramCycleStateDTO::kIdleAfterReset,
+                            std::nullopt, std::nullopt, std::nullopt},
+      true,
+      1U,
+      1U,
+      true,
+      true,
+      0U,
+      0U,
+      0U};
+  ASSERT_TRUE(kernel.UpdateCellAdmissionReadiness(ready).ok());
+  const auto claim = kernel.AcquireCellAdmissionClaim(
+      CellAdmissionClaimIntentDTO{
+          CellAdmissionClaimKindDTO::kProgramCycle,
+          CellAdmissionOwnerRoleDTO::kProgramRunner,
+          RequestOwnerEpoch("program.owner"),
+          "run.1",
+          RequestId("request.program-cycle.claim"),
+          ContentDigest(
+              "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+          kernel.GetAuthoringAdmission().admission_generation,
+          {},
+          ProgramCycleAdmissionEvidenceDTO{ProgramRevision("program.1"),
+                                           ProgramRevision("program.1")},
+          std::nullopt});
+  ASSERT_TRUE(claim.ok()) << claim.error().message;
+
+  const auto stopped = kernel.stop(
+      program_run_stop_request("request.program-run.before-execute", "run.1"));
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+  EXPECT_EQ(stopped.value().resolution_disposition,
+            StopResolutionDispositionDTO::kAlreadyTerminalNoEffect);
+  EXPECT_TRUE(stopped.value().affected_operation_revisions.empty());
+
+  const auto rejected =
+      kernel.execute(motion_operation("request.program-run.late-execute"));
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.error().details.at("reason"),
+            "program_run_stop_fence_active");
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(stopped.value().stop_id);
+    return status.ok() && status.value().state == StopStatusStateDTO::kSucceeded;
+  }));
+
+  const auto stale_release = kernel.release_program_run_stop_fence(
+      ProgramRunId("run.1"), StopId("stop.stale"),
+      stopped.value().stop_generation);
+  ASSERT_FALSE(stale_release.ok());
+  EXPECT_EQ(stale_release.error().details.at("reason"),
+            "program_run_stop_fence_stale");
+  const auto released = kernel.release_program_run_stop_fence(
+      ProgramRunId("run.1"), stopped.value().stop_id,
+      stopped.value().stop_generation);
+  ASSERT_TRUE(released.ok()) << released.error().message;
+  const auto admitted =
+      kernel.execute(motion_operation("request.program-run.after-release"));
+  ASSERT_TRUE(admitted.ok()) << admitted.error().message;
+}
+
 TEST(ResourceAddressedExecutionKernelTest, BlockedControlOnOneOperationCannotDelayDisjointStop) {
   using namespace std::chrono_literals;
 

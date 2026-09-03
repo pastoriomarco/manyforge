@@ -3,8 +3,11 @@ import {
   VIEWER_QUALIFICATION_GLOBAL,
   VIEWER_QUALIFICATION_QUERY_KEY,
   connectViewerQualification,
+  inspectViewerRenderer,
   isSoftwareRenderer,
   recordViewerModelBuild,
+  recordViewerObservationApplied,
+  recordViewerObservationReceived,
   recordViewerReactCommit,
   recordViewerRenderFrame,
   recordViewerRenderWork,
@@ -32,6 +35,32 @@ describe('viewer presentation and performance', () => {
       effectiveDpr: 1.5,
       antialias: true,
       preserveDrawingBuffer: false,
+    });
+  });
+
+  it('detects Firefox software rendering beneath a sanitized debug identity', () => {
+    const debugInfo = {
+      UNMASKED_VENDOR_WEBGL: 1,
+      UNMASKED_RENDERER_WEBGL: 2,
+    };
+    const context = {
+      VENDOR: 3,
+      RENDERER: 4,
+      getExtension: vi.fn(() => debugInfo),
+      getParameter: vi.fn((parameter: number) => ({
+        1: 'NVIDIA Corporation',
+        2: 'NVIDIA GeForce GTX 980, or similar',
+        4: 'llvmpipe, or similar',
+      })[parameter] ?? ''),
+    };
+    const gl = {
+      getContext: () => context,
+    } as never;
+
+    expect(inspectViewerRenderer(gl)).toEqual({
+      vendor: 'NVIDIA Corporation',
+      renderer: 'llvmpipe, or similar',
+      software: true,
     });
   });
 
@@ -73,6 +102,8 @@ describe('viewer presentation and performance', () => {
       snapshot: () => unknown;
       take: () => unknown;
       reset: () => void;
+      observationFlow: () => unknown;
+      resetObservationFlow: () => void;
     };
     expect(qualification.schemaVersion).toBe('manyforge.viewer.qualification.v1');
     expect(Object.isFrozen(qualification)).toBe(true);
@@ -89,6 +120,26 @@ describe('viewer presentation and performance', () => {
       }),
     );
     qualification.reset();
+    qualification.resetObservationFlow();
+    recordViewerObservationReceived({
+      ownerEpoch: 'owner.1',
+      sourceEpoch: 'source.1',
+      sourceSequence: 7,
+      receivedAtComposerMonotonicUs: 123,
+    }, false);
+    recordViewerObservationApplied({
+      ownerEpoch: 'owner.1',
+      sourceEpoch: 'source.1',
+      sourceSequence: 7,
+      receivedAtComposerMonotonicUs: 123,
+    });
+    expect(qualification.observationFlow()).toEqual(expect.objectContaining({
+      receivedFrames: 1,
+      appliedFrames: 1,
+      replacedBeforeApply: 0,
+      maxUnappliedFrames: 1,
+      lastApplied: expect.objectContaining({ sourceSequence: 7 }),
+    }));
     disconnect();
     expect(fakeWindow[VIEWER_QUALIFICATION_GLOBAL]).toBeUndefined();
 

@@ -201,8 +201,14 @@ class ProgramRunTickHost:
         self._maximum_workers = maximum_workers
         self._monotonic = monotonic
         self._terminal_observer = terminal_observer
-        self._scheduled: set[str] = set()
-        self._inflight: dict[str, Future[ProgramRunSnapshot]] = {}
+        # The value is the latest command-side wake revision for this run.
+        # A worker carries the revision it was submitted under, so its older
+        # completion cannot remove a wake issued by a concurrent command.
+        self._scheduled: dict[str, int] = {}
+        self._inflight: dict[
+            str, tuple[int, Future[ProgramRunSnapshot]]
+        ] = {}
+        self._schedule_revision = 0
         self._condition = Condition(RLock())
         self._thread: Thread | None = None
         self._shutdown = False
@@ -237,16 +243,28 @@ class ProgramRunTickHost:
             raise ValueError("program_run_id must be non-empty text")
         with self._condition:
             self._raise_if_unavailable()
-            if (
-                program_run_id not in self._scheduled
-                and len(self._scheduled) >= self._maximum_scheduled_runs
-            ):
-                raise ProgramSchedulingError("scheduled Program-run set is full")
-            self._scheduled.add(program_run_id)
-            self._condition.notify_all()
+            self._schedule_locked(program_run_id)
 
-    def start_run(self, admission: ProgramRunAdmission) -> ProgramRunSnapshot:
-        snapshot = self._owner.start(admission)
+    def _schedule_locked(self, program_run_id: str) -> None:
+        if (
+            program_run_id not in self._scheduled
+            and len(self._scheduled) >= self._maximum_scheduled_runs
+        ):
+            raise ProgramSchedulingError("scheduled Program-run set is full")
+        self._schedule_revision += 1
+        self._scheduled[program_run_id] = self._schedule_revision
+        self._condition.notify_all()
+
+    def start_run(
+        self,
+        admission: ProgramRunAdmission,
+        *,
+        program_run_id: str | None = None,
+    ) -> ProgramRunSnapshot:
+        snapshot = self._owner.start(
+            admission,
+            program_run_id=program_run_id,
+        )
         try:
             self.schedule(snapshot.capture.program_run_id)
         except Exception as scheduling_error:
@@ -338,9 +356,8 @@ class ProgramRunTickHost:
 
         with self._condition:
             self._raise_if_unavailable()
-            if (
-                program_run_id not in self._scheduled
-                and len(self._scheduled) >= self._maximum_scheduled_runs
+            if program_run_id not in self._scheduled and (
+                len(self._scheduled) >= self._maximum_scheduled_runs
             ):
                 raise ProgramSchedulingError("scheduled Program-run set is full")
             snapshot = self._owner.resume_full_stop(
@@ -348,8 +365,7 @@ class ProgramRunTickHost:
                 request_id=request_id,
                 reason=reason,
             )
-            self._scheduled.add(program_run_id)
-            self._condition.notify_all()
+            self._schedule_locked(program_run_id)
             return snapshot
 
     def reset_run(self, program_run_id: str) -> ProgramRunSnapshot:
@@ -374,25 +390,17 @@ class ProgramRunTickHost:
             raise ValueError("program_run_id must be non-empty text")
         with self._condition:
             self._raise_if_unavailable()
-            if (
-                program_run_id not in self._scheduled
-                and len(self._scheduled) >= self._maximum_scheduled_runs
+            if program_run_id not in self._scheduled and (
+                len(self._scheduled) >= self._maximum_scheduled_runs
             ):
                 raise ProgramSchedulingError("scheduled Program-run set is full")
-            newly_scheduled = program_run_id not in self._scheduled
-            self._scheduled.add(program_run_id)
-            try:
-                snapshot = self._owner.resolve_intervention(
-                    program_run_id,
-                    node_attempt_id=node_attempt_id,
-                    action=action,
-                    result=result,
-                )
-            except Exception:
-                if newly_scheduled:
-                    self._scheduled.discard(program_run_id)
-                raise
-            self._condition.notify_all()
+            snapshot = self._owner.resolve_intervention(
+                program_run_id,
+                node_attempt_id=node_attempt_id,
+                action=action,
+                result=result,
+            )
+            self._schedule_locked(program_run_id)
             return snapshot
 
     def read(self, program_run_id: str) -> ProgramRunSnapshot:
@@ -413,6 +421,19 @@ class ProgramRunTickHost:
             )
         )
 
+    def _current_after_worker(
+        self,
+        completed: ProgramRunSnapshot,
+    ) -> ProgramRunSnapshot:
+        """Join a worker result to any newer command-side owner transition."""
+
+        current = self._owner.read(completed.capture.program_run_id)
+        if current.run_revision < completed.run_revision:
+            raise ProgramSchedulingError(
+                "Program-run owner revision regressed after a tick"
+            )
+        return current
+
     def advance_ready_once(self) -> tuple[ProgramRunSnapshot, ...]:
         with self._condition:
             self._raise_if_unavailable()
@@ -420,30 +441,35 @@ class ProgramRunTickHost:
                 raise ProgramSchedulingError(
                     "manual Program tick is unavailable while the host is running"
                 )
-            program_run_ids = tuple(sorted(self._scheduled))
+            scheduled = tuple(sorted(self._scheduled.items()))
         futures = tuple(
             (
                 program_run_id,
+                schedule_revision,
                 self._executor.submit(
                     self._owner.advance_once,
                     program_run_id,
                 ),
             )
-            for program_run_id in program_run_ids
+            for program_run_id, schedule_revision in scheduled
         )
-        snapshots = [future.result() for _program_run_id, future in futures]
-        remove: list[str] = []
-        for program_run_id, snapshot in zip(
-            program_run_ids,
+        snapshots = [
+            self._current_after_worker(future.result())
+            for _program_run_id, _schedule_revision, future in futures
+        ]
+        remove: list[tuple[str, int]] = []
+        for (program_run_id, schedule_revision), snapshot in zip(
+            scheduled,
             snapshots,
             strict=True,
         ):
             if not self._requires_advance(snapshot):
-                remove.append(program_run_id)
+                remove.append((program_run_id, schedule_revision))
         if remove:
             with self._condition:
-                for program_run_id in remove:
-                    self._scheduled.discard(program_run_id)
+                for program_run_id, schedule_revision in remove:
+                    if self._scheduled.get(program_run_id) == schedule_revision:
+                        self._scheduled.pop(program_run_id, None)
         self._observe_terminals(snapshots)
         return tuple(snapshots)
 
@@ -477,19 +503,27 @@ class ProgramRunTickHost:
             with self._condition:
                 if self._shutdown:
                     return
-                for program_run_id, future in tuple(self._inflight.items()):
+                for program_run_id, inflight in tuple(self._inflight.items()):
+                    schedule_revision, future = inflight
                     if not future.done():
                         continue
                     self._inflight.pop(program_run_id)
                     try:
-                        snapshot = future.result()
+                        snapshot = self._current_after_worker(future.result())
                     except Exception as error:
                         self._worker_failure = error
                         self._condition.notify_all()
                         return
                     if not self._requires_advance(snapshot):
-                        self._scheduled.discard(program_run_id)
-                        if snapshot.state is not ProgramRunState.INTERVENTION_REQUIRED:
+                        removed = (
+                            self._scheduled.get(program_run_id)
+                            == schedule_revision
+                        )
+                        if removed:
+                            self._scheduled.pop(program_run_id, None)
+                        if removed and snapshot.state is not (
+                            ProgramRunState.INTERVENTION_REQUIRED
+                        ):
                             completed.append(snapshot)
 
                 now = self._monotonic()
@@ -503,14 +537,19 @@ class ProgramRunTickHost:
                         timeout=delay
                     )
                 else:
-                    for program_run_id in sorted(self._scheduled):
+                    for program_run_id, schedule_revision in sorted(
+                        self._scheduled.items()
+                    ):
                         if program_run_id in self._inflight:
                             continue
                         future = self._executor.submit(
                             self._owner.advance_once,
                             program_run_id,
                         )
-                        self._inflight[program_run_id] = future
+                        self._inflight[program_run_id] = (
+                            schedule_revision,
+                            future,
+                        )
                         future.add_done_callback(
                             lambda _future: self._notify_worker_completion()
                         )

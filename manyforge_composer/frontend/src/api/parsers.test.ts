@@ -32,6 +32,7 @@ import {
   parseProgramRunIndex,
   parseProgramRunStatus,
   parseProgramCycleResetResult,
+  parseProgramCycleStatus,
   parseProgramRuntimeControlProjection,
   parseScenarioCatalogResponse,
   parseSceneRuntimeProjection,
@@ -783,6 +784,31 @@ describe('Program product projections', () => {
 
     expect(projection.recoveryOffer).toBeNull();
     expect(projection.programRunId).toBe('program-run.1');
+  });
+
+  it('parses one coherent cycle, run, and runtime-control observation', () => {
+    const input = {
+      program_runner_owner_epoch: 'program-runner.epoch.1',
+      cycle_generation: 8,
+      state: 'running',
+      program_run_id: 'program-run.1',
+      cycle_claim_generation: 2,
+      terminal_or_settlement_reference: null,
+      run_revision: 3,
+      node_status_revision: 2,
+      runtime_control_revision: 1,
+      recovery_offer: null,
+      run: runStatus(),
+      runtime_controls: runtimeControlsProjection(),
+    };
+    const cycle = parseProgramCycleStatus(input);
+
+    expect(cycle.run?.runRevision).toBe(3);
+    expect(cycle.runtimeControls?.runtimeControls.runtimeControlRevision).toBe(1);
+    expect(() => parseProgramCycleStatus({
+      ...input,
+      run_revision: 4,
+    })).toThrow(/exact advertised run projection/);
   });
 
   it('accepts a completed recovery action with no subsequent offer', () => {

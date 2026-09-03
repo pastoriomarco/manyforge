@@ -12,6 +12,7 @@ import {
   sameHeadlessProjection,
   sameViewerProjection,
   useHeadlessStateSource,
+  useViewerHeadlessState,
 } from './useHeadlessState';
 
 function componentOverview(): ComposerHeadlessState['componentOverview'] {
@@ -66,8 +67,12 @@ function state(
       programRunId: null,
       cycleClaimGeneration: null,
       terminalOrSettlementReference: null,
+      runRevision: null,
+      nodeStatusRevision: null,
       runtimeControlRevision: null,
       recoveryOffer: null,
+      run: null,
+      runtimeControls: null,
     },
     draftIdentity: { draftId: 'draft-1', draftRevision: 1 },
     receiverEpoch: runtimeEpoch,
@@ -279,8 +284,12 @@ function wireState(generation: number): Record<string, unknown> {
       program_run_id: null,
       cycle_claim_generation: null,
       terminal_or_settlement_reference: null,
+      run_revision: null,
+      node_status_revision: null,
       runtime_control_revision: null,
       recovery_offer: null,
+      run: null,
+      runtime_controls: null,
     },
     draft_identity: { draft_id: 'draft-1', draft_revision: 1 },
     receiver_epoch: 'receiver.epoch.1',
@@ -386,6 +395,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     source.subscribeShell(() => { shellNotifications += 1; });
     source.subscribeViewer(() => { viewerNotifications += 1; });
     source.subscribeExecutionObservation(() => { observationNotifications += 1; });
+    source.setViewerDemand(true);
     source.setEnabled(true);
     const shellBaseline = shellNotifications;
     const viewerBaseline = viewerNotifications;
@@ -433,6 +443,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     vi.stubGlobal('WebSocket', FakeWebSocket);
 
     const source = new HeadlessStateSource();
+    source.setViewerDemand(true);
     source.setEnabled(true);
     const firstSocket = FakeWebSocket.instances.find(
       (socket) => new URL(socket.url).pathname === '/ws/scene/viewer',
@@ -481,6 +492,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     vi.stubGlobal('WebSocket', FakeWebSocket);
 
     const source = new HeadlessStateSource();
+    source.setViewerDemand(true);
     source.setEnabled(true);
     source.reconnect();
     expect(urls).toHaveLength(4);
@@ -653,6 +665,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     let shellNotifications = 0;
     source.subscribeViewer(() => { viewerNotifications += 1; });
     source.subscribeShell(() => { shellNotifications += 1; });
+    source.setViewerDemand(true);
     source.setEnabled(true);
 
     expect(FakeWebSocket.instances).toHaveLength(2);
@@ -735,6 +748,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
 
     const source = new HeadlessStateSource();
     const initialCreations = getHeadlessStateQualificationSnapshot().socketCreations;
+    source.setViewerDemand(true);
     source.setEnabled(true);
     expect(source.getExecutionObservationTransportStatus()).toMatchObject({
       phase: 'connecting',
@@ -779,6 +793,91 @@ describe('HeadlessStateSource delivery scheduling', () => {
       phase: 'disabled', message: null,
     });
     expect(getHeadlessStateQualificationSnapshot().activeSockets).toBe(0);
+  });
+
+  it('renews one visible static demand for more than 24 hours without frame work', () => {
+    vi.useFakeTimers();
+    const animationFrames: FrameRequestCallback[] = [];
+    class FakeWebSocket {
+      static readonly OPEN = 1;
+      static instances: FakeWebSocket[] = [];
+      readonly url: string;
+      readonly sent: string[] = [];
+      readyState = FakeWebSocket.OPEN;
+      onopen: (() => void) | null = null;
+      onmessage: ((message: MessageEvent) => void) | null = null;
+      onerror: (() => void) | null = null;
+      onclose: (() => void) | null = null;
+
+      constructor(url: string) {
+        this.url = url;
+        FakeWebSocket.instances.push(this);
+      }
+
+      close(): void {
+        this.readyState = 3;
+      }
+
+      open(): void {
+        this.onopen?.();
+      }
+
+      send(message: string): void {
+        this.sent.push(message);
+      }
+
+      sendFrame(value: unknown): void {
+        this.onmessage?.({ data: JSON.stringify(value) } as MessageEvent);
+      }
+    }
+    vi.stubGlobal('window', {
+      location: { href: 'http://composer.test/' },
+      requestAnimationFrame: (callback: FrameRequestCallback) => {
+        animationFrames.push(callback);
+        return animationFrames.length;
+      },
+      cancelAnimationFrame: vi.fn(),
+    });
+    vi.stubGlobal('WebSocket', FakeWebSocket);
+
+    const source = new HeadlessStateSource();
+    let observationNotifications = 0;
+    source.subscribeExecutionObservation(() => { observationNotifications += 1; });
+    source.setViewerDemand(true);
+    source.setEnabled(true);
+    const viewer = FakeWebSocket.instances.find(
+      (socket) => new URL(socket.url).pathname === '/ws/scene/viewer',
+    )!;
+    viewer.open();
+    viewer.sendFrame(wireObservation(1));
+    expect(animationFrames).toHaveLength(1);
+    animationFrames.shift()!(16);
+    const frame = source.getLatestExecutionObservation();
+    expect(frame).not.toBeNull();
+    source.markExecutionObservationApplied(frame!);
+    const appliedNotifications = observationNotifications;
+
+    vi.advanceTimersByTime(25 * 60 * 60 * 1000);
+
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    expect(animationFrames).toHaveLength(0);
+    expect(observationNotifications).toBe(appliedNotifications);
+    expect(source.getLatestExecutionObservation()).toBe(frame);
+    expect(viewer.sent.length).toBeGreaterThan(6_000);
+    expect(viewer.sent.every((message) => {
+      const credit = JSON.parse(message) as Record<string, unknown>;
+      return credit.schema_version
+          === 'manyforge.execution_observation_credit.v1';
+    })).toBe(true);
+    expect(JSON.parse(viewer.sent.at(-1)!)).toMatchObject({
+      last_applied: {
+        owner_epoch: 'execution-owner.1',
+        source_epoch: 'joint-source.1',
+        source_sequence: 1,
+      },
+    });
+    source.dispose();
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it('fails shell authority closed while retaining coherent viewer structure', () => {
@@ -884,6 +983,7 @@ describe('useHeadlessStateSource lifecycle', () => {
       nodeType: number;
       documentElement: FakeNode | null;
       activeElement: null;
+      visibilityState: 'visible';
       defaultView: Record<string, unknown>;
       addEventListener: () => void;
       removeEventListener: () => void;
@@ -893,6 +993,7 @@ describe('useHeadlessStateSource lifecycle', () => {
       nodeType: 9,
       documentElement: null,
       activeElement: null,
+      visibilityState: 'visible',
       defaultView: {},
       addEventListener: () => undefined,
       removeEventListener: () => undefined,
@@ -930,7 +1031,8 @@ describe('useHeadlessStateSource lifecycle', () => {
     const { createRoot } = await import('react-dom/client');
     const root = createRoot(makeNode('div') as unknown as Element);
     function Harness() {
-      useHeadlessStateSource(true);
+      const source = useHeadlessStateSource(true);
+      useViewerHeadlessState(source, true);
       return null;
     }
 
@@ -938,10 +1040,11 @@ describe('useHeadlessStateSource lifecycle', () => {
       root.render(createElement(StrictMode, null, createElement(Harness)));
     });
 
-    expect(FakeWebSocket.instances).toHaveLength(4);
-    expect(FakeWebSocket.instances.slice(0, 2).every((socket) => !socket.active))
-      .toBe(true);
+    expect(FakeWebSocket.instances).toHaveLength(2);
     expect(FakeWebSocket.instances.filter((socket) => socket.active)).toHaveLength(2);
+    expect(new Set(FakeWebSocket.instances.filter((socket) => socket.active).map(
+      (socket) => new URL(socket.url).pathname,
+    ))).toEqual(new Set(['/ws/state', '/ws/scene/viewer']));
     const activeShell = FakeWebSocket.instances.find(
       (socket) => socket.active && new URL(socket.url).pathname === '/ws/state',
     );
@@ -954,6 +1057,6 @@ describe('useHeadlessStateSource lifecycle', () => {
     expect(vi.getTimerCount()).toBe(0);
 
     vi.advanceTimersByTime(10_000);
-    expect(FakeWebSocket.instances).toHaveLength(4);
+    expect(FakeWebSocket.instances.filter((socket) => socket.active)).toHaveLength(0);
   });
 });

@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
+import asyncio
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal, Protocol
+import json
 import re
+import threading
 import uuid
 
-from fastapi import FastAPI, Path, Query, Request
+from fastapi import FastAPI, Path, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
@@ -16,6 +19,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .cclc import CCLCOpenPort, CCLCOpenRequestClient
 from .execution import ExecutionCommandClient, ExecutionEventPump
+from .execution_control import ExecutionControlBusyError, ExecutionControlClient
 from .manager import ManagerCommandClient
 from .models import (
     AcknowledgeAlarmRequest,
@@ -76,6 +80,39 @@ _REQUEST_ID_PATTERN = re.compile(r"[^A-Za-z0-9._-]")
 _MAXIMUM_SAFE_INTEGER = 9_007_199_254_740_991
 _MAXIMUM_ALARM_PAGE = 128
 _MAXIMUM_HISTORY_PAGE = 32
+_OBSERVATION_CREDIT_SCHEMA = "manyforge.execution_observation_credit.v1"
+_MAXIMUM_OBSERVATION_CREDIT_BYTES = 4_096
+
+
+def _execution_observation_cursor(message: str) -> dict[str, Any] | None:
+    if len(message.encode("utf-8")) > _MAXIMUM_OBSERVATION_CREDIT_BYTES:
+        raise ValueError("execution observation credit is oversized")
+    value = strict_json_object(
+        message,
+        label="execution observation credit",
+        maximum_bytes=_MAXIMUM_OBSERVATION_CREDIT_BYTES,
+    )
+    if set(value) != {"last_applied", "schema_version"} or (
+        value.get("schema_version") != _OBSERVATION_CREDIT_SCHEMA
+    ):
+        raise ValueError("execution observation credit has an invalid shape")
+    cursor = value.get("last_applied")
+    if cursor is None:
+        return None
+    if (
+        not isinstance(cursor, dict)
+        or set(cursor) != {"owner_epoch", "source_epoch", "source_sequence"}
+        or not isinstance(cursor.get("owner_epoch"), str)
+        or not cursor["owner_epoch"]
+        or len(cursor["owner_epoch"].encode("utf-8")) > 2_048
+        or not isinstance(cursor.get("source_epoch"), str)
+        or not cursor["source_epoch"]
+        or len(cursor["source_epoch"].encode("utf-8")) > 2_048
+        or type(cursor.get("source_sequence")) is not int
+        or not 0 <= cursor["source_sequence"] <= _MAXIMUM_SAFE_INTEGER
+    ):
+        raise ValueError("execution observation credit cursor is invalid")
+    return dict(cursor)
 
 
 @dataclass(frozen=True, slots=True)
@@ -283,6 +320,7 @@ def _error_status(code: str) -> int:
             "program_run_scheduling_failed",
             "request_ledger_full",
             "scene_projection_commit_uncertain",
+            "execution_control_ingress_busy",
         }
     ):
         return 503
@@ -392,6 +430,9 @@ def create_app(
             poll_seconds=config.execution_event_poll_milliseconds / 1_000.0,
         )
     assert service is not None
+    execution_controls = ExecutionControlClient(
+        thread_name_prefix="manyforge_headless_control",
+    )
     service_cclc = getattr(service, "cclc", None)
     if cclc is None:
         cclc = service_cclc
@@ -408,6 +449,28 @@ def create_app(
             )
         return cclc
 
+    async def control_call(callback, *, stop: bool = False):
+        try:
+            lane = execution_controls.stop if stop else execution_controls.ordinary
+            return await lane(callback)
+        except ExecutionControlBusyError as error:
+            raise HeadlessApiError(
+                "execution_control_ingress_busy",
+                str(error),
+                details={
+                    "lane": error.lane.value,
+                    "maximum_admitted": error.maximum_admitted,
+                },
+            ) from error
+
+    async def json_control_call(callback, *, stop: bool = False) -> JSONResponse:
+        """Run and encode one JSON-native result inside its bounded lane."""
+
+        return await control_call(
+            lambda: JSONResponse(content=callback()),
+            stop=stop,
+        )
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         if event_pump is not None:
@@ -415,16 +478,19 @@ def create_app(
         try:
             yield
         finally:
-            if owns_core:
-                try:
-                    if event_pump is not None:
-                        event_pump.shutdown()
-                finally:
+            try:
+                if owns_core:
                     try:
-                        if program_runner_client is not None:
-                            program_runner_client.close()
+                        if event_pump is not None:
+                            event_pump.shutdown()
                     finally:
-                        service.core.shutdown()
+                        try:
+                            if program_runner_client is not None:
+                                program_runner_client.close()
+                        finally:
+                            service.core.shutdown()
+            finally:
+                execution_controls.close()
 
     app = FastAPI(
         title="ManyForge Headless Runtime API",
@@ -492,16 +558,27 @@ def create_app(
             adapter_request_id = (
                 "malformed-stop." + getattr(request.state, "request_id", uuid.uuid4().hex[:16])
             )
-            response = execution_response(
-                service.execution_recognized_malformed_stop(
-                    request_id=adapter_request_id,
-                    recognized_route=request.url.path,
-                    reason=reason,
-                    attribution=_trusted_attribution(
-                        request, trusted_principal_adapter
-                    ),
-                )
+            attribution = _trusted_attribution(
+                request,
+                trusted_principal_adapter,
             )
+            try:
+                response = execution_response(
+                    await control_call(
+                        lambda: service.execution_recognized_malformed_stop(
+                            request_id=adapter_request_id,
+                            recognized_route=request.url.path,
+                            reason=reason,
+                            attribution=attribution,
+                        ),
+                        stop=True,
+                    )
+                )
+            except HeadlessApiError as execution_error:
+                response = await headless_error_handler(
+                    request,
+                    execution_error,
+                )
             if getattr(request.state, "recognized_stop_close_connection", False):
                 response.headers["Connection"] = "close"
             return response
@@ -670,14 +747,18 @@ def create_app(
         return service.program_runs(active_only=active_only, limit=limit)
 
     @app.post("/api/program/runs")
-    def program_run_start(request: ProgramRunStartRequest) -> dict[str, Any]:
-        return service.program_run_start(request)
+    async def program_run_start(
+        request: ProgramRunStartRequest,
+    ) -> dict[str, Any]:
+        return await json_control_call(lambda: service.program_run_start(request))
 
     @app.post("/api/program/scene-preparations")
-    def program_scene_prepare(
+    async def program_scene_prepare(
         request: ProgramScenePreparationRequest,
     ) -> dict[str, Any]:
-        return service.program_scene_prepare(request)
+        return await json_control_call(
+            lambda: service.program_scene_prepare(request)
+        )
 
     @app.get("/api/program/runs/{program_run_id}")
     def program_run_read(
@@ -686,7 +767,7 @@ def create_app(
         return service.program_run_read(program_run_id)
 
     @app.post("/api/program/runs/{program_run_id}/stop")
-    def program_run_stop(
+    async def program_run_stop(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
         request: ProgramRunStopRequest,
     ) -> dict[str, Any]:
@@ -695,10 +776,13 @@ def create_app(
                 "program_run_path_invalid",
                 "Program-run identity in the path and request body must match",
             )
-        return service.program_run_stop(program_run_id, request)
+        return await json_control_call(
+            lambda: service.program_run_stop(program_run_id, request),
+            stop=True,
+        )
 
     @app.post("/api/program/runs/{program_run_id}/motion-stop")
-    def program_run_motion_stop(
+    async def program_run_motion_stop(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
         request: ProgramRunStopRequest,
     ) -> dict[str, Any]:
@@ -707,10 +791,13 @@ def create_app(
                 "program_run_path_invalid",
                 "Program-run identity in path and body must match",
             )
-        return service.program_run_motion_stop(program_run_id, request)
+        return await json_control_call(
+            lambda: service.program_run_motion_stop(program_run_id, request),
+            stop=True,
+        )
 
     @app.post("/api/program/runs/{program_run_id}/full-stop")
-    def program_run_full_stop(
+    async def program_run_full_stop(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
         request: ProgramRunStopRequest,
     ) -> dict[str, Any]:
@@ -719,10 +806,13 @@ def create_app(
                 "program_run_path_invalid",
                 "Program-run identity in path and body must match",
             )
-        return service.program_run_full_stop(program_run_id, request)
+        return await json_control_call(
+            lambda: service.program_run_full_stop(program_run_id, request),
+            stop=True,
+        )
 
     @app.post("/api/program/runs/{program_run_id}/resume-full-stop")
-    def program_run_resume_full_stop(
+    async def program_run_resume_full_stop(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
         request: ProgramFullStopResumeRequest,
     ) -> dict[str, Any]:
@@ -731,10 +821,12 @@ def create_app(
                 "program_run_path_invalid",
                 "Program-run identity in path and body must match",
             )
-        return service.program_run_resume_full_stop(program_run_id, request)
+        return await json_control_call(
+            lambda: service.program_run_resume_full_stop(program_run_id, request)
+        )
 
     @app.post("/api/program/runs/{program_run_id}/reset")
-    def program_run_reset_full_stop(
+    async def program_run_reset_full_stop(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
         request: ProgramFullStopResetRequest,
     ) -> dict[str, Any]:
@@ -743,17 +835,21 @@ def create_app(
                 "program_run_path_invalid",
                 "Program-run identity in path and body must match",
             )
-        return service.program_run_reset_full_stop(program_run_id, request)
+        return await json_control_call(
+            lambda: service.program_run_reset_full_stop(program_run_id, request)
+        )
 
     @app.get("/api/cycle/status")
     def program_cycle_status() -> dict[str, Any]:
         return service.program_cycle_status()
 
     @app.post("/api/program/cycle/reset")
-    def program_cycle_reset(
+    async def program_cycle_reset(
         request: ProgramCycleResetRequest,
     ) -> dict[str, Any]:
-        return service.program_cycle_reset(request)
+        return await json_control_call(
+            lambda: service.program_cycle_reset(request)
+        )
 
     @app.get("/api/program/runs/{program_run_id}/runtime-controls")
     def program_runtime_controls(
@@ -769,70 +865,84 @@ def create_app(
             )
 
     @app.post("/api/program/runs/{program_run_id}/runtime-overrides")
-    def stage_runtime_override(
+    async def stage_runtime_override(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
         request: RuntimeOverrideStageRequest,
     ) -> dict[str, Any]:
         require_control_path(program_run_id, request)
-        return service.program_runtime_control_action(
-            program_run_id, "runtime-overrides", request
+        return await json_control_call(
+            lambda: service.program_runtime_control_action(
+                program_run_id, "runtime-overrides", request
+            )
         )
 
     @app.post("/api/program/runs/{program_run_id}/runtime-overrides/activate")
-    def activate_runtime_override(
+    async def activate_runtime_override(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
         request: RuntimeOverrideActionRequest,
     ) -> dict[str, Any]:
         require_control_path(program_run_id, request)
-        return service.program_runtime_control_action(
-            program_run_id, "runtime-overrides/activate", request
+        return await json_control_call(
+            lambda: service.program_runtime_control_action(
+                program_run_id, "runtime-overrides/activate", request
+            )
         )
 
     @app.post("/api/program/runs/{program_run_id}/runtime-overrides/clear")
-    def clear_runtime_override(
+    async def clear_runtime_override(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
         request: RuntimeOverrideActionRequest,
     ) -> dict[str, Any]:
         require_control_path(program_run_id, request)
-        return service.program_runtime_control_action(
-            program_run_id, "runtime-overrides/clear", request
+        return await json_control_call(
+            lambda: service.program_runtime_control_action(
+                program_run_id, "runtime-overrides/clear", request
+            )
         )
 
     @app.post("/api/program/runs/{program_run_id}/runtime-overrides/promote")
-    def promote_runtime_override(
+    async def promote_runtime_override(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
         request: RuntimeOverridePromotionRequest,
     ) -> dict[str, Any]:
         require_control_path(program_run_id, request)
-        return service.program_runtime_control_action(
-            program_run_id, "runtime-overrides/promote", request
+        return await json_control_call(
+            lambda: service.program_runtime_control_action(
+                program_run_id, "runtime-overrides/promote", request
+            )
         )
 
     @app.post("/api/program/runs/{program_run_id}/blackboard-values")
-    def write_runtime_blackboard(
+    async def write_runtime_blackboard(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
         request: RuntimeBlackboardWriteRequest,
     ) -> dict[str, Any]:
         require_control_path(program_run_id, request)
-        return service.program_runtime_control_action(
-            program_run_id, "blackboard-values", request
+        return await json_control_call(
+            lambda: service.program_runtime_control_action(
+                program_run_id, "blackboard-values", request
+            )
         )
 
     @app.post("/api/program/runs/{program_run_id}/manual-result")
-    def stage_manual_result(
+    async def stage_manual_result(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
         request: ManualResultStageRequest,
     ) -> dict[str, Any]:
         require_control_path(program_run_id, request)
-        return service.program_runtime_control_action(
-            program_run_id, "manual-result", request
+        return await json_control_call(
+            lambda: service.program_runtime_control_action(
+                program_run_id, "manual-result", request
+            )
         )
 
     @app.post("/api/cycle/recovery-actions")
-    def cycle_recovery_action(
+    async def cycle_recovery_action(
         request: CycleRecoveryActionRequest,
     ) -> dict[str, Any]:
-        return service.cycle_recovery_action(request)
+        return await json_control_call(
+            lambda: service.cycle_recovery_action(request)
+        )
 
     def viewer_asset_response(asset: ViewerModelAsset) -> Response:
         cache_control = (
@@ -991,18 +1101,102 @@ def create_app(
     def execution_control_state() -> JSONResponse:
         return execution_response(service.execution_control_state())
 
-    @app.get("/api/execution/observation")
-    def execution_observation() -> JSONResponse:
-        return execution_response(service.execution_observation())
+    @app.websocket("/ws/execution/observations")
+    async def execution_observation_stream(websocket: WebSocket) -> None:
+        """Proxy one credited, change-driven native observation session."""
+
+        await websocket.accept()
+        cancelled = threading.Event()
+        credit_ready = asyncio.Event()
+        pending_cursor: dict[str, Any] | None = None
+        has_pending_credit = False
+        request_in_flight = False
+        session: Any | None = None
+
+        async def receive_credit() -> None:
+            nonlocal pending_cursor, has_pending_credit
+            while True:
+                text = await websocket.receive_text()
+                if has_pending_credit or request_in_flight:
+                    raise ValueError(
+                        "only one execution observation credit may be outstanding"
+                    )
+                pending_cursor = _execution_observation_cursor(text)
+                has_pending_credit = True
+                credit_ready.set()
+
+        async def send_observation() -> None:
+            nonlocal pending_cursor, has_pending_credit, request_in_flight, session
+            while True:
+                await credit_ready.wait()
+                credit_ready.clear()
+                cursor = pending_cursor
+                pending_cursor = None
+                has_pending_credit = False
+                request_in_flight = True
+                if session is None:
+                    context = service.open_execution_observation_session()
+                    session = await asyncio.to_thread(context.__enter__)
+                response = await asyncio.to_thread(
+                    session.next,
+                    cursor,
+                    cancelled,
+                )
+                await websocket.send_text(
+                    json.dumps(
+                        response,
+                        allow_nan=False,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
+                )
+                request_in_flight = False
+
+        receiver = asyncio.create_task(receive_credit())
+        sender = asyncio.create_task(send_observation())
+        try:
+            await asyncio.wait(
+                {receiver, sender},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in (receiver, sender):
+                if task.done():
+                    task.result()
+        except (WebSocketDisconnect, asyncio.CancelledError):
+            pass
+        except (HeadlessApiError, RuntimeError, ValueError):
+            with suppress(RuntimeError, WebSocketDisconnect):
+                await websocket.close(
+                    code=1002,
+                    reason="invalid execution observation stream",
+                )
+        finally:
+            cancelled.set()
+            for task in (receiver, sender):
+                task.cancel()
+            if session is not None:
+                with suppress(Exception):
+                    session.close()
+            for task in (receiver, sender):
+                with suppress(
+                    asyncio.CancelledError,
+                    HeadlessApiError,
+                    RuntimeError,
+                    ValueError,
+                    WebSocketDisconnect,
+                ):
+                    await task
 
     @app.post("/api/execution/operations")
-    def execution_submit(
+    async def execution_submit(
         body: OperationIntentRequest,
         request: Request,
     ) -> JSONResponse:
+        attribution = _trusted_attribution(request, trusted_principal_adapter)
         return execution_response(
-            service.execution_submit(
-                body, _trusted_attribution(request, trusted_principal_adapter)
+            await control_call(
+                lambda: service.execution_submit(body, attribution)
             )
         )
 
@@ -1057,24 +1251,26 @@ def create_app(
         )
 
     @app.post("/api/execution/pick-place/sequences/pick")
-    def execution_start_pick(
+    async def execution_start_pick(
         body: PickSequencePlanningRequest,
         request: Request,
     ) -> JSONResponse:
+        attribution = _trusted_attribution(request, trusted_principal_adapter)
         return execution_response(
-            service.execution_start_pick(
-                body, _trusted_attribution(request, trusted_principal_adapter)
+            await control_call(
+                lambda: service.execution_start_pick(body, attribution)
             )
         )
 
     @app.post("/api/execution/pick-place/sequences/place")
-    def execution_start_place(
+    async def execution_start_place(
         body: PlaceSequencePlanningRequest,
         request: Request,
     ) -> JSONResponse:
+        attribution = _trusted_attribution(request, trusted_principal_adapter)
         return execution_response(
-            service.execution_start_place(
-                body, _trusted_attribution(request, trusted_principal_adapter)
+            await control_call(
+                lambda: service.execution_start_place(body, attribution)
             )
         )
 
@@ -1097,78 +1293,80 @@ def create_app(
             )
 
     @app.post("/api/execution/operations/{operation_id}/pause")
-    def execution_pause(
+    async def execution_pause(
         operation_id: Annotated[str, Path(min_length=1, max_length=256)],
         body: OperationControlRequest,
         request: Request,
     ) -> JSONResponse:
         require_matching_operation(operation_id, body.operation_id)
+        attribution = _trusted_attribution(request, trusted_principal_adapter)
         return execution_response(
-            service.execution_pause(
-                body, _trusted_attribution(request, trusted_principal_adapter)
-            )
+            await control_call(lambda: service.execution_pause(body, attribution))
         )
 
     @app.post("/api/execution/operations/{operation_id}/resume")
-    def execution_resume(
+    async def execution_resume(
         operation_id: Annotated[str, Path(min_length=1, max_length=256)],
         body: OperationControlRequest,
         request: Request,
     ) -> JSONResponse:
         require_matching_operation(operation_id, body.operation_id)
+        attribution = _trusted_attribution(request, trusted_principal_adapter)
         return execution_response(
-            service.execution_resume(
-                body, _trusted_attribution(request, trusted_principal_adapter)
-            )
+            await control_call(lambda: service.execution_resume(body, attribution))
         )
 
     @app.post("/api/execution/operations/{operation_id}/reset")
-    def execution_reset(
+    async def execution_reset(
         operation_id: Annotated[str, Path(min_length=1, max_length=256)],
         body: OperationControlRequest,
         request: Request,
     ) -> JSONResponse:
         require_matching_operation(operation_id, body.operation_id)
+        attribution = _trusted_attribution(request, trusted_principal_adapter)
         return execution_response(
-            service.execution_reset(
-                body, _trusted_attribution(request, trusted_principal_adapter)
-            )
+            await control_call(lambda: service.execution_reset(body, attribution))
         )
 
     @app.post(
         "/api/execution/operations/{operation_id}/acknowledge-completed"
     )
-    def execution_acknowledge_completed(
+    async def execution_acknowledge_completed(
         operation_id: Annotated[str, Path(min_length=1, max_length=256)],
         body: OperationControlRequest,
         request: Request,
     ) -> JSONResponse:
         require_matching_operation(operation_id, body.operation_id)
+        attribution = _trusted_attribution(request, trusted_principal_adapter)
         return execution_response(
-            service.execution_acknowledge_completed(
-                body, _trusted_attribution(request, trusted_principal_adapter)
+            await control_call(
+                lambda: service.execution_acknowledge_completed(body, attribution)
             )
         )
 
     @app.post("/api/execution/stops")
-    def execution_stop(
+    async def execution_stop(
         body: StopIntentRequest,
         request: Request,
     ) -> JSONResponse:
+        attribution = _trusted_attribution(request, trusted_principal_adapter)
         return execution_response(
-            service.execution_stop(
-                body, _trusted_attribution(request, trusted_principal_adapter)
+            await control_call(
+                lambda: service.execution_stop(body, attribution),
+                stop=True,
             )
         )
 
     @app.post("/api/execution/full-stop")
-    def execution_full_stop(
+    async def execution_full_stop(
         body: FullStopIntentRequest,
         request: Request,
     ) -> JSONResponse:
+        attribution = _trusted_attribution(request, trusted_principal_adapter)
         return execution_response(
-            service.execution_full_stop(
-                body, _trusted_attribution(request, trusted_principal_adapter)
+            await control_call(
+                lambda: service.execution_full_stop(body, attribution),
+                stop=True,
             )
         )
 
@@ -1177,19 +1375,25 @@ def create_app(
         return execution_response(service.execution_stop_fault())
 
     @app.post("/api/execution/stop-fault/recover")
-    def execution_recover_stop_fault(
+    async def execution_recover_stop_fault(
         body: StopFaultRecoveryIntentRequest,
     ) -> JSONResponse:
-        return execution_response(service.execution_recover_stop_fault(body))
+        return execution_response(
+            await control_call(lambda: service.execution_recover_stop_fault(body))
+        )
 
     @app.post("/api/execution/runtime-scale-control")
-    def execution_set_runtime_scale_control(
+    async def execution_set_runtime_scale_control(
         body: RuntimeScaleControlRequest,
         request: Request,
     ) -> JSONResponse:
+        attribution = _trusted_attribution(request, trusted_principal_adapter)
         return execution_response(
-            service.execution_set_runtime_scale_control(
-                body, _trusted_attribution(request, trusted_principal_adapter)
+            await control_call(
+                lambda: service.execution_set_runtime_scale_control(
+                    body,
+                    attribution,
+                )
             )
         )
 
@@ -1298,19 +1502,23 @@ def create_app(
             Query(ge=1, le=_MAXIMUM_SAFE_INTEGER),
         ] = None,
         limit: Annotated[int, Query(ge=1, le=_MAXIMUM_HISTORY_PAGE)] = 32,
-    ) -> dict[str, Any]:
+    ) -> JSONResponse:
         if start_ns is not None and end_ns is not None and start_ns > end_ns:
             raise HeadlessApiError(
                 "historian_query_invalid",
                 "start_ns must not exceed end_ns",
             )
-        return service.history(
-            start_ns=start_ns,
-            end_ns=end_ns,
-            components=components or (),
-            event_types=event_types or (),
-            before_sequence=before_sequence,
-            limit=limit,
+        # Encode this potentially large bounded page in the synchronous route
+        # worker instead of blocking the shared ASGI event loop.
+        return JSONResponse(
+            content=service.history(
+                start_ns=start_ns,
+                end_ns=end_ns,
+                components=components or (),
+                event_types=event_types or (),
+                before_sequence=before_sequence,
+                limit=limit,
+            )
         )
 
     @app.get("/api/execution/history/health")

@@ -676,7 +676,7 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
   EXPECT_EQ(qualified_count, 11U);
   EXPECT_EQ(registry.qualification_registry_digest().value(),
             "sha256:"
-            "04144f5a593b5cce338e44207f017d0c1c045605cc89c2284b3ee1e189176122");
+            "43087ef20c219f1687f11c2407afb6769bddc896f4a87c8724fe53398dc1ad57");
   EXPECT_NE(
       registry.find_qualified_value_schema(
           core::SchemaId("manyforge.value_schema.provider_contract.empty.v1"),
@@ -701,8 +701,8 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
       registry.find_qualified_value_schema(
           core::SchemaId("manyforge.value_schema.runtime.native_execution.v1"),
           core::SchemaRevision("sha256:"
-                               "bbdbef03855e2e09015386168c37a590d0e22ca51dcbfb539"
-                               "0ff1ab645f4e28a")),
+                               "4be97ca6314af96d083a37a6aed9ef5976ed0e63c02d69ac"
+                               "790377edeb6804fb")),
       nullptr);
   EXPECT_EQ(registry.find_qualified_value_schema(
                 core::SchemaId("manyforge.none.v1"),

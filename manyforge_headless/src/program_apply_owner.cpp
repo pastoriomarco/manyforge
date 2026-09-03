@@ -570,6 +570,8 @@ CanonicalValue ProgramSelectionOwner::Prepare(
         source_root);
     const deployment::FilesystemVerifiedProgramBindingSource
         baseline_binding_source(source_root);
+    const deployment::FilesystemVerifiedProgramSource baseline_program_source(
+        source_root);
     const auto bundle =
         bundle_source.get_verified(scenario.retained_bundle_id);
     Require(bundle != nullptr, "program_apply_bundle_invalid",
@@ -579,6 +581,12 @@ CanonicalValue ProgramSelectionOwner::Prepare(
         scenario.program_binding_id, *bundle, model_map);
     Require(baseline != nullptr, "program_apply_baseline_binding_invalid",
             "Program Apply occurrence has no verified baseline binding");
+    const auto baseline_program = baseline_program_source.get_verified(
+        baseline->value().program_id, baseline->value().program_revision,
+        *bundle);
+    Require(baseline_program != nullptr,
+            "program_apply_baseline_program_invalid",
+            "Program Apply occurrence has no verified baseline Program");
 
     const auto program = [&]() {
       try {
@@ -680,6 +688,8 @@ CanonicalValue ProgramSelectionOwner::Prepare(
             "Program Apply retained closure did not reopen exactly");
     auto artifact_model_map =
         LoadModelMap(*artifact_bundle, artifact_model_map_source_);
+    static_cast<void>(
+        program_repository_.put_if_absent(baseline_program, *artifact_bundle));
     static_cast<void>(binding_repository_.put_if_absent(
         baseline, *artifact_bundle, artifact_model_map));
     static_cast<void>(

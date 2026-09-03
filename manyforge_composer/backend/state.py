@@ -216,7 +216,15 @@ class ComposerState:
             else self.node_catalog
         )
 
-    def _restore_authoring_post_image(self, value: dict[str, Any]) -> None:
+    def _restore_authoring_post_image(
+        self,
+        value: dict[str, Any],
+        *,
+        catalog: Any | None = None,
+    ) -> None:
+        authoring_catalog = (
+            self._active_authoring_catalog() if catalog is None else catalog
+        )
         if value.get("schema_version") == "manyforge.composer_authoring_workspace.v2":
             if set(value) != {"schema_version", "program", "deployment"}:
                 raise AuthoringJournalError(
@@ -224,13 +232,11 @@ class ComposerState:
                     "retained Composer workspace has an invalid shape",
                 )
             self.draft_session.restore_retained_state(
-                value["program"], self._active_authoring_catalog()
+                value["program"], authoring_catalog
             )
             self.deployment_draft_session.restore_retained_state(value["deployment"])
             return
-        self.draft_session.restore_retained_state(
-            value, self._active_authoring_catalog()
-        )
+        self.draft_session.restore_retained_state(value, authoring_catalog)
 
     def authoring_retained_state(self) -> dict[str, Any]:
         """Return one durable post-image for the separate authored documents."""
@@ -723,7 +729,15 @@ class ComposerState:
                 "scenario_load_deployment_mismatch",
                 "the target Deployment was no longer active after Program Apply",
             )
-        self._restore_authoring_post_image(deepcopy(intent["post_state"]))
+        # Preflight parsed this exact post-image with the immutable local
+        # build-qualified catalog before the authoring claim. Program Apply
+        # can refresh Runner availability asynchronously, so reparsing against
+        # a second live join here would create a timing dependency inside the
+        # already-admitted transaction.
+        self._restore_authoring_post_image(
+            deepcopy(intent["post_state"]),
+            catalog=self.node_catalog,
+        )
         return {
             "status": "loaded",
             "headless": {
@@ -1025,13 +1039,18 @@ class ComposerState:
                 "startup Load Scenario requires Headless-backed authoring",
             )
         selection = self.headless_client.scenario_load_selection(scenario_id)
-        admission = self.headless_client.authoring_admission()
-        generation = admission.get("admission_generation")
-        if admission.get("authoring_allowed") is not True or type(generation) is not int:
-            raise AuthoringJournalError(
-                "scenario_load_authoring_not_ready",
-                "startup Load Scenario requires idle authoring admission",
-            )
+        deadline = time.monotonic() + _SCENARIO_LOAD_TIMEOUT_SECONDS
+        while True:
+            admission = self.headless_client.authoring_admission()
+            generation = admission.get("admission_generation")
+            if admission.get("authoring_allowed") is True and type(generation) is int:
+                break
+            if time.monotonic() >= deadline:
+                raise AuthoringJournalError(
+                    "scenario_load_authoring_not_ready",
+                    "startup Load Scenario requires idle authoring admission",
+                )
+            time.sleep(_SCENARIO_LOAD_POLL_SECONDS)
         request_id = "development-load-scenario-" + uuid.uuid4().hex
         return self.load_scenario(
             AuthoringMutationEnvelope(

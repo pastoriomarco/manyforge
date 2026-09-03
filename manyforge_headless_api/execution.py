@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import math
 import socket
+import sys
 import threading
 import time
+from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Any, Protocol
 import unicodedata
@@ -160,6 +162,8 @@ class ExecutionPort(Protocol):
 
     def observation(self) -> dict[str, Any]: ...
 
+    def open_observation_session(self) -> "ExecutionObservationSession": ...
+
     def submit(
         self,
         request: OperationIntentRequest,
@@ -301,6 +305,179 @@ def _canonical_json(value: dict[str, Any]) -> bytes:
         ) from exc
 
 
+def _decode_execution_response(payload: bytes, flags: int) -> dict[str, Any]:
+    if flags & socket.MSG_TRUNC or not payload:
+        raise HeadlessApiError(
+            "execution_command_response_invalid",
+            "execution response is empty or oversized",
+        )
+    try:
+        text = payload.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise HeadlessApiError(
+            "execution_command_response_invalid",
+            "execution response is not UTF-8",
+        ) from exc
+    response = strict_json_object(text, label="execution command response")
+    try:
+        canonical_response = rfc8785.dumps(response)
+    except (
+        rfc8785.CanonicalizationError,
+        UnicodeError,
+        ValueError,
+    ) as exc:
+        raise HeadlessApiError(
+            "execution_command_response_invalid",
+            "execution response is not canonically encodable",
+        ) from exc
+    if canonical_response != payload:
+        raise HeadlessApiError(
+            "execution_command_response_invalid",
+            "execution response is not canonical JSON",
+        )
+    if response.get("api_version") != EXECUTION_RESPONSE_VERSION:
+        raise HeadlessApiError(
+            "execution_command_response_invalid",
+            "execution response version is unsupported",
+        )
+    if type(response.get("ok")) is not bool:
+        raise HeadlessApiError(
+            "execution_command_response_invalid",
+            "execution response has no boolean result",
+        )
+    return response
+
+
+class ExecutionObservationSession(AbstractContextManager["ExecutionObservationSession"]):
+    """One demand-driven native observation session; no timer or state cache."""
+
+    def __init__(
+        self,
+        run_root: PinnedRunRoot,
+        socket_path: Path,
+    ) -> None:
+        self._run_root = run_root
+        self._socket_path = socket_path
+        self._address_context: Any | None = None
+        self._socket: socket.socket | None = None
+        self._close_lock = threading.Lock()
+
+    def __enter__(self) -> "ExecutionObservationSession":
+        if self._socket is not None:
+            raise RuntimeError("execution observation session is already open")
+        try:
+            context = self._run_root.socket_address(self._socket_path.name)
+            socket_address = context.__enter__()
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            client.setsockopt(
+                socket.SOL_SOCKET,
+                socket.SO_RCVBUF,
+                MAX_EXECUTION_RESPONSE_BYTES,
+            )
+            # A short receive timeout only makes cancellation observable. It
+            # never causes another request or owner read.
+            client.settimeout(0.25)
+            client.connect(socket_address)
+        except Exception:
+            if "client" in locals():
+                client.close()
+            if "context" in locals():
+                context.__exit__(*sys.exc_info())
+            raise
+        self._address_context = context
+        self._socket = client
+        return self
+
+    def close(self) -> None:
+        with self._close_lock:
+            client = self._socket
+            self._socket = None
+        if client is not None:
+            client.close()
+        context = self._address_context
+        self._address_context = None
+        if context is not None:
+            context.__exit__(None, None, None)
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def next(
+        self,
+        cursor: dict[str, Any] | None,
+        cancelled: threading.Event,
+    ) -> dict[str, Any]:
+        if cursor is not None and (
+            set(cursor) != {"owner_epoch", "source_epoch", "source_sequence"}
+            or not isinstance(cursor.get("owner_epoch"), str)
+            or not cursor["owner_epoch"]
+            or not isinstance(cursor.get("source_epoch"), str)
+            or not cursor["source_epoch"]
+            or type(cursor.get("source_sequence")) is not int
+            or not 0 <= cursor["source_sequence"] <= MAXIMUM_SAFE_INTEGER
+        ):
+            raise HeadlessApiError(
+                "execution_observation_cursor_invalid",
+                "execution observation cursor is invalid",
+            )
+        command = {
+            "api_version": EXECUTION_COMMAND_VERSION,
+            "after_owner_epoch": None if cursor is None else cursor["owner_epoch"],
+            "after_source_epoch": None if cursor is None else cursor["source_epoch"],
+            "after_source_sequence": (
+                None if cursor is None else cursor["source_sequence"]
+            ),
+            "command": "observation",
+        }
+        encoded = _canonical_json(command)
+        client = self._socket
+        if client is None:
+            raise HeadlessApiError(
+                "execution_owner_unavailable",
+                "native execution observation session is closed",
+            )
+        try:
+            sent = client.send(encoded)
+            if sent != len(encoded):
+                raise HeadlessApiError(
+                    "execution_command_transport_failure",
+                    "execution observation request was truncated",
+                )
+            while not cancelled.is_set():
+                try:
+                    payload, _ancillary, flags, _address = client.recvmsg(
+                        MAX_EXECUTION_RESPONSE_BYTES
+                    )
+                    response = _decode_execution_response(payload, flags)
+                    if response.get("ok") is True and (
+                        response.get("command") != "observation"
+                        or not isinstance(response.get("observation"), dict)
+                    ):
+                        raise HeadlessApiError(
+                            "execution_command_response_invalid",
+                            "native execution observation response is invalid",
+                        )
+                    return response
+                except socket.timeout:
+                    continue
+        except HeadlessApiError:
+            raise
+        except (OSError, TimeoutError) as exc:
+            if cancelled.is_set():
+                raise HeadlessApiError(
+                    "execution_observation_cancelled",
+                    "execution observation demand ended",
+                ) from exc
+            raise HeadlessApiError(
+                "execution_owner_unavailable",
+                f"native execution observation transport failed: {exc}",
+            ) from exc
+        raise HeadlessApiError(
+            "execution_observation_cancelled",
+            "execution observation demand ended",
+        )
+
+
 def _sparse_request_with_complete_context(request: Any) -> dict[str, Any]:
     """Keep optional request fields sparse without weakening context shape.
 
@@ -388,46 +565,7 @@ class ExecutionCommandClient:
                 "execution_owner_unavailable",
                 f"native execution transport failed: {exc}",
             ) from exc
-        if flags & socket.MSG_TRUNC or not payload:
-            raise HeadlessApiError(
-                "execution_command_response_invalid",
-                "execution response is empty or oversized",
-            )
-        try:
-            text = payload.decode("utf-8", errors="strict")
-        except UnicodeDecodeError as exc:
-            raise HeadlessApiError(
-                "execution_command_response_invalid",
-                "execution response is not UTF-8",
-            ) from exc
-        response = strict_json_object(text, label="execution command response")
-        try:
-            canonical_response = rfc8785.dumps(response)
-        except (
-            rfc8785.CanonicalizationError,
-            UnicodeError,
-            ValueError,
-        ) as exc:
-            raise HeadlessApiError(
-                "execution_command_response_invalid",
-                "execution response is not canonically encodable",
-            ) from exc
-        if canonical_response != payload:
-            raise HeadlessApiError(
-                "execution_command_response_invalid",
-                "execution response is not canonical JSON",
-            )
-        if response.get("api_version") != EXECUTION_RESPONSE_VERSION:
-            raise HeadlessApiError(
-                "execution_command_response_invalid",
-                "execution response version is unsupported",
-            )
-        if type(response.get("ok")) is not bool:
-            raise HeadlessApiError(
-                "execution_command_response_invalid",
-                "execution response has no boolean result",
-            )
-        return response
+        return _decode_execution_response(payload, flags)
 
     def stop_program_run(
         self,
@@ -458,6 +596,54 @@ class ExecutionCommandClient:
             raise HeadlessApiError(
                 "execution_command_response_identity_mismatch",
                 "Program-run Stop acceptance does not match its request",
+            )
+        return response
+
+    def release_program_run_stop_fence(
+        self,
+        program_run_id: str,
+        stop_id: str,
+        stop_generation: int,
+    ) -> dict[str, Any]:
+        """Reopen one exact internally owned Program-run Stop boundary."""
+
+        if self._attribution_transport != "internal":
+            raise HeadlessApiError(
+                "execution_request_attribution_invalid",
+                "Program-run Stop release is available only to the internal owner transport",
+            )
+        for label, value in (
+            ("Program-run identity", program_run_id),
+            ("Stop identity", stop_id),
+        ):
+            if (
+                not isinstance(value, str)
+                or not value
+                or unicodedata.normalize("NFC", value) != value
+                or len(value.encode("utf-8")) > 2_048
+            ):
+                raise ValueError(f"{label} must be bounded non-empty NFC text")
+        if (
+            type(stop_generation) is not int
+            or not 1 <= stop_generation <= MAXIMUM_SAFE_INTEGER
+        ):
+            raise ValueError("Stop generation is outside its safe bound")
+        response = self._exchange(
+            {
+                "api_version": EXECUTION_COMMAND_VERSION,
+                "attribution": self._request_attribution(None),
+                "command": "release_program_run_stop_fence",
+                "program_run_id": program_run_id,
+                "stop_generation": stop_generation,
+                "stop_id": stop_id,
+            }
+        )
+        if response.get("ok") is True and response.get("command") != (
+            "release_program_run_stop_fence"
+        ):
+            raise HeadlessApiError(
+                "execution_command_response_identity_mismatch",
+                "Program-run Stop release response changed its command identity",
             )
         return response
 
@@ -610,6 +796,12 @@ class ExecutionCommandClient:
     def observation(self) -> dict[str, Any]:
         return self._read_projection_on(
             "observation", self._observation_socket_path
+        )
+
+    def open_observation_session(self) -> ExecutionObservationSession:
+        return ExecutionObservationSession(
+            self._run_root,
+            self._observation_socket_path,
         )
 
     @staticmethod
@@ -1937,4 +2129,9 @@ class ExecutionEventPump:
                 self._stop.wait(self._poll_seconds)
 
 
-__all__ = ["ExecutionCommandClient", "ExecutionEventPump", "ExecutionPort"]
+__all__ = [
+    "ExecutionCommandClient",
+    "ExecutionEventPump",
+    "ExecutionObservationSession",
+    "ExecutionPort",
+]

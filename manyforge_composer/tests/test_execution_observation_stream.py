@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import queue
+import threading
 from typing import Any
 
 import pytest
@@ -84,62 +86,105 @@ def test_encode_execution_observation_frame_is_one_canonical_payload() -> None:
     assert encoded.startswith('{"cell_id":"cell-1",')
 
 
-def test_each_completed_observation_anchors_the_next_deadline() -> None:
-    assert stream._next_poll_deadline(0.1, 10.05) == pytest.approx(10.15)
-    assert stream._next_poll_deadline(0.25, 10.15) == pytest.approx(10.4)
+class _Upstream:
+    def __init__(self, owner: "_Client") -> None:
+        self.owner = owner
+
+    def __enter__(self) -> "_Upstream":
+        self.owner.connections += 1
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
+
+    def next(
+        self,
+        cursor: dict[str, Any] | None,
+        cancelled: threading.Event,
+    ) -> dict[str, Any]:
+        self.owner.cursors.put(cursor)
+        while not cancelled.is_set():
+            try:
+                return self.owner.responses.get(timeout=0.01)
+            except queue.Empty:
+                continue
+        raise RuntimeError("cancelled")
 
 
-def test_source_is_demand_bound_change_only_and_capacity_one(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class Client:
-        def __init__(self) -> None:
-            self.calls = 0
+class _Client:
+    def __init__(self) -> None:
+        self.connections = 0
+        self.cursors: queue.Queue[dict[str, Any] | None] = queue.Queue()
+        self.responses: queue.Queue[dict[str, Any]] = queue.Queue()
 
-        def execution_observation(self) -> dict[str, Any]:
-            self.calls += 1
-            if self.calls <= 2:
-                return _status(sequence=self.calls, position=0.1)
-            return _status(sequence=self.calls, position=float(self.calls))
+    def open_execution_observation_stream(self) -> _Upstream:
+        return _Upstream(self)
 
+
+async def _next_cursor(client: _Client) -> dict[str, Any] | None:
+    return await asyncio.to_thread(client.cursors.get, True, 1.0)
+
+
+async def _wait_for_error(source: stream.ExecutionObservationSource) -> None:
+    for _ in range(1_000):
+        if source.status()["source"]["error_count"] > 0:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("source error was not published")
+
+
+def test_source_is_change_driven_credited_and_independent_per_browser() -> None:
     async def exercise() -> None:
-        monkeypatch.setattr(stream, "_OBSERVATION_PERIOD_S", 0.001)
-        client = Client()
+        client = _Client()
         source = stream.ExecutionObservationSource(client)  # type: ignore[arg-type]
-        assert client.calls == 0
         subscription = source.subscribe()
-        for _ in range(200):
-            if source.status()["fanout"]["replaced_frames_total"] > 0:
-                break
-            # The owner sampler is a dedicated thread. Give the event loop a
-            # bounded scheduling opportunity to drain its capacity-one ingress.
-            await asyncio.sleep(0.001)
-        status = source.status()
-        assert status["source"]["poll_count"] >= 3
-        assert status["source"]["published_count"] < status["source"]["poll_count"]
-        assert status["source"]["last_poll_duration_us"] >= 0
-        assert status["source"]["max_poll_duration_us"] >= (
-            status["source"]["last_poll_duration_us"]
-        )
-        assert status["fanout"]["replaced_frames_total"] > 0
-        assert subscription.queue.qsize() == 1
-        latest_payload = subscription.queue.get_nowait()
-        latest = json.loads(latest_payload)
-        assert latest["source_sequence"] <= client.calls
-        assert latest["positions_rad"] == [
-            float(latest["source_sequence"]),
-            -float(latest["source_sequence"]),
-        ]
-        assert status["source"]["ingress_replaced_frames"] >= 0
-        assert status["source"]["ingress_schedule_failures"] == 0
+        assert client.connections == 0
+        source.grant_credit(subscription, None)
+        assert await _next_cursor(client) is None
+        client.responses.put(_status(sequence=1, position=0.1))
+        await asyncio.wait_for(subscription.wake.wait(), timeout=1.0)
+        first = json.loads(source.take_payload(subscription) or "null")
+        assert first["source_sequence"] == 1
 
+        # No acknowledgement means no second upstream request or frame.
+        await asyncio.sleep(0)
+        assert client.cursors.empty()
+
+        source.grant_credit(subscription, ("execution-owner.1", "joint-source.1", 1))
+        assert await _next_cursor(client) == {
+            "owner_epoch": "execution-owner.1",
+            "source_epoch": "joint-source.1",
+            "source_sequence": 1,
+        }
+        client.responses.put(_status(sequence=2, position=0.2))
+        await asyncio.wait_for(subscription.wake.wait(), timeout=1.0)
+        second_frame = json.loads(source.take_payload(subscription) or "null")
+        assert second_frame["source_sequence"] == 2
+
+        # A new browser receives the shared current frame without another
+        # owner request. Its missing acknowledgement cannot block the first.
         second = source.subscribe()
-        second_payload = second.queue.get_nowait()
-        assert second_payload is latest_payload
-        assert json.loads(second_payload)["source_sequence"] == latest["source_sequence"]
+        source.grant_credit(second, None)
+        await asyncio.wait_for(second.wake.wait(), timeout=1.0)
+        assert json.loads(source.take_payload(second) or "null")["source_sequence"] == 2
+        source.grant_credit(
+            subscription,
+            ("execution-owner.1", "joint-source.1", 2),
+        )
+        assert (await _next_cursor(client))["source_sequence"] == 2  # type: ignore[index]
+        client.responses.put(_status(sequence=3, position=0.3))
+        await asyncio.wait_for(subscription.wake.wait(), timeout=1.0)
+        assert json.loads(source.take_payload(subscription) or "null")["source_sequence"] == 3
+        assert not second.wake.is_set()
+
+        status = source.status()
+        assert status["source"]["mode"] == "change_driven"
+        assert status["source"]["periodic_http_requests"] == 0
+        assert status["source"]["wake_count"] == 3
+        assert status["fanout"]["capacity_per_client"] == 1
         source.unsubscribe(second)
         source.unsubscribe(subscription)
-        await asyncio.sleep(0)
+        source.close()
         status = source.status()
         assert status["fanout"]["client_count"] == 0
         assert status["source"]["active"] is False
@@ -147,75 +192,189 @@ def test_source_is_demand_bound_change_only_and_capacity_one(
     asyncio.run(exercise())
 
 
-def test_source_rejects_changed_state_at_the_same_source_sequence(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class Client:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        def execution_observation(self) -> dict[str, Any]:
-            self.calls += 1
-            return _status(sequence=7, position=float(self.calls))
-
+def test_source_coalesces_visual_heartbeats_but_retains_the_latest_cursor() -> None:
     async def exercise() -> None:
-        monkeypatch.setattr(stream, "_OBSERVATION_PERIOD_S", 0.0)
-        monkeypatch.setattr(stream, "_OBSERVATION_ERROR_PERIOD_S", 0.0)
-        source = stream.ExecutionObservationSource(Client())  # type: ignore[arg-type]
-        subscription = source.subscribe()
-        first = json.loads(await subscription.queue.get())
-        assert first["positions_rad"] == [1.0, -1.0]
-        for _ in range(200):
-            if source.status()["source"]["error_count"] > 0:
-                break
-            # Give the dedicated owner-sampling thread a bounded scheduling
-            # opportunity rather than spinning the event loop.
-            await asyncio.sleep(0.001)
-        status = source.status()["source"]
-        assert status["published_count"] == 1
-        assert status["error_count"] > 0
-        assert status["last_error"]["message"] == (
-            "execution observation changed without advancing its source sequence"
+        client = _Client()
+        source = stream.ExecutionObservationSource(
+            client,  # type: ignore[arg-type]
+            monotonic=lambda: 12.5,
         )
-        source.unsubscribe(subscription)
+        fast = source.subscribe()
+        source.grant_credit(fast, None)
+        assert await _next_cursor(client) is None
+        client.responses.put(_status(sequence=1, position=0.1))
+        await asyncio.wait_for(fast.wake.wait(), timeout=1.0)
+        first = json.loads(source.take_payload(fast) or "null")
+        assert first["received_at_monotonic_us"] == 12_500_000
+
+        source.grant_credit(
+            fast,
+            ("execution-owner.1", "joint-source.1", 1),
+        )
+        assert (await _next_cursor(client)) == {
+            "owner_epoch": "execution-owner.1",
+            "source_epoch": "joint-source.1",
+            "source_sequence": 1,
+        }
+        client.responses.put(_status(sequence=2, position=0.1))
+        next_cursor = await _next_cursor(client)
+        assert source.status()["fanout"]["coalesced_frames_total"] == 1
+        assert not fast.wake.is_set()
+
+        # First demand from another browser receives the newest complete
+        # identity even though the pose itself did not need another render.
+        slow = source.subscribe()
+        source.grant_credit(slow, None)
+        await asyncio.wait_for(slow.wake.wait(), timeout=1.0)
+        retained = json.loads(source.take_payload(slow) or "null")
+        assert retained["source_sequence"] == 2
+
+        # The original credit stays live and the next visual change advances
+        # immediately; the unacknowledged second browser is independent.
+        assert next_cursor["source_sequence"] == 2  # type: ignore[index]
+        client.responses.put(_status(sequence=3, position=0.3))
+        await asyncio.wait_for(fast.wake.wait(), timeout=1.0)
+        assert json.loads(source.take_payload(fast) or "null")["source_sequence"] == 3
+        assert not slow.wake.is_set()
+
+        source.unsubscribe(slow)
+        source.unsubscribe(fast)
+        source.close()
 
     asyncio.run(exercise())
 
 
-def test_source_accepts_a_fresh_restart_epoch_with_a_lower_sequence(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class Client:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        def execution_observation(self) -> dict[str, Any]:
-            self.calls += 1
-            response = _status(
-                sequence=50 if self.calls == 1 else 1,
-                position=0.1 if self.calls == 1 else 0.2,
-            )
-            if self.calls > 1:
-                response["observation"]["owner_epoch"] = "execution-owner.2"
-                response["observation"]["source_epoch"] = "joint-source.2"
-            return response
-
+def test_static_visible_credit_over_24_hours_creates_no_periodic_source_work() -> None:
     async def exercise() -> None:
-        monkeypatch.setattr(stream, "_OBSERVATION_PERIOD_S", 0.001)
-        source = stream.ExecutionObservationSource(Client())  # type: ignore[arg-type]
+        now = 0.0
+        client = _Client()
+        source = stream.ExecutionObservationSource(
+            client,  # type: ignore[arg-type]
+            monotonic=lambda: now,
+        )
         subscription = source.subscribe()
-        for _ in range(200):
-            if source.status()["source"]["published_count"] >= 2:
-                break
-            await asyncio.sleep(0.001)
+        source.grant_credit(subscription, None)
+        assert await _next_cursor(client) is None
+        client.responses.put(_status(sequence=1, position=0.1))
+        await asyncio.wait_for(subscription.wake.wait(), timeout=1.0)
+        source.take_payload(subscription)
+        applied = ("execution-owner.1", "joint-source.1", 1)
+        source.grant_credit(subscription, applied)
+        assert await _next_cursor(client) == {
+            "owner_epoch": "execution-owner.1",
+            "source_epoch": "joint-source.1",
+            "source_sequence": 1,
+        }
+
+        # Advance a manual clock through the same coarse 15-second renewals as
+        # the browser. One long-lived owner wait stays in flight; passage of
+        # time alone cannot create another read, frame, encode, or send.
+        for _ in range((25 * 60 * 60) // 15):
+            now += 15.0
+            source.grant_credit(subscription, applied)
+
+        assert now > 24 * 60 * 60
+        assert client.cursors.empty()
+        status = source.status()
+        assert status["source"]["wake_count"] == 1
+        assert status["source"]["published_count"] == 1
+        assert status["fanout"]["sent_count"] == 1
+        assert status["fanout"]["credit_count"] == 6_002
+        source.unsubscribe(subscription)
+        source.close()
+
+    asyncio.run(exercise())
+
+
+def test_source_bounds_clients_and_rejects_stale_acknowledgements() -> None:
+    async def exercise() -> None:
+        client = _Client()
+        source = stream.ExecutionObservationSource(client)  # type: ignore[arg-type]
+        subscriptions = [
+            source.subscribe()
+            for _ in range(stream.MAXIMUM_OBSERVATION_CLIENTS)
+        ]
+        with pytest.raises(RuntimeError, match="client limit"):
+            source.subscribe()
+
+        first = subscriptions[0]
+        source.grant_credit(first, None)
+        await _next_cursor(client)
+        client.responses.put(_status(sequence=1, position=0.1))
+        await asyncio.wait_for(first.wake.wait(), timeout=1.0)
+        source.take_payload(first)
+        with pytest.raises(ValueError, match="stale"):
+            source.grant_credit(
+                first,
+                ("execution-owner.1", "joint-source.1", 99),
+            )
+
+        for subscription in subscriptions:
+            source.unsubscribe(subscription)
+        source.close()
+
+    asyncio.run(exercise())
+
+
+def test_source_rejects_changed_state_at_the_same_source_sequence() -> None:
+    async def exercise() -> None:
+        client = _Client()
+        source = stream.ExecutionObservationSource(client)  # type: ignore[arg-type]
+        subscription = source.subscribe()
+        source.grant_credit(subscription, None)
+        assert await _next_cursor(client) is None
+        client.responses.put(_status(sequence=7, position=1.0))
+        await asyncio.wait_for(subscription.wake.wait(), timeout=1.0)
+        first = json.loads(source.take_payload(subscription) or "null")
+        assert first["positions_rad"] == [1.0, -1.0]
+        source.grant_credit(
+            subscription,
+            ("execution-owner.1", "joint-source.1", 7),
+        )
+        await _next_cursor(client)
+        client.responses.put(_status(sequence=7, position=2.0))
+        await _wait_for_error(source)
+        status = source.status()["source"]
+        assert status["published_count"] == 1
+        assert status["error_count"] == 1
+        assert status["last_error"]["message"] == (
+            "execution observation changed without advancing its source sequence"
+        )
+        source.unsubscribe(subscription)
+        source.close()
+
+    asyncio.run(exercise())
+
+
+def test_source_accepts_a_fresh_restart_epoch_with_a_lower_sequence() -> None:
+    async def exercise() -> None:
+        client = _Client()
+        source = stream.ExecutionObservationSource(client)  # type: ignore[arg-type]
+        subscription = source.subscribe()
+        source.grant_credit(subscription, None)
+        await _next_cursor(client)
+        client.responses.put(_status(sequence=50, position=0.1))
+        await asyncio.wait_for(subscription.wake.wait(), timeout=1.0)
+        source.take_payload(subscription)
+        source.grant_credit(
+            subscription,
+            ("execution-owner.1", "joint-source.1", 50),
+        )
+        await _next_cursor(client)
+        restarted = _status(sequence=1, position=0.2)
+        restarted["observation"]["owner_epoch"] = "execution-owner.2"
+        restarted["observation"]["source_epoch"] = "joint-source.2"
+        client.responses.put(restarted)
+        await asyncio.wait_for(subscription.wake.wait(), timeout=1.0)
         status = source.status()["source"]
         assert status["published_count"] == 2
         assert status["error_count"] == 0
-        latest = json.loads(subscription.queue.get_nowait())
+        latest = json.loads(source.take_payload(subscription) or "null")
         assert latest["owner_epoch"] == "execution-owner.2"
         assert latest["source_epoch"] == "joint-source.2"
         assert latest["source_sequence"] == 1
         assert latest["positions_rad"] == [0.2, -0.2]
         source.unsubscribe(subscription)
+        source.close()
 
     asyncio.run(exercise())

@@ -365,6 +365,9 @@ class HeadlessService:
     def execution_observation(self) -> dict[str, Any]:
         return self._execution().observation()
 
+    def open_execution_observation_session(self) -> Any:
+        return self._execution().open_observation_session()
+
     def execution_submit(
         self,
         request: OperationIntentRequest,

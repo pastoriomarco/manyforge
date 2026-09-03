@@ -1115,12 +1115,12 @@ function MeasuredRobotFrameDriver({
 
   const acceptPresentation = useCallback((
     next: NonNullable<RuntimeScenePresentation['measuredRobot']>,
-  ) => {
+  ): boolean => {
     // Admit the robot as one coherent batch. A partial transform set must not
     // move a subset of links and visually invent a torn robot state.
     for (const [linkName, target] of linkGroups) {
       if (target.current !== null && next.linkTransforms[linkName] === undefined) {
-        return;
+        return false;
       }
     }
 
@@ -1172,14 +1172,17 @@ function MeasuredRobotFrameDriver({
       changed = true;
     }
     if (changed) wake();
+    return true;
   }, [interpolationDurationMs, linkGroups, manifestModelKey, wake]);
 
   const acceptLatestLivePresentation = useCallback(() => {
     const current = livePresentation?.readMeasuredRobotPresentation() ?? null;
     if (current === null) return false;
+    const accepted = acceptPresentation(current);
+    if (!accepted) return false;
     acceptedLiveFrame.current = true;
-    acceptPresentation(current);
-    return true;
+    livePresentation?.markMeasuredRobotPresentationApplied(current);
+    return accepted;
   }, [acceptPresentation, livePresentation]);
 
   const applyLatestFrame = useCallback(() => {

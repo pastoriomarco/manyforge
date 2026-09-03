@@ -843,6 +843,36 @@ TEST(RetainedObservedStateChannelTest,
   EXPECT_TRUE(channel.wait_for_fresh_state(0ns));
 }
 
+TEST(RetainedObservedStateChannelTest,
+     RenderChangeWakeIgnoresFreshnessOnlySamples) {
+  const auto binding =
+      make_binding(CoordinateKind::kLinear, "gripper.target", true);
+  RetainedObservedStateChannel channel(
+      binding, nullptr,
+      RetainedObservedStateChannelConfig{
+          ObservedStateSourceKind::kPredictedState, "native.predicted", 0, 1U});
+  const std::array<double, 1U> position{0.0};
+  const std::array<double, 1U> velocity{0.0};
+  ASSERT_TRUE(channel.publish_state(position, velocity, 100, 100).applied());
+  const auto before = channel.render_change_generation();
+  EXPECT_FALSE(channel.wait_for_render_change(before, 0ns));
+
+  ASSERT_TRUE(channel.publish_state(position, velocity, 101, 101).applied());
+  EXPECT_EQ(channel.render_change_generation(), before);
+  EXPECT_FALSE(channel.wait_for_render_change(before, 0ns));
+
+  std::promise<bool> changed;
+  auto changed_future = changed.get_future();
+  std::thread waiter(
+      [&] { changed.set_value(channel.wait_for_render_change(before, 1s)); });
+  const std::array<double, 1U> next_position{0.1};
+  ASSERT_TRUE(
+      channel.publish_state(next_position, velocity, 102, 102).applied());
+  EXPECT_TRUE(changed_future.get());
+  waiter.join();
+  EXPECT_GT(channel.render_change_generation(), before);
+}
+
 TEST(RetainedExecutionStateSinkTest,
      MotionProjectionNeverRepublishesTheAdapterSuppliedVector) {
   auto binding = make_binding(CoordinateKind::kAngular, "arm.target");

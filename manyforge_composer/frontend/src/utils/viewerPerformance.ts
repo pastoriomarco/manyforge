@@ -1,6 +1,7 @@
 import type { WebGLRenderer } from 'three';
 
 const MAX_RENDER_INTERVAL_SAMPLES = 512;
+const MAX_OBSERVATION_INTERVAL_SAMPLES = 512;
 const SOFTWARE_RENDERER_TOKENS = [
   'llvmpipe',
   'softpipe',
@@ -25,6 +26,39 @@ interface ViewerMetricWindow {
   longTasks: number;
   longTaskTotalMs: number;
   longTaskMaxMs: number;
+}
+
+interface ViewerObservationMetricWindow {
+  receivedFrames: number;
+  appliedFrames: number;
+  replacedBeforeApply: number;
+  maxUnappliedFrames: number;
+  lastReceived: ViewerObservationIdentity | null;
+  lastApplied: ViewerObservationIdentity | null;
+  receivedAtMs: number | null;
+  appliedAtMs: number | null;
+  applyIntervalsMs: number[];
+  receiveToApplyMs: number[];
+}
+
+export interface ViewerObservationIdentity {
+  ownerEpoch: string;
+  sourceEpoch: string;
+  sourceSequence: number;
+  receivedAtComposerMonotonicUs: number;
+}
+
+export interface ViewerObservationPerformanceSnapshot {
+  receivedFrames: number;
+  appliedFrames: number;
+  replacedBeforeApply: number;
+  maxUnappliedFrames: number;
+  lastReceived: ViewerObservationIdentity | null;
+  lastApplied: ViewerObservationIdentity | null;
+  applyIntervalP95Ms: number | null;
+  applyIntervalMaxMs: number | null;
+  receiveToApplyP95Ms: number | null;
+  receiveToApplyMaxMs: number | null;
 }
 
 export interface ViewerRendererInspection {
@@ -109,6 +143,8 @@ export interface ViewerQualificationObject {
   snapshot: () => ViewerQualificationSnapshot;
   take: () => ViewerQualificationSnapshot;
   reset: () => void;
+  observationFlow: () => ViewerObservationPerformanceSnapshot;
+  resetObservationFlow: () => void;
 }
 
 function newWindow(nowMs = performance.now()): ViewerMetricWindow {
@@ -132,6 +168,21 @@ function newWindow(nowMs = performance.now()): ViewerMetricWindow {
   };
 }
 
+function newObservationWindow(): ViewerObservationMetricWindow {
+  return {
+    receivedFrames: 0,
+    appliedFrames: 0,
+    replacedBeforeApply: 0,
+    maxUnappliedFrames: 0,
+    lastReceived: null,
+    lastApplied: null,
+    receivedAtMs: null,
+    appliedAtMs: null,
+    applyIntervalsMs: [],
+    receiveToApplyMs: [],
+  };
+}
+
 export function isSoftwareRenderer(renderer: string | null): boolean {
   const normalized = renderer?.toLowerCase() ?? '';
   return SOFTWARE_RENDERER_TOKENS.some((token) => normalized.includes(token));
@@ -148,10 +199,16 @@ export function inspectViewerRenderer(
   const renderer = String(
     context.getParameter(debugInfo?.UNMASKED_RENDERER_WEBGL ?? context.RENDERER) ?? '',
   );
+  // Firefox may privacy-sanitize the debug renderer to a generic NVIDIA name
+  // even when WebGL is running through llvmpipe. The base renderer remains an
+  // accurate software signal in that case, so use both without weakening the
+  // hardware identity reported when neither is software-rendered.
+  const baseRenderer = String(context.getParameter(context.RENDERER) ?? '');
+  const softwareRenderer = [renderer, baseRenderer].find(isSoftwareRenderer);
   return {
     vendor: vendor || null,
-    renderer: renderer || null,
-    software: isSoftwareRenderer(renderer),
+    renderer: softwareRenderer || renderer || baseRenderer || null,
+    software: softwareRenderer !== undefined,
   };
 }
 
@@ -183,8 +240,10 @@ function percentile95(values: number[]): number | null {
 }
 
 let metrics = newWindow();
+let observationMetrics = newObservationWindow();
 let observer: PerformanceObserver | null = null;
 let monitoring = false;
+let observationMonitoring = false;
 let pendingModelBuild: number | null = null;
 let qualificationViewerActive = false;
 let qualificationCanvasMounted = false;
@@ -358,6 +417,30 @@ function performanceSnapshot(nowMs = performance.now()): ViewerPerformanceSnapsh
   };
 }
 
+function boundedSample(samples: number[], value: number): void {
+  if (samples.length >= MAX_OBSERVATION_INTERVAL_SAMPLES) samples.shift();
+  samples.push(Math.min(60_000, Math.max(0, value)));
+}
+
+function observationPerformanceSnapshot(): ViewerObservationPerformanceSnapshot {
+  return {
+    receivedFrames: observationMetrics.receivedFrames,
+    appliedFrames: observationMetrics.appliedFrames,
+    replacedBeforeApply: observationMetrics.replacedBeforeApply,
+    maxUnappliedFrames: observationMetrics.maxUnappliedFrames,
+    lastReceived: observationMetrics.lastReceived === null
+      ? null : { ...observationMetrics.lastReceived },
+    lastApplied: observationMetrics.lastApplied === null
+      ? null : { ...observationMetrics.lastApplied },
+    applyIntervalP95Ms: percentile95(observationMetrics.applyIntervalsMs),
+    applyIntervalMaxMs: observationMetrics.applyIntervalsMs.length === 0
+      ? null : Math.max(...observationMetrics.applyIntervalsMs),
+    receiveToApplyP95Ms: percentile95(observationMetrics.receiveToApplyMs),
+    receiveToApplyMaxMs: observationMetrics.receiveToApplyMs.length === 0
+      ? null : Math.max(...observationMetrics.receiveToApplyMs),
+  };
+}
+
 export function connectViewerQualification(): (() => void) {
   if (!isViewerQualificationOptedIn() || typeof window === 'undefined') {
     return () => undefined;
@@ -374,6 +457,7 @@ export function connectViewerQualification(): (() => void) {
     }
   };
   const originalConsoleError = console.error;
+  observationMonitoring = true;
   const onConsoleError = (...values: unknown[]) => {
     const message = values.map((value) => String(value)).join(' ');
     if (/(canvas|webgl|three|viewer|scene|model|shader)/i.test(message)) {
@@ -405,6 +489,10 @@ export function connectViewerQualification(): (() => void) {
     reset: () => {
       metrics = newWindow();
     },
+    observationFlow: observationPerformanceSnapshot,
+    resetObservationFlow: () => {
+      observationMetrics = newObservationWindow();
+    },
   });
   Object.defineProperty(window, VIEWER_QUALIFICATION_GLOBAL, {
     configurable: true,
@@ -416,11 +504,49 @@ export function connectViewerQualification(): (() => void) {
     window.removeEventListener('error', onError);
     window.removeEventListener('unhandledrejection', onUnhandledRejection);
     if (console.error === onConsoleError) console.error = originalConsoleError;
+    observationMonitoring = false;
     const windowValues = window as unknown as Window & Record<string, unknown>;
     if (windowValues[VIEWER_QUALIFICATION_GLOBAL] === qualification) {
       delete windowValues[VIEWER_QUALIFICATION_GLOBAL];
     }
   };
+}
+
+export function recordViewerObservationReceived(
+  identity: ViewerObservationIdentity,
+  replacedBeforeApply: boolean,
+): void {
+  if (!observationMonitoring) return;
+  observationMetrics.receivedFrames += 1;
+  if (replacedBeforeApply) observationMetrics.replacedBeforeApply += 1;
+  observationMetrics.maxUnappliedFrames = Math.max(
+    observationMetrics.maxUnappliedFrames,
+    1,
+  );
+  observationMetrics.lastReceived = { ...identity };
+  observationMetrics.receivedAtMs = performance.now();
+}
+
+export function recordViewerObservationApplied(
+  identity: ViewerObservationIdentity,
+): void {
+  if (!observationMonitoring) return;
+  const nowMs = performance.now();
+  observationMetrics.appliedFrames += 1;
+  if (observationMetrics.appliedAtMs !== null) {
+    boundedSample(
+      observationMetrics.applyIntervalsMs,
+      nowMs - observationMetrics.appliedAtMs,
+    );
+  }
+  if (observationMetrics.receivedAtMs !== null) {
+    boundedSample(
+      observationMetrics.receiveToApplyMs,
+      nowMs - observationMetrics.receivedAtMs,
+    );
+  }
+  observationMetrics.appliedAtMs = nowMs;
+  observationMetrics.lastApplied = { ...identity };
 }
 
 export function startViewerPerformanceMonitoring(): void {

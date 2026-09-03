@@ -922,19 +922,47 @@ class ProgramRuntime:
     def cycle_status(self) -> dict[str, Any]:
         result = self._cycle_status_core()
         program_run_id = result["program_run_id"]
+        run = None
+        if program_run_id is not None:
+            try:
+                run = self.read_run(program_run_id)
+            except (KeyError, ProgramRunnerError):
+                # The cycle journal deliberately outlives an in-memory run.
+                # Revision hints are nullable and must not make an otherwise
+                # valid terminal/reconciliation cycle unreadable.
+                run = None
+        result["run_revision"] = None if run is None else run["run_revision"]
+        result["node_status_revision"] = (
+            None if run is None else run["node_status_revision"]
+        )
         controls = (
             None
             if program_run_id is None
             else self._optional_controls(program_run_id)
+        )
+        recovery_offer = self._recovery_offer(
+            program_run_id,
+            cycle_generation=result["cycle_generation"],
         )
         result["runtime_control_revision"] = (
             None
             if controls is None
             else controls.snapshot()["runtime_control_revision"]
         )
-        result["recovery_offer"] = self._recovery_offer(
-            program_run_id,
-            cycle_generation=result["cycle_generation"],
+        result["recovery_offer"] = recovery_offer
+        # This is the single shared browser observation. Publishing the exact
+        # projections here prevents every connected browser from re-reading
+        # the same run and controls after receiving their revision hints.
+        result["run"] = run
+        result["runtime_controls"] = (
+            None
+            if run is None or controls is None or program_run_id is None
+            else self._runtime_controls_projection(
+                program_run_id,
+                live=run,
+                controls=controls,
+                recovery_offer=recovery_offer,
+            )
         )
         return result
 
@@ -1984,10 +2012,14 @@ class ProgramRuntime:
                     environment=self._environment,
                     owner_availability=self._owner_availability,
                 )
-                provisional_run_id = f"program-cycle.{cycle.cycle_generation}"
-                scene_context_id = provisional_run_id
+                # One identity spans the synchronous Program-cycle claim,
+                # scene context, Program owner, and every Kernel operation.
+                # The Kernel can therefore fence a Run before its first
+                # ordinary motion submission arrives.
+                program_run_id = f"program-cycle.{cycle.cycle_generation}"
+                scene_context_id = program_run_id
                 scene_context, initial_scene, scene_proof = self._prepare_run_scene(
-                    run_admission, provisional_run_id
+                    run_admission, program_run_id
                 )
                 # Scene preparation may have consumed one or more short
                 # authored-scene claims. Acquire Run only from the fresh
@@ -1998,9 +2030,7 @@ class ProgramRuntime:
                     "claim_kind": "program_cycle",
                     "owner_role": "program_runner",
                     "owner_epoch": self.owner_epoch,
-                    "owner_transaction_id": (
-                        f"program-cycle.{cycle.cycle_generation}"
-                    ),
+                    "owner_transaction_id": program_run_id,
                     "request_id": request.request_id,
                     "request_payload_digest": self._digest(
                         request.model_dump(mode="json")
@@ -2015,7 +2045,7 @@ class ProgramRuntime:
                 }
                 journal.begin_acquire(
                     expected_generation=cycle.cycle_generation,
-                    provisional_run_id=provisional_run_id,
+                    provisional_run_id=program_run_id,
                     evidence=claim_intent,
                 )
                 try:
@@ -2039,7 +2069,7 @@ class ProgramRuntime:
                 try:
                     journal.remember_acquired_claim(
                         expected_generation=cycle.cycle_generation,
-                        provisional_run_id=provisional_run_id,
+                        provisional_run_id=program_run_id,
                         claim=claim,
                     )
                 except Exception as error:
@@ -2073,7 +2103,15 @@ class ProgramRuntime:
                 )
                 release_scene_context()
                 host_start_invoked = True
-                snapshot = self._host.start_run(run_admission)
+                snapshot = self._host.start_run(
+                    run_admission,
+                    program_run_id=program_run_id,
+                )
+                if snapshot.capture.program_run_id != program_run_id:
+                    raise ProgramRunnerError(
+                        "program_run_identity_mismatch",
+                        "Program owner did not retain the admitted Program-run identity",
+                    )
                 started_snapshot = snapshot.to_dict()
                 with self._runtime_controls_lock:
                     self._runtime_controls[snapshot.capture.program_run_id] = (
@@ -2214,10 +2252,14 @@ class ProgramRuntime:
                 str(error),
             ) from error
 
-    def read_runtime_controls(self, program_run_id: str) -> dict[str, Any]:
-        live = self.read_run(program_run_id)
-        controls = self._controls(program_run_id)
-        cycle = self._journal.read() if self._journal is not None else None
+    def _runtime_controls_projection(
+        self,
+        program_run_id: str,
+        *,
+        live: Mapping[str, Any],
+        controls: ProgramRuntimeControls,
+        recovery_offer: dict[str, Any] | None,
+    ) -> dict[str, Any]:
         return {
             "schema_version": "manyforge.program_runtime_control_projection.v2",
             "owner_id": self.owner_id,
@@ -2225,14 +2267,26 @@ class ProgramRuntime:
             "program_run_id": program_run_id,
             "run_revision": live["run_revision"],
             "runtime_controls": controls.snapshot(),
-            "recovery_offer": self._recovery_offer(
-                program_run_id,
-                cycle_generation=(1 if cycle is None else cycle.cycle_generation),
-            ),
+            "recovery_offer": recovery_offer,
             "observation_override_candidate": (
                 self._runtime_override_observation_candidate(program_run_id)
             ),
         }
+
+    def read_runtime_controls(self, program_run_id: str) -> dict[str, Any]:
+        live = self.read_run(program_run_id)
+        controls = self._controls(program_run_id)
+        cycle = self._journal.read() if self._journal is not None else None
+        cycle_generation = 1 if cycle is None else cycle.cycle_generation
+        return self._runtime_controls_projection(
+            program_run_id,
+            live=live,
+            controls=controls,
+            recovery_offer=self._recovery_offer(
+                program_run_id,
+                cycle_generation=cycle_generation,
+            ),
+        )
 
     def _control_effect(self, request, *, kind: str, effect) -> dict[str, Any]:
         if self._closed or not self._started:
@@ -3170,11 +3224,12 @@ class ProgramRuntime:
                 str(error) or type(error).__name__,
             )
         else:
-            try:
-                _admission, journal = self._require_cycle_owner()
-                journal.retain_run_snapshot(result)
-            except Exception:
-                pass
+            # Kernel acceptance is the durable containment boundary.  This
+            # immediate projection is still a running, nonterminal mirror; a
+            # synchronous cycle-journal write here only makes the Stop reply
+            # wait behind unrelated status readers and adds no Stop authority.
+            # The scheduled owner continues to the exact recovery/terminal
+            # projection, whose normal lifecycle path owns durable retention.
             if retained is not None:
                 retained.result = deepcopy(result)
                 retained.settled.set()

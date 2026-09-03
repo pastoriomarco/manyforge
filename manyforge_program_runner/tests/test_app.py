@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+import threading
 from typing import Any
 
 import pytest
@@ -399,6 +402,92 @@ def test_private_surface_projects_owner_facts_and_manages_lifecycle() -> None:
     assert runtime.calls[6][0] == "resume_full_stop"
     assert runtime.calls[7][0] == "discard_full_stop"
     assert runtime.calls[8][0] == "stop"
+    assert runtime.closed is True
+
+
+def test_stop_route_progresses_while_both_ordinary_workers_are_occupied() -> None:
+    class PressuredRuntime(FakeRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self._lock = threading.Lock()
+            self._ordinary_started_count = 0
+            self.ordinary_workers_started = threading.Event()
+            self.release_ordinary = threading.Event()
+            self.stop_called = threading.Event()
+
+        def start_run(self, request: ProgramRunStartRequest) -> dict[str, Any]:
+            with self._lock:
+                self._ordinary_started_count += 1
+                if self._ordinary_started_count == 2:
+                    self.ordinary_workers_started.set()
+            self.release_ordinary.wait(timeout=2.0)
+            return super().start_run(request)
+
+        def stop_motion(
+            self,
+            program_run_id: str,
+            request: ProgramRunStopRequest,
+        ) -> dict[str, Any]:
+            self.stop_called.set()
+            return super().stop_motion(program_run_id, request)
+
+    runtime = PressuredRuntime()
+    app = create_app(runtime)
+    start_endpoint = next(
+        route.endpoint
+        for route in app.routes
+        if getattr(route, "path", None) == "/api/program/runs"
+        and "POST" in (getattr(route, "methods", set()) or set())
+    )
+    stop_endpoint = next(
+        route.endpoint
+        for route in app.routes
+        if getattr(route, "path", None)
+        == "/api/program/runs/{program_run_id}/motion-stop"
+    )
+    start_request = ProgramRunStartRequest.model_validate(
+        {
+            **_caller(),
+            "scenario_id": "cell-pick",
+            "scenario_catalog_revision": _DIGEST_A,
+            "expected_applied_record_digest": _DIGEST_B,
+            "draft_program_revision": _DIGEST_B,
+            "expected_admission_generation": 7,
+        }
+    )
+    stop_request = ProgramRunStopRequest.model_validate(
+        {
+            **_caller(),
+            "request_id": "request.stop.pressure",
+            "program_run_id": "program-run.1",
+            "expected_owner_epoch": "program-runner.epoch.1",
+            "reason": "priority qualification",
+        }
+    )
+
+    async def exercise() -> None:
+        async with app.router.lifespan_context(app):
+            ordinary = [
+                asyncio.create_task(start_endpoint(start_request))
+                for _ in range(2)
+            ]
+            try:
+                assert await asyncio.to_thread(
+                    runtime.ordinary_workers_started.wait,
+                    1.0,
+                )
+                stopped = await asyncio.wait_for(
+                    stop_endpoint("program-run.1", stop_request),
+                    timeout=0.5,
+                )
+                assert json.loads(stopped.body)["state"] == "running"
+                assert runtime.stop_called.is_set()
+                assert not runtime.release_ordinary.is_set()
+            finally:
+                runtime.release_ordinary.set()
+                await asyncio.gather(*ordinary)
+
+    asyncio.run(exercise())
     assert runtime.closed is True
 
 

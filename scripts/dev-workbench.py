@@ -329,6 +329,36 @@ def _require_current_workspace_deployment(
     return deployment_path
 
 
+def _require_current_workspace_node_environment(
+    binding: dict[str, Any],
+) -> Path:
+    """Reject a package compiled against stale executable node source."""
+
+    _regular_file(NODE_ENVIRONMENT_MANIFEST, "workspace node environment")
+    try:
+        manifest = json.loads(
+            NODE_ENVIRONMENT_MANIFEST.read_text(encoding="utf-8")
+        )
+        catalog = manifest["catalog"]
+        expected = {
+            "catalog_digest": catalog["catalog_digest"],
+            "catalog_id": catalog["catalog_id"],
+            "content_version": catalog["content_version"],
+            "environment_digest": manifest["environment_digest"],
+        }
+    except (KeyError, OSError, UnicodeError, TypeError, json.JSONDecodeError) as error:
+        raise WorkbenchError(
+            "workspace node environment manifest is invalid: "
+            f"{NODE_ENVIRONMENT_MANIFEST}: {error}"
+        ) from error
+    if binding.get("node_environment") != expected:
+        raise WorkbenchError(
+            "imported maintained Scenario package is stale relative to its "
+            "workspace node environment; refresh the qualified package cache"
+        )
+    return NODE_ENVIRONMENT_MANIFEST
+
+
 def _load_scenario(scenario_id: str) -> dict[str, Any]:
     catalog_path = PACKAGE_ROOT / "maintained.scenario-catalog.yaml"
     _regular_file(catalog_path, "maintained Scenario catalog")
@@ -409,6 +439,7 @@ def _load_scenario(scenario_id: str) -> dict[str, Any]:
     )
     _regular_file(workspace_program, "matching workspace Program")
     _require_current_workspace_deployment(row)
+    _require_current_workspace_node_environment(binding)
     # Composer parses this artifact and the backend Load Scenario command
     # compares its semantic Program revision with the retained selection.  Do
     # not add a stricter byte-format identity in the process launcher.
@@ -1081,6 +1112,21 @@ class Workbench:
 
         _wait_until(
             "fresh converged Manager baseline", manager_ready, self.processes
+        )
+
+        def node_environment_ready() -> dict[str, Any] | None:
+            # Manager convergence and Program Runner availability are
+            # published independently. Composer startup consumes their exact
+            # joined environment, so wait for that existing Headless contract
+            # instead of relying on process timing or retrying a failed load.
+            with HeadlessHttpClient(base_url, timeout_seconds=0.5) as client:
+                environment = client.node_environment()
+                return environment if environment.get("schema_version") else None
+
+        _wait_until(
+            "active Program node environment",
+            node_environment_ready,
+            self.processes,
         )
 
         with HeadlessHttpClient(base_url, timeout_seconds=1.0) as client:

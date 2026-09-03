@@ -13,6 +13,9 @@
 namespace manyforge::core {
 
 inline constexpr std::size_t kMaximumStopScopeSnapshotOperations = 4096U;
+// One bounded fence per maximum retained request, plus current and crossing
+// Program-run identities that may not yet have an operation row.
+inline constexpr std::size_t kMaximumStopScopeSnapshotProgramRuns = 4098U;
 inline constexpr std::size_t kMaximumStopScopeSnapshotComponents = 4096U;
 inline constexpr std::size_t kMaximumStopScopeSnapshotResources = 4096U;
 inline constexpr std::size_t kMaximumStopScopeMembershipRows = 65536U;
@@ -66,6 +69,11 @@ struct StopScopeResolverSnapshotDTO final {
   std::vector<StopScopeOperationSnapshotDTO> operations;
   std::vector<StopScopeComponentSnapshotDTO> components;
   std::vector<StopScopeResourceSnapshotDTO> resources;
+  /// Program runs already published by the Program owner or currently
+  /// crossing Execute admission. This lets an exact run-scoped Stop close an
+  /// idle/pending run without treating its absence from the operation table
+  /// as an unknown selector.
+  std::vector<ProgramRunId> known_program_runs;
 
   friend bool operator==(const StopScopeResolverSnapshotDTO&,
                          const StopScopeResolverSnapshotDTO&) = default;

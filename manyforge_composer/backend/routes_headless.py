@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Any, Literal
+from contextlib import asynccontextmanager
+import time
+from typing import Annotated, Any, Callable, Literal
 
 from fastapi import APIRouter, HTTPException, Path, Query
 from fastapi.responses import JSONResponse
 from pydantic import ConfigDict, Field, model_validator
 
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
+from manyforge_headless_api.execution_control import (
+    ExecutionControlBusyError,
+    ExecutionControlClient,
+)
 from manyforge_headless_api.models import (
     AcknowledgeAlarmRequest,
     AcknowledgeAllAlarmsRequest,
@@ -54,6 +60,12 @@ from .state import ComposerState
 _MAXIMUM_SAFE_INTEGER = 9_007_199_254_740_991
 _MAXIMUM_ALARM_PAGE = 128
 _MAXIMUM_HISTORY_PAGE = 32
+_CONTROL_INGRESS_MONOTONIC_HEADER = (
+    "X-ManyForge-Composer-Control-Ingress-Monotonic-Ns"
+)
+_CONTROL_RESPONSE_MONOTONIC_HEADER = (
+    "X-ManyForge-Composer-Control-Response-Monotonic-Ns"
+)
 _SCENE_RESULT_FIELDS = {
     "api_version",
     "committed_projection_revision",
@@ -154,18 +166,63 @@ def _call_scene(callback, body: SceneTransactionRequest):
 def create_headless_router(
     client: HeadlessHttpClient,
     state: ComposerState,
+    execution_controls: ExecutionControlClient | None = None,
+    shared_component_overview: Callable[[], dict[str, Any] | None] | None = None,
 ) -> APIRouter:
     """Expose only bounded reads and attributed intents; own no reducer."""
 
-    router = APIRouter()
+    owns_execution_controls = execution_controls is None
+    execution_controls = execution_controls or ExecutionControlClient(
+        thread_name_prefix="manyforge_composer_control",
+    )
+
+    @asynccontextmanager
+    async def lifespan(_app):
+        try:
+            yield
+        finally:
+            if owns_execution_controls:
+                execution_controls.close()
+
+    router = APIRouter(lifespan=lifespan)
+
+    async def control_call(callback, *, stop: bool = False):
+        try:
+            lane = (
+                execution_controls.stop
+                if stop
+                else execution_controls.ordinary
+            )
+            # Encode in the same bounded worker as the synchronous owner call.
+            # A plain mapping would be walked and encoded on the shared ASGI
+            # loop, where a large read response could delay an accepted Stop.
+            return await lane(lambda: JSONResponse(content=callback()))
+        except HeadlessClientError as error:
+            raise _translate(error) from error
+        except ExecutionControlBusyError as error:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "execution_control_ingress_busy",
+                    "message": str(error),
+                    "details": {
+                        "lane": error.lane.value,
+                        "maximum_admitted": error.maximum_admitted,
+                    },
+                },
+            ) from error
 
     @router.get("/api/runtime")
     def runtime() -> dict[str, Any]:
         return _call(client.runtime)
 
     @router.get("/api/component-overview")
-    def component_overview() -> dict[str, Any]:
-        return _call(client.component_overview)
+    def component_overview() -> JSONResponse:
+        if shared_component_overview is not None:
+            current = shared_component_overview()
+            if current is not None:
+                return JSONResponse(content=current)
+        return JSONResponse(content=_call(client.component_overview))
 
     @router.get("/api/manager/status")
     def manager_status() -> dict[str, Any]:
@@ -268,7 +325,7 @@ def create_headless_router(
         )
 
     @router.post("/api/program/runs")
-    def program_run_start(body: ProgramRunStartRequest) -> dict[str, Any]:
+    async def program_run_start(body: ProgramRunStartRequest) -> dict[str, Any]:
         draft = state.draft_session.snapshot()
         if draft.get("program_revision") != body.draft_program_revision:
             raise HTTPException(
@@ -302,7 +359,7 @@ def create_headless_router(
                         ),
                     },
                 )
-        return _call(
+        return await control_call(
             lambda: client.program_run_start(body.model_dump(mode="json"))
         )
 
@@ -311,8 +368,10 @@ def create_headless_router(
         return _call(client.program_cycle_status)
 
     @router.post("/api/program/cycle/reset")
-    def program_cycle_reset(body: ProgramCycleResetRequest) -> dict[str, Any]:
-        return _call(
+    async def program_cycle_reset(
+        body: ProgramCycleResetRequest,
+    ) -> dict[str, Any]:
+        return await control_call(
             lambda: client.program_cycle_reset(body.model_dump(mode="json"))
         )
 
@@ -333,24 +392,24 @@ def create_headless_router(
             )
 
     @router.post("/api/program/runs/{program_run_id}/runtime-overrides")
-    def stage_runtime_override(
+    async def stage_runtime_override(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
         body: RuntimeOverrideStageRequest,
     ) -> dict[str, Any]:
         require_control_path(program_run_id, body)
-        return _call(
+        return await control_call(
             lambda: client.program_runtime_control_action(
                 program_run_id, "runtime-overrides", body.model_dump(mode="json")
             )
         )
 
     @router.post("/api/program/runs/{program_run_id}/runtime-overrides/activate")
-    def activate_runtime_override(
+    async def activate_runtime_override(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
         body: RuntimeOverrideActionRequest,
     ) -> dict[str, Any]:
         require_control_path(program_run_id, body)
-        return _call(
+        return await control_call(
             lambda: client.program_runtime_control_action(
                 program_run_id,
                 "runtime-overrides/activate",
@@ -359,12 +418,12 @@ def create_headless_router(
         )
 
     @router.post("/api/program/runs/{program_run_id}/runtime-overrides/clear")
-    def clear_runtime_override(
+    async def clear_runtime_override(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
         body: RuntimeOverrideActionRequest,
     ) -> dict[str, Any]:
         require_control_path(program_run_id, body)
-        return _call(
+        return await control_call(
             lambda: client.program_runtime_control_action(
                 program_run_id,
                 "runtime-overrides/clear",
@@ -373,7 +432,7 @@ def create_headless_router(
         )
 
     @router.post("/api/program/runs/{program_run_id}/runtime-overrides/promote")
-    def promote_runtime_override(
+    async def promote_runtime_override(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
         body: RuntimeOverridePromotionRequest,
     ) -> dict[str, Any]:
@@ -392,7 +451,7 @@ def create_headless_router(
                     "details": error.detail,
                 },
             ) from error
-        return _call(
+        return await control_call(
             lambda: client.program_runtime_control_action(
                 program_run_id,
                 "runtime-overrides/promote",
@@ -401,12 +460,12 @@ def create_headless_router(
         )
 
     @router.post("/api/program/runs/{program_run_id}/blackboard-values")
-    def write_runtime_blackboard(
+    async def write_runtime_blackboard(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
         body: RuntimeBlackboardWriteRequest,
     ) -> dict[str, Any]:
         require_control_path(program_run_id, body)
-        return _call(
+        return await control_call(
             lambda: client.program_runtime_control_action(
                 program_run_id,
                 "blackboard-values",
@@ -415,22 +474,22 @@ def create_headless_router(
         )
 
     @router.post("/api/program/runs/{program_run_id}/manual-result")
-    def stage_manual_result(
+    async def stage_manual_result(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
         body: ManualResultStageRequest,
     ) -> dict[str, Any]:
         require_control_path(program_run_id, body)
-        return _call(
+        return await control_call(
             lambda: client.program_runtime_control_action(
                 program_run_id, "manual-result", body.model_dump(mode="json")
             )
         )
 
     @router.post("/api/cycle/recovery-actions")
-    def cycle_recovery_action(
+    async def cycle_recovery_action(
         body: CycleRecoveryActionRequest,
     ) -> dict[str, Any]:
-        return _call(
+        return await control_call(
             lambda: client.cycle_recovery_action(body.model_dump(mode="json"))
         )
 
@@ -441,7 +500,7 @@ def create_headless_router(
         return _call(lambda: client.program_run(program_run_id))
 
     @router.post("/api/program/runs/{program_run_id}/stop")
-    def program_run_stop(
+    async def program_run_stop(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
         body: ProgramRunStopRequest,
     ) -> dict[str, Any]:
@@ -455,18 +514,45 @@ def create_headless_router(
                     ),
                 },
             )
-        return _call(
+        return await control_call(
             lambda: client.program_run_stop(
                 program_run_id,
                 body.model_dump(mode="json"),
-            )
+            ),
+            stop=True,
         )
 
-    @router.post("/api/program/runs/{program_run_id}/motion-stop")
-    def program_run_motion_stop(
+    @router.post(
+        "/api/program/runs/{program_run_id}/motion-stop",
+        responses={
+            200: {
+                "headers": {
+                    _CONTROL_INGRESS_MONOTONIC_HEADER: {
+                        "description": (
+                            "Stateless same-host CLOCK_MONOTONIC route-entry "
+                            "timestamp used to qualify Stop handoff latency."
+                        ),
+                        "schema": {"type": "string", "pattern": "^[0-9]+$"},
+                    },
+                    _CONTROL_RESPONSE_MONOTONIC_HEADER: {
+                        "description": (
+                            "Stateless same-host CLOCK_MONOTONIC timestamp "
+                            "after the accepted Stop response is encoded."
+                        ),
+                        "schema": {"type": "string", "pattern": "^[0-9]+$"},
+                    },
+                }
+            }
+        },
+    )
+    async def program_run_motion_stop(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
         body: ProgramRunStopRequest,
     ) -> dict[str, Any]:
+        # UI6 qualification correlates this stateless route-entry fact with the
+        # Kernel's existing acceptance timestamp.  A response header avoids a
+        # tracing owner/store and leaves the strict owner response unchanged.
+        ingress_monotonic_ns = str(time.monotonic_ns())
         if body.program_run_id != program_run_id:
             raise HTTPException(
                 status_code=400,
@@ -477,15 +563,24 @@ def create_headless_router(
                     ),
                 },
             )
-        return _call(
+        result = await control_call(
             lambda: client.program_run_motion_stop(
                 program_run_id,
                 body.model_dump(mode="json"),
-            )
+            ),
+            stop=True,
         )
+        # ``control_call`` returns the encoded response itself, so attach the
+        # route-entry trace fact to that response rather than to FastAPI's
+        # injected placeholder.
+        result.headers[_CONTROL_INGRESS_MONOTONIC_HEADER] = ingress_monotonic_ns
+        result.headers[_CONTROL_RESPONSE_MONOTONIC_HEADER] = str(
+            time.monotonic_ns()
+        )
+        return result
 
     @router.post("/api/program/runs/{program_run_id}/full-stop")
-    def program_run_full_stop(
+    async def program_run_full_stop(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
         body: ProgramRunStopRequest,
     ) -> dict[str, Any]:
@@ -499,15 +594,16 @@ def create_headless_router(
                     ),
                 },
             )
-        return _call(
+        return await control_call(
             lambda: client.program_run_full_stop(
                 program_run_id,
                 body.model_dump(mode="json"),
-            )
+            ),
+            stop=True,
         )
 
     @router.post("/api/program/runs/{program_run_id}/resume-full-stop")
-    def program_run_resume_full_stop(
+    async def program_run_resume_full_stop(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
         body: ProgramFullStopResumeRequest,
     ) -> dict[str, Any]:
@@ -521,7 +617,7 @@ def create_headless_router(
                     ),
                 },
             )
-        return _call(
+        return await control_call(
             lambda: client.program_run_resume_full_stop(
                 program_run_id,
                 body.model_dump(mode="json"),
@@ -529,7 +625,7 @@ def create_headless_router(
         )
 
     @router.post("/api/program/runs/{program_run_id}/reset")
-    def program_run_reset_full_stop(
+    async def program_run_reset_full_stop(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
         body: ProgramFullStopResetRequest,
     ) -> dict[str, Any]:
@@ -543,7 +639,7 @@ def create_headless_router(
                     ),
                 },
             )
-        return _call(
+        return await control_call(
             lambda: client.program_run_reset_full_stop(
                 program_run_id,
                 body.model_dump(mode="json"),
@@ -606,13 +702,11 @@ def create_headless_router(
     def execution_control_state() -> dict[str, Any]:
         return _call(client.execution_control_state)
 
-    @router.get("/api/execution/observation")
-    def execution_observation() -> dict[str, Any]:
-        return _call(client.execution_observation)
-
     @router.post("/api/execution/operations")
-    def execution_submit(body: OperationIntentRequest) -> dict[str, Any]:
-        return _call(lambda: client.execute(body.model_dump(mode="json")))
+    async def execution_submit(body: OperationIntentRequest) -> dict[str, Any]:
+        return await control_call(
+            lambda: client.execute(body.model_dump(mode="json"))
+        )
 
     @router.post("/api/execution/motion-previews")
     def execution_preview_motion(
@@ -651,16 +745,20 @@ def create_headless_router(
         return _call(lambda: client.plan_place(body.model_dump(mode="json")))
 
     @router.post("/api/execution/pick-place/sequences/pick")
-    def execution_start_pick(
+    async def execution_start_pick(
         body: PickSequencePlanningRequest,
     ) -> dict[str, Any]:
-        return _call(lambda: client.start_pick(body.model_dump(mode="json")))
+        return await control_call(
+            lambda: client.start_pick(body.model_dump(mode="json"))
+        )
 
     @router.post("/api/execution/pick-place/sequences/place")
-    def execution_start_place(
+    async def execution_start_place(
         body: PlaceSequencePlanningRequest,
     ) -> dict[str, Any]:
-        return _call(lambda: client.start_place(body.model_dump(mode="json")))
+        return await control_call(
+            lambda: client.start_place(body.model_dump(mode="json"))
+        )
 
     @router.get("/api/execution/pick-place/sequences/{sequence_id}")
     def execution_pick_place_sequence(
@@ -684,80 +782,86 @@ def create_headless_router(
             )
 
     @router.post("/api/execution/operations/{operation_id}/pause")
-    def execution_pause(
+    async def execution_pause(
         operation_id: Annotated[str, Path(min_length=1, max_length=256)],
         body: OperationControlRequest,
     ) -> dict[str, Any]:
         require_matching_operation(operation_id, body.operation_id)
-        return _call(
+        return await control_call(
             lambda: client.pause_operation(operation_id, body.model_dump())
         )
 
     @router.post("/api/execution/operations/{operation_id}/resume")
-    def execution_resume(
+    async def execution_resume(
         operation_id: Annotated[str, Path(min_length=1, max_length=256)],
         body: OperationControlRequest,
     ) -> dict[str, Any]:
         require_matching_operation(operation_id, body.operation_id)
-        return _call(
+        return await control_call(
             lambda: client.resume_operation(operation_id, body.model_dump())
         )
 
     @router.post("/api/execution/operations/{operation_id}/reset")
-    def execution_reset(
+    async def execution_reset(
         operation_id: Annotated[str, Path(min_length=1, max_length=256)],
         body: OperationControlRequest,
     ) -> dict[str, Any]:
         require_matching_operation(operation_id, body.operation_id)
-        return _call(
+        return await control_call(
             lambda: client.reset_operation(operation_id, body.model_dump())
         )
 
     @router.post(
         "/api/execution/operations/{operation_id}/acknowledge-completed"
     )
-    def execution_acknowledge_completed(
+    async def execution_acknowledge_completed(
         operation_id: Annotated[str, Path(min_length=1, max_length=256)],
         body: OperationControlRequest,
     ) -> dict[str, Any]:
         require_matching_operation(operation_id, body.operation_id)
-        return _call(
+        return await control_call(
             lambda: client.acknowledge_completed_operation(
                 operation_id, body.model_dump()
             )
         )
 
     @router.post("/api/execution/stops")
-    def execution_stop(body: StopIntentRequest) -> dict[str, Any]:
-        return _call(
+    async def execution_stop(body: StopIntentRequest) -> dict[str, Any]:
+        return await control_call(
             lambda: client.stop_operations(
                 body.model_dump(mode="json", exclude_unset=True)
-            )
+            ),
+            stop=True,
         )
 
     @router.post("/api/execution/full-stop")
-    def execution_full_stop(body: FullStopIntentRequest) -> dict[str, Any]:
-        return _call(lambda: client.full_stop(body.model_dump()))
+    async def execution_full_stop(
+        body: FullStopIntentRequest,
+    ) -> dict[str, Any]:
+        return await control_call(
+            lambda: client.full_stop(body.model_dump()),
+            stop=True,
+        )
 
     @router.get("/api/execution/stop-fault")
     def execution_stop_fault() -> dict[str, Any]:
         return _call(client.stop_fault)
 
     @router.post("/api/execution/stop-fault/recover")
-    def execution_recover_stop_fault(
+    async def execution_recover_stop_fault(
         body: StopFaultRecoveryIntentRequest,
     ) -> dict[str, Any]:
-        return _call(
+        return await control_call(
             lambda: client.recover_stop_fault(
                 body.model_dump(mode="json", exclude_unset=True)
             )
         )
 
     @router.post("/api/execution/runtime-scale-control")
-    def execution_set_runtime_scale_control(
+    async def execution_set_runtime_scale_control(
         body: RuntimeScaleControlRequest,
     ) -> dict[str, Any]:
-        return _call(
+        return await control_call(
             lambda: client.set_runtime_scale_control(body.model_dump(mode="json"))
         )
 
@@ -881,7 +985,12 @@ def create_headless_router(
                 params.append((name, value))
         params.extend(("components", value) for value in components or ())
         params.extend(("event_types", value) for value in event_types or ())
-        return _call(lambda: client.history(params=params))
+        # The bounded history page can still be large. This synchronous route
+        # already runs in a read worker; encode there so history pressure does
+        # not stall the event loop used by execution controls.
+        return JSONResponse(
+            content=_call(lambda: client.history(params=params))
+        )
 
     @router.get("/api/execution/history/health")
     def historian_health() -> dict[str, Any]:

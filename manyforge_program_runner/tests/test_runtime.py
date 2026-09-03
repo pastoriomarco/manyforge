@@ -337,17 +337,26 @@ class _Host:
     def start(self) -> None:
         self.started += 1
 
-    def start_run(self, admission: object) -> _Snapshot:
+    def start_run(
+        self,
+        admission: object,
+        *,
+        program_run_id: str | None = None,
+    ) -> _Snapshot:
         self.start_admissions.append(admission)
-        program_run_id = f"program-run.{len(self.start_admissions)}"
+        admitted_program_run_id = (
+            f"program-run.{len(self.start_admissions)}"
+            if program_run_id is None
+            else program_run_id
+        )
         snapshot = _Snapshot(
-            program_run_id,
+            admitted_program_run_id,
             owner_id=self.owner_id,
             owner_epoch=self.owner_epoch,
             state="running",
             revision=1,
         )
-        self.owner.rows[program_run_id] = snapshot
+        self.owner.rows[admitted_program_run_id] = snapshot
         return snapshot
 
     def stop_run(
@@ -1385,7 +1394,25 @@ def test_run_prepares_while_idle_then_only_verifies_after_claim(
     runtime.start_run(_start_request())
 
     assert events == ["admission:1", "prepare", "admission:3", "claim", "verify"]
-    assert runtime.cycle_status()["state"] == "running"
+    status = runtime.cycle_status()
+    run = runtime.read_run(status["program_run_id"])
+    assert status["state"] == "running"
+    assert status["run_revision"] == run["run_revision"]
+    assert status["node_status_revision"] == run["node_status_revision"]
+    assert status["run"] == run
+    assert status["runtime_controls"]["program_run_id"] == run["capture"][
+        "program_run_id"
+    ]
+    assert (
+        status["runtime_controls"]["run_revision"]
+        == status["run_revision"]
+    )
+    assert (
+        status["runtime_controls"]["runtime_controls"][
+            "runtime_control_revision"
+        ]
+        == status["runtime_control_revision"]
+    )
     runtime.shutdown()
 
 
@@ -1519,7 +1546,7 @@ def test_host_start_without_a_result_retains_claim_for_reconciliation(
     monkeypatch.setattr(
         runtime._host,  # noqa: SLF001
         "start_run",
-        lambda _admission: (_ for _ in ()).throw(
+        lambda _admission, **_kwargs: (_ for _ in ()).throw(
             RuntimeError("owner response was lost")
         ),
     )
@@ -1698,7 +1725,7 @@ def test_runtime_replays_exact_requests_and_keeps_one_active_product_run(
     replayed = runtime.start_run(request)
 
     assert started == replayed
-    assert started["capture"]["program_run_id"] == "program-run.1"
+    assert started["capture"]["program_run_id"] == "program-cycle.1"
     assert host.started == 1
     assert host.start_admissions == [admitted]
     assert headless.applied_reads == 2
@@ -1728,16 +1755,27 @@ def test_runtime_replays_exact_requests_and_keeps_one_active_product_run(
             "request_owner_epoch": "composer.epoch.1",
             "source_label": "operator_ui",
             "correlation_id": None,
-            "program_run_id": "program-run.1",
+            "program_run_id": "program-cycle.1",
             "expected_owner_epoch": runtime.owner_epoch,
             "reason": "ordinary operator motion Stop",
         }
     )
-    motion_stopped = runtime.stop_motion("program-run.1", motion_stop)
-    assert runtime.stop_motion("program-run.1", motion_stop) == motion_stopped
+    cycle_journal = runtime._journal  # noqa: SLF001
+    assert cycle_journal is not None
+    original_retain = cycle_journal.retain_run_snapshot
+    stop_path_retention: list[dict[str, Any]] = []
+
+    def retain_on_stop_path(snapshot: dict[str, Any]) -> None:
+        stop_path_retention.append(snapshot)
+
+    cycle_journal.retain_run_snapshot = retain_on_stop_path  # type: ignore[method-assign]
+    motion_stopped = runtime.stop_motion("program-cycle.1", motion_stop)
+    assert runtime.stop_motion("program-cycle.1", motion_stop) == motion_stopped
+    cycle_journal.retain_run_snapshot = original_retain  # type: ignore[method-assign]
     assert motion_stopped["state"] == "running"
+    assert stop_path_retention == []
     assert host.motion_stop_calls == [
-        ("program-run.1", "ordinary operator motion Stop")
+        ("program-cycle.1", "ordinary operator motion Stop")
     ]
     assert runtime.cycle_status()["state"] == "running"
 
@@ -1748,11 +1786,11 @@ def test_runtime_replays_exact_requests_and_keeps_one_active_product_run(
             "reason": "ordinary operator Full Stop",
         }
     )
-    full_stopped = runtime.full_stop("program-run.1", full_stop)
-    assert runtime.full_stop("program-run.1", full_stop) == full_stopped
+    full_stopped = runtime.full_stop("program-cycle.1", full_stop)
+    assert runtime.full_stop("program-cycle.1", full_stop) == full_stopped
     assert full_stopped["state"] == "full_stopped"
     assert host.full_stop_calls == [
-        ("program-run.1", "ordinary operator Full Stop")
+        ("program-cycle.1", "ordinary operator Full Stop")
     ]
     assert runtime.cycle_status()["state"] == "running"
 
@@ -1762,21 +1800,21 @@ def test_runtime_replays_exact_requests_and_keeps_one_active_product_run(
             "request_owner_epoch": "composer.epoch.1",
             "source_label": "operator_ui",
             "correlation_id": None,
-            "program_run_id": "program-run.1",
+            "program_run_id": "program-cycle.1",
             "expected_owner_epoch": runtime.owner_epoch,
             "expected_run_revision": full_stopped["run_revision"],
             "reason": "operator Run after Full Stop",
         }
     )
     resumed = runtime.resume_full_stop(
-        "program-run.1", resume_full_stop
+        "program-cycle.1", resume_full_stop
     )
     assert runtime.resume_full_stop(
-        "program-run.1", resume_full_stop
+        "program-cycle.1", resume_full_stop
     ) == resumed
     assert resumed["state"] == "running"
     assert host.full_stop_resume_calls == [
-        ("program-run.1", "operator Run after Full Stop")
+        ("program-cycle.1", "operator Run after Full Stop")
     ]
     assert runtime.cycle_status()["state"] == "running"
 
@@ -1786,7 +1824,7 @@ def test_runtime_replays_exact_requests_and_keeps_one_active_product_run(
             "request_owner_epoch": "composer.epoch.1",
             "source_label": "operator_ui",
             "correlation_id": None,
-            "program_run_id": "program-run.1",
+            "program_run_id": "program-cycle.1",
             "expected_owner_epoch": runtime.owner_epoch,
             "reason": "operator stop",
         }
@@ -1808,10 +1846,10 @@ def test_runtime_replays_exact_requests_and_keeps_one_active_product_run(
         return snapshot
 
     host.stop_run = stop_with_terminal_observer  # type: ignore[method-assign]
-    stopped = runtime.stop_run("program-run.1", stop)
-    stop_replay = runtime.stop_run("program-run.1", stop)
+    stopped = runtime.stop_run("program-cycle.1", stop)
+    stop_replay = runtime.stop_run("program-cycle.1", stop)
     assert stopped == stop_replay
-    assert host.stop_calls == [("program-run.1", "operator stop")]
+    assert host.stop_calls == [("program-cycle.1", "operator stop")]
     assert runtime.cycle_status()["cycle_claim_generation"] == 1
     owner.rows.clear()
     with pytest.raises(ProgramRunnerError) as terminal:
@@ -1825,7 +1863,7 @@ def test_runtime_replays_exact_requests_and_keeps_one_active_product_run(
             "request_owner_epoch": "composer.epoch.1",
             "source_label": "operator_ui",
             "correlation_id": None,
-            "program_run_id": "program-run.1",
+            "program_run_id": "program-cycle.1",
             "expected_owner_epoch": runtime.owner_epoch,
             "expected_cycle_generation": 1,
             "expected_claim_generation": 1,
@@ -1840,22 +1878,22 @@ def test_runtime_replays_exact_requests_and_keeps_one_active_product_run(
     reset_result = runtime.reset_cycle(reset)
     assert runtime.reset_cycle(reset) == reset_result
     assert len(admission.releases) == 1
-    assert host.reset_calls == ["program-run.1"]
+    assert host.reset_calls == ["program-cycle.1"]
     assert runtime.cycle_status()["state"] == "idle_after_reset"
 
     second = runtime.start_run(_start_request(request_id="request.start.after-reset"))
-    assert second["capture"]["program_run_id"] == "program-run.2"
+    assert second["capture"]["program_run_id"] == "program-cycle.2"
     assert runtime.cycle_status()["state"] == "running"
     assert len(host.start_admissions) == 2
     second_full_stop = ProgramRunStopRequest.model_validate(
         {
             **full_stop.model_dump(mode="json"),
             "request_id": "request.full-stop.2",
-            "program_run_id": "program-run.2",
+            "program_run_id": "program-cycle.2",
         }
     )
     second_full_stopped = runtime.full_stop(
-        "program-run.2", second_full_stop
+        "program-cycle.2", second_full_stop
     )
     current_cycle = runtime.cycle_status()
     discard = ProgramFullStopResetRequest.model_validate(
@@ -1864,7 +1902,7 @@ def test_runtime_replays_exact_requests_and_keeps_one_active_product_run(
             "request_owner_epoch": "composer.epoch.1",
             "source_label": "operator_ui",
             "correlation_id": None,
-            "program_run_id": "program-run.2",
+            "program_run_id": "program-cycle.2",
             "expected_owner_epoch": runtime.owner_epoch,
             "expected_run_revision": second_full_stopped["run_revision"],
             "expected_cycle_generation": current_cycle["cycle_generation"],
@@ -1874,8 +1912,8 @@ def test_runtime_replays_exact_requests_and_keeps_one_active_product_run(
             "reason": "operator Reset discarded Full Stop",
         }
     )
-    discarded = runtime.discard_full_stop("program-run.2", discard)
-    assert runtime.discard_full_stop("program-run.2", discard) == discarded
+    discarded = runtime.discard_full_stop("program-cycle.2", discard)
+    assert runtime.discard_full_stop("program-cycle.2", discard) == discarded
     assert discarded["state"] == "stopped"
     terminal_cycle = runtime.cycle_status()
     assert terminal_cycle["state"] == "terminal_awaiting_reset"
@@ -1885,7 +1923,7 @@ def test_runtime_replays_exact_requests_and_keeps_one_active_product_run(
             "request_owner_epoch": "composer.epoch.1",
             "source_label": "operator_ui",
             "correlation_id": discard.request_id,
-            "program_run_id": "program-run.2",
+            "program_run_id": "program-cycle.2",
             "expected_owner_epoch": runtime.owner_epoch,
             "expected_cycle_generation": terminal_cycle["cycle_generation"],
             "expected_claim_generation": terminal_cycle[
@@ -1917,9 +1955,9 @@ def test_runtime_replays_exact_requests_and_keeps_one_active_product_run(
     runtime.shutdown()
     assert host.shutdowns == 1
     assert host.stop_calls == [
-        ("program-run.1", "operator stop"),
-        ("program-run.2", "operator Reset discarded Full Stop"),
-        ("program-run.3", "operator stop"),
+        ("program-cycle.1", "operator stop"),
+        ("program-cycle.2", "operator Reset discarded Full Stop"),
+        ("program-cycle.3", "operator stop"),
     ]
 
 
@@ -1962,7 +2000,7 @@ def test_operator_motion_stop_reset_stops_tree_and_resets_cycle_once(
 
     intervention = SimpleNamespace(
         identity=SimpleNamespace(
-            program_run_id="program-run.1",
+            program_run_id="program-cycle.1",
             node_instance_id="move.1",
             node_attempt_id="attempt.1",
         ),
@@ -2007,9 +2045,9 @@ def test_operator_motion_stop_reset_stops_tree_and_resets_cycle_once(
     assert result["run"]["state"] == "stopped"
     assert result["recovery_offer"] is None
     assert host.stop_calls == [
-        ("program-run.1", "operator Reset after motion Stop")
+        ("program-cycle.1", "operator Reset after motion Stop")
     ]
-    assert host.reset_calls == ["program-run.1"]
+    assert host.reset_calls == ["program-cycle.1"]
     assert len(admission.releases) == 1
     assert journal.read().state == "idle_after_reset"
     runtime.shutdown()
@@ -2670,14 +2708,14 @@ def test_stop_retains_claim_until_exact_terminal_snapshot_is_observed(
 
     host.stop_run = delayed_stop  # type: ignore[method-assign]
     stopped = runtime.stop_run(
-        "program-run.1",
+        "program-cycle.1",
         ProgramRunStopRequest.model_validate(
             {
                 "request_id": "request.stop.delayed",
                 "request_owner_epoch": "composer.epoch.1",
                 "source_label": "operator_ui",
                 "correlation_id": None,
-                "program_run_id": "program-run.1",
+                "program_run_id": "program-cycle.1",
                 "expected_owner_epoch": runtime.owner_epoch,
                 "reason": "operator stop",
             }
@@ -2690,13 +2728,13 @@ def test_stop_retains_claim_until_exact_terminal_snapshot_is_observed(
     assert admission.releases == []
 
     terminal_snapshot = _Snapshot(
-        "program-run.1",
+        "program-cycle.1",
         owner_id=runtime.owner_id,
         owner_epoch=runtime.owner_epoch,
         state="stopped",
         revision=3,
     )
-    owner.rows["program-run.1"] = terminal_snapshot
+    owner.rows["program-cycle.1"] = terminal_snapshot
     runtime._record_terminal_snapshot(terminal_snapshot)  # noqa: SLF001
     status = runtime.cycle_status()
     assert status["state"] == "terminal_awaiting_reset"

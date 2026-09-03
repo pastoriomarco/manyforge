@@ -10,7 +10,7 @@ from typing import Any, Iterator
 
 import httpx
 import pytest
-from fastapi import WebSocketDisconnect
+from fastapi import FastAPI, WebSocketDisconnect
 from fastapi.testclient import TestClient
 
 from manyforge_behavior.canonical_artifact import (
@@ -23,7 +23,11 @@ from manyforge_behavior.executable_node_resolver import build_executable_node_re
 from manyforge_behavior.node_environment import build_node_environment
 from manyforge_composer.backend import headless_ws
 from manyforge_composer.backend.app import create_app
-from manyforge_composer.backend.headless_ws import serve_headless_state
+from manyforge_composer.backend.headless_ws import (
+    HeadlessStateSource,
+    serve_headless_state,
+)
+from manyforge_composer.backend.routes_headless import create_headless_router
 from manyforge_composer.backend.routes_viewer import create_viewer_router
 from manyforge_composer.backend.security import SecurityConfig
 from manyforge_composer.backend.state import ComposerState
@@ -466,8 +470,6 @@ def headless_client() -> (
             payload = _runtime()
         elif path == "/api/component-overview":
             payload = _component_overview()
-        elif path == "/api/execution/observation":
-            payload = _execution_observation()
         elif path == "/api/manager/status":
             payload = {
                 "schema_version": "manyforge.manager_status_projection.v1",
@@ -1181,6 +1183,36 @@ def _caller() -> dict[str, Any]:
     }
 
 
+def test_component_overview_route_reuses_the_shared_browser_projection() -> None:
+    class Client:
+        calls = 0
+
+        def component_overview(self) -> dict[str, Any]:
+            self.calls += 1
+            return {**_component_overview(), "summary_label": "cold read"}
+
+    client = Client()
+    shared: list[dict[str, Any] | None] = [_component_overview()]
+    app = FastAPI()
+    app.include_router(
+        create_headless_router(
+            client,  # type: ignore[arg-type]
+            ComposerState(),
+            shared_component_overview=lambda: shared[0],
+        )
+    )
+
+    with TestClient(app) as composer:
+        assert composer.get("/api/component-overview").json() == shared[0]
+        assert client.calls == 0
+
+        shared[0] = None
+        response = composer.get("/api/component-overview")
+        assert response.status_code == 200
+        assert response.json()["summary_label"] == "cold read"
+        assert client.calls == 1
+
+
 def test_composer_projects_headless_reads_without_local_runtime_state(
     headless_client,
 ) -> None:
@@ -1305,6 +1337,9 @@ def test_composer_program_routes_are_strict_stateless_forwarders(
                 "reason": "ordinary operator motion Stop",
             },
         )
+        motion_stop_ingress = motion_stopped.headers.get(
+            "X-ManyForge-Composer-Control-Ingress-Monotonic-Ns"
+        )
         full_stopped = composer.post(
             "/api/program/runs/program-run.1/full-stop",
             json={
@@ -1349,6 +1384,7 @@ def test_composer_program_routes_are_strict_stateless_forwarders(
     assert started.status_code == 200
     assert read.json()["capture"]["program_run_id"] == "program-run.1"
     assert motion_stopped.json()["state"] == "running"
+    assert motion_stop_ingress is not None and motion_stop_ingress.isdigit()
     assert full_stopped.json()["state"] == "full_stopping"
     assert resumed.json()["state"] == "running"
     assert reset.json()["idle_cycle_generation"] == 5
@@ -1535,25 +1571,6 @@ def test_composer_operation_controls_are_strict_stateless_forwarders(
     assert forwarded[7]["body"] == recovery
     assert forwarded[8]["body"] == scale_control
     assert forwarded[9]["method"] == "GET"
-
-
-def test_composer_exposes_focused_execution_observation(
-    headless_client,
-) -> None:
-    client, requests, _node_environment = headless_client
-
-    with _composer(client) as composer:
-        response = composer.get("/api/execution/observation")
-
-    assert response.status_code == 200
-    assert response.json() == _execution_observation()
-    forwarded = [
-        item
-        for item in requests
-        if item["path"] == "/api/execution/observation"
-    ]
-    assert len(forwarded) == 1
-    assert forwarded[0]["method"] == "GET"
 
 
 def test_composer_preserves_recognized_malformed_stop_semantics(
@@ -2564,6 +2581,22 @@ def test_composer_uses_separate_shell_and_bounded_viewer_observation_sockets(
     headless_client,
 ) -> None:
     client, requests, _node_environment = headless_client
+    upstream_closed = threading.Event()
+
+    class ObservationStream:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            upstream_closed.set()
+
+        def next(self, cursor, cancelled):
+            assert cursor is None
+            return _execution_observation()
+
+    client.open_execution_observation_stream = (  # type: ignore[method-assign]
+        lambda: ObservationStream()
+    )
     with _composer(client) as composer:
         state = composer._composer_state
         assert state.authoring_admission is not None
@@ -2592,6 +2625,12 @@ def test_composer_uses_separate_shell_and_bounded_viewer_observation_sockets(
                 "complete": True,
             }
         with composer.websocket_connect("/ws/scene/viewer") as websocket:
+            websocket.send_json(
+                {
+                    "last_applied": None,
+                    "schema_version": "manyforge.execution_observation_credit.v1",
+                }
+            )
             observation = websocket.receive_json()
             assert observation == {
                 "schema_version": "manyforge.execution_observation_frame.v1",
@@ -2611,36 +2650,38 @@ def test_composer_uses_separate_shell_and_bounded_viewer_observation_sockets(
                 "positions_rad": [0.25],
             }
             assert observation["received_at_monotonic_us"] > 0
+        assert upstream_closed.wait(timeout=1.0)
         viewer_status = composer.get("/api/scene/viewer/status")
         assert viewer_status.status_code == 200
         assert viewer_status.json() == {
-            "schema_version": "manyforge.execution_observation_stream_status.v1",
+            "schema_version": "manyforge.execution_observation_stream_status.v2",
             "source": {
                 "active": False,
-                "rate_limit_hz": 30.0,
-                "poll_count": viewer_status.json()["source"]["poll_count"],
+                "mode": "change_driven",
+                "connection_count": 1,
+                "wake_count": 1,
                 "published_count": 1,
                 "error_count": 0,
-                "last_poll_duration_us": viewer_status.json()["source"][
-                    "last_poll_duration_us"
+                "last_wake_duration_us": viewer_status.json()["source"][
+                    "last_wake_duration_us"
                 ],
-                "max_poll_duration_us": viewer_status.json()["source"][
-                    "max_poll_duration_us"
+                "max_wake_duration_us": viewer_status.json()["source"][
+                    "max_wake_duration_us"
                 ],
                 "last_error": None,
-                "ingress_replaced_frames": 0,
-                "ingress_schedule_failures": 0,
+                "periodic_http_requests": 0,
             },
             "fanout": {
                 "client_count": 0,
                 "capacity_per_client": 1,
-                "replaced_frames_total": 0,
+                "credit_count": 1,
+                "sent_count": 1,
+                "coalesced_frames_total": 0,
             },
         }
-        assert viewer_status.json()["source"]["poll_count"] >= 1
-        assert viewer_status.json()["source"]["last_poll_duration_us"] >= 0
-        assert viewer_status.json()["source"]["max_poll_duration_us"] >= (
-            viewer_status.json()["source"]["last_poll_duration_us"]
+        assert viewer_status.json()["source"]["last_wake_duration_us"] >= 0
+        assert viewer_status.json()["source"]["max_wake_duration_us"] >= (
+            viewer_status.json()["source"]["last_wake_duration_us"]
         )
     assert {
         item["path"] for item in _without_authoring_owner_calls(requests)
@@ -2648,7 +2689,6 @@ def test_composer_uses_separate_shell_and_bounded_viewer_observation_sockets(
         "/api/runtime",
         "/api/component-overview",
         "/api/execution/alarms",
-        "/api/execution/observation",
         "/api/cycle/status",
     }
     alarm_request = next(
@@ -2664,20 +2704,30 @@ def test_slow_shell_read_does_not_block_dedicated_viewer_observation_lane(
     second_shell_started = threading.Event()
 
     class RecordingWebSocket:
-        def __init__(self) -> None:
+        def __init__(self, *, viewer: bool = False) -> None:
             self.shell_sent = asyncio.Event()
             self.observation_sent = asyncio.Event()
             self.disconnected = asyncio.Event()
+            self.credit_sent = False
+            self.viewer = viewer
 
         async def accept(self) -> None:
             return None
 
-        async def close(self) -> None:
+        async def close(self, *_args: object, **_kwargs: object) -> None:
             return None
 
-        async def receive(self) -> dict[str, str]:
+        async def receive_text(self) -> str:
+            if self.viewer and not self.credit_sent:
+                self.credit_sent = True
+                return json.dumps(
+                    {
+                        "last_applied": None,
+                        "schema_version": "manyforge.execution_observation_credit.v1",
+                    }
+                )
             await self.disconnected.wait()
-            return {"type": "websocket.disconnect"}
+            raise WebSocketDisconnect()
 
         async def send_text(self, message: str) -> None:
             payload = json.loads(message)
@@ -2718,7 +2768,8 @@ def test_slow_shell_read_does_not_block_dedicated_viewer_observation_lane(
 
     class Subscription:
         def __init__(self) -> None:
-            self.queue: asyncio.Queue[str] = asyncio.Queue(maxsize=1)
+            self.wake = asyncio.Event()
+            self.payload: str | None = None
 
     class ObservationSource:
         def __init__(self) -> None:
@@ -2732,6 +2783,21 @@ def test_slow_shell_read_does_not_block_dedicated_viewer_observation_lane(
         def unsubscribe(self, subscription: Subscription) -> None:
             assert subscription is self.subscription
             self.unsubscribed = True
+
+        def grant_credit(self, subscription: Subscription, cursor) -> None:
+            assert subscription is self.subscription
+            assert cursor is None
+            subscription.payload = json.dumps(
+                frame, separators=(",", ":"), sort_keys=True
+            )
+            subscription.wake.set()
+
+        def take_payload(self, subscription: Subscription) -> str | None:
+            assert subscription is self.subscription
+            payload = subscription.payload
+            subscription.payload = None
+            subscription.wake.clear()
+            return payload
 
     frame = {
         "schema_version": "manyforge.execution_observation_frame.v1",
@@ -2751,14 +2817,17 @@ def test_slow_shell_read_does_not_block_dedicated_viewer_observation_lane(
 
     async def exercise() -> None:
         shell_websocket = RecordingWebSocket()
-        viewer_websocket = RecordingWebSocket()
+        viewer_websocket = RecordingWebSocket(viewer=True)
         source = ObservationSource()
+        shell_source = HeadlessStateSource(
+            SnapshotClient(),  # type: ignore[arg-type]
+            admission=Admission(),  # type: ignore[arg-type]
+            draft_session=ComposerState().draft_session,
+        )
         shell_task = asyncio.create_task(
             serve_headless_state(
                 shell_websocket,  # type: ignore[arg-type]
-                SnapshotClient(),  # type: ignore[arg-type]
-                admission=Admission(),  # type: ignore[arg-type]
-                draft_session=ComposerState().draft_session,
+                shell_source,
             )
         )
 
@@ -2781,9 +2850,6 @@ def test_slow_shell_read_does_not_block_dedicated_viewer_observation_lane(
             await asyncio.wait_for(shell_websocket.shell_sent.wait(), timeout=1)
             assert await asyncio.to_thread(second_shell_started.wait, 1)
             assert source.subscription is not None
-            source.subscription.queue.put_nowait(
-                json.dumps(frame, separators=(",", ":"), sort_keys=True)
-            )
             await asyncio.wait_for(
                 viewer_websocket.observation_sent.wait(), timeout=0.2
             )
@@ -2801,6 +2867,83 @@ def test_slow_shell_read_does_not_block_dedicated_viewer_observation_lane(
         assert source.unsubscribed is True
 
     monkeypatch.setattr(headless_ws, "POLL_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(headless_ws, "FULL_REFRESH_SECONDS", 0)
+    asyncio.run(exercise())
+
+
+def test_viewer_demand_lease_expires_without_waiting_for_wall_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from manyforge_composer.backend import execution_observation_stream
+
+    class RecordingWebSocket:
+        def __init__(self) -> None:
+            self.accepted = False
+            self.closed = False
+            self.never_receives = asyncio.Event()
+
+        async def accept(self) -> None:
+            self.accepted = True
+
+        async def receive_text(self) -> str:
+            await self.never_receives.wait()
+            raise AssertionError("the test socket must remain silent")
+
+        async def send_text(self, _message: str) -> None:
+            raise AssertionError("an uncredited viewer cannot receive a frame")
+
+        async def close(self) -> None:
+            self.closed = True
+
+    class Subscription:
+        def __init__(self) -> None:
+            self.wake = asyncio.Event()
+
+    class ObservationSource:
+        def __init__(self) -> None:
+            self.subscription: Subscription | None = None
+            self.unsubscribed = False
+
+        def subscribe(self) -> Subscription:
+            self.subscription = Subscription()
+            return self.subscription
+
+        def unsubscribe(self, subscription: Subscription) -> None:
+            assert subscription is self.subscription
+            self.unsubscribed = True
+
+        def grant_credit(self, _subscription: Subscription, _cursor) -> None:
+            raise AssertionError("the expired client did not send credit")
+
+        def take_payload(self, _subscription: Subscription) -> None:
+            raise AssertionError("the expired client has no payload")
+
+    async def exercise() -> None:
+        source = ObservationSource()
+
+        class ViewerState:
+            execution_observation_source = source
+
+        router = create_viewer_router(
+            ViewerState(),  # type: ignore[arg-type]
+            SecurityConfig(),
+        )
+        endpoint = next(
+            route.endpoint
+            for route in router.routes
+            if getattr(route, "path", None) == "/ws/scene/viewer"
+        )
+        websocket = RecordingWebSocket()
+        await endpoint(websocket)  # type: ignore[arg-type]
+        assert websocket.accepted is True
+        assert websocket.closed is True
+        assert source.unsubscribed is True
+
+    monkeypatch.setattr(
+        execution_observation_stream,
+        "OBSERVATION_DEMAND_LEASE_SECONDS",
+        0.0,
+    )
     asyncio.run(exercise())
 
 
@@ -2819,6 +2962,10 @@ def test_composer_websocket_stream_is_read_only_transport(
     class RecordingWebSocket:
         async def accept(self) -> None:
             return None
+
+        async def receive_text(self) -> str:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
 
         async def send_text(self, message: str) -> None:
             assert json.loads(message)["complete"] is True
@@ -2844,12 +2991,16 @@ def test_composer_websocket_stream_is_read_only_transport(
             return _component_overview()
 
     monkeypatch.setattr(headless_ws, "POLL_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(headless_ws, "FULL_REFRESH_SECONDS", 0)
+    source = HeadlessStateSource(
+        SnapshotClient(),  # type: ignore[arg-type]
+        admission=admission,  # type: ignore[arg-type]
+        draft_session=ComposerState().draft_session,
+    )
     asyncio.run(
         serve_headless_state(
             RecordingWebSocket(),  # type: ignore[arg-type]
-            SnapshotClient(),  # type: ignore[arg-type]
-            admission=admission,  # type: ignore[arg-type]
-            draft_session=ComposerState().draft_session,
+            source,
         )
     )
 
@@ -2866,12 +3017,17 @@ def test_composer_websocket_skips_unchanged_owner_revisions(
         async def accept(self) -> None:
             return None
 
+        async def receive_text(self) -> str:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
         async def send_text(self, message: str) -> None:
             self.messages.append(message)
 
     class SnapshotClient:
         def __init__(self) -> None:
             self.polls = 0
+            self.overview_calls = 0
 
         def runtime(self) -> dict[str, Any]:
             self.polls += 1
@@ -2891,6 +3047,7 @@ def test_composer_websocket_skips_unchanged_owner_revisions(
             return {"state": "idle"}
 
         def component_overview(self) -> dict[str, Any]:
+            self.overview_calls += 1
             return _component_overview()
 
     class Admission:
@@ -2899,17 +3056,180 @@ def test_composer_websocket_skips_unchanged_owner_revisions(
 
     websocket = RecordingWebSocket()
     monkeypatch.setattr(headless_ws, "POLL_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(headless_ws, "FULL_REFRESH_SECONDS", 0)
+    client = SnapshotClient()
+    source = HeadlessStateSource(
+        client,  # type: ignore[arg-type]
+        admission=Admission(),  # type: ignore[arg-type]
+        draft_session=ComposerState().draft_session,
+    )
     asyncio.run(
         serve_headless_state(
             websocket,  # type: ignore[arg-type]
-            SnapshotClient(),  # type: ignore[arg-type]
-            admission=Admission(),  # type: ignore[arg-type]
-            draft_session=ComposerState().draft_session,
+            source,
         )
     )
 
     assert len(websocket.messages) == 1
     assert json.loads(websocket.messages[0])["snapshot_sequence"] == 1
+    assert client.overview_calls == 1
+
+
+def test_headless_state_source_reads_once_for_multiple_browsers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SnapshotClient:
+        def __init__(self) -> None:
+            self.runtime_calls = 0
+            self.alarm_calls = 0
+            self.admission_calls = 0
+            self.cycle_calls = 0
+            self.overview_calls = 0
+
+        def runtime(self) -> dict[str, Any]:
+            self.runtime_calls += 1
+            return _runtime()
+
+        def alarms(self, *, limit: int, ordering: str) -> dict[str, Any]:
+            assert limit == 32
+            assert ordering == "attention_newest"
+            self.alarm_calls += 1
+            return _alarms()
+
+        def authoring_admission(self) -> dict[str, Any]:
+            self.admission_calls += 1
+            return {"authoring_allowed": True, "admission_generation": 7}
+
+        def program_cycle_status(self) -> dict[str, Any]:
+            self.cycle_calls += 1
+            return {"state": "idle"}
+
+        def component_overview(self) -> dict[str, Any]:
+            self.overview_calls += 1
+            return _component_overview()
+
+    class Admission:
+        mutation_ready = True
+        receiver_epoch = "composer-snapshot.test"
+
+    async def exercise() -> None:
+        client = SnapshotClient()
+        source = HeadlessStateSource(
+            client,  # type: ignore[arg-type]
+            admission=Admission(),  # type: ignore[arg-type]
+            draft_session=ComposerState().draft_session,
+        )
+        first = source.subscribe()
+        second = source.subscribe()
+        await asyncio.wait_for(
+            asyncio.gather(first.wake.wait(), second.wake.wait()),
+            timeout=1.0,
+        )
+        assert source.take_payload(first) == source.take_payload(second)
+        deadline = asyncio.get_running_loop().time() + 1.0
+        while client.cycle_calls < 3:
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0)
+        await source.close()
+        # Browser count does not multiply reads, and the small cycle revision
+        # can wake independently from the heavier full shell projection.
+        assert client.runtime_calls == 1
+        assert client.overview_calls == 1
+        assert client.alarm_calls == 1
+        assert client.admission_calls == 1
+        assert 3 <= client.cycle_calls <= 4
+
+    monkeypatch.setattr(headless_ws, "POLL_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(headless_ws, "FULL_REFRESH_SECONDS", 60)
+    asyncio.run(exercise())
+
+
+def test_headless_state_source_control_does_not_wait_for_full_refresh() -> None:
+    class SnapshotClient:
+        def __init__(self) -> None:
+            self.cycle_revision = 1
+            self.alarm_revision = 5
+            self.full_reads = 0
+            self.block_overview = False
+            self.overview_started = threading.Event()
+            self.release_overview = threading.Event()
+
+        def runtime(self) -> dict[str, Any]:
+            self.full_reads += 1
+            return _runtime()
+
+        def alarms(self, *, limit: int, ordering: str) -> dict[str, Any]:
+            assert limit == 32
+            assert ordering == "attention_newest"
+            alarms = _alarms()
+            alarms["state_revision"] = self.alarm_revision
+            return alarms
+
+        def authoring_admission(self) -> dict[str, Any]:
+            return {"authoring_allowed": True, "admission_generation": 7}
+
+        def program_cycle_status(self) -> dict[str, Any]:
+            return {
+                "state": "running",
+                "run_revision": self.cycle_revision,
+                "recovery_offer": (
+                    None
+                    if self.cycle_revision == 1
+                    else {
+                        "offer_id": "offer.motion-stop.1",
+                        "offer_revision": 1,
+                    }
+                ),
+            }
+
+        def component_overview(self) -> dict[str, Any]:
+            if self.block_overview:
+                self.overview_started.set()
+                assert self.release_overview.wait(timeout=1.0)
+            overview = _component_overview()
+            overview["basis"]["alarm_state_revision"] = self.alarm_revision
+            return overview
+
+    class Admission:
+        mutation_ready = True
+        receiver_epoch = "composer-snapshot.test"
+
+    async def exercise() -> None:
+        client = SnapshotClient()
+        source = HeadlessStateSource(
+            client,  # type: ignore[arg-type]
+            admission=Admission(),  # type: ignore[arg-type]
+            draft_session=ComposerState().draft_session,
+        )
+        first = await source._refresh_full()  # noqa: SLF001
+        assert first is not None
+        assert client.full_reads == 1
+
+        client.block_overview = True
+        client.alarm_revision = 6
+        full_refresh = asyncio.create_task(source._refresh_full())  # noqa: SLF001
+        assert await asyncio.to_thread(client.overview_started.wait, 1.0)
+        client.cycle_revision = 2
+        second = await asyncio.wait_for(
+            source._refresh_control(),  # noqa: SLF001
+            timeout=0.2,
+        )
+        assert second is not None
+        projected = json.loads(second)
+        assert projected["program_cycle"]["run_revision"] == 2
+        assert projected["program_cycle"]["recovery_offer"] == {
+            "offer_id": "offer.motion-stop.1",
+            "offer_revision": 1,
+        }
+        assert full_refresh.done() is False
+        client.release_overview.set()
+        refreshed = await full_refresh
+        assert refreshed is not None
+        assert json.loads(refreshed)["program_cycle"]["run_revision"] == 2
+        assert client.full_reads == 2
+        await source.close()
+
+    asyncio.run(exercise())
 
 
 def test_composer_websocket_deduplicates_an_unchanged_owner_failure(
@@ -2922,6 +3242,10 @@ def test_composer_websocket_deduplicates_an_unchanged_owner_failure(
 
         async def accept(self) -> None:
             self.accepted = True
+
+        async def receive_text(self) -> str:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
 
         async def send_text(self, message: str) -> None:
             self.messages.append(message)
@@ -2956,13 +3280,17 @@ def test_composer_websocket_deduplicates_an_unchanged_owner_failure(
 
     websocket = RecordingWebSocket()
     monkeypatch.setattr(headless_ws, "POLL_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(headless_ws, "FULL_REFRESH_SECONDS", 0)
+    source = HeadlessStateSource(
+        FailingClient(),  # type: ignore[arg-type]
+        admission=Admission(),  # type: ignore[arg-type]
+        draft_session=ComposerState().draft_session,
+    )
 
     asyncio.run(
         serve_headless_state(
             websocket,  # type: ignore[arg-type]
-            FailingClient(),  # type: ignore[arg-type]
-            admission=Admission(),  # type: ignore[arg-type]
-            draft_session=ComposerState().draft_session,
+            source,
         )
     )
 
@@ -2989,6 +3317,10 @@ def test_composer_websocket_reports_an_oversized_projection_once(
 
         async def accept(self) -> None:
             return None
+
+        async def receive_text(self) -> str:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
 
         async def send_text(self, message: str) -> None:
             self.messages.append(message)
@@ -3033,13 +3365,17 @@ def test_composer_websocket_reports_an_oversized_projection_once(
     websocket = RecordingWebSocket()
     monkeypatch.setattr(headless_ws, "_encode", fail_snapshot_only)
     monkeypatch.setattr(headless_ws, "POLL_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(headless_ws, "FULL_REFRESH_SECONDS", 0)
+    source = HeadlessStateSource(
+        SnapshotClient(),  # type: ignore[arg-type]
+        admission=Admission(),  # type: ignore[arg-type]
+        draft_session=ComposerState().draft_session,
+    )
 
     asyncio.run(
         serve_headless_state(
             websocket,  # type: ignore[arg-type]
-            SnapshotClient(),  # type: ignore[arg-type]
-            admission=Admission(),  # type: ignore[arg-type]
-            draft_session=ComposerState().draft_session,
+            source,
         )
     )
 

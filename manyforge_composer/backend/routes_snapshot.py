@@ -26,6 +26,7 @@ SNAPSHOT_CLIENT_UNAVAILABLE_REASON_CODE: Final = (
     "composable_cell_snapshot_client_unavailable"
 )
 _MAXIMUM_SNAPSHOT_BYTES: Final = 4 * 1024 * 1024
+_MAXIMUM_SNAPSHOT_OBSERVERS: Final = 16
 _REQUEST_ID: Final = re.compile(r"^[0-9a-f]{32}$")
 _OWNER_EPOCH: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 
@@ -69,7 +70,8 @@ class SnapshotBroker:
 
     def __init__(self, *, prepare_capture: SnapshotPrepare | None = None) -> None:
         self._lock = threading.Lock()
-        self._sender: SnapshotSender | None = None
+        self._senders: list[SnapshotSender] = []
+        self._active_sender: SnapshotSender | None = None
         self._prepare_capture = prepare_capture
         self._capture_admitted = False
         self._pending: dict[str, threading.Event] = {}
@@ -91,11 +93,11 @@ class SnapshotBroker:
         if not callable(sender):
             raise TypeError("snapshot sender must be callable")
         with self._lock:
-            if self._capture_admitted or self._pending:
-                raise RuntimeError("cannot replace snapshot sender while active")
-            if self._sender is not None and self._sender is not sender:
-                raise RuntimeError("one snapshot observer is already bound")
-            self._sender = sender
+            if sender in self._senders:
+                return
+            if len(self._senders) >= _MAXIMUM_SNAPSHOT_OBSERVERS:
+                raise RuntimeError("snapshot observer limit reached")
+            self._senders.append(sender)
 
     def configure_prepare_capture(self, callback: SnapshotPrepare) -> None:
         if not callable(callback):
@@ -107,15 +109,17 @@ class SnapshotBroker:
 
     def unbind_sender(self, sender: SnapshotSender) -> None:
         with self._lock:
-            if self._sender is sender:
-                self._sender = None
+            if sender in self._senders:
+                self._senders.remove(sender)
+            if self._active_sender is sender:
+                self._active_sender = None
                 for request_id, event in self._pending.items():
                     self._results[request_id] = None
                     event.set()
 
     def has_observer(self) -> bool:
         with self._lock:
-            return self._sender is not None
+            return bool(self._senders)
 
     def capture_sync(
         self,
@@ -157,17 +161,19 @@ class SnapshotBroker:
                 self._busy_rejected_total += 1
                 self._failed_total += 1
                 return None
-            sender = self._sender
+            sender = self._senders[-1] if self._senders else None
             if sender is None:
                 self._unavailable_total += 1
                 self._failed_total += 1
                 return None
             self._capture_admitted = True
+            self._active_sender = sender
             prepare_capture = self._prepare_capture
 
         if prepare_capture is None:
             with self._lock:
                 self._capture_admitted = False
+                self._active_sender = None
                 self._preparation_failed_total += 1
                 self._failed_total += 1
                 self._last_completion_ns = time.monotonic_ns()
@@ -190,14 +196,16 @@ class SnapshotBroker:
         ):
             with self._lock:
                 self._capture_admitted = False
+                self._active_sender = None
                 self._preparation_failed_total += 1
                 self._failed_total += 1
                 self._last_completion_ns = time.monotonic_ns()
             return None
 
         with self._lock:
-            if self._sender is not sender:
+            if sender not in self._senders:
                 self._capture_admitted = False
+                self._active_sender = None
                 self._unavailable_total += 1
                 self._failed_total += 1
                 self._last_completion_ns = time.monotonic_ns()
@@ -228,6 +236,7 @@ class SnapshotBroker:
                 self._requirements.pop(request_id, None)
                 self._results.pop(request_id, None)
                 self._capture_admitted = False
+                self._active_sender = None
                 self._dispatch_failed_total += 1
                 self._failed_total += 1
                 self._last_completion_ns = time.monotonic_ns()
@@ -243,6 +252,7 @@ class SnapshotBroker:
                     self._pending.pop(request_id, None)
                     self._requirements.pop(request_id, None)
                     self._capture_admitted = False
+                    self._active_sender = None
                     self._last_completion_ns = time.monotonic_ns()
                     if result is None:
                         self._failed_total += 1
@@ -254,6 +264,7 @@ class SnapshotBroker:
                 self._requirements.pop(request_id, None)
                 self._results.pop(request_id, None)
                 self._capture_admitted = False
+                self._active_sender = None
                 self._timeouts_total += 1
                 self._failed_total += 1
                 self._last_completion_ns = time.monotonic_ns()
@@ -264,6 +275,7 @@ class SnapshotBroker:
             self._pending.pop(request_id, None)
             self._requirements.pop(request_id, None)
             self._capture_admitted = False
+            self._active_sender = None
             self._last_completion_ns = time.monotonic_ns()
             if result is None:
                 self._failed_total += 1
@@ -341,7 +353,8 @@ class SnapshotBroker:
     def status(self) -> dict[str, int | bool | None]:
         with self._lock:
             return {
-                "observer_bound": self._sender is not None,
+                "observer_bound": bool(self._senders),
+                "observer_count": len(self._senders),
                 "pending_count": len(self._pending),
                 "requests_total": self._requests_total,
                 "completed_total": self._completed_total,

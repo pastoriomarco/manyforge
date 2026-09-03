@@ -290,7 +290,16 @@ class RawWebDriver:
             raise CollectorError(f"WebDriver command failed: {value['error']}")
         return value
 
-    def create_session(self) -> str:
+    def create_session(
+        self,
+        *,
+        firefox_args: tuple[str, ...] = ("-headless",),
+    ) -> str:
+        if not firefox_args or any(
+            not isinstance(argument, str) or not argument
+            for argument in firefox_args
+        ):
+            raise CollectorError("Firefox arguments must be non-empty strings")
         value = self._request(
             "POST",
             "/session",
@@ -298,7 +307,7 @@ class RawWebDriver:
                 "capabilities": {
                     "alwaysMatch": {
                         "browserName": "firefox",
-                        "moz:firefoxOptions": {"args": ["-headless"]},
+                        "moz:firefoxOptions": {"args": list(firefox_args)},
                     }
                 }
             },

@@ -1209,7 +1209,16 @@ def test_reconciliation_gate_does_not_block_ordinary_accept_or_exact_read(
         identity = headless.execution_identity()
         targets = headless.execution_targets()
         control_state = headless.execution_control_state()
-        observation = headless.execution_observation()
+        with raw_api.websocket_connect("/ws/execution/observations") as viewer:
+            viewer.send_json(
+                {
+                    "last_applied": None,
+                    "schema_version": (
+                        "manyforge.execution_observation_credit.v1"
+                    ),
+                }
+            )
+            observation = viewer.receive_json()
         accepted = _runner_submission(
             runner,
             request_id="accept-while-reconciliation-gated",
@@ -1429,6 +1438,19 @@ def test_internal_program_run_stop_uses_one_exact_priority_request(
         assert stop_status["stop_status"]["state"] == "succeeded"
         observed = client.read(accepted["operation_id"])
         assert observed["operation"]["state"] == "stopped"
+
+        released = client.release_program_run_stop_fence(
+            "program-run.stop-process-test",
+            stopped["accepted"]["stop_id"],
+            stopped["accepted"]["stop_generation"],
+        )
+        replayed_release = client.release_program_run_stop_fence(
+            "program-run.stop-process-test",
+            stopped["accepted"]["stop_id"],
+            stopped["accepted"]["stop_generation"],
+        )
+        assert released["ok"] is True
+        assert replayed_release["ok"] is True
 
         event_deadline = time.monotonic() + 5.0
         stop_events: list[dict[str, Any]] = []
@@ -2850,6 +2872,25 @@ def test_cell_admission_crosses_real_execution_seqpacket_surface(
             "execution_observation_command_unsupported"
         )
         assert client.observation()["command"] == "observation"
+
+        # UI6 uses one persistent private session. A second credited request
+        # must cross the same accepted socket instead of reconnecting or
+        # falling back to the legacy one-request observation exchange.
+        with client.open_observation_session() as observation_session:
+            first_observation = observation_session.next(
+                None,
+                threading.Event(),
+            )
+            first_frame = first_observation["observation"]
+            repeated_current = observation_session.next(
+                {
+                    "owner_epoch": "retired-owner-epoch",
+                    "source_epoch": first_frame["source_epoch"],
+                    "source_sequence": first_frame["source_sequence"],
+                },
+                threading.Event(),
+            )
+        assert repeated_current["observation"] == first_frame
         assert process.poll() is None
     finally:
         _stop_host(process)

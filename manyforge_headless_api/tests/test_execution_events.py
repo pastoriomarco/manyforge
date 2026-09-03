@@ -485,6 +485,46 @@ def test_execution_client_reads_one_exact_internal_stop_status(
     )
 
 
+def test_execution_client_releases_one_exact_internal_program_run_fence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    client = ExecutionCommandClient(tmp_path, attribution_transport="internal")
+    captured: dict[str, Any] = {}
+
+    def exchange(command: dict[str, Any]) -> dict[str, Any]:
+        captured.update(command)
+        return {
+            "api_version": "manyforge.execution_command_response.v1",
+            "command": "release_program_run_stop_fence",
+            "ok": True,
+        }
+
+    monkeypatch.setattr(client, "_exchange", exchange)
+    assert client.release_program_run_stop_fence(
+        "program-run.1", "stop.1", 4
+    )["ok"] is True
+    assert captured == {
+        "api_version": "manyforge.execution_command.v1",
+        "attribution": {
+            "transport": "internal",
+            "assurance": "unverified",
+            "principal_id": None,
+        },
+        "command": "release_program_run_stop_fence",
+        "program_run_id": "program-run.1",
+        "stop_generation": 4,
+        "stop_id": "stop.1",
+    }
+
+    with pytest.raises(HeadlessApiError) as unavailable_publicly:
+        ExecutionCommandClient(tmp_path).release_program_run_stop_fence(
+            "program-run.1", "stop.1", 4
+        )
+    assert unavailable_publicly.value.code == (
+        "execution_request_attribution_invalid"
+    )
+
+
 def test_execution_client_projects_scoped_full_and_fault_recovery_commands(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

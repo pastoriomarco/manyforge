@@ -6,6 +6,7 @@ import logging
 import re
 import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket
@@ -19,6 +20,11 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
+
+from manyforge_headless_api.execution_control import (
+    ExecutionControlBusyError,
+    ExecutionControlClient,
+)
 
 from .log_throttle import ThrottledLog
 from .models import UnavailableDetail, UnavailableResponse
@@ -198,7 +204,34 @@ def create_app(
         else list(security.allowed_deployment_write_roots)
     )
 
-    app = FastAPI(title="ManyForge Composer (replaceable client)")
+    execution_controls = ExecutionControlClient(
+        thread_name_prefix="manyforge_composer_control",
+    )
+    headless_state_source = None
+    if state.headless_client is not None and state.authoring_admission is not None:
+        from .headless_ws import HeadlessStateSource
+
+        headless_state_source = HeadlessStateSource(
+            state.headless_client,
+            admission=state.authoring_admission,
+            draft_session=state.draft_session,
+        )
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        try:
+            yield
+        finally:
+            if state.execution_observation_source is not None:
+                state.execution_observation_source.close()
+            if headless_state_source is not None:
+                await headless_state_source.close()
+            execution_controls.close()
+
+    app = FastAPI(
+        title="ManyForge Composer (replaceable client)",
+        lifespan=lifespan,
+    )
     app.add_middleware(
         ComposerRequestBodyLimitMiddleware,
         maximum_bytes=_MAXIMUM_REQUEST_BODY_BYTES,
@@ -450,7 +483,16 @@ def create_app(
         from .routes_snapshot import create_snapshot_router
 
         app.include_router(
-            create_headless_router(state.headless_client, state),
+            create_headless_router(
+                state.headless_client,
+                state,
+                execution_controls,
+                (
+                    headless_state_source.current_component_overview
+                    if headless_state_source is not None
+                    else None
+                ),
+            ),
             tags=["headless-runtime-client"],
         )
         app.include_router(
@@ -482,10 +524,22 @@ def create_app(
                 from manyforge_headless_api.client import HeadlessClientError
 
                 try:
-                    payload = state.headless_client.recognized_malformed_stop(
-                        request.url.path
+                    payload = await execution_controls.stop(
+                        lambda: state.headless_client.recognized_malformed_stop(
+                            request.url.path
+                        )
                     )
                     response: Response = JSONResponse(content=payload)
+                except ExecutionControlBusyError as busy_error:
+                    response = JSONResponse(
+                        status_code=503,
+                        content={
+                            "detail": {
+                                "code": "execution_control_ingress_busy",
+                                "message": str(busy_error),
+                            }
+                        },
+                    )
                 except HeadlessClientError as client_error:
                     response = JSONResponse(
                         status_code=client_error.status_code or 503,
@@ -505,14 +559,12 @@ def create_app(
 
         @app.websocket("/ws/state")
         async def headless_state_websocket(websocket: WebSocket) -> None:
-            if state.authoring_admission is None:
+            if headless_state_source is None:
                 await websocket.close(code=1008)
                 return
             await serve_headless_state(
                 websocket,
-                state.headless_client,
-                admission=state.authoring_admission,
-                draft_session=state.draft_session,
+                headless_state_source,
             )
 
     async def unavailable_api(

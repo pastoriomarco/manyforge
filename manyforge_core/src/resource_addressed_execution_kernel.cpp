@@ -24,6 +24,21 @@
 namespace manyforge::core {
 namespace {
 
+template <typename Function>
+class ScopeExit final {
+ public:
+  explicit ScopeExit(Function function) : function_(std::move(function)) {}
+  ScopeExit(const ScopeExit&) = delete;
+  ScopeExit& operator=(const ScopeExit&) = delete;
+  ~ScopeExit() { function_(); }
+
+ private:
+  Function function_;
+};
+
+template <typename Function>
+ScopeExit(Function) -> ScopeExit<Function>;
+
 [[nodiscard]] bool is_active_stop_fault_latch(
     const std::optional<StopFaultLatchDTO>& latch) noexcept {
   return latch.has_value() && latch->state != StopFaultLatchStateDTO::kCleared;
@@ -2413,6 +2428,7 @@ StopScopeResolverSnapshotDTO ResourceAddressedExecutionKernel::capture_stop_scop
                                         cell_stop_generation_,
                                         {},
                                         stop_component_scope_,
+                                        {},
                                         {}};
   snapshot.operations.reserve(active_operations_.size() + historical_operations_.size());
   for (const auto& [operation_id, operation] : active_operations_) {
@@ -2455,6 +2471,27 @@ StopScopeResolverSnapshotDTO ResourceAddressedExecutionKernel::capture_stop_scop
   std::sort(
       snapshot.operations.begin(), snapshot.operations.end(),
       [](const auto& left, const auto& right) { return left.operation_id < right.operation_id; });
+
+  snapshot.known_program_runs.reserve(program_run_stop_fences_.size() + 3U);
+  if (current_program_run_id_.has_value()) {
+    snapshot.known_program_runs.push_back(*current_program_run_id_);
+  }
+  if (program_cycle_claim_run_.has_value()) {
+    snapshot.known_program_runs.push_back(
+        program_cycle_claim_run_->program_run_id);
+  }
+  if (pending_program_run_admission_.has_value()) {
+    snapshot.known_program_runs.push_back(*pending_program_run_admission_);
+  }
+  for (const auto& fence : program_run_stop_fences_) {
+    snapshot.known_program_runs.push_back(fence.program_run_id);
+  }
+  std::sort(snapshot.known_program_runs.begin(),
+            snapshot.known_program_runs.end());
+  snapshot.known_program_runs.erase(
+      std::unique(snapshot.known_program_runs.begin(),
+                  snapshot.known_program_runs.end()),
+      snapshot.known_program_runs.end());
 
   snapshot.resources.reserve(slots.slots.size());
   for (const auto& slot : slots.slots) {
@@ -2570,6 +2607,7 @@ ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
   runtime_scale_control_settings_.reserve(registrations_.size());
   stop_fault_recovery_replay_ledger_.reserve(config_.request_replay_capacity);
   operation_recovery_replay_ledger_.reserve(config_.request_replay_capacity);
+  program_run_stop_fences_.reserve(config_.request_replay_capacity);
   stop_terminal_history_.reserve(kMaximumResidentStopTerminalRecords);
   for (std::size_t index = 0U; index < stop_transactions_.size(); ++index) {
     stop_transactions_[index] = std::make_unique<StopTransaction>();
@@ -2624,6 +2662,22 @@ ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
                              recovery.error().code + ": " + recovery.error().message);
   }
   historical_operations_ = std::move(recovery.value().historical_operations);
+  for (const auto& recovered :
+       recovery.value().recovered_cell_admission_claims) {
+    if (recovered.release.has_value() ||
+        recovered.reconcile_settlement.has_value() ||
+        recovered.claim.intent.claim_kind !=
+            CellAdmissionClaimKindDTO::kProgramCycle) {
+      continue;
+    }
+    if (program_cycle_claim_run_.has_value()) {
+      throw std::runtime_error(
+          "recovered more than one held Program-cycle claim");
+    }
+    program_cycle_claim_run_ = ProgramCycleClaimRun{
+        ProgramRunId(recovered.claim.intent.owner_transaction_id),
+        recovered.claim.claim_generation};
+  }
   cell_admission_owner_ = std::make_unique<KernelCellAdmissionOwner>(
       config_.request_owner_epoch,
       std::min(config_.request_replay_capacity, config_.cell_admission_claim_capacity), clock_,
@@ -2864,25 +2918,71 @@ AuthoringAdmissionDTO ResourceAddressedExecutionKernel::GetAuthoringAdmission() 
 Result<AuthoringAdmissionDTO> ResourceAddressedExecutionKernel::UpdateCellAdmissionReadiness(
     const CellAdmissionReadinessSnapshotDTO& snapshot) {
   std::lock_guard admission_lock(*admission_mutex_);
-  return cell_admission_owner_->UpdateCellAdmissionReadiness(snapshot);
+  auto updated = cell_admission_owner_->UpdateCellAdmissionReadiness(snapshot);
+  if (updated.ok()) {
+    std::lock_guard state_lock(state_mutex_);
+    current_program_run_id_ =
+        snapshot.program_cycle_status_current &&
+                snapshot.program_cycle_status.has_value()
+            ? snapshot.program_cycle_status->program_run_id
+            : std::nullopt;
+  }
+  return updated;
 }
 
 Result<CellAdmissionClaimDTO> ResourceAddressedExecutionKernel::AcquireCellAdmissionClaim(
     const CellAdmissionClaimIntentDTO& intent) {
   std::lock_guard admission_lock(*admission_mutex_);
-  return cell_admission_owner_->AcquireCellAdmissionClaim(intent);
+  auto acquired = cell_admission_owner_->AcquireCellAdmissionClaim(intent);
+  if (acquired.ok() &&
+      intent.claim_kind == CellAdmissionClaimKindDTO::kProgramCycle) {
+    std::lock_guard state_lock(state_mutex_);
+    program_cycle_claim_run_ = ProgramCycleClaimRun{
+        ProgramRunId(intent.owner_transaction_id),
+        acquired.value().claim_generation};
+  }
+  return acquired;
 }
 
 Result<AuthoringAdmissionDTO> ResourceAddressedExecutionKernel::ReleaseCellAdmissionClaim(
     const CellAdmissionClaimReleaseDTO& release) {
   std::lock_guard admission_lock(*admission_mutex_);
-  return cell_admission_owner_->ReleaseCellAdmissionClaim(release);
+  auto released = cell_admission_owner_->ReleaseCellAdmissionClaim(release);
+  if (released.ok()) {
+    std::lock_guard state_lock(state_mutex_);
+    if (program_cycle_claim_run_.has_value() &&
+        program_cycle_claim_run_->claim_generation ==
+            release.claim_generation) {
+      program_cycle_claim_run_.reset();
+    }
+  }
+  return released;
 }
 
 Result<AuthoringAdmissionDTO> ResourceAddressedExecutionKernel::ReconcileCellAdmissionClaims(
     const CellAdmissionReconcileDTO& reconcile) {
+  std::optional<ProgramCycleClaimRun> program_cycle_claim_run;
+  for (const auto& claim : reconcile.retained_claims) {
+    if (claim.intent.claim_kind !=
+        CellAdmissionClaimKindDTO::kProgramCycle) {
+      continue;
+    }
+    if (program_cycle_claim_run.has_value()) {
+      return reject<AuthoringAdmissionDTO>(
+          "reconciliation retained more than one Program-cycle claim",
+          "program_cycle_claim_invariant", ErrorCode::kInvariantViolation);
+    }
+    program_cycle_claim_run = ProgramCycleClaimRun{
+        ProgramRunId(claim.intent.owner_transaction_id),
+        claim.claim_generation};
+  }
   std::lock_guard admission_lock(*admission_mutex_);
-  return cell_admission_owner_->ReconcileCellAdmissionClaims(reconcile);
+  auto reconciled = cell_admission_owner_->ReconcileCellAdmissionClaims(reconcile);
+  if (reconciled.ok()) {
+    std::lock_guard state_lock(state_mutex_);
+    program_cycle_claim_run_ = std::move(program_cycle_claim_run);
+  }
+  return reconciled;
 }
 
 Result<CellAdmissionRecoveryReceiptDTO>
@@ -4223,7 +4323,30 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
           error("request_ledger_full", "operation replay ledger reached its fixed bound",
                 "request_ledger_full"));
     }
+    const auto fence = std::find_if(
+        program_run_stop_fences_.begin(), program_run_stop_fences_.end(),
+        [&](const ProgramRunStopFence& candidate) {
+          return candidate.program_run_id == intent.program_run_id;
+        });
+    if (fence != program_run_stop_fences_.end()) {
+      return reject<OperationAcceptedDTO>(
+          "the Program run is closed by an accepted Stop",
+          "program_run_stop_fence_active", ErrorCode::kInvalidStateTransition);
+    }
+    if (pending_program_run_admission_.has_value()) {
+      return reject<OperationAcceptedDTO>(
+          "another Program-run admission is already being prepared",
+          "program_run_admission_invariant", ErrorCode::kInvariantViolation);
+    }
+    pending_program_run_admission_ = intent.program_run_id;
   }
+  const ScopeExit clear_pending_program_run([&] {
+    std::lock_guard state_lock(state_mutex_);
+    if (pending_program_run_admission_ ==
+        std::optional<ProgramRunId>{intent.program_run_id}) {
+      pending_program_run_admission_.reset();
+    }
+  });
 
   if (coordinated) {
     return execute_coordinated_motion_after_preflight(intent);
@@ -4566,6 +4689,16 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
       return reject<OperationAcceptedDTO>(
           "new motion admission closed while the operation was being prepared",
           "motion_admission_closed", ErrorCode::kInvalidStateTransition);
+    }
+    const auto run_fence = std::find_if(
+        program_run_stop_fences_.begin(), program_run_stop_fences_.end(),
+        [&](const ProgramRunStopFence& candidate) {
+          return candidate.program_run_id == intent.program_run_id;
+        });
+    if (run_fence != program_run_stop_fences_.end()) {
+      return reject<OperationAcceptedDTO>(
+          "the Program run was stopped while the operation was being prepared",
+          "program_run_stop_fence_active", ErrorCode::kInvalidStateTransition);
     }
     if (emergency_stop_reserve_.find(intent.request_context.request_id.value()).has_value()) {
       return Result<OperationAcceptedDTO>::Err(
@@ -5163,6 +5296,16 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
       return reject<OperationAcceptedDTO>(
           "new motion admission closed while the operation was being prepared",
           "motion_admission_closed", ErrorCode::kInvalidStateTransition);
+    }
+    const auto run_fence = std::find_if(
+        program_run_stop_fences_.begin(), program_run_stop_fences_.end(),
+        [&](const ProgramRunStopFence& candidate) {
+          return candidate.program_run_id == intent.program_run_id;
+        });
+    if (run_fence != program_run_stop_fences_.end()) {
+      return reject<OperationAcceptedDTO>(
+          "the Program run was stopped while the coordinated operation was being prepared",
+          "program_run_stop_fence_active", ErrorCode::kInvalidStateTransition);
     }
     if (emergency_stop_reserve_.find(intent.request_context.request_id.value()).has_value()) {
       return Result<OperationAcceptedDTO>::Err(
@@ -6233,6 +6376,43 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::full_stop(
   return accept_stop(EmergencyStopProjectedIntentDTO{intent});
 }
 
+Result<void> ResourceAddressedExecutionKernel::release_program_run_stop_fence(
+    const ProgramRunId& program_run_id, const StopId& stop_id,
+    const StopGeneration stop_generation) {
+  if (program_run_id.empty() || stop_id.empty() || !stop_generation.nonzero()) {
+    return reject<void>("Program-run Stop fence identity is invalid",
+                        "program_run_stop_fence_identity_invalid",
+                        ErrorCode::kInvalidRequest);
+  }
+  std::lock_guard state_lock(state_mutex_);
+  const auto fence = std::find_if(
+      program_run_stop_fences_.begin(), program_run_stop_fences_.end(),
+      [&](const ProgramRunStopFence& candidate) {
+        return candidate.program_run_id == program_run_id;
+      });
+  if (fence == program_run_stop_fences_.end()) {
+    return Result<void>::Ok();
+  }
+  if (fence->stop_id != stop_id || fence->stop_generation != stop_generation) {
+    return reject<void>("Program-run Stop fence identity changed",
+                        "program_run_stop_fence_stale",
+                        ErrorCode::kInvalidStateTransition);
+  }
+  if (pending_program_run_admission_ ==
+      std::optional<ProgramRunId>{program_run_id}) {
+    return reject<void>("a pre-Stop Program-run admission is still draining",
+                        "program_run_admission_in_flight",
+                        ErrorCode::kInvalidStateTransition);
+  }
+  if (!fence->releasable) {
+    return reject<void>("Program-run Stop has not settled successfully",
+                        "program_run_stop_fence_not_releasable",
+                        ErrorCode::kInvalidStateTransition);
+  }
+  program_run_stop_fences_.erase(fence);
+  return Result<void>::Ok();
+}
+
 Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::recognized_malformed_stop(
     const MalformedStopIngressDTO& ingress) {
   return accept_stop(EmergencyStopProjectedIntentDTO{std::monostate{}}, nullptr, &ingress);
@@ -7027,6 +7207,11 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop(
   } post_reserve_guard;
   const auto* ordinary = std::get_if<StopIntentDTO>(&projected_intent);
   const auto* full = std::get_if<FullStopIntentDTO>(&projected_intent);
+  const auto* program_run_targets =
+      ordinary == nullptr
+          ? nullptr
+          : std::get_if<std::vector<StopProgramRunTargetDTO>>(
+                &ordinary->selector);
   const auto normalized_alternatives = static_cast<unsigned>(ordinary != nullptr) +
                                        static_cast<unsigned>(full != nullptr) +
                                        static_cast<unsigned>(malformed_ingress != nullptr);
@@ -7106,6 +7291,26 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop(
         auto replayed = replay->accepted;
         replayed.replay_status = RequestReplayStatusDTO::kReplayedExact;
         return Result<StopAcceptedDTO>::Ok(std::move(replayed));
+      }
+    }
+    if (program_run_targets != nullptr) {
+      std::size_t missing_fences = 0U;
+      for (const auto& target : *program_run_targets) {
+        const auto retained = std::find_if(
+            program_run_stop_fences_.begin(), program_run_stop_fences_.end(),
+            [&](const ProgramRunStopFence& fence) {
+              return fence.program_run_id == target.program_run_id;
+            });
+        missing_fences += retained == program_run_stop_fences_.end() ? 1U : 0U;
+      }
+      if (missing_fences >
+          config_.request_replay_capacity -
+              std::min(config_.request_replay_capacity,
+                       program_run_stop_fences_.size())) {
+        return reject<StopAcceptedDTO>(
+            "Program-run Stop fence capacity is exhausted",
+            "program_run_stop_fence_capacity_exhausted",
+            ErrorCode::kInternalError);
       }
     }
     outer_deadline_ns =
@@ -7889,6 +8094,27 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop(
             outcome.acceptance_path,
             EmergencyStopProjectionStateDTO::kPending};
         projection.accepted = *accepted;
+      }
+    }
+    if (program_run_targets != nullptr && accepted.has_value() &&
+        !outcome.full_stop &&
+        accepted->resolution_disposition !=
+            StopResolutionDispositionDTO::kPromotedToFull) {
+      for (const auto& target : *program_run_targets) {
+        const auto retained = std::find_if(
+            program_run_stop_fences_.begin(), program_run_stop_fences_.end(),
+            [&](const ProgramRunStopFence& fence) {
+              return fence.program_run_id == target.program_run_id;
+            });
+        if (retained == program_run_stop_fences_.end()) {
+          program_run_stop_fences_.push_back(ProgramRunStopFence{
+              target.program_run_id, accepted->stop_id,
+              accepted->stop_generation, false});
+        } else {
+          retained->stop_id = accepted->stop_id;
+          retained->stop_generation = accepted->stop_generation;
+          retained->releasable = false;
+        }
       }
     }
     if (ordinary != nullptr && malformed_ingress == nullptr && accepted.has_value()) {
@@ -8780,6 +9006,15 @@ bool ResourceAddressedExecutionKernel::commit_stop_terminal_locked(
     transaction.certificate = certificate;
     transaction.terminal_projection_token = projection_token;
     stop_terminal_history_.push_back(std::move(record));
+    const bool program_run_fence_releasable =
+        certificate.result == StopCertificateResultDTO::kSucceededNominal ||
+        certificate.result == StopCertificateResultDTO::kSucceededEscalated;
+    for (auto& fence : program_run_stop_fences_) {
+      if (fence.stop_id == certificate.stop_id &&
+          fence.stop_generation == certificate.stop_generation) {
+        fence.releasable = program_run_fence_releasable;
+      }
+    }
     if (latch.has_value()) {
       cell_stop_fault_latch_generation_ = *latch_generation;
       active_stop_fault_latch_ = *latch;

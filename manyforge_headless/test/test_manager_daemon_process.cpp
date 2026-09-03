@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cctype>
 #include <chrono>
 #include <cstdlib>
@@ -20,6 +21,7 @@
 #include <manyforge_component_manager/manager_apply_journal.hpp>
 #include <manyforge_component_manager/native_execution_runtime_unit_admission.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
+#include <manyforge_core/types/cell_admission.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
@@ -705,8 +707,20 @@ ExecutionReadyObservation WaitForExecutionReady(
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
+  std::ifstream manager_log(directory.startup_stderr(), std::ios::binary);
+  std::string manager_detail{std::istreambuf_iterator<char>(manager_log),
+                             std::istreambuf_iterator<char>()};
+  constexpr std::size_t kMaximumFailureDetailBytes = 16U * 1024U;
+  if (manager_detail.size() > kMaximumFailureDetailBytes) {
+    manager_detail.erase(
+        0U, manager_detail.size() - kMaximumFailureDetailBytes);
+  }
   throw std::runtime_error("execution owner did not reopen exact product: " +
-                           observation.response);
+                           observation.response +
+                           (manager_detail.empty()
+                                ? std::string{}
+                                : std::string("; manager stderr: ") +
+                                      manager_detail));
 }
 
 RuntimeOfferProjection WaitForRuntimeOfferProjection(
@@ -776,14 +790,27 @@ std::string SendCommand(const std::filesystem::path &path,
     static_cast<void>(::close(client));
     throw std::runtime_error("Manager command send failed");
   }
-  std::vector<char> response(16U * 1024U + 1U);
-  const auto received =
-      ::recv(client, response.data(), response.size(), MSG_TRUNC);
-  static_cast<void>(::close(client));
-  if (received <= 0 || static_cast<std::size_t>(received) >= response.size()) {
+  char probe{};
+  ssize_t response_size = -1;
+  do {
+    response_size = ::recv(client, &probe, 1U, MSG_PEEK | MSG_TRUNC);
+  } while (response_size < 0 && errno == EINTR);
+  if (response_size <= 0 ||
+      static_cast<std::size_t>(response_size) >
+          core::kMaximumCellAdmissionJsonResponseBytes) {
+    static_cast<void>(::close(client));
     throw std::runtime_error("Manager command response is invalid");
   }
-  return {response.data(), static_cast<std::size_t>(received)};
+  std::string response(static_cast<std::size_t>(response_size), '\0');
+  ssize_t received = -1;
+  do {
+    received = ::recv(client, response.data(), response.size(), 0);
+  } while (received < 0 && errno == EINTR);
+  static_cast<void>(::close(client));
+  if (received != response_size) {
+    throw std::runtime_error("Manager command response changed during read");
+  }
+  return response;
 }
 
 void SendCommandAndDisconnect(const std::filesystem::path &path,

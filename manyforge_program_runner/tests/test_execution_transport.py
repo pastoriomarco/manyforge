@@ -49,6 +49,12 @@ def test_transport_reuses_the_owner_client_with_internal_attribution(
                 "command": kind,
                 "ok": True,
             }
+        if kind == "release_program_run_stop_fence":
+            return {
+                "api_version": "test",
+                "command": kind,
+                "ok": True,
+            }
         assert kind == "read_stop"
         return {
             "api_version": "test",
@@ -69,12 +75,27 @@ def test_transport_reuses_the_owner_client_with_internal_attribution(
     assert transport.identity()["ok"] is True
     assert transport.stop_program_run(_stop_body())["ok"] is True
     assert transport.stop_status("stop.1")["stop_status"]["state"] == "succeeded"
+    assert transport.release_program_run_stop_fence(
+        "program-run.1", "stop.1", 1
+    )["ok"] is True
     assert commands[1]["attribution"] == {
         "transport": "internal",
         "assurance": "unverified",
         "principal_id": None,
     }
     assert commands[1]["request"] == _stop_body()
+    assert commands[3] == {
+        "api_version": "manyforge.execution_command.v1",
+        "attribution": {
+            "transport": "internal",
+            "assurance": "unverified",
+            "principal_id": None,
+        },
+        "command": "release_program_run_stop_fence",
+        "program_run_id": "program-run.1",
+        "stop_generation": 1,
+        "stop_id": "stop.1",
+    }
 
 
 def test_transport_preserves_validation_and_owner_error_codes(

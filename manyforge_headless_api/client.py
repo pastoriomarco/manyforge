@@ -7,10 +7,12 @@ from dataclasses import dataclass
 import hashlib
 import json
 import re
+import threading
 from typing import Any, Iterable, Mapping, Sequence
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
+from websockets.sync.client import ClientConnection, connect as connect_websocket
 
 from .native import (
     MAX_ASSISTANT_MODE_CONTEXT_RESPONSE_BYTES,
@@ -33,6 +35,8 @@ MAX_HTTP_RESPONSE_BYTES = 64 * 1024 * 1024
 _CONDITION_ID_PATTERN = re.compile(r"^condition-[0-9a-f]{24}$")
 _ASSISTANT_MODE_PATTERN = re.compile(r"^[a-z][a-z0-9.-]*$")
 _SHA256_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
+_OBSERVATION_CREDIT_SCHEMA = "manyforge.execution_observation_credit.v1"
+_MAXIMUM_OBSERVATION_FRAME_BYTES = 4 * 1024 * 1024
 
 
 class HeadlessClientError(RuntimeError):
@@ -58,6 +62,95 @@ class CallerIdentity:
     source_label: str
 
 
+class HeadlessExecutionObservationStream:
+    """One credited WebSocket to the Headless native-observation proxy."""
+
+    def __init__(self, base_url: str, timeout_seconds: float) -> None:
+        parsed = urlsplit(base_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("headless base URL is invalid")
+        path = parsed.path.rstrip("/") + "/ws/execution/observations"
+        self._url = urlunsplit(
+            (
+                "wss" if parsed.scheme == "https" else "ws",
+                parsed.netloc,
+                path,
+                "",
+                "",
+            )
+        )
+        self._timeout_seconds = timeout_seconds
+        self._connection: ClientConnection | None = None
+
+    def __enter__(self) -> "HeadlessExecutionObservationStream":
+        self._connection = connect_websocket(
+            self._url,
+            open_timeout=self._timeout_seconds,
+            close_timeout=min(self._timeout_seconds, 1.0),
+            max_size=_MAXIMUM_OBSERVATION_FRAME_BYTES,
+        )
+        return self
+
+    def close(self) -> None:
+        connection = self._connection
+        self._connection = None
+        if connection is not None:
+            connection.close()
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def next(
+        self,
+        cursor: Mapping[str, Any] | None,
+        cancelled: threading.Event,
+    ) -> dict[str, Any]:
+        connection = self._connection
+        if connection is None:
+            raise HeadlessClientError(
+                "headless_observation_stream_closed",
+                "headless execution observation stream is closed",
+            )
+        last_applied = None if cursor is None else dict(cursor)
+        connection.send(
+            json.dumps(
+                {
+                    "last_applied": last_applied,
+                    "schema_version": _OBSERVATION_CREDIT_SCHEMA,
+                },
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+        while not cancelled.is_set():
+            try:
+                payload = connection.recv(timeout=0.25)
+            except TimeoutError:
+                continue
+            if not isinstance(payload, str):
+                raise HeadlessClientError(
+                    "headless_observation_stream_invalid",
+                    "headless execution observation frame is not text",
+                )
+            try:
+                return strict_json_object(
+                    payload,
+                    label="headless execution observation frame",
+                    maximum_bytes=_MAXIMUM_OBSERVATION_FRAME_BYTES,
+                )
+            except RuntimeError as exc:
+                raise HeadlessClientError(
+                    "headless_observation_stream_invalid",
+                    str(exc),
+                ) from exc
+        raise HeadlessClientError(
+            "headless_observation_stream_cancelled",
+            "headless execution observation demand ended",
+        )
+
+
 class HeadlessHttpClient:
     """Transport only: never cache, reconcile, or infer owner state."""
 
@@ -71,9 +164,19 @@ class HeadlessHttpClient:
         if timeout_seconds <= 0 or timeout_seconds > 30:
             raise ValueError("HTTP timeout must be in (0, 30] seconds")
         self._owns_client = client is None
+        self._base_url = base_url.rstrip("/")
         self._client = client or httpx.Client(
-            base_url=base_url.rstrip("/"),
+            base_url=self._base_url,
             timeout=httpx.Timeout(timeout_seconds),
+        )
+        self._timeout_seconds = timeout_seconds
+
+    def open_execution_observation_stream(
+        self,
+    ) -> HeadlessExecutionObservationStream:
+        return HeadlessExecutionObservationStream(
+            self._base_url,
+            self._timeout_seconds,
         )
 
     @staticmethod
@@ -782,9 +885,6 @@ class HeadlessHttpClient:
 
     def execution_control_state(self) -> dict[str, Any]:
         return self.request("GET", "/api/execution/control-state")
-
-    def execution_observation(self) -> dict[str, Any]:
-        return self.request("GET", "/api/execution/observation")
 
     def execute(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/execution/operations", body=body)

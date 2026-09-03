@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { api } from '../api/client';
 import type {
   AppliedProgramSelection,
+  ProgramRuntimeControlProjection,
   ProgramRunStatus,
   ProgramWorkspaceResponse,
   ScenarioCatalogResponse,
@@ -18,8 +19,9 @@ import {
   observeProgramCommandFailure,
   programCommandFailureMessage,
   programPendingAfterProjection,
+  programRunProjectionKey,
+  programRuntimeAfterSnapshot,
   programMotionStopSettled,
-  programRunNeedsObservationPoll,
   programRuntimeWakeKey,
   programTerminalFailureMessage,
   retainedScenarioSelection,
@@ -51,7 +53,9 @@ function admissionFixtures() {
       programRunnerOwnerEpoch: 'runner.epoch.1', cycleGeneration: 3,
       state: 'idle_after_reset', programRunId: null,
       cycleClaimGeneration: null, terminalOrSettlementReference: null,
+      runRevision: null, nodeStatusRevision: null,
       runtimeControlRevision: null, recoveryOffer: null,
+      run: null, runtimeControls: null,
     },
     draftIdentity: { draftId: 'draft-1', draftRevision: 5 },
   } as ComposerHeadlessState;
@@ -96,18 +100,27 @@ describe('Program runtime idle selection', () => {
           manager: { sourceOwnerEpoch: 'manager.1', sourceGeneration: 4 },
         },
       },
+      componentOverview: {
+        basis: {
+          appliedProgramOwnerEpoch: 'applied.1',
+          appliedProgramGeneration: 3,
+        },
+      },
       authoringAdmission: { admissionGeneration: 7 },
       programCycle: {
         programRunnerOwnerEpoch: 'runner.1',
         cycleGeneration: 2,
         state: 'idle_after_reset',
+        programRunId: null,
+        runRevision: null,
+        nodeStatusRevision: null,
         runtimeControlRevision: null,
         recoveryOffer: null,
       },
       draftIdentity: { draftId: 'draft-1', draftRevision: 5 },
     } as ComposerHeadlessState;
     expect(programRuntimeWakeKey(snapshot)).toContain(
-      'manager.1:no-retained-bundle:no-graph-revision:7',
+      'manager.1:no-retained-bundle:no-graph-revision:applied.1:3:7',
     );
     expect(programRuntimeWakeKey({
       ...snapshot,
@@ -119,6 +132,15 @@ describe('Program runtime idle selection', () => {
         },
       },
     })).toBe(programRuntimeWakeKey(snapshot));
+    expect(programRuntimeWakeKey({
+      ...snapshot,
+      programCycle: {
+        ...snapshot.programCycle,
+        runRevision: 2,
+      },
+    })).toBe(programRuntimeWakeKey(snapshot));
+    expect(source).not.toContain('PROGRAM_RUN_OBSERVATION_POLL_MS');
+    expect(source).not.toContain('api.programs.read(activeRunId');
     expect(programRuntimeWakeKey({
       ...snapshot,
       draftIdentity: { draftId: 'draft-1', draftRevision: 6 },
@@ -139,11 +161,21 @@ describe('Program runtime idle selection', () => {
     })).not.toBe(programRuntimeWakeKey(snapshot));
     expect(programRuntimeWakeKey({
       ...snapshot,
+      componentOverview: {
+        ...snapshot.componentOverview,
+        basis: {
+          ...snapshot.componentOverview.basis,
+          appliedProgramGeneration: 4,
+        },
+      },
+    })).not.toBe(programRuntimeWakeKey(snapshot));
+    expect(programRuntimeWakeKey({
+      ...snapshot,
       programCycle: {
         ...snapshot.programCycle,
         runtimeControlRevision: 2,
       },
-    })).not.toBe(programRuntimeWakeKey(snapshot));
+    })).toBe(programRuntimeWakeKey(snapshot));
   });
 
   it('does not derive operator selection from the catalog or Applied projection', () => {
@@ -157,8 +189,10 @@ describe('Program runtime idle selection', () => {
     expect(refresh).not.toContain('api.programs.start');
     expect(refresh).not.toContain('applyDraft');
     expect(refresh).toContain('api.programs.currentScenario()');
-    expect(refresh).toContain('pending: programPendingAfterProjection(');
-    expect(refresh).toContain('cycleDebugProjection');
+    expect(refresh).not.toContain('api.programs.runs(');
+    expect(refresh).not.toContain('api.programs.runtimeControls(');
+    expect(source).toContain('programRuntimeAfterSnapshot(');
+    expect(source).toContain('const pending = programPendingAfterProjection(');
   });
 
   it('retains only a still-available explicit operator selection', () => {
@@ -174,6 +208,69 @@ describe('Program runtime idle selection', () => {
 });
 
 describe('Program command settlement', () => {
+  it('does not discard a newer node-status projection within one run revision', () => {
+    const current = {
+      ownerEpoch: 'runner.epoch.1',
+      runRevision: 5,
+      nodeStatusRevision: 8,
+      capture: { programRunId: 'run-1' },
+      nodeStatuses: { first: 'running', second: 'idle' },
+    } as unknown as ProgramRunStatus;
+    const advanced = {
+      ...current,
+      nodeStatusRevision: 9,
+      nodeStatuses: { first: 'success', second: 'running' },
+    } as unknown as ProgramRunStatus;
+
+    expect(programRunProjectionKey(advanced)).not.toBe(
+      programRunProjectionKey(current),
+    );
+    expect(programRunProjectionKey({ ...advanced })).toBe(
+      programRunProjectionKey(advanced),
+    );
+  });
+
+  it('never lets an older shared snapshot undo a newer command response', () => {
+    const currentRun = {
+      ownerEpoch: 'runner.epoch.1',
+      runRevision: 5,
+      capture: { programRunId: 'run-1' },
+    } as ProgramRunStatus;
+    const currentControls = {
+      ownerEpoch: 'runner.epoch.1',
+      programRunId: 'run-1',
+      runRevision: 5,
+      runtimeControls: { runtimeControlRevision: 7 },
+    } as ProgramRuntimeControlProjection;
+    const olderRun = { ...currentRun, runRevision: 4 };
+    const cycle = {
+      programRunnerOwnerEpoch: 'runner.epoch.1',
+      cycleGeneration: 3,
+      state: 'running',
+      programRunId: 'run-1',
+      runRevision: 4,
+      nodeStatusRevision: 2,
+      runtimeControlRevision: 6,
+      run: olderRun,
+      runtimeControls: {
+        ...currentControls,
+        runRevision: 4,
+        runtimeControls: { runtimeControlRevision: 6 },
+      },
+    } as Parameters<typeof programRuntimeAfterSnapshot>[2];
+
+    expect(programRuntimeAfterSnapshot(
+      currentRun,
+      currentControls,
+      cycle,
+    )).toEqual({ run: currentRun, controls: currentControls });
+    expect(programRuntimeAfterSnapshot(
+      currentRun,
+      currentControls,
+      { ...cycle, programRunId: null, run: null, runtimeControls: null },
+    )).toEqual({ run: null, controls: null });
+  });
+
   it('re-reads the current cycle, exact run, and recovery after rejection', async () => {
     const run = {
       ownerEpoch: 'runner.epoch.current',
@@ -344,8 +441,6 @@ describe('Program command settlement', () => {
       { ...settled, ownerEpoch: 'runner.epoch.stale' },
     )).toBe('motion-stop');
     expect(programPendingAfterProjection('motion-stop', run, settled)).toBeNull();
-    expect(programRunNeedsObservationPoll(run, settled)).toBe(false);
-    expect(programRunNeedsObservationPoll(run, null)).toBe(true);
     expect(programPendingAfterProjection(
       'motion-stop',
       { ...run, state: 'stopped' },
@@ -416,7 +511,6 @@ describe('Program command settlement', () => {
     >;
     expect(programMotionStopSettled(run, resetOnly)).toBe(true);
     expect(programPendingAfterProjection('motion-stop', run, resetOnly)).toBeNull();
-    expect(programRunNeedsObservationPoll(run, resetOnly)).toBe(false);
   });
 
   it('keeps Resume disabled until the exact recovery offer changes', () => {
@@ -497,7 +591,9 @@ describe('Program runtime authority requests', () => {
         state: 'terminal_awaiting_reset' as const,
         programRunId: 'run-1', cycleClaimGeneration: 12,
         terminalOrSettlementReference: terminalReference,
+        runRevision: null, nodeStatusRevision: null,
         runtimeControlRevision: null, recoveryOffer: null,
+        run: null, runtimeControls: null,
       },
     };
     expect(buildProgramResetRequest(

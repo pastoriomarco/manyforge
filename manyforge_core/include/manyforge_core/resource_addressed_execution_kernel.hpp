@@ -342,6 +342,11 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
 
   [[nodiscard]] Result<StopAcceptedDTO> stop(const StopIntentDTO& intent);
   [[nodiscard]] Result<StopAcceptedDTO> full_stop(const FullStopIntentDTO& intent);
+  /// Reopen one exact Program-run admission fence after its accepted Stop has
+  /// settled and the Program owner has explicitly chosen recovery/resume.
+  [[nodiscard]] Result<void> release_program_run_stop_fence(
+      const ProgramRunId& program_run_id, const StopId& stop_id,
+      StopGeneration stop_generation);
   [[nodiscard]] Result<StopAcceptedDTO> recognized_malformed_stop(
       const MalformedStopIngressDTO& ingress);
 
@@ -622,6 +627,16 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   mutable std::mutex stop_fault_recovery_mutex_;
   mutable std::mutex operation_recovery_mutex_;
   mutable std::mutex state_mutex_;
+  struct ProgramRunStopFence final {
+    ProgramRunId program_run_id;
+    StopId stop_id;
+    StopGeneration stop_generation;
+    bool releasable{};
+  };
+  struct ProgramCycleClaimRun final {
+    ProgramRunId program_run_id;
+    CellAdmissionClaimGeneration claim_generation{0U};
+  };
   std::vector<ReplayEntry> replay_ledger_;
   std::vector<ControlReplayEntry> control_replay_ledger_;
   std::vector<StopReplayEntry> stop_replay_ledger_;
@@ -635,6 +650,15 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   struct OperationRecoveryReplayEntry;
   std::vector<OperationRecoveryReplayEntry> operation_recovery_replay_ledger_;
   std::vector<OperationStateDTO> historical_operations_;
+  std::vector<ProgramRunStopFence> program_run_stop_fences_;
+  std::optional<ProgramRunId> pending_program_run_admission_;
+  // Program-cycle acquisition is synchronous and precedes all Run effects.
+  // Its transaction identity is the exact ProgramRunId, so Stop never waits
+  // for the asynchronously refreshed Manager status projection to know a run.
+  std::optional<ProgramCycleClaimRun> program_cycle_claim_run_;
+  // Retained only as a compatibility/readiness source for a predecessor run
+  // admitted before Program-cycle transaction and ProgramRunId were unified.
+  std::optional<ProgramRunId> current_program_run_id_;
   /// Canonical bounded resident operation table. Every accepted operation also
   /// consumes one entry in the fixed-capacity replay ledger, so this table can
   /// never exceed request_replay_capacity.

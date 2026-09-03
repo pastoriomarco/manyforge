@@ -17,6 +17,7 @@ export interface ExecutionObservationFrame {
 export interface ExecutionObservationReader {
   getLatestExecutionObservation: () => ExecutionObservationFrame | null;
   subscribeExecutionObservation: (listener: () => void) => () => void;
+  markExecutionObservationApplied: (frame: ExecutionObservationFrame) => void;
 }
 
 export type ExecutionObservationTransportPhase =

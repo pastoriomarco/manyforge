@@ -536,8 +536,12 @@ export interface ProgramCycleStatus {
   programRunId: string | null;
   cycleClaimGeneration: number | null;
   terminalOrSettlementReference: string | null;
+  runRevision: number | null;
+  nodeStatusRevision: number | null;
   runtimeControlRevision: number | null;
   recoveryOffer: CycleRecoveryOffer | null;
+  run: ProgramRunStatus | null;
+  runtimeControls: ProgramRuntimeControlProjection | null;
 }
 
 export type RuntimeOverrideStatus = 'staged' | 'active' | 'cleared' | 'stale';

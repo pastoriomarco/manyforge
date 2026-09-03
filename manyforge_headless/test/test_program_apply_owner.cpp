@@ -334,6 +334,9 @@ TEST(ProgramSelectionOwnerTest,
     EXPECT_TRUE(std::filesystem::exists(RepositoryEntry(
         directory.artifacts(), "program-bindings",
         Text(prepared, "program_binding_id"))));
+    EXPECT_TRUE(std::filesystem::exists(RepositoryEntry(
+        directory.artifacts(), "programs",
+        baseline.program_revision.value())));
     EXPECT_FALSE(std::filesystem::exists(
         RepositoryEntry(directory.package(), "programs",
                         Text(prepared, "program_revision"))));

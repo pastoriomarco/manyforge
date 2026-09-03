@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
+import json
 from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -16,6 +17,45 @@ if TYPE_CHECKING:
 
 
 _SEND_TIMEOUT_SECONDS = 0.25
+_MAXIMUM_CREDIT_BYTES = 4_096
+
+
+def _credit_identity(message: str) -> tuple[str, str, int] | None:
+    from .execution_observation_stream import OBSERVATION_CREDIT_SCHEMA
+
+    if len(message.encode("utf-8")) > _MAXIMUM_CREDIT_BYTES:
+        raise ValueError("execution observation credit is oversized")
+    try:
+        value = json.loads(message)
+    except (json.JSONDecodeError, UnicodeError) as error:
+        raise ValueError("execution observation credit is not JSON") from error
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"last_applied", "schema_version"}
+        or value.get("schema_version") != OBSERVATION_CREDIT_SCHEMA
+    ):
+        raise ValueError("execution observation credit has an invalid shape")
+    cursor = value.get("last_applied")
+    if cursor is None:
+        return None
+    if (
+        not isinstance(cursor, dict)
+        or set(cursor) != {"owner_epoch", "source_epoch", "source_sequence"}
+        or not isinstance(cursor.get("owner_epoch"), str)
+        or not cursor["owner_epoch"]
+        or len(cursor["owner_epoch"].encode("utf-8")) > 2_048
+        or not isinstance(cursor.get("source_epoch"), str)
+        or not cursor["source_epoch"]
+        or len(cursor["source_epoch"].encode("utf-8")) > 2_048
+        or type(cursor.get("source_sequence")) is not int
+        or not 0 <= cursor["source_sequence"] <= 9_007_199_254_740_991
+    ):
+        raise ValueError("execution observation credit cursor is invalid")
+    return (
+        cursor["owner_epoch"],
+        cursor["source_epoch"],
+        cursor["source_sequence"],
+    )
 
 
 def create_viewer_router(
@@ -36,33 +76,46 @@ def create_viewer_router(
     @router.websocket("/ws/scene/viewer")
     async def viewer_observation(websocket: WebSocket) -> None:
         await websocket.accept()
-        subscription: ExecutionObservationSubscription = source.subscribe()
+        try:
+            subscription: ExecutionObservationSubscription = source.subscribe()
+        except RuntimeError:
+            await websocket.close(
+                code=1013,
+                reason="execution observation client limit reached",
+            )
+            return
 
         async def send_latest() -> None:
             while True:
-                payload = await subscription.queue.get()
+                await subscription.wake.wait()
+                payload = source.take_payload(subscription)
+                if payload is None:
+                    continue
                 await asyncio.wait_for(
                     websocket.send_text(payload),
                     timeout=_SEND_TIMEOUT_SECONDS,
                 )
 
-        async def wait_for_disconnect() -> None:
+        async def receive_credit() -> None:
+            from .execution_observation_stream import (
+                OBSERVATION_DEMAND_LEASE_SECONDS,
+            )
+
             while True:
-                message = await websocket.receive()
-                if message.get("type") == "websocket.disconnect":
-                    return
-                # This observer is deliberately one-way. Any inbound payload
-                # ends the session rather than creating a hidden command lane.
-                return
+                message = await asyncio.wait_for(
+                    websocket.receive_text(),
+                    timeout=OBSERVATION_DEMAND_LEASE_SECONDS,
+                )
+                source.grant_credit(subscription, _credit_identity(message))
 
         sender = asyncio.create_task(send_latest())
-        receiver = asyncio.create_task(wait_for_disconnect())
+        receiver = asyncio.create_task(receive_credit())
         try:
             await asyncio.wait(
                 {sender, receiver},
                 return_when=asyncio.FIRST_COMPLETED,
             )
-        except (WebSocketDisconnect, asyncio.TimeoutError):
+        except (WebSocketDisconnect, asyncio.TimeoutError, ValueError):
             pass
         finally:
             for task in (sender, receiver):
@@ -72,6 +125,7 @@ def create_viewer_router(
                     asyncio.CancelledError,
                     WebSocketDisconnect,
                     asyncio.TimeoutError,
+                    ValueError,
                 ):
                     await task
             source.unsubscribe(subscription)

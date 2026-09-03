@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from threading import Event, Thread
 from typing import Any, Mapping
 
 import pytest
@@ -47,8 +48,12 @@ class _Transport:
         self.operation_reads = 0
         self.stop_status_reads = 0
         self.stop_states: dict[str, str] = {}
+        self.stop_generations: dict[str, int] = {}
+        self.released_scope_stops: list[tuple[str, str, int]] = []
+        self.identity_reads = 0
 
     def identity(self) -> dict[str, Any]:
+        self.identity_reads += 1
         return {
             "ok": True,
             "identity": {
@@ -136,13 +141,25 @@ class _Transport:
         )
         stop_id = f"scope-stop-{len(self.stop_states) + 1}"
         self.stop_states[stop_id] = "stopping"
+        self.stop_generations[stop_id] = len(self.stop_generations) + 1
         return {
             "ok": True,
             "accepted": {
                 "request_id": body["request_context"]["request_id"],
                 "stop_id": stop_id,
+                "stop_generation": self.stop_generations[stop_id],
             },
         }
+
+    def release_program_run_stop_fence(
+        self, program_run_id: str, stop_id: str, stop_generation: int
+    ) -> dict[str, Any]:
+        assert self.stop_states[stop_id] == "succeeded"
+        assert self.stop_generations[stop_id] == stop_generation
+        self.released_scope_stops.append(
+            (program_run_id, stop_id, stop_generation)
+        )
+        return {"ok": True}
 
     def stop_status(self, stop_id: str):
         self.stop_status_reads += 1
@@ -406,6 +423,179 @@ def test_program_scope_stop_is_one_exact_batch_without_operation_reads() -> None
     assert port.scope.observe("program-run.1").state is ProgramRunScopeState.SETTLED
     assert transport.operation_reads == reads_before_stop
     assert transport.stop_status_reads == 2
+    transport.operations[started.task_id]["state"] = "stopped"
+    transport.operations[second.task_id]["state"] = "stopped"
+    released = port.scope.release_stop("program-run.1")
+    assert released.state is ProgramRunScopeState.SETTLED
+    assert transport.released_scope_stops == [
+        ("program-run.1", "scope-stop-1", 1)
+    ]
+
+
+def test_program_scope_stop_joins_inflight_admission_and_fences_fresh_work() -> None:
+    admission_entered = Event()
+    release_admission = Event()
+
+    class _BlockingAdmissionTransport(_Transport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.block_next_admission = False
+            self.program_run_fenced = False
+
+        def submit(self, body: Mapping[str, Any]) -> dict[str, Any]:
+            if self.block_next_admission:
+                admission_entered.set()
+                assert release_admission.wait(timeout=2.0)
+                if self.program_run_fenced:
+                    return {
+                        "ok": False,
+                        "error": {
+                            "code": "invalid_state_transition",
+                            "message": "Program-run Stop fence is active",
+                            "details": {
+                                "reason": "program_run_stop_fence_active"
+                            },
+                        },
+                    }
+            return super().submit(body)
+
+        def stop_program_run(self, body: Mapping[str, Any]):
+            self.program_run_fenced = True
+            return super().stop_program_run(body)
+
+    transport = _BlockingAdmissionTransport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    first = port.operations.start(
+        "motion.move_to_pose",
+        _identity("already-active"),
+        _motion_inputs(),
+    )
+    transport.operations[first.task_id].update(
+        {"state": "executing", "operation_revision": 3}
+    )
+    transport.block_next_admission = True
+    admission_errors: list[Exception] = []
+    stopped: list[ProgramRunScopeSnapshot] = []
+
+    def admit() -> None:
+        try:
+            port.operations.start(
+                "motion.move_to_pose",
+                _identity("crossing-admission"),
+                _motion_inputs(),
+            )
+        except Exception as error:
+            admission_errors.append(error)
+
+    admission = Thread(target=admit)
+    admission.start()
+    assert admission_entered.wait(timeout=1.0)
+
+    stop_completed = Event()
+
+    def stop() -> None:
+        stopped.append(port.scope.request_stop(
+            "program-run.1",
+            "execution:caller.1:request.concurrent",
+            "priority Stop",
+        ))
+        stop_completed.set()
+
+    stopping = Thread(target=stop)
+    stopping.start()
+    assert stop_completed.wait(timeout=0.5)
+    release_admission.set()
+    admission.join(timeout=1.0)
+    stopping.join(timeout=1.0)
+
+    assert not admission.is_alive()
+    assert not stopping.is_alive()
+    assert len(admission_errors) == 1
+    assert "successful envelope" in str(admission_errors[0])
+    assert stopped[0].state is ProgramRunScopeState.ACTIVE
+    assert stopped[0].active_operation_count == 1
+    assert [row[0] for row in transport.controls] == ["stop_program_run"]
+    with pytest.raises(ProductionPortError, match="scope is stopped"):
+        port.operations.start(
+            "motion.move_to_pose",
+            _identity("after-scope-stop"),
+            _motion_inputs(),
+        )
+    assert len(transport.submissions) == 1
+
+
+def test_program_scope_stop_reaches_kernel_before_first_task_is_retained() -> None:
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+
+    stopped = port.scope.request_stop(
+        "program-run.1",
+        "execution:caller.1:request.before-first-task",
+        "priority Stop during first admission",
+    )
+
+    assert stopped.state is ProgramRunScopeState.ACTIVE
+    assert stopped.active_operation_count == 0
+    assert [row[0] for row in transport.controls] == ["stop_program_run"]
+    with pytest.raises(ProductionPortError, match="scope is stopped"):
+        port.operations.start(
+            "motion.move_to_pose",
+            _identity("after-empty-scope-stop"),
+            _motion_inputs(),
+        )
+    assert transport.submissions == []
+
+
+def test_program_scope_stop_never_waits_on_the_ordinary_identity_lane() -> None:
+    identity_blocked = Event()
+    release_identity = Event()
+
+    class _BlockedOrdinaryTransport(_Transport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.block_identity = False
+
+        def identity(self) -> dict[str, Any]:
+            if self.block_identity:
+                identity_blocked.set()
+                assert release_identity.wait(timeout=2.0)
+            return super().identity()
+
+    transport = _BlockedOrdinaryTransport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    assert transport.identity_reads == 1
+    transport.block_identity = True
+
+    stopped: list[ProgramRunScopeSnapshot] = []
+    stop_completed = Event()
+
+    def stop() -> None:
+        stopped.append(
+            port.scope.request_stop(
+                "program-run.1",
+                "execution:caller.1:request.priority",
+                "priority Stop",
+            )
+        )
+        stop_completed.set()
+
+    stopping = Thread(target=stop)
+    stopping.start()
+    completed_without_ordinary_lane = stop_completed.wait(timeout=0.5)
+    if not completed_without_ordinary_lane:
+        release_identity.set()
+    stopping.join(timeout=1.0)
+    release_identity.set()
+
+    assert completed_without_ordinary_lane
+    assert not stopping.is_alive()
+    assert not identity_blocked.is_set()
+    assert transport.identity_reads == 1
+    assert stopped[0].state is ProgramRunScopeState.ACTIVE
+    assert [row[0] for row in transport.controls] == ["stop_program_run"]
 
 
 def test_program_scope_reuses_one_physical_stop_for_full_stop_quiescence() -> None:
@@ -536,12 +726,8 @@ def test_stale_native_deployment_fails_before_dispatch() -> None:
 
     transport = _StaleTransport()
     port = NativeKernelProgramPort(KernelClient(transport))
-    port.bind(_context())
-
     with pytest.raises(ProductionPortError, match="captured Program"):
-        port.operations.start(
-            "motion.move_to_pose", _identity(), _motion_inputs()
-        )
+        port.bind(_context())
 
     assert transport.submissions == []
 
@@ -886,6 +1072,69 @@ def test_native_motion_stop_projects_exact_operator_recovery_policy() -> None:
         == "operator_stop_policy"
     )
     port.unbind("program-run.1")
+
+
+def test_accepted_native_motion_recovery_releases_the_obsolete_task() -> None:
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    identity = _identity("motion-recovery")
+    started = port.operations.start(
+        "motion.move_to_pose",
+        identity,
+        _motion_inputs(),
+    )
+    operation = transport.operations[started.task_id]
+    operation.update(
+        {
+            "state": "stopped",
+            "operation_revision": 2,
+            "active_stop_id": "stop.1",
+            "active_stop_generation": 1,
+        }
+    )
+    transport.operation_recovery = lambda _operation_id: {
+        "ok": True,
+        "operation_revision": 2,
+        "participants": [{"operation_participant_id": "participant.arm"}],
+        "recovery_assessment": {
+            "recovery_class": "ordinary_operator_stop",
+            "assessment_revision": 3,
+            "control_command_epoch": "control.epoch.1",
+            "execution_id": "execution.1",
+            "latch_id": "",
+            "stop_certificate_id": "certificate.1",
+            "stop_owner_generation": 1,
+        },
+        "stop_generation": 1,
+        "stop_id": "stop.1",
+    }
+    transport.apply_operation_recovery = lambda _id, _revision, body: {
+        "ok": True,
+        "result": {
+            "request_id": body["request_id"],
+            "action": body["action"],
+            "accepted": True,
+            "resulting_assessment": {"recovery_class": "recovered"},
+        },
+    }
+
+    result = port.operations.recover(
+        started.task_id,
+        identity,
+        action="replan_from_stopped_state",
+        request_id="motion-recovery.1",
+        reason="operator Resume Motion",
+    )
+
+    assert result["accepted"] is True
+    assert port.scope.observe("program-run.1") == ProgramRunScopeSnapshot(
+        "program-run.1",
+        ProgramRunScopeState.SETTLED,
+        0,
+    )
+    with pytest.raises(ProductionPortError, match="not retained"):
+        port.operations.observe(started.task_id)
 
 
 def test_full_stopped_pick_place_recovers_exact_active_operation_for_run() -> None:

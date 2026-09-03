@@ -666,11 +666,12 @@ def test_start_binds_exact_client_context_before_tree_construction() -> None:
         context_port=context_port,
     )
 
-    started = owner.start(admission)
+    started = owner.start(admission, program_run_id="program-cycle.7")
 
     assert fixture_events[0] == "context_bind"
     assert len(context_port.contexts) == 1
     context = context_port.contexts[0]
+    assert started.capture.program_run_id == "program-cycle.7"
     assert context.program_run_id == started.capture.program_run_id
     assert context.program_binding_id == admission.program_binding_id
     assert context.program_binding["program_id"] == admission.program.program_id
@@ -957,6 +958,118 @@ def test_tick_host_keeps_only_operator_stop_intervention_observable() -> None:
     host.shutdown()
 
 
+def test_tick_host_retains_resume_after_a_stale_intervention_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interventions = ProgramInterventionRegistry(maximum_retained_runs=8)
+    owner, admission, task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE,
+        task_factory=_OperatorStopTaskPort,
+        interventions=interventions,
+    )
+    stale_worker_entered = Event()
+    release_stale_worker = Event()
+    block_stale_worker = Event()
+    advance_once = owner.advance_once
+
+    def controlled_advance(program_run_id: str):
+        snapshot = advance_once(program_run_id)
+        if (
+            block_stale_worker.is_set()
+            and snapshot.state is ProgramRunState.INTERVENTION_REQUIRED
+        ):
+            stale_worker_entered.set()
+            assert release_stale_worker.wait(timeout=2.0)
+        return snapshot
+
+    monkeypatch.setattr(owner, "advance_once", controlled_advance)
+    host = ProgramRunTickHost(owner, tick_interval_s=0.001)
+    # Exercise the wake revision independently from the owner's defensive
+    # current-snapshot join: the old worker must not erase Resume even if its
+    # completed snapshot remains stale at scheduler ingress.
+    monkeypatch.setattr(host, "_current_after_worker", lambda snapshot: snapshot)
+    host.start()
+    started = host.start_run(admission)
+    program_run_id = started.capture.program_run_id
+    try:
+        deadline = time.monotonic() + 2.0
+        while owner.read(program_run_id).state is not (
+            ProgramRunState.INTERVENTION_REQUIRED
+        ):
+            assert time.monotonic() < deadline
+            time.sleep(0.001)
+
+        block_stale_worker.set()
+        assert stale_worker_entered.wait(timeout=2.0)
+        intervention = interventions.read(program_run_id)
+        assert intervention is not None
+        resumed = host.resume_recovery(
+            program_run_id,
+            node_attempt_id=intervention.identity.node_attempt_id,
+            action="retry",
+        )
+        assert resumed.state is ProgramRunState.RUNNING
+
+        release_stale_worker.set()
+        deadline = time.monotonic() + 2.0
+        while task.starts < 2:
+            assert time.monotonic() < deadline
+            time.sleep(0.001)
+        assert owner.read(program_run_id).state is ProgramRunState.RUNNING
+    finally:
+        release_stale_worker.set()
+        host.stop_run(program_run_id)
+        host.shutdown()
+
+
+def test_tick_host_never_loses_repeated_operator_stop_recovery() -> None:
+    interventions = ProgramInterventionRegistry(maximum_retained_runs=8)
+    owner, admission, task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE,
+        task_factory=_OperatorStopTaskPort,
+        interventions=interventions,
+    )
+    host = ProgramRunTickHost(owner, tick_interval_s=0.001)
+    host.start()
+    started = host.start_run(admission)
+    program_run_id = started.capture.program_run_id
+
+    try:
+        for recovery_index in range(64):
+            deadline = time.monotonic() + 2.0
+            while owner.read(program_run_id).state is not (
+                ProgramRunState.INTERVENTION_REQUIRED
+            ):
+                assert time.monotonic() < deadline
+                time.sleep(0.001)
+
+            intervention = interventions.read(program_run_id)
+            assert intervention is not None
+            owner_result = owner.apply_owner_recovery(
+                program_run_id,
+                node_attempt_id=intervention.identity.node_attempt_id,
+                action="replan_from_stopped_state",
+                request_id=f"repeated-recovery.{recovery_index}",
+                reason="repeated scheduler qualification",
+            )
+            assert owner_result["accepted"] is True
+            resumed = host.resume_recovery(
+                program_run_id,
+                node_attempt_id=intervention.identity.node_attempt_id,
+                action="retry",
+            )
+            assert resumed.state is ProgramRunState.RUNNING
+
+            expected_starts = recovery_index + 2
+            deadline = time.monotonic() + 2.0
+            while task.starts < expected_starts:
+                assert time.monotonic() < deadline
+                time.sleep(0.001)
+    finally:
+        host.stop_run(program_run_id)
+        host.shutdown()
+
+
 def test_motion_stop_holds_the_current_node_without_terminating_the_run() -> None:
     interventions = ProgramInterventionRegistry(maximum_retained_runs=8)
     owner, admission, _task, scope, _events = _fixture(
@@ -968,6 +1081,7 @@ def test_motion_stop_holds_the_current_node_without_terminating_the_run() -> Non
     started = host.start_run(admission)
 
     assert host.advance_ready_once()[0].state is ProgramRunState.RUNNING
+    scope.state = ProgramRunScopeState.ACTIVE
     stopped = host.stop_motion(
         started.capture.program_run_id,
         reason="ordinary operator motion Stop",
@@ -983,6 +1097,86 @@ def test_motion_stop_holds_the_current_node_without_terminating_the_run() -> Non
     assert intervention.policy_parameter == "operator_stop_policy"
 
     host.stop_run(started.capture.program_run_id)
+    host.shutdown()
+
+
+def test_motion_stop_does_not_wait_for_blocked_tree_dispatch() -> None:
+    dispatch_entered = Event()
+    release_dispatch = Event()
+    owner, admission, _task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE,
+        task_factory=lambda events: _BlockingTaskPort(
+            events,
+            dispatch_entered,
+            release_dispatch,
+        ),
+    )
+    host = ProgramRunTickHost(owner, tick_interval_s=0.01)
+    started = host.start_run(admission)
+    advancing = Thread(target=host.advance_ready_once)
+    advancing.start()
+    assert dispatch_entered.wait(timeout=1.0)
+
+    scope.state = ProgramRunScopeState.ACTIVE
+    completed = Event()
+    result: list[ProgramRunState] = []
+
+    def stop() -> None:
+        result.append(
+            host.stop_motion(
+                started.capture.program_run_id,
+                reason="priority Stop while a tree dispatch is blocked",
+            ).state
+        )
+        completed.set()
+
+    stopping = Thread(target=stop)
+    stopping.start()
+    assert completed.wait(timeout=0.2)
+    assert result == [ProgramRunState.RUNNING]
+    assert scope.stop_requests == 1
+
+    release_dispatch.set()
+    advancing.join(timeout=1.0)
+    stopping.join(timeout=1.0)
+    assert not advancing.is_alive()
+    assert not stopping.is_alive()
+    scope.state = ProgramRunScopeState.SETTLED
+    host.stop_run(started.capture.program_run_id)
+    host.shutdown()
+
+
+def test_motion_stop_between_operations_preserves_the_tree_boundary() -> None:
+    interventions = ProgramInterventionRegistry(maximum_retained_runs=8)
+    owner, admission, task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE,
+        task_factory=_OperatorStopTaskPort,
+        interventions=interventions,
+    )
+    host = ProgramRunTickHost(owner, tick_interval_s=0.01)
+    started = host.start_run(admission)
+    program_run_id = started.capture.program_run_id
+
+    stopped = host.stop_motion(
+        program_run_id,
+        reason="ordinary operator motion Stop before the first operation",
+    )
+
+    assert stopped.state is ProgramRunState.FULL_STOPPED
+    assert stopped.active_operation_count == 0
+    assert scope.stop_requests == 1
+    assert task.starts == 0
+
+    resumed = host.resume_full_stop(
+        program_run_id,
+        request_id="run-after-boundary-stop.1",
+    )
+    assert resumed.state is ProgramRunState.RUNNING
+    assert scope.release_requests == 1
+    assert host.advance_ready_once()[0].state is ProgramRunState.RUNNING
+    assert task.starts == 1
+
+    host.stop_run(program_run_id)
     host.shutdown()
 
 

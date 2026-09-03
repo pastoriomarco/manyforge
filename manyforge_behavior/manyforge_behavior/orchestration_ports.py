@@ -356,7 +356,12 @@ class OwnerInvocationPort(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class ProgramRunScopeSnapshot:
-    """Kernel-operation quiescence for one exact Program run."""
+    """Kernel operation/Stop quiescence for one exact Program run.
+
+    An ACTIVE snapshot may contain zero retained operations while an accepted
+    run-scoped Stop is fencing a first admission that has not yet returned to
+    the Program owner.
+    """
 
     program_run_id: str
     state: ProgramRunScopeState
@@ -379,10 +384,11 @@ class ProgramRunScopeSnapshot:
             raise ValueError("a settled Program-run scope must be empty")
         if self.state is ProgramRunScopeState.ACTIVE and (
             self.active_operation_count is None
-            or self.active_operation_count < 1
             or self.reason_code is not None
         ):
-            raise ValueError("an active Program-run scope must name active work")
+            raise ValueError(
+                "an active Program-run scope must provide a bounded work count"
+            )
         if self.state is ProgramRunScopeState.UNKNOWN and (
             self.active_operation_count is not None
             or not isinstance(self.reason_code, str)

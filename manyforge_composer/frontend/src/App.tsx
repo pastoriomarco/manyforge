@@ -31,18 +31,17 @@ import {
   useOperationalErrorMirror,
   useOperationalErrors,
 } from './state/operationalErrors';
+import {
+  INSPECTOR_WIDTH_MIN,
+  WORKBENCH_DIVIDER_WIDTH,
+  workbenchWidthLimits,
+} from './state/workbenchLayout';
 
 function isNotFound(error: unknown): boolean {
   return error instanceof ApiError && error.status === 404;
 }
 
-const VIEWER_WIDTH_MIN = 420;
-const AUTHORING_WIDTH_MIN = 400;
-const INSPECTOR_WIDTH_MIN = 260;
-const INSPECTOR_WIDTH_MAX = 480;
 const INSPECTOR_SECTION_MIN_HEIGHT = 140;
-const WORKBENCH_DIVIDER_WIDTH = 8;
-const VIEWER_WIDTH_MAX_FRACTION = 2 / 3;
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
@@ -258,23 +257,11 @@ export default function App() {
     }
   }, [globalPanel, runtimeAttentionItems.length, runtimePanelAutomatic]);
   const runtimeView = headlessSnapshot?.componentOverview ?? null;
-  const viewerWidthMax = Math.max(
-    VIEWER_WIDTH_MIN,
-    Math.min(
-      Math.floor(workbenchWidth * VIEWER_WIDTH_MAX_FRACTION),
-      workbenchWidth - AUTHORING_WIDTH_MIN - inspectorWidth
-        - 2 * WORKBENCH_DIVIDER_WIDTH,
-    ),
-  );
-  const viewerWidthMin = Math.min(VIEWER_WIDTH_MIN, viewerWidthMax);
-  const inspectorWidthMax = Math.max(
-    INSPECTOR_WIDTH_MIN,
-    Math.min(
-      INSPECTOR_WIDTH_MAX,
-      workbenchWidth - AUTHORING_WIDTH_MIN - viewerWidthMin
-        - 2 * WORKBENCH_DIVIDER_WIDTH,
-    ),
-  );
+  const {
+    viewerWidthMin,
+    viewerWidthMax,
+    inspectorWidthMax,
+  } = workbenchWidthLimits(workbenchWidth, inspectorWidth);
   const programInspectorHeightMax = Math.max(
     INSPECTOR_SECTION_MIN_HEIGHT,
     inspectorHeight - INSPECTOR_SECTION_MIN_HEIGHT - WORKBENCH_DIVIDER_WIDTH,

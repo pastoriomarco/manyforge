@@ -47,7 +47,8 @@ namespace {
                                      ComponentLifecycleGeneration(11U),
                                      {ResourceId("robot.b.joint.1")}}},
       {StopScopeResourceSnapshotDTO{ResourceId("robot.a.joint.1"), StopGeneration(4U), false},
-       StopScopeResourceSnapshotDTO{ResourceId("robot.b.joint.1"), StopGeneration(6U), false}}};
+       StopScopeResourceSnapshotDTO{ResourceId("robot.b.joint.1"), StopGeneration(6U), false}},
+      {}};
 }
 
 [[nodiscard]] StopIntentDTO operation_stop(std::vector<StopOperationTargetDTO> targets = {
@@ -291,6 +292,16 @@ TEST(StopScopeResolverTest, InternalProgramRunSelectorCapturesOnlyCurrentRun) {
   ASSERT_TRUE(unknown.ok()) << unknown.error().message;
   EXPECT_EQ(unknown.value().disposition, StopResolutionDispositionDTO::kPromotedToFull);
   EXPECT_EQ(unknown.value().reason, StopScopeResolutionReasonDTO::kUnknownProgramRun);
+
+  auto idle = snapshot;
+  idle.operations.clear();
+  idle.known_program_runs = {ProgramRunId("program-run.a")};
+  const auto known_idle = resolve_stop_scope(program_run_stop(), idle);
+  ASSERT_TRUE(known_idle.ok()) << known_idle.error().message;
+  EXPECT_EQ(known_idle.value().disposition,
+            StopResolutionDispositionDTO::kAlreadyTerminalNoEffect);
+  EXPECT_FALSE(known_idle.value().full_stop);
+  EXPECT_TRUE(known_idle.value().operations.empty());
 }
 
 TEST(StopScopeResolverTest, UnknownOrMalformedOrdinaryScopePromotesToCurrentFullCapture) {

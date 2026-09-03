@@ -7,6 +7,7 @@ import {
   useState,
 } from 'react';
 import { api } from '../api/client';
+import { executionControlClient } from '../api/executionControlClient';
 import {
   buildPreviewIntent,
   initialRobotControlState,
@@ -324,26 +325,28 @@ export function useRobotControl(
     operationId: string,
     operationRevision: number,
     signal?: AbortSignal,
+    afterDispatch: () => void = () => {},
   ) => {
     let admissionError: unknown = null;
     try {
-      if (control === 'acknowledge_completed') {
-        await api.execution.acknowledgeCompleted(
-          ownerEpoch,
-          operationId,
-          operationRevision,
-          requestId(),
-          signal,
-        );
-      } else {
-        await api.execution.resetOperation(
-          ownerEpoch,
-          operationId,
-          operationRevision,
-          requestId(),
-          signal,
-        );
-      }
+      await executionControlClient.ordinary(
+        () => control === 'acknowledge_completed'
+          ? api.execution.acknowledgeCompleted(
+            ownerEpoch,
+            operationId,
+            operationRevision,
+            requestId(),
+            signal,
+          )
+          : api.execution.resetOperation(
+            ownerEpoch,
+            operationId,
+            operationRevision,
+            requestId(),
+            signal,
+          ),
+        afterDispatch,
+      );
     } catch (error: unknown) {
       admissionError = error;
     }
@@ -383,7 +386,6 @@ export function useRobotControl(
     ) return undefined;
     const controller = new AbortController();
     let current = true;
-    dispatch({ type: 'operation_settlement_started' });
     const settle = async () => {
       try {
         const status = await settleResidentOperation(
@@ -392,6 +394,7 @@ export function useRobotControl(
           automaticSettlementOperationId,
           automaticSettlementOperationRevision,
           controller.signal,
+          () => dispatch({ type: 'operation_settlement_started' }),
         );
         if (current) dispatch({ type: 'status_refreshed', status });
       } catch (error: unknown) {
@@ -490,16 +493,18 @@ export function useRobotControl(
     runtimeScaleQueued.current = null;
     runtimeScaleInFlight.current = true;
     runtimeScaleLastSentAt.current = performance.now();
-    setRuntimeScalePending(true);
     const controller = new AbortController();
     runtimeScaleAbort.current = controller;
     try {
-      const accepted = await api.execution.setRuntimeScaleControl(
-        context.ownerEpoch,
-        observed,
-        scale,
-        requestId(),
-        controller.signal,
+      const accepted = await executionControlClient.ordinary(
+        () => api.execution.setRuntimeScaleControl(
+          context.ownerEpoch,
+          observed,
+          scale,
+          requestId(),
+          controller.signal,
+        ),
+        () => setRuntimeScalePending(true),
       );
       if (
         !controller.signal.aborted
@@ -668,9 +673,11 @@ export function useRobotControl(
       || state.preview === null
     ) return;
     approveInFlight.current = true;
-    dispatch({ type: 'approve_started' });
     try {
-      const acceptance = await api.execution.submit(state.intent);
+      const acceptance = await executionControlClient.ordinary(
+        () => api.execution.submit(state.intent!),
+        () => dispatch({ type: 'approve_started' }),
+      );
       dispatch({ type: 'approve_resolved', acceptance });
     } catch (error: unknown) {
       dispatch({
@@ -695,12 +702,13 @@ export function useRobotControl(
     const operationId = state.operation.operationId;
     const operationRevision = state.operation.operationRevision;
     const ownerEpoch = state.status.ownerEpoch;
-    dispatch({ type: 'operation_settlement_started' });
     void settleResidentOperation(
       state.operation.state === 'completed' ? 'acknowledge_completed' : 'reset',
       ownerEpoch,
       operationId,
       operationRevision,
+      undefined,
+      () => dispatch({ type: 'operation_settlement_started' }),
     ).then((status) => {
       dispatch({ type: 'status_refreshed', status });
     }).catch((error: unknown) => {
@@ -721,14 +729,16 @@ export function useRobotControl(
       || state.operation === null
       || !robotControlHasActiveOperation(state)
     ) return;
-    clearRuntimeScaleQueue();
     stopInFlight.current = true;
-    dispatch({ type: 'stop_started' });
+    const ownerEpoch = state.status.ownerEpoch;
+    const operation = state.operation;
     try {
-      await api.execution.stop(
-        state.status.ownerEpoch,
-        state.operation,
-        requestId(),
+      await executionControlClient.stop(
+        () => api.execution.stop(ownerEpoch, operation, requestId()),
+        () => {
+          clearRuntimeScaleQueue();
+          dispatch({ type: 'stop_started' });
+        },
       );
     } catch (error: unknown) {
       dispatch({
@@ -749,14 +759,19 @@ export function useRobotControl(
       || action === undefined
       || !action.available
     ) return;
-    clearRuntimeScaleQueue();
-    setFullStopPending(true);
-    setFullStopError(null);
+    const ownerEpoch = state.status.ownerEpoch;
     try {
-      await api.execution.fullStop(
-        state.status.ownerEpoch,
-        action.expectedStopGeneration,
-        requestId(),
+      await executionControlClient.stop(
+        () => api.execution.fullStop(
+          ownerEpoch,
+          action.expectedStopGeneration,
+          requestId(),
+        ),
+        () => {
+          clearRuntimeScaleQueue();
+          setFullStopPending(true);
+          setFullStopError(null);
+        },
       );
       setReloadToken((current) => current + 1);
     } catch (error: unknown) {
@@ -774,14 +789,14 @@ export function useRobotControl(
       || (control === 'pause' && state.operation.state !== 'executing')
       || (control === 'resume' && state.operation.state !== 'paused')
     ) return;
-    setControlPending(control);
+    const ownerEpoch = state.status.ownerEpoch;
+    const operation = state.operation;
     try {
-      await api.execution[control](
-        state.status.ownerEpoch,
-        state.operation,
-        requestId(),
+      await executionControlClient.ordinary(
+        () => api.execution[control](ownerEpoch, operation, requestId()),
+        () => setControlPending(control),
       );
-      const observed = await api.execution.read(state.operation.operationId);
+      const observed = await api.execution.read(operation.operationId);
       dispatch({ type: 'operation_observed', operation: observed });
     } catch (error: unknown) {
       dispatch({
@@ -809,14 +824,17 @@ export function useRobotControl(
       || !state.operation.resident
       || !operationStateIsTerminal(state.operation.state)
     ) return;
-    setControlPending('reset');
-    dispatch({ type: 'operation_settlement_started' });
     try {
       const status = await settleResidentOperation(
         'reset',
         state.status.ownerEpoch,
         state.operation.operationId,
         state.operation.operationRevision,
+        undefined,
+        () => {
+          setControlPending('reset');
+          dispatch({ type: 'operation_settlement_started' });
+        },
       );
       dispatch({ type: 'status_refreshed', status });
     } catch (error: unknown) {
