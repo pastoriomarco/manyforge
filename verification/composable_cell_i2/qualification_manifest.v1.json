@@ -831,11 +831,6 @@
         "policy": "immutable_in_i2"
       },
       {
-        "path": "manyforge_deployment/test/golden/canonical_empty_admission.release.json",
-        "sha256": "816497df5b13d71b9cdce4755a159d7ec66764e07b51aabac6d71cfe8385c36a",
-        "policy": "rotate_and_requalify"
-      },
-      {
         "path": "manyforge_deployment/test/generate_lite6_retained_consumer_fixture.cpp",
         "sha256": "380d72b07b530ae4537cac0f011fcac6f19d178dd0a0fae34e8e855809a2992d",
         "policy": "retain_behavior_and_record_final_digest"

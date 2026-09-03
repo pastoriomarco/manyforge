@@ -117,12 +117,26 @@ Build and run the focused tests through the repository container:
 docker compose run --rm dev ./scripts/test-all.sh cpp
 ```
 
-The repository qualification command enables the exact checked canonical-empty
-Release golden. Ad-hoc builds leave that golden gate disabled because a
-different compiler, toolchain, or flag set legitimately produces a different
-build-qualified identity; deterministic and closure verification still run.
-Maintainers reproducing the repository golden directly must configure Release
-with `-DMANYFORGE_VERIFY_CANONICAL_EMPTY_RELEASE_GOLDEN=ON`.
+Ordinary development and CI generate the canonical-empty candidate from the
+current source/toolchain and verify deterministic construction, exact internal
+closure, and tamper rejection. They do not compare the resulting aggregate
+build/package identity with a checked hash, so a valid source change never
+requires an assertion-only digest edit.
+
+A fixed canonical-empty golden is reserved for an intentionally frozen Release
+candidate and is named for its exact Linux CPU target. Generate and review it
+through the single container-only workflow:
+
+```bash
+docker compose run --rm dev python3 \
+  scripts/qualification/review_canonical_empty_release_golden.py --check
+```
+
+Use `--update` instead of `--check` only when deliberately publishing a new
+frozen candidate, review the resulting Git diff, and then rerun `--check`.
+The command always performs a fresh Release build, selects only
+`linux-amd64` or `linux-arm64` from the generated compiler-build manifest, and
+rejects a non-Release or unsupported target before reading or writing a golden.
 
 Maintained `manyforge.program.v1` sources use the C++ authoring target
 `manyforge_program_revision` for their opaque identities. After editing one

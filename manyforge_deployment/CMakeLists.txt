@@ -947,16 +947,6 @@ target_link_libraries(
   manyforge::deployment_admission)
 
 option(BUILD_TESTING "Build unit tests" ON)
-option(
-  MANYFORGE_VERIFY_CANONICAL_EMPTY_RELEASE_GOLDEN
-  "Verify the repository-qualified canonical-empty Release package golden"
-  OFF)
-if(MANYFORGE_VERIFY_CANONICAL_EMPTY_RELEASE_GOLDEN AND
-   NOT CMAKE_BUILD_TYPE STREQUAL "Release")
-  message(FATAL_ERROR
-    "MANYFORGE_VERIFY_CANONICAL_EMPTY_RELEASE_GOLDEN requires the "
-    "single-configuration Release qualification profile")
-endif()
 if(BUILD_TESTING)
   enable_testing()
   find_package(GTest REQUIRED)
@@ -1757,10 +1747,6 @@ if(BUILD_TESTING)
     manyforge_deployment GTest::gtest_main)
   target_link_options(test_build_manifest PRIVATE
     "-Wl,--wrap=fsync")
-  if(MANYFORGE_VERIFY_CANONICAL_EMPTY_RELEASE_GOLDEN)
-    target_compile_definitions(test_build_manifest PRIVATE
-      MANYFORGE_VERIFY_CANONICAL_EMPTY_RELEASE_GOLDEN=1)
-  endif()
   gtest_discover_tests(test_build_manifest
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
@@ -1776,11 +1762,6 @@ if(BUILD_TESTING)
   add_executable(
     test_canonical_empty_admission
     test/test_canonical_empty_admission.cpp)
-  if(MANYFORGE_VERIFY_CANONICAL_EMPTY_RELEASE_GOLDEN)
-    target_compile_definitions(
-      test_canonical_empty_admission PRIVATE
-      MANYFORGE_CANONICAL_EMPTY_RELEASE_GOLDEN_FILE="${CMAKE_CURRENT_SOURCE_DIR}/test/golden/canonical_empty_admission.release.json")
-  endif()
   target_include_directories(
     test_canonical_empty_admission PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src")

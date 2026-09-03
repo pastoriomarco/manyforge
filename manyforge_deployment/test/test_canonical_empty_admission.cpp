@@ -1140,37 +1140,5 @@ TEST_F(CanonicalEmptyAdmissionPackageTest,
   }
 }
 
-TEST_F(CanonicalEmptyAdmissionPackageTest,
-       ReleasePackageMatchesTheCheckedQualificationGolden) {
-  const FilesystemCanonicalEmptyRetainedBundleSource source(base_path());
-  const auto admission = source.load_verified();
-
-#if defined(MANYFORGE_CANONICAL_EMPTY_RELEASE_GOLDEN_FILE)
-  const CanonicalValue build = parse_file(manifest_path(
-      base_path(), BuildManifestKind::kCompilerBuild,
-      admission.compiler_build_digest().value()));
-  ASSERT_EQ(text_member(build, "build_profile"), "Release")
-      << "the checked canonical-empty golden is valid only for the "
-         "explicit clean Release qualification gate";
-  std::string golden =
-      read_file(MANYFORGE_CANONICAL_EMPTY_RELEASE_GOLDEN_FILE);
-  if (golden.ends_with('\n')) {
-    golden.pop_back();
-  }
-  EXPECT_EQ(
-      admission.canonical_bytes(), golden);
-#else
-  GTEST_SKIP()
-      << "exact Release golden verification is disabled because the "
-         "qualification gate was not enabled";
-#endif
-  RecordProperty(
-      "canonical_empty_admission_digest",
-      admission.admission_digest().value());
-  RecordProperty(
-      "canonical_empty_retained_bundle_id",
-      admission.retained_bundle_id().value());
-}
-
 }  // namespace
 }  // namespace manyforge::deployment

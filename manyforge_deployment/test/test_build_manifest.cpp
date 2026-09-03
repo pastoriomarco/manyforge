@@ -113,16 +113,6 @@ namespace {
 
 constexpr std::string_view kZeroDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
-constexpr std::string_view kExpectedNodeEnvironmentDigest =
-    "sha256:4a726699e2829081ee3369b70743f530d3e4367e34fa64e2f967c9b33b19109d";
-constexpr std::string_view kExpectedCompilerContractDigest =
-    "sha256:522e09ca132f31d53c3d9601ffe6cd20c9da2e6a8d620a5581e99fc706754cb3";
-#ifdef MANYFORGE_VERIFY_CANONICAL_EMPTY_RELEASE_GOLDEN
-constexpr std::string_view kExpectedReleaseCompilerBuildDigest =
-    "sha256:7025ec6bc380be92dd10bb2446ee8b4454d1ff5be30ff7cbd4346617848dbfb8";
-constexpr std::string_view kExpectedReleaseCanonicalEmptyBundleId =
-    "sha256:fb336d16cbae56a7de81c05a0b7433b6ab016c32a87cc4c461d1075fcf027d56";
-#endif
 
 static_assert(!std::is_default_constructible_v<BuildQualifiedManifest>);
 static_assert(!std::is_aggregate_v<BuildQualifiedManifest>);
@@ -506,9 +496,15 @@ TEST(BuildManifestAuthority,
     const auto parsed =
         parse_strict_json_model_yaml(lhs->canonical_bytes()).root();
     EXPECT_EQ(canonical_json(parsed), lhs->canonical_bytes());
+    EXPECT_EQ(
+        detail::compute_content_identity(
+            parsed, identity_spec(expected_kinds[index])),
+        lhs->key().content_digest.value());
   }
   EXPECT_EQ(first.node_environment(),
             second.node_environment());
+  EXPECT_EQ(first.node_environment().environment_digest,
+            first.manifests()[0]->key().content_digest);
   EXPECT_EQ(first.compiler_contract_digest(),
             first.manifests()[1]->key().content_digest);
   EXPECT_EQ(first.compiler_build_digest(),
@@ -526,15 +522,6 @@ TEST(BuildManifestAuthority,
       first.manifests()[2]->canonical_bytes()).root();
   EXPECT_EQ(text_member(build, "compiler_contract_digest"),
             first.compiler_contract_digest().value());
-  EXPECT_EQ(first.node_environment().environment_digest.value(),
-            kExpectedNodeEnvironmentDigest);
-  EXPECT_EQ(first.compiler_contract_digest().value(),
-            kExpectedCompilerContractDigest);
-#ifdef MANYFORGE_VERIFY_CANONICAL_EMPTY_RELEASE_GOLDEN
-  EXPECT_EQ(text_member(build, "build_profile"), "Release");
-  EXPECT_EQ(first.compiler_build_digest().value(),
-            kExpectedReleaseCompilerBuildDigest);
-#endif
 }
 
 TEST(BuildManifestAuthority,
@@ -1755,13 +1742,6 @@ TEST(BuildManifestAuthority,
             context.compiler_contract_digest());
   EXPECT_EQ(bundle->value().provenance.compiler_build_digest,
             context.compiler_build_digest());
-#ifdef MANYFORGE_VERIFY_CANONICAL_EMPTY_RELEASE_GOLDEN
-  const auto build = parse_strict_json_model_yaml(
-      context.manifests()[2]->canonical_bytes()).root();
-  EXPECT_EQ(text_member(build, "build_profile"), "Release");
-  EXPECT_EQ(bundle->retained_bundle_id().value(),
-            kExpectedReleaseCanonicalEmptyBundleId);
-#endif
 }
 
 TEST(BuildManifestAuthority,

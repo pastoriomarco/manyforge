@@ -453,7 +453,6 @@ CAPTURE_TOOL = Path("scripts/qualification/source_identity.py")
 TRACKED_FILE_POLICIES = {
     "immutable_in_i2",
     "must_change_and_requalify",
-    "rotate_and_requalify",
     "retain_behavior_and_record_final_digest",
 }
 REQUIRED_BINDING_CASES = {
@@ -651,7 +650,6 @@ REQUIRED_CONSUMER_TESTS = {
 REQUIRED_TRACKED_FILE_POLICIES = {
     "third_party/roboplan/README.md": "immutable_in_i2",
     "third_party/roboplan/patches.sha256": "immutable_in_i2",
-    "manyforge_deployment/test/golden/canonical_empty_admission.release.json": "rotate_and_requalify",
     "manyforge_deployment/test/generate_lite6_retained_consumer_fixture.cpp": "retain_behavior_and_record_final_digest",
     "manyforge_deployment/test/qualify_retained_model_standard_parsers.py": "retain_behavior_and_record_final_digest",
     "manyforge_composer/tests/qualify_retained_compiled_visual_fk.py": "retain_behavior_and_record_final_digest",
@@ -2169,11 +2167,7 @@ def _candidate_tracked_file_digests(
         changed = current != baseline
         if policy == "immutable_in_i2" and changed:
             fail(f"immutable I2 input drifted: {relative}")
-        if (
-            require_final_rotation
-            and policy in {"must_change_and_requalify", "rotate_and_requalify"}
-            and not changed
-        ):
+        if require_final_rotation and policy == "must_change_and_requalify" and not changed:
             fail(f"required I2 input rotation did not occur: {relative}")
         rows.append(
             {
@@ -15654,9 +15648,7 @@ def _validate_result_tracked_digests(
             fail(f"qualification tracked digest evidence is wrong: {path}")
         if expected["policy"] == "immutable_in_i2" and row["changed"]:
             fail(f"immutable I2 input changed in the qualified commit: {path}")
-        if expected["policy"] in {"must_change_and_requalify", "rotate_and_requalify"} and not row[
-            "changed"
-        ]:
+        if expected["policy"] == "must_change_and_requalify" and not row["changed"]:
             fail(f"required I2 input did not rotate in the qualified commit: {path}")
     if seen != set(expected_rows):
         fail("qualification tracked digest inventory is incomplete")
@@ -17013,7 +17005,6 @@ def _prepare_native_release_lane(
             "-B",
             str(build_root),
             "-DMANYFORGE_CORE_INCLUDE_DIR=/workspace/manyforge_core/include",
-            "-DMANYFORGE_VERIFY_CANONICAL_EMPTY_RELEASE_GOLDEN=ON",
             f"-DMANYFORGE_GTEST_TIMEOUT_SECONDS={timeout}",
         ]
         if lane_id == "c02_tail_focused_release":
