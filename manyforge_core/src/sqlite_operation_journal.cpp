@@ -24,7 +24,6 @@
 #include <string>
 #include <string_view>
 #include <system_error>
-#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -1048,8 +1047,7 @@ template <typename StrongId>
   });
 }
 
-[[nodiscard]] CanonicalValue PreparedRuntimePolicyValue(
-    const PreparedRuntimePolicyRefDTO& policy) {
+[[nodiscard]] CanonicalValue PreparedRuntimePolicyValue(const PreparedRuntimePolicyRefDTO& policy) {
   const auto& source = policy.source_artifact;
   CanonicalValue::Object selected{
       {"maximum_tcp_linear_speed_mps",
@@ -1106,8 +1104,7 @@ template <typename StrongId>
                 !diagnostic.prepared_contract_digest.empty() && !diagnostic.move_id.empty() &&
                 !diagnostic.joint_names.empty() &&
                 diagnostic.joint_names.size() == state_row->resources.size() &&
-                diagnostic.joint_names.size() ==
-                    metrics.peak_abs_joint_velocity_rad_s.size() &&
+                diagnostic.joint_names.size() == metrics.peak_abs_joint_velocity_rad_s.size() &&
                 acceleration_shape_valid && finite_nonnegative(metrics.trajectory_duration_s) &&
                 std::all_of(metrics.peak_abs_joint_velocity_rad_s.begin(),
                             metrics.peak_abs_joint_velocity_rad_s.end(), finite_nonnegative) &&
@@ -1118,10 +1115,9 @@ template <typename StrongId>
             "operation_journal_record_invalid",
             "prepared-motion diagnostics do not match the exact prepared participant");
     std::set<std::string> joint_names;
-    Require(std::all_of(diagnostic.joint_names.begin(), diagnostic.joint_names.end(),
-                        [&](const auto& name) {
-                          return !name.empty() && joint_names.insert(name).second;
-                        }),
+    Require(std::all_of(
+                diagnostic.joint_names.begin(), diagnostic.joint_names.end(),
+                [&](const auto& name) { return !name.empty() && joint_names.insert(name).second; }),
             "operation_journal_record_invalid",
             "prepared-motion diagnostics contain invalid joint names");
 
@@ -1134,9 +1130,9 @@ template <typename StrongId>
           if constexpr (std::is_same_v<Scope, RuntimePolicyCellScopeDTO>) {
             scope_matches = true;
           } else {
-            scope_matches = scope.controllable_component_id ==
-                                state_row->controllable_component_id &&
-                            scope.command_target_id == state_row->command_target_id;
+            scope_matches =
+                scope.controllable_component_id == state_row->controllable_component_id &&
+                scope.command_target_id == state_row->command_target_id;
           }
         },
         selected.scope);
@@ -1165,8 +1161,7 @@ template <typename StrongId>
         {"joint_names", CanonicalValue(std::move(names))},
         {"move_id", CanonicalValue(diagnostic.move_id.value())},
         {"participant_id", CanonicalValue(diagnostic.participant_id.value())},
-        {"prepared_contract_digest",
-         CanonicalValue(diagnostic.prepared_contract_digest.value())},
+        {"prepared_contract_digest", CanonicalValue(diagnostic.prepared_contract_digest.value())},
         {"runtime_policy", PreparedRuntimePolicyValue(diagnostic.runtime_policy)},
         {"trajectory_metrics",
          CanonicalValue(CanonicalValue::Object{
@@ -1174,10 +1169,9 @@ template <typename StrongId>
               numeric_array(metrics.peak_abs_joint_acceleration_rad_s2)},
              {"peak_abs_joint_velocity_rad_s",
               numeric_array(metrics.peak_abs_joint_velocity_rad_s)},
-             {"peak_tcp_linear_speed_mps",
-              metrics.peak_tcp_linear_speed_mps.has_value()
-                  ? CanonicalValue(*metrics.peak_tcp_linear_speed_mps)
-                  : CanonicalValue(nullptr)},
+             {"peak_tcp_linear_speed_mps", metrics.peak_tcp_linear_speed_mps.has_value()
+                                               ? CanonicalValue(*metrics.peak_tcp_linear_speed_mps)
+                                               : CanonicalValue(nullptr)},
              {"trajectory_duration_s", CanonicalValue(metrics.trajectory_duration_s)}})}});
   }
   return CanonicalValue(std::move(rows));
@@ -2523,7 +2517,8 @@ class SqliteOperationJournal::Impl final {
   std::uint64_t RecordOperationAccepted(const RequestOwnerEpoch& owner_epoch,
                                         const OperationIntentDTO& intent,
                                         const OperationAcceptedDTO& accepted,
-                                        const OperationStateDTO& state);
+                                        const OperationStateDTO& state,
+                                        std::span<const OperationId> protected_operation_ids);
 
   std::uint64_t RecordControlAccepted(const RequestOwnerEpoch& owner_epoch,
                                       const OperationControlRequestDTO& request,
@@ -2560,12 +2555,10 @@ class SqliteOperationJournal::Impl final {
                                            const OperationStateDTO& state,
                                            const RuntimeScaleStatusDTO& scale_status);
 
-  std::uint64_t RecordOperationState(const RequestOwnerEpoch& owner_epoch,
-                                     const OperationStateDTO& state,
-                                     const RuntimeScaleStatusDTO* scale_status,
-                                     const char* transition_reason,
-                                     std::span<const PreparedMotionDiagnosticsDTO>
-                                         prepared_motion_diagnostics);
+  std::uint64_t RecordOperationState(
+      const RequestOwnerEpoch& owner_epoch, const OperationStateDTO& state,
+      const RuntimeScaleStatusDTO* scale_status, const char* transition_reason,
+      std::span<const PreparedMotionDiagnosticsDTO> prepared_motion_diagnostics);
 
   std::uint64_t RecordCellAdmissionClaimAcquired(const RequestOwnerEpoch& owner_epoch,
                                                  const CellAdmissionClaimDTO& claim);
@@ -2665,7 +2658,8 @@ class SqliteOperationJournal::Impl final {
                        const std::optional<RequestId>& request_id,
                        const CanonicalValue& record_value, const OperationStateDTO& state,
                        std::int64_t occurred_at_ns, bool effect_pending,
-                       std::string_view disposition);
+                       std::string_view disposition,
+                       std::span<const OperationId> protected_operation_ids = {});
 
   std::uint64_t AppendStopAcceptance(const RequestOwnerEpoch& owner_epoch,
                                      const EmergencyStopAcceptanceRecordDTO& acceptance,
@@ -2697,12 +2691,25 @@ std::uint64_t SqliteOperationJournal::Impl::Append(const RequestOwnerEpoch& owne
                                                    const CanonicalValue& record_value,
                                                    const OperationStateDTO& state,
                                                    std::int64_t occurred_at_ns, bool effect_pending,
-                                                   std::string_view disposition) {
+                                                   std::string_view disposition,
+                                                   const std::span<const OperationId>
+                                                       protected_operation_ids) {
   Require(!owner_epoch.empty() && !record_kind.empty() &&
               (!request_id.has_value() || !request_id->empty()) && occurred_at_ns >= 0 &&
               static_cast<std::uint64_t>(occurred_at_ns) <= kMaximumSafeInteger,
           "operation_journal_record_invalid", "operation journal record identity is invalid");
   RequireState(state);
+  Require(
+      protected_operation_ids.empty() ||
+          (record_kind == "operation_accepted" &&
+           std::all_of(protected_operation_ids.begin(), protected_operation_ids.end(),
+                       [](const OperationId& id) { return !id.empty(); }) &&
+           std::is_sorted(protected_operation_ids.begin(), protected_operation_ids.end()) &&
+           std::adjacent_find(protected_operation_ids.begin(), protected_operation_ids.end()) ==
+               protected_operation_ids.end() &&
+           std::binary_search(protected_operation_ids.begin(), protected_operation_ids.end(),
+                              state.operation_id)),
+      "operation_journal_record_invalid", "protected operation admission inventory is invalid");
   const auto payload_json = content_identity::canonical_json(record_value);
   Require(payload_json.size() <= kMaximumRecordJsonBytes, "operation_journal_record_too_large",
           "operation journal record exceeds the fixed payload bound");
@@ -2722,19 +2729,39 @@ std::uint64_t SqliteOperationJournal::Impl::Append(const RequestOwnerEpoch& owne
   const auto request_capacity = active.Integer(0);
   Require(request_capacity > 0 && !active.Step(), "operation_journal_corrupt",
           "active operation journal owner epoch is invalid");
+  if (!protected_operation_ids.empty()) {
+    const auto retained_capacity =
+        std::min(history_capacity_, static_cast<std::size_t>(request_capacity));
+    Require(protected_operation_ids.size() <= retained_capacity, "operation_capacity_full",
+            "active or unresolved operations occupy the configured operation capacity");
+    const auto historical_budget = retained_capacity - protected_operation_ids.size();
+    std::vector<OperationId> compact;
+    std::size_t retained_historical = 0U;
+    Statement snapshot_rows(database_,
+                            "SELECT operation_id FROM operation_snapshots "
+                            "ORDER BY snapshot_sequence DESC");
+    while (snapshot_rows.Step()) {
+      const OperationId operation_id(snapshot_rows.Text(0));
+      if (std::binary_search(protected_operation_ids.begin(), protected_operation_ids.end(),
+                             operation_id)) {
+        continue;
+      }
+      if (retained_historical++ >= historical_budget) {
+        compact.push_back(operation_id);
+      }
+    }
+    for (const auto& operation_id : compact) {
+      Statement remove_snapshot(database_, "DELETE FROM operation_snapshots WHERE operation_id=?");
+      remove_snapshot.Bind(1, operation_id.value());
+      Require(!remove_snapshot.Step(), "operation_journal_corrupt",
+              "resolved operation snapshot compaction failed");
+      Statement remove_records(database_, "DELETE FROM journal_records WHERE operation_id=?");
+      remove_records.Bind(1, operation_id.value());
+      Require(!remove_records.Step(), "operation_journal_corrupt",
+              "resolved operation record compaction failed");
+    }
+  }
   if (request_id.has_value()) {
-    Statement request_count(database_,
-                            "SELECT COUNT(*) FROM journal_records "
-                            "WHERE owner_epoch=? AND request_id IS NOT NULL "
-                            "AND record_kind<>'stop_acceptance_projected'");
-    request_count.Bind(1, owner_epoch.value());
-    Require(request_count.Step(), "operation_journal_corrupt",
-            "operation journal request count returned no row");
-    const auto count = request_count.Integer(0);
-    Require(!request_count.Step() && count >= 0, "operation_journal_corrupt",
-            "operation journal request count is invalid");
-    Require(count < request_capacity, "request_ledger_full",
-            "operation journal request ledger reached its fixed bound");
     Statement existing(database_,
                        "SELECT record_kind,payload_digest FROM journal_records "
                        "WHERE owner_epoch=? AND request_id=? "
@@ -2743,6 +2770,20 @@ std::uint64_t SqliteOperationJournal::Impl::Append(const RequestOwnerEpoch& owne
     existing.Bind(2, request_id->value());
     Require(!existing.Step(), "request_id_conflict",
             "operation journal request identity is already recorded");
+    Statement request_count(database_,
+                            "SELECT COUNT(DISTINCT operation_id) FROM journal_records "
+                            "WHERE owner_epoch=? AND request_id IS NOT NULL "
+                            "AND record_kind<>'stop_acceptance_projected' "
+                            "AND (operation_id IS NULL OR operation_id<>?)");
+    request_count.Bind(1, owner_epoch.value());
+    request_count.Bind(2, state.operation_id.value());
+    Require(request_count.Step(), "operation_journal_corrupt",
+            "operation journal resident-operation count returned no row");
+    const auto count = request_count.Integer(0);
+    Require(!request_count.Step() && count >= 0, "operation_journal_corrupt",
+            "operation journal resident-operation count is invalid");
+    Require(count < request_capacity, "request_ledger_full",
+            "operation journal request ledger reached its fixed bound");
   }
 
   Statement insert(database_,
@@ -2769,30 +2810,22 @@ std::uint64_t SqliteOperationJournal::Impl::Append(const RequestOwnerEpoch& owne
   const auto bounded_sequence = PositiveIdentifier(sequence, "operation journal sequence");
   StoreOperationSnapshot(database_, owner_epoch, state, bounded_sequence, disposition);
 
-  if (!request_id.has_value() && record_kind == "state_observed") {
-    Statement coalesce(database_,
-                       "DELETE FROM journal_records WHERE operation_id=? AND request_id IS NULL "
-                       "AND record_kind='state_observed' AND sequence<>? AND sequence NOT IN ("
-                       "SELECT snapshot_sequence FROM operation_snapshots)");
-    coalesce.Bind(1, state.operation_id.value());
-    coalesce.Bind(2, static_cast<std::int64_t>(sequence));
-    Require(!coalesce.Step(), "operation_journal_corrupt",
-            "operation journal state coalescing returned an unexpected row");
-  }
-  if (!request_id.has_value() &&
-      (record_kind == "state_observed" || record_kind == "operation_prepared")) {
-    Statement coalesce_prepared(
-        database_,
-        "DELETE FROM journal_records WHERE operation_id=? AND request_id IS NULL "
-        "AND record_kind='operation_prepared' AND sequence<>("
-        "SELECT MAX(sequence) FROM journal_records WHERE operation_id=? "
-        "AND request_id IS NULL AND record_kind='operation_prepared') "
-        "AND sequence NOT IN (SELECT snapshot_sequence FROM operation_snapshots)");
-    coalesce_prepared.Bind(1, state.operation_id.value());
-    coalesce_prepared.Bind(2, state.operation_id.value());
-    Require(!coalesce_prepared.Step(), "operation_journal_corrupt",
-            "operation journal prepared-evidence coalescing returned an unexpected row");
-  }
+  // The live journal stores one initial acceptance, the bounded preparation
+  // provenance, and the newest complete state of an operation, not an
+  // ever-growing command receipt history.
+  // StoreOperationSnapshot has already advanced the operation's single
+  // durable state anchor to this record, so every older state-conditioned
+  // update for the same operation is now redundant. Unresolved physical work
+  // remains represented by the snapshot itself.
+  Statement coalesce(database_,
+                     "DELETE FROM journal_records WHERE operation_id=? AND sequence<>? "
+                     "AND record_kind IN ('control_accepted','runtime_scale_accepted',"
+                     "'state_observed') "
+                     "AND sequence NOT IN (SELECT snapshot_sequence FROM operation_snapshots)");
+  coalesce.Bind(1, state.operation_id.value());
+  coalesce.Bind(2, static_cast<std::int64_t>(sequence));
+  Require(!coalesce.Step(), "operation_journal_corrupt",
+          "operation journal current-state coalescing returned an unexpected row");
   transaction.Commit();
   return bounded_sequence;
 }
@@ -3597,7 +3630,8 @@ OperationJournalRecoveryDTO SqliteOperationJournal::Impl::BeginOwnerEpoch(
 
 std::uint64_t SqliteOperationJournal::Impl::RecordOperationAccepted(
     const RequestOwnerEpoch& owner_epoch, const OperationIntentDTO& intent,
-    const OperationAcceptedDTO& accepted, const OperationStateDTO& state) {
+    const OperationAcceptedDTO& accepted, const OperationStateDTO& state,
+    const std::span<const OperationId> protected_operation_ids) {
   Require(intent.request_context.request_owner_epoch == owner_epoch &&
               intent.request_context.request_id == accepted.request_id &&
               accepted.replay_status == RequestReplayStatusDTO::kAcceptedNew &&
@@ -3617,7 +3651,7 @@ std::uint64_t SqliteOperationJournal::Impl::RecordOperationAccepted(
   return Append(owner_epoch, "operation_accepted", intent.request_context.request_id,
                 RecordValue("operation_accepted", owner_epoch, OperationIntentValue(intent),
                             OperationAcceptedValue(accepted), state, nullptr, true),
-                state, accepted.accepted_at_ns, true, "current");
+                state, accepted.accepted_at_ns, true, "current", protected_operation_ids);
 }
 
 std::uint64_t SqliteOperationJournal::Impl::RecordControlAccepted(
@@ -3964,8 +3998,7 @@ std::uint64_t SqliteOperationJournal::Impl::RecordOperationState(
   const std::string_view record_kind =
       prepared_diagnostics_expected ? "operation_prepared" : "state_observed";
   return Append(owner_epoch, record_kind, std::nullopt,
-                RecordValue(record_kind, owner_epoch,
-                            CanonicalValue(std::move(intent)),
+                RecordValue(record_kind, owner_epoch, CanonicalValue(std::move(intent)),
                             CanonicalValue(nullptr), state, scale_status, false),
                 state, state.updated_at_ns, false, "current");
 }
@@ -4686,9 +4719,12 @@ Result<OperationJournalRecoveryDTO> SqliteOperationJournal::BeginOwnerEpoch(
 
 Result<std::uint64_t> SqliteOperationJournal::RecordOperationAccepted(
     const RequestOwnerEpoch& owner_epoch, const OperationIntentDTO& intent,
-    const OperationAcceptedDTO& accepted, const OperationStateDTO& state) {
-  return AsResult<std::uint64_t>(
-      [&] { return impl_->RecordOperationAccepted(owner_epoch, intent, accepted, state); });
+    const OperationAcceptedDTO& accepted, const OperationStateDTO& state,
+    const std::span<const OperationId> protected_operation_ids) {
+  return AsResult<std::uint64_t>([&] {
+    return impl_->RecordOperationAccepted(owner_epoch, intent, accepted, state,
+                                          protected_operation_ids);
+  });
 }
 
 Result<std::uint64_t> SqliteOperationJournal::RecordControlAccepted(

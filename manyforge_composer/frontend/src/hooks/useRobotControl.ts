@@ -7,21 +7,23 @@ import {
   useState,
 } from 'react';
 import { api } from '../api/client';
-import { executionControlClient } from '../api/executionControlClient';
+import { parseRuntimeScaleControlAccepted } from '../api/parsers';
 import {
   buildPreviewIntent,
   initialRobotControlState,
   operationStateIsTerminal,
   ROBOT_CONTROL_AUTHOR_DEBOUNCE_MS,
-  ROBOT_CONTROL_OPERATION_POLL_MS,
   robotControlHasActiveOperation,
   robotControlReducer,
 } from '../state/robotControl';
+import type { ComposerHeadlessState } from '../types/headless';
+import type { HeadlessStateSource } from './useHeadlessState';
 import type { RobotControlState } from '../state/robotControl';
 import type { RobotControlMode } from '../state/robotControl';
 import type {
   DirectControlOperationIntent,
   Pose3Value,
+  RuntimeScaleControlAccepted,
   RuntimeScaleControlStatus,
 } from '../types/robotControl';
 
@@ -62,9 +64,6 @@ export function runtimeScaleControlScopeFence(
     status.controlBindingId ?? 'no-control-binding',
     status.controlBindingRevision ?? 'no-control-binding-revision',
     status.scalingDomainId ?? 'no-scaling-domain',
-    status.activeControlConfigurationId ?? 'no-active-control-configuration',
-    status.activeControlConfigurationGeneration
-      ?? 'no-active-control-configuration-generation',
   ].join('\u0000');
 }
 
@@ -84,9 +83,35 @@ export function mergeRuntimeScaleStatus(
     : projected;
 }
 
+export function acceptedRuntimeScaleStatus(
+  submitted: RuntimeScaleControlStatus,
+  accepted: RuntimeScaleControlAccepted,
+  expectedRequestId: string,
+  expectedScale: number,
+): RuntimeScaleControlStatus {
+  if (
+    accepted.requestId !== expectedRequestId
+    || accepted.controlGeneration !== submitted.controlGeneration + 1
+    || accepted.requestedScale !== expectedScale
+    || accepted.selector.programBindingId !== submitted.selector.programBindingId
+    || accepted.selector.componentRoleId !== submitted.selector.componentRoleId
+    || accepted.selector.targetRoleId !== submitted.selector.targetRoleId
+  ) {
+    throw new Error('Runtime velocity acceptance does not match its submitted command.');
+  }
+  return {
+    ...submitted,
+    controlGeneration: accepted.controlGeneration,
+    requestedScale: accepted.requestedScale,
+    activeOperationId: accepted.activeOperationId,
+    activeOperationRevision: accepted.activeOperationRevision,
+    activeOperationScaleGeneration: accepted.activeOperationScaleGeneration,
+  };
+}
+
 export interface RobotControlController {
   state: RobotControlState;
-  controlPending: 'pause' | 'resume' | 'reset' | null;
+  controlPending: 'stop' | 'pause' | 'resume' | 'reset' | null;
   runtimeScaleStatus: RuntimeScaleControlStatus | null;
   runtimeScaleDraft: number;
   runtimeScalePending: boolean;
@@ -109,6 +134,7 @@ export interface RobotControlController {
   resume: () => Promise<void>;
   reset: () => Promise<void>;
   setRuntimeScale: (scale: number) => void;
+  commitRuntimeScale: () => void;
   retry: () => void;
 }
 
@@ -116,14 +142,15 @@ export function useRobotControl(
   enabled: boolean,
   observeProgramRun = false,
   programStopActive = false,
+  headlessSnapshot: ComposerHeadlessState | null = null,
+  controlSource: HeadlessStateSource | null = null,
 ): RobotControlController {
   const [state, dispatch] = useReducer(
     robotControlReducer,
     initialRobotControlState,
   );
-  const [reloadToken, setReloadToken] = useState(0);
   const [controlPending, setControlPending] = useState<
-    'pause' | 'resume' | 'reset' | null
+    'stop' | 'pause' | 'resume' | 'reset' | null
   >(null);
   const [runtimeScaleStatus, setRuntimeScaleStatus] = useState<RuntimeScaleControlStatus | null>(null);
   const [runtimeScaleDraft, setRuntimeScaleDraft] = useState(1);
@@ -138,60 +165,43 @@ export function useRobotControl(
   const runtimeScaleInFlight = useRef(false);
   const runtimeScaleTimer = useRef<number | null>(null);
   const runtimeScaleLastSentAt = useRef(Number.NEGATIVE_INFINITY);
-  const runtimeScaleAbort = useRef<AbortController | null>(null);
   const runtimeScaleFlush = useRef<() => void>(() => undefined);
   const runtimeScaleStopActive = useRef(programStopActive);
   runtimeScaleStopActive.current = programStopActive;
-  const programRunWasObserved = useRef(false);
+  const programRunActive = useRef(observeProgramRun);
+  programRunActive.current = observeProgramRun;
+  const projectedOwnerRef = useRef<string | null>(null);
+  const requestedSettlementRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (!enabled) {
+      projectedOwnerRef.current = null;
       dispatch({ type: 'clear' });
-      return undefined;
+      return;
     }
-    const controller = new AbortController();
-    let current = true;
-    dispatch({ type: 'load' });
-    void api.execution.controlStatus(controller.signal)
-      .then((status) => {
-        if (current) dispatch({ type: 'status_resolved', status });
-      })
-      .catch((error: unknown) => {
-        if (current && !controller.signal.aborted) {
-          dispatch({
-            type: 'load_failed',
-            error: errorMessage(error, 'Execution owner status is unavailable.'),
-          });
-        }
-      });
-    return () => {
-      current = false;
-      controller.abort();
-    };
-  }, [enabled, reloadToken]);
-
-  useEffect(() => {
-    if (!enabled || !observeProgramRun) return;
-    programRunWasObserved.current = true;
-  }, [enabled, observeProgramRun]);
-
-  useEffect(() => {
-    if (!enabled) {
-      programRunWasObserved.current = false;
-      return undefined;
+    const status = headlessSnapshot?.executionControlStatus ?? null;
+    if (status === null) {
+      // Connection errors and command eligibility belong to the shared
+      // transport surface. Retain the last coherent direct-control status;
+      // transport absence is not evidence that a robot command failed.
+      return;
     }
-    if (observeProgramRun || !programRunWasObserved.current) return undefined;
-    programRunWasObserved.current = false;
-    const controller = new AbortController();
-    void api.execution.controlStatus(controller.signal)
-      .then((status) => dispatch({ type: 'status_refreshed', status }))
-      .catch(() => undefined);
-    return () => controller.abort();
-  }, [enabled, observeProgramRun]);
+    const initialize = projectedOwnerRef.current === null;
+    projectedOwnerRef.current = status.ownerEpoch;
+    dispatch({
+      type: observeProgramRun
+        ? 'program_status_refreshed'
+        : initialize
+          ? 'status_resolved'
+          : 'status_refreshed',
+      status,
+    });
+  }, [enabled, headlessSnapshot?.executionControlStatus, observeProgramRun]);
 
   useEffect(() => {
     if (
       !enabled
+      || observeProgramRun
       || state.phase !== 'planning'
       || state.status === null
     ) return undefined;
@@ -247,6 +257,7 @@ export function useRobotControl(
     };
   }, [
     enabled,
+    observeProgramRun,
     state.draftPositionsRad,
     state.draftPose,
     state.draftGripperPosition,
@@ -258,108 +269,37 @@ export function useRobotControl(
   ]);
 
   const selectMode = useCallback((mode: RobotControlMode) => {
+    if (programRunActive.current) return;
     dispatch({ type: 'select_mode', mode });
   }, []);
 
-  const operationId = state.operation?.operationId ?? null;
-  const operationActive = state.operation !== null
-    && !operationStateIsTerminal(state.operation.state);
   useEffect(() => {
-    if (!enabled || operationId === null || !operationActive) return undefined;
-    let current = true;
-    let timer: number | null = null;
-    let controller: AbortController | null = null;
-    const poll = () => {
-      if (!current) return;
-      controller = new AbortController();
-      void api.execution.read(operationId, controller.signal)
-        .then((operation) => {
-          if (!current) return;
-          dispatch({ type: 'operation_observed', operation });
-          if (!operationStateIsTerminal(operation.state)) {
-            timer = window.setTimeout(poll, ROBOT_CONTROL_OPERATION_POLL_MS);
-          }
-        })
-        .catch((error: unknown) => {
-          if (!current || controller?.signal.aborted) return;
-          dispatch({
-            type: 'operation_poll_failed',
-            error: errorMessage(error, 'Operation status is temporarily unavailable.'),
-          });
-          timer = window.setTimeout(poll, ROBOT_CONTROL_OPERATION_POLL_MS);
-        });
-    };
-    timer = window.setTimeout(poll, 0);
-    return () => {
-      current = false;
-      if (timer !== null) window.clearTimeout(timer);
-      controller?.abort();
-    };
-  }, [enabled, operationActive, operationId]);
-
-  const terminalOperation = state.operation !== null
-    && operationStateIsTerminal(state.operation.state)
-    ? `${state.operation.operationId}:${state.operation.operationRevision}`
-    : null;
-  useEffect(() => {
-    if (!enabled || terminalOperation === null) return undefined;
-    const controller = new AbortController();
-    let current = true;
-    void api.execution.controlStatus(controller.signal)
-      .then((status) => {
-        if (current) dispatch({ type: 'status_refreshed', status });
-      })
-      .catch(() => {
-        // The terminal operation remains authoritative. A later explicit retry
-        // refreshes observed state without rewriting the terminal outcome.
-      });
-    return () => {
-      current = false;
-      controller.abort();
-    };
-  }, [enabled, terminalOperation]);
+    dispatch({ type: 'program_activity_changed' });
+  }, [observeProgramRun]);
 
   const settleResidentOperation = useCallback(async (
     control: 'acknowledge_completed' | 'reset',
-    ownerEpoch: string,
     operationId: string,
     operationRevision: number,
-    signal?: AbortSignal,
-    afterDispatch: () => void = () => {},
   ) => {
-    let admissionError: unknown = null;
-    try {
-      await executionControlClient.ordinary(
-        () => control === 'acknowledge_completed'
-          ? api.execution.acknowledgeCompleted(
-            ownerEpoch,
-            operationId,
-            operationRevision,
-            requestId(),
-            signal,
-          )
-          : api.execution.resetOperation(
-            ownerEpoch,
-            operationId,
-            operationRevision,
-            requestId(),
-            signal,
-          ),
-        afterDispatch,
-      );
-    } catch (error: unknown) {
-      admissionError = error;
+    if (controlSource === null) {
+      throw new Error('Control connection is not synchronized.');
     }
-    for (let attempt = 0; attempt < 40; attempt += 1) {
-      const status = await api.execution.controlStatus(signal);
-      if (!status.residentOperations.some(
-        (operation) => operation.operationId === operationId,
-      )) return status;
-      if (admissionError !== null) throw admissionError;
-      await new Promise((resolve) => window.setTimeout(resolve, 50));
-    }
-    throw new Error('The terminal operation remains resident after settlement.');
-  }, []);
+    const correlationId = requestId();
+    await controlSource.sendExecutionCommand(
+      control === 'acknowledge_completed'
+        ? 'operation_acknowledge_completed'
+        : 'operation_reset',
+      {
+        operation_id: operationId,
+        expected_operation_revision: operationRevision,
+        reason: control === 'acknowledge_completed'
+          ? 'settle completed Robot Control operation'
+          : 'settle terminal Robot Control operation',
+      },
+      correlationId,
+    );
+  }, [controlSource]);
 
   const automaticSettlementControl = state.operation?.resident
     && (state.operation.state === 'completed'
@@ -384,21 +324,22 @@ export function useRobotControl(
       || automaticSettlementOperationRevision === null
       || settlementOwnerEpoch === null
     ) return undefined;
-    const controller = new AbortController();
-    let current = true;
+    const settlementKey = [
+      automaticSettlementControl,
+      automaticSettlementOperationId,
+      automaticSettlementOperationRevision,
+    ].join(':');
+    if (requestedSettlementRef.current === settlementKey) return undefined;
+    requestedSettlementRef.current = settlementKey;
     const settle = async () => {
       try {
-        const status = await settleResidentOperation(
+        await settleResidentOperation(
           automaticSettlementControl,
-          settlementOwnerEpoch,
           automaticSettlementOperationId,
           automaticSettlementOperationRevision,
-          controller.signal,
-          () => dispatch({ type: 'operation_settlement_started' }),
         );
-        if (current) dispatch({ type: 'status_refreshed', status });
       } catch (error: unknown) {
-        if (!current || controller.signal.aborted) return;
+        requestedSettlementRef.current = null;
         dispatch({
           type: 'operation_settlement_failed',
           error: errorMessage(
@@ -409,16 +350,12 @@ export function useRobotControl(
       }
     };
     void settle();
-    return () => {
-      current = false;
-      controller.abort();
-    };
+    return undefined;
   }, [
     automaticSettlementControl,
     automaticSettlementOperationId,
     automaticSettlementOperationRevision,
     enabled,
-    reloadToken,
     settleResidentOperation,
     settlementOwnerEpoch,
   ]);
@@ -448,8 +385,6 @@ export function useRobotControl(
 
   const clearRuntimeScaleQueue = useCallback(() => {
     runtimeScaleQueued.current = null;
-    runtimeScaleAbort.current?.abort();
-    runtimeScaleAbort.current = null;
     if (runtimeScaleTimer.current !== null) {
       window.clearTimeout(runtimeScaleTimer.current);
       runtimeScaleTimer.current = null;
@@ -493,88 +428,52 @@ export function useRobotControl(
     runtimeScaleQueued.current = null;
     runtimeScaleInFlight.current = true;
     runtimeScaleLastSentAt.current = performance.now();
-    const controller = new AbortController();
-    runtimeScaleAbort.current = controller;
     try {
-      const accepted = await executionControlClient.ordinary(
-        () => api.execution.setRuntimeScaleControl(
-          context.ownerEpoch,
-          observed,
+      if (controlSource === null) {
+        throw new Error('Control connection is not synchronized.');
+      }
+      const commandRequestId = requestId();
+      const receipt = await controlSource.sendExecutionCommand(
+        'runtime_scale',
+        {
+          selector: {
+            program_binding_id: observed.selector.programBindingId,
+            component_role_id: observed.selector.componentRoleId,
+            target_role_id: observed.selector.targetRoleId,
+          },
+          expected_control_generation: observed.controlGeneration,
           scale,
-          requestId(),
-          controller.signal,
-        ),
-        () => setRuntimeScalePending(true),
+        },
+        commandRequestId,
       );
+      const accepted = acceptedRuntimeScaleStatus(
+        observed,
+        parseRuntimeScaleControlAccepted(receipt.result),
+        commandRequestId,
+        scale,
+      );
+      const current = runtimeScaleStatusRef.current;
       if (
-        !controller.signal.aborted
-        && runtimeScaleContext.current?.scopeFence === context.scopeFence
+        runtimeScaleContext.current?.scopeFence === context.scopeFence
+        && (current === null || current.controlGeneration <= accepted.controlGeneration)
       ) {
-        const next: RuntimeScaleControlStatus = {
-          ...observed,
-          controlGeneration: accepted.controlGeneration,
-          requestedScale: accepted.requestedScale,
-          activeOperationId: accepted.activeOperationId,
-          activeOperationRevision: accepted.activeOperationRevision,
-          activeOperationScaleGeneration: accepted.activeOperationScaleGeneration,
-        };
-        runtimeScaleStatusRef.current = next;
-        setRuntimeScaleStatus(next);
-        if (runtimeScaleQueued.current === null) {
-          setRuntimeScaleDraft(next.requestedScale);
-        }
+        runtimeScaleStatusRef.current = accepted;
+        setRuntimeScaleStatus(accepted);
+      }
+      if (runtimeScaleContext.current?.scopeFence === context.scopeFence) {
         setRuntimeScaleError(null);
-        if (runtimeScaleQueued.current === null) {
-          // Read once after the latest accepted value, outside the transport
-          // cadence fence. This captures backend-owned effective/application
-          // evidence without doubling every coalesced pointer update.
-          void api.execution.runtimeScaleControl(context.selector)
-            .then((projected) => {
-              if (runtimeScaleContext.current?.scopeFence !== context.scopeFence) return;
-              const merged = mergeRuntimeScaleStatus(
-                runtimeScaleStatusRef.current,
-                projected,
-              );
-              runtimeScaleStatusRef.current = merged;
-              setRuntimeScaleStatus(merged);
-              if (runtimeScaleQueued.current === null) {
-                setRuntimeScaleDraft(merged.requestedScale);
-              }
-            })
-            .catch(() => {
-              // The accepted value remains authoritative. A later focused
-              // projection refreshes application evidence.
-            });
-        }
       }
     } catch (error: unknown) {
-      if (!controller.signal.aborted) {
-        setRuntimeScaleError(errorMessage(
-          error,
-          'Runtime velocity could not be updated; owner state will be re-read.',
-        ));
-        try {
-          const next = await api.execution.runtimeScaleControl(context.selector);
-          if (runtimeScaleContext.current?.scopeFence === context.scopeFence) {
-            runtimeScaleStatusRef.current = next;
-            setRuntimeScaleStatus(next);
-            if (runtimeScaleQueued.current === null) {
-              setRuntimeScaleDraft(next.requestedScale);
-            }
-          }
-        } catch {
-          // The explicit error stays visible; a later owner projection or
-          // automatic reconnect reads fresh state without treating the browser
-          // value as accepted.
-        }
-      }
+      setRuntimeScaleError(errorMessage(
+        error,
+        'Runtime velocity could not be updated; owner state remains authoritative.',
+      ));
     } finally {
-      if (runtimeScaleAbort.current === controller) runtimeScaleAbort.current = null;
       runtimeScaleInFlight.current = false;
       setRuntimeScalePending(runtimeScaleQueued.current !== null);
       scheduleRuntimeScaleFlush();
     }
-  }, [runtimeScaleScopeFence, scheduleRuntimeScaleFlush]);
+  }, [controlSource, runtimeScaleScopeFence, scheduleRuntimeScaleFlush]);
   runtimeScaleFlush.current = () => { void flushRuntimeScale(); };
 
   useEffect(() => {
@@ -611,7 +510,6 @@ export function useRobotControl(
   }, [projectedRuntimeScale, runtimeScaleScopeFence]);
 
   useEffect(() => () => {
-    runtimeScaleAbort.current?.abort();
     if (runtimeScaleTimer.current !== null) {
       window.clearTimeout(runtimeScaleTimer.current);
     }
@@ -640,9 +538,18 @@ export function useRobotControl(
     scheduleRuntimeScaleFlush();
   }, [scheduleRuntimeScaleFlush]);
 
+  const commitRuntimeScale = useCallback(() => {
+    if (runtimeScaleTimer.current !== null) {
+      window.clearTimeout(runtimeScaleTimer.current);
+      runtimeScaleTimer.current = null;
+    }
+    runtimeScaleFlush.current();
+  }, []);
+
   const editJoint = useCallback((jointIndex: number, positionRad: number) => {
     if (
-      state.status === null
+      programRunActive.current
+      || state.status === null
       || robotControlHasActiveOperation(state)
       || !Number.isFinite(positionRad)
       || jointIndex < 0
@@ -654,31 +561,43 @@ export function useRobotControl(
   }, [state]);
 
   const editMoveToJoints = useCallback((positionsRad: number[]) => {
+    if (programRunActive.current) return;
     dispatch({ type: 'edit_move_to_joint', positionsRad: [...positionsRad] });
   }, []);
 
   const editPose = useCallback((pose: Pose3Value) => {
+    if (programRunActive.current) return;
     dispatch({ type: 'edit_pose', pose });
   }, []);
 
   const editGripper = useCallback((position: number) => {
+    if (programRunActive.current) return;
     dispatch({ type: 'edit_gripper', position });
   }, []);
 
   const approve = useCallback(async () => {
     if (
       approveInFlight.current
+      || programRunActive.current
       || state.phase !== 'ready'
       || state.intent === null
       || state.preview === null
     ) return;
     approveInFlight.current = true;
     try {
-      const acceptance = await executionControlClient.ordinary(
-        () => api.execution.submit(state.intent!),
-        () => dispatch({ type: 'approve_started' }),
+      if (controlSource === null) {
+        throw new Error('Control connection is not synchronized.');
+      }
+      const payload = { ...state.intent } as Record<string, unknown>;
+      delete payload.request_context;
+      dispatch({ type: 'approve_started' });
+      await controlSource.sendExecutionCommand(
+        'operation_start',
+        payload,
+        state.intent.request_context.request_id,
       );
-      dispatch({ type: 'approve_resolved', acceptance });
+      // Receipt confirms transport handling only. The shared owner projection
+      // moves this surface from Approving to Executing.
     } catch (error: unknown) {
       dispatch({
         type: 'approve_rejected',
@@ -687,9 +606,10 @@ export function useRobotControl(
     } finally {
       approveInFlight.current = false;
     }
-  }, [state.intent, state.phase, state.preview]);
+  }, [controlSource, state.intent, state.phase, state.preview]);
 
   const revert = useCallback(() => {
+    if (programRunActive.current) return;
     if (
       state.status === null
       || state.operation === null
@@ -701,17 +621,13 @@ export function useRobotControl(
     }
     const operationId = state.operation.operationId;
     const operationRevision = state.operation.operationRevision;
-    const ownerEpoch = state.status.ownerEpoch;
+    if (controlPending !== null) return;
+    setControlPending('reset');
     void settleResidentOperation(
       state.operation.state === 'completed' ? 'acknowledge_completed' : 'reset',
-      ownerEpoch,
       operationId,
       operationRevision,
-      undefined,
-      () => dispatch({ type: 'operation_settlement_started' }),
-    ).then((status) => {
-      dispatch({ type: 'status_refreshed', status });
-    }).catch((error: unknown) => {
+    ).catch((error: unknown) => {
       dispatch({
         type: 'operation_settlement_failed',
         error: errorMessage(
@@ -719,8 +635,8 @@ export function useRobotControl(
           'The terminal Robot Control operation could not be cleared.',
         ),
       });
-    });
-  }, [settleResidentOperation, state.operation, state.status]);
+    }).finally(() => setControlPending(null));
+  }, [controlPending, settleResidentOperation, state.operation, state.status]);
 
   const stop = useCallback(async () => {
     if (
@@ -730,25 +646,35 @@ export function useRobotControl(
       || !robotControlHasActiveOperation(state)
     ) return;
     stopInFlight.current = true;
-    const ownerEpoch = state.status.ownerEpoch;
     const operation = state.operation;
     try {
-      await executionControlClient.stop(
-        () => api.execution.stop(ownerEpoch, operation, requestId()),
-        () => {
-          clearRuntimeScaleQueue();
-          dispatch({ type: 'stop_started' });
+      if (controlSource === null) {
+        throw new Error('Control connection is not synchronized.');
+      }
+      clearRuntimeScaleQueue();
+      setControlPending('stop');
+      await controlSource.sendExecutionCommand(
+        'operation_stop',
+        {
+          operations: [{
+            operation_id: operation.operationId,
+            expected_operation_revision: operation.operationRevision,
+            expected_stop_generation: operation.activeStopGeneration ?? 0,
+          }],
+          reason: 'operator Robot Control Stop',
         },
+        requestId(),
       );
     } catch (error: unknown) {
       dispatch({
-        type: 'stop_rejected',
+        type: 'operation_poll_failed',
         error: errorMessage(error, 'Operation Stop was rejected.'),
       });
     } finally {
       stopInFlight.current = false;
+      setControlPending(null);
     }
-  }, [clearRuntimeScaleQueue, state]);
+  }, [clearRuntimeScaleQueue, controlSource, state]);
 
   const fullStop = useCallback(async () => {
     const action = state.status?.cellStopAction;
@@ -759,27 +685,26 @@ export function useRobotControl(
       || action === undefined
       || !action.available
     ) return;
-    const ownerEpoch = state.status.ownerEpoch;
     try {
-      await executionControlClient.stop(
-        () => api.execution.fullStop(
-          ownerEpoch,
-          action.expectedStopGeneration,
-          requestId(),
-        ),
-        () => {
-          clearRuntimeScaleQueue();
-          setFullStopPending(true);
-          setFullStopError(null);
+      if (controlSource === null) {
+        throw new Error('Control connection is not synchronized.');
+      }
+      clearRuntimeScaleQueue();
+      setFullStopPending(true);
+      setFullStopError(null);
+      await controlSource.sendExecutionCommand(
+        'cell_full_stop',
+        {
+          expected_stop_generation: action.expectedStopGeneration,
         },
+        requestId(),
       );
-      setReloadToken((current) => current + 1);
     } catch (error: unknown) {
       setFullStopError(errorMessage(error, 'Full Stop was rejected.'));
     } finally {
       setFullStopPending(false);
     }
-  }, [clearRuntimeScaleQueue, enabled, fullStopPending, state.status]);
+  }, [clearRuntimeScaleQueue, controlSource, enabled, fullStopPending, state.status]);
 
   const controlOperation = useCallback(async (control: 'pause' | 'resume') => {
     if (
@@ -789,15 +714,21 @@ export function useRobotControl(
       || (control === 'pause' && state.operation.state !== 'executing')
       || (control === 'resume' && state.operation.state !== 'paused')
     ) return;
-    const ownerEpoch = state.status.ownerEpoch;
     const operation = state.operation;
     try {
-      await executionControlClient.ordinary(
-        () => api.execution[control](ownerEpoch, operation, requestId()),
-        () => setControlPending(control),
+      if (controlSource === null) {
+        throw new Error('Control connection is not synchronized.');
+      }
+      setControlPending(control);
+      await controlSource.sendExecutionCommand(
+        control === 'pause' ? 'operation_pause' : 'operation_resume',
+        {
+          operation_id: operation.operationId,
+          expected_operation_revision: operation.operationRevision,
+          reason: `operator Robot Control ${control}`,
+        },
+        requestId(),
       );
-      const observed = await api.execution.read(operation.operationId);
-      dispatch({ type: 'operation_observed', operation: observed });
     } catch (error: unknown) {
       dispatch({
         type: 'operation_poll_failed',
@@ -806,7 +737,7 @@ export function useRobotControl(
     } finally {
       setControlPending(null);
     }
-  }, [controlPending, state]);
+  }, [controlPending, controlSource, state]);
 
   const pause = useCallback(
     async () => controlOperation('pause'),
@@ -825,18 +756,12 @@ export function useRobotControl(
       || !operationStateIsTerminal(state.operation.state)
     ) return;
     try {
-      const status = await settleResidentOperation(
+      setControlPending('reset');
+      await settleResidentOperation(
         'reset',
-        state.status.ownerEpoch,
         state.operation.operationId,
         state.operation.operationRevision,
-        undefined,
-        () => {
-          setControlPending('reset');
-          dispatch({ type: 'operation_settlement_started' });
-        },
       );
-      dispatch({ type: 'status_refreshed', status });
     } catch (error: unknown) {
       dispatch({
         type: 'operation_settlement_failed',
@@ -848,8 +773,8 @@ export function useRobotControl(
   }, [controlPending, settleResidentOperation, state.operation, state.status]);
 
   const retry = useCallback(() => {
-    setReloadToken((current) => current + 1);
-  }, []);
+    controlSource?.reconnect();
+  }, [controlSource]);
   const dismissFullStopError = useCallback(() => {
     setFullStopError(null);
   }, []);
@@ -885,6 +810,7 @@ export function useRobotControl(
     resume,
     reset,
     setRuntimeScale,
+    commitRuntimeScale,
     retry,
   }), [
     approve,
@@ -906,6 +832,7 @@ export function useRobotControl(
     runtimeScaleStatus,
     selectMode,
     setRuntimeScale,
+    commitRuntimeScale,
     state,
     stop,
     fullStop,

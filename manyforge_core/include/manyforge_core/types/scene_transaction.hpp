@@ -118,6 +118,8 @@ struct SceneTransactionRequestDTO final {
   ProjectionRevisionDTO expected_projection_revision;
   SceneOperationRequestDTO operation;
   std::optional<AdmissionGeneration> expected_admission_generation;
+  std::optional<ProgramResetSceneAuthorizationDTO>
+      program_reset_scene_authorization{};
 };
 
 /// Owner-private, non-durable scene-successor request used by deterministic

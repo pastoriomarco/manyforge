@@ -337,14 +337,22 @@ core::Result<void> ValidateProgramCycleSettlementReadOnly(
     Statement metadata(
         database.get(),
         "SELECT schema_version FROM program_cycle_metadata WHERE singleton=1");
-    if (!metadata.Step() || metadata.Integer(0) != 3 || metadata.Step())
+    if (!metadata.Step())
+      throw std::runtime_error("Program-cycle journal schema differs");
+    const auto schema_version = metadata.Integer(0);
+    if ((schema_version != 3 && schema_version != 4) || metadata.Step())
       throw std::runtime_error("Program-cycle journal schema differs");
     Statement row(
         database.get(),
-        "SELECT state,owner_epoch,program_run_id,claim_json,terminal_reference,"
-        "start_settlement_json,release_intent_json,reconciliation_required,"
-        "acquisition_pending_json "
-        "FROM program_cycle WHERE singleton=1");
+        schema_version == 4
+            ? "SELECT state,owner_epoch,program_run_id,claim_json,"
+              "terminal_reference,start_settlement_json,release_intent_json,"
+              "reconciliation_required,acquisition_pending_json,reset_phase "
+              "FROM program_cycle WHERE singleton=1"
+            : "SELECT state,owner_epoch,program_run_id,claim_json,"
+              "terminal_reference,start_settlement_json,release_intent_json,"
+              "reconciliation_required,acquisition_pending_json,NULL "
+              "FROM program_cycle WHERE singleton=1");
     if (!row.Step())
       throw std::runtime_error("Program-cycle owner row is absent");
     const auto retained_claim = DecodeCellAdmissionClaim(row.Text(3));
@@ -354,8 +362,13 @@ core::Result<void> ValidateProgramCycleSettlementReadOnly(
                                                        row.Text(2), row.Text(4))
                       : ProgramStartSettlementMatches(row.Text(5), claim,
                                                       row.Text(2), row.Text(4));
+    const bool lifecycle_is_exact =
+        (schema_version == 3 && row.Text(0) == "terminal_awaiting_reset" &&
+         row.IsNull(9)) ||
+        (schema_version == 4 && row.Text(0) == "resetting" &&
+         !row.IsNull(9) && row.Text(9) == "releasing");
     const bool valid =
-        row.Text(0) == "terminal_awaiting_reset" &&
+        lifecycle_is_exact &&
         row.Text(1) == claim.intent.owner_epoch.value() &&
         retained_claim == claim && retained_release == release &&
         row.Text(4) == release.settlement.evidence_digest.value() &&
@@ -517,7 +530,10 @@ ValidateProgramRunnerOwnerReconciliationReadOnly(
     Statement metadata(
         database.get(),
         "SELECT schema_version FROM program_cycle_metadata WHERE singleton=1");
-    if (!metadata.Step() || metadata.Integer(0) != 3 || metadata.Step())
+    if (!metadata.Step())
+      throw std::runtime_error("Program-cycle journal schema differs");
+    const auto schema_version = metadata.Integer(0);
+    if ((schema_version != 3 && schema_version != 4) || metadata.Step())
       throw std::runtime_error("Program-cycle journal schema differs");
     Statement row(database.get(),
                   "SELECT state,owner_epoch,program_run_id,claim_json,"

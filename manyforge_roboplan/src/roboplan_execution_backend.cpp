@@ -8,6 +8,7 @@
 #include "native_stop_qualification_probe.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <limits>
@@ -46,6 +47,7 @@ constexpr int kTerminalSceneProjectionRetryAttempts = 10;
 constexpr auto kTerminalSceneProjectionRetryDelay =
     std::chrono::milliseconds(20);
 constexpr int kIdleHeartbeatBusyRetryLimit = 10;
+constexpr std::size_t kMaximumStopStageErrorDetails = 8U;
 
 struct HeartbeatScheduleAttempt final {
   std::atomic<bool> callback_admitted{false};
@@ -297,6 +299,51 @@ structured_text_details(const std::map<std::string, std::string> &details) {
     structured.emplace(key, core::interrupt_structured_string(value));
   }
   return structured;
+}
+
+std::map<std::string, std::string> stop_stage_error_details(
+    const std::map<std::string, std::string> &details, std::string reason) {
+  std::map<std::string, std::string> source = details;
+  source.insert_or_assign("reason", std::move(reason));
+  std::map<std::string, std::string> projected;
+  const auto add = [&](std::string_view key) {
+    const auto found = source.find(std::string(key));
+    if (found == source.end() || projected.size() >= 7U || key.empty() ||
+        key.size() > 64U || key.find('\0') != std::string_view::npos) {
+      return;
+    }
+    auto value = found->second;
+    value.erase(std::remove(value.begin(), value.end(), '\0'), value.end());
+    if (value.size() > 256U) {
+      value.resize(256U);
+    }
+    projected.emplace(found->first, std::move(value));
+  };
+  constexpr std::array preferred{
+      std::string_view("reason"),
+      std::string_view("recommended_disposition"),
+      std::string_view("trigger_reason"),
+      std::string_view("validation_failure_reason"),
+      std::string_view("retimer_validation_failure_reason"),
+      std::string_view("ali_validation_failure_reason"),
+      std::string_view("joint")};
+  for (const auto key : preferred) {
+    add(key);
+  }
+  for (const auto &[key, value] : source) {
+    (void)value;
+    add(key);
+  }
+  if (projected.size() < source.size()) {
+    projected.insert_or_assign("details_truncated", "true");
+  }
+  if (projected.empty()) {
+    projected.emplace("reason", "native_stop_stage_failed");
+  }
+  if (projected.size() > kMaximumStopStageErrorDetails) {
+    projected.erase(std::prev(projected.end()));
+  }
+  return projected;
 }
 
 double clamp_progress(double progress) {
@@ -1658,7 +1705,14 @@ RoboPlanExecutionBackend::TranslateStopStage(
           std::map<std::string, std::string> details = {}) {
         result.receiver_elapsed_duration_ns =
             std::max<std::int64_t>(0, clock_.now() - started_at);
-        details.insert_or_assign("reason", std::move(reason));
+        details = stop_stage_error_details(details, std::move(reason));
+        message.erase(std::remove(message.begin(), message.end(), '\0'),
+                      message.end());
+        if (message.empty()) {
+          message = "native Stop stage failed";
+        } else if (message.size() > 1024U) {
+          message.resize(1024U);
+        }
         result.error =
             core::ErrorDTO{core::kErrorMotionInterruptBackendStopFailed,
                            std::move(message), std::move(details)};

@@ -64,6 +64,7 @@ export function ProgramRuntimePanel({
   const {
     state,
     cycleState,
+    commandAllowed,
     refresh,
     run,
     resumeFullStop,
@@ -84,13 +85,21 @@ export function ProgramRuntimePanel({
   const [blackboardError, setBlackboardError] = useState<string | null>(null);
   const [manualOutput, setManualOutput] = useState('null');
   const [manualError, setManualError] = useState<string | null>(null);
-  const canStop = state.run?.state === 'running'
+  const canStop = cycleState === 'starting'
+    || state.run?.state === 'running'
     || state.run?.state === 'intervention_required';
+  const stopCommandPending = ['stop', 'motion-stop', 'full-stop']
+    .includes(state.pending ?? '');
   const fullStopped = state.run?.state === 'full_stopped';
   const canRun = state.runnerAvailable
     && state.applied !== null
     && state.pending === null
-    && (cycleState === 'idle_after_reset' || fullStopped);
+    && (
+      fullStopped
+        ? commandAllowed('program_resume_full_stop')
+        : cycleState === 'idle_after_reset'
+          && commandAllowed('program_run')
+    );
   const controls = state.controls?.runtimeControls ?? null;
   const recoveryOffer = state.controls?.recoveryOffer ?? null;
   const writableKeys = (state.applied?.program.blackboard?.keys ?? []).filter(
@@ -451,14 +460,13 @@ export function ProgramRuntimePanel({
           </ol>
         </details>
       )}
-      {(cycleState === 'terminal_awaiting_reset'
-        || state.run?.state === 'full_stopped') && (
+      {commandAllowed('program_reset') && (
         <button
           type="button"
           disabled={!enabled || state.pending !== null}
           onClick={() => { void reset(); }}
         >
-          {state.pending === 'reset' ? 'Resetting' : 'Reset Program cycle'}
+          {cycleState === 'resetting' ? 'Resetting' : 'Reset Program cycle'}
         </button>
       )}
 
@@ -474,8 +482,10 @@ export function ProgramRuntimePanel({
             }
           }}
         >
-          {state.pending === 'run' || state.pending === 'resume-full-stop'
+          {cycleState === 'starting'
             ? 'Starting'
+            : state.pending === 'run' || state.pending === 'resume-full-stop'
+            ? 'Sending Run'
             : fullStopped
               ? 'Run'
               : 'Run Applied Program'}
@@ -487,11 +497,15 @@ export function ProgramRuntimePanel({
             !enabled
             || !state.runnerAvailable
             || !canStop
-            || state.pending !== null
+            || stopCommandPending
           }
           onClick={() => { void stop(); }}
         >
-          {state.pending === 'stop' ? 'Stopping' : 'Program Stop'}
+          {state.run?.state === 'stopping'
+            ? 'Stopping'
+            : state.pending === 'stop'
+              ? 'Sending Stop'
+              : 'Program Stop'}
         </button>
       </div>
       <p className="panel-intro">
@@ -525,6 +539,8 @@ export function ProgramTransportControls({
   const motionActive = robotControlHasActiveOperation(robot.state);
   const motionPaused = robot.state.operation?.state === 'paused';
   const programMotionRunning = state.run?.state === 'running';
+  const programStarting = cycleState === 'starting';
+  const programStopping = cycleState === 'stopping';
   const programFullStopping = state.run?.state === 'full_stopping';
   const programFullStopped = state.run?.state === 'full_stopped';
   const canRun = enabled
@@ -532,7 +548,7 @@ export function ProgramTransportControls({
     && state.applied !== null
     && state.pending === null
     && !programMotionRunning
-    && cycleState === 'idle_after_reset';
+    && program.commandAllowed('program_run');
   const operatorStopOffer = programMotionStopSettled(
     state.run,
     state.controls,
@@ -556,10 +572,16 @@ export function ProgramTransportControls({
   const operatorStopResetAction = operatorStopOffer?.actions.find(
     (action) => action.actionId === 'reset_cycle' && action.enabled,
   )?.actionId ?? null;
+  const stopCommandPending = ['stop', 'motion-stop', 'full-stop']
+    .includes(state.pending ?? '');
   const canStopMotion = enabled
-    && state.pending === null
+    && !stopCommandPending
+    && !programStopping
     && !motionStopSettled
-    && (programMotionRunning || motionActive);
+    && (
+      (state.runnerAvailable && (programStarting || programMotionRunning))
+      || (robot.controlPending === null && motionActive)
+    );
   const canResumeOperatorStop = enabled
     && motionStopSettled
     && operatorStopResumeAction !== null
@@ -576,16 +598,13 @@ export function ProgramTransportControls({
     || canResumeFullStop;
   const canFullStop = enabled
     && state.runnerAvailable
-    && state.pending === null
+    && !stopCommandPending
     && ['running', 'intervention_required'].includes(state.run?.state ?? '');
   const canReset = enabled
     && state.pending === null
     && state.controlPending === null
-    && (
-      cycleState === 'terminal_awaiting_reset'
-      || programFullStopped
-      || (motionStopSettled && operatorStopResetAction !== null)
-    );
+    && (program.commandAllowed('program_reset')
+      || (motionStopSettled && operatorStopResetAction !== null));
   const velocityAvailable = enabled
     && (state.pending === null || state.pending === 'run')
     && !['stopping', 'full_stopping'].includes(state.run?.state ?? '')
@@ -636,13 +655,15 @@ export function ProgramTransportControls({
           }}
         >
           {robot.controlPending === 'resume'
-            ? 'Resuming'
+            ? 'Sending Resume'
+            : cycleState === 'starting'
+              ? 'Starting'
             : state.pending === 'resume-full-stop'
-              ? 'Starting'
+              ? 'Sending Run'
             : state.controlPending?.startsWith('recovery:')
-              ? 'Resuming'
+              ? 'Sending Resume'
             : state.pending === 'run'
-              ? 'Starting'
+              ? 'Sending Run'
               : canResume || canResumeOperatorStop
                 ? 'Resume Motion'
                 : programMotionRunning
@@ -667,21 +688,31 @@ export function ProgramTransportControls({
             type="button"
             className="danger-button transport-stop-primary"
             disabled={!canStopMotion || robot.state.phase === 'stopping'}
-            title={programMotionRunning
+            title={programStarting
+              ? 'Stop the Program before its pending start can launch motion.'
+              : programMotionRunning
               ? 'Stop addressed motion in the current Program without terminating its execution.'
               : motionActive
                 ? 'Stop the exact active Robot Control motion.'
                 : 'No addressed robot motion is active.'}
             onClick={() => {
-              if (programMotionRunning) {
+              if (programStarting) {
+                void program.stop();
+              } else if (programMotionRunning) {
                 void program.stopMotion();
               } else {
                 void robot.stop();
               }
             }}
           >
-            {robot.state.phase === 'stopping' || state.pending === 'motion-stop'
+            {programStopping
               ? 'Stopping'
+              : robot.controlPending === 'stop'
+              ? 'Sending Stop'
+              : robot.state.phase === 'stopping'
+              ? 'Stopping'
+              : state.pending === 'motion-stop'
+                ? 'Sending Stop'
               : motionStopped
                 ? 'Stopped'
                 : 'Stop'}
@@ -721,8 +752,10 @@ export function ProgramTransportControls({
                   void program.fullStop();
                 }}
               >
-                {state.pending === 'full-stop' || programFullStopping
+                {programFullStopping
                   ? 'Stopping'
+                  : state.pending === 'full-stop'
+                    ? 'Sending Full Stop'
                   : 'Full Stop'}
               </button>
             </div>
@@ -747,9 +780,11 @@ export function ProgramTransportControls({
             }
           }}
         >
-          {state.pending === 'reset'
-            || state.controlPending === 'recovery:reset_cycle'
+          {cycleState === 'resetting'
             ? 'Resetting'
+            : state.pending === 'reset'
+              || state.controlPending === 'recovery:reset_cycle'
+              ? 'Sending Reset'
             : 'Reset'}
         </button>
         <span className="viewer-tool-separator" aria-hidden="true" />
@@ -766,6 +801,9 @@ export function ProgramTransportControls({
             value={robot.runtimeScaleDraft}
             disabled={!velocityAvailable}
             onChange={(event) => robot.setRuntimeScale(Number(event.target.value))}
+            onPointerUp={robot.commitRuntimeScale}
+            onKeyUp={robot.commitRuntimeScale}
+            onBlur={robot.commitRuntimeScale}
           />
           <output>
             {velocityAvailable
@@ -819,7 +857,7 @@ export function ProgramTransportControls({
             title={fullStopReason}
             onClick={() => { void robot.fullStop(); }}
           >
-            {robot.fullStopPending ? 'Stopping' : 'Cell Full Stop'}
+            {robot.fullStopPending ? 'Sending Full Stop' : 'Cell Full Stop'}
           </button>
           {fullCellStop?.latestTerminal && (
             <p className="panel-intro">

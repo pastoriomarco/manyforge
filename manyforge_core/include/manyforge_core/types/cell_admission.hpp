@@ -48,6 +48,8 @@ enum class ProgramCycleStateDTO {
   kStopping,
   kTerminalAwaitingReset,
   kInterventionOrRecovery,
+  kResetting,
+  kRecoveryRequired,
 };
 
 enum class CellAdmissionSettlementKindDTO {
@@ -263,6 +265,21 @@ struct ProgramCycleStatusDTO final {
   friend bool operator==(const ProgramCycleStatusDTO&, const ProgramCycleStatusDTO&) = default;
 };
 
+/// Narrow authorization for logical-scene restoration owned by an accepted
+/// Program-cycle Reset.  This is not a general authoring credential: Kernel
+/// validates it against the current Resetting projection and the exact
+/// retained or reconciled Program-cycle claim before the scene owner commits
+/// one compare-and-swap transaction.
+struct ProgramResetSceneAuthorizationDTO final {
+  RequestOwnerEpoch program_runner_owner_epoch;
+  ProgramRunId program_run_id;
+  CellAdmissionClaimGeneration cycle_claim_generation{0U};
+  ContentDigest terminal_or_settlement_reference;
+
+  friend bool operator==(const ProgramResetSceneAuthorizationDTO&,
+                         const ProgramResetSceneAuthorizationDTO&) = default;
+};
+
 /// Owner-produced O(1) reduction. Counts are complete bounded aggregates, not
 /// collections to be rescanned by admission or Stop.
 struct CellAdmissionReadinessSnapshotDTO final {
@@ -297,6 +314,8 @@ ComputeCellAdmissionRecoveryFootprint(
     const std::vector<CellAdmissionRecoveryLedgerEntryDTO>& entries,
     const std::vector<CellAdmissionCurrentOwnerEpochDTO>& current_owner_epochs);
 [[nodiscard]] Result<void> ValidateProgramCycleStatus(const ProgramCycleStatusDTO& status);
+[[nodiscard]] Result<void> ValidateProgramResetSceneAuthorization(
+    const ProgramResetSceneAuthorizationDTO& authorization);
 [[nodiscard]] Result<ContentDigest> CellAdmissionClaimIntentDigest(
     const CellAdmissionClaimIntentDTO& intent);
 [[nodiscard]] Result<ContentDigest>

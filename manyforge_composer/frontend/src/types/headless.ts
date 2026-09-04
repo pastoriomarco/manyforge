@@ -1,4 +1,5 @@
 import type { ProgramCycleStatus } from './api';
+import type { ExecutionOwnerStatus } from './robotControl';
 
 export type SourceFreshness = 'fresh' | 'stale' | 'unavailable';
 
@@ -154,6 +155,7 @@ export interface ComposerHeadlessState {
     authoringAllowed: boolean;
     admissionGeneration: number;
   };
+  executionControlStatus: ExecutionOwnerStatus | null;
   programCycle: ProgramCycleStatus;
   draftIdentity: { draftId: string; draftRevision: number };
   receiverEpoch: string;

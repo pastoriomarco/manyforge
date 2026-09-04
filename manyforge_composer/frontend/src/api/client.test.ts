@@ -1,6 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import nativeBindingFixture from '../../../../manyforge_deployment/resources/program_binding_lite6_native.fixture.json';
-import { ApiError, api, resolveStructuralAssetUrl } from './client';
+import {
+  ApiError,
+  HISTORIAN_PAGE_LIMIT,
+  api,
+  historianListPath,
+  resolveStructuralAssetUrl,
+} from './client';
 import * as parserModule from './parsers';
 import type { DraftFenceRequest, ManagerApplyRequest } from '../types/api';
 import type { OperatorAlarmRecord } from '../types/headless';
@@ -866,11 +872,14 @@ describe('headless intent client', () => {
       components: ['manyforge.runtime'],
       eventTypes: ['operation_completed'],
       beforeSequence: 7,
-      limit: 64,
+      limit: HISTORIAN_PAGE_LIMIT,
     });
 
     expect(fetchMock.mock.calls[0]?.[0]).toBe(
-      '/api/execution/history?limit=64&start_ns=10&end_ns=20&before_sequence=7&components=manyforge.runtime&event_types=operation_completed',
+      '/api/execution/history?limit=32&start_ns=10&end_ns=20&before_sequence=7&components=manyforge.runtime&event_types=operation_completed',
+    );
+    expect(() => historianListPath({ limit: HISTORIAN_PAGE_LIMIT + 1 })).toThrow(
+      'History page limit must be an integer from 1 to 32',
     );
   });
 });

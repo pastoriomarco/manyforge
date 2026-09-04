@@ -194,6 +194,46 @@ TEST(OwnerSettlementReaders,
 }
 
 TEST(OwnerSettlementReaders,
+     ProgramResetV4RequiresTheExactResettingReleasePhase) {
+  const auto claim_json = ClaimJson("program_cycle", "program_runner",
+                                    "runner.1", "run.1", "start.1");
+  const std::string snapshot = "{\"capture\":{\"program_run_id\":\"run.1\"},"
+                               "\"run_revision\":2,\"state\":\"stopped\"}";
+  const auto evidence = content_identity::sha256_digest(
+      "{\"program_run_id\":\"run.1\",\"run_revision\":2,"
+      "\"state\":\"stopped\"}");
+  const auto release_json = ReleaseJson("program_runner", "runner.1", "run.1",
+                                        "start.1", "explicit_reset", evidence);
+  const auto claim = DecodeCellAdmissionClaim(claim_json);
+  const auto release = DecodeCellAdmissionClaimRelease(release_json);
+  TemporaryDatabase fixture;
+  fixture.Exec(
+      "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
+      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,4);"
+      "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
+      "owner_epoch TEXT,program_run_id TEXT,claim_json TEXT,"
+      "terminal_reference TEXT,start_settlement_json TEXT,"
+      "release_intent_json TEXT,reconciliation_required INTEGER,"
+      "acquisition_pending_json TEXT,reset_phase TEXT);"
+      "CREATE TABLE program_run_history(program_run_id TEXT PRIMARY KEY,"
+      "run_revision INTEGER,snapshot_json TEXT,terminal INTEGER);"
+      "INSERT INTO program_cycle VALUES(1,'resetting','runner.1','run.1','" +
+      claim_json + "','" + evidence + "',NULL,'" + release_json +
+      "',0,NULL,'releasing');"
+      "INSERT INTO program_run_history VALUES('run.1',2,'" + snapshot +
+      "',1)");
+  EXPECT_TRUE(
+      ValidateProgramCycleSettlementReadOnly(fixture.path(), claim, release)
+          .ok());
+
+  fixture.Exec("UPDATE program_cycle SET reset_phase='stopping'");
+  fixture.Close();
+  EXPECT_FALSE(
+      ValidateProgramCycleSettlementReadOnly(fixture.path(), claim, release)
+          .ok());
+}
+
+TEST(OwnerSettlementReaders,
      AuthoringCommitRequiresExactOutcomeDigestAndNoPrematureReceipt) {
   const auto claim_json = ClaimJson("authoring_mutation", "authoring_owner",
                                     "author.1", "author.tx.1", "author.tx.1");

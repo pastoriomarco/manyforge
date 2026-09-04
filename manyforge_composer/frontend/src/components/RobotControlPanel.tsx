@@ -57,7 +57,6 @@ function phaseLabel(phase: RobotControlPhase): string {
     case 'approving': return 'Submitting';
     case 'executing': return 'Executing';
     case 'stopping': return 'Stopping';
-    case 'settling': return 'Settling';
     case 'completed': return 'Completed';
     case 'stopped': return 'Stopped';
     case 'failed': return 'Failed';
@@ -280,8 +279,12 @@ export function RobotControlPanelView({
     retry,
   } = controller;
   const status = state.status;
-  const active = robotControlHasActiveOperation(state);
-  const canApprove = state.phase === 'ready'
+  const operationActive = robotControlHasActiveOperation(state);
+  const programActive = program?.cycleState !== null
+    && program?.cycleState !== undefined
+    && program.cycleState !== 'idle_after_reset';
+  const active = operationActive || programActive;
+  const canApprove = !programActive && state.phase === 'ready'
     && state.preview !== null
     && state.intent !== null;
   const canRevert = !active && (
@@ -289,7 +292,7 @@ export function RobotControlPanelView({
     || state.ghost !== null
     || state.operation !== null
   );
-  const canStop = active && state.operation !== null;
+  const canStop = operationActive && state.operation !== null;
   const overrideCandidate = program?.state.controls
     ?.observationOverrideCandidate ?? null;
   const overridePending = program?.state.controlPending
@@ -560,6 +563,12 @@ export function RobotControlPanelView({
 
       {enabled && status !== null && displayedTarget !== undefined && (
         <>
+          {programActive && (
+            <p className="central-inspector-notice" role="status">
+              <strong>Manual Robot Control is paused.</strong>{' '}
+              The backend Program lifecycle currently owns robot motion.
+            </p>
+          )}
           {state.phase === 'blocked' && (
             <p
               className="central-inspector-notice central-inspector-notice-warning"
@@ -1154,27 +1163,26 @@ export function RobotControlPanelView({
                       disabled={state.operation.state !== 'executing' || controlPending !== null}
                       onClick={() => { void pause(); }}
                     >
-                      {controlPending === 'pause' ? 'Pausing' : 'Pause'}
+                      {controlPending === 'pause' ? 'Sending Pause' : 'Pause'}
                     </button>
                     <button
                       type="button"
                       disabled={state.operation.state !== 'paused' || controlPending !== null}
                       onClick={() => { void resume(); }}
                     >
-                      {controlPending === 'resume' ? 'Resuming' : 'Resume'}
+                      {controlPending === 'resume' ? 'Sending Resume' : 'Resume'}
                     </button>
                     <button
                       type="button"
                       disabled={
                         !state.operation.resident
                         || !operationStateIsTerminal(state.operation.state)
-                        || state.phase === 'settling'
                         || controlPending !== null
                       }
                       title="Release this exact terminal direct operation after the owner has certified containment."
                       onClick={() => { void reset(); }}
                     >
-                      {controlPending === 'reset' ? 'Resetting' : 'Reset operation'}
+                      {controlPending === 'reset' ? 'Sending Reset' : 'Reset operation'}
                     </button>
                   </div>
                 </div>

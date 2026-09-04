@@ -171,6 +171,21 @@ class HeadlessHttpClient:
         )
         self._timeout_seconds = timeout_seconds
 
+    @property
+    def control_websocket_url(self) -> str:
+        """Public low-latency execution-control session URL."""
+
+        parsed = urlsplit(self._base_url)
+        return urlunsplit(
+            (
+                "wss" if parsed.scheme == "https" else "ws",
+                parsed.netloc,
+                parsed.path.rstrip("/") + "/ws/control",
+                "",
+                "",
+            )
+        )
+
     def open_execution_observation_stream(
         self,
     ) -> HeadlessExecutionObservationStream:
@@ -885,6 +900,16 @@ class HeadlessHttpClient:
 
     def execution_control_state(self) -> dict[str, Any]:
         return self.request("GET", "/api/execution/control-state")
+
+    def control_projection(self) -> dict[str, Any]:
+        """Read the public transport-neutral execution-control projection."""
+
+        return self.request("GET", "/api/control/state")
+
+    def submit_control_command(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Submit one strict public command envelope without adding semantics."""
+
+        return self.request("POST", "/api/control/commands", body=body)
 
     def execute(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/execution/operations", body=body)

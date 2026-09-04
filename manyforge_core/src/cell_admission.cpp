@@ -204,6 +204,10 @@ std::string_view to_string(ProgramCycleStateDTO value) noexcept {
       return "terminal_awaiting_reset";
     case ProgramCycleStateDTO::kInterventionOrRecovery:
       return "intervention_or_recovery";
+    case ProgramCycleStateDTO::kResetting:
+      return "resetting";
+    case ProgramCycleStateDTO::kRecoveryRequired:
+      return "recovery_required";
   }
   return {};
 }
@@ -569,14 +573,25 @@ Result<void> ValidateProgramCycleStatus(const ProgramCycleStatusDTO& status) {
     return Invalid<void>("program_cycle_status_identity_invalid");
   }
   const bool idle = status.state == ProgramCycleStateDTO::kIdleAfterReset;
+  const bool recovery =
+      status.state == ProgramCycleStateDTO::kInterventionOrRecovery ||
+      status.state == ProgramCycleStateDTO::kRecoveryRequired;
   const bool pending_acquire =
-      status.state == ProgramCycleStateDTO::kStarting &&
+      (status.state == ProgramCycleStateDTO::kStarting ||
+       status.state == ProgramCycleStateDTO::kStopping ||
+       status.state == ProgramCycleStateDTO::kResetting || recovery ||
+       (status.state == ProgramCycleStateDTO::kTerminalAwaitingReset &&
+        status.terminal_or_settlement_reference.has_value())) &&
       !status.cycle_claim_generation.has_value();
   if ((idle && (status.program_run_id.has_value() ||
                 status.cycle_claim_generation.has_value() ||
                 status.terminal_or_settlement_reference.has_value())) ||
       (!idle &&
-       (!status.program_run_id.has_value() || status.program_run_id->empty() ||
+       ((!recovery && (!status.program_run_id.has_value() ||
+                       status.program_run_id->empty())) ||
+        (status.cycle_claim_generation.has_value() &&
+         (!status.program_run_id.has_value() ||
+          status.program_run_id->empty())) ||
         (!pending_acquire &&
          (!status.cycle_claim_generation.has_value() ||
           !status.cycle_claim_generation->nonzero() ||
@@ -586,6 +601,18 @@ Result<void> ValidateProgramCycleStatus(const ProgramCycleStatusDTO& status) {
       (status.state == ProgramCycleStateDTO::kTerminalAwaitingReset &&
        !status.terminal_or_settlement_reference.has_value())) {
     return Invalid<void>("program_cycle_status_shape_invalid");
+  }
+  return Result<void>::Ok();
+}
+
+Result<void> ValidateProgramResetSceneAuthorization(
+    const ProgramResetSceneAuthorizationDTO& authorization) {
+  if (!BoundedIdentity(authorization.program_runner_owner_epoch.value()) ||
+      !BoundedIdentity(authorization.program_run_id.value()) ||
+      !authorization.cycle_claim_generation.nonzero() ||
+      authorization.cycle_claim_generation.value() > kMaximumSafeCounter ||
+      !Digest(authorization.terminal_or_settlement_reference)) {
+    return Invalid<void>("program_reset_scene_authorization_invalid");
   }
   return Result<void>::Ok();
 }

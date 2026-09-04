@@ -151,9 +151,12 @@ class IOperationJournal {
       const RequestOwnerEpoch& owner_epoch, std::int64_t started_at_ns,
       std::size_t request_capacity, const std::vector<ResourceId>& resource_inventory) = 0;
 
+  /// Atomically retain the new acceptance and compact only resolved history
+  /// outside the live owner's sorted active/unresolved operation inventory.
   [[nodiscard]] virtual Result<std::uint64_t> RecordOperationAccepted(
       const RequestOwnerEpoch& owner_epoch, const OperationIntentDTO& intent,
-      const OperationAcceptedDTO& accepted, const OperationStateDTO& state) = 0;
+      const OperationAcceptedDTO& accepted, const OperationStateDTO& state,
+      std::span<const OperationId> protected_operation_ids = {}) = 0;
 
   [[nodiscard]] virtual Result<std::uint64_t> RecordControlAccepted(
       const RequestOwnerEpoch& owner_epoch, const OperationControlRequestDTO& request,

@@ -557,11 +557,24 @@ def create_app(
                 return response
             return await request_validation_exception_handler(request, error)
 
-        @app.websocket("/ws/state")
+        @app.websocket("/ws/control")
         async def headless_state_websocket(websocket: WebSocket) -> None:
             if headless_state_source is None:
                 await websocket.close(code=1008)
                 return
+            origin = websocket.headers.get("origin")
+            host = websocket.headers.get("host")
+            if origin is not None:
+                from urllib.parse import urlsplit
+
+                parsed_origin = urlsplit(origin)
+                same_origin = (
+                    parsed_origin.scheme in {"http", "https"}
+                    and parsed_origin.netloc == host
+                )
+                if not same_origin and origin not in security.cors_origins:
+                    await websocket.close(code=1008, reason="control origin denied")
+                    return
             await serve_headless_state(
                 websocket,
                 headless_state_source,

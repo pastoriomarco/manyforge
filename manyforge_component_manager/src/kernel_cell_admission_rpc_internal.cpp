@@ -264,7 +264,7 @@ core::CellAdmissionReadinessSnapshotDTO Readiness(Reader &r) {
     return core::ProgramCycleStatusDTO{
         S<core::RequestOwnerEpoch>(r),
         r.U64(),
-        Enum<core::ProgramCycleStateDTO>(r, 6U),
+        Enum<core::ProgramCycleStateDTO>(r, 8U),
         Opt<core::ProgramRunId>(
             r, [](Reader &r) { return S<core::ProgramRunId>(r); }),
         Opt<core::CellAdmissionClaimGeneration>(
@@ -365,6 +365,23 @@ core::CellAdmissionRecoveryReceiptQueryDTO RecoveryQuery(Reader &r) {
     Fail("invalid recovery receipt query");
   return result;
 }
+void ProgramResetSceneAuthorization(
+    Writer &w, const core::ProgramResetSceneAuthorizationDTO &x) {
+  S(w, x.program_runner_owner_epoch);
+  S(w, x.program_run_id);
+  G(w, x.cycle_claim_generation);
+  S(w, x.terminal_or_settlement_reference);
+}
+core::ProgramResetSceneAuthorizationDTO
+ProgramResetSceneAuthorization(Reader &r) {
+  auto result = core::ProgramResetSceneAuthorizationDTO{
+      S<core::RequestOwnerEpoch>(r), S<core::ProgramRunId>(r),
+      G<core::CellAdmissionClaimGeneration>(r),
+      S<core::ContentDigest>(r)};
+  if (!core::ValidateProgramResetSceneAuthorization(result).ok())
+    Fail("invalid Program Reset scene authorization");
+  return result;
+}
 void RecoveryReceipt(Writer &w,
                      const core::CellAdmissionRecoveryReceiptDTO &x) {
   if (!core::ValidateCellAdmissionRecoveryReceipt(x).ok())
@@ -443,6 +460,12 @@ DispatchKernelCellAdmissionRpc(core::IKernelCellAdmissionPort &kernel,
     return adopt(kernel.GetCellAdmissionRecoveryReceipt(
         std::get<core::CellAdmissionRecoveryReceiptQueryDTO>(
             request.request)));
+  if (request.command == "cell_admission_validate_program_reset_scene") {
+    const auto validated = kernel.ValidateProgramResetSceneAuthorization(
+        std::get<core::ProgramResetSceneAuthorizationDTO>(request.request));
+    return validated.ok() ? KernelCellAdmissionRpcResponse{std::monostate{}}
+                          : KernelCellAdmissionRpcResponse{validated.error()};
+  }
   Fail("unknown cell-admission command");
 }
 std::string
@@ -455,8 +478,10 @@ EncodeKernelCellAdmissionRpcRequest(const KernelCellAdmissionRpcPacket &x) {
   const bool reconcile = x.command == "cell_admission_reconcile";
   const bool recovery_receipt =
       x.command == "cell_admission_recovery_receipt";
+  const bool program_reset_scene =
+      x.command == "cell_admission_validate_program_reset_scene";
   if (!get && !readiness && !liveness && !acquire && !release && !reconcile &&
-      !recovery_receipt)
+      !recovery_receipt && !program_reset_scene)
     Fail("unknown cell-admission command");
   if ((get && !std::holds_alternative<std::monostate>(x.request)) ||
       (readiness &&
@@ -474,7 +499,10 @@ EncodeKernelCellAdmissionRpcRequest(const KernelCellAdmissionRpcPacket &x) {
        !std::holds_alternative<core::CellAdmissionReconcileDTO>(x.request)) ||
       (recovery_receipt &&
        !std::holds_alternative<
-           core::CellAdmissionRecoveryReceiptQueryDTO>(x.request)))
+           core::CellAdmissionRecoveryReceiptQueryDTO>(x.request)) ||
+      (program_reset_scene &&
+       !std::holds_alternative<core::ProgramResetSceneAuthorizationDTO>(
+           x.request)))
     Fail("cell-admission command has the wrong request DTO");
   Writer w;
   w.out_.append(kMagic);
@@ -498,6 +526,9 @@ EncodeKernelCellAdmissionRpcRequest(const KernelCellAdmissionRpcPacket &x) {
           else if constexpr (std::is_same_v<
                                  T, core::CellAdmissionReconcileDTO>)
             Reconcile(w, v);
+          else if constexpr (std::is_same_v<
+                                 T, core::ProgramResetSceneAuthorizationDTO>)
+            ProgramResetSceneAuthorization(w, v);
           else
             RecoveryQuery(w, v);
         }
@@ -530,6 +561,8 @@ DecodeKernelCellAdmissionRpcRequest(std::string_view b) {
     x = Reconcile(r);
   else if (command == "cell_admission_recovery_receipt")
     x = RecoveryQuery(r);
+  else if (command == "cell_admission_validate_program_reset_scene")
+    x = ProgramResetSceneAuthorization(r);
   else
     Fail("unknown cell-admission command");
   r.Finish();
@@ -544,7 +577,8 @@ EncodeKernelCellAdmissionRpcResponse(std::string_view command,
       command != "cell_admission_acquire" &&
       command != "cell_admission_release" &&
       command != "cell_admission_reconcile" &&
-      command != "cell_admission_recovery_receipt")
+      command != "cell_admission_recovery_receipt" &&
+      command != "cell_admission_validate_program_reset_scene")
     Fail("unknown response command");
   if (command == "cell_admission_acquire" &&
       !std::holds_alternative<core::CellAdmissionClaimDTO>(x) &&
@@ -558,9 +592,14 @@ EncodeKernelCellAdmissionRpcResponse(std::string_view command,
       !std::holds_alternative<std::monostate>(x) &&
       !std::holds_alternative<core::ErrorDTO>(x))
     Fail("liveness publication response has the wrong DTO");
+  if (command == "cell_admission_validate_program_reset_scene" &&
+      !std::holds_alternative<std::monostate>(x) &&
+      !std::holds_alternative<core::ErrorDTO>(x))
+    Fail("Program Reset scene response has the wrong DTO");
   if (command != "cell_admission_acquire" &&
       command != "cell_admission_recovery_receipt" &&
       command != "cell_admission_publish_liveness" &&
+      command != "cell_admission_validate_program_reset_scene" &&
       !std::holds_alternative<core::AuthoringAdmissionDTO>(x) &&
       !std::holds_alternative<core::ErrorDTO>(x))
     Fail("response has the wrong DTO");
@@ -609,7 +648,8 @@ DecodeKernelCellAdmissionRpcResponse(std::string_view b) {
       command != "cell_admission_acquire" &&
       command != "cell_admission_release" &&
       command != "cell_admission_reconcile" &&
-      command != "cell_admission_recovery_receipt")
+      command != "cell_admission_recovery_receipt" &&
+      command != "cell_admission_validate_program_reset_scene")
     Fail("unknown response command");
   auto tag = r.Byte();
   KernelCellAdmissionRpcResponse x;

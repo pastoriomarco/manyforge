@@ -18,6 +18,7 @@ from manyforge_headless_api.models import (
     RuntimeOverridePromotionRequest,
     RuntimeOverrideStageRequest,
 )
+from manyforge_headless_api.control_protocol import AllowedExecutionCommandDTO
 
 
 _DIGEST = r"^sha256:[0-9a-f]{64}$"
@@ -44,7 +45,9 @@ class ProgramCycleStatusDTO(BaseModel):
         "starting",
         "running",
         "stopping",
+        "resetting",
         "terminal_awaiting_reset",
+        "recovery_required",
     ]
     program_run_id: Annotated[str, Field(min_length=1, max_length=256)] | None
     cycle_claim_generation: (
@@ -53,6 +56,22 @@ class ProgramCycleStatusDTO(BaseModel):
     terminal_or_settlement_reference: (
         Annotated[str, Field(pattern=_DIGEST)] | None
     )
+    execution_control_revision: Annotated[
+        int, Field(ge=1, le=9_007_199_254_740_991)
+    ]
+    causal_correlation_id: Annotated[
+        str, Field(min_length=1, max_length=256)
+    ] | None
+    causal_session_id: Annotated[str, Field(min_length=1, max_length=256)] | None
+    causal_client_sequence: Annotated[
+        str, Field(pattern=r"^[1-9][0-9]{0,19}$")
+    ] | None
+    current_command_kind: Annotated[
+        str, Field(min_length=1, max_length=256)
+    ] | None
+    failure: dict[str, Any] | None
+    reset_phase: Annotated[str, Field(min_length=1, max_length=256)] | None
+    allowed_commands: list[AllowedExecutionCommandDTO]
 
     @model_validator(mode="after")
     def exact_state_shape(self) -> "ProgramCycleStatusDTO":
@@ -64,15 +83,29 @@ class ProgramCycleStatusDTO(BaseModel):
                 and self.terminal_or_settlement_reference is None
             ):
                 raise ValueError("Program cycle has the wrong Idle shape")
-        elif self.program_run_id is None:
+        elif self.program_run_id is None and self.state != "recovery_required":
             raise ValueError("active Program cycle requires its run identity")
-        elif self.cycle_claim_generation is None and self.state != "starting":
+        elif self.cycle_claim_generation is None and self.state not in {
+            "starting",
+            "stopping",
+            "resetting",
+            "terminal_awaiting_reset",
+            "recovery_required",
+        }:
             raise ValueError("acquired Program cycle requires its claim generation")
         if (
             self.state == "terminal_awaiting_reset"
             and self.terminal_or_settlement_reference is None
         ):
             raise ValueError("terminal Program cycle requires its reference")
+        if (self.causal_session_id is None) != (
+            self.causal_client_sequence is None
+        ):
+            raise ValueError("causal session and client sequence must be paired")
+        if self.state == "resetting" and self.reset_phase is None:
+            raise ValueError("Resetting Program cycle requires its phase")
+        if self.state == "recovery_required" and self.failure is None:
+            raise ValueError("recovery-required Program cycle requires failure")
         return self
 
 

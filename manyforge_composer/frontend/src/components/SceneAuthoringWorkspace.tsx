@@ -1602,7 +1602,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   const productIdentity = sourceValue === null
     ? null
     : `${sourceValue.retained_bundle_id}\u0000${sourceValue.graph_revision}`;
-  const resetPresentationHeld = programRuntime.state.pending === 'reset';
+  const resetPresentationHeld = programRuntime.cycleState === 'resetting';
   const [retainedPresentation, setRetainedPresentation] = useState<
     RetainedSceneOwnerPresentation | null
   >(null);

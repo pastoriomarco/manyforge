@@ -6,14 +6,12 @@ import type {
   ExecutionOwnerStatus,
   MotionParticipantPayload,
   MotionPreviewReceipt,
-  OperationAcceptance,
   OperationObservation,
   OperationStateName,
   Pose3Value,
 } from '../types/robotControl';
 
 export const ROBOT_CONTROL_AUTHOR_DEBOUNCE_MS = 150;
-export const ROBOT_CONTROL_OPERATION_POLL_MS = 500;
 
 const TERMINAL_OPERATION_STATES = new Set<OperationStateName>([
   'completed',
@@ -41,7 +39,6 @@ export type RobotControlPhase =
   | 'approving'
   | 'executing'
   | 'stopping'
-  | 'settling'
   | 'completed'
   | 'stopped'
   | 'failed'
@@ -75,7 +72,9 @@ export type RobotControlAction =
   | { type: 'load' }
   | { type: 'status_resolved'; status: ExecutionOwnerStatus }
   | { type: 'status_refreshed'; status: ExecutionOwnerStatus }
+  | { type: 'program_status_refreshed'; status: ExecutionOwnerStatus }
   | { type: 'load_failed'; error: string }
+  | { type: 'program_activity_changed' }
   | { type: 'select_mode'; mode: RobotControlMode }
   | { type: 'edit'; positionsRad: number[] }
   | { type: 'edit_joint'; positionsRad: number[] }
@@ -94,14 +93,10 @@ export type RobotControlAction =
     }
   | { type: 'preview_rejected'; generation: number; error: string }
   | { type: 'approve_started' }
-  | { type: 'approve_resolved'; acceptance: OperationAcceptance }
   | { type: 'approve_rejected'; error: string }
   | { type: 'operation_observed'; operation: OperationObservation }
   | { type: 'operation_poll_failed'; error: string }
-  | { type: 'operation_settlement_started' }
   | { type: 'operation_settlement_failed'; error: string }
-  | { type: 'stop_started' }
-  | { type: 'stop_rejected'; error: string }
   | { type: 'dismiss_error' }
   | { type: 'revert' }
   | { type: 'clear' };
@@ -139,8 +134,7 @@ export function robotControlHasActiveOperation(
 ): boolean {
   return state.phase === 'approving'
     || state.phase === 'executing'
-    || state.phase === 'stopping'
-    || state.phase === 'settling';
+    || state.phase === 'stopping';
 }
 
 function arraysEqual<T>(left: T[], right: T[]): boolean {
@@ -271,22 +265,6 @@ function phaseForOperation(operation: OperationObservation): RobotControlPhase {
   return operation.state as RobotControlPhase;
 }
 
-function phaseForObservedOperation(
-  currentPhase: RobotControlPhase,
-  operation: OperationObservation,
-): RobotControlPhase {
-  // A poll that was already in flight when Stop was pressed may still carry
-  // the preceding executing revision.  It cannot revoke the locally pending
-  // exact Stop request.  Only the Stop response (stop_rejected) or a newer
-  // owner projection that has entered stopping/terminal state settles it.
-  if (currentPhase === 'stopping'
-    && !operationStateIsTerminal(operation.state)
-    && operation.state !== 'stopping') {
-    return 'stopping';
-  }
-  return phaseForOperation(operation);
-}
-
 function draftFromStatus(status: ExecutionOwnerStatus) {
   return {
     draftPositionsRad: [...status.observedMotion.positionsRad],
@@ -359,8 +337,11 @@ function resolveStatus(
     return {
       ...state,
       status,
-      phase: phaseForObservedOperation(state.phase, projectedOperation),
+      phase: phaseForOperation(projectedOperation),
       operation: projectedOperation,
+      intent: null,
+      preview: null,
+      ghostStale: state.ghost !== null || state.ghostStale,
       ...(operationStateIsTerminal(projectedOperation.state)
         ? draftFromStatus(status)
         : {}),
@@ -419,10 +400,34 @@ export function robotControlReducer(
       return resolveStatus(state, action.status, true);
     case 'status_refreshed':
       return resolveStatus(state, action.status, false);
+    case 'program_status_refreshed':
+      // The common owner projection also contains Program-owned resident
+      // operations. Robot Control must retain the fresh status for its later
+      // rebase without adopting those operations as manual-control work.
+      return { ...state, status: action.status };
     case 'load_failed':
       return state.status === null
         ? { ...state, phase: 'unavailable', error: action.error }
         : { ...state, error: action.error };
+    case 'program_activity_changed':
+      if (state.status === null || robotControlHasActiveOperation(state)) {
+        return state;
+      }
+      // A Program lifecycle owns robot motion while it is non-idle. Discard
+      // local no-motion work at either boundary and rebase on the owner's
+      // latest observation; never resume a stale pre-Program preview.
+      return {
+        ...state,
+        phase: 'idle',
+        ...draftFromStatus(state.status),
+        generation: state.generation + 1,
+        intent: null,
+        preview: null,
+        ghost: null,
+        ghostStale: false,
+        operation: null,
+        error: null,
+      };
     case 'select_mode':
       if (
         state.status === null
@@ -589,30 +594,6 @@ export function robotControlReducer(
         || state.intent === null
       ) return state;
       return { ...state, phase: 'approving', error: null };
-    case 'approve_resolved':
-      if (
-        state.phase !== 'approving'
-        || state.intent === null
-        || action.acceptance.requestId
-          !== state.intent.request_context.request_id
-      ) return state;
-      return {
-        ...state,
-        phase: 'executing',
-        preview: null,
-        ghostStale: state.ghost !== null,
-        operation: {
-          operationId: action.acceptance.operationId,
-          operationRevision: action.acceptance.operationRevision,
-          resident: true,
-          state: 'queued',
-          progress: 0,
-          activeStopId: null,
-          activeStopGeneration: null,
-          terminalError: null,
-        },
-        error: null,
-      };
     case 'approve_rejected':
       if (state.phase !== 'approving') return state;
       return {
@@ -631,7 +612,7 @@ export function robotControlReducer(
       ) return state;
       return {
         ...state,
-        phase: phaseForObservedOperation(state.phase, action.operation),
+        phase: phaseForOperation(action.operation),
         operation: action.operation,
         ghostStale: state.ghost !== null,
         error: action.operation.terminalError ?? state.error,
@@ -640,34 +621,8 @@ export function robotControlReducer(
       return robotControlHasActiveOperation(state)
         ? { ...state, error: action.error }
         : state;
-    case 'operation_settlement_started':
-      return state.operation !== null
-        && operationStateIsTerminal(state.operation.state)
-        && state.operation.resident
-        ? { ...state, phase: 'settling' }
-        : state;
     case 'operation_settlement_failed':
-      return state.phase === 'settling'
-        ? {
-            ...state,
-            phase: state.operation === null
-              ? 'blocked'
-              : phaseForOperation(state.operation),
-            error: action.error,
-          }
-        : state;
-    case 'stop_started':
-      return state.operation !== null && robotControlHasActiveOperation(state)
-        ? { ...state, phase: 'stopping', error: null }
-        : state;
-    case 'stop_rejected':
-      return state.operation !== null
-        ? {
-            ...state,
-            phase: phaseForOperation(state.operation),
-            error: action.error,
-          }
-        : state;
+      return { ...state, error: action.error };
     case 'dismiss_error':
       return state.error === null ? state : { ...state, error: null };
     case 'revert':

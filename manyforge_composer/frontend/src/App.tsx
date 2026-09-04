@@ -169,16 +169,26 @@ export default function App() {
     headlessEnabled,
     headlessSnapshot,
     programController.state.workspace,
+    headlessStateSource,
   );
   const robotControl = useRobotControl(
     headlessEnabled,
-    programRuntime.active,
+    programRuntime.cycleState !== null
+      && programRuntime.cycleState !== 'idle_after_reset',
     ['motion-stop', 'full-stop'].includes(programRuntime.state.pending ?? '')
       || ['stopping', 'full_stopping'].includes(
         programRuntime.state.run?.state ?? '',
       ),
+    headlessSnapshot,
+    headlessStateSource,
   );
   const operationalErrors = useOperationalErrors();
+  useOperationalErrorMirror({
+    source: 'composer.control_transport',
+    title: 'Control connection became unavailable',
+    message: headlessState.error,
+    onDismiss: headlessState.reconnect,
+  });
   useOperationalErrorMirror({
     source: 'composer.program_workspace',
     title: 'Program authoring command or response failed',
@@ -196,6 +206,7 @@ export default function App() {
     title: 'Cell Full Stop command failed',
     message: robotControl.fullStopError,
     onDismiss: robotControl.dismissFullStopError,
+    attentionPolicy: 'acknowledgement_required',
   });
   useOperationalErrorMirror({
     source: 'composer.runtime_scale',
@@ -237,13 +248,14 @@ export default function App() {
   ], [clientErrors, headlessSnapshot]);
   const openRuntimeAttention = useCallback((identity: string) => {
     setRuntimeAttentionRequest(identity);
-    // New operator attention always opens as the compact one-line rail. The
-    // operator may expand it deliberately without execution being obscured by
-    // an automatic client-error or alarm presentation.
-    setRuntimePanelExpanded(false);
-    setRuntimePanelAutomatic(true);
+    // Automatic attention may choose the initial compact presentation, but it
+    // must never override an already-open panel that the operator controls.
+    if (globalPanel !== 'runtime') {
+      setRuntimePanelExpanded(false);
+      setRuntimePanelAutomatic(true);
+    }
     setGlobalPanel('runtime');
-  }, []);
+  }, [globalPanel]);
   useEffect(() => {
     if (shouldCloseAutomaticRuntimeAttention(
       runtimePanelAutomatic,
@@ -645,7 +657,7 @@ export default function App() {
                 programController={programController}
                 programRuntime={programRuntime}
                 robotControl={robotControl}
-                runtimeEnabled={headlessEnabled}
+                runtimeEnabled={connectedProjection}
                 sourceModel={sourceModel}
                 viewerActive
                 viewerInspectorTarget={viewerInspectorTarget}
@@ -659,6 +671,7 @@ export default function App() {
                     enabled={headlessEnabled}
                     headlessStateSource={headlessStateSource}
                     clientErrors={clientErrors}
+                    clientHistory={operationalErrors.history}
                     onAcknowledgeClientError={operationalErrors.dismiss}
                     attentionRequest={runtimeAttentionRequest}
                     expanded={runtimePanelExpanded}

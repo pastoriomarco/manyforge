@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-import time
 from typing import Annotated, Any, Callable, Literal
 
 from fastapi import APIRouter, HTTPException, Path, Query
@@ -14,6 +13,10 @@ from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClien
 from manyforge_headless_api.execution_control import (
     ExecutionControlBusyError,
     ExecutionControlClient,
+)
+from manyforge_headless_api.control_protocol import (
+    ExecutionCommandRequestDTO,
+    is_stop_command,
 )
 from manyforge_headless_api.models import (
     AcknowledgeAlarmRequest,
@@ -60,12 +63,6 @@ from .state import ComposerState
 _MAXIMUM_SAFE_INTEGER = 9_007_199_254_740_991
 _MAXIMUM_ALARM_PAGE = 128
 _MAXIMUM_HISTORY_PAGE = 32
-_CONTROL_INGRESS_MONOTONIC_HEADER = (
-    "X-ManyForge-Composer-Control-Ingress-Monotonic-Ns"
-)
-_CONTROL_RESPONSE_MONOTONIC_HEADER = (
-    "X-ManyForge-Composer-Control-Response-Monotonic-Ns"
-)
 _SCENE_RESULT_FIELDS = {
     "api_version",
     "committed_projection_revision",
@@ -522,37 +519,11 @@ def create_headless_router(
             stop=True,
         )
 
-    @router.post(
-        "/api/program/runs/{program_run_id}/motion-stop",
-        responses={
-            200: {
-                "headers": {
-                    _CONTROL_INGRESS_MONOTONIC_HEADER: {
-                        "description": (
-                            "Stateless same-host CLOCK_MONOTONIC route-entry "
-                            "timestamp used to qualify Stop handoff latency."
-                        ),
-                        "schema": {"type": "string", "pattern": "^[0-9]+$"},
-                    },
-                    _CONTROL_RESPONSE_MONOTONIC_HEADER: {
-                        "description": (
-                            "Stateless same-host CLOCK_MONOTONIC timestamp "
-                            "after the accepted Stop response is encoded."
-                        ),
-                        "schema": {"type": "string", "pattern": "^[0-9]+$"},
-                    },
-                }
-            }
-        },
-    )
+    @router.post("/api/program/runs/{program_run_id}/motion-stop")
     async def program_run_motion_stop(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
         body: ProgramRunStopRequest,
     ) -> dict[str, Any]:
-        # UI6 qualification correlates this stateless route-entry fact with the
-        # Kernel's existing acceptance timestamp.  A response header avoids a
-        # tracing owner/store and leaves the strict owner response unchanged.
-        ingress_monotonic_ns = str(time.monotonic_ns())
         if body.program_run_id != program_run_id:
             raise HTTPException(
                 status_code=400,
@@ -563,21 +534,13 @@ def create_headless_router(
                     ),
                 },
             )
-        result = await control_call(
+        return await control_call(
             lambda: client.program_run_motion_stop(
                 program_run_id,
                 body.model_dump(mode="json"),
             ),
             stop=True,
         )
-        # ``control_call`` returns the encoded response itself, so attach the
-        # route-entry trace fact to that response rather than to FastAPI's
-        # injected placeholder.
-        result.headers[_CONTROL_INGRESS_MONOTONIC_HEADER] = ingress_monotonic_ns
-        result.headers[_CONTROL_RESPONSE_MONOTONIC_HEADER] = str(
-            time.monotonic_ns()
-        )
-        return result
 
     @router.post("/api/program/runs/{program_run_id}/full-stop")
     async def program_run_full_stop(
@@ -701,6 +664,19 @@ def create_headless_router(
     @router.get("/api/execution/control-state")
     def execution_control_state() -> dict[str, Any]:
         return _call(client.execution_control_state)
+
+    @router.get("/api/control/state")
+    def control_projection() -> dict[str, Any]:
+        return _call(client.control_projection)
+
+    @router.post("/api/control/commands")
+    async def submit_control_command(
+        body: ExecutionCommandRequestDTO,
+    ) -> JSONResponse:
+        return await control_call(
+            lambda: client.submit_control_command(body.model_dump(mode="json")),
+            stop=is_stop_command(body.command_envelope.command_kind),
+        )
 
     @router.post("/api/execution/operations")
     async def execution_submit(body: OperationIntentRequest) -> dict[str, Any]:
@@ -896,7 +872,10 @@ def create_headless_router(
         def commit_owner_scene():
             return _call_scene(
                 lambda: client.commit_scene_transaction(
-                    owner_request.model_dump(mode="json")
+                    owner_request.model_dump(
+                        mode="json",
+                        exclude={"program_reset_scene_authorization"},
+                    )
                 ),
                 owner_request,
             )

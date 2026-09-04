@@ -42,11 +42,12 @@ from ui6_native_flow import (
     _performance,
     _require,
     _reset_performance_metrics,
-    _resume_and_reset,
+    _resume_and_reset_during_motion,
     _stop_latency,
     _stop_probe,
     _wait_ready,
     _wait_client_baseline,
+    _wait_runtime_scale,
     _wait_running_node,
     _wait_status,
     _wait_status_stable,
@@ -63,11 +64,12 @@ PRESSURE_PERIOD_MS = 40
 PRESSURE_REQUEST_INTERVAL_S = 0.025
 LATENCY_FIELDS = (
     "clickToDispatchMs",
-    "dispatchToComposerIngressMs",
-    "composerIngressToKernelAcceptanceMs",
-    "kernelAcceptanceToComposerResponseMs",
-    "composerResponseToBrowserMs",
-    "kernelAcceptanceToResponseMs",
+    "dispatchToControlIngressMs",
+    "controlIngressToKernelAcceptanceMs",
+    "kernelAcceptanceToReceiptEmissionMs",
+    "receiptEmissionToBrowserMs",
+    "kernelAcceptanceToReceiptMs",
+    "kernelAcceptanceToStoppingPresentationMs",
     "kernelAcceptanceToPhysicalSettlementMs",
     "physicalSettlementToStoppedPresentationMs",
     "clickToStoppedPresentationMs",
@@ -82,9 +84,10 @@ LATENCY_FIELDS = (
 # latency regression.
 WARM_BUDGETS_MS: dict[str, dict[str, float]] = {
     "clickToDispatchMs": {"p99": 5.0, "max": 20.0},
-    "dispatchToComposerIngressMs": {"p99": 25.0, "max": 100.0},
-    "composerIngressToKernelAcceptanceMs": {"p99": 100.0, "max": 250.0},
-    "kernelAcceptanceToResponseMs": {"p99": 100.0, "max": 250.0},
+    "dispatchToControlIngressMs": {"p99": 25.0, "max": 100.0},
+    "controlIngressToKernelAcceptanceMs": {"p99": 100.0, "max": 250.0},
+    "kernelAcceptanceToReceiptMs": {"p99": 100.0, "max": 250.0},
+    "kernelAcceptanceToStoppingPresentationMs": {"p99": 250.0, "max": 500.0},
     "kernelAcceptanceToPhysicalSettlementMs": {"p99": 1_500.0, "max": 1_750.0},
     "physicalSettlementToStoppedPresentationMs": {"p99": 750.0, "max": 1_000.0},
     "clickToStoppedPresentationMs": {"p99": 2_250.0, "max": 2_500.0},
@@ -173,8 +176,8 @@ def _assert_interference(
     # Viewer/history work must not materially perturb the command handoff.
     handoff_fields = (
         "clickToDispatchMs",
-        "dispatchToComposerIngressMs",
-        "composerIngressToKernelAcceptanceMs",
+        "dispatchToControlIngressMs",
+        "controlIngressToKernelAcceptanceMs",
     )
     baseline_handoff = sum(
         float(baseline["metricsMs"][field]["p99"])
@@ -388,6 +391,7 @@ def _stop_row(
         f"{label} runtime scale",
         DEFAULT_TIMEOUT_S,
     )
+    _wait_runtime_scale(composer_url, CONTROL_SCALE)
 
     cold = _one_stop(driver, composer_url, start_label="Run")
     warm: list[dict[str, Any]] = []
@@ -398,9 +402,16 @@ def _stop_row(
         if (index + 1) % 10 == 0:
             _progress(f"{label}: {index + 1}/{warm_samples} warm Stops")
 
+    _wait(
+        lambda: _dom_state(driver),
+        lambda state: state["velocityDisabled"] is False,
+        f"{label} post-Stop runtime velocity availability",
+        DEFAULT_TIMEOUT_S,
+    )
     restored = _set_range(driver, 1.0)
     _require(restored["identityStable"], f"{label} scale restoration rebound control")
-    _resume_and_reset(driver)
+    _wait_runtime_scale(composer_url, 1.0)
+    _resume_and_reset_during_motion(driver)
     summary = _summarize(warm)
     _report_summary(summary, label)
     _assert_budgets(summary, label)

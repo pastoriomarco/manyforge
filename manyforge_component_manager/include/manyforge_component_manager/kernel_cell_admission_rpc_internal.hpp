@@ -23,6 +23,7 @@ using KernelCellAdmissionRpcRequest =
                  manyforge::core::CellAdmissionClaimReleaseDTO,
                  manyforge::core::CellAdmissionReconcileDTO,
                  manyforge::core::CellAdmissionRecoveryReceiptQueryDTO,
+                 manyforge::core::ProgramResetSceneAuthorizationDTO,
                  manyforge::core::ManagerLivenessObservationDTO>;
 
 struct KernelCellAdmissionRpcPacket final {

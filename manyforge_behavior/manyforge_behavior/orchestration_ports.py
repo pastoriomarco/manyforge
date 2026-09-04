@@ -7,7 +7,12 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
-from typing import Any, Protocol
+from typing import Any, Final, Protocol
+
+
+PROGRAM_MOTION_STOP_RECOVERY_CLASSES: Final = frozenset(
+    {"ordinary_operator_stop", "stop_fault_intervention"}
+)
 
 
 class OwnerTaskState(Enum):
@@ -533,6 +538,7 @@ __all__ = [
     "ProgramRunContextPort",
     "ProgramInterventionPort",
     "ProgramInterventionSnapshot",
+    "PROGRAM_MOTION_STOP_RECOVERY_CLASSES",
     "ProgramRunPortContext",
     "OwnerNodeInputs",
     "OwnerInvocationPort",

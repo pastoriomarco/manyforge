@@ -471,20 +471,39 @@ class ProgramRunnerLivenessReceiver:
         self._exact(
             status,
             {
+                "allowed_commands",
+                "causal_client_sequence",
+                "causal_correlation_id",
+                "causal_session_id",
+                "program_runner_owner_epoch",
+                "cycle_generation",
+                "current_command_kind",
+                "execution_control_revision",
+                "failure",
+                "state",
+                "program_run_id",
+                "cycle_claim_generation",
+                "reset_phase",
+                "terminal_or_settlement_reference",
+            },
+        )
+        projected = {
+            key: status[key]
+            for key in (
                 "program_runner_owner_epoch",
                 "cycle_generation",
                 "state",
                 "program_run_id",
                 "cycle_claim_generation",
                 "terminal_or_settlement_reference",
-            },
-        )
-        owner = status["program_runner_owner_epoch"]
-        generation = status["cycle_generation"]
-        state = status["state"]
-        run_id = status["program_run_id"]
-        claim_generation = status["cycle_claim_generation"]
-        terminal = status["terminal_or_settlement_reference"]
+            )
+        }
+        owner = projected["program_runner_owner_epoch"]
+        generation = projected["cycle_generation"]
+        state = projected["state"]
+        run_id = projected["program_run_id"]
+        claim_generation = projected["cycle_claim_generation"]
+        terminal = projected["terminal_or_settlement_reference"]
         if (
             not isinstance(owner, str)
             or not owner
@@ -497,7 +516,9 @@ class ProgramRunnerLivenessReceiver:
                 "starting",
                 "running",
                 "stopping",
+                "resetting",
                 "terminal_awaiting_reset",
+                "recovery_required",
             }
         ):
             raise ProgramRunnerLivenessError("malformed Program-cycle identity")
@@ -506,13 +527,24 @@ class ProgramRunnerLivenessReceiver:
             run_id is None and claim_generation is None and terminal is None
         ):
             raise ProgramRunnerLivenessError("malformed idle Program cycle")
-        if not idle and (
+        recovery = state == "recovery_required"
+        if not idle and not recovery and (
             not isinstance(run_id, str)
             or not run_id
             or len(run_id.encode("utf-8")) > 256
         ):
             raise ProgramRunnerLivenessError("malformed Program-cycle run identity")
-        if not idle and claim_generation is None and state != "starting":
+        if claim_generation is not None and not isinstance(run_id, str):
+            raise ProgramRunnerLivenessError("malformed Program-cycle run identity")
+        claimless_terminal = (
+            state == "terminal_awaiting_reset" and terminal is not None
+        )
+        if (
+            not idle
+            and claim_generation is None
+            and state not in {"starting", "stopping", "resetting", "recovery_required"}
+            and not claimless_terminal
+        ):
             raise ProgramRunnerLivenessError("malformed unacquired Program cycle")
         if claim_generation is not None and (
             type(claim_generation) is not int
@@ -528,7 +560,7 @@ class ProgramRunnerLivenessReceiver:
             raise ProgramRunnerLivenessError("malformed Program-cycle reference")
         if state == "terminal_awaiting_reset" and terminal is None:
             raise ProgramRunnerLivenessError("terminal Program cycle lacks evidence")
-        return status
+        return projected
 
     @staticmethod
     def _status_digest(status: Mapping[str, Any]) -> str:

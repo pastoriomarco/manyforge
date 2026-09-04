@@ -217,6 +217,7 @@ function authoringSnapshot(
   return {
     schemaVersion: 'manyforge.composer_headless_state.v2',
     complete: true,
+    executionControlStatus: null,
     componentOverview: {
       schemaVersion: 'manyforge.component_overview.v1',
       overviewRevision: `sha256:${'a'.repeat(64)}`,
@@ -258,6 +259,14 @@ function authoringSnapshot(
       runRevision: null,
       nodeStatusRevision: null,
       runtimeControlRevision: null,
+      executionControlRevision: 1,
+      causalCorrelationId: null,
+      causalSessionId: null,
+      causalClientSequence: null,
+      currentCommandKind: null,
+      failure: null,
+      resetPhase: null,
+      allowedCommands: [],
       recoveryOffer: null,
       run: null,
       runtimeControls: null,

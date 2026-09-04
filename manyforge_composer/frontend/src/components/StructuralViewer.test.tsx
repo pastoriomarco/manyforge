@@ -291,6 +291,10 @@ describe('viewer failure isolation', () => {
     expect(driver).toContain('}, 1_000 / 60);');
     expect(measuredLink).not.toContain('<AuthoritativeTransformGroup');
     expect(measuredLink).toContain('ref={groupRef}');
+    expect(measuredLink).toContain('const [bootstrapTransform] = useState');
+    expect(measuredLink).toContain('position={bootstrapTransform.position}');
+    expect(measuredLink).toContain('quaternion={bootstrapTransform.quaternion}');
+    expect(measuredLink).not.toContain('position={initialTransform.position_m}');
     expect(measuredLink).toContain('attachedObjects.map((object) => (');
     expect(measuredLink).toContain('<AttachedLogicalSceneObject');
     expect(source).toContain(

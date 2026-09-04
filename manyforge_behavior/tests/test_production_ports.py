@@ -1034,7 +1034,13 @@ def test_pick_sequence_observation_cancellation_and_intervention_are_exact() -> 
     port.unbind("program-run.1")
 
 
-def test_native_motion_stop_projects_exact_operator_recovery_policy() -> None:
+@pytest.mark.parametrize(
+    "recovery_class",
+    ["ordinary_operator_stop", "stop_fault_intervention"],
+)
+def test_native_motion_stop_projects_exact_operator_recovery_policy(
+    recovery_class: str,
+) -> None:
     transport = _Transport()
     port = NativeKernelProgramPort(KernelClient(transport))
     port.bind(_context())
@@ -1057,7 +1063,7 @@ def test_native_motion_stop_projects_exact_operator_recovery_policy() -> None:
         "operation_revision": operation["operation_revision"],
         "participants": [{"operation_participant_id": "participant.1"}],
         "recovery_assessment": {
-            "recovery_class": "ordinary_operator_stop",
+            "recovery_class": recovery_class,
         },
         "stop_generation": 2,
         "stop_id": "stop.1",

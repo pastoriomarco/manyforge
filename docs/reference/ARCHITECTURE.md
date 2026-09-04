@@ -60,14 +60,14 @@ ______________________________________________________________________
 | `manyforge_deployment`                    | C++20            | ROS-free, non-real-time composable-cell artifact decoding, qualified schema normalization, staged graph content identity, and compiler substrate. It is not a Kernel dependency.                                            |
 | `manyforge_component_manager`             | C++20            | Durable Apply, active retained-graph reconciliation, runtime-unit convergence, and explicit shutdown. The I5 daemon is its sole process owner and publishes immutable snapshots.                                            |
 | `manyforge_headless`                      | C++20 + pybind11 | I5/H0 runtime/scene source aggregation, scene-initialization lifetime, Alarm Lifecycle Owner, asynchronous historian, verified NodeEnvironment projection, and Manager/scene publication adapters.                          |
-| `manyforge_headless_api`                  | Python/FastAPI   | Bounded public HTTP/CLI projection and attributed alarm/Manager/Program intents over the owners. It does not own runtime, Program-run, scene, alarm conditions, or robot readiness.                                         |
-| `manyforge_program_runner`                | Python/FastAPI   | Independently restartable Program orchestration owner: exact Applied capture, tree construction/ticking, bounded status/replay, and explicit Program Stop over focused owner clients.                                       |
+| `manyforge_headless_api`                  | Python/FastAPI   | Bounded REST/WebSocket projection and one transport-neutral, two-class execution-control ingress over the owners. It owns transport freshness and delivery, not runtime, Program, scene, alarm, or robot semantics.          |
+| `manyforge_program_runner`                | Python/FastAPI   | Independently restartable durable Program-cycle owner: exact Applied capture, tree construction/ticking, backend-owned Resetting/allowed commands, current-state idempotence, and explicit Program Stop/Reset orchestration.   |
 | `manyforge_core/python`                   | pybind11         | Bindings exposing the kernel to Python (poll-based; no C++→Python callbacks).                                                                                                                                               |
 | `manyforge_collision`                     | C++20            | Planner-neutral collision-world/query implementation behind ManyForge collision ports.                                                                                                                                      |
 | `manyforge_roboplan`                      | C++ + pybind11   | Primary planning/projection adapter (RRT + TOPP-RA), native execution, and native kernel composition.                                                                                                                       |
 | `manyforge_ros2_control_execution`        | C++20/ROS 2      | Controller execution adapter: FollowJointTrajectory, feedback/settling, bounded stop/reset, isolated ROS scene projection, and optional exact controller/lifecycle dispatch admission.                                      |
 | `manyforge_behavior`                      | Python           | Node catalog/environment plus Program validation, tree, admission, scheduling, and focused client mechanisms hosted by the independent runner; it does not own robot effects.                                               |
-| `manyforge_composer`                      | FastAPI + React  | Structural/operator shell, revision-fenced strict Program Draft/Saved authoring, thin runtime projections, and a thin assistant-bridge operator client. Runtime/catalog/provider authority remains outside Composer.        |
+| `manyforge_composer`                      | FastAPI + React  | Structural/operator shell, revision-fenced Program authoring, transparent control/viewer proxies, and backend-state presentation. It owns no execution lifecycle and performs no Program/control polling.                    |
 | `manyforge_ros` / `manyforge_ros_bringup` | C++/Python       | ROS utility and deployment wiring: simulator inspection, standard controller/gripper surfaces, readiness supervision, and real/sim bring-up.                                                                                |
 | `manyforge_assistant_bridge`              | Python           | Bounded direct/`nemoclaw` model mediation, strict active-mode enforcement, Draft/read callback routing, cancellation/reconciliation, conversation history, and redacted audit. It owns no runtime effects or catalog truth. |
 
@@ -606,6 +606,12 @@ The current generated contracts are:
   generated from the current FastAPI application.
 - [`HEADLESS_REST_API.md`](HEADLESS_REST_API.md) — the independent I5/H0
   Manager, runtime, scene, alarm, history, and health projection.
+
+The current versioned WebSocket contract is:
+
+- [`CONTROL_WEBSOCKET_V1.md`](CONTROL_WEBSOCKET_V1.md) — the common
+  backend-authoritative execution-control session, fixed heartbeat/freshness
+  profile, sequencing, backpressure, reconnect, and integration rules.
 
 The following files are pinned historical reimplementation inputs. Their
 product surfaces are unavailable on the current cutover branch; they are not

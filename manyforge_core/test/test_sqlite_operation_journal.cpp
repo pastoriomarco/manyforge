@@ -2,6 +2,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
@@ -113,24 +114,23 @@ class ScopedTemporaryDirectory final {
       ProgramRunId("run.1"),
       OperationCoordinationPolicy::kIndependent,
       OperationStateKind::kPrepared,
-      {OperationParticipantStateDTO{
-          OperationParticipantId(id.value() + ":participant:1"),
-          ControllerGoalId(id.value() + ":controller-goal:1"),
-          ControllerGoalGeneration(1U),
-          ControllableComponentId("robot.1"),
-          CommandTargetId("arm"),
-          CapabilityId("execution.trajectory.execute"),
-          ControlDomainId("domain.arm"),
-          ControlDomainRevision("domain-revision"),
-          ControlBindingId("binding.arm"),
-          ControlBindingRevision("binding-revision"),
-          std::nullopt,
-          std::nullopt,
-          OperationParticipantPayloadKind::kMotion,
-          OperationStateKind::kPrepared,
-          0.0,
-          {ResourceId("robot.joint1")},
-          std::nullopt}},
+      {OperationParticipantStateDTO{OperationParticipantId(id.value() + ":participant:1"),
+                                    ControllerGoalId(id.value() + ":controller-goal:1"),
+                                    ControllerGoalGeneration(1U),
+                                    ControllableComponentId("robot.1"),
+                                    CommandTargetId("arm"),
+                                    CapabilityId("execution.trajectory.execute"),
+                                    ControlDomainId("domain.arm"),
+                                    ControlDomainRevision("domain-revision"),
+                                    ControlBindingId("binding.arm"),
+                                    ControlBindingRevision("binding-revision"),
+                                    std::nullopt,
+                                    std::nullopt,
+                                    OperationParticipantPayloadKind::kMotion,
+                                    OperationStateKind::kPrepared,
+                                    0.0,
+                                    {ResourceId("robot.joint1")},
+                                    std::nullopt}},
       updated_at_ns,
       std::nullopt,
       std::nullopt,
@@ -436,27 +436,24 @@ TEST(SqliteOperationJournalTest,
   ASSERT_FALSE(missing.ok());
   EXPECT_EQ(missing.error().code, "operation_journal_record_invalid");
 
-  const std::vector<PreparedMotionDiagnosticsDTO> diagnostics{
-      PreparedMotionDiagnosticsDTO{
-          state.participants.front().participant_id,
-          Digest('1'),
-          MoveId("move.pick"),
-          {"joint1"},
-          TrajectoryValidationMetricsDTO{2.5, {0.4}, {1.2}, 0.15},
-          PreparedRuntimePolicyRefDTO{
-              RuntimePolicyCatalogRecordRefDTO{
-                  RuntimePolicyId("manyforge.runtime_motion.cell"),
-                  RuntimePolicyRevision(Digest('2').value()),
-                  SchemaId("manyforge.runtime_policy.v1"),
-                  SchemaRevision(Digest('3').value()),
-                  Digest('4'),
-                  ContentAddressedStoreKey("catalog/runtime-policy/cell/record")},
-              RuntimeMotionSpeedLimitDTO{
-                  RuntimePolicyCommandTargetScopeDTO{ControllableComponentId("robot.1"),
-                                                     CommandTargetId("arm")},
-                  0.15}}}};
-  const auto recorded = journal.RecordOperationState(
-      epoch, state, nullptr, "subordinate_motion_prepared", diagnostics);
+  const std::vector<PreparedMotionDiagnosticsDTO> diagnostics{PreparedMotionDiagnosticsDTO{
+      state.participants.front().participant_id,
+      Digest('1'),
+      MoveId("move.pick"),
+      {"joint1"},
+      TrajectoryValidationMetricsDTO{2.5, {0.4}, {1.2}, 0.15},
+      PreparedRuntimePolicyRefDTO{
+          RuntimePolicyCatalogRecordRefDTO{
+              RuntimePolicyId("manyforge.runtime_motion.cell"),
+              RuntimePolicyRevision(Digest('2').value()), SchemaId("manyforge.runtime_policy.v1"),
+              SchemaRevision(Digest('3').value()), Digest('4'),
+              ContentAddressedStoreKey("catalog/runtime-policy/cell/record")},
+          RuntimeMotionSpeedLimitDTO{
+              RuntimePolicyCommandTargetScopeDTO{ControllableComponentId("robot.1"),
+                                                 CommandTargetId("arm")},
+              0.15}}}};
+  const auto recorded = journal.RecordOperationState(epoch, state, nullptr,
+                                                     "subordinate_motion_prepared", diagnostics);
   ASSERT_TRUE(recorded.ok()) << recorded.error().message;
 
   auto observed = state;
@@ -465,10 +462,8 @@ TEST(SqliteOperationJournalTest,
   observed.participants.front().state = OperationStateKind::kExecuting;
   observed.participants.front().progress = 0.25;
   observed.updated_at_ns = 11;
-  ASSERT_TRUE(journal
-                  .RecordOperationState(epoch, observed, nullptr,
-                                        "subordinate_state_observed")
-                  .ok());
+  ASSERT_TRUE(
+      journal.RecordOperationState(epoch, observed, nullptr, "subordinate_state_observed").ok());
 
   const auto page = journal.ReadEvents(epoch, 0U, kMaximumOperationJournalEventPage);
   ASSERT_TRUE(page.ok()) << page.error().message;
@@ -479,8 +474,7 @@ TEST(SqliteOperationJournalTest,
   EXPECT_NE(payload.find("\"move_id\":\"move.pick\""), std::string::npos);
   EXPECT_NE(payload.find("\"trajectory_duration_s\":2.5"), std::string::npos);
   EXPECT_NE(payload.find("\"peak_abs_joint_velocity_rad_s\":[0.4]"), std::string::npos);
-  EXPECT_NE(payload.find("\"peak_abs_joint_acceleration_rad_s2\":[1.2]"),
-            std::string::npos);
+  EXPECT_NE(payload.find("\"peak_abs_joint_acceleration_rad_s2\":[1.2]"), std::string::npos);
   EXPECT_NE(payload.find("\"peak_tcp_linear_speed_mps\":0.15"), std::string::npos);
   EXPECT_NE(payload.find("\"runtime_policy_id\":\"manyforge.runtime_motion.cell\""),
             std::string::npos);
@@ -498,8 +492,7 @@ TEST(SqliteOperationJournalTest,
   ASSERT_TRUE(reopened.ok()) << reopened.error().message;
   ASSERT_EQ(reopened.value().events.size(), 2U);
   EXPECT_EQ(reopened.value().events.front().record_kind, "operation_prepared");
-  EXPECT_NE(reopened.value().events.front().payload_json.find(
-                "\"prepared_motion_diagnostics\":[{"),
+  EXPECT_NE(reopened.value().events.front().payload_json.find("\"prepared_motion_diagnostics\":[{"),
             std::string::npos);
 }
 
@@ -747,8 +740,7 @@ TEST(SqliteOperationJournalTest,
                       [](const auto& event) { return event.record_kind == "stop_fault_cleared"; }),
         1);
     const auto operational_events =
-        journal.ReadOperationalEvents(epoch, first.value() - 1U,
-                                      kMaximumOperationJournalEventPage);
+        journal.ReadOperationalEvents(epoch, first.value() - 1U, kMaximumOperationJournalEventPage);
     ASSERT_TRUE(operational_events.ok()) << operational_events.error().message;
     ASSERT_EQ(operational_events.value().events.size(), 1U);
     EXPECT_EQ(operational_events.value().events.front().sequence, first.value());
@@ -1514,6 +1506,142 @@ TEST(SqliteOperationJournalTest, RequestCapacityAndFilesystemIdentityFailClosedB
   ASSERT_TRUE(std::filesystem::is_symlink(symlink));
   EXPECT_THROW(SqliteOperationJournal(symlink, cell_id, 4U), std::runtime_error);
   EXPECT_THROW(SqliteOperationJournal(database, CellId("another-cell"), 4U), std::runtime_error);
+}
+
+TEST(SqliteOperationJournalTest,
+     ResolvedStateConditionedOperationsRotateWithoutOwnerRestartOrCommandCountExhaustion) {
+  ScopedTemporaryDirectory temporary;
+  const auto database = temporary.path() / std::string(kOperationJournalFilename);
+  const CellId cell_id("cell.1");
+  const RequestOwnerEpoch epoch("execution-host.epoch.bounded-lifetime");
+  const std::vector<ResourceId> inventory{ResourceId("robot.gripper")};
+
+  {
+    SqliteOperationJournal journal(database, cell_id, 2U);
+    ASSERT_TRUE(journal.BeginOwnerEpoch(epoch, 1, 2U, inventory).ok());
+    for (std::uint64_t cycle = 1U; cycle <= 8U; ++cycle) {
+      const auto operation_id =
+          "operation:execution-host.epoch.bounded-lifetime:" + std::to_string(cycle);
+      auto state = OperationState(operation_id, OperationStateKind::kExecuting,
+                                  static_cast<std::int64_t>(cycle * 10U));
+      const std::array resident{state.operation_id};
+      const auto intent =
+          CommandIntent("request.bounded-lifetime." + std::to_string(cycle), epoch.value());
+      const auto accepted = journal.RecordOperationAccepted(
+          epoch, intent, Acceptance(intent, state), state, resident);
+      ASSERT_TRUE(accepted.ok()) << "cycle " << cycle << ": " << accepted.error().message;
+
+      for (std::uint64_t update = 1U; update <= 4U; ++update) {
+        const OperationControlRequestDTO request{
+            PublicRequestContextDTO{RequestId("request.bounded-lifetime.control." +
+                                              std::to_string(cycle) + "." + std::to_string(update)),
+                                    epoch, "journal-test", std::nullopt},
+            state.operation_id, state.operation_revision, std::nullopt};
+        const auto prior_revision = state.operation_revision;
+        const bool pause = update % 2U == 1U;
+        state.operation_revision = OperationRevision(state.operation_revision.value() + 1U);
+        state.state = pause ? OperationStateKind::kPaused : OperationStateKind::kExecuting;
+        state.participants.front().state = state.state;
+        ++state.updated_at_ns;
+        const OperationControlAcceptedDTO control{
+            request.request_context.request_id,
+            RequestReplayStatusDTO::kAcceptedNew,
+            state.operation_id,
+            prior_revision,
+            pause ? OperationControlKind::kPause : OperationControlKind::kResume,
+            state.operation_revision,
+            state.updated_at_ns};
+        const auto controlled = journal.RecordControlAccepted(epoch, request, control, state);
+        ASSERT_TRUE(controlled.ok())
+            << "cycle " << cycle << ", update " << update << ": " << controlled.error().message;
+      }
+
+      state.state = OperationStateKind::kCompleted;
+      state.participants.front().state = OperationStateKind::kCompleted;
+      state.participants.front().progress = 1.0;
+      ++state.updated_at_ns;
+      const auto completed =
+          journal.RecordOperationState(epoch, state, nullptr, "subordinate_completed");
+      ASSERT_TRUE(completed.ok()) << "cycle " << cycle << ": " << completed.error().message;
+    }
+    ASSERT_TRUE(journal.CloseOwnerEpoch(epoch, 100).ok());
+  }
+
+  SqliteOperationJournal replacement(database, cell_id, 2U);
+  const auto recovered = replacement.BeginOwnerEpoch(
+      RequestOwnerEpoch("execution-host.epoch.bounded-lifetime.replacement"), 200, 2U, inventory);
+  ASSERT_TRUE(recovered.ok()) << recovered.error().message;
+  ASSERT_EQ(recovered.value().historical_operations.size(), 2U);
+  EXPECT_TRUE(std::all_of(recovered.value().historical_operations.begin(),
+                          recovered.value().historical_operations.end(),
+                          [](const OperationStateDTO& state) {
+                            return state.state == OperationStateKind::kCompleted;
+                          }));
+  EXPECT_TRUE(recovered.value().unreconciled_resources.empty());
+}
+
+TEST(SqliteOperationJournalTest,
+     ActiveOperationControlUpdatesConsumeOneDurableAdmissionSlot) {
+  ScopedTemporaryDirectory temporary;
+  const auto database = temporary.path() / std::string(kOperationJournalFilename);
+  const CellId cell_id("cell.1");
+  const RequestOwnerEpoch epoch("execution-host.epoch.concurrent-capacity");
+  const std::vector<ResourceId> inventory{ResourceId("robot.arm"), ResourceId("robot.gripper")};
+  SqliteOperationJournal journal(database, cell_id, 2U);
+  ASSERT_TRUE(journal.BeginOwnerEpoch(epoch, 1, 2U, inventory).ok());
+
+  auto first = OperationState("operation:execution-host.epoch.concurrent-capacity:1",
+                              OperationStateKind::kExecuting, 10);
+  const std::array first_resident{first.operation_id};
+  const auto first_intent = CommandIntent("request.concurrent.first", epoch.value());
+  ASSERT_TRUE(journal
+                  .RecordOperationAccepted(epoch, first_intent,
+                                           Acceptance(first_intent, first), first,
+                                           first_resident)
+                  .ok());
+
+  for (std::uint64_t update = 1U; update <= 4U; ++update) {
+    const OperationControlRequestDTO request{
+        PublicRequestContextDTO{
+            RequestId("request.concurrent.first.control." + std::to_string(update)), epoch,
+            "journal-test", std::nullopt},
+        first.operation_id, first.operation_revision, std::nullopt};
+    const auto prior_revision = first.operation_revision;
+    const bool pause = update % 2U == 1U;
+    first.operation_revision = OperationRevision(first.operation_revision.value() + 1U);
+    first.state = pause ? OperationStateKind::kPaused : OperationStateKind::kExecuting;
+    first.participants.front().state = first.state;
+    ++first.updated_at_ns;
+    const OperationControlAcceptedDTO accepted{
+        request.request_context.request_id,
+        RequestReplayStatusDTO::kAcceptedNew,
+        first.operation_id,
+        prior_revision,
+        pause ? OperationControlKind::kPause : OperationControlKind::kResume,
+        first.operation_revision,
+        first.updated_at_ns};
+    ASSERT_TRUE(journal.RecordControlAccepted(epoch, request, accepted, first).ok());
+  }
+
+  auto second = OperationState("operation:execution-host.epoch.concurrent-capacity:2",
+                               OperationStateKind::kExecuting, 20);
+  const std::array both_resident{first.operation_id, second.operation_id};
+  const auto second_intent = CommandIntent("request.concurrent.second", epoch.value());
+  const auto second_accepted = journal.RecordOperationAccepted(
+      epoch, second_intent, Acceptance(second_intent, second), second, both_resident);
+  ASSERT_TRUE(second_accepted.ok()) << second_accepted.error().message;
+
+  first.state = OperationStateKind::kCompleted;
+  first.participants.front().state = OperationStateKind::kCompleted;
+  first.participants.front().progress = 1.0;
+  ++first.updated_at_ns;
+  ASSERT_TRUE(journal.RecordOperationState(epoch, first, nullptr, "subordinate_completed").ok());
+  second.state = OperationStateKind::kCompleted;
+  second.participants.front().state = OperationStateKind::kCompleted;
+  second.participants.front().progress = 1.0;
+  ++second.updated_at_ns;
+  ASSERT_TRUE(journal.RecordOperationState(epoch, second, nullptr, "subordinate_completed").ok());
+  ASSERT_TRUE(journal.CloseOwnerEpoch(epoch, 100).ok());
 }
 
 }  // namespace

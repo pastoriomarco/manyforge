@@ -21,6 +21,7 @@ from manyforge_behavior.executable_node_resolver import (
     build_executable_node_resolver,
 )
 from manyforge_behavior.orchestration_ports import (
+    PROGRAM_MOTION_STOP_RECOVERY_CLASSES,
     NodeAdapterPorts,
     OwnerTaskState,
     ProgramRunPortContext,
@@ -602,7 +603,8 @@ class ProgramRunOwner:
             task.task_id != intervention.owner_task_id
             or task.state is not OwnerTaskState.INTERRUPTED
             or not isinstance(assessment, Mapping)
-            or assessment.get("recovery_class") != "ordinary_operator_stop"
+            or assessment.get("recovery_class")
+            not in PROGRAM_MOTION_STOP_RECOVERY_CLASSES
         ):
             return
         port = self._ports.program_interventions
@@ -1436,6 +1438,39 @@ class ProgramRunOwner:
             self._reset_scope_effects(program_run_id)
             with self._lock:
                 return self._snapshot(self._entry(program_run_id))
+
+    def forget_reset_run(self, program_run_id: str) -> None:
+        """Drop one quiescent resident tree after durable Program Reset.
+
+        Durable history belongs to Program Runner's cycle journal.  Keeping the
+        executable tree here after its Kernel scope has been reset would turn
+        a concurrent-run bound into a process-lifetime command-count limit.
+        """
+
+        _text(program_run_id, field="program_run_id")
+        with self._lock:
+            entry = self._runs.get(program_run_id)
+            if entry is None:
+                return
+            transition_lock = entry.transition_lock
+        with transition_lock:
+            with self._lock:
+                entry = self._runs.get(program_run_id)
+                if entry is None:
+                    return
+                if entry.state not in {
+                    ProgramRunState.STOPPED,
+                    ProgramRunState.SUCCEEDED,
+                    ProgramRunState.FAILED,
+                }:
+                    raise ProgramRunOwnerError(
+                        "only a terminal Program run can be forgotten"
+                    )
+                if not entry.resources_released:
+                    raise ProgramRunOwnerError(
+                        "Program-run resources are not released"
+                    )
+                self._runs.pop(program_run_id)
 
     def reconcile_stop(self, program_run_id: str) -> ProgramRunSnapshot:
         with self._lock:

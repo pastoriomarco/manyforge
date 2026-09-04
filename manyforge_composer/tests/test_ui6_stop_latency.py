@@ -67,8 +67,8 @@ def test_pressure_interference_is_bounded_only_on_stop_handoff() -> None:
 
 def test_frozen_absolute_budgets_reject_old_composer_tail() -> None:
     samples = [_sample(1.0) for _ in range(100)]
-    samples[98]["composerIngressToKernelAcceptanceMs"] = 466.8
-    samples[99]["composerIngressToKernelAcceptanceMs"] = 466.8
+    samples[98]["controlIngressToKernelAcceptanceMs"] = 466.8
+    samples[99]["controlIngressToKernelAcceptanceMs"] = 466.8
     summary = ui6_stop._summarize(samples)
 
     with pytest.raises(ui6_stop.CollectorError, match="exceeded 100.0 ms"):

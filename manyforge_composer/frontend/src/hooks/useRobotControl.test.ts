@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import type { RuntimeScaleControlStatus } from '../types/robotControl';
 import {
+  acceptedRuntimeScaleStatus,
   mergeRuntimeScaleStatus,
   runtimeScaleControlScopeFence,
   runtimeScaleFlushDelay,
@@ -45,7 +46,7 @@ describe('persistent runtime-scale transport cadence', () => {
     expect(runtimeScaleFlushDelay(10, 0, true, true)).toBeNull();
   });
 
-  it('invalidates pending input on owner, binding, or control-configuration change', () => {
+  it('invalidates pending input only when its stable owner or scaling scope changes', () => {
     const initial = runtimeScaleControlScopeFence('owner-1', status);
     expect(runtimeScaleControlScopeFence('owner-2', status)).not.toBe(initial);
     expect(runtimeScaleControlScopeFence('owner-1', {
@@ -54,8 +55,57 @@ describe('persistent runtime-scale transport cadence', () => {
     })).not.toBe(initial);
     expect(runtimeScaleControlScopeFence('owner-1', {
       ...status,
-      activeControlConfigurationGeneration: 8,
+      scalingDomainId: 'scaling-domain-2',
     })).not.toBe(initial);
+  });
+
+  it('keeps queued input across ordinary scale acceptance revisions', () => {
+    const initial = runtimeScaleControlScopeFence('owner-1', status);
+    expect(runtimeScaleControlScopeFence('owner-1', {
+      ...status,
+      controlGeneration: 4,
+      requestedScale: 0.25,
+      activeControlConfigurationId: 'configuration-2',
+      activeControlConfigurationGeneration: 8,
+      activeOperationScaleGeneration: 4,
+      effectiveScale: 0.25,
+      applicationState: 'applied',
+    })).toBe(initial);
+  });
+
+  it('uses an exact owner acceptance to fence the next scale update', () => {
+    const accepted = acceptedRuntimeScaleStatus(status, {
+      requestId: 'scale-request-1',
+      selector: status.selector,
+      requestedScale: 0.25,
+      controlGeneration: 4,
+      activeOperationId: 'operation-1',
+      activeOperationRevision: 8,
+      activeOperationScaleGeneration: 2,
+    }, 'scale-request-1', 0.25);
+    expect(accepted).toMatchObject({
+      controlGeneration: 4,
+      requestedScale: 0.25,
+      activeOperationId: 'operation-1',
+    });
+    expect(() => acceptedRuntimeScaleStatus(status, {
+      requestId: 'scale-request-2',
+      selector: status.selector,
+      requestedScale: 0.25,
+      controlGeneration: 4,
+      activeOperationId: null,
+      activeOperationRevision: null,
+      activeOperationScaleGeneration: null,
+    }, 'scale-request-1', 0.25)).toThrow(/does not match/);
+    expect(() => acceptedRuntimeScaleStatus(status, {
+      requestId: 'scale-request-1',
+      selector: status.selector,
+      requestedScale: 0.4,
+      controlGeneration: 4,
+      activeOperationId: null,
+      activeOperationRevision: null,
+      activeOperationScaleGeneration: null,
+    }, 'scale-request-1', 0.25)).toThrow(/does not match/);
   });
 
   it('rejects a delayed projection older than the accepted owner generation', () => {

@@ -10,7 +10,7 @@ import threading
 import time
 from contextlib import AbstractContextManager
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 import unicodedata
 
 import rfc8785
@@ -479,16 +479,24 @@ class ExecutionObservationSession(AbstractContextManager["ExecutionObservationSe
 
 
 def _sparse_request_with_complete_context(request: Any) -> dict[str, Any]:
-    """Keep optional request fields sparse without weakening context shape.
+    """Project the public request context accepted by the native owner.
 
     Stop selectors deliberately omit unused selector kinds and an absent
-    reason, while the native public-request decoder requires all four context
-    fields (including a null correlation identity).  A model-wide
-    ``exclude_none`` incorrectly removed that required nested field.
+    reason.  Session/client sequence is Program-cycle audit metadata and is
+    consumed before this native boundary; the native request context remains
+    the closed four-field DTO, including a nullable correlation identity.
     """
 
     payload = request.model_dump(mode="json", exclude_none=True)
-    payload["request_context"] = request.request_context.model_dump(mode="json")
+    payload["request_context"] = request.request_context.model_dump(
+        mode="json",
+        include={
+            "request_id",
+            "request_owner_epoch",
+            "source_label",
+            "correlation_id",
+        },
+    )
     return payload
 
 
@@ -1952,6 +1960,23 @@ class ExecutionEventPump:
         self._thread: threading.Thread | None = None
         self._last_error: str | None = None
         self._health_lock = threading.Lock()
+        self._change_observer: Callable[[], None] | None = None
+
+    def set_change_observer(self, observer: Callable[[], None] | None) -> None:
+        if observer is not None and not callable(observer):
+            raise TypeError("execution event change observer must be callable")
+        self._change_observer = observer
+
+    def _notify_change(self) -> None:
+        observer = self._change_observer
+        if observer is None:
+            return
+        try:
+            observer()
+        except Exception:
+            # Diagnostics must not backpressure event ingestion. The next
+            # source revision or reconnect repairs a missed presentation wake.
+            pass
 
     @property
     def last_error(self) -> str | None:
@@ -1977,8 +2002,9 @@ class ExecutionEventPump:
                 raise RuntimeError("operation event pump did not stop in time")
         self._thread = None
 
-    def _record_error(self, error: Exception | None) -> None:
+    def _record_error(self, error: Exception | None) -> bool:
         with self._health_lock:
+            previous = self._last_error
             if error is None:
                 self._last_error = None
             else:
@@ -1987,6 +2013,7 @@ class ExecutionEventPump:
                 if isinstance(code, str) and code:
                     prefix += f"{code}: "
                 self._last_error = prefix + str(error)
+            return previous != self._last_error
 
     @staticmethod
     def _idle_owner_epoch(response: dict[str, Any]) -> str | None:
@@ -2018,11 +2045,14 @@ class ExecutionEventPump:
         source_high_water = 0
         condition_cursor: tuple[str, int] | None = None
         next_condition_poll_at = 0.0
+        current_condition_json: str | None = None
+        last_completed_identity: tuple[str, int, str | None, str] | None = None
 
         def condition_snapshot_kwargs(
             source_owner_epoch: str, through_source_sequence: int
         ) -> dict[str, str]:
-            nonlocal condition_cursor, next_condition_poll_at
+            nonlocal condition_cursor, current_condition_json
+            nonlocal next_condition_poll_at
             now = time.monotonic()
             cursor = (source_owner_epoch, through_source_sequence)
             if cursor == condition_cursor and now < next_condition_poll_at:
@@ -2034,9 +2064,24 @@ class ExecutionEventPump:
             latch = offer["latch"] if isinstance(offer, dict) else None
             condition_cursor = cursor
             next_condition_poll_at = now + self._condition_poll_seconds
-            return {
-                "current_stop_fault_json": _canonical_json(latch).decode("utf-8")
-            }
+            current_condition_json = _canonical_json(latch).decode("utf-8")
+            return {"current_stop_fault_json": current_condition_json}
+
+        def publish_if_changed(
+            source_owner_epoch: str,
+            through_source_sequence: int,
+            source_mode: str,
+        ) -> None:
+            nonlocal last_completed_identity
+            identity = (
+                source_owner_epoch,
+                through_source_sequence,
+                current_condition_json,
+                source_mode,
+            )
+            if identity != last_completed_identity:
+                last_completed_identity = identity
+                self._notify_change()
 
         while not self._stop.is_set():
             try:
@@ -2056,7 +2101,11 @@ class ExecutionEventPump:
                                 idle_epoch, source_high_water
                             ),
                         )
-                        self._record_error(None)
+                        publish_if_changed(
+                            idle_epoch, source_high_water, "idle"
+                        )
+                        if self._record_error(None):
+                            self._notify_change()
                         self._stop.wait(self._poll_seconds)
                         continue
                     status = identity_response.get("identity")
@@ -2082,6 +2131,7 @@ class ExecutionEventPump:
                     after_sequence,
                     limit=self._page_limit,
                 )
+                page_had_events = bool(page["events"])
                 for event in page["events"]:
                     self._core.ingest_operation_event(
                         source_owner_epoch=owner_epoch,
@@ -2109,21 +2159,30 @@ class ExecutionEventPump:
                         through_source_sequence=after_sequence,
                         **condition_snapshot_kwargs(owner_epoch, after_sequence),
                     )
-                    self._record_error(None)
+                    publish_if_changed(owner_epoch, after_sequence, "active")
+                    if self._record_error(None):
+                        self._notify_change()
                     self._stop.wait(self._poll_seconds)
+                elif page_had_events:
+                    # One wake per bounded page; downstream state slots retain
+                    # only the newest value while a larger page set drains.
+                    self._notify_change()
             except Exception as error:
                 if owner_epoch is not None:
                     try:
-                        self._core.mark_operation_event_source_unknown(
+                        quality = self._core.mark_operation_event_source_unknown(
                             source_owner_epoch=owner_epoch,
                         )
+                        if quality.get("status") == "marked_unknown":
+                            self._notify_change()
                     except Exception as quality_error:
                         error = RuntimeError(
                             f"{type(error).__name__}: {error}; "
                             "operation source-quality update failed: "
                             f"{type(quality_error).__name__}: {quality_error}"
                         )
-                self._record_error(error)
+                if self._record_error(error):
+                    self._notify_change()
                 owner_epoch = None
                 after_sequence = source_high_water
                 self._stop.wait(self._poll_seconds)

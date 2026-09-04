@@ -16,6 +16,7 @@ from manyforge_headless_api.models import (
     PickSequencePlanningRequest,
     PlaceSequencePlanningRequest,
     ProgramRunStopIntentRequest,
+    StopFaultRecoveryIntentRequest,
     StopIntentRequest,
 )
 from manyforge_headless_api.native import HeadlessApiError
@@ -110,6 +111,11 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
     def stop_program_run(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return super().stop_program_run(
             self._request(ProgramRunStopIntentRequest, body)
+        )
+
+    def recover_stop_fault(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return super().recover_stop_fault(
+            self._request(StopFaultRecoveryIntentRequest, body)
         )
 
     def _pick_place(

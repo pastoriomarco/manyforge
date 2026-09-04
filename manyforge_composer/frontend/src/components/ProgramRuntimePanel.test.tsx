@@ -89,6 +89,7 @@ function robotController(): RobotControlController {
     resume: vi.fn(),
     stop: vi.fn(),
     setRuntimeScale: vi.fn(),
+    commitRuntimeScale: vi.fn(),
   } as unknown as RobotControlController;
 }
 
@@ -98,6 +99,7 @@ function controller(
     state === 'succeeded' ? 'terminal_awaiting_reset' : 'running',
 ): ProgramRuntimeController {
   return {
+    commandAllowed: vi.fn(() => true),
     state: {
       catalog: null,
       currentScenario: null,
@@ -197,6 +199,7 @@ function controller(
       loading: false,
       observationError: null,
       pending: null,
+      pendingDeliveryConfirmed: false,
       controlPending: null,
       error: null,
     },
@@ -365,7 +368,7 @@ describe('Program runtime projection', () => {
       <ProgramTransportControls enabled program={starting} robot={robotController()} />,
     );
     expect(startingMarkup).toMatch(
-      /class="transport-run"[^>]*disabled=""[^>]*>Starting<\/button>/,
+      /class="transport-run"[^>]*disabled=""[^>]*>Sending Run<\/button>/,
     );
 
     const running = controller('running');
@@ -381,7 +384,7 @@ describe('Program runtime projection', () => {
       <ProgramTransportControls enabled program={running} robot={robotController()} />,
     );
     expect(stoppingMarkup).toMatch(
-      /class="danger-button transport-stop-primary"[^>]*disabled=""[^>]*>Stopping<\/button>/,
+      /class="danger-button transport-stop-primary"[^>]*disabled=""[^>]*>Sending Stop<\/button>/,
     );
     expect(stoppingMarkup).toMatch(
       /class="transport-run"[^>]*disabled=""[^>]*>Running<\/button>/,
@@ -424,6 +427,39 @@ describe('Program runtime projection', () => {
 
     expect(markup).toMatch(/type="range"[^>]*value="0.5"/);
     expect(markup).not.toMatch(/type="range"[^>]*disabled=/);
+  });
+
+  it('does not delay Run while a coalesced velocity update is pending', () => {
+    const idle = controller('succeeded', 'idle_after_reset');
+    const robot = robotController();
+    robot.runtimeScalePending = true;
+
+    const markup = renderToStaticMarkup(
+      <ProgramTransportControls enabled program={idle} robot={robot} />,
+    );
+
+    expect(markup).toContain('class="transport-run"');
+    expect(markup).not.toMatch(
+      /class="transport-run"[^>]*disabled=""[^>]*>Run<\/button>/,
+    );
+  });
+
+  it('keeps Stop available while Program Run is still starting', () => {
+    const starting = controller('succeeded', 'starting');
+    starting.state.run = null;
+    starting.state.pending = 'run';
+
+    const markup = renderToStaticMarkup(
+      <ProgramTransportControls
+        enabled
+        program={starting}
+        robot={robotController()}
+      />,
+    );
+
+    expect(markup).toMatch(
+      /class="danger-button transport-stop-primary"(?![^>]*disabled)[^>]*>Stop<\/button>/,
+    );
   });
 
   it('keeps fixed transport geometry and lets the Full Stop menu escape the bar', () => {

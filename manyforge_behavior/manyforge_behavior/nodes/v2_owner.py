@@ -8,6 +8,7 @@ from typing import Any
 import py_trees
 
 from manyforge_behavior.orchestration_ports import (
+    PROGRAM_MOTION_STOP_RECOVERY_CLASSES,
     NodeAttemptIdentity,
     NodeAttemptSource,
     OwnerInvocationPort,
@@ -192,7 +193,8 @@ class OwnerTaskAdapter(_OwnerAdapter):
         operator_stop = (
             task.state is OwnerTaskState.INTERRUPTED
             and isinstance(assessment, Mapping)
-            and assessment.get("recovery_class") == "ordinary_operator_stop"
+            and assessment.get("recovery_class")
+            in PROGRAM_MOTION_STOP_RECOVERY_CLASSES
         )
         if operator_stop and self._operator_stop_state is not None:
             if not self._operator_stop_state.hold(
@@ -423,7 +425,8 @@ class OwnerTaskAdapter(_OwnerAdapter):
         if (
             task.state is OwnerTaskState.INTERRUPTED
             and isinstance(assessment, Mapping)
-            and assessment.get("recovery_class") == "ordinary_operator_stop"
+            and assessment.get("recovery_class")
+            in PROGRAM_MOTION_STOP_RECOVERY_CLASSES
         ):
             return "held"
         if task.state is OwnerTaskState.SUCCEEDED:

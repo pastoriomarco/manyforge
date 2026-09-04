@@ -990,6 +990,69 @@ Result<CellAdmissionRecoveryReceiptDTO> KernelCellAdmissionOwner::GetCellAdmissi
   return Result<CellAdmissionRecoveryReceiptDTO>::Ok(std::move(receipt));
 }
 
+Result<void> KernelCellAdmissionOwner::ValidateProgramResetSceneAuthorization(
+    const ProgramResetSceneAuthorizationDTO& authorization) const {
+  const auto valid =
+      manyforge::core::ValidateProgramResetSceneAuthorization(authorization);
+  if (!valid.ok()) {
+    return Result<void>::Err(valid.error());
+  }
+  std::lock_guard lock(mutex_);
+  if (!readiness_.program_cycle_status_current ||
+      !readiness_.program_cycle_status.has_value()) {
+    return AuthoringNotReady<void>(generation_,
+                                   "program_reset_status_not_current");
+  }
+  const auto& status = *readiness_.program_cycle_status;
+  if (status.state != ProgramCycleStateDTO::kResetting ||
+      status.program_runner_owner_epoch !=
+          authorization.program_runner_owner_epoch ||
+      status.program_run_id !=
+          std::optional<ProgramRunId>{authorization.program_run_id} ||
+      status.cycle_claim_generation !=
+          std::optional<CellAdmissionClaimGeneration>{
+              authorization.cycle_claim_generation} ||
+      status.terminal_or_settlement_reference !=
+          std::optional<ContentDigest>{
+              authorization.terminal_or_settlement_reference}) {
+    return AuthoringNotReady<void>(generation_,
+                                   "program_reset_status_mismatch");
+  }
+  const auto entry = std::find_if(entries_.begin(), entries_.end(),
+                                  [&](const auto& candidate) {
+    return candidate.claim.claim_generation ==
+           authorization.cycle_claim_generation;
+  });
+  if (entry == entries_.end() || entry->release.has_value() ||
+      entry->claim.intent.claim_kind !=
+          CellAdmissionClaimKindDTO::kProgramCycle ||
+      entry->claim.intent.owner_role !=
+          CellAdmissionOwnerRoleDTO::kProgramRunner ||
+      entry->claim.intent.owner_transaction_id !=
+          authorization.program_run_id.value()) {
+    return AuthoringNotReady<void>(generation_,
+                                   "program_reset_claim_not_exact");
+  }
+  const bool held_by_current_owner =
+      !entry->reconcile_settlement.has_value() &&
+      entry->claim.intent.owner_epoch ==
+          authorization.program_runner_owner_epoch;
+  const bool reconciled_to_current_owner =
+      entry->reconcile_settlement.has_value() &&
+      entry->reconcile_settlement->predecessor_claim == entry->claim &&
+      entry->reconcile_settlement->successor_owner_role ==
+          CellAdmissionOwnerRoleDTO::kProgramRunner &&
+      entry->reconcile_settlement->successor_owner_epoch ==
+          authorization.program_runner_owner_epoch &&
+      entry->reconcile_settlement->settlement_predicate ==
+          CellAdmissionSettlementKindDTO::kReconciled;
+  if (!held_by_current_owner && !reconciled_to_current_owner) {
+    return AuthoringNotReady<void>(generation_,
+                                   "program_reset_claim_not_current");
+  }
+  return Result<void>::Ok();
+}
+
 bool KernelCellAdmissionOwner::has_unresolved_claims() const {
   std::lock_guard lock(mutex_);
   return held_claim_count_ != 0U;

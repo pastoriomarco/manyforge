@@ -29,6 +29,13 @@ class IKernelCellAdmissionPort {
   [[nodiscard]] virtual Result<CellAdmissionRecoveryReceiptDTO>
   GetCellAdmissionRecoveryReceipt(
       const CellAdmissionRecoveryReceiptQueryDTO& query) const = 0;
+  [[nodiscard]] virtual Result<void> ValidateProgramResetSceneAuthorization(
+      const ProgramResetSceneAuthorizationDTO& authorization) const {
+    static_cast<void>(authorization);
+    return Result<void>::Err(
+        ErrorDTO{"authoring_not_ready",
+                 "Program Reset scene authorization is unsupported", {}});
+  }
 };
 
 }  // namespace manyforge::core

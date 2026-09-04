@@ -117,7 +117,9 @@ core::ProgramCycleStateDTO CycleState(std::string_view v) {
                  core::ProgramCycleStateDTO::kRunning,
                  core::ProgramCycleStateDTO::kStopping,
                  core::ProgramCycleStateDTO::kTerminalAwaitingReset,
-                 core::ProgramCycleStateDTO::kInterventionOrRecovery})
+                 core::ProgramCycleStateDTO::kInterventionOrRecovery,
+                 core::ProgramCycleStateDTO::kResetting,
+                 core::ProgramCycleStateDTO::kRecoveryRequired})
     if (core::to_string(x) == v)
       return x;
   Fail("unknown cell-admission program-cycle state");

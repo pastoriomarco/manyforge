@@ -1301,12 +1301,19 @@ function MeasuredRuntimeLink({
   ) => void;
   onAssetError: (error: Error) => void;
 }) {
+  const [bootstrapTransform] = useState(() => ({
+    position: [...initialTransform.position_m] as Vector3Tuple,
+    quaternion: normalizeQuaternion(initialTransform.orientation_xyzw),
+  }));
+  // The slower shell pose is mount-only bootstrap. Once mounted, the credited
+  // observation driver is the sole writer of measured link transforms;
+  // unrelated React commits must never restore an older pose.
   return (
     <group
       ref={groupRef}
       name={`measured:${link.name}`}
-      position={initialTransform.position_m}
-      quaternion={normalizeQuaternion(initialTransform.orientation_xyzw)}
+      position={bootstrapTransform.position}
+      quaternion={bootstrapTransform.quaternion}
       onClick={(event) => onSelect(event, link.name)}
     >
       <group>

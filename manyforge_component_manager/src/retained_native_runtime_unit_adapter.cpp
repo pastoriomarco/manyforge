@@ -2230,6 +2230,16 @@ RetainedNativeRuntimeUnitAdapter::GetCellAdmissionRecoveryReceipt(
       {"cell_admission_recovery_receipt", query});
 }
 
+manyforge::core::Result<void>
+RetainedNativeRuntimeUnitAdapter::ValidateProgramResetSceneAuthorization(
+    const manyforge::core::ProgramResetSceneAuthorizationDTO
+        &authorization) const {
+  const auto result = impl_->KernelCellAdmissionCall<std::monostate>(
+      {"cell_admission_validate_program_reset_scene", authorization});
+  return result.ok() ? manyforge::core::Result<void>::Ok()
+                     : manyforge::core::Result<void>::Err(result.error());
+}
+
 manyforge::core::Result<
     std::shared_ptr<manyforge::core::IPlannerSceneProjection>>
 RetainedNativeRuntimeUnitAdapter::ResolveProjection(

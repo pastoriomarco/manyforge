@@ -52,6 +52,7 @@ STATIC_WINDOW_SECONDS = 2.0
 FROZEN_LEASE_SECONDS = 45.0
 FROZEN_WINDOW_SECONDS = 55.0
 POLL_SECONDS = 0.05
+STOP_CONTROL_SCALE = 0.01
 
 
 def _progress(label: str) -> None:
@@ -101,6 +102,42 @@ def _viewer_status(composer_backend_url: str) -> dict[str, Any]:
     ):
         raise CollectorError("viewer source status is malformed")
     return value
+
+
+def _wait_runtime_scale(
+    composer_backend_url: str,
+    requested_scale: float,
+    *,
+    timeout_s: float = DEFAULT_TIMEOUT_S,
+) -> dict[str, Any]:
+    """Wait for the owner setting, not the slider's optimistic local value."""
+
+    deadline = time.monotonic() + timeout_s
+    current: dict[str, Any] = {}
+    while True:
+        projection = _http_json(
+            composer_backend_url,
+            "/api/execution/control-state",
+        )
+        control_state = projection.get("control_state")
+        current = (
+            control_state.get("runtime_scale_control", {})
+            if isinstance(control_state, dict)
+            else {}
+        )
+        observed = current.get("requested_scale")
+        if (
+            isinstance(observed, (int, float))
+            and not isinstance(observed, bool)
+            and math.isclose(float(observed), requested_scale, abs_tol=1e-9)
+        ):
+            return current
+        if time.monotonic() >= deadline:
+            raise CollectorError(
+                "timed out waiting for authoritative runtime scale: "
+                f"{json.dumps(current, separators=(',', ':'), sort_keys=True)}"
+            )
+        time.sleep(POLL_SECONDS)
 
 
 def _count(status: dict[str, Any], group: str, key: str) -> int:
@@ -447,6 +484,18 @@ def _visibility_row(
         lambda status: _client_count(status) == baseline_clients + 1,
         "foreground browser after closing helper tab",
     )
+    # Viewer demand and operator-control liveness are independent. A hidden
+    # browser may intentionally let its short control heartbeat expire; require
+    # automatic control resynchronization before the next command row.
+    _control_ready, _ = _wait(
+        lambda: _dom_state(driver),
+        lambda state: (
+            state["deploymentConnected"]
+            and state["velocityDisabled"] is False
+        ),
+        "foreground control-session recovery",
+        DEFAULT_TIMEOUT_S,
+    )
     return {
         "hiddenClientCount": _client_count(hidden),
         "foregroundClientCount": _client_count(foreground),
@@ -455,10 +504,6 @@ def _visibility_row(
 
 
 STOP_PROBE_INSTALL_SCRIPT = r"""return (() => {
-  if (window.__manyforgeUi6OriginalFetch === undefined) {
-    window.__manyforgeUi6OriginalFetch = window.fetch.bind(window);
-  }
-  const originalFetch = window.__manyforgeUi6OriginalFetch;
   const stop = document.querySelector('.viewer-transport .transport-stop-primary');
   if (!(stop instanceof HTMLButtonElement)) return false;
   const probe = {
@@ -466,44 +511,51 @@ STOP_PROBE_INSTALL_SCRIPT = r"""return (() => {
     clickWallMs: null,
     dispatchPerfMs: null,
     dispatchWallMs: null,
-    responsePerfMs: null,
-    responseWallMs: null,
-    responseStatus: null,
-    responsePath: null,
-    responseBody: null,
-    composerIngressMonotonicNs: null,
-    composerResponseMonotonicNs: null,
+    correlationId: null,
+    commandKind: null,
+    receiptPerfMs: null,
+    receiptWallMs: null,
+    receipt: null,
+    controlIngressMonotonicNs: null,
+    receiptEmittedMonotonicNs: null,
     stoppingPerfMs: null,
     stoppedPerfMs: null,
   };
   window.__manyforgeUi6StopProbe = probe;
-  window.fetch = async (...args) => {
-    const input = args[0];
-    const url = typeof input === 'string' ? input : input?.url;
-    const isStop = typeof url === 'string'
-      && /\/api\/program\/runs\/[^/]+\/(?:motion-stop|stop)$/.test(
-        new URL(url, window.location.href).pathname,
-      );
-    if (isStop && probe.dispatchPerfMs === null) {
-      probe.dispatchPerfMs = performance.now();
-      probe.dispatchWallMs = Date.now();
-      probe.responsePath = new URL(url, window.location.href).pathname;
-    }
-    const response = await originalFetch(...args);
-    if (isStop && probe.responsePerfMs === null) {
-      probe.responsePerfMs = performance.now();
-      probe.responseWallMs = Date.now();
-      probe.responseStatus = response.status;
-      probe.composerIngressMonotonicNs = response.headers.get(
-        'X-ManyForge-Composer-Control-Ingress-Monotonic-Ns',
-      );
-      probe.composerResponseMonotonicNs = response.headers.get(
-        'X-ManyForge-Composer-Control-Response-Monotonic-Ns',
-      );
-      try { probe.responseBody = await response.clone().json(); } catch { /* bounded diagnostic */ }
-    }
-    return response;
-  };
+  if (window.__manyforgeUi6OriginalWebSocketSend === undefined) {
+    window.__manyforgeUi6OriginalWebSocketSend = WebSocket.prototype.send;
+    WebSocket.prototype.send = function(data) {
+      const active = window.__manyforgeUi6StopProbe;
+      let message = null;
+      try { message = typeof data === 'string' ? JSON.parse(data) : null;
+      } catch { /* another socket or non-JSON message */ }
+      const kind = message?.command?.command_envelope?.command_kind;
+      const isStop = message?.message_kind === 'command'
+        && (kind === 'program_motion_stop' || kind === 'program_stop');
+      if (isStop && active?.dispatchPerfMs === null) {
+        active.dispatchPerfMs = performance.now();
+        active.dispatchWallMs = Date.now();
+        active.correlationId = message.command.command_envelope.correlation_id;
+        active.commandKind = kind;
+        const socket = this;
+        const receive = (event) => {
+          let incoming = null;
+          try { incoming = typeof event.data === 'string' ? JSON.parse(event.data) : null;
+          } catch { return; }
+          if (incoming?.message_kind !== 'command_receipt'
+              || incoming?.receipt?.correlation_id !== active.correlationId) return;
+          active.receiptPerfMs = performance.now();
+          active.receiptWallMs = Date.now();
+          active.receipt = incoming.receipt;
+          active.controlIngressMonotonicNs = incoming.receipt.received_monotonic_ns;
+          active.receiptEmittedMonotonicNs = incoming.emitted_monotonic_ns;
+          socket.removeEventListener('message', receive);
+        };
+        socket.addEventListener('message', receive);
+      }
+      return window.__manyforgeUi6OriginalWebSocketSend.call(this, data);
+    };
+  }
   const observer = new MutationObserver(() => {
     const text = stop.textContent?.trim();
     if (text === 'Stopping' && probe.stoppingPerfMs === null) {
@@ -654,47 +706,66 @@ def _stop_latency(
     _require(completed_ns >= accepted_ns, "terminal Stop preceded acceptance")
     click_perf = _finite(probe.get("clickPerfMs"), "Stop click time")
     dispatch_perf = _finite(probe.get("dispatchPerfMs"), "Stop dispatch time")
-    response_perf = _finite(probe.get("responsePerfMs"), "Stop response time")
+    receipt_perf = _finite(probe.get("receiptPerfMs"), "Stop receipt time")
     stopped_perf = _finite(probe.get("stoppedPerfMs"), "Stopped presentation time")
     dispatch_wall = _finite(probe.get("dispatchWallMs"), "Stop dispatch wall time")
-    ingress_raw = probe.get("composerIngressMonotonicNs")
+    stopping_perf = _finite(probe.get("stoppingPerfMs"), "Stopping presentation time")
+    ingress_raw = probe.get("controlIngressMonotonicNs")
     if not isinstance(ingress_raw, str) or not ingress_raw.isdigit():
-        raise CollectorError("Composer Stop ingress timestamp is missing")
+        raise CollectorError("control Stop ingress timestamp is missing")
     ingress_ns = int(ingress_raw)
-    response_raw = probe.get("composerResponseMonotonicNs")
-    if not isinstance(response_raw, str) or not response_raw.isdigit():
-        raise CollectorError("Composer Stop response timestamp is missing")
-    composer_response_ns = int(response_raw)
-    _require(ingress_ns <= accepted_ns, "Kernel accepted Stop before Composer ingress")
+    emitted_raw = probe.get("receiptEmittedMonotonicNs")
+    if not isinstance(emitted_raw, str) or not emitted_raw.isdigit():
+        raise CollectorError("control Stop receipt timestamp is missing")
+    emitted_ns = int(emitted_raw)
+    _require(ingress_ns <= accepted_ns, "Kernel accepted Stop before control ingress")
     _require(
-        accepted_ns <= composer_response_ns,
-        "Composer encoded the Stop response before Kernel acceptance",
+        accepted_ns <= emitted_ns,
+        "control owner emitted the Stop receipt before Kernel acceptance",
     )
     ingress_wall_ms = (ingress_ns + monotonic_wall_offset_ns) / 1_000_000.0
     accepted_wall_ms = (accepted_ns + monotonic_wall_offset_ns) / 1_000_000.0
     completed_wall_ms = (completed_ns + monotonic_wall_offset_ns) / 1_000_000.0
     result = {
         "clickToDispatchMs": dispatch_perf - click_perf,
-        "dispatchToComposerIngressMs": ingress_wall_ms - dispatch_wall,
-        "composerIngressToKernelAcceptanceMs": (accepted_ns - ingress_ns)
+        "dispatchToControlIngressMs": ingress_wall_ms - dispatch_wall,
+        "controlIngressToKernelAcceptanceMs": (accepted_ns - ingress_ns)
         / 1_000_000.0,
-        "kernelAcceptanceToResponseMs": response_perf - dispatch_perf
+        "kernelAcceptanceToReceiptMs": receipt_perf - dispatch_perf
         - (accepted_wall_ms - dispatch_wall),
-        "kernelAcceptanceToComposerResponseMs": (
-            composer_response_ns - accepted_ns
+        "kernelAcceptanceToReceiptEmissionMs": (
+            emitted_ns - accepted_ns
         ) / 1_000_000.0,
-        "composerResponseToBrowserMs": response_perf - dispatch_perf
+        "receiptEmissionToBrowserMs": receipt_perf - dispatch_perf
         - (
-            (composer_response_ns + monotonic_wall_offset_ns) / 1_000_000.0
+            (emitted_ns + monotonic_wall_offset_ns) / 1_000_000.0
             - dispatch_wall
+        ),
+        "kernelAcceptanceToStoppingPresentationMs": (
+            stopping_perf
+            - click_perf
+            - (
+                accepted_wall_ms
+                - _finite(probe.get("clickWallMs"), "Stop click wall time")
+            )
         ),
         "kernelAcceptanceToPhysicalSettlementMs": (completed_ns - accepted_ns)
         / 1_000_000.0,
         "physicalSettlementToStoppedPresentationMs": stopped_perf - click_perf
         - (completed_wall_ms - _finite(probe.get("clickWallMs"), "Stop click wall time")),
         "clickToStoppedPresentationMs": stopped_perf - click_perf,
-        "httpStatus": probe.get("responseStatus"),
-        "responsePath": probe.get("responsePath"),
+        "transport": "websocket",
+        "commandKind": probe.get("commandKind"),
+        "receiptDisposition": (
+            probe.get("receipt", {}).get("disposition")
+            if isinstance(probe.get("receipt"), dict)
+            else None
+        ),
+        "receiptCode": (
+            probe.get("receipt", {}).get("code")
+            if isinstance(probe.get("receipt"), dict)
+            else None
+        ),
         "stopId": payload.get("stop_id"),
         "stopGeneration": payload.get("stop_generation"),
         "historianSequence": terminal_event.get("sequence"),
@@ -705,13 +776,18 @@ def _stop_latency(
                 isinstance(value, (int, float)) and math.isfinite(float(value)),
                 f"Stop latency {key} is invalid",
             )
-    _require(result["httpStatus"] == 200, "Stop endpoint did not return HTTP 200")
+    _require(
+        result["receiptDisposition"]
+        in {"received", "joined", "already_current", "no_effect"},
+        "Stop control receipt did not confirm backend ingress",
+    )
     return result
 
 
 def _run_and_stop(
     driver: RawWebDriver,
     composer_url: str,
+    composer_backend_url: str,
 ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
     idle, _ = _wait(
         lambda: _dom_state(driver),
@@ -720,17 +796,21 @@ def _run_and_stop(
         DEFAULT_TIMEOUT_S,
     )
     _require(idle["stopDisabled"] is True, "Stop is enabled before Run")
-    slowed = _set_range(driver, 0.25)
+    # Keep the latency probe inside the ordinary recoverable Stop profile.
+    # The independent stop-fault row covers hard-stop escalation; this row
+    # must remain resumable so it can prove current-only continuation.
+    slowed = _set_range(driver, STOP_CONTROL_SCALE)
     _require(
         slowed["identityStable"] and slowed["focused"],
         "pre-Stop velocity scaling lost control identity/focus",
     )
     _scaled, _ = _wait(
         lambda: _dom_state(driver),
-        lambda state: state["velocityValue"] == "0.25",
+        lambda state: state["velocityValue"] == str(STOP_CONTROL_SCALE),
         "pre-Stop velocity scaling",
         DEFAULT_TIMEOUT_S,
     )
+    _wait_runtime_scale(composer_backend_url, STOP_CONTROL_SCALE)
     before_history = _history_sequence(composer_url)
     _require(
         _execute(driver, STOP_PROBE_INSTALL_SCRIPT) is True,
@@ -787,6 +867,12 @@ def _run_and_stop(
         "Stop never presented Stopping",
     )
     terminal = _wait_stop_terminal(composer_url, before_history)
+    _velocity_ready, _ = _wait(
+        lambda: _dom_state(driver),
+        lambda state: state["velocityDisabled"] is False,
+        "post-Stop runtime velocity availability",
+        DEFAULT_TIMEOUT_S,
+    )
     restored = _set_range(driver, 1.0)
     _require(
         restored["identityStable"],
@@ -801,7 +887,7 @@ def _run_and_stop(
     return stopped, terminal, stop_trace
 
 
-def _resume_and_reset(driver: RawWebDriver) -> None:
+def _resume_and_reset_during_motion(driver: RawWebDriver) -> None:
     _click_selector(driver, ".transport-run", "Resume Motion")
     _running, trace = _wait(
         lambda: _dom_state(driver),
@@ -809,18 +895,12 @@ def _resume_and_reset(driver: RawWebDriver) -> None:
             state["runText"] == "Running"
             and state["runDisabled"] is True
             and state["stopDisabled"] is False
+            and state["resetDisabled"] is False
         ),
         "resumed Running",
         DEFAULT_TIMEOUT_S,
     )
     _assert_transition_fences(trace, "UI6 Resume")
-    _terminal, terminal_trace = _wait(
-        lambda: _dom_state(driver),
-        lambda state: state["resetDisabled"] is False and state["runDisabled"] is True,
-        "terminal Program before UI6 Reset",
-        TERMINAL_TIMEOUT_S,
-    )
-    _assert_transition_fences(terminal_trace, "UI6 terminal")
     _click_selector(driver, ".transport-reset", "Reset")
     _idle, reset_trace = _wait(
         lambda: _dom_state(driver),
@@ -853,7 +933,7 @@ def _ensure_idle(driver: RawWebDriver) -> None:
         return
     if current["runText"] == "Resume Motion" and current["runDisabled"] is False:
         _progress("settling retained stopped cycle before qualification")
-        _resume_and_reset(driver)
+        _resume_and_reset_during_motion(driver)
         return
     if current["resetDisabled"] is False:
         _progress("resetting retained terminal cycle before qualification")
@@ -889,7 +969,11 @@ def _slow_client_row(
     time.sleep(0.10)
 
     _progress("fast-client Run/Stop during slow-client freeze")
-    stopped, terminal, stop_trace = _run_and_stop(fast, composer_url)
+    stopped, terminal, stop_trace = _run_and_stop(
+        fast,
+        composer_url,
+        composer_backend_url,
+    )
     fast_flow = _flow(fast)
     fast_snapshot = _performance(fast)
     _require(fast_flow["receivedFrames"] > 0, "fast client received no motion frames")
@@ -968,7 +1052,7 @@ def _slow_client_row(
     )
     after = _viewer_status(composer_backend_url)
     _progress("fast-client Resume/completion/Reset")
-    _resume_and_reset(fast)
+    _resume_and_reset_during_motion(fast)
     return {
         "freezeSeconds": freeze_seconds,
         "browserFreeze": browser_freeze,

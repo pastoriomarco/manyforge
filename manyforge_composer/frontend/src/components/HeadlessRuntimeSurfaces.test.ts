@@ -34,10 +34,18 @@ describe('headless Composer presentation adapters', () => {
       id: 'composer.error.1',
       title: 'Program command failed',
       message: 'Exact response mismatch.',
+      active: true,
+      acknowledgementRequired: false,
     }])).toBe('Program command failed');
     expect(runtimeAttentionSummary([], [
-      { id: 'composer.error.1', title: 'First', message: 'First detail' },
-      { id: 'composer.error.2', title: 'Second', message: 'Second detail' },
+      {
+        id: 'composer.error.1', title: 'First', message: 'First detail',
+        active: true, acknowledgementRequired: false,
+      },
+      {
+        id: 'composer.error.2', title: 'Second', message: 'Second detail',
+        active: false, acknowledgementRequired: true,
+      },
     ])).toBe('2 messages require attention');
   });
 
@@ -170,6 +178,7 @@ describe('headless Composer presentation adapters', () => {
     const snapshot: ComposerHeadlessState = {
       schemaVersion: 'manyforge.composer_headless_state.v2',
       complete: true,
+      executionControlStatus: null,
       componentOverview: {
         schemaVersion: 'manyforge.component_overview.v1',
         overviewRevision: `sha256:${'a'.repeat(64)}`,
@@ -211,6 +220,14 @@ describe('headless Composer presentation adapters', () => {
         runRevision: null,
         nodeStatusRevision: null,
         runtimeControlRevision: null,
+        executionControlRevision: 1,
+        causalCorrelationId: null,
+        causalSessionId: null,
+        causalClientSequence: null,
+        currentCommandKind: null,
+        failure: null,
+        resetPhase: null,
+        allowedCommands: [],
         recoveryOffer: null,
         run: null,
         runtimeControls: null,
@@ -267,6 +284,8 @@ describe('headless Composer presentation adapters', () => {
         id: 'composer.program_runtime',
         title: 'Program command or response failed',
         message: 'Invalid response from /api/program/runs/program-run.1',
+        active: false,
+        acknowledgementRequired: true,
       }],
       onAcknowledgeClientError: vi.fn(),
     }));
@@ -277,7 +296,7 @@ describe('headless Composer presentation adapters', () => {
     expect(html).toContain('>History</button>');
     expect(html).not.toContain('ACTIVE — ACKNOWLEDGED · Reduced capability');
     expect(html).toContain('Reconnect headless projection');
-    expect(html).toContain('COMPOSER ERROR — DISMISSAL REQUIRED');
+    expect(html).toContain('COMPOSER ERROR — RESOLVED · DISMISSAL REQUIRED');
     expect(html).toContain('Invalid response from /api/program/runs/program-run.1');
     expect(html).toContain('Acknowledge message');
     expect(html).toContain('Acknowledge all');
@@ -290,6 +309,8 @@ describe('headless Composer presentation adapters', () => {
         id: 'composer.program_runtime',
         title: 'Program command or response failed',
         message: 'Invalid response from /api/program/runs/program-run.1',
+        active: false,
+        acknowledgementRequired: true,
       }],
       expanded: false,
       onExpandedChange: vi.fn(),
@@ -322,6 +343,8 @@ describe('headless Composer presentation adapters', () => {
         id: 'composer.source_model',
         title: 'Viewer source-model response failed',
         message: 'Projection contract mismatch.',
+        active: true,
+        acknowledgementRequired: false,
       }],
       onAcknowledgeClientError: vi.fn(),
       expanded: false,
@@ -331,7 +354,7 @@ describe('headless Composer presentation adapters', () => {
       'runtime-observability-surface collapsed has-attention attention-error',
     );
     expect(singleClientFailure).toContain('Viewer source-model response failed');
-    expect(singleClientFailure).toContain('>Acknowledge</button>');
+    expect(singleClientFailure).toContain('>Dismiss</button>');
     expect(singleClientFailure).not.toContain('Acknowledge all');
   });
 });

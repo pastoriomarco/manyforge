@@ -17,7 +17,11 @@ from manyforge_headless_api.models import (
     ProgramRunStopRequest,
     ProgramScenePreparationRequest,
 )
-from manyforge_program_runner.app import create_app
+from manyforge_program_runner.app import (
+    ProgramControlStateSource,
+    _serve_program_control_state,
+    create_app,
+)
 from manyforge_program_runner.models import (
     ProgramCycleResetRequest,
     ProgramNodeAvailabilityRequest,
@@ -73,6 +77,22 @@ class FakeRuntime:
         self.started = False
         self.closed = False
         self.calls: list[tuple[str, Any]] = []
+        self.control_state_observers: set[Any] = set()
+        self.control_revision = 1
+        self.node_status_revision = 1
+
+    def add_control_state_observer(self, observer) -> None:
+        self.control_state_observers.add(observer)
+
+    def remove_control_state_observer(self, observer) -> None:
+        self.control_state_observers.discard(observer)
+
+    def publish_control_state(self, *, node_only: bool = False) -> None:
+        self.node_status_revision += 1
+        if not node_only:
+            self.control_revision += 1
+        for observer in tuple(self.control_state_observers):
+            observer()
 
     def start(self) -> None:
         self.started = True
@@ -194,6 +214,20 @@ class FakeRuntime:
             "program_run_id": None,
             "cycle_claim_generation": None,
             "terminal_or_settlement_reference": None,
+            "execution_control_revision": self.control_revision,
+            "causal_correlation_id": None,
+            "causal_session_id": None,
+            "causal_client_sequence": None,
+            "current_command_kind": None,
+            "failure": None,
+            "reset_phase": None,
+            "allowed_commands": [],
+            "run_revision": None,
+            "node_status_revision": self.node_status_revision,
+            "runtime_control_revision": None,
+            "recovery_offer": None,
+            "run": None,
+            "runtime_controls": None,
         }
 
     def read_runtime_controls(self, program_run_id: str) -> dict[str, Any]:
@@ -281,7 +315,8 @@ def test_reset_is_an_explicit_strict_cycle_transition() -> None:
 
 
 def test_cycle_status_exposes_only_program_runner_owned_facts() -> None:
-    client = TestClient(create_app(FakeRuntime()))
+    runtime = FakeRuntime()
+    client = TestClient(create_app(runtime))
     with client:
         response = client.get("/api/cycle/status")
     assert response.status_code == 200
@@ -292,8 +327,86 @@ def test_cycle_status_exposes_only_program_runner_owned_facts() -> None:
         "program_run_id",
         "cycle_claim_generation",
         "terminal_or_settlement_reference",
+        "execution_control_revision",
+        "causal_correlation_id",
+        "causal_session_id",
+        "causal_client_sequence",
+        "current_command_kind",
+        "failure",
+        "reset_phase",
+        "allowed_commands",
+        "run_revision",
+        "node_status_revision",
+        "runtime_control_revision",
+        "recovery_offer",
+        "run",
+        "runtime_controls",
     }
     assert client.get("/api/program/cycle/status").status_code == 404
+    assert runtime.control_state_observers == set()
+
+
+def test_control_state_websocket_is_change_driven_and_demand_scoped() -> None:
+    runtime = FakeRuntime()
+    client = TestClient(create_app(runtime))
+
+    with client:
+        assert runtime.control_state_observers == set()
+        with client.websocket_connect("/ws/program/control-state") as websocket:
+            first = websocket.receive_json()
+            assert first["schema_version"] == "manyforge.program_control_state.v1"
+            assert first["server_sequence"] == "1"
+            assert first["program_cycle"]["execution_control_revision"] == 1
+            assert len(runtime.control_state_observers) == 1
+
+            runtime.publish_control_state()
+            second = websocket.receive_json()
+            assert second["server_sequence"] == "2"
+            assert second["program_cycle"]["execution_control_revision"] == 2
+            assert second["program_cycle"]["node_status_revision"] == 2
+
+        assert runtime.control_state_observers == set()
+
+
+def test_control_state_websocket_releases_disconnected_clients_without_owner_wake() -> None:
+    class FakeWebSocket:
+        def __init__(self) -> None:
+            self.inbound: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+            self.outbound: asyncio.Queue[str] = asyncio.Queue()
+
+        async def accept(self) -> None:
+            return None
+
+        async def receive(self) -> dict[str, Any]:
+            return await self.inbound.get()
+
+        async def send_text(self, payload: str) -> None:
+            await self.outbound.put(payload)
+
+        async def close(self, *, code: int, reason: str) -> None:
+            del code, reason
+
+    async def exercise() -> None:
+        runtime = FakeRuntime()
+        source = ProgramControlStateSource(runtime)
+        # More sequential clients than the concurrent capacity proves that a
+        # quiet owner cannot retain dead subscriptions indefinitely.
+        for _ in range(6):
+            websocket = FakeWebSocket()
+            serving = asyncio.create_task(
+                _serve_program_control_state(websocket, source)  # type: ignore[arg-type]
+            )
+            first = json.loads(
+                await asyncio.wait_for(websocket.outbound.get(), timeout=1.0)
+            )
+            assert first["server_sequence"] == "1"
+            assert len(runtime.control_state_observers) == 1
+            await websocket.inbound.put({"type": "websocket.disconnect"})
+            await asyncio.wait_for(serving, timeout=1.0)
+            assert runtime.control_state_observers == set()
+        source.close()
+
+    asyncio.run(exercise())
 
 
 def test_private_surface_projects_owner_facts_and_manages_lifecycle() -> None:

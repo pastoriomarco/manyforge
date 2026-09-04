@@ -7,10 +7,12 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
+from queue import Empty, Queue
 import shutil
 import socket
 import subprocess
 import sys
+from threading import Event, Thread
 import time
 from typing import Callable, Iterator
 
@@ -679,7 +681,7 @@ def _composer_snapshot_stream(
 ) -> Iterator[Callable[[], dict]]:
     websocket_url = (
         stack.composer_url.replace("http://", "ws://", 1)
-        + f"/ws/state?client_id={client_id}"
+        + "/ws/control"
     )
     with connect_websocket(
         websocket_url,
@@ -687,26 +689,94 @@ def _composer_snapshot_stream(
         close_timeout=1,
         max_size=16 * 1024 * 1024,
     ) as websocket:
-        def next_snapshot() -> dict:
-            deadline = time.monotonic() + 8.0
-            last_payload: object = None
-            while time.monotonic() < deadline:
-                last_payload = json.loads(
-                    websocket.recv(timeout=max(deadline - time.monotonic(), 0.001))
-                )
-                while True:
-                    try:
-                        last_payload = json.loads(websocket.recv(timeout=0))
-                    except TimeoutError:
-                        break
-                assert isinstance(last_payload, dict)
-                if last_payload.get("complete") is True:
-                    return last_payload
-            raise RuntimeError(
-                f"Composer did not publish a complete snapshot: {last_payload!r}"
+        websocket.send(
+            json.dumps(
+                {
+                    "schema_version": "manyforge.execution_control.v1",
+                    "message_kind": "client_hello",
+                    "supported_versions": ["manyforge.execution_control.v1"],
+                    "client_incarnation": f"process-test.{client_id}",
+                    "source_label": "process_test",
+                }
             )
+        )
+        server_hello = json.loads(websocket.recv(timeout=2.0))
+        assert server_hello["message_kind"] == "server_hello"
+        control_session_id = server_hello["control_session_id"]
+        client_sequence = 0
+        stopped = Event()
+        current_shell: Queue[dict | BaseException] = Queue(maxsize=1)
 
-        yield next_snapshot
+        def publish(value: dict | BaseException) -> None:
+            try:
+                current_shell.get_nowait()
+            except Empty:
+                pass
+            current_shell.put_nowait(value)
+
+        def receive() -> None:
+            nonlocal client_sequence
+            try:
+                while not stopped.is_set():
+                    try:
+                        last_payload = json.loads(websocket.recv(timeout=0.5))
+                    except TimeoutError:
+                        continue
+                    assert isinstance(last_payload, dict)
+                    if last_payload.get("message_kind") == "heartbeat_challenge":
+                        client_sequence += 1
+                        websocket.send(
+                            json.dumps(
+                                {
+                                    "schema_version": (
+                                        "manyforge.execution_control.v1"
+                                    ),
+                                    "message_kind": "heartbeat_echo",
+                                    "control_session_id": control_session_id,
+                                    "client_sequence": str(client_sequence),
+                                    "challenge_sequence": last_payload[
+                                        "challenge_sequence"
+                                    ],
+                                }
+                            )
+                        )
+                        continue
+                    shell = last_payload.get("shell")
+                    if (
+                        last_payload.get("message_kind") in {"snapshot", "delta"}
+                        and isinstance(shell, dict)
+                        and shell.get("complete") is True
+                    ):
+                        publish(shell)
+            except BaseException as error:
+                if not stopped.is_set():
+                    publish(error)
+
+        receiver = Thread(
+            target=receive,
+            name="manyforge-process-test-control-receiver",
+            daemon=True,
+        )
+        receiver.start()
+
+        def next_snapshot() -> dict:
+            try:
+                value = current_shell.get(timeout=8.0)
+            except Empty as error:
+                raise RuntimeError(
+                    "Composer did not publish a complete current snapshot"
+                ) from error
+            if isinstance(value, BaseException):
+                raise RuntimeError("Composer control stream failed") from value
+            return value
+
+        try:
+            yield next_snapshot
+        finally:
+            stopped.set()
+            receiver.join(timeout=2.0)
+            if receiver.is_alive():
+                raise RuntimeError("Composer control receiver did not stop")
 
 
 def _composer_fence(
@@ -1493,27 +1563,43 @@ def test_real_program_apply_reuses_active_deployment_and_survives_api_restart(
                     first_applied["source"]["source_owner_epoch"]
                 )
 
-                started = client.program_run_start(
-                    {
-                        "request_id": "program-apply.process.run.1",
-                        "request_owner_epoch": "process-test-browser-restarted",
-                        "source_label": "program_apply_process_test",
-                        "correlation_id": "program-apply.process.run.1",
-                        "scenario_id": "program_apply_fixture",
-                        "scenario_catalog_revision": scenarios[
-                            "scenario_catalog_revision"
-                        ],
-                        "expected_applied_record_digest": replay_applied[
-                            "source"
-                        ]["record_digest"],
-                        "draft_program_revision": replay_applied[
-                            "program_revision"
-                        ],
-                        "expected_admission_generation": (
-                            _current_authoring_generation(client)
-                        ),
-                    }
-                )
+                for attempt in range(8):
+                    try:
+                        started = client.program_run_start(
+                            {
+                                "request_id": (
+                                    f"program-apply.process.run.1.{attempt}"
+                                ),
+                                "request_owner_epoch": (
+                                    "process-test-browser-restarted"
+                                ),
+                                "source_label": "program_apply_process_test",
+                                "correlation_id": "program-apply.process.run.1",
+                                "scenario_id": "program_apply_fixture",
+                                "scenario_catalog_revision": scenarios[
+                                    "scenario_catalog_revision"
+                                ],
+                                "expected_applied_record_digest": replay_applied[
+                                    "source"
+                                ]["record_digest"],
+                                "draft_program_revision": replay_applied[
+                                    "program_revision"
+                                ],
+                                "expected_admission_generation": (
+                                    stack.wait_authoring_admission(
+                                        expected_allowed=True
+                                    )["admission_generation"]
+                                ),
+                            }
+                        )
+                        break
+                    except HeadlessClientError as error:
+                        if (
+                            error.code
+                            not in {"authoring_not_ready", "stale_generation"}
+                            or attempt == 7
+                        ):
+                            raise
                 program_run_id = started["capture"]["program_run_id"]
                 terminal = started
                 deadline = time.monotonic() + 10.0

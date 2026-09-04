@@ -9,13 +9,43 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, TypeVar
+from typing import Any, Callable, Literal, Mapping, Protocol, TypeVar
+
+from .control_protocol import (
+    ControlFreshnessAuthority,
+    ControlProtocolError,
+    ExecutionCommandReceiptDTO,
+    ExecutionCommandRequestDTO,
+    ExecutionIngressResult,
+    ExecutionIngressStamp,
+    MAXIMUM_U64,
+    is_stop_command,
+)
 
 
 T = TypeVar("T")
+
+
+class ExecutionControlProjectionPort(Protocol):
+    def __call__(self) -> tuple[str, int]: ...
+
+
+class ExecutionControlDispatchPort(Protocol):
+    def __call__(
+        self,
+        request: ExecutionCommandRequestDTO,
+        stamp: ExecutionIngressStamp,
+    ) -> tuple[ExecutionIngressResult, Mapping[str, Any] | None]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionControlSubmission:
+    receipt: ExecutionCommandReceiptDTO
+    result: Mapping[str, Any] | None
 
 
 class ExecutionControlLane(str, Enum):
@@ -88,7 +118,12 @@ class _BoundedLane:
             with self._lock:
                 self._running -= 1
 
-    async def run(self, callback: Callable[[], T]) -> T:
+    def submit(
+        self,
+        callback: Callable[[], T],
+        *,
+        on_admitted: Callable[[], None] | None = None,
+    ) -> asyncio.Future[T]:
         if not self._capacity.acquire(blocking=False):
             with self._lock:
                 self._rejected += 1
@@ -99,6 +134,8 @@ class _BoundedLane:
         with self._lock:
             self._admitted += 1
         try:
+            if on_admitted is not None:
+                on_admitted()
             executor = self._executor_for_submit()
             future = asyncio.get_running_loop().run_in_executor(
                 executor,
@@ -120,7 +157,10 @@ class _BoundedLane:
         # Cancelling a disconnected HTTP handler cannot cancel synchronous
         # transport work already running in a thread. Keep its admission until
         # the worker really finishes so disconnect storms cannot grow the lane.
-        return await asyncio.shield(future)
+        return future
+
+    async def run(self, callback: Callable[[], T]) -> T:
+        return await asyncio.shield(self.submit(callback))
 
     def close(self) -> None:
         with self._lock:
@@ -176,6 +216,15 @@ class ExecutionControlClient:
     async def ordinary(self, callback: Callable[[], T]) -> T:
         return await self._lanes[ExecutionControlLane.ORDINARY].run(callback)
 
+    def start(
+        self,
+        lane: ExecutionControlLane,
+        callback: Callable[[], T],
+        *,
+        on_admitted: Callable[[], None] | None = None,
+    ) -> asyncio.Future[T]:
+        return self._lanes[lane].submit(callback, on_admitted=on_admitted)
+
     def close(self) -> None:
         for lane in self._lanes.values():
             lane.close()
@@ -184,9 +233,275 @@ class ExecutionControlClient:
         return {lane.value: self._lanes[lane].status() for lane in self._lanes}
 
 
+class ExecutionControlIngress:
+    """One freshness/stamping boundary shared by every transport adapter."""
+
+    def __init__(
+        self,
+        *,
+        projection: ExecutionControlProjectionPort,
+        dispatch: ExecutionControlDispatchPort,
+        authority: ControlFreshnessAuthority | None = None,
+        lanes: ExecutionControlClient | None = None,
+        clock_ns: Callable[[], int] = time.monotonic_ns,
+    ) -> None:
+        if not callable(projection) or not callable(dispatch):
+            raise TypeError("execution-control ingress ports must be callable")
+        self._projection = projection
+        self._dispatch = dispatch
+        self._authority = authority or ControlFreshnessAuthority()
+        self._lanes = lanes or ExecutionControlClient()
+        self._owns_lanes = lanes is None
+        self._clock_ns = clock_ns
+        self._lifecycle_lock = threading.Lock()
+        self._active_control_sessions = 0
+        self._sequence_lock = threading.Lock()
+        self._received_sequence = 0
+
+    @property
+    def receiver_incarnation(self) -> str:
+        with self._lifecycle_lock:
+            return self._authority.receiver_incarnation
+
+    @property
+    def active_control_sessions(self) -> int:
+        with self._lifecycle_lock:
+            return self._active_control_sessions
+
+    def _rollover_required_locked(self) -> bool:
+        with self._sequence_lock:
+            received_sequence_exhausted = self._received_sequence >= MAXIMUM_U64
+        return (
+            self._authority.rollover_required
+            or received_sequence_exhausted
+        )
+
+    def _rotate_if_quiescent_locked(self) -> bool:
+        if not self._rollover_required_locked():
+            return False
+        admitted = sum(
+            lane["admitted"] for lane in self._lanes.status().values()
+        )
+        if self._active_control_sessions or admitted:
+            return False
+        self._authority.rotate_quiescent(
+            active_sessions=0,
+            inflight_commands=0,
+        )
+        with self._sequence_lock:
+            self._received_sequence = 0
+        return True
+
+    def _try_rotate_if_quiescent(self) -> bool:
+        with self._lifecycle_lock:
+            return self._rotate_if_quiescent_locked()
+
+    def open_control_session(self) -> None:
+        with self._lifecycle_lock:
+            self._rotate_if_quiescent_locked()
+            if self._rollover_required_locked():
+                raise ControlProtocolError(
+                    "control_sequence_rollover_required",
+                    "control receiver must finish its current sessions before rollover",
+                )
+            self._active_control_sessions += 1
+
+    def close_control_session(self) -> None:
+        with self._lifecycle_lock:
+            if self._active_control_sessions < 1:
+                raise RuntimeError("control session registration underflow")
+            self._active_control_sessions -= 1
+            self._rotate_if_quiescent_locked()
+
+    def current_freshness(self):
+        owner_epoch, control_revision = self._projection()
+        return self.freshness_for(owner_epoch, control_revision)
+
+    def freshness_for(self, owner_epoch: str, control_revision: int):
+        """Issue from an already-cached exact owner projection (heartbeat path)."""
+
+        with self._lifecycle_lock:
+            self._rotate_if_quiescent_locked()
+            return self._authority.issue(
+                semantic_owner_epoch=owner_epoch,
+                execution_control_revision=control_revision,
+            )
+
+    def _next_received_sequence(self) -> int:
+        with self._sequence_lock:
+            if self._received_sequence >= MAXIMUM_U64:
+                raise ControlProtocolError(
+                    "control_sequence_rollover_required",
+                    "control ingress sequence requires quiescent rotation",
+                )
+            self._received_sequence += 1
+            return self._received_sequence
+
+    def _submit_sync(
+        self,
+        request: ExecutionCommandRequestDTO,
+        stamp: ExecutionIngressStamp,
+    ) -> ExecutionControlSubmission:
+        envelope = request.command_envelope
+        if not is_stop_command(envelope.command_kind):
+            owner_epoch, control_revision = self._projection()
+            self._authority.validate(
+                envelope.freshness,
+                current_owner_epoch=owner_epoch,
+                current_control_revision=control_revision,
+            )
+            if (
+                envelope.expected_semantic_owner_epoch != owner_epoch
+                or envelope.expected_execution_control_revision != control_revision
+            ):
+                raise ControlProtocolError(
+                    "control_projection_stale",
+                    "command does not identify the current semantic owner state",
+                )
+        disposition, result = self._dispatch(request, stamp)
+        receipt = ExecutionCommandReceiptDTO(
+            schema_version="manyforge.execution_command_receipt.v1",
+            correlation_id=envelope.correlation_id,
+            control_session_id=envelope.control_session_id,
+            client_sequence=envelope.client_sequence,
+            receiver_incarnation=stamp.receiver_incarnation,
+            received_server_sequence=str(stamp.received_server_sequence),
+            received_monotonic_ns=str(stamp.received_monotonic_ns),
+            disposition=disposition.disposition,
+            code=disposition.code,
+            semantic_owner_epoch=disposition.semantic_owner_epoch,
+            execution_control_revision=disposition.execution_control_revision,
+            current_identity=(
+                None
+                if disposition.current_identity is None
+                else dict(disposition.current_identity)
+            ),
+        )
+        return ExecutionControlSubmission(receipt=receipt, result=result)
+
+    def rejection_receipt(
+        self,
+        request: ExecutionCommandRequestDTO,
+        *,
+        code: str,
+        semantic_owner_epoch: str | None = None,
+        execution_control_revision: int | None = None,
+    ) -> ExecutionCommandReceiptDTO:
+        """Project a failed ingress decision without retaining a receipt."""
+
+        if semantic_owner_epoch is None or execution_control_revision is None:
+            owner_epoch, control_revision = self._projection()
+        else:
+            owner_epoch = semantic_owner_epoch
+            control_revision = execution_control_revision
+        envelope = request.command_envelope
+        return ExecutionCommandReceiptDTO(
+            schema_version="manyforge.execution_command_receipt.v1",
+            correlation_id=envelope.correlation_id,
+            control_session_id=envelope.control_session_id,
+            client_sequence=envelope.client_sequence,
+            receiver_incarnation=self.receiver_incarnation,
+            received_server_sequence=str(self._next_received_sequence()),
+            received_monotonic_ns=str(self._clock_ns()),
+            disposition="rejected",
+            code=code,
+            semantic_owner_epoch=owner_epoch,
+            execution_control_revision=control_revision,
+            current_identity=None,
+        )
+
+    async def submit(
+        self,
+        request: ExecutionCommandRequestDTO,
+        *,
+        transport_kind: Literal["rest", "websocket", "ros2", "local"],
+        trusted_principal_id: str | None = None,
+        assurance: str | None = None,
+    ) -> ExecutionControlSubmission:
+        return await asyncio.shield(
+            self._start_submission(
+                request,
+                transport_kind=transport_kind,
+                trusted_principal_id=trusted_principal_id,
+                assurance=assurance,
+            )
+        )
+
+    def _start_submission(
+        self,
+        request: ExecutionCommandRequestDTO,
+        *,
+        transport_kind: Literal["rest", "websocket", "ros2", "local"],
+        trusted_principal_id: str | None,
+        assurance: str | None,
+    ) -> asyncio.Future[ExecutionControlSubmission]:
+        stamp: ExecutionIngressStamp | None = None
+
+        def mark_admitted() -> None:
+            nonlocal stamp
+            stamp = ExecutionIngressStamp(
+                transport_kind=transport_kind,
+                receiver_incarnation=self._authority.receiver_incarnation,
+                received_server_sequence=self._next_received_sequence(),
+                received_monotonic_ns=self._clock_ns(),
+                trusted_principal_id=trusted_principal_id,
+                assurance=assurance,
+            )
+
+        def callback() -> ExecutionControlSubmission:
+            if stamp is None:
+                raise RuntimeError("execution-control admission stamp is missing")
+            return self._submit_sync(
+                request,
+                stamp,
+            )
+        lane = (
+            ExecutionControlLane.STOP
+            if is_stop_command(request.command_envelope.command_kind)
+            else ExecutionControlLane.ORDINARY
+        )
+        with self._lifecycle_lock:
+            self._rotate_if_quiescent_locked()
+            if self._rollover_required_locked():
+                raise ControlProtocolError(
+                    "control_sequence_rollover_required",
+                    "control receiver must reach a quiescent boundary before admission",
+                )
+            future = self._lanes.start(
+                lane,
+                callback,
+                on_admitted=mark_admitted,
+            )
+        future.add_done_callback(lambda _done: self._try_rotate_if_quiescent())
+        return future
+
+    def start(
+        self,
+        request: ExecutionCommandRequestDTO,
+        *,
+        transport_kind: Literal["rest", "websocket", "ros2", "local"],
+        trusted_principal_id: str | None = None,
+        assurance: str | None = None,
+    ) -> asyncio.Future[ExecutionControlSubmission]:
+        """Admit one command to an existing lane without awaiting its effect."""
+
+        return self._start_submission(
+            request,
+            transport_kind=transport_kind,
+            trusted_principal_id=trusted_principal_id,
+            assurance=assurance,
+        )
+
+    def close(self) -> None:
+        if self._owns_lanes:
+            self._lanes.close()
+
+
 __all__ = [
     "ExecutionControlBusyError",
     "ExecutionControlClient",
+    "ExecutionControlIngress",
     "ExecutionControlLane",
     "ExecutionControlLaneSpec",
+    "ExecutionControlSubmission",
 ]

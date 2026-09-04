@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react';
 
+import { HISTORIAN_PAGE_LIMIT } from '../api/client';
 import type { HistorianListQuery } from '../api/client';
 import type { HistorianDetail } from '../types/headless';
 
@@ -104,6 +105,7 @@ interface ExecutionHistoryPanelProps {
   open: boolean;
   onClose: () => void;
   events: ExecutionHistoryEventView[];
+  eyebrow?: string;
   loading?: boolean;
   error?: string | null;
   currentExecutionId?: number;
@@ -125,6 +127,7 @@ export function ExecutionHistoryPanel({
   open,
   onClose,
   events,
+  eyebrow = 'Authoritative event projection',
   loading = false,
   error = null,
   currentExecutionId,
@@ -164,7 +167,7 @@ export function ExecutionHistoryPanel({
     ...(startNs === undefined ? {} : { startNs }),
     ...(component.trim() ? { components: [component.trim()] } : {}),
     ...(eventType.trim() ? { eventTypes: [eventType.trim()] } : {}),
-    limit: 64,
+    limit: HISTORIAN_PAGE_LIMIT,
   });
   const filtered = useMemo(
     () => filterExecutionHistoryEvents(events, {
@@ -201,7 +204,7 @@ export function ExecutionHistoryPanel({
     >
       <header>
         <div>
-          <p className="eyebrow">Authoritative event projection</p>
+          <p className="eyebrow">{eyebrow}</p>
           <h2 id="history-title">Runtime history</h2>
         </div>
         <div className="button-row">

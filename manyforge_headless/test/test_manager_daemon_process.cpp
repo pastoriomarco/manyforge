@@ -1063,6 +1063,7 @@ std::string SceneAddRequest(
                  })},
                 {"support_contacts", CanonicalValue(CanonicalValue::Array{})},
             })},
+           {"program_reset_scene_authorization", CanonicalValue(nullptr)},
            {"request_context",
             CanonicalValue(CanonicalValue::Object{
                 {"correlation_id", CanonicalValue(nullptr)},

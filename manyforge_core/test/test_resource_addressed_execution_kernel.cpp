@@ -96,12 +96,9 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     if (defer_prepared_dispatch_effect) {
       std::lock_guard lock(prepared_motion_mutex_);
       if (prepared_snapshot && prepared_snapshot->execution_id == execution_id &&
-          prepared_snapshot->state ==
-              ResolvedPreparedMotionExecutionStateDTO::kDispatchRequested) {
-        prepared_snapshot->state =
-            ResolvedPreparedMotionExecutionStateDTO::kCancelledPreDispatch;
-        return AddressedParticipantStopFenceDisposition::
-            kEffectPreventedBeforeDispatch;
+          prepared_snapshot->state == ResolvedPreparedMotionExecutionStateDTO::kDispatchRequested) {
+        prepared_snapshot->state = ResolvedPreparedMotionExecutionStateDTO::kCancelledPreDispatch;
+        return AddressedParticipantStopFenceDisposition::kEffectPreventedBeforeDispatch;
       }
     }
     return AddressedParticipantStopFenceDisposition::kDispatchCommitted;
@@ -220,8 +217,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
                                           {{"reason", "prepared_dispatch_mismatch"}}});
       }
       prepared_snapshot->state = defer_prepared_dispatch_effect
-                                     ? ResolvedPreparedMotionExecutionStateDTO::
-                                           kDispatchRequested
+                                     ? ResolvedPreparedMotionExecutionStateDTO::kDispatchRequested
                                      : ResolvedPreparedMotionExecutionStateDTO::kDispatched;
       execution_request = last_prepared_request->execution_request;
     }
@@ -1068,14 +1064,12 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
         start,
         {std::move(planning_result), 0U, request.binding.planner_capability_binding},
         {ValidationRevision("validation.test"),
-         ValidationResultDTO{
-             true, std::nullopt,
-             TrajectoryValidationMetricsDTO{
-                 trajectory.waypoints.back().time_from_start_s,
-                 std::vector<double>(trajectory.joint_names.size(), 0.5),
-                 std::vector<double>(trajectory.joint_names.size(), 0.0), 0.1}},
-         world,
-         CollisionPolicyRevision{1U, Digest('d')}, decision},
+         ValidationResultDTO{true, std::nullopt,
+                             TrajectoryValidationMetricsDTO{
+                                 trajectory.waypoints.back().time_from_start_s,
+                                 std::vector<double>(trajectory.joint_names.size(), 0.5),
+                                 std::vector<double>(trajectory.joint_names.size(), 0.0), 0.1}},
+         world, CollisionPolicyRevision{1U, Digest('d')}, decision},
         std::move(contact_policy),
         {authority.runtime_policy.value().source_artifact,
          authority.runtime_policy.value().selected_motion_speed_limit},
@@ -1255,7 +1249,14 @@ class FakeOperationJournal final : public IOperationJournal {
 
   Result<std::uint64_t> RecordOperationAccepted(const RequestOwnerEpoch&, const OperationIntentDTO&,
                                                 const OperationAcceptedDTO&,
-                                                const OperationStateDTO& state) override {
+                                                const OperationStateDTO& state,
+                                                const std::span<const OperationId>
+                                                    protected_operation_ids) override {
+    {
+      std::lock_guard lock(mutex);
+      protected_operation_inventories.emplace_back(protected_operation_ids.begin(),
+                                                   protected_operation_ids.end());
+    }
     if (operation_acceptance_hook) {
       operation_acceptance_hook();
     }
@@ -1409,11 +1410,9 @@ class FakeOperationJournal final : public IOperationJournal {
     return Record("runtime_scale_accepted", state);
   }
 
-  Result<std::uint64_t> RecordOperationState(const RequestOwnerEpoch&,
-                                             const OperationStateDTO& state,
-                                             const RuntimeScaleStatusDTO*,
-                                             const char* transition_reason,
-                                             std::span<const PreparedMotionDiagnosticsDTO>) override {
+  Result<std::uint64_t> RecordOperationState(
+      const RequestOwnerEpoch&, const OperationStateDTO& state, const RuntimeScaleStatusDTO*,
+      const char* transition_reason, std::span<const PreparedMotionDiagnosticsDTO>) override {
     return Record(std::string("state:") + transition_reason, state);
   }
 
@@ -1487,6 +1486,7 @@ class FakeOperationJournal final : public IOperationJournal {
   std::atomic<int> stop_surveillance_calls{};
   std::atomic<int> stop_fault_clear_calls{};
   std::vector<OperationStateDTO> states;
+  std::vector<std::vector<OperationId>> protected_operation_inventories;
   std::optional<EmergencyStopAcceptanceRecordDTO> last_stop_acceptance;
   std::optional<EmergencyStopProjectedIntentDTO> last_stop_intent;
   std::optional<StopAcceptedDTO> last_stop_accepted;
@@ -2449,21 +2449,17 @@ TEST(ResourceAddressedExecutionKernelTest,
 
 [[nodiscard]] RuntimeScaleControlSelectorDTO runtime_scale_control_selector(
     std::string component_role = "robot", std::string target_role = "arm") {
-  return RuntimeScaleControlSelectorDTO{
-      ProgramBindingId(test_digest('1')),
-      ComponentRoleId(std::move(component_role)),
-      TargetRoleId(std::move(target_role))};
+  return RuntimeScaleControlSelectorDTO{ProgramBindingId(test_digest('1')),
+                                        ComponentRoleId(std::move(component_role)),
+                                        TargetRoleId(std::move(target_role))};
 }
 
 [[nodiscard]] RuntimeScaleControlRequestDTO runtime_scale_control_request(
     std::string request_id, std::uint64_t expected_generation, double scale) {
   return RuntimeScaleControlRequestDTO{
-      PublicRequestContextDTO{RequestId(std::move(request_id)),
-                              RequestOwnerEpoch("kernel.epoch.1"), "test",
-                              std::nullopt},
-      runtime_scale_control_selector(),
-      RuntimeScaleControlGeneration(expected_generation),
-      scale};
+      PublicRequestContextDTO{RequestId(std::move(request_id)), RequestOwnerEpoch("kernel.epoch.1"),
+                              "test", std::nullopt},
+      runtime_scale_control_selector(), RuntimeScaleControlGeneration(expected_generation), scale};
 }
 
 TEST(ResourceAddressedExecutionKernelTest, ResolvesPortableMotionAndReservesExactResource) {
@@ -3129,20 +3125,18 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine engine;
   engine.defer_prepared_dispatch_effect = true;
   const auto binding =
-      make_binding("arm", "arm", "execution.trajectory.execute",
-                   CoordinateKind::kAngular);
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   ResourceAddressedExecutionKernel kernel(
       {registration(binding, engine)}, clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
 
-  const auto accepted =
-      kernel.execute(motion_operation("request.motion.dispatch-handoff"));
+  const auto accepted = kernel.execute(motion_operation("request.motion.dispatch-handoff"));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
   ASSERT_EQ(engine.dispatch_prepared_motion_calls, 1);
   ASSERT_EQ(engine.execute_calls, 0);
 
-  const auto stopped = kernel.stop(
-      stop_request("request.stop.dispatch-handoff", accepted.value(), 1U));
+  const auto stopped =
+      kernel.stop(stop_request("request.stop.dispatch-handoff", accepted.value(), 1U));
   ASSERT_TRUE(stopped.ok()) << stopped.error().message;
   ASSERT_TRUE(wait_until([&] {
     const auto status = kernel.get_stop_status(stopped.value().stop_id);
@@ -3156,8 +3150,8 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto status = kernel.get_stop_status(stopped.value().stop_id);
   ASSERT_TRUE(status.ok());
   ASSERT_TRUE(status.value().stop_certificate.has_value());
-  const auto certificate = kernel.get_stop_certificate(
-      status.value().stop_certificate->stop_certificate_id);
+  const auto certificate =
+      kernel.get_stop_certificate(status.value().stop_certificate->stop_certificate_id);
   ASSERT_TRUE(certificate.ok()) << certificate.error().message;
   ASSERT_EQ(certificate.value().scope_entries.size(), 1U);
   EXPECT_EQ(certificate.value().scope_entries.front().dispatch_state,
@@ -4204,20 +4198,19 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernelConfig config{
-      RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U};
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
   ResourceAddressedExecutionKernel kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute",
-                       CoordinateKind::kAngular),
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal, std::move(config));
   const CellAdmissionReadinessSnapshotDTO ready{
       true,
       ProgramCycleStatusDTO{RequestOwnerEpoch("program.owner"), 1U,
-                            ProgramCycleStateDTO::kIdleAfterReset,
-                            std::nullopt, std::nullopt, std::nullopt},
+                            ProgramCycleStateDTO::kIdleAfterReset, std::nullopt, std::nullopt,
+                            std::nullopt},
       true,
       1U,
       1U,
@@ -4227,51 +4220,42 @@ TEST(ResourceAddressedExecutionKernelTest,
       0U,
       0U};
   ASSERT_TRUE(kernel.UpdateCellAdmissionReadiness(ready).ok());
-  const auto claim = kernel.AcquireCellAdmissionClaim(
-      CellAdmissionClaimIntentDTO{
-          CellAdmissionClaimKindDTO::kProgramCycle,
-          CellAdmissionOwnerRoleDTO::kProgramRunner,
-          RequestOwnerEpoch("program.owner"),
-          "run.1",
-          RequestId("request.program-cycle.claim"),
-          ContentDigest(
-              "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
-          kernel.GetAuthoringAdmission().admission_generation,
-          {},
-          ProgramCycleAdmissionEvidenceDTO{ProgramRevision("program.1"),
-                                           ProgramRevision("program.1")},
-          std::nullopt});
+  const auto claim = kernel.AcquireCellAdmissionClaim(CellAdmissionClaimIntentDTO{
+      CellAdmissionClaimKindDTO::kProgramCycle,
+      CellAdmissionOwnerRoleDTO::kProgramRunner,
+      RequestOwnerEpoch("program.owner"),
+      "run.1",
+      RequestId("request.program-cycle.claim"),
+      ContentDigest("sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+      kernel.GetAuthoringAdmission().admission_generation,
+      {},
+      ProgramCycleAdmissionEvidenceDTO{ProgramRevision("program.1"), ProgramRevision("program.1")},
+      std::nullopt});
   ASSERT_TRUE(claim.ok()) << claim.error().message;
 
-  const auto stopped = kernel.stop(
-      program_run_stop_request("request.program-run.before-execute", "run.1"));
+  const auto stopped =
+      kernel.stop(program_run_stop_request("request.program-run.before-execute", "run.1"));
   ASSERT_TRUE(stopped.ok()) << stopped.error().message;
   EXPECT_EQ(stopped.value().resolution_disposition,
             StopResolutionDispositionDTO::kAlreadyTerminalNoEffect);
   EXPECT_TRUE(stopped.value().affected_operation_revisions.empty());
 
-  const auto rejected =
-      kernel.execute(motion_operation("request.program-run.late-execute"));
+  const auto rejected = kernel.execute(motion_operation("request.program-run.late-execute"));
   ASSERT_FALSE(rejected.ok());
-  EXPECT_EQ(rejected.error().details.at("reason"),
-            "program_run_stop_fence_active");
+  EXPECT_EQ(rejected.error().details.at("reason"), "program_run_stop_fence_active");
   ASSERT_TRUE(wait_until([&] {
     const auto status = kernel.get_stop_status(stopped.value().stop_id);
     return status.ok() && status.value().state == StopStatusStateDTO::kSucceeded;
   }));
 
   const auto stale_release = kernel.release_program_run_stop_fence(
-      ProgramRunId("run.1"), StopId("stop.stale"),
-      stopped.value().stop_generation);
+      ProgramRunId("run.1"), StopId("stop.stale"), stopped.value().stop_generation);
   ASSERT_FALSE(stale_release.ok());
-  EXPECT_EQ(stale_release.error().details.at("reason"),
-            "program_run_stop_fence_stale");
+  EXPECT_EQ(stale_release.error().details.at("reason"), "program_run_stop_fence_stale");
   const auto released = kernel.release_program_run_stop_fence(
-      ProgramRunId("run.1"), stopped.value().stop_id,
-      stopped.value().stop_generation);
+      ProgramRunId("run.1"), stopped.value().stop_id, stopped.value().stop_generation);
   ASSERT_TRUE(released.ok()) << released.error().message;
-  const auto admitted =
-      kernel.execute(motion_operation("request.program-run.after-release"));
+  const auto admitted = kernel.execute(motion_operation("request.program-run.after-release"));
   ASSERT_TRUE(admitted.ok()) << admitted.error().message;
 }
 
@@ -6271,36 +6255,30 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine engine;
   ResourceAddressedExecutionKernel kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute",
-                       CoordinateKind::kAngular),
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
 
-  const auto initial =
-      kernel.get_runtime_scale_control(runtime_scale_control_selector());
+  const auto initial = kernel.get_runtime_scale_control(runtime_scale_control_selector());
   ASSERT_TRUE(initial.ok()) << initial.error().message;
   EXPECT_TRUE(initial.value().supported);
   EXPECT_FALSE(initial.value().frozen);
-  EXPECT_EQ(initial.value().control_generation,
-            RuntimeScaleControlGeneration(0U));
+  EXPECT_EQ(initial.value().control_generation, RuntimeScaleControlGeneration(0U));
   EXPECT_DOUBLE_EQ(initial.value().requested_scale, 1.0);
   EXPECT_FALSE(initial.value().active_operation_id.has_value());
 
-  const auto request =
-      runtime_scale_control_request("request.scale.control.1", 0U, 0.4);
+  const auto request = runtime_scale_control_request("request.scale.control.1", 0U, 0.4);
   const auto configured = kernel.set_runtime_scale_control(request);
   ASSERT_TRUE(configured.ok()) << configured.error().message;
-  EXPECT_EQ(configured.value().control_generation,
-            RuntimeScaleControlGeneration(1U));
+  EXPECT_EQ(configured.value().control_generation, RuntimeScaleControlGeneration(1U));
   EXPECT_DOUBLE_EQ(configured.value().requested_scale, 0.4);
   EXPECT_FALSE(configured.value().active_operation_id.has_value());
   EXPECT_EQ(engine.runtime_scale_calls, 0);
 
   const auto replay = kernel.set_runtime_scale_control(request);
   ASSERT_TRUE(replay.ok()) << replay.error().message;
-  EXPECT_EQ(replay.value().replay_status,
-            RequestReplayStatusDTO::kReplayedExact);
+  EXPECT_EQ(replay.value().replay_status, RequestReplayStatusDTO::kReplayedExact);
   EXPECT_EQ(engine.runtime_scale_calls, 0);
   auto conflicting_request = request;
   conflicting_request.scale = 0.5;
@@ -6309,43 +6287,85 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(conflict.error().code, "request_id_conflict");
   EXPECT_EQ(engine.runtime_scale_calls, 0);
 
-  const auto first = kernel.execute(
-      motion_operation("request.scale.control.first-operation"));
+  const auto first = kernel.execute(motion_operation("request.scale.control.first-operation"));
   ASSERT_TRUE(first.ok()) << first.error().message;
   ASSERT_TRUE(engine.last_execute.has_value());
   ASSERT_TRUE(engine.last_execute->initial_runtime_scale.has_value());
-  EXPECT_DOUBLE_EQ(
-      engine.last_execute->initial_runtime_scale->requested_scale, 0.4);
+  EXPECT_DOUBLE_EQ(engine.last_execute->initial_runtime_scale->requested_scale, 0.4);
   ASSERT_TRUE(engine.last_runtime_scale_command.has_value());
   EXPECT_DOUBLE_EQ(engine.last_runtime_scale_command->requested_scale, 0.4);
 
   engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kCompleted);
-  const auto acknowledged = kernel.acknowledge_completed(control_request(
-      "request.scale.control.first-ack", first.value(), 1U));
+  const auto acknowledged = kernel.acknowledge_completed(
+      control_request("request.scale.control.first-ack", first.value(), 1U));
   ASSERT_TRUE(acknowledged.ok()) << acknowledged.error().message;
   ASSERT_TRUE(wait_until([&] {
     const auto slots = kernel.resource_snapshot();
     return !slots.empty() && slots.front().state == ResourceSlotState::kFree;
   }));
 
-  const auto between =
-      kernel.get_runtime_scale_control(runtime_scale_control_selector());
+  const auto between = kernel.get_runtime_scale_control(runtime_scale_control_selector());
   ASSERT_TRUE(between.ok()) << between.error().message;
-  EXPECT_EQ(between.value().control_generation,
-            RuntimeScaleControlGeneration(1U));
+  EXPECT_EQ(between.value().control_generation, RuntimeScaleControlGeneration(1U));
   EXPECT_DOUBLE_EQ(between.value().requested_scale, 0.4);
   EXPECT_FALSE(between.value().active_operation_id.has_value());
 
-  const auto second = kernel.execute(
-      motion_operation("request.scale.control.second-operation"));
+  const auto second = kernel.execute(motion_operation("request.scale.control.second-operation"));
   ASSERT_TRUE(second.ok()) << second.error().message;
   ASSERT_TRUE(engine.last_execute.has_value());
-  EXPECT_DOUBLE_EQ(
-      engine.last_execute->initial_runtime_scale->requested_scale, 0.4);
-  const auto active =
-      kernel.get_runtime_scale_control(runtime_scale_control_selector());
+  EXPECT_DOUBLE_EQ(engine.last_execute->initial_runtime_scale->requested_scale, 0.4);
+  const auto active = kernel.get_runtime_scale_control(runtime_scale_control_selector());
   ASSERT_TRUE(active.ok()) << active.error().message;
   EXPECT_EQ(active.value().active_operation_id, second.value().operation_id);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     StateConditionedExecutionControlsDoNotExhaustOwnerLifetimeCapacity) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 2U});
+
+  for (std::uint64_t cycle = 0U; cycle < 8U; ++cycle) {
+    const auto executed =
+        kernel.execute(motion_operation("request.bounded.execute." + std::to_string(cycle)));
+    ASSERT_TRUE(executed.ok()) << "cycle " << cycle << ": " << executed.error().message;
+    engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kCompleted);
+    const auto acknowledged = kernel.acknowledge_completed(
+        control_request("request.bounded.ack." + std::to_string(cycle), executed.value(), 1U));
+    ASSERT_TRUE(acknowledged.ok()) << "cycle " << cycle << ": " << acknowledged.error().message;
+    ASSERT_TRUE(wait_until(
+        [&] { return kernel.resource_snapshot().front().state == ResourceSlotState::kFree; }));
+  }
+
+  auto control = kernel.get_runtime_scale_control(runtime_scale_control_selector());
+  ASSERT_TRUE(control.ok()) << control.error().message;
+  for (std::uint64_t update = 0U; update < 8U; ++update) {
+    const auto accepted = kernel.set_runtime_scale_control(runtime_scale_control_request(
+        "request.bounded.scale-control." + std::to_string(update),
+        control.value().control_generation.value(), 0.1 * static_cast<double>((update % 8U) + 1U)));
+    ASSERT_TRUE(accepted.ok()) << "update " << update << ": " << accepted.error().message;
+    control = kernel.get_runtime_scale_control(runtime_scale_control_selector());
+    ASSERT_TRUE(control.ok()) << control.error().message;
+  }
+
+  const auto active = kernel.execute(motion_operation("request.bounded.scale-operation"));
+  ASSERT_TRUE(active.ok()) << active.error().message;
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  for (std::uint64_t update = 0U; update < 8U; ++update) {
+    const auto status = kernel.get_runtime_scale(active.value().operation_id);
+    ASSERT_TRUE(status.ok()) << status.error().message;
+    const auto accepted = kernel.set_runtime_scale(runtime_scale_request(
+        "request.bounded.scale." + std::to_string(update), active.value(),
+        status.value().operation_revision.value(), status.value().runtime_scale_generation.value(),
+        0.1 * static_cast<double>((update % 8U) + 1U)));
+    ASSERT_TRUE(accepted.ok()) << "update " << update << ": " << accepted.error().message;
+  }
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -6355,13 +6375,11 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine engine;
   ResourceAddressedExecutionKernel kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute",
-                       CoordinateKind::kAngular),
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
-  const auto executed =
-      kernel.execute(motion_operation("request.scale.control.live-operation"));
+  const auto executed = kernel.execute(motion_operation("request.scale.control.live-operation"));
   ASSERT_TRUE(executed.ok()) << executed.error().message;
   engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
 
@@ -6369,29 +6387,23 @@ TEST(ResourceAddressedExecutionKernelTest,
       runtime_scale_control_request("request.scale.control.live", 0U, 0.25));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
   EXPECT_EQ(accepted.value().active_operation_id, executed.value().operation_id);
-  EXPECT_EQ(accepted.value().control_generation,
-            RuntimeScaleControlGeneration(1U));
+  EXPECT_EQ(accepted.value().control_generation, RuntimeScaleControlGeneration(1U));
   ASSERT_TRUE(accepted.value().active_operation_scale_generation.has_value());
-  EXPECT_EQ(*accepted.value().active_operation_scale_generation,
-            RuntimeScaleGeneration(1U));
+  EXPECT_EQ(*accepted.value().active_operation_scale_generation, RuntimeScaleGeneration(1U));
   ASSERT_TRUE(engine.last_runtime_scale_command.has_value());
   EXPECT_DOUBLE_EQ(engine.last_runtime_scale_command->requested_scale, 0.25);
 
-  const auto status =
-      kernel.get_runtime_scale_control(runtime_scale_control_selector());
+  const auto status = kernel.get_runtime_scale_control(runtime_scale_control_selector());
   ASSERT_TRUE(status.ok()) << status.error().message;
-  EXPECT_EQ(status.value().control_generation,
-            RuntimeScaleControlGeneration(1U));
+  EXPECT_EQ(status.value().control_generation, RuntimeScaleControlGeneration(1U));
   EXPECT_DOUBLE_EQ(status.value().requested_scale, 0.25);
   EXPECT_DOUBLE_EQ(*status.value().effective_scale, 0.25);
-  EXPECT_EQ(status.value().application_state,
-            RuntimeScaleApplicationState::kApplied);
+  EXPECT_EQ(status.value().application_state, RuntimeScaleApplicationState::kApplied);
 
   const auto stale = kernel.set_runtime_scale_control(
       runtime_scale_control_request("request.scale.control.stale", 0U, 0.5));
   ASSERT_FALSE(stale.ok());
-  EXPECT_EQ(stale.error().details.at("reason"),
-            "runtime_scale_control_generation_stale");
+  EXPECT_EQ(stale.error().details.at("reason"), "runtime_scale_control_generation_stale");
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -6400,15 +6412,11 @@ TEST(ResourceAddressedExecutionKernelTest,
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
   const auto program_binding =
-      make_binding("arm", "arm", "execution.trajectory.execute",
-                   CoordinateKind::kAngular);
-  const auto direct_control_binding =
-      same_control_scope_program_alias(program_binding);
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto direct_control_binding = same_control_scope_program_alias(program_binding);
   ResourceAddressedExecutionKernel kernel(
-      {registration(program_binding, engine),
-       registration(direct_control_binding, engine)},
-      clock, scheduler, default_journal,
-      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
+      {registration(program_binding, engine), registration(direct_control_binding, engine)}, clock,
+      scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
 
   const auto configured = kernel.set_runtime_scale_control(
       runtime_scale_control_request("request.scale.control.shared", 0U, 0.4));
@@ -6417,38 +6425,30 @@ TEST(ResourceAddressedExecutionKernelTest,
       direct_control_binding.value().program_binding_id,
       direct_control_binding.value().component_role_id,
       direct_control_binding.value().target_role_id};
-  const auto shared_projection =
-      kernel.get_runtime_scale_control(direct_selector);
+  const auto shared_projection = kernel.get_runtime_scale_control(direct_selector);
   ASSERT_TRUE(shared_projection.ok()) << shared_projection.error().message;
-  EXPECT_EQ(shared_projection.value().control_generation,
-            RuntimeScaleControlGeneration(1U));
+  EXPECT_EQ(shared_projection.value().control_generation, RuntimeScaleControlGeneration(1U));
   EXPECT_DOUBLE_EQ(shared_projection.value().requested_scale, 0.4);
 
   auto direct = motion_operation("request.scale.control.direct");
   direct.program_id = direct_control_binding.value().program_id;
   direct.program_revision = direct_control_binding.value().program_revision;
-  direct.program_binding_id =
-      direct_control_binding.value().program_binding_id;
-  direct.participants.front().component_role_id =
-      direct_control_binding.value().component_role_id;
-  direct.participants.front().target_role_id =
-      direct_control_binding.value().target_role_id;
+  direct.program_binding_id = direct_control_binding.value().program_binding_id;
+  direct.participants.front().component_role_id = direct_control_binding.value().component_role_id;
+  direct.participants.front().target_role_id = direct_control_binding.value().target_role_id;
   const auto executed = kernel.execute(direct);
   ASSERT_TRUE(executed.ok()) << executed.error().message;
   ASSERT_TRUE(engine.last_execute.has_value());
   ASSERT_TRUE(engine.last_execute->initial_runtime_scale.has_value());
-  EXPECT_DOUBLE_EQ(engine.last_execute->initial_runtime_scale->requested_scale,
-                   0.4);
+  EXPECT_DOUBLE_EQ(engine.last_execute->initial_runtime_scale->requested_scale, 0.4);
 
   engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
-  const auto status =
-      kernel.get_runtime_scale_control(runtime_scale_control_selector());
+  const auto status = kernel.get_runtime_scale_control(runtime_scale_control_selector());
   ASSERT_TRUE(status.ok()) << status.error().message;
   EXPECT_EQ(status.value().active_operation_id, executed.value().operation_id);
 
   const auto retimed = kernel.set_runtime_scale_control(
-      runtime_scale_control_request("request.scale.control.shared.live", 1U,
-                                    0.25));
+      runtime_scale_control_request("request.scale.control.shared.live", 1U, 0.25));
   ASSERT_TRUE(retimed.ok()) << retimed.error().message;
   EXPECT_EQ(retimed.value().active_operation_id, executed.value().operation_id);
   ASSERT_TRUE(engine.last_runtime_scale_command.has_value());
@@ -6464,13 +6464,11 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine engine;
   ResourceAddressedExecutionKernel kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute",
-                       CoordinateKind::kAngular),
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
-  const auto executed =
-      kernel.execute(motion_operation("request.scale.control.stop-race"));
+  const auto executed = kernel.execute(motion_operation("request.scale.control.stop-race"));
   ASSERT_TRUE(executed.ok()) << executed.error().message;
   engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
 
@@ -6483,17 +6481,15 @@ TEST(ResourceAddressedExecutionKernelTest,
     release_scale.wait();
   };
   auto scale_future = std::async(std::launch::async, [&] {
-    return kernel.set_runtime_scale_control(runtime_scale_control_request(
-        "request.scale.control.stop-race.update", 0U, 0.4));
+    return kernel.set_runtime_scale_control(
+        runtime_scale_control_request("request.scale.control.stop-race.update", 0U, 0.4));
   });
   ASSERT_EQ(scale_entered.wait_for(10s), std::future_status::ready);
 
   auto stop_future = std::async(std::launch::async, [&] {
-    return kernel.stop(stop_request("request.scale.control.stop-race.stop",
-                                    executed.value(), 1U));
+    return kernel.stop(stop_request("request.scale.control.stop-race.stop", executed.value(), 1U));
   });
-  const bool stop_was_not_delayed =
-      stop_future.wait_for(250ms) == std::future_status::ready;
+  const bool stop_was_not_delayed = stop_future.wait_for(250ms) == std::future_status::ready;
   release_scale_promise.set_value();
   ASSERT_TRUE(stop_was_not_delayed)
       << "an in-flight runtime-scale provider call delayed Stop acceptance";
@@ -6511,11 +6507,9 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(terminal.value().state, OperationStateKind::kStopped);
   EXPECT_EQ(terminal.value().active_stop_id, stopped.value().stop_id);
 
-  const auto setting =
-      kernel.get_runtime_scale_control(runtime_scale_control_selector());
+  const auto setting = kernel.get_runtime_scale_control(runtime_scale_control_selector());
   ASSERT_TRUE(setting.ok()) << setting.error().message;
-  EXPECT_EQ(setting.value().control_generation,
-            RuntimeScaleControlGeneration(1U));
+  EXPECT_EQ(setting.value().control_generation, RuntimeScaleControlGeneration(1U));
   EXPECT_DOUBLE_EQ(setting.value().requested_scale, 0.4);
 }
 
@@ -6526,26 +6520,22 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine engine;
   ResourceAddressedExecutionKernel kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute",
-                       CoordinateKind::kAngular),
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
 
   const auto configured = kernel.set_runtime_scale_control(
-      runtime_scale_control_request("request.scale.control.before-reset", 0U,
-                                    0.35));
+      runtime_scale_control_request("request.scale.control.before-reset", 0U, 0.35));
   ASSERT_TRUE(configured.ok()) << configured.error().message;
-  const auto first =
-      kernel.execute(motion_operation("request.scale.control.reset.first"));
+  const auto first = kernel.execute(motion_operation("request.scale.control.reset.first"));
   ASSERT_TRUE(first.ok()) << first.error().message;
   ASSERT_TRUE(engine.last_execute.has_value());
-  EXPECT_DOUBLE_EQ(engine.last_execute->initial_runtime_scale->requested_scale,
-                   0.35);
+  EXPECT_DOUBLE_EQ(engine.last_execute->initial_runtime_scale->requested_scale, 0.35);
   engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
 
-  const auto stopped = kernel.stop(stop_request(
-      "request.scale.control.reset.stop", first.value(), 1U));
+  const auto stopped =
+      kernel.stop(stop_request("request.scale.control.reset.stop", first.value(), 1U));
   ASSERT_TRUE(stopped.ok()) << stopped.error().message;
   ASSERT_TRUE(wait_until([&] {
     const auto state = kernel.get_operation_state(first.value().operation_id);
@@ -6553,29 +6543,24 @@ TEST(ResourceAddressedExecutionKernelTest,
   }));
   const auto stopped_state = kernel.get_operation_state(first.value().operation_id);
   ASSERT_TRUE(stopped_state.ok()) << stopped_state.error().message;
-  const auto reset = kernel.reset(control_request(
-      "request.scale.control.reset.release", first.value(),
-      stopped_state.value().operation_revision.value()));
+  const auto reset =
+      kernel.reset(control_request("request.scale.control.reset.release", first.value(),
+                                   stopped_state.value().operation_revision.value()));
   ASSERT_TRUE(reset.ok()) << reset.error().message;
-  ASSERT_TRUE(wait_until([&] {
-    return kernel.resource_snapshot().front().state == ResourceSlotState::kFree;
-  }));
+  ASSERT_TRUE(wait_until(
+      [&] { return kernel.resource_snapshot().front().state == ResourceSlotState::kFree; }));
 
-  const auto between =
-      kernel.get_runtime_scale_control(runtime_scale_control_selector());
+  const auto between = kernel.get_runtime_scale_control(runtime_scale_control_selector());
   ASSERT_TRUE(between.ok()) << between.error().message;
-  EXPECT_EQ(between.value().control_generation,
-            RuntimeScaleControlGeneration(1U));
+  EXPECT_EQ(between.value().control_generation, RuntimeScaleControlGeneration(1U));
   EXPECT_DOUBLE_EQ(between.value().requested_scale, 0.35);
   EXPECT_FALSE(between.value().active_operation_id.has_value());
 
-  const auto second =
-      kernel.execute(motion_operation("request.scale.control.reset.second"));
+  const auto second = kernel.execute(motion_operation("request.scale.control.reset.second"));
   ASSERT_TRUE(second.ok()) << second.error().message;
   ASSERT_TRUE(engine.last_execute.has_value());
   ASSERT_TRUE(engine.last_execute->initial_runtime_scale.has_value());
-  EXPECT_DOUBLE_EQ(engine.last_execute->initial_runtime_scale->requested_scale,
-                   0.35);
+  EXPECT_DOUBLE_EQ(engine.last_execute->initial_runtime_scale->requested_scale, 0.35);
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -8066,8 +8051,8 @@ void VerifyStopFaultRecoveryMotionAdmission(const bool latch_manager_liveness_lo
     // A cleared Stop-fault latch remains retained as history. It must never
     // contaminate recovery for a later ordinary Stop or turn that operation
     // into Reset-only intervention.
-    const auto ordinary_stop = kernel.stop(
-        stop_request("request.surveillance.admitted.stop", admitted.value(), 1U));
+    const auto ordinary_stop =
+        kernel.stop(stop_request("request.surveillance.admitted.stop", admitted.value(), 1U));
     ASSERT_TRUE(ordinary_stop.ok()) << ordinary_stop.error().message;
     ASSERT_TRUE(wait_until([&] {
       const auto state = kernel.get_operation_state(admitted.value().operation_id);
@@ -8078,8 +8063,7 @@ void VerifyStopFaultRecoveryMotionAdmission(const bool latch_manager_liveness_lo
     ASSERT_TRUE(ordinary_recovery.ok()) << ordinary_recovery.error().message;
     EXPECT_EQ(ordinary_recovery.value().assessment.recovery_class,
               RecoveryClass::kOrdinaryOperatorStop);
-    EXPECT_EQ(ordinary_recovery.value().assessment.status,
-              RecoveryAssessmentStatus::kRetryReady);
+    EXPECT_EQ(ordinary_recovery.value().assessment.status, RecoveryAssessmentStatus::kRetryReady);
     EXPECT_TRUE(ordinary_recovery.value().assessment.retry_admissible);
     EXPECT_FALSE(kernel.cell_stop_action_projection().fault.has_value());
   }
@@ -8778,7 +8762,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 
   ResourceAddressedExecutionKernel kernel(
       {registration(binding, engine)}, clock, scheduler, journal,
-      {RequestOwnerEpoch("kernel.epoch.new"), CellId("cell.test"), 16U});
+      {RequestOwnerEpoch("kernel.epoch.new"), CellId("cell.test"), 1U});
   const auto historical = kernel.get_operation_state(old_operation);
   ASSERT_TRUE(historical.ok()) << historical.error().message;
   EXPECT_EQ(historical.value().state, OperationStateKind::kInterventionRequired);
@@ -8793,7 +8777,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   intent.request_context.request_owner_epoch = RequestOwnerEpoch("kernel.epoch.new");
   const auto blocked = kernel.execute(intent);
   ASSERT_FALSE(blocked.ok());
-  EXPECT_EQ(blocked.error().details.at("reason"), "resource_scope_busy");
+  EXPECT_EQ(blocked.error().details.at("reason"), "operation_capacity_full");
   EXPECT_EQ(engine.execute_calls, 0);
   EXPECT_EQ(engine.stop_calls, 0);
 
@@ -8829,6 +8813,9 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto admitted = kernel.execute(admitted_intent);
   ASSERT_TRUE(admitted.ok()) << admitted.error().message;
   EXPECT_EQ(engine.execute_calls, 1);
+  ASSERT_EQ(journal.protected_operation_inventories.size(), 1U);
+  EXPECT_EQ(journal.protected_operation_inventories.front(),
+            std::vector<OperationId>{admitted.value().operation_id});
 }
 
 TEST(ResourceAddressedExecutionKernelTest,

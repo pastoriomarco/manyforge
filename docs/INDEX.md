@@ -201,6 +201,12 @@ rather than silently checking only a reduced projection.
   - Independent I5/H0 owner-issued projection, generated from the headless
     FastAPI application. The default live schema is at `:9010/openapi.json`.
 
+- [`reference/CONTROL_WEBSOCKET_V1.md`](reference/CONTROL_WEBSOCKET_V1.md)
+
+  - Versioned Composer/Headless execution-control session: fixed heartbeat and
+    freshness profile, exact sequencing, common ingress, authoritative
+    lifecycle projection, backpressure, reconnect, and security boundaries.
+
 ### Historical Composer/client interaction references
 
 - [`reference/HISTORICAL_COMPOSER_INTERACTION_REFERENCE.md`](reference/HISTORICAL_COMPOSER_INTERACTION_REFERENCE.md)

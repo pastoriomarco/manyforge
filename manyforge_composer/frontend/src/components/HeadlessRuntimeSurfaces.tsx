@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { api } from '../api/client';
+import { api, HISTORIAN_PAGE_LIMIT } from '../api/client';
 import type { HistorianListQuery } from '../api/client';
 import { useShellHeadlessState } from '../hooks/useHeadlessState';
 import type {
@@ -33,6 +33,8 @@ export interface ClientOperationalError {
   id: string;
   title: string;
   message: string;
+  active: boolean;
+  acknowledgementRequired: boolean;
 }
 
 
@@ -171,6 +173,7 @@ interface HeadlessRuntimeSurfacesProps {
   enabled: boolean;
   headlessStateSource: HeadlessStateSource;
   clientErrors?: ClientOperationalError[];
+  clientHistory?: ExecutionHistoryEventView[];
   onAcknowledgeClientError?: (id: string) => void;
   attentionRequest?: string | null;
   expanded?: boolean;
@@ -182,6 +185,7 @@ interface HeadlessRuntimeSurfacesViewProps {
   enabled: boolean;
   headlessState: HeadlessStateResult;
   clientErrors?: ClientOperationalError[];
+  clientHistory?: ExecutionHistoryEventView[];
   onAcknowledgeClientError?: (id: string) => void;
   attentionRequest?: string | null;
   expanded?: boolean;
@@ -215,6 +219,7 @@ export function HeadlessRuntimeSurfacesView({
   enabled,
   headlessState,
   clientErrors = [],
+  clientHistory = [],
   onAcknowledgeClientError,
   attentionRequest = null,
   expanded = true,
@@ -230,7 +235,9 @@ export function HeadlessRuntimeSurfacesView({
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState<string | null>(null);
   const [historyEvents, setHistoryEvents] = useState<ExecutionHistoryEventView[]>([]);
-  const [historyQuery, setHistoryQuery] = useState<HistorianListQuery>({ limit: 64 });
+  const [historyQuery, setHistoryQuery] = useState<HistorianListQuery>({
+    limit: HISTORIAN_PAGE_LIMIT,
+  });
   const [historyNextBefore, setHistoryNextBefore] = useState<number | null>(null);
   const [historyHasOlder, setHistoryHasOlder] = useState(false);
   const [historyDetail, setHistoryDetail] = useState<HistorianDetail | null>(null);
@@ -271,6 +278,11 @@ export function HeadlessRuntimeSurfacesView({
   const attentionSeverity = clientErrors.length > 0 || attention.some(
     (alarm) => alarm.priority === 'critical' || alarm.priority === 'high',
   ) ? 'error' : 'warning';
+  const combinedHistory = useMemo(() => (
+    [...clientHistory, ...historyEvents].sort((left, right) => (
+      right.timestampNs - left.timestampNs || left.id.localeCompare(right.id)
+    ))
+  ), [clientHistory, historyEvents]);
   useEffect(() => {
     if (attentionCount < 2) setBulkFence(null);
   }, [attentionCount]);
@@ -306,7 +318,11 @@ export function HeadlessRuntimeSurfacesView({
   };
 
   const loadHistoryDetail = async (event: ExecutionHistoryEventView) => {
-    if (event.sequence === undefined) return;
+    if (event.sequence === undefined) {
+      setHistoryDetail(null);
+      setHistoryDetailError(null);
+      return;
+    }
     setHistoryDetailLoading(true);
     setHistoryDetailError(null);
     try {
@@ -417,10 +433,12 @@ export function HeadlessRuntimeSurfacesView({
             <button
               type="button"
               disabled={bulkBusy || busyActivation !== null}
-              title="Acknowledge this Composer message. This does not change execution."
+              title={`${singleClientError.acknowledgementRequired
+                ? 'Acknowledge'
+                : 'Dismiss'} this Composer message. This does not change execution.`}
               onClick={() => onAcknowledgeClientError(singleClientError.id)}
             >
-              Acknowledge
+              {singleClientError.acknowledgementRequired ? 'Acknowledge' : 'Dismiss'}
             </button>
           )}
           {singleAlarm !== undefined && (
@@ -508,7 +526,9 @@ export function HeadlessRuntimeSurfacesView({
           <div className="operator-alarm-panel" key={clientError.id}>
             <details>
               <summary>
-                COMPOSER ERROR — DISMISSAL REQUIRED · {clientError.title}
+                COMPOSER ERROR{clientError.acknowledgementRequired
+                  ? ` — ${clientError.active ? '' : 'RESOLVED · '}DISMISSAL REQUIRED`
+                  : ''} · {clientError.title}
               </summary>
               <KernelErrorPanel
                 error={{ code: clientError.id, message: clientError.message }}
@@ -526,7 +546,9 @@ export function HeadlessRuntimeSurfacesView({
                 type="button"
                 onClick={() => onAcknowledgeClientError?.(clientError.id)}
               >
-                Acknowledge message
+                {clientError.acknowledgementRequired
+                  ? 'Acknowledge message'
+                  : 'Dismiss message'}
               </button>
             </div>
           </div>
@@ -576,7 +598,8 @@ export function HeadlessRuntimeSurfacesView({
         onReload={(query) => { void loadHistory(query); }}
         onLoadOlder={() => { void loadHistory(historyQuery, true); }}
         hasOlder={historyHasOlder}
-        events={historyEvents}
+        events={combinedHistory}
+        eyebrow="Backend history and bounded Composer-session trace"
         loading={historyLoading}
         error={historyError}
         selectedDetail={historyDetail}
@@ -625,6 +648,7 @@ export function HeadlessRuntimeSurfaces({
   enabled,
   headlessStateSource,
   clientErrors = [],
+  clientHistory = [],
   onAcknowledgeClientError,
   attentionRequest = null,
   expanded = true,
@@ -647,6 +671,7 @@ export function HeadlessRuntimeSurfaces({
       enabled={enabled}
       headlessState={headlessState}
       clientErrors={clientErrors}
+      clientHistory={clientHistory}
       onAcknowledgeClientError={onAcknowledgeClientError}
       attentionRequest={attentionRequest}
       expanded={expanded}

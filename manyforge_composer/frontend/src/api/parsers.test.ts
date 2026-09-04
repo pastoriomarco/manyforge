@@ -794,6 +794,14 @@ describe('Program product projections', () => {
       program_run_id: 'program-run.1',
       cycle_claim_generation: 2,
       terminal_or_settlement_reference: null,
+      execution_control_revision: 4,
+      causal_correlation_id: null,
+      causal_session_id: null,
+      causal_client_sequence: null,
+      current_command_kind: null,
+      failure: null,
+      reset_phase: null,
+      allowed_commands: [],
       run_revision: 3,
       node_status_revision: 2,
       runtime_control_revision: 1,
@@ -808,6 +816,50 @@ describe('Program product projections', () => {
     expect(() => parseProgramCycleStatus({
       ...input,
       run_revision: 4,
+    })).toThrow(/exact advertised run projection/);
+  });
+
+  it('retains an immutable predecessor run after terminal owner recovery', () => {
+    const run = runStatus('failed');
+    run.tree_status = 'failure';
+    run.node_statuses = { root: 'failure' };
+    const controls = runtimeControlsProjection();
+    controls.owner_epoch = 'program-runner.epoch.2';
+    const input = {
+      program_runner_owner_epoch: 'program-runner.epoch.2',
+      cycle_generation: 8,
+      state: 'terminal_awaiting_reset',
+      program_run_id: 'program-run.1',
+      cycle_claim_generation: 2,
+      terminal_or_settlement_reference: digestA,
+      execution_control_revision: 5,
+      causal_correlation_id: 'run.1',
+      causal_session_id: null,
+      causal_client_sequence: null,
+      current_command_kind: 'program_run',
+      failure: null,
+      reset_phase: null,
+      allowed_commands: [],
+      run_revision: 3,
+      node_status_revision: 2,
+      runtime_control_revision: 1,
+      recovery_offer: null,
+      run,
+      runtime_controls: controls,
+    };
+    const cycle = parseProgramCycleStatus(input);
+
+    expect(cycle.programRunnerOwnerEpoch).toBe('program-runner.epoch.2');
+    expect(cycle.run?.ownerEpoch).toBe('program-runner.epoch.1');
+    expect(parseProgramCycleStatus({
+      ...input,
+      state: 'resetting',
+      reset_phase: 'stopping_motion',
+      current_command_kind: 'program_reset',
+    }).run?.ownerEpoch).toBe('program-runner.epoch.1');
+    expect(() => parseProgramCycleStatus({
+      ...input,
+      state: 'running',
     })).toThrow(/exact advertised run projection/);
   });
 

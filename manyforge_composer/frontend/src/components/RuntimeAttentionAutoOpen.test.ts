@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  retainActiveRuntimeAttention,
   shouldCloseAutomaticRuntimeAttention,
   unpresentedRuntimeAttention,
   type RuntimeAttentionItem,
@@ -27,6 +28,15 @@ describe('runtime attention automatic presentation', () => {
 
   it('does not turn ordinary warning state into an attention item', () => {
     expect(unpresentedRuntimeAttention(new Set(), [])).toEqual([]);
+  });
+
+  it('bounds presented identities to active conditions and permits reactivation', () => {
+    const presented = new Set([backend.identity, composer.identity]);
+    retainActiveRuntimeAttention(presented, [backend]);
+    expect([...presented]).toEqual([backend.identity]);
+    expect(unpresentedRuntimeAttention(presented, [backend, composer])).toEqual([
+      composer,
+    ]);
   });
 
   it('closes an automatically opened empty rail but preserves manual panels', () => {

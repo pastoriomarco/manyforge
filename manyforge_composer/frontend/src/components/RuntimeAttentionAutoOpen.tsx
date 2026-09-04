@@ -11,6 +11,16 @@ export function unpresentedRuntimeAttention(
   return items.filter((item) => !presented.has(item.identity));
 }
 
+export function retainActiveRuntimeAttention(
+  presented: Set<string>,
+  items: RuntimeAttentionItem[],
+): void {
+  const active = new Set(items.map((item) => item.identity));
+  presented.forEach((identity) => {
+    if (!active.has(identity)) presented.delete(identity);
+  });
+}
+
 export function shouldCloseAutomaticRuntimeAttention(
   automatic: boolean,
   activePanel: 'runtime' | 'assistant' | null,
@@ -33,6 +43,7 @@ export function RuntimeAttentionAutoOpen({
   const presented = useRef(new Set<string>());
 
   useEffect(() => {
+    retainActiveRuntimeAttention(presented.current, items);
     const unpresented = unpresentedRuntimeAttention(presented.current, items);
     items.forEach((item) => presented.current.add(item.identity));
     if (unpresented.length > 0) onOpen(unpresented[0].identity);

@@ -19,7 +19,22 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .cclc import CCLCOpenPort, CCLCOpenRequestClient
 from .execution import ExecutionCommandClient, ExecutionEventPump
-from .execution_control import ExecutionControlBusyError, ExecutionControlClient
+from .control_dispatch import (
+    HeadlessExecutionControlDispatch,
+    requires_execution_owner_fence,
+)
+from .control_protocol import (
+    ControlProtocolError,
+    ExecutionCommandRequestDTO,
+    is_stop_command,
+)
+from .control_session import serve_execution_control
+from .control_state import HeadlessControlStateSource, build_control_projection
+from .execution_control import (
+    ExecutionControlBusyError,
+    ExecutionControlClient,
+    ExecutionControlIngress,
+)
 from .manager import ManagerCommandClient
 from .models import (
     AcknowledgeAlarmRequest,
@@ -316,7 +331,6 @@ def _error_status(code: str) -> int:
             "operator_alarm_state_unavailable",
             "program_applied_selection_not_active",
             "program_runner_unavailable",
-            "program_run_request_ledger_full",
             "program_run_scheduling_failed",
             "request_ledger_full",
             "scene_projection_commit_uncertain",
@@ -433,6 +447,40 @@ def create_app(
     execution_controls = ExecutionControlClient(
         thread_name_prefix="manyforge_headless_control",
     )
+    control_dispatch = HeadlessExecutionControlDispatch(service)
+    control_ingress = ExecutionControlIngress(
+        projection=control_dispatch.owner_projection,
+        dispatch=control_dispatch,
+        lanes=execution_controls,
+    )
+    runner_control_url = getattr(
+        getattr(service, "program_runner", None),
+        "control_state_websocket_url",
+        None,
+    )
+    if not isinstance(runner_control_url, str):
+        runner_control_url = None
+    cold_watch_paths = (
+        ()
+        if config is None
+        else (
+            config.projection_root,
+            config.program_selection_state_root,
+        )
+    )
+    control_state_source = HeadlessControlStateSource(
+        service,
+        control_ingress,
+        program_runner_websocket_url=runner_control_url,
+        cold_watch_paths=cold_watch_paths,
+        cold_freshness_budget_ns=(
+            None
+            if config is None
+            else config.freshness_milliseconds * 1_000_000
+        ),
+    )
+    if event_pump is not None:
+        event_pump.set_change_observer(control_state_source.notify_cold)
     service_cclc = getattr(service, "cclc", None)
     if cclc is None:
         cclc = service_cclc
@@ -471,6 +519,70 @@ def create_app(
             stop=stop,
         )
 
+    async def rest_execution_command(
+        *,
+        command_kind: str,
+        payload: dict[str, Any],
+        request_context: Any,
+        transport_request: Request,
+    ) -> dict[str, Any]:
+        """Adapt a named REST route to the one semantic command ingress."""
+
+        if is_stop_command(command_kind):
+            # Stop must reach its reserved lane without first waiting on an
+            # owner projection. The semantic owner resolves stale exact scope
+            # conservatively; these envelope fields grant no authority.
+            owner_epoch = request_context.request_owner_epoch
+            control_revision = 1
+        else:
+            owner_epoch, control_revision = control_dispatch.owner_projection()
+        freshness = control_ingress.freshness_for(
+            owner_epoch, control_revision
+        )
+        correlation_id = (
+            request_context.correlation_id or request_context.request_id
+        )
+        command_payload = dict(payload)
+        if requires_execution_owner_fence(command_kind):
+            command_payload["expected_execution_owner_epoch"] = (
+                request_context.request_owner_epoch
+            )
+        command = ExecutionCommandRequestDTO.model_validate(
+            {
+                "command_envelope": {
+                    "schema_version": "manyforge.execution_command.v1",
+                    "command_kind": command_kind,
+                    "correlation_id": correlation_id,
+                    "source_label": request_context.source_label,
+                    "control_session_id": None,
+                    "client_sequence": None,
+                    "freshness": freshness.model_dump(mode="json"),
+                    "expected_semantic_owner_epoch": owner_epoch,
+                    "expected_execution_control_revision": control_revision,
+                },
+                "payload": command_payload,
+            }
+        )
+        attribution = _trusted_attribution(
+            transport_request, trusted_principal_adapter
+        )
+        submission = await control_ingress.submit(
+            command,
+            transport_kind="rest",
+            trusted_principal_id=attribution.principal_id,
+            assurance=attribution.assurance,
+        )
+        control_state_source.notify_control()
+        if submission.receipt.disposition == "rejected" and not (
+            isinstance(submission.result, dict)
+            and submission.result.get("ok") is False
+        ):
+            raise HeadlessApiError(
+                submission.receipt.code,
+                "execution command was rejected by its current owner",
+            )
+        return {} if submission.result is None else dict(submission.result)
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         if event_pump is not None:
@@ -479,6 +591,7 @@ def create_app(
             yield
         finally:
             try:
+                await control_state_source.close()
                 if owns_core:
                     try:
                         if event_pump is not None:
@@ -490,6 +603,7 @@ def create_app(
                         finally:
                             service.core.shutdown()
             finally:
+                control_ingress.close()
                 execution_controls.close()
 
     app = FastAPI(
@@ -535,6 +649,23 @@ def create_app(
                 "detail": {
                     "code": error.code,
                     "details": error.details,
+                    "message": str(error),
+                    "request_id": getattr(request.state, "request_id", None),
+                }
+            },
+        )
+
+    @app.exception_handler(ControlProtocolError)
+    async def control_protocol_error_handler(
+        request: Request,
+        error: ControlProtocolError,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": {
+                    "code": error.code,
+                    "details": {},
                     "message": str(error),
                     "request_id": getattr(request.state, "request_id", None),
                 }
@@ -748,9 +879,15 @@ def create_app(
 
     @app.post("/api/program/runs")
     async def program_run_start(
-        request: ProgramRunStartRequest,
+        body: ProgramRunStartRequest,
+        request: Request,
     ) -> dict[str, Any]:
-        return await json_control_call(lambda: service.program_run_start(request))
+        return await rest_execution_command(
+            command_kind="program_run",
+            payload=body.model_dump(mode="json"),
+            request_context=body,
+            transport_request=request,
+        )
 
     @app.post("/api/program/scene-preparations")
     async def program_scene_prepare(
@@ -769,86 +906,142 @@ def create_app(
     @app.post("/api/program/runs/{program_run_id}/stop")
     async def program_run_stop(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
-        request: ProgramRunStopRequest,
+        body: ProgramRunStopRequest,
+        request: Request,
     ) -> dict[str, Any]:
-        if request.program_run_id != program_run_id:
+        if body.program_run_id != program_run_id:
             raise HeadlessApiError(
                 "program_run_path_invalid",
                 "Program-run identity in the path and request body must match",
             )
-        return await json_control_call(
-            lambda: service.program_run_stop(program_run_id, request),
-            stop=True,
+        return await rest_execution_command(
+            command_kind="program_stop",
+            payload=body.model_dump(mode="json"),
+            request_context=body,
+            transport_request=request,
         )
 
     @app.post("/api/program/runs/{program_run_id}/motion-stop")
     async def program_run_motion_stop(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
-        request: ProgramRunStopRequest,
+        body: ProgramRunStopRequest,
+        request: Request,
     ) -> dict[str, Any]:
-        if request.program_run_id != program_run_id:
+        if body.program_run_id != program_run_id:
             raise HeadlessApiError(
                 "program_run_path_invalid",
                 "Program-run identity in path and body must match",
             )
-        return await json_control_call(
-            lambda: service.program_run_motion_stop(program_run_id, request),
-            stop=True,
+        return await rest_execution_command(
+            command_kind="program_motion_stop",
+            payload=body.model_dump(mode="json"),
+            request_context=body,
+            transport_request=request,
         )
 
     @app.post("/api/program/runs/{program_run_id}/full-stop")
     async def program_run_full_stop(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
-        request: ProgramRunStopRequest,
+        body: ProgramRunStopRequest,
+        request: Request,
     ) -> dict[str, Any]:
-        if request.program_run_id != program_run_id:
+        if body.program_run_id != program_run_id:
             raise HeadlessApiError(
                 "program_run_path_invalid",
                 "Program-run identity in path and body must match",
             )
-        return await json_control_call(
-            lambda: service.program_run_full_stop(program_run_id, request),
-            stop=True,
+        return await rest_execution_command(
+            command_kind="program_full_stop",
+            payload=body.model_dump(mode="json"),
+            request_context=body,
+            transport_request=request,
         )
 
     @app.post("/api/program/runs/{program_run_id}/resume-full-stop")
     async def program_run_resume_full_stop(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
-        request: ProgramFullStopResumeRequest,
+        body: ProgramFullStopResumeRequest,
+        request: Request,
     ) -> dict[str, Any]:
-        if request.program_run_id != program_run_id:
+        if body.program_run_id != program_run_id:
             raise HeadlessApiError(
                 "program_run_path_invalid",
                 "Program-run identity in path and body must match",
             )
-        return await json_control_call(
-            lambda: service.program_run_resume_full_stop(program_run_id, request)
+        return await rest_execution_command(
+            command_kind="program_resume_full_stop",
+            payload=body.model_dump(mode="json"),
+            request_context=body,
+            transport_request=request,
         )
 
     @app.post("/api/program/runs/{program_run_id}/reset")
     async def program_run_reset_full_stop(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
-        request: ProgramFullStopResetRequest,
+        body: ProgramFullStopResetRequest,
+        request: Request,
     ) -> dict[str, Any]:
-        if request.program_run_id != program_run_id:
+        if body.program_run_id != program_run_id:
             raise HeadlessApiError(
                 "program_run_path_invalid",
                 "Program-run identity in path and body must match",
             )
-        return await json_control_call(
-            lambda: service.program_run_reset_full_stop(program_run_id, request)
+        return await rest_execution_command(
+            command_kind="program_discard_full_stop",
+            payload=body.model_dump(mode="json"),
+            request_context=body,
+            transport_request=request,
         )
 
     @app.get("/api/cycle/status")
     def program_cycle_status() -> dict[str, Any]:
         return service.program_cycle_status()
 
+    @app.get("/api/control/state")
+    def execution_control_projection() -> dict[str, Any]:
+        cycle = service.program_cycle_status()
+        return build_control_projection(cycle, control_ingress).model_dump(
+            mode="json"
+        )
+
+    @app.post("/api/control/commands")
+    async def execution_control_command(
+        body: ExecutionCommandRequestDTO,
+        request: Request,
+    ) -> JSONResponse:
+        attribution = _trusted_attribution(request, trusted_principal_adapter)
+        submission = await control_ingress.submit(
+            body,
+            transport_kind="rest",
+            trusted_principal_id=attribution.principal_id,
+            assurance=attribution.assurance,
+        )
+        control_state_source.notify_control()
+        return JSONResponse(
+            content={
+                "receipt": submission.receipt.model_dump(mode="json"),
+                "result": submission.result,
+            }
+        )
+
+    @app.websocket("/ws/control")
+    async def execution_control_websocket(websocket: WebSocket) -> None:
+        await serve_execution_control(
+            websocket,
+            control_state_source,
+            control_ingress,
+        )
+
     @app.post("/api/program/cycle/reset")
     async def program_cycle_reset(
-        request: ProgramCycleResetRequest,
+        body: ProgramCycleResetRequest,
+        request: Request,
     ) -> dict[str, Any]:
-        return await json_control_call(
-            lambda: service.program_cycle_reset(request)
+        return await rest_execution_command(
+            command_kind="program_reset",
+            payload=body.model_dump(mode="json"),
+            request_context=body,
+            transport_request=request,
         )
 
     @app.get("/api/program/runs/{program_run_id}/runtime-controls")
@@ -867,81 +1060,97 @@ def create_app(
     @app.post("/api/program/runs/{program_run_id}/runtime-overrides")
     async def stage_runtime_override(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
-        request: RuntimeOverrideStageRequest,
+        body: RuntimeOverrideStageRequest,
+        request: Request,
     ) -> dict[str, Any]:
-        require_control_path(program_run_id, request)
-        return await json_control_call(
-            lambda: service.program_runtime_control_action(
-                program_run_id, "runtime-overrides", request
-            )
+        require_control_path(program_run_id, body)
+        return await rest_execution_command(
+            command_kind="program_runtime_override_stage",
+            payload=body.model_dump(mode="json"),
+            request_context=body,
+            transport_request=request,
         )
 
     @app.post("/api/program/runs/{program_run_id}/runtime-overrides/activate")
     async def activate_runtime_override(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
-        request: RuntimeOverrideActionRequest,
+        body: RuntimeOverrideActionRequest,
+        request: Request,
     ) -> dict[str, Any]:
-        require_control_path(program_run_id, request)
-        return await json_control_call(
-            lambda: service.program_runtime_control_action(
-                program_run_id, "runtime-overrides/activate", request
-            )
+        require_control_path(program_run_id, body)
+        return await rest_execution_command(
+            command_kind="program_runtime_override_activate",
+            payload=body.model_dump(mode="json"),
+            request_context=body,
+            transport_request=request,
         )
 
     @app.post("/api/program/runs/{program_run_id}/runtime-overrides/clear")
     async def clear_runtime_override(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
-        request: RuntimeOverrideActionRequest,
+        body: RuntimeOverrideActionRequest,
+        request: Request,
     ) -> dict[str, Any]:
-        require_control_path(program_run_id, request)
-        return await json_control_call(
-            lambda: service.program_runtime_control_action(
-                program_run_id, "runtime-overrides/clear", request
-            )
+        require_control_path(program_run_id, body)
+        return await rest_execution_command(
+            command_kind="program_runtime_override_clear",
+            payload=body.model_dump(mode="json"),
+            request_context=body,
+            transport_request=request,
         )
 
     @app.post("/api/program/runs/{program_run_id}/runtime-overrides/promote")
     async def promote_runtime_override(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
-        request: RuntimeOverridePromotionRequest,
+        body: RuntimeOverridePromotionRequest,
+        request: Request,
     ) -> dict[str, Any]:
-        require_control_path(program_run_id, request)
-        return await json_control_call(
-            lambda: service.program_runtime_control_action(
-                program_run_id, "runtime-overrides/promote", request
-            )
+        require_control_path(program_run_id, body)
+        return await rest_execution_command(
+            command_kind="program_runtime_override_promote",
+            payload=body.model_dump(mode="json"),
+            request_context=body,
+            transport_request=request,
         )
 
     @app.post("/api/program/runs/{program_run_id}/blackboard-values")
     async def write_runtime_blackboard(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
-        request: RuntimeBlackboardWriteRequest,
+        body: RuntimeBlackboardWriteRequest,
+        request: Request,
     ) -> dict[str, Any]:
-        require_control_path(program_run_id, request)
-        return await json_control_call(
-            lambda: service.program_runtime_control_action(
-                program_run_id, "blackboard-values", request
-            )
+        require_control_path(program_run_id, body)
+        return await rest_execution_command(
+            command_kind="program_runtime_blackboard_write",
+            payload=body.model_dump(mode="json"),
+            request_context=body,
+            transport_request=request,
         )
 
     @app.post("/api/program/runs/{program_run_id}/manual-result")
     async def stage_manual_result(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
-        request: ManualResultStageRequest,
+        body: ManualResultStageRequest,
+        request: Request,
     ) -> dict[str, Any]:
-        require_control_path(program_run_id, request)
-        return await json_control_call(
-            lambda: service.program_runtime_control_action(
-                program_run_id, "manual-result", request
-            )
+        require_control_path(program_run_id, body)
+        return await rest_execution_command(
+            command_kind="program_manual_result_stage",
+            payload=body.model_dump(mode="json"),
+            request_context=body,
+            transport_request=request,
         )
 
     @app.post("/api/cycle/recovery-actions")
     async def cycle_recovery_action(
-        request: CycleRecoveryActionRequest,
+        body: CycleRecoveryActionRequest,
+        request: Request,
     ) -> dict[str, Any]:
-        return await json_control_call(
-            lambda: service.cycle_recovery_action(request)
+        return await rest_execution_command(
+            command_kind="execution_recovery",
+            payload=body.model_dump(mode="json"),
+            request_context=body,
+            transport_request=request,
         )
 
     def viewer_asset_response(asset: ViewerModelAsset) -> Response:
@@ -1193,10 +1402,12 @@ def create_app(
         body: OperationIntentRequest,
         request: Request,
     ) -> JSONResponse:
-        attribution = _trusted_attribution(request, trusted_principal_adapter)
         return execution_response(
-            await control_call(
-                lambda: service.execution_submit(body, attribution)
+            await rest_execution_command(
+                command_kind="operation_start",
+                payload=body.model_dump(mode="json"),
+                request_context=body.request_context,
+                transport_request=request,
             )
         )
 
@@ -1255,10 +1466,12 @@ def create_app(
         body: PickSequencePlanningRequest,
         request: Request,
     ) -> JSONResponse:
-        attribution = _trusted_attribution(request, trusted_principal_adapter)
         return execution_response(
-            await control_call(
-                lambda: service.execution_start_pick(body, attribution)
+            await rest_execution_command(
+                command_kind="pick_sequence_start",
+                payload=body.model_dump(mode="json"),
+                request_context=body.approach_operation.request_context,
+                transport_request=request,
             )
         )
 
@@ -1267,10 +1480,12 @@ def create_app(
         body: PlaceSequencePlanningRequest,
         request: Request,
     ) -> JSONResponse:
-        attribution = _trusted_attribution(request, trusted_principal_adapter)
         return execution_response(
-            await control_call(
-                lambda: service.execution_start_place(body, attribution)
+            await rest_execution_command(
+                command_kind="place_sequence_start",
+                payload=body.model_dump(mode="json"),
+                request_context=body.approach_operation.request_context,
+                transport_request=request,
             )
         )
 
@@ -1299,9 +1514,13 @@ def create_app(
         request: Request,
     ) -> JSONResponse:
         require_matching_operation(operation_id, body.operation_id)
-        attribution = _trusted_attribution(request, trusted_principal_adapter)
         return execution_response(
-            await control_call(lambda: service.execution_pause(body, attribution))
+            await rest_execution_command(
+                command_kind="operation_pause",
+                payload=body.model_dump(mode="json"),
+                request_context=body.request_context,
+                transport_request=request,
+            )
         )
 
     @app.post("/api/execution/operations/{operation_id}/resume")
@@ -1311,9 +1530,13 @@ def create_app(
         request: Request,
     ) -> JSONResponse:
         require_matching_operation(operation_id, body.operation_id)
-        attribution = _trusted_attribution(request, trusted_principal_adapter)
         return execution_response(
-            await control_call(lambda: service.execution_resume(body, attribution))
+            await rest_execution_command(
+                command_kind="operation_resume",
+                payload=body.model_dump(mode="json"),
+                request_context=body.request_context,
+                transport_request=request,
+            )
         )
 
     @app.post("/api/execution/operations/{operation_id}/reset")
@@ -1323,9 +1546,13 @@ def create_app(
         request: Request,
     ) -> JSONResponse:
         require_matching_operation(operation_id, body.operation_id)
-        attribution = _trusted_attribution(request, trusted_principal_adapter)
         return execution_response(
-            await control_call(lambda: service.execution_reset(body, attribution))
+            await rest_execution_command(
+                command_kind="operation_reset",
+                payload=body.model_dump(mode="json"),
+                request_context=body.request_context,
+                transport_request=request,
+            )
         )
 
     @app.post(
@@ -1337,10 +1564,12 @@ def create_app(
         request: Request,
     ) -> JSONResponse:
         require_matching_operation(operation_id, body.operation_id)
-        attribution = _trusted_attribution(request, trusted_principal_adapter)
         return execution_response(
-            await control_call(
-                lambda: service.execution_acknowledge_completed(body, attribution)
+            await rest_execution_command(
+                command_kind="operation_acknowledge_completed",
+                payload=body.model_dump(mode="json"),
+                request_context=body.request_context,
+                transport_request=request,
             )
         )
 
@@ -1349,11 +1578,12 @@ def create_app(
         body: StopIntentRequest,
         request: Request,
     ) -> JSONResponse:
-        attribution = _trusted_attribution(request, trusted_principal_adapter)
         return execution_response(
-            await control_call(
-                lambda: service.execution_stop(body, attribution),
-                stop=True,
+            await rest_execution_command(
+                command_kind="operation_stop",
+                payload=body.model_dump(mode="json"),
+                request_context=body.request_context,
+                transport_request=request,
             )
         )
 
@@ -1362,11 +1592,12 @@ def create_app(
         body: FullStopIntentRequest,
         request: Request,
     ) -> JSONResponse:
-        attribution = _trusted_attribution(request, trusted_principal_adapter)
         return execution_response(
-            await control_call(
-                lambda: service.execution_full_stop(body, attribution),
-                stop=True,
+            await rest_execution_command(
+                command_kind="cell_full_stop",
+                payload=body.model_dump(mode="json"),
+                request_context=body.request_context,
+                transport_request=request,
             )
         )
 
@@ -1377,9 +1608,15 @@ def create_app(
     @app.post("/api/execution/stop-fault/recover")
     async def execution_recover_stop_fault(
         body: StopFaultRecoveryIntentRequest,
+        request: Request,
     ) -> JSONResponse:
         return execution_response(
-            await control_call(lambda: service.execution_recover_stop_fault(body))
+            await rest_execution_command(
+                command_kind="stop_recovery",
+                payload=body.model_dump(mode="json"),
+                request_context=body.request_context,
+                transport_request=request,
+            )
         )
 
     @app.post("/api/execution/runtime-scale-control")
@@ -1387,13 +1624,12 @@ def create_app(
         body: RuntimeScaleControlRequest,
         request: Request,
     ) -> JSONResponse:
-        attribution = _trusted_attribution(request, trusted_principal_adapter)
         return execution_response(
-            await control_call(
-                lambda: service.execution_set_runtime_scale_control(
-                    body,
-                    attribution,
-                )
+            await rest_execution_command(
+                command_kind="runtime_scale",
+                payload=body.model_dump(mode="json"),
+                request_context=body.request_context,
+                transport_request=request,
             )
         )
 

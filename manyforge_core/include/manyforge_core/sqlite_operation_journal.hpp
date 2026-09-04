@@ -65,7 +65,8 @@ class SqliteOperationJournal final : public IOperationJournal {
 
   [[nodiscard]] Result<std::uint64_t> RecordOperationAccepted(
       const RequestOwnerEpoch& owner_epoch, const OperationIntentDTO& intent,
-      const OperationAcceptedDTO& accepted, const OperationStateDTO& state) override;
+      const OperationAcceptedDTO& accepted, const OperationStateDTO& state,
+      std::span<const OperationId> protected_operation_ids = {}) override;
 
   [[nodiscard]] Result<std::uint64_t> RecordControlAccepted(
       const RequestOwnerEpoch& owner_epoch, const OperationControlRequestDTO& request,

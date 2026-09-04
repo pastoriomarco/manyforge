@@ -50,6 +50,8 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
       const CellAdmissionReconcileDTO& reconcile) override;
   [[nodiscard]] Result<CellAdmissionRecoveryReceiptDTO> GetCellAdmissionRecoveryReceipt(
       const CellAdmissionRecoveryReceiptQueryDTO& query) const override;
+  [[nodiscard]] Result<void> ValidateProgramResetSceneAuthorization(
+      const ProgramResetSceneAuthorizationDTO& authorization) const override;
   [[nodiscard]] Result<void> Publish(const ManagerLivenessObservationDTO& observation) override;
   [[nodiscard]] Result<AuthoringAdmissionDTO> ReplaceManagerLivenessRequiredSet(
       const ManagerLivenessRequiredSetDTO& required_set);

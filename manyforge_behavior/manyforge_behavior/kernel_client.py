@@ -57,6 +57,10 @@ class ExecutionTransport(Protocol):
 
     def stop_status(self, stop_id: str) -> dict[str, Any]: ...
 
+    def stop_fault(self) -> dict[str, Any]: ...
+
+    def recover_stop_fault(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
+
 
 class KernelClientResponseError(RuntimeError):
     """Raised when a transport returns a successful but malformed projection."""
@@ -385,6 +389,21 @@ class KernelClient:
                 "execution Stop status changed its aggregate identity"
             )
         return response
+
+    def stop_fault(self) -> dict[str, Any]:
+        method = getattr(self._transport, "stop_fault", None)
+        if not callable(method):
+            raise TypeError("execution transport has no callable stop_fault")
+        return self._successful(method(), label="Stop-fault observation")
+
+    def recover_stop_fault(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        method = getattr(self._transport, "recover_stop_fault", None)
+        if not callable(method):
+            raise TypeError("execution transport has no callable recover_stop_fault")
+        return self._successful(
+            method(request),
+            label="Stop-fault recovery",
+        )
 
 
 class MockKernelClient:

@@ -532,13 +532,26 @@ export interface ProgramCycleStatus {
   programRunnerOwnerEpoch: string;
   cycleGeneration: number;
   state: 'idle_after_reset' | 'starting' | 'running' | 'stopping'
-    | 'terminal_awaiting_reset';
+    | 'resetting' | 'terminal_awaiting_reset' | 'recovery_required';
   programRunId: string | null;
   cycleClaimGeneration: number | null;
   terminalOrSettlementReference: string | null;
   runRevision: number | null;
   nodeStatusRevision: number | null;
   runtimeControlRevision: number | null;
+  executionControlRevision: number;
+  causalCorrelationId: string | null;
+  causalSessionId: string | null;
+  causalClientSequence: string | null;
+  currentCommandKind: string | null;
+  failure: Record<string, JsonValue> | null;
+  resetPhase: string | null;
+  allowedCommands: Array<{
+    commandKind: string;
+    semanticTarget: Record<string, JsonValue>;
+    allowed: boolean;
+    disabledReason: string | null;
+  }>;
   recoveryOffer: CycleRecoveryOffer | null;
   run: ProgramRunStatus | null;
   runtimeControls: ProgramRuntimeControlProjection | null;

@@ -10,9 +10,9 @@
 #include <manyforge_core/emergency_stop_acceptance_reserve.hpp>
 #include <manyforge_core/kernel_cell_admission_owner.hpp>
 #include <manyforge_core/orphan_resource_reconciliation.hpp>
+#include <manyforge_core/ports/i_manager_liveness_fail_safe_port.hpp>
 #include <manyforge_core/ports/iaddressed_motion_preview.hpp>
 #include <manyforge_core/ports/iaddressed_operation_owner.hpp>
-#include <manyforge_core/ports/i_manager_liveness_fail_safe_port.hpp>
 #include <manyforge_core/ports/icontrol_domain_execution_port.hpp>
 #include <manyforge_core/ports/ioperation_journal.hpp>
 #include <manyforge_core/ports/iresolved_participant_execution_engine.hpp>
@@ -150,8 +150,7 @@ struct CellStopStageSummaryDTO final {
   std::optional<MotionControlledStopMode> executed_mode;
   std::optional<std::string> substitution_reason;
 
-  friend bool operator==(const CellStopStageSummaryDTO&,
-                         const CellStopStageSummaryDTO&) = default;
+  friend bool operator==(const CellStopStageSummaryDTO&, const CellStopStageSummaryDTO&) = default;
 };
 
 struct CellStopTerminalSummaryDTO final {
@@ -170,13 +169,11 @@ struct CellStopFaultSummaryDTO final {
   StopFaultLatchGeneration latch_generation;
   StopFaultLatchStateDTO state{StopFaultLatchStateDTO::kLatched};
   StopFaultTriggerDTO trigger{StopFaultTriggerDTO::kPersistenceDegraded};
-  StopFaultRecoveryStatusDTO recovery_status{
-      StopFaultRecoveryStatusDTO::kWaitingForObservation};
+  StopFaultRecoveryStatusDTO recovery_status{StopFaultRecoveryStatusDTO::kWaitingForObservation};
   std::string reason_code;
   std::optional<StopCertificateRefDTO> certificate;
 
-  friend bool operator==(const CellStopFaultSummaryDTO&,
-                         const CellStopFaultSummaryDTO&) = default;
+  friend bool operator==(const CellStopFaultSummaryDTO&, const CellStopFaultSummaryDTO&) = default;
 };
 
 struct CellStopActionProjectionDTO final {
@@ -344,9 +341,9 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] Result<StopAcceptedDTO> full_stop(const FullStopIntentDTO& intent);
   /// Reopen one exact Program-run admission fence after its accepted Stop has
   /// settled and the Program owner has explicitly chosen recovery/resume.
-  [[nodiscard]] Result<void> release_program_run_stop_fence(
-      const ProgramRunId& program_run_id, const StopId& stop_id,
-      StopGeneration stop_generation);
+  [[nodiscard]] Result<void> release_program_run_stop_fence(const ProgramRunId& program_run_id,
+                                                            const StopId& stop_id,
+                                                            StopGeneration stop_generation);
   [[nodiscard]] Result<StopAcceptedDTO> recognized_malformed_stop(
       const MalformedStopIngressDTO& ingress);
 
@@ -391,13 +388,12 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       const CellAdmissionClaimReleaseDTO& release) override;
   [[nodiscard]] Result<AuthoringAdmissionDTO> ReconcileCellAdmissionClaims(
       const CellAdmissionReconcileDTO& reconcile) override;
-  [[nodiscard]] Result<CellAdmissionRecoveryReceiptDTO>
-  GetCellAdmissionRecoveryReceipt(
+  [[nodiscard]] Result<CellAdmissionRecoveryReceiptDTO> GetCellAdmissionRecoveryReceipt(
       const CellAdmissionRecoveryReceiptQueryDTO& query) const override;
-  [[nodiscard]] Result<void> Publish(
-      const ManagerLivenessObservationDTO& observation) override;
-  void LatchAndContain(
-      const ManagerLivenessLossIntentDTO& intent) noexcept override;
+  [[nodiscard]] Result<void> ValidateProgramResetSceneAuthorization(
+      const ProgramResetSceneAuthorizationDTO& authorization) const override;
+  [[nodiscard]] Result<void> Publish(const ManagerLivenessObservationDTO& observation) override;
+  void LatchAndContain(const ManagerLivenessLossIntentDTO& intent) noexcept override;
   [[nodiscard]] Result<AuthoringAdmissionDTO> ReplaceManagerLivenessRequiredSet(
       const ManagerLivenessRequiredSetDTO& required_set);
 
@@ -417,13 +413,11 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] std::vector<OperationStateDTO> get_resident_operations(
       const std::vector<ProgramRunId>& program_run_ids) const;
 
-  [[nodiscard]] Result<OperationRecoveryProjectionDTO>
-  get_operation_recovery_assessment(const OperationId& operation_id) const;
+  [[nodiscard]] Result<OperationRecoveryProjectionDTO> get_operation_recovery_assessment(
+      const OperationId& operation_id) const;
 
-  [[nodiscard]] Result<KernelRecoveryActionResultDTO>
-  apply_operation_recovery_action(
-      const OperationId& operation_id,
-      OperationRevision expected_operation_revision,
+  [[nodiscard]] Result<KernelRecoveryActionResultDTO> apply_operation_recovery_action(
+      const OperationId& operation_id, OperationRevision expected_operation_revision,
       const KernelRecoveryActionRequestDTO& request);
 
   /// NRT owner-scheduler reconciliation point. This closes event-loss windows
@@ -516,7 +510,6 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   struct ReplayEntry;
   struct ControlReplayEntry;
   struct StopReplayEntry;
-  struct FullStopReplayEntry;
   struct RuntimeScaleReplayEntry;
   struct RuntimeScaleControlReplayEntry;
   struct RuntimeScaleControlSetting;
@@ -568,6 +561,11 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   void CompleteOperationControlEffect(OperationControlEffectResult result) noexcept;
   [[nodiscard]] Result<void> settle_control_operation_locked(const OperationId& operation_id,
                                                              OperationControlKind control);
+  [[nodiscard]] std::vector<OperationId> durable_operation_retention_ids_locked() const;
+  [[nodiscard]] bool evict_oldest_historical_operation_locked(
+      std::span<const OperationId> protected_operation_ids);
+  [[nodiscard]] bool make_operation_admission_capacity_locked();
+  void retain_historical_operation_locked(OperationStateDTO state);
   [[nodiscard]] Result<void> reconfigure_runtime_participants_impl(
       std::vector<RuntimeParticipantExecutionRegistration> registrations,
       RuntimeParticipantAdmissionResolver participant_resolver,
@@ -580,8 +578,7 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       const ResolvedRuntimeScaleStatusDTO& resolved_status);
   [[nodiscard]] Result<RuntimeScaleAcceptedDTO> set_runtime_scale_impl(
       const RuntimeScaleRequestDTO& request, bool retain_public_replay);
-  [[nodiscard]] Result<RuntimeScaleControlResolution>
-  resolve_runtime_scale_control_locked(
+  [[nodiscard]] Result<RuntimeScaleControlResolution> resolve_runtime_scale_control_locked(
       const RuntimeScaleControlSelectorDTO& selector) const;
   [[nodiscard]] double runtime_scale_setting_for_binding_locked(
       const RuntimeParticipantBindingDTO& binding) const noexcept;
@@ -640,10 +637,8 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   std::vector<ReplayEntry> replay_ledger_;
   std::vector<ControlReplayEntry> control_replay_ledger_;
   std::vector<StopReplayEntry> stop_replay_ledger_;
-  std::vector<FullStopReplayEntry> full_stop_replay_ledger_;
   std::vector<RuntimeScaleReplayEntry> runtime_scale_replay_ledger_;
-  std::vector<RuntimeScaleControlReplayEntry>
-      runtime_scale_control_replay_ledger_;
+  std::vector<RuntimeScaleControlReplayEntry> runtime_scale_control_replay_ledger_;
   std::vector<RuntimeScaleControlSetting> runtime_scale_control_settings_;
   struct StopFaultRecoveryReplayEntry;
   std::vector<StopFaultRecoveryReplayEntry> stop_fault_recovery_replay_ledger_;
@@ -659,9 +654,8 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   // Retained only as a compatibility/readiness source for a predecessor run
   // admitted before Program-cycle transaction and ProgramRunId were unified.
   std::optional<ProgramRunId> current_program_run_id_;
-  /// Canonical bounded resident operation table. Every accepted operation also
-  /// consumes one entry in the fixed-capacity replay ledger, so this table can
-  /// never exceed request_replay_capacity.
+  /// Canonical bounded resident operation table. Unresolved operations are
+  /// never evicted; resolved history rotates before new admission.
   std::map<OperationId, std::unique_ptr<ActiveOperation>> active_operations_;
   std::vector<EngineSubscription> engine_subscriptions_;
   // Engaged exactly once during successful construction and replaced only by

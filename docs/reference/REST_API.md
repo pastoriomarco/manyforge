@@ -3,13 +3,13 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py structural-rest
-  Last regenerated: 2026-09-02 12:35:10 UTC
+  Last regenerated: 2026-09-03 15:07:22 UTC
   Generator source: scripts/regen-public-contracts.py:gen_rest_api
 -->
 
 # Composer REST API
 
-This is the structural, authoring, and thin runtime-client Composer surface retained during the composable-cell runtime cutover. Catalog reads, sandboxed artifact browsing, structural URDF assets, health, and the strict revision-fenced Program Draft/Saved workflow remain available. When Headless and the independent Program runner are configured, Composer also forwards scenario, Applied, Program Run, status, explicit Program Stop, and confirmed CCLC lifecycle/route requests without owning their state. Complete product launch and remaining scene/backend capabilities remain unavailable. The catch-all `/api/{unavailable_path}` operations return the typed runtime-unavailable response for former product routes.
+This is the structural, authoring, and thin runtime-client Composer surface retained during the composable-cell runtime cutover. Catalog reads, sandboxed artifact browsing, structural URDF assets, health, and the strict revision-fenced Program Draft/Saved workflow remain available. When Headless and the independent Program runner are configured, Composer also forwards scenario, Applied, Program Run, status, explicit Program Stop, and confirmed CCLC lifecycle/route requests without owning their state. Generic `/api/control/state` and `/api/control/commands` expose the same state-conditioned ingress used by the versioned `/ws/control` session; callers submit once and observe backend-owned lifecycle state. Complete product launch and remaining scene/backend capabilities remain unavailable. The catch-all `/api/{unavailable_path}` operations return the typed runtime-unavailable response for former product routes.
 
 The live schema is available at `/openapi.json` and `/docs` while the API process is running.
 
@@ -32,6 +32,8 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `POST` | `/api/cclc/routes/requests` | headless-runtime-client | Cclc Route Submit |
 | `GET` | `/api/cclc/routes/transactions/{transaction_id}` | headless-runtime-client | Cclc Route Status |
 | `GET` | `/api/component-overview` | headless-runtime-client | Component Overview |
+| `POST` | `/api/control/commands` | headless-runtime-client | Submit Control Command |
+| `GET` | `/api/control/state` | headless-runtime-client | Control Projection |
 | `POST` | `/api/cycle/recovery-actions` | headless-runtime-client | Cycle Recovery Action |
 | `GET` | `/api/cycle/status` | headless-runtime-client | Program Cycle Status |
 | `POST` | `/api/deployment/discard` | composer-deployment-draft | Discard |

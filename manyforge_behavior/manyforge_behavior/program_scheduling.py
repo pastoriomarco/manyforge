@@ -170,6 +170,7 @@ class ProgramRunTickHost:
         maximum_workers: int = 4,
         monotonic: Callable[[], float] = time.monotonic,
         terminal_observer: Callable[[ProgramRunSnapshot], None] | None = None,
+        state_observer: Callable[[ProgramRunSnapshot], None] | None = None,
     ) -> None:
         if not isinstance(owner, ProgramRunOwner):
             raise TypeError("tick host requires one ProgramRunOwner")
@@ -195,12 +196,16 @@ class ProgramRunTickHost:
             raise TypeError("monotonic clock must be callable")
         if terminal_observer is not None and not callable(terminal_observer):
             raise TypeError("terminal observer must be callable")
+        if state_observer is not None and not callable(state_observer):
+            raise TypeError("state observer must be callable")
         self._owner = owner
         self._tick_interval_s = float(tick_interval_s)
         self._maximum_scheduled_runs = maximum_scheduled_runs
         self._maximum_workers = maximum_workers
         self._monotonic = monotonic
         self._terminal_observer = terminal_observer
+        self._state_observer = state_observer
+        self._observed_revisions: dict[str, tuple[int, int]] = {}
         # The value is the latest command-side wake revision for this run.
         # A worker carries the revision it was submitted under, so its older
         # completion cannot remove a wake issued by a concurrent command.
@@ -289,6 +294,7 @@ class ProgramRunTickHost:
                     "cleanup settled"
                 ) from scheduling_error
             raise
+        self._observe_state(snapshot)
         return snapshot
 
     def stop_run(
@@ -308,6 +314,7 @@ class ProgramRunTickHost:
             ProgramRunState.FINALIZING,
         }:
             self.schedule(program_run_id)
+        self._observe_state(snapshot)
         return snapshot
 
     def stop_motion(
@@ -325,6 +332,7 @@ class ProgramRunTickHost:
             stop_request_id=stop_request_id,
         )
         self.schedule(program_run_id)
+        self._observe_state(snapshot)
         return snapshot
 
     def full_stop(
@@ -343,6 +351,7 @@ class ProgramRunTickHost:
         )
         if snapshot.state is ProgramRunState.FULL_STOPPING:
             self.schedule(program_run_id)
+        self._observe_state(snapshot)
         return snapshot
 
     def resume_full_stop(
@@ -366,17 +375,35 @@ class ProgramRunTickHost:
                 reason=reason,
             )
             self._schedule_locked(program_run_id)
-            return snapshot
+        self._observe_state(snapshot)
+        return snapshot
 
     def reset_run(self, program_run_id: str) -> ProgramRunSnapshot:
         """Release the exact terminal run's resident owner effects."""
 
-        return self._owner.reset_effects(program_run_id)
+        snapshot = self._owner.reset_effects(program_run_id)
+        self._observe_state(snapshot)
+        return snapshot
 
     def reset_retained_run(self, program_run_id: str) -> None:
         """Reset a proven terminal run whose behavior-tree owner rotated."""
 
         self._owner.reset_retained_effects(program_run_id)
+
+    def forget_reset_run(self, program_run_id: str) -> None:
+        """Release scheduler presentation state and the reset resident tree."""
+
+        with self._condition:
+            if (
+                program_run_id in self._scheduled
+                or program_run_id in self._inflight
+            ):
+                raise ProgramSchedulingError(
+                    "a scheduled Program run cannot be forgotten"
+                )
+        self._owner.forget_reset_run(program_run_id)
+        with self._condition:
+            self._observed_revisions.pop(program_run_id, None)
 
     def resume_recovery(
         self,
@@ -401,10 +428,43 @@ class ProgramRunTickHost:
                 result=result,
             )
             self._schedule_locked(program_run_id)
-            return snapshot
+        self._observe_state(snapshot)
+        return snapshot
 
     def read(self, program_run_id: str) -> ProgramRunSnapshot:
         return self._owner.read(program_run_id)
+
+    def wait_terminal(
+        self,
+        program_run_id: str,
+        *,
+        timeout_s: float = 5.0,
+    ) -> ProgramRunSnapshot:
+        """Wait on owner progress notifications, never by polling its state."""
+
+        if (
+            isinstance(timeout_s, bool)
+            or not isinstance(timeout_s, (int, float))
+            or not 0.0 < float(timeout_s) <= 60.0
+        ):
+            raise ValueError("terminal wait timeout is outside (0, 60]")
+        deadline = self._monotonic() + float(timeout_s)
+        with self._condition:
+            while True:
+                self._raise_if_unavailable()
+                snapshot = self._owner.read(program_run_id)
+                if snapshot.state in {
+                    ProgramRunState.STOPPED,
+                    ProgramRunState.SUCCEEDED,
+                    ProgramRunState.FAILED,
+                }:
+                    return snapshot
+                remaining = deadline - self._monotonic()
+                if remaining <= 0.0:
+                    raise ProgramSchedulingError(
+                        "Program run did not settle before its terminal deadline"
+                    )
+                self._condition.wait(timeout=remaining)
 
     def _requires_advance(self, snapshot: ProgramRunSnapshot) -> bool:
         if snapshot.state in {
@@ -471,7 +531,42 @@ class ProgramRunTickHost:
                     if self._scheduled.get(program_run_id) == schedule_revision:
                         self._scheduled.pop(program_run_id, None)
         self._observe_terminals(snapshots)
+        self._observe_states(snapshots)
         return tuple(snapshots)
+
+    def _observe_state(self, snapshot: ProgramRunSnapshot) -> None:
+        """Wake presentation without making it part of scheduling correctness."""
+
+        observer = self._state_observer
+        if observer is None:
+            return
+        program_run_id = snapshot.capture.program_run_id
+        revision = (snapshot.run_revision, snapshot.node_status_revision)
+        with self._condition:
+            current = self._observed_revisions.get(program_run_id)
+            if current is not None and (
+                revision[0] <= current[0] and revision[1] <= current[1]
+            ):
+                return
+        try:
+            observer(snapshot)
+        except Exception:
+            # A status consumer cannot stall or fail Program execution.  It
+            # will recover from the next current-snapshot wake.
+            return
+        with self._condition:
+            current = self._observed_revisions.get(program_run_id)
+            if current is None:
+                self._observed_revisions[program_run_id] = revision
+            else:
+                self._observed_revisions[program_run_id] = (
+                    max(current[0], revision[0]),
+                    max(current[1], revision[1]),
+                )
+
+    def _observe_states(self, snapshots: list[ProgramRunSnapshot]) -> None:
+        for snapshot in snapshots:
+            self._observe_state(snapshot)
 
     def _observe_terminals(self, snapshots: list[ProgramRunSnapshot]) -> None:
         observer = self._terminal_observer
@@ -500,6 +595,7 @@ class ProgramRunTickHost:
         next_tick = self._monotonic()
         while True:
             completed: list[ProgramRunSnapshot] = []
+            observed: list[ProgramRunSnapshot] = []
             with self._condition:
                 if self._shutdown:
                     return
@@ -514,6 +610,7 @@ class ProgramRunTickHost:
                         self._worker_failure = error
                         self._condition.notify_all()
                         return
+                    observed.append(snapshot)
                     if not self._requires_advance(snapshot):
                         removed = (
                             self._scheduled.get(program_run_id)
@@ -559,6 +656,8 @@ class ProgramRunTickHost:
                     self._observe_terminals(completed)
                 except ProgramSchedulingError:
                     return
+            if observed:
+                self._observe_states(observed)
 
     def _notify_worker_completion(self) -> None:
         with self._condition:

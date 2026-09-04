@@ -4,6 +4,7 @@ import asyncio
 import json
 import queue
 import threading
+import time
 from typing import Any
 
 import pytest
@@ -126,11 +127,19 @@ async def _next_cursor(client: _Client) -> dict[str, Any] | None:
 
 
 async def _wait_for_error(source: stream.ExecutionObservationSource) -> None:
-    for _ in range(1_000):
-        if source.status()["source"]["error_count"] > 0:
-            return
-        await asyncio.sleep(0)
-    raise AssertionError("source error was not published")
+    def wait_for_worker() -> bool:
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            if source.status()["source"]["error_count"] > 0:
+                return True
+            # This is cross-thread test synchronization, not product retry or
+            # scheduling. Yield the GIL so the observation worker can publish
+            # its terminal diagnostic even on a saturated qualification host.
+            time.sleep(0.001)
+        return False
+
+    if not await asyncio.to_thread(wait_for_worker):
+        raise AssertionError("source error was not published")
 
 
 def test_source_is_change_driven_credited_and_independent_per_browser() -> None:

@@ -166,6 +166,11 @@ ContentDigest Digest(const char digit) {
 
 class TestCellAdmissionPort final : public core::IKernelCellAdmissionPort {
 public:
+  void RejectProgramResetSceneAuthorization(bool reject) {
+    std::lock_guard lock(mutex_);
+    reject_program_reset_scene_authorization_ = reject;
+  }
+
   [[nodiscard]] core::AuthoringAdmissionDTO
   GetAuthoringAdmission() const override {
     std::lock_guard lock(mutex_);
@@ -320,6 +325,19 @@ public:
         std::move(receipt));
   }
 
+  [[nodiscard]] core::Result<void> ValidateProgramResetSceneAuthorization(
+      const core::ProgramResetSceneAuthorizationDTO &authorization)
+      const override {
+    std::lock_guard lock(mutex_);
+    if (reject_program_reset_scene_authorization_ ||
+        !core::ValidateProgramResetSceneAuthorization(authorization).ok()) {
+      return core::Result<void>::Err(
+          ErrorDTO{"authoring_not_ready",
+                   "Program Reset scene authorization is unavailable", {}});
+    }
+    return core::Result<void>::Ok();
+  }
+
 private:
   struct Entry final {
     core::CellAdmissionClaimDTO claim;
@@ -330,6 +348,7 @@ private:
   std::vector<Entry> entries_;
   std::optional<std::size_t> held_index_;
   std::uint64_t next_claim_generation_{1U};
+  bool reject_program_reset_scene_authorization_{};
 };
 
 class ControlledPublicationReader final
@@ -1816,6 +1835,25 @@ TEST(LogicalSceneTransactionCodec,
   unknown_field += ",\"unknown\":true}";
   EXPECT_THROW(DecodeCanonicalSceneTransactionRequest(unknown_field),
                std::invalid_argument);
+
+  auto reset_request = request;
+  reset_request.expected_admission_generation.reset();
+  reset_request.program_reset_scene_authorization =
+      core::ProgramResetSceneAuthorizationDTO{
+          RequestOwnerEpoch("program-runner.epoch.2"),
+          core::ProgramRunId("program-cycle.2"),
+          core::CellAdmissionClaimGeneration(9U), Digest('e')};
+  const auto reset_encoded =
+      logical_scene_codec_internal::EncodeRequest(reset_request);
+  const auto reset_decoded =
+      DecodeCanonicalSceneTransactionRequest(reset_encoded);
+  EXPECT_EQ(logical_scene_codec_internal::EncodeRequest(reset_decoded),
+            reset_encoded);
+  EXPECT_EQ(reset_decoded.program_reset_scene_authorization,
+            reset_request.program_reset_scene_authorization);
+  EXPECT_NE(logical_scene_codec_internal::EncodeRequestDigestInput(
+                reset_request),
+            logical_scene_codec_internal::EncodeRequestDigestInput(request));
 }
 
 TEST(LogicalSceneTransactionCodec,
@@ -1959,6 +1997,42 @@ TEST(CanonicalEmptySceneOwner, UpsertCreatesReplacesAndRecognizesAnExactNoOp) {
   EXPECT_DOUBLE_EQ(relative_fixed->pose_in_cell.position_m.x_m, 1.75);
   EXPECT_DOUBLE_EQ(relative_fixed->pose_in_cell.position_m.y_m, 0.5);
   EXPECT_DOUBLE_EQ(relative_fixed->pose_in_cell.position_m.z_m, 0.5);
+}
+
+TEST(CanonicalEmptySceneOwner,
+     ProgramResetRestorationUsesExactAuthorizationWithoutOpeningAuthoring) {
+  TemporaryDirectory directory("scene-program-reset");
+  const auto admission = LoadAdmission();
+  ControlledPublicationReader publication_reader;
+  TestCellAdmissionPort cell_admission;
+  CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
+                                 admission, publication_reader,
+                                 cell_admission);
+  const auto active =
+      FinalizeCanonicalBootstrap(owner, publication_reader, admission)
+          .canonical_empty_target;
+  auto request = AddBoxRequest(active, admission.cell_id(),
+                               "scene-request-program-reset");
+  request.expected_admission_generation.reset();
+  request.program_reset_scene_authorization =
+      core::ProgramResetSceneAuthorizationDTO{
+          RequestOwnerEpoch("program-runner.epoch.2"),
+          core::ProgramRunId("program-cycle.2"),
+          core::CellAdmissionClaimGeneration(9U), Digest('e')};
+
+  cell_admission.RejectProgramResetSceneAuthorization(true);
+  const auto rejected = owner.Commit(request);
+  ASSERT_FALSE(rejected.success);
+  ASSERT_TRUE(rejected.error.has_value());
+  EXPECT_EQ(rejected.error->code, "authoring_not_ready");
+  EXPECT_TRUE(cell_admission.GetAuthoringAdmission().authoring_allowed);
+
+  cell_admission.RejectProgramResetSceneAuthorization(false);
+  const auto committed = owner.Commit(request);
+  ASSERT_TRUE(committed.success)
+      << (committed.error.has_value() ? committed.error->message
+                                      : "missing error");
+  EXPECT_TRUE(cell_admission.GetAuthoringAdmission().authoring_allowed);
 }
 
 TEST(CanonicalEmptySceneOwner,

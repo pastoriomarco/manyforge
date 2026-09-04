@@ -672,6 +672,12 @@ RequiredProgramCycleStatus(const CanonicalValue &value) {
     state = core::ProgramCycleStateDTO::kStopping;
   } else if (state_name == "terminal_awaiting_reset") {
     state = core::ProgramCycleStateDTO::kTerminalAwaitingReset;
+  } else if (state_name == "resetting") {
+    state = core::ProgramCycleStateDTO::kResetting;
+  } else if (state_name == "recovery_required") {
+    state = core::ProgramCycleStateDTO::kRecoveryRequired;
+  } else if (state_name == "intervention_or_recovery") {
+    state = core::ProgramCycleStateDTO::kInterventionOrRecovery;
   } else {
     Fail("Program Runner cycle status has an unsupported state");
   }

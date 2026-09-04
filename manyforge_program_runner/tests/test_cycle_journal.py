@@ -1,4 +1,4 @@
-"""Durable Program-cycle state and replay invariants."""
+"""Durable Program-cycle state and bounded in-flight command invariants."""
 
 from __future__ import annotations
 
@@ -75,13 +75,13 @@ def test_existing_unsupported_database_is_rejected_without_mutation(
             database.execute("PRAGMA writable_schema=ON")
             database.execute(
                 "UPDATE sqlite_schema SET sql=replace(sql,"
-                "' CHECK(schema_version=3)','') "
+                "' CHECK(schema_version=4)','') "
                 "WHERE name='program_cycle_metadata'"
             )
             database.execute("PRAGMA writable_schema=OFF")
         else:
             database.execute(
-                "INSERT INTO program_cycle_requests VALUES(?,?,?,?,?,NULL,NULL)",
+                "INSERT INTO program_cycle_inflight_commands VALUES(?,?,?,?,?)",
                 ("caller", "broken", "start", "{", 1),
             )
         database.commit()
@@ -109,7 +109,7 @@ def test_absent_database_creates_only_current_schema_under_existing_parent(
     try:
         assert database.execute(
             "SELECT schema_version FROM program_cycle_metadata WHERE singleton=1"
-        ).fetchone() == (3,)
+        ).fetchone() == (4,)
         assert {
             row[0]
             for row in database.execute(
@@ -118,7 +118,7 @@ def test_absent_database_creates_only_current_schema_under_existing_parent(
         } == {
             "program_cycle_metadata",
             "program_cycle",
-            "program_cycle_requests",
+            "program_cycle_inflight_commands",
             "program_runner_liveness",
             "program_run_history",
         }
@@ -212,7 +212,7 @@ def test_read_only_preflight_sees_crash_left_wal_without_mutating_it(
         reader.execute("BEGIN")
         assert reader.execute(
             "SELECT schema_version FROM program_cycle_metadata"
-        ).fetchone() == (3,)
+        ).fetchone() == (4,)
         writer = sqlite3.connect(path, isolation_level=None)
         try:
             writer.execute("PRAGMA wal_autocheckpoint=0")
@@ -237,7 +237,9 @@ def test_read_only_preflight_sees_crash_left_wal_without_mutating_it(
         reader.close()
 
 
-def test_terminal_blocks_new_cycle_and_reset_replays_after_restart(tmp_path) -> None:
+def test_terminal_blocks_new_cycle_and_resolved_commands_do_not_accumulate(
+    tmp_path,
+) -> None:
     path = tmp_path / "cycle.sqlite3"
     journal = ProgramCycleJournal(path, owner_epoch="runner.epoch.1")
     intent = {"request_id": "start.1", "program": "identity-only"}
@@ -333,32 +335,33 @@ def test_terminal_blocks_new_cycle_and_reset_replays_after_restart(tmp_path) -> 
         "state": "succeeded",
         "capture": {"program_run_id": "run.1"},
     }
-    replay = restarted.record_request(
+    reused_identity_is_a_new_stale_intent = restarted.record_request(
         owner_epoch="caller.epoch.1",
         request_id="reset.1",
         kind="reset",
         intent=reset_intent,
         cycle_generation=1,
     )
-    assert replay.disposition == "succeeded"
-    assert replay.result == result
+    assert reused_identity_is_a_new_stale_intent.disposition == "new"
+    restarted.cancel_request(
+        owner_epoch="caller.epoch.1", request_id="reset.1"
+    )
     restarted.close()
 
     database = sqlite3.connect(path)
-    encoded = database.execute(
-        "SELECT intent_json FROM program_cycle_requests WHERE request_id='start.1'"
-    ).fetchone()[0]
-    assert "tree" not in encoded
-    assert "identity-only" in encoded
+    assert database.execute(
+        "SELECT COUNT(*) FROM program_cycle_inflight_commands"
+    ).fetchone() == (0,)
+    database.close()
 
 
-def test_known_rejection_replays_and_unresolved_request_never_reexecutes(
+def test_known_rejection_is_discarded_but_unresolved_request_never_reexecutes(
     tmp_path,
 ) -> None:
     journal = ProgramCycleJournal(
         tmp_path / "cycle.sqlite3",
         owner_epoch="runner.1",
-        maximum_requests=2,
+        maximum_inflight_commands=1,
     )
     first = journal.record_request(
         owner_epoch="caller.1",
@@ -374,19 +377,17 @@ def test_known_rejection_replays_and_unresolved_request_never_reexecutes(
         code="program_run_draft_applied_mismatch",
         message="Draft and Applied Program revisions differ",
     )
-    rejected = journal.record_request(
+    rejected_identity_is_reusable = journal.record_request(
         owner_epoch="caller.1",
         request_id="start.rejected",
         kind="start",
         intent={"revision": 1},
         cycle_generation=2,
     )
-    assert rejected.disposition == "rejected"
-    assert rejected.error == {
-        "code": "program_run_draft_applied_mismatch",
-        "message": "Draft and Applied Program revisions differ",
-        "details": {},
-    }
+    assert rejected_identity_is_reusable.disposition == "new"
+    journal.cancel_request(
+        owner_epoch="caller.1", request_id="start.rejected"
+    )
 
     assert journal.record_request(
         owner_epoch="caller.1",
@@ -437,6 +438,13 @@ def test_every_runtime_request_kind_survives_owner_restart(tmp_path) -> None:
             intent={"kind": kind},
             cycle_generation=1,
         ).disposition == "new"
+    journal.transition(
+        expected_generation=1,
+        expected_states=("idle_after_reset",),
+        state="starting",
+        program_run_id="program-cycle.1",
+        claim={"claim_generation": 1},
+    )
     with pytest.raises(ValueError, match="kind is unsupported"):
         journal.record_request(
             owner_epoch="operator.1",
@@ -591,6 +599,58 @@ def test_each_exact_post_acquire_crash_checkpoint_recovers_terminal(
     assert record.owner_epoch == "runner.stable"
     assert record.terminal_reference is None
     assert record.reconciliation_required is True
+    recovered.close()
+
+
+def test_restart_turns_interrupted_reset_into_exact_recovery_phase(tmp_path) -> None:
+    path = tmp_path / "reset-interrupted.sqlite3"
+    journal = ProgramCycleJournal(path, owner_epoch="runner.old")
+    journal.transition(
+        expected_generation=1,
+        expected_states=("idle_after_reset",),
+        state="terminal_awaiting_reset",
+        program_run_id="program-cycle.1",
+        claim={"claim_generation": 1},
+        terminal_reference="sha256:" + "a" * 64,
+    )
+    journal.record_request(
+        owner_epoch="operator.1",
+        request_id="reset.1",
+        kind="reset",
+        intent={"kind": "reset"},
+        cycle_generation=1,
+    )
+    journal.begin_resetting(
+        expected_generation=1,
+        program_run_id="program-cycle.1",
+        correlation_id="reset.1",
+    )
+    journal.update_reset_phase(
+        expected_generation=1,
+        program_run_id="program-cycle.1",
+        expected_phase="stopping",
+        phase="restoring_scene",
+    )
+    journal.close()
+
+    recovered = ProgramCycleJournal(path, owner_epoch="runner.new")
+    record = recovered.read()
+    assert record.state == "recovery_required"
+    assert record.owner_epoch == "runner.old"
+    assert record.reset_phase == "restoring_scene"
+    assert record.reconciliation_required is True
+    assert record.failure == {
+        "code": "program_cycle_reset_interrupted",
+        "failed_phase": "restoring_scene",
+        "message": "Program Runner restarted during Reset",
+    }
+    assert recovered.record_request(
+        owner_epoch="operator.1",
+        request_id="reset.1",
+        kind="reset",
+        intent={"kind": "reset"},
+        cycle_generation=1,
+    ).disposition == "in_progress"
     recovered.close()
 
 

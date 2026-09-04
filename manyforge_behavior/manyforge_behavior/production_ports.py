@@ -30,6 +30,7 @@ from manyforge_behavior.kernel_client import (
     KernelOperationSettlementPendingError,
 )
 from manyforge_behavior.orchestration_ports import (
+    PROGRAM_MOTION_STOP_RECOVERY_CLASSES,
     NodeAttemptIdentity,
     OwnerInvocationResult,
     OwnerNodeInputs,
@@ -1755,7 +1756,9 @@ class NativeKernelProgramPort:
             assessment = self._recovery_assessment(operation, task.operation_id)
             if assessment is not None:
                 metadata["recovery_assessment"] = assessment
-                if assessment.get("recovery_class") == "ordinary_operator_stop":
+                if assessment.get("recovery_class") in (
+                    PROGRAM_MOTION_STOP_RECOVERY_CLASSES
+                ):
                     metadata["authored_failure_policy"] = "pause_for_operator"
                     metadata["authored_failure_policy_parameter"] = (
                         "operator_stop_policy"
@@ -2104,7 +2107,21 @@ class NativeKernelProgramPort:
         # the semantic Program Stop to the Kernel, whose current-run and
         # pending-admission capture can close that race without making Stop
         # wait for the ordinary command lane.
-        context = self._context(program_run_id)
+        try:
+            context = self._context(program_run_id)
+            request_owner_epoch = context.request_owner_epoch
+        except ProductionPortError:
+            # Program Runner may accept Stop after committing Starting but
+            # before the Program tree binds its client context.  Once the
+            # Program-cycle claim exists, the Kernel can fence that exact run
+            # directly; no operation or local task needs to exist yet.
+            status = _mapping(
+                self._kernel.identity().get("identity"),
+                field="execution identity",
+            )
+            request_owner_epoch = _text(
+                status.get("owner_epoch"), field="owner_epoch"
+            )
         response = self._kernel.stop_program_run(
             {
                 "request_context": {
@@ -2113,7 +2130,7 @@ class NativeKernelProgramPort:
                         program_run_id,
                         stop_request_id,
                     ),
-                    "request_owner_epoch": context.request_owner_epoch,
+                    "request_owner_epoch": request_owner_epoch,
                     "source_label": "manyforge_behavior",
                     "correlation_id": program_run_id,
                 },
@@ -2335,7 +2352,7 @@ class NativeKernelProgramPort:
                     if (
                         assessment is not None
                         and assessment.get("recovery_class")
-                        == "ordinary_operator_stop"
+                        in PROGRAM_MOTION_STOP_RECOVERY_CLASSES
                     ):
                         metadata = dict(snapshot.metadata)
                         metadata.update(
@@ -2957,6 +2974,7 @@ class HeadlessSceneProgramPort:
         request_owner_epoch: str,
         expected_projection_revision: Mapping[str, Any],
         operation: Mapping[str, Any],
+        program_reset_scene_authorization: Mapping[str, Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         body: dict[str, Any] = {
             "request_context": {
@@ -2969,22 +2987,69 @@ class HeadlessSceneProgramPort:
             "operation": dict(operation),
         }
         if operation.get("kind") in _AUTHORED_SCENE_OPERATIONS:
-            admission = self._transport.authoring_admission()
-            generation = admission.get("admission_generation")
-            if (
-                type(generation) is not int
-                or not 1 <= generation <= 9_007_199_254_740_991
-            ):
-                raise ProductionPortError(
-                    "authoring-admission owner omitted its current generation"
+            if program_reset_scene_authorization is not None:
+                authorization = dict(program_reset_scene_authorization)
+                if set(authorization) != {
+                    "program_runner_owner_epoch",
+                    "program_run_id",
+                    "cycle_claim_generation",
+                    "terminal_or_settlement_reference",
+                }:
+                    raise ProductionPortError(
+                        "Program Reset scene authorization is malformed"
+                    )
+                _text(
+                    authorization["program_runner_owner_epoch"],
+                    field="program_runner_owner_epoch",
                 )
-            body["expected_admission_generation"] = generation
-            # A no-effect stale-admission rejection is durably replayed by the
-            # logical-scene owner. Include the observed generation so a later
-            # retry cannot be trapped behind that obsolete outcome.
-            body["request_context"]["request_id"] = _request_identity(
-                "scene-admission", request_id, str(generation)
-            )
+                _text(
+                    authorization["program_run_id"],
+                    field="program_run_id",
+                )
+                generation = authorization["cycle_claim_generation"]
+                if (
+                    type(generation) is not int
+                    or not 1 <= generation <= 9_007_199_254_740_991
+                ):
+                    raise ProductionPortError(
+                        "Program Reset scene claim generation is invalid"
+                    )
+                reference = _text(
+                    authorization["terminal_or_settlement_reference"],
+                    field="terminal_or_settlement_reference",
+                )
+                if (
+                    len(reference) != 71
+                    or not reference.startswith("sha256:")
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in reference[7:]
+                    )
+                ):
+                    raise ProductionPortError(
+                        "Program Reset scene settlement reference is invalid"
+                    )
+                body["program_reset_scene_authorization"] = authorization
+                body["request_context"]["request_id"] = _request_identity(
+                    "scene-reset", request_id, str(generation)
+                )
+            else:
+                admission = self._transport.authoring_admission()
+                generation = admission.get("admission_generation")
+                if (
+                    type(generation) is not int
+                    or not 1 <= generation <= 9_007_199_254_740_991
+                ):
+                    raise ProductionPortError(
+                        "authoring-admission owner omitted its current generation"
+                    )
+                body["expected_admission_generation"] = generation
+                # A no-effect stale-admission rejection is durably replayed by the
+                # logical-scene owner. Include the observed generation so a later
+                # retry cannot be trapped behind that obsolete outcome.
+                body["request_context"]["request_id"] = _request_identity(
+                    "scene-admission", request_id, str(generation)
+                )
         response = self._scene.commit(body)
         committed = dict(
             _mapping(
@@ -3397,6 +3462,8 @@ class HeadlessSceneProgramPort:
         self,
         context: ProgramRunPortContext,
         initial_scene: Sequence[Mapping[str, Any]],
+        *,
+        program_reset_scene_authorization: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         parsed = self._parse_context(context)
         self.bind(context)
@@ -3444,6 +3511,9 @@ class HeadlessSceneProgramPort:
                         request_owner_epoch=view.request_owner_epoch,
                         expected_projection_revision=expected,
                         operation=operation,
+                        program_reset_scene_authorization=(
+                            program_reset_scene_authorization
+                        ),
                     )
                     return
                 except Exception as error:

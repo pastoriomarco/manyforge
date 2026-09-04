@@ -66,8 +66,19 @@ class RecordingKernel final : public core::IKernelCellAdmissionPort {
     return core::Result<core::CellAdmissionRecoveryReceiptDTO>::Err(
         core::ErrorDTO{"unused", "unused", {}});
   }
+  core::Result<void> ValidateProgramResetSceneAuthorization(
+      const core::ProgramResetSceneAuthorizationDTO& authorization)
+      const override {
+    reset_scene_authorization = authorization;
+    if (failure.has_value()) {
+      return core::Result<void>::Err(*failure);
+    }
+    return core::Result<void>::Ok();
+  }
 
   std::optional<core::ManagerLivenessObservationDTO> published;
+  mutable std::optional<core::ProgramResetSceneAuthorizationDTO>
+      reset_scene_authorization;
   std::optional<core::ErrorDTO> failure;
 };
 
@@ -122,6 +133,37 @@ TEST(KernelCellAdmissionRpcInternal, LivenessPublicationFailureIsPreserved) {
       kernel, {"cell_admission_publish_liveness", Observation()});
   ASSERT_TRUE(std::holds_alternative<core::ErrorDTO>(response));
   EXPECT_EQ(std::get<core::ErrorDTO>(response), *kernel.failure);
+}
+
+TEST(KernelCellAdmissionRpcInternal,
+     ProgramResetSceneAuthorizationRoundTripsAndDispatches) {
+  const core::ProgramResetSceneAuthorizationDTO authorization{
+      core::RequestOwnerEpoch("program-runner.epoch.2"),
+      core::ProgramRunId("program-cycle.2"),
+      core::CellAdmissionClaimGeneration(9U),
+      core::ContentDigest("sha256:" + std::string(64U, 'b'))};
+  const component_manager::detail::KernelCellAdmissionRpcPacket request{
+      "cell_admission_validate_program_reset_scene", authorization};
+  const auto decoded =
+      component_manager::detail::DecodeKernelCellAdmissionRpcRequest(
+          component_manager::detail::EncodeKernelCellAdmissionRpcRequest(
+              request));
+  ASSERT_EQ(decoded.command, request.command);
+  EXPECT_EQ(std::get<core::ProgramResetSceneAuthorizationDTO>(decoded.request),
+            authorization);
+
+  RecordingKernel kernel;
+  const auto response =
+      component_manager::detail::DispatchKernelCellAdmissionRpc(kernel,
+                                                                 decoded);
+  EXPECT_EQ(kernel.reset_scene_authorization, authorization);
+  EXPECT_TRUE(std::holds_alternative<std::monostate>(response));
+  const auto response_packet =
+      component_manager::detail::DecodeKernelCellAdmissionRpcResponse(
+          component_manager::detail::EncodeKernelCellAdmissionRpcResponse(
+              decoded.command, response));
+  EXPECT_TRUE(
+      std::holds_alternative<std::monostate>(response_packet.response));
 }
 
 }  // namespace

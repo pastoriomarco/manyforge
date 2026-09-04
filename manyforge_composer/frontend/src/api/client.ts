@@ -139,9 +139,15 @@ export interface HistorianListQuery {
   limit?: number;
 }
 
+export const HISTORIAN_PAGE_LIMIT = 32;
+
 export function historianListPath(query: HistorianListQuery = {}): string {
+  const limit = query.limit ?? HISTORIAN_PAGE_LIMIT;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > HISTORIAN_PAGE_LIMIT) {
+    throw new Error(`History page limit must be an integer from 1 to ${HISTORIAN_PAGE_LIMIT}`);
+  }
   const parameters = new URLSearchParams();
-  parameters.set('limit', String(query.limit ?? 32));
+  parameters.set('limit', String(limit));
   if (query.startNs !== undefined) parameters.set('start_ns', String(query.startNs));
   if (query.endNs !== undefined) parameters.set('end_ns', String(query.endNs));
   if (query.beforeSequence !== undefined) {

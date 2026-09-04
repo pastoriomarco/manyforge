@@ -7,7 +7,6 @@ import {
   buildPreviewIntent,
   initialRobotControlState,
   ROBOT_CONTROL_AUTHOR_DEBOUNCE_MS,
-  ROBOT_CONTROL_OPERATION_POLL_MS,
   robotControlReducer,
 } from './robotControl';
 import type {
@@ -247,6 +246,28 @@ function readyState() {
   return state;
 }
 
+function executingState() {
+  const approving = robotControlReducer(
+    readyState(),
+    { type: 'approve_started' },
+  );
+  const status = structuredClone(approving.status!);
+  status.residentOperations = [{
+    operationId: 'operation-1',
+    operationRevision: 1,
+    resident: true,
+    state: 'queued',
+    progress: 0,
+    activeStopId: null,
+    activeStopGeneration: null,
+    terminalError: null,
+  }];
+  return robotControlReducer(approving, {
+    type: 'status_refreshed',
+    status,
+  });
+}
+
 function gripperReceiptFixture(
   status: ExecutionOwnerStatus,
   requestId: string,
@@ -283,7 +304,6 @@ function gripperReceiptFixture(
 describe('addressed Robot Control state', () => {
   it('preserves the historical bounded authoring cadence', () => {
     expect(ROBOT_CONTROL_AUTHOR_DEBOUNCE_MS).toBe(150);
-    expect(ROBOT_CONTROL_OPERATION_POLL_MS).toBe(500);
   });
 
   it('builds an ordinary operation from exact source-local owner facts', () => {
@@ -429,17 +449,10 @@ describe('addressed Robot Control state', () => {
     expect(blocked.error).toContain('outside');
   });
 
-  it('submits only a ready preview and tracks its exact operation', () => {
+  it('waits for the owner projection before tracking the exact operation', () => {
     const ready = readyState();
     const approving = robotControlReducer(ready, { type: 'approve_started' });
-    const executing = robotControlReducer(approving, {
-      type: 'approve_resolved',
-      acceptance: {
-        requestId: 'request-1',
-        operationId: 'operation-1',
-        operationRevision: 1,
-      },
-    });
+    const executing = executingState();
 
     expect(approving.phase).toBe('approving');
     expect(executing.phase).toBe('executing');
@@ -452,79 +465,49 @@ describe('addressed Robot Control state', () => {
   });
 
   it('does not let Edit or Revert pretend to cancel execution', () => {
-    const ready = readyState();
-    const approving = robotControlReducer(ready, { type: 'approve_started' });
-    const executing = robotControlReducer(approving, {
-      type: 'approve_resolved',
-      acceptance: {
-        requestId: 'request-1',
-        operationId: 'operation-1',
-        operationRevision: 1,
-      },
-    });
+    const executing = executingState();
 
     expect(robotControlReducer(executing, {
       type: 'edit',
       positionsRad: [0.8, 0.5],
     })).toBe(executing);
     expect(robotControlReducer(executing, { type: 'revert' })).toBe(executing);
-    expect(robotControlReducer(executing, { type: 'stop_started' }).phase)
-      .toBe('stopping');
   });
 
-  it('keeps Stop pending across an older execution poll and retains rejection', () => {
-    const ready = readyState();
-    const approving = robotControlReducer(ready, { type: 'approve_started' });
-    const executing = robotControlReducer(approving, {
-      type: 'approve_resolved',
-      acceptance: {
-        requestId: 'request-1',
-        operationId: 'operation-1',
-        operationRevision: 1,
-      },
-    });
-    const stopping = robotControlReducer(executing, { type: 'stop_started' });
-    const racedPoll = robotControlReducer(stopping, {
+  it('changes lifecycle only when a newer owner operation is projected', () => {
+    const executing = executingState();
+    const stillExecuting = robotControlReducer(executing, {
       type: 'operation_observed',
       operation: {
-        ...stopping.operation!,
+        ...executing.operation!,
         operationRevision: 2,
         state: 'executing',
         progress: 0.2,
       },
     });
-    expect(racedPoll.phase).toBe('stopping');
+    expect(stillExecuting.phase).toBe('executing');
 
-    const rejected = robotControlReducer(racedPoll, {
-      type: 'stop_rejected',
-      error: 'Stop request was rejected.',
-    });
-    expect(rejected.phase).toBe('executing');
-    expect(rejected.error).toBe('Stop request was rejected.');
-
-    const laterPoll = robotControlReducer(rejected, {
+    const stopping = robotControlReducer(stillExecuting, {
       type: 'operation_observed',
       operation: {
-        ...rejected.operation!,
+        ...stillExecuting.operation!,
         operationRevision: 3,
-        state: 'executing',
+        state: 'stopping',
         progress: 0.3,
       },
     });
-    expect(laterPoll.error).toBe('Stop request was rejected.');
+    expect(stopping.phase).toBe('stopping');
+
+    const failed = robotControlReducer(stopping, {
+      type: 'operation_poll_failed',
+      error: 'Stop request was rejected.',
+    });
+    expect(failed.phase).toBe('stopping');
+    expect(failed.error).toBe('Stop request was rejected.');
   });
 
   it('keeps a resident terminal operation until exact owner settlement', () => {
-    const ready = readyState();
-    const approving = robotControlReducer(ready, { type: 'approve_started' });
-    let state = robotControlReducer(approving, {
-      type: 'approve_resolved',
-      acceptance: {
-        requestId: 'request-1',
-        operationId: 'operation-1',
-        operationRevision: 1,
-      },
-    });
+    let state = executingState();
     state = robotControlReducer(state, {
       type: 'operation_observed',
       operation: {
@@ -555,8 +538,6 @@ describe('addressed Robot Control state', () => {
     expect(state.draftPositionsRad).toEqual([0.24, 0.49]);
     expect(state.draftGripperPosition).toBe(0.031);
 
-    state = robotControlReducer(state, { type: 'operation_settlement_started' });
-    expect(state.phase).toBe('settling');
     const settledStatus = statusFixture();
     settledStatus.observedMotion.positionsRad = [0.24, 0.49];
     state = robotControlReducer(state, {
@@ -620,6 +601,48 @@ describe('addressed Robot Control state', () => {
     expect(restarted.preview).toBeNull();
     expect(restarted.ghost).toBeNull();
     expect(restarted.error).toContain('restarted');
+  });
+
+  it('discards a local preview at a Program lifecycle boundary', () => {
+    const ready = readyState();
+    const rebased = robotControlReducer(ready, {
+      type: 'program_activity_changed',
+    });
+
+    expect(rebased.phase).toBe('idle');
+    expect(rebased.draftPositionsRad).toEqual(
+      ready.status?.observedMotion.positionsRad,
+    );
+    expect(rebased.intent).toBeNull();
+    expect(rebased.preview).toBeNull();
+    expect(rebased.ghost).toBeNull();
+    expect(rebased.generation).toBe(ready.generation + 1);
+  });
+
+  it('does not adopt Program-owned resident operations as Robot Control work', () => {
+    const ready = readyState();
+    const status = statusFixture();
+    status.residentOperations = ['program-motion-1', 'program-motion-2'].map(
+      (operationId) => ({
+        operationId,
+        operationRevision: 1,
+        resident: true,
+        state: 'completed' as const,
+        progress: 1,
+        activeStopId: null,
+        activeStopGeneration: null,
+        terminalError: null,
+      }),
+    );
+
+    const observed = robotControlReducer(ready, {
+      type: 'program_status_refreshed',
+      status,
+    });
+
+    expect(observed.status).toBe(status);
+    expect(observed.operation).toBeNull();
+    expect(observed.error).toBeNull();
   });
 
   it('preserves absolute pose and explicit current-to-target Cartesian meaning', () => {

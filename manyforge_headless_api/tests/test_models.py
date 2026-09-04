@@ -703,6 +703,20 @@ def test_scene_transaction_is_strict_and_cannot_assert_attribution() -> None:
     with pytest.raises(ValidationError):
         SceneTransactionRequest.model_validate(malformed_revision)
 
+    reset = _scene_transaction()
+    reset["program_reset_scene_authorization"] = {
+        "program_runner_owner_epoch": "program-runner.epoch.2",
+        "program_run_id": "program-cycle.2",
+        "cycle_claim_generation": 9,
+        "terminal_or_settlement_reference": "sha256:" + "e" * 64,
+    }
+    parsed_reset = SceneTransactionRequest.model_validate(reset)
+    assert parsed_reset.program_reset_scene_authorization is not None
+    assert (
+        parsed_reset.program_reset_scene_authorization.cycle_claim_generation
+        == 9
+    )
+
 
 def test_scene_support_declarations_are_portable_and_mode_normalized() -> None:
     body = _scene_transaction()

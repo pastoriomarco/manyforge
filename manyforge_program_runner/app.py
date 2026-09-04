@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import suppress
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
+import json
+from threading import Lock
+import time
 from typing import Annotated, Any, Protocol, runtime_checkable
 
-from fastapi import FastAPI, Path, Query, Request
+from fastapi import FastAPI, Path, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 from manyforge_headless_api.app import RequestBodyLimitMiddleware
@@ -32,6 +38,191 @@ from .models import (
     RuntimeOverrideStageRequest,
 )
 from .runtime import ProgramRunnerError
+
+
+_PROGRAM_CONTROL_STATE_SCHEMA = "manyforge.program_control_state.v1"
+_MAXIMUM_PROGRAM_CONTROL_CLIENTS = 4
+_MAXIMUM_PROGRAM_CONTROL_MESSAGE_BYTES = 16 * 1024 * 1024
+_NODE_PROGRESS_PERIOD_NS = 50_000_000
+
+
+@dataclass(eq=False)
+class _ProgramControlSubscription:
+    wake: asyncio.Event
+    closed: bool = False
+
+
+class ProgramControlStateSource:
+    """Thread-safe capacity-one wake source over current Program owner state."""
+
+    def __init__(self, runtime: Any, *, clock_ns=time.monotonic_ns) -> None:
+        add = getattr(runtime, "add_control_state_observer", None)
+        remove = getattr(runtime, "remove_control_state_observer", None)
+        if not callable(add) or not callable(remove):
+            raise TypeError("Program runtime has no control-state observation port")
+        self._runtime = runtime
+        self._add = add
+        self._remove = remove
+        self._clock_ns = clock_ns
+        self._lock = Lock()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._subscriptions: set[_ProgramControlSubscription] = set()
+        self._registered = False
+        self._closed = False
+
+    def subscribe(self) -> _ProgramControlSubscription:
+        loop = asyncio.get_running_loop()
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Program control-state source is closed")
+            if self._loop is not None and self._loop is not loop:
+                raise RuntimeError("Program control-state source crossed event loops")
+            if len(self._subscriptions) >= _MAXIMUM_PROGRAM_CONTROL_CLIENTS:
+                raise RuntimeError("Program control-state client limit reached")
+            self._loop = loop
+            subscription = _ProgramControlSubscription(asyncio.Event())
+            self._subscriptions.add(subscription)
+            register = not self._registered
+            if register:
+                self._registered = True
+        if register:
+            self._add(self.notify)
+        subscription.wake.set()
+        return subscription
+
+    def unsubscribe(self, subscription: _ProgramControlSubscription) -> None:
+        with self._lock:
+            subscription.closed = True
+            subscription.wake.set()
+            self._subscriptions.discard(subscription)
+            unregister = self._registered and not self._subscriptions
+            if unregister:
+                self._registered = False
+                self._loop = None
+        if unregister:
+            self._remove(self.notify)
+
+    def notify(self) -> None:
+        with self._lock:
+            loop = self._loop
+            subscriptions = tuple(self._subscriptions)
+        if loop is None:
+            return
+        for subscription in subscriptions:
+            if not subscription.closed:
+                loop.call_soon_threadsafe(subscription.wake.set)
+
+    def snapshot(self) -> tuple[dict[str, Any], int]:
+        return self._runtime.cycle_status(), self._clock_ns()
+
+    def clock_ns(self) -> int:
+        return self._clock_ns()
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            subscriptions = tuple(self._subscriptions)
+        for subscription in subscriptions:
+            self.unsubscribe(subscription)
+
+
+async def _serve_program_control_state(
+    websocket: WebSocket,
+    source: ProgramControlStateSource,
+) -> None:
+    await websocket.accept()
+    try:
+        subscription = source.subscribe()
+    except RuntimeError:
+        # The peer may already have abandoned the handshake while overload is
+        # being rejected. Rejection must remain bounded and must not turn that
+        # ordinary race into an ASGI exception storm.
+        with suppress(RuntimeError, WebSocketDisconnect):
+            await websocket.close(
+                code=1013,
+                reason="Program control-state unavailable",
+            )
+        return
+    sequence = 0
+    last_control_revision: int | None = None
+    last_node_send_ns = 0
+    disconnect = asyncio.create_task(websocket.receive())
+    try:
+        while not subscription.closed:
+            wake = asyncio.create_task(subscription.wake.wait())
+            ready, _pending = await asyncio.wait(
+                (wake, disconnect),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if disconnect in ready:
+                if not wake.done():
+                    wake.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await wake
+                message = disconnect.result()
+                if message.get("type") != "websocket.disconnect":
+                    await websocket.close(
+                        code=1008,
+                        reason="Program control state is server-only",
+                    )
+                return
+            subscription.wake.clear()
+            cycle, observed_ns = await asyncio.to_thread(source.snapshot)
+            control_revision = cycle.get("execution_control_revision")
+            node_only = (
+                last_control_revision is not None
+                and control_revision == last_control_revision
+            )
+            remaining_ns = _NODE_PROGRESS_PERIOD_NS - (
+                observed_ns - last_node_send_ns
+            )
+            if node_only and remaining_ns > 0:
+                deadline_ns = observed_ns + remaining_ns
+                while node_only:
+                    timeout = max(
+                        0.0,
+                        (deadline_ns - source.clock_ns()) / 1_000_000_000,
+                    )
+                    if timeout == 0.0:
+                        break
+                    try:
+                        await asyncio.wait_for(subscription.wake.wait(), timeout)
+                    except asyncio.TimeoutError:
+                        break
+                    subscription.wake.clear()
+                    cycle, observed_ns = await asyncio.to_thread(source.snapshot)
+                    control_revision = cycle.get("execution_control_revision")
+                    node_only = control_revision == last_control_revision
+                cycle, observed_ns = await asyncio.to_thread(source.snapshot)
+                control_revision = cycle.get("execution_control_revision")
+            sequence += 1
+            payload = json.dumps(
+                {
+                    "schema_version": _PROGRAM_CONTROL_STATE_SCHEMA,
+                    "server_sequence": str(sequence),
+                    "program_cycle": cycle,
+                },
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            if len(payload.encode("utf-8")) > _MAXIMUM_PROGRAM_CONTROL_MESSAGE_BYTES:
+                await websocket.close(code=1009, reason="Program control state oversized")
+                return
+            await websocket.send_text(payload)
+            last_control_revision = (
+                control_revision if isinstance(control_revision, int) else None
+            )
+            last_node_send_ns = observed_ns
+    except (WebSocketDisconnect, RuntimeError):
+        pass
+    finally:
+        if not disconnect.done():
+            disconnect.cancel()
+            with suppress(asyncio.CancelledError):
+                await disconnect
+        source.unsubscribe(subscription)
 
 
 @runtime_checkable
@@ -155,6 +346,12 @@ def create_app(runtime: ProgramRunnerApplicationPort) -> FastAPI:
     execution_controls = ExecutionControlClient(
         thread_name_prefix="manyforge_program_runner_control",
     )
+    try:
+        control_state_source: ProgramControlStateSource | None = (
+            ProgramControlStateSource(runtime)
+        )
+    except TypeError:
+        control_state_source = None
 
     async def control_call(callback, *, stop: bool = False):
         try:
@@ -182,6 +379,8 @@ def create_app(runtime: ProgramRunnerApplicationPort) -> FastAPI:
             try:
                 runtime.shutdown()
             finally:
+                if control_state_source is not None:
+                    control_state_source.close()
                 execution_controls.close()
 
     app = FastAPI(
@@ -396,6 +595,13 @@ def create_app(runtime: ProgramRunnerApplicationPort) -> FastAPI:
     def cycle_status() -> dict[str, Any]:
         return runtime.cycle_status()
 
+    @app.websocket("/ws/program/control-state")
+    async def program_control_state(websocket: WebSocket) -> None:
+        if control_state_source is None:
+            await websocket.close(code=1008, reason="Program control state unavailable")
+            return
+        await _serve_program_control_state(websocket, control_state_source)
+
     @app.get("/api/program/liveness/status")
     def liveness_status() -> dict[str, Any]:
         read = getattr(runtime, "liveness_status", None)
@@ -409,4 +615,8 @@ def create_app(runtime: ProgramRunnerApplicationPort) -> FastAPI:
     return app
 
 
-__all__ = ["ProgramRunnerApplicationPort", "create_app"]
+__all__ = [
+    "ProgramControlStateSource",
+    "ProgramRunnerApplicationPort",
+    "create_app",
+]

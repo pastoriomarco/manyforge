@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from typing import Any, Protocol
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
 
@@ -33,6 +33,9 @@ class ProgramRunnerClientError(RuntimeError):
 
 
 class ProgramRunnerPort(Protocol):
+    @property
+    def control_state_websocket_url(self) -> str | None: ...
+
     def node_availability(
         self, body: Mapping[str, Any]
     ) -> dict[str, Any]: ...
@@ -116,9 +119,25 @@ class ProgramRunnerHttpClient:
                 "Program-runner URL must be absolute credential-free HTTP(S)"
             )
         self._owns_client = client is None
+        self._base_url = base_url.rstrip("/")
         self._client = client or httpx.Client(
-            base_url=base_url.rstrip("/"),
+            base_url=self._base_url,
             timeout=httpx.Timeout(timeout_seconds),
+        )
+
+    @property
+    def control_state_websocket_url(self) -> str:
+        """Private event-driven Program control projection URL."""
+
+        parsed = urlsplit(self._base_url)
+        return urlunsplit(
+            (
+                "wss" if parsed.scheme == "https" else "ws",
+                parsed.netloc,
+                "/ws/program/control-state",
+                "",
+                "",
+            )
         )
 
     @staticmethod

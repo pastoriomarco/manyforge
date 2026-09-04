@@ -118,6 +118,8 @@ describe('Composer shell continuity', () => {
     expect(workspaceSource).toContain('onDismissAllNotices={dismissAllNotices}');
     expect(source.match(/<SceneAuthoringWorkspace/g)).toHaveLength(1);
     expect(source.match(/useHeadlessStateSource\(headlessEnabled\)/g)).toHaveLength(1);
+    expect(source).toContain('runtimeEnabled={connectedProjection}');
+    expect(source).not.toContain('runtimeEnabled={headlessEnabled}');
     expect(sceneSource.match(/<StructuralViewer/g)).toHaveLength(1);
     expect(sceneSource).toContain('createPortal(editorSurface, editorTarget)');
     expect(workspaceSource).toContain("'params'");
@@ -145,7 +147,7 @@ describe('Composer shell continuity', () => {
     expect(appSource).not.toContain("source: 'composer.headless_projection'");
     expect(appSource).toContain('expanded={runtimePanelExpanded}');
     expect(appSource).toMatch(
-      /const openRuntimeAttention[\s\S]*setRuntimePanelExpanded\(false\)[\s\S]*setGlobalPanel\('runtime'\)/,
+      /const openRuntimeAttention[\s\S]*if \(globalPanel !== 'runtime'\)[\s\S]*setRuntimePanelExpanded\(false\)[\s\S]*setGlobalPanel\('runtime'\)/,
     );
     expect(appSource).not.toContain('panelClassName="runtime-observability-overlay"');
     expect(controlsSource).toContain('<ArtifactBrowser lockedKind="program"');

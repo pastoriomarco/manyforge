@@ -2,7 +2,6 @@ import { readFileSync } from 'node:fs';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { api } from '../api/client';
 import type {
   AppliedProgramSelection,
   ProgramRuntimeControlProjection,
@@ -13,11 +12,12 @@ import type {
 import type { ComposerHeadlessState } from '../types/headless';
 import {
   buildProgramResetRequest,
+  buildProgramStopRequest,
   buildProgramFullStopResetRequest,
   buildProgramStartRequest,
   controlPendingAfterProjection,
-  observeProgramCommandFailure,
   programCommandFailureMessage,
+  programPendingAfterControlUpdate,
   programPendingAfterProjection,
   programRunProjectionKey,
   programRuntimeAfterSnapshot,
@@ -55,10 +55,14 @@ function admissionFixtures() {
       cycleClaimGeneration: null, terminalOrSettlementReference: null,
       runRevision: null, nodeStatusRevision: null,
       runtimeControlRevision: null, recoveryOffer: null,
+      executionControlRevision: 1,
+      causalCorrelationId: null, causalSessionId: null,
+      causalClientSequence: null, currentCommandKind: null,
+      failure: null, resetPhase: null, allowedCommands: [],
       run: null, runtimeControls: null,
     },
     draftIdentity: { draftId: 'draft-1', draftRevision: 5 },
-  } as ComposerHeadlessState;
+  } as unknown as ComposerHeadlessState;
   return { applied, workspace, snapshot };
 }
 
@@ -120,7 +124,7 @@ describe('Program runtime idle selection', () => {
       draftIdentity: { draftId: 'draft-1', draftRevision: 5 },
     } as ComposerHeadlessState;
     expect(programRuntimeWakeKey(snapshot)).toContain(
-      'manager.1:no-retained-bundle:no-graph-revision:applied.1:3:7',
+      'manager.1:no-retained-bundle:no-graph-revision:applied.1:3',
     );
     expect(programRuntimeWakeKey({
       ...snapshot,
@@ -158,7 +162,7 @@ describe('Program runtime idle selection', () => {
         ...snapshot.authoringAdmission,
         admissionGeneration: 8,
       },
-    })).not.toBe(programRuntimeWakeKey(snapshot));
+    })).toBe(programRuntimeWakeKey(snapshot));
     expect(programRuntimeWakeKey({
       ...snapshot,
       componentOverview: {
@@ -192,7 +196,7 @@ describe('Program runtime idle selection', () => {
     expect(refresh).not.toContain('api.programs.runs(');
     expect(refresh).not.toContain('api.programs.runtimeControls(');
     expect(source).toContain('programRuntimeAfterSnapshot(');
-    expect(source).toContain('const pending = programPendingAfterProjection(');
+    expect(source).toContain('const pending = programPendingAfterControlUpdate(');
   });
 
   it('retains only a still-available explicit operator selection', () => {
@@ -208,6 +212,63 @@ describe('Program runtime idle selection', () => {
 });
 
 describe('Program command settlement', () => {
+  it('keeps sending state until delivery and owner projection are both current', () => {
+    const runningCycle = {
+      programRunnerOwnerEpoch: 'runner.epoch.1',
+      cycleGeneration: 4,
+      state: 'running',
+      programRunId: 'run-1',
+      cycleClaimGeneration: 8,
+    } as const;
+    const run = {
+      ownerEpoch: 'runner.epoch.1',
+      state: 'running',
+      capture: { programRunId: 'run-1' },
+    } as ProgramRunStatus;
+
+    expect(programPendingAfterControlUpdate(
+      'run', false, run, null, runningCycle,
+    )).toBe('run');
+    expect(programPendingAfterControlUpdate(
+      'run', true, run, null, runningCycle,
+    )).toBeNull();
+  });
+
+  it('addresses Program Stop from the authoritative cycle while Start is pending', () => {
+    const { snapshot } = admissionFixtures();
+    const starting = {
+      ...snapshot,
+      programCycle: {
+        ...snapshot.programCycle,
+        state: 'starting' as const,
+        programRunId: 'program-cycle.7',
+        allowedCommands: [{
+          commandKind: 'program_stop',
+          semanticTarget: {},
+          allowed: true,
+          disabledReason: null,
+        }],
+      },
+    };
+    expect(buildProgramStopRequest(
+      starting, 'composer.epoch.1', 'request.stop.1',
+    )).toMatchObject({
+      program_run_id: 'program-cycle.7',
+      expected_owner_epoch: 'runner.epoch.1',
+    });
+    expect(buildProgramStopRequest(
+      {
+        ...starting,
+        programCycle: {
+          ...starting.programCycle,
+          allowedCommands: [],
+        },
+      },
+      'composer.epoch.1',
+      'request.stop.2',
+    )).toBeNull();
+  });
+
   it('does not discard a newer node-status projection within one run revision', () => {
     const current = {
       ownerEpoch: 'runner.epoch.1',
@@ -269,71 +330,6 @@ describe('Program command settlement', () => {
       currentControls,
       { ...cycle, programRunId: null, run: null, runtimeControls: null },
     )).toEqual({ run: null, controls: null });
-  });
-
-  it('re-reads the current cycle, exact run, and recovery after rejection', async () => {
-    const run = {
-      ownerEpoch: 'runner.epoch.current',
-      state: 'intervention_required',
-      runRevision: 9,
-      treeStatus: 'failure',
-      capture: { programRunId: 'run-current' },
-      nodeStatuses: { 'node.move': 'failure' },
-      activeOperationCount: 0,
-      reasonCode: 'owner_request_failed',
-      message: 'new motion admission is closed by an active Stop fault',
-    } as unknown as ProgramRunStatus;
-    const cycle = {
-      programRunnerOwnerEpoch: 'runner.epoch.current',
-      cycleGeneration: 8,
-      state: 'terminal_awaiting_reset',
-      programRunId: 'run-current',
-      cycleClaimGeneration: 14,
-    } as unknown as Awaited<ReturnType<typeof api.programs.cycleStatus>>;
-    const controls = {
-      ownerEpoch: 'runner.epoch.current',
-      programRunId: 'run-current',
-      recoveryOffer: {
-        recoveryClass: 'stop_fault_intervention',
-        status: 'reset_required',
-        offerRevision: 4,
-        nodeInstanceId: 'node.move',
-        operationId: 'operation-current',
-        reasonCode: 'active_stop_fault_requires_reset',
-        actions: [{ actionId: 'reset_cycle', enabled: true }],
-      },
-    } as unknown as Awaited<ReturnType<typeof api.programs.runtimeControls>>;
-    const cycleStatus = vi.spyOn(api.programs, 'cycleStatus')
-      .mockResolvedValue(cycle);
-    const read = vi.spyOn(api.programs, 'read').mockResolvedValue(run);
-    const runtimeControls = vi.spyOn(api.programs, 'runtimeControls')
-      .mockResolvedValue(controls);
-
-    const diagnostic = await observeProgramCommandFailure(
-      new Error('Run request failed'),
-      'Program Run was rejected.',
-      'program-run-start.request-7',
-      null,
-      null,
-      null,
-    );
-
-    expect(cycleStatus).toHaveBeenCalledOnce();
-    expect(read).toHaveBeenCalledWith('run-current');
-    expect(runtimeControls).toHaveBeenCalledWith('run-current');
-    expect(diagnostic.run).toBe(run);
-    expect(diagnostic.controls).toBe(controls);
-    expect(diagnostic.message).toContain('Request program-run-start.request-7.');
-    expect(diagnostic.message).toContain(
-      'Observed cycle: terminal_awaiting_reset, generation 8',
-    );
-    expect(diagnostic.message).toContain(
-      'Observed recovery stop_fault_intervention: reset_required',
-    );
-    expect(diagnostic.message).toContain('Allowed actions: reset_cycle.');
-    expect(diagnostic.message).toContain(
-      'Current status was re-read after the failed request.',
-    );
   });
 
   it('keeps exact request and current owner projections in command failures', () => {
@@ -454,6 +450,13 @@ describe('Program command settlement', () => {
       programRunId: 'run-1',
       cycleClaimGeneration: 8,
     })).toBeNull();
+    expect(programPendingAfterProjection('stop', null, null, {
+      programRunnerOwnerEpoch: 'runner.epoch.1',
+      cycleGeneration: 4,
+      state: 'terminal_awaiting_reset',
+      programRunId: 'run-1',
+      cycleClaimGeneration: null,
+    })).toBeNull();
     const idleCycle = {
       programRunnerOwnerEpoch: 'runner.epoch.1',
       cycleGeneration: 5,
@@ -464,40 +467,12 @@ describe('Program command settlement', () => {
       authoringAllowed: true,
     } as const;
     expect(programPendingAfterProjection(
-      'run', run, settled, {
-        ...idleCycle,
-        cycleGeneration: 4,
-        state: 'running',
-        programRunId: 'run-1',
-        cycleClaimGeneration: 8,
-      }, 'run',
-    )).toBe('run');
-    expect(programPendingAfterProjection(
-      'reset', null, null, idleCycle, 'reset',
-    )).toBe('reset');
-    expect(programPendingAfterProjection(
       'reset', null, null, idleCycle,
     )).toBeNull();
     expect(programPendingAfterProjection(
       'reset', null, null,
       { ...idleCycle, authoringAllowed: false },
-      null,
-      { admissionGeneration: 12, allowEqual: false },
     )).toBe('reset');
-    expect(programPendingAfterProjection(
-      'reset', null, null, idleCycle, null,
-      { admissionGeneration: 12, allowEqual: false },
-    )).toBe('reset');
-    expect(programPendingAfterProjection(
-      'reset', null, null,
-      { ...idleCycle, admissionGeneration: 13 },
-      null,
-      { admissionGeneration: 12, allowEqual: false },
-    )).toBeNull();
-    expect(programPendingAfterProjection(
-      'reset', null, null, idleCycle, null,
-      { admissionGeneration: 12, allowEqual: true },
-    )).toBeNull();
 
     const resetOnly = {
       ...settled,
@@ -593,6 +568,10 @@ describe('Program runtime authority requests', () => {
         terminalOrSettlementReference: terminalReference,
         runRevision: null, nodeStatusRevision: null,
         runtimeControlRevision: null, recoveryOffer: null,
+        executionControlRevision: 1,
+        causalCorrelationId: null, causalSessionId: null,
+        causalClientSequence: null, currentCommandKind: null,
+        failure: null, resetPhase: null, allowedCommands: [],
         run: null, runtimeControls: null,
       },
     };
@@ -602,7 +581,7 @@ describe('Program runtime authority requests', () => {
       request_id: 'reset.fixture',
       request_owner_epoch: 'composer-program-owner.fixture',
       source_label: 'operator_ui',
-      correlation_id: null,
+      correlation_id: 'reset.fixture',
       program_run_id: 'run-1',
       expected_owner_epoch: 'runner.epoch.1',
       expected_cycle_generation: 4,

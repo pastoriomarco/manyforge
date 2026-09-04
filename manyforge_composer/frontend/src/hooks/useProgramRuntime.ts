@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { ApiError, api } from '../api/client';
-import { executionControlClient } from '../api/executionControlClient';
 import { errorMessage } from '../state/structuralResource';
 import type {
   AppliedProgramSelection,
@@ -17,7 +16,11 @@ import type {
   ScenarioCatalogResponse,
 } from '../types/api';
 import type { ComposerHeadlessState } from '../types/headless';
-import { browserStableIdentity } from './useHeadlessState';
+import {
+  browserStableIdentity,
+  type ExecutionControlCommandKind,
+  type HeadlessStateSource,
+} from './useHeadlessState';
 
 const CURRENT_STATES = new Set([
   'running',
@@ -36,11 +39,6 @@ type ProgramCycleDebugProjection = Pick<ProgramCycleStatus,
   admissionGeneration?: number;
   authoringAllowed?: boolean;
 };
-
-export interface ProgramResetAdmissionFence {
-  admissionGeneration: number;
-  allowEqual: boolean;
-}
 
 export function programCurrentStatusSummary(
   run: ProgramRunStatus | null,
@@ -101,67 +99,11 @@ export function programTerminalFailureMessage(
   return `Program execution failed. ${programCurrentStatusSummary(run, controls, cycle)}`;
 }
 
-export interface ProgramCommandFailureDiagnostic {
-  message: string;
-  run: ProgramRunStatus | null;
-  controls: ProgramRuntimeControlProjection | null;
-}
-
-export async function observeProgramCommandFailure(
-  reason: unknown,
-  fallback: string,
-  requestId: string,
-  fallbackRun: ProgramRunStatus | null,
-  fallbackControls: ProgramRuntimeControlProjection | null,
-  fallbackCycle: ProgramCycleDebugProjection | null,
-): Promise<ProgramCommandFailureDiagnostic> {
-  const observationErrors: string[] = [];
-  let cycle: ProgramCycleStatus | null = null;
-  try {
-    cycle = await api.programs.cycleStatus();
-  } catch (observationError) {
-    observationErrors.push(errorMessage(
-      observationError,
-      'Fresh Program-cycle status unavailable.',
-    ));
-  }
-  const programRunId = cycle?.programRunId
-    ?? fallbackRun?.capture.programRunId
-    ?? null;
-  let run = fallbackRun;
-  let controls = fallbackControls;
-  if (programRunId !== null) {
-    const [runResult, controlsResult] = await Promise.allSettled([
-      api.programs.read(programRunId),
-      api.programs.runtimeControls(programRunId),
-    ]);
-    if (runResult.status === 'fulfilled') run = runResult.value;
-    else observationErrors.push(errorMessage(
-      runResult.reason,
-      'Fresh Program-run status unavailable.',
-    ));
-    if (controlsResult.status === 'fulfilled') controls = controlsResult.value;
-    else observationErrors.push(errorMessage(
-      controlsResult.reason,
-      'Fresh Program recovery status unavailable.',
-    ));
-  }
-  return {
-    run,
-    controls,
-    message: [
-      errorMessage(reason, fallback),
-      `Request ${requestId}.`,
-      programCurrentStatusSummary(run, controls, cycle ?? fallbackCycle),
-      observationErrors.length === 0
-        ? 'Current status was re-read after the failed request.'
-        : `Current-status read was incomplete: ${[...new Set(observationErrors)].join(' ')}`,
-    ].join(' '),
-  };
-}
-
 export function programRuntimeWakeKey(snapshot: ComposerHeadlessState | null): string {
   if (snapshot === null) return 'unavailable';
+  // Catalog and Applied reads follow their own owner identities. Program-cycle
+  // and authoring-admission revisions are already carried by the control
+  // snapshot and must not refetch static authoring resources during motion.
   const manager = snapshot.runtime.sections.manager;
   const basis = snapshot.componentOverview?.basis;
   const managerActive = manager.payload?.active;
@@ -179,7 +121,6 @@ export function programRuntimeWakeKey(snapshot: ComposerHeadlessState | null): s
       ? active.graph_revision : 'no-graph-revision',
     basis?.appliedProgramOwnerEpoch ?? 'no-applied-owner',
     basis?.appliedProgramGeneration ?? 'no-applied-generation',
-    snapshot.authoringAdmission.admissionGeneration,
   ].join(':');
 }
 
@@ -209,6 +150,7 @@ interface ProgramRuntimeState {
   loading: boolean;
   observationError: string | null;
   pending: ProgramPendingCommand;
+  pendingDeliveryConfirmed: boolean;
   controlPending: string | null;
   error: string | null;
 }
@@ -224,6 +166,7 @@ const INITIAL_STATE: ProgramRuntimeState = {
   loading: true,
   observationError: null,
   pending: null,
+  pendingDeliveryConfirmed: false,
   controlPending: null,
   error: null,
 };
@@ -354,12 +297,7 @@ export function programPendingAfterProjection(
   run: ProgramRunStatus | null,
   controls: ProgramRuntimeControlProjection | null,
   cycle: ProgramCycleDebugProjection | null = null,
-  responsePending: ProgramPendingCommand = null,
-  resetAdmissionFence: ProgramResetAdmissionFence | null = null,
 ): ProgramPendingCommand {
-  // Owner projection may overtake the exact HTTP response. Keep the pressed
-  // command disabled until both halves of that same operation have settled.
-  if (pending !== null && responsePending === pending) return pending;
   if (pending === 'motion-stop') {
     if (programMotionStopSettled(run, controls)) return null;
     if (
@@ -369,36 +307,26 @@ export function programPendingAfterProjection(
     return pending;
   }
   if (pending === 'run') {
-    return run !== null
+    if (run !== null
       && run.state === 'running'
       && cycle?.state === 'running'
-      && cycle.programRunId === run.capture.programRunId
-      ? null
-      : pending;
+      && cycle.programRunId === run.capture.programRunId) return null;
+    return cycle !== null
+      && ['stopping', 'resetting', 'terminal_awaiting_reset', 'recovery_required']
+        .includes(cycle.state)
+      ? null : pending;
   }
   if (pending === 'reset') {
-    if (cycle?.state !== 'idle_after_reset') return pending;
-    // A Reset first publishes Idle, then prepares the authored scene under
-    // short authoring claims. Do not expose Run against the crossed, older
-    // admission projection. The exact Reset response supplies the fence; a
-    // response that was already authoring-ready may settle at equality.
-    if (resetAdmissionFence === null) return null;
-    if (cycle.authoringAllowed !== true) return pending;
-    const generation = cycle.admissionGeneration;
-    if (generation === undefined) return pending;
-    return (
-      generation > resetAdmissionFence.admissionGeneration
-      || (
-        resetAdmissionFence.allowEqual
-        && generation === resetAdmissionFence.admissionGeneration
-      )
-    ) ? null : pending;
+    return cycle?.state === 'idle_after_reset'
+      && cycle.authoringAllowed === true ? null : pending;
   }
   if (pending === 'stop') {
-    return run !== null
+    const settled = (
+      run !== null
       && ['stopped', 'succeeded', 'failed'].includes(run.state)
-      ? null
-      : pending;
+    ) || cycle?.state === 'terminal_awaiting_reset'
+      || cycle?.state === 'idle_after_reset';
+    return settled ? null : pending;
   }
   if (pending === 'full-stop') {
     return run?.state === 'full_stopped' ? null : pending;
@@ -409,6 +337,18 @@ export function programPendingAfterProjection(
       : pending;
   }
   return pending;
+}
+
+export function programPendingAfterControlUpdate(
+  pending: ProgramPendingCommand,
+  deliveryConfirmed: boolean,
+  run: ProgramRunStatus | null,
+  controls: ProgramRuntimeControlProjection | null,
+  cycle: ProgramCycleDebugProjection | null = null,
+): ProgramPendingCommand {
+  return deliveryConfirmed
+    ? programPendingAfterProjection(pending, run, controls, cycle)
+    : pending;
 }
 
 export function buildProgramStartRequest(
@@ -451,21 +391,54 @@ export function buildProgramResetRequest(
   const cycle = snapshot?.programCycle;
   if (
     cycle === undefined
-    || cycle.state !== 'terminal_awaiting_reset'
-    || cycle.programRunId === null || cycle.cycleClaimGeneration === null
-    || cycle.terminalOrSettlementReference === null
+    || !['running', 'terminal_awaiting_reset'].includes(cycle.state)
+    || cycle.programRunId === null
+    || (
+      cycle.state === 'terminal_awaiting_reset'
+      && cycle.terminalOrSettlementReference === null
+    )
+    || (
+      cycle.state === 'running'
+      && cycle.terminalOrSettlementReference !== null
+    )
   ) return null;
   return {
     request_id: requestId,
     request_owner_epoch: requestOwnerEpoch,
     source_label: 'operator_ui',
-    correlation_id: null,
+    correlation_id: requestId,
     program_run_id: cycle.programRunId,
     expected_owner_epoch: cycle.programRunnerOwnerEpoch,
     expected_cycle_generation: cycle.cycleGeneration,
     expected_claim_generation: cycle.cycleClaimGeneration,
     terminal_reference: cycle.terminalOrSettlementReference,
     settlement_evidence_digest: cycle.terminalOrSettlementReference,
+  };
+}
+
+export function buildProgramStopRequest(
+  snapshot: ComposerHeadlessState | null,
+  requestOwnerEpoch: string,
+  requestId: string,
+): Record<string, JsonValue> | null {
+  const cycle = snapshot?.programCycle;
+  const allowed = cycle?.allowedCommands.some(
+    (command) => command.commandKind === 'program_stop' && command.allowed,
+  ) ?? false;
+  if (
+    cycle === undefined
+    || !allowed
+    || !['starting', 'running'].includes(cycle.state)
+    || cycle.programRunId === null
+  ) return null;
+  return {
+    request_id: requestId,
+    request_owner_epoch: requestOwnerEpoch,
+    source_label: 'operator_ui',
+    correlation_id: requestId,
+    program_run_id: cycle.programRunId,
+    expected_owner_epoch: cycle.programRunnerOwnerEpoch,
+    reason: 'ordinary operator Program Stop',
   };
 }
 
@@ -573,17 +546,14 @@ export function useProgramRuntime(
   enabled: boolean,
   snapshot: ComposerHeadlessState | null = null,
   workspace: ProgramWorkspaceResponse | null = null,
+  controlSource: HeadlessStateSource | null = null,
 ) {
   const [state, setState] = useState<ProgramRuntimeState>(INITIAL_STATE);
-  const stateRef = useRef(state);
-  stateRef.current = state;
   const mounted = useRef(true);
   const refreshing = useRef(false);
   const refreshQueued = useRef(false);
   const observationRetryAttempt = useRef(0);
   const [observationRetrySequence, setObservationRetrySequence] = useState(0);
-  const programResponsePending = useRef<ProgramPendingCommand>(null);
-  const resetAdmissionFence = useRef<ProgramResetAdmissionFence | null>(null);
   const catalogCache = useRef<ScenarioCatalogResponse | null>(null);
   const requestedWakeKey = useRef<string | null>(null);
   const callerEpoch = useRef(browserStableIdentity(
@@ -604,8 +574,6 @@ export function useProgramRuntime(
     },
     [snapshot],
   );
-  const cycleDebugProjectionRef = useRef(cycleDebugProjection);
-  cycleDebugProjectionRef.current = cycleDebugProjection;
   const refresh = useCallback(async () => {
     if (!enabled || !snapshotAvailable) return;
     if (refreshing.current) {
@@ -722,14 +690,15 @@ export function useProgramRuntime(
         current.controls,
         cycle,
       );
-      const pending = programPendingAfterProjection(
+      const pending = programPendingAfterControlUpdate(
         current.pending,
+        current.pendingDeliveryConfirmed,
         projected.run,
         projected.controls,
         cycleDebugProjection,
-        programResponsePending.current,
-        resetAdmissionFence.current,
       );
+      const pendingDeliveryConfirmed = pending !== null
+        && current.pendingDeliveryConfirmed;
       const controlPending = controlPendingAfterProjection(
         current.controlPending,
         current.controls,
@@ -750,6 +719,7 @@ export function useProgramRuntime(
         && controlsKey(current.controls) === controlsKey(projected.controls)
         && current.runnerAvailable
         && current.pending === pending
+        && current.pendingDeliveryConfirmed === pendingDeliveryConfirmed
         && current.controlPending === controlPending
         && current.error === error
       ) return current;
@@ -759,11 +729,17 @@ export function useProgramRuntime(
         controls: projected.controls,
         runnerAvailable: true,
         pending,
+        pendingDeliveryConfirmed,
         controlPending,
         error,
       };
     });
-  }, [cycleDebugProjection, enabled, snapshot]);
+  }, [
+    cycleDebugProjection,
+    enabled,
+    snapshot,
+    state.pendingDeliveryConfirmed,
+  ]);
 
   useEffect(() => {
     if (
@@ -798,8 +774,6 @@ export function useProgramRuntime(
   useEffect(() => {
     if (!enabled) {
       setState(INITIAL_STATE);
-      programResponsePending.current = null;
-      resetAdmissionFence.current = null;
       catalogCache.current = null;
       requestedWakeKey.current = null;
       observationRetryAttempt.current = 0;
@@ -852,9 +826,21 @@ export function useProgramRuntime(
   }, []);
 
   const beginProgramCommand = useCallback((pending: Exclude<ProgramPendingCommand, null>) => {
-    programResponsePending.current = pending;
-    if (pending !== 'reset') resetAdmissionFence.current = null;
-    setState((current) => ({ ...current, pending, error: null }));
+    setState((current) => ({
+      ...current,
+      pending,
+      pendingDeliveryConfirmed: false,
+      error: null,
+    }));
+  }, []);
+
+  const confirmProgramCommandDelivery = useCallback((
+    expectedPending: Exclude<ProgramPendingCommand, null>,
+  ) => {
+    if (!mounted.current) return;
+    setState((current) => current.pending !== expectedPending
+      ? current
+      : { ...current, pendingDeliveryConfirmed: true });
   }, []);
 
   const beginControlCommand = useCallback((pending: string) => {
@@ -866,33 +852,27 @@ export function useProgramRuntime(
     fallback: string,
     requestId: string,
     pendingKind: 'program' | 'control',
+    expectedPending: string,
   ) => {
-    if (pendingKind === 'program') {
-      programResponsePending.current = null;
-      resetAdmissionFence.current = null;
-    }
-    const diagnostic = await observeProgramCommandFailure(
-      reason,
-      fallback,
-      requestId,
-      stateRef.current.run,
-      stateRef.current.controls,
-      cycleDebugProjectionRef.current,
-    );
     if (!mounted.current) return;
-    const diagnosticControls = diagnostic.run !== null
-      && diagnostic.controls?.ownerEpoch === diagnostic.run.ownerEpoch
-      && diagnostic.controls.programRunId === diagnostic.run.capture.programRunId
-      ? diagnostic.controls
-      : null;
-    setState((current) => ({
-      ...current,
-      run: diagnostic.run,
-      controls: diagnosticControls,
-      pending: pendingKind === 'program' ? null : current.pending,
-      controlPending: pendingKind === 'control' ? null : current.controlPending,
-      error: diagnostic.message,
-    }));
+    setState((current) => {
+      if (
+        (pendingKind === 'program' && current.pending !== expectedPending)
+        || (pendingKind === 'control'
+          && current.controlPending !== expectedPending)
+      ) return current;
+      return {
+        ...current,
+        pending: pendingKind === 'program' ? null : current.pending,
+        pendingDeliveryConfirmed: pendingKind === 'program'
+          ? false : current.pendingDeliveryConfirmed,
+        controlPending: pendingKind === 'control' ? null : current.controlPending,
+        error: [
+          errorMessage(reason, fallback),
+          `Request ${requestId}. Backend state remains authoritative.`,
+        ].join(' '),
+      };
+    });
   }, []);
 
   const run = useCallback(async () => {
@@ -902,113 +882,69 @@ export function useProgramRuntime(
       callerEpoch.current, requestId,
     );
     if (request === null) return;
+    if (controlSource === null) return;
+    beginProgramCommand('run');
     try {
-      const status = await executionControlClient.ordinary(
-        () => api.programs.start(request),
-        () => beginProgramCommand('run'),
+      await controlSource.sendExecutionCommand(
+        'program_run', request, requestId,
       );
-      programResponsePending.current = null;
-      if (mounted.current) {
-        setState((current) => ({
-          ...current,
-          run: status,
-          controls: null,
-          pending: programPendingAfterProjection(
-            current.pending,
-            status,
-            null,
-            cycleDebugProjectionRef.current,
-          ),
-        }));
-      }
+      confirmProgramCommandDelivery('run');
     } catch (reason) {
       await recordCommandFailure(
-        reason, 'Program Run was rejected.', requestId, 'program',
+        reason, 'Program Run was rejected.', requestId, 'program', 'run',
       );
     }
   }, [
-    beginProgramCommand, recordCommandFailure, snapshot,
+    beginProgramCommand, confirmProgramCommandDelivery, controlSource,
+    recordCommandFailure, snapshot,
     state.applied, state.pending, state.runnerAvailable, workspace,
   ]);
 
   const reset = useCallback(async () => {
     const requestId = identity('program-cycle-reset');
-    const fullStopRequest = buildProgramFullStopResetRequest(
-      snapshot, state.run, callerEpoch.current, requestId,
-    );
-    const request = fullStopRequest ?? buildProgramResetRequest(
+    const request = buildProgramResetRequest(
       snapshot, callerEpoch.current, requestId,
     );
-    if (request === null) return;
+    if (request === null || controlSource === null) return;
+    beginProgramCommand('reset');
     try {
-      const result = await executionControlClient.ordinary(
-        () => fullStopRequest !== null && state.run !== null
-          ? api.programs.resetFullStop(
-            state.run.capture.programRunId,
-            fullStopRequest,
-          )
-          : api.programs.resetCycle(request),
-        () => beginProgramCommand('reset'),
+      await controlSource.sendExecutionCommand(
+        'program_reset', request, requestId,
       );
-      resetAdmissionFence.current = {
-        admissionGeneration: result.admission.admissionGeneration,
-        allowEqual: result.admission.authoringAllowed,
-      };
-      programResponsePending.current = null;
-      await refresh();
+      confirmProgramCommandDelivery('reset');
     } catch (reason) {
       await recordCommandFailure(
-        reason, 'Program Reset was rejected.', requestId, 'program',
+        reason, 'Program Reset was rejected.', requestId, 'program', 'reset',
       );
     }
   }, [
-    beginProgramCommand, recordCommandFailure, refresh, snapshot, state.run,
+    beginProgramCommand, confirmProgramCommandDelivery, controlSource,
+    recordCommandFailure, snapshot,
   ]);
 
   const stop = useCallback(async () => {
-    if (
-      !state.run
-      || !state.runnerAvailable
-      || state.pending !== null
-    ) return;
+    if (!state.runnerAvailable || ['stop', 'motion-stop', 'full-stop', 'reset']
+      .includes(state.pending ?? '')) return;
     const requestId = identity('program-run-stop');
+    const request = buildProgramStopRequest(
+      snapshot, callerEpoch.current, requestId,
+    );
+    if (controlSource === null || request === null) return;
+    beginProgramCommand('stop');
     try {
-      const status = await executionControlClient.stop(
-        () => api.programs.stop(
-          state.run!.capture.programRunId,
-          {
-            request_id: requestId,
-            request_owner_epoch: callerEpoch.current,
-            source_label: 'operator_ui',
-            correlation_id: requestId,
-            program_run_id: state.run!.capture.programRunId,
-            expected_owner_epoch: state.run!.ownerEpoch,
-            reason: 'ordinary operator Program Stop',
-          },
-        ),
-        () => beginProgramCommand('stop'),
+      await controlSource.sendExecutionCommand(
+        'program_stop', request, requestId,
       );
-      programResponsePending.current = null;
-      if (mounted.current) {
-        setState((current) => ({
-          ...current,
-          run: status,
-          pending: programPendingAfterProjection(
-            current.pending,
-            status,
-            current.controls,
-            cycleDebugProjectionRef.current,
-          ),
-        }));
-      }
+      confirmProgramCommandDelivery('stop');
     } catch (reason) {
       await recordCommandFailure(
-        reason, 'Program Stop was rejected.', requestId, 'program',
+        reason, 'Program Stop was rejected.', requestId, 'program', 'stop',
       );
     }
   }, [
-    beginProgramCommand, recordCommandFailure,
-    state.pending, state.run, state.runnerAvailable,
+    beginProgramCommand, confirmProgramCommandDelivery, controlSource,
+    recordCommandFailure,
+    snapshot, state.pending, state.runnerAvailable,
   ]);
 
   const stopMotion = useCallback(async () => {
@@ -1016,45 +952,35 @@ export function useProgramRuntime(
       !state.run
       || state.run.state !== 'running'
       || !state.runnerAvailable
-      || state.pending !== null
+      || ['stop', 'motion-stop', 'full-stop', 'reset']
+        .includes(state.pending ?? '')
     ) return;
     const requestId = identity('program-motion-stop');
+    if (controlSource === null) return;
+    beginProgramCommand('motion-stop');
     try {
-      const status = await executionControlClient.stop(
-        () => api.programs.stopMotion(
-          state.run!.capture.programRunId,
-          {
-            request_id: requestId,
-            request_owner_epoch: callerEpoch.current,
-            source_label: 'operator_ui',
-            correlation_id: requestId,
-            program_run_id: state.run!.capture.programRunId,
-            expected_owner_epoch: state.run!.ownerEpoch,
-            reason: 'ordinary operator motion Stop',
-          },
-        ),
-        () => beginProgramCommand('motion-stop'),
+      await controlSource.sendExecutionCommand(
+        'program_motion_stop',
+        {
+          request_id: requestId,
+          request_owner_epoch: callerEpoch.current,
+          source_label: 'operator_ui',
+          correlation_id: requestId,
+          program_run_id: state.run.capture.programRunId,
+          expected_owner_epoch: state.run.ownerEpoch,
+          reason: 'ordinary operator motion Stop',
+        },
+        requestId,
       );
-      programResponsePending.current = null;
-      if (mounted.current) {
-        setState((current) => ({
-          ...current,
-          run: status,
-          pending: programPendingAfterProjection(
-            current.pending,
-            status,
-            current.controls,
-            cycleDebugProjectionRef.current,
-          ),
-        }));
-      }
+      confirmProgramCommandDelivery('motion-stop');
     } catch (reason) {
       await recordCommandFailure(
-        reason, 'Motion Stop was rejected.', requestId, 'program',
+        reason, 'Motion Stop was rejected.', requestId, 'program', 'motion-stop',
       );
     }
   }, [
-    beginProgramCommand, recordCommandFailure,
+    beginProgramCommand, confirmProgramCommandDelivery, controlSource,
+    recordCommandFailure,
     state.pending, state.run, state.runnerAvailable,
   ]);
 
@@ -1063,45 +989,35 @@ export function useProgramRuntime(
       !state.run
       || !['running', 'intervention_required'].includes(state.run.state)
       || !state.runnerAvailable
-      || state.pending !== null
+      || ['stop', 'motion-stop', 'full-stop', 'reset']
+        .includes(state.pending ?? '')
     ) return;
     const requestId = identity('program-full-stop');
+    if (controlSource === null) return;
+    beginProgramCommand('full-stop');
     try {
-      const status = await executionControlClient.stop(
-        () => api.programs.fullStop(
-          state.run!.capture.programRunId,
-          {
-            request_id: requestId,
-            request_owner_epoch: callerEpoch.current,
-            source_label: 'operator_ui',
-            correlation_id: requestId,
-            program_run_id: state.run!.capture.programRunId,
-            expected_owner_epoch: state.run!.ownerEpoch,
-            reason: 'ordinary operator Full Stop',
-          },
-        ),
-        () => beginProgramCommand('full-stop'),
+      await controlSource.sendExecutionCommand(
+        'program_full_stop',
+        {
+          request_id: requestId,
+          request_owner_epoch: callerEpoch.current,
+          source_label: 'operator_ui',
+          correlation_id: requestId,
+          program_run_id: state.run.capture.programRunId,
+          expected_owner_epoch: state.run.ownerEpoch,
+          reason: 'ordinary operator Full Stop',
+        },
+        requestId,
       );
-      programResponsePending.current = null;
-      if (mounted.current) {
-        setState((current) => ({
-          ...current,
-          run: status,
-          pending: programPendingAfterProjection(
-            current.pending,
-            status,
-            current.controls,
-            cycleDebugProjectionRef.current,
-          ),
-        }));
-      }
+      confirmProgramCommandDelivery('full-stop');
     } catch (reason) {
       await recordCommandFailure(
-        reason, 'Full Stop was rejected.', requestId, 'program',
+        reason, 'Full Stop was rejected.', requestId, 'program', 'full-stop',
       );
     }
   }, [
-    beginProgramCommand, recordCommandFailure,
+    beginProgramCommand, confirmProgramCommandDelivery, controlSource,
+    recordCommandFailure,
     state.pending, state.run, state.runnerAvailable,
   ]);
 
@@ -1113,43 +1029,33 @@ export function useProgramRuntime(
       || state.pending !== null
     ) return;
     const requestId = identity('program-full-stop-run');
+    if (controlSource === null) return;
+    beginProgramCommand('resume-full-stop');
     try {
-      const status = await executionControlClient.ordinary(
-        () => api.programs.resumeFullStop(
-          state.run!.capture.programRunId,
-          {
-            request_id: requestId,
-            request_owner_epoch: callerEpoch.current,
-            source_label: 'operator_ui',
-            correlation_id: requestId,
-            program_run_id: state.run!.capture.programRunId,
-            expected_owner_epoch: state.run!.ownerEpoch,
-            expected_run_revision: state.run!.runRevision,
-            reason: 'operator Run after Full Stop',
-          },
-        ),
-        () => beginProgramCommand('resume-full-stop'),
+      await controlSource.sendExecutionCommand(
+        'program_resume_full_stop',
+        {
+          request_id: requestId,
+          request_owner_epoch: callerEpoch.current,
+          source_label: 'operator_ui',
+          correlation_id: requestId,
+          program_run_id: state.run.capture.programRunId,
+          expected_owner_epoch: state.run.ownerEpoch,
+          expected_run_revision: state.run.runRevision,
+          reason: 'operator Run after Full Stop',
+        },
+        requestId,
       );
-      programResponsePending.current = null;
-      if (mounted.current) {
-        setState((current) => ({
-          ...current,
-          run: status,
-          pending: programPendingAfterProjection(
-            current.pending,
-            status,
-            current.controls,
-            cycleDebugProjectionRef.current,
-          ),
-        }));
-      }
+      confirmProgramCommandDelivery('resume-full-stop');
     } catch (reason) {
       await recordCommandFailure(
         reason, 'Run after Full Stop was rejected.', requestId, 'program',
+        'resume-full-stop',
       );
     }
   }, [
-    beginProgramCommand, recordCommandFailure,
+    beginProgramCommand, confirmProgramCommandDelivery, controlSource,
+    recordCommandFailure,
     state.pending, state.run, state.runnerAvailable,
   ]);
 
@@ -1178,32 +1084,22 @@ export function useProgramRuntime(
   const performRuntimeControl = useCallback(async (
     pending: string,
     requestId: string,
-    effect: () => Promise<{
-      run: ProgramRunStatus;
-      runtimeControls: ProgramRuntimeControlProjection;
-    }>,
+    commandKind: ExecutionControlCommandKind,
+    payload: Record<string, JsonValue>,
     fallback: string,
   ) => {
+    if (controlSource === null) return;
+    beginControlCommand(pending);
     try {
-      const result = await executionControlClient.ordinary(
-        effect,
-        () => beginControlCommand(pending),
+      await controlSource.sendExecutionCommand(
+        commandKind, payload, requestId,
       );
-      if (mounted.current) setState((current) => ({
-        ...current,
-        run: result.run,
-        controls: result.runtimeControls,
-        controlPending: controlPendingAfterProjection(
-          current.controlPending,
-          current.controls,
-          result.runtimeControls,
-          result.run,
-        ),
-      }));
     } catch (reason) {
-      await recordCommandFailure(reason, fallback, requestId, 'control');
+      await recordCommandFailure(
+        reason, fallback, requestId, 'control', pending,
+      );
     }
-  }, [beginControlCommand, recordCommandFailure]);
+  }, [beginControlCommand, controlSource, recordCommandFailure]);
 
   const applyRecoveryAction = useCallback((actionId: CycleRecoveryActionId) => {
     const offer = state.controls?.recoveryOffer;
@@ -1227,7 +1123,8 @@ export function useProgramRuntime(
     void performRuntimeControl(
       `recovery:${actionId}`,
       requestId,
-      () => api.programs.applyRecoveryAction(body),
+      'execution_recovery',
+      body,
       'The recovery action was rejected.',
     );
   }, [performRuntimeControl, state.controlPending, state.controls]);
@@ -1249,19 +1146,16 @@ export function useProgramRuntime(
     void performRuntimeControl(
       'override:stage-observation',
       requestId,
-      () => api.programs.runtimeControlAction(
-        base.program_run_id as string,
-        'runtime-overrides',
-        {
-          ...base,
-          node_instance_id: candidate.nodeInstanceId,
-          node_attempt_id: candidate.nodeAttemptId,
-          parameter_id: candidate.parameterId,
-          value: candidate.value,
-          source_observation_id: candidate.sourceObservationId,
-          source_owner_generation: candidate.sourceOwnerGeneration,
-        },
-      ),
+      'program_runtime_override_stage',
+      {
+        ...base,
+        node_instance_id: candidate.nodeInstanceId,
+        node_attempt_id: candidate.nodeAttemptId,
+        parameter_id: candidate.parameterId,
+        value: candidate.value,
+        source_observation_id: candidate.sourceObservationId,
+        source_owner_generation: candidate.sourceOwnerGeneration,
+      },
       'The Robot snapshot could not be staged.',
     );
   }, [performRuntimeControl, runtimeControlRequest, state.controls]);
@@ -1273,11 +1167,11 @@ export function useProgramRuntime(
     const requestId = identity(`program-runtime-override-${action}`);
     const base = runtimeControlRequest(requestId);
     if (base === null || (action === 'promote' && workspace === null)) return;
-    const path = action === 'activate'
-      ? 'runtime-overrides/activate'
+    const commandKind: ExecutionControlCommandKind = action === 'activate'
+      ? 'program_runtime_override_activate'
       : action === 'clear'
-        ? 'runtime-overrides/clear'
-        : 'runtime-overrides/promote';
+        ? 'program_runtime_override_clear'
+        : 'program_runtime_override_promote';
     const body: Record<string, JsonValue> = {
       ...base,
       override_id: override.overrideId,
@@ -1290,11 +1184,8 @@ export function useProgramRuntime(
     void performRuntimeControl(
       `override:${action}:${override.overrideId}`,
       requestId,
-      () => api.programs.runtimeControlAction(
-        base.program_run_id as string,
-        path,
-        body,
-      ),
+      commandKind,
+      body,
       action === 'activate'
         ? 'The runtime override could not be activated.'
         : action === 'clear'
@@ -1310,11 +1201,8 @@ export function useProgramRuntime(
     void performRuntimeControl(
       `blackboard:${key}`,
       requestId,
-      () => api.programs.runtimeControlAction(
-        base.program_run_id as string,
-        'blackboard-values',
-        { ...base, key, value },
-      ),
+      'program_runtime_blackboard_write',
+      { ...base, key, value },
       'The runtime blackboard value was rejected.',
     );
   }, [performRuntimeControl, runtimeControlRequest]);
@@ -1330,17 +1218,14 @@ export function useProgramRuntime(
     void performRuntimeControl(
       `manual-result:${outcome}`,
       requestId,
-      () => api.programs.runtimeControlAction(
-        base.program_run_id as string,
-        'manual-result',
-        {
-          ...base,
-          node_instance_id: offer.nodeInstanceId,
-          node_attempt_id: offer.nodeAttemptId,
-          outcome,
-          output,
-        },
-      ),
+      'program_manual_result_stage',
+      {
+        ...base,
+        node_instance_id: offer.nodeInstanceId,
+        node_attempt_id: offer.nodeAttemptId,
+        outcome,
+        output,
+      },
       'The manual result was rejected.',
     );
   }, [performRuntimeControl, runtimeControlRequest, state.controls]);
@@ -1422,10 +1307,16 @@ export function useProgramRuntime(
     [state.run],
   );
   const cycleState = snapshot?.programCycle?.state ?? null;
+  const commandAllowed = useCallback((commandKind: string): boolean => (
+    snapshot?.programCycle.allowedCommands.some(
+      (command) => command.commandKind === commandKind && command.allowed,
+    ) ?? false
+  ), [snapshot]);
 
   return useMemo(() => ({
     state,
     cycleState,
+    commandAllowed,
     active,
     refresh,
     selectScenario,
@@ -1458,6 +1349,7 @@ export function useProgramRuntime(
     clearScenarioSelection,
     dismissError,
     cycleState,
+    commandAllowed,
     refresh,
     reset,
     run,

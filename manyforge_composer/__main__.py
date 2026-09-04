@@ -138,7 +138,18 @@ def main() -> None:
             static_dir=args.static_dir,
             security=security,
         )
-        uvicorn.run(app, host=args.host, port=args.port)
+        # The application middleware already emits bounded structured access
+        # records. Uvicorn's per-request duplicate is unbounded hot-path I/O
+        # and can delay the control WebSocket under read-heavy workloads.
+        uvicorn.run(
+            app,
+            host=args.host,
+            port=args.port,
+            access_log=False,
+            # Real-time control/viewer frames favor bounded CPU and latency;
+            # initial static assets still use normal HTTP compression/caching.
+            ws_per_message_deflate=False,
+        )
     finally:
         if assistant_client is not None:
             assistant_client.close()

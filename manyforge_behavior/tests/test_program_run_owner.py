@@ -152,6 +152,8 @@ class _PolicyTaskPort(_TaskPort):
 
 
 class _OperatorStopTaskPort(_TaskPort):
+    recovery_class = "ordinary_operator_stop"
+
     def __init__(self, events: list[str]) -> None:
         super().__init__(events, OwnerTaskState.ACTIVE)
         self.observations = 0
@@ -169,7 +171,7 @@ class _OperatorStopTaskPort(_TaskPort):
                 "authored_failure_policy_parameter": "operator_stop_policy",
                 "recovery_assessment": {
                     "allowed_actions": ["replan_from_stopped_state"],
-                    "recovery_class": "ordinary_operator_stop",
+                    "recovery_class": self.recovery_class,
                 },
             },
             reason_code="operation_stopped",
@@ -214,6 +216,10 @@ class _MalformedOperatorStopTaskPort(_OperatorStopTaskPort):
             reason_code="operation_stopped",
             message="native operation omitted its exact Stop identity",
         )
+
+
+class _StopFaultTaskPort(_OperatorStopTaskPort):
+    recovery_class = "stop_fault_intervention"
 
 
 class _BlockingTaskPort(_TaskPort):
@@ -372,6 +378,7 @@ def _fixture(
     context_port: _ContextPort | None = None,
     interventions: ProgramInterventionRegistry | None = None,
     run_id_factory: Callable[[], str] | None = None,
+    maximum_retained_runs: int = 8,
 ) -> tuple[ProgramRunOwner, ProgramRunAdmission, _TaskPort, _ScopePort, list[str]]:
     events: list[str] = []
     if context_port is not None:
@@ -433,7 +440,7 @@ def _fixture(
         owner_epoch="program-runner.epoch.1",
         ports=ports,
         run_id_factory=run_id_factory or (lambda: "program-run-1"),
-        maximum_retained_runs=8,
+        maximum_retained_runs=maximum_retained_runs,
     )
     return owner, admission, task, scope, events
 
@@ -835,6 +842,25 @@ def test_terminal_run_reset_releases_exact_kernel_scope() -> None:
     assert events[-1] == "scope_reset"
 
 
+def test_durable_reset_forgets_resident_tree_and_reuses_concurrent_capacity() -> None:
+    sequence = iter(f"program-run-{index}" for index in range(1, 9))
+    owner, admission, _task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED,
+        run_id_factory=lambda: next(sequence),
+        maximum_retained_runs=1,
+    )
+
+    for _ in range(8):
+        started = owner.start(admission)
+        completed = owner.advance_once(started.capture.program_run_id)
+        assert completed.state is ProgramRunState.SUCCEEDED
+        owner.reset_effects(started.capture.program_run_id)
+        owner.forget_reset_run(started.capture.program_run_id)
+
+    assert scope.reset_requests == 8
+    assert owner.list_snapshots(limit=8) == ((), False)
+
+
 def test_active_run_cannot_reset_kernel_scope() -> None:
     owner, admission, _task, scope, _events = _fixture(
         initial_task_state=OwnerTaskState.ACTIVE
@@ -1095,6 +1121,37 @@ def test_motion_stop_holds_the_current_node_without_terminating_the_run() -> Non
     intervention = interventions.read(started.capture.program_run_id)
     assert intervention is not None
     assert intervention.policy_parameter == "operator_stop_policy"
+
+    host.stop_run(started.capture.program_run_id)
+    host.shutdown()
+
+
+def test_motion_stop_retains_escalated_stop_for_backend_recovery() -> None:
+    interventions = ProgramInterventionRegistry(maximum_retained_runs=8)
+    owner, admission, _task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE,
+        task_factory=_StopFaultTaskPort,
+        interventions=interventions,
+    )
+    host = ProgramRunTickHost(owner, tick_interval_s=0.01)
+    started = host.start_run(admission)
+
+    assert host.advance_ready_once()[0].state is ProgramRunState.RUNNING
+    scope.state = ProgramRunScopeState.ACTIVE
+    assert host.stop_motion(started.capture.program_run_id).state is (
+        ProgramRunState.RUNNING
+    )
+
+    held = host.advance_ready_once()[0]
+    assert held.state is ProgramRunState.INTERVENTION_REQUIRED
+    intervention = interventions.read(started.capture.program_run_id)
+    assert intervention is not None
+    assert intervention.policy_parameter == "operator_stop_policy"
+    assert intervention.owner_assessment is not None
+    assert (
+        intervention.owner_assessment["recovery_class"]
+        == "stop_fault_intervention"
+    )
 
     host.stop_run(started.capture.program_run_id)
     host.shutdown()

@@ -1234,6 +1234,51 @@ class FakeProgramRunner:
         self.node_environment_digest = node_environment_digest
         self.calls: list[tuple[str, Any]] = []
 
+    def cycle_status(self) -> dict[str, Any]:
+        command_kinds = (
+            "program_run",
+            "program_motion_stop",
+            "program_full_stop",
+            "program_stop",
+            "program_reset",
+            "program_resume_full_stop",
+            "program_discard_full_stop",
+            "program_runtime_override_stage",
+            "program_runtime_override_activate",
+            "program_runtime_override_clear",
+            "program_runtime_override_promote",
+            "program_runtime_blackboard_write",
+            "program_manual_result_stage",
+            "operation_start",
+            "operation_stop",
+            "operation_pause",
+            "operation_resume",
+            "operation_reset",
+            "operation_acknowledge_completed",
+            "pick_sequence_start",
+            "place_sequence_start",
+            "cell_full_stop",
+            "execution_recovery",
+            "stop_recovery",
+            "runtime_scale",
+        )
+        return {
+            "program_runner_owner_epoch": "program-runner.epoch.1",
+            "execution_control_revision": 1,
+            "cycle_generation": 1,
+            "state": "idle_after_reset",
+            "program_run_id": None,
+            "allowed_commands": [
+                {
+                    "command_kind": kind,
+                    "semantic_target": {},
+                    "allowed": True,
+                    "disabled_reason": None,
+                }
+                for kind in command_kinds
+            ],
+        }
+
     def node_availability(self, body: dict[str, Any]) -> dict[str, Any]:
         raise ProgramRunnerClientError(
             "program_node_availability_unavailable",
@@ -1437,6 +1482,16 @@ class _ResetProgramRunner(FakeProgramRunner):
 
     def reset_cycle(self, body: dict[str, Any]) -> dict[str, Any]:
         self.calls.append(("reset_cycle", copy.deepcopy(body)))
+        if (
+            self.cycle["state"] not in {"running", "terminal_awaiting_reset"}
+            or self.cycle["cycle_generation"]
+            != body["expected_cycle_generation"]
+        ):
+            raise ProgramRunnerClientError(
+                "program_cycle_reset_stale",
+                "Reset does not identify the current Program cycle",
+                409,
+            )
         return {
             "schema_version": "manyforge.program_cycle_reset_result.v1",
             "program_run_id": body["program_run_id"],
@@ -1445,51 +1500,6 @@ class _ResetProgramRunner(FakeProgramRunner):
             "settlement_reference": body["settlement_evidence_digest"],
             "admission": {},
             "runtime_controls": None,
-        }
-
-
-class _LatchedResetExecution(FakeExecution):
-    def __init__(self) -> None:
-        super().__init__()
-        self.fault_reads = 0
-
-    def identity(self) -> dict[str, Any]:
-        self.requests.append(("identity", None))
-        return {
-            "ok": True,
-            "command": "identity",
-            "identity": {"owner_epoch": "native-owner.epoch.1"},
-        }
-
-    def stop_fault(self) -> dict[str, Any]:
-        self.requests.append(("stop_fault", None))
-        self.fault_reads += 1
-        if self.fault_reads > 1:
-            return {"ok": True, "command": "get_stop_fault", "stop_fault": None}
-        return {
-            "ok": True,
-            "command": "get_stop_fault",
-            "stop_fault": {
-                "configuration_expectations": [
-                    {
-                        "control_domain_id": "domain.arm",
-                        "active_control_configuration_id": "configuration.arm.1",
-                        "active_control_configuration_generation": 3,
-                    }
-                ],
-                "latch": {
-                    "latch_id": "stop-fault.1",
-                    "latch_generation": 1,
-                    "recovery_assessment_revision": 2,
-                    "stop_certificate": {
-                        "stop_certificate_id": "stop-certificate.1",
-                        "stop_certificate_revision": 1,
-                    },
-                    "cell_id": "cell.1",
-                    "retained_bundle_id": "sha256:" + "1" * 64,
-                    "graph_revision": "sha256:" + "2" * 64,
-                },
-            },
         }
 
 
@@ -1510,8 +1520,8 @@ def _cycle_reset_request() -> ProgramCycleResetRequest:
     )
 
 
-def test_program_cycle_reset_recovers_exact_stop_latch_before_cycle_release() -> None:
-    execution = _LatchedResetExecution()
+def test_program_cycle_reset_is_one_thin_owner_command() -> None:
+    execution = FakeExecution()
     runner = _ResetProgramRunner()
     service = _service(
         FakeCore(), FakeManager(), execution=execution, program_runner=runner
@@ -1520,38 +1530,28 @@ def test_program_cycle_reset_recovers_exact_stop_latch_before_cycle_release() ->
     result = service.program_cycle_reset(_cycle_reset_request())
 
     assert result["idle_cycle_generation"] == 5
-    assert [kind for kind, _request in execution.requests] == [
-        "stop_fault",
-        "identity",
-        "recover_stop_fault",
-        "stop_fault",
-    ]
-    recovery = execution.requests[2][1]
-    assert isinstance(recovery, StopFaultRecoveryIntentRequest)
-    assert recovery.request_context.request_owner_epoch == "native-owner.epoch.1"
-    assert [kind for kind, _request in runner.calls] == [
-        "cycle_status",
-        "reset_cycle",
-    ]
+    assert execution.requests == []
+    assert [kind for kind, _request in runner.calls] == ["reset_cycle"]
 
 
 def test_stale_program_cycle_reset_has_no_stop_recovery_effect() -> None:
-    execution = _LatchedResetExecution()
+    execution = FakeExecution()
     runner = _ResetProgramRunner()
     runner.cycle["cycle_generation"] = 5
     service = _service(
         FakeCore(), FakeManager(), execution=execution, program_runner=runner
     )
 
-    with pytest.raises(HeadlessApiError, match="exact terminal Program cycle"):
+    with pytest.raises(HeadlessApiError) as stale:
         service.program_cycle_reset(_cycle_reset_request())
 
+    assert stale.value.code == "program_cycle_reset_stale"
     assert execution.requests == []
-    assert [kind for kind, _request in runner.calls] == ["cycle_status"]
+    assert [kind for kind, _request in runner.calls] == ["reset_cycle"]
 
 
-def test_successor_idle_reset_replay_is_forwarded_without_stop_recovery() -> None:
-    execution = _LatchedResetExecution()
+def test_successor_idle_reset_is_rejected_without_replaying_effects() -> None:
+    execution = FakeExecution()
     runner = _ResetProgramRunner()
     runner.cycle.update(
         {
@@ -1566,56 +1566,23 @@ def test_successor_idle_reset_replay_is_forwarded_without_stop_recovery() -> Non
         FakeCore(), FakeManager(), execution=execution, program_runner=runner
     )
 
-    result = service.program_cycle_reset(_cycle_reset_request())
+    with pytest.raises(HeadlessApiError) as stale:
+        service.program_cycle_reset(_cycle_reset_request())
 
-    assert result["idle_cycle_generation"] == 5
+    assert stale.value.code == "program_cycle_reset_stale"
     assert execution.requests == []
-    assert [kind for kind, _request in runner.calls] == [
-        "cycle_status",
-        "reset_cycle",
-    ]
-
-
-class _FullStoppedResetProgramRunner(_ResetProgramRunner):
-    def __init__(self) -> None:
-        super().__init__()
-        self.cycle.update(
-            {
-                "state": "running",
-                "terminal_or_settlement_reference": None,
-            }
-        )
-
-    def discard_full_stop(
-        self,
-        program_run_id: str,
-        body: dict[str, Any],
-    ) -> dict[str, Any]:
-        terminal = self._snapshot(state="stopped")
-        self.calls.append(
-            ("discard_full_stop", (program_run_id, copy.deepcopy(body)))
-        )
-        reference = "sha256:" + hashlib.sha256(
-            rfc8785.dumps(
-                {
-                    "program_run_id": program_run_id,
-                    "run_revision": terminal["run_revision"],
-                    "state": terminal["state"],
-                }
-            )
-        ).hexdigest()
-        self.cycle.update(
-            {
-                "state": "terminal_awaiting_reset",
-                "terminal_or_settlement_reference": reference,
-            }
-        )
-        return terminal
+    assert [kind for kind, _request in runner.calls] == ["reset_cycle"]
 
 
 def test_full_stopped_reset_is_one_public_command_with_exact_inner_settlement() -> None:
-    execution = _LatchedResetExecution()
-    runner = _FullStoppedResetProgramRunner()
+    execution = FakeExecution()
+    runner = _ResetProgramRunner()
+    runner.cycle.update(
+        {
+            "state": "running",
+            "terminal_or_settlement_reference": None,
+        }
+    )
     service = _service(
         FakeCore(), FakeManager(), execution=execution, program_runner=runner
     )
@@ -1637,22 +1604,12 @@ def test_full_stopped_reset_is_one_public_command_with_exact_inner_settlement() 
     result = service.program_run_reset_full_stop("program-run.1", request)
 
     assert result["idle_cycle_generation"] == 5
-    assert [kind for kind, _value in runner.calls] == [
-        "discard_full_stop",
-        "cycle_status",
-        "reset_cycle",
-    ]
+    assert [kind for kind, _value in runner.calls] == ["reset_cycle"]
     reset_body = runner.calls[-1][1]
-    assert reset_body["terminal_reference"] == (
-        runner.cycle["terminal_or_settlement_reference"]
-    )
-    assert reset_body["request_id"].startswith("program-full-stop-reset-")
-    assert [kind for kind, _value in execution.requests] == [
-        "stop_fault",
-        "identity",
-        "recover_stop_fault",
-        "stop_fault",
-    ]
+    assert reset_body["terminal_reference"] is None
+    assert reset_body["settlement_evidence_digest"] is None
+    assert reset_body["request_id"] == request.request_id
+    assert execution.requests == []
 
 
 def _service(
@@ -3395,7 +3352,10 @@ def test_execution_missing_reference_is_a_public_not_found() -> None:
 def test_operation_controls_and_scale_control_are_thin_fenced_routes() -> None:
     execution = FakeExecution()
     app = create_app(
-        service=_service(FakeCore(), FakeManager(), execution)
+        service=_service(
+            FakeCore(), FakeManager(), execution,
+            program_runner=FakeProgramRunner(active=False),
+        )
     )
     context = {
         "request_id": "request.control.1",
@@ -3469,7 +3429,10 @@ def test_operation_controls_and_scale_control_are_thin_fenced_routes() -> None:
 def test_full_stop_and_stop_fault_recovery_are_thin_owner_routes() -> None:
     execution = FakeExecution()
     app = create_app(
-        service=_service(FakeCore(), FakeManager(), execution)
+        service=_service(
+            FakeCore(), FakeManager(), execution,
+            program_runner=FakeProgramRunner(active=False),
+        )
     )
     context = {
         "request_id": "request.full-stop.1",
@@ -3526,7 +3489,10 @@ def test_full_stop_and_stop_fault_recovery_are_thin_owner_routes() -> None:
 def test_execution_mutation_principal_can_only_come_from_trusted_adapter() -> None:
     execution = FakeExecution()
     app = create_app(
-        service=_service(FakeCore(), FakeManager(), execution),
+        service=_service(
+            FakeCore(), FakeManager(), execution,
+            program_runner=FakeProgramRunner(active=False),
+        ),
         trusted_principal_adapter=FakeTrustedAdapter(),
     )
     body = {
@@ -3568,7 +3534,10 @@ def test_execution_mutation_principal_can_only_come_from_trusted_adapter() -> No
 def test_operation_control_paths_accept_bounded_stop_and_promote_mixed_scope() -> None:
     execution = FakeExecution()
     app = create_app(
-        service=_service(FakeCore(), FakeManager(), execution)
+        service=_service(
+            FakeCore(), FakeManager(), execution,
+            program_runner=FakeProgramRunner(active=False),
+        )
     )
     context = {
         "request_id": "request.control.1",

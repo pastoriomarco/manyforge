@@ -275,7 +275,24 @@ class RawWebDriver:
         try:
             with urlopen(request, timeout=self.timeout_s) as response:
                 raw = response.read(max_response_bytes + 1)
-        except (HTTPError, URLError, TimeoutError, OSError) as error:
+        except HTTPError as error:
+            raw = error.read(max_response_bytes + 1)
+            detail = ""
+            try:
+                decoded_error = json.loads(raw.decode("utf-8"))
+                value = decoded_error.get("value")
+                if isinstance(value, dict):
+                    parts = [
+                        item for item in (value.get("error"), value.get("message"))
+                        if isinstance(item, str) and item
+                    ]
+                    detail = f": {' · '.join(parts)}" if parts else ""
+            except (AttributeError, UnicodeDecodeError, json.JSONDecodeError):
+                pass
+            raise CollectorError(
+                f"WebDriver {method} {path} failed{detail}"
+            ) from error
+        except (URLError, TimeoutError, OSError) as error:
             raise CollectorError(f"WebDriver {method} {path} failed") from error
         if len(raw) > max_response_bytes:
             raise CollectorError("WebDriver response is oversized")
@@ -285,10 +302,7 @@ class RawWebDriver:
             raise CollectorError("WebDriver returned malformed JSON") from error
         if not isinstance(decoded, dict) or "value" not in decoded:
             raise CollectorError("WebDriver returned an unsupported command response")
-        value = decoded["value"]
-        if isinstance(value, dict) and isinstance(value.get("error"), str):
-            raise CollectorError(f"WebDriver command failed: {value['error']}")
-        return value
+        return decoded["value"]
 
     def create_session(
         self,

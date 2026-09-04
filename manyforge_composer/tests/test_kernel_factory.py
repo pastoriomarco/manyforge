@@ -14,6 +14,8 @@ def test_structural_entrypoint_contains_no_kernel_construction_path() -> None:
     source = Path(composer_main.__file__).read_text(encoding="utf-8")
 
     assert not hasattr(composer_main, "_make_kernel")
+    assert "access_log=False" in source
+    assert "ws_per_message_deflate=False" in source
     for forbidden in (
         "MockKernelClient",
         "manyforge_roboplan_py",

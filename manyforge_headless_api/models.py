@@ -61,6 +61,45 @@ class CallerAttributionRequest(StrictRequest):
         )
 
 
+class ExecutionControlAttributionRequest(CallerAttributionRequest):
+    """Optional causal identity of one persistent execution-control session."""
+
+    session_id: str | None = None
+    client_sequence: str | None = None
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_identity(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _bounded_nfc(
+            value,
+            label="session_id",
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+    @field_validator("client_sequence")
+    @classmethod
+    def validate_client_sequence(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if (
+            not value.isascii()
+            or not value.isdigit()
+            or value.startswith("0")
+            or not 1 <= int(value) <= 18_446_744_073_709_551_615
+            or str(int(value)) != value
+        ):
+            raise ValueError("client_sequence must be canonical positive uint64 text")
+        return value
+
+    @model_validator(mode="after")
+    def paired_control_session(self) -> "ExecutionControlAttributionRequest":
+        if (self.session_id is None) != (self.client_sequence is None):
+            raise ValueError("session_id and client_sequence must be paired")
+        return self
+
+
 class AuthoringMutationContext(CallerAttributionRequest):
     """Exact owner-issued context carried by one authoring transaction."""
 
@@ -327,7 +366,7 @@ class ProgramApplyRequest(StrictRequest):
         return self
 
 
-class ProgramRunStartRequest(CallerAttributionRequest):
+class ProgramRunStartRequest(ExecutionControlAttributionRequest):
     """Start exactly the Applied Program selected by these immutable facts."""
 
     scenario_id: Annotated[
@@ -357,7 +396,7 @@ class ProgramScenePreparationRequest(CallerAttributionRequest):
     ]
 
 
-class ProgramRunStopRequest(CallerAttributionRequest):
+class ProgramRunStopRequest(ExecutionControlAttributionRequest):
     """Request Kernel-first Stop for one exact runner-owned Program run."""
 
     program_run_id: str
@@ -385,7 +424,7 @@ class ProgramRunStopRequest(CallerAttributionRequest):
         )
 
 
-class ProgramCycleResetRequest(CallerAttributionRequest):
+class ProgramCycleResetRequest(ExecutionControlAttributionRequest):
     program_run_id: str
     expected_owner_epoch: str
     expected_cycle_generation: Annotated[
@@ -393,9 +432,11 @@ class ProgramCycleResetRequest(CallerAttributionRequest):
     ]
     expected_claim_generation: Annotated[
         int, Field(ge=1, le=9_007_199_254_740_991)
-    ]
-    terminal_reference: Annotated[str, Field(pattern=SHA256_PATTERN)]
-    settlement_evidence_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    ] | None = None
+    terminal_reference: Annotated[str, Field(pattern=SHA256_PATTERN)] | None = None
+    settlement_evidence_digest: Annotated[
+        str, Field(pattern=SHA256_PATTERN)
+    ] | None = None
 
     @field_validator("program_run_id", "expected_owner_epoch")
     @classmethod
@@ -405,7 +446,7 @@ class ProgramCycleResetRequest(CallerAttributionRequest):
         )
 
 
-class ProgramRunControlRequest(CallerAttributionRequest):
+class ProgramRunControlRequest(ExecutionControlAttributionRequest):
     """Common exact fence for one current-run-only control."""
 
     program_run_id: str
@@ -532,7 +573,7 @@ class ManualResultStageRequest(ProgramRunControlRequest):
         )
 
 
-class CycleRecoveryActionRequest(CallerAttributionRequest):
+class CycleRecoveryActionRequest(ExecutionControlAttributionRequest):
     """Consume exactly one current owner-issued cycle recovery offer."""
 
     expected_owner_epoch: str
@@ -1306,6 +1347,28 @@ SceneOperationRequest = Annotated[
 ]
 
 
+class ProgramResetSceneAuthorizationRequest(StrictRequest):
+    """Internal exact scope for one backend-owned Reset scene mutation."""
+
+    program_runner_owner_epoch: str
+    program_run_id: str
+    cycle_claim_generation: Annotated[
+        int, Field(ge=1, le=9_007_199_254_740_991)
+    ]
+    terminal_or_settlement_reference: Annotated[
+        str, Field(pattern=SHA256_PATTERN)
+    ]
+
+    @field_validator("program_runner_owner_epoch", "program_run_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(
+            value,
+            label=info.field_name,
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+
 class SceneTransactionRequest(StrictRequest):
     request_context: CallerAttributionRequest
     expected_projection_revision: ProjectionRevisionRequest
@@ -1313,6 +1376,9 @@ class SceneTransactionRequest(StrictRequest):
     expected_admission_generation: Annotated[
         int | None, Field(ge=1, le=9_007_199_254_740_991)
     ] = None
+    program_reset_scene_authorization: (
+        ProgramResetSceneAuthorizationRequest | None
+    ) = None
 
 
 class ActionSpanRequest(StrictRequest):

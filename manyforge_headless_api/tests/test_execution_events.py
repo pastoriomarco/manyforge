@@ -1164,16 +1164,24 @@ def test_event_pump_delivers_without_frontend_polling_and_stops_cleanly() -> Non
 def test_event_pump_reconciles_typed_idle_owner_without_querying_events() -> None:
     core = _RecordingCore()
     execution = _IdleExecution()
+    wakes: list[None] = []
     pump = ExecutionEventPump(  # type: ignore[arg-type]
         core, execution, poll_seconds=0.01, page_limit=1
     )
+    pump.set_change_observer(lambda: wakes.append(None))
     pump.start()
     assert core.completed.wait(timeout=1.0)
+    for _ in range(100):
+        if execution.status_calls >= 4:
+            break
+        threading.Event().wait(0.01)
     pump.shutdown()
 
     assert pump.last_error is None
     assert execution.status_calls >= 1
     assert execution.events_calls == 0
+    assert execution.status_calls >= 4
+    assert wakes == [None]
     assert core.completed_calls[0] == {
         "current_stop_fault_json": "null",
         "source_owner_epoch": execution.owner_epoch,

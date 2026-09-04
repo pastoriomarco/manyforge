@@ -222,6 +222,9 @@ def _serve(args: argparse.Namespace) -> int:
         host=args.host,
         port=args.port,
         access_log=False,
+        # The Headless real-time channels carry small bounded messages. Avoid
+        # per-frame deflate work on the same event loop that admits Stop.
+        ws_per_message_deflate=False,
     )
     return 0
 

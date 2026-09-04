@@ -469,6 +469,40 @@ TEST(NativeStopQualificationSeamTest,
 }
 
 TEST(NativeStopQualificationSeamTest,
+     PlannerDiagnosticOverflowProjectsOneStableStopStageFailure) {
+  WallClock clock;
+  auto binding = fixture::make_binding();
+  auto channel = std::make_shared<fixture::StateChannel>(binding);
+  RoboPlanExecutionBackendConfig config;
+  config.soft_on_path_max_jerk_rad_s3 = {{"joint_1", 0.01},
+                                         {"joint_2", 0.01}};
+  RecordingProbe probe;
+  auto backend = detail::NativeStopQualificationAccess::construct(
+      binding, channel, clock, config, probe);
+  const auto stage = controlled_stage_fixture();
+  auto execution =
+      backend->execute_trajectory(fixture::trajectory(binding, 5.0));
+  ASSERT_TRUE(wait_until_executing(*backend, 0.05));
+  detail::NativeStopQualificationAccess::install_prepared_goal_membership(
+      *backend, stage, core::ContentDigest("prepared.diagnostic"), execution);
+
+  const auto result = backend->TranslateStopStage(
+      stage, remaining_budget(stage), std::stop_token{});
+
+  EXPECT_EQ(result.attempt_disposition,
+            core::StopStageAttemptDispositionDTO::kNotDispatched);
+  EXPECT_EQ(result.outcome, core::ParticipantStopStageOutcomeDTO::kFailed);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_LE(result.error->details.size(), 8U);
+  EXPECT_EQ(result.error->details.at("reason"),
+            "soft_on_path_retimer_not_dispatchable");
+  EXPECT_EQ(result.error->details.at("recommended_disposition"), "hard_stop");
+  EXPECT_EQ(result.error->details.at("details_truncated"), "true");
+  EXPECT_TRUE(backend->stop().accepted);
+  EXPECT_TRUE(execution.wait_for_completion(2'000'000'000LL));
+}
+
+TEST(NativeStopQualificationSeamTest,
      NearEndpointNaturalCompletionUsesTheOriginalGoalWithoutReplacement) {
   core::FakeClock clock;
   auto binding = fixture::make_binding();

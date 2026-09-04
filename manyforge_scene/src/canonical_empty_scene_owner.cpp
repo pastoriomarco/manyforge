@@ -9740,16 +9740,24 @@ CanonicalEmptySceneOwner::Commit(const SceneTransactionRequestDTO &request) {
   }
 
   const bool authored_mutation = IsAuthoredSceneMutation(request);
+  const bool program_reset_mutation =
+      authored_mutation &&
+      request.program_reset_scene_authorization.has_value();
   if (authored_mutation &&
-      !request.expected_admission_generation.has_value()) {
+      (request.expected_admission_generation.has_value() ==
+       program_reset_mutation)) {
     return reject(core::RequestReplayStatusDTO::kAcceptedNew,
                   "authoring_not_ready",
-                  "authored scene mutation requires an admission generation");
+                  "authored scene mutation requires exactly one ordinary or "
+                  "Program Reset authorization");
   }
-  if (!authored_mutation && request.expected_admission_generation.has_value()) {
+  if (!authored_mutation &&
+      (request.expected_admission_generation.has_value() ||
+       request.program_reset_scene_authorization.has_value())) {
     return reject(core::RequestReplayStatusDTO::kAcceptedNew,
                   "invalid_request",
-                  "runtime-owned scene mutation cannot carry authoring admission");
+                  "runtime-owned scene mutation cannot carry scene authoring "
+                  "authorization");
   }
 
   std::string request_json;
@@ -9932,6 +9940,18 @@ CanonicalEmptySceneOwner::Commit(const SceneTransactionRequestDTO &request) {
                   "live_scene_snapshot_unavailable", error.what());
   }
 
+  if (program_reset_mutation) {
+    const auto authorized =
+        impl_->cell_admission_->ValidateProgramResetSceneAuthorization(
+            *request.program_reset_scene_authorization);
+    if (!authorized.ok()) {
+      return reject(core::RequestReplayStatusDTO::kAcceptedNew,
+                    "authoring_not_ready",
+                    "Program Reset scene restoration is not current",
+                    authorized.error().details);
+    }
+  }
+
   core::SceneTransactionDTO scene_transaction{
       request.request_context.request_id,
       request.attribution,
@@ -9985,7 +10005,7 @@ CanonicalEmptySceneOwner::Commit(const SceneTransactionRequestDTO &request) {
   }
 
   std::optional<core::CellAdmissionClaimDTO> authored_claim;
-  if (authored_mutation) {
+  if (authored_mutation && !program_reset_mutation) {
     try {
       authored_claim = RequireAuthoredSceneClaim(
           *impl_->cell_admission_,

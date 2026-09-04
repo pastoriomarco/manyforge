@@ -28,7 +28,8 @@ class AdmissionJournal final : public IOperationJournal {
   }
   Result<std::uint64_t> RecordOperationAccepted(const RequestOwnerEpoch&, const OperationIntentDTO&,
                                                 const OperationAcceptedDTO&,
-                                                const OperationStateDTO&) override {
+                                                const OperationStateDTO&,
+                                                std::span<const OperationId>) override {
     return Result<std::uint64_t>::Err(ErrorCode::kInternalError);
   }
   Result<std::uint64_t> RecordControlAccepted(const RequestOwnerEpoch&,
@@ -279,6 +280,16 @@ TEST(KernelCellAdmissionOwner, StartsFalseAndEveryReadinessInputFailsClosed) {
       ProgramRunId("program-cycle.2"),    std::nullopt, std::nullopt};
   ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(acquiring).ok());
   EXPECT_FALSE(owner.GetAuthoringAdmission().authoring_allowed);
+  acquiring.program_cycle_status->state = ProgramCycleStateDTO::kStopping;
+  ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(acquiring).ok());
+  EXPECT_FALSE(owner.GetAuthoringAdmission().authoring_allowed);
+  acquiring.program_cycle_status->state = ProgramCycleStateDTO::kResetting;
+  ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(acquiring).ok());
+  EXPECT_FALSE(owner.GetAuthoringAdmission().authoring_allowed);
+  acquiring.program_cycle_status->state =
+      ProgramCycleStateDTO::kRecoveryRequired;
+  ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(acquiring).ok());
+  EXPECT_FALSE(owner.GetAuthoringAdmission().authoring_allowed);
   ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(ready).ok());
 
   for (int row = 0; row != 11; ++row) {
@@ -331,6 +342,45 @@ TEST(KernelCellAdmissionOwner, StartsFalseAndEveryReadinessInputFailsClosed) {
     EXPECT_FALSE(owner.GetAuthoringAdmission().authoring_allowed) << row;
     ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(ready).ok());
   }
+}
+
+TEST(KernelCellAdmissionOwner,
+     ProgramResetSceneAuthorizationRequiresExactResettingCycleAndClaim) {
+  FixedClock clock;
+  AdmissionJournal journal;
+  auto owner = Owner(clock, journal);
+  ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).ok());
+  auto intent = Intent(CellAdmissionClaimKindDTO::kProgramCycle,
+                       owner.GetAuthoringAdmission().admission_generation,
+                       "program-reset.claim");
+  intent.owner_epoch = RequestOwnerEpoch("program.owner");
+  intent.owner_transaction_id = "program-cycle.2";
+  const auto acquired = owner.AcquireCellAdmissionClaim(intent);
+  ASSERT_TRUE(acquired.ok());
+  const ProgramResetSceneAuthorizationDTO authorization{
+      RequestOwnerEpoch("program.owner"), ProgramRunId("program-cycle.2"),
+      acquired.value().claim_generation, ContentDigest(kDigest)};
+
+  EXPECT_EQ(owner.ValidateProgramResetSceneAuthorization(authorization)
+                .error()
+                .details.at("reason"),
+            "program_reset_status_mismatch");
+
+  auto resetting = Ready();
+  resetting.program_cycle_status = ProgramCycleStatusDTO{
+      RequestOwnerEpoch("program.owner"), 2U,
+      ProgramCycleStateDTO::kResetting, ProgramRunId("program-cycle.2"),
+      acquired.value().claim_generation, ContentDigest(kDigest)};
+  ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(resetting).ok());
+  EXPECT_TRUE(
+      owner.ValidateProgramResetSceneAuthorization(authorization).ok());
+
+  auto stale = authorization;
+  stale.terminal_or_settlement_reference = ContentDigest(kDigestB);
+  EXPECT_EQ(owner.ValidateProgramResetSceneAuthorization(stale)
+                .error()
+                .details.at("reason"),
+            "program_reset_status_mismatch");
 }
 
 TEST(KernelCellAdmissionOwner, RestartContinuesTheDurableClaimGenerationHighWater) {

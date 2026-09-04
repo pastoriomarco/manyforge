@@ -133,6 +133,10 @@ public:
   GetCellAdmissionRecoveryReceipt(
       const manyforge::core::CellAdmissionRecoveryReceiptQueryDTO &query)
       const override;
+  [[nodiscard]] manyforge::core::Result<void>
+  ValidateProgramResetSceneAuthorization(
+      const manyforge::core::ProgramResetSceneAuthorizationDTO &authorization)
+      const override;
   [[nodiscard]] manyforge::core::Result<
       std::shared_ptr<manyforge::core::IPlannerSceneProjection>>
   ResolveProjection(const manyforge::core::ProjectionNativeRuntimeBindingDTO

@@ -1462,6 +1462,45 @@ CanonicalValue Snapshot(const core::LogicalSceneSnapshotDTO &snapshot) {
   });
 }
 
+CanonicalValue ProgramResetSceneAuthorization(
+    const core::ProgramResetSceneAuthorizationDTO &authorization) {
+  if (!core::ValidateProgramResetSceneAuthorization(authorization).ok()) {
+    Fail("cannot encode an invalid Program Reset scene authorization");
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"cycle_claim_generation",
+       Unsigned(authorization.cycle_claim_generation.value(),
+                "cycle_claim_generation")},
+      {"program_run_id", CanonicalValue(authorization.program_run_id.value())},
+      {"program_runner_owner_epoch",
+       CanonicalValue(authorization.program_runner_owner_epoch.value())},
+      {"terminal_or_settlement_reference",
+       CanonicalValue(
+           authorization.terminal_or_settlement_reference.value())},
+  });
+}
+
+core::ProgramResetSceneAuthorizationDTO DecodeProgramResetSceneAuthorization(
+    const CanonicalValue &value) {
+  ExactObject(value, 4U, "Program Reset scene authorization");
+  core::ProgramResetSceneAuthorizationDTO result{
+      core::RequestOwnerEpoch(String(Member(value, "program_runner_owner_epoch"),
+                                     "program_runner_owner_epoch")),
+      core::ProgramRunId(
+          String(Member(value, "program_run_id"), "program_run_id")),
+      core::CellAdmissionClaimGeneration(DecodeUnsigned(
+          Member(value, "cycle_claim_generation"),
+          "cycle_claim_generation")),
+      core::ContentDigest(String(
+          Member(value, "terminal_or_settlement_reference"),
+          "terminal_or_settlement_reference")),
+  };
+  if (!core::ValidateProgramResetSceneAuthorization(result).ok()) {
+    Fail("Program Reset scene authorization is invalid");
+  }
+  return result;
+}
+
 } // namespace
 
 std::string EncodeRequest(const core::SceneTransactionRequestDTO &request) {
@@ -1475,6 +1514,11 @@ std::string EncodeRequest(const core::SceneTransactionRequestDTO &request) {
       {"expected_projection_revision",
        Projection(request.expected_projection_revision)},
       {"operation", RequestOperation(request.operation)},
+      {"program_reset_scene_authorization",
+       request.program_reset_scene_authorization.has_value()
+           ? ProgramResetSceneAuthorization(
+                 *request.program_reset_scene_authorization)
+           : CanonicalValue(nullptr)},
       {"request_context", RequestContext(request.request_context)},
   }));
 }
@@ -1485,6 +1529,11 @@ EncodeRequestDigestInput(const core::SceneTransactionRequestDTO &request) {
       {"expected_projection_revision",
        Projection(request.expected_projection_revision)},
       {"operation", RequestOperation(request.operation)},
+      {"program_reset_scene_authorization",
+       request.program_reset_scene_authorization.has_value()
+           ? ProgramResetSceneAuthorization(
+                 *request.program_reset_scene_authorization)
+           : CanonicalValue(nullptr)},
       {"request_context", RequestContext(request.request_context)},
   }));
 }
@@ -1495,7 +1544,7 @@ core::SceneTransactionRequestDTO DecodeRequest(const std::string_view bytes) {
   if (ci::canonical_json(root) != bytes) {
     Fail("scene transaction request is not canonical JSON");
   }
-  ExactObject(root, 5U, "scene transaction request");
+  ExactObject(root, 6U, "scene transaction request");
   std::optional<core::AdmissionGeneration> expected_admission_generation;
   const auto &encoded_admission =
       Member(root, "expected_admission_generation");
@@ -1503,12 +1552,21 @@ core::SceneTransactionRequestDTO DecodeRequest(const std::string_view bytes) {
     expected_admission_generation = core::AdmissionGeneration(
         DecodeUnsigned(encoded_admission, "expected_admission_generation"));
   }
+  std::optional<core::ProgramResetSceneAuthorizationDTO>
+      program_reset_scene_authorization;
+  const auto &encoded_reset_authorization =
+      Member(root, "program_reset_scene_authorization");
+  if (!encoded_reset_authorization.is_null()) {
+    program_reset_scene_authorization =
+        DecodeProgramResetSceneAuthorization(encoded_reset_authorization);
+  }
   core::SceneTransactionRequestDTO request{
       DecodeRequestContext(Member(root, "request_context")),
       DecodeAttribution(Member(root, "attribution")),
       DecodeProjection(Member(root, "expected_projection_revision")),
       DecodeRequestOperation(Member(root, "operation")),
       expected_admission_generation,
+      program_reset_scene_authorization,
   };
   if (!request.attribution.locally_valid() ||
       !request.expected_projection_revision.valid()) {

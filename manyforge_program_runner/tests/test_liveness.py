@@ -25,6 +25,26 @@ class _Clock:
         return self.now
 
 
+def _cycle_status(**changes):
+    return {
+        "program_runner_owner_epoch": "runner-owner",
+        "cycle_generation": 7,
+        "state": "idle_after_reset",
+        "program_run_id": None,
+        "cycle_claim_generation": None,
+        "terminal_or_settlement_reference": None,
+        "execution_control_revision": 1,
+        "causal_correlation_id": None,
+        "causal_session_id": None,
+        "causal_client_sequence": None,
+        "current_command_kind": None,
+        "failure": None,
+        "reset_phase": None,
+        "allowed_commands": [],
+        **changes,
+    }
+
+
 def _receiver(tmp_path: Path):
     clock = _Clock()
     losses: list[str] = []
@@ -39,14 +59,7 @@ def _receiver(tmp_path: Path):
         on_reconciliation=lambda digest, runtime, owner: reconciliations.append(
             (digest, runtime, owner)
         ),
-        cycle_status=lambda: {
-            "program_runner_owner_epoch": "runner-owner",
-            "cycle_generation": 7,
-            "state": "idle_after_reset",
-            "program_run_id": None,
-            "cycle_claim_generation": None,
-            "terminal_or_settlement_reference": None,
-        },
+        cycle_status=_cycle_status,
         monotonic_ns=clock,
     )
     return receiver, clock, losses, reconciliations
@@ -275,12 +288,7 @@ def test_probe_fails_closed_when_owner_cannot_issue_current_cycle_status(
 def test_probe_rejects_open_or_malformed_cycle_projection(tmp_path: Path):
     receiver, _clock, _losses, _reconciliations = _receiver(tmp_path)
     receiver._cycle_status = lambda: {  # type: ignore[method-assign]  # noqa: SLF001
-        "program_runner_owner_epoch": "runner-owner",
-        "cycle_generation": 7,
-        "state": "idle_after_reset",
-        "program_run_id": None,
-        "cycle_claim_generation": None,
-        "terminal_or_settlement_reference": None,
+        **_cycle_status(),
         "foreign": True,
     }
     with pytest.raises(ProgramRunnerLivenessError, match="non-closed"):
@@ -288,37 +296,42 @@ def test_probe_rejects_open_or_malformed_cycle_projection(tmp_path: Path):
             {"api_version": API_VERSION, "cell_id": "cell", "kind": "probe"}
         )
 
-    receiver._cycle_status = lambda: {  # type: ignore[method-assign]  # noqa: SLF001
-        "program_runner_owner_epoch": "runner-owner",
-        "cycle_generation": 7,
-        "state": "running",
-        "program_run_id": None,
-        "cycle_claim_generation": None,
-        "terminal_or_settlement_reference": None,
-    }
+    receiver._cycle_status = lambda: _cycle_status(  # type: ignore[method-assign]  # noqa: SLF001
+        state="running",
+    )
     with pytest.raises(ProgramRunnerLivenessError, match="run identity"):
         receiver._handle(  # noqa: SLF001
             {"api_version": API_VERSION, "cell_id": "cell", "kind": "probe"}
         )
 
 
-def test_probe_reports_pending_acquire_as_starting_without_a_claim(tmp_path: Path):
+@pytest.mark.parametrize("state", ["starting", "stopping", "resetting"])
+def test_probe_reports_pending_cycle_without_a_claim(
+    tmp_path: Path,
+    state: str,
+):
     receiver, _clock, _losses, _reconciliations = _receiver(tmp_path)
-    receiver._cycle_status = lambda: {  # type: ignore[method-assign]  # noqa: SLF001
-        "program_runner_owner_epoch": "runner-owner",
-        "cycle_generation": 7,
-        "state": "starting",
-        "program_run_id": "program-cycle.7",
-        "cycle_claim_generation": None,
-        "terminal_or_settlement_reference": None,
-    }
+    receiver._cycle_status = lambda: _cycle_status(  # type: ignore[method-assign]  # noqa: SLF001
+        state=state,
+        program_run_id="program-cycle.7",
+        reset_phase="stopping" if state == "resetting" else None,
+    )
 
     response = receiver._handle(  # noqa: SLF001
         {"api_version": API_VERSION, "cell_id": "cell", "kind": "probe"}
     )
 
-    assert response["program_cycle_status"]["state"] == "starting"
-    assert response["program_cycle_status"]["cycle_claim_generation"] is None
+    projected = response["program_cycle_status"]
+    assert projected["state"] == state
+    assert projected["cycle_claim_generation"] is None
+    assert set(projected) == {
+        "program_runner_owner_epoch",
+        "cycle_generation",
+        "state",
+        "program_run_id",
+        "cycle_claim_generation",
+        "terminal_or_settlement_reference",
+    }
 
 
 @pytest.mark.parametrize("packet", [b"{}", b"x" * 16_385])

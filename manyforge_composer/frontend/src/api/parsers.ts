@@ -166,10 +166,13 @@ export function parseProgramCycleStatus(value: unknown): ProgramCycleStatus {
     'cycle_claim_generation', 'terminal_or_settlement_reference',
     'run_revision', 'node_status_revision',
     'runtime_control_revision', 'recovery_offer', 'run', 'runtime_controls',
+    'execution_control_revision', 'causal_correlation_id',
+    'causal_session_id', 'causal_client_sequence', 'current_command_kind',
+    'failure', 'reset_phase', 'allowed_commands',
   ], 'programCycleStatus');
   const state = stringAt(record.state, 'programCycleStatus.state');
   if (!['idle_after_reset', 'starting', 'running', 'stopping',
-    'terminal_awaiting_reset'].includes(state)) {
+    'resetting', 'terminal_awaiting_reset', 'recovery_required'].includes(state)) {
     return fail('programCycleStatus.state', 'a supported Program cycle state');
   }
   const parsed: ProgramCycleStatus = {
@@ -214,6 +217,52 @@ export function parseProgramCycleStatus(value: unknown): ProgramCycleStatus {
         record.runtime_control_revision,
         'programCycleStatus.runtime_control_revision',
       ),
+    executionControlRevision: positiveIntegerAt(
+      record.execution_control_revision,
+      'programCycleStatus.execution_control_revision',
+    ),
+    causalCorrelationId: nullableStringAt(
+      record.causal_correlation_id,
+      'programCycleStatus.causal_correlation_id',
+    ),
+    causalSessionId: nullableStringAt(
+      record.causal_session_id,
+      'programCycleStatus.causal_session_id',
+    ),
+    causalClientSequence: nullableStringAt(
+      record.causal_client_sequence,
+      'programCycleStatus.causal_client_sequence',
+    ),
+    currentCommandKind: nullableStringAt(
+      record.current_command_kind,
+      'programCycleStatus.current_command_kind',
+    ),
+    failure: record.failure === null
+      ? null
+      : jsonRecordAt(record.failure, 'programCycleStatus.failure'),
+    resetPhase: nullableStringAt(
+      record.reset_phase,
+      'programCycleStatus.reset_phase',
+    ),
+    allowedCommands: arrayAt(
+      record.allowed_commands,
+      'programCycleStatus.allowed_commands',
+    ).map((value, index) => {
+      const path = `programCycleStatus.allowed_commands[${index}]`;
+      const command = objectAt(value, path);
+      exactKeysAt(command, [
+        'command_kind', 'semantic_target', 'allowed', 'disabled_reason',
+      ], path);
+      return {
+        commandKind: stringAt(command.command_kind, `${path}.command_kind`),
+        semanticTarget: jsonRecordAt(command.semantic_target, `${path}.semantic_target`),
+        allowed: booleanAt(command.allowed, `${path}.allowed`),
+        disabledReason: nullableStringAt(
+          command.disabled_reason,
+          `${path}.disabled_reason`,
+        ),
+      };
+    }),
     recoveryOffer: record.recovery_offer === null
       ? null
       : parseCycleRecoveryOffer(
@@ -231,7 +280,10 @@ export function parseProgramCycleStatus(value: unknown): ProgramCycleStatus {
     }
   } else if (
     parsed.run.capture.programRunId !== parsed.programRunId
-    || parsed.run.ownerEpoch !== parsed.programRunnerOwnerEpoch
+    || (
+      !['terminal_awaiting_reset', 'resetting'].includes(parsed.state)
+      && parsed.run.ownerEpoch !== parsed.programRunnerOwnerEpoch
+    )
     || parsed.run.runRevision !== parsed.runRevision
     || parsed.run.nodeStatusRevision !== parsed.nodeStatusRevision
   ) {
@@ -6436,7 +6488,8 @@ export function parseComposerHeadlessState(
   const record = objectAt(value, 'headlessState');
   exactKeysAt(record, [
     'schema_version', 'runtime', 'alarms', 'component_overview', 'authoring_admission',
-    'program_cycle', 'draft_identity', 'receiver_epoch',
+    'execution_targets', 'execution_control_state', 'program_cycle',
+    'draft_identity', 'receiver_epoch',
     'snapshot_sequence', 'complete',
   ], 'headlessState');
   const schemaVersion = stringAt(
@@ -6468,6 +6521,13 @@ export function parseComposerHeadlessState(
       authoringAllowed: booleanAt(admission.authoring_allowed, 'headlessState.authoring_admission.authoring_allowed'),
       admissionGeneration: positiveIntegerAt(admission.admission_generation, 'headlessState.authoring_admission.admission_generation'),
     },
+    executionControlStatus: record.execution_targets === null
+      && record.execution_control_state === null
+      ? null
+      : parseExecutionControlStatus(
+          record.execution_targets,
+          record.execution_control_state,
+        ),
     programCycle: parseProgramCycleStatus(record.program_cycle),
     draftIdentity: {
       draftId: stringAt(draft.draft_id, 'headlessState.draft_identity.draft_id'),

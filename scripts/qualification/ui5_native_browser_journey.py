@@ -67,6 +67,7 @@ DOM_STATE_SCRIPT = f"""return (() => {{
     runtimeSummary: runtime?.querySelector(
       '.runtime-observability-rail-summary',
     )?.textContent?.trim() ?? null,
+    runtimeText: runtime?.textContent?.replace(/\\s+/g, ' ').trim().slice(0, 4096) ?? null,
     runtimeGeometry: runtime === null || stage === null ? null : (() => {{
       const panel = runtime.getBoundingClientRect();
       const viewport = stage.getBoundingClientRect();
@@ -203,28 +204,99 @@ def _select_workspace(driver: RawWebDriver, workspace: str) -> None:
 
 def _set_range(driver: RawWebDriver, value: float) -> dict[str, Any]:
     _require(math.isfinite(value) and 0.0 <= value <= 1.0, "invalid velocity value")
-    script = """return (() => {
+    slider = _execute(driver, """return (() => {
       const input = document.querySelector(
         '.viewer-transport .transport-velocity input',
       );
       if (!(input instanceof HTMLInputElement) || input.disabled) return null;
       window.__manyforgeUi5Velocity ??= input;
-      input.focus();
-      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(
-        input,
-        %s,
+      input.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+      return { value: Number(input.value), step: Number(input.step) };
+    })();""")
+    if not isinstance(slider, dict):
+        raise CollectorError("runtime velocity slider is unavailable")
+    step = float(slider["step"])
+    observed = float(slider["value"])
+    _require(step > 0.0 and math.isfinite(step), "runtime velocity step is invalid")
+    _require(math.isfinite(observed), "runtime velocity value is invalid")
+    element = driver.command(
+        "POST",
+        "/element",
+        {
+            "using": "css selector",
+            "value": ".viewer-transport .transport-velocity input",
+        },
+    )
+    if not isinstance(element, dict):
+        raise CollectorError("runtime velocity slider element is unavailable")
+    element_id = element.get("element-6066-11e4-a52e-4f735466cecf")
+    if not isinstance(element_id, str) or not element_id:
+        raise CollectorError("runtime velocity slider element identity is invalid")
+    if math.isclose(observed, value, abs_tol=step / 2.0):
+        # Sending a harmless key focuses an already-current slider without
+        # manufacturing an owner command.
+        keys = "\ue00c"
+        driver.command(
+            "POST",
+            f"/element/{element_id}/value",
+            {"text": keys, "value": list(keys)},
+        )
+    else:
+        # Put the browser control one step from the target without dispatching
+        # an event, then perform the final step as one trusted WebDriver key.
+        # The DOM setup alone cannot satisfy the qualification: React must
+        # handle the trusted input and the caller verifies the owner projection.
+        # Retry only the local input setup if an intervening React render
+        # restored the controlled value before WebDriver delivered the key.
+        increasing = value > 0.0
+        precursor = value - step if increasing else value + step
+        precursor = min(1.0, max(0.0, precursor))
+        keys = "\ue014" if increasing else "\ue012"
+        for _ in range(3):
+            prepared = _execute(driver, """return (() => {
+              const input = document.querySelector(
+                '.viewer-transport .transport-velocity input',
+              );
+              if (!(input instanceof HTMLInputElement) || input.disabled) return null;
+              Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(
+                input,
+                %s,
+              );
+              return Number(input.value);
+            })();""" % json.dumps(str(precursor)))
+            if not isinstance(prepared, (int, float)) or not math.isclose(
+                float(prepared), precursor, abs_tol=step / 2.0
+            ):
+                raise CollectorError("runtime velocity slider setup failed")
+            driver.command(
+                "POST",
+                f"/element/{element_id}/value",
+                {"text": keys, "value": list(keys)},
+            )
+            observed = _execute(
+                driver,
+                "return Number(document.querySelector("
+                "'.viewer-transport .transport-velocity input')?.value);",
+            )
+            if isinstance(observed, (int, float)) and math.isclose(
+                float(observed), value, abs_tol=step / 2.0
+            ):
+                break
+    result = _execute(driver, """return (() => {
+      const input = document.querySelector(
+        '.viewer-transport .transport-velocity input',
       );
-      input.dispatchEvent(new Event('input', { bubbles: true }));
-      input.dispatchEvent(new Event('change', { bubbles: true }));
+      if (!(input instanceof HTMLInputElement)) return null;
       return {
         value: input.value,
         identityStable: input === window.__manyforgeUi5Velocity,
         focused: document.activeElement === input,
       };
-    })();""" % json.dumps(str(value))
-    result = _execute(driver, script)
-    if not isinstance(result, dict):
-        raise CollectorError("runtime velocity slider is unavailable")
+    })();""")
+    if not isinstance(result, dict) or not math.isclose(
+        float(result["value"]), value, abs_tol=step / 2.0
+    ):
+        raise CollectorError("runtime velocity slider did not reach its target")
     return result
 
 
@@ -757,7 +829,10 @@ def _approve_mode(
         f"Robot Control {mode} owner settlement",
         TERMINAL_TIMEOUT_S,
     )
-    _require(settled["error"] is None, f"Robot Control {mode} execution reported an error")
+    _require(
+        settled["error"] is None,
+        f"Robot Control {mode} execution reported an error: {settled['error']}",
+    )
     phases = [state["phase"] for state in trace if state["phase"] is not None]
     _require(
         any(phase in {"Submitting", "Executing", "Settling", "Completed"} for phase in phases),
