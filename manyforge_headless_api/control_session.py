@@ -1,4 +1,4 @@
-"""Versioned bidirectional UI6-F execution-control WebSocket session."""
+"""Versioned bidirectional UI6-G execution-control WebSocket session."""
 
 from __future__ import annotations
 
@@ -24,11 +24,13 @@ from .control_protocol import (
     CONTROL_PROTOCOL_VERSION,
     MAXIMUM_U64,
     ControlClientHelloDTO,
+    ControlClientIncidentDTO,
     ControlHeartbeatChallengeDTO,
     ControlHeartbeatEchoDTO,
     ControlResyncRequestDTO,
     ControlResyncRequiredDTO,
     ControlServerHelloDTO,
+    ControlStateAppliedDTO,
     ExecutionCommandReceiptMessageDTO,
     ExecutionControlCommandDTO,
     ExecutionControlDeltaDTO,
@@ -38,8 +40,8 @@ from .control_protocol import (
 from .control_state import (
     ControlStateFrame,
     ControlStateSubscription,
-    ControlStateUnavailableError,
     HeadlessControlStateSource,
+    control_shell_fact_key,
 )
 from .execution_control import (
     ExecutionControlBusyError,
@@ -52,6 +54,7 @@ _SEND_TIMEOUT_SECONDS = 0.25
 _CLIENT_HELLO_TIMEOUT_SECONDS = 1.0
 _CONTROL_DEAD_PEER_TIMEOUT_NS = 30_000_000_000
 _MAXIMUM_RECEIPTS = 8
+_MAXIMUM_CLIENT_INCIDENTS_PER_SECOND = 8
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -84,22 +87,28 @@ class _OutboundSlots:
         self.receipts.append(payload)
         self.wake.set()
 
-    def put_state(self, payload: Any) -> None:
+    def put_state(self, payload: Any) -> bool:
+        replaced = self.state is not None
         self.state = payload
         self.wake.set()
+        return replaced
 
     def put_heartbeat(self, payload: Any) -> None:
         self.heartbeat = payload
         self.wake.set()
 
-    async def take(self) -> Any | None:
+    async def take(
+        self,
+        *,
+        state_allowed: Callable[[], bool] = lambda: True,
+    ) -> Any | None:
         while not self.closed:
             if self.receipts:
                 return self.receipts.popleft()
             if self.heartbeat is not None:
                 payload, self.heartbeat = self.heartbeat, None
                 return payload
-            if self.state is not None:
+            if state_allowed() and self.state is not None:
                 payload, self.state = self.state, None
                 return payload
             self.wake.clear()
@@ -130,8 +139,12 @@ class ExecutionControlSession:
         self._clock_ns = clock_ns
         self._session_id = f"control-session.{uuid.uuid4().hex}"
         self._server_sequence = 0
+        self._state_sequence = 0
+        self._state_inflight: int | None = None
         self._challenge_sequence = 0
         self._last_echoed_challenge = 0
+        self._challenge_issued_ns: int | None = None
+        self._delay_level = 0
         self._last_client_sequence = 0
         self._last_heartbeat_ns = clock_ns()
         self._rate_window_ns = self._last_heartbeat_ns
@@ -143,7 +156,13 @@ class ExecutionControlSession:
         self._slots = _OutboundSlots()
         self._subscription: ControlStateSubscription | None = None
         self._latest_frame: ControlStateFrame | None = None
+        self._snapshot_sent = False
         self._resync_required = False
+        self._client_incarnation = "unknown-client"
+        self._source_label = "unknown-client"
+        self._server_incidents: dict[str, int] = {}
+        self._incident_rate_window_ns = self._last_heartbeat_ns
+        self._incident_rate_count = 0
         self._ingress_session_open = False
         self._closed = False
 
@@ -169,6 +188,15 @@ class ExecutionControlSession:
         self._last_client_sequence = sequence
         return sequence
 
+    def _admit_client_incident(self) -> None:
+        now = self._clock_ns()
+        if now - self._incident_rate_window_ns >= 1_000_000_000:
+            self._incident_rate_window_ns = now
+            self._incident_rate_count = 0
+        self._incident_rate_count += 1
+        if self._incident_rate_count > _MAXIMUM_CLIENT_INCIDENTS_PER_SECOND:
+            raise ValueError("control client incident rate exceeded")
+
     def _shell(self, frame: ControlStateFrame) -> dict[str, Any]:
         return self._enrich(dict(frame.shell))
 
@@ -178,6 +206,7 @@ class ExecutionControlSession:
             message_kind="snapshot",
             control_session_id=self._session_id,
             server_sequence="1",
+            state_sequence="1",
             received_client_sequence=(
                 None
                 if self._last_client_sequence == 0
@@ -188,17 +217,44 @@ class ExecutionControlSession:
             complete=True,
         )
 
-    def _delta_message(self, frame: ControlStateFrame) -> ExecutionControlDeltaDTO:
-        shell = (
-            self._shell(frame)
-            if frame.event_class == "cold"
-            else {"program_cycle": frame.shell["program_cycle"]}
-        )
+    def _delta_message(
+        self,
+        frame: ControlStateFrame,
+        previous: ControlStateFrame | None,
+    ) -> ExecutionControlDeltaDTO:
+        """Carry only changed owner facts after the complete snapshot.
+
+        A control snapshot is deliberately complete, but retransmitting its
+        unchanged runtime, target, and runtime-control structures at every
+        sparse lifecycle boundary can put hundreds of kilobytes ahead of a
+        later command receipt on the ordered socket.  Top-level owner facts
+        are immutable values, so replacement of only the changed facts is a
+        complete and considerably cheaper delta contract.
+        """
+
+        current = self._shell(frame)
+        prior = {} if previous is None else previous.shell
+        shell: dict[str, Any] = {"complete": False}
+        for name, value in current.items():
+            if (
+                name not in prior
+                or control_shell_fact_key(current, name)
+                != control_shell_fact_key(prior, name)
+            ):
+                shell[name] = value
+        # Targets are immutable within their validated execution identity. A
+        # target replacement still carries its matching control capture; an
+        # ordinary control-state change can reuse the already-validated target.
+        if "execution_targets" in shell:
+            shell["execution_control_state"] = current[
+                "execution_control_state"
+            ]
         return ExecutionControlDeltaDTO(
             schema_version=CONTROL_PROTOCOL_VERSION,
             message_kind="delta",
             control_session_id=self._session_id,
             server_sequence="1",
+            state_sequence="1",
             received_client_sequence=(
                 None
                 if self._last_client_sequence == 0
@@ -209,30 +265,73 @@ class ExecutionControlSession:
             shell=shell,
         )
 
-    async def _send_direct(self, payload: str) -> None:
+    async def _send_direct(self, payload: str, kind: str) -> None:
         await asyncio.wait_for(
             self._websocket.send_text(payload),
             timeout=_SEND_TIMEOUT_SECONDS,
         )
+        self._source.record_message(kind, len(payload.encode("utf-8")))
 
     async def _send_message(self, message: Any) -> None:
         """Assign transport order only when an item actually leaves its slot."""
 
         if isinstance(message, str):
-            await self._send_direct(message)
+            await self._send_direct(message, "unknown")
             return
         fields = getattr(type(message), "model_fields", {})
         if "server_sequence" in fields:
-            message = message.model_copy(
-                update={"server_sequence": self._next_server_sequence()}
-            )
+            updates = {"server_sequence": self._next_server_sequence()}
+            if getattr(message, "message_kind", None) in {"snapshot", "delta"}:
+                if self._state_inflight is not None:
+                    raise RuntimeError("control state credit is already in flight")
+                if self._state_sequence >= MAXIMUM_U64:
+                    raise ValueError("control state sequence requires renewal")
+                self._state_sequence += 1
+                self._state_inflight = self._state_sequence
+                updates["state_sequence"] = str(self._state_sequence)
+            if getattr(message, "message_kind", None) == "command_receipt":
+                # This is the emission boundary, not the earlier completion
+                # callback that merely placed the receipt in its priority slot.
+                updates["emitted_monotonic_ns"] = str(self._clock_ns())
+            message = message.model_copy(update=updates)
         kind = getattr(message, "message_kind", None)
         maximum = (
             CONTROL_MAXIMUM_SNAPSHOT_BYTES
             if kind in {"snapshot", "delta", "command_receipt"}
             else CONTROL_MAXIMUM_MESSAGE_BYTES
         )
-        await self._send_direct(_encode(message, maximum_bytes=maximum))
+        await self._send_direct(_encode(message, maximum_bytes=maximum), str(kind))
+        if kind == "snapshot":
+            self._snapshot_sent = True
+
+    def _put_state(self, payload: Any) -> None:
+        pending = self._slots.state
+        if (
+            isinstance(pending, ExecutionControlDeltaDTO)
+            and isinstance(payload, ExecutionControlDeltaDTO)
+        ):
+            # Each sparse delta is reduced against the preceding owner frame,
+            # but a slow client may never have received that frame. Preserve
+            # the union of changed top-level facts in the one pending slot;
+            # newer values still replace older values for the same fact.
+            payload = payload.model_copy(
+                update={"shell": {**pending.shell, **payload.shell}}
+            )
+        elif (
+            isinstance(pending, ExecutionControlSnapshotDTO)
+            and isinstance(payload, ExecutionControlDeltaDTO)
+        ):
+            shell = {**pending.shell, **payload.shell}
+            shell.pop("complete", None)
+            payload = pending.model_copy(
+                update={
+                    "control": payload.control or pending.control,
+                    "received_client_sequence": payload.received_client_sequence,
+                    "shell": shell,
+                }
+            )
+        if self._slots.put_state(payload):
+            self._source.record_state_replacement()
 
     async def _handshake(self) -> None:
         raw = await asyncio.wait_for(
@@ -244,11 +343,12 @@ class ExecutionControlSession:
         hello = ControlClientHelloDTO.model_validate_json(raw, strict=True)
         if tuple(hello.supported_versions) != (CONTROL_PROTOCOL_VERSION,):
             raise ValueError("control protocol version is unsupported")
+        self._client_incarnation = hello.client_incarnation
+        self._source_label = hello.source_label
         subscription = await self._source.subscribe()
         self._subscription = subscription
-        # Confirm the transport immediately; cold shell assembly is a distinct
-        # synchronization step and may take longer on supported CPU-rendered
-        # edge targets. Readiness still waits for the complete snapshot.
+        # Confirm transport immediately. Heartbeat and semantic synchronization
+        # start as independent tasks after this response.
         hello_response = ControlServerHelloDTO(
             schema_version=CONTROL_PROTOCOL_VERSION,
             message_kind="server_hello",
@@ -261,48 +361,16 @@ class ExecutionControlSession:
             maximum_messages_per_second=CONTROL_MAXIMUM_MESSAGES_PER_SECOND,
         )
         await self._send_direct(
-            _encode(hello_response, maximum_bytes=CONTROL_MAXIMUM_MESSAGE_BYTES)
+            _encode(hello_response, maximum_bytes=CONTROL_MAXIMUM_MESSAGE_BYTES),
+            "server_hello",
         )
-        # Initial owner synchronization is not a heartbeat failure. Keep the
-        # one transport open and watch for a real client disconnect while the
-        # change-driven source converges; reconnecting cannot make an owner
-        # become current and used to create overlapping upstream subscribers.
-        disconnect = asyncio.create_task(self._websocket.receive())
-        try:
-            while not subscription.closed:
-                wake = asyncio.create_task(subscription.wake.wait())
-                ready, _pending = await asyncio.wait(
-                    (wake, disconnect),
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                if disconnect in ready:
-                    if not wake.done():
-                        wake.cancel()
-                        with suppress(asyncio.CancelledError):
-                            await wake
-                    message = disconnect.result()
-                    if message.get("type") == "websocket.disconnect":
-                        raise WebSocketDisconnect()
-                    raise ValueError(
-                        "control client sent a message before synchronization"
-                    )
-                frame = self._source.take(subscription)
-                if frame is not None:
-                    self._latest_frame = frame
-                    break
-        finally:
-            if not disconnect.done():
-                disconnect.cancel()
-                with suppress(asyncio.CancelledError):
-                    await disconnect
-        if self._latest_frame is None:
-            raise RuntimeError("control source closed before synchronization")
-        await self._send_message(self._snapshot_message(self._latest_frame))
         self._last_heartbeat_ns = self._clock_ns()
 
     async def _writer(self) -> None:
         while not self._closed:
-            payload = await self._slots.take()
+            payload = await self._slots.take(
+                state_allowed=lambda: self._state_inflight is None
+            )
             if payload is None:
                 return
             await self._send_message(payload)
@@ -317,6 +385,9 @@ class ExecutionControlSession:
                 continue
             previous = self._latest_frame
             self._latest_frame = frame
+            if not self._snapshot_sent:
+                self._put_state(self._snapshot_message(frame))
+                continue
             if previous is not None and (
                 previous.control.receiver_incarnation
                 != frame.control.receiver_incarnation
@@ -324,7 +395,7 @@ class ExecutionControlSession:
                 != frame.control.semantic_owner_epoch
             ):
                 self._resync_required = True
-                self._slots.put_state(
+                self._put_state(
                     ControlResyncRequiredDTO(
                         schema_version=CONTROL_PROTOCOL_VERSION,
                         message_kind="resync_required",
@@ -336,7 +407,83 @@ class ExecutionControlSession:
                 continue
             if self._resync_required:
                 continue
-            self._slots.put_state(self._delta_message(frame))
+            self._put_state(self._delta_message(frame, previous))
+
+    def _record_incident(
+        self,
+        *,
+        incident_id: str,
+        incident_kind: str,
+        phase: str,
+        first_observed_ns: int,
+        last_observed_ns: int,
+        occurrence_count: int,
+        maximum_delay_ns: int | None,
+        reason_code: str,
+    ) -> None:
+        self._source.record_incident(
+            incident_id=incident_id,
+            incident_kind=incident_kind,
+            phase=phase,
+            control_session_id=self._session_id,
+            client_incarnation=self._client_incarnation,
+            source_label=self._source_label,
+            reason_code=reason_code,
+            occurrence_count=occurrence_count,
+            maximum_delay_ns=maximum_delay_ns,
+            first_observed_ns=first_observed_ns,
+            last_observed_ns=last_observed_ns,
+        )
+
+    def _classify_outstanding_heartbeat(self, now_ns: int) -> None:
+        issued_ns = self._challenge_issued_ns
+        if issued_ns is None:
+            return
+        elapsed = now_ns - issued_ns
+        for level, threshold, kind, reason in (
+            (1, CONTROL_HEARTBEAT_DELAYED_NS, "control_delayed", "heartbeat_delayed"),
+            (2, CONTROL_HEARTBEAT_STALE_NS, "control_stale", "heartbeat_stale"),
+        ):
+            if elapsed < threshold or self._delay_level >= level:
+                continue
+            self._delay_level = level
+            self._source.record_delay_transition(stale=level == 2)
+            first = self._source.relative_monotonic_ns(now_ns)
+            self._server_incidents[kind] = first
+            self._record_incident(
+                incident_id=f"{self._session_id}.{kind}.{self._challenge_sequence}",
+                incident_kind=kind,
+                phase="activated",
+                first_observed_ns=first,
+                last_observed_ns=first,
+                occurrence_count=1,
+                maximum_delay_ns=elapsed,
+                reason_code=reason,
+            )
+
+    def _resolve_heartbeat_incidents(
+        self,
+        now_ns: int,
+        elapsed_ns: int,
+        *,
+        reason_code: str = "heartbeat_recovered",
+    ) -> None:
+        count = max(1, elapsed_ns // CONTROL_HEARTBEAT_PERIOD_NS)
+        last = self._source.relative_monotonic_ns(now_ns)
+        for kind in ("control_delayed", "control_stale"):
+            first = self._server_incidents.pop(kind, None)
+            if first is None:
+                continue
+            self._record_incident(
+                incident_id=f"{self._session_id}.{kind}.{self._challenge_sequence}",
+                incident_kind=kind,
+                phase="resolved",
+                first_observed_ns=first,
+                last_observed_ns=last,
+                occurrence_count=count,
+                maximum_delay_ns=elapsed_ns,
+                reason_code=reason_code,
+            )
 
     def _next_heartbeat(
         self,
@@ -348,18 +495,21 @@ class ExecutionControlSession:
         # The outbound slot gives this tiny challenge priority over replaceable
         # state so sustained node progress cannot starve session liveness.
         if self._challenge_sequence > self._last_echoed_challenge:
+            self._classify_outstanding_heartbeat(now_ns)
             if now_ns - self._last_heartbeat_ns > _CONTROL_DEAD_PEER_TIMEOUT_NS:
                 raise TimeoutError("control peer stopped answering heartbeats")
             return None
-        try:
-            frame = self._source.current()
-        except ControlStateUnavailableError:
-            # Program and cold owner projections may advance separately during
-            # Reset or owner recovery. Pause readiness until they agree; this
-            # is not evidence that the browser peer died, so retain the socket.
-            return None
-        self._latest_frame = frame
+        semantic = self._source.semantic_context()
+        freshness = None
+        if semantic.status == "current":
+            assert semantic.semantic_owner_epoch is not None
+            assert semantic.execution_control_revision is not None
+            freshness = self._ingress.freshness_for(
+                semantic.semantic_owner_epoch,
+                semantic.execution_control_revision,
+            )
         self._challenge_sequence += 1
+        self._challenge_issued_ns = now_ns
         return ControlHeartbeatChallengeDTO(
             schema_version=CONTROL_PROTOCOL_VERSION,
             message_kind="heartbeat_challenge",
@@ -371,16 +521,18 @@ class ExecutionControlSession:
                 if self._last_client_sequence == 0
                 else str(self._last_client_sequence)
             ),
-            freshness=frame.control.freshness,
+            semantic_status=semantic.status,  # type: ignore[arg-type]
+            semantic_reason=semantic.reason,
+            freshness=freshness,
         )
 
     async def _heartbeat(self) -> None:
         period = CONTROL_HEARTBEAT_PERIOD_NS / 1_000_000_000
         while not self._closed:
-            await asyncio.sleep(period)
             challenge = self._next_heartbeat(self._clock_ns())
             if challenge is not None:
                 self._slots.put_heartbeat(challenge)
+            await asyncio.sleep(period)
 
     def _receipt_done(
         self,
@@ -393,10 +545,19 @@ class ExecutionControlSession:
             self._runtime_scale_pending = None
         if self._closed:
             return
+        kind = request.command.command_envelope.command_kind
         try:
             submission = future.result()
             receipt = submission.receipt
-            result = None if submission.result is None else dict(submission.result)
+            # The owner state is the execution truth and streams independently.
+            # Only runtime scale currently needs one compact synchronous result;
+            # shipping whole Program/operation snapshots in every receipt makes
+            # browsers parse data they immediately discard.
+            result = (
+                dict(submission.result)
+                if kind == "runtime_scale" and submission.result is not None
+                else None
+            )
         except Exception as error:
             frame = self._latest_frame or self._source.current()
             receipt = self._ingress.rejection_receipt(
@@ -511,13 +672,47 @@ class ExecutionControlSession:
                 ):
                     raise ValueError("control heartbeat challenge is stale or unknown")
                 self._last_echoed_challenge = challenge
-                self._last_heartbeat_ns = self._clock_ns()
+                now_ns = self._clock_ns()
+                issued_ns = self._challenge_issued_ns or now_ns
+                round_trip_ns = max(0, now_ns - issued_ns)
+                self._source.record_heartbeat_echo(round_trip_ns)
+                self._resolve_heartbeat_incidents(now_ns, round_trip_ns)
+                self._delay_level = 0
+                self._challenge_issued_ns = None
+                self._last_heartbeat_ns = now_ns
+            elif kind == "state_applied":
+                message = ControlStateAppliedDTO.model_validate(value)
+                if message.control_session_id != self._session_id:
+                    raise ValueError("control state credit names another session")
+                applied = int(message.state_sequence)
+                if self._state_inflight is None or applied != self._state_inflight:
+                    raise ValueError("control state credit is stale or unknown")
+                self._state_inflight = None
+                self._slots.wake.set()
             elif kind == "command":
                 message = ExecutionControlCommandDTO.model_validate(value)
                 if message.control_session_id != self._session_id:
                     raise ValueError("control command names another session")
                 self._admit_client_sequence(message.client_sequence)
                 self._receive_command(message)
+            elif kind == "client_incident":
+                message = ControlClientIncidentDTO.model_validate(value)
+                if message.control_session_id != self._session_id:
+                    raise ValueError("client incident names another session")
+                self._admit_client_sequence(message.client_sequence)
+                self._admit_client_incident()
+                self._source.record_client_incident_transition(
+                    client_incarnation=self._client_incarnation,
+                    incident_id=message.incident_id,
+                    incident_kind=message.incident_kind,
+                    phase=message.phase,
+                    control_session_id=self._session_id,
+                    source_label=self._source_label,
+                    occurrence_count=message.occurrence_count,
+                    maximum_delay_ns=message.maximum_delay_ns,
+                    reason_code=message.reason_code,
+                    now_ns=self._clock_ns(),
+                )
             elif kind == "resync":
                 message = ControlResyncRequestDTO.model_validate(value)
                 if message.control_session_id != self._session_id:
@@ -526,7 +721,7 @@ class ExecutionControlSession:
                 frame = self._source.current()
                 self._latest_frame = frame
                 self._resync_required = False
-                self._slots.put_state(self._snapshot_message(frame))
+                self._put_state(self._snapshot_message(frame))
             else:
                 raise ValueError("control client message kind is unsupported")
 
@@ -568,6 +763,14 @@ class ExecutionControlSession:
         finally:
             self._closed = True
             self._slots.close()
+            if self._server_incidents:
+                now_ns = self._clock_ns()
+                issued_ns = self._challenge_issued_ns or now_ns
+                self._resolve_heartbeat_incidents(
+                    now_ns,
+                    max(0, now_ns - issued_ns),
+                    reason_code="control_session_closed",
+                )
             for task in tasks:
                 if not task.done():
                     task.cancel()

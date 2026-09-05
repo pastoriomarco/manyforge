@@ -114,22 +114,17 @@ describe('headless Composer presentation adapters', () => {
     const stored: HistorianStoredEvent = {
       sequence: 11,
       event: {
-        schemaVersion: 'manyforge.historian_event.v1',
+        schemaVersion: 'manyforge.historian_event_summary.v1',
         eventId: 'event-11',
         component: 'manyforge.alarm',
         eventType: 'operator_alarm_acknowledged',
         severity: 'INFO',
-        occurredAtNs: 100,
+        occurredAtNs: '100',
         occurredAtWall: '2026-08-05T12:00:00Z',
-        payload: {
-          condition_id: 'condition-1',
-          journal_payload: {
-            operation_state: {
-              program_run_id: 'program-run-1',
-              operation_id: 'operation-1',
-            },
-          },
-        },
+        message: 'operator alarm acknowledged',
+        conditionId: 'condition-1',
+        programRunId: 'program-run-1',
+        operationId: 'operation-1',
       },
     };
 
@@ -278,6 +273,10 @@ describe('headless Composer presentation adapters', () => {
       headlessState: {
         snapshot,
         error: 'Headless projection disconnected.',
+        transportStatus: 'disconnected',
+        transportError: 'Headless projection disconnected.',
+        semanticStatus: 'current',
+        semanticReason: null,
         reconnect,
       },
       clientErrors: [{
@@ -304,7 +303,15 @@ describe('headless Composer presentation adapters', () => {
 
     const collapsed = renderToStaticMarkup(createElement(HeadlessRuntimeSurfacesView, {
       enabled: true,
-      headlessState: { snapshot, error: null, reconnect },
+      headlessState: {
+        snapshot,
+        error: null,
+        transportStatus: 'connected',
+        transportError: null,
+        semanticStatus: 'current',
+        semanticReason: null,
+        reconnect,
+      },
       clientErrors: [{
         id: 'composer.program_runtime',
         title: 'Program command or response failed',
@@ -337,6 +344,10 @@ describe('headless Composer presentation adapters', () => {
           },
         },
         error: null,
+        transportStatus: 'connected',
+        transportError: null,
+        semanticStatus: 'current',
+        semanticReason: null,
         reconnect,
       },
       clientErrors: [{

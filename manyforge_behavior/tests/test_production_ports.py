@@ -548,6 +548,26 @@ def test_program_scope_stop_reaches_kernel_before_first_task_is_retained() -> No
     assert transport.submissions == []
 
 
+def test_unbound_program_scope_stop_uses_stable_kernel_epoch_source() -> None:
+    transport = _Transport()
+    port = NativeKernelProgramPort(
+        KernelClient(transport),
+        current_owner_epoch=lambda: "kernel.epoch.recovered",
+    )
+
+    stopped = port.scope.request_stop(
+        "program-run.retained",
+        "execution:runner.new:retained-stop",
+        "restart containment",
+    )
+
+    assert stopped.state is ProgramRunScopeState.ACTIVE
+    assert transport.identity_reads == 0
+    assert transport.controls[-1][2]["request_context"][
+        "request_owner_epoch"
+    ] == "kernel.epoch.recovered"
+
+
 def test_program_scope_stop_never_waits_on_the_ordinary_identity_lane() -> None:
     identity_blocked = Event()
     release_identity = Event()

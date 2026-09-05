@@ -609,7 +609,7 @@ The current generated contracts are:
 
 The current versioned WebSocket contract is:
 
-- [`CONTROL_WEBSOCKET_V1.md`](CONTROL_WEBSOCKET_V1.md) — the common
+- [`CONTROL_WEBSOCKET_V2.md`](CONTROL_WEBSOCKET_V2.md) — the common
   backend-authoritative execution-control session, fixed heartbeat/freshness
   profile, sequencing, backpressure, reconnect, and integration rules.
 

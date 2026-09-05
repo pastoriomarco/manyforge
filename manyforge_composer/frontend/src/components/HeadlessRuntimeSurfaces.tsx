@@ -3,6 +3,7 @@ import { api, HISTORIAN_PAGE_LIMIT } from '../api/client';
 import type { HistorianListQuery } from '../api/client';
 import { useShellHeadlessState } from '../hooks/useHeadlessState';
 import type {
+  ControlClientIncidentKind,
   HeadlessStateResult,
   HeadlessStateSource,
 } from '../hooks/useHeadlessState';
@@ -35,6 +36,7 @@ export interface ClientOperationalError {
   message: string;
   active: boolean;
   acknowledgementRequired: boolean;
+  severity?: 'warning' | 'error';
 }
 
 
@@ -99,41 +101,9 @@ function alarmPhase(eventType: string): HistoryAlarmPhase {
   return null;
 }
 
-const PROGRAM_RUN_ID_FIELDS = new Set(['program_run_id', 'programRunId']);
-const OPERATION_ID_FIELDS = new Set(['operation_id', 'operationId']);
-
-export function nestedHistorianIdentity(
-  value: unknown,
-  names: ReadonlySet<string>,
-): string | null {
-  const pending: Array<{ value: unknown; depth: number }> = [{ value, depth: 0 }];
-  let visited = 0;
-  while (pending.length > 0 && visited < 2_048) {
-    const current = pending.pop();
-    if (current === undefined) break;
-    visited += 1;
-    if (current.depth > 12 || current.value === null || typeof current.value !== 'object') {
-      continue;
-    }
-    if (Array.isArray(current.value)) {
-      for (const child of current.value) {
-        pending.push({ value: child, depth: current.depth + 1 });
-      }
-      continue;
-    }
-    for (const [name, child] of Object.entries(current.value as Record<string, unknown>)) {
-      if (names.has(name) && typeof child === 'string' && child.trim()) return child;
-      pending.push({ value: child, depth: current.depth + 1 });
-    }
-  }
-  return null;
-}
-
 export function historianEventView(
   stored: HistorianStoredEvent,
 ): ExecutionHistoryEventView {
-  const readableType = stored.event.eventType.replaceAll('_', ' ');
-  const conditionId = stored.event.payload.condition_id;
   return {
     id: `${stored.sequence}:${stored.event.eventId}`,
     sequence: stored.sequence,
@@ -141,20 +111,13 @@ export function historianEventView(
     timestamp: stored.event.occurredAtWall,
     severity: stored.event.severity,
     channel: stored.event.component,
-    message: typeof conditionId === 'string'
-      ? `${readableType}: ${conditionId}`
-      : readableType,
+    message: stored.event.conditionId === null
+      ? stored.event.message
+      : `${stored.event.message}: ${stored.event.conditionId}`,
     type: stored.event.eventType,
     alarmPhase: alarmPhase(stored.event.eventType),
-    programRunId: nestedHistorianIdentity(
-      stored.event.payload,
-      PROGRAM_RUN_ID_FIELDS,
-    ),
-    operationId: nestedHistorianIdentity(
-      stored.event.payload,
-      OPERATION_ID_FIELDS,
-    ),
-    details: stored.event.payload,
+    programRunId: stored.event.programRunId,
+    operationId: stored.event.operationId,
   };
 }
 
@@ -173,7 +136,6 @@ interface HeadlessRuntimeSurfacesProps {
   enabled: boolean;
   headlessStateSource: HeadlessStateSource;
   clientErrors?: ClientOperationalError[];
-  clientHistory?: ExecutionHistoryEventView[];
   onAcknowledgeClientError?: (id: string) => void;
   attentionRequest?: string | null;
   expanded?: boolean;
@@ -185,12 +147,16 @@ interface HeadlessRuntimeSurfacesViewProps {
   enabled: boolean;
   headlessState: HeadlessStateResult;
   clientErrors?: ClientOperationalError[];
-  clientHistory?: ExecutionHistoryEventView[];
   onAcknowledgeClientError?: (id: string) => void;
   attentionRequest?: string | null;
   expanded?: boolean;
   onExpandedChange?: (expanded: boolean) => void;
   onClose?: () => void;
+  reportClientIncident?: (
+    kind: ControlClientIncidentKind,
+    active: boolean,
+    reasonCode: string,
+  ) => void;
 }
 
 interface RuntimeAttentionFence {
@@ -219,12 +185,12 @@ export function HeadlessRuntimeSurfacesView({
   enabled,
   headlessState,
   clientErrors = [],
-  clientHistory = [],
   onAcknowledgeClientError,
   attentionRequest = null,
   expanded = true,
   onExpandedChange,
   onClose,
+  reportClientIncident,
 }: HeadlessRuntimeSurfacesViewProps) {
   const { snapshot, error, reconnect } = headlessState;
   const [busyActivation, setBusyActivation] = useState<string | null>(null);
@@ -238,6 +204,10 @@ export function HeadlessRuntimeSurfacesView({
   const [historyQuery, setHistoryQuery] = useState<HistorianListQuery>({
     limit: HISTORIAN_PAGE_LIMIT,
   });
+  const [historyBefore, setHistoryBefore] = useState<number | null>(null);
+  const [historyNewerCursors, setHistoryNewerCursors] = useState<
+    Array<number | null>
+  >([]);
   const [historyNextBefore, setHistoryNextBefore] = useState<number | null>(null);
   const [historyHasOlder, setHistoryHasOlder] = useState(false);
   const [historyDetail, setHistoryDetail] = useState<HistorianDetail | null>(null);
@@ -253,6 +223,20 @@ export function HeadlessRuntimeSurfacesView({
     message: historyError,
     onDismiss: () => setHistoryError(null),
   });
+  useEffect(() => {
+    reportClientIncident?.(
+      'history_request_failed',
+      historyError !== null,
+      'history_request_failed',
+    );
+  }, [historyError, reportClientIncident]);
+  useEffect(() => {
+    reportClientIncident?.(
+      'history_detail_request_failed',
+      historyDetailError !== null,
+      'history_detail_request_failed',
+    );
+  }, [historyDetailError, reportClientIncident]);
   useOperationalErrorMirror({
     source: 'composer.runtime_history_detail',
     title: 'Runtime history detail request failed',
@@ -275,41 +259,37 @@ export function HeadlessRuntimeSurfacesView({
   const attentionSummary = runtimeAttentionSummary(attention, clientErrors);
   const singleClientError = attentionCount === 1 ? clientErrors[0] : undefined;
   const singleAlarm = attentionCount === 1 ? attention[0] : undefined;
-  const attentionSeverity = clientErrors.length > 0 || attention.some(
+  const attentionSeverity = clientErrors.some((item) => item.severity !== 'warning')
+    || attention.some(
     (alarm) => alarm.priority === 'critical' || alarm.priority === 'high',
   ) ? 'error' : 'warning';
-  const combinedHistory = useMemo(() => (
-    [...clientHistory, ...historyEvents].sort((left, right) => (
-      right.timestampNs - left.timestampNs || left.id.localeCompare(right.id)
-    ))
-  ), [clientHistory, historyEvents]);
   useEffect(() => {
     if (attentionCount < 2) setBulkFence(null);
   }, [attentionCount]);
 
   const loadHistory = async (
     query: HistorianListQuery = historyQuery,
-    append = false,
+    beforeSequence: number | null = null,
+    newerCursors: Array<number | null> = [],
   ) => {
     setHistoryLoading(true);
     setHistoryError(null);
     try {
       const effectiveQuery = {
         ...query,
-        ...(append && historyNextBefore !== null
-          ? { beforeSequence: historyNextBefore }
+        ...(beforeSequence !== null
+          ? { beforeSequence }
           : { beforeSequence: undefined }),
       };
       const page = await api.history.list(effectiveQuery);
-      const incoming = page.events.map(historianEventView);
-      setHistoryEvents((current) => append
-        ? [...current, ...incoming.filter((event) => (
-            !current.some((existing) => existing.id === event.id)
-          ))]
-        : incoming);
+      setHistoryEvents(page.events.map(historianEventView));
       setHistoryQuery(query);
+      setHistoryBefore(beforeSequence);
+      setHistoryNewerCursors(newerCursors);
       setHistoryNextBefore(page.nextBeforeSequence);
       setHistoryHasOlder(page.truncated && page.nextBeforeSequence !== null);
+      setHistoryDetail(null);
+      setHistoryDetailError(null);
     } catch (reason) {
       setHistoryError(actionErrorMessage(reason));
     } finally {
@@ -523,10 +503,14 @@ export function HeadlessRuntimeSurfacesView({
           </header>
           {attentionCount === 0 && <p className="muted">Nothing currently requires acknowledgement.</p>}
           {clientErrors.map((clientError) => (
-          <div className="operator-alarm-panel" key={clientError.id}>
+          <div
+            className={`operator-alarm-panel severity-${clientError.severity ?? 'error'}`}
+            key={clientError.id}
+          >
             <details>
               <summary>
-                COMPOSER ERROR{clientError.acknowledgementRequired
+                COMPOSER {(clientError.severity ?? 'error').toUpperCase()}{
+                  clientError.acknowledgementRequired
                   ? ` — ${clientError.active ? '' : 'RESOLVED · '}DISMISSAL REQUIRED`
                   : ''} · {clientError.title}
               </summary>
@@ -535,7 +519,7 @@ export function HeadlessRuntimeSurfacesView({
                 presentation={{
                   headline: clientError.title,
                   hint: clientError.message,
-                  severity: 'error',
+                  severity: clientError.severity ?? 'error',
                 }}
                 presentationKey={clientError.id}
                 eyebrow="Composer client error"
@@ -596,10 +580,29 @@ export function HeadlessRuntimeSurfacesView({
         embedded
         onClose={() => setMode('attention')}
         onReload={(query) => { void loadHistory(query); }}
-        onLoadOlder={() => { void loadHistory(historyQuery, true); }}
+        onLoadOlder={() => {
+          if (historyNextBefore !== null) {
+            void loadHistory(
+              historyQuery,
+              historyNextBefore,
+              [...historyNewerCursors, historyBefore],
+            );
+          }
+        }}
+        onLoadNewer={() => {
+          const before = historyNewerCursors.at(-1);
+          if (before !== undefined) {
+            void loadHistory(
+              historyQuery,
+              before,
+              historyNewerCursors.slice(0, -1),
+            );
+          }
+        }}
         hasOlder={historyHasOlder}
-        events={combinedHistory}
-        eyebrow="Backend history and bounded Composer-session trace"
+        hasNewer={historyNewerCursors.length > 0}
+        events={historyEvents}
+        eyebrow="Backend history"
         loading={historyLoading}
         error={historyError}
         selectedDetail={historyDetail}
@@ -648,7 +651,6 @@ export function HeadlessRuntimeSurfaces({
   enabled,
   headlessStateSource,
   clientErrors = [],
-  clientHistory = [],
   onAcknowledgeClientError,
   attentionRequest = null,
   expanded = true,
@@ -671,12 +673,12 @@ export function HeadlessRuntimeSurfaces({
       enabled={enabled}
       headlessState={headlessState}
       clientErrors={clientErrors}
-      clientHistory={clientHistory}
       onAcknowledgeClientError={onAcknowledgeClientError}
       attentionRequest={attentionRequest}
       expanded={expanded}
       onExpandedChange={onExpandedChange}
       onClose={onClose}
+      reportClientIncident={headlessStateSource.reportClientIncident}
     />
   );
 }

@@ -516,6 +516,7 @@ STOP_PROBE_INSTALL_SCRIPT = r"""return (() => {
     receiptPerfMs: null,
     receiptWallMs: null,
     receipt: null,
+    messagesBeforeReceipt: [],
     controlIngressMonotonicNs: null,
     receiptEmittedMonotonicNs: null,
     stoppingPerfMs: null,
@@ -542,8 +543,18 @@ STOP_PROBE_INSTALL_SCRIPT = r"""return (() => {
           let incoming = null;
           try { incoming = typeof event.data === 'string' ? JSON.parse(event.data) : null;
           } catch { return; }
-          if (incoming?.message_kind !== 'command_receipt'
-              || incoming?.receipt?.correlation_id !== active.correlationId) return;
+          const receiptMatches = incoming?.message_kind === 'command_receipt'
+            && incoming?.receipt?.correlation_id === active.correlationId;
+          if (!receiptMatches) {
+            if (active.messagesBeforeReceipt.length < 16) {
+              active.messagesBeforeReceipt.push({
+                kind: incoming?.message_kind ?? 'unknown',
+                bytes: typeof event.data === 'string' ? event.data.length : null,
+                afterDispatchMs: performance.now() - active.dispatchPerfMs,
+              });
+            }
+            return;
+          }
           active.receiptPerfMs = performance.now();
           active.receiptWallMs = Date.now();
           active.receipt = incoming.receipt;
@@ -586,6 +597,7 @@ def _history_sequence(composer_url: str) -> int:
 
 def _wait_running_node(
     composer_url: str,
+    instance_id: str | None = None,
     timeout_s: float = DEFAULT_TIMEOUT_S,
 ) -> dict[str, Any]:
     """Wait for one owner-published running Program node before ordinary Stop."""
@@ -607,7 +619,11 @@ def _wait_running_node(
                 isinstance(run, dict)
                 and run.get("state") == "running"
                 and isinstance(node_statuses, dict)
-                and any(status == "running" for status in node_statuses.values())
+                and (
+                    node_statuses.get(instance_id) == "running"
+                    if instance_id is not None
+                    else any(status == "running" for status in node_statuses.values())
+                )
             ):
                 return run
         if time.monotonic() >= deadline:
@@ -636,7 +652,19 @@ def _wait_stop_terminal(
             if not isinstance(event, dict):
                 continue
             sequence = event.get("sequence")
-            historian_event = event.get("event")
+            summary = event.get("event")
+            if (
+                type(sequence) is not int
+                or sequence <= after_sequence
+                or not isinstance(summary, dict)
+                or summary.get("event_type") != "stop_terminal_projected"
+            ):
+                continue
+            detail = _http_json(
+                composer_url,
+                f"/api/execution/history/{sequence}",
+            )
+            historian_event = detail.get("event")
             wrapped_payload = (
                 historian_event.get("payload")
                 if isinstance(historian_event, dict)
@@ -648,9 +676,7 @@ def _wait_stop_terminal(
                 else None
             )
             if (
-                type(sequence) is int
-                and sequence > after_sequence
-                and isinstance(payload, dict)
+                isinstance(payload, dict)
                 and payload.get("record_kind") == "stop_terminal_projected"
             ):
                 return {
@@ -766,6 +792,7 @@ def _stop_latency(
             if isinstance(probe.get("receipt"), dict)
             else None
         ),
+        "messagesBeforeReceipt": probe.get("messagesBeforeReceipt", []),
         "stopId": payload.get("stop_id"),
         "stopGeneration": payload.get("stop_generation"),
         "historianSequence": terminal_event.get("sequence"),
@@ -828,7 +855,10 @@ def _run_and_stop(
         DEFAULT_TIMEOUT_S,
     )
     _assert_transition_fences(run_trace, "UI6 Run")
-    _wait_running_node(composer_url)
+    # The first Program node is a gripper command and can settle immediately.
+    # Wait for the qualified arm-motion node so this row actually measures the
+    # configured soft Stop path instead of racing a zero-duration terminal.
+    _wait_running_node(composer_url, "move_to_rest")
     _motion_flow, _ = _wait(
         lambda: _flow(driver),
         lambda state: (
@@ -1037,6 +1067,17 @@ def _slow_client_row(
             break
         if time.monotonic() >= recovery_deadline:
             detail = "" if recovery_error is None else f": {recovery_error}"
+            if recovery_error is None:
+                detail = ": " + json.dumps(
+                    {
+                        "fast_current": fast_current,
+                        "slow_flow": recovered_flow,
+                        "slow_status": _qualification_status(slow),
+                        "viewer_status": _viewer_status(composer_backend_url),
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
             raise CollectorError(
                 "timed out waiting for thawed client frame application" + detail
             )

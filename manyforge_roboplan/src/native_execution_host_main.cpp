@@ -48,6 +48,7 @@
 #include <manyforge_deployment/retained_runtime_policy.hpp>
 #include <manyforge_deployment/runtime_contract_registry.hpp>
 #include <manyforge_deployment/runtime_program_binding.hpp>
+#include <manyforge_deployment/stop_evidence_policy_codec.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <manyforge_roboplan/process_contained_candidate_client.hpp>
 #include <manyforge_roboplan/retained_collision_world_projector.hpp>
@@ -2330,8 +2331,7 @@ struct Command final {
     return decoded;
   }
   if (command == "release_program_run_stop_fence") {
-    RequireExactObjectSize(root, 6U,
-                           "Program-run Stop fence release command");
+    RequireExactObjectSize(root, 6U, "Program-run Stop fence release command");
     const auto attribution =
         DecodeRequestAttribution(Member(root, "attribution"));
     Require(attribution.transport == core::RequestTransportDTO::kInternal &&
@@ -2342,8 +2342,8 @@ struct Command final {
     Command decoded{CommandKind::kReleaseProgramRunStopFence};
     decoded.program_run_id = core::ProgramRunId(Text(root, "program_run_id"));
     decoded.stop_id = core::StopId(Text(root, "stop_id"));
-    decoded.stop_generation = core::StopGeneration(
-        Counter(root, "stop_generation", 1U));
+    decoded.stop_generation =
+        core::StopGeneration(Counter(root, "stop_generation", 1U));
     return decoded;
   }
   if (command == "full_stop") {
@@ -2429,6 +2429,24 @@ ErrorResponse(std::string code, std::string message,
       {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
       {"error", ErrorValue(core::ErrorDTO{std::move(code), std::move(message),
                                           std::move(details)})},
+      {"ok", CanonicalValue(false)},
+  });
+}
+
+[[nodiscard]] CanonicalValue ExecutionOwnerNotReadyIdentityResponse(
+    const core::ResourceAddressedExecutionKernel &owner,
+    const core::RequestOwnerEpoch &owner_epoch) {
+  const auto admission = owner.GetAuthoringAdmission();
+  return CanonicalValue(CanonicalValue::Object{
+      {"admission_generation",
+       CanonicalValue(
+           static_cast<double>(admission.admission_generation.value()))},
+      {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+      {"error",
+       ErrorValue(core::ErrorDTO{
+           "execution_owner_not_ready",
+           "the managed execution owner has no active physical product",
+           {{"owner_epoch", owner_epoch.value()}}})},
       {"ok", CanonicalValue(false)},
   });
 }
@@ -7651,6 +7669,73 @@ LoadExactManagedCandidateBundle(
   return bundle;
 }
 
+[[nodiscard]] std::optional<core::StopDeadlineBudgetDTO>
+LoadManagedBootstrapStopBudget(const ManagedRuntimeChildConfig &config,
+                               const core::RetainedBundleId &retained_bundle_id,
+                               const core::GraphRevision &graph_revision) {
+  const deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
+      config.package_root);
+  const auto bundle = bundle_source.get_verified(retained_bundle_id);
+  Require(bundle != nullptr &&
+              bundle->value().cell_graph.cell_id ==
+                  core::CellId(config.cell_id) &&
+              bundle->retained_bundle_id() == retained_bundle_id &&
+              bundle->value().cell_graph.graph_revision == graph_revision,
+          "managed bootstrap Stop policy differs from the retained product");
+
+  using PolicyIdentity =
+      std::pair<core::StopEvidencePolicyId, core::StopEvidencePolicyRevision>;
+  std::set<PolicyIdentity> required;
+  for (const auto &binding : bundle->value().cell_graph.control_bindings) {
+    required.emplace(binding.stop_evidence_policy_id,
+                     binding.stop_evidence_policy_revision);
+  }
+  if (required.empty()) {
+    return std::nullopt;
+  }
+
+  const deployment::FilesystemVerifiedCatalogArtifactSource catalog_store(
+      config.package_root);
+  std::optional<core::StopDeadlineBudgetDTO> envelope;
+  for (const auto &record : bundle->value().catalogs.records) {
+    const auto *const reference =
+        std::get_if<core::StopEvidencePolicyCatalogRecordRefDTO>(&record);
+    if (reference == nullptr ||
+        !required.contains(
+            {reference->record_id, reference->record_revision})) {
+      continue;
+    }
+    const auto bytes = catalog_store.get_verified(
+        reference->content_addressed_store_key, reference->content_digest);
+    Require(bytes.has_value(),
+            "managed bootstrap Stop policy artifact is unavailable");
+    const auto policy = deployment::resolve_and_qualify_stop_evidence_policy(
+        *reference, reference->content_addressed_store_key, *bytes);
+    Require(policy.reference() == *reference,
+            "managed bootstrap Stop policy readback differs");
+    required.erase({reference->record_id, reference->record_revision});
+    if (policy.value().disposition ==
+        core::StopEvidenceDisposition::kNotStoppable) {
+      continue;
+    }
+    Require(policy.value().deadline_budget.has_value(),
+            "managed stoppable policy has no deadline envelope");
+    auto candidate = *policy.value().deadline_budget;
+    candidate.phases.clear();
+    Require(!envelope.has_value() ||
+                (envelope->outer_duration_ns == candidate.outer_duration_ns &&
+                 envelope->kernel_completion_reserve_ns ==
+                     candidate.kernel_completion_reserve_ns),
+            "managed Stop policies do not share one cell deadline envelope");
+    envelope = std::move(candidate);
+  }
+  Require(required.empty(),
+          "managed bootstrap Stop policy is absent from the retained catalog");
+  Require(envelope.has_value(),
+          "managed execution product has no stoppable deadline envelope");
+  return envelope;
+}
+
 [[nodiscard]] std::optional<CompositionBuildInput> BuildManagedCompositionInput(
     const ManagedRuntimeChildConfig &config,
     const ManagedProjectionRegistry &projections,
@@ -7837,6 +7922,20 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
             "managed active retained-bundle publication cannot be verified");
     return std::move(publication.value());
   };
+  auto bootstrap_retained_bundle_id = config.retained_bundle_id;
+  auto bootstrap_graph_revision = config.graph_revision;
+  if (!config.program_cycle_journal.empty()) {
+    const auto retained_run =
+        detail::ReadActiveProgramRunProductForReconciliation(
+            config.program_cycle_journal);
+    if (!retained_run.ok()) {
+      Fail(retained_run.error().message);
+    }
+    if (retained_run.value().has_value()) {
+      bootstrap_retained_bundle_id = retained_run.value()->retained_bundle_id;
+      bootstrap_graph_revision = retained_run.value()->graph_revision;
+    }
+  }
   detached_owner_clock = std::make_shared<WallClock>();
   detached_owner_scheduler = std::make_shared<SimpleScheduler>(
       SimpleSchedulerConfig::from_environment());
@@ -7852,8 +7951,12 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       &admission_gate,
       std::nullopt};
   bootstrap_kernel_config.empty_runtime_retained_bundle_id =
-      config.retained_bundle_id;
-  bootstrap_kernel_config.empty_runtime_graph_revision = config.graph_revision;
+      bootstrap_retained_bundle_id;
+  bootstrap_kernel_config.empty_runtime_graph_revision =
+      bootstrap_graph_revision;
+  bootstrap_kernel_config.cell_stop_deadline_budget =
+      LoadManagedBootstrapStopBudget(config, bootstrap_retained_bundle_id,
+                                     bootstrap_graph_revision);
   bootstrap_kernel_config.stop_fault_recovery_facts_resolver =
       [&](const core::StopStatusDTO &status, const std::int64_t assessed_at_ns)
       -> core::Result<core::StopFaultRecoveryFactsDTO> {
@@ -9631,7 +9734,12 @@ private:
 
   [[nodiscard]] CanonicalValue
   IdentityResponse(Composition &composition) const {
+    const auto admission =
+        composition.runtime->addressed_kernel->GetAuthoringAdmission();
     return CanonicalValue(CanonicalValue::Object{
+        {"admission_generation",
+         CanonicalValue(
+             static_cast<double>(admission.admission_generation.value()))},
         {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
         {"command", CanonicalValue("identity")},
         {"identity", IdentityValue(composition)},
@@ -9874,8 +9982,9 @@ private:
     Fail("execution observation source stopped");
   }
 
-  [[nodiscard]] CanonicalValue ExecuteStop(const Command &command,
-                                           Composition &composition) {
+  [[nodiscard]] CanonicalValue
+  ExecuteStop(const Command &command,
+              core::ResourceAddressedExecutionKernel &addressed_kernel) {
     const bool ordinary = (command.kind == CommandKind::kStop ||
                            command.kind == CommandKind::kStopProgramRun) &&
                           command.stop.has_value();
@@ -9889,13 +9998,12 @@ private:
             "execution Stop control lane accepts one complete Stop command");
     const auto result = [&] {
       if (ordinary) {
-        return composition.runtime->addressed_kernel->stop(*command.stop);
+        return addressed_kernel.stop(*command.stop);
       }
       if (full) {
-        return composition.runtime->addressed_kernel->full_stop(
-            *command.full_stop);
+        return addressed_kernel.full_stop(*command.full_stop);
       }
-      return composition.runtime->addressed_kernel->recognized_malformed_stop(
+      return addressed_kernel.recognized_malformed_stop(
           core::MalformedStopIngressDTO{
               command.malformed_stop->request_id, owner_epoch_,
               command.malformed_stop->attribution,
@@ -9918,6 +10026,25 @@ private:
                             ? "stop_program_run"
                             : "stop")},
         {"ok", CanonicalValue(true)},
+    });
+  }
+
+  [[nodiscard]] CanonicalValue
+  ReadStop(const Command &command,
+           core::ResourceAddressedExecutionKernel &addressed_kernel) const {
+    const auto status = addressed_kernel.get_stop_status(*command.stop_id);
+    if (!status.ok()) {
+      return CanonicalValue(CanonicalValue::Object{
+          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+          {"error", ErrorValue(status.error())},
+          {"ok", CanonicalValue(false)},
+      });
+    }
+    return CanonicalValue(CanonicalValue::Object{
+        {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+        {"command", CanonicalValue("read_stop")},
+        {"ok", CanonicalValue(true)},
+        {"stop_status", StopStatusSummaryValue(status.value())},
     });
   }
 
@@ -9950,7 +10077,12 @@ private:
             {"ok", CanonicalValue(false)},
         });
       }
+      const auto admission =
+          composition.runtime->addressed_kernel->GetAuthoringAdmission();
       return CanonicalValue(CanonicalValue::Object{
+          {"admission_generation",
+           CanonicalValue(static_cast<double>(
+               admission.admission_generation.value()))},
           {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
           {"command", CanonicalValue("events")},
           {"event_page", OperationEventPageValue(page.value())},
@@ -9958,28 +10090,13 @@ private:
       });
     }
     if (command.kind == CommandKind::kReadStop) {
-      const auto status =
-          composition.runtime->addressed_kernel->get_stop_status(
-              *command.stop_id);
-      if (!status.ok()) {
-        return CanonicalValue(CanonicalValue::Object{
-            {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-            {"error", ErrorValue(status.error())},
-            {"ok", CanonicalValue(false)},
-        });
-      }
-      return CanonicalValue(CanonicalValue::Object{
-          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-          {"command", CanonicalValue("read_stop")},
-          {"ok", CanonicalValue(true)},
-          {"stop_status", StopStatusSummaryValue(status.value())},
-      });
+      return ReadStop(command, *composition.runtime->addressed_kernel);
     }
     if (command.kind == CommandKind::kStop ||
         command.kind == CommandKind::kStopProgramRun ||
         command.kind == CommandKind::kFullStop ||
         command.kind == CommandKind::kMalformedStop) {
-      return ExecuteStop(command, composition);
+      return ExecuteStop(command, *composition.runtime->addressed_kernel);
     }
     const bool read_only =
         command.kind == CommandKind::kObservation ||
@@ -10382,14 +10499,12 @@ private:
     }
     if (command.kind == CommandKind::kReleaseProgramRunStopFence) {
       const auto result =
-          composition.runtime->addressed_kernel
-              ->release_program_run_stop_fence(*command.program_run_id,
-                                               *command.stop_id,
-                                               *command.stop_generation);
+          composition.runtime->addressed_kernel->release_program_run_stop_fence(
+              *command.program_run_id, *command.stop_id,
+              *command.stop_generation);
       if (!result.ok()) {
         return CanonicalValue(CanonicalValue::Object{
-            {"api_version",
-             CanonicalValue(std::string(kResponseApiVersion))},
+            {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
             {"error", ErrorValue(result.error())},
             {"ok", CanonicalValue(false)},
         });
@@ -10640,14 +10755,7 @@ private:
             const auto cell_admission =
                 detail::TryDecodeCellAdmissionCommand(bytes);
             std::shared_lock composition_lock(composition_access_.mutex);
-            if (composition_access_.current == nullptr &&
-                !cell_admission.has_value()) {
-              response = ErrorResponse(
-                  "execution_owner_not_ready",
-                  "the managed execution owner has no active physical product",
-                  {{"owner_epoch", owner_epoch_.value()}});
-            } else if (cell_admission.has_value() &&
-                       lane != CommandLane::kOrdinary) {
+            if (cell_admission.has_value() && lane != CommandLane::kOrdinary) {
               const bool stop_lane = lane == CommandLane::kStop;
               response = detail::CellAdmissionResponseValue(
                   cell_admission->command,
@@ -10676,6 +10784,29 @@ private:
                     "execution_observation_command_unsupported",
                     "the independent observation socket accepts only "
                     "observation");
+              } else if (composition_access_.current == nullptr) {
+                auto *const owner = composition_access_.addressed_kernel;
+                Require(owner != nullptr,
+                        "stable addressed execution Kernel is not installed");
+                if (lane == CommandLane::kStop &&
+                    command.kind == CommandKind::kStopProgramRun) {
+                  // Restart containment belongs to the stable Kernel, not to
+                  // a product that is still being reconstructed.
+                  response = ExecuteStop(command, *owner);
+                } else if (lane == CommandLane::kOrdinary &&
+                           command.kind == CommandKind::kReadStop) {
+                  response = ReadStop(command, *owner);
+                } else if (lane == CommandLane::kOrdinary &&
+                           command.kind == CommandKind::kIdentity) {
+                  response = ExecutionOwnerNotReadyIdentityResponse(
+                      *owner, owner_epoch_);
+                } else {
+                  response =
+                      ErrorResponse("execution_owner_not_ready",
+                                    "the managed execution owner has no active "
+                                    "physical product",
+                                    {{"owner_epoch", owner_epoch_.value()}});
+                }
               } else {
                 if (lane == CommandLane::kObservation &&
                     command.observation_cursor_supplied) {
@@ -10685,7 +10816,9 @@ private:
                 } else {
                   response =
                       lane == CommandLane::kStop
-                          ? ExecuteStop(command, *composition_access_.current)
+                          ? ExecuteStop(command,
+                                        *composition_access_.current->runtime
+                                             ->addressed_kernel)
                           : Execute(command, *composition_access_.current);
                 }
               }

@@ -11,8 +11,9 @@ namespace manyforge::component_manager {
 
 namespace detail {
 
-/// One Manager-wide retry latch. A failed exact batch blocks every receiver
-/// until all partial renewals have had a full expiry interval to contain.
+/// One native-batch retry latch. An indeterminate failure inside the exact
+/// native batch blocks retries until partial renewals have expired. Failures
+/// before that batch or in a separately addressed receiver retry normally.
 class ManagerLivenessRetryGate final {
  public:
   [[nodiscard]] bool attempt_allowed(const std::uint64_t now_ns) const noexcept {

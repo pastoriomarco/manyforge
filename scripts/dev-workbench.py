@@ -1129,8 +1129,23 @@ class Workbench:
             self.processes,
         )
 
-        with HeadlessHttpClient(base_url, timeout_seconds=1.0) as client:
-            startup_cycle_state = _startup_cycle_state(client)
+        def contained_startup_cycle() -> str | None:
+            with HeadlessHttpClient(base_url, timeout_seconds=0.5) as client:
+                try:
+                    return _startup_cycle_state(client)
+                except WorkbenchError:
+                    # Manager rebuilds the exact retained native product on its
+                    # existing asynchronous builder lane.  A replacement Runner
+                    # stays fenced until that product can certify containment;
+                    # treat the intervening active state as startup progress,
+                    # never as permission to continue the old run.
+                    return None
+
+        startup_cycle_state = _wait_until(
+            "contained Program-cycle startup reconciliation",
+            contained_startup_cycle,
+            self.processes,
+        )
 
         def authoring_ready() -> dict[str, Any] | None:
             with HeadlessHttpClient(base_url, timeout_seconds=0.5) as client:
@@ -1292,9 +1307,12 @@ class Workbench:
                 status = client.request(
                     "GET", "/api/program/liveness/status"
                 )
+                cycle = client.program_cycle_status()
             return bool(
                 status.get("state") == "expired"
                 and status.get("command_fenced") is True
+                and cycle.get("state")
+                in {"idle_after_reset", "terminal_awaiting_reset"}
             )
 
         try:
@@ -1322,7 +1340,7 @@ class Workbench:
             process.wait(timeout=5)
 
     def close(self) -> None:
-        for name in ("Vite HMR", "Composer backend", "Headless API"):
+        for name in ("Vite HMR", "Composer backend"):
             for process_name, process in reversed(self.processes):
                 if process_name == name:
                     self._terminate(process)
@@ -1330,6 +1348,9 @@ class Workbench:
         self._wait_for_program_runner_manager_expiry()
         for process_name, process in reversed(self.processes):
             if process_name == "Program runner":
+                self._terminate(process)
+        for process_name, process in reversed(self.processes):
+            if process_name == "Headless API":
                 self._terminate(process)
         for name, process in reversed(self.processes):
             if name not in {

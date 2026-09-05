@@ -791,23 +791,25 @@ class FakeCore:
         return {"schema_version": "manyforge.headless_api_mutation_response.v1"}
 
     def history(self, **kwargs: Any) -> dict[str, Any]:
+        del kwargs
         return {
-            "schema_version": "manyforge.historian_page.v1",
+            "schema_version": "manyforge.historian_summary_page.v1",
             "events": [],
-            "query": kwargs,
+            "next_before_sequence": None,
+            "truncated": False,
         }
 
     def history_detail(self, sequence: int) -> dict[str, Any]:
         return {
-            "schema_version": "manyforge.historian_detail.v1",
+            "schema_version": "manyforge.historian_detail.v2",
             "sequence": sequence,
             "event": {
-                "schema_version": "manyforge.historian_event.v1",
+                "schema_version": "manyforge.historian_event.v2",
                 "event_id": "event-1",
                 "component": "manyforge.execution",
                 "event_type": "operation_updated",
                 "severity": "INFO",
-                "occurred_at_ns": 1,
+                "occurred_at_ns": "1",
                 "occurred_at_wall": "2026-08-28T00:00:00Z",
                 "payload": {},
             },
@@ -1902,6 +1904,64 @@ def test_runtime_manager_scene_alarm_history_and_health_are_thin_reads() -> None
         assert next(
             row for row in overview["components"] if row["id"] == "observe_render"
         )["status"] == "healthy"
+
+
+def test_component_overview_fact_capture_reads_each_source_once() -> None:
+    class CountingFactService:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def value(self, name: str) -> dict[str, Any]:
+            self.calls.append(name)
+            return {"source": name}
+
+        def runtime(self) -> dict[str, Any]:
+            return self.value("runtime")
+
+        def alarms(self, **kwargs: Any) -> dict[str, Any]:
+            assert kwargs == {"limit": 32, "ordering": "attention_newest"}
+            return self.value("alarms")
+
+        def authoring_admission(self) -> dict[str, Any]:
+            return self.value("authoring_admission")
+
+        def program_cycle_status(self) -> dict[str, Any]:
+            return self.value("program_cycle")
+
+        def program_applied(self) -> dict[str, Any]:
+            return self.value("applied_program")
+
+        def source_model(self) -> dict[str, Any]:
+            return self.value("source_model")
+
+        def execution_identity(self) -> dict[str, Any]:
+            return self.value("execution_identity")
+
+        def execution_targets(self) -> dict[str, Any]:
+            return self.value("execution_targets")
+
+        def execution_control_state(self) -> dict[str, Any]:
+            return self.value("execution_control")
+
+    service = CountingFactService()
+    exact_cycle = {"source": "program_stream"}
+    facts = HeadlessService.component_overview_facts(  # type: ignore[arg-type]
+        service,
+        program_cycle=exact_cycle,
+    )
+
+    assert facts.program_cycle is exact_cycle
+    assert service.calls == [
+        "runtime",
+        "alarms",
+        "authoring_admission",
+        "applied_program",
+        "source_model",
+        "execution_identity",
+        "execution_targets",
+        "execution_control",
+    ]
+    assert len(service.calls) == len(set(service.calls)) == 8
 
 
 def test_node_environment_joins_only_the_exact_applied_runner_offer() -> None:
@@ -3017,6 +3077,90 @@ def test_history_detail_is_an_exact_bounded_read() -> None:
     assert invalid.status_code == 422
 
 
+def test_history_list_is_summary_only_and_keeps_exact_detail_on_demand() -> None:
+    client, core, _manager = _client()
+    large_payload = {
+        "message": "Control connection stale",
+        "program_run_id": "program-run.7",
+        "nested": {
+            "operation_id": "operation.9",
+            "diagnostic_blob": "x" * 32_000,
+        },
+    }
+
+    def history(**_kwargs: Any) -> dict[str, Any]:
+        return {
+            "schema_version": "manyforge.historian_summary_page.v1",
+            "events": [
+                {
+                    "sequence": 7,
+                    "event": {
+                        "schema_version": "manyforge.historian_event_summary.v1",
+                        "event_id": "event-7",
+                        "component": "manyforge.composer",
+                        "event_type": "client_incident_activated",
+                        "severity": "ERROR",
+                        "occurred_at_ns": "9007199254740992",
+                        "occurred_at_wall": "2026-09-04T10:00:00Z",
+                        "message": "Control connection stale",
+                        "program_run_id": "program-run.7",
+                        "operation_id": "operation.9",
+                        "condition_id": None,
+                    },
+                }
+            ],
+            "next_before_sequence": 7,
+            "truncated": True,
+        }
+
+    def history_detail(sequence: int) -> dict[str, Any]:
+        return {
+            "schema_version": "manyforge.historian_detail.v2",
+            "sequence": sequence,
+            "event": {
+                "schema_version": "manyforge.historian_event.v2",
+                "event_id": "event-7",
+                "component": "manyforge.composer",
+                "event_type": "client_incident_activated",
+                "severity": "ERROR",
+                "occurred_at_ns": "9007199254740992",
+                "occurred_at_wall": "2026-09-04T10:00:00Z",
+                "payload": large_payload,
+            },
+            "sections": {
+                name: {"available": False, "reason": "not published", "value": None}
+                for name in ("incident", "execution_digest", "blackboard", "latency")
+            },
+        }
+
+    core.history = history  # type: ignore[method-assign]
+    core.history_detail = history_detail  # type: ignore[method-assign]
+    with client:
+        response = client.get("/api/execution/history?limit=32")
+        detail = client.get("/api/execution/history/7")
+
+    assert response.status_code == 200, response.text
+    page = response.json()
+    assert page["schema_version"] == "manyforge.historian_summary_page.v1"
+    assert len(response.content) < 2_048
+    assert "payload" not in page["events"][0]["event"]
+    assert page["events"][0]["event"] == {
+        "schema_version": "manyforge.historian_event_summary.v1",
+        "event_id": "event-7",
+        "component": "manyforge.composer",
+        "event_type": "client_incident_activated",
+        "severity": "ERROR",
+        "occurred_at_ns": "9007199254740992",
+        "occurred_at_wall": "2026-09-04T10:00:00Z",
+        "message": "Control connection stale",
+        "program_run_id": "program-run.7",
+        "operation_id": "operation.9",
+        "condition_id": None,
+    }
+    assert detail.status_code == 200
+    assert detail.json()["event"]["payload"] == large_payload
+
+
 def test_openapi_contains_no_condition_mutation_route() -> None:
     client, _core, _manager = _client()
     with client:
@@ -3032,6 +3176,7 @@ def test_openapi_contains_no_condition_mutation_route() -> None:
     assert "/api/assistant/modes/{mode_id}" in paths
     assert "/api/assistant/modes/{mode_id}/context" in paths
     assert {
+        "/api/control/diagnostics",
         "/api/execution/diagnostics",
         "/api/execution/identity",
         "/api/execution/targets",
@@ -3073,6 +3218,27 @@ def test_execution_diagnostics_is_explicit_and_status_is_only_compatibility() ->
         "ok": True,
         "command": "status",
         "status": {},
+    }
+
+
+def test_control_diagnostics_are_bounded_and_do_not_start_source_work() -> None:
+    client, _core, _manager = _client()
+    with client:
+        diagnostics = client.get("/api/control/diagnostics")
+
+    assert diagnostics.status_code == 200
+    value = diagnostics.json()
+    assert value["schema_version"] == "manyforge.control_plane_diagnostics.v1"
+    assert value["active_clients"] == 0
+    assert value["owner_reads"] == 0
+    assert value["reductions"] == 0
+    assert value["messages_sent"] == {
+        "server_hello": 0,
+        "heartbeat_challenge": 0,
+        "snapshot": 0,
+        "delta": 0,
+        "command_receipt": 0,
+        "resync_required": 0,
     }
 
 

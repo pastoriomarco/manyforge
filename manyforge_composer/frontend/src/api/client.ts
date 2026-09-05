@@ -7,14 +7,10 @@ import {
   parseDeploymentWorkspaceResponse,
   parseFileBrowserResponse,
   parseHealthResponse,
-  parseHeadlessRuntimeSnapshot,
   parseHistorianPage,
   parseHistorianDetail,
-  parseExecutionOwnerStatus,
   parseExecutionIdentity,
-  parseExecutionControlStatus,
   parseManagerApplyResponse,
-  parseManagerApplyStatusResponse,
   parseManagerDeploymentCandidatePreviewResponse,
   parseManagerDiffProjection,
   parseManagerGraphProjection,
@@ -22,22 +18,10 @@ import {
   parseMotionPreviewResponse,
   parseNodeEnvironmentResponse,
   parseObjectResponse,
-  parseOperationAcceptance,
-  parseOperationObservation,
-  parseRuntimeScaleControlAccepted,
-  parseRuntimeScaleControlStatus,
-  parseOperatorAlarmSnapshot,
   parseProgramWorkspaceResponse,
   parseProgramWorkspaceTransitionResponse,
   parseCurrentScenarioResponse,
-  parseProgramCycleResetResult,
-  parseProgramCycleStatus,
-  parseProgramRuntimeControlProjection,
-  parseProgramRuntimeControlResult,
-  parseCycleRecoveryActionResult,
   parseRuntimeOverrideMaterializationResponse,
-  parseProgramRunIndex,
-  parseProgramRunStatus,
   parseScenarioCatalogResponse,
   parseSceneTransactionResponse,
   parseSceneMeshAssetMetadata,
@@ -72,7 +56,6 @@ import type {
   HealthResponse,
   JsonValue,
   ManagerApplyResponse,
-  ManagerApplyStatusResponse,
   NodeEnvironmentResponse,
   ManagerDiffProjection,
   ManagerGraphProjection,
@@ -80,14 +63,7 @@ import type {
   ProgramWorkspaceResponse,
   ProgramWorkspaceTransitionResponse,
   CurrentScenarioResponse,
-  ProgramCycleResetResult,
-  ProgramCycleStatus,
-  ProgramRuntimeControlProjection,
-  ProgramRuntimeControlResult,
-  CycleRecoveryActionResult,
   RuntimeOverrideMaterializationResponse,
-  ProgramRunIndex,
-  ProgramRunStatus,
   ScenarioCatalogResponse,
   SceneTransactionRequest,
   SceneTransactionResponse,
@@ -98,22 +74,15 @@ import type {
 } from '../types/api';
 import type {
   AlarmMembership,
-  HeadlessRuntimeSnapshot,
   HistorianPage,
   HistorianDetail,
   OperatorAlarmRecord,
-  OperatorAlarmSnapshot,
 } from '../types/headless';
 import type {
   CapabilityCommandPreviewReceipt,
   DirectControlOperationIntent,
-  ExecutionOwnerStatus,
   ExecutionIdentity,
   MotionPreviewReceipt,
-  OperationAcceptance,
-  OperationObservation,
-  RuntimeScaleControlAccepted,
-  RuntimeScaleControlStatus,
 } from '../types/robotControl';
 import type {
   AssistantModeIndex,
@@ -131,8 +100,8 @@ import type {
 } from '../types/cclc';
 
 export interface HistorianListQuery {
-  startNs?: number;
-  endNs?: number;
+  startNs?: string;
+  endNs?: string;
   components?: string[];
   eventTypes?: string[];
   beforeSequence?: number;
@@ -141,6 +110,17 @@ export interface HistorianListQuery {
 
 export const HISTORIAN_PAGE_LIMIT = 32;
 
+function historianNanoseconds(value: string, label: string): string {
+  if (
+    value.length > 19
+    || !/^(0|[1-9]\d*)$/.test(value)
+    || BigInt(value) > 9_223_372_036_854_775_807n
+  ) {
+    throw new Error(`${label} must be a canonical nonnegative int64 decimal string`);
+  }
+  return value;
+}
+
 export function historianListPath(query: HistorianListQuery = {}): string {
   const limit = query.limit ?? HISTORIAN_PAGE_LIMIT;
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > HISTORIAN_PAGE_LIMIT) {
@@ -148,8 +128,12 @@ export function historianListPath(query: HistorianListQuery = {}): string {
   }
   const parameters = new URLSearchParams();
   parameters.set('limit', String(limit));
-  if (query.startNs !== undefined) parameters.set('start_ns', String(query.startNs));
-  if (query.endNs !== undefined) parameters.set('end_ns', String(query.endNs));
+  if (query.startNs !== undefined) {
+    parameters.set('start_ns', historianNanoseconds(query.startNs, 'History start'));
+  }
+  if (query.endNs !== undefined) {
+    parameters.set('end_ns', historianNanoseconds(query.endNs, 'History end'));
+  }
   if (query.beforeSequence !== undefined) {
     parameters.set('before_sequence', String(query.beforeSequence));
   }
@@ -159,27 +143,6 @@ export function historianListPath(query: HistorianListQuery = {}): string {
 }
 
 const BASE_URL = import.meta.env.VITE_API_URL || '';
-
-interface ExecutionTargetsCache {
-  identity: string;
-  projection: unknown;
-}
-
-let executionTargetsCache: ExecutionTargetsCache | null = null;
-
-function executionProjectionIdentityKey(value: unknown): string | null {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    return null;
-  }
-  const identity = (value as Record<string, unknown>).identity;
-  if (identity === null || typeof identity !== 'object' || Array.isArray(identity)) {
-    return null;
-  }
-  // Native responses use canonical JSON, so the exact owner/product identity
-  // has stable key order. This key is only a cache hint; the strict parser
-  // below still validates and compares both complete identities before use.
-  return JSON.stringify(identity);
-}
 
 export function resolveStructuralAssetUrl(path: string): string {
   if (/^https?:\/\//i.test(path) || path.startsWith('blob:')) {
@@ -688,135 +651,6 @@ export const api = {
       requestJson('/api/scenarios/current', parseCurrentScenarioResponse, signal),
     applied: (signal?: AbortSignal): Promise<AppliedProgramSelection> =>
       requestJson('/api/program/applied', parseAppliedProgramSelection, signal),
-    runs: (
-      activeOnly = false,
-      limit = 128,
-      signal?: AbortSignal,
-    ): Promise<ProgramRunIndex> => {
-      const params = new URLSearchParams({
-        active_only: activeOnly ? 'true' : 'false',
-        limit: String(limit),
-      });
-      return requestJson(
-        `/api/program/runs?${params.toString()}`,
-        parseProgramRunIndex,
-        signal,
-      );
-    },
-    start: (
-      body: Record<string, JsonValue>,
-      signal?: AbortSignal,
-    ): Promise<ProgramRunStatus> => requestJson(
-      '/api/program/runs',
-      parseProgramRunStatus,
-      signal,
-      { method: 'POST', body: JSON.stringify(body) },
-    ),
-    read: (
-      programRunId: string,
-      signal?: AbortSignal,
-    ): Promise<ProgramRunStatus> => requestJson(
-      `/api/program/runs/${encodeURIComponent(programRunId)}`,
-      parseProgramRunStatus,
-      signal,
-    ),
-    stop: (
-      programRunId: string,
-      body: Record<string, JsonValue>,
-      signal?: AbortSignal,
-    ): Promise<ProgramRunStatus> => requestJson(
-      `/api/program/runs/${encodeURIComponent(programRunId)}/stop`,
-      parseProgramRunStatus,
-      signal,
-      { method: 'POST', body: JSON.stringify(body) },
-    ),
-    stopMotion: (
-      programRunId: string,
-      body: Record<string, JsonValue>,
-      signal?: AbortSignal,
-    ): Promise<ProgramRunStatus> => requestJson(
-      `/api/program/runs/${encodeURIComponent(programRunId)}/motion-stop`,
-      parseProgramRunStatus,
-      signal,
-      { method: 'POST', body: JSON.stringify(body) },
-    ),
-    fullStop: (
-      programRunId: string,
-      body: Record<string, JsonValue>,
-      signal?: AbortSignal,
-    ): Promise<ProgramRunStatus> => requestJson(
-      `/api/program/runs/${encodeURIComponent(programRunId)}/full-stop`,
-      parseProgramRunStatus,
-      signal,
-      { method: 'POST', body: JSON.stringify(body) },
-    ),
-    resumeFullStop: (
-      programRunId: string,
-      body: Record<string, JsonValue>,
-      signal?: AbortSignal,
-    ): Promise<ProgramRunStatus> => requestJson(
-      `/api/program/runs/${encodeURIComponent(programRunId)}/resume-full-stop`,
-      parseProgramRunStatus,
-      signal,
-      { method: 'POST', body: JSON.stringify(body) },
-    ),
-    resetFullStop: (
-      programRunId: string,
-      body: Record<string, JsonValue>,
-      signal?: AbortSignal,
-    ): Promise<ProgramCycleResetResult> => requestJson(
-      `/api/program/runs/${encodeURIComponent(programRunId)}/reset`,
-      parseProgramCycleResetResult,
-      signal,
-      { method: 'POST', body: JSON.stringify(body) },
-    ),
-    resetCycle: (
-      body: Record<string, JsonValue>,
-      signal?: AbortSignal,
-    ): Promise<ProgramCycleResetResult> => requestJson(
-      '/api/program/cycle/reset',
-      parseProgramCycleResetResult,
-      signal,
-      { method: 'POST', body: JSON.stringify(body) },
-    ),
-    cycleStatus: (signal?: AbortSignal): Promise<ProgramCycleStatus> => requestJson(
-      '/api/cycle/status',
-      parseProgramCycleStatus,
-      signal,
-    ),
-    runtimeControls: (
-      programRunId: string,
-      signal?: AbortSignal,
-    ): Promise<ProgramRuntimeControlProjection> => requestJson(
-      `/api/program/runs/${encodeURIComponent(programRunId)}/runtime-controls`,
-      parseProgramRuntimeControlProjection,
-      signal,
-    ),
-    runtimeControlAction: (
-      programRunId: string,
-      action: 'runtime-overrides'
-        | 'runtime-overrides/activate'
-        | 'runtime-overrides/clear'
-        | 'runtime-overrides/promote'
-        | 'blackboard-values'
-        | 'manual-result',
-      body: Record<string, JsonValue>,
-      signal?: AbortSignal,
-    ): Promise<ProgramRuntimeControlResult> => requestJson(
-      `/api/program/runs/${encodeURIComponent(programRunId)}/${action}`,
-      parseProgramRuntimeControlResult,
-      signal,
-      { method: 'POST', body: JSON.stringify(body) },
-    ),
-    applyRecoveryAction: (
-      body: Record<string, JsonValue>,
-      signal?: AbortSignal,
-    ): Promise<CycleRecoveryActionResult> => requestJson(
-      '/api/cycle/recovery-actions',
-      parseCycleRecoveryActionResult,
-      signal,
-      { method: 'POST', body: JSON.stringify(body) },
-    ),
   },
   manager: {
     status: (signal?: AbortSignal): Promise<ManagerStatusProjection> => requestJson(
@@ -861,27 +695,6 @@ export const api = {
       signal,
       { method: 'POST', body: JSON.stringify(request) },
     ),
-    applyStatus: (
-      applyId: string,
-      applyGeneration: number,
-      signal?: AbortSignal,
-    ): Promise<ManagerApplyStatusResponse> => requestJson(
-      `/api/manager/apply/status?${new URLSearchParams({
-        apply_id: applyId,
-        apply_generation: String(applyGeneration),
-      }).toString()}`,
-      (value) => {
-        const response = parseManagerApplyStatusResponse(value);
-        if (
-          response.applyId !== applyId
-          || response.applyGeneration !== applyGeneration
-        ) {
-          throw new Error('Manager Apply status changed durable identity');
-        }
-        return response;
-      },
-      signal,
-    ),
   },
   files: {
     browse: (
@@ -907,10 +720,6 @@ export const api = {
         parseSceneUrdfManifest,
         signal,
       ),
-  },
-  runtime: {
-    get: (signal?: AbortSignal): Promise<HeadlessRuntimeSnapshot> =>
-      requestJson('/api/runtime', parseHeadlessRuntimeSnapshot, signal),
   },
   assistant: {
     modes: (signal?: AbortSignal): Promise<AssistantModeIndex> =>
@@ -996,51 +805,6 @@ export const api = {
       requestJson(
         '/api/execution/identity',
         parseExecutionIdentity,
-        signal,
-      ),
-    controlStatus: async (
-      signal?: AbortSignal,
-    ): Promise<ExecutionOwnerStatus> => {
-      const controlState = await requestJson(
-        '/api/execution/control-state',
-        (value) => value,
-        signal,
-      );
-      const controlIdentity = executionProjectionIdentityKey(controlState);
-      if (executionTargetsCache?.identity !== controlIdentity) {
-        executionTargetsCache = null;
-      }
-      let targets = executionTargetsCache?.identity === controlIdentity
-        ? executionTargetsCache.projection
-        : null;
-      if (targets === null) {
-        targets = await requestJson(
-          '/api/execution/targets',
-          (value) => value,
-          signal,
-        );
-      }
-      const status = parseExecutionControlStatus(targets, controlState);
-      const targetIdentity = executionProjectionIdentityKey(targets);
-      if (
-        executionTargetsCache === null
-        && targetIdentity !== null
-        && targetIdentity === controlIdentity
-      ) {
-        // Only a complete, strictly parsed target projection is stable enough
-        // to reuse. A malformed response must be retried, never made sticky.
-        executionTargetsCache = {
-          identity: targetIdentity,
-          projection: targets,
-        };
-      }
-      return status;
-    },
-    /** Explicit cold-path aggregate; ordinary UI flows use scoped views. */
-    diagnostics: (signal?: AbortSignal): Promise<ExecutionOwnerStatus> =>
-      requestJson(
-        '/api/execution/diagnostics',
-        parseExecutionOwnerStatus,
         signal,
       ),
     previewMotion: (
@@ -1145,250 +909,8 @@ export const api = {
       signal,
       { method: 'POST', body: JSON.stringify(intent) },
     ),
-    submit: (
-      intent: DirectControlOperationIntent,
-      signal?: AbortSignal,
-    ): Promise<OperationAcceptance> => requestJson(
-      '/api/execution/operations',
-      (value) => {
-        const accepted = parseOperationAcceptance(value);
-        if (accepted.requestId !== intent.request_context.request_id) {
-          throw new Error('operation acceptance does not match its request');
-        }
-        return accepted;
-      },
-      signal,
-      { method: 'POST', body: JSON.stringify(intent) },
-    ),
-    read: (
-      operationId: string,
-      signal?: AbortSignal,
-    ): Promise<OperationObservation> => requestJson(
-      `/api/execution/operations/${encodeURIComponent(operationId)}`,
-      (value) => {
-        const observation = parseOperationObservation(value);
-        if (observation.operationId !== operationId) {
-          throw new Error('operation observation does not match its request');
-        }
-        return observation;
-      },
-      signal,
-    ),
-    pause: (
-      ownerEpoch: string,
-      operation: OperationObservation,
-      requestId: string,
-      signal?: AbortSignal,
-    ): Promise<Record<string, unknown>> => requestJson(
-      `/api/execution/operations/${encodeURIComponent(operation.operationId)}/pause`,
-      parseObjectResponse,
-      signal,
-      {
-        method: 'POST',
-        body: JSON.stringify({
-          request_context: {
-            request_id: requestId,
-            request_owner_epoch: ownerEpoch,
-            source_label: 'composer_ui',
-            correlation_id: null,
-          },
-          operation_id: operation.operationId,
-          expected_operation_revision: operation.operationRevision,
-          reason: 'operator Robot Control pause',
-        }),
-      },
-    ),
-    resume: (
-      ownerEpoch: string,
-      operation: OperationObservation,
-      requestId: string,
-      signal?: AbortSignal,
-    ): Promise<Record<string, unknown>> => requestJson(
-      `/api/execution/operations/${encodeURIComponent(operation.operationId)}/resume`,
-      parseObjectResponse,
-      signal,
-      {
-        method: 'POST',
-        body: JSON.stringify({
-          request_context: {
-            request_id: requestId,
-            request_owner_epoch: ownerEpoch,
-            source_label: 'composer_ui',
-            correlation_id: null,
-          },
-          operation_id: operation.operationId,
-          expected_operation_revision: operation.operationRevision,
-          reason: 'operator Robot Control resume',
-        }),
-      },
-    ),
-    acknowledgeCompleted: (
-      ownerEpoch: string,
-      operationId: string,
-      operationRevision: number,
-      requestId: string,
-      signal?: AbortSignal,
-    ): Promise<Record<string, unknown>> => requestJson(
-      `/api/execution/operations/${encodeURIComponent(operationId)}/acknowledge-completed`,
-      parseObjectResponse,
-      signal,
-      {
-        method: 'POST',
-        body: JSON.stringify({
-          request_context: {
-            request_id: requestId,
-            request_owner_epoch: ownerEpoch,
-            source_label: 'composer_ui',
-            correlation_id: null,
-          },
-          operation_id: operationId,
-          expected_operation_revision: operationRevision,
-          reason: 'settle completed Robot Control operation',
-        }),
-      },
-    ),
-    resetOperation: (
-      ownerEpoch: string,
-      operationId: string,
-      operationRevision: number,
-      requestId: string,
-      signal?: AbortSignal,
-    ): Promise<Record<string, unknown>> => requestJson(
-      `/api/execution/operations/${encodeURIComponent(operationId)}/reset`,
-      parseObjectResponse,
-      signal,
-      {
-        method: 'POST',
-        body: JSON.stringify({
-          request_context: {
-            request_id: requestId,
-            request_owner_epoch: ownerEpoch,
-            source_label: 'composer_ui',
-            correlation_id: null,
-          },
-          operation_id: operationId,
-          expected_operation_revision: operationRevision,
-          reason: 'settle terminal Robot Control operation',
-        }),
-      },
-    ),
-    runtimeScaleControl: (
-      selector: RuntimeScaleControlStatus['selector'],
-      signal?: AbortSignal,
-    ): Promise<RuntimeScaleControlStatus> => {
-      const query = new URLSearchParams({
-        program_binding_id: selector.programBindingId,
-        component_role_id: selector.componentRoleId,
-        target_role_id: selector.targetRoleId,
-      });
-      return requestJson(
-        `/api/execution/runtime-scale-control?${query.toString()}`,
-        parseRuntimeScaleControlStatus,
-        signal,
-      );
-    },
-    setRuntimeScaleControl: (
-      ownerEpoch: string,
-      status: RuntimeScaleControlStatus,
-      scale: number,
-      requestId: string,
-      signal?: AbortSignal,
-    ): Promise<RuntimeScaleControlAccepted> => requestJson(
-      '/api/execution/runtime-scale-control',
-      parseRuntimeScaleControlAccepted,
-      signal,
-      {
-        method: 'POST',
-        body: JSON.stringify({
-          request_context: {
-            request_id: requestId,
-            request_owner_epoch: ownerEpoch,
-            source_label: 'composer_ui',
-            correlation_id: null,
-          },
-          selector: {
-            program_binding_id: status.selector.programBindingId,
-            component_role_id: status.selector.componentRoleId,
-            target_role_id: status.selector.targetRoleId,
-          },
-          expected_control_generation: status.controlGeneration,
-          scale,
-        }),
-      },
-    ),
-    stop: (
-      ownerEpoch: string,
-      operation: OperationObservation,
-      requestId: string,
-      signal?: AbortSignal,
-    ): Promise<Record<string, unknown>> => requestJson(
-      '/api/execution/stops',
-      parseObjectResponse,
-      signal,
-      {
-        method: 'POST',
-        body: JSON.stringify({
-          request_context: {
-            request_id: requestId,
-            request_owner_epoch: ownerEpoch,
-            source_label: 'composer_ui',
-            correlation_id: null,
-          },
-          operations: [{
-            operation_id: operation.operationId,
-            expected_operation_revision: operation.operationRevision,
-            expected_stop_generation: operation.activeStopGeneration ?? 0,
-          }],
-          reason: 'operator Robot Control Stop',
-        }),
-      },
-    ),
-    fullStop: (
-      ownerEpoch: string,
-      expectedStopGeneration: number,
-      requestId: string,
-      signal?: AbortSignal,
-    ): Promise<Record<string, unknown>> => requestJson(
-      '/api/execution/full-stop',
-      parseObjectResponse,
-      signal,
-      {
-        method: 'POST',
-        body: JSON.stringify({
-          request_context: {
-            request_id: requestId,
-            request_owner_epoch: ownerEpoch,
-            source_label: 'composer_ui',
-            correlation_id: null,
-          },
-          expected_stop_generation: expectedStopGeneration,
-        }),
-      },
-    ),
-    stopFault: (
-      signal?: AbortSignal,
-    ): Promise<Record<string, unknown>> => requestJson(
-      '/api/execution/stop-fault',
-      parseObjectResponse,
-      signal,
-    ),
-    recoverStopFault: (
-      intent: Record<string, JsonValue>,
-      signal?: AbortSignal,
-    ): Promise<Record<string, unknown>> => requestJson(
-      '/api/execution/stop-fault/recover',
-      parseObjectResponse,
-      signal,
-      { method: 'POST', body: JSON.stringify(intent) },
-    ),
   },
   alarms: {
-    list: (signal?: AbortSignal): Promise<OperatorAlarmSnapshot> =>
-      requestJson(
-        '/api/execution/alarms?limit=32&ordering=attention_newest',
-        parseOperatorAlarmSnapshot,
-        signal,
-      ),
     acknowledge: (
       alarm: OperatorAlarmRecord,
       ownerEpoch: string,

@@ -692,9 +692,9 @@ def _composer_snapshot_stream(
         websocket.send(
             json.dumps(
                 {
-                    "schema_version": "manyforge.execution_control.v1",
+                    "schema_version": "manyforge.execution_control.v2",
                     "message_kind": "client_hello",
-                    "supported_versions": ["manyforge.execution_control.v1"],
+                    "supported_versions": ["manyforge.execution_control.v2"],
                     "client_incarnation": f"process-test.{client_id}",
                     "source_label": "process_test",
                 }
@@ -706,6 +706,7 @@ def _composer_snapshot_stream(
         client_sequence = 0
         stopped = Event()
         current_shell: Queue[dict | BaseException] = Queue(maxsize=1)
+        applied_shell: dict | None = None
 
         def publish(value: dict | BaseException) -> None:
             try:
@@ -715,7 +716,7 @@ def _composer_snapshot_stream(
             current_shell.put_nowait(value)
 
         def receive() -> None:
-            nonlocal client_sequence
+            nonlocal applied_shell, client_sequence
             try:
                 while not stopped.is_set():
                     try:
@@ -729,7 +730,7 @@ def _composer_snapshot_stream(
                             json.dumps(
                                 {
                                     "schema_version": (
-                                        "manyforge.execution_control.v1"
+                                        "manyforge.execution_control.v2"
                                     ),
                                     "message_kind": "heartbeat_echo",
                                     "control_session_id": control_session_id,
@@ -741,13 +742,40 @@ def _composer_snapshot_stream(
                             )
                         )
                         continue
+                    kind = last_payload.get("message_kind")
                     shell = last_payload.get("shell")
-                    if (
-                        last_payload.get("message_kind") in {"snapshot", "delta"}
-                        and isinstance(shell, dict)
-                        and shell.get("complete") is True
+                    if kind not in {"snapshot", "delta"} or not isinstance(
+                        shell, dict
                     ):
-                        publish(shell)
+                        continue
+                    if kind == "snapshot":
+                        assert shell.get("complete") is True
+                        applied_shell = dict(shell)
+                    else:
+                        assert applied_shell is not None
+                        assert shell.get("complete") is False
+                        applied_shell.update(
+                            {
+                                name: value
+                                for name, value in shell.items()
+                                if name != "complete"
+                            }
+                        )
+                    state_sequence = last_payload.get("state_sequence")
+                    if state_sequence is not None:
+                        websocket.send(
+                            json.dumps(
+                                {
+                                    "schema_version": (
+                                        "manyforge.execution_control.v2"
+                                    ),
+                                    "message_kind": "state_applied",
+                                    "control_session_id": control_session_id,
+                                    "state_sequence": state_sequence,
+                                }
+                            )
+                        )
+                    publish(dict(applied_shell))
             except BaseException as error:
                 if not stopped.is_set():
                     publish(error)
@@ -1773,7 +1801,7 @@ def test_manager_api_cli_and_replacements_preserve_headless_owners(
             "source-model": "manyforge.source_model_projection.v2",
             "scene": "manyforge.scene_projection.v1",
             "alarms": "manyforge.operator_alarm_snapshot.v2",
-            "history": "manyforge.historian_page.v1",
+            "history": "manyforge.historian_summary_page.v1",
         }
         cli_payloads: dict[str, dict] = {}
         for cli_operation, expected_schema in cli_reads.items():

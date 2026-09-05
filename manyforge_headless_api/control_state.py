@@ -1,4 +1,4 @@
-"""Demand-driven current-state source for the UI6-F control session.
+"""Demand-driven current-state source for the UI6-G control session.
 
 The source is deliberately small: Program Runner wakes it through one private
 revision stream, filesystem owners wake one cold-combine bit, and each browser
@@ -9,11 +9,14 @@ semantic owner.
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from functools import partial
 import json
 from pathlib import Path
-from typing import Any, Iterable
+import time
+from typing import Any, Callable, Iterable
 
 from watchfiles import awatch
 from websockets.asyncio.client import connect as connect_websocket
@@ -26,12 +29,14 @@ from .control_protocol import (
     EXECUTION_CONTROL_PROJECTION_SCHEMA,
     ExecutionControlProjectionDTO,
 )
+from .component_overview import ComponentOverviewFacts
 from .execution_control import ExecutionControlIngress
 from .native import HeadlessApiError, strict_json_object
 from .service import HeadlessService
 
 
 _PROGRAM_CONTROL_STATE_SCHEMA = "manyforge.program_control_state.v1"
+_MAXIMUM_ACTIVE_CLIENT_INCIDENTS = CONTROL_MAXIMUM_CLIENTS * 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,45 +58,14 @@ class ControlStateUnavailableError(RuntimeError):
     """The owner inputs do not yet form one coherent control snapshot."""
 
 
-def _overview_basis_matches(
-    overview: dict[str, Any],
-    runtime: dict[str, Any],
-    alarms: dict[str, Any],
-    authoring: dict[str, Any],
-    cycle: dict[str, Any],
-) -> bool:
-    basis = overview.get("basis")
-    sections = runtime.get("sections")
-    if not isinstance(basis, dict) or not isinstance(sections, dict):
-        return False
+@dataclass(frozen=True, slots=True)
+class ControlSemanticContext:
+    """Cached semantic availability used by heartbeat without owner reads."""
 
-    def source(name: str) -> dict[str, Any]:
-        value = sections.get(name)
-        return value if isinstance(value, dict) else {}
-
-    expected = {
-        "runtime_projection_owner_epoch": runtime.get("projection_owner_epoch"),
-        "manager_source_owner_epoch": source("manager").get("source_owner_epoch"),
-        "logical_scene_source_owner_epoch": source("logical_scene").get(
-            "source_owner_epoch"
-        ),
-        "logical_scene_source_generation": source("logical_scene").get(
-            "source_generation"
-        ),
-        "scene_runtime_source_owner_epoch": source("scene_runtime").get(
-            "source_owner_epoch"
-        ),
-        "scene_runtime_source_generation": source("scene_runtime").get(
-            "source_generation"
-        ),
-        "alarm_owner_epoch": alarms.get("owner_epoch"),
-        "alarm_generation": alarms.get("generation"),
-        "alarm_state_revision": alarms.get("state_revision"),
-        "admission_generation": authoring.get("admission_generation"),
-        "program_runner_owner_epoch": cycle.get("program_runner_owner_epoch"),
-        "program_cycle_generation": cycle.get("cycle_generation"),
-    }
-    return all(basis.get(key) == value for key, value in expected.items())
+    status: str
+    reason: str | None
+    semantic_owner_epoch: str | None = None
+    execution_control_revision: int | None = None
 
 
 def _meaningful_runtime_key(runtime: dict[str, Any]) -> tuple[Any, ...]:
@@ -121,54 +95,142 @@ def _meaningful_runtime_key(runtime: dict[str, Any]) -> tuple[Any, ...]:
         tuple(runtime.get("unavailable_sections", ())),
         source("manager", False),
         source("logical_scene", True),
-        source("scene_runtime", True),
+        # Scene-runtime generations also advance for high-rate pose samples.
+        # Initialization/error meaning remains in the rest of the section;
+        # motion itself belongs to the capacity-one Viewer stream.
+        source("scene_runtime", False),
     )
+
+
+def _meaningful_alarm_key(alarms: dict[str, Any]) -> str:
+    """Exclude recorder time/counters that do not change alarm meaning."""
+
+    payload = {
+        key: value
+        for key, value in alarms.items()
+        if key not in {"state_revision", "timestamp_ns"}
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _meaningful_overview_key(overview: dict[str, Any]) -> str:
+    """Compare operator status, not reduction/publication bookkeeping."""
+
+    payload = {
+        key: value
+        for key, value in overview.items()
+        if key not in {"overview_revision", "basis"}
+    }
+    components = payload.get("components")
+    if isinstance(components, list):
+        payload["components"] = [
+            {
+                key: value
+                for key, value in row.items()
+                if key != "generation"
+            }
+            if isinstance(row, dict)
+            else row
+            for row in components
+        ]
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _meaningful_execution_control_key(control_response: Any) -> str:
+    """Keep control meaning while motion samples remain Viewer-only."""
+
+    control = (
+        dict(control_response) if isinstance(control_response, dict) else {}
+    )
+    state = control.get("control_state")
+    if isinstance(state, dict):
+        state = dict(state)
+        state.pop("observed_motion", None)
+        state.pop("observed_gripper", None)
+        control["control_state"] = state
+    return json.dumps(
+        control, sort_keys=True, separators=(",", ":")
+    )
+
+
+def control_shell_fact_key(shell: dict[str, Any], name: str) -> Any:
+    """Return one immutable domain's operator-relevant equality key."""
+
+    if name == "runtime":
+        return _meaningful_runtime_key(shell[name])
+    if name == "alarms":
+        return _meaningful_alarm_key(shell[name])
+    if name == "component_overview":
+        return _meaningful_overview_key(shell[name])
+    if name == "execution_targets":
+        return json.dumps(
+            shell.get(name), sort_keys=True, separators=(",", ":")
+        )
+    if name == "execution_control_state":
+        return _meaningful_execution_control_key(shell.get(name))
+    if name == "authoring_admission":
+        value = shell[name]
+        return (
+            value.get("authoring_allowed"),
+            value.get("admission_generation"),
+        )
+    if name == "program_cycle":
+        return json.dumps(
+            shell[name], sort_keys=True, separators=(",", ":")
+        )
+    return shell.get(name)
 
 
 def _shell_key(shell: dict[str, Any]) -> tuple[Any, ...]:
-    alarms = shell["alarms"]
-    authoring = shell["authoring_admission"]
-    overview = shell["component_overview"]
     return (
-        _meaningful_runtime_key(shell["runtime"]),
-        alarms.get("owner_epoch"),
-        alarms.get("generation"),
-        alarms.get("state_revision"),
-        authoring.get("authoring_allowed"),
-        authoring.get("admission_generation"),
-        json.dumps(
-            shell["execution_targets"], sort_keys=True, separators=(",", ":")
-        ),
-        json.dumps(
-            shell["execution_control_state"],
-            sort_keys=True,
-            separators=(",", ":"),
-        ),
-        json.dumps(overview, sort_keys=True, separators=(",", ":")),
+        control_shell_fact_key(shell, "runtime"),
+        control_shell_fact_key(shell, "alarms"),
+        control_shell_fact_key(shell, "authoring_admission"),
+        control_shell_fact_key(shell, "execution_targets"),
+        control_shell_fact_key(shell, "execution_control_state"),
+        control_shell_fact_key(shell, "component_overview"),
     )
 
 
-def _fresh_runtime_expiry_delay_ns(
-    runtime: dict[str, Any],
-    freshness_budget_ns: int,
-) -> int | None:
-    """Return the one next semantic freshness boundary, not a poll period."""
+def _source_file_semantic_key(path: Path) -> str | None:
+    """Identify owner meaning without treating its freshness pulse as state."""
 
-    sections = runtime.get("sections")
-    if not isinstance(sections, dict):
+    try:
+        source = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
         return None
-    remaining: list[int] = []
-    for value in sections.values():
-        if not isinstance(value, dict) or value.get("freshness") != "fresh":
-            continue
-        age_ns = value.get("receiver_age_ns")
-        if type(age_ns) is not int or age_ns < 0:
-            continue
-        # Native freshness remains valid at the budget and becomes stale one
-        # nanosecond later. A crossed boundary is reread once; it never starts
-        # a periodic retry loop.
-        remaining.append(max(1, freshness_budget_ns - age_ns + 1))
-    return min(remaining) if remaining else None
+    if not isinstance(source, dict):
+        return None
+    payload = source.get("payload")
+    if path.name == "manager-source.json" and isinstance(payload, dict):
+        # Manager's two observation counters prove native liveness but do not
+        # alter any operator-visible convergence or command decision.
+        runtime = payload.get("runtime")
+        if isinstance(runtime, dict):
+            observed = runtime.get("observed_units")
+            if isinstance(observed, list):
+                for row in observed:
+                    if isinstance(row, dict):
+                        row.pop("process_observation_sequence", None)
+                        row.pop("source_report_sequence", None)
+    elif path.name == "scene-runtime-source.json" and isinstance(payload, dict):
+        state = payload.get("state")
+        if isinstance(state, dict):
+            # Pose samples are Viewer/scene data, not control-shell health.
+            # Initialization state, identity, error, and counters still wake
+            # this cold path; individual samples and their observation time do
+            # not. A committed object pose also advances logical-scene, whose
+            # own source wake remains authoritative for scene presentation.
+            state.pop("pose_sources", None)
+            state.pop("updated_at_ns", None)
+    meaning = {
+        "api_version": source.get("api_version"),
+        "payload": payload,
+        "source_owner_epoch": source.get("source_owner_epoch"),
+        "source_owner_id": source.get("source_owner_id"),
+        "source_owner_kind": source.get("source_owner_kind"),
+    }
+    return json.dumps(meaning, sort_keys=True, separators=(",", ":"))
 
 
 def build_control_projection(
@@ -220,35 +282,192 @@ class HeadlessControlStateSource:
         *,
         program_runner_websocket_url: str | None,
         cold_watch_paths: Iterable[Path] = (),
+        cold_freshness_paths: Iterable[Path] = (),
         cold_freshness_budget_ns: int | None = None,
+        incident_recorder: Callable[..., dict[str, Any]] | None = None,
     ) -> None:
         self._service = service
         self._ingress = ingress
         self._runner_url = program_runner_websocket_url
         self._watch_paths = tuple(
-            dict.fromkeys(str(path) for path in cold_watch_paths if path.exists())
+            dict.fromkeys(Path(path) for path in cold_watch_paths)
+        )
+        self._watch_roots = tuple(
+            dict.fromkeys(path.parent for path in self._watch_paths)
+        )
+        self._freshness_paths = frozenset(
+            Path(path) for path in cold_freshness_paths
         )
         if cold_freshness_budget_ns is not None and cold_freshness_budget_ns < 1:
             raise ValueError("cold freshness budget must be positive")
         self._cold_freshness_budget_ns = cold_freshness_budget_ns
+        self._incident_recorder = incident_recorder
+        self._diagnostic_origin_ns = time.monotonic_ns()
+        self._diagnostics = {
+            "owner_reads": 0,
+            "reductions": 0,
+            "unchanged_reductions": 0,
+            "state_replacements": 0,
+            "bytes_sent": 0,
+            "heartbeat_challenges": 0,
+            "heartbeat_echoes": 0,
+            "delayed_transitions": 0,
+            "stale_transitions": 0,
+        }
+        self._publications = {"critical": 0, "node_progress": 0, "cold": 0}
+        self._messages = {
+            "server_hello": 0,
+            "heartbeat_challenge": 0,
+            "snapshot": 0,
+            "delta": 0,
+            "command_receipt": 0,
+            "resync_required": 0,
+        }
+        self._heartbeat_rtt_ns: deque[int] = deque(maxlen=256)
+        self._active_client_incidents: dict[
+            tuple[str, str], tuple[str, int, str]
+        ] = {}
         self._subscriptions: set[ControlStateSubscription] = set()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._runner_task: asyncio.Task[None] | None = None
         self._cold_task: asyncio.Task[None] | None = None
         self._watch_task: asyncio.Task[None] | None = None
         self._cold_expiry_handle: asyncio.TimerHandle | None = None
+        self._watch_keys: dict[Path, str | None] = {}
+        self._watch_fresh: dict[Path, bool] = {}
         self._lifecycle_lock = asyncio.Lock()
         self._closed = False
         self._generation = 0
         self._cycle: dict[str, Any] | None = None
+        self._facts: ComponentOverviewFacts | None = None
         self._shell: dict[str, Any] | None = None
         self._shell_key: tuple[Any, ...] | None = None
         self._cold_wake: asyncio.Event | None = None
         self._program_source_current = False
+        self._semantic_reason: str | None = None
 
     @property
     def active_clients(self) -> int:
         return len(self._subscriptions)
+
+    def diagnostics(self) -> dict[str, Any]:
+        """Return fixed-size control-plane counters without touching an owner."""
+
+        samples = sorted(self._heartbeat_rtt_ns)
+
+        def percentile(fraction: float) -> int | None:
+            if not samples:
+                return None
+            return samples[min(len(samples) - 1, int((len(samples) - 1) * fraction))]
+
+        return {
+            "schema_version": "manyforge.control_plane_diagnostics.v1",
+            "active_clients": len(self._subscriptions),
+            **self._diagnostics,
+            "publications": dict(self._publications),
+            "messages_sent": dict(self._messages),
+            "heartbeat_rtt_sample_count": len(samples),
+            "heartbeat_rtt_p50_ns": percentile(0.50),
+            "heartbeat_rtt_p95_ns": percentile(0.95),
+            "heartbeat_rtt_p99_ns": percentile(0.99),
+            "heartbeat_rtt_max_ns": samples[-1] if samples else None,
+        }
+
+    def record_message(self, kind: str, byte_count: int) -> None:
+        self._messages[kind] = self._messages.get(kind, 0) + 1
+        self._diagnostics["bytes_sent"] += byte_count
+        if kind == "heartbeat_challenge":
+            self._diagnostics["heartbeat_challenges"] += 1
+
+    def record_state_replacement(self) -> None:
+        self._diagnostics["state_replacements"] += 1
+
+    def record_heartbeat_echo(self, round_trip_ns: int) -> None:
+        self._diagnostics["heartbeat_echoes"] += 1
+        self._heartbeat_rtt_ns.append(max(0, round_trip_ns))
+
+    def record_delay_transition(self, stale: bool) -> None:
+        key = "stale_transitions" if stale else "delayed_transitions"
+        self._diagnostics[key] += 1
+
+    def record_incident(self, **record: Any) -> None:
+        """Schedule one sparse native enqueue outside transport hot paths.
+
+        The native recorder itself is the existing bounded asynchronous
+        Historian ingress. Scheduling that constant-time enqueue for the next
+        event-loop turn avoids both transport-path work and an additional
+        unbounded Python executor queue.
+        """
+
+        recorder = self._incident_recorder
+        loop = self._loop
+        if recorder is None or loop is None:
+            return
+        callback = partial(self._record_incident_now, recorder, record)
+        loop.call_soon(callback)
+
+    @staticmethod
+    def _record_incident_now(
+        recorder: Callable[..., dict[str, Any]], record: dict[str, Any]
+    ) -> None:
+        with suppress(Exception):
+            recorder(**record)
+
+    def record_client_incident_transition(
+        self,
+        *,
+        client_incarnation: str,
+        incident_id: str,
+        incident_kind: str,
+        phase: str,
+        control_session_id: str,
+        source_label: str,
+        occurrence_count: int,
+        maximum_delay_ns: int | None,
+        reason_code: str,
+        now_ns: int,
+    ) -> None:
+        """Aggregate a browser-only incident across socket reconnects."""
+
+        key = (client_incarnation, incident_id)
+        now = self.relative_monotonic_ns(now_ns)
+        if phase == "activated":
+            active = self._active_client_incidents.get(key)
+            if active is not None:
+                if active[0] != incident_kind:
+                    raise ValueError("client incident identity changed kind")
+                return
+            if len(self._active_client_incidents) >= _MAXIMUM_ACTIVE_CLIENT_INCIDENTS:
+                # This cache only correlates a later resolution; the activation
+                # is already durable. Expiring the oldest abandoned browser
+                # episode is safe and avoids a lifetime exhaustion counter.
+                oldest = next(iter(self._active_client_incidents))
+                self._active_client_incidents.pop(oldest)
+            self._active_client_incidents[key] = (incident_kind, now, source_label)
+            first = now
+        else:
+            active = self._active_client_incidents.pop(key, None)
+            if active is None:
+                return
+            if active[0] != incident_kind:
+                raise ValueError("client incident identity changed kind")
+            first = active[1]
+        self.record_incident(
+            incident_id=incident_id,
+            incident_kind=incident_kind,
+            phase=phase,
+            control_session_id=control_session_id,
+            client_incarnation=client_incarnation,
+            source_label=source_label,
+            reason_code=reason_code,
+            occurrence_count=occurrence_count,
+            maximum_delay_ns=maximum_delay_ns,
+            first_observed_ns=first,
+            last_observed_ns=now,
+        )
+
+    def relative_monotonic_ns(self, now_ns: int) -> int:
+        return max(0, now_ns - self._diagnostic_origin_ns)
 
     async def subscribe(self) -> ControlStateSubscription:
         loop = asyncio.get_running_loop()
@@ -266,7 +485,7 @@ class HeadlessControlStateSource:
                 self._cold_wake = asyncio.Event()
                 self._runner_task = loop.create_task(self._run_program_source())
                 self._cold_task = loop.create_task(self._run_cold_assembler())
-                if self._watch_paths:
+                if self._watch_roots:
                     self._watch_task = loop.create_task(self._run_file_wakes())
                 self.notify_cold()
             elif self._is_synchronized():
@@ -299,10 +518,14 @@ class HeadlessControlStateSource:
                 self._cold_expiry_handle.cancel()
                 self._cold_expiry_handle = None
             self._cycle = None
+            self._facts = None
             self._shell = None
             self._shell_key = None
             self._cold_wake = None
+            self._watch_keys.clear()
+            self._watch_fresh.clear()
             self._program_source_current = False
+            self._semantic_reason = None
             self._loop = None
 
     def notify_cold(self) -> None:
@@ -312,7 +535,15 @@ class HeadlessControlStateSource:
             loop.call_soon_threadsafe(wake.set)
 
     def notify_control(self) -> None:
-        """Wake injected-service fixtures after an in-process owner effect."""
+        """Refresh non-Program facts after one accepted control effect.
+
+        Program lifecycle has its own change stream.  Kernel authoring
+        admission does not, so command completion must also wake the one
+        capacity-one cold reduction instead of waiting for an unrelated
+        Manager or execution-event pulse.
+        """
+
+        self.notify_cold()
 
         loop = self._loop
         if loop is not None and self._runner_url is None:
@@ -337,26 +568,74 @@ class HeadlessControlStateSource:
             raise ControlStateUnavailableError("control state is not synchronized")
         return self._frame("critical")
 
+    def current_component_overview(self) -> dict[str, Any] | None:
+        """Return the already-reduced Overview while the shared source is active.
+
+        ``None`` means there is no control demand and therefore no retained fact
+        set.  A caller may then perform one standalone capture.  While control
+        demand exists, returning anything except the shared current reduction
+        would reread owners and reintroduce the crossed-projection path UI6-G
+        removes.
+        """
+
+        if not self._subscriptions:
+            return None
+        if not self._is_synchronized():
+            raise ControlStateUnavailableError("control state is not synchronized")
+        assert self._shell is not None
+        overview = self._shell.get("component_overview")
+        if not isinstance(overview, dict):
+            raise ControlStateUnavailableError("component overview is unavailable")
+        return dict(overview)
+
+    def semantic_context(self) -> ControlSemanticContext:
+        """Return cached semantic state without reading or reducing an owner."""
+
+        cycle = self._cycle
+        if cycle is None:
+            return ControlSemanticContext(
+                status="synchronizing",
+                reason="program_control_state_synchronizing",
+            )
+        if not self._program_source_current:
+            return ControlSemanticContext(
+                status="unavailable",
+                reason="program_control_source_unavailable",
+            )
+        if self._semantic_reason is not None:
+            return ControlSemanticContext(
+                status="unavailable",
+                reason=self._semantic_reason,
+            )
+        if not self._is_synchronized():
+            return ControlSemanticContext(
+                status="synchronizing",
+                reason="control_projection_synchronizing",
+            )
+        owner_epoch = cycle.get("program_runner_owner_epoch")
+        revision = cycle.get("execution_control_revision")
+        if not isinstance(owner_epoch, str) or type(revision) is not int:
+            return ControlSemanticContext(
+                status="unavailable",
+                reason="program_control_identity_invalid",
+            )
+        return ControlSemanticContext(
+            status="current",
+            reason=None,
+            semantic_owner_epoch=owner_epoch,
+            execution_control_revision=revision,
+        )
+
     def _is_synchronized(self) -> bool:
         cycle = self._cycle
-        shell = self._shell
-        if cycle is None or shell is None or not self._program_source_current:
-            return False
-        runtime = shell.get("runtime")
-        alarms = shell.get("alarms")
-        overview = shell.get("component_overview")
-        authoring = shell.get("authoring_admission")
-        if not all(
-            isinstance(value, dict)
-            for value in (runtime, alarms, overview, authoring)
-        ):
-            return False
-        return _overview_basis_matches(
-            overview,
-            runtime,
-            alarms,
-            authoring,
-            cycle,
+        facts = self._facts
+        return bool(
+            cycle is not None
+            and facts is not None
+            and self._shell is not None
+            and self._program_source_current
+            and self._semantic_reason is None
+            and facts.program_cycle == cycle
         )
 
     def _frame(self, event_class: str) -> ControlStateFrame:
@@ -366,13 +645,14 @@ class HeadlessControlStateSource:
             generation=self._generation,
             event_class=event_class,
             control=build_control_projection(self._cycle, self._ingress),
-            shell={**self._shell, "program_cycle": self._cycle},
+            shell=dict(self._shell),
         )
 
     def _publish(self, event_class: str) -> None:
         if not self._is_synchronized():
             return
         self._generation += 1
+        self._publications[event_class] += 1
         frame = self._frame(event_class)
         for subscription in self._subscriptions:
             if subscription.closed:
@@ -394,18 +674,30 @@ class HeadlessControlStateSource:
         if previous == cycle:
             return
         self._cycle = cycle
-        if previous is None or (
-            (
-                previous.get("program_runner_owner_epoch"),
-                previous.get("cycle_generation"),
-            )
-            != (
-                cycle.get("program_runner_owner_epoch"),
-                cycle.get("cycle_generation"),
-            )
-        ):
+        if self._facts is None:
             self.notify_cold()
+        else:
+            # Program is not reread through Component Overview. Replacing the
+            # one captured Program fact and rerunning the pure reducer is the
+            # complete update, even if another owner advanced independently.
+            facts = replace(self._facts, program_cycle=cycle)
+            try:
+                shell = self._shell_from_facts(facts)
+            except ControlStateUnavailableError as error:
+                self._semantic_reason = str(error)
+                return
+            self._facts = facts
+            self._diagnostics["reductions"] += 1
+            self._shell = shell
+            self._shell_key = _shell_key(shell)
+            self._semantic_reason = None
         self._publish(event_class)
+        if event_class == "critical" and self._facts is not None:
+            # Program lifecycle and Kernel authoring admission are distinct
+            # authorities, but claim/release changes occur at these sparse
+            # lifecycle boundaries. Refresh the dependent cold facts once;
+            # high-rate node progress never enters this path.
+            self.notify_cold()
 
     async def _run_program_source(self) -> None:
         if self._runner_url is None:
@@ -471,59 +763,57 @@ class HeadlessControlStateSource:
                 await asyncio.sleep(retry_seconds)
                 retry_seconds = min(retry_seconds * 2, 1.0)
 
-    async def _assemble_shell(self) -> tuple[dict[str, Any], tuple[Any, ...]]:
-        async def execution_projection() -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-            try:
-                targets, control_state = await asyncio.gather(
-                    asyncio.to_thread(self._service.execution_targets),
-                    asyncio.to_thread(self._service.execution_control_state),
-                )
-            except Exception:
-                return None, None
-            return targets, control_state
-
-        runtime, alarms, authoring, execution_pair = await asyncio.gather(
-            asyncio.to_thread(self._service.runtime),
-            asyncio.to_thread(
-                self._service.alarms,
-                limit=32,
-                ordering="attention_newest",
-            ),
-            asyncio.to_thread(self._service.authoring_admission),
-            execution_projection(),
-        )
-        execution_targets, execution_control_state = execution_pair
-        overview = await asyncio.to_thread(self._service.component_overview)
+    async def _capture_facts(self) -> ComponentOverviewFacts:
         cycle = self._cycle
         if cycle is None:
-            cycle = await asyncio.to_thread(self._service.program_cycle_status)
-            self._cycle = cycle
-        if not _overview_basis_matches(overview, runtime, alarms, authoring, cycle):
-            # A source advanced across the cold aggregate. One immediate
-            # current reread converges without publishing a crossed snapshot.
-            runtime = await asyncio.to_thread(self._service.runtime)
-            alarms = await asyncio.to_thread(
-                self._service.alarms,
-                limit=32,
-                ordering="attention_newest",
+            raise ControlStateUnavailableError(
+                "program_control_state_synchronizing"
             )
-            authoring = await asyncio.to_thread(self._service.authoring_admission)
-            execution_targets, execution_control_state = await execution_projection()
-            overview = await asyncio.to_thread(self._service.component_overview)
-            cycle = self._cycle or cycle
-            if not _overview_basis_matches(
-                overview, runtime, alarms, authoring, cycle
-            ):
-                raise RuntimeError("cold control projection crossed owner revisions")
-        shell = {
-            "runtime": runtime,
-            "alarms": alarms,
-            "component_overview": overview,
-            "authoring_admission": authoring,
-            "execution_targets": execution_targets,
-            "execution_control_state": execution_control_state,
+        facts = await asyncio.to_thread(
+            self._service.component_overview_facts,
+            program_cycle=cycle,
+        )
+        self._diagnostics["owner_reads"] += 8
+        # Program may advance while the other independent facts are captured.
+        # Replacing that one cached value is sufficient; no owner is reread.
+        current_cycle = self._cycle
+        return facts if current_cycle == cycle else replace(
+            facts,
+            program_cycle=current_cycle,
+        )
+
+    @staticmethod
+    def _shell_from_facts(facts: ComponentOverviewFacts) -> dict[str, Any]:
+        required = {
+            "runtime": facts.runtime,
+            "alarms": facts.alarms,
+            "authoring_admission": facts.authoring_admission,
+            "program_cycle": facts.program_cycle,
         }
-        return shell, _shell_key(shell)
+        missing = next(
+            (name for name, value in required.items() if not isinstance(value, dict)),
+            None,
+        )
+        if missing is not None:
+            error = facts.errors.get(missing, {})
+            code = error.get("code", f"{missing}_projection_unavailable")
+            raise ControlStateUnavailableError(str(code))
+        return {
+            "runtime": dict(facts.runtime),
+            "alarms": dict(facts.alarms),
+            "component_overview": facts.reduce(),
+            "authoring_admission": dict(facts.authoring_admission),
+            "execution_targets": facts.execution_targets_response,
+            "execution_control_state": facts.execution_control_response,
+            "program_cycle": dict(facts.program_cycle),
+        }
+
+    async def _assemble_shell(
+        self,
+    ) -> tuple[ComponentOverviewFacts, dict[str, Any], tuple[Any, ...]]:
+        facts = await self._capture_facts()
+        shell = self._shell_from_facts(facts)
+        return facts, shell, _shell_key(shell)
 
     async def _run_cold_assembler(self) -> None:
         assert self._cold_wake is not None
@@ -533,49 +823,77 @@ class HeadlessControlStateSource:
             wake.clear()
             await asyncio.sleep(CONTROL_COLD_COMBINE_NS / 1_000_000_000)
             try:
-                shell, key = await self._assemble_shell()
+                facts, shell, key = await self._assemble_shell()
+            except ControlStateUnavailableError as error:
+                self._semantic_reason = str(error)
+                continue
             except Exception:
+                self._semantic_reason = "control_projection_assembly_failed"
                 continue
             changed = key != self._shell_key
+            self._facts = facts
             self._shell = shell
             self._shell_key = key
-            self._schedule_cold_expiry(shell)
+            self._diagnostics["reductions"] += 1
+            self._semantic_reason = None
             if changed or self._generation == 0:
                 self._publish("cold")
+            else:
+                self._diagnostics["unchanged_reductions"] += 1
 
-    def _schedule_cold_expiry(self, shell: dict[str, Any]) -> None:
+    def _refresh_file_watches(self, *, notify: bool) -> None:
+        """Collapse source pulses and wake only on meaning/freshness changes."""
+
+        now_ns = time.time_ns()
+        changed = False
+        for path in self._watch_paths:
+            key = _source_file_semantic_key(path)
+            if path in self._watch_keys and self._watch_keys[path] != key:
+                changed = True
+            self._watch_keys[path] = key
+            if path not in self._freshness_paths:
+                continue
+            try:
+                fresh = now_ns - path.stat().st_mtime_ns <= (
+                    self._cold_freshness_budget_ns or 0
+                )
+            except OSError:
+                fresh = False
+            if path in self._watch_fresh and self._watch_fresh[path] != fresh:
+                changed = True
+            self._watch_fresh[path] = fresh
+
         if self._cold_expiry_handle is not None:
             self._cold_expiry_handle.cancel()
             self._cold_expiry_handle = None
         budget_ns = self._cold_freshness_budget_ns
         loop = self._loop
-        runtime = shell.get("runtime")
-        if (
-            budget_ns is None
-            or loop is None
-            or not self._subscriptions
-            or not isinstance(runtime, dict)
-        ):
-            return
-        delay_ns = _fresh_runtime_expiry_delay_ns(runtime, budget_ns)
-        if delay_ns is None:
-            return
-
-        def expire() -> None:
-            self._cold_expiry_handle = None
+        if budget_ns is not None and loop is not None and self._subscriptions:
+            deadlines = []
+            for path, fresh in self._watch_fresh.items():
+                if not fresh:
+                    continue
+                try:
+                    deadlines.append(path.stat().st_mtime_ns + budget_ns + 1)
+                except OSError:
+                    changed = True
+                    self._watch_fresh[path] = False
+            if deadlines:
+                delay_ns = max(1, min(deadlines) - time.time_ns())
+                self._cold_expiry_handle = loop.call_later(
+                    delay_ns / 1_000_000_000,
+                    partial(self._refresh_file_watches, notify=True),
+                )
+        if changed and notify:
             self.notify_cold()
-
-        self._cold_expiry_handle = loop.call_later(
-            delay_ns / 1_000_000_000,
-            expire,
-        )
 
     async def _run_file_wakes(self) -> None:
         try:
-            async for _changes in awatch(*self._watch_paths):
+            self._refresh_file_watches(notify=False)
+            async for _changes in awatch(*self._watch_roots):
                 if not self._subscriptions or self._closed:
                     return
-                self.notify_cold()
+                self._refresh_file_watches(notify=True)
         except asyncio.CancelledError:
             raise
         except OSError:
@@ -583,9 +901,11 @@ class HeadlessControlStateSource:
 
 
 __all__ = [
+    "ControlSemanticContext",
     "ControlStateFrame",
     "ControlStateSubscription",
     "ControlStateUnavailableError",
     "HeadlessControlStateSource",
     "build_control_projection",
+    "control_shell_fact_key",
 ]

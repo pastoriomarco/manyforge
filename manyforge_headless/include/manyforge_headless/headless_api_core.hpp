@@ -191,9 +191,8 @@ public:
                       std::string_view expected_scenario_catalog_revision,
                       std::string_view canonical_program_bytes);
   [[nodiscard]] manyforge::content_identity::CanonicalValue ReplayProgramApply(
-      std::string_view scenario_id,
-      std::string_view scenario_catalog_revision, std::string_view program_id,
-      std::string_view program_revision,
+      std::string_view scenario_id, std::string_view scenario_catalog_revision,
+      std::string_view program_id, std::string_view program_revision,
       const std::optional<std::string> &expected_applied_record_digest,
       std::string_view request_owner_epoch, std::string_view request_id);
   [[nodiscard]] manyforge::content_identity::CanonicalValue CommitProgramApply(
@@ -228,7 +227,17 @@ public:
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   HistoryPage(const HistorianQuery &query);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
+  HistorySummaryPage(const HistorianQuery &query);
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
   HistoryDetail(std::uint64_t sequence);
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
+  RecordClientIncident(std::string incident_id, std::string incident_kind,
+                       std::string phase, std::string control_session_id,
+                       std::string client_incarnation, std::string source_label,
+                       std::string reason_code, std::uint64_t occurrence_count,
+                       std::optional<std::uint64_t> maximum_delay_ns,
+                       std::uint64_t first_observed_ns,
+                       std::uint64_t last_observed_ns);
   [[nodiscard]] manyforge::content_identity::CanonicalValue HistorianHealth();
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   ReconcileHistorianHealth(std::uint64_t expected_health_generation,
@@ -246,10 +255,10 @@ public:
       manyforge::content_identity::CanonicalValue journal_payload,
       std::string payload_digest);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
-  CompleteOperationEventSnapshot(std::string source_owner_epoch,
-                                 std::uint64_t through_source_sequence,
-                                 std::optional<manyforge::content_identity::CanonicalValue>
-                                     current_stop_fault = std::nullopt);
+  CompleteOperationEventSnapshot(
+      std::string source_owner_epoch, std::uint64_t through_source_sequence,
+      std::optional<manyforge::content_identity::CanonicalValue>
+          current_stop_fault = std::nullopt);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   MarkOperationEventSourceUnknown(std::string source_owner_epoch);
   void Shutdown();

@@ -5,7 +5,6 @@ import {
   parseAppliedProgramSelection,
   parseCapabilityCommandPreviewResponse,
   parseCatalogResponse,
-  parseCycleRecoveryActionResult,
   parseCurrentScenarioResponse,
   parseDeploymentWorkspaceResponse,
   parseExecutionControlStatus,
@@ -26,12 +25,9 @@ import {
   parseNodeEnvironmentResponse,
   parseLogicalSceneProjection,
   parseManagerApplyResponse,
-  parseManagerApplyStatusResponse,
   parseProgramWorkspaceResponse,
   parseProgramWorkspaceTransitionResponse,
-  parseProgramRunIndex,
   parseProgramRunStatus,
-  parseProgramCycleResetResult,
   parseProgramCycleStatus,
   parseProgramRuntimeControlProjection,
   parseScenarioCatalogResponse,
@@ -754,27 +750,10 @@ describe('Program product projections', () => {
     })).toThrow(/closed record/);
   });
 
-  it('keeps run status and index tied to one exact runner owner', () => {
+  it('keeps run status tied to one exact runner owner', () => {
     const status = parseProgramRunStatus(runStatus());
-    const index = parseProgramRunIndex({
-      schema_version: 'manyforge.program_run_index.v1',
-      owner_id: 'program-runner.cell-a',
-      owner_epoch: 'program-runner.epoch.1',
-      active_only: true,
-      truncated: false,
-      runs: [runStatus()],
-    });
 
     expect(status.capture.programRunId).toBe('program-run.1');
-    expect(index.runs[0].runRevision).toBe(3);
-    expect(() => parseProgramRunIndex({
-      schema_version: 'manyforge.program_run_index.v1',
-      owner_id: 'program-runner.cell-a',
-      owner_epoch: 'another-epoch',
-      active_only: true,
-      truncated: false,
-      runs: [runStatus()],
-    })).toThrow(/exact indexed owner/);
   });
 
   it('accepts exact runtime controls when no recovery action is offered', () => {
@@ -817,6 +796,14 @@ describe('Program product projections', () => {
       ...input,
       run_revision: 4,
     })).toThrow(/exact advertised run projection/);
+    expect(() => parseProgramCycleStatus({
+      ...input,
+      causal_client_sequence: '0',
+    })).toThrow(/canonical positive uint64/);
+    expect(parseProgramCycleStatus({
+      ...input,
+      causal_client_sequence: '18446744073709551615',
+    }).causalClientSequence).toBe('18446744073709551615');
   });
 
   it('retains an immutable predecessor run after terminal owner recovery', () => {
@@ -861,57 +848,6 @@ describe('Program product projections', () => {
       ...input,
       state: 'running',
     })).toThrow(/exact advertised run projection/);
-  });
-
-  it('accepts a completed recovery action with no subsequent offer', () => {
-    const result = parseCycleRecoveryActionResult({
-      schema_version: 'manyforge.cycle_recovery_result.v2',
-      request_id: 'request.1',
-      accepted: true,
-      action_id: 'acknowledge_and_continue',
-      cycle_resumed: true,
-      result_code: 'accepted',
-      owner_result: null,
-      run: runStatus(),
-      runtime_controls: runtimeControlsProjection(),
-      recovery_offer: null,
-    });
-
-    expect(result.recoveryOffer).toBeNull();
-    expect(result.run.capture.programRunId).toBe('program-run.1');
-  });
-
-  it('parses the exact post-Reset admission fence', () => {
-    const result = parseProgramCycleResetResult({
-      schema_version: 'manyforge.program_cycle_reset_result.v1',
-      program_run_id: 'program-run.1',
-      reset_cycle_generation: 8,
-      idle_cycle_generation: 9,
-      settlement_reference: digestA,
-      admission: {
-        admission_generation: 12,
-        authoring_allowed: false,
-      },
-      runtime_controls: null,
-    });
-
-    expect(result.admission).toEqual({
-      admissionGeneration: 12,
-      authoringAllowed: false,
-    });
-    expect(() => parseProgramCycleResetResult({
-      schema_version: 'manyforge.program_cycle_reset_result.v1',
-      program_run_id: 'program-run.1',
-      reset_cycle_generation: 8,
-      idle_cycle_generation: 9,
-      settlement_reference: digestA,
-      admission: {
-        admission_generation: 12,
-        authoring_allowed: false,
-        ignored: true,
-      },
-      runtime_controls: null,
-    })).toThrow(/exactly \[admission_generation, authoring_allowed\]/);
   });
 
   it('parses Composer Apply, Load, and Revert wrappers without trusting headless details', () => {
@@ -1577,20 +1513,6 @@ describe('headless projection parsers', () => {
       .toBe(2);
   });
 
-  it('parses an exact read-only Manager Apply status without submit identity', () => {
-    const status = parseManagerApplyStatusResponse({
-      api_version: 'manyforge.manager_command_response.v1',
-      apply_generation: 2,
-      apply_id: 'apply-2',
-      candidate_projection_revision: null,
-      error: null,
-      ok: true,
-      state: 'pending',
-    });
-    expect(status.state).toBe('pending');
-    expect(status.applyId).toBe('apply-2');
-  });
-
   it('rejects obsolete, extra-field, and inconsistent Manager Apply receipts', () => {
     const obsolete = {
       api_version: 'manyforge.manager_command_response.v1',
@@ -1777,40 +1699,59 @@ describe('headless projection parsers', () => {
   });
 
   it('accepts the bounded historian page and validates event schema identity', () => {
-    const page = parseHistorianPage({
-      schema_version: 'manyforge.historian_page.v1',
+    const wire = {
+      schema_version: 'manyforge.historian_summary_page.v1',
       events: [{
         sequence: 7,
         event: {
-          schema_version: 'manyforge.historian_event.v1',
+          schema_version: 'manyforge.historian_event_summary.v1',
           event_id: 'event-1',
           component: 'manyforge.alarm',
           event_type: 'operator_alarm_activated',
           severity: 'INFO',
-          occurred_at_ns: 123,
+          occurred_at_ns: '9007199254740992',
           occurred_at_wall: '2026-08-05T12:00:00Z',
-          payload: { condition_id: 'condition-1' },
+          message: 'operator alarm activated',
+          program_run_id: null,
+          operation_id: null,
+          condition_id: 'condition-1',
         },
       }],
       next_before_sequence: null,
       truncated: false,
-    });
+    };
+    const page = parseHistorianPage(wire);
 
     expect(page.events[0]?.event.eventType).toBe('operator_alarm_activated');
     expect(page.events[0]?.sequence).toBe(7);
+    expect(() => parseHistorianPage({ ...wire, payload: {} })).toThrow();
+    const eventWithPayload = structuredClone(wire);
+    (eventWithPayload.events[0]!.event as Record<string, unknown>).payload = {};
+    expect(() => parseHistorianPage(eventWithPayload)).toThrow();
+    const numericTimestamp = structuredClone(wire);
+    (numericTimestamp.events[0]!.event as Record<string, unknown>).occurred_at_ns = 123;
+    expect(() => parseHistorianPage(numericTimestamp)).toThrow(
+      'must be a string',
+    );
+    const noncanonicalTimestamp = structuredClone(wire);
+    (noncanonicalTimestamp.events[0]!.event as Record<string, unknown>)
+      .occurred_at_ns = '0123';
+    expect(() => parseHistorianPage(noncanonicalTimestamp)).toThrow(
+      'a canonical nonnegative int64 decimal string',
+    );
   });
 
   it('accepts typed exact historian detail availability unions', () => {
     const detail = parseHistorianDetail({
-      schema_version: 'manyforge.historian_detail.v1',
+      schema_version: 'manyforge.historian_detail.v2',
       sequence: 7,
       event: {
-        schema_version: 'manyforge.historian_event.v1',
+        schema_version: 'manyforge.historian_event.v2',
         event_id: 'event-1',
         component: 'manyforge.execution',
         event_type: 'operation_updated',
         severity: 'INFO',
-        occurred_at_ns: 123,
+        occurred_at_ns: '9007199254740992',
         occurred_at_wall: '2026-08-05T12:00:00Z',
         payload: {},
       },
@@ -1825,7 +1766,7 @@ describe('headless projection parsers', () => {
     expect(detail.sections.executionDigest.available).toBe(true);
     expect(() => parseHistorianDetail({
       ...detail,
-      schema_version: 'manyforge.historian_detail.v1',
+      schema_version: 'manyforge.historian_detail.v2',
     })).toThrow();
   });
 });

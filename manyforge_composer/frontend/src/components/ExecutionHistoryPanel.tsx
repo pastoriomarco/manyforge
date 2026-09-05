@@ -21,7 +21,7 @@ export type HistoryAlarmPhase =
 export interface ExecutionHistoryEventView {
   id: string;
   sequence?: number;
-  timestampNs: number;
+  timestampNs: string;
   timestamp?: string | null;
   severity?: string | null;
   channel: string;
@@ -33,6 +33,8 @@ export interface ExecutionHistoryEventView {
   alarmPhase?: HistoryAlarmPhase;
   details?: unknown;
 }
+
+const MAXIMUM_MOUNTED_HISTORY_ROWS = 32;
 
 export function historySeverityGroup(
   severity: string | null | undefined,
@@ -63,8 +65,8 @@ export function filterExecutionHistoryEvents(
     alarmView?: HistoryAlarmFilter;
     conditionIdentity?: string;
     executionId?: number;
-    startNs?: number;
-    endNs?: number;
+    startNs?: string;
+    endNs?: string;
     programRunId?: string;
     operationId?: string;
   },
@@ -78,8 +80,14 @@ export function filterExecutionHistoryEvents(
     ) return false;
     if (options.eventType && event.type !== options.eventType) return false;
     if (options.channel && event.channel !== options.channel) return false;
-    if (options.startNs !== undefined && event.timestampNs < options.startNs) return false;
-    if (options.endNs !== undefined && event.timestampNs > options.endNs) return false;
+    if (
+      options.startNs !== undefined
+      && BigInt(event.timestampNs) < BigInt(options.startNs)
+    ) return false;
+    if (
+      options.endNs !== undefined
+      && BigInt(event.timestampNs) > BigInt(options.endNs)
+    ) return false;
     if (options.programRunId && event.programRunId !== options.programRunId) return false;
     if (options.operationId && event.operationId !== options.operationId) return false;
     if (!matchesAlarmView(event, options.alarmView ?? 'all')) return false;
@@ -112,7 +120,9 @@ interface ExecutionHistoryPanelProps {
   embedded?: boolean;
   onReload?: (query: HistorianListQuery) => void;
   onLoadOlder?: () => void;
+  onLoadNewer?: () => void;
   hasOlder?: boolean;
+  hasNewer?: boolean;
   selectedDetail?: HistorianDetail | null;
   detailLoading?: boolean;
   detailError?: string | null;
@@ -134,7 +144,9 @@ export function ExecutionHistoryPanel({
   embedded = false,
   onReload,
   onLoadOlder,
+  onLoadNewer,
   hasOlder = false,
+  hasNewer = false,
   selectedDetail = null,
   detailLoading = false,
   detailError = null,
@@ -150,19 +162,24 @@ export function ExecutionHistoryPanel({
   const [operationId, setOperationId] = useState('');
   const [currentOnly, setCurrentOnly] = useState(true);
   const newestTimestampNs = events.reduce(
-    (latest, event) => Math.max(latest, event.timestampNs),
-    0,
+    (latest, event) => {
+      const timestamp = BigInt(event.timestampNs);
+      return timestamp > latest ? timestamp : latest;
+    },
+    0n,
   );
   const windowDurationNs = timeWindow === 'minute'
-    ? 60e9
+    ? 60_000_000_000n
     : timeWindow === 'five_minutes'
-      ? 300e9
+      ? 300_000_000_000n
       : timeWindow === 'hour'
-        ? 3_600e9
+        ? 3_600_000_000_000n
         : null;
-  const startNs = windowDurationNs === null || newestTimestampNs === 0
+  const startNs = windowDurationNs === null || newestTimestampNs === 0n
     ? undefined
-    : Math.max(0, newestTimestampNs - windowDurationNs);
+    : (newestTimestampNs > windowDurationNs
+      ? newestTimestampNs - windowDurationNs
+      : 0n).toString();
   const query = (): HistorianListQuery => ({
     ...(startNs === undefined ? {} : { startNs }),
     ...(component.trim() ? { components: [component.trim()] } : {}),
@@ -306,12 +323,14 @@ export function ExecutionHistoryPanel({
         {!loading && !error && filtered.length === 0 && (
           <p className="muted">No events match these filters.</p>
         )}
-        {filtered.map((event) => (
+        {filtered.slice(0, MAXIMUM_MOUNTED_HISTORY_ROWS).map((event) => (
           <button
             type="button"
             key={event.id}
             className={`history-event severity-${historySeverityGroup(event.severity)}${
-              selectedDetail?.sequence === event.sequence ? ' selected' : ''
+              event.sequence !== undefined
+                && selectedDetail !== null
+                && selectedDetail.sequence === event.sequence ? ' selected' : ''
             }`}
             onClick={() => onSelectEvent?.(event)}
           >
@@ -322,10 +341,19 @@ export function ExecutionHistoryPanel({
             <small>{event.channel} · {event.type}</small>
           </button>
         ))}
-        {hasOlder && onLoadOlder && (
-          <button type="button" disabled={loading} onClick={onLoadOlder}>
-            Load older events
-          </button>
+        {(hasNewer || hasOlder) && (
+          <nav className="history-page-navigation" aria-label="History pages">
+            <button
+              type="button"
+              disabled={loading || !hasNewer}
+              onClick={onLoadNewer}
+            >Newer</button>
+            <button
+              type="button"
+              disabled={loading || !hasOlder}
+              onClick={onLoadOlder}
+            >Older</button>
+          </nav>
         )}
       </div>
       {(detailLoading || detailError !== null || selectedDetail !== null) && (

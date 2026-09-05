@@ -26,7 +26,6 @@ import type {
   ManagerApplyRecord,
   ManagerApplyReplayStatus,
   ManagerApplyResponse,
-  ManagerApplyStatusResponse,
   ManagerDeploymentCandidatePreviewResponse,
   ManagerDeploymentRecordDiff,
   ManagerDiffProjection,
@@ -49,16 +48,13 @@ import type {
   ProgramSceneResource,
   ProgramSceneShape,
   ProgramTreeNode,
-  ProgramRunIndex,
   ProgramCycleStatus,
   ProgramRunStateName,
   ProgramRunStatus,
   CycleRecoveryAction,
   CycleRecoveryActionId,
-  CycleRecoveryActionResult,
   CycleRecoveryOffer,
   ProgramRuntimeControlProjection,
-  ProgramRuntimeControlResult,
   ProgramRuntimeControlsSnapshot,
   RuntimeControlAuditEvent,
   RuntimeOverrideObservationCandidate,
@@ -66,7 +62,6 @@ import type {
   RuntimeOverrideRecord,
   RuntimeOverrideStatus,
   RuntimeOverrideMaterializationResponse,
-  ProgramCycleResetResult,
   ProgramValueSource,
   ProgramViewerMetadata,
   ProgramWorkspaceResponse,
@@ -101,63 +96,6 @@ import type {
   SourceModelTarget,
   Vector3Tuple,
 } from '../types/api';
-
-export function parseProgramCycleResetResult(value: unknown): ProgramCycleResetResult {
-  const record = objectAt(value, 'programCycleReset');
-  exactKeysAt(record, [
-    'schema_version', 'program_run_id', 'reset_cycle_generation',
-    'idle_cycle_generation', 'settlement_reference', 'admission',
-    'runtime_controls',
-  ], 'programCycleReset');
-  const schemaVersion = stringAt(record.schema_version, 'programCycleReset.schema_version');
-  if (schemaVersion !== 'manyforge.program_cycle_reset_result.v1') {
-    return fail('programCycleReset.schema_version', 'the expected reset result schema');
-  }
-  const programRunId = stringAt(
-    record.program_run_id,
-    'programCycleReset.program_run_id',
-  );
-  const runtimeControls = record.runtime_controls === null
-    ? null
-    : parseProgramRuntimeControlsSnapshot(
-      record.runtime_controls,
-      'programCycleReset.runtime_controls',
-    );
-  if (runtimeControls !== null && runtimeControls.programRunId !== programRunId) {
-    return fail('programCycleReset', 'one exact Program-run identity');
-  }
-  const admission = objectAt(record.admission, 'programCycleReset.admission');
-  exactKeysAt(admission, [
-    'admission_generation', 'authoring_allowed',
-  ], 'programCycleReset.admission');
-  return {
-    schemaVersion,
-    programRunId,
-    resetCycleGeneration: positiveIntegerAt(
-      record.reset_cycle_generation,
-      'programCycleReset.reset_cycle_generation',
-    ),
-    idleCycleGeneration: positiveIntegerAt(
-      record.idle_cycle_generation,
-      'programCycleReset.idle_cycle_generation',
-    ),
-    settlementReference: digestAt(
-      record.settlement_reference,
-      'programCycleReset.settlement_reference',
-    ),
-    admission: {
-      admissionGeneration: positiveIntegerAt(
-        admission.admission_generation,
-        'programCycleReset.admission.admission_generation',
-      ),
-      authoringAllowed: booleanAt(
-        admission.authoring_allowed,
-        'programCycleReset.admission.authoring_allowed',
-      ),
-    },
-    runtimeControls,
-  };
-}
 
 export function parseProgramCycleStatus(value: unknown): ProgramCycleStatus {
   const record = objectAt(value, 'programCycleStatus');
@@ -229,7 +167,7 @@ export function parseProgramCycleStatus(value: unknown): ProgramCycleStatus {
       record.causal_session_id,
       'programCycleStatus.causal_session_id',
     ),
-    causalClientSequence: nullableStringAt(
+    causalClientSequence: nullablePositiveUint64TextAt(
       record.causal_client_sequence,
       'programCycleStatus.causal_client_sequence',
     ),
@@ -321,6 +259,7 @@ import type {
   HeadlessRuntimeSnapshot,
   HeadlessSourceSection,
   HistorianEvent,
+  HistorianEventSummary,
   HistorianDetail,
   HistorianPage,
   OperatorAlarmRecord,
@@ -339,7 +278,6 @@ import type {
   MotionPreviewReceipt,
   ObservedGripperTarget,
   ObservedMotionTarget,
-  OperationAcceptance,
   OperationObservation,
   RuntimeScaleControlAccepted,
   RuntimeScaleControlStatus,
@@ -418,6 +356,37 @@ function stringAt(value: unknown, path: string): string {
     return fail(path, 'a string');
   }
   return value;
+}
+
+function nonnegativeInt64TextAt(value: unknown, path: string): string {
+  const text = stringAt(value, path);
+  if (
+    text.length > 19
+    || !/^(0|[1-9]\d*)$/.test(text)
+    || BigInt(text) > 9_223_372_036_854_775_807n
+  ) {
+    return fail(path, 'a canonical nonnegative int64 decimal string');
+  }
+  return text;
+}
+
+function positiveUint64TextAt(value: unknown, path: string): string {
+  const text = stringAt(value, path);
+  if (
+    text.length > 20
+    || !/^[1-9]\d*$/.test(text)
+    || BigInt(text) > 18_446_744_073_709_551_615n
+  ) {
+    return fail(path, 'a canonical positive uint64 decimal string');
+  }
+  return text;
+}
+
+function nullablePositiveUint64TextAt(
+  value: unknown,
+  path: string,
+): string | null {
+  return value === null ? null : positiveUint64TextAt(value, path);
 }
 
 function digestAt(value: unknown, path: string): string {
@@ -2301,75 +2270,6 @@ export function parseManagerApplyResponse(value: unknown): ManagerApplyResponse 
   };
 }
 
-export function parseManagerApplyStatusResponse(
-  value: unknown,
-): ManagerApplyStatusResponse {
-  const record = objectAt(value, 'managerApplyStatus');
-  exactKeysAt(
-    record,
-    [
-      'api_version',
-      'apply_generation',
-      'apply_id',
-      'candidate_projection_revision',
-      'error',
-      'ok',
-      'state',
-    ],
-    'managerApplyStatus',
-  );
-  const apiVersion = stringAt(
-    record.api_version,
-    'managerApplyStatus.api_version',
-  );
-  if (apiVersion !== 'manyforge.manager_command_response.v1') {
-    return fail(
-      'managerApplyStatus.api_version',
-      'manyforge.manager_command_response.v1',
-    );
-  }
-  if (!booleanAt(record.ok, 'managerApplyStatus.ok') || record.error !== null) {
-    return fail('managerApplyStatus', 'one accepted read-only status');
-  }
-  const state = stringAt(record.state, 'managerApplyStatus.state');
-  if (state !== 'pending' && state !== 'succeeded') {
-    return fail('managerApplyStatus.state', 'pending or succeeded');
-  }
-  const base = {
-    apiVersion: 'manyforge.manager_command_response.v1' as const,
-    applyGeneration: positiveIntegerAt(
-      record.apply_generation,
-      'managerApplyStatus.apply_generation',
-    ),
-    applyId: stringAt(record.apply_id, 'managerApplyStatus.apply_id'),
-    error: null,
-    ok: true as const,
-  };
-  if (state === 'pending') {
-    if (record.candidate_projection_revision !== null) {
-      return fail(
-        'managerApplyStatus.candidate_projection_revision',
-        'null while pending',
-      );
-    }
-    return { ...base, candidateProjectionRevision: null, state };
-  }
-  if (record.candidate_projection_revision === null) {
-    return fail(
-      'managerApplyStatus.candidate_projection_revision',
-      'a projection revision after success',
-    );
-  }
-  return {
-    ...base,
-    candidateProjectionRevision: parseProjectionRevision(
-      record.candidate_projection_revision,
-      'managerApplyStatus.candidate_projection_revision',
-    ),
-    state,
-  };
-}
-
 function parseProgramDraftProjection(
   value: unknown,
   path: string,
@@ -3502,47 +3402,6 @@ export function parseProgramRunStatus(value: unknown): ProgramRunStatus {
   };
 }
 
-export function parseProgramRunIndex(value: unknown): ProgramRunIndex {
-  const path = 'programRunIndex';
-  const record = objectAt(value, path);
-  exactKeysAt(
-    record,
-    ['active_only', 'owner_epoch', 'owner_id', 'runs', 'schema_version', 'truncated'],
-    path,
-  );
-  const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.program_run_index.v1') {
-    return fail(`${path}.schema_version`, 'manyforge.program_run_index.v1');
-  }
-  const ownerId = stringAt(record.owner_id, `${path}.owner_id`);
-  const ownerEpoch = stringAt(record.owner_epoch, `${path}.owner_epoch`);
-  const activeOnly = booleanAt(record.active_only, `${path}.active_only`);
-  const runs = boundedArrayAt(record.runs, `${path}.runs`, 4096)
-    .map(parseProgramRunStatus);
-  if (runs.some((run) => (
-    run.ownerId !== ownerId
-    || run.ownerEpoch !== ownerEpoch
-    || (activeOnly && ![
-      'running',
-      'intervention_required',
-      'full_stopping',
-      'full_stopped',
-      'stopping',
-      'finalizing',
-    ].includes(run.state))
-  ))) {
-    return fail(`${path}.runs`, 'statuses from the exact indexed owner and filter');
-  }
-  return {
-    schemaVersion,
-    ownerId,
-    ownerEpoch,
-    activeOnly,
-    truncated: booleanAt(record.truncated, `${path}.truncated`),
-    runs,
-  };
-}
-
 const RUNTIME_OVERRIDE_STATUSES = new Set<RuntimeOverrideStatus>([
   'staged', 'active', 'cleared', 'stale',
 ]);
@@ -4115,96 +3974,6 @@ export function parseProgramRuntimeControlProjection(
     runtimeControls,
     recoveryOffer,
     observationOverrideCandidate,
-  };
-}
-
-export function parseProgramRuntimeControlResult(
-  value: unknown,
-): ProgramRuntimeControlResult {
-  const path = 'programRuntimeControlResult';
-  const record = objectAt(value, path);
-  exactKeysAt(record, [
-    'schema_version', 'request_id', 'accepted', 'result', 'run',
-    'runtime_controls',
-  ], path);
-  const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (
-    schemaVersion !== 'manyforge.program_runtime_control_result.v1'
-    || booleanAt(record.accepted, `${path}.accepted`) !== true
-  ) {
-    return fail(path, 'an accepted runtime-control result');
-  }
-  const run = parseProgramRunStatus(record.run);
-  const runtimeControls = parseProgramRuntimeControlProjection(
-    record.runtime_controls,
-  );
-  if (run.capture.programRunId !== runtimeControls.programRunId) {
-    return fail(path, 'one exact Program-run identity');
-  }
-  if (
-    run.ownerEpoch !== runtimeControls.ownerEpoch
-    || run.runRevision !== runtimeControls.runRevision
-  ) {
-    return fail(path, 'matching owner and run revisions');
-  }
-  return {
-    schemaVersion,
-    requestId: stringAt(record.request_id, `${path}.request_id`),
-    accepted: true,
-    result: jsonValueAt(record.result, `${path}.result`),
-    run,
-    runtimeControls,
-  };
-}
-
-export function parseCycleRecoveryActionResult(
-  value: unknown,
-): CycleRecoveryActionResult {
-  const path = 'cycleRecoveryActionResult';
-  const record = objectAt(value, path);
-  exactKeysAt(record, [
-    'schema_version', 'request_id', 'accepted', 'action_id', 'cycle_resumed',
-    'result_code', 'owner_result', 'run', 'runtime_controls', 'recovery_offer',
-  ], path);
-  const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  const actionId = stringAt(record.action_id, `${path}.action_id`) as CycleRecoveryActionId;
-  if (
-    schemaVersion !== 'manyforge.cycle_recovery_result.v2'
-    || booleanAt(record.accepted, `${path}.accepted`) !== true
-    || stringAt(record.result_code, `${path}.result_code`) !== 'accepted'
-    || !RECOVERY_ACTION_IDS.has(actionId)
-  ) {
-    return fail(path, 'an accepted cycle-recovery result');
-  }
-  const run = parseProgramRunStatus(record.run);
-  const runtimeControls = parseProgramRuntimeControlProjection(
-    record.runtime_controls,
-  );
-  const recoveryOffer = record.recovery_offer === null
-    ? null
-    : parseCycleRecoveryOffer(record.recovery_offer, `${path}.recovery_offer`);
-  if (
-    run.capture.programRunId !== runtimeControls.programRunId
-    || (recoveryOffer !== null
-      && recoveryOffer.programRunId !== runtimeControls.programRunId)
-    || run.ownerEpoch !== runtimeControls.ownerEpoch
-    || run.runRevision !== runtimeControls.runRevision
-  ) {
-    return fail(path, 'one exact Program-run identity');
-  }
-  return {
-    schemaVersion,
-    requestId: stringAt(record.request_id, `${path}.request_id`),
-    accepted: true,
-    actionId,
-    cycleResumed: booleanAt(record.cycle_resumed, `${path}.cycle_resumed`),
-    resultCode: 'accepted',
-    ownerResult: record.owner_result === null
-      ? null
-      : jsonValueAt(record.owner_result, `${path}.owner_result`),
-    run,
-    runtimeControls,
-    recoveryOffer,
   };
 }
 
@@ -6354,7 +6123,7 @@ export function parseOperatorAlarmSnapshot(
   };
 }
 
-function parseComponentOverviewProjection(
+export function parseComponentOverviewProjection(
   value: unknown,
   path: string,
 ): ComponentOverviewProjection {
@@ -6545,8 +6314,8 @@ export function parseObjectResponse(value: unknown): Record<string, unknown> {
 function parseHistorianEvent(value: unknown, path: string): HistorianEvent {
   const record = objectAt(value, path);
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.historian_event.v1') {
-    return fail(`${path}.schema_version`, 'manyforge.historian_event.v1');
+  if (schemaVersion !== 'manyforge.historian_event.v2') {
+    return fail(`${path}.schema_version`, 'manyforge.historian_event.v2');
   }
   return {
     schemaVersion,
@@ -6554,7 +6323,10 @@ function parseHistorianEvent(value: unknown, path: string): HistorianEvent {
     component: stringAt(record.component, `${path}.component`),
     eventType: stringAt(record.event_type, `${path}.event_type`),
     severity: stringAt(record.severity, `${path}.severity`) as 'error',
-    occurredAtNs: integerAt(record.occurred_at_ns, `${path}.occurred_at_ns`),
+    occurredAtNs: nonnegativeInt64TextAt(
+      record.occurred_at_ns,
+      `${path}.occurred_at_ns`,
+    ),
     occurredAtWall: stringAt(
       record.occurred_at_wall,
       `${path}.occurred_at_wall`,
@@ -6563,22 +6335,71 @@ function parseHistorianEvent(value: unknown, path: string): HistorianEvent {
   };
 }
 
-export function parseHistorianPage(value: unknown): HistorianPage {
-  const record = objectAt(value, 'history');
-  const schemaVersion = stringAt(record.schema_version, 'history.schema_version');
-  if (schemaVersion !== 'manyforge.historian_page.v1') {
-    return fail('history.schema_version', 'manyforge.historian_page.v1');
+function parseHistorianEventSummary(
+  value: unknown,
+  path: string,
+): HistorianEventSummary {
+  const record = objectAt(value, path);
+  exactKeysAt(record, [
+    'component',
+    'condition_id',
+    'event_id',
+    'event_type',
+    'message',
+    'occurred_at_ns',
+    'occurred_at_wall',
+    'operation_id',
+    'program_run_id',
+    'schema_version',
+    'severity',
+  ], path);
+  const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
+  if (schemaVersion !== 'manyforge.historian_event_summary.v1') {
+    return fail(`${path}.schema_version`, 'manyforge.historian_event_summary.v1');
   }
   return {
     schemaVersion,
-    events: arrayAt(record.events, 'history.events').map((value, index) => {
+    eventId: stringAt(record.event_id, `${path}.event_id`),
+    component: stringAt(record.component, `${path}.component`),
+    eventType: stringAt(record.event_type, `${path}.event_type`),
+    severity: stringAt(record.severity, `${path}.severity`),
+    occurredAtNs: nonnegativeInt64TextAt(
+      record.occurred_at_ns,
+      `${path}.occurred_at_ns`,
+    ),
+    occurredAtWall: stringAt(record.occurred_at_wall, `${path}.occurred_at_wall`),
+    message: stringAt(record.message, `${path}.message`),
+    programRunId: nullableStringAt(record.program_run_id, `${path}.program_run_id`),
+    operationId: nullableStringAt(record.operation_id, `${path}.operation_id`),
+    conditionId: nullableStringAt(record.condition_id, `${path}.condition_id`),
+  };
+}
+
+export function parseHistorianPage(value: unknown): HistorianPage {
+  const record = objectAt(value, 'history');
+  exactKeysAt(record, [
+    'events',
+    'next_before_sequence',
+    'schema_version',
+    'truncated',
+  ], 'history');
+  const schemaVersion = stringAt(record.schema_version, 'history.schema_version');
+  if (schemaVersion !== 'manyforge.historian_summary_page.v1') {
+    return fail('history.schema_version', 'manyforge.historian_summary_page.v1');
+  }
+  const events = arrayAt(record.events, 'history.events');
+  if (events.length > 32) return fail('history.events', 'at most 32 summary rows');
+  return {
+    schemaVersion,
+    events: events.map((value, index) => {
       const stored = objectAt(value, `history.events[${index}]`);
+      exactKeysAt(stored, ['event', 'sequence'], `history.events[${index}]`);
       return {
-        sequence: integerAt(
+        sequence: positiveIntegerAt(
           stored.sequence,
           `history.events[${index}].sequence`,
         ),
-        event: parseHistorianEvent(
+        event: parseHistorianEventSummary(
           stored.event,
           `history.events[${index}].event`,
         ),
@@ -6586,7 +6407,10 @@ export function parseHistorianPage(value: unknown): HistorianPage {
     }),
     nextBeforeSequence: record.next_before_sequence === null
       ? null
-      : integerAt(record.next_before_sequence, 'history.next_before_sequence'),
+      : positiveIntegerAt(
+          record.next_before_sequence,
+          'history.next_before_sequence',
+        ),
     truncated: booleanAt(record.truncated, 'history.truncated'),
   };
 }
@@ -6609,8 +6433,8 @@ export function parseHistorianDetail(value: unknown): HistorianDetail {
   const record = objectAt(value, 'historyDetail');
   exactKeysAt(record, ['event', 'schema_version', 'sections', 'sequence'], 'historyDetail');
   const schemaVersion = stringAt(record.schema_version, 'historyDetail.schema_version');
-  if (schemaVersion !== 'manyforge.historian_detail.v1') {
-    return fail('historyDetail.schema_version', 'manyforge.historian_detail.v1');
+  if (schemaVersion !== 'manyforge.historian_detail.v2') {
+    return fail('historyDetail.schema_version', 'manyforge.historian_detail.v2');
   }
   const sections = objectAt(record.sections, 'historyDetail.sections');
   exactKeysAt(
@@ -8479,35 +8303,6 @@ export function parseCapabilityCommandPreviewResponse(
     minPosition,
     maxPosition,
     commitEligible: true,
-  };
-}
-
-export function parseOperationAcceptance(value: unknown): OperationAcceptance {
-  const envelope = objectAt(value, 'operationAcceptance');
-  if (
-    booleanAt(envelope.ok, 'operationAcceptance.ok') !== true
-    || stringAt(envelope.command, 'operationAcceptance.command') !== 'submit'
-  ) {
-    return fail('operationAcceptance', 'a successful submit response');
-  }
-  const accepted = objectAt(envelope.accepted, 'operationAcceptance.accepted');
-  const revision = integerAt(
-    accepted.operation_revision,
-    'operationAcceptance.accepted.operation_revision',
-  );
-  if (revision < 1) {
-    return fail('operationAcceptance.accepted.operation_revision', 'positive');
-  }
-  return {
-    requestId: stringAt(
-      accepted.request_id,
-      'operationAcceptance.accepted.request_id',
-    ),
-    operationId: stringAt(
-      accepted.operation_id,
-      'operationAcceptance.accepted.operation_id',
-    ),
-    operationRevision: revision,
   };
 }
 

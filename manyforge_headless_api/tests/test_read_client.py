@@ -21,7 +21,7 @@ SCHEMAS = {
     "/api/scene": "manyforge.scene_projection.v1",
     "/api/execution/alarms": "manyforge.operator_alarm_snapshot.v2",
     "/api/execution/alarms/metrics": "manyforge.operator_alarm_metrics.v1",
-    "/api/execution/history": "manyforge.historian_page.v1",
+    "/api/execution/history": "manyforge.historian_summary_page.v1",
     "/api/execution/history/health": "manyforge.async_historian_health.v1",
 }
 

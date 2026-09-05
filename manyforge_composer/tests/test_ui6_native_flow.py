@@ -90,7 +90,7 @@ def test_counter_delta_keeps_renewal_separate_from_visual_work() -> None:
     }
 
 
-def test_terminal_history_normalizes_the_existing_historian_envelope(
+def test_terminal_history_reads_exact_detail_for_matching_bounded_summary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     payload = {
@@ -100,24 +100,54 @@ def test_terminal_history_normalizes_the_existing_historian_envelope(
         "stop_generation": 4,
         "stop_id": "stop.4",
     }
-    page = {
-        "events": [{
-            "event": {
-                "event_type": "stop_terminal_projected",
-                "payload": {"journal_payload": payload},
-            },
-            "sequence": 12,
-        }],
+    summary_page = {
+        "events": [
+            {
+                "event": {
+                    "event_type": "stop_terminal_projected",
+                    "event_id": "event-stop-12",
+                },
+                "sequence": 12,
+            }
+        ],
     }
-    monkeypatch.setattr(ui6, "_http_json", lambda *_args, **_kwargs: page)
+    detail = {
+        "event": {
+            "event_type": "stop_terminal_projected",
+            "payload": {"journal_payload": payload},
+        },
+        "sequence": 12,
+    }
+    requests: list[tuple[str, tuple[tuple[str, object], ...]]] = []
+
+    def http_json(
+        _url: str,
+        path: str,
+        *,
+        params: list[tuple[str, object]] | None = None,
+    ) -> dict[str, Any]:
+        requests.append((path, tuple(params or ())))
+        if path == "/api/execution/history":
+            return summary_page
+        assert path == "/api/execution/history/12"
+        return detail
+
+    monkeypatch.setattr(ui6, "_http_json", http_json)
 
     terminal = ui6._wait_stop_terminal("http://composer.test", 11)
 
     assert terminal == {
-        "event": page["events"][0]["event"],
+        "event": detail["event"],
         "payload": payload,
         "sequence": 12,
     }
+    assert requests == [
+        (
+            "/api/execution/history",
+            (("event_types", "stop_terminal_projected"), ("limit", 32)),
+        ),
+        ("/api/execution/history/12", ()),
+    ]
 
 
 def test_ordinary_stop_waits_for_one_owner_published_running_node(
@@ -199,6 +229,7 @@ def test_stop_latency_uses_kernel_acceptance_and_settlement_timestamps() -> None
         "stopId": "stop.4",
         "stopGeneration": 4,
         "historianSequence": 12,
+        "messagesBeforeReceipt": [],
     }
 
 

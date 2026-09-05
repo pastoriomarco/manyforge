@@ -67,7 +67,10 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
   };
 
   [[nodiscard]] AuthoringAdmissionDTO AdmissionLocked() const noexcept;
+  [[nodiscard]] bool NonCycleReadinessLocked() const noexcept;
   [[nodiscard]] bool BaseReadinessLocked() const noexcept;
+  [[nodiscard]] bool MatchingStartingProgramCycleLocked(
+      const CellAdmissionClaimIntentDTO& intent) const noexcept;
   [[nodiscard]] const Entry* FindReplayLocked(const CellAdmissionClaimIntentDTO& intent) const;
   [[nodiscard]] Entry* FindHeldLocked(CellAdmissionClaimGeneration generation);
   [[nodiscard]] const Entry* ParentCycleLocked(const CellAdmissionClaimIntentDTO& intent) const;

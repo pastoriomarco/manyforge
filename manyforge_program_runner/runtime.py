@@ -36,6 +36,7 @@ from manyforge_behavior.orchestration_ports import (
     CompositeProgramRunContextPort,
     NodeAdapterPorts,
     OwnerTaskPort,
+    ProgramRunScopeState,
 )
 from manyforge_behavior.production_ports import (
     HeadlessSceneProgramPort,
@@ -308,7 +309,10 @@ class ProgramRuntime:
             )
         self._simulation_control = simulation_control
         self._environment = build_node_environment()
-        self._native = NativeKernelProgramPort(self._kernel)
+        self._native = NativeKernelProgramPort(
+            self._kernel,
+            current_owner_epoch=self._current_kernel_owner_epoch,
+        )
         self._scene = HeadlessSceneProgramPort(self._headless)
         self._cclc = CCLCProgramTaskPort(
             self._headless,
@@ -466,6 +470,7 @@ class ProgramRuntime:
             # domain-separated evidence.
             del evidence_digest
             retained = journal.liveness()
+            cycle = journal.read()
             liveness_status = (
                 None if self._liveness is None else self._liveness.status()
             )
@@ -474,6 +479,18 @@ class ProgramRuntime:
                 if liveness_status is None
                 else liveness_status.get("fault_reference")
             )
+            if (
+                cycle.reconciliation_required
+                and cycle.program_run_id is not None
+                and cycle.state
+                not in {"idle_after_reset", "terminal_awaiting_reset"}
+                and isinstance(fault_reference, str)
+            ):
+                self._contain_retained_run(
+                    cycle.program_run_id,
+                    fault_reference=fault_reference,
+                )
+                cycle = journal.read()
             if (
                 not retained.expired
                 and isinstance(fault_reference, str)
@@ -816,6 +833,19 @@ class ProgramRuntime:
                     pass
             for program_run_id in dict.fromkeys(run_ids):
                 try:
+                    self._owner.read(program_run_id)
+                except ProgramRunOwnerError:
+                    try:
+                        self._contain_retained_run(
+                            program_run_id,
+                            fault_reference=fault_reference,
+                        )
+                    except Exception:
+                        # The exact Kernel scope did not prove settlement. The
+                        # retained cycle stays fenced for later reconciliation.
+                        pass
+                    continue
+                try:
                     snapshot = self._host.stop_run(
                         program_run_id,
                         reason="manager_presence_expired",
@@ -826,6 +856,94 @@ class ProgramRuntime:
                     # unavailable whenever containment cannot be proven.
                     pass
         return fault_reference
+
+    def _contain_retained_run(
+        self,
+        program_run_id: str,
+        *,
+        fault_reference: str,
+    ) -> bool:
+        """Contain one non-resident retained run from exact Kernel evidence.
+
+        A replacement Program Runner deliberately cannot recreate an in-flight
+        behavior tree. It can still fence the immutable Program-run identity at
+        the Kernel and, after certified settlement, retain the same terminal
+        presentation that an ordinary owner Stop would have produced.
+        """
+
+        journal = self._journal
+        if journal is None:
+            return False
+        retained = journal.read_run_snapshot(program_run_id)
+        if not isinstance(retained, Mapping):
+            return False
+        capture = retained.get("capture")
+        if (
+            not isinstance(capture, Mapping)
+            or capture.get("program_run_id") != program_run_id
+        ):
+            return False
+        state = retained.get("state")
+        if state in {"stopped", "succeeded", "failed"}:
+            self._record_terminal_snapshot(retained)
+            return journal.read().state == "terminal_awaiting_reset"
+        revision = retained.get("run_revision")
+        node_revision = retained.get("node_status_revision")
+        statuses = retained.get("node_statuses")
+        if (
+            type(revision) is not int
+            or revision < 1
+            or type(node_revision) is not int
+            or node_revision < 1
+            or not isinstance(statuses, Mapping)
+        ):
+            return False
+
+        scope = self._native.scope
+        settlement = scope.request_stop(
+            program_run_id,
+            self._digest(
+                {
+                    "fault_reference": fault_reference,
+                    "kind": "manager_loss_retained_run_stop",
+                    "program_run_id": program_run_id,
+                }
+            ),
+            "manager_presence_expired",
+        )
+        # Reconciliation is retried by the existing Manager-renewal cadence.
+        # Never hold that liveness request open while physical settlement is
+        # pending: the exact Kernel Stop identity is idempotent, so the next
+        # renewal observes or rejoins the same containment operation.
+        if settlement.state is not ProgramRunScopeState.SETTLED:
+            return False
+
+        stopped_statuses = {
+            instance_id: "idle" for instance_id in statuses
+        }
+        terminal = deepcopy(dict(retained))
+        terminal.update(
+            {
+                "run_revision": revision + 1,
+                "state": "stopped",
+                "tree_status": "invalid",
+                "node_status_revision": (
+                    node_revision + 1
+                    if dict(statuses) != stopped_statuses
+                    else node_revision
+                ),
+                "node_statuses": stopped_statuses,
+                "active_operation_count": 0,
+                "reason_code": None,
+                "message": "",
+            }
+        )
+        self._record_terminal_snapshot(terminal)
+        cycle = journal.read()
+        return bool(
+            cycle.state == "terminal_awaiting_reset"
+            and cycle.program_run_id == program_run_id
+        )
 
     def _build_owner_availability(self) -> dict[str, AvailabilityFact]:
         resolver = build_executable_node_resolver(self._environment)
@@ -938,6 +1056,19 @@ class ProgramRuntime:
                 "durable Program-cycle admission is not configured",
             )
         return self._admission, self._journal
+
+    def _current_kernel_owner_epoch(self) -> str:
+        """Read the stable Kernel identity without requiring a robot product."""
+
+        admission, _journal = self._require_cycle_owner()
+        inventory = admission.recovery_inventory(owner_epoch=self.owner_epoch)
+        owner_epoch = inventory.get("kernel_owner_epoch")
+        if not isinstance(owner_epoch, str) or not owner_epoch:
+            raise ProgramRunnerError(
+                "execution_command_response_invalid",
+                "cell admission omitted the current Kernel owner epoch",
+            )
+        return owner_epoch
 
     @staticmethod
     def _admission_generation(value: Mapping[str, Any]) -> int:
@@ -1181,13 +1312,25 @@ class ProgramRuntime:
             command["command_kind"]: command["allowed"]
             for command in result["allowed_commands"]
         }
+        reconciliation_fenced = any(
+            command["disabled_reason"]
+            == "program_cycle_reconciliation_required"
+            for command in result["allowed_commands"]
+        )
+
+        def run_allows(kind: str, *states: str) -> bool:
+            return bool(
+                base_permissions.get(kind, False)
+                and cycle_running
+                and run_state in states
+            )
+
+        stoppable = ("running", "intervention_required")
         exact_run_permissions = {
-            "program_motion_stop": cycle_running and run_state in {
-                "running", "intervention_required"
-            },
-            "program_full_stop": cycle_running and run_state in {
-                "running", "intervention_required"
-            },
+            "program_motion_stop": run_allows(
+                "program_motion_stop", *stoppable
+            ),
+            "program_full_stop": run_allows("program_full_stop", *stoppable),
             # Starting has no retained Program tree yet, so its authoritative
             # cycle permission must survive this tree-dependent refinement.
             # Program Stop is the one Stop form that can overtake acquisition.
@@ -1197,36 +1340,34 @@ class ProgramRuntime:
                     "running", "intervention_required", "full_stopping"
                 }
             ),
-            "program_reset": (
-                base_permissions.get("program_reset", False)
-                or cycle_running and run_state in {
+            "program_reset": base_permissions.get("program_reset", False)
+            and (
+                not cycle_running
+                or run_state in {
                     "running", "intervention_required", "full_stopped"
                 }
             ),
             "program_resume_full_stop": (
-                cycle_running and run_state == "full_stopped"
+                not reconciliation_fenced
+                and cycle_running
+                and run_state == "full_stopped"
             ),
             "program_discard_full_stop": (
-                cycle_running and run_state == "full_stopped"
+                not reconciliation_fenced
+                and cycle_running
+                and run_state == "full_stopped"
             ),
-            "program_runtime_override_stage": (
-                cycle_running and run_state == "running"
-            ),
-            "program_runtime_override_activate": (
-                cycle_running and run_state == "running"
-            ),
-            "program_runtime_override_clear": (
-                cycle_running and run_state == "running"
-            ),
-            "program_runtime_override_promote": (
-                cycle_running and run_state == "running"
-            ),
-            "program_runtime_blackboard_write": (
-                cycle_running and run_state == "running"
-            ),
-            "program_manual_result_stage": (
-                cycle_running and run_state == "running"
-            ),
+            **{
+                kind: run_allows(kind, "running")
+                for kind in (
+                    "program_runtime_override_stage",
+                    "program_runtime_override_activate",
+                    "program_runtime_override_clear",
+                    "program_runtime_override_promote",
+                    "program_runtime_blackboard_write",
+                    "program_manual_result_stage",
+                )
+            },
         }
         for command in result["allowed_commands"]:
             kind = command["command_kind"]

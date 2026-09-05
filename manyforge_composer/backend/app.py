@@ -487,11 +487,6 @@ def create_app(
                 state.headless_client,
                 state,
                 execution_controls,
-                (
-                    headless_state_source.current_component_overview
-                    if headless_state_source is not None
-                    else None
-                ),
             ),
             tags=["headless-runtime-client"],
         )

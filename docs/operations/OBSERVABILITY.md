@@ -76,23 +76,20 @@ The launcher pins all bridge/supervisor/vLLM-proxy artifacts under
 | `$LOG_DIR/vllm-proxy.pid`                | vLLM proxy PID for stop                            |
 | `$LOG_DIR/launcher-smoke.json`           | Last `smoke` verb output (`scripts/launch.sh:616`) |
 
-### Kernel events
+### Runtime events
 
-Kernel events are **not persisted to disk**. They are buffered in
-memory by `manyforge_composer/backend/event_recorder.py` and surfaced
-through:
+Runtime and alarm events are written asynchronously to the bounded Headless
+Historian. Composer does not buffer, merge, or persist a second event stream.
+The public read surface is:
 
-- `GET /api/kernel/events?since=N` — drains the queue since cursor N.
-- `GET /api/execution/history` — same store, with rich filtering
-  (`eventTypes`, `minSeverity`, `components`, `startNs`, etc.).
-- `GET /api/execution/digest` — the high-level summary used by the
-  Composer UI.
-- `GET /api/execution/alarms` — current condition-backed alarms, source/
-  manager health, and bounded lifecycle history.
+- `GET /api/execution/history` — one bounded 32-row summary page;
+- `GET /api/execution/history/{sequence}` — exact detail for one selected row;
+- `GET /api/execution/history/health` — Historian storage health; and
+- `GET /api/execution/alarms` — current condition-backed alarms.
 
-There is no log-replay mechanism today; if you need to capture a
-failure for offline analysis use `GET /api/debug/export?run_id=…`
-(see below).
+The browser mounts only the current summary page and requests detail on
+selection. This keeps debugging evidence durable without coupling History
+size or rendering work to browser uptime.
 
 ### What is **not** a runtime log
 
@@ -164,8 +161,12 @@ not itself a pose-apply failure. A definitive failure is separately alarmed.
 
 The in-view **Tools > Viewer rate** selector controls only the current browser's
 bounded NRT frame request (`Auto`, 2, 5, 10, 15, or 30 Hz). `Auto` requests
-15 Hz for both hardware and software renderers. Select a lower explicit rate
-when software rendering or same-host load needs a tighter bound. External object
+at most 30 applied robot frames/s on hardware and 10/s under software WebGL;
+the applied-frame credit itself enforces the bound, so a slow renderer cannot
+run continuously and starve heartbeat/control work. Software keeps DPR 1
+without antialiasing; hardware uses antialiasing and a DPR cap of 1.5. Select a
+lower explicit rate when software rendering or same-host load needs a tighter
+bound. External object
 freshness is controlled separately by the applied deployment pose source's
 `max_update_hz`; increasing the viewer rate does not increase that source's
 acquisition rate.

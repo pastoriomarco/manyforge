@@ -37,7 +37,7 @@ def _source() -> HeadlessStateSource:
 def _owner_snapshot() -> str:
     return json.dumps(
         {
-            "schema_version": "manyforge.execution_control.v1",
+            "schema_version": "manyforge.execution_control.v2",
             "message_kind": "snapshot",
             "control_session_id": "control-session.1",
             "server_sequence": "1",
@@ -54,7 +54,7 @@ def test_source_only_enriches_owner_frames_and_performs_no_http_reads() -> None:
     first = json.loads(source.enrich(_owner_snapshot()))
     second_value = json.loads(_owner_snapshot())
     second_value["message_kind"] = "delta"
-    second = json.loads(source.enrich(json.dumps(second_value)))
+    second_payload = json.dumps(second_value)
 
     assert first["control"] == {"semantic_owner_epoch": "runner.1"}
     assert first["shell"]["schema_version"] == (
@@ -63,13 +63,13 @@ def test_source_only_enriches_owner_frames_and_performs_no_http_reads() -> None:
     assert first["shell"]["receiver_epoch"] == "composer.epoch.1"
     assert first["shell"]["snapshot_sequence"] == 1
     assert first["shell"]["draft_identity"]["draft_revision"] == 0
-    assert second["shell"]["snapshot_sequence"] == 2
-    assert source.current_component_overview() == {"readiness": "ready"}
+    assert first["shell"]["complete"] is True
+    assert source.enrich(second_payload) == second_payload
 
 
 def test_source_forwards_receipts_without_reencoding_them() -> None:
     source = _source()
-    receipt = '{ "schema_version":"manyforge.execution_control.v1", "message_kind":"command_receipt" }'
+    receipt = '{ "schema_version":"manyforge.execution_control.v2", "message_kind":"command_receipt" }'
 
     assert source.enrich(receipt) == receipt
 
@@ -165,7 +165,7 @@ def test_proxy_forwards_both_directions_and_releases_demand(
         assert browser.sent[0]["message_kind"] == "snapshot"
         assert browser.sent[0]["shell"]["receiver_epoch"] == "composer.epoch.1"
         assert connection_options["compression"] is None
-        assert source._clients == 0  # noqa: SLF001
+        assert not source._local_subscriptions  # noqa: SLF001
 
     asyncio.run(exercise())
 
@@ -188,6 +188,53 @@ def test_slow_browser_output_cannot_block_command_ingress(monkeypatch) -> None:
         assert upstream.sent == ["stop-command"]
         browser.release_send.set()
         await asyncio.wait_for(task, 0.5)
+
+    asyncio.run(exercise())
+
+
+def test_local_draft_wake_emits_one_resequenced_latest_shell(
+    monkeypatch,
+) -> None:
+    class _TwoFrameBrowser(_Browser):
+        async def send_text(self, message: str) -> None:
+            self.sent.append(json.loads(message))
+            if len(self.sent) == 2:
+                raise WebSocketDisconnect()
+
+    async def exercise() -> None:
+        upstream = _Upstream(wait_for_browser=False)
+        monkeypatch.setattr(
+            headless_ws,
+            "connect_websocket",
+            lambda *_args, **_kwargs: upstream,
+        )
+        source = _source()
+        browser = _TwoFrameBrowser('{"message_kind":"client_hello"}')
+        task = asyncio.create_task(
+            serve_headless_state(browser, source)  # type: ignore[arg-type]
+        )
+        while not browser.sent:
+            await asyncio.sleep(0)
+        source.notify_local_state_change()
+        await asyncio.wait_for(task, 0.5)
+
+        assert [frame["server_sequence"] for frame in browser.sent] == ["1", "2"]
+        assert browser.sent[1]["message_kind"] == "delta"
+        assert browser.sent[1]["event_class"] == "cold"
+        assert browser.sent[1]["control"] is None
+        assert browser.sent[1]["shell"]["complete"] is False
+        assert browser.sent[1]["shell"]["snapshot_sequence"] == 2
+        assert browser.sent[1]["shell"] == {
+            "complete": False,
+            "draft_identity": {
+                "draft_id": source._draft_session.snapshot()["draft_id"],  # noqa: SLF001
+                "draft_revision": 0,
+            },
+            "receiver_epoch": "composer.epoch.1",
+            "schema_version": "manyforge.composer_headless_state.v2",
+            "snapshot_sequence": 2,
+        }
+        assert not source._local_subscriptions  # noqa: SLF001
 
     asyncio.run(exercise())
 

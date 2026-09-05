@@ -9,6 +9,7 @@ Manager clients.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass, fields
 import hashlib
 from typing import Any
 
@@ -22,6 +23,27 @@ _WAITING = "waiting"
 _WARNING = "warning"
 _FAULT = "fault"
 _OFFLINE = "offline"
+
+
+@dataclass(frozen=True, slots=True)
+class ComponentOverviewFacts:
+    """One immutable capture of every owner fact used by the reducer."""
+
+    runtime: Mapping[str, Any] | None
+    alarms: Mapping[str, Any] | None
+    authoring_admission: Mapping[str, Any] | None
+    program_cycle: Mapping[str, Any] | None
+    applied_program: Mapping[str, Any] | None
+    source_model: Mapping[str, Any] | None
+    execution_identity_response: Mapping[str, Any] | None
+    execution_targets_response: Mapping[str, Any] | None
+    execution_control_response: Mapping[str, Any] | None
+    errors: Mapping[str, Mapping[str, Any]]
+
+    def reduce(self) -> dict[str, Any]:
+        return build_component_overview(
+            **{field.name: getattr(self, field.name) for field in fields(self)}
+        )
 
 
 def _mapping(value: object) -> Mapping[str, Any]:
@@ -361,7 +383,13 @@ def build_component_overview(
                 required_for=("Observe / Render", "Plan / Preview"),
                 owner_id=section.get("source_owner_id"),
                 owner_epoch=section.get("source_owner_epoch"),
-                generation=section.get("source_generation"),
+                # Scene-runtime generation advances for pose samples. The
+                # exact value remains in basis, not operator-visible health.
+                generation=(
+                    None
+                    if section_id == "scene_runtime"
+                    else section.get("source_generation")
+                ),
                 reason_code=reason,
                 scope="scene",
             )
@@ -755,10 +783,30 @@ def build_component_overview(
             "execution_publication_generation": identity.get("active_publication_generation"),
         },
     }
+    # The revision identifies operator-visible meaning, not receiver
+    # bookkeeping.  Keep the latter in ``basis`` for diagnostics without
+    # making an otherwise identical Overview look new on every source pulse.
+    revision_value = {
+        **overview,
+        "basis": {
+            key: value
+            for key, value in overview["basis"].items()
+            if key
+            not in {
+                "runtime_projection_generation",
+                "alarm_state_revision",
+                "scene_runtime_source_generation",
+            }
+        },
+    }
     overview["overview_revision"] = "sha256:" + hashlib.sha256(
-        rfc8785.dumps(overview)
+        rfc8785.dumps(revision_value)
     ).hexdigest()
     return overview
 
 
-__all__ = ["COMPONENT_OVERVIEW_VERSION", "build_component_overview"]
+__all__ = [
+    "COMPONENT_OVERVIEW_VERSION",
+    "ComponentOverviewFacts",
+    "build_component_overview",
+]

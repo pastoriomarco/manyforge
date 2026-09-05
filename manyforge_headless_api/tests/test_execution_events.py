@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import threading
 from pathlib import Path
@@ -54,6 +55,33 @@ def _event(owner_epoch: str, sequence: int) -> dict[str, Any]:
         "request_id": None,
         "sequence": sequence,
     }
+
+
+def _progress_event(
+    owner_epoch: str,
+    sequence: int,
+    *,
+    state: str,
+    progress: float,
+    operation_id: str = "operation.1",
+) -> dict[str, Any]:
+    event = copy.deepcopy(_event(owner_epoch, sequence))
+    event["operation_id"] = operation_id
+    operation = event["payload"]["operation_state"]
+    operation["operation_id"] = operation_id
+    operation["state"] = state
+    operation["updated_at_ns"] = 100 + sequence
+    operation["participants"] = [
+        {
+            "participant_id": "operation.1.participant.1",
+            "progress": progress,
+            "state": state,
+            "terminal_error": None,
+        }
+    ]
+    canonical = rfc8785.dumps(event["payload"])
+    event["payload_digest"] = f"sha256:{hashlib.sha256(canonical).hexdigest()}"
+    return event
 
 
 def _stop_projection_event(
@@ -197,6 +225,7 @@ def _stop_fault_clear_event(owner_epoch: str, sequence: int) -> dict[str, Any]:
 
 def _page(owner_epoch: str, events: list[dict[str, Any]]) -> dict[str, Any]:
     return {
+        "admission_generation": 1,
         "api_version": "manyforge.execution_command_response.v1",
         "command": "events",
         "event_page": {
@@ -274,6 +303,13 @@ def test_execution_client_validates_event_cursor_and_owner(
     monkeypatch.setattr(client, "_exchange", lambda _command: response)
     page = client.events(owner_epoch, 0)
     assert page["next_after_sequence"] == 1
+    assert page["admission_generation"] == 1
+
+    response["admission_generation"] = 0
+    with pytest.raises(HeadlessApiError) as invalid_admission:
+        client.events(owner_epoch, 0)
+    assert invalid_admission.value.code == "execution_command_response_invalid"
+    response["admission_generation"] = 1
 
     response["event_page"]["next_after_sequence"] = 2
     with pytest.raises(HeadlessApiError) as invalid:
@@ -1035,6 +1071,7 @@ class _RecordingCore:
 class _PagedExecution:
     def __init__(self) -> None:
         self.owner_epoch = "execution-host.epoch.pump"
+        self.admission_generation = 1
         self.fail = False
         self.event = _event(self.owner_epoch, 1)
         self.stop_fault_offer: dict[str, Any] | None = None
@@ -1042,6 +1079,7 @@ class _PagedExecution:
 
     def identity(self) -> dict[str, Any]:
         return {
+            "admission_generation": self.admission_generation,
             "api_version": "manyforge.execution_command_response.v1",
             "command": "identity",
             "ok": True,
@@ -1057,6 +1095,7 @@ class _PagedExecution:
         assert limit == 1
         events = [] if after_sequence else [self.event]
         return {
+            "admission_generation": self.admission_generation,
             "events": events,
             "has_more": False,
             "next_after_sequence": after_sequence or 1,
@@ -1074,9 +1113,40 @@ class _PagedExecution:
         }
 
 
+class _StreamingExecution(_PagedExecution):
+    def __init__(self) -> None:
+        super().__init__()
+        self._events: list[dict[str, Any]] = []
+        self._lock = threading.Lock()
+
+    def append(self, event: dict[str, Any]) -> None:
+        with self._lock:
+            self._events.append(event)
+
+    def events(
+        self, owner_epoch: str, after_sequence: int, *, limit: int = 16
+    ) -> dict[str, Any]:
+        assert owner_epoch == self.owner_epoch
+        with self._lock:
+            available = [
+                event for event in self._events if event["sequence"] > after_sequence
+            ]
+            events = available[:limit]
+        next_sequence = events[-1]["sequence"] if events else after_sequence
+        return {
+            "admission_generation": self.admission_generation,
+            "events": events,
+            "has_more": len(available) > len(events),
+            "next_after_sequence": next_sequence,
+            "owner_epoch": owner_epoch,
+            "schema_version": "manyforge.execution_event_page.v1",
+        }
+
+
 class _IdleExecution:
     def __init__(self, *, include_epoch: bool = True) -> None:
         self.owner_epoch = "kernel-owner.runtime-epoch"
+        self.admission_generation = 1
         self.include_epoch = include_epoch
         self.status_calls = 0
         self.events_calls = 0
@@ -1086,6 +1156,7 @@ class _IdleExecution:
         self.status_calls += 1
         details = {"owner_epoch": self.owner_epoch} if self.include_epoch else {}
         return {
+            "admission_generation": self.admission_generation,
             "api_version": "manyforge.execution_command_response.v1",
             "command": "identity",
             "error": {
@@ -1121,6 +1192,7 @@ class _RetiringExecution(_PagedExecution):
         if not self.retired:
             return super().identity()
         return {
+            "admission_generation": self.admission_generation,
             "api_version": "manyforge.execution_command_response.v1",
             "command": "identity",
             "error": {
@@ -1161,6 +1233,117 @@ def test_event_pump_delivers_without_frontend_polling_and_stops_cleanly() -> Non
     ).decode("utf-8")
 
 
+def test_event_pump_wakes_cold_state_when_kernel_admission_advances() -> None:
+    core = _RecordingCore()
+    execution = _StreamingExecution()
+    changed = threading.Event()
+    wakes: list[None] = []
+    pump = ExecutionEventPump(  # type: ignore[arg-type]
+        core, execution, poll_seconds=0.01, page_limit=1
+    )
+
+    def observe() -> None:
+        wakes.append(None)
+        changed.set()
+
+    pump.set_change_observer(observe)
+    pump.start()
+    assert changed.wait(timeout=1.0)
+    changed.clear()
+    baseline = len(wakes)
+
+    execution.admission_generation += 1
+    assert changed.wait(timeout=1.0)
+    pump.shutdown()
+
+    assert core.ingested == []
+    assert len(wakes) == baseline + 1
+
+
+def test_event_pump_records_progress_without_rebuilding_control_projection() -> None:
+    core = _RecordingCore()
+    execution = _StreamingExecution()
+    wakes: list[None] = []
+    execution.append(
+        _progress_event(execution.owner_epoch, 1, state="executing", progress=0.1)
+    )
+    pump = ExecutionEventPump(  # type: ignore[arg-type]
+        core, execution, poll_seconds=0.01, page_limit=1
+    )
+    pump.set_change_observer(lambda: wakes.append(None))
+    pump.start()
+    for _ in range(100):
+        if len(core.ingested) >= 1 and wakes:
+            break
+        threading.Event().wait(0.01)
+    first_wake_count = len(wakes)
+
+    execution.append(
+        _progress_event(execution.owner_epoch, 2, state="executing", progress=0.8)
+    )
+    for _ in range(100):
+        if len(core.ingested) >= 2:
+            break
+        threading.Event().wait(0.01)
+    threading.Event().wait(0.03)
+
+    assert len(core.ingested) == 2
+    assert len(wakes) == first_wake_count == 1
+
+    execution.append(
+        _progress_event(execution.owner_epoch, 3, state="completed", progress=1.0)
+    )
+    for _ in range(100):
+        if len(core.ingested) >= 3 and len(wakes) > first_wake_count:
+            break
+        threading.Event().wait(0.01)
+    pump.shutdown()
+
+    assert len(core.ingested) == 3
+    assert len(wakes) == first_wake_count + 1
+
+
+def test_event_pump_operation_semantic_cache_has_the_native_resident_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "manyforge_headless_api.execution.MAXIMUM_RESIDENT_OPERATION_CONTROL_KEYS",
+        1,
+    )
+    core = _RecordingCore()
+    execution = _StreamingExecution()
+    execution.append(
+        _progress_event(
+            execution.owner_epoch,
+            1,
+            state="executing",
+            progress=0.1,
+            operation_id="operation.1",
+        )
+    )
+    execution.append(
+        _progress_event(
+            execution.owner_epoch,
+            2,
+            state="executing",
+            progress=0.1,
+            operation_id="operation.2",
+        )
+    )
+    pump = ExecutionEventPump(  # type: ignore[arg-type]
+        core, execution, poll_seconds=0.01, page_limit=1
+    )
+    pump.start()
+    for _ in range(100):
+        if pump.last_error is not None:
+            break
+        threading.Event().wait(0.01)
+    pump.shutdown()
+
+    assert pump.last_error is not None
+    assert "execution_control_projection_capacity_invalid" in pump.last_error
+
+
 def test_event_pump_reconciles_typed_idle_owner_without_querying_events() -> None:
     core = _RecordingCore()
     execution = _IdleExecution()
@@ -1187,6 +1370,33 @@ def test_event_pump_reconciles_typed_idle_owner_without_querying_events() -> Non
         "source_owner_epoch": execution.owner_epoch,
         "through_source_sequence": 0,
     }
+
+
+def test_event_pump_wakes_cold_state_when_idle_kernel_admission_advances() -> None:
+    core = _RecordingCore()
+    execution = _IdleExecution()
+    changed = threading.Event()
+    wakes: list[None] = []
+    pump = ExecutionEventPump(  # type: ignore[arg-type]
+        core, execution, poll_seconds=0.01, page_limit=1
+    )
+
+    def observe() -> None:
+        wakes.append(None)
+        changed.set()
+
+    pump.set_change_observer(observe)
+    pump.start()
+    assert changed.wait(timeout=1.0)
+    changed.clear()
+    baseline = len(wakes)
+
+    execution.admission_generation += 1
+    assert changed.wait(timeout=1.0)
+    pump.shutdown()
+
+    assert len(wakes) == baseline + 1
+    assert execution.events_calls == 0
 
 
 def test_event_pump_reconciles_idle_after_owner_retirement_at_event_high_water() -> None:

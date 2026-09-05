@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
+import logging
 import math
 from pathlib import Path
 import re
@@ -93,6 +94,7 @@ _ASSISTANT_PROPOSAL_MUTATIONS = frozenset(
 _PORTABLE_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_.-]*$")
 _PORTABLE_ID_MAX_BYTES = 128
 _T = TypeVar("_T")
+_LOGGER = logging.getLogger(__name__)
 
 
 def _is_portable_id(value: Any) -> bool:
@@ -727,6 +729,28 @@ class ComposerDraftSession:
         self._saved_document = (
             program.to_dict() if resolved_source is not None else None
         )
+        self._identity_change_observer: Callable[[], None] | None = None
+
+    def set_identity_change_observer(
+        self, observer: Callable[[], None] | None
+    ) -> None:
+        """Install the one non-authoritative presentation wake callback."""
+
+        if observer is not None and not callable(observer):
+            raise TypeError("Draft identity observer must be callable")
+        with self._lock:
+            self._identity_change_observer = observer
+
+    def _notify_identity_change_locked(self) -> None:
+        observer = self._identity_change_observer
+        if observer is None:
+            return
+        try:
+            observer()
+        except Exception:
+            # A presentation wake cannot roll back or relabel an already
+            # committed authoring-owner mutation.
+            _LOGGER.exception("Composer Draft identity wake failed")
 
     @property
     def draft_id(self) -> str:
@@ -864,6 +888,7 @@ class ComposerDraftSession:
                     status_code=503,
                 )
         with self._lock:
+            prior_identity = (self._draft_id, self._revision)
             self._draft_id = draft_id
             self._revision = revision
             self._authoring = deepcopy(authoring)
@@ -872,6 +897,8 @@ class ComposerDraftSession:
             self._saved_path = resolved_saved_path
             self._saved_program_revision = saved_revision
             self._saved_document = deepcopy(saved_document)
+            if prior_identity != (self._draft_id, self._revision):
+                self._notify_identity_change_locked()
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -1156,6 +1183,7 @@ class ComposerDraftSession:
             self._saved_path = str(Path(source_path).resolve())
             self._saved_program_revision = program.program_revision
             self._saved_document = program.to_dict()
+            self._notify_identity_change_locked()
             return self._workspace_snapshot_locked()
 
     def apply_current_program(
@@ -1269,6 +1297,7 @@ class ComposerDraftSession:
             self._saved_path = None
             self._saved_program_revision = None
             self._saved_document = None
+            self._notify_identity_change_locked()
             return self._workspace_snapshot_locked()
 
     def discard_to_applied(
@@ -1304,6 +1333,7 @@ class ComposerDraftSession:
             self._program = applied
             self._diagnostics = []
             self._revision += 1
+            self._notify_identity_change_locked()
             return self._workspace_snapshot_locked(
                 applied_program_revision=applied.program_revision,
             )
@@ -1350,6 +1380,7 @@ class ComposerDraftSession:
                     self._program = validated_saved
                     self._diagnostics = []
                     self._revision += 1
+                    self._notify_identity_change_locked()
                 return None, self._workspace_snapshot_locked(
                     applied_program_revision=validated_saved.program_revision,
                 )
@@ -1374,6 +1405,7 @@ class ComposerDraftSession:
                 self._program = validated_saved
                 self._diagnostics = []
                 self._revision += 1
+                self._notify_identity_change_locked()
             return result, self._workspace_snapshot_locked(
                 applied_program_revision=validated_saved.program_revision,
             )
@@ -1456,6 +1488,7 @@ class ComposerDraftSession:
             self._program = candidate
             self._diagnostics = diagnostics
             self._revision += 1
+            self._notify_identity_change_locked()
             return DraftMutationResult(
                 mutation=mutation,
                 details=details,

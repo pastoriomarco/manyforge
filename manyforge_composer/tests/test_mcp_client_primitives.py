@@ -38,7 +38,7 @@ class RecordingReader:
 
     def invoke(self, operation, arguments=None):
         self.calls.append((operation, arguments))
-        return {"schema_version": "manyforge.historian_page.v1"}
+        return {"schema_version": "manyforge.historian_summary_page.v1"}
 
 
 def test_mcp_adapter_exposes_only_the_closed_h0_read_catalog() -> None:
@@ -50,7 +50,7 @@ def test_mcp_adapter_exposes_only_the_closed_h0_read_catalog() -> None:
         {"limit": 4},
     )
 
-    assert result["schema_version"] == "manyforge.historian_page.v1"
+    assert result["schema_version"] == "manyforge.historian_summary_page.v1"
     assert reader.calls == [("history", {"limit": 4})]
     assert MCP_HEADLESS_READ_TOOLS["manyforge_node_environment"] == (
         "node_environment"

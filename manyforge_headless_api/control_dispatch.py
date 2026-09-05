@@ -208,6 +208,34 @@ class HeadlessExecutionControlDispatch:
         )
 
     @staticmethod
+    def _addressed_result(
+        request: ExecutionCommandRequestDTO,
+        *,
+        disposition: str,
+        code: str,
+        current_identity: Mapping[str, Any] | None = None,
+    ) -> ExecutionIngressResult:
+        """Describe owner disposition without resampling owner state.
+
+        The command envelope already names the exact semantic context admitted
+        at this ingress.  Current owner state travels independently on the
+        change-driven control stream, so synchronously rereading Program Runner
+        after an effect only delays the receipt and can accidentally describe a
+        concurrent, unrelated transition.
+        """
+
+        envelope = request.command_envelope
+        return ExecutionIngressResult(
+            disposition=disposition,  # type: ignore[arg-type]
+            code=code,
+            semantic_owner_epoch=envelope.expected_semantic_owner_epoch,
+            execution_control_revision=(
+                envelope.expected_execution_control_revision
+            ),
+            current_identity=current_identity,
+        )
+
+    @staticmethod
     def _availability(
         cycle: Mapping[str, Any], command_kind: str
     ) -> tuple[bool, str | None]:
@@ -273,6 +301,11 @@ class HeadlessExecutionControlDispatch:
                     "program_runner_unavailable",
                     "independent Program runner is not configured",
                 )
+            cycle_before = None
+        elif is_stop_command(envelope.command_kind):
+            # Recognized Stop must not wait for a Program projection read.  Its
+            # semantic owner validates the exact target and current state, then
+            # the state stream publishes the authoritative outcome.
             cycle_before = None
         else:
             cycle_before = self._service.program_cycle_status()
@@ -487,20 +520,18 @@ class HeadlessExecutionControlDispatch:
             current_identity = {"execution_owner_epoch": owner}
 
             def owner_result(disposition: str, code: str) -> ExecutionIngressResult:
-                return ExecutionIngressResult(
-                    disposition=disposition,  # type: ignore[arg-type]
+                return self._addressed_result(
+                    request,
+                    disposition=disposition,
                     code=code,
-                    semantic_owner_epoch=owner,
-                    execution_control_revision=revision,
                     current_identity=current_identity,
                 )
 
         else:
-            cycle_after = self._service.program_cycle_status()
 
             def owner_result(disposition: str, code: str) -> ExecutionIngressResult:
-                return self._owner_result(
-                    cycle_after,
+                return self._addressed_result(
+                    request,
                     disposition=disposition,
                     code=code,
                 )

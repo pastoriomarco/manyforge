@@ -59,6 +59,7 @@ from ui6_native_flow import (
 RESULT_SCHEMA = "manyforge.ui6.stop-latency.v1"
 WARM_SAMPLES = 100
 CONTROL_SCALE = 0.01
+MIN_MOTION_FRAME_ADVANCE = 3
 PRESSURE_WORK_MS = 12
 PRESSURE_PERIOD_MS = 40
 PRESSURE_REQUEST_INTERVAL_S = 0.025
@@ -201,22 +202,13 @@ def _assert_interference(
     return comparison
 
 
-STOP_CLICK_SCRIPT = r"""return (() => {
-  const stop = document.querySelector('.viewer-transport .transport-stop-primary');
-  const probe = window.__manyforgeUi6StopProbe;
-  if (!(stop instanceof HTMLButtonElement) || stop.disabled || probe === undefined) {
-    return false;
-  }
-  probe.clickPerfMs = performance.now();
-  probe.clickWallMs = Date.now();
-  stop.click();
-  return true;
-})();"""
-
-
-STOP_PRESENTATION_WAIT_SCRIPT = r"""
+STOP_CLICK_AND_PRESENTATION_WAIT_SCRIPT = r"""
 const done = arguments[arguments.length - 1];
 const transport = document.querySelector('.viewer-transport');
+const stop = document.querySelector(
+  '.viewer-transport .transport-stop-primary',
+);
+const probe = window.__manyforgeUi6StopProbe;
 let finished = false;
 let timeoutId;
 let observer;
@@ -259,8 +251,11 @@ const inspect = () => {
     finish({ state, trace });
   }
 };
-if (!(transport instanceof HTMLElement)) {
-  finish({ error: 'transport unavailable', state: read(), trace });
+if (!(transport instanceof HTMLElement)
+  || !(stop instanceof HTMLButtonElement)
+  || stop.disabled
+  || probe === undefined) {
+  finish({ error: 'eligible Stop unavailable', state: read(), trace });
 } else {
   observer = new MutationObserver(inspect);
   observer.observe(transport, {
@@ -273,20 +268,23 @@ if (!(transport instanceof HTMLElement)) {
   timeoutId = window.setTimeout(() => {
     finish({ error: 'timed out', state: read(), trace });
   }, 4000);
+  probe.clickPerfMs = performance.now();
+  probe.clickWallMs = Date.now();
+  stop.click();
   inspect();
 }
 """
 
 
-def _await_stopped_presentation(
+def _click_and_await_stopped_presentation(
     driver: RawWebDriver,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Observe the transition in-page without perturbing Firefox at 20 Hz."""
+    """Dispatch and observe Stop in one browser task without remote-command churn."""
 
     value = driver.command(
         "POST",
         "/execute/async",
-        {"script": STOP_PRESENTATION_WAIT_SCRIPT, "args": []},
+        {"script": STOP_CLICK_AND_PRESENTATION_WAIT_SCRIPT, "args": []},
     )
     if not isinstance(value, dict):
         raise CollectorError("Stopped presentation wait returned an invalid result")
@@ -345,24 +343,25 @@ def _one_stop(
         DEFAULT_TIMEOUT_S,
     )
     _assert_transition_fences(run_trace, f"UI6 repeated {start_label}")
-    _wait_running_node(composer_url)
+    _wait_running_node(composer_url, "move_to_rest")
+    _wait_history_event_after(composer_url, "operation_executing", before_history)
+    # Do not sample the controller's first acceleration instant.  The latency
+    # row measures an in-flight Stop, while a Stop issued on the first sample
+    # can legitimately exercise the separately-qualified hard-stop fallback.
+    # Three source revisions are still only a bounded, sub-frame-rate setup
+    # guard and are outside every timed Stop interval below.
     _moved, _ = _wait(
         lambda: _flow(driver),
         lambda state: (
             isinstance(state.get("lastApplied"), dict)
-            and state["lastApplied"].get("sourceSequence", -1) > before_sequence
+            and state["lastApplied"].get("sourceSequence", -1)
+            >= before_sequence + MIN_MOTION_FRAME_ADVANCE
         ),
         f"new applied motion frame after {start_label}",
         DEFAULT_TIMEOUT_S,
     )
 
-    _clicked, _ = _wait(
-        lambda: _execute(driver, STOP_CLICK_SCRIPT),
-        lambda clicked: clicked is True,
-        "eligible Stop click after observed motion",
-        DEFAULT_TIMEOUT_S,
-    )
-    _stopped, stop_trace = _await_stopped_presentation(driver)
+    _stopped, stop_trace = _click_and_await_stopped_presentation(driver)
     _assert_transition_fences(stop_trace, "UI6 repeated Stop")
     _require(
         any(state["stopText"] == "Stopping" for state in stop_trace),
@@ -370,6 +369,43 @@ def _one_stop(
     )
     terminal = _wait_stop_terminal(composer_url, before_history)
     return _stop_latency(_stop_probe(driver), terminal, _monotonic_wall_offset_ns())
+
+
+def _wait_history_event_after(
+    composer_url: str,
+    event_type: str,
+    after_sequence: int,
+    timeout_s: float = DEFAULT_TIMEOUT_S,
+) -> dict[str, Any]:
+    """Wait for owner evidence that the operation crossed the named boundary."""
+
+    deadline = time.monotonic() + timeout_s
+    while True:
+        page = _http_json(
+            composer_url,
+            "/api/execution/history",
+            params=[("event_types", event_type), ("limit", 32)],
+        )
+        events = page.get("events")
+        if not isinstance(events, list):
+            raise CollectorError("historian operation page is malformed")
+        for row in events:
+            if not isinstance(row, dict):
+                continue
+            sequence = row.get("sequence")
+            summary = row.get("event")
+            if (
+                type(sequence) is int
+                and sequence > after_sequence
+                and isinstance(summary, dict)
+                and summary.get("event_type") == event_type
+            ):
+                return row
+        if time.monotonic() >= deadline:
+            raise CollectorError(
+                f"timed out waiting for {event_type} after sequence {after_sequence}"
+            )
+        time.sleep(0.02)
 
 
 def _stop_row(
@@ -411,10 +447,10 @@ def _stop_row(
     restored = _set_range(driver, 1.0)
     _require(restored["identityStable"], f"{label} scale restoration rebound control")
     _wait_runtime_scale(composer_url, 1.0)
-    _resume_and_reset_during_motion(driver)
     summary = _summarize(warm)
     _report_summary(summary, label)
     _assert_budgets(summary, label)
+    _resume_and_reset_during_motion(driver)
     return {"cold": cold, "warm": summary}
 
 

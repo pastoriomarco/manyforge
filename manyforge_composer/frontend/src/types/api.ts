@@ -519,15 +519,6 @@ export interface ProgramRunStatus {
   message: string;
 }
 
-export interface ProgramRunIndex {
-  schemaVersion: 'manyforge.program_run_index.v1';
-  ownerId: string;
-  ownerEpoch: string;
-  activeOnly: boolean;
-  truncated: boolean;
-  runs: ProgramRunStatus[];
-}
-
 export interface ProgramCycleStatus {
   programRunnerOwnerEpoch: string;
   cycleGeneration: number;
@@ -702,33 +693,11 @@ export interface ProgramRuntimeControlProjection {
   observationOverrideCandidate: RuntimeOverrideObservationCandidate;
 }
 
-export interface ProgramRuntimeControlResult {
-  schemaVersion: 'manyforge.program_runtime_control_result.v1';
-  requestId: string;
-  accepted: true;
-  result: JsonValue;
-  run: ProgramRunStatus;
-  runtimeControls: ProgramRuntimeControlProjection;
-}
-
 export interface RuntimeOverrideMaterializationResponse {
   proposalId: string;
   mutation: string;
   details: Record<string, JsonValue>;
   workspace: ProgramWorkspaceResponse;
-}
-
-export interface CycleRecoveryActionResult {
-  schemaVersion: 'manyforge.cycle_recovery_result.v2';
-  requestId: string;
-  accepted: true;
-  actionId: CycleRecoveryActionId;
-  cycleResumed: boolean;
-  resultCode: 'accepted';
-  ownerResult: JsonValue | null;
-  run: ProgramRunStatus;
-  runtimeControls: ProgramRuntimeControlProjection;
-  recoveryOffer: CycleRecoveryOffer | null;
 }
 
 export type ProgramWorkspaceTransitionStatus =
@@ -1412,27 +1381,10 @@ export type ManagerApplyResponse =
   | ManagerApplyPendingResponse
   | ManagerApplySucceededResponse;
 
-export type ManagerApplyStatusResponse =
-  | Omit<ManagerApplyPendingResponse, 'replayStatus' | 'requestId' | 'requestOwnerEpoch'>
-  | Omit<ManagerApplySucceededResponse, 'replayStatus' | 'requestId' | 'requestOwnerEpoch'>;
-
 export interface DraftMutationResponse {
   mutation: string;
   details: Record<string, JsonValue>;
   workspace: ProgramWorkspaceResponse;
-}
-
-export interface ProgramCycleResetResult {
-  schemaVersion: 'manyforge.program_cycle_reset_result.v1';
-  programRunId: string;
-  resetCycleGeneration: number;
-  idleCycleGeneration: number;
-  settlementReference: string;
-  admission: {
-    admissionGeneration: number;
-    authoringAllowed: boolean;
-  };
-  runtimeControls: ProgramRuntimeControlsSnapshot | null;
 }
 
 export type Vector3Tuple = [number, number, number];

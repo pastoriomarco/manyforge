@@ -272,32 +272,32 @@ public:
         });
   }
 
-  std::string ReplayProgramApply(
-      std::string scenario_id, std::string scenario_catalog_revision,
-      std::string program_id, std::string program_revision,
-      std::optional<std::string> expected_applied_record_digest,
-      std::string request_owner_epoch, std::string request_id) {
+  std::string
+  ReplayProgramApply(std::string scenario_id,
+                     std::string scenario_catalog_revision,
+                     std::string program_id, std::string program_revision,
+                     std::optional<std::string> expected_applied_record_digest,
+                     std::string request_owner_epoch, std::string request_id) {
     py::gil_scoped_release release;
-    return Invoke(
-        [this, scenario_id = std::move(scenario_id),
-         scenario_catalog_revision = std::move(scenario_catalog_revision),
-         program_id = std::move(program_id),
-         program_revision = std::move(program_revision),
-         expected_applied_record_digest =
-             std::move(expected_applied_record_digest),
-         request_owner_epoch = std::move(request_owner_epoch),
-         request_id = std::move(request_id)]() {
-          return core_->ReplayProgramApply(
-              scenario_id, scenario_catalog_revision, program_id,
-              program_revision, expected_applied_record_digest,
-              request_owner_epoch, request_id);
-        });
+    return Invoke([this, scenario_id = std::move(scenario_id),
+                   scenario_catalog_revision =
+                       std::move(scenario_catalog_revision),
+                   program_id = std::move(program_id),
+                   program_revision = std::move(program_revision),
+                   expected_applied_record_digest =
+                       std::move(expected_applied_record_digest),
+                   request_owner_epoch = std::move(request_owner_epoch),
+                   request_id = std::move(request_id)]() {
+      return core_->ReplayProgramApply(
+          scenario_id, scenario_catalog_revision, program_id, program_revision,
+          expected_applied_record_digest, request_owner_epoch, request_id);
+    });
   }
 
-  std::string CommitProgramApply(
-      std::string canonical_preparation_json,
-      std::optional<std::string> expected_applied_record_digest,
-      std::string request_owner_epoch, std::string request_id) {
+  std::string
+  CommitProgramApply(std::string canonical_preparation_json,
+                     std::optional<std::string> expected_applied_record_digest,
+                     std::string request_owner_epoch, std::string request_id) {
     py::gil_scoped_release release;
     return Invoke(
         [this,
@@ -433,6 +433,25 @@ public:
     });
   }
 
+  std::string HistorySummary(const std::optional<std::int64_t> start_ns,
+                             const std::optional<std::int64_t> end_ns,
+                             const std::vector<std::string> &components,
+                             const std::vector<std::string> &event_types,
+                             const std::optional<std::uint64_t> before_sequence,
+                             const std::size_t limit) {
+    HistorianQuery query{
+        start_ns,
+        end_ns,
+        std::set<std::string>(components.begin(), components.end()),
+        std::set<std::string>(event_types.begin(), event_types.end()),
+        before_sequence,
+        limit};
+    py::gil_scoped_release release;
+    return Invoke([this, query = std::move(query)]() {
+      return core_->HistorySummaryPage(query);
+    });
+  }
+
   std::string HistorianHealth() {
     py::gil_scoped_release release;
     return Invoke([this]() { return core_->HistorianHealth(); });
@@ -440,7 +459,35 @@ public:
 
   std::string HistoryDetail(const std::uint64_t sequence) {
     py::gil_scoped_release release;
-    return Invoke([this, sequence]() { return core_->HistoryDetail(sequence); });
+    return Invoke(
+        [this, sequence]() { return core_->HistoryDetail(sequence); });
+  }
+
+  std::string
+  RecordClientIncident(std::string incident_id, std::string incident_kind,
+                       std::string phase, std::string control_session_id,
+                       std::string client_incarnation, std::string source_label,
+                       std::string reason_code,
+                       const std::uint64_t occurrence_count,
+                       const std::optional<std::uint64_t> maximum_delay_ns,
+                       const std::uint64_t first_observed_ns,
+                       const std::uint64_t last_observed_ns) {
+    py::gil_scoped_release release;
+    return Invoke(
+        [this, incident_id = std::move(incident_id),
+         incident_kind = std::move(incident_kind), phase = std::move(phase),
+         control_session_id = std::move(control_session_id),
+         client_incarnation = std::move(client_incarnation),
+         source_label = std::move(source_label),
+         reason_code = std::move(reason_code), occurrence_count,
+         maximum_delay_ns, first_observed_ns, last_observed_ns]() mutable {
+          return core_->RecordClientIncident(
+              std::move(incident_id), std::move(incident_kind),
+              std::move(phase), std::move(control_session_id),
+              std::move(client_incarnation), std::move(source_label),
+              std::move(reason_code), occurrence_count, maximum_delay_ns,
+              first_observed_ns, last_observed_ns);
+        });
   }
 
   std::string CommitProgramModelAttempt(std::string record_json) {
@@ -523,11 +570,10 @@ public:
     });
   }
 
-  std::string
-  CompleteOperationEventSnapshot(std::string source_owner_epoch,
-                                 const std::uint64_t through_source_sequence,
-                                 std::optional<std::string>
-                                     current_stop_fault_json) {
+  std::string CompleteOperationEventSnapshot(
+      std::string source_owner_epoch,
+      const std::uint64_t through_source_sequence,
+      std::optional<std::string> current_stop_fault_json) {
     py::gil_scoped_release release;
     return Invoke([this, source_owner_epoch = std::move(source_owner_epoch),
                    through_source_sequence,
@@ -536,9 +582,9 @@ public:
       std::optional<CanonicalValue> current_stop_fault;
       if (current_stop_fault_json.has_value()) {
         try {
-          current_stop_fault = deployment::parse_strict_json_model_yaml(
-                                   *current_stop_fault_json)
-                                   .root();
+          current_stop_fault =
+              deployment::parse_strict_json_model_yaml(*current_stop_fault_json)
+                  .root();
         } catch (const std::exception &error) {
           throw OperatorAlarmError(
               "headless_operation_event_invalid",
@@ -595,23 +641,19 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
   module.doc() =
       "Thin binding over the C++ ManyForge headless runtime API core";
   module.def("compile_deployment_draft",
-             &manyforge::headless::CompileDeploymentDraft,
-             py::arg("source"));
+             &manyforge::headless::CompileDeploymentDraft, py::arg("source"));
   py::class_<HeadlessApiBridge>(module, "HeadlessApiCore")
       .def(py::init<std::string, std::string, std::string, std::string,
                     std::string, std::string, std::string, std::string,
-                    std::string,
-                    std::vector<std::string>, std::string,
+                    std::string, std::vector<std::string>, std::string,
                     std::optional<std::string>, std::uint64_t, std::size_t,
                     std::size_t, std::size_t>(),
            py::arg("projection_root"), py::arg("install_root"),
-           py::arg("artifact_root"),
-           py::arg("program_selection_state_root"),
+           py::arg("artifact_root"), py::arg("program_selection_state_root"),
            py::arg("node_catalog_path"),
            py::arg("node_environment_manifest_path"),
-           py::arg("alarm_catalog_path"),
-           py::arg("historian_database_path"), py::arg("cell_id"),
-           py::arg("resource_ids"), py::arg("owner_id"),
+           py::arg("alarm_catalog_path"), py::arg("historian_database_path"),
+           py::arg("cell_id"), py::arg("resource_ids"), py::arg("owner_id"),
            py::arg("owner_epoch") = std::nullopt,
            py::arg("freshness_milliseconds") = 2000U,
            py::arg("historian_queue_capacity") = 1024U,
@@ -679,8 +721,19 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
            py::arg("components") = std::vector<std::string>{},
            py::arg("event_types") = std::vector<std::string>{},
            py::arg("before_sequence") = std::nullopt, py::arg("limit") = 1000U)
+      .def("history_summary", &HeadlessApiBridge::HistorySummary,
+           py::arg("start_ns") = std::nullopt, py::arg("end_ns") = std::nullopt,
+           py::arg("components") = std::vector<std::string>{},
+           py::arg("event_types") = std::vector<std::string>{},
+           py::arg("before_sequence") = std::nullopt, py::arg("limit") = 32U)
       .def("history_detail", &HeadlessApiBridge::HistoryDetail,
            py::arg("sequence"))
+      .def("record_client_incident", &HeadlessApiBridge::RecordClientIncident,
+           py::arg("incident_id"), py::arg("incident_kind"), py::arg("phase"),
+           py::arg("control_session_id"), py::arg("client_incarnation"),
+           py::arg("source_label"), py::arg("reason_code"),
+           py::arg("occurrence_count"), py::arg("maximum_delay_ns"),
+           py::arg("first_observed_ns"), py::arg("last_observed_ns"))
       .def("historian_health", &HeadlessApiBridge::HistorianHealth)
       .def("commit_program_model_attempt",
            &HeadlessApiBridge::CommitProgramModelAttempt,

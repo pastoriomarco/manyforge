@@ -1347,6 +1347,62 @@ TEST(HeadlessApiCore,
 }
 
 TEST(HeadlessApiCore,
+     ClientIncidentTransitionsAreStrictSparseAndDurablyQueued) {
+  TemporaryDirectory directory;
+  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+
+  const auto activated = core.RecordClientIncident(
+      "client-incident.one", "control_delayed", "activated",
+      "control-session.one", "client.one", "operator_ui",
+      "heartbeat_delayed", 1U, 600'000'000U, 100U, 100U);
+  EXPECT_EQ(Text(activated, "schema_version"),
+            "manyforge.client_incident_record.v1");
+  EXPECT_TRUE(std::get<bool>(Member(activated, "recorded").storage()));
+  const auto resolved = core.RecordClientIncident(
+      "client-incident.one", "control_delayed", "resolved",
+      "control-session.one", "client.one", "operator_ui",
+      "heartbeat_recovered", 3U, 700'000'000U, 100U, 800U);
+  EXPECT_TRUE(std::get<bool>(Member(resolved, "recorded").storage()));
+
+  HistorianQuery query;
+  query.components.insert("manyforge.composer");
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  CanonicalValue page;
+  do {
+    page = core.HistoryPage(query);
+    if (Array(page, "events").size() == 2U) {
+      break;
+    }
+    std::this_thread::yield();
+  } while (std::chrono::steady_clock::now() < deadline);
+  ASSERT_EQ(Array(page, "events").size(), 2U);
+  const auto &newest = Member(Array(page, "events").front(), "event");
+  EXPECT_EQ(Text(newest, "event_type"), "client_incident_resolved");
+  EXPECT_EQ(Text(newest, "severity"), "INFO");
+  const auto &payload = Member(newest, "payload");
+  EXPECT_EQ(Text(payload, "original_severity"), "WARN");
+  EXPECT_EQ(Text(payload, "first_observed_ns"), "100");
+  EXPECT_EQ(Text(payload, "last_observed_ns"), "800");
+
+  constexpr auto kBeyondJsonSafeInteger = std::uint64_t{1} << 53U;
+  EXPECT_NO_THROW(static_cast<void>(core.RecordClientIncident(
+      "client-incident.long-lived", "control_delayed", "activated",
+      "control-session.one", "client.one", "operator_ui",
+      "heartbeat_delayed", 1U, 600'000'000U,
+      kBeyondJsonSafeInteger + 1U, kBeyondJsonSafeInteger + 2U)));
+
+  try {
+    static_cast<void>(core.RecordClientIncident(
+        "client-incident.invalid", "arbitrary_event", "activated",
+        "control-session.one", "client.one", "operator_ui", "forged", 1U,
+        std::nullopt, 1U, 1U));
+    FAIL() << "arbitrary client event kind was accepted";
+  } catch (const OperatorAlarmError &error) {
+    EXPECT_EQ(error.code(), "client_incident_invalid");
+  }
+}
+
+TEST(HeadlessApiCore,
      DurableOperationFactsDriveHistoryAndAlarmWithoutOwningExecutionState) {
   TemporaryDirectory directory;
   HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());

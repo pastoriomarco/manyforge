@@ -650,8 +650,8 @@ def test_cleanup_uses_bounded_reverse_owner_order(monkeypatch: Any) -> None:
     assert observed == [
         "Vite HMR",
         "Composer backend",
-        "Headless API",
         "Manager",
         "Program runner fenced",
         "Program runner",
+        "Headless API",
     ]

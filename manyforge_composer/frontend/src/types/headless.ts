@@ -163,26 +163,40 @@ export interface ComposerHeadlessState {
 }
 
 export interface HistorianEvent {
-  schemaVersion: 'manyforge.historian_event.v1';
+  schemaVersion: 'manyforge.historian_event.v2';
   eventId: string;
   component: string;
   eventType: string;
   severity: string;
-  occurredAtNs: number;
+  occurredAtNs: string;
   occurredAtWall: string;
   payload: Record<string, unknown>;
 }
 
 export interface HistorianStoredEvent {
   sequence: number;
-  event: HistorianEvent;
+  event: HistorianEventSummary;
 }
 
 export interface HistorianPage {
-  schemaVersion: 'manyforge.historian_page.v1';
+  schemaVersion: 'manyforge.historian_summary_page.v1';
   events: HistorianStoredEvent[];
   nextBeforeSequence: number | null;
   truncated: boolean;
+}
+
+export interface HistorianEventSummary {
+  schemaVersion: 'manyforge.historian_event_summary.v1';
+  eventId: string;
+  component: string;
+  eventType: string;
+  severity: string;
+  occurredAtNs: string;
+  occurredAtWall: string;
+  message: string;
+  programRunId: string | null;
+  operationId: string | null;
+  conditionId: string | null;
 }
 
 export type HistorianDetailSectionName =
@@ -198,7 +212,7 @@ export interface HistorianDetailSection {
 }
 
 export interface HistorianDetail {
-  schemaVersion: 'manyforge.historian_detail.v1';
+  schemaVersion: 'manyforge.historian_detail.v2';
   sequence: number;
   event: HistorianEvent;
   sections: Record<HistorianDetailSectionName, HistorianDetailSection>;

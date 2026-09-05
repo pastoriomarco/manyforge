@@ -199,7 +199,6 @@ function controller(
       loading: false,
       observationError: null,
       pending: null,
-      pendingDeliveryConfirmed: false,
       controlPending: null,
       error: null,
     },

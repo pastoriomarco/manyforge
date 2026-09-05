@@ -198,9 +198,8 @@ TEST(EventHistorian, SqliteStoreIsIdempotentRetainedRestartableAndPaged) {
     const auto exact = store.Read(4U);
     ASSERT_TRUE(exact.has_value());
     EXPECT_EQ(exact->sequence, 4U);
-    EXPECT_EQ(exact->event.event_id, Event(4U, "manyforge.scene",
-                                          "operator_alarm_returned")
-                                         .event_id);
+    EXPECT_EQ(exact->event.event_id,
+              Event(4U, "manyforge.scene", "operator_alarm_returned").event_id);
     EXPECT_FALSE(store.Read(2U).has_value());
   }
 
@@ -208,6 +207,78 @@ TEST(EventHistorian, SqliteStoreIsIdempotentRetainedRestartableAndPaged) {
   const auto page = reopened.Query(HistorianQuery{});
   ASSERT_EQ(page.events.size(), 3U);
   EXPECT_EQ(page.events.front().event.event_id, Event(5U).event_id);
+}
+
+TEST(EventHistorian, LongServiceNanosecondsRemainExactAndRestartable) {
+  const auto legacy = Event(1U);
+  const auto legacy_persistence =
+      content_identity::canonical_json(HistorianPersistenceValue(legacy));
+  EXPECT_NE(legacy_persistence.find("manyforge.historian_event.v1"),
+            std::string::npos);
+  EXPECT_NE(legacy_persistence.find("\"occurred_at_ns\":101"),
+            std::string::npos);
+  const auto legacy_public =
+      content_identity::canonical_json(HistorianEventValue(legacy));
+  EXPECT_NE(legacy_public.find("manyforge.historian_event.v2"),
+            std::string::npos);
+  EXPECT_NE(legacy_public.find("\"occurred_at_ns\":\"101\""),
+            std::string::npos);
+
+  constexpr std::int64_t timestamp = 9007199254740992LL;
+  const auto event =
+      MakeHistorianEvent("manyforge.composer", "client_incident_resolved",
+                         "INFO", timestamp, "2026-09-04T12:00:00Z",
+                         CanonicalValue(CanonicalValue::Object{
+                             {"incident_id", CanonicalValue("incident.1")},
+                         }));
+  const auto public_value =
+      content_identity::canonical_json(HistorianEventValue(event));
+  EXPECT_NE(public_value.find("manyforge.historian_event.v2"),
+            std::string::npos);
+  EXPECT_NE(public_value.find("\"occurred_at_ns\":\"9007199254740992\""),
+            std::string::npos);
+
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "long-service.sqlite3";
+  {
+    SqliteEventHistoryStore store(path, 2U);
+    EXPECT_EQ(store.Append(event), IEventHistoryStore::AppendStatus::kStored);
+  }
+  SqliteEventHistoryStore reopened(path, 2U);
+  const auto page = reopened.Query(HistorianQuery{});
+  ASSERT_EQ(page.events.size(), 1U);
+  EXPECT_EQ(page.events.front().event.occurred_at_ns, timestamp);
+}
+
+TEST(EventHistorian, SummaryPageSelectsListFieldsWithoutPublishingPayload) {
+  const auto event = MakeHistorianEvent(
+      "manyforge.composer", "client_incident_activated", "ERROR",
+      9007199254740992LL, "2026-09-04T10:00:00Z",
+      CanonicalValue(CanonicalValue::Object{
+          {"incident_kind", CanonicalValue("control_delayed")},
+          {"nested",
+           CanonicalValue(CanonicalValue::Object{
+               {"diagnostic_blob", CanonicalValue(std::string(32000U, 'x'))},
+               {"operation_id", CanonicalValue("operation.9")},
+           })},
+          {"phase", CanonicalValue("resolved")},
+          {"program_run_id", CanonicalValue("program-run.7")},
+      }));
+  const auto encoded =
+      content_identity::canonical_json(HistorianSummaryPageValue(
+          HistorianPage{{HistorianStoredEvent{7U, event}}, true, 6U}));
+
+  EXPECT_NE(encoded.find("manyforge.historian_summary_page.v1"),
+            std::string::npos);
+  EXPECT_NE(encoded.find("manyforge.historian_event_summary.v1"),
+            std::string::npos);
+  EXPECT_NE(encoded.find("Control delayed resolved"), std::string::npos);
+  EXPECT_NE(encoded.find("program-run.7"), std::string::npos);
+  EXPECT_NE(encoded.find("operation.9"), std::string::npos);
+  EXPECT_NE(encoded.find("\"occurred_at_ns\":\"9007199254740992\""),
+            std::string::npos);
+  EXPECT_EQ(encoded.find("diagnostic_blob"), std::string::npos);
+  EXPECT_EQ(encoded.find(std::string(1024U, 'x')), std::string::npos);
 }
 
 TEST(EventHistorian, DetailPublishesOnlyTypedSourceBackedSections) {
@@ -226,7 +297,7 @@ TEST(EventHistorian, DetailPublishesOnlyTypedSourceBackedSections) {
       }));
   const auto encoded = content_identity::canonical_json(
       HistorianDetailValue(HistorianStoredEvent{7U, event}));
-  EXPECT_NE(encoded.find("manyforge.historian_detail.v1"), std::string::npos);
+  EXPECT_NE(encoded.find("manyforge.historian_detail.v2"), std::string::npos);
   EXPECT_NE(encoded.find("operation.1"), std::string::npos);
   EXPECT_NE(encoded.find("part_ready"), std::string::npos);
   EXPECT_NE(encoded.find("duration_ns"), std::string::npos);

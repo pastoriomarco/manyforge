@@ -87,6 +87,10 @@ def _valid_operation_event_identity(event: dict[str, Any]) -> bool:
 
 MAX_EXECUTION_PACKET_BYTES = 1024 * 1024
 MAX_EXECUTION_RESPONSE_BYTES = 4 * 1024 * 1024
+# Mirrors the native operation journal's closed maximum. Released operations
+# are removed as their control event is ingested, so this is a concurrent
+# owner-state bound rather than lifetime retention.
+MAXIMUM_RESIDENT_OPERATION_CONTROL_KEYS = 4096
 MOTION_PREVIEW_RESPONSE_KEYS = frozenset(
     {"api_version", "command", "ok", "preview_receipt"}
 )
@@ -865,8 +869,11 @@ class ExecutionCommandClient:
         if response.get("ok") is not True:
             self._raise_error_response(response)
         page = response.get("event_page")
+        admission_generation = response.get("admission_generation")
         if (
             response.get("command") != "events"
+            or type(admission_generation) is not int
+            or not 1 <= admission_generation <= MAXIMUM_SAFE_INTEGER
             or not isinstance(page, dict)
             or page.get("schema_version")
             != "manyforge.execution_event_page.v1"
@@ -922,6 +929,7 @@ class ExecutionCommandClient:
                 "execution_command_response_invalid",
                 "native execution event cursor does not match its records",
             )
+        page["admission_generation"] = admission_generation
         return page
 
     def submit(
@@ -2016,6 +2024,104 @@ class ExecutionEventPump:
             return previous != self._last_error
 
     @staticmethod
+    def _control_projection_key(event: dict[str, Any]) -> tuple[Any, ...]:
+        """Return only operation facts that can change the control shell.
+
+        Native ``state_observed`` rows deliberately retain exact progress and
+        timing in History.  Those high-rate samples belong to the credited
+        Viewer/history paths, not to the cold control projection.  Lifecycle,
+        Stop, runtime-scale, and fault meaning remains in this small key.
+        """
+
+        record_kind = event["record_kind"]
+        if record_kind in {
+            "stop_acceptance_projected",
+            "stop_terminal_projected",
+            "stop_fault_cleared",
+        }:
+            # Stop projections are sparse, globally scoped owner facts.  Their
+            # exact digest is the simplest complete change identity.
+            return (record_kind, event["payload_digest"])
+
+        payload = event["payload"]
+        operation = payload["operation_state"]
+
+        def selected(row: dict[str, Any], *names: str) -> tuple[Any, ...]:
+            return tuple(row.get(name) for name in names)
+
+        scale = payload.get("runtime_scale_status")
+        scale_key = (
+            None
+            if not isinstance(scale, dict)
+            else (
+                *selected(
+                    scale,
+                    "runtime_scale_generation",
+                    "state",
+                    "requested_scale",
+                    "effective_scale",
+                ),
+                tuple(
+                    (
+                        *selected(
+                            participant,
+                            "participant_id",
+                            "state",
+                            "accepted_generation",
+                            "commanded_scale",
+                            "applied_scale",
+                            "supported",
+                        ),
+                        rfc8785.dumps(participant.get("error")),
+                    )
+                    for participant in scale.get("participants", ())
+                ),
+            )
+        )
+        return (
+            record_kind,
+            *selected(
+                operation,
+                "operation_id",
+                "operation_revision",
+                "state",
+                "active_stop_id",
+                "active_stop_generation",
+            ),
+            tuple(
+                (
+                    *selected(participant, "participant_id", "state"),
+                    rfc8785.dumps(participant.get("terminal_error")),
+                )
+                for participant in operation.get("participants", ())
+            ),
+            scale_key,
+        )
+
+    @staticmethod
+    def _operation_is_released(event: dict[str, Any]) -> bool:
+        if event["record_kind"] != "control_accepted":
+            return False
+        result = event["payload"].get("result")
+        return isinstance(result, dict) and result.get("control") in {
+            "acknowledge_completed",
+            "reset",
+        }
+
+    @staticmethod
+    def _admission_generation(response: dict[str, Any]) -> int:
+        generation = response.get("admission_generation")
+        if (
+            type(generation) is not int
+            or not 1 <= generation <= MAXIMUM_SAFE_INTEGER
+        ):
+            raise HeadlessApiError(
+                "execution_command_response_invalid",
+                "native execution identity has no valid admission generation",
+            )
+        return generation
+
+    @staticmethod
     def _idle_owner_epoch(response: dict[str, Any]) -> str | None:
         """Return the typed epoch of an idle owner, if the response proves it."""
         if response.get("ok") is not False:
@@ -2046,7 +2152,10 @@ class ExecutionEventPump:
         condition_cursor: tuple[str, int] | None = None
         next_condition_poll_at = 0.0
         current_condition_json: str | None = None
-        last_completed_identity: tuple[str, int, str | None, str] | None = None
+        last_source_identity: tuple[str, str | None, str] | None = None
+        operation_control_keys: dict[str, tuple[Any, ...]] = {}
+        control_projection_changed = False
+        admission_generation: int | None = None
 
         def condition_snapshot_kwargs(
             source_owner_epoch: str, through_source_sequence: int
@@ -2069,24 +2178,29 @@ class ExecutionEventPump:
 
         def publish_if_changed(
             source_owner_epoch: str,
-            through_source_sequence: int,
             source_mode: str,
         ) -> None:
-            nonlocal last_completed_identity
+            nonlocal control_projection_changed, last_source_identity
             identity = (
                 source_owner_epoch,
-                through_source_sequence,
                 current_condition_json,
                 source_mode,
             )
-            if identity != last_completed_identity:
-                last_completed_identity = identity
+            if identity != last_source_identity or control_projection_changed:
+                last_source_identity = identity
+                control_projection_changed = False
                 self._notify_change()
 
         while not self._stop.is_set():
             try:
                 if owner_epoch is None:
                     identity_response = self._execution.identity()
+                    next_admission_generation = self._admission_generation(
+                        identity_response
+                    )
+                    if admission_generation != next_admission_generation:
+                        admission_generation = next_admission_generation
+                        control_projection_changed = True
                     if identity_response.get("ok") is not True:
                         idle_epoch = self._idle_owner_epoch(identity_response)
                         if idle_epoch is None:
@@ -2102,7 +2216,7 @@ class ExecutionEventPump:
                             ),
                         )
                         publish_if_changed(
-                            idle_epoch, source_high_water, "idle"
+                            idle_epoch, "idle"
                         )
                         if self._record_error(None):
                             self._notify_change()
@@ -2123,6 +2237,7 @@ class ExecutionEventPump:
                         source_high_water_epoch = next_epoch
                         source_high_water = 0
                         after_sequence = 0
+                        operation_control_keys.clear()
                     else:
                         after_sequence = source_high_water
                     owner_epoch = next_epoch
@@ -2131,6 +2246,10 @@ class ExecutionEventPump:
                     after_sequence,
                     limit=self._page_limit,
                 )
+                next_admission_generation = page["admission_generation"]
+                if admission_generation != next_admission_generation:
+                    admission_generation = next_admission_generation
+                    control_projection_changed = True
                 page_had_events = bool(page["events"])
                 for event in page["events"]:
                     self._core.ingest_operation_event(
@@ -2148,6 +2267,26 @@ class ExecutionEventPump:
                     )
                     after_sequence = event["sequence"]
                     source_high_water = after_sequence
+                    operation_id = event.get("operation_id")
+                    if isinstance(operation_id, str):
+                        key = self._control_projection_key(event)
+                        if (
+                            operation_id not in operation_control_keys
+                            and len(operation_control_keys)
+                            >= MAXIMUM_RESIDENT_OPERATION_CONTROL_KEYS
+                        ):
+                            raise HeadlessApiError(
+                                "execution_control_projection_capacity_invalid",
+                                "native resident operations exceed the closed bound",
+                            )
+                        if operation_control_keys.get(operation_id) != key:
+                            operation_control_keys[operation_id] = key
+                            control_projection_changed = True
+                        if self._operation_is_released(event):
+                            operation_control_keys.pop(operation_id, None)
+                    else:
+                        # The only operation-less events are sparse Stop facts.
+                        control_projection_changed = True
                 if page["next_after_sequence"] != after_sequence:
                     raise HeadlessApiError(
                         "execution_command_response_invalid",
@@ -2159,14 +2298,15 @@ class ExecutionEventPump:
                         through_source_sequence=after_sequence,
                         **condition_snapshot_kwargs(owner_epoch, after_sequence),
                     )
-                    publish_if_changed(owner_epoch, after_sequence, "active")
+                    publish_if_changed(owner_epoch, "active")
                     if self._record_error(None):
                         self._notify_change()
                     self._stop.wait(self._poll_seconds)
-                elif page_had_events:
-                    # One wake per bounded page; downstream state slots retain
-                    # only the newest value while a larger page set drains.
-                    self._notify_change()
+                elif page_had_events and control_projection_changed:
+                    # Do not delay a sparse lifecycle/Stop/fault transition
+                    # behind a larger History catch-up.  The downstream cold
+                    # combiner still retains only the newest requested value.
+                    publish_if_changed(owner_epoch, "active")
             except Exception as error:
                 if owner_epoch is not None:
                     try:

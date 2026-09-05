@@ -75,7 +75,7 @@ def test_frozen_absolute_budgets_reject_old_composer_tail() -> None:
         ui6_stop._assert_budgets(summary, "candidate")
 
 
-def test_stopped_presentation_wait_uses_one_browser_side_observer() -> None:
+def test_stop_dispatch_and_presentation_wait_share_one_browser_task() -> None:
     state = {
         "runText": "Resume Motion",
         "runDisabled": False,
@@ -108,7 +108,9 @@ def test_stopped_presentation_wait_uses_one_browser_side_observer() -> None:
 
     driver = Driver()
 
-    observed_state, observed_trace = ui6_stop._await_stopped_presentation(driver)
+    observed_state, observed_trace = (
+        ui6_stop._click_and_await_stopped_presentation(driver)
+    )
 
     assert observed_state == state
     assert observed_trace == trace
@@ -116,7 +118,12 @@ def test_stopped_presentation_wait_uses_one_browser_side_observer() -> None:
         (
             "POST",
             "/execute/async",
-            {"script": ui6_stop.STOP_PRESENTATION_WAIT_SCRIPT, "args": []},
+            {
+                "script": ui6_stop.STOP_CLICK_AND_PRESENTATION_WAIT_SCRIPT,
+                "args": [],
+            },
         )
     ]
-    assert "MutationObserver" in ui6_stop.STOP_PRESENTATION_WAIT_SCRIPT
+    script = ui6_stop.STOP_CLICK_AND_PRESENTATION_WAIT_SCRIPT
+    assert "MutationObserver" in script
+    assert script.index("new MutationObserver") < script.index("stop.click()")

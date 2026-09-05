@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
-from copy import deepcopy
+from dataclasses import dataclass
 import json
 import logging
 import re
@@ -17,6 +17,7 @@ from manyforge_headless_api.control_protocol import (
     CONTROL_MAXIMUM_CLIENTS,
     CONTROL_MAXIMUM_MESSAGE_BYTES,
     CONTROL_MAXIMUM_SNAPSHOT_BYTES,
+    MAXIMUM_U64,
 )
 from websockets.asyncio.client import connect as connect_websocket
 from websockets.exceptions import ConnectionClosed
@@ -27,7 +28,15 @@ from .draft_session import ComposerDraftSession
 
 _SEND_TIMEOUT_SECONDS = 0.25
 _STATE_MESSAGE = re.compile(r'"message_kind"\s*:\s*"(?:snapshot|delta)"')
+_SNAPSHOT_MESSAGE = re.compile(r'"message_kind"\s*:\s*"snapshot"')
+_SERVER_SEQUENCE = re.compile(r'("server_sequence"\s*:\s*")([1-9][0-9]*)(")')
 _LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(eq=False, slots=True)
+class _LocalStateSubscription:
+    loop: asyncio.AbstractEventLoop
+    wake: asyncio.Event
 
 
 class HeadlessStateSource:
@@ -43,63 +52,84 @@ class HeadlessStateSource:
         self._client = client
         self._admission = admission
         self._draft_session = draft_session
-        self._lock = asyncio.Lock()
-        self._clients = 0
+        self._lock = threading.Lock()
         self._closed = False
-        self._latest_overview: dict[str, Any] | None = None
         self._local_revision = 0
         self._enrich_lock = threading.Lock()
+        self._local_subscriptions: set[_LocalStateSubscription] = set()
+        self._draft_session.set_identity_change_observer(
+            self.notify_local_state_change
+        )
 
     @property
     def control_websocket_url(self) -> str:
         return self._client.control_websocket_url
 
-    async def acquire(self) -> None:
-        async with self._lock:
+    async def acquire(self) -> _LocalStateSubscription:
+        with self._lock:
             if self._closed:
                 raise RuntimeError("Composer control proxy is closed")
-            if self._clients >= CONTROL_MAXIMUM_CLIENTS:
+            if len(self._local_subscriptions) >= CONTROL_MAXIMUM_CLIENTS:
                 raise RuntimeError("Composer control client limit reached")
-            self._clients += 1
+            subscription = _LocalStateSubscription(
+                loop=asyncio.get_running_loop(),
+                wake=asyncio.Event(),
+            )
+            self._local_subscriptions.add(subscription)
+            return subscription
 
-    async def release(self) -> None:
-        async with self._lock:
-            self._clients = max(0, self._clients - 1)
+    async def release(self, subscription: _LocalStateSubscription) -> None:
+        with self._lock:
+            self._local_subscriptions.discard(subscription)
 
     async def close(self) -> None:
-        async with self._lock:
+        with self._lock:
             self._closed = True
+        self._draft_session.set_identity_change_observer(None)
+
+    def notify_local_state_change(self) -> None:
+        """Wake each browser once when Composer's Draft identity advances."""
+
+        with self._lock:
+            if self._closed:
+                return
+            subscriptions = tuple(self._local_subscriptions)
+        for subscription in subscriptions:
+            subscription.loop.call_soon_threadsafe(subscription.wake.set)
+
+    def _local_shell(self, *, complete: bool) -> dict[str, Any]:
+        draft = self._draft_session.snapshot()
+        self._local_revision += 1
+        return {
+            "complete": complete,
+            "draft_identity": {
+                "draft_id": draft["draft_id"],
+                "draft_revision": draft["draft_revision"],
+            },
+            "receiver_epoch": self._admission.receiver_epoch,
+            "schema_version": "manyforge.composer_headless_state.v2",
+            "snapshot_sequence": self._local_revision,
+        }
 
     def enrich(self, payload: str) -> str:
         if len(payload.encode("utf-8")) > CONTROL_MAXIMUM_SNAPSHOT_BYTES:
             raise ValueError("Headless control projection is oversized")
+        # Owner deltas are already sparse, validated control-protocol frames.
+        # Composer's local Draft identity changes on its own direct wake, so
+        # parsing and re-encoding every unrelated owner delta would add no fact.
+        if _SNAPSHOT_MESSAGE.search(payload) is None:
+            return payload
         value = json.loads(payload)
         if not isinstance(value, dict):
             raise ValueError("Headless control projection is not an object")
         kind = value.get("message_kind")
-        if kind not in {"snapshot", "delta"}:
-            # Receipts and heartbeats are already strict owner messages. A
-            # transparent proxy must not parse-copy-encode them on the command
-            # response path merely to return identical bytes.
-            return payload
+        if kind != "snapshot":
+            raise ValueError("Headless snapshot classification is invalid")
         with self._enrich_lock:
             shell = value.get("shell")
             if isinstance(shell, dict):
-                # json.loads() already produced a private tree for this frame.
-                draft = self._draft_session.snapshot()
-                self._local_revision += 1
-                shell["draft_identity"] = {
-                    "draft_id": draft["draft_id"],
-                    "draft_revision": draft["draft_revision"],
-                }
-                shell["receiver_epoch"] = self._admission.receiver_epoch
-                shell["snapshot_sequence"] = self._local_revision
-                shell["schema_version"] = "manyforge.composer_headless_state.v2"
-                shell["complete"] = True
+                shell.update(self._local_shell(complete=True))
                 value["shell"] = shell
-                overview = shell.get("component_overview")
-                if isinstance(overview, dict):
-                    self._latest_overview = overview
             encoded = json.dumps(
                 value,
                 allow_nan=False,
@@ -111,10 +141,35 @@ class HeadlessStateSource:
             raise ValueError("Composer control projection is oversized")
         return encoded
 
-    def current_component_overview(self) -> dict[str, Any] | None:
-        value = self._latest_overview
-        return None if value is None else deepcopy(value)
+    def local_delta(self, template: str) -> str:
+        """Build one tiny latest-only Draft identity delta."""
 
+        value = json.loads(template)
+        if not isinstance(value, dict):
+            raise ValueError("Headless control projection is not an object")
+        with self._enrich_lock:
+            local = {
+                "schema_version": value.get("schema_version"),
+                "message_kind": "delta",
+                "control_session_id": value.get("control_session_id"),
+                "server_sequence": value.get("server_sequence"),
+                "received_client_sequence": value.get(
+                    "received_client_sequence"
+                ),
+                "event_class": "cold",
+                "control": None,
+                "shell": self._local_shell(complete=False),
+            }
+            encoded = json.dumps(
+                local,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        if len(encoded.encode("utf-8")) > CONTROL_MAXIMUM_SNAPSHOT_BYTES:
+            raise ValueError("Composer local control projection is oversized")
+        return encoded
 
 async def serve_headless_state(
     websocket: WebSocket,
@@ -123,7 +178,7 @@ async def serve_headless_state(
     """Proxy one ordered control session without polling or semantic reduction."""
 
     try:
-        await source.acquire()
+        local_subscription = await source.acquire()
     except RuntimeError:
         await websocket.close(code=1013, reason="control client unavailable")
         return
@@ -140,6 +195,22 @@ async def serve_headless_state(
             open_timeout=1.0,
             close_timeout=0.25,
         ) as upstream:
+            downstream_sequence = 0
+            latest_state_payload: str | None = None
+
+            def downstream(payload: str) -> str:
+                nonlocal downstream_sequence
+                if _SERVER_SEQUENCE.search(payload) is None:
+                    return payload
+                if downstream_sequence >= MAXIMUM_U64:
+                    raise ValueError("Composer control sequence requires renewal")
+                downstream_sequence += 1
+                return _SERVER_SEQUENCE.sub(
+                    rf"\g<1>{downstream_sequence}\g<3>",
+                    payload,
+                    count=1,
+                )
+
             async def browser_to_owner() -> None:
                 while True:
                     message = await websocket.receive_text()
@@ -148,17 +219,58 @@ async def serve_headless_state(
                     await upstream.send(message)
 
             async def owner_to_browser() -> None:
-                async for message in upstream:
-                    if not isinstance(message, str):
-                        raise ValueError("Headless control frame is not text")
-                    payload = (
-                        await asyncio.to_thread(source.enrich, message)
-                        if _STATE_MESSAGE.search(message)
-                        else source.enrich(message)
-                    )
-                    await asyncio.wait_for(
-                        websocket.send_text(payload),
-                        timeout=_SEND_TIMEOUT_SECONDS,
+                nonlocal latest_state_payload
+                iterator = upstream.__aiter__()
+                owner_next = asyncio.create_task(iterator.__anext__())
+                local_next = asyncio.create_task(local_subscription.wake.wait())
+                try:
+                    while True:
+                        done, _pending = await asyncio.wait(
+                            {owner_next, local_next},
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if owner_next in done:
+                            try:
+                                message = owner_next.result()
+                            except StopAsyncIteration:
+                                return
+                            if not isinstance(message, str):
+                                raise ValueError("Headless control frame is not text")
+                            is_state = _STATE_MESSAGE.search(message) is not None
+                            # Only the initial snapshot needs Composer-local
+                            # enrichment. Owner deltas and control messages stay
+                            # byte-for-byte transparent on the hot relay.
+                            payload = (
+                                await asyncio.to_thread(source.enrich, message)
+                                if _SNAPSHOT_MESSAGE.search(message) is not None
+                                else message
+                            )
+                            if is_state:
+                                latest_state_payload = payload
+                            await asyncio.wait_for(
+                                websocket.send_text(downstream(payload)),
+                                timeout=_SEND_TIMEOUT_SECONDS,
+                            )
+                            owner_next = asyncio.create_task(iterator.__anext__())
+                        if local_next in done:
+                            local_subscription.wake.clear()
+                            if latest_state_payload is not None:
+                                payload = source.local_delta(latest_state_payload)
+                                await asyncio.wait_for(
+                                    websocket.send_text(downstream(payload)),
+                                    timeout=_SEND_TIMEOUT_SECONDS,
+                                )
+                                latest_state_payload = payload
+                            local_next = asyncio.create_task(
+                                local_subscription.wake.wait()
+                            )
+                finally:
+                    owner_next.cancel()
+                    local_next.cancel()
+                    await asyncio.gather(
+                        owner_next,
+                        local_next,
+                        return_exceptions=True,
                     )
 
             tasks = {
@@ -200,7 +312,7 @@ async def serve_headless_state(
                 WebSocketDisconnect,
             ):
                 await task
-        await source.release()
+        await source.release(local_subscription)
         with suppress(RuntimeError, WebSocketDisconnect):
             await websocket.close(code=1000)
 

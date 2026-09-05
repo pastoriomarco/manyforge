@@ -2890,7 +2890,23 @@ def test_cell_admission_crosses_real_execution_seqpacket_surface(
                 },
                 threading.Event(),
             )
-        assert repeated_current["observation"] == first_frame
+        repeated_frame = repeated_current["observation"]
+        # A foreign owner cursor requests the exact current frame. The native
+        # state owner may have accepted a freshness-only sample meanwhile, so
+        # its source sequence can advance even though the render value did not.
+        # Normal same-owner delivery remains gated by render-change generation.
+        assert (
+            repeated_frame["source_sequence"] >= first_frame["source_sequence"]
+        )
+        assert {
+            key: value
+            for key, value in repeated_frame.items()
+            if key != "source_sequence"
+        } == {
+            key: value
+            for key, value in first_frame.items()
+            if key != "source_sequence"
+        }
         assert process.poll() is None
     finally:
         _stop_host(process)

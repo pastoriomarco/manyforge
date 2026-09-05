@@ -176,14 +176,17 @@ def test_roboplan_suite_qualifies_only_the_retained_product_consumer() -> None:
     assert configure.index("cmakeFiles-v1") < configure.index('cmake "$WORKSPACE')
     assert configure.index("toolchains-v1") < configure.index('cmake "$WORKSPACE')
     assert "tail -" not in configure
-    assert "--target \"${producer_targets[@]}\" -- -k" in producer
+    assert "--target \"${producer_targets[@]}\" -- -k 0" in producer
     assert "tail -" not in producer
     assert "C++ retained RoboPlan product-consumer tests" in body
     assert "MANYFORGE_ENABLE_ROS2_CONTROL" not in body
     assert "manyforge_roboplan_py" not in body
     assert "manyforge_roboplan/python" not in body
     assert "configure_roboplan_build" in body
-    assert 'cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" -- -k' in body
+    assert (
+        'cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" -- -k 0'
+        in body
+    )
     assert "tail -" not in body
     assert body.index("if ! cmake --build") < body.index(
         'require_ctest_tests "manyforge_roboplan"'

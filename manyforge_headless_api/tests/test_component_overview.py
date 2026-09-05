@@ -248,10 +248,13 @@ def test_overview_revision_changes_only_with_semantic_content() -> None:
     facts = _facts()
     first = build_component_overview(**facts)
     heartbeat = copy.deepcopy(facts)
+    heartbeat["runtime"]["projection_generation"] = 99
     heartbeat["runtime"]["sections"]["manager"]["source_generation"] = 100
     heartbeat["runtime"]["sections"]["manager"]["payload"]["runtime"][
         "observed_units"
     ][0]["process_observation_sequence"] = 200
+    heartbeat["alarms"]["state_revision"] = 201
+    heartbeat["runtime"]["sections"]["scene_runtime"]["source_generation"] = 202
 
     second = build_component_overview(**heartbeat)
 

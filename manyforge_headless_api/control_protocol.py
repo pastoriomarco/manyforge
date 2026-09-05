@@ -1,4 +1,4 @@
-"""Strict UI6-F execution-control protocol and freshness authority.
+"""Strict UI6-G execution-control protocol and freshness authority.
 
 The DTOs in this module are ROS-free and transport-neutral.  HTTP, WebSocket,
 and in-process adapters decode into the same request and call the same ingress;
@@ -22,7 +22,7 @@ import uuid
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
-CONTROL_PROTOCOL_VERSION = "manyforge.execution_control.v1"
+CONTROL_PROTOCOL_VERSION = "manyforge.execution_control.v2"
 EXECUTION_COMMAND_SCHEMA = "manyforge.execution_command.v1"
 EXECUTION_COMMAND_RECEIPT_SCHEMA = "manyforge.execution_command_receipt.v1"
 EXECUTION_CONTROL_PROJECTION_SCHEMA = "manyforge.execution_control_projection.v1"
@@ -87,6 +87,14 @@ ProgramCycleState = Literal[
     "terminal_awaiting_reset",
     "recovery_required",
 ]
+ControlSemanticStatus = Literal["current", "synchronizing", "unavailable"]
+ControlClientIncidentKind = Literal[
+    "browser_render_delayed",
+    "command_delivery_unconfirmed",
+    "control_disconnected",
+    "history_detail_request_failed",
+    "history_request_failed",
+]
 
 _STOP_KINDS = frozenset(
     {
@@ -128,7 +136,7 @@ class ControlFreshnessContextDTO(_StrictDTO):
         int, Field(ge=1, le=MAXIMUM_SAFE_INTEGER)
     ]
     issued_server_sequence: str
-    valid_for_ns: Annotated[int, Field(ge=1, le=CONTROL_FRESHNESS_VALID_FOR_NS)]
+    valid_for_ns: Literal[CONTROL_FRESHNESS_VALID_FOR_NS]
 
     @field_validator("context_id", "receiver_incarnation", "semantic_owner_epoch")
     @classmethod
@@ -271,9 +279,9 @@ class ExecutionCommandReceiptDTO(_StrictDTO):
 
 
 class ControlClientHelloDTO(_StrictDTO):
-    schema_version: Literal["manyforge.execution_control.v1"]
+    schema_version: Literal["manyforge.execution_control.v2"]
     message_kind: Literal["client_hello"]
-    supported_versions: tuple[Literal["manyforge.execution_control.v1"]]
+    supported_versions: tuple[Literal["manyforge.execution_control.v2"]]
     client_incarnation: str
     source_label: str
 
@@ -297,7 +305,7 @@ class ControlClientHelloDTO(_StrictDTO):
 
 
 class ControlHeartbeatEchoDTO(_StrictDTO):
-    schema_version: Literal["manyforge.execution_control.v1"]
+    schema_version: Literal["manyforge.execution_control.v2"]
     message_kind: Literal["heartbeat_echo"]
     control_session_id: str
     client_sequence: str
@@ -318,8 +326,65 @@ class ControlHeartbeatEchoDTO(_StrictDTO):
         return _u64_text(value, label=info.field_name)
 
 
+class ControlStateAppliedDTO(_StrictDTO):
+    """Browser credit for one consumed replaceable state value."""
+
+    schema_version: Literal["manyforge.execution_control.v2"]
+    message_kind: Literal["state_applied"]
+    control_session_id: str
+    state_sequence: str
+
+    @field_validator("control_session_id")
+    @classmethod
+    def validate_state_session(cls, value: str) -> str:
+        return _bounded_nfc(
+            value,
+            label="control_session_id",
+            maximum_bytes=MAXIMUM_IDENTITY_BYTES,
+        )
+
+    @field_validator("state_sequence")
+    @classmethod
+    def validate_state_sequence(cls, value: str) -> str:
+        return _u64_text(value, label="state_sequence")
+
+
+class ControlClientIncidentDTO(_StrictDTO):
+    """Strict non-authoritative browser-only incident transition."""
+
+    schema_version: Literal["manyforge.execution_control.v2"]
+    message_kind: Literal["client_incident"]
+    control_session_id: str
+    client_sequence: str
+    incident_id: str
+    incident_kind: ControlClientIncidentKind
+    phase: Literal["activated", "resolved"]
+    occurrence_count: Annotated[int, Field(ge=1, le=1_000_000)]
+    maximum_delay_ns: Annotated[int, Field(ge=0, le=MAXIMUM_SAFE_INTEGER)] | None
+    reason_code: str
+
+    @field_validator("control_session_id", "incident_id")
+    @classmethod
+    def validate_incident_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(
+            value,
+            label=info.field_name,
+            maximum_bytes=MAXIMUM_IDENTITY_BYTES,
+        )
+
+    @field_validator("client_sequence")
+    @classmethod
+    def validate_incident_sequence(cls, value: str) -> str:
+        return _u64_text(value, label="client_sequence")
+
+    @field_validator("reason_code")
+    @classmethod
+    def validate_incident_reason(cls, value: str) -> str:
+        return _bounded_nfc(value, label="reason_code", maximum_bytes=256)
+
+
 class ExecutionControlCommandDTO(_StrictDTO):
-    schema_version: Literal["manyforge.execution_control.v1"]
+    schema_version: Literal["manyforge.execution_control.v2"]
     message_kind: Literal["command"]
     control_session_id: str
     client_sequence: str
@@ -351,7 +416,7 @@ class ExecutionControlCommandDTO(_StrictDTO):
 
 
 class ControlResyncRequestDTO(_StrictDTO):
-    schema_version: Literal["manyforge.execution_control.v1"]
+    schema_version: Literal["manyforge.execution_control.v2"]
     message_kind: Literal["resync"]
     control_session_id: str
     client_sequence: str
@@ -372,7 +437,7 @@ class ControlResyncRequestDTO(_StrictDTO):
 
 
 class ControlServerHelloDTO(_StrictDTO):
-    schema_version: Literal["manyforge.execution_control.v1"]
+    schema_version: Literal["manyforge.execution_control.v2"]
     message_kind: Literal["server_hello"]
     receiver_incarnation: str
     control_session_id: str
@@ -384,20 +449,40 @@ class ControlServerHelloDTO(_StrictDTO):
 
 
 class ControlHeartbeatChallengeDTO(_StrictDTO):
-    schema_version: Literal["manyforge.execution_control.v1"]
+    schema_version: Literal["manyforge.execution_control.v2"]
     message_kind: Literal["heartbeat_challenge"]
     control_session_id: str
     server_sequence: str
     challenge_sequence: str
     received_client_sequence: str | None
-    freshness: ControlFreshnessContextDTO
+    semantic_status: ControlSemanticStatus
+    semantic_reason: str | None
+    freshness: ControlFreshnessContextDTO | None
+
+    @model_validator(mode="after")
+    def paired_semantic_context(self) -> "ControlHeartbeatChallengeDTO":
+        if self.semantic_status == "current":
+            if self.semantic_reason is not None or self.freshness is None:
+                raise ValueError("current heartbeat requires only freshness")
+        elif self.semantic_reason is None or self.freshness is not None:
+            raise ValueError(
+                "non-current heartbeat requires a reason and no freshness"
+            )
+        if self.semantic_reason is not None:
+            _bounded_nfc(
+                self.semantic_reason,
+                label="semantic_reason",
+                maximum_bytes=1024,
+            )
+        return self
 
 
 class ExecutionControlSnapshotDTO(_StrictDTO):
-    schema_version: Literal["manyforge.execution_control.v1"]
+    schema_version: Literal["manyforge.execution_control.v2"]
     message_kind: Literal["snapshot"]
     control_session_id: str
     server_sequence: str
+    state_sequence: str
     received_client_sequence: str | None
     control: "ExecutionControlProjectionDTO"
     shell: dict[str, Any]
@@ -405,24 +490,23 @@ class ExecutionControlSnapshotDTO(_StrictDTO):
 
 
 class ExecutionControlDeltaDTO(_StrictDTO):
-    schema_version: Literal["manyforge.execution_control.v1"]
+    schema_version: Literal["manyforge.execution_control.v2"]
     message_kind: Literal["delta"]
     control_session_id: str
     server_sequence: str
+    state_sequence: str
     received_client_sequence: str | None
     event_class: Literal["critical", "node_progress", "cold"]
     control: Optional["ExecutionControlProjectionDTO"]
-    shell: dict[str, Any] | None
-
-    @model_validator(mode="after")
-    def nonempty_delta(self) -> "ExecutionControlDeltaDTO":
-        if self.control is None and self.shell is None:
-            raise ValueError("control delta cannot be empty")
-        return self
+    # Every current producer carries a shell: owner deltas carry at least the
+    # Program fact and Composer-local deltas carry the Draft identity. Keeping
+    # an unused control-only variant would make the generated and browser
+    # contracts disagree for no operational benefit.
+    shell: dict[str, Any]
 
 
 class ExecutionCommandReceiptMessageDTO(_StrictDTO):
-    schema_version: Literal["manyforge.execution_control.v1"]
+    schema_version: Literal["manyforge.execution_control.v2"]
     message_kind: Literal["command_receipt"]
     control_session_id: str
     server_sequence: str
@@ -438,7 +522,7 @@ class ExecutionCommandReceiptMessageDTO(_StrictDTO):
 
 
 class ControlResyncRequiredDTO(_StrictDTO):
-    schema_version: Literal["manyforge.execution_control.v1"]
+    schema_version: Literal["manyforge.execution_control.v2"]
     message_kind: Literal["resync_required"]
     control_session_id: str
     server_sequence: str
@@ -747,6 +831,8 @@ __all__ = [
     "CONTROL_NODE_PROGRESS_PERIOD_NS",
     "CONTROL_PROTOCOL_VERSION",
     "ControlClientHelloDTO",
+    "ControlClientIncidentDTO",
+    "ControlClientIncidentKind",
     "ControlFreshnessAuthority",
     "ControlFreshnessContextDTO",
     "ControlHeartbeatChallengeDTO",
@@ -755,6 +841,8 @@ __all__ = [
     "ControlResyncRequestDTO",
     "ControlResyncRequiredDTO",
     "ControlServerHelloDTO",
+    "ControlStateAppliedDTO",
+    "ControlSemanticStatus",
     "EXECUTION_COMMAND_RECEIPT_SCHEMA",
     "EXECUTION_COMMAND_SCHEMA",
     "EXECUTION_CONTROL_PROJECTION_SCHEMA",

@@ -314,7 +314,15 @@ Result<ObservedStateSnapshotDTO> AddressedObservedStatePublication::current_stat
     return Result<ObservedStateSnapshotDTO>::Err(
         state_error("observed_state_query_context_mismatch"));
   }
-  auto view = publication_.acquire(now_ns);
+  // The caller's timestamp defines the observation boundary. A concurrent
+  // publisher may commit a newer sample after that timestamp but before this
+  // read; prefer the newest retained sample that actually existed as-of the
+  // boundary. Fall back to the latest view only to preserve a precise stale or
+  // future-sample validation error when no as-of sample exists.
+  auto view = publication_.acquire_as_of(now_ns);
+  if (!view) {
+    view = publication_.acquire(now_ns);
+  }
   if (!view) {
     return Result<ObservedStateSnapshotDTO>::Err(state_error("observed_state_not_published"));
   }

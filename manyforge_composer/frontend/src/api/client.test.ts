@@ -7,7 +7,6 @@ import {
   historianListPath,
   resolveStructuralAssetUrl,
 } from './client';
-import * as parserModule from './parsers';
 import type { DraftFenceRequest, ManagerApplyRequest } from '../types/api';
 import type { OperatorAlarmRecord } from '../types/headless';
 
@@ -372,56 +371,6 @@ describe('structural API client', () => {
     );
   });
 
-  it('never retains a malformed execution-target projection', async () => {
-    const identity = { owner_epoch: 'malformed-target-owner' };
-    const fetchMock = vi.fn().mockImplementation((input: string) => response(
-      input.endsWith('/control-state')
-        ? { identity }
-        : { identity, targets: { malformed: true } },
-    ));
-    vi.stubGlobal('fetch', fetchMock);
-
-    await expect(api.execution.controlStatus()).rejects.toThrow();
-    await expect(api.execution.controlStatus()).rejects.toThrow();
-
-    expect(fetchMock.mock.calls.map(([input]) => input)).toEqual([
-      '/api/execution/control-state',
-      '/api/execution/targets',
-      '/api/execution/control-state',
-      '/api/execution/targets',
-    ]);
-  });
-
-  it('reuses validated targets only for the exact control identity', async () => {
-    const ownerA = { owner_epoch: 'validated-target-owner-a' };
-    const ownerB = { owner_epoch: 'validated-target-owner-b' };
-    const parsed = { marker: 'strictly-validated' } as unknown as ReturnType<
-      typeof parserModule.parseExecutionControlStatus
-    >;
-    const parserSpy = vi.spyOn(parserModule, 'parseExecutionControlStatus')
-      .mockReturnValue(parsed);
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(response({ identity: ownerA }))
-      .mockResolvedValueOnce(response({ identity: ownerA, targets: {} }))
-      .mockResolvedValueOnce(response({ identity: ownerA }))
-      .mockResolvedValueOnce(response({ identity: ownerB }))
-      .mockResolvedValueOnce(response({ identity: ownerB, targets: {} }));
-    vi.stubGlobal('fetch', fetchMock);
-
-    expect(await api.execution.controlStatus()).toBe(parsed);
-    expect(await api.execution.controlStatus()).toBe(parsed);
-    expect(await api.execution.controlStatus()).toBe(parsed);
-
-    expect(parserSpy).toHaveBeenCalledTimes(3);
-    expect(fetchMock.mock.calls.map(([input]) => input)).toEqual([
-      '/api/execution/control-state',
-      '/api/execution/targets',
-      '/api/execution/control-state',
-      '/api/execution/control-state',
-      '/api/execution/targets',
-    ]);
-  });
-
   it('submits one exact revision-fenced Draft mutation', async () => {
     const fetchMock = vi.fn().mockResolvedValue(response({
       mutation: 'tree_draft_update_node_params',
@@ -454,25 +403,15 @@ describe('structural API client', () => {
     expect(result.workspace.saved.matchesDraft).toBe(true);
   });
 
-  it('forwards Apply and bounded runner reads without client-owned state', async () => {
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(response({
-        status: 'applied',
-        headless: appliedResultFixture(),
-        workspace: workspaceFixture(),
-      }))
-      .mockResolvedValueOnce(response({
-        schema_version: 'manyforge.program_run_index.v1',
-        owner_id: 'program-runner.cell-a',
-        owner_epoch: 'program-runner.epoch.1',
-        active_only: true,
-        truncated: false,
-        runs: [],
-      }));
+  it('forwards Apply without client-owned state', async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(response({
+      status: 'applied',
+      headless: appliedResultFixture(),
+      workspace: workspaceFixture(),
+    }));
     vi.stubGlobal('fetch', fetchMock);
 
     await api.programWorkspace.apply(draftFence());
-    await api.programs.runs(true, 1);
 
     const [applyUrl, applyOptions] = fetchMock.mock.calls[0] as [
       string,
@@ -482,9 +421,6 @@ describe('structural API client', () => {
     expect(JSON.parse(String(applyOptions.body))).toEqual({
       ...draftFence(),
     });
-    expect(fetchMock.mock.calls[1]?.[0]).toBe(
-      '/api/program/runs?active_only=true&limit=1',
-    );
   });
 
   it('submits exact fenced New, Discard, and Revert requests', async () => {
@@ -632,17 +568,6 @@ describe('headless intent client', () => {
     expect(receipt.committed_projection_revision.scene_revision.revision_id).toBe(2);
   });
 
-  it('requests a bounded attention-newest alarm page', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(response({}));
-    vi.stubGlobal('fetch', fetchMock);
-
-    await expect(api.alarms.list()).rejects.toThrow('Invalid response');
-
-    expect(fetchMock.mock.calls[0]?.[0]).toBe(
-      '/api/execution/alarms?limit=32&ordering=attention_newest',
-    );
-  });
-
   it('posts manager apply with revision fences and calls manager graph endpoint', async () => {
     const request: ManagerApplyRequest = {
       request_id: 'request-manager-1',
@@ -727,34 +652,6 @@ describe('headless intent client', () => {
     );
   });
 
-  it('observes Manager Apply through the read-only durable identity route', async () => {
-    const payload = managerApplyFixture({
-      request_id: 'request-manager-1',
-      request_owner_epoch: 'owner.epoch.1',
-      source_label: 'composer_ui',
-      correlation_id: null,
-      deployment_artifact_id: 'artifact-1',
-      deployment_revision: 'rev-2',
-      expected_current: { graph_revision: 'graph-9', retained_bundle_id: 'bundle-9' },
-      reject_if_affected_busy: true,
-      expected_admission_generation: 7,
-      candidate_receipt: managerCandidateReceipt(),
-    });
-    delete payload.replay_status;
-    delete payload.request_id;
-    delete payload.request_owner_epoch;
-    const fetchMock = vi.fn().mockResolvedValue(response(payload));
-    vi.stubGlobal('fetch', fetchMock);
-
-    const observed = await api.manager.applyStatus('apply-1', 1);
-
-    expect(observed.state).toBe('succeeded');
-    expect(fetchMock.mock.calls[0]?.[0]).toBe(
-      '/api/manager/apply/status?apply_id=apply-1&apply_generation=1',
-    );
-    expect((fetchMock.mock.calls[0]?.[1] as RequestInit).method).toBe('GET');
-  });
-
   it('submits one exact alarm activation without a caller-supplied principal', async () => {
     const fetchMock = vi.fn().mockResolvedValue(response({ acknowledged: true }));
     vi.stubGlobal('fetch', fetchMock);
@@ -827,15 +724,15 @@ describe('headless intent client', () => {
 
   it('reads one exact typed historian detail by safe sequence', async () => {
     const fetchMock = vi.fn().mockResolvedValue(response({
-      schema_version: 'manyforge.historian_detail.v1',
+      schema_version: 'manyforge.historian_detail.v2',
       sequence: 7,
       event: {
-        schema_version: 'manyforge.historian_event.v1',
+        schema_version: 'manyforge.historian_event.v2',
         event_id: 'event-1',
         component: 'manyforge.execution',
         event_type: 'operation_updated',
         severity: 'INFO',
-        occurred_at_ns: 1,
+        occurred_at_ns: '1',
         occurred_at_wall: '2026-08-28T00:00:00Z',
         payload: {},
       },
@@ -859,7 +756,7 @@ describe('headless intent client', () => {
 
   it('carries bounded historian time, component, type, and page filters', async () => {
     const fetchMock = vi.fn().mockResolvedValue(response({
-      schema_version: 'manyforge.historian_page.v1',
+      schema_version: 'manyforge.historian_summary_page.v1',
       events: [],
       next_before_sequence: null,
       truncated: false,
@@ -867,8 +764,8 @@ describe('headless intent client', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     await api.history.list({
-      startNs: 10,
-      endNs: 20,
+      startNs: '10',
+      endNs: '20',
       components: ['manyforge.runtime'],
       eventTypes: ['operation_completed'],
       beforeSequence: 7,
@@ -880,6 +777,9 @@ describe('headless intent client', () => {
     );
     expect(() => historianListPath({ limit: HISTORIAN_PAGE_LIMIT + 1 })).toThrow(
       'History page limit must be an integer from 1 to 32',
+    );
+    expect(() => historianListPath({ startNs: '01' })).toThrow(
+      'History start must be a canonical nonnegative int64 decimal string',
     );
   });
 });

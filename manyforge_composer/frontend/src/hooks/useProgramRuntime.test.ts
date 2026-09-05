@@ -13,11 +13,8 @@ import type { ComposerHeadlessState } from '../types/headless';
 import {
   buildProgramResetRequest,
   buildProgramStopRequest,
-  buildProgramFullStopResetRequest,
   buildProgramStartRequest,
   controlPendingAfterProjection,
-  programCommandFailureMessage,
-  programPendingAfterControlUpdate,
   programPendingAfterProjection,
   programRunProjectionKey,
   programRuntimeAfterSnapshot,
@@ -196,7 +193,7 @@ describe('Program runtime idle selection', () => {
     expect(refresh).not.toContain('api.programs.runs(');
     expect(refresh).not.toContain('api.programs.runtimeControls(');
     expect(source).toContain('programRuntimeAfterSnapshot(');
-    expect(source).toContain('const pending = programPendingAfterControlUpdate(');
+    expect(source).toContain('const pending = programPendingAfterProjection(');
   });
 
   it('retains only a still-available explicit operator selection', () => {
@@ -212,7 +209,7 @@ describe('Program runtime idle selection', () => {
 });
 
 describe('Program command settlement', () => {
-  it('keeps sending state until delivery and owner projection are both current', () => {
+  it('mirrors authoritative owner state without waiting for a transport receipt', () => {
     const runningCycle = {
       programRunnerOwnerEpoch: 'runner.epoch.1',
       cycleGeneration: 4,
@@ -226,11 +223,8 @@ describe('Program command settlement', () => {
       capture: { programRunId: 'run-1' },
     } as ProgramRunStatus;
 
-    expect(programPendingAfterControlUpdate(
-      'run', false, run, null, runningCycle,
-    )).toBe('run');
-    expect(programPendingAfterControlUpdate(
-      'run', true, run, null, runningCycle,
+    expect(programPendingAfterProjection(
+      'run', run, null, runningCycle,
     )).toBeNull();
   });
 
@@ -332,53 +326,6 @@ describe('Program command settlement', () => {
     )).toEqual({ run: null, controls: null });
   });
 
-  it('keeps exact request and current owner projections in command failures', () => {
-    const run = {
-      ownerEpoch: 'runner.epoch.1',
-      state: 'intervention_required',
-      runRevision: 7,
-      treeStatus: 'running',
-      capture: { programRunId: 'run-1' },
-      nodeStatuses: { 'node.move': 'failure' },
-      activeOperationCount: 0,
-      reasonCode: 'operation_stopped',
-      message: 'The exact operation stopped before motion began.',
-    } as unknown as ProgramRunStatus;
-    const controls = {
-      recoveryOffer: {
-        recoveryClass: 'stop_fault_intervention',
-        status: 'reset_required',
-        offerRevision: 3,
-        nodeInstanceId: 'node.move',
-        operationId: 'operation-1',
-        reasonCode: 'active_stop_fault_requires_reset',
-        actions: [{ actionId: 'reset_cycle', enabled: true }],
-      },
-    } as Parameters<typeof programCommandFailureMessage>[4];
-    const { snapshot } = admissionFixtures();
-    const message = programCommandFailureMessage(
-      new Error('new motion admission is closed'),
-      'Run failed.',
-      'program-run-start.fixture',
-      run,
-      controls,
-      {
-        ...snapshot,
-        programCycle: {
-          ...snapshot.programCycle,
-          state: 'running',
-          cycleGeneration: 4,
-        },
-      },
-    );
-    expect(message).toContain('Request program-run-start.fixture.');
-    expect(message).toContain('run-1: intervention_required, revision 7');
-    expect(message).toContain('cycle: running, generation 4');
-    expect(message).toContain(
-      'recovery stop_fault_intervention: reset_required, offer revision 3',
-    );
-  });
-
   it('turns an asynchronously observed terminal failure into one detailed error', () => {
     const run = {
       ownerEpoch: 'runner.epoch.1',
@@ -472,7 +419,7 @@ describe('Program command settlement', () => {
     expect(programPendingAfterProjection(
       'reset', null, null,
       { ...idleCycle, authoringAllowed: false },
-    )).toBe('reset');
+    )).toBeNull();
 
     const resetOnly = {
       ...settled,
@@ -601,46 +548,4 @@ describe('Program runtime authority requests', () => {
     )).toBeNull();
   });
 
-  it('resets a Full-stopped tree with exact run and cycle fences', () => {
-    const { snapshot } = admissionFixtures();
-    const fullStoppedSnapshot = {
-      ...snapshot,
-      programCycle: {
-        ...snapshot.programCycle,
-        state: 'running' as const,
-        programRunId: 'run-1',
-        cycleClaimGeneration: 12,
-      },
-    };
-    const run = {
-      state: 'full_stopped',
-      ownerEpoch: 'runner.epoch.1',
-      runRevision: 9,
-      capture: { programRunId: 'run-1' },
-    } as ProgramRunStatus;
-
-    expect(buildProgramFullStopResetRequest(
-      fullStoppedSnapshot,
-      run,
-      'composer-program-owner.fixture',
-      'reset-full-stop.fixture',
-    )).toEqual({
-      request_id: 'reset-full-stop.fixture',
-      request_owner_epoch: 'composer-program-owner.fixture',
-      source_label: 'operator_ui',
-      correlation_id: 'reset-full-stop.fixture',
-      program_run_id: 'run-1',
-      expected_owner_epoch: 'runner.epoch.1',
-      expected_run_revision: 9,
-      expected_cycle_generation: 3,
-      expected_claim_generation: 12,
-      reason: 'operator Reset discarded Full Stop',
-    });
-    expect(buildProgramFullStopResetRequest(
-      fullStoppedSnapshot,
-      { ...run, state: 'running' },
-      'composer-program-owner.fixture',
-      'reset-full-stop.fixture',
-    )).toBeNull();
-  });
 });

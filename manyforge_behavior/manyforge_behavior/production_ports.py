@@ -16,7 +16,7 @@ import json
 import math
 from threading import RLock
 import time
-from typing import Any, Final, Protocol
+from typing import Any, Callable, Final, Protocol
 
 from manyforge_behavior.geometry import (
     normalize_quat,
@@ -437,10 +437,18 @@ class _PickPlaceTask:
 class NativeKernelProgramPort:
     """Captured context plus separate native task and Program-scope clients."""
 
-    def __init__(self, kernel: KernelClient) -> None:
+    def __init__(
+        self,
+        kernel: KernelClient,
+        *,
+        current_owner_epoch: Callable[[], str] | None = None,
+    ) -> None:
         if not isinstance(kernel, KernelClient):
             raise TypeError("kernel must be one bounded KernelClient")
+        if current_owner_epoch is not None and not callable(current_owner_epoch):
+            raise TypeError("current_owner_epoch must be callable")
         self._kernel = kernel
+        self._current_owner_epoch = current_owner_epoch
         self._contexts: dict[str, _BoundContext] = {}
         self._tasks: dict[str, _OperationTask] = {}
         self._pick_place_tasks: dict[str, _PickPlaceTask] = {}
@@ -2115,12 +2123,16 @@ class NativeKernelProgramPort:
             # before the Program tree binds its client context.  Once the
             # Program-cycle claim exists, the Kernel can fence that exact run
             # directly; no operation or local task needs to exist yet.
-            status = _mapping(
-                self._kernel.identity().get("identity"),
-                field="execution identity",
-            )
             request_owner_epoch = _text(
-                status.get("owner_epoch"), field="owner_epoch"
+                (
+                    self._current_owner_epoch()
+                    if self._current_owner_epoch is not None
+                    else _mapping(
+                        self._kernel.identity().get("identity"),
+                        field="execution identity",
+                    ).get("owner_epoch")
+                ),
+                field="owner_epoch",
             )
         response = self._kernel.stop_program_run(
             {

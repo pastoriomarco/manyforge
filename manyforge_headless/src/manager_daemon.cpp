@@ -2724,6 +2724,8 @@ private:
       return;
     }
     std::optional<core::ProgramCycleStatusDTO> probed_cycle_status;
+    bool native_batch_started = false;
+    bool native_batch_completed = false;
     try {
       const auto runner = ProbeProgramRunnerLiveness(
           config_.program_runner_liveness_socket, admission_.cell_id());
@@ -2854,6 +2856,7 @@ private:
                  .durable_public_pointer_content_digest,
              required_set, retained_policy, heartbeat, reconciliation});
       }
+      native_batch_started = !requests.empty();
       const auto responses =
           requests.empty()
               ? std::vector<core::ManagerLivenessObservationDTO>{}
@@ -2887,6 +2890,7 @@ private:
               "evidence");
         }
       }
+      native_batch_completed = true;
       if (!reconciliation.has_value()) {
         throw std::runtime_error(
             "Program Runner liveness requires converged reconciliation");
@@ -2960,12 +2964,19 @@ private:
           return;
         }
       }
-      const auto failure_ns = ElapsedNs();
-      const auto expiry = static_cast<std::uint64_t>(
-          deployment::native_execution_runtime_contract::
-              manager_liveness_policy()
-                  .expiry_timeout_ns);
-      manager_liveness_retry_gate_.RecordFailure(failure_ns, expiry);
+      if (!native_batch_started || native_batch_completed) {
+        // Only uncertainty inside the native batch needs a full lease-expiry
+        // delay. A separately addressed Program Runner rejection must not
+        // starve native children whose renewal already completed.
+        manager_liveness_retry_gate_.RecordSuccess();
+      } else {
+        const auto failure_ns = ElapsedNs();
+        const auto expiry = static_cast<std::uint64_t>(
+            deployment::native_execution_runtime_contract::
+                manager_liveness_policy()
+                    .expiry_timeout_ns);
+        manager_liveness_retry_gate_.RecordFailure(failure_ns, expiry);
+      }
       std::cerr << "Manager native liveness renewal remains fail-closed: "
                 << error.what() << '\n';
     } catch (...) {
@@ -2978,12 +2989,16 @@ private:
           return;
         }
       }
-      const auto failure_ns = ElapsedNs();
-      const auto expiry = static_cast<std::uint64_t>(
-          deployment::native_execution_runtime_contract::
-              manager_liveness_policy()
-                  .expiry_timeout_ns);
-      manager_liveness_retry_gate_.RecordFailure(failure_ns, expiry);
+      if (!native_batch_started || native_batch_completed) {
+        manager_liveness_retry_gate_.RecordSuccess();
+      } else {
+        const auto failure_ns = ElapsedNs();
+        const auto expiry = static_cast<std::uint64_t>(
+            deployment::native_execution_runtime_contract::
+                manager_liveness_policy()
+                    .expiry_timeout_ns);
+        manager_liveness_retry_gate_.RecordFailure(failure_ns, expiry);
+      }
       std::cerr << "Manager native liveness renewal remains fail-closed\n";
     }
   }

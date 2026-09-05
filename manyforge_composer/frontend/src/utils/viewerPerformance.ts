@@ -70,7 +70,6 @@ export interface ViewerRendererInspection {
 export interface ViewerPresentationProfile {
   effectiveDpr: number;
   antialias: boolean;
-  preserveDrawingBuffer: boolean;
 }
 
 export interface ViewerPerformanceSnapshot {
@@ -222,14 +221,12 @@ export function selectViewerPresentationProfile(
   if (software) {
     return {
       effectiveDpr: 1,
-      antialias: true,
-      preserveDrawingBuffer: true,
+      antialias: false,
     };
   }
   return {
     effectiveDpr: Math.min(finiteDpr, 1.5),
     antialias: true,
-    preserveDrawingBuffer: false,
   };
 }
 

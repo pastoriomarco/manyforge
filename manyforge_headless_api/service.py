@@ -63,7 +63,7 @@ from .models import (
     StopFaultRecoveryIntentRequest,
 )
 from .cell_admission import CellAdmissionError
-from .component_overview import build_component_overview
+from .component_overview import ComponentOverviewFacts
 from .native import HeadlessApiError, HeadlessCorePort, ViewerModelAsset
 from .program_runner_client import ProgramRunnerClientError, ProgramRunnerPort
 from .program_binding_transport import ProgramBindingTransportError
@@ -105,6 +105,24 @@ _ACTIVE_PROGRAM_RUN_STATES = frozenset(
         "finalizing",
     }
 )
+
+_HISTORY_SUMMARY_PAGE_VERSION = "manyforge.historian_summary_page.v1"
+
+
+def _history_summary_page(page: dict[str, Any]) -> dict[str, Any]:
+    events = page.get("events")
+    if (
+        page.get("schema_version") != _HISTORY_SUMMARY_PAGE_VERSION
+        or not isinstance(events, list)
+        or len(events) > 32
+    ):
+        raise HeadlessApiError(
+            "historian_response_invalid",
+            "native historian returned an invalid summary page",
+        )
+    return page
+
+
 def _bounded_text(value: object, *, maximum_bytes: int) -> bool:
     return (
         isinstance(value, str)
@@ -540,8 +558,12 @@ class HeadlessService:
             )
         return snapshot
 
-    def component_overview(self) -> dict[str, Any]:
-        """Return one read-only reduction over current identified owner facts."""
+    def component_overview_facts(
+        self,
+        *,
+        program_cycle: dict[str, Any] | None = None,
+    ) -> ComponentOverviewFacts:
+        """Capture each owner exactly once for one Component Overview reduction."""
 
         projections: dict[str, dict[str, Any] | None] = {}
         errors: dict[str, dict[str, Any]] = {}
@@ -568,13 +590,16 @@ class HeadlessService:
             lambda: self.alarms(limit=32, ordering="attention_newest"),
         )
         capture("authoring_admission", self.authoring_admission)
-        capture("program_cycle", self.program_cycle_status)
+        if program_cycle is None:
+            capture("program_cycle", self.program_cycle_status)
+        else:
+            projections["program_cycle"] = program_cycle
         capture("applied_program", self.program_applied)
         capture("source_model", self.source_model)
         capture("execution_identity", self.execution_identity)
         capture("execution_targets", self.execution_targets)
         capture("execution_control", self.execution_control_state)
-        return build_component_overview(
+        return ComponentOverviewFacts(
             runtime=projections["runtime"],
             alarms=projections["alarms"],
             authoring_admission=projections["authoring_admission"],
@@ -586,6 +611,11 @@ class HeadlessService:
             execution_control_response=projections["execution_control"],
             errors=errors,
         )
+
+    def component_overview(self) -> dict[str, Any]:
+        """Return one pure reduction over one exact read of each owner."""
+
+        return self.component_overview_facts().reduce()
 
     def scene_resource_poses(
         self,
@@ -2063,17 +2093,24 @@ class HeadlessService:
         before_sequence: int | None,
         limit: int,
     ) -> dict[str, Any]:
-        return self.core.history(
-            start_ns=start_ns,
-            end_ns=end_ns,
-            components=list(components),
-            event_types=list(event_types),
-            before_sequence=before_sequence,
-            limit=limit,
+        return _history_summary_page(
+            self.core.history(
+                start_ns=start_ns,
+                end_ns=end_ns,
+                components=list(components),
+                event_types=list(event_types),
+                before_sequence=before_sequence,
+                limit=limit,
+            )
         )
 
     def history_detail(self, sequence: int) -> dict[str, Any]:
         return self.core.history_detail(sequence)
+
+    def record_client_incident(self, **kwargs: Any) -> dict[str, Any]:
+        """Non-blockingly enqueue one strict client-incident transition."""
+
+        return self.core.record_client_incident(**kwargs)
 
     def historian_reconcile(
         self,

@@ -29,7 +29,11 @@ from .control_protocol import (
     is_stop_command,
 )
 from .control_session import serve_execution_control
-from .control_state import HeadlessControlStateSource, build_control_projection
+from .control_state import (
+    ControlStateUnavailableError,
+    HeadlessControlStateSource,
+    build_control_projection,
+)
 from .execution_control import (
     ExecutionControlBusyError,
     ExecutionControlClient,
@@ -93,6 +97,7 @@ from .deployment_compiler import DeploymentCandidateCompiler
 
 _REQUEST_ID_PATTERN = re.compile(r"[^A-Za-z0-9._-]")
 _MAXIMUM_SAFE_INTEGER = 9_007_199_254_740_991
+_MAXIMUM_SIGNED_64 = 9_223_372_036_854_775_807
 _MAXIMUM_ALARM_PAGE = 128
 _MAXIMUM_HISTORY_PAGE = 32
 _OBSERVATION_CREDIT_SCHEMA = "manyforge.execution_observation_credit.v1"
@@ -460,12 +465,21 @@ def create_app(
     )
     if not isinstance(runner_control_url, str):
         runner_control_url = None
-    cold_watch_paths = (
+    cold_freshness_paths = (
         ()
         if config is None
         else (
-            config.projection_root,
-            config.program_selection_state_root,
+            config.projection_root / "manager-source.json",
+            config.projection_root / "logical-scene-source.json",
+            config.projection_root / "scene-runtime-source.json",
+        )
+    )
+    cold_watch_paths = (
+        cold_freshness_paths
+        if config is None
+        else (
+            *cold_freshness_paths,
+            config.program_selection_state_root / "program-selection-owner.json",
         )
     )
     control_state_source = HeadlessControlStateSource(
@@ -473,11 +487,13 @@ def create_app(
         control_ingress,
         program_runner_websocket_url=runner_control_url,
         cold_watch_paths=cold_watch_paths,
+        cold_freshness_paths=cold_freshness_paths,
         cold_freshness_budget_ns=(
             None
             if config is None
             else config.freshness_milliseconds * 1_000_000
         ),
+        incident_recorder=getattr(service, "record_client_incident", None),
     )
     if event_pump is not None:
         event_pump.set_change_observer(control_state_source.notify_cold)
@@ -724,8 +740,21 @@ def create_app(
         return service.runtime()
 
     @app.get("/api/component-overview")
-    def component_overview() -> dict[str, Any]:
-        return service.component_overview()
+    async def component_overview() -> dict[str, Any]:
+        try:
+            current = control_state_source.current_component_overview()
+        except ControlStateUnavailableError as error:
+            raise HeadlessApiError(
+                "control_projection_unavailable",
+                str(error),
+            ) from error
+        if current is not None:
+            return current
+        # With no control client there is deliberately no retained source work.
+        # A standalone REST reader owns exactly one on-demand fact capture and
+        # reduction in a read worker instead of starting a polling/subscription
+        # lifetime.
+        return await asyncio.to_thread(service.component_overview)
 
     @app.get("/api/cell/authoring-admission")
     def authoring_admission() -> dict[str, Any]:
@@ -735,25 +764,33 @@ def create_app(
     def acquire_authoring_transaction(
         body: AuthoringMutationContext,
     ) -> dict[str, Any]:
-        return {"claim": service.acquire_authoring_mutation(body)}
+        claim = service.acquire_authoring_mutation(body)
+        control_state_source.notify_cold()
+        return {"claim": claim}
 
     @app.post("/api/program/authoring-transactions/settle")
     def settle_authoring_transaction(
         body: AuthoringMutationSettlementRequest,
     ) -> dict[str, Any]:
-        return {"admission": service.settle_authoring_mutation(body)}
+        admission = service.settle_authoring_mutation(body)
+        control_state_source.notify_cold()
+        return {"admission": admission}
 
     @app.post("/api/program/authoring-transactions/recovery-receipt")
     def recover_authoring_transaction(
         body: AuthoringMutationRecoveryRequest,
     ) -> dict[str, Any]:
-        return {"recovery_receipt": service.recover_authoring_mutation(body)}
+        receipt = service.recover_authoring_mutation(body)
+        control_state_source.notify_cold()
+        return {"recovery_receipt": receipt}
 
     @app.post("/api/program/authoring-transactions/reconcile-owner")
     def reconcile_authoring_owner(
         body: AuthoringOwnerReconciliationRequest,
     ) -> dict[str, Any]:
-        return {"admission": service.reconcile_authoring_owner(body)}
+        admission = service.reconcile_authoring_owner(body)
+        control_state_source.notify_cold()
+        return {"admission": admission}
 
     @app.get("/api/manager/status")
     def manager_status() -> dict[str, Any]:
@@ -1031,6 +1068,10 @@ def create_app(
             control_state_source,
             control_ingress,
         )
+
+    @app.get("/api/control/diagnostics")
+    async def execution_control_diagnostics() -> dict[str, Any]:
+        return control_state_source.diagnostics()
 
     @app.post("/api/program/cycle/reset")
     async def program_cycle_reset(
@@ -1719,11 +1760,11 @@ def create_app(
     def history(
         start_ns: Annotated[
             int | None,
-            Query(ge=0, le=_MAXIMUM_SAFE_INTEGER),
+            Query(ge=0, le=_MAXIMUM_SIGNED_64),
         ] = None,
         end_ns: Annotated[
             int | None,
-            Query(ge=0, le=_MAXIMUM_SAFE_INTEGER),
+            Query(ge=0, le=_MAXIMUM_SIGNED_64),
         ] = None,
         components: Annotated[
             list[str] | None,

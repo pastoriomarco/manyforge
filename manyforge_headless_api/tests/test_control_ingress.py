@@ -196,6 +196,60 @@ def test_stop_is_stamped_at_lane_admission_without_a_program_projection_read() -
     assert submission.receipt.received_monotonic_ns == "2000000000"
 
 
+def test_program_stop_dispatch_never_resamples_program_projection() -> None:
+    class Service:
+        program_runner = object()
+
+        def __init__(self) -> None:
+            self.request = None
+
+        @staticmethod
+        def program_cycle_status() -> dict[str, Any]:
+            raise AssertionError("recognized Stop synchronously read Program state")
+
+        def program_run_motion_stop(self, program_run_id, request):
+            self.request = request
+            assert program_run_id == "program-run.1"
+            return {"accepted": True}
+
+    clock = _Clock()
+    ingress, _stamps = _ingress(clock)
+    try:
+        request = _request(
+            ingress,
+            kind="program_motion_stop",
+            correlation="request.motion-stop",
+        ).model_copy(
+            update={
+                "payload": {
+                    "request_id": "request.motion-stop",
+                    "program_run_id": "program-run.1",
+                    "expected_owner_epoch": "runner.1",
+                    "reason": "operator Stop",
+                }
+            }
+        )
+    finally:
+        ingress.close()
+    service = Service()
+    disposition, result = HeadlessExecutionControlDispatch(service)(  # type: ignore[arg-type]
+        request,
+        ExecutionIngressStamp(
+            transport_kind="websocket",
+            receiver_incarnation="receiver.1",
+            received_server_sequence=1,
+            received_monotonic_ns=1,
+        ),
+    )
+
+    assert disposition.disposition == "received"
+    assert disposition.semantic_owner_epoch == "runner.1"
+    assert disposition.execution_control_revision == 7
+    assert disposition.current_identity is None
+    assert result == {"accepted": True}
+    assert service.request is not None
+
+
 def test_completed_commands_leave_no_live_receipt_history_or_count_limit() -> None:
     clock = _Clock()
     ingress, stamps = _ingress(clock)

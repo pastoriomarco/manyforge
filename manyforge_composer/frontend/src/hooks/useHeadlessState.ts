@@ -2,7 +2,10 @@ import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { resolveStructuralAssetUrl } from '../api/client';
 import {
   parseComposerHeadlessState,
+  parseComponentOverviewProjection,
   parseExecutionControlStatus,
+  parseHeadlessRuntimeSnapshot,
+  parseOperatorAlarmSnapshot,
   parseProgramCycleStatus,
 } from '../api/parsers';
 import type { ComposerHeadlessState } from '../types/headless';
@@ -126,6 +129,10 @@ export function parseExecutionObservationFrame(raw: unknown): ExecutionObservati
 export interface HeadlessStateResult {
   snapshot: ComposerHeadlessState | null;
   error: string | null;
+  transportStatus: ControlTransportStatus;
+  transportError: string | null;
+  semanticStatus: ControlSemanticStatus;
+  semanticReason: string | null;
   reconnect: () => void;
 }
 
@@ -134,11 +141,12 @@ export interface HeadlessStateAdmission {
   reason: string | null;
 }
 
-const CONTROL_PROTOCOL_VERSION = 'manyforge.execution_control.v1';
+const CONTROL_PROTOCOL_VERSION = 'manyforge.execution_control.v2';
 const EXECUTION_COMMAND_SCHEMA = 'manyforge.execution_command.v1';
 const CONTROL_HEARTBEAT_PERIOD_NS = 250_000_000;
 const CONTROL_HEARTBEAT_DELAYED_NS = 500_000_000;
 const CONTROL_HEARTBEAT_STALE_NS = 1_000_000_000;
+const CONTROL_COMMAND_DELIVERY_NS = 1_000_000_000;
 const CONTROL_MAXIMUM_MESSAGE_BYTES = 64 * 1024;
 const CONTROL_MAXIMUM_MESSAGES_PER_SECOND = 64;
 
@@ -223,6 +231,30 @@ interface CurrentExecutionControl {
   freshness: ControlFreshnessContext;
 }
 
+export type ControlTransportStatus =
+  | 'connecting'
+  | 'connected'
+  | 'delayed'
+  | 'stale'
+  | 'disconnected';
+export type ControlSemanticStatus = 'current' | 'synchronizing' | 'unavailable';
+export type ControlClientIncidentKind =
+  | 'browser_render_delayed'
+  | 'command_delivery_unconfirmed'
+  | 'control_disconnected'
+  | 'history_detail_request_failed'
+  | 'history_request_failed';
+
+interface ClientIncidentState {
+  id: string;
+  kind: ControlClientIncidentKind;
+  reasonCode: string;
+  startedMs: number;
+  occurrenceCount: number;
+  maximumDelayNs: number | null;
+  activationSent: boolean;
+}
+
 export interface ExecutionCommandReceipt {
   correlationId: string;
   disposition: 'received' | 'rejected' | 'joined' | 'already_current' | 'no_effect';
@@ -244,8 +276,17 @@ export function admitHeadlessState(
 ): HeadlessStateAdmission {
   if (current === null) return { accepted: true, reason: null };
   if (candidate.receiverEpoch === current.receiverEpoch) {
-    if (candidate.snapshotSequence <= current.snapshotSequence) {
+    if (candidate.snapshotSequence < current.snapshotSequence) {
       return { accepted: false, reason: 'Headless snapshot sequence regressed.' };
+    }
+    if (candidate.snapshotSequence === current.snapshotSequence
+      && (candidate.draftIdentity.draftId !== current.draftIdentity.draftId
+        || candidate.draftIdentity.draftRevision
+          !== current.draftIdentity.draftRevision)) {
+      return {
+        accepted: false,
+        reason: 'Headless Draft identity changed without a local sequence advance.',
+      };
     }
   }
   return { accepted: true, reason: null };
@@ -276,142 +317,6 @@ export function browserStableIdentity(storageKey: string, prefix: string): strin
       ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
     return `${prefix}.${random}`;
   }
-}
-
-export function sameHeadlessProjection(
-  current: ComposerHeadlessState | null,
-  candidate: ComposerHeadlessState,
-): boolean {
-  if (current === null) return false;
-  return current.receiverEpoch === candidate.receiverEpoch
-    && current.runtime.projectionOwnerEpoch === candidate.runtime.projectionOwnerEpoch
-    && current.runtime.projectionOwnerId === candidate.runtime.projectionOwnerId
-    && current.runtime.complete === candidate.runtime.complete
-    && sameStrings(current.runtime.reasons, candidate.runtime.reasons)
-    && sameStrings(
-      current.runtime.unavailableSections,
-      candidate.runtime.unavailableSections,
-    )
-    && sameSourceSection(
-      current.runtime.sections.manager,
-      candidate.runtime.sections.manager,
-      false,
-    )
-    && sameSourceSection(
-      current.runtime.sections.logicalScene,
-      candidate.runtime.sections.logicalScene,
-      true,
-    )
-    && sameSourceSection(
-      current.runtime.sections.sceneRuntime,
-      candidate.runtime.sections.sceneRuntime,
-      true,
-    )
-    && current.alarms.ownerEpoch === candidate.alarms.ownerEpoch
-    && current.alarms.generation === candidate.alarms.generation
-    && sameComponentOverviewPresentation(
-      current.componentOverview,
-      candidate.componentOverview,
-    )
-    && current.authoringAdmission.authoringAllowed
-      === candidate.authoringAdmission.authoringAllowed
-    && current.authoringAdmission.admissionGeneration
-      === candidate.authoringAdmission.admissionGeneration
-    && current.executionControlStatus?.ownerEpoch
-      === candidate.executionControlStatus?.ownerEpoch
-    && current.executionControlStatus?.activePublicationGeneration
-      === candidate.executionControlStatus?.activePublicationGeneration
-    && current.executionControlStatus?.residentOperations.length
-      === candidate.executionControlStatus?.residentOperations.length
-    && (current.executionControlStatus?.residentOperations ?? [])
-      .every((operation, index) => {
-      const next = candidate.executionControlStatus?.residentOperations[index];
-      return next !== undefined
-        && operation.operationId === next.operationId
-        && operation.operationRevision === next.operationRevision
-        && operation.state === next.state
-        && operation.resident === next.resident;
-    })
-    && current.executionControlStatus?.runtimeScaleControl?.controlGeneration
-      === candidate.executionControlStatus?.runtimeScaleControl?.controlGeneration
-    && current.executionControlStatus?.runtimeScaleControl?.requestedScale
-      === candidate.executionControlStatus?.runtimeScaleControl?.requestedScale
-    && current.programCycle.programRunnerOwnerEpoch
-      === candidate.programCycle.programRunnerOwnerEpoch
-    && current.programCycle.cycleGeneration === candidate.programCycle.cycleGeneration
-    && current.programCycle.state === candidate.programCycle.state
-    && current.programCycle.programRunId === candidate.programCycle.programRunId
-    && current.programCycle.cycleClaimGeneration
-      === candidate.programCycle.cycleClaimGeneration
-    && current.programCycle.terminalOrSettlementReference
-      === candidate.programCycle.terminalOrSettlementReference
-    && current.programCycle.runRevision === candidate.programCycle.runRevision
-    && current.programCycle.nodeStatusRevision
-      === candidate.programCycle.nodeStatusRevision
-    && current.programCycle.runtimeControlRevision
-      === candidate.programCycle.runtimeControlRevision
-    && current.programCycle.recoveryOffer?.offerId
-      === candidate.programCycle.recoveryOffer?.offerId
-    && current.programCycle.recoveryOffer?.offerRevision
-      === candidate.programCycle.recoveryOffer?.offerRevision
-    && current.draftIdentity.draftId === candidate.draftIdentity.draftId
-    && current.draftIdentity.draftRevision === candidate.draftIdentity.draftRevision;
-}
-
-export function sameComponentOverviewPresentation(
-  current: ComposerHeadlessState['componentOverview'],
-  candidate: ComposerHeadlessState['componentOverview'],
-): boolean {
-  const currentBasis = current.basis;
-  const candidateBasis = candidate.basis;
-  return current.readiness === candidate.readiness
-    && current.summaryLabel === candidate.summaryLabel
-    && current.profileLabel === candidate.profileLabel
-    && current.authorityLabel === candidate.authorityLabel
-    && current.userMessage === candidate.userMessage
-    && sameStrings(current.capabilities, candidate.capabilities)
-    && current.components.length === candidate.components.length
-    && current.components.every((component, index) => {
-      const next = candidate.components[index];
-      return next !== undefined
-        && component.id === next.id
-        && component.label === next.label
-        && component.status === next.status
-        && component.detail === next.detail
-        && component.required === next.required
-        && sameStrings(component.requiredFor, next.requiredFor)
-        && component.ownerId === next.ownerId
-        && component.ownerEpoch === next.ownerEpoch
-        && component.generation === next.generation
-        && component.reasonCode === next.reasonCode
-        && component.scope === next.scope
-        && sameStrings(component.contributorIds, next.contributorIds);
-    })
-    && currentBasis.runtimeProjectionOwnerEpoch
-      === candidateBasis.runtimeProjectionOwnerEpoch
-    // The aggregate runtime generation is a transport heartbeat when every
-    // identified contributor below is unchanged.  It remains retained in the
-    // latest source frame for diagnostics but must not wake the shell/viewer.
-    && currentBasis.managerSourceOwnerEpoch === candidateBasis.managerSourceOwnerEpoch
-    && currentBasis.logicalSceneSourceOwnerEpoch
-      === candidateBasis.logicalSceneSourceOwnerEpoch
-    && currentBasis.logicalSceneSourceGeneration
-      === candidateBasis.logicalSceneSourceGeneration
-    && currentBasis.sceneRuntimeSourceOwnerEpoch
-      === candidateBasis.sceneRuntimeSourceOwnerEpoch
-    && currentBasis.sceneRuntimeSourceGeneration
-      === candidateBasis.sceneRuntimeSourceGeneration
-    && currentBasis.alarmOwnerEpoch === candidateBasis.alarmOwnerEpoch
-    && currentBasis.alarmGeneration === candidateBasis.alarmGeneration
-    && currentBasis.alarmStateRevision === candidateBasis.alarmStateRevision
-    && currentBasis.admissionGeneration === candidateBasis.admissionGeneration
-    && currentBasis.programRunnerOwnerEpoch === candidateBasis.programRunnerOwnerEpoch
-    && currentBasis.programCycleGeneration === candidateBasis.programCycleGeneration
-    && currentBasis.appliedProgramOwnerEpoch === candidateBasis.appliedProgramOwnerEpoch
-    && currentBasis.appliedProgramGeneration === candidateBasis.appliedProgramGeneration
-    && currentBasis.executionOwnerEpoch === candidateBasis.executionOwnerEpoch
-    && currentBasis.executionPublicationGeneration
-      === candidateBasis.executionPublicationGeneration;
 }
 
 function sameStrings(current: string[], candidate: string[]): boolean {
@@ -507,17 +412,29 @@ export class HeadlessStateSource implements ExecutionObservationReader {
   private controlHeartbeatTimer: ReturnType<typeof setTimeout> | null = null;
   private controlSessionId: string | null = null;
   private controlReceiverIncarnation: string | null = null;
+  private controlSnapshotBarrierPending = true;
   private controlServerSequence = 0n;
   private controlClientSequence = 0;
   private controlHeartbeatConfirmed = false;
   private lastControlEchoSequence = 0;
+  private lastReceivedClientSequence = 0n;
+  private controlHeartbeatFreshness: ControlFreshnessContext | null = null;
+  private commandDeliveryFaultSessionId: string | null = null;
+  private controlTransportStatus: ControlTransportStatus = 'disconnected';
+  private controlTransportError: string | null = null;
+  private controlSemanticStatus: ControlSemanticStatus = 'synchronizing';
+  private controlSemanticReason: string | null = 'control_projection_synchronizing';
   private executionControl: CurrentExecutionControl | null = null;
+  private executionTargetsWire: unknown = null;
   private ordinaryControlPending: string | null = null;
   private runtimeScaleControlPending: string | null = null;
   private readonly commandReceipts = new Map<string, {
     resolve: (receipt: ExecutionCommandReceipt) => void;
     reject: (reason: Error) => void;
+    clientSequence: bigint;
+    deliveryTimer: ReturnType<typeof setTimeout> | null;
   }>();
+  private readonly clientIncidents = new Map<ControlClientIncidentKind, ClientIncidentState>();
   private observationSerial = 0;
   private observationSocket: WebSocket | null = null;
   private observationReconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -551,7 +468,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
   constructor() {
     headlessSourceRecords.add(this.qualificationRecord);
     publishHeadlessQualification();
-    this.shellResult = { snapshot: null, error: null, reconnect: this.reconnect };
+    this.shellResult = this.result();
     this.viewerResult = this.shellResult;
   }
 
@@ -617,6 +534,8 @@ export class HeadlessStateSource implements ExecutionObservationReader {
       || sessionId === null
       || control === null
       || !this.controlHeartbeatConfirmed
+      || this.controlTransportError !== null
+      || (!stop && !this.controlProjectionIsCurrent())
     ) {
       return Promise.reject(new Error('Control connection is not synchronized.'));
     }
@@ -664,11 +583,51 @@ export class HeadlessStateSource implements ExecutionObservationReader {
       },
     };
     return new Promise<ExecutionCommandReceipt>((resolve, reject) => {
-      this.commandReceipts.set(correlationId, { resolve, reject });
+      const pending = {
+        resolve,
+        reject,
+        clientSequence: BigInt(clientSequence),
+        deliveryTimer: null as ReturnType<typeof setTimeout> | null,
+      };
+      this.commandReceipts.set(correlationId, pending);
       if (runtimeScale) this.runtimeScaleControlPending = correlationId;
       else if (!stop) this.ordinaryControlPending = correlationId;
       try {
         socket.send(JSON.stringify(command));
+        pending.deliveryTimer = setTimeout(() => {
+          if (this.commandReceipts.get(correlationId) !== pending) return;
+          const delivered = this.lastReceivedClientSequence >= pending.clientSequence;
+          if (delivered) {
+            // The server watermark is the transport acknowledgement. Owner
+            // work may legitimately continue (for example, Reset settlement)
+            // while lifecycle state is already arriving independently.
+            pending.deliveryTimer = null;
+            return;
+          }
+          this.commandReceipts.delete(correlationId);
+          if (this.ordinaryControlPending === correlationId) {
+            this.ordinaryControlPending = null;
+          }
+          if (this.runtimeScaleControlPending === correlationId) {
+            this.runtimeScaleControlPending = null;
+          }
+          const error = new Error(
+            'Command delivery is unconfirmed; commands are disabled.',
+          );
+          pending.reject(error);
+          this.controlTransportError = error.message;
+          this.commandDeliveryFaultSessionId = sessionId;
+          this.reportClientIncident(
+            'command_delivery_unconfirmed',
+            true,
+            'command_watermark_missing',
+            CONTROL_COMMAND_DELIVERY_NS,
+          );
+          this.refreshControlCondition();
+          // Recover only through a new current snapshot. The backend may have
+          // received the command even though this session could not prove it.
+          socket.close(1002, 'command delivery unconfirmed');
+        }, CONTROL_COMMAND_DELIVERY_NS / 1_000_000);
       } catch (reason) {
         this.commandReceipts.delete(correlationId);
         if (this.ordinaryControlPending === correlationId) {
@@ -680,6 +639,40 @@ export class HeadlessStateSource implements ExecutionObservationReader {
         reject(reason instanceof Error ? reason : new Error('Command delivery failed.'));
       }
     });
+  };
+
+  readonly reportClientIncident = (
+    kind: ControlClientIncidentKind,
+    active: boolean,
+    reasonCode: string,
+    observedDelayNs: number | null = null,
+  ): void => {
+    const existing = this.clientIncidents.get(kind);
+    if (active) {
+      if (existing !== undefined) {
+        existing.occurrenceCount += 1;
+        existing.maximumDelayNs = observedDelayNs === null
+          ? existing.maximumDelayNs
+          : Math.max(existing.maximumDelayNs ?? 0, observedDelayNs);
+        return;
+      }
+      const incident: ClientIncidentState = {
+        id: `client-incident.${globalThis.crypto?.randomUUID?.()
+          ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`}`,
+        kind,
+        reasonCode,
+        startedMs: performance.now(),
+        occurrenceCount: 1,
+        maximumDelayNs: observedDelayNs,
+        activationSent: false,
+      };
+      this.clientIncidents.set(kind, incident);
+      this.sendClientIncidentTransition(incident, 'activated');
+      return;
+    }
+    if (existing === undefined) return;
+    this.sendClientIncidentTransition(existing, 'resolved');
+    this.clientIncidents.delete(kind);
   };
 
   readonly markViewerPresented = (snapshot: ComposerHeadlessState | null): void => {
@@ -814,24 +807,35 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     const socket = this.socket;
     this.socket = null;
     this.clearControlSession(reason);
+    this.controlTransportStatus = this.enabled && !this.disposed
+      ? 'connecting'
+      : 'disconnected';
     socket?.close(1000, reason);
     this.latest = null;
     this.presentedViewer = null;
     this.presentedFrame = null;
-    this.publishImmediate();
+    this.refreshControlCondition();
   }
 
   private clearControlSession(reason: string): void {
     this.controlSessionId = null;
     this.controlReceiverIncarnation = null;
+    this.controlSnapshotBarrierPending = true;
     this.controlServerSequence = 0n;
     this.executionControl = null;
+    this.executionTargetsWire = null;
     this.controlClientSequence = 0;
     this.controlHeartbeatConfirmed = false;
     this.lastControlEchoSequence = 0;
+    this.lastReceivedClientSequence = 0n;
+    this.controlHeartbeatFreshness = null;
+    this.controlTransportError = null;
+    this.controlSemanticStatus = 'synchronizing';
+    this.controlSemanticReason = 'control_projection_synchronizing';
     this.ordinaryControlPending = null;
     this.runtimeScaleControlPending = null;
     for (const pending of this.commandReceipts.values()) {
+      if (pending.deliveryTimer !== null) clearTimeout(pending.deliveryTimer);
       pending.reject(new Error(`Command delivery unconfirmed; ${reason}.`));
     }
     this.commandReceipts.clear();
@@ -858,6 +862,9 @@ export class HeadlessStateSource implements ExecutionObservationReader {
 
   private connect(): void {
     if (!this.enabled || this.disposed) return;
+    this.controlTransportStatus = 'connecting';
+    this.controlTransportError = null;
+    this.refreshControlCondition();
     const serial = ++this.serial;
     const socket = new WebSocket(websocketUrl('/ws/control'));
     this.socket = socket;
@@ -906,11 +913,22 @@ export class HeadlessStateSource implements ExecutionObservationReader {
           }
           this.controlSessionId = record.control_session_id;
           this.controlReceiverIncarnation = record.receiver_incarnation;
+          this.controlSnapshotBarrierPending = true;
           this.controlServerSequence = 0n;
           this.controlClientSequence = 0;
           this.controlHeartbeatConfirmed = false;
           this.lastControlEchoSequence = 0;
-          this.scheduleControlSynchronizationWatch(serial, socket);
+          this.lastReceivedClientSequence = 0n;
+          this.controlHeartbeatFreshness = null;
+          this.controlTransportError = null;
+          this.controlSemanticStatus = 'synchronizing';
+          this.controlSemanticReason = 'control_projection_synchronizing';
+          for (const incident of this.clientIncidents.values()) {
+            incident.activationSent = false;
+            this.sendClientIncidentTransition(incident, 'activated');
+          }
+          this.refreshControlCondition();
+          this.scheduleControlHeartbeatWatch(serial, socket);
           return;
         }
         if (this.controlSessionId === null
@@ -921,39 +939,65 @@ export class HeadlessStateSource implements ExecutionObservationReader {
         }
         this.controlServerSequence = BigInt(record.server_sequence);
         if (kind === 'heartbeat_challenge') {
+          const semanticStatus = record.semantic_status;
+          const semanticReason = record.semantic_reason;
+          if (!['current', 'synchronizing', 'unavailable'].includes(
+            String(semanticStatus),
+          )) throw new Error('Control heartbeat semantic status is invalid.');
+          const current = semanticStatus === 'current';
+          if ((current && semanticReason !== null)
+            || (!current && (typeof semanticReason !== 'string'
+              || semanticReason.length === 0))) {
+            throw new Error('Control heartbeat semantic reason is invalid.');
+          }
           if (
             !canonicalPositiveU64(record.challenge_sequence)
-            || record.freshness === null
-            || typeof record.freshness !== 'object'
-            || Array.isArray(record.freshness)
           ) throw new Error('Control heartbeat is invalid.');
-          const freshness = record.freshness as unknown as ControlFreshnessContext;
-          if (
-            typeof freshness.context_id !== 'string'
-            || typeof freshness.receiver_incarnation !== 'string'
-            || typeof freshness.semantic_owner_epoch !== 'string'
-            || !Number.isSafeInteger(freshness.execution_control_revision)
-            || !canonicalPositiveU64(freshness.issued_server_sequence)
-            || freshness.valid_for_ns !== 750_000_000
-          ) throw new Error('Control freshness context is invalid.');
-          if (this.executionControl !== null) {
-            this.executionControl = { ...this.executionControl, freshness };
+          let freshness: ControlFreshnessContext | null = null;
+          if (current) {
+            if (record.freshness === null
+              || typeof record.freshness !== 'object'
+              || Array.isArray(record.freshness)) {
+              throw new Error('Current heartbeat omitted freshness.');
+            }
+            freshness = record.freshness as unknown as ControlFreshnessContext;
+            if (
+              typeof freshness.context_id !== 'string'
+              || typeof freshness.receiver_incarnation !== 'string'
+              || typeof freshness.semantic_owner_epoch !== 'string'
+              || !Number.isSafeInteger(freshness.execution_control_revision)
+              || !canonicalPositiveU64(freshness.issued_server_sequence)
+              || freshness.valid_for_ns !== 750_000_000
+            ) throw new Error('Control freshness context is invalid.');
+            if (this.controlMatchesFreshness(this.executionControl, freshness)) {
+              this.executionControl = { ...this.executionControl, freshness };
+            }
+          } else if (record.freshness !== null) {
+            throw new Error('Non-current heartbeat carried command freshness.');
           }
+          const semanticChanged = this.controlSemanticStatus !== semanticStatus
+            || this.controlSemanticReason !== semanticReason;
+          this.controlSemanticStatus = semanticStatus as ControlSemanticStatus;
+          this.controlSemanticReason = semanticReason as string | null;
+          this.controlHeartbeatFreshness = freshness;
           const received = record.received_client_sequence;
+          if (received !== null && !canonicalPositiveU64(received)) {
+            throw new Error('Control client watermark is invalid.');
+          }
+          if (canonicalPositiveU64(received)) {
+            const watermark = BigInt(received);
+            if (watermark < this.lastReceivedClientSequence) {
+              throw new Error('Control client watermark regressed.');
+            }
+            this.lastReceivedClientSequence = watermark;
+          }
           const confirmedNow = this.lastControlEchoSequence > 0
             && canonicalPositiveU64(received)
             && BigInt(received) >= BigInt(this.lastControlEchoSequence);
-          if (confirmedNow) {
-            this.scheduleControlHeartbeatWatch(serial, socket);
-            if (!this.controlHeartbeatConfirmed) {
-              this.controlHeartbeatConfirmed = true;
-              this.latestError = null;
-              if (this.latest !== null) {
-                this.scheduleShell();
-                this.scheduleViewer();
-              }
-            }
-          }
+          // Echo before publishing React state or durable diagnostic
+          // transitions. A semantic revision can legitimately reach this
+          // cached heartbeat context before its replaceable shell delta; that
+          // brief mismatch is synchronization, never a broken transport.
           this.controlClientSequence += 1;
           this.lastControlEchoSequence = this.controlClientSequence;
           socket.send(JSON.stringify({
@@ -963,6 +1007,26 @@ export class HeadlessStateSource implements ExecutionObservationReader {
             client_sequence: String(this.controlClientSequence),
             challenge_sequence: record.challenge_sequence,
           }));
+          if (confirmedNow) {
+            this.scheduleControlHeartbeatWatch(serial, socket);
+            if (!this.controlHeartbeatConfirmed) {
+              this.controlHeartbeatConfirmed = true;
+              this.controlTransportStatus = 'connected';
+              this.controlTransportError = null;
+              this.reportClientIncident(
+                'control_disconnected',
+                false,
+                'control_websocket_recovered',
+              );
+              this.resolveCommandDeliveryFaultAfterResynchronization();
+              this.refreshControlCondition();
+              if (this.latest !== null) {
+                this.scheduleShell();
+                this.scheduleViewer();
+              }
+            }
+          }
+          if (semanticChanged || confirmedNow) this.refreshControlCondition();
           return;
         }
         if (kind === 'command_receipt') {
@@ -996,6 +1060,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
           const pending = this.commandReceipts.get(correlationId);
           if (pending !== undefined) {
             this.commandReceipts.delete(correlationId);
+            if (pending.deliveryTimer !== null) clearTimeout(pending.deliveryTimer);
             if (this.ordinaryControlPending === correlationId) {
               this.ordinaryControlPending = null;
             }
@@ -1025,80 +1090,15 @@ export class HeadlessStateSource implements ExecutionObservationReader {
         if (kind !== 'snapshot' && kind !== 'delta') {
           throw new Error('Control server message kind is unsupported.');
         }
-        const controlValue = record.control;
-        if (controlValue === null || typeof controlValue !== 'object'
-          || Array.isArray(controlValue)) {
-          throw new Error('Control projection is unavailable.');
+        if (this.controlSnapshotBarrierPending && kind !== 'snapshot') {
+          throw new Error('Control delta preceded its snapshot barrier.');
         }
-        const control = controlValue as unknown as CurrentExecutionControl;
-        if (typeof control.receiver_incarnation !== 'string'
-          || typeof control.semantic_owner_epoch !== 'string'
-          || !Number.isSafeInteger(control.execution_control_revision)
-          || control.freshness === null || typeof control.freshness !== 'object') {
-          throw new Error('Control projection identity is invalid.');
+        const ownerState = record.control !== null;
+        if ((ownerState && !canonicalPositiveU64(record.state_sequence))
+          || (!ownerState && record.state_sequence !== undefined)) {
+          throw new Error('Control state delivery sequence is invalid.');
         }
-        this.executionControl = control;
-        const shell = record.shell;
-        if (shell === null || typeof shell !== 'object' || Array.isArray(shell)) {
-          throw new Error('Control state message omitted its shell.');
-        }
-        const shellRecord = shell as Record<string, unknown>;
-        let candidate: ComposerHeadlessState;
-        if ('runtime' in shellRecord) {
-          candidate = parseComposerHeadlessState(shellRecord);
-        } else {
-          if (this.latest === null || !('program_cycle' in shellRecord)) {
-            throw new Error('Control delta preceded its snapshot barrier.');
-          }
-          const draft = shellRecord.draft_identity;
-          if (draft === null || typeof draft !== 'object' || Array.isArray(draft)) {
-            throw new Error('Control delta omitted its Draft identity.');
-          }
-          const draftRecord = draft as Record<string, unknown>;
-          if (typeof draftRecord.draft_id !== 'string'
-            || !Number.isSafeInteger(draftRecord.draft_revision)
-            || typeof shellRecord.receiver_epoch !== 'string'
-            || !Number.isSafeInteger(shellRecord.snapshot_sequence)) {
-            throw new Error('Control delta shell identity is invalid.');
-          }
-          candidate = {
-            ...this.latest,
-            programCycle: parseProgramCycleStatus(shellRecord.program_cycle),
-            ...(shellRecord.execution_targets !== undefined
-              && shellRecord.execution_control_state !== undefined
-              ? {
-                  executionControlStatus: parseExecutionControlStatus(
-                    shellRecord.execution_targets,
-                    shellRecord.execution_control_state,
-                  ),
-                }
-              : {}),
-            draftIdentity: {
-              draftId: draftRecord.draft_id,
-              draftRevision: draftRecord.draft_revision as number,
-            },
-            receiverEpoch: shellRecord.receiver_epoch,
-            snapshotSequence: shellRecord.snapshot_sequence as number,
-          };
-        }
-        const admission = admitHeadlessState(this.latest, candidate);
-        if (!admission.accepted) {
-          this.publishError(admission.reason);
-          socket.close(1002, 'non-monotonic headless projection');
-          return;
-        }
-        const shellChanged = !sameHeadlessProjection(this.latest, candidate);
-        const viewerChanged = !sameViewerProjection(this.latest, candidate);
-        this.latest = candidate;
-        if (kind === 'snapshot' && !this.controlHeartbeatConfirmed) {
-          this.scheduleControlHeartbeatWatch(serial, socket);
-        }
-        if (this.controlHeartbeatConfirmed) this.latestError = null;
-        this.advancePresentedFrame(candidate);
-        if (this.controlHeartbeatConfirmed) {
-          if (viewerChanged) this.scheduleViewer();
-          if (shellChanged) this.scheduleShell();
-        }
+        this.applyControlState(record, kind, socket);
       } catch (reason) {
         this.publishError(
           reason instanceof Error
@@ -1110,15 +1110,22 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     };
     socket.onerror = () => {
       if (serial !== this.serial || this.socket !== socket) return;
+      this.controlTransportStatus = 'disconnected';
       this.publishError('Headless WebSocket transport failed.');
     };
     socket.onclose = () => {
       if (serial !== this.serial || !this.enabled || this.disposed) return;
+      this.reportClientIncident(
+        'control_disconnected',
+        true,
+        'control_websocket_closed',
+      );
       if (this.socket === socket) {
         this.socket = null;
       }
       this.clearControlHeartbeatWatch();
       this.clearControlSession('control connection closed');
+      this.controlTransportStatus = 'disconnected';
       // An actual close establishes a new snapshot barrier even if this
       // session had already been classified as delayed or stale.
       this.publishError('Headless projection disconnected.');
@@ -1128,10 +1135,257 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     };
   }
 
+  private applyControlState(
+    record: Record<string, unknown>,
+    kind: 'snapshot' | 'delta',
+    socket: WebSocket,
+  ): void {
+    try {
+      const controlValue = record.control;
+      if (controlValue !== null && (typeof controlValue !== 'object'
+        || Array.isArray(controlValue))) {
+        throw new Error('Control projection is unavailable.');
+      }
+      if (controlValue !== null) {
+        const control = controlValue as unknown as CurrentExecutionControl;
+        if (typeof control.receiver_incarnation !== 'string'
+          || typeof control.semantic_owner_epoch !== 'string'
+          || !Number.isSafeInteger(control.execution_control_revision)
+          || control.execution_control_revision < 1
+          || control.freshness === null || typeof control.freshness !== 'object') {
+          throw new Error('Control projection identity is invalid.');
+        }
+        const heartbeatFreshness = this.controlHeartbeatFreshness;
+        this.executionControl = heartbeatFreshness !== null
+          && this.controlMatchesFreshness(control, heartbeatFreshness)
+          ? { ...control, freshness: heartbeatFreshness }
+          : control;
+      } else if (this.executionControl === null) {
+        throw new Error('Control delta preceded its control snapshot.');
+      }
+      const shell = record.shell;
+      if (shell === null || typeof shell !== 'object' || Array.isArray(shell)) {
+        throw new Error('Control state message omitted its shell.');
+      }
+      const shellRecord = shell as Record<string, unknown>;
+      let candidate: ComposerHeadlessState;
+      let candidateExecutionTargetsWire = this.executionTargetsWire;
+      if (kind === 'snapshot') {
+        candidate = parseComposerHeadlessState(shellRecord);
+        candidateExecutionTargetsWire = shellRecord.execution_targets;
+      } else {
+        if (this.latest === null) {
+          throw new Error('Control delta preceded its snapshot barrier.');
+        }
+        if (shellRecord.complete !== false) {
+          throw new Error('Partial control delta claimed to be complete.');
+        }
+        const localIdentityFields = [
+          'schema_version', 'draft_identity', 'receiver_epoch', 'snapshot_sequence',
+        ];
+        const localIdentityCount = localIdentityFields.filter(
+          (name) => name in shellRecord,
+        ).length;
+        if (localIdentityCount !== 0
+          && localIdentityCount !== localIdentityFields.length) {
+          throw new Error('Control delta contains a partial Composer identity.');
+        }
+        const hasLocalIdentity = localIdentityCount === localIdentityFields.length;
+        let draftIdentity = this.latest.draftIdentity;
+        let receiverEpoch = this.latest.receiverEpoch;
+        let snapshotSequence = this.latest.snapshotSequence;
+        if (hasLocalIdentity) {
+          const draft = shellRecord.draft_identity;
+          if (draft === null || typeof draft !== 'object' || Array.isArray(draft)) {
+            throw new Error('Control delta Draft identity is invalid.');
+          }
+          const draftRecord = draft as Record<string, unknown>;
+          if (typeof draftRecord.draft_id !== 'string'
+            || !Number.isSafeInteger(draftRecord.draft_revision)
+            || typeof shellRecord.receiver_epoch !== 'string'
+            || !Number.isSafeInteger(shellRecord.snapshot_sequence)
+            || shellRecord.schema_version
+              !== 'manyforge.composer_headless_state.v2') {
+            throw new Error('Control delta shell identity is invalid.');
+          }
+          draftIdentity = {
+            draftId: draftRecord.draft_id,
+            draftRevision: draftRecord.draft_revision as number,
+          };
+          receiverEpoch = shellRecord.receiver_epoch;
+          snapshotSequence = shellRecord.snapshot_sequence as number;
+        }
+        const permitted = new Set([
+          'schema_version', 'complete', 'runtime', 'alarms',
+          'component_overview', 'authoring_admission', 'execution_targets',
+          'execution_control_state', 'program_cycle', 'draft_identity',
+          'receiver_epoch', 'snapshot_sequence',
+        ]);
+        if (Object.keys(shellRecord).some((name) => !permitted.has(name))) {
+          throw new Error('Control delta shell shape is invalid.');
+        }
+        const targetsPresent = 'execution_targets' in shellRecord;
+        const executionStatePresent = 'execution_control_state' in shellRecord;
+        if (targetsPresent && !executionStatePresent) {
+          throw new Error('Control delta replaced targets without their control capture.');
+        }
+        let authoringAdmission = this.latest.authoringAdmission;
+        if ('authoring_admission' in shellRecord) {
+          const value = shellRecord.authoring_admission;
+          if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+            throw new Error('Control delta authoring admission is invalid.');
+          }
+          const admission = value as Record<string, unknown>;
+          if (Object.keys(admission).length !== 2
+            || !('authoring_allowed' in admission)
+            || !('admission_generation' in admission)
+            || typeof admission.authoring_allowed !== 'boolean'
+            || !Number.isSafeInteger(admission.admission_generation)
+            || (admission.admission_generation as number) < 1) {
+            throw new Error('Control delta authoring admission is invalid.');
+          }
+          authoringAdmission = {
+            authoringAllowed: admission.authoring_allowed,
+            admissionGeneration: admission.admission_generation as number,
+          };
+        }
+        let executionControlStatus = this.latest.executionControlStatus;
+        if (executionStatePresent) {
+          const executionTargets = targetsPresent
+            ? shellRecord.execution_targets
+            : this.executionTargetsWire;
+          executionControlStatus = executionTargets === null
+            && shellRecord.execution_control_state === null
+            ? null
+            : parseExecutionControlStatus(
+                executionTargets,
+                shellRecord.execution_control_state,
+              );
+          if (targetsPresent) candidateExecutionTargetsWire = executionTargets;
+        }
+        candidate = {
+          ...this.latest,
+          ...('runtime' in shellRecord
+            ? { runtime: parseHeadlessRuntimeSnapshot(shellRecord.runtime) }
+            : {}),
+          ...('alarms' in shellRecord
+            ? { alarms: parseOperatorAlarmSnapshot(shellRecord.alarms) }
+            : {}),
+          ...('component_overview' in shellRecord
+            ? {
+                componentOverview: parseComponentOverviewProjection(
+                  shellRecord.component_overview,
+                  'headlessState.component_overview',
+                ),
+              }
+            : {}),
+          ...('program_cycle' in shellRecord
+            ? { programCycle: parseProgramCycleStatus(shellRecord.program_cycle) }
+            : {}),
+          authoringAdmission,
+          executionControlStatus,
+          draftIdentity,
+          receiverEpoch,
+          snapshotSequence,
+        };
+      }
+      const admission = admitHeadlessState(
+        this.controlSnapshotBarrierPending ? null : this.latest,
+        candidate,
+      );
+      if (!admission.accepted) {
+        this.publishError(admission.reason);
+        socket.close(1002, 'non-monotonic headless projection');
+        return;
+      }
+      this.controlSnapshotBarrierPending = false;
+      this.executionTargetsWire = candidateExecutionTargetsWire;
+      const viewerChanged = !sameViewerProjection(this.latest, candidate);
+      this.latest = candidate;
+      if (canonicalPositiveU64(record.state_sequence)) {
+        socket.send(JSON.stringify({
+          schema_version: CONTROL_PROTOCOL_VERSION,
+          message_kind: 'state_applied',
+          control_session_id: this.controlSessionId,
+          state_sequence: record.state_sequence,
+        }));
+      }
+      this.refreshControlCondition();
+      this.advancePresentedFrame(candidate);
+      this.resolveCommandDeliveryFaultAfterResynchronization();
+      if (this.controlHeartbeatConfirmed) {
+        if (viewerChanged) this.scheduleViewer();
+        // The v2 backend publishes only semantic owner changes; the browser
+        // does not repeat its reduction or second-guess that authority.
+        this.scheduleShell();
+      }
+    } catch (reason) {
+      this.publishError(
+        reason instanceof Error
+          ? reason.message
+          : 'Invalid headless WebSocket projection.',
+      );
+      socket.close(1002, 'invalid headless projection');
+    }
+  }
+
   private clearControlHeartbeatWatch(): void {
     if (this.controlHeartbeatTimer !== null) {
       clearTimeout(this.controlHeartbeatTimer);
       this.controlHeartbeatTimer = null;
+    }
+  }
+
+  private resolveCommandDeliveryFaultAfterResynchronization(): void {
+    if (
+      this.commandDeliveryFaultSessionId === null
+      || this.controlSessionId === null
+      || this.controlSessionId === this.commandDeliveryFaultSessionId
+      || !this.controlHeartbeatConfirmed
+      || this.controlSnapshotBarrierPending
+      || this.latest === null
+    ) return;
+    this.commandDeliveryFaultSessionId = null;
+    this.reportClientIncident(
+      'command_delivery_unconfirmed',
+      false,
+      'control_snapshot_resynchronized',
+    );
+  }
+
+  private sendClientIncidentTransition(
+    incident: ClientIncidentState,
+    phase: 'activated' | 'resolved',
+  ): void {
+    const socket = this.socket;
+    const sessionId = this.controlSessionId;
+    if (socket === null || socket.readyState !== WebSocket.OPEN || sessionId === null) {
+      return;
+    }
+    if (phase === 'resolved' && !incident.activationSent) return;
+    this.controlClientSequence += 1;
+    const elapsedNs = Math.max(
+      0,
+      Math.round((performance.now() - incident.startedMs) * 1_000_000),
+    );
+    try {
+      socket.send(JSON.stringify({
+        schema_version: CONTROL_PROTOCOL_VERSION,
+        message_kind: 'client_incident',
+        control_session_id: sessionId,
+        client_sequence: String(this.controlClientSequence),
+        incident_id: incident.id,
+        incident_kind: incident.kind,
+        phase,
+        occurrence_count: incident.occurrenceCount,
+        maximum_delay_ns: incident.maximumDelayNs ?? elapsedNs,
+        reason_code: phase === 'activated' ? incident.reasonCode : 'client_incident_recovered',
+      }));
+      if (phase === 'activated') incident.activationSent = true;
+    } catch {
+      // The connection classifier owns transport failure. Keep an unsent
+      // activation in memory so a later session can report it once.
+      if (phase === 'activated') incident.activationSent = false;
     }
   }
 
@@ -1144,38 +1398,21 @@ export class HeadlessStateSource implements ExecutionObservationReader {
       // server confirmation. An old challenge queued in a paused browser
       // must not briefly re-enable commands.
       this.lastControlEchoSequence = this.controlClientSequence + 1;
-      this.latestError = 'Control connection is delayed; commands are disabled.';
-      this.cancelPublications();
-      this.publishImmediate();
+      this.controlTransportStatus = 'delayed';
+      this.controlTransportError = 'Control connection is delayed; commands are disabled.';
+      this.refreshControlCondition();
       this.controlHeartbeatTimer = setTimeout(() => {
         if (serial !== this.serial || this.socket !== socket) return;
         this.controlHeartbeatTimer = null;
         this.controlHeartbeatConfirmed = false;
-        this.latestError = 'Control connection is stale; commands are disabled.';
-        this.cancelPublications();
-        this.publishImmediate();
+        this.controlTransportStatus = 'stale';
+        this.controlTransportError = 'Control connection is stale; commands are disabled.';
+        this.refreshControlCondition();
         // Keep the live transport. The server keeps one challenge
         // outstanding and can recover the session without reconnect churn;
         // it separately reclaims a genuinely dead peer after a bounded wait.
       }, (CONTROL_HEARTBEAT_STALE_NS - CONTROL_HEARTBEAT_DELAYED_NS) / 1_000_000);
     }, CONTROL_HEARTBEAT_DELAYED_NS / 1_000_000);
-  }
-
-  private scheduleControlSynchronizationWatch(
-    serial: number,
-    socket: WebSocket,
-  ): void {
-    this.clearControlHeartbeatWatch();
-    this.controlHeartbeatTimer = setTimeout(() => {
-      if (serial !== this.serial || this.socket !== socket) return;
-      this.controlHeartbeatTimer = null;
-      this.controlHeartbeatConfirmed = false;
-      this.latestError = 'Control state synchronization is delayed; commands are disabled.';
-      this.cancelPublications();
-      this.publishImmediate();
-      // Reconnecting cannot make a semantic owner become current. Keep this
-      // one transport open so the backend source can recover without churn.
-    }, CONTROL_HEARTBEAT_STALE_NS / 1_000_000);
   }
 
   private connectObservation(): void {
@@ -1275,6 +1512,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
         || !this.viewerDemand
         || this.disposed
       ) return;
+      this.discardUnappliedExecutionObservation();
       if (this.observationSocket === socket) {
         this.observationSocket = null;
         this.qualificationRecord.socketActive = false;
@@ -1329,9 +1567,14 @@ export class HeadlessStateSource implements ExecutionObservationReader {
   }
 
   private result(): HeadlessStateResult {
+    const semantic = this.semanticCondition();
     return {
       snapshot: this.latest,
       error: this.latestError,
+      transportStatus: this.controlTransportStatus,
+      transportError: this.controlTransportError,
+      semanticStatus: semantic.status,
+      semanticReason: semantic.reason,
       reconnect: this.reconnect,
     };
   }
@@ -1350,21 +1593,67 @@ export class HeadlessStateSource implements ExecutionObservationReader {
   }
 
   private publishError(error: string | null): void {
-    // Commands must lose authority immediately, but a transport interruption
-    // must not reinterpret the last coherent owner scene as an empty scene.
-    // Keep the structural viewer snapshot. The independently bounded viewer
-    // transport owns dynamic-observation validity and reconnects separately.
-    const retainedViewerSnapshot = error === null
-      ? null
-      : this.viewerResult.snapshot;
-    this.latestError = error;
-    if (error !== null) {
-      this.latest = null;
-      this.presentedViewer = null;
-      this.presentedFrame = null;
+    this.controlTransportError = error;
+    if (error !== null) this.controlHeartbeatConfirmed = false;
+    this.refreshControlCondition();
+  }
+
+  private controlMatchesFreshness(
+    control: CurrentExecutionControl | null,
+    freshness: ControlFreshnessContext | null,
+  ): control is CurrentExecutionControl {
+    return control !== null
+      && freshness !== null
+      && freshness.receiver_incarnation === control.receiver_incarnation
+      && freshness.semantic_owner_epoch === control.semantic_owner_epoch
+      && freshness.execution_control_revision
+        === control.execution_control_revision;
+  }
+
+  private controlProjectionIsCurrent(): boolean {
+    return this.controlSemanticStatus === 'current'
+      && this.controlMatchesFreshness(
+        this.executionControl,
+        this.controlHeartbeatFreshness,
+      );
+  }
+
+  private semanticCondition(): {
+    status: ControlSemanticStatus;
+    reason: string | null;
+  } {
+    if (this.controlSemanticStatus !== 'current') {
+      return {
+        status: this.controlSemanticStatus,
+        reason: this.controlSemanticReason,
+      };
     }
+    return this.controlProjectionIsCurrent()
+      ? { status: 'current', reason: null }
+      : { status: 'synchronizing', reason: 'control_projection_synchronizing' };
+  }
+
+  private refreshControlCondition(): void {
+    let error = this.enabled ? this.controlTransportError : null;
+    const semantic = this.semanticCondition();
+    if (this.enabled && error === null && semantic.status === 'synchronizing') {
+      error = 'Control state is synchronizing; commands are disabled.';
+    } else if (this.enabled && error === null && semantic.status === 'unavailable') {
+      error = `Control state is unavailable (${semantic.reason
+        ?? 'owner unavailable'}); commands are disabled.`;
+    }
+    if (
+      error === this.latestError
+      && this.shellResult.transportStatus === this.controlTransportStatus
+      && this.shellResult.transportError === this.controlTransportError
+      && this.shellResult.semanticStatus === semantic.status
+      && this.shellResult.semanticReason === semantic.reason
+    ) return;
+    // Transport and semantic availability remove command authority, but they
+    // do not erase the last coherent backend presentation or viewer scene.
+    this.latestError = error;
     this.cancelPublications();
-    this.publishImmediate(retainedViewerSnapshot);
+    this.publishImmediate();
   }
 
   private publishImmediate(
@@ -1418,6 +1707,13 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     this.latestExecutionObservation = null;
     this.appliedExecutionObservation = null;
     this.cancelObservationFrame();
+    for (const listener of this.executionObservationListeners) listener();
+  }
+
+  private discardUnappliedExecutionObservation(): void {
+    this.cancelObservationFrame();
+    if (this.latestExecutionObservation === this.appliedExecutionObservation) return;
+    this.latestExecutionObservation = this.appliedExecutionObservation;
     for (const listener of this.executionObservationListeners) listener();
   }
 
@@ -1495,6 +1791,10 @@ export function useViewerHeadlessState(
   const inactive = useRef<HeadlessStateResult>({
     snapshot: null,
     error: null,
+    transportStatus: 'disconnected',
+    transportError: null,
+    semanticStatus: 'synchronizing',
+    semanticReason: 'control_projection_synchronizing',
     reconnect: source.reconnect,
   });
   useEffect(() => {

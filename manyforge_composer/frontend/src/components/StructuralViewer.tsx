@@ -1,5 +1,6 @@
 import {
   Component,
+  memo,
   Profiler,
   Suspense,
   useCallback,
@@ -99,7 +100,7 @@ interface StructuralViewerProps {
   viewerActive: boolean;
   manifest: StructuralResourceState<SceneUrdfManifest>;
   onRetry: () => void;
-  sceneObjects?: LogicalSceneObject[];
+  sceneObjects?: readonly LogicalSceneObject[];
   programDraftPreview?: boolean;
   programDraftIdentity?: {
     draftId: string;
@@ -151,7 +152,7 @@ interface StructuralViewerProps {
   } | null;
   pointCloudCellId?: string;
   viewer?: ProgramViewerMetadata;
-  frameAxes?: Array<{
+  frameAxes?: ReadonlyArray<{
     linkName: string;
     sourceLinkName: string;
     sourceJointName: string | null;
@@ -163,7 +164,7 @@ interface StructuralViewerProps {
     poseAvailable: boolean;
   }>;
   objectAxesVisibleIds?: string[];
-  objectAxesRows?: Array<{
+  objectAxesRows?: ReadonlyArray<{
     sceneResourceId: string;
     attached: boolean;
     poseAvailable: boolean;
@@ -1050,6 +1051,7 @@ function MeasuredRuntimeModel({
         interpolationDurationMs={softwareRenderer
           ? 0
           : MAX_AUTHORITATIVE_INTERPOLATION_MS}
+        minimumCreditIntervalMs={softwareRenderer ? 100 : 1_000 / 30}
       />
       {manifest.links.map((link) => {
         const transform = presentation.linkTransforms[link.name];
@@ -1092,6 +1094,7 @@ function MeasuredRobotFrameDriver({
   livePresentation,
   latestFrameAppliers,
   interpolationDurationMs,
+  minimumCreditIntervalMs,
 }: {
   manifestModelKey: string;
   linkGroups: ReadonlyMap<string, { current: THREE.Group | null }>;
@@ -1099,18 +1102,29 @@ function MeasuredRobotFrameDriver({
   livePresentation?: MeasuredRobotPresentationReader;
   latestFrameAppliers: Set<() => void>;
   interpolationDurationMs: number;
+  minimumCreditIntervalMs: number;
 }) {
   const previous = useRef(new Map<string, AuthoritativeTransformFrame>());
   const active = useRef(new Map<string, AuthoritativeTransformTransition>());
   const acceptedLiveFrame = useRef(false);
   const continuationTimer = useRef<number | null>(null);
+  const appliedAfterRenderTimer = useRef<number | null>(null);
+  const lastAppliedCreditAtMs = useRef<number | null>(null);
+  const pendingAppliedPresentation = useRef<
+    NonNullable<RuntimeScenePresentation['measuredRobot']> | null
+  >(null);
   const invalidate = useThree((state) => state.invalidate);
   const wake = useCallback(() => {
     if (continuationTimer.current !== null) {
       window.clearTimeout(continuationTimer.current);
-      continuationTimer.current = null;
     }
-    invalidate();
+    // Observation listeners themselves run on a browser animation callback.
+    // Defer invalidation by one task so React Three Fiber cannot consume it in
+    // an already-closing frame and leave a capacity-one stream without credit.
+    continuationTimer.current = window.setTimeout(() => {
+      continuationTimer.current = null;
+      invalidate();
+    }, 0);
   }, [invalidate]);
 
   const acceptPresentation = useCallback((
@@ -1125,7 +1139,6 @@ function MeasuredRobotFrameDriver({
     }
 
     const streamIdentity = measuredRobotStreamIdentity(manifestModelKey, next);
-    let changed = false;
     for (const [linkName, target] of linkGroups) {
       const group = target.current;
       const transform = next.linkTransforms[linkName];
@@ -1169,25 +1182,26 @@ function MeasuredRobotFrameDriver({
         transition.durationMs = interpolationDurationMs;
         active.current.set(linkName, transition);
       }
-      changed = true;
     }
-    if (changed) wake();
     return true;
-  }, [interpolationDurationMs, linkGroups, manifestModelKey, wake]);
+  }, [interpolationDurationMs, linkGroups, manifestModelKey]);
 
-  const acceptLatestLivePresentation = useCallback(() => {
+  const acceptLatestLivePresentation = useCallback((wakeAfterApply = true) => {
     const current = livePresentation?.readMeasuredRobotPresentation() ?? null;
     if (current === null) return false;
     const accepted = acceptPresentation(current);
     if (!accepted) return false;
     acceptedLiveFrame.current = true;
-    livePresentation?.markMeasuredRobotPresentationApplied(current);
+    pendingAppliedPresentation.current = current;
+    // Publish the presentation to the render callback before waking it.  An
+    // invalidate may be serviced immediately by an already-running Canvas;
+    // waking first can therefore render a pose without returning its credit.
+    if (wakeAfterApply) wake();
     return accepted;
-  }, [acceptPresentation, livePresentation]);
+  }, [acceptPresentation, livePresentation, wake]);
 
   const applyLatestFrame = useCallback(() => {
-    acceptLatestLivePresentation();
-    if (active.current.size === 0) return;
+    acceptLatestLivePresentation(false);
     for (const [linkName, transition] of active.current) {
       const group = linkGroups.get(linkName)?.current ?? null;
       if (group === null) continue;
@@ -1202,15 +1216,21 @@ function MeasuredRobotFrameDriver({
     previous.current.clear();
     active.current.clear();
     acceptedLiveFrame.current = false;
+    pendingAppliedPresentation.current = null;
+    lastAppliedCreditAtMs.current = null;
+    if (appliedAfterRenderTimer.current !== null) {
+      window.clearTimeout(appliedAfterRenderTimer.current);
+      appliedAfterRenderTimer.current = null;
+    }
   }, [linkGroups, manifestModelKey]);
 
   useLayoutEffect(() => {
     // The slower structural/runtime projection is bootstrap-only after the
     // dedicated observation stream has supplied its first exact frame.
     if (!acceptLatestLivePresentation() && !acceptedLiveFrame.current) {
-      acceptPresentation(presentation);
+      if (acceptPresentation(presentation)) wake();
     }
-  }, [acceptLatestLivePresentation, acceptPresentation, presentation]);
+  }, [acceptLatestLivePresentation, acceptPresentation, presentation, wake]);
 
   useLayoutEffect(() => {
     if (livePresentation === undefined) return undefined;
@@ -1231,31 +1251,63 @@ function MeasuredRobotFrameDriver({
       window.clearTimeout(continuationTimer.current);
       continuationTimer.current = null;
     }
+    if (appliedAfterRenderTimer.current !== null) {
+      window.clearTimeout(appliedAfterRenderTimer.current);
+      appliedAfterRenderTimer.current = null;
+    }
   }, []);
 
   useFrame(() => {
-    if (active.current.size === 0) return;
-    const nowMs = performance.now();
-    let pending = false;
-    for (const [linkName, transition] of active.current) {
-      const group = linkGroups.get(linkName)?.current ?? null;
-      if (group === null) {
-        active.current.delete(linkName);
-        continue;
+    if (active.current.size !== 0) {
+      const nowMs = performance.now();
+      let pending = false;
+      for (const [linkName, transition] of active.current) {
+        const group = linkGroups.get(linkName)?.current ?? null;
+        if (group === null) {
+          active.current.delete(linkName);
+          continue;
+        }
+        if (applyAuthoritativeTransformTransition(
+          transition,
+          nowMs,
+          group.position,
+          group.quaternion,
+        )) active.current.delete(linkName);
+        else pending = true;
       }
-      if (applyAuthoritativeTransformTransition(
-        transition,
-        nowMs,
-        group.position,
-        group.quaternion,
-      )) active.current.delete(linkName);
-      else pending = true;
+      if (pending && continuationTimer.current === null) {
+        continuationTimer.current = window.setTimeout(() => {
+          continuationTimer.current = null;
+          invalidate();
+        }, 1_000 / 60);
+      }
     }
-    if (pending && continuationTimer.current === null) {
-      continuationTimer.current = window.setTimeout(() => {
-        continuationTimer.current = null;
-        invalidate();
-      }, 1_000 / 60);
+    if (
+      active.current.size === 0
+      && pendingAppliedPresentation.current !== null
+      && appliedAfterRenderTimer.current === null
+    ) {
+      // React Three Fiber invokes useFrame callbacks before gl.render().  A
+      // task therefore runs only after this admitted pose has completed its
+      // Canvas render. Bound the next credit as well as waiting for rendering:
+      // an applied-credit loop that runs at the renderer's absolute maximum
+      // leaves no browser-thread headroom for heartbeat or control messages.
+      const previousCreditAtMs = lastAppliedCreditAtMs.current;
+      const delayMs = previousCreditAtMs === null
+        ? 0
+        : Math.max(
+          0,
+          minimumCreditIntervalMs - (performance.now() - previousCreditAtMs),
+        );
+      appliedAfterRenderTimer.current = window.setTimeout(() => {
+        appliedAfterRenderTimer.current = null;
+        const rendered = pendingAppliedPresentation.current;
+        pendingAppliedPresentation.current = null;
+        if (rendered !== null) {
+          lastAppliedCreditAtMs.current = performance.now();
+          livePresentation?.markMeasuredRobotPresentationApplied(rendered);
+        }
+      }, delayMs);
     }
   }, -1_000);
 
@@ -1470,6 +1522,8 @@ type SceneTransformCommit = (
   expectedIdentity: SceneTransformIdentity,
 ) => Promise<boolean>;
 
+const ignoreSceneTransformCommit: SceneTransformCommit = async () => false;
+
 function EditableLogicalSceneObject({
   object,
   selected,
@@ -1607,7 +1661,7 @@ function LogicalSceneObjects({
   onTransformDraggingChange,
   onContextPointerDown,
 }: {
-  objects: LogicalSceneObject[];
+  objects: readonly LogicalSceneObject[];
   appearance: Extract<SceneObjectAppearance, 'authoritative' | 'draft'>;
   selectedSceneResourceId: string | null;
   onSelect: (event: ThreeEvent<MouseEvent>, sceneResourceId: string) => void;
@@ -1688,7 +1742,7 @@ function ObservedLogicalSceneObjects({
   axesSizeM,
   onSelect,
 }: {
-  objects: LogicalSceneObject[];
+  objects: readonly LogicalSceneObject[];
   presentation: RuntimeScenePresentation;
   wireframe: boolean;
   ownerIdentity: StructuralViewerProps['sceneOwnerIdentity'];
@@ -2290,7 +2344,7 @@ export function viewerContextWasDragged({
     > VIEWER_CONTEXT_DRAG_THRESHOLD_PX;
 }
 
-function ViewerCanvas({
+const ViewerCanvas = memo(function ViewerCanvas({
   manifest,
   collisionsVisible,
   wireframeVisible,
@@ -2338,7 +2392,7 @@ function ViewerCanvas({
   wireframeVisible: boolean;
   onAssetError: (error: Error) => void;
   onIsolatedAssetError: (error: Error) => void;
-  sceneObjects: LogicalSceneObject[];
+  sceneObjects: readonly LogicalSceneObject[];
   programDraftPreview: boolean;
   selectedSceneResourceId: string | null;
   onSelectSceneResource: (sceneResourceId: string | null) => void;
@@ -2543,14 +2597,13 @@ function ViewerCanvas({
       onContextMenu={(event) => event.preventDefault()}
     >
     <Canvas
-      key={`${renderer.software ? 'software' : 'hardware'}:${renderer.preserveDrawingBuffer ? 'preserved' : 'transient'}`}
+      key={renderer.software ? 'software' : 'hardware'}
       frameloop="demand"
       dpr={renderer.effectiveDpr}
       gl={{
         antialias: renderer.antialias,
         alpha: false,
         powerPreference: 'high-performance',
-        preserveDrawingBuffer: renderer.preserveDrawingBuffer,
       }}
       onCreated={({ gl }) => {
         if (qualificationEnabled && materializationStartedAtMs.current === null) {
@@ -2743,7 +2796,7 @@ function ViewerCanvas({
     </Canvas>
     </div>
   );
-}
+});
 
 function StructuralViewerContent({
   viewerActive,
@@ -2843,12 +2896,14 @@ function StructuralViewerContent({
   const transformCommit = programDraftPreview
     ? onCommitProgramDraftTransform
     : onCommitSceneTransform;
-  const transformIdentity = programDraftPreview
-    ? programDraftIdentity === undefined ? undefined : {
-        ownerEpoch: programDraftIdentity.draftId,
-        generation: programDraftIdentity.draftRevision,
-      }
-    : sceneOwnerIdentity;
+  const transformIdentity = useMemo(() => (
+    programDraftPreview
+      ? programDraftIdentity === undefined ? undefined : {
+          ownerEpoch: programDraftIdentity.draftId,
+          generation: programDraftIdentity.draftRevision,
+        }
+      : sceneOwnerIdentity
+  ), [programDraftIdentity, programDraftPreview, sceneOwnerIdentity]);
   const transformBaseEnabled = transformCommit !== undefined
     && transformIdentity !== undefined
     && (selectedSceneResourceId === null || !editLockedObjectIds.has(selectedSceneResourceId))
@@ -3019,6 +3074,19 @@ function StructuralViewerContent({
   ) => {
     recordViewerReactCommit(actualDuration);
   }, []);
+  const canvasViewer = useMemo(() => ({
+    ...viewer,
+    frame_gizmo_size_m: frameAxesSizeM,
+    object_axes_gizmo_size_m: objectAxesSizeM,
+  }), [frameAxesSizeM, objectAxesSizeM, viewer]);
+  const canvasSceneContext = useCallback((
+    sceneResourceId: string,
+    x: number,
+    y: number,
+  ) => {
+    if (selectionLocked && sceneResourceId !== selectedSceneResourceId) return;
+    setContextMenu({ sceneResourceId, x, y });
+  }, [selectedSceneResourceId, selectionLocked]);
 
   useEffect(() => {
     const available = new Set(
@@ -3253,11 +3321,7 @@ function StructuralViewerContent({
               pointCloudFrame={pointCloud.frame}
               frameAxes={presentedFrameAxes}
               objectAxesVisibleIds={objectAxesVisible}
-              viewer={{
-                ...viewer,
-                frame_gizmo_size_m: frameAxesSizeM,
-                object_axes_gizmo_size_m: objectAxesSizeM,
-              }}
+              viewer={canvasViewer}
               cameraPresentation={cameraPresentation}
               cameraContentRevision={cameraContentRevision}
               onModelMaterialized={reportModelMaterialized}
@@ -3268,14 +3332,8 @@ function StructuralViewerContent({
               objectEditorActive={inspectorPanel === 'object'}
               robotEditorActive={inspectorPanel === 'robot'}
               transformIdentity={transformIdentity}
-              onCommitSceneTransform={transformCommit ?? (async () => false)}
-              onSceneContext={(sceneResourceId, x, y) => {
-                if (
-                  selectionLocked
-                  && sceneResourceId !== selectedSceneResourceId
-                ) return;
-                setContextMenu({ sceneResourceId, x, y });
-              }}
+              onCommitSceneTransform={transformCommit ?? ignoreSceneTransformCommit}
+              onSceneContext={canvasSceneContext}
               cameraCommand={cameraCommand}
           />
         )}

@@ -434,12 +434,6 @@ export type DirectControlPreviewReceipt =
   | MotionPreviewReceipt
   | CapabilityCommandPreviewReceipt;
 
-export interface OperationAcceptance {
-  requestId: string;
-  operationId: string;
-  operationRevision: number;
-}
-
 export type OperationStateName =
   | 'queued'
   | 'resolving'

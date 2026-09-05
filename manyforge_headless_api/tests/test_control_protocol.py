@@ -7,11 +7,14 @@ from pydantic import ValidationError
 
 from manyforge_headless_api.control_protocol import (
     CONTROL_FRESHNESS_VALID_FOR_NS,
+    CONTROL_PROTOCOL_VERSION,
+    ControlClientIncidentDTO,
     ControlFreshnessAuthority,
     ControlProtocolError,
     EXECUTION_COMMAND_SCHEMA,
     ExecutionCommandEnvelopeDTO,
     ExecutionCommandRequestDTO,
+    ExecutionControlDeltaDTO,
     MAXIMUM_U64,
 )
 
@@ -72,6 +75,30 @@ def test_freshness_is_stateless_signed_and_expires_at_exact_backend_boundary() -
             current_control_revision=4,
         )
     assert expired.value.code == "control_freshness_expired"
+
+
+def test_freshness_profile_and_delta_shape_are_one_closed_contract() -> None:
+    authority = ControlFreshnessAuthority(secret=b"x" * 32)
+    context = _envelope(authority).freshness.model_dump(mode="json")
+    with pytest.raises(ValidationError):
+        type(_envelope(authority).freshness).model_validate(
+            {**context, "valid_for_ns": CONTROL_FRESHNESS_VALID_FOR_NS - 1}
+        )
+
+    delta = {
+        "schema_version": CONTROL_PROTOCOL_VERSION,
+        "message_kind": "delta",
+        "control_session_id": "session.1",
+        "server_sequence": "1",
+        "state_sequence": "1",
+        "received_client_sequence": None,
+        "event_class": "cold",
+        "control": None,
+        "shell": {},
+    }
+    assert ExecutionControlDeltaDTO.model_validate(delta).shell == {}
+    with pytest.raises(ValidationError):
+        ExecutionControlDeltaDTO.model_validate({**delta, "shell": None})
 
 
 def test_freshness_rejects_tamper_owner_revision_and_receiver_replacement() -> None:
@@ -186,3 +213,27 @@ def test_command_envelope_is_closed_paired_and_payload_bounded() -> None:
             command_envelope=envelope,
             payload={"value": "x" * (64 * 1024)},
         )
+
+
+def test_client_incident_is_a_closed_non_authoritative_enum() -> None:
+    incident = {
+        "schema_version": CONTROL_PROTOCOL_VERSION,
+        "message_kind": "client_incident",
+        "control_session_id": "session.1",
+        "client_sequence": "1",
+        "incident_id": "incident.1",
+        "incident_kind": "control_disconnected",
+        "phase": "activated",
+        "occurrence_count": 1,
+        "maximum_delay_ns": None,
+        "reason_code": "control_websocket_closed",
+    }
+    assert ControlClientIncidentDTO.model_validate(incident).incident_kind == (
+        "control_disconnected"
+    )
+    with pytest.raises(ValidationError):
+        ControlClientIncidentDTO.model_validate(
+            {**incident, "incident_kind": "execute_arbitrary_payload"}
+        )
+    with pytest.raises(ValidationError):
+        ControlClientIncidentDTO.model_validate({**incident, "payload": {}})

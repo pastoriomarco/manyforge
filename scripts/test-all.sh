@@ -338,7 +338,7 @@ build_headless_roboplan_producer_closure() {
         manyforge_roboplan_candidate_worker
     )
     if ! cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" \
-        --target "${producer_targets[@]}" -- -k; then
+        --target "${producer_targets[@]}" -- -k 0; then
         echo -e "${RED}  FAIL: RoboPlan producer closure build failed${NC}"
         return 1
     fi
@@ -378,7 +378,7 @@ run_roboplan_tests() {
         FAIL=$((FAIL + 1))
         return
     fi
-    if ! cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" -- -k; then
+    if ! cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" -- -k 0; then
         echo -e "${RED}  FAIL: RoboPlan producer build failed${NC}"
         FAIL=$((FAIL + 1))
         return

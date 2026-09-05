@@ -154,6 +154,30 @@ TEST(AddressedObservedStatePublicationTest,
 }
 
 TEST(AddressedObservedStatePublicationTest,
+     CurrentStateDoesNotCombineAnEarlierReadBoundaryWithANewerSample) {
+  AddressedObservedStatePublication publication(
+      config(context({CoordinateKind::kAngular})));
+  const auto names = publication.query_context().joint_names;
+  const std::array first_position{0.1};
+  const std::array second_position{0.2};
+  ASSERT_TRUE(publication
+                  .publish(ObservedStateSourceKind::kPredictedState, names,
+                           first_position, {}, 100, 100)
+                  .published);
+  ASSERT_TRUE(publication
+                  .publish(ObservedStateSourceKind::kPredictedState, names,
+                           second_position, {}, 101, 101)
+                  .published);
+
+  const auto state = publication.current_state(publication.query_context(), 100);
+
+  ASSERT_TRUE(state.ok()) << state.error().message;
+  EXPECT_EQ(state.value().received_timestamp_ns, 100);
+  EXPECT_DOUBLE_EQ(
+      std::get<AngularPositionDTO>(state.value().positions[0]).value_rad, 0.1);
+}
+
+TEST(AddressedObservedStatePublicationTest,
      RejectsForeignContextAndStaleMeasuredState) {
   AddressedObservedStatePublication publication(config(context(
       {CoordinateKind::kAngular}, StateAuthorityClass::kMeasured, 100)));

@@ -16,9 +16,13 @@ namespace {
 using content_identity::CanonicalValue;
 
 constexpr std::uint64_t kMaximumSafeInteger = 9007199254740991ULL;
+constexpr std::string_view kHistorianEventV1 = "manyforge.historian_event.v1";
 constexpr std::size_t kMaximumIdentityBytes = 1024U;
 constexpr std::size_t kMaximumWallTimeBytes = 128U;
 constexpr std::size_t kMaximumHistorianQueueCapacity = 65536U;
+constexpr std::size_t kMaximumSummaryTraversalNodes = 2048U;
+constexpr std::size_t kMaximumSummaryTraversalDepth = 12U;
+constexpr std::size_t kMaximumSummaryTextCodePoints = 1024U;
 
 [[noreturn]] void HistorianFail(const std::string &code,
                                 const std::string &message) {
@@ -73,6 +77,12 @@ CanonicalValue OptionalString(const std::optional<std::string> &value) {
   return value.has_value() ? CanonicalValue(*value) : CanonicalValue(nullptr);
 }
 
+CanonicalValue PersistedNanoseconds(const std::int64_t value) {
+  return static_cast<std::uint64_t>(value) <= kMaximumSafeInteger
+             ? Number(value, "occurred_at_ns")
+             : CanonicalValue(std::to_string(value));
+}
+
 void ValidateEvent(const HistorianEvent &event) {
   ValidateText(event.event_id, "event_id", kMaximumIdentityBytes);
   ValidateText(event.component, "component", kMaximumIdentityBytes);
@@ -81,7 +91,8 @@ void ValidateEvent(const HistorianEvent &event) {
               event.severity == "WARN" || event.severity == "ERROR" ||
               event.severity == "CRITICAL",
           "historian_event_invalid", "event severity is unsupported");
-  ValidateSafeInteger(event.occurred_at_ns, "occurred_at_ns");
+  Require(event.occurred_at_ns >= 0, "historian_value_invalid",
+          "occurred_at_ns must be nonnegative");
   ValidateText(event.occurred_at_wall, "occurred_at_wall",
                kMaximumWallTimeBytes);
   const auto payload = content_identity::canonical_json(event.payload);
@@ -98,7 +109,7 @@ CanonicalValue EventIdentityValue(const std::string &component,
   return CanonicalValue(CanonicalValue::Object{
       {"component", CanonicalValue(component)},
       {"event_type", CanonicalValue(event_type)},
-      {"occurred_at_ns", Number(occurred_at_ns, "occurred_at_ns")},
+      {"occurred_at_ns", PersistedNanoseconds(occurred_at_ns)},
       {"occurred_at_wall", CanonicalValue(occurred_at_wall)},
       {"payload", payload},
       {"severity", CanonicalValue(severity)},
@@ -135,6 +146,113 @@ void Advance(std::uint64_t &value) noexcept {
   }
 }
 
+std::string Utf8Prefix(const std::string &value,
+                       const std::size_t maximum_code_points) {
+  std::size_t code_points = 0U;
+  for (std::size_t index = 0U; index < value.size(); ++index) {
+    const auto byte = static_cast<unsigned char>(value[index]);
+    if ((byte & 0xc0U) == 0x80U) {
+      continue;
+    }
+    if (code_points == maximum_code_points) {
+      return value.substr(0U, index);
+    }
+    ++code_points;
+  }
+  return value;
+}
+
+std::string WordsFromIdentifier(const std::string &value,
+                                const bool capitalize) {
+  auto result = value;
+  for (auto &character : result) {
+    if (character == '_') {
+      character = ' ';
+    } else if (capitalize && character >= 'A' && character <= 'Z') {
+      character = static_cast<char>(character - 'A' + 'a');
+    }
+  }
+  if (capitalize && !result.empty() && result.front() >= 'a' &&
+      result.front() <= 'z') {
+    result.front() = static_cast<char>(result.front() - 'a' + 'A');
+  }
+  return result;
+}
+
+const std::string *StringMember(const CanonicalValue &value,
+                                const std::string_view name) {
+  if (!value.is_object()) {
+    return nullptr;
+  }
+  const auto *member = value.find_object_member(name);
+  return member == nullptr ? nullptr
+                           : std::get_if<std::string>(&member->storage());
+}
+
+struct SummaryIdentities final {
+  std::optional<std::string> program_run_id;
+  std::optional<std::string> operation_id;
+  std::optional<std::string> condition_id;
+};
+
+SummaryIdentities SummaryIdentityValues(const CanonicalValue &payload) {
+  SummaryIdentities result;
+  std::vector<std::pair<const CanonicalValue *, std::size_t>> pending{
+      {&payload, 0U}};
+  std::size_t visited = 0U;
+  while (!pending.empty() && visited < kMaximumSummaryTraversalNodes) {
+    const auto [current, depth] = pending.back();
+    pending.pop_back();
+    ++visited;
+    if (depth > kMaximumSummaryTraversalDepth) {
+      continue;
+    }
+    if (current->is_object()) {
+      for (const auto &[name, child] : current->as_object()) {
+        std::optional<std::string> *target = nullptr;
+        if (name == "program_run_id") {
+          target = &result.program_run_id;
+        } else if (name == "operation_id") {
+          target = &result.operation_id;
+        } else if (name == "condition_id" ||
+                   name == "operator_alarm_condition_id") {
+          target = &result.condition_id;
+        }
+        if (target != nullptr && !target->has_value()) {
+          const auto *text = std::get_if<std::string>(&child.storage());
+          if (text != nullptr && !text->empty()) {
+            *target = Utf8Prefix(*text, kMaximumSummaryTextCodePoints);
+          }
+        }
+        pending.emplace_back(&child, depth + 1U);
+      }
+    } else if (current->is_array()) {
+      for (const auto &child : current->as_array()) {
+        pending.emplace_back(&child, depth + 1U);
+      }
+    }
+  }
+  return result;
+}
+
+std::string SummaryMessage(const HistorianEvent &event) {
+  if (const auto *message = StringMember(event.payload, "message");
+      message != nullptr && !message->empty()) {
+    return Utf8Prefix(*message, kMaximumSummaryTextCodePoints);
+  }
+  if (const auto *incident = StringMember(event.payload, "incident_kind");
+      incident != nullptr && !incident->empty()) {
+    auto message = WordsFromIdentifier(*incident, true);
+    if (const auto *phase = StringMember(event.payload, "phase");
+        phase != nullptr && *phase == "resolved") {
+      message += " resolved";
+    }
+    return Utf8Prefix(message, kMaximumSummaryTextCodePoints);
+  }
+  return Utf8Prefix(WordsFromIdentifier(event.event_type, false),
+                    kMaximumSummaryTextCodePoints);
+}
+
 } // namespace
 
 EventHistorianError::EventHistorianError(std::string code, std::string message)
@@ -162,7 +280,11 @@ HistorianEvent MakeHistorianEvent(std::string component, std::string event_type,
   const auto digest = content_identity::framed_sha256(
       dedicated_identity.has_value() ? "manyforge-program-model-attempt-event"
                                      : "manyforge-historian-event",
-      "v1", identity);
+      dedicated_identity.has_value() ||
+              static_cast<std::uint64_t>(occurred_at_ns) <= kMaximumSafeInteger
+          ? "v1"
+          : "v2",
+      identity);
   HistorianEvent event{
       "event-" + digest.substr(7U, 32U),
       std::move(component),
@@ -189,11 +311,29 @@ CanonicalValue HistorianEventValue(const HistorianEvent &event) {
       {"component", CanonicalValue(event.component)},
       {"event_id", CanonicalValue(event.event_id)},
       {"event_type", CanonicalValue(event.event_type)},
-      {"occurred_at_ns", Number(event.occurred_at_ns, "occurred_at_ns")},
+      {"occurred_at_ns", CanonicalValue(std::to_string(event.occurred_at_ns))},
       {"occurred_at_wall", CanonicalValue(event.occurred_at_wall)},
       {"payload", event.payload},
       {"schema_version",
        CanonicalValue(std::string(kHistorianEventSchemaVersion))},
+      {"severity", CanonicalValue(event.severity)},
+  });
+}
+
+CanonicalValue HistorianPersistenceValue(const HistorianEvent &event) {
+  ValidateEvent(event);
+  const bool legacy =
+      static_cast<std::uint64_t>(event.occurred_at_ns) <= kMaximumSafeInteger;
+  return CanonicalValue(CanonicalValue::Object{
+      {"component", CanonicalValue(event.component)},
+      {"event_id", CanonicalValue(event.event_id)},
+      {"event_type", CanonicalValue(event.event_type)},
+      {"occurred_at_ns", PersistedNanoseconds(event.occurred_at_ns)},
+      {"occurred_at_wall", CanonicalValue(event.occurred_at_wall)},
+      {"payload", event.payload},
+      {"schema_version",
+       CanonicalValue(std::string(legacy ? kHistorianEventV1
+                                         : kHistorianEventSchemaVersion))},
       {"severity", CanonicalValue(event.severity)},
   });
 }
@@ -217,6 +357,43 @@ CanonicalValue HistorianPageValue(const HistorianPage &page) {
   });
 }
 
+CanonicalValue HistorianSummaryPageValue(const HistorianPage &page) {
+  CanonicalValue::Array events;
+  events.reserve(page.events.size());
+  for (const auto &stored : page.events) {
+    ValidateEvent(stored.event);
+    const auto identities = SummaryIdentityValues(stored.event.payload);
+    events.emplace_back(CanonicalValue(CanonicalValue::Object{
+        {"event",
+         CanonicalValue(CanonicalValue::Object{
+             {"component", CanonicalValue(stored.event.component)},
+             {"condition_id", OptionalString(identities.condition_id)},
+             {"event_id", CanonicalValue(stored.event.event_id)},
+             {"event_type", CanonicalValue(stored.event.event_type)},
+             {"message", CanonicalValue(SummaryMessage(stored.event))},
+             {"occurred_at_ns",
+              CanonicalValue(std::to_string(stored.event.occurred_at_ns))},
+             {"occurred_at_wall",
+              CanonicalValue(stored.event.occurred_at_wall)},
+             {"operation_id", OptionalString(identities.operation_id)},
+             {"program_run_id", OptionalString(identities.program_run_id)},
+             {"schema_version",
+              CanonicalValue(std::string(kHistorianEventSummarySchemaVersion))},
+             {"severity", CanonicalValue(stored.event.severity)},
+         })},
+        {"sequence", Number(stored.sequence, "sequence")},
+    }));
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"events", CanonicalValue(std::move(events))},
+      {"next_before_sequence",
+       OptionalNumber(page.next_before_sequence, "next_before_sequence")},
+      {"schema_version",
+       CanonicalValue(std::string(kHistorianSummaryPageSchemaVersion))},
+      {"truncated", CanonicalValue(page.truncated)},
+  });
+}
+
 CanonicalValue HistorianDetailValue(const HistorianStoredEvent &stored) {
   ValidateSafeInteger(stored.sequence, "history detail sequence");
   ValidateEvent(stored.event);
@@ -233,8 +410,9 @@ CanonicalValue HistorianDetailValue(const HistorianStoredEvent &stored) {
   const auto *schema = event.payload.is_object()
                            ? event.payload.find_object_member("schema_version")
                            : nullptr;
-  const auto *schema_text =
-      schema == nullptr ? nullptr : std::get_if<std::string>(&schema->storage());
+  const auto *schema_text = schema == nullptr
+                                ? nullptr
+                                : std::get_if<std::string>(&schema->storage());
   const bool operation = schema_text != nullptr &&
                          *schema_text == "manyforge.operation_history_event.v1";
   const bool incident = event.component == "manyforge.alarm" ||
@@ -243,11 +421,10 @@ CanonicalValue HistorianDetailValue(const HistorianStoredEvent &stored) {
 
   CanonicalValue::Object execution;
   if (operation) {
-    for (const auto name : {"effect_pending", "native_sequence",
-                            "native_sequence_gap", "operation_id",
-                            "operation_revision", "payload_digest",
-                            "record_kind", "request_id",
-                            "source_owner_epoch"}) {
+    for (const auto name :
+         {"effect_pending", "native_sequence", "native_sequence_gap",
+          "operation_id", "operation_revision", "payload_digest", "record_kind",
+          "request_id", "source_owner_epoch"}) {
       if (const auto *value = event.payload.find_object_member(name);
           value != nullptr) {
         execution.emplace_back(name, *value);

@@ -101,9 +101,105 @@ ProgramStartSettlementJson(std::string_view claim_json,
   return "{\"claim\":" + std::string(claim_json) +
          ",\"kind\":\"proven_no_effect\",\"prepared_scene\":{"
          "\"schema_version\":\"manyforge.prepared_program_scene.v1\"},"
-         "\"program_run_id\":\"" + std::string(program_run_id) +
+         "\"program_run_id\":\"" +
+         std::string(program_run_id) +
          "\",\"schema_version\":"
          "\"manyforge.program_cycle_start_settlement.v1\"}";
+}
+
+TEST(OwnerSettlementReaders,
+     ActiveProgramRunRecoveryReturnsItsExactCapturedProduct) {
+  TemporaryDatabase fixture;
+  fixture.Exec(
+      "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
+      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,4);"
+      "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
+      "program_run_id TEXT,reconciliation_required INTEGER);"
+      "CREATE TABLE program_run_history(program_run_id TEXT PRIMARY KEY,"
+      "snapshot_json TEXT,terminal INTEGER);"
+      "INSERT INTO program_cycle VALUES(1,'running','run.7',1);"
+      "INSERT INTO program_run_history VALUES('run.7',"
+      "'{\"capture\":{\"graph_revision\":\"" +
+      std::string(kDigestA) +
+      "\",\"program_run_id\":\"run.7\",\"retained_bundle_id\":\"" +
+      std::string(kDigestB) + "\"},\"state\":\"running\"}',0)");
+  fixture.Close();
+
+  const auto result =
+      ReadActiveProgramRunProductForReconciliation(fixture.path());
+
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(result.value().has_value());
+  EXPECT_EQ(result.value()->program_run_id, core::ProgramRunId("run.7"));
+  EXPECT_EQ(result.value()->retained_bundle_id,
+            core::RetainedBundleId(std::string(kDigestB)));
+  EXPECT_EQ(result.value()->graph_revision,
+            core::GraphRevision(std::string(kDigestA)));
+}
+
+TEST(OwnerSettlementReaders, AbsentProgramJournalHasNoRecoveryProduct) {
+  const auto absent = std::filesystem::temp_directory_path() /
+                      ("manyforge-absent-program-cycle-" +
+                       std::to_string(::getpid()) + ".sqlite3");
+  std::filesystem::remove(absent);
+
+  const auto result = ReadActiveProgramRunProductForReconciliation(absent);
+
+  ASSERT_TRUE(result.ok());
+  EXPECT_FALSE(result.value().has_value());
+}
+
+TEST(OwnerSettlementReaders,
+     CurrentOrTerminalProgramRunNeedsNoRecoveryProduct) {
+  TemporaryDatabase current;
+  current.Exec(
+      "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
+      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,4);"
+      "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
+      "program_run_id TEXT,reconciliation_required INTEGER);"
+      "INSERT INTO program_cycle VALUES(1,'running','run.7',0)");
+  current.Close();
+  const auto current_result =
+      ReadActiveProgramRunProductForReconciliation(current.path());
+  ASSERT_TRUE(current_result.ok());
+  EXPECT_FALSE(current_result.value().has_value());
+
+  TemporaryDatabase terminal;
+  terminal.Exec(
+      "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
+      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,4);"
+      "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
+      "program_run_id TEXT,reconciliation_required INTEGER);"
+      "INSERT INTO program_cycle "
+      "VALUES(1,'terminal_awaiting_reset','run.7',1)");
+  terminal.Close();
+  const auto terminal_result =
+      ReadActiveProgramRunProductForReconciliation(terminal.path());
+  ASSERT_TRUE(terminal_result.ok());
+  EXPECT_FALSE(terminal_result.value().has_value());
+}
+
+TEST(OwnerSettlementReaders, ActiveProgramRunRecoveryRejectsACrossRunCapture) {
+  TemporaryDatabase fixture;
+  fixture.Exec(
+      "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
+      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,4);"
+      "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
+      "program_run_id TEXT,reconciliation_required INTEGER);"
+      "CREATE TABLE program_run_history(program_run_id TEXT PRIMARY KEY,"
+      "snapshot_json TEXT,terminal INTEGER);"
+      "INSERT INTO program_cycle VALUES(1,'running','run.7',1);"
+      "INSERT INTO program_run_history VALUES('run.7',"
+      "'{\"capture\":{\"graph_revision\":\"" +
+      std::string(kDigestA) +
+      "\",\"program_run_id\":\"run.other\",\"retained_bundle_id\":\"" +
+      std::string(kDigestB) + "\"},\"state\":\"running\"}',0)");
+  fixture.Close();
+
+  const auto result =
+      ReadActiveProgramRunProductForReconciliation(fixture.path());
+
+  EXPECT_FALSE(result.ok());
 }
 
 TEST(OwnerSettlementReaders,
@@ -220,8 +316,8 @@ TEST(OwnerSettlementReaders,
       "INSERT INTO program_cycle VALUES(1,'resetting','runner.1','run.1','" +
       claim_json + "','" + evidence + "',NULL,'" + release_json +
       "',0,NULL,'releasing');"
-      "INSERT INTO program_run_history VALUES('run.1',2,'" + snapshot +
-      "',1)");
+      "INSERT INTO program_run_history VALUES('run.1',2,'" +
+      snapshot + "',1)");
   EXPECT_TRUE(
       ValidateProgramCycleSettlementReadOnly(fixture.path(), claim, release)
           .ok());
@@ -354,9 +450,9 @@ TEST(OwnerSettlementReaders,
       ProgramStartSettlementJson(claim_json, "cycle.1");
   const auto terminal_evidence =
       content_identity::sha256_digest(start_settlement);
-  const auto release_json = ReleaseJson("program_runner", "runner.1", "cycle.1",
-                                        "start.1", "explicit_reset",
-                                        terminal_evidence);
+  const auto release_json =
+      ReleaseJson("program_runner", "runner.1", "cycle.1", "start.1",
+                  "explicit_reset", terminal_evidence);
   TemporaryDatabase terminal;
   terminal.Exec(
       "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
@@ -417,7 +513,10 @@ TEST(OwnerSettlementReaders,
       claim_json + "',NULL,'" + terminal_evidence + "','" + start_settlement +
       "',1,NULL,'" + evidence.value().value() + "')");
   const core::CellAdmissionReconcileDTO reconcile{
-      core::RequestOwnerEpoch("kernel.1"), {claim}, requested, evidence.value()};
+      core::RequestOwnerEpoch("kernel.1"),
+      {claim},
+      requested,
+      evidence.value()};
 
   const auto validation = ValidateProgramRunnerOwnerReconciliationReadOnly(
       terminal.path(), {claim}, current, reconcile);

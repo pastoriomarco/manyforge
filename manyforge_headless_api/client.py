@@ -220,16 +220,31 @@ class HeadlessHttpClient:
             response=value,
         )
 
-    def request(
+    @staticmethod
+    def _response_bound(method: str, path: str) -> int:
+        maximum = MAX_HTTP_RESPONSE_BYTES
+        if method.upper() == "GET":
+            if path == "/api/source-model-context":
+                maximum = MAX_SOURCE_MODEL_CONTEXT_RESPONSE_BYTES
+            elif path.startswith("/api/assistant/modes/") and path.endswith(
+                "/context"
+            ):
+                maximum = MAX_ASSISTANT_MODE_CONTEXT_RESPONSE_BYTES
+        return maximum
+
+    def _request_payload(
         self,
         method: str,
         path: str,
         *,
         params: Sequence[tuple[str, str | int]] = (),
         body: Mapping[str, Any] | None = None,
-    ) -> dict[str, Any]:
+    ) -> tuple[bytes, int, int]:
+        """Read one bounded response without imposing projection semantics."""
+
         if not path.startswith("/api/") or ".." in path:
             raise ValueError("headless API path is invalid")
+        maximum_response_bytes = self._response_bound(method, path)
         try:
             with self._client.stream(
                 method,
@@ -239,18 +254,6 @@ class HeadlessHttpClient:
             ) as response:
                 chunks: list[bytes] = []
                 size = 0
-                maximum_response_bytes = MAX_HTTP_RESPONSE_BYTES
-                if method.upper() == "GET":
-                    if path == "/api/source-model-context":
-                        maximum_response_bytes = (
-                            MAX_SOURCE_MODEL_CONTEXT_RESPONSE_BYTES
-                        )
-                    elif path.startswith("/api/assistant/modes/") and path.endswith(
-                        "/context"
-                    ):
-                        maximum_response_bytes = (
-                            MAX_ASSISTANT_MODE_CONTEXT_RESPONSE_BYTES
-                        )
                 for chunk in response.iter_bytes():
                     size += len(chunk)
                     if size > maximum_response_bytes:
@@ -260,6 +263,7 @@ class HeadlessHttpClient:
                             response.status_code,
                         )
                     chunks.append(chunk)
+                status_code = response.status_code
         except HeadlessClientError:
             raise
         except httpx.HTTPError as exc:
@@ -267,17 +271,25 @@ class HeadlessHttpClient:
                 "headless_http_unavailable",
                 f"headless API request failed: {exc}",
             ) from exc
-        payload = b"".join(chunks)
+        return b"".join(chunks), status_code, maximum_response_bytes
+
+    @staticmethod
+    def _decode_response(
+        payload: bytes,
+        *,
+        status_code: int,
+        maximum_response_bytes: int,
+    ) -> dict[str, Any]:
         try:
             text = payload.decode("utf-8", errors="strict")
         except UnicodeDecodeError as exc:
             raise HeadlessClientError(
                 "headless_http_response_invalid",
                 "headless API response is not UTF-8",
-                response.status_code,
+                status_code,
             ) from exc
         try:
-            value = strict_json_object(
+            return strict_json_object(
                 text,
                 label="headless HTTP response",
                 maximum_bytes=maximum_response_bytes,
@@ -286,11 +298,74 @@ class HeadlessHttpClient:
             raise HeadlessClientError(
                 getattr(exc, "code", "headless_http_response_invalid"),
                 str(exc),
-                response.status_code,
+                status_code,
             ) from exc
-        if response.status_code >= 400:
-            raise self._error_from_response(value, response.status_code)
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Sequence[tuple[str, str | int]] = (),
+        body: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload, status_code, maximum = self._request_payload(
+            method,
+            path,
+            params=params,
+            body=body,
+        )
+        value = self._decode_response(
+            payload,
+            status_code=status_code,
+            maximum_response_bytes=maximum,
+        )
+        if status_code >= 400:
+            raise self._error_from_response(value, status_code)
         return value
+
+    def get_json_payload(
+        self,
+        path: str,
+        *,
+        params: Sequence[tuple[str, str | int]] = (),
+    ) -> bytes:
+        """Relay one bounded owner JSON object without parse/re-encode churn.
+
+        This is for transparent in-process proxy routes whose browser consumer
+        already strictly validates the public DTO. Error responses are still
+        decoded here so Composer preserves the normal typed HTTP failure.
+        """
+
+        payload, status_code, maximum = self._request_payload(
+            "GET", path, params=params
+        )
+        if status_code >= 400:
+            value = self._decode_response(
+                payload,
+                status_code=status_code,
+                maximum_response_bytes=maximum,
+            )
+            raise self._error_from_response(value, status_code)
+        try:
+            text = payload.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise HeadlessClientError(
+                "headless_http_response_invalid",
+                "headless API response is not UTF-8",
+                status_code,
+            ) from exc
+        # Full public DTO validation happens once in the browser. Retaining
+        # object framing here prevents an accidental non-JSON transport reply
+        # without repeating the expensive parse/allocate/encode cycle.
+        stripped = text.strip()
+        if not stripped.startswith("{") or not stripped.endswith("}"):
+            raise HeadlessClientError(
+                "headless_http_response_invalid",
+                "headless API response is not a JSON object",
+                status_code,
+            )
+        return payload
 
     def _request_viewer_asset(
         self,
@@ -450,6 +525,9 @@ class HeadlessHttpClient:
 
     def component_overview(self) -> dict[str, Any]:
         return self.request("GET", "/api/component-overview")
+
+    def component_overview_payload(self) -> bytes:
+        return self.get_json_payload("/api/component-overview")
 
     def authoring_admission(self) -> dict[str, Any]:
         return self.request("GET", "/api/cell/authoring-admission")
@@ -1110,6 +1188,13 @@ class HeadlessHttpClient:
         params: Sequence[tuple[str, str | int]] = (),
     ) -> dict[str, Any]:
         return self.request("GET", "/api/execution/history", params=params)
+
+    def history_payload(
+        self,
+        *,
+        params: Sequence[tuple[str, str | int]] = (),
+    ) -> bytes:
+        return self.get_json_payload("/api/execution/history", params=params)
 
     def history_detail(self, sequence: int) -> dict[str, Any]:
         if not 1 <= sequence <= 9_007_199_254_740_991:

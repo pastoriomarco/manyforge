@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from typing import Annotated, Any, Callable, Literal
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, HTTPException, Path, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import ConfigDict, Field, model_validator
 
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
@@ -164,7 +164,6 @@ def create_headless_router(
     client: HeadlessHttpClient,
     state: ComposerState,
     execution_controls: ExecutionControlClient | None = None,
-    shared_component_overview: Callable[[], dict[str, Any] | None] | None = None,
 ) -> APIRouter:
     """Expose only bounded reads and attributed intents; own no reducer."""
 
@@ -214,12 +213,11 @@ def create_headless_router(
         return _call(client.runtime)
 
     @router.get("/api/component-overview")
-    def component_overview() -> JSONResponse:
-        if shared_component_overview is not None:
-            current = shared_component_overview()
-            if current is not None:
-                return JSONResponse(content=current)
-        return JSONResponse(content=_call(client.component_overview))
+    def component_overview() -> Response:
+        return Response(
+            content=_call(client.component_overview_payload),
+            media_type="application/json",
+        )
 
     @router.get("/api/manager/status")
     def manager_status() -> dict[str, Any]:
@@ -967,8 +965,9 @@ def create_headless_router(
         # The bounded history page can still be large. This synchronous route
         # already runs in a read worker; encode there so history pressure does
         # not stall the event loop used by execution controls.
-        return JSONResponse(
-            content=_call(lambda: client.history(params=params))
+        return Response(
+            content=_call(lambda: client.history_payload(params=params)),
+            media_type="application/json",
         )
 
     @router.get("/api/execution/history/health")

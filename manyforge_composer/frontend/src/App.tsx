@@ -186,7 +186,7 @@ export default function App() {
   useOperationalErrorMirror({
     source: 'composer.control_transport',
     title: 'Control connection became unavailable',
-    message: headlessState.error,
+    message: headlessState.transportError,
     onDismiss: headlessState.reconnect,
   });
   useOperationalErrorMirror({
@@ -377,13 +377,29 @@ export default function App() {
 
   const connectedProjection = headlessEnabled
     && headlessSnapshot !== null
-    && headlessState.error === null;
+    && headlessState.transportStatus === 'connected'
+    && headlessState.semanticStatus === 'current';
   const connectionLabel = connectedProjection
     ? 'Headless owner connected'
-    : headlessEnabled ? 'Headless projection unavailable' : 'Runtime unavailable';
+    : !headlessEnabled
+      ? 'Runtime unavailable'
+      : headlessState.transportStatus === 'delayed'
+        ? 'Control connection delayed'
+        : headlessState.transportStatus === 'stale'
+          ? 'Control connection stale'
+          : headlessState.transportStatus === 'connected'
+            ? `Headless owner connected · control state ${headlessState.semanticStatus}`
+            : headlessState.transportStatus === 'connecting'
+              ? 'Connecting to Headless owner'
+              : 'Headless owner disconnected';
   const connectionDetail = connectedProjection
     ? `Receiver ${headlessSnapshot.receiverEpoch} · snapshot ${headlessSnapshot.snapshotSequence}`
-    : headlessState.error
+    : headlessState.transportError
+      ?? (headlessState.semanticStatus === 'current'
+        ? null
+        : `Control state ${headlessState.semanticStatus}: ${headlessState.semanticReason
+          ?? 'owner projection unavailable'}`)
+      ?? headlessState.error
       ?? (health.status === 'error' || health.status === 'absent'
         ? health.message
         : health.status === 'ready'
@@ -671,7 +687,6 @@ export default function App() {
                     enabled={headlessEnabled}
                     headlessStateSource={headlessStateSource}
                     clientErrors={clientErrors}
-                    clientHistory={operationalErrors.history}
                     onAcknowledgeClientError={operationalErrors.dismiss}
                     attentionRequest={runtimeAttentionRequest}
                     expanded={runtimePanelExpanded}

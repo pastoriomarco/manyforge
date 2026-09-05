@@ -207,18 +207,38 @@ KernelCellAdmissionOwner::KernelCellAdmissionOwner(
   }
 }
 
-bool KernelCellAdmissionOwner::BaseReadinessLocked() const noexcept {
+bool KernelCellAdmissionOwner::NonCycleReadinessLocked() const noexcept {
   const bool manager_liveness_current =
       manager_liveness_required_set_.has_value() &&
       manager_liveness_current_unfenced_count_ == manager_liveness_rows_.size();
-  return readiness_.program_cycle_status_current && readiness_.program_cycle_status.has_value() &&
-         readiness_.program_cycle_status->state == ProgramCycleStateDTO::kIdleAfterReset &&
-         manager_liveness_current && readiness_.required_component_status_current &&
+  return manager_liveness_current && readiness_.required_component_status_current &&
          readiness_.required_component_total ==
              readiness_.required_component_current_compatible_ready_converged &&
          readiness_.deployment_status_current && readiness_.deployment_converged &&
          readiness_.blocking_fault_count == 0U && readiness_.unresolved_owner_count == 0U &&
          readiness_.unsettled_effect_count == 0U;
+}
+
+bool KernelCellAdmissionOwner::BaseReadinessLocked() const noexcept {
+  return NonCycleReadinessLocked() && readiness_.program_cycle_status_current &&
+         readiness_.program_cycle_status.has_value() &&
+         readiness_.program_cycle_status->state == ProgramCycleStateDTO::kIdleAfterReset;
+}
+
+bool KernelCellAdmissionOwner::MatchingStartingProgramCycleLocked(
+    const CellAdmissionClaimIntentDTO& intent) const noexcept {
+  if (intent.claim_kind != CellAdmissionClaimKindDTO::kProgramCycle ||
+      intent.owner_role != CellAdmissionOwnerRoleDTO::kProgramRunner || held_claim_count_ != 0U ||
+      !NonCycleReadinessLocked() || !readiness_.program_cycle_status_current ||
+      !readiness_.program_cycle_status.has_value()) {
+    return false;
+  }
+  const auto& cycle = *readiness_.program_cycle_status;
+  return cycle.state == ProgramCycleStateDTO::kStarting &&
+         cycle.program_runner_owner_epoch == intent.owner_epoch && cycle.program_run_id.has_value() &&
+         cycle.program_run_id->value() == intent.owner_transaction_id &&
+         !cycle.cycle_claim_generation.has_value() &&
+         !cycle.terminal_or_settlement_reference.has_value();
 }
 
 Result<void> KernelCellAdmissionOwner::AdvanceGenerationLocked() {
@@ -552,7 +572,8 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireCellAdmissionClai
       return AuthoringNotReady<CellAdmissionClaimDTO>(generation_,
                                                       "intervention_offer_not_current");
     }
-  } else if (!AdmissionLocked().authoring_allowed) {
+  } else if (!AdmissionLocked().authoring_allowed &&
+             !MatchingStartingProgramCycleLocked(intent)) {
     return AuthoringNotReady<CellAdmissionClaimDTO>(generation_, "positive_admission_required");
   }
 

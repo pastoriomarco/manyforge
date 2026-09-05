@@ -22,7 +22,6 @@ from manyforge_composer.backend.visual_state import (
     compose_pose_in_world,
     relative_pose_from_world,
 )
-from manyforge_composer.backend.ws_state import StateHub
 
 
 class _RecordingSocket:
@@ -230,15 +229,6 @@ def test_visual_pose_composition_round_trips_without_runtime_or_fk_owner() -> No
     ) == child_in_parent
 
 
-def test_unavailable_worker_factories_fail_before_state_or_process_effects() -> None:
-    class PoisonState:
-        def __getattribute__(self, name: str) -> object:
-            raise AssertionError(f"state was accessed: {name}")
-
+def test_unavailable_worker_factory_fails_before_process_effects() -> None:
     with pytest.raises(RuntimeError, match="composable_cell_viewer_worker_unavailable"):
         ViewerWorkerSupervisor()
-    with pytest.raises(
-        RuntimeError,
-        match="composable_cell_state_projection_unavailable",
-    ):
-        StateHub().start(PoisonState())  # type: ignore[arg-type]

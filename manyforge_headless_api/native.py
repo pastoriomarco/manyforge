@@ -322,6 +322,7 @@ class HeadlessCorePort(Protocol):
 
     def history(self, **kwargs: Any) -> dict[str, Any]: ...
     def history_detail(self, sequence: int) -> dict[str, Any]: ...
+    def record_client_incident(self, **kwargs: Any) -> dict[str, Any]: ...
 
     def historian_health(self) -> dict[str, Any]: ...
 
@@ -806,7 +807,10 @@ class NativeHeadlessCore:
 
     def history(self, **kwargs: Any) -> dict[str, Any]:
         return self._require_object(
-            self._invoke("history", **kwargs),
+            # The list endpoint never needs full payloads. Project its bounded
+            # rows while the native call has released the Python GIL; exact
+            # payloads remain available through history_detail().
+            self._invoke("history_summary", **kwargs),
             method="history",
         )
 
@@ -814,6 +818,12 @@ class NativeHeadlessCore:
         return self._require_object(
             self._invoke("history_detail", sequence),
             method="history_detail",
+        )
+
+    def record_client_incident(self, **kwargs: Any) -> dict[str, Any]:
+        return self._require_object(
+            self._invoke("record_client_incident", **kwargs),
+            method="record_client_incident",
         )
 
     def historian_health(self) -> dict[str, Any]:

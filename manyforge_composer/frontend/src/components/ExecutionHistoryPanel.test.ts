@@ -6,24 +6,25 @@ import {
   filterExecutionHistoryEvents,
   type ExecutionHistoryEventView,
 } from './ExecutionHistoryPanel';
+import type { HistorianDetail } from '../types/headless';
 
 const events: ExecutionHistoryEventView[] = [
   {
-    id: '1', timestampNs: 1, severity: 'INFO', channel: 'execution',
+    id: '1', timestampNs: '1', severity: 'INFO', channel: 'execution',
     message: 'Motion started', executionId: 7, type: 'execute_started',
     programRunId: 'run-1', operationId: 'operation-1',
   },
   {
-    id: '2', timestampNs: 2, severity: 'WARN', channel: 'runtime',
+    id: '2', timestampNs: '2', severity: 'WARN', channel: 'runtime',
     message: 'Offer changed', executionId: 7, type: 'recovery_rejected',
   },
   {
-    id: '3', timestampNs: 3, severity: 'ERROR', channel: 'fault',
+    id: '3', timestampNs: '3', severity: 'ERROR', channel: 'fault',
     message: 'Collision with wall', executionId: 8, type: 'collision',
     details: { condition: 'condition-wall' },
   },
   {
-    id: '4', timestampNs: 4, severity: 'INFO', channel: 'alarm',
+    id: '4', timestampNs: '4', severity: 'INFO', channel: 'alarm',
     message: 'Alarm activated', executionId: 8, type: 'alarm_event',
     alarmPhase: 'activation', details: { condition: 'condition-wall' },
   },
@@ -71,8 +72,8 @@ describe('execution history filtering', () => {
       eventType: '',
       channel: '',
       search: '',
-      startNs: 1,
-      endNs: 1,
+      startNs: '1',
+      endNs: '1',
       programRunId: 'run-1',
       operationId: 'operation-1',
     }).map((event) => event.id)).toEqual(['1']);
@@ -81,7 +82,7 @@ describe('execution history filtering', () => {
   it('renders the largest supported public history page within the presentation budget', () => {
     const page = Array.from({ length: 32 }, (_, index): ExecutionHistoryEventView => ({
       id: `event-${index + 1}`,
-      timestampNs: index + 1,
+      timestampNs: String(index + 1),
       timestamp: `2026-08-09T12:00:${String(index).padStart(2, '0')}Z`,
       severity: index % 5 === 0 ? 'WARN' : 'INFO',
       channel: index % 2 === 0 ? 'execution' : 'runtime',
@@ -107,7 +108,67 @@ describe('execution history filtering', () => {
     expect(markup).toContain('Retained event 32');
     expect(markup).toContain('Program run');
     expect(markup).toContain('Operation');
-    expect(markup).toContain('Load older events');
+    expect(markup).toContain('Older');
     expect(elapsedMs).toBeLessThan(1000);
+  });
+
+  it('never mounts more than one bounded backend page', () => {
+    const merged = Array.from({ length: 64 }, (_, index): ExecutionHistoryEventView => ({
+      id: `merged-${index + 1}`,
+      timestampNs: String(64 - index),
+      severity: 'INFO',
+      channel: 'manyforge.composer',
+      message: `Merged event ${index + 1}`,
+      type: 'client_incident_resolved',
+    }));
+
+    const markup = renderToStaticMarkup(createElement(ExecutionHistoryPanel, {
+      open: true,
+      onClose: vi.fn(),
+      events: merged,
+    }));
+
+    expect(markup.match(/class="history-event /g)).toHaveLength(32);
+    expect(markup).toContain('Merged event 32');
+    expect(markup).not.toContain('Merged event 33');
+  });
+
+  it('keeps error severity on a selected sequenced row', () => {
+    const selected: HistorianDetail = {
+      schemaVersion: 'manyforge.historian_detail.v2',
+      sequence: 9,
+      event: {
+        schemaVersion: 'manyforge.historian_event.v2',
+        eventId: 'event-9',
+        component: 'manyforge.composer',
+        eventType: 'client_incident_activated',
+        severity: 'ERROR',
+        occurredAtNs: '9',
+        occurredAtWall: '2026-09-04T10:00:00Z',
+        payload: {},
+      },
+      sections: {
+        incident: { available: false, reason: 'not published', value: null },
+        executionDigest: { available: false, reason: 'not published', value: null },
+        blackboard: { available: false, reason: 'not published', value: null },
+        latency: { available: false, reason: 'not published', value: null },
+      },
+    };
+    const markup = renderToStaticMarkup(createElement(ExecutionHistoryPanel, {
+      open: true,
+      onClose: vi.fn(),
+      events: [{
+        id: 'event-9',
+        sequence: 9,
+        timestampNs: '9',
+        severity: 'ERROR',
+        channel: 'manyforge.composer',
+        message: 'Control connection stale',
+        type: 'client_incident_activated',
+      }],
+      selectedDetail: selected,
+    }));
+
+    expect(markup).toContain('history-event severity-error selected');
   });
 });

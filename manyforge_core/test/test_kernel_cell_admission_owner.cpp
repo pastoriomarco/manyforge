@@ -345,6 +345,72 @@ TEST(KernelCellAdmissionOwner, StartsFalseAndEveryReadinessInputFailsClosed) {
 }
 
 TEST(KernelCellAdmissionOwner,
+     ExactStartingProgramCycleMayAcquireWhileOrdinaryAuthoringRemainsClosed) {
+  FixedClock clock;
+  AdmissionJournal journal;
+  auto owner = Owner(clock, journal);
+  auto starting = Ready();
+  starting.program_cycle_status = ProgramCycleStatusDTO{
+      RequestOwnerEpoch("owner.1"), 1U, ProgramCycleStateDTO::kStarting,
+      ProgramRunId("transaction.1"), std::nullopt, std::nullopt};
+  ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(starting).ok());
+  const auto admission = owner.GetAuthoringAdmission();
+  ASSERT_FALSE(admission.authoring_allowed);
+
+  EXPECT_EQ(owner
+                .AcquireCellAdmissionClaim(Intent(
+                    CellAdmissionClaimKindDTO::kAuthoringMutation,
+                    admission.admission_generation, "authoring.while-starting"))
+                .error()
+                .code,
+            "authoring_not_ready");
+  const auto cycle = owner.AcquireCellAdmissionClaim(
+      Intent(CellAdmissionClaimKindDTO::kProgramCycle,
+             admission.admission_generation, "program.starting"));
+  ASSERT_TRUE(cycle.ok());
+  EXPECT_EQ(cycle.value().intent.owner_epoch, RequestOwnerEpoch("owner.1"));
+  EXPECT_EQ(cycle.value().intent.owner_transaction_id, "transaction.1");
+}
+
+TEST(KernelCellAdmissionOwner,
+     StartingProgramCycleExceptionIsExactAndFailsClosedForEveryOtherCase) {
+  const auto rejected = [](auto mutate_readiness, auto mutate_intent) {
+    FixedClock clock;
+    AdmissionJournal journal;
+    auto owner = Owner(clock, journal);
+    auto starting = Ready();
+    starting.program_cycle_status = ProgramCycleStatusDTO{
+        RequestOwnerEpoch("owner.1"), 1U, ProgramCycleStateDTO::kStarting,
+        ProgramRunId("transaction.1"), std::nullopt, std::nullopt};
+    mutate_readiness(starting);
+    EXPECT_TRUE(owner.UpdateCellAdmissionReadiness(starting).ok());
+    auto intent = Intent(CellAdmissionClaimKindDTO::kProgramCycle,
+                         owner.GetAuthoringAdmission().admission_generation,
+                         "program.starting.rejected");
+    mutate_intent(intent);
+    const auto result = owner.AcquireCellAdmissionClaim(intent);
+    EXPECT_FALSE(result.ok());
+    if (!result.ok()) {
+      EXPECT_EQ(result.error().code, "authoring_not_ready");
+    }
+  };
+  const auto unchanged_readiness = [](auto&) {};
+  const auto unchanged_intent = [](auto&) {};
+
+  rejected(unchanged_readiness, [](auto& intent) {
+    intent.owner_epoch = RequestOwnerEpoch("foreign.program.owner");
+  });
+  rejected(unchanged_readiness, [](auto& intent) {
+    intent.owner_transaction_id = "program-cycle.foreign";
+  });
+  rejected([](auto& readiness) {
+    readiness.program_cycle_status->state = ProgramCycleStateDTO::kStopping;
+  }, unchanged_intent);
+  rejected([](auto& readiness) { readiness.blocking_fault_count = 1U; },
+           unchanged_intent);
+}
+
+TEST(KernelCellAdmissionOwner,
      ProgramResetSceneAuthorizationRequiresExactResettingCycleAndClaim) {
   FixedClock clock;
   AdmissionJournal journal;

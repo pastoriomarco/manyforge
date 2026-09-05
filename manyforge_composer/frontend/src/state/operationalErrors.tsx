@@ -15,27 +15,6 @@ export type OperationalErrorAttentionPolicy =
   | 'transient'
   | 'acknowledgement_required';
 
-export interface ClientOperationalHistoryEvent {
-  id: string;
-  timestampNs: number;
-  timestamp: string;
-  severity: 'ERROR' | 'INFO';
-  channel: 'manyforge.composer';
-  message: string;
-  type:
-    | 'composer_client_error_activated'
-    | 'composer_client_error_updated'
-    | 'composer_client_error_resolved'
-    | 'composer_client_error_acknowledged'
-    | 'composer_client_error_dismissed';
-  details: {
-    source: string;
-    title: string;
-    detail: string;
-    attentionPolicy: OperationalErrorAttentionPolicy;
-  };
-}
-
 export interface OperationalErrorRecord extends ClientOperationalError {
   source: string;
   attentionPolicy: OperationalErrorAttentionPolicy;
@@ -44,7 +23,6 @@ export interface OperationalErrorRecord extends ClientOperationalError {
 
 interface OperationalErrorRegistry {
   errors: ClientOperationalError[];
-  history: ClientOperationalHistoryEvent[];
   report: (
     source: string,
     title: string,
@@ -58,7 +36,6 @@ interface OperationalErrorRegistry {
 
 const EMPTY_REGISTRY: OperationalErrorRegistry = {
   errors: [],
-  history: [],
   report: () => undefined,
   resolve: () => undefined,
   dismiss: () => undefined,
@@ -66,7 +43,6 @@ const EMPTY_REGISTRY: OperationalErrorRegistry = {
 
 export interface OperationalErrorState {
   records: Map<string, OperationalErrorRecord>;
-  history: ClientOperationalHistoryEvent[];
   sequence: number;
 }
 
@@ -78,55 +54,12 @@ export type OperationalErrorAction =
       message: string;
       attentionPolicy: OperationalErrorAttentionPolicy;
       dismissSource?: () => void;
-      observedAtMs: number;
     }
-  | { kind: 'resolve'; source: string; observedAtMs: number }
-  | { kind: 'dismiss'; id: string; observedAtMs: number };
-
-const MAXIMUM_CLIENT_HISTORY_EVENTS = 128;
+  | { kind: 'resolve'; source: string }
+  | { kind: 'dismiss'; id: string };
 
 export function initialOperationalErrorState(): OperationalErrorState {
-  return { records: new Map(), history: [], sequence: 0 };
-}
-
-function historyEvent(
-  sequence: number,
-  record: OperationalErrorRecord,
-  type: ClientOperationalHistoryEvent['type'],
-  observedAtMs: number,
-): ClientOperationalHistoryEvent {
-  const resolved = type === 'composer_client_error_resolved';
-  const cleared = type === 'composer_client_error_acknowledged'
-    || type === 'composer_client_error_dismissed';
-  return {
-    id: `composer-session:${sequence}`,
-    timestampNs: Math.trunc(observedAtMs) * 1_000_000,
-    timestamp: new Date(observedAtMs).toISOString(),
-    severity: resolved || cleared ? 'INFO' : 'ERROR',
-    channel: 'manyforge.composer',
-    message: `${record.title}: ${record.message}`,
-    type,
-    details: {
-      source: record.source,
-      title: record.title,
-      detail: record.message,
-      attentionPolicy: record.attentionPolicy,
-    },
-  };
-}
-
-function withHistory(
-  state: OperationalErrorState,
-  record: OperationalErrorRecord,
-  type: ClientOperationalHistoryEvent['type'],
-  observedAtMs: number,
-): Pick<OperationalErrorState, 'history' | 'sequence'> {
-  const sequence = state.sequence + 1;
-  return {
-    sequence,
-    history: [historyEvent(sequence, record, type, observedAtMs), ...state.history]
-      .slice(0, MAXIMUM_CLIENT_HISTORY_EVENTS),
-  };
+  return { records: new Map(), sequence: 0 };
 }
 
 export function reduceOperationalErrors(
@@ -151,6 +84,10 @@ export function reduceOperationalErrors(
       active: true,
       acknowledgementRequired:
         action.attentionPolicy === 'acknowledgement_required',
+      severity: action.source === 'composer.control_transport'
+        && action.message.startsWith('Control connection is delayed')
+        ? 'warning'
+        : 'error',
       attentionPolicy: action.attentionPolicy,
       dismissSource: action.dismissSource,
     };
@@ -159,14 +96,7 @@ export function reduceOperationalErrors(
     records.set(action.source, record);
     return {
       records,
-      ...withHistory(
-        state,
-        record,
-        existing?.active === true
-          ? 'composer_client_error_updated'
-          : 'composer_client_error_activated',
-        action.observedAtMs,
-      ),
+      sequence: state.sequence + 1,
     };
   }
   const match = action.kind === 'resolve'
@@ -186,16 +116,7 @@ export function reduceOperationalErrors(
   }
   return {
     records,
-    ...withHistory(
-      state,
-      match,
-      action.kind === 'resolve'
-        ? 'composer_client_error_resolved'
-        : match.attentionPolicy === 'acknowledgement_required'
-          ? 'composer_client_error_acknowledged'
-          : 'composer_client_error_dismissed',
-      action.observedAtMs,
-    ),
+    sequence: state.sequence + 1,
   };
 }
 
@@ -226,29 +147,27 @@ export function OperationalErrorProvider({ children }: { children: ReactNode }) 
       message,
       attentionPolicy,
       dismissSource,
-      observedAtMs: Date.now(),
     }));
   }, []);
   const resolve = useCallback<OperationalErrorRegistry['resolve']>((source) => {
     setState((current) => reduceOperationalErrors(current, {
-      kind: 'resolve', source, observedAtMs: Date.now(),
+      kind: 'resolve', source,
     }));
   }, []);
   const dismiss = useCallback((id: string) => {
     const callback = [...state.records.values()].find((record) => record.id === id)
       ?.dismissSource;
     setState((current) => reduceOperationalErrors(current, {
-      kind: 'dismiss', id, observedAtMs: Date.now(),
+      kind: 'dismiss', id,
     }));
     callback?.();
   }, [state.records]);
   const value = useMemo<OperationalErrorRegistry>(() => ({
     errors: [...state.records.values()].reverse(),
-    history: state.history,
     report,
     resolve,
     dismiss,
-  }), [dismiss, report, resolve, state.history, state.records]);
+  }), [dismiss, report, resolve, state.records]);
   return (
     <OperationalErrorContext.Provider value={value}>
       {children}

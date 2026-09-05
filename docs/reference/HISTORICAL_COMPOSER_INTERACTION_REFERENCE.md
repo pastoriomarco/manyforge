@@ -237,14 +237,10 @@ currently runnable qualification.
   proposal effects.
 
 - `assistant_tool_schemas.py`: lines 1–140 contain defensive schema copying,
-  description-independent hashing, and field-policy narrowing.
-  `schema_projection.strip_schema_descriptions` now retains the
-  owner-neutral copy/description behavior; the historical hash and
-  orientation-field narrowing remain unqualified contract input for
-  owner-issued N schemas. The generic description/property helpers from
-  lines 141 and 443–470 are likewise retained in `schema_projection` as
-  `with_description`, `with_replaced_description`, `property_schema`, and
-  `projected_property_or_fallback`. Lines 141–428
+  description-independent hashing, and field-policy narrowing. These remain
+  requirements input for owner-issued N schemas; the interim, test-only
+  `schema_projection` extraction was deleted by the UI6-G dead-code audit
+  because no production caller consumed it. Lines 141–428
   are v1 parameter, blackboard-binding, catalog-entry, and tree-tool
   projections; catalog-driven authoring intent survives at N, but the v1
   parameter/blackboard DTOs and string-form compatibility fallback do not.
@@ -404,9 +400,9 @@ currently runnable qualification.
   channel, and alarm payload builders) contain read/presentation behavior. H0
   now carries the alarm/event subset; execution-specific projections remain
   N/P5 work. Lines 137–187 contain alarm error and query
-  parsers. Their substantive wall-time/filter behavior is retained in
-  `event_recorder.HistoryQuery` and `parse_wall_timestamp_ns`; only the future
-  thin route's CSV/HTTP-error adaptation remains. Lines 188–508 build
+  parsers. Their filter behavior is now owned by the bounded Headless
+  Historian query contract; only the future thin route's CSV/HTTP-error
+  adaptation remains. Lines 188–508 build
   blackboard and execution digests from many in-process owners; their stable
   operator summaries remain requirements, while the cross-owner join and v1
   blackboard/runtime truth stay deleted. The behavior in lines 509–628 is now
@@ -537,16 +533,17 @@ each deleted owner names the headless gate that must exist first. The complete
 historical blobs remain input only.
 
 The immediately owner-neutral helper audit is now qualified through N6-c5:
-`backend/assistant_client_primitives.py`, `backend/schema_projection.py`, and
-`backend/mcp_client_primitives.py` contain the exact extractions identified
-above, with focused tests in `tests/test_assistant_client_primitives.py`,
-`tests/test_schema_projection.py`, and
-`tests/test_mcp_client_primitives.py`. The historical schema hash was
+`backend/assistant_client_primitives.py` and
+`backend/mcp_client_primitives.py` contain the production-consumed extractions
+identified above, with focused tests in
+`tests/test_assistant_client_primitives.py` and
+`tests/test_mcp_client_primitives.py`. The unused interim schema-projection
+helper was removed during UI6-G rather than retained as speculative code. The historical schema hash was
 deliberately not copied. Current assistant schema and catalog hashes are
 derived from retained owner inputs and independently checked by the bridge and
 Composer. The substantive history-query parsing continues to live in
-`event_recorder.HistoryQuery` and `parse_wall_timestamp_ns`; the assistant
-bridge adapts only the bounded owner read needed by its current tool contract.
+the Headless Historian contract; the assistant bridge adapts only the bounded
+owner read needed by its current tool contract.
 
 N6-c5 also supplies current successors for the historical bounded provider
 request/cancel/status mechanics and all registry-backed Program/scene/blackboard

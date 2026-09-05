@@ -180,6 +180,58 @@ def test_client_uses_the_component_overview_route() -> None:
     ]
 
 
+def test_client_relays_bounded_owner_json_without_reencoding() -> None:
+    payloads = {
+        "/api/component-overview": b' {"schema_version":"overview.v1"}\n',
+        "/api/execution/history": b'{"schema_version":"history.v1"}',
+    }
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, content=payloads[request.url.path], request=request)
+
+    raw = httpx.Client(
+        base_url="http://headless.test",
+        transport=httpx.MockTransport(handler),
+    )
+    client = HeadlessHttpClient("http://unused.test", client=raw)
+    try:
+        assert client.component_overview_payload() == payloads[
+            "/api/component-overview"
+        ]
+        assert client.history_payload(params=(("limit", 32),)) == payloads[
+            "/api/execution/history"
+        ]
+    finally:
+        raw.close()
+    assert requests[1].url.params["limit"] == "32"
+
+
+def test_client_raw_json_relay_preserves_typed_owner_errors() -> None:
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            503,
+            json={
+                "detail": {
+                    "code": "historian_unavailable",
+                    "message": "durable history is unavailable",
+                }
+            },
+            request=request,
+        )
+    )
+    raw = httpx.Client(base_url="http://headless.test", transport=transport)
+    client = HeadlessHttpClient("http://unused.test", client=raw)
+    try:
+        with pytest.raises(HeadlessClientError) as error:
+            client.history_payload()
+    finally:
+        raw.close()
+    assert error.value.code == "historian_unavailable"
+    assert error.value.status_code == 503
+
+
 def test_client_uses_the_dedicated_node_environment_route() -> None:
     requests: list[httpx.Request] = []
 

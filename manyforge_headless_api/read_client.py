@@ -28,7 +28,7 @@ READ_OPERATION_SCHEMAS: Final = MappingProxyType(
         "scene": "manyforge.scene_projection.v1",
         "alarms": "manyforge.operator_alarm_snapshot.v2",
         "alarm_metrics": "manyforge.operator_alarm_metrics.v1",
-        "history": "manyforge.historian_page.v1",
+        "history": "manyforge.historian_summary_page.v1",
         "historian_health": "manyforge.async_historian_health.v1",
     }
 )

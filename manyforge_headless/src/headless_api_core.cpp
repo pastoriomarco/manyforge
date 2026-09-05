@@ -639,8 +639,8 @@ HeadlessApiCore::ScenarioProgramSelection(const std::string_view scenario_id) {
       "scenario_program_selection_unavailable",
       "Manager has not converged the active retained bundle");
 
-  const auto selected = [&]()
-      -> std::optional<deployment::ScenarioProgramSelection> {
+  const auto selected =
+      [&]() -> std::optional<deployment::ScenarioProgramSelection> {
     try {
       return scenario_catalog_source_.TryLoadExactProgramSelectionForActive(
           scenario_id, core::RetainedBundleId(active_bundle_id),
@@ -709,8 +709,7 @@ HeadlessApiCore::ScenarioLoadSelection(const std::string_view scenario_id) {
                 scenario_id,
                 core::RetainedBundleId(
                     RequiredString(active, "retained_bundle_id")),
-                core::GraphRevision(
-                    RequiredString(active, "graph_revision")));
+                core::GraphRevision(RequiredString(active, "graph_revision")));
         if (selected.has_value()) {
           return ScenarioSelectionProjection(
               *selected, CanonicalValue(CanonicalValue::Array{}));
@@ -969,6 +968,21 @@ CanonicalValue HeadlessApiCore::HistoryPage(const HistorianQuery &query) {
   return HistorianPageValue(store->Query(query));
 }
 
+CanonicalValue
+HeadlessApiCore::HistorySummaryPage(const HistorianQuery &query) {
+  std::shared_ptr<SqliteEventHistoryStore> store;
+  {
+    std::lock_guard lock(mutex_);
+    Require(!shutdown_, "headless_api_closed", "headless API core is closed");
+    SynchronizeHistorianHealthLocked();
+    store = history_store_;
+  }
+  // Keep both the durable read and list projection outside the coordination
+  // lock. The summary deliberately omits full payloads; callers fetch one
+  // selected event through HistoryDetail instead.
+  return HistorianSummaryPageValue(store->Query(query));
+}
+
 CanonicalValue HeadlessApiCore::HistoryDetail(const std::uint64_t sequence) {
   std::shared_ptr<SqliteEventHistoryStore> store;
   {
@@ -981,6 +995,83 @@ CanonicalValue HeadlessApiCore::HistoryDetail(const std::uint64_t sequence) {
   Require(stored.has_value(), "historian_event_not_found",
           "the requested history event is not retained");
   return HistorianDetailValue(*stored);
+}
+
+CanonicalValue HeadlessApiCore::RecordClientIncident(
+    std::string incident_id, std::string incident_kind, std::string phase,
+    std::string control_session_id, std::string client_incarnation,
+    std::string source_label, std::string reason_code,
+    const std::uint64_t occurrence_count,
+    const std::optional<std::uint64_t> maximum_delay_ns,
+    const std::uint64_t first_observed_ns,
+    const std::uint64_t last_observed_ns) {
+  const auto bounded_text = [](const std::string &value,
+                               const std::size_t maximum_bytes) {
+    return !value.empty() && value.size() <= maximum_bytes &&
+           content_identity::is_utf8_nfc(value);
+  };
+  const std::set<std::string> allowed_kinds{
+      "browser_render_delayed", "command_delivery_unconfirmed",
+      "control_delayed",        "control_disconnected",
+      "control_stale",          "history_detail_request_failed",
+      "history_request_failed"};
+  Require(bounded_text(incident_id, 256U) &&
+              bounded_text(control_session_id, 256U) &&
+              bounded_text(client_incarnation, 256U) &&
+              bounded_text(source_label, 256U) &&
+              bounded_text(reason_code, 256U),
+          "client_incident_invalid",
+          "client incident attribution must be bounded NFC text");
+  Require(allowed_kinds.contains(incident_kind), "client_incident_invalid",
+          "client incident kind is unsupported");
+  Require(phase == "activated" || phase == "resolved",
+          "client_incident_invalid", "client incident phase is unsupported");
+  Require(occurrence_count > 0U && occurrence_count <= kMaximumSafeInteger &&
+              first_observed_ns <= last_observed_ns &&
+              (!maximum_delay_ns.has_value() ||
+               *maximum_delay_ns <= kMaximumSafeInteger),
+          "client_incident_invalid",
+          "client incident counters or monotonic times are invalid");
+
+  const bool warning = incident_kind == "control_delayed";
+  const auto severity = warning ? "WARN" : "ERROR";
+  CanonicalValue payload(CanonicalValue::Object{
+      {"client_incarnation", CanonicalValue(client_incarnation)},
+      {"control_session_id", CanonicalValue(control_session_id)},
+      {"first_observed_ns", CanonicalValue(std::to_string(first_observed_ns))},
+      {"incident_id", CanonicalValue(incident_id)},
+      {"incident_kind", CanonicalValue(incident_kind)},
+      {"last_observed_ns", CanonicalValue(std::to_string(last_observed_ns))},
+      {"maximum_delay_ns", maximum_delay_ns.has_value()
+                               ? Number(*maximum_delay_ns, "maximum_delay_ns")
+                               : CanonicalValue(nullptr)},
+      {"occurrence_count", Number(occurrence_count, "occurrence_count")},
+      {"original_severity", CanonicalValue(severity)},
+      {"phase", CanonicalValue(phase)},
+      {"reason_code", CanonicalValue(reason_code)},
+      {"schema_version", CanonicalValue("manyforge.client_incident_event.v1")},
+      {"source_label", CanonicalValue(source_label)},
+  });
+
+  std::lock_guard lock(mutex_);
+  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
+  auto event = MakeHistorianEvent(
+      "manyforge.composer", "client_incident_" + phase,
+      phase == "resolved" ? "INFO" : severity, clocks_.monotonic_time_ns(),
+      clocks_.wall_time_text(), std::move(payload));
+  const auto event_id = event.event_id;
+  const bool recorded = historian_.TryEnqueue(std::move(event));
+  if (!recorded) {
+    alarm_owner_.MarkHealthUnavailable(
+        std::string(kHistorianOwnerHealthCode),
+        "historian delivery queue rejected a client incident transition");
+  }
+  SynchronizeHistorianHealthLocked();
+  return CanonicalValue(CanonicalValue::Object{
+      {"event_id", CanonicalValue(event_id)},
+      {"recorded", CanonicalValue(recorded)},
+      {"schema_version", CanonicalValue("manyforge.client_incident_record.v1")},
+  });
 }
 
 CanonicalValue HeadlessApiCore::HistorianHealth() {
@@ -1233,11 +1324,10 @@ CanonicalValue HeadlessApiCore::IngestOperationEvent(
       record_kind == "stop_acceptance_projected";
   const bool stop_terminal_projection =
       record_kind == "stop_terminal_projected";
-  const bool stop_fault_clear_projection =
-      record_kind == "stop_fault_cleared";
-  const bool stop_scoped_projection =
-      stop_acceptance_projection || stop_terminal_projection ||
-      stop_fault_clear_projection;
+  const bool stop_fault_clear_projection = record_kind == "stop_fault_cleared";
+  const bool stop_scoped_projection = stop_acceptance_projection ||
+                                      stop_terminal_projection ||
+                                      stop_fault_clear_projection;
   Require(!source_owner_epoch.empty() && source_sequence != 0U &&
               source_sequence <= kMaximumSafeInteger && !record_kind.empty() &&
               has_operation_id == has_operation_revision &&
@@ -1369,39 +1459,37 @@ CanonicalValue HeadlessApiCore::IngestOperationEvent(
   } else if (stop_fault_clear_projection) {
     const auto &fault_latch = RequiredMember(journal_payload, "fault_latch");
     const auto &result = RequiredMember(journal_payload, "result");
-    const auto &certificate =
-        RequiredMember(fault_latch, "stop_certificate");
+    const auto &certificate = RequiredMember(fault_latch, "stop_certificate");
     const auto request = RequiredString(journal_payload, "request_id");
     const auto stop_id = RequiredString(journal_payload, "stop_id");
     const auto stop_generation =
         RequiredCounter(journal_payload, "stop_generation", 1U);
-    Require(
-        RequiredString(journal_payload, "api_version") ==
-                "manyforge.stop_fault_clear_projection.v1" &&
-            RequiredString(journal_payload, "owner_epoch") ==
-                source_owner_epoch &&
-            request_id.has_value() && *request_id == request &&
-            result.is_object() && RequiredBool(result, "accepted") &&
-            RequiredString(result, "request_id") == request &&
-            std::holds_alternative<std::nullptr_t>(
-                RequiredMember(result, "error").storage()) &&
-            fault_latch.is_object() &&
-            RequiredString(fault_latch, "state") == "cleared" &&
-            RequiredString(fault_latch, "recovery_status") == "cleared" &&
-            RequiredString(fault_latch, "reason_code") ==
-                "stop_fault_recovery_cleared" &&
-            RequiredString(fault_latch, "stop_id") == stop_id &&
-            RequiredCounter(fault_latch, "stop_generation", 1U) ==
-                stop_generation &&
-            certificate.is_object() &&
-            RequiredString(certificate, "stop_certificate_id") ==
-                RequiredString(journal_payload, "stop_certificate_id") &&
-            RequiredCounter(certificate, "stop_certificate_revision", 1U) ==
-                RequiredCounter(journal_payload, "stop_certificate_revision",
-                                1U) &&
-            !effect_pending,
-        "headless_operation_event_invalid",
-        "Stop fault-clear projection does not match its durable envelope");
+    Require(RequiredString(journal_payload, "api_version") ==
+                    "manyforge.stop_fault_clear_projection.v1" &&
+                RequiredString(journal_payload, "owner_epoch") ==
+                    source_owner_epoch &&
+                request_id.has_value() && *request_id == request &&
+                result.is_object() && RequiredBool(result, "accepted") &&
+                RequiredString(result, "request_id") == request &&
+                std::holds_alternative<std::nullptr_t>(
+                    RequiredMember(result, "error").storage()) &&
+                fault_latch.is_object() &&
+                RequiredString(fault_latch, "state") == "cleared" &&
+                RequiredString(fault_latch, "recovery_status") == "cleared" &&
+                RequiredString(fault_latch, "reason_code") ==
+                    "stop_fault_recovery_cleared" &&
+                RequiredString(fault_latch, "stop_id") == stop_id &&
+                RequiredCounter(fault_latch, "stop_generation", 1U) ==
+                    stop_generation &&
+                certificate.is_object() &&
+                RequiredString(certificate, "stop_certificate_id") ==
+                    RequiredString(journal_payload, "stop_certificate_id") &&
+                RequiredCounter(certificate, "stop_certificate_revision", 1U) ==
+                    RequiredCounter(journal_payload,
+                                    "stop_certificate_revision", 1U) &&
+                !effect_pending,
+            "headless_operation_event_invalid",
+            "Stop fault-clear projection does not match its durable envelope");
   } else {
     Require(RequiredString(journal_payload, "api_version") ==
                     "manyforge.operation_journal_record.v1" &&
@@ -1540,8 +1628,7 @@ CanonicalValue HeadlessApiCore::IngestOperationEvent(
 }
 
 CanonicalValue HeadlessApiCore::CompleteOperationEventSnapshot(
-    std::string source_owner_epoch,
-    const std::uint64_t through_source_sequence,
+    std::string source_owner_epoch, const std::uint64_t through_source_sequence,
     std::optional<CanonicalValue> current_stop_fault) {
   Require(!source_owner_epoch.empty() &&
               through_source_sequence <= kMaximumSafeInteger,
@@ -2518,9 +2605,8 @@ void HeadlessApiCore::ReconcileOperationFaultLocked(
 
 void HeadlessApiCore::ReconcileStopFaultLocked(
     const CanonicalValue &journal_payload, const std::string_view record_kind,
-    const std::uint64_t native_sequence,
-    const std::string_view payload_digest, const std::int64_t occurred_at_ns,
-    const std::string_view occurred_at_wall,
+    const std::uint64_t native_sequence, const std::string_view payload_digest,
+    const std::int64_t occurred_at_ns, const std::string_view occurred_at_wall,
     const std::string_view raw_event_id) {
   const auto &fault_latch = RequiredMember(journal_payload, "fault_latch");
   if (std::holds_alternative<std::nullptr_t>(fault_latch.storage())) {
@@ -2605,8 +2691,7 @@ void HeadlessApiCore::ObserveCurrentStopFaultLocked(
   const auto latch_id = RequiredString(fault_latch, "latch_id");
   const auto cell_id = RequiredString(fault_latch, "cell_id");
   const auto state = RequiredString(fault_latch, "state");
-  const auto recovery_status =
-      RequiredString(fault_latch, "recovery_status");
+  const auto recovery_status = RequiredString(fault_latch, "recovery_status");
   const auto trigger = RequiredString(fault_latch, "trigger");
   const auto stop_id = RequiredString(fault_latch, "stop_id");
   const auto stop_generation =
@@ -2643,8 +2728,7 @@ void HeadlessApiCore::ObserveCurrentStopFaultLocked(
           RequiredString(certificate, "stop_id") == stop_id &&
           RequiredCounter(certificate, "stop_generation", 1U) ==
               stop_generation &&
-          RequiredCounter(certificate, "stop_certificate_revision", 1U) !=
-              0U &&
+          RequiredCounter(certificate, "stop_certificate_revision", 1U) != 0U &&
           !RequiredString(certificate, "stop_certificate_id").empty(),
       "headless_operation_event_invalid",
       "current Stop-fault condition is internally inconsistent");

@@ -24,11 +24,15 @@
 namespace manyforge::headless {
 
 inline constexpr std::string_view kHistorianEventSchemaVersion =
-    "manyforge.historian_event.v1";
+    "manyforge.historian_event.v2";
 inline constexpr std::string_view kHistorianPageSchemaVersion =
-    "manyforge.historian_page.v1";
+    "manyforge.historian_page.v2";
+inline constexpr std::string_view kHistorianSummaryPageSchemaVersion =
+    "manyforge.historian_summary_page.v1";
+inline constexpr std::string_view kHistorianEventSummarySchemaVersion =
+    "manyforge.historian_event_summary.v1";
 inline constexpr std::string_view kHistorianDetailSchemaVersion =
-    "manyforge.historian_detail.v1";
+    "manyforge.historian_detail.v2";
 inline constexpr std::size_t kDefaultHistorianQueueCapacity = 1024U;
 inline constexpr std::size_t kDefaultHistorianRecordRetention = 100000U;
 inline constexpr std::size_t kMaximumHistorianPageSize = 10000U;
@@ -62,6 +66,10 @@ MakeHistorianEvent(std::string component, std::string event_type,
 MakeAlarmLifecycleHistorianEvent(const AlarmLifecycleFact &fact);
 [[nodiscard]] manyforge::content_identity::CanonicalValue
 HistorianEventValue(const HistorianEvent &event);
+/// Exact persisted digest form. Values written before the v2 wire cutover keep
+/// their v1 numeric representation so an existing database remains readable.
+[[nodiscard]] manyforge::content_identity::CanonicalValue
+HistorianPersistenceValue(const HistorianEvent &event);
 
 struct HistorianStoredEvent final {
   std::uint64_t sequence;
@@ -85,6 +93,11 @@ struct HistorianPage final {
 
 [[nodiscard]] manyforge::content_identity::CanonicalValue
 HistorianPageValue(const HistorianPage &page);
+/// Bounded list projection. Full event payloads remain available only through
+/// HistorianDetailValue so a History list cannot make the Python control loop
+/// parse and discard large nested records.
+[[nodiscard]] manyforge::content_identity::CanonicalValue
+HistorianSummaryPageValue(const HistorianPage &page);
 [[nodiscard]] manyforge::content_identity::CanonicalValue
 HistorianDetailValue(const HistorianStoredEvent &stored);
 

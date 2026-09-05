@@ -320,6 +320,90 @@ AuthoringRelease(const core::CellAdmissionClaimDTO &claim,
 
 } // namespace
 
+core::Result<std::optional<ActiveProgramRunProductIdentity>>
+ReadActiveProgramRunProductForReconciliation(
+    const std::filesystem::path &database_path) {
+  try {
+    std::error_code status_error;
+    const auto status =
+        std::filesystem::symlink_status(database_path, status_error);
+    if (status_error == std::errc::no_such_file_or_directory ||
+        status.type() == std::filesystem::file_type::not_found) {
+      return core::Result<std::optional<ActiveProgramRunProductIdentity>>::Ok(
+          std::nullopt);
+    }
+    if (status_error || !std::filesystem::is_regular_file(status))
+      throw std::runtime_error("Program-cycle journal is not a regular file");
+    auto database = OpenReadOnly(database_path);
+    Statement metadata(
+        database.get(),
+        "SELECT schema_version FROM program_cycle_metadata WHERE singleton=1");
+    if (!metadata.Step())
+      throw std::runtime_error("Program-cycle journal schema differs");
+    const auto schema_version = metadata.Integer(0);
+    if ((schema_version != 3 && schema_version != 4) || metadata.Step())
+      throw std::runtime_error("Program-cycle journal schema differs");
+
+    Statement row(database.get(),
+                  "SELECT state,program_run_id,reconciliation_required "
+                  "FROM program_cycle WHERE singleton=1");
+    if (!row.Step())
+      throw std::runtime_error("Program-cycle owner row is absent");
+    const auto state = row.Text(0);
+    const bool reconciliation_required = row.Integer(2) == 1;
+    if (!reconciliation_required || state == "idle_after_reset" ||
+        state == "terminal_awaiting_reset") {
+      if (row.Step())
+        throw std::runtime_error("Program-cycle owner row is duplicated");
+      Exec(database.get(), "COMMIT");
+      return core::Result<std::optional<ActiveProgramRunProductIdentity>>::Ok(
+          std::nullopt);
+    }
+    if ((state != "starting" && state != "running" && state != "stopping" &&
+         state != "resetting" && state != "recovery_required") ||
+        row.IsNull(1))
+      throw std::runtime_error("Program-cycle recovery state is invalid");
+    const auto program_run_id = row.Text(1);
+    if (row.Step())
+      throw std::runtime_error("Program-cycle owner row is duplicated");
+
+    Statement history(database.get(),
+                      "SELECT snapshot_json,terminal FROM program_run_history "
+                      "WHERE program_run_id=?");
+    history.Bind(1, program_run_id);
+    if (!history.Step())
+      throw std::runtime_error("active Program-run snapshot is absent");
+    const auto snapshot = ci::parse_canonical_json(history.Text(0));
+    const bool terminal = history.Integer(1) == 1;
+    if (history.Step())
+      throw std::runtime_error("active Program-run snapshot is duplicated");
+    if (terminal) {
+      Exec(database.get(), "COMMIT");
+      return core::Result<std::optional<ActiveProgramRunProductIdentity>>::Ok(
+          std::nullopt);
+    }
+    const auto &capture = Member(snapshot, "capture");
+    const auto captured_run_id = StringMember(capture, "program_run_id");
+    const auto retained_bundle_id = StringMember(capture, "retained_bundle_id");
+    const auto graph_revision = StringMember(capture, "graph_revision");
+    if (captured_run_id != program_run_id || retained_bundle_id.empty() ||
+        graph_revision.empty())
+      throw std::runtime_error("active Program-run capture is invalid");
+    Exec(database.get(), "COMMIT");
+    return core::Result<std::optional<ActiveProgramRunProductIdentity>>::Ok(
+        ActiveProgramRunProductIdentity{
+            core::ProgramRunId(program_run_id),
+            core::RetainedBundleId(retained_bundle_id),
+            core::GraphRevision(graph_revision)});
+  } catch (const std::exception &error) {
+    return core::Result<std::optional<ActiveProgramRunProductIdentity>>::Err(
+        core::ErrorDTO{"invariant_violation",
+                       "active Program-run recovery product cannot be proven",
+                       {{"reason", "program_run_recovery_product_unavailable"},
+                        {"detail", error.what()}}});
+  }
+}
+
 core::Result<void> ValidateProgramCycleSettlementReadOnly(
     const std::filesystem::path &database_path,
     const core::CellAdmissionClaimDTO &claim,
@@ -365,11 +449,10 @@ core::Result<void> ValidateProgramCycleSettlementReadOnly(
     const bool lifecycle_is_exact =
         (schema_version == 3 && row.Text(0) == "terminal_awaiting_reset" &&
          row.IsNull(9)) ||
-        (schema_version == 4 && row.Text(0) == "resetting" &&
-         !row.IsNull(9) && row.Text(9) == "releasing");
+        (schema_version == 4 && row.Text(0) == "resetting" && !row.IsNull(9) &&
+         row.Text(9) == "releasing");
     const bool valid =
-        lifecycle_is_exact &&
-        row.Text(1) == claim.intent.owner_epoch.value() &&
+        lifecycle_is_exact && row.Text(1) == claim.intent.owner_epoch.value() &&
         retained_claim == claim && retained_release == release &&
         row.Text(4) == release.settlement.evidence_digest.value() &&
         evidence_matches && row.Integer(7) == 0 && row.IsNull(8) && !row.Step();
@@ -535,12 +618,13 @@ ValidateProgramRunnerOwnerReconciliationReadOnly(
     const auto schema_version = metadata.Integer(0);
     if ((schema_version != 3 && schema_version != 4) || metadata.Step())
       throw std::runtime_error("Program-cycle journal schema differs");
-    Statement row(database.get(),
-                  "SELECT state,owner_epoch,program_run_id,claim_json,"
-                  "release_intent_json,terminal_reference,start_settlement_json,"
-                  "reconciliation_required,acquisition_pending_json,"
-                  "reconciliation_evidence_digest "
-                  "FROM program_cycle WHERE singleton=1");
+    Statement row(
+        database.get(),
+        "SELECT state,owner_epoch,program_run_id,claim_json,"
+        "release_intent_json,terminal_reference,start_settlement_json,"
+        "reconciliation_required,acquisition_pending_json,"
+        "reconciliation_evidence_digest "
+        "FROM program_cycle WHERE singleton=1");
     if (!row.Step() || row.Text(1) != replacement.predecessor.value() ||
         row.Integer(7) != 1 || !row.IsNull(8) || row.IsNull(9) ||
         row.Text(9) != reconcile.reconciliation_evidence_digest.value())

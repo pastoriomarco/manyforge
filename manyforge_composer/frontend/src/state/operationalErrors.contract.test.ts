@@ -10,7 +10,6 @@ function report(
   state: OperationalErrorState,
   source: string,
   attentionPolicy: 'transient' | 'acknowledgement_required',
-  observedAtMs = 1,
 ): OperationalErrorState {
   return reduceOperationalErrors(state, {
     kind: 'report',
@@ -18,27 +17,18 @@ function report(
     title: 'Viewer response failed',
     message: 'Exact diagnostic',
     attentionPolicy,
-    observedAtMs,
   });
 }
 
 describe('operational error lifecycle', () => {
-  it('auto-resolves a transient error but retains activation and recovery trace', () => {
+  it('auto-resolves a transient error while durable trace remains backend-owned', () => {
     const active = report(initialOperationalErrorState(), 'composer.viewer', 'transient');
     const resolved = reduceOperationalErrors(active, {
-      kind: 'resolve', source: 'composer.viewer', observedAtMs: 2,
+      kind: 'resolve', source: 'composer.viewer',
     });
 
     expect(resolved.records.size).toBe(0);
-    expect(resolved.history.map((event) => event.type)).toEqual([
-      'composer_client_error_resolved',
-      'composer_client_error_activated',
-    ]);
-    expect(resolved.history[1]?.details).toMatchObject({
-      source: 'composer.viewer',
-      detail: 'Exact diagnostic',
-      attentionPolicy: 'transient',
-    });
+    expect(resolved.sequence).toBe(2);
   });
 
   it('retains a returned acknowledgement-required error until explicit acknowledgement', () => {
@@ -48,7 +38,7 @@ describe('operational error lifecycle', () => {
       'acknowledgement_required',
     );
     const returned = reduceOperationalErrors(active, {
-      kind: 'resolve', source: 'composer.full_stop', observedAtMs: 2,
+      kind: 'resolve', source: 'composer.full_stop',
     });
     const record = [...returned.records.values()][0];
 
@@ -57,25 +47,23 @@ describe('operational error lifecycle', () => {
       acknowledgementRequired: true,
     });
     const acknowledged = reduceOperationalErrors(returned, {
-      kind: 'dismiss', id: record?.id ?? '', observedAtMs: 3,
+      kind: 'dismiss', id: record?.id ?? '',
     });
     expect(acknowledged.records.size).toBe(0);
-    expect(acknowledged.history[0]?.type)
-      .toBe('composer_client_error_acknowledged');
+    expect(acknowledged.sequence).toBe(3);
   });
 
-  it('bounds session trace independently of occurrence count', () => {
+  it('retains no browser-side history while issuing stable unique identities', () => {
     let state = initialOperationalErrorState();
     for (let index = 0; index < 80; index += 1) {
       const source = `composer.source.${index}`;
-      state = report(state, source, 'transient', index * 2);
+      state = report(state, source, 'transient');
       state = reduceOperationalErrors(state, {
-        kind: 'resolve', source, observedAtMs: index * 2 + 1,
+        kind: 'resolve', source,
       });
     }
 
     expect(state.records.size).toBe(0);
-    expect(state.history).toHaveLength(128);
-    expect(state.history[0]?.id).toBe('composer-session:160');
+    expect(state.sequence).toBe(160);
   });
 });

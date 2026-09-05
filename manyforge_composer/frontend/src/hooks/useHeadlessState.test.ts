@@ -9,8 +9,6 @@ import {
   executionCommandPayload,
   getHeadlessStateQualificationSnapshot,
   parseExecutionObservationFrame,
-  sameComponentOverviewPresentation,
-  sameHeadlessProjection,
   sameViewerProjection,
   useHeadlessStateSource,
   useViewerHeadlessState,
@@ -168,51 +166,15 @@ describe('Headless owner-frame admission', () => {
       .toThrow('Execution owner identity is unavailable.');
   });
 
-  it('treats transport-only sequence updates as the same UI projection', () => {
-    const current = state('receiver.epoch.1', 2);
-    const next = structuredClone(current);
-    next.snapshotSequence += 1;
-    expect(sameHeadlessProjection(current, next)).toBe(true);
-    next.alarms.stateRevision += 1;
-    expect(sameHeadlessProjection(current, next)).toBe(true);
-    next.alarms.generation += 1;
-    expect(sameHeadlessProjection(current, next)).toBe(false);
-    next.alarms.generation -= 1;
-    next.draftIdentity.draftRevision += 1;
-    expect(sameHeadlessProjection(current, next)).toBe(false);
-  });
-
   it('publishes owner runtime-control revisions without invalidating the viewer', () => {
     const current = state('receiver.epoch.1', 2);
     const next = structuredClone(current);
     next.snapshotSequence += 1;
     next.programCycle.runtimeControlRevision = 2;
-    expect(sameHeadlessProjection(current, next)).toBe(false);
     expect(sameViewerProjection(current, next)).toBe(true);
   });
 
-  it('suppresses aggregate Overview heartbeats but publishes semantic changes', () => {
-    const current = state('receiver.epoch.1', 2);
-    const next = structuredClone(current);
-    next.componentOverview.overviewRevision = `sha256:${'b'.repeat(64)}`;
-    next.componentOverview.basis.runtimeProjectionGeneration = 3;
-    expect(sameComponentOverviewPresentation(
-      current.componentOverview,
-      next.componentOverview,
-    )).toBe(true);
-    expect(sameHeadlessProjection(current, next)).toBe(true);
-    expect(sameViewerProjection(current, next)).toBe(true);
-
-    next.componentOverview.readiness = 'degraded';
-    next.componentOverview.summaryLabel = 'Some functional scopes unavailable';
-    expect(sameComponentOverviewPresentation(
-      current.componentOverview,
-      next.componentOverview,
-    )).toBe(false);
-    expect(sameHeadlessProjection(current, next)).toBe(false);
-  });
-
-  it('does not publish Manager observation heartbeats as UI or viewer changes', () => {
+  it('does not invalidate the viewer for Manager observation heartbeats', () => {
     const current = state('receiver.epoch.1', 2);
     const heartbeat = structuredClone(current);
     heartbeat.snapshotSequence += 1;
@@ -221,12 +183,10 @@ describe('Headless owner-frame admission', () => {
       (heartbeat.runtime.sections.manager.sourceGeneration ?? 0) + 1;
     heartbeat.runtime.sections.manager.receiverAgeNs =
       (heartbeat.runtime.sections.manager.receiverAgeNs ?? 0) + 1;
-    expect(sameHeadlessProjection(current, heartbeat)).toBe(true);
     expect(sameViewerProjection(current, heartbeat)).toBe(true);
 
     heartbeat.runtime.sections.logicalScene.sourceGeneration =
       (heartbeat.runtime.sections.logicalScene.sourceGeneration ?? 0) + 1;
-    expect(sameHeadlessProjection(current, heartbeat)).toBe(false);
     expect(sameViewerProjection(current, heartbeat)).toBe(false);
   });
 
@@ -252,10 +212,19 @@ describe('Headless owner-frame admission', () => {
     });
   });
 
-  it('requires a strictly forward sequence within an epoch but accepts a fresh barrier',
+  it('allows owner deltas at one local sequence but rejects local regression',
     () => {
       const current = state('runtime.epoch.1', 2);
       expect(admitHeadlessState(current, state('runtime.epoch.1', 2)).accepted)
+        .toBe(true);
+      expect(admitHeadlessState(current, state('runtime.epoch.1', 1)).accepted)
+        .toBe(false);
+      const changedWithoutSequence = state('runtime.epoch.1', 2);
+      changedWithoutSequence.draftIdentity = {
+        ...changedWithoutSequence.draftIdentity,
+        draftRevision: changedWithoutSequence.draftIdentity.draftRevision + 1,
+      };
+      expect(admitHeadlessState(current, changedWithoutSequence).accepted)
         .toBe(false);
       expect(admitHeadlessState(current, state('runtime.epoch.2', 99)).accepted)
         .toBe(true);
@@ -401,7 +370,7 @@ function synchronizeControl(
 ): void {
   socket.testServerSequence = 0;
   receiveControl(socket, {
-    schema_version: 'manyforge.execution_control.v1',
+    schema_version: 'manyforge.execution_control.v2',
     message_kind: 'server_hello',
     receiver_incarnation: 'headless.receiver.1',
     control_session_id: sessionId,
@@ -412,21 +381,25 @@ function synchronizeControl(
     maximum_messages_per_second: 64,
   });
   receiveControl(socket, {
-    schema_version: 'manyforge.execution_control.v1',
+    schema_version: 'manyforge.execution_control.v2',
     message_kind: 'heartbeat_challenge',
     control_session_id: sessionId,
     server_sequence: nextControlServerSequence(socket),
     challenge_sequence: '1',
     received_client_sequence: null,
+    semantic_status: 'current',
+    semantic_reason: null,
     freshness: controlFreshness(1),
   });
   receiveControl(socket, {
-    schema_version: 'manyforge.execution_control.v1',
+    schema_version: 'manyforge.execution_control.v2',
     message_kind: 'heartbeat_challenge',
     control_session_id: sessionId,
     server_sequence: nextControlServerSequence(socket),
     challenge_sequence: '2',
     received_client_sequence: '1',
+    semantic_status: 'current',
+    semantic_reason: null,
     freshness: controlFreshness(1),
   });
 }
@@ -436,15 +409,18 @@ function receiveHeartbeat(
   challenge: number,
   receivedClientSequence: string,
   sessionId = CONTROL_SESSION_ID,
+  controlRevision = 1,
 ): void {
   receiveControl(socket, {
-    schema_version: 'manyforge.execution_control.v1',
+    schema_version: 'manyforge.execution_control.v2',
     message_kind: 'heartbeat_challenge',
     control_session_id: sessionId,
     server_sequence: nextControlServerSequence(socket),
     challenge_sequence: String(challenge),
     received_client_sequence: receivedClientSequence,
-    freshness: controlFreshness(1),
+    semantic_status: 'current',
+    semantic_reason: null,
+    freshness: controlFreshness(controlRevision),
   });
 }
 
@@ -455,11 +431,13 @@ function receiveControlSnapshot(
 ): void {
   const cycle = shell.program_cycle as Record<string, unknown>;
   const revision = cycle.execution_control_revision as number;
+  const serverSequence = nextControlServerSequence(socket);
   receiveControl(socket, {
-    schema_version: 'manyforge.execution_control.v1',
+    schema_version: 'manyforge.execution_control.v2',
     message_kind: 'snapshot',
     control_session_id: sessionId,
-    server_sequence: nextControlServerSequence(socket),
+    server_sequence: serverSequence,
+    state_sequence: serverSequence,
     received_client_sequence: '2',
     control: {
       receiver_incarnation: 'headless.receiver.1',
@@ -696,6 +674,132 @@ describe('HeadlessStateSource delivery scheduling', () => {
     source.dispose();
   });
 
+  it('accepts a Composer-local Draft delta without replacing control state', () => {
+    vi.useFakeTimers();
+    const animationFrames: FrameRequestCallback[] = [];
+    class FakeWebSocket {
+      static shell: FakeWebSocket;
+      onopen: (() => void) | null = null;
+      onmessage: ((message: MessageEvent) => void) | null = null;
+      onerror: (() => void) | null = null;
+      onclose: (() => void) | null = null;
+      constructor(url: string) {
+        if (new URL(url).pathname === '/ws/control') FakeWebSocket.shell = this;
+      }
+      close(): void {}
+      send(): void {}
+    }
+    vi.stubGlobal('window', {
+      location: { href: 'http://composer.test/' },
+      requestAnimationFrame: (callback: FrameRequestCallback) => {
+        animationFrames.push(callback); return animationFrames.length;
+      },
+      cancelAnimationFrame: vi.fn(),
+    });
+    vi.stubGlobal('WebSocket', FakeWebSocket);
+    const source = new HeadlessStateSource();
+    source.setEnabled(true);
+    synchronizeControl(FakeWebSocket.shell);
+    const initial = wireState(1);
+    receiveControlSnapshot(FakeWebSocket.shell, initial);
+    animationFrames[0]!(16);
+    vi.advanceTimersByTime(HEADLESS_SHELL_PUBLICATION_MS);
+
+    const local = {
+      schema_version: 'manyforge.composer_headless_state.v2',
+      complete: false,
+      receiver_epoch: initial.receiver_epoch,
+      snapshot_sequence: 3,
+      draft_identity: { draft_id: 'draft-1', draft_revision: 2 },
+    };
+    receiveControl(FakeWebSocket.shell, {
+      schema_version: 'manyforge.execution_control.v2',
+      message_kind: 'delta',
+      control_session_id: CONTROL_SESSION_ID,
+      server_sequence: nextControlServerSequence(FakeWebSocket.shell),
+      received_client_sequence: '2',
+      event_class: 'cold',
+      control: null,
+      shell: local,
+    });
+    vi.advanceTimersByTime(HEADLESS_SHELL_PUBLICATION_MS);
+
+    expect(source.getShellSnapshot().error).toBeNull();
+    expect(source.getShellSnapshot().snapshot?.draftIdentity).toEqual({
+      draftId: 'draft-1', draftRevision: 2,
+    });
+    expect(source.getViewerSnapshot().snapshot?.draftIdentity.draftRevision).toBe(1);
+    source.dispose();
+  });
+
+  it('merges a typed owner delta without retransmitting unchanged domains', () => {
+    vi.useFakeTimers();
+    class FakeWebSocket {
+      static shell: FakeWebSocket;
+      onopen: (() => void) | null = null;
+      onmessage: ((message: MessageEvent) => void) | null = null;
+      onerror: (() => void) | null = null;
+      onclose: (() => void) | null = null;
+      constructor(url: string) {
+        if (new URL(url).pathname === '/ws/control') FakeWebSocket.shell = this;
+      }
+      close(): void {}
+      send(): void {}
+    }
+    vi.stubGlobal('window', { location: { href: 'http://composer.test/' } });
+    vi.stubGlobal('WebSocket', FakeWebSocket);
+    const source = new HeadlessStateSource();
+    source.setEnabled(true);
+    synchronizeControl(FakeWebSocket.shell);
+    const initial = wireState(1);
+    receiveControlSnapshot(FakeWebSocket.shell, initial);
+    vi.advanceTimersByTime(HEADLESS_SHELL_PUBLICATION_MS);
+
+    const cycle = structuredClone(initial.program_cycle) as Record<string, unknown>;
+    cycle.execution_control_revision = 2;
+    cycle.state = 'starting';
+    const local = {
+      complete: false,
+      program_cycle: cycle,
+      authoring_admission: {
+        admission_generation: 2,
+        authoring_allowed: false,
+      },
+    };
+    receiveControl(FakeWebSocket.shell, {
+      schema_version: 'manyforge.execution_control.v2',
+      message_kind: 'delta',
+      control_session_id: CONTROL_SESSION_ID,
+      server_sequence: nextControlServerSequence(FakeWebSocket.shell),
+      state_sequence: '2',
+      received_client_sequence: '2',
+      event_class: 'critical',
+      control: {
+        receiver_incarnation: 'headless.receiver.1',
+        semantic_owner_epoch: 'runner.epoch.1',
+        execution_control_revision: 2,
+        freshness: controlFreshness(2),
+      },
+      shell: local,
+    });
+    receiveHeartbeat(FakeWebSocket.shell, 3, '2', CONTROL_SESSION_ID, 2);
+    vi.advanceTimersByTime(HEADLESS_SHELL_PUBLICATION_MS);
+
+    const merged = source.getShellSnapshot().snapshot!;
+    expect(source.getShellSnapshot().error).toBeNull();
+    expect(merged.programCycle.state).toBe('starting');
+    expect(merged.authoringAdmission).toEqual({
+      admissionGeneration: 2, authoringAllowed: false,
+    });
+    expect(merged.draftIdentity).toEqual({
+      draftId: 'draft-1', draftRevision: 1,
+    });
+    expect(merged.snapshotSequence).toBe(initial.snapshot_sequence);
+    expect(merged.runtime).toBe(source.getViewerSnapshot().snapshot?.runtime);
+    expect(merged.alarms.ownerEpoch).toBe('alarms.epoch.1');
+    source.dispose();
+  });
+
   it('advances exact capture identity across visually equivalent heartbeats', () => {
     vi.useFakeTimers();
     const animationFrames: FrameRequestCallback[] = [];
@@ -832,11 +936,17 @@ describe('HeadlessStateSource delivery scheduling', () => {
         maxActiveSockets: 1,
       }),
     );
+    synchronizeControl(shellSocket);
+    const initialShell = wireState(1);
+    (initialShell.program_cycle as Record<string, unknown>)
+      .execution_control_revision = 1;
+    receiveControlSnapshot(shellSocket, initialShell);
     const viewerBaseline = viewerNotifications;
     const shellBaseline = shellNotifications;
-    synchronizeControl(shellSocket);
-    for (let generation = 1; generation <= 100; generation += 1) {
-      receiveControlSnapshot(shellSocket, wireState(generation));
+    for (let generation = 2; generation <= 100; generation += 1) {
+      const shell = wireState(generation);
+      (shell.program_cycle as Record<string, unknown>).execution_control_revision = 1;
+      receiveControlSnapshot(shellSocket, shell);
     }
     expect(animationFrames).toHaveLength(1);
     expect(source.getViewerSnapshot().error).toBeNull();
@@ -938,6 +1048,99 @@ describe('HeadlessStateSource delivery scheduling', () => {
       phase: 'disabled', message: null,
     });
     expect(getHeadlessStateQualificationSnapshot().activeSockets).toBe(0);
+  });
+
+  it('drops a stranded unapplied viewer callback before current-only reconnect', () => {
+    vi.useFakeTimers();
+    const animationFrames = new Map<number, FrameRequestCallback>();
+    let nextAnimationFrame = 0;
+    class FakeWebSocket {
+      static readonly OPEN = 1;
+      static instances: FakeWebSocket[] = [];
+      readonly url: string;
+      readonly sent: string[] = [];
+      readyState = FakeWebSocket.OPEN;
+      onopen: (() => void) | null = null;
+      onmessage: ((message: MessageEvent) => void) | null = null;
+      onerror: (() => void) | null = null;
+      onclose: (() => void) | null = null;
+
+      constructor(url: string) {
+        this.url = url;
+        FakeWebSocket.instances.push(this);
+      }
+
+      open(): void { this.onopen?.(); }
+      send(value: string): void { this.sent.push(value); }
+      sendFrame(value: unknown): void {
+        this.onmessage?.({ data: JSON.stringify(value) } as MessageEvent);
+      }
+      fail(): void {
+        this.readyState = 3;
+        this.onerror?.();
+        this.onclose?.();
+      }
+      close(): void {
+        if (this.readyState !== FakeWebSocket.OPEN) return;
+        this.readyState = 3;
+        this.onclose?.();
+      }
+    }
+    vi.stubGlobal('window', {
+      location: { href: 'http://composer.test/' },
+      requestAnimationFrame: (callback: FrameRequestCallback) => {
+        nextAnimationFrame += 1;
+        animationFrames.set(nextAnimationFrame, callback);
+        return nextAnimationFrame;
+      },
+      cancelAnimationFrame: (id: number) => { animationFrames.delete(id); },
+    });
+    vi.stubGlobal('WebSocket', FakeWebSocket);
+
+    const source = new HeadlessStateSource();
+    const applied: number[] = [];
+    source.subscribeExecutionObservation(() => {
+      const frame = source.getLatestExecutionObservation();
+      if (frame === null || applied.at(-1) === frame.sourceSequence) return;
+      applied.push(frame.sourceSequence);
+      source.markExecutionObservationApplied(frame);
+    });
+    source.setViewerDemand(true);
+    source.setEnabled(true);
+    const viewer = FakeWebSocket.instances.find(
+      (socket) => new URL(socket.url).pathname === '/ws/scene/viewer',
+    )!;
+    viewer.open();
+    viewer.sendFrame(wireObservation(1));
+    const firstCallback = animationFrames.get(1)!;
+    animationFrames.delete(1);
+    firstCallback(16);
+    expect(applied).toEqual([1]);
+
+    viewer.sendFrame(wireObservation(2));
+    expect(animationFrames.size).toBe(1);
+    viewer.fail();
+    expect(animationFrames.size).toBe(0);
+    expect(source.getLatestExecutionObservation()?.sourceSequence).toBe(1);
+
+    vi.advanceTimersByTime(1_000);
+    const replacement = FakeWebSocket.instances.filter(
+      (socket) => new URL(socket.url).pathname === '/ws/scene/viewer',
+    ).at(-1)!;
+    replacement.open();
+    replacement.sendFrame(wireObservation(3));
+    expect(animationFrames.size).toBe(1);
+    const [currentId, currentCallback] = [...animationFrames.entries()][0]!;
+    animationFrames.delete(currentId);
+    currentCallback(32);
+
+    expect(applied).toEqual([1, 3]);
+    expect(source.getLatestExecutionObservation()?.sourceSequence).toBe(3);
+    expect(JSON.parse(replacement.sent.at(-1)!)).toMatchObject({
+      last_applied: { source_sequence: 3 },
+    });
+    source.dispose();
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it('renews one visible static demand for more than 24 hours without frame work', () => {
@@ -1065,14 +1268,16 @@ describe('HeadlessStateSource delivery scheduling', () => {
     FakeWebSocket.shell.onerror?.();
 
     expect(source.getShellSnapshot()).toMatchObject({
-      snapshot: null,
+      snapshot: coherent,
       error: 'Headless WebSocket transport failed.',
     });
     expect(source.getViewerSnapshot()).toMatchObject({
       snapshot: coherent,
       error: 'Headless WebSocket transport failed.',
     });
-    expect(source.getPresentedRuntimeFrame()).toBeNull();
+    expect(source.getPresentedRuntimeFrame()).toEqual({
+      ownerEpoch: 'runtime.epoch.1', generation: 7,
+    });
     source.dispose();
   });
 
@@ -1118,6 +1323,8 @@ describe('HeadlessStateSource delivery scheduling', () => {
     expect(source.getShellSnapshot()).toMatchObject({
       snapshot: expect.any(Object),
       error: 'Control connection is delayed; commands are disabled.',
+      transportStatus: 'delayed',
+      semanticStatus: 'current',
     });
 
     receiveHeartbeat(FakeWebSocket.shell, 3, '2');
@@ -1133,6 +1340,8 @@ describe('HeadlessStateSource delivery scheduling', () => {
     expect(source.getShellSnapshot()).toMatchObject({
       snapshot: expect.any(Object),
       error: 'Control connection is stale; commands are disabled.',
+      transportStatus: 'stale',
+      semanticStatus: 'current',
     });
 
     const retainedSocket = FakeWebSocket.shell;
@@ -1153,7 +1362,70 @@ describe('HeadlessStateSource delivery scheduling', () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it('does not treat initial owner synchronization as a stale heartbeat', () => {
+  it('echoes a newer semantic heartbeat while its replaceable projection catches up', () => {
+    vi.useFakeTimers();
+    class FakeWebSocket {
+      static readonly OPEN = 1;
+      static shell: FakeWebSocket;
+      readonly sent: string[] = [];
+      readyState = FakeWebSocket.OPEN;
+      closed = false;
+      onopen: (() => void) | null = null;
+      onmessage: ((message: MessageEvent) => void) | null = null;
+      onerror: (() => void) | null = null;
+      onclose: (() => void) | null = null;
+
+      constructor(url: string) {
+        if (new URL(url).pathname === '/ws/control') FakeWebSocket.shell = this;
+      }
+
+      close(): void {
+        this.closed = true;
+        this.readyState = 3;
+      }
+
+      send(value: string): void { this.sent.push(value); }
+    }
+    vi.stubGlobal('window', {
+      location: { href: 'http://composer.test/' },
+      requestAnimationFrame: vi.fn(),
+      cancelAnimationFrame: vi.fn(),
+    });
+    vi.stubGlobal('WebSocket', FakeWebSocket);
+
+    const source = new HeadlessStateSource();
+    source.setEnabled(true);
+    synchronizeControl(FakeWebSocket.shell);
+    receiveControlSnapshot(FakeWebSocket.shell, wireState(1));
+    vi.advanceTimersByTime(HEADLESS_SHELL_PUBLICATION_MS);
+    expect(source.getShellSnapshot().error).toBeNull();
+
+    receiveHeartbeat(FakeWebSocket.shell, 3, '2', CONTROL_SESSION_ID, 2);
+
+    expect(FakeWebSocket.shell.closed).toBe(false);
+    expect(JSON.parse(FakeWebSocket.shell.sent.at(-1)!)).toMatchObject({
+      message_kind: 'heartbeat_echo',
+      challenge_sequence: '3',
+    });
+    expect(source.getShellSnapshot().error).toBe(
+      'Control state is synchronizing; commands are disabled.',
+    );
+    expect(source.getShellSnapshot()).toMatchObject({
+      transportStatus: 'connected',
+      transportError: null,
+      semanticStatus: 'synchronizing',
+      semanticReason: 'control_projection_synchronizing',
+    });
+
+    receiveControlSnapshot(FakeWebSocket.shell, wireState(2));
+
+    expect(FakeWebSocket.shell.closed).toBe(false);
+    expect(source.getShellSnapshot().error).toBeNull();
+    source.dispose();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('classifies missing heartbeat independently during initial synchronization', () => {
     vi.useFakeTimers();
     class FakeWebSocket {
       static readonly OPEN = 1;
@@ -1187,7 +1459,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     const source = new HeadlessStateSource();
     source.setEnabled(true);
     receiveControl(FakeWebSocket.shell, {
-      schema_version: 'manyforge.execution_control.v1',
+      schema_version: 'manyforge.execution_control.v2',
       message_kind: 'server_hello',
       receiver_incarnation: 'headless.receiver.1',
       control_session_id: CONTROL_SESSION_ID,
@@ -1202,8 +1474,69 @@ describe('HeadlessStateSource delivery scheduling', () => {
     expect(FakeWebSocket.shell.closed).toBe(false);
     expect(source.getShellSnapshot()).toMatchObject({
       snapshot: null,
-      error: 'Control state synchronization is delayed; commands are disabled.',
+      error: 'Control connection is stale; commands are disabled.',
     });
+    source.dispose();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('reports one durable disconnect episode after the same browser reconnects', () => {
+    vi.useFakeTimers();
+    class FakeWebSocket {
+      static readonly OPEN = 1;
+      static instances: FakeWebSocket[] = [];
+      readonly sent: string[] = [];
+      readyState = FakeWebSocket.OPEN;
+      onopen: (() => void) | null = null;
+      onmessage: ((message: MessageEvent) => void) | null = null;
+      onerror: (() => void) | null = null;
+      onclose: (() => void) | null = null;
+
+      constructor() { FakeWebSocket.instances.push(this); }
+      send(value: string): void { this.sent.push(value); }
+      close(): void { this.readyState = 3; }
+      fail(): void {
+        this.readyState = 3;
+        this.onclose?.();
+      }
+    }
+    vi.stubGlobal('window', {
+      location: { href: 'http://composer.test/' },
+      requestAnimationFrame: vi.fn(),
+      cancelAnimationFrame: vi.fn(),
+    });
+    let retainedIdentity: string | null = null;
+    vi.stubGlobal('localStorage', {
+      getItem: () => retainedIdentity,
+      setItem: (_key: string, value: string) => { retainedIdentity = value; },
+    });
+    vi.stubGlobal('WebSocket', FakeWebSocket);
+
+    const source = new HeadlessStateSource();
+    source.setEnabled(true);
+    const first = FakeWebSocket.instances[0]!;
+    synchronizeControl(first);
+    receiveControlSnapshot(first, wireState(1));
+    first.fail();
+    expect(source.getShellSnapshot().error).toContain('disconnected');
+
+    vi.advanceTimersByTime(1_000);
+    const replacement = FakeWebSocket.instances[1]!;
+    replacement.onopen?.();
+    synchronizeControl(replacement);
+    receiveHeartbeat(replacement, 3, '3');
+    receiveControlSnapshot(replacement, wireState(1));
+    const transitions = replacement.sent
+      .map((value) => JSON.parse(value) as Record<string, unknown>)
+      .filter((value) => value.message_kind === 'client_incident');
+    expect(transitions.map((value) => ({
+      kind: value.incident_kind,
+      phase: value.phase,
+    }))).toEqual([
+      { kind: 'control_disconnected', phase: 'activated' },
+      { kind: 'control_disconnected', phase: 'resolved' },
+    ]);
+    expect(source.getShellSnapshot().error).toBeNull();
     source.dispose();
     expect(vi.getTimerCount()).toBe(0);
   });
@@ -1289,8 +1622,29 @@ describe('HeadlessStateSource delivery scheduling', () => {
     const command = JSON.parse(FakeWebSocket.shell.sent.at(-1)!) as {
       client_sequence: string;
     };
+    for (const draftRevision of [2, 3]) {
+      receiveControl(FakeWebSocket.shell, {
+        schema_version: 'manyforge.execution_control.v2',
+        message_kind: 'delta',
+        control_session_id: CONTROL_SESSION_ID,
+        server_sequence: nextControlServerSequence(FakeWebSocket.shell),
+        received_client_sequence: command.client_sequence,
+        event_class: 'cold',
+        control: null,
+        shell: {
+          schema_version: 'manyforge.composer_headless_state.v2',
+          complete: false,
+          receiver_epoch: 'receiver.epoch.1',
+          snapshot_sequence: draftRevision + 1,
+          draft_identity: {
+            draft_id: 'draft-1', draft_revision: draftRevision,
+          },
+        },
+      });
+    }
+    expect(source.getShellSnapshot().snapshot?.draftIdentity.draftRevision).toBe(1);
     receiveControl(FakeWebSocket.shell, {
-      schema_version: 'manyforge.execution_control.v1',
+      schema_version: 'manyforge.execution_control.v2',
       message_kind: 'command_receipt',
       control_session_id: CONTROL_SESSION_ID,
       server_sequence: nextControlServerSequence(FakeWebSocket.shell),
@@ -1320,7 +1674,174 @@ describe('HeadlessStateSource delivery scheduling', () => {
       receivedMonotonicNs: '100',
       emittedMonotonicNs: '200',
     });
+    await Promise.resolve();
+    vi.advanceTimersByTime(HEADLESS_SHELL_PUBLICATION_MS);
     expect(source.getShellSnapshot().snapshot?.programCycle.state).toBe(before);
+    expect(source.getShellSnapshot().snapshot?.draftIdentity.draftRevision).toBe(3);
+    source.dispose();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('fails closed once for unconfirmed delivery until a fresh session snapshot', async () => {
+    vi.useFakeTimers();
+    class FakeWebSocket {
+      static readonly OPEN = 1;
+      static instances: FakeWebSocket[] = [];
+      readonly sent: string[] = [];
+      readyState = FakeWebSocket.OPEN;
+      onopen: (() => void) | null = null;
+      onmessage: ((message: MessageEvent) => void) | null = null;
+      onerror: (() => void) | null = null;
+      onclose: (() => void) | null = null;
+
+      constructor() { FakeWebSocket.instances.push(this); }
+
+      close(): void {
+        if (this.readyState !== FakeWebSocket.OPEN) return;
+        this.readyState = 3;
+        this.onclose?.();
+      }
+      send(value: string): void { this.sent.push(value); }
+    }
+    vi.stubGlobal('window', {
+      location: { href: 'http://composer.test/' },
+      requestAnimationFrame: vi.fn(),
+      cancelAnimationFrame: vi.fn(),
+    });
+    vi.stubGlobal('WebSocket', FakeWebSocket);
+
+    const source = new HeadlessStateSource();
+    source.setEnabled(true);
+    const first = FakeWebSocket.instances[0]!;
+    synchronizeControl(first);
+    receiveControlSnapshot(first, wireState(1));
+    (source as unknown as { clearControlHeartbeatWatch: () => void })
+      .clearControlHeartbeatWatch();
+    const pending = source.sendExecutionCommand(
+      'program_run', { scenario_id: 'lite6' }, 'correlation.unconfirmed-1',
+    );
+    const rejection = expect(pending).rejects.toThrow(
+      'Command delivery is unconfirmed',
+    );
+
+    vi.advanceTimersByTime(1_000);
+    await rejection;
+    expect(first.readyState).toBe(3);
+    const activated = first.sent
+      .map((value) => JSON.parse(value) as Record<string, unknown>)
+      .find((value) => value.message_kind === 'client_incident');
+    expect(activated).toMatchObject({
+      incident_kind: 'command_delivery_unconfirmed',
+      phase: 'activated',
+    });
+
+    vi.advanceTimersByTime(1_000);
+    const replacement = FakeWebSocket.instances[1]!;
+    replacement.onopen?.();
+    synchronizeControl(replacement, 'control-session.test-2');
+    expect(source.getShellSnapshot().error).not.toBeNull();
+    receiveControlSnapshot(replacement, wireState(1), 'control-session.test-2');
+    expect(replacement.sent.some((value) => (
+      JSON.parse(value).incident_kind === 'command_delivery_unconfirmed'
+      && JSON.parse(value).phase === 'resolved'
+    ))).toBe(false);
+    receiveHeartbeat(replacement, 3, '4', 'control-session.test-2');
+    expect(source.getShellSnapshot().error).toBeNull();
+    const transitions = replacement.sent
+      .map((value) => JSON.parse(value) as Record<string, unknown>)
+      .filter((value) => value.message_kind === 'client_incident');
+    expect(transitions).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        incident_kind: 'command_delivery_unconfirmed',
+        phase: 'resolved',
+        reason_code: 'client_incident_recovered',
+      }),
+    ]));
+    source.dispose();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('keeps a watermarked command pending while applying backend lifecycle', async () => {
+    vi.useFakeTimers();
+    class FakeWebSocket {
+      static readonly OPEN = 1;
+      static shell: FakeWebSocket;
+      readonly sent: string[] = [];
+      readyState = FakeWebSocket.OPEN;
+      onopen: (() => void) | null = null;
+      onmessage: ((message: MessageEvent) => void) | null = null;
+      onerror: (() => void) | null = null;
+      onclose: (() => void) | null = null;
+
+      constructor(url: string) {
+        if (new URL(url).pathname === '/ws/control') FakeWebSocket.shell = this;
+      }
+      close(): void { this.readyState = 3; }
+      send(value: string): void { this.sent.push(value); }
+    }
+    vi.stubGlobal('window', {
+      location: { href: 'http://composer.test/' },
+      requestAnimationFrame: vi.fn(),
+      cancelAnimationFrame: vi.fn(),
+    });
+    vi.stubGlobal('WebSocket', FakeWebSocket);
+
+    const source = new HeadlessStateSource();
+    source.setEnabled(true);
+    const socket = FakeWebSocket.shell;
+    synchronizeControl(socket);
+    receiveControlSnapshot(socket, wireState(1));
+    const pending = source.sendExecutionCommand(
+      'program_run', { scenario_id: 'lite6' }, 'correlation.receipt-missing-1',
+    );
+    const command = JSON.parse(socket.sent.at(-1)!) as { client_sequence: string };
+    receiveHeartbeat(socket, 3, command.client_sequence);
+    (source as unknown as { clearControlHeartbeatWatch: () => void })
+      .clearControlHeartbeatWatch();
+    let settled = false;
+    void pending.finally(() => { settled = true; });
+
+    vi.advanceTimersByTime(1_000);
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(socket.readyState).toBe(FakeWebSocket.OPEN);
+    expect(source.getShellSnapshot().error).toBeNull();
+
+    const resetting = wireState(2);
+    (resetting.program_cycle as Record<string, unknown>).state = 'resetting';
+    (resetting.program_cycle as Record<string, unknown>).reset_phase = 'stopping';
+    receiveControlSnapshot(socket, resetting);
+    vi.advanceTimersByTime(HEADLESS_SHELL_PUBLICATION_MS);
+    expect(source.getShellSnapshot().snapshot?.programCycle.state).toBe('resetting');
+    expect(settled).toBe(false);
+
+    receiveControl(socket, {
+      schema_version: 'manyforge.execution_control.v2',
+      message_kind: 'command_receipt',
+      control_session_id: CONTROL_SESSION_ID,
+      server_sequence: nextControlServerSequence(socket),
+      received_client_sequence: command.client_sequence,
+      emitted_monotonic_ns: '200',
+      receipt: {
+        schema_version: 'manyforge.execution_command_receipt.v1',
+        correlation_id: 'correlation.receipt-missing-1',
+        control_session_id: CONTROL_SESSION_ID,
+        client_sequence: command.client_sequence,
+        receiver_incarnation: 'headless.receiver.1',
+        received_server_sequence: '10',
+        received_monotonic_ns: '100',
+        disposition: 'received',
+        code: 'program_run_received',
+        semantic_owner_epoch: 'runner.epoch.1',
+        execution_control_revision: 2,
+        current_identity: { cycle_generation: 1 },
+      },
+      result: null,
+    });
+    await expect(pending).resolves.toMatchObject({
+      correlationId: 'correlation.receipt-missing-1',
+      disposition: 'received',
+    });
     source.dispose();
     expect(vi.getTimerCount()).toBe(0);
   });

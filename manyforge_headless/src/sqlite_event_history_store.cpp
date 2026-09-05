@@ -326,7 +326,7 @@ public:
 
   IEventHistoryStore::AppendStatus Append(const HistorianEvent &event) {
     const auto event_json =
-        content_identity::canonical_json(HistorianEventValue(event));
+        content_identity::canonical_json(HistorianPersistenceValue(event));
     const auto payload_json = content_identity::canonical_json(event.payload);
     const auto payload_digest = content_identity::sha256_digest(payload_json);
     const auto event_digest = content_identity::sha256_digest(event_json);
@@ -460,7 +460,7 @@ public:
       Require(
           event.event_id == event_id &&
               content_identity::sha256_digest(content_identity::canonical_json(
-                  HistorianEventValue(event))) == event_digest,
+                  HistorianPersistenceValue(event))) == event_digest,
           "historian_storage_corrupt",
           "historian event identity or digest is invalid");
       events.push_back(

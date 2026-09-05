@@ -28,13 +28,11 @@ describe('viewer presentation and performance', () => {
     expect(isSoftwareRenderer('NVIDIA Tegra')).toBe(false);
     expect(selectViewerPresentationProfile(true, 2)).toEqual({
       effectiveDpr: 1,
-      antialias: true,
-      preserveDrawingBuffer: true,
+      antialias: false,
     });
     expect(selectViewerPresentationProfile(false, 2)).toEqual({
       effectiveDpr: 1.5,
       antialias: true,
-      preserveDrawingBuffer: false,
     });
   });
 

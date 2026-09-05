@@ -891,7 +891,7 @@ def headless_client() -> (
         elif path.endswith("/acknowledge") or path.endswith("/acknowledge-all"):
             payload = {"schema_version": "manyforge.headless_api_mutation_response.v1"}
         elif path == "/api/execution/history":
-            payload = {"schema_version": "manyforge.historian_page.v1", "events": []}
+            payload = {"schema_version": "manyforge.historian_summary_page.v1", "events": []}
         elif path == "/api/execution/history/health":
             payload = {
                 "schema_version": "manyforge.historian_health.v1",
@@ -1259,30 +1259,26 @@ def _caller() -> dict[str, Any]:
     }
 
 
-def test_component_overview_route_reuses_the_shared_browser_projection() -> None:
+def test_component_overview_route_reads_one_fresh_headless_projection() -> None:
     class Client:
         calls = 0
 
-        def component_overview(self) -> dict[str, Any]:
+        def component_overview_payload(self) -> bytes:
             self.calls += 1
-            return {**_component_overview(), "summary_label": "cold read"}
+            return json.dumps(
+                {**_component_overview(), "summary_label": "cold read"}
+            ).encode("utf-8")
 
     client = Client()
-    shared: list[dict[str, Any] | None] = [_component_overview()]
     app = FastAPI()
     app.include_router(
         create_headless_router(
             client,  # type: ignore[arg-type]
             ComposerState(),
-            shared_component_overview=lambda: shared[0],
         )
     )
 
     with TestClient(app) as composer:
-        assert composer.get("/api/component-overview").json() == shared[0]
-        assert client.calls == 0
-
-        shared[0] = None
         response = composer.get("/api/component-overview")
         assert response.status_code == 200
         assert response.json()["summary_label"] == "cold read"

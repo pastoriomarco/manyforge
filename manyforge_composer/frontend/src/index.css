@@ -592,6 +592,15 @@ button:disabled {
   margin-bottom: 0.55rem;
 }
 
+.operator-alarm-panel.severity-warning {
+  border-color: #7d673e;
+  background: rgb(42 32 15 / 97%);
+}
+
+.operator-alarm-panel.severity-warning summary {
+  color: #f0d59f;
+}
+
 .standing-alarm-chip {
   padding: 0.2rem 0.45rem;
   border: 1px solid #7d673e;
@@ -7759,8 +7768,15 @@ svg.viewer-camera-icon {
 }
 
 .history-event.selected {
-  border-color: #66b8ca;
+  outline: 1px solid #66b8ca;
+  outline-offset: 1px;
   background: #102a35;
+}
+
+.history-page-navigation {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
 }
 
 .history-detail {
