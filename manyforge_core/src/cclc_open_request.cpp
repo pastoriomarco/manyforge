@@ -623,7 +623,7 @@ template <typename StrongCounter>
 [[nodiscard]] CanonicalValue lifecycle_acceptance_value(
     const ComponentLifecycleAcceptedDTO& value) {
   return CanonicalValue(CanonicalValue::Object{
-      {"accepted_at_ns", safe_signed(value.accepted_at_ns)},
+      {"accepted_at_ns", content_identity::nonnegative_int64_value(value.accepted_at_ns)},
       {"component_lifecycle_generation",
        safe_unsigned(value.component_lifecycle_generation.value())},
       {"lifecycle_transaction_generation",
@@ -649,7 +649,7 @@ template <typename StrongCounter>
   }
   return CanonicalValue(CanonicalValue::Object{
       {"acceptance", lifecycle_acceptance_value(value.acceptance)},
-      {"accepted_at_ns", safe_signed(value.accepted_at_ns)},
+      {"accepted_at_ns", content_identity::nonnegative_int64_value(value.accepted_at_ns)},
       {"controllable_component_id",
        CanonicalValue(value.accepted_intent.controllable_component_id.value())},
       {"current_state", value.current_state.has_value()
@@ -657,7 +657,7 @@ template <typename StrongCounter>
                             : CanonicalValue(nullptr)},
       {"domains", CanonicalValue(std::move(domains))},
       {"error", value.error.has_value() ? error_value(*value.error) : CanonicalValue(nullptr)},
-      {"latest_updated_at_ns", safe_signed(value.latest_updated_at_ns)},
+      {"latest_updated_at_ns", content_identity::nonnegative_int64_value(value.latest_updated_at_ns)},
       {"phase", CanonicalValue(std::string(lifecycle_phase(value.phase)))},
       {"previous_state", value.previous_state.has_value()
                              ? CanonicalValue(std::string(to_string(*value.previous_state)))
@@ -683,7 +683,7 @@ template <typename StrongCounter>
 
 [[nodiscard]] CanonicalValue route_acceptance_value(const RouteSelectionAcceptedDTO& value) {
   return CanonicalValue(CanonicalValue::Object{
-      {"accepted_at_ns", safe_signed(value.accepted_at_ns)},
+      {"accepted_at_ns", content_identity::nonnegative_int64_value(value.accepted_at_ns)},
       {"candidate_active_control_configuration_generation",
        safe_unsigned(value.candidate_active_control_configuration_generation.value())},
       {"candidate_active_control_configuration_id",
@@ -710,12 +710,12 @@ template <typename StrongCounter>
   }
   return CanonicalValue(CanonicalValue::Object{
       {"acceptance", route_acceptance_value(value.acceptance)},
-      {"accepted_at_ns", safe_signed(value.accepted_at_ns)},
+      {"accepted_at_ns", content_identity::nonnegative_int64_value(value.accepted_at_ns)},
       {"affected_control_binding_ids", CanonicalValue(std::move(bindings))},
       {"affected_controller_role_ids", CanonicalValue(std::move(controllers))},
       {"effect", CanonicalValue(std::string(route_effect(value.effect)))},
       {"error", value.error.has_value() ? error_value(*value.error) : CanonicalValue(nullptr)},
-      {"latest_updated_at_ns", safe_signed(value.latest_updated_at_ns)},
+      {"latest_updated_at_ns", content_identity::nonnegative_int64_value(value.latest_updated_at_ns)},
       {"phase", CanonicalValue(std::string(route_phase(value.phase)))},
       {"reconciliation_required", CanonicalValue(value.reconciliation_required)},
       {"remaining_duration_ns", safe_signed(value.remaining_duration_ns)},

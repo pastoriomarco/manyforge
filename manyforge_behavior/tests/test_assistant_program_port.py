@@ -1310,12 +1310,17 @@ def test_unbind_retries_durable_cancellation_before_releasing_a_model_task() -> 
         port.close()
 
 
-def test_unbind_retries_the_exact_completed_outcome_after_audit_failure() -> None:
+@pytest.mark.parametrize("timestamp_ns", [
+    9_007_199_254_740_991, 9_007_199_254_740_992, 9_007_199_254_740_993,
+    105 * 86400 * 10**9, 31 * 366 * 86400 * 10**9,
+])
+def test_unbind_retries_the_exact_completed_outcome_after_audit_failure(timestamp_ns) -> None:
     audit = _AuditSink(failures=1)
     port = ProgramAssistantPort(
         _ModelTransport([_selected_response()]),
         HeadlessProgramSceneSource(_SceneTransport()),
         audit_sink=audit,
+        clock_ns=lambda: timestamp_ns,
     )
     try:
         port.bind(
@@ -1352,7 +1357,8 @@ def test_unbind_retries_the_exact_completed_outcome_after_audit_failure() -> Non
 
         assert [record["outcome"] for record in audit.records] == ["success"]
         assert audit.attempted_records[0] == audit.records[0]
-        assert type(audit.records[0]["occurred_at_ns"]) is int
+        expected_time = timestamp_ns if timestamp_ns <= 9_007_199_254_740_991 else str(timestamp_ns)
+        assert audit.records[0]["occurred_at_ns"] == expected_time
         assert audit.records[0]["occurred_at_wall"].endswith("Z")
         assert audit.records[0]["response_digest"] is not None
         assert audit.records[0]["validated_output_digest"] is not None

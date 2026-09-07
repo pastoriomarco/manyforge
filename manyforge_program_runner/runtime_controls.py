@@ -16,12 +16,18 @@ import unicodedata
 
 import rfc8785
 
+from manyforge_behavior.json_scalars import nonnegative_int64, nonnegative_int64_value
 
-RUNTIME_CONTROL_SCHEMA: Final = "manyforge.program_runtime_controls.v1"
+
+RUNTIME_CONTROL_SCHEMA: Final = "manyforge.program_runtime_controls.v2"
+_LEGACY_CONTROL_SCHEMA: Final = "manyforge.program_runtime_controls.v1"
 RECOVERY_OFFER_SCHEMA: Final = "manyforge.cycle_recovery_offer.v2"
 _MAX_OVERRIDES: Final = 1_024
-_MAX_AUDIT: Final = 4_096
+_MAX_AUDIT: Final = 256
+_MAX_REVISION: Final = 9_007_199_254_740_991
 _MAX_PROMOTIONS: Final = 1_024
+# One entry per captured Program node, never per request/attempt.
+_MAX_RETRY_NODES: Final = 100_000
 _MAX_RETRIES_PER_NODE: Final = 255
 _RECOVERY_FENCE_FIELDS: Final = (
     "program_generation",
@@ -129,11 +135,16 @@ def manual_result_availability(
     if intervention.owner_task_id is None:
         return True, None
     owner = intervention.owner_assessment
-    if not isinstance(owner, Mapping) or owner.get(
-        "acknowledged_non_moving"
-    ) is not True:
+    if (
+        not isinstance(owner, Mapping)
+        or owner.get("acknowledged_non_moving") is not True
+    ):
         return False, "manual_result_owner_not_acknowledged"
-    valid_until_ns = owner.get("observed_state_valid_until_ns")
+    try:
+        raw_deadline = owner.get("observed_state_valid_until_ns", 0)
+        valid_until_ns = nonnegative_int64(raw_deadline)
+    except ValueError:
+        return False, "manual_result_owner_observation_invalid"
     if (
         type(valid_until_ns) is int
         and valid_until_ns > 0
@@ -190,6 +201,12 @@ class ProgramRuntimeControls:
     def program_run_id(self) -> str:
         return self._capture["program_run_id"]
 
+    @property
+    def revision(self) -> int:
+        """Read the owner change key without copying overrides or audit data."""
+        with self._lock:
+            return self._revision
+
     @classmethod
     def restore(
         cls,
@@ -198,10 +215,12 @@ class ProgramRuntimeControls:
     ) -> "ProgramRuntimeControls":
         """Restore the latest journaled control state for one retained run."""
 
-        if not isinstance(snapshot, Mapping) or snapshot.get(
-            "schema_version"
-        ) != RUNTIME_CONTROL_SCHEMA:
+        if not isinstance(snapshot, Mapping) or snapshot.get("schema_version") not in {
+            RUNTIME_CONTROL_SCHEMA,
+            _LEGACY_CONTROL_SCHEMA,
+        }:
             raise ValueError("retained runtime controls have an unsupported schema")
+        legacy = snapshot["schema_version"] == _LEGACY_CONTROL_SCHEMA
         if set(snapshot) != _SNAPSHOT_FIELDS:
             raise ValueError("retained runtime controls have an invalid shape")
         fences = snapshot.get("recovery_fences")
@@ -213,16 +232,16 @@ class ProgramRuntimeControls:
         audit = snapshot.get("audit")
         if (
             type(revision) is not int
-            or revision < 1
+            or not 1 <= revision <= _MAX_REVISION
             or snapshot.get("program_run_id") != instance.program_run_id
             or not isinstance(overrides, list)
             or len(overrides) > _MAX_OVERRIDES
             or not isinstance(proposals, list)
             or len(proposals) > _MAX_PROMOTIONS
             or not isinstance(retry_counts, dict)
-            or len(retry_counts) > _MAX_OVERRIDES
+            or len(retry_counts) > (1_024 if legacy else _MAX_RETRY_NODES)
             or not isinstance(audit, list)
-            or len(audit) > _MAX_AUDIT
+            or len(audit) > (4_096 if legacy else _MAX_AUDIT)
         ):
             raise ValueError("retained runtime controls exceed their bounds")
         restored_overrides: dict[str, dict[str, Any]] = {}
@@ -233,7 +252,7 @@ class ProgramRuntimeControls:
                 or row.get("schema_version") != "manyforge.runtime_override.v1"
                 or not _bounded_text(row.get("override_id"))
                 or type(row.get("override_revision")) is not int
-                or row["override_revision"] < 1
+                or not 1 <= row["override_revision"] <= revision
                 or row.get("program_run_id") != instance.program_run_id
                 or any(
                     row.get(field) != instance._capture[field]
@@ -310,74 +329,83 @@ class ProgramRuntimeControls:
                 )
         expected_flags = {
             "has_active_runtime_overrides": any(
-                row["status"] == "active"
-                for row in restored_overrides.values()
+                row["status"] == "active" for row in restored_overrides.values()
             ),
             "has_staged_runtime_overrides": any(
-                row["status"] == "staged"
-                for row in restored_overrides.values()
+                row["status"] == "staged" for row in restored_overrides.values()
             ),
             "has_stale_runtime_overrides": any(
-                row["status"] == "stale"
-                for row in restored_overrides.values()
+                row["status"] == "stale" for row in restored_overrides.values()
             ),
         }
-        if any(snapshot.get(field) is not expected for field, expected in expected_flags.items()):
+        if any(
+            snapshot.get(field) is not expected
+            for field, expected in expected_flags.items()
+        ):
             raise ValueError("retained runtime-control flags are divergent")
         restored_retries: dict[str, int] = {}
         for node_instance_id, count in retry_counts.items():
             if (
-                not isinstance(node_instance_id, str)
-                or not node_instance_id
+                not _bounded_text(node_instance_id)
                 or type(count) is not int
                 or not 0 <= count <= _MAX_RETRIES_PER_NODE
             ):
                 raise ValueError("retained runtime retry count is invalid")
             restored_retries[node_instance_id] = count
-        for index, event in enumerate(audit, start=1):
+        expected_length = revision - 1 if legacy else min(revision - 1, _MAX_AUDIT)
+        if len(audit) != expected_length:
+            raise ValueError("retained runtime-control revision is divergent")
+        for index, event in enumerate(audit, start=revision - len(audit)):
             if (
                 not isinstance(event, dict)
+                or type(event.get("event_revision")) is not int
                 or event.get("event_revision") != index
                 or not isinstance(event.get("kind"), str)
                 or not event["kind"]
             ):
                 raise ValueError("retained runtime-control audit is invalid")
-        if revision != len(audit) + 1:
-            raise ValueError("retained runtime-control revision is divergent")
         instance._revision = revision
         instance._overrides = restored_overrides
         instance._promotion_proposals = restored_proposals
         instance._retry_counts = restored_retries
-        instance._audit = deepcopy(audit)
+        instance._audit = deepcopy(audit[-_MAX_AUDIT:])
         return instance
 
-    def _event(
-        self, kind: str, *, reserved_after: int = 1, **facts: Any
-    ) -> None:
-        self.require_audit_capacity(reserved_after=reserved_after)
+    def _event(self, kind: str, *, reserved_after: int = 1, **facts: Any) -> None:
+        self.require_event_revisions(reserved_after=reserved_after)
         self._audit.append(
             {
-                "event_revision": len(self._audit) + 1,
+                "event_revision": self._revision,
                 "kind": kind,
                 **deepcopy(facts),
             }
         )
+        del self._audit[:-_MAX_AUDIT]
         self._revision += 1
 
-    def require_audit_capacity(
+    def require_event_revisions(
         self, *, events: int = 1, reserved_after: int = 1
     ) -> None:
-        """Fail before a control effect when its audit record cannot fit."""
+        """Check exact revision arithmetic before effect, not lifetime history size."""
 
         if type(events) is not int or events < 1:
             raise ValueError("runtime-control audit event count is invalid")
         if type(reserved_after) is not int or not 0 <= reserved_after <= 1:
             raise ValueError("runtime-control audit reservation is invalid")
-        if len(self._audit) + events > _MAX_AUDIT - reserved_after:
-            raise ProgramRuntimeControlError(
-                "program_runtime_control_history_full",
-                "bounded runtime-control history is full",
-            )
+        with self._lock:
+            if self._revision + events + reserved_after > _MAX_REVISION:
+                raise ProgramRuntimeControlError(
+                    "program_runtime_control_revision_exhausted",
+                    "runtime-control revision cannot advance exactly",
+                )
+
+    def _retire_resolved_overrides(self) -> None:
+        protected = {row["override_id"] for row in self._promotion_proposals.values()}
+        self._overrides = {
+            key: row
+            for key, row in self._overrides.items()
+            if row["status"] in {"staged", "active"} or key in protected
+        }
 
     def stage_override(
         self,
@@ -413,14 +441,21 @@ class ProgramRuntimeControls:
         override_id = _digest("manyforge.runtime_override.v1", identity)
         with self._lock:
             current = self._overrides.get(override_id)
-            if current is not None:
+            if current is not None and current["status"] in {"staged", "active"}:
                 return deepcopy(current)
+            self.require_event_revisions()
+            if current is not None:
+                current["status"] = "staged"
+                current["override_revision"] += 1
+                self._event("runtime_override_staged", override_id=override_id)
+                return deepcopy(current)
+            if len(self._overrides) >= _MAX_OVERRIDES:
+                self._retire_resolved_overrides()
             if len(self._overrides) >= _MAX_OVERRIDES:
                 raise ProgramRuntimeControlError(
                     "program_runtime_override_capacity_full",
                     "bounded runtime-override capacity is full",
                 )
-            self.require_audit_capacity()
             record = {
                 "schema_version": "manyforge.runtime_override.v1",
                 "override_id": override_id,
@@ -451,16 +486,30 @@ class ProgramRuntimeControls:
                     "program_runtime_override_stale",
                     "only a staged runtime override can be activated",
                 )
-            self.require_audit_capacity()
+            self.require_event_revisions()
             activator(
                 node_instance_id=record["node_instance_id"],
                 node_attempt_id=record["node_attempt_id"],
                 parameter_id=record["parameter_id"],
                 value=record["value"],
             )
+            superseded = []
+            for prior in self._overrides.values():
+                if (
+                    prior["status"] == "active"
+                    and prior["node_instance_id"] == record["node_instance_id"]
+                    and prior["parameter_id"] == record["parameter_id"]
+                ):
+                    prior["status"] = "cleared"
+                    prior["override_revision"] += 1
+                    superseded.append(prior["override_id"])
             record["status"] = "active"
             record["override_revision"] += 1
-            self._event("runtime_override_activated", override_id=override_id)
+            self._event(
+                "runtime_override_activated",
+                override_id=override_id,
+                superseded_override_ids=superseded,
+            )
             return deepcopy(record)
 
     def clear_override(self, override_id: str, *, clearer) -> dict[str, Any]:
@@ -468,7 +517,7 @@ class ProgramRuntimeControls:
             record = self._override(override_id)
             if record["status"] == "cleared":
                 return deepcopy(record)
-            self.require_audit_capacity()
+            self.require_event_revisions()
             if record["status"] == "active":
                 clearer(
                     node_instance_id=record["node_instance_id"],
@@ -522,7 +571,7 @@ class ProgramRuntimeControls:
                     "program_runtime_promotion_capacity_full",
                     "bounded runtime-override promotion capacity is full",
                 )
-            self.require_audit_capacity()
+            self.require_event_revisions()
             proposal = {
                 "schema_version": "manyforge.runtime_override_promotion.v1",
                 "proposal_id": proposal_id,
@@ -537,7 +586,13 @@ class ProgramRuntimeControls:
             )
             return deepcopy(proposal)
 
-    def mark_reset(self) -> None:
+    def mark_reset(
+        self,
+        *,
+        request_id: str | None = None,
+        correlation_id: str | None = None,
+        source_label: str | None = None,
+    ) -> None:
         with self._lock:
             changed = any(
                 override["status"] in {"staged", "active"}
@@ -546,9 +601,16 @@ class ProgramRuntimeControls:
                 proposal["status"] == "awaiting_reset"
                 for proposal in self._promotion_proposals.values()
             )
-            if not changed:
+            # A fresh transport request can resume the same owner Reset after
+            # a phase-write failure. It must not consume another revision or
+            # replace the original accepted transition's attribution.
+            recorded = bool(
+                self._audit
+                and self._audit[-1]["kind"] == "program_runtime_controls_reset"
+            )
+            if not changed and (request_id is None or recorded):
                 return
-            self.require_audit_capacity(reserved_after=0)
+            self.require_event_revisions(reserved_after=0)
             for override in self._overrides.values():
                 if override["status"] in {"staged", "active"}:
                     override["status"] = "stale"
@@ -557,18 +619,38 @@ class ProgramRuntimeControls:
                 if proposal["status"] == "awaiting_reset":
                     proposal["status"] = "ready"
             self._event(
-                "program_runtime_controls_reset", reserved_after=0
+                "program_runtime_controls_reset",
+                reserved_after=0,
+                request_id=request_id,
+                correlation_id=correlation_id,
+                source_label=source_label,
+                action_id="reset_cycle",
             )
 
-    def note_retry(self, node_instance_id: str) -> int:
+    def require_retry_capacity(self, node_instance_id: str) -> None:
+        """Preflight the captured node's retry allowance before owner effects."""
         with self._lock:
-            count = self._retry_counts.get(node_instance_id, 0) + 1
-            if count > _MAX_RETRIES_PER_NODE:
+            if not _bounded_text(node_instance_id):
+                raise ValueError("retry requires one exact captured node identity")
+            if self._retry_counts.get(node_instance_id, 0) >= _MAX_RETRIES_PER_NODE:
                 raise ProgramRuntimeControlError(
                     "program_runtime_retry_limit_reached",
                     "the retained retry count reached its fixed bound",
                 )
-            self.require_audit_capacity()
+            if (
+                node_instance_id not in self._retry_counts
+                and len(self._retry_counts) >= _MAX_RETRY_NODES
+            ):
+                raise ProgramRuntimeControlError(
+                    "program_runtime_retry_nodes_full",
+                    "retry identities exceed the maximum captured Program node count",
+                )
+
+    def note_retry(self, node_instance_id: str) -> int:
+        with self._lock:
+            self.require_retry_capacity(node_instance_id)
+            self.require_event_revisions()
+            count = self._retry_counts.get(node_instance_id, 0) + 1
             self._retry_counts[node_instance_id] = count
             self._event(
                 "program_node_retry",
@@ -623,24 +705,21 @@ class ProgramRuntimeControls:
             # tick after the addressed owner releases an ordinary Stop. That
             # stale internal row is not another operator recovery offer.
             return None
-        valid_until_ns = (
-            owner.get("observed_state_valid_until_ns")
-            if isinstance(owner, dict)
-            and type(owner.get("observed_state_valid_until_ns")) is int
-            and owner["observed_state_valid_until_ns"] > 0
-            else None
-        )
+        try:
+            valid_until_ns = (
+                nonnegative_int64(owner.get("observed_state_valid_until_ns", 0)) or None
+                if isinstance(owner, dict)
+                else None
+            )
+        except ValueError:
+            return None
         observation_current = (
             valid_until_ns is None or time.monotonic_ns() < valid_until_ns
         )
-        operator_stop_recovery = (
-            intervention.policy_parameter == "operator_stop_policy"
-        )
+        operator_stop_recovery = intervention.policy_parameter == "operator_stop_policy"
         if operator_stop_recovery:
             manual_result_enabled = False
-            manual_result_disabled_reason = (
-                "operator_stop_requires_owner_recovery"
-            )
+            manual_result_disabled_reason = "operator_stop_requires_owner_recovery"
         else:
             manual_result_enabled, manual_result_disabled_reason = (
                 manual_result_availability(intervention, policy)
@@ -683,8 +762,7 @@ class ProgramRuntimeControls:
                 {
                     "action_id": action_id,
                     "label_key": f"recovery.{action_id}",
-                    "requires_confirmation": action_id
-                    == "acknowledge_and_continue",
+                    "requires_confirmation": action_id == "acknowledge_and_continue",
                     "performs_backend_reset": False,
                     "enabled": enabled,
                     "disabled_reason_code": (
@@ -745,10 +823,7 @@ class ProgramRuntimeControls:
             operator_stop_recovery
             and observation_current
             and operator_stop_settled
-            and (
-                owner.get("retry_admissible") is True
-                or stop_fault_reset_required
-            )
+            and (owner.get("retry_admissible") is True or stop_fault_reset_required)
         )
         actions.append(
             {
@@ -791,13 +866,22 @@ class ProgramRuntimeControls:
         with self._lock:
             if self._offer_key == offer_key and self._offer is not None:
                 return deepcopy(self._offer)
+            if self._offer_revision >= _MAX_REVISION:
+                raise ProgramRuntimeControlError(
+                    "program_recovery_offer_revision_exhausted",
+                    "recovery-offer revision cannot advance exactly",
+                )
             self._offer_revision += 1
             result = {
                 "schema_version": RECOVERY_OFFER_SCHEMA,
                 "offer_id": _digest("manyforge.cycle_recovery_offer.v2", material),
                 "offer_revision": self._offer_revision,
-                "generated_at_ns": time.monotonic_ns(),
-                "valid_until_ns": valid_until_ns,
+                "generated_at_ns": nonnegative_int64_value(time.monotonic_ns()),
+                "valid_until_ns": (
+                    nonnegative_int64_value(valid_until_ns)
+                    if valid_until_ns is not None
+                    else None
+                ),
                 "kernel_assessment_revision": (
                     owner.get("assessment_revision", 0)
                     if isinstance(owner, dict)
@@ -810,18 +894,14 @@ class ProgramRuntimeControls:
                 ),
                 "operation_id": intervention.owner_task_id,
                 "operation_revision": (
-                    owner.get("operation_revision")
-                    if isinstance(owner, dict)
-                    else None
+                    owner.get("operation_revision") if isinstance(owner, dict) else None
                 ),
                 "program_run_id": identity.program_run_id,
                 "program_binding_id": self._capture["program_binding_id"],
                 "node_instance_id": identity.node_instance_id,
                 "node_attempt_id": identity.node_attempt_id,
                 "participants": (
-                    owner.get("participants", [])
-                    if isinstance(owner, dict)
-                    else []
+                    owner.get("participants", []) if isinstance(owner, dict) else []
                 ),
                 "graph_revision": self._capture["graph_revision"],
                 "retained_bundle_id": self._capture["retained_bundle_id"],
@@ -848,8 +928,7 @@ class ProgramRuntimeControls:
                 ),
                 "stop_certificate_id": (
                     owner.get("stop_certificate_id")
-                    if isinstance(owner, dict)
-                    and owner.get("stop_certificate_id")
+                    if isinstance(owner, dict) and owner.get("stop_certificate_id")
                     else None
                 ),
                 "stop_certificate_revision": (
@@ -863,9 +942,11 @@ class ProgramRuntimeControls:
                     "retry_ready"
                     if isinstance(owner, dict)
                     and owner.get("acknowledged_non_moving") is True
-                    else owner.get("status", "action_required")
-                    if isinstance(owner, dict)
-                    else "action_required"
+                    else (
+                        owner.get("status", "action_required")
+                        if isinstance(owner, dict)
+                        else "action_required"
+                    )
                 ),
                 "recovery_class": (
                     owner.get("recovery_class", "unknown_fault")
@@ -882,9 +963,7 @@ class ProgramRuntimeControls:
                 ),
                 "reason_code": intervention.reason_code,
                 "evidence_refs": (
-                    owner.get("evidence_refs", [])
-                    if isinstance(owner, dict)
-                    else []
+                    owner.get("evidence_refs", []) if isinstance(owner, dict) else []
                 ),
                 "policy": deepcopy(projected_policy),
             }

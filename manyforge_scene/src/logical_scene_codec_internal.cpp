@@ -619,12 +619,12 @@ ProviderEvidence(const core::SceneObjectProviderEvidenceDTO &value) {
       {"provider_source_epoch", CanonicalValue(value.provider_source_epoch)},
       {"provider_source_sequence",
        Unsigned(value.provider_source_sequence, "provider_source_sequence")},
-      {"received_at_ns", Integer(value.received_at_ns, "received_at_ns")},
+      {"received_at_ns", content_identity::nonnegative_int64_value(value.received_at_ns)},
   };
   if (value.source_timestamp_ns.has_value()) {
     object.emplace_back(
         "source_timestamp_ns",
-        Integer(*value.source_timestamp_ns, "source_timestamp_ns"));
+        content_identity::nonnegative_int64_value(*value.source_timestamp_ns));
   }
   if (value.source_freshness_budget_ns.has_value()) {
     object.emplace_back("source_freshness_budget_ns",
@@ -651,13 +651,13 @@ DecodeProviderEvidence(const CanonicalValue &value) {
       String(Member(value, "provider_source_epoch"), "provider_source_epoch"),
       DecodeUnsigned(Member(value, "provider_source_sequence"),
                      "provider_source_sequence"),
-      DecodeInteger(Member(value, "received_at_ns"), "received_at_ns"),
+      content_identity::parse_nonnegative_int64(Member(value, "received_at_ns")),
       std::nullopt,
       std::nullopt,
   };
   if (const auto *timestamp = value.find_object_member("source_timestamp_ns")) {
     result.source_timestamp_ns =
-        DecodeInteger(*timestamp, "source_timestamp_ns");
+        content_identity::parse_nonnegative_int64(*timestamp);
   }
   if (const auto *budget =
           value.find_object_member("source_freshness_budget_ns")) {

@@ -429,7 +429,7 @@ TEST(BoundedOperationControlExecutorTest,
   ASSERT_TRUE(result.result.has_value());
   EXPECT_FALSE(result.result->accepted);
   EXPECT_TRUE(result.result->prepared_resume_created);
-  EXPECT_TRUE(result.result->prepared_resume_cleanup_complete);
+  EXPECT_TRUE(result.result->prepared_resume_cleanup_finished);
   ASSERT_TRUE(result.result->error.has_value());
   EXPECT_EQ(result.result->error->details.at("reason"),
             "prepared_resume_superseded_during_prepare");

@@ -1,3 +1,4 @@
+import { parseNanoseconds } from '../types/nanoseconds';
 import type {
   CCLCAdmission,
   CCLCComponentExpectation,
@@ -519,7 +520,7 @@ function statusAt(
     'request_id', 'route_selection_transaction_generation',
     'route_selection_transaction_id', 'timeout_duration_ns',
   ], `${path}.acceptance`);
-  safeIntegerAt(acceptance.accepted_at_ns, `${path}.acceptance.accepted_at_ns`);
+  parseNanoseconds(acceptance.accepted_at_ns, `${path}.acceptance.accepted_at_ns`);
   safeIntegerAt(acceptance.timeout_duration_ns, `${path}.acceptance.timeout_duration_ns`);
   textAt(acceptance.request_id, `${path}.acceptance.request_id`);
   if (kind === 'lifecycle') {
@@ -581,8 +582,8 @@ function statusAt(
       ], `${path}.resulting_active_control_configuration`);
     }
   }
-  safeIntegerAt(row.accepted_at_ns, `${path}.accepted_at_ns`);
-  safeIntegerAt(row.latest_updated_at_ns, `${path}.latest_updated_at_ns`);
+  parseNanoseconds(row.accepted_at_ns, `${path}.accepted_at_ns`);
+  parseNanoseconds(row.latest_updated_at_ns, `${path}.latest_updated_at_ns`);
   safeIntegerAt(row.remaining_duration_ns, `${path}.remaining_duration_ns`);
   textAt(row.status_owner_epoch, `${path}.status_owner_epoch`);
   integerAt(row.status_sequence, `${path}.status_sequence`);

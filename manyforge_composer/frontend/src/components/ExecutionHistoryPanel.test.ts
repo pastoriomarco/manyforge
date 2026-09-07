@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it, vi } from 'vitest';
 import {
   ExecutionHistoryPanel,
-  filterExecutionHistoryEvents,
+  historyFilterQuery,
   type ExecutionHistoryEventView,
 } from './ExecutionHistoryPanel';
 import type { HistorianDetail } from '../types/headless';
@@ -31,52 +31,27 @@ const events: ExecutionHistoryEventView[] = [
 ];
 
 describe('execution history filtering', () => {
-  it('combines severity, execution, and text filters', () => {
-    expect(filterExecutionHistoryEvents(events, {
-      severity: 'error', eventType: '', channel: '', search: 'wall', executionId: 8,
-    }).map((event) => event.id)).toEqual(['3']);
-    expect(filterExecutionHistoryEvents(events, {
-      severity: 'warning', eventType: '', channel: '', search: '', executionId: 7,
-    }).map((event) => event.id)).toEqual(['2']);
+  it('sends every predicate to the backend without depending on loaded events or browser time', () => {
+    expect(historyFilterQuery({
+      severity: 'error', alarmView: 'acknowledgement', timeWindow: 'minute',
+      component: ' manyforge.alarm ', eventType: 'operator_alarm_acknowledged',
+      search: ' collision wall ', programRunId: 'run-1', operationId: 'operation-1',
+      correlations: { conditionId: 'condition-wall', actionSpanId: 'action-7' },
+    })).toEqual({
+      limit: 32, recentSeconds: 60, severities: ['ERROR', 'CRITICAL'],
+      alarmPhase: 'acknowledged', components: ['manyforge.alarm'],
+      eventTypes: ['operator_alarm_acknowledged'], search: 'collision wall',
+      programRunId: 'run-1', operationId: 'operation-1',
+      conditionId: 'condition-wall', actionSpanId: 'action-7',
+    });
   });
 
-  it('uses an adapter-supplied alarm phase instead of old event IDs', () => {
-    expect(filterExecutionHistoryEvents(events, {
-      severity: 'all', eventType: '', channel: '', search: '', alarmView: 'lifecycle',
-    }).map((event) => event.id)).toEqual(['4']);
-    expect(filterExecutionHistoryEvents(events, {
-      severity: 'all', eventType: '', channel: '', search: '', alarmView: 'raw',
-    }).map((event) => event.id)).toEqual(['1', '2', '3']);
-  });
-
-  it('combines retained event type, channel, and condition identity filters', () => {
-    expect(filterExecutionHistoryEvents(events, {
-      severity: 'all',
-      eventType: 'alarm_event',
-      channel: 'alarm',
-      search: '',
-      conditionIdentity: 'condition-wall',
-    }).map((event) => event.id)).toEqual(['4']);
-    expect(filterExecutionHistoryEvents(events, {
-      severity: 'all',
-      eventType: 'alarm_event',
-      channel: 'alarm',
-      search: '',
-      conditionIdentity: 'condition-missing',
-    })).toEqual([]);
-  });
-
-  it('filters exact time, Program-run, and operation identities', () => {
-    expect(filterExecutionHistoryEvents(events, {
-      severity: 'all',
-      eventType: '',
-      channel: '',
-      search: '',
-      startNs: '1',
-      endNs: '1',
-      programRunId: 'run-1',
-      operationId: 'operation-1',
-    }).map((event) => event.id)).toEqual(['1']);
+  it('renders the server result without a second, page-local filter', () => {
+    const markup = renderToStaticMarkup(createElement(ExecutionHistoryPanel, {
+      open: true, onClose: vi.fn(), events, currentProgramRunId: 'another-run',
+    }));
+    expect(markup.match(/class="history-event /g)).toHaveLength(4);
+    expect(markup).toContain('Recorded UTC unavailable');
   });
 
   it('renders the largest supported public history page within the presentation budget', () => {
@@ -96,7 +71,7 @@ describe('execution history filtering', () => {
       open: true,
       onClose: vi.fn(),
       events: page,
-      currentExecutionId: 42,
+      currentProgramRunId: 'run-42',
       onReload: vi.fn(),
       onLoadOlder: vi.fn(),
       hasOlder: true,
@@ -131,6 +106,17 @@ describe('execution history filtering', () => {
     expect(markup.match(/class="history-event /g)).toHaveLength(32);
     expect(markup).toContain('Merged event 32');
     expect(markup).not.toContain('Merged event 33');
+  });
+
+  it('never reparses backend-rejected UTC and disables old-page selection during replacement', () => {
+    const markup = renderToStaticMarkup(createElement(ExecutionHistoryPanel, {
+      open: true, onClose: vi.fn(), loading: true,
+      events: [{ id: 'invalid-wall', timestampNs: '7', timestampUtcNs: null,
+        timestamp: '2026-02-30T00:00:00Z', channel: 'test', message: 'Fault', type: 'error' }],
+    }));
+    expect(markup).toContain('Recorded UTC unavailable');
+    expect(markup).toContain('Original recorded wall time: 2026-02-30T00:00:00Z');
+    expect(markup).toContain('disabled="" class="history-event');
   });
 
   it('keeps error severity on a selected sequenced row', () => {

@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import type { Nanoseconds } from '../types/nanoseconds';
 
 import type {
   CarriedObjectAttachment,
@@ -34,7 +35,7 @@ export interface MeasuredRobotPresentation {
   sourceId: string;
   sourceEpoch: string;
   sourceSequence: number;
-  observedAtNs: number | null;
+  observedAtNs: Nanoseconds | null;
   linkTransforms: Record<string, RuntimeLinkTransform>;
 }
 
@@ -52,7 +53,7 @@ export interface MeasuredPosePresentation {
   sourceId: string;
   sourceEpoch: string;
   sourceSequence: number;
-  observedAtNs: number;
+  observedAtNs: Nanoseconds;
   pose: SceneRuntimeObservationPose;
 }
 
@@ -175,7 +176,7 @@ export function executionObservationRobotPresentation(
   sourceModel: SourceModelProjection | null,
   manifest: SceneUrdfManifest | null,
   descriptor: ManualControlMotionDescriptor | null,
-  observedAtNs: number | null,
+  observedAtNs: Nanoseconds | null,
 ): MeasuredRobotPresentation | null {
   if (
     frame === null
@@ -187,53 +188,52 @@ export function executionObservationRobotPresentation(
     || frame.retainedBundleId !== manifest.retained_bundle_id
     || frame.graphRevision !== sourceModel.graph_revision
     || frame.graphRevision !== manifest.graph_revision
-    || frame.sourceJointNames.length !== frame.compiledJointNames.length
-    || frame.sourceJointNames.length !== frame.positionsRad.length
     || descriptor === null
-    || descriptor.controllableComponentId !== frame.controllableComponentId
-    || descriptor.commandTargetId !== frame.commandTargetId
-    || descriptor.joints.length !== frame.sourceJointNames.length
   ) return null;
-
-  const occurrence = sourceModel.occurrences.find(
-    (candidate) => candidate.component_id === frame.controllableComponentId,
-  );
-  const target = sourceModel.targets.find((candidate) => (
-    candidate.component_id === frame.controllableComponentId
-    && candidate.target_id === frame.commandTargetId
+  const motion = frame.targets.find((target) => (
+    target.controllableComponentId === descriptor.controllableComponentId
+    && target.commandTargetId === descriptor.commandTargetId
   ));
-  if (occurrence === undefined || target === undefined) return null;
-  const commandableOrderMatches = target.model_groups.some((group) => (
-    group.commandable_source_joint_names.length === frame.sourceJointNames.length
-    && group.commandable_source_joint_names.every(
-      (name, index) => name === frame.sourceJointNames[index],
-    )
-  ));
-  if (!commandableOrderMatches) return null;
-
-  const occurrenceCoordinates = new Set(
-    occurrence.coordinates.map((coordinate) => coordinate.source_joint_name),
-  );
+  if (motion === undefined || motion.sourceJointNames.length !== descriptor.joints.length
+    || descriptor.joints.some((joint, index) => (
+      joint.sourceJointName !== motion.sourceJointNames[index]
+      || joint.compiledJointName !== motion.compiledJointNames[index]
+    ))) return null;
   const compiledPositions = new Map<string, number>();
-  for (const [index, sourceJointName] of frame.sourceJointNames.entries()) {
-    const compiledJointName = frame.compiledJointNames[index];
-    const position = frame.positionsRad[index];
-    const describedJoint = descriptor.joints[index];
-    if (
-      compiledJointName === undefined
-      || describedJoint === undefined
-      || describedJoint.sourceJointName !== sourceJointName
-      || describedJoint.compiledJointName !== compiledJointName
-      || !occurrenceCoordinates.has(sourceJointName)
-      || !Number.isFinite(position)
-      || compiledPositions.has(compiledJointName)
-    ) return null;
-    compiledPositions.set(compiledJointName, position);
+  for (const observed of frame.targets) {
+    const target = sourceModel.targets.find((candidate) => (
+      candidate.component_id === observed.controllableComponentId
+      && candidate.target_id === observed.commandTargetId
+    ));
+    if (target === undefined || observed.sourceJointNames.length !== observed.compiledJointNames.length
+      || observed.sourceJointNames.length !== observed.positionsSi.length
+      || observed.sourceJointNames.length !== observed.coordinateKinds.length) return null;
+    const groups = target.model_groups.filter((group) => (
+      group.commandable_source_joint_names.length === observed.sourceJointNames.length
+      && group.commandable_source_joint_names.every((name, index) => name === observed.sourceJointNames[index])
+    ));
+    if (groups.length !== 1) return null;
+    const occurrence = sourceModel.occurrences.find((candidate) => (
+      candidate.component_id === observed.controllableComponentId
+      && candidate.model_instance_id === groups[0].model_instance_id
+    ));
+    if (occurrence === undefined) return null;
+    for (const [index, sourceName] of observed.sourceJointNames.entries()) {
+      const compiledName = observed.compiledJointNames[index];
+      const value = observed.positionsSi[index];
+      const coordinates = occurrence.coordinates.filter((coordinate) => (
+        coordinate.source_joint_name === sourceName && coordinate.viewer_joint_name === compiledName
+      ));
+      if (coordinates.length !== 1 || coordinates[0].coordinate_kind !== observed.coordinateKinds[index]
+        || coordinates[0].unit !== (observed.coordinateKinds[index] === 'angular' ? 'rad' : 'm')
+        || !Number.isFinite(value) || compiledPositions.has(compiledName)) return null;
+      compiledPositions.set(compiledName, value);
+    }
   }
   const linkTransforms = measuredLinkTransforms(manifest, compiledPositions);
   return linkTransforms === null ? null : {
-    objectId: frame.controllableComponentId,
-    sourceId: `execution:${frame.commandTargetId}`,
+    objectId: descriptor.controllableComponentId,
+    sourceId: `execution:${descriptor.commandTargetId}`,
     sourceEpoch: `${frame.ownerEpoch}:${frame.sourceEpoch}`,
     sourceSequence: frame.sourceSequence,
     observedAtNs,
@@ -263,7 +263,7 @@ export function createExecutionRobotPresentationReader(
         sourceModel,
         manifest,
         descriptor,
-        frame === null ? null : frame.receivedAtMonotonicUs * 1_000,
+        frame === null ? null : (BigInt(frame.receivedAtMonotonicUs) * 1_000n).toString(),
       );
       return cachedPresentation;
     },

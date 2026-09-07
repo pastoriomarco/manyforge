@@ -4456,6 +4456,42 @@ TEST(CanonicalEmptySceneOwner,
   EXPECT_EQ(owner.VerifyIntegrity().transaction_intent_count, 5);
 }
 
+TEST(CanonicalEmptySceneOwner, LongServiceProviderEvidenceSurvivesRealJournalRestart) {
+  TemporaryDirectory directory;
+  const auto database = directory.path() / "logical-scene.sqlite3";
+  const auto admission = LoadAdmission();
+  ControlledPublicationReader publication_reader;
+  TestCellAdmissionPort cell_admission;
+  constexpr std::int64_t years31 = 31LL * 366 * 86400 * 1000000000;
+  core::SceneObjectProviderEvidenceDTO evidence{
+      core::ProviderInstanceId("provider-instance"),
+      core::ProviderManifestId("provider-manifest"),
+      core::ProviderManifestRevision(Digest('7').value()),
+      "provider-epoch", 1U, years31 + 1, years31 - 1, 5000,
+  };
+  {
+    CanonicalEmptySceneOwner owner(database, admission, publication_reader, cell_admission);
+    const auto bootstrap = FinalizeCanonicalBootstrap(owner, publication_reader, admission);
+    const auto added = owner.Commit(AddBoxRequest(bootstrap.canonical_empty_target, admission.cell_id()));
+    ASSERT_TRUE(added.success);
+    const auto projection = *added.committed_projection_revision;
+    const auto pose = owner.GetObjectPose(core::SceneResourceId("scene-box"));
+    ASSERT_TRUE(pose.ok());
+    core::SceneTransactionRequestDTO request{
+        SceneRequestContext("scene-request-long-clock", projection), {}, projection,
+        core::UpdateObjectPoseRequestDTO{core::SceneResourceId("scene-box"), pose.value(),
+            core::CellSceneFrameRefDTO{admission.cell_id()}, evidence, false}, std::nullopt,
+    };
+    const auto committed = owner.Commit(request);
+    ASSERT_TRUE(committed.success) << (committed.error ? committed.error->message : "missing error");
+    EXPECT_EQ(owner.GetObjectState(core::SceneResourceId("scene-box")).provider_evidence, evidence);
+    EXPECT_EQ(owner.VerifyIntegrity().transaction_intent_count, 2);
+  }
+  CanonicalEmptySceneOwner replacement(database, admission, publication_reader, cell_admission);
+  EXPECT_EQ(replacement.GetObjectState(core::SceneResourceId("scene-box")).provider_evidence, evidence);
+  EXPECT_EQ(replacement.VerifyIntegrity().transaction_intent_count, 2);
+}
+
 TEST(CanonicalEmptySceneOwner,
      ProjectionCommitRollbackAndUncertaintyUseClosedDurableOutcomes) {
   TemporaryDirectory packages("scene-native-projection-packages");

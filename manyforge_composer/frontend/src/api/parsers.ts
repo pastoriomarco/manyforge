@@ -1,3 +1,4 @@
+import { parseNanoseconds, type Nanoseconds } from '../types/nanoseconds';
 import type {
   RetainedNeutralProjection,
   CatalogBlackboardBinding,
@@ -262,6 +263,8 @@ import type {
   HistorianEventSummary,
   HistorianDetail,
   HistorianPage,
+  HistorianDiscovery,
+  HistorianRetention,
   OperatorAlarmRecord,
   OperatorAlarmSnapshot,
   SourceFreshness,
@@ -438,18 +441,14 @@ function positiveNumberAt(value: unknown, path: string): number {
   return number;
 }
 
-function monotonicNanosecondsAt(value: unknown, path: string): number {
-  const number = numberAt(value, path);
-  if (!Number.isInteger(number) || number < 0) {
-    return fail(path, 'non-negative monotonic nanoseconds');
-  }
-  return number;
+function monotonicNanosecondsAt(value: unknown, path: string): Nanoseconds {
+  return parseNanoseconds(value, path);
 }
 
 function nullableMonotonicNanosecondsAt(
   value: unknown,
   path: string,
-): number | null {
+): Nanoseconds | null {
   return value === null ? null : monotonicNanosecondsAt(value, path);
 }
 
@@ -3563,8 +3562,8 @@ export function parseProgramRuntimeControlsSnapshot(
     'overrides', 'promotion_proposals', 'retry_counts', 'audit',
   ], path);
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.program_runtime_controls.v1') {
-    return fail(`${path}.schema_version`, 'manyforge.program_runtime_controls.v1');
+  if (schemaVersion !== 'manyforge.program_runtime_controls.v2') {
+    return fail(`${path}.schema_version`, 'manyforge.program_runtime_controls.v2');
   }
   const programRunId = stringAt(record.program_run_id, `${path}.program_run_id`);
   const fences = objectAt(record.recovery_fences, `${path}.recovery_fences`);
@@ -3592,16 +3591,22 @@ export function parseProgramRuntimeControlsSnapshot(
       integerAt(count, `${path}.retry_counts.${nodeInstanceId}`),
     ],
   ));
-  if (Object.values(retryCounts).some((count) => count < 0 || count > 255)) {
-    return fail(`${path}.retry_counts`, 'retry counts from 0 through 255');
+  if (Object.keys(retryCounts).length > 100_000
+      || Object.values(retryCounts).some((count) => count < 0 || count > 255)) {
+    return fail(`${path}.retry_counts`, 'at most 100000 Program nodes with retry counts from 0 through 255');
   }
-  const audit = boundedArrayAt(record.audit, `${path}.audit`, 4096)
+  const revision = positiveIntegerAt(
+    record.runtime_control_revision,
+    `${path}.runtime_control_revision`,
+  );
+  const audit = boundedArrayAt(record.audit, `${path}.audit`, 256)
     .map((item, index) => parseRuntimeControlAuditEvent(
       item,
       `${path}.audit[${index}]`,
     ));
   if (
-    audit.some((event, index) => event.eventRevision !== index + 1)
+    audit.length !== Math.min(revision - 1, 256)
+    || audit.some((event, index) => event.eventRevision !== revision - audit.length + index)
     || new Set(overrides.map((item) => item.overrideId)).size !== overrides.length
     || new Set(promotionProposals.map((item) => item.proposalId)).size
       !== promotionProposals.length
@@ -3643,19 +3648,7 @@ export function parseProgramRuntimeControlsSnapshot(
   return {
     schemaVersion,
     programRunId,
-    runtimeControlRevision: (() => {
-      const revision = positiveIntegerAt(
-        record.runtime_control_revision,
-        `${path}.runtime_control_revision`,
-      );
-      if (revision !== audit.length + 1) {
-        return fail(
-          `${path}.runtime_control_revision`,
-          'one more than the retained audit length',
-        );
-      }
-      return revision;
-    })(),
+    runtimeControlRevision: revision,
     recoveryFences: {
       programGeneration: integerAt(
         fences.program_generation,
@@ -3940,10 +3933,10 @@ export function parseProgramRuntimeControlProjection(
     'observation_override_candidate',
   ], path);
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.program_runtime_control_projection.v2') {
+  if (schemaVersion !== 'manyforge.program_runtime_control_projection.v3') {
     return fail(
       `${path}.schema_version`,
-      'manyforge.program_runtime_control_projection.v2',
+      'manyforge.program_runtime_control_projection.v3',
     );
   }
   const programRunId = stringAt(record.program_run_id, `${path}.program_run_id`);
@@ -5299,9 +5292,9 @@ export function parseSceneRuntimeProjection(value: unknown): SceneRuntimeProject
       )),
       reason: stringAt(state.reason, 'sceneRuntime.state.reason'),
       runtime_identity: runtimeIdentity,
-      started_at_ns: integerAt(state.started_at_ns, 'sceneRuntime.state.started_at_ns'),
+      started_at_ns: monotonicNanosecondsAt(state.started_at_ns, 'sceneRuntime.state.started_at_ns'),
       state: stateName as SceneRuntimeProjection['state']['state'],
-      updated_at_ns: integerAt(state.updated_at_ns, 'sceneRuntime.state.updated_at_ns'),
+      updated_at_ns: monotonicNanosecondsAt(state.updated_at_ns, 'sceneRuntime.state.updated_at_ns'),
     },
   };
 }
@@ -5324,7 +5317,7 @@ function parseSceneRuntimeObservationPose(
       'frame_kind',
       'orientation_xyzw',
       'position_m',
-      'source_stamp_s',
+      'source_stamp_ns',
     ],
     path,
   );
@@ -5343,9 +5336,9 @@ function parseSceneRuntimeObservationPose(
     frame_kind: 'cell_frame',
     orientation_xyzw: orientation,
     position_m: vector3At(record.position_m, `${path}.position_m`),
-    source_stamp_s: nullableNumberAt(
-      record.source_stamp_s,
-      `${path}.source_stamp_s`,
+    source_stamp_ns: record.source_stamp_ns === null ? null : parseNanoseconds(
+      record.source_stamp_ns,
+      `${path}.source_stamp_ns`,
     ),
   };
 }
@@ -5355,8 +5348,8 @@ function parseSceneRuntimeGoodPayload(
   path: string,
 ): SceneRuntimeGoodObservationPayload {
   const record = objectAt(value, path);
-  if (record.api_version !== 'manyforge.ros_pose_observation.v1') {
-    return fail(`${path}.api_version`, 'manyforge.ros_pose_observation.v1');
+  if (record.api_version !== 'manyforge.ros_pose_observation.v2') {
+    return fail(`${path}.api_version`, 'manyforge.ros_pose_observation.v2');
   }
   const kind = stringAt(record.kind, `${path}.kind`);
   if (kind === 'joint_state') {
@@ -5367,7 +5360,7 @@ function parseSceneRuntimeGoodPayload(
         'joint_names',
         'kind',
         'positions',
-        'source_stamp_s',
+        'source_stamp_ns',
         'topic',
       ],
       path,
@@ -5391,13 +5384,13 @@ function parseSceneRuntimeGoodPayload(
       return fail(`${path}.topic`, 'one absolute ROS topic');
     }
     return {
-      api_version: 'manyforge.ros_pose_observation.v1',
+      api_version: 'manyforge.ros_pose_observation.v2',
       joint_names: names,
       kind,
       positions,
-      source_stamp_s: nullableNumberAt(
-        record.source_stamp_s,
-        `${path}.source_stamp_s`,
+      source_stamp_ns: record.source_stamp_ns === null ? null : parseNanoseconds(
+        record.source_stamp_ns,
+        `${path}.source_stamp_ns`,
       ),
       topic,
     };
@@ -5411,7 +5404,7 @@ function parseSceneRuntimeGoodPayload(
   if (kind === 'simulation_entity_pose') {
     exactKeysAt(source, ['entity'], `${path}.source`);
     return {
-      api_version: 'manyforge.ros_pose_observation.v1',
+      api_version: 'manyforge.ros_pose_observation.v2',
       kind,
       pose,
       source: {
@@ -5439,7 +5432,7 @@ function parseSceneRuntimeGoodPayload(
     return fail(`${path}.source`, 'non-negative position covariance');
   }
   return {
-    api_version: 'manyforge.ros_pose_observation.v1',
+    api_version: 'manyforge.ros_pose_observation.v2',
     kind,
     pose,
     source: {
@@ -5461,8 +5454,8 @@ function parseSceneRuntimeUnknownPayload(
 ): SceneRuntimeUnknownObservationPayload {
   const record = objectAt(value, path);
   exactKeysAt(record, ['api_version', 'kind', 'source_error'], path);
-  if (record.api_version !== 'manyforge.ros_pose_observation.v1') {
-    return fail(`${path}.api_version`, 'manyforge.ros_pose_observation.v1');
+  if (record.api_version !== 'manyforge.ros_pose_observation.v2') {
+    return fail(`${path}.api_version`, 'manyforge.ros_pose_observation.v2');
   }
   const kind = stringAt(record.kind, `${path}.kind`);
   if (![
@@ -5479,7 +5472,7 @@ function parseSceneRuntimeUnknownPayload(
     `${path}.source_error`,
   );
   return {
-    api_version: 'manyforge.ros_pose_observation.v1',
+    api_version: 'manyforge.ros_pose_observation.v2',
     kind: kind as SceneRuntimeUnknownObservationPayload['kind'],
     source_error: {
       code: nonEmptyStringAt(sourceError.code, `${path}.source_error.code`),
@@ -5519,9 +5512,9 @@ function parseSceneRuntimePoseSource(
     ],
     path,
   );
-  const observedAt = integerAt(record.observed_at_ns, `${path}.observed_at_ns`);
-  const expiresAt = integerAt(record.expires_at_ns, `${path}.expires_at_ns`);
-  if (expiresAt < observedAt) {
+  const observedAt = monotonicNanosecondsAt(record.observed_at_ns, `${path}.observed_at_ns`);
+  const expiresAt = monotonicNanosecondsAt(record.expires_at_ns, `${path}.expires_at_ns`);
+  if (BigInt(expiresAt) < BigInt(observedAt)) {
     return fail(`${path}.expires_at_ns`, 'at least observed_at_ns');
   }
   const base = {
@@ -6046,7 +6039,7 @@ function parseOperatorAlarmRecord(
   const record = objectAt(value, path);
   return {
     ...parseAlarmMembership(record, path),
-    activatedAtNs: integerAt(record.activated_at_ns, `${path}.activated_at_ns`),
+    activatedAtNs: monotonicNanosecondsAt(record.activated_at_ns, `${path}.activated_at_ns`),
     definitionId: stringAt(record.definition_id, `${path}.definition_id`),
     lifecycleState: alarmLifecycleStateAt(
       record.lifecycle_state,
@@ -6352,10 +6345,14 @@ function parseHistorianEventSummary(
     'program_run_id',
     'schema_version',
     'severity',
+    'condition_severity',
+    'occurred_at_utc_ns',
+    'clock_owner',
+    'wall_clock_regressed',
   ], path);
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.historian_event_summary.v1') {
-    return fail(`${path}.schema_version`, 'manyforge.historian_event_summary.v1');
+  if (schemaVersion !== 'manyforge.historian_event_summary.v2') {
+    return fail(`${path}.schema_version`, 'manyforge.historian_event_summary.v2');
   }
   return {
     schemaVersion,
@@ -6372,7 +6369,62 @@ function parseHistorianEventSummary(
     programRunId: nullableStringAt(record.program_run_id, `${path}.program_run_id`),
     operationId: nullableStringAt(record.operation_id, `${path}.operation_id`),
     conditionId: nullableStringAt(record.condition_id, `${path}.condition_id`),
+    conditionSeverity: stringAt(record.condition_severity, `${path}.condition_severity`),
+    occurredAtUtcNs: record.occurred_at_utc_ns === null ? null : nonnegativeInt64TextAt(record.occurred_at_utc_ns, `${path}.occurred_at_utc_ns`),
+    clockOwner: nullableStringAt(record.clock_owner, `${path}.clock_owner`),
+    wallClockRegressed: booleanAt(record.wall_clock_regressed, `${path}.wall_clock_regressed`),
   };
+}
+
+function parseHistorianRetention(value: unknown): HistorianRetention | null {
+  if (value === null) return null;
+  const path = 'history.retention';
+  const record = objectAt(value, path);
+  exactKeysAt(record, ['schema_version', 'partitions', 'partition_row_limit', 'partition_record_byte_limit', 'database_page_byte_limit', 'duration_guaranteed', 'prior_pruning_known'], path);
+  if (record.schema_version !== 'manyforge.historian_retention.v1' || record.duration_guaranteed !== false) {
+    return fail(path, 'the bounded local retention v1 profile');
+  }
+  const partitions = arrayAt(record.partitions, `${path}.partitions`);
+  if (partitions.length !== 2) return fail(path, 'routine and important retention partitions');
+  return {
+    schemaVersion: record.schema_version,
+    partitionRowLimit: nonnegativeInt64TextAt(record.partition_row_limit, `${path}.partition_row_limit`),
+    partitionRecordByteLimit: nonnegativeInt64TextAt(record.partition_record_byte_limit, `${path}.partition_record_byte_limit`),
+    databasePageByteLimit: nonnegativeInt64TextAt(record.database_page_byte_limit, `${path}.database_page_byte_limit`),
+    durationGuaranteed: false,
+    priorPruningKnown: booleanAt(record.prior_pruning_known, `${path}.prior_pruning_known`),
+    partitions: partitions.map((value, index) => {
+      const partPath = `${path}.partitions[${index}]`;
+      const part = objectAt(value, partPath);
+      exactKeysAt(part, ['partition', 'retained_count', 'retained_bytes', 'pruned_count', 'pruned_bytes', 'last_pruned_sequence', 'unknown_time_count', 'regressed_time_count', 'loss_counter_saturated', 'first_recorded_utc_ns', 'last_recorded_utc_ns'], partPath);
+      const partition = index === 0 ? 'routine' : 'important';
+      if (part.partition !== partition) return fail(partPath, partition);
+      const scalar = (key: string) => nonnegativeInt64TextAt(part[key], `${partPath}.${key}`);
+      const nullable = (key: string) => part[key] === null ? null : scalar(key);
+      return {
+        partition, retainedCount: scalar('retained_count'), retainedBytes: scalar('retained_bytes'),
+        prunedCount: scalar('pruned_count'), prunedBytes: scalar('pruned_bytes'),
+        lastPrunedSequence: nullable('last_pruned_sequence'), unknownTimeCount: scalar('unknown_time_count'),
+        regressedTimeCount: scalar('regressed_time_count'),
+        lossCounterSaturated: booleanAt(part.loss_counter_saturated, `${partPath}.loss_counter_saturated`),
+        firstRecordedUtcNs: nullable('first_recorded_utc_ns'), lastRecordedUtcNs: nullable('last_recorded_utc_ns'),
+      };
+    }),
+  };
+}
+
+export function parseHistorianDiscovery(value: unknown): HistorianDiscovery {
+  const record = objectAt(value, 'history.discovery');
+  exactKeysAt(record, ['schema_version', 'kind', 'values', 'truncated', 'next_after'], 'history.discovery');
+  if (record.schema_version !== 'manyforge.historian_discovery.v1') return fail('history.discovery.schema_version', 'manyforge.historian_discovery.v1');
+  const kind = stringAt(record.kind, 'history.discovery.kind');
+  if (kind !== 'program_run_id' && kind !== 'component' && kind !== 'channel' && kind !== 'event_type') return fail('history.discovery.kind', 'a declared discovery kind');
+  const values = arrayAt(record.values, 'history.discovery.values').map((value) => stringAt(value, 'history.discovery.value'));
+  if (values.length > 32 || new Set(values).size !== values.length || values.some((value) => !value || new TextEncoder().encode(value).length > 1024 || value !== value.normalize('NFC'))) return fail('history.discovery.values', 'at most 32 unique nonempty NFC values of at most 1024 bytes');
+  const truncated = booleanAt(record.truncated, 'history.discovery.truncated');
+  const nextAfter = record.next_after === null ? null : stringAt(record.next_after, 'history.discovery.next_after');
+  if ((truncated && values.length === 0) || nextAfter !== (truncated ? values.at(-1) : null)) return fail('history.discovery.next_after', 'an advancing exact cursor');
+  return { schemaVersion: record.schema_version, kind, values, truncated, nextAfter };
 }
 
 export function parseHistorianPage(value: unknown): HistorianPage {
@@ -6382,11 +6434,15 @@ export function parseHistorianPage(value: unknown): HistorianPage {
     'next_before_sequence',
     'schema_version',
     'truncated',
+    'time_window',
+    'retention',
   ], 'history');
   const schemaVersion = stringAt(record.schema_version, 'history.schema_version');
-  if (schemaVersion !== 'manyforge.historian_summary_page.v1') {
-    return fail('history.schema_version', 'manyforge.historian_summary_page.v1');
+  if (schemaVersion !== 'manyforge.historian_summary_page.v2') {
+    return fail('history.schema_version', 'manyforge.historian_summary_page.v2');
   }
+  const window = objectAt(record.time_window, 'history.time_window');
+  exactKeysAt(window, ['start_utc_ns', 'end_utc_ns'], 'history.time_window');
   const events = arrayAt(record.events, 'history.events');
   if (events.length > 32) return fail('history.events', 'at most 32 summary rows');
   return {
@@ -6412,6 +6468,11 @@ export function parseHistorianPage(value: unknown): HistorianPage {
           'history.next_before_sequence',
         ),
     truncated: booleanAt(record.truncated, 'history.truncated'),
+    timeWindow: {
+      startUtcNs: window.start_utc_ns === null ? null : nonnegativeInt64TextAt(window.start_utc_ns, 'history.time_window.start_utc_ns'),
+      endUtcNs: window.end_utc_ns === null ? null : nonnegativeInt64TextAt(window.end_utc_ns, 'history.time_window.end_utc_ns'),
+    },
+    retention: parseHistorianRetention(record.retention),
   };
 }
 
@@ -7157,7 +7218,7 @@ export function parseExecutionControlStatus(
       'cell_stop_action',
       'observed_gripper',
       'observed_motion',
-      'resident_operations',
+      'manual_operations',
       'runtime_scale_control',
       'schema_version',
     ],
@@ -7166,10 +7227,10 @@ export function parseExecutionControlStatus(
   if (stringAt(
     control.schema_version,
     'executionControlState.control_state.schema_version',
-  ) !== 'manyforge.execution_control_state.v3') {
+  ) !== 'manyforge.execution_control_state.v4') {
     return fail(
       'executionControlState.control_state.schema_version',
-      'manyforge.execution_control_state.v3',
+      'manyforge.execution_control_state.v4',
     );
   }
   const motionTarget = objectAt(
@@ -7191,36 +7252,53 @@ export function parseExecutionControlStatus(
       'executionTargets.targets.direct_control_gripper.program_run_id',
     ),
   ]);
-  const residentOperations = arrayAt(
-    control.resident_operations,
-    'executionControlState.control_state.resident_operations',
-  ).map((value, index) => {
-    const operation = objectAt(
+  const manualRows = arrayAt(
+    control.manual_operations,
+    'executionControlState.control_state.manual_operations',
+  );
+  if (manualRows.length > allowedProgramRuns.size) {
+    return fail('executionControlState.control_state.manual_operations', 'at most one result per addressed manual target');
+  }
+  const manualOperations = manualRows.map((value, index) => {
+    const projection = objectAt(
       value,
-      `executionControlState.control_state.resident_operations[${index}]`,
+      `executionControlState.control_state.manual_operations[${index}]`,
     );
+    exactKeysAt(projection, ['operation', 'resident'],
+      `executionControlState.control_state.manual_operations[${index}]`);
+    const operation = objectAt(projection.operation,
+      `executionControlState.control_state.manual_operations[${index}].operation`);
     const programRunId = stringAt(
       operation.program_run_id,
-      `executionControlState.control_state.resident_operations[${index}].program_run_id`,
+      `executionControlState.control_state.manual_operations[${index}].program_run_id`,
     );
     if (!allowedProgramRuns.has(programRunId)) {
       return fail(
-        `executionControlState.control_state.resident_operations[${index}].program_run_id`,
+        `executionControlState.control_state.manual_operations[${index}].program_run_id`,
         'one of the exact direct-control Program runs',
       );
     }
-    return parseOperationObservation({
+    const observed = parseOperationObservation({
       command: 'read',
       ok: true,
       operation,
-      resident: true,
+      resident: projection.resident,
     });
+    if (!observed.resident && ![
+      'completed', 'stopped', 'failed', 'interrupted', 'intervention_required', 'cancelled_pre_dispatch',
+    ].includes(observed.state)) {
+      return fail('executionControlState.control_state.manual_operations',
+        'a terminal state for nonresident results');
+    }
+    return { ...observed, programRunId };
   });
-  if (new Set(residentOperations.map((operation) => operation.operationId)).size
-    !== residentOperations.length) {
+  if (new Set(manualOperations.map((operation) => operation.operationId)).size
+    !== manualOperations.length
+    || new Set(manualOperations.map((operation) => operation.programRunId)).size
+      !== manualOperations.length) {
     return fail(
-      'executionControlState.control_state.resident_operations',
-      'unique operation identities',
+      'executionControlState.control_state.manual_operations',
+      'unique operation and manual-target identities',
     );
   }
   const status = parseExecutionOwnerStatus({
@@ -7264,7 +7342,7 @@ export function parseExecutionControlStatus(
   }
   return {
     ...status,
-    residentOperations,
+    manualOperations,
     runtimeScaleControl,
   };
 }
@@ -7890,7 +7968,7 @@ export function parseExecutionOwnerStatus(value: unknown): ExecutionOwnerStatus 
     },
     observedMotion,
     observedGripper,
-    residentOperations: [],
+    manualOperations: [],
     runtimeScaleControl: null,
     cellStopAction: {
       available: cellStopAvailable,
@@ -8643,7 +8721,7 @@ export function parseRuntimeScaleControlAccepted(
     accepted.replay_status,
     'runtimeScaleControlAcceptance.accepted.replay_status',
   );
-  numberAt(
+  monotonicNanosecondsAt(
     accepted.accepted_at_ns,
     'runtimeScaleControlAcceptance.accepted.accepted_at_ns',
   );

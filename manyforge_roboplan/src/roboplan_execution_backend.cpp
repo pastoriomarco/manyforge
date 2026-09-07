@@ -806,8 +806,7 @@ std::int64_t RoboPlanExecutionBackend::publish_snapshot(
   // has its own bounded preallocated lane and cannot queue behind lifecycle
   // snapshot readers.
   bool state_published = false;
-  if (joint_positions.size() ==
-      state_channel_->query_context().joint_names.size()) {
+  if (joint_positions.size() == observed_at_rest_velocities_.size()) {
     const std::span<const double> velocities =
         at_rest_state ? std::span<const double>(observed_at_rest_velocities_)
                       : std::span<const double>{};
@@ -1144,14 +1143,24 @@ void RoboPlanExecutionBackend::execution_worker(
     }
 
     if (pause_requested) {
+      // A paused worker consumes scale intent without advancing trajectory
+      // time. Its dormant register is the starting scale of a later Resume.
+      applied_runtime_scale =
+          runtime_velocity_scale_.load(std::memory_order_acquire);
+      {
+        std::lock_guard<std::mutex> state_lock(state_mutex_);
+        state_.active_runtime_velocity_scale = applied_runtime_scale;
+      }
       publish_snapshot(core::ExecutionState::kPaused,
                        get_execution_snapshot().progress, latest_positions);
       std::unique_lock<std::mutex> lock(execution_mutex_);
-      execution_cv_.wait(lock, [this, &st]() {
-        return st.stop_requested() || !state_.pause_requested.load();
+      execution_cv_.wait(lock, [this, &st, applied_runtime_scale]() {
+        return st.stop_requested() || !state_.pause_requested.load() ||
+               runtime_velocity_scale_.load(std::memory_order_acquire) !=
+                   applied_runtime_scale;
       });
       last_tick_ns = clock_.now();
-      if (st.stop_requested()) {
+      if (st.stop_requested() || state_.pause_requested.load()) {
         continue;
       }
       publish_snapshot(core::ExecutionState::kExecuting,
@@ -2814,7 +2823,7 @@ void RoboPlanExecutionBackend::set_runtime_velocity_scale(double scale) {
   if (scale > 1.0)
     scale = 1.0;
   {
-    std::lock_guard<std::mutex> lock(runtime_velocity_scale_mutex_);
+    std::scoped_lock lock(runtime_velocity_scale_mutex_, execution_mutex_);
     if (controlled_stop_runtime_scale_freeze_depth_ > 0) {
       // M4: freeze the owned runtime scale during controlled stops. Slider/API
       // intent is applied after the stop so it cannot stretch, freeze, or
@@ -2832,14 +2841,31 @@ void RoboPlanExecutionBackend::set_runtime_velocity_scale(double scale) {
 core::RuntimeScaleMechanismStatusDTO
 RoboPlanExecutionBackend::runtime_velocity_scale_status() const {
   std::lock_guard<std::mutex> lock(state_mutex_);
+  // This is a real, synchronous observation of an in-process mechanism, not
+  // a renewed timestamp on cached physical feedback. Do not couple its
+  // freshness to motion frames or produce idle motion frames to keep it live.
+  constexpr std::uint64_t maximum_sequence = (std::uint64_t{1} << 53U) - 1U;
+  if (runtime_scale_observation_sequence_ == maximum_sequence) {
+    return core::RuntimeScaleMechanismStatusDTO{
+        true,
+        false,
+        0.0,
+        0.0,
+        0.0,
+        maximum_sequence,
+        clock_.now(),
+        core::ErrorDTO{"runtime_scale_observation_exhausted",
+                       "native scaler observation sequence exhausted",
+                       {}}};
+  }
   return core::RuntimeScaleMechanismStatusDTO{
       true,
       state_.running.load(std::memory_order_acquire),
       runtime_velocity_scale_.load(std::memory_order_acquire),
       state_.active_runtime_velocity_scale,
       state_.active_trajectory_time_s,
-      state_.snapshot.sequence_number,
-      state_.snapshot.timestamp_ns,
+      ++runtime_scale_observation_sequence_,
+      clock_.now(),
       std::nullopt};
 }
 
@@ -2851,7 +2877,7 @@ void RoboPlanExecutionBackend::begin_controlled_stop_runtime_scale_freeze() {
 bool RoboPlanExecutionBackend::end_controlled_stop_runtime_scale_freeze() {
   bool applied_deferred_scale = false;
   {
-    std::lock_guard<std::mutex> lock(runtime_velocity_scale_mutex_);
+    std::scoped_lock lock(runtime_velocity_scale_mutex_, execution_mutex_);
     if (controlled_stop_runtime_scale_freeze_depth_ <= 0) {
       return false;
     }

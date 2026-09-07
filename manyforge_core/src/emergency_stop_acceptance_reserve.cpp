@@ -123,6 +123,7 @@ void assign(std::array<char, Size>& destination, std::size_t& used,
          (candidate.disposition != StopResolutionDispositionDTO::kPromotedToFull ||
           candidate.full_stop) &&
          (!candidate.full_stop || candidate.disposition == StopResolutionDispositionDTO::kExact ||
+          candidate.disposition == StopResolutionDispositionDTO::kStaleButUnambiguouslyResolved ||
           candidate.disposition == StopResolutionDispositionDTO::kPromotedToFull);
 }
 
@@ -234,11 +235,12 @@ EmergencyStopAcceptanceOutcome EmergencyStopAcceptanceReserve::reserve_or_join(
   };
   const auto coalesce_full = [&]() {
     const auto full_slot = static_cast<StopControlSlotIndex>(correlation_capacity_);
+    const bool explicit_full = candidate.full_stop &&
+        (candidate.disposition == StopResolutionDispositionDTO::kExact ||
+         candidate.disposition == StopResolutionDispositionDTO::kStaleButUnambiguouslyResolved);
     if (!full_stop_slot_.active) {
-      const bool explicit_full =
-          candidate.disposition == StopResolutionDispositionDTO::kExact && candidate.full_stop;
       fill(full_stop_slot_, full_slot, nullptr, true,
-           explicit_full ? StopResolutionDispositionDTO::kExact
+           explicit_full ? candidate.disposition
                          : StopResolutionDispositionDTO::kPromotedToFull,
            explicit_full ? EmergencyStopAcceptancePathDTO::kFreshReserved
                          : EmergencyStopAcceptancePathDTO::kCoalescedFull,
@@ -251,8 +253,7 @@ EmergencyStopAcceptanceOutcome EmergencyStopAcceptanceReserve::reserve_or_join(
     auto coalesced = publish(full_stop_slot_, full_slot, RequestReplayStatusDTO::kAcceptedNew,
                              EmergencyStopAcceptancePathDTO::kCoalescedFull, false);
     coalesced.disposition =
-        candidate.disposition == StopResolutionDispositionDTO::kExact && candidate.full_stop
-            ? StopResolutionDispositionDTO::kExact
+        explicit_full ? candidate.disposition
             : StopResolutionDispositionDTO::kPromotedToFull;
     return coalesced;
   };

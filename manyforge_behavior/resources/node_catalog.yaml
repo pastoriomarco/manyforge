@@ -6,9 +6,9 @@
 # This is the complete built-in catalog contract for the atomic v2 cutover.
 
 api_version: manyforge.node_catalog.v2
-content_version: 1.1.0
+content_version: 2.0.0
 catalog_id: manyforge_builtin
-catalog_digest: sha256:cf249e13ee06142852da23b53d48f3bf6fa5bbc1ec92e548327ef9146afee6fe
+catalog_digest: sha256:5fce54890158a72df20063dac31531ede96dbf27b01be3a8256099c7e0ba1bb4
 
 schema_types:
   coordinate_position:
@@ -509,7 +509,7 @@ entries:
   - id: repeat
     name: Repeat
     category: control_flow
-    description: Repeat one child a bounded number of times.
+    description: Repeat one child a finite number of times or indefinitely (-1).
     stability: stable
     tags: [control_flow, decorator]
     profiles: {min_program_profile: composable-cell-v1}
@@ -517,10 +517,11 @@ entries:
     children: {min: 1, max: 1}
     parameters:
       - id: num_cycles
-        required: true
+        required: false
+        default: -1
         schema:
           type: int
-          constraints: {min_inclusive: 1, max_inclusive: 1000000}
+          constraints: {min_inclusive: -1, max_inclusive: 1000000, not_equal: 0}
     required_capabilities: []
     execution:
       blocking: false
@@ -533,7 +534,7 @@ entries:
   - id: retry
     name: Retry
     category: control_flow
-    description: Retry one child a bounded number of attempts.
+    description: Retry one child a finite number of attempts or indefinitely (-1).
     stability: stable
     tags: [control_flow, decorator]
     profiles: {min_program_profile: composable-cell-v1}
@@ -541,10 +542,11 @@ entries:
     children: {min: 1, max: 1}
     parameters:
       - id: num_attempts
-        required: true
+        required: false
+        default: -1
         schema:
           type: int
-          constraints: {min_inclusive: 1, max_inclusive: 1000000}
+          constraints: {min_inclusive: -1, max_inclusive: 1000000, not_equal: 0}
     required_capabilities: []
     execution:
       blocking: false
@@ -2767,6 +2769,11 @@ entries:
       - id: target_role
         required: true
         schema: {type: string, semantic_type: target_role}
+      - id: recovery_action
+        required: true
+        schema:
+          type: enum
+          values: [retry_motion_from_current_state, acknowledge_and_continue, retry_after_scene_repair, replan_from_stopped_state]
     required_capabilities: []
     owner_context:
       kind: current_recovery_offer

@@ -1,8 +1,9 @@
-import { useMemo, useState } from 'react';
+import { useState } from 'react';
 
-import { HISTORIAN_PAGE_LIMIT } from '../api/client';
+import { api, HISTORIAN_PAGE_LIMIT } from '../api/client';
+import { HistoryDiscovery } from './HistoryDiscovery';
 import type { HistorianListQuery } from '../api/client';
-import type { HistorianDetail } from '../types/headless';
+import type { HistorianDetail, HistorianRetention } from '../types/headless';
 
 export type HistorySeverityFilter = 'all' | 'info' | 'warning' | 'error';
 export type HistoryAlarmFilter =
@@ -23,6 +24,9 @@ export interface ExecutionHistoryEventView {
   sequence?: number;
   timestampNs: string;
   timestamp?: string | null;
+  timestampUtcNs?: string | null;
+  clockOwner?: string | null;
+  wallClockRegressed?: boolean;
   severity?: string | null;
   channel: string;
   message: string;
@@ -45,68 +49,38 @@ export function historySeverityGroup(
   return 'info';
 }
 
-function matchesAlarmView(
-  event: ExecutionHistoryEventView,
-  alarmView: HistoryAlarmFilter,
-): boolean {
-  if (alarmView === 'all') return true;
-  if (alarmView === 'raw') return !event.alarmPhase;
-  if (alarmView === 'lifecycle') return Boolean(event.alarmPhase);
-  return event.alarmPhase === alarmView;
-}
-
-export function filterExecutionHistoryEvents(
-  events: ExecutionHistoryEventView[],
-  options: {
-    severity: HistorySeverityFilter;
-    eventType: string;
-    channel: string;
-    search: string;
-    alarmView?: HistoryAlarmFilter;
-    conditionIdentity?: string;
-    executionId?: number;
-    startNs?: string;
-    endNs?: string;
-    programRunId?: string;
-    operationId?: string;
-  },
-): ExecutionHistoryEventView[] {
-  const needle = options.search.trim().toLocaleLowerCase();
-  const conditionNeedle = (options.conditionIdentity ?? '').trim().toLocaleLowerCase();
-  return events.filter((event) => {
-    if (
-      options.severity !== 'all'
-      && historySeverityGroup(event.severity) !== options.severity
-    ) return false;
-    if (options.eventType && event.type !== options.eventType) return false;
-    if (options.channel && event.channel !== options.channel) return false;
-    if (
-      options.startNs !== undefined
-      && BigInt(event.timestampNs) < BigInt(options.startNs)
-    ) return false;
-    if (
-      options.endNs !== undefined
-      && BigInt(event.timestampNs) > BigInt(options.endNs)
-    ) return false;
-    if (options.programRunId && event.programRunId !== options.programRunId) return false;
-    if (options.operationId && event.operationId !== options.operationId) return false;
-    if (!matchesAlarmView(event, options.alarmView ?? 'all')) return false;
-    if (
-      options.executionId !== undefined
-      && event.executionId !== options.executionId
-    ) return false;
-    const document = JSON.stringify(event).toLocaleLowerCase();
-    if (conditionNeedle && !document.includes(conditionNeedle)) return false;
-    return !needle || document.includes(needle);
-  });
+export function historyFilterQuery(options: {
+  severity: HistorySeverityFilter;
+  alarmView: HistoryAlarmFilter;
+  timeWindow: 'all' | 'minute' | 'five_minutes' | 'hour';
+  component: string;
+  eventType: string;
+  search: string;
+  programRunId: string;
+  operationId: string;
+  correlations?: Partial<HistorianListQuery>;
+}): HistorianListQuery {
+  return {
+    ...options.correlations,
+    limit: HISTORIAN_PAGE_LIMIT,
+    recentSeconds: { all: undefined, minute: 60, five_minutes: 300, hour: 3600 }[options.timeWindow],
+    severities: { all: undefined, info: ['INFO', 'DEBUG'], warning: ['WARN'], error: ['ERROR', 'CRITICAL'] }[options.severity],
+    alarmPhase: { all: undefined, lifecycle: 'all', activation: 'activated', return: 'returned', acknowledgement: 'acknowledged', raw: 'raw' }[options.alarmView] as HistorianListQuery['alarmPhase'],
+    components: options.component.trim() ? [options.component.trim()] : undefined,
+    eventTypes: options.eventType.trim() ? [options.eventType.trim()] : undefined,
+    programRunId: options.programRunId.trim() || undefined,
+    operationId: options.operationId.trim() || undefined,
+    search: options.search.trim() || undefined,
+  };
 }
 
 function eventTime(event: ExecutionHistoryEventView): string {
-  if (event.timestamp) {
-    const parsed = new Date(event.timestamp);
-    if (!Number.isNaN(parsed.getTime())) return parsed.toLocaleTimeString();
+  if (event.timestampUtcNs != null) {
+    return new Date(Number(BigInt(event.timestampUtcNs) / 1_000_000n)).toLocaleTimeString();
   }
-  return `${event.timestampNs} ns`;
+  return event.clockOwner
+    ? `UTC unavailable · ${event.clockOwner}: ${event.timestampNs} ns`
+    : 'Recorded UTC unavailable';
 }
 
 interface ExecutionHistoryPanelProps {
@@ -116,7 +90,8 @@ interface ExecutionHistoryPanelProps {
   eyebrow?: string;
   loading?: boolean;
   error?: string | null;
-  currentExecutionId?: number;
+  retention?: HistorianRetention | null;
+  currentProgramRunId?: string | null;
   embedded?: boolean;
   onReload?: (query: HistorianListQuery) => void;
   onLoadOlder?: () => void;
@@ -130,8 +105,8 @@ interface ExecutionHistoryPanelProps {
 }
 
 /**
- * Prop-driven history presentation. I5 owns the exact retained event DTO and
- * polling client; this panel deliberately has no endpoint or lifecycle owner.
+ * Only a bounded, already-filtered backend page is rendered. Filters never
+ * scan the browser's current page or turn unrelated owner clocks into UTC.
  */
 export function ExecutionHistoryPanel({
   open,
@@ -140,7 +115,8 @@ export function ExecutionHistoryPanel({
   eyebrow = 'Authoritative event projection',
   loading = false,
   error = null,
-  currentExecutionId,
+  retention = null,
+  currentProgramRunId,
   embedded = false,
   onReload,
   onLoadOlder,
@@ -160,58 +136,14 @@ export function ExecutionHistoryPanel({
   const [eventType, setEventType] = useState('');
   const [programRunId, setProgramRunId] = useState('');
   const [operationId, setOperationId] = useState('');
-  const [currentOnly, setCurrentOnly] = useState(true);
-  const newestTimestampNs = events.reduce(
-    (latest, event) => {
-      const timestamp = BigInt(event.timestampNs);
-      return timestamp > latest ? timestamp : latest;
-    },
-    0n,
-  );
-  const windowDurationNs = timeWindow === 'minute'
-    ? 60_000_000_000n
-    : timeWindow === 'five_minutes'
-      ? 300_000_000_000n
-      : timeWindow === 'hour'
-        ? 3_600_000_000_000n
-        : null;
-  const startNs = windowDurationNs === null || newestTimestampNs === 0n
-    ? undefined
-    : (newestTimestampNs > windowDurationNs
-      ? newestTimestampNs - windowDurationNs
-      : 0n).toString();
-  const query = (): HistorianListQuery => ({
-    ...(startNs === undefined ? {} : { startNs }),
-    ...(component.trim() ? { components: [component.trim()] } : {}),
-    ...(eventType.trim() ? { eventTypes: [eventType.trim()] } : {}),
-    limit: HISTORIAN_PAGE_LIMIT,
+  const [currentOnly, setCurrentOnly] = useState(false);
+  const [correlations, setCorrelations] = useState<Partial<HistorianListQuery>>({});
+  const query = (): HistorianListQuery => historyFilterQuery({
+    severity, alarmView, timeWindow, component, eventType, search, operationId,
+    programRunId: currentOnly && currentProgramRunId ? currentProgramRunId : programRunId,
+    correlations,
   });
-  const filtered = useMemo(
-    () => filterExecutionHistoryEvents(events, {
-      severity,
-      alarmView,
-      eventType: eventType.trim(),
-      channel: component.trim(),
-      search,
-      executionId: currentOnly ? currentExecutionId : undefined,
-      startNs,
-      programRunId: programRunId.trim(),
-      operationId: operationId.trim(),
-    }),
-    [
-      alarmView,
-      component,
-      currentExecutionId,
-      currentOnly,
-      eventType,
-      events,
-      operationId,
-      programRunId,
-      search,
-      severity,
-      startNs,
-    ],
-  );
+  const validSearch = search.trim() === '' || Array.from(search.trim()).length >= 3;
   if (!open) return null;
 
   return (
@@ -225,7 +157,7 @@ export function ExecutionHistoryPanel({
           <h2 id="history-title">Runtime history</h2>
         </div>
         <div className="button-row">
-          {onReload && <button type="button" onClick={() => onReload(query())}>Refresh</button>}
+          {onReload && <button type="button" disabled={loading || !validSearch} onClick={() => onReload(query())}>Refresh</button>}
           {!embedded && <button type="button" onClick={onClose}>Close</button>}
         </div>
       </header>
@@ -236,7 +168,7 @@ export function ExecutionHistoryPanel({
             value={timeWindow}
             onChange={(event) => setTimeWindow(event.target.value as typeof timeWindow)}
           >
-            <option value="all">All loaded time</option>
+            <option value="all">All retained time</option>
             <option value="minute">Latest minute</option>
             <option value="five_minutes">Latest 5 minutes</option>
             <option value="hour">Latest hour</option>
@@ -274,6 +206,7 @@ export function ExecutionHistoryPanel({
           <span>Program run</span>
           <input
             value={programRunId}
+            disabled={currentOnly && Boolean(currentProgramRunId)}
             onChange={(event) => setProgramRunId(event.target.value)}
             placeholder="program-run…"
           />
@@ -302,31 +235,70 @@ export function ExecutionHistoryPanel({
         </label>
         <label>
           <span>Search</span>
-          <input value={search} onChange={(event) => setSearch(event.target.value)} />
+          <input value={search} maxLength={256} placeholder="At least 3 characters" onChange={(event) => setSearch(event.target.value)} />
         </label>
         <label className="history-current-toggle">
           <input
             type="checkbox"
             checked={currentOnly}
-            disabled={currentExecutionId === undefined}
+            disabled={!currentProgramRunId}
             onChange={(event) => setCurrentOnly(event.target.checked)}
           />
-          Current execution
+          Current Program run
         </label>
         {onReload && (
-          <button type="button" onClick={() => onReload(query())}>Apply filters</button>
+          <button type="button" disabled={loading || !validSearch} onClick={() => onReload(query())}>Apply filters</button>
         )}
       </div>
+      <HistoryDiscovery onSelect={(kind, value) => {
+        if (kind === 'program_run_id') { setCurrentOnly(false); setProgramRunId(value); }
+        else if (kind === 'component') setComponent(value);
+        else if (kind === 'event_type') setEventType(value);
+        else setCorrelations({ ...correlations, channel: value });
+      }} />
+      {validSearch && <p>
+        <a href={api.history.exportUrl(query())} download="manyforge-debug.json">Export filtered diagnostic bundle</a>
+        {' · '}<a href={api.history.exportUrl(query(), true)} download="manyforge-trace.json">Normalized trace</a>
+        {' '}<span className="muted">Up to 256 retained events; coverage and continuation are included.</span>
+      </p>}
+      <details className="history-correlation-filters">
+        <summary>Exact causal references</summary>
+        <div className="history-filters">
+          {([
+            ['channel', 'Exact component / channel'],
+            ['actionSpanId', 'Action span'], ['nodeInstanceId', 'Node instance'],
+            ['interventionSessionId', 'Intervention'], ['contactPolicyId', 'Contact policy'],
+            ['incidentId', 'Incident'], ['conditionId', 'Condition'],
+          ] as const).map(([key, label]) => (
+            <label key={key}><span>{label}</span>
+              <input value={correlations[key] ?? ''} maxLength={1024}
+                onChange={(event) => setCorrelations({ ...correlations, [key]: event.target.value.trim() || undefined })} />
+            </label>
+          ))}
+        </div>
+      </details>
+      {retention && <details className="history-retention">
+        <summary>Retention and recorded-time coverage</summary>
+        <p className="muted">Bounded local history, not a permanent archive. Important events and routine progress have independent limits. Export evidence before it is pruned.</p>
+        {!retention.priorPruningKnown && <p className="muted">Legacy history did not retain pruning counts; coverage before this migration is unknown.</p>}
+        {retention.partitions.map((part) => <p key={part.partition}>
+          <strong>{part.partition}</strong>: {part.retainedCount} retained; {part.prunedCount} pruned{part.lossCounterSaturated ? ' (at least)' : ''}.
+          {' '}Recorded UTC: {part.firstRecordedUtcNs === null ? 'unavailable' : new Date(Number(BigInt(part.firstRecordedUtcNs) / 1_000_000n)).toISOString()}
+          {' → '}{part.lastRecordedUtcNs === null ? 'unavailable' : new Date(Number(BigInt(part.lastRecordedUtcNs) / 1_000_000n)).toISOString()}.
+          {' '}{part.unknownTimeCount} unknown times; {part.regressedTimeCount} clock regressions.
+        </p>)}
+      </details>}
       <div className="history-events">
         {loading && <p className="muted">Loading history…</p>}
         {error && <p className="error-state" role="alert">{error}</p>}
-        {!loading && !error && filtered.length === 0 && (
+        {!loading && !error && events.length === 0 && (
           <p className="muted">No events match these filters.</p>
         )}
-        {filtered.slice(0, MAXIMUM_MOUNTED_HISTORY_ROWS).map((event) => (
+        {events.slice(0, MAXIMUM_MOUNTED_HISTORY_ROWS).map((event) => (
           <button
             type="button"
             key={event.id}
+            disabled={loading}
             className={`history-event severity-${historySeverityGroup(event.severity)}${
               event.sequence !== undefined
                 && selectedDetail !== null
@@ -336,7 +308,7 @@ export function ExecutionHistoryPanel({
           >
             <header>
               <strong>{event.message || event.type}</strong>
-              <time>{eventTime(event)}</time>
+              <time title={event.timestamp ? `Original recorded wall time: ${event.timestamp}` : undefined}>{eventTime(event)}{event.wallClockRegressed ? ' · clock moved backward' : ''}</time>
             </header>
             <small>{event.channel} · {event.type}</small>
           </button>

@@ -1,0 +1,27 @@
+{
+  "local_delta": {
+    "schema_version": "manyforge.execution_control.v2",
+    "message_kind": "delta",
+    "control_session_id": "control-session.test-1",
+    "server_sequence": "3",
+    "event_class": "cold",
+    "control": null,
+    "shell": {
+      "schema_version": "manyforge.composer_headless_state.v2",
+      "complete": false,
+      "receiver_epoch": "receiver.epoch.1",
+      "snapshot_sequence": 3,
+      "draft_identity": { "draft_id": "draft-1", "draft_revision": 2 }
+    }
+  },
+  "invalid_overlays": [
+    { "state_sequence": "1" },
+    { "state_sequence": null },
+    { "received_client_sequence": null },
+    { "received_client_sequence": "1" },
+    { "event_class": "critical" },
+    { "control": {} },
+    { "shell": { "complete": true } },
+    { "shell": null }
+  ]
+}

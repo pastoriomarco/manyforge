@@ -141,8 +141,9 @@ struct OperationJournalRecoveryDTO final {
 /// owner-produced result, and resulting immutable state before their
 /// subordinate effect. Stop acceptance is deliberately different: the Kernel
 /// has already linearized/fenced it, and this port only attempts its forensic
-/// projection. State observations are committed before they become visible
-/// through owner projections.
+/// projection. Lifecycle/error transitions are committed before they become
+/// visible through owner projections. Progress-only observations update the
+/// owner's live snapshot; they do not require one durable record per sample.
 class IOperationJournal {
  public:
   virtual ~IOperationJournal() = default;

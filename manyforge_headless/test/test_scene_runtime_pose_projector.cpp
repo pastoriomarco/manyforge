@@ -52,9 +52,10 @@ core::CapabilityProviderBindingDTO Provider(const core::CellId &cell_id) {
 }
 
 CanonicalValue PosePayload(const double x = 0.25,
-                           const double quaternion_w = 1.0) {
+                           const double quaternion_w = 1.0,
+                           const std::int64_t source_stamp_ns = 1250000000) {
   return CanonicalValue(CanonicalValue::Object{
-      {"api_version", CanonicalValue("manyforge.ros_pose_observation.v1")},
+      {"api_version", CanonicalValue("manyforge.ros_pose_observation.v2")},
       {"kind", CanonicalValue("simulation_entity_pose")},
       {"pose", CanonicalValue(CanonicalValue::Object{
                    {"frame_id", CanonicalValue("universe")},
@@ -70,7 +71,7 @@ CanonicalValue PosePayload(const double x = 0.25,
                                       CanonicalValue(-0.5),
                                       CanonicalValue(0.75),
                                   })},
-                   {"source_stamp_s", CanonicalValue(1.25)},
+                   {"source_stamp_ns", content_identity::nonnegative_int64_value(source_stamp_ns)},
                })},
       {"source", CanonicalValue(CanonicalValue::Object{
                      {"entity", CanonicalValue("/box")},
@@ -221,6 +222,30 @@ TEST(SceneRuntimePoseProjector,
   ASSERT_TRUE(already_applied.ok()) << already_applied.error().message;
   EXPECT_EQ(already_applied.value().status,
             SceneRuntimePoseApplicationStatus::kAlreadyApplied);
+  EXPECT_EQ(scene.commit_count, 1U);
+}
+
+TEST(SceneRuntimePoseProjector, LongServicePoseEvidenceRemainsExactAndIdempotent) {
+  const core::CellId cell_id("cell.1");
+  FakeSceneAuthority scene;
+  SceneRuntimePoseProjector projector(scene, cell_id);
+  const std::vector providers{Provider(cell_id)};
+  constexpr std::int64_t years31 = 31LL * 366 * 86400 * 1000000000;
+  auto observation = Observation(PosePayload(0.25, 1.0, years31 - 1));
+  observation.observed_at_ns = years31;
+  observation.expires_at_ns = observation.observed_at_ns + 900;
+  const auto applied = projector.Apply(providers, scene.projection.retained_bundle_id,
+                                        scene.projection.graph_revision, observation);
+  ASSERT_TRUE(applied.ok()) << applied.error().message;
+  ASSERT_TRUE(scene.last_request.has_value());
+  const auto &update = std::get<core::UpdateObjectPoseRequestDTO>(scene.last_request->operation);
+  ASSERT_TRUE(update.provider_evidence.has_value());
+  EXPECT_EQ(update.provider_evidence->received_at_ns, observation.observed_at_ns);
+  EXPECT_EQ(update.provider_evidence->source_freshness_budget_ns, 900);
+  EXPECT_EQ(update.provider_evidence->source_timestamp_ns, years31 - 1);
+  const auto replay = projector.Apply(providers, scene.projection.retained_bundle_id,
+                                       scene.projection.graph_revision, observation);
+  ASSERT_TRUE(replay.ok()) << replay.error().message;
   EXPECT_EQ(scene.commit_count, 1U);
 }
 

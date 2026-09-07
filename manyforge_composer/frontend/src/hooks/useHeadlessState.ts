@@ -11,6 +11,7 @@ import {
 import type { ComposerHeadlessState } from '../types/headless';
 import type {
   ExecutionObservationFrame,
+  ExecutionObservationTarget,
   ExecutionObservationReader,
   ExecutionObservationTransportPhase,
   ExecutionObservationTransportStatus,
@@ -28,9 +29,16 @@ const RECONNECT_DELAY_MS = 1000;
 // execution-control settlement.
 export const HEADLESS_SHELL_PUBLICATION_MS = 50;
 
-const EXECUTION_OBSERVATION_SCHEMA = 'manyforge.execution_observation_frame.v1';
+const EXECUTION_OBSERVATION_SCHEMA = 'manyforge.execution_observation_frame.v2';
 const EXECUTION_OBSERVATION_CREDIT_SCHEMA = 'manyforge.execution_observation_credit.v1';
 const EXECUTION_OBSERVATION_RENEWAL_MS = 15_000;
+const observationTextEncoder = new TextEncoder();
+function isObservationText(value: unknown): value is string {
+  // At most three UTF-8 bytes per UTF-16 code unit. Ordinary short identifiers
+  // need no per-coordinate buffer allocation to enforce the wire byte limit.
+  return typeof value === 'string' && value.length > 0 && value.length <= 2048
+    && (value.length <= 682 || observationTextEncoder.encode(value).length <= 2048);
+}
 
 function sameExecutionObservationFrame(
   current: ExecutionObservationFrame,
@@ -42,72 +50,97 @@ function sameExecutionObservationFrame(
     && current.cellId === candidate.cellId
     && current.retainedBundleId === candidate.retainedBundleId
     && current.graphRevision === candidate.graphRevision
-    && current.controllableComponentId === candidate.controllableComponentId
-    && current.commandTargetId === candidate.commandTargetId
-    && sameStrings(current.sourceJointNames, candidate.sourceJointNames)
-    && sameStrings(current.compiledJointNames, candidate.compiledJointNames)
-    && current.positionsRad.length === candidate.positionsRad.length
-    && current.positionsRad.every((value, index) => value === candidate.positionsRad[index]);
+    && current.targets.length === candidate.targets.length
+    && current.targets.every((target, index) => {
+      const next = candidate.targets[index];
+      return target.controllableComponentId === next.controllableComponentId
+        && target.commandTargetId === next.commandTargetId
+        && target.sourceEpoch === next.sourceEpoch
+        && sameStrings(target.sourceJointNames, next.sourceJointNames)
+        && sameStrings(target.compiledJointNames, next.compiledJointNames)
+        && sameStrings(target.coordinateKinds, next.coordinateKinds)
+        && target.positionsSi.length === next.positionsSi.length
+        && target.positionsSi.every((value, joint) => value === next.positionsSi[joint]);
+    });
 }
 
 export function parseExecutionObservationFrame(raw: unknown): ExecutionObservationFrame {
-  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
-    throw new Error('Execution observation frame must be an object.');
-  }
-  const record = raw as Record<string, unknown>;
-  const expected = [
+  const object = (value: unknown, keys: string[]): Record<string, unknown> => {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)
+      || Object.keys(value).length !== keys.length
+      || Object.keys(value).some((key) => !keys.includes(key))) {
+      throw new Error('Execution observation frame has an invalid shape.');
+    }
+    return value as Record<string, unknown>;
+  };
+  const record = object(raw, [
     'cell_id',
-    'command_target_id',
-    'compiled_joint_names',
-    'controllable_component_id',
     'graph_revision',
     'owner_epoch',
-    'positions_rad',
     'received_at_monotonic_us',
     'retained_bundle_id',
     'schema_version',
     'source_epoch',
-    'source_joint_names',
     'source_sequence',
-  ].sort();
-  if (Object.keys(record).sort().some((key, index) => key !== expected[index])
-    || Object.keys(record).length !== expected.length) {
-    throw new Error('Execution observation frame has an invalid shape.');
-  }
-  const text = (key: string): string => {
-    const value = record[key];
-    if (typeof value !== 'string' || value.length === 0) {
+    'targets',
+  ]);
+  const text = (key: string, source = record): string => {
+    const value = source[key];
+    if (!isObservationText(value)) {
       throw new Error(`Execution observation ${key} is invalid.`);
     }
     return value;
   };
-  const integer = (key: string): number => {
-    const value = record[key];
+  const integer = (key: string, source = record): number => {
+    const value = source[key];
     if (!Number.isSafeInteger(value) || (value as number) < 0) {
       throw new Error(`Execution observation ${key} is invalid.`);
     }
     return value as number;
   };
-  const strings = (key: string): string[] => {
-    const value = record[key];
+  const strings = (key: string, source: Record<string, unknown>): string[] => {
+    const value = source[key];
     if (!Array.isArray(value) || value.length === 0 || value.length > 1024
-      || value.some((item) => typeof item !== 'string' || item.length === 0)
+      || value.some((item) => !isObservationText(item))
       || new Set(value).size !== value.length) {
       throw new Error(`Execution observation ${key} is invalid.`);
     }
     return [...value] as string[];
   };
-  const sourceJointNames = strings('source_joint_names');
-  const compiledJointNames = strings('compiled_joint_names');
-  const rawPositions = record.positions_rad;
-  if (!Array.isArray(rawPositions)
-    || rawPositions.some((value) => typeof value !== 'number' || !Number.isFinite(value))
-    || rawPositions.length !== sourceJointNames.length
-    || compiledJointNames.length !== sourceJointNames.length) {
-    throw new Error('Execution observation joint vectors are invalid.');
-  }
   if (record.schema_version !== EXECUTION_OBSERVATION_SCHEMA) {
     throw new Error('Execution observation schema is unsupported.');
+  }
+  if (!Array.isArray(record.targets) || record.targets.length === 0 || record.targets.length > 64) {
+    throw new Error('Execution observation target count is invalid.');
+  }
+  const targets: ExecutionObservationTarget[] = record.targets.map((rawTarget) => {
+    const target = object(rawTarget, ['controllable_component_id', 'command_target_id', 'source_epoch',
+      'source_sequence', 'source_joint_names', 'compiled_joint_names', 'coordinate_kinds', 'positions_si']);
+    const sourceJointNames = strings('source_joint_names', target);
+    const compiledJointNames = strings('compiled_joint_names', target);
+    const kinds = target.coordinate_kinds;
+    const positions = target.positions_si;
+    if (!Array.isArray(positions) || !Array.isArray(kinds)
+      || positions.some((value) => typeof value !== 'number' || !Number.isFinite(value))
+      || kinds.some((kind) => kind !== 'angular' && kind !== 'linear')
+      || positions.length !== sourceJointNames.length || kinds.length !== sourceJointNames.length
+      || compiledJointNames.length !== sourceJointNames.length) {
+      throw new Error('Execution observation joint vectors are invalid.');
+    }
+    return Object.freeze({
+      controllableComponentId: text('controllable_component_id', target),
+      commandTargetId: text('command_target_id', target),
+      sourceEpoch: text('source_epoch', target),
+      sourceSequence: integer('source_sequence', target),
+      sourceJointNames, compiledJointNames,
+      coordinateKinds: [...kinds] as Array<'angular' | 'linear'>,
+      positionsSi: [...positions] as number[],
+    });
+  });
+  const addresses = targets.map((target) => JSON.stringify([target.controllableComponentId, target.commandTargetId]));
+  const compiled = targets.flatMap((target) => target.compiledJointNames);
+  if (new Set(addresses).size !== addresses.length || new Set(compiled).size !== compiled.length || compiled.length > 1024) {
+    throw new Error('Execution observation targets overlap or exceed the coordinate bound.');
   }
   return Object.freeze({
     schemaVersion: EXECUTION_OBSERVATION_SCHEMA,
@@ -115,14 +148,10 @@ export function parseExecutionObservationFrame(raw: unknown): ExecutionObservati
     cellId: text('cell_id'),
     retainedBundleId: text('retained_bundle_id'),
     graphRevision: text('graph_revision'),
-    controllableComponentId: text('controllable_component_id'),
-    commandTargetId: text('command_target_id'),
     sourceEpoch: text('source_epoch'),
     sourceSequence: integer('source_sequence'),
     receivedAtMonotonicUs: integer('received_at_monotonic_us'),
-    sourceJointNames,
-    compiledJointNames,
-    positionsRad: [...rawPositions] as number[],
+    targets,
   });
 }
 
@@ -981,16 +1010,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
           this.controlSemanticReason = semanticReason as string | null;
           this.controlHeartbeatFreshness = freshness;
           const received = record.received_client_sequence;
-          if (received !== null && !canonicalPositiveU64(received)) {
-            throw new Error('Control client watermark is invalid.');
-          }
-          if (canonicalPositiveU64(received)) {
-            const watermark = BigInt(received);
-            if (watermark < this.lastReceivedClientSequence) {
-              throw new Error('Control client watermark regressed.');
-            }
-            this.lastReceivedClientSequence = watermark;
-          }
+          this.admitControlWatermark(received);
           const confirmedNow = this.lastControlEchoSequence > 0
             && canonicalPositiveU64(received)
             && BigInt(received) >= BigInt(this.lastControlEchoSequence);
@@ -1042,9 +1062,11 @@ export class HeadlessStateSource implements ExecutionObservationReader {
           if (typeof correlationId !== 'string' || typeof code !== 'string'
             || receipt.schema_version !== 'manyforge.execution_command_receipt.v1'
             || receipt.control_session_id !== this.controlSessionId
-            || receipt.client_sequence !== record.received_client_sequence
+            || !canonicalPositiveU64(record.received_client_sequence)
             || receipt.receiver_incarnation !== this.controlReceiverIncarnation
             || !canonicalPositiveU64(receipt.client_sequence)
+            || BigInt(record.received_client_sequence as string)
+              < BigInt(receipt.client_sequence as string)
             || !canonicalPositiveU64(receipt.received_server_sequence)
             || !canonicalPositiveU64(receipt.received_monotonic_ns)
             || typeof receipt.semantic_owner_epoch !== 'string'
@@ -1058,6 +1080,11 @@ export class HeadlessStateSource implements ExecutionObservationReader {
             throw new Error('Control command receipt is invalid.');
           }
           const pending = this.commandReceipts.get(correlationId);
+          if (pending !== undefined
+              && pending.clientSequence !== BigInt(receipt.client_sequence as string)) {
+            throw new Error('Control receipt watermark or command identity is invalid.');
+          }
+          this.admitControlWatermark(record.received_client_sequence);
           if (pending !== undefined) {
             this.commandReceipts.delete(correlationId);
             if (pending.deliveryTimer !== null) clearTimeout(pending.deliveryTimer);
@@ -1095,9 +1122,12 @@ export class HeadlessStateSource implements ExecutionObservationReader {
         }
         const ownerState = record.control !== null;
         if ((ownerState && !canonicalPositiveU64(record.state_sequence))
-          || (!ownerState && record.state_sequence !== undefined)) {
+          || (!ownerState && (kind !== 'delta' || record.event_class !== 'cold'
+            || record.state_sequence !== undefined
+            || record.received_client_sequence !== undefined))) {
           throw new Error('Control state delivery sequence is invalid.');
         }
+        if (ownerState) this.admitControlWatermark(record.received_client_sequence);
         this.applyControlState(record, kind, socket);
       } catch (reason) {
         this.publishError(
@@ -1133,6 +1163,17 @@ export class HeadlessStateSource implements ExecutionObservationReader {
         if (serial === this.serial) this.connect();
       }, RECONNECT_DELAY_MS);
     };
+  }
+
+  private admitControlWatermark(value: unknown): void {
+    if (value !== null && !canonicalPositiveU64(value)) {
+      throw new Error('Control client watermark is invalid.');
+    }
+    const watermark = value === null ? 0n : BigInt(value as string);
+    if (watermark < this.lastReceivedClientSequence) {
+      throw new Error('Control client watermark regressed.');
+    }
+    this.lastReceivedClientSequence = watermark;
   }
 
   private applyControlState(

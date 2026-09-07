@@ -352,7 +352,7 @@ public:
     return Result<ControlledStateDTO>::Ok(snapshot);
   }
 
-  const ObservedStateQueryContextDTO &query_context() const noexcept override {
+  ObservedStateQueryContextDTO query_context() const override {
     return context_;
   }
 
@@ -844,6 +844,32 @@ TEST(RetainedObservedStateChannelTest,
 }
 
 TEST(RetainedObservedStateChannelTest,
+     MoreThan4096RouteChangesRetainOnlyCurrentBinding) {
+  const auto first = make_binding(CoordinateKind::kLinear, "gripper.target",
+                                  true, "route.first");
+  const auto second = make_binding(CoordinateKind::kLinear, "gripper.target",
+                                   true, "route.second");
+  RetainedObservedStateChannel channel(
+      first, nullptr,
+      RetainedObservedStateChannelConfig{
+          ObservedStateSourceKind::kPredictedState, "native.predicted", 0, 1U});
+  const std::array position{0.0}, velocity{0.0};
+  ASSERT_TRUE(channel.publish_state(position, velocity, 100, 100).applied());
+  const auto captured = channel.binding();
+  for (std::int64_t index = 1; index <= 5000; ++index) {
+    const auto &next = index % 2 == 0 ? first : second;
+    ASSERT_TRUE(channel.RebindRoute(next, 100 + index).ok());
+    EXPECT_EQ(channel.binding().value(), next.value());
+    const auto current = channel.current_state_bounded(100 + index, 101 + index,
+                                                       std::stop_token{});
+    ASSERT_TRUE(current.ok());
+    EXPECT_EQ(current.value().control_route_id,
+              next.value().control_path->control_route_id);
+  }
+  EXPECT_EQ(captured.value(), first.value());
+}
+
+TEST(RetainedObservedStateChannelTest,
      RenderChangeWakeIgnoresFreshnessOnlySamples) {
   const auto binding =
       make_binding(CoordinateKind::kLinear, "gripper.target", true);
@@ -871,6 +897,63 @@ TEST(RetainedObservedStateChannelTest,
   EXPECT_TRUE(changed_future.get());
   waiter.join();
   EXPECT_GT(channel.render_change_generation(), before);
+}
+
+TEST(RetainedObservedStateChannelTest, SharedWakePublishesGripperOnlyChangesAndHasOnePendingToken) {
+  auto wake = std::make_shared<RetainedObservationWake>();
+  const auto config = RetainedObservedStateChannelConfig{
+      ObservedStateSourceKind::kPredictedState, "native.predicted", 0, 1U};
+  RetainedObservedStateChannel arm(make_binding(CoordinateKind::kLinear, "arm.target", true),
+                                    nullptr, config, nullptr, wake);
+  RetainedObservedStateChannel gripper(make_binding(CoordinateKind::kLinear, "gripper.target", true),
+                                        nullptr, config, nullptr, wake);
+  const std::array zero{0.0}, moved{0.025};
+  ASSERT_TRUE(arm.publish_state(zero, zero, 100, 100).applied());
+  ASSERT_TRUE(gripper.publish_state(zero, zero, 100, 100).applied());
+  const auto before = arm.render_change_generation();
+  ASSERT_TRUE(arm.publish_state(zero, zero, 101, 101).applied());
+  EXPECT_EQ(arm.render_change_generation(), before);
+  std::promise<bool> changed;
+  auto changed_future = changed.get_future();
+  std::jthread reader([&] { changed.set_value(arm.wait_for_render_change(before, 1s)); });
+  ASSERT_TRUE(gripper.publish_state(moved, zero, 102, 102).applied());
+  EXPECT_TRUE(changed_future.get());
+  EXPECT_EQ(arm.render_change_generation(), gripper.render_change_generation());
+  for (int sample = 0; sample < 100'000; ++sample) wake->notify();
+  EXPECT_TRUE(wake->wait_after(before, 0ns));
+  EXPECT_FALSE(wake->wait_after(wake->generation(), 0ns));
+  RetainedObservationWake replacement;
+  EXPECT_NE(replacement.incarnation(), wake->incarnation());
+  EXPECT_EQ(replacement.generation(), 0U);
+}
+
+TEST(RetainedObservedStateChannelTest, PositionOnlyChangesAndInvalidationWakeWithoutGrantingRestEvidence) {
+  const auto binding = make_binding(CoordinateKind::kLinear, "gripper.target", true);
+  RetainedObservedStateChannel channel(
+      binding, nullptr,
+      RetainedObservedStateChannelConfig{
+          ObservedStateSourceKind::kPredictedState, "native.predicted", 0, 1U});
+  const auto names = channel.query_context().joint_names;
+  const std::vector<double> positions(names.size(), 0.0), velocities(names.size(), 0.0);
+  const auto source = ObservedRobotStateSourceKind::kPredictedState;
+  ASSERT_TRUE(channel.publish_adapter_state(source, names, positions, velocities, 100, 100).complete);
+  const auto before = channel.render_change_generation();
+  auto moved = positions;
+  moved.front() = 0.1;
+  const auto without_velocity = channel.publish_adapter_state(source, names, moved, {}, 101, 101);
+  ASSERT_TRUE(without_velocity.complete);
+  EXPECT_FALSE(without_velocity.velocities_complete);
+  EXPECT_GT(channel.render_change_generation(), before);
+  const auto moved_generation = channel.render_change_generation();
+  auto incomplete = moved;
+  incomplete.front() = std::numeric_limits<double>::quiet_NaN();
+  ASSERT_TRUE(channel.publish_adapter_state(source, names, incomplete, {}, 102, 102).published);
+  EXPECT_GT(channel.render_change_generation(), moved_generation);
+  const auto invalid_generation = channel.render_change_generation();
+  ASSERT_TRUE(channel.publish_adapter_state(source, names, incomplete, {}, 103, 103).published);
+  EXPECT_EQ(channel.render_change_generation(), invalid_generation);
+  ASSERT_TRUE(channel.publish_adapter_state(source, names, moved, {}, 104, 104).complete);
+  EXPECT_GT(channel.render_change_generation(), invalid_generation);
 }
 
 TEST(RetainedExecutionStateSinkTest,

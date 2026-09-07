@@ -32,11 +32,14 @@ describe('UI4 application and viewport composition', () => {
     expect(viewer).toContain('aria-label="Robot control information"');
     expect(viewer).toContain('{props.runtimeOverlay}');
     expect(styles).toContain('.central-inspector-body.robot-inspector-body');
-    expect(styles).toMatch(/\.viewer-inspector-section \.robot-control-panel \{[\s\S]*?height: 100%;[\s\S]*?flex-direction: column;/);
-    expect(styles).toMatch(/\.viewer-inspector-section \.robot-control-body \{[\s\S]*?display: flex;[\s\S]*?flex-direction: column;[\s\S]*?overflow: hidden;/);
-    expect(styles).toMatch(/\.viewer-inspector-section \.robot-control-editor \{[\s\S]*?flex: 1 1 auto;[\s\S]*?overflow-y: auto;/);
-    expect(styles).toMatch(/\.viewer-inspector-section \.robot-control-preview \{[\s\S]*?flex: 0 1 auto;[\s\S]*?max-height: min\(28vh, 16rem\);/);
-    expect(styles).toMatch(/\.viewer-inspector-section \.robot-control-footer \{\s*flex: 0 0 auto;/);
+    // Shared panel geometry applies in docked and floating hosts. The real
+    // Firefox qualification checks the resulting pinned footer at each size;
+    // these source checks must not require a duplicate inspector-only layer.
+    expect(styles).toMatch(/\.robot-control-panel \{[^}]*height: 100%;[^}]*flex-direction: column;/);
+    expect(styles).toMatch(/\.robot-control-body \{[^}]*display: flex;[^}]*flex-direction: column;[^}]*overflow: hidden;/);
+    expect(styles).toMatch(/\.robot-control-editor \{[^}]*flex: 1 1 auto;[^}]*overflow: auto;/);
+    expect(styles).toMatch(/\.robot-control-preview \{[^}]*flex: 0 1 auto;[^}]*max-height: min\(28vh, 16rem\);/);
+    expect(styles).toMatch(/\.robot-control-footer \{\s*flex: 0 0 auto;/);
     expect(styles).toMatch(/\.robot-control-actions \{[\s\S]*?justify-content: center;/);
     expect(styles).toMatch(/\.viewer-inspector-section \.robot-control-modes \{[\s\S]*?justify-content: center;/);
     expect(styles).toMatch(/\.central-inspector-actions \.inspector-info-button \{[\s\S]*?border-color: transparent;/);

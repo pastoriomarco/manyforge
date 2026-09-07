@@ -1204,18 +1204,22 @@ void verify_resolved_program_binding(
     verify_resolved_program_binding(*binding, *product->second.bundle,
                                     product->second.model_map);
   }
-  const auto reused_generic_ur_program = program_bundles.find(
-      "sha256:"
-      "385569e5d9b2c2628abf67fc4633583e97cd9cfb0fc881d3cf3bae0750d2951a");
-  const auto reused_isaac_ur_program = program_bundles.find(
-      "sha256:"
-      "65d15a2be5027c80eb82f02a6cb57805458c7c480e9d9ad38b98fe1a0ec4211e");
+  // The obligation is that the same verified Program is reusable across two
+  // retained products. Ordinary source/catalog edits must not require another
+  // hard-coded aggregate content hash in this construction check.
+  const auto reused_bundle_count = [&](const std::string_view program_id) {
+    const auto record =
+        std::find_if(stored.begin(), stored.end(), [&](const auto &candidate) {
+          return candidate.program_id.value() == program_id;
+        });
+    return record == stored.end()
+               ? 0U
+               : program_bundles.at(record->program_revision.value()).size();
+  };
   if (binding_ids.size() != 13U || program_revisions.size() != 11U ||
       reopened.size() != 13U || program_reopened.size() != 11U ||
-      reused_generic_ur_program == program_bundles.end() ||
-      reused_generic_ur_program->second.size() != 2U ||
-      reused_isaac_ur_program == program_bundles.end() ||
-      reused_isaac_ur_program->second.size() != 2U) {
+      reused_bundle_count("pick_and_place_ur10e_robotiq_demo") != 2U ||
+      reused_bundle_count("isaac_manipulator_scene_light") != 2U) {
     throw std::logic_error(
         "maintained Program-Binding set loses its eleven-to-thirteen closure");
   }
@@ -1575,7 +1579,7 @@ qualify_catalog(const std::filesystem::path &root,
   QualifiedCatalogClosure result;
 
   for (const auto &path :
-       source_files(catalog_root / "capability_definition", 43U)) {
+       source_files(catalog_root / "capability_definition", 44U)) {
     const std::string bytes = read_file(path);
     const auto reference =
         make_reference<core::CapabilityDefinitionCatalogRecordRefDTO>(bytes);
@@ -1593,18 +1597,36 @@ qualify_catalog(const std::filesystem::path &root,
       target_capabilities.push_back(capability);
     }
   }
-  if (target_capabilities.size() != 22U) {
+  if (target_capabilities.size() != 23U) {
     throw std::logic_error(
         "maintained component closure has the wrong target-capability count");
   }
-  for (const auto &path : source_files(catalog_root / "component_type", 3U)) {
+  for (const auto &path : source_files(catalog_root / "component_type", 5U)) {
     const std::string bytes = read_file(path);
     const auto reference =
         make_reference<core::ComponentTypeCatalogRecordRefDTO>(bytes);
+    const auto parsed = deployment::parse_strict_json_model_yaml(bytes);
+    std::set<std::string, std::less<>> selected_ids;
+    for (const auto &target : require_array(
+             require_member(parsed.root(), "command_targets", "component"),
+             "command targets")) {
+      for (const auto &capability : require_array(
+               require_member(target, "capabilities", "command target"),
+               "capabilities")) {
+        selected_ids.insert(require_string_member(capability, "capability_id"));
+      }
+    }
+    std::vector<deployment::QualifiedCapabilityDefinition>
+        selected_capabilities;
+    for (const auto &capability : target_capabilities) {
+      if (selected_ids.contains(capability.value().capability_id.value())) {
+        selected_capabilities.push_back(capability);
+      }
+    }
     result.component_types.push_back(
         deployment::resolve_and_qualify_component_type(
             reference, reference.content_addressed_store_key, bytes,
-            target_capabilities));
+            selected_capabilities));
     input_source.add(reference.content_addressed_store_key,
                      reference.content_digest, bytes);
     insert_reference(result, reference);
@@ -1682,7 +1704,7 @@ qualify_catalog(const std::filesystem::path &root,
           manifest.value()
                   .lifecycle_plan_catalog->catalog_api_version.value() !=
               core::kBrandLifecyclePlanCatalogApiVersion ||
-          manifest.value().offered_capabilities.size() != 15U ||
+          manifest.value().offered_capabilities.size() != 16U ||
           manifest.value().provider_contracts.size() != 2U ||
           !has_contract_role("software_hard_stop") ||
           !has_contract_role("stop_contract")) {
@@ -1875,7 +1897,7 @@ qualify_catalog(const std::filesystem::path &root,
     result.model_assets.push_back(std::move(verified));
     result.structural_preparations.push_back(std::move(preparation));
   }
-  if (result.records.size() != 83U || result.runtime_profiles.size() != 2U ||
+  if (result.records.size() != 86U || result.runtime_profiles.size() != 2U ||
       result.runtime_policies.size() != 12U) {
     throw std::logic_error("maintained exact catalog closure is incomplete");
   }
@@ -1889,6 +1911,7 @@ void verify_scenarios(const std::filesystem::path &root,
              "manyforge_local_examples.site_overlay.json");
   std::map<std::string, std::pair<std::string, std::string>, std::less<>>
       family_identities;
+  std::map<std::string, std::string, std::less<>> family_models;
   for (const auto &scenario : kScenarios) {
     const std::string bytes = read_file(root / scenario.source);
     const std::string expected_runtime_profile_id =
@@ -1946,7 +1969,7 @@ void verify_scenarios(const std::filesystem::path &root,
     const std::size_t expected_catalog_count =
         (scenario.ros2_control_execution
              ? 54U
-             : (scenario.family_id == "lite6_lite_gripper" ? 56U : 50U)) +
+             : (scenario.family_id == "lite6_lite_gripper" ? 57U : 51U)) +
         2U * external_manifest_ids.size();
     if (verified.catalog_records().size() != expected_catalog_count) {
       throw std::invalid_argument(
@@ -1972,7 +1995,8 @@ void verify_scenarios(const std::filesystem::path &root,
     if (graph.controllable_components.size() != 1U ||
         graph.model_instances.size() != 1U ||
         graph.runtime_units.size() != 1U ||
-        graph.control_bindings.size() != 12U ||
+        graph.control_bindings.size() !=
+            (scenario.ros2_control_execution ? 12U : 13U) ||
         applicability.capability_provider_bindings.size() != 26U) {
       throw std::invalid_argument("maintained scenario has an incomplete "
                                   "component/runtime/capability closure: " +
@@ -2169,7 +2193,9 @@ void verify_scenarios(const std::filesystem::path &root,
       if (!scenario.ros2_control_execution) {
         const bool trajectory_binding =
             binding.command_target_id.value() == "arm" &&
-            binding.capability_id.value() == "execution.trajectory.execute";
+            (binding.capability_id.value() == "execution.trajectory.execute" ||
+             binding.capability_id.value() ==
+                 "execution.runtime_scale.operation_scoped");
         if (trajectory_binding) {
           if (binding.runtime_scale_route_qualifications.size() != 1U) {
             throw std::invalid_argument(
@@ -2221,10 +2247,10 @@ void verify_scenarios(const std::filesystem::path &root,
       }
     }
     if (!scenario.ros2_control_execution &&
-        native_runtime_scale_binding_count != 1U) {
-      throw std::invalid_argument(
-          "native scenario does not select exactly one runtime-scale binding: " +
-          std::string(scenario.source));
+        native_runtime_scale_binding_count != 2U) {
+      throw std::invalid_argument("native scenario does not select trajectory "
+                                  "and node scaling bindings: " +
+                                  std::string(scenario.source));
     }
     for (const auto &binding : applicability.capability_provider_bindings) {
       if (!binding.capability_id.value().starts_with("assistant.")) {
@@ -2260,7 +2286,11 @@ void verify_scenarios(const std::filesystem::path &root,
             "provider occurrence");
       }
     }
-    if (historical_capabilities.size() != 36U) {
+    const bool has_operation_scale =
+        historical_capabilities.erase(
+            "execution.runtime_scale.operation_scoped") == 1U;
+    if (historical_capabilities.size() != 36U ||
+        has_operation_scale == scenario.ros2_control_execution) {
       throw std::invalid_argument(
           "maintained scenario does not retain all 36 historical facilities: " +
           std::string(scenario.source));
@@ -2268,7 +2298,9 @@ void verify_scenarios(const std::filesystem::path &root,
     const auto &component = graph.controllable_components.front();
     const auto &model = graph.model_instances.front();
     const std::string expected_component_id =
-        std::string(scenario.family_id) + ".component";
+        std::string(scenario.family_id) + (scenario.ros2_control_execution
+                                               ? ".fixed_scale.component"
+                                               : ".component");
     if (component.component_type_id.value() != expected_component_id ||
         model.model_asset_id.value() != scenario.family_id) {
       throw std::invalid_argument(
@@ -2278,13 +2310,20 @@ void verify_scenarios(const std::filesystem::path &root,
     const auto identity = std::pair{component.component_type_revision.value(),
                                     model.model_revision.value()};
     const auto [position, inserted] =
-        family_identities.emplace(std::string(scenario.family_id), identity);
+        family_identities.emplace(expected_component_id, identity);
     if (!inserted && position->second != identity) {
       throw std::invalid_argument(
-          "same-family scenarios select different component/model revisions");
+          "same-profile scenarios select different component/model revisions");
+    }
+    const auto [model_position, model_inserted] = family_models.emplace(
+        std::string(scenario.family_id), model.model_revision.value());
+    if (!model_inserted &&
+        model_position->second != model.model_revision.value()) {
+      throw std::invalid_argument(
+          "same-family profiles select different models");
     }
   }
-  if (family_identities.size() != 3U) {
+  if (family_identities.size() != 5U || family_models.size() != 3U) {
     throw std::logic_error("maintained scenarios do not cover three families");
   }
 }
@@ -2569,7 +2608,7 @@ int main(int argc, char **argv) {
     publish_and_verify_scenario_catalog(root, products, bindings,
                                         package.path());
     std::cout << "12 deployments, 3 shared families, 36 historical facilities, "
-                 "71 exact catalog referents, 13 durable Program Bindings, "
+                 "verified exact catalog referents, 13 durable Program Bindings, "
                  "and 13 scenario closures validated\n";
     return 0;
   } catch (const std::exception &error) {

@@ -30,10 +30,10 @@ from manyforge_behavior.catalog_schema import (
 
 
 EXPECTED_API_VERSION = "manyforge.node_catalog.v2"
-EXPECTED_CONTENT_VERSION = "1.1.0"
+EXPECTED_CONTENT_VERSION = "2.0.0"
 BUILTIN_CATALOG_ID = "manyforge_builtin"
 EXPECTED_BUILTIN_CATALOG_DIGEST = (
-    "sha256:cf249e13ee06142852da23b53d48f3bf6fa5bbc1ec92e548327ef9146afee6fe"
+    "sha256:5fce54890158a72df20063dac31531ede96dbf27b01be3a8256099c7e0ba1bb4"
 )
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
 _COMPOSABLE_PROFILE_RE = re.compile(r"^composable-cell-v(\d+)$")
@@ -672,7 +672,7 @@ class NodeCatalog:
             or self._catalog_digest != EXPECTED_BUILTIN_CATALOG_DIGEST
         ):
             raise CatalogValidationError(
-                "catalog does not match the frozen built-in v2/1.1.0 packet"
+                f"catalog does not match the frozen built-in v2/{EXPECTED_CONTENT_VERSION} packet"
             )
 
         self._entries = MappingProxyType(entries)

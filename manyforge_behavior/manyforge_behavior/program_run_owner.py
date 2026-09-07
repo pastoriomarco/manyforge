@@ -841,6 +841,43 @@ class ProgramRunOwner:
                 )
             task_id = intervention.owner_task_id
             identity = intervention.identity
+            # Capture before recovery refreshes the offer. Only this Stop may
+            # be handed off by an explicit motion-Resume workflow.
+            previous_assessment = intervention.owner_assessment or {}
+            stop_id = previous_assessment.get("stop_id")
+            stop_generation = previous_assessment.get("stop_generation")
+            expected_stop = (
+                (stop_id, stop_generation)
+                if isinstance(stop_id, str)
+                and stop_id
+                and type(stop_generation) is int
+                and stop_generation > 0
+                else None
+            )
+        if expected_stop is not None and action != "acknowledge_and_continue":
+            # One participant's recovery offer does not prove the complete
+            # Program Stop is settled. Do not begin Resume while another
+            # participant can still join that same active Stop occurrence.
+            try:
+                captured_stop = self._scope.capture_stop(program_run_id)
+                if captured_stop is None:
+                    expected_stop = None
+                    settled, scope_reason = True, None
+                else:
+                    if captured_stop != expected_stop:
+                        raise ProgramRunOwnerError("Program Stop handoff is stale")
+                    scope = self._scope.observe(program_run_id)
+                    _count, settled, scope_reason = self._scope_fields(
+                        scope, program_run_id
+                    )
+            except Exception as error:
+                raise ProgramRunOwnerError(
+                    "Program Stop settlement is unavailable"
+                ) from error
+            if not settled or scope_reason is not None:
+                raise ProgramRunOwnerError(
+                    "Program Stop must settle completely before Resume"
+                )
         result = recover(
             task_id,
             identity,
@@ -852,6 +889,35 @@ class ProgramRunOwner:
             raise ProgramRunOwnerOutcomeUnknownError(
                 "owner recovery returned an invalid result"
             )
+        if (
+            result["accepted"]
+            and action != "acknowledge_and_continue"
+            and expected_stop is not None
+        ):
+            with self._lock:
+                if (
+                    self._entry(program_run_id).state
+                    is not ProgramRunState.INTERVENTION_REQUIRED
+                    or self.intervention(program_run_id) != intervention
+                ):
+                    raise ProgramRunOwnerOutcomeUnknownError(
+                        "Program state changed after recovery acceptance; Resume was not applied"
+                    )
+            try:
+                released = self._scope.release_stop(
+                    program_run_id, expected_stop=expected_stop
+                )
+                _count, settled, scope_reason = self._scope_fields(
+                    released, program_run_id
+                )
+                if not settled or scope_reason is not None:
+                    raise ProgramRunOwnerError(
+                        scope_reason or "motion Stop handoff is not settled"
+                    )
+            except Exception as error:
+                raise ProgramRunOwnerOutcomeUnknownError(
+                    "recovery was accepted but its exact motion Stop handoff is unresolved"
+                ) from error
         assessment = result.get("resulting_assessment")
         if isinstance(assessment, Mapping):
             port = self._ports.program_interventions
@@ -902,6 +968,7 @@ class ProgramRunOwner:
         reason_code: str | None,
         message: str,
         stop_request_id: str | None = None,
+        explicit: bool = False,
     ) -> ProgramRunSnapshot:
         with self._lock:
             transition_lock = self._entry(program_run_id).transition_lock
@@ -926,10 +993,11 @@ class ProgramRunOwner:
                         ProgramRunState.FULL_STOPPING,
                         ProgramRunState.FULL_STOPPED,
                     }
-                    issue_stop = not entry.stop_requested
+                    first_stop = not entry.stop_requested
+                    issue_stop = first_stop or explicit
                     observe_existing_stop = transitioning_from_full_stop
-                    invalidate_tree = issue_stop or transitioning_from_full_stop
-                    if issue_stop or transitioning_from_full_stop:
+                    invalidate_tree = first_stop or transitioning_from_full_stop
+                    if first_stop or transitioning_from_full_stop:
                         entry.stop_requested = True
                         entry.state = ProgramRunState.STOPPING
                         entry.state_after_stop = state_after_stop
@@ -1038,6 +1106,7 @@ class ProgramRunOwner:
             state_after_stop=ProgramRunState.STOPPED,
             reason_code=None,
             message="",
+            explicit=True,
         )
 
     def stop_motion(
@@ -1110,33 +1179,50 @@ class ProgramRunOwner:
                 entry.revision += 1
                 preserve_boundary = entry.state is ProgramRunState.FULL_STOPPING
                 snapshot = self._snapshot(entry)
-            if not preserve_boundary or not transition_lock.acquire(blocking=False):
+            if (
+                not preserve_boundary
+                or not _settled
+                or not transition_lock.acquire(blocking=False)
+            ):
                 return snapshot
             try:
-                return self._complete_full_stop(program_run_id)
+                return self._complete_full_stop(
+                    program_run_id, expected_revision=snapshot.run_revision
+                )
             finally:
                 transition_lock.release()
 
-    def _complete_full_stop(self, program_run_id: str) -> ProgramRunSnapshot:
+    def _complete_full_stop(
+        self, program_run_id: str, *, expected_revision: int
+    ) -> ProgramRunSnapshot:
         """Freeze a physically settled run without invalidating its tree."""
 
         with self._lock:
             entry = self._entry(program_run_id)
-            if entry.state is not ProgramRunState.FULL_STOPPING:
+            if (
+                entry.state is not ProgramRunState.FULL_STOPPING
+                or entry.revision != expected_revision
+            ):
                 return self._snapshot(entry)
             run = entry.run
+            captured_revision = entry.revision
         try:
             active, _held, unrecoverable = run.reconcile_full_stop_tasks()
         except Exception as error:
             with self._lock:
                 entry = self._entry(program_run_id)
+                if entry.revision != captured_revision:
+                    return self._snapshot(entry)
                 entry.active_operation_count = None
                 entry.reason_code = "program_full_stop_task_state_unknown"
                 entry.message = str(error) or type(error).__name__
                 return self._snapshot(entry)
         with self._lock:
             entry = self._entry(program_run_id)
-            if entry.state is not ProgramRunState.FULL_STOPPING:
+            if (
+                entry.state is not ProgramRunState.FULL_STOPPING
+                or entry.revision != captured_revision
+            ):
                 return self._snapshot(entry)
             if active:
                 entry.active_operation_count = active
@@ -1172,8 +1258,10 @@ class ProgramRunOwner:
         if reason is not None:
             _text(reason, field="reason", maximum_bytes=4_096)
         with self._lock:
-            transition_lock = self._entry(program_run_id).transition_lock
-        with transition_lock:
+            entry = self._entry(program_run_id)
+            transition_lock = entry.transition_lock
+            stop_lock = entry.motion_stop_lock
+        with stop_lock:
             with self._lock:
                 entry = self._entry(program_run_id)
                 if entry.state in {
@@ -1184,26 +1272,23 @@ class ProgramRunOwner:
                     ProgramRunState.STOPPING,
                 }:
                     return self._snapshot(entry)
-                if entry.state is ProgramRunState.FULL_STOPPED:
-                    return self._snapshot(entry)
-                if entry.state is ProgramRunState.FULL_STOPPING:
-                    reconcile = True
-                elif entry.state in {
+                if entry.state in {
                     ProgramRunState.RUNNING,
                     ProgramRunState.INTERVENTION_REQUIRED,
+                    ProgramRunState.FULL_STOPPED,
                 }:
-                    reconcile = False
                     entry.state = ProgramRunState.FULL_STOPPING
                     entry.stop_requested = True
                     entry.reason_code = None
                     entry.message = ""
-                    entry.revision += 1
-                else:
+                elif entry.state is not ProgramRunState.FULL_STOPPING:
                     raise ProgramRunOwnerError(
                         "Full Stop requires a current Program run"
                     )
-            if reconcile:
-                return self.reconcile_full_stop(program_run_id)
+                entry.revision += 1
+                request_revision = entry.revision
+            # This is an explicit command, not passive reconciliation. Let
+            # the Kernel join/recapture even after an earlier lost reply.
             try:
                 scope = self._scope.request_stop(
                     program_run_id,
@@ -1216,22 +1301,29 @@ class ProgramRunOwner:
             except Exception as error:
                 with self._lock:
                     entry = self._entry(program_run_id)
+                    if entry.revision != request_revision:
+                        return self._snapshot(entry)
                     entry.active_operation_count = None
                     entry.reason_code = "program_run_scope_unknown"
                     entry.message = str(error) or type(error).__name__
                     return self._snapshot(entry)
             with self._lock:
                 entry = self._entry(program_run_id)
+                if entry.revision != request_revision:
+                    return self._snapshot(entry)
                 entry.active_operation_count = active_count
                 if scope_reason is not None:
                     entry.reason_code = scope_reason
                     entry.message = "Kernel Program-run scope is unknown"
                     settled = False
-            return (
-                self._complete_full_stop(program_run_id)
-                if settled
-                else self.read(program_run_id)
-            )
+            if not settled or not transition_lock.acquire(blocking=False):
+                return self.read(program_run_id)
+            try:
+                return self._complete_full_stop(
+                    program_run_id, expected_revision=request_revision
+                )
+            finally:
+                transition_lock.release()
 
     def reconcile_full_stop(self, program_run_id: str) -> ProgramRunSnapshot:
         with self._lock:
@@ -1244,6 +1336,7 @@ class ProgramRunOwner:
                 entry = self._entry(program_run_id)
                 if entry.state is not ProgramRunState.FULL_STOPPING:
                     return self._snapshot(entry)
+                captured_revision = entry.revision
             try:
                 scope = self._scope.observe(program_run_id)
                 active_count, settled, scope_reason = self._scope_fields(
@@ -1252,19 +1345,25 @@ class ProgramRunOwner:
             except Exception as error:
                 with self._lock:
                     entry = self._entry(program_run_id)
+                    if entry.revision != captured_revision:
+                        return self._snapshot(entry)
                     entry.active_operation_count = None
                     entry.reason_code = "program_run_scope_unknown"
                     entry.message = str(error) or type(error).__name__
                     return self._snapshot(entry)
             with self._lock:
                 entry = self._entry(program_run_id)
+                if entry.revision != captured_revision:
+                    return self._snapshot(entry)
                 entry.active_operation_count = active_count
                 if scope_reason is not None:
                     entry.reason_code = scope_reason
                     entry.message = "Kernel Program-run scope is unknown"
                     settled = False
             return (
-                self._complete_full_stop(program_run_id)
+                self._complete_full_stop(
+                    program_run_id, expected_revision=captured_revision
+                )
                 if settled
                 else self.read(program_run_id)
             )
@@ -1294,6 +1393,8 @@ class ProgramRunOwner:
                     )
                 run = entry.run
                 maximum_recoveries = len(entry.node_statuses) + 1
+                captured_revision = entry.revision
+            expected_stop = self._scope.capture_stop(program_run_id)
             interventions = self._ports.program_interventions
             for _index in range(maximum_recoveries):
                 active, held, unrecoverable = run.reconcile_full_stop_tasks()
@@ -1325,21 +1426,18 @@ class ProgramRunOwner:
                     raise ProgramRunOwnerOutcomeUnknownError(
                         "Full Stop lost an exact stopped task identity"
                     )
-                owner_port = getattr(
-                    self._ports, intervention.owner_port_name, None
-                )
+                owner_port = getattr(self._ports, intervention.owner_port_name, None)
                 recover = getattr(owner_port, "recover", None)
                 if not callable(recover):
                     raise ProgramRunOwnerError(
                         "preserved Full Stop task does not support fresh-state recovery"
                     )
-                recovery_request_id = "full-stop-resume:" + sha256(
-                    (
-                        request_id
-                        + ":"
-                        + intervention.owner_task_id
-                    ).encode("utf-8")
-                ).hexdigest()
+                recovery_request_id = (
+                    "full-stop-resume:"
+                    + sha256(
+                        (request_id + ":" + intervention.owner_task_id).encode("utf-8")
+                    ).hexdigest()
+                )
                 result = recover(
                     intervention.owner_task_id,
                     intervention.identity,
@@ -1347,9 +1445,10 @@ class ProgramRunOwner:
                     request_id=recovery_request_id,
                     reason=reason,
                 )
-                if not isinstance(result, Mapping) or type(
-                    result.get("accepted")
-                ) is not bool:
+                if (
+                    not isinstance(result, Mapping)
+                    or type(result.get("accepted")) is not bool
+                ):
                     raise ProgramRunOwnerOutcomeUnknownError(
                         "Full Stop owner recovery returned an invalid result"
                     )
@@ -1362,6 +1461,15 @@ class ProgramRunOwner:
                         else "fresh current-state recovery was rejected"
                     )
                     raise ProgramRunOwnerError(message)
+                with self._lock:
+                    entry = self._entry(program_run_id)
+                    if (
+                        entry.state is not ProgramRunState.FULL_STOPPED
+                        or entry.revision != captured_revision
+                    ):
+                        raise ProgramRunOwnerOutcomeUnknownError(
+                            "Program state changed during Full Stop recovery"
+                        )
                 try:
                     interventions.resolve(
                         intervention.identity,
@@ -1380,7 +1488,11 @@ class ProgramRunOwner:
                 raise ProgramRunOwnerOutcomeUnknownError(
                     "Full Stop recovery left an unresolved held task"
                 )
-            released = self._scope.release_stop(program_run_id)
+            released = (
+                self._scope.release_stop(program_run_id, expected_stop=expected_stop)
+                if expected_stop is not None
+                else self._scope.observe(program_run_id)
+            )
             active_count, settled, scope_reason = self._scope_fields(
                 released, program_run_id
             )
@@ -1390,7 +1502,10 @@ class ProgramRunOwner:
                 )
             with self._lock:
                 entry = self._entry(program_run_id)
-                if entry.state is not ProgramRunState.FULL_STOPPED:
+                if (
+                    entry.state is not ProgramRunState.FULL_STOPPED
+                    or entry.revision != captured_revision
+                ):
                     raise ProgramRunOwnerOutcomeUnknownError(
                         "Program state changed during Full Stop recovery"
                     )

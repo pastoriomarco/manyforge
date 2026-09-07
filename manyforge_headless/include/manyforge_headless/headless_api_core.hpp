@@ -149,7 +149,6 @@ struct HeadlessApiCoreConfig final {
   RuntimeSnapshotFreshnessPolicy freshness_policy;
   std::size_t historian_queue_capacity{kDefaultHistorianQueueCapacity};
   std::size_t historian_record_retention{kDefaultHistorianRecordRetention};
-  std::size_t mutation_replay_capacity{4096U};
 };
 
 struct HeadlessApiCoreClocks final {
@@ -227,7 +226,9 @@ public:
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   HistoryPage(const HistorianQuery &query);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
-  HistorySummaryPage(const HistorianQuery &query);
+  HistoryQueryPage(const HistorianQuery &query, bool full_records = false);
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
+  HistoryDiscovery(const std::string &kind, const std::string &after, std::size_t limit);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   HistoryDetail(std::uint64_t sequence);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
@@ -237,7 +238,8 @@ public:
                        std::string reason_code, std::uint64_t occurrence_count,
                        std::optional<std::uint64_t> maximum_delay_ns,
                        std::uint64_t first_observed_ns,
-                       std::uint64_t last_observed_ns);
+                       std::uint64_t last_observed_ns,
+                       std::map<std::string, std::string> causal_context = {});
   [[nodiscard]] manyforge::content_identity::CanonicalValue HistorianHealth();
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   ReconcileHistorianHealth(std::uint64_t expected_health_generation,
@@ -275,11 +277,6 @@ private:
     std::uint64_t source_sequence{};
     std::string last_condition_fingerprint;
     std::optional<AlarmConditionUpdate> last_update;
-  };
-
-  struct ReplayEntry final {
-    std::string request_digest;
-    manyforge::content_identity::CanonicalValue response;
   };
 
   [[nodiscard]] HeadlessRuntimeSnapshot RefreshLocked();
@@ -336,12 +333,6 @@ private:
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   MutationResponse(const AlarmMutation &mutation,
                    const std::vector<std::string> &audit_event_ids);
-  [[nodiscard]] std::optional<manyforge::content_identity::CanonicalValue>
-  LookupReplayLocked(std::string_view request_key,
-                     std::string_view request_digest) const;
-  void RequireReplayCapacityLocked() const;
-  void StoreReplayLocked(std::string request_key, std::string request_digest,
-                         manyforge::content_identity::CanonicalValue response);
 
   HeadlessApiCoreConfig config_;
   HeadlessApiCoreClocks clocks_;
@@ -383,7 +374,6 @@ private:
   std::map<std::string, AlarmSubject> active_stop_faults_;
   std::set<std::string> observed_stop_faults_;
   mutable std::mutex mutex_;
-  std::map<std::string, ReplayEntry> replay_;
   std::uint64_t node_environment_generation_{};
   std::string previous_node_environment_digest_;
   std::uint64_t source_model_generation_{};

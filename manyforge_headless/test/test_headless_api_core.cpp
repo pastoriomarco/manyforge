@@ -138,7 +138,6 @@ Config(const TemporaryDirectory &directory, std::string owner_epoch,
                                      10'000'000'000LL},
       32U,
       1000U,
-      32U,
   };
 }
 
@@ -290,9 +289,8 @@ CanonicalValue OperationJournalPayload(
                                     : CanonicalValue(nullptr);
   return CanonicalValue(CanonicalValue::Object{
       {"api_version", CanonicalValue("manyforge.operation_journal_record.v1")},
-      {"effect_pending",
-       CanonicalValue(record_kind != "state_observed" &&
-                      record_kind != "operation_prepared")},
+      {"effect_pending", CanonicalValue(record_kind != "state_observed" &&
+                                        record_kind != "operation_prepared")},
       {"intent", CanonicalValue(CanonicalValue::Object{})},
       {"operation_state",
        CanonicalValue(CanonicalValue::Object{
@@ -363,8 +361,7 @@ StopTerminalProjectionPayload(const std::string &owner_epoch,
                 {"persistence_degraded", CanonicalValue(false)},
                 {"reason_code", CanonicalValue("stop_escalated")},
                 {"recovery_assessment_revision", CanonicalValue(1.0)},
-                {"recovery_status",
-                 CanonicalValue("waiting_for_observation")},
+                {"recovery_status", CanonicalValue("waiting_for_observation")},
                 {"state", CanonicalValue("latched")},
                 {"stop_certificate",
                  CanonicalValue(CanonicalValue::Object{
@@ -433,8 +430,7 @@ StopTerminalProjectionPayload(const std::string &owner_epoch,
   });
 }
 
-CanonicalValue StopFaultClearProjectionPayload(
-    const std::string &owner_epoch) {
+CanonicalValue StopFaultClearProjectionPayload(const std::string &owner_epoch) {
   return CanonicalValue(CanonicalValue::Object{
       {"api_version",
        CanonicalValue("manyforge.stop_fault_clear_projection.v1")},
@@ -465,15 +461,13 @@ CanonicalValue StopFaultClearProjectionPayload(
       {"owner_epoch", CanonicalValue(owner_epoch)},
       {"record_kind", CanonicalValue("stop_fault_cleared")},
       {"request_id", CanonicalValue("stop-fault-reset.test.1")},
-      {"result",
-       CanonicalValue(CanonicalValue::Object{
-           {"accepted", CanonicalValue(true)},
-           {"error", CanonicalValue(nullptr)},
-           {"replay_status", CanonicalValue("accepted_new")},
-           {"request_id", CanonicalValue("stop-fault-reset.test.1")},
-       })},
-      {"stop_certificate_id",
-       CanonicalValue("stop-certificate.test.1")},
+      {"result", CanonicalValue(CanonicalValue::Object{
+                     {"accepted", CanonicalValue(true)},
+                     {"error", CanonicalValue(nullptr)},
+                     {"replay_status", CanonicalValue("accepted_new")},
+                     {"request_id", CanonicalValue("stop-fault-reset.test.1")},
+                 })},
+      {"stop_certificate_id", CanonicalValue("stop-certificate.test.1")},
       {"stop_certificate_revision", CanonicalValue(1.0)},
       {"stop_generation", CanonicalValue(1.0)},
       {"stop_id", CanonicalValue("stop.test.1")},
@@ -482,21 +476,18 @@ CanonicalValue StopFaultClearProjectionPayload(
 
 CanonicalValue CurrentStopFaultLatch() {
   return CanonicalValue(CanonicalValue::Object{
-      {"captured_operation_ids",
-       CanonicalValue(CanonicalValue::Array{
-           CanonicalValue("operation.test.1"),
-       })},
-      {"captured_resources",
-       CanonicalValue(CanonicalValue::Array{
-           CanonicalValue("resource.arm.a"),
-       })},
+      {"captured_operation_ids", CanonicalValue(CanonicalValue::Array{
+                                     CanonicalValue("operation.test.1"),
+                                 })},
+      {"captured_resources", CanonicalValue(CanonicalValue::Array{
+                                 CanonicalValue("resource.arm.a"),
+                             })},
       {"cell_id", CanonicalValue(std::string(kCellId))},
-      {"clear_projection",
-       CanonicalValue(CanonicalValue::Object{
-           {"error", CanonicalValue(nullptr)},
-           {"retry_generation", CanonicalValue(nullptr)},
-           {"state", CanonicalValue("not_applicable")},
-       })},
+      {"clear_projection", CanonicalValue(CanonicalValue::Object{
+                               {"error", CanonicalValue(nullptr)},
+                               {"retry_generation", CanonicalValue(nullptr)},
+                               {"state", CanonicalValue("not_applicable")},
+                           })},
       {"evidence_refs", CanonicalValue(CanonicalValue::Array{})},
       {"graph_revision", CanonicalValue(Digest('6'))},
       {"latch_generation", CanonicalValue(1.0)},
@@ -509,20 +500,18 @@ CanonicalValue CurrentStopFaultLatch() {
       {"state", CanonicalValue("latched")},
       {"stop_certificate",
        CanonicalValue(CanonicalValue::Object{
-           {"stop_certificate_id",
-            CanonicalValue("stop-certificate.test.1")},
+           {"stop_certificate_id", CanonicalValue("stop-certificate.test.1")},
            {"stop_certificate_revision", CanonicalValue(1.0)},
            {"stop_generation", CanonicalValue(1.0)},
            {"stop_id", CanonicalValue("stop.test.1")},
        })},
       {"stop_generation", CanonicalValue(1.0)},
       {"stop_id", CanonicalValue("stop.test.1")},
-      {"terminal_projection",
-       CanonicalValue(CanonicalValue::Object{
-           {"error", CanonicalValue(nullptr)},
-           {"retry_generation", CanonicalValue(nullptr)},
-           {"state", CanonicalValue("recorded")},
-       })},
+      {"terminal_projection", CanonicalValue(CanonicalValue::Object{
+                                  {"error", CanonicalValue(nullptr)},
+                                  {"retry_generation", CanonicalValue(nullptr)},
+                                  {"state", CanonicalValue("recorded")},
+                              })},
       {"trigger", CanonicalValue("escalated")},
   });
 }
@@ -771,19 +760,19 @@ TEST(HeadlessApiCore,
       Unsigned(provider, "record_revision"), Caller(), "operator aware", true);
   EXPECT_TRUE(std::get<bool>(Member(response, "changed").storage()));
   EXPECT_EQ(Array(response, "audit_event_ids").size(), 1U);
-  const auto replay = core.AcknowledgeAlarm(
+  const auto duplicate = core.AcknowledgeAlarm(
       Text(provider, "condition_id"), Text(provider, "activation_id"),
       Unsigned(provider, "record_revision"), Caller(), "operator aware", true);
-  EXPECT_EQ(replay, response);
-  try {
-    static_cast<void>(core.AcknowledgeAlarm(
-        Text(provider, "condition_id"), Text(provider, "activation_id"),
-        Unsigned(provider, "record_revision"), Caller(), "changed reason",
-        true));
-    FAIL() << "conflicting request replay was accepted";
-  } catch (const OperatorAlarmError &error) {
-    EXPECT_EQ(error.code(), "headless_request_identity_conflict");
-  }
+  EXPECT_EQ(Text(duplicate, "status"), "already_acknowledged");
+  EXPECT_FALSE(std::get<bool>(Member(duplicate, "changed").storage()));
+  EXPECT_TRUE(Array(duplicate, "audit_event_ids").empty());
+  // Attribution is not an owner-lifetime receipt key. The exact activation
+  // remains acknowledged, even if another caller supplies a different reason.
+  const auto repeated = core.AcknowledgeAlarm(
+      Text(provider, "condition_id"), Text(provider, "activation_id"),
+      Unsigned(provider, "record_revision"), Caller(), "changed reason", true);
+  EXPECT_FALSE(std::get<bool>(Member(repeated, "changed").storage()));
+  EXPECT_TRUE(Array(repeated, "audit_event_ids").empty());
 
   const auto deadline = std::chrono::steady_clock::now() + 2s;
   while (HistoryCount(core) < 2U &&
@@ -1231,24 +1220,22 @@ TEST(HeadlessApiCore,
 }
 
 TEST(HeadlessApiCore,
-     HistorianReconciliationIsAttributedReplayedAndNeverSilentlyEvicted) {
+     HealthyReconciliationHasNoReceiptLifetimeOrRepeatedAuditEffect) {
   TemporaryDirectory directory;
-  auto config = Config(directory, "api.epoch.1");
-  config.mutation_replay_capacity = 2U;
-  HeadlessApiCore core(std::move(config), Clocks());
+  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
 
   const auto first = core.ReconcileHistorianHealth(0U, Caller("request.1"));
   EXPECT_EQ(Text(first, "schema_version"),
             "manyforge.historian_reconciliation.v1");
-  EXPECT_TRUE(std::get<bool>(Member(first, "reconciled").storage()));
-  ASSERT_EQ(Array(first, "audit_event_ids").size(), 1U);
+  EXPECT_FALSE(std::get<bool>(Member(first, "reconciled").storage()));
+  EXPECT_TRUE(Array(first, "audit_event_ids").empty());
   EXPECT_EQ(core.ReconcileHistorianHealth(0U, Caller("request.1")), first);
 
   try {
     static_cast<void>(core.ReconcileHistorianHealth(1U, Caller("request.1")));
-    FAIL() << "one request identity accepted conflicting reconciliation data";
-  } catch (const OperatorAlarmError &error) {
-    EXPECT_EQ(error.code(), "headless_request_identity_conflict");
+    FAIL() << "a non-current generation reconciled historian health";
+  } catch (const EventHistorianError &error) {
+    EXPECT_EQ(error.code(), "historian_health_generation_stale");
   }
   try {
     static_cast<void>(core.ReconcileHistorianHealth(
@@ -1258,22 +1245,66 @@ TEST(HeadlessApiCore,
     EXPECT_EQ(error.code(), "stale_request_owner_epoch");
   }
 
-  const auto second = core.ReconcileHistorianHealth(0U, Caller("request.2"));
-  EXPECT_TRUE(std::get<bool>(Member(second, "reconciled").storage()));
-  try {
-    static_cast<void>(core.ReconcileHistorianHealth(0U, Caller("request.3")));
-    FAIL() << "full mutation ledger silently evicted an earlier request";
-  } catch (const OperatorAlarmError &error) {
-    EXPECT_EQ(error.code(), "headless_request_ledger_full");
+  // More than twice the removed default receipt capacity, without retained
+  // per-request state, historian work, or eventual permanent refusal.
+  for (std::size_t index = 0U; index < 10000U; ++index) {
+    EXPECT_EQ(core.ReconcileHistorianHealth(
+                  0U, Caller("request." + std::to_string(index))),
+              first);
   }
   EXPECT_EQ(core.ReconcileHistorianHealth(0U, Caller("request.1")), first);
+  EXPECT_EQ(HistoryCount(core), 0U);
+}
 
-  const auto deadline = std::chrono::steady_clock::now() + 2s;
-  while (HistoryCount(core) < 2U &&
-         std::chrono::steady_clock::now() < deadline) {
-    std::this_thread::yield();
+TEST(
+    HeadlessApiCore,
+    DistinctAlarmMutationsOutliveSmallHistoryWithoutAcknowledgingNewerActivations) {
+  TemporaryDirectory directory;
+  auto config = Config(directory, "api.epoch.1");
+  config.historian_record_retention = 4U;
+  HeadlessApiCore core(config, Clocks());
+  std::string old_condition;
+  std::string old_activation;
+  std::uint64_t old_revision = 0;
+  for (std::uint64_t index = 1; index <= 64; ++index) {
+    PublishHealthySources(directory, "failed", index * 2);
+    const auto snapshot = core.AlarmSnapshot();
+    const auto &active = OnlyAlarm(snapshot);
+    const auto condition = Text(active, "condition_id");
+    const auto activation = Text(active, "activation_id");
+    const auto revision = Unsigned(active, "record_revision");
+    if (!old_activation.empty()) {
+      EXPECT_THROW(static_cast<void>(core.AcknowledgeAlarm(
+                       old_condition, old_activation, old_revision,
+                       Caller("late.previous"), std::nullopt, true)),
+                   OperatorAlarmError);
+    }
+    const auto acknowledged = core.AcknowledgeAlarm(
+        condition, activation, revision, Caller("ack." + std::to_string(index)),
+        std::nullopt, true);
+    EXPECT_EQ(Array(acknowledged, "audit_event_ids").size(), 1U);
+    const auto duplicate = core.AcknowledgeAlarm(
+        condition, activation, revision,
+        Caller("retry." + std::to_string(index)), std::nullopt, true);
+    EXPECT_TRUE(Array(duplicate, "audit_event_ids").empty());
+    PublishHealthySources(directory, "open", index * 2 + 1);
+    EXPECT_TRUE(Array(core.AlarmSnapshot(), "alarms").empty());
+    old_condition = condition;
+    old_activation = activation;
+    old_revision = revision;
   }
-  EXPECT_EQ(HistoryCount(core), 2U);
+  HistorianQuery query;
+  query.limit = 32U;
+  const auto page = core.HistoryQueryPage(query, false);
+  const auto &retention = Member(page, "retention");
+  EXPECT_EQ(Text(retention, "partition_row_limit"), "4");
+  const auto &partitions = Array(retention, "partitions");
+  ASSERT_EQ(partitions.size(), 2U);
+  for (const auto &partition : partitions) {
+    EXPECT_LE(std::stoull(Text(partition, "retained_count")), 4U);
+    EXPECT_GT(std::stoull(Text(partition, "pruned_count")), 0U);
+  }
+  EXPECT_LE(Array(page, "events").size(), 8U);
 }
 
 TEST(HeadlessApiCore,
@@ -1353,15 +1384,18 @@ TEST(HeadlessApiCore,
 
   const auto activated = core.RecordClientIncident(
       "client-incident.one", "control_delayed", "activated",
-      "control-session.one", "client.one", "operator_ui",
-      "heartbeat_delayed", 1U, 600'000'000U, 100U, 100U);
+      "control-session.one", "client.one", "operator_ui", "heartbeat_delayed",
+      1U, 600'000'000U, 100U, 100U);
   EXPECT_EQ(Text(activated, "schema_version"),
             "manyforge.client_incident_record.v1");
   EXPECT_TRUE(std::get<bool>(Member(activated, "recorded").storage()));
   const auto resolved = core.RecordClientIncident(
       "client-incident.one", "control_delayed", "resolved",
-      "control-session.one", "client.one", "operator_ui",
-      "heartbeat_recovered", 3U, 700'000'000U, 100U, 800U);
+      "control-session.one", "client.one", "operator_ui", "heartbeat_recovered",
+      3U, 700'000'000U, 100U, 800U,
+      {{"program_run_id", "run.at.incident"},
+       {"scene_id", "scene.at.incident"},
+       {"program_source_current", "false"}});
   EXPECT_TRUE(std::get<bool>(Member(resolved, "recorded").storage()));
 
   HistorianQuery query;
@@ -1383,13 +1417,19 @@ TEST(HeadlessApiCore,
   EXPECT_EQ(Text(payload, "original_severity"), "WARN");
   EXPECT_EQ(Text(payload, "first_observed_ns"), "100");
   EXPECT_EQ(Text(payload, "last_observed_ns"), "800");
+  EXPECT_EQ(Text(Member(payload, "causal_context"), "program_run_id"),
+            "run.at.incident");
+  EXPECT_EQ(Text(Member(payload, "causal_context"), "scene_id"),
+            "scene.at.incident");
+  EXPECT_EQ(Text(Member(payload, "causal_context"), "capture_semantics"),
+            "last_received_source_facts");
 
   constexpr auto kBeyondJsonSafeInteger = std::uint64_t{1} << 53U;
   EXPECT_NO_THROW(static_cast<void>(core.RecordClientIncident(
       "client-incident.long-lived", "control_delayed", "activated",
-      "control-session.one", "client.one", "operator_ui",
-      "heartbeat_delayed", 1U, 600'000'000U,
-      kBeyondJsonSafeInteger + 1U, kBeyondJsonSafeInteger + 2U)));
+      "control-session.one", "client.one", "operator_ui", "heartbeat_delayed",
+      1U, 600'000'000U, kBeyondJsonSafeInteger + 1U,
+      kBeyondJsonSafeInteger + 2U)));
 
   try {
     static_cast<void>(core.RecordClientIncident(
@@ -1488,8 +1528,8 @@ TEST(HeadlessApiCore,
       source_epoch, "operation_prepared", "prepared", CanonicalValue(nullptr));
   const auto prepared_json = content_identity::canonical_json(prepared);
   const auto ingested = core.IngestOperationEvent(
-      source_epoch, 1U, "operation_prepared", std::nullopt, "operation.test.1", 1U,
-      100U, "2026-08-07T10:00:00.000000001Z", false, prepared,
+      source_epoch, 1U, "operation_prepared", std::nullopt, "operation.test.1",
+      1U, 100U, "2026-08-07T10:00:00.000000001Z", false, prepared,
       content_identity::sha256_digest(prepared_json));
   EXPECT_EQ(Text(ingested, "status"), "ingested");
   EXPECT_TRUE(Array(core.AlarmSnapshot(), "alarms").empty());
@@ -1504,8 +1544,86 @@ TEST(HeadlessApiCore,
   }
   const auto page = core.HistoryPage(query);
   ASSERT_EQ(Array(page, "events").size(), 1U);
-  EXPECT_EQ(Member(Member(Array(page, "events").front(), "event"), "event_type"),
-            CanonicalValue("operation_prepared"));
+  EXPECT_EQ(
+      Member(Member(Array(page, "events").front(), "event"), "event_type"),
+      CanonicalValue("operation_prepared"));
+}
+
+TEST(HeadlessApiCore, OrderedJournalCapturesPreserveExactInt64HistoryIngress) {
+  for (const auto order : {std::uint64_t{1}, (std::uint64_t{1} << 53U) + 1U,
+                           static_cast<std::uint64_t>(INT64_MAX)}) {
+    SCOPED_TRACE(order);
+    TemporaryDirectory directory;
+    HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+    const std::string epoch = "execution-host.ordered";
+    auto fields = OperationJournalPayload(epoch, "operation_prepared",
+                                          "prepared", CanonicalValue(nullptr))
+                      .as_object();
+    for (auto &[name, value] : fields) {
+      if (name == "api_version")
+        value = CanonicalValue("manyforge.operation_journal_record.v2");
+      if (name == "operation_state") {
+        auto state = value.as_object();
+        state.emplace_back("journal_capture_order",
+                           CanonicalValue(std::to_string(order)));
+        value = CanonicalValue(std::move(state));
+      }
+    }
+    const CanonicalValue payload(std::move(fields));
+    const auto ingested = core.IngestOperationEvent(
+        epoch, 1U, "operation_prepared", std::nullopt, "operation.test.1", 1U,
+        100U, "2026-09-07T10:00:00.000000001Z", false, payload,
+        content_identity::sha256_digest(
+            content_identity::canonical_json(payload)));
+    EXPECT_EQ(Text(ingested, "status"), "ingested");
+    EXPECT_TRUE(Array(core.AlarmSnapshot(), "alarms").empty());
+  }
+}
+
+TEST(HeadlessApiCore,
+     OversizedCommittedFactHasRecoverableGenerationFencedHistoryHealth) {
+  TemporaryDirectory directory;
+  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+  const std::string epoch = "execution-host.epoch.1";
+  const auto normal = OperationJournalPayload(
+      epoch, "operation_prepared", "prepared", CanonicalValue(nullptr));
+  auto fields = std::get<CanonicalValue::Object>(normal.storage());
+  for (auto &[key, value] : fields) {
+    if (key == "intent") {
+      value = CanonicalValue(CanonicalValue::Object{
+          {"diagnostic", CanonicalValue(std::string(300 * 1024, 'x'))}});
+    }
+  }
+  const CanonicalValue oversized(std::move(fields));
+  const auto ingest = [&](const CanonicalValue &payload,
+                          const std::uint64_t sequence) {
+    return core.IngestOperationEvent(
+        epoch, sequence, "operation_prepared", std::nullopt, "operation.test.1",
+        1U, 100, "2026-08-07T10:00:00Z", false, payload,
+        content_identity::sha256_digest(
+            content_identity::canonical_json(payload)));
+  };
+  EXPECT_EQ(Text(ingest(oversized, 1), "status"), "ingested");
+  const auto failed = core.HistorianHealth();
+  EXPECT_FALSE(std::get<bool>(Member(failed, "available").storage()));
+  const auto generation = Unsigned(failed, "health_generation");
+  EXPECT_FALSE(std::get<bool>(
+      Member(core.ReconcileHistorianHealth(generation, Caller("early")),
+             "reconciled")
+          .storage()));
+  EXPECT_EQ(Text(ingest(normal, 2), "status"), "ingested");
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  while (!std::get<bool>(
+             Member(core.HistorianHealth(), "recovery_ready").storage()) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  const auto recovered =
+      core.ReconcileHistorianHealth(generation, Caller("repair"));
+  EXPECT_TRUE(std::get<bool>(Member(recovered, "reconciled").storage()));
+  EXPECT_EQ(Array(recovered, "audit_event_ids").size(), 1U);
+  EXPECT_TRUE(
+      std::get<bool>(Member(core.HistorianHealth(), "available").storage()));
 }
 
 TEST(HeadlessApiCore,
@@ -1678,9 +1796,8 @@ TEST(HeadlessApiCore,
       content_identity::canonical_json(terminal));
 
   static_cast<void>(core.IngestOperationEvent(
-      source_epoch, 1U, "stop_terminal_projected", std::nullopt,
-      std::nullopt, std::nullopt, 1100U,
-      "2026-08-07T10:00:01.000000001Z", false, terminal,
+      source_epoch, 1U, "stop_terminal_projected", std::nullopt, std::nullopt,
+      std::nullopt, 1100U, "2026-08-07T10:00:01.000000001Z", false, terminal,
       terminal_digest));
   static_cast<void>(core.CompleteOperationEventSnapshot(source_epoch, 1U));
 
@@ -1696,18 +1813,17 @@ TEST(HeadlessApiCore,
             "stop-fault.test.1");
   EXPECT_EQ(Text(Member(active, "correlations"), "stop_certificate_id"),
             "stop-certificate.test.1");
-  EXPECT_EQ(Text(Member(Member(active, "details"), "fault_latch"),
-                 "reason_code"),
-            "stop_escalated");
+  EXPECT_EQ(
+      Text(Member(Member(active, "details"), "fault_latch"), "reason_code"),
+      "stop_escalated");
 
   const auto cleared = StopFaultClearProjectionPayload(source_epoch);
   const auto cleared_digest = content_identity::sha256_digest(
       content_identity::canonical_json(cleared));
   static_cast<void>(core.IngestOperationEvent(
       source_epoch, 2U, "stop_fault_cleared", "stop-fault-reset.test.1",
-      std::nullopt, std::nullopt, 1200U,
-      "2026-08-07T10:00:01.000000002Z", false, cleared,
-      cleared_digest));
+      std::nullopt, std::nullopt, 1200U, "2026-08-07T10:00:01.000000002Z",
+      false, cleared, cleared_digest));
   static_cast<void>(core.CompleteOperationEventSnapshot(source_epoch, 2U));
 
   const auto returned_snapshot = core.AlarmSnapshot();

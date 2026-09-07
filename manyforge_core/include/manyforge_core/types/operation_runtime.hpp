@@ -86,6 +86,10 @@ struct OperationStateDTO final {
   std::optional<StopId> active_stop_id;
   std::optional<StopGeneration> active_stop_generation;
   std::optional<RuntimeScaleGeneration> runtime_scale_generation;
+  // Private Kernel/journal capture order, never a public control precondition.
+  // Zero is reserved for unsequenced historical records; fresh Kernel captures
+  // use a checked int64-range value independent of clock and control revision.
+  std::uint64_t journal_capture_order{};
 
   friend bool operator==(const OperationStateDTO&, const OperationStateDTO&) = default;
 };

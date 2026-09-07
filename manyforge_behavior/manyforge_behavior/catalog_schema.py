@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -45,6 +46,7 @@ _NUMERIC_CONSTRAINT_KEYS = {
     "max_inclusive",
     "min_exclusive",
     "max_exclusive",
+    "not_equal",
 }
 _SEMANTIC_TYPES = {
     "blackboard_key",
@@ -102,10 +104,7 @@ class CatalogSchemaError(Exception):
 def _freeze_json_value(value: Any) -> Any:
     if isinstance(value, Mapping):
         return MappingProxyType(
-            {
-                key: _freeze_json_value(nested)
-                for key, nested in value.items()
-            }
+            {key: _freeze_json_value(nested) for key, nested in value.items()}
         )
     if isinstance(value, list):
         return tuple(_freeze_json_value(nested) for nested in value)
@@ -160,7 +159,9 @@ class CatalogSchema:
 class CatalogSchemaRegistry:
     types: Mapping[str, CatalogSchema] = field(default_factory=dict)
 
-    def resolve(self, schema: CatalogSchema, *, stack: tuple[str, ...] = ()) -> CatalogSchema:
+    def resolve(
+        self, schema: CatalogSchema, *, stack: tuple[str, ...] = ()
+    ) -> CatalogSchema:
         """Resolve a schema reference to its concrete definition."""
         if not schema.is_ref():
             return schema
@@ -171,7 +172,9 @@ class CatalogSchemaRegistry:
         try:
             target = self.types[name]
         except KeyError as exc:
-            raise CatalogSchemaError(f"Unknown schema reference '{schema.ref}'") from exc
+            raise CatalogSchemaError(
+                f"Unknown schema reference '{schema.ref}'"
+            ) from exc
         return self.resolve(target, stack=(*stack, name))
 
     def to_json_schema(self, schema: CatalogSchema) -> dict[str, Any]:
@@ -224,7 +227,9 @@ def parse_schema(raw_schema: Any, *, path: str) -> CatalogSchema:
                 f"{path}: schema_ref form permits only conditional annotations"
             )
         if not isinstance(ref, str) or not ref.strip():
-            raise CatalogSchemaError(f"{path}: schema reference must be a non-empty string")
+            raise CatalogSchemaError(
+                f"{path}: schema reference must be a non-empty string"
+            )
         required_when = raw_schema.get("required_when", {})
         allowed_when = raw_schema.get("allowed_when", {})
         if not isinstance(required_when, Mapping):
@@ -256,6 +261,18 @@ def parse_schema(raw_schema: Any, *, path: str) -> CatalogSchema:
         raise CatalogSchemaError(
             f"{path}.constraints contains unsupported keys {unknown_constraints}"
         )
+    if "not_equal" in constraints and (
+        schema_type not in {"int", "float"}
+        or isinstance(constraints["not_equal"], bool)
+        or not isinstance(constraints["not_equal"], (int, float))
+        or (
+            isinstance(constraints["not_equal"], float)
+            and not math.isfinite(constraints["not_equal"])
+        )
+    ):
+        raise CatalogSchemaError(
+            f"{path}.constraints.not_equal requires one numeric scalar schema"
+        )
 
     properties: dict[str, CatalogSchema] = {}
     raw_properties = raw_schema.get("properties", {})
@@ -268,7 +285,9 @@ def parse_schema(raw_schema: Any, *, path: str) -> CatalogSchema:
             raise CatalogSchemaError(f"{path}.properties must be a mapping")
         for prop_name, raw_property in raw_properties.items():
             if not isinstance(prop_name, str) or not prop_name.strip():
-                raise CatalogSchemaError(f"{path}.properties keys must be non-empty strings")
+                raise CatalogSchemaError(
+                    f"{path}.properties keys must be non-empty strings"
+                )
             properties[prop_name] = parse_schema(
                 raw_property,
                 path=f"{path}.properties.{prop_name}",
@@ -321,7 +340,9 @@ def parse_schema(raw_schema: Any, *, path: str) -> CatalogSchema:
     min_items = _optional_non_negative_int(raw_schema, "min_items", path)
     max_items = _optional_non_negative_int(raw_schema, "max_items", path)
     if length is not None and (min_items is not None or max_items is not None):
-        raise CatalogSchemaError(f"{path}: length cannot be combined with min_items/max_items")
+        raise CatalogSchemaError(
+            f"{path}: length cannot be combined with min_items/max_items"
+        )
     if min_items is not None and max_items is not None and min_items > max_items:
         raise CatalogSchemaError(f"{path}: min_items cannot exceed max_items")
 
@@ -349,7 +370,9 @@ def parse_schema(raw_schema: Any, *, path: str) -> CatalogSchema:
         )
 
     resolves_to = raw_schema.get("resolves_to")
-    if resolves_to is not None and (not isinstance(resolves_to, str) or not resolves_to.strip()):
+    if resolves_to is not None and (
+        not isinstance(resolves_to, str) or not resolves_to.strip()
+    ):
         raise CatalogSchemaError(f"{path}.resolves_to must be a non-empty string")
 
     requires_current_value = raw_schema.get("requires_current_value", False)
@@ -363,9 +386,7 @@ def parse_schema(raw_schema: Any, *, path: str) -> CatalogSchema:
                 f"{path}.semantic_type has unsupported value {semantic_type!r}"
             )
         if schema_type != "string":
-            raise CatalogSchemaError(
-                f"{path}.semantic_type requires type=string"
-            )
+            raise CatalogSchemaError(f"{path}.semantic_type requires type=string")
 
     semantic_scope_parameter = raw_schema.get("semantic_scope_parameter")
     if semantic_scope_parameter is not None:
@@ -414,7 +435,9 @@ def validate_value(
     allow_partial: bool = False,
 ) -> list[CatalogValueIssue]:
     concrete = registry.resolve(schema)
-    return _validate_value(concrete, value, registry=registry, path=path, allow_partial=allow_partial)
+    return _validate_value(
+        concrete, value, registry=registry, path=path, allow_partial=allow_partial
+    )
 
 
 def schema_type_label(schema: CatalogSchema, registry: CatalogSchemaRegistry) -> str:
@@ -448,7 +471,9 @@ def _validate_schema(
         declared = set(schema.properties)
         for field_name in schema.required:
             if field_name not in declared:
-                raise CatalogSchemaError(f"{path}.required references unknown field '{field_name}'")
+                raise CatalogSchemaError(
+                    f"{path}.required references unknown field '{field_name}'"
+                )
         for groups, group_name in (
             (schema.exactly_one, "exactly_one"),
             (schema.mutually_exclusive, "mutually_exclusive"),
@@ -491,11 +516,17 @@ def _validate_schema(
         _validate_schema(schema.items, registry, path=f"{path}.items", stack=stack)
     elif schema.schema_type in _SCALAR_TYPES | {"enum"}:
         if schema.properties:
-            raise CatalogSchemaError(f"{path}: scalar/enum schemas cannot declare properties")
+            raise CatalogSchemaError(
+                f"{path}: scalar/enum schemas cannot declare properties"
+            )
         if schema.items is not None:
-            raise CatalogSchemaError(f"{path}: scalar/enum schemas cannot declare items")
+            raise CatalogSchemaError(
+                f"{path}: scalar/enum schemas cannot declare items"
+            )
     else:
-        raise CatalogSchemaError(f"{path}: unsupported schema type '{schema.schema_type}'")
+        raise CatalogSchemaError(
+            f"{path}: unsupported schema type '{schema.schema_type}'"
+        )
     if schema.resolves_to is not None:
         registry.resolve(CatalogSchema(ref=schema.resolves_to), stack=stack)
 
@@ -541,11 +572,21 @@ def _validate_value(
             issues.append(_issue(path, "must be an array", schema_type))
         else:
             if schema.length is not None and len(value) != schema.length:
-                issues.append(_issue(path, f"must contain exactly {schema.length} items", "array"))
+                issues.append(
+                    _issue(path, f"must contain exactly {schema.length} items", "array")
+                )
             if schema.min_items is not None and len(value) < schema.min_items:
-                issues.append(_issue(path, f"must contain at least {schema.min_items} items", "array"))
+                issues.append(
+                    _issue(
+                        path, f"must contain at least {schema.min_items} items", "array"
+                    )
+                )
             if schema.max_items is not None and len(value) > schema.max_items:
-                issues.append(_issue(path, f"must contain at most {schema.max_items} items", "array"))
+                issues.append(
+                    _issue(
+                        path, f"must contain at most {schema.max_items} items", "array"
+                    )
+                )
             if schema.items is not None:
                 for index, item in enumerate(value):
                     issues.extend(
@@ -585,9 +626,13 @@ def _validate_value(
                         )
                     )
             if not allow_partial:
-                missing = tuple(field for field in schema.required if field not in supplied)
+                missing = tuple(
+                    field for field in schema.required if field not in supplied
+                )
                 for field_name in missing:
-                    issues.append(_issue(f"{path}.{field_name}", "is required", "required"))
+                    issues.append(
+                        _issue(f"{path}.{field_name}", "is required", "required")
+                    )
             for field_name, prop_schema in schema.properties.items():
                 if field_name in value:
                     if prop_schema.allowed_when and not _condition_matches(
@@ -596,7 +641,9 @@ def _validate_value(
                     ):
                         conditions = ", ".join(
                             f"{key}={condition_value}"
-                            for key, condition_value in sorted(prop_schema.allowed_when.items())
+                            for key, condition_value in sorted(
+                                prop_schema.allowed_when.items()
+                            )
                         )
                         issues.append(
                             _issue(
@@ -615,7 +662,13 @@ def _validate_value(
                         )
                     )
                 elif not allow_partial and _required_when_matches(prop_schema, value):
-                    issues.append(_issue(f"{path}.{field_name}", "is required by condition", "required_when"))
+                    issues.append(
+                        _issue(
+                            f"{path}.{field_name}",
+                            "is required by condition",
+                            "required_when",
+                        )
+                    )
             for group in schema.exactly_one:
                 count = sum(1 for field_name in group if field_name in supplied)
                 if count != 1:
@@ -639,11 +692,15 @@ def _validate_value(
                         )
                     )
     else:
-        issues.append(_issue(path, f"unsupported schema type '{schema_type}'", str(schema_type)))
+        issues.append(
+            _issue(path, f"unsupported schema type '{schema_type}'", str(schema_type))
+        )
     return issues
 
 
-def _to_json_schema(schema: CatalogSchema, registry: CatalogSchemaRegistry) -> dict[str, Any]:
+def _to_json_schema(
+    schema: CatalogSchema, registry: CatalogSchemaRegistry
+) -> dict[str, Any]:
     if schema.is_ref():
         return _to_json_schema(registry.resolve(schema), registry)
 
@@ -665,7 +722,9 @@ def _to_json_schema(schema: CatalogSchema, registry: CatalogSchemaRegistry) -> d
         result["enum"] = list(schema.enum_values)
     elif schema_type == "array":
         result["type"] = "array"
-        result["items"] = _to_json_schema(schema.items or CatalogSchema(schema_type="string"), registry)
+        result["items"] = _to_json_schema(
+            schema.items or CatalogSchema(schema_type="string"), registry
+        )
         if schema.length is not None:
             result["minItems"] = schema.length
             result["maxItems"] = schema.length
@@ -688,7 +747,9 @@ def _to_json_schema(schema: CatalogSchema, registry: CatalogSchemaRegistry) -> d
             result["required"] = list(schema.required)
         all_of: list[dict[str, Any]] = []
         for group in schema.exactly_one:
-            all_of.append({"oneOf": [{"required": [field_name]} for field_name in group]})
+            all_of.append(
+                {"oneOf": [{"required": [field_name]} for field_name in group]}
+            )
         for group in schema.mutually_exclusive:
             all_of.append(
                 {
@@ -708,8 +769,7 @@ def _to_json_schema(schema: CatalogSchema, registry: CatalogSchemaRegistry) -> d
                     "if": {
                         "required": [key for key, _value in condition_items],
                         "properties": {
-                            key: {"const": value}
-                            for key, value in condition_items
+                            key: {"const": value} for key, value in condition_items
                         },
                     },
                     "then": {"required": sorted(required_fields)},
@@ -733,9 +793,7 @@ def _to_json_schema(schema: CatalogSchema, registry: CatalogSchemaRegistry) -> d
     if schema.semantic_type is not None:
         result["x-manyforge-semantic-type"] = schema.semantic_type
     if schema.semantic_scope_parameter is not None:
-        result["x-manyforge-semantic-scope-parameter"] = (
-            schema.semantic_scope_parameter
-        )
+        result["x-manyforge-semantic-scope-parameter"] = schema.semantic_scope_parameter
     return result
 
 
@@ -745,7 +803,7 @@ def _schema_type_name_from_ref(ref: str) -> str:
         raise CatalogSchemaError(
             f"Schema references must use '#/schema_types/<name>', got '{ref}'"
         )
-    return ref[len(prefix):]
+    return ref[len(prefix) :]
 
 
 def _optional_string(raw: Mapping[str, Any], key: str, path: str) -> str:
@@ -757,7 +815,9 @@ def _optional_string(raw: Mapping[str, Any], key: str, path: str) -> str:
     return value
 
 
-def _optional_non_negative_int(raw: Mapping[str, Any], key: str, path: str) -> int | None:
+def _optional_non_negative_int(
+    raw: Mapping[str, Any], key: str, path: str
+) -> int | None:
     if key not in raw or raw[key] is None:
         return None
     value = raw[key]
@@ -769,7 +829,9 @@ def _optional_non_negative_int(raw: Mapping[str, Any], key: str, path: str) -> i
 def _string_tuple(value: Any, *, path: str) -> tuple[str, ...]:
     if value in (None, ()):
         return ()
-    if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
+    if not isinstance(value, list) or not all(
+        isinstance(item, str) and item.strip() for item in value
+    ):
         raise CatalogSchemaError(f"{path} must be a list of non-empty strings")
     if len(value) != len(set(value)):
         raise CatalogSchemaError(f"{path} must not contain duplicate values")
@@ -786,17 +848,25 @@ def _field_group_tuple(value: Any, *, path: str) -> tuple[tuple[str, ...], ...]:
         if not isinstance(raw_group, list) or not all(
             isinstance(item, str) and item.strip() for item in raw_group
         ):
-            raise CatalogSchemaError(f"{path}[{index}] must be a list of non-empty strings")
+            raise CatalogSchemaError(
+                f"{path}[{index}] must be a list of non-empty strings"
+            )
         if len(raw_group) < 2:
-            raise CatalogSchemaError(f"{path}[{index}] must contain at least two fields")
+            raise CatalogSchemaError(
+                f"{path}[{index}] must contain at least two fields"
+            )
         if len(raw_group) != len(set(raw_group)):
-            raise CatalogSchemaError(f"{path}[{index}] must not contain duplicate fields")
+            raise CatalogSchemaError(
+                f"{path}[{index}] must not contain duplicate fields"
+            )
         groups.append(tuple(raw_group))
     return tuple(groups)
 
 
 def _is_number(value: Any) -> bool:
-    return (isinstance(value, int) or isinstance(value, float)) and not isinstance(value, bool)
+    return (isinstance(value, int) or isinstance(value, float)) and not isinstance(
+        value, bool
+    )
 
 
 def _validate_numeric_constraints(
@@ -807,17 +877,41 @@ def _validate_numeric_constraints(
     issues: list[CatalogValueIssue] = []
     constraints = schema.constraints
     if "min_inclusive" in constraints and value < float(constraints["min_inclusive"]):
-        issues.append(_issue(path, f"must be >= {constraints['min_inclusive']}", "numeric_constraint"))
+        issues.append(
+            _issue(
+                path, f"must be >= {constraints['min_inclusive']}", "numeric_constraint"
+            )
+        )
     if "max_inclusive" in constraints and value > float(constraints["max_inclusive"]):
-        issues.append(_issue(path, f"must be <= {constraints['max_inclusive']}", "numeric_constraint"))
+        issues.append(
+            _issue(
+                path, f"must be <= {constraints['max_inclusive']}", "numeric_constraint"
+            )
+        )
     if "min_exclusive" in constraints and value <= float(constraints["min_exclusive"]):
-        issues.append(_issue(path, f"must be > {constraints['min_exclusive']}", "numeric_constraint"))
+        issues.append(
+            _issue(
+                path, f"must be > {constraints['min_exclusive']}", "numeric_constraint"
+            )
+        )
     if "max_exclusive" in constraints and value >= float(constraints["max_exclusive"]):
-        issues.append(_issue(path, f"must be < {constraints['max_exclusive']}", "numeric_constraint"))
+        issues.append(
+            _issue(
+                path, f"must be < {constraints['max_exclusive']}", "numeric_constraint"
+            )
+        )
+    if "not_equal" in constraints and value == constraints["not_equal"]:
+        issues.append(
+            _issue(
+                path, f"must not equal {constraints['not_equal']}", "numeric_constraint"
+            )
+        )
     return issues
 
 
-def _apply_numeric_json_constraints(result: dict[str, Any], schema: CatalogSchema) -> None:
+def _apply_numeric_json_constraints(
+    result: dict[str, Any], schema: CatalogSchema
+) -> None:
     constraints = schema.constraints
     if "min_inclusive" in constraints:
         result["minimum"] = constraints["min_inclusive"]
@@ -827,6 +921,8 @@ def _apply_numeric_json_constraints(result: dict[str, Any], schema: CatalogSchem
         result["exclusiveMinimum"] = constraints["min_exclusive"]
     if "max_exclusive" in constraints:
         result["exclusiveMaximum"] = constraints["max_exclusive"]
+    if "not_equal" in constraints:
+        result["not"] = {"const": constraints["not_equal"]}
 
 
 def _required_when_matches(schema: CatalogSchema, value: Mapping[str, Any]) -> bool:
@@ -843,8 +939,7 @@ def _json_schema_condition(condition: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "required": [key for key, _value in sorted(condition.items())],
         "properties": {
-            key: {"const": value}
-            for key, value in sorted(condition.items())
+            key: {"const": value} for key, value in sorted(condition.items())
         },
     }
 

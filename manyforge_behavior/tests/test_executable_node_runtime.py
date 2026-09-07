@@ -269,7 +269,7 @@ def _ports(
         assistant_requests=task_port,
         pick_place=task_port,
         simulator_control=task_port,
-        kernel_controls=invocation_port,
+        kernel_controls=task_port,
     )
 
 
@@ -302,8 +302,8 @@ def test_closed_resolver_exactly_disposes_all_fifty_rows() -> None:
     dispositions = resolver.dispositions
 
     assert len(dispositions) == len(environment.registry.rows) == 50
-    assert sum(item.adapter_build_qualified for item in dispositions) == 43
-    assert sum(not item.adapter_build_qualified for item in dispositions) == 7
+    assert sum(item.adapter_build_qualified for item in dispositions) == 45
+    assert sum(not item.adapter_build_qualified for item in dispositions) == 5
     assert all(
         (
             (item.unavailable_reason_code is None and not item.restoration_gates)
@@ -312,11 +312,11 @@ def test_closed_resolver_exactly_disposes_all_fifty_rows() -> None:
         )
         for item in dispositions
     )
-    assert {
+    assert "kernel.full_stop" not in {
         item.row.node_id: item.restoration_gates
         for item in dispositions
         if not item.adapter_build_qualified
-    }["kernel.full_stop"] == ("I8", "P5")
+    }
 
 
 def test_headless_static_projection_matches_the_closed_deferred_set() -> None:
@@ -401,6 +401,49 @@ def test_simulation_row_uses_the_focused_cancellable_task_owner() -> None:
     assert task.starts[0][2].parameters == {}
     assert adapter.update() is py_trees.common.Status.SUCCESS
     assert task.acknowledgements == [("task-1", task.starts[0][1])]
+
+
+@pytest.mark.parametrize("outcome", [OwnerTaskState.SUCCEEDED, OwnerTaskState.FAILED])
+def test_recovery_row_uses_the_exact_control_port_and_does_not_retry(outcome) -> None:
+    document = _minimal_document()
+    parameters = {"target_role": "arm", "recovery_action": "acknowledge_and_continue"}
+    document["tree"] = {
+        "node_id": "recovery.apply_offered_action",
+        "instance_id": "recover_arm",
+        "parameters": parameters,
+        "children": [],
+    }
+    catalog = _catalog()
+    program = Program.from_dict(_identified(document), catalog)
+    task = _TaskPort((outcome,))
+    environment = build_node_environment()
+    adapter = build_executable_node_resolver(environment).instantiate(
+        environment.registry.record("recovery.apply_offered_action"),
+        NodeAdapterBuildContext(
+            name="recover_arm",
+            node_instance_id="recover_arm",
+            parameters=program.tree.parameters,
+            input_resolver=NodeAttemptInputResolver(
+                program=program,
+                catalog=catalog,
+                value_store=ProgramValueStore.from_program(program),
+            ),
+            attempt_source=ProgramRunAttemptSource("run.recovery"),
+            ports=NodeAdapterPorts(kernel_controls=task),
+        ),
+    )
+    adapter.initialise()
+    expected = (
+        py_trees.common.Status.SUCCESS
+        if outcome is OwnerTaskState.SUCCEEDED
+        else py_trees.common.Status.FAILURE
+    )
+    assert adapter.update() is expected
+    assert adapter.update() is expected
+    assert len(task.starts) == 1
+    assert task.starts[0][0] == "recovery.apply_offered_action"
+    assert dict(task.starts[0][2].parameters) == parameters
+    assert not task.observations
 
 
 def test_accepted_task_retries_only_typed_observation_unavailability() -> None:

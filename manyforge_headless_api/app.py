@@ -40,6 +40,7 @@ from .execution_control import (
     ExecutionControlIngress,
 )
 from .manager import ManagerCommandClient
+from .history_query import HistorianQueryRequest, HistorianDiscoveryRequest, HistorianDebugRequest
 from .models import (
     AcknowledgeAlarmRequest,
     AcknowledgeAllAlarmsRequest,
@@ -331,7 +332,6 @@ def _error_status(code: str) -> int:
         "unavailable" in code
         or code in {
             "headless_api_closed",
-            "headless_request_ledger_full",
             "kernel_owner_unavailable",
             "operator_alarm_state_unavailable",
             "program_applied_selection_not_active",
@@ -1758,45 +1758,29 @@ def create_app(
 
     @app.get("/api/execution/history")
     def history(
-        start_ns: Annotated[
-            int | None,
-            Query(ge=0, le=_MAXIMUM_SIGNED_64),
-        ] = None,
-        end_ns: Annotated[
-            int | None,
-            Query(ge=0, le=_MAXIMUM_SIGNED_64),
-        ] = None,
-        components: Annotated[
-            list[str] | None,
-            Query(max_length=256),
-        ] = None,
-        event_types: Annotated[
-            list[str] | None,
-            Query(max_length=256),
-        ] = None,
-        before_sequence: Annotated[
-            int | None,
-            Query(ge=1, le=_MAXIMUM_SAFE_INTEGER),
-        ] = None,
-        limit: Annotated[int, Query(ge=1, le=_MAXIMUM_HISTORY_PAGE)] = 32,
+        query: Annotated[HistorianQueryRequest, Query()],
     ) -> JSONResponse:
-        if start_ns is not None and end_ns is not None and start_ns > end_ns:
-            raise HeadlessApiError(
-                "historian_query_invalid",
-                "start_ns must not exceed end_ns",
-            )
         # Encode this potentially large bounded page in the synchronous route
         # worker instead of blocking the shared ASGI event loop.
         return JSONResponse(
-            content=service.history(
-                start_ns=start_ns,
-                end_ns=end_ns,
-                components=components or (),
-                event_types=event_types or (),
-                before_sequence=before_sequence,
-                limit=limit,
-            )
+            content=service.history(query)
         )
+
+    @app.get("/api/execution/history/export")
+    def history_export(query: Annotated[HistorianQueryRequest, Query()]) -> JSONResponse:
+        return JSONResponse(content=service.history_export(query), headers={"Content-Disposition": 'attachment; filename="manyforge-events.json"'})
+
+    @app.get("/api/execution/history/discovery")
+    def history_discovery(query: Annotated[HistorianDiscoveryRequest, Query()]) -> JSONResponse:
+        return JSONResponse(content=service.core.history_discovery(**query.model_dump()))
+
+    @app.get("/api/debug/export")
+    def debug_export(query: Annotated[HistorianDebugRequest, Query()]) -> JSONResponse:
+        return JSONResponse(content=service.debug_export(query.history_query()), headers={"Content-Disposition": 'attachment; filename="manyforge-debug.json"'})
+
+    @app.get("/api/debug/export/ros2-medkit")
+    def normalized_trace_export(query: Annotated[HistorianDebugRequest, Query()]) -> JSONResponse:
+        return JSONResponse(content=service.debug_export(query.history_query())["normalized_trace"], headers={"Content-Disposition": 'attachment; filename="manyforge-trace.json"'})
 
     @app.get("/api/execution/history/health")
     def historian_health() -> dict[str, Any]:

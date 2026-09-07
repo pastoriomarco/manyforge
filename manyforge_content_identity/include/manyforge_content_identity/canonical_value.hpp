@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -59,7 +60,9 @@ class CanonicalValue final {
 };
 
 inline constexpr std::size_t kMaximumCanonicalJsonBytes = 16U * 1024U * 1024U;
-inline constexpr std::size_t kMaximumCanonicalJsonDepth = 32U;
+// Explicit legacy consumers may read 64 nested containers plus their scalar.
+// The default stays narrow; widening this ceiling never widens a caller's DTO.
+inline constexpr std::size_t kMaximumCanonicalJsonDepth = 65U;
 inline constexpr std::size_t kMaximumCanonicalJsonNodes = 1024U * 1024U;
 
 /// Caller-selected limits may narrow, but never exceed, the fixed library
@@ -68,7 +71,7 @@ inline constexpr std::size_t kMaximumCanonicalJsonNodes = 1024U * 1024U;
 /// bound).
 struct CanonicalJsonParseLimits final {
   std::size_t maximum_bytes{kMaximumCanonicalJsonBytes};
-  std::size_t maximum_depth{kMaximumCanonicalJsonDepth};
+  std::size_t maximum_depth{32U};
   std::size_t maximum_nodes{kMaximumCanonicalJsonNodes};
 
   friend bool operator==(const CanonicalJsonParseLimits &,
@@ -87,6 +90,13 @@ void require_utf8_nfc(std::string_view text, std::string_view context);
 
 /// Serializes a validated value using RFC 8785 JSON Canonicalization Scheme.
 [[nodiscard]] std::string canonical_json(const CanonicalValue &value);
+
+/// Exact nonnegative int64 scalar. Preserve legacy safe-number bytes; use
+/// canonical decimal text above the I-JSON integer limit. The decoder also
+/// accepts canonical decimal text at small values for string-only transports.
+/// This is a scalar codec, not a clock, duration policy, or identity allocator.
+[[nodiscard]] CanonicalValue nonnegative_int64_value(std::int64_t value);
+[[nodiscard]] std::int64_t parse_nonnegative_int64(const CanonicalValue &value);
 
 /// Parses exactly one already-canonical RFC 8785 JSON value under fixed hard
 /// bounds. It rejects any valid JSON spelling whose reserialization differs

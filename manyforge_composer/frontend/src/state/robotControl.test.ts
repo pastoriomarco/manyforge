@@ -9,299 +9,79 @@ import {
   ROBOT_CONTROL_AUTHOR_DEBOUNCE_MS,
   robotControlReducer,
 } from './robotControl';
-import type {
-  CapabilityCommandPreviewReceipt,
-  ExecutionOwnerStatus,
-  MotionPreviewReceipt,
-} from '../types/robotControl';
 
-function statusFixture(ownerEpoch = 'execution-owner-1'): ExecutionOwnerStatus {
-  return {
-    ownerEpoch,
-    cellId: 'cell.1',
-    activePublicationGeneration: 1,
-    graphRevision: 'sha256:graph',
-    retainedBundleId: 'sha256:bundle',
-    sceneRevision: {
-      scene_id: 'scene-1',
-      revision_id: 3,
-      content_hash: 'sha256:scene',
-    },
-    directControl: {
-      controllableComponentId: 'robot-a',
-      commandTargetId: 'arm',
-      componentRoleId: 'controlled_component',
-      targetRoleId: 'command_target',
-      baseFrameRoleId: 'base',
-      tcpFrameRoleId: 'tcp',
-      operationCapabilityId: 'execution.trajectory.execute',
-      planningCapabilityIds: [
-        'planning.motion.cartesian_path',
-        'planning.motion.joint_goal',
-        'planning.motion.pose_goal',
-      ],
-      frameRoleIds: ['base', 'tcp'],
-      programId: 'manyforge.direct_control.motion',
-      programRevision: 'sha256:direct-program',
-      programBindingId: 'sha256:direct-binding',
-      programRunId: 'direct-control-owner-1',
-      joints: [
-        {
-          sourceJointName: 'joint1',
-          minPositionRad: -1,
-          maxPositionRad: 1,
-          maxVelocityRadS: 2,
-          maxAccelerationRadS2: 3,
-        },
-        {
-          sourceJointName: 'joint2',
-          minPositionRad: -2,
-          maxPositionRad: 2,
-          maxVelocityRadS: 2,
-          maxAccelerationRadS2: null,
-        },
-      ],
-      targetDescriptor: {
-        schemaVersion: 'manyforge.manual_control_motion_descriptor.v3',
-        controllableComponentId: 'robot-a',
-        commandTargetId: 'arm',
-        componentRoleId: 'controlled_component',
-        targetRoleId: 'command_target',
-        frames: [
-          { frameRoleId: 'base', compiledFrameName: 'base_link', modelInstanceId: 'robot-model', modelRevision: 'sha256:model' },
-          { frameRoleId: 'tcp', compiledFrameName: 'tool0', modelInstanceId: 'robot-model', modelRevision: 'sha256:model' },
-        ],
-        joints: [
-          { sourceJointName: 'joint1', compiledJointName: 'robot__joint1', unit: 'rad', minPositionRad: -1, maxPositionRad: 1, maxVelocityRadS: 2, maxAccelerationRadS2: 3 },
-          { sourceJointName: 'joint2', compiledJointName: 'robot__joint2', unit: 'rad', minPositionRad: -2, maxPositionRad: 2, maxVelocityRadS: 2, maxAccelerationRadS2: null },
-        ],
-        operationalJointLimits: [
-          {
-            sourceJointName: 'joint1', modelMaxVelocityRadS: 2,
-            modelMaxAccelerationRadS2: 3, deploymentMaxVelocityRadS: 1.5,
-            deploymentMaxAccelerationRadS2: 2.5, deploymentMaxJerkRadS3: 10,
-            effectiveMaxVelocityRadS: 1.5, effectiveMaxAccelerationRadS2: 2.5,
-            effectiveMaxJerkRadS3: 10,
-          },
-          {
-            sourceJointName: 'joint2', modelMaxVelocityRadS: 2,
-            modelMaxAccelerationRadS2: null, deploymentMaxVelocityRadS: null,
-            deploymentMaxAccelerationRadS2: null, deploymentMaxJerkRadS3: null,
-            effectiveMaxVelocityRadS: 2, effectiveMaxAccelerationRadS2: null,
-            effectiveMaxJerkRadS3: null,
-          },
-        ],
-        operationalLimit: null,
-        contracts: {
-          operationCapabilityId: 'execution.trajectory.execute',
-          operationCapabilityDefinitionRevision: 'sha256:execution',
-          commandSchema: null,
-          controlPath: null,
-          supportingProviders: [
-            'planning.motion.cartesian_path',
-            'planning.motion.joint_goal',
-            'planning.motion.pose_goal',
-          ].map((capabilityId) => ({
-            capabilityId,
-            capabilityDefinitionRevision: 'sha256:planning',
-            capabilityProviderBindingId: capabilityId,
-            capabilityProviderBindingRevision: 'sha256:provider',
-            providerManifestId: 'planner',
-            providerManifestRevision: 'sha256:manifest',
-          })),
-        },
-      },
-    },
-    directControlGripper: {
-      controllableComponentId: 'robot-a',
-      commandTargetId: 'gripper',
-      componentRoleId: 'controlled_component',
-      targetRoleId: 'command_target',
-      operationCapabilityId: 'tool.gripper.command',
-      programId: 'manyforge.direct_control.gripper',
-      programRevision: 'sha256:direct-gripper-program',
-      programBindingId: 'sha256:direct-gripper-binding',
-      programRunId: 'direct-control-gripper-owner-1',
-      commandSchemaId: 'gripper.command_position',
-      commandSchemaRevision: 'sha256:gripper-schema',
-      sourceCoordinateName: 'finger_joint',
-      sourceKind: 'model_role',
-      coordinateKind: 'linear_m',
-      minPosition: 0,
-      maxPosition: 0.04,
-      targetDescriptor: {
-        schemaVersion: 'manyforge.manual_control_gripper_descriptor.v2',
-        controllableComponentId: 'robot-a', commandTargetId: 'gripper',
-        componentRoleId: 'controlled_component', targetRoleId: 'command_target',
-        description: 'Test gripper', commandKind: 'gripper_position',
-        actuationKind: 'position_commanded', transportKind: 'resolved_binding',
-        controlInterfaceContractId: null, stateAuthorityId: null,
-        stateAuthorityClass: null, completionPolicy: 'goal_fenced_target_reached',
-        graspConfirmationPolicy: 'binding_feedback_required',
-        sourceGroupName: 'gripper', openStateRef: 'open', closedStateRef: 'closed',
-        commandDurationS: 0.5, touchLinks: ['finger_link'], mountFrame: 'tool0',
-        attachFrame: 'tool0', tcpFrame: 'tool0', auxiliaryFrames: [],
-        sourceCoordinateName: 'finger_joint', sourceKind: 'model_role',
-        coordinateKind: 'linear_m', unit: 'm', minPosition: 0, maxPosition: 0.04,
-        mimicFollowers: [], namedPresets: [],
-        contracts: {
-          operationCapabilityId: 'tool.gripper.command',
-          operationCapabilityDefinitionRevision: 'sha256:gripper',
-          commandSchema: { commandSchemaId: 'gripper.command_position', commandSchemaRevision: 'sha256:gripper-schema' },
-          controlPath: null, supportingProviders: [],
-        },
-      },
-    },
-    observedMotion: {
-      targetRoleId: 'scenario-arm',
-      controllableComponentId: 'robot-a',
-      commandTargetId: 'arm',
-      sequence: 7,
-      sourceEpoch: 'joint-source-1',
-      sourceJointNames: ['joint1', 'joint2'],
-      positionsRad: [0, 0.1],
-      complete: true,
-      currentTcpPose: {
-        position_m: { x_m: 0.1, y_m: 0.2, z_m: 0.3 },
-        orientation: { x: 0, y: 0, z: 0, w: 1 },
-      },
-    },
-    observedGripper: {
-      sequence: 4,
-      sourceEpoch: 'gripper-source-1',
-      sourceCoordinateName: 'finger_joint',
-      position: 0.02,
-      coordinateKind: 'linear_m',
-      complete: true,
-    },
-    residentOperations: [],
-    runtimeScaleControl: null,
-    cellStopAction: {
-      available: true,
-      unavailableReason: null,
-      expectedStopGeneration: 0,
-      latestTerminal: null,
-      fault: null,
-    },
-  };
-}
-
-function receiptFixture(
-  status: ExecutionOwnerStatus,
-  requestId: string,
-  positionsRad: number[],
-): MotionPreviewReceipt {
-  return {
-    schemaVersion: 'manyforge.direct_control_motion_preview.v1',
-    receiptDigest: 'sha256:receipt',
-    intentDigest: 'sha256:intent',
-    requestId,
-    requestOwnerEpoch: status.ownerEpoch,
-    programId: status.directControl.programId,
-    programRevision: status.directControl.programRevision,
-    programBindingId: status.directControl.programBindingId,
-    programRunId: status.directControl.programRunId,
-    graphRevision: status.graphRevision,
-    retainedBundleId: status.retainedBundleId,
-    sceneRevision: { ...status.sceneRevision },
-    componentRoleId: status.directControl.componentRoleId,
-    targetRoleId: status.directControl.targetRoleId,
-    requiredCapabilityId: status.directControl.operationCapabilityId,
-    sourceJointNames: status.directControl.joints.map(
-      (joint) => joint.sourceJointName,
-    ),
-    startPositionsRad: [...status.observedMotion.positionsRad],
-    finalPositionsRad: [...positionsRad],
-    finalTcpPose: {
-      position_m: { x_m: 0.1, y_m: 0.2, z_m: 0.3 },
-      orientation: { x: 0, y: 0, z: 0, w: 1 },
-    },
-    collisionWorldRevision: {
-      revision_id: 5,
-      content_hash: 'collision-5',
-    },
-    commitEligible: true,
-  };
-}
-
-function readyState() {
-  const status = statusFixture();
-  const positions = [0.25, 0.5];
-  let state = robotControlReducer(initialRobotControlState, {
-    type: 'status_resolved',
-    status,
-  });
-  state = robotControlReducer(state, { type: 'edit', positionsRad: positions });
-  const intent = buildJointMotionIntent(status, positions, 'request-1');
-  state = robotControlReducer(state, {
-    type: 'preview_started',
-    generation: state.generation,
-    intent,
-  });
-  state = robotControlReducer(state, {
-    type: 'preview_resolved',
-    generation: state.generation,
-    receipt: receiptFixture(status, 'request-1', positions),
-  });
-  return state;
-}
-
-function executingState() {
-  const approving = robotControlReducer(
-    readyState(),
-    { type: 'approve_started' },
-  );
-  const status = structuredClone(approving.status!);
-  status.residentOperations = [{
-    operationId: 'operation-1',
-    operationRevision: 1,
-    resident: true,
-    state: 'queued',
-    progress: 0,
-    activeStopId: null,
-    activeStopGeneration: null,
-    terminalError: null,
-  }];
-  return robotControlReducer(approving, {
-    type: 'status_refreshed',
-    status,
-  });
-}
-
-function gripperReceiptFixture(
-  status: ExecutionOwnerStatus,
-  requestId: string,
-  position: number,
-): CapabilityCommandPreviewReceipt {
-  return {
-    schemaVersion: 'manyforge.direct_control_capability_command_preview.v1',
-    receiptDigest: 'sha256:gripper-receipt',
-    intentDigest: 'sha256:gripper-intent',
-    requestId,
-    requestOwnerEpoch: status.ownerEpoch,
-    programId: status.directControlGripper.programId,
-    programRevision: status.directControlGripper.programRevision,
-    programBindingId: status.directControlGripper.programBindingId,
-    programRunId: status.directControlGripper.programRunId,
-    graphRevision: status.graphRevision,
-    retainedBundleId: status.retainedBundleId,
-    sceneRevision: { ...status.sceneRevision },
-    componentRoleId: status.directControlGripper.componentRoleId,
-    targetRoleId: status.directControlGripper.targetRoleId,
-    requiredCapabilityId: status.directControlGripper.operationCapabilityId,
-    commandSchemaId: status.directControlGripper.commandSchemaId,
-    commandSchemaRevision: status.directControlGripper.commandSchemaRevision,
-    sourceCoordinateName: status.directControlGripper.sourceCoordinateName,
-    sourceKind: status.directControlGripper.sourceKind,
-    coordinateKind: status.directControlGripper.coordinateKind,
-    targetPosition: position,
-    minPosition: status.directControlGripper.minPosition,
-    maxPosition: status.directControlGripper.maxPosition,
-    commitEligible: true,
-  };
-}
+import { statusFixture, receiptFixture, readyState, executingState, gripperReceiptFixture } from '../testFixtures/robotControl';
 
 describe('addressed Robot Control state', () => {
+  it('invalidates a Move To preview when its semantic source kind changes at the same pose', () => {
+    let state = robotControlReducer(initialRobotControlState, { type: 'status_resolved', status: statusFixture() });
+    state = robotControlReducer(state, { type: 'select_mode', mode: 'move_to' });
+    const joint = robotControlReducer(state, { type: 'edit_move_to_joint', positionsRad: [0.25, 0.35] });
+    const pose = robotControlReducer(joint, { type: 'edit_pose', pose: joint.draftPose });
+    expect(pose.moveToKind).toBe('pose');
+    expect(pose.generation).toBe(joint.generation + 1);
+    expect(buildPreviewIntent(pose, 'pose-new').participants[0].payload).toMatchObject({
+      kind: 'motion', motion: { kind: 'pose_goal' },
+    });
+    const back = robotControlReducer(pose, { type: 'edit_move_to_joint', positionsRad: joint.draftPositionsRad });
+    expect(back.moveToKind).toBe('joint');
+    expect(back.generation).toBe(pose.generation + 1);
+  });
+  it('accumulates individual joint edits without using a stale rendered vector', () => {
+    const loaded = robotControlReducer(initialRobotControlState, { type: 'status_resolved', status: statusFixture() });
+    const first = robotControlReducer(loaded, { type: 'edit_joint', jointIndex: 0, positionRad: 0.25 });
+    const second = robotControlReducer(first, { type: 'edit_joint', jointIndex: 1, positionRad: 0.35 });
+    expect(second.draftPositionsRad).toEqual([0.25, 0.35]);
+    expect(second.generation).toBe(first.generation + 1);
+    for (const jointIndex of [-1, 2, 0.5, NaN]) {
+      expect(robotControlReducer(second, { type: 'edit_joint', jointIndex, positionRad: 0 })).toBe(second);
+    }
+  });
+
+  it.each([false, true])('seeds only the first edit from current observation, retained result=%s', (retained) => {
+    let status = statusFixture();
+    if (retained) status.manualOperations = [{
+      programRunId: status.directControl.programRunId, operationId: 'completed-1',
+      operationRevision: 2, resident: false, state: 'completed', progress: 1,
+      activeStopGeneration: null, activeStopId: null, terminalError: null,
+    }];
+    let state = robotControlReducer(initialRobotControlState, { type: 'status_resolved', status });
+    const oldDraft = state.draftPositionsRad;
+    status = { ...status, observedMotion: { ...status.observedMotion, positionsRad: [0.5, 0.5] } };
+    state = robotControlReducer(state, { type: 'status_refreshed', status });
+    expect(state.draftPositionsRad).toBe(oldDraft); // No observation-driven draft copy.
+    state = robotControlReducer(state, { type: 'edit_joint', jointIndex: 0, positionRad: 0.6 });
+    expect(state.draftPositionsRad).toEqual([0.6, 0.5]);
+    state = robotControlReducer(state, { type: 'status_refreshed', status: {
+      ...status, observedMotion: { ...status.observedMotion, positionsRad: [0.2, 0.3] },
+    } });
+    state = robotControlReducer(state, { type: 'edit_joint', jointIndex: 1, positionRad: 0.7 });
+    expect(state.draftPositionsRad).toEqual([0.6, 0.7]);
+  });
+
+  it('retries only the local rejected preview and fences the old reply', () => {
+    const ready = readyState();
+    const failed = robotControlReducer(ready, { type: 'preview_rejected', generation: ready.generation, error: 'planner unavailable' });
+    const retry = robotControlReducer(failed, { type: 'retry_preview' });
+    expect(retry.phase).toBe('planning');
+    expect(retry.draftPositionsRad).toEqual(failed.draftPositionsRad);
+    expect(retry.generation).toBe(failed.generation + 1);
+    expect(robotControlReducer(retry, { type: 'preview_rejected', generation: failed.generation, error: 'old failure' })).toBe(retry);
+    const active = executingState();
+    expect(robotControlReducer(active, { type: 'retry_preview' })).toBe(active);
+  });
+
+  it('does not apply an old approval failure to a newer draft or owner', () => {
+    const ready = readyState();
+    const approving = robotControlReducer(ready, { type: 'approve_started' });
+    expect(robotControlReducer(approving, {
+      type: 'approve_rejected', generation: ready.generation - 1, error: 'old response',
+    })).toBe(approving);
+    expect(robotControlReducer(approving, {
+      type: 'approve_rejected', generation: ready.generation, error: 'current response',
+    }).error).toBe('current response');
+  });
+
   it('preserves the historical bounded authoring cadence', () => {
     expect(ROBOT_CONTROL_AUTHOR_DEBOUNCE_MS).toBe(150);
   });
@@ -499,7 +279,9 @@ describe('addressed Robot Control state', () => {
     expect(stopping.phase).toBe('stopping');
 
     const failed = robotControlReducer(stopping, {
-      type: 'operation_poll_failed',
+      type: 'operation_control_failed',
+      ownerEpoch: stopping.status!.ownerEpoch,
+      operationId: stopping.operation!.operationId,
       error: 'Stop request was rejected.',
     });
     expect(failed.phase).toBe('stopping');
@@ -530,7 +312,7 @@ describe('addressed Robot Control state', () => {
       ...observed.observedGripper!,
       position: 0.031,
     };
-    observed.residentOperations = [state.operation!];
+    observed.manualOperations = [{ ...state.operation!, programRunId: observed.directControl.programRunId }];
     state = robotControlReducer(state, {
       type: 'status_refreshed',
       status: observed,
@@ -551,7 +333,8 @@ describe('addressed Robot Control state', () => {
 
   it('recovers the exact resident operation on a fresh client load', () => {
     const status = statusFixture();
-    status.residentOperations = [{
+    status.manualOperations = [{
+      programRunId: status.directControl.programRunId,
       operationId: 'operation-recovered',
       operationRevision: 4,
       resident: true,
@@ -566,12 +349,93 @@ describe('addressed Robot Control state', () => {
       status,
     });
     expect(recovered.phase).toBe('executing');
-    expect(recovered.operation).toEqual(status.residentOperations[0]);
+    expect(recovered.operation).toEqual(status.manualOperations[0]);
+  });
+
+  it('shows a short move that completed before the first active projection, without overwriting the next draft', () => {
+    let state = robotControlReducer(readyState(), { type: 'approve_started' });
+    const status = statusFixture();
+    status.manualOperations = [{
+      ...executingState().operation!, programRunId: status.directControl.programRunId,
+      operationId: 'short-move', state: 'completed', progress: 1, resident: false,
+    }];
+    state = robotControlReducer(state, { type: 'status_refreshed', status });
+    expect(state.phase).toBe('completed');
+    expect(state.operation?.resident).toBe(false);
+    state = robotControlReducer(state, { type: 'edit', positionsRad: [0.1, 0.2] });
+    const generation = state.generation;
+    state = robotControlReducer(state, { type: 'status_refreshed', status: structuredClone(status) });
+    expect(state.phase).toBe('planning');
+    expect(state.generation).toBe(generation);
+    expect(state.draftPositionsRad).toEqual([0.1, 0.2]);
+  });
+
+  it.each([true, false])('follows a subsequent owner move even when the predecessor terminal frame was skipped (resident=%s)', (resident) => {
+    const state = executingState();
+    const status = statusFixture();
+    status.manualOperations = [{
+      ...state.operation!, programRunId: status.directControl.programRunId,
+      operationId: 'next-move-from-another-client', resident,
+      state: resident ? 'executing' : 'completed',
+    }];
+    const next = robotControlReducer(state, { type: 'status_refreshed', status });
+    expect(next.operation?.operationId).toBe('next-move-from-another-client');
+    expect(next.phase).toBe(resident ? 'executing' : 'completed');
+    expect(next.error).toBeNull();
+  });
+
+  it('selects the retained gripper result independently from the arm and keeps mode coherent after replacement', () => {
+    const status = statusFixture();
+    status.manualOperations = [{
+      ...executingState().operation!, programRunId: status.directControlGripper.programRunId,
+      state: 'completed', resident: false,
+    }];
+    let state = robotControlReducer(initialRobotControlState, { type: 'status_resolved', status });
+    expect(state.operation).toBeNull();
+    state = robotControlReducer(state, { type: 'select_mode', mode: 'gripper' });
+    expect(state.operation?.state).toBe('completed');
+    const changed = structuredClone(status);
+    changed.ownerEpoch = 'next-owner';
+    state = robotControlReducer(state, { type: 'status_refreshed', status: changed });
+    expect(state.mode).toBe('gripper');
+    expect(state.operation?.state).toBe('completed');
+  });
+
+  it('keeps resident fault evidence on local Revert and does not authorize a new edit', () => {
+    let state = executingState();
+    state = robotControlReducer(state, { type: 'operation_observed', operation: {
+      ...state.operation!, state: 'intervention_required', terminalError: 'physical rest unproven',
+    } });
+    const reverted = robotControlReducer(state, { type: 'revert' });
+    expect(reverted.operation).toBe(state.operation);
+    expect(reverted.phase).toBe('intervention_required');
+    expect(reverted.error).toBe('physical rest unproven');
+    expect(reverted.ghost).toBeNull();
+    expect(robotControlReducer(reverted, { type: 'edit', positionsRad: [0.2, 0.3] })).toBe(reverted);
+  });
+
+  it('fences old previews on an exact scene change but not on a fresh observation', () => {
+    const ready = readyState();
+    const fresh = structuredClone(ready.status!);
+    fresh.observedMotion.positionsRad = [0.01, 0.02];
+    const stillReady = robotControlReducer(ready, { type: 'status_refreshed', status: fresh });
+    expect(stillReady.phase).toBe('ready');
+    expect(stillReady.generation).toBe(ready.generation);
+    const replacement = structuredClone(fresh);
+    replacement.sceneRevision.revision_id += 1;
+    const changed = robotControlReducer(stillReady, { type: 'status_refreshed', status: replacement });
+    expect(changed.preview).toBeNull();
+    expect(changed.generation).toBeGreaterThan(ready.generation);
+    const late = robotControlReducer(changed, {
+      type: 'preview_resolved', generation: ready.generation, receipt: ready.preview!,
+    });
+    expect(late).toBe(changed);
   });
 
   it('fails closed instead of choosing among multiple resident operations', () => {
     const status = statusFixture();
-    status.residentOperations = ['one', 'two'].map((operationId) => ({
+    status.manualOperations = ['one', 'two'].map((operationId) => ({
+      programRunId: status.directControl.programRunId,
       operationId,
       operationRevision: 1,
       resident: true,
@@ -622,8 +486,9 @@ describe('addressed Robot Control state', () => {
   it('does not adopt Program-owned resident operations as Robot Control work', () => {
     const ready = readyState();
     const status = statusFixture();
-    status.residentOperations = ['program-motion-1', 'program-motion-2'].map(
+    status.manualOperations = ['program-motion-1', 'program-motion-2'].map(
       (operationId) => ({
+        programRunId: 'program-run.1',
         operationId,
         operationRevision: 1,
         resident: true,

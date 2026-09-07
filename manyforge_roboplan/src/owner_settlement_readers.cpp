@@ -350,7 +350,10 @@ ReadActiveProgramRunProductForReconciliation(
     if (!row.Step())
       throw std::runtime_error("Program-cycle owner row is absent");
     const auto state = row.Text(0);
-    const bool reconciliation_required = row.Integer(2) == 1;
+    const auto reconciliation_flag = row.Integer(2);
+    if (reconciliation_flag != 0 && reconciliation_flag != 1)
+      throw std::runtime_error("Program-cycle reconciliation flag is invalid");
+    const bool reconciliation_required = reconciliation_flag == 1;
     if (!reconciliation_required || state == "idle_after_reset" ||
         state == "terminal_awaiting_reset") {
       if (row.Step())
@@ -374,14 +377,10 @@ ReadActiveProgramRunProductForReconciliation(
     if (!history.Step())
       throw std::runtime_error("active Program-run snapshot is absent");
     const auto snapshot = ci::parse_canonical_json(history.Text(0));
-    const bool terminal = history.Integer(1) == 1;
+    const auto terminal_flag = history.Integer(1);
+    const bool terminal = terminal_flag == 1;
     if (history.Step())
       throw std::runtime_error("active Program-run snapshot is duplicated");
-    if (terminal) {
-      Exec(database.get(), "COMMIT");
-      return core::Result<std::optional<ActiveProgramRunProductIdentity>>::Ok(
-          std::nullopt);
-    }
     const auto &capture = Member(snapshot, "capture");
     const auto captured_run_id = StringMember(capture, "program_run_id");
     const auto retained_bundle_id = StringMember(capture, "retained_bundle_id");
@@ -389,7 +388,23 @@ ReadActiveProgramRunProductForReconciliation(
     if (captured_run_id != program_run_id || retained_bundle_id.empty() ||
         graph_revision.empty())
       throw std::runtime_error("active Program-run capture is invalid");
+    const auto run_state = StringMember(snapshot, "state");
+    const bool terminal_state = run_state == "stopped" ||
+                                run_state == "succeeded" ||
+                                run_state == "failed";
+    if ((terminal_flag != 0 && terminal_flag != 1) ||
+        terminal != terminal_state ||
+        (!terminal_state && run_state != "running" &&
+         run_state != "intervention_required" && run_state != "full_stopping" &&
+         run_state != "full_stopped" && run_state != "stopping" &&
+         run_state != "finalizing"))
+      throw std::runtime_error(
+          "active Program-run state and terminal evidence disagree");
     Exec(database.get(), "COMMIT");
+    if (terminal) {
+      return core::Result<std::optional<ActiveProgramRunProductIdentity>>::Ok(
+          std::nullopt);
+    }
     return core::Result<std::optional<ActiveProgramRunProductIdentity>>::Ok(
         ActiveProgramRunProductIdentity{
             core::ProgramRunId(program_run_id),

@@ -4,6 +4,7 @@
 #include <utf8proc.h>
 
 #include <algorithm>
+#include <charconv>
 #include <cmath>
 #include <compare>
 #include <cstdint>
@@ -15,6 +16,40 @@
 #include <sstream>
 
 namespace manyforge::content_identity {
+
+CanonicalValue nonnegative_int64_value(const std::int64_t value) {
+  if (value < 0) {
+    throw CanonicalValueError("nonnegative int64 required");
+  }
+  return value <= 9'007'199'254'740'991LL
+             ? CanonicalValue(static_cast<double>(value))
+             : CanonicalValue(std::to_string(value));
+}
+
+std::int64_t parse_nonnegative_int64(const CanonicalValue &value) {
+  if (value.is_number()) {
+    const auto number = value.as_number();
+    if (number >= 0 && number <= 9'007'199'254'740'991.0 &&
+        std::trunc(number) == number) {
+      return static_cast<std::int64_t>(number);
+    }
+  } else if (value.is_string()) {
+    const auto &text = value.as_string();
+    if (!text.empty() && text.size() <= 19U &&
+        (text.size() == 1U || text.front() != '0') &&
+        std::all_of(text.begin(), text.end(), [](const char digit) {
+          return digit >= '0' && digit <= '9';
+        })) {
+      std::int64_t result{};
+      const auto parsed = std::from_chars(text.data(), text.data() + text.size(), result);
+      if (parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size()) {
+        return result;
+      }
+    }
+  }
+  throw CanonicalValueError("exact nonnegative int64 scalar required");
+}
+
 namespace {
 
 using Utf8procBuffer = std::unique_ptr<utf8proc_uint8_t, decltype(&std::free)>;

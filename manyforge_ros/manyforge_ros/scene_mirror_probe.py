@@ -45,7 +45,7 @@ _PREFERRED_SERVICE_LEAVES: Final = {
 @dataclass(frozen=True)
 class PoseSnapshot:
     frame_id: str
-    stamp_sec: float | None
+    stamp_ns: int | None
     position_xyz: tuple[float, float, float]
     orientation_xyzw: tuple[float, float, float, float]
 
@@ -566,7 +566,7 @@ def pose_snapshot_from_state(state: Any) -> PoseSnapshot:
     pose = state.pose
     return PoseSnapshot(
         frame_id=_bounded_text(state.header.frame_id, label="pose frame_id"),
-        stamp_sec=_timestamp_seconds(stamp),
+        stamp_ns=_timestamp_nanoseconds(stamp),
         position_xyz=(
             _finite_float(pose.position.x, label="pose position.x"),
             _finite_float(pose.position.y, label="pose position.y"),
@@ -731,7 +731,7 @@ def _exact_int(value: Any, *, label: str) -> int:
     return value
 
 
-def _timestamp_seconds(stamp: Any) -> float:
+def _timestamp_nanoseconds(stamp: Any) -> int:
     sec = _exact_int(getattr(stamp, "sec", None), label="timestamp sec")
     nanosec = _exact_int(
         getattr(stamp, "nanosec", None),
@@ -739,12 +739,9 @@ def _timestamp_seconds(stamp: Any) -> float:
     )
     if not 0 <= nanosec < 1_000_000_000:
         raise ValueError("timestamp nanosec must be in [0, 1000000000)")
-    try:
-        value = float(sec) + float(nanosec) * 1e-9
-    except OverflowError as error:
-        raise ValueError("timestamp must be finite") from error
-    if not math.isfinite(value):
-        raise ValueError("timestamp must be finite")
+    value = sec * 1_000_000_000 + nanosec
+    if not 0 <= value <= (1 << 63) - 1:
+        raise ValueError("timestamp must be a nonnegative signed int64")
     return value
 
 

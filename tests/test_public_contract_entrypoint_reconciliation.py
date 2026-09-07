@@ -167,6 +167,18 @@ def test_tracked_public_contracts_include_the_program_client_boundary() -> None:
     assert "never interpreted as idle" in headless
 
 
+def test_explicit_mcp_contract_write_and_check(monkeypatch, tmp_path) -> None:
+    module = _load_generator_module()
+    reference = tmp_path / "MCP_RUNTIME_CONTRACT.md"
+    monkeypatch.setattr(module, "MCP_REFERENCE_PATH", reference)
+    monkeypatch.setattr(module, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(module, "gen_mcp_api", lambda: "generated MCP\n")
+    assert module.main(["mcp"]) == 0
+    assert module.main(["mcp", "--check"]) == 0
+    reference.write_text("stale\n", encoding="utf-8")
+    assert module.main(["mcp", "--check"]) == 1
+
+
 def _write_recording_command(path: Path) -> None:
     path.write_text(
         "#!/usr/bin/env bash\n"

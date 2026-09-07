@@ -15,6 +15,25 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+it('downloads filtered diagnostics directly without fetching or parsing into UI state', () => {
+  const fetcher = vi.fn();
+  vi.stubGlobal('fetch', fetcher);
+  const query = { programRunId: 'run.one / two', channel: 'manyforge.composer', recentSeconds: 60 };
+  expect(api.history.exportUrl(query)).toContain('/api/debug/export?');
+  expect(api.history.exportUrl(query, true)).toContain('/api/debug/export/ros2-medkit?');
+  expect(api.history.exportUrl(query)).toContain('channel=manyforge.composer');
+  expect(api.history.exportUrl(query)).toContain('program_run_id=run.one+%2F+two');
+  expect(fetcher).not.toHaveBeenCalled();
+});
+
+it('rejects a discovery page for a different requested index', async () => {
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response({
+    schema_version: 'manyforge.historian_discovery.v1', kind: 'channel',
+    values: ['manyforge.composer'], truncated: false, next_after: null,
+  })));
+  await expect(api.history.discovery('program_run_id')).rejects.toThrow('different kind');
+});
+
 function response(
   payload: unknown,
   options: { ok?: boolean; status?: number; statusText?: string } = {},
@@ -52,7 +71,7 @@ function workspaceFixture(): Record<string, unknown> {
     name: 'Fixture',
     catalog: {
       api_version: 'manyforge.node_catalog.v2',
-      content_version: '1.1.0',
+      content_version: '2.0.0',
     },
     component_roles: {},
     target_roles: {},
@@ -756,7 +775,9 @@ describe('headless intent client', () => {
 
   it('carries bounded historian time, component, type, and page filters', async () => {
     const fetchMock = vi.fn().mockResolvedValue(response({
-      schema_version: 'manyforge.historian_summary_page.v1',
+      schema_version: 'manyforge.historian_summary_page.v2',
+      time_window: { start_utc_ns: '10', end_utc_ns: '20' },
+      retention: null,
       events: [],
       next_before_sequence: null,
       truncated: false,
@@ -764,8 +785,8 @@ describe('headless intent client', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     await api.history.list({
-      startNs: '10',
-      endNs: '20',
+      startUtcNs: '10',
+      endUtcNs: '20',
       components: ['manyforge.runtime'],
       eventTypes: ['operation_completed'],
       beforeSequence: 7,
@@ -773,7 +794,7 @@ describe('headless intent client', () => {
     });
 
     expect(fetchMock.mock.calls[0]?.[0]).toBe(
-      '/api/execution/history?limit=32&start_ns=10&end_ns=20&before_sequence=7&components=manyforge.runtime&event_types=operation_completed',
+      '/api/execution/history?limit=32&start_utc_ns=10&end_utc_ns=20&before_sequence=7&components=manyforge.runtime&event_types=operation_completed',
     );
     expect(() => historianListPath({ limit: HISTORIAN_PAGE_LIMIT + 1 })).toThrow(
       'History page limit must be an integer from 1 to 32',

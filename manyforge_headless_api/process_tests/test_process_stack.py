@@ -1801,7 +1801,7 @@ def test_manager_api_cli_and_replacements_preserve_headless_owners(
             "source-model": "manyforge.source_model_projection.v2",
             "scene": "manyforge.scene_projection.v1",
             "alarms": "manyforge.operator_alarm_snapshot.v2",
-            "history": "manyforge.historian_summary_page.v1",
+            "history": "manyforge.historian_summary_page.v2",
         }
         cli_payloads: dict[str, dict] = {}
         for cli_operation, expected_schema in cli_reads.items():

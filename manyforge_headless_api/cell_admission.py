@@ -13,6 +13,8 @@ from typing import Any, Final
 
 import rfc8785
 
+from manyforge_behavior.json_scalars import nonnegative_int64
+
 from .private_transport import (
     PinnedRunRoot,
     PrivateTransportCapabilityError,
@@ -340,18 +342,21 @@ class CellAdmissionClient:
         if set(intent) != _INTENT_KEYS:
             raise ValueError("claim intent is not the exact A1 projection")
         result = self._call("cell_admission_acquire", intent)
+        try:
+            nonnegative_int64(result.get("accepted_at_ns"))
+        except ValueError as error:
+            raise CellAdmissionError("execution_command_response_invalid",
+                                     "native claim acceptance time is malformed") from error
         if (
             set(result) != _CLAIM_KEYS
             or result.get("intent") != dict(intent)
             or any(
                 type(result.get(key)) is not int
                 for key in (
-                    "accepted_at_ns",
                     "acquired_admission_generation",
                     "claim_generation",
                 )
             )
-            or result["accepted_at_ns"] < 0
             or not 1
             <= result["acquired_admission_generation"]
             <= 9_007_199_254_740_991

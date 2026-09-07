@@ -48,6 +48,7 @@ from manyforge_headless_api.models import (
     RuntimeOverridePromotionRequest,
     RuntimeOverrideStageRequest,
 )
+from manyforge_headless_api.history_query import HistorianQueryRequest, HistorianDiscoveryRequest, HistorianDebugRequest
 
 from .node_environment_client import (
     ActiveNodeEnvironmentProjectionError,
@@ -930,45 +931,31 @@ def create_headless_router(
 
     @router.get("/api/execution/history")
     def history(
-        start_ns: Annotated[
-            int | None,
-            Query(ge=0, le=_MAXIMUM_SAFE_INTEGER),
-        ] = None,
-        end_ns: Annotated[
-            int | None,
-            Query(ge=0, le=_MAXIMUM_SAFE_INTEGER),
-        ] = None,
-        components: Annotated[
-            list[str] | None,
-            Query(max_length=256),
-        ] = None,
-        event_types: Annotated[
-            list[str] | None,
-            Query(max_length=256),
-        ] = None,
-        before_sequence: Annotated[
-            int | None,
-            Query(ge=1, le=_MAXIMUM_SAFE_INTEGER),
-        ] = None,
-        limit: Annotated[int, Query(ge=1, le=_MAXIMUM_HISTORY_PAGE)] = 32,
+        query: Annotated[HistorianQueryRequest, Query()],
     ) -> dict[str, Any]:
-        params: list[tuple[str, str | int]] = [("limit", limit)]
-        for name, value in (
-            ("start_ns", start_ns),
-            ("end_ns", end_ns),
-            ("before_sequence", before_sequence),
-        ):
-            if value is not None:
-                params.append((name, value))
-        params.extend(("components", value) for value in components or ())
-        params.extend(("event_types", value) for value in event_types or ())
         # The bounded history page can still be large. This synchronous route
         # already runs in a read worker; encode there so history pressure does
         # not stall the event loop used by execution controls.
         return Response(
-            content=_call(lambda: client.history_payload(params=params)),
+            content=_call(lambda: client.history_payload(params=query.query_parameters())),
             media_type="application/json",
         )
+
+    @router.get("/api/execution/history/export")
+    def history_export(query: Annotated[HistorianQueryRequest, Query()]) -> Response:
+        return Response(content=_call(lambda: client.get_json_payload("/api/execution/history/export", params=query.query_parameters())), media_type="application/json", headers={"Content-Disposition": 'attachment; filename="manyforge-events.json"'})
+
+    @router.get("/api/execution/history/discovery")
+    def history_discovery(query: Annotated[HistorianDiscoveryRequest, Query()]) -> Response:
+        return Response(content=_call(lambda: client.get_json_payload("/api/execution/history/discovery", params=query.model_dump())), media_type="application/json")
+
+    @router.get("/api/debug/export")
+    def debug_export(query: Annotated[HistorianDebugRequest, Query()]) -> Response:
+        return Response(content=_call(lambda: client.get_json_payload("/api/debug/export", params=query.history_query().query_parameters())), media_type="application/json", headers={"Content-Disposition": 'attachment; filename="manyforge-debug.json"'})
+
+    @router.get("/api/debug/export/ros2-medkit")
+    def normalized_trace_export(query: Annotated[HistorianDebugRequest, Query()]) -> Response:
+        return Response(content=_call(lambda: client.get_json_payload("/api/debug/export/ros2-medkit", params=query.history_query().query_parameters())), media_type="application/json", headers={"Content-Disposition": 'attachment; filename="manyforge-trace.json"'})
 
     @router.get("/api/execution/history/health")
     def historian_health() -> dict[str, Any]:

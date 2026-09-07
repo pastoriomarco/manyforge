@@ -6,13 +6,14 @@
 # `scripts/regen-public-contracts.py` from
 # the configured schema-only Composer route superset;
 # `docs/reference/HEADLESS_REST_API.md`
-# comes from the independent H0 FastAPI route owner. Removed aggregate MCP,
+# comes from the independent H0 FastAPI route owner. The optional MCP contract
+# is derived from the actual Composer routes. Removed aggregate
 # assistant-provider, viewer, execution, and lifecycle contracts are not
 # generated.
 #
 # The historical no-argument form represented the removed aggregate contract
 # check and is unavailable.  The retained REST-only check requires the
-# explicit `structural-rest` or `headless-rest` selector and exits 1 on drift.
+# explicit `structural-rest`, `headless-rest`, or `mcp` selector; exits 1 on drift.
 #
 # It MUST run inside the manyforge dev container — the regen script
 # imports the retained Composer app and structural state, which require the
@@ -34,8 +35,8 @@ if (( $# == 0 )); then
   exit 78
 fi
 
-if (( $# != 1 )) || { [[ "$1" != "structural-rest" ]] && [[ "$1" != "headless-rest" ]]; }; then
-  builtin printf 'Usage: %s {structural-rest|headless-rest}\n' "$0" >&2
+if (( $# != 1 )) || { [[ "$1" != "structural-rest" ]] && [[ "$1" != "headless-rest" ]] && [[ "$1" != "mcp" ]]; }; then
+  builtin printf 'Usage: %s {structural-rest|headless-rest|mcp}\n' "$0" >&2
   exit 64
 fi
 

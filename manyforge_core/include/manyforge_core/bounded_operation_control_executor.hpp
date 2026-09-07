@@ -41,6 +41,9 @@ struct OperationControlEffectRequest final {
   IResolvedPreparedParticipantExecutionEngine* prepared_engine{};
   std::shared_ptr<const ResolvedPreparedMotionResumeRequestDTO> prepared_resume;
   std::shared_ptr<std::atomic_bool> cancellation_requested;
+  // Internal disposal of an already-created Resume product, not another
+  // public control or another original participant effect.
+  bool prepared_resume_cleanup_only{};
 };
 
 struct OperationControlEffectResult final {
@@ -50,11 +53,11 @@ struct OperationControlEffectResult final {
   OperationControlKind control{OperationControlKind::kPause};
   bool accepted{};
   std::optional<ErrorDTO> error;
-  // Resume-only cleanup facts. A created preparation that is not yet cleaned
-  // up must remain owned until either dispatch is linearized or exact
-  // pre-dispatch cancellation completes.
+  // Resume-only lifetime facts. Finished means no product was created or its
+  // one disposal attempt returned; accepted/error retain success or failure.
   bool prepared_resume_created{};
-  bool prepared_resume_cleanup_complete{};
+  bool prepared_resume_cleanup_finished{};
+  bool prepared_resume_cleanup_only{};
 };
 
 enum class OperationControlEffectStartStatus : std::uint8_t {
@@ -119,6 +122,8 @@ class BoundedOperationControlExecutor final {
 
   [[nodiscard]] std::size_t capacity() const noexcept;
   [[nodiscard]] bool prequalified_ready() const noexcept;
+  /// Includes completion callbacks after their result slot was released.
+  [[nodiscard]] bool has_active_calls() const noexcept;
   [[nodiscard]] OperationControlEffectStartResult TryStart(
       OperationControlEffectRequest request) noexcept;
   [[nodiscard]] OperationControlEffectTakeResult TryTake(

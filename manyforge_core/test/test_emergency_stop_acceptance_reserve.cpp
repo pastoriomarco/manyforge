@@ -88,6 +88,30 @@ TEST(EmergencyStopAcceptanceReserveTest,
   EXPECT_EQ(reserve.active_correlation_count(), 1U);
 }
 
+TEST(EmergencyStopAcceptanceReserveTest, StaleExplicitFullStopRetainsItsResolvedDisposition) {
+  EmergencyStopAcceptanceReserve reserve(2U);
+  auto request = candidate("request.stale.full");
+  request.full_stop = true;
+  request.disposition = StopResolutionDispositionDTO::kStaleButUnambiguouslyResolved;
+  const auto first = reserve.reserve_or_join(request);
+  ASSERT_TRUE(first.accepted());
+  EXPECT_TRUE(first.full_stop);
+  EXPECT_EQ(first.disposition, request.disposition);
+  EXPECT_EQ(first.acceptance_path, EmergencyStopAcceptancePathDTO::kFreshReserved);
+  request.request_id = "request.stale.full.join";
+  request.proposed_stop_id = "stop.unused";
+  request.proposed_stop_generation = StopGeneration(2U);
+  request.accepted_at_ns = 200;
+  request.outer_deadline_ns = 2'000;
+  request.full_stop_outer_deadline_ns = 2'000;
+  const auto joined = reserve.reserve_or_join(request);
+  ASSERT_TRUE(joined.accepted());
+  EXPECT_EQ(joined.stop_id(), first.stop_id());
+  EXPECT_EQ(joined.work_token, first.work_token);
+  EXPECT_EQ(joined.outer_deadline_ns, first.outer_deadline_ns);
+  EXPECT_EQ(joined.disposition, request.disposition);
+}
+
 TEST(EmergencyStopAcceptanceReserveTest, ConflictingResidentIdentityPromotesAndLatchesFullStop) {
   EmergencyStopAcceptanceReserve reserve(2U);
   ASSERT_TRUE(reserve.reserve_or_join(candidate("request.conflict")).accepted());

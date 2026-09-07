@@ -552,7 +552,6 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
 
  private:
   struct PreparedMotionSession;
-  struct PreparedCapabilityCommandSession;
   struct PlanningSuccess;
   struct ExecuteWorkerPlanPhaseResult;
   struct ExecuteWorkerValidationPhaseResult;
@@ -1153,8 +1152,6 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
 
   mutable std::mutex prepared_motion_session_mutex_;
   std::shared_ptr<PreparedMotionSession> active_prepared_motion_session_;
-  mutable std::mutex prepared_command_session_mutex_;
-  std::shared_ptr<PreparedCapabilityCommandSession> active_prepared_command_session_;
 
   // Declared last so its destructor runs first after the kernel destructor body.
   // The destructor body already stops/drains it explicitly; this member order is

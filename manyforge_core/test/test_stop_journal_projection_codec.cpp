@@ -319,30 +319,40 @@ inline constexpr char kDigestB[] =
 }
 
 TEST(StopJournalProjectionCodecTest, RoundTripsAcceptanceAndAffectedStateCanonically) {
-  auto terminal = TerminalProjection();
-  OperationStateDTO operation{OperationId("operation.1"),
-                              OperationRevision(5U),
-                              ProgramBindingId(kDigestB),
-                              ProgramRunId("program-run.1"),
-                              OperationCoordinationPolicy::kIndependent,
-                              OperationStateKind::kStopped,
-                              {},
-                              30,
-                              terminal.certificate.stop_id,
-                              terminal.certificate.stop_generation,
-                              std::nullopt};
-  StopJournalAcceptanceProjectionDTO projection{
-      terminal.stop_status.accepted,
-      EmergencyStopAffectedStateSnapshotDTO{{std::move(operation)},
-                                            {ResourceId("joint.1"), ResourceId("joint.2")}}};
-  const auto encoded = EncodeStopJournalAcceptanceProjection(projection);
-  ASSERT_TRUE(encoded.ok()) << encoded.error().message;
-  const auto decoded = DecodeStopJournalAcceptanceProjection(encoded.value());
-  ASSERT_TRUE(decoded.ok()) << decoded.error().message;
-  EXPECT_EQ(decoded.value(), projection);
-  const auto reencoded = EncodeStopJournalAcceptanceProjection(decoded.value());
-  ASSERT_TRUE(reencoded.ok());
-  EXPECT_EQ(reencoded.value(), encoded.value());
+  for (const auto capture_order :
+       {std::uint64_t{0}, std::uint64_t{1}, (std::uint64_t{1} << 53U) + 1U,
+        static_cast<std::uint64_t>(INT64_MAX)}) {
+    SCOPED_TRACE(capture_order);
+    auto terminal = TerminalProjection();
+    OperationStateDTO operation{OperationId("operation.1"),
+                                OperationRevision(5U),
+                                ProgramBindingId(kDigestB),
+                                ProgramRunId("program-run.1"),
+                                OperationCoordinationPolicy::kIndependent,
+                                OperationStateKind::kStopped,
+                                {},
+                                30,
+                                terminal.certificate.stop_id,
+                                terminal.certificate.stop_generation,
+                                std::nullopt};
+    operation.journal_capture_order = capture_order;
+    StopJournalAcceptanceProjectionDTO projection{
+        terminal.stop_status.accepted,
+        EmergencyStopAffectedStateSnapshotDTO{{std::move(operation)},
+                                              {ResourceId("joint.1"), ResourceId("joint.2")}}};
+    const auto encoded = EncodeStopJournalAcceptanceProjection(projection);
+    ASSERT_TRUE(encoded.ok()) << encoded.error().message;
+    EXPECT_NE(encoded.value().find(
+                  capture_order == 0U ? "manyforge.internal.stop-journal-acceptance-projection.v1"
+                                      : "manyforge.internal.stop-journal-acceptance-projection.v2"),
+              std::string::npos);
+    const auto decoded = DecodeStopJournalAcceptanceProjection(encoded.value());
+    ASSERT_TRUE(decoded.ok()) << decoded.error().message;
+    EXPECT_EQ(decoded.value(), projection);
+    const auto reencoded = EncodeStopJournalAcceptanceProjection(decoded.value());
+    ASSERT_TRUE(reencoded.ok());
+    EXPECT_EQ(reencoded.value(), encoded.value());
+  }
 }
 
 TEST(StopJournalProjectionCodecTest, RoundTripsEveryEmbeddedTerminalStageFieldCanonically) {

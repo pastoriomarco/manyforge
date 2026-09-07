@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 import pytest
 
 from manyforge_headless_api.app import create_app
-from manyforge_headless_api.native import HeadlessApiConfig
+from manyforge_headless_api.native import HeadlessApiConfig, NativeHeadlessCore
 
 
 CATALOG = Path("/workspace/manyforge_headless/resources/operator-alarm-catalog.v1.yaml")
@@ -52,7 +52,6 @@ def _config(root: Path, owner_epoch: str) -> HeadlessApiConfig:
         freshness_milliseconds=100,
         historian_queue_capacity=32,
         historian_record_retention=100,
-        mutation_replay_capacity=32,
     )
 
 
@@ -219,6 +218,54 @@ def test_native_http_owner_works_without_composer_and_fences_replay(
 
         assert client.get("/api/health").json()["status"] == "degraded"
     assert "manyforge_composer" not in sys.modules
+
+
+def test_native_history_discovery_exports_and_exact_context_survive_restart(tmp_path: Path) -> None:
+    config = replace(_config(tmp_path, "history.epoch.1"), historian_queue_capacity=64)
+    core = NativeHeadlessCore(config)
+    origin = 31 * 365 * 86400 * 1_000_000_000
+    try:
+        for index in range(35):
+            result = core.record_client_incident(
+                incident_id=f"incident.{index}", incident_kind="control_delayed",
+                phase="activated", control_session_id="session.1", client_incarnation="client.1",
+                source_label="operator_ui", reason_code="heartbeat_delayed", occurrence_count=1,
+                maximum_delay_ns=600_000_000,
+                first_observed_ns=origin + index, last_observed_ns=origin + index,
+                causal_context={"program_run_id": "run.old" if index == 0 else "run.new",
+                                "scene_id": "scene.at.incident"},
+            )
+            assert result["recorded"] is True
+    finally:
+        core.shutdown()  # real bounded writer drain; reopen through the public API
+
+    with TestClient(create_app(replace(config, owner_epoch="history.epoch.2"))) as client:
+        page = client.get("/api/execution/history", params={"program_run_id": "run.old", "severities": "WARN"})
+        assert page.status_code == 200, page.text
+        row, = page.json()["events"]
+        assert row["sequence"] == 1  # selection is before the 32-row page, not a browser scan
+        detail = client.get("/api/execution/history/1")
+        assert detail.status_code == 200, detail.text
+        channels = client.get("/api/execution/history/discovery", params={"kind": "channel"})
+        assert channels.status_code == 200, channels.text
+        assert channels.json()["values"] == ["manyforge.composer"]
+        runs = client.get("/api/execution/history/discovery", params={"kind": "program_run_id", "limit": 1})
+        assert runs.json()["values"] == ["run.new"]
+        assert runs.json()["next_after"] == "run.new"
+        assert client.get("/api/execution/history/discovery", params={"kind": "program_run_id", "after": "run.new"}).json()["values"] == ["run.old"]
+        for path in ("/api/execution/history/export", "/api/debug/export", "/api/debug/export/ros2-medkit"):
+            response = client.get(path, params={"program_run_id": "run.old"})
+            assert response.status_code == 200, response.text
+            assert response.headers["content-disposition"].startswith("attachment;")
+            assert "scene.at.incident" in response.text
+            if path.endswith("/ros2-medkit"):
+                assert response.json()["schema_version"] == "manyforge.ros2_medkit_trace.v2"
+                assert response.json()["records"][0]["program_run_id"] == "run.old"
+        exported = client.get("/api/execution/history/export", params={"program_run_id": "run.old"}).json()
+        assert exported["events"][0]["event"]["payload"]["first_observed_ns"] == str(origin)
+        assert client.get("/api/debug/export?run_id=a&program_run_id=b").status_code == 422
+        assert client.get("/api/execution/history/discovery?kind=payload_json").status_code == 422
+        assert client.get("/api/execution/history/export?limit=33").status_code == 422
 
 
 def test_http_owner_restart_reannunciates_from_fresh_source_observation(

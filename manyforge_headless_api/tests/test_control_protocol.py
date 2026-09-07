@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -85,18 +87,13 @@ def test_freshness_profile_and_delta_shape_are_one_closed_contract() -> None:
             {**context, "valid_for_ns": CONTROL_FRESHNESS_VALID_FOR_NS - 1}
         )
 
-    delta = {
-        "schema_version": CONTROL_PROTOCOL_VERSION,
-        "message_kind": "delta",
-        "control_session_id": "session.1",
-        "server_sequence": "1",
-        "state_sequence": "1",
-        "received_client_sequence": None,
-        "event_class": "cold",
-        "control": None,
-        "shell": {},
-    }
-    assert ExecutionControlDeltaDTO.model_validate(delta).shell == {}
+    fixture = json.loads((Path(__file__).parent / "fixtures/control-v2-local-delta.json").read_text())
+    delta = fixture["local_delta"]
+    parsed = ExecutionControlDeltaDTO.model_validate(delta)
+    assert parsed.model_dump(mode="json") == delta
+    for invalid in fixture["invalid_overlays"]:
+        with pytest.raises(ValidationError):
+            ExecutionControlDeltaDTO.model_validate({**delta, **invalid})
     with pytest.raises(ValidationError):
         ExecutionControlDeltaDTO.model_validate({**delta, "shell": None})
 

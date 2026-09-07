@@ -18,6 +18,16 @@ class ExecutionTransport(Protocol):
 
     def observation(self) -> dict[str, Any]: ...
 
+    def query_target(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
+
+    def query_operation(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
+
+    def full_stop(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
+
+    def set_operation_runtime_scale(
+        self, body: Mapping[str, Any]
+    ) -> dict[str, Any]: ...
+
     def submit(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
     def read(self, operation_id: str) -> dict[str, Any]: ...
@@ -31,17 +41,11 @@ class ExecutionTransport(Protocol):
         body: Mapping[str, Any],
     ) -> dict[str, Any]: ...
 
-    def pause(
-        self, operation_id: str, body: Mapping[str, Any]
-    ) -> dict[str, Any]: ...
+    def pause(self, operation_id: str, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
-    def resume(
-        self, operation_id: str, body: Mapping[str, Any]
-    ) -> dict[str, Any]: ...
+    def resume(self, operation_id: str, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
-    def reset(
-        self, operation_id: str, body: Mapping[str, Any]
-    ) -> dict[str, Any]: ...
+    def reset(self, operation_id: str, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
     def acknowledge_completed(
         self, operation_id: str, body: Mapping[str, Any]
@@ -178,6 +182,11 @@ class KernelClient:
     def observation(self) -> dict[str, Any]:
         return self._projection("observation")
 
+    def query_target(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return self._successful(
+            self._transport.query_target(body), label="target observation"
+        )
+
     def _projection(self, method_name: str) -> dict[str, Any]:
         method = getattr(self._transport, method_name, None)
         if not callable(method):
@@ -185,25 +194,19 @@ class KernelClient:
         return self._successful(method(), label=method_name.replace("_", " "))
 
     def execute(self, intent: Mapping[str, Any]) -> dict[str, Any]:
-        return self._successful(
-            self._transport.submit(intent), label="submission"
-        )
+        return self._successful(self._transport.submit(intent), label="submission")
 
     def plan_pick(self, intent: Mapping[str, Any]) -> dict[str, Any]:
         method = getattr(self._transport, "plan_pick", None)
         if not callable(method):
             raise TypeError("execution transport has no callable plan_pick")
-        return self._successful(
-            method(intent), label="pick planning"
-        )
+        return self._successful(method(intent), label="pick planning")
 
     def plan_place(self, intent: Mapping[str, Any]) -> dict[str, Any]:
         method = getattr(self._transport, "plan_place", None)
         if not callable(method):
             raise TypeError("execution transport has no callable plan_place")
-        return self._successful(
-            method(intent), label="place planning"
-        )
+        return self._successful(method(intent), label="place planning")
 
     def start_pick(self, intent: Mapping[str, Any]) -> dict[str, Any]:
         method = getattr(self._transport, "start_pick", None)
@@ -244,12 +247,8 @@ class KernelClient:
     def recovery_assessment(self, operation_id: str) -> dict[str, Any]:
         method = getattr(self._transport, "operation_recovery", None)
         if not callable(method):
-            raise TypeError(
-                "execution transport has no callable operation_recovery"
-            )
-        response = self._successful(
-            method(operation_id), label="recovery assessment"
-        )
+            raise TypeError("execution transport has no callable operation_recovery")
+        response = self._successful(method(operation_id), label="recovery assessment")
         assessment = response.get("recovery_assessment")
         if not isinstance(assessment, dict):
             raise KernelClientResponseError(
@@ -290,31 +289,45 @@ class KernelClient:
             label="recovery action",
         )
         result = response.get("result")
-        if not isinstance(result, dict):
+        if (
+            not isinstance(result, dict)
+            or result.get("request_id") != request.get("request_id")
+            or result.get("action") != request.get("action")
+            or type(result.get("accepted")) is not bool
+            or not isinstance(result.get("resulting_assessment"), dict)
+        ):
             raise KernelClientResponseError(
-                "headless recovery action has no owner result"
+                "headless recovery action has no exact owner result"
             )
         return result
 
-    def pause(
-        self, operation_id: str, request: Mapping[str, Any]
-    ) -> dict[str, Any]:
+    def pause(self, operation_id: str, request: Mapping[str, Any]) -> dict[str, Any]:
         return self._successful(
             self._transport.pause(operation_id, request),
             label="Pause",
         )
 
-    def resume(
-        self, operation_id: str, request: Mapping[str, Any]
-    ) -> dict[str, Any]:
+    def query_operation(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        return self._successful(
+            self._transport.query_operation(request), label="Program operation context"
+        )
+
+    def full_stop(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        return self._successful(self._transport.full_stop(request), label="Full Stop")
+
+    def set_operation_runtime_scale(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        return self._successful(
+            self._transport.set_operation_runtime_scale(request),
+            label="operation runtime scale",
+        )
+
+    def resume(self, operation_id: str, request: Mapping[str, Any]) -> dict[str, Any]:
         return self._successful(
             self._transport.resume(operation_id, request),
             label="Resume",
         )
 
-    def reset(
-        self, operation_id: str, request: Mapping[str, Any]
-    ) -> dict[str, Any]:
+    def reset(self, operation_id: str, request: Mapping[str, Any]) -> dict[str, Any]:
         return self._successful(
             self._transport.reset(operation_id, request),
             label="Reset",
@@ -324,25 +337,18 @@ class KernelClient:
         self, operation_id: str, request: Mapping[str, Any]
     ) -> dict[str, Any]:
         try:
-            response = self._transport.acknowledge_completed(
-                operation_id, request
-            )
+            response = self._transport.acknowledge_completed(operation_id, request)
         except Exception as error:
             details = getattr(error, "details", None)
-            if (
-                getattr(error, "code", None) == "operation_effect_in_flight"
-                or (
-                    isinstance(details, Mapping)
-                    and details.get("reason") == "operation_effect_in_flight"
-                )
+            if getattr(error, "code", None) == "operation_effect_in_flight" or (
+                isinstance(details, Mapping)
+                and details.get("reason") == "operation_effect_in_flight"
             ):
                 raise KernelOperationSettlementPendingError(
                     "operation completion is waiting for a subordinate effect"
                 ) from error
             raise
-        return self._successful(
-            response, label="completion acknowledgement"
-        )
+        return self._successful(response, label="completion acknowledgement")
 
     def stop(self, request: Mapping[str, Any]) -> dict[str, Any]:
         return self._successful(

@@ -1,6 +1,6 @@
 api_version: manyforge.program.v1
 program_id: isaac_manipulator_scene_light_collision
-program_revision: sha256:47eae98a1a3c12c1d4567a9e264ef8198331b9169861a18b5a20ddee30a061e3
+program_revision: sha256:56af68ba0198cddb6fbb03bd68df7bb6a18ec3c1b2432ac4e1c17fd32d9ef9b1
 program_profile: composable-cell-v1
 name: isaac_manipulator_scene_light_collision
 description: >-
@@ -10,7 +10,7 @@ description: >-
   collision and Stop path can be observed without a supervisor fallback.
 catalog:
   api_version: manyforge.node_catalog.v2
-  content_version: 1.1.0
+  content_version: 2.0.0
 compatibility:
   lanes: [isaac-sim]
   assistant: forbidden

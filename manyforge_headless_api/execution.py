@@ -16,7 +16,9 @@ import unicodedata
 import rfc8785
 
 from .models import (
+    MAX_IDENTITY_BYTES,
     FullStopIntentRequest,
+    GripperFeedbackObservation,
     OperationControlRequest,
     OperationRecoveryActionRequest,
     OperationIntentRequest,
@@ -24,12 +26,16 @@ from .models import (
     PickSequencePlanningRequest,
     PlaceSequencePlanningRequest,
     ProgramRunStopIntentRequest,
+    ProgramOperationQuery,
     RuntimeScaleControlRequest,
+    OperationRuntimeScaleRequest,
     RuntimeScaleControlSelectorRequest,
     StopFaultRecoveryIntentRequest,
     StopIntentRequest,
+    TargetObservationQuery,
 )
 from .native import HeadlessApiError, HeadlessCorePort, strict_json_object
+from manyforge_behavior.json_scalars import nonnegative_int64
 from .private_transport import (
     PinnedRunRoot,
     PrivateTransportCapabilityError,
@@ -119,9 +125,7 @@ MOTION_PREVIEW_RECEIPT_KEYS = frozenset(
         "target_role_id",
     }
 )
-MOTION_PREVIEW_COLLISION_REVISION_KEYS = frozenset(
-    {"content_hash", "revision_id"}
-)
+MOTION_PREVIEW_COLLISION_REVISION_KEYS = frozenset({"content_hash", "revision_id"})
 CAPABILITY_COMMAND_PREVIEW_RESPONSE_KEYS = frozenset(
     {"api_version", "command", "ok", "preview_receipt"}
 )
@@ -163,6 +167,8 @@ class ExecutionPort(Protocol):
     def targets(self) -> dict[str, Any]: ...
 
     def control_state(self) -> dict[str, Any]: ...
+
+    def query_target(self, request: TargetObservationQuery) -> dict[str, Any]: ...
 
     def observation(self) -> dict[str, Any]: ...
 
@@ -352,7 +358,9 @@ def _decode_execution_response(payload: bytes, flags: int) -> dict[str, Any]:
     return response
 
 
-class ExecutionObservationSession(AbstractContextManager["ExecutionObservationSession"]):
+class ExecutionObservationSession(
+    AbstractContextManager["ExecutionObservationSession"]
+):
     """One demand-driven native observation session; no timer or state cache."""
 
     def __init__(
@@ -526,9 +534,7 @@ class ExecutionCommandClient:
                 f"native execution run capability is invalid: {error}",
             ) from error
         self._socket_path = self._run_root.path / EXECUTION_SOCKET_FILE
-        self._control_socket_path = (
-            self._run_root.path / EXECUTION_CONTROL_SOCKET_FILE
-        )
+        self._control_socket_path = self._run_root.path / EXECUTION_CONTROL_SOCKET_FILE
         self._observation_socket_path = (
             self._run_root.path / EXECUTION_OBSERVATION_SOCKET_FILE
         )
@@ -545,9 +551,7 @@ class ExecutionCommandClient:
                 "execution command exceeds its byte bound",
             )
         try:
-            with self._run_root.socket_address(
-                socket_path.name
-            ) as socket_address:
+            with self._run_root.socket_address(socket_path.name) as socket_address:
                 with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as client:
                     client.setsockopt(
                         socket.SOL_SOCKET,
@@ -602,8 +606,7 @@ class ExecutionCommandClient:
         if response.get("ok") is True and (
             response.get("command") != "stop_program_run"
             or not isinstance(accepted, dict)
-            or accepted.get("request_id")
-            != request.request_context.request_id
+            or accepted.get("request_id") != request.request_context.request_id
         ):
             raise HeadlessApiError(
                 "execution_command_response_identity_mismatch",
@@ -695,8 +698,7 @@ class ExecutionCommandClient:
                 "stop_generation",
                 "stop_id",
             }
-            or status.get("schema_version")
-            != "manyforge.execution_stop_status.v1"
+            or status.get("schema_version") != "manyforge.execution_stop_status.v1"
             or status.get("stop_id") != stop_id
             or not isinstance(status.get("request_id"), str)
             or not status["request_id"]
@@ -724,9 +726,7 @@ class ExecutionCommandClient:
     def _exchange_control(self, command: dict[str, Any]) -> dict[str, Any]:
         return self._exchange_on(command, self._control_socket_path)
 
-    def _request_attribution(
-        self, trusted_principal_id: str | None
-    ) -> dict[str, Any]:
+    def _request_attribution(self, trusted_principal_id: str | None) -> dict[str, Any]:
         if trusted_principal_id is not None and (
             not trusted_principal_id
             or unicodedata.normalize("NFC", trusted_principal_id)
@@ -769,9 +769,7 @@ class ExecutionCommandClient:
             )
         return response
 
-    def _read_projection_on(
-        self, command: str, socket_path: Path
-    ) -> dict[str, Any]:
+    def _read_projection_on(self, command: str, socket_path: Path) -> dict[str, Any]:
         return self._validate_projection_response(
             command,
             self._exchange_on(
@@ -805,10 +803,132 @@ class ExecutionCommandClient:
     def control_state(self) -> dict[str, Any]:
         return self._read_projection("control_state")
 
-    def observation(self) -> dict[str, Any]:
-        return self._read_projection_on(
-            "observation", self._observation_socket_path
+    def query_operation(self, request: ProgramOperationQuery) -> dict[str, Any]:
+        response = self.require_success(
+            self._exchange(
+                {
+                    "api_version": EXECUTION_COMMAND_VERSION,
+                    "command": "query_operation",
+                    "query": request.model_dump(mode="json"),
+                }
+            )
         )
+        operation = response.get("operation")
+        if (
+            response.get("command") != "query_operation"
+            or response.get("owner_epoch") != request.owner_epoch
+            or response.get("target_role_id") != request.target_role_id
+            or not isinstance(operation, dict)
+            or operation.get("program_run_id") != request.program_run_id
+            or operation.get("program_binding_id") != request.program_binding_id
+            or not isinstance(operation.get("operation_id"), str)
+            or not operation["operation_id"]
+            or len(operation["operation_id"].encode("utf-8")) > MAX_IDENTITY_BYTES
+            or type(operation.get("operation_revision")) is not int
+            or not 1 <= operation["operation_revision"] <= MAXIMUM_SAFE_INTEGER
+            or not isinstance(operation.get("participants"), list)
+            or len(operation["participants"]) != 1
+            or not isinstance(operation["participants"][0], dict)
+        ):
+            raise HeadlessApiError(
+                "execution_operation_context_invalid",
+                "operation context does not match its exact query",
+            )
+        return response
+
+    def set_operation_runtime_scale(
+        self,
+        request: OperationRuntimeScaleRequest,
+        *,
+        trusted_principal_id: str | None,
+    ) -> dict[str, Any]:
+        response = self.require_success(
+            self._exchange(
+                {
+                    "api_version": EXECUTION_COMMAND_VERSION,
+                    "attribution": self._request_attribution(trusted_principal_id),
+                    "command": "set_operation_runtime_scale",
+                    "request": request.model_dump(mode="json"),
+                }
+            )
+        )
+        accepted = response.get("accepted")
+        if (
+            response.get("command") != "set_operation_runtime_scale"
+            or not isinstance(accepted, dict)
+            or accepted.get("request_id") != request.request_context.request_id
+            or accepted.get("operation_id") != request.operation_id
+            or accepted.get("operation_revision") != request.expected_operation_revision
+            or type(accepted.get("runtime_scale_generation")) is not int
+            or accepted["runtime_scale_generation"]
+            != request.expected_runtime_scale_generation + 1
+            or accepted.get("requested_scale") != request.scale
+        ):
+            raise HeadlessApiError(
+                "execution_command_response_identity_mismatch",
+                "operation scaling acceptance does not match its request",
+            )
+        return response
+
+    def query_target(self, request: TargetObservationQuery) -> dict[str, Any]:
+        response = self.require_success(
+            self._exchange(
+                {
+                    "api_version": EXECUTION_COMMAND_VERSION,
+                    "command": "query_target",
+                    "query": request.model_dump(mode="json", exclude_none=True),
+                }
+            )
+        )
+        observation = response.get("target_observation")
+        expected = request.model_dump(mode="json", exclude_none=True)
+        expected["schema_version"] = "manyforge.target_observation.v1"
+        if (
+            response.get("command") != "query_target"
+            or not isinstance(observation, dict)
+            or set(observation)
+            != set(expected) | {"source_epoch", "source_sequence", "value"}
+            or any(observation.get(key) != value for key, value in expected.items())
+            or not isinstance(observation.get("source_epoch"), str)
+            or not observation["source_epoch"]
+            or len(observation["source_epoch"].encode("utf-8")) > 256
+            or unicodedata.normalize("NFC", observation["source_epoch"])
+            != observation["source_epoch"]
+            or type(observation.get("source_sequence")) is not int
+            or not 1 <= observation["source_sequence"] <= MAXIMUM_SAFE_INTEGER
+        ):
+            raise HeadlessApiError(
+                "execution_target_observation_invalid",
+                "native target query returned a mismatched observation",
+            )
+        try:
+            if request.kind == "frame_pose":
+                pose = Pose3Request.model_validate(observation["value"])
+                orientation = pose.orientation
+                norm_squared = sum(
+                    value * value
+                    for value in (
+                        orientation.x,
+                        orientation.y,
+                        orientation.z,
+                        orientation.w,
+                    )
+                )
+                if abs(norm_squared - 1.0) > 1e-6:
+                    raise ValueError(
+                        "native frame orientation is not a unit quaternion"
+                    )
+            else:
+                GripperFeedbackObservation.model_validate(observation["value"])
+        except ValueError as error:
+            raise HeadlessApiError(
+                "execution_target_observation_invalid",
+                "native target query returned invalid typed evidence",
+            ) from error
+        return response
+
+    def observation(self) -> dict[str, Any]:
+        return self._read_projection_on("observation", self._observation_socket_path)
 
     def open_observation_session(self) -> ExecutionObservationSession:
         return ExecutionObservationSession(
@@ -875,13 +995,10 @@ class ExecutionCommandClient:
             or type(admission_generation) is not int
             or not 1 <= admission_generation <= MAXIMUM_SAFE_INTEGER
             or not isinstance(page, dict)
-            or page.get("schema_version")
-            != "manyforge.execution_event_page.v1"
+            or page.get("schema_version") != "manyforge.execution_event_page.v1"
             or page.get("owner_epoch") != owner_epoch
             or type(page.get("next_after_sequence")) is not int
-            or not after_sequence
-            <= page["next_after_sequence"]
-            <= MAXIMUM_SAFE_INTEGER
+            or not after_sequence <= page["next_after_sequence"] <= MAXIMUM_SAFE_INTEGER
             or type(page.get("has_more")) is not bool
             or not isinstance(page.get("events"), list)
             or len(page["events"]) > limit
@@ -893,6 +1010,15 @@ class ExecutionCommandClient:
             )
         previous = after_sequence
         for event in page["events"]:
+            try:
+                nonnegative_int64(
+                    event.get("occurred_at_ns") if isinstance(event, dict) else None
+                )
+            except ValueError as error:
+                raise HeadlessApiError(
+                    "execution_command_response_invalid",
+                    "native execution event timestamp is invalid",
+                ) from error
             if (
                 not isinstance(event, dict)
                 or event.get("owner_epoch") != owner_epoch
@@ -908,8 +1034,6 @@ class ExecutionCommandClient:
                     )
                 )
                 or not _valid_operation_event_identity(event)
-                or type(event.get("occurred_at_ns")) is not int
-                or not 0 <= event["occurred_at_ns"] <= MAXIMUM_SAFE_INTEGER
                 or not isinstance(event.get("occurred_at_wall"), str)
                 or not event["occurred_at_wall"]
                 or len(event["occurred_at_wall"].encode("utf-8")) > 128
@@ -996,23 +1120,18 @@ class ExecutionCommandClient:
             != "manyforge.direct_control_motion_preview.v1"
             or receipt.get("commit_eligible") is not True
             or receipt.get("intent_digest") != expected_intent_digest
-            or receipt.get("request_id")
-            != operation["request_context"]["request_id"]
+            or receipt.get("request_id") != operation["request_context"]["request_id"]
             or receipt.get("request_owner_epoch")
             != operation["request_context"]["request_owner_epoch"]
             or receipt.get("program_id") != operation["program_id"]
-            or receipt.get("program_revision")
-            != operation["program_revision"]
-            or receipt.get("program_binding_id")
-            != operation["program_binding_id"]
+            or receipt.get("program_revision") != operation["program_revision"]
+            or receipt.get("program_binding_id") != operation["program_binding_id"]
             or receipt.get("program_run_id") != operation["program_run_id"]
-            or receipt.get("graph_revision")
-            != operation["expected_graph_revision"]
+            or receipt.get("graph_revision") != operation["expected_graph_revision"]
             or receipt.get("retained_bundle_id")
             != operation["expected_retained_bundle_id"]
             or receipt.get("scene_revision") != expected_scene
-            or receipt.get("component_role_id")
-            != participant["component_role_id"]
+            or receipt.get("component_role_id") != participant["component_role_id"]
             or receipt.get("target_role_id") != participant["target_role_id"]
             or receipt.get("required_capability_id")
             != participant["required_capability_id"]
@@ -1052,8 +1171,7 @@ class ExecutionCommandClient:
                 for value in [*start_positions, *final_positions]
             )
             or not isinstance(collision_revision, dict)
-            or set(collision_revision)
-            != MOTION_PREVIEW_COLLISION_REVISION_KEYS
+            or set(collision_revision) != MOTION_PREVIEW_COLLISION_REVISION_KEYS
             or type(collision_revision.get("revision_id")) is not int
             or collision_revision["revision_id"] < 1
             or collision_revision["revision_id"] > MAXIMUM_SAFE_INTEGER
@@ -1067,8 +1185,7 @@ class ExecutionCommandClient:
         digest_input = dict(receipt)
         receipt_digest = digest_input.pop("receipt_digest", None)
         expected_receipt_digest = (
-            "sha256:"
-            + hashlib.sha256(_canonical_json(digest_input)).hexdigest()
+            "sha256:" + hashlib.sha256(_canonical_json(digest_input)).hexdigest()
         )
         if receipt_digest != expected_receipt_digest:
             raise HeadlessApiError(
@@ -1106,9 +1223,7 @@ class ExecutionCommandClient:
         payload = participant["payload"]
         command_value = payload.get("command_value")
         position = (
-            command_value.get("position")
-            if isinstance(command_value, dict)
-            else None
+            command_value.get("position") if isinstance(command_value, dict) else None
         )
         expected_intent_digest = (
             "sha256:" + hashlib.sha256(_canonical_json(operation)).hexdigest()
@@ -1128,29 +1243,22 @@ class ExecutionCommandClient:
             != "manyforge.direct_control_capability_command_preview.v1"
             or receipt.get("commit_eligible") is not True
             or receipt.get("intent_digest") != expected_intent_digest
-            or receipt.get("request_id")
-            != operation["request_context"]["request_id"]
+            or receipt.get("request_id") != operation["request_context"]["request_id"]
             or receipt.get("request_owner_epoch")
             != operation["request_context"]["request_owner_epoch"]
             or receipt.get("program_id") != operation["program_id"]
-            or receipt.get("program_revision")
-            != operation["program_revision"]
-            or receipt.get("program_binding_id")
-            != operation["program_binding_id"]
+            or receipt.get("program_revision") != operation["program_revision"]
+            or receipt.get("program_binding_id") != operation["program_binding_id"]
             or receipt.get("program_run_id") != operation["program_run_id"]
-            or receipt.get("graph_revision")
-            != operation["expected_graph_revision"]
+            or receipt.get("graph_revision") != operation["expected_graph_revision"]
             or receipt.get("retained_bundle_id")
             != operation["expected_retained_bundle_id"]
-            or receipt.get("scene_revision")
-            != operation["expected_scene_revision"]
-            or receipt.get("component_role_id")
-            != participant["component_role_id"]
+            or receipt.get("scene_revision") != operation["expected_scene_revision"]
+            or receipt.get("component_role_id") != participant["component_role_id"]
             or receipt.get("target_role_id") != participant["target_role_id"]
             or receipt.get("required_capability_id")
             != participant["required_capability_id"]
-            or receipt.get("command_schema_id")
-            != payload.get("command_schema_id")
+            or receipt.get("command_schema_id") != payload.get("command_schema_id")
             or receipt.get("command_schema_revision")
             != payload.get("command_schema_revision")
         ):
@@ -1193,10 +1301,7 @@ class ExecutionCommandClient:
             or target_position != expected_target
             or not isinstance(receipt.get("source_coordinate_name"), str)
             or not receipt["source_coordinate_name"]
-            or not (
-                bounded_model_resource
-                or unbounded_component_local_resource
-            )
+            or not (bounded_model_resource or unbounded_component_local_resource)
         ):
             raise HeadlessApiError(
                 "execution_command_response_invalid",
@@ -1234,9 +1339,7 @@ class ExecutionCommandClient:
                 "execution_command_response_identity_mismatch",
                 "execution observation does not match the requested operation",
             )
-        if response.get("ok") is True and type(
-            response.get("resident")
-        ) is not bool:
+        if response.get("ok") is True and type(response.get("resident")) is not bool:
             raise HeadlessApiError(
                 "execution_command_response_invalid",
                 "execution observation has no exact residency projection",
@@ -1299,9 +1402,7 @@ class ExecutionCommandClient:
             raise ValueError("operation_id must be bounded non-empty text")
         if (
             type(expected_operation_revision) is not int
-            or not 1
-            <= expected_operation_revision
-            <= MAXIMUM_SAFE_INTEGER
+            or not 1 <= expected_operation_revision <= MAXIMUM_SAFE_INTEGER
         ):
             raise ValueError("expected operation revision is invalid")
         response = self._exchange(
@@ -1354,21 +1455,15 @@ class ExecutionCommandClient:
                 or result.get("sequence_id") != request.sequence_id
                 or result.get("kind") != expected_kind
                 or result.get("selected_object_id") != request.selected_object_id
-                or result.get("status")
-                not in {"planned", "no_feasible_candidate"}
+                or result.get("status") not in {"planned", "no_feasible_candidate"}
                 or type(result.get("attempted_candidate_count")) is not int
-                or not 0
-                <= result["attempted_candidate_count"]
-                <= 4096
+                or not 0 <= result["attempted_candidate_count"] <= 4096
                 or not isinstance(result.get("reports"), list)
-                or len(result["reports"])
-                > result["attempted_candidate_count"]
+                or len(result["reports"]) > result["attempted_candidate_count"]
                 or (
                     expected_kind == "pick"
                     and result["attempted_candidate_count"] > 0
-                    and not isinstance(
-                        result.get("last_attempted_candidate"), dict
-                    )
+                    and not isinstance(result.get("last_attempted_candidate"), dict)
                 )
                 or (
                     expected_kind == "place"
@@ -1421,14 +1516,10 @@ class ExecutionCommandClient:
         }
         if (
             not isinstance(value, dict)
-            or value.get("schema_version")
-            != "manyforge.pick_place_sequence_status.v1"
+            or value.get("schema_version") != "manyforge.pick_place_sequence_status.v1"
             or value.get("sequence_id") != sequence_id
             or value.get("kind") not in {"pick", "place"}
-            or (
-                expected_kind is not None
-                and value.get("kind") != expected_kind
-            )
+            or (expected_kind is not None and value.get("kind") != expected_kind)
             or value.get("phase") not in phases
             or not isinstance(value.get("selected_object_id"), str)
             or not value["selected_object_id"]
@@ -1443,9 +1534,7 @@ class ExecutionCommandClient:
             )
             or (
                 value.get("committed_projection_revision") is not None
-                and not isinstance(
-                    value.get("committed_projection_revision"), dict
-                )
+                and not isinstance(value.get("committed_projection_revision"), dict)
             )
             or (
                 value.get("terminal_error") is not None
@@ -1546,8 +1635,7 @@ class ExecutionCommandClient:
         if response.get("ok") is True and (
             response.get("command") != command
             or not isinstance(accepted, dict)
-            or accepted.get("request_id")
-            != request.request_context.request_id
+            or accepted.get("request_id") != request.request_context.request_id
             or accepted.get("operation_id") != request.operation_id
             or accepted.get("control") != command
             or accepted.get("accepted_against_revision")
@@ -1619,8 +1707,7 @@ class ExecutionCommandClient:
         if response.get("ok") is True and (
             response.get("command") != "stop"
             or not isinstance(accepted, dict)
-            or accepted.get("request_id")
-            != request.request_context.request_id
+            or accepted.get("request_id") != request.request_context.request_id
         ):
             raise HeadlessApiError(
                 "execution_command_response_identity_mismatch",
@@ -1646,8 +1733,7 @@ class ExecutionCommandClient:
         if response.get("ok") is True and (
             response.get("command") != "full_stop"
             or not isinstance(accepted, dict)
-            or accepted.get("request_id")
-            != request.request_context.request_id
+            or accepted.get("request_id") != request.request_context.request_id
             or accepted.get("resolution_reason") != "explicit_full_stop"
         ):
             raise HeadlessApiError(
@@ -1730,7 +1816,10 @@ class ExecutionCommandClient:
             "retained_bundle_id",
             "stop_id",
         )
-        if any(not isinstance(latch.get(key), str) or not latch[key] for key in required_text):
+        if any(
+            not isinstance(latch.get(key), str) or not latch[key]
+            for key in required_text
+        ):
             return False
         if any(
             type(latch.get(key)) is not int
@@ -1781,8 +1870,7 @@ class ExecutionCommandClient:
                 "stop_id",
             }
             or any(
-                not isinstance(certificate.get(key), str)
-                or not certificate[key]
+                not isinstance(certificate.get(key), str) or not certificate[key]
                 for key in ("stop_certificate_id", "stop_id")
             )
             or any(
@@ -1905,8 +1993,7 @@ class ExecutionCommandClient:
         if response.get("ok") is True and (
             response.get("command") != "set_runtime_scale_control"
             or not isinstance(accepted, dict)
-            or accepted.get("request_id")
-            != request.request_context.request_id
+            or accepted.get("request_id") != request.request_context.request_id
             or accepted.get("selector") != selector
             or accepted.get("requested_scale") != request.scale
         ):
@@ -1954,9 +2041,7 @@ class ExecutionEventPump:
         if not 0.01 <= poll_seconds <= 5.0:
             raise ValueError("operation event polling period is outside [0.01, 5]")
         if not 0.05 <= condition_poll_seconds <= 5.0:
-            raise ValueError(
-                "operation condition polling period is outside [0.05, 5]"
-            )
+            raise ValueError("operation condition polling period is outside [0.05, 5]")
         if not 1 <= page_limit <= 16:
             raise ValueError("operation event page limit is outside [1, 16]")
         self._core = core
@@ -2111,10 +2196,7 @@ class ExecutionEventPump:
     @staticmethod
     def _admission_generation(response: dict[str, Any]) -> int:
         generation = response.get("admission_generation")
-        if (
-            type(generation) is not int
-            or not 1 <= generation <= MAXIMUM_SAFE_INTEGER
-        ):
+        if type(generation) is not int or not 1 <= generation <= MAXIMUM_SAFE_INTEGER:
             raise HeadlessApiError(
                 "execution_command_response_invalid",
                 "native execution identity has no valid admission generation",
@@ -2204,29 +2286,25 @@ class ExecutionEventPump:
                     if identity_response.get("ok") is not True:
                         idle_epoch = self._idle_owner_epoch(identity_response)
                         if idle_epoch is None:
-                            ExecutionCommandClient._raise_error_response(identity_response)
+                            ExecutionCommandClient._raise_error_response(
+                                identity_response
+                            )
                         if source_high_water_epoch != idle_epoch:
                             source_high_water_epoch = idle_epoch
                             source_high_water = 0
                         self._core.complete_operation_event_snapshot(
                             source_owner_epoch=idle_epoch,
                             through_source_sequence=source_high_water,
-                            **condition_snapshot_kwargs(
-                                idle_epoch, source_high_water
-                            ),
+                            **condition_snapshot_kwargs(idle_epoch, source_high_water),
                         )
-                        publish_if_changed(
-                            idle_epoch, "idle"
-                        )
+                        publish_if_changed(idle_epoch, "idle")
                         if self._record_error(None):
                             self._notify_change()
                         self._stop.wait(self._poll_seconds)
                         continue
                     status = identity_response.get("identity")
                     next_epoch = (
-                        status.get("owner_epoch")
-                        if isinstance(status, dict)
-                        else None
+                        status.get("owner_epoch") if isinstance(status, dict) else None
                     )
                     if not isinstance(next_epoch, str) or not next_epoch:
                         raise HeadlessApiError(
@@ -2259,7 +2337,7 @@ class ExecutionEventPump:
                         request_id=event["request_id"],
                         operation_id=event["operation_id"],
                         operation_revision=event["operation_revision"],
-                        occurred_at_ns=event["occurred_at_ns"],
+                        occurred_at_ns=nonnegative_int64(event["occurred_at_ns"]),
                         occurred_at_wall=event["occurred_at_wall"],
                         effect_pending=event["effect_pending"],
                         payload_json=_canonical_json(event["payload"]).decode("utf-8"),

@@ -1,4 +1,5 @@
 import type { ProgramBindingDocument } from './programBindingTransport.generated';
+import type { Nanoseconds } from './nanoseconds';
 export type { ProgramBindingDocument } from './programBindingTransport.generated';
 
 export type ArtifactKind = 'program' | 'deployment' | 'mesh';
@@ -592,7 +593,7 @@ export interface RuntimeControlAuditEvent {
 }
 
 export interface ProgramRuntimeControlsSnapshot {
-  schemaVersion: 'manyforge.program_runtime_controls.v1';
+  schemaVersion: 'manyforge.program_runtime_controls.v2';
   programRunId: string;
   runtimeControlRevision: number;
   recoveryFences: {
@@ -631,8 +632,8 @@ export interface CycleRecoveryOffer {
   schemaVersion: 'manyforge.cycle_recovery_offer.v2';
   offerId: string;
   offerRevision: number;
-  generatedAtNs: number;
-  validUntilNs: number | null;
+  generatedAtNs: Nanoseconds;
+  validUntilNs: Nanoseconds | null;
   kernelAssessmentRevision: number;
   controlCommandEpoch: number;
   operationId: string | null;
@@ -683,7 +684,7 @@ export interface RuntimeOverrideObservationCandidate {
 }
 
 export interface ProgramRuntimeControlProjection {
-  schemaVersion: 'manyforge.program_runtime_control_projection.v2';
+  schemaVersion: 'manyforge.program_runtime_control_projection.v3';
   ownerId: string;
   ownerEpoch: string;
   programRunId: string;
@@ -957,26 +958,26 @@ export interface SceneRuntimeObservationPose {
   frame_kind: 'cell_frame';
   orientation_xyzw: QuaternionXyzwTuple;
   position_m: Vector3Tuple;
-  source_stamp_s: number | null;
+  source_stamp_ns: Nanoseconds | null;
 }
 
 export type SceneRuntimeGoodObservationPayload =
   | {
-      api_version: 'manyforge.ros_pose_observation.v1';
+      api_version: 'manyforge.ros_pose_observation.v2';
       joint_names: string[];
       kind: 'joint_state';
       positions: number[];
-      source_stamp_s: number | null;
+      source_stamp_ns: Nanoseconds | null;
       topic: string;
     }
   | {
-      api_version: 'manyforge.ros_pose_observation.v1';
+      api_version: 'manyforge.ros_pose_observation.v2';
       kind: 'simulation_entity_pose';
       pose: SceneRuntimeObservationPose;
       source: { entity: string };
     }
   | {
-      api_version: 'manyforge.ros_pose_observation.v1';
+      api_version: 'manyforge.ros_pose_observation.v2';
       kind: 'detection3d_pose';
       pose: SceneRuntimeObservationPose;
       source: {
@@ -989,7 +990,7 @@ export type SceneRuntimeGoodObservationPayload =
     };
 
 export interface SceneRuntimeUnknownObservationPayload {
-  api_version: 'manyforge.ros_pose_observation.v1';
+  api_version: 'manyforge.ros_pose_observation.v2';
   kind: 'joint_state' | 'simulation_entity_pose' | 'detection3d_pose';
   source_error: {
     code: string;
@@ -1000,9 +1001,9 @@ export interface SceneRuntimeUnknownObservationPayload {
 
 interface SceneRuntimePoseSourceBase {
   buffered: boolean;
-  expires_at_ns: number;
+  expires_at_ns: Nanoseconds;
   object_id: string;
-  observed_at_ns: number;
+  observed_at_ns: Nanoseconds;
   policy_id: string;
   source_epoch: string;
   source_epoch_order: number;
@@ -1045,9 +1046,9 @@ export interface SceneRuntimeProjection {
       retained_bundle_id: string;
       runtime_generation: number;
     } | null;
-    started_at_ns: number;
+    started_at_ns: Nanoseconds;
     state: 'open' | 'closed' | 'resetting' | 'seeding' | 'replaying' | 'failed' | 'retired';
-    updated_at_ns: number;
+    updated_at_ns: Nanoseconds;
   };
 }
 

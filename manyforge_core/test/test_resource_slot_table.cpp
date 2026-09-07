@@ -368,6 +368,26 @@ TEST(ResourceSlotTableTest,
   }
 }
 
+TEST(ResourceSlotTableTest, TerminalOwnedSlotRemainsFenceableUntilEffectSettlement) {
+  ResourceSlotTable table({ResourceId("arm.joint")});
+  const auto current = owner("op.a", "part.a");
+  ASSERT_TRUE(table.reserve(current, {ResourceId("arm.joint")}).ok());
+  ASSERT_TRUE(
+      table.transition(current, {ResourceId("arm.joint")}, ResourceSlotState::kTerminal).ok());
+  const auto before = table.coherent_snapshot();
+  const auto fenced = table.stop_fence_batch(
+      ResourceSlotStopFenceRequestDTO{before.operation_resource_generation,
+                                      StopGeneration(1U),
+                                      {stop_fence_owner(current, {ResourceId("arm.joint")})},
+                                      {}});
+  ASSERT_TRUE(fenced.ok()) << fenced.error().message;
+  const auto after = table.coherent_snapshot();
+  ASSERT_EQ(after.slots.size(), 1U);
+  EXPECT_EQ(after.slots.front().state, ResourceSlotState::kStopping);
+  EXPECT_EQ(after.slots.front().owner->operation_revision, OperationRevision(2U));
+  EXPECT_FALSE(table.release(current, {ResourceId("arm.joint")}).ok());
+}
+
 TEST(ResourceSlotTableTest, BatchFencePrevalidatesEveryOwnerBeforeMutatingAnySlot) {
   ResourceSlotTable table({ResourceId("robot.a.joint"), ResourceId("robot.b.joint")});
   const auto first = owner("op.a", "part.a");
@@ -550,9 +570,7 @@ TEST(ResourceSlotTableTest, RejectsInvalidInventoryAtConstruction) {
 TEST(ResourceSlotTableTest, EmptyRuntimeInventoryCanBePopulatedAndEmptied) {
   ResourceSlotTable table(std::vector<ResourceId>{});
   EXPECT_TRUE(table.snapshot().empty());
-  ASSERT_TRUE(table.reconfigure_runtime_inventory(
-                       {ResourceId("joint.1")}, {}, {})
-                  .ok());
+  ASSERT_TRUE(table.reconfigure_runtime_inventory({ResourceId("joint.1")}, {}, {}).ok());
   ASSERT_EQ(table.snapshot().size(), 1U);
   ASSERT_TRUE(table.reconfigure_runtime_inventory({}, {}, {}).ok());
   EXPECT_TRUE(table.snapshot().empty());
@@ -721,9 +739,8 @@ TEST(ResourceSlotTableTest, RejectsReconfigurationThatRemovesAnOccupiedResource)
   const auto operation = owner();
   ASSERT_TRUE(table.reserve(operation, arm_resources()).ok());
 
-  const auto rejected =
-      table.reconfigure_runtime_inventory({ResourceId("joint.1")}, active_configurations(),
-                                          active_configurations());
+  const auto rejected = table.reconfigure_runtime_inventory(
+      {ResourceId("joint.1")}, active_configurations(), active_configurations());
   ASSERT_FALSE(rejected.ok());
   EXPECT_EQ(rejected.error().details.at("reason"),
             "runtime_resource_inventory_removes_occupied_resource");
@@ -735,9 +752,9 @@ TEST(ResourceSlotTableTest, RejectsReconfigurationThatChangesAnOccupiedControlCo
   const auto operation = owner();
   ASSERT_TRUE(table.reserve(operation, arm_resources()).ok());
 
-  const auto rejected = table.reconfigure_runtime_inventory(
-      arm_resources(), active_configurations("active.replaced"),
-      active_configurations("active.replaced"));
+  const auto rejected =
+      table.reconfigure_runtime_inventory(arm_resources(), active_configurations("active.replaced"),
+                                          active_configurations("active.replaced"));
   ASSERT_FALSE(rejected.ok());
   EXPECT_EQ(rejected.error().details.at("reason"), "runtime_active_control_configuration_changed");
   const auto admission = table.admission_snapshot(arm_resources());
@@ -766,16 +783,14 @@ TEST(ResourceSlotTableTest, SeparatesApplyStagedAndRoutePublishedConfigurations)
       arm_resources(), active_configurations("active.staged"), {});
   ASSERT_TRUE(staged.ok()) << staged.error().message;
   const auto admission = table.admission_snapshot(arm_resources());
-  EXPECT_EQ(admission.active_control_configurations,
-            active_configurations("active.staged"));
+  EXPECT_EQ(admission.active_control_configurations, active_configurations("active.staged"));
   EXPECT_TRUE(admission.route_published_active_control_configurations.empty());
 
-  const auto published = table.replace_route_publication_inventory(
-      active_configurations("active.cclc"));
+  const auto published =
+      table.replace_route_publication_inventory(active_configurations("active.cclc"));
   ASSERT_TRUE(published.ok()) << published.error().message;
   const auto current = table.admission_snapshot(arm_resources());
-  EXPECT_EQ(current.active_control_configurations,
-            active_configurations("active.staged"));
+  EXPECT_EQ(current.active_control_configurations, active_configurations("active.staged"));
   EXPECT_EQ(current.route_published_active_control_configurations,
             active_configurations("active.cclc"));
 }

@@ -12,6 +12,7 @@ import type {
   AlarmPriority,
   HistorianStoredEvent,
   HistorianDetail,
+  HistorianRetention,
   OperatorAlarmRecord,
 } from '../types/headless';
 import {
@@ -67,7 +68,7 @@ export function attentionAlarmsNewestFirst(
       alarm.lifecycleState === 'active_unacknowledged'
       || alarm.lifecycleState === 'returned_unacknowledged')
     .sort((left, right) =>
-      right.activatedAtNs - left.activatedAtNs
+      Number(BigInt(right.activatedAtNs) - BigInt(left.activatedAtNs))
       || left.conditionId.localeCompare(right.conditionId));
 }
 
@@ -97,7 +98,8 @@ export function operatorAlarmView(alarm: OperatorAlarmRecord): OperatorAlarmView
 function alarmPhase(eventType: string): HistoryAlarmPhase {
   if (eventType === 'operator_alarm_activated') return 'activation';
   if (eventType === 'operator_alarm_returned') return 'return';
-  if (eventType === 'operator_alarm_acknowledged') return 'acknowledgement';
+  if (eventType === 'operator_alarm_acknowledged'
+    || eventType === 'operator_alarm_bulk_acknowledged') return 'acknowledgement';
   return null;
 }
 
@@ -109,7 +111,10 @@ export function historianEventView(
     sequence: stored.sequence,
     timestampNs: stored.event.occurredAtNs,
     timestamp: stored.event.occurredAtWall,
-    severity: stored.event.severity,
+    timestampUtcNs: stored.event.occurredAtUtcNs,
+    severity: stored.event.conditionSeverity,
+    clockOwner: stored.event.clockOwner,
+    wallClockRegressed: stored.event.wallClockRegressed,
     channel: stored.event.component,
     message: stored.event.conditionId === null
       ? stored.event.message
@@ -201,6 +206,7 @@ export function HeadlessRuntimeSurfacesView({
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState<string | null>(null);
   const [historyEvents, setHistoryEvents] = useState<ExecutionHistoryEventView[]>([]);
+  const [historyRetention, setHistoryRetention] = useState<HistorianRetention | null>(null);
   const [historyQuery, setHistoryQuery] = useState<HistorianListQuery>({
     limit: HISTORIAN_PAGE_LIMIT,
   });
@@ -213,6 +219,20 @@ export function HeadlessRuntimeSurfacesView({
   const [historyDetail, setHistoryDetail] = useState<HistorianDetail | null>(null);
   const [historyDetailLoading, setHistoryDetailLoading] = useState(false);
   const [historyDetailError, setHistoryDetailError] = useState<string | null>(null);
+  const historyRequest = useRef<AbortController | null>(null);
+  const historyDetailRequest = useRef<AbortController | null>(null);
+  useEffect(() => () => {
+    historyRequest.current?.abort();
+    historyDetailRequest.current?.abort();
+  }, []);
+  useEffect(() => {
+    if (!enabled || !expanded || mode !== 'history') {
+      historyRequest.current?.abort();
+      historyDetailRequest.current?.abort();
+      setHistoryLoading(false);
+      setHistoryDetailLoading(false);
+    }
+  }, [enabled, expanded, mode]);
   const acknowledgeAllButton = useRef<HTMLButtonElement>(null);
   useEffect(() => {
     if (attentionRequest !== null) setMode('attention');
@@ -272,6 +292,11 @@ export function HeadlessRuntimeSurfacesView({
     beforeSequence: number | null = null,
     newerCursors: Array<number | null> = [],
   ) => {
+    historyRequest.current?.abort();
+    historyDetailRequest.current?.abort();
+    const request = new AbortController();
+    historyRequest.current = request;
+    setHistoryDetailLoading(false);
     setHistoryLoading(true);
     setHistoryError(null);
     try {
@@ -281,37 +306,52 @@ export function HeadlessRuntimeSurfacesView({
           ? { beforeSequence }
           : { beforeSequence: undefined }),
       };
-      const page = await api.history.list(effectiveQuery);
+      const page = await api.history.list(effectiveQuery, request.signal);
+      if (request.signal.aborted) return;
+      historyDetailRequest.current?.abort();
+      setHistoryDetailLoading(false);
       setHistoryEvents(page.events.map(historianEventView));
-      setHistoryQuery(query);
+      setHistoryRetention(page.retention);
+      // Freeze the server's UTC window for navigation; Refresh requests a new
+      // relative window. Client time and owner-monotonic samples are irrelevant.
+      setHistoryQuery({ ...query, recentSeconds: undefined,
+        startUtcNs: page.timeWindow.startUtcNs ?? undefined,
+        endUtcNs: page.timeWindow.endUtcNs ?? undefined });
       setHistoryBefore(beforeSequence);
-      setHistoryNewerCursors(newerCursors);
+      setHistoryNewerCursors(newerCursors.slice(-32));
       setHistoryNextBefore(page.nextBeforeSequence);
       setHistoryHasOlder(page.truncated && page.nextBeforeSequence !== null);
       setHistoryDetail(null);
       setHistoryDetailError(null);
     } catch (reason) {
-      setHistoryError(actionErrorMessage(reason));
+      if (!request.signal.aborted) setHistoryError(actionErrorMessage(reason));
     } finally {
-      setHistoryLoading(false);
+      if (!request.signal.aborted) setHistoryLoading(false);
     }
   };
 
   const loadHistoryDetail = async (event: ExecutionHistoryEventView) => {
+    if (historyLoading) return;
+    historyDetailRequest.current?.abort();
     if (event.sequence === undefined) {
       setHistoryDetail(null);
       setHistoryDetailError(null);
       return;
     }
+    const request = new AbortController();
+    historyDetailRequest.current = request;
     setHistoryDetailLoading(true);
     setHistoryDetailError(null);
     try {
-      setHistoryDetail(await api.history.detail(event.sequence));
+      const detail = await api.history.detail(event.sequence, request.signal);
+      if (!request.signal.aborted) setHistoryDetail(detail);
     } catch (reason) {
-      setHistoryDetail(null);
-      setHistoryDetailError(actionErrorMessage(reason));
+      if (!request.signal.aborted) {
+        setHistoryDetail(null);
+        setHistoryDetailError(actionErrorMessage(reason));
+      }
     } finally {
-      setHistoryDetailLoading(false);
+      if (!request.signal.aborted) setHistoryDetailLoading(false);
     }
   };
 
@@ -488,7 +528,7 @@ export function HeadlessRuntimeSurfacesView({
           aria-pressed={mode === 'history'}
           onClick={() => {
             setMode('history');
-            if (historyEvents.length === 0) void loadHistory();
+            if (historyEvents.length === 0 && !historyLoading) void loadHistory();
           }}
         >History</button>
       </nav>
@@ -602,6 +642,8 @@ export function HeadlessRuntimeSurfacesView({
         hasOlder={historyHasOlder}
         hasNewer={historyNewerCursors.length > 0}
         events={historyEvents}
+        retention={historyRetention}
+        currentProgramRunId={snapshot?.programCycle.programRunId}
         eyebrow="Backend history"
         loading={historyLoading}
         error={historyError}

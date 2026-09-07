@@ -21,7 +21,7 @@ SCHEMAS = {
     "/api/scene": "manyforge.scene_projection.v1",
     "/api/execution/alarms": "manyforge.operator_alarm_snapshot.v2",
     "/api/execution/alarms/metrics": "manyforge.operator_alarm_metrics.v1",
-    "/api/execution/history": "manyforge.historian_summary_page.v1",
+    "/api/execution/history": "manyforge.historian_summary_page.v2",
     "/api/execution/history/health": "manyforge.async_historian_health.v1",
 }
 
@@ -79,8 +79,8 @@ def test_alarm_and_history_reads_are_bounded_before_transport() -> None:
         reader.invoke(
             "history",
             {
-                "start_ns": 2,
-                "end_ns": 8,
+                "start_utc_ns": 2,
+                "end_utc_ns": 8,
                 "components": ["manyforge.alarm"],
                 "event_types": ["operator_alarm_activated"],
                 "before_sequence": 9,
@@ -90,7 +90,7 @@ def test_alarm_and_history_reads_are_bounded_before_transport() -> None:
         with pytest.raises(HeadlessReadInputError, match="unsupported value"):
             reader.invoke("alarms", {"states": ["cleared"]})
         with pytest.raises(HeadlessReadInputError, match="must not exceed"):
-            reader.invoke("history", {"start_ns": 9, "end_ns": 2})
+            reader.invoke("history", {"start_utc_ns": 9, "end_utc_ns": 2})
     finally:
         raw.close()
 

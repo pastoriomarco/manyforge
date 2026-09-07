@@ -72,7 +72,6 @@ class HeadlessApiConfig:
     freshness_milliseconds: int = 2_000
     historian_queue_capacity: int = 1_024
     historian_record_retention: int = 100_000
-    mutation_replay_capacity: int = 4_096
     # Apply and scene commits are durable Manager transactions, not health
     # probes. Keep their local transport wait bounded but long enough for the
     # owner to return the authoritative result instead of reporting an
@@ -321,6 +320,8 @@ class HeadlessCorePort(Protocol):
     def acknowledge_all(self, **kwargs: Any) -> dict[str, Any]: ...
 
     def history(self, **kwargs: Any) -> dict[str, Any]: ...
+    def history_export(self, **kwargs: Any) -> dict[str, Any]: ...
+    def history_discovery(self, *, kind: str, after: str, limit: int) -> dict[str, Any]: ...
     def history_detail(self, sequence: int) -> dict[str, Any]: ...
     def record_client_incident(self, **kwargs: Any) -> dict[str, Any]: ...
 
@@ -422,7 +423,6 @@ class NativeHeadlessCore:
                 config.freshness_milliseconds,
                 config.historian_queue_capacity,
                 config.historian_record_retention,
-                config.mutation_replay_capacity,
             )
         except Exception as exc:
             raise HeadlessApiError(
@@ -810,8 +810,14 @@ class NativeHeadlessCore:
             # The list endpoint never needs full payloads. Project its bounded
             # rows while the native call has released the Python GIL; exact
             # payloads remain available through history_detail().
-            self._invoke("history_summary", **kwargs),
+            self._invoke("history_query", **kwargs),
             method="history",
+        )
+
+    def history_export(self, **kwargs: Any) -> dict[str, Any]:
+        return self._require_object(
+            self._invoke("history_query", full_records=True, **kwargs),
+            method="history_export",
         )
 
     def history_detail(self, sequence: int) -> dict[str, Any]:
@@ -819,6 +825,9 @@ class NativeHeadlessCore:
             self._invoke("history_detail", sequence),
             method="history_detail",
         )
+
+    def history_discovery(self, *, kind: str, after: str, limit: int) -> dict[str, Any]:
+        return self._require_object(self._invoke("history_discovery", kind=kind, after=after, limit=limit), method="history_discovery")
 
     def record_client_incident(self, **kwargs: Any) -> dict[str, Any]:
         return self._require_object(

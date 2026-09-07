@@ -1,6 +1,8 @@
 #include <manyforge_roboplan/retained_observed_state_channel.hpp>
 
 #include <algorithm>
+#include <limits>
+#include <stdexcept>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -109,21 +111,52 @@ position_value(const core::CoordinatePositionDTO &position) noexcept {
 
 } // namespace
 
+RetainedObservationWake::RetainedObservationWake()
+    : incarnation_([] {
+        // Presentation stream identity only; this counter owns no execution
+        // state and retains no prior incarnation. Construction is NRT.
+        static std::atomic<std::uint64_t> next{1U};
+        auto value = next.load(std::memory_order_relaxed);
+        do {
+          if (value == std::numeric_limits<std::uint64_t>::max())
+            throw std::overflow_error("observation incarnation exhausted");
+        } while (!next.compare_exchange_weak(value, value + 1U, std::memory_order_relaxed));
+        return value;
+      }()) {}
+
+void RetainedObservationWake::notify() noexcept {
+  generation_.fetch_add(1U, std::memory_order_release);
+  if (!pending_.exchange(true, std::memory_order_acq_rel)) wake_.release();
+}
+
+bool RetainedObservationWake::wait_after(
+    const std::uint64_t after, const std::chrono::nanoseconds timeout) const {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (generation() == after) {
+    if (!wake_.try_acquire_until(deadline)) return generation() != after;
+    // A publication racing with this clear is visible in the next generation
+    // read. Once cleared, the next publisher can release the single token.
+    static_cast<void>(pending_.exchange(false, std::memory_order_acq_rel));
+  }
+  return true;
+}
+
 RetainedObservedStateChannel::RetainedObservedStateChannel(
     core::RuntimeParticipantBinding binding,
     std::shared_ptr<RetainedKinematicStateProjector> projector,
-    RetainedObservedStateChannelConfig config, core::IClock *clock)
-    : initial_binding_(std::move(binding)), projector_(std::move(projector)),
+    RetainedObservedStateChannelConfig config, core::IClock *clock,
+    std::shared_ptr<RetainedObservationWake> render_wake)
+    : current_binding_(std::move(binding)), projector_(std::move(projector)),
       config_(std::move(config)), clock_(clock),
-      publication_(publication_config(initial_binding_, config_)),
+      publication_(publication_config(current_binding_, config_)),
       projection_context_(publication_.query_context()),
-      last_render_positions_(publication_.query_context().resources.size()),
-      current_binding_(&initial_binding_) {
-  retained_route_bindings_.reserve(4096U);
+      render_wake_(render_wake ? std::move(render_wake)
+                               : std::make_shared<RetainedObservationWake>()),
+      last_render_positions_(projection_context_.resources.size()) {
   if (!projector_) {
-    if (!initial_binding_.value().model_groups.empty() ||
-        std::any_of(initial_binding_.value().resources.begin(),
-                    initial_binding_.value().resources.end(),
+    if (!current_binding_.value().model_groups.empty() ||
+        std::any_of(current_binding_.value().resources.begin(),
+                    current_binding_.value().resources.end(),
                     [](const auto &resource) {
                       return resource.source_joint_name.has_value();
                     })) {
@@ -132,8 +165,8 @@ RetainedObservedStateChannel::RetainedObservedStateChannel(
     }
     return;
   }
-  if (std::any_of(initial_binding_.value().resources.begin(),
-                  initial_binding_.value().resources.end(),
+  if (std::any_of(current_binding_.value().resources.begin(),
+                  current_binding_.value().resources.end(),
                   [](const auto &resource) {
                     return !resource.source_joint_name.has_value();
                   })) {
@@ -168,45 +201,24 @@ core::Result<void> RetainedObservedStateChannel::RebindRoute(
       if (!rebound.ok()) {
         return rebound;
       }
-      const auto *current_binding =
-          current_binding_.load(std::memory_order_acquire);
-      if (binding.value() != current_binding->value()) {
-        if (retained_route_bindings_.size() >= 4096U) {
-          return core::Result<void>::Err(channel_error(
-              "retained_state_route_rebind_capacity_exhausted",
-              "native route-state binding history reached its fixed bound"));
-        }
-        retained_route_bindings_.push_back(
-            std::make_unique<const core::RuntimeParticipantBinding>(
-                std::move(binding)));
-        current_binding_.store(retained_route_bindings_.back().get(),
-                               std::memory_order_release);
+      if (binding.value() != current_binding_.value()) {
+        current_binding_ = std::move(binding);
         notify_render_change();
       }
       return core::Result<void>::Ok();
     }
-    if (retained_route_bindings_.size() >= 4096U) {
-      return core::Result<void>::Err(channel_error(
-          "retained_state_route_rebind_capacity_exhausted",
-          "native route-state binding history reached its fixed bound"));
-    }
-    retained_route_bindings_.push_back(
-        std::make_unique<const core::RuntimeParticipantBinding>(
-            std::move(binding)));
     const bool was_fresh_state_required =
         fresh_state_required_.load(std::memory_order_acquire);
     fresh_state_required_.store(true, std::memory_order_release);
     auto rebound = publication_.rebind_route_context(std::move(rebound_context),
                                                      transition_time_ns);
     if (!rebound.ok()) {
-      retained_route_bindings_.pop_back();
       fresh_state_required_.store(was_fresh_state_required,
                                   std::memory_order_release);
       fresh_state_cv_.notify_all();
       return rebound;
     }
-    current_binding_.store(retained_route_bindings_.back().get(),
-                           std::memory_order_release);
+    current_binding_ = std::move(binding);
     // AddressedObservedStatePublication has just republished the complete
     // owner sample at the transition time. It is therefore current under the
     // new route and must not be stranded behind the recovery freshness gate.
@@ -271,7 +283,9 @@ RetainedStateProjectionResult RetainedObservedStateChannel::publish_state(
     const std::int64_t source_timestamp_ns,
     const std::int64_t received_timestamp_ns) {
   std::lock_guard route_lock(route_rebind_mutex_);
-  const auto &context = publication_.query_context();
+  // Route changes cannot alter physical shape/names; reuse the construction
+  // context on this per-sample path instead of copying routing metadata.
+  const auto &context = projection_context_;
   if (positions_si.size() != context.resources.size() ||
       (!velocities_si.empty() &&
        velocities_si.size() != context.resources.size())) {
@@ -284,6 +298,7 @@ RetainedStateProjectionResult RetainedObservedStateChannel::publish_state(
       config_.source_kind, context.joint_names, positions_si, velocities_si,
       source_timestamp_ns, received_timestamp_ns);
   if (!published.published || !published.complete) {
+    if (published.published) record_render_unavailable();
     const std::string reason = published.reason == nullptr
                                    ? "retained_state_publication_failed"
                                    : published.reason;
@@ -312,12 +327,18 @@ RetainedObservedStateChannel::publish_adapter_state(
   const auto published = publication_.publish(
       addressed_source_kind(source), source_joint_names, positions_si,
       velocities_si, source_timestamp_ns, received_timestamp_ns);
-  if (published.published && published.complete &&
-      published.velocities_complete) {
-    fresh_state_required_.store(false, std::memory_order_release);
-    fresh_sample_generation_.fetch_add(1U, std::memory_order_acq_rel);
-    record_render_positions(source_joint_names, positions_si);
-    fresh_state_cv_.notify_all();
+  if (published.published) {
+    if (published.complete) {
+      record_render_positions(source_joint_names, positions_si);
+      // Positions suffice for rendering, never for motion-rest recovery.
+      if (published.velocities_complete) {
+        fresh_state_required_.store(false, std::memory_order_release);
+        fresh_sample_generation_.fetch_add(1U, std::memory_order_acq_rel);
+        fresh_state_cv_.notify_all();
+      }
+    } else {
+      record_render_unavailable();
+    }
   }
   return published;
 }
@@ -363,7 +384,7 @@ RetainedObservedStateChannel::publish_state_bounded(
                           ? "native state publication was cancelled"
                           : "native state publication missed its deadline")};
   }
-  const auto &context = publication_.query_context();
+  const auto &context = projection_context_;
   if (positions_si.size() != context.resources.size() ||
       (!velocities_si.empty() &&
        velocities_si.size() != context.resources.size())) {
@@ -386,6 +407,10 @@ RetainedObservedStateChannel::publish_state_bounded(
   }
   if (!published.published || !published.complete ||
       !published.velocities_complete) {
+    if (published.published) {
+      if (published.complete) record_render_positions(context.joint_names, positions_si);
+      else record_render_unavailable();
+    }
     const std::string reason = published.reason == nullptr
                                    ? "retained_state_publication_failed"
                                    : published.reason;
@@ -479,8 +504,11 @@ RetainedObservedStateChannel::current_state_bounded(
         "retained_state_fresh_sample_unavailable",
         "native route state requires a fresh current-binding sample"));
   }
-  auto result =
-      publication_.current_state(publication_.query_context(), now_ns);
+  // The addressed owner selects context and sample together, with a try-lock.
+  // No extra blocking context copy may enter this deadline-bounded path.
+  auto result = publication_.publication_at(
+      projection_context_.control_binding_id,
+      projection_context_.control_binding_revision, now_ns);
   if (cancellation.stop_requested() || is_expired()) {
     return core::Result<core::ObservedStateSnapshotDTO>::Err(channel_error(
         cancellation.stop_requested() ? "retained_state_read_cancelled"
@@ -489,7 +517,10 @@ RetainedObservedStateChannel::current_state_bounded(
             ? "native state read was cancelled"
             : "native state read missed its deadline"));
   }
-  return result;
+  if (!result.ok())
+    return core::Result<core::ObservedStateSnapshotDTO>::Err(result.error());
+  return core::Result<core::ObservedStateSnapshotDTO>::Ok(
+      std::move(result.value().snapshot));
 }
 
 core::Result<core::ControlledStateDTO>
@@ -544,17 +575,13 @@ bool RetainedObservedStateChannel::wait_for_fresh_state(
 bool RetainedObservedStateChannel::wait_for_render_change(
     const std::uint64_t after_generation,
     const std::chrono::nanoseconds timeout) const {
-  std::unique_lock lock(fresh_state_mutex_);
-  return fresh_state_cv_.wait_for(lock, timeout, [this, after_generation] {
-    return render_change_generation_.load(std::memory_order_acquire) !=
-           after_generation;
-  });
+  return render_wake_->wait_after(after_generation, timeout);
 }
 
 void RetainedObservedStateChannel::record_render_positions(
     const std::span<const std::string> source_joint_names,
     const std::span<const double> positions_si) {
-  const auto &canonical_names = publication_.query_context().joint_names;
+  const auto &canonical_names = projection_context_.joint_names;
   if (source_joint_names.size() != positions_si.size() ||
       canonical_names.size() != last_render_positions_.size()) {
     return;
@@ -589,8 +616,14 @@ void RetainedObservedStateChannel::record_render_positions(
 }
 
 void RetainedObservedStateChannel::notify_render_change() noexcept {
-  render_change_generation_.fetch_add(1U, std::memory_order_acq_rel);
-  fresh_state_cv_.notify_all();
+  render_wake_->notify();
+}
+
+void RetainedObservedStateChannel::record_render_unavailable() noexcept {
+  if (render_positions_valid_) {
+    render_positions_valid_ = false;
+    notify_render_change();
+  }
 }
 
 } // namespace manyforge::roboplan_backend

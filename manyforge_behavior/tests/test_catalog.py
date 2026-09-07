@@ -24,7 +24,7 @@ from manyforge_behavior.node_registry import build_node_registry
 
 CATALOG_PATH = Path(__file__).parent.parent / "resources" / "node_catalog.yaml"
 EXPECTED_CATALOG_DIGEST = (
-    "sha256:cf249e13ee06142852da23b53d48f3bf6fa5bbc1ec92e548327ef9146afee6fe"
+    "sha256:5fce54890158a72df20063dac31531ede96dbf27b01be3a8256099c7e0ba1bb4"
 )
 
 

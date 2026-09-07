@@ -653,7 +653,7 @@ ProviderEvidence(const core::SceneObjectProviderEvidenceDTO &value) {
       {"provider_source_epoch", CanonicalValue(value.provider_source_epoch)},
       {"provider_source_sequence",
        Unsigned(value.provider_source_sequence, "provider_source_sequence")},
-      {"received_at_ns", Integer(value.received_at_ns, "received_at_ns")},
+      {"received_at_ns", content_identity::nonnegative_int64_value(value.received_at_ns)},
       {"source_freshness_budget_ns",
        value.source_freshness_budget_ns.has_value()
            ? Integer(*value.source_freshness_budget_ns,
@@ -661,7 +661,7 @@ ProviderEvidence(const core::SceneObjectProviderEvidenceDTO &value) {
            : CanonicalValue(nullptr)},
       {"source_timestamp_ns",
        value.source_timestamp_ns.has_value()
-           ? Integer(*value.source_timestamp_ns, "source_timestamp_ns")
+           ? content_identity::nonnegative_int64_value(*value.source_timestamp_ns)
            : CanonicalValue(nullptr)},
   });
 }

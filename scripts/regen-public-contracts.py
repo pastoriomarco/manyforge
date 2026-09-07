@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Regenerate code-owned structural Composer or headless REST references.
+"""Regenerate code-owned Composer/Headless REST or optional MCP references.
 
-The composable-cell cutover still removes the former aggregate MCP, assistant,
+The composable-cell cutover still removes the former aggregate assistant,
 viewer, and lifecycle contract owners. The explicit generators are:
 
   - ``docs/reference/REST_API.md`` from
     ``create_app(ComposerState()).openapi()``.
   - ``docs/reference/HEADLESS_REST_API.md`` from the independent H0/N3 FastAPI
     route owner.
+  - ``docs/reference/MCP_RUNTIME_CONTRACT.md`` from the optional stateless
+    Composer adapter and the same FastAPI DTO schemas.
 
 Do not add unavailable product surfaces or synthetic compatibility contracts
 to this generator. A restored public surface must first regain a real code
@@ -54,6 +56,7 @@ if __name__ == "__main__" and _is_legacy_aggregate_invocation(sys.argv[1:]):
 
 
 import argparse
+import json
 import re
 import time
 from pathlib import Path
@@ -64,6 +67,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 REF_DIR = REPO_ROOT / "docs" / "reference"
 REST_REFERENCE_PATH = REF_DIR / "REST_API.md"
 HEADLESS_REST_REFERENCE_PATH = REF_DIR / "HEADLESS_REST_API.md"
+MCP_REFERENCE_PATH = REF_DIR / "MCP_RUNTIME_CONTRACT.md"
 
 # Composer is importable from the repository root, while manyforge_behavior
 # uses a nested package root. Keep direct invocation deterministic instead of
@@ -218,6 +222,56 @@ def gen_headless_rest_api() -> str:
     return "".join(body)
 
 
+def gen_mcp_api() -> str:
+    """Render the optional adapter's real route-derived tool schemas."""
+    from manyforge_composer.backend.app import create_app
+    from manyforge_composer.backend.mcp_adapter import tool_contracts
+    from manyforge_composer.backend.state import ComposerState
+
+    with tempfile.TemporaryDirectory(prefix="manyforge-mcp-contract-") as state_root:
+        app = create_app(
+            ComposerState(headless_client=object(), authoring_state_root=state_root)
+        )
+        contracts = tool_contracts(app)
+    body = [
+        _stamp("gen_mcp_api", "mcp"),
+        "# ManyForge MCP HTTP contract\n\n",
+        "Optional Streamable HTTP at `/mcp/`, enabled with Composer's `--mcp-http` "
+        "and the `manyforge_composer[mcp]` extra. Disabled by default. "
+        "The adapter is stateless: no MCP session ID, replay store, SSE fallback, "
+        "heartbeat or background polling. It accepts the SDK initialize/tools/list/"
+        "tools/call protocol; separate calls do not share execution authority.\n\n",
+        "Each action delegates to the listed existing REST route. Supply its exact "
+        "body and current owner-issued identities/confirmation/freshness; the adapter "
+        "does not manufacture these, infer a target, retry or weaken admission. "
+        "Read current backend state after commands. A lost tool response never proves "
+        "no effect and must not trigger a new motion command. Kernel and Program "
+        "Runner retain lifecycle ownership and reserved Stop capacity.\n\n",
+        "Requests are limited to 1 MiB; owner response/query bounds also apply. "
+        "Configure `MANYFORGE_MCP_ALLOWED_HOSTS` for remote Host names/IPs and "
+        "`MANYFORGE_CORS_ORIGINS` for browser origins. Default MCP hosts are loopback. "
+        "These are transport bounds, not caller authorization. Use the deployment's "
+        "trusted network/perimeter; request attribution is not authentication.\n\n",
+        "JSON route bodies are returned as text with `isError` for HTTP failures; "
+        "viewer snapshots return MCP image content and require an existing matching "
+        "viewer. Tools list only configured routes; capability availability is still "
+        "determined by their owners. This is the current wire contract, not full "
+        "historical-functional or provider qualification. Historical v0 signatures "
+        "are preserved in git at `08222188293df8e12f90dc72e204c21f22f92ea1`.\n\n",
+    ]
+    for tool in contracts:
+        body.extend(
+            [
+                f"## {tool['name']}\n\n",
+                tool["description"] + "\n\n",
+                "```json\n",
+                json.dumps(tool, indent=2, sort_keys=True),
+                "\n```\n\n",
+            ]
+        )
+    return "".join(body).rstrip() + "\n"
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if _is_legacy_aggregate_invocation(arguments):
@@ -243,13 +297,17 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Exit 1 if regeneration would change HEADLESS_REST_API.md.",
     )
+    mcp = subparsers.add_parser(
+        "mcp", help="Regenerate the optional route-derived MCP contract."
+    )
+    mcp.add_argument("--check", action="store_true")
     args = parser.parse_args(arguments)
 
-    targets: dict[Path, Callable[[], str]] = (
-        {REST_REFERENCE_PATH: gen_rest_api}
-        if args.selector == "structural-rest"
-        else {HEADLESS_REST_REFERENCE_PATH: gen_headless_rest_api}
-    )
+    targets: dict[Path, Callable[[], str]] = {
+        "structural-rest": {REST_REFERENCE_PATH: gen_rest_api},
+        "headless-rest": {HEADLESS_REST_REFERENCE_PATH: gen_headless_rest_api},
+        "mcp": {MCP_REFERENCE_PATH: gen_mcp_api},
+    }[args.selector]
     drift: list[str] = []
     for path, generator in targets.items():
         new_content = generator()

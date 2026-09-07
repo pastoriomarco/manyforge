@@ -25,6 +25,12 @@ class SecurityConfig:
     # CORS allowed origins.  Empty list → deny all cross-origin requests.
     cors_origins: list[str] = field(default_factory=lambda: ["http://localhost:3000"])
 
+    # Used only when the optional MCP HTTP transport is explicitly enabled.
+    # Remote names/IPs must be declared; binding 0.0.0.0 is not a Host allowlist.
+    mcp_allowed_hosts: list[str] = field(
+        default_factory=lambda: ["localhost:*", "127.0.0.1:*", "[::1]:*"]
+    )
+
     # Filesystem roots that the file-browser endpoint is allowed to traverse.
     # Paths outside these roots (after symlink resolution) are rejected.
     allowed_fs_roots: list[str] = field(default_factory=lambda: ["/workspace"])
@@ -53,6 +59,11 @@ class SecurityConfig:
         deployment_write_roots = _csv("MANYFORGE_DEPLOYMENT_WRITE_ROOTS")
         return cls(
             cors_origins=_csv("MANYFORGE_CORS_ORIGINS") or ["http://localhost:3000"],
+            mcp_allowed_hosts=(
+                _csv("MANYFORGE_MCP_ALLOWED_HOSTS")
+                if "MANYFORGE_MCP_ALLOWED_HOSTS" in os.environ
+                else ["localhost:*", "127.0.0.1:*", "[::1]:*"]
+            ),
             allowed_fs_roots=_csv("MANYFORGE_FS_ROOTS") or ["/workspace"],
             allowed_program_write_roots=program_write_roots,
             allowed_deployment_write_roots=deployment_write_roots,

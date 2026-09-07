@@ -292,6 +292,22 @@ TEST(CellAdmissionCommandCodec, PrivateDtoAndResponseRoundTripsAreLossless) {
                std::invalid_argument);
 }
 
+TEST(CellAdmissionCommandCodec, LongServiceClaimSurvivesJsonAndPrivateOwnerTransport) {
+  const auto packet = *TryDecodeCellAdmissionCommand(ci::canonical_json(
+      Envelope("cell_admission_acquire", Intent())));
+  RecordingKernel kernel;
+  auto response = cm::DispatchKernelCellAdmissionRpc(kernel, packet);
+  auto &claim = std::get<core::CellAdmissionClaimDTO>(response);
+  claim.accepted_at_ns = 31LL * 366 * 86400 * 1000000000;
+  const auto json = CellAdmissionResponseValue("cell_admission_acquire", response);
+  const auto &wire_claim = *json.find_object_member("claim");
+  EXPECT_EQ(wire_claim.find_object_member("accepted_at_ns")->as_string(),
+            std::to_string(claim.accepted_at_ns));
+  EXPECT_EQ(DecodeCellAdmissionClaim(ci::canonical_json(wire_claim)), claim);
+  const auto private_bytes = cm::EncodeKernelCellAdmissionRpcResponse(packet.command, response);
+  EXPECT_EQ(cm::DecodeKernelCellAdmissionRpcResponse(private_bytes).response, response);
+}
+
 TEST(CellAdmissionCommandCodec, FreezesExactCommandSpecificJsonShapes) {
   const auto admission = ci::canonical_json(CellAdmissionResponseValue(
       "cell_admission_release",

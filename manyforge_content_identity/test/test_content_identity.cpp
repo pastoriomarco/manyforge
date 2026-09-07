@@ -14,6 +14,30 @@ namespace {
 
 [[nodiscard]] double double_from_bits(std::uint64_t bits) { return std::bit_cast<double>(bits); }
 
+TEST(CanonicalValue, ExactNanosecondRangePreservesLegacyBytesAndRejectsRounding) {
+  constexpr std::int64_t boundary = 9'007'199'254'740'991LL;
+  for (const std::int64_t time : std::vector<std::int64_t>{0LL, boundary, boundary + 1, boundary + 2,
+                                 105LL * 86400 * 1000000000,
+                                 31LL * 366 * 86400 * 1000000000,
+                                 std::numeric_limits<std::int64_t>::max()}) {
+    const auto value = nonnegative_int64_value(time);
+    EXPECT_EQ(value.is_number(), time <= boundary);
+    EXPECT_EQ(parse_nonnegative_int64(value), time);
+    EXPECT_EQ(parse_nonnegative_int64(parse_canonical_json(canonical_json(value))), time);
+  }
+  EXPECT_EQ(canonical_json(nonnegative_int64_value(boundary)), "9007199254740991");
+  EXPECT_EQ(canonical_json(nonnegative_int64_value(boundary + 2)), "\"9007199254740993\"");
+  for (const auto &invalid : {CanonicalValue(-1.0), CanonicalValue(0.5),
+                              CanonicalValue(9007199254740992.0),
+                              CanonicalValue("-1"), CanonicalValue("+1"),
+                              CanonicalValue("01"), CanonicalValue("1e6"),
+                              CanonicalValue("9223372036854775808"),
+                              CanonicalValue(""), CanonicalValue(nullptr)}) {
+    EXPECT_THROW(static_cast<void>(parse_nonnegative_int64(invalid)), CanonicalValueError);
+  }
+  EXPECT_THROW(static_cast<void>(nonnegative_int64_value(-1)), CanonicalValueError);
+}
+
 TEST(CanonicalValue, SerializesPublishedRfc8785Example) {
   const CanonicalValue value(CanonicalValue::Object{
       {"numbers", CanonicalValue(CanonicalValue::Array{

@@ -77,7 +77,7 @@ export type RobotControlAction =
   | { type: 'program_activity_changed' }
   | { type: 'select_mode'; mode: RobotControlMode }
   | { type: 'edit'; positionsRad: number[] }
-  | { type: 'edit_joint'; positionsRad: number[] }
+  | { type: 'edit_joint'; jointIndex: number; positionRad: number }
   | { type: 'edit_move_to_joint'; positionsRad: number[] }
   | { type: 'edit_pose'; pose: Pose3Value }
   | { type: 'edit_gripper'; position: number }
@@ -93,10 +93,10 @@ export type RobotControlAction =
     }
   | { type: 'preview_rejected'; generation: number; error: string }
   | { type: 'approve_started' }
-  | { type: 'approve_rejected'; error: string }
+  | { type: 'approve_rejected'; generation: number; error: string }
+  | { type: 'retry_preview' }
   | { type: 'operation_observed'; operation: OperationObservation }
-  | { type: 'operation_poll_failed'; error: string }
-  | { type: 'operation_settlement_failed'; error: string }
+  | { type: 'operation_control_failed'; ownerEpoch: string; operationId: string; error: string }
   | { type: 'dismiss_error' }
   | { type: 'revert' }
   | { type: 'clear' };
@@ -273,12 +273,20 @@ function draftFromStatus(status: ExecutionOwnerStatus) {
   };
 }
 
+export function robotControlHasLocalDraft(state: RobotControlState): boolean {
+  return state.operation === null
+    && (state.phase === 'planning' || state.phase === 'ready'
+      || state.phase === 'approving' || state.phase === 'blocked');
+}
+
 function resolveStatus(
   state: RobotControlState,
   status: ExecutionOwnerStatus,
   initialize: boolean,
 ): RobotControlState {
-  const projected = status.residentOperations;
+  const selectedRun = state.mode === 'gripper'
+    ? status.directControlGripper.programRunId : status.directControl.programRunId;
+  const projected = status.manualOperations.filter((operation) => operation.programRunId === selectedRun);
   const projectedOperation = projected.length === 1 ? projected[0] : null;
   const projectionError = projected.length > 1
     ? 'More than one direct-control operation is resident; Robot Control will not guess which operation to own.'
@@ -289,16 +297,28 @@ function resolveStatus(
       ? 'idle'
       : phaseForOperation(projectedOperation);
   const resolvedOperation = projectionError === null ? projectedOperation : null;
-  if (state.status !== null && state.status.ownerEpoch !== status.ownerEpoch) {
+  if (state.status !== null && (
+    state.status.ownerEpoch !== status.ownerEpoch
+    || state.status.retainedBundleId !== status.retainedBundleId
+    || state.status.graphRevision !== status.graphRevision
+    || state.status.directControl.programBindingId !== status.directControl.programBindingId
+    || state.status.directControlGripper.programBindingId !== status.directControlGripper.programBindingId
+    || state.status.sceneRevision.scene_id !== status.sceneRevision.scene_id
+    || state.status.sceneRevision.revision_id !== status.sceneRevision.revision_id
+    || state.status.sceneRevision.content_hash !== status.sceneRevision.content_hash
+  )) {
     return {
       ...initialRobotControlState,
+      mode: state.mode,
       status,
       phase: resolvedPhase,
       ...draftFromStatus(status),
       generation: state.generation + 1,
       operation: resolvedOperation,
       error: projectionError
-        ?? 'The execution owner restarted. The prior preview was discarded.',
+        ?? (state.status.ownerEpoch !== status.ownerEpoch
+          ? 'The execution owner restarted. The prior preview was discarded.'
+          : 'The target binding or scene changed. The prior preview was discarded.'),
     };
   }
   if (initialize || state.status === null) {
@@ -312,7 +332,7 @@ function resolveStatus(
       ghost: null,
       ghostStale: false,
       operation: resolvedOperation,
-      error: projectionError,
+      error: projectionError ?? resolvedOperation?.terminalError ?? null,
     };
   }
   if (projectionError !== null) {
@@ -324,16 +344,15 @@ function resolveStatus(
       error: projectionError,
     };
   }
+  // The latest settled result stays visible through the same owner snapshot,
+  // but repeated publication must not overwrite a new draft or an approval
+  // still waiting for a *new* operation to become visible.
+  if (projectedOperation !== null && !projectedOperation.resident
+    && state.status.manualOperations.some((previous) => !previous.resident
+      && previous.operationId === projectedOperation.operationId)) {
+    return { ...state, status };
+  }
   if (projectedOperation !== null) {
-    if (state.operation !== null
-      && state.operation.operationId !== projectedOperation.operationId) {
-      return {
-        ...state,
-        status,
-        phase: 'blocked',
-        error: 'The execution owner projected a different resident direct-control operation; Robot Control will not cross the operation identity.',
-      };
-    }
     return {
       ...state,
       status,
@@ -342,12 +361,13 @@ function resolveStatus(
       intent: null,
       preview: null,
       ghostStale: state.ghost !== null || state.ghostStale,
+      error: projectedOperation.terminalError ?? state.error,
       ...(operationStateIsTerminal(projectedOperation.state)
         ? draftFromStatus(status)
         : {}),
     };
   }
-  if (state.operation !== null && operationStateIsTerminal(state.operation.state)) {
+  if (state.operation !== null) {
     return {
       ...state,
       status,
@@ -361,12 +381,9 @@ function resolveStatus(
       error: state.error,
     };
   }
-  const operationSettled = state.operation !== null
-    && operationStateIsTerminal(state.operation.state);
   return {
     ...state,
     status,
-    ...(operationSettled ? draftFromStatus(status) : {}),
   };
 }
 
@@ -391,6 +408,8 @@ export function robotControlReducer(
   state: RobotControlState,
   action: RobotControlAction,
 ): RobotControlState {
+  if (state.operation?.resident && ['edit', 'edit_joint', 'edit_move_to_joint', 'edit_pose', 'edit_gripper']
+    .includes(action.type)) return state;
   switch (action.type) {
     case 'load':
       return state.status === null
@@ -410,7 +429,7 @@ export function robotControlReducer(
         ? { ...state, phase: 'unavailable', error: action.error }
         : { ...state, error: action.error };
     case 'program_activity_changed':
-      if (state.status === null || robotControlHasActiveOperation(state)) {
+      if (state.status === null || robotControlHasActiveOperation(state) || state.operation?.resident) {
         return state;
       }
       // A Program lifecycle owns robot motion while it is non-idle. Discard
@@ -434,7 +453,7 @@ export function robotControlReducer(
         || robotControlHasActiveOperation(state)
         || state.mode === action.mode
       ) return state;
-      return {
+      return resolveStatus({
         ...state,
         mode: action.mode,
         moveToKind: 'pose',
@@ -447,13 +466,21 @@ export function robotControlReducer(
         ghostStale: false,
         operation: null,
         error: null,
-      };
+      }, state.status, true);
     case 'edit':
     case 'edit_joint': {
       if (state.status === null || robotControlHasActiveOperation(state)) {
         return state;
       }
-      if (!positionsAreValid(state.status, action.positionsRad)) {
+      const baseline = robotControlHasLocalDraft(state)
+        ? state.draftPositionsRad : state.status.observedMotion.positionsRad;
+      const positionsRad = action.type === 'edit' ? action.positionsRad : [...baseline];
+      if (action.type === 'edit_joint') {
+        if (!Number.isInteger(action.jointIndex) || action.jointIndex < 0
+          || action.jointIndex >= positionsRad.length) return state;
+        positionsRad[action.jointIndex] = action.positionRad;
+      }
+      if (!positionsAreValid(state.status, positionsRad)) {
         return {
           ...state,
           phase: 'blocked',
@@ -466,11 +493,11 @@ export function robotControlReducer(
       }
       if (
         state.mode === 'joint'
-        && arraysEqual(state.draftPositionsRad, action.positionsRad)
+        && arraysEqual(baseline, positionsRad)
       ) return state;
       return invalidateDraft(state, {
         mode: 'joint',
-        draftPositionsRad: [...action.positionsRad],
+        draftPositionsRad: [...positionsRad],
       });
     }
     case 'edit_move_to_joint': {
@@ -514,7 +541,9 @@ export function robotControlReducer(
           error: 'The authored TCP pose is invalid.',
         };
       }
-      if (posesEqual(state.draftPose, action.pose)) return state;
+      if (posesEqual(robotControlHasLocalDraft(state)
+        ? state.draftPose : state.status.observedMotion.currentTcpPose, action.pose)
+        && (state.mode !== 'move_to' || state.moveToKind === 'pose')) return state;
       return invalidateDraft(state, {
         ...(state.mode === 'move_to' ? { moveToKind: 'pose' as const } : {}),
         draftPose: copyPose(action.pose),
@@ -536,7 +565,8 @@ export function robotControlReducer(
       }
       if (
         state.mode === 'gripper'
-        && state.draftGripperPosition === action.position
+        && (robotControlHasLocalDraft(state)
+          ? state.draftGripperPosition : state.status.observedGripper?.position) === action.position
       ) return state;
       return invalidateDraft(state, {
         mode: 'gripper',
@@ -595,7 +625,7 @@ export function robotControlReducer(
       ) return state;
       return { ...state, phase: 'approving', error: null };
     case 'approve_rejected':
-      if (state.phase !== 'approving') return state;
+      if (state.phase !== 'approving' || action.generation !== state.generation) return state;
       return {
         ...state,
         phase: 'blocked',
@@ -603,6 +633,9 @@ export function robotControlReducer(
         ghostStale: state.ghost !== null,
         error: action.error,
       };
+    case 'retry_preview':
+      if (state.status === null || state.operation?.resident || state.phase !== 'blocked') return state;
+      return invalidateDraft(state, {});
     case 'operation_observed':
       if (
         state.operation === null
@@ -617,19 +650,19 @@ export function robotControlReducer(
         ghostStale: state.ghost !== null,
         error: action.operation.terminalError ?? state.error,
       };
-    case 'operation_poll_failed':
-      return robotControlHasActiveOperation(state)
+    case 'operation_control_failed':
+      return state.status?.ownerEpoch === action.ownerEpoch
+        && state.operation?.operationId === action.operationId
         ? { ...state, error: action.error }
         : state;
-    case 'operation_settlement_failed':
-      return { ...state, error: action.error };
     case 'dismiss_error':
       return state.error === null ? state : { ...state, error: null };
     case 'revert':
       if (robotControlHasActiveOperation(state)) return state;
       return {
         ...state,
-        phase: state.status === null ? 'unavailable' : 'idle',
+        phase: state.operation?.resident ? phaseForOperation(state.operation)
+          : state.status === null ? 'unavailable' : 'idle',
         ...(state.status === null
           ? {
               draftPositionsRad: [],
@@ -642,8 +675,8 @@ export function robotControlReducer(
         preview: null,
         ghost: null,
         ghostStale: false,
-        operation: null,
-        error: null,
+        operation: state.operation?.resident ? state.operation : null,
+        error: state.operation?.resident ? state.operation.terminalError : null,
       };
     case 'clear':
       return {

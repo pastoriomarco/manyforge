@@ -241,6 +241,9 @@ private:
 
   mutable std::mutex execution_mutex_;
   mutable std::mutex state_mutex_;
+  // On-demand observations of the native scaler itself, independent of the
+  // motion stream (which intentionally has no ticks while paused).
+  mutable std::uint64_t runtime_scale_observation_sequence_{};
   std::condition_variable execution_cv_;
   std::jthread worker_thread_;
   ExecutionStateData state_;

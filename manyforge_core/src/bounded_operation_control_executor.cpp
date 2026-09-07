@@ -92,6 +92,9 @@ class BoundedOperationControlExecutor::Impl final {
   }
 
   [[nodiscard]] std::size_t capacity() const noexcept { return slots_.size(); }
+  [[nodiscard]] bool has_active_calls() const noexcept {
+    return active_calls_.load(std::memory_order_acquire) != 0U;
+  }
 
   [[nodiscard]] bool prequalified_ready() const noexcept {
     return accepting_.load(std::memory_order_acquire) &&
@@ -293,6 +296,7 @@ class BoundedOperationControlExecutor::Impl final {
                                           request->control,
                                           false,
                                           std::nullopt};
+      result.prepared_resume_cleanup_only = request->prepared_resume_cleanup_only;
       bool infrastructure_failure = false;
       try {
         switch (request->control) {
@@ -303,12 +307,20 @@ class BoundedOperationControlExecutor::Impl final {
             break;
           }
           case OperationControlKind::kResume: {
+            if (request->prepared_resume_cleanup_only) {
+              result.prepared_resume_cleanup_finished = true;
+              const auto cancelled =
+                  request->prepared_engine->CancelPreparedResumeMotion(request->subordinate_id);
+              result.accepted = cancelled.ok();
+              if (!cancelled.ok()) result.error = cancelled.error();
+              break;
+            }
             if (request->cancellation_requested->load(std::memory_order_acquire)) {
               result.error =
                   ErrorDTO{std::string(to_string(ErrorCode::kInvalidStateTransition)),
                            "Prepared Resume was superseded before subordinate preparation",
                            {{"reason", "prepared_resume_superseded_before_prepare"}}};
-              result.prepared_resume_cleanup_complete = true;
+              result.prepared_resume_cleanup_finished = true;
               break;
             }
             auto value = request->prepared_engine->PrepareResumeMotion(request->subordinate_id,
@@ -317,15 +329,17 @@ class BoundedOperationControlExecutor::Impl final {
             if (!value.ok()) {
               // The exact preparation API must not retain a dispatchable
               // product when it reports failure.
-              result.prepared_resume_cleanup_complete = true;
+              result.prepared_resume_cleanup_finished = true;
             }
             if (value.ok() && request->cancellation_requested->load(std::memory_order_acquire)) {
+              // A failed or throwing disposal remains one completed attempt,
+              // not permission for an automatic second cancellation.
+              result.prepared_resume_cleanup_finished = true;
               auto cancelled =
                   request->prepared_engine->CancelPreparedResumeMotion(request->subordinate_id);
               if (!cancelled.ok()) {
                 value = Result<void>::Err(cancelled.error());
               } else {
-                result.prepared_resume_cleanup_complete = true;
                 value = Result<void>::Err(
                     ErrorDTO{std::string(to_string(ErrorCode::kInvalidStateTransition)),
                              "Prepared Resume was superseded during subordinate preparation",
@@ -409,6 +423,10 @@ std::size_t BoundedOperationControlExecutor::capacity() const noexcept {
 
 bool BoundedOperationControlExecutor::prequalified_ready() const noexcept {
   return impl_->prequalified_ready();
+}
+
+bool BoundedOperationControlExecutor::has_active_calls() const noexcept {
+  return impl_->has_active_calls();
 }
 
 OperationControlEffectStartResult BoundedOperationControlExecutor::TryStart(

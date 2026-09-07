@@ -86,9 +86,19 @@ def create_viewer_router(
             return
 
         async def send_latest() -> None:
+            from .execution_observation_stream import (
+                ExecutionObservationSourceUnavailable,
+            )
+
             while True:
                 await subscription.wake.wait()
-                payload = source.take_payload(subscription)
+                try:
+                    payload = source.take_payload(subscription)
+                except ExecutionObservationSourceUnavailable:
+                    await websocket.close(
+                        code=1013, reason="execution observation source unavailable"
+                    )
+                    return
                 if payload is None:
                     continue
                 await asyncio.wait_for(

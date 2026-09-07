@@ -148,6 +148,7 @@ CREATE TABLE operation_snapshots (
   runtime_scale_generation INTEGER,
   disposition TEXT NOT NULL,
   snapshot_sequence INTEGER NOT NULL,
+  journal_capture_order INTEGER NOT NULL DEFAULT 0 CHECK(journal_capture_order >= 0),
   FOREIGN KEY(owner_epoch) REFERENCES owner_epochs(owner_epoch),
   FOREIGN KEY(snapshot_sequence) REFERENCES journal_records(sequence)
 ) STRICT;
@@ -494,10 +495,9 @@ class Transaction final {
 }
 
 [[nodiscard]] CanonicalValue Timestamp(std::int64_t value, std::string_view label) {
-  Require(value >= 0 && static_cast<std::uint64_t>(value) <= kMaximumSafeInteger,
-          "operation_journal_record_invalid",
-          std::string(label) + " is outside the lossless I-JSON range");
-  return CanonicalValue(static_cast<double>(value));
+  Require(value >= 0, "operation_journal_record_invalid",
+          std::string(label) + " must be nonnegative");
+  return content_identity::nonnegative_int64_value(value);
 }
 
 template <typename StrongId>
@@ -1025,7 +1025,7 @@ template <typename StrongId>
         {"terminal_error", ErrorValue(participant.terminal_error)},
     });
   }
-  return CanonicalValue(CanonicalValue::Object{
+  CanonicalValue::Object result{
       {"active_stop_generation",
        state.active_stop_generation.has_value()
            ? Number(state.active_stop_generation->value(), "active Stop generation")
@@ -1044,7 +1044,14 @@ template <typename StrongId>
            : CanonicalValue(nullptr)},
       {"state", CanonicalValue(std::string(OperationStateName(state.state)))},
       {"updated_at_ns", Timestamp(state.updated_at_ns, "operation update timestamp")},
-  });
+  };
+  // Preserve legacy payload bytes on read/migration. Fresh Kernel captures
+  // carry this private ordering fact; it is not part of public control DTOs.
+  if (state.journal_capture_order != 0U) {
+    result.emplace_back("journal_capture_order",
+                        CanonicalValue(std::to_string(state.journal_capture_order)));
+  }
+  return CanonicalValue(std::move(result));
 }
 
 [[nodiscard]] CanonicalValue PreparedRuntimePolicyValue(const PreparedRuntimePolicyRefDTO& policy) {
@@ -1639,7 +1646,9 @@ template <typename StrongId>
                                          const RuntimeScaleStatusDTO* scale_status,
                                          bool effect_pending) {
   return CanonicalValue(CanonicalValue::Object{
-      {"api_version", CanonicalValue("manyforge.operation_journal_record.v1")},
+      {"api_version",
+       CanonicalValue(state.journal_capture_order == 0U ? "manyforge.operation_journal_record.v1"
+                                                        : "manyforge.operation_journal_record.v2")},
       {"effect_pending", CanonicalValue(effect_pending)},
       {"intent", intent},
       {"operation_state", OperationStateValue(state)},
@@ -1655,7 +1664,7 @@ template <typename StrongId>
       state.program_binding_id.empty() || state.program_run_id.empty() ||
       state.participants.empty() || state.participants.size() > kMaxOperationParticipants ||
       state.updated_at_ns < 0 ||
-      static_cast<std::uint64_t>(state.updated_at_ns) > kMaximumSafeInteger ||
+      state.journal_capture_order > static_cast<std::uint64_t>(INT64_MAX) ||
       (state.active_stop_id.has_value() != state.active_stop_generation.has_value())) {
     return false;
   }
@@ -1723,7 +1732,6 @@ void RequireEmergencyStopProjection(const RequestOwnerEpoch& owner_epoch,
               BoundedIdentity(acceptance.stop_id.value(), kMaximumEmergencyStopIdentityBytes) &&
               acceptance.stop_generation.nonzero() && acceptance.accepted_at_ns >= 0 &&
               acceptance.outer_deadline_ns > acceptance.accepted_at_ns &&
-              static_cast<std::uint64_t>(acceptance.outer_deadline_ns) <= kMaximumSafeInteger &&
               content_identity::is_sha256_digest(acceptance.captured_scope_digest.value()) &&
               acceptance.projection_state == EmergencyStopProjectionStateDTO::kPending &&
               KnownEmergencyStopRecordEnums(acceptance) && acceptance.attribution.locally_valid() &&
@@ -2009,12 +2017,43 @@ template <typename T>
   return static_cast<std::uint64_t>(value);
 }
 
+void ValidateSnapshotCaptureOrder(sqlite3* database, const OperationId& operation_id,
+                                  std::uint64_t order) {
+  Statement record(database,
+                   "SELECT payload_json,payload_digest FROM journal_records WHERE sequence="
+                   "(SELECT snapshot_sequence FROM operation_snapshots WHERE operation_id=?)");
+  record.Bind(1, operation_id.value());
+  Require(record.Step(), "operation_journal_corrupt", "current capture record is missing");
+  const auto bytes = record.Text(0);
+  Require(bytes.size() <= kMaximumRecordJsonBytes &&
+              content_identity::sha256_digest(bytes) == record.Text(1) && !record.Step(),
+          "operation_journal_corrupt", "current capture record integrity failed");
+  // SQLite already owns these bounded JSON records. Extract just the named
+  // operation, including a multi-operation Stop capture, without constructing
+  // a second large C++ document or trusting an uncommitted projection column.
+  Statement captured(database,
+                     "SELECT json_extract(?,'$.operation_state.journal_capture_order') "
+                     "WHERE json_extract(?,'$.operation_state.operation_id')=? UNION ALL "
+                     "SELECT json_extract(value,'$.journal_capture_order') "
+                     "FROM json_each(?,'$.affected_state.operations') "
+                     "WHERE json_extract(value,'$.operation_id')=?");
+  captured.Bind(1, bytes);
+  captured.Bind(2, bytes);
+  captured.Bind(3, operation_id.value());
+  captured.Bind(4, bytes);
+  captured.Bind(5, operation_id.value());
+  Require(captured.Step() &&
+              (order == 0U ? captured.IsNull(0) : captured.Text(0) == std::to_string(order)) &&
+              !captured.Step(),
+          "operation_journal_corrupt", "snapshot order differs from its committed capture");
+}
+
 [[nodiscard]] OperationStateDTO LoadOperationState(sqlite3* database,
                                                    const OperationId& operation_id) {
   Statement snapshot(database,
                      "SELECT operation_revision,program_binding_id,program_run_id,"
                      "coordination_policy,state,updated_at_ns,active_stop_id,"
-                     "active_stop_generation,runtime_scale_generation "
+                     "active_stop_generation,runtime_scale_generation,journal_capture_order "
                      "FROM operation_snapshots WHERE operation_id=?");
   snapshot.Bind(1, operation_id.value());
   Require(snapshot.Step(), "operation_journal_corrupt", "operation snapshot is missing");
@@ -2024,8 +2063,8 @@ template <typename T>
   Require(coordination.has_value() && operation_state.has_value(), "operation_journal_corrupt",
           "operation snapshot contains an unknown closed-enum value");
   const auto updated_at_ns = snapshot.Integer(5);
-  Require(updated_at_ns >= 0 && static_cast<std::uint64_t>(updated_at_ns) <= kMaximumSafeInteger,
-          "operation_journal_corrupt", "operation snapshot timestamp is invalid");
+  Require(updated_at_ns >= 0, "operation_journal_corrupt",
+          "operation snapshot timestamp is invalid");
   const bool has_stop_id = !snapshot.IsNull(6);
   const bool has_stop_generation = !snapshot.IsNull(7);
   Require(has_stop_id == has_stop_generation, "operation_journal_corrupt",
@@ -2053,6 +2092,7 @@ template <typename T>
       std::move(stop_id),
       std::move(stop_generation),
       std::move(runtime_scale_generation),
+      static_cast<std::uint64_t>(snapshot.Integer(9)),
   };
   Require(!snapshot.Step(), "operation_journal_corrupt",
           "operation snapshot identity is not unique");
@@ -2142,21 +2182,55 @@ template <typename T>
     ++expected_index;
   }
   RequireState(state);
+  ValidateSnapshotCaptureOrder(database, operation_id, state.journal_capture_order);
   return state;
 }
 
 void StoreOperationSnapshot(sqlite3* database, const RequestOwnerEpoch& owner_epoch,
                             const OperationStateDTO& state, std::uint64_t snapshot_sequence,
-                            std::string_view disposition) {
+                            std::string_view disposition, std::string_view capture_digest) {
   RequireState(state);
   Require(snapshot_sequence > 0U && snapshot_sequence <= kMaximumSafeInteger,
           "operation_journal_record_invalid", "operation journal sequence is invalid");
+  Statement previous(database,
+                     "SELECT journal_capture_order,operation_revision FROM operation_snapshots "
+                     "WHERE operation_id=?");
+  previous.Bind(1, state.operation_id.value());
+  if (previous.Step()) {
+    const auto order = previous.Integer(0);
+    const auto revision = previous.Integer(1);
+    Require(order >= 0 && !previous.Step(), "operation_journal_corrupt",
+            "operation snapshot capture order is invalid");
+    ValidateSnapshotCaptureOrder(database, state.operation_id, static_cast<std::uint64_t>(order));
+    if (order > 0) {
+      if (state.journal_capture_order < static_cast<std::uint64_t>(order)) return;
+      if (state.journal_capture_order == static_cast<std::uint64_t>(order)) {
+        Require(LoadOperationState(database, state.operation_id) == state,
+                "operation_journal_corrupt", "equal capture order names conflicting state");
+        Statement record(
+            database,
+            "SELECT payload_json,payload_digest FROM journal_records WHERE sequence="
+            "(SELECT snapshot_sequence FROM operation_snapshots WHERE operation_id=?)");
+        record.Bind(1, state.operation_id.value());
+        Require(record.Step(), "operation_journal_corrupt", "current capture record is missing");
+        const auto bytes = record.Text(0);
+        const auto digest = record.Text(1);
+        Require(content_identity::sha256_digest(bytes) == digest && !record.Step(),
+                "operation_journal_corrupt", "current capture record integrity failed");
+        Require(digest == capture_digest, "operation_journal_corrupt",
+                "equal capture order names conflicting journal contents");
+        return;
+      }
+      Require(state.operation_revision.value() >= static_cast<std::uint64_t>(revision),
+              "operation_journal_corrupt", "newer capture regresses the public operation revision");
+    }
+  }
   Statement upsert(database,
                    "INSERT INTO operation_snapshots("
                    "operation_id,owner_epoch,operation_revision,program_binding_id,"
                    "program_run_id,coordination_policy,state,updated_at_ns,active_stop_id,"
                    "active_stop_generation,runtime_scale_generation,disposition,"
-                   "snapshot_sequence) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                   "snapshot_sequence,journal_capture_order) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                    "ON CONFLICT(operation_id) DO UPDATE SET owner_epoch=excluded.owner_epoch,"
                    "operation_revision=excluded.operation_revision,"
                    "program_binding_id=excluded.program_binding_id,"
@@ -2166,7 +2240,9 @@ void StoreOperationSnapshot(sqlite3* database, const RequestOwnerEpoch& owner_ep
                    "active_stop_generation=excluded.active_stop_generation,"
                    "runtime_scale_generation=excluded.runtime_scale_generation,"
                    "disposition=excluded.disposition,"
-                   "snapshot_sequence=excluded.snapshot_sequence");
+                   "snapshot_sequence=excluded.snapshot_sequence,"
+                   "journal_capture_order=excluded.journal_capture_order "
+                   "WHERE excluded.operation_revision>=operation_snapshots.operation_revision");
   upsert.Bind(1, state.operation_id.value());
   upsert.Bind(2, owner_epoch.value());
   upsert.Bind(3, static_cast<std::int64_t>(state.operation_revision.value()));
@@ -2189,8 +2265,10 @@ void StoreOperationSnapshot(sqlite3* database, const RequestOwnerEpoch& owner_ep
   }
   upsert.Bind(12, disposition);
   upsert.Bind(13, static_cast<std::int64_t>(snapshot_sequence));
+  upsert.Bind(14, static_cast<std::int64_t>(state.journal_capture_order));
   Require(!upsert.Step(), "operation_journal_corrupt",
           "operation snapshot upsert returned an unexpected row");
+  if (sqlite3_changes(database) == 0) return;
 
   Statement remove_participants(database,
                                 "DELETE FROM operation_participants WHERE operation_id=?");
@@ -2277,7 +2355,13 @@ void StoreOperationSnapshot(sqlite3* database, const RequestOwnerEpoch& owner_ep
 /// regress the recovery snapshot.
 void StoreOperationSnapshotMonotonic(sqlite3* database, const RequestOwnerEpoch& owner_epoch,
                                      const OperationStateDTO& state,
-                                     std::uint64_t snapshot_sequence) {
+                                     std::uint64_t snapshot_sequence,
+                                     std::string_view capture_digest) {
+  if (state.journal_capture_order != 0U) {
+    StoreOperationSnapshot(database, owner_epoch, state, snapshot_sequence, "current",
+                           capture_digest);
+    return;
+  }
   Statement present(database, "SELECT COUNT(*) FROM operation_snapshots WHERE operation_id=?");
   present.Bind(1, state.operation_id.value());
   Require(present.Step(), "operation_journal_corrupt",
@@ -2286,11 +2370,15 @@ void StoreOperationSnapshotMonotonic(sqlite3* database, const RequestOwnerEpoch&
   Require(!present.Step() && (count == 0 || count == 1), "operation_journal_corrupt",
           "operation snapshot presence query is invalid");
   if (count == 0) {
-    StoreOperationSnapshot(database, owner_epoch, state, snapshot_sequence, "current");
+    StoreOperationSnapshot(database, owner_epoch, state, snapshot_sequence, "current",
+                           capture_digest);
     return;
   }
 
   const auto current = LoadOperationState(database, state.operation_id);
+  // A delayed unsequenced legacy capture cannot replace an ordered one,
+  // including at the same public revision and clock. It is old, not corrupt.
+  if (current.journal_capture_order != 0U) return;
   if (current.operation_revision.value() > state.operation_revision.value() ||
       (current.operation_revision == state.operation_revision &&
        current.updated_at_ns > state.updated_at_ns)) {
@@ -2302,7 +2390,8 @@ void StoreOperationSnapshotMonotonic(sqlite3* database, const RequestOwnerEpoch&
             "equal operation revision/timestamp names conflicting immutable state");
     return;
   }
-  StoreOperationSnapshot(database, owner_epoch, state, snapshot_sequence, "current");
+  StoreOperationSnapshot(database, owner_epoch, state, snapshot_sequence, "current",
+                         capture_digest);
 }
 
 [[nodiscard]] CellAdmissionClaimKindDTO CellClaimKind(std::string_view value) {
@@ -2610,6 +2699,47 @@ class SqliteOperationJournal::Impl final {
     sqlite3_limit(database_, SQLITE_LIMIT_LENGTH, static_cast<int>(kMaximumRecordJsonBytes));
   }
 
+  void ValidateLegacy(std::int64_t version) {
+    // Migration must not widen the domain of corrupt legacy rows. Stream the
+    // bounded retained journal once, before publishing its new format identity.
+    Statement integrity(database_, "PRAGMA quick_check");
+    Require(integrity.Step() && integrity.Text(0) == "ok" && !integrity.Step(),
+            "operation_journal_corrupt", "legacy journal integrity check failed");
+    Statement foreign_keys(database_, "PRAGMA foreign_key_check");
+    Require(!foreign_keys.Step(), "operation_journal_corrupt",
+            "legacy journal contains broken references");
+    Statement timestamps(database_,
+                         "SELECT started_at_ns FROM owner_epochs UNION ALL "
+                         "SELECT closed_at_ns FROM owner_epochs WHERE closed_at_ns IS NOT NULL "
+                         "UNION ALL SELECT occurred_at_ns FROM journal_records "
+                         "UNION ALL SELECT updated_at_ns FROM operation_snapshots "
+                         "UNION ALL SELECT accepted_at_ns FROM cell_admission_claims");
+    while (timestamps.Step()) {
+      const auto value = timestamps.Integer(0);
+      Require(
+          value >= 0 && (version != 9 || static_cast<std::uint64_t>(value) <= kMaximumSafeInteger),
+          "operation_journal_corrupt", "legacy journal timestamp exceeds its declared domain");
+    }
+    Statement payloads(database_,
+                       "SELECT payload_json,payload_digest FROM journal_records UNION ALL "
+                       "SELECT acceptance_payload,acceptance_digest FROM stop_projections "
+                       "UNION ALL SELECT terminal_payload,terminal_digest FROM stop_projections "
+                       "WHERE terminal_payload IS NOT NULL UNION ALL "
+                       "SELECT surveillance_payload,surveillance_digest FROM stop_projections "
+                       "WHERE surveillance_payload IS NOT NULL UNION ALL "
+                       "SELECT clear_payload,clear_digest FROM stop_projections "
+                       "WHERE clear_payload IS NOT NULL");
+    while (payloads.Step()) {
+      const auto payload = payloads.Text(0);
+      // These bytes were canonicalized on admission. Verify the original
+      // commitment, just as ReadEvents does; this format-only cutover must not
+      // impose a newer parser's smaller byte/depth/node limits on old evidence.
+      Require(payload.size() <= kMaximumRecordJsonBytes &&
+                  content_identity::sha256_digest(payload) == payloads.Text(1),
+              "operation_journal_corrupt", "legacy journal payload integrity check failed");
+    }
+  }
+
   void InitializeOrValidate() {
     std::lock_guard lock(mutex_);
     Transaction transaction(database_);
@@ -2636,6 +2766,36 @@ class SqliteOperationJournal::Impl final {
     }
     Require(SchemaObjectNames(database_) == ExpectedSchemaObjects(),
             "operation_journal_storage_foreign", "operation journal contains an unexpected schema");
+    Require(
+        ScalarInteger(database_, "PRAGMA application_id") == kOperationJournalSqliteApplicationId,
+        "operation_journal_storage_foreign", "operation journal application identity is invalid");
+    // Validate before adding the private capture order. Legacy canonical
+    // payload bytes, sequence numbers and hashes are never rewritten.
+    const auto legacy_version = ScalarInteger(database_, "PRAGMA user_version");
+    if (legacy_version == 9 || legacy_version == 10) {
+      {
+        Statement legacy(database_,
+                         "SELECT schema_id,schema_version,cell_id,history_capacity FROM "
+                         "journal_metadata WHERE singleton=1");
+        Require(
+            legacy.Step() &&
+                legacy.Text(0) == "manyforge.internal.execution.operation-journal.o1.5.v" +
+                                      std::to_string(legacy_version) &&
+                legacy.Integer(1) == legacy_version && legacy.Text(2) == cell_id_.value() &&
+                legacy.Integer(3) == static_cast<std::int64_t>(history_capacity_) && !legacy.Step(),
+            "operation_journal_storage_foreign", "legacy operation journal identity is invalid");
+      }
+      ValidateLegacy(legacy_version);
+      Exec(database_,
+           "ALTER TABLE operation_snapshots ADD COLUMN journal_capture_order "
+           "INTEGER NOT NULL DEFAULT 0 CHECK(journal_capture_order >= 0)");
+      Statement upgrade(
+          database_, "UPDATE journal_metadata SET schema_id=?,schema_version=? WHERE singleton=1");
+      upgrade.Bind(1, kOperationJournalSchemaId);
+      upgrade.Bind(2, kOperationJournalSchemaVersion);
+      Require(!upgrade.Step(), "operation_journal_corrupt", "journal cutover returned a row");
+      Exec(database_, "PRAGMA user_version=" + std::to_string(kOperationJournalSchemaVersion));
+    }
     Require(
         ScalarInteger(database_, "PRAGMA application_id") == kOperationJournalSqliteApplicationId &&
             ScalarInteger(database_, "PRAGMA user_version") == kOperationJournalSchemaVersion,
@@ -2685,31 +2845,25 @@ class SqliteOperationJournal::Impl final {
   bool closed_{};
 };
 
-std::uint64_t SqliteOperationJournal::Impl::Append(const RequestOwnerEpoch& owner_epoch,
-                                                   std::string_view record_kind,
-                                                   const std::optional<RequestId>& request_id,
-                                                   const CanonicalValue& record_value,
-                                                   const OperationStateDTO& state,
-                                                   std::int64_t occurred_at_ns, bool effect_pending,
-                                                   std::string_view disposition,
-                                                   const std::span<const OperationId>
-                                                       protected_operation_ids) {
+std::uint64_t SqliteOperationJournal::Impl::Append(
+    const RequestOwnerEpoch& owner_epoch, std::string_view record_kind,
+    const std::optional<RequestId>& request_id, const CanonicalValue& record_value,
+    const OperationStateDTO& state, std::int64_t occurred_at_ns, bool effect_pending,
+    std::string_view disposition, const std::span<const OperationId> protected_operation_ids) {
   Require(!owner_epoch.empty() && !record_kind.empty() &&
-              (!request_id.has_value() || !request_id->empty()) && occurred_at_ns >= 0 &&
-              static_cast<std::uint64_t>(occurred_at_ns) <= kMaximumSafeInteger,
+              (!request_id.has_value() || !request_id->empty()) && occurred_at_ns >= 0,
           "operation_journal_record_invalid", "operation journal record identity is invalid");
   RequireState(state);
-  Require(
-      protected_operation_ids.empty() ||
-          (record_kind == "operation_accepted" &&
-           std::all_of(protected_operation_ids.begin(), protected_operation_ids.end(),
-                       [](const OperationId& id) { return !id.empty(); }) &&
-           std::is_sorted(protected_operation_ids.begin(), protected_operation_ids.end()) &&
-           std::adjacent_find(protected_operation_ids.begin(), protected_operation_ids.end()) ==
-               protected_operation_ids.end() &&
-           std::binary_search(protected_operation_ids.begin(), protected_operation_ids.end(),
-                              state.operation_id)),
-      "operation_journal_record_invalid", "protected operation admission inventory is invalid");
+  Require(protected_operation_ids.empty() ||
+              (record_kind == "operation_accepted" &&
+               std::all_of(protected_operation_ids.begin(), protected_operation_ids.end(),
+                           [](const OperationId& id) { return !id.empty(); }) &&
+               std::is_sorted(protected_operation_ids.begin(), protected_operation_ids.end()) &&
+               std::adjacent_find(protected_operation_ids.begin(), protected_operation_ids.end()) ==
+                   protected_operation_ids.end() &&
+               std::binary_search(protected_operation_ids.begin(), protected_operation_ids.end(),
+                                  state.operation_id)),
+          "operation_journal_record_invalid", "protected operation admission inventory is invalid");
   const auto payload_json = content_identity::canonical_json(record_value);
   Require(payload_json.size() <= kMaximumRecordJsonBytes, "operation_journal_record_too_large",
           "operation journal record exceeds the fixed payload bound");
@@ -2808,15 +2962,15 @@ std::uint64_t SqliteOperationJournal::Impl::Append(const RequestOwnerEpoch& owne
           "operation journal insert returned an unexpected row");
   const auto sequence = sqlite3_last_insert_rowid(database_);
   const auto bounded_sequence = PositiveIdentifier(sequence, "operation journal sequence");
-  StoreOperationSnapshot(database_, owner_epoch, state, bounded_sequence, disposition);
+  StoreOperationSnapshot(database_, owner_epoch, state, bounded_sequence, disposition,
+                         payload_digest);
 
   // The live journal stores one initial acceptance, the bounded preparation
   // provenance, and the newest complete state of an operation, not an
   // ever-growing command receipt history.
-  // StoreOperationSnapshot has already advanced the operation's single
-  // durable state anchor to this record, so every older state-conditioned
-  // update for the same operation is now redundant. Unresolved physical work
-  // remains represented by the snapshot itself.
+  // The state anchor advances unless this is a delayed lower-revision fact.
+  // Preserve that current anchor plus the newest event, not a lifetime list.
+  // Unresolved physical work remains represented by the snapshot itself.
   Statement coalesce(database_,
                      "DELETE FROM journal_records WHERE operation_id=? AND sequence<>? "
                      "AND record_kind IN ('control_accepted','runtime_scale_accepted',"
@@ -2912,7 +3066,7 @@ std::uint64_t SqliteOperationJournal::Impl::AppendStopAcceptance(
   const auto sequence =
       PositiveIdentifier(sqlite3_last_insert_rowid(database_), "operation journal sequence");
   for (const auto& state : affected_state.operations) {
-    StoreOperationSnapshotMonotonic(database_, owner_epoch, state, sequence);
+    StoreOperationSnapshotMonotonic(database_, owner_epoch, state, sequence, payload_digest);
   }
   const auto acceptance_projection = EncodeStopJournalAcceptanceProjection(
       StopJournalAcceptanceProjectionDTO{accepted, affected_state});
@@ -2939,9 +3093,8 @@ std::uint64_t SqliteOperationJournal::Impl::AppendStopAcceptance(
 std::uint64_t SqliteOperationJournal::Impl::AppendStopSurveillanceCheckpoint(
     const RequestOwnerEpoch& owner_epoch, const StopJournalSurveillanceProjectionDTO& projection,
     const std::string& payload_json, const std::int64_t projected_at_ns) {
-  Require(
-      projected_at_ns >= 0 && static_cast<std::uint64_t>(projected_at_ns) <= kMaximumSafeInteger,
-      "operation_journal_record_invalid", "Stop surveillance projection time is invalid");
+  Require(projected_at_ns >= 0, "operation_journal_record_invalid",
+          "Stop surveillance projection time is invalid");
   Require(payload_json.size() <= kMaximumRecordJsonBytes, "operation_journal_record_too_large",
           "Stop surveillance projection exceeds the fixed payload bound");
   const auto payload_digest = content_identity::sha256_digest(payload_json);
@@ -3192,7 +3345,6 @@ OperationJournalEventPageDTO SqliteOperationJournal::Impl::ReadEvents(
     const auto payload_digest = query.Text(9);
     Require(sequence > after_sequence && !record_kind.empty() &&
                 (!operation_id.has_value() || !operation_id->empty()) && occurred_at_ns >= 0 &&
-                static_cast<std::uint64_t>(occurred_at_ns) <= kMaximumSafeInteger &&
                 (effect_pending_value == 0 || effect_pending_value == 1) &&
                 payload_json.size() <= kMaximumRecordJsonBytes &&
                 content_identity::sha256_digest(payload_json) == payload_digest,
@@ -3215,9 +3367,8 @@ OperationJournalEventPageDTO SqliteOperationJournal::Impl::ReadEvents(
 OperationJournalRecoveryDTO SqliteOperationJournal::Impl::BeginOwnerEpoch(
     const RequestOwnerEpoch& owner_epoch, std::int64_t started_at_ns, std::size_t request_capacity,
     const std::vector<ResourceId>& resource_inventory) {
-  Require(!owner_epoch.empty() && started_at_ns >= 0 &&
-              static_cast<std::uint64_t>(started_at_ns) <= kMaximumSafeInteger &&
-              request_capacity > 0U && request_capacity <= kMaximumRequestCapacity &&
+  Require(!owner_epoch.empty() && started_at_ns >= 0 && request_capacity > 0U &&
+              request_capacity <= kMaximumRequestCapacity &&
               resource_inventory.size() <= kMaxKernelResourceSlots,
           "operation_journal_owner_epoch_invalid",
           "operation journal owner epoch admission is invalid");
@@ -3393,6 +3544,11 @@ OperationJournalRecoveryDTO SqliteOperationJournal::Impl::BeginOwnerEpoch(
          {"previous_owner_epoch", prior_snapshot.owner_epoch.value()},
          {"reason", "unreconciled_external_or_orphan_goal"}}};
     state.state = OperationStateKind::kInterventionRequired;
+    if (state.journal_capture_order != 0U) {
+      Require(state.journal_capture_order < static_cast<std::uint64_t>(INT64_MAX),
+              "operation_journal_record_invalid", "operation capture order exhausted");
+      ++state.journal_capture_order;
+    }
     state.updated_at_ns = started_at_ns;
     for (auto& participant : state.participants) {
       for (const auto& resource : participant.resources) {
@@ -3433,7 +3589,8 @@ OperationJournalRecoveryDTO SqliteOperationJournal::Impl::BeginOwnerEpoch(
             "host-replacement journal insert returned an unexpected row");
     const auto sequence =
         PositiveIdentifier(sqlite3_last_insert_rowid(database_), "operation journal sequence");
-    StoreOperationSnapshot(database_, owner_epoch, state, sequence, "orphaned_by_host_replacement");
+    StoreOperationSnapshot(database_, owner_epoch, state, sequence, "orphaned_by_host_replacement",
+                           content_identity::sha256_digest(payload_json));
   }
 
   Statement orphan_count(database_,
@@ -3857,9 +4014,8 @@ std::uint64_t SqliteOperationJournal::Impl::RecordStopFaultCleared(
 
 std::uint64_t SqliteOperationJournal::Impl::CloseOwnerEpoch(const RequestOwnerEpoch& owner_epoch,
                                                             const std::int64_t closed_at_ns) {
-  Require(!owner_epoch.empty() && closed_at_ns >= 0 &&
-              static_cast<std::uint64_t>(closed_at_ns) <= kMaximumSafeInteger,
-          "operation_journal_owner_epoch_invalid", "owner close identity is invalid");
+  Require(!owner_epoch.empty() && closed_at_ns >= 0, "operation_journal_owner_epoch_invalid",
+          "owner close identity is invalid");
   std::lock_guard lock(mutex_);
   RequireOpen();
   const auto occurred_at_wall = wall_time_text_();
@@ -3910,7 +4066,7 @@ std::uint64_t SqliteOperationJournal::Impl::CloseOwnerEpoch(const RequestOwnerEp
           "operation_journal_owner_close_blocked",
           "owner close is blocked by unresolved cell-admission claims");
   const auto payload = content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
-      {"closed_at_ns", CanonicalValue(static_cast<double>(closed_at_ns))},
+      {"closed_at_ns", Timestamp(closed_at_ns, "owner close timestamp")},
       {"owner_epoch", CanonicalValue(owner_epoch.value())},
   }));
   Statement insert(database_,
@@ -4008,8 +4164,7 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimAcquired(
   Require(ValidateCellAdmissionClaimIntent(claim.intent).ok() && claim.claim_generation.nonzero() &&
               claim.acquired_admission_generation.nonzero() &&
               claim.intent.expected_admission_generation == claim.acquired_admission_generation &&
-              claim.accepted_at_ns >= 0 &&
-              static_cast<std::uint64_t>(claim.accepted_at_ns) <= kMaximumSafeInteger,
+              claim.accepted_at_ns >= 0,
           "operation_journal_record_invalid", "cell-admission acquire record is invalid");
   std::lock_guard lock(mutex_);
   if (critical_section_observer_) {

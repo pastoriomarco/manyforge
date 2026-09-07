@@ -25,6 +25,18 @@ function frame(
 }
 
 describe('authoritative viewer interpolation', () => {
+  it('subtracts long-service clocks exactly across numeric and text encodings', () => {
+    const boundary = 9_007_199_254_740_991n;
+    for (const start of [boundary, 31n * 366n * 86400n * 1_000_000_000n]) {
+      const previous = frame({ observedAtNs: start === boundary ? Number(start) : String(start) });
+      const next = frame({ sourceSequence: 2, observedAtNs: String(start + 40_000_001n) });
+      expect(authoritativeInterpolationDurationMs(previous, next)).toBe(40.000001);
+      expect(authoritativeInterpolationDurationMs(next, frame({
+        sourceSequence: 3, observedAtNs: String(start),
+      }))).toBe(0);
+    }
+  });
+
   it('admits only strictly advancing frames from the same stream', () => {
     const previous = frame();
     const advancing = frame({

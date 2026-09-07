@@ -46,6 +46,11 @@ export PYTHONPYCACHEPREFIX="${PYTHONPYCACHEPREFIX:-/tmp/manyforge-pycache}"
 BUILD_DIR="${MANYFORGE_BUILD_DIR:-/tmp/manyforge-build}"
 CTEST_TEST_TIMEOUT_S="${CTEST_TEST_TIMEOUT_S:-60}"
 BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-$(nproc)}"
+BUILD_GENERATOR="${CMAKE_GENERATOR:-Ninja}"
+case "$BUILD_GENERATOR" in
+    Ninja|"Unix Makefiles") ;;
+    *) echo "Unsupported test build generator: $BUILD_GENERATOR (use Ninja or Unix Makefiles)" >&2; exit 2 ;;
+esac
 if [[ ! "${BUILD_PARALLEL_LEVEL}" =~ ^[1-9][0-9]*$ ]]; then
     echo "CMAKE_BUILD_PARALLEL_LEVEL must be a positive integer" >&2
     exit 2
@@ -100,12 +105,25 @@ raise SystemExit(0)
 PY
 }
 
+# Read the configured tree, not the operator's shell, before passing native
+# keep-going flags. CMake itself rejects a different -G for an existing cache.
+set_build_keep_going_args() {
+    local build="$1"
+    local generator
+    generator=$(sed -n 's/^CMAKE_GENERATOR:INTERNAL=//p' "$build/CMakeCache.txt")
+    case "$generator" in
+        Ninja) BUILD_KEEP_GOING_ARGS=(-k 0) ;;
+        "Unix Makefiles") BUILD_KEEP_GOING_ARGS=(-k) ;;
+        *) echo "Unsupported or missing configured generator in $build/CMakeCache.txt" >&2; return 1 ;;
+    esac
+}
+
 build_manyforge_core() {
     local build="$1"
     local build_testing="$2"
     mkdir -p "$build"
     cd "$build"
-    cmake "$WORKSPACE/manyforge_core" -DCMAKE_BUILD_TYPE=Release \
+    cmake "$WORKSPACE/manyforge_core" -G "$BUILD_GENERATOR" -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_TESTING="$build_testing" \
         -DMANYFORGE_GTEST_TIMEOUT_SECONDS="$CTEST_TEST_TIMEOUT_S" 2>&1 | tail -3
     cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" 2>&1 | tail -5
@@ -116,7 +134,7 @@ build_manyforge_content_identity() {
     local build_testing="$2"
     mkdir -p "$build"
     cd "$build"
-    cmake "$WORKSPACE/manyforge_content_identity" \
+    cmake "$WORKSPACE/manyforge_content_identity" -G "$BUILD_GENERATOR" \
         -DCMAKE_BUILD_TYPE=Release \
         -DMANYFORGE_CONTENT_IDENTITY_BUILD_TESTING="$build_testing" 2>&1 | tail -3
     cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" 2>&1 | tail -5
@@ -127,7 +145,7 @@ build_manyforge_persistence() {
     local build_testing="$2"
     mkdir -p "$build"
     cd "$build"
-    cmake "$WORKSPACE/manyforge_persistence" \
+    cmake "$WORKSPACE/manyforge_persistence" -G "$BUILD_GENERATOR" \
         -DCMAKE_BUILD_TYPE=Release \
         -DMANYFORGE_PERSISTENCE_BUILD_TESTING="$build_testing" 2>&1 | tail -3
     cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" 2>&1 | tail -5
@@ -138,7 +156,7 @@ build_manyforge_scene() {
     local build_testing="$2"
     mkdir -p "$build"
     cd "$build"
-    cmake "$WORKSPACE/manyforge_scene" -DCMAKE_BUILD_TYPE=Release \
+    cmake "$WORKSPACE/manyforge_scene" -G "$BUILD_GENERATOR" -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_TESTING="$build_testing" \
         -DMANYFORGE_SCENE_GTEST_TIMEOUT_SECONDS="$CTEST_TEST_TIMEOUT_S" 2>&1 | tail -3
     cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" 2>&1 | tail -5
@@ -149,7 +167,7 @@ build_manyforge_deployment() {
     local build_testing="$2"
     mkdir -p "$build"
     cd "$build"
-    cmake "$WORKSPACE/manyforge_deployment" -DCMAKE_BUILD_TYPE=Release \
+    cmake "$WORKSPACE/manyforge_deployment" -G "$BUILD_GENERATOR" -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_TESTING="$build_testing" \
         -DMANYFORGE_CORE_INCLUDE_DIR="$WORKSPACE/manyforge_core/include" \
         -DMANYFORGE_GTEST_TIMEOUT_SECONDS="$CTEST_TEST_TIMEOUT_S" 2>&1 | tail -3
@@ -161,7 +179,7 @@ build_manyforge_component_manager() {
     local build_testing="$2"
     mkdir -p "$build"
     cd "$build"
-    cmake "$WORKSPACE/manyforge_component_manager" -DCMAKE_BUILD_TYPE=Release \
+    cmake "$WORKSPACE/manyforge_component_manager" -G "$BUILD_GENERATOR" -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_TESTING="$build_testing" \
         -DMANYFORGE_GTEST_TIMEOUT_SECONDS="$CTEST_TEST_TIMEOUT_S" 2>&1 | tail -3
     cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" 2>&1 | tail -5
@@ -176,7 +194,7 @@ build_manyforge_headless() {
     )"
     mkdir -p "$build"
     cd "$build"
-    cmake "$WORKSPACE/manyforge_headless" -DCMAKE_BUILD_TYPE=Release \
+    cmake "$WORKSPACE/manyforge_headless" -G "$BUILD_GENERATOR" -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_TESTING=ON \
         -DMANYFORGE_HEADLESS_BUILD_PYTHON=ON \
         -Dpybind11_DIR="$pybind11_cmake_dir" \
@@ -315,7 +333,7 @@ PY
         BOOST_ROOT="$boost_root" \
         BOOST_INCLUDEDIR="${boost_root:+${boost_root}/include}" \
         BOOST_LIBRARYDIR="${boost_root:+${boost_root}/lib}" \
-        cmake "$WORKSPACE/manyforge_roboplan" -DCMAKE_BUILD_TYPE=Release \
+        cmake "$WORKSPACE/manyforge_roboplan" -G "$BUILD_GENERATOR" -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_TESTING=ON \
         -DMANYFORGE_GTEST_TIMEOUT_SECONDS="$CTEST_TEST_TIMEOUT_S"; then
         echo -e "${RED}  FAIL: RoboPlan producer configure failed${NC}"
@@ -337,8 +355,9 @@ build_headless_roboplan_producer_closure() {
         manyforge_native_execution_host_pick_place_fixture
         manyforge_roboplan_candidate_worker
     )
+    set_build_keep_going_args "$build" || return 1
     if ! cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" \
-        --target "${producer_targets[@]}" -- -k 0; then
+        --target "${producer_targets[@]}" -- "${BUILD_KEEP_GOING_ARGS[@]}"; then
         echo -e "${RED}  FAIL: RoboPlan producer closure build failed${NC}"
         return 1
     fi
@@ -378,7 +397,11 @@ run_roboplan_tests() {
         FAIL=$((FAIL + 1))
         return
     fi
-    if ! cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" -- -k 0; then
+    if ! set_build_keep_going_args "$build"; then
+        FAIL=$((FAIL + 1))
+        return
+    fi
+    if ! cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" -- "${BUILD_KEEP_GOING_ARGS[@]}"; then
         echo -e "${RED}  FAIL: RoboPlan producer build failed${NC}"
         FAIL=$((FAIL + 1))
         return

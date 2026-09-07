@@ -1182,7 +1182,7 @@ std::string SceneRuntimeObserveRequest(
       {"object_id", CanonicalValue(std::string(object_id))},
       {"payload",
        CanonicalValue(CanonicalValue::Object{
-           {"api_version", CanonicalValue("manyforge.ros_pose_observation.v1")},
+           {"api_version", CanonicalValue("manyforge.ros_pose_observation.v2")},
            {"kind", CanonicalValue("joint_state")},
            {"positions", CanonicalValue(CanonicalValue::Array{
                              CanonicalValue(position),
@@ -1214,7 +1214,7 @@ std::string SceneRuntimePoseObserveRequest(
       {"object_id", CanonicalValue(std::string(object_id))},
       {"payload",
        CanonicalValue(CanonicalValue::Object{
-           {"api_version", CanonicalValue("manyforge.ros_pose_observation.v1")},
+           {"api_version", CanonicalValue("manyforge.ros_pose_observation.v2")},
            {"kind", CanonicalValue("simulation_entity_pose")},
            {"pose", CanonicalValue(CanonicalValue::Object{
                         {"frame_id", CanonicalValue("universe")},
@@ -1227,7 +1227,7 @@ std::string SceneRuntimePoseObserveRequest(
                          CanonicalValue(CanonicalValue::Array{
                              CanonicalValue(position), CanonicalValue(-0.5),
                              CanonicalValue(0.75)})},
-                        {"source_stamp_s", CanonicalValue(1.25)},
+                        {"source_stamp_ns", CanonicalValue(1250000000.0)},
                     })},
            {"source", CanonicalValue(CanonicalValue::Object{
                           {"entity", CanonicalValue("/box")}})},

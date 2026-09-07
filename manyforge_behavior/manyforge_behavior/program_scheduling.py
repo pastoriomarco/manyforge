@@ -270,6 +270,13 @@ class ProgramRunTickHost:
             admission,
             program_run_id=program_run_id,
         )
+        self._schedule_or_stop(snapshot)
+        self._observe_state(snapshot)
+        return snapshot
+
+    def _schedule_or_stop(self, snapshot: ProgramRunSnapshot) -> None:
+        """Schedule admitted work or contain it if capacity changed meanwhile."""
+
         try:
             self.schedule(snapshot.capture.program_run_id)
         except Exception as scheduling_error:
@@ -294,8 +301,6 @@ class ProgramRunTickHost:
                     "cleanup settled"
                 ) from scheduling_error
             raise
-        self._observe_state(snapshot)
-        return snapshot
 
     def stop_run(
         self,
@@ -369,12 +374,15 @@ class ProgramRunTickHost:
                 len(self._scheduled) >= self._maximum_scheduled_runs
             ):
                 raise ProgramSchedulingError("scheduled Program-run set is full")
-            snapshot = self._owner.resume_full_stop(
-                program_run_id,
-                request_id=request_id,
-                reason=reason,
-            )
-            self._schedule_locked(program_run_id)
+        # Provider recovery may block; it must not hold the scheduler mutex
+        # needed to publish/schedule a newer priority Stop. Admission and
+        # Resume share the existing containment-on-scheduling-failure path.
+        snapshot = self._owner.resume_full_stop(
+            program_run_id,
+            request_id=request_id,
+            reason=reason,
+        )
+        self._schedule_or_stop(snapshot)
         self._observe_state(snapshot)
         return snapshot
 

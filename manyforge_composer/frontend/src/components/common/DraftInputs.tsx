@@ -17,6 +17,8 @@ type DraftTextInputProps = Omit<
   onCommit: (value: string) => void;
   validate?: (value: string) => string | null;
   onInvalidChange?: (message: string | null) => void;
+  onPendingChange?: (pending: boolean) => void;
+  resetKey?: string | number;
   shiftStepMultiplier?: number;
   commitNativeStep?: boolean;
   dirtyClassName?: string;
@@ -27,6 +29,8 @@ export function DraftTextInput({
   onCommit,
   validate,
   onInvalidChange,
+  onPendingChange,
+  resetKey,
   shiftStepMultiplier,
   commitNativeStep,
   dirtyClassName,
@@ -42,10 +46,33 @@ export function DraftTextInput({
   const skipNextCommit = useRef(false);
   const inputRef = useRef<HTMLInputElement | null>(null);
   const sawBeforeInput = useRef(false);
+  const userEdited = useRef(false);
 
   useEffect(() => {
-    if (!focused && invalidMessage === null) setDraft(normalizedValue);
-  }, [focused, invalidMessage, normalizedValue]);
+    if (!userEdited.current || (!focused && invalidMessage === null)) {
+      userEdited.current = false;
+      setDraft(normalizedValue);
+    } else if (draft === normalizedValue && invalidMessage === null) {
+      userEdited.current = false;
+    }
+  }, [draft, focused, invalidMessage, normalizedValue]);
+
+  useEffect(() => {
+    onPendingChange?.(invalidMessage !== null || (userEdited.current && draft !== normalizedValue));
+  }, [draft, invalidMessage, normalizedValue, onPendingChange]);
+
+  const currentValue = useRef(normalizedValue);
+  currentValue.current = normalizedValue;
+  useEffect(() => {
+    userEdited.current = false;
+    setDraft(currentValue.current);
+    setInvalidMessage(null);
+    onInvalidChange?.(null);
+    onPendingChange?.(false);
+    // Only an explicit local rebase resets even an invalid/focused input.
+    // Ordinary owner observations must not overwrite what is being typed.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [resetKey]);
 
   const validateDraft = useCallback(() => {
     const message = validate?.(draft) ?? null;
@@ -54,14 +81,17 @@ export function DraftTextInput({
     return message;
   }, [draft, onInvalidChange, validate]);
   const commit = useCallback(() => {
+    if (!userEdited.current) return;
     const message = validateDraft();
     if (message === null && draft !== normalizedValue) onCommit(draft);
   }, [draft, normalizedValue, onCommit, validateDraft]);
   const reset = useCallback(() => {
+    userEdited.current = false;
     setDraft(normalizedValue);
     setInvalidMessage(null);
     onInvalidChange?.(null);
-  }, [normalizedValue, onInvalidChange]);
+    onPendingChange?.(false);
+  }, [normalizedValue, onInvalidChange, onPendingChange]);
 
   useEffect(() => {
     const input = inputRef.current;
@@ -75,6 +105,7 @@ export function DraftTextInput({
       sawBeforeInput.current = false;
       if (typedEdit) return;
       const candidate = input.value;
+      userEdited.current = true;
       const message = validate?.(candidate) ?? null;
       setDraft(candidate);
       setInvalidMessage(message);
@@ -103,7 +134,12 @@ export function DraftTextInput({
         setFocused(true);
         onFocus?.(event);
       }}
-      onChange={(event) => setDraft(event.target.value)}
+      onChange={(event) => {
+        const next = event.target.value;
+        userEdited.current = true;
+        setDraft(next);
+        onPendingChange?.(next !== normalizedValue || (validate?.(next) ?? null) !== null);
+      }}
       onBlur={(event) => {
         if (skipNextCommit.current) skipNextCommit.current = false;
         else commit();
@@ -130,7 +166,9 @@ export function DraftTextInput({
                 event.shiftKey ? shiftStepMultiplier : 1
               ),
             )));
+            userEdited.current = true;
             setDraft(next);
+            onPendingChange?.(next !== normalizedValue || (validate?.(next) ?? null) !== null);
             if (commitNativeStep) {
               const message = validate?.(next) ?? null;
               setInvalidMessage(message);

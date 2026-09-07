@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py headless-rest
-  Last regenerated: 2026-09-04 11:41:35 UTC
+  Last regenerated: 2026-09-07 02:02:46 UTC
   Generator source: scripts/regen-public-contracts.py:gen_headless_rest_api
 -->
 
@@ -36,6 +36,8 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `GET` | `/api/control/state` |  | Execution Control Projection |
 | `POST` | `/api/cycle/recovery-actions` |  | Cycle Recovery Action |
 | `GET` | `/api/cycle/status` |  | Program Cycle Status |
+| `GET` | `/api/debug/export` |  | Debug Export |
+| `GET` | `/api/debug/export/ros2-medkit` |  | Normalized Trace Export |
 | `GET` | `/api/execution/alarms` |  | Alarms |
 | `POST` | `/api/execution/alarms/acknowledge-all` |  | Acknowledge All |
 | `GET` | `/api/execution/alarms/metrics` |  | Alarm Metrics |
@@ -45,6 +47,8 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `GET` | `/api/execution/diagnostics` |  | Execution Diagnostics |
 | `POST` | `/api/execution/full-stop` |  | Execution Full Stop |
 | `GET` | `/api/execution/history` |  | History |
+| `GET` | `/api/execution/history/discovery` |  | History Discovery |
+| `GET` | `/api/execution/history/export` |  | History Export |
 | `GET` | `/api/execution/history/health` |  | Historian Health |
 | `POST` | `/api/execution/history/reconcile` |  | Historian Reconcile |
 | `GET` | `/api/execution/history/{sequence}` |  | History Detail |

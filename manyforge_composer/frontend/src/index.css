@@ -1132,7 +1132,12 @@ code {
 }
 
 .robot-control-panel {
-  margin-bottom: 1rem;
+  display: flex;
+  height: 100%;
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
+  margin: 0;
 }
 
 .robot-control-operation code,
@@ -1141,8 +1146,11 @@ code {
 }
 
 .robot-control-body {
-  display: grid;
-  grid-template-columns: minmax(24rem, 1.25fr) minmax(20rem, 0.75fr);
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
 }
 
 .robot-control-modes {
@@ -1160,9 +1168,10 @@ code {
 }
 
 .robot-control-editor {
-  max-height: 34rem;
+  flex: 1 1 auto;
+  min-height: 0;
   overflow: auto;
-  border-right: 1px solid #203542;
+  border-bottom: 1px solid #203542;
 }
 
 .robot-control-joints {
@@ -1209,8 +1218,10 @@ code {
 }
 
 .robot-control-preview {
+  flex: 0 1 auto;
   min-width: 0;
-  max-height: 34rem;
+  min-height: 3.3rem;
+  max-height: min(28vh, 16rem);
   overflow: auto;
   background: #091720;
 }
@@ -1337,6 +1348,7 @@ code {
 }
 
 .robot-control-footer {
+  flex: 0 0 auto;
   padding: 0.8rem 1rem;
   border-top: 1px solid #29414f;
   background: #0b1a23;
@@ -4114,15 +4126,6 @@ svg.viewer-camera-icon {
   .program-properties {
     grid-column: 1 / -1;
     border-top: 1px solid #203542;
-  }
-
-  .robot-control-body {
-    grid-template-columns: 1fr;
-  }
-
-  .robot-control-editor {
-    border-right: 0;
-    border-bottom: 1px solid #203542;
   }
 
   .catalog-browser {
@@ -7022,42 +7025,8 @@ svg.viewer-camera-icon {
 }
 
 .viewer-inspector-section .robot-control-panel {
-  display: flex;
-  height: 100%;
-  min-height: 0;
-  flex-direction: column;
-  overflow: hidden;
-  margin: 0;
   border: 0;
   border-radius: 0;
-}
-
-.viewer-inspector-section .robot-control-body {
-  display: flex;
-  flex: 1 1 auto;
-  min-height: 0;
-  flex-direction: column;
-  overflow: hidden;
-}
-
-.viewer-inspector-section .robot-control-editor {
-  flex: 1 1 auto;
-  max-height: none;
-  min-height: 0;
-  overflow-y: auto;
-  border-right: 0;
-  border-bottom: 1px solid #203542;
-}
-
-.viewer-inspector-section .robot-control-preview {
-  flex: 0 1 auto;
-  min-height: 3.3rem;
-  max-height: min(28vh, 16rem);
-  overflow-y: auto;
-}
-
-.viewer-inspector-section .robot-control-footer {
-  flex: 0 0 auto;
 }
 
 .viewer-inspector-section .robot-control-pose-grid {
@@ -7434,47 +7403,6 @@ svg.viewer-camera-icon {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 0.35rem;
-}
-
-.robot-control-gripper-facts {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 0.35rem;
-  margin: 0;
-}
-
-.robot-control-gripper-facts > div {
-  min-width: 0;
-  padding: 0.4rem;
-  border: 1px solid #243c49;
-  border-radius: 0.4rem;
-  background: #0a1821;
-}
-
-.robot-control-gripper-facts :is(dt, dd) {
-  margin: 0;
-  overflow-wrap: anywhere;
-}
-
-.robot-control-gripper-facts dt {
-  color: #7895a2;
-  font-size: var(--inspector-help-font-size);
-}
-
-.robot-control-gripper-facts dd {
-  margin-top: 0.15rem;
-  color: #bfd2d9;
-  font-size: var(--inspector-label-font-size);
-}
-
-.robot-control-mimic {
-  color: #91a9b4;
-  font-size: var(--inspector-help-font-size);
-}
-
-.robot-control-mimic ul {
-  margin: 0.35rem 0 0;
-  padding-left: 1rem;
 }
 
 .viewer-inspector-section .robot-control-actions {
@@ -7901,12 +7829,4 @@ svg.viewer-camera-icon {
     transform: none;
   }
 
-  .overlay-panel .robot-control-body {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .overlay-panel .robot-control-editor {
-    border-right: 0;
-    border-bottom: 1px solid #203542;
-  }
 }

@@ -545,12 +545,11 @@ CanonicalValue ProviderEvidence(const SceneObjectProviderEvidenceDTO& value,
        Unsigned(value.provider_source_sequence,
                 std::string(field) + ".provider_source_sequence")},
       {"received_at_ns",
-       Signed(value.received_at_ns, std::string(field) + ".received_at_ns")},
+       content_identity::nonnegative_int64_value(value.received_at_ns)},
   };
   if (value.source_timestamp_ns.has_value()) {
     object.emplace_back("source_timestamp_ns",
-                        Signed(*value.source_timestamp_ns,
-                               std::string(field) + ".source_timestamp_ns"));
+                        content_identity::nonnegative_int64_value(*value.source_timestamp_ns));
   }
   if (value.source_freshness_budget_ns.has_value()) {
     Require(

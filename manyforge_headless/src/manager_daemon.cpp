@@ -997,8 +997,8 @@ RequiredParentAuthoringClaim(const CanonicalValue &value) {
       core::AdmissionGeneration(RequiredUnsigned(
           RequiredMember(value, "acquired_admission_generation"),
           "parent acquired_admission_generation")),
-      static_cast<std::int64_t>(RequiredNonnegativeUnsigned(
-          RequiredMember(value, "accepted_at_ns"), "parent accepted_at_ns")),
+      manyforge::content_identity::parse_nonnegative_int64(
+          RequiredMember(value, "accepted_at_ns")),
   };
   Require(core::ValidateCellAdmissionClaimIntent(claim.intent).ok(),
           "parent authoring claim is invalid");
@@ -2724,8 +2724,12 @@ private:
       return;
     }
     std::optional<core::ProgramCycleStatusDTO> probed_cycle_status;
-    bool native_batch_started = false;
-    bool native_batch_completed = false;
+    using BatchProgress = component_manager::detail::ManagerLivenessBatchProgress;
+    auto native_batch = BatchProgress::kNotStarted;
+    const auto record_attempt_failure = [&] {
+      manager_liveness_retry_gate_.RecordAttemptFailure(native_batch, ElapsedNs(),
+          static_cast<std::uint64_t>(deployment::native_execution_runtime_contract::manager_liveness_policy().expiry_timeout_ns));
+    };
     try {
       const auto runner = ProbeProgramRunnerLiveness(
           config_.program_runner_liveness_socket, admission_.cell_id());
@@ -2856,7 +2860,7 @@ private:
                  .durable_public_pointer_content_digest,
              required_set, retained_policy, heartbeat, reconciliation});
       }
-      native_batch_started = !requests.empty();
+      if (!requests.empty()) native_batch = BatchProgress::kInFlight;
       const auto responses =
           requests.empty()
               ? std::vector<core::ManagerLivenessObservationDTO>{}
@@ -2890,7 +2894,7 @@ private:
               "evidence");
         }
       }
-      native_batch_completed = true;
+      native_batch = BatchProgress::kValidated;
       if (!reconciliation.has_value()) {
         throw std::runtime_error(
             "Program Runner liveness requires converged reconciliation");
@@ -2964,19 +2968,7 @@ private:
           return;
         }
       }
-      if (!native_batch_started || native_batch_completed) {
-        // Only uncertainty inside the native batch needs a full lease-expiry
-        // delay. A separately addressed Program Runner rejection must not
-        // starve native children whose renewal already completed.
-        manager_liveness_retry_gate_.RecordSuccess();
-      } else {
-        const auto failure_ns = ElapsedNs();
-        const auto expiry = static_cast<std::uint64_t>(
-            deployment::native_execution_runtime_contract::
-                manager_liveness_policy()
-                    .expiry_timeout_ns);
-        manager_liveness_retry_gate_.RecordFailure(failure_ns, expiry);
-      }
+      record_attempt_failure();
       std::cerr << "Manager native liveness renewal remains fail-closed: "
                 << error.what() << '\n';
     } catch (...) {
@@ -2989,16 +2981,7 @@ private:
           return;
         }
       }
-      if (!native_batch_started || native_batch_completed) {
-        manager_liveness_retry_gate_.RecordSuccess();
-      } else {
-        const auto failure_ns = ElapsedNs();
-        const auto expiry = static_cast<std::uint64_t>(
-            deployment::native_execution_runtime_contract::
-                manager_liveness_policy()
-                    .expiry_timeout_ns);
-        manager_liveness_retry_gate_.RecordFailure(failure_ns, expiry);
-      }
+      record_attempt_failure();
       std::cerr << "Manager native liveness renewal remains fail-closed\n";
     }
   }
@@ -3955,16 +3938,13 @@ private:
           }
         } else {
           const auto observed_at = HostMonotonicNs();
-          constexpr auto kMaximumSafeInteger = 9007199254740991ULL;
-          const auto observed_unsigned =
-              static_cast<std::uint64_t>(observed_at);
-          if (*command.pose_lifetime_ns >
-              kMaximumSafeInteger - observed_unsigned) {
+          if (observed_at < 0 || *command.pose_lifetime_ns > static_cast<std::uint64_t>(
+                  std::numeric_limits<std::int64_t>::max() - observed_at)) {
             TrySendResponse(
                 client.get(),
                 ErrorResponse(
                     "scene_runtime_observation_expiry_invalid",
-                    "pose observation expiry exceeds the safe range"));
+                    "pose observation expiry exceeds the int64 clock range"));
             return false;
           }
           PoseSourceObservation observation{
@@ -3973,8 +3953,7 @@ private:
               session->second.source_epoch_order,
               *command.pose_source_sequence,
               observed_at,
-              static_cast<std::int64_t>(observed_unsigned +
-                                        *command.pose_lifetime_ns),
+              observed_at + static_cast<std::int64_t>(*command.pose_lifetime_ns),
               *command.pose_quality,
               *command.pose_eligible,
               *command.pose_payload,

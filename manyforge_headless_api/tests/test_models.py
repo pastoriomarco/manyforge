@@ -10,7 +10,9 @@ from manyforge_headless_api.models import (
     AcknowledgeAllAlarmsRequest,
     ManagerApplyRequest,
     MotionParticipantRequest,
+    MAX_OPERATION_PARTICIPANTS,
     OperationControlRequest,
+    OperationIntentRequest,
     OperationParticipantRequest,
     PickSequencePlanningRequest,
     PlaceSequencePlanningRequest,
@@ -127,6 +129,47 @@ def _tool_payload() -> dict[str, object]:
         "completion_timeout_s": 2.0,
         "caller_options": [],
     }
+
+
+@pytest.mark.parametrize(
+    ("count", "policy", "valid"),
+    [
+        (0, "independent", False),
+        (1, "independent", True),
+        (1, "coordinated_all", False),
+        (2, "independent", False),
+        (2, "coordinated_all", True),
+        (2, "invented", False),
+        (MAX_OPERATION_PARTICIPANTS, "coordinated_all", True),
+        (MAX_OPERATION_PARTICIPANTS + 1, "coordinated_all", False),
+    ],
+)
+def test_operation_participant_bounds_and_coordination(count, policy, valid) -> None:
+    operation = _planning_operation("bounded-participants", _tool_payload(), tool=True)
+    operation["participants"] *= count
+    operation["coordination_policy"] = policy
+    if valid:
+        parsed = OperationIntentRequest.model_validate(operation)
+        assert len(parsed.participants) == count
+        assert parsed.coordination_policy == policy
+    else:
+        with pytest.raises(ValidationError):
+            OperationIntentRequest.model_validate(operation)
+
+
+def test_coordinated_operation_checks_every_participant_action_span() -> None:
+    operation = _planning_operation("spans", _tool_payload(), tool=True)
+    operation["coordination_policy"] = "coordinated_all"
+    operation["participants"].append(deepcopy(operation["participants"][0]))
+    operation["participants"][1]["action_span"] = {
+        "action_source": "system",
+        "action_span_id": "span.second",
+        "program_run_id": "run:other",
+    }
+    with pytest.raises(ValidationError, match="must match the operation"):
+        OperationIntentRequest.model_validate(operation)
+    operation["participants"][1]["action_span"]["program_run_id"] = "run:test"
+    assert OperationIntentRequest.model_validate(operation).participants[1].action_span
 
 
 def _cartesian_path() -> dict[str, object]:

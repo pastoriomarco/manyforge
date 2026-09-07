@@ -793,7 +793,7 @@ class FakeCore:
     def history(self, **kwargs: Any) -> dict[str, Any]:
         del kwargs
         return {
-            "schema_version": "manyforge.historian_summary_page.v1",
+            "schema_version": "manyforge.historian_summary_page.v2",
             "events": [],
             "next_before_sequence": None,
             "truncated": False,
@@ -944,7 +944,7 @@ class FakeExecution:
             "api_version": "manyforge.execution_command_response.v1",
             "ok": True,
             "command": "observation",
-            "observation": {"schema_version": "manyforge.execution_observation.v1"},
+            "observation": {"schema_version": "manyforge.execution_observation.v2"},
         }
 
     def submit(
@@ -3090,18 +3090,22 @@ def test_history_list_is_summary_only_and_keeps_exact_detail_on_demand() -> None
 
     def history(**_kwargs: Any) -> dict[str, Any]:
         return {
-            "schema_version": "manyforge.historian_summary_page.v1",
+            "schema_version": "manyforge.historian_summary_page.v2",
             "events": [
                 {
                     "sequence": 7,
                     "event": {
-                        "schema_version": "manyforge.historian_event_summary.v1",
+                        "schema_version": "manyforge.historian_event_summary.v2",
                         "event_id": "event-7",
                         "component": "manyforge.composer",
                         "event_type": "client_incident_activated",
                         "severity": "ERROR",
                         "occurred_at_ns": "9007199254740992",
                         "occurred_at_wall": "2026-09-04T10:00:00Z",
+                        "occurred_at_utc_ns": "1788516000000000000",
+                        "clock_owner": "headless:owner.1",
+                        "wall_clock_regressed": False,
+                        "condition_severity": "ERROR",
                         "message": "Control connection stale",
                         "program_run_id": "program-run.7",
                         "operation_id": "operation.9",
@@ -3141,17 +3145,21 @@ def test_history_list_is_summary_only_and_keeps_exact_detail_on_demand() -> None
 
     assert response.status_code == 200, response.text
     page = response.json()
-    assert page["schema_version"] == "manyforge.historian_summary_page.v1"
+    assert page["schema_version"] == "manyforge.historian_summary_page.v2"
     assert len(response.content) < 2_048
     assert "payload" not in page["events"][0]["event"]
     assert page["events"][0]["event"] == {
-        "schema_version": "manyforge.historian_event_summary.v1",
+        "schema_version": "manyforge.historian_event_summary.v2",
         "event_id": "event-7",
         "component": "manyforge.composer",
         "event_type": "client_incident_activated",
         "severity": "ERROR",
         "occurred_at_ns": "9007199254740992",
         "occurred_at_wall": "2026-09-04T10:00:00Z",
+        "occurred_at_utc_ns": "1788516000000000000",
+        "clock_owner": "headless:owner.1",
+        "wall_clock_regressed": False,
+        "condition_severity": "ERROR",
         "message": "Control connection stale",
         "program_run_id": "program-run.7",
         "operation_id": "operation.9",
@@ -3263,7 +3271,7 @@ def test_execution_observation_websocket_proxies_one_persistent_credited_session
                 "api_version": "manyforge.execution_command_response.v1",
                 "command": "observation",
                 "observation": {
-                    "schema_version": "manyforge.execution_observation.v1",
+                    "schema_version": "manyforge.execution_observation.v2",
                     "source_sequence": len(self.cursors),
                 },
                 "ok": True,

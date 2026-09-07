@@ -1821,7 +1821,7 @@ target: 0.5
         ),
         (
             "manyforge.value_schema.runtime.native_execution.v1",
-            "sha256:c20bf40303bddd213d8db77b7075c0fe224e00928f4e6bda3cbfd7ebba880d6e",
+            "sha256:4be97ca6314af96d083a37a6aed9ef5976ed0e63c02d69ac790377edeb6804fb",
         ),
         (
             "manyforge.value_schema.runtime.ros2_control_execution.v1",
@@ -1829,7 +1829,7 @@ target: 0.5
         ),
     }
     assert registry.qualification_registry_digest.value == (
-        "sha256:50b5f0670b82edbc106cf413030af6481bb4390a7d8fee2dedfeb3686fd7adb5"
+        "sha256:43087ef20c219f1687f11c2407afb6769bddc896f4a87c8724fe53398dc1ad57"
     )
     assert (
         json.loads(registry.normalized_projection_canonical_json)["catalog_schemas"][0][

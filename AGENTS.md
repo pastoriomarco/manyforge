@@ -232,20 +232,21 @@ ______________________________________________________________________
 
 ## Operator-facing reference docs (this repo)
 
-Only the generated structural REST contract is current. Historical interaction
-contracts remain in this repo as non-operative reimplementation inputs. Use
+Generated REST, control-WebSocket and optional MCP contracts describe their
+current explicit entrypoints. Historical interaction contracts remain
+non-operative reimplementation inputs. Use
 [`docs/reference/ARCHITECTURE.md`](docs/reference/ARCHITECTURE.md) for the
 hand-maintained ownership and end-to-end flow map.
 
 | Topic                   | Doc                                                                                                                          | Source-of-truth                                                                                                     |
 | ----------------------- | ---------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
 | Composer REST API       | [`docs/reference/REST_API.md`](docs/reference/REST_API.md)                                                                   | FastAPI app's `/openapi.json` (live at `:9000/openapi.json` when Composer is running)                               |
-| MCP runtime contract    | [`docs/reference/MCP_RUNTIME_CONTRACT.md`](docs/reference/MCP_RUNTIME_CONTRACT.md)                                           | Historical at `082221...`; unavailable                                                                              |
+| MCP runtime contract    | [`docs/reference/MCP_RUNTIME_CONTRACT.md`](docs/reference/MCP_RUNTIME_CONTRACT.md)                                           | Optional Composer MCP adapter and its mapped owner routes; no separate execution authority                          |
 | Assistant-provider HTTP | [`docs/reference/ASSISTANT_PROVIDER_CONTRACT.md`](docs/reference/ASSISTANT_PROVIDER_CONTRACT.md)                             | Historical at `082221...`; live bridge removed and unavailable; retained protocol/supervisor logic is porting input |
 | Viewer data plane       | [`docs/reference/HISTORICAL_COMPOSER_INTERACTION_REFERENCE.md`](docs/reference/HISTORICAL_COMPOSER_INTERACTION_REFERENCE.md) | Pinned historical implementation plus responsibility/test ledger; unavailable                                       |
 
-`REST_API.md` alone is generated from the retained FastAPI application. To
-regenerate it:
+Regenerate the exact named surface (`structural-rest`, `headless-rest`, or
+`mcp`) from its owning application/registry. For example:
 
 ```bash
 docker compose run --rm dev \

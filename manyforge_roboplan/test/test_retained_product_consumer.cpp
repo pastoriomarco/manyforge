@@ -1376,6 +1376,11 @@ TEST(RetainedProductRoboPlanConsumer,
   const deployment::FilesystemCanonicalEmptyRetainedBundleSource
       admission_source(package_root);
   const auto admission = admission_source.load_verified();
+  const deployment::FilesystemVerifiedCatalogArtifactSource empty_catalog(
+      package_root);
+  EXPECT_FALSE(deployment::resolve_retained_stop_deadline_budget(
+                   admission.retained_bundle(), empty_catalog)
+                   .has_value());
   const deployment::FilesystemVerifiedRetainedProductArtifactSource
       product_source(package_root);
 
@@ -2187,6 +2192,50 @@ TEST(
 }
 
 TEST(RetainedProductCrossConsumer,
+     BootstrapStopEnvelopeFollowsDeclaredCapabilityAndExactArtifacts) {
+  ScopedTemporaryRoot temporary;
+  const auto passive_root = temporary.path() / "not-stoppable";
+  ASSERT_TRUE(std::filesystem::create_directory(passive_root));
+  const auto passive =
+      deployment::test::materialize_lite6_retained_consumer_fixture(
+          passive_root);
+  const deployment::FilesystemVerifiedCatalogArtifactSource passive_catalog(
+      passive_root);
+  EXPECT_FALSE(deployment::resolve_retained_stop_deadline_budget(
+      *passive.bundle, passive_catalog));
+
+  const auto motion_root = temporary.path() / "stoppable";
+  ASSERT_TRUE(std::filesystem::create_directory(motion_root));
+  const auto motion = deployment::test::
+      materialize_lite6_stop_capable_native_motion_retained_consumer_fixture(
+          motion_root);
+  const deployment::FilesystemVerifiedCatalogArtifactSource motion_catalog(
+      motion_root);
+  const auto budget = deployment::resolve_retained_stop_deadline_budget(
+      *motion.bundle, motion_catalog);
+  ASSERT_TRUE(budget);
+  EXPECT_GT(budget->outer_duration_ns, budget->kernel_completion_reserve_ns);
+  EXPECT_GT(budget->kernel_completion_reserve_ns, 0);
+  EXPECT_TRUE(budget->phases.empty());
+  class MissingCatalog final : public deployment::ICatalogArtifactSource {
+    std::optional<std::string>
+    get_verified(const core::ContentAddressedStoreKey &,
+                 const core::ContentDigest &,
+                 std::optional<std::uint64_t>) const override {
+      return std::nullopt;
+    }
+  } missing;
+  EXPECT_THROW(deployment::resolve_retained_stop_deadline_budget(*motion.bundle,
+                                                                 missing),
+               deployment::RetainedRuntimePolicyError);
+  // Even a non-stoppable capability must prove its exact policy, not treat
+  // missing/tampered artifacts as an empty or passive product.
+  EXPECT_THROW(deployment::resolve_retained_stop_deadline_budget(
+                   *passive.bundle, missing),
+               deployment::RetainedRuntimePolicyError);
+}
+
+TEST(RetainedProductCrossConsumer,
      ProductSelectedStateConfigDoesNotEvaluateNativePredictedFallback) {
   ScopedTemporaryRoot temporary;
   const std::filesystem::path package_root =
@@ -2476,9 +2525,9 @@ TEST(RetainedProductCrossConsumer,
   const auto physical_scope = make_runtime_fence_scope(
       {&runtime->motion_binding, &*runtime->gripper_binding});
   EXPECT_EQ(runtime->collision_publisher.get(), projection.get());
+  const auto arm_context = runtime->motion_state_channel->query_context();
   EXPECT_TRUE(std::all_of(
-      runtime->motion_state_channel->query_context().coordinate_kinds.begin(),
-      runtime->motion_state_channel->query_context().coordinate_kinds.end(),
+      arm_context.coordinate_kinds.begin(), arm_context.coordinate_kinds.end(),
       [](const auto kind) { return kind == core::CoordinateKind::kAngular; }));
   ASSERT_EQ(
       runtime->gripper_state_channel->query_context().coordinate_kinds.size(),
@@ -2554,8 +2603,8 @@ TEST(RetainedProductCrossConsumer,
   EXPECT_DOUBLE_EQ(validation.trajectory_metrics->trajectory_duration_s, 1.0);
   EXPECT_EQ(validation.trajectory_metrics->peak_abs_joint_velocity_rad_s,
             std::vector<double>(joint_names.value().size(), 0.0));
-  EXPECT_TRUE(
-      validation.trajectory_metrics->peak_abs_joint_acceleration_rad_s2.empty());
+  EXPECT_TRUE(validation.trajectory_metrics->peak_abs_joint_acceleration_rad_s2
+                  .empty());
   EXPECT_FALSE(
       validation.trajectory_metrics->peak_tcp_linear_speed_mps.has_value());
 
@@ -2593,8 +2642,7 @@ TEST(RetainedProductCrossConsumer,
   EXPECT_DOUBLE_EQ(measured_metrics.trajectory_duration_s, 1.0);
   ASSERT_EQ(measured_metrics.peak_abs_joint_velocity_rad_s.size(),
             joint_names.value().size());
-  EXPECT_NEAR(measured_metrics.peak_abs_joint_velocity_rad_s[0], 0.02,
-              1.0e-12);
+  EXPECT_NEAR(measured_metrics.peak_abs_joint_velocity_rad_s[0], 0.02, 1.0e-12);
   ASSERT_EQ(measured_metrics.peak_abs_joint_acceleration_rad_s2.size(),
             joint_names.value().size());
   EXPECT_NEAR(measured_metrics.peak_abs_joint_acceleration_rad_s2[0], 0.03,
@@ -3836,6 +3884,99 @@ TEST(RetainedProductCrossConsumer,
               physical_bindings[index].value().controllable_component_id);
     EXPECT_EQ(resolved.value().value().resources,
               physical_bindings[index].value().resources);
+    const auto &physical = physical_bindings[index];
+    const auto &control = *physical.value().control_path;
+    const auto context = core::make_observed_state_query_context(physical, 100);
+    ASSERT_TRUE(context.ok());
+    auto sample = make_fixture_state(
+        context.value(),
+        std::vector<double>(physical.value().resources.size(), 0.0), 1, 10);
+    core::ActiveControlConfigurationDTO configuration{
+        control.active_control_configuration_id,
+        control.control_domain_id,
+        control.control_domain_revision,
+        {{control.control_binding_id, control.control_binding_revision,
+          control.control_route_id}},
+        control.activation_set_id,
+        control.controller_topology_id,
+        control.topology_revision,
+        control.provider_runtime_unit_id,
+        control.provider_runtime_epoch,
+        1,
+        {},
+        control.active_control_configuration_generation,
+        core::ActiveControlConfigurationStateDTO::kReconciled};
+    for (const auto &resource : physical.value().resources) {
+      configuration.kinematic_resource_source_projections.push_back(
+          {resource.resource_id,
+           {{control.control_binding_id, control.control_binding_revision}},
+           control.provider_instance_id,
+           control.provider_manifest_id,
+           control.provider_manifest_revision,
+           control.state_authority_id,
+           control.state_authority_class,
+           sample.source_kind});
+    }
+    ASSERT_TRUE(
+        target_observation_source_is_current(physical, sample, configuration));
+    auto changed_configuration = configuration;
+    changed_configuration.state = core::ActiveControlConfigurationStateDTO::
+        kExternalOrUnknownUnreconciled;
+    EXPECT_FALSE(target_observation_source_is_current(physical, sample,
+                                                      changed_configuration));
+    changed_configuration = configuration;
+    changed_configuration.active_control_configuration_generation =
+        core::ActiveControlConfigurationGeneration(2);
+    EXPECT_FALSE(target_observation_source_is_current(physical, sample,
+                                                      changed_configuration));
+    changed_configuration = configuration;
+    changed_configuration.binding_routes.clear();
+    EXPECT_FALSE(target_observation_source_is_current(physical, sample,
+                                                      changed_configuration));
+    changed_configuration = configuration;
+    changed_configuration.kinematic_resource_source_projections.front()
+        .publication_source = core::ObservedStateSourceKind::kActionFeedback;
+    EXPECT_FALSE(target_observation_source_is_current(physical, sample,
+                                                      changed_configuration));
+    auto changed_sample = sample;
+    changed_sample.provider_instance_id =
+        core::ProviderInstanceId("different.provider");
+    EXPECT_FALSE(target_observation_source_is_current(physical, changed_sample,
+                                                      configuration));
+    changed_sample = sample;
+    changed_sample.source_epoch = core::RuntimeEpoch("different.epoch");
+    EXPECT_FALSE(target_observation_source_is_current(physical, changed_sample,
+                                                      configuration));
+    // A second capability binding may read this source only when the current
+    // owner explicitly groups both bindings. Never relabel the sample.
+    changed_sample = sample;
+    changed_sample.control_binding_id =
+        core::ControlBindingId("source.binding");
+    EXPECT_FALSE(target_observation_source_is_current(physical, changed_sample,
+                                                      configuration));
+    configuration.binding_routes.push_back(
+        {changed_sample.control_binding_id,
+         changed_sample.control_binding_revision,
+         changed_sample.control_route_id});
+    for (auto &group : configuration.kinematic_resource_source_projections)
+      group.contributing_control_bindings.push_back(
+          {changed_sample.control_binding_id,
+           changed_sample.control_binding_revision});
+    EXPECT_TRUE(target_observation_source_is_current(physical, changed_sample,
+                                                     configuration));
+    const auto &frames = inventory.motion[index]
+                             ->value()
+                             .target_role_bindings.front()
+                             .frame_role_bindings;
+    ASSERT_FALSE(frames.empty());
+    for (const auto &frame : frames) {
+      EXPECT_TRUE(
+          resolver.FrameObservationCovered(frame, physical_bindings[index]));
+      if (frame.frame_role_id.value() == "tcp") {
+        EXPECT_FALSE(resolver.FrameObservationCovered(
+            frame, physical_bindings[(index + 1U) % physical_bindings.size()]));
+      }
+    }
   }
 
   auto unknown = make_motion_operation(

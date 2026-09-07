@@ -11,6 +11,57 @@
 #include <manyforge_content_identity/content_identity.hpp>
 
 namespace manyforge::headless {
+
+std::optional<std::int64_t> HistorianRecordedUtcNs(std::string_view wall) noexcept {
+  if (wall.size() < 20U || wall.size() > 35U || wall[4] != '-' || wall[7] != '-' ||
+      (wall[10] != 'T' && wall[10] != 't' && wall[10] != ' ') ||
+      wall[13] != ':' || wall[16] != ':') {
+    return std::nullopt;
+  }
+  const auto digits = [wall](std::size_t start, std::size_t count) {
+    int result = 0;
+    for (std::size_t i = start; i < start + count; ++i) {
+      if (i >= wall.size() || wall[i] < '0' || wall[i] > '9') return -1;
+      result = result * 10 + wall[i] - '0';
+    }
+    return result;
+  };
+  const int year = digits(0U, 4U), month = digits(5U, 2U), day = digits(8U, 2U);
+  const int hour = digits(11U, 2U), minute = digits(14U, 2U), second = digits(17U, 2U);
+  if (year < 0 || month < 1 || day < 1 || hour < 0 || hour > 23 ||
+      minute < 0 || minute > 59 || second < 0 || second > 59) return std::nullopt;
+  const std::chrono::year_month_day date{std::chrono::year{year},
+      std::chrono::month{static_cast<unsigned>(month)}, std::chrono::day{static_cast<unsigned>(day)}};
+  if (!date.ok()) return std::nullopt;
+  std::size_t offset = 19U;
+  std::int64_t fraction = 0;
+  if (wall[offset] == '.') {
+    const auto start = ++offset;
+    while (offset < wall.size() && wall[offset] >= '0' && wall[offset] <= '9') {
+      if (offset - start >= 9U) return std::nullopt;
+      fraction = fraction * 10 + wall[offset++] - '0';
+    }
+    if (offset == start) return std::nullopt;
+    for (auto count = offset - start; count < 9U; ++count) fraction *= 10;
+  }
+  int zone_seconds = 0;
+  if (offset + 1U == wall.size() && (wall[offset] == 'Z' || wall[offset] == 'z')) {
+    // Explicit UTC.
+  } else if (offset + 6U == wall.size() && (wall[offset] == '+' || wall[offset] == '-') &&
+             wall[offset + 3U] == ':') {
+    const auto h = digits(offset + 1U, 2U), m = digits(offset + 4U, 2U);
+    if (h < 0 || h > 23 || m < 0 || m > 59) return std::nullopt;
+    zone_seconds = (h * 3600 + m * 60) * (wall[offset] == '-' ? -1 : 1);
+  } else {
+    return std::nullopt;
+  }
+  const auto seconds = std::chrono::sys_days(date).time_since_epoch().count() * 86400LL +
+                       hour * 3600 + minute * 60 + second - zone_seconds;
+  constexpr auto maximum = std::numeric_limits<std::int64_t>::max();
+  if (seconds < 0 || seconds > (maximum - fraction) / 1000000000LL) return std::nullopt;
+  return seconds * 1000000000LL + fraction;
+}
+
 namespace {
 
 using content_identity::CanonicalValue;
@@ -197,41 +248,42 @@ struct SummaryIdentities final {
 
 SummaryIdentities SummaryIdentityValues(const CanonicalValue &payload) {
   SummaryIdentities result;
-  std::vector<std::pair<const CanonicalValue *, std::size_t>> pending{
-      {&payload, 0U}};
+  std::set<std::string> run, operation, condition;
   std::size_t visited = 0U;
-  while (!pending.empty() && visited < kMaximumSummaryTraversalNodes) {
-    const auto [current, depth] = pending.back();
-    pending.pop_back();
-    ++visited;
-    if (depth > kMaximumSummaryTraversalDepth) {
-      continue;
+  bool complete = true;
+  const auto visit = [&](auto &&self, const CanonicalValue &current, std::size_t depth) -> void {
+    if (++visited > kMaximumSummaryTraversalNodes || depth > kMaximumSummaryTraversalDepth) {
+      complete = false;
+      return;
     }
-    if (current->is_object()) {
-      for (const auto &[name, child] : current->as_object()) {
-        std::optional<std::string> *target = nullptr;
-        if (name == "program_run_id") {
-          target = &result.program_run_id;
-        } else if (name == "operation_id") {
-          target = &result.operation_id;
-        } else if (name == "condition_id" ||
-                   name == "operator_alarm_condition_id") {
-          target = &result.condition_id;
-        }
-        if (target != nullptr && !target->has_value()) {
+    if (current.is_object()) {
+      for (const auto &[name, child] : current.as_object()) {
+        auto *target = name == "program_run_id" ? &run : name == "operation_id" ? &operation :
+            name == "condition_id" || name == "operator_alarm_condition_id" ? &condition : nullptr;
+        if (target != nullptr) {
           const auto *text = std::get_if<std::string>(&child.storage());
-          if (text != nullptr && !text->empty()) {
-            *target = Utf8Prefix(*text, kMaximumSummaryTextCodePoints);
-          }
+          if (text != nullptr && !text->empty() && target->size() < 2) target->insert(*text);
         }
-        pending.emplace_back(&child, depth + 1U);
+        self(self, child, depth + 1);
+        if (!complete) return;
       }
-    } else if (current->is_array()) {
-      for (const auto &child : current->as_array()) {
-        pending.emplace_back(&child, depth + 1U);
+    } else if (current.is_array()) {
+      for (const auto &child : current.as_array()) {
+        self(self, child, depth + 1);
+        if (!complete) return;
       }
     }
-  }
+  };
+  visit(visit, payload, 0);
+  const auto unique = [&](const std::set<std::string> &values) -> std::optional<std::string> {
+    // A list never labels an ambiguous or clipped identity as exact. All
+    // applicable keys remain indexed and available through detail/export.
+    return complete && values.size() == 1 && values.begin()->size() <= 1024
+        ? std::optional(*values.begin()) : std::nullopt;
+  };
+  result.program_run_id = unique(run);
+  result.operation_id = unique(operation);
+  result.condition_id = unique(condition);
   return result;
 }
 
@@ -300,9 +352,11 @@ HistorianEvent MakeHistorianEvent(std::string component, std::string event_type,
 
 HistorianEvent
 MakeAlarmLifecycleHistorianEvent(const AlarmLifecycleFact &fact) {
+  auto payload = AlarmLifecycleFactValue(fact).as_object();
+  payload.emplace_back("clock_owner", CanonicalValue("headless:" + fact.owner_epoch));
   return MakeHistorianEvent("manyforge.alarm", fact.event_type, "INFO",
                             fact.occurred_at_ns, fact.occurred_at_wall,
-                            AlarmLifecycleFactValue(fact));
+                            CanonicalValue(std::move(payload)));
 }
 
 CanonicalValue HistorianEventValue(const HistorianEvent &event) {
@@ -368,6 +422,8 @@ CanonicalValue HistorianSummaryPageValue(const HistorianPage &page) {
          CanonicalValue(CanonicalValue::Object{
              {"component", CanonicalValue(stored.event.component)},
              {"condition_id", OptionalString(identities.condition_id)},
+             {"condition_severity", CanonicalValue(HistorianConditionSeverity(stored.event))},
+             {"clock_owner", OptionalString(stored.clock_owner)},
              {"event_id", CanonicalValue(stored.event.event_id)},
              {"event_type", CanonicalValue(stored.event.event_type)},
              {"message", CanonicalValue(SummaryMessage(stored.event))},
@@ -375,6 +431,9 @@ CanonicalValue HistorianSummaryPageValue(const HistorianPage &page) {
               CanonicalValue(std::to_string(stored.event.occurred_at_ns))},
              {"occurred_at_wall",
               CanonicalValue(stored.event.occurred_at_wall)},
+             {"occurred_at_utc_ns", stored.occurred_at_utc_ns
+                 ? CanonicalValue(std::to_string(*stored.occurred_at_utc_ns)) : CanonicalValue(nullptr)},
+             {"wall_clock_regressed", CanonicalValue(stored.wall_clock_regressed)},
              {"operation_id", OptionalString(identities.operation_id)},
              {"program_run_id", OptionalString(identities.program_run_id)},
              {"schema_version",
@@ -390,7 +449,52 @@ CanonicalValue HistorianSummaryPageValue(const HistorianPage &page) {
        OptionalNumber(page.next_before_sequence, "next_before_sequence")},
       {"schema_version",
        CanonicalValue(std::string(kHistorianSummaryPageSchemaVersion))},
+      {"retention", page.retention},
       {"truncated", CanonicalValue(page.truncated)},
+  });
+}
+
+std::string HistorianConditionSeverity(const HistorianEvent &event) {
+  const auto *schema = StringMember(event.payload, "schema_version");
+  const auto *original = StringMember(event.payload, "original_severity");
+  if (schema != nullptr && *schema == "manyforge.client_incident_event.v1" && original != nullptr &&
+      (*original == "WARN" || *original == "ERROR" || *original == "CRITICAL")) return *original;
+  return event.severity;
+}
+
+CanonicalValue HistorianExportPageValue(const HistorianPage &page) {
+  // Full diagnostic reads remain paged and byte bounded; they never make the
+  // control WebSocket carry event payloads or turn export into an archive.
+  CanonicalValue::Array events;
+  // Reserve the complete fixed envelope, retained-coverage metadata and the
+  // HTTP adapter's exact time-window fields, not just event bodies.
+  std::size_t bytes = content_identity::canonical_json(page.retention).size() + 512U;
+  std::optional<std::uint64_t> last;
+  for (const auto &stored : page.events) {
+    CanonicalValue value(CanonicalValue::Object{
+        {"sequence", Number(stored.sequence, "sequence")},
+        {"event", HistorianEventValue(stored.event)},
+        {"persistence_digest", CanonicalValue(content_identity::sha256_digest(
+            content_identity::canonical_json(HistorianPersistenceValue(stored.event))))},
+        {"clock_owner", OptionalString(stored.clock_owner)},
+        {"occurred_at_utc_ns", stored.occurred_at_utc_ns
+            ? CanonicalValue(std::to_string(*stored.occurred_at_utc_ns)) : CanonicalValue(nullptr)},
+        {"wall_clock_regressed", CanonicalValue(stored.wall_clock_regressed)},
+        {"condition_severity", CanonicalValue(HistorianConditionSeverity(stored.event))},
+    });
+    const auto size = content_identity::canonical_json(value).size();
+    if (!events.empty() && (events.size() == 32U || bytes + size + 1U > 1024U * 1024U)) break;
+    bytes += size + 1U;
+    last = stored.sequence;
+    events.push_back(std::move(value));
+  }
+  const bool truncated = page.truncated || events.size() < page.events.size();
+  return CanonicalValue(CanonicalValue::Object{
+      {"schema_version", CanonicalValue("manyforge.historian_export_page.v1")},
+      {"events", CanonicalValue(std::move(events))},
+      {"truncated", CanonicalValue(truncated)},
+      {"next_before_sequence", OptionalNumber(truncated ? last : std::nullopt, "next_before_sequence")},
+      {"retention", page.retention},
   });
 }
 
@@ -415,16 +519,17 @@ CanonicalValue HistorianDetailValue(const HistorianStoredEvent &stored) {
                                 : std::get_if<std::string>(&schema->storage());
   const bool operation = schema_text != nullptr &&
                          *schema_text == "manyforge.operation_history_event.v1";
+  const auto condition_severity = HistorianConditionSeverity(event);
   const bool incident = event.component == "manyforge.alarm" ||
-                        event.severity == "WARN" || event.severity == "ERROR" ||
-                        event.severity == "CRITICAL";
+                        condition_severity == "WARN" || condition_severity == "ERROR" ||
+                        condition_severity == "CRITICAL";
 
   CanonicalValue::Object execution;
   if (operation) {
     for (const auto name :
          {"effect_pending", "native_sequence", "native_sequence_gap",
           "operation_id", "operation_revision", "payload_digest", "record_kind",
-          "request_id", "source_owner_epoch"}) {
+          "request_id", "source_owner_epoch", "journal_payload"}) {
       if (const auto *value = event.payload.find_object_member(name);
           value != nullptr) {
         execution.emplace_back(name, *value);
@@ -480,6 +585,8 @@ CanonicalValue HistorianDetailValue(const HistorianStoredEvent &stored) {
                         {"event_id", CanonicalValue(event.event_id)},
                         {"event_type", CanonicalValue(event.event_type)},
                         {"severity", CanonicalValue(event.severity)},
+                        {"condition_severity", CanonicalValue(condition_severity)},
+                        {"recorded_facts", event.payload},
                     }))},
            {"latency",
             section(latency != nullptr,
@@ -567,7 +674,7 @@ AsyncHistorianHealth AsyncEventHistorian::Health() const {
   return {
       "manyforge.async_historian_health.v1",
       !failure_active_,
-      failure_active_ && recovery_write_observed_,
+      failure_active_ && recovery_write_observed_ && health_generation_ < kMaximumSafeInteger,
       accepting_,
       health_generation_,
       error_code_,
@@ -581,6 +688,12 @@ AsyncHistorianHealth AsyncEventHistorian::Health() const {
       overflow_count_,
       delivery_failure_count_,
   };
+}
+
+void AsyncEventHistorian::ReportDeliveryFailure(std::string code, std::string message) {
+  std::lock_guard lock(mutex_);
+  Advance(delivery_failure_count_);
+  MarkFailureLocked(std::move(code), std::move(message));
 }
 
 bool AsyncEventHistorian::WaitUntilIdle(
@@ -600,17 +713,35 @@ bool AsyncEventHistorian::ReconcileHealth(
           "historian_health_generation_stale",
           "historian health changed before reconciliation");
   if (!failure_active_) {
-    return true;
+    // An already healthy generation has no state change or new audit fact.
+    return false;
   }
   if (!recovery_write_observed_) {
+    return false;
+  }
+  if (!AdvanceHealthGenerationLocked()) {
     return false;
   }
   failure_active_ = false;
   recovery_write_observed_ = false;
   error_code_.reset();
   error_message_.reset();
-  Advance(health_generation_);
   return true;
+}
+
+bool AsyncEventHistorian::AdvanceHealthGenerationLocked() {
+  if (health_generation_ < kMaximumSafeInteger) {
+    ++health_generation_;
+    return true;
+  }
+  // Diagnostic counters may saturate; a causal generation must never be
+  // reused to authorize a later repair. Only a new owner incarnation can
+  // replace this exhausted namespace.
+  failure_active_ = true;
+  recovery_write_observed_ = false;
+  error_code_ = "historian_health_generation_exhausted";
+  error_message_ = "historian health identity exhausted; owner replacement required";
+  return false;
 }
 
 void AsyncEventHistorian::Shutdown() {
@@ -637,7 +768,7 @@ void AsyncEventHistorian::MarkFailureLocked(std::string code,
   error_code_ = std::move(code);
   error_message_ = std::move(message);
   if (changed) {
-    Advance(health_generation_);
+    static_cast<void>(AdvanceHealthGenerationLocked());
   }
 }
 

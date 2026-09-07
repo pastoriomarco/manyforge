@@ -86,8 +86,9 @@ changing semantic state.
    browser imposes no lifecycle timeout, holds no backend state behind the
    receipt, and rejects an unresolved receipt if the session disconnects.
 7. Server messages after hello have one increasing sequence in actual wire
-   order. Owner replacement produces `resync_required`; resync returns current
-   state only and never replays motion or commands.
+   order. Owner replacement produces `resync_required`; the client replaces
+   that session by reconnecting, receiving current state only. No in-band
+   `resync` command or replay of motion/commands exists.
 8. Every owner `snapshot` or `delta` carries a separate `state_sequence`. Once
    the browser has validated and merged that value, it returns
    `state_applied` for the exact sequence. Headless sends no later owner state
@@ -97,18 +98,40 @@ changing semantic state.
    block another browser.
 
 Client message kinds are `client_hello`, `heartbeat_echo`, `state_applied`,
-`command`, `client_incident`, and `resync`. `client_incident` accepts only the small
+`command`, and `client_incident`. `client_incident` accepts only the small
 published enum of browser-only transport/render/history failures; Headless
 supplies time and attribution and cannot be used as a general event writer.
 The v2 client enum is `browser_render_delayed`,
 `command_delivery_unconfirmed`, `control_disconnected`,
 `history_request_failed`, and `history_detail_request_failed`. Headless itself
 records `control_delayed` and `control_stale` from measured challenge RTT.
+Each threshold has one bounded incident episode across consecutive delayed
+challenges. A late echo proves liveness but does not resolve delay; one round
+trip below that threshold resolves it, recording the original incident ID,
+first/last observation, affected challenge count and maximum delay. Closing
+the session records its termination, not a fabricated healthy round trip.
+Recoverable Runner-frame or filesystem-source failures are separate
+`control_source_unavailable` incidents recorded by Headless, never by clients.
+They keep independent heartbeat alive and recover from one coherent current
+capture in the existing source loop; no browser churn or command retry is
+required. Recorder failure is observable in bounded diagnostics and logs.
 Server message kinds are `server_hello`, `heartbeat_challenge`, `snapshot`,
 `delta`, `command_receipt`, and `resync_required`. Exact closed DTO validation
 is owned by `manyforge_headless_api/control_protocol.py`. Unknown fields,
 another session/version, sequence gaps, stale freshness, size excess, and rate
 excess fail closed before ordinary owner state changes.
+
+For a `delta`, `control` and owner `state_sequence` are present together.
+Composer-local Draft deltas carry neither an owner sequence nor a received
+watermark and have `shell.complete=false`. Explicit null sequence/watermark
+fields are not substitutes for omission. Owner deltas also have an incomplete
+shell and retain each omitted validated immutable domain.
+
+A receipt's `received_client_sequence` is the cumulative watermark at emission,
+so it may exceed its exact `receipt.client_sequence` when a heartbeat or scale
+message overtakes owner completion. It cannot regress or fall below that exact
+command. Only the matching pending command/session/correlation is resolved by
+the receipt; a higher watermark is not an unrelated command's outcome.
 
 ## State construction and publication
 

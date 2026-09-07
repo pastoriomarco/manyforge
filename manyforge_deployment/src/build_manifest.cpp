@@ -64,7 +64,7 @@ constexpr std::string_view kExecutablePackageIdentityDomain =
 constexpr std::string_view kBuiltinCatalogApiVersion =
     "manyforge.node_catalog.v2";
 constexpr std::string_view kBuiltinCatalogId = "manyforge_builtin";
-constexpr std::string_view kBuiltinCatalogContentVersion = "1.1.0";
+constexpr std::string_view kBuiltinCatalogContentVersion = "2.0.0";
 constexpr std::string_view kPythonSourcePackageFormat =
     "manyforge.python-source-package.v1";
 constexpr std::string_view kCompositionNamingScheme =

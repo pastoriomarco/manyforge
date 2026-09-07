@@ -126,6 +126,23 @@ TEST(RetainedStopSurveillanceOwnerTest,
 }
 
 TEST(RetainedStopSurveillanceOwnerTest,
+     PositionsWithoutVelocityNeverProveRest) {
+  const auto binding = make_binding();
+  auto channel = std::make_shared<StateChannel>(binding);
+  const auto source = ObservationSource(binding);
+  RetainedStopSurveillanceOwner owner(
+      {RetainedStopSurveillanceSourceInput{binding, channel, {source}, {}}});
+  const std::array positions{0.0, 0.0};
+  ASSERT_TRUE(channel->publish_state(positions, {}, 100, 100).applied());
+  const auto observation = owner.Observe(Query(source, 101));
+  EXPECT_EQ(observation.availability,
+            core::StopSurveillanceSourceAvailabilityDTO::kUnavailable);
+  EXPECT_FALSE(observation.evaluated_evidence.has_value());
+  ASSERT_TRUE(observation.error.has_value());
+  EXPECT_EQ(observation.error->code, "stop_surveillance_velocity_unavailable");
+}
+
+TEST(RetainedStopSurveillanceOwnerTest,
      RejectsUnsealedOrAmbiguousSourceInventoryBeforePublication) {
   const auto binding = make_binding();
   auto channel = std::make_shared<StateChannel>(binding);
@@ -218,8 +235,7 @@ TEST(RetainedStopSurveillanceOwnerTest,
       core::RequestOwnerEpoch("owner.2"), core::CellId("cell.test"), 7U,
       resources, 105);
   ASSERT_FALSE(rejected.ok());
-  EXPECT_EQ(rejected.error().code,
-            "native_current_resource_identity_mismatch");
+  EXPECT_EQ(rejected.error().code, "native_current_resource_identity_mismatch");
 
   channel->refresh_source_on_wait(true);
   const auto reconciled = owner.BuildOrphanResourceReconciliationFacts(
@@ -268,8 +284,7 @@ TEST(RetainedStopSurveillanceOwnerTest,
       core::RequestOwnerEpoch("owner.2"), core::CellId("cell.test"), 7U,
       resources, 105);
   ASSERT_FALSE(rejected.ok());
-  EXPECT_EQ(rejected.error().code,
-            "native_current_resource_identity_mismatch");
+  EXPECT_EQ(rejected.error().code, "native_current_resource_identity_mismatch");
 }
 
 } // namespace

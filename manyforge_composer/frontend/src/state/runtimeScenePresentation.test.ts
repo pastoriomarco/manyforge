@@ -125,7 +125,7 @@ function sourceModel(): SourceModelProjection {
       model_instance_id: 'model-instance-1',
       model_revision: 'model-revision-1',
       coordinates: [
-        { source_joint_name: 'source-joint' },
+        { source_joint_name: 'source-joint', viewer_joint_name: 'joint-1', coordinate_kind: 'angular', unit: 'rad' },
         { source_joint_name: 'joint-1' },
       ],
     }],
@@ -141,6 +141,7 @@ function sourceModel(): SourceModelProjection {
         }],
         model_groups: [{
           commandable_source_joint_names: ['source-joint'],
+          model_instance_id: 'model-instance-1',
         }],
       },
       {
@@ -278,14 +279,14 @@ function baseSource(
 
 function posePayload(kind: 'simulation_entity_pose' | 'detection3d_pose') {
   const common = {
-    api_version: 'manyforge.ros_pose_observation.v1' as const,
+    api_version: 'manyforge.ros_pose_observation.v2' as const,
     kind,
     pose: {
       frame_id: 'cell',
       frame_kind: 'cell_frame' as const,
       orientation_xyzw: [0, 0, 0, 1] as [number, number, number, number],
       position_m: [0.4, 0.2, 0.1] as [number, number, number],
-      source_stamp_s: 12,
+      source_stamp_ns: 12000000000,
     },
   };
   return kind === 'simulation_entity_pose'
@@ -356,19 +357,20 @@ describe('runtime scene presentation', () => {
 
   it('projects and caches compact owner observations once per frame', () => {
     let frame: ExecutionObservationFrame | null = {
-      schemaVersion: 'manyforge.execution_observation_frame.v1',
+      schemaVersion: 'manyforge.execution_observation_frame.v2',
       ownerEpoch: 'owner-1',
       cellId: 'cell-1',
       retainedBundleId: 'bundle-1',
       graphRevision: 'graph-1',
-      controllableComponentId: 'robot-1',
-      commandTargetId: 'arm',
       sourceEpoch: 'native-1',
       sourceSequence: 5,
       receivedAtMonotonicUs: 123,
-      sourceJointNames: ['source-joint'],
-      compiledJointNames: ['joint-1'],
-      positionsRad: [Math.PI / 2],
+      targets: [{
+        controllableComponentId: 'robot-1', commandTargetId: 'arm',
+        sourceEpoch: 'native-1', sourceSequence: 5,
+        sourceJointNames: ['source-joint'], compiledJointNames: ['joint-1'],
+        coordinateKinds: ['angular'], positionsSi: [Math.PI / 2],
+      }],
     };
     const projected = executionObservationRobotPresentation(
       frame, sourceModel(), manifest(), motionDescriptor(), 2_000_000,
@@ -389,23 +391,71 @@ describe('runtime scene presentation', () => {
     const first = reader.readMeasuredRobotPresentation();
     const second = reader.readMeasuredRobotPresentation();
     expect(first).toBe(second);
-    expect(first?.observedAtNs).toBe(123_000);
+    expect(first?.observedAtNs).toBe('123000');
     expect(reads).toBe(2);
 
-    frame = { ...frame, compiledJointNames: ['fixed-tip'] };
+    frame = { ...frame, sourceSequence: 6, receivedAtMonotonicUs: 9_007_199_254_741 };
+    expect(reader.readMeasuredRobotPresentation()?.observedAtNs).toBe('9007199254741000');
+
+    frame = { ...frame, targets: [{ ...frame.targets[0], compiledJointNames: ['fixed-tip'] }] };
     expect(reader.readMeasuredRobotPresentation()).toBeNull();
 
     frame = { ...frame, graphRevision: 'crossed-graph' };
     expect(reader.readMeasuredRobotPresentation()).toBeNull();
   });
 
+  it('moves model-backed gripper master and mimic fingers without an arm update', () => {
+    const model = sourceModel();
+    const geometry = manifest();
+    geometry.links.push(...['finger-left', 'finger-right'].map((name) => ({ ...geometry.links[0], name })));
+    geometry.joints.push(
+      { ...joint('finger-master', 'prismatic', 'tip', 'finger-left', [0, 0, 0]),
+        axis: [0, 1, 0], coordinate_unit: 'm', is_mimic_master: true },
+      { ...joint('finger-mimic', 'prismatic', 'tip', 'finger-right', [0, 0, 0]),
+        axis: [0, 1, 0], coordinate_unit: 'm',
+        mimic: { master: 'finger-master', multiplier: -1, offset: 0 } },
+    );
+    model.occurrences.push({
+      ...model.occurrences[0], model_instance_id: 'gripper-model',
+      coordinates: [{ ...model.occurrences[0].coordinates[0],
+        source_joint_name: 'finger', viewer_joint_name: 'finger-master', coordinate_kind: 'linear', unit: 'm' }],
+    });
+    model.targets[1].model_groups = [{ ...model.targets[0].model_groups[0],
+      model_instance_id: 'gripper-model', commandable_source_joint_names: ['finger'] }];
+    const frame: ExecutionObservationFrame = {
+      schemaVersion: 'manyforge.execution_observation_frame.v2', ownerEpoch: 'owner-1',
+      cellId: 'cell-1', retainedBundleId: 'bundle-1', graphRevision: 'graph-1',
+      sourceEpoch: 'render-1', sourceSequence: 10, receivedAtMonotonicUs: 123,
+      targets: [
+        { controllableComponentId: 'robot-1', commandTargetId: 'arm', sourceEpoch: 'arm-1', sourceSequence: 5,
+          sourceJointNames: ['source-joint'], compiledJointNames: ['joint-1'], coordinateKinds: ['angular'], positionsSi: [0] },
+        { controllableComponentId: 'robot-1', commandTargetId: 'gripper', sourceEpoch: 'gripper-1', sourceSequence: 8,
+          sourceJointNames: ['finger'], compiledJointNames: ['finger-master'], coordinateKinds: ['linear'], positionsSi: [0.025] },
+      ],
+    };
+    const open = executionObservationRobotPresentation(frame, model, geometry, motionDescriptor(), null);
+    expect(open?.linkTransforms['finger-left'].position_m[1]).toBeCloseTo(0.025);
+    expect(open?.linkTransforms['finger-right'].position_m[1]).toBeCloseTo(-0.025);
+    frame.sourceSequence += 1;
+    frame.targets[1] = { ...frame.targets[1], sourceSequence: 9, positionsSi: [0.005] };
+    const closed = executionObservationRobotPresentation(frame, model, geometry, motionDescriptor(), null);
+    expect(closed?.linkTransforms.tip).toEqual(open?.linkTransforms.tip);
+    expect(closed?.linkTransforms['finger-left'].position_m[1]).toBeCloseTo(0.005);
+    expect(closed?.linkTransforms['finger-right'].position_m[1]).toBeCloseTo(-0.005);
+    frame.targets[1].coordinateKinds = ['angular'];
+    expect(executionObservationRobotPresentation(frame, model, geometry, motionDescriptor(), null)).toBeNull();
+    frame.targets[1].coordinateKinds = ['linear'];
+    model.occurrences[1].model_instance_id = 'foreign-model';
+    expect(executionObservationRobotPresentation(frame, model, geometry, motionDescriptor(), null)).toBeNull();
+  });
+
   it('computes retained-model FK and exact measured object/TCP overlays', () => {
     const jointSource = baseSource({
-      api_version: 'manyforge.ros_pose_observation.v1',
+      api_version: 'manyforge.ros_pose_observation.v2',
       joint_names: ['joint-1'],
       kind: 'joint_state',
       positions: [Math.PI / 2],
-      source_stamp_s: 11,
+      source_stamp_ns: 11000000000,
       topic: '/isaac_joint_states',
     });
     const tcp = baseSource(posePayload('simulation_entity_pose'), {
@@ -419,7 +469,7 @@ describe('runtime scene presentation', () => {
       source_sequence: 3,
     });
     const unknown = baseSource({
-      api_version: 'manyforge.ros_pose_observation.v1',
+      api_version: 'manyforge.ros_pose_observation.v2',
       kind: 'detection3d_pose',
       source_error: {
         code: 'detection_not_found',
@@ -525,19 +575,20 @@ describe('runtime scene presentation', () => {
 
     const cellPose = (positionRad: number) => {
       const frame: ExecutionObservationFrame = {
-        schemaVersion: 'manyforge.execution_observation_frame.v1',
+        schemaVersion: 'manyforge.execution_observation_frame.v2',
         ownerEpoch: 'owner-1',
         cellId: 'cell-1',
         retainedBundleId: 'bundle-1',
         graphRevision: 'graph-1',
-        controllableComponentId: 'robot-1',
-        commandTargetId: 'arm',
         sourceEpoch: 'native-1',
         sourceSequence: positionRad === 0 ? 1 : 2,
         receivedAtMonotonicUs: 123,
-        sourceJointNames: ['source-joint'],
-        compiledJointNames: ['joint-1'],
-        positionsRad: [positionRad],
+        targets: [{
+          controllableComponentId: 'robot-1', commandTargetId: 'arm',
+          sourceEpoch: 'native-1', sourceSequence: positionRad === 0 ? 1 : 2,
+          sourceJointNames: ['source-joint'], compiledJointNames: ['joint-1'],
+          coordinateKinds: ['angular'], positionsSi: [positionRad],
+        }],
       };
       const robot = executionObservationRobotPresentation(
         frame, sourceModel(), manifest(), motionDescriptor(), 2_000_000,
@@ -634,11 +685,11 @@ describe('runtime scene presentation', () => {
     });
     const presentation = runtimeScenePresentation(
       runtime([baseSource({
-        api_version: 'manyforge.ros_pose_observation.v1',
+        api_version: 'manyforge.ros_pose_observation.v2',
         joint_names: ['joint-1'],
         kind: 'joint_state',
         positions: [0.5],
-        source_stamp_s: null,
+        source_stamp_ns: null,
         topic: '/isaac_joint_states',
       })]),
       logicalScene(),

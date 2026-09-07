@@ -66,6 +66,7 @@ add_library(manyforge_core
   src/execution_collision_support.cpp
   src/execution_correlation_tracker.cpp
   src/execution_gripper_support.cpp
+  src/gripper_participant_engine.cpp
   src/execution_interrupt_support.cpp
   src/execution_recovery_support.cpp
   src/execution_snapshot_publisher.cpp
@@ -563,10 +564,15 @@ if(BUILD_TESTING)
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   if(MANYFORGE_CORE_BUILD_SQLITE_OPERATION_JOURNAL)
+    target_compile_definitions(test_resource_addressed_execution_kernel PRIVATE
+      MANYFORGE_TEST_SQLITE_OPERATION_JOURNAL=1)
+    target_link_libraries(test_resource_addressed_execution_kernel PRIVATE
+      manyforge_core_sqlite_operation_journal)
     add_executable(test_sqlite_operation_journal
       test/test_sqlite_operation_journal.cpp)
     target_link_libraries(test_sqlite_operation_journal PRIVATE
-      manyforge_core_sqlite_operation_journal GTest::gtest_main)
+      manyforge_core_sqlite_operation_journal manyforge::content_identity
+      SQLite::SQLite3 GTest::gtest_main)
     gtest_discover_tests(test_sqlite_operation_journal
       PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 

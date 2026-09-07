@@ -185,9 +185,9 @@ commands must not be run or cited as current lane evidence.
 
 These files are generated from owning code/models and must not be edited by
 hand. Regenerate one retained surface with
-`scripts/regen-public-contracts.py {structural-rest|headless-rest}`; CI guards
+`scripts/regen-public-contracts.py {structural-rest|headless-rest|mcp}`; CI guards
 freshness with the matching
-`scripts/ci/check-public-contracts-fresh.sh {structural-rest|headless-rest}`
+`scripts/ci/check-public-contracts-fresh.sh {structural-rest|headless-rest|mcp}`
 selector. The historical no-argument aggregate forms are typed unavailable
 rather than silently checking only a reduced projection.
 
@@ -207,14 +207,19 @@ rather than silently checking only a reduced projection.
     freshness profile, exact sequencing, common ingress, authoritative
     lifecycle projection, backpressure, reconnect, and security boundaries.
 
+- [`reference/MCP_RUNTIME_CONTRACT.md`](reference/MCP_RUNTIME_CONTRACT.md)
+
+  - Optional Composer MCP tools mapped to existing owner routes, generated
+    from the adapter registry. External provider sessions require their own
+    qualification; tool availability is not provider-loop evidence.
+
 ### Historical Composer/client interaction references
 
 - [`reference/HISTORICAL_COMPOSER_INTERACTION_REFERENCE.md`](reference/HISTORICAL_COMPOSER_INTERACTION_REFERENCE.md)
   records the exact full-Composer source tree and reimplementation rule.
-- [`reference/MCP_RUNTIME_CONTRACT.md`](reference/MCP_RUNTIME_CONTRACT.md) and
-  [`reference/ASSISTANT_PROVIDER_CONTRACT.md`](reference/ASSISTANT_PROVIDER_CONTRACT.md)
-  are non-operative historical contracts. They are not generated from or
-  exposed by the current shell.
+- [`reference/ASSISTANT_PROVIDER_CONTRACT.md`](reference/ASSISTANT_PROVIDER_CONTRACT.md)
+  is a non-operative historical provider contract, not proof of a currently
+  connected external assistant.
 - [`reference/VIEWER_DATA_PLANE_V1.schema.json`](reference/VIEWER_DATA_PLANE_V1.schema.json)
   and its
   [`fixture`](reference/VIEWER_DATA_PLANE_V1.fixture.json), plus the historical

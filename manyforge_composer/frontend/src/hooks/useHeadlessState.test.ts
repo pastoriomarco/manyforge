@@ -1,5 +1,6 @@
 import { StrictMode, act, createElement } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import localDeltaFixture from '../../../../manyforge_headless_api/tests/fixtures/control-v2-local-delta.json';
 
 import type { ComposerHeadlessState } from '../types/headless';
 import {
@@ -428,6 +429,7 @@ function receiveControlSnapshot(
   socket: ControlTestSocket,
   shell: Record<string, unknown>,
   sessionId = CONTROL_SESSION_ID,
+  receivedClientSequence = '2',
 ): void {
   const cycle = shell.program_cycle as Record<string, unknown>;
   const revision = cycle.execution_control_revision as number;
@@ -438,7 +440,7 @@ function receiveControlSnapshot(
     control_session_id: sessionId,
     server_sequence: serverSequence,
     state_sequence: serverSequence,
-    received_client_sequence: '2',
+    received_client_sequence: receivedClientSequence,
     control: {
       receiver_incarnation: 'headless.receiver.1',
       semantic_owner_epoch: 'runner.epoch.1',
@@ -452,19 +454,20 @@ function receiveControlSnapshot(
 
 function wireObservation(sequence: number): Record<string, unknown> {
   return {
-    schema_version: 'manyforge.execution_observation_frame.v1',
+    schema_version: 'manyforge.execution_observation_frame.v2',
     owner_epoch: 'execution-owner.1',
     cell_id: 'cell-1',
     retained_bundle_id: 'bundle-1',
     graph_revision: 'graph-1',
-    controllable_component_id: 'robot-1',
-    command_target_id: 'arm',
     source_epoch: 'joint-source.1',
     source_sequence: sequence,
     received_at_monotonic_us: 10_000 + sequence,
-    source_joint_names: ['joint1'],
-    compiled_joint_names: ['robot__joint1'],
-    positions_rad: [sequence / 100],
+    targets: [{
+      controllable_component_id: 'robot-1', command_target_id: 'arm',
+      source_epoch: 'arm-source.1', source_sequence: sequence,
+      source_joint_names: ['joint1'], compiled_joint_names: ['robot__joint1'],
+      coordinate_kinds: ['angular'], positions_si: [sequence / 100],
+    }],
   };
 }
 
@@ -477,13 +480,24 @@ describe('HeadlessStateSource delivery scheduling', () => {
   it('strictly parses compact execution observations', () => {
     expect(parseExecutionObservationFrame(wireObservation(2))).toMatchObject({
       sourceSequence: 2,
-      positionsRad: [0.02],
+      targets: [{ positionsSi: [0.02] }],
     });
     const crossed = wireObservation(3);
-    crossed.compiled_joint_names = ['a', 'b'];
+    (crossed.targets as Record<string, unknown>[])[0].compiled_joint_names = ['a', 'b'];
     expect(() => parseExecutionObservationFrame(crossed)).toThrow(
       /joint vectors/,
     );
+  });
+
+  it('uses the same UTF-8 identity byte bounds as the owner and proxy', () => {
+    const frame = wireObservation(2);
+    frame.source_epoch = '界'.repeat(682);
+    expect(parseExecutionObservationFrame(frame).sourceEpoch).toBe(frame.source_epoch);
+    frame.source_epoch = '界'.repeat(683);
+    expect(() => parseExecutionObservationFrame(frame)).toThrow(/source_epoch/);
+    frame.source_epoch = 'source';
+    (frame.targets as Record<string, unknown>[])[0].source_joint_names = ['界'.repeat(683)];
+    expect(() => parseExecutionObservationFrame(frame)).toThrow(/source_joint_names/);
   });
 
   it('coalesces an observation burst without publishing React state lanes', () => {
@@ -674,7 +688,8 @@ describe('HeadlessStateSource delivery scheduling', () => {
     source.dispose();
   });
 
-  it('accepts a Composer-local Draft delta without replacing control state', () => {
+  it.each([null, ...localDeltaFixture.invalid_overlays])(
+    'shares the local Draft-delta contract with Python: %j', (invalidOverlay) => {
     vi.useFakeTimers();
     const animationFrames: FrameRequestCallback[] = [];
     class FakeWebSocket {
@@ -705,25 +720,18 @@ describe('HeadlessStateSource delivery scheduling', () => {
     animationFrames[0]!(16);
     vi.advanceTimersByTime(HEADLESS_SHELL_PUBLICATION_MS);
 
-    const local = {
-      schema_version: 'manyforge.composer_headless_state.v2',
-      complete: false,
-      receiver_epoch: initial.receiver_epoch,
-      snapshot_sequence: 3,
-      draft_identity: { draft_id: 'draft-1', draft_revision: 2 },
-    };
     receiveControl(FakeWebSocket.shell, {
-      schema_version: 'manyforge.execution_control.v2',
-      message_kind: 'delta',
-      control_session_id: CONTROL_SESSION_ID,
+      ...localDeltaFixture.local_delta,
+      ...(invalidOverlay ?? {}),
       server_sequence: nextControlServerSequence(FakeWebSocket.shell),
-      received_client_sequence: '2',
-      event_class: 'cold',
-      control: null,
-      shell: local,
     });
     vi.advanceTimersByTime(HEADLESS_SHELL_PUBLICATION_MS);
 
+    if (invalidOverlay !== null) {
+      expect(source.getShellSnapshot().error).not.toBeNull();
+      source.dispose();
+      return;
+    }
     expect(source.getShellSnapshot().error).toBeNull();
     expect(source.getShellSnapshot().snapshot?.draftIdentity).toEqual({
       draftId: 'draft-1', draftRevision: 2,
@@ -1525,7 +1533,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     replacement.onopen?.();
     synchronizeControl(replacement);
     receiveHeartbeat(replacement, 3, '3');
-    receiveControlSnapshot(replacement, wireState(1));
+    receiveControlSnapshot(replacement, wireState(1), CONTROL_SESSION_ID, '3');
     const transitions = replacement.sent
       .map((value) => JSON.parse(value) as Record<string, unknown>)
       .filter((value) => value.message_kind === 'client_incident');
@@ -1583,7 +1591,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it('correlates one WebSocket command receipt without inventing lifecycle state', async () => {
+  it('correlates a receipt under a newer cumulative watermark without inventing lifecycle state', async () => {
     vi.useFakeTimers();
     class FakeWebSocket {
       static readonly OPEN = 1;
@@ -1628,7 +1636,6 @@ describe('HeadlessStateSource delivery scheduling', () => {
         message_kind: 'delta',
         control_session_id: CONTROL_SESSION_ID,
         server_sequence: nextControlServerSequence(FakeWebSocket.shell),
-        received_client_sequence: command.client_sequence,
         event_class: 'cold',
         control: null,
         shell: {
@@ -1648,7 +1655,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
       message_kind: 'command_receipt',
       control_session_id: CONTROL_SESSION_ID,
       server_sequence: nextControlServerSequence(FakeWebSocket.shell),
-      received_client_sequence: command.client_sequence,
+      received_client_sequence: String(BigInt(command.client_sequence) + 2n),
       emitted_monotonic_ns: '200',
       receipt: {
         schema_version: 'manyforge.execution_command_receipt.v1',
@@ -1810,7 +1817,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     const resetting = wireState(2);
     (resetting.program_cycle as Record<string, unknown>).state = 'resetting';
     (resetting.program_cycle as Record<string, unknown>).reset_phase = 'stopping';
-    receiveControlSnapshot(socket, resetting);
+    receiveControlSnapshot(socket, resetting, CONTROL_SESSION_ID, command.client_sequence);
     vi.advanceTimersByTime(HEADLESS_SHELL_PUBLICATION_MS);
     expect(source.getShellSnapshot().snapshot?.programCycle.state).toBe('resetting');
     expect(settled).toBe(false);

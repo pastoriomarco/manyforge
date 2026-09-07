@@ -1,17 +1,24 @@
-export interface ExecutionObservationFrame {
-  schemaVersion: 'manyforge.execution_observation_frame.v1';
-  ownerEpoch: string;
-  cellId: string;
-  retainedBundleId: string;
-  graphRevision: string;
+export interface ExecutionObservationTarget {
   controllableComponentId: string;
   commandTargetId: string;
   sourceEpoch: string;
   sourceSequence: number;
-  receivedAtMonotonicUs: number;
   sourceJointNames: string[];
   compiledJointNames: string[];
-  positionsRad: number[];
+  coordinateKinds: Array<'angular' | 'linear'>;
+  positionsSi: number[];
+}
+
+export interface ExecutionObservationFrame {
+  schemaVersion: 'manyforge.execution_observation_frame.v2';
+  ownerEpoch: string;
+  cellId: string;
+  retainedBundleId: string;
+  graphRevision: string;
+  sourceEpoch: string;
+  sourceSequence: number;
+  receivedAtMonotonicUs: number;
+  targets: ExecutionObservationTarget[];
 }
 
 export interface ExecutionObservationReader {

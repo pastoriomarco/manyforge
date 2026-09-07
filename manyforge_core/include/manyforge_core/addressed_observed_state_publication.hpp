@@ -42,8 +42,7 @@ class AddressedObservedStatePublication final : public IObservedStateProvider {
       const ControlBindingRevision& control_binding_revision) const override;
   [[nodiscard]] Result<ObservedStatePublicationDTO> publication_at(
       const ControlBindingId& control_binding_id,
-      const ControlBindingRevision& control_binding_revision,
-      std::int64_t now_ns) const override;
+      const ControlBindingRevision& control_binding_revision, std::int64_t now_ns) const override;
 
   /// Rebind only the route/configuration identity of a commanded or predicted
   /// source while retaining its exact physical source and numeric channel.
@@ -53,7 +52,8 @@ class AddressedObservedStatePublication final : public IObservedStateProvider {
   [[nodiscard]] Result<void> rebind_route_context(ObservedStateQueryContextDTO query_context,
                                                   std::int64_t transition_time_ns);
 
-  [[nodiscard]] const ObservedStateQueryContextDTO& query_context() const noexcept;
+  /// NRT value copy. A route replacement never invalidates a caller's context.
+  [[nodiscard]] ObservedStateQueryContextDTO query_context() const;
   [[nodiscard]] std::uint64_t authority_generation() const noexcept {
     return config_.authority_generation;
   }
@@ -63,12 +63,12 @@ class AddressedObservedStatePublication final : public IObservedStateProvider {
   /// Single-writer construction seam for a retained execution adapter. The
   /// addressed owner keeps storage and query authority; callers may only
   /// publish source kinds already sealed into this instance.
-  [[nodiscard]] ObservedRobotStatePublication& numeric_publication_writer()
-      noexcept {
+  [[nodiscard]] ObservedRobotStatePublication& numeric_publication_writer() noexcept {
     return publication_;
   }
 
  private:
+  friend struct AddressedObservedStatePublicationTestAccess;
   [[nodiscard]] ObservedStateSnapshotDTO make_snapshot(
       const ObservedRobotStatePublication::ReadView& view,
       const ObservedStateQueryContextDTO& context) const;
@@ -79,8 +79,8 @@ class AddressedObservedStatePublication final : public IObservedStateProvider {
   AddressedObservedStatePublicationConfig config_;
   ObservedRobotStatePublication publication_;
   mutable std::mutex route_context_mutex_;
-  std::vector<std::unique_ptr<const ObservedStateQueryContextDTO>> retained_route_contexts_;
-  std::atomic<const ObservedStateQueryContextDTO*> current_query_context_;
+  ObservedStateQueryContextDTO current_query_context_;
+  std::uint64_t context_first_sequence_{};
 };
 
 /// Explicit compatibility adapter for the existing all-angular subordinate

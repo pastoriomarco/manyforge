@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -17,7 +18,6 @@ using V = CanonicalValue;
 using A = CanonicalValue::Array;
 
 constexpr std::uint64_t kMaxSafeUnsigned = 9'007'199'254'740'991ULL;
-constexpr std::int64_t kMaxSafeSigned = 9'007'199'254'740'991LL;
 constexpr std::size_t kMaxProjectionBytes = 16U * 1024U * 1024U;
 
 class CodecError final : public std::invalid_argument {
@@ -79,12 +79,11 @@ template <typename T>
 }
 
 [[nodiscard]] std::int64_t i64(const V& value, const std::string_view context) {
-  const auto result = number(value, context);
-  if (result < static_cast<double>(-kMaxSafeSigned) ||
-      result > static_cast<double>(kMaxSafeSigned) || std::trunc(result) != result) {
-    bad(std::string(context) + " is not an I-JSON signed integer");
+  try {
+    return content_identity::parse_nonnegative_int64(value);
+  } catch (const content_identity::CanonicalValueError&) {
+    bad(std::string(context) + " is not an exact nonnegative int64");
   }
-  return static_cast<std::int64_t>(result);
 }
 
 template <typename Tag>
@@ -326,8 +325,9 @@ template <typename T, typename Decode>
 }
 
 [[nodiscard]] V phase_budget_value(const StopAcceptedPhaseBudgetDTO& value) {
-  return arr({enc(value.phase_id), V(static_cast<double>(value.fixed_deadline_offset_ns)),
-              V(static_cast<double>(value.remaining_deadline_offset_ns))});
+  return arr({enc(value.phase_id),
+              content_identity::nonnegative_int64_value(value.fixed_deadline_offset_ns),
+              content_identity::nonnegative_int64_value(value.remaining_deadline_offset_ns)});
 }
 
 [[nodiscard]] StopAcceptedPhaseBudgetDTO phase_budget_from(const V& value) {
@@ -347,16 +347,17 @@ template <typename T, typename Decode>
            [](const auto& row) {
              return arr({enc(row.predecessor_stop_id), enc(row.predecessor_stop_generation),
                          enc(row.captured_scope_digest),
-                         V(static_cast<double>(row.remaining_outer_duration_ns_at_join))});
+                         content_identity::nonnegative_int64_value(
+                             row.remaining_outer_duration_ns_at_join)});
            }),
        vec(value.affected_operation_revisions,
            [](const auto& row) {
              return arr({enc(row.operation_id), enc(row.operation_revision_after_acceptance)});
            }),
-       V(static_cast<double>(value.fixed_outer_duration_ns)),
-       V(static_cast<double>(value.fixed_kernel_completion_reserve_ns)),
-       V(static_cast<double>(value.remaining_outer_duration_ns)),
-       V(static_cast<double>(value.accepted_at_ns)),
+       content_identity::nonnegative_int64_value(value.fixed_outer_duration_ns),
+       content_identity::nonnegative_int64_value(value.fixed_kernel_completion_reserve_ns),
+       content_identity::nonnegative_int64_value(value.remaining_outer_duration_ns),
+       content_identity::nonnegative_int64_value(value.accepted_at_ns),
        vec(value.participant_budget_allocations, [](const auto& row) {
          return arr({enc(row.origin_stop_id), enc(row.origin_stop_generation),
                      enc(row.operation_id), enc(row.participant_id),
@@ -461,16 +462,37 @@ template <typename T, typename Decode>
 }
 
 [[nodiscard]] V operation_state_value(const OperationStateDTO& value) {
-  return arr({enc(value.operation_id), enc(value.operation_revision), enc(value.program_binding_id),
-              enc(value.program_run_id), enc(value.coordination_policy), enc(value.state),
-              vec(value.participants, participant_state_value),
-              V(static_cast<double>(value.updated_at_ns)), opt(value.active_stop_id, id_value),
-              opt(value.active_stop_generation, id_value),
-              opt(value.runtime_scale_generation, id_value)});
+  V::Array fields{enc(value.operation_id),
+                  enc(value.operation_revision),
+                  enc(value.program_binding_id),
+                  enc(value.program_run_id),
+                  enc(value.coordination_policy),
+                  enc(value.state),
+                  vec(value.participants, participant_state_value),
+                  content_identity::nonnegative_int64_value(value.updated_at_ns),
+                  opt(value.active_stop_id, id_value),
+                  opt(value.active_stop_generation, id_value),
+                  opt(value.runtime_scale_generation, id_value)};
+  if (value.journal_capture_order != 0U) {
+    if (value.journal_capture_order > static_cast<std::uint64_t>(INT64_MAX)) {
+      bad("operation journal capture order is out of range");
+    }
+    fields.emplace_back(std::to_string(value.journal_capture_order));
+  }
+  return V(std::move(fields));
 }
 
 [[nodiscard]] OperationStateDTO operation_state_from(const V& value) {
-  const auto& f = exact(value, 11U, "operation state");
+  if (!value.is_array() || (value.as_array().size() != 11U && value.as_array().size() != 12U)) {
+    bad("operation state has an unsupported shape");
+  }
+  const auto& f = value.as_array();
+  std::uint64_t capture_order{};
+  if (f.size() == 12U) {
+    if (!f[11].is_string()) bad("operation journal capture order must be decimal text");
+    capture_order = static_cast<std::uint64_t>(content_identity::parse_nonnegative_int64(f[11]));
+    if (capture_order == 0U) bad("new operation capture order must be positive");
+  }
   return OperationStateDTO{
       did<OperationId>(f[0], "operation ID"),
       did<OperationRevision>(f[1], "operation revision"),
@@ -484,7 +506,8 @@ template <typename T, typename Decode>
       dopt<StopGeneration>(
           f[9], [](const V& v) { return did<StopGeneration>(v, "active Stop generation"); }),
       dopt<RuntimeScaleGeneration>(
-          f[10], [](const V& v) { return did<RuntimeScaleGeneration>(v, "scale generation"); })};
+          f[10], [](const V& v) { return did<RuntimeScaleGeneration>(v, "scale generation"); }),
+      capture_order};
 }
 
 [[nodiscard]] V affected_value(const EmergencyStopAffectedStateSnapshotDTO& value) {
@@ -634,7 +657,7 @@ template <typename T, typename Decode>
 
 [[nodiscard]] V evidence_source_requirement_value(const StopEvidenceSourceRequirementDTO& v) {
   return arr(
-      {enc(v.source_kind), V(static_cast<double>(v.freshness_budget_ns)),
+      {enc(v.source_kind), content_identity::nonnegative_int64_value(v.freshness_budget_ns),
        opt(v.endpoint_role_id, id_value),
        vec(v.allowed_authority_classes, [](const StateAuthorityClass item) { return enc(item); })});
 }
@@ -656,8 +679,9 @@ template <typename T, typename Decode>
               opt(v.registered_evidence_kind_id, id_value),
               evidence_source_requirement_value(v.source_requirement),
               arr({enc(v.observation_semantics.observation_kind),
-                   opt(v.observation_semantics.minimum_dwell_ns,
-                       [](const std::int64_t item) { return V(static_cast<double>(item)); })})});
+                   opt(v.observation_semantics.minimum_dwell_ns, [](const std::int64_t item) {
+                     return content_identity::nonnegative_int64_value(item);
+                   })})});
 }
 
 [[nodiscard]] StopEvidenceRequirementDTO evidence_requirement_from(const V& v) {
@@ -804,10 +828,11 @@ template <typename T, typename Decode>
 }
 
 [[nodiscard]] V deadline_budget_value(const StopDeadlineBudgetDTO& v) {
-  return arr({V(static_cast<double>(v.outer_duration_ns)),
-              V(static_cast<double>(v.kernel_completion_reserve_ns)),
+  return arr({content_identity::nonnegative_int64_value(v.outer_duration_ns),
+              content_identity::nonnegative_int64_value(v.kernel_completion_reserve_ns),
               vec(v.phases, [](const StopBudgetPhaseDTO& phase) {
-                return arr({enc(phase.phase_id), V(static_cast<double>(phase.deadline_offset_ns))});
+                return arr({enc(phase.phase_id),
+                            content_identity::nonnegative_int64_value(phase.deadline_offset_ns)});
               })});
 }
 
@@ -1105,13 +1130,14 @@ template <typename T, typename Decode>
 }
 
 [[nodiscard]] V evidence_item_value(const StopEvidenceItemDTO& v) {
-  return arr({enc(v.evidence_item_id), enc(v.required_class), enc(v.state),
-              resolved_evidence_source_value(v.resolved_source), opt(v.source_epoch, id_value),
-              opt(v.source_sequence,
-                  [](const std::uint64_t item) { return V(static_cast<double>(item)); }),
-              opt(v.source_age_at_evaluation_ns,
-                  [](const std::int64_t item) { return V(static_cast<double>(item)); }),
-              opt(v.evidence, json_value), opt(v.error, error_value)});
+  return arr(
+      {enc(v.evidence_item_id), enc(v.required_class), enc(v.state),
+       resolved_evidence_source_value(v.resolved_source), opt(v.source_epoch, id_value),
+       opt(v.source_sequence,
+           [](const std::uint64_t item) { return V(static_cast<double>(item)); }),
+       opt(v.source_age_at_evaluation_ns,
+           [](const std::int64_t item) { return content_identity::nonnegative_int64_value(item); }),
+       opt(v.evidence, json_value), opt(v.error, error_value)});
 }
 
 [[nodiscard]] StopEvidenceItemDTO evidence_item_from(const V& v) {
@@ -1139,7 +1165,7 @@ template <typename T, typename Decode>
        opt(v.source_epoch, id_value),
        opt(v.source_sequence,
            [](const std::uint64_t item) { return V(static_cast<double>(item)); }),
-       V(static_cast<double>(v.receiver_elapsed_duration_ns)),
+       content_identity::nonnegative_int64_value(v.receiver_elapsed_duration_ns),
        vec(v.evidence_items, evidence_item_value), opt(v.error, error_value)});
 }
 
@@ -1360,8 +1386,8 @@ template <typename T, typename Decode>
               enc(v.dispatch_state), opt(v.stop_evidence_policy_id, id_value),
               opt(v.stop_evidence_policy_revision, id_value),
               opt(v.participant_stop_invocation_plan_digest, id_value),
-              V(static_cast<double>(v.accepted_at_ns)),
-              V(static_cast<double>(v.remaining_outer_duration_ns)),
+              content_identity::nonnegative_int64_value(v.accepted_at_ns),
+              content_identity::nonnegative_int64_value(v.remaining_outer_duration_ns),
               vec(v.phases, phase_budget_value)});
 }
 
@@ -1386,7 +1412,7 @@ template <typename T, typename Decode>
 
 [[nodiscard]] V attempted_result_value(const StopAttemptedStageResultDTO& v) {
   return arr({scope_key_value(v.scope_key), V(static_cast<double>(v.result_sequence)),
-              V(static_cast<double>(v.completed_at_ns)), enc(v.authority),
+              content_identity::nonnegative_int64_value(v.completed_at_ns), enc(v.authority),
               stage_result_value(v.result)});
 }
 
@@ -1431,7 +1457,8 @@ template <typename T, typename Decode>
                   [](const StopPredecessorAcceptanceRefDTO& row) {
                     return arr({enc(row.predecessor_stop_id), enc(row.predecessor_stop_generation),
                                 enc(row.captured_scope_digest),
-                                V(static_cast<double>(row.remaining_outer_duration_ns_at_join))});
+                                content_identity::nonnegative_int64_value(
+                                    row.remaining_outer_duration_ns_at_join)});
                   }),
               vec(v.newly_fenced_operation_revisions,
                   [](const StopAffectedOperationRevisionDTO& row) {
@@ -1524,7 +1551,7 @@ template <typename T, typename Decode>
               opt(v.interrupt_correlation, interrupt_correlation_value),
               opt(v.fault_latch_id, id_value),
               opt(v.fault_latch_generation, id_value),
-              V(static_cast<double>(v.completed_at_ns)),
+              content_identity::nonnegative_int64_value(v.completed_at_ns),
               opt(v.terminal_error, error_value)});
 }
 
@@ -1566,10 +1593,10 @@ template <typename T, typename Decode>
 
 [[nodiscard]] V remaining_budget_value(const RemainingStopBudgetDTO& v) {
   return arr({enc(v.stop_id), enc(v.stop_generation),
-              V(static_cast<double>(v.remaining_outer_duration_ns)),
+              content_identity::nonnegative_int64_value(v.remaining_outer_duration_ns),
               vec(v.phases, [](const RemainingStopPhaseBudgetDTO& phase) {
-                return arr({enc(phase.phase_id),
-                            V(static_cast<double>(phase.remaining_deadline_offset_ns))});
+                return arr({enc(phase.phase_id), content_identity::nonnegative_int64_value(
+                                                     phase.remaining_deadline_offset_ns)});
               })});
 }
 
@@ -1725,7 +1752,8 @@ template <typename T, typename Decode>
        opt(v.source_epoch, id_value),
        opt(v.source_sequence,
            [](const std::uint64_t item) { return V(static_cast<double>(item)); }),
-       opt(v.source_age_ns, [](const std::int64_t item) { return V(static_cast<double>(item)); }),
+       opt(v.source_age_ns,
+           [](const std::int64_t item) { return content_identity::nonnegative_int64_value(item); }),
        opt(v.error, error_value)});
 }
 
@@ -1744,23 +1772,24 @@ template <typename T, typename Decode>
 }
 
 [[nodiscard]] V surveillance_value(const StopPostTerminalSurveillanceDTO& v) {
-  return arr({enc(v.stop_id), enc(v.stop_generation), certificate_ref_value(v.stop_certificate),
-              enc(v.latch_id), enc(v.latch_generation), enc(v.owner_epoch),
-              V(static_cast<double>(v.surveillance_generation)), vec(v.resources, id_value),
-              vec(v.source_statuses, surveillance_source_value),
-              arr({V(static_cast<double>(v.policy.sample_cadence_ns)),
-                   V(static_cast<double>(v.policy.checkpoint_interval_ns)),
-                   V(static_cast<double>(v.policy.retained_checkpoint_limit))}),
-              V(static_cast<double>(v.continued_motion_count)),
-              opt(v.first_continued_motion_at_ns,
-                  [](const std::int64_t item) { return V(static_cast<double>(item)); }),
-              opt(v.last_continued_motion_at_ns,
-                  [](const std::int64_t item) { return V(static_cast<double>(item)); }),
-              opt(v.late_quiescence_evidence_digest, id_value),
-              opt(v.late_quiescence_observed_at_ns,
-                  [](const std::int64_t item) { return V(static_cast<double>(item)); }),
-              enc(v.state), V(static_cast<double>(v.checkpoint_generation)),
-              projection_status_value(v.checkpoint_projection)});
+  return arr(
+      {enc(v.stop_id), enc(v.stop_generation), certificate_ref_value(v.stop_certificate),
+       enc(v.latch_id), enc(v.latch_generation), enc(v.owner_epoch),
+       V(static_cast<double>(v.surveillance_generation)), vec(v.resources, id_value),
+       vec(v.source_statuses, surveillance_source_value),
+       arr({content_identity::nonnegative_int64_value(v.policy.sample_cadence_ns),
+            content_identity::nonnegative_int64_value(v.policy.checkpoint_interval_ns),
+            V(static_cast<double>(v.policy.retained_checkpoint_limit))}),
+       V(static_cast<double>(v.continued_motion_count)),
+       opt(v.first_continued_motion_at_ns,
+           [](const std::int64_t item) { return content_identity::nonnegative_int64_value(item); }),
+       opt(v.last_continued_motion_at_ns,
+           [](const std::int64_t item) { return content_identity::nonnegative_int64_value(item); }),
+       opt(v.late_quiescence_evidence_digest, id_value),
+       opt(v.late_quiescence_observed_at_ns,
+           [](const std::int64_t item) { return content_identity::nonnegative_int64_value(item); }),
+       enc(v.state), V(static_cast<double>(v.checkpoint_generation)),
+       projection_status_value(v.checkpoint_projection)});
 }
 
 [[nodiscard]] StopPostTerminalSurveillanceDTO surveillance_from(const V& v) {
@@ -1827,16 +1856,26 @@ template <typename T, typename Decode>
 }
 
 [[nodiscard]] V acceptance_root(const StopJournalAcceptanceProjectionDTO& value) {
-  return arr({V(std::string(kStopJournalAcceptanceProjectionApiVersion)),
+  const bool ordered =
+      std::any_of(value.affected_state.operations.begin(), value.affected_state.operations.end(),
+                  [](const auto& row) { return row.journal_capture_order != 0U; });
+  return arr({V(ordered ? "manyforge.internal.stop-journal-acceptance-projection.v2"
+                        : "manyforge.internal.stop-journal-acceptance-projection.v1"),
               accepted_value(value.accepted), affected_value(value.affected_state)});
 }
 
 [[nodiscard]] StopJournalAcceptanceProjectionDTO acceptance_root_from(const V& value) {
   const auto& f = exact(value, 3U, "Stop journal acceptance projection");
-  if (str(f[0], "acceptance API version") != kStopJournalAcceptanceProjectionApiVersion) {
+  const auto version = str(f[0], "acceptance API version");
+  if (version != "manyforge.internal.stop-journal-acceptance-projection.v1" &&
+      version != "manyforge.internal.stop-journal-acceptance-projection.v2") {
     bad("Stop journal acceptance projection API version is unsupported");
   }
-  return StopJournalAcceptanceProjectionDTO{accepted_from(f[1]), affected_from(f[2])};
+  auto result = StopJournalAcceptanceProjectionDTO{accepted_from(f[1]), affected_from(f[2])};
+  if (acceptance_root(result).as_array().front().as_string() != version) {
+    bad("Stop acceptance version does not match its capture shape");
+  }
+  return result;
 }
 
 [[nodiscard]] V terminal_root(const StopJournalTerminalProjectionDTO& value) {

@@ -278,6 +278,7 @@ struct AlarmDurationSummary final {
   std::optional<std::uint64_t> p50_ns;
   std::optional<std::uint64_t> p95_ns;
   std::optional<std::uint64_t> p99_ns;
+  bool sum_saturated{};
 };
 
 struct AlarmChatteringCandidate final {

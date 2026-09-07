@@ -61,15 +61,6 @@ std::uint64_t Counter(const Value &v, std::string_view name,
           "cell-admission counter is out of range");
   return static_cast<std::uint64_t>(n);
 }
-std::int64_t SignedCounter(const Value &v, std::string_view name) {
-  const auto &x = Member(v, name);
-  Require(x.is_number(), "cell-admission integer has the wrong type");
-  const auto n = x.as_number();
-  Require(std::isfinite(n) && std::floor(n) == n &&
-              std::abs(n) <= kMaximumSafeInteger,
-          "cell-admission integer is out of range");
-  return static_cast<std::int64_t>(n);
-}
 const Value::Array &Array(const Value &v, std::string_view name) {
   const auto &x = Member(v, name);
   Require(x.is_array(), "cell-admission collection has the wrong type");
@@ -213,7 +204,7 @@ core::CellAdmissionClaimDTO Claim(const Value &v) {
       core::CellAdmissionClaimGeneration(Counter(v, "claim_generation", 1U)),
       core::AdmissionGeneration(
           Counter(v, "acquired_admission_generation", 1U)),
-      SignedCounter(v, "accepted_at_ns")};
+      ci::parse_nonnegative_int64(Member(v, "accepted_at_ns"))};
   return result;
 }
 core::CellAdmissionClaimReleaseDTO Release(const Value &v) {
@@ -377,7 +368,7 @@ Value IntentValue(const core::CellAdmissionClaimIntentDTO &v) {
 }
 Value ClaimValue(const core::CellAdmissionClaimDTO &v) {
   return Value(Value::Object{
-      {"accepted_at_ns", Value(static_cast<double>(v.accepted_at_ns))},
+      {"accepted_at_ns", ci::nonnegative_int64_value(v.accepted_at_ns)},
       {"acquired_admission_generation",
        Value(static_cast<double>(v.acquired_admission_generation.value()))},
       {"claim_generation",

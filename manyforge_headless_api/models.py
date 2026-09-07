@@ -5,7 +5,22 @@ from __future__ import annotations
 import unicodedata
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    WithJsonSchema,
+    field_validator,
+    field_serializer,
+    model_validator,
+)
+
+from manyforge_behavior.json_scalars import (
+    MAXIMUM_INT64,
+    MAXIMUM_SAFE_INTEGER,
+    nonnegative_int64,
+    nonnegative_int64_value,
+)
 
 
 MAX_IDENTITY_BYTES = 256
@@ -17,6 +32,7 @@ MAX_PROGRAM_RUN_REASON_BYTES = 4096
 MAX_STOP_IDENTITY_BYTES = 128
 MAX_STOP_REASON_BYTES = 1024
 MAX_STOP_SELECTOR_TARGETS = 4096
+MAX_OPERATION_PARTICIPANTS = 4096
 SHA256_PATTERN = r"^sha256:[0-9a-f]{64}$"
 
 
@@ -32,6 +48,49 @@ class StrictRequest(BaseModel):
     """Forbid coercion and caller-invented fields at public mutation ingress."""
 
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+
+class TargetObservationQuery(StrictRequest):
+    """One exact, effect-free read of a captured Program target."""
+
+    schema_version: Literal["manyforge.target_observation_query.v1"]
+    owner_epoch: str
+    program_binding_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    target_role_id: str
+    kind: Literal["frame_pose", "gripper_status"]
+    frame_role_id: str | None = None
+
+    @field_validator("owner_epoch", "target_role_id", "frame_role_id")
+    @classmethod
+    def validate_identity(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _bounded_nfc(
+            value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES
+        )
+
+    @model_validator(mode="after")
+    def exact_query(self) -> "TargetObservationQuery":
+        if (self.kind == "frame_pose") != (self.frame_role_id is not None):
+            raise ValueError("only a frame-pose query names a frame role")
+        return self
+
+
+class ProgramOperationQuery(StrictRequest):
+    """Select one resident operation from exact backend-owned Program scope."""
+
+    schema_version: Literal["manyforge.program_operation_query.v1"]
+    owner_epoch: str
+    program_binding_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    program_run_id: str
+    target_role_id: str
+
+    @field_validator("owner_epoch", "program_run_id", "target_role_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(
+            value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES
+        )
 
 
 class CallerAttributionRequest(StrictRequest):
@@ -103,9 +162,7 @@ class ExecutionControlAttributionRequest(CallerAttributionRequest):
 class AuthoringMutationContext(CallerAttributionRequest):
     """Exact owner-issued context carried by one authoring transaction."""
 
-    expected_admission_generation: Annotated[
-        int, Field(ge=1, le=9_007_199_254_740_991)
-    ]
+    expected_admission_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
     request_payload_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
     owner_transaction_id: str
 
@@ -230,18 +287,14 @@ class ExpectedCurrentRequest(StrictRequest):
 
 
 class ManagerDeploymentCandidateReceipt(StrictRequest):
-    schema_version: Literal[
-        "manyforge.manager_deployment_candidate_receipt.v1"
-    ]
+    schema_version: Literal["manyforge.manager_deployment_candidate_receipt.v1"]
     deployment_artifact_id: str
     deployment_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
     scenario_catalog_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
     candidate_retained_bundle_id: str
     candidate_graph_revision: str
     expected_current: ExpectedCurrentRequest
-    expected_admission_generation: Annotated[
-        int, Field(ge=1, le=9_007_199_254_740_991)
-    ]
+    expected_admission_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
     manager_owner_epoch: str
     receipt_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
 
@@ -264,9 +317,7 @@ class ManagerDeploymentCandidatePreviewRequest(StrictRequest):
     deployment_artifact_id: str
     deployment_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
     expected_current: ExpectedCurrentRequest
-    expected_admission_generation: Annotated[
-        int, Field(ge=1, le=9_007_199_254_740_991)
-    ]
+    expected_admission_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
     request_owner_epoch: str
 
     @field_validator("deployment_artifact_id", "request_owner_epoch")
@@ -284,9 +335,7 @@ class DeploymentCandidateCompilationRequest(StrictRequest):
         str,
         Field(min_length=1, max_length=128, pattern=r"^[a-z][a-z0-9_.-]*$"),
     ]
-    expected_scenario_catalog_revision: Annotated[
-        str, Field(pattern=SHA256_PATTERN)
-    ]
+    expected_scenario_catalog_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
     deployment: dict[str, Any]
     program: dict[str, Any]
     authoring_claim: dict[str, Any]
@@ -331,15 +380,12 @@ class ManagerApplyRequest(CallerAttributionRequest):
             )
         expected_generation = self.expected_admission_generation
         if expected_generation is not None and (
-            self.candidate_receipt.expected_admission_generation
-            != expected_generation
+            self.candidate_receipt.expected_admission_generation != expected_generation
         ):
             raise ValueError("candidate receipt admission generation differs")
         if (
-            self.candidate_receipt.deployment_artifact_id
-            != self.deployment_artifact_id
-            or self.candidate_receipt.deployment_revision
-            != self.deployment_revision
+            self.candidate_receipt.deployment_artifact_id != self.deployment_artifact_id
+            or self.candidate_receipt.deployment_revision != self.deployment_revision
             or self.candidate_receipt.expected_current != self.expected_current
         ):
             raise ValueError("candidate receipt does not match Apply selection")
@@ -379,9 +425,7 @@ class ProgramRunStartRequest(ExecutionControlAttributionRequest):
         Field(pattern=SHA256_PATTERN),
     ]
     draft_program_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
-    expected_admission_generation: Annotated[
-        int, Field(ge=1, le=9_007_199_254_740_991)
-    ]
+    expected_admission_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
 
 
 class ProgramScenePreparationRequest(CallerAttributionRequest):
@@ -391,9 +435,7 @@ class ProgramScenePreparationRequest(CallerAttributionRequest):
         str,
         Field(pattern=SHA256_PATTERN),
     ]
-    expected_admission_generation: Annotated[
-        int, Field(ge=1, le=9_007_199_254_740_991)
-    ]
+    expected_admission_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
 
 
 class ProgramRunStopRequest(ExecutionControlAttributionRequest):
@@ -427,16 +469,14 @@ class ProgramRunStopRequest(ExecutionControlAttributionRequest):
 class ProgramCycleResetRequest(ExecutionControlAttributionRequest):
     program_run_id: str
     expected_owner_epoch: str
-    expected_cycle_generation: Annotated[
-        int, Field(ge=1, le=9_007_199_254_740_991)
-    ]
-    expected_claim_generation: Annotated[
-        int, Field(ge=1, le=9_007_199_254_740_991)
-    ] | None = None
+    expected_cycle_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
+    expected_claim_generation: (
+        Annotated[int, Field(ge=1, le=9_007_199_254_740_991)] | None
+    ) = None
     terminal_reference: Annotated[str, Field(pattern=SHA256_PATTERN)] | None = None
-    settlement_evidence_digest: Annotated[
-        str, Field(pattern=SHA256_PATTERN)
-    ] | None = None
+    settlement_evidence_digest: Annotated[str, Field(pattern=SHA256_PATTERN)] | None = (
+        None
+    )
 
     @field_validator("program_run_id", "expected_owner_epoch")
     @classmethod
@@ -451,9 +491,7 @@ class ProgramRunControlRequest(ExecutionControlAttributionRequest):
 
     program_run_id: str
     expected_owner_epoch: str
-    expected_run_revision: Annotated[
-        int, Field(ge=1, le=9_007_199_254_740_991)
-    ]
+    expected_run_revision: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
 
     @field_validator("program_run_id", "expected_owner_epoch")
     @classmethod
@@ -483,12 +521,8 @@ class ProgramFullStopResumeRequest(ProgramRunControlRequest):
 class ProgramFullStopResetRequest(ProgramFullStopResumeRequest):
     """Discard one exact Full-stopped tree and reset its Program cycle."""
 
-    expected_cycle_generation: Annotated[
-        int, Field(ge=1, le=9_007_199_254_740_991)
-    ]
-    expected_claim_generation: Annotated[
-        int, Field(ge=1, le=9_007_199_254_740_991)
-    ]
+    expected_cycle_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
+    expected_claim_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
 
 
 class RuntimeOverrideStageRequest(ProgramRunControlRequest):
@@ -497,9 +531,9 @@ class RuntimeOverrideStageRequest(ProgramRunControlRequest):
     parameter_id: str
     value: Any
     source_observation_id: str | None = None
-    source_owner_generation: Annotated[
-        int, Field(ge=1, le=9_007_199_254_740_991)
-    ] | None = None
+    source_owner_generation: (
+        Annotated[int, Field(ge=1, le=9_007_199_254_740_991)] | None
+    ) = None
 
     @field_validator(
         "node_instance_id",
@@ -528,16 +562,12 @@ class RuntimeOverrideStageRequest(ProgramRunControlRequest):
 
 class RuntimeOverrideActionRequest(ProgramRunControlRequest):
     override_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
-    expected_override_revision: Annotated[
-        int, Field(ge=1, le=9_007_199_254_740_991)
-    ]
+    expected_override_revision: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
 
 
 class RuntimeOverridePromotionRequest(RuntimeOverrideActionRequest):
     expected_draft_id: str
-    expected_draft_revision: Annotated[
-        int, Field(ge=1, le=9_007_199_254_740_991)
-    ]
+    expected_draft_revision: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
 
     @field_validator("expected_draft_id")
     @classmethod
@@ -554,9 +584,7 @@ class RuntimeBlackboardWriteRequest(ProgramRunControlRequest):
     @field_validator("key")
     @classmethod
     def validate_key(cls, value: str) -> str:
-        return _bounded_nfc(
-            value, label="key", maximum_bytes=MAX_IDENTITY_BYTES
-        )
+        return _bounded_nfc(value, label="key", maximum_bytes=MAX_IDENTITY_BYTES)
 
 
 class ManualResultStageRequest(ProgramRunControlRequest):
@@ -601,9 +629,7 @@ class CycleRecoveryActionRequest(ExecutionControlAttributionRequest):
     def validate_recovery_reason(cls, value: str | None) -> str | None:
         if value is None:
             return None
-        return _bounded_nfc(
-            value, label="reason", maximum_bytes=MAX_STOP_REASON_BYTES
-        )
+        return _bounded_nfc(value, label="reason", maximum_bytes=MAX_STOP_REASON_BYTES)
 
 
 class ProgramModelAuditPolicy(StrictRequest):
@@ -663,7 +689,24 @@ class ProgramModelAttemptRequest(StrictRequest):
         Field(pattern=SHA256_PATTERN),
     ]
     model_version: str
-    occurred_at_ns: Annotated[int, Field(ge=0, le=9_007_199_254_740_991)]
+    occurred_at_ns: Annotated[
+        int,
+        Field(ge=0, le=MAXIMUM_INT64),
+        WithJsonSchema(
+            {
+                "anyOf": [
+                    {"type": "integer", "minimum": 0, "maximum": MAXIMUM_SAFE_INTEGER},
+                    {
+                        "type": "string",
+                        "pattern": r"^(0|[1-9][0-9]{0,18})$",
+                        "maxLength": 19,
+                        "format": "nonnegative-int64-decimal",
+                        "description": "Canonical decimal int64 in [0, 9223372036854775807].",
+                    },
+                ],
+            }
+        ),
+    ]
     occurred_at_wall: str
     latency_ms: Annotated[
         float,
@@ -671,6 +714,15 @@ class ProgramModelAttemptRequest(StrictRequest):
     ]
     usage: dict[str, Any] | None
     response_value: Any | None
+
+    @field_validator("occurred_at_ns", mode="before")
+    @classmethod
+    def exact_occurrence_time(cls, value: Any) -> int:
+        return nonnegative_int64(value)
+
+    @field_serializer("occurred_at_ns")
+    def encode_occurrence_time(self, value: int) -> int | str:
+        return nonnegative_int64_value(value)
 
     @field_validator(
         "model_attempt_id",
@@ -702,7 +754,9 @@ class ProgramModelAttemptRequest(StrictRequest):
             maximum_bytes=MAX_IDENTITY_BYTES,
         )
 
-    @field_validator("prompt_text", "error_message", "model_version", "occurred_at_wall")
+    @field_validator(
+        "prompt_text", "error_message", "model_version", "occurred_at_wall"
+    )
     @classmethod
     def validate_model_attempt_text(cls, value: str | None, info) -> str | None:
         if value is None:
@@ -770,9 +824,7 @@ class SceneResourcePoseQuery(StrictRequest):
             for value in values
         ]
         if normalized != sorted(set(normalized)):
-            raise ValueError(
-                "scene_resource_ids must be strictly sorted and unique"
-            )
+            raise ValueError("scene_resource_ids must be strictly sorted and unique")
         return normalized
 
 
@@ -864,9 +916,7 @@ class ComponentSceneFrameRequest(StrictRequest):
     model_instance_id: str
     frame_role_id: str
 
-    @field_validator(
-        "controllable_component_id", "model_instance_id", "frame_role_id"
-    )
+    @field_validator("controllable_component_id", "model_instance_id", "frame_role_id")
     @classmethod
     def validate_frame_identity(cls, value: str, info) -> str:
         return _bounded_nfc(
@@ -892,9 +942,7 @@ class PassiveModelSceneFrameRequest(StrictRequest):
 
 
 SceneFrameRequest = Annotated[
-    CellSceneFrameRequest
-    | ComponentSceneFrameRequest
-    | PassiveModelSceneFrameRequest,
+    CellSceneFrameRequest | ComponentSceneFrameRequest | PassiveModelSceneFrameRequest,
     Field(discriminator="kind"),
 ]
 
@@ -965,25 +1013,17 @@ class SceneSupportContactRequest(StrictRequest):
     """Portable object-to-object support intent, never a native body pair."""
 
     support_object_id: str
-    mode: Literal[
-        "contact_release", "bounded_penetration", "contact_process"
-    ] = "contact_release"
-    release_evidence_mode: Literal[
-        "signed_penetration", "binary_contact"
-    ] = "signed_penetration"
+    mode: Literal["contact_release", "bounded_penetration", "contact_process"] = (
+        "contact_release"
+    )
+    release_evidence_mode: Literal["signed_penetration", "binary_contact"] = (
+        "signed_penetration"
+    )
     enforce_max_start_penetration: bool = True
-    max_start_penetration_m: Annotated[
-        float, Field(ge=0, allow_inf_nan=False)
-    ] = 0.0
-    release_tolerance_m: Annotated[
-        float, Field(ge=0, allow_inf_nan=False)
-    ] = 1e-5
-    min_release_progress_m: Annotated[
-        float, Field(ge=0, allow_inf_nan=False)
-    ] = 0.0
-    max_contact_penetration_m: Annotated[
-        float, Field(ge=0, allow_inf_nan=False)
-    ] = 0.0
+    max_start_penetration_m: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 0.0
+    release_tolerance_m: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 1e-5
+    min_release_progress_m: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 0.0
+    max_contact_penetration_m: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 0.0
     require_separation_by_end: bool = True
     require_strictly_decreasing_penetration: bool = True
     allow_recontact: bool = False
@@ -1002,20 +1042,17 @@ class SceneSupportContactRequest(StrictRequest):
             normalized.setdefault("release_tolerance_m", 0.0)
             normalized.setdefault("min_release_progress_m", 0.0)
             normalized.setdefault("require_separation_by_end", False)
-            normalized.setdefault(
-                "require_strictly_decreasing_penetration", False
-            )
+            normalized.setdefault("require_strictly_decreasing_penetration", False)
             normalized.setdefault("allow_recontact", False)
-        elif normalized.get(
-            "release_evidence_mode", "signed_penetration"
-        ) == "binary_contact":
+        elif (
+            normalized.get("release_evidence_mode", "signed_penetration")
+            == "binary_contact"
+        ):
             normalized.setdefault("enforce_max_start_penetration", False)
             normalized.setdefault("max_start_penetration_m", 0.0)
             normalized.setdefault("release_tolerance_m", 0.0)
             normalized.setdefault("min_release_progress_m", 0.0)
-            normalized.setdefault(
-                "require_strictly_decreasing_penetration", False
-            )
+            normalized.setdefault("require_strictly_decreasing_penetration", False)
         return normalized
 
     @field_validator("support_object_id")
@@ -1032,8 +1069,7 @@ class SceneSupportContactRequest(StrictRequest):
         if self.mode == "contact_release":
             if self.max_contact_penetration_m != 0.0:
                 raise ValueError(
-                    "max_contact_penetration_m is valid only for "
-                    "bounded_penetration"
+                    "max_contact_penetration_m is valid only for " "bounded_penetration"
                 )
             if self.release_evidence_mode == "binary_contact" and (
                 self.enforce_max_start_penetration
@@ -1050,8 +1086,7 @@ class SceneSupportContactRequest(StrictRequest):
 
         if self.release_evidence_mode != "signed_penetration":
             raise ValueError(
-                "release_evidence_mode is not applicable outside "
-                "contact_release"
+                "release_evidence_mode is not applicable outside " "contact_release"
             )
         if (
             self.enforce_max_start_penetration
@@ -1065,13 +1100,9 @@ class SceneSupportContactRequest(StrictRequest):
             raise ValueError(
                 "release-only fields must be neutral outside contact_release"
             )
-        if (
-            self.mode == "contact_process"
-            and self.max_contact_penetration_m != 0.0
-        ):
+        if self.mode == "contact_process" and self.max_contact_penetration_m != 0.0:
             raise ValueError(
-                "max_contact_penetration_m is valid only for "
-                "bounded_penetration"
+                "max_contact_penetration_m is valid only for " "bounded_penetration"
             )
         return self
 
@@ -1122,9 +1153,7 @@ class CollisionPolicyRequest(StrictRequest):
     support_contacts: Annotated[
         list[SupportContactPolicyRequest], Field(max_length=4096)
     ]
-    contact_grasps: Annotated[
-        list[ContactGraspPolicyRequest], Field(max_length=4096)
-    ]
+    contact_grasps: Annotated[list[ContactGraspPolicyRequest], Field(max_length=4096)]
     require_full_diagnostics: bool
 
     @field_validator("policy_id")
@@ -1262,9 +1291,7 @@ class AttachCarriedObjectRequest(StrictRequest):
             maximum_bytes=MAX_IDENTITY_BYTES,
         )
 
-    @field_validator(
-        "touch_body_roles", "expected_component_attachment_revisions"
-    )
+    @field_validator("touch_body_roles", "expected_component_attachment_revisions")
     @classmethod
     def validate_sorted_identities(cls, values: list[str], info) -> list[str]:
         normalized = [
@@ -1352,12 +1379,8 @@ class ProgramResetSceneAuthorizationRequest(StrictRequest):
 
     program_runner_owner_epoch: str
     program_run_id: str
-    cycle_claim_generation: Annotated[
-        int, Field(ge=1, le=9_007_199_254_740_991)
-    ]
-    terminal_or_settlement_reference: Annotated[
-        str, Field(pattern=SHA256_PATTERN)
-    ]
+    cycle_claim_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
+    terminal_or_settlement_reference: Annotated[str, Field(pattern=SHA256_PATTERN)]
 
     @field_validator("program_runner_owner_epoch", "program_run_id")
     @classmethod
@@ -1376,9 +1399,9 @@ class SceneTransactionRequest(StrictRequest):
     expected_admission_generation: Annotated[
         int | None, Field(ge=1, le=9_007_199_254_740_991)
     ] = None
-    program_reset_scene_authorization: (
-        ProgramResetSceneAuthorizationRequest | None
-    ) = None
+    program_reset_scene_authorization: ProgramResetSceneAuthorizationRequest | None = (
+        None
+    )
 
 
 class ActionSpanRequest(StrictRequest):
@@ -1429,12 +1452,8 @@ class MotionTolerancesRequest(StrictRequest):
 
 
 class MotionSpeedProfileRequest(StrictRequest):
-    velocity_scale: Annotated[
-        float, Field(gt=0, le=1, allow_inf_nan=False)
-    ]
-    acceleration_scale: Annotated[
-        float, Field(gt=0, le=1, allow_inf_nan=False)
-    ]
+    velocity_scale: Annotated[float, Field(gt=0, le=1, allow_inf_nan=False)]
+    acceleration_scale: Annotated[float, Field(gt=0, le=1, allow_inf_nan=False)]
     max_tcp_linear_speed_mps: Annotated[
         float | None, Field(gt=0, allow_inf_nan=False)
     ] = None
@@ -1446,15 +1465,11 @@ class MotionTimeoutsRequest(StrictRequest):
 
 
 class JointDynamicsLimitRequest(StrictRequest):
-    max_velocity_rad_s: Annotated[
-        float | None, Field(gt=0, allow_inf_nan=False)
-    ] = None
+    max_velocity_rad_s: Annotated[float | None, Field(gt=0, allow_inf_nan=False)] = None
     max_acceleration_rad_s2: Annotated[
         float | None, Field(gt=0, allow_inf_nan=False)
     ] = None
-    max_jerk_rad_s3: Annotated[
-        float | None, Field(gt=0, allow_inf_nan=False)
-    ] = None
+    max_jerk_rad_s3: Annotated[float | None, Field(gt=0, allow_inf_nan=False)] = None
 
 
 class JointGoalRequest(StrictRequest):
@@ -1495,25 +1510,13 @@ class PoseGoalRequest(StrictRequest):
 class CartesianPathRequest(StrictRequest):
     kind: Literal["cartesian_path"]
     waypoints: Annotated[list[Pose3Request], Field(min_length=1, max_length=4096)]
-    max_translation_step_m: Annotated[
-        float, Field(gt=0, allow_inf_nan=False)
-    ]
-    max_rotation_step_rad: Annotated[
-        float, Field(gt=0, allow_inf_nan=False)
-    ]
+    max_translation_step_m: Annotated[float, Field(gt=0, allow_inf_nan=False)]
+    max_rotation_step_rad: Annotated[float, Field(gt=0, allow_inf_nan=False)]
     speed_mode: Literal["bounded"]
-    max_linear_speed_mps: Annotated[
-        float, Field(gt=0, allow_inf_nan=False)
-    ]
-    max_angular_speed_rad_s: Annotated[
-        float, Field(gt=0, allow_inf_nan=False)
-    ]
-    max_linear_acceleration_mps2: Annotated[
-        float, Field(gt=0, allow_inf_nan=False)
-    ]
-    max_angular_acceleration_rad_s2: Annotated[
-        float, Field(gt=0, allow_inf_nan=False)
-    ]
+    max_linear_speed_mps: Annotated[float, Field(gt=0, allow_inf_nan=False)]
+    max_angular_speed_rad_s: Annotated[float, Field(gt=0, allow_inf_nan=False)]
+    max_linear_acceleration_mps2: Annotated[float, Field(gt=0, allow_inf_nan=False)]
+    max_angular_acceleration_rad_s2: Annotated[float, Field(gt=0, allow_inf_nan=False)]
     fallback_policy: Literal["fail_closed", "allow_joint_space_fallback"]
 
 
@@ -1537,6 +1540,15 @@ CoordinatePositionRequest = Annotated[
     AngularPositionRequest | LinearPositionRequest,
     Field(discriminator="kind"),
 ]
+
+
+class GripperFeedbackObservation(StrictRequest):
+    state: Literal["idle", "executing", "completed", "failed"]
+    command_id: Annotated[int, Field(ge=0, le=9_007_199_254_740_991)]
+    generation: Annotated[int, Field(ge=0, le=9_007_199_254_740_991)]
+    revision: Annotated[int, Field(ge=0, le=9_007_199_254_740_991)]
+    observed_position: CoordinatePositionRequest
+    grasp_confirmed: bool | None
 
 
 class AngularEffortRequest(StrictRequest):
@@ -1591,9 +1603,7 @@ class CapabilityCommandParticipantRequest(StrictRequest):
     command_schema_revision: str
     command_value: GripperPositionCommandValueRequest
     completion_timeout_s: Annotated[float, Field(gt=0, allow_inf_nan=False)]
-    caller_options: Annotated[
-        list[CommandDurationOptionRequest], Field(max_length=64)
-    ]
+    caller_options: Annotated[list[CommandDurationOptionRequest], Field(max_length=64)]
 
     @field_validator("command_schema_id", "command_schema_revision")
     @classmethod
@@ -1801,9 +1811,7 @@ class OperationParticipantRequest(StrictRequest):
         Field(discriminator="kind"),
     ]
 
-    @field_validator(
-        "component_role_id", "target_role_id", "required_capability_id"
-    )
+    @field_validator("component_role_id", "target_role_id", "required_capability_id")
     @classmethod
     def validate_participant_identity(cls, value: str, info) -> str:
         return _bounded_nfc(
@@ -1823,9 +1831,10 @@ class OperationIntentRequest(StrictRequest):
     expected_retained_bundle_id: str
     expected_scene_revision: SceneRevisionRequest | None
     participants: Annotated[
-        list[OperationParticipantRequest], Field(min_length=1, max_length=1)
+        list[OperationParticipantRequest],
+        Field(min_length=1, max_length=MAX_OPERATION_PARTICIPANTS),
     ]
-    coordination_policy: Literal["independent"]
+    coordination_policy: Literal["independent", "coordinated_all"]
 
     @field_validator(
         "program_id",
@@ -1844,14 +1853,17 @@ class OperationIntentRequest(StrictRequest):
         )
 
     @model_validator(mode="after")
-    def validate_program_span_run(self) -> "OperationIntentRequest":
-        span = self.participants[0].action_span
-        if (
-            span is not None
-            and span.program_run_id is not None
-            and span.program_run_id != self.program_run_id
-        ):
-            raise ValueError("action span program_run_id must match the operation")
+    def validate_operation_scope(self) -> "OperationIntentRequest":
+        if (len(self.participants) == 1) != (self.coordination_policy == "independent"):
+            raise ValueError("participant count must match the coordination policy")
+        for participant in self.participants:
+            span = participant.action_span
+            if (
+                span is not None
+                and span.program_run_id is not None
+                and span.program_run_id != self.program_run_id
+            ):
+                raise ValueError("action span program_run_id must match the operation")
         return self
 
 
@@ -1962,7 +1974,9 @@ def _validate_pick_place_operations(
         raise ValueError("pick/place approach must be a motion operation")
     if not isinstance(descend.participants[0].payload, MotionParticipantRequest):
         raise ValueError("pick/place descend must be a motion operation")
-    if not isinstance(tool.participants[0].payload, CapabilityCommandParticipantRequest):
+    if not isinstance(
+        tool.participants[0].payload, CapabilityCommandParticipantRequest
+    ):
         raise ValueError("pick/place tool phase must be a capability command")
     if not isinstance(retreat.participants[0].payload, MotionParticipantRequest):
         raise ValueError("pick/place retreat must be a motion operation")
@@ -2091,18 +2105,14 @@ class PlaceSequencePlanningRequest(StrictRequest):
             or bool(value.runtime_object_bindings)
             for value in motions
         ):
-            raise ValueError(
-                "place motion phases cannot carry contact-policy state"
-            )
+            raise ValueError("place motion phases cannot carry contact-policy state")
         return self
 
 
 class OperationControlRequest(StrictRequest):
     request_context: CallerAttributionRequest
     operation_id: str
-    expected_operation_revision: Annotated[
-        int, Field(ge=1, le=9_007_199_254_740_991)
-    ]
+    expected_operation_revision: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
     reason: str | None = None
 
     @field_validator("operation_id")
@@ -2134,15 +2144,11 @@ class OperationRecoveryActionRequest(StrictRequest):
         "reset_cycle",
     ]
     principal_id: str = ""
-    expected_assessment_revision: Annotated[
-        int, Field(ge=1, le=9_007_199_254_740_991)
-    ]
+    expected_assessment_revision: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
     expected_control_command_epoch: Annotated[
         int, Field(ge=0, le=9_007_199_254_740_991)
     ]
-    expected_execution_id: Annotated[
-        int, Field(ge=1, le=9_007_199_254_740_991)
-    ]
+    expected_execution_id: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
     expected_latch_id: str = ""
     expected_stop_certificate_id: str = ""
     expected_stop_owner_generation: Annotated[
@@ -2166,18 +2172,16 @@ class OperationRecoveryActionRequest(StrictRequest):
         return _bounded_nfc(
             value,
             label=info.field_name,
-            maximum_bytes=(MAX_REASON_BYTES if info.field_name == "reason" else MAX_IDENTITY_BYTES),
+            maximum_bytes=(
+                MAX_REASON_BYTES if info.field_name == "reason" else MAX_IDENTITY_BYTES
+            ),
         )
 
 
 class StopOperationTargetRequest(StrictRequest):
     operation_id: str
-    expected_operation_revision: Annotated[
-        int, Field(ge=1, le=9_007_199_254_740_991)
-    ]
-    expected_stop_generation: Annotated[
-        int, Field(ge=0, le=9_007_199_254_740_991)
-    ]
+    expected_operation_revision: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
+    expected_stop_generation: Annotated[int, Field(ge=0, le=9_007_199_254_740_991)]
 
     @field_validator("operation_id")
     @classmethod
@@ -2212,9 +2216,7 @@ class StopResourceTargetRequest(StrictRequest):
     expected_operation_resource_generation: Annotated[
         int, Field(ge=0, le=9_007_199_254_740_991)
     ]
-    expected_stop_generation: Annotated[
-        int, Field(ge=0, le=9_007_199_254_740_991)
-    ]
+    expected_stop_generation: Annotated[int, Field(ge=0, le=9_007_199_254_740_991)]
 
     @field_validator("resource_id", "expected_graph_revision")
     @classmethod
@@ -2228,18 +2230,27 @@ class StopResourceTargetRequest(StrictRequest):
 
 class StopIntentRequest(StrictRequest):
     request_context: CallerAttributionRequest
-    operations: Annotated[
-        list[StopOperationTargetRequest],
-        Field(min_length=1, max_length=MAX_STOP_SELECTOR_TARGETS),
-    ] | None = None
-    components: Annotated[
-        list[StopComponentTargetRequest],
-        Field(min_length=1, max_length=MAX_STOP_SELECTOR_TARGETS),
-    ] | None = None
-    resources: Annotated[
-        list[StopResourceTargetRequest],
-        Field(min_length=1, max_length=MAX_STOP_SELECTOR_TARGETS),
-    ] | None = None
+    operations: (
+        Annotated[
+            list[StopOperationTargetRequest],
+            Field(min_length=1, max_length=MAX_STOP_SELECTOR_TARGETS),
+        ]
+        | None
+    ) = None
+    components: (
+        Annotated[
+            list[StopComponentTargetRequest],
+            Field(min_length=1, max_length=MAX_STOP_SELECTOR_TARGETS),
+        ]
+        | None
+    ) = None
+    resources: (
+        Annotated[
+            list[StopResourceTargetRequest],
+            Field(min_length=1, max_length=MAX_STOP_SELECTOR_TARGETS),
+        ]
+        | None
+    ) = None
     reason: str | None = None
 
     @field_validator("reason", mode="before")
@@ -2277,7 +2288,11 @@ class StopIntentRequest(StrictRequest):
         context = self.request_context
         for label, value, maximum in (
             ("request_id", context.request_id, MAX_STOP_IDENTITY_BYTES),
-            ("request_owner_epoch", context.request_owner_epoch, MAX_STOP_IDENTITY_BYTES),
+            (
+                "request_owner_epoch",
+                context.request_owner_epoch,
+                MAX_STOP_IDENTITY_BYTES,
+            ),
             ("source_label", context.source_label, MAX_IDENTITY_BYTES),
         ):
             _bounded_nfc(value, label=label, maximum_bytes=maximum)
@@ -2329,9 +2344,7 @@ class ProgramRunStopIntentRequest(StrictRequest):
 
 class FullStopIntentRequest(StrictRequest):
     request_context: CallerAttributionRequest
-    expected_stop_generation: Annotated[
-        int, Field(ge=0, le=9_007_199_254_740_991)
-    ]
+    expected_stop_generation: Annotated[int, Field(ge=0, le=9_007_199_254_740_991)]
 
     @model_validator(mode="after")
     def validate_context(self) -> FullStopIntentRequest:
@@ -2369,9 +2382,7 @@ class StopFaultRecoveryConfigurationExpectationRequest(StrictRequest):
 class StopFaultRecoveryIntentRequest(StrictRequest):
     request_context: CallerAttributionRequest
     expected_latch_id: str
-    expected_latch_generation: Annotated[
-        int, Field(ge=1, le=9_007_199_254_740_991)
-    ]
+    expected_latch_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
     expected_recovery_assessment_revision: Annotated[
         int, Field(ge=1, le=9_007_199_254_740_991)
     ]
@@ -2408,9 +2419,7 @@ class StopFaultRecoveryIntentRequest(StrictRequest):
     def validate_reason(cls, value: str | None) -> str | None:
         if value is None:
             return None
-        return _bounded_nfc(
-            value, label="reason", maximum_bytes=MAX_STOP_REASON_BYTES
-        )
+        return _bounded_nfc(value, label="reason", maximum_bytes=MAX_STOP_REASON_BYTES)
 
     @model_validator(mode="after")
     def validate_expectations(self) -> StopFaultRecoveryIntentRequest:
@@ -2451,12 +2460,27 @@ class RuntimeScaleControlSelectorRequest(StrictRequest):
         )
 
 
+class OperationRuntimeScaleRequest(StrictRequest):
+    request_context: CallerAttributionRequest
+    operation_id: str
+    expected_operation_revision: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
+    expected_runtime_scale_generation: Annotated[
+        int, Field(ge=0, le=9_007_199_254_740_990)
+    ]
+    scale: Annotated[float, Field(gt=0, le=1, allow_inf_nan=False)]
+
+    @field_validator("operation_id")
+    @classmethod
+    def validate_identity(cls, value: str) -> str:
+        return _bounded_nfc(
+            value, label="operation_id", maximum_bytes=MAX_IDENTITY_BYTES
+        )
+
+
 class RuntimeScaleControlRequest(StrictRequest):
     request_context: CallerAttributionRequest
     selector: RuntimeScaleControlSelectorRequest
-    expected_control_generation: Annotated[
-        int, Field(ge=0, le=9_007_199_254_740_991)
-    ]
+    expected_control_generation: Annotated[int, Field(ge=0, le=9_007_199_254_740_991)]
     scale: Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
 
 
@@ -2542,7 +2566,9 @@ class CCLCExpectedControlDomainRequest(StrictRequest):
 
     @model_validator(mode="after")
     def validate_binding_order(self) -> "CCLCExpectedControlDomainRequest":
-        identifiers = [item.control_binding_id for item in self.expected_control_bindings]
+        identifiers = [
+            item.control_binding_id for item in self.expected_control_bindings
+        ]
         if identifiers != sorted(identifiers) or len(identifiers) != len(
             set(identifiers)
         ):
@@ -2566,9 +2592,7 @@ class ComponentLifecycleRequest(StrictRequest):
     ]
     reason: str | None = None
     confirmed: bool
-    expected_admission_generation: Annotated[
-        int, Field(ge=1, le=9_007_199_254_740_991)
-    ]
+    expected_admission_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
 
     @field_validator("controllable_component_id", "expected_graph_revision")
     @classmethod
@@ -2596,7 +2620,10 @@ class ComponentLifecycleRequest(StrictRequest):
                 "expected_control_domains must be strictly ordered by domain ID"
             )
         if (
-            sum(len(item.expected_control_bindings) for item in self.expected_control_domains)
+            sum(
+                len(item.expected_control_bindings)
+                for item in self.expected_control_domains
+            )
             > 4_096
         ):
             raise ValueError("expected control bindings exceed the aggregate bound")
@@ -2658,9 +2685,7 @@ class CCLCDesiredControlConfigurationRequest(StrictRequest):
         ]
         binding_ids = [item.control_binding_id for item in self.binding_routes]
         if keys != sorted(keys) or len(binding_ids) != len(set(binding_ids)):
-            raise ValueError(
-                "binding_routes must be canonical with unique binding IDs"
-            )
+            raise ValueError("binding_routes must be canonical with unique binding IDs")
         return self
 
 
@@ -2683,9 +2708,7 @@ class CCLCRouteComponentExpectationRequest(StrictRequest):
 
 class RouteSelectionRequest(StrictRequest):
     request_context: CallerAttributionRequest
-    expected_admission_generation: Annotated[
-        int, Field(ge=1, le=9_007_199_254_740_991)
-    ]
+    expected_admission_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
     expected_retained_bundle_id: str
     expected_graph_revision: str
     desired_configuration: CCLCDesiredControlConfigurationRequest

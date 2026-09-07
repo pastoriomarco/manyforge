@@ -377,6 +377,31 @@ TEST(NativeStopQualificationSeamTest,
 }
 
 TEST(NativeStopQualificationSeamTest,
+     ZeroOrExpiredRemainingBudgetNeverDispatchesAStopStage) {
+  WallClock clock;
+  const auto binding = fixture::make_binding();
+  auto channel = std::make_shared<fixture::StateChannel>(binding);
+  RecordingProbe probe;
+  auto backend = detail::NativeStopQualificationAccess::construct(
+      binding, channel, clock, RoboPlanExecutionBackendConfig{}, probe);
+  const auto stage = direct_stage_fixture();
+  for (const auto remaining : {0LL, -1LL}) {
+    auto budget = remaining_budget(stage);
+    budget.remaining_outer_duration_ns = remaining;
+    const auto result =
+        backend->TranslateStopStage(stage, budget, std::stop_token{});
+    EXPECT_EQ(result.attempt_disposition,
+              core::StopStageAttemptDispositionDTO::kNotDispatched);
+    ASSERT_TRUE(result.error);
+    EXPECT_EQ(result.error->code, "motion_interrupt_backend_stop_failed");
+    EXPECT_EQ(result.error->details.at("reason"),
+              "resolved_stop_stage_budget_invalid");
+    EXPECT_EQ(backend->get_execution_snapshot().state,
+              core::ExecutionState::kIdle);
+  }
+}
+
+TEST(NativeStopQualificationSeamTest,
      ExactPreparedGoalCancelStopsOnlyItsActiveNativeExecution) {
   WallClock clock;
   auto binding = fixture::make_binding();
@@ -474,8 +499,7 @@ TEST(NativeStopQualificationSeamTest,
   auto binding = fixture::make_binding();
   auto channel = std::make_shared<fixture::StateChannel>(binding);
   RoboPlanExecutionBackendConfig config;
-  config.soft_on_path_max_jerk_rad_s3 = {{"joint_1", 0.01},
-                                         {"joint_2", 0.01}};
+  config.soft_on_path_max_jerk_rad_s3 = {{"joint_1", 0.01}, {"joint_2", 0.01}};
   RecordingProbe probe;
   auto backend = detail::NativeStopQualificationAccess::construct(
       binding, channel, clock, config, probe);
@@ -516,9 +540,8 @@ TEST(NativeStopQualificationSeamTest,
   auto backend = detail::NativeStopQualificationAccess::construct(
       binding, channel, clock, config, probe);
   auto stage = controlled_stage_fixture();
-  auto &parameters =
-      *stage.participant_stop_plan.stage_commands.front()
-           .validated_contract_parameters;
+  auto &parameters = *stage.participant_stop_plan.stage_commands.front()
+                          .validated_contract_parameters;
   parameters["deceleration_time_s"] = core::JsonValueDTO{0.15};
   stage.participant_stop_plan.stage_commands.front()
       .resolved_stage.default_contract_parameters = parameters;
@@ -533,8 +556,8 @@ TEST(NativeStopQualificationSeamTest,
       *backend, stage, core::ContentDigest("prepared.natural"), execution);
 
   auto stopped = std::async(std::launch::async, [&] {
-    return backend->TranslateStopStage(
-        stage, remaining_budget(stage), std::stop_token{});
+    return backend->TranslateStopStage(stage, remaining_budget(stage),
+                                       std::stop_token{});
   });
   ASSERT_TRUE(probe.wait_for(
       detail::NativeStopQualificationEvent::kNominalResultWaitEnter));
@@ -571,8 +594,7 @@ TEST(NativeStopQualificationSeamTest,
   RoboPlanExecutionBackendConfig config;
   config.soft_on_path_max_jerk_rad_s3 = {{"joint_1", 1'000'000.0},
                                          {"joint_2", 1'000'000.0}};
-  RecordingProbe probe(
-      detail::NativeStopQualificationEvent::kPhysicalDispatch);
+  RecordingProbe probe(detail::NativeStopQualificationEvent::kPhysicalDispatch);
   auto backend = detail::NativeStopQualificationAccess::construct(
       binding, channel, clock, config, probe);
   auto execution =
@@ -583,8 +605,8 @@ TEST(NativeStopQualificationSeamTest,
     return backend->execute_controlled_stop(
         fixture::soft_profile(binding, 0.30));
   });
-  const bool reached_dispatch = probe.wait_for(
-      detail::NativeStopQualificationEvent::kPhysicalDispatch);
+  const bool reached_dispatch =
+      probe.wait_for(detail::NativeStopQualificationEvent::kPhysicalDispatch);
   if (!reached_dispatch) {
     probe.release();
   }
@@ -607,6 +629,61 @@ TEST(NativeStopQualificationSeamTest,
 }
 
 TEST(NativeStopQualificationSeamTest,
+     PausedScaleChangesDoNotAdvanceMotionOrDependOnMotionFrameFreshness) {
+  core::FakeClock clock;
+  clock.advance(1);
+  auto binding = fixture::make_binding();
+  auto channel = std::make_shared<fixture::StateChannel>(binding);
+  RecordingProbe probe;
+  auto backend = detail::NativeStopQualificationAccess::construct(
+      binding, channel, clock, {}, probe);
+  auto execution =
+      backend->execute_trajectory(fixture::trajectory(binding, 5.0));
+  ASSERT_TRUE(wait_until_executing(*backend));
+  ASSERT_TRUE(backend->pause().accepted);
+  const auto until = [](auto predicate) {
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (predicate())
+        return true;
+      std::this_thread::yield();
+    }
+    return false;
+  };
+  ASSERT_TRUE(until([&] {
+    return backend->get_execution_snapshot().state ==
+           core::ExecutionState::kPaused;
+  }));
+  const auto before = backend->get_execution_snapshot();
+  backend->set_runtime_velocity_scale(0.4);
+  ASSERT_TRUE(until([&] {
+    return backend->runtime_velocity_scale_status().applied_scale == 0.4;
+  }));
+  ASSERT_TRUE(until([&] {
+    return backend->get_execution_snapshot().sequence_number >
+           before.sequence_number;
+  }));
+  const auto paused = backend->get_execution_snapshot();
+  const auto first = backend->runtime_velocity_scale_status();
+  // Virtual years, not a wall-clock soak. A genuine local register read is
+  // fresh without publishing another joint frame or advancing the robot.
+  clock.advance(31LL * 365 * 24 * 60 * 60 * 1'000'000'000);
+  const auto later = backend->runtime_velocity_scale_status();
+  EXPECT_FALSE(later.error.has_value());
+  EXPECT_GT(later.acknowledgement_sequence, first.acknowledgement_sequence);
+  EXPECT_EQ(later.acknowledgement_timestamp_ns, clock.now());
+  EXPECT_EQ(later.virtual_trajectory_time_s, first.virtual_trajectory_time_s);
+  EXPECT_EQ(backend->get_execution_snapshot().sequence_number,
+            paused.sequence_number);
+  EXPECT_EQ(backend->get_execution_snapshot().joint_positions_rad,
+            before.joint_positions_rad);
+  EXPECT_EQ(backend->get_execution_snapshot().state,
+            core::ExecutionState::kPaused);
+  EXPECT_TRUE(backend->reset().accepted);
+  EXPECT_TRUE(execution.wait_for_completion(2'000'000'000LL));
+}
+
+TEST(NativeStopQualificationSeamTest,
      NonRestingAddressedStateFailsTheControlledStopEvidenceContract) {
   WallClock clock;
   auto binding = fixture::make_binding();
@@ -620,8 +697,7 @@ TEST(NativeStopQualificationSeamTest,
       binding, channel, clock, config, probe);
   auto stage = controlled_stage_fixture();
   auto &plan = stage.participant_stop_plan;
-  auto &parameters =
-      *plan.stage_commands.front().validated_contract_parameters;
+  auto &parameters = *plan.stage_commands.front().validated_contract_parameters;
   parameters["deceleration_time_s"] = core::JsonValueDTO{0.05};
   plan.stage_commands.front().resolved_stage.default_contract_parameters =
       parameters;

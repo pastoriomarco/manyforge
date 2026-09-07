@@ -74,6 +74,23 @@ TEST(SourceSnapshotCodec, RoundTripsCanonicalClosedRecordAndRejectsTamper) {
                SourceSnapshotIntegrityError);
 }
 
+TEST(SourceSnapshotCodec, LongServiceTimeKeepsExactIdentityAcrossAtomicPublication) {
+  TemporaryDirectory directory;
+  AtomicSourceSnapshotChannel channel(directory.path(), "manager.json");
+  constexpr std::int64_t boundary = 9'007'199'254'740'991LL;
+  for (const auto time : std::vector<std::int64_t>{boundary, boundary + 1, boundary + 2,
+           105LL * 86400 * 1000000000, 31LL * 366 * 86400 * 1000000000}) {
+    const auto snapshot = channel.Publish("component_manager", "manager.cell-a", "epoch-a",
+                                          time, Payload("alpha"));
+    const auto wire = SourceSnapshotCodec::Encode(snapshot);
+    EXPECT_EQ(SourceSnapshotCodec::Decode(wire), snapshot);
+    ASSERT_TRUE(channel.Read().has_value());
+    EXPECT_EQ(channel.Read()->observed_at_ns, time);
+    // Observation time is not a new semantic generation or model identity.
+    EXPECT_EQ(snapshot.source_generation, 1U);
+  }
+}
+
 TEST(AtomicSourceSnapshotChannel,
      SkipsCrashLeftoverTemporaryNameWithoutDeletingIt) {
   TemporaryDirectory directory;

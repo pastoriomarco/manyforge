@@ -71,9 +71,7 @@ class ProgramRunPortContext:
     graph_revision: str
     node_environment_digest: str
     program_binding: Mapping[str, Any]
-    program: Mapping[str, Any] = field(
-        default_factory=lambda: MappingProxyType({})
-    )
+    program: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
     assistant_projection: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
@@ -183,8 +181,7 @@ class CompositeProgramRunContextPort:
                     rollback_errors.append(rollback_error)
             if rollback_errors:
                 detail = "; ".join(
-                    str(error) or type(error).__name__
-                    for error in rollback_errors
+                    str(error) or type(error).__name__ for error in rollback_errors
                 )
                 raise ProgramRunContextError(
                     "Program-run context bind failed and rollback was not "
@@ -200,9 +197,7 @@ class CompositeProgramRunContextPort:
             except Exception as error:
                 errors.append(error)
         if errors:
-            detail = "; ".join(
-                str(error) or type(error).__name__ for error in errors
-            )
+            detail = "; ".join(str(error) or type(error).__name__ for error in errors)
             raise ProgramRunContextError(
                 f"Program-run context cleanup was incomplete: {detail}"
             ) from errors[0]
@@ -388,8 +383,7 @@ class ProgramRunScopeSnapshot:
         ):
             raise ValueError("a settled Program-run scope must be empty")
         if self.state is ProgramRunScopeState.ACTIVE and (
-            self.active_operation_count is None
-            or self.reason_code is not None
+            self.active_operation_count is None or self.reason_code is not None
         ):
             raise ValueError(
                 "an active Program-run scope must provide a bounded work count"
@@ -414,7 +408,13 @@ class ProgramRunScopePort(Protocol):
 
     def observe(self, program_run_id: str) -> ProgramRunScopeSnapshot: ...
 
-    def release_stop(self, program_run_id: str) -> ProgramRunScopeSnapshot: ...
+    def capture_stop(self, program_run_id: str) -> tuple[str, int] | None:
+        """Capture the Program Stop; None means no Program-scope fence."""
+        ...
+
+    def release_stop(
+        self, program_run_id: str, *, expected_stop: tuple[str, int] | None = None
+    ) -> ProgramRunScopeSnapshot: ...
 
     def reset(self, program_run_id: str) -> ProgramRunScopeSnapshot: ...
 
@@ -523,7 +523,7 @@ class NodeAdapterPorts:
     simulator_control: OwnerTaskPort | None = None
     cclc_lifecycle: OwnerTaskPort | None = None
     cclc_routes: OwnerTaskPort | None = None
-    kernel_controls: OwnerInvocationPort | None = None
+    kernel_controls: OwnerTaskPort | None = None
     program_run_scope: ProgramRunScopePort | None = None
     program_run_context: ProgramRunContextPort | None = None
     program_interventions: ProgramInterventionPort | None = None

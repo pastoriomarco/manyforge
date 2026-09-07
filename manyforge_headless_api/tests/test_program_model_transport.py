@@ -29,6 +29,26 @@ _DIGEST = "sha256:" + "a" * 64
 _JPEG = b"\xff\xd8\xff\xe0manyforge-model-snapshot"
 
 
+@pytest.mark.parametrize("mode", ["validation", "serialization"])
+def test_model_attempt_openapi_exposes_lossless_int64_wire_forms(mode):
+    from manyforge_headless_api.models import ProgramModelAttemptRequest
+    from manyforge_behavior.json_scalars import MAXIMUM_SAFE_INTEGER
+
+    schema = ProgramModelAttemptRequest.model_json_schema(mode=mode)
+    numeric, decimal = schema["properties"]["occurred_at_ns"]["anyOf"]
+    assert numeric == {"type": "integer", "minimum": 0, "maximum": MAXIMUM_SAFE_INTEGER}
+    assert decimal["type"] == "string"
+    assert decimal["maxLength"] == 19
+    assert decimal["format"] == "nonnegative-int64-decimal"
+    # The existing exact decoder/serializer remains the range authority.
+    timestamp = 31 * 366 * 86400 * 10**9
+    assert ProgramModelAttemptRequest.exact_occurrence_time(str(timestamp)) == timestamp
+    instance = ProgramModelAttemptRequest.model_construct(occurred_at_ns=timestamp)
+    assert instance.model_dump(include={"occurred_at_ns"}) == {
+        "occurred_at_ns": str(timestamp)
+    }
+
+
 def _config() -> ProgramModelEndpointConfig:
     return ProgramModelEndpointConfig(
         external_resource_alias="site_llm",
@@ -71,8 +91,7 @@ def _request(*, tool: bool = False) -> ProgramModelRequest:
 
 def _snapshot_attachment() -> dict[str, object]:
     return {
-        "data_url": "data:image/jpeg;base64,"
-        + base64.b64encode(_JPEG).decode("ascii"),
+        "data_url": "data:image/jpeg;base64," + base64.b64encode(_JPEG).decode("ascii"),
         "kind": "snapshot_image",
         "media_type": "image/jpeg",
         "source": {
@@ -96,9 +115,7 @@ def test_json_request_uses_explicit_site_endpoint_and_bounded_contract() -> None
             200,
             json={
                 "model": "model-a.2026-08",
-                "choices": [
-                    {"message": {"content": '{"selected_object_id":"part"}'}}
-                ],
+                "choices": [{"message": {"content": '{"selected_object_id":"part"}'}}],
                 "usage": {"total_tokens": 17},
             },
         )

@@ -18,6 +18,29 @@ from manyforge_behavior.kernel_client import (
 )
 
 
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("request_id", "another.request"),
+        ("action", "reset_cycle"),
+        ("accepted", 1),
+        ("accepted", "true"),
+        ("resulting_assessment", None),
+    ],
+)
+def test_recovery_result_must_match_the_exact_request(field, value) -> None:
+    request = {"request_id": "recovery.1", "action": "acknowledge_and_continue"}
+    result = {**request, "accepted": True, "resulting_assessment": {}, field: value}
+
+    class Transport(FakeTransport):
+        def apply_operation_recovery(self, operation_id, revision, body):
+            assert (operation_id, revision, body) == ("operation.1", 3, request)
+            return {"ok": True, "result": result}
+
+    with pytest.raises(KernelClientResponseError, match="exact owner result"):
+        KernelClient(Transport()).recover("operation.1", 3, request)
+
+
 class FakeTransport:
     def __init__(self) -> None:
         self.submitted: Mapping[str, Any] | None = None

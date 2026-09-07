@@ -6,9 +6,10 @@ from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
 from hashlib import sha256
-from threading import Lock, RLock
+from threading import RLock
 from types import MappingProxyType
 from typing import Any, Final
+from uuid import uuid4
 
 import py_trees
 import rfc8785
@@ -43,7 +44,6 @@ from manyforge_behavior.nodes.stop_policy import (
 )
 
 PROGRAM_RUN_CAPTURE_API: Final = "manyforge.program_run_capture.v1"
-_MAX_ATTEMPTS_PER_NODE: Final = 1_000_000
 
 
 class ProgramRuntimeError(RuntimeError):
@@ -214,36 +214,25 @@ class ProgramRunCapture:
 
 
 class ProgramRunAttemptSource:
-    """Issue bounded collision-resistant attempt IDs within one exact run."""
+    """Issue opaque attempt identities without retaining completed attempts.
+
+    Attempt IDs correlate owner work; they are not ordering or freshness
+    authority. UUIDs remove the old per-node lifetime counter and its limit.
+    Exact run/operation generations continue to fence every physical effect.
+    """
 
     def __init__(self, program_run_id: str) -> None:
         self._program_run_id = _require_text(
             program_run_id,
             field="program_run_id",
         )
-        self._counts: dict[str, int] = {}
-        self._lock = Lock()
 
     def begin(self, node_instance_id: str) -> NodeAttemptIdentity:
         node_id = _require_text(node_instance_id, field="node_instance_id")
-        with self._lock:
-            count = self._counts.get(node_id, 0) + 1
-            if count > _MAX_ATTEMPTS_PER_NODE:
-                raise ProgramRuntimeError(
-                    f"node {node_id!r} exceeds the bounded attempt count"
-                )
-            self._counts[node_id] = count
-        preimage = (
-            self._program_run_id.encode("utf-8")
-            + b"\x00"
-            + node_id.encode("utf-8")
-            + b"\x00"
-            + str(count).encode("ascii")
-        )
         return NodeAttemptIdentity(
             program_run_id=self._program_run_id,
             node_instance_id=node_id,
-            node_attempt_id=f"attempt:{sha256(preimage).hexdigest()}",
+            node_attempt_id=f"attempt:{uuid4().hex}",
         )
 
 
@@ -362,9 +351,7 @@ class ExecutableProgramRun:
             self._build_node(
                 child,
                 inherited_stop_policy=effective_stop_policy,
-                ancestor_holds=(
-                    ancestor_holds or effective_stop_policy == "hold"
-                ),
+                ancestor_holds=(ancestor_holds or effective_stop_policy == "hold"),
             )
             for child in node.children
         )
@@ -516,6 +503,7 @@ class ExecutableProgramRun:
                 return
             self._stopped = True
             self._tree.root.stop(py_trees.common.Status.INVALID)
+
 
 __all__ = [
     "ExecutableProgramRun",

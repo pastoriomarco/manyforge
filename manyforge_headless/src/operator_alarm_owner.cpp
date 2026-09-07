@@ -114,11 +114,10 @@ CanonicalValue Number(const std::uint64_t value, const std::string_view label,
 }
 
 CanonicalValue Number(const std::int64_t value, const std::string_view label) {
-  Require(value >= 0 &&
-              static_cast<std::uint64_t>(value) <= kMaximumSafeInteger,
+  Require(value >= 0,
           "operator_alarm_value_invalid",
-          std::string(label) + " must be a nonnegative I-JSON safe integer");
-  return CanonicalValue(static_cast<double>(value));
+          std::string(label) + " must be a nonnegative int64");
+  return content_identity::nonnegative_int64_value(value);
 }
 
 CanonicalValue StringArray(const std::vector<std::string> &values) {
@@ -258,8 +257,7 @@ AlarmLifecycleOwner::AlarmLifecycleOwner(
 
 std::int64_t AlarmLifecycleOwner::MonotonicNow() const {
   const auto value = monotonic_clock_();
-  Require(value >= 0 &&
-              static_cast<std::uint64_t>(value) <= kMaximumSafeInteger,
+  Require(value >= 0,
           "operator_alarm_clock_invalid",
           "alarm monotonic clock returned an invalid value");
   return value;

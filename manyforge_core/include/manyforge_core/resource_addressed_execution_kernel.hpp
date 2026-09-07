@@ -106,6 +106,9 @@ struct StopSurveillanceExecutionConfig final {
 struct OperationReadProjectionDTO final {
   OperationStateDTO operation;
   bool resident{};
+  RequestOwnerEpoch request_owner_epoch;
+  std::optional<OperationControlAcceptedDTO> last_control{};
+  bool control_pending{};
 
   friend bool operator==(const OperationReadProjectionDTO&,
                          const OperationReadProjectionDTO&) = default;
@@ -256,6 +259,10 @@ struct ResourceAddressedExecutionKernelConfig final {
   /// an empty-runtime bootstrap. It is never a constraint on later non-empty
   /// participant reconfiguration.
   std::optional<GraphRevision> empty_runtime_graph_revision;
+  /// Verified selected resource inventory before physical engines exist.
+  /// Only valid with the paired empty-runtime bundle/graph identities. These
+  /// are ordinary slot-table entries, not ready participants or rest evidence.
+  std::vector<ResourceId> empty_runtime_resource_inventory;
   std::size_t cell_admission_claim_capacity{1024U};
   CellAdmissionInterventionValidator cell_admission_intervention_validator;
   CellAdmissionSettlementValidator cell_admission_settlement_validator;
@@ -413,6 +420,12 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] std::vector<OperationStateDTO> get_resident_operations(
       const std::vector<ProgramRunId>& program_run_ids) const;
 
+  /// One coherent current-result projection per requested run scope: every
+  /// resident operation, or its latest retained result when none is resident.
+  /// Reuses bounded owner history; reads never settle/release operations.
+  [[nodiscard]] std::vector<OperationReadProjectionDTO> get_latest_run_operations(
+      const std::vector<ProgramRunId>& program_run_ids) const;
+
   [[nodiscard]] Result<OperationRecoveryProjectionDTO> get_operation_recovery_assessment(
       const OperationId& operation_id) const;
 
@@ -515,6 +528,7 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   struct RuntimeScaleControlSetting;
   struct RuntimeScaleControlResolution;
   struct ActiveOperation;
+  class OperationCommitGuard;
   struct StopTransaction;
   struct StopTerminalRecord;
   struct StopProjectionJob;
@@ -524,6 +538,9 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   struct EngineSubscription;
   struct PreviewSession;
 
+  [[nodiscard]] bool operation_control_reconfiguration_busy_locked() const;
+  [[nodiscard]] std::vector<IResolvedParticipantExecutionEngine*> operation_control_engines_locked(
+      const std::vector<RuntimeParticipantExecutionRegistration>& registrations) const;
   [[nodiscard]] const RuntimeParticipantExecutionRegistration* registration_for(
       const RuntimeParticipantBinding& binding) const noexcept;
   [[nodiscard]] Result<RuntimeParticipantExecutionRegistration> resolve_registration(
@@ -534,6 +551,8 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       const OperationId& operation_id) noexcept;
   [[nodiscard]] const ActiveOperation* find_active_operation_locked(
       const OperationId& operation_id) const noexcept;
+  [[nodiscard]] OperationReadProjectionDTO operation_projection_locked(
+      const OperationStateDTO& state, bool resident, bool control_pending) const;
   [[nodiscard]] std::optional<OperationId> find_event_operation_locked(
       const IResolvedParticipantExecutionEngine* engine, std::uint64_t subordinate_id) const;
   void on_engine_event(IResolvedParticipantExecutionEngine* engine, const KernelEvent& event);
@@ -542,6 +561,11 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
                                                      std::uint64_t subordinate_id,
                                                      OperationStateKind state, double progress,
                                                      std::optional<ErrorDTO> terminal_error);
+  void stamp_operation_capture_locked(ActiveOperation& operation, OperationStateDTO& state);
+  [[nodiscard]] Result<bool> record_operation_state_locked(
+      std::unique_lock<std::mutex>& state_lock, OperationStateDTO& state,
+      const RuntimeScaleStatusDTO* scale, const char* reason,
+      std::span<const PreparedMotionDiagnosticsDTO> diagnostics = {});
   [[nodiscard]] Result<void> advance_prepared_motion(const OperationId& operation_id,
                                                      IResolvedParticipantExecutionEngine* engine);
   [[nodiscard]] Result<void> advance_prepared_resume(const OperationId& operation_id,
@@ -559,6 +583,7 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] Result<OperationControlAcceptedDTO> apply_control(
       const OperationControlRequestDTO& request, OperationControlKind control);
   void CompleteOperationControlEffect(OperationControlEffectResult result) noexcept;
+  [[nodiscard]] OperationStateDTO publish_settlement_fault_locked(ActiveOperation& operation);
   [[nodiscard]] Result<void> settle_control_operation_locked(const OperationId& operation_id,
                                                              OperationControlKind control);
   [[nodiscard]] std::vector<OperationId> durable_operation_retention_ids_locked() const;
@@ -576,6 +601,9 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] Result<void> apply_runtime_scale_status(
       IResolvedParticipantExecutionEngine* engine,
       const ResolvedRuntimeScaleStatusDTO& resolved_status);
+  [[nodiscard]] Result<void> retain_runtime_scale_observation_locked(
+      std::unique_lock<std::mutex>& state_lock, ActiveOperation& operation,
+      RuntimeScaleStatusDTO status, const char* reason);
   [[nodiscard]] Result<RuntimeScaleAcceptedDTO> set_runtime_scale_impl(
       const RuntimeScaleRequestDTO& request, bool retain_public_replay);
   [[nodiscard]] Result<RuntimeScaleControlResolution> resolve_runtime_scale_control_locked(
@@ -586,6 +614,12 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   void StageAttemptCompleted(StopStageAttemptHandle handle) noexcept override;
   void OperationControlEffectCompleted(BoundedOperationControlExecutor& executor,
                                        OperationControlEffectHandle handle) noexcept override;
+  void settle_completed_control_locked(const OperationId& operation_id);
+  void settle_completed_resume_locked(const OperationId& operation_id);
+  OperationStateDTO capture_control_failure_locked(ActiveOperation& operation);
+  void cancel_prepared_resume(const OperationId& operation_id,
+                              IResolvedPreparedParticipantExecutionEngine& engine,
+                              std::uint64_t subordinate_id);
   void ProjectStop(StopControlWorkToken token, std::stop_token cancellation) noexcept;
   void RunStopSurveillance(StopCertificateId certificate_id,
                            std::uint64_t schedule_generation) noexcept;

@@ -160,7 +160,7 @@ def test_scene_mirror_captures_info_pose_bounds_and_per_entity_failure() -> None
     assert first.category_name == "CATEGORY_OBJECT"
     assert first.pose == scene_mirror_probe.PoseSnapshot(
         frame_id="world",
-        stamp_sec=12.5,
+        stamp_ns=12500000000,
         position_xyz=(1.0, 0.0, 0.0),
         orientation_xyzw=(0.0, 0.0, 0.0, 1.0),
     )
@@ -234,7 +234,7 @@ def test_configured_service_name_requires_the_exact_graph_type() -> None:
 def test_scene_snapshot_records_and_service_merge_remain_owner_neutral() -> None:
     pose = scene_mirror_probe.PoseSnapshot(
         frame_id="world",
-        stamp_sec=12.5,
+        stamp_ns=12500000000,
         position_xyz=(1.0, 2.0, 3.0),
         orientation_xyzw=(0.0, 0.0, 0.0, 1.0),
     )
@@ -300,7 +300,7 @@ def test_pose_and_bounds_translation_is_finite_and_normalized() -> None:
     assert scene_mirror_probe.pose_snapshot_from_state(state) == (
         scene_mirror_probe.PoseSnapshot(
             frame_id="world",
-            stamp_sec=12.5,
+            stamp_ns=12500000000,
             position_xyz=(1.0, 2.0, 3.0),
             orientation_xyzw=(0.0, 0.0, 0.0, 1.0),
         )

@@ -33,6 +33,10 @@
           "capability_id": "execution.resume"
         },
         {
+          "capability_definition_revision": "sha256:4ee00df7b3510c1490c83e247d12b73553ab53e4e6673da53ebea475fb756fad",
+          "capability_id": "execution.runtime_scale.operation_scoped"
+        },
+        {
           "capability_definition_revision": "sha256:3ed811803c31726c758e227fc52bd57854cc6e7fa09dff0fd117d41800d4f8b9",
           "capability_id": "execution.stop.soft"
         },
@@ -175,7 +179,7 @@
     "model_role_id": "arm_model"
   },
   "component_type_id": "ur5_roboplan.component",
-  "component_type_revision": "sha256:c5eee3527e962d1ea37e6432e31109ce787d666bb638bf1315d8cd8d6966346d",
+  "component_type_revision": "sha256:437081bdb41251cb4788bb58585dc5265b4efb4ab342a1af88a123b564ca2550",
   "model_mounts": [],
   "model_roles": [
     {

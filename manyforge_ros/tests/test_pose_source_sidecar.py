@@ -54,7 +54,7 @@ from manyforge_ros.scene_mirror_probe import PoseSnapshot
 def test_fixed_local_offset_rejects_non_finite_source_position() -> None:
     pose = PoseSnapshot(
         frame_id="world",
-        stamp_sec=1.0,
+        stamp_ns=1000000000,
         position_xyz=(nan, 0.0, 0.0),
         orientation_xyzw=(0.0, 0.0, 0.0, 1.0),
     )
@@ -74,7 +74,7 @@ def test_fixed_local_offset_rotates_translation_and_orientation() -> None:
     half_root = 2.0**-0.5
     pose = PoseSnapshot(
         frame_id="world",
-        stamp_sec=1.0,
+        stamp_ns=1000000000,
         position_xyz=(0.5, 0.0, 0.25),
         orientation_xyzw=(0.0, 0.0, half_root, half_root),
     )
@@ -95,14 +95,26 @@ def test_pose_stamped_normalizes_frame_stamp_and_quaternion() -> None:
     pose = normalize_pose_stamped_message(message)
 
     assert pose.frame_id == "world"
-    assert pose.stamp_sec == pytest.approx(12.25)
+    assert pose.stamp_ns == 12250000000
     assert pose.position_xyz == (1.0, 2.0, 3.0)
     assert pose.orientation_xyzw == (0.0, 0.0, 0.0, 1.0)
 
 
+@pytest.mark.parametrize("nanoseconds", [
+    (1 << 53) - 1, 1 << 53, (1 << 53) + 1,
+    105 * 86400 * 1_000_000_000, 31 * 366 * 86400 * 1_000_000_000 + 1,
+])
+def test_pose_timestamp_is_exact_across_long_service_boundaries(nanoseconds: int) -> None:
+    sec, nanos = divmod(nanoseconds, 1_000_000_000)
+    pose = normalize_pose_stamped_message(
+        _pose_stamped("world", sec, nanos, 0.0, 0.0, 0.0, w=1.0)
+    )
+    assert pose.stamp_ns == nanoseconds
+
+
 @pytest.mark.parametrize(
     ("sec", "nanosec"),
-    [("12", 0), (True, 0), (12, -1), (12, 1_000_000_000)],
+    [("12", 0), (True, 0), (12, -1), (12, 1_000_000_000), (-1, 0), (1 << 63, 0)],
 )
 def test_pose_stamped_rejects_non_integral_or_out_of_range_timestamps(
     sec: object,
@@ -180,7 +192,7 @@ def test_joint_state_normalization_does_not_claim_angular_only_units() -> None:
     assert sample.topic == "/joint_states"
     assert sample.names == ("revolute_joint", "prismatic_joint")
     assert sample.positions == (0.25, 0.012)
-    assert sample.source_stamp_s == pytest.approx(17.25)
+    assert sample.source_stamp_ns == 17250000000
     assert not hasattr(sample, "joint_positions_rad")
 
 
@@ -303,7 +315,7 @@ def test_detection_covariance_and_nested_results_are_consumed_with_hard_caps() -
 def test_pose_transform_requires_tf_instead_of_relabeling_frame() -> None:
     pose = PoseSnapshot(
         frame_id="camera",
-        stamp_sec=1.0,
+        stamp_ns=1000000000,
         position_xyz=(1.0, 2.0, 3.0),
         orientation_xyzw=(0.0, 0.0, 0.0, 1.0),
     )
@@ -326,7 +338,7 @@ def test_simulation_capture_is_stateless_and_reports_each_entity() -> None:
                 name="/World/tool0",
                 pose=PoseSnapshot(
                     frame_id="world",
-                    stamp_sec=100.0,
+                    stamp_ns=100000000000,
                     position_xyz=(0.5, 0.0, 0.25),
                     orientation_xyzw=(0.0, 0.0, 2.0**-0.5, 2.0**-0.5),
                 ),
@@ -411,7 +423,7 @@ def test_simulation_capture_requires_exact_declared_header_before_real_tf() -> N
                 name="/World/tool0",
                 pose=PoseSnapshot(
                     frame_id="tool0",
-                    stamp_sec=1.0,
+                    stamp_ns=1000000000,
                     position_xyz=(1.0, 2.0, 3.0),
                     orientation_xyzw=(0.0, 0.0, 0.0, 1.0),
                 ),
@@ -448,7 +460,7 @@ def test_simulation_capture_requires_exact_declared_header_before_real_tf() -> N
                 name="/World/tool0",
                 pose=PoseSnapshot(
                     frame_id="changed_tool0",
-                    stamp_sec=1.0,
+                    stamp_ns=1000000000,
                     position_xyz=(1.0, 2.0, 3.0),
                     orientation_xyzw=(0.0, 0.0, 0.0, 1.0),
                 ),
@@ -470,7 +482,7 @@ def test_simulation_capture_requires_exact_declared_header_before_real_tf() -> N
 def test_simulation_capture_rejects_duplicate_or_unbounded_source_rows() -> None:
     pose = PoseSnapshot(
         frame_id="world",
-        stamp_sec=1.0,
+        stamp_ns=1000000000,
         position_xyz=(0.0, 0.0, 0.0),
         orientation_xyzw=(0.0, 0.0, 0.0, 1.0),
     )

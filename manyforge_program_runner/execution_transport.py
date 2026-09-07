@@ -11,13 +11,17 @@ from pydantic import BaseModel, ValidationError
 from manyforge_headless_api.execution import ExecutionCommandClient
 from manyforge_headless_api.models import (
     OperationControlRequest,
+    OperationRuntimeScaleRequest,
     OperationIntentRequest,
     OperationRecoveryActionRequest,
     PickSequencePlanningRequest,
     PlaceSequencePlanningRequest,
     ProgramRunStopIntentRequest,
+    ProgramOperationQuery,
+    FullStopIntentRequest,
     StopFaultRecoveryIntentRequest,
     StopIntentRequest,
+    TargetObservationQuery,
 )
 from manyforge_headless_api.native import HeadlessApiError
 
@@ -56,6 +60,22 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
             trusted_principal_id=None,
         )
 
+    def query_target(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return super().query_target(self._request(TargetObservationQuery, body))
+
+    def query_operation(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return super().query_operation(self._request(ProgramOperationQuery, body))
+
+    def full_stop(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return super().full_stop(
+            self._request(FullStopIntentRequest, body), trusted_principal_id=None
+        )
+
+    def set_operation_runtime_scale(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return super().set_operation_runtime_scale(
+            self._request(OperationRuntimeScaleRequest, body), trusted_principal_id=None
+        )
+
     def apply_operation_recovery(
         self,
         operation_id: str,
@@ -82,19 +102,13 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
             )
         return getattr(super(), method)(request, trusted_principal_id=None)
 
-    def pause(
-        self, operation_id: str, body: Mapping[str, Any]
-    ) -> dict[str, Any]:
+    def pause(self, operation_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
         return self._mapped_control("pause", operation_id, body)
 
-    def resume(
-        self, operation_id: str, body: Mapping[str, Any]
-    ) -> dict[str, Any]:
+    def resume(self, operation_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
         return self._mapped_control("resume", operation_id, body)
 
-    def reset(
-        self, operation_id: str, body: Mapping[str, Any]
-    ) -> dict[str, Any]:
+    def reset(self, operation_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
         return self._mapped_control("reset", operation_id, body)
 
     def acknowledge_completed(
@@ -121,8 +135,7 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
     def _pick_place(
         self,
         method: str,
-        model: type[PickSequencePlanningRequest]
-        | type[PlaceSequencePlanningRequest],
+        model: type[PickSequencePlanningRequest] | type[PlaceSequencePlanningRequest],
         body: Mapping[str, Any],
     ) -> dict[str, Any]:
         return getattr(super(), method)(
@@ -141,5 +154,6 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
 
     def start_place(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self._pick_place("start_place", PlaceSequencePlanningRequest, body)
+
 
 __all__ = ["ProgramRunnerExecutionTransport"]

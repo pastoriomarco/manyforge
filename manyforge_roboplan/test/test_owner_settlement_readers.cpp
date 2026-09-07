@@ -203,6 +203,58 @@ TEST(OwnerSettlementReaders, ActiveProgramRunRecoveryRejectsACrossRunCapture) {
 }
 
 TEST(OwnerSettlementReaders,
+     RecoveryNeverTreatsPartialOrCrossedRunRecordsAsNoRecoveryProduct) {
+  struct Case {
+    const char *cycle_state;
+    const char *run_state;
+    const char *captured_id;
+    int terminal;
+    bool row_present;
+    bool valid;
+  };
+  for (const auto &item :
+       {Case{"running", "running", "run.7", 0, false, false},
+        Case{"running", "running", "run.7", 1, true, false},
+        Case{"stopping", "stopped", "run.7", 0, true, false},
+        Case{"resetting", "unknown", "run.7", 0, true, false},
+        Case{"recovery_required", "succeeded", "run.other", 1, true, false},
+        Case{"starting", "running", "run.7", 2, true, false},
+        Case{"recovery_required", "full_stopped", "run.7", 0, true, true},
+        Case{"recovery_required", "stopped", "run.7", 1, true, true}}) {
+    SCOPED_TRACE(std::string(item.cycle_state) + "/" + item.run_state + "/" +
+                 std::to_string(item.terminal));
+    TemporaryDatabase fixture;
+    fixture.Exec(
+        "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY "
+        "KEY,schema_version INTEGER);"
+        "INSERT INTO program_cycle_metadata VALUES(1,4);"
+        "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state "
+        "TEXT,program_run_id TEXT,reconciliation_required INTEGER);"
+        "CREATE TABLE program_run_history(program_run_id TEXT PRIMARY "
+        "KEY,snapshot_json TEXT,terminal INTEGER);"
+        "INSERT INTO program_cycle VALUES(1,'" +
+        std::string(item.cycle_state) + "','run.7',1)");
+    if (item.row_present) {
+      fixture.Exec("INSERT INTO program_run_history "
+                   "VALUES('run.7','{\"capture\":{\"graph_revision\":\"" +
+                   std::string(kDigestA) + "\",\"program_run_id\":\"" +
+                   item.captured_id + "\",\"retained_bundle_id\":\"" +
+                   std::string(kDigestB) + "\"},\"state\":\"" + item.run_state +
+                   "\"}'," + std::to_string(item.terminal) + ")");
+    }
+    fixture.Close();
+    const auto result =
+        ReadActiveProgramRunProductForReconciliation(fixture.path());
+    ASSERT_EQ(result.ok(), item.valid);
+    if (item.valid)
+      EXPECT_EQ(result.value().has_value(), item.terminal == 0);
+    else
+      EXPECT_EQ(result.error().details.at("reason"),
+                "program_run_recovery_product_unavailable");
+  }
+}
+
+TEST(OwnerSettlementReaders,
      ProgramResetRequiresExactDurableTerminalClaimAndReleaseIntent) {
   const auto claim_json = ClaimJson("program_cycle", "program_runner",
                                     "runner.1", "cycle.1", "start.1");

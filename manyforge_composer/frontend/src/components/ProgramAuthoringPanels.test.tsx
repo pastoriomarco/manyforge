@@ -123,7 +123,7 @@ function authoringProgram(
     name: 'Test Program',
     catalog: {
       api_version: 'manyforge.node_catalog.v2',
-      content_version: '1.1.0',
+      content_version: '2.0.0',
     },
     component_roles: { robot: {} },
     target_roles: {},

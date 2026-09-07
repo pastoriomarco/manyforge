@@ -63,6 +63,7 @@ import {
 import {
   quaternionFromRpyDegrees,
   robotControlHasActiveOperation,
+  robotControlHasLocalDraft,
 } from '../state/robotControl';
 import type { StructuralResourceState } from '../state/structuralResource';
 import {
@@ -2216,7 +2217,11 @@ export function SceneAuthoringWorkspace({
     || (robotControl.state.mode === 'move_to'
       && robotControl.state.moveToKind !== 'joint');
   const candidateTcp = previewGhost?.finalTcpPose
-    ?? (tcpDraftMode ? robotControl.state.draftPose : null);
+    ?? (tcpDraftMode
+      ? robotControlHasLocalDraft(robotControl.state)
+        ? robotControl.state.draftPose
+        : robotControl.state.status?.observedMotion.currentTcpPose ?? null
+      : null);
   const cellGhost = useMemo(() => candidateTcp === null
     ? null
     : candidateTcpPoseInCell(

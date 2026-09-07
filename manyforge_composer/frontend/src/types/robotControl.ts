@@ -255,7 +255,7 @@ export interface ExecutionOwnerStatus {
   directControlGripper: DirectControlGripperStatus;
   observedMotion: ObservedMotionTarget;
   observedGripper: ObservedGripperTarget | null;
-  residentOperations: OperationObservation[];
+  manualOperations: (OperationObservation & { programRunId: string })[];
   cellStopAction: CellStopActionStatus;
   runtimeScaleControl: RuntimeScaleControlStatus | null;
 }

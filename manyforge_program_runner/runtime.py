@@ -338,6 +338,9 @@ class ProgramRuntime:
         )
         self._ports = NodeAdapterPorts(
             kernel_operations=self._native.operations,
+            kernel_controls=self._native.controls,
+            model_queries=self._native.queries,
+            gripper_status=self._native.queries,
             scene_transactions=self._scene,
             assistant_requests=self._assistant,
             pick_place=self._native.pick_place,
@@ -1285,7 +1288,7 @@ class ProgramRuntime:
         result["runtime_control_revision"] = (
             None
             if controls is None
-            else controls.snapshot()["runtime_control_revision"]
+            else controls.revision
         )
         result["recovery_offer"] = recovery_offer
         # This is the single shared browser observation. Publishing the exact
@@ -2896,7 +2899,7 @@ class ProgramRuntime:
         recovery_offer: dict[str, Any] | None,
     ) -> dict[str, Any]:
         return {
-            "schema_version": "manyforge.program_runtime_control_projection.v2",
+            "schema_version": "manyforge.program_runtime_control_projection.v3",
             "owner_id": self.owner_id,
             "owner_epoch": self.owner_epoch,
             "program_run_id": program_run_id,
@@ -3085,7 +3088,7 @@ class ProgramRuntime:
                             "staging"
                         ),
                     )
-            before = controls.snapshot()["runtime_control_revision"]
+            before = controls.revision
             record = controls.stage_override(
                 node_instance_id=request.node_instance_id,
                 node_attempt_id=request.node_attempt_id,
@@ -3097,7 +3100,7 @@ class ProgramRuntime:
                     program_run_id, **values
                 ),
             )
-            if controls.snapshot()["runtime_control_revision"] != before:
+            if controls.revision != before:
                 try:
                     self._owner.note_runtime_control_change(program_run_id)
                 except Exception as error:
@@ -3221,14 +3224,14 @@ class ProgramRuntime:
                 program_run_id,
                 node_instance_id=current["node_instance_id"],
             )
-            before = controls.snapshot()["runtime_control_revision"]
+            before = controls.revision
             proposal = controls.request_promotion(
                 request.override_id,
                 node_id=node_id,
                 expected_draft_id=request.expected_draft_id,
                 expected_draft_revision=request.expected_draft_revision,
             )
-            if controls.snapshot()["runtime_control_revision"] != before:
+            if controls.revision != before:
                 try:
                     self._owner.note_runtime_control_change(program_run_id)
                 except Exception as error:
@@ -3253,7 +3256,7 @@ class ProgramRuntime:
         controls = self._controls(program_run_id)
 
         def effect():
-            controls.require_audit_capacity()
+            controls.require_event_revisions()
             self._owner.write_runtime_blackboard(
                 program_run_id,
                 key=request.key,
@@ -3313,7 +3316,7 @@ class ProgramRuntime:
                         "attempt"
                     ),
                 )
-            controls.require_audit_capacity()
+            controls.require_event_revisions()
             snapshot = self._host.resume_recovery(
                 program_run_id,
                 node_attempt_id=request.node_attempt_id,
@@ -3460,13 +3463,17 @@ class ProgramRuntime:
             try:
                 owner_result = None
                 cycle_resumed = False
-                controls.require_audit_capacity(
+                controls.require_event_revisions(
                     events=(
                         1
-                        if request.action_id == "acknowledge_and_continue"
+                        if request.action_id in {"acknowledge_and_continue", "reset_cycle"}
                         else 2
-                    )
+                    ),
+                    reserved_after=0 if request.action_id == "reset_cycle" else 1,
                 )
+                if (request.action_id not in {"reset_cycle", "acknowledge_and_continue"}
+                    and intervention.policy_parameter != "operator_stop_policy"):
+                    controls.require_retry_capacity(intervention.identity.node_instance_id)
                 if request.action_id == "reset_cycle":
                     effect_started = True
                     terminal = self._host.stop_run(
@@ -3606,19 +3613,22 @@ class ProgramRuntime:
                                 intervention.identity.node_instance_id
                             )
                         cycle_resumed = True
-                controls.audit_value(
-                    "cycle_recovery_action_applied",
-                    offer_id=request.offer_id,
-                    action_id=request.action_id,
-                    node_instance_id=intervention.identity.node_instance_id,
-                    node_attempt_id=intervention.identity.node_attempt_id,
-                    cycle_resumed=cycle_resumed,
-                )
+                # Reset already records the owner transition and caller at its
+                # sole commit point; do not append a second wrapper event.
+                if request.action_id != "reset_cycle":
+                    controls.audit_value(
+                        "cycle_recovery_action_applied",
+                        offer_id=request.offer_id,
+                        action_id=request.action_id,
+                        node_instance_id=intervention.identity.node_instance_id,
+                        node_attempt_id=intervention.identity.node_attempt_id,
+                        cycle_resumed=cycle_resumed,
+                    )
                 projected = self._project_run(snapshot.to_dict())
                 runtime_controls = (
                     {
                         "schema_version": (
-                            "manyforge.program_runtime_control_projection.v2"
+                            "manyforge.program_runtime_control_projection.v3"
                         ),
                         "owner_id": self.owner_id,
                         "owner_epoch": self.owner_epoch,
@@ -4822,7 +4832,11 @@ class ProgramRuntime:
                         reset_scene_authorization,
                     )
                     if controls is not None:
-                        controls.mark_reset()
+                        controls.mark_reset(
+                            request_id=request.request_id,
+                            correlation_id=request.correlation_id,
+                            source_label=request.source_label,
+                        )
                     journal.update_reset_phase(
                         expected_generation=cycle.cycle_generation,
                         program_run_id=request.program_run_id,

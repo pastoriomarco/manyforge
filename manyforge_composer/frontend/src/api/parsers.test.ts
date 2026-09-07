@@ -14,6 +14,7 @@ import {
   parseHeadlessRuntimeSnapshot,
   parseHistorianPage,
   parseHistorianDetail,
+  parseHistorianDiscovery,
   parseManagerDiffProjection,
   parseManagerGraphProjection,
   parseManagerStatusProjection,
@@ -39,6 +40,17 @@ import {
   parseSourceModelProjection,
 } from './parsers';
 
+it('bounds discovery by encoded bytes and requires the exact continuation', () => {
+  const page = { schema_version: 'manyforge.historian_discovery.v1', kind: 'channel',
+    values: ['manyforge.composer'], truncated: true, next_after: 'manyforge.composer' };
+  expect(parseHistorianDiscovery(page).nextAfter).toBe('manyforge.composer');
+  for (const patch of [{ next_after: 'other' }, { values: [] },
+    { values: ['é'.repeat(513)], next_after: 'é'.repeat(513) },
+    { values: ['e\u0301'], next_after: 'e\u0301' }]) {
+    expect(() => parseHistorianDiscovery({ ...page, ...patch })).toThrow(StructuralContractError);
+  }
+});
+
 function programFixture(): Record<string, unknown> {
   return {
     api_version: 'manyforge.program.v1',
@@ -48,7 +60,7 @@ function programFixture(): Record<string, unknown> {
     name: 'Fixture',
     catalog: {
       api_version: 'manyforge.node_catalog.v2',
-      content_version: '1.1.0',
+      content_version: '2.0.0',
     },
     component_roles: {},
     target_roles: {},
@@ -585,13 +597,13 @@ describe('Program product projections', () => {
 
   function runtimeControlsProjection(): Record<string, unknown> {
     return {
-      schema_version: 'manyforge.program_runtime_control_projection.v2',
+      schema_version: 'manyforge.program_runtime_control_projection.v3',
       owner_id: 'program-runner.cell-a',
       owner_epoch: 'program-runner.epoch.1',
       program_run_id: 'program-run.1',
       run_revision: 3,
       runtime_controls: {
-        schema_version: 'manyforge.program_runtime_controls.v1',
+        schema_version: 'manyforge.program_runtime_controls.v2',
         program_run_id: 'program-run.1',
         runtime_control_revision: 1,
         recovery_fences: {
@@ -763,6 +775,30 @@ describe('Program product projections', () => {
 
     expect(projection.recoveryOffer).toBeNull();
     expect(projection.programRunId).toBe('program-run.1');
+  });
+
+  it('accepts a bounded recent control trace after many events and rejects gaps', () => {
+    const input = runtimeControlsProjection();
+    const controls = input.runtime_controls as Record<string, unknown>;
+    controls.runtime_control_revision = 10_001;
+    controls.audit = Array.from({ length: 256 }, (_, index) => ({
+      event_revision: 9_745 + index, kind: 'runtime_blackboard_written', value: index,
+    }));
+    const parsed = parseProgramRuntimeControlProjection(input).runtimeControls;
+    expect(parsed.runtimeControlRevision).toBe(10_001);
+    expect(parsed.audit[0].eventRevision).toBe(9_745);
+    for (const length of [0, 255, 257]) {
+      controls.audit = Array.from({ length }, (_, index) => ({
+        event_revision: 10_001 - length + index, kind: 'event',
+      }));
+      expect(() => parseProgramRuntimeControlProjection(input)).toThrow();
+    }
+    controls.audit = Array.from({ length: 256 }, (_, index) => ({
+      event_revision: 9_744 + index, kind: 'event',
+    }));
+    expect(() => parseProgramRuntimeControlProjection(input)).toThrow();
+    controls.schema_version = 'manyforge.program_runtime_controls.v1';
+    expect(() => parseProgramRuntimeControlProjection(input)).toThrow();
   });
 
   it('parses one coherent cycle, run, and runtime-control observation', () => {
@@ -1348,22 +1384,22 @@ describe('headless projection parsers', () => {
     const state = fixture.state as Record<string, unknown>;
     state.pose_sources = [
       poseSourceFixture({
-        api_version: 'manyforge.ros_pose_observation.v1',
+        api_version: 'manyforge.ros_pose_observation.v2',
         joint_names: ['joint_1', 'joint_2'],
         kind: 'joint_state',
         positions: [0.1, -0.2],
-        source_stamp_s: 12.5,
+        source_stamp_ns: 12500000000,
         topic: '/isaac_joint_states',
       }),
       poseSourceFixture({
-        api_version: 'manyforge.ros_pose_observation.v1',
+        api_version: 'manyforge.ros_pose_observation.v2',
         kind: 'simulation_entity_pose',
         pose: {
           frame_id: 'universe',
           frame_kind: 'cell_frame',
           orientation_xyzw: [0, 0, 0, 1],
           position_m: [0.4, -0.2, 0.1],
-          source_stamp_s: 13,
+          source_stamp_ns: 13000000000,
         },
         source: { entity: '/mac_n_cheese_centered' },
       }, {
@@ -1373,7 +1409,7 @@ describe('headless projection parsers', () => {
         source_sequence: 8,
       }),
       poseSourceFixture({
-        api_version: 'manyforge.ros_pose_observation.v1',
+        api_version: 'manyforge.ros_pose_observation.v2',
         kind: 'detection3d_pose',
         source_error: {
           code: 'detection_not_found',
@@ -1399,14 +1435,14 @@ describe('headless projection parsers', () => {
     const invalidFrame = sceneRuntimeFixture();
     (invalidFrame.state as Record<string, unknown>).pose_sources = [
       poseSourceFixture({
-        api_version: 'manyforge.ros_pose_observation.v1',
+        api_version: 'manyforge.ros_pose_observation.v2',
         kind: 'simulation_entity_pose',
         pose: {
           frame_id: 'world',
           frame_kind: 'unmapped_frame',
           orientation_xyzw: [0, 0, 0, 1],
           position_m: [0, 0, 0],
-          source_stamp_s: null,
+          source_stamp_ns: null,
         },
         source: { entity: '/part' },
       }),
@@ -1418,11 +1454,11 @@ describe('headless projection parsers', () => {
     const duplicateJoint = sceneRuntimeFixture();
     (duplicateJoint.state as Record<string, unknown>).pose_sources = [
       poseSourceFixture({
-        api_version: 'manyforge.ros_pose_observation.v1',
+        api_version: 'manyforge.ros_pose_observation.v2',
         joint_names: ['joint_1', 'joint_1'],
         kind: 'joint_state',
         positions: [0.1, 0.2],
-        source_stamp_s: null,
+        source_stamp_ns: null,
         topic: '/isaac_joint_states',
       }),
     ];
@@ -1433,7 +1469,7 @@ describe('headless projection parsers', () => {
     const dishonestUnknown = sceneRuntimeFixture();
     (dishonestUnknown.state as Record<string, unknown>).pose_sources = [
       poseSourceFixture({
-        api_version: 'manyforge.ros_pose_observation.v1',
+        api_version: 'manyforge.ros_pose_observation.v2',
         kind: 'joint_state',
         source_error: {
           code: 'source_error',
@@ -1700,11 +1736,17 @@ describe('headless projection parsers', () => {
 
   it('accepts the bounded historian page and validates event schema identity', () => {
     const wire = {
-      schema_version: 'manyforge.historian_summary_page.v1',
+      schema_version: 'manyforge.historian_summary_page.v2',
+      time_window: { start_utc_ns: null, end_utc_ns: null },
+      retention: null,
       events: [{
         sequence: 7,
         event: {
-          schema_version: 'manyforge.historian_event_summary.v1',
+          schema_version: 'manyforge.historian_event_summary.v2',
+          condition_severity: 'ERROR',
+          occurred_at_utc_ns: '1785931200000000000',
+          clock_owner: 'headless:test-epoch',
+          wall_clock_regressed: false,
           event_id: 'event-1',
           component: 'manyforge.alarm',
           event_type: 'operator_alarm_activated',
@@ -2101,8 +2143,7 @@ describe('addressed Robot Control parsers', () => {
       observed_state: observedGripper,
       ...gripperTarget
     } = structuredClone(response.status.direct_control_gripper);
-    const scoped = parseExecutionControlStatus(
-      {
+    const targetsResponse = {
         api_version: 'manyforge.execution_command_response.v1',
         command: 'targets',
         identity,
@@ -2112,15 +2153,15 @@ describe('addressed Robot Control parsers', () => {
           direct_control_gripper: gripperTarget,
           schema_version: 'manyforge.execution_targets.v1',
         },
-      },
-      {
+    };
+    const controlResponse = {
         api_version: 'manyforge.execution_command_response.v1',
         command: 'control_state',
         control_state: {
           cell_stop_action: response.status.cell_stop_action,
           observed_gripper: observedGripper,
           observed_motion: observedMotion,
-          resident_operations: [],
+          manual_operations: [] as unknown[],
           runtime_scale_control: {
             active_control_configuration_generation: 1,
             active_control_configuration_id: 'active-1',
@@ -2145,12 +2186,31 @@ describe('addressed Robot Control parsers', () => {
             },
             supported: true,
           },
-          schema_version: 'manyforge.execution_control_state.v3',
+          schema_version: 'manyforge.execution_control_state.v4',
         },
         identity,
         ok: true,
+    };
+    const scoped = parseExecutionControlStatus(targetsResponse, controlResponse);
+    const retired = {
+      resident: false, operation: {
+        program_run_id: motionTarget.program_run_id, operation_id: 'manual-1', operation_revision: 2,
+        state: 'completed', participants: [{progress: 1, terminal_error: null}],
+        active_stop_id: null, active_stop_generation: null,
       },
-    );
+    };
+    controlResponse.control_state.manual_operations = [retired];
+    expect(parseExecutionControlStatus(targetsResponse, controlResponse).manualOperations[0])
+      .toMatchObject({operationId: 'manual-1', resident: false, state: 'completed'});
+    for (const rows of [
+      [{...retired, operation: {...retired.operation, program_run_id: 'foreign'}}],
+      [{...retired, operation: {...retired.operation, state: 'executing'}}],
+      [retired, {...retired, operation: {...retired.operation, operation_id: 'duplicate-target'}}],
+      [retired, retired, retired],
+    ]) {
+      controlResponse.control_state.manual_operations = rows;
+      expect(() => parseExecutionControlStatus(targetsResponse, controlResponse)).toThrow();
+    }
     expect(scoped.directControl.targetDescriptor).toEqual(
       status.directControl.targetDescriptor,
     );

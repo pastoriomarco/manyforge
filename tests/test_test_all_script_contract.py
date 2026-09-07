@@ -176,7 +176,7 @@ def test_roboplan_suite_qualifies_only_the_retained_product_consumer() -> None:
     assert configure.index("cmakeFiles-v1") < configure.index('cmake "$WORKSPACE')
     assert configure.index("toolchains-v1") < configure.index('cmake "$WORKSPACE')
     assert "tail -" not in configure
-    assert "--target \"${producer_targets[@]}\" -- -k 0" in producer
+    assert '--target "${producer_targets[@]}" -- "${BUILD_KEEP_GOING_ARGS[@]}"' in producer
     assert "tail -" not in producer
     assert "C++ retained RoboPlan product-consumer tests" in body
     assert "MANYFORGE_ENABLE_ROS2_CONTROL" not in body
@@ -184,7 +184,7 @@ def test_roboplan_suite_qualifies_only_the_retained_product_consumer() -> None:
     assert "manyforge_roboplan/python" not in body
     assert "configure_roboplan_build" in body
     assert (
-        'cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" -- -k 0'
+        'cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" -- "${BUILD_KEEP_GOING_ARGS[@]}"'
         in body
     )
     assert "tail -" not in body
@@ -210,8 +210,10 @@ def test_headless_required_process_cases_name_the_current_semantic_tests() -> No
     assert "DistinctNativePackageUsesFreshManagerGenerationAfterCleanStop" not in body
 
 
+@pytest.mark.parametrize("generator", [None, "Ninja", "Unix Makefiles"])
 def test_headless_selector_builds_producer_closure_before_native_headless(
     tmp_path: Path,
+    generator: str | None,
 ) -> None:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -243,6 +245,7 @@ def test_headless_selector_builds_producer_closure_before_native_headless(
         "  fi\n"
         "  exit 0\n"
         "fi\n"
+        "printf 'CMAKE_GENERATOR:INTERNAL=%s\\n' \"$3\" > CMakeCache.txt\n"
         "case \"$1\" in\n"
         "  */manyforge_roboplan)\n"
         "    printf '%s\\n' producer-configure >> \"$FAKE_LOG\"\n"
@@ -293,6 +296,9 @@ def test_headless_selector_builds_producer_closure_before_native_headless(
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "WORKSPACE": str(_REPO_ROOT),
     }
+    environment.pop("CMAKE_GENERATOR", None)
+    if generator is not None:
+        environment["CMAKE_GENERATOR"] = generator
     completed = subprocess.run(
         ["bash", str(_TEST_ALL), "headless"],
         cwd=_REPO_ROOT,
@@ -312,6 +318,10 @@ def test_headless_selector_builds_producer_closure_before_native_headless(
     )
     assert "stop_qualification" not in producer_targets
     assert "manyforge_roboplan_candidate_worker" in producer_targets
+    expected_generator = generator or "Ninja"
+    producer_args = next(event for event in events if event.startswith("producer-args:"))
+    assert f"-G {expected_generator}" in producer_args
+    assert producer_targets.endswith("-- -k 0" if expected_generator == "Ninja" else "-- -k")
     headless_args = next(
         event for event in events if event.startswith("headless-args:")
     )
@@ -330,6 +340,54 @@ def test_headless_selector_builds_producer_closure_before_native_headless(
         check=False,
     )
     assert omitted.returncode != 0
+
+
+@pytest.mark.parametrize("generator", ["Ninja", "Unix Makefiles"])
+def test_keep_going_uses_real_configured_generator(tmp_path: Path, generator: str) -> None:
+    project = tmp_path / "source"
+    project.mkdir()
+    (project / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.16)\n"
+        "project(test_generator NONE)\n"
+        "add_custom_target(probe ALL COMMAND ${CMAKE_COMMAND} -E true)\n",
+        encoding="utf-8",
+    )
+    build = tmp_path / "build"
+    subprocess.run(
+        ["cmake", "-S", str(project), "-B", str(build), "-G", generator],
+        check=True, capture_output=True, text=True,
+    )
+    # Exercise the actual helper against an actual cache/build tool. No
+    # product build is needed to detect the original Make '-k 0' failure.
+    source = _TEST_ALL.read_text(encoding="utf-8")
+    helper = "set_build_keep_going_args() {" + source.split(
+        "set_build_keep_going_args() {", 1
+    )[1].split("\n}\n", 1)[0] + "\n}\n"
+    completed = subprocess.run(
+        ["bash", "-eu", "-c", helper + '\nset_build_keep_going_args "$1"\n'
+         'cmake --build "$1" -- "${BUILD_KEEP_GOING_ARGS[@]}"', "test", str(build)],
+        check=False, capture_output=True, text=True,
+        env={**os.environ, "CMAKE_GENERATOR": "unrelated-shell-value"},
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    incompatible = subprocess.run(
+        ["cmake", "-S", str(project), "-B", str(build), "-G",
+         "Unix Makefiles" if generator == "Ninja" else "Ninja"],
+        check=False, capture_output=True, text=True,
+    )
+    assert incompatible.returncode != 0
+    assert "Does not match the generator used previously" in incompatible.stderr
+
+
+def test_unsupported_generator_rejects_before_build(tmp_path: Path) -> None:
+    completed = subprocess.run(
+        ["bash", str(_TEST_ALL), "headless"],
+        env={**os.environ, "CMAKE_GENERATOR": "unsupported", "MANYFORGE_BUILD_DIR": str(tmp_path / "build")},
+        check=False, capture_output=True, text=True,
+    )
+    assert completed.returncode == 2
+    assert "Unsupported test build generator" in completed.stderr
+    assert not (tmp_path / "build").exists()
 
 
 def test_compose_retains_explicit_ros_runtime_products_and_build_cache() -> None:

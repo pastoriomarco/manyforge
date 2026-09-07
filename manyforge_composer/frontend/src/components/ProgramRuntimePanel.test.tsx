@@ -125,7 +125,7 @@ function controller(
           name: 'Next pick',
           catalog: {
             api_version: 'manyforge.node_catalog.v2',
-            content_version: '1.1.0',
+            content_version: '2.0.0',
           },
           component_roles: { component: {} },
           target_roles: {},
@@ -145,7 +145,7 @@ function controller(
           graph_revision: `sha256:${'b'.repeat(64)}`,
           node_environment: {
             catalog_id: 'manyforge.default',
-            content_version: '1.1.0',
+            content_version: '2.0.0',
             catalog_digest: `sha256:${'a'.repeat(64)}`,
             environment_digest: `sha256:${'c'.repeat(64)}`,
           },

@@ -32,7 +32,7 @@ from .draft_session import (
     OPERATOR_DRAFT_MUTATIONS,
     draft_applicability,
 )
-from .authoring_forest import from_program
+from .authoring_forest import AuthoringForestError, derive_candidate, from_program
 from .node_environment_client import (
     ActiveNodeEnvironmentProjectionError,
     read_active_node_environment,
@@ -171,6 +171,11 @@ class OpenDraftRequest(_DraftFence):
 
 class NewDraftRequest(_DraftFence):
     confirm_discard: bool = Field(default=False, alias="confirmDiscard")
+
+
+class ValidateProgramSourceRequest(BaseModel):
+    model_config = _DTO_CONFIG
+    authoring: dict[str, Any]
 
 
 class SaveDraftRequest(_DraftFence):
@@ -1386,6 +1391,22 @@ def create_draft_router(state: ComposerState) -> APIRouter:
     @router.get("/api/program/draft")
     def read_draft() -> dict[str, Any]:
         return state.draft_session.snapshot()
+
+    @router.post("/api/program/validate")
+    def validate_program_source(body: ValidateProgramSourceRequest) -> dict[str, Any]:
+        # Pure derivation with the same build-qualified authoring catalog.
+        # No Draft replacement, Apply, file write, lease, or runtime read.
+        try:
+            candidate, diagnostics = derive_candidate(body.authoring, state.node_catalog)
+        except AuthoringForestError as error:
+            raise HTTPException(status_code=422, detail={
+                "code": error.code, "message": str(error), "context": error.detail,
+            }) from error
+        return {
+            "valid": candidate is not None and not diagnostics,
+            "diagnostics": diagnostics,
+            "candidate": candidate.to_dict() if candidate is not None else None,
+        }
 
     @router.get("/api/program/workspace")
     def read_workspace() -> dict[str, Any]:

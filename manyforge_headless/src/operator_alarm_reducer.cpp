@@ -58,10 +58,9 @@ void ValidateSafeInteger(const std::uint64_t value,
 
 void ValidateSafeInteger(const std::int64_t value,
                          const std::string_view label) {
-  Require(value >= 0 &&
-              static_cast<std::uint64_t>(value) <= kMaximumSafeInteger,
+  Require(value >= 0,
           "operator_alarm_value_invalid",
-          std::string(label) + " must be a nonnegative I-JSON safe integer");
+          std::string(label) + " must be a nonnegative int64");
 }
 
 CanonicalValue EmptyObject() {
@@ -104,7 +103,7 @@ CanonicalValue Number(const std::uint64_t value, const std::string_view label,
 
 CanonicalValue Number(const std::int64_t value, const std::string_view label) {
   ValidateSafeInteger(value, label);
-  return CanonicalValue(static_cast<double>(value));
+  return content_identity::nonnegative_int64_value(value);
 }
 
 CanonicalValue OptionalNumber(const std::optional<std::uint64_t> value,

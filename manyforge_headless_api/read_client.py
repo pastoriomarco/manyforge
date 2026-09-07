@@ -28,7 +28,7 @@ READ_OPERATION_SCHEMAS: Final = MappingProxyType(
         "scene": "manyforge.scene_projection.v1",
         "alarms": "manyforge.operator_alarm_snapshot.v2",
         "alarm_metrics": "manyforge.operator_alarm_metrics.v1",
-        "history": "manyforge.historian_summary_page.v1",
+        "history": "manyforge.historian_summary_page.v2",
         "historian_health": "manyforge.async_historian_health.v1",
     }
 )
@@ -188,66 +188,13 @@ class HeadlessReadClient:
                 raise HeadlessReadInputError("states contains an unsupported value")
             response = self._transport.alarms(limit=limit, states=states)
         else:
-            _require_keys(
-                values,
-                {
-                    "start_ns",
-                    "end_ns",
-                    "components",
-                    "event_types",
-                    "before_sequence",
-                    "limit",
-                },
-            )
-            params: list[tuple[str, str | int]] = []
-            for name in ("start_ns", "end_ns"):
-                if name in values:
-                    params.append(
-                        (
-                            name,
-                            _integer(
-                                values[name],
-                                label=name,
-                                minimum=0,
-                                maximum=MAXIMUM_SAFE_INTEGER,
-                            ),
-                        )
-                    )
-            if (
-                "start_ns" in values
-                and "end_ns" in values
-                and values["start_ns"] > values["end_ns"]
-            ):
-                raise HeadlessReadInputError("start_ns must not exceed end_ns")
-            for name in ("components", "event_types"):
-                params.extend(
-                    (name, item)
-                    for item in _identities(values.get(name, ()), label=name)
-                )
-            if "before_sequence" in values:
-                params.append(
-                    (
-                        "before_sequence",
-                        _integer(
-                            values["before_sequence"],
-                            label="before_sequence",
-                            minimum=1,
-                            maximum=MAXIMUM_SAFE_INTEGER,
-                        ),
-                    )
-                )
-            params.append(
-                (
-                    "limit",
-                    _integer(
-                        values.get("limit", MAXIMUM_HISTORY_PAGE),
-                        label="limit",
-                        minimum=1,
-                        maximum=MAXIMUM_HISTORY_PAGE,
-                    ),
-                )
-            )
-            response = self._transport.history(params=params)
+            from .history_query import HistorianQueryRequest
+
+            try:
+                query = HistorianQueryRequest.model_validate(values, strict=True)
+            except ValueError as error:
+                raise HeadlessReadInputError(str(error)) from error
+            response = self._transport.history(params=query.query_parameters())
         return _require_schema(
             operation,
             READ_OPERATION_SCHEMAS[operation],

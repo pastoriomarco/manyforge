@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <semaphore>
 #include <span>
 #include <stop_token>
 #include <string>
@@ -20,6 +21,27 @@
 namespace manyforge::roboplan_backend {
 
 class RetainedObservedStateChannelTestAccess;
+
+/// One coalesced notification for the composition's single native viewer
+/// reader. There is no sample queue and publishers never wait for that reader.
+/// Browser fanout remains outside the execution process.
+class RetainedObservationWake final {
+public:
+  RetainedObservationWake();
+  [[nodiscard]] std::uint64_t incarnation() const noexcept { return incarnation_; }
+  [[nodiscard]] std::uint64_t generation() const noexcept {
+    return generation_.load(std::memory_order_acquire);
+  }
+  void notify() noexcept;
+  [[nodiscard]] bool wait_after(std::uint64_t generation,
+                                std::chrono::nanoseconds timeout) const;
+
+private:
+  const std::uint64_t incarnation_;
+  std::atomic<std::uint64_t> generation_{};
+  mutable std::atomic<bool> pending_{};
+  mutable std::binary_semaphore wake_{0};
+};
 
 struct RetainedObservedStateChannelConfig final {
   RetainedObservedStateChannelConfig() = default;
@@ -129,8 +151,8 @@ public:
   }
   [[nodiscard]] virtual core::Result<core::ControlledStateDTO>
   current_controlled_state() const = 0;
-  [[nodiscard]] virtual const core::ObservedStateQueryContextDTO &
-  query_context() const noexcept = 0;
+  [[nodiscard]] virtual core::ObservedStateQueryContextDTO
+  query_context() const = 0;
   [[nodiscard]] virtual const core::AddressedObservedStatePublication *
   addressed_publication() const noexcept = 0;
   /// Wait for a source-owned sample after a route rebind. The default keeps
@@ -166,7 +188,8 @@ public:
   RetainedObservedStateChannel(
       core::RuntimeParticipantBinding binding,
       std::shared_ptr<RetainedKinematicStateProjector> projector,
-      RetainedObservedStateChannelConfig config, core::IClock *clock = nullptr);
+      RetainedObservedStateChannelConfig config, core::IClock *clock = nullptr,
+      std::shared_ptr<RetainedObservationWake> render_wake = nullptr);
 
   RetainedObservedStateChannel(const RetainedObservedStateChannel &) = delete;
   RetainedObservedStateChannel &
@@ -231,21 +254,27 @@ public:
   wait_for_fresh_state(std::chrono::nanoseconds timeout) const override;
   [[nodiscard]] std::uint64_t
   render_change_generation() const noexcept override {
-    return render_change_generation_.load(std::memory_order_acquire);
+    return render_wake_->generation();
+  }
+  // Called under the host's composition replacement fence. A waiting viewer
+  // must recapture the new product (or its absence), even while we are idle.
+  void notify_composition_replaced() noexcept { render_wake_->notify(); }
+  [[nodiscard]] std::uint64_t render_incarnation() const noexcept {
+    return render_wake_->incarnation();
   }
   [[nodiscard]] bool
   wait_for_render_change(std::uint64_t after_generation,
                          std::chrono::nanoseconds timeout) const override;
 
-  [[nodiscard]] const core::RuntimeParticipantBinding &
-  binding() const noexcept {
-    return *current_binding_.load(std::memory_order_acquire);
+  [[nodiscard]] core::RuntimeParticipantBinding binding() const {
+    std::lock_guard lock(route_rebind_mutex_);
+    return current_binding_;
   }
   [[nodiscard]] core::ObservedStateSourceKind source_kind() const noexcept {
     return config_.source_kind;
   }
-  [[nodiscard]] const core::ObservedStateQueryContextDTO &
-  query_context() const noexcept override {
+  [[nodiscard]] core::ObservedStateQueryContextDTO
+  query_context() const override {
     return publication_.query_context();
   }
   [[nodiscard]] const core::AddressedObservedStatePublication &
@@ -268,7 +297,7 @@ public:
 private:
   friend class RetainedObservedStateChannelTestAccess;
 
-  core::RuntimeParticipantBinding initial_binding_;
+  core::RuntimeParticipantBinding current_binding_;
   std::shared_ptr<RetainedKinematicStateProjector> projector_;
   RetainedObservedStateChannelConfig config_;
   core::IClock *clock_{};
@@ -279,15 +308,13 @@ private:
   mutable std::condition_variable fresh_state_cv_;
   std::atomic<bool> fresh_state_required_{};
   std::atomic<std::uint64_t> fresh_sample_generation_{};
-  std::atomic<std::uint64_t> render_change_generation_{};
+  std::shared_ptr<RetainedObservationWake> render_wake_;
   std::vector<double> last_render_positions_;
   bool render_positions_valid_{};
-  std::vector<std::unique_ptr<const core::RuntimeParticipantBinding>>
-      retained_route_bindings_;
-  std::atomic<const core::RuntimeParticipantBinding *> current_binding_;
 
   void record_render_positions(std::span<const std::string> source_joint_names,
                                std::span<const double> positions_si);
+  void record_render_unavailable() noexcept;
   void notify_render_change() noexcept;
 };
 

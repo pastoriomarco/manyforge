@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from contextlib import suppress
+from dataclasses import dataclass
 import json
 import logging
 import time
@@ -27,7 +28,6 @@ from .control_protocol import (
     ControlClientIncidentDTO,
     ControlHeartbeatChallengeDTO,
     ControlHeartbeatEchoDTO,
-    ControlResyncRequestDTO,
     ControlResyncRequiredDTO,
     ControlServerHelloDTO,
     ControlStateAppliedDTO,
@@ -48,6 +48,15 @@ from .execution_control import (
     ExecutionControlIngress,
     ExecutionControlSubmission,
 )
+
+
+@dataclass
+class _DelayEpisode:
+    incident_id: str
+    first_ns: int
+    last_ns: int
+    count: int = 1
+    maximum_delay_ns: int = 0
 
 
 _SEND_TIMEOUT_SECONDS = 0.25
@@ -160,7 +169,7 @@ class ExecutionControlSession:
         self._resync_required = False
         self._client_incarnation = "unknown-client"
         self._source_label = "unknown-client"
-        self._server_incidents: dict[str, int] = {}
+        self._server_incidents: dict[str, _DelayEpisode] = {}
         self._incident_rate_window_ns = self._last_heartbeat_ns
         self._incident_rate_count = 0
         self._ingress_session_open = False
@@ -281,6 +290,10 @@ class ExecutionControlSession:
         fields = getattr(type(message), "model_fields", {})
         if "server_sequence" in fields:
             updates = {"server_sequence": self._next_server_sequence()}
+            if "received_client_sequence" in fields:
+                updates["received_client_sequence"] = (
+                    str(self._last_client_sequence) if self._last_client_sequence else None
+                )
             if getattr(message, "message_kind", None) in {"snapshot", "delta"}:
                 if self._state_inflight is not None:
                     raise RuntimeError("control state credit is already in flight")
@@ -448,14 +461,24 @@ class ExecutionControlSession:
                 continue
             self._delay_level = level
             self._source.record_delay_transition(stale=level == 2)
-            first = self._source.relative_monotonic_ns(now_ns)
-            self._server_incidents[kind] = first
+            observed = self._source.relative_monotonic_ns(now_ns)
+            episode = self._server_incidents.get(kind)
+            if episode is not None:
+                episode.count += 1
+                episode.last_ns = observed
+                episode.maximum_delay_ns = max(episode.maximum_delay_ns, elapsed)
+                continue
+            episode = _DelayEpisode(
+                f"{self._session_id}.{kind}.{self._challenge_sequence}",
+                observed, observed, maximum_delay_ns=elapsed,
+            )
+            self._server_incidents[kind] = episode
             self._record_incident(
-                incident_id=f"{self._session_id}.{kind}.{self._challenge_sequence}",
+                incident_id=episode.incident_id,
                 incident_kind=kind,
                 phase="activated",
-                first_observed_ns=first,
-                last_observed_ns=first,
+                first_observed_ns=observed,
+                last_observed_ns=observed,
                 occurrence_count=1,
                 maximum_delay_ns=elapsed,
                 reason_code=reason,
@@ -468,20 +491,30 @@ class ExecutionControlSession:
         *,
         reason_code: str = "heartbeat_recovered",
     ) -> None:
-        count = max(1, elapsed_ns // CONTROL_HEARTBEAT_PERIOD_NS)
         last = self._source.relative_monotonic_ns(now_ns)
-        for kind in ("control_delayed", "control_stale"):
-            first = self._server_incidents.pop(kind, None)
-            if first is None:
+        for kind, threshold in (
+            ("control_delayed", CONTROL_HEARTBEAT_DELAYED_NS),
+            ("control_stale", CONTROL_HEARTBEAT_STALE_NS),
+        ):
+            episode = self._server_incidents.get(kind)
+            if episode is None:
                 continue
+            episode.last_ns = last
+            episode.maximum_delay_ns = max(episode.maximum_delay_ns, elapsed_ns)
+            # A late echo proves the transport is alive, not that its delay
+            # recovered. Only an on-time round trip ends this threshold's
+            # continuous episode; the next delayed challenge joins it.
+            if elapsed_ns >= threshold and reason_code == "heartbeat_recovered":
+                continue
+            del self._server_incidents[kind]
             self._record_incident(
-                incident_id=f"{self._session_id}.{kind}.{self._challenge_sequence}",
+                incident_id=episode.incident_id,
                 incident_kind=kind,
                 phase="resolved",
-                first_observed_ns=first,
-                last_observed_ns=last,
-                occurrence_count=count,
-                maximum_delay_ns=elapsed_ns,
+                first_observed_ns=episode.first_ns,
+                last_observed_ns=episode.last_ns,
+                occurrence_count=episode.count,
+                maximum_delay_ns=episode.maximum_delay_ns,
                 reason_code=reason_code,
             )
 
@@ -559,12 +592,11 @@ class ExecutionControlSession:
                 else None
             )
         except Exception as error:
-            frame = self._latest_frame or self._source.current()
             receipt = self._ingress.rejection_receipt(
                 request.command,
                 code=getattr(error, "code", "execution_control_delivery_uncertain"),
-                semantic_owner_epoch=frame.control.semantic_owner_epoch,
-                execution_control_revision=frame.control.execution_control_revision,
+                semantic_owner_epoch=request.command.command_envelope.expected_semantic_owner_epoch,
+                execution_control_revision=request.command.command_envelope.expected_execution_control_revision,
             )
             result = None
         message = ExecutionCommandReceiptMessageDTO(
@@ -594,7 +626,6 @@ class ExecutionControlSession:
                 else self._ordinary_pending
             )
             if pending is not None and not pending.done():
-                frame = self._latest_frame or self._source.current()
                 receipt = self._ingress.rejection_receipt(
                     message.command,
                     code=(
@@ -602,8 +633,8 @@ class ExecutionControlSession:
                         if runtime_scale
                         else "control_session_ordinary_command_pending"
                     ),
-                    semantic_owner_epoch=frame.control.semantic_owner_epoch,
-                    execution_control_revision=frame.control.execution_control_revision,
+                    semantic_owner_epoch=message.command.command_envelope.expected_semantic_owner_epoch,
+                    execution_control_revision=message.command.command_envelope.expected_execution_control_revision,
                 )
                 self._slots.put_receipt(
                     ExecutionCommandReceiptMessageDTO(
@@ -624,12 +655,11 @@ class ExecutionControlSession:
                 transport_kind="websocket",
             )
         except ExecutionControlBusyError:
-            frame = self._latest_frame or self._source.current()
             receipt = self._ingress.rejection_receipt(
                 message.command,
                 code="execution_control_ingress_busy",
-                semantic_owner_epoch=frame.control.semantic_owner_epoch,
-                execution_control_revision=frame.control.execution_control_revision,
+                semantic_owner_epoch=message.command.command_envelope.expected_semantic_owner_epoch,
+                execution_control_revision=message.command.command_envelope.expected_execution_control_revision,
             )
             self._slots.put_receipt(
                 ExecutionCommandReceiptMessageDTO(
@@ -673,9 +703,12 @@ class ExecutionControlSession:
                     raise ValueError("control heartbeat challenge is stale or unknown")
                 self._last_echoed_challenge = challenge
                 now_ns = self._clock_ns()
-                issued_ns = self._challenge_issued_ns or now_ns
+                issued_ns = self._challenge_issued_ns
+                if issued_ns is None:
+                    raise ValueError("control heartbeat has no outstanding challenge")
                 round_trip_ns = max(0, now_ns - issued_ns)
                 self._source.record_heartbeat_echo(round_trip_ns)
+                self._classify_outstanding_heartbeat(now_ns)
                 self._resolve_heartbeat_incidents(now_ns, round_trip_ns)
                 self._delay_level = 0
                 self._challenge_issued_ns = None
@@ -713,15 +746,6 @@ class ExecutionControlSession:
                     reason_code=message.reason_code,
                     now_ns=self._clock_ns(),
                 )
-            elif kind == "resync":
-                message = ControlResyncRequestDTO.model_validate(value)
-                if message.control_session_id != self._session_id:
-                    raise ValueError("control resync names another session")
-                self._admit_client_sequence(message.client_sequence)
-                frame = self._source.current()
-                self._latest_frame = frame
-                self._resync_required = False
-                self._put_state(self._snapshot_message(frame))
             else:
                 raise ValueError("control client message kind is unsupported")
 
@@ -765,7 +789,8 @@ class ExecutionControlSession:
             self._slots.close()
             if self._server_incidents:
                 now_ns = self._clock_ns()
-                issued_ns = self._challenge_issued_ns or now_ns
+                issued_ns = (now_ns if self._challenge_issued_ns is None
+                             else self._challenge_issued_ns)
                 self._resolve_heartbeat_incidents(
                     now_ns,
                     max(0, now_ns - issued_ns),

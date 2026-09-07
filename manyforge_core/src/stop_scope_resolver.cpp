@@ -1041,7 +1041,6 @@ template <typename Intent>
       fixed_budget.kernel_completion_reserve_ns >= fixed_budget.outer_duration_ns ||
       remaining_outer_duration_ns < 0 ||
       remaining_outer_duration_ns > fixed_budget.outer_duration_ns || accepted_at_ns < 0 ||
-      static_cast<std::uint64_t>(accepted_at_ns) > kMaximumIJsonInteger ||
       participant_plans.size() > kMaximumStopAcceptedParticipants) {
     return Result<StopAcceptedDTO>::Err(
         stop_acceptance_input_error("stop_acceptance_budget_invalid"));
@@ -1163,7 +1162,8 @@ Result<StopAcceptedDTO> MakeAggregatedStopAccepted(
     std::span<const StopAcceptedPredecessorInput> predecessors) {
   const bool aggregate_resolution =
       resolution.disposition == StopResolutionDispositionDTO::kPromotedToFull ||
-      (resolution.disposition == StopResolutionDispositionDTO::kExact &&
+      ((resolution.disposition == StopResolutionDispositionDTO::kExact ||
+        resolution.disposition == StopResolutionDispositionDTO::kStaleButUnambiguouslyResolved) &&
        resolution.reason == StopScopeResolutionReasonDTO::kExplicitFullStop);
   if (!aggregate_resolution || !resolution.full_stop || predecessors.empty() ||
       predecessors.size() > kMaximumStopPredecessors || proposed_remaining_outer_duration_ns <= 0) {
@@ -1353,7 +1353,8 @@ std::optional<std::string_view> stop_accepted_field_error(
   }
   if (!accepted.joined_predecessor_stops.empty() &&
       accepted.resolution_disposition != StopResolutionDispositionDTO::kPromotedToFull &&
-      !(accepted.resolution_disposition == StopResolutionDispositionDTO::kExact &&
+      !((accepted.resolution_disposition == StopResolutionDispositionDTO::kExact ||
+         accepted.resolution_disposition == StopResolutionDispositionDTO::kStaleButUnambiguouslyResolved) &&
         accepted.resolution_reason == StopScopeResolutionReasonDTO::kExplicitFullStop)) {
     return "stop_accepted_predecessor_resolution_invalid";
   }
@@ -1367,8 +1368,7 @@ std::optional<std::string_view> stop_accepted_field_error(
       accepted.fixed_kernel_completion_reserve_ns >= accepted.fixed_outer_duration_ns ||
       accepted.remaining_outer_duration_ns < 0 ||
       accepted.remaining_outer_duration_ns > accepted.fixed_outer_duration_ns ||
-      accepted.accepted_at_ns < 0 ||
-      static_cast<std::uint64_t>(accepted.accepted_at_ns) > kMaximumIJsonInteger) {
+      accepted.accepted_at_ns < 0) {
     return "stop_accepted_outer_budget_invalid";
   }
   if (accepted.participant_budget_allocations.size() > kMaximumStopAcceptedParticipants ||

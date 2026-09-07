@@ -186,7 +186,7 @@ def test_normalized_observations_map_to_stable_manager_payloads(
             topic="/isaac_joint_states",
             names=("extra", "joint_b", "joint_a"),
             positions=(9.0, 0.2, 0.1),
-            source_stamp_s=12.5,
+            source_stamp_ns=12500000000,
         ),
     )
     assert joint.quality == "good"
@@ -196,7 +196,7 @@ def test_normalized_observations_map_to_stable_manager_payloads(
 
     pose = PoseSnapshot(
         frame_id="universe",
-        stamp_sec=13.0,
+        stamp_ns=13000000000,
         position_xyz=(0.4, -0.2, 0.1),
         orientation_xyzw=(0.0, 0.0, 0.0, 1.0),
     )
@@ -217,7 +217,7 @@ def test_normalized_observations_map_to_stable_manager_payloads(
                 entity="/mac_n_cheese_centered",
                 pose=PoseSnapshot(
                     frame_id="world",
-                    stamp_sec=13.0,
+                    stamp_ns=13000000000,
                     position_xyz=(0.4, -0.2, 0.1),
                     orientation_xyzw=(0.0, 0.0, 0.0, 1.0),
                 ),
@@ -233,7 +233,7 @@ def test_normalized_observations_map_to_stable_manager_payloads(
             max_position_variance_m2=0.001,
             pose=PoseSnapshot(
                 frame_id="link_base",
-                stamp_sec=13.0,
+                stamp_ns=13000000000,
                 position_xyz=pose.position_xyz,
                 orientation_xyzw=pose.orientation_xyzw,
             ),
@@ -258,7 +258,7 @@ def test_normalized_observations_map_to_stable_manager_payloads(
                 topic="/isaac_joint_states",
                 names=("joint_a",),
                 positions=(0.1,),
-                source_stamp_s=None,
+                source_stamp_ns=None,
             ),
         )
     assert raised.value.code == "joint_set_incomplete"

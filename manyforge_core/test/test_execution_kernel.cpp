@@ -13,6 +13,7 @@
 #include <manyforge_core/execution_interrupt_support.hpp>
 #include <manyforge_core/execution_kernel.hpp>
 #include <manyforge_core/execution_stop_support.hpp>
+#include <manyforge_core/gripper_participant_engine.hpp>
 #include <manyforge_core/logical_scene_identity.hpp>
 #include <manyforge_core/testing/addressed_request_fixtures.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
@@ -330,15 +331,13 @@ class MockFocusedPorts final : public IObservedRobotStateProvider,
       on_validate();
     }
     auto result = next_validation;
-    if (result.valid && !result.error.has_value() &&
-        !result.trajectory_metrics.has_value() && !trajectory.waypoints.empty()) {
+    if (result.valid && !result.error.has_value() && !result.trajectory_metrics.has_value() &&
+        !trajectory.waypoints.empty()) {
       result.trajectory_metrics = TrajectoryValidationMetricsDTO{
           trajectory.waypoints.back().time_from_start_s,
           std::vector<double>(trajectory.joint_names.size(), 0.0),
           std::vector<double>(trajectory.joint_names.size(), 0.0),
-          options.max_tcp_linear_speed_mps > 0.0
-              ? std::optional<double>{0.0}
-              : std::nullopt};
+          options.max_tcp_linear_speed_mps > 0.0 ? std::optional<double>{0.0} : std::nullopt};
     }
     return result;
   }
@@ -2513,6 +2512,47 @@ class ExecutionKernelTest : public ::testing::Test {
 
 // --- Happy path ---
 
+TEST_F(ExecutionKernelTest, IndependentGripperParticipantHasNoMotionLifecycleOrWorkers) {
+  GripperParticipantEngine gripper(context, clock);
+  const auto request = make_test_gripper_request();
+  const auto admitted = gripper.command_gripper(request);
+  ASSERT_TRUE(admitted.accepted);
+  const auto observed = gripper.get_gripper_status(request.gripper_id);
+  const auto invalidations = context.gripper_invalidation_count.load();
+  {
+    ExecutionKernelPorts ports = context;
+    ports.gripper_command_backend = nullptr;
+    ExecutionKernel arm(planner, ports, execution, clock, scheduler, cache);
+    configure_authoritative_collision_validation(arm, collision_world_publisher, collision_engine);
+    const auto motion = arm.execute(make_test_request("independent_arm"));
+    ASSERT_TRUE(motion.ok());
+    ASSERT_TRUE(arm.wait_for_completion(1'000'000'000));
+    EXPECT_TRUE(arm.reset().accepted);
+    EXPECT_EQ(gripper.get_gripper_status(request.gripper_id).generation, observed.generation);
+    EXPECT_EQ(context.gripper_invalidation_count.load(), invalidations);
+    const auto arm_state = arm.get_status();
+    EXPECT_FALSE(gripper.pause().accepted);
+    EXPECT_FALSE(gripper.resume().accepted);
+    EXPECT_FALSE(gripper.execute(make_test_request("wrong_target")).ok());
+    EXPECT_EQ(arm.get_status().execution_id, arm_state.execution_id);
+    EXPECT_EQ(arm.get_status().state, arm_state.state);
+  }
+  EXPECT_EQ(context.gripper_invalidation_count.load(), invalidations);
+  EXPECT_EQ(context.gripper_command_count.load(), 1);
+}
+
+TEST_F(ExecutionKernelTest, MotionParticipantRejectsPreparedCommandLifecycleWithoutEffect) {
+  const auto dispatch = kernel.DispatchPreparedCapabilityCommand(
+      1U, ContentDigest("command.digest"), ControllerGoalId("command.goal"),
+      ControllerGoalGeneration(1U));
+  EXPECT_FALSE(dispatch.ok());
+  EXPECT_FALSE(kernel.ObservePreparedCapabilityCommand(1U).ok());
+  EXPECT_FALSE(kernel.CancelPreparedCapabilityCommand(1U).ok());
+  EXPECT_EQ(context.gripper_command_count.load(), 0);
+  EXPECT_EQ(context.gripper_invalidation_count.load(), 0);
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kIdle);
+}
+
 TEST_F(ExecutionKernelTest, GripperPortDelegatesImmutableCommandStatusAndLoss) {
   GripperCommandRequestDTO request;
   request.gripper_id = "primary";
@@ -2639,14 +2679,12 @@ TEST_F(ExecutionKernelTest, Execute_HappyPath_ReturnsExecutionId) {
   EXPECT_EQ(kernel.get_status().state, ExecutionState::kCompleted);
 }
 
-TEST_F(ExecutionKernelTest,
-       Execute_BackendRejectedDispatchPreservesExactBackendCause) {
+TEST_F(ExecutionKernelTest, Execute_BackendRejectedDispatchPreservesExactBackendCause) {
   execution.next_terminal_state = ExecutionState::kFailed;
-  execution.snapshot.error =
-      ErrorDTO{kErrorExecutionRejected,
-               "Execution progress authority could not be armed",
-               {{"reason", "execution_progress_publication_rejected"},
-                {"publication_reason", "execution_generation_retired"}}};
+  execution.snapshot.error = ErrorDTO{kErrorExecutionRejected,
+                                      "Execution progress authority could not be armed",
+                                      {{"reason", "execution_progress_publication_rejected"},
+                                       {"publication_reason", "execution_generation_retired"}}};
 
   auto result = execute_sync(make_test_request("backend_dispatch_rejected"));
 
@@ -2655,12 +2693,9 @@ TEST_F(ExecutionKernelTest,
   const auto snapshot = kernel.get_execution_snapshot();
   ASSERT_TRUE(snapshot.error.has_value());
   EXPECT_EQ(snapshot.error->code, kErrorExecutionRejected);
-  EXPECT_EQ(snapshot.error->details.at("reason"),
-            "execution_progress_publication_rejected");
-  EXPECT_EQ(snapshot.error->details.at("publication_reason"),
-            "execution_generation_retired");
-  EXPECT_EQ(snapshot.error->details.at("dispatch_boundary"),
-            "execution_backend_handle");
+  EXPECT_EQ(snapshot.error->details.at("reason"), "execution_progress_publication_rejected");
+  EXPECT_EQ(snapshot.error->details.at("publication_reason"), "execution_generation_retired");
+  EXPECT_EQ(snapshot.error->details.at("dispatch_boundary"), "execution_backend_handle");
   EXPECT_EQ(snapshot.error->details.at("execution_generation"), "0");
   const auto outcome = kernel.get_execution_outcome(result.value());
   ASSERT_TRUE(outcome.has_value());
@@ -6249,8 +6284,7 @@ TEST_F(ExecutionKernelTest,
   EXPECT_FALSE(controlled_kernel.get_active_interrupt_latch().has_value());
 }
 
-TEST_F(ExecutionKernelTest,
-       AddressedStopFenceWinsLookaheadHandoffBeforeInterruptedProjection) {
+TEST_F(ExecutionKernelTest, AddressedStopFenceWinsLookaheadHandoffBeforeInterruptedProjection) {
   ControlledExecution controlled_execution;
   controlled_execution.enable_execution_progress_publication();
   ThreadSafeFakeClock local_clock;
@@ -6283,8 +6317,7 @@ TEST_F(ExecutionKernelTest,
                                          {local_lookahead_engine});
   controlled_kernel.subscribe_events([&](const KernelEvent& event) {
     const auto surface = event.details.find("surface");
-    if (event.type == KernelEventType::kCollisionDetected &&
-        surface != event.details.end() &&
+    if (event.type == KernelEventType::kCollisionDetected && surface != event.details.end() &&
         surface->second == "addressed_runtime_collision_authority") {
       controlled_kernel.fence_addressed_participant_stop(
           addressed_execution_id.load(std::memory_order_acquire));
@@ -6332,15 +6365,13 @@ TEST_F(ExecutionKernelTest,
   }
   const auto handoff = std::find_if(captured.begin(), captured.end(), [](const auto& event) {
     const auto surface = event.details.find("surface");
-    return event.type == KernelEventType::kCollisionDetected &&
-           surface != event.details.end() &&
+    return event.type == KernelEventType::kCollisionDetected && surface != event.details.end() &&
            surface->second == "addressed_runtime_collision_authority";
   });
-  const auto interrupted =
-      std::find_if(captured.begin(), captured.end(), [](const auto& event) {
-        return event.type == KernelEventType::kStateTransition &&
-               event.to_state == ExecutionState::kInterrupted;
-      });
+  const auto interrupted = std::find_if(captured.begin(), captured.end(), [](const auto& event) {
+    return event.type == KernelEventType::kStateTransition &&
+           event.to_state == ExecutionState::kInterrupted;
+  });
   ASSERT_NE(handoff, captured.end());
   EXPECT_EQ(interrupted, captured.end());
   EXPECT_EQ(handoff->details.at("addressed_stop_authority_handoff"), "true");

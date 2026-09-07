@@ -153,9 +153,6 @@ class HeadlessStateSource:
                 "message_kind": "delta",
                 "control_session_id": value.get("control_session_id"),
                 "server_sequence": value.get("server_sequence"),
-                "received_client_sequence": value.get(
-                    "received_client_sequence"
-                ),
                 "event_class": "cold",
                 "control": None,
                 "shell": self._local_shell(complete=False),

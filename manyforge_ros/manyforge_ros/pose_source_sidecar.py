@@ -69,7 +69,7 @@ class NormalizedJointState:
     topic: str
     names: tuple[str, ...]
     positions: tuple[float, ...]
-    source_stamp_s: float | None
+    source_stamp_ns: int | None
 
 
 @dataclass(frozen=True)
@@ -372,7 +372,7 @@ def normalize_joint_state_message(message: Any, *, topic: str) -> NormalizedJoin
         topic=normalized_topic,
         names=names,
         positions=positions,
-        source_stamp_s=_stamp_to_float(
+        source_stamp_ns=_stamp_to_ns(
             getattr(getattr(message, "header", None), "stamp", None)
         ),
     )
@@ -640,7 +640,7 @@ def capture_simulation_entity_poses(
                     )
                 pose = PoseSnapshot(
                     frame_id=request.source_coordinate_frame_id,
-                    stamp_sec=pose.stamp_sec,
+                    stamp_ns=pose.stamp_ns,
                     position_xyz=pose.position_xyz,
                     orientation_xyzw=pose.orientation_xyzw,
                 )
@@ -780,7 +780,7 @@ def transform_pose_snapshot(
     )
     return PoseSnapshot(
         frame_id=target_frame,
-        stamp_sec=normalized_pose.stamp_sec,
+        stamp_ns=normalized_pose.stamp_ns,
         position_xyz=transformed_position,
         orientation_xyzw=transformed_orientation,
     )
@@ -821,7 +821,7 @@ def compose_pose_with_local_offset(
     )
     return PoseSnapshot(
         frame_id=normalized_pose.frame_id,
-        stamp_sec=normalized_pose.stamp_sec,
+        stamp_ns=normalized_pose.stamp_ns,
         position_xyz=composed_position,
         orientation_xyzw=_normalize_quaternion(
             _quaternion_multiply(
@@ -863,7 +863,7 @@ def normalize_transform_stamped(transform: Any) -> PoseSnapshot:
         ) from exc
     return PoseSnapshot(
         frame_id=frame_id,
-        stamp_sec=_stamp_to_float(getattr(header, "stamp", None)),
+        stamp_ns=_stamp_to_ns(getattr(header, "stamp", None)),
         position_xyz=position_xyz,
         orientation_xyzw=orientation_xyzw,
     )
@@ -1013,7 +1013,7 @@ def _pose_msg_to_snapshot(
     )
     return PoseSnapshot(
         frame_id=frame_id,
-        stamp_sec=_stamp_to_float(getattr(header, "stamp", None)),
+        stamp_ns=_stamp_to_ns(getattr(header, "stamp", None)),
         position_xyz=position_xyz,
         orientation_xyzw=orientation_xyzw,
     )
@@ -1108,7 +1108,7 @@ def _vector_add(
     return (lhs[0] + rhs[0], lhs[1] + rhs[1], lhs[2] + rhs[2])
 
 
-def _stamp_to_float(stamp: Any) -> float | None:
+def _stamp_to_ns(stamp: Any) -> int | None:
     if stamp is None:
         return None
     sec = getattr(stamp, "sec", None)
@@ -1123,15 +1123,10 @@ def _stamp_to_float(stamp: Any) -> float | None:
             "invalid_timestamp",
             "timestamp nanosec must be in [0, 1000000000)",
         )
-    try:
-        value = float(sec) + float(nanosec) * 1e-9
-    except (TypeError, ValueError, OverflowError) as exc:
+    value = sec * 1_000_000_000 + nanosec
+    if not 0 <= value <= (1 << 63) - 1:
         raise ObservationNormalizationError(
-            "invalid_timestamp", "timestamp must be finite"
-        ) from exc
-    if not isfinite(value):
-        raise ObservationNormalizationError(
-            "invalid_timestamp", "timestamp must be finite"
+            "invalid_timestamp", "timestamp must be a nonnegative signed int64"
         )
     return value
 
@@ -1234,11 +1229,11 @@ def _validated_pose_snapshot(pose: PoseSnapshot, *, label: str) -> PoseSnapshot:
             length=3,
             label=f"{label} position_xyz",
         )
-        stamp_sec = (
-            None
-            if pose.stamp_sec is None
-            else _finite_number(pose.stamp_sec, label=f"{label} stamp_sec")
-        )
+        stamp_ns = pose.stamp_ns
+        if stamp_ns is not None and (
+            type(stamp_ns) is not int or not 0 <= stamp_ns <= (1 << 63) - 1
+        ):
+            raise ValueError(f"{label} stamp_ns must be a nonnegative signed int64")
         orientation_values = _finite_numeric_sequence(
             pose.orientation_xyzw,
             length=4,
@@ -1252,7 +1247,7 @@ def _validated_pose_snapshot(pose: PoseSnapshot, *, label: str) -> PoseSnapshot:
     )
     return PoseSnapshot(
         frame_id=frame_id,
-        stamp_sec=stamp_sec,
+        stamp_ns=stamp_ns,
         position_xyz=position_xyz,  # type: ignore[arg-type]
         orientation_xyzw=orientation_xyzw,
     )

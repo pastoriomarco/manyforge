@@ -3,6 +3,7 @@
 #include <sqlite3.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <limits>
@@ -17,7 +18,6 @@
 #include <vector>
 
 #include <manyforge_content_identity/content_identity.hpp>
-#include <manyforge_deployment/artifact_codec.hpp>
 
 namespace manyforge::headless {
 namespace {
@@ -25,7 +25,7 @@ namespace {
 using content_identity::CanonicalValue;
 
 constexpr int kHistorianApplicationId = 0x4D464548;
-constexpr int kHistorianUserVersion = 1;
+constexpr int kHistorianUserVersion = 2;
 constexpr int kBusyTimeoutMilliseconds = 1000;
 constexpr std::uint64_t kMaximumSafeInteger = 9007199254740991ULL;
 constexpr std::size_t kMaximumRecordRetention = 1000000U;
@@ -57,6 +57,68 @@ CREATE INDEX historian_events_component_idx
 CREATE INDEX historian_events_type_idx
   ON historian_events(event_type, sequence DESC);
 )sql";
+
+// Secondary indexes live with the immutable event, never in another service.
+// External-content FTS retains no second copy of payload_json.
+constexpr std::string_view kQueryIndexSchema = R"sql(
+ALTER TABLE historian_metadata ADD COLUMN prior_pruning_known INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE historian_events ADD COLUMN occurred_at_utc_ns INTEGER;
+ALTER TABLE historian_events ADD COLUMN clock_owner TEXT;
+ALTER TABLE historian_events ADD COLUMN wall_clock_regressed INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE historian_events ADD COLUMN condition_severity TEXT NOT NULL DEFAULT 'INFO';
+ALTER TABLE historian_events ADD COLUMN retention_class INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE historian_events ADD COLUMN record_bytes INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX historian_events_utc_idx ON historian_events(occurred_at_utc_ns,sequence DESC);
+CREATE INDEX historian_events_clock_idx ON historian_events(clock_owner,occurred_at_ns DESC,sequence DESC);
+CREATE INDEX historian_events_severity_idx ON historian_events(condition_severity,sequence DESC);
+CREATE INDEX historian_events_retention_idx ON historian_events(retention_class,sequence);
+CREATE INDEX historian_events_coverage_idx ON historian_events(retention_class,occurred_at_utc_ns);
+CREATE TABLE historian_retention (
+  partition INTEGER PRIMARY KEY CHECK(partition IN (0,1)),
+  pruned_count INTEGER NOT NULL DEFAULT 0,
+  pruned_bytes INTEGER NOT NULL DEFAULT 0,
+  last_pruned_sequence INTEGER
+) STRICT;
+INSERT INTO historian_retention(partition) VALUES(0),(1);
+CREATE TABLE historian_event_keys (
+  sequence INTEGER NOT NULL REFERENCES historian_events(sequence) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  value TEXT NOT NULL,
+  PRIMARY KEY(sequence,kind,value)
+) STRICT, WITHOUT ROWID;
+CREATE INDEX historian_event_keys_lookup_idx ON historian_event_keys(kind,value,sequence DESC);
+CREATE VIEW historian_search_content AS
+  SELECT sequence,component,event_type,payload_json AS details FROM historian_events;
+CREATE VIRTUAL TABLE historian_search USING fts5(
+  component,event_type,details,content='historian_search_content',content_rowid='sequence',tokenize='trigram'
+);
+)sql";
+
+constexpr std::string_view kCorrelationNames =
+    "'program_run_id','operation_id','action_span_id','node_instance_id','node_attempt_id',"
+    "'intervention_session_id','contact_policy_id','incident_id','condition_id','alarm_condition_id',"
+    "'activation_id','stop_id','resource_id','source_owner_epoch','phase','parent_node_attempt_id'";
+const std::set<std::string> kCorrelationKeys{
+    "program_run_id", "operation_id", "action_span_id", "node_instance_id", "node_attempt_id",
+    "intervention_session_id", "contact_policy_id", "incident_id", "condition_id", "alarm_condition_id",
+    "activation_id", "stop_id", "resource_id", "source_owner_epoch", "channel", "phase", "parent_node_attempt_id"};
+
+std::optional<std::string> RecordedClockOwner(const HistorianEvent &event) {
+  if (!event.payload.is_object()) return std::nullopt;
+  const auto text = [&](std::string_view name) -> std::optional<std::string> {
+    const auto *value = event.payload.find_object_member(name);
+    if (value == nullptr || !std::holds_alternative<std::string>(value->storage())) return std::nullopt;
+    const auto &result = value->as_string();
+    return result.empty() || result.size() > 1024U ? std::nullopt : std::optional(result);
+  };
+  if (auto explicit_owner = text("clock_owner")) return explicit_owner;
+  // Only this versioned native adapter proves which clock stamped the event.
+  // Arbitrary nested owner/session IDs are not a clock-domain assertion.
+  if (text("schema_version") == "manyforge.operation_history_event.v1") {
+    if (auto epoch = text("source_owner_epoch")) return "kernel:" + *epoch;
+  }
+  return std::nullopt;
+}
 
 [[noreturn]] void StoreFail(const std::string &code,
                             const std::string &message) {
@@ -91,7 +153,7 @@ void Exec(sqlite3 *database, const std::string &sql) {
     const std::string detail =
         error == nullptr ? SqliteDetail(database, result) : error;
     sqlite3_free(error);
-    StoreFail("historian_storage_failure",
+    StoreFail(result == SQLITE_BUSY || result == SQLITE_LOCKED ? "historian_storage_busy" : "historian_storage_failure",
               "execute SQLite statement: " + detail);
   }
 }
@@ -122,6 +184,14 @@ public:
           "bind SQLite integer");
   }
 
+  void BindNull(const int index) {
+    Check(database_, sqlite3_bind_null(statement_, index), "bind SQLite null");
+  }
+
+  [[nodiscard]] bool IsNull(const int column) const {
+    return sqlite3_column_type(statement_, column) == SQLITE_NULL;
+  }
+
   [[nodiscard]] bool Step() {
     const auto result = sqlite3_step(statement_);
     if (result == SQLITE_ROW) {
@@ -130,7 +200,8 @@ public:
     if (result == SQLITE_DONE) {
       return false;
     }
-    StoreFail(result == SQLITE_BUSY || result == SQLITE_LOCKED
+    StoreFail(result == SQLITE_INTERRUPT ? "historian_query_budget_exceeded" :
+              result == SQLITE_BUSY || result == SQLITE_LOCKED
                   ? "historian_storage_busy"
                   : "historian_storage_failure",
               "step SQLite statement: " + SqliteDetail(database_, result));
@@ -239,6 +310,32 @@ void ValidateQuery(const HistorianQuery &query) {
           "history page limit exceeds 10000");
   Require(query.components.size() <= 256U && query.event_types.size() <= 256U,
           "historian_query_invalid", "history filter exceeds 256 values");
+  Require((!query.start_ns && !query.end_ns) || query.clock_owner.has_value(),
+          "historian_query_invalid", "monotonic filters require an exact clock_owner; use UTC across owners");
+  Require((!query.start_utc_ns || *query.start_utc_ns >= 0) &&
+              (!query.end_utc_ns || *query.end_utc_ns >= 0) &&
+              (!query.start_utc_ns || !query.end_utc_ns || *query.start_utc_ns <= *query.end_utc_ns),
+          "historian_query_invalid", "history UTC bounds are invalid");
+  for (const auto &severity : query.severities) {
+    Require(std::set<std::string>{"DEBUG", "INFO", "WARN", "ERROR", "CRITICAL"}.contains(severity),
+            "historian_query_invalid", "unsupported history severity");
+  }
+  for (const auto &[kind, value] : query.correlations) {
+    Require(kCorrelationKeys.contains(kind) && !value.empty() && value.size() <= 1024U &&
+                content_identity::is_utf8_nfc(value),
+            "historian_query_invalid", "unsupported or invalid history correlation");
+  }
+  Require(!query.clock_owner || (!query.clock_owner->empty() && query.clock_owner->size() <= 1024U &&
+              content_identity::is_utf8_nfc(*query.clock_owner)),
+          "historian_query_invalid", "invalid history clock owner");
+  Require(!query.alarm_phase || std::set<std::string>{"all", "activated", "returned", "acknowledged", "raw"}.contains(*query.alarm_phase),
+          "historian_query_invalid", "unsupported alarm history phase");
+  if (!query.search.empty()) {
+    const auto characters = std::count_if(query.search.begin(), query.search.end(),
+        [](unsigned char byte) { return (byte & 0xc0U) != 0x80U; });
+    Require(query.search.size() <= 256U && characters >= 3 && content_identity::is_utf8_nfc(query.search),
+            "historian_query_invalid", "indexed search requires 3 or more Unicode characters and at most 256 bytes");
+  }
   if (query.start_ns.has_value()) {
     Require(*query.start_ns >= 0, "historian_query_invalid",
             "history start_ns must be nonnegative");
@@ -279,6 +376,87 @@ std::string Placeholders(const std::size_t count) {
   return result;
 }
 
+std::int64_t RetentionPartition(const HistorianEvent &event) {
+  const auto severity = HistorianConditionSeverity(event);
+  return severity == "ERROR" || severity == "CRITICAL" ||
+      event.event_type.find("stop") != std::string::npos ||
+      event.event_type.find("acknowledged") != std::string::npos;
+}
+
+HistorianStoredEvent ReadStoredEvent(const Statement &row, bool indexed = true) {
+  const auto sequence = row.Integer(0);
+  Require(sequence > 0 && static_cast<std::uint64_t>(sequence) <= kMaximumSafeInteger,
+          "historian_storage_corrupt", "historian event sequence is invalid");
+  const auto payload_json = row.Text(7);
+  Require(content_identity::sha256_digest(payload_json) == row.Text(8),
+          "historian_storage_corrupt", "historian payload digest does not match stored bytes");
+  CanonicalValue payload;
+  try {
+    payload = content_identity::parse_canonical_json(payload_json,
+        content_identity::CanonicalJsonParseLimits{kMaximumHistorianPayloadBytes, 65U, 250000U});
+  } catch (const std::exception &error) {
+    StoreFail("historian_storage_corrupt",
+              "historian payload is not strict canonical JSON: " + std::string(error.what()));
+  }
+  auto event = MakeHistorianEvent(row.Text(2), row.Text(3), row.Text(4), row.Integer(5),
+                                  row.Text(6), std::move(payload));
+  const auto event_json = content_identity::canonical_json(HistorianPersistenceValue(event));
+  Require(event.event_id == row.Text(1) &&
+              content_identity::sha256_digest(event_json) == row.Text(9),
+          "historian_storage_corrupt", "historian event identity or digest is invalid");
+  const auto utc = HistorianRecordedUtcNs(event.occurred_at_wall);
+  const auto owner = RecordedClockOwner(event);
+  bool regressed = false;
+  if (indexed) {
+    const auto flag = row.Integer(12);
+    Require(utc.has_value() != row.IsNull(10) && (!utc || *utc == row.Integer(10)) &&
+                owner.has_value() != row.IsNull(11) && (!owner || *owner == row.Text(11)) &&
+                (flag == 0 || flag == 1) && row.Text(13) == HistorianConditionSeverity(event) &&
+                row.Integer(14) == RetentionPartition(event) &&
+                row.Integer(15) == static_cast<std::int64_t>(event_json.size()),
+            "historian_storage_corrupt", "historian query index does not match the original event");
+    regressed = flag == 1;
+  }
+  return {static_cast<std::uint64_t>(sequence), std::move(event), utc, owner, regressed};
+}
+
+constexpr std::string_view kEventColumns =
+    "sequence,event_id,component,event_type,severity,occurred_at_ns,occurred_at_wall,"
+    "payload_json,payload_digest,event_digest";
+const std::string kIndexedEventColumns = std::string(kEventColumns) +
+    ",occurred_at_utc_ns,clock_owner,wall_clock_regressed,condition_severity,retention_class,record_bytes";
+
+class QueryBudget final {
+ public:
+  explicit QueryBudget(sqlite3 *database) : database_(database),
+      deadline_(std::chrono::steady_clock::now() + std::chrono::milliseconds(100)) {
+    sqlite3_progress_handler(database_, 1000, [](void *self) {
+      return std::chrono::steady_clock::now() >= static_cast<QueryBudget *>(self)->deadline_ ? 1 : 0;
+    }, this);
+  }
+  ~QueryBudget() { sqlite3_progress_handler(database_, 0, nullptr, nullptr); }
+  void Check() const {
+    Require(std::chrono::steady_clock::now() < deadline_, "historian_query_budget_exceeded",
+            "history query exceeded its 100 ms work budget; narrow the filters");
+  }
+ private:
+  sqlite3 *database_;
+  std::chrono::steady_clock::time_point deadline_;
+};
+
+struct PartitionUsage {
+  std::int64_t count{}, bytes{}, unknown_time{}, regressed_time{};
+};
+using RetainedUsage = std::array<PartitionUsage, 2>;
+
+void AccumulateUsage(RetainedUsage &usage, const HistorianStoredEvent &stored, std::int64_t bytes) {
+  auto &part = usage.at(static_cast<std::size_t>(RetentionPartition(stored.event)));
+  ++part.count;
+  part.bytes += bytes;
+  part.unknown_time += !stored.occurred_at_utc_ns;
+  part.regressed_time += stored.wall_clock_regressed;
+}
+
 } // namespace
 
 class SqliteEventHistoryStore::Impl final {
@@ -308,6 +486,8 @@ public:
                 "open historian database: " + detail);
     }
     try {
+      Require(sqlite3_db_readonly(database_, "main") == 0, "historian_storage_failure",
+              "historian requires writable storage; read-only fallback is not healthy persistence");
       Configure();
       InitializeOrValidate();
     } catch (...) {
@@ -333,8 +513,19 @@ public:
     std::lock_guard lock(mutex_);
     RequireOpen();
     Transaction transaction(database_);
+    RequireUnchanged();
+    // Check before allocating a sequence. Duplicate delivery must neither
+    // prune nor consume a lifetime sequence allowance.
+    Statement existing(database_, "SELECT event_digest FROM historian_events WHERE event_id=?");
+    existing.Bind(1, event.event_id);
+    if (existing.Step()) {
+      Require(existing.Text(0) == event_digest && !existing.Step(), "historian_event_identity_conflict",
+              "stored historian identity has conflicting content");
+      transaction.Commit();
+      return IEventHistoryStore::AppendStatus::kDuplicate;
+    }
     Statement insert(
-        database_, "INSERT OR IGNORE INTO historian_events("
+        database_, "INSERT INTO historian_events("
                    "event_id,component,event_type,severity,occurred_at_ns,"
                    "occurred_at_wall,payload_json,payload_digest,event_digest) "
                    "VALUES(?,?,?,?,?,?,?,?,?)");
@@ -349,29 +540,15 @@ public:
     insert.Bind(9, event_digest);
     Require(!insert.Step(), "historian_storage_corrupt",
             "historian insert returned an unexpected row");
-    const bool stored = sqlite3_changes(database_) == 1;
-    if (!stored) {
-      Statement existing(
-          database_,
-          "SELECT event_digest FROM historian_events WHERE event_id=?");
-      existing.Bind(1, event.event_id);
-      Require(existing.Step() && existing.Text(0) == event_digest &&
-                  !existing.Step(),
-              "historian_event_identity_conflict",
-              "stored historian identity has conflicting content");
-    } else {
-      Statement prune(
-          database_,
-          "DELETE FROM historian_events WHERE sequence <= COALESCE(("
-          "SELECT sequence FROM historian_events ORDER BY sequence DESC "
-          "LIMIT 1 OFFSET ?),0)");
-      prune.Bind(1, static_cast<std::int64_t>(record_retention_));
-      Require(!prune.Step(), "historian_storage_corrupt",
-              "historian prune returned an unexpected row");
-    }
+    const auto sequence = sqlite3_last_insert_rowid(database_);
+    Require(sequence > 0 && static_cast<std::uint64_t>(sequence) <= kMaximumSafeInteger,
+            "historian_sequence_rollover_required", "historian sequence namespace requires replacement");
+    auto usage = usage_;
+    IndexEvent(sequence, event, payload_json, static_cast<std::int64_t>(event_json.size()), usage);
+    Prune(usage);
     transaction.Commit();
-    return stored ? IEventHistoryStore::AppendStatus::kStored
-                  : IEventHistoryStore::AppendStatus::kDuplicate;
+    usage_ = usage;
+    return IEventHistoryStore::AppendStatus::kStored;
   }
 
   HistorianPage Query(const HistorianQuery &query) {
@@ -379,10 +556,7 @@ public:
     if (query.limit == 0U) {
       return {{}, false, std::nullopt};
     }
-    std::string sql =
-        "SELECT sequence,event_id,component,event_type,severity,"
-        "occurred_at_ns,occurred_at_wall,payload_json,payload_digest,"
-        "event_digest FROM historian_events WHERE 1=1";
+    std::string sql = "SELECT " + kIndexedEventColumns + " FROM historian_events WHERE 1=1";
     if (query.start_ns.has_value()) {
       sql += " AND occurred_at_ns>=?";
     }
@@ -393,17 +567,39 @@ public:
       sql += " AND sequence<?";
     }
     if (!query.components.empty()) {
-      sql +=
-          " AND component IN (" + Placeholders(query.components.size()) + ")";
+      sql += " AND (component GLOB ?";
+      for (std::size_t i = 1; i < query.components.size(); ++i) sql += " OR component GLOB ?";
+      sql += ')';
     }
     if (!query.event_types.empty()) {
       sql +=
           " AND event_type IN (" + Placeholders(query.event_types.size()) + ")";
     }
+    if (query.start_utc_ns) sql += " AND occurred_at_utc_ns>=?";
+    if (query.end_utc_ns) sql += " AND occurred_at_utc_ns<=?";
+    if (query.clock_owner) sql += " AND clock_owner=?";
+    if (!query.severities.empty()) sql += " AND condition_severity IN (" + Placeholders(query.severities.size()) + ")";
+    for (const auto &[kind, value] : query.correlations) {
+      (void)value;
+      sql += kind == "channel" ? " AND component=?"
+          : " AND sequence IN (SELECT sequence FROM historian_event_keys WHERE kind=? AND value=?)";
+    }
+    if (query.alarm_phase) {
+      sql += *query.alarm_phase == "raw" ? " AND component<>'manyforge.alarm'" : " AND component='manyforge.alarm'";
+      if (*query.alarm_phase != "all" && *query.alarm_phase != "raw") {
+        sql += *query.alarm_phase == "acknowledged"
+            ? " AND event_type IN ('operator_alarm_acknowledged','operator_alarms_acknowledged','operator_alarm_bulk_acknowledged')"
+            : " AND event_type=?";
+      }
+    }
+    if (!query.search.empty()) sql += " AND sequence IN (SELECT rowid FROM historian_search WHERE historian_search MATCH ?)";
     sql += " ORDER BY sequence DESC LIMIT ?";
 
     std::lock_guard lock(mutex_);
     RequireOpen();
+    Transaction snapshot(database_);
+    RequireUnchanged();
+    QueryBudget budget(database_);
     Statement statement(database_, sql);
     int parameter = 1;
     if (query.start_ns.has_value()) {
@@ -417,54 +613,51 @@ public:
                      static_cast<std::int64_t>(*query.before_sequence));
     }
     for (const auto &component : query.components) {
-      statement.Bind(parameter++, component);
+      std::string prefix;
+      for (const auto character : component) {
+        if (character == '*' || character == '?' || character == '[') prefix += '[' + std::string(1, character) + ']';
+        else prefix += character;
+      }
+      statement.Bind(parameter++, prefix + '*');
     }
     for (const auto &event_type : query.event_types) {
       statement.Bind(parameter++, event_type);
+    }
+    if (query.start_utc_ns) statement.Bind(parameter++, *query.start_utc_ns);
+    if (query.end_utc_ns) statement.Bind(parameter++, *query.end_utc_ns);
+    if (query.clock_owner) statement.Bind(parameter++, *query.clock_owner);
+    for (const auto &severity : query.severities) statement.Bind(parameter++, severity);
+    for (const auto &[kind, value] : query.correlations) {
+      if (kind != "channel") statement.Bind(parameter++, kind);
+      statement.Bind(parameter++, value);
+    }
+    if (query.alarm_phase && *query.alarm_phase != "all" && *query.alarm_phase != "raw" && *query.alarm_phase != "acknowledged") {
+      statement.Bind(parameter++, "operator_alarm_" + *query.alarm_phase);
+    }
+    if (!query.search.empty()) {
+      const auto quote = [](std::string_view text) {
+        std::string phrase = "\"";
+        for (const auto c : text) {
+          phrase += c;
+          if (c == '"') phrase += '"';
+        }
+        return phrase + '"';
+      };
+      // Search original fields and JSON string contents without materializing
+      // another decoded text copy. Quoting prevents FTS query syntax injection.
+      auto phrase = quote(query.search);
+      const auto encoded = content_identity::canonical_json(CanonicalValue(query.search));
+      const auto escaped = encoded.substr(1, encoded.size() - 2);
+      if (escaped != query.search) phrase += " OR " + quote(escaped);
+      statement.Bind(parameter++, phrase);
     }
     statement.Bind(parameter, static_cast<std::int64_t>(query.limit + 1U));
 
     std::vector<HistorianStoredEvent> events;
     events.reserve(query.limit + 1U);
     while (statement.Step()) {
-      const auto sequence = statement.Integer(0);
-      const auto event_id = statement.Text(1);
-      const auto component = statement.Text(2);
-      const auto event_type = statement.Text(3);
-      const auto severity = statement.Text(4);
-      const auto occurred_at_ns = statement.Integer(5);
-      const auto occurred_at_wall = statement.Text(6);
-      const auto payload_json = statement.Text(7);
-      const auto payload_digest = statement.Text(8);
-      const auto event_digest = statement.Text(9);
-      Require(sequence > 0 &&
-                  static_cast<std::uint64_t>(sequence) <= kMaximumSafeInteger,
-              "historian_storage_corrupt",
-              "historian event sequence is invalid");
-      Require(content_identity::sha256_digest(payload_json) == payload_digest,
-              "historian_storage_corrupt",
-              "historian payload digest does not match stored bytes");
-      CanonicalValue payload;
-      try {
-        const auto decoded =
-            deployment::parse_strict_json_model_yaml(payload_json);
-        payload = decoded.root();
-      } catch (const std::exception &error) {
-        StoreFail("historian_storage_corrupt",
-                  "historian payload is not strict canonical JSON: " +
-                      std::string(error.what()));
-      }
-      auto event =
-          MakeHistorianEvent(component, event_type, severity, occurred_at_ns,
-                             occurred_at_wall, std::move(payload));
-      Require(
-          event.event_id == event_id &&
-              content_identity::sha256_digest(content_identity::canonical_json(
-                  HistorianPersistenceValue(event))) == event_digest,
-          "historian_storage_corrupt",
-          "historian event identity or digest is invalid");
-      events.push_back(
-          {static_cast<std::uint64_t>(sequence), std::move(event)});
+      events.push_back(ReadStoredEvent(statement));
+      budget.Check();
     }
     const bool truncated = events.size() > query.limit;
     if (truncated) {
@@ -473,24 +666,61 @@ public:
     const auto next = truncated && !events.empty()
                           ? std::optional<std::uint64_t>(events.back().sequence)
                           : std::nullopt;
-    return {std::move(events), truncated, next};
+    return {std::move(events), truncated, next, Retention()};
   }
 
   std::optional<HistorianStoredEvent> Read(const std::uint64_t sequence) {
     Require(sequence > 0U && sequence <= kMaximumSafeInteger,
             "historian_query_invalid", "history detail sequence is invalid");
-    const auto page = Query(HistorianQuery{
-        .start_ns = std::nullopt,
-        .end_ns = std::nullopt,
-        .components = {},
-        .event_types = {},
-        .before_sequence = sequence + 1U,
-        .limit = 1U,
-    });
-    if (page.events.empty() || page.events.front().sequence != sequence) {
+    std::lock_guard lock(mutex_);
+    RequireOpen();
+    Transaction snapshot(database_);
+    RequireUnchanged();
+    QueryBudget budget(database_);
+    Statement row(database_, "SELECT " + kIndexedEventColumns +
+                              " FROM historian_events WHERE sequence=?");
+    row.Bind(1, static_cast<std::int64_t>(sequence));
+    if (!row.Step()) {
       return std::nullopt;
     }
-    return page.events.front();
+    auto stored = ReadStoredEvent(row);
+    budget.Check();
+    return stored;
+  }
+
+  CanonicalValue Discover(const std::string &kind, const std::string &after, std::size_t limit) {
+    Require((kind == "component" || kind == "event_type" || kCorrelationKeys.contains(kind)) &&
+                after.size() <= 1024U && content_identity::is_utf8_nfc(after) && limit > 0 && limit <= 32,
+            "historian_query_invalid", "invalid bounded history discovery query");
+    // Channel is the historical UI name for the producing component, not
+    // an unrelated string nested in a producer's payload.
+    const std::string field = kind == "channel" ? "component" : kind;
+    const bool column = field == "component" || field == "event_type";
+    // The only SQL identifiers are this closed, owner-defined pair. All
+    // caller-supplied values remain bound parameters.
+    const std::string sql = column
+        ? "SELECT DISTINCT " + field + " FROM historian_events WHERE " + field + ">? AND length(CAST(" + field + " AS BLOB)) BETWEEN 1 AND 1024 ORDER BY " + field + " LIMIT ?"
+        : "SELECT DISTINCT value FROM historian_event_keys WHERE kind=? AND value>? ORDER BY value LIMIT ?";
+    std::lock_guard lock(mutex_);
+    RequireOpen();
+    Transaction snapshot(database_);
+    RequireUnchanged();
+    QueryBudget budget(database_);
+    Statement rows(database_, sql);
+    int parameter = 1;
+    if (!column) rows.Bind(parameter++, kind);
+    rows.Bind(parameter++, after);
+    rows.Bind(parameter, static_cast<std::int64_t>(limit + 1));
+    CanonicalValue::Array values;
+    while (rows.Step()) values.emplace_back(rows.Text(0));
+    const bool truncated = values.size() > limit;
+    if (truncated) values.resize(limit);
+    const CanonicalValue next = truncated ? values.back() : CanonicalValue(nullptr);
+    return CanonicalValue(CanonicalValue::Object{
+        {"schema_version", CanonicalValue("manyforge.historian_discovery.v1")},
+        {"kind", CanonicalValue(kind)}, {"values", CanonicalValue(std::move(values))},
+        {"truncated", CanonicalValue(truncated)}, {"next_after", next},
+    });
   }
 
   void Close() {
@@ -498,8 +728,6 @@ public:
     if (closed_) {
       return;
     }
-    sqlite3_wal_checkpoint_v2(database_, nullptr, SQLITE_CHECKPOINT_TRUNCATE,
-                              nullptr, nullptr);
     const auto result = sqlite3_close(database_);
     if (result != SQLITE_OK) {
       StoreFail("historian_storage_failure",
@@ -510,20 +738,166 @@ public:
   }
 
 private:
+  void IndexEvent(std::int64_t sequence, const HistorianEvent &event, const std::string &payload_json,
+                  std::int64_t record_bytes, RetainedUsage &usage) {
+    const auto utc = HistorianRecordedUtcNs(event.occurred_at_wall);
+    const auto clock = RecordedClockOwner(event);
+    bool regressed = false;
+    if (clock && utc) {
+      Statement previous(database_, "SELECT occurred_at_ns,occurred_at_utc_ns FROM historian_events "
+          "WHERE clock_owner=? AND occurred_at_utc_ns IS NOT NULL AND occurred_at_ns<? "
+          "ORDER BY occurred_at_ns DESC,sequence DESC LIMIT 1");
+      previous.Bind(1, *clock);
+      previous.Bind(2, event.occurred_at_ns);
+      if (previous.Step()) regressed = *utc < previous.Integer(1);
+      // Late ingest can also prove a regression at an already retained
+      // successor. This is a sticky derived uncertainty flag; original event
+      // bytes/digests and source order never change.
+      Statement next(database_, "SELECT sequence,occurred_at_utc_ns,retention_class,wall_clock_regressed FROM historian_events "
+          "WHERE clock_owner=? AND occurred_at_utc_ns IS NOT NULL AND occurred_at_ns>? ORDER BY occurred_at_ns,sequence LIMIT 1");
+      next.Bind(1, *clock);
+      next.Bind(2, event.occurred_at_ns);
+      if (next.Step() && *utc > next.Integer(1) && next.Integer(3) == 0) {
+        Statement mark(database_, "UPDATE historian_events SET wall_clock_regressed=1 WHERE sequence=?");
+        mark.Bind(1, next.Integer(0));
+        Require(!mark.Step(), "historian_storage_corrupt", "historian clock flag update returned a row");
+        ++usage.at(static_cast<std::size_t>(next.Integer(2))).regressed_time;
+      }
+    }
+    const auto condition_severity = HistorianConditionSeverity(event);
+    const auto partition = RetentionPartition(event);
+    Statement time_index(database_, "UPDATE historian_events SET occurred_at_utc_ns=?,clock_owner=?,wall_clock_regressed=?,"
+        "condition_severity=?,retention_class=?,record_bytes=? WHERE sequence=?");
+    if (utc) time_index.Bind(1, *utc); else time_index.BindNull(1);
+    if (clock) time_index.Bind(2, *clock); else time_index.BindNull(2);
+    time_index.Bind(3, static_cast<std::int64_t>(regressed));
+    time_index.Bind(4, condition_severity);
+    time_index.Bind(5, partition);
+    time_index.Bind(6, record_bytes);
+    time_index.Bind(7, sequence);
+    Require(!time_index.Step(), "historian_storage_corrupt", "historian time index returned a row");
+    Statement keys(database_, "INSERT OR IGNORE INTO historian_event_keys(sequence,kind,value) "
+        "SELECT ?,key,value FROM json_tree(?) WHERE type='text' AND key IN (" + std::string(kCorrelationNames) + ") AND length(CAST(value AS BLOB)) BETWEEN 1 AND 1024");
+    keys.Bind(1, sequence);
+    keys.Bind(2, payload_json);
+    Require(!keys.Step(), "historian_storage_corrupt", "historian correlation index returned a row");
+    Statement search(database_, "INSERT INTO historian_search(rowid,component,event_type,details) "
+        "SELECT sequence,component,event_type,details FROM historian_search_content WHERE sequence=?");
+    search.Bind(1, sequence);
+    Require(!search.Step(), "historian_storage_corrupt", "historian text index returned a row");
+    auto &part = usage.at(static_cast<std::size_t>(partition));
+    ++part.count;
+    part.bytes += record_bytes;
+    part.unknown_time += !utc;
+    part.regressed_time += regressed;
+  }
+
+  void Prune(RetainedUsage &usage) {
+    for (std::int64_t partition : {0, 1}) {
+      auto &part = usage.at(static_cast<std::size_t>(partition));
+      for (;;) {
+        if (part.count <= static_cast<std::int64_t>(record_retention_) && part.bytes <= 16LL * 1024LL * 1024LL) break;
+        Statement oldest(database_, "SELECT " + kIndexedEventColumns + " FROM historian_events WHERE retention_class=? ORDER BY sequence LIMIT 1");
+        oldest.Bind(1, partition);
+        Require(oldest.Step(), "historian_storage_corrupt", "historian retention count has no record");
+        const auto stored = ReadStoredEvent(oldest);
+        const auto sequence = oldest.Integer(0), bytes = oldest.Integer(15);
+        Statement remove_index(database_, "INSERT INTO historian_search(historian_search,rowid,component,event_type,details) "
+            "SELECT 'delete',sequence,component,event_type,details FROM historian_search_content WHERE sequence=?");
+        remove_index.Bind(1, sequence);
+        Require(!remove_index.Step(), "historian_storage_corrupt", "historian index deletion returned a row");
+        Statement remove(database_, "DELETE FROM historian_events WHERE sequence=?");
+        remove.Bind(1, sequence);
+        Require(!remove.Step(), "historian_storage_corrupt", "historian deletion returned a row");
+        Statement loss(database_, "UPDATE historian_retention SET "
+            "pruned_count=min(pruned_count,9007199254740990)+1,pruned_bytes=min(pruned_bytes,9223372036854775807-?)+?,"
+            "last_pruned_sequence=? WHERE partition=?");
+        loss.Bind(1, bytes);
+        loss.Bind(2, bytes);
+        loss.Bind(3, sequence);
+        loss.Bind(4, partition);
+        Require(!loss.Step(), "historian_storage_corrupt", "historian prune fact returned a row");
+        --part.count;
+        part.bytes -= bytes;
+        part.unknown_time -= !stored.occurred_at_utc_ns;
+        part.regressed_time -= stored.wall_clock_regressed;
+      }
+    }
+  }
+
+  CanonicalValue Retention() {
+    Statement rows(database_, "SELECT partition,pruned_count,pruned_bytes,last_pruned_sequence FROM historian_retention ORDER BY partition");
+    CanonicalValue::Array partitions;
+    while (rows.Step()) {
+      Require(rows.Integer(0) == static_cast<std::int64_t>(partitions.size()) && rows.Integer(0) < 2 &&
+                  rows.Integer(1) >= 0 && static_cast<std::uint64_t>(rows.Integer(1)) <= kMaximumSafeInteger &&
+                  rows.Integer(2) >= 0 && (rows.IsNull(3) || (rows.Integer(3) > 0 &&
+                  static_cast<std::uint64_t>(rows.Integer(3)) <= kMaximumSafeInteger)),
+              "historian_storage_corrupt", "historian loss metadata is invalid");
+      CanonicalValue::Object part{{"partition", CanonicalValue(rows.Integer(0) == 0 ? "routine" : "important")}};
+      const auto &usage = usage_.at(static_cast<std::size_t>(rows.Integer(0)));
+      for (const auto &[name, value] : std::vector<std::pair<std::string_view, std::int64_t>>{
+          {"retained_count",usage.count},{"retained_bytes",usage.bytes},
+          {"unknown_time_count",usage.unknown_time},{"regressed_time_count",usage.regressed_time}}) {
+        part.emplace_back(name, CanonicalValue(std::to_string(value)));
+      }
+      part.emplace_back("loss_counter_saturated", CanonicalValue(
+          static_cast<std::uint64_t>(rows.Integer(1)) == kMaximumSafeInteger ||
+          rows.Integer(2) == std::numeric_limits<std::int64_t>::max()));
+      for (const auto &[column, name] : std::vector<std::pair<int, std::string_view>>{
+          {1,"pruned_count"},{2,"pruned_bytes"},{3,"last_pruned_sequence"}}) {
+        part.emplace_back(name, rows.IsNull(column) ? CanonicalValue(nullptr) : CanonicalValue(std::to_string(rows.Integer(column))));
+      }
+      for (bool latest : {false, true}) {
+        Statement edge(database_, "SELECT occurred_at_utc_ns FROM historian_events WHERE retention_class=? AND occurred_at_utc_ns IS NOT NULL "
+            "ORDER BY occurred_at_utc_ns " + std::string(latest ? "DESC" : "ASC") + " LIMIT 1");
+        edge.Bind(1, rows.Integer(0));
+        part.emplace_back(latest ? "last_recorded_utc_ns" : "first_recorded_utc_ns",
+                          edge.Step() ? CanonicalValue(std::to_string(edge.Integer(0))) : CanonicalValue(nullptr));
+      }
+      partitions.emplace_back(std::move(part));
+    }
+    Require(partitions.size() == 2, "historian_storage_corrupt", "historian loss metadata is incomplete");
+    const auto prior_pruning_known = ScalarInteger(database_, "SELECT prior_pruning_known FROM historian_metadata WHERE singleton=1");
+    Require(prior_pruning_known == 0 || prior_pruning_known == 1,
+            "historian_storage_corrupt", "historian coverage metadata is invalid");
+    return CanonicalValue(CanonicalValue::Object{
+        {"schema_version", CanonicalValue("manyforge.historian_retention.v1")},
+        {"partitions", CanonicalValue(std::move(partitions))},
+        {"partition_row_limit", CanonicalValue(std::to_string(record_retention_))},
+        {"partition_record_byte_limit", CanonicalValue("16777216")},
+        {"database_page_byte_limit", CanonicalValue("536870912")},
+        {"duration_guaranteed", CanonicalValue(false)},
+        {"prior_pruning_known", CanonicalValue(prior_pruning_known == 1)},
+    });
+  }
+
   void RequireOpen() const {
     Require(!closed_ && database_ != nullptr, "historian_closed",
             "historian database is closed");
   }
 
+  void RequireUnchanged() const {
+    // Called under BEGIN IMMEDIATE, not before acquiring the SQLite snapshot:
+    // another connection cannot change an index between this check and use.
+    Require(ScalarInteger(database_, "PRAGMA data_version") == database_version_,
+            "historian_storage_changed", "historian storage was changed by another writer; reopen and validate before use");
+  }
+
   void Configure() {
     Check(database_, sqlite3_busy_timeout(database_, kBusyTimeoutMilliseconds),
           "configure historian busy timeout");
-    Exec(database_, "PRAGMA journal_mode=WAL");
+    // This store already serializes its sole connection. WAL adds no reader
+    // concurrency here, but a foreign reader can prevent its reclamation.
+    // A rollback journal bounds storage by the page image, is reused after
+    // each transaction, and reports a busy/full sink through existing health.
+    Statement journal_mode(database_, "PRAGMA journal_mode=TRUNCATE");
+    Require(journal_mode.Step() && journal_mode.Text(0) == "truncate" && !journal_mode.Step(),
+            "historian_storage_failure", "historian rollback journal could not be configured");
     Exec(database_, "PRAGMA synchronous=FULL");
     Exec(database_, "PRAGMA foreign_keys=ON");
     Exec(database_, "PRAGMA trusted_schema=OFF");
     Exec(database_, "PRAGMA recursive_triggers=OFF");
-    Exec(database_, "PRAGMA wal_autocheckpoint=1000");
     const auto page_size = ScalarInteger(database_, "PRAGMA page_size");
     Require(page_size > 0, "historian_storage_corrupt",
             "historian SQLite page size is invalid");
@@ -536,6 +910,48 @@ private:
             "historian SQLite page ceiling could not be configured");
     sqlite3_limit(database_, SQLITE_LIMIT_LENGTH,
                   static_cast<int>(512U * 1024U));
+  }
+
+  struct LegacyLoss { std::int64_t cutoff{}, count{}, bytes{}; };
+
+  std::array<LegacyLoss, 2> ReclaimLegacyIndexSpace() {
+    RetainedUsage retained_usage{};
+    std::array<LegacyLoss, 2> loss{};
+    // Verify all originals before deleting any row. Keep each class's newest
+    // bounded suffix; the same transaction records exactly what was pruned.
+    {
+      Statement rows(database_, "SELECT " + std::string(kEventColumns) + " FROM historian_events ORDER BY sequence DESC");
+      while (rows.Step()) {
+        const auto stored = ReadStoredEvent(rows, false);
+        const auto bytes = static_cast<std::int64_t>(content_identity::canonical_json(HistorianPersistenceValue(stored.event)).size());
+        const auto partition = static_cast<std::size_t>(RetentionPartition(stored.event));
+        auto &kept = retained_usage.at(partition);
+        auto &pruned = loss.at(partition);
+        if (pruned.cutoff != 0 || kept.count >= static_cast<std::int64_t>(record_retention_) ||
+            kept.bytes + bytes > 16LL * 1024LL * 1024LL) {
+          if (pruned.cutoff == 0) pruned.cutoff = static_cast<std::int64_t>(stored.sequence);
+          ++pruned.count;
+          pruned.bytes += bytes;
+        } else {
+          ++kept.count;
+          kept.bytes += bytes;
+        }
+      }
+    }
+    const std::string condition = "(CASE WHEN json_extract(payload_json,'$.schema_version')='manyforge.client_incident_event.v1' "
+        "AND json_extract(payload_json,'$.original_severity') IN ('WARN','ERROR','CRITICAL') "
+        "THEN json_extract(payload_json,'$.original_severity') ELSE severity END)";
+    const std::string partition_sql = "CASE WHEN " + condition + " IN ('ERROR','CRITICAL') OR instr(event_type,'stop')>0 "
+        "OR instr(event_type,'acknowledged')>0 THEN 1 ELSE 0 END";
+    for (std::size_t partition = 0; partition < loss.size(); ++partition) {
+      if (loss[partition].cutoff == 0) continue;
+      Statement remove(database_, "DELETE FROM historian_events WHERE sequence<=? AND (" + partition_sql + ")=?");
+      remove.Bind(1, loss[partition].cutoff);
+      remove.Bind(2, static_cast<std::int64_t>(partition));
+      Require(!remove.Step() && sqlite3_changes64(database_) == loss[partition].count,
+              "historian_storage_corrupt", "legacy retention classification differs from verified records");
+    }
+    return loss;
   }
 
   void InitializeOrValidate() {
@@ -551,7 +967,7 @@ private:
       Exec(database_,
            "PRAGMA application_id=" + std::to_string(kHistorianApplicationId));
       Exec(database_,
-           "PRAGMA user_version=" + std::to_string(kHistorianUserVersion));
+           "PRAGMA user_version=1");
       Statement metadata(database_,
                          "INSERT INTO historian_metadata("
                          "singleton,schema_id,schema_version,record_retention) "
@@ -560,13 +976,47 @@ private:
       Require(!metadata.Step(), "historian_storage_corrupt",
               "historian metadata insert returned a row");
     }
-    const std::set<std::string> expected{
+    std::set<std::string> expected{
         "index:historian_events_component_idx",
         "index:historian_events_time_idx",
         "index:historian_events_type_idx",
         "table:historian_events",
         "table:historian_metadata",
     };
+    const auto version = ScalarInteger(database_, "PRAGMA user_version");
+    if (version == 1) {
+      Require(SchemaObjectNames(database_) == expected &&
+                  ScalarInteger(database_, "PRAGMA application_id") == kHistorianApplicationId,
+              "historian_storage_foreign", "legacy historian schema is invalid");
+      Statement metadata(database_, "SELECT schema_id,schema_version,record_retention FROM historian_metadata WHERE singleton=1");
+      Require(metadata.Step() && metadata.Text(0) == "manyforge.event_historian" && metadata.Integer(1) == 1 &&
+                  metadata.Integer(2) == static_cast<std::int64_t>(record_retention_) && !metadata.Step(),
+              "historian_storage_foreign", "legacy historian metadata is invalid");
+      const auto loss = ReclaimLegacyIndexSpace();
+      Exec(database_, std::string(kQueryIndexSchema));
+      for (std::size_t partition = 0; partition < loss.size(); ++partition) {
+        Statement record_loss(database_, "UPDATE historian_retention SET pruned_count=?,pruned_bytes=?,last_pruned_sequence=? WHERE partition=?");
+        record_loss.Bind(1, loss[partition].count);
+        record_loss.Bind(2, loss[partition].bytes);
+        if (loss[partition].cutoff) record_loss.Bind(3, loss[partition].cutoff); else record_loss.BindNull(3);
+        record_loss.Bind(4, static_cast<std::int64_t>(partition));
+        Require(!record_loss.Step(), "historian_storage_corrupt", "legacy prune accounting returned a row");
+      }
+      if (objects.empty()) Exec(database_, "UPDATE historian_metadata SET prior_pruning_known=1 WHERE singleton=1");
+      Statement rows(database_, "SELECT " + std::string(kEventColumns) + " FROM historian_events ORDER BY sequence");
+      while (rows.Step()) {
+        const auto stored = ReadStoredEvent(rows, false);
+        IndexEvent(static_cast<std::int64_t>(stored.sequence), stored.event, rows.Text(7),
+            static_cast<std::int64_t>(content_identity::canonical_json(HistorianPersistenceValue(stored.event)).size()), usage_);
+      }
+      Prune(usage_);
+      Exec(database_, "UPDATE historian_metadata SET schema_version=2 WHERE singleton=1");
+      Exec(database_, "PRAGMA user_version=2");
+    }
+    expected.insert({"index:historian_events_utc_idx", "index:historian_events_clock_idx", "index:historian_events_severity_idx",
+        "index:historian_event_keys_lookup_idx", "index:historian_events_retention_idx", "index:historian_events_coverage_idx",
+        "table:historian_retention", "table:historian_event_keys", "table:historian_search", "view:historian_search_content",
+        "table:historian_search_data", "table:historian_search_idx", "table:historian_search_docsize", "table:historian_search_config"});
     Require(SchemaObjectNames(database_) == expected,
             "historian_storage_foreign",
             "historian database contains an unexpected schema");
@@ -581,12 +1031,37 @@ private:
                        "FROM historian_metadata WHERE singleton=1");
     Require(metadata.Step() &&
                 metadata.Text(0) == "manyforge.event_historian" &&
-                metadata.Integer(1) == 1 &&
+                metadata.Integer(1) == kHistorianUserVersion &&
                 metadata.Integer(2) ==
                     static_cast<std::int64_t>(record_retention_) &&
                 !metadata.Step(),
             "historian_storage_foreign",
             "historian metadata is invalid or configuration changed");
+    // There is no persisted usage counter that can authorize deleting rows.
+    // Rebuild the tiny writer cache from intact rows once, then change a local
+    // copy with each transaction and expose it only after commit.
+    usage_ = {};
+    Statement retained(database_, "SELECT " + kIndexedEventColumns + " FROM historian_events ORDER BY sequence");
+    while (retained.Step()) {
+      const auto stored = ReadStoredEvent(retained);
+      AccumulateUsage(usage_, stored, retained.Integer(15));
+    }
+    // Derived indexes are not independent evidence. Validate them against
+    // intact originals once before any query can use their result.
+    const std::string expected_keys = "SELECT DISTINCT e.sequence,j.key,j.value FROM historian_events e,json_tree(e.payload_json) j "
+        "WHERE j.type='text' AND j.key IN (" + std::string(kCorrelationNames) + ") AND length(CAST(j.value AS BLOB)) BETWEEN 1 AND 1024";
+    for (const bool missing : {false, true}) {
+      const std::string actual = "SELECT sequence,kind,value FROM historian_event_keys";
+      Statement difference(database_, (missing ? expected_keys + " EXCEPT " + actual : actual + " EXCEPT " + expected_keys) + " LIMIT 1");
+      Require(!difference.Step(), "historian_storage_corrupt", "historian correlation index differs from original records");
+    }
+    try {
+      Exec(database_, "INSERT INTO historian_search(historian_search,rank) VALUES('integrity-check',1)");
+    } catch (const EventHistorianError &error) {
+      StoreFail("historian_storage_corrupt", "historian search index differs from original records: " + std::string(error.what()));
+    }
+    static_cast<void>(Retention());
+    database_version_ = ScalarInteger(database_, "PRAGMA data_version");
     transaction.Commit();
   }
 
@@ -595,6 +1070,8 @@ private:
   std::mutex mutex_;
   sqlite3 *database_{};
   bool closed_{};
+  RetainedUsage usage_{};
+  std::int64_t database_version_{};
 };
 
 SqliteEventHistoryStore::SqliteEventHistoryStore(
@@ -611,6 +1088,10 @@ SqliteEventHistoryStore::Append(const HistorianEvent &event) {
 
 HistorianPage SqliteEventHistoryStore::Query(const HistorianQuery &query) {
   return impl_->Query(query);
+}
+
+CanonicalValue SqliteEventHistoryStore::Discover(const std::string &kind, const std::string &after, std::size_t limit) {
+  return impl_->Discover(kind, after, limit);
 }
 
 std::optional<HistorianStoredEvent>

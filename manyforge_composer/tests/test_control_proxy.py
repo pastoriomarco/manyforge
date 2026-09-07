@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 import threading
 from typing import Any
 
@@ -13,6 +14,7 @@ from manyforge_composer.backend.headless_ws import (
     serve_headless_state,
 )
 from manyforge_composer.backend.state import ComposerState
+from manyforge_headless_api.control_protocol import ExecutionControlDeltaDTO
 
 
 class _Client:
@@ -72,6 +74,27 @@ def test_source_forwards_receipts_without_reencoding_them() -> None:
     receipt = '{ "schema_version":"manyforge.execution_control.v2", "message_kind":"command_receipt" }'
 
     assert source.enrich(receipt) == receipt
+
+
+def test_actual_local_delta_matches_the_public_dto_without_an_owner_claim() -> None:
+    source = _source()
+    template = json.loads(_owner_snapshot())
+    template["state_sequence"] = "7"
+    template["received_client_sequence"] = "11"
+    local = json.loads(source.local_delta(json.dumps(template)))
+    assert ExecutionControlDeltaDTO.model_validate(local).model_dump(mode="json") == local
+    assert "state_sequence" not in local
+    assert "received_client_sequence" not in local
+    assert local["control"] is None
+    assert local["shell"]["complete"] is False
+    fixture = json.loads((Path(__file__).parents[2] / "manyforge_headless_api/tests/fixtures/control-v2-local-delta.json").read_text())
+    # Only runtime identities/revisions vary. The real producer must have
+    # exactly the same wire shape consumed by Python and the browser.
+    expected = fixture["local_delta"]
+    assert set(local) == set(expected)
+    assert set(local["shell"]) == set(expected["shell"])
+    for key in ("schema_version", "message_kind", "event_class", "control"):
+        assert local[key] == expected[key]
 
 
 class _Upstream:

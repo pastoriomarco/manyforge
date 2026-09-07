@@ -1,4 +1,5 @@
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
@@ -34,15 +35,14 @@ constexpr std::size_t kHeaderBytes = 16U;
   throw std::runtime_error(std::move(message));
 }
 
-void constrain_to_parent(int argc, char** argv) {
+void constrain_to_parent(int argc, char **argv) {
   if (argc != 3 || std::string_view(argv[1]) != "--parent-pid") {
     fail("usage: fake_process_candidate_worker --parent-pid PID");
   }
   pid_t expected_parent{};
   const std::string_view encoded(argv[2]);
-  const auto parsed =
-      std::from_chars(encoded.data(), encoded.data() + encoded.size(),
-                      expected_parent);
+  const auto parsed = std::from_chars(
+      encoded.data(), encoded.data() + encoded.size(), expected_parent);
   if (encoded.empty() || parsed.ec != std::errc{} ||
       parsed.ptr != encoded.data() + encoded.size() || expected_parent <= 0) {
     fail("fake worker parent PID is malformed");
@@ -55,8 +55,8 @@ void constrain_to_parent(int argc, char** argv) {
   }
 }
 
-void read_all(int descriptor, void* output, std::size_t size) {
-  auto* bytes = static_cast<char*>(output);
+void read_all(int descriptor, void *output, std::size_t size) {
+  auto *bytes = static_cast<char *>(output);
   std::size_t offset = 0U;
   while (offset < size) {
     const auto count = ::read(descriptor, bytes + offset, size - offset);
@@ -70,11 +70,12 @@ void read_all(int descriptor, void* output, std::size_t size) {
   }
 }
 
-void write_all(int descriptor, const void* input, std::size_t size) {
-  const auto* bytes = static_cast<const char*>(input);
+void write_all(int descriptor, const void *input, std::size_t size) {
+  const auto *bytes = static_cast<const char *>(input);
   std::size_t offset = 0U;
   while (offset < size) {
-    const auto count = ::send(descriptor, bytes + offset, size - offset, MSG_NOSIGNAL);
+    const auto count =
+        ::send(descriptor, bytes + offset, size - offset, MSG_NOSIGNAL);
     if (count < 0 && errno == EINTR) {
       continue;
     }
@@ -85,14 +86,14 @@ void write_all(int descriptor, const void* input, std::size_t size) {
   }
 }
 
-[[nodiscard]] std::uint16_t u16(const std::array<unsigned char, kHeaderBytes>& header,
-                                std::size_t offset) {
+[[nodiscard]] std::uint16_t
+u16(const std::array<unsigned char, kHeaderBytes> &header, std::size_t offset) {
   return static_cast<std::uint16_t>(header[offset]) |
          (static_cast<std::uint16_t>(header[offset + 1U]) << 8U);
 }
 
-[[nodiscard]] std::uint32_t u32(const std::array<unsigned char, kHeaderBytes>& header,
-                                std::size_t offset) {
+[[nodiscard]] std::uint32_t
+u32(const std::array<unsigned char, kHeaderBytes> &header, std::size_t offset) {
   std::uint32_t value = 0U;
   for (unsigned shift = 0U; shift < 32U; shift += 8U) {
     value |= static_cast<std::uint32_t>(header[offset++]) << shift;
@@ -100,8 +101,8 @@ void write_all(int descriptor, const void* input, std::size_t size) {
   return value;
 }
 
-[[nodiscard]] std::uint64_t u64(const std::array<unsigned char, kHeaderBytes>& header,
-                                std::size_t offset) {
+[[nodiscard]] std::uint64_t
+u64(const std::array<unsigned char, kHeaderBytes> &header, std::size_t offset) {
   std::uint64_t value = 0U;
   for (unsigned shift = 0U; shift < 64U; shift += 8U) {
     value |= static_cast<std::uint64_t>(header[offset++]) << shift;
@@ -109,14 +110,15 @@ void write_all(int descriptor, const void* input, std::size_t size) {
   return value;
 }
 
-void set_u16(std::array<unsigned char, kHeaderBytes>& header, std::size_t offset,
-             std::uint16_t value) {
+void set_u16(std::array<unsigned char, kHeaderBytes> &header,
+             std::size_t offset, std::uint16_t value) {
   header[offset] = static_cast<unsigned char>(value & 0xffU);
   header[offset + 1U] = static_cast<unsigned char>((value >> 8U) & 0xffU);
 }
 
 template <typename Value>
-void set_integer(std::array<unsigned char, kHeaderBytes>& header, std::size_t offset, Value value) {
+void set_integer(std::array<unsigned char, kHeaderBytes> &header,
+                 std::size_t offset, Value value) {
   for (unsigned shift = 0U; shift < sizeof(Value) * 8U; shift += 8U) {
     header[offset++] = static_cast<unsigned char>((value >> shift) & 0xffU);
   }
@@ -152,11 +154,12 @@ void send_frame(int descriptor, MessageType type, std::string_view payload) {
   }
 }
 
-[[nodiscard]] std::vector<double> angular_positions(const core::ControlledStateDTO& state) {
+[[nodiscard]] std::vector<double>
+angular_positions(const core::ControlledStateDTO &state) {
   std::vector<double> result;
   result.reserve(state.positions.size());
-  for (const auto& position : state.positions) {
-    const auto* angular = std::get_if<core::AngularPositionDTO>(&position);
+  for (const auto &position : state.positions) {
+    const auto *angular = std::get_if<core::AngularPositionDTO>(&position);
     if (angular == nullptr) {
       fail("fake worker requires angular state");
     }
@@ -165,8 +168,9 @@ void send_frame(int descriptor, MessageType type, std::string_view payload) {
   return result;
 }
 
-[[nodiscard]] core::TrajectoryDTO trajectory(const RoboPlanCandidateRequestDTO& request) {
-  const auto* goal = std::get_if<core::ResolvedJointGoalDTO>(&request.motion);
+[[nodiscard]] core::TrajectoryDTO
+trajectory(const RoboPlanCandidateRequestDTO &request) {
+  const auto *goal = std::get_if<core::ResolvedJointGoalDTO>(&request.motion);
   if (goal == nullptr) {
     fail("fake worker requires a joint goal");
   }
@@ -178,23 +182,28 @@ void send_frame(int descriptor, MessageType type, std::string_view payload) {
     fail("fake worker received inconsistent joint dimensions");
   }
   auto target = start;
-  for (std::size_t goal_index = 0U; goal_index < goal->resources.size(); ++goal_index) {
+  for (std::size_t goal_index = 0U; goal_index < goal->resources.size();
+       ++goal_index) {
     const auto found =
-        std::find(request.resources.begin(), request.resources.end(), goal->resources[goal_index]);
+        std::find(request.resources.begin(), request.resources.end(),
+                  goal->resources[goal_index]);
     if (found == request.resources.end()) {
       fail("fake worker goal names an unbound resource");
     }
-    const auto index = static_cast<std::size_t>(std::distance(request.resources.begin(), found));
-    if (request.start_state.joint_names[index] != goal->joint_names[goal_index]) {
+    const auto index = static_cast<std::size_t>(
+        std::distance(request.resources.begin(), found));
+    if (request.start_state.joint_names[index] !=
+        goal->joint_names[goal_index]) {
       fail("fake worker goal resource and compiled joint disagree");
     }
     target[index] = goal->positions_rad[goal_index];
   }
   const std::vector<double> zeros(start.size(), 0.0);
-  return core::TrajectoryDTO{request.resources,
-                             request.start_state.joint_names,
-                             {core::TrajectoryWaypointDTO{0.0, std::move(start), zeros, zeros},
-                              core::TrajectoryWaypointDTO{1.0, std::move(target), zeros, zeros}}};
+  return core::TrajectoryDTO{
+      request.resources,
+      request.start_state.joint_names,
+      {core::TrajectoryWaypointDTO{0.0, std::move(start), zeros, zeros},
+       core::TrajectoryWaypointDTO{1.0, std::move(target), zeros, zeros}}};
 }
 
 int run() {
@@ -206,25 +215,31 @@ int run() {
   const auto input = worker_protocol::decode_initialization(initialize.payload);
   constexpr std::string_view kCrashOncePrefix = "crash-once:";
   constexpr std::string_view kCountGenerationsPrefix = "count-generations:";
-  const bool crash_once = input.model.native_scene_name.starts_with(kCrashOncePrefix);
-  const bool count_generations = input.model.native_scene_name.starts_with(kCountGenerationsPrefix);
+  const bool crash_once =
+      input.model.native_scene_name.starts_with(kCrashOncePrefix);
+  const bool count_generations =
+      input.model.native_scene_name.starts_with(kCountGenerationsPrefix);
   const std::filesystem::path generation_counter(
-      count_generations ? input.model.native_scene_name.substr(kCountGenerationsPrefix.size())
-                        : std::string{});
+      count_generations
+          ? input.model.native_scene_name.substr(kCountGenerationsPrefix.size())
+          : std::string{});
   if (count_generations) {
-    if (input.model.geometries.size() != 1U || input.model.allowed_collision_pairs.size() != 1U ||
+    if (input.model.geometries.size() != 1U ||
+        input.model.allowed_collision_pairs.size() != 1U ||
         input.model.geometries.front().compiled_parent_frame != "base" ||
-        !std::holds_alternative<core::BoxShapeDTO>(input.model.geometries.front().shape)) {
+        !std::holds_alternative<core::BoxShapeDTO>(
+            input.model.geometries.front().shape)) {
       fail("fake worker received the wrong retained projection");
     }
-    const auto& pair = input.model.allowed_collision_pairs.front();
-    const auto& geometry_name = input.model.geometries.front().native_geometry_name;
+    const auto &pair = input.model.allowed_collision_pairs.front();
+    const auto &geometry_name =
+        input.model.geometries.front().native_geometry_name;
     if (!((pair.first == "forearm_link" && pair.second == geometry_name) ||
           (pair.first == geometry_name && pair.second == "forearm_link"))) {
       fail("fake worker received the wrong retained collision policy");
     }
-    const int counter =
-        ::open(generation_counter.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+    const int counter = ::open(generation_counter.c_str(),
+                               O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
     if (counter < 0) {
       fail("fake worker could not open its generation counter");
     }
@@ -235,14 +250,15 @@ int run() {
       fail("fake worker could not record its generation");
     }
   }
-  const char* configured_marker = std::getenv("MANYFORGE_FAKE_WORKER_MARKER");
+  const char *configured_marker = std::getenv("MANYFORGE_FAKE_WORKER_MARKER");
   std::filesystem::path first_generation_marker;
   if (configured_marker != nullptr && configured_marker[0] != '\0') {
     first_generation_marker = configured_marker;
   } else if (count_generations) {
     first_generation_marker = generation_counter;
   } else if (crash_once) {
-    first_generation_marker = input.model.native_scene_name.substr(kCrashOncePrefix.size());
+    first_generation_marker =
+        input.model.native_scene_name.substr(kCrashOncePrefix.size());
   } else {
     first_generation_marker = input.model.native_scene_name;
   }
@@ -256,12 +272,36 @@ int run() {
     if (frame.type != MessageType::kPlan) {
       fail("fake worker received an unsupported request");
     }
-    const int marker =
-        ::open(first_generation_marker.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    const int marker = ::open(first_generation_marker.c_str(),
+                              O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     if (marker >= 0) {
       static_cast<void>(::close(marker));
       if (crash_once) {
         return 42;
+      }
+      const char *failure_gate =
+          std::getenv("MANYFORGE_FAKE_WORKER_FAILURE_GATE");
+      if (failure_gate != nullptr && failure_gate[0] != '\0') {
+        // Test-only explicit release: exercise the real owner's asynchronous
+        // planning failure without racing the initial Prepare return.
+        const int gate =
+            ::open(failure_gate, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+        if (gate < 0)
+          fail("fake worker could not open failure gate");
+        pollfd ready{gate, POLLIN, 0};
+        char release{};
+        const bool released =
+            ::poll(&ready, 1, 5000) == 1 && ::read(gate, &release, 1) == 1;
+        static_cast<void>(::close(gate));
+        if (!released)
+          fail("fake worker failure gate was not released");
+        send_frame(descriptor, MessageType::kPlanResult,
+                   worker_protocol::encode_trajectory_result(
+                       core::Result<core::TrajectoryDTO>::Err(core::ErrorDTO{
+                           "planning_failed",
+                           "injected gated native planner failure",
+                           {{"reason", "test_planner_failure"}}})));
+        continue;
       }
       for (;;) {
         static_cast<void>(::pause());
@@ -270,17 +310,18 @@ int run() {
     if (errno != EEXIST) {
       fail("fake worker could not create generation marker");
     }
-    const auto request = worker_protocol::decode_candidate_request(frame.payload);
+    const auto request =
+        worker_protocol::decode_candidate_request(frame.payload);
     send_frame(descriptor, MessageType::kPlanResult,
                worker_protocol::encode_trajectory_result(
                    core::Result<core::TrajectoryDTO>::Ok(trajectory(request))));
   }
 }
 
-}  // namespace
-}  // namespace manyforge::roboplan_backend
+} // namespace
+} // namespace manyforge::roboplan_backend
 
-int main(int argc, char** argv) {
+int main(int argc, char **argv) {
   try {
     manyforge::roboplan_backend::constrain_to_parent(argc, argv);
     return manyforge::roboplan_backend::run();

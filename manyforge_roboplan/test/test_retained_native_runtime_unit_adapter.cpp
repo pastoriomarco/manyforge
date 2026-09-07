@@ -1,9 +1,12 @@
 #include <gtest/gtest.h>
 
 #include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -311,15 +314,56 @@ MakeAdapter(NativeFixture &fixture, const std::filesystem::path &target_root) {
       std::string(contract::kLaunchEnvironmentContract));
 }
 
+[[nodiscard]] content_identity::CanonicalValue
+ExecutionPacket(const std::filesystem::path &socket_path,
+                std::string_view packet, bool normalize = true) {
+  const auto encoded =
+      normalize ? deployment::canonical_json(
+                      deployment::parse_strict_json_model_yaml(packet).root())
+                : std::string(packet);
+  struct Socket final {
+    int fd = ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    ~Socket() {
+      if (fd >= 0)
+        ::close(fd);
+    }
+  } socket;
+  if (socket.fd < 0)
+    throw std::runtime_error("qualification socket failed");
+  timeval bound{2, 0};
+  sockaddr_un address{};
+  address.sun_family = AF_UNIX;
+  const auto path = socket_path.string();
+  if (path.size() >= sizeof(address.sun_path))
+    throw std::runtime_error("qualification socket path exceeds bound");
+  std::copy(path.begin(), path.end(), address.sun_path);
+  if (::setsockopt(socket.fd, SOL_SOCKET, SO_RCVTIMEO, &bound, sizeof(bound)) !=
+          0 ||
+      ::setsockopt(socket.fd, SOL_SOCKET, SO_SNDTIMEO, &bound, sizeof(bound)) !=
+          0 ||
+      ::connect(socket.fd, reinterpret_cast<sockaddr *>(&address),
+                sizeof(address)) != 0 ||
+      ::send(socket.fd, encoded.data(), encoded.size(), MSG_NOSIGNAL) !=
+          static_cast<ssize_t>(encoded.size())) {
+    throw std::runtime_error("qualification packet dispatch failed");
+  }
+  std::array<char, 131072> bytes{};
+  const auto count = ::recv(socket.fd, bytes.data(), bytes.size(), MSG_TRUNC);
+  if (count <= 0 || static_cast<std::size_t>(count) > bytes.size())
+    throw std::runtime_error("qualification reply absent/oversized");
+  return content_identity::parse_canonical_json(
+      std::string_view(bytes.data(), static_cast<std::size_t>(count)));
+}
+
 class CountingBundleSource final
     : public deployment::IVerifiedRetainedBundleSource {
 public:
   explicit CountingBundleSource(
-      const deployment::IVerifiedRetainedBundleSource& source)
+      const deployment::IVerifiedRetainedBundleSource &source)
       : source_(source) {}
 
   std::shared_ptr<const deployment::RetainedBundle> get_verified(
-      const core::RetainedBundleId& retained_bundle_id) const override {
+      const core::RetainedBundleId &retained_bundle_id) const override {
     ++reads_;
     return source_.get_verified(retained_bundle_id);
   }
@@ -327,7 +371,7 @@ public:
   [[nodiscard]] std::size_t reads() const noexcept { return reads_; }
 
 private:
-  const deployment::IVerifiedRetainedBundleSource& source_;
+  const deployment::IVerifiedRetainedBundleSource &source_;
   mutable std::size_t reads_{};
 };
 
@@ -335,11 +379,11 @@ class CountingArtifactSource final
     : public deployment::IVerifiedRetainedProductArtifactSource {
 public:
   explicit CountingArtifactSource(
-      const deployment::IVerifiedRetainedProductArtifactSource& source)
+      const deployment::IVerifiedRetainedProductArtifactSource &source)
       : source_(source) {}
 
   std::optional<deployment::VerifiedRetainedProductArtifact> get_verified(
-      const deployment::RetainedProductArtifactQuery& query) const override {
+      const deployment::RetainedProductArtifactQuery &query) const override {
     ++reads_;
     return source_.get_verified(query);
   }
@@ -347,7 +391,7 @@ public:
   [[nodiscard]] std::size_t reads() const noexcept { return reads_; }
 
 private:
-  const deployment::IVerifiedRetainedProductArtifactSource& source_;
+  const deployment::IVerifiedRetainedProductArtifactSource &source_;
   mutable std::size_t reads_{};
 };
 
@@ -604,11 +648,10 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   CountingBundleSource bundles(fixture.bundle_source);
   CountingArtifactSource artifacts(fixture.artifact_source);
   auto adapter = component_manager::RetainedNativeRuntimeUnitAdapter(
-      MANYFORGE_NATIVE_EXECUTION_TARGET_ROOT,
-      fixture.root / "retained-package", fixture.manager_state_root.path(),
-      fixture.manager_run_root.path(), fixture.execution_state_root.path(),
-      fixture.execution_run_root.path(), bundles, artifacts,
-      std::string(contract::kOperatingSystem),
+      MANYFORGE_NATIVE_EXECUTION_TARGET_ROOT, fixture.root / "retained-package",
+      fixture.manager_state_root.path(), fixture.manager_run_root.path(),
+      fixture.execution_state_root.path(), fixture.execution_run_root.path(),
+      bundles, artifacts, std::string(contract::kOperatingSystem),
       std::string(contract::kLaunchEnvironmentContract));
 
   EXPECT_EQ(adapter.ObserveProcess(*fixture.query).state(),
@@ -682,6 +725,95 @@ TEST(RetainedNativeRuntimeUnitAdapter,
 }
 
 TEST(RetainedNativeRuntimeUnitAdapter,
+     ReservedStopAndExactReadsRemainAvailableBeforePhysicalReconstruction) {
+  NativeFixture fixture;
+  auto adapter = MakeAdapter(fixture, MANYFORGE_NATIVE_EXECUTION_TARGET_ROOT);
+  const auto process = adapter.EnsureRunning(*fixture.query);
+  ASSERT_EQ(process.state(), component_manager::ProcessPresenceState::kPresent);
+  const auto ordinary =
+      fixture.execution_run_root.path() / "execution-command.sock";
+  const auto priority =
+      fixture.execution_run_root.path() / "execution-control.sock";
+  const auto identity = ExecutionPacket(
+      ordinary,
+      R"({"api_version":"manyforge.execution_command.v1","command":"identity"})");
+  const auto *error = identity.find_object_member("error");
+  ASSERT_NE(error, nullptr);
+  EXPECT_EQ(TextMember(*error, "code"), "execution_owner_not_ready");
+  const auto owner =
+      TextMember(*error->find_object_member("details"), "owner_epoch");
+  const std::string attribution =
+      R"("attribution":{"transport":"internal","assurance":"unverified","principal_id":null})";
+  const auto packet = [&](std::string_view command, std::string_view request) {
+    return "{\"api_version\":\"manyforge.execution_command.v1\",\"command\":"
+           "\"" +
+           std::string(command) + "\"," + attribution +
+           ",\"request\":" + std::string(request) + "}";
+  };
+  const auto context = [&](std::string_view request) {
+    return "{\"request_id\":\"" + std::string(request) +
+           "\",\"request_owner_epoch\":\"" + owner +
+           "\",\"source_label\":\"qualification\",\"correlation_id\":null}";
+  };
+  for (const auto &command : {std::string("stop_program_run"),
+                              std::string("stop"), std::string("full_stop")}) {
+    SCOPED_TRACE(command);
+    const auto target = command == "full_stop"
+                            ? "\"expected_stop_generation\":0"
+                        : command == "stop_program_run"
+                            ? "\"program_run_id\":\"run.before-reconstruction\""
+                            : "\"operations\":[{\"operation_id\":\"operation."
+                              "before-reconstruction\",\"expected_operation_"
+                              "revision\":1,\"expected_stop_generation\":0}]";
+    const auto reply = ExecutionPacket(
+        priority, packet(command, "{\"request_context\":" + context(command) +
+                                      "," + target + "}"));
+    const auto encoded = content_identity::canonical_json(reply);
+    EXPECT_EQ(encoded.find("execution_owner_not_ready"), std::string::npos)
+        << encoded;
+    EXPECT_EQ(encoded.find("execution_command_invalid"), std::string::npos)
+        << encoded;
+    ASSERT_NE(reply.find_object_member("accepted"), nullptr) << encoded;
+    const auto *accepted = reply.find_object_member("accepted");
+    const auto read = ExecutionPacket(
+          ordinary, "{\"api_version\":\"manyforge.execution_command.v1\","
+                    "\"command\":\"read_stop\",\"stop_id\":\"" +
+                        TextMember(*accepted, "stop_id") + "\"," + attribution +
+                        "}");
+    EXPECT_NE(read.find_object_member("stop_status"), nullptr)
+        << content_identity::canonical_json(read);
+  }
+  const auto malformed = ExecutionPacket(priority, "{", false);
+  ASSERT_NE(malformed.find_object_member("error"), nullptr);
+  EXPECT_EQ(TextMember(*malformed.find_object_member("error"), "code"),
+            "execution_command_invalid");
+  const auto recognized = ExecutionPacket(
+      priority,
+      "{\"api_version\":\"manyforge.execution_command.v1\",\"command\":"
+      "\"malformed_stop\",\"request_id\":\"malformed.1\",\"recognized_route\":"
+      "\"/api/execution/stops\",\"reason\":\"recognized_stop_payload_invalid\"," +
+          attribution + "}");
+  ASSERT_NE(recognized.find_object_member("accepted"), nullptr)
+      << content_identity::canonical_json(recognized);
+  const auto late = ExecutionPacket(
+      ordinary,
+      packet("resume",
+             "{\"request_context\":" + context("late.resume") +
+                 ",\"operation_id\":\"operation.before-reconstruction\","
+                 "\"expected_operation_revision\":1,\"reason\":null}"));
+  ASSERT_NE(late.find_object_member("error"), nullptr);
+  EXPECT_EQ(TextMember(*late.find_object_member("error"), "code"),
+            "execution_owner_not_ready");
+  EXPECT_TRUE(
+      adapter
+          .ObserveProgress(*fixture.query,
+                           core::RuntimeEpoch(process.process_incarnation()))
+          .has_value());
+  EXPECT_EQ(adapter.EnsureStopped(*fixture.query).state(),
+            component_manager::ProcessPresenceState::kAbsent);
+}
+
+TEST(RetainedNativeRuntimeUnitAdapter,
      PartialAuthoredDuplicateCannotShadowInstalledChildPackage) {
   NativeFixture fixture;
   ScopedTemporaryRoot authored;
@@ -696,17 +828,16 @@ TEST(RetainedNativeRuntimeUnitAdapter,
       authored_bundle_directory / bundle_filename));
 
   auto adapter = component_manager::RetainedNativeRuntimeUnitAdapter(
-      MANYFORGE_NATIVE_EXECUTION_TARGET_ROOT,
-      fixture.root / "retained-package", fixture.manager_state_root.path(),
-      fixture.manager_run_root.path(), fixture.execution_state_root.path(),
-      fixture.execution_run_root.path(), fixture.bundle_source,
-      fixture.artifact_source, std::string(contract::kOperatingSystem),
+      MANYFORGE_NATIVE_EXECUTION_TARGET_ROOT, fixture.root / "retained-package",
+      fixture.manager_state_root.path(), fixture.manager_run_root.path(),
+      fixture.execution_state_root.path(), fixture.execution_run_root.path(),
+      fixture.bundle_source, fixture.artifact_source,
+      std::string(contract::kOperatingSystem),
       std::string(contract::kLaunchEnvironmentContract), {}, {}, {},
       authored.path());
 
   const auto started = adapter.EnsureRunning(*fixture.query);
-  ASSERT_EQ(started.state(),
-            component_manager::ProcessPresenceState::kPresent);
+  ASSERT_EQ(started.state(), component_manager::ProcessPresenceState::kPresent);
   EXPECT_EQ(adapter.EnsureStopped(*fixture.query).state(),
             component_manager::ProcessPresenceState::kAbsent);
 }

@@ -44,6 +44,7 @@ from manyforge_behavior.program_run_owner import (
     ProgramRunAdmission,
     ProgramRunOwner,
     ProgramRunOwnerError,
+    ProgramRunOwnerOutcomeUnknownError,
     ProgramRunState,
     build_applied_program_run_admission,
     build_program_run_admission,
@@ -172,6 +173,8 @@ class _OperatorStopTaskPort(_TaskPort):
                 "recovery_assessment": {
                     "allowed_actions": ["replan_from_stopped_state"],
                     "recovery_class": self.recovery_class,
+                    "stop_id": "stop.1",
+                    "stop_generation": 1,
                 },
             },
             reason_code="operation_stopped",
@@ -341,8 +344,14 @@ class _ScopePort:
     def observe(self, program_run_id: str) -> ProgramRunScopeSnapshot:
         return self._snapshot(program_run_id)
 
-    def release_stop(self, program_run_id: str) -> ProgramRunScopeSnapshot:
+    def capture_stop(self, program_run_id):
+        return ("stop.1", 1) if self.stop_requests else None
+
+    def release_stop(
+        self, program_run_id: str, *, expected_stop=None
+    ) -> ProgramRunScopeSnapshot:
         self.release_requests += 1
+        self.last_expected_stop = expected_stop
         self._events.append("scope_stop_release")
         return self._snapshot(program_run_id)
 
@@ -1096,9 +1105,11 @@ def test_tick_host_never_loses_repeated_operator_stop_recovery() -> None:
         host.shutdown()
 
 
-def test_motion_stop_holds_the_current_node_without_terminating_the_run() -> None:
+def test_motion_stop_holds_the_current_node_and_resume_hands_off_its_exact_fence() -> (
+    None
+):
     interventions = ProgramInterventionRegistry(maximum_retained_runs=8)
-    owner, admission, _task, scope, _events = _fixture(
+    owner, admission, task, scope, _events = _fixture(
         initial_task_state=OwnerTaskState.ACTIVE,
         task_factory=_OperatorStopTaskPort,
         interventions=interventions,
@@ -1122,7 +1133,257 @@ def test_motion_stop_holds_the_current_node_without_terminating_the_run() -> Non
     assert intervention is not None
     assert intervention.policy_parameter == "operator_stop_policy"
 
+    scope.state = ProgramRunScopeState.SETTLED
+    owner_result = owner.apply_owner_recovery(
+        started.capture.program_run_id,
+        node_attempt_id=intervention.identity.node_attempt_id,
+        action="replan_from_stopped_state",
+        request_id="resume-motion.1",
+        reason=None,
+    )
+    assert owner_result["accepted"] is True
+    assert scope.release_requests == 1
+    assert scope.last_expected_stop == ("stop.1", 1)
+    host.resume_recovery(
+        started.capture.program_run_id,
+        node_attempt_id=intervention.identity.node_attempt_id,
+        action="retry",
+    )
+    assert host.advance_ready_once()[0].state is ProgramRunState.RUNNING
+    assert task.starts == 1
+    # The retry-resolution tick is separate from the fresh-attempt tick.
+    assert (
+        owner.advance_once(started.capture.program_run_id).state
+        is ProgramRunState.RUNNING
+    )
+    assert task.starts == 2
+
     host.stop_run(started.capture.program_run_id)
+    host.shutdown()
+
+
+@pytest.mark.parametrize(
+    "failure", ["new_program_stop", "changed_intervention", "release_unavailable"]
+)
+def test_motion_recovery_cannot_resume_across_a_new_stop_or_failed_handoff(
+    failure,
+) -> None:
+    interventions = ProgramInterventionRegistry(maximum_retained_runs=8)
+    owner, admission, task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE,
+        task_factory=_OperatorStopTaskPort,
+        interventions=interventions,
+    )
+    host = ProgramRunTickHost(owner, tick_interval_s=0.01)
+    started = host.start_run(admission)
+    run_id = started.capture.program_run_id
+    host.advance_ready_once()
+    scope.state = ProgramRunScopeState.ACTIVE
+    host.stop_motion(run_id)
+    assert host.advance_ready_once()[0].state is ProgramRunState.INTERVENTION_REQUIRED
+    intervention = interventions.read(run_id)
+    assert intervention is not None
+    scope.state = ProgramRunScopeState.SETTLED
+    recover = task.recover
+
+    def accept_then_stop(*args, **kwargs):
+        result = recover(*args, **kwargs)
+        if failure == "new_program_stop":
+            scope.state = ProgramRunScopeState.ACTIVE
+            owner.stop(run_id, stop_request_id="new-independent-stop")
+        elif failure == "changed_intervention":
+            interventions.release(run_id)
+            interventions.require(
+                NodeAttemptIdentity(
+                    run_id, intervention.identity.node_instance_id, "different-attempt"
+                ),
+                reason_code=intervention.reason_code,
+                message=intervention.message,
+                policy_parameter=intervention.policy_parameter,
+                owner_port_name=intervention.owner_port_name,
+                owner_task_id="different-task",
+                owner_assessment=intervention.owner_assessment,
+            )
+        return result
+
+    task.recover = accept_then_stop
+
+    def unavailable(_run_id, *, expected_stop):
+        assert expected_stop == ("stop.1", 1)
+        raise RuntimeError("Stop handoff unavailable")
+
+    if failure == "release_unavailable":
+        scope.release_stop = unavailable
+    try:
+        with pytest.raises(ProgramRunOwnerOutcomeUnknownError):
+            owner.apply_owner_recovery(
+                run_id,
+                node_attempt_id=intervention.identity.node_attempt_id,
+                action="replan_from_stopped_state",
+                request_id="resume.1",
+                reason=None,
+            )
+        assert len(task.recoveries) == 1
+        assert scope.release_requests == 0
+        assert owner.read(run_id).state is not ProgramRunState.RUNNING
+        assert task.starts == 1
+    finally:
+        scope.state = ProgramRunScopeState.SETTLED
+        host.stop_run(run_id)
+        host.shutdown()
+
+
+@pytest.mark.parametrize("program_scope", [True, False])
+def test_recovery_preflights_only_its_exact_program_stop(program_scope):
+    interventions = ProgramInterventionRegistry(maximum_retained_runs=8)
+    owner, admission, task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE,
+        task_factory=_OperatorStopTaskPort,
+        interventions=interventions,
+    )
+    host = ProgramRunTickHost(owner, tick_interval_s=0.01)
+    run_id = host.start_run(admission).capture.program_run_id
+    host.advance_ready_once()
+    scope.state = ProgramRunScopeState.ACTIVE
+    if program_scope:
+        host.stop_motion(run_id)
+    # The task reports a current offer, but the aggregate still has work.
+    assert host.advance_ready_once()[0].state is ProgramRunState.INTERVENTION_REQUIRED
+    intervention = interventions.read(run_id)
+    assert intervention is not None
+    if program_scope:
+        with pytest.raises(ProgramRunOwnerError, match="settle completely"):
+            owner.apply_owner_recovery(
+                run_id,
+                node_attempt_id=intervention.identity.node_attempt_id,
+                action="replan_from_stopped_state",
+                request_id="too-early",
+                reason=None,
+            )
+        assert not task.recoveries and scope.release_requests == 0
+        scope.state = ProgramRunScopeState.SETTLED
+    accepted = owner.apply_owner_recovery(
+        run_id,
+        node_attempt_id=intervention.identity.node_attempt_id,
+        action="replan_from_stopped_state",
+        request_id="settled",
+        reason=None,
+    )
+    assert accepted["accepted"] and len(task.recoveries) == 1
+    if program_scope:
+        assert scope.last_expected_stop == ("stop.1", 1)
+    else:
+        assert scope.state is ProgramRunScopeState.ACTIVE
+        assert scope.release_requests == 0
+    scope.state = ProgramRunScopeState.SETTLED
+    host.stop_run(run_id)
+    host.shutdown()
+
+
+@pytest.mark.parametrize("full", [False, True])
+def test_explicit_stop_recaptures_a_lost_reply_through_the_native_scope(full):
+    from .test_production_ports import _Transport, _context
+    from manyforge_behavior.kernel_client import KernelClient
+    from manyforge_behavior.production_ports import NativeKernelProgramPort
+
+    owner, admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE,
+        task_factory=_OperatorStopTaskPort,
+        interventions=ProgramInterventionRegistry(maximum_retained_runs=8),
+    )
+    run_id = owner.start(admission).capture.program_run_id
+    owner.advance_once(run_id)
+    transport = _Transport()
+    native = NativeKernelProgramPort(KernelClient(transport))
+    native.bind(replace(_context(), program_run_id=run_id))
+    owner._scope = native.scope
+    original = transport.stop_program_run
+
+    def lost(body):
+        original(body)
+        raise OSError("native Stop accepted; response lost")
+
+    transport.stop_program_run = lost
+    request = owner.full_stop if full else owner.stop
+    first = request(run_id, stop_request_id="lost")
+    assert first.state is (
+        ProgramRunState.FULL_STOPPING if full else ProgramRunState.STOPPING
+    )
+    assert native.scope.observe(run_id).state is ProgramRunScopeState.UNKNOWN
+    owner.advance_once(run_id)  # passive reconciliation must not retry an effect
+    assert len(transport.controls) == 1
+    transport.stop_program_run = original
+    request(run_id, stop_request_id="fresh-recapture")
+    assert len(transport.controls) == 2
+    transport.stop_states["scope-stop-2"] = "succeeded"
+    settled = owner.advance_once(run_id)
+    assert settled.state is (
+        ProgramRunState.FULL_STOPPED if full else ProgramRunState.STOPPED
+    )
+    if full:
+        owner.stop(run_id, stop_request_id="finish-preserved-run")
+        transport.stop_states["scope-stop-3"] = "succeeded"
+        assert owner.advance_once(run_id).state is ProgramRunState.STOPPED
+    assert native.scope.reset(run_id).state is ProgramRunScopeState.SETTLED
+    assert not native._scope_stops
+
+
+def test_full_stop_overtakes_a_held_full_stop_resume_without_releasing_its_fence():
+    interventions = ProgramInterventionRegistry(maximum_retained_runs=8)
+    owner, admission, task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE,
+        task_factory=_OperatorStopTaskPort,
+        interventions=interventions,
+    )
+    host = ProgramRunTickHost(owner, tick_interval_s=0.01)
+    run_id = host.start_run(admission).capture.program_run_id
+    host.advance_ready_once()
+    assert (
+        host.full_stop(run_id, stop_request_id="first").state
+        is ProgramRunState.FULL_STOPPED
+    )
+    entered, finish, stop_done = Event(), Event(), Event()
+    recover, errors, stopped = task.recover, [], []
+
+    def held_recovery(*args, **kwargs):
+        entered.set()
+        assert finish.wait(timeout=2)
+        return recover(*args, **kwargs)
+
+    task.recover = held_recovery
+
+    def resume():
+        try:
+            host.resume_full_stop(run_id, request_id="older-resume")
+        except Exception as error:
+            errors.append(error)
+
+    def stop():
+        stopped.append(host.full_stop(run_id, stop_request_id="newer-stop"))
+        stop_done.set()
+
+    resuming = Thread(target=resume)
+    resuming.start()
+    assert entered.wait(timeout=2)
+    scope.state = ProgramRunScopeState.ACTIVE
+    stopping = Thread(target=stop)
+    stopping.start()
+    try:
+        assert stop_done.wait(timeout=0.5)
+        assert stopped[0].state is ProgramRunState.FULL_STOPPING
+        assert scope.stop_requests == 2
+        assert scope.release_requests == 0
+    finally:
+        finish.set()
+        resuming.join(timeout=2)
+        stopping.join(timeout=2)
+    assert not resuming.is_alive() and not stopping.is_alive()
+    assert len(errors) == 1 and isinstance(
+        errors[0], ProgramRunOwnerOutcomeUnknownError
+    )
+    assert scope.release_requests == 0 and task.starts == 1
+    scope.state = ProgramRunScopeState.SETTLED
+    host.stop_run(run_id)
     host.shutdown()
 
 
@@ -1148,10 +1409,7 @@ def test_motion_stop_retains_escalated_stop_for_backend_recovery() -> None:
     assert intervention is not None
     assert intervention.policy_parameter == "operator_stop_policy"
     assert intervention.owner_assessment is not None
-    assert (
-        intervention.owner_assessment["recovery_class"]
-        == "stop_fault_intervention"
-    )
+    assert intervention.owner_assessment["recovery_class"] == "stop_fault_intervention"
 
     host.stop_run(started.capture.program_run_id)
     host.shutdown()
@@ -1201,6 +1459,48 @@ def test_motion_stop_does_not_wait_for_blocked_tree_dispatch() -> None:
     scope.state = ProgramRunScopeState.SETTLED
     host.stop_run(started.capture.program_run_id)
     host.shutdown()
+
+
+def test_motion_stop_with_zero_local_tasks_waits_for_scope_certificate():
+    owner, admission, task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
+    run_id = owner.start(admission).capture.program_run_id
+    scope.state = ProgramRunScopeState.ACTIVE
+    request = scope.request_stop
+
+    def accepted(*args):
+        request(*args)
+        return ProgramRunScopeSnapshot(run_id, ProgramRunScopeState.ACTIVE, 0)
+
+    scope.request_stop = accepted
+    assert owner.stop_motion(run_id).state is ProgramRunState.FULL_STOPPING
+    assert task.starts == 0
+    scope.state = ProgramRunScopeState.SETTLED
+    assert owner.advance_once(run_id).state is ProgramRunState.FULL_STOPPED
+
+
+def test_old_scope_settlement_cannot_complete_a_newer_full_stop():
+    owner, admission, _task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
+    run_id = owner.start(admission).capture.program_run_id
+    scope.state = ProgramRunScopeState.ACTIVE
+    owner.full_stop(run_id, stop_request_id="first")
+    observe = scope.observe
+
+    def crossed(run):
+        scope.state = ProgramRunScopeState.SETTLED
+        result = observe(run)
+        scope.state = ProgramRunScopeState.ACTIVE
+        owner.full_stop(run, stop_request_id="newer")
+        return result
+
+    scope.observe = crossed
+    assert owner.reconcile_full_stop(run_id).state is ProgramRunState.FULL_STOPPING
+    scope.observe = observe
+    scope.state = ProgramRunScopeState.SETTLED
+    assert owner.reconcile_full_stop(run_id).state is ProgramRunState.FULL_STOPPED
 
 
 def test_motion_stop_between_operations_preserves_the_tree_boundary() -> None:

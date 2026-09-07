@@ -22,7 +22,7 @@ namespace core = manyforge::core;
 using content_identity::CanonicalValue;
 
 constexpr std::string_view kPoseObservationPayloadApiVersion =
-    "manyforge.ros_pose_observation.v1";
+    "manyforge.ros_pose_observation.v2";
 constexpr std::string_view kPoseApplicationRequestApiVersion =
     "manyforge.scene_runtime_pose_application.v1";
 constexpr std::uint64_t kMaximumSafeInteger = 9007199254740991ULL;
@@ -88,20 +88,7 @@ std::optional<std::int64_t> SourceTimestampNs(const CanonicalValue &value) {
   if (std::holds_alternative<std::nullptr_t>(value.storage())) {
     return std::nullopt;
   }
-  const auto seconds = Number(value, "pose source_stamp_s");
-  constexpr auto kNanosecondsPerSecond = 1000000000.0;
-  const auto scaled = seconds * kNanosecondsPerSecond;
-  if (seconds < 0.0 || !std::isfinite(scaled) ||
-      scaled > static_cast<double>(kMaximumSafeInteger)) {
-    throw std::invalid_argument(
-        "pose source_stamp_s exceeds the safe nanosecond range");
-  }
-  const auto result = static_cast<std::int64_t>(std::llround(scaled));
-  if (result < 0 || static_cast<std::uint64_t>(result) > kMaximumSafeInteger) {
-    throw std::invalid_argument(
-        "pose source_stamp_s cannot be represented exactly enough");
-  }
-  return result;
+  return content_identity::parse_nonnegative_int64(value);
 }
 
 void ValidateSource(const std::string_view kind, const CanonicalValue &source) {
@@ -174,7 +161,7 @@ DecodedPose DecodePose(const CanonicalValue &payload) {
   result.orientation.y *= inverse_norm;
   result.orientation.z *= inverse_norm;
   result.orientation.w *= inverse_norm;
-  return {result, SourceTimestampNs(Member(pose, "source_stamp_s"))};
+  return {result, SourceTimestampNs(Member(pose, "source_stamp_ns"))};
 }
 
 const core::CapabilityProviderBindingDTO *SelectProvider(
@@ -215,12 +202,11 @@ CanonicalValue Unsigned(const std::uint64_t value,
 }
 
 CanonicalValue Integer(const std::int64_t value, const std::string_view label) {
-  constexpr auto kMaximum = static_cast<std::int64_t>(kMaximumSafeInteger);
-  if (value < -kMaximum || value > kMaximum) {
+  if (value < 0) {
     throw std::invalid_argument(std::string(label) +
-                                " exceeds the I-JSON safe range");
+                                " must be nonnegative");
   }
-  return CanonicalValue(static_cast<double>(value));
+  return content_identity::nonnegative_int64_value(value);
 }
 
 CanonicalValue

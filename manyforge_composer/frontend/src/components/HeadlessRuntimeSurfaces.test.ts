@@ -114,7 +114,11 @@ describe('headless Composer presentation adapters', () => {
     const stored: HistorianStoredEvent = {
       sequence: 11,
       event: {
-        schemaVersion: 'manyforge.historian_event_summary.v1',
+        schemaVersion: 'manyforge.historian_event_summary.v2',
+        conditionSeverity: 'ERROR',
+        clockOwner: 'headless:test-epoch',
+        wallClockRegressed: false,
+        occurredAtUtcNs: '1785931200000000000',
         eventId: 'event-11',
         component: 'manyforge.alarm',
         eventType: 'operator_alarm_acknowledged',
@@ -131,6 +135,7 @@ describe('headless Composer presentation adapters', () => {
     const view = historianEventView(stored);
 
     expect(view.alarmPhase).toBe('acknowledgement');
+    expect(view.severity).toBe('ERROR');
     expect(view.message).toContain('condition-1');
     expect(view.programRunId).toBe('program-run-1');
     expect(view.operationId).toBe('operation-1');

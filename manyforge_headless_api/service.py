@@ -8,7 +8,7 @@ from functools import lru_cache
 import hashlib
 import json
 import time
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 import rfc8785
 
@@ -25,6 +25,7 @@ from manyforge_behavior.program import Program, ProgramValidationError
 
 from .execution import ExecutionPort
 from .manager import ManagerPort
+from .history_query import HistorianQueryRequest
 from .models import (
     AcknowledgeAlarmRequest,
     AcknowledgeAllAlarmsRequest,
@@ -106,20 +107,31 @@ _ACTIVE_PROGRAM_RUN_STATES = frozenset(
     }
 )
 
-_HISTORY_SUMMARY_PAGE_VERSION = "manyforge.historian_summary_page.v1"
+_HISTORY_SUMMARY_PAGE_VERSION = "manyforge.historian_summary_page.v2"
 
 
-def _history_summary_page(page: dict[str, Any]) -> dict[str, Any]:
+def _history_page(page: dict[str, Any], schema: str) -> dict[str, Any]:
     events = page.get("events")
     if (
-        page.get("schema_version") != _HISTORY_SUMMARY_PAGE_VERSION
+        page.get("schema_version") != schema
         or not isinstance(events, list)
         or len(events) > 32
+        or type(page.get("truncated")) is not bool
     ):
         raise HeadlessApiError(
             "historian_response_invalid",
-            "native historian returned an invalid summary page",
+            "native historian returned an invalid page",
         )
+    previous = 9_007_199_254_740_992
+    for stored in events:
+        sequence = stored.get("sequence") if isinstance(stored, dict) else None
+        if type(sequence) is not int or not 0 < sequence < previous:
+            raise HeadlessApiError("historian_response_invalid", "historian page sequence is invalid")
+        previous = sequence
+    expected = events[-1]["sequence"] if page["truncated"] and events else None
+    cursor = page.get("next_before_sequence")
+    if (page["truncated"] and not events) or cursor != expected or (cursor is not None and type(cursor) is not int):
+        raise HeadlessApiError("historian_response_invalid", "historian page cursor does not advance")
     return page
 
 
@@ -562,6 +574,7 @@ class HeadlessService:
         self,
         *,
         program_cycle: dict[str, Any] | None = None,
+        cancelled: Callable[[], bool] | None = None,
     ) -> ComponentOverviewFacts:
         """Capture each owner exactly once for one Component Overview reduction."""
 
@@ -569,6 +582,8 @@ class HeadlessService:
         errors: dict[str, dict[str, Any]] = {}
 
         def capture(name: str, callback) -> None:
+            if cancelled is not None and cancelled():
+                raise InterruptedError("control owner capture cancelled")
             try:
                 value = callback()
                 if not isinstance(value, dict):
@@ -1120,7 +1135,9 @@ class HeadlessService:
             or not _bounded_text(owner_epoch, maximum_bytes=512)
             or type(projection.get("run_revision")) is not int
             or not 1 <= projection["run_revision"] <= 9_007_199_254_740_991
+            or not isinstance(state, str)
             or state not in _PROGRAM_RUN_STATES
+            or not isinstance(projection.get("tree_status"), str)
             or projection.get("tree_status")
             not in {"invalid", "running", "success", "failure"}
             or type(projection.get("node_status_revision")) is not int
@@ -1129,6 +1146,7 @@ class HeadlessService:
             or len(node_statuses) > 100_000
             or any(
                 not _bounded_text(instance_id, maximum_bytes=512)
+                or not isinstance(status, str)
                 or status not in {"idle", "running", "success", "failure"}
                 for instance_id, status in node_statuses.items()
             )
@@ -2085,27 +2103,44 @@ class HeadlessService:
 
     def history(
         self,
-        *,
-        start_ns: int | None,
-        end_ns: int | None,
-        components: Sequence[str],
-        event_types: Sequence[str],
-        before_sequence: int | None,
-        limit: int,
+        query: HistorianQueryRequest,
     ) -> dict[str, Any]:
-        return _history_summary_page(
-            self.core.history(
-                start_ns=start_ns,
-                end_ns=end_ns,
-                components=list(components),
-                event_types=list(event_types),
-                before_sequence=before_sequence,
-                limit=limit,
-            )
-        )
+        arguments = query.native_arguments(now_utc_ns=time.time_ns())
+        page = _history_page(self.core.history(**arguments), _HISTORY_SUMMARY_PAGE_VERSION)
+        # Keep a relative window fixed across Older/Newer navigation. These
+        # are the query's actual server UTC bounds, not another source clock.
+        return {**page, "time_window": {key: None if arguments[key] is None else str(arguments[key])
+                                        for key in ("start_utc_ns", "end_utc_ns")}}
 
     def history_detail(self, sequence: int) -> dict[str, Any]:
         return self.core.history_detail(sequence)
+
+    def history_export(self, query: HistorianQueryRequest) -> dict[str, Any]:
+        arguments = query.native_arguments(now_utc_ns=time.time_ns())
+        page = _history_page(self.core.history_export(**arguments), "manyforge.historian_export_page.v1")
+        return {**page, "time_window": {key: None if arguments[key] is None else str(arguments[key])
+                                        for key in ("start_utc_ns", "end_utc_ns")}}
+
+    def debug_export(self, query: HistorianQueryRequest) -> dict[str, Any]:
+        from .history_diagnostics import forensic_bundle
+
+        page = self.history_export(query)
+        events = list(page["events"])
+        current = query.model_copy(update={"recent_seconds": None,
+            **{key: int(value) if value is not None else None for key, value in page["time_window"].items()}})
+        for _ in range(7):
+            if not page["truncated"] or page["next_before_sequence"] is None:
+                break
+            before = page["next_before_sequence"]
+            if not events or type(before) is not int or before != events[-1]["sequence"]:
+                raise HeadlessApiError("historian_response_invalid", "export cursor does not advance")
+            current = current.model_copy(update={"before_sequence": before})
+            page = self.history_export(current)
+            if page["events"] and page["events"][0]["sequence"] >= before:
+                raise HeadlessApiError("historian_response_invalid", "export cursor repeated a previous page")
+            events.extend(page["events"])
+        return forensic_bundle({**page, "events": events}, program_run_id=current.program_run_id,
+                               exported_at_ns=time.time_ns())
 
     def record_client_incident(self, **kwargs: Any) -> dict[str, Any]:
         """Non-blockingly enqueue one strict client-incident transition."""

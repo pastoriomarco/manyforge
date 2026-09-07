@@ -45,6 +45,7 @@ from manyforge_behavior.orchestration_ports import (
     OwnerTaskState,
     ProgramRunPortContext,
 )
+from manyforge_behavior.json_scalars import nonnegative_int64_value
 
 
 _RETAINED_ASSISTANT_API: Final = "manyforge.retained_assistant.v1"
@@ -1301,7 +1302,7 @@ class ProgramAssistantPort:
         snapshot_source: ProgramSnapshotSource | None = None,
         maximum_workers: int = 4,
         maximum_tasks: int = _MAX_TASKS,
-        clock: Any = time.monotonic,
+        clock_ns: Any = time.monotonic_ns,
         wall_clock: Any = _utc_wall_time_text,
     ) -> None:
         for method in ("validate_endpoint", "complete"):
@@ -1322,7 +1323,7 @@ class ProgramAssistantPort:
             or not 1 <= maximum_workers <= _MAX_WORKERS
             or type(maximum_tasks) is not int
             or not 1 <= maximum_tasks <= _MAX_TASKS
-            or not callable(clock)
+            or not callable(clock_ns)
             or not callable(wall_clock)
         ):
             raise ValueError("assistant port bounds are invalid")
@@ -1335,12 +1336,16 @@ class ProgramAssistantPort:
             thread_name_prefix="manyforge-program-model",
         )
         self._maximum_tasks = maximum_tasks
-        self._clock = clock
+        self._clock_ns = clock_ns
         self._wall_clock = wall_clock
         self._contexts: dict[str, _BoundContext] = {}
         self._tasks: dict[str, _Task] = {}
         self._lock = RLock()
         self._closed = False
+
+    def _clock(self) -> float:
+        """Second-based timeout budgets share the exact record clock."""
+        return self._clock_ns() / 1_000_000_000
 
     @staticmethod
     def _task_id(identity: NodeAttemptIdentity) -> str:
@@ -1772,18 +1777,15 @@ class ProgramAssistantPort:
             if attempt.terminal_outcome is not None:
                 return False
             if attempt.pending_terminal_record is None:
-                completed_at_s = self._clock()
-                if (
-                    isinstance(completed_at_s, bool)
-                    or not isinstance(completed_at_s, (int, float))
-                    or not math.isfinite(float(completed_at_s))
-                    or completed_at_s < 0.0
-                    or completed_at_s * 1_000_000_000.0 > _MAX_SAFE_INTEGER
-                ):
+                completed_at_ns = self._clock_ns()
+                try:
+                    occurred_at_ns = nonnegative_int64_value(completed_at_ns)
+                except ValueError as exc:
                     raise _TaskFailure(
                         "model_audit_record_invalid",
                         "model-attempt terminal time is outside its bound",
-                    )
+                    ) from exc
+                completed_at_s = completed_at_ns / 1_000_000_000
                 try:
                     wall_time = self._wall_clock()
                     if not isinstance(wall_time, str) or not wall_time:
@@ -1825,9 +1827,7 @@ class ProgramAssistantPort:
                                 "" if response is None else response.model_version,
                                 maximum_bytes=_MAX_MODEL_VERSION_BYTES,
                             ),
-                            "occurred_at_ns": int(
-                                completed_at_s * 1_000_000_000.0
-                            ),
+                            "occurred_at_ns": occurred_at_ns,
                             "occurred_at_wall": occurred_at_wall,
                             "latency_ms": min(
                                 _MAX_TIMEOUT_S * 1_000.0,

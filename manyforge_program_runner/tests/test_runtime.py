@@ -37,6 +37,7 @@ from manyforge_headless_api.cell_admission import (
     cell_admission_owner_epoch_reconciliation_evidence_digest,
 )
 from manyforge_program_runner.cycle_journal import ProgramCycleJournal
+from manyforge_program_runner.runtime_controls import ProgramRuntimeControls
 from manyforge_program_runner.models import (
     ProgramCycleResetRequest,
     ProgramNodeAvailabilityRequest,
@@ -2399,9 +2400,11 @@ def test_repeated_run_is_state_rejected_and_keeps_one_active_product_run(
     ]
 
 
+@pytest.mark.parametrize("near_revision_limit", [False, True])
 def test_operator_motion_stop_reset_stops_tree_and_resets_cycle_once(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
+    near_revision_limit: bool,
 ) -> None:
     monkeypatch.setattr(
         "manyforge_program_runner.runtime.build_applied_program_run_admission",
@@ -2439,6 +2442,24 @@ def test_operator_motion_stop_reset_stops_tree_and_resets_cycle_once(
     )
     runtime.start()
     runtime.start_run(_start_request())
+
+    if near_revision_limit:
+        controls = runtime._controls("program-cycle.1")
+        controls.stage_override(
+            node_instance_id="move.1", node_attempt_id="attempt.1",
+            parameter_id="velocity_scale", value=0.5,
+            source_observation_id=None, source_owner_generation=None,
+            validator=lambda **values: values["value"],
+        )
+        snapshot = controls.snapshot()
+        maximum = 9_007_199_254_740_991
+        snapshot["runtime_control_revision"] = maximum - 1
+        snapshot["audit"] = [
+            {"event_revision": index, "kind": "prior_control"}
+            for index in range(maximum - 257, maximum - 1)
+        ]
+        capture = runtime.read_run("program-cycle.1")["capture"]
+        runtime._runtime_controls["program-cycle.1"] = ProgramRuntimeControls.restore(capture, snapshot)
 
     intervention = SimpleNamespace(
         identity=SimpleNamespace(
@@ -2495,6 +2516,11 @@ def test_operator_motion_stop_reset_stops_tree_and_resets_cycle_once(
     assert cleared_stop_faults == ["program-cycle.1"]
     assert len(admission.releases) == 1
     assert journal.read().state == "idle_after_reset"
+    if near_revision_limit:
+        controls_result = result["runtime_controls"]["runtime_controls"]
+        assert controls_result["runtime_control_revision"] == maximum
+        assert controls_result["audit"][-1]["kind"] == "program_runtime_controls_reset"
+        assert controls_result["audit"][-1]["correlation_id"] == "operator-stop-reset.1"
     runtime.shutdown()
 
 
@@ -3164,9 +3190,11 @@ def test_release_failure_is_visible_and_only_known_rejection_can_resume(
     runtime.shutdown()
 
 
+@pytest.mark.parametrize("phase_write_failure", [False, True])
 def test_reset_keeps_backend_fenced_when_scene_convergence_fails(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
+    phase_write_failure: bool,
 ) -> None:
     events: list[str] = []
 
@@ -3221,7 +3249,7 @@ def test_reset_keeps_backend_fenced_when_scene_convergence_fails(
         }
         contexts.append(context_id)
         events.append(f"scene:{len(contexts)}")
-        if len(contexts) == 1:
+        if len(contexts) == 1 and not phase_write_failure:
             raise RuntimeError("logical scene owner temporarily unavailable")
         return ({"source": {"record_digest": _DIGEST_A}}, {"proof": True})
 
@@ -3242,6 +3270,35 @@ def test_reset_keeps_backend_fenced_when_scene_convergence_fails(
     )
     runtime.start()
 
+    if phase_write_failure:
+        capture = {
+            "program_run_id": "program-cycle.1", "program_id": "program.1",
+            "program_revision": _DIGEST_A, "program_binding_id": _DIGEST_B,
+            "retained_bundle_id": _DIGEST_A, "graph_revision": _DIGEST_B,
+            "node_environment_digest": _DIGEST_A,
+        }
+        snapshot = ProgramRuntimeControls(capture).snapshot()
+        maximum = 9_007_199_254_740_991
+        snapshot["runtime_control_revision"] = maximum - 1
+        snapshot["audit"] = [
+            {"event_revision": index, "kind": "prior_control"}
+            for index in range(maximum - 257, maximum - 1)
+        ]
+        controls = ProgramRuntimeControls.restore(capture, snapshot)
+        runtime._runtime_controls["program-cycle.1"] = controls
+        update_phase = journal.update_reset_phase
+        failed_phase_write = False
+
+        def fail_phase_once(**kwargs):
+            nonlocal failed_phase_write
+            if kwargs["phase"] == "releasing" and not failed_phase_write:
+                failed_phase_write = True
+                assert controls.revision == maximum
+                raise RuntimeError("Reset phase write temporarily unavailable")
+            return update_phase(**kwargs)
+
+        monkeypatch.setattr(journal, "update_reset_phase", fail_phase_once)
+
     with pytest.raises(ProgramRunnerError) as failed:
         runtime.reset_cycle(request)
     assert failed.value.code == "program_cycle_recovery_required"
@@ -3256,7 +3313,8 @@ def test_reset_keeps_backend_fenced_when_scene_convergence_fails(
     assert failed_cycle.failure == {
         "code": "program_cycle_reset_scene_preparation_failed",
         "failed_phase": "restoring_scene",
-        "message": "logical scene owner temporarily unavailable",
+        "message": ("Reset phase write temporarily unavailable" if phase_write_failure
+                    else "logical scene owner temporarily unavailable"),
     }
     assert admission.releases == []
 
@@ -3265,6 +3323,9 @@ def test_reset_keeps_backend_fenced_when_scene_convergence_fails(
     assert events == ["scene:1", "scene:2", "release", "idle"]
     assert len(admission.releases) == 1
     assert journal.read().state == "idle_after_reset"
+    if phase_write_failure:
+        assert controls.revision == maximum
+        assert controls.snapshot()["audit"][-1]["request_id"] == "reset.scene.1"
     runtime.shutdown()
 
 

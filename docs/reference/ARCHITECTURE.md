@@ -10,10 +10,13 @@
 > consequence routing, immutable certificates/fault latches, durable
 > surveillance/recovery, and command-free orphan reconciliation. The governance
 > contracts are ROS-free; the current product realization is native. Packaged
-> aggregate launch, public MCP/external-agent loops, dynamic live viewer truth,
-> Isaac/ROS product launch, real hardware, and generalized tools remain later
+> aggregate launch, external-agent provider loops, Isaac/ROS product launch,
+> real hardware, and generalized tools remain later
 > I9-I11 work. Sections describing those three-lane transports remain target or
 > historical reference unless they explicitly name the current native owner.
+> Composer's optional MCP adapter maps tools to the same owner routes as
+> other clients; it has no independent command or lifecycle authority. The
+> current viewer receives credited, current-only native observations.
 
 A coherent, mid-depth map of how ManyForge is put together: the components, how
 a program flows through them, and — most importantly — which layer owns which
@@ -613,12 +616,15 @@ The current versioned WebSocket contract is:
   backend-authoritative execution-control session, fixed heartbeat/freshness
   profile, sequencing, backpressure, reconnect, and integration rules.
 
+The optional MCP adapter is described by the generated
+[`MCP_RUNTIME_CONTRACT.md`](MCP_RUNTIME_CONTRACT.md). Tool discovery is not
+evidence that an external assistant provider or every historical workflow has
+been qualified.
+
 The following files are pinned historical reimplementation inputs. Their
 product surfaces are unavailable on the current cutover branch; they are not
 generated from, or evidence for, a running current product:
 
-- [`MCP_RUNTIME_CONTRACT.md`](MCP_RUNTIME_CONTRACT.md) — historical MCP tool
-  surface.
 - [`ASSISTANT_PROVIDER_CONTRACT.md`](ASSISTANT_PROVIDER_CONTRACT.md) —
   historical assistant-provider HTTP contract.
 - [`VIEWER_DATA_PLANE_V1.schema.json`](VIEWER_DATA_PLANE_V1.schema.json) —

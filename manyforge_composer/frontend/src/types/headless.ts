@@ -1,4 +1,5 @@
 import type { ProgramCycleStatus } from './api';
+import type { Nanoseconds } from './nanoseconds';
 import type { ExecutionOwnerStatus } from './robotControl';
 
 export type SourceFreshness = 'fresh' | 'stale' | 'unavailable';
@@ -50,7 +51,7 @@ export interface AlarmMembership {
 }
 
 export interface OperatorAlarmRecord extends AlarmMembership {
-  activatedAtNs: number;
+  activatedAtNs: Nanoseconds;
   definitionId: string;
   lifecycleState: AlarmLifecycleState;
   active: boolean;
@@ -178,15 +179,47 @@ export interface HistorianStoredEvent {
   event: HistorianEventSummary;
 }
 
+export interface HistorianDiscovery {
+  schemaVersion: 'manyforge.historian_discovery.v1';
+  kind: 'program_run_id' | 'component' | 'channel' | 'event_type';
+  values: string[];
+  truncated: boolean;
+  nextAfter: string | null;
+}
+
 export interface HistorianPage {
-  schemaVersion: 'manyforge.historian_summary_page.v1';
+  schemaVersion: 'manyforge.historian_summary_page.v2';
   events: HistorianStoredEvent[];
   nextBeforeSequence: number | null;
   truncated: boolean;
+  timeWindow: { startUtcNs: string | null; endUtcNs: string | null };
+  retention: HistorianRetention | null;
+}
+
+export interface HistorianRetention {
+  schemaVersion: 'manyforge.historian_retention.v1';
+  partitionRowLimit: string;
+  partitionRecordByteLimit: string;
+  databasePageByteLimit: string;
+  durationGuaranteed: false;
+  priorPruningKnown: boolean;
+  partitions: Array<{
+    partition: 'routine' | 'important';
+    retainedCount: string;
+    retainedBytes: string;
+    prunedCount: string;
+    prunedBytes: string;
+    lastPrunedSequence: string | null;
+    unknownTimeCount: string;
+    regressedTimeCount: string;
+    lossCounterSaturated: boolean;
+    firstRecordedUtcNs: string | null;
+    lastRecordedUtcNs: string | null;
+  }>;
 }
 
 export interface HistorianEventSummary {
-  schemaVersion: 'manyforge.historian_event_summary.v1';
+  schemaVersion: 'manyforge.historian_event_summary.v2';
   eventId: string;
   component: string;
   eventType: string;
@@ -197,6 +230,10 @@ export interface HistorianEventSummary {
   programRunId: string | null;
   operationId: string | null;
   conditionId: string | null;
+  conditionSeverity: string;
+  occurredAtUtcNs: string | null;
+  clockOwner: string | null;
+  wallClockRegressed: boolean;
 }
 
 export type HistorianDetailSectionName =

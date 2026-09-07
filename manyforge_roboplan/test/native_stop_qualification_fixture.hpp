@@ -273,8 +273,8 @@ public:
     return core::Result<core::ControlledStateDTO>::Ok(state_);
   }
 
-  const core::ObservedStateQueryContextDTO &
-  query_context() const noexcept override {
+  core::ObservedStateQueryContextDTO
+  query_context() const override {
     return context_;
   }
 

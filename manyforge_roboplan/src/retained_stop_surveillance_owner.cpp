@@ -95,7 +95,7 @@ source_input_valid(const RetainedStopSurveillanceSourceInput &source) {
       (source.observation_sources.empty() &&
        !source.no_active_goal_evidence_source))
     return false;
-  const auto &context = source.state_channel->query_context();
+  const auto context = source.state_channel->query_context();
   auto expected = core::make_observed_state_query_context(
       source.binding, context.freshness_budget_ns);
   if (!expected.ok() || expected.value() != context)
@@ -317,10 +317,10 @@ latest_authoritative_attempt(
   return selected;
 }
 
-[[nodiscard]] core::ActivationSetId containment_activation_set(
-    const core::ResolvedStopContainmentScopeDTO &scope) {
-  return std::visit(
-      [](const auto &value) { return value.activation_set_id; }, scope);
+[[nodiscard]] core::ActivationSetId
+containment_activation_set(const core::ResolvedStopContainmentScopeDTO &scope) {
+  return std::visit([](const auto &value) { return value.activation_set_id; },
+                    scope);
 }
 
 [[nodiscard]] bool provider_target_stably_matches(
@@ -332,14 +332,12 @@ latest_authoritative_attempt(
          predecessor.provider_manifest_revision ==
              current.provider_manifest_revision &&
          predecessor.runtime_unit_id == current.provider_runtime_unit_id &&
-         std::count_if(binding.runtime_unit_epochs.begin(),
-                       binding.runtime_unit_epochs.end(),
-                       [&](const auto &row) {
-                         return row.runtime_unit_id ==
-                                    current.provider_runtime_unit_id &&
-                                row.runtime_epoch ==
-                                    current.provider_runtime_epoch;
-                       }) == 1;
+         std::count_if(
+             binding.runtime_unit_epochs.begin(),
+             binding.runtime_unit_epochs.end(), [&](const auto &row) {
+               return row.runtime_unit_id == current.provider_runtime_unit_id &&
+                      row.runtime_epoch == current.provider_runtime_epoch;
+             }) == 1;
 }
 
 [[nodiscard]] bool provider_target_stably_matches(
@@ -351,14 +349,12 @@ latest_authoritative_attempt(
          predecessor.provider_manifest_revision ==
              current.provider_manifest_revision &&
          predecessor.runtime_unit_id == current.provider_runtime_unit_id &&
-         std::count_if(binding.runtime_unit_epochs.begin(),
-                       binding.runtime_unit_epochs.end(),
-                       [&](const auto &row) {
-                         return row.runtime_unit_id ==
-                                    current.provider_runtime_unit_id &&
-                                row.runtime_epoch ==
-                                    current.provider_runtime_epoch;
-                       }) == 1;
+         std::count_if(
+             binding.runtime_unit_epochs.begin(),
+             binding.runtime_unit_epochs.end(), [&](const auto &row) {
+               return row.runtime_unit_id == current.provider_runtime_unit_id &&
+                      row.runtime_epoch == current.provider_runtime_epoch;
+             }) == 1;
 }
 
 [[nodiscard]] bool successor_binding_matches_terminal_participant(
@@ -430,7 +426,7 @@ latest_authoritative_attempt(
       return false;
     }
   } else if (!provider_target_stably_matches(command.command_target, path,
-                                              binding)) {
+                                             binding)) {
     return false;
   }
 
@@ -447,14 +443,13 @@ latest_authoritative_attempt(
     predecessor_observation_present = true;
     successor_observation_present =
         successor_observation_present ||
-        std::any_of(source.observation_sources.begin(),
-                    source.observation_sources.end(), [&](const auto &current) {
-                      return current.evidence_requirement ==
-                                 requirement.requirement &&
-                             is_exact_runtime_successor(
-                                 current.resolved_source,
-                                 requirement.resolved_source);
-                    });
+        std::any_of(
+            source.observation_sources.begin(),
+            source.observation_sources.end(), [&](const auto &current) {
+              return current.evidence_requirement == requirement.requirement &&
+                     is_exact_runtime_successor(current.resolved_source,
+                                                requirement.resolved_source);
+            });
   }
   return !predecessor_observation_present || successor_observation_present;
 }
@@ -494,8 +489,8 @@ successor_configuration_evidence_digest(
     }
     const RetainedStopSurveillanceSourceInput *selected = nullptr;
     for (const auto &source : sources) {
-      if (!successor_binding_matches_terminal_participant(
-              source, *participant, *attempt, latch)) {
+      if (!successor_binding_matches_terminal_participant(source, *participant,
+                                                          *attempt, latch)) {
         continue;
       }
       if (selected != nullptr) {
@@ -559,8 +554,7 @@ successor_configuration_evidence_digest(
            expectation.active_control_configuration_generation.value()))},
       {"predecessor_active_control_configuration_id",
        CanonicalValue(expectation.active_control_configuration_id.value())},
-      {"retained_bundle_id",
-       CanonicalValue(latch.retained_bundle_id.value())},
+      {"retained_bundle_id", CanonicalValue(latch.retained_bundle_id.value())},
   });
   return core::ContentDigest(content_identity::framed_sha256(
       kSuccessorConfigurationEvidenceDomain,
@@ -591,8 +585,6 @@ successor_configuration_evidence_digest(
       snapshot.resources != context.resources ||
       snapshot.joint_names != context.joint_names ||
       snapshot.positions.size() != context.coordinate_kinds.size() ||
-      !snapshot.velocities.has_value() ||
-      snapshot.velocities->size() != context.coordinate_kinds.size() ||
       snapshot.source_epoch != context.runtime_epoch ||
       snapshot.state_authority_id != context.state_authority_id ||
       snapshot.state_authority_class != context.state_authority_class) {
@@ -601,9 +593,7 @@ successor_configuration_evidence_digest(
   for (std::size_t index = 0U; index < context.coordinate_kinds.size();
        ++index) {
     if (core::coordinate_kind(snapshot.positions[index]) !=
-            context.coordinate_kinds[index] ||
-        core::coordinate_kind((*snapshot.velocities)[index]) !=
-            context.coordinate_kinds[index]) {
+        context.coordinate_kinds[index]) {
       return false;
     }
   }
@@ -658,10 +648,11 @@ struct RefreshedCurrentQuiescenceObservation final {
        CanonicalValue(std::to_string(
            query.stop_certificate.stop_certificate_revision.value()))},
   });
-  return core::ContentDigest(content_identity::framed_sha256(
-      kResourceEvidenceDomain, "manyforge.stop-fault-recovery-successor-"
-                               "resource-evidence.v1",
-      value));
+  return core::ContentDigest(
+      content_identity::framed_sha256(kResourceEvidenceDomain,
+                                      "manyforge.stop-fault-recovery-successor-"
+                                      "resource-evidence.v1",
+                                      value));
 }
 
 [[nodiscard]] bool quiescence_refreshable(const core::ErrorDTO &failure) {
@@ -699,16 +690,14 @@ observe_current_quiescence(const RetainedStopSurveillanceSourceInput &source,
     return core::Result<CurrentQuiescenceObservation>::Err(observed.error());
   }
   const auto &snapshot = observed.value();
-  const auto &context = source.state_channel->query_context();
   // The source binding and channel context are published by different owner
   // steps during route adoption. Never combine a current binding with a
   // predecessor publication (especially its runtime epoch) into one fact.
   const auto expected_context = core::make_observed_state_query_context(
-      source.binding, context.freshness_budget_ns);
+      source.binding, snapshot.freshness_budget_ns);
   if (!expected_context.ok() ||
       !core::validate_observed_state_snapshot(snapshot, assessed_at_ns).ok() ||
-      !snapshot_matches_context(snapshot, context) ||
-      expected_context.value() != context ||
+      !snapshot_matches_context(snapshot, expected_context.value()) ||
       assessed_at_ns < snapshot.received_timestamp_ns) {
     return invalid<CurrentQuiescenceObservation>(
         "native_current_resource_identity_mismatch",
@@ -820,7 +809,6 @@ select_source(const std::vector<RetainedStopSurveillanceSourceInput> &sources,
   return result;
 }
 
-
 [[nodiscard]] std::optional<SelectedSource> select_successor_source(
     const std::vector<RetainedStopSurveillanceSourceInput> &sources,
     const core::StopEvidenceRequirementDTO &requirement,
@@ -852,11 +840,13 @@ observe_selected(const core::StopSurveillanceObservationQueryDTO &query,
         "stop_surveillance_source_unavailable", observed.error().message);
   }
   const auto &snapshot = observed.value();
-  const auto &context = selected.source.state_channel->query_context();
-  if (!core::validate_observed_state_snapshot(snapshot,
+  const auto expected_context = core::make_observed_state_query_context(
+      selected.source.binding, snapshot.freshness_budget_ns);
+  if (!expected_context.ok() ||
+      !core::validate_observed_state_snapshot(snapshot,
                                               query.evaluation_time_ns)
            .ok() ||
-      !snapshot_matches_context(snapshot, context) ||
+      !snapshot_matches_context(snapshot, expected_context.value()) ||
       snapshot.source_epoch !=
           query.resolved_source.runtime_target.provider_runtime_epoch ||
       snapshot.state_authority_id !=
@@ -874,6 +864,13 @@ observe_selected(const core::StopSurveillanceObservationQueryDTO &query,
         query, core::StopSurveillanceSourceAvailabilityDTO::kUnavailable,
         "stop_surveillance_source_stale",
         "native surveillance source is stale");
+  }
+  if (!snapshot.velocities ||
+      snapshot.velocities->size() != snapshot.resources.size()) {
+    return unavailable_sample(
+        query, core::StopSurveillanceSourceAvailabilityDTO::kUnavailable,
+        "stop_surveillance_velocity_unavailable",
+        "native surveillance source has no complete velocity evidence");
   }
   bool at_rest = true;
   for (const auto &resource : selected.observation.observed_resources) {
@@ -1127,8 +1124,8 @@ RetainedStopSurveillanceOwner::BuildRecoveryFacts(
             select_source(sources, requirement.first, requirement.second);
         bool successor = false;
         if (!selected.has_value()) {
-          selected = select_successor_source(
-              sources, requirement.first, requirement.second);
+          selected = select_successor_source(sources, requirement.first,
+                                             requirement.second);
           successor = selected.has_value();
         }
         if (!selected.has_value())
@@ -1138,8 +1135,8 @@ RetainedStopSurveillanceOwner::BuildRecoveryFacts(
               selected->source, selected->observation.observed_resources,
               effective_assessed_at_ns, clock_);
           if (current.ok()) {
-            effective_assessed_at_ns = std::max(
-                effective_assessed_at_ns, current.value().assessed_at_ns);
+            effective_assessed_at_ns = std::max(effective_assessed_at_ns,
+                                                current.value().assessed_at_ns);
           }
           for (const auto &resource :
                selected->observation.observed_resources) {
@@ -1185,11 +1182,11 @@ RetainedStopSurveillanceOwner::BuildRecoveryFacts(
                 observed.snapshot.source_epoch,
                 observed.snapshot.sequence,
                 observed.source_age_ns,
-                std::min(requirement.first.source_requirement
-                             .freshness_budget_ns,
-                         kRetainedNativeReconciliationFreshnessBudgetNs),
-                successor_resource_evidence_digest(
-                    query, selected->source, observed, resource),
+                std::min(
+                    requirement.first.source_requirement.freshness_budget_ns,
+                    kRetainedNativeReconciliationFreshnessBudgetNs),
+                successor_resource_evidence_digest(query, selected->source,
+                                                   observed, resource),
                 std::nullopt};
           }
           continue;
@@ -1308,8 +1305,8 @@ RetainedStopSurveillanceOwner::BuildRecoveryFacts(
         evidence = configuration_evidence_digest(
             expectation, latch.retained_bundle_id, latch.graph_revision);
       } else {
-        evidence = successor_configuration_evidence_digest(
-            status, sources, latch, expectation);
+        evidence = successor_configuration_evidence_digest(status, sources,
+                                                           latch, expectation);
       }
       configuration_facts.push_back(core::StopFaultRecoveryConfigurationFactDTO{
           expectation, evidence.has_value(), std::move(evidence)});

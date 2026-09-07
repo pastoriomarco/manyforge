@@ -1704,23 +1704,40 @@ DecodeOperation(const CanonicalValue &value,
                 const core::RequestAttributionDTO &attribution) {
   RequireExactObjectSize(value, 10U, "operation intent");
   const auto &request = Member(value, "request_context");
-  const auto &participants = Array(value, "participants");
-  Require(participants.size() == 1U,
-          "N3 admits exactly one operation participant");
-  const auto &participant = participants.front();
-  RequireExactObjectSize(participant, 5U, "operation participant");
-  std::optional<core::ActionSpanDTO> action_span;
-  const auto &span = Member(participant, "action_span");
-  if (!std::holds_alternative<std::nullptr_t>(span.storage())) {
-    action_span = DecodeActionSpan(span);
+  const auto &participant_values = Array(value, "participants");
+  Require(!participant_values.empty() &&
+              participant_values.size() <= core::kMaxOperationParticipants,
+          "operation participant count exceeds its bounds");
+  const auto policy_name = Text(value, "coordination_policy");
+  Require(policy_name == "independent" || policy_name == "coordinated_all",
+          "operation coordination policy is unsupported");
+  const auto policy = policy_name == "independent"
+                          ? core::OperationCoordinationPolicy::kIndependent
+                          : core::OperationCoordinationPolicy::kCoordinatedAll;
+  Require((participant_values.size() == 1U) ==
+              (policy == core::OperationCoordinationPolicy::kIndependent),
+          "operation participant count differs from its coordination policy");
+  std::vector<core::OperationParticipantIntentDTO> participants;
+  participants.reserve(participant_values.size());
+  for (const auto &participant : participant_values) {
+    RequireExactObjectSize(participant, 5U, "operation participant");
+    std::optional<core::ActionSpanDTO> action_span;
+    const auto &span = Member(participant, "action_span");
+    if (!std::holds_alternative<std::nullptr_t>(span.storage())) {
+      action_span = DecodeActionSpan(span);
+    }
+    participants.push_back(core::OperationParticipantIntentDTO{
+        core::ComponentRoleId(Text(participant, "component_role_id")),
+        core::TargetRoleId(Text(participant, "target_role_id")),
+        core::CapabilityId(Text(participant, "required_capability_id")),
+        std::move(action_span),
+        DecodeParticipantPayload(Member(participant, "payload"))});
   }
   std::optional<core::SceneRevision> expected_scene;
   const auto &scene = Member(value, "expected_scene_revision");
   if (!std::holds_alternative<std::nullptr_t>(scene.storage())) {
     expected_scene = DecodeSceneRevision(scene);
   }
-  Require(Text(value, "coordination_policy") == "independent",
-          "N3 admits only independent operation coordination");
   return core::OperationIntentDTO{
       DecodeRequestContext(request),
       core::ProgramId(Text(value, "program_id")),
@@ -1730,13 +1747,8 @@ DecodeOperation(const CanonicalValue &value,
       core::GraphRevision(Text(value, "expected_graph_revision")),
       core::RetainedBundleId(Text(value, "expected_retained_bundle_id")),
       std::move(expected_scene),
-      {core::OperationParticipantIntentDTO{
-          core::ComponentRoleId(Text(participant, "component_role_id")),
-          core::TargetRoleId(Text(participant, "target_role_id")),
-          core::CapabilityId(Text(participant, "required_capability_id")),
-          std::move(action_span),
-          DecodeParticipantPayload(Member(participant, "payload"))}},
-      core::OperationCoordinationPolicy::kIndependent,
+      std::move(participants),
+      policy,
       attribution};
 }
 
@@ -2047,6 +2059,8 @@ enum class CommandKind {
   kStatus,
   kIdentity,
   kTargets,
+  kQueryTarget,
+  kQueryOperation,
   kControlState,
   kObservation,
   kEvents,
@@ -2069,6 +2083,7 @@ enum class CommandKind {
   kGetStopFault,
   kRecoverStopFault,
   kSetRuntimeScaleControl,
+  kSetOperationRuntimeScale,
   kGetRuntimeScaleControl,
   kPlanPick,
   kPlanPlace,
@@ -2090,10 +2105,26 @@ struct MalformedStopCommand final {
   std::string reason;
 };
 
+struct TargetObservationQuery final {
+  core::RequestOwnerEpoch owner_epoch;
+  core::ProgramBindingId program_binding_id;
+  core::TargetRoleId target_role_id;
+  std::optional<core::FrameRoleId> frame_role_id;
+};
+
+struct ProgramOperationQuery final {
+  core::RequestOwnerEpoch owner_epoch;
+  core::ProgramBindingId program_binding_id;
+  core::ProgramRunId program_run_id;
+  core::TargetRoleId target_role_id;
+};
+
 struct Command final {
   explicit Command(CommandKind command_kind) : kind(command_kind) {}
 
   CommandKind kind;
+  std::optional<TargetObservationQuery> target_query;
+  std::optional<ProgramOperationQuery> operation_query;
   std::optional<core::OperationIntentDTO> operation;
   std::optional<core::ContentDigest> operation_digest;
   std::optional<core::OperationId> operation_id;
@@ -2108,6 +2139,7 @@ struct Command final {
   std::optional<MalformedStopCommand> malformed_stop;
   std::optional<core::StopFaultRecoveryIntentDTO> stop_fault_recovery;
   std::optional<core::RuntimeScaleControlRequestDTO> runtime_scale_control;
+  std::optional<core::RuntimeScaleRequestDTO> operation_runtime_scale;
   std::optional<core::RuntimeScaleControlSelectorDTO>
       runtime_scale_control_selector;
   std::optional<core::RequestOwnerEpoch> event_owner_epoch{};
@@ -2148,6 +2180,42 @@ struct Command final {
   if (command == "targets") {
     RequireExactObjectSize(root, 2U, "targets command");
     return Command{CommandKind::kTargets};
+  }
+  if (command == "query_target") {
+    RequireExactObjectSize(root, 3U, "target observation command");
+    const auto &query = Member(root, "query");
+    const auto kind = Text(query, "kind");
+    Require(kind == "frame_pose" || kind == "gripper_status",
+            "target observation kind is unsupported");
+    RequireExactObjectSize(query, kind == "frame_pose" ? 6U : 5U,
+                           "target observation query");
+    Require(Text(query, "schema_version") ==
+                "manyforge.target_observation_query.v1",
+            "target observation query schema is unsupported");
+    Command decoded{CommandKind::kQueryTarget};
+    decoded.target_query = TargetObservationQuery{
+        core::RequestOwnerEpoch(Text(query, "owner_epoch")),
+        core::ProgramBindingId(Text(query, "program_binding_id")),
+        core::TargetRoleId(Text(query, "target_role_id")),
+        kind == "frame_pose"
+            ? std::optional(core::FrameRoleId(Text(query, "frame_role_id")))
+            : std::nullopt};
+    return decoded;
+  }
+  if (command == "query_operation") {
+    RequireExactObjectSize(root, 3U, "Program operation query command");
+    const auto &query = Member(root, "query");
+    RequireExactObjectSize(query, 5U, "Program operation query");
+    Require(Text(query, "schema_version") ==
+                "manyforge.program_operation_query.v1",
+            "Program operation query schema is unsupported");
+    Command decoded{CommandKind::kQueryOperation};
+    decoded.operation_query = ProgramOperationQuery{
+        core::RequestOwnerEpoch(Text(query, "owner_epoch")),
+        core::ProgramBindingId(Text(query, "program_binding_id")),
+        core::ProgramRunId(Text(query, "program_run_id")),
+        core::TargetRoleId(Text(query, "target_role_id"))};
+    return decoded;
   }
   if (command == "control_state") {
     RequireExactObjectSize(root, 2U, "control-state command");
@@ -2379,6 +2447,25 @@ struct Command final {
         DecodeStopFaultRecoveryIntent(Member(root, "request"));
     return decoded;
   }
+  if (command == "set_operation_runtime_scale") {
+    RequireExactObjectSize(root, 4U, "operation runtime-scale command");
+    const auto &value = Member(root, "request");
+    RequireExactObjectSize(value, 5U, "operation runtime-scale request");
+    const double scale = Number(value, "scale");
+    Require(scale > 0.0 && scale <= 1.0,
+            "node runtime scale must be in (0, 1]");
+    Command decoded{CommandKind::kSetOperationRuntimeScale};
+    decoded.operation_runtime_scale = core::RuntimeScaleRequestDTO{
+        DecodeRequestContext(Member(value, "request_context")),
+        core::OperationId(Text(value, "operation_id")),
+        core::OperationRevision(
+            Counter(value, "expected_operation_revision", 1U)),
+        core::RuntimeScaleGeneration(
+            Counter(value, "expected_runtime_scale_generation", 0U)),
+        scale,
+        DecodeRequestAttribution(Member(root, "attribution"))};
+    return decoded;
+  }
   if (command == "set_runtime_scale_control") {
     RequireExactObjectSize(root, 4U, "runtime-scale control command");
     const auto attribution =
@@ -2438,9 +2525,8 @@ ErrorResponse(std::string code, std::string message,
     const core::RequestOwnerEpoch &owner_epoch) {
   const auto admission = owner.GetAuthoringAdmission();
   return CanonicalValue(CanonicalValue::Object{
-      {"admission_generation",
-       CanonicalValue(
-           static_cast<double>(admission.admission_generation.value()))},
+      {"admission_generation", CanonicalValue(static_cast<double>(
+                                   admission.admission_generation.value()))},
       {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
       {"error",
        ErrorValue(core::ErrorDTO{
@@ -2899,8 +2985,8 @@ AcceptedValue(const core::OperationAcceptedDTO &value) {
     });
   }
   return CanonicalValue(CanonicalValue::Object{
-      {"accepted_at_ns",
-       CanonicalValue(static_cast<double>(value.accepted_at_ns))},
+      {"accepted_at_ns", manyforge::content_identity::nonnegative_int64_value(
+                             value.accepted_at_ns)},
       {"operation_id", CanonicalValue(value.operation_id.value())},
       {"operation_revision",
        CanonicalValue(static_cast<double>(value.operation_revision.value()))},
@@ -2931,8 +3017,8 @@ ControlAcceptedValue(const core::OperationControlAcceptedDTO &value) {
       {"accepted_against_revision",
        CanonicalValue(
            static_cast<double>(value.accepted_against_revision.value()))},
-      {"accepted_at_ns",
-       CanonicalValue(static_cast<double>(value.accepted_at_ns))},
+      {"accepted_at_ns", manyforge::content_identity::nonnegative_int64_value(
+                             value.accepted_at_ns)},
       {"control", CanonicalValue(std::string(ControlName(value.control)))},
       {"operation_id", CanonicalValue(value.operation_id.value())},
       {"operation_revision_after_acceptance",
@@ -3066,7 +3152,8 @@ StopAcceptedValue(const core::StopAcceptedDTO &value) {
     for (const auto &phase : participant.phases) {
       phases.emplace_back(CanonicalValue::Object{
           {"fixed_deadline_offset_ns",
-           CanonicalValue(static_cast<double>(phase.fixed_deadline_offset_ns))},
+           manyforge::content_identity::nonnegative_int64_value(
+               phase.fixed_deadline_offset_ns)},
           {"phase_id", CanonicalValue(phase.phase_id.value())},
           {"remaining_deadline_offset_ns",
            CanonicalValue(
@@ -3087,8 +3174,8 @@ StopAcceptedValue(const core::StopAcceptedDTO &value) {
     });
   }
   return CanonicalValue(CanonicalValue::Object{
-      {"accepted_at_ns",
-       CanonicalValue(static_cast<double>(value.accepted_at_ns))},
+      {"accepted_at_ns", manyforge::content_identity::nonnegative_int64_value(
+                             value.accepted_at_ns)},
       {"affected_operation_revisions",
        CanonicalValue(std::move(affected_operations))},
       {"captured_scope_digest",
@@ -3097,12 +3184,14 @@ StopAcceptedValue(const core::StopAcceptedDTO &value) {
        CanonicalValue(
            static_cast<double>(value.fixed_kernel_completion_reserve_ns))},
       {"fixed_outer_duration_ns",
-       CanonicalValue(static_cast<double>(value.fixed_outer_duration_ns))},
+       manyforge::content_identity::nonnegative_int64_value(
+           value.fixed_outer_duration_ns)},
       {"joined_predecessor_stops", CanonicalValue(std::move(predecessors))},
       {"participant_budget_allocations",
        CanonicalValue(std::move(participant_budgets))},
       {"remaining_outer_duration_ns",
-       CanonicalValue(static_cast<double>(value.remaining_outer_duration_ns))},
+       manyforge::content_identity::nonnegative_int64_value(
+           value.remaining_outer_duration_ns)},
       {"replay_status",
        CanonicalValue(std::string(core::to_string(value.replay_status)))},
       {"request_id", CanonicalValue(value.request_id.value())},
@@ -3755,8 +3844,8 @@ StopHistoryAttemptValue(const core::StopAttemptedStageResultDTO &attempt,
            StopAttemptDispositionName(result.attempt_disposition)))},
       {"authority",
        CanonicalValue(std::string(StopStageAuthorityName(attempt.authority)))},
-      {"completed_at_ns",
-       CanonicalValue(static_cast<double>(attempt.completed_at_ns))},
+      {"completed_at_ns", manyforge::content_identity::nonnegative_int64_value(
+                              attempt.completed_at_ns)},
       {"controller_acknowledgement_sequence",
        result.controller_acknowledgement_sequence.has_value()
            ? CanonicalValue(static_cast<double>(
@@ -3881,8 +3970,8 @@ StopHistorySettlementValue(const core::StopScopeEntryDTO &entry) {
       },
       entry.facts);
   return CanonicalValue(CanonicalValue::Object{
-      {"accepted_at_ns",
-       CanonicalValue(static_cast<double>(entry.accepted_at_ns))},
+      {"accepted_at_ns", manyforge::content_identity::nonnegative_int64_value(
+                             entry.accepted_at_ns)},
       {"dispatch_state",
        CanonicalValue(static_cast<double>(entry.dispatch_state))},
       {"facts", std::move(facts)},
@@ -4004,8 +4093,9 @@ StopHistoryFaultValue(const std::optional<core::StopFaultLatchDTO> &fault) {
       include_details
           ? StopAcceptedValue(status.accepted)
           : CanonicalValue(CanonicalValue::Object{
-                {"accepted_at_ns", CanonicalValue(static_cast<double>(
-                                       status.accepted.accepted_at_ns))},
+                {"accepted_at_ns",
+                 manyforge::content_identity::nonnegative_int64_value(
+                     status.accepted.accepted_at_ns)},
                 {"request_id",
                  CanonicalValue(status.accepted.request_id.value())},
                 {"stop_generation",
@@ -4024,8 +4114,8 @@ StopHistoryFaultValue(const std::optional<core::StopFaultLatchDTO> &fault) {
       {"certificate_evidence", CanonicalValue(std::move(certificate_evidence))},
       {"certificate_evidence_count",
        CanonicalValue(static_cast<double>(certificate.evidence_items.size()))},
-      {"completed_at_ns",
-       CanonicalValue(static_cast<double>(certificate.completed_at_ns))},
+      {"completed_at_ns", manyforge::content_identity::nonnegative_int64_value(
+                              certificate.completed_at_ns)},
       {"details_truncated", CanonicalValue(!include_details)},
       {"dispatched_stopped",
        include_details
@@ -4242,8 +4332,8 @@ RecoveryAssessmentValue(const core::KernelRecoveryAssessmentDTO &value) {
   }
   return CanonicalValue(CanonicalValue::Object{
       {"allowed_actions", CanonicalValue(std::move(actions))},
-      {"assessed_at_ns",
-       CanonicalValue(static_cast<double>(value.assessed_at_ns))},
+      {"assessed_at_ns", manyforge::content_identity::nonnegative_int64_value(
+                             value.assessed_at_ns)},
       {"assessment_revision",
        CanonicalValue(static_cast<double>(value.assessment_revision))},
       {"backend_stop_confirmed", CanonicalValue(value.backend_stop_confirmed)},
@@ -4267,8 +4357,8 @@ RecoveryAssessmentValue(const core::KernelRecoveryAssessmentDTO &value) {
       {"observed_state_source_id",
        CanonicalValue(value.observed_state_source_id)},
       {"observed_state_valid_until_ns",
-       CanonicalValue(
-           static_cast<double>(value.observed_state_valid_until_ns))},
+       manyforge::content_identity::nonnegative_int64_value(
+           value.observed_state_valid_until_ns)},
       {"policy_id", CanonicalValue(value.policy_id)},
       {"preemption_result",
        CanonicalValue(std::string(
@@ -4355,8 +4445,8 @@ RecoveryActionResultValue(const core::KernelRecoveryActionResultDTO &value) {
 [[nodiscard]] CanonicalValue RuntimeScaleControlAcceptedValue(
     const core::RuntimeScaleControlAcceptedDTO &value) {
   return CanonicalValue(CanonicalValue::Object{
-      {"accepted_at_ns",
-       CanonicalValue(static_cast<double>(value.accepted_at_ns))},
+      {"accepted_at_ns", manyforge::content_identity::nonnegative_int64_value(
+                             value.accepted_at_ns)},
       {"active_operation_id",
        value.active_operation_id.has_value()
            ? CanonicalValue(value.active_operation_id->value())
@@ -4507,7 +4597,11 @@ OperationStateValue(const core::OperationStateDTO &value) {
       {"active_stop_id", value.active_stop_id.has_value()
                              ? CanonicalValue(value.active_stop_id->value())
                              : CanonicalValue(nullptr)},
-      {"coordination_policy", CanonicalValue("independent")},
+      {"coordination_policy",
+       CanonicalValue(value.coordination_policy ==
+                              core::OperationCoordinationPolicy::kCoordinatedAll
+                          ? "coordinated_all"
+                          : "independent")},
       {"operation_id", CanonicalValue(value.operation_id.value())},
       {"operation_revision",
        CanonicalValue(static_cast<double>(value.operation_revision.value()))},
@@ -4520,8 +4614,8 @@ OperationStateValue(const core::OperationStateDTO &value) {
                  static_cast<double>(value.runtime_scale_generation->value()))
            : CanonicalValue(nullptr)},
       {"state", CanonicalValue(std::string(StateName(value.state)))},
-      {"updated_at_ns",
-       CanonicalValue(static_cast<double>(value.updated_at_ns))},
+      {"updated_at_ns", manyforge::content_identity::nonnegative_int64_value(
+                            value.updated_at_ns)},
   });
 }
 
@@ -4565,8 +4659,8 @@ OperationEventPageValue(const core::OperationJournalEventPageDTO &page) {
     }
     events.emplace_back(CanonicalValue::Object{
         {"effect_pending", CanonicalValue(event.effect_pending)},
-        {"occurred_at_ns",
-         CanonicalValue(static_cast<double>(event.occurred_at_ns))},
+        {"occurred_at_ns", manyforge::content_identity::nonnegative_int64_value(
+                               event.occurred_at_ns)},
         {"occurred_at_wall", CanonicalValue(event.occurred_at_wall)},
         {"operation_id", event.operation_id.has_value()
                              ? CanonicalValue(event.operation_id->value())
@@ -4672,7 +4766,8 @@ ObservedTargetValue(const core::TargetRoleId &target_role_id,
       {"joint_names", CanonicalValue(std::move(joint_names))},
       {"positions", CanonicalValue(std::move(positions))},
       {"received_timestamp_ns",
-       CanonicalValue(static_cast<double>(state.received_timestamp_ns))},
+       manyforge::content_identity::nonnegative_int64_value(
+           state.received_timestamp_ns)},
       {"resources", CanonicalValue(std::move(resources))},
       {"sequence", CanonicalValue(static_cast<double>(state.sequence))},
       {"source_epoch", CanonicalValue(state.source_epoch.value())},
@@ -4680,7 +4775,8 @@ ObservedTargetValue(const core::TargetRoleId &target_role_id,
       {"source_kind",
        CanonicalValue(std::string(core::to_string(state.source_kind)))},
       {"source_timestamp_ns",
-       CanonicalValue(static_cast<double>(state.source_timestamp_ns))},
+       manyforge::content_identity::nonnegative_int64_value(
+           state.source_timestamp_ns)},
       {"state_authority_class", CanonicalValue(std::string(core::to_string(
                                     state.state_authority_class)))},
       {"state_authority_id", CanonicalValue(state.state_authority_id.value())},
@@ -5357,24 +5453,6 @@ ActiveFacts(const deployment::RuntimeProgramTargetBinding &primary,
             "runtime provider is assigned to conflicting runtime units");
     runtime_units.insert(runtime_unit);
   };
-  const auto provider_runtime_unit =
-      [](const core::CapabilityProviderBindingDTO &binding) {
-        std::set<core::RuntimeUnitId> selected;
-        for (const auto &endpoint : binding.endpoint_bindings) {
-          if (endpoint.source_kind !=
-              core::CapabilityEndpointSourceKind::kRuntimeUnit) {
-            continue;
-          }
-          const auto *runtime_unit =
-              std::get_if<core::RuntimeUnitId>(&endpoint.source_id);
-          Require(runtime_unit != nullptr,
-                  "capability-provider endpoint source kind and value differ");
-          selected.insert(*runtime_unit);
-        }
-        Require(selected.size() == 1U,
-                "capability provider has no single exact runtime-unit owner");
-        return *selected.begin();
-      };
   if (primary.control_binding().has_value()) {
     insert_provider(primary.control_binding()->provider_instance_id,
                     primary.control_binding()->provider_runtime_unit_id);
@@ -5382,13 +5460,14 @@ ActiveFacts(const deployment::RuntimeProgramTargetBinding &primary,
   if (primary.capability_provider_binding().has_value()) {
     insert_provider(
         primary.capability_provider_binding()->provider_instance_id,
-        provider_runtime_unit(*primary.capability_provider_binding()));
+        retained_provider_runtime_unit(*primary.capability_provider_binding()));
   }
   for (const auto &support : supporting) {
     if (support.capability_provider_binding().has_value()) {
       insert_provider(
           support.capability_provider_binding()->provider_instance_id,
-          provider_runtime_unit(*support.capability_provider_binding()));
+          retained_provider_runtime_unit(
+              *support.capability_provider_binding()));
     }
   }
   std::vector<core::RuntimeUnitEpochBindingDTO> runtime_epochs;
@@ -6033,6 +6112,8 @@ struct Composition final {
   CanonicalValue direct_control_gripper_descriptor;
   RetainedPlanningModelStage stage;
   std::shared_ptr<RetainedNativeRuntime> runtime;
+  std::shared_ptr<const ProductBackedRuntimeParticipantResolver>
+      target_resolver;
   core::ProjectionRevisionDTO projection_revision;
   core::ActiveBundlePublicationGeneration publication_generation;
   core::TargetRoleId status_motion_target_role_id;
@@ -6162,6 +6243,15 @@ struct ExecutionCompositionAccess final {
   mutable std::shared_mutex mutex;
   Composition *current{};
   core::ResourceAddressedExecutionKernel *addressed_kernel{};
+
+  void replace_current(Composition *replacement) {
+    // Caller holds mutex exclusively; current remains alive through this
+    // publication. Wake the old channel once, never poll for replacement.
+    if (current != nullptr && current != replacement) {
+      current->runtime->motion_state_channel->notify_composition_replaced();
+    }
+    current = replacement;
+  }
 };
 
 struct ManagedExecutionSurfaceControl final {
@@ -6705,22 +6795,31 @@ BuildProductComposition(CompositionBuildInput input) {
   auto planner = std::make_unique<RoboPlanPlannerBackend>(
       inventory->projection_binding, candidate_binding,
       std::move(candidate_client));
-  const RetainedRuntimeParticipantResolverFactory participant_resolver_factory =
+  const auto make_participant_resolver =
       [package_root = input.package_root, bundle = input.bundle,
        model_map = input.model_map](
           std::vector<core::RuntimeParticipantBinding> physical_bindings) {
-        auto resolver =
-            std::make_shared<ProductBackedRuntimeParticipantResolver>(
-                package_root, bundle, model_map, std::move(physical_bindings));
+        return std::make_shared<ProductBackedRuntimeParticipantResolver>(
+            package_root, bundle, model_map, std::move(physical_bindings));
+      };
+  const RetainedRuntimeParticipantResolverFactory participant_resolver_factory =
+      [make_participant_resolver](
+          std::vector<core::RuntimeParticipantBinding> physical_bindings) {
+        auto resolver = make_participant_resolver(std::move(physical_bindings));
         return RetainedRuntimeParticipantResolver{
             [resolver](const core::OperationIntentDTO &operation,
                        const std::size_t participant_index) {
               return resolver->Resolve(operation, participant_index);
             }};
       };
-  auto participant_resolver =
-      participant_resolver_factory({direct_control_motion_binding.value(),
-                                    direct_control_gripper_binding.value()});
+  auto target_resolver =
+      make_participant_resolver({direct_control_motion_binding.value(),
+                                 direct_control_gripper_binding.value()});
+  RetainedRuntimeParticipantResolver participant_resolver =
+      [resolver = target_resolver](const core::OperationIntentDTO &operation,
+                                   const std::size_t participant_index) {
+        return resolver->Resolve(operation, participant_index);
+      };
   const auto reference_collision_model = collision_model;
   const auto reference_runtime_unit_id = *local_runtime_unit_id;
   const auto reference_runtime_epoch = input.runtime_epoch;
@@ -6742,7 +6841,8 @@ BuildProductComposition(CompositionBuildInput input) {
         std::vector<RetainedSceneFrameStateSourceInput> state_sources;
         state_sources.reserve(channels.size());
         for (const auto &channel : channels) {
-          const auto &resources = channel->binding().value().resources;
+          const auto binding = channel->binding();
+          const auto &resources = binding.value().resources;
           const bool has_model_resource = std::any_of(
               resources.begin(), resources.end(), [](const auto &resource) {
                 return resource.source_joint_name.has_value();
@@ -6982,6 +7082,7 @@ BuildProductComposition(CompositionBuildInput input) {
   composition->planner_scene_projection =
       std::move(input.planner_scene_projection);
   composition->scene_frame_resolver = std::move(direct_scene_frame_resolver);
+  composition->target_resolver = std::move(target_resolver);
   if (composition->planner_scene_projection != nullptr) {
     composition->scene_authority_proxy =
         std::make_shared<ManagerSceneAuthorityProxy>(
@@ -7669,10 +7770,15 @@ LoadExactManagedCandidateBundle(
   return bundle;
 }
 
-[[nodiscard]] std::optional<core::StopDeadlineBudgetDTO>
-LoadManagedBootstrapStopBudget(const ManagedRuntimeChildConfig &config,
-                               const core::RetainedBundleId &retained_bundle_id,
-                               const core::GraphRevision &graph_revision) {
+struct ManagedBootstrapStopProduct final {
+  std::optional<core::StopDeadlineBudgetDTO> deadline_budget;
+  std::vector<core::ResourceId> resource_inventory;
+};
+
+[[nodiscard]] ManagedBootstrapStopProduct LoadManagedBootstrapStopProduct(
+    const ManagedRuntimeChildConfig &config,
+    const core::RetainedBundleId &retained_bundle_id,
+    const core::GraphRevision &graph_revision) {
   const deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
       config.package_root);
   const auto bundle = bundle_source.get_verified(retained_bundle_id);
@@ -7683,57 +7789,20 @@ LoadManagedBootstrapStopBudget(const ManagedRuntimeChildConfig &config,
               bundle->value().cell_graph.graph_revision == graph_revision,
           "managed bootstrap Stop policy differs from the retained product");
 
-  using PolicyIdentity =
-      std::pair<core::StopEvidencePolicyId, core::StopEvidencePolicyRevision>;
-  std::set<PolicyIdentity> required;
-  for (const auto &binding : bundle->value().cell_graph.control_bindings) {
-    required.emplace(binding.stop_evidence_policy_id,
-                     binding.stop_evidence_policy_revision);
-  }
-  if (required.empty()) {
-    return std::nullopt;
-  }
-
   const deployment::FilesystemVerifiedCatalogArtifactSource catalog_store(
       config.package_root);
-  std::optional<core::StopDeadlineBudgetDTO> envelope;
-  for (const auto &record : bundle->value().catalogs.records) {
-    const auto *const reference =
-        std::get_if<core::StopEvidencePolicyCatalogRecordRefDTO>(&record);
-    if (reference == nullptr ||
-        !required.contains(
-            {reference->record_id, reference->record_revision})) {
+  std::set<core::ResourceId> resources;
+  for (const auto &binding : bundle->value().cell_graph.control_bindings) {
+    if (binding.provider_runtime_unit_id.value() != config.runtime_unit_id)
       continue;
-    }
-    const auto bytes = catalog_store.get_verified(
-        reference->content_addressed_store_key, reference->content_digest);
-    Require(bytes.has_value(),
-            "managed bootstrap Stop policy artifact is unavailable");
-    const auto policy = deployment::resolve_and_qualify_stop_evidence_policy(
-        *reference, reference->content_addressed_store_key, *bytes);
-    Require(policy.reference() == *reference,
-            "managed bootstrap Stop policy readback differs");
-    required.erase({reference->record_id, reference->record_revision});
-    if (policy.value().disposition ==
-        core::StopEvidenceDisposition::kNotStoppable) {
-      continue;
-    }
-    Require(policy.value().deadline_budget.has_value(),
-            "managed stoppable policy has no deadline envelope");
-    auto candidate = *policy.value().deadline_budget;
-    candidate.phases.clear();
-    Require(!envelope.has_value() ||
-                (envelope->outer_duration_ns == candidate.outer_duration_ns &&
-                 envelope->kernel_completion_reserve_ns ==
-                     candidate.kernel_completion_reserve_ns),
-            "managed Stop policies do not share one cell deadline envelope");
-    envelope = std::move(candidate);
+    for (const auto &resource : binding.resource_bindings)
+      resources.insert(resource.resource_id);
   }
-  Require(required.empty(),
-          "managed bootstrap Stop policy is absent from the retained catalog");
-  Require(envelope.has_value(),
-          "managed execution product has no stoppable deadline envelope");
-  return envelope;
+  Require(resources.size() <= core::kMaxKernelResourceSlots,
+          "managed bootstrap resource inventory exceeds the Kernel bound");
+  return {
+      deployment::resolve_retained_stop_deadline_budget(*bundle, catalog_store),
+      {resources.begin(), resources.end()}};
 }
 
 [[nodiscard]] std::optional<CompositionBuildInput> BuildManagedCompositionInput(
@@ -7954,9 +8023,14 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       bootstrap_retained_bundle_id;
   bootstrap_kernel_config.empty_runtime_graph_revision =
       bootstrap_graph_revision;
+  bootstrap_kernel_config.prequalified_max_live_stop_participants =
+      kNativeMaximumLiveStopParticipants;
+  auto bootstrap_stop = LoadManagedBootstrapStopProduct(
+      config, bootstrap_retained_bundle_id, bootstrap_graph_revision);
   bootstrap_kernel_config.cell_stop_deadline_budget =
-      LoadManagedBootstrapStopBudget(config, bootstrap_retained_bundle_id,
-                                     bootstrap_graph_revision);
+      std::move(bootstrap_stop.deadline_budget);
+  bootstrap_kernel_config.empty_runtime_resource_inventory =
+      std::move(bootstrap_stop.resource_inventory);
   bootstrap_kernel_config.stop_fault_recovery_facts_resolver =
       [&](const core::StopStatusDTO &status, const std::int64_t assessed_at_ns)
       -> core::Result<core::StopFaultRecoveryFactsDTO> {
@@ -8096,15 +8170,24 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     if (retired_managed_composition == nullptr || owner == nullptr) {
       return;
     }
-    auto *const retired_engine =
-        retired_managed_composition->runtime->participant_engine.get();
-    if (owner->participant_engine_in_use(retired_engine)) {
-      return;
+    auto &registrations =
+        retired_managed_composition->runtime->participant_registrations;
+    std::set<core::IResolvedParticipantExecutionEngine *> engines;
+    for (const auto &registration : registrations)
+      engines.insert(registration.engine);
+    for (auto *engine : engines) {
+      if (owner->participant_engine_in_use(engine))
+        return;
     }
-    const auto released = owner->release_retired_engine(retired_engine);
-    if (released.ok()) {
-      retired_managed_composition.reset();
+    for (auto *engine : engines) {
+      if (!owner->release_retired_engine(engine).ok())
+        return;
+      // Reuse the retired registration set to track successful detachments.
+      // A later call resumes only unfinished work, without a second registry.
+      std::erase_if(registrations,
+                    [engine](const auto &row) { return row.engine == engine; });
     }
+    retired_managed_composition.reset();
   };
 
   const auto rethrow_composition_failure = [&] {
@@ -8188,7 +8271,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
               fence_owner.BindDisableHandoffKernel(
                   *built->runtime->addressed_kernel);
               active_managed_composition = std::move(built);
-              execution_composition.current = active_managed_composition.get();
+              execution_composition.replace_current(
+                  active_managed_composition.get());
               execution_composition.addressed_kernel =
                   active_managed_composition->runtime->addressed_kernel.get();
               stop_recovery_runtime.store(
@@ -8551,7 +8635,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
 #endif
             active_managed_composition = std::move(prepared);
           }
-          execution_composition.current = active_managed_composition.get();
+          execution_composition.replace_current(
+              active_managed_composition.get());
           execution_composition.addressed_kernel = stable_addressed_kernel();
           stop_recovery_runtime.store(
               active_managed_composition == nullptr
@@ -9404,6 +9489,220 @@ private:
     });
   }
 
+  [[nodiscard]] CanonicalValue
+  QueryTargetResponse(const TargetObservationQuery &query,
+                      Composition &composition) const {
+    if (query.owner_epoch != owner_epoch_)
+      return ErrorResponse("execution_target_owner_stale",
+                           "target query names a replaced owner");
+    const bool frame_query = query.frame_role_id.has_value();
+    const auto &channel = frame_query
+                              ? composition.runtime->motion_state_channel
+                              : composition.runtime->gripper_state_channel;
+    if (!channel)
+      return ErrorResponse("execution_target_observation_unavailable",
+                           "target has no qualified observation channel");
+    const auto observed_binding = channel->binding();
+    const auto &binding = observed_binding.value();
+    const auto configuration =
+        composition.runtime->ReadCurrentPublishedRouteConfiguration(
+            binding.control_path->control_domain_id);
+    if (!configuration.ok() || !configuration.value())
+      return ErrorResponse("execution_target_observation_unavailable",
+                           "target has no current route configuration");
+    const auto representatives =
+        composition.runtime->ReadCurrentPhysicalParticipants(
+            *configuration.value());
+    if (!representatives.ok())
+      return ErrorResponse("execution_target_observation_unavailable",
+                           "target route is not reconciled");
+    const auto resolved = composition.target_resolver->ResolveObservationTarget(
+        query.program_binding_id, query.target_role_id,
+        core::CapabilityId(frame_query ? "model.kinematics.fk"
+                                       : "tool.gripper.feedback"),
+        observed_binding, representatives.value());
+    if (!resolved.ok())
+      return ErrorResponse(resolved.error().code, resolved.error().message);
+    const auto &target = resolved.value().target.target_role();
+    const auto observed =
+        channel->current_state(composition.runtime->clock->now());
+    if (!observed.ok())
+      return ErrorResponse(observed.error().code, observed.error().message);
+    const auto &state = observed.value();
+    const auto current_configuration =
+        composition.runtime->ReadCurrentPublishedRouteConfiguration(
+            state.control_domain_id);
+    if (!current_configuration.ok() || !current_configuration.value() ||
+        !target_observation_source_is_current(
+            resolved.value().observation_binding, state,
+            *current_configuration.value()))
+      return ErrorResponse("execution_target_observation_unavailable",
+                           "selected read source is no longer reconciled");
+    Require(state.complete &&
+                state.controllable_component_id ==
+                    binding.controllable_component_id &&
+                state.command_target_id == binding.command_target_id &&
+                state.resources.size() == binding.resources.size() &&
+                state.joint_names.size() == binding.resources.size() &&
+                state.positions.size() == binding.resources.size(),
+            "target query observation crosses its retained binding");
+    std::vector<double> positions;
+    positions.reserve(binding.resources.size());
+    for (std::size_t index = 0; index < binding.resources.size(); ++index) {
+      const auto &resource = binding.resources[index];
+      Require(state.resources[index] == resource.resource_id &&
+                  state.joint_names[index] == resource.compiled_resource_name &&
+                  core::coordinate_kind(state.positions[index]) ==
+                      resource.coordinate_kind,
+              "target query observation has mismatched coordinates");
+      const auto *angular =
+          std::get_if<core::AngularPositionDTO>(&state.positions[index]);
+      const auto *linear =
+          std::get_if<core::LinearPositionDTO>(&state.positions[index]);
+      Require(angular != nullptr || linear != nullptr,
+              "target query observation has unsupported coordinate units");
+      const double value = angular ? angular->value_rad : linear->value_m;
+      Require(std::isfinite(value), "target query observation is not finite");
+      positions.push_back(value);
+    }
+    CanonicalValue value;
+    if (frame_query) {
+      const auto frame =
+          std::find_if(target.frame_role_bindings.begin(),
+                       target.frame_role_bindings.end(), [&](const auto &row) {
+                         return row.frame_role_id == *query.frame_role_id;
+                       });
+      if (frame == target.frame_role_bindings.end())
+        return ErrorResponse(
+            "execution_target_frame_unavailable",
+            "frame role is not declared by the target binding");
+      if (!composition.target_resolver->FrameObservationCovered(
+              *frame, observed_binding))
+        return ErrorResponse(
+            "execution_target_frame_state_unavailable",
+            "frame depends on coordinates outside the qualified observation");
+      // Empty base means the composed model root, i.e. the logical cell frame.
+      const auto pose = composition.runtime->kinematics->forward_kinematics(
+          core::FkRequestDTO{
+              core::RobotStateDTO{state.joint_names, std::move(positions), {}},
+              frame->compiled_frame_name,
+              {}});
+      if (!pose.ok())
+        return ErrorResponse(pose.error().code, pose.error().message);
+      value = PoseValue(pose.value());
+    } else {
+      if (!composition.runtime->gripper || binding.resources.size() != 1U)
+        return ErrorResponse("gripper_feedback_unavailable",
+                             "target has no qualified gripper feedback");
+      const auto status = composition.runtime->gripper->get_gripper_status(
+          binding.command_target_id.value());
+      value = CanonicalValue(CanonicalValue::Object{
+          {"command_id",
+           CanonicalValue(static_cast<double>(status.command_id))},
+          {"generation",
+           CanonicalValue(static_cast<double>(status.generation))},
+          // No command echo or unqualified evidence label proves a grasp.
+          {"grasp_confirmed", CanonicalValue(nullptr)},
+          {"observed_position",
+           CoordinatePositionValue(state.positions.front())},
+          {"revision", CanonicalValue(static_cast<double>(status.revision))},
+          {"state",
+           CanonicalValue(core::gripper_command_state_name(status.state))},
+      });
+    }
+    CanonicalValue::Object result{
+        {"kind", CanonicalValue(frame_query ? "frame_pose" : "gripper_status")},
+        {"owner_epoch", CanonicalValue(owner_epoch_.value())},
+        {"program_binding_id",
+         CanonicalValue(query.program_binding_id.value())},
+        {"schema_version", CanonicalValue("manyforge.target_observation.v1")},
+        {"source_epoch", CanonicalValue(state.source_epoch.value())},
+        {"source_sequence",
+         CanonicalValue(static_cast<double>(state.sequence))},
+        {"target_role_id", CanonicalValue(query.target_role_id.value())},
+        {"value", std::move(value)},
+    };
+    if (frame_query)
+      result.emplace_back("frame_role_id",
+                          CanonicalValue(query.frame_role_id->value()));
+    return CanonicalValue(CanonicalValue::Object{
+        {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+        {"command", CanonicalValue("query_target")},
+        {"ok", CanonicalValue(true)},
+        {"target_observation", CanonicalValue(std::move(result))},
+    });
+  }
+
+  [[nodiscard]] CanonicalValue
+  QueryOperationResponse(const ProgramOperationQuery &query,
+                         Composition &composition) const {
+    if (query.owner_epoch != owner_epoch_)
+      return ErrorResponse("stale_request_owner_epoch",
+                           "operation query names another native owner");
+    const auto target = composition.target_resolver->ResolveOperationTarget(
+        query.program_binding_id, query.target_role_id);
+    if (!target.ok())
+      return ErrorResponse(target.error().code, target.error().message);
+    // This is one bounded immutable owner capture, not a new operation index.
+    const auto operations =
+        composition.runtime->addressed_kernel->get_resident_operations(
+            {query.program_run_id});
+    const core::OperationStateDTO *selected = nullptr;
+    for (const auto &operation : operations) {
+      if (operation.program_binding_id != query.program_binding_id)
+        continue;
+      const auto matches = std::count_if(
+          operation.participants.begin(), operation.participants.end(),
+          [&](const auto &participant) {
+            return participant.controllable_component_id ==
+                       target.value().controllable_component_id &&
+                   participant.command_target_id ==
+                       target.value().command_target_id;
+          });
+      if (matches == 0)
+        continue;
+      if (selected || operation.participants.size() != 1U)
+        return ErrorResponse(
+            "execution_operation_context_ambiguous",
+            "target does not select one exact operation scope");
+      selected = &operation;
+    }
+    if (!selected)
+      return ErrorResponse(
+          "execution_operation_context_unavailable",
+          "target has no resident operation in the exact Program run");
+    CanonicalValue scale_value;
+    if (selected->runtime_scale_generation.has_value()) {
+      const auto scale =
+          composition.runtime->addressed_kernel->get_runtime_scale(
+              selected->operation_id);
+      if (!scale.ok())
+        return ErrorResponse(scale.error().code, scale.error().message);
+      if (scale.value().operation_revision != selected->operation_revision ||
+          scale.value().runtime_scale_generation !=
+              *selected->runtime_scale_generation)
+        return ErrorResponse("execution_operation_observation_changed",
+                             "operation changed during scale observation");
+      scale_value = CanonicalValue(CanonicalValue::Object{
+          {"generation", CanonicalValue(static_cast<double>(
+                             scale.value().runtime_scale_generation.value()))},
+          {"state",
+           CanonicalValue(std::string(core::to_string(scale.value().state)))},
+          {"requested_scale", CanonicalValue(scale.value().requested_scale)},
+          {"effective_scale", CanonicalValue(scale.value().effective_scale)},
+      });
+    }
+    return CanonicalValue(CanonicalValue::Object{
+        {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+        {"command", CanonicalValue("query_operation")},
+        {"ok", CanonicalValue(true)},
+        {"operation", OperationStateValue(*selected)},
+        {"runtime_scale", std::move(scale_value)},
+        {"owner_epoch", CanonicalValue(owner_epoch_.value())},
+        {"target_role_id", CanonicalValue(query.target_role_id.value())},
+    });
+  }
+
   [[nodiscard]] CanonicalValue DirectControlObservedValue(
       Composition &composition,
       const core::ObservedStateSnapshotDTO &observed_state) const {
@@ -9737,9 +10036,8 @@ private:
     const auto admission =
         composition.runtime->addressed_kernel->GetAuthoringAdmission();
     return CanonicalValue(CanonicalValue::Object{
-        {"admission_generation",
-         CanonicalValue(
-             static_cast<double>(admission.admission_generation.value()))},
+        {"admission_generation", CanonicalValue(static_cast<double>(
+                                     admission.admission_generation.value()))},
         {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
         {"command", CanonicalValue("identity")},
         {"identity", IdentityValue(composition)},
@@ -9793,14 +10091,16 @@ private:
       Fail("runtime-scale control projection failed: " +
            runtime_scale_control.error().message);
     }
-    const auto resident_operations =
-        composition.runtime->addressed_kernel->get_resident_operations(
+    const auto manual_operations =
+        composition.runtime->addressed_kernel->get_latest_run_operations(
             {direct_control_program_run_id_,
              direct_control_gripper_program_run_id_});
-    CanonicalValue::Array resident_operation_values;
-    resident_operation_values.reserve(resident_operations.size());
-    for (const auto &operation : resident_operations) {
-      resident_operation_values.push_back(OperationStateValue(operation));
+    CanonicalValue::Array manual_operation_values;
+    manual_operation_values.reserve(manual_operations.size());
+    for (const auto &projection : manual_operations) {
+      manual_operation_values.emplace_back(CanonicalValue::Object{
+          {"operation", OperationStateValue(projection.operation)},
+          {"resident", CanonicalValue(projection.resident)}});
     }
     return CanonicalValue(CanonicalValue::Object{
         {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
@@ -9816,12 +10116,12 @@ private:
                   current.gripper.has_value() ? &*current.gripper : nullptr)},
              {"observed_motion",
               DirectControlObservedValue(composition, current.motion)},
-             {"resident_operations",
-              CanonicalValue(std::move(resident_operation_values))},
+             {"manual_operations",
+              CanonicalValue(std::move(manual_operation_values))},
              {"runtime_scale_control",
               RuntimeScaleControlStatusValue(runtime_scale_control.value())},
              {"schema_version",
-              CanonicalValue("manyforge.execution_control_state.v3")},
+              CanonicalValue("manyforge.execution_control_state.v4")},
          })},
         {"identity", IdentityValue(composition)},
         {"ok", CanonicalValue(true)},
@@ -9845,40 +10145,74 @@ private:
     // these two reads is either visible in the snapshot or makes the later
     // wait predicate immediately true, so a change cannot be missed.
     const auto change_generation = channel->render_change_generation();
-    const auto observed =
-        channel->current_state(composition.runtime->clock->now());
-    if (!observed.ok()) {
-      Fail("selected motion observation is unavailable: " +
-           observed.error().message);
-    }
-    const auto &state = observed.value();
-    const auto &binding = composition.direct_control_motion_binding.value();
-    Require(state.complete &&
-                state.resources.size() == binding.resources.size() &&
-                state.joint_names.size() == binding.resources.size() &&
-                state.positions.size() == binding.resources.size(),
-            "selected motion observation crosses its retained target");
-
-    CanonicalValue::Array source_joint_names;
-    CanonicalValue::Array compiled_joint_names;
-    CanonicalValue::Array positions_rad;
-    source_joint_names.reserve(binding.resources.size());
-    compiled_joint_names.reserve(binding.resources.size());
-    positions_rad.reserve(binding.resources.size());
-    for (std::size_t index = 0U; index < binding.resources.size(); ++index) {
-      const auto &resource = binding.resources[index];
-      const auto *position =
-          std::get_if<core::AngularPositionDTO>(&state.positions[index]);
-      Require(resource.source_joint_name.has_value() &&
-                  resource.coordinate_kind == core::CoordinateKind::kAngular &&
-                  state.resources[index] == resource.resource_id &&
-                  state.joint_names[index] == resource.compiled_resource_name &&
-                  position != nullptr && std::isfinite(position->value_rad),
-              "selected motion observation has invalid retained coordinates");
-      source_joint_names.emplace_back(*resource.source_joint_name);
-      compiled_joint_names.emplace_back(resource.compiled_resource_name);
-      positions_rad.emplace_back(position->value_rad);
-    }
+    const auto now = composition.runtime->clock->now();
+    CanonicalValue::Array targets;
+    const auto append_target =
+        [&](const auto &selected_channel,
+            const core::RuntimeParticipantBinding &selected_binding) {
+          const auto &binding = selected_binding.value();
+          // A component-local actuator has no URDF coordinate to animate.
+          if (binding.model_groups.empty())
+            return;
+          const auto observed = selected_channel->current_state(now);
+          if (!observed.ok())
+            Fail("selected observation is unavailable: " +
+                 observed.error().message);
+          const auto &state = observed.value();
+          Require(state.complete &&
+                      state.resources.size() == binding.resources.size() &&
+                      state.joint_names.size() == binding.resources.size() &&
+                      state.positions.size() == binding.resources.size() &&
+                      state.controllable_component_id ==
+                          binding.controllable_component_id &&
+                      state.command_target_id == binding.command_target_id,
+                  "selected observation crosses its retained target");
+          CanonicalValue::Array source_names, compiled_names, kinds, positions;
+          for (std::size_t index = 0; index < binding.resources.size();
+               ++index) {
+            const auto &resource = binding.resources[index];
+            const auto *angular =
+                std::get_if<core::AngularPositionDTO>(&state.positions[index]);
+            const auto *linear =
+                std::get_if<core::LinearPositionDTO>(&state.positions[index]);
+            Require(resource.source_joint_name.has_value() &&
+                        state.resources[index] == resource.resource_id &&
+                        state.joint_names[index] ==
+                            resource.compiled_resource_name &&
+                        ((angular && resource.coordinate_kind ==
+                                         core::CoordinateKind::kAngular) ||
+                         (linear && resource.coordinate_kind ==
+                                        core::CoordinateKind::kLinear)),
+                    "selected observation has invalid retained coordinates");
+            const double value = angular ? angular->value_rad : linear->value_m;
+            Require(std::isfinite(value),
+                    "selected observation position is not finite");
+            source_names.emplace_back(*resource.source_joint_name);
+            compiled_names.emplace_back(resource.compiled_resource_name);
+            kinds.emplace_back(angular ? "angular" : "linear");
+            positions.emplace_back(value);
+          }
+          targets.emplace_back(CanonicalValue::Object{
+              {"command_target_id",
+               CanonicalValue(binding.command_target_id.value())},
+              {"compiled_joint_names",
+               CanonicalValue(std::move(compiled_names))},
+              {"controllable_component_id",
+               CanonicalValue(binding.controllable_component_id.value())},
+              {"coordinate_kinds", CanonicalValue(std::move(kinds))},
+              {"positions_si", CanonicalValue(std::move(positions))},
+              {"source_epoch", CanonicalValue(state.source_epoch.value())},
+              {"source_joint_names", CanonicalValue(std::move(source_names))},
+              {"source_sequence",
+               CanonicalValue(static_cast<double>(state.sequence))},
+          });
+        };
+    append_target(channel, composition.direct_control_motion_binding);
+    if (composition.runtime->gripper_state_channel)
+      append_target(composition.runtime->gripper_state_channel,
+                    composition.direct_control_gripper_binding);
+    const auto stream_epoch =
+        "render." + std::to_string(channel->render_incarnation());
     const auto &bundle = *composition.bundle;
     auto response = CanonicalValue(CanonicalValue::Object{
         {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
@@ -9887,30 +10221,22 @@ private:
          CanonicalValue(CanonicalValue::Object{
              {"cell_id",
               CanonicalValue(bundle.value().cell_graph.cell_id.value())},
-             {"command_target_id",
-              CanonicalValue(binding.command_target_id.value())},
-             {"compiled_joint_names",
-              CanonicalValue(std::move(compiled_joint_names))},
-             {"controllable_component_id",
-              CanonicalValue(binding.controllable_component_id.value())},
              {"graph_revision",
               CanonicalValue(bundle.value().cell_graph.graph_revision.value())},
              {"owner_epoch", CanonicalValue(owner_epoch_.value())},
-             {"positions_rad", CanonicalValue(std::move(positions_rad))},
              {"retained_bundle_id",
               CanonicalValue(bundle.retained_bundle_id().value())},
              {"schema_version",
-              CanonicalValue("manyforge.execution_observation.v1")},
-             {"source_epoch", CanonicalValue(state.source_epoch.value())},
-             {"source_joint_names",
-              CanonicalValue(std::move(source_joint_names))},
+              CanonicalValue("manyforge.execution_observation.v2")},
+             {"source_epoch", CanonicalValue(stream_epoch)},
              {"source_sequence",
-              CanonicalValue(static_cast<double>(state.sequence))},
+              CanonicalValue(static_cast<double>(change_generation))},
+             {"targets", CanonicalValue(std::move(targets))},
          })},
         {"ok", CanonicalValue(true)},
     });
     return ObservationProjection{std::move(response), std::move(channel),
-                                 state.source_epoch.value(), state.sequence,
+                                 stream_epoch, change_generation,
                                  change_generation};
   }
 
@@ -10020,6 +10346,7 @@ private:
     return CanonicalValue(CanonicalValue::Object{
         {"accepted", StopAcceptedValue(result.value())},
         {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+        {"owner_epoch", CanonicalValue(owner_epoch_.value())},
         {"command",
          CanonicalValue(full ? "full_stop"
                         : command.kind == CommandKind::kStopProgramRun
@@ -10081,8 +10408,8 @@ private:
           composition.runtime->addressed_kernel->GetAuthoringAdmission();
       return CanonicalValue(CanonicalValue::Object{
           {"admission_generation",
-           CanonicalValue(static_cast<double>(
-               admission.admission_generation.value()))},
+           CanonicalValue(
+               static_cast<double>(admission.admission_generation.value()))},
           {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
           {"command", CanonicalValue("events")},
           {"event_page", OperationEventPageValue(page.value())},
@@ -10099,6 +10426,8 @@ private:
       return ExecuteStop(command, *composition.runtime->addressed_kernel);
     }
     const bool read_only =
+        command.kind == CommandKind::kQueryTarget ||
+        command.kind == CommandKind::kQueryOperation ||
         command.kind == CommandKind::kObservation ||
         command.kind == CommandKind::kGetStopFault ||
         command.kind == CommandKind::kRead ||
@@ -10116,6 +10445,12 @@ private:
           "manager_liveness_not_current",
           "ordinary execution command requires an exact current unfenced "
           "Manager lease");
+    }
+    if (command.kind == CommandKind::kQueryTarget) {
+      return QueryTargetResponse(*command.target_query, composition);
+    }
+    if (command.kind == CommandKind::kQueryOperation) {
+      return QueryOperationResponse(*command.operation_query, composition);
     }
     if (command.kind == CommandKind::kGetStopFault) {
       const auto offer = composition.runtime->addressed_kernel
@@ -10177,8 +10512,16 @@ private:
           {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
           {"command", CanonicalValue("read")},
           {"ok", CanonicalValue(true)},
+          {"owner_epoch",
+           CanonicalValue(projection.value().request_owner_epoch.value())},
           {"operation", OperationStateValue(projection.value().operation)},
           {"resident", CanonicalValue(projection.value().resident)},
+          {"last_control",
+           projection.value().last_control.has_value()
+               ? ControlAcceptedValue(*projection.value().last_control)
+               : CanonicalValue(nullptr)},
+          {"control_pending",
+           CanonicalValue(projection.value().control_pending)},
       });
     }
     if (command.kind == CommandKind::kGetOperationRecovery) {
@@ -10459,6 +10802,30 @@ private:
            RuntimeScaleControlStatusValue(status.value())},
       });
     }
+    if (command.kind == CommandKind::kSetOperationRuntimeScale) {
+      const auto result =
+          composition.runtime->addressed_kernel->set_runtime_scale(
+              *command.operation_runtime_scale);
+      if (!result.ok())
+        return ErrorResponse(result.error().code, result.error().message);
+      const auto &value = result.value();
+      return CanonicalValue(CanonicalValue::Object{
+          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+          {"command", CanonicalValue("set_operation_runtime_scale")},
+          {"ok", CanonicalValue(true)},
+          {"accepted",
+           CanonicalValue(CanonicalValue::Object{
+               {"request_id", CanonicalValue(value.request_id.value())},
+               {"operation_id", CanonicalValue(value.operation_id.value())},
+               {"operation_revision", CanonicalValue(static_cast<double>(
+                                          value.operation_revision.value()))},
+               {"runtime_scale_generation",
+                CanonicalValue(static_cast<double>(
+                    value.runtime_scale_generation.value()))},
+               {"requested_scale", CanonicalValue(value.requested_scale)},
+           })},
+      });
+    }
     if (command.kind == CommandKind::kSetRuntimeScaleControl) {
       const auto result =
           composition.runtime->addressed_kernel->set_runtime_scale_control(
@@ -10530,6 +10897,8 @@ private:
       case CommandKind::kStatus:
       case CommandKind::kIdentity:
       case CommandKind::kTargets:
+      case CommandKind::kQueryTarget:
+      case CommandKind::kQueryOperation:
       case CommandKind::kControlState:
       case CommandKind::kObservation:
       case CommandKind::kEvents:
@@ -10548,6 +10917,7 @@ private:
       case CommandKind::kGetStopFault:
       case CommandKind::kRecoverStopFault:
       case CommandKind::kSetRuntimeScaleControl:
+      case CommandKind::kSetOperationRuntimeScale:
       case CommandKind::kGetRuntimeScaleControl:
       case CommandKind::kPlanPick:
       case CommandKind::kPlanPlace:
@@ -10577,6 +10947,56 @@ private:
   [[nodiscard]] std::optional<core::ErrorDTO> LastReconcileError() const {
     std::lock_guard lock(reconcile_error_mutex_);
     return last_reconcile_error_;
+  }
+
+  [[nodiscard]] core::Result<void>
+  ReconcileDirectControlOperations(Composition &composition) const {
+    auto &kernel = *composition.runtime->addressed_kernel;
+    // Reuse the native owner's reconciliation lane. Browsers neither own nor
+    // trigger release, and ordinary Program runs retain their Runner policy.
+    for (const auto &operation : kernel.get_resident_operations(
+             {direct_control_program_run_id_,
+              direct_control_gripper_program_run_id_})) {
+      const bool completed =
+          operation.state == core::OperationStateKind::kCompleted;
+      const bool clean_stop =
+          operation.state == core::OperationStateKind::kStopped ||
+          operation.state == core::OperationStateKind::kCancelledPreDispatch;
+      if ((!completed && !clean_stop) ||
+          std::any_of(operation.participants.begin(),
+                      operation.participants.end(),
+                      [](const auto &participant) {
+                        return participant.terminal_error.has_value();
+                      }))
+        continue;
+      const auto request_id = manyforge::content_identity::sha256_digest(
+          owner_epoch_.value() + "\nmanual-settlement\n" +
+          operation.operation_id.value() + "\n" +
+          std::to_string(operation.operation_revision.value()));
+      const core::OperationControlRequestDTO request{
+          {core::RequestId(request_id), owner_epoch_, "native.direct_control",
+           operation.operation_id.value()},
+          operation.operation_id,
+          operation.operation_revision,
+          "release owner-confirmed clean terminal manual operation",
+          {}};
+      const auto accepted = completed ? kernel.acknowledge_completed(request)
+                                      : kernel.reset(request);
+      if (!accepted.ok()) {
+        const auto reason = accepted.error().details.find("reason");
+        // The exact Kernel gate wins a concurrent Stop/Reset/settlement. Only
+        // these expected races are reconsidered on the existing owner tick.
+        if (reason != accepted.error().details.end() &&
+            (reason->second == "operation_revision_stale" ||
+             reason->second == "operation_not_resident" ||
+             reason->second == "operation_control_state_invalid" ||
+             reason->second == "operation_control_busy" ||
+             reason->second == "operation_effect_in_flight"))
+          continue;
+        return core::Result<void>::Err(accepted.error());
+      }
+    }
+    return core::Result<void>::Ok();
   }
 
   void RunReconciliationLane(std::stop_token stop_token) noexcept {
@@ -10625,6 +11045,10 @@ private:
                   return pick_place_reconciled.error();
                 }
               }
+              const auto manual_settlement =
+                  ReconcileDirectControlOperations(composition);
+              if (!manual_settlement.ok())
+                return manual_settlement.error();
               return std::nullopt;
             }();
             std::lock_guard error_lock(reconcile_error_mutex_);
@@ -10788,10 +11212,11 @@ private:
                 auto *const owner = composition_access_.addressed_kernel;
                 Require(owner != nullptr,
                         "stable addressed execution Kernel is not installed");
-                if (lane == CommandLane::kStop &&
-                    command.kind == CommandKind::kStopProgramRun) {
-                  // Restart containment belongs to the stable Kernel, not to
-                  // a product that is still being reconstructed.
+                if (lane == CommandLane::kStop) {
+                  // All containment requests reach the stable Kernel during
+                  // reconstruction. It owns exact scope resolution, journal
+                  // fences and unavailable evidence; the host cannot infer
+                  // rest from the absence of a composed physical product.
                   response = ExecuteStop(command, *owner);
                 } else if (lane == CommandLane::kOrdinary &&
                            command.kind == CommandKind::kReadStop) {

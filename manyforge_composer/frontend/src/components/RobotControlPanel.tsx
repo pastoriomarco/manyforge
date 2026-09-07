@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { createContext, useCallback, useContext, useEffect, useId, useMemo, useRef, useState } from 'react';
 
 import { useRobotControl } from '../hooks/useRobotControl';
 import type { RobotControlController } from '../hooks/useRobotControl';
@@ -9,6 +9,7 @@ import {
   operationStateIsTerminal,
   quaternionFromRpyDegrees,
   robotControlHasActiveOperation,
+  robotControlHasLocalDraft,
   rpyDegreesFromQuaternion,
 } from '../state/robotControl';
 import type {
@@ -27,6 +28,7 @@ import type { CartesianMoveDraftOptions } from '../utils/moveTo';
 import { relativePose, type PoseTuple } from '../utils/poseTransforms';
 import { flattenProgramForest } from '../utils/programAuthoring';
 import { DraftTextInput } from './common/DraftInputs';
+import { OverlayPanel } from './OverlayPanel';
 
 const RAD_TO_DEG = 180 / Math.PI;
 const DEG_TO_RAD = Math.PI / 180;
@@ -144,6 +146,14 @@ function targetIsTemporary(
     && Math.abs(draft - observed) > 1e-6;
 }
 
+const RobotInputContext = createContext<{
+  resetKey: string;
+  reportPending: (label: string, pending: boolean) => void;
+}>({
+  resetKey: '',
+  reportPending: () => undefined,
+});
+
 function RobotNumberInput({
   label,
   value,
@@ -163,6 +173,9 @@ function RobotNumberInput({
   onCommit: (value: number) => void;
   pending?: boolean;
 }) {
+  const { resetKey, reportPending } = useContext(RobotInputContext);
+  const onPendingChange = useCallback((dirty: boolean) => reportPending(label, dirty), [label, reportPending]);
+  useEffect(() => () => reportPending(label, false), [label, reportPending]);
   const displayValue = value === null
     ? null
     : value === 0
@@ -180,6 +193,8 @@ function RobotNumberInput({
       shiftStepMultiplier={10}
       commitNativeStep
       value={displayValue}
+      resetKey={resetKey}
+      onPendingChange={onPendingChange}
       title={value === null ? undefined : `Exact value: ${String(value)}`}
       disabled={disabled}
       className={pending ? 'robot-control-target-pending' : undefined}
@@ -256,7 +271,22 @@ export function RobotControlPanelView({
   const [linearStepM, setLinearStepM] = useState(0.01);
   const [coordinateStep, setCoordinateStep] = useState(0.01);
   const [moveSourceId, setMoveSourceId] = useState('');
+  const [moveSourceCapture, setMoveSourceCapture] = useState<string | null>(null);
   const [storedMoveId, setStoredMoveId] = useState('');
+  const [previewInfoOpen, setPreviewInfoOpen] = useState(false);
+  const previewInfoButton = useRef<HTMLButtonElement>(null);
+  const previewInfoId = useId();
+  const [inputRebase, setInputRebase] = useState(0);
+  const [pendingInputs, setPendingInputs] = useState<ReadonlySet<string>>(new Set());
+  const reportPending = useCallback((label: string, dirty: boolean) => {
+    setPendingInputs((previous) => {
+      if (previous.has(label) === dirty) return previous;
+      const next = new Set(previous);
+      if (dirty) next.add(label);
+      else next.delete(label);
+      return next;
+    });
+  }, []);
   const [moveOptions, setMoveOptions] = useState<CartesianMoveDraftOptions>({
     orientationMode: 'keep-current',
     offsetXyzM: [0, 0, 0],
@@ -279,25 +309,35 @@ export function RobotControlPanelView({
     retry,
   } = controller;
   const status = state.status;
-  const operationActive = robotControlHasActiveOperation(state);
   const programActive = program?.cycleState !== null
     && program?.cycleState !== undefined
     && program.cycleState !== 'idle_after_reset';
+  const inputResetKey = [status?.ownerEpoch, status?.directControl.programBindingId,
+    status?.directControlGripper.programBindingId, status?.sceneRevision.scene_id,
+    status?.sceneRevision.revision_id, status?.sceneRevision.content_hash,
+    status?.retainedBundleId, status?.graphRevision, programActive,
+    state.mode, inputRebase].join('\u0000');
+  const inputContext = useMemo(() => ({ resetKey: inputResetKey, reportPending }), [inputResetKey, reportPending]);
+  const operationActive = robotControlHasActiveOperation(state);
   const active = operationActive || programActive;
-  const canApprove = !programActive && state.phase === 'ready'
+  const authoringBlocked = active || state.operation?.resident === true;
+  const canApprove = !programActive && pendingInputs.size === 0 && state.phase === 'ready'
     && state.preview !== null
     && state.intent !== null;
   const canRevert = !active && (
     state.phase !== 'idle'
     || state.ghost !== null
     || state.operation !== null
+    || pendingInputs.size > 0
   );
   const canStop = operationActive && state.operation !== null;
   const overrideCandidate = program?.state.controls
     ?.observationOverrideCandidate ?? null;
   const overridePending = program?.state.controlPending
     === 'override:stage-observation';
-  const rpy = rpyDegreesFromQuaternion(state.draftPose.orientation);
+  const presentedPose = robotControlHasLocalDraft(state) || status === null
+    ? state.draftPose : status.observedMotion.currentTcpPose;
+  const rpy = rpyDegreesFromQuaternion(presentedPose.orientation);
   const authoring = draft?.state.workspace?.draft.authoring ?? null;
   const appliedBinding = program?.state.applied?.programBinding ?? null;
   const moveSources = useMemo<MoveToSource[]>(() => {
@@ -458,6 +498,13 @@ export function RobotControlPanelView({
     options: CartesianMoveDraftOptions = moveOptions,
   ) => {
     const source = moveSources.find((row) => row.id === sourceId);
+    setMoveSourceCapture(source === undefined ? null
+      : JSON.stringify([source.id, source.kind, source.positionsRad ?? source.pose]));
+    if (source === undefined) {
+      revert();
+      setInputRebase((value) => value + 1);
+      return;
+    }
     if (source?.kind === 'joint' && source.positionsRad !== undefined) {
       editMoveToJoints(source.positionsRad);
       return;
@@ -473,6 +520,19 @@ export function RobotControlPanelView({
     editPose(poseTarget(target));
   };
   const selectedMoveSource = moveSources.find((row) => row.id === moveSourceId);
+  const selectedMoveSourceKey = selectedMoveSource === undefined ? null
+    : JSON.stringify([selectedMoveSource.id, selectedMoveSource.kind,
+      selectedMoveSource.positionsRad ?? selectedMoveSource.pose]);
+  const moveSourceCurrent = moveSourceCapture === null
+    || moveSourceCapture === selectedMoveSourceKey;
+  useEffect(() => {
+    if (state.mode !== 'move_to' || authoringBlocked || state.phase === 'approving'
+      || moveSourceCurrent) return;
+    setMoveSourceCapture(null);
+    setMoveSourceId('');
+    setInputRebase((value) => value + 1);
+    revert();
+  }, [authoringBlocked, moveSourceCurrent, revert, state.mode, state.phase]);
 
   const saveObservedIntoStoredMove = () => {
     if (selectedStoredMove?.node === undefined) return;
@@ -503,8 +563,8 @@ export function RobotControlPanelView({
   ) => {
     if (!Number.isFinite(value)) return;
     editPose({
-      position_m: { ...state.draftPose.position_m, [field]: value },
-      orientation: { ...state.draftPose.orientation },
+      position_m: { ...presentedPose.position_m, [field]: value },
+      orientation: { ...presentedPose.orientation },
     });
   };
 
@@ -513,7 +573,7 @@ export function RobotControlPanelView({
     const next = [...rpy] as [number, number, number];
     next[index] = value;
     editPose({
-      position_m: { ...state.draftPose.position_m },
+      position_m: { ...presentedPose.position_m },
       orientation: quaternionFromRpyDegrees(...next),
     });
   };
@@ -534,6 +594,7 @@ export function RobotControlPanelView({
     : observedGripperPosition ?? state.draftGripperPosition;
 
   return (
+    <RobotInputContext.Provider value={inputContext}>
     <section
       className="panel robot-control-panel"
       aria-label="Robot Control"
@@ -557,7 +618,7 @@ export function RobotControlPanelView({
         <div className="panel-state error-state">
           <strong>Robot Control is unavailable.</strong>
           <span>{state.error}</span>
-          <button type="button" onClick={retry}>Retry</button>
+          <span>Current owner facts and connection recovery update this panel automatically.</span>
         </div>
       )}
 
@@ -576,6 +637,7 @@ export function RobotControlPanelView({
             >
               <strong>Preview is blocked.</strong>{' '}
               {state.error ?? 'The execution owner rejected this target.'}
+              <button type="button" disabled={authoringBlocked} onClick={retry}>Retry preview</button>
             </p>
           )}
           <nav className="robot-control-modes" aria-label="Manual control mode">
@@ -596,14 +658,13 @@ export function RobotControlPanelView({
             className="robot-control-step-controls"
             aria-label="Robot control increments"
           >
-            {(state.mode === 'joint'
-              || (state.mode === 'move_to' && selectedMoveSource?.kind === 'joint')) && (
+            {state.mode === 'joint' && (
               <StepSelect
                 label="Step"
                 unit="deg"
                 options={ANGULAR_STEP_DEG_OPTIONS}
                 value={angularStepDeg}
-                disabled={active}
+                disabled={authoringBlocked}
                 onChange={setAngularStepDeg}
               />
             )}
@@ -616,7 +677,7 @@ export function RobotControlPanelView({
                   unit="m"
                   options={LINEAR_STEP_M_OPTIONS}
                   value={linearStepM}
-                  disabled={active}
+                  disabled={authoringBlocked}
                   onChange={setLinearStepM}
                 />
                 <StepSelect
@@ -624,7 +685,7 @@ export function RobotControlPanelView({
                   unit="deg"
                   options={ANGULAR_STEP_DEG_OPTIONS}
                   value={angularStepDeg}
-                  disabled={active}
+                  disabled={authoringBlocked}
                   onChange={setAngularStepDeg}
                 />
               </>
@@ -635,36 +696,32 @@ export function RobotControlPanelView({
                 unit={status.directControlGripper.targetDescriptor.unit}
                 options={COORDINATE_STEP_OPTIONS}
                 value={coordinateStep}
-                disabled={active}
+                disabled={authoringBlocked}
                 onChange={setCoordinateStep}
               />
             )}
             {(state.mode === 'pose_goal' || state.mode === 'cartesian_path') && (
               <div className="robot-control-tcp-tools" aria-label="TCP transform controls">
-                <label>
-                  <span>Frame</span>
-                  <select
+                <span className="robot-control-target-frame">
+                  <span>Target frame</span>{' '}
+                  <code
                     aria-label="TCP target frame"
-                    value={status.directControl.baseFrameRoleId}
-                    disabled
                     title="The current direct-control contract permits this logical base frame."
                   >
-                    <option value={status.directControl.baseFrameRoleId}>
-                      {status.directControl.baseFrameRoleId}
-                    </option>
-                  </select>
-                </label>
+                    {status.directControl.baseFrameRoleId}
+                  </code>
+                </span>
                 <span className="robot-control-segment" role="group" aria-label="TCP gizmo mode">
                   <button
                     type="button"
                     aria-pressed={tcpTransformMode === 'translate'}
-                    disabled={active}
+                    disabled={authoringBlocked}
                     onClick={() => onTcpTransformModeChange('translate')}
                   >Translate</button>
                   <button
                     type="button"
                     aria-pressed={tcpTransformMode === 'rotate'}
-                    disabled={active}
+                    disabled={authoringBlocked}
                     onClick={() => onTcpTransformModeChange('rotate')}
                   >Rotate</button>
                 </span>
@@ -672,13 +729,13 @@ export function RobotControlPanelView({
                   <button
                     type="button"
                     aria-pressed={tcpTransformSpace === 'local'}
-                    disabled={active}
+                    disabled={authoringBlocked}
                     onClick={() => onTcpTransformSpaceChange('local')}
                   >Local</button>
                   <button
                     type="button"
                     aria-pressed={tcpTransformSpace === 'world'}
-                    disabled={active}
+                    disabled={authoringBlocked}
                     onClick={() => onTcpTransformSpaceChange('world')}
                   >World</button>
                 </span>
@@ -722,7 +779,7 @@ export function RobotControlPanelView({
                             max={degrees(joint.maxPositionRad)}
                             step="any"
                             value={degrees(presented)}
-                            disabled={active}
+                            disabled={authoringBlocked}
                             onChange={(event) => {
                               const value = event.currentTarget.valueAsNumber;
                               if (Number.isFinite(value)) {
@@ -737,7 +794,7 @@ export function RobotControlPanelView({
                               max={degrees(joint.maxPositionRad)}
                               step={angularStepDeg}
                               value={degrees(presented)}
-                              disabled={active}
+                              disabled={authoringBlocked}
                               pending={pending}
                               onCommit={(value) => editJoint(index, radians(value))}
                             />
@@ -761,7 +818,7 @@ export function RobotControlPanelView({
                         <span>Object, frame, or stored move</span>
                         <select
                           value={selectedMoveSource === undefined ? '' : moveSourceId}
-                          disabled={active}
+                          disabled={authoringBlocked}
                           onChange={(event) => {
                             const sourceId = event.currentTarget.value;
                             setMoveSourceId(sourceId);
@@ -787,7 +844,7 @@ export function RobotControlPanelView({
                             <span>Orientation</span>
                             <select
                               value={moveOptions.orientationMode}
-                              disabled={active || !moveSourceId}
+                              disabled={authoringBlocked || !moveSourceId}
                               onChange={(event) => {
                                 const next = {
                                   ...moveOptions,
@@ -810,7 +867,7 @@ export function RobotControlPanelView({
                               label={`${axis} local offset metres`}
                               step={linearStepM}
                               value={moveOptions.offsetXyzM[index]}
-                              disabled={active || !moveSourceId}
+                              disabled={authoringBlocked || !moveSourceId}
                               onCommit={(value) => {
                                 const offsetXyzM = [...moveOptions.offsetXyzM] as [number, number, number];
                                 offsetXyzM[index] = value;
@@ -828,7 +885,7 @@ export function RobotControlPanelView({
                               label={`${axis} local offset degrees`}
                               step={angularStepDeg}
                               value={degrees(moveOptions.offsetRpyRad[index])}
-                              disabled={active || !moveSourceId}
+                              disabled={authoringBlocked || !moveSourceId}
                               onCommit={(value) => {
                                 const offsetRpyRad = [...moveOptions.offsetRpyRad] as [number, number, number];
                                 offsetRpyRad[index] = radians(value);
@@ -870,8 +927,8 @@ export function RobotControlPanelView({
                         <RobotNumberInput
                           label={`${field.slice(0, 1)} target metres`}
                           step={linearStepM}
-                          value={state.draftPose.position_m[field]}
-                          disabled={active}
+                          value={presentedPose.position_m[field]}
+                          disabled={authoringBlocked}
                           onCommit={(value) => editPosePosition(field, value)}
                         />
                         <span>m</span>
@@ -886,7 +943,7 @@ export function RobotControlPanelView({
                         label={`${label} target degrees`}
                         step={angularStepDeg}
                         value={rpy[index]}
-                        disabled={active}
+                        disabled={authoringBlocked}
                         onCommit={(value) => editPoseOrientation(index, value)}
                       />
                         <span>deg</span>
@@ -917,43 +974,15 @@ export function RobotControlPanelView({
 
               {state.mode === 'gripper' && (
                 <div className="robot-control-gripper-editor">
-                <dl className="robot-control-gripper-facts">
-                  <div>
-                    <dt>State authority</dt>
-                    <dd>
-                      {status.observedGripper === null
-                        ? 'No current gripper observation'
-                        : `${status.observedGripper.sourceEpoch} · ${status.observedGripper.complete ? 'complete' : 'partial'}`}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>Command</dt>
-                    <dd>{status.directControlGripper.operationCapabilityId}</dd>
-                  </div>
-                  <div>
-                    <dt>Transport</dt>
-                    <dd>
-                      {status.directControlGripper.targetDescriptor.contracts.controlPath
-                        ?.controlInterfaceContractId ?? 'provider-owned capability command'}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>Completion / grasp</dt>
-                    <dd>
-                      owner-observed coordinate settlement · grasp confirmation{' '}
-                      {status.directControlGripper.targetDescriptor.contracts.supportingProviders
-                        .some((provider) => provider.capabilityId.includes('grasp'))
-                        ? 'offered'
-                        : 'not offered'}
-                    </dd>
-                  </div>
-                </dl>
+                <p className="robot-control-pose-note">
+                  Completion confirms the observed coordinate, not an object grasp.
+                </p>
                 {status.directControlGripper.targetDescriptor.namedPresets.length > 0 && (
                   <label className="robot-control-preset">
                     <span>Named preset</span>
                     <select
                       defaultValue=""
-                      disabled={active}
+                      disabled={authoringBlocked}
                       onChange={(event) => {
                         const preset = status.directControlGripper.targetDescriptor
                           .namedPresets.find((candidate) => candidate.name === event.target.value);
@@ -992,7 +1021,7 @@ export function RobotControlPanelView({
                         max={status.directControlGripper.targetDescriptor.maxPosition}
                         step="any"
                         value={presentedGripperPosition ?? ''}
-                        disabled={active}
+                        disabled={authoringBlocked}
                         onChange={(event) => {
                           const value = event.currentTarget.valueAsNumber;
                           if (Number.isFinite(value)) editGripper(value);
@@ -1006,7 +1035,7 @@ export function RobotControlPanelView({
                         max={status.directControlGripper.targetDescriptor.maxPosition ?? undefined}
                         step={coordinateStep}
                         value={presentedGripperPosition}
-                        disabled={active}
+                        disabled={authoringBlocked}
                         pending={gripperTargetPending}
                         onCommit={editGripper}
                       />
@@ -1016,22 +1045,6 @@ export function RobotControlPanelView({
                     </span>
                   </span>
                 </label>
-                {status.directControlGripper.targetDescriptor.mimicFollowers.length > 0 && (
-                  <details className="robot-control-mimic">
-                    <summary>
-                      {status.directControlGripper.targetDescriptor.mimicFollowers.length}{' '}
-                      mimic follower{status.directControlGripper.targetDescriptor.mimicFollowers.length === 1 ? '' : 's'}
-                    </summary>
-                    <ul>
-                      {status.directControlGripper.targetDescriptor.mimicFollowers.map((follower) => (
-                        <li key={follower.compiledCoordinateName}>
-                          <code>{follower.sourceCoordinateName}</code>{' '}
-                          = master × {follower.multiplier} + {follower.offset}
-                        </li>
-                      ))}
-                    </ul>
-                  </details>
-                )}
                 </div>
               )}
 
@@ -1044,7 +1057,7 @@ export function RobotControlPanelView({
                     <span>Eligible Program Draft move</span>
                     <select
                       value={selectedStoredMove === undefined ? '' : storedMoveId}
-                      disabled={active || eligibleStoredMoves.length === 0}
+                      disabled={authoringBlocked || eligibleStoredMoves.length === 0}
                       onChange={(event) => setStoredMoveId(event.currentTarget.value)}
                     >
                       <option value="">Choose a stored move</option>
@@ -1098,9 +1111,14 @@ export function RobotControlPanelView({
                     <span className="status-pill status-pill-danger">stale</span>
                   )}
                   <button
+                    ref={previewInfoButton}
                     type="button"
                     className="inspector-info-button"
                     aria-label="Preview information"
+                    aria-haspopup="dialog"
+                    aria-expanded={previewInfoOpen}
+                    aria-controls={previewInfoOpen ? previewInfoId : undefined}
+                    onClick={() => setPreviewInfoOpen(true)}
                     title="The preview is owner-validated and does not move the robot. Only Approve can submit it for execution."
                   >i</button>
                 </div>
@@ -1118,19 +1136,6 @@ export function RobotControlPanelView({
               )}
 
               {state.ghost !== null && (
-                <>
-                  <dl className="robot-control-ghost-joints">
-                    {state.ghost.sourceJointNames.map((name, index) => (
-                      <div key={name}>
-                        <dt>{name}</dt>
-                        <dd>
-                          {formatDegrees(
-                            state.ghost?.finalPositionsRad[index] ?? 0,
-                          )}°
-                        </dd>
-                      </div>
-                    ))}
-                  </dl>
                   <p className="robot-control-tcp">
                     TCP predicted at{' '}
                     <code>
@@ -1139,25 +1144,16 @@ export function RobotControlPanelView({
                       {state.ghost.finalTcpPose.position_m.z_m.toFixed(3)} m
                     </code>
                   </p>
-                  <p className="robot-control-evidence">
-                    scene revision {state.ghost.sceneRevision.revision_id} ·{' '}
-                    collision revision{' '}
-                    {state.ghost.collisionWorldRevision.revision_id}
-                  </p>
-                </>
               )}
 
               {state.operation !== null && (
                 <div className="robot-control-operation">
-                  <span>
-                    Operation <code>{state.operation.operationId}</code>
-                  </span>
-                  <progress max={1} value={state.operation.progress} />
+                  <progress aria-label="Operation progress" max={1} value={state.operation.progress} />
                   <span>
                     {state.operation.state} ·{' '}
                     {Math.round(state.operation.progress * 100)}%
                   </span>
-                  <div className="robot-control-operation-actions">
+                  {state.operation.resident && <div className="robot-control-operation-actions">
                     <button
                       type="button"
                       disabled={state.operation.state !== 'executing' || controlPending !== null}
@@ -1184,7 +1180,7 @@ export function RobotControlPanelView({
                     >
                       {controlPending === 'reset' ? 'Sending Reset' : 'Reset operation'}
                     </button>
-                  </div>
+                  </div>}
                 </div>
               )}
 
@@ -1202,7 +1198,7 @@ export function RobotControlPanelView({
               <button
                 className="approve-button"
                 type="button"
-                disabled={!canApprove}
+                disabled={!canApprove || (state.mode === 'move_to' && !moveSourceCurrent)}
                 title="Submit this exact validated target to the execution owner."
                 onClick={() => void approve()}
               >
@@ -1212,7 +1208,11 @@ export function RobotControlPanelView({
                 type="button"
                 disabled={!canRevert}
                 title="Discard only the local no-motion preview."
-                onClick={revert}
+                onClick={() => {
+                  setInputRebase((previous) => previous + 1);
+                  setPendingInputs(new Set());
+                  revert();
+                }}
               >
                 Revert
               </button>
@@ -1227,9 +1227,42 @@ export function RobotControlPanelView({
               </button>
             </div>
           </footer>
+          {previewInfoOpen && <OverlayPanel
+            open={previewInfoOpen}
+            title="Preview information"
+            titleId={previewInfoId}
+            kind="info"
+            onClose={() => setPreviewInfoOpen(false)}
+            returnFocusRef={previewInfoButton}
+          >
+            <p>The preview is owner-validated and does not move the robot. Only Approve submits the exact validated target.</p>
+            <p>Target coordinates are relative to <code>{status.directControl.baseFrameRoleId}</code>. Local/World selects gizmo axes, not the target reference frame.</p>
+            {state.error !== null && <p className="robot-control-error">{state.error}</p>}
+            {state.ghost !== null && <>
+              <dl className="robot-control-ghost-joints">
+                {state.ghost.sourceJointNames.map((name, index) => (
+                  <div key={name}>
+                    <dt>{name}</dt>
+                    <dd>{state.ghost?.finalPositionsRad[index]} rad</dd>
+                  </div>
+                ))}
+              </dl>
+              <p>Scene revision {state.ghost.sceneRevision.revision_id} · collision revision {state.ghost.collisionWorldRevision.revision_id}</p>
+            </>}
+            {state.operation !== null && <p>Operation <code>{state.operation.operationId}</code> · revision {state.operation.operationRevision} · {state.operation.resident ? 'retained by owner' : 'settled by owner'}</p>}
+            <details>
+              <summary>Target and owner contract</summary>
+              <pre>{JSON.stringify({
+                ownerEpoch: status.ownerEpoch,
+                bindingId: state.mode === 'gripper' ? status.directControlGripper.programBindingId : status.directControl.programBindingId,
+                target: state.mode === 'gripper' ? status.directControlGripper.targetDescriptor : status.directControl.targetDescriptor,
+              }, null, 2)}</pre>
+            </details>
+          </OverlayPanel>}
         </>
       )}
     </section>
+    </RobotInputContext.Provider>
   );
 }
 

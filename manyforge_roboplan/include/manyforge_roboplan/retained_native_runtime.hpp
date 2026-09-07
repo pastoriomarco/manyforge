@@ -25,7 +25,23 @@
 #include <utility>
 #include <vector>
 
+namespace manyforge::core {
+class GripperParticipantEngine;
+}
+
 namespace manyforge::roboplan_backend {
+
+// This native host supports one motion participant and one optional scalar
+// gripper. Reserve both Stop lanes before ingress, including while CCLC has
+// not yet published either route. Capability/Program aliases do not add lanes.
+inline constexpr std::size_t kNativeMaximumLiveStopParticipants = 2U;
+
+/// Capability-specific ControlBindings may share one exact physical source.
+/// This is the same realization check used by native runtime construction;
+/// it does not prove current route reconciliation or sample freshness.
+[[nodiscard]] bool retained_bindings_share_backend_owner(
+    const core::RuntimeParticipantBinding &primary,
+    const core::RuntimeParticipantBinding &representative) noexcept;
 
 struct RetainedNativeRuntimeConfig final {
   core::RequestOwnerEpoch request_owner_epoch;
@@ -235,8 +251,7 @@ struct RetainedNativeRuntime final
   /// Exact Deployment-selected runtime policy sealed against this motion
   /// target. Retained for focused observability; it is immutable and does not
   /// grant a second policy owner.
-  std::optional<core::RuntimeParticipantPolicySelection>
-      motion_runtime_policy;
+  std::optional<core::RuntimeParticipantPolicySelection> motion_runtime_policy;
   std::optional<double> deployment_maximum_tcp_linear_speed_mps;
 
   std::shared_ptr<core::ICollisionWorldSnapshotPublisher> collision_publisher;
@@ -247,6 +262,9 @@ struct RetainedNativeRuntime final
       lookahead_collision_engines;
 
   std::shared_ptr<core::ExecutionKernel> participant_engine;
+  std::shared_ptr<core::GripperParticipantEngine> gripper_participant_engine;
+  [[nodiscard]] core::IResolvedParticipantExecutionEngine *
+  participant_engine_for(bool motion) const;
   std::vector<core::RuntimeParticipantExecutionRegistration>
       participant_registrations;
   core::RuntimeParticipantAdmissionResolver participant_resolver;

@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdint>
 #include <map>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -36,15 +37,16 @@ CanonicalValue Number(const std::uint64_t value, const std::string_view label) {
 }
 
 CanonicalValue Number(const std::int64_t value, const std::string_view label) {
-  if (value < 0 || static_cast<std::uint64_t>(value) > kMaximumSafeInteger) {
-    Fail(std::string(label) + " is not a nonnegative safe integer");
+  if (value < 0) {
+    Fail(std::string(label) + " is not a nonnegative int64");
   }
-  return CanonicalValue(static_cast<double>(value));
+  return content_identity::nonnegative_int64_value(value);
 }
 
 CanonicalValue OptionalNumber(const std::optional<std::uint64_t> value,
                               const std::string_view label) {
-  return value.has_value() ? Number(*value, label) : CanonicalValue(nullptr);
+  return value.has_value() ? Number(static_cast<std::int64_t>(*value), label)
+                           : CanonicalValue(nullptr);
 }
 
 AlarmDurationSummary Summarize(std::vector<std::uint64_t> values) {
@@ -54,9 +56,11 @@ AlarmDurationSummary Summarize(std::vector<std::uint64_t> values) {
   }
   std::sort(values.begin(), values.end());
   std::uint64_t sum = 0U;
+  bool sum_saturated = false;
+  constexpr auto maximum = static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
   for (const auto value : values) {
-    sum = std::min(kMaximumSafeInteger,
-                   sum + std::min(value, kMaximumSafeInteger - sum));
+    sum_saturated = sum_saturated || value > maximum - sum;
+    sum += std::min(value, maximum - sum);
   }
   const auto percentile = [&values](const double fraction) {
     const auto rank = static_cast<std::size_t>(
@@ -67,7 +71,7 @@ AlarmDurationSummary Summarize(std::vector<std::uint64_t> values) {
       values.size(),    sum,
       values.front(),   values.back(),
       percentile(0.50), percentile(0.95),
-      percentile(0.99),
+      percentile(0.99), sum_saturated,
   };
 }
 
@@ -98,7 +102,8 @@ CanonicalValue DurationValue(const AlarmDurationSummary &summary) {
       {"p50_ns", OptionalNumber(summary.p50_ns, "p50_ns")},
       {"p95_ns", OptionalNumber(summary.p95_ns, "p95_ns")},
       {"p99_ns", OptionalNumber(summary.p99_ns, "p99_ns")},
-      {"sum_ns", Number(summary.sum_ns, "sum_ns")},
+      {"sum_ns", Number(static_cast<std::int64_t>(summary.sum_ns), "sum_ns")},
+      {"sum_saturated", CanonicalValue(summary.sum_saturated)},
   });
 }
 

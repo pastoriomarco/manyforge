@@ -11,10 +11,69 @@ from pathlib import Path
 
 from manyforge_behavior.nodes.control_flow import RepeatDecorator, RetryDecorator
 from manyforge_behavior.catalog import NodeCatalog
+from manyforge_behavior.catalog_schema import (
+    CatalogSchemaError,
+    parse_schema,
+    validate_value,
+)
+from manyforge_behavior.program_runtime import ProgramRunAttemptSource
+
+
+@pytest.mark.parametrize("retry", [False, True])
+def test_indefinite_execution_yields_each_tick_and_has_no_lifetime_counter(retry):
+    leaf = CountingLeaf("leaf", fail_until=100_000 if retry else 0)
+    node = (
+        RetryDecorator("forever", leaf) if retry else RepeatDecorator("forever", leaf)
+    )
+    tree = py_trees.trees.BehaviourTree(node)
+    for _ in range(10_000):
+        tree.tick()
+        assert node.status is py_trees.common.Status.RUNNING
+    assert leaf.tick_count == 10_000
+    assert getattr(node, "_attempt_count" if retry else "_cycle_count") == 0
+    node.stop(py_trees.common.Status.INVALID)
+    assert leaf.status is py_trees.common.Status.INVALID
+    # Resume starts an ordinary fresh attempt, with no discarded backlog.
+    tree.tick()
+    assert leaf.tick_count == 10_001
+
+
+def test_attempt_ids_retain_no_counts_or_completed_identity_history():
+    source = ProgramRunAttemptSource("run.indefinite")
+    before = vars(source).copy()
+    identifiers = {source.begin("root/leaf").node_attempt_id for _ in range(20_000)}
+    assert len(identifiers) == 20_000
+    assert vars(source) == before
+
+
+def test_loop_schema_and_json_schema_reject_zero_but_accept_indefinite():
+    catalog = NodeCatalog(Path(__file__).parents[1] / "resources/node_catalog.yaml")
+    for node_id in ("repeat", "retry"):
+        parameter = catalog.get(node_id).parameters[0]
+        for value in (-1, 1, 1_000_000):
+            assert not validate_value(
+                parameter.schema, value, registry=catalog.schema_registry
+            )
+        for value in (-2, 0, 1_000_001, True, 1.5):
+            assert validate_value(
+                parameter.schema, value, registry=catalog.schema_registry
+            )
+        projected = catalog.schema_registry.to_json_schema(parameter.schema)
+        assert projected["minimum"] == -1
+        assert projected["not"] == {"const": 0}
+
+
+@pytest.mark.parametrize(
+    "value", [True, "0", float("nan"), float("inf"), float("-inf")]
+)
+def test_numeric_exclusion_rejects_nonfinite_or_untyped_constraint(value):
+    with pytest.raises(CatalogSchemaError):
+        parse_schema({"type": "int", "constraints": {"not_equal": value}}, path="loop")
 
 
 class CountingLeaf(py_trees.behaviour.Behaviour):
     """Leaf that tracks tick count and can be configured to fail/succeed."""
+
     def __init__(self, name, fail_until=0):
         super().__init__(name)
         self.tick_count = 0
@@ -61,8 +120,8 @@ class TestRepeatDecorator:
         assert tree.root.status == py_trees.common.Status.SUCCESS
         assert leaf.tick_count == 1
 
-    @pytest.mark.parametrize("count", [-1, 0, 1_000_001])
-    def test_repeat_rejects_unbounded_or_out_of_schema_counts(self, count):
+    @pytest.mark.parametrize("count", [-2, 0, 1_000_001])
+    def test_repeat_rejects_out_of_schema_counts(self, count):
         leaf = CountingLeaf("leaf", fail_until=0)
         with pytest.raises(ValueError):
             RepeatDecorator("repeat", child=leaf, num_cycles=count)
@@ -121,8 +180,8 @@ class TestRetryDecorator:
         assert tree.root.status == py_trees.common.Status.FAILURE
         assert leaf.tick_count == 2
 
-    @pytest.mark.parametrize("count", [-1, 0, 1_000_001])
-    def test_retry_rejects_unbounded_or_out_of_schema_counts(self, count):
+    @pytest.mark.parametrize("count", [-2, 0, 1_000_001])
+    def test_retry_rejects_out_of_schema_counts(self, count):
         leaf = CountingLeaf("leaf", fail_until=0)
         with pytest.raises(ValueError):
             RetryDecorator("retry", child=leaf, num_attempts=count)
@@ -148,7 +207,9 @@ class TestNestedRetryRepeat:
         retry(2) > repeat(3) > sequence([leaf]).
         Takes 3 tree ticks — repeat advances once per tick, then retry sees SUCCESS."""
         leaf = CountingLeaf("leaf", fail_until=0)
-        sequence = py_trees.composites.Sequence("sequence", memory=True, children=[leaf])
+        sequence = py_trees.composites.Sequence(
+            "sequence", memory=True, children=[leaf]
+        )
         repeat = RepeatDecorator("repeat", child=sequence, num_cycles=3)
         retry = RetryDecorator("retry", child=repeat, num_attempts=2)
         tree = py_trees.trees.BehaviourTree(root=retry)
@@ -190,12 +251,13 @@ class TestCatalogEntries:
         assert repeat_entry.children_max == 1
         assert len(repeat_entry.parameters) == 1
         assert repeat_entry.parameters[0].id == "num_cycles"
-        assert repeat_entry.parameters[0].required is True
-        assert repeat_entry.parameters[0].has_default is False
+        assert repeat_entry.parameters[0].required is False
+        assert repeat_entry.parameters[0].default == -1
         assert repeat_entry.parameters[0].schema.schema_type == "int"
         assert dict(repeat_entry.parameters[0].schema.constraints) == {
-            "min_inclusive": 1,
+            "min_inclusive": -1,
             "max_inclusive": 1_000_000,
+            "not_equal": 0,
         }
 
         assert retry_entry.kind == "decorator"
@@ -203,10 +265,11 @@ class TestCatalogEntries:
         assert retry_entry.children_max == 1
         assert len(retry_entry.parameters) == 1
         assert retry_entry.parameters[0].id == "num_attempts"
-        assert retry_entry.parameters[0].required is True
-        assert retry_entry.parameters[0].has_default is False
+        assert retry_entry.parameters[0].required is False
+        assert retry_entry.parameters[0].default == -1
         assert retry_entry.parameters[0].schema.schema_type == "int"
         assert dict(retry_entry.parameters[0].schema.constraints) == {
-            "min_inclusive": 1,
+            "min_inclusive": -1,
             "max_inclusive": 1_000_000,
+            "not_equal": 0,
         }

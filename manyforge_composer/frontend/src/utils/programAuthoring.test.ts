@@ -243,7 +243,7 @@ describe('Program parameter binding continuity', () => {
       name: 'Semantic test',
       catalog: {
         api_version: 'manyforge.node_catalog.v2',
-        content_version: '1.1.0',
+        content_version: '2.0.0',
       },
       component_roles: { robot: {}, tool: {} },
       target_roles: {
@@ -301,7 +301,7 @@ describe('Program parameter binding continuity', () => {
       name: 'Bound motion',
       catalog: {
         api_version: 'manyforge.node_catalog.v2',
-        content_version: '1.1.0',
+        content_version: '2.0.0',
       },
       component_roles: {},
       target_roles: {},
@@ -373,7 +373,7 @@ describe('Program parameter binding continuity', () => {
       name: 'Incomplete motion',
       catalog: {
         api_version: 'manyforge.node_catalog.v2',
-        content_version: '1.1.0',
+        content_version: '2.0.0',
       },
       component_roles: {},
       target_roles: {},

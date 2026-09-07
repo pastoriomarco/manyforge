@@ -129,6 +129,11 @@ CAPABILITIES: Final = {
         "target_binding",
         "control_binding",
     ),
+    "execution.runtime_scale.operation_scoped": (
+        "sha256:4ee00df7b3510c1490c83e247d12b73553ab53e4e6673da53ebea475fb756fad",
+        "target_binding",
+        "control_binding",
+    ),
     "execution.contact.geometric": (
         "sha256:63a3d877d78d71a5932cce5c92d2932b740fbba6e88d00ca3b5dd94429e3eb3d",
         "target_binding",
@@ -307,6 +312,11 @@ ARM_CAPABILITIES: Final = tuple(
         }
     )
 )
+# The historical closure remains the original 36 facilities. Scaling is an
+# additional native-qualified realization, not an unqualified ROS claim.
+NATIVE_ARM_CAPABILITIES: Final = tuple(sorted(
+    (*ARM_CAPABILITIES, "execution.runtime_scale.operation_scoped")
+))
 GRIPPER_CAPABILITIES: Final = tuple(
     sorted(
         {
@@ -558,7 +568,9 @@ def capability_selector(capability_id: str) -> dict[str, str]:
     }
 
 
-def component_type_document(family: dict[str, Any]) -> dict[str, Any]:
+def component_type_document(
+    family: dict[str, Any], *, runtime_scaling: bool = True
+) -> dict[str, Any]:
     family_id = family["model_family_id"]
     semantics = family["semantics"]
     group_roles = {
@@ -609,7 +621,7 @@ def component_type_document(family: dict[str, Any]) -> dict[str, Any]:
         gripper_resource["coordinate_kind"] = "linear"
     value = {
         "api_version": "manyforge.component_type.v1",
-        "component_type_id": f"{family_id}.component",
+        "component_type_id": f"{family_id}{'' if runtime_scaling else '.fixed_scale'}.component",
         "tags": ["articulated-arm", "gripper"],
         "model_roles": [
             {"model_role_id": "arm_model", "cardinality": "exactly_one"}
@@ -652,7 +664,7 @@ def component_type_document(family: dict[str, Any]) -> dict[str, Any]:
                 "collision_body_roles": arm_collision_roles,
                 "capabilities": [
                     capability_selector(capability_id)
-                    for capability_id in ARM_CAPABILITIES
+                    for capability_id in (NATIVE_ARM_CAPABILITIES if runtime_scaling else ARM_CAPABILITIES)
                 ],
             },
             {
@@ -1852,7 +1864,7 @@ def catalog_sources(
     control_capabilities = tuple(
         sorted(
             capability_id
-            for capability_id in set(ARM_CAPABILITIES + GRIPPER_CAPABILITIES)
+            for capability_id in set(NATIVE_ARM_CAPABILITIES + GRIPPER_CAPABILITIES)
             if CAPABILITIES[capability_id][2] == "control_binding"
         )
     )
@@ -1870,7 +1882,7 @@ def catalog_sources(
     native_arm_capabilities = tuple(
         sorted(
             capability_id
-            for capability_id in ARM_CAPABILITIES
+            for capability_id in NATIVE_ARM_CAPABILITIES
             if CAPABILITIES[capability_id][2] == "control_binding"
         )
     )
@@ -1921,7 +1933,8 @@ def catalog_sources(
         "lite6_arm": native_arm_manifest,
         "lite6_gripper": native_gripper_manifest,
         "ros2_control": ros2_control_provider_manifest(
-            control_capabilities, planner_capabilities
+            tuple(value for value in control_capabilities
+                  if value != "execution.runtime_scale.operation_scoped"), planner_capabilities
         ),
     }
     for key, document in manifests.items():
@@ -2020,6 +2033,16 @@ def catalog_sources(
         )
 
     component_references: dict[str, dict[str, str]] = {}
+    fixed_scale_profiles = {
+        profile["runtime_restoration_profile_id"]
+        for profile in description["runtime_restoration_profiles"]
+        if "ros2_control_runtime" in profile
+    }
+    fixed_scale_families = {
+        deployment["model_family_id"]
+        for deployment in description["deployments"]
+        if deployment["runtime_restoration_profile_id"] in fixed_scale_profiles
+    }
     for family in description["model_families"]:
         document = component_type_document(family)
         family_id = family["model_family_id"]
@@ -2038,6 +2061,20 @@ def catalog_sources(
         )
         sources[f"component:{family_id}"] = source
         component_references[family_id] = source[2]
+        if family_id in fixed_scale_families:
+            # A target declaration is a required capability set, not optional
+            # advertising. Reuse the generator for the fixed-scale profile;
+            # never promise native scaling through an unqualified ROS provider.
+            fixed = component_type_document(family, runtime_scaling=False)
+            sources[f"component:fixed_scale:{family_id}"] = generated_catalog_document(
+                root=root,
+                relative_path=("manyforge_deployment/resources/maintained/catalog/"
+                               f"component_type/{fixed['component_type_id']}.json"),
+                kind="component_type", record_id=fixed["component_type_id"],
+                record_revision=fixed["component_type_revision"],
+                schema_id="manyforge.component_type.v1",
+                schema_revision=schemas["component_type"], value=fixed,
+            )
 
     command_path = root / "manyforge_deployment/resources/catalog/gripper.command_position.v1.yaml"
     command = read_yaml(command_path, "gripper command schema")
@@ -2126,7 +2163,7 @@ def graph_and_applicability(
     native_lite6_lifecycle = (
         not ros2_control and family_id == LITE6_NATIVE_MODEL_FAMILY_ID
     )
-    component_ref = refs[f"component:{family_id}"]
+    component_ref = refs[f"component:{'fixed_scale:' if ros2_control else ''}{family_id}"]
     model_ref = refs[f"model:{family_id}"]
     runtime_ref = refs[f"runtime{':ros2_control' if ros2_control else ''}"]
     arm_stop_ref = refs["stop:arm"]
@@ -2173,7 +2210,7 @@ def graph_and_applicability(
 
     bindings: list[dict[str, Any]] = []
     for target, capabilities, resources in (
-        ("arm", ARM_CAPABILITIES, arm_resources),
+        ("arm", ARM_CAPABILITIES if ros2_control else NATIVE_ARM_CAPABILITIES, arm_resources),
         ("gripper", GRIPPER_CAPABILITIES, gripper_resources),
     ):
         stop_ref = arm_stop_ref if target == "arm" else goal_cancel_stop_ref
@@ -2235,7 +2272,7 @@ def graph_and_applicability(
             if (
                 not ros2_control
                 and target == "arm"
-                and capability_id == "execution.trajectory.execute"
+                and capability_id in {"execution.trajectory.execute", "execution.runtime_scale.operation_scoped"}
             ):
                 binding["runtime_scale_route_qualifications"] = [
                     {
@@ -2735,7 +2772,7 @@ def deployment_candidate(
         not ros2_control and family_id == LITE6_NATIVE_MODEL_FAMILY_ID
     )
     catalog_keys = {
-        *(f"capability:{capability_id}" for capability_id in ARM_CAPABILITIES),
+        *(f"capability:{capability_id}" for capability_id in (ARM_CAPABILITIES if ros2_control else NATIVE_ARM_CAPABILITIES)),
         *(f"capability:{capability_id}" for capability_id in GRIPPER_CAPABILITIES),
         *(f"capability:{capability_id}" for capability_id in CELL_CAPABILITIES),
         *(
@@ -2747,7 +2784,7 @@ def deployment_candidate(
             else []
         ),
         "command_schema",
-        f"component:{family_id}",
+        f"component:{'fixed_scale:' if ros2_control else ''}{family_id}",
         f"contract:{key_prefix}arm",
         f"contract:{key_prefix}gripper",
         f"model:{family_id}",

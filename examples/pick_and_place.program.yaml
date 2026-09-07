@@ -1,6 +1,6 @@
 api_version: manyforge.program.v1
 program_id: pick_and_place_demo
-program_revision: sha256:622bb486587b1c47e2f0dfcace01ad702b21431de8e91601468dd445adba694b
+program_revision: sha256:b81154bd99347b3feaf9b9a78d5ae5fa3d1ad78b657198a19bc96ed535cde964
 program_profile: composable-cell-v1
 name: pick_and_place_demo
 description: >-
@@ -10,7 +10,7 @@ description: >-
   scene and attachment revisions now invalidate planning automatically.
 catalog:
   api_version: manyforge.node_catalog.v2
-  content_version: 1.1.0
+  content_version: 2.0.0
 compatibility:
   lanes: [manyforge-only]
   assistant: forbidden

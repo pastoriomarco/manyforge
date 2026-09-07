@@ -63,6 +63,7 @@ import type {
   Vector3Tuple,
 } from '../types/api';
 import type { Pose3Value } from '../types/robotControl';
+import type { Nanoseconds } from '../types/nanoseconds';
 import type { ExecutionObservationTransportStatus } from '../types/viewerObservation';
 import type { SceneObjectMutationAvailability } from '../state/sceneAuthoring';
 import {
@@ -362,7 +363,7 @@ function AuthoritativeTransformGroup({
   name: string;
   streamIdentity: string;
   sourceSequence: number;
-  observedAtNs: number | null;
+  observedAtNs: Nanoseconds | null;
   positionM: Vector3Tuple;
   orientationXyzw: QuaternionXyzwTuple;
   liveFrame?: {

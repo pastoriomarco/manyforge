@@ -68,6 +68,10 @@ set(
   "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_deployment"
   CACHE PATH
   "Path to the manyforge_deployment source tree")
+# One canonical spelling for shared configure inputs. Ninja otherwise sees
+# distinct CMake phony outputs that collapse to the same normalized path.
+get_filename_component(MANYFORGE_DEPLOYMENT_SOURCE_DIR
+  "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}" REALPATH)
 if(NOT TARGET manyforge::deployment_admission)
   if(TARGET manyforge_deployment)
     message(FATAL_ERROR
@@ -220,9 +224,10 @@ if(BUILD_TESTING)
   set(MANYFORGE_SCENE_GTEST_TIMEOUT_SECONDS "60" CACHE STRING
       "Per-test timeout for manyforge_scene gtest cases")
 
-  set(
+  get_filename_component(
     _MANYFORGE_SCENE_LITE6_SOURCE_ROOT
-    "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/../manyforge_example_models/models/lite6_lite_gripper")
+    "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/../manyforge_example_models/models/lite6_lite_gripper"
+    REALPATH)
   set(
     _MANYFORGE_SCENE_LITE6_FIXTURE_ROOT
     "${CMAKE_CURRENT_BINARY_DIR}/lite6_structural_scene_fixture")

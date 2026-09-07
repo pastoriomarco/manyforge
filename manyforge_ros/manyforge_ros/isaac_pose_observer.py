@@ -40,10 +40,11 @@ from manyforge_ros.pose_source_sidecar import (
     SimulationEntityPoseRequest,
 )
 from manyforge_ros.scene_mirror_probe import PoseSnapshot
+from manyforge_behavior.json_scalars import nonnegative_int64_value
 
 
 SITE_CONFIG_VERSION = "manyforge.isaac_pose_observer_site.v1"
-OBSERVATION_PAYLOAD_VERSION = "manyforge.ros_pose_observation.v1"
+OBSERVATION_PAYLOAD_VERSION = "manyforge.ros_pose_observation.v2"
 MAX_SITE_CONFIG_BYTES = 256 * 1024
 MAX_CONFIGURED_OBSERVATIONS = 128
 
@@ -359,7 +360,8 @@ def joint_state_observation_intent(
             "joint_names": list(binding.required_joint_names),
             "kind": "joint_state",
             "positions": [positions[name] for name in binding.required_joint_names],
-            "source_stamp_s": observation.source_stamp_s,
+            "source_stamp_ns": (None if observation.source_stamp_ns is None
+                                else nonnegative_int64_value(observation.source_stamp_ns)),
             "topic": binding.topic,
         },
     )
@@ -812,7 +814,8 @@ def _pose_intent(
                 "frame_id": pose.frame_id,
                 "orientation_xyzw": list(pose.orientation_xyzw),
                 "position_m": list(pose.position_xyz),
-                "source_stamp_s": pose.stamp_sec,
+                "source_stamp_ns": (None if pose.stamp_ns is None
+                                    else nonnegative_int64_value(pose.stamp_ns)),
             },
             "source": source,
         },

@@ -19,7 +19,7 @@ from typing import Annotated, Any, Callable, Literal, Mapping, Optional
 import unicodedata
 import uuid
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_serializer, model_validator
 
 
 CONTROL_PROTOCOL_VERSION = "manyforge.execution_control.v2"
@@ -415,27 +415,6 @@ class ExecutionControlCommandDTO(_StrictDTO):
         return self
 
 
-class ControlResyncRequestDTO(_StrictDTO):
-    schema_version: Literal["manyforge.execution_control.v2"]
-    message_kind: Literal["resync"]
-    control_session_id: str
-    client_sequence: str
-
-    @field_validator("control_session_id")
-    @classmethod
-    def validate_resync_session(cls, value: str) -> str:
-        return _bounded_nfc(
-            value,
-            label="control_session_id",
-            maximum_bytes=MAXIMUM_IDENTITY_BYTES,
-        )
-
-    @field_validator("client_sequence")
-    @classmethod
-    def validate_resync_sequence(cls, value: str) -> str:
-        return _u64_text(value, label="client_sequence")
-
-
 class ControlServerHelloDTO(_StrictDTO):
     schema_version: Literal["manyforge.execution_control.v2"]
     message_kind: Literal["server_hello"]
@@ -494,8 +473,8 @@ class ExecutionControlDeltaDTO(_StrictDTO):
     message_kind: Literal["delta"]
     control_session_id: str
     server_sequence: str
-    state_sequence: str
-    received_client_sequence: str | None
+    state_sequence: str | None = None
+    received_client_sequence: str | None = None
     event_class: Literal["critical", "node_progress", "cold"]
     control: Optional["ExecutionControlProjectionDTO"]
     # Every current producer carries a shell: owner deltas carry at least the
@@ -503,6 +482,33 @@ class ExecutionControlDeltaDTO(_StrictDTO):
     # an unused control-only variant would make the generated and browser
     # contracts disagree for no operational benefit.
     shell: dict[str, Any]
+
+    @model_validator(mode="after")
+    def paired_owner_state(self) -> "ExecutionControlDeltaDTO":
+        if self.control is None:
+            if {"state_sequence", "received_client_sequence"} & self.model_fields_set:
+                raise ValueError("local Draft delta cannot claim owner state or receipt")
+            if self.event_class != "cold":
+                raise ValueError("local Draft delta must be cold")
+        else:
+            if self.state_sequence is None:
+                raise ValueError("owner delta requires its state sequence")
+            _u64_text(self.state_sequence, label="state_sequence")
+            if "received_client_sequence" not in self.model_fields_set:
+                raise ValueError("owner delta requires its receive watermark")
+            if self.received_client_sequence is not None:
+                _u64_text(self.received_client_sequence, label="received_client_sequence")
+        if self.shell.get("complete") is not False:
+            raise ValueError("delta shell must be explicitly incomplete")
+        return self
+
+    @model_serializer(mode="wrap")
+    def serialize_delta(self, handler: Any) -> dict[str, Any]:
+        value = handler(self)
+        if self.control is None:
+            value.pop("state_sequence", None)
+            value.pop("received_client_sequence", None)
+        return value
 
 
 class ExecutionCommandReceiptMessageDTO(_StrictDTO):
@@ -514,6 +520,14 @@ class ExecutionCommandReceiptMessageDTO(_StrictDTO):
     emitted_monotonic_ns: str
     receipt: ExecutionCommandReceiptDTO
     result: dict[str, Any] | None
+
+    @model_validator(mode="after")
+    def cumulative_receive_watermark(self) -> "ExecutionCommandReceiptMessageDTO":
+        _u64_text(self.received_client_sequence, label="received_client_sequence")
+        if (self.control_session_id != self.receipt.control_session_id or
+                int(self.received_client_sequence) < int(self.receipt.client_sequence)):
+            raise ValueError("receipt must name its session and a covered command")
+        return self
 
     @field_validator("emitted_monotonic_ns")
     @classmethod
@@ -838,7 +852,6 @@ __all__ = [
     "ControlHeartbeatChallengeDTO",
     "ControlHeartbeatEchoDTO",
     "ControlProtocolError",
-    "ControlResyncRequestDTO",
     "ControlResyncRequiredDTO",
     "ControlServerHelloDTO",
     "ControlStateAppliedDTO",

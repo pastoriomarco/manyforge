@@ -1,6 +1,6 @@
 api_version: manyforge.program.v1
 program_id: isaac_manipulator_scene_light
-program_revision: sha256:65d15a2be5027c80eb82f02a6cb57805458c7c480e9d9ad38b98fe1a0ec4211e
+program_revision: sha256:5b1d81840a48889191bedeb4e785a54bda33a695b43919aca809805dddf6374c
 program_profile: composable-cell-v1
 name: isaac_manipulator_scene_light
 description: >-
@@ -10,7 +10,7 @@ description: >-
   gripper commands, carried-object transitions, and retained-world rest pose.
 catalog:
   api_version: manyforge.node_catalog.v2
-  content_version: 1.1.0
+  content_version: 2.0.0
 compatibility:
   lanes: [isaac-sim]
   assistant: optional

@@ -10,10 +10,10 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Final, Mapping
 
-from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
+from manyforge_headless_api.client import HeadlessHttpClient
 
 
-OBSERVATION_FRAME_SCHEMA: Final = "manyforge.execution_observation_frame.v1"
+OBSERVATION_FRAME_SCHEMA: Final = "manyforge.execution_observation_frame.v2"
 OBSERVATION_CREDIT_SCHEMA: Final = "manyforge.execution_observation_credit.v1"
 OBSERVATION_DEMAND_LEASE_SECONDS: Final = 45.0
 MAXIMUM_OBSERVATION_CLIENTS: Final = 16
@@ -23,6 +23,10 @@ _MAXIMUM_JOINTS: Final = 1_024
 
 class ExecutionObservationProjectionError(ValueError):
     """The execution owner returned an invalid render observation."""
+
+
+class ExecutionObservationSourceUnavailable(RuntimeError):
+    """Current presentation source failed; reconnect must recapture, not replay."""
 
 
 def _object(value: Any, path: str) -> dict[str, Any]:
@@ -40,11 +44,7 @@ def _text(value: Any, path: str) -> str:
 
 
 def _safe_integer(value: Any, path: str) -> int:
-    if (
-        type(value) is not int
-        or value < 0
-        or value > _MAXIMUM_SAFE_INTEGER
-    ):
+    if type(value) is not int or value < 0 or value > _MAXIMUM_SAFE_INTEGER:
         raise ExecutionObservationProjectionError(
             f"{path} must be a non-negative safe integer"
         )
@@ -87,51 +87,43 @@ def project_execution_observation(
             "execution observation response identity is invalid"
         )
     observed = _object(response.get("observation"), "observation")
-    if set(observed) != {
-        "cell_id",
-        "command_target_id",
-        "compiled_joint_names",
-        "controllable_component_id",
-        "graph_revision",
-        "owner_epoch",
-        "positions_rad",
-        "retained_bundle_id",
-        "schema_version",
-        "source_epoch",
-        "source_joint_names",
-        "source_sequence",
-    } or observed.get("schema_version") != "manyforge.execution_observation.v1":
+    if (
+        set(observed)
+        != {
+            "cell_id",
+            "graph_revision",
+            "owner_epoch",
+            "retained_bundle_id",
+            "schema_version",
+            "source_epoch",
+            "source_sequence",
+            "targets",
+        }
+        or observed.get("schema_version") != "manyforge.execution_observation.v2"
+    ):
         raise ExecutionObservationProjectionError(
             "execution observation schema is unsupported"
         )
-    source_joint_names = _text_array(
-        observed.get("source_joint_names"),
-        "observation.source_joint_names",
-    )
-    compiled_joint_names = _text_array(
-        observed.get("compiled_joint_names"),
-        "observation.compiled_joint_names",
-    )
-    if len(source_joint_names) != len(compiled_joint_names):
+    raw_targets = observed.get("targets")
+    if not isinstance(raw_targets, list) or not 0 < len(raw_targets) <= 64:
         raise ExecutionObservationProjectionError(
-            "source and compiled joint orders differ"
+            "observation targets must contain 1..64 entries"
         )
-    raw_positions = observed.get("positions_rad")
-    if not isinstance(raw_positions, list):
-        raise ExecutionObservationProjectionError(
-            "observation.positions_rad must be an array"
-        )
-    positions = [
-        _finite_number(item, f"positions_rad[{index}]")
-        for index, item in enumerate(raw_positions)
+    targets = [_project_target(item) for item in raw_targets]
+    addresses = [
+        (target["controllable_component_id"], target["command_target_id"])
+        for target in targets
     ]
-    if len(source_joint_names) != len(positions):
+    compiled = [name for target in targets for name in target["compiled_joint_names"]]
+    if (
+        len(set(addresses)) != len(addresses)
+        or len(set(compiled)) != len(compiled)
+        or len(compiled) > _MAXIMUM_JOINTS
+    ):
         raise ExecutionObservationProjectionError(
-            "observed joint positions differ from the retained joint order"
+            "observation targets overlap or exceed the coordinate bound"
         )
-    received = _safe_integer(
-        received_at_monotonic_us, "received_at_monotonic_us"
-    )
+    received = _safe_integer(received_at_monotonic_us, "received_at_monotonic_us")
     return {
         "schema_version": OBSERVATION_FRAME_SCHEMA,
         "owner_epoch": _text(observed.get("owner_epoch"), "observation.owner_epoch"),
@@ -142,14 +134,6 @@ def project_execution_observation(
         "graph_revision": _text(
             observed.get("graph_revision"), "observation.graph_revision"
         ),
-        "controllable_component_id": _text(
-            observed.get("controllable_component_id"),
-            "observation.controllable_component_id",
-        ),
-        "command_target_id": _text(
-            observed.get("command_target_id"),
-            "observation.command_target_id",
-        ),
         "source_epoch": _text(
             observed.get("source_epoch"),
             "observation.source_epoch",
@@ -159,9 +143,58 @@ def project_execution_observation(
             "observation.source_sequence",
         ),
         "received_at_monotonic_us": received,
-        "source_joint_names": source_joint_names,
-        "compiled_joint_names": compiled_joint_names,
-        "positions_rad": positions,
+        "targets": targets,
+    }
+
+
+def _project_target(raw: Any) -> dict[str, Any]:
+    target = _object(raw, "observation.target")
+    if set(target) != {
+        "controllable_component_id",
+        "command_target_id",
+        "source_epoch",
+        "source_sequence",
+        "source_joint_names",
+        "compiled_joint_names",
+        "coordinate_kinds",
+        "positions_si",
+    }:
+        raise ExecutionObservationProjectionError(
+            "observation target schema is unsupported"
+        )
+    source = _text_array(target["source_joint_names"], "target.source_joint_names")
+    compiled = _text_array(
+        target["compiled_joint_names"], "target.compiled_joint_names"
+    )
+    kinds, positions = target["coordinate_kinds"], target["positions_si"]
+    if (
+        not isinstance(kinds, list)
+        or not isinstance(positions, list)
+        or len(source) != len(compiled)
+        or len(kinds) != len(source)
+        or len(positions) != len(source)
+        or any(kind not in ("angular", "linear") for kind in kinds)
+    ):
+        raise ExecutionObservationProjectionError(
+            "target joint orders differ or coordinate kinds are invalid"
+        )
+    return {
+        "controllable_component_id": _text(
+            target["controllable_component_id"], "target.component"
+        ),
+        "command_target_id": _text(
+            target["command_target_id"], "target.command_target"
+        ),
+        "source_epoch": _text(target["source_epoch"], "target.source_epoch"),
+        "source_sequence": _safe_integer(
+            target["source_sequence"], "target.source_sequence"
+        ),
+        "source_joint_names": source,
+        "compiled_joint_names": compiled,
+        "coordinate_kinds": list(kinds),
+        "positions_si": [
+            _finite_number(value, "target.position_si") for value in positions
+        ],
     }
 
 
@@ -183,12 +216,19 @@ def _render_signature(frame: dict[str, Any]) -> tuple[Any, ...]:
         frame["cell_id"],
         frame["retained_bundle_id"],
         frame["graph_revision"],
-        frame["controllable_component_id"],
-        frame["command_target_id"],
         frame["source_epoch"],
-        tuple(frame["source_joint_names"]),
-        tuple(frame["compiled_joint_names"]),
-        tuple(frame["positions_rad"]),
+        tuple(
+            (
+                target["controllable_component_id"],
+                target["command_target_id"],
+                target["source_epoch"],
+                tuple(target["source_joint_names"]),
+                tuple(target["compiled_joint_names"]),
+                tuple(target["coordinate_kinds"]),
+                tuple(target["positions_si"]),
+            )
+            for target in frame["targets"]
+        ),
     )
 
 
@@ -200,6 +240,7 @@ class ExecutionObservationSubscription:
     outstanding: tuple[str, str, int] | None = None
     credit: bool = False
     closed: bool = False
+    unavailable: bool = False
 
 
 def observation_identity(frame: Mapping[str, Any]) -> tuple[str, str, int]:
@@ -312,7 +353,11 @@ class ExecutionObservationSource:
     ) -> None:
         wakes: list[ExecutionObservationSubscription] = []
         with self._condition:
-            if subscription.closed or subscription not in self._subscriptions:
+            if (
+                subscription.closed
+                or subscription.unavailable
+                or subscription not in self._subscriptions
+            ):
                 raise ValueError("execution observation subscription is closed")
             if subscription.outstanding is not None:
                 if last_applied == subscription.outstanding:
@@ -327,7 +372,9 @@ class ExecutionObservationSource:
                     raise ValueError("execution observation acknowledgement is stale")
             elif subscription.last_applied is None:
                 if last_applied is not None:
-                    raise ValueError("initial execution observation credit has a cursor")
+                    raise ValueError(
+                        "initial execution observation credit has a cursor"
+                    )
             elif last_applied != subscription.last_applied:
                 raise ValueError("execution observation renewal cursor is stale")
             subscription.credit = True
@@ -344,6 +391,10 @@ class ExecutionObservationSource:
         subscription: ExecutionObservationSubscription,
     ) -> str | None:
         with self._condition:
+            if subscription.unavailable:
+                raise ExecutionObservationSourceUnavailable(
+                    "execution observation source is unavailable"
+                )
             payload = subscription.payload
             subscription.payload = None
             subscription.wake.clear()
@@ -353,9 +404,7 @@ class ExecutionObservationSource:
 
     def status(self) -> dict[str, Any]:
         with self._condition:
-            last_error = (
-                None if self._last_error is None else dict(self._last_error)
-            )
+            last_error = None if self._last_error is None else dict(self._last_error)
             return {
                 "schema_version": "manyforge.execution_observation_stream_status.v2",
                 "source": {
@@ -391,7 +440,10 @@ class ExecutionObservationSource:
 
     def _has_demand_locked(self) -> bool:
         return any(
-            not item.closed and item.credit and item.outstanding is None
+            not item.closed
+            and not item.unavailable
+            and item.credit
+            and item.outstanding is None
             for item in self._subscriptions
         )
 
@@ -430,7 +482,9 @@ class ExecutionObservationSource:
         except RuntimeError:
             return
 
-    def _admit_response(self, response: dict[str, Any]) -> None:
+    def _admit_response(
+        self, response: dict[str, Any], cancel: threading.Event
+    ) -> None:
         frame = project_execution_observation(
             response,
             received_at_monotonic_us=int(self._monotonic() * 1_000_000),
@@ -443,7 +497,11 @@ class ExecutionObservationSource:
             # response raced that cancellation, discard it: a later first
             # demand must read the owner's current frame, never this interval's
             # cached result.
-            if not self._subscriptions:
+            if (
+                not self._subscriptions
+                or cancel.is_set()
+                or self._active_upstream_cancel is not cancel
+            ):
                 return
             if (
                 self._last_identity is not None
@@ -505,7 +563,7 @@ class ExecutionObservationSource:
                 cancel = threading.Event()
                 self._active_upstream_cancel = cancel
                 self._connections += 1
-            failed = False
+            failure: Exception | None = None
             try:
                 with self._client.open_execution_observation_stream() as upstream:
                     while not cancel.is_set():
@@ -533,43 +591,54 @@ class ExecutionObservationSource:
                                 self._max_wake_duration_us,
                                 elapsed_us,
                             )
-                        self._admit_response(response)
-            except (HeadlessClientError, ExecutionObservationProjectionError) as error:
-                failed = not cancel.is_set()
-                if failed:
-                    with self._condition:
+                        self._admit_response(response, cancel)
+            except Exception as error:
+                failure = error
+            finally:
+                failed_subscriptions: list[ExecutionObservationSubscription] = []
+                with self._condition:
+                    current_interval = self._active_upstream_cancel is cancel
+                    if current_interval:
+                        self._active_upstream_cancel = None
+                    if failure is not None and current_interval and not cancel.is_set():
                         self._errors += 1
                         self._last_error = {
                             "code": getattr(
-                                error,
+                                failure,
                                 "code",
-                                "execution_observation_projection_invalid",
+                                (
+                                    "execution_observation_projection_invalid"
+                                    if isinstance(
+                                        failure, ExecutionObservationProjectionError
+                                    )
+                                    else "execution_observation_source_failed"
+                                ),
                             ),
-                            "message": str(error)[:512],
+                            "message": str(failure)[:512],
                         }
-            except Exception as error:
-                failed = not cancel.is_set()
-                if failed:
-                    with self._condition:
-                        self._errors += 1
-                        self._last_error = {
-                            "code": "execution_observation_source_failed",
-                            "message": str(error)[:512],
-                        }
-            finally:
-                with self._condition:
-                    if self._active_upstream_cancel is cancel:
-                        self._active_upstream_cancel = None
-                    if failed:
+                        # This is a transport failure, not an unchanged robot.
+                        # Reuse the existing socket reconnect/current barrier;
+                        # no new health stream or cached stale frame is needed.
+                        self._last_payload = None
+                        self._last_identity = None
+                        self._last_render_signature = None
+                        for subscription in self._subscriptions:
+                            subscription.unavailable = True
+                            subscription.payload = None
+                            subscription.credit = False
+                            subscription.outstanding = None
+                            failed_subscriptions.append(subscription)
                         # No timer-driven retry. The next explicit browser
                         # credit/renewal advances demand and permits reconnect.
                         self._retry_after_generation = self._demand_generation
                     self._condition.notify_all()
+                self._wake_subscriptions(failed_subscriptions)
 
 
 __all__ = [
     "ExecutionObservationProjectionError",
     "ExecutionObservationSource",
+    "ExecutionObservationSourceUnavailable",
     "ExecutionObservationSubscription",
     "MAXIMUM_OBSERVATION_CLIENTS",
     "OBSERVATION_CREDIT_SCHEMA",

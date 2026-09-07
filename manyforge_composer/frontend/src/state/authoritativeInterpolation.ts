@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 
 import type { QuaternionXyzwTuple, Vector3Tuple } from '../types/api';
+import type { Nanoseconds } from '../types/nanoseconds';
 import { normalizeQuaternion } from '../utils/structuralTransforms';
 
 /**
@@ -16,7 +17,7 @@ export const MAX_AUTHORITATIVE_INTERPOLATION_MS = 50;
 export interface AuthoritativeTransformFrame {
   streamIdentity: string;
   sourceSequence: number;
-  observedAtNs: number | null;
+  observedAtNs: Nanoseconds | null;
   positionM: Vector3Tuple;
   orientationXyzw: QuaternionXyzwTuple;
 }
@@ -72,12 +73,13 @@ export function authoritativeInterpolationDurationMs(
     || next.sourceSequence <= previous.sourceSequence
     || previous.observedAtNs === null
     || next.observedAtNs === null
-    || next.observedAtNs <= previous.observedAtNs
   ) return 0;
 
-  const sourceDeltaMs = (next.observedAtNs - previous.observedAtNs) / 1e6;
-  if (!Number.isFinite(sourceDeltaMs) || sourceDeltaMs <= 0) return 0;
-  return Math.min(sourceDeltaMs, MAX_AUTHORITATIVE_INTERPOLATION_MS);
+  // Subtract exact clocks before converting the bounded presentation duration.
+  const sourceDeltaNs = BigInt(next.observedAtNs) - BigInt(previous.observedAtNs);
+  if (sourceDeltaNs <= 0n) return 0;
+  if (sourceDeltaNs >= 50_000_000n) return MAX_AUTHORITATIVE_INTERPOLATION_MS;
+  return Number(sourceDeltaNs) / 1e6;
 }
 
 export function createAuthoritativeTransformTransition(

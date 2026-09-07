@@ -158,18 +158,19 @@ def _execution_observation() -> dict[str, Any]:
         "command": "observation",
         "ok": True,
         "observation": {
-            "schema_version": "manyforge.execution_observation.v1",
+            "schema_version": "manyforge.execution_observation.v2",
             "owner_epoch": "execution.epoch.1",
             "cell_id": "cell-a",
             "retained_bundle_id": "bundle.1",
             "graph_revision": "graph.1",
-            "controllable_component_id": "robot-a",
-            "command_target_id": "arm",
             "source_epoch": "joint-source.1",
             "source_sequence": 7,
-            "source_joint_names": ["joint1"],
-            "compiled_joint_names": ["robot-a__joint1"],
-            "positions_rad": [0.25],
+            "targets": [{
+                "controllable_component_id": "robot-a", "command_target_id": "arm",
+                "source_epoch": "arm-source.1", "source_sequence": 7,
+                "source_joint_names": ["joint1"], "compiled_joint_names": ["robot-a__joint1"],
+                "coordinate_kinds": ["angular"], "positions_si": [0.25],
+            }],
         },
     }
 
@@ -891,7 +892,7 @@ def headless_client() -> (
         elif path.endswith("/acknowledge") or path.endswith("/acknowledge-all"):
             payload = {"schema_version": "manyforge.headless_api_mutation_response.v1"}
         elif path == "/api/execution/history":
-            payload = {"schema_version": "manyforge.historian_summary_page.v1", "events": []}
+            payload = {"schema_version": "manyforge.historian_summary_page.v2", "events": []}
         elif path == "/api/execution/history/health":
             payload = {
                 "schema_version": "manyforge.historian_health.v1",

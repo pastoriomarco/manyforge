@@ -9,6 +9,7 @@ import {
   parseHealthResponse,
   parseHistorianPage,
   parseHistorianDetail,
+  parseHistorianDiscovery,
   parseExecutionIdentity,
   parseManagerApplyResponse,
   parseManagerDeploymentCandidatePreviewResponse,
@@ -76,6 +77,7 @@ import type {
   AlarmMembership,
   HistorianPage,
   HistorianDetail,
+  HistorianDiscovery,
   OperatorAlarmRecord,
 } from '../types/headless';
 import type {
@@ -106,6 +108,22 @@ export interface HistorianListQuery {
   eventTypes?: string[];
   beforeSequence?: number;
   limit?: number;
+  startUtcNs?: string;
+  endUtcNs?: string;
+  recentSeconds?: number;
+  clockOwner?: string;
+  severities?: string[];
+  programRunId?: string;
+  operationId?: string;
+  actionSpanId?: string;
+  nodeInstanceId?: string;
+  interventionSessionId?: string;
+  contactPolicyId?: string;
+  incidentId?: string;
+  conditionId?: string;
+  channel?: string;
+  alarmPhase?: 'all' | 'activated' | 'returned' | 'acknowledged' | 'raw';
+  search?: string;
 }
 
 export const HISTORIAN_PAGE_LIMIT = 32;
@@ -134,6 +152,21 @@ export function historianListPath(query: HistorianListQuery = {}): string {
   if (query.endNs !== undefined) {
     parameters.set('end_ns', historianNanoseconds(query.endNs, 'History end'));
   }
+  for (const [key, value] of [['start_utc_ns', query.startUtcNs], ['end_utc_ns', query.endUtcNs]] as const) {
+    if (value !== undefined) parameters.set(key, historianNanoseconds(value, key));
+  }
+  for (const [key, value] of [
+    ['recent_seconds', query.recentSeconds], ['clock_owner', query.clockOwner],
+    ['program_run_id', query.programRunId], ['operation_id', query.operationId],
+    ['action_span_id', query.actionSpanId], ['node_instance_id', query.nodeInstanceId],
+    ['intervention_session_id', query.interventionSessionId], ['contact_policy_id', query.contactPolicyId],
+    ['incident_id', query.incidentId], ['condition_id', query.conditionId],
+    ['channel', query.channel],
+    ['alarm_phase', query.alarmPhase], ['search', query.search],
+  ] as const) {
+    if (value !== undefined) parameters.set(key, String(value));
+  }
+  for (const severity of query.severities ?? []) parameters.append('severities', severity);
   if (query.beforeSequence !== undefined) {
     parameters.set('before_sequence', String(query.beforeSequence));
   }
@@ -964,6 +997,17 @@ export const api = {
     ),
   },
   history: {
+    discovery: (kind: HistorianDiscovery['kind'], after = '', signal?: AbortSignal): Promise<HistorianDiscovery> =>
+      requestJson(`/api/execution/history/discovery?${new URLSearchParams({ kind, after, limit: '32' })}`, (value) => {
+        const page = parseHistorianDiscovery(value);
+        if (page.kind !== kind) throw new Error('History discovery response has a different kind');
+        return page;
+      }, signal),
+    // Browser downloads the bounded bundle directly: large evidence is never
+    // parsed, copied into React state, or mixed with control publications.
+    exportUrl: (query: HistorianListQuery = {}, normalizedTrace = false): string => resolveStructuralAssetUrl(
+      historianListPath(query).replace('/api/execution/history?', `/api/debug/export${normalizedTrace ? '/ros2-medkit' : ''}?`),
+    ),
     list: (
       query: HistorianListQuery = {},
       signal?: AbortSignal,

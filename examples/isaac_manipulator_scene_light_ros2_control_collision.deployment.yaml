@@ -299,7 +299,7 @@
       "capability_definition_revision": "sha256:c99e2dc6d89129ca1d1d4a44d561d878b786df610d1ff241f6e09b5b100edb28",
       "capability_id": "model.kinematics.fk",
       "capability_provider_binding_id": "isaac_ur10e_collision_robot.arm.model-kinematics-fk.provider",
-      "capability_provider_binding_revision": "sha256:fee7083ba1cb0ec07528fa4a850101be18527e2aa8b416b3c1aa97b86d8aeb79",
+      "capability_provider_binding_revision": "sha256:a377861de29a5987960bdd00f3a7ec033a12a23206dd4ad4d1be503397054248",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -314,7 +314,7 @@
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
-        "component_type_revision": "sha256:76a01c6d886bd98b4e451dce0e97cc6e6935bbad51440998118961c724f0d681",
+        "component_type_revision": "sha256:600a4e67a63f393c0a582de5f02b3791eb79d3b2a2f45ce4cc995a091777b6b5",
         "control_binding_id": "isaac_ur10e_collision_robot.arm.execution-trajectory-execute",
         "control_binding_revision": "sha256:61b557cb883a52a96f9a670df0afd7e6703bb2761373b4d015b1e9979b0a9bf7",
         "controllable_component_id": "isaac_ur10e_collision_robot"
@@ -324,7 +324,7 @@
       "capability_definition_revision": "sha256:4212f32bfc7e9b04cb11db023da86b9a8f75531b5d775674d559631d93b65053",
       "capability_id": "model.limits.joint",
       "capability_provider_binding_id": "isaac_ur10e_collision_robot.arm.model-limits-joint.provider",
-      "capability_provider_binding_revision": "sha256:bfad9195a9d5cbad3fd4c7007c4ab0456d79c057da342b205bc5050d8c24794b",
+      "capability_provider_binding_revision": "sha256:e2a1db537c170fabc9183a9384b354ccf26d8a119abea28ca0a066d9fc74129a",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -339,7 +339,7 @@
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
-        "component_type_revision": "sha256:76a01c6d886bd98b4e451dce0e97cc6e6935bbad51440998118961c724f0d681",
+        "component_type_revision": "sha256:600a4e67a63f393c0a582de5f02b3791eb79d3b2a2f45ce4cc995a091777b6b5",
         "control_binding_id": "isaac_ur10e_collision_robot.arm.execution-trajectory-execute",
         "control_binding_revision": "sha256:61b557cb883a52a96f9a670df0afd7e6703bb2761373b4d015b1e9979b0a9bf7",
         "controllable_component_id": "isaac_ur10e_collision_robot"
@@ -349,7 +349,7 @@
       "capability_definition_revision": "sha256:be53c54ff0aa662db108113e9273e847e790d1b6f0adbba591d50f2237134a00",
       "capability_id": "planning.motion.cartesian_path",
       "capability_provider_binding_id": "isaac_ur10e_collision_robot.arm.planning-motion-cartesian_path.provider",
-      "capability_provider_binding_revision": "sha256:eba081f188d5e38eb48af342d9b19de8f57e79438f17541fb4b88dcef780f3ec",
+      "capability_provider_binding_revision": "sha256:f961858ba7c67d5542a5d5dac854599fe07fb761505994b497a35fc7945765b0",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -364,7 +364,7 @@
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
-        "component_type_revision": "sha256:76a01c6d886bd98b4e451dce0e97cc6e6935bbad51440998118961c724f0d681",
+        "component_type_revision": "sha256:600a4e67a63f393c0a582de5f02b3791eb79d3b2a2f45ce4cc995a091777b6b5",
         "control_binding_id": "isaac_ur10e_collision_robot.arm.execution-trajectory-execute",
         "control_binding_revision": "sha256:61b557cb883a52a96f9a670df0afd7e6703bb2761373b4d015b1e9979b0a9bf7",
         "controllable_component_id": "isaac_ur10e_collision_robot"
@@ -374,7 +374,7 @@
       "capability_definition_revision": "sha256:0f6cb2fda7e1d05f20a5867203b84c0e0427440f4b11657941a907c2e2a23dce",
       "capability_id": "planning.motion.joint_goal",
       "capability_provider_binding_id": "isaac_ur10e_collision_robot.arm.planning-motion-joint_goal.provider",
-      "capability_provider_binding_revision": "sha256:93317f093e2e9e019139c06bc857b21fd229ad8cbb15a11eb18f49b3e9187fae",
+      "capability_provider_binding_revision": "sha256:e9bde532295413fd97ec4dc49582cb0dffe9bdaf7ec57697828c42afcd28a6dc",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -389,7 +389,7 @@
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
-        "component_type_revision": "sha256:76a01c6d886bd98b4e451dce0e97cc6e6935bbad51440998118961c724f0d681",
+        "component_type_revision": "sha256:600a4e67a63f393c0a582de5f02b3791eb79d3b2a2f45ce4cc995a091777b6b5",
         "control_binding_id": "isaac_ur10e_collision_robot.arm.execution-trajectory-execute",
         "control_binding_revision": "sha256:61b557cb883a52a96f9a670df0afd7e6703bb2761373b4d015b1e9979b0a9bf7",
         "controllable_component_id": "isaac_ur10e_collision_robot"
@@ -399,7 +399,7 @@
       "capability_definition_revision": "sha256:422c7d9025d46e0fc660705a4f05171a235279872f91c820e952cf16792b8148",
       "capability_id": "planning.motion.pose_goal",
       "capability_provider_binding_id": "isaac_ur10e_collision_robot.arm.planning-motion-pose_goal.provider",
-      "capability_provider_binding_revision": "sha256:41bf0acc66e24e0fec3bca1639465ead6597b466929af51634554d5ccc98b196",
+      "capability_provider_binding_revision": "sha256:22340c35f45c740ab599d7d429cf2aa7634b05e714c6fa22e3a564d7a0533de4",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -414,7 +414,7 @@
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
-        "component_type_revision": "sha256:76a01c6d886bd98b4e451dce0e97cc6e6935bbad51440998118961c724f0d681",
+        "component_type_revision": "sha256:600a4e67a63f393c0a582de5f02b3791eb79d3b2a2f45ce4cc995a091777b6b5",
         "control_binding_id": "isaac_ur10e_collision_robot.arm.execution-trajectory-execute",
         "control_binding_revision": "sha256:61b557cb883a52a96f9a670df0afd7e6703bb2761373b4d015b1e9979b0a9bf7",
         "controllable_component_id": "isaac_ur10e_collision_robot"
@@ -424,7 +424,7 @@
       "capability_definition_revision": "sha256:14c53dad299a42d6604eac14240d015e22a4bc1adb363fb252111e62a2d2ad90",
       "capability_id": "planning.profile.balanced",
       "capability_provider_binding_id": "isaac_ur10e_collision_robot.arm.planning-profile-balanced.provider",
-      "capability_provider_binding_revision": "sha256:42b7d7764ccb2d27cd14a08361078f6584112e688b2af393ce8a16f0471de084",
+      "capability_provider_binding_revision": "sha256:a3b198a9a891f39f9967bee10485bc00184209486cb1d5631f055fe172934c63",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -439,7 +439,7 @@
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
-        "component_type_revision": "sha256:76a01c6d886bd98b4e451dce0e97cc6e6935bbad51440998118961c724f0d681",
+        "component_type_revision": "sha256:600a4e67a63f393c0a582de5f02b3791eb79d3b2a2f45ce4cc995a091777b6b5",
         "control_binding_id": "isaac_ur10e_collision_robot.arm.execution-trajectory-execute",
         "control_binding_revision": "sha256:61b557cb883a52a96f9a670df0afd7e6703bb2761373b4d015b1e9979b0a9bf7",
         "controllable_component_id": "isaac_ur10e_collision_robot"
@@ -449,7 +449,7 @@
       "capability_definition_revision": "sha256:e0f578ef9af205b3c7c184fb1124ffb4fe3c35874b5e993358b43a2dc43d2674",
       "capability_id": "planning.profile.first_feasible",
       "capability_provider_binding_id": "isaac_ur10e_collision_robot.arm.planning-profile-first_feasible.provider",
-      "capability_provider_binding_revision": "sha256:c43f12d540c8e7ca2ffbcd0b8a3412ba4b0dbac30613f9b4e284f0d2d8bd8f46",
+      "capability_provider_binding_revision": "sha256:ee6b2e333d1aceacf1bb0dd9879883a29863b2810cca85ee19de008adae68ec5",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -464,7 +464,7 @@
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
-        "component_type_revision": "sha256:76a01c6d886bd98b4e451dce0e97cc6e6935bbad51440998118961c724f0d681",
+        "component_type_revision": "sha256:600a4e67a63f393c0a582de5f02b3791eb79d3b2a2f45ce4cc995a091777b6b5",
         "control_binding_id": "isaac_ur10e_collision_robot.arm.execution-trajectory-execute",
         "control_binding_revision": "sha256:61b557cb883a52a96f9a670df0afd7e6703bb2761373b4d015b1e9979b0a9bf7",
         "controllable_component_id": "isaac_ur10e_collision_robot"
@@ -474,7 +474,7 @@
       "capability_definition_revision": "sha256:7f570672270455207d5fb8eb210cd1dd22a99d7909421cf0dc8036c32e4beffb",
       "capability_id": "planning.profile.quality_bounded",
       "capability_provider_binding_id": "isaac_ur10e_collision_robot.arm.planning-profile-quality_bounded.provider",
-      "capability_provider_binding_revision": "sha256:9bf2038867f7eb4c8e6058e49c6068bb64a7fe7efe3136a535f81ea3b4fe8e22",
+      "capability_provider_binding_revision": "sha256:e4ba01a5cd6b50acf1980b5f179a974d1982c533c27b6e36baf1671679e7de0f",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -489,7 +489,7 @@
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
-        "component_type_revision": "sha256:76a01c6d886bd98b4e451dce0e97cc6e6935bbad51440998118961c724f0d681",
+        "component_type_revision": "sha256:600a4e67a63f393c0a582de5f02b3791eb79d3b2a2f45ce4cc995a091777b6b5",
         "control_binding_id": "isaac_ur10e_collision_robot.arm.execution-trajectory-execute",
         "control_binding_revision": "sha256:61b557cb883a52a96f9a670df0afd7e6703bb2761373b4d015b1e9979b0a9bf7",
         "controllable_component_id": "isaac_ur10e_collision_robot"
@@ -499,7 +499,7 @@
       "capability_definition_revision": "sha256:1fde55ff59f977844d1e42a115df0e66305953803e7f2830fec4821e3cd36385",
       "capability_id": "planning.trajectory.time_parameterized",
       "capability_provider_binding_id": "isaac_ur10e_collision_robot.arm.planning-trajectory-time_parameterized.provider",
-      "capability_provider_binding_revision": "sha256:ce57c20ec85462784a5aad57a555fe5799c59db6a60c5ef10239fe3848889ad6",
+      "capability_provider_binding_revision": "sha256:fe50eeb68b92240c47fee6ff53cc1779867d016e14a40f44d5f8648af3aa5b47",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -514,7 +514,7 @@
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
-        "component_type_revision": "sha256:76a01c6d886bd98b4e451dce0e97cc6e6935bbad51440998118961c724f0d681",
+        "component_type_revision": "sha256:600a4e67a63f393c0a582de5f02b3791eb79d3b2a2f45ce4cc995a091777b6b5",
         "control_binding_id": "isaac_ur10e_collision_robot.arm.execution-trajectory-execute",
         "control_binding_revision": "sha256:61b557cb883a52a96f9a670df0afd7e6703bb2761373b4d015b1e9979b0a9bf7",
         "controllable_component_id": "isaac_ur10e_collision_robot"
@@ -524,7 +524,7 @@
       "capability_definition_revision": "sha256:3cd04895527038906ddcb9c6ca9fd87f4535eba41e5014b04917c66603f26653",
       "capability_id": "validation.trajectory.non_collision",
       "capability_provider_binding_id": "isaac_ur10e_collision_robot.arm.validation-trajectory-non_collision.provider",
-      "capability_provider_binding_revision": "sha256:581520b3521c0f3b64143f17b6ff34b4280dd9578039fdbf73319eb0faa2af18",
+      "capability_provider_binding_revision": "sha256:3b1cefeb13eb843140beec02a0de931d237a17968aed7e1ac2e8e76a876055f0",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -539,7 +539,7 @@
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
-        "component_type_revision": "sha256:76a01c6d886bd98b4e451dce0e97cc6e6935bbad51440998118961c724f0d681",
+        "component_type_revision": "sha256:600a4e67a63f393c0a582de5f02b3791eb79d3b2a2f45ce4cc995a091777b6b5",
         "control_binding_id": "isaac_ur10e_collision_robot.arm.execution-trajectory-execute",
         "control_binding_revision": "sha256:61b557cb883a52a96f9a670df0afd7e6703bb2761373b4d015b1e9979b0a9bf7",
         "controllable_component_id": "isaac_ur10e_collision_robot"
@@ -549,7 +549,7 @@
       "capability_definition_revision": "sha256:c99e2dc6d89129ca1d1d4a44d561d878b786df610d1ff241f6e09b5b100edb28",
       "capability_id": "model.kinematics.fk",
       "capability_provider_binding_id": "isaac_ur10e_collision_robot.gripper.model-kinematics-fk.provider",
-      "capability_provider_binding_revision": "sha256:7f730edb8d150206c1877fcbe264e3da8fff33a2f46ef011d27aa94bb4be5af9",
+      "capability_provider_binding_revision": "sha256:688f020e949084551c681b40839b3602188368aa450482b83187bd3e0a0b0561",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -564,7 +564,7 @@
       "scope": "target_binding",
       "target": {
         "command_target_id": "gripper",
-        "component_type_revision": "sha256:76a01c6d886bd98b4e451dce0e97cc6e6935bbad51440998118961c724f0d681",
+        "component_type_revision": "sha256:600a4e67a63f393c0a582de5f02b3791eb79d3b2a2f45ce4cc995a091777b6b5",
         "control_binding_id": "isaac_ur10e_collision_robot.gripper.tool-gripper-command",
         "control_binding_revision": "sha256:1b7092784c2adf165de0c2a8f0edc10e4ca74b4b0e6b354610f9ee46b9e2bfb1",
         "controllable_component_id": "isaac_ur10e_collision_robot"
@@ -574,7 +574,7 @@
       "capability_definition_revision": "sha256:4212f32bfc7e9b04cb11db023da86b9a8f75531b5d775674d559631d93b65053",
       "capability_id": "model.limits.joint",
       "capability_provider_binding_id": "isaac_ur10e_collision_robot.gripper.model-limits-joint.provider",
-      "capability_provider_binding_revision": "sha256:425d99b4036b156c541c3c386bacca083f39212073eefb791be7383189df2d94",
+      "capability_provider_binding_revision": "sha256:12b7ca54ca646ce9d8565b5866ec62018b39c0562dd9f0dc8e36c2269546b525",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -589,7 +589,7 @@
       "scope": "target_binding",
       "target": {
         "command_target_id": "gripper",
-        "component_type_revision": "sha256:76a01c6d886bd98b4e451dce0e97cc6e6935bbad51440998118961c724f0d681",
+        "component_type_revision": "sha256:600a4e67a63f393c0a582de5f02b3791eb79d3b2a2f45ce4cc995a091777b6b5",
         "control_binding_id": "isaac_ur10e_collision_robot.gripper.tool-gripper-command",
         "control_binding_revision": "sha256:1b7092784c2adf165de0c2a8f0edc10e4ca74b4b0e6b354610f9ee46b9e2bfb1",
         "controllable_component_id": "isaac_ur10e_collision_robot"
@@ -977,11 +977,11 @@
         "schema_revision": "sha256:dd305be4c7071d4b5fcf31c031d80b7adb8d3a29562629a189b167922b1f29da"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/component_type/ur10e_robotiq_2f_140.component/76a01c6d886bd98b4e451dce0e97cc6e6935bbad51440998118961c724f0d681",
-        "content_digest": "sha256:cb8c3904d3e534627c74051625525f716dd3858f14cf3b3aed80be207d6bdf39",
-        "record_id": "ur10e_robotiq_2f_140.component",
+        "content_addressed_store_key": "catalog/maintained/component_type/ur10e_robotiq_2f_140.fixed_scale.component/600a4e67a63f393c0a582de5f02b3791eb79d3b2a2f45ce4cc995a091777b6b5",
+        "content_digest": "sha256:11fdd1678de040900ca1021f337a852466f62c9493944ef4f0807d06a3640ad0",
+        "record_id": "ur10e_robotiq_2f_140.fixed_scale.component",
         "record_kind": "component_type",
-        "record_revision": "sha256:76a01c6d886bd98b4e451dce0e97cc6e6935bbad51440998118961c724f0d681",
+        "record_revision": "sha256:600a4e67a63f393c0a582de5f02b3791eb79d3b2a2f45ce4cc995a091777b6b5",
         "schema_id": "manyforge.component_type.v1",
         "schema_revision": "sha256:8e728ad4442d46b98f0d0534f8189df9b7982f982ab99cb656e6fdbeef231009"
       },
@@ -1101,7 +1101,7 @@
     ]
   },
   "deployment_artifact_id": "isaac_manipulator_scene_light_ros2_control_collision",
-  "deployment_revision": "sha256:8de678b37e6ab3adc8fd3644e9058a3513d85857b9e2b6bdc787295a25dc1ede",
+  "deployment_revision": "sha256:eb58c4bb37e9582b5f1413ce75c2606a9af5bf839b568ad967d367230cbc0407",
   "description": "Retained Isaac UR10e light-scene collision scenario using commanded ROS 2 control execution, the authoritative runtime collision projection, and Kernel-owned Stop evidence.",
   "desired_control_configurations": [
     {
@@ -1917,8 +1917,8 @@
     ],
     "controllable_components": [
       {
-        "component_type_id": "ur10e_robotiq_2f_140.component",
-        "component_type_revision": "sha256:76a01c6d886bd98b4e451dce0e97cc6e6935bbad51440998118961c724f0d681",
+        "component_type_id": "ur10e_robotiq_2f_140.fixed_scale.component",
+        "component_type_revision": "sha256:600a4e67a63f393c0a582de5f02b3791eb79d3b2a2f45ce4cc995a091777b6b5",
         "controllable_component_id": "isaac_ur10e_collision_robot",
         "model_role_bindings": [
           {

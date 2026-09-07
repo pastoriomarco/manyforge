@@ -26,7 +26,6 @@ _REMOVED_RUNTIME_OPTIONS: Final = (
     "--assistant-timeout-s",
     "--assistant-api-token",
     "--mcp",
-    "--mcp-http",
     "--trace-dir",
     "--failure-archive-dir",
     "--failure-archive-max-age-s",
@@ -83,6 +82,11 @@ def main() -> None:
     parser.add_argument("--headless-api-timeout-s", type=float, default=2.0)
     parser.add_argument("--assistant-bridge-url")
     parser.add_argument(
+        "--mcp-http",
+        action="store_true",
+        help="enable the optional stateless MCP adapter at /mcp/ (requires the mcp extra)",
+    )
+    parser.add_argument(
         "--startup-scenario",
         help=(
             "explicitly Load one complete launcher-selected Scenario before "
@@ -137,6 +141,7 @@ def main() -> None:
             state,
             static_dir=args.static_dir,
             security=security,
+            enable_mcp=args.mcp_http,
         )
         # The application middleware already emits bounded structured access
         # records. Uvicorn's per-request duplicate is unbounded hot-path I/O

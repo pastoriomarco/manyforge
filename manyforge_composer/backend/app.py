@@ -181,6 +181,8 @@ def create_app(
     state: ComposerState,
     static_dir: str | None = None,
     security: SecurityConfig | None = None,
+    *,
+    enable_mcp: bool = False,
 ) -> FastAPI:
     """Create structural, Draft/Saved authoring, and thin headless routes.
 
@@ -251,6 +253,7 @@ def create_app(
         "/api/program/revert",
         "/api/program/runs",
         "/api/program/save",
+        "/api/program/validate",
         "/api/scenarios/load",
     ):
         app.add_middleware(
@@ -600,6 +603,17 @@ def create_app(
             code=1013,
             reason=RUNTIME_UNAVAILABLE_REASON_CODE,
         )
+
+    if enable_mcp:
+        from .mcp_adapter import ComposerMcpAdapter
+
+        mcp_adapter = ComposerMcpAdapter(app, security)
+        app.add_middleware(
+            ComposerRequestBodyLimitMiddleware,
+            maximum_bytes=_MAXIMUM_REQUEST_BODY_BYTES,
+            path_prefix="/mcp",
+        )
+        app.mount("/mcp", mcp_adapter.handle_request, name="mcp")
 
     resolved_static = _find_static_dir(static_dir)
     if resolved_static is not None:

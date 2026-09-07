@@ -450,7 +450,10 @@ export function ProgramRuntimePanel({
 
       {controls !== null && controls.audit.length > 0 && (
         <details className="runtime-control-section">
-          <summary>Runtime-control history ({controls.audit.length})</summary>
+          <summary>Recent runtime-control events ({controls.audit.length})</summary>
+          {controls.audit[0].eventRevision > 1 && (
+            <p>Earlier events are outside this recent window. Use Runtime / history for retained operational history.</p>
+          )}
           <ol className="runtime-control-audit">
             {controls.audit.map((event) => (
               <li key={event.eventRevision}>

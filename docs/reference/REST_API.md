@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py structural-rest
-  Last regenerated: 2026-09-03 15:07:22 UTC
+  Last regenerated: 2026-09-07 00:13:48 UTC
   Generator source: scripts/regen-public-contracts.py:gen_rest_api
 -->
 
@@ -36,6 +36,8 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `GET` | `/api/control/state` | headless-runtime-client | Control Projection |
 | `POST` | `/api/cycle/recovery-actions` | headless-runtime-client | Cycle Recovery Action |
 | `GET` | `/api/cycle/status` | headless-runtime-client | Program Cycle Status |
+| `GET` | `/api/debug/export` | headless-runtime-client | Debug Export |
+| `GET` | `/api/debug/export/ros2-medkit` | headless-runtime-client | Normalized Trace Export |
 | `POST` | `/api/deployment/discard` | composer-deployment-draft | Discard |
 | `POST` | `/api/deployment/draft/apply` | composer-deployment-draft | Apply Authored Candidate |
 | `POST` | `/api/deployment/draft/controlled-stop` | composer-deployment-draft | Update Controlled Stop |
@@ -56,6 +58,8 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `GET` | `/api/execution/diagnostics` | headless-runtime-client | Execution Diagnostics |
 | `POST` | `/api/execution/full-stop` | headless-runtime-client | Execution Full Stop |
 | `GET` | `/api/execution/history` | headless-runtime-client | History |
+| `GET` | `/api/execution/history/discovery` | headless-runtime-client | History Discovery |
+| `GET` | `/api/execution/history/export` | headless-runtime-client | History Export |
 | `GET` | `/api/execution/history/health` | headless-runtime-client | Historian Health |
 | `POST` | `/api/execution/history/reconcile` | headless-runtime-client | Historian Reconcile |
 | `GET` | `/api/execution/history/{sequence}` | headless-runtime-client | Historian Detail |
@@ -119,6 +123,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `POST` | `/api/program/runs/{program_run_id}/stop` | headless-runtime-client | Program Run Stop |
 | `POST` | `/api/program/save` | composer-draft | Save Draft |
 | `POST` | `/api/program/save-as` | composer-draft | Save Draft As |
+| `POST` | `/api/program/validate` | composer-draft | Validate Program Source |
 | `GET` | `/api/program/workspace` | composer-draft | Read Workspace |
 | `GET` | `/api/runtime` | headless-runtime-client | Runtime |
 | `GET` | `/api/scenarios` | headless-runtime-client | Scenarios |

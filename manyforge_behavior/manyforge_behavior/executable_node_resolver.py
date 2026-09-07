@@ -114,9 +114,7 @@ class NodeAdapterBuildContext:
         if self.operator_stop_state is not None and not isinstance(
             self.operator_stop_state, OperatorMotionStopState
         ):
-            raise TypeError(
-                "operator_stop_state must be one OperatorMotionStopState"
-            )
+            raise TypeError("operator_stop_state must be one OperatorMotionStopState")
 
 
 NodeAdapterBuilder = Callable[[NodeAdapterBuildContext], py_trees.behaviour.Behaviour]
@@ -193,7 +191,7 @@ def _repeat(context: NodeAdapterBuildContext) -> py_trees.behaviour.Behaviour:
     return RepeatDecorator(
         name=context.name,
         child=context.children[0],
-        num_cycles=context.parameters["num_cycles"],
+        num_cycles=context.parameters.get("num_cycles", -1),
     )
 
 
@@ -201,7 +199,7 @@ def _retry(context: NodeAdapterBuildContext) -> py_trees.behaviour.Behaviour:
     return RetryDecorator(
         name=context.name,
         child=context.children[0],
-        num_attempts=context.parameters["num_attempts"],
+        num_attempts=context.parameters.get("num_attempts", -1),
     )
 
 
@@ -371,6 +369,13 @@ _TASK_OWNER_PORTS: Final[Mapping[str, str]] = MappingProxyType(
         "cclc.control_route": "cclc_routes",
         "cclc.lifecycle": "cclc_lifecycle",
         "kernel.operation": "kernel_operations",
+        "kernel.pause": "kernel_controls",
+        "kernel.reset": "kernel_controls",
+        "kernel.resume": "kernel_controls",
+        "kernel.runtime_scaling": "kernel_controls",
+        "kernel.stop": "kernel_controls",
+        "kernel.full_stop": "kernel_controls",
+        "kernel.recovery": "kernel_controls",
         "kernel.pick_place_sequence": "pick_place",
         "planning.pick_sequence": "pick_place",
         "simulator.control": "simulator_control",
@@ -378,11 +383,6 @@ _TASK_OWNER_PORTS: Final[Mapping[str, str]] = MappingProxyType(
 )
 _INVOCATION_OWNER_PORTS: Final[Mapping[str, str]] = MappingProxyType(
     {
-        "kernel.pause": "kernel_controls",
-        "kernel.reset": "kernel_controls",
-        "kernel.resume": "kernel_controls",
-        "kernel.runtime_scaling": "kernel_controls",
-        "kernel.stop": "kernel_controls",
         "model.kinematics": "model_queries",
         "scene.carried_attachment": "scene_transactions",
         "scene.transaction": "scene_transactions",
@@ -393,13 +393,8 @@ _DEFERRED_BY_NODE: Final[Mapping[str, tuple[str, tuple[str, ...]]]] = MappingPro
         "io.get_input": (I11_ADAPTER_REASON, ("I11", "T")),
         "io.set_output": (I11_ADAPTER_REASON, ("I11", "T")),
         "io.wait_for_input": (I11_ADAPTER_REASON, ("I11", "T")),
-        "kernel.full_stop": (I8_ADAPTER_REASON, ("I8", "P5")),
         "motion.move_until_signal": (I8_ADAPTER_REASON, ("I8", "P5")),
         "motion.probe_search": (I8_ADAPTER_REASON, ("I8", "P5")),
-        "recovery.apply_offered_action": (
-            I8_ADAPTER_REASON,
-            ("I8", "P5"),
-        ),
     }
 )
 

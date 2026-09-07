@@ -4,6 +4,7 @@
 #include <iterator>
 #include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
+#include <manyforge_core/gripper_participant_engine.hpp>
 #include <manyforge_core/motion_interrupt/stop_profile_mapper.hpp>
 #include <manyforge_roboplan/retained_native_runtime.hpp>
 #include <map>
@@ -462,7 +463,8 @@ stop_surveillance_sources(
     const std::optional<core::RuntimeParticipantStopReadiness>
         &gripper_readiness,
     const std::shared_ptr<RetainedObservedStateChannel> &gripper_channel,
-    core::IResolvedParticipantExecutionEngine *engine) {
+    core::IResolvedParticipantExecutionEngine *engine,
+    core::IResolvedParticipantExecutionEngine *gripper_engine) {
   std::vector<RetainedStopSurveillanceSourceInput> result;
   if (auto motion = stop_surveillance_source(
           motion_binding, motion_readiness, motion_channel,
@@ -473,7 +475,7 @@ stop_surveillance_sources(
   if (gripper_binding.has_value()) {
     if (auto gripper = stop_surveillance_source(
             *gripper_binding, gripper_readiness, gripper_channel,
-            gripper_goal_observer(engine, *gripper_binding));
+            gripper_goal_observer(gripper_engine, *gripper_binding));
         gripper.has_value()) {
       result.push_back(std::move(*gripper));
     }
@@ -848,6 +850,12 @@ RetainedObservedStateChannelConfig select_retained_state_channel_config(
 
 } // namespace detail
 
+bool retained_bindings_share_backend_owner(
+    const core::RuntimeParticipantBinding &primary,
+    const core::RuntimeParticipantBinding &representative) noexcept {
+  return same_backend_owner(primary, representative);
+}
+
 std::shared_ptr<RetainedNativeRuntime>
 create_retained_native_runtime_participants(
     RetainedNativeRuntimeInput input, RetainedNativeRuntimeConfig config,
@@ -1074,10 +1082,12 @@ create_retained_native_runtime_participants(
 
   auto motion_state_config = detail::select_retained_state_channel_config(
       std::move(input.motion_state_channel_config), runtime->motion_binding);
+  auto observation_wake = std::make_shared<RetainedObservationWake>();
   runtime->motion_state_channel =
       std::make_shared<RetainedObservedStateChannel>(
           runtime->motion_binding, runtime->state_projector,
-          std::move(motion_state_config), runtime->clock.get());
+          std::move(motion_state_config), runtime->clock.get(),
+          observation_wake);
   const auto initial_timestamp_ns = runtime->clock->now();
   const auto motion_initialized =
       config.initial_motion_positions_rad.empty()
@@ -1125,7 +1135,7 @@ create_retained_native_runtime_participants(
             detail::select_retained_state_channel_config(
                 std::move(input.gripper_state_channel_config),
                 *runtime->gripper_binding),
-            runtime->clock.get());
+            runtime->clock.get(), observation_wake);
     if (model_backed) {
       const auto gripper_initialized =
           runtime->gripper_state_channel->initialize_from_projection(
@@ -1265,7 +1275,7 @@ create_retained_native_runtime_participants(
                                    *runtime->trajectory_validator,
                                    *runtime->collision_trajectory_projector,
                                    nullptr,
-                                   runtime->gripper.get(),
+                                   nullptr,
                                    input.planning_scene_synchronizer.get()};
   runtime->planning_scene_synchronizer =
       std::move(input.planning_scene_synchronizer);
@@ -1278,6 +1288,11 @@ create_retained_native_runtime_participants(
       runtime->lookahead_collision_engines);
   runtime->participant_engine->set_collision_validation_policy_snapshot(
       runtime->collision_publisher->collision_policy_snapshot());
+  if (runtime->gripper) {
+    runtime->gripper_participant_engine =
+        std::make_shared<core::GripperParticipantEngine>(*runtime->gripper,
+                                                         *runtime->clock);
+  }
 
   std::vector<core::RuntimeParticipantExecutionRegistration> registrations;
   registrations.reserve(runtime->control_binding_representatives.size() +
@@ -1294,7 +1309,7 @@ create_retained_native_runtime_participants(
         primary ? (motion_owner ? input.motion_stop_readiness
                                 : input.gripper_stop_readiness)
                 : std::nullopt,
-        runtime->participant_engine.get(),
+        runtime->participant_engine_for(motion_owner),
         motion_owner ? static_cast<core::IControlDomainExecutionPort *>(
                            runtime->execution.get())
                      : runtime->gripper_stop_execution_port,
@@ -1313,7 +1328,8 @@ create_retained_native_runtime_participants(
   }
   for (const auto &alias : runtime->gripper_binding_aliases) {
     registrations.push_back(runtime_registration(
-        alias, input.gripper_stop_readiness, runtime->participant_engine.get(),
+        alias, input.gripper_stop_readiness,
+        runtime->gripper_participant_engine.get(),
         runtime->gripper_stop_execution_port, std::nullopt));
   }
   std::vector<core::RuntimeParticipantExecutionRegistration>
@@ -1326,8 +1342,8 @@ create_retained_native_runtime_participants(
   if (runtime->gripper_binding.has_value()) {
     physical_registrations.push_back(runtime_registration(
         *runtime->gripper_binding, input.gripper_stop_readiness,
-        runtime->participant_engine.get(), runtime->gripper_stop_execution_port,
-        std::nullopt));
+        runtime->gripper_participant_engine.get(),
+        runtime->gripper_stop_execution_port, std::nullopt));
   }
   auto binding_resolver = std::move(input.participant_resolver);
   if (runtime->participant_resolver_factory) {
@@ -1356,10 +1372,17 @@ create_retained_native_runtime_participants(
                   ? readiness_for(runtime->participant_registrations,
                                   *runtime->gripper_binding)
                   : std::nullopt,
-              runtime->gripper_state_channel,
-              runtime->participant_engine.get()),
+              runtime->gripper_state_channel, runtime->participant_engine.get(),
+              runtime->gripper_participant_engine.get()),
           runtime->clock.get());
   return runtime;
+}
+
+core::IResolvedParticipantExecutionEngine *
+RetainedNativeRuntime::participant_engine_for(const bool motion) const {
+  if (motion)
+    return participant_engine.get();
+  return gripper_participant_engine.get();
 }
 
 core::Result<std::vector<core::RuntimeParticipantBinding>>
@@ -1715,7 +1738,7 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
         motion_fault_stop_profile));
     if (next_gripper.has_value()) {
       physical_registrations.push_back(runtime_registration(
-          *next_gripper, gripper_readiness, participant_engine.get(),
+          *next_gripper, gripper_readiness, gripper_participant_engine.get(),
           gripper_stop_execution_port, std::nullopt));
     }
     std::vector<core::RuntimeParticipantExecutionRegistration> registrations;
@@ -1738,7 +1761,7 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
           (motion_owner ? next_motion.value() : next_gripper->value());
       registrations.push_back(runtime_registration(
           representative, readiness_for_binding(representative),
-          participant_engine.get(),
+          participant_engine_for(motion_owner),
           motion_owner ? static_cast<core::IControlDomainExecutionPort *>(
                              execution.get())
                        : gripper_stop_execution_port,
@@ -1757,7 +1780,7 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
     }
     for (const auto &alias : next_gripper_aliases) {
       registrations.push_back(runtime_registration(
-          alias, gripper_readiness, participant_engine.get(),
+          alias, gripper_readiness, gripper_participant_engine.get(),
           gripper_stop_execution_port, std::nullopt));
     }
 
@@ -1863,7 +1886,8 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
     }
     auto next_surveillance_sources = stop_surveillance_sources(
         next_motion, motion_readiness, motion_state_channel, next_gripper,
-        gripper_readiness, gripper_state_channel, participant_engine.get());
+        gripper_readiness, gripper_state_channel, participant_engine.get(),
+        gripper_participant_engine.get());
     if (stop_surveillance_owner != nullptr) {
       auto valid = RetainedStopSurveillanceOwner::ValidateSources(
           next_surveillance_sources);
@@ -2066,7 +2090,7 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
         motion_fault_stop_profile));
     if (next_gripper.has_value()) {
       physical_registrations.push_back(runtime_registration(
-          *next_gripper, gripper_readiness, participant_engine.get(),
+          *next_gripper, gripper_readiness, gripper_participant_engine.get(),
           gripper_stop_execution_port, std::nullopt));
     }
     std::vector<core::RuntimeParticipantExecutionRegistration> registrations;
@@ -2089,7 +2113,7 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
           (motion_owner ? next_motion.value() : next_gripper->value());
       registrations.push_back(runtime_registration(
           representative, readiness_for_binding(representative),
-          participant_engine.get(),
+          participant_engine_for(motion_owner),
           motion_owner ? static_cast<core::IControlDomainExecutionPort *>(
                              execution.get())
                        : gripper_stop_execution_port,
@@ -2108,7 +2132,7 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
     }
     for (const auto &alias : next_gripper_aliases) {
       registrations.push_back(runtime_registration(
-          alias, gripper_readiness, participant_engine.get(),
+          alias, gripper_readiness, gripper_participant_engine.get(),
           gripper_stop_execution_port, std::nullopt));
     }
 
@@ -2227,7 +2251,8 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
     if (stop_surveillance_owner != nullptr) {
       auto next_sources = stop_surveillance_sources(
           next_motion, motion_readiness, motion_state_channel, next_gripper,
-          gripper_readiness, gripper_state_channel, participant_engine.get());
+          gripper_readiness, gripper_state_channel, participant_engine.get(),
+          gripper_participant_engine.get());
       auto valid = RetainedStopSurveillanceOwner::ValidateSources(next_sources);
       if (!valid.ok()) {
         throw std::logic_error(
@@ -2432,7 +2457,7 @@ void attach_retained_native_addressed_owner(
         std::move(config.graph_revision),
         std::move(config.cell_stop_deadline_budget),
         core::kMaximumEmergencyStopCorrelationEntries,
-        0U,
+        kNativeMaximumLiveStopParticipants,
         0U,
         std::move(stop_surveillance_config),
         std::move(recovery_facts_resolver)};

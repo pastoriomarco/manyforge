@@ -47,6 +47,18 @@ TEST(OperationIntentTest, AcceptsPortableSingleMotionIntent) {
   ASSERT_TRUE(result.ok()) << result.error().message;
 }
 
+TEST(OperationIntentTest, EveryParticipantActionSpanMustMatchTheOperationRun) {
+  auto operation = valid_motion_operation();
+  operation.coordination_policy = OperationCoordinationPolicy::kCoordinatedAll;
+  operation.participants.push_back(operation.participants.front());
+  operation.participants.back().action_span->program_run_id = "run.other";
+  const auto rejected = validate_operation_intent(operation);
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.error().details.at("reason"), "operation_action_span_run_mismatch");
+  operation.participants.back().action_span->program_run_id = operation.program_run_id.value();
+  EXPECT_TRUE(validate_operation_intent(operation).ok());
+}
+
 TEST(OperationIntentTest, RejectsDuplicateSourceJointNames) {
   auto operation = valid_motion_operation();
   auto& motion = std::get<MotionParticipantIntentDTO>(operation.participants.front().payload);

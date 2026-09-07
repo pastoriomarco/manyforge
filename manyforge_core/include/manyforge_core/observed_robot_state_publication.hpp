@@ -27,27 +27,22 @@ enum class ObservedRobotStateAuthorityProfile {
   kPredictedNative,
 };
 
-const char* observed_robot_state_source_kind_name(
-    ObservedRobotStateSourceKind kind) noexcept;
+const char* observed_robot_state_source_kind_name(ObservedRobotStateSourceKind kind) noexcept;
 const char* observed_robot_state_authority_profile_name(
     ObservedRobotStateAuthorityProfile profile) noexcept;
 
 struct ObservedRobotStateSourceConfig {
   ObservedRobotStateSourceConfig() = default;
-  ObservedRobotStateSourceConfig(
-      ObservedRobotStateSourceKind source_kind,
-      std::string id,
-      ObservedRobotStateAuthorityProfile profile,
-      std::int64_t budget_ns,
-      std::string profile_id = {})
+  ObservedRobotStateSourceConfig(ObservedRobotStateSourceKind source_kind, std::string id,
+                                 ObservedRobotStateAuthorityProfile profile, std::int64_t budget_ns,
+                                 std::string profile_id = {})
       : kind(source_kind),
         source_id(std::move(id)),
         authority_profile(profile),
         freshness_budget_ns(budget_ns),
         authority_profile_id(std::move(profile_id)) {}
 
-  ObservedRobotStateSourceKind kind =
-      ObservedRobotStateSourceKind::kJointState;
+  ObservedRobotStateSourceKind kind = ObservedRobotStateSourceKind::kJointState;
   std::string source_id;
   ObservedRobotStateAuthorityProfile authority_profile =
       ObservedRobotStateAuthorityProfile::kMeasured;
@@ -66,8 +61,7 @@ struct ObservedRobotStateSnapshotDTO {
   std::vector<double> positions_rad;
   std::optional<std::vector<double>> velocities_rad_s;
   std::string source_id;
-  ObservedRobotStateSourceKind source_kind =
-      ObservedRobotStateSourceKind::kJointState;
+  ObservedRobotStateSourceKind source_kind = ObservedRobotStateSourceKind::kJointState;
   std::int64_t source_timestamp_ns = 0;
   std::int64_t received_timestamp_ns = 0;
   std::string authority_profile;
@@ -91,8 +85,7 @@ struct ObservedRobotStatePublicationMetrics {
 };
 
 struct ObservedRobotStateSourceMetrics {
-  ObservedRobotStateSourceKind source_kind =
-      ObservedRobotStateSourceKind::kJointState;
+  ObservedRobotStateSourceKind source_kind = ObservedRobotStateSourceKind::kJointState;
   std::string source_id;
   std::uint64_t published_total = 0;
   std::uint64_t incomplete_total = 0;
@@ -125,12 +118,14 @@ class ObservedRobotStatePublication final {
   };
 
   struct SourceLane {
-    explicit SourceLane(ObservedRobotStateSourceConfig source,
-                        std::size_t joint_count);
+    explicit SourceLane(ObservedRobotStateSourceConfig source, std::size_t joint_count);
 
     ObservedRobotStateSourceConfig source;
     std::array<Slot, kSlotsPerSource> slots;
     std::atomic<int> published_slot{-1};
+    // Highest overwritten sequence in this lane. A pinned older slot alone
+    // cannot prove that no intervening invalidation existed at an as-of read.
+    std::atomic<std::uint64_t> retired_sequence{0};
     std::atomic_flag writer = ATOMIC_FLAG_INIT;
     std::atomic<std::uint64_t> published_total{0};
     std::atomic<std::uint64_t> incomplete_total{0};
@@ -167,8 +162,7 @@ class ObservedRobotStatePublication final {
 
    private:
     friend class ObservedRobotStatePublication;
-    ReadView(const ObservedRobotStatePublication* owner,
-             const SourceLane* lane,
+    ReadView(const ObservedRobotStatePublication* owner, const SourceLane* lane,
              const Slot* slot) noexcept;
     void release() noexcept;
 
@@ -177,21 +171,18 @@ class ObservedRobotStatePublication final {
     const Slot* slot_ = nullptr;
   };
 
-  ObservedRobotStatePublication(
-      std::vector<std::string> canonical_joint_names,
-      std::vector<ObservedRobotStateSourceConfig> precedence,
-      std::size_t max_source_joint_count = 256);
+  ObservedRobotStatePublication(std::vector<std::string> canonical_joint_names,
+                                std::vector<ObservedRobotStateSourceConfig> precedence,
+                                std::size_t max_source_joint_count = 256);
   ObservedRobotStatePublication(const ObservedRobotStatePublication&) = delete;
-  ObservedRobotStatePublication& operator=(
-      const ObservedRobotStatePublication&) = delete;
+  ObservedRobotStatePublication& operator=(const ObservedRobotStatePublication&) = delete;
 
-  ObservedRobotStatePublishResult publish(
-      ObservedRobotStateSourceKind source,
-      std::span<const std::string> source_joint_names,
-      std::span<const double> positions_rad,
-      std::span<const double> velocities_rad_s,
-      std::int64_t source_timestamp_ns,
-      std::int64_t received_timestamp_ns) noexcept;
+  ObservedRobotStatePublishResult publish(ObservedRobotStateSourceKind source,
+                                          std::span<const std::string> source_joint_names,
+                                          std::span<const double> positions_rad,
+                                          std::span<const double> velocities_rad_s,
+                                          std::int64_t source_timestamp_ns,
+                                          std::int64_t received_timestamp_ns) noexcept;
 
   /// Select the first fresh, complete source in configured precedence order.
   /// If no such source exists, returns the highest-precedence published sample
@@ -207,32 +198,25 @@ class ObservedRobotStatePublication final {
   [[nodiscard]] ReadView acquire_latest() const noexcept;
   /// NRT value-copy surface for bindings/diagnostics. RT consumers use
   /// acquire() so no allocation or mutable storage crosses the hot path.
-  [[nodiscard]] std::optional<ObservedRobotStateSnapshotDTO> snapshot(
-      std::int64_t now_ns) const;
-  [[nodiscard]] std::optional<ObservedRobotStateSnapshotDTO>
-  snapshot_latest() const;
+  [[nodiscard]] std::optional<ObservedRobotStateSnapshotDTO> snapshot(std::int64_t now_ns) const;
+  [[nodiscard]] std::optional<ObservedRobotStateSnapshotDTO> snapshot_latest() const;
 
   [[nodiscard]] std::span<const std::string> canonical_joint_names() const {
     return canonical_joint_names_;
   }
-  [[nodiscard]] const std::string& joint_order_token() const noexcept {
-    return joint_order_token_;
-  }
+  [[nodiscard]] const std::string& joint_order_token() const noexcept { return joint_order_token_; }
   [[nodiscard]] ObservedRobotStatePublicationMetrics metrics() const noexcept;
-  [[nodiscard]] std::vector<ObservedRobotStateSourceMetrics> source_metrics()
-      const;
+  [[nodiscard]] std::vector<ObservedRobotStateSourceMetrics> source_metrics() const;
   /// Construction-time source identity in authority-precedence order. This
   /// bounded NRT readback lets an enclosing addressed owner prove that an
   /// injected single-writer publication has exactly the adapter's sources;
   /// mutable lane storage remains private.
-  [[nodiscard]] std::vector<ObservedRobotStateSourceConfig> source_configs()
-      const;
+  [[nodiscard]] std::vector<ObservedRobotStateSourceConfig> source_configs() const;
 
  private:
   ReadView acquire_slot(const SourceLane& lane, std::size_t index) const noexcept;
   ReadView acquire_lane(const SourceLane& lane) const noexcept;
-  static std::string make_joint_order_token(
-      std::span<const std::string> joint_names);
+  static std::string make_joint_order_token(std::span<const std::string> joint_names);
 
   std::vector<std::string> canonical_joint_names_;
   std::string joint_order_token_;

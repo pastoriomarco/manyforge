@@ -10,12 +10,13 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from contextlib import suppress
 from dataclasses import dataclass, replace
 from functools import partial
 import json
+import logging
 from pathlib import Path
 import time
+import threading
 from typing import Any, Callable, Iterable
 
 from watchfiles import awatch
@@ -32,11 +33,34 @@ from .control_protocol import (
 from .component_overview import ComponentOverviewFacts
 from .execution_control import ExecutionControlIngress
 from .native import HeadlessApiError, strict_json_object
+from .program_cycle import ProgramCycleFrameDTO
 from .service import HeadlessService
 
 
 _PROGRAM_CONTROL_STATE_SCHEMA = "manyforge.program_control_state.v1"
 _MAXIMUM_ACTIVE_CLIENT_INCIDENTS = CONTROL_MAXIMUM_CLIENTS * 8
+_SOURCE_RETRY_INITIAL_SECONDS = 0.05
+_SOURCE_RETRY_MAX_SECONDS = 1.0
+_LOGGER = logging.getLogger(__name__)
+
+
+async def _drained_owner_read(
+    callback: Callable[..., Any], *, stop: threading.Event | None = None, **kwargs: Any
+) -> Any:
+    """Keep the one physical read alive until teardown can actually drain it.
+
+    Cancelling to_thread's waiter cannot cancel a running native/HTTP call.
+    Shielding and draining it lets the existing lifecycle lock serialize source
+    generations, without another executor, work queue, or detached read.
+    """
+    read = asyncio.create_task(asyncio.to_thread(callback, **kwargs))
+    try:
+        return await asyncio.shield(read)
+    except asyncio.CancelledError:
+        if stop is not None:
+            stop.set()
+        await asyncio.gather(read, return_exceptions=True)
+        raise
 
 
 @dataclass(frozen=True, slots=True)
@@ -313,6 +337,8 @@ class HeadlessControlStateSource:
             "heartbeat_echoes": 0,
             "delayed_transitions": 0,
             "stale_transitions": 0,
+            "source_failures": 0,
+            "incident_recording_failures": 0,
         }
         self._publications = {"critical": 0, "node_progress": 0, "cold": 0}
         self._messages = {
@@ -343,7 +369,11 @@ class HeadlessControlStateSource:
         self._shell: dict[str, Any] | None = None
         self._shell_key: tuple[Any, ...] | None = None
         self._cold_wake: asyncio.Event | None = None
+        self._program_wake: asyncio.Event | None = None
         self._program_source_current = False
+        self._watch_source_current = True
+        self._source_incidents: dict[str, tuple[int, int]] = {}
+        self._incident_recording_failed = False
         self._semantic_reason: str | None = None
 
     @property
@@ -403,15 +433,100 @@ class HeadlessControlStateSource:
         loop = self._loop
         if recorder is None or loop is None:
             return
+        # Copy only fixed scalar references now. The queued recorder must not
+        # substitute a later cycle/scene for the incident-time source facts.
+        record["causal_context"] = self._incident_context()
         callback = partial(self._record_incident_now, recorder, record)
         loop.call_soon(callback)
 
-    @staticmethod
+    def _incident_context(self) -> dict[str, str]:
+        def mapping(value: Any) -> dict:
+            return value if isinstance(value, dict) else {}
+
+        cycle = self._cycle or {}
+        capture = mapping(mapping(cycle.get("run")).get("capture"))
+        runtime = self._facts.runtime if self._facts is not None else None
+        scene = mapping(mapping(mapping(runtime).get("sections")).get("logical_scene"))
+        projection = mapping(mapping(mapping(scene.get("payload")).get("access")).get("active_projection"))
+        scene_revision = mapping(projection.get("scene_revision"))
+        context: dict[str, str] = {
+            "program_source_current": str(self._program_source_current).lower(),
+            "cold_source_current": str(self._watch_source_current).lower(),
+        }
+        for source, names in (
+            (cycle, {key: key for key in ("program_run_id", "program_runner_owner_epoch", "cycle_generation",
+                                         "execution_control_revision", "run_revision", "reset_phase")} | {"state": "cycle_state"}),
+            (capture, {key: key for key in ("program_id", "program_revision", "graph_revision", "retained_bundle_id",
+                                           "program_binding_id", "node_environment_digest")}),
+            (scene, {key: f"scene_{key}" for key in ("source_owner_id", "source_owner_epoch", "source_generation")} |
+                    {"freshness": "scene_source_freshness"}),
+            (scene_revision, {"scene_id": "scene_id", "revision_id": "scene_revision_id", "content_hash": "scene_content_hash"}),
+        ):
+            for name, target in names.items():
+                value = source.get(name)
+                if (isinstance(value, str) and value and len(value.encode("utf-8")) <= 1024) or type(value) is int:
+                    context[target] = str(value)
+        return context
+
     def _record_incident_now(
-        recorder: Callable[..., dict[str, Any]], record: dict[str, Any]
+        self, recorder: Callable[..., dict[str, Any]], record: dict[str, Any]
     ) -> None:
-        with suppress(Exception):
-            recorder(**record)
+        try:
+            result = recorder(**record)
+            if result.get("recorded") is False:
+                raise OSError("bounded historian ingress refused the incident")
+        except Exception:
+            self._diagnostics["incident_recording_failures"] += 1
+            if not self._incident_recording_failed:
+                _LOGGER.exception("Control incident recorder unavailable; trace may be incomplete")
+            self._incident_recording_failed = True
+        else:
+            if self._incident_recording_failed:
+                _LOGGER.info("Control incident recorder recovered")
+            self._incident_recording_failed = False
+
+    def _source_transition(self, source: str, *, failed: bool) -> None:
+        """One bounded episode per upstream source; never a retry event log."""
+        now = self.relative_monotonic_ns(time.monotonic_ns())
+        active = self._source_incidents.get(source)
+        if failed:
+            self._diagnostics["source_failures"] += 1
+            if active is not None:
+                self._source_incidents[source] = (active[0], active[1] + 1)
+                return
+            first, count = now, 1
+            self._source_incidents[source] = (first, count)
+            _LOGGER.warning("Control source unavailable: %s", source)
+        else:
+            if active is None:
+                return
+            first, count = self._source_incidents.pop(source)
+        self.record_incident(
+            incident_id=f"{source}.{first}",
+            incident_kind="control_source_unavailable",
+            phase="activated" if failed else "resolved",
+            control_session_id=self._ingress.receiver_incarnation,
+            client_incarnation="headless-source",
+            source_label=source,
+            reason_code="source_unavailable" if failed else "source_recovered",
+            occurrence_count=count,
+            maximum_delay_ns=None,
+            first_observed_ns=first,
+            last_observed_ns=now,
+        )
+
+    def _invalidate_source(self, source: str) -> None:
+        if source == "program":
+            self._program_source_current = False
+        elif source == "file_watch":
+            self._watch_source_current = False
+            if self._cold_expiry_handle is not None:
+                self._cold_expiry_handle.cancel()
+                self._cold_expiry_handle = None
+        self._source_transition(source, failed=True)
+        self._facts = None
+        for subscription in self._subscriptions:
+            subscription.frame = None
 
     def record_client_incident_transition(
         self,
@@ -483,6 +598,8 @@ class HeadlessControlStateSource:
             self._subscriptions.add(subscription)
             if len(self._subscriptions) == 1:
                 self._cold_wake = asyncio.Event()
+                self._program_wake = asyncio.Event()
+                self._program_wake.set()
                 self._runner_task = loop.create_task(self._run_program_source())
                 self._cold_task = loop.create_task(self._run_cold_assembler())
                 if self._watch_roots:
@@ -522,9 +639,11 @@ class HeadlessControlStateSource:
             self._shell = None
             self._shell_key = None
             self._cold_wake = None
+            self._program_wake = None
             self._watch_keys.clear()
             self._watch_fresh.clear()
             self._program_source_current = False
+            self._watch_source_current = True
             self._semantic_reason = None
             self._loop = None
 
@@ -546,10 +665,9 @@ class HeadlessControlStateSource:
         self.notify_cold()
 
         loop = self._loop
-        if loop is not None and self._runner_url is None:
-            loop.call_soon_threadsafe(
-                lambda: asyncio.create_task(self._read_current_cycle("critical"))
-            )
+        wake = self._program_wake
+        if loop is not None and wake is not None and self._runner_url is None:
+            loop.call_soon_threadsafe(wake.set)
 
     async def close(self) -> None:
         self._closed = True
@@ -592,6 +710,14 @@ class HeadlessControlStateSource:
         """Return cached semantic state without reading or reducing an owner."""
 
         cycle = self._cycle
+        if "program" in self._source_incidents:
+            return ControlSemanticContext(
+                status="unavailable", reason="program_control_source_unavailable"
+            )
+        if not self._watch_source_current:
+            return ControlSemanticContext(
+                status="unavailable", reason="control_file_watch_unavailable"
+            )
         if cycle is None:
             return ControlSemanticContext(
                 status="synchronizing",
@@ -634,6 +760,7 @@ class HeadlessControlStateSource:
             and facts is not None
             and self._shell is not None
             and self._program_source_current
+            and self._watch_source_current
             and self._semantic_reason is None
             and facts.program_cycle == cycle
         )
@@ -660,19 +787,32 @@ class HeadlessControlStateSource:
             subscription.frame = frame
             subscription.wake.set()
 
-    async def _read_current_cycle(self, event_class: str) -> None:
+    async def _read_current_cycle(self, event_class: str) -> bool:
         try:
-            cycle = await asyncio.to_thread(self._service.program_cycle_status)
+            cycle = await _drained_owner_read(self._service.program_cycle_status)
+            self._accept_cycle(cycle, event_class)
+            return True
+        except (HeadlessApiError, OSError, ValueError):
+            self._invalidate_source("program")
+            return False
         except Exception:
-            self._program_source_current = False
-            return
-        self._program_source_current = True
-        self._accept_cycle(cycle, event_class)
+            self._invalidate_source("program")
+            _LOGGER.exception("Unexpected Program control read failure")
+            raise
 
     def _accept_cycle(self, cycle: dict[str, Any], event_class: str) -> None:
         previous = self._cycle
-        if previous == cycle:
+        recovering = not self._program_source_current
+        if previous == cycle and not recovering:
             return
+        # Validate before replacing the last coherent owner fact. A malformed
+        # identity must not poison recovery or publish new command freshness.
+        ProgramCycleFrameDTO.model_validate(cycle)
+        if cycle["run"] is not None:
+            HeadlessService._validate_program_run_snapshot(cycle["run"])
+        build_control_projection(cycle, self._ingress)
+        self._program_source_current = True
+        self._source_transition("program", failed=False)
         self._cycle = cycle
         if self._facts is None:
             self.notify_cold()
@@ -701,9 +841,20 @@ class HeadlessControlStateSource:
 
     async def _run_program_source(self) -> None:
         if self._runner_url is None:
-            await self._read_current_cycle("critical")
+            assert self._program_wake is not None
+            wake = self._program_wake
+            retry_seconds = _SOURCE_RETRY_INITIAL_SECONDS
+            while self._subscriptions and not self._closed:
+                await wake.wait()
+                wake.clear()
+                if await self._read_current_cycle("critical"):
+                    retry_seconds = _SOURCE_RETRY_INITIAL_SECONDS
+                else:
+                    await asyncio.sleep(retry_seconds)
+                    retry_seconds = min(retry_seconds * 2, _SOURCE_RETRY_MAX_SECONDS)
+                    wake.set()
             return
-        retry_seconds = 0.05
+        retry_seconds = _SOURCE_RETRY_INITIAL_SECONDS
         while self._subscriptions and not self._closed:
             try:
                 async with connect_websocket(
@@ -713,7 +864,6 @@ class HeadlessControlStateSource:
                     close_timeout=0.25,
                 ) as websocket:
                     previous_sequence = 0
-                    retry_seconds = 0.05
                     async for message in websocket:
                         if not isinstance(message, str):
                             raise ValueError("Program control frame is not text")
@@ -743,7 +893,6 @@ class HeadlessControlStateSource:
                         cycle = value.get("program_cycle")
                         if not isinstance(cycle, dict):
                             raise ValueError("Program control state omitted its cycle")
-                        self._program_source_current = True
                         previous = self._cycle
                         event_class = (
                             "node_progress"
@@ -753,15 +902,22 @@ class HeadlessControlStateSource:
                             else "critical"
                         )
                         self._accept_cycle(cycle, event_class)
+                        retry_seconds = _SOURCE_RETRY_INITIAL_SECONDS
+                # A clean peer close also invalidates the cached authority.
+                self._invalidate_source("program")
             except asyncio.CancelledError:
                 raise
-            except (ConnectionClosed, OSError, TimeoutError, ValueError):
+            except (ConnectionClosed, OSError, TimeoutError, ValueError, HeadlessApiError):
                 # Reconnection is source recovery, never command replay. Keep
                 # the newest visual state but stop issuing new frames until a
                 # current owner snapshot arrives.
-                self._program_source_current = False
-                await asyncio.sleep(retry_seconds)
-                retry_seconds = min(retry_seconds * 2, 1.0)
+                self._invalidate_source("program")
+            except Exception:
+                self._invalidate_source("program")
+                _LOGGER.exception("Unexpected Program control source failure")
+                raise
+            await asyncio.sleep(retry_seconds)
+            retry_seconds = min(retry_seconds * 2, _SOURCE_RETRY_MAX_SECONDS)
 
     async def _capture_facts(self) -> ComponentOverviewFacts:
         cycle = self._cycle
@@ -769,8 +925,11 @@ class HeadlessControlStateSource:
             raise ControlStateUnavailableError(
                 "program_control_state_synchronizing"
             )
-        facts = await asyncio.to_thread(
+        stop = threading.Event()
+        facts = await _drained_owner_read(
             self._service.component_overview_facts,
+            stop=stop,
+            cancelled=stop.is_set,
             program_cycle=cycle,
         )
         self._diagnostics["owner_reads"] += 8
@@ -818,6 +977,7 @@ class HeadlessControlStateSource:
     async def _run_cold_assembler(self) -> None:
         assert self._cold_wake is not None
         wake = self._cold_wake
+        retry_seconds = _SOURCE_RETRY_INITIAL_SECONDS
         while self._subscriptions and not self._closed:
             await wake.wait()
             wake.clear()
@@ -826,20 +986,43 @@ class HeadlessControlStateSource:
                 facts, shell, key = await self._assemble_shell()
             except ControlStateUnavailableError as error:
                 self._semantic_reason = str(error)
+                if self._cycle is not None:
+                    # Normal owner read failures are captured as missing facts
+                    # by HeadlessService. They are an incident too, not just
+                    # failures that happen to escape as an I/O exception.
+                    self._invalidate_source("cold_projection")
+                await asyncio.sleep(retry_seconds)
+                retry_seconds = min(retry_seconds * 2, _SOURCE_RETRY_MAX_SECONDS)
+                wake.set()
+                continue
+            except (HeadlessApiError, OSError, ValueError):
+                self._semantic_reason = "control_projection_source_unavailable"
+                self._invalidate_source("cold_projection")
+                await asyncio.sleep(retry_seconds)
+                retry_seconds = min(retry_seconds * 2, _SOURCE_RETRY_MAX_SECONDS)
+                wake.set()
                 continue
             except Exception:
                 self._semantic_reason = "control_projection_assembly_failed"
+                self._invalidate_source("cold_projection")
+                _LOGGER.exception("Unexpected control projection failure")
+                raise
+            if not self._program_source_current or not self._watch_source_current:
                 continue
-            changed = key != self._shell_key
+            changed = key != self._shell_key or self._facts is None
             self._facts = facts
             self._shell = shell
             self._shell_key = key
             self._diagnostics["reductions"] += 1
             self._semantic_reason = None
+            retry_seconds = _SOURCE_RETRY_INITIAL_SECONDS
+            self._source_transition("cold_projection", failed=False)
             if changed or self._generation == 0:
                 self._publish("cold")
             else:
                 self._diagnostics["unchanged_reductions"] += 1
+            if self._watch_source_current:
+                self._source_transition("file_watch", failed=False)
 
     def _refresh_file_watches(self, *, notify: bool) -> None:
         """Collapse source pulses and wake only on meaning/freshness changes."""
@@ -888,16 +1071,29 @@ class HeadlessControlStateSource:
             self.notify_cold()
 
     async def _run_file_wakes(self) -> None:
-        try:
-            self._refresh_file_watches(notify=False)
-            async for _changes in awatch(*self._watch_roots):
-                if not self._subscriptions or self._closed:
-                    return
-                self._refresh_file_watches(notify=True)
-        except asyncio.CancelledError:
-            raise
-        except OSError:
-            return
+        retry_seconds = _SOURCE_RETRY_INITIAL_SECONDS
+        while self._subscriptions and not self._closed:
+            try:
+                self._refresh_file_watches(notify=False)
+                self._watch_source_current = True
+                self.notify_cold()  # Recovery captures current owners once.
+                async for _changes in awatch(*self._watch_roots):
+                    if not self._subscriptions or self._closed:
+                        return
+                    self._refresh_file_watches(notify=True)
+                    self._source_transition("file_watch", failed=False)
+                    retry_seconds = _SOURCE_RETRY_INITIAL_SECONDS
+                self._invalidate_source("file_watch")
+            except asyncio.CancelledError:
+                raise
+            except OSError:
+                self._invalidate_source("file_watch")
+            except Exception:
+                self._invalidate_source("file_watch")
+                _LOGGER.exception("Unexpected control file-watch failure")
+                raise
+            await asyncio.sleep(retry_seconds)
+            retry_seconds = min(retry_seconds * 2, _SOURCE_RETRY_MAX_SECONDS)
 
 
 __all__ = [

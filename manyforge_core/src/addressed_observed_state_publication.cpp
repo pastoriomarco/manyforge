@@ -155,9 +155,7 @@ AddressedObservedStatePublication::AddressedObservedStatePublication(
       }()),
       publication_(config_.query_context.joint_names, config_.source_precedence,
                    config_.maximum_source_resource_count),
-      current_query_context_(&config_.query_context) {
-  retained_route_contexts_.reserve(4096U);
-}
+      current_query_context_(config_.query_context) {}
 
 Result<void> AddressedObservedStatePublication::rebind_route_context(
     ObservedStateQueryContextDTO query_context, const std::int64_t transition_time_ns) {
@@ -171,35 +169,30 @@ Result<void> AddressedObservedStatePublication::rebind_route_context(
       return Result<void>::Err(state_error("observed_state_route_rebind_not_permitted"));
     }
     std::lock_guard lock(route_context_mutex_);
-    const auto* current = current_query_context_.load(std::memory_order_acquire);
-    if (query_context == *current) {
+    if (query_context == current_query_context_) {
       return Result<void>::Ok();
     }
-    if (!same_physical_query_context(*current, query_context) ||
-        retained_route_contexts_.size() >= 4096U) {
+    if (!same_physical_query_context(current_query_context_, query_context)) {
       return Result<void>::Err(state_error("observed_state_route_rebind_identity_mismatch"));
     }
     auto latest = publication_.acquire_latest();
     if (!latest || !latest.complete() || !latest.velocities_complete()) {
-      return Result<void>::Err(
-          state_error("observed_state_route_rebind_source_unavailable"));
+      return Result<void>::Err(state_error("observed_state_route_rebind_source_unavailable"));
+    }
+    if (!validate_observed_state_snapshot(make_snapshot(latest, current_query_context_),
+                                          transition_time_ns)
+             .ok()) {
+      return Result<void>::Err(state_error("observed_state_route_rebind_source_not_current"));
     }
 
-    retained_route_contexts_.push_back(
-        std::make_unique<const ObservedStateQueryContextDTO>(
-            std::move(query_context)));
     const auto seeded =
-        publication_.publish(latest.source_kind(), latest.joint_names(),
-                             latest.positions_rad(), latest.velocities_rad_s(),
-                             transition_time_ns, transition_time_ns);
-    if (!seeded.published || !seeded.complete ||
-        !seeded.velocities_complete) {
-      retained_route_contexts_.pop_back();
-      return Result<void>::Err(
-          state_error("observed_state_route_rebind_publish_failed"));
+        publication_.publish(latest.source_kind(), latest.joint_names(), latest.positions_rad(),
+                             latest.velocities_rad_s(), transition_time_ns, transition_time_ns);
+    if (!seeded.published || !seeded.complete || !seeded.velocities_complete) {
+      return Result<void>::Err(state_error("observed_state_route_rebind_publish_failed"));
     }
-    current_query_context_.store(retained_route_contexts_.back().get(),
-                                 std::memory_order_release);
+    current_query_context_ = std::move(query_context);
+    context_first_sequence_ = seeded.sequence;
     return Result<void>::Ok();
   } catch (const std::exception&) {
     return Result<void>::Err(state_error("observed_state_route_rebind_capacity_unavailable"));
@@ -208,18 +201,17 @@ Result<void> AddressedObservedStatePublication::rebind_route_context(
   }
 }
 
-const ObservedStateQueryContextDTO& AddressedObservedStatePublication::query_context()
-    const noexcept {
-  return *current_query_context_.load(std::memory_order_acquire);
+ObservedStateQueryContextDTO AddressedObservedStatePublication::query_context() const {
+  std::lock_guard lock(route_context_mutex_);
+  return current_query_context_;
 }
 
 ObservedRobotStatePublishResult AddressedObservedStatePublication::publish(
     ObservedStateSourceKind source, std::span<const std::string> source_joint_names,
     std::span<const double> positions_si, std::span<const double> velocities_si,
     std::int64_t source_timestamp_ns, std::int64_t received_timestamp_ns) noexcept {
-  return publication_.publish(numeric_source_kind(source), source_joint_names,
-                              positions_si, velocities_si, source_timestamp_ns,
-                              received_timestamp_ns);
+  return publication_.publish(numeric_source_kind(source), source_joint_names, positions_si,
+                              velocities_si, source_timestamp_ns, received_timestamp_ns);
 }
 
 ObservedStateSnapshotDTO AddressedObservedStatePublication::make_snapshot(
@@ -283,33 +275,36 @@ ObservedStatePublicationDTO AddressedObservedStatePublication::make_publication(
     const ObservedRobotStatePublication::ReadView& view,
     const ObservedStateQueryContextDTO& context) const {
   auto snapshot = make_snapshot(view, context);
-  return ObservedStatePublicationDTO{
-      context.controllable_component_id,
-      context.command_target_id,
-      context.control_domain_id,
-      context.control_domain_revision,
-      context.control_binding_id,
-      context.control_binding_revision,
-      context.controller_topology_id,
-      context.topology_revision,
-      context.control_route_id,
-      context.active_control_configuration_id,
-      context.active_control_configuration_generation,
-      context.provider_instance_id,
-      context.provider_manifest_id,
-      context.provider_manifest_revision,
-      context.state_authority_id,
-      context.state_authority_class,
-      context.runtime_epoch,
-      config_.authority_generation,
-      view.sequence(),
-      std::move(snapshot),
-      view.received_timestamp_ns()};
+  return ObservedStatePublicationDTO{context.controllable_component_id,
+                                     context.command_target_id,
+                                     context.control_domain_id,
+                                     context.control_domain_revision,
+                                     context.control_binding_id,
+                                     context.control_binding_revision,
+                                     context.controller_topology_id,
+                                     context.topology_revision,
+                                     context.control_route_id,
+                                     context.active_control_configuration_id,
+                                     context.active_control_configuration_generation,
+                                     context.provider_instance_id,
+                                     context.provider_manifest_id,
+                                     context.provider_manifest_revision,
+                                     context.state_authority_id,
+                                     context.state_authority_class,
+                                     context.runtime_epoch,
+                                     config_.authority_generation,
+                                     view.sequence(),
+                                     std::move(snapshot),
+                                     view.received_timestamp_ns()};
 }
 
 Result<ObservedStateSnapshotDTO> AddressedObservedStatePublication::current_state(
     const ObservedStateQueryContextDTO& context, std::int64_t now_ns) const {
-  const auto& current = query_context();
+  std::unique_lock lock(route_context_mutex_, std::try_to_lock);
+  if (!lock.owns_lock()) {
+    return Result<ObservedStateSnapshotDTO>::Err(state_error("observed_state_route_context_busy"));
+  }
+  const auto& current = current_query_context_;
   if (context != current) {
     return Result<ObservedStateSnapshotDTO>::Err(
         state_error("observed_state_query_context_mismatch"));
@@ -326,6 +321,10 @@ Result<ObservedStateSnapshotDTO> AddressedObservedStatePublication::current_stat
   if (!view) {
     return Result<ObservedStateSnapshotDTO>::Err(state_error("observed_state_not_published"));
   }
+  if (view.sequence() < context_first_sequence_) {
+    return Result<ObservedStateSnapshotDTO>::Err(
+        state_error("observed_state_context_not_current_at_evaluation_time"));
+  }
   auto snapshot = make_snapshot(view, current);
   if (auto valid = validate_observed_state_snapshot(snapshot, now_ns); !valid.ok()) {
     return Result<ObservedStateSnapshotDTO>::Err(valid.error());
@@ -336,7 +335,12 @@ Result<ObservedStateSnapshotDTO> AddressedObservedStatePublication::current_stat
 Result<ObservedStatePublicationDTO> AddressedObservedStatePublication::publication(
     const ControlBindingId& control_binding_id,
     const ControlBindingRevision& control_binding_revision) const {
-  const auto& context = query_context();
+  std::unique_lock lock(route_context_mutex_, std::try_to_lock);
+  if (!lock.owns_lock()) {
+    return Result<ObservedStatePublicationDTO>::Err(
+        state_error("observed_state_route_context_busy"));
+  }
+  const auto& context = current_query_context_;
   if (control_binding_id != context.control_binding_id ||
       control_binding_revision != context.control_binding_revision) {
     return Result<ObservedStatePublicationDTO>::Err(
@@ -346,15 +350,22 @@ Result<ObservedStatePublicationDTO> AddressedObservedStatePublication::publicati
   if (!view) {
     return Result<ObservedStatePublicationDTO>::Err(state_error("observed_state_not_published"));
   }
-  return Result<ObservedStatePublicationDTO>::Ok(
-      make_publication(view, context));
+  if (view.sequence() < context_first_sequence_) {
+    return Result<ObservedStatePublicationDTO>::Err(
+        state_error("observed_state_context_not_current_at_evaluation_time"));
+  }
+  return Result<ObservedStatePublicationDTO>::Ok(make_publication(view, context));
 }
 
 Result<ObservedStatePublicationDTO> AddressedObservedStatePublication::publication_at(
     const ControlBindingId& control_binding_id,
-    const ControlBindingRevision& control_binding_revision,
-    std::int64_t now_ns) const {
-  const auto& context = query_context();
+    const ControlBindingRevision& control_binding_revision, std::int64_t now_ns) const {
+  std::unique_lock lock(route_context_mutex_, std::try_to_lock);
+  if (!lock.owns_lock()) {
+    return Result<ObservedStatePublicationDTO>::Err(
+        state_error("observed_state_route_context_busy"));
+  }
+  const auto& context = current_query_context_;
   if (control_binding_id != context.control_binding_id ||
       control_binding_revision != context.control_binding_revision) {
     return Result<ObservedStatePublicationDTO>::Err(
@@ -365,13 +376,12 @@ Result<ObservedStatePublicationDTO> AddressedObservedStatePublication::publicati
         state_error("observed_state_evaluation_time_invalid"));
   }
   auto view = publication_.acquire_as_of(now_ns);
-  if (!view) {
+  if (!view || view.sequence() < context_first_sequence_) {
     return Result<ObservedStatePublicationDTO>::Err(
         state_error("observed_state_unavailable_at_evaluation_time"));
   }
   auto result = make_publication(view, context);
-  if (auto valid = validate_observed_state_publication(result, now_ns);
-      !valid.ok()) {
+  if (auto valid = validate_observed_state_publication(result, now_ns); !valid.ok()) {
     return Result<ObservedStatePublicationDTO>::Err(valid.error());
   }
   return Result<ObservedStatePublicationDTO>::Ok(std::move(result));

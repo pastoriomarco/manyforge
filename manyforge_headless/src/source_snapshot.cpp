@@ -101,11 +101,11 @@ CanonicalValue Number(const std::uint64_t value, const std::string_view label) {
 }
 
 CanonicalValue Number(const std::int64_t value, const std::string_view label) {
-  if (value < 0 || static_cast<std::uint64_t>(value) > kMaximumSafeInteger) {
+  if (value < 0) {
     throw std::invalid_argument(std::string(label) +
-                                " must be a nonnegative safe integer");
+                                " must be a nonnegative int64");
   }
-  return CanonicalValue(static_cast<double>(value));
+  return content_identity::nonnegative_int64_value(value);
 }
 
 CanonicalValue SemanticValue(const std::string &source_owner_kind,
@@ -359,7 +359,6 @@ bool SourceSnapshot::valid() const noexcept {
          bounded_printable(source_owner_id) &&
          bounded_printable(source_owner_epoch) && source_generation != 0U &&
          source_generation <= kMaximumSafeInteger && observed_at_ns >= 0 &&
-         static_cast<std::uint64_t>(observed_at_ns) <= kMaximumSafeInteger &&
          content_identity::is_sha256_digest(semantic_content_digest) &&
          content_identity::is_sha256_digest(record_digest);
 }
@@ -438,16 +437,17 @@ SourceSnapshotCodec::Decode(const std::string_view canonical_bytes) {
   }
 
   const auto generation = RequiredUnsigned(root, "source_generation", true);
-  const auto observed = RequiredUnsigned(root, "observed_at_ns", false);
-  if (observed >
-      static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+  std::int64_t observed{};
+  try {
+    observed = content_identity::parse_nonnegative_int64(RequiredMember(root, "observed_at_ns"));
+  } catch (const content_identity::CanonicalValueError&) {
     throw SourceSnapshotIntegrityError(
-        "source snapshot observed_at_ns exceeds int64");
+        "source snapshot observed_at_ns is not exact nonnegative int64");
   }
   auto result = Create(RequiredString(root, "source_owner_kind"),
                        RequiredString(root, "source_owner_id"),
                        RequiredString(root, "source_owner_epoch"), generation,
-                       static_cast<std::int64_t>(observed),
+                       observed,
                        RequiredMember(root, "payload"));
   if (result.semantic_content_digest !=
           RequiredString(root, "semantic_content_digest") ||

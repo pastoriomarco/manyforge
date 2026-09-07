@@ -51,9 +51,8 @@ void ValidateSafeInteger(const std::uint64_t value,
 
 void ValidateSafeInteger(const std::int64_t value,
                          const std::string_view label) {
-  Require(value >= 0 &&
-              static_cast<std::uint64_t>(value) <= kMaximumSafeInteger,
-          std::string(label) + " must be a nonnegative I-JSON safe integer");
+  Require(value >= 0,
+          std::string(label) + " must be a nonnegative int64");
 }
 
 void ValidateIdentity(const SceneRuntimeIdentity &identity) {
@@ -109,7 +108,7 @@ CanonicalValue Number(const std::uint64_t value, const std::string_view label,
 
 CanonicalValue Number(const std::int64_t value, const std::string_view label) {
   ValidateSafeInteger(value, label);
-  return CanonicalValue(static_cast<double>(value));
+  return content_identity::nonnegative_int64_value(value);
 }
 
 CanonicalValue OptionalString(const std::optional<std::string> &value) {
@@ -285,8 +284,7 @@ bool PoseSourceObservation::valid() const noexcept {
   return key.valid() && IsBoundedText(source_epoch, kMaximumIdentifierBytes) &&
          source_epoch_order <= kMaximumSafeInteger &&
          source_sequence <= kMaximumSafeInteger && observed_at_ns >= 0 &&
-         expires_at_ns >= observed_at_ns &&
-         static_cast<std::uint64_t>(expires_at_ns) <= kMaximumSafeInteger;
+         expires_at_ns >= observed_at_ns;
 }
 
 SceneRuntimeStateOwner::SceneRuntimeStateOwner(

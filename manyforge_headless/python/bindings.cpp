@@ -187,8 +187,7 @@ public:
                     std::optional<std::string> owner_epoch,
                     const std::uint64_t freshness_milliseconds,
                     const std::size_t historian_queue_capacity,
-                    const std::size_t historian_record_retention,
-                    const std::size_t mutation_replay_capacity)
+                    const std::size_t historian_record_retention)
       : core_(std::make_unique<HeadlessApiCore>(HeadlessApiCoreConfig{
             std::move(projection_root),
             std::move(install_root),
@@ -210,7 +209,6 @@ public:
             },
             historian_queue_capacity,
             historian_record_retention,
-            mutation_replay_capacity,
         })) {}
 
   std::string RuntimeSnapshot() {
@@ -433,23 +431,36 @@ public:
     });
   }
 
-  std::string HistorySummary(const std::optional<std::int64_t> start_ns,
+  std::string HistoryQuery(const std::optional<std::int64_t> start_ns,
                              const std::optional<std::int64_t> end_ns,
                              const std::vector<std::string> &components,
                              const std::vector<std::string> &event_types,
                              const std::optional<std::uint64_t> before_sequence,
-                             const std::size_t limit) {
+                             const std::size_t limit,
+                             const std::optional<std::int64_t> start_utc_ns,
+                             const std::optional<std::int64_t> end_utc_ns,
+                             const std::vector<std::string> &severities,
+                             const std::map<std::string, std::string> &correlations,
+                             const std::optional<std::string> &alarm_phase,
+                             const std::string &search,
+                             const std::optional<std::string> &clock_owner,
+                             const bool full_records) {
     HistorianQuery query{
         start_ns,
         end_ns,
         std::set<std::string>(components.begin(), components.end()),
         std::set<std::string>(event_types.begin(), event_types.end()),
         before_sequence,
-        limit};
+        limit, start_utc_ns, end_utc_ns, std::set<std::string>(severities.begin(), severities.end()), correlations, alarm_phase, search, clock_owner};
     py::gil_scoped_release release;
-    return Invoke([this, query = std::move(query)]() {
-      return core_->HistorySummaryPage(query);
+    return Invoke([this, query = std::move(query), full_records]() {
+      return core_->HistoryQueryPage(query, full_records);
     });
+  }
+
+  std::string HistoryDiscovery(const std::string &kind, const std::string &after, std::size_t limit) {
+    py::gil_scoped_release release;
+    return Invoke([&] { return core_->HistoryDiscovery(kind, after, limit); });
   }
 
   std::string HistorianHealth() {
@@ -471,7 +482,8 @@ public:
                        const std::uint64_t occurrence_count,
                        const std::optional<std::uint64_t> maximum_delay_ns,
                        const std::uint64_t first_observed_ns,
-                       const std::uint64_t last_observed_ns) {
+                       const std::uint64_t last_observed_ns,
+                       std::map<std::string, std::string> causal_context) {
     py::gil_scoped_release release;
     return Invoke(
         [this, incident_id = std::move(incident_id),
@@ -480,13 +492,14 @@ public:
          client_incarnation = std::move(client_incarnation),
          source_label = std::move(source_label),
          reason_code = std::move(reason_code), occurrence_count,
-         maximum_delay_ns, first_observed_ns, last_observed_ns]() mutable {
+         maximum_delay_ns, first_observed_ns, last_observed_ns,
+         causal_context = std::move(causal_context)]() mutable {
           return core_->RecordClientIncident(
               std::move(incident_id), std::move(incident_kind),
               std::move(phase), std::move(control_session_id),
               std::move(client_incarnation), std::move(source_label),
               std::move(reason_code), occurrence_count, maximum_delay_ns,
-              first_observed_ns, last_observed_ns);
+              first_observed_ns, last_observed_ns, std::move(causal_context));
         });
   }
 
@@ -647,7 +660,7 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
                     std::string, std::string, std::string, std::string,
                     std::string, std::vector<std::string>, std::string,
                     std::optional<std::string>, std::uint64_t, std::size_t,
-                    std::size_t, std::size_t>(),
+                    std::size_t>(),
            py::arg("projection_root"), py::arg("install_root"),
            py::arg("artifact_root"), py::arg("program_selection_state_root"),
            py::arg("node_catalog_path"),
@@ -657,8 +670,7 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
            py::arg("owner_epoch") = std::nullopt,
            py::arg("freshness_milliseconds") = 2000U,
            py::arg("historian_queue_capacity") = 1024U,
-           py::arg("historian_record_retention") = 100000U,
-           py::arg("mutation_replay_capacity") = 4096U)
+           py::arg("historian_record_retention") = 100000U)
       .def("runtime_snapshot", &HeadlessApiBridge::RuntimeSnapshot)
       .def("node_environment_projection",
            &HeadlessApiBridge::NodeEnvironmentProjection)
@@ -721,19 +733,27 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
            py::arg("components") = std::vector<std::string>{},
            py::arg("event_types") = std::vector<std::string>{},
            py::arg("before_sequence") = std::nullopt, py::arg("limit") = 1000U)
-      .def("history_summary", &HeadlessApiBridge::HistorySummary,
+      .def("history_query", &HeadlessApiBridge::HistoryQuery,
            py::arg("start_ns") = std::nullopt, py::arg("end_ns") = std::nullopt,
            py::arg("components") = std::vector<std::string>{},
            py::arg("event_types") = std::vector<std::string>{},
-           py::arg("before_sequence") = std::nullopt, py::arg("limit") = 32U)
+           py::arg("before_sequence") = std::nullopt, py::arg("limit") = 32U,
+           py::arg("start_utc_ns") = std::nullopt, py::arg("end_utc_ns") = std::nullopt,
+           py::arg("severities") = std::vector<std::string>{},
+           py::arg("correlations") = std::map<std::string, std::string>{},
+           py::arg("alarm_phase") = std::nullopt, py::arg("search") = "",
+           py::arg("clock_owner") = std::nullopt, py::arg("full_records") = false)
       .def("history_detail", &HeadlessApiBridge::HistoryDetail,
            py::arg("sequence"))
+      .def("history_discovery", &HeadlessApiBridge::HistoryDiscovery,
+           py::arg("kind"), py::arg("after") = "", py::arg("limit") = 32U)
       .def("record_client_incident", &HeadlessApiBridge::RecordClientIncident,
            py::arg("incident_id"), py::arg("incident_kind"), py::arg("phase"),
            py::arg("control_session_id"), py::arg("client_incarnation"),
            py::arg("source_label"), py::arg("reason_code"),
            py::arg("occurrence_count"), py::arg("maximum_delay_ns"),
-           py::arg("first_observed_ns"), py::arg("last_observed_ns"))
+           py::arg("first_observed_ns"), py::arg("last_observed_ns"),
+           py::arg("causal_context") = std::map<std::string, std::string>{})
       .def("historian_health", &HeadlessApiBridge::HistorianHealth)
       .def("commit_program_model_attempt",
            &HeadlessApiBridge::CommitProgramModelAttempt,

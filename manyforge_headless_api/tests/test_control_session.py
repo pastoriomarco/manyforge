@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import json
+import hashlib
 import threading
+from types import SimpleNamespace
 from typing import Any
 
 from fastapi import WebSocketDisconnect
@@ -35,6 +38,9 @@ from manyforge_headless_api.control_state import (
 )
 from manyforge_headless_api.component_overview import ComponentOverviewFacts
 from manyforge_headless_api.execution_control import ExecutionControlIngress
+from manyforge_headless_api.execution_control import ExecutionControlBusyError, ExecutionControlLane
+from manyforge_headless_api.service import HeadlessService
+from manyforge_headless_api import control_state as control_state_module
 
 
 def _cycle() -> dict[str, Any]:
@@ -45,6 +51,15 @@ def _cycle() -> dict[str, Any]:
         "state": "idle_after_reset",
         "program_run_id": None,
         "run_revision": None,
+        "node_status_revision": None,
+        "runtime_control_revision": None,
+        "run": None,
+        "runtime_controls": None,
+        "recovery_offer": None,
+        "cycle_claim_generation": None,
+        "terminal_or_settlement_reference": None,
+        "reset_phase": None,
+        "current_command_kind": None,
         "allowed_commands": [
             {
                 "command_kind": "program_run",
@@ -58,6 +73,30 @@ def _cycle() -> dict[str, Any]:
         "causal_client_sequence": None,
         "failure": None,
     }
+
+
+def _running_cycle(node_revision: int) -> dict[str, Any]:
+    digest = "sha256:" + "a" * 64
+    capture = {
+        key: digest for key in (
+            "applied_record_digest", "scenario_catalog_revision", "program_revision",
+            "program_binding_id", "retained_bundle_id", "graph_revision", "node_environment_digest",
+        )
+    }
+    capture.update({
+        "schema_version": "manyforge.program_run_capture.v1", "program_run_id": "run.1",
+        "scenario_id": "pick", "program_id": "program.pick", "node_policies": [],
+        "node_policy_digest": "sha256:" + hashlib.sha256(b"[]").hexdigest(),
+        "owner_identities": [{"owner_role": "program_runner", "owner_id": "runner", "owner_epoch": "runner.1"}],
+    })
+    run = {
+        "schema_version": "manyforge.program_run_status.v2", "owner_id": "runner", "owner_epoch": "runner.1",
+        "run_revision": 1, "capture": capture, "state": "running", "tree_status": "running",
+        "node_status_revision": node_revision, "node_statuses": {"root": "running"},
+        "active_operation_count": 1, "reason_code": None, "message": "",
+    }
+    return {**_cycle(), "state": "running", "program_run_id": "run.1", "cycle_claim_generation": 1,
+            "run": run, "run_revision": 1, "node_status_revision": node_revision}
 
 
 def _ingress(stamps: list[Any]) -> ExecutionControlIngress:
@@ -847,6 +886,28 @@ def test_delayed_and_stale_heartbeat_are_one_sparse_incident_episode() -> None:
             now_ns + CONTROL_HEARTBEAT_STALE_NS + 2,
             CONTROL_HEARTBEAT_STALE_NS + 2,
         )
+        assert len(source.incidents) == 2  # The late echo is not recovery.
+        session._challenge_issued_ns = None  # noqa: SLF001
+        session._delay_level = 0  # noqa: SLF001
+        # Consecutive delayed challenges join the same two bounded episodes.
+        for index in range(2, 102):
+            issued = now_ns + index * 2_000_000_000
+            assert session._next_heartbeat(issued) is not None  # noqa: SLF001
+            session._classify_outstanding_heartbeat(  # noqa: SLF001
+                issued + CONTROL_HEARTBEAT_STALE_NS + 1
+            )
+            session._resolve_heartbeat_incidents(  # noqa: SLF001
+                issued + CONTROL_HEARTBEAT_STALE_NS + 2,
+                CONTROL_HEARTBEAT_STALE_NS + 2,
+            )
+            session._last_echoed_challenge = index  # noqa: SLF001
+            session._challenge_issued_ns = None  # noqa: SLF001
+            session._delay_level = 0  # noqa: SLF001
+        assert len(source.incidents) == 2
+        assert len(session._server_incidents) == 2  # noqa: SLF001
+        session._resolve_heartbeat_incidents(  # noqa: SLF001
+            now_ns + 205_000_000_000, 10_000_000
+        )
         assert [
             (event["incident_kind"], event["phase"])
             for event in source.incidents
@@ -856,7 +917,13 @@ def test_delayed_and_stale_heartbeat_are_one_sparse_incident_episode() -> None:
             ("control_delayed", "resolved"),
             ("control_stale", "resolved"),
         ]
-        assert source.delay_transitions == [False, True]
+        assert source.delay_transitions == [False, True] * 101
+        for activated, resolved in zip(source.incidents[:2], source.incidents[2:]):
+            assert resolved["incident_id"] == activated["incident_id"]
+            assert resolved["first_observed_ns"] == activated["first_observed_ns"]
+            assert resolved["occurrence_count"] == 101
+            assert resolved["maximum_delay_ns"] == CONTROL_HEARTBEAT_STALE_NS + 2
+        assert not session._server_incidents  # noqa: SLF001
     finally:
         ingress.close()
 
@@ -1158,6 +1225,225 @@ def test_no_control_client_creates_no_tasks_reads_or_timers() -> None:
     assert stamps == []
 
 
+@pytest.mark.parametrize("malformed", [
+    {"state": "running"},
+    {**_cycle(), "node_status_revision": 0},
+    {key: value for key, value in _cycle().items() if key != "runtime_controls"},
+    {**_cycle(), "run_revision": 1},
+    {**_cycle(), "runtime_control_revision": 1},
+    *[{**_running_cycle(1), "run": {**_running_cycle(1)["run"], field: value}}
+      for field, value in (("state", []), ("tree_status", {}), ("node_statuses", {"root": []}))],
+])
+def test_program_source_recovers_same_current_cycle_after_malformed_identity(monkeypatch, malformed) -> None:
+    async def exercise() -> None:
+        ingress = _ingress([])
+        requests: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        attempts: asyncio.Queue[int] = asyncio.Queue()
+        count = 0
+
+        class Upstream:
+            async def __aenter__(self):
+                nonlocal count
+                count += 1
+                self.sequence = 0
+                attempts.put_nowait(count)
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                cycle = await requests.get()
+                self.sequence += 1
+                return json.dumps({"schema_version": "manyforge.program_control_state.v1",
+                                   "server_sequence": str(self.sequence), "program_cycle": cycle})
+
+        monkeypatch.setattr(control_state_module, "connect_websocket", lambda *_a, **_k: Upstream())
+        monkeypatch.setattr(control_state_module, "_SOURCE_RETRY_INITIAL_SECONDS", 0)
+        source = HeadlessControlStateSource(
+            SimpleNamespace(component_overview_facts=lambda *, program_cycle, cancelled=None: _facts_for_cycle(program_cycle)),
+            ingress, program_runner_websocket_url="ws://runner.test/state",
+        )
+        first = await source.subscribe()
+        second = await source.subscribe()
+        try:
+            assert await asyncio.wait_for(attempts.get(), 1) == 1
+            requests.put_nowait(_cycle())
+            await asyncio.wait_for(first.wake.wait(), 1)
+            source.take(first)
+            source.take(second)
+            # A new connection containing a bad identity invalidates semantics
+            # without dropping either browser or poisoning the cached cycle.
+            requests.put_nowait(malformed)
+            assert await asyncio.wait_for(attempts.get(), 1) == 2
+            assert source.semantic_context().status == "unavailable"
+            assert source._cycle == _cycle()  # noqa: SLF001
+            assert source.take(first) is None and source.take(second) is None
+            requests.put_nowait(malformed)
+            assert await asyncio.wait_for(attempts.get(), 1) == 3
+            requests.put_nowait(_cycle())
+            await asyncio.wait_for(first.wake.wait(), 1)
+            assert source.semantic_context().status == "current"
+            assert source.take(first).shell["program_cycle"] == _cycle()
+            assert source.take(second).shell["program_cycle"] == _cycle()
+            assert not source._runner_task.done()  # noqa: SLF001
+        finally:
+            await source.unsubscribe(first)
+            await source.unsubscribe(second)
+            assert source._runner_task is None  # noqa: SLF001
+            ingress.close()
+
+    asyncio.run(exercise())
+
+
+def test_fallback_read_recovers_and_bursts_use_one_existing_task(monkeypatch) -> None:
+    async def exercise() -> None:
+        ingress = _ingress([])
+        calls = 0
+        loop = asyncio.get_running_loop()
+        recovered_read = asyncio.Event()
+
+        def read():
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise OSError("source temporarily unavailable")
+            loop.call_soon_threadsafe(recovered_read.set)
+            return _cycle()
+
+        monkeypatch.setattr(control_state_module, "_SOURCE_RETRY_INITIAL_SECONDS", 0)
+        source = HeadlessControlStateSource(
+            SimpleNamespace(program_cycle_status=read,
+                            component_overview_facts=lambda *, program_cycle, cancelled=None: _facts_for_cycle(program_cycle)),
+            ingress, program_runner_websocket_url=None,
+        )
+        subscription = await source.subscribe()
+        try:
+            task = source._runner_task  # noqa: SLF001
+            await asyncio.wait_for(subscription.wake.wait(), 1)
+            assert source.semantic_context().status == "current"
+            source.take(subscription)
+            assert calls == 2
+            recovered_read.clear()
+            for _ in range(1000):
+                source.notify_control()
+            await asyncio.wait_for(recovered_read.wait(), 1)
+            assert calls == 3  # the burst is one bit, not 1000 read tasks
+            assert source._runner_task is task and not task.done()  # noqa: SLF001
+            assert source.diagnostics()["source_failures"] == 1
+        finally:
+            await source.unsubscribe(subscription)
+            assert source._runner_task is None and source._cold_task is None  # noqa: SLF001
+            assert source._program_wake is None  # noqa: SLF001
+            ingress.close()
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("missing_fact", [False, True])
+def test_cold_source_failure_recovers_without_a_second_file_event(monkeypatch, missing_fact) -> None:
+    async def exercise() -> None:
+        ingress = _ingress([])
+        calls = 0
+
+        def facts(*, program_cycle, cancelled=None):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                if missing_fact:
+                    return replace(_facts_for_cycle(program_cycle), runtime=None,
+                                   errors={"runtime": {"code": "runtime_source_unavailable"}})
+                raise OSError("read temporarily failed")
+            return _facts_for_cycle(program_cycle)
+
+        monkeypatch.setattr(control_state_module, "_SOURCE_RETRY_INITIAL_SECONDS", 0)
+        source = HeadlessControlStateSource(
+            SimpleNamespace(program_cycle_status=_cycle, component_overview_facts=facts),
+            ingress, program_runner_websocket_url=None,
+        )
+        records = []
+        source.record_incident = lambda **record: records.append(record)  # type: ignore[method-assign]
+        subscription = await source.subscribe()
+        try:
+            await asyncio.wait_for(subscription.wake.wait(), 1)
+            assert source.semantic_context().status == "current"
+            assert calls == 2
+            assert [(r["incident_kind"], r["phase"]) for r in records] == [
+                ("control_source_unavailable", "activated"),
+                ("control_source_unavailable", "resolved"),
+            ]
+            assert records[0]["incident_id"] == records[1]["incident_id"]
+        finally:
+            await source.unsubscribe(subscription)
+            ingress.close()
+    asyncio.run(exercise())
+
+
+def test_incident_recorder_failure_is_counted_and_logged_once_per_episode(caplog) -> None:
+    ingress = _ingress([])
+    source = HeadlessControlStateSource(object(), ingress, program_runner_websocket_url=None)
+    def fail(**_record):
+        raise OSError("history sink failed")
+    try:
+        for _ in range(100):
+            source._record_incident_now(fail, {})  # noqa: SLF001
+        assert source.diagnostics()["incident_recording_failures"] == 100
+        assert sum("trace may be incomplete" in row.message for row in caplog.records) == 1
+        source._record_incident_now(lambda **_record: {}, {})  # noqa: SLF001
+        source._record_incident_now(fail, {})  # noqa: SLF001
+        assert sum("trace may be incomplete" in row.message for row in caplog.records) == 2
+        source._record_incident_now(lambda **_record: {"recorded": False}, {})  # noqa: SLF001
+        assert source.diagnostics()["incident_recording_failures"] == 102
+    finally:
+        ingress.close()
+
+
+def test_file_watcher_failure_invalidates_and_recovers_without_client_churn(monkeypatch, tmp_path) -> None:
+    async def exercise() -> None:
+        ingress = _ingress([])
+        fail = asyncio.Event()
+        retry = asyncio.Event()
+        count = 0
+
+        async def watches(*_args):
+            nonlocal count
+            count += 1
+            if count == 1:
+                await fail.wait()
+                raise OSError("watch root disappeared")
+            retry.set()
+            yield set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(control_state_module, "awatch", watches)
+        monkeypatch.setattr(control_state_module, "_SOURCE_RETRY_INITIAL_SECONDS", 0)
+        source = HeadlessControlStateSource(
+            SimpleNamespace(program_cycle_status=_cycle,
+                            component_overview_facts=lambda *, program_cycle, cancelled=None: _facts_for_cycle(program_cycle)),
+            ingress, program_runner_websocket_url=None,
+            cold_watch_paths=(tmp_path / "source.json",),
+        )
+        subscription = await source.subscribe()
+        try:
+            await asyncio.wait_for(subscription.wake.wait(), 1)
+            source.take(subscription)
+            fail.set()
+            await asyncio.wait_for(retry.wait(), 1)
+            await asyncio.wait_for(subscription.wake.wait(), 1)
+            assert source.semantic_context().status == "current"
+            assert source.diagnostics()["source_failures"] == 1
+            assert not source._watch_task.done()  # noqa: SLF001
+        finally:
+            await source.unsubscribe(subscription)
+            assert source._watch_task is None  # noqa: SLF001
+            assert source._cold_expiry_handle is None  # noqa: SLF001
+            ingress.close()
+
+    asyncio.run(exercise())
+
+
 def test_last_client_teardown_finishes_before_a_new_source_generation() -> None:
     class NoReadService:
         def __getattr__(self, name: str):
@@ -1221,6 +1507,100 @@ def test_last_client_teardown_finishes_before_a_new_source_generation() -> None:
         asyncio.run(exercise())
     finally:
         ingress.close()
+
+
+def test_last_client_drains_physical_read_and_cancels_remaining_capture() -> None:
+    async def exercise() -> None:
+        ingress = _ingress([])
+        loop = asyncio.get_running_loop()
+        entered = asyncio.Event()
+        released = threading.Event()
+        calls: list[str] = []
+
+        class Service:
+            program_cycle_status = staticmethod(_cycle)
+            component_overview_facts = HeadlessService.component_overview_facts
+
+            def runtime(self):
+                calls.append("runtime")
+                loop.call_soon_threadsafe(entered.set)
+                if not released.wait(2):
+                    raise AssertionError("test did not release physical owner read")
+                return {}
+
+            def __getattr__(self, name):
+                # No later owner in the old capture may be read after cancel.
+                def read(*_args, **_kwargs):
+                    calls.append(name)
+                    return {}
+                return read
+
+        source = HeadlessControlStateSource(Service(), ingress, program_runner_websocket_url=None)
+        first = await source.subscribe()
+        await asyncio.wait_for(entered.wait(), 1)
+        teardown = asyncio.create_task(source.unsubscribe(first))
+        await asyncio.sleep(0)
+        replacement = asyncio.create_task(source.subscribe())
+        await asyncio.sleep(0)
+        try:
+            assert not teardown.done() and not replacement.done()
+            assert calls == ["runtime"]
+            released.set()
+            await asyncio.wait_for(teardown, 1)
+            second = await asyncio.wait_for(replacement, 1)
+            # The replacement's cold combine has not begun. The old physical
+            # call is finished and did not launch any of its seven later reads.
+            assert calls == ["runtime"]
+            await source.unsubscribe(second)
+        finally:
+            released.set()
+            await source.close()
+            ingress.close()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("busy", [False, True])
+def test_stop_rejection_does_not_require_initial_semantic_snapshot(monkeypatch, busy) -> None:
+    async def exercise() -> None:
+        ingress = _ingress([])
+        source = HeadlessControlStateSource(object(), ingress, program_runner_websocket_url=None)
+        session = ExecutionControlSession(_HandshakeSocket(), source, ingress)
+        session_id = session._session_id  # noqa: SLF001
+        command = ExecutionControlCommandDTO.model_validate({
+            "schema_version": CONTROL_PROTOCOL_VERSION, "message_kind": "command",
+            "control_session_id": session_id, "client_sequence": "1",
+            "command": {"command_envelope": {
+                "schema_version": EXECUTION_COMMAND_SCHEMA, "command_kind": "program_stop",
+                "correlation_id": "stop.before.snapshot", "source_label": "test",
+                "control_session_id": session_id, "client_sequence": "1",
+                "freshness": ingress.freshness_for("runner.1", 4).model_dump(mode="json"),
+                "expected_semantic_owner_epoch": "runner.1",
+                "expected_execution_control_revision": 4,
+            }, "payload": {}},
+        })
+        failed = asyncio.get_running_loop().create_future()
+        def start(*_args, **_kwargs):
+            if busy:
+                raise ExecutionControlBusyError(ExecutionControlLane.STOP, 1)
+            failed.set_exception(OSError("Stop dispatch unavailable"))
+            return failed
+        monkeypatch.setattr(ingress, "start", start)
+        try:
+            assert source.semantic_context().status == "synchronizing"
+            session._receive_command(command)  # noqa: SLF001
+            await asyncio.sleep(0)
+            receipts = list(session._slots.receipts)  # noqa: SLF001
+            assert len(receipts) == 1
+            assert receipts[0].receipt.disposition == "rejected"
+            assert receipts[0].receipt.correlation_id == "stop.before.snapshot"
+            assert receipts[0].receipt.current_identity is None
+            assert not session._closed  # noqa: SLF001
+            assert session._next_heartbeat(1) is not None  # noqa: SLF001
+        finally:
+            session._closed = True  # noqa: SLF001
+            ingress.close()
+    asyncio.run(exercise())
 
 
 def test_cold_freshness_uses_one_deadline_and_cancels_it_without_clients(
@@ -1402,9 +1782,26 @@ def test_incident_enqueue_uses_native_async_boundary_without_executor_queue() ->
             incident_recorder=lambda **value: recorded.append(value) or {},
         )
         source._loop = asyncio.get_running_loop()  # noqa: SLF001
+        source._cycle = _running_cycle(1)  # noqa: SLF001
+        source._program_source_current = True  # noqa: SLF001
+        source._facts = SimpleNamespace(runtime={"sections": {"logical_scene": {  # noqa: SLF001
+            "source_owner_epoch": "scene.owner.at.incident", "freshness": "fresh",
+            "payload": {"access": {"active_projection": {"scene_revision": {
+                "scene_id": "scene.at.incident", "revision_id": 4, "content_hash": "sha256:" + "b" * 64,
+            }}}},
+        }}})
         source.record_incident(incident_id="incident.1", phase="activated")
         assert recorded == []
+        source._cycle = _cycle()  # noqa: SLF001
+        source._facts = None  # noqa: SLF001
         await asyncio.sleep(0)
+        assert len(recorded) == 1
+        context = recorded[0].pop("causal_context")
+        assert context["program_run_id"] == "run.1"
+        assert context["program_source_current"] == "true"
+        assert context["scene_id"] == "scene.at.incident"
+        assert context["scene_revision_id"] == "4"
+        assert context["scene_source_owner_epoch"] == "scene.owner.at.incident"
         assert recorded == [{"incident_id": "incident.1", "phase": "activated"}]
 
     try:
@@ -1477,7 +1874,7 @@ def test_control_source_keeps_only_the_newest_unapplied_owner_frame() -> None:
         source.notify_cold = lambda: cold_wakes.append(None)  # type: ignore[method-assign]
         for node_revision in (2, 3, 4):
             source._accept_cycle(  # noqa: SLF001
-                {**_cycle(), "node_status_revision": node_revision},
+                _running_cycle(node_revision),
                 "node_progress",
             )
         frame = source.take(subscription)
@@ -1518,7 +1915,7 @@ def test_slow_control_client_cannot_delay_or_backlog_another_client() -> None:
         source._program_source_current = True  # noqa: SLF001
 
         source._accept_cycle(  # noqa: SLF001
-            {**cycle, "node_status_revision": 2},
+            _running_cycle(2),
             "node_progress",
         )
         first = source.take(current)
@@ -1526,7 +1923,7 @@ def test_slow_control_client_cannot_delay_or_backlog_another_client() -> None:
         assert first.shell["program_cycle"]["node_status_revision"] == 2
 
         source._accept_cycle(  # noqa: SLF001
-            {**cycle, "node_status_revision": 3},
+            _running_cycle(3),
             "node_progress",
         )
         newest = source.take(current)

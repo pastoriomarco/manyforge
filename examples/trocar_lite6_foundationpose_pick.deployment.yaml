@@ -299,7 +299,7 @@
       "capability_definition_revision": "sha256:c99e2dc6d89129ca1d1d4a44d561d878b786df610d1ff241f6e09b5b100edb28",
       "capability_id": "model.kinematics.fk",
       "capability_provider_binding_id": "isaac_lite6_trocar_robot.arm.model-kinematics-fk.provider",
-      "capability_provider_binding_revision": "sha256:f7b3d32c966df8d79b51ec2bd877cc0f63f475dc8ddef02bd78a8b0a2816edbd",
+      "capability_provider_binding_revision": "sha256:3fec4a7a1fd98e59e8f4f728c6d93433fbf54ccc7551d3606e228eae90a77341",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -314,7 +314,7 @@
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
-        "component_type_revision": "sha256:5db50139e1bcf61ecd8f2d880ac160fac119ea1daad041c53cb0b75a8fd9139a",
+        "component_type_revision": "sha256:99aa1541ed4d6bb366c5cdb9fcf3ba02da293c643656c4944ed81aebef053e1f",
         "control_binding_id": "isaac_lite6_trocar_robot.arm.execution-trajectory-execute",
         "control_binding_revision": "sha256:33b614f8530612417c0de6c05f17d782ab3e661a329f3263f448890157fc3ac2",
         "controllable_component_id": "isaac_lite6_trocar_robot"
@@ -324,7 +324,7 @@
       "capability_definition_revision": "sha256:4212f32bfc7e9b04cb11db023da86b9a8f75531b5d775674d559631d93b65053",
       "capability_id": "model.limits.joint",
       "capability_provider_binding_id": "isaac_lite6_trocar_robot.arm.model-limits-joint.provider",
-      "capability_provider_binding_revision": "sha256:ddd24f7c5b090a41c02c26356c924b9042e4f1b5ecd341312ee9a9d835323411",
+      "capability_provider_binding_revision": "sha256:a10e11fc9089582021a532ebf38fbc6061f6a23784326d9dd7622bc95417a4e3",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -339,7 +339,7 @@
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
-        "component_type_revision": "sha256:5db50139e1bcf61ecd8f2d880ac160fac119ea1daad041c53cb0b75a8fd9139a",
+        "component_type_revision": "sha256:99aa1541ed4d6bb366c5cdb9fcf3ba02da293c643656c4944ed81aebef053e1f",
         "control_binding_id": "isaac_lite6_trocar_robot.arm.execution-trajectory-execute",
         "control_binding_revision": "sha256:33b614f8530612417c0de6c05f17d782ab3e661a329f3263f448890157fc3ac2",
         "controllable_component_id": "isaac_lite6_trocar_robot"
@@ -349,7 +349,7 @@
       "capability_definition_revision": "sha256:be53c54ff0aa662db108113e9273e847e790d1b6f0adbba591d50f2237134a00",
       "capability_id": "planning.motion.cartesian_path",
       "capability_provider_binding_id": "isaac_lite6_trocar_robot.arm.planning-motion-cartesian_path.provider",
-      "capability_provider_binding_revision": "sha256:57068c8cc1e5ed2eea152b0ce4b6b0faff029c34a6bb2ed28ac279c5cc2db365",
+      "capability_provider_binding_revision": "sha256:c1fd0500e5bb9041ea99b485b9e3c13123b055b1cfa5a438dece3dd1ebc6be94",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -364,7 +364,7 @@
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
-        "component_type_revision": "sha256:5db50139e1bcf61ecd8f2d880ac160fac119ea1daad041c53cb0b75a8fd9139a",
+        "component_type_revision": "sha256:99aa1541ed4d6bb366c5cdb9fcf3ba02da293c643656c4944ed81aebef053e1f",
         "control_binding_id": "isaac_lite6_trocar_robot.arm.execution-trajectory-execute",
         "control_binding_revision": "sha256:33b614f8530612417c0de6c05f17d782ab3e661a329f3263f448890157fc3ac2",
         "controllable_component_id": "isaac_lite6_trocar_robot"
@@ -374,7 +374,7 @@
       "capability_definition_revision": "sha256:0f6cb2fda7e1d05f20a5867203b84c0e0427440f4b11657941a907c2e2a23dce",
       "capability_id": "planning.motion.joint_goal",
       "capability_provider_binding_id": "isaac_lite6_trocar_robot.arm.planning-motion-joint_goal.provider",
-      "capability_provider_binding_revision": "sha256:437ebe902fecce709c9e71348b13945e39aa7ceb7e055f730e981a15341b96b9",
+      "capability_provider_binding_revision": "sha256:1bcffca72e96c5d6c5992a35867bf24d59604a4e377f9cac136a9b56bdacb4e2",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -389,7 +389,7 @@
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
-        "component_type_revision": "sha256:5db50139e1bcf61ecd8f2d880ac160fac119ea1daad041c53cb0b75a8fd9139a",
+        "component_type_revision": "sha256:99aa1541ed4d6bb366c5cdb9fcf3ba02da293c643656c4944ed81aebef053e1f",
         "control_binding_id": "isaac_lite6_trocar_robot.arm.execution-trajectory-execute",
         "control_binding_revision": "sha256:33b614f8530612417c0de6c05f17d782ab3e661a329f3263f448890157fc3ac2",
         "controllable_component_id": "isaac_lite6_trocar_robot"
@@ -399,7 +399,7 @@
       "capability_definition_revision": "sha256:422c7d9025d46e0fc660705a4f05171a235279872f91c820e952cf16792b8148",
       "capability_id": "planning.motion.pose_goal",
       "capability_provider_binding_id": "isaac_lite6_trocar_robot.arm.planning-motion-pose_goal.provider",
-      "capability_provider_binding_revision": "sha256:4ba3b42b43d1a9e4c0855c05b7550628e9dd7770e152a544f4c39d3b1e21e4f6",
+      "capability_provider_binding_revision": "sha256:99aa7028ba49422d2537c37ecf9c5d68d5cdae1c9289feecd40983d75dbc7428",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -414,7 +414,7 @@
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
-        "component_type_revision": "sha256:5db50139e1bcf61ecd8f2d880ac160fac119ea1daad041c53cb0b75a8fd9139a",
+        "component_type_revision": "sha256:99aa1541ed4d6bb366c5cdb9fcf3ba02da293c643656c4944ed81aebef053e1f",
         "control_binding_id": "isaac_lite6_trocar_robot.arm.execution-trajectory-execute",
         "control_binding_revision": "sha256:33b614f8530612417c0de6c05f17d782ab3e661a329f3263f448890157fc3ac2",
         "controllable_component_id": "isaac_lite6_trocar_robot"
@@ -424,7 +424,7 @@
       "capability_definition_revision": "sha256:14c53dad299a42d6604eac14240d015e22a4bc1adb363fb252111e62a2d2ad90",
       "capability_id": "planning.profile.balanced",
       "capability_provider_binding_id": "isaac_lite6_trocar_robot.arm.planning-profile-balanced.provider",
-      "capability_provider_binding_revision": "sha256:b5522155db2a995b7cd0b0d3b9de62264fc6951f41f60ddc43a30f9ab8d7fda4",
+      "capability_provider_binding_revision": "sha256:dcbe9c54647abe52a8afbb6c2e1d912525757e9fc2c7b3944b1561b91679c44f",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -439,7 +439,7 @@
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
-        "component_type_revision": "sha256:5db50139e1bcf61ecd8f2d880ac160fac119ea1daad041c53cb0b75a8fd9139a",
+        "component_type_revision": "sha256:99aa1541ed4d6bb366c5cdb9fcf3ba02da293c643656c4944ed81aebef053e1f",
         "control_binding_id": "isaac_lite6_trocar_robot.arm.execution-trajectory-execute",
         "control_binding_revision": "sha256:33b614f8530612417c0de6c05f17d782ab3e661a329f3263f448890157fc3ac2",
         "controllable_component_id": "isaac_lite6_trocar_robot"
@@ -449,7 +449,7 @@
       "capability_definition_revision": "sha256:e0f578ef9af205b3c7c184fb1124ffb4fe3c35874b5e993358b43a2dc43d2674",
       "capability_id": "planning.profile.first_feasible",
       "capability_provider_binding_id": "isaac_lite6_trocar_robot.arm.planning-profile-first_feasible.provider",
-      "capability_provider_binding_revision": "sha256:fe151c4c0c4971e5cb1bdca8e25ac203a3df83ad1ae3146af5481fcef6bfd277",
+      "capability_provider_binding_revision": "sha256:26ecda69d470531fec6e4921d86d878c99f5200b36f29adb59efec64cdcd2674",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -464,7 +464,7 @@
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
-        "component_type_revision": "sha256:5db50139e1bcf61ecd8f2d880ac160fac119ea1daad041c53cb0b75a8fd9139a",
+        "component_type_revision": "sha256:99aa1541ed4d6bb366c5cdb9fcf3ba02da293c643656c4944ed81aebef053e1f",
         "control_binding_id": "isaac_lite6_trocar_robot.arm.execution-trajectory-execute",
         "control_binding_revision": "sha256:33b614f8530612417c0de6c05f17d782ab3e661a329f3263f448890157fc3ac2",
         "controllable_component_id": "isaac_lite6_trocar_robot"
@@ -474,7 +474,7 @@
       "capability_definition_revision": "sha256:7f570672270455207d5fb8eb210cd1dd22a99d7909421cf0dc8036c32e4beffb",
       "capability_id": "planning.profile.quality_bounded",
       "capability_provider_binding_id": "isaac_lite6_trocar_robot.arm.planning-profile-quality_bounded.provider",
-      "capability_provider_binding_revision": "sha256:2555eca75b4d4c71e4b0408cea118d76816bd81499f320368e471fe67f67e1c0",
+      "capability_provider_binding_revision": "sha256:ff5917b9e85e652152134089d341e4dff8d9a8137f5a25f43b67e52ec8d952b2",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -489,7 +489,7 @@
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
-        "component_type_revision": "sha256:5db50139e1bcf61ecd8f2d880ac160fac119ea1daad041c53cb0b75a8fd9139a",
+        "component_type_revision": "sha256:99aa1541ed4d6bb366c5cdb9fcf3ba02da293c643656c4944ed81aebef053e1f",
         "control_binding_id": "isaac_lite6_trocar_robot.arm.execution-trajectory-execute",
         "control_binding_revision": "sha256:33b614f8530612417c0de6c05f17d782ab3e661a329f3263f448890157fc3ac2",
         "controllable_component_id": "isaac_lite6_trocar_robot"
@@ -499,7 +499,7 @@
       "capability_definition_revision": "sha256:1fde55ff59f977844d1e42a115df0e66305953803e7f2830fec4821e3cd36385",
       "capability_id": "planning.trajectory.time_parameterized",
       "capability_provider_binding_id": "isaac_lite6_trocar_robot.arm.planning-trajectory-time_parameterized.provider",
-      "capability_provider_binding_revision": "sha256:a33a6acc9cb1a1cec769f778781c2503d82bf803aea0fd4114cd12c8e98aa66c",
+      "capability_provider_binding_revision": "sha256:8b7e5dd8b9e0a36127ec227156ca4fa5a4551426c07236c07973efc26e9094d9",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -514,7 +514,7 @@
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
-        "component_type_revision": "sha256:5db50139e1bcf61ecd8f2d880ac160fac119ea1daad041c53cb0b75a8fd9139a",
+        "component_type_revision": "sha256:99aa1541ed4d6bb366c5cdb9fcf3ba02da293c643656c4944ed81aebef053e1f",
         "control_binding_id": "isaac_lite6_trocar_robot.arm.execution-trajectory-execute",
         "control_binding_revision": "sha256:33b614f8530612417c0de6c05f17d782ab3e661a329f3263f448890157fc3ac2",
         "controllable_component_id": "isaac_lite6_trocar_robot"
@@ -524,7 +524,7 @@
       "capability_definition_revision": "sha256:3cd04895527038906ddcb9c6ca9fd87f4535eba41e5014b04917c66603f26653",
       "capability_id": "validation.trajectory.non_collision",
       "capability_provider_binding_id": "isaac_lite6_trocar_robot.arm.validation-trajectory-non_collision.provider",
-      "capability_provider_binding_revision": "sha256:450afc7f23f8a1086d9fd43a0db0e6961ed401cf49d8cdd16ee1bfa6dea50028",
+      "capability_provider_binding_revision": "sha256:ddb65edc820f25a093ec3c4af2326cd389482acdecb154586aeddd16534bd5b3",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -539,7 +539,7 @@
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
-        "component_type_revision": "sha256:5db50139e1bcf61ecd8f2d880ac160fac119ea1daad041c53cb0b75a8fd9139a",
+        "component_type_revision": "sha256:99aa1541ed4d6bb366c5cdb9fcf3ba02da293c643656c4944ed81aebef053e1f",
         "control_binding_id": "isaac_lite6_trocar_robot.arm.execution-trajectory-execute",
         "control_binding_revision": "sha256:33b614f8530612417c0de6c05f17d782ab3e661a329f3263f448890157fc3ac2",
         "controllable_component_id": "isaac_lite6_trocar_robot"
@@ -549,7 +549,7 @@
       "capability_definition_revision": "sha256:c99e2dc6d89129ca1d1d4a44d561d878b786df610d1ff241f6e09b5b100edb28",
       "capability_id": "model.kinematics.fk",
       "capability_provider_binding_id": "isaac_lite6_trocar_robot.gripper.model-kinematics-fk.provider",
-      "capability_provider_binding_revision": "sha256:2e759aa09397ef408aafd80e2c9ea5afdec7676fc871d03c3f93b745bba19f93",
+      "capability_provider_binding_revision": "sha256:90f087b7e80a17513a5fd5fd8dc9bfd94ef8951929f53c130a94da8d4c414733",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -564,7 +564,7 @@
       "scope": "target_binding",
       "target": {
         "command_target_id": "gripper",
-        "component_type_revision": "sha256:5db50139e1bcf61ecd8f2d880ac160fac119ea1daad041c53cb0b75a8fd9139a",
+        "component_type_revision": "sha256:99aa1541ed4d6bb366c5cdb9fcf3ba02da293c643656c4944ed81aebef053e1f",
         "control_binding_id": "isaac_lite6_trocar_robot.gripper.tool-gripper-command",
         "control_binding_revision": "sha256:5a4b95356cfc221acdeebeb12e48289d6f075d3f4f13a1f8b1ca46cebe2d82bb",
         "controllable_component_id": "isaac_lite6_trocar_robot"
@@ -574,7 +574,7 @@
       "capability_definition_revision": "sha256:4212f32bfc7e9b04cb11db023da86b9a8f75531b5d775674d559631d93b65053",
       "capability_id": "model.limits.joint",
       "capability_provider_binding_id": "isaac_lite6_trocar_robot.gripper.model-limits-joint.provider",
-      "capability_provider_binding_revision": "sha256:edd242335ec174d1fbbe39941f6bfbce5496bf39f091b5722a6f48728de48d19",
+      "capability_provider_binding_revision": "sha256:eda962f101e22adf3854a1f6432b586baf212e80f4c167fce0bf3b29b448cb60",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -589,7 +589,7 @@
       "scope": "target_binding",
       "target": {
         "command_target_id": "gripper",
-        "component_type_revision": "sha256:5db50139e1bcf61ecd8f2d880ac160fac119ea1daad041c53cb0b75a8fd9139a",
+        "component_type_revision": "sha256:99aa1541ed4d6bb366c5cdb9fcf3ba02da293c643656c4944ed81aebef053e1f",
         "control_binding_id": "isaac_lite6_trocar_robot.gripper.tool-gripper-command",
         "control_binding_revision": "sha256:5a4b95356cfc221acdeebeb12e48289d6f075d3f4f13a1f8b1ca46cebe2d82bb",
         "controllable_component_id": "isaac_lite6_trocar_robot"
@@ -977,11 +977,11 @@
         "schema_revision": "sha256:dd305be4c7071d4b5fcf31c031d80b7adb8d3a29562629a189b167922b1f29da"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/component_type/lite6_lite_gripper.component/5db50139e1bcf61ecd8f2d880ac160fac119ea1daad041c53cb0b75a8fd9139a",
-        "content_digest": "sha256:b208aa527667010495a6ab4815a95cbc65e311a2adcb60e878f98cff160efb45",
-        "record_id": "lite6_lite_gripper.component",
+        "content_addressed_store_key": "catalog/maintained/component_type/lite6_lite_gripper.fixed_scale.component/99aa1541ed4d6bb366c5cdb9fcf3ba02da293c643656c4944ed81aebef053e1f",
+        "content_digest": "sha256:978f6133298c16cfbb835ad770143fe8bcbf64fe9eb63e98a1a9dcd0d98c64b9",
+        "record_id": "lite6_lite_gripper.fixed_scale.component",
         "record_kind": "component_type",
-        "record_revision": "sha256:5db50139e1bcf61ecd8f2d880ac160fac119ea1daad041c53cb0b75a8fd9139a",
+        "record_revision": "sha256:99aa1541ed4d6bb366c5cdb9fcf3ba02da293c643656c4944ed81aebef053e1f",
         "schema_id": "manyforge.component_type.v1",
         "schema_revision": "sha256:8e728ad4442d46b98f0d0534f8189df9b7982f982ab99cb656e6fdbeef231009"
       },
@@ -1102,7 +1102,7 @@
     ]
   },
   "deployment_artifact_id": "trocar_lite6_foundationpose_pick",
-  "deployment_revision": "sha256:cf4bf6616a4bfb295b071d272c03045a9963caf13b4aaeb0a839f627c0268258",
+  "deployment_revision": "sha256:3fcfb2571a8e47deebc938837fcad3517eee5720873403dfaf1f2965f48b7886",
   "description": "Retained Isaac Lite6 trocar pick deployment using the commanded ROS 2 control runtime and the qualified FoundationPose Detection3D pose-source client.",
   "desired_control_configurations": [
     {
@@ -1918,8 +1918,8 @@
     ],
     "controllable_components": [
       {
-        "component_type_id": "lite6_lite_gripper.component",
-        "component_type_revision": "sha256:5db50139e1bcf61ecd8f2d880ac160fac119ea1daad041c53cb0b75a8fd9139a",
+        "component_type_id": "lite6_lite_gripper.fixed_scale.component",
+        "component_type_revision": "sha256:99aa1541ed4d6bb366c5cdb9fcf3ba02da293c643656c4944ed81aebef053e1f",
         "controllable_component_id": "isaac_lite6_trocar_robot",
         "model_role_bindings": [
           {

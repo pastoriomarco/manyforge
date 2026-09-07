@@ -28,9 +28,9 @@ inline constexpr std::string_view kHistorianEventSchemaVersion =
 inline constexpr std::string_view kHistorianPageSchemaVersion =
     "manyforge.historian_page.v2";
 inline constexpr std::string_view kHistorianSummaryPageSchemaVersion =
-    "manyforge.historian_summary_page.v1";
+    "manyforge.historian_summary_page.v2";
 inline constexpr std::string_view kHistorianEventSummarySchemaVersion =
-    "manyforge.historian_event_summary.v1";
+    "manyforge.historian_event_summary.v2";
 inline constexpr std::string_view kHistorianDetailSchemaVersion =
     "manyforge.historian_detail.v2";
 inline constexpr std::size_t kDefaultHistorianQueueCapacity = 1024U;
@@ -74,7 +74,16 @@ HistorianPersistenceValue(const HistorianEvent &event);
 struct HistorianStoredEvent final {
   std::uint64_t sequence;
   HistorianEvent event;
+  std::optional<std::int64_t> occurred_at_utc_ns{};
+  std::optional<std::string> clock_owner{};
+  bool wall_clock_regressed{};
 };
+
+/// Strict recorded ISO-8601 wall time, never a freshness or causal clock.
+/// Unknown, leap-second or out-of-int64 historical times remain unavailable.
+[[nodiscard]] std::optional<std::int64_t>
+HistorianRecordedUtcNs(std::string_view wall) noexcept;
+[[nodiscard]] std::string HistorianConditionSeverity(const HistorianEvent &event);
 
 struct HistorianQuery final {
   std::optional<std::int64_t> start_ns;
@@ -83,12 +92,20 @@ struct HistorianQuery final {
   std::set<std::string> event_types;
   std::optional<std::uint64_t> before_sequence;
   std::size_t limit{1000U};
+  std::optional<std::int64_t> start_utc_ns{};
+  std::optional<std::int64_t> end_utc_ns{};
+  std::set<std::string> severities{};
+  std::map<std::string, std::string> correlations{};
+  std::optional<std::string> alarm_phase{};
+  std::string search{};
+  std::optional<std::string> clock_owner{};
 };
 
 struct HistorianPage final {
   std::vector<HistorianStoredEvent> events;
   bool truncated;
   std::optional<std::uint64_t> next_before_sequence;
+  manyforge::content_identity::CanonicalValue retention{};
 };
 
 [[nodiscard]] manyforge::content_identity::CanonicalValue
@@ -98,6 +115,8 @@ HistorianPageValue(const HistorianPage &page);
 /// parse and discard large nested records.
 [[nodiscard]] manyforge::content_identity::CanonicalValue
 HistorianSummaryPageValue(const HistorianPage &page);
+[[nodiscard]] manyforge::content_identity::CanonicalValue
+HistorianExportPageValue(const HistorianPage &page);
 [[nodiscard]] manyforge::content_identity::CanonicalValue
 HistorianDetailValue(const HistorianStoredEvent &stored);
 
@@ -127,6 +146,8 @@ public:
 
   [[nodiscard]] AppendStatus Append(const HistorianEvent &event) override;
   [[nodiscard]] HistorianPage Query(const HistorianQuery &query) override;
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
+  Discover(const std::string &kind, const std::string &after, std::size_t limit);
   [[nodiscard]] std::optional<HistorianStoredEvent>
   Read(std::uint64_t sequence) override;
   void Close();
@@ -170,6 +191,9 @@ public:
   /// Non-blocking with respect to durable storage. Returns false when the
   /// bounded in-memory delivery queue cannot accept the event.
   [[nodiscard]] bool TryEnqueue(HistorianEvent event);
+  /// A committed fact failed before enqueue (for example during encoding).
+  /// Shares the same generation-fenced health recovery as store/queue failures.
+  void ReportDeliveryFailure(std::string code, std::string message);
   [[nodiscard]] AsyncHistorianHealth Health() const;
   [[nodiscard]] bool WaitUntilIdle(std::chrono::milliseconds timeout) const;
 
@@ -179,8 +203,10 @@ public:
   void Shutdown();
 
 private:
+  friend struct AsyncEventHistorianTestAccess;
   void Run();
   void MarkFailureLocked(std::string code, std::string message);
+  [[nodiscard]] bool AdvanceHealthGenerationLocked();
 
   std::shared_ptr<IEventHistoryStore> store_;
   std::size_t queue_capacity_;

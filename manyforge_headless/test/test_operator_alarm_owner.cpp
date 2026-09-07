@@ -653,6 +653,26 @@ TEST_F(AlarmOwnerTest,
             std::string::npos);
 }
 
+TEST_F(AlarmOwnerTest, LongStandingAlarmMetricsRemainExactBeyondThirtyYears) {
+  auto owner = MakeOwner();
+  RegisterScene(*owner);
+  static_cast<void>(owner->Submit(SceneUpdate(1U, true)));
+  const auto active = owner->Snapshot().alarms.front();
+  constexpr std::int64_t years31 = 31LL * 366 * 24 * 60 * 60 * 1000000000;
+  monotonic_ns_ = years31;
+  static_cast<void>(owner->Acknowledge(active.condition_id, active.activation_id,
+                                      active.record_revision, Caller(), std::nullopt, true));
+  monotonic_ns_ = 2 * years31;
+  const auto metrics = owner->Metrics();
+  ASSERT_TRUE(metrics.acknowledgement_latency_ns.maximum_ns.has_value());
+  EXPECT_GT(*metrics.acknowledgement_latency_ns.maximum_ns, 9007199254740991ULL);
+  EXPECT_GT(*metrics.current_standing_duration_ns.maximum_ns, 9007199254740991ULL);
+  EXPECT_FALSE(metrics.acknowledgement_latency_ns.sum_saturated);
+  const auto encoded = content_identity::canonical_json(OperatorAlarmMetricsValue(metrics));
+  EXPECT_NE(encoded.find("\"max_ns\":\""), std::string::npos);
+  EXPECT_NE(encoded.find("\"sum_saturated\":false"), std::string::npos);
+}
+
 TEST_F(AlarmOwnerTest, BoundedCanonicalInputsAndSnapshotShapeAreEnforced) {
   auto owner = MakeOwner();
   RegisterScene(*owner);

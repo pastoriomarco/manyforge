@@ -106,8 +106,10 @@ template <typename Identity>
                                               StopScopeResolutionReasonDTO reason) noexcept {
   switch (reason) {
     case StopScopeResolutionReasonDTO::kExactCurrentScope:
-    case StopScopeResolutionReasonDTO::kExplicitFullStop:
       return disposition == StopResolutionDispositionDTO::kExact;
+    case StopScopeResolutionReasonDTO::kExplicitFullStop:
+      return disposition == StopResolutionDispositionDTO::kExact ||
+             disposition == StopResolutionDispositionDTO::kStaleButUnambiguouslyResolved;
     case StopScopeResolutionReasonDTO::kStaleMetadataCurrentScope:
       return disposition == StopResolutionDispositionDTO::kStaleButUnambiguouslyResolved;
     case StopScopeResolutionReasonDTO::kKnownTerminalOrIdleNoEffect:
@@ -661,7 +663,8 @@ struct DerivedTerminal final {
   }
   if (!certificate.predecessor_certificates.empty() &&
       certificate.resolution_disposition != StopResolutionDispositionDTO::kPromotedToFull &&
-      !(certificate.resolution_disposition == StopResolutionDispositionDTO::kExact &&
+      !((certificate.resolution_disposition == StopResolutionDispositionDTO::kExact ||
+         certificate.resolution_disposition == StopResolutionDispositionDTO::kStaleButUnambiguouslyResolved) &&
         certificate.resolution_reason == StopScopeResolutionReasonDTO::kExplicitFullStop)) {
     return "stop_certificate_predecessor_resolution_invalid";
   }
@@ -755,7 +758,8 @@ std::optional<std::string_view> stop_terminal_reduction_input_field_error(
   }
   if (!input.predecessor_certificates.empty() &&
       input.resolution_disposition != StopResolutionDispositionDTO::kPromotedToFull &&
-      !(input.resolution_disposition == StopResolutionDispositionDTO::kExact &&
+      !((input.resolution_disposition == StopResolutionDispositionDTO::kExact ||
+         input.resolution_disposition == StopResolutionDispositionDTO::kStaleButUnambiguouslyResolved) &&
         input.resolution_reason == StopScopeResolutionReasonDTO::kExplicitFullStop)) {
     return "stop_terminal_predecessor_resolution_invalid";
   }

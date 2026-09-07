@@ -315,27 +315,30 @@ RuntimeContractDeclarationRegistry::make_rows() {
           std::string(detail::kNativeExecutionRuntimeProfileId)),
       core::RuntimeProfileRevision(
           detail::native_execution_runtime_profile_revision()),
-      core::ProductContractId(std::string(
-          detail::kNativeExecutionRuntimeProductContractId)),
+      core::ProductContractId(
+          std::string(detail::kNativeExecutionRuntimeProductContractId)),
       core::ProductContractRevision(native_product_revision),
       make_offer(
           detail::kNativeExecutionRuntimeImplementationId,
           {core::ApiContractId(std::string(
                native_execution_runtime_contract::kRuntimeRoleApiContractId)),
-           core::ApiContractId(std::string(
-               native_execution_runtime_contract::kStatusEndpointApiContractId)),
-           core::ApiContractId(std::string(
-               native_execution_runtime_contract::
-                   kProjectionEndpointApiContractId)),
-           core::ApiContractId(std::string(
-               native_execution_runtime_contract::
-                   kLogicalSceneEndpointApiContractId))},
+           core::ApiContractId(std::string(native_execution_runtime_contract::
+                                               kStatusEndpointApiContractId)),
+           core::ApiContractId(
+               std::string(native_execution_runtime_contract::
+                               kProjectionEndpointApiContractId)),
+           core::ApiContractId(
+               std::string(native_execution_runtime_contract::
+                               kLogicalSceneEndpointApiContractId))},
           declared_capabilities(
               runtime_contract_capabilities::kExecutionServices,
-              runtime_contract_capabilities::kLogicalSceneServices)),
-      {role_mapping(detail::kNativeExecutionRuntimeRoleId,
-                    native_execution_runtime_contract::kRuntimeRoleApiContractId,
-                    "native-execution-host")},
+              runtime_contract_capabilities::kLogicalSceneServices,
+              std::array<std::string_view, 1U>{
+                  "execution.runtime_scale.operation_scoped"})),
+      {role_mapping(
+          detail::kNativeExecutionRuntimeRoleId,
+          native_execution_runtime_contract::kRuntimeRoleApiContractId,
+          "native-execution-host")},
       {endpoint_mapping(
            detail::kNativeExecutionRuntimeStatusEndpointRoleId,
            native_execution_runtime_contract::kStatusEndpointApiContractId,
@@ -346,7 +349,8 @@ RuntimeContractDeclarationRegistry::make_rows() {
            "native-execution-host"),
        endpoint_mapping(
            detail::kNativeExecutionRuntimeLogicalSceneEndpointRoleId,
-           native_execution_runtime_contract::kLogicalSceneEndpointApiContractId,
+           native_execution_runtime_contract::
+               kLogicalSceneEndpointApiContractId,
            "native-execution-host")}));
   rows.push_back(RuntimeContractDeclaration(
       core::RuntimeProfileId(

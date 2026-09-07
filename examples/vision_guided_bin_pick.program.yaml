@@ -1,6 +1,6 @@
 api_version: manyforge.program.v1
 program_id: vision_guided_bin_pick
-program_revision: sha256:24cce46731d8581b5c91c32cdfaf31c1bd0fd8f6ae4145b2aaefc13d54d429b3
+program_revision: sha256:aacd027a6b023305fa7c958e49af57c7e3e51284f4c31d9ff85519bf03ba2f28
 program_profile: composable-cell-v1
 name: vision_guided_bin_pick
 description: >-
@@ -10,7 +10,7 @@ description: >-
   the selected object and a simulated non-model tool target.
 catalog:
   api_version: manyforge.node_catalog.v2
-  content_version: 1.1.0
+  content_version: 2.0.0
 compatibility:
   lanes: [manyforge-only]
   assistant: required

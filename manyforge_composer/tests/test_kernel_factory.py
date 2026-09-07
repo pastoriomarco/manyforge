@@ -33,7 +33,6 @@ _REMOVED_RUNTIME_INVOCATIONS = (
     ("--assistant-timeout-s", "1"),
     ("--assistant-api-token", "test-token"),
     ("--mcp",),
-    ("--mcp-http",),
     ("--trace-dir", "/tmp/manyforge-test-traces"),
     ("--failure-archive-dir", "/tmp/manyforge-test-failures"),
     ("--failure-archive-max-age-s", "1"),
@@ -76,7 +75,8 @@ def test_removed_runtime_modes_fail_with_the_stable_unavailable_reason(
 
 
 def test_structural_options_are_not_classified_as_removed_runtime_options() -> None:
-    assert len(composer_main._REMOVED_RUNTIME_OPTIONS) == 16
+    assert len(composer_main._REMOVED_RUNTIME_OPTIONS) == 15
+    assert composer_main._removed_runtime_option(("--mcp-http",)) is None
     assert composer_main._removed_runtime_option(
         (
             "--host=127.0.0.1",
