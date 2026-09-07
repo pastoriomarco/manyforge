@@ -162,8 +162,7 @@ CellAdmissionClaimIntentDTO Intent(CellAdmissionClaimKindDTO kind, AdmissionGene
 
 CellAdmissionClaimReleaseDTO Release(const CellAdmissionClaimDTO& claim) {
   const auto settlement =
-      claim.intent.claim_kind == CellAdmissionClaimKindDTO::kProgramCycle ||
-              claim.intent.claim_kind == CellAdmissionClaimKindDTO::kManualOperation
+      claim.intent.claim_kind == CellAdmissionClaimKindDTO::kProgramCycle
           ? CellAdmissionSettlementKindDTO::kExplicitReset
           : (claim.intent.claim_kind == CellAdmissionClaimKindDTO::kAuthoringMutation ||
                      claim.intent.claim_kind == CellAdmissionClaimKindDTO::kAuthoredScene
@@ -507,6 +506,43 @@ TEST(KernelCellAdmissionOwner, ProgramResetSceneAuthorizationRequiresExactResett
   stale.terminal_or_settlement_reference = ContentDigest(kDigestB);
   EXPECT_EQ(owner.ValidateProgramResetSceneAuthorization(stale).error().details.at("reason"),
             "program_reset_status_mismatch");
+
+  auto child_intent = Intent(CellAdmissionClaimKindDTO::kInterventionOrRecovery,
+                            owner.GetAuthoringAdmission().admission_generation,
+                            "program-reset.child");
+  child_intent.intervention_evidence->parent_program_cycle_claim_generation =
+      acquired.value().claim_generation;
+  const auto child = owner.AcquireCellAdmissionClaim(child_intent);
+  ASSERT_TRUE(child.ok());
+  const auto blocked_reset = owner.ValidateProgramResetSceneAuthorization(authorization);
+  ASSERT_FALSE(blocked_reset.ok());
+  EXPECT_EQ(blocked_reset.error().details.at("reason"),
+            "program_reset_child_unsettled");
+  EXPECT_FALSE(owner.ReleaseCellAdmissionClaim(Release(acquired.value())).ok());
+  ASSERT_TRUE(owner.ReleaseCellAdmissionClaim(Release(child.value())).ok());
+  EXPECT_TRUE(owner.ValidateProgramResetSceneAuthorization(authorization).ok());
+}
+
+TEST(KernelCellAdmissionOwner, RecoveryRejectsMultipleHeldCyclesAndMissingProgramEvidence) {
+  FixedClock clock;
+  AdmissionJournal journal;
+  const CellAdmissionClaimDTO first{
+      Intent(CellAdmissionClaimKindDTO::kProgramCycle, AdmissionGeneration(1U)),
+      CellAdmissionClaimGeneration(1U), AdmissionGeneration(1U), 1};
+  auto second = first;
+  second.claim_generation = CellAdmissionClaimGeneration(2U);
+  second.intent.request_id = RequestId("second-claim");
+  const std::vector<OperationJournalRecoveryDTO::RecoveredCellAdmissionClaimDTO> duplicate{
+      {first, {}, {}}, {second, {}, {}}};
+  EXPECT_THROW(
+      KernelCellAdmissionOwner(RequestOwnerEpoch("kernel.2"), 8U, clock, journal, duplicate),
+      std::runtime_error);
+  second.intent.program_cycle_evidence.reset();
+  const std::vector<OperationJournalRecoveryDTO::RecoveredCellAdmissionClaimDTO> malformed{
+      {second, {}, {}}};
+  EXPECT_THROW(
+      KernelCellAdmissionOwner(RequestOwnerEpoch("kernel.2"), 8U, clock, journal, malformed),
+      std::runtime_error);
 }
 
 TEST(KernelCellAdmissionOwner, RestartContinuesTheDurableClaimGenerationHighWater) {
@@ -1182,6 +1218,99 @@ TEST(KernelCellAdmissionOwner,
   EXPECT_TRUE(settled.ReconcileCellAdmissionClaims(reconcile).ok());
   EXPECT_EQ(settled.ReleaseCellAdmissionClaim(Release(first)).error().code, "stale_generation");
   EXPECT_TRUE(settled.ReleaseCellAdmissionClaim(Release(second)).ok());
+}
+
+TEST(KernelCellAdmissionOwner, ParentReconciliationRequiresEveryHeldChildInTheSameAtomicBatch) {
+  FixedClock clock;
+  AdmissionJournal journal;
+  const CellAdmissionClaimDTO parent{
+      Intent(CellAdmissionClaimKindDTO::kProgramCycle, AdmissionGeneration(1U)),
+      CellAdmissionClaimGeneration(1U), AdmissionGeneration(1U), 41};
+  auto child_intent = Intent(CellAdmissionClaimKindDTO::kInterventionOrRecovery,
+                            AdmissionGeneration(2U), "child");
+  child_intent.intervention_evidence->parent_program_cycle_claim_generation = parent.claim_generation;
+  const CellAdmissionClaimDTO child{
+      child_intent, CellAdmissionClaimGeneration(2U), AdmissionGeneration(2U), 42};
+  const std::vector<OperationJournalRecoveryDTO::RecoveredCellAdmissionClaimDTO> recovery{
+      {parent, {}, {}}, {child, {}, {}}};
+  for (const bool settle_child : {false, true}) {
+    const std::vector<CellAdmissionCurrentOwnerEpochDTO> successors{
+        {CellAdmissionOwnerRoleDTO::kProgramRunner, RequestOwnerEpoch("owner.2")},
+        {CellAdmissionOwnerRoleDTO::kInterventionOrRecoveryOwner,
+         RequestOwnerEpoch(settle_child ? "owner.2" : "owner.1")}};
+    KernelCellAdmissionOwner owner(
+        RequestOwnerEpoch("kernel.2"), 4U, clock, journal, recovery, AdmissionGeneration(3U), {}, {},
+        [settle_child](const auto& held, const auto&, const auto& reconcile) {
+          CellAdmissionReconcileValidationDTO result{reconcile.current_owner_epochs, {}};
+          for (const auto& claim : held) {
+            if (claim.intent.claim_kind == CellAdmissionClaimKindDTO::kProgramCycle || settle_child)
+              result.settlements.push_back(
+                  {claim, claim.intent.owner_role, RequestOwnerEpoch("owner.2"),
+                   CellAdmissionSettlementKindDTO::kReconciled,
+                   reconcile.reconciliation_evidence_digest});
+          }
+          return Result<CellAdmissionReconcileValidationDTO>::Ok(std::move(result));
+        });
+    const auto before = journal.sequence.load();
+    const CellAdmissionReconcileDTO reconcile{
+        RequestOwnerEpoch("kernel.2"), {parent, child}, successors, ContentDigest(kDigest)};
+    const auto result = owner.ReconcileCellAdmissionClaims(reconcile);
+    ASSERT_EQ(result.ok(), settle_child);
+    if (!settle_child) {
+      EXPECT_EQ(result.error().details.at("reason"), "reconcile_parent_child_unsettled");
+      EXPECT_EQ(journal.sequence.load(), before);
+      EXPECT_EQ(owner.held_claim(CellAdmissionClaimKindDTO::kProgramCycle), parent);
+      EXPECT_EQ(owner.held_claim(CellAdmissionClaimKindDTO::kInterventionOrRecovery), child);
+    } else {
+      EXPECT_FALSE(owner.has_unresolved_claims());
+      const auto after = journal.sequence.load();
+      EXPECT_TRUE(owner.ReconcileCellAdmissionClaims(reconcile).ok());
+      EXPECT_EQ(journal.sequence.load(), after);
+    }
+  }
+}
+
+TEST(KernelCellAdmissionOwner, ExactManualReconciliationReplayDoesNotTouchSuccessorWork) {
+  FixedClock clock;
+  AdmissionJournal journal;
+  const auto intent = Intent(CellAdmissionClaimKindDTO::kManualOperation, AdmissionGeneration(7U));
+  const CellAdmissionClaimDTO claim{intent, CellAdmissionClaimGeneration(4U),
+                                    AdmissionGeneration(7U), 41};
+  int validations = 0;
+  KernelCellAdmissionOwner owner(
+      RequestOwnerEpoch("kernel.2"), 4U, clock, journal, {{claim, {}, {}}}, AdmissionGeneration(8U),
+      {}, {},
+      [&](const auto& held, const auto&, const auto& request) {
+        ++validations;
+        return Result<CellAdmissionReconcileValidationDTO>::Ok(
+            {request.current_owner_epochs,
+             {{held.front(), CellAdmissionOwnerRoleDTO::kManualOperationOwner,
+               RequestOwnerEpoch("kernel.2"), CellAdmissionSettlementKindDTO::kReconciled,
+               request.reconciliation_evidence_digest}}});
+      },
+      {}, {{CellAdmissionOwnerRoleDTO::kManualOperationOwner, intent.owner_epoch}},
+      EmptyLivenessSet());
+  const auto request = owner.manual_owner_reconciliation_request();
+  ASSERT_TRUE(request.ok() && request.value().has_value());
+  ASSERT_TRUE(owner.ReconcileCellAdmissionClaims(*request.value()).ok());
+  ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).ok());
+  auto next = Intent(CellAdmissionClaimKindDTO::kManualOperation,
+                     owner.GetAuthoringAdmission().admission_generation, "successor.manual");
+  next.owner_epoch = RequestOwnerEpoch("kernel.2");
+  const auto acquired = owner.AcquireCellAdmissionClaim(next);
+  ASSERT_TRUE(acquired.ok());
+  const auto before = owner.GetAuthoringAdmission();
+  const auto writes = journal.sequence.load();
+  const auto replay = owner.ReconcileCellAdmissionClaims(*request.value());
+  ASSERT_TRUE(replay.ok());
+  EXPECT_EQ(replay.value(), before);
+  EXPECT_FALSE(replay.value().authoring_allowed);
+  EXPECT_EQ(journal.sequence.load(), writes);
+  EXPECT_EQ(validations, 1);
+  EXPECT_EQ(owner.held_claim(CellAdmissionClaimKindDTO::kManualOperation), acquired.value());
+  auto changed = *request.value();
+  changed.retained_claims.clear();
+  EXPECT_FALSE(owner.ReconcileCellAdmissionClaims(changed).ok());
 }
 
 TEST(KernelCellAdmissionOwner, SupportsMultipleExactReconciliationsInOneKernelEpoch) {

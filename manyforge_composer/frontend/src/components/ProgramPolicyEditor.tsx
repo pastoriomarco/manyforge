@@ -36,6 +36,8 @@ export interface ProgramPolicyForm {
   modification_policy: ProgramNodeModificationPolicy;
   recovery_policy: ProgramNodeRecoveryPolicy;
   operator_stop_policy: ProgramOperatorStopPolicy;
+  execution_group_mode: 'inherit' | 'all' | 'named';
+  execution_group_names: string;
 }
 
 export type ProgramPolicyField =
@@ -47,7 +49,8 @@ export type ProgramPolicyField =
   | 'recovery_policy.max_retries'
   | 'recovery_policy.allowed_skills'
   | 'recovery_policy.persistence_ceiling'
-  | 'operator_stop_policy';
+  | 'operator_stop_policy'
+  | 'execution_groups';
 
 export function effectiveProgramPolicy(node: ProgramTreeNode): ProgramPolicyForm {
   return {
@@ -64,6 +67,10 @@ export function effectiveProgramPolicy(node: ProgramTreeNode): ProgramPolicyForm
       allowed_skills: [...(node.recovery_policy?.allowed_skills ?? [])],
     },
     operator_stop_policy: node.operator_stop_policy ?? DEFAULT_OPERATOR_STOP_POLICY,
+    execution_group_mode: Array.isArray(node.execution_groups)
+      ? 'named' : node.execution_groups ?? 'inherit',
+    execution_group_names: Array.isArray(node.execution_groups)
+      ? node.execution_groups.join(', ') : '',
   };
 }
 
@@ -79,6 +86,15 @@ export function validateProgramPolicy(
   form: ProgramPolicyForm,
 ): Partial<Record<ProgramPolicyField, string>> {
   const errors: Partial<Record<ProgramPolicyField, string>> = {};
+  if (form.execution_group_mode === 'named') {
+    const groups = form.execution_group_names.split(',').map((name) => name.trim());
+    if (groups.length > 4096 || new Set(groups).size !== groups.length
+        || groups.some((name) => name.length > 128 || !/^[a-z][a-z0-9_.-]*$/.test(name)
+          || name === 'all' || name === 'inherit')) {
+      setError(errors, 'execution_groups',
+        'Use unique lower-case group names separated by commas (letters, digits, _, . or -; start with a letter; at most 128 characters). All and inherit are reserved.');
+    }
+  }
   const { modification_policy: modification, recovery_policy: recovery } = form;
   const hasIntervention = recovery.allowed_recovery_actions.includes('intervention');
   const hasRuntimeOverride = recovery.allowed_recovery_actions.includes('runtime_override');
@@ -173,18 +189,21 @@ function selectOptions<T extends string>(options: Array<[T, string]>) {
 
 interface ProgramPolicyEditorProps {
   node: ProgramTreeNode;
+  inheritedGroups?: string[];
   busy: boolean;
   onUpdate: (
     instanceId: string,
     modificationPolicy: ProgramNodeModificationPolicy,
     recoveryPolicy: ProgramNodeRecoveryPolicy,
     operatorStopPolicy: ProgramOperatorStopPolicy,
+    executionGroups: NonNullable<ProgramTreeNode['execution_groups']>,
   ) => void;
   onInvalidChange?: (message: string | null) => void;
 }
 
 export function ProgramPolicyEditor({
   node,
+  inheritedGroups = [],
   busy,
   onUpdate,
   onInvalidChange,
@@ -218,9 +237,15 @@ export function ProgramPolicyEditor({
         allowed_skills: [...form.recovery_policy.allowed_skills],
       },
       form.operator_stop_policy,
+      form.execution_group_mode === 'named'
+        ? form.execution_group_names.split(',').map((name) => name.trim()).sort()
+        : form.execution_group_mode,
     );
   };
   const id = node.instance_id;
+  const resolvedGroups = form.execution_group_mode === 'inherit' ? inheritedGroups
+    : form.execution_group_mode === 'all' ? []
+      : form.execution_group_names.split(',').map((name) => name.trim()).filter(Boolean);
   const updateModification = (
     field: keyof ProgramNodeModificationPolicy,
     value: ProgramModificationPolicyValue | ProgramInterventionDelegate,
@@ -463,6 +488,47 @@ export function ProgramPolicyEditor({
 
       <fieldset className="program-policy-fieldset">
         <legend>Operator Stop policy</legend>
+        <label className="program-policy-field" htmlFor={fieldId(id, 'execution_groups')}>
+          Execution groups
+          <select
+            id={fieldId(id, 'execution_groups')}
+            value={form.execution_group_mode}
+            disabled={busy}
+            onChange={(event) => setForm((current) => ({
+              ...current,
+              execution_group_mode: event.target.value as ProgramPolicyForm['execution_group_mode'],
+            }))}
+          >
+            {selectOptions([
+              ['inherit', 'Inherit'],
+              ['all', 'All only'],
+              ['named', 'Named groups'],
+            ])}
+          </select>
+        </label>
+        {form.execution_group_mode === 'named' && (
+          <label className="program-policy-field" htmlFor={fieldId(id, 'execution_group_names')}>
+            Group names
+            <input
+              id={fieldId(id, 'execution_group_names')}
+              value={form.execution_group_names}
+              placeholder="robot_a, all_grippers"
+              disabled={busy}
+              aria-invalid={errors.execution_groups !== undefined}
+              aria-describedby={describedBy('execution_groups')}
+              title={errors.execution_groups}
+              onChange={(event) => setForm((current) => ({
+                ...current, execution_group_names: event.target.value,
+              }))}
+            />
+            <FieldError id={errorId('execution_groups')} message={errors.execution_groups} />
+          </label>
+        )}
+        <p className="program-policy-help">
+          Draft memberships: {['all', ...resolvedGroups].join(', ')}.
+          {' '}All always includes this node. Named groups replace inherited names
+          and may overlap. Saved for the next Run; running membership cannot change.
+        </p>
         <label className="program-policy-field" htmlFor={fieldId(id, 'operator_stop_policy')}>
           Stop behavior
           <select

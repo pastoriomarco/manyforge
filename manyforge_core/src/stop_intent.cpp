@@ -179,6 +179,10 @@ std::optional<std::string_view> operation_control_request_field_error(
   if (!attribution_valid(request.attribution)) {
     return "operation_control_attribution_invalid";
   }
+  if (request.execution_scope.has_value() &&
+      !valid_program_node_execution_scope(*request.execution_scope)) {
+    return "operation_control_scope_invalid";
+  }
   return std::nullopt;
 }
 

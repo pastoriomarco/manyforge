@@ -105,7 +105,7 @@ def _write_exact_closure(
         },
     }
     program = {
-        "api_version": "manyforge.program.v1",
+        "api_version": "manyforge.program.v2",
         "program_id": "pick_program",
         "program_revision": program_revision,
         "catalog": {

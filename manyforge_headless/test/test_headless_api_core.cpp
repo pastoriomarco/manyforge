@@ -1581,6 +1581,91 @@ TEST(HeadlessApiCore, OrderedJournalCapturesPreserveExactInt64HistoryIngress) {
 }
 
 TEST(HeadlessApiCore,
+     CapturedProgramOriginIsTracedWithAnExplicitJournalVersion) {
+  TemporaryDirectory directory;
+  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+  const std::string epoch = "execution-host.captured";
+  auto fields = OperationJournalPayload(epoch, "operation_prepared", "prepared",
+                                        CanonicalValue(nullptr))
+                    .as_object();
+  for (auto &[name, value] : fields) {
+    if (name == "api_version")
+      value = CanonicalValue("manyforge.operation_journal_record.v3");
+    if (name != "operation_state")
+      continue;
+    auto state = value.as_object();
+    state.emplace_back("journal_capture_order", CanonicalValue("1"));
+    for (auto &[field, content] : state) {
+      if (field != "participants")
+        continue;
+      auto participants = content.as_array();
+      auto participant = participants.front().as_object();
+      participant.emplace_back(
+          "execution_scope",
+          CanonicalValue(CanonicalValue::Object{
+              {"node_instance_id", CanonicalValue("pick")},
+              {"node_attempt_id", CanonicalValue("pick.attempt.1")}}));
+      participants.front() = CanonicalValue(std::move(participant));
+      content = CanonicalValue(std::move(participants));
+    }
+    value = CanonicalValue(std::move(state));
+  }
+  const auto ingest = [&](const CanonicalValue &payload) {
+    return core.IngestOperationEvent(
+        epoch, 1U, "operation_prepared", std::nullopt, "operation.test.1", 1U,
+        100U, "2026-09-07T10:00:00.000000001Z", false, payload,
+        content_identity::sha256_digest(
+            content_identity::canonical_json(payload)));
+  };
+  const CanonicalValue payload(fields);
+  EXPECT_EQ(Text(ingest(payload), "status"), "ingested");
+  for (auto &[name, value] : fields) {
+    if (name == "api_version")
+      value = CanonicalValue("manyforge.operation_journal_record.v2");
+  }
+  EXPECT_THROW(ingest(CanonicalValue(fields)), std::exception);
+  EXPECT_TRUE(Array(core.AlarmSnapshot(), "alarms").empty());
+
+  const auto stop_ingest = [&](const std::string &api,
+                               const CanonicalValue &order) {
+    auto operation = Member(payload, "operation_state").as_object();
+    for (auto &[name, value] : operation) {
+      if (name == "journal_capture_order")
+        value = order;
+    }
+    auto stop = StopAcceptanceProjectionPayload(epoch).as_object();
+    for (auto &[name, value] : stop) {
+      if (name == "api_version")
+        value = CanonicalValue(api);
+      if (name == "affected_state")
+        value = CanonicalValue(CanonicalValue::Object{
+            {"operations",
+             CanonicalValue(CanonicalValue::Array{CanonicalValue(operation)})},
+            {"resources", CanonicalValue(CanonicalValue::Array{})}});
+    }
+    const CanonicalValue projection(std::move(stop));
+    return core.IngestOperationEvent(
+        epoch, 2U, "stop_acceptance_projected", "stop-request.1", std::nullopt,
+        std::nullopt, 101U, "2026-09-07T10:00:00.000000002Z", true, projection,
+        content_identity::sha256_digest(
+            content_identity::canonical_json(projection)));
+  };
+  EXPECT_THROW(stop_ingest("manyforge.stop_acceptance_projection.v2",
+                           CanonicalValue("1")),
+               std::exception);
+  for (const auto &bad_order :
+       {CanonicalValue("0"), CanonicalValue(1.0), CanonicalValue(nullptr)}) {
+    EXPECT_THROW(
+        stop_ingest("manyforge.stop_acceptance_projection.v3", bad_order),
+        std::exception);
+  }
+  EXPECT_EQ(Text(stop_ingest("manyforge.stop_acceptance_projection.v3",
+                             CanonicalValue("1")),
+                 "status"),
+            "ingested");
+}
+
+TEST(HeadlessApiCore,
      OversizedCommittedFactHasRecoverableGenerationFencedHistoryHealth) {
   TemporaryDirectory directory;
   HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());

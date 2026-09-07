@@ -572,42 +572,15 @@ def _run_native_benchmark_move(
         terminal, indent=2, sort_keys=True
     )
 
-    acknowledgment = OperationControlRequest.model_validate(
-        {
-            "request_context": {
-                "request_id": f"ack-{request_id}",
-                "request_owner_epoch": identity["owner_epoch"],
-                "source_label": "n7_b_native_benchmark",
-                "correlation_id": "n7-b-historical-benchmark",
-            },
-            "operation_id": operation_id,
-            "expected_operation_revision": projection["operation_revision"],
-            "reason": "release completed N7 benchmark operation",
-        }
-    )
-    settlement_deadline = time.monotonic() + 5.0
-    while True:
-        released = client.acknowledge_completed(
-            acknowledgment,
-            trusted_principal_id=None,
-        )
-        if released.get("ok") is True:
-            break
-        error = released.get("error")
-        details = error.get("details") if isinstance(error, dict) else None
-        if (
-            not isinstance(details, dict)
-            or details.get("reason") != "operation_effect_in_flight"
-            or time.monotonic() >= settlement_deadline
-        ):
-            break
-        time.sleep(0.005)
-    assert released["ok"] is True, released
+    # Native manual-control settlement is backend-owned. Keep retirement
+    # outside the historical timing sample without a redundant client Ack.
+    _wait_retired(client, operation_id)
+    return elapsed_seconds
 
-    # Control acceptance is asynchronous. Keep retirement outside the
-    # historical timing sample, but do not start another sample until the
-    # Kernel's authoritative projection confirms the operation is no longer
-    # resident. Admission and recovery remain separate backend facts.
+
+def _wait_retired(client: ExecutionCommandClient, operation_id: str) -> None:
+    """Observe exact automatic settlement; never perform client-side cleanup."""
+
     residency_projection: dict[str, Any] = {}
     residency_deadline = time.monotonic() + 5.0
     while True:
@@ -616,11 +589,10 @@ def _run_native_benchmark_move(
             break
         if time.monotonic() >= residency_deadline:
             raise AssertionError(
-                "native execution remained resident after acknowledgement: "
+                "native execution remained resident after terminal settlement: "
                 f"{residency_projection}"
             )
         time.sleep(0.005)
-    return elapsed_seconds
 
 
 def _wait_state(
@@ -1289,6 +1261,158 @@ def test_reconciliation_exception_uses_caught_host_failure_path(
         _stop_host(process)
 
 
+def test_private_program_capture_is_claim_bound_and_cannot_mint_node_effects(
+    tmp_path: Path,
+) -> None:
+    from manyforge_program_runner.execution_transport import ProgramRunnerExecutionTransport
+
+    fixture_root = tmp_path / "fixture"
+    shutil.copytree(_required_path("MANYFORGE_I6_NATIVE_FIXTURE_ROOT"), fixture_root)
+    manifest = json.loads((fixture_root / "manifest.json").read_text("utf-8"))
+    state_root, run_root = tmp_path / "state", tmp_path / "run"
+    state_root.mkdir()
+    run_root.mkdir()
+    process = _start_host(fixture_root, state_root, run_root, manifest)
+    client = ProgramRunnerExecutionTransport(run_root, timeout_seconds=2.0)
+    admission = CellAdmissionClient(run_root, timeout_seconds=2.0)
+    try:
+        identity = client.identity()["identity"]
+        capture = {
+            "schema_version": "manyforge.program_run_execution_capture.v1",
+            "request_owner_epoch": identity["owner_epoch"],
+            "program_runner_owner_epoch": "standalone-admission-fixture.program-runner",
+            "claim_generation": 1,
+            "program_run_id": "program-capture.1",
+            **{key: manifest[key] for key in (
+                "program_id", "program_revision", "program_binding_id",
+                "retained_bundle_id", "graph_revision",
+            )},
+        }
+        with pytest.raises(HeadlessApiError) as unclaimed:
+            client.register_program_run_capture(capture)
+        assert unclaimed.value.details["reason"] == "program_execution_capture_stale"
+        current = admission.get()
+        assert current["authoring_allowed"] is True
+        claim = admission.acquire({
+            "claim_kind": "program_cycle", "owner_role": "program_runner",
+            "owner_epoch": capture["program_runner_owner_epoch"],
+            "owner_transaction_id": capture["program_run_id"],
+            "request_id": "claim.program-capture.1",
+            "request_payload_digest": "sha256:" + "a" * 64,
+            "expected_admission_generation": current["admission_generation"],
+            "scope": {"resources": [], "configurations": []},
+            "program_cycle_evidence": {
+                "draft_program_revision": capture["program_revision"],
+                "applied_program_revision": capture["program_revision"],
+            },
+            "intervention_evidence": None,
+        })
+        capture["claim_generation"] = claim["claim_generation"]
+        accepted = client.register_program_run_capture(capture)
+        assert client.register_program_run_capture(capture) == accepted
+        for changed in (
+            {"table": {"nodes": []}},
+            {"claim_generation": capture["claim_generation"] + 1},
+            {"program_runner_owner_epoch": "another-runner"},
+            {"program_binding_id": "sha256:" + "0" * 64},
+        ):
+            with pytest.raises(HeadlessApiError):
+                client.register_program_run_capture({**capture, **changed})
+
+        direct = client.targets()["targets"]["direct_control"]
+        observation = client.observation()["observation"]["targets"][0]
+        operation = _direct_control_joint_operation(
+            identity, direct, request_id="forged-node-effect",
+            positions_rad=list(observation["positions_si"]),
+        )
+        operation.update({key: capture[key] for key in (
+            "program_id", "program_revision", "program_binding_id", "program_run_id",
+        )})
+        operation["participants"][0]["execution_scope"] = {
+            "node_instance_id": "root", "node_attempt_id": "root.1",
+        }
+        # The sealed fixture has a logical root only. A valid claim and a
+        # physically valid target cannot turn that node into an effect owner.
+        with pytest.raises(HeadlessApiError) as logical:
+            client.submit(operation)
+        assert logical.value.details["reason"] == "program_execution_scope_unknown"
+        raw = ExecutionCommandClient(run_root, timeout_seconds=2.0)
+        denied = raw._exchange({
+            "api_version": EXECUTION_COMMAND_VERSION, "command": "submit",
+            "operation": operation,
+            "attribution": {"transport": "http", "assurance": "unverified", "principal_id": None},
+        })
+        assert denied["ok"] is False
+        assert denied["error"]["code"] == "execution_command_invalid"
+        assert "Program origin requires the private owner-client path" in denied["error"]["message"]
+        without_origin = copy.deepcopy(operation)
+        without_origin["participants"][0].pop("execution_scope")
+        missing = raw._exchange({
+            "api_version": EXECUTION_COMMAND_VERSION, "command": "submit",
+            "operation": without_origin,
+            "attribution": {"transport": "http", "assurance": "unverified", "principal_id": None},
+        })
+        assert missing["ok"] is False
+        assert missing["error"]["details"]["reason"] == "program_execution_scope_missing"
+        # A different run cannot evade the capture by dropping its origin.
+        without_origin["program_run_id"] = "unclaimed-foreign-run"
+        foreign = raw.submit(
+            OperationIntentRequest.model_validate(without_origin),
+            trusted_principal_id=None,
+        )
+        assert foreign["ok"] is False
+        assert foreign["error"]["details"]["reason"] == "program_execution_scope_missing"
+        forged_direct = _direct_control_joint_operation(
+            identity, direct, request_id="forged-direct-product",
+            positions_rad=list(observation["positions_si"]),
+        )
+        forged_direct["program_id"] = "forged-direct-program"
+        forged = raw.submit(
+            OperationIntentRequest.model_validate(forged_direct),
+            trusted_principal_id=None,
+        )
+        assert forged["ok"] is False
+        assert forged["error"]["details"]["reason"] == "direct_control_product_mismatch"
+        scoped_direct = _direct_control_joint_operation(
+            identity, direct, request_id="scoped-direct-product",
+            positions_rad=list(observation["positions_si"]),
+        )
+        scoped_direct["participants"][0]["execution_scope"] = {
+            "node_instance_id": "root", "node_attempt_id": "root.1",
+        }
+        with pytest.raises(HeadlessApiError) as scoped:
+            client.submit(scoped_direct)
+        assert scoped.value.details["reason"] == "direct_control_product_mismatch"
+        mixed = copy.deepcopy(operation)
+        mixed["participants"].append(without_origin["participants"][0])
+        mixed["coordination_policy"] = "coordinated_all"
+        mixed_result = raw._exchange({
+            "api_version": EXECUTION_COMMAND_VERSION, "command": "submit",
+            "operation": mixed,
+            "attribution": {"transport": "internal", "assurance": "unverified", "principal_id": None},
+        })
+        assert mixed_result["ok"] is False
+        assert mixed_result["error"]["details"]["reason"] == "program_execution_scope_missing"
+        stopped = client.stop_program_run({
+            "request_context": {
+                "request_id": "stop.program-capture.1",
+                "request_owner_epoch": identity["owner_epoch"],
+                "source_label": "native-capture-test", "correlation_id": None,
+            },
+            "program_run_id": capture["program_run_id"],
+            "reason": "Stop before any node effect",
+        })
+        assert stopped["ok"] is True
+        assert client.register_program_run_capture(capture) == accepted
+        with pytest.raises(HeadlessApiError) as held:
+            client.submit(operation)
+        assert held.value.details["reason"] == "program_run_stop_fence_active"
+        with sqlite3.connect(state_root / "operation-journal.sqlite3") as database:
+            assert database.execute("SELECT COUNT(*) FROM operation_snapshots").fetchone()[0] == 0
+    finally:
+        _stop_host(process)
+
+
 def test_internal_program_run_stop_uses_one_exact_priority_request(
     tmp_path: Path,
 ) -> None:
@@ -1583,6 +1707,10 @@ def test_pick_place_planning_crosses_real_cpp_owner_and_thin_clients(
 
 
 def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
+    from manyforge_program_runner.execution_transport import (
+        ProgramRunnerExecutionTransport,
+    )
+
     built_fixture = _required_path("MANYFORGE_I6_NATIVE_FIXTURE_ROOT")
     fixture_root = tmp_path / "fixture"
     shutil.copytree(built_fixture, fixture_root)
@@ -1992,20 +2120,7 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
         direct_terminal = _wait_terminal(runner, direct_operation_id)["operation"]
         assert direct_terminal["state"] == "completed", direct_terminal
         assert direct_terminal["program_binding_id"] == direct["program_binding_id"]
-        composer.acknowledge_completed_operation(
-            direct_operation_id,
-            {
-                "request_context": {
-                    "request_id": "ack-composer-direct-operation",
-                    "request_owner_epoch": first_status["owner_epoch"],
-                    "source_label": "composer_ui",
-                    "correlation_id": None,
-                },
-                "operation_id": direct_operation_id,
-                "expected_operation_revision": direct_terminal["operation_revision"],
-                "reason": "release completed direct-control operation",
-            },
-        )
+        _wait_retired(native, direct_operation_id)
 
         relative_status = headless.execution_diagnostics()["status"]
         relative_direct = relative_status["direct_control"]
@@ -2044,20 +2159,7 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
             )
             <= relative_payload["tolerances"]["rotation_tol_rad"]
         )
-        composer.acknowledge_completed_operation(
-            relative_operation_id,
-            {
-                "request_context": {
-                    "request_id": "ack-composer-relative-operation",
-                    "request_owner_epoch": relative_status["owner_epoch"],
-                    "source_label": "composer_ui",
-                    "correlation_id": None,
-                },
-                "operation_id": relative_operation_id,
-                "expected_operation_revision": relative_terminal["operation_revision"],
-                "reason": "release completed relative operation",
-            },
-        )
+        _wait_retired(native, relative_operation_id)
 
         direct_gripper_accepted = composer.execute(gripper_intent)
         direct_gripper_operation_id = direct_gripper_accepted["accepted"][
@@ -2070,22 +2172,7 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
         assert direct_gripper_terminal["program_binding_id"] == (
             direct_gripper["program_binding_id"]
         )
-        composer.acknowledge_completed_operation(
-            direct_gripper_operation_id,
-            {
-                "request_context": {
-                    "request_id": "ack-composer-direct-gripper-operation",
-                    "request_owner_epoch": first_status["owner_epoch"],
-                    "source_label": "composer_ui",
-                    "correlation_id": None,
-                },
-                "operation_id": direct_gripper_operation_id,
-                "expected_operation_revision": direct_gripper_terminal[
-                    "operation_revision"
-                ],
-                "reason": "release completed direct-control gripper operation",
-            },
-        )
+        _wait_retired(native, direct_gripper_operation_id)
 
         with pytest.raises(HeadlessClientError) as rejected:
             _runner_submission(
@@ -2375,6 +2462,19 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
         stopped = _wait_terminal(runner, controlled_id)["operation"]
         stop_settlement_elapsed_s = time.monotonic() - stop_requested_at
         assert stopped["state"] == "stopped", json.dumps(stopped, sort_keys=True)
+        current_query = ProgramRunnerExecutionTransport(
+            execution_run_root, timeout_seconds=2.0
+        )
+        controlled_query = {
+            "schema_version": "manyforge.program_operation_query.v1",
+            "owner_epoch": first_status["owner_epoch"],
+            "program_binding_id": manifest["program_binding_id"],
+            "program_run_id": "n3-program-run-1",
+            "target_role_id": manifest["target_role_id"],
+        }
+        assert current_query.query_operation(controlled_query)["operation"][
+            "operation_id"
+        ] == controlled_id
         assert stopped["active_stop_id"] == stop_accepted["accepted"]["stop_id"]
         assert stop_acceptance_elapsed_s < 0.5
         projected_stop = headless.execution_diagnostics()["status"]["cell_stop_action"]
@@ -2509,6 +2609,9 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
             reason="release first stopped operation",
             correlation_id="n4-public-control-test",
         )
+        with pytest.raises(HeadlessApiError) as retired_query:
+            current_query.query_operation(controlled_query)
+        assert retired_query.value.code == "execution_operation_context_unavailable"
         persisted_scale_control = composer.runtime_scale_control(scale_selector)[
             "runtime_scale_control"
         ]
@@ -2727,7 +2830,7 @@ def test_target_queries_cannot_borrow_undeclared_capabilities(tmp_path: Path) ->
         _stop_host(process)
 
 
-def test_program_operation_query_and_scale_use_exact_native_scope(
+def test_program_operation_query_rejects_wrong_or_missing_native_context(
     tmp_path: Path,
 ) -> None:
     from manyforge_program_runner.execution_transport import (
@@ -2742,7 +2845,6 @@ def test_program_operation_query_and_scale_use_exact_native_scope(
     run_root.mkdir()
     process = _start_host(fixture_root, state_root, run_root, manifest)
     client = ProgramRunnerExecutionTransport(run_root, timeout_seconds=2.0)
-    runner = OrchestratorRunner(KernelClient(client))
     try:
         identity = client.identity()["identity"]
         query = {
@@ -2762,90 +2864,10 @@ def test_program_operation_query_and_scale_use_exact_native_scope(
                 client.query_operation({**query, **change})
             assert error.value.code == code
         assert client.events(identity["owner_epoch"], 0) == before
-        accepted = _runner_submission(
-            runner,
-            request_id="h5-control-move",
-            joint_names=("joint1",),
-            positions=(1.5,),
-        )
-        operation_id = accepted["accepted"]["operation_id"]
-        _wait_state(runner, operation_id, {"executing"})
-        selected = client.query_operation(query)["operation"]
-        assert selected["operation_id"] == operation_id
-        assert selected["program_run_id"] == query["program_run_id"]
-        with pytest.raises(HeadlessApiError) as error:
-            client.query_operation({**query, "program_run_id": "foreign-run"})
-        assert error.value.code == "execution_operation_context_unavailable"
-
-        def control_request(label, operation):
-            return {
-                "request_context": {
-                    "request_id": label,
-                    "request_owner_epoch": identity["owner_epoch"],
-                    "source_label": "ui6h-native-control-test",
-                },
-                "operation_id": operation_id,
-                "expected_operation_revision": operation["operation_revision"],
-                "reason": label,
-            }
-
-        client.pause(operation_id, control_request("h5-pause", selected))
-        _wait_state(runner, operation_id, {"paused"})
-        current = client.query_operation(query)
-        scaling = control_request("h5-operation-scale", current["operation"])
-        scaling.pop("reason")
-        scaling.update(
-            scale=0.4,
-            expected_runtime_scale_generation=current["operation"][
-                "runtime_scale_generation"
-            ],
-        )
-        scaled = client.set_operation_runtime_scale(scaling)["accepted"]
-        deadline = time.monotonic() + 2.0
-        wait = threading.Event()
-        while time.monotonic() < deadline:
-            current = client.query_operation(query)
-            if current["runtime_scale"]["state"] == "applied":
-                break
-            wait.wait(0.005)
-        assert (
-            current["runtime_scale"]["generation"] == scaled["runtime_scale_generation"]
-        )
-        assert current["runtime_scale"]["state"] == "applied"
-        assert current["runtime_scale"]["effective_scale"] == pytest.approx(0.4)
-        assert (
-            client.control_state()["control_state"]["runtime_scale_control"][
-                "requested_scale"
-            ]
-            == 1.0
-        )
-        client.resume(operation_id, control_request("h5-resume", current["operation"]))
-        _wait_state(runner, operation_id, {"executing"})
-        current = client.query_operation(query)["operation"]
-        stop = client.stop(
-            {
-                "request_context": control_request("h5-stop", current)[
-                    "request_context"
-                ],
-                "operations": [
-                    {
-                        "operation_id": operation_id,
-                        "expected_operation_revision": current["operation_revision"],
-                        "expected_stop_generation": 0,
-                    }
-                ],
-            }
-        )
-        stopped = _wait_state(runner, operation_id, {"stopped"})["operation"]
-        assert stopped["active_stop_id"] == stop["accepted"]["stop_id"]
-        assert (
-            client.query_operation(query)["operation"]["operation_id"] == operation_id
-        )
-        client.reset(operation_id, control_request("h5-reset", stopped))
-        assert client.read(operation_id)["resident"] is False
-        with pytest.raises(HeadlessApiError) as error:
-            client.query_operation(query)
-        assert error.value.code == "execution_operation_context_unavailable"
+        # Positive lookup, paused scale, Resume and unchanged persistent scale
+        # are checked by ui6h_target_queries.py --controls through an actual
+        # claimed/captured Program. The old synthetic submission here had no
+        # authored origin and no longer represents the Runner's contract.
     finally:
         _stop_host(process)
 
@@ -3327,6 +3349,11 @@ def test_native_arm_and_gripper_scoped_stop_do_not_cross_lifecycles(
             ),
         }
         intents["arm"]["participants"][0]["payload"]["speed_profile"]["velocity_scale"] = 0.1
+        # This tests explicit owner Reset, not the manual-control host's
+        # automatic terminal retirement. Give each independent operation a
+        # non-manual run identity so both owners cannot race the same Reset.
+        for target, intent in intents.items():
+            intent["program_run_id"] = f"native-isolation-{target}"
         tool_payload = intents["gripper"]["participants"][0]["payload"]
         tool_payload["completion_timeout_s"] = 3.0
         tool_payload["caller_options"][0]["value_s"] = 2.0

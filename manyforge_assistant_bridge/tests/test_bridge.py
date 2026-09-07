@@ -210,7 +210,7 @@ def _request(projection: dict[str, Any]) -> dict[str, Any]:
             "candidateAvailable": True,
             "programRevision": "sha256:" + "8" * 64,
             "program": {
-                "api_version": "manyforge.program.v1",
+                "api_version": "manyforge.program.v2",
                 "program_revision": "sha256:" + "8" * 64,
             },
             "diagnostics": [],

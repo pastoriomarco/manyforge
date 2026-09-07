@@ -226,6 +226,7 @@ export interface ProgramTreeNode {
   modification_policy?: ProgramNodeModificationPolicy;
   recovery_policy?: ProgramNodeRecoveryPolicy;
   operator_stop_policy?: ProgramOperatorStopPolicy;
+  execution_groups?: 'inherit' | 'all' | string[];
 }
 
 export interface ProgramParameterDeclaration {
@@ -258,7 +259,7 @@ export interface BlackboardKeyDeclaration {
 }
 
 export interface ProgramDocument {
-  api_version: 'manyforge.program.v1';
+  api_version: 'manyforge.program.v2';
   program_id: string;
   program_revision: string;
   program_profile: 'composable-cell-v1';
@@ -683,14 +684,28 @@ export interface RuntimeOverrideObservationCandidate {
   sourceOwnerGeneration: number | null;
 }
 
+export interface ProgramExecutionSelectionControls {
+  selectionRevision: number;
+  groups: Array<{
+    groupId: string;
+    nodeCount: number;
+    heldNodeCount: number;
+    state: 'running' | 'held' | 'mixed' | 'stopping' | 'faulted' | 'unavailable';
+    stopAllowed: boolean;
+    resumeAllowed: boolean;
+    resumeUnavailableReason: string | null;
+  }>;
+}
+
 export interface ProgramRuntimeControlProjection {
-  schemaVersion: 'manyforge.program_runtime_control_projection.v3';
+  schemaVersion: 'manyforge.program_runtime_control_projection.v4';
   ownerId: string;
   ownerEpoch: string;
   programRunId: string;
   runRevision: number;
   runtimeControls: ProgramRuntimeControlsSnapshot;
   recoveryOffer: CycleRecoveryOffer | null;
+  executionSelections: ProgramExecutionSelectionControls;
   observationOverrideCandidate: RuntimeOverrideObservationCandidate;
 }
 

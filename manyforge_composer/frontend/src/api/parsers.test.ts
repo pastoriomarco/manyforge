@@ -53,7 +53,7 @@ it('bounds discovery by encoded bytes and requires the exact continuation', () =
 
 function programFixture(): Record<string, unknown> {
   return {
-    api_version: 'manyforge.program.v1',
+    api_version: 'manyforge.program.v2',
     program_id: 'fixture',
     program_revision: `sha256:${'a'.repeat(64)}`,
     program_profile: 'composable-cell-v1',
@@ -597,7 +597,7 @@ describe('Program product projections', () => {
 
   function runtimeControlsProjection(): Record<string, unknown> {
     return {
-      schema_version: 'manyforge.program_runtime_control_projection.v3',
+      schema_version: 'manyforge.program_runtime_control_projection.v4',
       owner_id: 'program-runner.cell-a',
       owner_epoch: 'program-runner.epoch.1',
       program_run_id: 'program-run.1',
@@ -621,6 +621,12 @@ describe('Program product projections', () => {
         audit: [],
       },
       recovery_offer: null,
+      execution_selections: {
+        selection_revision: 0,
+        groups: [{ group_id: 'all', node_count: 1, held_node_count: 0,
+          state: 'running', stop_allowed: true, resume_allowed: false,
+          resume_unavailable_reason: 'selection_not_held' }],
+      },
       observation_override_candidate: {
         schema_version: 'manyforge.runtime_override_observation_candidate.v1',
         available: false,
@@ -1088,6 +1094,24 @@ describe('parseCatalogResponse', () => {
 });
 
 describe('Program workspace parsers', () => {
+  it('preserves canonical execution membership without inventing runtime group state', () => {
+    const fixture = workspaceFixture();
+    const program = (fixture.draft as Record<string, unknown>).program as Record<string, unknown>;
+    const tree = program.tree as Record<string, unknown>;
+    tree.execution_groups = ['all_grippers', 'robot_a'];
+    expect(parseProgramWorkspaceResponse(fixture).draft.program?.tree.execution_groups)
+      .toEqual(['all_grippers', 'robot_a']);
+    tree.execution_groups = 'all';
+    expect(parseProgramWorkspaceResponse(fixture).draft.program?.tree.execution_groups).toBe('all');
+    for (const malformed of [null, 'inherit', 'robot_a', [], ['all'], ['a', 'a'], ['z', 'a'], ['UPPER']]) {
+      tree.execution_groups = malformed;
+      expect(() => parseProgramWorkspaceResponse(fixture)).toThrow();
+    }
+    delete tree.execution_groups;
+    program.api_version = 'manyforge.program.v1';
+    expect(() => parseProgramWorkspaceResponse(fixture)).toThrow('manyforge.program.v2');
+  });
+
   it('keeps Draft, Saved, and unavailable Applied identities distinct', () => {
     const workspace = parseProgramWorkspaceResponse(workspaceFixture());
 

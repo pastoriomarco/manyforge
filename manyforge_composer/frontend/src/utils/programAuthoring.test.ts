@@ -237,7 +237,7 @@ describe('Program parameter binding continuity', () => {
     };
     const selected = tree({ parameters: { target_role: 'gripper' } });
     const program: ProgramAuthoringDocument = {
-      api_version: 'manyforge.program.v1',
+      api_version: 'manyforge.program.v2',
       program_id: 'semantic_test',
       program_profile: 'composable-cell-v1',
       name: 'Semantic test',
@@ -295,7 +295,7 @@ describe('Program parameter binding continuity', () => {
       ],
     };
     const program = {
-      api_version: 'manyforge.program.v1',
+      api_version: 'manyforge.program.v2',
       program_id: 'bound_motion',
       program_profile: 'composable-cell-v1',
       name: 'Bound motion',
@@ -367,7 +367,7 @@ describe('Program parameter binding continuity', () => {
       ],
     };
     const program = {
-      api_version: 'manyforge.program.v1',
+      api_version: 'manyforge.program.v2',
       program_id: 'incomplete_motion',
       program_profile: 'composable-cell-v1',
       name: 'Incomplete motion',

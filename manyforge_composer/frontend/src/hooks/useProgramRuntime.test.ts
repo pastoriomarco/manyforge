@@ -209,6 +209,22 @@ describe('Program runtime idle selection', () => {
 });
 
 describe('Program command settlement', () => {
+  it.each(['motion-stop', 'resume-motion'] as const)(
+    'retires %s delivery feedback when its owner/run is replaced or ends', (pending) => {
+      const run = { ownerEpoch: 'owner.1', state: 'running',
+        capture: { programRunId: 'run.1' } } as ProgramRunStatus;
+      expect(programPendingAfterProjection(pending, run, null, null, run)).toBe(pending);
+      for (const replacement of [
+        null,
+        { ...run, ownerEpoch: 'owner.2' },
+        { ...run, capture: { ...run.capture, programRunId: 'run.2' } },
+        { ...run, state: 'succeeded' as const },
+      ]) {
+        expect(programPendingAfterProjection(pending, replacement, null, null, run)).toBeNull();
+      }
+    },
+  );
+
   it('mirrors authoritative owner state without waiting for a transport receipt', () => {
     const runningCycle = {
       programRunnerOwnerEpoch: 'runner.epoch.1',
@@ -353,7 +369,7 @@ describe('Program command settlement', () => {
       .toBeNull();
   });
 
-  it('keeps Motion Stop pending through acceptance and clears it only on exact evidence', () => {
+  it('keeps selected delivery feedback separate from physical Stop presentation', () => {
     const run = {
       ownerEpoch: 'runner.epoch.1',
       state: 'running',
@@ -362,6 +378,10 @@ describe('Program command settlement', () => {
     const settled = {
       ownerEpoch: 'runner.epoch.1',
       programRunId: 'run-1',
+      executionSelections: { selectionRevision: 1, groups: [
+        { groupId: 'all', nodeCount: 1, heldNodeCount: 1, state: 'held',
+          stopAllowed: true, resumeAllowed: true, resumeUnavailableReason: null },
+      ] },
       recoveryOffer: {
         programRunId: 'run-1',
         recoveryClass: 'ordinary_operator_stop',
@@ -383,7 +403,9 @@ describe('Program command settlement', () => {
       run,
       { ...settled, ownerEpoch: 'runner.epoch.stale' },
     )).toBe('motion-stop');
-    expect(programPendingAfterProjection('motion-stop', run, settled)).toBeNull();
+    // Sending feedback ends on transport receipt, not guessed physical status.
+    expect(programPendingAfterProjection('motion-stop', run, settled)).toBe('motion-stop');
+    expect(programMotionStopSettled(run, settled)).toBe(true);
     expect(programPendingAfterProjection(
       'motion-stop',
       { ...run, state: 'stopped' },
@@ -432,7 +454,7 @@ describe('Program command settlement', () => {
       Parameters<typeof programMotionStopSettled>[1]
     >;
     expect(programMotionStopSettled(run, resetOnly)).toBe(true);
-    expect(programPendingAfterProjection('motion-stop', run, resetOnly)).toBeNull();
+    expect(programPendingAfterProjection('motion-stop', run, resetOnly)).toBe('motion-stop');
   });
 
   it('keeps Resume disabled until the exact recovery offer changes', () => {

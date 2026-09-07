@@ -117,7 +117,7 @@ function authoringProgram(
   keys: BlackboardKeyDeclaration[] = [],
 ): ProgramAuthoringDocument {
   return {
-    api_version: 'manyforge.program.v1',
+    api_version: 'manyforge.program.v2',
     program_id: 'test_program',
     program_profile: 'composable-cell-v1',
     name: 'Test Program',
@@ -751,6 +751,7 @@ describe('Program authoring panels', () => {
       dismissError: vi.fn(),
       run: vi.fn(),
       stopMotion: vi.fn(),
+      resumeMotion: vi.fn(),
       fullStop: vi.fn(),
       resumeFullStop: vi.fn(),
       stop: vi.fn(),
@@ -819,7 +820,7 @@ describe('Program authoring panels', () => {
         programLoaded: true,
         authoring: {
           schema_version: 'manyforge.composer_authoring_forest.v1',
-          api_version: 'manyforge.program.v1',
+          api_version: 'manyforge.program.v2',
           program_id: 'program-blocked',
           program_profile: 'composable-cell-v1',
           name: 'Blocked',
@@ -835,7 +836,7 @@ describe('Program authoring panels', () => {
         candidateAvailable: true,
         programRevision: `sha256:${'a'.repeat(64)}`,
         program: {
-          api_version: 'manyforge.program.v1',
+          api_version: 'manyforge.program.v2',
           program_id: 'program-blocked',
           program_revision: `sha256:${'a'.repeat(64)}`,
           program_profile: 'composable-cell-v1',
@@ -937,6 +938,7 @@ describe('Program authoring panels', () => {
       dismissError: vi.fn(),
       run: vi.fn(),
       stopMotion: vi.fn(),
+      resumeMotion: vi.fn(),
       fullStop: vi.fn(),
       resumeFullStop: vi.fn(),
       stop: vi.fn(),

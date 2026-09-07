@@ -14,7 +14,10 @@ from manyforge_behavior.orchestration_ports import (
     ProgramRunScopeSnapshot,
     ProgramRunScopeState,
 )
-from manyforge_behavior.program_run_owner import ProgramRunOwnerError
+from manyforge_behavior.program_run_owner import (
+    ProgramRunOwnerError, ProgramRunOwnerOutcomeUnknownError,
+    ProgramRunOwnerRecoveryIncompleteError,
+)
 from manyforge_headless_api.models import (
     CycleRecoveryActionRequest,
     ProgramFullStopResetRequest,
@@ -41,7 +44,9 @@ from manyforge_program_runner.runtime_controls import ProgramRuntimeControls
 from manyforge_program_runner.models import (
     ProgramCycleResetRequest,
     ProgramNodeAvailabilityRequest,
+    ProgramSelectionStopRequest,
 )
+from manyforge_behavior.nodes.stop_policy import OperatorMotionStopSnapshot
 
 
 _DIGEST_A = "sha256:" + "a" * 64
@@ -129,6 +134,7 @@ class _Headless:
     def __init__(self) -> None:
         self.applied_reads = 0
         self.selection_reads = 0
+        self.registered_captures: list[dict[str, Any]] = []
 
     def program_applied(self) -> dict[str, Any]:
         self.applied_reads += 1
@@ -151,12 +157,22 @@ class _Headless:
         return {
             "ok": True,
             "identity": {
+                "owner_epoch": "execution.epoch.1",
                 "program_binding_id": None,
                 "retained_bundle_id": None,
                 "graph_revision": None,
                 "active_publication_generation": 1,
                 "scene_revision": {"revision_id": 1},
             },
+        }
+
+    def register_program_run_capture(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        self.registered_captures.append(deepcopy(dict(body)))
+        return {
+            "ok": True,
+            "command": "register_program_run_capture",
+            "program_run_id": body["program_run_id"],
+            "claim_generation": body["claim_generation"],
         }
 
     def stop_fault(self) -> dict[str, Any]:
@@ -258,6 +274,23 @@ class _Owner:
 
     def intervention(self, _program_run_id: str):
         return None
+
+    def operator_stop_scope(self, _program_run_id: str):
+        return OperatorMotionStopSnapshot()
+
+    def execution_selection_controls(self, program_run_id: str) -> dict[str, Any]:
+        running = self.rows[program_run_id].state == "running"
+        return {
+            "selection_revision": 0,
+            "groups": [{
+                "group_id": "all", "node_count": 1, "held_node_count": 0,
+                "state": "running" if running else "unavailable",
+                "stop_allowed": running, "resume_allowed": False,
+                "resume_unavailable_reason": (
+                    "selection_not_held" if running else "program_run_not_running"
+                ),
+            }],
+        }
 
 
 class _ObservationOwner(_Owner):
@@ -402,6 +435,7 @@ class _Host:
         self,
         program_run_id: str,
         *,
+        group_id: str = "all",
         reason: str | None,
         stop_request_id: str | None = None,
     ) -> _Snapshot:
@@ -1376,7 +1410,13 @@ def _bypass_scene_preparation(monkeypatch: pytest.MonkeyPatch) -> None:
         ProgramRuntime,
         "_prepare_run_scene",
         lambda _self, _admission, _run_id, **_kwargs: (
-            object(),
+            SimpleNamespace(
+                program_id="cell-pick",
+                program_revision=_DIGEST_A,
+                program_binding_id=_DIGEST_B,
+                retained_bundle_id=_DIGEST_A,
+                graph_revision=_DIGEST_B,
+            ),
             (),
             deepcopy(proof),
         ),
@@ -1408,7 +1448,14 @@ class _PreparedRunAdmission:
         self.program = SimpleNamespace(to_dict=lambda: {"scene": []})
 
     def port_context(self, program_run_id: str) -> object:
-        return SimpleNamespace(program_run_id=program_run_id)
+        return SimpleNamespace(
+            program_run_id=program_run_id,
+            program_id="cell-pick",
+            program_revision=_DIGEST_A,
+            program_binding_id=_DIGEST_B,
+            retained_bundle_id=_DIGEST_A,
+            graph_revision=_DIGEST_B,
+        )
 
 
 def test_applied_activation_prepares_scene_while_idle_without_run_claim(
@@ -1475,6 +1522,122 @@ def test_applied_activation_prepares_scene_while_idle_without_run_claim(
     assert admission.claims == []
     assert runtime.cycle_status()["state"] == "idle_after_reset"
     runtime.shutdown()
+
+
+@pytest.mark.parametrize("delayed_stop", [False, True])
+def test_starting_stop_reaches_native_while_capture_registration_is_held(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, delayed_stop: bool
+) -> None:
+    entered, release = Event(), Event()
+    stop_entered, release_stop = Event(), Event()
+    stops: list[dict[str, Any]] = []
+
+    class HeldRegistration(_Headless):
+        def register_program_run_capture(self, body):
+            entered.set()
+            assert release.wait(5), "registration gate was not released"
+            return super().register_program_run_capture(body)
+
+        def stop_program_run(self, body):
+            stops.append(deepcopy(body))
+            assert body["request_context"]["request_owner_epoch"] == "execution.epoch.1"
+            return {
+                "ok": True, "owner_epoch": "execution.epoch.1",
+                "accepted": {
+                    "request_id": body["request_context"]["request_id"],
+                    "stop_id": "stop.1", "stop_generation": len(stops),
+                    "replay_status": "accepted_new",
+                },
+            }
+
+    def ordinary_read_forbidden(**_kwargs):
+        raise AssertionError("Stop attempted an ordinary owner read")
+
+    headless, admission = HeldRegistration(), _Admission()
+    monkeypatch.setattr(admission, "recovery_inventory", ordinary_read_forbidden)
+    monkeypatch.setattr(
+        "manyforge_program_runner.runtime.build_applied_program_run_admission",
+        lambda *_args, **_kwargs: _PreparedRunAdmission(),
+    )
+    _bypass_scene_preparation(monkeypatch)
+    runtime = ProgramRuntime(
+        ProgramRunnerConfig(headless_url="http://headless.test", owner_epoch="runner.1"),
+        headless_client=headless, execution_transport=headless,
+        admission_client=admission,
+        cycle_journal=ProgramCycleJournal(tmp_path / "cycle.sqlite3", owner_epoch="runner.1"),
+    )
+    runtime._host.shutdown()
+    host = _Host(_Owner(), owner_id=runtime.owner_id, owner_epoch=runtime.owner_epoch)
+    runtime._host = host
+    runtime.start()
+    failures = []
+    stop_results, stop_errors = [], []
+    request_stop = runtime._native.scope.request_stop
+
+    def held_stop(program_run_id, stop_request_id, reason):
+        if delayed_stop and stop_request_id.startswith("execution:"):
+            stop_entered.set()
+            assert release_stop.wait(5), "Stop gate was not released"
+        return request_stop(program_run_id, stop_request_id, reason)
+
+    monkeypatch.setattr(runtime._native.scope, "request_stop", held_stop)
+
+    def start():
+        try:
+            runtime.start_run(_start_request())
+        except Exception as error:
+            failures.append(error)
+
+    starter = Thread(target=start)
+    stopper = None
+    starter.start()
+    try:
+        assert entered.wait(5), "Start did not reach the registration gate"
+
+        request = ProgramRunStopRequest.model_validate({
+            "request_id": "stop.during-registration", "request_owner_epoch": "composer.1",
+            "source_label": "operator", "correlation_id": None,
+            "program_run_id": "program-cycle.1", "expected_owner_epoch": "runner.1",
+            "reason": "stop during capture",
+        })
+
+        def stop():
+            try:
+                stop_results.append(runtime.stop_run("program-cycle.1", request))
+            except Exception as error:
+                stop_errors.append(error)
+
+        if delayed_stop:
+            stopper = Thread(target=stop)
+            stopper.start()
+            assert stop_entered.wait(5), "Stop did not commit Stopping"
+            release.set()
+            starter.join(5)
+            assert not starter.is_alive()
+            assert len(stops) == 1
+            assert runtime._starting_kernel_owner_epoch is None
+            release_stop.set()
+            stopper.join(5)
+            assert not stopper.is_alive()
+            assert len(stops) == 2
+        else:
+            stop()
+            assert len(stops) == 1 and not release.is_set()
+        assert not stop_errors
+        assert stop_results[0]["state"] == "stopping"
+        assert host.start_admissions == []
+    finally:
+        release.set()
+        release_stop.set()
+        starter.join(5)
+        if stopper is not None:
+            stopper.join(5)
+        runtime.shutdown()
+    assert not starter.is_alive()
+    assert len(failures) == 1
+    assert isinstance(failures[0], ProgramRunnerError)
+    assert failures[0].code == "program_run_superseded_by_stop"
+    assert runtime._starting_kernel_owner_epoch is None
 
 
 def test_run_prepares_while_idle_then_only_verifies_after_claim(
@@ -2103,6 +2266,18 @@ def test_repeated_run_is_state_rejected_and_keeps_one_active_product_run(
 
     runtime.start()
     request = _start_request()
+    register = headless.register_program_run_capture
+
+    def register_after_claim(body: Mapping[str, Any]) -> dict[str, Any]:
+        assert host.start_admissions == []
+        cycle = runtime._journal.read()
+        assert cycle.state == "starting" and cycle.claim is not None
+        assert body["claim_generation"] == cycle.claim["claim_generation"]
+        assert body["program_runner_owner_epoch"] == runtime.owner_epoch
+        assert body["program_run_id"] == cycle.program_run_id
+        return register(body)
+
+    monkeypatch.setattr(headless, "register_program_run_capture", register_after_claim)
     started = runtime.start_run(request)
     with pytest.raises(ProgramRunnerError) as repeated:
         runtime.start_run(request)
@@ -2114,6 +2289,9 @@ def test_repeated_run_is_state_rejected_and_keeps_one_active_product_run(
     assert headless.applied_reads == 2
     assert headless.selection_reads == 1
     assert len(joins) == 1
+    assert len(headless.registered_captures) == 1
+    assert "table" not in headless.registered_captures[0]
+    monkeypatch.setattr(headless, "register_program_run_capture", register)
 
     with pytest.raises(ProgramRunnerError) as active:
         runtime.start_run(_start_request(request_id="request.start.2"))
@@ -2132,7 +2310,7 @@ def test_repeated_run_is_state_rejected_and_keeps_one_active_product_run(
         )
     assert changed_repeated_intent.value.code == "program_cycle_reset_required"
 
-    motion_stop = ProgramRunStopRequest.model_validate(
+    motion_stop = ProgramSelectionStopRequest.model_validate(
         {
             "request_id": "request.motion-stop.1",
             "request_owner_epoch": "composer.epoch.1",
@@ -2157,12 +2335,14 @@ def test_repeated_run_is_state_rejected_and_keeps_one_active_product_run(
     def observe_motion_stopping(
         program_run_id: str,
         *,
+        group_id: str = "all",
         reason: str | None,
         stop_request_id: str | None = None,
     ) -> _Snapshot:
         stopping_statuses.append(runtime.cycle_status())
         return original_motion_stop(
             program_run_id,
+            group_id=group_id,
             reason=reason,
             stop_request_id=stop_request_id,
         )
@@ -2175,20 +2355,18 @@ def test_repeated_run_is_state_rejected_and_keeps_one_active_product_run(
     assert motion_stopped["state"] == "running"
     assert stop_path_retention == []
     assert len(stopping_statuses) == 1
-    assert stopping_statuses[0]["state"] == "stopping"
-    assert stopping_statuses[0]["current_command_kind"] == "program_motion_stop"
+    assert stopping_statuses[0]["state"] == "running"
     stopping_commands = {
         row["command_kind"]: row
         for row in stopping_statuses[0]["allowed_commands"]
     }
-    assert stopping_commands["program_motion_stop"]["allowed"] is False
-    assert stopping_commands["program_reset"]["allowed"] is False
+    assert stopping_commands["program_motion_stop"]["allowed"] is True
+    assert stopping_commands["program_reset"]["allowed"] is True
     assert host.motion_stop_calls == [
         ("program-cycle.1", "ordinary operator motion Stop")
     ]
     motion_stopped_cycle = runtime.cycle_status()
-    assert motion_stopped_cycle["state"] == "stopping"
-    assert motion_stopped_cycle["current_command_kind"] == "program_motion_stop"
+    assert motion_stopped_cycle["state"] == "running"
 
     settled_motion_stop = _Snapshot(
         "program-cycle.1",
@@ -2201,11 +2379,10 @@ def test_repeated_run_is_state_rejected_and_keeps_one_active_product_run(
     runtime._observe_run_state(settled_motion_stop)  # noqa: SLF001
     motion_stopped_cycle = runtime.cycle_status()
     assert motion_stopped_cycle["state"] == "running"
-    assert motion_stopped_cycle["current_command_kind"] == "program_motion_stop"
 
     full_stop = ProgramRunStopRequest.model_validate(
         {
-            **motion_stop.model_dump(mode="json"),
+            **motion_stop.model_dump(mode="json", exclude={"group_id"}),
             "request_id": "request.full-stop.1",
             "reason": "ordinary operator Full Stop",
         }
@@ -2400,11 +2577,104 @@ def test_repeated_run_is_state_rejected_and_keeps_one_active_product_run(
     ]
 
 
-@pytest.mark.parametrize("near_revision_limit", [False, True])
+@pytest.mark.parametrize("case", ["unselected", "incomplete", "unknown"])
+def test_default_resume_routes_only_selected_nodes_and_preserves_partial_outcomes(
+    monkeypatch, tmp_path, case,
+):
+    monkeypatch.setattr(
+        "manyforge_program_runner.runtime.build_applied_program_run_admission",
+        lambda *_args, **_kwargs: object(),
+    )
+    _bypass_scene_preparation(monkeypatch)
+    runtime, journal, _admission = _reconcile_runtime(
+        tmp_path,
+        journal_owner_epoch="runner.1",
+        runtime_owner_epoch="runner.1",
+        inventory={},
+    )
+    owner = _Owner()
+    host = _Host(owner, owner_id=runtime.owner_id, owner_epoch=runtime.owner_epoch)
+    runtime._owner, runtime._host = owner, host
+    runtime.start()
+    runtime.start_run(_start_request())
+    intervention = SimpleNamespace(
+        identity=SimpleNamespace(
+            program_run_id="program-cycle.1",
+            node_instance_id="move.1",
+            node_attempt_id="attempt.1",
+        ),
+        owner_task_id="operation.1",
+        policy_parameter="operator_stop_policy",
+    )
+    owner.intervention = lambda _run: intervention
+    owner.operator_stop_scope = lambda _run: OperatorMotionStopSnapshot(
+        4, frozenset({"other" if case == "unselected" else "move.1"})
+    )
+    offer = {
+        "offer_id": _DIGEST_A,
+        "offer_revision": 1,
+        "actions": [{"action_id": "replan_from_stopped_state", "enabled": True}],
+    }
+    runtime._recovery_offer = lambda *_args, **_kwargs: deepcopy(offer)
+    calls = []
+
+    def focused(*_args, **_kwargs):
+        calls.append("focused")
+        raise ProgramRunOwnerError("focused owner rejected without effect")
+
+    def selected(*_args, **_kwargs):
+        calls.append("selected")
+        error = (
+            ProgramRunOwnerRecoveryIncompleteError if case == "incomplete"
+            else ProgramRunOwnerOutcomeUnknownError
+        )
+        raise error("first cleanup accepted; second result " + case)
+
+    owner.apply_owner_recovery = focused
+    host.resume_motion = selected
+    request = CycleRecoveryActionRequest.model_validate(
+        {
+            "request_id": "resume.1",
+            "request_owner_epoch": "client.1",
+            "source_label": "test",
+            "expected_owner_epoch": runtime.owner_epoch,
+            "offer_id": offer["offer_id"],
+            "offer_revision": offer["offer_revision"],
+            "action_id": "replan_from_stopped_state",
+        }
+    )
+    try:
+        with pytest.raises(ProgramRunnerError) as rejected:
+            runtime.apply_recovery_action(request)
+        assert calls == ["focused" if case == "unselected" else "selected"]
+        if case == "unknown":
+            assert rejected.value.code == "program_cycle_reconciliation_required"
+            assert journal.read().reconciliation_required
+        else:
+            assert journal.read().state == "running"
+            assert not journal.read().reconciliation_required
+            if case == "incomplete":
+                assert rejected.value.code == "program_motion_resume_incomplete"
+                assert rejected.value.details["cleanup_accepted"] is True
+                assert rejected.value.details["recovery_offer"] == offer
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("near_revision_limit", "pending_stop", "failure"),
+    [
+        (False, False, None), (True, False, None),
+        (False, True, None), (True, True, None),
+        (False, True, "restore"), (False, True, "release"),
+    ],
+)
 def test_operator_motion_stop_reset_stops_tree_and_resets_cycle_once(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
     near_revision_limit: bool,
+    pending_stop: bool,
+    failure: str | None,
 ) -> None:
     monkeypatch.setattr(
         "manyforge_program_runner.runtime.build_applied_program_run_admission",
@@ -2443,6 +2713,32 @@ def test_operator_motion_stop_reset_stops_tree_and_resets_cycle_once(
     runtime.start()
     runtime.start_run(_start_request())
 
+    if pending_stop:
+        stop_run = host.stop_run
+        terminal = None
+
+        def stop_pending(program_run_id: str, **kwargs: Any) -> _Snapshot:
+            nonlocal terminal
+            terminal = stop_run(program_run_id, **kwargs)
+            stopping = _Snapshot(
+                program_run_id, owner_id=runtime.owner_id,
+                owner_epoch=runtime.owner_epoch, state="stopping",
+                revision=terminal.run_revision,
+            )
+            owner.rows[program_run_id] = stopping
+            return stopping
+
+        def wait_settlement(program_run_id: str, **_kwargs: Any) -> _Snapshot:
+            assert journal.read().state == "resetting"
+            assert journal.read().reset_phase == "stopping"
+            assert not admission.releases and not host.reset_calls
+            assert terminal is not None
+            owner.rows[program_run_id] = terminal
+            return terminal
+
+        host.stop_run = stop_pending
+        host.wait_terminal = wait_settlement
+
     if near_revision_limit:
         controls = runtime._controls("program-cycle.1")
         controls.stage_override(
@@ -2479,7 +2775,7 @@ def test_operator_motion_stop_reset_stops_tree_and_resets_cycle_once(
         "actions": [{"action_id": "reset_cycle", "enabled": True}],
     }
     runtime._recovery_offer = (  # type: ignore[method-assign]  # noqa: SLF001
-        lambda _run_id, *, cycle_generation: (
+        lambda _run_id, *, cycle_generation, selection_scope=None: (
             deepcopy(offer)
             if cycle_generation == 1 and journal.read().state == "running"
             else None
@@ -2499,6 +2795,49 @@ def test_operator_motion_stop_reset_stops_tree_and_resets_cycle_once(
         }
     )
 
+    if failure is not None:
+        if failure == "restore":
+            def failed_restore(*_args: Any) -> None:
+                raise ProgramRunnerError("program_scene_unavailable", "restore failed")
+
+            runtime._prepare_scene_after_reset = failed_restore
+        else:
+            admission.release_error = RuntimeError("release reply lost")
+
+        try:
+            with pytest.raises(ProgramRunnerError) as rejected:
+                runtime.apply_recovery_action(request)
+            cause = (
+                "program_scene_unavailable" if failure == "restore"
+                else "program_cycle_reconciliation_required"
+            )
+            assert rejected.value.code == "program_cycle_recovery_required"
+            assert rejected.value.details == {"cause_code": cause}
+            failed_cycle = journal.read()
+            assert failed_cycle.state == "recovery_required"
+            assert failed_cycle.cycle_generation == 1
+            assert failed_cycle.claim is not None
+            assert failed_cycle.reset_phase == (
+                "restoring_scene" if failure == "restore" else "releasing"
+            )
+            assert failed_cycle.reconciliation_required is (failure == "release")
+            assert failed_cycle.failure["code"] == cause
+            if failure == "restore":
+                assert failed_cycle.failure["failed_phase"] == "restoring_scene"
+                assert not admission.releases
+            pending = journal._database.execute(  # noqa: SLF001
+                "SELECT request_id,request_kind FROM program_cycle_inflight_commands"
+            ).fetchall()
+            # The wrapper retires only itself. Canonical Reset retires its
+            # known failure, but retains the unresolved release request.
+            assert all(row[0] != request.request_id for row in pending)
+            assert [row[1] for row in pending] == (
+                ["reset"] if failure == "release" else []
+            )
+        finally:
+            runtime.shutdown()
+        return
+
     result = runtime.apply_recovery_action(request)
 
     with pytest.raises(ProgramRunnerError) as completed_recovery:
@@ -2509,15 +2848,16 @@ def test_operator_motion_stop_reset_stops_tree_and_resets_cycle_once(
     assert result["cycle_resumed"] is False
     assert result["run"]["state"] == "stopped"
     assert result["recovery_offer"] is None
+    assert result["runtime_controls"] is None
     assert host.stop_calls == [
-        ("program-cycle.1", "operator Reset after motion Stop")
+        ("program-cycle.1", "operator requested Program cycle Reset")
     ]
     assert host.reset_calls == ["program-cycle.1"]
     assert cleared_stop_faults == ["program-cycle.1"]
     assert len(admission.releases) == 1
     assert journal.read().state == "idle_after_reset"
     if near_revision_limit:
-        controls_result = result["runtime_controls"]["runtime_controls"]
+        controls_result = result["owner_result"]["cycle_reset"]["runtime_controls"]
         assert controls_result["runtime_control_revision"] == maximum
         assert controls_result["audit"][-1]["kind"] == "program_runtime_controls_reset"
         assert controls_result["audit"][-1]["correlation_id"] == "operator-stop-reset.1"

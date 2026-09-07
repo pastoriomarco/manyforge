@@ -40,7 +40,7 @@ def _program(*, metadata: dict | None = None) -> Program:
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v1",
+        api_version="manyforge.program.v2",
     )
     return Program.from_dict(document, catalog)
 
@@ -53,7 +53,7 @@ def _program_with_instance_id(instance_id: str) -> Program:
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v1",
+        api_version="manyforge.program.v2",
     )
     return Program.from_dict(document, catalog)
 
@@ -76,7 +76,7 @@ def _lite6_program_with_literal_tcp_limit(limit_mps: float = 0.14) -> Program:
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v1",
+        api_version="manyforge.program.v2",
     )
     return Program.from_dict(document, catalog)
 
@@ -375,7 +375,7 @@ def test_store_observed_move_updates_only_selected_node(
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v1",
+        api_version="manyforge.program.v2",
     )
     session = ComposerDraftSession(Program.from_dict(document, catalog))
 
@@ -1015,6 +1015,27 @@ def test_node_policy_mutation_round_trips_nondefaults_and_reidentifies() -> None
         result.snapshot["program"],
         build_node_environment().catalog,
     ).to_dict() == result.snapshot["program"]
+
+
+def test_node_execution_groups_use_existing_draft_policy_validation() -> None:
+    session = ComposerDraftSession(_program())
+    arguments = {**_node_policy_arguments(session), "execution_groups": ["robot_a", "all_grippers"]}
+    result = _mutate(session, "program_draft_update_node_policies", arguments)
+    node = result.snapshot["program"]["tree"]["children"][0]
+    assert node["execution_groups"] == ["all_grippers", "robot_a"]
+    assert Program.from_dict(result.snapshot["program"], build_node_environment().catalog)
+
+    # Other policy changes preserve membership unless it is explicitly supplied.
+    result = _mutate(session, "program_draft_update_node_policies", _node_policy_arguments(session))
+    assert result.snapshot["program"]["tree"]["children"][0]["execution_groups"] == node["execution_groups"]
+    before = session.snapshot()
+    for groups in ([], ["all"], ["robot_a", "robot_a"], ["Robot A"], None):
+        with pytest.raises(DraftSessionError, match="execution_groups"):
+            _mutate(session, "program_draft_update_node_policies", {**arguments, "execution_groups": groups})
+        assert session.snapshot() == before
+    for groups in ("all", "inherit"):
+        result = _mutate(session, "program_draft_update_node_policies", {**arguments, "execution_groups": groups})
+        assert result.snapshot["program"]["tree"]["children"][0].get("execution_groups", "inherit") == groups
 
 
 def test_node_policy_rejects_unavailable_skills_atomically() -> None:
@@ -1742,7 +1763,7 @@ def test_motion_settings_and_insert_follow_catalog_field_bindings_not_parameter_
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v1",
+        api_version="manyforge.program.v2",
     )
     session = ComposerDraftSession(Program.from_dict(document, catalog))
 

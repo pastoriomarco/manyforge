@@ -30,7 +30,7 @@ def _config(tmp_path: Path) -> NativeLauncherConfig:
     examples = source / "examples"
     examples.mkdir()
     (examples / "fixture.program.yaml").write_text(
-        "schema_version: manyforge.program.v1\n",
+        "schema_version: manyforge.program.v2\n",
         encoding="utf-8",
     )
     (examples / "fixture.deployment.yaml").write_text(
@@ -354,7 +354,7 @@ def test_start_records_and_preserves_the_instance_program_workspace(
     )
     assert spawn_count == 4
     saved = config.program_workspace / "saved.program.yaml"
-    saved.write_text("schema_version: manyforge.program.v1\n", encoding="utf-8")
+    saved.write_text("schema_version: manyforge.program.v2\n", encoding="utf-8")
     record = launcher.store.read()
     assert record is not None
     assert record[1]["paths"]["program_workspace"] == str(
@@ -384,7 +384,7 @@ def test_start_records_and_preserves_the_instance_program_workspace(
     )
     assert spawn_count == 8
     assert saved.read_text(encoding="utf-8") == (
-        "schema_version: manyforge.program.v1\n"
+        "schema_version: manyforge.program.v2\n"
     )
     assert package_aggregate_sha256(config.install_root) == package_before
 

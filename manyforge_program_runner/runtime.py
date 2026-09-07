@@ -46,6 +46,7 @@ from manyforge_behavior.program_run_owner import (
     ProgramRunOwner,
     ProgramRunOwnerError,
     ProgramRunOwnerOutcomeUnknownError,
+    ProgramRunOwnerRecoveryIncompleteError,
     ProgramRunState,
     build_applied_program_run_admission,
 )
@@ -83,6 +84,8 @@ from .models import (
     ProgramFullStopResetRequest,
     ProgramFullStopResumeRequest,
     ProgramNodeAvailabilityRequest,
+    ProgramSelectionStopRequest,
+    ProgramSelectionResumeRequest,
     RuntimeBlackboardWriteRequest,
     RuntimeOverrideActionRequest,
     RuntimeOverridePromotionRequest,
@@ -290,6 +293,9 @@ class ProgramRuntime:
                 timeout_seconds=min(config.headless_timeout_seconds, 30.0),
             )
         self._kernel = KernelClient(execution_transport)
+        # Starting has no bound tree yet. Retain its already-read Kernel
+        # attribution so priority Stop never needs an ordinary owner read.
+        self._starting_kernel_owner_epoch: str | None = None
         self._model_transport = model_transport
         self._snapshot_source = snapshot_source
         if simulation_control is not None and any(
@@ -409,31 +415,7 @@ class ProgramRuntime:
                 continue
 
     def _observe_run_state(self, snapshot: Any) -> None:
-        """Join settled motion Stop to the durable cycle, then wake readers."""
-
-        value = (
-            snapshot.to_dict()
-            if callable(getattr(snapshot, "to_dict", None))
-            else snapshot
-        )
-        if isinstance(value, Mapping) and value.get("state") in {
-            "intervention_required",
-            "full_stopped",
-        }:
-            capture = value.get("capture")
-            program_run_id = (
-                capture.get("program_run_id")
-                if isinstance(capture, Mapping)
-                else None
-            )
-            if self._journal is not None and isinstance(program_run_id, str):
-                # This exact owner state proves that Kernel containment is no
-                # longer merely accepted/in flight. The journal callback wakes
-                # presentation whether this wins or a terminal race already did.
-                self._journal.observe_motion_stop_settled(
-                    program_run_id=program_run_id
-                )
-                return
+        """Wake readers; selected holds do not transition the whole cycle."""
         self._notify_control_state_change()
 
     def _require_manager_current(self) -> None:
@@ -1063,6 +1045,9 @@ class ProgramRuntime:
     def _current_kernel_owner_epoch(self) -> str:
         """Read the stable Kernel identity without requiring a robot product."""
 
+        starting_epoch = self._starting_kernel_owner_epoch
+        if starting_epoch is not None:
+            return starting_epoch
         admission, _journal = self._require_cycle_owner()
         inventory = admission.recovery_inventory(owner_epoch=self.owner_epoch)
         owner_epoch = inventory.get("kernel_owner_epoch")
@@ -1174,6 +1159,7 @@ class ProgramRuntime:
         allowed_by_state = {
             "program_run": cycle.state == "idle_after_reset",
             "program_motion_stop": cycle.state in {"starting", "running"},
+            "program_motion_resume": cycle.state == "running",
             "program_full_stop": cycle.state in {"starting", "running"},
             "program_stop": cycle.state in {"starting", "running"},
             "program_reset": cycle.state in {
@@ -1330,6 +1316,7 @@ class ProgramRuntime:
 
         stoppable = ("running", "intervention_required")
         exact_run_permissions = {
+            "program_motion_resume": run_allows("program_motion_resume", *stoppable),
             "program_motion_stop": run_allows(
                 "program_motion_stop", *stoppable
             ),
@@ -1451,6 +1438,7 @@ class ProgramRuntime:
         program_run_id: str | None,
         *,
         cycle_generation: int,
+        selection_scope=None,
     ) -> dict[str, Any] | None:
         if program_run_id is None:
             return None
@@ -1472,11 +1460,18 @@ class ProgramRuntime:
         policy = live.capture.node_policy_by_instance_id.get(
             intervention.identity.node_instance_id
         )
+        selection_revision = None
+        if intervention.policy_parameter == "operator_stop_policy":
+            if selection_scope is None:
+                selection_scope = self._owner.operator_stop_scope(program_run_id)
+            if intervention.identity.node_instance_id in selection_scope.held_nodes:
+                selection_revision = selection_scope.selection_revision
         return controls.recovery_offer(
             cycle_generation=cycle_generation,
             owner_epoch=self.owner_epoch,
             intervention=intervention,
             policy={} if policy is None else policy.recovery_policy,
+            selection_revision=selection_revision,
         )
 
     @staticmethod
@@ -2655,6 +2650,15 @@ class ProgramRuntime:
                     run_admission, program_run_id
                 )
                 abort_if_stop_won()
+                execution_identity = self._kernel.identity()
+                kernel_epoch = execution_identity["identity"].get("owner_epoch")
+                if not isinstance(kernel_epoch, str) or not kernel_epoch:
+                    raise ProgramRunnerError(
+                        "execution_command_response_invalid",
+                        "execution identity omitted the Kernel owner epoch",
+                    )
+                self._starting_kernel_owner_epoch = kernel_epoch
+                abort_if_stop_won()
                 # Scene preparation may have consumed one or more short
                 # authored-scene claims. Acquire Run only from the fresh
                 # generation that follows those exact owner commits.
@@ -2724,8 +2728,22 @@ class ProgramRuntime:
                 )
                 recovery_fences = self._run_recovery_fences(
                     applied_after_claim,
-                    self._kernel.identity(),
+                    execution_identity,
                     scene_admission_epoch=generation,
+                )
+                self._kernel.register_program_run_capture(
+                    {
+                        "schema_version": "manyforge.program_run_execution_capture.v1",
+                        "request_owner_epoch": execution_identity["identity"]["owner_epoch"],
+                        "program_runner_owner_epoch": self.owner_epoch,
+                        "claim_generation": claim["claim_generation"],
+                        "program_run_id": program_run_id,
+                        "program_id": scene_context.program_id,
+                        "program_revision": scene_context.program_revision,
+                        "program_binding_id": scene_context.program_binding_id,
+                        "retained_bundle_id": scene_context.retained_bundle_id,
+                        "graph_revision": scene_context.graph_revision,
+                    }
                 )
                 release_scene_context()
                 abort_if_stop_won()
@@ -2862,6 +2880,8 @@ class ProgramRuntime:
                 )
             else:
                 return result
+            finally:
+                self._starting_kernel_owner_epoch = None
             self._retain_rejection(
                 journal,
                 owner_epoch=request.request_owner_epoch,
@@ -2899,13 +2919,14 @@ class ProgramRuntime:
         recovery_offer: dict[str, Any] | None,
     ) -> dict[str, Any]:
         return {
-            "schema_version": "manyforge.program_runtime_control_projection.v3",
+            "schema_version": "manyforge.program_runtime_control_projection.v4",
             "owner_id": self.owner_id,
             "owner_epoch": self.owner_epoch,
             "program_run_id": program_run_id,
             "run_revision": live["run_revision"],
             "runtime_controls": controls.snapshot(),
             "recovery_offer": recovery_offer,
+            "execution_selections": self._owner.execution_selection_controls(program_run_id),
             "observation_override_candidate": (
                 self._runtime_override_observation_candidate(program_run_id)
             ),
@@ -2975,6 +2996,8 @@ class ProgramRuntime:
             if (
                 cycle.program_run_id != request.program_run_id
                 or cycle.state not in {"running", "stopping"}
+                or cycle.reconciliation_required
+                or (kind == "resume_motion" and cycle.state != "running")
             ):
                 reject(
                     ProgramRunnerError(
@@ -3032,6 +3055,8 @@ class ProgramRuntime:
                     run_snapshot=projected,
                 )
                 return result
+            except ProgramRunOwnerOutcomeUnknownError as error:
+                unresolved(error)
             except ProgramRunnerError as error:
                 if effect_completed:
                     unresolved(error)
@@ -3387,7 +3412,7 @@ class ProgramRuntime:
                     error = ProgramRunnerError(
                         error.code,
                         str(error),
-                        details={"recovery_offer": latest_offer},
+                        details={**error.details, "recovery_offer": latest_offer},
                     )
                 self._retain_rejection(
                     journal,
@@ -3409,9 +3434,11 @@ class ProgramRuntime:
                     )
                 )
             program_run_id = cycle.program_run_id
+            selection_scope = self._owner.operator_stop_scope(program_run_id)
             offer = self._recovery_offer(
                 program_run_id,
                 cycle_generation=cycle.cycle_generation,
+                selection_scope=selection_scope,
             )
             action = None if offer is None else next(
                 (
@@ -3475,49 +3502,9 @@ class ProgramRuntime:
                     and intervention.policy_parameter != "operator_stop_policy"):
                     controls.require_retry_capacity(intervention.identity.node_instance_id)
                 if request.action_id == "reset_cycle":
-                    effect_started = True
-                    terminal = self._host.stop_run(
-                        program_run_id,
-                        reason=(
-                            request.reason
-                            or "operator Reset after ordinary motion Stop"
-                        ),
-                        stop_request_id=self._digest(
-                            {
-                                "kind": "operator_stop_reset_program_stop",
-                                "request_owner_epoch": (
-                                    request.request_owner_epoch
-                                ),
-                                "request_id": request.request_id,
-                                "program_run_id": program_run_id,
-                            }
-                        ),
-                    )
-                    if getattr(terminal.state, "value", terminal.state) not in {
-                        ProgramRunState.STOPPED.value,
-                        ProgramRunState.SUCCEEDED.value,
-                        ProgramRunState.FAILED.value,
-                    }:
-                        raise ProgramRunOwnerOutcomeUnknownError(
-                            "motion-stopped tree did not settle for Reset"
-                        )
-                    projected_terminal = self._project_run(terminal.to_dict())
-                    self._record_terminal_snapshot(projected_terminal)
-                    settled_cycle = journal.read()
-                    settled_claim = settled_cycle.claim
-                    terminal_reference = settled_cycle.terminal_reference
-                    if (
-                        settled_cycle.state != "terminal_awaiting_reset"
-                        or settled_cycle.cycle_generation
-                        != cycle.cycle_generation
-                        or settled_cycle.program_run_id != program_run_id
-                        or not isinstance(settled_claim, Mapping)
-                        or type(settled_claim.get("claim_generation")) is not int
-                        or not isinstance(terminal_reference, str)
-                    ):
-                        raise ProgramRunOwnerOutcomeUnknownError(
-                            "motion-stopped Reset settlement was not retained"
-                        )
+                    # The offer only authorizes the action. The ordinary Reset
+                    # state machine owns stopping, settlement and restoration.
+                    # Do not run a second Stop-before-Reset protocol here.
                     reset_request = ProgramCycleResetRequest.model_validate(
                         {
                             "request_id": self._digest(
@@ -3537,22 +3524,40 @@ class ProgramRuntime:
                             ),
                             "program_run_id": program_run_id,
                             "expected_owner_epoch": self.owner_epoch,
-                            "expected_cycle_generation": (
-                                settled_cycle.cycle_generation
+                            "expected_cycle_generation": cycle.cycle_generation,
+                            "expected_claim_generation": (
+                                None if cycle.claim is None
+                                else cycle.claim["claim_generation"]
                             ),
-                            "expected_claim_generation": settled_claim[
-                                "claim_generation"
-                            ],
-                            "terminal_reference": terminal_reference,
-                            "settlement_evidence_digest": terminal_reference,
+                            "session_id": request.session_id,
+                            "client_sequence": request.client_sequence,
                         }
                     )
-                    reset_result = self.reset_cycle(reset_request)
-                    owner_result = {
-                        "program_stop": projected_terminal,
-                        "cycle_reset": reset_result,
+                    try:
+                        reset_result = self.reset_cycle(reset_request)
+                    except ProgramRunnerError as error:
+                        # Reset has already retained its exact phase/failure.
+                        # Close only this adapter's request; do not relabel a
+                        # known Reset failure as unknown or overwrite its state.
+                        self._retain_rejection(
+                            journal, owner_epoch=request.request_owner_epoch,
+                            request_id=request.request_id, error=error,
+                        )
+                        raise
+                    terminal = journal.read_run_snapshot(program_run_id)
+                    return {
+                        "schema_version": "manyforge.cycle_recovery_result.v2",
+                        "request_id": request.request_id, "accepted": True,
+                        "action_id": request.action_id, "cycle_resumed": False,
+                        "result_code": "accepted",
+                        "owner_result": {
+                            "program_stop": terminal, "cycle_reset": reset_result,
+                        },
+                        "run": terminal,
+                        # The run is retired; the final audit snapshot is in
+                        # cycle_reset.runtime_controls, not live eligibility.
+                        "runtime_controls": None, "recovery_offer": None,
                     }
-                    snapshot = terminal
                 elif request.action_id == "retry_runtime_step":
                     effect_started = True
                     snapshot = self._host.resume_recovery(
@@ -3564,6 +3569,21 @@ class ProgramRuntime:
                         controls.note_retry(
                             intervention.identity.node_instance_id
                         )
+                    cycle_resumed = True
+                elif (
+                    intervention.policy_parameter == "operator_stop_policy"
+                    and intervention.identity.node_instance_id in selection_scope.held_nodes
+                    and request.action_id == "replan_from_stopped_state"
+                ):
+                    effect_started = True
+                    snapshot = self._host.resume_motion(
+                        program_run_id,
+                        expected_selection_revision=selection_scope.selection_revision,
+                        request_id=request.request_id,
+                        reason=request.reason,
+                    )
+                    owner_effect_accepted = True
+                    owner_result = {"accepted": True, "action": request.action_id}
                     cycle_resumed = True
                 else:
                     effect_started = True
@@ -3613,34 +3633,15 @@ class ProgramRuntime:
                                 intervention.identity.node_instance_id
                             )
                         cycle_resumed = True
-                # Reset already records the owner transition and caller at its
-                # sole commit point; do not append a second wrapper event.
-                if request.action_id != "reset_cycle":
-                    controls.audit_value(
-                        "cycle_recovery_action_applied",
-                        offer_id=request.offer_id,
-                        action_id=request.action_id,
-                        node_instance_id=intervention.identity.node_instance_id,
-                        node_attempt_id=intervention.identity.node_attempt_id,
-                        cycle_resumed=cycle_resumed,
-                    )
-                projected = self._project_run(snapshot.to_dict())
-                runtime_controls = (
-                    {
-                        "schema_version": (
-                            "manyforge.program_runtime_control_projection.v3"
-                        ),
-                        "owner_id": self.owner_id,
-                        "owner_epoch": self.owner_epoch,
-                        "program_run_id": program_run_id,
-                        "run_revision": projected["run_revision"],
-                        "runtime_controls": controls.snapshot(),
-                        "recovery_offer": None,
-                        "observation_override_candidate": None,
-                    }
-                    if request.action_id == "reset_cycle"
-                    else self.read_runtime_controls(program_run_id)
+                controls.audit_value(
+                    "cycle_recovery_action_applied",
+                    offer_id=request.offer_id,
+                    action_id=request.action_id,
+                    node_instance_id=intervention.identity.node_instance_id,
+                    node_attempt_id=intervention.identity.node_attempt_id,
+                    cycle_resumed=cycle_resumed,
                 )
+                projected = self._project_run(snapshot.to_dict())
                 result = {
                     "schema_version": "manyforge.cycle_recovery_result.v2",
                     "request_id": request.request_id,
@@ -3650,26 +3651,18 @@ class ProgramRuntime:
                     "result_code": "accepted",
                     "owner_result": owner_result,
                     "run": projected,
-                    "runtime_controls": runtime_controls,
-                    "recovery_offer": (
-                        None
-                        if request.action_id == "reset_cycle"
-                        else self._recovery_offer(
-                            program_run_id,
-                            cycle_generation=cycle.cycle_generation,
-                        )
+                    "runtime_controls": self.read_runtime_controls(program_run_id),
+                    "recovery_offer": self._recovery_offer(
+                        program_run_id,
+                        cycle_generation=cycle.cycle_generation,
                     ),
                 }
-                if request.action_id != "reset_cycle":
-                    journal.complete_control_request(
-                        owner_epoch=request.request_owner_epoch,
-                        request_id=request.request_id,
-                        result=result,
-                        run_snapshot=projected,
-                    )
-                # A successful nested Reset atomically entered the successor
-                # Idle generation and removed every predecessor in-flight
-                # identity, including this outer recovery command.
+                journal.complete_control_request(
+                    owner_epoch=request.request_owner_epoch,
+                    request_id=request.request_id,
+                    result=result,
+                    run_snapshot=projected,
+                )
                 return result
             except ProgramRunnerError as error:
                 if effect_started:
@@ -3689,6 +3682,13 @@ class ProgramRuntime:
                 )
             except ProgramRunOwnerOutcomeUnknownError as error:
                 unresolved(error)
+            except ProgramRunOwnerRecoveryIncompleteError as error:
+                # Known cleanup is retained by current attempts. Report it
+                # explicitly without faulting an otherwise coherent cycle.
+                reject(ProgramRunnerError(
+                    "program_motion_resume_incomplete", str(error),
+                    details={"cleanup_accepted": True},
+                ))
             except (ProgramRunOwnerError, ProgramRuntimeControlError) as error:
                 if owner_effect_accepted or (
                     effect_started
@@ -3905,12 +3905,12 @@ class ProgramRuntime:
     def stop_motion(
         self,
         program_run_id: str,
-        request: ProgramRunStopRequest,
+        request: ProgramSelectionStopRequest,
     ) -> dict[str, Any]:
         """Stop current addressed work without terminating the Program."""
 
-        if not isinstance(request, ProgramRunStopRequest):
-            raise TypeError("stop_motion requires one ProgramRunStopRequest")
+        if not isinstance(request, ProgramSelectionStopRequest):
+            raise TypeError("stop_motion requires one ProgramSelectionStopRequest")
         if self._closed or not self._started:
             raise ProgramRunnerError(
                 "program_runner_unavailable",
@@ -3960,57 +3960,20 @@ class ProgramRuntime:
                 "resident motion Stop outcome is unavailable",
             )
 
-        stopping_committed = False
         try:
-            _admission, journal = self._require_cycle_owner()
-            cycle = journal.read()
-            if (
-                cycle.owner_epoch != self.owner_epoch
-                or cycle.program_run_id != program_run_id
-            ):
-                raise ProgramRunnerError(
-                    "program_run_not_found",
-                    "Program motion Stop does not identify the current Program cycle",
-                )
-            current_run = self.read_run(program_run_id)
-            if cycle.state == "stopping":
-                # A concurrent exact Stop already owns containment.  Joining
-                # it must not issue another physical command or wait for a
-                # later state to become legal.
-                result = current_run
-            elif (
-                cycle.state == "running"
-                and current_run.get("state") == "intervention_required"
-            ):
-                # Rest is already represented by the current recovery offer.
-                # A repeated Stop is a state-conditioned no-effect success.
-                result = current_run
-            elif cycle.state != "running" or current_run.get("state") != "running":
-                raise ProgramRunnerError(
-                    "program_motion_stop_invalid",
-                    "motion Stop requires a running Program",
-                )
-            else:
-                journal.transition(
-                    expected_generation=cycle.cycle_generation,
-                    expected_states=("running",),
-                    state="stopping",
-                    program_run_id=program_run_id,
-                    correlation_id=request.correlation_id or request.request_id,
-                    session_id=request.session_id,
-                    client_sequence=request.client_sequence,
-                    command_kind="program_motion_stop",
-                )
-                stopping_committed = True
-                snapshot = self._host.stop_motion(
-                    program_run_id,
-                    reason=request.reason,
-                    stop_request_id=(
-                        "motion:"
-                        f"{request.request_owner_epoch}:{request.request_id}"
-                    ),
-                )
-                result = self._project_run(snapshot.to_dict())
+            # The resident Run supplies the immutable claim. The Kernel
+            # validates and holds its selection before any journal/projection
+            # work; a partly held Program remains a running cycle.
+            snapshot = self._host.stop_motion(
+                program_run_id,
+                group_id=request.group_id,
+                reason=request.reason,
+                stop_request_id=(
+                    "motion:"
+                    f"{request.request_owner_epoch}:{request.request_id}"
+                ),
+            )
+            result = self._project_run(snapshot.to_dict())
         except ProgramRunOwnerOutcomeUnknownError as error:
             outcome = ProgramRunnerError(
                 "program_motion_stop_outcome_unknown",
@@ -4031,11 +3994,6 @@ class ProgramRuntime:
                 str(error) or type(error).__name__,
             )
         else:
-            # Kernel acceptance remains the containment authority.  The two
-            # small cycle transitions only expose backend-owned eligibility
-            # while that exact owner call is in flight; they neither poll nor
-            # duplicate physical Stop state.  The scheduled owner continues
-            # to the exact recovery/terminal projection.
             if retained is not None:
                 retained.result = deepcopy(result)
                 retained.settled.set()
@@ -4043,24 +4001,41 @@ class ProgramRuntime:
                     self._inflight_stops.pop(key, None)
             return result
 
-        if stopping_committed:
-            try:
-                journal.require_reconciliation(
-                    expected_generation=cycle.cycle_generation
-                )
-            except Exception:
-                pass
-            outcome = ProgramRunnerError(
-                "program_cycle_recovery_required",
-                str(outcome),
-                details={"cause_code": outcome.code},
-            )
         if retained is not None:
             retained.error = outcome
             retained.settled.set()
             with self._inflight_stops_lock:
                 self._inflight_stops.pop(key, None)
         raise outcome
+
+    def resume_motion(
+        self, program_run_id: str, request: ProgramSelectionResumeRequest
+    ) -> dict[str, Any]:
+        if not isinstance(request, ProgramSelectionResumeRequest):
+            raise TypeError("resume_motion requires one ProgramSelectionResumeRequest")
+        if request.program_run_id != program_run_id:
+            raise ProgramRunnerError("program_run_path_invalid", "motion Resume changed its Run")
+
+        def effect() -> dict[str, Any]:
+            try:
+                snapshot = self._host.resume_motion(
+                    program_run_id,
+                    expected_selection_revision=request.expected_selection_revision,
+                    request_id=request.request_id,
+                    group_id=request.group_id,
+                    reason=request.reason,
+                )
+            except ProgramRunOwnerRecoveryIncompleteError as error:
+                raise ProgramRunnerError(
+                    "program_motion_resume_incomplete", str(error),
+                    details={"cleanup_accepted": True},
+                ) from error
+            return {"state": snapshot.state.value, "run_revision": snapshot.run_revision}
+
+        # Reuse ordinary current-run command ordering, attribution and outcome
+        # retention. Unknown effects enter its existing reconciliation path.
+        result = self._control_effect(request, kind="resume_motion", effect=effect)
+        return self._project_run(result["run"])
 
     def full_stop(
         self,
@@ -4587,11 +4562,8 @@ class ProgramRuntime:
                         phase="settling",
                         terminal_reference=reference,
                     )
-                # A Reset entered from an owner-issued recovery action has
-                # already terminalized the Program tree before reaching this
-                # method.  It still must consume the exact Kernel Stop-fault
-                # latch; otherwise Reset could publish Idle while native
-                # admission remains closed for the next Run.
+                # Any entrypoint must reconcile the exact Kernel Stop-fault
+                # latch before publishing Idle for the next Run.
                 self._clear_reset_stop_fault(request)
                 cycle = journal.read()
                 request = request.model_copy(

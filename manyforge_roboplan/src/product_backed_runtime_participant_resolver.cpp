@@ -283,18 +283,20 @@ ProductBackedRuntimeParticipantResolver::ResolveOperationTarget(
     const auto program = programs_.get_verified(
         binding->value().program_id, binding->value().program_revision,
         *retained_bundle_);
-    if (!program || program->value().node_environment !=
-                        binding->value().node_environment)
+    if (!program ||
+        program->value().node_environment != binding->value().node_environment)
       throw std::invalid_argument("no exact canonical Program");
     const auto &targets = binding->value().target_role_bindings;
-    const auto target = std::find_if(targets.begin(), targets.end(),
-        [&](const auto &row) { return row.target_role_id == target_role_id; });
+    const auto target =
+        std::find_if(targets.begin(), targets.end(), [&](const auto &row) {
+          return row.target_role_id == target_role_id;
+        });
     if (target == targets.end())
       throw std::invalid_argument("no declared target role");
     return core::Result<core::ProgramTargetRoleBindingDTO>::Ok(*target);
   } catch (const std::exception &error) {
-    return core::Result<core::ProgramTargetRoleBindingDTO>::Err(
-        core::ErrorDTO{"execution_operation_target_unavailable", error.what(), {}});
+    return core::Result<core::ProgramTargetRoleBindingDTO>::Err(core::ErrorDTO{
+        "execution_operation_target_unavailable", error.what(), {}});
   }
 }
 
@@ -403,11 +405,13 @@ ProductBackedRuntimeParticipantResolver::
         std::filesystem::path package_root,
         std::shared_ptr<const deployment::RetainedBundle> retained_bundle,
         deployment::VerifiedRetainedModelMap retained_model_map,
-        std::vector<core::RuntimeParticipantBinding> physical_bindings)
+        std::vector<core::RuntimeParticipantBinding> physical_bindings,
+        std::vector<core::ProgramBindingId> intrinsic_direct_bindings)
     : programs_(package_root), bindings_(std::move(package_root)),
       retained_bundle_(std::move(retained_bundle)),
       retained_model_map_(std::move(retained_model_map)),
-      physical_bindings_(std::move(physical_bindings)) {
+      physical_bindings_(std::move(physical_bindings)),
+      intrinsic_direct_bindings_(std::move(intrinsic_direct_bindings)) {
   if (retained_bundle_ == nullptr || physical_bindings_.empty() ||
       retained_model_map_.query().retained_bundle_id !=
           retained_bundle_->retained_bundle_id() ||
@@ -422,6 +426,22 @@ ProductBackedRuntimeParticipantResolver::
     throw std::invalid_argument(
         "product-backed participant resolver inputs do not share one active "
         "runtime product");
+  }
+  std::sort(intrinsic_direct_bindings_.begin(),
+            intrinsic_direct_bindings_.end());
+  if (std::adjacent_find(intrinsic_direct_bindings_.begin(),
+                         intrinsic_direct_bindings_.end()) !=
+          intrinsic_direct_bindings_.end() ||
+      std::any_of(intrinsic_direct_bindings_.begin(),
+                  intrinsic_direct_bindings_.end(), [&](const auto &id) {
+                    return std::none_of(
+                        physical_bindings_.begin(), physical_bindings_.end(),
+                        [&](const auto &binding) {
+                          return binding.value().program_binding_id == id;
+                        });
+                  })) {
+    throw std::invalid_argument(
+        "compiler-direct bindings must identify exact composed participants");
   }
 
   std::vector<collision::RetainedComponentCollisionBodyProjectionInput>
@@ -621,6 +641,49 @@ ProductBackedRuntimeParticipantResolver::ResolveObservationTarget(
   }
 }
 
+core::Result<core::ProgramRunExecutionCaptureDTO>
+ProductBackedRuntimeParticipantResolver::ResolveProgramCapture(
+    core::ProgramRunExecutionCaptureDTO capture) const {
+  try {
+    if (capture.table != nullptr ||
+        capture.retained_bundle_id != retained_bundle_->retained_bundle_id() ||
+        capture.graph_revision !=
+            retained_bundle_->value().cell_graph.graph_revision) {
+      return Reject<core::ProgramRunExecutionCaptureDTO>(
+          "Program capture must name the active product and carry no table",
+          "program_capture_product_mismatch", core::ErrorCode::kInvalidRequest);
+    }
+    const auto binding = bindings_.get_verified(
+        capture.program_binding_id, *retained_bundle_, retained_model_map_);
+    if (binding == nullptr ||
+        binding->value().program_id != capture.program_id ||
+        binding->value().program_revision != capture.program_revision) {
+      return Reject<core::ProgramRunExecutionCaptureDTO>(
+          "Program capture has no exact generated Binding",
+          "program_capture_binding_unavailable",
+          core::ErrorCode::kMissingReference);
+    }
+    const auto program = programs_.get_verified(
+        capture.program_id, capture.program_revision, *retained_bundle_);
+    if (program == nullptr || program->value().node_environment !=
+                                  binding->value().node_environment) {
+      return Reject<core::ProgramRunExecutionCaptureDTO>(
+          "Program capture has no exact canonical Program",
+          "program_capture_source_unavailable",
+          core::ErrorCode::kMissingReference);
+    }
+    capture.table = std::shared_ptr<const core::ProgramExecutionTableDTO>(
+        program, &program->execution_table());
+    return core::Result<core::ProgramRunExecutionCaptureDTO>::Ok(
+        std::move(capture));
+  } catch (const std::exception &exception) {
+    return Reject<core::ProgramRunExecutionCaptureDTO>(
+        std::string("Program capture product resolution failed: ") +
+            exception.what(),
+        "program_capture_resolution_failed");
+  }
+}
+
 core::Result<core::RuntimeParticipantBinding>
 ProductBackedRuntimeParticipantResolver::Resolve(
     const core::OperationIntentDTO &operation,
@@ -638,9 +701,17 @@ ProductBackedRuntimeParticipantResolver::Resolve(
           core::ErrorCode::kMissingReference);
     }
     const auto &participant = operation.participants[participant_index];
-    if (const auto *precomposed = FindExactPrecomposedBinding(
-            operation, participant, physical_bindings_);
-        precomposed != nullptr) {
+    if (std::binary_search(intrinsic_direct_bindings_.begin(),
+                           intrinsic_direct_bindings_.end(),
+                           operation.program_binding_id)) {
+      const auto *precomposed = FindExactPrecomposedBinding(
+          operation, participant, physical_bindings_);
+      if (precomposed == nullptr) {
+        return Reject<core::RuntimeParticipantBinding>(
+            "direct-control operation differs from its compiled product",
+            "direct_control_product_mismatch",
+            core::ErrorCode::kInvalidRequest);
+      }
       return core::bind_runtime_participant_collision_body_aliases(
           *precomposed, collision_body_aliases_);
     }
@@ -714,6 +785,46 @@ ProductBackedRuntimeParticipantResolver::Resolve(
         "exact product-backed participant resolution failed",
         "runtime_participant_product_resolution_failed");
   }
+}
+
+core::Result<void>
+ProductBackedRuntimeParticipantResolver::ValidateExecutionOrigin(
+    const core::OperationIntentDTO &operation) const {
+  const bool direct = std::binary_search(intrinsic_direct_bindings_.begin(),
+                                         intrinsic_direct_bindings_.end(),
+                                         operation.program_binding_id);
+  for (const auto &participant : operation.participants) {
+    if (direct) {
+      if (participant.execution_scope.has_value() ||
+          FindExactPrecomposedBinding(operation, participant,
+                                      physical_bindings_) == nullptr) {
+        return Reject<void>(
+            "direct-control operation differs from its compiled product",
+            "direct_control_product_mismatch",
+            core::ErrorCode::kInvalidRequest);
+      }
+    } else if (!participant.execution_scope.has_value()) {
+      return Reject<void>(
+          "Program effects require private captured node origin",
+          "program_execution_scope_missing", core::ErrorCode::kInvalidRequest);
+    }
+  }
+  return core::Result<void>::Ok();
+}
+
+core::Result<RetainedResolvedParticipant>
+ProductBackedRuntimeParticipantResolver::ResolveExecutionParticipant(
+    const core::OperationIntentDTO &operation,
+    const std::size_t participant_index) const {
+  auto binding = Resolve(operation, participant_index);
+  if (!binding.ok())
+    return core::Result<RetainedResolvedParticipant>::Err(binding.error());
+  return core::Result<RetainedResolvedParticipant>::Ok({
+      std::move(binding.value()),
+      std::binary_search(intrinsic_direct_bindings_.begin(),
+                         intrinsic_direct_bindings_.end(),
+                         operation.program_binding_id),
+  });
 }
 
 } // namespace manyforge::roboplan_backend

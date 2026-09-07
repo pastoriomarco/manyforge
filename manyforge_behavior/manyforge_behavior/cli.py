@@ -1,17 +1,24 @@
-"""V2 build-owned node-environment inspection commands."""
+"""Build-owned node inspection and explicit offline Program migration."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
+from pathlib import Path
 import sys
+import tempfile
 
 import yaml
 
+from manyforge_behavior.canonical_artifact import load_strict_json_yaml
+from manyforge_behavior.catalog import NodeCatalog
 from manyforge_behavior.node_environment import (
+    BUILTIN_CATALOG_PATH,
     NodeEnvironmentBuildError,
     build_node_environment,
 )
+from manyforge_behavior.program import migrate_program_v1
 
 
 def _build(_args: argparse.Namespace):
@@ -24,9 +31,7 @@ def _nodes_list(args: argparse.Namespace) -> int:
         {
             "node_id": entry.id,
             "kind": entry.kind,
-            "registered_implementations": dict(
-                entry.runner_implementation_ids
-            ),
+            "registered_implementations": dict(entry.runner_implementation_ids),
         }
         for entry in environment.catalog.entries
     ]
@@ -52,9 +57,7 @@ def _nodes_validate(args: argparse.Namespace) -> int:
                 "status": "accepted",
                 "environment_digest": environment.environment_digest,
                 "catalog_digest": environment.catalog.catalog_digest,
-                "registered_implementation_count": len(
-                    environment.registry.rows
-                ),
+                "registered_implementation_count": len(environment.registry.rows),
             },
             sort_keys=True,
             indent=2,
@@ -81,6 +84,41 @@ def _nodes_catalog(args: argparse.Namespace) -> int:
             ),
             end="",
         )
+    return 0
+
+
+def _program_migrate(args: argparse.Namespace) -> int:
+    """Validate before writing; atomically publish a new, never overwritten file."""
+
+    program = migrate_program_v1(
+        load_strict_json_yaml(args.input), NodeCatalog(BUILTIN_CATALOG_PATH)
+    )
+    destination = Path(args.output)
+    # A same-directory temporary plus no-clobber link keeps a partial write
+    # invisible. No store, backend, active Draft or existing Binding is touched.
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=destination.parent, prefix=".program-migration-", delete=False
+        ) as stream:
+            temporary = Path(stream.name)
+            stream.write(program.canonical_bytes)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.link(temporary, destination)
+        directory = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if temporary is not None:
+            temporary.unlink()
+    print(
+        json.dumps(
+            {"program_revision": program.program_revision, "output": str(destination)}
+        )
+    )
     return 0
 
 
@@ -111,6 +149,18 @@ def _parser() -> argparse.ArgumentParser:
     )
     catalog_parser.add_argument("--json", action="store_true")
     catalog_parser.set_defaults(handler=_nodes_catalog)
+
+    program = commands.add_parser("program", help="offline Program artifact tools")
+    program_commands = program.add_subparsers(dest="program_command", required=True)
+    migrate = program_commands.add_parser(
+        "migrate-v1",
+        help="validate v1 and create a separate v2 artifact; never modifies a Binding",
+    )
+    migrate.add_argument("--input", required=True)
+    migrate.add_argument(
+        "--output", required=True, help="new path; existing files are never overwritten"
+    )
+    migrate.set_defaults(handler=_program_migrate)
     return parser
 
 

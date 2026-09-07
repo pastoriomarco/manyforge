@@ -197,14 +197,19 @@ class OwnerTaskAdapter(_OwnerAdapter):
             in PROGRAM_MOTION_STOP_RECOVERY_CLASSES
         )
         if operator_stop and self._operator_stop_state is not None:
-            if not self._operator_stop_state.hold(
-                task.task_id, dict(task.metadata)
+            if (
+                not isinstance(task.metadata.get("active_stop_id"), str)
+                or not task.metadata["active_stop_id"]
+                or type(task.metadata.get("active_stop_generation")) is not int
+                or task.metadata["active_stop_generation"] < 1
             ):
                 self._record_failure(
                     "owner_stop_identity_missing",
                     "ordinary operator Stop omitted its exact Stop identity",
                 )
                 return py_trees.common.Status.FAILURE
+            if not self._intervention_reported:
+                self._operator_stop_state.refresh()
         if self._intervention_reported:
             if self._intervention_port is None or self._identity is None:
                 self._record_failure(
@@ -227,8 +232,6 @@ class OwnerTaskAdapter(_OwnerAdapter):
             if action == "retry":
                 # A fresh attempt takes a fresh identity and input snapshot;
                 # the already-submitted owner request is never changed.
-                if operator_stop and self._operator_stop_state is not None:
-                    self._operator_stop_state.resolve(task.task_id)
                 self.initialise()
                 return py_trees.common.Status.RUNNING
             if action == "manual_success":
@@ -306,13 +309,6 @@ class OwnerTaskAdapter(_OwnerAdapter):
                     return py_trees.common.Status.FAILURE
                 if not self._intervention_reported:
                     try:
-                        current = self._intervention_port.read(
-                            self._identity.program_run_id
-                        )
-                        if current is not None and current.identity != self._identity:
-                            # Parallel stopped attempts are recovered one at a
-                            # time through the existing exact-attempt surface.
-                            return py_trees.common.Status.RUNNING
                         self._intervention_port.require(
                             self._identity,
                             reason_code=(
@@ -338,6 +334,8 @@ class OwnerTaskAdapter(_OwnerAdapter):
                         )
                         return py_trees.common.Status.FAILURE
                     self._intervention_reported = True
+                    if self._operator_stop_state is not None:
+                        self._operator_stop_state.note_task_observation_change()
                 self._record_failure(task.reason_code, task.message)
                 # Keep this exact terminal owner task in place.  The production
                 # scheduler removes the run from automatic ticking, so neither
@@ -376,6 +374,8 @@ class OwnerTaskAdapter(_OwnerAdapter):
                         "owner observation selected another task",
                     )
                     return py_trees.common.Status.FAILURE
+                if observed.state is not self._task.state and self._operator_stop_state is not None:
+                    self._operator_stop_state.note_task_observation_change()
                 self._task = observed
         except Exception as exc:
             self._record_failure("owner_request_failed", str(exc))
@@ -396,6 +396,8 @@ class OwnerTaskAdapter(_OwnerAdapter):
                         "owner observation selected another task",
                     )
                     return
+                if observed.state is not self._task.state and self._operator_stop_state is not None:
+                    self._operator_stop_state.note_task_observation_change()
                 self._task = observed
             self._settle(self._task)
         except OwnerTaskObservationUnavailableError:
@@ -403,20 +405,39 @@ class OwnerTaskAdapter(_OwnerAdapter):
         except Exception as exc:
             self._record_failure("owner_request_failed", str(exc))
 
-    def reconcile_full_stop_task(self) -> str:
+    def reconcile_full_stop_task(self, *, selected_resume: bool = False) -> str:
         """Observe accepted Program-scope work without ticking the tree.
 
-        Only the task families captured by ``ProgramRunScopePort`` take part.
-        Unrelated asynchronous owners remain preserved and are not advanced by
-        Full Stop settlement.
+        Full Stop observes only physical tasks in its existing scope. Selected
+        Resume also waits for other accepted owners' work; it does not cancel
+        them or pretend the Kernel stopped them.
         """
 
-        if self._owner_port_name not in {"kernel_operations", "pick_place"}:
+        if not selected_resume and self._owner_port_name not in {
+            "kernel_operations", "pick_place",
+        }:
             return "unaffected"
         if self._task is None:
             return "inactive"
         self.observe_while_operator_stop_held()
+        return self._control_state(self._task)
+
+    @property
+    def has_active_task(self) -> bool:
+        return self._task is not None and self._task.state is OwnerTaskState.ACTIVE
+
+    def observe_control_state(self) -> str:
+        """Read status without settling tasks, acknowledging or writing outputs."""
         task = self._task
+        if task is not None and task.state is OwnerTaskState.ACTIVE:
+            observed = self._port.observe(task.task_id)
+            if observed.task_id != task.task_id:
+                raise ValueError("owner observation selected another task")
+            task = observed
+        return self._control_state(task)
+
+    @staticmethod
+    def _control_state(task: OwnerTaskSnapshot | None) -> str:
         if task is None:
             return "inactive"
         if task.state is OwnerTaskState.ACTIVE:

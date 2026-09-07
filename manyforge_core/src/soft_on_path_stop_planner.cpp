@@ -2420,8 +2420,12 @@ Result<JerkLimitedStopProfileDTO> compute_jerk_limited_stop_profile(
           (v > envelope_rate + std::max(1e-6, 0.01 * envelope_rate) ||
            v + desired * dt_step >
                envelope_rate + std::max(1e-6, 0.01 * envelope_rate));
-      if (envelope_binding && used_envelope != nullptr) {
-        *used_envelope = true;
+      if (envelope_binding) {
+        if (used_envelope != nullptr) {
+          *used_envelope = true;
+        }
+        // Search and emitted integration must use identical dynamics;
+        // requesting a diagnostic must never change the candidate.
         desired = std::min(desired, (envelope_rate - v) /
                                         std::max(dt_step, kEpsilon));
       }

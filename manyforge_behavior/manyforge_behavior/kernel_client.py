@@ -30,6 +30,16 @@ class ExecutionTransport(Protocol):
 
     def submit(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
+    def register_program_run_capture(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
+
+    def read_program_execution_scope(self, program_run_id: str) -> dict[str, Any]: ...
+
+    def stop_program_selection(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
+
+    def release_program_selection(
+        self, body: Mapping[str, Any], expected_selection_revision: int
+    ) -> dict[str, Any]: ...
+
     def read(self, operation_id: str) -> dict[str, Any]: ...
 
     def operation_recovery(self, operation_id: str) -> dict[str, Any]: ...
@@ -172,6 +182,14 @@ class KernelClient:
 
     def identity(self) -> dict[str, Any]:
         return self._successful(self._transport.identity(), label="identity")
+
+    def register_program_run_capture(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Install a claim-bound capture through the private Program transport."""
+
+        return self._successful(
+            self._transport.register_program_run_capture(body),
+            label="Program execution capture",
+        )
 
     def targets(self) -> dict[str, Any]:
         return self._projection("targets")
@@ -361,6 +379,49 @@ class KernelClient:
             self._transport.stop_program_run(request),
             label="Program-run Stop",
         )
+
+    def read_program_execution_scope(self, program_run_id: str) -> dict[str, Any]:
+        response = self._successful(
+            self._transport.read_program_execution_scope(program_run_id),
+            label="Program execution scope",
+        )
+        scope = response.get("scope")
+        if not isinstance(scope, dict) or scope.get("program_run_id") != program_run_id:
+            raise KernelClientResponseError("execution scope changed its Program run")
+        return scope
+
+    def stop_program_selection(self, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        response = self._successful(
+            self._transport.stop_program_selection(request),
+            label="Program selection Stop",
+        )
+        accepted = response.get("accepted")
+        if (
+            response.get("command") != "stop_program_selection"
+            or not isinstance(accepted, Mapping)
+            or accepted.get("group_id") != request.get("group_id")
+            or accepted.get("replay_status") not in {"accepted_new", "replayed_exact"}
+            or not isinstance(accepted.get("state"), Mapping)
+        ):
+            raise KernelClientResponseError("Program selection Stop omitted its scope")
+        return accepted
+
+    def release_program_selection(
+        self, request: Mapping[str, Any], expected_selection_revision: int
+    ) -> Mapping[str, Any]:
+        response = self._successful(
+            self._transport.release_program_selection(request, expected_selection_revision),
+            label="Program selection Resume",
+        )
+        scope = response.get("scope")
+        if (
+            response.get("command") != "release_program_selection"
+            or not isinstance(scope, Mapping)
+            or type(scope.get("selection_revision")) is not int
+            or scope["selection_revision"] != expected_selection_revision + 1
+        ):
+            raise KernelClientResponseError("Program selection Resume omitted its scope")
+        return scope
 
     def release_program_run_stop_fence(
         self, program_run_id: str, stop_id: str, stop_generation: int

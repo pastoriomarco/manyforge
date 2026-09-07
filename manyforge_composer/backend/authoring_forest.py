@@ -15,7 +15,7 @@ from manyforge_behavior.program import Program, ProgramValidationError
 
 
 AUTHORING_FOREST_VERSION = "manyforge.composer_authoring_forest.v1"
-PROGRAM_API_VERSION = "manyforge.program.v1"
+PROGRAM_API_VERSION = "manyforge.program.v2"
 MAXIMUM_NODES = 100_000
 MAXIMUM_DEPTH = 256
 MAXIMUM_POSITIONS = MAXIMUM_NODES

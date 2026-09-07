@@ -802,7 +802,8 @@ make_kernel_participant_resolver(
     }
     const core::RuntimeParticipantExecutionRegistration *physical = nullptr;
     for (const auto &candidate : physical_registrations) {
-      if (!same_physical_binding(candidate.binding, binding.value(), true)) {
+      if (!same_physical_binding(candidate.binding, binding.value().binding,
+                                 true)) {
         continue;
       }
       if (physical != nullptr) {
@@ -821,12 +822,15 @@ make_kernel_participant_resolver(
           core::ErrorCode::kMissingReference);
     }
     try {
+      auto registration = runtime_registration(
+          std::move(binding.value().binding), physical->stop_readiness,
+          physical->engine, physical->stop_execution_port,
+          physical->runtime_policy, physical->default_operator_stop_profile,
+          physical->default_fault_stop_profile);
+      registration.intrinsic_direct_control =
+          binding.value().intrinsic_direct_control;
       return core::Result<core::RuntimeParticipantExecutionRegistration>::Ok(
-          runtime_registration(
-              std::move(binding.value()), physical->stop_readiness,
-              physical->engine, physical->stop_execution_port,
-              physical->runtime_policy, physical->default_operator_stop_profile,
-              physical->default_fault_stop_profile));
+          std::move(registration));
     } catch (const std::exception &exception) {
       return route_publication_error<
           core::RuntimeParticipantExecutionRegistration>(

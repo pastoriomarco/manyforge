@@ -37,7 +37,7 @@ function workspace(
   programRevision = `sha256:${String(draftRevision).padStart(64, '0')}`,
 ): ProgramWorkspaceResponse {
   const program = {
-    api_version: 'manyforge.program.v1' as const,
+    api_version: 'manyforge.program.v2' as const,
     program_id: 'program-1',
     program_revision: programRevision,
     program_profile: 'composable-cell-v1' as const,
@@ -367,6 +367,7 @@ describe('useProgramWorkspace Draft policy interaction', () => {
         modificationPolicy,
         recoveryPolicy,
         operatorStopPolicy,
+        ['all_grippers', 'robot_a'],
       );
       expect(apiMock.programWorkspace.mutate).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -382,6 +383,7 @@ describe('useProgramWorkspace Draft policy interaction', () => {
           modification_policy: modificationPolicy,
           recovery_policy: recoveryPolicy,
           operator_stop_policy: operatorStopPolicy,
+          execution_groups: ['all_grippers', 'robot_a'],
         },
       );
     });

@@ -3867,7 +3867,8 @@ TEST(RetainedProductCrossConsumer,
                             bundle.value()
                                 .compiled_products.symbol_role_maps.front()
                                 .product_id}),
-      physical_bindings);
+      physical_bindings,
+      {program_binding_ids.begin(), program_binding_ids.end()});
   const auto scene = make_projection_runtime_shadow_snapshot(
       core::CellId(std::string(cell_id)));
   for (std::size_t index = 0U; index < physical_bindings.size(); ++index) {
@@ -3876,6 +3877,11 @@ TEST(RetainedProductCrossConsumer,
         scene.shared()->revision);
     operation.request_context.request_id =
         core::RequestId("request.two-lite6." + std::to_string(index + 1U));
+    ASSERT_TRUE(resolver.ValidateExecutionOrigin(operation).ok());
+    auto forged = operation;
+    forged.program_id = core::ProgramId("forged-direct-program");
+    EXPECT_FALSE(resolver.ValidateExecutionOrigin(forged).ok());
+    EXPECT_FALSE(resolver.Resolve(forged, 0U).ok());
     const auto resolved = resolver.Resolve(operation, 0U);
     ASSERT_TRUE(resolved.ok()) << resolved.error().message;
     EXPECT_EQ(resolved.value().value().program_binding_id,

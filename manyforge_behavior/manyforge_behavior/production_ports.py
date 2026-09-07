@@ -1083,6 +1083,10 @@ class NativeKernelProgramPort:
                     "target_role_id": target.target_role_id,
                     "required_capability_id": capability_id,
                     "action_span": span.as_request(),
+                    "execution_scope": {
+                        "node_instance_id": identity.node_instance_id,
+                        "node_attempt_id": identity.node_attempt_id,
+                    },
                     "payload": dict(payload),
                 }
             ],
@@ -1613,6 +1617,10 @@ class NativeKernelProgramPort:
                             "target_role_id": target.target_role_id,
                             "required_capability_id": capability_id,
                             "action_span": span.as_request(),
+                            "execution_scope": {
+                                "node_instance_id": identity.node_instance_id,
+                                "node_attempt_id": identity.node_attempt_id,
+                            },
                             "payload": payload,
                         }
                     ],
@@ -2087,6 +2095,10 @@ class NativeKernelProgramPort:
     ) -> ProgramRunScopeSnapshot:
         _text(stop_request_id, field="stop_request_id", maximum_bytes=2_048)
         with self._lock:
+            existing_stop = self._scope_stops.get(program_run_id)
+            request_owner_epoch = (
+                existing_stop.owner_epoch if existing_stop is not None else None
+            )
             tasks = tuple(
                 task
                 for task in self._tasks.values()
@@ -2107,25 +2119,27 @@ class NativeKernelProgramPort:
         # the semantic Program Stop to the Kernel, whose current-run and
         # pending-admission capture can close that race without making Stop
         # wait for the ordinary command lane.
-        try:
-            context = self._context(program_run_id)
-            request_owner_epoch = context.request_owner_epoch
-        except ProductionPortError:
-            # Program Runner may accept Stop after committing Starting but
-            # before the Program tree binds its client context.  Once the
-            # Program-cycle claim exists, the Kernel can fence that exact run
-            # directly; no operation or local task needs to exist yet.
-            request_owner_epoch = _text(
-                (
-                    self._current_owner_epoch()
-                    if self._current_owner_epoch is not None
-                    else _mapping(
-                        self._kernel.identity().get("identity"),
-                        field="execution identity",
-                    ).get("owner_epoch")
-                ),
-                field="owner_epoch",
-            )
+        # A delayed Starting Stop can arrive after Start has contained its
+        # own aborted admission and retired its temporary context. Reuse that
+        # exact Stop responder, without an ordinary-lane identity lookup.
+        if request_owner_epoch is None:
+            try:
+                context = self._context(program_run_id)
+                request_owner_epoch = context.request_owner_epoch
+            except ProductionPortError:
+                # Starting may precede tree binding. The Kernel can fence the
+                # claimed run without any local task or operation existing.
+                request_owner_epoch = _text(
+                    (
+                        self._current_owner_epoch()
+                        if self._current_owner_epoch is not None
+                        else _mapping(
+                            self._kernel.identity().get("identity"),
+                            field="execution identity",
+                        ).get("owner_epoch")
+                    ),
+                    field="owner_epoch",
+                )
         with self._lock:
             stop = self._scope_stops.get(program_run_id)
             if stop is None:
@@ -2745,7 +2759,13 @@ class _NativeKernelControlTaskPort:
                         "kernel.resume_operation": kernel.resume,
                         "kernel.reset_operation": kernel.reset,
                     }[node_id]
-                    response = method(operation_id, {**request, "reason": node_id})
+                    response = method(operation_id, {
+                        **request, "reason": node_id,
+                        "execution_scope": {
+                            "node_instance_id": identity.node_instance_id,
+                            "node_attempt_id": identity.node_attempt_id,
+                        },
+                    })
             task.accepted = dict(
                 _mapping(response.get("accepted"), field="accepted control")
             )
@@ -3113,6 +3133,23 @@ class _NativeKernelProgramScopePort:
 
     def observe(self, program_run_id: str) -> ProgramRunScopeSnapshot:
         return self._owner._observe_scope(program_run_id)
+
+    def execution_scope(self, program_run_id: str) -> Mapping[str, Any]:
+        context = self._owner._context(program_run_id)
+        scope = self._owner._kernel.read_program_execution_scope(program_run_id)
+        if scope.get("request_owner_epoch") != context.request_owner_epoch:
+            raise ProductionPortError("Program execution scope owner changed")
+        return scope
+
+    def stop_selection(self, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        return self._owner._kernel.stop_program_selection(request)
+
+    def release_selection(
+        self, request: Mapping[str, Any], expected_selection_revision: int
+    ) -> Mapping[str, Any]:
+        return self._owner._kernel.release_program_selection(
+            request, expected_selection_revision
+        )
 
     def capture_stop(self, program_run_id: str) -> tuple[str, int] | None:
         with self._owner._lock:

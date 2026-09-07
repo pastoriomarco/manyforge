@@ -22,6 +22,7 @@ import {
   catalogFieldAcceptsValueSource,
   deriveProgramMotionConfiguration,
   flattenProgramForest,
+  inheritedProgramExecutionGroups,
   PROGRAM_MOTION_FIELDS,
   programDiagnosticNodeId,
   resolveProgramParameterLiteralValue,
@@ -58,6 +59,7 @@ interface ProgramPropertyEditorProps {
     modificationPolicy: ProgramNodeModificationPolicy,
     recoveryPolicy: ProgramNodeRecoveryPolicy,
     operatorStopPolicy: ProgramOperatorStopPolicy,
+    executionGroups: NonNullable<ProgramTreeNode['execution_groups']>,
   ) => void;
   onInvalidEditChange?: (invalid: boolean) => void;
   diagnostics?: ProgramAuthoringDiagnostic[];
@@ -205,6 +207,10 @@ export function ProgramPropertyEditor({
     () => flattenProgramForest(roots).find(
       ({ node }) => node.instance_id === selectedId,
     )?.node ?? null,
+    [roots, selectedId],
+  );
+  const inheritedGroups = useMemo(
+    () => inheritedProgramExecutionGroups(roots, selectedId),
     [roots, selectedId],
   );
   const entry = selected
@@ -646,6 +652,7 @@ export function ProgramPropertyEditor({
       <ProgramPolicyEditor
         key={`${selected.instance_id}:${discardEpoch}`}
         node={selected}
+        inheritedGroups={inheritedGroups}
         busy={busy}
         onUpdate={onUpdateNodePolicies}
         onInvalidChange={(message) => setErrors((current) => {

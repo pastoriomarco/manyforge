@@ -348,6 +348,29 @@ export function flattenProgramForest(roots: ProgramTreeNode[]): FlatProgramNode[
   return result;
 }
 
+/** Draft-only inheritance preview; runtime uses the backend's captured selection. */
+export function inheritedProgramExecutionGroups(
+  roots: ProgramTreeNode[],
+  instanceId: string | null,
+): string[] {
+  if (instanceId === null) return [];
+  const visit = (node: ProgramTreeNode, inherited: string[]): string[] | null => {
+    if (node.instance_id === instanceId) return inherited;
+    const groups = Array.isArray(node.execution_groups) ? node.execution_groups
+      : node.execution_groups === 'all' ? [] : inherited;
+    for (const child of node.children) {
+      const found = visit(child, groups);
+      if (found !== null) return found;
+    }
+    return null;
+  };
+  for (const root of roots) {
+    const found = visit(root, []);
+    if (found !== null) return found;
+  }
+  return [];
+}
+
 /** Resolve one backend diagnostic path to its retained node, without deriving validity. */
 export function programDiagnosticNodeId(
   roots: ProgramTreeNode[],

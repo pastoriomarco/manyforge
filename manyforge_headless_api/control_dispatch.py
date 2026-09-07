@@ -33,6 +33,8 @@ from .models import (
     ProgramFullStopResumeRequest,
     ProgramRunStartRequest,
     ProgramRunStopRequest,
+    ProgramSelectionStopRequest,
+    ProgramSelectionResumeRequest,
     RuntimeScaleControlRequest,
     RuntimeBlackboardWriteRequest,
     RuntimeOverrideActionRequest,
@@ -354,7 +356,8 @@ class HeadlessExecutionControlDispatch:
                 "program_full_stop",
                 "program_stop",
             }:
-                model = ProgramRunStopRequest.model_validate({**payload, **context})
+                request_type = ProgramSelectionStopRequest if kind == "program_motion_stop" else ProgramRunStopRequest
+                model = request_type.model_validate({**payload, **context})
                 if kind == "program_motion_stop":
                     result = self._service.program_run_motion_stop(
                         model.program_run_id, model
@@ -365,6 +368,9 @@ class HeadlessExecutionControlDispatch:
                     )
                 else:
                     result = self._service.program_run_stop(model.program_run_id, model)
+            elif kind == "program_motion_resume":
+                model = ProgramSelectionResumeRequest.model_validate({**payload, **context})
+                result = self._service.program_run_motion_resume(model.program_run_id, model)
             elif kind == "program_reset":
                 result = self._service.program_cycle_reset(
                     ProgramCycleResetRequest.model_validate({**payload, **context})

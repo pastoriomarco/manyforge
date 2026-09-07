@@ -138,7 +138,7 @@ The command always performs a fresh Release build, selects only
 `linux-amd64` or `linux-arm64` from the generated compiler-build manifest, and
 rejects a non-Release or unsupported target before reading or writing a golden.
 
-Maintained `manyforge.program.v1` sources use the C++ authoring target
+Maintained `manyforge.program.v2` sources use the C++ authoring target
 `manyforge_program_revision` for their opaque identities. After editing one
 Program, run:
 

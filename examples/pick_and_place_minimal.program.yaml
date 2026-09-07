@@ -1,6 +1,6 @@
-api_version: manyforge.program.v1
+api_version: manyforge.program.v2
 program_id: pick_and_place_minimal
-program_revision: sha256:ca7114071e00bc2b966c7e4044c3afc74b1f9c69e2832e52853ff2182b896766
+program_revision: sha256:11b3ce3372733fe1042b4bba315b1815032d45e0d1dda98b55465c7ab286a02d
 program_profile: composable-cell-v1
 name: pick_and_place_minimal
 description: >-

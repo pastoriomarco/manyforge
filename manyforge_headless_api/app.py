@@ -58,6 +58,8 @@ from .models import (
     ProgramModelAttemptRequest,
     ProgramRunStartRequest,
     ProgramRunStopRequest,
+    ProgramSelectionStopRequest,
+    ProgramSelectionResumeRequest,
     ProgramFullStopResetRequest,
     ProgramFullStopResumeRequest,
     ProgramScenePreparationRequest,
@@ -961,7 +963,7 @@ def create_app(
     @app.post("/api/program/runs/{program_run_id}/motion-stop")
     async def program_run_motion_stop(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
-        body: ProgramRunStopRequest,
+        body: ProgramSelectionStopRequest,
         request: Request,
     ) -> dict[str, Any]:
         if body.program_run_id != program_run_id:
@@ -971,6 +973,21 @@ def create_app(
             )
         return await rest_execution_command(
             command_kind="program_motion_stop",
+            payload=body.model_dump(mode="json"),
+            request_context=body,
+            transport_request=request,
+        )
+
+    @app.post("/api/program/runs/{program_run_id}/resume-motion")
+    async def program_run_motion_resume(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        body: ProgramSelectionResumeRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        if body.program_run_id != program_run_id:
+            raise HeadlessApiError("program_run_path_invalid", "Program-run identity in path and body must match")
+        return await rest_execution_command(
+            command_kind="program_motion_resume",
             payload=body.model_dump(mode="json"),
             request_context=body,
             transport_request=request,

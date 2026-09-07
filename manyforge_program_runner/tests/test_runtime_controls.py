@@ -494,6 +494,16 @@ def test_operator_stop_recovery_uses_owner_fence_not_failure_retry_policy() -> N
         "enabled": False,
         "disabled_reason_code": "operator_stop_requires_owner_recovery",
     }
+    selected = controls.recovery_offer(
+        cycle_generation=6, owner_epoch="runner.epoch.1", intervention=intervention,
+        policy=_policy(), selection_revision=3,
+    )
+    newer = controls.recovery_offer(
+        cycle_generation=6, owner_epoch="runner.epoch.1", intervention=intervention,
+        policy=_policy(), selection_revision=4,
+    )
+    assert newer["offer_id"] != selected["offer_id"]
+    assert newer["offer_revision"] == selected["offer_revision"] + 1
 
 
 def test_operator_stop_reset_waits_for_proven_non_moving_state() -> None:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
@@ -24,6 +24,10 @@ class OwnerTaskState(Enum):
 
 class OwnerTaskObservationUnavailableError(RuntimeError):
     """The exact accepted owner task is temporarily unavailable to observe."""
+
+
+class ProgramSelectionReleaseRejectedError(RuntimeError):
+    """The owner explicitly refused a selection release before changing holds."""
 
 
 class ProgramRunScopeState(Enum):
@@ -154,6 +158,16 @@ class CompositeProgramRunContextPort:
     """
 
     def __init__(self, *ports: ProgramRunContextPort) -> None:
+        # Nested composites already unwind failed binds. Flatten them so a
+        # parent's rollback cannot clean up the same member a second time.
+        ports = tuple(
+            member
+            for port in ports
+            for member in (
+                port._ports if isinstance(port, CompositeProgramRunContextPort)
+                else (port,)
+            )
+        )
         if not ports:
             raise ValueError("composite context requires at least one port")
         if any(
@@ -408,6 +422,20 @@ class ProgramRunScopePort(Protocol):
 
     def observe(self, program_run_id: str) -> ProgramRunScopeSnapshot: ...
 
+    def execution_scope(self, program_run_id: str) -> Mapping[str, Any]:
+        """Read the exact Kernel capture and current indexed node holds."""
+        ...
+
+    def stop_selection(self, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Contain a captured selection; return the accepted current scope."""
+        ...
+
+    def release_selection(
+        self, request: Mapping[str, Any], expected_selection_revision: int
+    ) -> Mapping[str, Any]:
+        """Release only that selection after its accepted effects are retired."""
+        ...
+
     def capture_stop(self, program_run_id: str) -> tuple[str, int] | None:
         """Capture the Program Stop; None means no Program-scope fence."""
         ...
@@ -475,6 +503,10 @@ class ProgramInterventionSnapshot:
 class ProgramInterventionPort(Protocol):
     """Record and read authored intervention without owning Kernel Pause."""
 
+    def register_run(
+        self, program_run_id: str, node_instance_ids: Collection[str]
+    ) -> None: ...
+
     def require(
         self,
         identity: NodeAttemptIdentity,
@@ -488,6 +520,12 @@ class ProgramInterventionPort(Protocol):
     ) -> ProgramInterventionSnapshot: ...
 
     def read(self, program_run_id: str) -> ProgramInterventionSnapshot | None: ...
+
+    def read_all(
+        self, program_run_id: str
+    ) -> tuple[ProgramInterventionSnapshot, ...]: ...
+
+    def has_operator_stop(self, program_run_id: str) -> bool: ...
 
     def refresh_owner_assessment(
         self,

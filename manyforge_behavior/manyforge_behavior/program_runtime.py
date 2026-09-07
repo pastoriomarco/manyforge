@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
 from hashlib import sha256
@@ -40,6 +40,7 @@ from manyforge_behavior.recovery import (
 )
 from manyforge_behavior.nodes.stop_policy import (
     OperatorMotionStopPolicy,
+    OperatorMotionStopSnapshot,
     OperatorMotionStopState,
 )
 
@@ -313,7 +314,21 @@ class ExecutableProgramRun:
         )
         self._attempt_source = ProgramRunAttemptSource(capture.program_run_id)
         self._ports = ports
-        self._operator_stop_state = OperatorMotionStopState()
+        node_children: dict[str, tuple[str, ...]] = {}
+
+        def capture_topology(node: ProgramTreeNode) -> None:
+            for child in node.children:
+                capture_topology(child)
+            node_children[node.instance_id] = tuple(
+                child.instance_id for child in node.children
+            )
+
+        capture_topology(program.tree)
+        self._scope_node_ids = tuple(sorted(node_children))
+        self._scope_identity: tuple[str, str, int] | None = None
+        self._operator_stop_state = OperatorMotionStopState(
+            node_children, read_scope=self._read_operator_stop_scope
+        )
         self._authored_nodes: dict[str, py_trees.behaviour.Behaviour] = {}
         root = self._build_node(
             program.tree,
@@ -330,7 +345,6 @@ class ExecutableProgramRun:
         node: ProgramTreeNode,
         *,
         inherited_stop_policy: str,
-        ancestor_holds: bool = False,
         root: bool = False,
     ) -> py_trees.behaviour.Behaviour:
         authored_stop_policy = node.operator_stop_policy or "inherit"
@@ -351,7 +365,6 @@ class ExecutableProgramRun:
             self._build_node(
                 child,
                 inherited_stop_policy=effective_stop_policy,
-                ancestor_holds=(ancestor_holds or effective_stop_policy == "hold"),
             )
             for child in node.children
         )
@@ -384,7 +397,7 @@ class ExecutableProgramRun:
                 attempt_source=self._attempt_source,
                 recovery_port=recovery_port,
             )
-        if effective_stop_policy == "hold" and not ancestor_holds:
+        if effective_stop_policy == "hold":
             built = OperatorMotionStopPolicy(
                 child=built,
                 node_instance_id=node.instance_id,
@@ -443,7 +456,9 @@ class ExecutableProgramRun:
             self._tree.tick()
             return self._tree.root.status
 
-    def reconcile_full_stop_tasks(self) -> tuple[int, int, int]:
+    def reconcile_full_stop_tasks(
+        self, *, node_ids: frozenset[str] | None = None
+    ) -> tuple[int, int, int]:
         """Observe only accepted Program-scope tasks while the tree is frozen.
 
         The result is ``(active, held, unrecoverable)``. Repeating this after
@@ -451,28 +466,194 @@ class ExecutableProgramRun:
         next parallel held task without ticking or submitting new work.
         """
 
+        states = tuple(self.task_control_states(node_ids=node_ids, settle=True).values())
+        return states.count("active"), states.count("held"), states.count("unrecoverable")
+
+    def task_control_states(
+        self, *, node_ids: frozenset[str] | None = None, settle: bool = False
+    ) -> dict[str, str]:
+        """Read current tasks; only explicit reconciliation may settle them.
+
+        Selected Resume also joins other owners' existing task settlement;
+        a Kernel hold alone cannot prove their work ended. Full Stop retains
+        its existing physical task scope and distinct cancellation contract.
+        """
         with self._lock:
-            active = 0
-            held = 0
-            unrecoverable = 0
+            result = {}
             for behaviour in self._tree.root.iterate():
-                reconcile = getattr(behaviour, "reconcile_full_stop_task", None)
-                if not callable(reconcile):
+                if node_ids is not None and behaviour.name not in node_ids:
                     continue
-                state = reconcile()
-                if state == "active":
-                    active += 1
-                elif state == "held":
-                    held += 1
-                elif state == "unrecoverable":
-                    unrecoverable += 1
-            return active, held, unrecoverable
+                read = getattr(behaviour, "reconcile_full_stop_task" if settle else "observe_control_state", None)
+                if callable(read):
+                    result[behaviour.name] = (
+                        read(selected_resume=node_ids is not None) if settle else read()
+                    )
+            return result
+
+    def _read_operator_stop_scope(self) -> OperatorMotionStopSnapshot:
+        scope_port = self._ports.program_run_scope
+        if scope_port is None:
+            raise ProgramRuntimeError("operator Stop requires a Kernel scope port")
+        return self._decode_operator_stop_scope(
+            scope_port.execution_scope(self._capture.program_run_id)
+        )
+
+    def _decode_operator_stop_scope(
+        self, scope: Mapping[str, Any]
+    ) -> OperatorMotionStopSnapshot:
+        runner_epoch = next(
+            (
+                owner.owner_epoch for owner in self._capture.owner_identities
+                if owner.owner_role == "program_runner"
+            ),
+            None,
+        )
+        if (
+            not isinstance(scope, Mapping)
+            or scope.get("schema_version") != "manyforge.program_execution_scope.v1"
+            or scope.get("program_run_id") != self._capture.program_run_id
+            or runner_epoch is None
+            or scope.get("program_runner_owner_epoch") != runner_epoch
+            or not isinstance(scope.get("request_owner_epoch"), str)
+            or not scope["request_owner_epoch"]
+            or type(scope.get("claim_generation")) is not int
+            or not 0 < scope["claim_generation"] <= 2**53 - 1
+            or type(scope.get("selection_revision")) is not int
+            or not 0 <= scope["selection_revision"] <= 2**53 - 1
+        ):
+            raise ProgramRuntimeError("operator Stop projection changed its capture")
+        identity = (
+            scope["request_owner_epoch"], runner_epoch, scope["claim_generation"]
+        )
+        if self._scope_identity is not None and identity != self._scope_identity:
+            raise ProgramRuntimeError("operator Stop projection changed its owner/claim")
+        held: set[str] = set()
+        phases: dict[str, frozenset[str]] = {}
+        for field in (
+            "held_node_indices", "stopping_node_indices", "faulted_node_indices"
+        ):
+            indices = scope.get(field)
+            if (
+                not isinstance(indices, (list, tuple))
+                or len(indices) > len(self._scope_node_ids)
+            ):
+                raise ProgramRuntimeError(
+                    "operator Stop projection has invalid node indices"
+                )
+            previous = -1
+            for index in indices:
+                if (
+                    type(index) is not int
+                    or not previous < index < len(self._scope_node_ids)
+                ):
+                    raise ProgramRuntimeError(
+                        "operator Stop projection has invalid node indices"
+                    )
+                node_id = self._scope_node_ids[index]
+                if node_id in held:
+                    raise ProgramRuntimeError("operator Stop projection repeats a node")
+                held.add(node_id)
+                previous = index
+            phases[field] = self.scope_node_ids(indices)
+        self._scope_identity = identity
+        return OperatorMotionStopSnapshot(
+            scope["selection_revision"], frozenset(held),
+            phases["stopping_node_indices"], phases["faulted_node_indices"],
+        )
+
+    def refresh_pending_stop_settlement(self) -> None:
+        """Use the existing tree worker only until accepted containment settles."""
+        if self._operator_stop_state.snapshot().stopping_nodes:
+            try:
+                self._operator_stop_state.refresh()
+            except Exception:
+                # An observation outage is not a failed tree or proof of rest.
+                # Keep the exact holds; the next settling tick retries the read.
+                pass
 
     @property
-    def operator_stop_held(self) -> bool:
-        """Whether an exact Program task still owns an operator Stop hold."""
+    def stop_observation_error(self) -> str | None:
+        return self._operator_stop_state.observation_error()
 
-        return self._operator_stop_state.snapshot().held
+    def take_stop_observation_change(self) -> bool:
+        return self._operator_stop_state.take_observation_change()
+
+    def pending_selected_observation(self) -> bool:
+        """Cached scheduling query; never reads an owner or grants admission."""
+        scope = self._operator_stop_state.snapshot()
+        if scope.stopping_nodes:
+            return True
+        if not scope.held_nodes:
+            return False
+        with self._lock:
+            return any(
+                node.name in scope.held_nodes and getattr(node, "has_active_task", False)
+                for node in self._tree.root.iterate()
+            )
+
+    def refresh_operator_stop_scope(self) -> None:
+        """Refresh scheduling only, never issue or release physical containment."""
+
+        self._operator_stop_state.refresh()
+
+    def read_operator_stop_scope(self) -> Mapping[str, Any]:
+        scope_port = self._ports.program_run_scope
+        if scope_port is None:
+            raise ProgramRuntimeError("operator Stop requires a Kernel scope port")
+        scope = scope_port.execution_scope(self._capture.program_run_id)
+        self.publish_operator_stop_scope(scope)
+        return scope
+
+    def operator_stop_scope(self) -> OperatorMotionStopSnapshot:
+        return self._operator_stop_state.snapshot()
+
+    def scope_node_ids(self, indices: Sequence[int]) -> frozenset[str]:
+        """Translate indices from an already validated captured scope."""
+        return frozenset(self._scope_node_ids[index] for index in indices)
+
+    def publish_operator_stop_scope(
+        self, scope: Mapping[str, Any], *, expected_revision: int | None = None,
+        released_nodes: frozenset[str] = frozenset(),
+    ) -> None:
+        """Apply the accepted owner result without a tree lock or another read."""
+        snapshot = self._decode_operator_stop_scope(scope)
+        if (
+            expected_revision is not None and snapshot.selection_revision != expected_revision
+        ) or released_nodes & snapshot.held_nodes:
+            raise ProgramRuntimeError("selection release did not release its exact scope")
+        self._operator_stop_state.publish(snapshot)
+
+    def execution_selection(self, group_id: str) -> frozenset[str]:
+        try:
+            return frozenset(self._program.execution_selections[group_id])
+        except KeyError as error:
+            raise ProgramRuntimeError("execution selection is not in this capture") from error
+
+    @property
+    def execution_selections(self) -> Mapping[str, tuple[str, ...]]:
+        return self._program.execution_selections
+
+    def execution_selection_request(
+        self, group_id: str, request_id: str
+    ) -> dict[str, Any]:
+        if self._scope_identity is None:
+            raise ProgramRuntimeError("Program execution scope is not captured")
+        kernel_epoch, runner_epoch, claim = self._scope_identity
+        # Do not resolve Stop membership here: the Kernel owns conservative
+        # containment of an unknown selection as well as valid selections.
+        return {
+            "schema_version": "manyforge.program_execution_selection.v1",
+            "program_runner_owner_epoch": runner_epoch,
+            "claim_generation": claim,
+            "program_run_id": self._capture.program_run_id,
+            "group_id": group_id,
+            "request_context": {
+                "request_id": request_id,
+                "request_owner_epoch": kernel_epoch,
+                "source_label": "program_selection_control",
+                "correlation_id": None,
+            },
+        }
 
     def terminal_failure(self) -> tuple[str, str]:
         """Return the exact focused-owner failure at a failed tree tip."""

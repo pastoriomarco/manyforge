@@ -70,6 +70,11 @@ function ordinaryMotionStopControls(): NonNullable<
     ownerEpoch: 'program-runner.epoch.1',
     programRunId: 'program-run.1',
     recoveryOffer: ordinaryMotionStopOffer(),
+    executionSelections: {
+      selectionRevision: 1,
+      groups: [{ groupId: 'all', nodeCount: 1, heldNodeCount: 1,
+        state: 'held', stopAllowed: true, resumeAllowed: true, resumeUnavailableReason: null }],
+    },
   } as unknown as NonNullable<ProgramRuntimeController['state']['controls']>;
 }
 
@@ -118,7 +123,7 @@ function controller(
         sourceOwnerEpoch: 'headless.epoch.1',
         sourceGeneration: 1,
         program: {
-          api_version: 'manyforge.program.v1',
+          api_version: 'manyforge.program.v2',
           program_id: 'next-pick',
           program_revision: `sha256:${'b'.repeat(64)}`,
           program_profile: 'composable-cell-v1',
@@ -214,6 +219,7 @@ function controller(
     dismissError: vi.fn(),
     run: vi.fn(),
     stopMotion: vi.fn(),
+    resumeMotion: vi.fn(),
     fullStop: vi.fn(),
     resumeFullStop: vi.fn(),
     stop: vi.fn(),
@@ -360,7 +366,7 @@ describe('Program runtime projection', () => {
     expect(markup).not.toMatch(/class="transport-reset meaningful"[^>]*disabled=/);
   });
 
-  it('shows stable in-flight and Running labels while preventing repeated commands', () => {
+  it('keeps Stop callable while a selected Stop receipt is pending, but blocks Resume', () => {
     const starting = controller('succeeded', 'idle_after_reset');
     starting.state.pending = 'run';
     const startingMarkup = renderToStaticMarkup(
@@ -383,7 +389,7 @@ describe('Program runtime projection', () => {
       <ProgramTransportControls enabled program={running} robot={robotController()} />,
     );
     expect(stoppingMarkup).toMatch(
-      /class="danger-button transport-stop-primary"[^>]*disabled=""[^>]*>Sending Stop<\/button>/,
+      /class="danger-button transport-stop-primary"(?![^>]*disabled)[^>]*>Sending Stop<\/button>/,
     );
     expect(stoppingMarkup).toMatch(
       /class="transport-run"[^>]*disabled=""[^>]*>Running<\/button>/,

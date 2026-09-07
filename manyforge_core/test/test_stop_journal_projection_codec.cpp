@@ -355,6 +355,60 @@ TEST(StopJournalProjectionCodecTest, RoundTripsAcceptanceAndAffectedStateCanonic
   }
 }
 
+TEST(StopJournalProjectionCodecTest, CapturedNodeOriginUsesAnExplicitVersionAndRejectsAliasing) {
+  auto terminal = TerminalProjection();
+  OperationStateDTO operation{OperationId("operation.1"),
+                              OperationRevision(1U),
+                              ProgramBindingId(kDigestB),
+                              ProgramRunId("run.1"),
+                              OperationCoordinationPolicy::kIndependent,
+                              OperationStateKind::kStopped,
+                              {},
+                              30,
+                              terminal.certificate.stop_id,
+                              terminal.certificate.stop_generation,
+                              std::nullopt};
+  operation.journal_capture_order = 1U;
+  OperationParticipantStateDTO participant{OperationParticipantId("participant.1"),
+                                           ControllerGoalId("goal.1"),
+                                           ControllerGoalGeneration(1U),
+                                           ControllableComponentId("arm"),
+                                           CommandTargetId("joints"),
+                                           CapabilityId("execution.trajectory.execute"),
+                                           ControlDomainId("domain.1"),
+                                           ControlDomainRevision(kDigestA),
+                                           ControlBindingId("binding.1"),
+                                           ControlBindingRevision(kDigestA),
+                                           std::nullopt,
+                                           std::nullopt,
+                                           OperationParticipantPayloadKind::kMotion,
+                                           OperationStateKind::kStopped,
+                                           0.0,
+                                           {},
+                                           std::nullopt};
+  participant.execution_scope =
+      ProgramNodeExecutionScopeDTO{ProgramNodeInstanceId("pick"), "attempt.2"};
+  operation.participants.push_back(participant);
+  StopJournalAcceptanceProjectionDTO projection{terminal.stop_status.accepted, {{operation}, {}}};
+  const auto encoded = EncodeStopJournalAcceptanceProjection(projection);
+  ASSERT_TRUE(encoded.ok()) << encoded.error().message;
+  EXPECT_NE(encoded.value().find("acceptance-projection.v3"), std::string::npos);
+  const auto decoded = DecodeStopJournalAcceptanceProjection(encoded.value());
+  ASSERT_TRUE(decoded.ok()) << decoded.error().message;
+  EXPECT_EQ(decoded.value(), projection);
+  auto legacy_alias = encoded.value();
+  legacy_alias.replace(legacy_alias.find("acceptance-projection.v3"),
+                       std::string("acceptance-projection.v3").size(), "acceptance-projection.v2");
+  EXPECT_FALSE(DecodeStopJournalAcceptanceProjection(legacy_alias).ok());
+  auto unordered = projection;
+  unordered.affected_state.operations.front().journal_capture_order = 0U;
+  EXPECT_FALSE(EncodeStopJournalAcceptanceProjection(unordered).ok());
+  projection.affected_state.operations.front()
+      .participants.front()
+      .execution_scope->node_attempt_id.clear();
+  EXPECT_FALSE(EncodeStopJournalAcceptanceProjection(projection).ok());
+}
+
 TEST(StopJournalProjectionCodecTest, RoundTripsEveryEmbeddedTerminalStageFieldCanonically) {
   const auto projection = TerminalProjection();
   ASSERT_EQ(projection.certificate.attempted_stage_results.size(), 1U);

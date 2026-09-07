@@ -191,6 +191,7 @@ function canonicalPositiveU64(value: unknown): value is string {
 export type ExecutionControlCommandKind =
   | 'program_run'
   | 'program_motion_stop'
+  | 'program_motion_resume'
   | 'program_full_stop'
   | 'program_stop'
   | 'program_reset'

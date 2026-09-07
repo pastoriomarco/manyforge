@@ -8,6 +8,7 @@
 #include <manyforge_core/types/joint_dynamics_limits.hpp>
 #include <manyforge_core/types/motion_interrupt.hpp>
 #include <manyforge_core/types/motion_spec.hpp>
+#include <manyforge_core/types/program_contract.hpp>
 #include <manyforge_core/types/projection_common.hpp>
 #include <manyforge_core/types/runtime_object_binding.hpp>
 #include <manyforge_core/types/speed_profile.hpp>
@@ -90,6 +91,9 @@ struct OperationParticipantIntentDTO final {
   CapabilityId required_capability_id;
   std::optional<ActionSpanDTO> action_span;
   OperationParticipantPayloadDTO payload;
+  /// Required for captured Program work; absent only for exact intrinsic
+  /// direct-control bindings. It cannot be inferred from an ActionSpan label.
+  std::optional<ProgramNodeExecutionScopeDTO> execution_scope{};
   friend bool operator==(const OperationParticipantIntentDTO&,
                          const OperationParticipantIntentDTO&) = default;
 };

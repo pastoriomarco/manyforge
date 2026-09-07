@@ -2,8 +2,9 @@
 
 #include <algorithm>
 #include <cctype>
-#include <cstddef>
 #include <cmath>
+#include <cstddef>
+#include <map>
 #include <set>
 #include <string>
 #include <string_view>
@@ -13,6 +14,7 @@
 #include <vector>
 
 #include "content_identity_internal.hpp"
+#include "embedded_build_evidence.hpp"
 #include "manyforge_deployment/artifact_codec.hpp"
 #include "manyforge_deployment/content_identity.hpp"
 
@@ -30,68 +32,69 @@ constexpr std::size_t kMaximumProgramSkillIdBytes = 128U;
   throw ProgramContractError(std::move(message));
 }
 
-[[nodiscard]] const CanonicalValue::Object& require_object(
-    const CanonicalValue& value, std::string_view path) {
-  const auto* object = std::get_if<CanonicalValue::Object>(&value.storage());
+[[nodiscard]] const CanonicalValue::Object &
+require_object(const CanonicalValue &value, std::string_view path) {
+  const auto *object = std::get_if<CanonicalValue::Object>(&value.storage());
   if (object == nullptr) {
     fail(std::string(path) + ": expected object");
   }
   return *object;
 }
 
-[[nodiscard]] const CanonicalValue::Array& require_array(
-    const CanonicalValue& value, std::string_view path) {
-  const auto* array = std::get_if<CanonicalValue::Array>(&value.storage());
+[[nodiscard]] const CanonicalValue::Array &
+require_array(const CanonicalValue &value, std::string_view path) {
+  const auto *array = std::get_if<CanonicalValue::Array>(&value.storage());
   if (array == nullptr) {
     fail(std::string(path) + ": expected array");
   }
   return *array;
 }
 
-[[nodiscard]] const std::string& require_string(
-    const CanonicalValue& value, std::string_view path) {
-  const auto* text = std::get_if<std::string>(&value.storage());
+[[nodiscard]] const std::string &require_string(const CanonicalValue &value,
+                                                std::string_view path) {
+  const auto *text = std::get_if<std::string>(&value.storage());
   if (text == nullptr) {
     fail(std::string(path) + ": expected string");
   }
   return *text;
 }
 
-[[nodiscard]] double require_number(const CanonicalValue& value,
+[[nodiscard]] double require_number(const CanonicalValue &value,
                                     std::string_view path) {
-  const auto* number = std::get_if<double>(&value.storage());
+  const auto *number = std::get_if<double>(&value.storage());
   if (number == nullptr || !std::isfinite(*number)) {
     fail(std::string(path) + ": expected finite number");
   }
   return *number;
 }
 
-[[nodiscard]] const CanonicalValue& require_member(
-    const CanonicalValue::Object& object, std::string_view name,
-    std::string_view path) {
-  const auto found = std::find_if(
-      object.begin(), object.end(),
-      [name](const auto& member) { return member.first == name; });
+[[nodiscard]] const CanonicalValue &
+require_member(const CanonicalValue::Object &object, std::string_view name,
+               std::string_view path) {
+  const auto found =
+      std::find_if(object.begin(), object.end(),
+                   [name](const auto &member) { return member.first == name; });
   if (found == object.end()) {
-    fail(std::string(path) + ": missing required field '" +
-         std::string(name) + "'");
+    fail(std::string(path) + ": missing required field '" + std::string(name) +
+         "'");
   }
   return found->second;
 }
 
-[[nodiscard]] const CanonicalValue* find_member(
-    const CanonicalValue::Object& object, std::string_view name) noexcept {
-  const auto found = std::find_if(
-      object.begin(), object.end(),
-      [name](const auto& member) { return member.first == name; });
+[[nodiscard]] const CanonicalValue *
+find_member(const CanonicalValue::Object &object,
+            std::string_view name) noexcept {
+  const auto found =
+      std::find_if(object.begin(), object.end(),
+                   [name](const auto &member) { return member.first == name; });
   return found == object.end() ? nullptr : &found->second;
 }
 
-void require_fields(const CanonicalValue::Object& object,
+void require_fields(const CanonicalValue::Object &object,
                     std::initializer_list<std::string_view> required,
                     std::initializer_list<std::string_view> optional,
                     std::string_view path) {
-  for (const auto& [name, unused] : object) {
+  for (const auto &[name, unused] : object) {
     (void)unused;
     if (std::find(required.begin(), required.end(), name) == required.end() &&
         std::find(optional.begin(), optional.end(), name) == optional.end()) {
@@ -103,7 +106,7 @@ void require_fields(const CanonicalValue::Object& object,
   }
 }
 
-void require_exact_fields(const CanonicalValue::Object& object,
+void require_exact_fields(const CanonicalValue::Object &object,
                           std::initializer_list<std::string_view> expected,
                           std::string_view path) {
   require_fields(object, expected, {}, path);
@@ -120,8 +123,7 @@ void require_exact_fields(const CanonicalValue::Object& object,
 }
 
 [[nodiscard]] bool is_ascii_alphanumeric(unsigned char value) noexcept {
-  return (value >= 'a' && value <= 'z') ||
-         (value >= 'A' && value <= 'Z') ||
+  return (value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z') ||
          (value >= '0' && value <= '9');
 }
 
@@ -141,29 +143,28 @@ void require_program_local_identity(std::string_view value,
   require_identity(value, path);
   if (value.front() < 'a' || value.front() > 'z' ||
       !std::all_of(value.begin(), value.end(), [](unsigned char byte) {
-        return (byte >= 'a' && byte <= 'z') ||
-               (byte >= '0' && byte <= '9') || byte == '.' || byte == '_' ||
-               byte == '-';
+        return (byte >= 'a' && byte <= 'z') || (byte >= '0' && byte <= '9') ||
+               byte == '.' || byte == '_' || byte == '-';
       })) {
     fail(std::string(path) + ": expected lower-case Program-local ID");
   }
 }
 
 template <typename StrongType>
-[[nodiscard]] StrongType parse_program_identity(const CanonicalValue& value,
+[[nodiscard]] StrongType parse_program_identity(const CanonicalValue &value,
                                                 std::string_view path) {
-  const std::string& spelling = require_string(value, path);
+  const std::string &spelling = require_string(value, path);
   require_program_local_identity(spelling, path);
   return StrongType(spelling);
 }
 
 template <typename StrongType>
-[[nodiscard]] std::vector<StrongType> parse_identity_set(
-    const CanonicalValue* value, std::string_view path) {
+[[nodiscard]] std::vector<StrongType>
+parse_identity_set(const CanonicalValue *value, std::string_view path) {
   if (value == nullptr) {
     return {};
   }
-  const auto& array = require_array(*value, path);
+  const auto &array = require_array(*value, path);
   if (array.size() > core::kMaxProgramRoleRequirements) {
     fail(std::string(path) + ": exceeds fixed Program role bound");
   }
@@ -180,19 +181,20 @@ template <typename StrongType>
   return result;
 }
 
-[[nodiscard]] std::vector<std::string> parse_text_set(
-    const CanonicalValue* value, std::string_view path) {
+[[nodiscard]] std::vector<std::string>
+parse_text_set(const CanonicalValue *value, std::string_view path) {
   if (value == nullptr) {
     return {};
   }
-  const auto& array = require_array(*value, path);
+  const auto &array = require_array(*value, path);
   if (array.size() > core::kMaxProgramRoleRequirements) {
     fail(std::string(path) + ": exceeds fixed Program role bound");
   }
   std::vector<std::string> result;
   result.reserve(array.size());
   for (std::size_t index = 0U; index < array.size(); ++index) {
-    const std::string& item = require_string(array[index], index_path(path, index));
+    const std::string &item =
+        require_string(array[index], index_path(path, index));
     require_program_local_identity(item, index_path(path, index));
     result.push_back(item);
   }
@@ -203,10 +205,10 @@ template <typename StrongType>
   return result;
 }
 
-[[nodiscard]] const core::CapabilityDefinitionDescriptor*
-require_capability_definition(const core::RetainedBundleDTO& bundle,
-                              const core::CapabilityId& capability_id) {
-  const auto* descriptor =
+[[nodiscard]] const core::CapabilityDefinitionDescriptor *
+require_capability_definition(const core::RetainedBundleDTO &bundle,
+                              const core::CapabilityId &capability_id) {
+  const auto *descriptor =
       core::find_builtin_capability_definition(capability_id.value());
   if (descriptor == nullptr) {
     fail("Program target requires an unknown capability: " +
@@ -214,7 +216,7 @@ require_capability_definition(const core::RetainedBundleDTO& bundle,
   }
   std::size_t exact_matches = 0U;
   std::size_t conflicting_matches = 0U;
-  for (const auto& record : bundle.catalogs.records) {
+  for (const auto &record : bundle.catalogs.records) {
     if (core::catalog_record_kind(record) !=
             core::CatalogRecordKind::kCapabilityDefinition ||
         core::catalog_record_id_value(record) != capability_id.value()) {
@@ -234,9 +236,9 @@ require_capability_definition(const core::RetainedBundleDTO& bundle,
   return descriptor;
 }
 
-[[nodiscard]] core::ProgramCapabilityDisposition parse_disposition(
-    const CanonicalValue& value, std::string_view path) {
-  const std::string& spelling = require_string(value, path);
+[[nodiscard]] core::ProgramCapabilityDisposition
+parse_disposition(const CanonicalValue &value, std::string_view path) {
+  const std::string &spelling = require_string(value, path);
   if (spelling == "required") {
     return core::ProgramCapabilityDisposition::kRequired;
   }
@@ -246,24 +248,27 @@ require_capability_definition(const core::RetainedBundleDTO& bundle,
   fail(std::string(path) + ": expected required or optional");
 }
 
-void verify_value_source(const CanonicalValue& value, std::string_view path) {
-  const auto& source = require_object(value, path);
-  const std::string& kind =
-      require_string(require_member(source, "kind", path), child_path(path, "kind"));
+void verify_value_source(const CanonicalValue &value, std::string_view path) {
+  const auto &source = require_object(value, path);
+  const std::string &kind = require_string(require_member(source, "kind", path),
+                                           child_path(path, "kind"));
   if (kind == "program_parameter" || kind == "blackboard_key") {
     require_exact_fields(source, {"kind", "reference"}, path);
     require_program_local_identity(
-        require_string(require_member(source, "reference", path), child_path(path, "reference")),
+        require_string(require_member(source, "reference", path),
+                       child_path(path, "reference")),
         child_path(path, "reference"));
     return;
   }
   if (kind == "blackboard_field") {
     require_exact_fields(source, {"kind", "reference", "field"}, path);
     require_program_local_identity(
-        require_string(require_member(source, "reference", path), child_path(path, "reference")),
+        require_string(require_member(source, "reference", path),
+                       child_path(path, "reference")),
         child_path(path, "reference"));
     require_program_local_identity(
-        require_string(require_member(source, "field", path), child_path(path, "field")),
+        require_string(require_member(source, "field", path),
+                       child_path(path, "field")),
         child_path(path, "field"));
     return;
   }
@@ -271,8 +276,8 @@ void verify_value_source(const CanonicalValue& value, std::string_view path) {
 }
 
 [[nodiscard]] core::ProgramModificationPolicyValue
-parse_modification_value(const CanonicalValue& value, std::string_view path) {
-  const auto& spelling = require_string(value, path);
+parse_modification_value(const CanonicalValue &value, std::string_view path) {
+  const auto &spelling = require_string(value, path);
   if (spelling == "forbidden") {
     return core::ProgramModificationPolicyValue::kForbidden;
   }
@@ -285,9 +290,10 @@ parse_modification_value(const CanonicalValue& value, std::string_view path) {
   fail(std::string(path) + ": invalid modification-policy value");
 }
 
-[[nodiscard]] core::ProgramInterventionDelegate parse_intervention_delegate(
-    const CanonicalValue& value, std::string_view path) {
-  const auto& spelling = require_string(value, path);
+[[nodiscard]] core::ProgramInterventionDelegate
+parse_intervention_delegate(const CanonicalValue &value,
+                            std::string_view path) {
+  const auto &spelling = require_string(value, path);
   if (spelling == "forbidden") {
     return core::ProgramInterventionDelegate::kForbidden;
   }
@@ -303,9 +309,9 @@ parse_modification_value(const CanonicalValue& value, std::string_view path) {
   fail(std::string(path) + ": invalid intervention-delegate value");
 }
 
-[[nodiscard]] core::ProgramRecoveryAction parse_recovery_action(
-    const CanonicalValue& value, std::string_view path) {
-  const auto& spelling = require_string(value, path);
+[[nodiscard]] core::ProgramRecoveryAction
+parse_recovery_action(const CanonicalValue &value, std::string_view path) {
+  const auto &spelling = require_string(value, path);
   if (spelling == "intervention") {
     return core::ProgramRecoveryAction::kIntervention;
   }
@@ -316,8 +322,8 @@ parse_modification_value(const CanonicalValue& value, std::string_view path) {
 }
 
 [[nodiscard]] core::ProgramRecoveryPersistenceCeiling
-parse_persistence_ceiling(const CanonicalValue& value, std::string_view path) {
-  const auto& spelling = require_string(value, path);
+parse_persistence_ceiling(const CanonicalValue &value, std::string_view path) {
+  const auto &spelling = require_string(value, path);
   if (spelling == "session_only") {
     return core::ProgramRecoveryPersistenceCeiling::kSessionOnly;
   }
@@ -330,9 +336,9 @@ parse_persistence_ceiling(const CanonicalValue& value, std::string_view path) {
   fail(std::string(path) + ": invalid persistence ceiling");
 }
 
-[[nodiscard]] core::ProgramOperatorStopPolicy parse_stop_policy(
-    const CanonicalValue& value, std::string_view path) {
-  const auto& spelling = require_string(value, path);
+[[nodiscard]] core::ProgramOperatorStopPolicy
+parse_stop_policy(const CanonicalValue &value, std::string_view path) {
+  const auto &spelling = require_string(value, path);
   if (spelling == "inherit") {
     return core::ProgramOperatorStopPolicy::kInherit;
   }
@@ -345,8 +351,8 @@ parse_persistence_ceiling(const CanonicalValue& value, std::string_view path) {
   fail(std::string(path) + ": invalid operator Stop policy");
 }
 
-[[nodiscard]] std::uint8_t require_retry_count(const CanonicalValue& value,
-                                                std::string_view path) {
+[[nodiscard]] std::uint8_t require_retry_count(const CanonicalValue &value,
+                                               std::string_view path) {
   const double number = require_number(value, path);
   if (number < 0.0 || number > 255.0 || std::trunc(number) != number) {
     fail(std::string(path) + ": expected integer in 0..255");
@@ -354,7 +360,7 @@ parse_persistence_ceiling(const CanonicalValue& value, std::string_view path) {
   return static_cast<std::uint8_t>(number);
 }
 
-[[nodiscard]] bool policy_is_default(const core::ProgramNodePolicyDTO& policy) {
+[[nodiscard]] bool policy_is_default(const core::ProgramNodePolicyDTO &policy) {
   return policy.modification_policy ==
              core::ProgramNodeModificationPolicyDTO{} &&
          policy.recovery_policy == core::ProgramNodeRecoveryPolicyDTO{} &&
@@ -362,26 +368,25 @@ parse_persistence_ceiling(const CanonicalValue& value, std::string_view path) {
              core::ProgramOperatorStopPolicy::kInherit;
 }
 
-[[nodiscard]] core::ProgramNodePolicyDTO parse_node_policy(
-    const CanonicalValue::Object& node, std::string_view path) {
+[[nodiscard]] core::ProgramNodePolicyDTO
+parse_node_policy(const CanonicalValue::Object &node, std::string_view path) {
   core::ProgramNodePolicyDTO result{
-      core::ProgramNodeInstanceId(require_string(
-          require_member(node, "instance_id", path),
-          child_path(path, "instance_id"))),
+      core::ProgramNodeInstanceId(
+          require_string(require_member(node, "instance_id", path),
+                         child_path(path, "instance_id"))),
       {},
       {},
       core::ProgramOperatorStopPolicy::kInherit};
   require_program_local_identity(result.instance_id.value(),
                                  child_path(path, "instance_id"));
 
-  if (const auto* modification = find_member(node, "modification_policy");
+  if (const auto *modification = find_member(node, "modification_policy");
       modification != nullptr) {
-    const auto& value = require_object(
-        *modification, child_path(path, "modification_policy"));
-    require_exact_fields(value,
-                         {"runtime_override", "persistent_edit",
-                          "intervention_delegate"},
-                         child_path(path, "modification_policy"));
+    const auto &value =
+        require_object(*modification, child_path(path, "modification_policy"));
+    require_exact_fields(
+        value, {"runtime_override", "persistent_edit", "intervention_delegate"},
+        child_path(path, "modification_policy"));
     result.modification_policy.runtime_override = parse_modification_value(
         require_member(value, "runtime_override",
                        child_path(path, "modification_policy")),
@@ -390,8 +395,7 @@ parse_persistence_ceiling(const CanonicalValue& value, std::string_view path) {
     result.modification_policy.persistent_edit = parse_modification_value(
         require_member(value, "persistent_edit",
                        child_path(path, "modification_policy")),
-        child_path(child_path(path, "modification_policy"),
-                   "persistent_edit"));
+        child_path(child_path(path, "modification_policy"), "persistent_edit"));
     result.modification_policy.intervention_delegate =
         parse_intervention_delegate(
             require_member(value, "intervention_delegate",
@@ -400,17 +404,17 @@ parse_persistence_ceiling(const CanonicalValue& value, std::string_view path) {
                        "intervention_delegate"));
   }
 
-  if (const auto* recovery = find_member(node, "recovery_policy");
+  if (const auto *recovery = find_member(node, "recovery_policy");
       recovery != nullptr) {
-    const auto& value =
+    const auto &value =
         require_object(*recovery, child_path(path, "recovery_policy"));
-    require_exact_fields(
-        value,
-        {"allow_intervention", "allowed_recovery_actions", "max_retries",
-         "allowed_skills", "persistence_ceiling"},
-        child_path(path, "recovery_policy"));
-    const auto& allow = require_member(
-        value, "allow_intervention", child_path(path, "recovery_policy"));
+    require_exact_fields(value,
+                         {"allow_intervention", "allowed_recovery_actions",
+                          "max_retries", "allowed_skills",
+                          "persistence_ceiling"},
+                         child_path(path, "recovery_policy"));
+    const auto &allow = require_member(value, "allow_intervention",
+                                       child_path(path, "recovery_policy"));
     if (!allow.is_bool()) {
       fail(child_path(child_path(path, "recovery_policy"),
                       "allow_intervention") +
@@ -418,22 +422,23 @@ parse_persistence_ceiling(const CanonicalValue& value, std::string_view path) {
     }
     result.recovery_policy.allow_intervention = allow.as_bool();
 
-    const std::string actions_path =
-        child_path(child_path(path, "recovery_policy"),
-                   "allowed_recovery_actions");
-    const auto& actions = require_array(
-        require_member(value, "allowed_recovery_actions",
-                       child_path(path, "recovery_policy")),
-        actions_path);
+    const std::string actions_path = child_path(
+        child_path(path, "recovery_policy"), "allowed_recovery_actions");
+    const auto &actions =
+        require_array(require_member(value, "allowed_recovery_actions",
+                                     child_path(path, "recovery_policy")),
+                      actions_path);
     if (actions.size() > 2U) {
       fail(actions_path + ": exceeds the closed action bound");
     }
     for (std::size_t index = 0U; index < actions.size(); ++index) {
       result.recovery_policy.allowed_recovery_actions.push_back(
-          parse_recovery_action(actions[index], index_path(actions_path, index)));
+          parse_recovery_action(actions[index],
+                                index_path(actions_path, index)));
     }
-    if (!std::is_sorted(result.recovery_policy.allowed_recovery_actions.begin(),
-                        result.recovery_policy.allowed_recovery_actions.end()) ||
+    if (!std::is_sorted(
+            result.recovery_policy.allowed_recovery_actions.begin(),
+            result.recovery_policy.allowed_recovery_actions.end()) ||
         std::adjacent_find(
             result.recovery_policy.allowed_recovery_actions.begin(),
             result.recovery_policy.allowed_recovery_actions.end()) !=
@@ -448,16 +453,16 @@ parse_persistence_ceiling(const CanonicalValue& value, std::string_view path) {
 
     const std::string skills_path =
         child_path(child_path(path, "recovery_policy"), "allowed_skills");
-    const auto& skills = require_array(
-        require_member(value, "allowed_skills",
-                       child_path(path, "recovery_policy")),
-        skills_path);
+    const auto &skills =
+        require_array(require_member(value, "allowed_skills",
+                                     child_path(path, "recovery_policy")),
+                      skills_path);
     if (skills.size() > kMaximumProgramAllowedSkills) {
       fail(skills_path + ": exceeds the 256-skill bound");
     }
     for (std::size_t index = 0U; index < skills.size(); ++index) {
       const std::string item_path = index_path(skills_path, index);
-      const auto& skill = require_string(skills[index], item_path);
+      const auto &skill = require_string(skills[index], item_path);
       if (skill.size() > kMaximumProgramSkillIdBytes) {
         fail(item_path + ": exceeds the 128-byte skill ID bound");
       }
@@ -474,17 +479,16 @@ parse_persistence_ceiling(const CanonicalValue& value, std::string_view path) {
     result.recovery_policy.persistence_ceiling = parse_persistence_ceiling(
         require_member(value, "persistence_ceiling",
                        child_path(path, "recovery_policy")),
-        child_path(child_path(path, "recovery_policy"),
-                   "persistence_ceiling"));
+        child_path(child_path(path, "recovery_policy"), "persistence_ceiling"));
   }
 
-  if (const auto* stop = find_member(node, "operator_stop_policy");
+  if (const auto *stop = find_member(node, "operator_stop_policy");
       stop != nullptr) {
     result.operator_stop_policy =
         parse_stop_policy(*stop, child_path(path, "operator_stop_policy"));
   }
 
-  const auto& actions = result.recovery_policy.allowed_recovery_actions;
+  const auto &actions = result.recovery_policy.allowed_recovery_actions;
   const bool intervention =
       std::find(actions.begin(), actions.end(),
                 core::ProgramRecoveryAction::kIntervention) != actions.end();
@@ -498,8 +502,7 @@ parse_persistence_ceiling(const CanonicalValue& value, std::string_view path) {
   }
   const bool runtime_override =
       std::find(actions.begin(), actions.end(),
-                core::ProgramRecoveryAction::kRuntimeOverride) !=
-      actions.end();
+                core::ProgramRecoveryAction::kRuntimeOverride) != actions.end();
   if (runtime_override &&
       result.modification_policy.runtime_override ==
           core::ProgramModificationPolicyValue::kForbidden) {
@@ -540,34 +543,31 @@ parse_persistence_ceiling(const CanonicalValue& value, std::string_view path) {
   return result;
 }
 
-[[nodiscard]] CanonicalValue node_policy_projection(
-    const core::ProgramNodePolicyDTO& policy) {
+[[nodiscard]] CanonicalValue
+node_policy_projection(const core::ProgramNodePolicyDTO &policy) {
   CanonicalValue::Object result;
-  if (policy.modification_policy !=
-      core::ProgramNodeModificationPolicyDTO{}) {
+  if (policy.modification_policy != core::ProgramNodeModificationPolicyDTO{}) {
     result.emplace_back(
         "modification_policy",
         CanonicalValue(CanonicalValue::Object{
-            {"intervention_delegate", CanonicalValue(std::string(
-                                           core::to_string(policy
-                                               .modification_policy
-                                               .intervention_delegate)))},
-            {"persistent_edit", CanonicalValue(std::string(
-                                     core::to_string(policy.modification_policy
-                                                         .persistent_edit)))},
-            {"runtime_override", CanonicalValue(std::string(
-                                      core::to_string(policy.modification_policy
-                                                          .runtime_override)))},
+            {"intervention_delegate",
+             CanonicalValue(std::string(core::to_string(
+                 policy.modification_policy.intervention_delegate)))},
+            {"persistent_edit",
+             CanonicalValue(std::string(
+                 core::to_string(policy.modification_policy.persistent_edit)))},
+            {"runtime_override",
+             CanonicalValue(std::string(core::to_string(
+                 policy.modification_policy.runtime_override)))},
         }));
   }
   if (policy.recovery_policy != core::ProgramNodeRecoveryPolicyDTO{}) {
     CanonicalValue::Array actions;
-    for (const auto action :
-         policy.recovery_policy.allowed_recovery_actions) {
+    for (const auto action : policy.recovery_policy.allowed_recovery_actions) {
       actions.emplace_back(std::string(core::to_string(action)));
     }
     CanonicalValue::Array skills;
-    for (const auto& skill : policy.recovery_policy.allowed_skills) {
+    for (const auto &skill : policy.recovery_policy.allowed_skills) {
       skills.emplace_back(skill);
     }
     result.emplace_back(
@@ -580,41 +580,83 @@ parse_persistence_ceiling(const CanonicalValue& value, std::string_view path) {
             {"max_retries", CanonicalValue(static_cast<double>(
                                 policy.recovery_policy.max_retries))},
             {"persistence_ceiling",
-             CanonicalValue(std::string(core::to_string(
-                 policy.recovery_policy.persistence_ceiling)))},
+             CanonicalValue(std::string(
+                 core::to_string(policy.recovery_policy.persistence_ceiling)))},
         }));
   }
   if (policy.operator_stop_policy !=
       core::ProgramOperatorStopPolicy::kInherit) {
-    result.emplace_back(
-        "operator_stop_policy",
-        CanonicalValue(std::string(
-            core::to_string(policy.operator_stop_policy))));
+    result.emplace_back("operator_stop_policy",
+                        CanonicalValue(std::string(
+                            core::to_string(policy.operator_stop_policy))));
   }
   return CanonicalValue(std::move(result));
 }
 
-[[nodiscard]] CanonicalValue normalize_program_tree(
-    const CanonicalValue& value, std::string_view path) {
-  const auto& node = require_object(value, path);
+// nullopt inherits; an empty vector means explicit `all` (no named groups).
+[[nodiscard]] std::optional<std::vector<std::string>>
+execution_groups(const CanonicalValue::Object &node, std::string_view path) {
+  const auto *value = find_member(node, "execution_groups");
+  if (value == nullptr) {
+    return std::nullopt;
+  }
+  const auto group_path = child_path(path, "execution_groups");
+  if (const auto *text = std::get_if<std::string>(&value->storage())) {
+    if (*text == "inherit")
+      return std::nullopt;
+    if (*text == "all")
+      return std::vector<std::string>{};
+    fail(group_path + ": expected inherit, all, or a nonempty named set");
+  }
+  const auto &values = require_array(*value, group_path);
+  if (values.empty() || values.size() > core::kMaxProgramExecutionGroups) {
+    fail(group_path + ": named set violates fixed nonempty bound");
+  }
+  std::vector<std::string> groups;
+  groups.reserve(values.size());
+  for (const auto &item : values) {
+    const auto &name = require_string(item, group_path);
+    require_program_local_identity(name, group_path);
+    if (name == "all" || name == "inherit") {
+      fail(group_path + ": reserved selector cannot be a named membership");
+    }
+    groups.push_back(name);
+  }
+  std::sort(groups.begin(), groups.end());
+  if (std::adjacent_find(groups.begin(), groups.end()) != groups.end()) {
+    fail(group_path + ": duplicate named membership");
+  }
+  return groups;
+}
+
+[[nodiscard]] CanonicalValue normalize_program_tree(const CanonicalValue &value,
+                                                    std::string_view path,
+                                                    std::size_t depth,
+                                                    std::size_t &count) {
+  if (depth > kMaximumProgramTreeDepth || ++count > kMaximumProgramTreeNodes) {
+    fail(std::string(path) + ": Program tree exceeds fixed traversal bounds");
+  }
+  const auto &node = require_object(value, path);
   require_fields(node, {"node_id", "instance_id", "parameters", "children"},
                  {"metadata", "value_sources", "modification_policy",
-                  "recovery_policy", "operator_stop_policy"},
+                  "recovery_policy", "operator_stop_policy",
+                  "execution_groups"},
                  path);
-  const auto& instance = require_string(
-      require_member(node, "instance_id", path),
-      child_path(path, "instance_id"));
+  const auto &instance =
+      require_string(require_member(node, "instance_id", path),
+                     child_path(path, "instance_id"));
   require_program_local_identity(instance, child_path(path, "instance_id"));
   const auto policy = parse_node_policy(node, path);
+  const auto groups = execution_groups(node, path);
   CanonicalValue::Object normalized;
   normalized.reserve(node.size());
-  for (const auto& [name, child] : node) {
+  for (const auto &[name, child] : node) {
     if (name == "modification_policy" || name == "recovery_policy" ||
-        name == "operator_stop_policy") {
+        name == "operator_stop_policy" || name == "execution_groups") {
       continue;
     }
     if (name == "children") {
-      const auto& children = require_array(child, child_path(path, name));
+      const auto &children = require_array(child, child_path(path, name));
       if (children.size() > kMaximumProgramChildren) {
         fail(std::string(path) + ": child count exceeds fixed bound");
       }
@@ -622,38 +664,53 @@ parse_persistence_ceiling(const CanonicalValue& value, std::string_view path) {
       normalized_children.reserve(children.size());
       for (std::size_t index = 0U; index < children.size(); ++index) {
         normalized_children.push_back(normalize_program_tree(
-            children[index], index_path(child_path(path, "children"), index)));
+            children[index], index_path(child_path(path, "children"), index),
+            depth + 1U, count));
       }
-      normalized.emplace_back(name, CanonicalValue(std::move(normalized_children)));
+      normalized.emplace_back(name,
+                              CanonicalValue(std::move(normalized_children)));
     } else {
       normalized.emplace_back(name, child);
     }
   }
   if (!policy_is_default(policy)) {
     const auto projected = node_policy_projection(policy);
-    for (const auto& [name, child] : projected.as_object()) {
+    for (const auto &[name, child] : projected.as_object()) {
       normalized.emplace_back(name, child);
+    }
+  }
+  if (groups.has_value()) {
+    if (groups->empty()) {
+      normalized.emplace_back("execution_groups", CanonicalValue("all"));
+    } else {
+      CanonicalValue::Array names;
+      for (const auto &name : *groups)
+        names.emplace_back(name);
+      normalized.emplace_back("execution_groups",
+                              CanonicalValue(std::move(names)));
     }
   }
   return CanonicalValue(std::move(normalized));
 }
 
-void verify_tree(const CanonicalValue& value, std::string_view path,
-                 std::size_t depth, std::size_t& count,
-                 std::set<std::string>& instance_ids,
-                 std::vector<core::ProgramNodePolicyDTO>& node_policies) {
+void verify_tree(const CanonicalValue &value, std::string_view path,
+                 std::size_t depth, std::size_t &count,
+                 std::set<std::string> &instance_ids,
+                 std::vector<core::ProgramNodePolicyDTO> &node_policies) {
   if (depth > kMaximumProgramTreeDepth || ++count > kMaximumProgramTreeNodes) {
     fail(std::string(path) + ": Program tree exceeds fixed traversal bounds");
   }
-  const auto& node = require_object(value, path);
+  const auto &node = require_object(value, path);
   require_fields(node, {"node_id", "instance_id", "parameters", "children"},
                  {"metadata", "value_sources", "modification_policy",
-                  "recovery_policy", "operator_stop_policy"},
+                  "recovery_policy", "operator_stop_policy",
+                  "execution_groups"},
                  path);
-  const std::string& node_id =
-      require_string(require_member(node, "node_id", path), child_path(path, "node_id"));
-  const std::string& instance_id =
-      require_string(require_member(node, "instance_id", path), child_path(path, "instance_id"));
+  const std::string &node_id = require_string(
+      require_member(node, "node_id", path), child_path(path, "node_id"));
+  const std::string &instance_id =
+      require_string(require_member(node, "instance_id", path),
+                     child_path(path, "instance_id"));
   require_program_local_identity(node_id, child_path(path, "node_id"));
   require_program_local_identity(instance_id, child_path(path, "instance_id"));
   if (!instance_ids.insert(instance_id).second) {
@@ -663,57 +720,65 @@ void verify_tree(const CanonicalValue& value, std::string_view path,
   if (!policy_is_default(policy)) {
     node_policies.push_back(policy);
   }
-  const auto& parameters =
-      require_object(require_member(node, "parameters", path), child_path(path, "parameters"));
+  const auto &parameters = require_object(
+      require_member(node, "parameters", path), child_path(path, "parameters"));
   if (parameters.size() > core::kMaxProgramRoleRequirements) {
     fail(std::string(path) + ".parameters: exceeds fixed bound");
   }
-  if (const auto* value_sources = find_member(node, "value_sources"); value_sources != nullptr) {
-    const auto& sources = require_object(*value_sources, child_path(path, "value_sources"));
+  if (const auto *value_sources = find_member(node, "value_sources");
+      value_sources != nullptr) {
+    const auto &sources =
+        require_object(*value_sources, child_path(path, "value_sources"));
     if (sources.empty() || sources.size() > core::kMaxProgramRoleRequirements) {
-      fail(std::string(path) + ".value_sources: violates fixed non-empty bound");
+      fail(std::string(path) +
+           ".value_sources: violates fixed non-empty bound");
     }
-    for (const auto& [parameter_id, source] : sources) {
-      require_program_local_identity(parameter_id, child_path(path, "value_sources") + " key");
+    for (const auto &[parameter_id, source] : sources) {
+      require_program_local_identity(
+          parameter_id, child_path(path, "value_sources") + " key");
       if (find_member(parameters, parameter_id) != nullptr) {
         fail(std::string(path) + ": parameter '" + parameter_id +
              "' is supplied by both parameters and value_sources");
       }
-      verify_value_source(source, child_path(child_path(path, "value_sources"), parameter_id));
+      verify_value_source(
+          source, child_path(child_path(path, "value_sources"), parameter_id));
     }
   }
-  if (const auto* metadata = find_member(node, "metadata"); metadata != nullptr) {
+  if (const auto *metadata = find_member(node, "metadata");
+      metadata != nullptr) {
     (void)require_object(*metadata, child_path(path, "metadata"));
   }
-  const auto& children = require_array(require_member(node, "children", path),
+  const auto &children = require_array(require_member(node, "children", path),
                                        child_path(path, "children"));
   if (children.size() > kMaximumProgramChildren) {
     fail(std::string(path) + ": child count exceeds fixed bound");
   }
   for (std::size_t index = 0U; index < children.size(); ++index) {
-    verify_tree(children[index], index_path(child_path(path, "children"), index),
-                depth + 1U, count, instance_ids, node_policies);
+    verify_tree(children[index],
+                index_path(child_path(path, "children"), index), depth + 1U,
+                count, instance_ids, node_policies);
   }
 }
 
-void verify_optional_top_level_shapes(const CanonicalValue::Object& root) {
-  if (const auto* compatibility = find_member(root, "compatibility");
+void verify_optional_top_level_shapes(const CanonicalValue::Object &root) {
+  if (const auto *compatibility = find_member(root, "compatibility");
       compatibility != nullptr) {
-    const auto& object = require_object(*compatibility, "program.compatibility");
+    const auto &object =
+        require_object(*compatibility, "program.compatibility");
     require_fields(object, {}, {"lanes", "assistant", "requires", "tags"},
                    "program.compatibility");
-    if (const auto* lanes = find_member(object, "lanes"); lanes != nullptr) {
+    if (const auto *lanes = find_member(object, "lanes"); lanes != nullptr) {
       const auto values = parse_text_set(lanes, "program.compatibility.lanes");
-      for (const auto& lane : values) {
+      for (const auto &lane : values) {
         if (lane != "manyforge-only" && lane != "isaac-sim" &&
             lane != "real-robot") {
           fail("program.compatibility.lanes: unknown lane");
         }
       }
     }
-    if (const auto* assistant = find_member(object, "assistant");
+    if (const auto *assistant = find_member(object, "assistant");
         assistant != nullptr) {
-      const std::string& spelling =
+      const std::string &spelling =
           require_string(*assistant, "program.compatibility.assistant");
       if (spelling != "required" && spelling != "optional" &&
           spelling != "forbidden") {
@@ -725,38 +790,39 @@ void verify_optional_top_level_shapes(const CanonicalValue::Object& root) {
     (void)parse_text_set(find_member(object, "tags"),
                          "program.compatibility.tags");
   }
-  if (const auto* viewer = find_member(root, "viewer"); viewer != nullptr) {
+  if (const auto *viewer = find_member(root, "viewer"); viewer != nullptr) {
     (void)require_object(*viewer, "program.viewer");
   }
-  for (const std::string_view field : {"scene", "parameters",
-                                       "contact_policies"}) {
-    if (const auto* value = find_member(root, field); value != nullptr) {
+  for (const std::string_view field :
+       {"scene", "parameters", "contact_policies"}) {
+    if (const auto *value = find_member(root, field); value != nullptr) {
       (void)require_array(*value, child_path("program", field));
     }
   }
-  if (const auto* blackboard = find_member(root, "blackboard");
+  if (const auto *blackboard = find_member(root, "blackboard");
       blackboard != nullptr) {
     (void)require_object(*blackboard, "program.blackboard");
   }
 }
 
-[[nodiscard]] bool declared_scene_resource_runtime_object(
-    const CanonicalValue::Object& root, std::string_view runtime_object_id) {
-  const auto* blackboard_value = find_member(root, "blackboard");
+[[nodiscard]] bool
+declared_scene_resource_runtime_object(const CanonicalValue::Object &root,
+                                       std::string_view runtime_object_id) {
+  const auto *blackboard_value = find_member(root, "blackboard");
   if (blackboard_value == nullptr) {
     return false;
   }
-  const auto& blackboard = require_object(*blackboard_value,
-                                          "program.blackboard");
-  const auto* keys_value = find_member(blackboard, "keys");
+  const auto &blackboard =
+      require_object(*blackboard_value, "program.blackboard");
+  const auto *keys_value = find_member(blackboard, "keys");
   if (keys_value == nullptr) {
     return false;
   }
-  const auto& keys = require_array(*keys_value, "program.blackboard.keys");
-  return std::count_if(keys.begin(), keys.end(), [&](const auto& value) {
-           const auto& key = require_object(value, "program.blackboard.keys[]");
-           const auto* name = find_member(key, "key");
-           const auto* type = find_member(key, "type");
+  const auto &keys = require_array(*keys_value, "program.blackboard.keys");
+  return std::count_if(keys.begin(), keys.end(), [&](const auto &value) {
+           const auto &key = require_object(value, "program.blackboard.keys[]");
+           const auto *name = find_member(key, "key");
+           const auto *type = find_member(key, "type");
            return name != nullptr && type != nullptr &&
                   require_string(*name, "program.blackboard.keys[].key") ==
                       runtime_object_id &&
@@ -770,29 +836,28 @@ struct ParsedContactPair final {
   core::RuntimeObjectId runtime_object_id;
 };
 
-[[nodiscard]] ParsedContactPair parse_contact_grasp_pair(
-    const CanonicalValue& value, std::string_view path) {
-  const auto& pair = require_object(value, path);
+[[nodiscard]] ParsedContactPair
+parse_contact_grasp_pair(const CanonicalValue &value, std::string_view path) {
+  const auto &pair = require_object(value, path);
   require_fields(pair, {"body_a", "body_b"}, {}, path);
 
   std::optional<core::ProgramContactGraspBodySelectorDTO> body_selector;
   std::optional<core::RuntimeObjectId> runtime_object_id;
-  const auto parse_side = [&](const CanonicalValue& side_value,
+  const auto parse_side = [&](const CanonicalValue &side_value,
                               std::string side_path) {
-    const auto& side = require_object(side_value, side_path);
-    const std::string& kind = require_string(
+    const auto &side = require_object(side_value, side_path);
+    const std::string &kind = require_string(
         require_member(side, "kind", side_path), child_path(side_path, "kind"));
     if (kind == "component_model_body") {
       require_fields(side,
-                     {"kind", "component_role_id",
-                      "collision_body_role_id"},
+                     {"kind", "component_role_id", "collision_body_role_id"},
                      {"model_role_id"}, side_path);
       if (body_selector.has_value()) {
         fail(std::string(path) +
              ": contact_grasp pair has two component-model sides");
       }
       std::optional<core::ModelRoleId> model_role;
-      if (const auto* model = find_member(side, "model_role_id");
+      if (const auto *model = find_member(side, "model_role_id");
           model != nullptr) {
         model_role = parse_program_identity<core::ModelRoleId>(
             *model, child_path(side_path, "model_role_id"));
@@ -819,7 +884,7 @@ struct ParsedContactPair final {
       return;
     }
     fail(side_path + ": contact_grasp requires component_model_body or "
-                       "runtime_object");
+                     "runtime_object");
   };
 
   parse_side(require_member(pair, "body_a", path), child_path(path, "body_a"));
@@ -834,14 +899,14 @@ struct ParsedContactPair final {
 
 [[nodiscard]] std::vector<core::ProgramContactGraspTemplateDTO>
 parse_contact_grasp_templates(
-    const CanonicalValue::Object& root,
-    const std::vector<core::ProgramTargetRoleRequirementDTO>& targets) {
-  const auto* policies_value = find_member(root, "contact_policies");
+    const CanonicalValue::Object &root,
+    const std::vector<core::ProgramTargetRoleRequirementDTO> &targets) {
+  const auto *policies_value = find_member(root, "contact_policies");
   if (policies_value == nullptr) {
     return {};
   }
-  const auto& policies = require_array(*policies_value,
-                                       "program.contact_policies");
+  const auto &policies =
+      require_array(*policies_value, "program.contact_policies");
   if (policies.size() > core::kMaxProgramContractRoles) {
     fail("program.contact_policies: exceeds fixed bound");
   }
@@ -849,8 +914,8 @@ parse_contact_grasp_templates(
   result.reserve(policies.size());
   for (std::size_t index = 0U; index < policies.size(); ++index) {
     const std::string path = index_path("program.contact_policies", index);
-    const auto& policy = require_object(policies[index], path);
-    const auto* mode_value = find_member(policy, "mode");
+    const auto &policy = require_object(policies[index], path);
+    const auto *mode_value = find_member(policy, "mode");
     if (mode_value == nullptr ||
         require_string(*mode_value, child_path(path, "mode")) !=
             "contact_grasp") {
@@ -869,8 +934,7 @@ parse_contact_grasp_templates(
     }
     if (require_string(require_member(policy, "sensing_mode", path),
                        child_path(path, "sensing_mode")) != "geometry_only") {
-      fail(path +
-           ": I6/N5d accepts only geometry-only contact_grasp policies");
+      fail(path + ": I6/N5d accepts only geometry-only contact_grasp policies");
     }
     if (require_string(
             require_member(policy, "default_unmatched_response", path),
@@ -882,32 +946,28 @@ parse_contact_grasp_templates(
     const auto policy_id = parse_program_identity<core::ContactPolicyId>(
         require_member(policy, "policy_id", path),
         child_path(path, "policy_id"));
-    const auto policy_revision =
-        core::ContactPolicyRevision(require_string(
-            require_member(policy, "version", path),
-            child_path(path, "version")));
+    const auto policy_revision = core::ContactPolicyRevision(require_string(
+        require_member(policy, "version", path), child_path(path, "version")));
     if (!is_sha256_digest(policy_revision.value()) ||
         !detail::verify_content_identity(
             policies[index],
             detail::ContentIdentitySpec{
-                .identity_domain =
-                    "catalog-record-revision/contact_policy",
+                .identity_domain = "catalog-record-revision/contact_policy",
                 .api_version = "manyforge.contact_policy.v1",
                 .own_field = "version"})) {
       fail(path + ": ContactPolicyRevision does not match the policy value");
     }
 
-    const auto& zones = require_array(require_member(policy, "zones", path),
+    const auto &zones = require_array(require_member(policy, "zones", path),
                                       child_path(path, "zones"));
     if (zones.size() != 1U) {
       fail(path + ": contact_grasp currently requires exactly one zone");
     }
     const std::string zone_path = index_path(child_path(path, "zones"), 0U);
-    const auto& zone = require_object(zones.front(), zone_path);
+    const auto &zone = require_object(zones.front(), zone_path);
     require_fields(zone,
                    {"zone_id", "body_pairs", "violation_response",
-                    "max_penetration_m",
-                    "terminal_window_start_fraction"},
+                    "max_penetration_m", "terminal_window_start_fraction"},
                    {"notes"}, zone_path);
     require_program_local_identity(
         require_string(require_member(zone, "zone_id", zone_path),
@@ -920,9 +980,9 @@ parse_contact_grasp_templates(
            ": contact_grasp violation must use hard_stop in this qualified "
            "profile");
     }
-    const double max_penetration = require_number(
-        require_member(zone, "max_penetration_m", zone_path),
-        child_path(zone_path, "max_penetration_m"));
+    const double max_penetration =
+        require_number(require_member(zone, "max_penetration_m", zone_path),
+                       child_path(zone_path, "max_penetration_m"));
     const double terminal_start = require_number(
         require_member(zone, "terminal_window_start_fraction", zone_path),
         child_path(zone_path, "terminal_window_start_fraction"));
@@ -931,18 +991,16 @@ parse_contact_grasp_templates(
       fail(zone_path + ": contact_grasp bounds are outside their valid range");
     }
 
-    const auto& pairs = require_array(
-        require_member(zone, "body_pairs", zone_path),
-        child_path(zone_path, "body_pairs"));
-    if (pairs.empty() ||
-        pairs.size() > core::kMaxProgramRoleRequirements) {
+    const auto &pairs =
+        require_array(require_member(zone, "body_pairs", zone_path),
+                      child_path(zone_path, "body_pairs"));
+    if (pairs.empty() || pairs.size() > core::kMaxProgramRoleRequirements) {
       fail(zone_path + ": contact_grasp body-pair count violates bounds");
     }
     std::vector<core::ProgramContactGraspBodySelectorDTO> selectors;
     selectors.reserve(pairs.size());
     std::optional<core::RuntimeObjectId> runtime_object_id;
-    for (std::size_t pair_index = 0U; pair_index < pairs.size();
-         ++pair_index) {
+    for (std::size_t pair_index = 0U; pair_index < pairs.size(); ++pair_index) {
       auto parsed = parse_contact_grasp_pair(
           pairs[pair_index],
           index_path(child_path(zone_path, "body_pairs"), pair_index));
@@ -954,28 +1012,27 @@ parse_contact_grasp_templates(
       runtime_object_id = parsed.runtime_object_id;
       selectors.push_back(std::move(parsed.body_selector));
     }
-    const auto selector_key = [](const auto& selector) {
-      return std::tuple(
-          selector.component_role_id.value(),
-          selector.model_role_id.has_value()
-              ? selector.model_role_id->value()
-              : std::string{},
-          selector.collision_body_role_id.value());
+    const auto selector_key = [](const auto &selector) {
+      return std::tuple(selector.component_role_id.value(),
+                        selector.model_role_id.has_value()
+                            ? selector.model_role_id->value()
+                            : std::string{},
+                        selector.collision_body_role_id.value());
     };
     if (!std::is_sorted(selectors.begin(), selectors.end(),
-                        [&](const auto& left, const auto& right) {
+                        [&](const auto &left, const auto &right) {
                           return selector_key(left) < selector_key(right);
                         }) ||
         std::adjacent_find(selectors.begin(), selectors.end(),
-                           [&](const auto& left, const auto& right) {
+                           [&](const auto &left, const auto &right) {
                              return selector_key(left) == selector_key(right);
                            }) != selectors.end()) {
       fail(zone_path +
            ": contact_grasp body pairs must be unique and canonical-sorted");
     }
-    for (const auto& selector : selectors) {
+    for (const auto &selector : selectors) {
       const auto matches = std::count_if(
-          targets.begin(), targets.end(), [&](const auto& target) {
+          targets.begin(), targets.end(), [&](const auto &target) {
             return target.component_role_id == selector.component_role_id &&
                    std::find(target.required_collision_body_roles.begin(),
                              target.required_collision_body_roles.end(),
@@ -994,22 +1051,21 @@ parse_contact_grasp_templates(
       }
     }
     if (!runtime_object_id.has_value() ||
-        !declared_scene_resource_runtime_object(
-            root, runtime_object_id->value())) {
-      fail(path +
-           ": contact_grasp runtime object is not one declared "
-           "scene_resource blackboard key");
+        !declared_scene_resource_runtime_object(root,
+                                                runtime_object_id->value())) {
+      fail(path + ": contact_grasp runtime object is not one declared "
+                  "scene_resource blackboard key");
     }
     result.push_back(core::ProgramContactGraspTemplateDTO{
         policy_id, policy_revision, *runtime_object_id, std::move(selectors),
         max_penetration, terminal_start});
   }
-  if (!std::is_sorted(result.begin(), result.end(), [](const auto& left,
-                                                       const auto& right) {
-        return left.contact_policy_id < right.contact_policy_id;
-      }) ||
+  if (!std::is_sorted(result.begin(), result.end(),
+                      [](const auto &left, const auto &right) {
+                        return left.contact_policy_id < right.contact_policy_id;
+                      }) ||
       std::adjacent_find(result.begin(), result.end(),
-                         [](const auto& left, const auto& right) {
+                         [](const auto &left, const auto &right) {
                            return left.contact_policy_id ==
                                   right.contact_policy_id;
                          }) != result.end()) {
@@ -1018,38 +1074,274 @@ parse_contact_grasp_templates(
   return result;
 }
 
-[[nodiscard]] core::ProgramBindingContractDTO extract_contract(
-    const CanonicalValue& root_value, const RetainedBundle& retained_bundle) {
-  const auto& root = require_object(root_value, "program");
-  require_fields(
-      root,
-      {"api_version", "program_id", "program_revision", "program_profile",
-       "name", "catalog", "component_roles", "target_roles", "tree"},
-      {"description", "compatibility", "viewer", "scene", "parameters",
-       "blackboard", "contact_policies"},
-      "program");
+struct QualifiedExecutionCatalog final {
+  std::string catalog_id;
+  std::string content_version;
+  std::string digest;
+  CanonicalValue schema_types;
+  std::map<std::string, CanonicalValue, std::less<>> entries;
+};
+
+// The existing build gate validates the complete catalog. Read its embedded
+// bytes once, never files/environment projections or an editable reverse map
+// during Run/Stop. The retained catalog identity still has to match exactly.
+[[nodiscard]] const QualifiedExecutionCatalog &execution_catalog() {
+  static const auto catalog = [] {
+    const auto root =
+        parse_strict_json_model_yaml(detail::build_evidence::kNodeCatalog)
+            .root();
+    const auto &object = require_object(root, "execution catalog");
+    QualifiedExecutionCatalog result{
+        require_string(require_member(object, "catalog_id", "catalog"),
+                       "catalog_id"),
+        require_string(require_member(object, "content_version", "catalog"),
+                       "content_version"),
+        require_string(require_member(object, "catalog_digest", "catalog"),
+                       "catalog_digest"),
+        require_member(object, "schema_types", "catalog"),
+        {}};
+    auto payload = object;
+    std::erase_if(payload, [](const auto &item) {
+      return item.first == "catalog_digest";
+    });
+    if (sha256_digest(canonical_json(CanonicalValue(std::move(payload)))) !=
+        result.digest) {
+      fail("embedded execution catalog digest mismatch");
+    }
+    for (const auto &entry : require_array(
+             require_member(object, "entries", "catalog"), "catalog.entries")) {
+      const auto &fields = require_object(entry, "catalog.entry");
+      const auto &id = require_string(
+          require_member(fields, "id", "catalog.entry"), "node_id");
+      if (!result.entries.emplace(id, entry).second) {
+        fail("embedded execution catalog contains duplicate nodes");
+      }
+    }
+    return result;
+  }();
+  return catalog;
+}
+
+[[nodiscard]] std::vector<core::ProgramNodeTargetEffectDTO> node_target_effects(
+    const CanonicalValue::Object &node, const CanonicalValue::Object &entry,
+    const std::vector<core::ProgramTargetRoleRequirementDTO> &targets,
+    std::string_view path) {
+  const auto &parameters =
+      require_object(require_member(node, "parameters", path), path);
+  const auto *sources_value = find_member(node, "value_sources");
+  const auto *sources = sources_value == nullptr
+                            ? nullptr
+                            : &require_object(*sources_value, path);
+  const auto &definitions =
+      require_array(require_member(entry, "parameters", path), path);
+  const auto effective = [&](const std::string &id,
+                             bool condition = false) -> const CanonicalValue * {
+    // Scope attribution must not depend on a later blackboard value or edit.
+    if (sources != nullptr && find_member(*sources, id) != nullptr) {
+      fail(std::string(path) +
+           ": effect scope/condition requires a literal parameter: " + id);
+    }
+    for (const auto &definition : definitions) {
+      const auto &fields = require_object(definition, "catalog.parameter");
+      if (require_string(require_member(fields, "id", path), path) == id) {
+        const auto *value = find_member(parameters, id);
+        if (value == nullptr)
+          value = find_member(fields, "default");
+        if (!condition)
+          return value;
+        const auto *schema = find_member(fields, "schema");
+        if (schema == nullptr) {
+          const auto &ref =
+              require_string(require_member(fields, "schema_ref", path), path);
+          constexpr std::string_view prefix = "#/schema_types/";
+          if (!ref.starts_with(prefix))
+            fail(std::string(path) + ": invalid condition schema reference");
+          schema = execution_catalog().schema_types.find_object_member(
+              ref.substr(prefix.size()));
+        }
+        if (schema == nullptr)
+          fail(std::string(path) + ": absent condition schema");
+        const auto &shape = require_object(*schema, path);
+        // Qualified catalog conditions are enum selections. New condition
+        // types need explicit qualification, never truthy/coercing fallback.
+        if (require_string(require_member(shape, "type", path), path) !=
+            "enum") {
+          fail(std::string(path) +
+               ": condition schema is not a qualified enum");
+        }
+        const auto &values =
+            require_array(require_member(shape, "values", path), path);
+        if (value == nullptr || !value->is_string() ||
+            std::find(values.begin(), values.end(), *value) == values.end()) {
+          fail(std::string(path) + ": invalid catalog condition value: " + id);
+        }
+        return value;
+      }
+    }
+    fail(std::string(path) +
+         ": catalog effect selector names no parameter: " + id);
+  };
+  std::vector<core::ProgramNodeTargetEffectDTO> effects;
+  for (const auto &requirement : require_array(
+           require_member(entry, "required_capabilities", path), path)) {
+    const auto &fields =
+        require_object(requirement, "catalog.required_capability");
+    if (require_string(require_member(fields, "scope", path), path) !=
+        "target_binding") {
+      continue;
+    }
+    if (const auto *condition = find_member(fields, "when")) {
+      const auto &when = require_object(*condition, "catalog.when");
+      const auto *value = effective(
+          require_string(require_member(when, "parameter", path), path), true);
+      if (value == nullptr || *value != require_member(when, "equals", path))
+        continue;
+    }
+    const auto *role = effective(
+        require_string(require_member(fields, "target_parameter", path), path));
+    if (role == nullptr)
+      fail(std::string(path) + ": missing literal target role for node effect");
+    const core::TargetRoleId role_id(require_string(*role, path));
+    const core::CapabilityId capability(
+        require_string(require_member(fields, "capability_id", path), path));
+    const auto target =
+        std::lower_bound(targets.begin(), targets.end(), role_id,
+                         [](const auto &item, const auto &id) {
+                           return item.target_role_id < id;
+                         });
+    if (target == targets.end() || target->target_role_id != role_id) {
+      fail(std::string(path) + ": effect references an undeclared target role");
+    }
+    const auto associated =
+        std::lower_bound(target->required_capabilities.begin(),
+                         target->required_capabilities.end(), capability,
+                         [](const auto &item, const auto &id) {
+                           return item.capability_id < id;
+                         });
+    if (associated == target->required_capabilities.end() ||
+        associated->capability_id != capability) {
+      fail(std::string(path) +
+           ": target role does not declare the node's required capability");
+    }
+    effects.push_back({role_id, capability});
+  }
+  const auto less = [](const auto &a, const auto &b) {
+    return std::tie(a.target_role_id, a.capability_id) <
+           std::tie(b.target_role_id, b.capability_id);
+  };
+  std::sort(effects.begin(), effects.end(), less);
+  effects.erase(std::unique(effects.begin(), effects.end()), effects.end());
+  return effects;
+}
+
+[[nodiscard]] core::ProgramExecutionTableDTO capture_execution_table(
+    const CanonicalValue &tree, const std::set<std::string> &instances,
+    const core::RetainedNodeEnvironmentDTO &environment,
+    const std::vector<core::ProgramTargetRoleRequirementDTO> &targets) {
+  const auto &catalog = execution_catalog();
+  if (catalog.catalog_id != environment.catalog_id ||
+      catalog.content_version != environment.content_version ||
+      core::ContentDigest(catalog.digest) != environment.catalog_digest) {
+    fail("Program execution capture requires the exact qualified retained node "
+         "catalog");
+  }
+  core::ProgramExecutionTableDTO table;
+  table.nodes.reserve(instances.size());
+  for (const auto &instance : instances) {
+    table.nodes.push_back({core::ProgramNodeInstanceId(instance), {}, {}});
+  }
+  std::map<std::string, std::vector<std::uint32_t>> selections;
+  std::size_t membership_count = 0U;
+  std::size_t effect_count = 0U;
+  const auto visit = [&](auto &&self, const CanonicalValue &value,
+                         const std::vector<std::string> &inherited) -> void {
+    const auto &node = require_object(value, "program.tree");
+    const auto &instance = require_string(
+        require_member(node, "instance_id", "tree"), "instance_id");
+    const auto path = "program.tree." + instance;
+    const auto authored = execution_groups(node, path);
+    const auto &groups = authored.has_value() ? *authored : inherited;
+    if (groups.size() >
+        core::kMaxProgramExecutionMemberships - membership_count) {
+      fail(path + ": resolved execution memberships exceed fixed bound");
+    }
+    membership_count += groups.size();
+    auto selected = std::lower_bound(
+        table.nodes.begin(), table.nodes.end(),
+        core::ProgramNodeInstanceId(instance),
+        [](const auto &item, const auto &id) { return item.instance_id < id; });
+    const auto index =
+        static_cast<std::uint32_t>(selected - table.nodes.begin());
+    for (const auto &group : groups) {
+      auto [entry, inserted] = selections.try_emplace(group);
+      if (inserted && selections.size() > core::kMaxProgramExecutionGroups) {
+        fail(path + ": execution group names exceed fixed bound");
+      }
+      entry->second.push_back(index);
+    }
+    const auto &node_id =
+        require_string(require_member(node, "node_id", path), path);
+    const auto definition = catalog.entries.find(node_id);
+    if (definition == catalog.entries.end())
+      fail(path + ": node is absent from the qualified catalog");
+    const auto &entry = require_object(definition->second, "catalog.entry");
+    const auto &execution =
+        require_object(require_member(entry, "execution", path), path);
+    selected->owner_api =
+        require_string(require_member(execution, "owner_api", path), path);
+    selected->target_effects = node_target_effects(node, entry, targets, path);
+    if (selected->target_effects.size() >
+        core::kMaxProgramTargetEffects - effect_count) {
+      fail(path + ": resolved target effects exceed fixed bound");
+    }
+    effect_count += selected->target_effects.size();
+    for (const auto &child :
+         require_array(require_member(node, "children", path), path)) {
+      self(self, child, groups);
+    }
+  };
+  visit(visit, tree, {});
+  for (auto &[name, indices] : selections) {
+    std::sort(indices.begin(), indices.end());
+    table.named_selections.push_back({name, std::move(indices)});
+  }
+  return table;
+}
+
+[[nodiscard]] core::ProgramBindingContractDTO
+extract_contract(const CanonicalValue &root_value,
+                 const RetainedBundle &retained_bundle,
+                 core::ProgramExecutionTableDTO &execution_table) {
+  const auto &root = require_object(root_value, "program");
+  require_fields(root,
+                 {"api_version", "program_id", "program_revision",
+                  "program_profile", "name", "catalog", "component_roles",
+                  "target_roles", "tree"},
+                 {"description", "compatibility", "viewer", "scene",
+                  "parameters", "blackboard", "contact_policies"},
+                 "program");
   if (require_string(require_member(root, "api_version", "program"),
                      "program.api_version") != core::kProgramApiVersion) {
-    fail("program.api_version: expected manyforge.program.v1");
+    fail("program.api_version: expected manyforge.program.v2");
   }
   if (require_string(require_member(root, "program_profile", "program"),
                      "program.program_profile") !=
       core::kComposableCellProgramProfile) {
     fail("program.program_profile: expected composable-cell-v1");
   }
-  const std::string& name = require_string(
-      require_member(root, "name", "program"), "program.name");
+  const std::string &name =
+      require_string(require_member(root, "name", "program"), "program.name");
   if (name.empty()) {
     fail("program.name: expected non-empty text");
   }
-  if (const auto* description = find_member(root, "description");
+  if (const auto *description = find_member(root, "description");
       description != nullptr) {
     (void)require_string(*description, "program.description");
   }
 
-  const auto& bundle = retained_bundle.value();
-  const auto& catalog = require_object(require_member(root, "catalog", "program"),
-                                       "program.catalog");
+  const auto &bundle = retained_bundle.value();
+  const auto &catalog = require_object(
+      require_member(root, "catalog", "program"), "program.catalog");
   require_exact_fields(catalog, {"api_version", "content_version"},
                        "program.catalog");
   if (require_string(require_member(catalog, "api_version", "program.catalog"),
@@ -1062,19 +1354,19 @@ parse_contact_grasp_templates(
     fail("Program catalog selector differs from the retained node environment");
   }
 
-  const auto& component_roles = require_object(
-      require_member(root, "component_roles", "program"),
-      "program.component_roles");
+  const auto &component_roles =
+      require_object(require_member(root, "component_roles", "program"),
+                     "program.component_roles");
   if (component_roles.empty() ||
       component_roles.size() > core::kMaxProgramContractRoles) {
     fail("program.component_roles: violates fixed non-empty role bound");
   }
   std::vector<core::ProgramComponentRoleRequirementDTO> components;
   components.reserve(component_roles.size());
-  for (const auto& [role_name, role_value] : component_roles) {
+  for (const auto &[role_name, role_value] : component_roles) {
     require_program_local_identity(role_name, "program.component_roles key");
     const std::string path = "program.component_roles." + role_name;
-    const auto& role = require_object(role_value, path);
+    const auto &role = require_object(role_value, path);
     require_fields(role, {},
                    {"required_component_type_tags", "required_model_roles",
                     "required_attachment_interfaces"},
@@ -1092,37 +1384,35 @@ parse_contact_grasp_templates(
     });
   }
 
-  const auto& target_roles = require_object(
-      require_member(root, "target_roles", "program"),
-      "program.target_roles");
+  const auto &target_roles = require_object(
+      require_member(root, "target_roles", "program"), "program.target_roles");
   if (target_roles.size() > core::kMaxProgramContractRoles) {
     fail("program.target_roles: exceeds fixed role bound");
   }
   std::vector<core::ProgramTargetRoleRequirementDTO> targets;
   targets.reserve(target_roles.size());
-  for (const auto& [role_name, role_value] : target_roles) {
+  for (const auto &[role_name, role_value] : target_roles) {
     require_program_local_identity(role_name, "program.target_roles key");
     const std::string path = "program.target_roles." + role_name;
-    const auto& role = require_object(role_value, path);
-    require_fields(
-        role, {"component_role", "required_capabilities"},
-        {"required_frame_roles", "required_resource_roles",
-         "required_collision_body_roles", "required_model_roles"},
-        path);
+    const auto &role = require_object(role_value, path);
+    require_fields(role, {"component_role", "required_capabilities"},
+                   {"required_frame_roles", "required_resource_roles",
+                    "required_collision_body_roles", "required_model_roles"},
+                   path);
     const core::ComponentRoleId component_role =
         parse_program_identity<core::ComponentRoleId>(
             require_member(role, "component_role", path),
             child_path(path, "component_role"));
     if (std::none_of(components.begin(), components.end(),
-                     [&](const auto& component) {
+                     [&](const auto &component) {
                        return component.component_role_id == component_role;
                      })) {
       fail(path + ": references an undeclared component role");
     }
 
-    const auto& capability_values = require_array(
-        require_member(role, "required_capabilities", path),
-        child_path(path, "required_capabilities"));
+    const auto &capability_values =
+        require_array(require_member(role, "required_capabilities", path),
+                      child_path(path, "required_capabilities"));
     if (capability_values.empty() ||
         capability_values.size() > core::kMaxProgramRoleRequirements) {
       fail(path + ": required_capabilities violates fixed non-empty bound");
@@ -1132,7 +1422,7 @@ parse_contact_grasp_templates(
     for (std::size_t index = 0U; index < capability_values.size(); ++index) {
       const std::string capability_path =
           index_path(child_path(path, "required_capabilities"), index);
-      const auto& capability =
+      const auto &capability =
           require_object(capability_values[index], capability_path);
       require_exact_fields(capability,
                            {"capability_id", "parameters", "disposition"},
@@ -1144,7 +1434,7 @@ parse_contact_grasp_templates(
       (void)require_object(
           require_member(capability, "parameters", capability_path),
           child_path(capability_path, "parameters"));
-      const auto* definition =
+      const auto *definition =
           require_capability_definition(bundle, capability_id);
       capabilities.push_back(core::ProgramCapabilityRequirementDTO{
           capability_id,
@@ -1155,22 +1445,21 @@ parse_contact_grasp_templates(
               child_path(capability_path, "disposition")),
       });
     }
-    if (!std::is_sorted(
-            capabilities.begin(), capabilities.end(),
-            [](const auto& left, const auto& right) {
-              return left.capability_id < right.capability_id;
-            }) ||
-        std::adjacent_find(
-            capabilities.begin(), capabilities.end(),
-            [](const auto& left, const auto& right) {
-              return left.capability_id == right.capability_id;
-            }) != capabilities.end()) {
+    if (!std::is_sorted(capabilities.begin(), capabilities.end(),
+                        [](const auto &left, const auto &right) {
+                          return left.capability_id < right.capability_id;
+                        }) ||
+        std::adjacent_find(capabilities.begin(), capabilities.end(),
+                           [](const auto &left, const auto &right) {
+                             return left.capability_id == right.capability_id;
+                           }) != capabilities.end()) {
       fail(path +
            ": required_capabilities must be unique and canonical-sorted");
     }
 
     targets.push_back(core::ProgramTargetRoleRequirementDTO{
-        core::TargetRoleId(role_name), component_role,
+        core::TargetRoleId(role_name),
+        component_role,
         std::move(capabilities),
         parse_identity_set<core::FrameRoleId>(
             find_member(role, "required_frame_roles"),
@@ -1193,22 +1482,24 @@ parse_contact_grasp_templates(
   std::vector<core::ProgramNodePolicyDTO> node_policies;
   verify_tree(require_member(root, "tree", "program"), "program.tree", 0U,
               tree_count, instance_ids, node_policies);
+  execution_table = capture_execution_table(
+      require_member(root, "tree", "program"), instance_ids,
+      bundle.catalogs.node_environment, targets);
   std::sort(node_policies.begin(), node_policies.end(),
-            [](const auto& left, const auto& right) {
+            [](const auto &left, const auto &right) {
               return left.instance_id < right.instance_id;
             });
 
-  const std::string& revision = require_string(
-      require_member(root, "program_revision", "program"),
-      "program.program_revision");
+  const std::string &revision =
+      require_string(require_member(root, "program_revision", "program"),
+                     "program.program_revision");
   if (!is_sha256_digest(revision)) {
     fail("program.program_revision: expected lowercase sha256 digest");
   }
   auto contact_grasp_templates = parse_contact_grasp_templates(root, targets);
   return core::ProgramBindingContractDTO{
       parse_program_identity<core::ProgramId>(
-          require_member(root, "program_id", "program"),
-          "program.program_id"),
+          require_member(root, "program_id", "program"), "program.program_id"),
       core::ProgramRevision(revision),
       bundle.catalogs.node_environment,
       std::move(components),
@@ -1218,26 +1509,43 @@ parse_contact_grasp_templates(
   };
 }
 
-}  // namespace
+} // namespace
 
 namespace detail {
 
 class ProgramBindingContractConstructionAuthority final {
- public:
-  [[nodiscard]] static std::shared_ptr<const ProgramBindingContract> construct(
-      core::ProgramBindingContractDTO value, CanonicalValue root,
-      std::string bytes) {
+public:
+  [[nodiscard]] static std::shared_ptr<const ProgramBindingContract>
+  construct(core::ProgramBindingContractDTO value, CanonicalValue root,
+            std::string bytes, core::ProgramExecutionTableDTO execution_table) {
     return std::shared_ptr<const ProgramBindingContract>(
         new ProgramBindingContract(std::move(value), std::move(root),
-                                   std::move(bytes)));
+                                   std::move(bytes),
+                                   std::move(execution_table)));
   }
 };
 
-}  // namespace detail
+} // namespace detail
+
+CanonicalValue normalize_program_authoring(const CanonicalValue &source_root) {
+  const auto &source = require_object(source_root, "program");
+  if (require_string(require_member(source, "api_version", "program"),
+                     "program.api_version") != core::kProgramApiVersion) {
+    fail("program.api_version: expected manyforge.program.v2");
+  }
+  (void)require_member(source, "tree", "program");
+  auto members = source;
+  std::size_t count = 0U;
+  for (auto &[name, value] : members) {
+    if (name == "tree")
+      value = normalize_program_tree(value, "program.tree", 0U, count);
+  }
+  return CanonicalValue(std::move(members));
+}
 
 std::shared_ptr<const ProgramBindingContract>
 verify_program_binding_contract(std::string_view canonical_program_bytes,
-                                const RetainedBundle& retained_bundle) {
+                                const RetainedBundle &retained_bundle) {
   try {
     if (canonical_program_bytes.size() > kMaxArtifactEncodedBytes) {
       fail("canonical Program exceeds fixed artifact byte bound");
@@ -1250,40 +1558,28 @@ verify_program_binding_contract(std::string_view canonical_program_bytes,
     if (canonical_json(source_root) != canonical_program_bytes) {
       fail("Program binding input is not schema-normalized RFC 8785 JSON");
     }
-    CanonicalValue root = source_root;
-    if (root.find_object_member("tree") != nullptr) {
-      CanonicalValue::Object members;
-      const auto& source_members = require_object(root, "program");
-      members.reserve(source_members.size());
-      for (const auto& [name, value] : source_members) {
-        if (name == "tree") {
-          members.emplace_back(name, normalize_program_tree(value, "program.tree"));
-        } else {
-          members.emplace_back(name, value);
-        }
-      }
-      root = CanonicalValue(std::move(members));
-    }
+    CanonicalValue root = normalize_program_authoring(source_root);
+    core::ProgramExecutionTableDTO execution_table;
     core::ProgramBindingContractDTO value =
-        extract_contract(root, retained_bundle);
+        extract_contract(root, retained_bundle, execution_table);
     const std::string normalized_bytes = canonical_json(root);
     if (!detail::verify_content_identity(
-            root,
-            detail::ContentIdentitySpec{
-                .identity_domain = "program-revision",
-                .api_version = std::string(core::kProgramApiVersion),
-                .own_field = "program_revision",
-            })) {
+            root, detail::ContentIdentitySpec{
+                      .identity_domain = "program-revision",
+                      .api_version = std::string(core::kProgramApiVersion),
+                      .own_field = "program_revision",
+                  })) {
       fail("ProgramRevision does not match the complete canonical Program");
     }
     return detail::ProgramBindingContractConstructionAuthority::construct(
-        std::move(value), std::move(root), normalized_bytes);
-  } catch (const ProgramContractError&) {
+        std::move(value), std::move(root), normalized_bytes,
+        std::move(execution_table));
+  } catch (const ProgramContractError &) {
     throw;
-  } catch (const std::exception& error) {
+  } catch (const std::exception &error) {
     fail(std::string("Program binding-contract verification failed: ") +
          error.what());
   }
 }
 
-}  // namespace manyforge::deployment
+} // namespace manyforge::deployment

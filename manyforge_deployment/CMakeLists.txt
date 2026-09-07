@@ -129,6 +129,13 @@ if(NOT MANYFORGE_NODE_ENVIRONMENT_DELIMITER_COLLISION EQUAL -1)
     "raw-string delimiter")
 endif()
 
+file(READ "${MANYFORGE_NODE_CATALOG_SOURCE}" MANYFORGE_EMBEDDED_NODE_CATALOG)
+string(FIND "${MANYFORGE_EMBEDDED_NODE_CATALOG}" ")mf_node_cat\""
+  MANYFORGE_NODE_CATALOG_DELIMITER_COLLISION)
+if(NOT MANYFORGE_NODE_CATALOG_DELIMITER_COLLISION EQUAL -1)
+  message(FATAL_ERROR "node catalog collides with its generated-header delimiter")
+endif()
+
 set(
   MANYFORGE_CORE_INCLUDE_DIR
   "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_core/include"
@@ -972,6 +979,15 @@ if(BUILD_TESTING)
       "${CMAKE_CURRENT_SOURCE_DIR}/test/program_revision_tool.cmake")
 
   add_test(
+    NAME ProgramRevisionLoaderRoundtrip
+    COMMAND "${CMAKE_COMMAND}" -E env
+      "PYTHONPATH=${_MANYFORGE_WORKSPACE_ROOT}/manyforge_behavior:${_MANYFORGE_WORKSPACE_ROOT}"
+      "MANYFORGE_PROGRAM_REVISION_TOOL=$<TARGET_FILE:manyforge_program_revision>"
+      "${Python3_EXECUTABLE}" -m pytest -q -p no:cacheprovider
+      "${CMAKE_CURRENT_SOURCE_DIR}/test/test_program_revision_roundtrip.py")
+  set_tests_properties(ProgramRevisionLoaderRoundtrip PROPERTIES TIMEOUT 60)
+
+  add_test(
     NAME MaintainedProgramSourceRevisions
     COMMAND
       "${CMAKE_COMMAND}"
@@ -1189,6 +1205,7 @@ if(BUILD_TESTING)
   add_executable(test_program_contract
     test/test_program_contract.cpp)
   target_compile_definitions(test_program_contract PRIVATE
+    MANYFORGE_PROGRAM_CAPTURE_PACKAGE_ROOT="${CMAKE_CURRENT_BINARY_DIR}/program_capture_package"
     MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${CMAKE_CURRENT_BINARY_DIR}/generated/lite6_lite_gripper_structural"
     MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_example_models/models/lite6_lite_gripper")
   target_include_directories(test_program_contract PRIVATE
@@ -1196,7 +1213,17 @@ if(BUILD_TESTING)
   target_link_libraries(test_program_contract PRIVATE
     manyforge_deployment GTest::gtest_main)
   gtest_discover_tests(test_program_contract
-    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS}
+      FIXTURES_REQUIRED ProgramCapturePackage)
+  add_dependencies(test_program_contract manyforge_maintained_deployment_occurrences)
+  add_test(NAME ProgramCapturePackage
+    COMMAND "${CMAKE_COMMAND}"
+      "-DTOOL=$<TARGET_FILE:manyforge_maintained_deployment_occurrences>"
+      "-DWORKSPACE=${_MANYFORGE_WORKSPACE_ROOT}"
+      "-DBUILD_ROOT=${CMAKE_CURRENT_BINARY_DIR}"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/test/program_capture_package.cmake")
+  set_tests_properties(ProgramCapturePackage PROPERTIES
+    FIXTURES_SETUP ProgramCapturePackage TIMEOUT 120)
 
   add_executable(test_program_binding_compiler
     test/test_program_binding_compiler.cpp)

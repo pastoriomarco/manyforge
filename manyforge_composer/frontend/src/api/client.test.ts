@@ -65,7 +65,7 @@ function workspaceFixture(): Record<string, unknown> {
     children: [],
   };
   const programFields = {
-    api_version: 'manyforge.program.v1',
+    api_version: 'manyforge.program.v2',
     program_id: 'fixture',
     program_profile: 'composable-cell-v1',
     name: 'Fixture',

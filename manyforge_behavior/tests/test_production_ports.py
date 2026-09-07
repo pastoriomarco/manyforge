@@ -456,6 +456,9 @@ def test_control_node_submits_once_then_observes_owner_outcome(node, state):
     assert len(transport.controls) == len(transport.queries) == 1
     request = transport.controls[0][2]
     assert request["expected_operation_revision"] == 7
+    assert request["execution_scope"] == {
+        "node_instance_id": "control", "node_attempt_id": "attempt.1",
+    }
     assert request["request_context"]["request_owner_epoch"] == "kernel.epoch.7"
     transport.operations["controlled"]["state"] = state
     result = owner.controls.observe(task.task_id)
@@ -835,6 +838,10 @@ def test_relative_pose_submission_uses_capture_and_preserves_portable_roles() ->
     participant = request["participants"][0]
     assert participant["component_role_id"] == "robot"
     assert participant["target_role_id"] == "arm"
+    assert participant["execution_scope"] == {
+        "node_instance_id": _identity().node_instance_id,
+        "node_attempt_id": _identity().node_attempt_id,
+    }
     payload = participant["payload"]
     assert payload["target_mode"] == "relative"
     assert payload["target_reference"] == {
@@ -1857,6 +1864,15 @@ def test_pick_planning_assembles_portable_intent_without_prepared_authority() ->
         for phase in ("approach", "descend", "tool", "retreat")
     }
     assert len(request_ids) == 4
+    for phase in ("approach", "descend", "tool", "retreat"):
+        participant = intent[f"{phase}_operation"]["participants"][0]
+        assert participant["execution_scope"] == {
+            "node_instance_id": identity.node_instance_id,
+            "node_attempt_id": identity.node_attempt_id,
+        }
+        assert participant["action_span"]["node_instance_id"] == (
+            f"{identity.node_instance_id}/{phase}"
+        )
     assert "prepared" not in repr(intent).lower()
     port.pick_place.acknowledge(result.task_id, identity)
 

@@ -148,8 +148,9 @@ make_native_motion_context(const std::filesystem::path &root) {
   return {std::move(bundle), std::move(*model_map)};
 }
 
-[[nodiscard]] CanonicalValue make_program_root(const RetainedBundle &bundle,
-                                               bool include_node_policy = false) {
+[[nodiscard]] CanonicalValue
+make_program_root(const RetainedBundle &bundle,
+                  bool include_node_policy = false) {
   CanonicalValue::Object tree{
       {"node_id", CanonicalValue("sequence")},
       {"instance_id", CanonicalValue("root")},
@@ -169,17 +170,16 @@ make_native_motion_context(const std::filesystem::path &root) {
         CanonicalValue(CanonicalValue::Object{
             {"allow_intervention", CanonicalValue(false)},
             {"allowed_recovery_actions",
-             CanonicalValue(CanonicalValue::Array{
-                 CanonicalValue("runtime_override")})},
+             CanonicalValue(
+                 CanonicalValue::Array{CanonicalValue("runtime_override")})},
             {"max_retries", CanonicalValue(1.0)},
             {"allowed_skills", CanonicalValue(CanonicalValue::Array{})},
             {"persistence_ceiling", CanonicalValue("session_only")},
         }));
-    tree.emplace_back("operator_stop_policy",
-                      CanonicalValue("hold"));
+    tree.emplace_back("operator_stop_policy", CanonicalValue("hold"));
   }
   return CanonicalValue(CanonicalValue::Object{
-      {"api_version", CanonicalValue("manyforge.program.v1")},
+      {"api_version", CanonicalValue("manyforge.program.v2")},
       {"program_id", CanonicalValue("i6_binding_compiler_program")},
       {"program_revision", CanonicalValue(std::string(kZeroDigest))},
       {"program_profile", CanonicalValue("composable-cell-v1")},
@@ -336,14 +336,13 @@ make_aggregate_program_root(const RetainedBundle &bundle) {
 [[nodiscard]] std::string make_program_bytes(const RetainedBundle &bundle,
                                              bool aggregate_gripper = false,
                                              bool include_node_policy = false) {
-  CanonicalValue root =
-      aggregate_gripper
-          ? make_aggregate_program_root(bundle)
-          : make_program_root(bundle, include_node_policy);
+  CanonicalValue root = aggregate_gripper
+                            ? make_aggregate_program_root(bundle)
+                            : make_program_root(bundle, include_node_policy);
   const std::string revision =
       compute_content_identity(root, ContentIdentitySpec{
                                          .identity_domain = "program-revision",
-                                         .api_version = "manyforge.program.v1",
+                                         .api_version = "manyforge.program.v2",
                                          .own_field = "program_revision",
                                      });
   CanonicalValue::Object members = root.as_object();
@@ -478,14 +477,13 @@ TEST(ProgramBindingCompilerTest,
   const auto contract = verify_program_binding_contract(
       make_program_bytes(*context.bundle, false, true), *context.bundle);
   FilesystemCatalogArtifactStore catalog_store(root.path());
-  const auto binding = compile_program_binding(
-      *contract, valid_assignment(), *context.bundle, context.model_map,
-      catalog_store);
+  const auto binding =
+      compile_program_binding(*contract, valid_assignment(), *context.bundle,
+                              context.model_map, catalog_store);
 
   ASSERT_EQ(contract->value().node_policies.size(), 1U);
   ASSERT_NE(binding, nullptr);
-  EXPECT_EQ(binding->value().node_policies,
-            contract->value().node_policies);
+  EXPECT_EQ(binding->value().node_policies, contract->value().node_policies);
 
   ScopedTrustedRoot direct_root;
   const BindingCompilerContext direct_context =

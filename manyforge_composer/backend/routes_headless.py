@@ -38,6 +38,8 @@ from manyforge_headless_api.models import (
     StopFaultRecoveryIntentRequest,
     ProgramRunStartRequest,
     ProgramRunStopRequest,
+    ProgramSelectionStopRequest,
+    ProgramSelectionResumeRequest,
     ProgramFullStopResetRequest,
     ProgramFullStopResumeRequest,
     ProgramCycleResetRequest,
@@ -521,7 +523,7 @@ def create_headless_router(
     @router.post("/api/program/runs/{program_run_id}/motion-stop")
     async def program_run_motion_stop(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
-        body: ProgramRunStopRequest,
+        body: ProgramSelectionStopRequest,
     ) -> dict[str, Any]:
         if body.program_run_id != program_run_id:
             raise HTTPException(
@@ -540,6 +542,20 @@ def create_headless_router(
             ),
             stop=True,
         )
+
+    @router.post("/api/program/runs/{program_run_id}/resume-motion")
+    async def program_run_motion_resume(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        body: ProgramSelectionResumeRequest,
+    ) -> dict[str, Any]:
+        if body.program_run_id != program_run_id:
+            raise HTTPException(status_code=400, detail={
+                "code": "program_run_path_invalid",
+                "message": "Program-run identity in path and body must match",
+            })
+        return await control_call(lambda: client.program_run_motion_resume(
+            program_run_id, body.model_dump(mode="json"),
+        ))
 
     @router.post("/api/program/runs/{program_run_id}/full-stop")
     async def program_run_full_stop(

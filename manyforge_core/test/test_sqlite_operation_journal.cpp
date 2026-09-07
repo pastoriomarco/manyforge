@@ -495,8 +495,8 @@ TEST(SqliteOperationJournalTest, ExactLongServiceTimesSurviveOperationStopAndRes
   }
 }
 
-TEST(SqliteOperationJournalTest, V9AndV10CutoverPreservesHistoricalPayloadBytesAndDigests) {
-  for (const int version : {9, 10}) {
+TEST(SqliteOperationJournalTest, V9ThroughV11CutoverPreservesHistoricalPayloadBytesAndDigests) {
+  for (const int version : {9, 10, 11}) {
     SCOPED_TRACE(version);
     ScopedTemporaryDirectory directory;
     const auto database = directory.path() / "journal.sqlite3";
@@ -527,9 +527,11 @@ TEST(SqliteOperationJournalTest, V9AndV10CutoverPreservesHistoricalPayloadBytesA
     sqlite3* legacy = nullptr;
     ASSERT_EQ(sqlite3_open(database.c_str(), &legacy), SQLITE_OK);
     const auto legacy_schema =
-        "ALTER TABLE operation_snapshots DROP COLUMN journal_capture_order;"
-        "PRAGMA user_version=" +
-        std::to_string(version) +
+        std::string(
+            "ALTER TABLE operation_participants DROP COLUMN execution_node_instance_id;"
+            "ALTER TABLE operation_participants DROP COLUMN execution_node_attempt_id;") +
+        (version < 11 ? "ALTER TABLE operation_snapshots DROP COLUMN journal_capture_order;" : "") +
+        "PRAGMA user_version=" + std::to_string(version) +
         "; UPDATE journal_metadata SET schema_version=" + std::to_string(version) +
         ",schema_id='manyforge.internal.execution.operation-journal.o1.5.v" +
         std::to_string(version) + "' WHERE singleton=1;";
@@ -570,6 +572,8 @@ TEST(SqliteOperationJournalTest, CorruptV9CutoverLeavesIdentityAndEvidenceUntouc
     ASSERT_EQ(
         sqlite3_exec(
             legacy,
+            "ALTER TABLE operation_participants DROP COLUMN execution_node_instance_id;"
+            "ALTER TABLE operation_participants DROP COLUMN execution_node_attempt_id;"
             "ALTER TABLE operation_snapshots DROP COLUMN journal_capture_order;"
             "PRAGMA user_version=9; UPDATE journal_metadata SET schema_version=9,"
             "schema_id='manyforge.internal.execution.operation-journal.o1.5.v9' WHERE singleton=1;",
@@ -600,6 +604,47 @@ TEST(SqliteOperationJournalTest, CorruptV9CutoverLeavesIdentityAndEvidenceUntouc
     ASSERT_EQ(sqlite3_prepare_v2(legacy, "PRAGMA user_version", -1, &version, nullptr), SQLITE_OK);
     ASSERT_EQ(sqlite3_step(version), SQLITE_ROW);
     EXPECT_EQ(sqlite3_column_int(version, 0), 9);
+    sqlite3_finalize(version);
+    sqlite3_close(legacy);
+  }
+}
+
+TEST(SqliteOperationJournalTest, CorruptV11CaptureOrderCannotCommitTheSchemaUpgrade) {
+  for (const auto order : {0, 100}) {
+    ScopedTemporaryDirectory temporary;
+    const auto database = temporary.path() / "corrupt-v11.sqlite3";
+    const CellId cell("cell.test");
+    const RequestOwnerEpoch epoch("owner.v11");
+    {
+      SqliteOperationJournal journal(database, cell);
+      ASSERT_TRUE(journal.BeginOwnerEpoch(epoch, 1, 16U, {}).ok());
+      auto state = OperationState("operation.legacy", OperationStateKind::kExecuting, 2);
+      state.journal_capture_order = 1U;
+      const auto command = CommandIntent("request.legacy", epoch.value());
+      ASSERT_TRUE(
+          journal.RecordOperationAccepted(epoch, command, Acceptance(command, state), state).ok());
+    }
+    sqlite3* legacy = nullptr;
+    ASSERT_EQ(sqlite3_open(database.c_str(), &legacy), SQLITE_OK);
+    const auto downgrade =
+        "ALTER TABLE operation_participants DROP COLUMN execution_node_instance_id;"
+        "ALTER TABLE operation_participants DROP COLUMN execution_node_attempt_id;"
+        "PRAGMA user_version=11; UPDATE journal_metadata SET schema_version=11,"
+        "schema_id='manyforge.internal.execution.operation-journal.o1.5.v11';"
+        "UPDATE operation_snapshots SET journal_capture_order=" +
+        std::to_string(order);
+    ASSERT_EQ(sqlite3_exec(legacy, downgrade.c_str(), nullptr, nullptr, nullptr), SQLITE_OK);
+    EXPECT_THROW(SqliteOperationJournal(database, cell), std::runtime_error);
+    sqlite3_stmt* version = nullptr;
+    ASSERT_EQ(sqlite3_prepare_v2(legacy,
+                                 "SELECT schema_version,(SELECT COUNT(*) FROM "
+                                 "pragma_table_info('operation_participants') "
+                                 "WHERE name='execution_node_instance_id') FROM journal_metadata",
+                                 -1, &version, nullptr),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(version), SQLITE_ROW);
+    EXPECT_EQ(sqlite3_column_int(version, 0), 11);
+    EXPECT_EQ(sqlite3_column_int(version, 1), 0);
     sqlite3_finalize(version);
     sqlite3_close(legacy);
   }
@@ -1009,9 +1054,13 @@ TEST(SqliteOperationJournalTest,
   const CellId cell_id("cell.1");
   const std::vector<ResourceId> inventory{ResourceId("robot.gripper")};
   const RequestOwnerEpoch first_epoch("execution-host.epoch.1");
-  const auto intent = CommandIntent("request.command.1", first_epoch.value());
-  const auto state =
+  auto intent = CommandIntent("request.command.1", first_epoch.value());
+  auto state =
       OperationState("operation:execution-host.epoch.1:1", OperationStateKind::kExecuting, 10);
+  const ProgramNodeExecutionScopeDTO scope{ProgramNodeInstanceId("grasp"), "grasp.attempt.1"};
+  intent.participants.front().execution_scope = scope;
+  state.participants.front().execution_scope = scope;
+  state.journal_capture_order = 1U;
   {
     SqliteOperationJournal journal(database, cell_id, 8U);
     const auto begun = journal.BeginOwnerEpoch(first_epoch, 1, 4U, inventory);
@@ -1032,6 +1081,7 @@ TEST(SqliteOperationJournalTest,
   EXPECT_EQ(historical.operation_id, state.operation_id);
   EXPECT_EQ(historical.state, OperationStateKind::kInterventionRequired);
   EXPECT_EQ(historical.updated_at_ns, 20);
+  EXPECT_EQ(historical.participants.front().execution_scope, scope);
   ASSERT_TRUE(historical.participants.front().terminal_error.has_value());
   EXPECT_EQ(historical.participants.front().terminal_error->details.at("reason"),
             "unreconciled_external_or_orphan_goal");
@@ -1045,6 +1095,35 @@ TEST(SqliteOperationJournalTest,
   ASSERT_EQ(recovered_again.value().historical_operations.size(), 1U);
   EXPECT_EQ(recovered_again.value().historical_operations.front(), historical);
   EXPECT_EQ(recovered_again.value().unreconciled_resources, inventory);
+}
+
+TEST(SqliteOperationJournalTest, LaterSnapshotsCannotChangeCapturedProgramOrigin) {
+  ScopedTemporaryDirectory temporary;
+  const RequestOwnerEpoch epoch("execution-host.captured");
+  SqliteOperationJournal journal(temporary.path() / "captured.sqlite3", CellId("cell.1"), 8U);
+  const std::vector<ResourceId> inventory{ResourceId("robot.gripper")};
+  ASSERT_TRUE(journal.BeginOwnerEpoch(epoch, 1, 4U, inventory).ok());
+  auto intent = CommandIntent("captured-command", epoch.value());
+  auto initial = OperationState("operation.captured", OperationStateKind::kExecuting, 10);
+  initial.journal_capture_order = 3U;
+  initial.participants.front().execution_scope =
+      ProgramNodeExecutionScopeDTO{ProgramNodeInstanceId("grasp"), "grasp.attempt.1"};
+  intent.participants.front().execution_scope = initial.participants.front().execution_scope;
+  ASSERT_TRUE(
+      journal.RecordOperationAccepted(epoch, intent, Acceptance(intent, initial), initial).ok());
+  for (const bool remove_origin : {false, true}) {
+    for (const auto order : {2U, 4U}) {
+      auto changed = initial;
+      changed.journal_capture_order = order;
+      changed.updated_at_ns = 11;
+      if (remove_origin)
+        changed.participants.front().execution_scope.reset();
+      else
+        changed.participants.front().execution_scope->node_instance_id =
+            ProgramNodeInstanceId("other");
+      EXPECT_FALSE(journal.RecordOperationState(epoch, changed, nullptr, "changed-origin").ok());
+    }
+  }
 }
 
 TEST(SqliteOperationJournalTest,
@@ -1739,6 +1818,94 @@ TEST(SqliteOperationJournalTest,
     ASSERT_FALSE(recovered.ok());
     EXPECT_EQ(recovered.error().code, "operation_journal_corrupt");
   }
+}
+
+TEST(SqliteOperationJournalTest, AuthoredOriginCorruptionFailsOnWriteAndReopen) {
+  for (const auto* update :
+       {"UPDATE operation_participants SET "
+        "execution_node_instance_id='other',execution_node_attempt_id='other.attempt'",
+        "UPDATE operation_participants SET "
+        "execution_node_instance_id=NULL,execution_node_attempt_id=NULL",
+        "UPDATE operation_snapshots SET program_run_id='other.run'",
+        "UPDATE operation_snapshots SET program_binding_id='other.binding'"}) {
+    SCOPED_TRACE(update);
+    ScopedTemporaryDirectory temporary;
+    const auto database = temporary.path() / "origin-corruption.sqlite3";
+    const RequestOwnerEpoch epoch("owner.origin-integrity");
+    const CellId cell("cell.test");
+    const std::vector<ResourceId> inventory{ResourceId("robot.gripper")};
+    auto state = OperationState("operation.origin-integrity", OperationStateKind::kCompleted, 10);
+    state.journal_capture_order = 1U;
+    state.participants.front().execution_scope =
+        ProgramNodeExecutionScopeDTO{ProgramNodeInstanceId("grasp"), "grasp.attempt.1"};
+    {
+      SqliteOperationJournal journal(database, cell, 8U);
+      ASSERT_TRUE(journal.BeginOwnerEpoch(epoch, 1, 8U, inventory).ok());
+      auto intent = CommandIntent("request.origin-integrity", epoch.value());
+      intent.participants.front().execution_scope = state.participants.front().execution_scope;
+      ASSERT_TRUE(
+          journal.RecordOperationAccepted(epoch, intent, Acceptance(intent, state), state).ok());
+      sqlite3* corrupt = nullptr;
+      ASSERT_EQ(sqlite3_open(database.c_str(), &corrupt), SQLITE_OK);
+      ASSERT_EQ(sqlite3_exec(corrupt, update, nullptr, nullptr, nullptr), SQLITE_OK);
+      ASSERT_EQ(sqlite3_close(corrupt), SQLITE_OK);
+      state.journal_capture_order = 2U;
+      const auto rejected = journal.RecordOperationState(epoch, state, nullptr, "next_capture");
+      ASSERT_FALSE(rejected.ok());
+      EXPECT_EQ(rejected.error().code, "operation_journal_corrupt");
+    }
+    SqliteOperationJournal replacement(database, cell, 8U);
+    const auto recovered = replacement.BeginOwnerEpoch(
+        RequestOwnerEpoch("owner.origin-integrity.2"), 20, 8U, inventory);
+    ASSERT_FALSE(recovered.ok());
+    EXPECT_EQ(recovered.error().code, "operation_journal_corrupt");
+  }
+}
+
+TEST(SqliteOperationJournalTest, ScopedStopProjectionRetainsOriginAndVersionOnReopen) {
+  ScopedTemporaryDirectory temporary;
+  const auto database = temporary.path() / "scoped-stop.sqlite3";
+  const CellId cell("cell.test");
+  const RequestOwnerEpoch epoch("owner.scoped-stop");
+  const std::vector<ResourceId> inventory{ResourceId("robot.gripper")};
+  auto state = OperationState("operation.scoped-stop", OperationStateKind::kExecuting, 10);
+  state.journal_capture_order = 1U;
+  state.participants.front().execution_scope =
+      ProgramNodeExecutionScopeDTO{ProgramNodeInstanceId("grasp"), "grasp.attempt.1"};
+  {
+    SqliteOperationJournal journal(database, cell, 8U);
+    ASSERT_TRUE(journal.BeginOwnerEpoch(epoch, 1, 8U, inventory).ok());
+    auto command = CommandIntent("scoped-command", epoch.value());
+    command.participants.front().execution_scope = state.participants.front().execution_scope;
+    ASSERT_TRUE(
+        journal.RecordOperationAccepted(epoch, command, Acceptance(command, state), state).ok());
+    state.state = OperationStateKind::kStopping;
+    state.participants.front().state = OperationStateKind::kStopping;
+    state.journal_capture_order = 2U;
+    state.active_stop_id = StopId("stop.scoped");
+    state.active_stop_generation = StopGeneration(1U);
+    const FullStopIntentDTO stop{
+        {RequestId("scoped-stop"), epoch, "test", {}}, StopGeneration(0U), {}};
+    const auto accepted = StopAcceptanceRecord(epoch, "scoped-stop", "stop.scoped", 1U, 20);
+    const auto projected =
+        ProjectStopAccepted(journal, epoch, accepted, EmergencyStopProjectedIntentDTO(stop),
+                            StopAffectedState({state}, inventory));
+    ASSERT_EQ(projected.projection_state, EmergencyStopProjectionStateDTO::kRecorded);
+    const auto events = journal.ReadEvents(epoch, 0U, 8U);
+    ASSERT_TRUE(events.ok());
+    ASSERT_EQ(events.value().events.size(), 2U);
+    const auto& bytes = events.value().events.back().payload_json;
+    EXPECT_NE(bytes.find("manyforge.stop_acceptance_projection.v3"), std::string::npos);
+    EXPECT_NE(bytes.find("grasp.attempt.1"), std::string::npos);
+  }
+  SqliteOperationJournal replacement(database, cell, 8U);
+  const auto recovered =
+      replacement.BeginOwnerEpoch(RequestOwnerEpoch("owner.scoped-stop.2"), 30, 8U, inventory);
+  ASSERT_TRUE(recovered.ok()) << recovered.error().message;
+  ASSERT_EQ(recovered.value().historical_operations.size(), 1U);
+  EXPECT_EQ(recovered.value().historical_operations.front().participants.front().execution_scope,
+            state.participants.front().execution_scope);
+  EXPECT_EQ(recovered.value().unreconciled_resources, inventory);
 }
 
 TEST(SqliteOperationJournalTest, UnresolvedOrphanFenceSurvivesBoundedHistoryCompaction) {

@@ -58,6 +58,13 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
   [[nodiscard]] bool LatchManagerLivenessLoss(const ManagerLivenessLossIntentDTO& intent) noexcept;
 
   [[nodiscard]] bool has_unresolved_claims() const;
+  /// Current held authority, excluding released and reconciled predecessors.
+  [[nodiscard]] std::optional<CellAdmissionClaimDTO> held_claim(
+      CellAdmissionClaimKindDTO kind) const;
+  /// Internal successor-owner request using the exact existing ledger inventory.
+  /// It grants no release: Reconcile still requires Kernel settlement validation.
+  [[nodiscard]] Result<std::optional<CellAdmissionReconcileDTO>>
+  manual_owner_reconciliation_request() const;
 
  private:
   struct Entry final {
@@ -74,6 +81,9 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
   [[nodiscard]] const Entry* FindReplayLocked(const CellAdmissionClaimIntentDTO& intent) const;
   [[nodiscard]] Entry* FindHeldLocked(CellAdmissionClaimGeneration generation);
   [[nodiscard]] const Entry* ParentCycleLocked(const CellAdmissionClaimIntentDTO& intent) const;
+  [[nodiscard]] bool HasUnsettledChildrenLocked(
+      CellAdmissionClaimGeneration parent,
+      const std::vector<CellAdmissionReconcileSettlementDTO>& prospective = {}) const;
   [[nodiscard]] bool IsStaleOwnerLocked(const CellAdmissionClaimIntentDTO& intent) const;
   [[nodiscard]] Result<void> AdvanceGenerationLocked();
 

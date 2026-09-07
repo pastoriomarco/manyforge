@@ -13,6 +13,7 @@ import type {
   ProgramNodeModificationPolicy,
   ProgramNodeRecoveryPolicy,
   ProgramOperatorStopPolicy,
+  ProgramTreeNode,
   ProgramWorkspaceResponse,
   ProgramWorkspaceTransitionResponse,
   ProgramWorkspaceTransitionStatus,
@@ -370,12 +371,14 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
     modificationPolicy: ProgramNodeModificationPolicy,
     recoveryPolicy: ProgramNodeRecoveryPolicy,
     operatorStopPolicy: ProgramOperatorStopPolicy,
+    executionGroups: NonNullable<ProgramTreeNode['execution_groups']>,
   ) => {
     mutate('program_draft_update_node_policies', {
       instance_id: instanceId,
       modification_policy: modificationPolicy as unknown as JsonValue,
       recovery_policy: recoveryPolicy as unknown as JsonValue,
       operator_stop_policy: operatorStopPolicy,
+      execution_groups: executionGroups,
     });
   }, [mutate]);
   const clearFeedback = useCallback(() => {

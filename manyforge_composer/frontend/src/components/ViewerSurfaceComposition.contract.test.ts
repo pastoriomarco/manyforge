@@ -59,7 +59,7 @@ describe('UI4 application and viewport composition', () => {
     const styles = source('../index.css');
 
     expect(transport).toContain('canResume || canResumeOperatorStop');
-    expect(transport).toContain('program.applyRecoveryAction(operatorStopResumeAction)');
+    expect(transport).toContain('program.resumeMotion(selectedGroup?.groupId)');
     expect(transport).toContain('transport-stop-primary');
     expect(transport).toContain('transport-stop-disclosure');
     expect(transport).toContain('Full Stop');

@@ -421,19 +421,45 @@ template <typename T, typename Decode>
 }
 
 [[nodiscard]] V participant_state_value(const OperationParticipantStateDTO& value) {
-  return arr({enc(value.participant_id), enc(value.controller_goal_id),
-              enc(value.controller_goal_generation), enc(value.controllable_component_id),
-              enc(value.command_target_id), enc(value.capability_id), enc(value.control_domain_id),
-              enc(value.control_domain_revision), enc(value.control_binding_id),
-              enc(value.control_binding_revision),
-              opt(value.capability_provider_binding_id, id_value),
-              opt(value.capability_provider_binding_revision, id_value), enc(value.payload_kind),
-              enc(value.state), V(value.progress), vec(value.resources, id_value),
-              opt(value.terminal_error, error_value)});
+  A fields{enc(value.participant_id),
+           enc(value.controller_goal_id),
+           enc(value.controller_goal_generation),
+           enc(value.controllable_component_id),
+           enc(value.command_target_id),
+           enc(value.capability_id),
+           enc(value.control_domain_id),
+           enc(value.control_domain_revision),
+           enc(value.control_binding_id),
+           enc(value.control_binding_revision),
+           opt(value.capability_provider_binding_id, id_value),
+           opt(value.capability_provider_binding_revision, id_value),
+           enc(value.payload_kind),
+           enc(value.state),
+           V(value.progress),
+           vec(value.resources, id_value),
+           opt(value.terminal_error, error_value)};
+  if (value.execution_scope.has_value()) {
+    if (!valid_program_node_execution_scope(*value.execution_scope)) {
+      bad("operation participant scope is invalid");
+    }
+    fields.push_back(arr(
+        {enc(value.execution_scope->node_instance_id), V(value.execution_scope->node_attempt_id)}));
+  }
+  return V(std::move(fields));
 }
 
 [[nodiscard]] OperationParticipantStateDTO participant_state_from(const V& value) {
-  const auto& f = exact(value, 17U, "operation participant state");
+  if (!value.is_array() || (value.as_array().size() != 17U && value.as_array().size() != 18U)) {
+    bad("operation participant state has an unsupported shape");
+  }
+  const auto& f = value.as_array();
+  std::optional<ProgramNodeExecutionScopeDTO> scope;
+  if (f.size() == 18U) {
+    const auto& origin = exact(f[17], 2U, "operation participant scope");
+    scope = ProgramNodeExecutionScopeDTO{did<ProgramNodeInstanceId>(origin[0], "node instance ID"),
+                                         str(origin[1], "node attempt ID")};
+    if (!valid_program_node_execution_scope(*scope)) bad("operation participant scope is invalid");
+  }
   return OperationParticipantStateDTO{
       did<OperationParticipantId>(f[0], "participant ID"),
       did<ControllerGoalId>(f[1], "controller goal ID"),
@@ -458,10 +484,14 @@ template <typename T, typename Decode>
       number(f[14], "progress"),
       dvec<ResourceId>(
           f[15], [](const V& v) { return did<ResourceId>(v, "resource ID"); }, "resources"),
-      dopt<ErrorDTO>(f[16], error_from)};
+      dopt<ErrorDTO>(f[16], error_from),
+      std::move(scope)};
 }
 
 [[nodiscard]] V operation_state_value(const OperationStateDTO& value) {
+  if (has_program_execution_scope(value) && value.journal_capture_order == 0U) {
+    bad("captured Program work requires an ordered Stop snapshot");
+  }
   V::Array fields{enc(value.operation_id),
                   enc(value.operation_revision),
                   enc(value.program_binding_id),
@@ -1856,11 +1886,15 @@ template <typename T, typename Decode>
 }
 
 [[nodiscard]] V acceptance_root(const StopJournalAcceptanceProjectionDTO& value) {
+  const bool scoped =
+      std::any_of(value.affected_state.operations.begin(), value.affected_state.operations.end(),
+                  has_program_execution_scope);
   const bool ordered =
       std::any_of(value.affected_state.operations.begin(), value.affected_state.operations.end(),
                   [](const auto& row) { return row.journal_capture_order != 0U; });
-  return arr({V(ordered ? "manyforge.internal.stop-journal-acceptance-projection.v2"
-                        : "manyforge.internal.stop-journal-acceptance-projection.v1"),
+  return arr({V(scoped    ? "manyforge.internal.stop-journal-acceptance-projection.v3"
+                : ordered ? "manyforge.internal.stop-journal-acceptance-projection.v2"
+                          : "manyforge.internal.stop-journal-acceptance-projection.v1"),
               accepted_value(value.accepted), affected_value(value.affected_state)});
 }
 
@@ -1868,7 +1902,8 @@ template <typename T, typename Decode>
   const auto& f = exact(value, 3U, "Stop journal acceptance projection");
   const auto version = str(f[0], "acceptance API version");
   if (version != "manyforge.internal.stop-journal-acceptance-projection.v1" &&
-      version != "manyforge.internal.stop-journal-acceptance-projection.v2") {
+      version != "manyforge.internal.stop-journal-acceptance-projection.v2" &&
+      version != "manyforge.internal.stop-journal-acceptance-projection.v3") {
     bad("Stop journal acceptance projection API version is unsupported");
   }
   auto result = StopJournalAcceptanceProjectionDTO{accepted_from(f[1]), affected_from(f[2])};

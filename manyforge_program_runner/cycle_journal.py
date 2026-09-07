@@ -239,6 +239,7 @@ _REQUEST_KINDS: Final = frozenset(
         "manual_result_stage",
         "recovery_action",
         "resume_full_stop",
+        "resume_motion",
         "discard_full_stop",
     }
 )
@@ -1926,25 +1927,6 @@ class ProgramCycleJournal:
             ).rowcount
             if changed != 1:
                 raise RuntimeError("Program-cycle stopping transition is stale")
-
-    def observe_motion_stop_settled(self, *, program_run_id: str) -> bool:
-        """Return the cycle to Running after its exact motion Stop settles.
-
-        The Program-run owner, rather than a transport response or UI timer,
-        supplies settlement. A concurrent terminal transition wins cleanly.
-        """
-
-        with self._transaction():
-            changed = self._database.execute(
-                """
-                UPDATE program_cycle SET state='running',
-                    execution_control_revision=execution_control_revision+1
-                WHERE singleton=1 AND program_run_id=? AND state='stopping'
-                  AND current_command_kind='program_motion_stop'
-                """,
-                (program_run_id,),
-            ).rowcount
-        return changed == 1
 
     def begin_resetting(
         self,

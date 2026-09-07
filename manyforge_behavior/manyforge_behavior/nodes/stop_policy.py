@@ -4,18 +4,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from threading import RLock
-from typing import Any, Iterator
+from typing import Callable, Iterator, Mapping
 
 import py_trees
 
 
 @dataclass(frozen=True, slots=True)
 class OperatorMotionStopSnapshot:
-    """The exact Stop identity currently observed by one Program run."""
+    """Scheduling-only projection of one current Kernel selection revision."""
 
-    stop_id: str | None = None
-    stop_generation: int = 0
-    held: bool = False
+    selection_revision: int = 0
+    held_nodes: frozenset[str] = frozenset()
+    stopping_nodes: frozenset[str] = frozenset()
+    faulted_nodes: frozenset[str] = frozenset()
 
 
 class OperatorMotionStopState:
@@ -23,59 +24,116 @@ class OperatorMotionStopState:
 
     This is scheduling state, not Stop authority. The Kernel owns acceptance,
     containment, certificates, and recovery; the Program run merely remembers
-    which exact owner-issued Stop it observed so authored hold/continue policy
-    can affect tree ticking.
+    the current owner-issued held-node set so authored hold/continue policy
+    can affect tree ticking. Completing one task never releases that scope.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        node_children: Mapping[str, tuple[str, ...]],
+        *,
+        read_scope: Callable[[], OperatorMotionStopSnapshot] | None = None,
+    ) -> None:
+        # The validated Program supplies child-before-parent order. Each edge
+        # is retained once; never materialize a descendant set for every node.
+        self._node_children = tuple(node_children.items())
+        self._node_ids = frozenset(node_children)
+        seen: set[str] = set()
+        for node_id, children in self._node_children:
+            if any(child not in seen for child in children):
+                raise ValueError("captured Stop topology must be child-before-parent")
+            seen.add(node_id)
+        self._read_scope = read_scope
         self._snapshot = OperatorMotionStopSnapshot()
-        self._held_tasks: dict[str, tuple[str, int]] = {}
+        self._held_subtrees: frozenset[str] = frozenset()
+        self._observation_changed = False
+        self._observation_error: str | None = None
         self._lock = RLock()
 
-    def hold(self, task_id: str, metadata: dict[str, Any] | Any) -> bool:
-        if not isinstance(task_id, str) or not task_id:
-            return False
-        if not isinstance(metadata, dict):
-            return False
-        stop_id = metadata.get("active_stop_id")
-        generation = metadata.get("active_stop_generation")
+    def publish(self, snapshot: OperatorMotionStopSnapshot) -> None:
         if (
-            not isinstance(stop_id, str)
-            or not stop_id
-            or type(generation) is not int
-            or generation < 1
+            not isinstance(snapshot, OperatorMotionStopSnapshot)
+            or type(snapshot.selection_revision) is not int
+            or snapshot.selection_revision < 0
+            or not isinstance(snapshot.held_nodes, frozenset)
+            or not snapshot.held_nodes <= self._node_ids
+            or not isinstance(snapshot.stopping_nodes, frozenset)
+            or not isinstance(snapshot.faulted_nodes, frozenset)
+            or not (snapshot.stopping_nodes | snapshot.faulted_nodes) <= snapshot.held_nodes
+            or snapshot.stopping_nodes & snapshot.faulted_nodes
         ):
-            return False
+            raise ValueError("operator Stop projection is outside its captured scope")
         with self._lock:
-            self._held_tasks[task_id] = (stop_id, generation)
-            newest_stop_id, newest_generation = max(
-                self._held_tasks.values(), key=lambda row: row[1]
-            )
-            self._snapshot = OperatorMotionStopSnapshot(
-                stop_id=newest_stop_id,
-                stop_generation=newest_generation,
-                held=True,
-            )
-        return True
+            if snapshot.selection_revision < self._snapshot.selection_revision:
+                return
+            if snapshot.selection_revision == self._snapshot.selection_revision:
+                if snapshot.held_nodes != self._snapshot.held_nodes:
+                    raise ValueError(
+                        "operator Stop projection changed without a revision"
+                    )
+                # Within one selection, settlement is monotonic. A crossing
+                # older read cannot put settled work back into Stopping or
+                # erase a fault. Release/reset has a new selection revision.
+                if (not snapshot.stopping_nodes <= self._snapshot.stopping_nodes
+                    or not self._snapshot.faulted_nodes <= snapshot.faulted_nodes):
+                    return
+                if not (snapshot.faulted_nodes - self._snapshot.faulted_nodes) <= self._snapshot.stopping_nodes:
+                    raise ValueError("settled operator Stop changed its terminal outcome")
+                if self._observation_error is not None:
+                    self._observation_error = None
+                    self._observation_changed = True
+                if snapshot == self._snapshot:
+                    return
+            if snapshot.held_nodes != self._snapshot.held_nodes:
+                held_subtrees: set[str] = set()
+                for node_id, children in self._node_children:
+                    if node_id in snapshot.held_nodes and all(
+                        child in held_subtrees for child in children
+                    ):
+                        held_subtrees.add(node_id)
+                self._held_subtrees = frozenset(held_subtrees)
+            self._snapshot = snapshot
+            self._observation_error = None
+            self._observation_changed = True
+
+    def note_task_observation_change(self) -> None:
+        """Coalesce a held task's terminal change into the existing Run wake."""
+        with self._lock:
+            self._observation_changed = True
+
+    def take_observation_change(self) -> bool:
+        with self._lock:
+            changed, self._observation_changed = self._observation_changed, False
+            return changed
+
+    def refresh(self) -> None:
+        if self._read_scope is None:
+            raise RuntimeError("operator Stop has no captured owner projection")
+        # No owner I/O under the scheduling-view lock. A crossing newer
+        # selection publication wins by its existing Kernel revision.
+        basis = self.snapshot()
+        try:
+            self.publish(self._read_scope())
+        except Exception:
+            with self._lock:
+                # A late failed read cannot poison a newer accepted Stop or
+                # settled view, which may no longer need another owner read.
+                if self._snapshot == basis and self._observation_error is None:
+                    self._observation_error = "program_selection_observation_unavailable"
+                    self._observation_changed = True
+            raise
+
+    def observation_error(self) -> str | None:
+        with self._lock:
+            return self._observation_error
 
     def snapshot(self) -> OperatorMotionStopSnapshot:
         with self._lock:
             return self._snapshot
 
-    def resolve(self, task_id: str) -> None:
+    def holds_subtree(self, node_instance_id: str) -> bool:
         with self._lock:
-            self._held_tasks.pop(task_id, None)
-            if not self._held_tasks:
-                self._snapshot = OperatorMotionStopSnapshot()
-                return
-            newest_stop_id, newest_generation = max(
-                self._held_tasks.values(), key=lambda row: row[1]
-            )
-            self._snapshot = OperatorMotionStopSnapshot(
-                stop_id=newest_stop_id,
-                stop_generation=newest_generation,
-                held=True,
-            )
+            return node_instance_id in self._held_subtrees
 
 
 class OperatorMotionStopPolicy(py_trees.decorators.Decorator):
@@ -93,6 +151,7 @@ class OperatorMotionStopPolicy(py_trees.decorators.Decorator):
         stop_state: OperatorMotionStopState,
     ) -> None:
         super().__init__(name=f"operator-stop:{node_instance_id}", child=child)
+        self._node_instance_id = node_instance_id
         self._stop_state = stop_state
 
     def _observe_active_tasks(self) -> None:
@@ -102,7 +161,7 @@ class OperatorMotionStopPolicy(py_trees.decorators.Decorator):
                 observe()
 
     def tick(self) -> Iterator[py_trees.behaviour.Behaviour]:
-        if not self._stop_state.snapshot().held:
+        if not self._stop_state.holds_subtree(self._node_instance_id):
             yield from super().tick()
             return
         self._observe_active_tasks()

@@ -52,6 +52,7 @@ import type {
   ProgramCycleStatus,
   ProgramRunStateName,
   ProgramRunStatus,
+  ProgramExecutionSelectionControls,
   CycleRecoveryAction,
   CycleRecoveryActionId,
   CycleRecoveryOffer,
@@ -958,6 +959,7 @@ function parseProgramTreeNode(
       'modification_policy',
       'recovery_policy',
       'operator_stop_policy',
+      'execution_groups',
     ],
     path,
   );
@@ -1004,6 +1006,29 @@ function parseProgramTreeNode(
       return fail(`${path}.operator_stop_policy`, 'a closed Stop policy');
     }
     node.operator_stop_policy = operatorStop;
+  }
+  if (record.execution_groups !== undefined) {
+    const groupPath = `${path}.execution_groups`;
+    if (record.execution_groups === 'all') {
+      node.execution_groups = 'all';
+    } else {
+      const groups = arrayAt(record.execution_groups, groupPath);
+      if (groups.length === 0 || groups.length > 4096) {
+        return fail(groupPath, 'a bounded nonempty named selection');
+      }
+      const names = groups.map((group, index) => {
+        const name = stringAt(group, `${groupPath}[${index}]`);
+        if (name.length > 128 || !/^[a-z][a-z0-9_.-]*$/.test(name)
+            || name === 'all' || name === 'inherit') {
+          return fail(groupPath, 'portable non-reserved execution group IDs');
+        }
+        return name;
+      });
+      if (names.some((name, index) => index > 0 && names[index - 1] >= name)) {
+        return fail(groupPath, 'unique canonical-sorted execution group IDs');
+      }
+      node.execution_groups = names;
+    }
   }
   const modification = node.modification_policy ?? {
     runtime_override: 'forbidden' as const,
@@ -1363,8 +1388,8 @@ export function parseProgramDocument(value: unknown, path = 'program'): ProgramD
     path,
   );
   const apiVersion = stringAt(record.api_version, `${path}.api_version`);
-  if (apiVersion !== 'manyforge.program.v1') {
-    return fail(`${path}.api_version`, 'the literal "manyforge.program.v1"');
+  if (apiVersion !== 'manyforge.program.v2') {
+    return fail(`${path}.api_version`, 'the literal "manyforge.program.v2"');
   }
   const programProfile = stringAt(record.program_profile, `${path}.program_profile`);
   if (programProfile !== 'composable-cell-v1') {
@@ -3922,6 +3947,47 @@ function parseRuntimeOverrideObservationCandidate(
   return result;
 }
 
+function parseExecutionSelectionControls(value: unknown, path: string): ProgramExecutionSelectionControls {
+  const record = objectAt(value, path);
+  exactKeysAt(record, ['selection_revision', 'groups'], path);
+  const selectionRevision = integerAt(record.selection_revision, `${path}.selection_revision`);
+  if (selectionRevision < 0) return fail(path, 'a nonnegative selection revision');
+  let previous = '';
+  const groups = boundedArrayAt(record.groups, `${path}.groups`, 4097).map((raw, index) => {
+    const key = `${path}.groups[${index}]`;
+    const row = objectAt(raw, key);
+    exactKeysAt(row, ['group_id', 'node_count', 'held_node_count', 'state',
+      'stop_allowed', 'resume_allowed', 'resume_unavailable_reason'], key);
+    const groupId = stringAt(row.group_id, `${key}.group_id`);
+    if (!/^[a-z][a-z0-9_.-]{0,127}$/.test(groupId) || groupId === 'inherit' || groupId <= previous) {
+      return fail(key, 'canonical unique captured group IDs');
+    }
+    previous = groupId;
+    const nodeCount = positiveIntegerAt(row.node_count, `${key}.node_count`);
+    const heldNodeCount = integerAt(row.held_node_count, `${key}.held_node_count`);
+    const state = stringAt(row.state, `${key}.state`);
+    if (!['running', 'held', 'mixed', 'stopping', 'faulted', 'unavailable'].includes(state)) {
+      return fail(key, 'an owner selection state');
+    }
+    const stopAllowed = booleanAt(row.stop_allowed, `${key}.stop_allowed`);
+    const resumeAllowed = booleanAt(row.resume_allowed, `${key}.resume_allowed`);
+    const resumeUnavailableReason = nullableStringAt(row.resume_unavailable_reason, `${key}.resume_unavailable_reason`);
+    if (nodeCount > 100_000 || heldNodeCount < 0 || heldNodeCount > nodeCount
+      || (state === 'running' && heldNodeCount !== 0)
+      || (state === 'held' && heldNodeCount !== nodeCount)
+      || (state === 'mixed' && (heldNodeCount === 0 || heldNodeCount === nodeCount))
+      || (resumeAllowed && (!['held', 'mixed'].includes(state) || heldNodeCount === 0))
+      || resumeAllowed !== (resumeUnavailableReason === null)) {
+      return fail(key, 'coherent bounded selection status and eligibility');
+    }
+    return { groupId, nodeCount, heldNodeCount,
+      state: state as ProgramExecutionSelectionControls['groups'][number]['state'],
+      stopAllowed, resumeAllowed, resumeUnavailableReason };
+  });
+  if (!groups.some((group) => group.groupId === 'all')) return fail(path, 'the built-in all selection');
+  return { selectionRevision, groups };
+}
+
 export function parseProgramRuntimeControlProjection(
   value: unknown,
 ): ProgramRuntimeControlProjection {
@@ -3930,13 +3996,13 @@ export function parseProgramRuntimeControlProjection(
   exactKeysAt(record, [
     'schema_version', 'owner_id', 'owner_epoch', 'program_run_id',
     'run_revision', 'runtime_controls', 'recovery_offer',
-    'observation_override_candidate',
+    'observation_override_candidate', 'execution_selections',
   ], path);
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.program_runtime_control_projection.v3') {
+  if (schemaVersion !== 'manyforge.program_runtime_control_projection.v4') {
     return fail(
       `${path}.schema_version`,
-      'manyforge.program_runtime_control_projection.v3',
+      'manyforge.program_runtime_control_projection.v4',
     );
   }
   const programRunId = stringAt(record.program_run_id, `${path}.program_run_id`);
@@ -3966,6 +4032,7 @@ export function parseProgramRuntimeControlProjection(
     runRevision: positiveIntegerAt(record.run_revision, `${path}.run_revision`),
     runtimeControls,
     recoveryOffer,
+    executionSelections: parseExecutionSelectionControls(record.execution_selections, `${path}.execution_selections`),
     observationOverrideCandidate,
   };
 }

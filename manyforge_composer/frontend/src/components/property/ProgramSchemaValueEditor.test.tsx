@@ -37,7 +37,7 @@ const node: ProgramTreeNode = {
 };
 
 const program: ProgramAuthoringDocument = {
-  api_version: 'manyforge.program.v1',
+  api_version: 'manyforge.program.v2',
   program_id: 'schema_editor',
   program_profile: 'composable-cell-v1',
   name: 'Schema editor',

@@ -946,8 +946,11 @@ class ExecutionCommandClient:
             and error["code"]
             and isinstance(error.get("message"), str)
             and error["message"]
+            and isinstance(error.get("details", {}), dict)
         ):
-            raise HeadlessApiError(error["code"], error["message"])
+            raise HeadlessApiError(
+                error["code"], error["message"], details=error.get("details")
+            )
         raise HeadlessApiError(
             "execution_command_response_invalid",
             "native execution owner returned an invalid error response",

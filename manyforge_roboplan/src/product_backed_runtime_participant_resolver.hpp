@@ -14,6 +14,8 @@
 
 namespace manyforge::roboplan_backend {
 
+struct RetainedResolvedParticipant;
+
 /// Native providers must resolve to one exact managed runtime-unit owner.
 [[nodiscard]] core::RuntimeUnitId retained_provider_runtime_unit(
     const core::CapabilityProviderBindingDTO &binding);
@@ -43,11 +45,28 @@ public:
       std::filesystem::path package_root,
       std::shared_ptr<const deployment::RetainedBundle> retained_bundle,
       deployment::VerifiedRetainedModelMap retained_model_map,
-      std::vector<core::RuntimeParticipantBinding> physical_bindings);
+      std::vector<core::RuntimeParticipantBinding> physical_bindings,
+      std::vector<core::ProgramBindingId> intrinsic_direct_bindings);
 
   [[nodiscard]] core::Result<core::RuntimeParticipantBinding>
   Resolve(const core::OperationIntentDTO &operation,
           std::size_t participant_index) const;
+
+  [[nodiscard]] core::Result<RetainedResolvedParticipant>
+  ResolveExecutionParticipant(const core::OperationIntentDTO &operation,
+                              std::size_t participant_index) const;
+
+  /// Effect-only ingress check. Preview/query resolution does not acquire
+  /// authority. Captured Program effects still require the Kernel's exact
+  /// claim/node checks; compiler-direct effects still require manual admission.
+  [[nodiscard]] core::Result<void>
+  ValidateExecutionOrigin(const core::OperationIntentDTO &operation) const;
+
+  /// Resolve identity-only Run registration to a const, sealed Program table.
+  /// This does not acquire a claim or authorize effects; Kernel installation
+  /// checks the actual held Program-cycle claim after this cold product read.
+  [[nodiscard]] core::Result<core::ProgramRunExecutionCaptureDTO>
+  ResolveProgramCapture(core::ProgramRunExecutionCaptureDTO capture) const;
 
   /// Resolve a read against the same immutable product as admission. This
   /// neither creates an OperationIntent nor grants execution authority.
@@ -80,6 +99,9 @@ private:
   std::shared_ptr<const deployment::RetainedBundle> retained_bundle_;
   deployment::VerifiedRetainedModelMap retained_model_map_;
   std::vector<core::RuntimeParticipantBinding> physical_bindings_;
+  // Supplied by the actual direct-control compiler at composition, never
+  // inferred from an operation label or a precomposed Program alias.
+  std::vector<core::ProgramBindingId> intrinsic_direct_bindings_;
   std::vector<core::RuntimeCollisionBodyAliasDTO> collision_body_aliases_;
 };
 

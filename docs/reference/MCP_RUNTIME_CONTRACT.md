@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py mcp
-  Last regenerated: 2026-09-07 02:02:48 UTC
+  Last regenerated: 2026-09-07 18:27:03 UTC
   Generator source: scripts/regen-public-contracts.py:gen_mcp_api
 -->
 
@@ -1883,6 +1883,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "enum": [
               "program_run",
               "program_motion_stop",
+              "program_motion_resume",
               "program_full_stop",
               "program_stop",
               "program_reset",
@@ -6951,7 +6952,10 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
         "additionalProperties": false,
         "properties": {
           "coordination_policy": {
-            "const": "independent",
+            "enum": [
+              "independent",
+              "coordinated_all"
+            ],
             "title": "Coordination Policy",
             "type": "string"
           },
@@ -6977,7 +6981,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "items": {
               "$ref": "#/$defs/OperationParticipantRequest"
             },
-            "maxItems": 1,
+            "maxItems": 4096,
             "minItems": 1,
             "title": "Participants",
             "type": "array"

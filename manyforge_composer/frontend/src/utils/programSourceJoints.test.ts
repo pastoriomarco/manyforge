@@ -26,7 +26,7 @@ const node: ProgramTreeNode = {
 };
 
 const authoring: ProgramAuthoringDocument = {
-  api_version: 'manyforge.program.v1',
+  api_version: 'manyforge.program.v2',
   program_id: 'pick',
   program_profile: 'composable-cell-v1',
   name: 'Pick',
@@ -42,7 +42,7 @@ const authoring: ProgramAuthoringDocument = {
 };
 
 const program: ProgramDocument = {
-  api_version: 'manyforge.program.v1',
+  api_version: 'manyforge.program.v2',
   program_id: 'pick',
   program_revision: 'sha256:program',
   program_profile: 'composable-cell-v1',

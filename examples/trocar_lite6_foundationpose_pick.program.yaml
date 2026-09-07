@@ -1,6 +1,6 @@
-api_version: manyforge.program.v1
+api_version: manyforge.program.v2
 program_id: trocar_lite6_foundationpose_pick
-program_revision: sha256:b70a9d002d34388bef2879588861eecfa79c7ad12fb7c9b57ac31bfa36f41888
+program_revision: sha256:464ecd3377ce22fe8d676d89481f7a98b3a1e936a271a2688d5847ed7d31b99a
 program_profile: composable-cell-v1
 name: trocar_lite6_foundationpose_pick
 description: >-

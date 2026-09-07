@@ -314,7 +314,7 @@ def test_observed_scene_save_preserves_program_metadata_and_source_identity() ->
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v1",
+        api_version="manyforge.program.v2",
     )
     state = ComposerState(program=Program.from_dict(document, catalog))
     state.headless_client = Headless()  # type: ignore[assignment]
@@ -688,7 +688,7 @@ def test_node_policy_success_with_imported_node_a_skills_is_closed_and_headless_
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v1",
+        api_version="manyforge.program.v2",
     )
     program = Program.from_dict(document, catalog)
 

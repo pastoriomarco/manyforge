@@ -117,6 +117,7 @@ function identity(prefix: string): string {
 export type ProgramPendingCommand =
   | 'run'
   | 'motion-stop'
+  | 'resume-motion'
   | 'full-stop'
   | 'resume-full-stop'
   | 'stop'
@@ -190,7 +191,7 @@ function controlsKey(value: ProgramRuntimeControlProjection | null): string {
       + `${value.runtimeControls.runtimeControlRevision}:`
       + `${value.recoveryOffer?.offerId ?? 'no-offer'}:`
       + `${value.recoveryOffer?.offerRevision ?? 0}:`
-      + JSON.stringify(value.observationOverrideCandidate);
+      + JSON.stringify([value.observationOverrideCandidate, value.executionSelections]);
 }
 
 export function controlPendingAfterProjection(
@@ -213,11 +214,7 @@ export function controlPendingAfterProjection(
     : pending;
 }
 
-/**
- * Physical motion settlement may retain either the ordinary retry-ready
- * recovery or a stronger outer Stop fault that permits Reset only. Both are
- * Stopped to the operator; only the former may expose Resume.
- */
+/** Whole-selection presentation comes from the owner, not one focused task. */
 export function programMotionStopSettled(
   run: ProgramRunStatus | null,
   controls: ProgramRuntimeControlProjection | null,
@@ -229,35 +226,27 @@ export function programMotionStopSettled(
     || controls.ownerEpoch !== run.ownerEpoch
     || controls.programRunId !== run.capture.programRunId
   ) return false;
-  const offer = controls.recoveryOffer;
-  return offer !== null
-    && offer.programRunId === run.capture.programRunId
-    && ['ordinary_operator_stop', 'stop_fault_intervention'].includes(
-      offer.recoveryClass,
-    )
-    && ['retry_ready', 'reset_required'].includes(offer.status)
-    && offer.stopId !== null
-    && offer.stopGeneration !== null
-    && offer.stopGeneration > 0
-    && offer.stopCertificateId !== null
-    && offer.stopCertificateRevision !== null
-    && offer.stopCertificateRevision > 0;
+  return controls.executionSelections.groups.some(
+    (group) => group.groupId === 'all' && group.state === 'held',
+  );
 }
 
-/** Keep an accepted motion Stop pending until owner evidence proves settlement. */
+/** Cycle controls mirror owner transitions; selected commands track delivery only. */
 export function programPendingAfterProjection(
   pending: ProgramPendingCommand,
   run: ProgramRunStatus | null,
-  controls: ProgramRuntimeControlProjection | null,
+  _controls: ProgramRuntimeControlProjection | null,
   cycle: ProgramCycleDebugProjection | null = null,
+  previousRun: ProgramRunStatus | null = run,
 ): ProgramPendingCommand {
-  if (pending === 'motion-stop') {
-    if (programMotionStopSettled(run, controls)) return null;
-    if (
-      run !== null
-      && ['full_stopped', 'stopped', 'succeeded', 'failed'].includes(run.state)
-    ) return null;
-    return pending;
+  if (pending === 'motion-stop' || pending === 'resume-motion') {
+    // Delivery feedback belongs to its captured run, not a successor/idle
+    // projection. Its late reply cannot clear a newer request's exact token.
+    return run === null
+      || run.ownerEpoch !== previousRun?.ownerEpoch
+      || run.capture.programRunId !== previousRun?.capture.programRunId
+      || !['running', 'intervention_required'].includes(run.state)
+      ? null : pending;
   }
   if (pending === 'run') {
     if (run !== null
@@ -459,6 +448,7 @@ export function useProgramRuntime(
 ) {
   const [state, setState] = useState<ProgramRuntimeState>(INITIAL_STATE);
   const mounted = useRef(true);
+  const pendingProgramRequest = useRef<string | null>(null);
   const refreshing = useRef(false);
   const refreshQueued = useRef(false);
   const observationRetryAttempt = useRef(0);
@@ -604,6 +594,7 @@ export function useProgramRuntime(
         projected.run,
         projected.controls,
         cycleDebugProjection,
+        current.run,
       );
       const controlPending = controlPendingAfterProjection(
         current.controlPending,
@@ -728,7 +719,10 @@ export function useProgramRuntime(
       : { ...current, error: null });
   }, []);
 
-  const beginProgramCommand = useCallback((pending: Exclude<ProgramPendingCommand, null>) => {
+  const beginProgramCommand = useCallback((
+    pending: Exclude<ProgramPendingCommand, null>, requestId: string,
+  ) => {
+    pendingProgramRequest.current = requestId;
     setState((current) => ({
       ...current,
       pending,
@@ -746,13 +740,19 @@ export function useProgramRuntime(
     requestId: string,
     pendingKind: 'program' | 'control',
     expectedPending: string,
+    expectedRun?: ProgramRunStatus,
   ) => {
     if (!mounted.current) return;
     setState((current) => {
       if (
-        (pendingKind === 'program' && current.pending !== expectedPending)
+        (pendingKind === 'program' && (current.pending !== expectedPending
+          || pendingProgramRequest.current !== requestId))
         || (pendingKind === 'control'
           && current.controlPending !== expectedPending)
+        || (expectedRun !== undefined && (
+          current.run?.ownerEpoch !== expectedRun.ownerEpoch
+          || current.run?.capture.programRunId !== expectedRun.capture.programRunId
+        ))
       ) return current;
       return {
         ...current,
@@ -774,7 +774,7 @@ export function useProgramRuntime(
     );
     if (request === null) return;
     if (controlSource === null) return;
-    beginProgramCommand('run');
+    beginProgramCommand('run', requestId);
     try {
       await controlSource.sendExecutionCommand(
         'program_run', request, requestId,
@@ -796,7 +796,7 @@ export function useProgramRuntime(
       snapshot, callerEpoch.current, requestId,
     );
     if (request === null || controlSource === null) return;
-    beginProgramCommand('reset');
+    beginProgramCommand('reset', requestId);
     try {
       await controlSource.sendExecutionCommand(
         'program_reset', request, requestId,
@@ -812,14 +812,14 @@ export function useProgramRuntime(
   ]);
 
   const stop = useCallback(async () => {
-    if (!state.runnerAvailable || ['stop', 'motion-stop', 'full-stop', 'reset']
+    if (!state.runnerAvailable || ['stop', 'full-stop', 'reset']
       .includes(state.pending ?? '')) return;
     const requestId = identity('program-run-stop');
     const request = buildProgramStopRequest(
       snapshot, callerEpoch.current, requestId,
     );
     if (controlSource === null || request === null) return;
-    beginProgramCommand('stop');
+    beginProgramCommand('stop', requestId);
     try {
       await controlSource.sendExecutionCommand(
         'program_stop', request, requestId,
@@ -835,20 +835,29 @@ export function useProgramRuntime(
     snapshot, state.pending, state.runnerAvailable,
   ]);
 
-  const stopMotion = useCallback(async () => {
+  const selectionCommand = useCallback(async (
+    pending: 'motion-stop' | 'resume-motion', groupId: string,
+  ) => {
+    const resume = pending === 'resume-motion';
+    const controls = state.controls;
     if (
       !state.run
-      || state.run.state !== 'running'
+      || !['running', 'intervention_required'].includes(state.run.state)
       || !state.runnerAvailable
-      || ['stop', 'motion-stop', 'full-stop', 'reset']
+      || ['stop', 'full-stop', 'reset']
         .includes(state.pending ?? '')
+      || (resume && (state.pending !== null || state.controlPending !== null
+        || !controlsMatchRun(controls, state.run)
+        || !controls.executionSelections.groups.some(
+          (group) => group.groupId === groupId && group.resumeAllowed,
+        )))
     ) return;
-    const requestId = identity('program-motion-stop');
+    const requestId = identity(`program-${pending}`);
     if (controlSource === null) return;
-    beginProgramCommand('motion-stop');
+    beginProgramCommand(pending, requestId);
     try {
       await controlSource.sendExecutionCommand(
-        'program_motion_stop',
+        resume ? 'program_motion_resume' : 'program_motion_stop',
         {
           request_id: requestId,
           request_owner_epoch: callerEpoch.current,
@@ -856,32 +865,48 @@ export function useProgramRuntime(
           correlation_id: requestId,
           program_run_id: state.run.capture.programRunId,
           expected_owner_epoch: state.run.ownerEpoch,
-          reason: 'ordinary operator motion Stop',
+          group_id: groupId,
+          ...(resume && controls !== null ? {
+            expected_run_revision: controls.runRevision,
+            expected_selection_revision: controls.executionSelections.selectionRevision,
+          } : {}),
+          reason: `operator ${pending}`,
         },
         requestId,
       );
     } catch (reason) {
       await recordCommandFailure(
-        reason, 'Motion Stop was rejected.', requestId, 'program', 'motion-stop',
+        reason, 'Selection command was rejected.', requestId, 'program', pending, state.run,
       );
+    } finally {
+      // This clears only Sending feedback, never a hold or lifecycle state.
+      // A newer priority Stop must not be cleared by an older Resume reply.
+      if (mounted.current) setState((current) => current.pending === pending
+        && pendingProgramRequest.current === requestId
+        && current.run?.ownerEpoch === state.run?.ownerEpoch
+        && current.run?.capture.programRunId === state.run?.capture.programRunId
+        ? { ...current, pending: null } : current);
     }
   }, [
     beginProgramCommand, controlSource,
     recordCommandFailure,
-    state.pending, state.run, state.runnerAvailable,
+    state.pending, state.controlPending, state.controls, state.run, state.runnerAvailable,
   ]);
+
+  const stopMotion = useCallback((groupId = 'all') => selectionCommand('motion-stop', groupId), [selectionCommand]);
+  const resumeMotion = useCallback((groupId = 'all') => selectionCommand('resume-motion', groupId), [selectionCommand]);
 
   const fullStop = useCallback(async () => {
     if (
       !state.run
       || !['running', 'intervention_required'].includes(state.run.state)
       || !state.runnerAvailable
-      || ['stop', 'motion-stop', 'full-stop', 'reset']
+      || ['stop', 'full-stop', 'reset']
         .includes(state.pending ?? '')
     ) return;
     const requestId = identity('program-full-stop');
     if (controlSource === null) return;
-    beginProgramCommand('full-stop');
+    beginProgramCommand('full-stop', requestId);
     try {
       await controlSource.sendExecutionCommand(
         'program_full_stop',
@@ -916,7 +941,7 @@ export function useProgramRuntime(
     ) return;
     const requestId = identity('program-full-stop-run');
     if (controlSource === null) return;
-    beginProgramCommand('resume-full-stop');
+    beginProgramCommand('resume-full-stop', requestId);
     try {
       await controlSource.sendExecutionCommand(
         'program_resume_full_stop',
@@ -1213,6 +1238,7 @@ export function useProgramRuntime(
     dismissError,
     run,
     stopMotion,
+    resumeMotion,
     fullStop,
     resumeFullStop,
     stop,
@@ -1243,6 +1269,7 @@ export function useProgramRuntime(
     reset,
     run,
     stopMotion,
+    resumeMotion,
     fullStop,
     resumeFullStop,
     selectScenario,

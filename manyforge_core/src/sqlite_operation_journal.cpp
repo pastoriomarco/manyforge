@@ -174,6 +174,8 @@ CREATE TABLE operation_participants (
   progress REAL NOT NULL,
   terminal_error_code TEXT,
   terminal_error_message TEXT,
+  execution_node_instance_id TEXT,
+  execution_node_attempt_id TEXT,
   PRIMARY KEY(operation_id, participant_index),
   FOREIGN KEY(operation_id) REFERENCES operation_snapshots(operation_id)
     ON DELETE CASCADE
@@ -947,11 +949,24 @@ template <typename StrongId>
   });
 }
 
+void AddExecutionScope(CanonicalValue::Object& row,
+                       const std::optional<ProgramNodeExecutionScopeDTO>& scope) {
+  if (!scope.has_value()) return;
+  Require(valid_program_node_execution_scope(*scope), "operation_journal_record_invalid",
+          "operation node execution scope is invalid");
+  row.emplace_back("execution_scope",
+                   CanonicalValue(CanonicalValue::Object{
+                       {"node_attempt_id", CanonicalValue(scope->node_attempt_id)},
+                       {"node_instance_id", CanonicalValue(scope->node_instance_id.value())}}));
+  std::sort(row.begin(), row.end(),
+            [](const auto& left, const auto& right) { return left.first < right.first; });
+}
+
 [[nodiscard]] CanonicalValue OperationIntentValue(const OperationIntentDTO& intent) {
   CanonicalValue::Array participants;
   participants.reserve(intent.participants.size());
   for (const auto& participant : intent.participants) {
-    participants.emplace_back(CanonicalValue::Object{
+    CanonicalValue::Object row{
         {"action_span", ActionSpanValue(participant.action_span)},
         {"component_role_id", CanonicalValue(participant.component_role_id.value())},
         {"payload",
@@ -960,7 +975,9 @@ template <typename StrongId>
              : CapabilityPayloadValue(std::get<CapabilityCommandIntentDTO>(participant.payload))},
         {"required_capability_id", CanonicalValue(participant.required_capability_id.value())},
         {"target_role_id", CanonicalValue(participant.target_role_id.value())},
-    });
+    };
+    AddExecutionScope(row, participant.execution_scope);
+    participants.emplace_back(std::move(row));
   }
   return CanonicalValue(CanonicalValue::Object{
       {"coordination_policy",
@@ -998,10 +1015,13 @@ template <typename StrongId>
 }
 
 [[nodiscard]] CanonicalValue OperationStateValue(const OperationStateDTO& state) {
+  Require(!has_program_execution_scope(state) || state.journal_capture_order > 0U,
+          "operation_journal_record_invalid",
+          "captured Program work requires an ordered journal snapshot");
   CanonicalValue::Array participants;
   participants.reserve(state.participants.size());
   for (const auto& participant : state.participants) {
-    participants.emplace_back(CanonicalValue::Object{
+    CanonicalValue::Object row{
         {"capability_id", CanonicalValue(participant.capability_id.value())},
         {"capability_provider_binding_id",
          OptionalIdentity(participant.capability_provider_binding_id)},
@@ -1023,7 +1043,9 @@ template <typename StrongId>
         {"resources", StringArray(participant.resources)},
         {"state", CanonicalValue(std::string(OperationStateName(participant.state)))},
         {"terminal_error", ErrorValue(participant.terminal_error)},
-    });
+    };
+    AddExecutionScope(row, participant.execution_scope);
+    participants.emplace_back(std::move(row));
   }
   CanonicalValue::Object result{
       {"active_stop_generation",
@@ -1185,14 +1207,16 @@ template <typename StrongId>
 }
 
 [[nodiscard]] CanonicalValue ControlRequestValue(const OperationControlRequestDTO& request) {
-  return CanonicalValue(CanonicalValue::Object{
+  CanonicalValue::Object row{
       {"expected_operation_revision",
        Number(request.expected_operation_revision.value(), "expected operation revision")},
       {"operation_id", CanonicalValue(request.operation_id.value())},
       {"reason", OptionalText(request.reason)},
       {"request_attribution", RequestAttributionValue(request.attribution)},
       {"request_context", RequestContextValue(request.request_context)},
-  });
+  };
+  AddExecutionScope(row, request.execution_scope);
+  return CanonicalValue(std::move(row));
 }
 
 [[nodiscard]] CanonicalValue ControlAcceptedValue(const OperationControlAcceptedDTO& accepted) {
@@ -1542,11 +1566,14 @@ template <typename StrongId>
     const EmergencyStopAcceptanceRecordDTO& acceptance,
     const EmergencyStopProjectedIntentDTO& intent, const StopAcceptedDTO& accepted,
     const EmergencyStopAffectedStateSnapshotDTO& affected_state) {
+  const bool scoped = std::any_of(affected_state.operations.begin(),
+                                  affected_state.operations.end(), has_program_execution_scope);
   return CanonicalValue(CanonicalValue::Object{
       {"acceptance", EmergencyStopAcceptanceRecordValue(acceptance)},
       {"accepted", StopAcceptedValue(accepted)},
       {"affected_state", EmergencyStopAffectedStateValue(affected_state)},
-      {"api_version", CanonicalValue("manyforge.stop_acceptance_projection.v2")},
+      {"api_version", CanonicalValue(scoped ? "manyforge.stop_acceptance_projection.v3"
+                                            : "manyforge.stop_acceptance_projection.v2")},
       {"intent", ProjectedStopIntentValue(intent)},
       {"record_kind", CanonicalValue("stop_acceptance_projected")},
   });
@@ -1645,10 +1672,12 @@ template <typename StrongId>
                                          const OperationStateDTO& state,
                                          const RuntimeScaleStatusDTO* scale_status,
                                          bool effect_pending) {
+  const bool scoped = has_program_execution_scope(state);
   return CanonicalValue(CanonicalValue::Object{
-      {"api_version",
-       CanonicalValue(state.journal_capture_order == 0U ? "manyforge.operation_journal_record.v1"
-                                                        : "manyforge.operation_journal_record.v2")},
+      {"api_version", CanonicalValue(scoped ? "manyforge.operation_journal_record.v3"
+                                     : state.journal_capture_order == 0U
+                                         ? "manyforge.operation_journal_record.v1"
+                                         : "manyforge.operation_journal_record.v2")},
       {"effect_pending", CanonicalValue(effect_pending)},
       {"intent", intent},
       {"operation_state", OperationStateValue(state)},
@@ -1669,6 +1698,10 @@ template <typename StrongId>
     return false;
   }
   for (const auto& participant : state.participants) {
+    if (participant.execution_scope.has_value() &&
+        !valid_program_node_execution_scope(*participant.execution_scope)) {
+      return false;
+    }
     if (participant.participant_id.empty() || participant.controller_goal_id.empty() ||
         !participant.controller_goal_generation.nonzero() ||
         participant.controllable_component_id.empty() || participant.command_target_id.empty() ||
@@ -2017,8 +2050,8 @@ template <typename T>
   return static_cast<std::uint64_t>(value);
 }
 
-void ValidateSnapshotCaptureOrder(sqlite3* database, const OperationId& operation_id,
-                                  std::uint64_t order) {
+void ValidateSnapshotCapture(sqlite3* database, const OperationId& operation_id,
+                             std::uint64_t order, const OperationStateDTO* successor = nullptr) {
   Statement record(database,
                    "SELECT payload_json,payload_digest FROM journal_records WHERE sequence="
                    "(SELECT snapshot_sequence FROM operation_snapshots WHERE operation_id=?)");
@@ -2032,9 +2065,9 @@ void ValidateSnapshotCaptureOrder(sqlite3* database, const OperationId& operatio
   // operation, including a multi-operation Stop capture, without constructing
   // a second large C++ document or trusting an uncommitted projection column.
   Statement captured(database,
-                     "SELECT json_extract(?,'$.operation_state.journal_capture_order') "
+                     "SELECT json_extract(?,'$.operation_state') "
                      "WHERE json_extract(?,'$.operation_state.operation_id')=? UNION ALL "
-                     "SELECT json_extract(value,'$.journal_capture_order') "
+                     "SELECT value "
                      "FROM json_each(?,'$.affected_state.operations') "
                      "WHERE json_extract(value,'$.operation_id')=?");
   captured.Bind(1, bytes);
@@ -2042,10 +2075,67 @@ void ValidateSnapshotCaptureOrder(sqlite3* database, const OperationId& operatio
   captured.Bind(3, operation_id.value());
   captured.Bind(4, bytes);
   captured.Bind(5, operation_id.value());
-  Require(captured.Step() &&
-              (order == 0U ? captured.IsNull(0) : captured.Text(0) == std::to_string(order)) &&
-              !captured.Step(),
-          "operation_journal_corrupt", "snapshot order differs from its committed capture");
+  Require(captured.Step() && !captured.IsNull(0), "operation_journal_corrupt",
+          "operation has no committed capture");
+  const auto state = captured.Text(0);
+  Require(!captured.Step(), "operation_journal_corrupt", "operation capture is ambiguous");
+  Statement shape(
+      database,
+      "SELECT json_extract(?,'$.journal_capture_order'), "
+      "json_array_length(?,'$.participants'), "
+      "(SELECT COUNT(*) FROM operation_participants WHERE operation_id=?),"
+      "json_extract(?,'$.program_run_id'),json_extract(?,'$.program_binding_id'),"
+      "program_run_id,program_binding_id FROM operation_snapshots WHERE operation_id=?");
+  shape.Bind(1, state);
+  shape.Bind(2, state);
+  shape.Bind(3, operation_id.value());
+  shape.Bind(4, state);
+  shape.Bind(5, state);
+  shape.Bind(6, operation_id.value());
+  Require(shape.Step() &&
+              (order == 0U ? shape.IsNull(0) : shape.Text(0) == std::to_string(order)) &&
+              !shape.IsNull(1) && shape.Integer(1) == shape.Integer(2) &&
+              shape.Text(3) == shape.Text(5) && shape.Text(4) == shape.Text(6),
+          "operation_journal_corrupt", "snapshot differs from its committed capture");
+  if (successor != nullptr) {
+    Require(shape.Text(3) == successor->program_run_id.value() &&
+                shape.Text(4) == successor->program_binding_id.value() &&
+                shape.Integer(1) == static_cast<std::int64_t>(successor->participants.size()),
+            "operation_journal_record_invalid", "operation snapshot changed its captured Program");
+  }
+  Statement origins(
+      database,
+      "SELECT p.participant_id,p.execution_node_instance_id,p.execution_node_attempt_id,"
+      "json_extract(j.value,'$.participant_id'),json_type(j.value,'$.execution_scope'),"
+      "json_extract(j.value,'$.execution_scope.node_instance_id'),"
+      "json_extract(j.value,'$.execution_scope.node_attempt_id') "
+      "FROM json_each(?,'$.participants') j LEFT JOIN operation_participants p "
+      "ON p.operation_id=? AND p.participant_index=CAST(j.key AS INTEGER) "
+      "ORDER BY CAST(j.key AS INTEGER)");
+  origins.Bind(1, state);
+  origins.Bind(2, operation_id.value());
+  std::size_t index = 0U;
+  while (origins.Step()) {
+    const bool scoped = !origins.IsNull(4);
+    Require(!origins.IsNull(0) && origins.Text(0) == origins.Text(3) &&
+                (scoped ? (origins.Text(4) == "object" && !origins.IsNull(1) &&
+                           !origins.IsNull(2) && !origins.IsNull(5) && !origins.IsNull(6) &&
+                           origins.Text(1) == origins.Text(5) && origins.Text(2) == origins.Text(6))
+                        : (origins.IsNull(1) && origins.IsNull(2))),
+            "operation_journal_corrupt", "snapshot origin differs from its committed capture");
+    if (successor != nullptr) {
+      Require(index < successor->participants.size(), "operation_journal_record_invalid",
+              "operation snapshot changed its participant capture");
+      const auto& participant = successor->participants[index];
+      const auto& scope = participant.execution_scope;
+      Require(origins.Text(0) == participant.participant_id.value() &&
+                  scoped == scope.has_value() &&
+                  (!scoped || (origins.Text(5) == scope->node_instance_id.value() &&
+                               origins.Text(6) == scope->node_attempt_id)),
+              "operation_journal_record_invalid", "operation snapshot changed its authored origin");
+    }
+    ++index;
+  }
 }
 
 [[nodiscard]] OperationStateDTO LoadOperationState(sqlite3* database,
@@ -2103,7 +2193,8 @@ void ValidateSnapshotCaptureOrder(sqlite3* database, const OperationId& operatio
                          "capability_id,control_domain_id,control_domain_revision,"
                          "control_binding_id,control_binding_revision,"
                          "capability_provider_binding_id,capability_provider_binding_revision,"
-                         "payload_kind,state,progress,terminal_error_code,terminal_error_message "
+                         "payload_kind,state,progress,terminal_error_code,terminal_error_message,"
+                         "execution_node_instance_id,execution_node_attempt_id "
                          "FROM operation_participants WHERE operation_id=? "
                          "ORDER BY participant_index");
   participants.Bind(1, operation_id.value());
@@ -2115,6 +2206,13 @@ void ValidateSnapshotCaptureOrder(sqlite3* database, const OperationId& operatio
     const auto participant_state = OperationStateFromName(participants.Text(14));
     Require(payload_kind.has_value() && participant_state.has_value(), "operation_journal_corrupt",
             "operation participant contains an unknown closed-enum value");
+    Require(participants.IsNull(18) == participants.IsNull(19), "operation_journal_corrupt",
+            "operation participant scope is incomplete");
+    std::optional<ProgramNodeExecutionScopeDTO> execution_scope;
+    if (!participants.IsNull(18)) {
+      execution_scope = ProgramNodeExecutionScopeDTO{ProgramNodeInstanceId(participants.Text(18)),
+                                                     participants.Text(19)};
+    }
     const bool has_provider_id = !participants.IsNull(11);
     const bool has_provider_revision = !participants.IsNull(12);
     Require(has_provider_id == has_provider_revision, "operation_journal_corrupt",
@@ -2178,11 +2276,12 @@ void ValidateSnapshotCaptureOrder(sqlite3* database, const OperationId& operatio
         participants.Real(15),
         std::move(resources),
         std::move(terminal_error),
+        std::move(execution_scope),
     });
     ++expected_index;
   }
   RequireState(state);
-  ValidateSnapshotCaptureOrder(database, operation_id, state.journal_capture_order);
+  ValidateSnapshotCapture(database, operation_id, state.journal_capture_order);
   return state;
 }
 
@@ -2201,7 +2300,8 @@ void StoreOperationSnapshot(sqlite3* database, const RequestOwnerEpoch& owner_ep
     const auto revision = previous.Integer(1);
     Require(order >= 0 && !previous.Step(), "operation_journal_corrupt",
             "operation snapshot capture order is invalid");
-    ValidateSnapshotCaptureOrder(database, state.operation_id, static_cast<std::uint64_t>(order));
+    ValidateSnapshotCapture(database, state.operation_id, static_cast<std::uint64_t>(order),
+                            &state);
     if (order > 0) {
       if (state.journal_capture_order < static_cast<std::uint64_t>(order)) return;
       if (state.journal_capture_order == static_cast<std::uint64_t>(order)) {
@@ -2286,8 +2386,9 @@ void StoreOperationSnapshot(sqlite3* database, const RequestOwnerEpoch& owner_ep
         "capability_id,control_domain_id,control_domain_revision,control_binding_id,"
         "control_binding_revision,capability_provider_binding_id,"
         "capability_provider_binding_revision,payload_kind,state,progress,"
-        "terminal_error_code,terminal_error_message) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+        "terminal_error_code,terminal_error_message,execution_node_instance_id,execution_node_"
+        "attempt_id) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
     insert_participant.Bind(1, state.operation_id.value());
     insert_participant.Bind(2, static_cast<std::int64_t>(index));
     insert_participant.Bind(3, participant.participant_id.value());
@@ -2317,6 +2418,13 @@ void StoreOperationSnapshot(sqlite3* database, const RequestOwnerEpoch& owner_ep
     } else {
       insert_participant.BindNull(18);
       insert_participant.BindNull(19);
+    }
+    if (participant.execution_scope.has_value()) {
+      insert_participant.Bind(20, participant.execution_scope->node_instance_id.value());
+      insert_participant.Bind(21, participant.execution_scope->node_attempt_id);
+    } else {
+      insert_participant.BindNull(20);
+      insert_participant.BindNull(21);
     }
     Require(!insert_participant.Step(), "operation_journal_corrupt",
             "operation participant insert returned an unexpected row");
@@ -2772,7 +2880,7 @@ class SqliteOperationJournal::Impl final {
     // Validate before adding the private capture order. Legacy canonical
     // payload bytes, sequence numbers and hashes are never rewritten.
     const auto legacy_version = ScalarInteger(database_, "PRAGMA user_version");
-    if (legacy_version == 9 || legacy_version == 10) {
+    if (legacy_version == 9 || legacy_version == 10 || legacy_version == 11) {
       {
         Statement legacy(database_,
                          "SELECT schema_id,schema_version,cell_id,history_capacity FROM "
@@ -2786,9 +2894,23 @@ class SqliteOperationJournal::Impl final {
             "operation_journal_storage_foreign", "legacy operation journal identity is invalid");
       }
       ValidateLegacy(legacy_version);
+      if (legacy_version < 11) {
+        Exec(database_,
+             "ALTER TABLE operation_snapshots ADD COLUMN journal_capture_order "
+             "INTEGER NOT NULL DEFAULT 0 CHECK(journal_capture_order >= 0)");
+      }
       Exec(database_,
-           "ALTER TABLE operation_snapshots ADD COLUMN journal_capture_order "
-           "INTEGER NOT NULL DEFAULT 0 CHECK(journal_capture_order >= 0)");
+           "ALTER TABLE operation_participants ADD COLUMN execution_node_instance_id TEXT");
+      Exec(database_,
+           "ALTER TABLE operation_participants ADD COLUMN execution_node_attempt_id TEXT");
+      Statement snapshots(database_,
+                          "SELECT operation_id,journal_capture_order FROM operation_snapshots");
+      while (snapshots.Step()) {
+        Require(snapshots.Integer(1) >= 0, "operation_journal_corrupt",
+                "legacy capture order is invalid");
+        ValidateSnapshotCapture(database_, OperationId(snapshots.Text(0)),
+                                static_cast<std::uint64_t>(snapshots.Integer(1)));
+      }
       Statement upgrade(
           database_, "UPDATE journal_metadata SET schema_id=?,schema_version=? WHERE singleton=1");
       upgrade.Bind(1, kOperationJournalSchemaId);
@@ -3795,15 +3917,18 @@ std::uint64_t SqliteOperationJournal::Impl::RecordOperationAccepted(
               accepted.operation_id == state.operation_id &&
               accepted.operation_revision == state.operation_revision &&
               accepted.accepted_at_ns == state.updated_at_ns &&
-              accepted.participant_assignments.size() == state.participants.size(),
+              accepted.participant_assignments.size() == state.participants.size() &&
+              intent.participants.size() == state.participants.size(),
           "operation_journal_record_invalid",
           "operation acceptance does not match its durable intent or state");
   for (std::size_t index = 0; index < accepted.participant_assignments.size(); ++index) {
-    Require(accepted.participant_assignments[index].input_index == index &&
-                accepted.participant_assignments[index].participant_id ==
-                    state.participants[index].participant_id,
-            "operation_journal_record_invalid",
-            "operation acceptance participant assignment is inconsistent");
+    Require(
+        accepted.participant_assignments[index].input_index == index &&
+            accepted.participant_assignments[index].participant_id ==
+                state.participants[index].participant_id &&
+            intent.participants[index].execution_scope == state.participants[index].execution_scope,
+        "operation_journal_record_invalid",
+        "operation acceptance participant assignment is inconsistent");
   }
   return Append(owner_epoch, "operation_accepted", intent.request_context.request_id,
                 RecordValue("operation_accepted", owner_epoch, OperationIntentValue(intent),

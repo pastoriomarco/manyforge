@@ -54,7 +54,7 @@ ProgramBytes(const deployment::RetainedBundle &bundle,
   constexpr std::string_view kZeroDigest =
       "sha256:0000000000000000000000000000000000000000000000000000000000000000";
   deployment::CanonicalValue root(deployment::CanonicalValue::Object{
-      {"api_version", deployment::CanonicalValue("manyforge.program.v1")},
+      {"api_version", deployment::CanonicalValue("manyforge.program.v2")},
       {"catalog",
        deployment::CanonicalValue(deployment::CanonicalValue::Object{
            {"api_version",
@@ -130,7 +130,7 @@ ProgramBytes(const deployment::RetainedBundle &bundle,
   const auto revision = deployment::detail::compute_content_identity(
       root, deployment::detail::ContentIdentitySpec{
                 .identity_domain = "program-revision",
-                .api_version = "manyforge.program.v1",
+                .api_version = "manyforge.program.v2",
                 .own_field = "program_revision",
             });
   auto members = root.as_object();

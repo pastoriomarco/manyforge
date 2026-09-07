@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py structural-rest
-  Last regenerated: 2026-09-07 00:13:48 UTC
+  Last regenerated: 2026-09-07 18:26:53 UTC
   Generator source: scripts/regen-public-contracts.py:gen_rest_api
 -->
 
@@ -115,6 +115,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `POST` | `/api/program/runs/{program_run_id}/motion-stop` | headless-runtime-client | Program Run Motion Stop |
 | `POST` | `/api/program/runs/{program_run_id}/reset` | headless-runtime-client | Program Run Reset Full Stop |
 | `POST` | `/api/program/runs/{program_run_id}/resume-full-stop` | headless-runtime-client | Program Run Resume Full Stop |
+| `POST` | `/api/program/runs/{program_run_id}/resume-motion` | headless-runtime-client | Program Run Motion Resume |
 | `GET` | `/api/program/runs/{program_run_id}/runtime-controls` | headless-runtime-client | Program Runtime Controls |
 | `POST` | `/api/program/runs/{program_run_id}/runtime-overrides` | headless-runtime-client | Stage Runtime Override |
 | `POST` | `/api/program/runs/{program_run_id}/runtime-overrides/activate` | headless-runtime-client | Activate Runtime Override |

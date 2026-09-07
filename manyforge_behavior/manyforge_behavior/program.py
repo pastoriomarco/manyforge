@@ -1,4 +1,4 @@
-"""Strict v1 Program authoring and bounded legacy-neutral tree helpers.
+"""Strict v2 Program authoring and bounded legacy-neutral tree helpers.
 
 The loader validates portable authored meaning against one independently
 verified v2 catalog. It does not restore the former v0 singleton schema,
@@ -20,6 +20,7 @@ from typing import Any, Final, Mapping, NoReturn
 from manyforge_behavior.canonical_artifact import (
     StrictArtifactError,
     canonical_json_bytes,
+    compute_content_identity,
     load_strict_json_yaml,
     verify_content_identity,
 )
@@ -41,7 +42,11 @@ _MAX_VALUE_STRING_CHARS: Final = 1_000_000
 _MAX_DOCUMENT_TEXT_CHARS: Final = 8 * 1024 * 1024
 _MAX_INTEGER_BITS: Final = 256
 _MAX_CANONICAL_BYTES: Final = 96 * 1024 * 1024
-_PROGRAM_API_VERSION: Final = "manyforge.program.v1"
+_PROGRAM_API_VERSION: Final = "manyforge.program.v2"
+_PREVIOUS_PROGRAM_API_VERSION: Final = "manyforge.program.v1"
+_MAX_EXECUTION_GROUPS: Final = 4096
+_MAX_RESOLVED_GROUP_MEMBERSHIPS: Final = _MAX_TREE_NODES
+_MAX_RESOLVED_TARGET_EFFECTS: Final = _MAX_TREE_NODES
 _PROGRAM_PROFILE: Final = "composable-cell-v1"
 _CATALOG_API_VERSION: Final = "manyforge.node_catalog.v2"
 _IDENTIFIER_RE: Final = re.compile(r"^[a-z][a-z0-9_.-]*$")
@@ -279,6 +284,7 @@ class TreeNode:
     modification_policy: dict[str, str] = field(default_factory=dict)
     recovery_policy: dict[str, Any] = field(default_factory=dict)
     operator_stop_policy: str = "inherit"
+    execution_groups: str | tuple[str, ...] = "inherit"
 
     def __post_init__(self) -> None:
         budget = _TraversalBudget()
@@ -308,6 +314,9 @@ class TreeNode:
         self.operator_stop_policy = _parse_operator_stop_policy(
             self.operator_stop_policy,
             path="tree",
+        )
+        self.execution_groups = parse_execution_groups(
+            self.execution_groups, path="tree"
         )
         _validate_tree_graph(self)
 
@@ -369,6 +378,7 @@ _TREE_FIELDS: Final = frozenset(
         "modification_policy",
         "recovery_policy",
         "operator_stop_policy",
+        "execution_groups",
     }
 )
 
@@ -382,6 +392,34 @@ def _parse_operator_stop_policy(raw_policy: Any, *, path: str) -> str:
             f"{path}.operator_stop_policy must be one of: {allowed}"
         )
     return raw_policy
+
+
+def parse_execution_groups(raw: Any, *, path: str) -> str | tuple[str, ...]:
+    """Normalize one closed authoring value; no runtime group state lives here."""
+
+    if type(raw) is str and raw in {"inherit", "all"}:
+        return raw
+    if (
+        type(raw) not in {list, tuple}
+        or not 1 <= len(raw) <= _MAX_EXECUTION_GROUPS
+        or any(
+            type(name) is not str
+            or len(name) > 128
+            or _IDENTIFIER_RE.fullmatch(name) is None
+            or name in {"inherit", "all"}
+            for name in raw
+        )
+        or len(set(raw)) != len(raw)
+    ):
+        raise ProgramValidationError(
+            f"{path}.execution_groups must be inherit, all, or a bounded nonempty "
+            "set of unique portable group IDs"
+        )
+    return tuple(sorted(raw))
+
+
+def _execution_groups_document(groups: str | tuple[str, ...]) -> str | list[str]:
+    return groups if isinstance(groups, str) else list(groups)
 
 
 def _parse_modification_policy(raw_policy: Any, *, path: str) -> dict[str, str]:
@@ -488,9 +526,7 @@ _CANONICAL_RECOVERY_POLICY_FIELDS: Final = frozenset(
         "persistence_ceiling",
     }
 )
-_CANONICAL_RECOVERY_ACTIONS: Final = frozenset(
-    {"intervention", "runtime_override"}
-)
+_CANONICAL_RECOVERY_ACTIONS: Final = frozenset({"intervention", "runtime_override"})
 _CANONICAL_RECOVERY_PERSISTENCE_CEILINGS: Final = frozenset(
     {"session_only", "runtime_override", "draft_patch"}
 )
@@ -568,8 +604,7 @@ def _parse_canonical_recovery_policy(
         type(actions) is not list
         or len(actions) > len(_CANONICAL_RECOVERY_ACTIONS)
         or any(
-            type(action) is not str
-            or action not in _CANONICAL_RECOVERY_ACTIONS
+            type(action) is not str or action not in _CANONICAL_RECOVERY_ACTIONS
             for action in actions
         )
         or len(actions) != len(set(actions))
@@ -605,9 +640,8 @@ def _parse_canonical_recovery_policy(
                 f"{skill_path} exceeds the 128-byte skill ID bound"
             )
         normalized_skills.append(skill_id)
-    if (
-        normalized_skills != sorted(normalized_skills)
-        or len(normalized_skills) != len(set(normalized_skills))
+    if normalized_skills != sorted(normalized_skills) or len(normalized_skills) != len(
+        set(normalized_skills)
     ):
         raise ProgramValidationError(
             f"{path}.recovery_policy.allowed_skills is not canonical-sorted"
@@ -642,14 +676,15 @@ def _normalize_canonical_node_policies(
     else:
         modification = dict(_CANONICAL_DEFAULT_MODIFICATION_POLICY)
     if "recovery_policy" in node:
-        recovery = _parse_canonical_recovery_policy(
-            node["recovery_policy"], path=path
-        )
+        recovery = _parse_canonical_recovery_policy(node["recovery_policy"], path=path)
     else:
         recovery = dict(_CANONICAL_DEFAULT_RECOVERY_POLICY)
     if "operator_stop_policy" in node:
         operator_stop = node["operator_stop_policy"]
-        if type(operator_stop) is not str or operator_stop not in OPERATOR_STOP_POLICY_VALUES:
+        if (
+            type(operator_stop) is not str
+            or operator_stop not in OPERATOR_STOP_POLICY_VALUES
+        ):
             raise ProgramValidationError(
                 f"{path}.operator_stop_policy must be inherit, hold, or continue"
             )
@@ -696,14 +731,10 @@ def _normalize_canonical_node_policies(
         )
 
     normalized_modification = (
-        None
-        if modification == _CANONICAL_DEFAULT_MODIFICATION_POLICY
-        else modification
+        None if modification == _CANONICAL_DEFAULT_MODIFICATION_POLICY else modification
     )
     normalized_recovery = (
-        None
-        if recovery == _CANONICAL_DEFAULT_RECOVERY_POLICY
-        else recovery
+        None if recovery == _CANONICAL_DEFAULT_RECOVERY_POLICY else recovery
     )
     normalized_stop = None if operator_stop == "inherit" else operator_stop
     return normalized_modification, normalized_recovery, normalized_stop
@@ -711,6 +742,8 @@ def _normalize_canonical_node_policies(
 
 def _remove_explicit_default_policy_spelling(
     root: dict[str, Any],
+    *,
+    execution_groups_supported: bool = False,
 ) -> dict[str, Any]:
     """Remove only the exact source spellings permitted by C1 migration."""
 
@@ -758,20 +791,25 @@ def _remove_explicit_default_policy_spelling(
             raise ProgramValidationError("tree node count exceeds bounded maximum")
 
         migrated = dict(node)
+        if execution_groups_supported and "execution_groups" in migrated:
+            groups = parse_execution_groups(migrated["execution_groups"], path="tree")
+            if groups == "inherit":
+                del migrated["execution_groups"]
+            else:
+                migrated["execution_groups"] = _execution_groups_document(groups)
         if is_default_modification(migrated.get("modification_policy")):
             del migrated["modification_policy"]
         if is_default_recovery(migrated.get("recovery_policy")):
             del migrated["recovery_policy"]
-        if type(migrated.get("operator_stop_policy")) is str and migrated[
-            "operator_stop_policy"
-        ] == "inherit":
+        if (
+            type(migrated.get("operator_stop_policy")) is str
+            and migrated["operator_stop_policy"] == "inherit"
+        ):
             del migrated["operator_stop_policy"]
         children = migrated.get("children")
         if type(children) is list:
             if len(children) > _MAX_CHILDREN_PER_NODE:
-                raise ProgramValidationError(
-                    "tree child count exceeds bounded maximum"
-                )
+                raise ProgramValidationError("tree child count exceeds bounded maximum")
             ancestors.add(identity)
             try:
                 migrated["children"] = [
@@ -789,6 +827,7 @@ def _select_identity_verified_program_root(
     root: dict[str, Any],
     *,
     source: str,
+    api_version: str = _PROGRAM_API_VERSION,
 ) -> dict[str, Any]:
     """Verify identity before semantic validation, with one bounded migration."""
 
@@ -796,7 +835,7 @@ def _select_identity_verified_program_root(
     # contain a usable identity field at all.  A stale, otherwise well-shaped
     # identity must not be hidden by authored semantic errors.
     if (
-        root.get("api_version") != _PROGRAM_API_VERSION
+        root.get("api_version") != api_version
         or type(root.get("program_revision")) is not str
         or re.fullmatch(r"sha256:[0-9a-f]{64}", root["program_revision"]) is None
     ):
@@ -806,7 +845,7 @@ def _select_identity_verified_program_root(
             root,
             own_field="program_revision",
             identity_domain="program-revision",
-            api_version=_PROGRAM_API_VERSION,
+            api_version=api_version,
             label=source,
         )
         return root
@@ -816,7 +855,9 @@ def _select_identity_verified_program_root(
         ):
             _program_error(f"{source}.program_revision", str(raw_identity_error))
         try:
-            candidate = _remove_explicit_default_policy_spelling(root)
+            candidate = _remove_explicit_default_policy_spelling(
+                root, execution_groups_supported=api_version == _PROGRAM_API_VERSION
+            )
         except ProgramValidationError:
             _program_error(f"{source}.program_revision", str(raw_identity_error))
         try:
@@ -824,7 +865,7 @@ def _select_identity_verified_program_root(
                 candidate,
                 own_field="program_revision",
                 identity_domain="program-revision",
-                api_version=_PROGRAM_API_VERSION,
+                api_version=api_version,
                 label=source,
             )
         except StrictArtifactError as exc:
@@ -893,6 +934,13 @@ def _traverse_tree(
             path=f"{path}.operator_stop_policy",
             budget=budget,
         )
+        execution_groups = parse_execution_groups(node.execution_groups, path=path)
+        for group in (
+            (execution_groups,)
+            if isinstance(execution_groups, str)
+            else execution_groups
+        ):
+            _bounded_text(group, path=f"{path}.execution_groups", budget=budget)
         if type(node.children) is not list:
             raise ProgramValidationError(f"{path}.children must be a built-in list")
         if len(node.children) > _MAX_CHILDREN_PER_NODE:
@@ -906,6 +954,10 @@ def _traverse_tree(
                 document["params"] = params
             if operator_stop_policy != "inherit":
                 document["operator_stop_policy"] = operator_stop_policy
+            if execution_groups != "inherit":
+                document["execution_groups"] = _execution_groups_document(
+                    execution_groups
+                )
             if modification_policy:
                 document["modification_policy"] = modification_policy
             if recovery_policy:
@@ -1035,6 +1087,9 @@ def tree_node_from_dict(
                 document.get("operator_stop_policy"),
                 path=current_path,
             )
+            execution_groups = parse_execution_groups(
+                document.get("execution_groups", "inherit"), path=current_path
+            )
             _bounded_text(
                 operator_stop_policy,
                 path=f"{current_path}.operator_stop_policy",
@@ -1074,6 +1129,7 @@ def tree_node_from_dict(
                 modification_policy=modification_policy,
                 recovery_policy=recovery_policy,
                 operator_stop_policy=operator_stop_policy,
+                execution_groups=execution_groups,
             )
         finally:
             ancestors.remove(identity)
@@ -1275,6 +1331,7 @@ def apply_tree_param_overrides(
                 modification_policy=modification_policy,
                 recovery_policy=recovery_policy,
                 operator_stop_policy=operator_stop_policy,
+                execution_groups=current.execution_groups,
             )
         finally:
             ancestors.remove(identity)
@@ -1284,7 +1341,7 @@ def apply_tree_param_overrides(
 
 @dataclass(frozen=True, slots=True)
 class ProgramTreeNode:
-    """One validated v1 node instance with portable authored values only."""
+    """One validated node instance with portable authored values only."""
 
     node_id: str
     instance_id: str
@@ -1295,6 +1352,7 @@ class ProgramTreeNode:
     modification_policy: Mapping[str, str] | None = None
     recovery_policy: Mapping[str, Any] | None = None
     operator_stop_policy: str | None = None
+    execution_groups: str | tuple[str, ...] = "inherit"
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -1311,14 +1369,48 @@ class ProgramTreeNode:
         if self.metadata is not None:
             result["metadata"] = deepcopy(dict(self.metadata))
         if self.modification_policy is not None:
-            result["modification_policy"] = deepcopy(
-                dict(self.modification_policy)
-            )
+            result["modification_policy"] = deepcopy(dict(self.modification_policy))
         if self.recovery_policy is not None:
             result["recovery_policy"] = deepcopy(dict(self.recovery_policy))
         if self.operator_stop_policy is not None:
             result["operator_stop_policy"] = self.operator_stop_policy
+        if self.execution_groups != "inherit":
+            result["execution_groups"] = _execution_groups_document(
+                self.execution_groups
+            )
         return result
+
+
+def _resolve_execution_selections(
+    tree: ProgramTreeNode,
+) -> Mapping[str, tuple[str, ...]]:
+    """Compile bounded selection membership once, without any hold state."""
+
+    members: dict[str, list[str]] = {"all": []}
+    pending = [(tree, ())]
+    memberships = 0
+    while pending:
+        node, inherited = pending.pop()
+        groups = (
+            inherited
+            if node.execution_groups == "inherit"
+            else () if node.execution_groups == "all" else node.execution_groups
+        )
+        assert isinstance(groups, tuple)
+        members["all"].append(node.instance_id)
+        memberships += len(groups)
+        if memberships > _MAX_RESOLVED_GROUP_MEMBERSHIPS:
+            raise ProgramValidationError(
+                "resolved execution-group memberships exceed the node bound"
+            )
+        for name in groups:
+            members.setdefault(name, []).append(node.instance_id)
+        if len(members) > _MAX_EXECUTION_GROUPS + 1:
+            raise ProgramValidationError("execution groups exceed the group bound")
+        pending.extend((child, groups) for child in reversed(node.children))
+    return MappingProxyType(
+        {name: tuple(sorted(nodes)) for name, nodes in sorted(members.items())}
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1360,9 +1452,7 @@ class ProgramNodePolicy:
             path=f"node_policies.{self.instance_id}",
         )
         if normalized == (None, None, None):
-            raise ProgramValidationError(
-                "default node-policy rows must be omitted"
-            )
+            raise ProgramValidationError("default node-policy rows must be omitted")
         if recovery["allowed_skills"]:
             raise ProgramValidationError(
                 "Program Run rejects nonempty allowed_skills until an exact "
@@ -1645,6 +1735,8 @@ class _ProgramValidationContext:
     blackboard_namespaces: set[str]
     blackboard_keys: dict[str, BlackboardKeyDeclaration]
     contact_policy_ids: set[str]
+    execution_groups_supported: bool = True
+    target_effect_count: int = 0
     tree_instance_ids: set[str] = field(default_factory=set)
 
 
@@ -2039,9 +2131,7 @@ def _validate_scene(
                 )
             )
         if "metadata" in row:
-            metadata = _program_mapping(
-                row["metadata"], path=f"{row_path}.metadata"
-            )
+            metadata = _program_mapping(row["metadata"], path=f"{row_path}.metadata")
             canonical_json_bytes(metadata)
             if "support_contacts" in metadata:
                 contacts = _program_list(
@@ -2127,9 +2217,13 @@ def _validate_scene(
                             "release_tolerance_m",
                             "min_release_progress_m",
                         ):
-                            if field in contact and _program_number(
-                                contact[field], path=f"{contact_path}.{field}"
-                            ) < 0.0:
+                            if (
+                                field in contact
+                                and _program_number(
+                                    contact[field], path=f"{contact_path}.{field}"
+                                )
+                                < 0.0
+                            ):
                                 _program_error(
                                     f"{contact_path}.{field}",
                                     "must be non-negative",
@@ -2151,9 +2245,7 @@ def _validate_scene(
                         _program_error(
                             f"{contact_path}.mode", "has an unsupported mode"
                         )
-                    support_contact_refs.append(
-                        (scene_id, support_id, contact_path)
-                    )
+                    support_contact_refs.append((scene_id, support_id, contact_path))
                 if support_ids != sorted(set(support_ids)):
                     _program_error(
                         f"{row_path}.metadata.support_contacts",
@@ -2899,9 +2991,13 @@ def _validate_semantic_value(
                             f"cannot resolve semantic scope from {scope_parameter!r}",
                         )
                     scoped_target = context.target_roles.get(scope_value)
-                    accepted = scoped_target is not None and identity in scoped_target.get(
-                        role_field,
-                        (),
+                    accepted = (
+                        scoped_target is not None
+                        and identity
+                        in scoped_target.get(
+                            role_field,
+                            (),
+                        )
                     )
                     scope_description = f"target role {scope_value!r}"
                 if not accepted:
@@ -3143,6 +3239,7 @@ def _validate_node_capabilities(
     context: _ProgramValidationContext,
 ) -> None:
     parameter_by_id = {parameter.id: parameter for parameter in entry.parameters}
+    effects: set[tuple[str, str]] = set()
     for requirement in entry.required_capabilities:
         if requirement.when_parameter is not None:
             selected = _effective_parameter_value(
@@ -3175,6 +3272,13 @@ def _validate_node_capabilities(
                 f"target role {target_role!r} does not declare required capability "
                 f"{requirement.capability_id!r}",
             )
+        effects.add((target_role, requirement.capability_id))
+    context.target_effect_count += len(effects)
+    if (
+        context.execution_groups_supported
+        and context.target_effect_count > _MAX_RESOLVED_TARGET_EFFECTS
+    ):
+        _program_error(path, "resolved target effects exceed fixed bound")
 
 
 def _validate_catalog_blackboard_bindings(
@@ -3286,6 +3390,11 @@ def _validate_program_tree(
                 "recovery_policy",
                 "operator_stop_policy",
             }
+        )
+        | (
+            frozenset({"execution_groups"})
+            if context.execution_groups_supported
+            else frozenset()
         ),
         path=path,
     )
@@ -3464,6 +3573,9 @@ def _validate_program_tree(
         recovery_policy,
         operator_stop_policy,
     ) = _normalize_canonical_node_policies(node, path=path)
+    execution_groups = parse_execution_groups(
+        node.get("execution_groups", "inherit"), path=path
+    )
     metadata: Mapping[str, Any] | None = None
     if "metadata" in node:
         metadata_row = _program_mapping(node["metadata"], path=f"{path}.metadata")
@@ -3489,11 +3601,10 @@ def _validate_program_tree(
             else None
         ),
         recovery_policy=(
-            _freeze_mapping(recovery_policy)
-            if recovery_policy is not None
-            else None
+            _freeze_mapping(recovery_policy) if recovery_policy is not None else None
         ),
         operator_stop_policy=operator_stop_policy,
+        execution_groups=execution_groups,
     )
 
 
@@ -3502,6 +3613,7 @@ def _validate_program_document(
     *,
     catalog: NodeCatalog,
     source: str,
+    api_version: str = _PROGRAM_API_VERSION,
 ) -> tuple[
     dict[str, Any],
     ProgramTreeNode,
@@ -3509,7 +3621,9 @@ def _validate_program_document(
     dict[str, BlackboardKeyDeclaration],
 ]:
     root = _program_mapping(data, path=source)
-    root = _select_identity_verified_program_root(root, source=source)
+    root = _select_identity_verified_program_root(
+        root, source=source, api_version=api_version
+    )
     _program_closed(
         root,
         required=frozenset(
@@ -3528,8 +3642,8 @@ def _validate_program_document(
         optional=_TOP_LEVEL_FIELDS,
         path=source,
     )
-    if root["api_version"] != _PROGRAM_API_VERSION:
-        _program_error(f"{source}.api_version", f"must be {_PROGRAM_API_VERSION}")
+    if root["api_version"] != api_version:
+        _program_error(f"{source}.api_version", f"must be {api_version}")
     _program_identifier(root["program_id"], path=f"{source}.program_id")
     if root["program_profile"] != _PROGRAM_PROFILE:
         _program_error(f"{source}.program_profile", f"must be {_PROGRAM_PROFILE}")
@@ -3622,6 +3736,7 @@ def _validate_program_document(
         blackboard_namespaces=namespaces,
         blackboard_keys=blackboard_keys,
         contact_policy_ids=contact_policy_ids,
+        execution_groups_supported=api_version == _PROGRAM_API_VERSION,
     )
     tree = _validate_program_tree(
         root["tree"],
@@ -3637,7 +3752,7 @@ def _validate_program_document(
             normalized_root,
             own_field="program_revision",
             identity_domain="program-revision",
-            api_version=_PROGRAM_API_VERSION,
+            api_version=api_version,
             label=source,
         )
     except StrictArtifactError as exc:
@@ -3646,7 +3761,7 @@ def _validate_program_document(
 
 
 class Program:
-    """Validated portable ``manyforge.program.v1`` authoring artifact.
+    """Validated portable ``manyforge.program.v2`` authoring artifact.
 
     This loader owns no binding, runtime, filesystem discovery, node factory,
     or deployment-capability union. It validates authored meaning against one
@@ -3664,12 +3779,12 @@ class Program:
     ) -> None:
         if skill_catalog is not None:
             raise ProgramValidationError(
-                "v0 skill expansion is unavailable; v1 Programs contain only "
+                "v0 skill expansion is unavailable; v2 Programs contain only "
                 "ordinary active-catalog nodes"
             )
         if deployment_capability_keys is not None:
             raise ProgramValidationError(
-                "deployment-wide capability unions cannot validate a v1 Program"
+                "deployment-wide capability unions cannot validate a v2 Program"
             )
         source_path = Path(path)
         try:
@@ -3691,12 +3806,12 @@ class Program:
     ) -> "Program":
         if skill_catalog is not None:
             raise ProgramValidationError(
-                "v0 skill expansion is unavailable; v1 Programs contain only "
+                "v0 skill expansion is unavailable; v2 Programs contain only "
                 "ordinary active-catalog nodes"
             )
         if deployment_capability_keys is not None:
             raise ProgramValidationError(
-                "deployment-wide capability unions cannot validate a v1 Program"
+                "deployment-wide capability unions cannot validate a v2 Program"
             )
         if type(data) is not dict:
             raise ProgramValidationError("Program root must be a built-in mapping")
@@ -3738,14 +3853,44 @@ class Program:
         self.catalog_content_version = str(normalized["catalog"]["content_version"])
         self.validated_catalog_digest = catalog.catalog_digest
         self.tree = tree
+        self.execution_selections = _resolve_execution_selections(tree)
         self.parameters = MappingProxyType(dict(parameters))
         self.blackboard_keys = MappingProxyType(dict(blackboard_keys))
         self.canonical_bytes = canonical
 
     def to_dict(self) -> dict[str, Any]:
-        """Return one detached exact v1 authoring document."""
+        """Return one detached exact v2 authoring document."""
 
         return deepcopy(self._data)
+
+
+def migrate_program_v1(data: dict[str, Any], catalog: NodeCatalog) -> Program:
+    """Explicit offline conversion; the runtime loader never calls this path.
+
+    Validate the old closed schema and its original identity before creating
+    the successor. The input and any existing binding remain untouched.
+    """
+
+    if type(data) is not dict:
+        raise ProgramValidationError("Program root must be a built-in mapping")
+    try:
+        canonical_json_bytes(data)
+        normalized, _tree, _parameters, _blackboard = _validate_program_document(
+            deepcopy(data),
+            catalog=catalog,
+            source="v1 migration",
+            api_version=_PREVIOUS_PROGRAM_API_VERSION,
+        )
+        normalized["api_version"] = _PROGRAM_API_VERSION
+        normalized["program_revision"] = compute_content_identity(
+            normalized,
+            own_field="program_revision",
+            identity_domain="program-revision",
+            api_version=_PROGRAM_API_VERSION,
+        )
+    except StrictArtifactError as exc:
+        raise ProgramValidationError(str(exc)) from exc
+    return Program.from_dict(normalized, catalog)
 
 
 __all__ = [
@@ -3762,6 +3907,7 @@ __all__ = [
     "compute_program_tree_hash",
     "find_tree_node_by_name",
     "merge_param_patch",
+    "migrate_program_v1",
     "program_node_policies",
     "require_exact_program_binding_node_policies",
     "tree_node_from_dict",

@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py headless-rest
-  Last regenerated: 2026-09-07 02:02:46 UTC
+  Last regenerated: 2026-09-07 18:26:58 UTC
   Generator source: scripts/regen-public-contracts.py:gen_headless_rest_api
 -->
 
@@ -98,6 +98,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `POST` | `/api/program/runs/{program_run_id}/motion-stop` |  | Program Run Motion Stop |
 | `POST` | `/api/program/runs/{program_run_id}/reset` |  | Program Run Reset Full Stop |
 | `POST` | `/api/program/runs/{program_run_id}/resume-full-stop` |  | Program Run Resume Full Stop |
+| `POST` | `/api/program/runs/{program_run_id}/resume-motion` |  | Program Run Motion Resume |
 | `GET` | `/api/program/runs/{program_run_id}/runtime-controls` |  | Program Runtime Controls |
 | `POST` | `/api/program/runs/{program_run_id}/runtime-overrides` |  | Stage Runtime Override |
 | `POST` | `/api/program/runs/{program_run_id}/runtime-overrides/activate` |  | Activate Runtime Override |

@@ -6951,6 +6951,21 @@ svg.viewer-camera-icon {
   min-width: 6.25rem;
 }
 
+.transport-selection {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  font-size: 0.7rem;
+  min-width: 0;
+}
+
+.transport-selection select {
+  width: 10rem;
+  max-width: 22vw;
+  padding: 0.25rem;
+  font-size: 0.8rem;
+}
+
 .transport-velocity {
   display: flex;
   min-width: 9.5rem;

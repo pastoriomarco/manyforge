@@ -29,6 +29,7 @@
 #include <manyforge_core/time/ischeduler.hpp>
 #include <manyforge_core/types/component_lifecycle.hpp>
 #include <manyforge_core/types/prepared_participant_stop_plan.hpp>
+#include <manyforge_core/types/program_execution_control.hpp>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -82,6 +83,10 @@ struct RuntimeParticipantExecutionRegistration final {
   /// Stop plan for runtime-collision containment. It is sealed with the same
   /// operation/goal as the ordinary plan and never selected by caller input.
   std::optional<MotionInterruptStopProfileDTO> default_fault_stop_profile;
+
+  /// Composition-owned classification from an exact compiler-direct product,
+  /// never inferred from missing Program origin or a caller's source label.
+  bool intrinsic_direct_control{};
 };
 
 using RuntimeParticipantAdmissionResolver =
@@ -346,6 +351,20 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
 
   [[nodiscard]] Result<StopAcceptedDTO> stop(const StopIntentDTO& intent);
   [[nodiscard]] Result<StopAcceptedDTO> full_stop(const FullStopIntentDTO& intent);
+  /// Install the sealed immutable Program association before any node effect.
+  /// Repeated exact registration preserves current admission holds. This is
+  /// process-local composition, not a public caller-supplied table interface.
+  [[nodiscard]] Result<void> register_program_run_capture(ProgramRunExecutionCaptureDTO capture);
+  [[nodiscard]] Result<ProgramExecutionSelectionAcceptedDTO> stop_program_selection(
+      const ProgramExecutionSelectionRequestDTO& request);
+  [[nodiscard]] Result<ProgramExecutionScopeStateDTO> get_program_execution_scope(
+      const ProgramRunId& program_run_id) const;
+  /// Release only after the selected effects are settled and retired. The
+  /// Program owner performs exact recovery/cleanup before this final release.
+  /// Any intervening selection change invalidates the entire requested batch.
+  [[nodiscard]] Result<ProgramExecutionScopeStateDTO> release_program_selection(
+      const ProgramExecutionSelectionRequestDTO& request,
+      std::uint64_t expected_selection_revision);
   /// Reopen one exact Program-run admission fence after its accepted Stop has
   /// settled and the Program owner has explicitly chosen recovery/resume.
   [[nodiscard]] Result<void> release_program_run_stop_fence(const ProgramRunId& program_run_id,
@@ -437,6 +456,10 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   /// and advances capability-command completion without making public reads
   /// effectful.
   [[nodiscard]] Result<void> reconcile_subordinate_state() override;
+
+  /// Retire the exclusive manual claim only after exact operation cleanup.
+  /// Reuses the ordinary owner reconciliation lane; Stop never waits for it.
+  [[nodiscard]] Result<void> reconcile_manual_operation_admission();
 
   [[nodiscard]] std::vector<ResourceSlotSnapshotDTO> resource_snapshot() const;
 
@@ -547,6 +570,21 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       const OperationIntentDTO& operation, std::size_t participant_index) const;
   [[nodiscard]] StopScopeResolverSnapshotDTO capture_stop_scope_locked(
       const ResourceSlotTableSnapshotDTO& slots) const;
+  [[nodiscard]] Result<void> validate_program_execution_scope_locked(
+      const OperationIntentDTO& intent) const;
+  [[nodiscard]] Result<void> validate_program_resume_scope_locked(
+      const OperationIntentDTO& intent,
+      const std::optional<ProgramNodeExecutionScopeDTO>& actor) const;
+  [[nodiscard]] Result<void> reconcile_manual_operation_admission_locked();
+  [[nodiscard]] Result<void> validate_manual_operation_settlement(
+      const CellAdmissionClaimDTO& claim, const CellAdmissionClaimReleaseDTO& release) const;
+  [[nodiscard]] Result<CellAdmissionReconcileValidationDTO> validate_manual_owner_reconciliation(
+      const std::vector<CellAdmissionClaimDTO>& held,
+      const std::vector<CellAdmissionCurrentOwnerEpochDTO>& current,
+      const CellAdmissionReconcileDTO& request) const;
+  [[nodiscard]] Result<std::optional<CellAdmissionSettlementEvidenceDTO>>
+  manual_operation_settlement_locked(const CellAdmissionClaimDTO& claim) const;
+  void refresh_execution_claims();  // caller holds admission_mutex_
   [[nodiscard]] ActiveOperation* find_active_operation_locked(
       const OperationId& operation_id) noexcept;
   [[nodiscard]] const ActiveOperation* find_active_operation_locked(
@@ -581,7 +619,8 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       const OperationId& operation_id, IResolvedParticipantExecutionEngine* failing_engine,
       ErrorDTO failure);
   [[nodiscard]] Result<OperationControlAcceptedDTO> apply_control(
-      const OperationControlRequestDTO& request, OperationControlKind control);
+      const OperationControlRequestDTO& request, OperationControlKind control,
+      bool automatic_manual_retirement = false);
   void CompleteOperationControlEffect(OperationControlEffectResult result) noexcept;
   [[nodiscard]] OperationStateDTO publish_settlement_fault_locked(ActiveOperation& operation);
   [[nodiscard]] Result<void> settle_control_operation_locked(const OperationId& operation_id,
@@ -632,6 +671,19 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       EmergencyStopProjectedIntentDTO intent,
       const PartialDispatchStopScope* partial_dispatch_scope = nullptr,
       const MalformedStopIngressDTO* malformed_ingress = nullptr);
+  // One acceptance boundary shared by physical and captured-node selections.
+  // Publish only after state_mutex_ is released; the existing workers own all
+  // provider effects and journal projection.
+  struct StopWorkHandoff final {
+    std::optional<StopControlWorkToken> control;
+    std::optional<StopControlWorkToken> projection;
+  };
+  [[nodiscard]] Result<StopAcceptedDTO> accept_stop_locked(
+      EmergencyStopProjectedIntentDTO intent, StopWorkHandoff& handoff, TimePoint accepted_at_ns,
+      const PartialDispatchStopScope* partial_dispatch_scope = nullptr,
+      const MalformedStopIngressDTO* malformed_ingress = nullptr);
+  void publish_stop_work(const StopWorkHandoff& handoff) noexcept;
+  [[nodiscard]] bool ordinary_request_id_retained_locked(const RequestId& request_id) const;
   [[nodiscard]] Result<KernelDisableHandoffRuntimeSnapshotDTO>
   capture_disable_handoff_runtime_snapshot_impl(const DisableRuntimeExpectation& expectation) const;
 
@@ -660,14 +712,26 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   mutable std::mutex state_mutex_;
   struct ProgramRunStopFence final {
     ProgramRunId program_run_id;
-    StopId stop_id;
+    std::optional<StopId> stop_id;
     StopGeneration stop_generation;
     bool releasable{};
+    std::uint64_t selection_revision{};
+    std::uint64_t legacy_selection_revision{};
+    std::vector<ProgramNodeHoldStateDTO> node_states{};
+    std::vector<ProgramNodeStopEffectDTO> pending_effects{};
   };
   struct ProgramCycleClaimRun final {
     ProgramRunId program_run_id;
     CellAdmissionClaimGeneration claim_generation{0U};
+    RequestOwnerEpoch program_runner_owner_epoch;
+    ProgramRevision program_revision;
+    std::optional<ProgramRunExecutionCaptureDTO> capture{};
   };
+  [[nodiscard]] Result<std::vector<std::uint32_t>> resolve_program_selection_locked(
+      const ProgramExecutionSelectionRequestDTO& request) const;
+  [[nodiscard]] ProgramExecutionScopeStateDTO program_execution_scope_locked(
+      const ProgramRunStopFence& fence) const;
+  void reduce_program_selection_stop_locked(const StopCertificateDTO& certificate);
   std::vector<ReplayEntry> replay_ledger_;
   std::vector<ControlReplayEntry> control_replay_ledger_;
   std::vector<StopReplayEntry> stop_replay_ledger_;
@@ -685,6 +749,9 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   // Its transaction identity is the exact ProgramRunId, so Stop never waits
   // for the asynchronously refreshed Manager status projection to know a run.
   std::optional<ProgramCycleClaimRun> program_cycle_claim_run_;
+  // Same ledger's current exact manual claim; also protects its operation
+  // from diagnostic-history retirement until settlement/reconciliation.
+  std::optional<CellAdmissionClaimDTO> manual_operation_claim_;
   // Retained only as a compatibility/readiness source for a predecessor run
   // admitted before Program-cycle transaction and ProgramRunId were unified.
   std::optional<ProgramRunId> current_program_run_id_;

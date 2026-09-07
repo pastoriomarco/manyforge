@@ -8,8 +8,8 @@
 #include <manyforge_deployment/site_overlay_resolution.hpp>
 #include <manyforge_lite6_product/lifecycle_profile.hpp>
 
-#include <array>
 #include <algorithm>
+#include <array>
 #include <filesystem>
 #include <iostream>
 #include <span>
@@ -147,19 +147,20 @@ struct ProgramPublication final {
   core::ScenarioCatalogRevision catalog_revision;
 };
 
-[[nodiscard]] std::string ProgramBytes(
-    const deployment::RetainedBundle &bundle) {
-  const auto arm_binding = std::find_if(
-      bundle.value().cell_graph.control_bindings.begin(),
-      bundle.value().cell_graph.control_bindings.end(), [](const auto &binding) {
-        return binding.command_target_id.value() ==
-               deployment::test::kLite6ArmTargetId;
-      });
+[[nodiscard]] std::string
+ProgramBytes(const deployment::RetainedBundle &bundle) {
+  const auto arm_binding =
+      std::find_if(bundle.value().cell_graph.control_bindings.begin(),
+                   bundle.value().cell_graph.control_bindings.end(),
+                   [](const auto &binding) {
+                     return binding.command_target_id.value() ==
+                            deployment::test::kLite6ArmTargetId;
+                   });
   if (arm_binding == bundle.value().cell_graph.control_bindings.end()) {
     throw std::logic_error("assistant-native bundle has no arm capability");
   }
   deployment::CanonicalValue root(deployment::CanonicalValue::Object{
-      {"api_version", deployment::CanonicalValue("manyforge.program.v1")},
+      {"api_version", deployment::CanonicalValue("manyforge.program.v2")},
       {"catalog",
        deployment::CanonicalValue(deployment::CanonicalValue::Object{
            {"api_version",
@@ -178,7 +179,8 @@ struct ProgramPublication final {
       {"program_profile", deployment::CanonicalValue("composable-cell-v1")},
       {"program_revision",
        deployment::CanonicalValue(std::string(kZeroDigest))},
-      {"scene", deployment::CanonicalValue(deployment::CanonicalValue::Array{})},
+      {"scene",
+       deployment::CanonicalValue(deployment::CanonicalValue::Array{})},
       {"target_roles",
        deployment::CanonicalValue(deployment::CanonicalValue::Object{
            {"arm",
@@ -237,7 +239,7 @@ struct ProgramPublication final {
   const auto revision = deployment::detail::compute_content_identity(
       root, deployment::detail::ContentIdentitySpec{
                 .identity_domain = "program-revision",
-                .api_version = "manyforge.program.v1",
+                .api_version = "manyforge.program.v2",
                 .own_field = "program_revision",
             });
   auto members = root.as_object();
@@ -262,7 +264,8 @@ struct ProgramPublication final {
   const auto model_map =
       model_maps.get_verified(deployment::RetainedModelMapQuery{
           bundle->retained_bundle_id(),
-          bundle->value().compiled_products.symbol_role_maps.front()
+          bundle->value()
+              .compiled_products.symbol_role_maps.front()
               .product_id});
   if (!model_map.has_value()) {
     throw std::logic_error("assistant-native model map did not reopen");
@@ -275,8 +278,8 @@ struct ProgramPublication final {
       core::ProgramRoleAssignmentDTO{
           {core::ProgramComponentRoleAssignmentDTO{
               core::ComponentRoleId("robot"),
-              core::ControllableComponentId(
-                  std::string(deployment::test::kLite6ControllableComponentId))}},
+              core::ControllableComponentId(std::string(
+                  deployment::test::kLite6ControllableComponentId))}},
           {core::ProgramTargetRoleAssignmentDTO{
               core::TargetRoleId("arm"),
               core::CommandTargetId(
@@ -346,8 +349,7 @@ void WriteAssistantNativeMetadata(
       }));
   std::ofstream stream(path, std::ios::binary | std::ios::trunc);
   if (!stream) {
-    throw std::runtime_error(
-        "cannot create assistant-native fixture metadata");
+    throw std::runtime_error("cannot create assistant-native fixture metadata");
   }
   stream << bytes;
   stream.flush();
@@ -371,15 +373,16 @@ int main(int argc, char **argv) {
       throw std::logic_error(
           "Manager Apply fixture lifecycle catalogs are unavailable");
     }
-    auto source = arguments.assistant_native
-                      ? deployment::test::
-                            make_lite6_native_cclc_assistant_product_retention_fixture(
-                                arm_lifecycle_semantic.value().value(),
-                                gripper_lifecycle_semantic.value().value())
-                      : deployment::test::
-                            make_lite6_native_cclc_product_retention_fixture(
-                                arm_lifecycle_semantic.value().value(),
-                                gripper_lifecycle_semantic.value().value());
+    auto source =
+        arguments.assistant_native
+            ? deployment::test::
+                  make_lite6_native_cclc_assistant_product_retention_fixture(
+                      arm_lifecycle_semantic.value().value(),
+                      gripper_lifecycle_semantic.value().value())
+            : deployment::test::
+                  make_lite6_native_cclc_product_retention_fixture(
+                      arm_lifecycle_semantic.value().value(),
+                      gripper_lifecycle_semantic.value().value());
     if (!source.native_execution_runtime_profile.has_value()) {
       throw std::logic_error(
           "Manager Apply fixture lacks its native runtime profile");
@@ -438,8 +441,8 @@ int main(int argc, char **argv) {
             arguments.package_root, admission_filename, *predecessor);
 
     if (arguments.assistant_native) {
-      const auto program = PublishAssistantNativeProgram(
-          arguments.package_root, physical_candidate);
+      const auto program = PublishAssistantNativeProgram(arguments.package_root,
+                                                         physical_candidate);
       WriteAssistantNativeMetadata(arguments.metadata_path, admission,
                                    *physical_candidate, program,
                                    admission_filename);

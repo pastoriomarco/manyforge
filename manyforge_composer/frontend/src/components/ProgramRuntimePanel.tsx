@@ -88,7 +88,9 @@ export function ProgramRuntimePanel({
   const canStop = cycleState === 'starting'
     || state.run?.state === 'running'
     || state.run?.state === 'intervention_required';
-  const stopCommandPending = ['stop', 'motion-stop', 'full-stop']
+  // A selected Stop receipt must not block Stop for a different selection or
+  // the broader Full Stop. The owner, not pending click feedback, holds nodes.
+  const stopCommandPending = ['stop', 'full-stop', 'reset']
     .includes(state.pending ?? '');
   const fullStopped = state.run?.state === 'full_stopped';
   const canRun = state.runnerAvailable
@@ -537,11 +539,17 @@ export function ProgramTransportControls({
 }) {
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [stopMenuOpen, setStopMenuOpen] = useState(false);
+  const [selection, setSelection] = useState({ runId: '', groupId: 'all' });
   const detailsButton = useRef<HTMLButtonElement>(null);
   const { state, cycleState } = program;
+  const runId = state.run?.capture.programRunId ?? '';
+  const selections = state.controls?.executionSelections.groups ?? [];
+  const selectedGroup = selections.find((group) => group.groupId === (
+    selection.runId === runId ? selection.groupId : 'all'
+  )) ?? selections.find((group) => group.groupId === 'all');
   const motionActive = robotControlHasActiveOperation(robot.state);
   const motionPaused = robot.state.operation?.state === 'paused';
-  const programMotionRunning = state.run?.state === 'running';
+  const programMotionRunning = ['running', 'intervention_required'].includes(state.run?.state ?? '');
   const programStarting = cycleState === 'starting';
   const programStopping = cycleState === 'stopping';
   const programFullStopping = state.run?.state === 'full_stopping';
@@ -552,14 +560,7 @@ export function ProgramTransportControls({
     && state.pending === null
     && !programMotionRunning
     && program.commandAllowed('program_run');
-  const operatorStopOffer = programMotionStopSettled(
-    state.run,
-    state.controls,
-  )
-    ? state.controls?.recoveryOffer ?? null
-    : null;
-  const motionStopSettled = operatorStopOffer !== null
-    && ['running', 'intervention_required'].includes(state.run?.state ?? '');
+  const motionStopSettled = selectedGroup?.state === 'held' && programMotionRunning;
   const motionStopped = motionStopSettled
     || programFullStopped
     || state.run?.state === 'stopped'
@@ -567,27 +568,22 @@ export function ProgramTransportControls({
       !programMotionRunning
       && robot.state.operation?.state === 'stopped'
     );
-  const operatorStopResumeAction = operatorStopOffer?.actions.find(
-    (action) => action.actionId === operatorStopOffer.primaryAction
-      && action.actionId !== 'reset_cycle'
-      && action.enabled,
-  )?.actionId ?? null;
-  const operatorStopResetAction = operatorStopOffer?.actions.find(
-    (action) => action.actionId === 'reset_cycle' && action.enabled,
-  )?.actionId ?? null;
-  const stopCommandPending = ['stop', 'motion-stop', 'full-stop']
+  const stopCommandPending = ['stop', 'full-stop', 'reset']
     .includes(state.pending ?? '');
   const canStopMotion = enabled
     && !stopCommandPending
     && !programStopping
     && !motionStopSettled
+    && selectedGroup?.state !== 'stopping'
     && (
-      (state.runnerAvailable && (programStarting || programMotionRunning))
+      (state.runnerAvailable && (programStarting || (programMotionRunning
+        && program.commandAllowed('program_motion_stop')
+        && (selectedGroup?.stopAllowed ?? true))))
       || (robot.controlPending === null && motionActive)
     );
   const canResumeOperatorStop = enabled
-    && motionStopSettled
-    && operatorStopResumeAction !== null
+    && selectedGroup?.resumeAllowed === true
+    && program.commandAllowed('program_motion_resume')
     && state.pending === null
     && state.controlPending === null;
   const canResume = enabled
@@ -606,8 +602,7 @@ export function ProgramTransportControls({
   const canReset = enabled
     && state.pending === null
     && state.controlPending === null
-    && (program.commandAllowed('program_reset')
-      || (motionStopSettled && operatorStopResetAction !== null));
+    && program.commandAllowed('program_reset');
   const velocityAvailable = enabled
     && (state.pending === null || state.pending === 'run')
     && !['stopping', 'full_stopping'].includes(state.run?.state ?? '')
@@ -630,6 +625,22 @@ export function ProgramTransportControls({
   return (
     <>
       <div className="viewer-transport" aria-label="Program and motion controls">
+        {selections.length > 1 && (
+          <label className="transport-selection" title={selectedGroup?.resumeUnavailableReason?.replaceAll('_', ' ')}>
+            <span>Scope</span>
+            <select
+              aria-label="Motion control group"
+              value={selectedGroup?.groupId ?? 'all'}
+              onChange={(event) => setSelection({ runId, groupId: event.target.value })}
+            >
+              {selections.map((group) => (
+                <option key={group.groupId} value={group.groupId}>
+                  {group.groupId === 'all' ? 'All nodes' : group.groupId} · {group.state}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
         <button
           type="button"
           className="transport-run"
@@ -639,19 +650,18 @@ export function ProgramTransportControls({
             : canResumeFullStop
               ? 'Run the preserved Program tree from fresh current-state resolution.'
             : canResumeOperatorStop
-              ? 'Resume from the exact owner-issued operator Stop recovery.'
+              ? 'Resume only this selection after fresh backend assessment.'
             : canRun
               ? 'Run the exact Applied Program.'
-              : 'Run requires an Applied Program and an idle, reset runner.'}
+              : selectedGroup?.resumeUnavailableReason?.replaceAll('_', ' ')
+                ?? 'Run requires an Applied Program and an idle, reset runner.'}
           onClick={() => {
             if (canResume) {
               void robot.resume();
             } else if (canResumeFullStop) {
               void program.resumeFullStop();
-            } else if (
-              canResumeOperatorStop && operatorStopResumeAction !== null
-            ) {
-              void program.applyRecoveryAction(operatorStopResumeAction);
+            } else if (canResumeOperatorStop) {
+              void program.resumeMotion(selectedGroup?.groupId);
             } else {
               void program.run();
             }
@@ -663,7 +673,7 @@ export function ProgramTransportControls({
               ? 'Starting'
             : state.pending === 'resume-full-stop'
               ? 'Sending Run'
-            : state.controlPending?.startsWith('recovery:')
+            : state.pending === 'resume-motion' || state.controlPending?.startsWith('recovery:')
               ? 'Sending Resume'
             : state.pending === 'run'
               ? 'Sending Run'
@@ -702,13 +712,13 @@ export function ProgramTransportControls({
               if (programStarting) {
                 void program.stop();
               } else if (programMotionRunning) {
-                void program.stopMotion();
+                void program.stopMotion(selectedGroup?.groupId);
               } else {
                 void robot.stop();
               }
             }}
           >
-            {programStopping
+            {programStopping || selectedGroup?.state === 'stopping'
               ? 'Stopping'
               : robot.controlPending === 'stop'
               ? 'Sending Stop'
@@ -776,11 +786,7 @@ export function ProgramTransportControls({
               : 'Reset the completed Program cycle.'
             : 'Reset is available after a terminal run or Full Stop.'}
           onClick={() => {
-            if (motionStopSettled && operatorStopResetAction !== null) {
-              void program.applyRecoveryAction(operatorStopResetAction);
-            } else {
-              void program.reset();
-            }
+            void program.reset();
           }}
         >
           {cycleState === 'resetting'

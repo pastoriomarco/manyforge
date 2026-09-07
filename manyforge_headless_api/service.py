@@ -41,6 +41,8 @@ from .models import (
     ProgramModelAttemptRequest,
     ProgramRunStartRequest,
     ProgramRunStopRequest,
+    ProgramSelectionStopRequest,
+    ProgramSelectionResumeRequest,
     ProgramFullStopResetRequest,
     ProgramFullStopResumeRequest,
     ProgramScenePreparationRequest,
@@ -1478,12 +1480,27 @@ class HeadlessService:
     def program_run_motion_stop(
         self,
         program_run_id: str,
-        request: ProgramRunStopRequest,
+        request: ProgramSelectionStopRequest,
     ) -> dict[str, Any]:
         try:
             projection = self._program_runner().stop_motion(
                 program_run_id,
                 request.model_dump(mode="json"),
+            )
+        except ProgramRunnerClientError as error:
+            raise self._runner_error(error) from error
+        return self._validate_program_run_snapshot(
+            projection,
+            expected_program_run_id=program_run_id,
+            expected_owner_epoch=request.expected_owner_epoch,
+        )
+
+    def program_run_motion_resume(
+        self, program_run_id: str, request: ProgramSelectionResumeRequest,
+    ) -> dict[str, Any]:
+        try:
+            projection = self._program_runner().resume_motion(
+                program_run_id, request.model_dump(mode="json"),
             )
         except ProgramRunnerClientError as error:
             raise self._runner_error(error) from error
@@ -1931,7 +1948,7 @@ class HeadlessService:
                 program,
                 own_field="program_revision",
                 identity_domain="program-revision",
-                api_version="manyforge.program.v1",
+                api_version="manyforge.program.v2",
                 label="applied_program.program",
             )
             validated = Program.from_dict(

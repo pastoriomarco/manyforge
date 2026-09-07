@@ -226,7 +226,7 @@ def _remove_program_tree_with_valid_identity(value: dict[str, Any]) -> None:
         value["program"],
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v1",
+        api_version="manyforge.program.v2",
     )
     value["program_revision"] = value["program"]["program_revision"]
     value["program_binding"]["program_revision"] = value["program_revision"]
@@ -2638,7 +2638,7 @@ def test_program_apply_rejects_invalid_program_before_native_preparation() -> No
             json={
                 "scenario_id": "cell-pick",
                 "scenario_catalog_revision": "sha256:" + "6" * 64,
-                "program": {"api_version": "manyforge.program.v1"},
+                "program": {"api_version": "manyforge.program.v2"},
                 "expected_applied_record_digest": None,
                 "authoring_claim": _authoring_claim(),
             },

@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -84,15 +85,9 @@ class BoundedStopControlExecutor::Impl final {
     bool armed = false;
     if (accepting_.load(std::memory_order_acquire) && Valid(token) && deadline >= 0) {
       auto& slot = slots_[token.slot];
-      const auto retained = slot.deadline_generation.load(std::memory_order_acquire);
-      if (token.generation >= retained) {
-        // Disarm before replacing the scalar fields. The one Stop owner may
-        // rearm a generation after its prior deadline callback has dequeued;
-        // a concurrent already-dequeued callback is intentionally not recalled.
-        slot.deadline_armed.store(false, std::memory_order_release);
-        slot.deadline_ns.store(deadline, std::memory_order_relaxed);
-        slot.deadline_generation.store(token.generation, std::memory_order_relaxed);
-        slot.deadline_armed.store(true, std::memory_order_release);
+      if (token.generation >= slot.writer_generation) {
+        slot.writer_generation = token.generation;
+        PublishDeadline(slot, Deadline{token.generation, deadline, true});
         armed = true;
       }
     }
@@ -107,8 +102,9 @@ class BoundedStopControlExecutor::Impl final {
     bool cancelled = false;
     if (Valid(token)) {
       auto& slot = slots_[token.slot];
-      if (slot.deadline_generation.load(std::memory_order_acquire) == token.generation) {
-        cancelled = slot.deadline_armed.exchange(false, std::memory_order_acq_rel);
+      if (slot.writer_generation == token.generation) {
+        PublishDeadline(slot, Deadline{token.generation, 0, false});
+        cancelled = true;
       }
     }
     if (cancelled) {
@@ -147,13 +143,38 @@ class BoundedStopControlExecutor::Impl final {
   }
 
  private:
+  struct Deadline final {
+    std::uint64_t generation{};
+    TimePoint at{};
+    bool armed{};
+  };
+
+  static constexpr unsigned kIndexMask = 3U;
+  static constexpr unsigned kDirty = 4U;
+  static constexpr unsigned kActive = 8U;
+  static constexpr unsigned kWakePending = 1U;
+  static constexpr unsigned kQuiescent = 2U;
+
   struct Slot final {
     std::atomic<std::uint64_t> requested_generation{0U};
     std::atomic<std::uint64_t> delivered_generation{0U};
-    std::atomic<std::uint64_t> deadline_generation{0U};
-    std::atomic<TimePoint> deadline_ns{0};
-    std::atomic<bool> deadline_armed{false};
+    // One serialized producer and one worker exchange the latest scalar
+    // deadline. Each owns a buffer; the third is the exchange slot. No reader
+    // can see a partially replaced pair, and no publication counter can wrap.
+    // This is a capacity-one handoff, not a queue of past deadlines.
+    std::array<Deadline, 3U> deadlines{};
+    unsigned writer_index{0U};
+    unsigned reader_index{1U};
+    std::uint64_t writer_generation{};
+    std::atomic<unsigned> middle{2U};
   };
+
+  static void PublishDeadline(Slot& slot, Deadline deadline) noexcept {
+    slot.deadlines[slot.writer_index] = deadline;
+    slot.writer_index =
+        slot.middle.exchange(slot.writer_index | kDirty | kActive, std::memory_order_acq_rel) &
+        kIndexMask;
+  }
 
   [[nodiscard]] bool Valid(const StopControlWorkToken token) const noexcept {
     return token.locally_valid() && token.slot < capacity_;
@@ -167,7 +188,9 @@ class BoundedStopControlExecutor::Impl final {
   }
 
   void WakeWorker() noexcept {
-    if (!wake_posted_.exchange(true, std::memory_order_acq_rel)) {
+    // Publication invalidates the worker's idle acknowledgement in the same
+    // atomic handoff that coalesces semaphore wakes.
+    if ((wake_state_.exchange(kWakePending, std::memory_order_acq_rel) & kWakePending) == 0U) {
       wake_.release();
     }
   }
@@ -180,15 +203,23 @@ class BoundedStopControlExecutor::Impl final {
         worker_scanning_.load(std::memory_order_acquire)) {
       return false;
     }
+    return wake_state_.load(std::memory_order_acquire) == kQuiescent;
+  }
+
+  // Only the worker audits slots: a callback can transfer pending work from
+  // a later slot to an earlier one, defeating a concurrent caller's scan.
+  void AcknowledgeQuiescence() noexcept {
     for (std::size_t index = 0; index < capacity_; ++index) {
       const auto& slot = slots_[index];
       if (slot.requested_generation.load(std::memory_order_acquire) >
               slot.delivered_generation.load(std::memory_order_acquire) ||
-          slot.deadline_armed.load(std::memory_order_acquire)) {
-        return false;
+          (slot.middle.load(std::memory_order_acquire) & kActive) != 0U) {
+        return;
       }
     }
-    return true;
+    unsigned expected = 0U;
+    static_cast<void>(wake_state_.compare_exchange_strong(
+        expected, kQuiescent, std::memory_order_acq_rel, std::memory_order_acquire));
   }
 
   void Invoke(const StopControlWorkToken token) noexcept {
@@ -202,45 +233,54 @@ class BoundedStopControlExecutor::Impl final {
     std::optional<TimePoint> nearest_deadline;
     for (std::size_t index = 0; index < capacity_; ++index) {
       auto& slot = slots_[index];
+      if ((slot.middle.load(std::memory_order_acquire) & kDirty) != 0U) {
+        slot.reader_index =
+            slot.middle.exchange(slot.reader_index | kActive, std::memory_order_acq_rel) &
+            kIndexMask;
+      }
+      auto& deadline = slot.deadlines[slot.reader_index];
       const auto requested = slot.requested_generation.load(std::memory_order_acquire);
       const auto delivered = slot.delivered_generation.load(std::memory_order_acquire);
-      bool invoked_initial = false;
+      bool due = false;
+      if (deadline.armed && requested > deadline.generation) {
+        deadline.armed = false;
+      } else if (deadline.armed && requested == deadline.generation) {
+        // Arm-before-Publish stays dormant until its generation is visible.
+        // Claim only the current clean publication. A concurrent Cancel/rearm
+        // marks middle dirty and prevents claiming this older deadline, even
+        // when it uses the identical generation and timestamp.
+        if (deadline.at <= clock_.now()) {
+          auto publication = slot.middle.load(std::memory_order_acquire);
+          if ((publication & kDirty) == 0U &&
+              slot.middle.compare_exchange_strong(
+                  publication, publication, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            due = true;
+            deadline.armed = false;
+          }
+        } else if (!nearest_deadline.has_value() || deadline.at < *nearest_deadline) {
+          nearest_deadline = deadline.at;
+        }
+      }
+
+      // Initial progress covers only a deadline claimed BEFORE the callback.
+      // A rearm during that callback stays dirty for the next scan; a future
+      // deadline becoming due during it likewise remains armed.
       if (requested > delivered) {
         Invoke(StopControlWorkToken{static_cast<std::uint32_t>(index), requested});
         slot.delivered_generation.store(requested, std::memory_order_release);
-        invoked_initial = true;
+      } else if (due) {
+        Invoke(StopControlWorkToken{static_cast<std::uint32_t>(index), deadline.generation});
       }
 
-      if (!slot.deadline_armed.load(std::memory_order_acquire)) {
-        continue;
-      }
-      const auto deadline_generation = slot.deadline_generation.load(std::memory_order_acquire);
-      const auto current_generation = slot.requested_generation.load(std::memory_order_acquire);
-      if (current_generation > deadline_generation) {
-        bool expected = true;
-        static_cast<void>(slot.deadline_armed.compare_exchange_strong(
-            expected, false, std::memory_order_acq_rel, std::memory_order_acquire));
-        continue;
-      }
-      // Arm-before-Publish is the required safe ordering: the deadline stays
-      // dormant until Publish makes the same generation visible.
-      if (current_generation < deadline_generation) {
-        continue;
-      }
-      const auto deadline = slot.deadline_ns.load(std::memory_order_acquire);
-      if (deadline <= clock_.now()) {
-        bool expected = true;
-        if (slot.deadline_armed.compare_exchange_strong(expected, false, std::memory_order_acq_rel,
-                                                        std::memory_order_acquire)) {
-          // The initial progress call already observes an elapsed outer
-          // deadline. Do not manufacture a redundant callback in the same
-          // scan merely because ArmDeadline preceded Publish.
-          if (!invoked_initial) {
-            Invoke(StopControlWorkToken{static_cast<std::uint32_t>(index), deadline_generation});
-          }
+      if (!deadline.armed) {
+        // Clear drain accounting only after the claimed callback returned,
+        // and only if no producer has published another pending deadline.
+        auto publication = slot.middle.load(std::memory_order_acquire);
+        if ((publication & kDirty) == 0U) {
+          static_cast<void>(slot.middle.compare_exchange_strong(publication, publication & ~kActive,
+                                                                std::memory_order_acq_rel,
+                                                                std::memory_order_acquire));
         }
-      } else if (!nearest_deadline.has_value() || deadline < *nearest_deadline) {
-        nearest_deadline = deadline;
       }
     }
     return nearest_deadline;
@@ -254,6 +294,7 @@ class BoundedStopControlExecutor::Impl final {
     while (!stop_token.stop_requested()) {
       worker_scanning_.store(true, std::memory_order_release);
       const auto nearest_deadline = Scan();
+      AcknowledgeQuiescence();
       worker_scanning_.store(false, std::memory_order_release);
       NotifyDrainState();
       if (stop_token.stop_requested()) {
@@ -272,8 +313,8 @@ class BoundedStopControlExecutor::Impl final {
       }
       if (awakened) {
         // A producer that races this store either left all of its state visible
-        // to the next scan or observes false and posts the next semaphore wake.
-        wake_posted_.store(false, std::memory_order_release);
+        // to the next scan or observes clear state and posts the next semaphore wake.
+        wake_state_.store(0U, std::memory_order_release);
       }
     }
 
@@ -293,7 +334,7 @@ class BoundedStopControlExecutor::Impl final {
   std::atomic<std::size_t> api_calls_inflight_{0U};
   std::atomic<std::size_t> callback_inflight_{0U};
   std::binary_semaphore wake_{0};
-  std::atomic<bool> wake_posted_{false};
+  std::atomic<unsigned> wake_state_{0U};
   std::mutex drain_mutex_;
   std::condition_variable drain_changed_;
   std::jthread worker_;

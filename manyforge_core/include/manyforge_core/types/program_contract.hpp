@@ -1,9 +1,9 @@
 #pragma once
 
-#include <manyforge_core/types/retained_product.hpp>
-
 #include <cstddef>
 #include <cstdint>
+#include <manyforge_core/types/retained_product.hpp>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -11,18 +11,107 @@
 
 namespace manyforge::core {
 
-inline constexpr std::string_view kProgramApiVersion = "manyforge.program.v1";
-inline constexpr std::string_view kComposableCellProgramProfile =
-    "composable-cell-v1";
+inline constexpr std::string_view kProgramApiVersion = "manyforge.program.v2";
+inline constexpr std::string_view kComposableCellProgramProfile = "composable-cell-v1";
 inline constexpr std::size_t kMaxProgramContractRoles = 4096U;
 inline constexpr std::size_t kMaxProgramRoleRequirements = 4096U;
 inline constexpr std::size_t kMaxProgramTreeNodes = 100000U;
+inline constexpr std::size_t kMaxProgramExecutionGroups = 4096U;
+inline constexpr std::size_t kMaxProgramExecutionMemberships = kMaxProgramTreeNodes;
+inline constexpr std::size_t kMaxProgramTargetEffects = kMaxProgramTreeNodes;
 inline constexpr std::size_t kMaxProgramNodePolicies = kMaxProgramTreeNodes;
 inline constexpr std::size_t kMaxProgramAllowedSkills = 256U;
 inline constexpr std::size_t kMaxProgramSkillIdBytes = 128U;
 
+[[nodiscard]] constexpr bool valid_program_execution_group(std::string_view value) noexcept {
+  if (value.empty() || value.size() > 128U || value == "inherit" || value.front() < 'a' ||
+      value.front() > 'z') {
+    return false;
+  }
+  for (const auto c : value) {
+    if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '-')) {
+      return false;
+    }
+  }
+  return true;
+}
+
 struct ProgramNodeInstanceIdTag final {};
 using ProgramNodeInstanceId = StrongString<ProgramNodeInstanceIdTag>;
+
+/// A target/capability association derived from the qualified node catalog,
+/// its parameter defaults/conditions and this exact Program's literal roles.
+struct ProgramNodeTargetEffectDTO final {
+  TargetRoleId target_role_id;
+  CapabilityId capability_id;
+
+  friend bool operator==(const ProgramNodeTargetEffectDTO&,
+                         const ProgramNodeTargetEffectDTO&) = default;
+};
+
+struct ProgramExecutionNodeDTO final {
+  ProgramNodeInstanceId instance_id;
+  std::string owner_api;
+  std::vector<ProgramNodeTargetEffectDTO> target_effects;
+
+  friend bool operator==(const ProgramExecutionNodeDTO&, const ProgramExecutionNodeDTO&) = default;
+};
+
+struct ProgramExecutionSelectionDTO final {
+  std::string group_id;
+  // Sorted indices into ProgramExecutionTableDTO::nodes; names are stored once.
+  std::vector<std::uint32_t> node_indices;
+
+  friend bool operator==(const ProgramExecutionSelectionDTO&,
+                         const ProgramExecutionSelectionDTO&) = default;
+};
+
+/// Immutable derived data, not another artifact or runtime group state.
+/// The sealed Program contract proves its provenance. All authored nodes,
+/// including logical and never-started nodes, occur in instance-ID order.
+/// The built-in `all` selector means the complete nodes vector; it is not
+/// redundantly stored in named_selections or in sparse policy rows.
+struct ProgramExecutionTableDTO final {
+  std::vector<ProgramExecutionNodeDTO> nodes;
+  std::vector<ProgramExecutionSelectionDTO> named_selections;
+
+  friend bool operator==(const ProgramExecutionTableDTO&,
+                         const ProgramExecutionTableDTO&) = default;
+};
+
+/// Original authored work attribution, separate from diagnostic ActionSpan
+/// labels (which may name derived phases). A new attempt never changes scope.
+struct ProgramNodeExecutionScopeDTO final {
+  ProgramNodeInstanceId node_instance_id;
+  std::string node_attempt_id;
+
+  friend bool operator==(const ProgramNodeExecutionScopeDTO&,
+                         const ProgramNodeExecutionScopeDTO&) = default;
+};
+
+[[nodiscard]] inline bool valid_program_node_execution_scope(
+    const ProgramNodeExecutionScopeDTO& scope) noexcept {
+  return !scope.node_instance_id.empty() && scope.node_instance_id.value().size() <= 128U &&
+         scope.node_instance_id.value().find('\0') == std::string::npos &&
+         !scope.node_attempt_id.empty() && scope.node_attempt_id.size() <= 512U &&
+         scope.node_attempt_id.find('\0') == std::string::npos;
+}
+
+/// Process-local input from the sealed Program/Binding composition boundary.
+/// Transports carry the identities only, never a caller-supplied table.
+/// Kernel installation independently joins current claim/owner/configuration.
+struct ProgramRunExecutionCaptureDTO final {
+  RequestOwnerEpoch request_owner_epoch;
+  RequestOwnerEpoch program_runner_owner_epoch;
+  CellAdmissionClaimGeneration claim_generation;
+  ProgramRunId program_run_id;
+  ProgramId program_id;
+  ProgramRevision program_revision;
+  ProgramBindingId program_binding_id;
+  RetainedBundleId retained_bundle_id;
+  GraphRevision graph_revision;
+  std::shared_ptr<const ProgramExecutionTableDTO> table;
+};
 
 enum class ProgramModificationPolicyValue : std::uint8_t {
   kForbidden = 0,
@@ -30,8 +119,7 @@ enum class ProgramModificationPolicyValue : std::uint8_t {
   kLlmAllowed,
 };
 
-[[nodiscard]] constexpr std::string_view to_string(
-    ProgramModificationPolicyValue value) noexcept {
+[[nodiscard]] constexpr std::string_view to_string(ProgramModificationPolicyValue value) noexcept {
   switch (value) {
     case ProgramModificationPolicyValue::kForbidden:
       return "forbidden";
@@ -50,8 +138,7 @@ enum class ProgramInterventionDelegate : std::uint8_t {
   kProgramOnly,
 };
 
-[[nodiscard]] constexpr std::string_view to_string(
-    ProgramInterventionDelegate value) noexcept {
+[[nodiscard]] constexpr std::string_view to_string(ProgramInterventionDelegate value) noexcept {
   switch (value) {
     case ProgramInterventionDelegate::kForbidden:
       return "forbidden";
@@ -70,8 +157,7 @@ enum class ProgramRecoveryAction : std::uint8_t {
   kRuntimeOverride,
 };
 
-[[nodiscard]] constexpr std::string_view to_string(
-    ProgramRecoveryAction value) noexcept {
+[[nodiscard]] constexpr std::string_view to_string(ProgramRecoveryAction value) noexcept {
   switch (value) {
     case ProgramRecoveryAction::kIntervention:
       return "intervention";
@@ -106,8 +192,7 @@ enum class ProgramOperatorStopPolicy : std::uint8_t {
   kContinue,
 };
 
-[[nodiscard]] constexpr std::string_view to_string(
-    ProgramOperatorStopPolicy value) noexcept {
+[[nodiscard]] constexpr std::string_view to_string(ProgramOperatorStopPolicy value) noexcept {
   switch (value) {
     case ProgramOperatorStopPolicy::kInherit:
       return "inherit";
@@ -120,12 +205,9 @@ enum class ProgramOperatorStopPolicy : std::uint8_t {
 }
 
 struct ProgramNodeModificationPolicyDTO final {
-  ProgramModificationPolicyValue runtime_override{
-      ProgramModificationPolicyValue::kForbidden};
-  ProgramModificationPolicyValue persistent_edit{
-      ProgramModificationPolicyValue::kForbidden};
-  ProgramInterventionDelegate intervention_delegate{
-      ProgramInterventionDelegate::kForbidden};
+  ProgramModificationPolicyValue runtime_override{ProgramModificationPolicyValue::kForbidden};
+  ProgramModificationPolicyValue persistent_edit{ProgramModificationPolicyValue::kForbidden};
+  ProgramInterventionDelegate intervention_delegate{ProgramInterventionDelegate::kForbidden};
 
   friend bool operator==(const ProgramNodeModificationPolicyDTO&,
                          const ProgramNodeModificationPolicyDTO&) = default;
@@ -152,11 +234,9 @@ struct ProgramNodePolicyDTO final {
   ProgramNodeInstanceId instance_id;
   ProgramNodeModificationPolicyDTO modification_policy;
   ProgramNodeRecoveryPolicyDTO recovery_policy;
-  ProgramOperatorStopPolicy operator_stop_policy{
-      ProgramOperatorStopPolicy::kInherit};
+  ProgramOperatorStopPolicy operator_stop_policy{ProgramOperatorStopPolicy::kInherit};
 
-  friend bool operator==(const ProgramNodePolicyDTO&,
-                         const ProgramNodePolicyDTO&) = default;
+  friend bool operator==(const ProgramNodePolicyDTO&, const ProgramNodePolicyDTO&) = default;
 };
 
 enum class ProgramCapabilityDisposition : std::uint8_t {
@@ -164,8 +244,7 @@ enum class ProgramCapabilityDisposition : std::uint8_t {
   kOptional,
 };
 
-[[nodiscard]] constexpr std::string_view to_string(
-    ProgramCapabilityDisposition value) noexcept {
+[[nodiscard]] constexpr std::string_view to_string(ProgramCapabilityDisposition value) noexcept {
   switch (value) {
     case ProgramCapabilityDisposition::kRequired:
       return "required";

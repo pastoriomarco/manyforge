@@ -1139,6 +1139,25 @@ TEST(JerkLimitedStopProfileTest, BackwardEnvelopeRejectsOverfastFutureCorner) {
   EXPECT_FALSE(result.value().validation_failure_reason.empty());
 }
 
+TEST(JerkLimitedStopProfileTest, BackwardEnvelopeTimingSearchMatchesEmission) {
+  // The search must apply the same envelope as emission, even though it
+  // does not collect samples or request the "used envelope" diagnostic.
+  // Timing convergence alone does not certify the corner's joint jerk.
+  for (const double target_time : {1.0, 1.5}) {
+    SCOPED_TRACE(target_time);
+    const auto result = compute_jerk_limited_stop_profile(
+        curved_corner_2d(), 0.0, 1.0, 0.0, target_time,
+        {{"joint_1", 5.0}, {"joint_2", 5.0}},
+        {{"joint_1", 50.0}, {"joint_2", 50.0}}, 0.01);
+    ASSERT_TRUE(result.ok()) << result.error().message;
+    EXPECT_TRUE(result.value().used_backward_envelope);
+    EXPECT_NEAR(result.value().achieved_stop_time_s, target_time, 1e-3);
+    EXPECT_FALSE(result.value().dispatchable);
+    EXPECT_EQ(result.value().validation_failure_reason,
+              "interpolated_jerk_limit_exceeded");
+  }
+}
+
 TEST(JerkLimitedStopProfileTest, RejectsInvalidInputs) {
   EXPECT_FALSE(compute_jerk_limited_stop_profile(linear_trajectory_1d(), 0.0,
                                                  0.0, 0.0, 0.5,

@@ -1,6 +1,6 @@
-api_version: manyforge.program.v1
+api_version: manyforge.program.v2
 program_id: pick_and_place_ur10e_robotiq_demo
-program_revision: sha256:e366f9249a3dcd78e126457ae3d6a9e4ec9614456cdae8a8e8cf851853a0fcbf
+program_revision: sha256:ce15ba524de796df2626cc423c56cc179ab8778e00edd9872db144ff196a0c12
 program_profile: composable-cell-v1
 name: pick_and_place_ur10e_robotiq_demo
 description: >-

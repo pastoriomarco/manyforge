@@ -227,6 +227,13 @@ Result<void> validate_operation_intent(const OperationIntentDTO& intent) {
     if (participant.action_span.has_value() && !valid_action_span(*participant.action_span)) {
       return invalid("operation action span is malformed", "operation_action_span_invalid");
     }
+    if (participant.execution_scope.has_value()) {
+      const auto& scope = *participant.execution_scope;
+      if (!valid_program_node_execution_scope(scope)) {
+        return invalid("operation authored node scope is malformed",
+                       "operation_execution_scope_invalid");
+      }
+    }
     if (participant.action_span.has_value() && !participant.action_span->program_run_id.empty() &&
         participant.action_span->program_run_id != intent.program_run_id.value()) {
       return invalid("operation action span names a different Program run",

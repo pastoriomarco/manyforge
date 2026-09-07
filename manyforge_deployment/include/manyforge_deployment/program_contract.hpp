@@ -21,9 +21,14 @@ inline constexpr std::uint64_t kMaxDurableProgramBytes =
     512ULL * 1024ULL * 1024ULL;
 
 class ProgramContractError final : public std::invalid_argument {
- public:
+public:
   using std::invalid_argument::invalid_argument;
 };
+
+/// Pure bounded authoring normalization shared by revision tools and the
+/// verifier. This is not a Program/catalog/binding proof or a migration.
+[[nodiscard]] CanonicalValue
+normalize_program_authoring(const CanonicalValue &source_root);
 
 namespace detail {
 class ProgramBindingContractConstructionAuthority;
@@ -37,34 +42,41 @@ class ProgramBindingContractConstructionAuthority;
 /// boundary independently closes the Program envelope, revision, roles, tree
 /// structure, and exact retained capability revisions needed by binding.
 class ProgramBindingContract final {
- public:
+public:
   ~ProgramBindingContract() = default;
-  ProgramBindingContract(const ProgramBindingContract&) = delete;
-  ProgramBindingContract& operator=(const ProgramBindingContract&) = delete;
-  ProgramBindingContract(ProgramBindingContract&&) = delete;
-  ProgramBindingContract& operator=(ProgramBindingContract&&) = delete;
+  ProgramBindingContract(const ProgramBindingContract &) = delete;
+  ProgramBindingContract &operator=(const ProgramBindingContract &) = delete;
+  ProgramBindingContract(ProgramBindingContract &&) = delete;
+  ProgramBindingContract &operator=(ProgramBindingContract &&) = delete;
 
-  [[nodiscard]] const core::ProgramBindingContractDTO& value() const noexcept {
+  [[nodiscard]] const core::ProgramBindingContractDTO &value() const noexcept {
     return value_;
   }
-  [[nodiscard]] const CanonicalValue& normalized_program_root() const noexcept {
+  [[nodiscard]] const CanonicalValue &normalized_program_root() const noexcept {
     return normalized_program_root_;
   }
   [[nodiscard]] std::string_view canonical_program_bytes() const noexcept {
     return canonical_program_bytes_;
   }
+  [[nodiscard]] const core::ProgramExecutionTableDTO &
+  execution_table() const noexcept {
+    return execution_table_;
+  }
 
- private:
+private:
   ProgramBindingContract(core::ProgramBindingContractDTO value,
                          CanonicalValue normalized_program_root,
-                         std::string canonical_program_bytes)
+                         std::string canonical_program_bytes,
+                         core::ProgramExecutionTableDTO execution_table)
       : value_(std::move(value)),
         normalized_program_root_(std::move(normalized_program_root)),
-        canonical_program_bytes_(std::move(canonical_program_bytes)) {}
+        canonical_program_bytes_(std::move(canonical_program_bytes)),
+        execution_table_(std::move(execution_table)) {}
 
   core::ProgramBindingContractDTO value_;
   CanonicalValue normalized_program_root_;
   std::string canonical_program_bytes_;
+  core::ProgramExecutionTableDTO execution_table_;
 
   friend class detail::ProgramBindingContractConstructionAuthority;
 };
@@ -77,9 +89,8 @@ class ProgramBindingContract final {
 /// only after schema/catalog/program validation; this function independently
 /// proves the content identity and binding-relevant completeness.
 [[nodiscard]] std::shared_ptr<const ProgramBindingContract>
-verify_program_binding_contract(
-    std::string_view canonical_program_bytes,
-    const RetainedBundle& retained_bundle);
+verify_program_binding_contract(std::string_view canonical_program_bytes,
+                                const RetainedBundle &retained_bundle);
 
 /// Immutable content-addressed Program read port.
 ///
@@ -87,39 +98,38 @@ verify_program_binding_contract(
 /// contextual: the exact retained bundle must still validate every catalog
 /// and capability reference before a Program is returned.
 class IProgramSource {
- public:
+public:
   virtual ~IProgramSource() = default;
 
   [[nodiscard]] virtual std::shared_ptr<const ProgramBindingContract>
-  get_verified(const core::ProgramId& program_id,
-               const core::ProgramRevision& program_revision,
-               const RetainedBundle& retained_bundle) const = 0;
+  get_verified(const core::ProgramId &program_id,
+               const core::ProgramRevision &program_revision,
+               const RetainedBundle &retained_bundle) const = 0;
 };
 
 /// Immutable content-addressed Program publication and read port.
 class IProgramRepository : public IProgramSource {
- public:
+public:
   ~IProgramRepository() override = default;
 
-  [[nodiscard]] virtual bool put_if_absent(
-      std::shared_ptr<const ProgramBindingContract> program,
-      const RetainedBundle& retained_bundle) = 0;
+  [[nodiscard]] virtual bool
+  put_if_absent(std::shared_ptr<const ProgramBindingContract> program,
+                const RetainedBundle &retained_bundle) = 0;
 };
 
 /// Get-only Program source below one immutable package root.
 class FilesystemVerifiedProgramSource final : public IProgramSource {
- public:
+public:
   explicit FilesystemVerifiedProgramSource(
       std::filesystem::path trusted_package_root,
-      std::uint64_t maximum_single_program_bytes =
-          kMaxArtifactEncodedBytes);
+      std::uint64_t maximum_single_program_bytes = kMaxArtifactEncodedBytes);
 
-  [[nodiscard]] std::shared_ptr<const ProgramBindingContract> get_verified(
-      const core::ProgramId& program_id,
-      const core::ProgramRevision& program_revision,
-      const RetainedBundle& retained_bundle) const override;
+  [[nodiscard]] std::shared_ptr<const ProgramBindingContract>
+  get_verified(const core::ProgramId &program_id,
+               const core::ProgramRevision &program_revision,
+               const RetainedBundle &retained_bundle) const override;
 
- private:
+private:
   std::filesystem::path trusted_package_root_;
   std::uint64_t maximum_single_program_bytes_;
 };
@@ -130,7 +140,7 @@ class FilesystemVerifiedProgramSource final : public IProgramSource {
 /// proves canonical content identity; each point lookup repeats the complete
 /// retained-bundle contextual verification before returning the sealed value.
 class FilesystemProgramRepository final : public IProgramRepository {
- public:
+public:
   explicit FilesystemProgramRepository(
       std::filesystem::path trusted_root,
       std::size_t max_program_count = kMaxDurableProgramCount,
@@ -138,28 +148,28 @@ class FilesystemProgramRepository final : public IProgramRepository {
       std::uint64_t max_single_program_bytes = kMaxArtifactEncodedBytes);
   ~FilesystemProgramRepository() override;
 
-  FilesystemProgramRepository(const FilesystemProgramRepository&) = delete;
-  FilesystemProgramRepository& operator=(const FilesystemProgramRepository&) =
-      delete;
-  FilesystemProgramRepository(FilesystemProgramRepository&&) = delete;
-  FilesystemProgramRepository& operator=(FilesystemProgramRepository&&) =
-      delete;
+  FilesystemProgramRepository(const FilesystemProgramRepository &) = delete;
+  FilesystemProgramRepository &
+  operator=(const FilesystemProgramRepository &) = delete;
+  FilesystemProgramRepository(FilesystemProgramRepository &&) = delete;
+  FilesystemProgramRepository &
+  operator=(FilesystemProgramRepository &&) = delete;
 
-  [[nodiscard]] bool put_if_absent(
-      std::shared_ptr<const ProgramBindingContract> program,
-      const RetainedBundle& retained_bundle) override;
+  [[nodiscard]] bool
+  put_if_absent(std::shared_ptr<const ProgramBindingContract> program,
+                const RetainedBundle &retained_bundle) override;
 
-  [[nodiscard]] std::shared_ptr<const ProgramBindingContract> get_verified(
-      const core::ProgramId& program_id,
-      const core::ProgramRevision& program_revision,
-      const RetainedBundle& retained_bundle) const override;
+  [[nodiscard]] std::shared_ptr<const ProgramBindingContract>
+  get_verified(const core::ProgramId &program_id,
+               const core::ProgramRevision &program_revision,
+               const RetainedBundle &retained_bundle) const override;
 
   [[nodiscard]] std::size_t size() const;
   [[nodiscard]] std::uint64_t retained_bytes() const;
 
- private:
+private:
   struct Storage;
   std::unique_ptr<Storage> storage_;
 };
 
-}  // namespace manyforge::deployment
+} // namespace manyforge::deployment

@@ -72,6 +72,10 @@ class ProgramRunnerPort(Protocol):
         body: Mapping[str, Any],
     ) -> dict[str, Any]: ...
 
+    def resume_motion(
+        self, program_run_id: str, body: Mapping[str, Any]
+    ) -> dict[str, Any]: ...
+
     def discard_full_stop(
         self,
         program_run_id: str,
@@ -283,6 +287,13 @@ class ProgramRunnerHttpClient:
             "POST",
             f"{self._run_path(program_run_id)}/motion-stop",
             body=body,
+        )
+
+    def resume_motion(
+        self, program_run_id: str, body: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST", f"{self._run_path(program_run_id)}/motion-resume", body=body,
         )
 
     def full_stop(

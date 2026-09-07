@@ -1699,6 +1699,25 @@ DecodeParticipantPayload(const CanonicalValue &value) {
   Fail("operation payload kind is unsupported");
 }
 
+[[nodiscard]] std::optional<core::ProgramNodeExecutionScopeDTO>
+DecodeProgramExecutionScope(const CanonicalValue &value,
+                            const core::RequestAttributionDTO &attribution) {
+  const auto *scope = value.find_object_member("execution_scope");
+  if (scope == nullptr)
+    return std::nullopt;
+  Require(attribution.transport == core::RequestTransportDTO::kInternal &&
+              attribution.assurance == core::RequestAssuranceDTO::kUnverified &&
+              !attribution.principal_id.has_value(),
+          "Program origin requires the private owner-client path");
+  RequireExactObjectSize(*scope, 2U, "Program node execution scope");
+  core::ProgramNodeExecutionScopeDTO decoded{
+      core::ProgramNodeInstanceId(Text(*scope, "node_instance_id")),
+      Text(*scope, "node_attempt_id")};
+  Require(core::valid_program_node_execution_scope(decoded),
+          "Program node execution scope is malformed or oversized");
+  return decoded;
+}
+
 [[nodiscard]] core::OperationIntentDTO
 DecodeOperation(const CanonicalValue &value,
                 const core::RequestAttributionDTO &attribution) {
@@ -1720,7 +1739,10 @@ DecodeOperation(const CanonicalValue &value,
   std::vector<core::OperationParticipantIntentDTO> participants;
   participants.reserve(participant_values.size());
   for (const auto &participant : participant_values) {
-    RequireExactObjectSize(participant, 5U, "operation participant");
+    auto execution_scope =
+        DecodeProgramExecutionScope(participant, attribution);
+    RequireExactObjectSize(participant, execution_scope.has_value() ? 6U : 5U,
+                           "operation participant");
     std::optional<core::ActionSpanDTO> action_span;
     const auto &span = Member(participant, "action_span");
     if (!std::holds_alternative<std::nullptr_t>(span.storage())) {
@@ -1731,7 +1753,8 @@ DecodeOperation(const CanonicalValue &value,
         core::TargetRoleId(Text(participant, "target_role_id")),
         core::CapabilityId(Text(participant, "required_capability_id")),
         std::move(action_span),
-        DecodeParticipantPayload(Member(participant, "payload"))});
+        DecodeParticipantPayload(Member(participant, "payload")),
+        std::move(execution_scope)});
   }
   std::optional<core::SceneRevision> expected_scene;
   const auto &scene = Member(value, "expected_scene_revision");
@@ -1843,13 +1866,17 @@ DecodePlacePlanningIntent(const CanonicalValue &value,
 [[nodiscard]] core::OperationControlRequestDTO
 DecodeOperationControlRequest(const CanonicalValue &value,
                               const core::RequestAttributionDTO &attribution) {
-  RequireExactObjectSize(value, 4U, "operation control request");
+  auto execution_scope = DecodeProgramExecutionScope(value, attribution);
+  RequireExactObjectSize(value, execution_scope.has_value() ? 5U : 4U,
+                         "operation control request");
   return core::OperationControlRequestDTO{
       DecodeRequestContext(Member(value, "request_context")),
       core::OperationId(Text(value, "operation_id")),
       core::OperationRevision(
           Counter(value, "expected_operation_revision", 1U)),
-      OptionalBoundedText(value, "reason", kMaximumReasonBytes), attribution};
+      OptionalBoundedText(value, "reason", kMaximumReasonBytes),
+      attribution,
+      std::move(execution_scope)};
 }
 
 [[nodiscard]] core::StopIntentDTO
@@ -2066,6 +2093,7 @@ enum class CommandKind {
   kEvents,
   kPreviewMotion,
   kPreviewCapabilityCommand,
+  kRegisterProgramCapture,
   kSubmit,
   kRead,
   kReadStop,
@@ -2077,6 +2105,9 @@ enum class CommandKind {
   kAcknowledgeCompleted,
   kStop,
   kStopProgramRun,
+  kStopProgramSelection,
+  kReadProgramExecutionScope,
+  kReleaseProgramSelection,
   kReleaseProgramRunStopFence,
   kFullStop,
   kMalformedStop,
@@ -2126,6 +2157,9 @@ struct Command final {
   std::optional<TargetObservationQuery> target_query;
   std::optional<ProgramOperationQuery> operation_query;
   std::optional<core::OperationIntentDTO> operation;
+  std::optional<core::ProgramRunExecutionCaptureDTO> program_capture;
+  std::optional<core::ProgramExecutionSelectionRequestDTO> program_selection;
+  std::uint64_t expected_selection_revision{};
   std::optional<core::ContentDigest> operation_digest;
   std::optional<core::OperationId> operation_id;
   std::optional<core::StopId> stop_id;
@@ -2169,6 +2203,66 @@ struct Command final {
   Require(Text(root, "api_version") == kCommandApiVersion,
           "execution command API version is unsupported");
   const auto command = Text(root, "command");
+  if (command == "stop_program_selection" ||
+      command == "release_program_selection") {
+    const bool release = command == "release_program_selection";
+    RequireExactObjectSize(root, release ? 5U : 4U,
+                           "Program selection command");
+    const auto attribution =
+        DecodeRequestAttribution(Member(root, "attribution"));
+    Require(attribution.transport == core::RequestTransportDTO::kInternal &&
+                attribution.assurance ==
+                    core::RequestAssuranceDTO::kUnverified &&
+                !attribution.principal_id.has_value(),
+            "Program selection requires internal owner attribution");
+    const auto &request = Member(root, "request");
+    RequireExactObjectSize(request, 6U, "Program selection request");
+    Require(Text(request, "schema_version") ==
+                "manyforge.program_execution_selection.v1",
+            "Program selection request schema is unsupported");
+    Command decoded{release ? CommandKind::kReleaseProgramSelection
+                            : CommandKind::kStopProgramSelection};
+    decoded.program_selection = core::ProgramExecutionSelectionRequestDTO{
+        DecodeRequestContext(Member(request, "request_context")),
+        core::RequestOwnerEpoch(Text(request, "program_runner_owner_epoch")),
+        core::CellAdmissionClaimGeneration(
+            Counter(request, "claim_generation", 1U)),
+        core::ProgramRunId(Text(request, "program_run_id")),
+        Text(request, "group_id"),
+        attribution};
+    if (release)
+      decoded.expected_selection_revision =
+          Counter(root, "expected_selection_revision", 0U);
+    return decoded;
+  }
+  if (command == "read_program_execution_scope") {
+    RequireExactObjectSize(root, 3U, "Program execution scope read");
+    Command decoded{CommandKind::kReadProgramExecutionScope};
+    decoded.program_run_id = core::ProgramRunId(Text(root, "program_run_id"));
+    return decoded;
+  }
+  if (command == "register_program_run_capture") {
+    RequireExactObjectSize(root, 3U, "Program capture registration command");
+    const auto &capture = Member(root, "capture");
+    RequireExactObjectSize(capture, 10U, "Program capture registration");
+    Require(Text(capture, "schema_version") ==
+                "manyforge.program_run_execution_capture.v1",
+            "Program capture registration schema is unsupported");
+    Command decoded{CommandKind::kRegisterProgramCapture};
+    decoded.program_capture = core::ProgramRunExecutionCaptureDTO{
+        core::RequestOwnerEpoch(Text(capture, "request_owner_epoch")),
+        core::RequestOwnerEpoch(Text(capture, "program_runner_owner_epoch")),
+        core::CellAdmissionClaimGeneration(
+            Counter(capture, "claim_generation", 1U)),
+        core::ProgramRunId(Text(capture, "program_run_id")),
+        core::ProgramId(Text(capture, "program_id")),
+        core::ProgramRevision(Text(capture, "program_revision")),
+        core::ProgramBindingId(Text(capture, "program_binding_id")),
+        core::RetainedBundleId(Text(capture, "retained_bundle_id")),
+        core::GraphRevision(Text(capture, "graph_revision")),
+        {}};
+    return decoded;
+  }
   if (command == "status") {
     RequireExactObjectSize(root, 2U, "status command");
     return Command{CommandKind::kStatus};
@@ -3326,6 +3420,85 @@ StopCertificateRefValue(const core::StopCertificateRefDTO &value) {
        CanonicalValue(static_cast<double>(value.stop_generation.value()))},
       {"stop_id", CanonicalValue(value.stop_id.value())},
   });
+}
+
+[[nodiscard]] CanonicalValue
+ProgramExecutionScopeValue(const core::ProgramExecutionScopeStateDTO &value) {
+  // Group sparse node indices by state. Repeating field names for each of
+  // 100,000 captured nodes exceeds the bounded native response envelope.
+  CanonicalValue::Array held, stopping, faulted, pending;
+  for (const auto &node : value.held_nodes) {
+    auto *indices =
+        node.state == core::ProgramNodeHoldStateDTO::kHeld       ? &held
+        : node.state == core::ProgramNodeHoldStateDTO::kStopping ? &stopping
+        : node.state == core::ProgramNodeHoldStateDTO::kFaulted  ? &faulted
+                                                                 : nullptr;
+    if (indices != nullptr)
+      indices->emplace_back(static_cast<double>(node.node_index));
+  }
+  for (const auto &effect : value.pending_effects) {
+    pending.emplace_back(CanonicalValue::Object{
+        {"node_index", CanonicalValue(static_cast<double>(effect.node_index))},
+        {"operation_id", CanonicalValue(effect.operation_id.value())},
+        {"participant_id", CanonicalValue(effect.participant_id.value())},
+        {"stop_id", CanonicalValue(effect.stop_id.value())},
+        {"stop_generation",
+         CanonicalValue(static_cast<double>(effect.stop_generation.value()))}});
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"schema_version",
+       CanonicalValue("manyforge.program_execution_scope.v1")},
+      {"request_owner_epoch",
+       CanonicalValue(value.request_owner_epoch.value())},
+      {"program_runner_owner_epoch",
+       CanonicalValue(value.program_runner_owner_epoch.value())},
+      {"claim_generation",
+       CanonicalValue(static_cast<double>(value.claim_generation.value()))},
+      {"program_run_id", CanonicalValue(value.program_run_id.value())},
+      {"selection_revision",
+       CanonicalValue(static_cast<double>(value.selection_revision))},
+      {"held_node_indices", CanonicalValue(std::move(held))},
+      {"stopping_node_indices", CanonicalValue(std::move(stopping))},
+      {"faulted_node_indices", CanonicalValue(std::move(faulted))},
+      {"pending_effects", CanonicalValue(std::move(pending))}});
+}
+
+[[nodiscard]] CanonicalValue ProgramSelectionAcceptedValue(
+    const core::ProgramExecutionSelectionAcceptedDTO &value,
+    const std::string &group_id) {
+  const auto indices = [](const auto &source) {
+    CanonicalValue::Array result;
+    for (const auto index : source)
+      result.emplace_back(static_cast<double>(index));
+    return CanonicalValue(std::move(result));
+  };
+  CanonicalValue containment(nullptr);
+  if (value.fresh_containment.has_value()) {
+    const auto &stop = *value.fresh_containment;
+    // Existing operation/Stop queries own recovery evidence. This result
+    // identifies physical work without duplicating its budget/certificate.
+    containment = CanonicalValue(CanonicalValue::Object{
+        {"stop_id", CanonicalValue(stop.stop_id.value())},
+        {"stop_generation",
+         CanonicalValue(static_cast<double>(stop.stop_generation.value()))},
+        {"resolution_disposition", CanonicalValue(std::string(core::to_string(
+                                       stop.resolution_disposition)))}});
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"state", value.state.has_value()
+                    ? ProgramExecutionScopeValue(*value.state)
+                    : CanonicalValue(nullptr)},
+      {"group_id", CanonicalValue(group_id)},
+      {"widened_node_indices", indices(value.widened_node_indices)},
+      {"fresh_containment", std::move(containment)},
+      {"selection_error", value.selection_error.has_value()
+                              ? ErrorValue(*value.selection_error)
+                              : CanonicalValue(nullptr)},
+      {"replay_status",
+       CanonicalValue(value.replay_status ==
+                              core::RequestReplayStatusDTO::kReplayedExact
+                          ? "replayed_exact"
+                          : "accepted_new")}});
 }
 
 [[nodiscard]] CanonicalValue
@@ -6797,10 +6970,15 @@ BuildProductComposition(CompositionBuildInput input) {
       std::move(candidate_client));
   const auto make_participant_resolver =
       [package_root = input.package_root, bundle = input.bundle,
-       model_map = input.model_map](
+       model_map = input.model_map,
+       intrinsic_direct_bindings =
+           std::vector<core::ProgramBindingId>{
+               direct_control_binding->program_binding_id(),
+               direct_control_gripper_program_binding->program_binding_id()}](
           std::vector<core::RuntimeParticipantBinding> physical_bindings) {
         return std::make_shared<ProductBackedRuntimeParticipantResolver>(
-            package_root, bundle, model_map, std::move(physical_bindings));
+            package_root, bundle, model_map, std::move(physical_bindings),
+            intrinsic_direct_bindings);
       };
   const RetainedRuntimeParticipantResolverFactory participant_resolver_factory =
       [make_participant_resolver](
@@ -6809,7 +6987,8 @@ BuildProductComposition(CompositionBuildInput input) {
         return RetainedRuntimeParticipantResolver{
             [resolver](const core::OperationIntentDTO &operation,
                        const std::size_t participant_index) {
-              return resolver->Resolve(operation, participant_index);
+              return resolver->ResolveExecutionParticipant(operation,
+                                                           participant_index);
             }};
       };
   auto target_resolver =
@@ -6818,7 +6997,8 @@ BuildProductComposition(CompositionBuildInput input) {
   RetainedRuntimeParticipantResolver participant_resolver =
       [resolver = target_resolver](const core::OperationIntentDTO &operation,
                                    const std::size_t participant_index) {
-        return resolver->Resolve(operation, participant_index);
+        return resolver->ResolveExecutionParticipant(operation,
+                                                     participant_index);
       };
   const auto reference_collision_model = collision_model;
   const auto reference_runtime_unit_id = *local_runtime_unit_id;
@@ -10311,6 +10491,20 @@ private:
   [[nodiscard]] CanonicalValue
   ExecuteStop(const Command &command,
               core::ResourceAddressedExecutionKernel &addressed_kernel) {
+    if (command.kind == CommandKind::kStopProgramSelection) {
+      const auto result =
+          addressed_kernel.stop_program_selection(*command.program_selection);
+      if (!result.ok())
+        return ErrorResponse(result.error().code, result.error().message,
+                             result.error().details);
+      return CanonicalValue(CanonicalValue::Object{
+          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+          {"command", CanonicalValue("stop_program_selection")},
+          {"ok", CanonicalValue(true)},
+          {"accepted",
+           ProgramSelectionAcceptedValue(
+               result.value(), command.program_selection->group_id)}});
+    }
     const bool ordinary = (command.kind == CommandKind::kStop ||
                            command.kind == CommandKind::kStopProgramRun) &&
                           command.stop.has_value();
@@ -10377,6 +10571,19 @@ private:
 
   [[nodiscard]] CanonicalValue Execute(const Command &command,
                                        Composition &composition) {
+    if (command.kind == CommandKind::kReadProgramExecutionScope) {
+      const auto result =
+          composition.runtime->addressed_kernel->get_program_execution_scope(
+              *command.program_run_id);
+      if (!result.ok())
+        return ErrorResponse(result.error().code, result.error().message,
+                             result.error().details);
+      return CanonicalValue(CanonicalValue::Object{
+          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+          {"command", CanonicalValue("read_program_execution_scope")},
+          {"ok", CanonicalValue(true)},
+          {"scope", ProgramExecutionScopeValue(result.value())}});
+    }
     if (command.kind == CommandKind::kStatus) {
       return StatusResponse(composition);
     }
@@ -10421,6 +10628,7 @@ private:
     }
     if (command.kind == CommandKind::kStop ||
         command.kind == CommandKind::kStopProgramRun ||
+        command.kind == CommandKind::kStopProgramSelection ||
         command.kind == CommandKind::kFullStop ||
         command.kind == CommandKind::kMalformedStop) {
       return ExecuteStop(command, *composition.runtime->addressed_kernel);
@@ -10692,6 +10900,27 @@ private:
                              "the selected native process has no joined "
                              "pick/place sequence owner");
       }
+      const auto validate_origin = [&](const auto &request) {
+        for (const auto *operation :
+             {&request.approach_operation, &request.descend_operation,
+              &request.tool_operation, &request.retreat_operation}) {
+          const auto valid =
+              composition.target_resolver->ValidateExecutionOrigin(*operation);
+          if (!valid.ok())
+            return valid;
+        }
+        return core::Result<void>::Ok();
+      };
+      const auto origin = command.kind == CommandKind::kStartPick
+                              ? validate_origin(*command.pick_planning)
+                              : validate_origin(*command.place_planning);
+      if (!origin.ok()) {
+        return CanonicalValue(CanonicalValue::Object{
+            {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+            {"error", ErrorValue(origin.error())},
+            {"ok", CanonicalValue(false)},
+        });
+      }
       const auto sequence_id = command.kind == CommandKind::kStartPick
                                    ? command.pick_planning->sequence_id
                                    : command.place_planning->sequence_id;
@@ -10766,7 +10995,40 @@ private:
            PickPlacePlanningResultValue(sequence_id, kind, result.value())},
       });
     }
+    if (command.kind == CommandKind::kRegisterProgramCapture) {
+      const auto capture = composition.target_resolver->ResolveProgramCapture(
+          *command.program_capture);
+      const auto result =
+          capture.ok() ? composition.runtime->addressed_kernel
+                             ->register_program_run_capture(capture.value())
+                       : core::Result<void>::Err(capture.error());
+      if (!result.ok()) {
+        return CanonicalValue(CanonicalValue::Object{
+            {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+            {"error", ErrorValue(result.error())},
+            {"ok", CanonicalValue(false)},
+        });
+      }
+      return CanonicalValue(CanonicalValue::Object{
+          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+          {"command", CanonicalValue("register_program_run_capture")},
+          {"ok", CanonicalValue(true)},
+          {"program_run_id",
+           CanonicalValue(capture.value().program_run_id.value())},
+          {"claim_generation", CanonicalValue(static_cast<double>(
+                                   capture.value().claim_generation.value()))},
+      });
+    }
     if (command.kind == CommandKind::kSubmit) {
+      const auto origin = composition.target_resolver->ValidateExecutionOrigin(
+          *command.operation);
+      if (!origin.ok()) {
+        return CanonicalValue(CanonicalValue::Object{
+            {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+            {"error", ErrorValue(origin.error())},
+            {"ok", CanonicalValue(false)},
+        });
+      }
       const auto result =
           composition.runtime->addressed_kernel->execute(*command.operation);
       if (!result.ok()) {
@@ -10864,6 +11126,19 @@ private:
           {"result", RecoveryActionResultValue(result.value())},
       });
     }
+    if (command.kind == CommandKind::kReleaseProgramSelection) {
+      const auto result =
+          composition.runtime->addressed_kernel->release_program_selection(
+              *command.program_selection, command.expected_selection_revision);
+      if (!result.ok())
+        return ErrorResponse(result.error().code, result.error().message,
+                             result.error().details);
+      return CanonicalValue(CanonicalValue::Object{
+          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+          {"command", CanonicalValue("release_program_selection")},
+          {"ok", CanonicalValue(true)},
+          {"scope", ProgramExecutionScopeValue(result.value())}});
+    }
     if (command.kind == CommandKind::kReleaseProgramRunStopFence) {
       const auto result =
           composition.runtime->addressed_kernel->release_program_run_stop_fence(
@@ -10904,6 +11179,7 @@ private:
       case CommandKind::kEvents:
       case CommandKind::kPreviewMotion:
       case CommandKind::kPreviewCapabilityCommand:
+      case CommandKind::kRegisterProgramCapture:
       case CommandKind::kSubmit:
       case CommandKind::kRead:
       case CommandKind::kReadStop:
@@ -10911,6 +11187,9 @@ private:
       case CommandKind::kApplyOperationRecovery:
       case CommandKind::kStop:
       case CommandKind::kStopProgramRun:
+      case CommandKind::kStopProgramSelection:
+      case CommandKind::kReadProgramExecutionScope:
+      case CommandKind::kReleaseProgramSelection:
       case CommandKind::kReleaseProgramRunStopFence:
       case CommandKind::kFullStop:
       case CommandKind::kMalformedStop:
@@ -10951,52 +11230,10 @@ private:
 
   [[nodiscard]] core::Result<void>
   ReconcileDirectControlOperations(Composition &composition) const {
-    auto &kernel = *composition.runtime->addressed_kernel;
-    // Reuse the native owner's reconciliation lane. Browsers neither own nor
-    // trigger release, and ordinary Program runs retain their Runner policy.
-    for (const auto &operation : kernel.get_resident_operations(
-             {direct_control_program_run_id_,
-              direct_control_gripper_program_run_id_})) {
-      const bool completed =
-          operation.state == core::OperationStateKind::kCompleted;
-      const bool clean_stop =
-          operation.state == core::OperationStateKind::kStopped ||
-          operation.state == core::OperationStateKind::kCancelledPreDispatch;
-      if ((!completed && !clean_stop) ||
-          std::any_of(operation.participants.begin(),
-                      operation.participants.end(),
-                      [](const auto &participant) {
-                        return participant.terminal_error.has_value();
-                      }))
-        continue;
-      const auto request_id = manyforge::content_identity::sha256_digest(
-          owner_epoch_.value() + "\nmanual-settlement\n" +
-          operation.operation_id.value() + "\n" +
-          std::to_string(operation.operation_revision.value()));
-      const core::OperationControlRequestDTO request{
-          {core::RequestId(request_id), owner_epoch_, "native.direct_control",
-           operation.operation_id.value()},
-          operation.operation_id,
-          operation.operation_revision,
-          "release owner-confirmed clean terminal manual operation",
-          {}};
-      const auto accepted = completed ? kernel.acknowledge_completed(request)
-                                      : kernel.reset(request);
-      if (!accepted.ok()) {
-        const auto reason = accepted.error().details.find("reason");
-        // The exact Kernel gate wins a concurrent Stop/Reset/settlement. Only
-        // these expected races are reconsidered on the existing owner tick.
-        if (reason != accepted.error().details.end() &&
-            (reason->second == "operation_revision_stale" ||
-             reason->second == "operation_not_resident" ||
-             reason->second == "operation_control_state_invalid" ||
-             reason->second == "operation_control_busy" ||
-             reason->second == "operation_effect_in_flight"))
-          continue;
-        return core::Result<void>::Err(accepted.error());
-      }
-    }
-    return core::Result<void>::Ok();
+    // One exact Kernel claim identifies manual work, independent of caller
+    // labels. Reuse this owner lane; browsers never trigger terminal release.
+    return composition.runtime->addressed_kernel
+        ->reconcile_manual_operation_admission();
   }
 
   void RunReconciliationLane(std::stop_token stop_token) noexcept {

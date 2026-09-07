@@ -806,6 +806,13 @@ class HeadlessHttpClient:
             body=body,
         )
 
+    def program_run_motion_resume(
+        self, program_run_id: str, body: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        return self.request(
+            "POST", f"{self._program_run_path(program_run_id)}/resume-motion", body=body,
+        )
+
     def program_run_full_stop(
         self,
         program_run_id: str,

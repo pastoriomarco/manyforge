@@ -15,7 +15,7 @@ from typing import Any, Final
 import yaml
 
 API_VERSION: Final = "manyforge.maintained_deployment_sources.v1"
-PROGRAM_API_VERSION: Final = "manyforge.program.v1"
+PROGRAM_API_VERSION: Final = "manyforge.program.v2"
 _EXPECTED_HISTORICAL_SOURCE_COMMIT: Final = "c4b075fa6dfb69e463c61f3efa8cfce8de681e8a"
 _ID = re.compile(r"^[a-z][a-z0-9_.-]{0,127}$")
 _HEX40 = re.compile(r"^[0-9a-f]{40}$")

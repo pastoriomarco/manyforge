@@ -284,7 +284,7 @@ def _applied_context(
                 program,
                 own_field="program_revision",
                 identity_domain="program-revision",
-                api_version="manyforge.program.v1",
+                api_version="manyforge.program.v2",
                 label="applied_program.program",
             )
             if isinstance(program, dict)

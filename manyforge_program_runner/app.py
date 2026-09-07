@@ -32,6 +32,8 @@ from .models import (
     ProgramCycleResetRequest,
     ProgramNodeAvailabilityRequest,
     ProgramScenePreparationRequest,
+    ProgramSelectionStopRequest,
+    ProgramSelectionResumeRequest,
     RuntimeBlackboardWriteRequest,
     RuntimeOverrideActionRequest,
     RuntimeOverridePromotionRequest,
@@ -258,7 +260,11 @@ class ProgramRunnerApplicationPort(Protocol):
     def stop_motion(
         self,
         program_run_id: str,
-        request: ProgramRunStopRequest,
+        request: ProgramSelectionStopRequest,
+    ) -> dict[str, Any]: ...
+
+    def resume_motion(
+        self, program_run_id: str, request: ProgramSelectionResumeRequest
     ) -> dict[str, Any]: ...
 
     def full_stop(
@@ -462,7 +468,7 @@ def create_app(runtime: ProgramRunnerApplicationPort) -> FastAPI:
     @app.post("/api/program/runs/{program_run_id}/motion-stop")
     async def stop_motion(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
-        request: ProgramRunStopRequest,
+        request: ProgramSelectionStopRequest,
     ) -> dict[str, Any]:
         if request.program_run_id != program_run_id:
             raise ProgramRunnerError(
@@ -473,6 +479,15 @@ def create_app(runtime: ProgramRunnerApplicationPort) -> FastAPI:
             lambda: runtime.stop_motion(program_run_id, request),
             stop=True,
         )
+
+    @app.post("/api/program/runs/{program_run_id}/motion-resume")
+    async def resume_motion(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        request: ProgramSelectionResumeRequest,
+    ) -> dict[str, Any]:
+        if request.program_run_id != program_run_id:
+            raise ProgramRunnerError("program_run_path_invalid", "Program-run path and body must match")
+        return await control_call(lambda: runtime.resume_motion(program_run_id, request))
 
     @app.post("/api/program/runs/{program_run_id}/full-stop")
     async def full_stop(

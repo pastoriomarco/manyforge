@@ -1,6 +1,6 @@
-api_version: manyforge.program.v1
+api_version: manyforge.program.v2
 program_id: pick_and_place_demo
-program_revision: sha256:b81154bd99347b3feaf9b9a78d5ae5fa3d1ad78b657198a19bc96ed535cde964
+program_revision: sha256:dd703c32fa2cb59f9e30eb75552b924f1940ed224b99aa931a7b6f1411a02698
 program_profile: composable-cell-v1
 name: pick_and_place_demo
 description: >-

@@ -7,9 +7,10 @@ and robot/scene/model semantics remain in their focused owners.
 from __future__ import annotations
 
 from collections.abc import Callable
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from copy import deepcopy
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field
 from threading import Condition, RLock, Thread
 import time
 from typing import Final
@@ -36,8 +37,20 @@ class ProgramSchedulingError(RuntimeError):
     """The bounded scheduler or intervention registry is unavailable."""
 
 
+@dataclass(slots=True)
+class _InterventionEntry:
+    record: ProgramInterventionSnapshot
+    resolution: tuple[str, object] | None = None
+
+
+@dataclass(slots=True)
+class _RunInterventions:
+    node_ids: frozenset[str]
+    entries: dict[str, _InterventionEntry] = field(default_factory=dict)
+
+
 class ProgramInterventionRegistry:
-    """Retain at most one exact authored intervention per Program run."""
+    """One current attempt per captured node, retired with its Program run."""
 
     def __init__(self, *, maximum_retained_runs: int = _MAX_SCHEDULED_RUNS) -> None:
         if (
@@ -46,9 +59,41 @@ class ProgramInterventionRegistry:
         ):
             raise ValueError("intervention retention is outside its bound")
         self._maximum_retained_runs = maximum_retained_runs
-        self._records: dict[str, ProgramInterventionSnapshot] = {}
-        self._resolutions: dict[str, tuple[NodeAttemptIdentity, str, object]] = {}
+        self._runs: dict[str, _RunInterventions] = {}
         self._lock = RLock()
+
+    def register_run(
+        self, program_run_id: str, node_instance_ids: Collection[str]
+    ) -> None:
+        if not isinstance(program_run_id, str) or not program_run_id:
+            raise ValueError("program_run_id must be non-empty text")
+        if not node_instance_ids or any(
+            not isinstance(node, str) or not node for node in node_instance_ids
+        ):
+            raise ValueError("interventions require captured Program nodes")
+        nodes = frozenset(node_instance_ids)
+        with self._lock:
+            if program_run_id in self._runs:
+                raise ProgramSchedulingError(
+                    "Program intervention capture is already registered"
+                )
+            if len(self._runs) >= self._maximum_retained_runs:
+                raise ProgramSchedulingError("intervention retention is full")
+            self._runs[program_run_id] = _RunInterventions(nodes)
+
+    def _run(self, identity: NodeAttemptIdentity) -> _RunInterventions:
+        run = self._runs.get(identity.program_run_id)
+        if run is None or identity.node_instance_id not in run.node_ids:
+            raise ProgramSchedulingError(
+                "intervention identifies an uncaptured Program node"
+            )
+        return run
+
+    def _entry(self, identity: NodeAttemptIdentity) -> _InterventionEntry:
+        entry = self._run(identity).entries.get(identity.node_instance_id)
+        if entry is None or entry.record.identity != identity:
+            raise ProgramSchedulingError("Program recovery identifies a stale attempt")
+        return entry
 
     def require(
         self,
@@ -71,23 +116,54 @@ class ProgramInterventionRegistry:
             owner_assessment=owner_assessment,
         )
         with self._lock:
-            current = self._records.get(identity.program_run_id)
+            run = self._run(identity)
+            current = run.entries.get(identity.node_instance_id)
             if current is not None:
-                if current != record:
+                if current.record != record:
                     raise ProgramSchedulingError(
-                        "Program run already requires another intervention"
+                        "Program node already requires another intervention"
                     )
-                return current
-            if len(self._records) >= self._maximum_retained_runs:
-                raise ProgramSchedulingError("intervention retention is full")
-            self._records[identity.program_run_id] = record
+                return current.record
+            run.entries[identity.node_instance_id] = _InterventionEntry(record)
             return record
 
     def read(self, program_run_id: str) -> ProgramInterventionSnapshot | None:
         if not isinstance(program_run_id, str) or not program_run_id:
             raise ValueError("program_run_id must be non-empty text")
         with self._lock:
-            return self._records.get(program_run_id)
+            run = self._runs.get(program_run_id)
+            if run is None:
+                return None
+            # Preserve the single-focus presentation. An ordinary intervention
+            # must not be hidden by an operator Stop that allows ticking.
+            first = None
+            for entry in run.entries.values():
+                if entry.resolution is not None:
+                    continue
+                if entry.record.policy_parameter != "operator_stop_policy":
+                    return entry.record
+                if first is None:
+                    first = entry.record
+            return first
+
+    def has_operator_stop(self, program_run_id: str) -> bool:
+        """Scheduling query without allocating an all-entry projection."""
+        with self._lock:
+            run = self._runs.get(program_run_id)
+            return run is not None and any(
+                entry.record.policy_parameter == "operator_stop_policy"
+                for entry in run.entries.values()
+            )
+
+    def read_all(
+        self, program_run_id: str
+    ) -> tuple[ProgramInterventionSnapshot, ...]:
+        with self._lock:
+            run = self._runs.get(program_run_id)
+            return (
+                () if run is None
+                else tuple(entry.record for entry in run.entries.values())
+            )
 
     def refresh_owner_assessment(
         self,
@@ -95,11 +171,8 @@ class ProgramInterventionRegistry:
         assessment: Mapping[str, object],
     ) -> ProgramInterventionSnapshot:
         with self._lock:
-            current = self._records.get(identity.program_run_id)
-            if current is None or current.identity != identity:
-                raise ProgramSchedulingError(
-                    "Program recovery assessment identifies a stale attempt"
-                )
+            entry = self._entry(identity)
+            current = entry.record
             updated = ProgramInterventionSnapshot(
                 identity=current.identity,
                 reason_code=current.reason_code,
@@ -109,7 +182,7 @@ class ProgramInterventionRegistry:
                 owner_task_id=current.owner_task_id,
                 owner_assessment=assessment,
             )
-            self._records[identity.program_run_id] = updated
+            entry.record = updated
             return updated
 
     def resolve(
@@ -122,40 +195,37 @@ class ProgramInterventionRegistry:
         if action not in {"retry", "manual_success", "manual_failure"}:
             raise ValueError("Program recovery resolution is unsupported")
         with self._lock:
-            current = self._records.get(identity.program_run_id)
-            if current is None or current.identity != identity:
-                raise ProgramSchedulingError(
-                    "Program recovery resolution is stale"
-                )
-            existing = self._resolutions.get(identity.program_run_id)
-            resolution = (identity, action, deepcopy(result))
-            if existing is not None and existing != resolution:
+            entry = self._entry(identity)
+            resolution = (action, deepcopy(result))
+            if entry.resolution is not None and entry.resolution != resolution:
                 raise ProgramSchedulingError(
                     "Program recovery already has another resolution"
                 )
-            self._resolutions[identity.program_run_id] = resolution
+            entry.resolution = resolution
 
     def consume_resolution(
         self, identity: NodeAttemptIdentity
     ) -> tuple[str, object] | None:
         with self._lock:
-            current = self._resolutions.get(identity.program_run_id)
-            if current is None:
+            run = self._run(identity)
+            entry = run.entries.get(identity.node_instance_id)
+            if entry is None:
                 return None
-            if current[0] != identity:
+            if entry.record.identity != identity:
                 raise ProgramSchedulingError(
                     "Program recovery resolution identifies another attempt"
                 )
-            self._resolutions.pop(identity.program_run_id, None)
-            self._records.pop(identity.program_run_id, None)
-            return current[1], deepcopy(current[2])
+            if entry.resolution is None:
+                return None
+            action, result = entry.resolution
+            del run.entries[identity.node_instance_id]
+            return action, deepcopy(result)
 
     def release(self, program_run_id: str) -> None:
         if not isinstance(program_run_id, str) or not program_run_id:
             raise ValueError("program_run_id must be non-empty text")
         with self._lock:
-            self._records.pop(program_run_id, None)
-            self._resolutions.pop(program_run_id, None)
+            self._runs.pop(program_run_id, None)
 
 
 class ProgramRunTickHost:
@@ -326,6 +396,7 @@ class ProgramRunTickHost:
         self,
         program_run_id: str,
         *,
+        group_id: str = "all",
         reason: str | None = None,
         stop_request_id: str | None = None,
     ) -> ProgramRunSnapshot:
@@ -333,12 +404,40 @@ class ProgramRunTickHost:
 
         snapshot = self._owner.stop_motion(
             program_run_id,
+            group_id=group_id,
             reason=reason,
             stop_request_id=stop_request_id,
         )
         self.schedule(program_run_id)
         self._observe_state(snapshot)
         return snapshot
+
+    def resume_motion(
+        self,
+        program_run_id: str,
+        *,
+        expected_selection_revision: int,
+        request_id: str,
+        group_id: str = "all",
+        reason: str | None = None,
+    ) -> ProgramRunSnapshot:
+        try:
+            return self._owner.resume_motion(
+                program_run_id,
+                expected_selection_revision=expected_selection_revision,
+                request_id=request_id,
+                group_id=group_id,
+                reason=reason,
+            )
+        finally:
+            # Cleanup or an explicit reconciliation may have changed the
+            # current view even when the release reply was lost. No retries.
+            snapshot = self._owner.read(program_run_id)
+            if snapshot.state in {
+                ProgramRunState.RUNNING, ProgramRunState.INTERVENTION_REQUIRED,
+            }:
+                self.schedule(program_run_id)
+            self._observe_state(snapshot)
 
     def full_stop(
         self,

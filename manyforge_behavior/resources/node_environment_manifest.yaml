@@ -6,10 +6,10 @@
     "catalog_id": "manyforge_builtin",
     "content_version": "2.0.0"
   },
-  "environment_digest": "sha256:7c6a2de5c906e09f494a76da5a2ac5a3f7e09e09c499ef00efae57163897238f",
+  "environment_digest": "sha256:a11425cf0c23c90f0dce1104d058b4dfbdd982e89e758e54f3eb3712b927990d",
   "executable_packages": [
     {
-      "content_digest": "sha256:3bf6028e37aea6211ac35d13306ecfcedcea8a67d08044b7f4cec8fc102e660f",
+      "content_digest": "sha256:ddde97ea8c6eb207227bc03272bcf0596cd2df7686f20104bb155850e20bc0c3",
       "executable_package_id": "manyforge_behavior",
       "package_format": "manyforge.python-source-package.v1",
       "package_version": "0.1.0"
@@ -354,7 +354,7 @@
       "source_id": "python-module:manyforge_behavior.cclc_program_port"
     },
     {
-      "content_digest": "sha256:04af0a51d62fd77083d427df15dd7db188cf80143b0df690ff3a342cfe30add0",
+      "content_digest": "sha256:2833c2ef319db36200c6d308682ec2542183eb6c25f9ace5cb30b91e8ce26c5c",
       "executable_package_id": "manyforge_behavior",
       "source_id": "python-module:manyforge_behavior.cli"
     },
@@ -394,7 +394,7 @@
       "source_id": "python-module:manyforge_behavior.json_scalars"
     },
     {
-      "content_digest": "sha256:2080227fd66e665649865d335a02f8a25f2e166aac9ee781b6353fe3f5d1f22a",
+      "content_digest": "sha256:638f64a3bc2afbbdbaed9f3f36fd0318b28e5dbd97577a79594049f84c42ea48",
       "executable_package_id": "manyforge_behavior",
       "source_id": "python-module:manyforge_behavior.kernel_client"
     },
@@ -479,12 +479,12 @@
       "source_id": "python-module:manyforge_behavior.nodes.simulation"
     },
     {
-      "content_digest": "sha256:5b9c0088913a2c37910710a9b5010f37576911c333dabf9b0545ab42bd41bb89",
+      "content_digest": "sha256:4776dc306253ecb11afc0ca4a7c62de36236e8289455b7d00087e7a431ccc838",
       "executable_package_id": "manyforge_behavior",
       "source_id": "python-module:manyforge_behavior.nodes.stop_policy"
     },
     {
-      "content_digest": "sha256:b0479cc28d62ed69b5b0d8a19c9f0b66c5b96f13540496ba06116afc3b20dc70",
+      "content_digest": "sha256:c9913f5e274cee9807cdbcb565c57ea8ac2c31c82b8e189ea243e8b0e878d090",
       "executable_package_id": "manyforge_behavior",
       "source_id": "python-module:manyforge_behavior.nodes.v2_owner"
     },
@@ -494,7 +494,7 @@
       "source_id": "python-module:manyforge_behavior.nodes.v2_pure"
     },
     {
-      "content_digest": "sha256:15add654f1ca04cb710a12eb316226fc29bca434884a08e84a4b05bf5dd05842",
+      "content_digest": "sha256:2738dd1ade7c365a0665f0f4ab3ffb4789263593dbe22adc32b6b0bd7bf5247e",
       "executable_package_id": "manyforge_behavior",
       "source_id": "python-module:manyforge_behavior.orchestration_ports"
     },
@@ -504,27 +504,27 @@
       "source_id": "python-module:manyforge_behavior.orchestration_values"
     },
     {
-      "content_digest": "sha256:7a9dd9b8a6fd783f7a26eb649ac4bfab659b6f031caa7697363a1c2321b4dabc",
+      "content_digest": "sha256:ecb58489e8755b24fc1f8210b541be5838bed27410d41f998112eb19a5868b6c",
       "executable_package_id": "manyforge_behavior",
       "source_id": "python-module:manyforge_behavior.production_ports"
     },
     {
-      "content_digest": "sha256:7e71158ad8c2d5bebb1172fab9d4473cf965573e14292884cfbf692fcb032e4e",
+      "content_digest": "sha256:33491f251558ecb86b85281d96a20d7bf0833030eb5c5e09afe1ce927611aa6e",
       "executable_package_id": "manyforge_behavior",
       "source_id": "python-module:manyforge_behavior.program"
     },
     {
-      "content_digest": "sha256:8fd03b02bf93fba76c43edd53e49eb290814376046cd7e98901d5d28181808e8",
+      "content_digest": "sha256:bc48e0f2abea0e92c5f40421f5ac12e283b61b1b25ca553a163e7862dd514d05",
       "executable_package_id": "manyforge_behavior",
       "source_id": "python-module:manyforge_behavior.program_run_owner"
     },
     {
-      "content_digest": "sha256:a476e5208f5c579b48ba9709a92d0b23bddb13e3303638d010c821b1d62747f9",
+      "content_digest": "sha256:94e55f9868588005755616731dbbf3b26d91dcea2713bdf5c27e6db91d7aa36a",
       "executable_package_id": "manyforge_behavior",
       "source_id": "python-module:manyforge_behavior.program_runtime"
     },
     {
-      "content_digest": "sha256:9a09f7d126d2bfd7d8a60a2364ad1eb494686d4a4f300c4962441cb48ce1a5a9",
+      "content_digest": "sha256:5359c35658549b3499df29d56b41dc0967fcbfa02623ea6cde3edf227376bf8d",
       "executable_package_id": "manyforge_behavior",
       "source_id": "python-module:manyforge_behavior.program_scheduling"
     },
@@ -534,7 +534,7 @@
       "source_id": "python-module:manyforge_behavior.reason_codes"
     },
     {
-      "content_digest": "sha256:a4e5362a118a9f32215a88f943744a9bb07583daa5405d9dab6565278700be5e",
+      "content_digest": "sha256:65b07dce4d645a397c51ab83a467a678a2a599bccda4381822302047d84775b7",
       "executable_package_id": "manyforge_behavior",
       "source_id": "python-module:manyforge_behavior.recovery"
     },
@@ -559,7 +559,7 @@
       "source_id": "python-module:manyforge_behavior.runtime_resources"
     },
     {
-      "content_digest": "sha256:17265f43436ea2f91b146aeb2eb59be9e139adb83346e45f28f917b3786d6d37",
+      "content_digest": "sha256:40a2980f16799c6b28f918dfda777f2f4dbefd3b80fbef6f143829c86b5b527b",
       "executable_package_id": "manyforge_behavior",
       "source_id": "python-module:manyforge_behavior.scenarios"
     },

@@ -66,6 +66,7 @@ struct OperationParticipantStateDTO final {
   double progress{};
   std::vector<ResourceId> resources;
   std::optional<ErrorDTO> terminal_error;
+  std::optional<ProgramNodeExecutionScopeDTO> execution_scope{};
 
   friend bool operator==(const OperationParticipantStateDTO&,
                          const OperationParticipantStateDTO&) = default;
@@ -93,6 +94,13 @@ struct OperationStateDTO final {
 
   friend bool operator==(const OperationStateDTO&, const OperationStateDTO&) = default;
 };
+
+[[nodiscard]] inline bool has_program_execution_scope(const OperationStateDTO& state) noexcept {
+  for (const auto& participant : state.participants) {
+    if (participant.execution_scope.has_value()) return true;
+  }
+  return false;
+}
 
 struct StopOperationTargetDTO final {
   OperationId operation_id;
@@ -391,6 +399,9 @@ struct OperationControlRequestDTO final {
   std::optional<std::string> reason;
   /// Receiving-adapter provenance. Public payloads cannot populate this field.
   RequestAttributionDTO attribution{};
+  /// Private authored control-node origin, distinct from the target operation.
+  /// Public control payloads cannot supply this field.
+  std::optional<ProgramNodeExecutionScopeDTO> execution_scope{};
 
   friend bool operator==(const OperationControlRequestDTO&,
                          const OperationControlRequestDTO&) = default;

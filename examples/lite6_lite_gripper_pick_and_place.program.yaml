@@ -1,6 +1,6 @@
-api_version: manyforge.program.v1
+api_version: manyforge.program.v2
 program_id: lite6_lite_gripper_pick_and_place
-program_revision: sha256:426abfd8c562fe19685c1b8b7e85571ac9e588ae86bee65c14ba3e23972af28a
+program_revision: sha256:c4e6a91da2f0c0cc5bdccb7e1e6c84d758bb1ef30073423aaf3d3b5d4ec5f638
 program_profile: composable-cell-v1
 name: lite6_lite_gripper_pick_and_place
 description: >-

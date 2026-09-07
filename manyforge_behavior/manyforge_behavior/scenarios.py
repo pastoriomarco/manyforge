@@ -25,7 +25,7 @@ from manyforge_behavior.node_environment import NodeEnvironment
 
 SCENARIO_CATALOG_API: Final = "manyforge.scenario_catalog.v1"
 SCENARIO_CATALOG_IDENTITY_DOMAIN: Final = "scenario-catalog-revision"
-PROGRAM_API: Final = "manyforge.program.v1"
+PROGRAM_API: Final = "manyforge.program.v2"
 DEPLOYMENT_API: Final = "manyforge.deployment.v1"
 PROGRAM_BINDING_API: Final = "manyforge.program_binding.v1"
 RETAINED_BUNDLE_API: Final = "manyforge.retained_bundle.v1"

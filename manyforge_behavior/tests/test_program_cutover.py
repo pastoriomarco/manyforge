@@ -59,7 +59,7 @@ def _identified(document: dict[str, Any]) -> dict[str, Any]:
         result,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v1",
+        api_version="manyforge.program.v2",
     )
     return result
 

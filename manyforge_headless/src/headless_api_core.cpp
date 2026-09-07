@@ -234,6 +234,35 @@ const CanonicalValue::Array &RequiredArray(const CanonicalValue &root,
   return *value;
 }
 
+bool ValidateCapturedProgramOrigin(const CanonicalValue &state, bool allowed) {
+  bool captured = false;
+  for (const auto &participant : RequiredArray(state, "participants")) {
+    const auto *scope = participant.find_object_member("execution_scope");
+    if (scope == nullptr)
+      continue;
+    captured = true;
+    Require(allowed && scope->is_object() && scope->as_object().size() == 2U,
+            "headless_operation_event_invalid",
+            "authored origin requires its exact journal version");
+    const auto &node = RequiredString(*scope, "node_instance_id");
+    const auto &attempt = RequiredString(*scope, "node_attempt_id");
+    Require(!node.empty() && node.size() <= 128U &&
+                node.find('\0') == std::string::npos && !attempt.empty() &&
+                attempt.size() <= 512U &&
+                attempt.find('\0') == std::string::npos,
+            "headless_operation_event_invalid",
+            "authored origin is invalid or unbounded");
+  }
+  if (captured) {
+    const auto &order = RequiredMember(state, "journal_capture_order");
+    Require(order.is_string() &&
+                content_identity::parse_nonnegative_int64(order) > 0,
+            "headless_operation_event_invalid",
+            "authored origin requires an ordered snapshot");
+  }
+  return captured;
+}
+
 bool IsOperationFaultState(const std::string_view state) noexcept {
   return state == "failed" || state == "interrupted" ||
          state == "intervention_required";
@@ -1343,8 +1372,9 @@ CanonicalValue HeadlessApiCore::IngestOperationEvent(
     const auto stop_id = RequiredString(acceptance, "stop_id");
     const auto stop_generation =
         RequiredCounter(acceptance, "stop_generation", 1U);
-    Require(RequiredString(journal_payload, "api_version") ==
-                    "manyforge.stop_acceptance_projection.v2" &&
+    const auto api = RequiredString(journal_payload, "api_version");
+    const bool scoped = api == "manyforge.stop_acceptance_projection.v3";
+    Require((scoped || api == "manyforge.stop_acceptance_projection.v2") &&
                 accepted.is_object() && affected_state.is_object() &&
                 intent.is_object() && request_id.has_value() &&
                 RequiredString(acceptance, "owner_epoch") ==
@@ -1358,6 +1388,12 @@ CanonicalValue HeadlessApiCore::IngestOperationEvent(
                 effect_pending == (entry_state == "active"),
             "headless_operation_event_invalid",
             "Stop acceptance projection does not match its durable envelope");
+    bool captured = false;
+    for (const auto &operation : RequiredArray(affected_state, "operations")) {
+      captured = ValidateCapturedProgramOrigin(operation, scoped) || captured;
+    }
+    Require(captured == scoped, "headless_operation_event_invalid",
+            "Stop projection version does not match authored origin");
   } else if (stop_terminal_projection) {
     const auto &acceptance = RequiredMember(journal_payload, "acceptance");
     const auto &attempted_stages =
@@ -1463,7 +1499,8 @@ CanonicalValue HeadlessApiCore::IngestOperationEvent(
   } else {
     const auto record_api = RequiredString(journal_payload, "api_version");
     Require((record_api == "manyforge.operation_journal_record.v1" ||
-             record_api == "manyforge.operation_journal_record.v2") &&
+             record_api == "manyforge.operation_journal_record.v2" ||
+             record_api == "manyforge.operation_journal_record.v3") &&
                 RequiredString(journal_payload, "owner_epoch") ==
                     source_owner_epoch &&
                 RequiredBool(journal_payload, "effect_pending") ==
@@ -1487,6 +1524,13 @@ CanonicalValue HeadlessApiCore::IngestOperationEvent(
                     *operation_revision,
             "headless_operation_event_invalid",
             "operation event state does not match its durable envelope");
+    const bool captured_origin = ValidateCapturedProgramOrigin(
+        *operation_state,
+        record_api == "manyforge.operation_journal_record.v3");
+    Require(captured_origin ==
+                (record_api == "manyforge.operation_journal_record.v3"),
+            "headless_operation_event_invalid",
+            "journal version does not match authored origin");
   }
   const auto event_type =
       OperationHistoryEventType(record_kind, journal_payload);

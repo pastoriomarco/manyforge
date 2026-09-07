@@ -682,6 +682,7 @@ class ProgramRuntimeControls:
         owner_epoch: str,
         intervention,
         policy: Mapping[str, Any],
+        selection_revision: int | None = None,
     ) -> dict[str, Any] | None:
         if intervention is None:
             return None
@@ -862,6 +863,10 @@ class ProgramRuntimeControls:
             "policy": projected_policy,
             "recovery_fences": deepcopy(self._recovery_fences),
         }
+        if selection_revision is not None:
+            # The opaque offer also fences a newer selection Stop even when
+            # it reuses the same physical Stop certificate.
+            material["selection_revision"] = selection_revision
         offer_key = _digest("manyforge.cycle_recovery_offer.semantic.v2", material)
         with self._lock:
             if self._offer_key == offer_key and self._offer is not None:

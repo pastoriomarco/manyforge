@@ -29,6 +29,7 @@ from manyforge_behavior.program import (
     Program,
     ProgramValidationError,
     merge_param_patch,
+    parse_execution_groups,
 )
 
 from .authoring_forest import (
@@ -345,11 +346,11 @@ def _node_policy_arguments(
         "recovery_policy",
         "operator_stop_policy",
     }
-    if set(arguments) != expected_fields:
+    if set(arguments) - {"execution_groups"} != expected_fields:
         _error(
             "draft_arguments_invalid",
             f"{_NODE_POLICY_MUTATION} requires exactly "
-            f"{sorted(expected_fields)}",
+            f"{sorted(expected_fields)}, optionally execution_groups",
         )
 
     instance_id = arguments["instance_id"]
@@ -2597,6 +2598,12 @@ class ComposerDraftSession:
             recovery,
             operator_stop,
         ) = _node_policy_arguments(arguments)
+        groups = None
+        if "execution_groups" in arguments:
+            try:
+                groups = parse_execution_groups(arguments["execution_groups"], path="node")
+            except ProgramValidationError as error:
+                _error("draft_arguments_invalid", str(error))
         node = _lookup_exact_instance(document["forest"], instance_id)
         if modification == _DEFAULT_MODIFICATION_POLICY:
             node.pop("modification_policy", None)
@@ -2610,6 +2617,10 @@ class ComposerDraftSession:
             node.pop("operator_stop_policy", None)
         else:
             node["operator_stop_policy"] = operator_stop
+        if groups == "inherit":
+            node.pop("execution_groups", None)
+        elif groups is not None:
+            node["execution_groups"] = groups if isinstance(groups, str) else list(groups)
         return {"updated_instance_id": instance_id}
 
     @staticmethod

@@ -1220,7 +1220,8 @@ class Workbench:
         print("starting Vite HMR", flush=True)
         vite = subprocess.Popen(
             (
-                "npm", "run", "dev", "--", "--host", "0.0.0.0",
+                "node", str(FRONTEND_ROOT / "node_modules/vite/bin/vite.js"),
+                "--host", "0.0.0.0",
                 "--port", str(self.frontend_port),
             ),
             cwd=FRONTEND_ROOT,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from typing import Any
 
 import py_trees
@@ -51,6 +52,20 @@ class RecoveryAwareNode(py_trees.decorators.Decorator):
             self._identity = self._attempt_source.begin(self._node_instance_id)
         return self._identity
 
+    def tick(self) -> Iterator[py_trees.behaviour.Behaviour]:
+        # The normal Decorator tick visits its child before update(). A held
+        # failed child must not initialise a new attempt merely because an
+        # independent Parallel sibling was resumed.
+        if not self._held:
+            yield from super().tick()
+            return
+        status = self.update()
+        if status is not py_trees.common.Status.RUNNING:
+            self._held = False
+            self.stop(status)
+        self.status = status
+        yield self
+
     def update(self) -> py_trees.common.Status:
         if self._held:
             identity = self._exact_identity()
@@ -70,29 +85,21 @@ class RecoveryAwareNode(py_trees.decorators.Decorator):
         if self.decorated.status is not py_trees.common.Status.FAILURE:
             return self.decorated.status
         identity = self._exact_identity()
-        current = self._recovery_port.read(identity.program_run_id)
-        if current is None:
-            reason = getattr(
-                self.decorated, "failure_reason_code", None
-            ) or "program_node_failed"
-            message = getattr(self.decorated, "failure_message", "")
-            owner_context = getattr(
-                self.decorated, "owner_recovery_context", None
-            )
-            owner_context = (
-                dict(owner_context)
-                if isinstance(owner_context, dict)
-                else {}
-            )
-            self._recovery_port.require(
-                identity,
-                reason_code=reason,
-                message=message,
-                policy_parameter="recovery_policy",
-                **owner_context,
-            )
-        elif current.identity != identity:
-            raise RuntimeError("Program run already holds another recovery")
+        reason = getattr(
+            self.decorated, "failure_reason_code", None
+        ) or "program_node_failed"
+        message = getattr(self.decorated, "failure_message", "")
+        owner_context = getattr(
+            self.decorated, "owner_recovery_context", None
+        )
+        owner_context = dict(owner_context) if isinstance(owner_context, dict) else {}
+        self._recovery_port.require(
+            identity,
+            reason_code=reason,
+            message=message,
+            policy_parameter="recovery_policy",
+            **owner_context,
+        )
         self._held = True
         return py_trees.common.Status.RUNNING
 

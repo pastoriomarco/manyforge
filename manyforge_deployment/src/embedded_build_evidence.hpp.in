@@ -13,6 +13,9 @@ struct BuildEvidenceRow final {
 inline constexpr std::string_view kNodeEnvironmentManifest =
     R"mf_node_env(@MANYFORGE_EMBEDDED_NODE_ENVIRONMENT_MANIFEST@)mf_node_env";
 
+inline constexpr std::string_view kNodeCatalog =
+    R"mf_node_cat(@MANYFORGE_EMBEDDED_NODE_CATALOG@)mf_node_cat";
+
 inline constexpr std::array<BuildEvidenceRow,
                             @MANYFORGE_COMPILER_SOURCE_COUNT@>
     kCompilerSourceInputs{{

@@ -121,8 +121,13 @@ using RetainedReferenceResolverFactory =
     std::function<std::shared_ptr<core::IReferencePoseResolver>(
         const std::vector<std::shared_ptr<RetainedObservedStateChannel>> &)>;
 
+struct RetainedResolvedParticipant final {
+  core::RuntimeParticipantBinding binding;
+  bool intrinsic_direct_control{};
+};
+
 using RetainedRuntimeParticipantResolver =
-    std::function<core::Result<core::RuntimeParticipantBinding>(
+    std::function<core::Result<RetainedResolvedParticipant>(
         const core::OperationIntentDTO &, std::size_t)>;
 
 using RetainedRuntimeParticipantResolverFactory =

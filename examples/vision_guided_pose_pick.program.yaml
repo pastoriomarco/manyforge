@@ -1,6 +1,6 @@
-api_version: manyforge.program.v1
+api_version: manyforge.program.v2
 program_id: vision_guided_pose_pick
-program_revision: sha256:6e0d65602f1563fddae7fb94ab47d3a0dbacbd940ce636599a435a435f9180d0
+program_revision: sha256:b3a8e45113ff4cf9c64b549008c4c64cd9d0a800e26a662272db571d79c047c3
 program_profile: composable-cell-v1
 name: vision_guided_pose_pick
 description: >-

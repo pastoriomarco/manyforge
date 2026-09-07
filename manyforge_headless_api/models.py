@@ -466,6 +466,21 @@ class ProgramRunStopRequest(ExecutionControlAttributionRequest):
         )
 
 
+class ProgramSelectionStopRequest(ProgramRunStopRequest):
+    """Stop immutable Program membership, never caller-selected operations."""
+
+    group_id: Annotated[
+        str, Field(pattern=r"^[a-z][a-z0-9_.-]*$", min_length=1, max_length=128)
+    ] = "all"
+
+
+class ProgramSelectionResumeRequest(ProgramSelectionStopRequest):
+    """Reassess and release one selection of the exact current Program run."""
+
+    expected_run_revision: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
+    expected_selection_revision: Annotated[int, Field(ge=0, le=9_007_199_254_740_991)]
+
+
 class ProgramCycleResetRequest(ExecutionControlAttributionRequest):
     program_run_id: str
     expected_owner_epoch: str

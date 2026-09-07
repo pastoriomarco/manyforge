@@ -85,6 +85,39 @@ class SteadyClock final : public IClock {
   }
 };
 
+class GatedClock final : public IClock {
+ public:
+  TimePoint now() const override {
+    const auto captured = time.load();
+    if (block_next_.exchange(false)) {
+      std::unique_lock lock(mutex_);
+      entered_ = true;
+      changed_.notify_all();
+      changed_.wait(lock, [this] { return released_; });
+    }
+    return captured;
+  }
+
+  void BlockNextRead() { block_next_.store(true); }
+  bool WaitForRead() {
+    std::unique_lock lock(mutex_);
+    return changed_.wait_for(lock, 1s, [this] { return entered_; });
+  }
+  void Release() {
+    std::lock_guard lock(mutex_);
+    released_ = true;
+    changed_.notify_all();
+  }
+  std::atomic<TimePoint> time{100};
+
+ private:
+  mutable std::atomic<bool> block_next_{};
+  mutable std::mutex mutex_;
+  mutable std::condition_variable changed_;
+  mutable bool entered_{};
+  bool released_{};
+};
+
 class RecordingReceiver final : public IStopControlWorkReceiver {
  public:
   void ProgressStop(const StopControlWorkToken token) noexcept override {
@@ -203,6 +236,90 @@ TEST(BoundedStopControlExecutorTest, DeadlineRearmCoalescesAndCancellationPreven
   EXPECT_EQ(receiver.Count(token), 2U);
 }
 
+TEST(BoundedStopControlExecutorTest, SameTokenRearmDuringInitialCallbackIsNotConsumedByDedup) {
+  SteadyClock clock;
+  RecordingReceiver receiver;
+  BoundedStopControlExecutor executor(2U, clock, receiver);
+  const StopControlWorkToken token{0U, 1U};
+  const auto deadline = clock.now();
+  receiver.Block(token);
+  executor.ArmDeadline(token, deadline);
+  executor.Publish(token);
+  const bool entered = receiver.WaitForCount(1U);
+  if (entered) executor.ArmDeadline(token, deadline);
+  receiver.Release();
+  ASSERT_TRUE(entered);
+  EXPECT_TRUE(receiver.WaitForCount(2U));
+  executor.CloseIngress();
+  EXPECT_TRUE(executor.DrainFor(1s));
+  EXPECT_EQ(receiver.Count(token), 2U);
+}
+
+TEST(BoundedStopControlExecutorTest,
+     FutureDeadlineBecomingDueDuringInitialCallbackStillProgresses) {
+  class Clock final : public IClock {
+   public:
+    TimePoint now() const override { return time.load(); }
+    std::atomic<TimePoint> time{100};
+  } clock;
+  RecordingReceiver receiver;
+  BoundedStopControlExecutor executor(2U, clock, receiver);
+  const StopControlWorkToken token{0U, 1U};
+  receiver.Block(token);
+  executor.ArmDeadline(token, 200);
+  executor.Publish(token);
+  const bool entered = receiver.WaitForCount(1U);
+  clock.time.store(300);
+  receiver.Release();
+  ASSERT_TRUE(entered);
+  EXPECT_TRUE(receiver.WaitForCount(2U));
+  executor.CloseIngress();
+  EXPECT_TRUE(executor.DrainFor(1s));
+  EXPECT_EQ(receiver.Count(token), 2U);
+}
+
+TEST(BoundedStopControlExecutorTest, DeadlineClaimCannotConsumeConcurrentCancelRearmOrSlotReuse) {
+  for (const int schedule : {0, 1, 2}) {
+    SCOPED_TRACE(schedule);
+    const bool cancel = schedule == 2;
+    const bool reuse = schedule == 1;
+    GatedClock clock;
+    RecordingReceiver receiver;
+    BoundedStopControlExecutor executor(2U, clock, receiver);
+    const StopControlWorkToken old{0U, 1U};
+    const StopControlWorkToken next{0U, reuse ? 2U : 1U};
+    executor.Publish(old);
+    ASSERT_TRUE(receiver.WaitForCount(1U));
+    clock.BlockNextRead();
+    executor.ArmDeadline(old, 0);
+    const bool entered = clock.WaitForRead();
+    if (cancel) {
+      executor.CancelDeadline(old);
+    } else {
+      executor.ArmDeadline(next, 200);
+      if (reuse) executor.CancelDeadline(old);  // must not cancel the new generation
+    }
+    // This later slot proves the blocked scan has resumed without a sleep.
+    executor.Publish({1U, 1U});
+    clock.Release();
+    ASSERT_TRUE(entered);
+    EXPECT_TRUE(receiver.WaitForCount(2U));
+    EXPECT_EQ(receiver.Count(old), 1U);
+    if (reuse) {
+      EXPECT_EQ(receiver.Count(next), 0U);  // not yet published
+    }
+    if (!cancel) {
+      clock.time.store(300);
+      executor.Publish(next);
+      executor.Publish({1U, 2U});
+      EXPECT_TRUE(receiver.WaitForCount(4U));
+      EXPECT_EQ(receiver.Count(next), reuse ? 1U : 2U);
+    }
+    executor.CloseIngress();
+    EXPECT_TRUE(executor.DrainFor(1s));
+  }
+}
+
 TEST(BoundedStopControlExecutorTest, DedicatedFullStopSlotProgressesAtMaximumCorrelationCapacity) {
   SteadyClock clock;
   RecordingReceiver receiver;
@@ -276,6 +393,42 @@ TEST(BoundedStopControlExecutorTest, CloseAndDrainNeverOutliveAnInFlightReceiver
   EXPECT_EQ(destruction.wait_for(20ms), std::future_status::timeout);
   receiver.Release();
   EXPECT_EQ(destruction.wait_for(1s), std::future_status::ready);
+}
+
+TEST(BoundedStopControlExecutorTest, OpenIngressDrainIncludesCausalWorkPublishedToAnEarlierSlot) {
+  SteadyClock clock;
+  class Receiver final : public IStopControlWorkReceiver {
+   public:
+    void ProgressStop(StopControlWorkToken token) noexcept override {
+      if (token.slot == 1U) {
+        later.ProgressStop(token);
+        executor->ArmDeadline({0U, 1U}, 0);
+        executor->Publish({0U, 1U});
+      } else {
+        earlier.ProgressStop(token);
+      }
+    }
+    RecordingReceiver earlier, later;
+    IStopControlExecutor* executor{};
+  } receiver;
+  receiver.later.Block({1U, 1U});
+  receiver.earlier.Block({0U, 1U});
+  BoundedStopControlExecutor executor(2U, clock, receiver);
+  receiver.executor = &executor;
+  executor.Publish({1U, 1U});
+  const bool later_entered = receiver.later.WaitForCount(1U);
+  auto drain = std::async(std::launch::async, [&] { return executor.DrainFor(1s); });
+  receiver.later.Release();
+  const bool earlier_entered = receiver.earlier.WaitForCount(1U);
+  EXPECT_EQ(drain.wait_for(20ms), std::future_status::timeout);
+  receiver.earlier.Release();
+  ASSERT_TRUE(later_entered);
+  ASSERT_TRUE(earlier_entered);
+  EXPECT_TRUE(drain.get());
+  EXPECT_EQ(receiver.earlier.Count({0U, 1U}), 1U);
+  EXPECT_TRUE(executor.prequalified_ready());  // causal drain precedes CloseIngress
+  executor.CloseIngress();
+  EXPECT_TRUE(executor.DrainFor(1s));
 }
 
 TEST(BoundedStopControlExecutorTest,

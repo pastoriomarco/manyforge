@@ -1,6 +1,6 @@
-api_version: manyforge.program.v1
+api_version: manyforge.program.v2
 program_id: isaac_manipulator_scene_light_collision
-program_revision: sha256:56af68ba0198cddb6fbb03bd68df7bb6a18ec3c1b2432ac4e1c17fd32d9ef9b1
+program_revision: sha256:d5a2e83e43161d13cc148cb4f14ad9d9c23325913f9c0f3a808124de780dc790
 program_profile: composable-cell-v1
 name: isaac_manipulator_scene_light_collision
 description: >-
