@@ -226,8 +226,8 @@ FileDescriptor OpenDirectory(const std::filesystem::path &directory) {
 
 std::optional<SourceSnapshotFileObservation>
 ReadObservedAt(const int directory_fd, const std::string &file_name) {
-  const int descriptor = ::openat(directory_fd, file_name.c_str(),
-                                  O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  const int descriptor =
+      ::openat(directory_fd, file_name.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
   if (descriptor < 0) {
     if (errno == ENOENT) {
       return std::nullopt;

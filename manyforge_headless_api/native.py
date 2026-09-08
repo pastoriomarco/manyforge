@@ -113,26 +113,18 @@ class HeadlessApiConfig:
             or manager_run in execution_run.parents
             or execution_run in manager_run.parents
         ):
-            raise ValueError(
-                "manager_run_root and execution_run_root must be disjoint trees"
-            )
+            raise ValueError("manager_run_root and execution_run_root must be disjoint trees")
         durable_paths = path_values[:-2]
         for durable_path in durable_paths:
             try:
                 resolved = durable_path.resolve(strict=False)
             except (OSError, RuntimeError) as error:
-                raise ValueError(
-                    "Headless durable capabilities cannot be resolved"
-                ) from error
+                raise ValueError("Headless durable capabilities cannot be resolved") from error
             if any(
-                resolved == run_root
-                or run_root in resolved.parents
-                or resolved in run_root.parents
+                resolved == run_root or run_root in resolved.parents or resolved in run_root.parents
                 for run_root in (manager_run, execution_run)
             ):
-                raise ValueError(
-                    "durable Headless paths must be outside disposable run roots"
-                )
+                raise ValueError("durable Headless paths must be outside disposable run roots")
         for label, value in (("cell_id", self.cell_id), ("owner_id", self.owner_id)):
             if (
                 not value
@@ -156,9 +148,7 @@ class HeadlessApiConfig:
                 or unicodedata.normalize("NFC", resource_id) != resource_id
                 or len(resource_id.encode("utf-8")) > 1_024
             ):
-                raise ValueError(
-                    "resource_ids must contain bounded non-empty NFC text"
-                )
+                raise ValueError("resource_ids must contain bounded non-empty NFC text")
         if self.freshness_milliseconds < 1:
             raise ValueError("freshness_milliseconds must be positive")
         if not 0 < self.manager_timeout_seconds <= MAX_MANAGER_COMMAND_TIMEOUT_SECONDS:
@@ -168,9 +158,7 @@ class HeadlessApiConfig:
         if not 0 < self.cclc_timeout_seconds <= 30:
             raise ValueError("cclc_timeout_seconds must be in (0, 30]")
         if not 10 <= self.execution_event_poll_milliseconds <= 5_000:
-            raise ValueError(
-                "execution_event_poll_milliseconds must be between 10 and 5000"
-            )
+            raise ValueError("execution_event_poll_milliseconds must be between 10 and 5000")
         if self.program_runner_url is not None:
             parsed_runner_url = urlsplit(self.program_runner_url)
             if (
@@ -186,9 +174,7 @@ class HeadlessApiConfig:
                     "program_runner_url must be an absolute credential-free HTTP(S) URL"
                 )
         if not 0 < self.program_runner_timeout_seconds <= 60:
-            raise ValueError(
-                "program_runner_timeout_seconds must be in (0, 60]"
-            )
+            raise ValueError("program_runner_timeout_seconds must be in (0, 60]")
         compiler_parts = (
             self.deployment_compiler_path is not None,
             self.deployment_compiler_workspace_root is not None,
@@ -204,9 +190,7 @@ class HeadlessApiConfig:
             assert self.deployment_compiler_path is not None
             assert self.deployment_compiler_workspace_root is not None
             if len(self.deployment_compiler_prepared_roots) != 3:
-                raise ValueError(
-                    "Deployment compiler requires three prepared model roots"
-                )
+                raise ValueError("Deployment compiler requires three prepared model roots")
             compiler_paths = (
                 self.deployment_compiler_path,
                 self.deployment_compiler_workspace_root,
@@ -215,21 +199,14 @@ class HeadlessApiConfig:
             if any(not path.is_absolute() for path in compiler_paths):
                 raise ValueError("Deployment compiler capabilities must be absolute")
             family_ids = tuple(
-                family_id
-                for family_id, _ in self.deployment_compiler_prepared_roots
+                family_id for family_id, _ in self.deployment_compiler_prepared_roots
             )
             if family_ids != tuple(sorted(set(family_ids))):
-                raise ValueError(
-                    "Deployment compiler prepared families must be sorted and unique"
-                )
+                raise ValueError("Deployment compiler prepared families must be sorted and unique")
         if not 0 < self.deployment_compiler_timeout_seconds <= 300:
-            raise ValueError(
-                "deployment_compiler_timeout_seconds must be in (0, 300]"
-            )
+            raise ValueError("deployment_compiler_timeout_seconds must be in (0, 300]")
         if not 1_024 <= self.maximum_request_body_bytes <= 1024 * 1024:
-            raise ValueError(
-                "maximum_request_body_bytes must be between 1024 and 1048576"
-            )
+            raise ValueError("maximum_request_body_bytes must be between 1024 and 1048576")
 
 
 @dataclass(frozen=True, slots=True)
@@ -324,6 +301,10 @@ class HeadlessCorePort(Protocol):
     def history_discovery(self, *, kind: str, after: str, limit: int) -> dict[str, Any]: ...
     def history_detail(self, sequence: int) -> dict[str, Any]: ...
     def record_client_incident(self, **kwargs: Any) -> dict[str, Any]: ...
+
+    def record_program_diagnostic(self, record: Mapping[str, Any]) -> dict[str, Any]: ...
+
+    def record_gripper_confirmation(self, record: Mapping[str, Any]) -> dict[str, Any]: ...
 
     def historian_health(self) -> dict[str, Any]: ...
 
@@ -519,9 +500,10 @@ class NativeHeadlessCore:
             "schema_version",
             "viewer_model_revision",
         }
-        if set(metadata) != expected_fields or metadata.get(
-            "schema_version"
-        ) != "manyforge.viewer_model_asset.v1":
+        if (
+            set(metadata) != expected_fields
+            or metadata.get("schema_version") != "manyforge.viewer_model_asset.v1"
+        ):
             raise HeadlessApiError(
                 "headless_projection_response_invalid",
                 f"native {method} returned unsupported asset metadata",
@@ -539,8 +521,7 @@ class NativeHeadlessCore:
             if (
                 not isinstance(logical_uri, str)
                 or not logical_uri
-                or len(logical_uri.encode("utf-8"))
-                > MAX_VIEWER_MODEL_RESOURCE_URI_BYTES
+                or len(logical_uri.encode("utf-8")) > MAX_VIEWER_MODEL_RESOURCE_URI_BYTES
             ):
                 raise HeadlessApiError(
                     "headless_projection_response_invalid",
@@ -572,8 +553,7 @@ class NativeHeadlessCore:
             "product_id",
         )
         if any(
-            not isinstance(metadata[field], str) or not metadata[field]
-            for field in text_fields
+            not isinstance(metadata[field], str) or not metadata[field] for field in text_fields
         ):
             raise HeadlessApiError(
                 "headless_projection_response_invalid",
@@ -586,10 +566,7 @@ class NativeHeadlessCore:
             "viewer_model_revision",
         ):
             value = metadata[digest_field]
-            if (
-                not isinstance(value, str)
-                or _SHA256_PATTERN.fullmatch(value) is None
-            ):
+            if not isinstance(value, str) or _SHA256_PATTERN.fullmatch(value) is None:
                 raise HeadlessApiError(
                     "headless_projection_response_invalid",
                     f"viewer asset {digest_field} is not a SHA-256 digest",
@@ -827,12 +804,39 @@ class NativeHeadlessCore:
         )
 
     def history_discovery(self, *, kind: str, after: str, limit: int) -> dict[str, Any]:
-        return self._require_object(self._invoke("history_discovery", kind=kind, after=after, limit=limit), method="history_discovery")
+        return self._require_object(
+            self._invoke("history_discovery", kind=kind, after=after, limit=limit),
+            method="history_discovery",
+        )
 
     def record_client_incident(self, **kwargs: Any) -> dict[str, Any]:
         return self._require_object(
             self._invoke("record_client_incident", **kwargs),
             method="record_client_incident",
+        )
+
+    def record_program_diagnostic(self, record: Mapping[str, Any]) -> dict[str, Any]:
+        encoded = rfc8785.dumps(dict(record))
+        if len(encoded) > 64 * 1024:
+            raise HeadlessApiError(
+                "program_diagnostic_invalid",
+                "Program diagnostic exceeds its byte bound",
+            )
+        return self._require_object(
+            self._invoke("record_program_diagnostic", encoded.decode("utf-8")),
+            method="record_program_diagnostic",
+        )
+
+    def record_gripper_confirmation(self, record: Mapping[str, Any]) -> dict[str, Any]:
+        encoded = rfc8785.dumps(dict(record))
+        if len(encoded) > 8192:
+            raise HeadlessApiError(
+                "gripper_confirmation_trace_invalid",
+                "Gripper confirmation trace exceeds its byte bound",
+            )
+        return self._require_object(
+            self._invoke("record_gripper_confirmation", encoded.decode("utf-8")),
+            method="record_gripper_confirmation",
         )
 
     def historian_health(self) -> dict[str, Any]:

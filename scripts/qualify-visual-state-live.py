@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pure visual-observer evidence scoring plus the I9/I live-probe gate.
+"""Pure historical visual-evidence scoring; retired live-collection CLI.
 
 The complete historical probe is preserved at
 ``manyforge@08222188293df8e12f90dc72e204c21f22f92ea1`` (blob
@@ -8,10 +8,11 @@ The complete historical probe is preserved at
 * lines 25-68 and 189-330 supplied the sample value, scalar normalization,
   percentile, summary, and budget checks retained here with explicit bounds;
 * lines 70-187 translated the old snake/camel ``/api/scene/state`` response
-  and performed HTTP sampling.  That route adapter is an I9/I restoration
-  target and is intentionally absent; and
+  and performed HTTP sampling. That route was superseded by the native
+  execution-observation stream and is intentionally absent; and
 * lines 332-440 parsed the old CLI, sampled its route on a clock, and wrote
-  JSON/JSONL evidence.  Live collection and file output also return at I9/I.
+  JSON/JSONL evidence. Current live collection is owned by
+  scripts/qualification/current_workbench_browser_collector.py.
 
 ``Sample`` now means an already-normalized, source-owned observer record.  No
 function in this module discovers a route, fetches Composer state, reads a
@@ -29,13 +30,10 @@ from typing import Any, Final, NoReturn
 
 
 RUNTIME_UNAVAILABLE_REASON_CODE: Final = "composable_cell_runtime_unavailable"
-VISUAL_PROBE_RESTORATION_GATES: Final = ("I9", "I")
 MAX_VISUAL_PROBE_SAMPLES: Final = 1_000_000
 MAX_SAMPLE_TEXT_CHARS: Final = 4_096
 
-DEFAULT_SNAPSHOT_MODES: Final = frozenset(
-    {"visual_snapshot", "visual_snapshot_pending"}
-)
+DEFAULT_SNAPSHOT_MODES: Final = frozenset({"visual_snapshot", "visual_snapshot_pending"})
 DEFAULT_PENDING_MODES: Final = frozenset({"visual_snapshot_pending"})
 DEFAULT_LEGACY_MODES: Final = frozenset({"legacy_live"})
 
@@ -50,8 +48,8 @@ class VisualProbeBoundsError(ValueError):
 
 def _raise_visual_probe_unavailable() -> NoReturn:
     raise VisualProbeUnavailableError(
-        f"{RUNTIME_UNAVAILABLE_REASON_CODE}: the observer-owned live visual "
-        "qualification probe returns at I9/I"
+        f"{RUNTIME_UNAVAILABLE_REASON_CODE}: historical visual collection is retired; "
+        "use scripts/qualification/current_workbench_browser_collector.py"
     )
 
 
@@ -108,9 +106,7 @@ class Sample:
         if not isinstance(self.mode, str):
             raise TypeError("mode must be a string")
         if not self.mode or len(self.mode) > MAX_SAMPLE_TEXT_CHARS:
-            raise ValueError(
-                f"mode must contain 1..{MAX_SAMPLE_TEXT_CHARS} characters"
-            )
+            raise ValueError(f"mode must contain 1..{MAX_SAMPLE_TEXT_CHARS} characters")
         for field_name in (
             "served_from_visual_snapshot",
             "snapshot_stale",
@@ -152,9 +148,7 @@ class Sample:
                 if not isinstance(value, str):
                     raise TypeError(f"{field_name} must be a string or None")
                 if len(value) > MAX_SAMPLE_TEXT_CHARS:
-                    raise ValueError(
-                        f"{field_name} exceeds {MAX_SAMPLE_TEXT_CHARS} characters"
-                    )
+                    raise ValueError(f"{field_name} exceeds {MAX_SAMPLE_TEXT_CHARS} characters")
 
     def to_json(self) -> dict[str, Any]:
         """Project the normalized sample into an artifact-ready mapping."""
@@ -205,9 +199,7 @@ def _optional_int(value: Any) -> int | None:
 
 def _percentile(values: Sequence[float], percentile: float) -> float | None:
     if len(values) > MAX_VISUAL_PROBE_SAMPLES:
-        raise VisualProbeBoundsError(
-            f"values exceeds {MAX_VISUAL_PROBE_SAMPLES} entries"
-        )
+        raise VisualProbeBoundsError(f"values exceeds {MAX_VISUAL_PROBE_SAMPLES} entries")
     percentile_value = _required_nonnegative_float(
         percentile,
         field_name="percentile",
@@ -217,8 +209,7 @@ def _percentile(values: Sequence[float], percentile: float) -> float | None:
     if not values:
         return None
     ordered = sorted(
-        _required_nonnegative_float(value, field_name="values entry")
-        for value in values
+        _required_nonnegative_float(value, field_name="values entry") for value in values
     )
     if len(ordered) == 1:
         return ordered[0]
@@ -243,35 +234,21 @@ def _build_summary(
     if isinstance(samples, (str, bytes)):
         raise TypeError("samples must be a sequence of Sample values")
     if len(samples) > MAX_VISUAL_PROBE_SAMPLES:
-        raise VisualProbeBoundsError(
-            f"samples exceeds {MAX_VISUAL_PROBE_SAMPLES} entries"
-        )
+        raise VisualProbeBoundsError(f"samples exceeds {MAX_VISUAL_PROBE_SAMPLES} entries")
     if not all(isinstance(sample, Sample) for sample in samples):
         raise TypeError("samples must contain only Sample values")
     ok_samples = [sample for sample in samples if sample.ok]
     latencies = [sample.latency_ms for sample in ok_samples]
     mode_counts = Counter(sample.mode for sample in ok_samples)
-    fallback_counts = Counter(
-        sample.fallback_reason or "none" for sample in ok_samples
-    )
+    fallback_counts = Counter(sample.fallback_reason or "none" for sample in ok_samples)
     publisher_errors = Counter(
-        sample.snapshot_publisher_error
-        for sample in ok_samples
-        if sample.snapshot_publisher_error
+        sample.snapshot_publisher_error for sample in ok_samples if sample.snapshot_publisher_error
     )
     stale_count = sum(1 for sample in ok_samples if sample.snapshot_stale)
-    pending_count = sum(
-        1 for sample in ok_samples if sample.mode in pending_modes
-    )
+    pending_count = sum(1 for sample in ok_samples if sample.mode in pending_modes)
     legacy_count = sum(1 for sample in ok_samples if sample.mode in legacy_modes)
-    non_snapshot_count = sum(
-        1 for sample in ok_samples if sample.mode not in snapshot_modes
-    )
-    ages = [
-        sample.snapshot_age_ms
-        for sample in ok_samples
-        if sample.snapshot_age_ms is not None
-    ]
+    non_snapshot_count = sum(1 for sample in ok_samples if sample.mode not in snapshot_modes)
+    ages = [sample.snapshot_age_ms for sample in ok_samples if sample.snapshot_age_ms is not None]
     return {
         "sample_count": len(samples),
         "ok_count": len(ok_samples),
@@ -320,14 +297,11 @@ def _evaluate(
         failures.append(f"observer errors {error_count} > budget {max_error_count}")
     legacy_count = int(summary.get("legacy_count", 0))
     if legacy_count > max_legacy_count:
-        failures.append(
-            f"legacy-mode samples {legacy_count} > budget {max_legacy_count}"
-        )
+        failures.append(f"legacy-mode samples {legacy_count} > budget {max_legacy_count}")
     non_snapshot_count = int(summary.get("non_snapshot_count", 0))
     if non_snapshot_count > max_non_snapshot_count:
         failures.append(
-            "non-snapshot samples "
-            f"{non_snapshot_count} > budget {max_non_snapshot_count}"
+            "non-snapshot samples " f"{non_snapshot_count} > budget {max_non_snapshot_count}"
         )
     publisher_errors = summary.get("publisher_errors", {})
     if publisher_errors:
@@ -335,14 +309,10 @@ def _evaluate(
     latency = summary.get("latency_ms", {})
     p95 = latency.get("p95") if isinstance(latency, Mapping) else None
     if p95 is not None and p95 > max_p95_ms:
-        failures.append(
-            f"visual-observer p95 latency {p95:.1f} ms > budget {max_p95_ms:.1f} ms"
-        )
+        failures.append(f"visual-observer p95 latency {p95:.1f} ms > budget {max_p95_ms:.1f} ms")
     stale_ratio = summary.get("stale_ratio")
     if stale_ratio is not None and stale_ratio > max_stale_ratio:
-        failures.append(
-            f"snapshot stale ratio {stale_ratio:.3f} > budget {max_stale_ratio:.3f}"
-        )
+        failures.append(f"snapshot stale ratio {stale_ratio:.3f} > budget {max_stale_ratio:.3f}")
     pending_ratio = summary.get("pending_ratio")
     if pending_ratio is not None and pending_ratio > max_pending_ratio:
         failures.append(
@@ -363,7 +333,7 @@ def require_visual_probe(
 def main(_argv: list[str] | None = None) -> int:
     print(
         f"{RUNTIME_UNAVAILABLE_REASON_CODE}: historical live visual-state "
-        "collection returns at I9/I",
+        "collection is retired; use scripts/qualification/current_workbench_browser_collector.py",
         file=sys.stderr,
     )
     return 78

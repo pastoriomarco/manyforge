@@ -30,28 +30,28 @@ machine-readable companion to this doc.
   domain-separated content-digest primitives.
 - `manyforge_persistence/` — shared ROS-free mechanical durable-storage
   safety primitives; semantic owners retain their own schemas and state.
-- `manyforge_scene/` — ROS-free canonical-empty logical-scene owner
-  foundation; no live scene surface.
+- `manyforge_scene/` — ROS-free logical-scene owner and revision-bound
+  runtime transactions; renderer/planner scenes remain projections.
 - `manyforge_deployment/` — ROS-free composable-cell decoding, qualification,
   and compiler substrate.
-- `manyforge_component_manager/` — ROS-free C++ runtime-observation and
-  durable-persistence foundation for the Component Manager.
-- `manyforge_roboplan/` — retained planning-model staging and offline
-  RoboPlan import qualification during the destructive cutover; native and
-  ros2_control runtime adapters are intentionally unavailable until their
-  plan restoration gates.
-- `manyforge_behavior/` — build-owned v2 node environment plus explicitly
-  unavailable legacy execution entry points during the cutover.
-- `manyforge_composer/` — structural FastAPI/React authoring shell; runtime,
-  MCP, assistant, and live-viewer ownership is unavailable.
-- `manyforge_assistant_bridge/` — retained protocol hashing and pure
-  supervisor reduction plus historical interaction guidance; the live
-  provider bridge remains removed and unavailable.
+- `manyforge_component_manager/` — ROS-free durable Apply/runtime-convergence
+  owner, hosted by the Manager daemon.
+- `manyforge_roboplan/` — RoboPlan adapter, native execution composition,
+  observed-state publication and model staging. Native availability does not
+  imply a qualified ROS/physical product route.
+- `manyforge_behavior/` — build-owned node environment, typed Program
+  construction, scheduling and thin owner adapters; no robot-effect authority.
+- `manyforge_program_runner/` — independently restartable Program-cycle owner.
+- `manyforge_headless_api/` — bounded REST/WebSocket transport over native owners.
+- `manyforge_composer/` — FastAPI/React authoring and operator shell, native
+  viewer and optional thin MCP adapter; it does not own runtime lifecycle.
+- `manyforge_assistant_bridge/` — bounded direct-provider mediation and Draft
+  callbacks; provider-loop qualification remains separate from MCP availability.
 - `manyforge_ros/`, `manyforge_ros_bringup/` — retained ROS adapter modules
   and bringup helpers; no current ROS product lane.
-- `scripts/` — container qualification and structural-shell helpers;
-  `launch.sh` is an explicit runtime-unavailable boundary.
-- `docs/` — current structural reference plus historical operator runbooks.
+- `scripts/` — container qualification and explicit native development workbench;
+  historical aggregate `launch.sh` remains an unavailable boundary.
+- `docs/` — generated current contracts and explicitly historical operator runbooks.
 
 Specs and ADRs are in a separate private repository (`manyforge_specs`)
 and are not required at runtime. They **are** required for maintainer

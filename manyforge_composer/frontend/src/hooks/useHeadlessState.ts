@@ -203,6 +203,7 @@ export type ExecutionControlCommandKind =
   | 'program_runtime_override_promote'
   | 'program_runtime_blackboard_write'
   | 'program_manual_result_stage'
+  | 'gripper_confirm'
   | 'operation_start'
   | 'operation_stop'
   | 'operation_pause'
@@ -538,6 +539,14 @@ export class HeadlessStateSource implements ExecutionObservationReader {
   };
   readonly getExecutionObservationTransportStatus = () =>
     this.observationTransportStatus;
+  readonly rejectExecutionObservation = (frame: ExecutionObservationFrame): void => {
+    if (frame !== this.latestExecutionObservation || this.observationSocket === null) return;
+    this.publishObservationTransportStatus(
+      'reconnecting',
+      'The measured-state frame does not match the current model; requesting current state.',
+    );
+    this.observationSocket.close(4002, 'execution observation/model changed');
+  };
   readonly subscribeExecutionObservationTransport = (listener: Listener) => {
     this.observationTransportListeners.add(listener);
     return () => this.observationTransportListeners.delete(listener);
@@ -656,7 +665,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
           this.refreshControlCondition();
           // Recover only through a new current snapshot. The backend may have
           // received the command even though this session could not prove it.
-          socket.close(1002, 'command delivery unconfirmed');
+          socket.close(4002, 'command delivery unconfirmed');
         }, CONTROL_COMMAND_DELIVERY_NS / 1_000_000);
       } catch (reason) {
         this.commandReceipts.delete(correlationId);
@@ -770,7 +779,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     this.qualificationRecord.enabled = enabled;
     this.stopConnection('Composer headless source disabled');
     this.stopObservationConnection('Composer viewer source disabled');
-    this.cancelPublications();
+    this.cancelStatePublications();
     this.latest = null;
     this.clearExecutionObservation();
     this.presentedViewer = null;
@@ -819,7 +828,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     this.qualificationRecord.enabled = false;
     this.stopConnection('Composer client unmounted');
     this.stopObservationConnection('Composer client unmounted');
-    this.cancelPublications();
+    this.cancelStatePublications();
     this.shellListeners.clear();
     this.viewerListeners.clear();
     this.executionObservationListeners.clear();
@@ -887,6 +896,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
       this.qualificationRecord.socketActive = false;
       publishHeadlessQualification();
     }
+    this.discardUnappliedExecutionObservation();
     socket?.close(1000, reason);
   }
 
@@ -1136,7 +1146,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
             ? reason.message
             : 'Invalid headless WebSocket projection.',
         );
-        socket.close(1002, 'invalid headless projection');
+        socket.close(4002, 'invalid headless projection');
       }
     };
     socket.onerror = () => {
@@ -1337,7 +1347,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
       );
       if (!admission.accepted) {
         this.publishError(admission.reason);
-        socket.close(1002, 'non-monotonic headless projection');
+        socket.close(4002, 'non-monotonic headless projection');
         return;
       }
       this.controlSnapshotBarrierPending = false;
@@ -1367,7 +1377,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
           ? reason.message
           : 'Invalid headless WebSocket projection.',
       );
-      socket.close(1002, 'invalid headless projection');
+      socket.close(4002, 'invalid headless projection');
     }
   }
 
@@ -1497,7 +1507,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
           && candidate.sourceEpoch === current.sourceEpoch
           && candidate.sourceSequence < current.sourceSequence
         ) {
-          socket.close(1002, 'non-monotonic execution observation');
+          socket.close(4002, 'non-monotonic execution observation');
           return;
         }
         if (
@@ -1507,12 +1517,12 @@ export class HeadlessStateSource implements ExecutionObservationReader {
           && candidate.sourceEpoch === current.sourceEpoch
         ) {
           if (!sameExecutionObservationFrame(current, candidate)) {
-            socket.close(1002, 'changed execution observation at one sequence');
+            socket.close(4002, 'changed execution observation at one sequence');
             return;
           }
           this.publishObservationTransportStatus('live', null);
-          this.appliedExecutionObservation = current;
-          this.sendObservationCredit(current);
+          if (current === this.appliedExecutionObservation) this.sendObservationCredit(current);
+          else this.scheduleExecutionObservation();
           return;
         }
         recordViewerObservationReceived(
@@ -1532,7 +1542,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
           'reconnecting',
           'The live measured-state viewer received an invalid sample and is reconnecting.',
         );
-        socket.close(1002, 'invalid execution observation');
+        socket.close(4002, 'invalid execution observation');
       }
     };
     socket.onerror = () => {
@@ -1694,7 +1704,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     // Transport and semantic availability remove command authority, but they
     // do not erase the last coherent backend presentation or viewer scene.
     this.latestError = error;
-    this.cancelPublications();
+    this.cancelStatePublications();
     this.publishImmediate();
   }
 
@@ -1801,11 +1811,12 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     this.observationFrame = null;
   }
 
-  private cancelPublications(): void {
+  private cancelStatePublications(): void {
     if (this.shellTimer !== null) clearTimeout(this.shellTimer);
     this.shellTimer = null;
     this.cancelViewerFrame();
-    this.cancelObservationFrame();
+    // Cold/control changes must not strand an independently credited joint
+    // frame. Observation teardown owns cancellation of that separate plane.
   }
 }
 

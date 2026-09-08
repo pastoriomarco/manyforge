@@ -524,6 +524,29 @@ public:
     });
   }
 
+  std::string RecordGripperConfirmation(const std::string& record_json) {
+    py::gil_scoped_release release;
+    return Invoke([this, &record_json]() {
+      if (record_json.size() > 8192U)
+        throw OperatorAlarmError("gripper_confirmation_trace_invalid",
+                                 "Gripper confirmation trace exceeds its byte bound");
+      auto record = deployment::parse_strict_json_model_yaml(record_json).root();
+      return core_->RecordGripperConfirmation(std::move(record));
+    });
+  }
+
+  std::string RecordProgramDiagnostic(const std::string& record_json) {
+    py::gil_scoped_release release;
+    return Invoke([this, &record_json]() {
+      if (record_json.size() > 64U * 1024U) {
+        throw OperatorAlarmError("program_diagnostic_invalid",
+                                 "Program diagnostic exceeds its byte bound");
+      }
+      auto record = deployment::parse_strict_json_model_yaml(record_json).root();
+      return core_->RecordProgramDiagnostic(std::move(record));
+    });
+  }
+
   std::string ReconcileHistorianHealth(
       const std::uint64_t expected_generation, std::string request_id,
       std::string request_owner_epoch, std::string source_label,
@@ -655,87 +678,70 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
       "Thin binding over the C++ ManyForge headless runtime API core";
   module.def("compile_deployment_draft",
              &manyforge::headless::CompileDeploymentDraft, py::arg("source"));
+  module.def(
+      "read_control_source_file_hint",
+      [](const std::string& path) { return manyforge::headless::ReadControlSourceFileHint(path); },
+      py::arg("path"), py::call_guard<py::gil_scoped_release>());
   py::class_<HeadlessApiBridge>(module, "HeadlessApiCore")
-      .def(py::init<std::string, std::string, std::string, std::string,
-                    std::string, std::string, std::string, std::string,
-                    std::string, std::vector<std::string>, std::string,
-                    std::optional<std::string>, std::uint64_t, std::size_t,
-                    std::size_t>(),
-           py::arg("projection_root"), py::arg("install_root"),
-           py::arg("artifact_root"), py::arg("program_selection_state_root"),
-           py::arg("node_catalog_path"),
-           py::arg("node_environment_manifest_path"),
-           py::arg("alarm_catalog_path"), py::arg("historian_database_path"),
-           py::arg("cell_id"), py::arg("resource_ids"), py::arg("owner_id"),
-           py::arg("owner_epoch") = std::nullopt,
-           py::arg("freshness_milliseconds") = 2000U,
-           py::arg("historian_queue_capacity") = 1024U,
+      .def(py::init<std::string, std::string, std::string, std::string, std::string, std::string,
+                    std::string, std::string, std::string, std::vector<std::string>, std::string,
+                    std::optional<std::string>, std::uint64_t, std::size_t, std::size_t>(),
+           py::arg("projection_root"), py::arg("install_root"), py::arg("artifact_root"),
+           py::arg("program_selection_state_root"), py::arg("node_catalog_path"),
+           py::arg("node_environment_manifest_path"), py::arg("alarm_catalog_path"),
+           py::arg("historian_database_path"), py::arg("cell_id"), py::arg("resource_ids"),
+           py::arg("owner_id"), py::arg("owner_epoch") = std::nullopt,
+           py::arg("freshness_milliseconds") = 2000U, py::arg("historian_queue_capacity") = 1024U,
            py::arg("historian_record_retention") = 100000U)
       .def("runtime_snapshot", &HeadlessApiBridge::RuntimeSnapshot)
-      .def("node_environment_projection",
-           &HeadlessApiBridge::NodeEnvironmentProjection)
+      .def("node_environment_projection", &HeadlessApiBridge::NodeEnvironmentProjection)
       .def("source_model_projection", &HeadlessApiBridge::SourceModelProjection)
       .def("source_model_context", &HeadlessApiBridge::SourceModelContext)
-      .def("assistant_mode_context", &HeadlessApiBridge::AssistantModeContext,
-           py::arg("mode_id"))
-      .def("scenario_catalog_projection",
-           &HeadlessApiBridge::ScenarioCatalogProjection)
-      .def("scenario_program_selection",
-           &HeadlessApiBridge::ScenarioProgramSelection, py::arg("scenario_id"))
+      .def("assistant_mode_context", &HeadlessApiBridge::AssistantModeContext, py::arg("mode_id"))
+      .def("scenario_catalog_projection", &HeadlessApiBridge::ScenarioCatalogProjection)
+      .def("scenario_program_selection", &HeadlessApiBridge::ScenarioProgramSelection,
+           py::arg("scenario_id"))
       .def("scenario_load_selection", &HeadlessApiBridge::ScenarioLoadSelection,
            py::arg("scenario_id"))
-      .def("prepare_program_apply", &HeadlessApiBridge::PrepareProgramApply,
-           py::arg("scenario_id"), py::arg("scenario_catalog_revision"),
-           py::arg("canonical_program_json"))
-      .def("replay_program_apply", &HeadlessApiBridge::ReplayProgramApply,
-           py::arg("scenario_id"), py::arg("scenario_catalog_revision"),
-           py::arg("program_id"), py::arg("program_revision"),
-           py::arg("expected_applied_record_digest"),
-           py::arg("request_owner_epoch"), py::arg("request_id"))
+      .def("prepare_program_apply", &HeadlessApiBridge::PrepareProgramApply, py::arg("scenario_id"),
+           py::arg("scenario_catalog_revision"), py::arg("canonical_program_json"))
+      .def("replay_program_apply", &HeadlessApiBridge::ReplayProgramApply, py::arg("scenario_id"),
+           py::arg("scenario_catalog_revision"), py::arg("program_id"), py::arg("program_revision"),
+           py::arg("expected_applied_record_digest"), py::arg("request_owner_epoch"),
+           py::arg("request_id"))
       .def("commit_program_apply", &HeadlessApiBridge::CommitProgramApply,
-           py::arg("canonical_preparation_json"),
-           py::arg("expected_applied_record_digest"),
+           py::arg("canonical_preparation_json"), py::arg("expected_applied_record_digest"),
            py::arg("request_owner_epoch"), py::arg("request_id"))
-      .def("applied_program_selection",
-           &HeadlessApiBridge::AppliedProgramSelection)
+      .def("applied_program_selection", &HeadlessApiBridge::AppliedProgramSelection)
       .def("viewer_model_urdf", &HeadlessApiBridge::ViewerModelUrdf)
       .def("viewer_model_resource", &HeadlessApiBridge::ViewerModelResource,
            py::arg("expected_retained_bundle_id"), py::arg("logical_uri"))
       .def("assistant_mode_index", &HeadlessApiBridge::AssistantModeIndex)
-      .def("assistant_mode_projection",
-           &HeadlessApiBridge::AssistantModeProjection, py::arg("mode_id"))
+      .def("assistant_mode_projection", &HeadlessApiBridge::AssistantModeProjection,
+           py::arg("mode_id"))
       .def("alarm_snapshot", &HeadlessApiBridge::AlarmSnapshot,
            py::arg("limit") = std::optional<std::size_t>(32U),
-           py::arg("states") = std::vector<std::string>{},
-           py::arg("ordering") = "default")
+           py::arg("states") = std::vector<std::string>{}, py::arg("ordering") = "default")
       .def("alarm_metrics", &HeadlessApiBridge::AlarmMetrics)
-      .def("acknowledge_alarm", &HeadlessApiBridge::Acknowledge,
-           py::arg("condition_id"), py::arg("activation_id"),
-           py::arg("expected_record_revision"), py::arg("request_id"),
+      .def("acknowledge_alarm", &HeadlessApiBridge::Acknowledge, py::arg("condition_id"),
+           py::arg("activation_id"), py::arg("expected_record_revision"), py::arg("request_id"),
            py::arg("request_owner_epoch"), py::arg("source_label"),
-           py::arg("correlation_id") = std::nullopt,
-           py::arg("transport_kind") = "http",
+           py::arg("correlation_id") = std::nullopt, py::arg("transport_kind") = "http",
            py::arg("adapter_id") = "manyforge.headless.http.v1",
-           py::arg("assurance") = "unverified",
-           py::arg("trusted_principal_id") = std::nullopt,
+           py::arg("assurance") = "unverified", py::arg("trusted_principal_id") = std::nullopt,
            py::arg("reason") = std::nullopt, py::arg("confirmed") = false)
-      .def("acknowledge_all", &HeadlessApiBridge::AcknowledgeAll,
-           py::arg("members"), py::arg("expected_generation"),
-           py::arg("request_id"), py::arg("request_owner_epoch"),
+      .def("acknowledge_all", &HeadlessApiBridge::AcknowledgeAll, py::arg("members"),
+           py::arg("expected_generation"), py::arg("request_id"), py::arg("request_owner_epoch"),
            py::arg("source_label"), py::arg("correlation_id") = std::nullopt,
-           py::arg("transport_kind") = "http",
-           py::arg("adapter_id") = "manyforge.headless.http.v1",
-           py::arg("assurance") = "unverified",
-           py::arg("trusted_principal_id") = std::nullopt,
+           py::arg("transport_kind") = "http", py::arg("adapter_id") = "manyforge.headless.http.v1",
+           py::arg("assurance") = "unverified", py::arg("trusted_principal_id") = std::nullopt,
            py::arg("reason") = std::nullopt, py::arg("confirmed") = false)
-      .def("history", &HeadlessApiBridge::History,
-           py::arg("start_ns") = std::nullopt, py::arg("end_ns") = std::nullopt,
-           py::arg("components") = std::vector<std::string>{},
+      .def("history", &HeadlessApiBridge::History, py::arg("start_ns") = std::nullopt,
+           py::arg("end_ns") = std::nullopt, py::arg("components") = std::vector<std::string>{},
            py::arg("event_types") = std::vector<std::string>{},
            py::arg("before_sequence") = std::nullopt, py::arg("limit") = 1000U)
-      .def("history_query", &HeadlessApiBridge::HistoryQuery,
-           py::arg("start_ns") = std::nullopt, py::arg("end_ns") = std::nullopt,
-           py::arg("components") = std::vector<std::string>{},
+      .def("history_query", &HeadlessApiBridge::HistoryQuery, py::arg("start_ns") = std::nullopt,
+           py::arg("end_ns") = std::nullopt, py::arg("components") = std::vector<std::string>{},
            py::arg("event_types") = std::vector<std::string>{},
            py::arg("before_sequence") = std::nullopt, py::arg("limit") = 32U,
            py::arg("start_utc_ns") = std::nullopt, py::arg("end_utc_ns") = std::nullopt,
@@ -743,43 +749,36 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
            py::arg("correlations") = std::map<std::string, std::string>{},
            py::arg("alarm_phase") = std::nullopt, py::arg("search") = "",
            py::arg("clock_owner") = std::nullopt, py::arg("full_records") = false)
-      .def("history_detail", &HeadlessApiBridge::HistoryDetail,
-           py::arg("sequence"))
-      .def("history_discovery", &HeadlessApiBridge::HistoryDiscovery,
-           py::arg("kind"), py::arg("after") = "", py::arg("limit") = 32U)
+      .def("history_detail", &HeadlessApiBridge::HistoryDetail, py::arg("sequence"))
+      .def("history_discovery", &HeadlessApiBridge::HistoryDiscovery, py::arg("kind"),
+           py::arg("after") = "", py::arg("limit") = 32U)
       .def("record_client_incident", &HeadlessApiBridge::RecordClientIncident,
            py::arg("incident_id"), py::arg("incident_kind"), py::arg("phase"),
-           py::arg("control_session_id"), py::arg("client_incarnation"),
-           py::arg("source_label"), py::arg("reason_code"),
-           py::arg("occurrence_count"), py::arg("maximum_delay_ns"),
+           py::arg("control_session_id"), py::arg("client_incarnation"), py::arg("source_label"),
+           py::arg("reason_code"), py::arg("occurrence_count"), py::arg("maximum_delay_ns"),
            py::arg("first_observed_ns"), py::arg("last_observed_ns"),
            py::arg("causal_context") = std::map<std::string, std::string>{})
       .def("historian_health", &HeadlessApiBridge::HistorianHealth)
-      .def("commit_program_model_attempt",
-           &HeadlessApiBridge::CommitProgramModelAttempt,
+      .def("record_program_diagnostic", &HeadlessApiBridge::RecordProgramDiagnostic,
            py::arg("record_json"))
-      .def("reconcile_historian_health",
-           &HeadlessApiBridge::ReconcileHistorianHealth,
-           py::arg("expected_generation"), py::arg("request_id"),
-           py::arg("request_owner_epoch"), py::arg("source_label"),
-           py::arg("correlation_id") = std::nullopt,
-           py::arg("transport_kind") = "http",
-           py::arg("adapter_id") = "manyforge.headless.http.v1",
-           py::arg("assurance") = "unverified",
-           py::arg("trusted_principal_id") = std::nullopt)
+      .def("record_gripper_confirmation", &HeadlessApiBridge::RecordGripperConfirmation,
+           py::arg("record_json"))
+      .def("commit_program_model_attempt", &HeadlessApiBridge::CommitProgramModelAttempt,
+           py::arg("record_json"))
+      .def("reconcile_historian_health", &HeadlessApiBridge::ReconcileHistorianHealth,
+           py::arg("expected_generation"), py::arg("request_id"), py::arg("request_owner_epoch"),
+           py::arg("source_label"), py::arg("correlation_id") = std::nullopt,
+           py::arg("transport_kind") = "http", py::arg("adapter_id") = "manyforge.headless.http.v1",
+           py::arg("assurance") = "unverified", py::arg("trusted_principal_id") = std::nullopt)
       .def("ingest_operation_event", &HeadlessApiBridge::IngestOperationEvent,
-           py::arg("source_owner_epoch"), py::arg("source_sequence"),
-           py::arg("record_kind"), py::arg("request_id"),
-           py::arg("operation_id"), py::arg("operation_revision"),
-           py::arg("occurred_at_ns"), py::arg("occurred_at_wall"),
-           py::arg("effect_pending"), py::arg("payload_json"),
-           py::arg("payload_digest"))
-      .def("complete_operation_event_snapshot",
-           &HeadlessApiBridge::CompleteOperationEventSnapshot,
+           py::arg("source_owner_epoch"), py::arg("source_sequence"), py::arg("record_kind"),
+           py::arg("request_id"), py::arg("operation_id"), py::arg("operation_revision"),
+           py::arg("occurred_at_ns"), py::arg("occurred_at_wall"), py::arg("effect_pending"),
+           py::arg("payload_json"), py::arg("payload_digest"))
+      .def("complete_operation_event_snapshot", &HeadlessApiBridge::CompleteOperationEventSnapshot,
            py::arg("source_owner_epoch"), py::arg("through_source_sequence"),
            py::arg("current_stop_fault_json") = std::nullopt)
       .def("mark_operation_event_source_unknown",
-           &HeadlessApiBridge::MarkOperationEventSourceUnknown,
-           py::arg("source_owner_epoch"))
+           &HeadlessApiBridge::MarkOperationEventSourceUnknown, py::arg("source_owner_epoch"))
       .def("shutdown", &HeadlessApiBridge::Shutdown);
 }

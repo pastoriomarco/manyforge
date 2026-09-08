@@ -142,6 +142,10 @@ class ManyForgeCollisionEngine final : public core::ICollisionQueryEngine {
   using SharedModelPtr = std::shared_ptr<const SharedModel>;
   using SharedSceneCachePtr = std::shared_ptr<SharedSceneCache>;
 
+  // Cold loading has an N*N geometry-index matrix before SRDF pruning. This
+  // separate envelope is not the runtime logical-body or active-pair budget.
+  static constexpr std::size_t kMaximumRetainedCollisionGeometries = 1024;
+
   /// Parse URDF/SRDF and load immutable Pinocchio model assets once.
   static SharedModelPtr load_shared_model(
       const std::string& model_name,

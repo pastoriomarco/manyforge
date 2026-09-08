@@ -23,12 +23,11 @@ from manyforge_composer.backend.mcp_adapter import (
 )
 from manyforge_composer.backend.security import SecurityConfig
 from manyforge_composer.backend.state import ComposerState
+from manyforge_headless_api.client import HeadlessHttpClient
 
 
 def _security(tmp_path: Path) -> SecurityConfig:
-    return SecurityConfig(
-        allowed_fs_roots=[str(tmp_path)], mcp_allowed_hosts=["testserver"]
-    )
+    return SecurityConfig(allowed_fs_roots=[str(tmp_path)], mcp_allowed_hosts=["testserver"])
 
 
 def _call(client: TestClient, name: str, arguments: dict, *, request_id: int = 1):
@@ -49,13 +48,9 @@ def test_optional_off_does_not_construct_mcp(tmp_path, monkeypatch):
         raise AssertionError("MCP constructed while disabled")
 
     monkeypatch.setattr(ComposerMcpAdapter, "__init__", forbidden)
-    with TestClient(
-        create_app(ComposerState(), security=_security(tmp_path))
-    ) as client:
+    with TestClient(create_app(ComposerState(), security=_security(tmp_path))) as client:
         assert client.post("/mcp/").status_code in {404, 405}
-        assert not any(
-            getattr(route, "name", "") == "mcp" for route in client.app.routes
-        )
+        assert not any(getattr(route, "name", "") == "mcp" for route in client.app.routes)
         assert client.get("/api/program/draft").status_code == 200
 
 
@@ -75,9 +70,61 @@ def test_all_19_tools_derive_action_schemas_from_real_routes(tmp_path):
             assert method.lower() in api["paths"][path]
     validator = next(t for t in contracts if t["name"] == "manyforge_program_validate")
     assert validator["annotations"]["readOnlyHint"]
-    assert not next(t for t in contracts if t["name"] == "manyforge_kernel")[
-        "annotations"
-    ]["readOnlyHint"]
+    assert next(t for t in contracts if t["name"] == "manyforge_skills")["annotations"][
+        "readOnlyHint"
+    ]
+    assert not next(t for t in contracts if t["name"] == "manyforge_kernel")["annotations"][
+        "readOnlyHint"
+    ]
+
+
+def test_real_mcp_skill_expansion_uses_existing_headless_http_client(tmp_path):
+    calls = []
+    body = {
+        "schema_version": "manyforge.skill_expansion_request.v1",
+        "expected_environment_digest": "sha256:" + "1" * 64,
+        "skill_id": "move_to_named_config",
+        "instance_prefix": "selected",
+        "arguments": {},
+        "component_roles": {},
+        "target_roles": {},
+        "program_context": {},
+    }
+    owner_result = {
+        "schema_version": "manyforge.skill_expansion.v1",
+        "tree": {},
+        "trace": [],
+    }
+
+    def owner(request):
+        calls.append((request.method, request.url.path, json.loads(request.content)))
+        if request.url.path != "/api/skills/expand":
+            return httpx.Response(
+                503,
+                json={
+                    "detail": {
+                        "code": "fixture_owner_unavailable",
+                        "message": "No effect owner in this transport test",
+                    }
+                },
+            )
+        return httpx.Response(200, json=owner_result)
+
+    with httpx.Client(
+        base_url="http://headless.test", transport=httpx.MockTransport(owner)
+    ) as transport:
+        headless = HeadlessHttpClient("http://headless.test", client=transport)
+        state = ComposerState(headless_client=headless, authoring_state_root=str(tmp_path))
+        before = state.draft_session.snapshot()
+        with TestClient(create_app(state, security=_security(tmp_path), enable_mcp=True)) as client:
+            calls.clear()  # exclude the application's independent startup recovery probe
+            result = _call(client, "manyforge_skills", {"action": "expand", "body": body}).json()[
+                "result"
+            ]
+            assert not result["isError"], result
+            assert json.loads(result["content"][0]["text"]) == owner_result
+            assert calls == [("POST", "/api/skills/expand", body)]
+            assert state.draft_session.snapshot() == before
 
 
 def test_real_mcp_initialize_discover_read_and_pure_validation(tmp_path):
@@ -112,12 +159,8 @@ def test_real_mcp_initialize_discover_read_and_pure_validation(tmp_path):
             },
         )
         assert listed.status_code == 200
-        assert any(
-            t["name"] == "manyforge_catalog" for t in listed.json()["result"]["tools"]
-        )
-        response = _call(client, "manyforge_program_tree", {"action": "read"}).json()[
-            "result"
-        ]
+        assert any(t["name"] == "manyforge_catalog" for t in listed.json()["result"]["tools"])
+        response = _call(client, "manyforge_program_tree", {"action": "read"}).json()["result"]
         assert not response["isError"]
         assert json.loads(response["content"][0]["text"]) == before
         validated = _call(
@@ -168,16 +211,9 @@ def test_mcp_keeps_host_origin_and_request_size_bounds(tmp_path):
     with TestClient(
         create_app(ComposerState(), security=_security(tmp_path), enable_mcp=True)
     ) as client:
+        assert client.post("/mcp/", headers={"Host": "foreign.invalid"}, json={}).status_code == 421
         assert (
-            client.post(
-                "/mcp/", headers={"Host": "foreign.invalid"}, json={}
-            ).status_code
-            == 421
-        )
-        assert (
-            client.post(
-                "/mcp/", headers={"Origin": "http://foreign.invalid"}, json={}
-            ).status_code
+            client.post("/mcp/", headers={"Origin": "http://foreign.invalid"}, json={}).status_code
             == 403
         )
         assert client.post("/mcp/", content=b"x" * (1024 * 1024 + 1)).status_code == 413
@@ -195,16 +231,14 @@ def test_runtime_failure_and_malformed_stop_keep_real_route_semantics(tmp_path, 
 
     owner = Owner()
     state = ComposerState(headless_client=owner, authoring_state_root=str(tmp_path))
-    with TestClient(
-        create_app(state, security=_security(tmp_path), enable_mcp=True)
-    ) as client:
+    with TestClient(create_app(state, security=_security(tmp_path), enable_mcp=True)) as client:
         invalid = _call(
             client, "manyforge_cycle_control", {"action": "command", "body": {}}
         ).json()["result"]
         assert invalid["isError"]
-        stop = _call(
-            client, "manyforge_kernel", {"action": "full_stop", "body": body}
-        ).json()["result"]
+        stop = _call(client, "manyforge_kernel", {"action": "full_stop", "body": body}).json()[
+            "result"
+        ]
         assert not stop["isError"]
         assert json.loads(stop["content"][0]["text"])["accepted"]
         assert owner.stops == ["/api/execution/full-stop"]
@@ -400,9 +434,7 @@ def test_nonfinite_recognized_stop_body_reaches_the_owner(tmp_path):
             return {"accepted": True, "path": path}
 
     state = ComposerState(headless_client=Owner(), authoring_state_root=str(tmp_path))
-    with TestClient(
-        create_app(state, security=_security(tmp_path), enable_mcp=True)
-    ) as client:
+    with TestClient(create_app(state, security=_security(tmp_path), enable_mcp=True)) as client:
         response = client.post(
             "/mcp/",
             headers={
@@ -422,9 +454,7 @@ def test_nonfinite_recognized_stop_body_reaches_the_owner(tmp_path):
         '{"operations":[{"operation_id":"A","operation_id":"B"}]}',
     ],
 )
-def test_raw_duplicate_stop_selectors_reach_malformed_containment(
-    tmp_path, action, body
-):
+def test_raw_duplicate_stop_selectors_reach_malformed_containment(tmp_path, action, body):
     class Owner:
         def __init__(self):
             self.stops = []
@@ -435,9 +465,7 @@ def test_raw_duplicate_stop_selectors_reach_malformed_containment(
 
     owner = Owner()
     state = ComposerState(headless_client=owner, authoring_state_root=str(tmp_path))
-    with TestClient(
-        create_app(state, security=_security(tmp_path), enable_mcp=True)
-    ) as client:
+    with TestClient(create_app(state, security=_security(tmp_path), enable_mcp=True)) as client:
         response = client.post(
             "/mcp/",
             headers={
@@ -454,9 +482,7 @@ def test_raw_duplicate_stop_selectors_reach_malformed_containment(
         result = response.json()["result"]
         assert not result["isError"]
         assert json.loads(result["content"][0]["text"])["malformed"]
-        assert owner.stops == [
-            "/api/execution/" + ("stops" if action == "stop" else "full-stop")
-        ]
+        assert owner.stops == ["/api/execution/" + ("stops" if action == "stop" else "full-stop")]
 
 
 @pytest.mark.parametrize(
@@ -472,18 +498,14 @@ def test_raw_duplicate_stop_selectors_reach_malformed_containment(
 def test_raw_duplicate_routing_or_ordinary_bodies_are_rejected(tmp_path, params):
     # A sentinel owner has no effect methods: rejection must precede dispatch.
     state = ComposerState(headless_client=object(), authoring_state_root=str(tmp_path))
-    with TestClient(
-        create_app(state, security=_security(tmp_path), enable_mcp=True)
-    ) as client:
+    with TestClient(create_app(state, security=_security(tmp_path), enable_mcp=True)) as client:
         response = client.post(
             "/mcp/",
             headers={
                 "Accept": "application/json, text/event-stream",
                 "Content-Type": "application/json",
             },
-            content='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{'
-            + params
-            + "}}",
+            content='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{' + params + "}}",
         )
         assert response.status_code == 400
         assert response.json()["error"]["code"] == -32600
@@ -514,12 +536,7 @@ def test_lossy_duplicate_decoding_must_not_turn_malformed_stop_into_scoped_stop(
         + "}"
     )
     # Pin the counterfactual: the old SDK-last-member-wins path accepts B.
-    assert (
-        StopIntentRequest.model_validate(json.loads(raw_body))
-        .operations[0]
-        .operation_id
-        == "B"
-    )
+    assert StopIntentRequest.model_validate(json.loads(raw_body)).operations[0].operation_id == "B"
 
     class Owner:
         def __init__(self):
@@ -535,9 +552,7 @@ def test_lossy_duplicate_decoding_must_not_turn_malformed_stop_into_scoped_stop(
 
     owner = Owner()
     state = ComposerState(headless_client=owner, authoring_state_root=str(tmp_path))
-    with TestClient(
-        create_app(state, security=_security(tmp_path), enable_mcp=True)
-    ) as client:
+    with TestClient(create_app(state, security=_security(tmp_path), enable_mcp=True)) as client:
         response = client.post(
             "/mcp/",
             headers={
@@ -545,9 +560,7 @@ def test_lossy_duplicate_decoding_must_not_turn_malformed_stop_into_scoped_stop(
                 "Content-Type": "application/json",
             },
             content='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":'
-            '{"name":"manyforge_kernel","arguments":{"action":"stop","body":'
-            + raw_body
-            + "}}}",
+            '{"name":"manyforge_kernel","arguments":{"action":"stop","body":' + raw_body + "}}}",
         )
         assert not response.json()["result"]["isError"]
         assert (owner.malformed, owner.scoped) == (1, 0)

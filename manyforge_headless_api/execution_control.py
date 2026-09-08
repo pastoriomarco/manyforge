@@ -11,7 +11,7 @@ import asyncio
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Callable, Literal, Mapping, Protocol, TypeVar
 
@@ -271,17 +271,12 @@ class ExecutionControlIngress:
     def _rollover_required_locked(self) -> bool:
         with self._sequence_lock:
             received_sequence_exhausted = self._received_sequence >= MAXIMUM_U64
-        return (
-            self._authority.rollover_required
-            or received_sequence_exhausted
-        )
+        return self._authority.rollover_required or received_sequence_exhausted
 
     def _rotate_if_quiescent_locked(self) -> bool:
         if not self._rollover_required_locked():
             return False
-        admitted = sum(
-            lane["admitted"] for lane in self._lanes.status().values()
-        )
+        admitted = sum(lane["admitted"] for lane in self._lanes.status().values())
         if self._active_control_sessions or admitted:
             return False
         self._authority.rotate_quiescent(
@@ -345,11 +340,12 @@ class ExecutionControlIngress:
         envelope = request.command_envelope
         if not is_stop_command(envelope.command_kind):
             owner_epoch, control_revision = self._projection()
-            self._authority.validate(
+            valid_until_ns = self._authority.validate(
                 envelope.freshness,
                 current_owner_epoch=owner_epoch,
                 current_control_revision=control_revision,
             )
+            stamp = replace(stamp, valid_until_monotonic_ns=valid_until_ns)
             if (
                 envelope.expected_semantic_owner_epoch != owner_epoch
                 or envelope.expected_execution_control_revision != control_revision
@@ -372,9 +368,7 @@ class ExecutionControlIngress:
             semantic_owner_epoch=disposition.semantic_owner_epoch,
             execution_control_revision=disposition.execution_control_revision,
             current_identity=(
-                None
-                if disposition.current_identity is None
-                else dict(disposition.current_identity)
+                None if disposition.current_identity is None else dict(disposition.current_identity)
             ),
         )
         return ExecutionControlSubmission(receipt=receipt, result=result)
@@ -455,6 +449,7 @@ class ExecutionControlIngress:
                 request,
                 stamp,
             )
+
         lane = (
             ExecutionControlLane.STOP
             if is_stop_command(request.command_envelope.command_kind)

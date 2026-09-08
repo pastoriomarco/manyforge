@@ -10,6 +10,7 @@ raw process output are not qualification deliverables.
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
 import socket
 import subprocess
@@ -23,17 +24,17 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from manyforge_behavior.canonical_artifact import load_strict_json_yaml
-from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
+from manyforge_headless_api.client import HeadlessHttpClient
+from manyforge_headless_api.execution import ExecutionCommandClient
+from manyforge_headless_api.models import TargetObservationQuery
 from manyforge_operator.cell_layout import CellInstanceLayout
-from websockets.sync.client import connect
+from scripts.qualification.control_client_fixture import composer_snapshot_stream
 
 WORKSPACE = Path(os.environ.get("MANYFORGE_ROOT", "/workspace")).resolve()
 PACKAGE = Path(os.environ["N7_MATRIX_PACKAGE"]).resolve()
 INSTALLED = Path(os.environ["N7_MATRIX_INSTALLED"]).resolve()
 NODE_CATALOG = WORKSPACE / "manyforge_behavior/resources/node_catalog.yaml"
-ALARM_CATALOG = Path(
-    WORKSPACE / "manyforge_headless/resources/operator-alarm-catalog.v1.yaml"
-)
+ALARM_CATALOG = Path(WORKSPACE / "manyforge_headless/resources/operator-alarm-catalog.v1.yaml")
 MODEL_ID = "qwen3.6-35b-a3b-nvfp4-tq-mtp-manyforge"
 POSE_MODEL_ID = "cosmos-reason2-8b"
 EXPECTED_SNAPSHOT_SOURCE_GATE = "model_snapshot_image_source_unavailable"
@@ -129,9 +130,7 @@ def composer_json(
             payload = response.read()
     except HTTPError as error:
         payload = error.read().decode("utf-8", errors="replace")
-        raise RuntimeError(
-            f"Composer {method} {path} returned {error.code}: {payload}"
-        ) from error
+        raise RuntimeError(f"Composer {method} {path} returned {error.code}: {payload}") from error
     decoded = json.loads(payload)
     if not isinstance(decoded, dict):
         raise RuntimeError(f"Composer {method} {path} returned a non-object")
@@ -195,9 +194,7 @@ def wait_for_api(base_url: str, processes: tuple[subprocess.Popen[bytes], ...]) 
     while time.monotonic() < deadline:
         for process in processes:
             if process.poll() is not None:
-                raise RuntimeError(
-                    f"process exited during startup: {process.returncode}"
-                )
+                raise RuntimeError(f"process exited during startup: {process.returncode}")
         try:
             with HeadlessHttpClient(base_url, timeout_seconds=1.0) as client:
                 runtime = client.runtime()
@@ -218,9 +215,7 @@ def wait_for_composer(
     while time.monotonic() < deadline:
         for process in processes:
             if process.poll() is not None:
-                raise RuntimeError(
-                    f"process exited during Composer startup: {process.returncode}"
-                )
+                raise RuntimeError(f"process exited during Composer startup: {process.returncode}")
         try:
             catalog = composer_json(base_url, "GET", "/api/scenarios")
             if catalog.get("api_version") == "manyforge.scenario_catalog.v1":
@@ -258,13 +253,9 @@ def _process_commands(
     manager_run_root = layout.run_root / "manager"
     execution_state_root = layout.owner_state_root("execution-host")
     execution_run_root = layout.run_root / "execution-host"
-    program_cycle_journal = (
-        layout.owner_state_root("program-runner") / "program-cycle.sqlite3"
-    )
+    program_cycle_journal = layout.owner_state_root("program-runner") / "program-cycle.sqlite3"
     authoring_state_root = layout.owner_state_root("composer-authoring")
-    program_runner_liveness_socket = (
-        manager_run_root / "program-runner-liveness.sock"
-    )
+    program_runner_liveness_socket = manager_run_root / "program-runner-liveness.sock"
     return {
         "manager": [
             str(INSTALLED / "manyforge_manager_daemon"),
@@ -337,6 +328,8 @@ def _process_commands(
             str(layout.owner_state_root("program-selection")),
             "--node-catalog-path",
             str(NODE_CATALOG),
+            "--node-environment-manifest-path",
+            str(WORKSPACE / "manyforge_behavior/resources/node_environment_manifest.yaml"),
             "--alarm-catalog-path",
             str(ALARM_CATALOG),
             "--historian-database-path",
@@ -378,11 +371,10 @@ def _process_commands(
     }
 
 
-def _authoring_apply_body(
+def _scenario_load_body(
     *,
     workspace: dict[str, object],
     snapshot: dict[str, object],
-    client_id: str,
     scenario_id: str,
     scenario_catalog_revision: str,
 ) -> dict[str, object]:
@@ -390,14 +382,9 @@ def _authoring_apply_body(
     admission = snapshot.get("authoring_admission")
     cycle = snapshot.get("program_cycle")
     snapshot_draft = snapshot.get("draft_identity")
-    receiver_epoch = snapshot.get("receiver_epoch")
-    sequence = snapshot.get("snapshot_sequence")
     if (
-        workspace.get("schemaVersion")
-        != "manyforge.composer_program_workspace.v1"
-        or snapshot.get("schema_version")
-        != "manyforge.composer_headless_state.v2"
-        or not client_id
+        workspace.get("schemaVersion") != "manyforge.composer_program_workspace.v2"
+        or snapshot.get("schema_version") != "manyforge.composer_headless_state.v2"
         or not isinstance(draft, dict)
         or not isinstance(admission, dict)
         or not isinstance(cycle, dict)
@@ -407,23 +394,16 @@ def _authoring_apply_body(
         or cycle.get("state") != "idle_after_reset"
         or snapshot_draft.get("draft_id") != draft.get("draftId")
         or snapshot_draft.get("draft_revision") != draft.get("draftRevision")
-        or not isinstance(receiver_epoch, str)
-        or not receiver_epoch
-        or type(sequence) is not int
-        or sequence < 1
         or type(admission.get("admission_generation")) is not int
         or admission["admission_generation"] < 1
     ):
-        raise RuntimeError("Composer did not publish one Apply-ready snapshot")
+        raise RuntimeError("Composer did not publish one Load-ready snapshot")
     return {
         "draftId": draft["draftId"],
         "expectedDraftRevision": draft["draftRevision"],
-        "clientId": client_id,
-        "snapshotReceiverEpoch": receiver_epoch,
-        "snapshotSequence": sequence,
         "expectedAdmissionGeneration": admission["admission_generation"],
         "requestOwnerEpoch": "n7-product-matrix.authoring",
-        "requestId": f"n7.apply.{scenario_id}",
+        "requestId": f"n7.load.{scenario_id}",
         "scenarioCatalogRevision": scenario_catalog_revision,
         "scenarioId": scenario_id,
     }
@@ -467,11 +447,6 @@ def qualify_scenario(
             api_url = f"http://127.0.0.1:{api_port}"
             composer_url = f"http://127.0.0.1:{composer_port}"
             environment = os.environ.copy()
-            manager = subprocess.Popen(
-                commands["manager"],
-                stdout=log,
-                stderr=subprocess.STDOUT,
-            )
             runner = subprocess.Popen(
                 commands["program"],
                 stdout=log,
@@ -483,6 +458,11 @@ def qualify_scenario(
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 env=environment,
+            )
+            manager = subprocess.Popen(
+                commands["manager"],
+                stdout=log,
+                stderr=subprocess.STDOUT,
             )
             wait_for_api(api_url, (manager, runner, api))
             composer_environment = environment.copy()
@@ -509,75 +489,96 @@ def qualify_scenario(
                     "/api/program/workspace",
                 )
                 browser_client_id = f"n7-product-matrix.{scenario_id}"
-                with connect(
-                    f"ws://127.0.0.1:{composer_port}/ws/state"
-                    f"?client_id={browser_client_id}",
-                    open_timeout=5.0,
-                    close_timeout=1.0,
-                    max_size=16 * 1024 * 1024,
-                    proxy=None,
-                ) as state_socket:
-                    raw_snapshot = state_socket.recv(timeout=5.0)
-                    if not isinstance(raw_snapshot, str):
-                        raise RuntimeError("Composer state snapshot is not text")
-                    snapshot_bytes = raw_snapshot.encode("utf-8")
-                    if len(snapshot_bytes) > 16 * 1024 * 1024:
-                        raise RuntimeError("Composer state snapshot is oversized")
-                    headless_snapshot = json.loads(snapshot_bytes)
-                    if not isinstance(headless_snapshot, dict):
-                        raise RuntimeError("Composer state snapshot is not an object")
-                    apply_body = _authoring_apply_body(
+                with composer_snapshot_stream(
+                    composer_url,
+                    client_id=browser_client_id,
+                ) as next_snapshot:
+                    headless_snapshot = next_snapshot()
+                    load_body = _scenario_load_body(
                         workspace=workspace,
                         snapshot=headless_snapshot,
-                        client_id=browser_client_id,
                         scenario_id=scenario_id,
-                        scenario_catalog_revision=catalog[
-                            "scenario_catalog_revision"
-                        ],
+                        scenario_catalog_revision=catalog["scenario_catalog_revision"],
                     )
-                    composer_apply = composer_json(
+                    composer_load = composer_json(
                         composer_url,
                         "POST",
-                        "/api/program/apply",
-                        apply_body,
+                        "/api/scenarios/load",
+                        load_body,
                     )
-                applied_result = composer_apply.get("headless")
+                load_result = composer_load.get("headless")
                 if (
-                    composer_apply.get("status") != "applied"
-                    or not isinstance(applied_result, dict)
-                    or applied_result.get("status") != "applied"
-                    or not isinstance(applied_result.get("applied"), dict)
+                    composer_load.get("status") != "loaded"
+                    or not isinstance(load_result, dict)
+                    or load_result.get("scenario", {}).get("scenario_id") != scenario_id
                 ):
                     raise RuntimeError(
-                        f"Composer Apply returned a divergent result: {composer_apply}"
+                        f"Composer Load returned a divergent result: {composer_load}"
                     )
-                applied = applied_result["applied"]
+                applied = client.program_applied()
                 selection = client.scenario_program_selection(scenario_id)
                 if selection["program"] != program:
                     raise RuntimeError("applied scenario selected another Program")
-                readiness_deadline = time.monotonic() + 25.0
-                while True:
-                    try:
-                        client.execution_diagnostics()
-                        break
-                    except HeadlessClientError:
-                        if time.monotonic() >= readiness_deadline:
-                            raise
-                        time.sleep(0.02)
+                # Use the maintained operator's exact CCLC convergence, not a
+                # second lifecycle implementation or diagnostics-as-readiness.
+                spec = importlib.util.spec_from_file_location(
+                    "matrix_workbench", WORKSPACE / "scripts/dev-workbench.py"
+                )
+                assert spec is not None and spec.loader is not None
+                workbench = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(workbench)
+                workbench.PACKAGE_ROOT = PACKAGE
+                metadata = workbench._load_scenario(scenario_id)
+                workbench._converge_control_management(
+                    client,
+                    metadata["component_ids"],
+                    scenario_id=scenario_id,
+                    processes=[
+                        ("manager", manager),
+                        ("runner", runner),
+                        ("headless", api),
+                        ("composer", composer),
+                    ],
+                )
+                # Read the real feedback binding before any effect. UR5 has a
+                # component-local gripper coordinate; Lite6/UR10e use model
+                # coordinates. Neither kind of read needs command authority.
+                native = ExecutionCommandClient(layout.run_root / "execution-host")
+                owner_epoch = native.identity()["identity"]["owner_epoch"]
+                gripper_queries = []
+                for role_id, role in program["target_roles"].items():
+                    if not any(
+                        capability["capability_id"] == "tool.gripper.command"
+                        for capability in role["required_capabilities"]
+                    ):
+                        continue
+                    feedback = native.query_target(
+                        TargetObservationQuery(
+                            schema_version="manyforge.target_observation_query.v1",
+                            owner_epoch=owner_epoch,
+                            program_binding_id=metadata["program_binding_id"],
+                            target_role_id=role_id,
+                            kind="gripper_status",
+                        )
+                    )["target_observation"]
+                    if feedback["value"]["grasp_confirmed"] is not None:
+                        raise RuntimeError("position feedback invented grasp evidence")
+                    gripper_queries.append(role_id)
+                admission = client.authoring_admission()
+                if admission.get("authoring_allowed") is not True:
+                    raise RuntimeError(f"Program admission is not ready: {admission}")
                 snapshot = composer_json(
                     composer_url,
                     "POST",
                     "/api/program/runs",
                     {
                         "correlation_id": f"n7.{scenario_id}",
-                        "expected_applied_record_digest": applied["source"][
-                            "record_digest"
-                        ],
+                        "expected_applied_record_digest": applied["source"]["record_digest"],
+                        "draft_program_revision": program["program_revision"],
+                        "expected_admission_generation": admission["admission_generation"],
                         "request_id": f"n7.start.{scenario_id}",
                         "request_owner_epoch": "n7-product-matrix",
-                        "scenario_catalog_revision": catalog[
-                            "scenario_catalog_revision"
-                        ],
+                        "scenario_catalog_revision": catalog["scenario_catalog_revision"],
                         "scenario_id": scenario_id,
                         "source_label": "n7_product_matrix",
                     },
@@ -598,29 +599,26 @@ def qualify_scenario(
                         f"/api/program/runs/{program_run_id}",
                     )
             if snapshot["state"] != expected_state:
-                raise RuntimeError(
-                    f"{scenario_id} ended as {snapshot['state']}: {snapshot}"
-                )
+                raise RuntimeError(f"{scenario_id} ended as {snapshot['state']}: {snapshot}")
             if (
                 expected_state == "failed"
                 and snapshot["reason_code"] != EXPECTED_SNAPSHOT_SOURCE_GATE
             ):
-                raise RuntimeError(
-                    f"{scenario_id} failed for the wrong reason: {snapshot}"
-                )
+                raise RuntimeError(f"{scenario_id} failed for the wrong reason: {snapshot}")
             layout.validate()
             return {
                 "elapsed_s": round(time.monotonic() - started_at, 3),
                 "reason_code": snapshot["reason_code"],
                 "scenario_id": scenario_id,
                 "state": snapshot["state"],
+                "gripper_feedback_targets": gripper_queries,
             }
         except Exception as error:
             log.flush()
-            detail = log_path.read_text(encoding="utf-8", errors="replace")[-12000:]
-            raise RuntimeError(
-                f"{scenario_id}: {error}\n--- stack log ---\n{detail}"
-            ) from error
+            detail = log_path.read_text(encoding="utf-8", errors="replace")
+            if len(detail) > 28000:
+                detail = detail[:16000] + "\n[bounded log excerpt]\n" + detail[-12000:]
+            raise RuntimeError(f"{scenario_id}: {error}\n--- stack log ---\n{detail}") from error
         finally:
             stop(composer)
             stop(runner)
@@ -666,15 +664,11 @@ def main() -> int:
                 encoding="utf-8",
             )
             selected_id = os.environ.get("N7_MATRIX_SCENARIO")
-            rows = tuple(
-                row for row in SCENARIOS if selected_id is None or row[0] == selected_id
-            )
+            rows = tuple(row for row in SCENARIOS if selected_id is None or row[0] == selected_id)
             if not rows:
                 raise RuntimeError("N7_MATRIX_SCENARIO selected no scenario")
             results = [qualify_scenario(*row, model_config) for row in rows]
-        expected_model_calls = int(
-            any(row[0] == "ur5_semantic_shape_pick" for row in rows)
-        )
+        expected_model_calls = int(any(row[0] == "ur5_semantic_shape_pick" for row in rows))
         if len(model_requests) != expected_model_calls:
             raise RuntimeError(
                 "unexpected bounded semantic-selection call count: "
@@ -689,9 +683,7 @@ def main() -> int:
                 or len(tools) != 1
                 or tools[0].get("function", {}).get("name") != "select_scene_object"
             ):
-                raise RuntimeError(
-                    f"model request was not the qualified tool call: {request}"
-                )
+                raise RuntimeError(f"model request was not the qualified tool call: {request}")
         print(
             json.dumps(
                 {"model_calls": len(model_requests), "results": results},

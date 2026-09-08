@@ -36,13 +36,6 @@ namespace manyforge::roboplan_backend {
 // not yet published either route. Capability/Program aliases do not add lanes.
 inline constexpr std::size_t kNativeMaximumLiveStopParticipants = 2U;
 
-/// Capability-specific ControlBindings may share one exact physical source.
-/// This is the same realization check used by native runtime construction;
-/// it does not prove current route reconciliation or sample freshness.
-[[nodiscard]] bool retained_bindings_share_backend_owner(
-    const core::RuntimeParticipantBinding &primary,
-    const core::RuntimeParticipantBinding &representative) noexcept;
-
 struct RetainedNativeRuntimeConfig final {
   core::RequestOwnerEpoch request_owner_epoch;
   core::CellId cell_id;
@@ -300,13 +293,26 @@ struct RetainedNativeRuntime final
   ReadCurrentPublishedRouteConfiguration(
       const core::ControlDomainId &control_domain_id) const;
 
+  /// Final source check and evidence write share route-publication ordering.
+  /// The host supplies the verified confirmation representative and its
+  /// explicit policy; this is not an unqualified public mutation endpoint.
+  [[nodiscard]] core::Result<core::GripperGraspEvidenceDTO> RecordGraspObservation(
+      const core::RuntimeParticipantBinding& source,
+      const core::GripperGraspObservationDTO& observation, core::Duration freshness_budget_ns,
+      core::TimePoint admission_deadline_ns);
+
+  [[nodiscard]] core::Result<core::GripperCommandStatusDTO> ReadGripperStatus(
+      const core::RuntimeParticipantBinding& source) const;
+
   /// Publish the exact route facts already sealed into a direct native
   /// runtime. Maintained products without a lifecycle owner call this once
   /// after installation; lifecycle-managed products publish through CCLC.
   [[nodiscard]] core::Result<void> PublishCurrentRetainedRouteConfigurations();
 
 private:
-  mutable std::mutex route_publication_mutex_;
+ // Caller holds route_publication_mutex_. No owner read or write escapes it.
+ [[nodiscard]] bool GripperSourceIsCurrent(const core::RuntimeParticipantBinding& source) const;
+ mutable std::mutex route_publication_mutex_;
 };
 
 /// Assemble only the product-specific subordinate participant runtime. This

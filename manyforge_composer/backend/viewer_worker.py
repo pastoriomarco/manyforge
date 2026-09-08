@@ -1,8 +1,8 @@
-"""Bounded worker-envelope primitives and the fenced I9 worker factory.
+"""Retained, payload-neutral envelope integrity and CPU-set parsing.
 
 The old visual snapshot builder, versioned Composer worker protocol, and
-process supervisor are absent. Generic envelope integrity and CPU-set parsing
-remain as port inputs; creating a visual worker is explicitly unavailable.
+process supervisor were superseded by the native credited observation stream.
+These pure helpers create no process, queue, observation source or FK owner.
 """
 
 from __future__ import annotations
@@ -10,16 +10,10 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from typing import Any, Final, NoReturn
+from typing import Any, Final
 
 
-_DEFAULT_MAX_INPUT_BYTES: Final = 8 * 1024 * 1024
-_DEFAULT_MAX_OUTPUT_BYTES: Final = 16 * 1024 * 1024
 _SCHEMA_TOKEN: Final = re.compile(r"^[a-z][a-z0-9_.-]{0,127}$")
-VIEWER_WORKER_UNAVAILABLE_REASON_CODE: Final = (
-    "composable_cell_viewer_worker_unavailable"
-)
-VIEWER_WORKER_RESTORATION_GATE: Final = "I9"
 
 
 class ViewerWorkerError(RuntimeError):
@@ -29,10 +23,6 @@ class ViewerWorkerError(RuntimeError):
         super().__init__(detail or reason)
         self.reason = reason
         self.detail = detail or reason
-
-
-class ViewerWorkerUnavailableError(ViewerWorkerError):
-    """The I9 observer-owned visual worker has not been connected."""
 
 
 def _canonical_json_bytes(value: Any) -> bytes:
@@ -130,32 +120,4 @@ def _parse_cpu_set(raw: str) -> set[int]:
     return cpus
 
 
-def require_viewer_worker() -> NoReturn:
-    raise ViewerWorkerUnavailableError(
-        VIEWER_WORKER_UNAVAILABLE_REASON_CODE,
-        f"{VIEWER_WORKER_UNAVAILABLE_REASON_CODE}: visual worker returns at I9 "
-        "after binding to the observer-owned snapshot contract",
-    )
-
-
-class ViewerWorkerSupervisor:
-    """Stable import marker; construction performs no process or queue effect."""
-
-    def __init__(
-        self,
-        *,
-        timeout_s: float | None = None,
-        max_input_bytes: int = _DEFAULT_MAX_INPUT_BYTES,
-        max_output_bytes: int = _DEFAULT_MAX_OUTPUT_BYTES,
-        worker_target: Any | None = None,
-    ) -> None:
-        del timeout_s, max_input_bytes, max_output_bytes, worker_target
-        require_viewer_worker()
-
-
-__all__ = [
-    "ViewerWorkerError",
-    "ViewerWorkerSupervisor",
-    "ViewerWorkerUnavailableError",
-    "require_viewer_worker",
-]
+__all__ = ["ViewerWorkerError"]

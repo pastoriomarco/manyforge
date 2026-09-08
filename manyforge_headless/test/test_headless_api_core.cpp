@@ -1442,6 +1442,137 @@ TEST(HeadlessApiCore,
   }
 }
 
+TEST(HeadlessApiCore, GripperConfirmationTraceIsBoundedAttributedAndNeverLiveProof) {
+  TemporaryDirectory directory;
+  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+  CanonicalValue record(CanonicalValue::Object{
+      {"schema_version", CanonicalValue("manyforge.gripper_confirmation_trace.v1")},
+      {"origin_epoch", CanonicalValue("control.session.1")},
+      {"request_id", CanonicalValue("press.1")},
+      {"source_label", CanonicalValue("station.operator")},
+      {"native_owner_epoch", CanonicalValue("native.1")},
+      {"program_binding_id", CanonicalValue(Digest('2'))},
+      {"target_role_id", CanonicalValue("gripper")},
+      {"command_id", CanonicalValue(7.0)},
+      {"generation", CanonicalValue(2.0)},
+      {"expected_status_revision", CanonicalValue(9.0)},
+      {"confirmed", CanonicalValue(true)},
+      {"phase", CanonicalValue("attempted")},
+      {"details", CanonicalValue(CanonicalValue::Object{
+                      {"assurance", CanonicalValue("unverified")},
+                      {"principal_id", CanonicalValue(nullptr)},
+                  })},
+  });
+  const auto result = core.RecordGripperConfirmation(record);
+  EXPECT_TRUE(std::get<bool>(Member(result, "recorded").storage()));
+  HistorianQuery query;
+  query.components.insert("manyforge.gripper");
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  CanonicalValue page;
+  do {
+    page = core.HistoryPage(query);
+    if (Array(page, "events").size() == 1U) break;
+    std::this_thread::yield();
+  } while (std::chrono::steady_clock::now() < deadline);
+  ASSERT_EQ(Array(page, "events").size(), 1U);
+  const auto& event = Member(Array(page, "events").front(), "event");
+  EXPECT_EQ(Text(event, "event_type"), "gripper_confirmation_attempted");
+  const auto& payload = Member(event, "payload");
+  EXPECT_EQ(Text(payload, "origin_epoch"), "control.session.1");
+  EXPECT_EQ(Text(payload, "clock_owner"), "headless:api.epoch.1");
+  EXPECT_EQ(Text(payload, "evidence_kind"), "operator_attestation_trace");
+  EXPECT_EQ(payload.find_object_member("evidence"), nullptr);
+  for (const auto& [field, invalid] : CanonicalValue::Object{
+           {"phase", CanonicalValue("sensor_proof")},
+           {"command_id", CanonicalValue(0.0)},
+           {"details", CanonicalValue(std::string(9000, 'x'))},
+           {"confirmed", CanonicalValue(1.0)},
+       }) {
+    auto changed = record.as_object();
+    for (auto& [key, value] : changed)
+      if (key == field) value = invalid;
+    EXPECT_THROW(static_cast<void>(core.RecordGripperConfirmation(CanonicalValue(changed))),
+                 OperatorAlarmError);
+  }
+}
+
+TEST(HeadlessApiCore, ProgramDiagnosticRetainsExactProducerValuesAndClock) {
+  TemporaryDirectory directory;
+  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+  CanonicalValue record(CanonicalValue::Object{
+      {"schema_version", CanonicalValue("manyforge.program_diagnostic.v1")},
+      {"program_run_id", CanonicalValue("run.diagnostic")},
+      {"owner_epoch", CanonicalValue("runner.1")},
+      {"program_revision", CanonicalValue(Digest('1'))},
+      {"program_binding_id", CanonicalValue(Digest('2'))},
+      {"retained_bundle_id", CanonicalValue(Digest('3'))},
+      {"graph_revision", CanonicalValue(Digest('4'))},
+      {"state", CanonicalValue("failed")},
+      {"reason_code", CanonicalValue("condition_not_met")},
+      {"message", CanonicalValue("Program condition not met")},
+      {"occurred_at_ns", CanonicalValue("9007199254740993")},
+      {"occurred_at_wall", CanonicalValue("2026-09-08T00:00:00Z")},
+      {"blackboard",
+       CanonicalValue(CanonicalValue::Object{{"ready", CanonicalValue(false)},
+                                             {"program_run_id", CanonicalValue("foreign.run")}})},
+      {"runtime_overrides", CanonicalValue(CanonicalValue::Object{
+                                {"[\"move\",\"velocity_scale\"]", CanonicalValue(0.2)}})},
+      {"omitted_blackboard_count", CanonicalValue(2.0)},
+      {"omitted_override_count", CanonicalValue(0.0)},
+      {"delivery_loss_count", CanonicalValue(3.0)},
+  });
+  const auto result = core.RecordProgramDiagnostic(record);
+  EXPECT_TRUE(std::get<bool>(Member(result, "recorded").storage()));
+  HistorianQuery query;
+  query.components.insert("manyforge.program_runner");
+  query.correlations.emplace("program_run_id", "run.diagnostic");
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  CanonicalValue page;
+  do {
+    page = core.HistoryPage(query);
+    if (Array(page, "events").size() == 1U) break;
+    std::this_thread::yield();
+  } while (std::chrono::steady_clock::now() < deadline);
+  ASSERT_EQ(Array(page, "events").size(), 1U);
+  const auto& stored = Array(page, "events").front();
+  const auto& event = Member(stored, "event");
+  EXPECT_EQ(Text(event, "occurred_at_ns"), "9007199254740993");
+  EXPECT_EQ(Text(event, "severity"), "ERROR");
+  EXPECT_EQ(content_identity::canonical_json(Member(Member(event, "payload"), "blackboard")),
+            "{\"program_run_id\":\"foreign.run\",\"ready\":false}");
+  EXPECT_EQ(Text(Member(event, "payload"), "clock_owner"), "program_runner:runner.1");
+  query.correlations["program_run_id"] = "foreign.run";
+  EXPECT_TRUE(Array(core.HistoryPage(query), "events").empty());
+  auto near_limit = record.as_object();
+  CanonicalValue::Object near_values;
+  for (std::size_t index = 0U; index < 8U; ++index) {
+    std::string key("a");
+    key += std::to_string(index);
+    near_values.emplace_back(std::move(key),
+                             CanonicalValue(std::string(index == 7U ? 1761U : 2040U, 'x')));
+  }
+  near_values.emplace_back("z", CanonicalValue(CanonicalValue::Array(100, CanonicalValue(0.0))));
+  for (auto& [name, value] : near_limit) {
+    if (name == "blackboard") value = CanonicalValue(near_values);
+  }
+  EXPECT_TRUE(std::get<bool>(
+      Member(core.RecordProgramDiagnostic(CanonicalValue(near_limit)), "recorded").storage()));
+  for (const auto& oversized : {CanonicalValue(std::string(3000, 'x')),
+                                CanonicalValue(CanonicalValue::Array(513, CanonicalValue(0.0)))}) {
+    auto invalid_values = record.as_object();
+    for (auto& [name, value] : invalid_values) {
+      if (name == "blackboard")
+        value = CanonicalValue(CanonicalValue::Object{{"oversized", oversized}});
+    }
+    EXPECT_THROW(static_cast<void>(core.RecordProgramDiagnostic(CanonicalValue(invalid_values))),
+                 OperatorAlarmError);
+  }
+  auto invalid = record.as_object();
+  invalid.emplace_back("accepted", CanonicalValue(true));
+  EXPECT_THROW(static_cast<void>(core.RecordProgramDiagnostic(CanonicalValue(std::move(invalid)))),
+               OperatorAlarmError);
+}
+
 TEST(HeadlessApiCore,
      DurableOperationFactsDriveHistoryAndAlarmWithoutOwningExecutionState) {
   TemporaryDirectory directory;

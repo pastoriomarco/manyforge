@@ -152,7 +152,8 @@ provider_contract_role_id(const CanonicalValue &declaration) {
 }
 
 [[nodiscard]] inline CanonicalValue native_execution_configuration(
-    std::string_view controllable_component_id, bool include_gripper) {
+    std::string_view controllable_component_id, bool include_gripper,
+    bool operator_confirmation = false) {
   CanonicalValue::Object configuration{
       {"mode", CanonicalValue("simulated")},
       {"planner_rng_seed", CanonicalValue(12345.0)},
@@ -167,55 +168,47 @@ provider_contract_role_id(const CanonicalValue &declaration) {
       {"execution_tick_hz", CanonicalValue(100.0)},
       {"collision_monitor_period_ms", CanonicalValue(50.0)},
       {"direct_control_joint_limits",
-       CanonicalValue(CanonicalValue::Array{CanonicalValue(
-           CanonicalValue::Object{
-               {"controllable_component_id",
-                CanonicalValue(std::string(controllable_component_id))},
-               {"command_target_id",
-                CanonicalValue(std::string(kLite6ArmTargetId))},
-               {"source_joint_name", CanonicalValue("joint1")},
-               {"max_velocity_rad_s", CanonicalValue(1.5)},
-               {"max_acceleration_rad_s2", CanonicalValue(2.5)},
-               {"max_jerk_rad_s3", CanonicalValue(10.0)},
-           })})},
+       CanonicalValue(CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+           {"controllable_component_id", CanonicalValue(std::string(controllable_component_id))},
+           {"command_target_id", CanonicalValue(std::string(kLite6ArmTargetId))},
+           {"source_joint_name", CanonicalValue("joint1")},
+           {"max_velocity_rad_s", CanonicalValue(1.5)},
+           {"max_acceleration_rad_s2", CanonicalValue(2.5)},
+           {"max_jerk_rad_s3", CanonicalValue(10.0)},
+       })})},
       {"motion_target_limits",
-       CanonicalValue(CanonicalValue::Array{CanonicalValue(
-           CanonicalValue::Object{
-               {"controllable_component_id",
-                CanonicalValue(std::string(controllable_component_id))},
-               {"command_target_id",
-                CanonicalValue(std::string(kLite6ArmTargetId))},
-               {"maximum_tcp_linear_speed_mps", CanonicalValue(0.15)},
-           })})},
+       CanonicalValue(CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+           {"controllable_component_id", CanonicalValue(std::string(controllable_component_id))},
+           {"command_target_id", CanonicalValue(std::string(kLite6ArmTargetId))},
+           {"maximum_tcp_linear_speed_mps", CanonicalValue(0.15)},
+       })})},
   };
   if (include_gripper) {
+    CanonicalValue::Object gripper_configuration{
+        {"actuation_kind", CanonicalValue("position_commanded")},
+        {"attach_frame", CanonicalValue("link_tcp")},
+        {"auxiliary_frames",
+         CanonicalValue(CanonicalValue::Array{CanonicalValue("lite_gripper_base_link")})},
+        {"closed_state_ref", CanonicalValue("closed")},
+        {"command_duration_s", CanonicalValue(0.8)},
+        {"command_target_id", CanonicalValue(std::string(kLite6GripperTargetId))},
+        {"controllable_component_id", CanonicalValue(std::string(controllable_component_id))},
+        {"description", CanonicalValue("Native simulated UFACTORY lite pneumatic gripper.")},
+        {"mount_frame", CanonicalValue("link_eef")},
+        {"open_state_ref", CanonicalValue("open")},
+        {"tcp_frame", CanonicalValue("link_tcp")},
+        {"touch_links",
+         CanonicalValue(CanonicalValue::Array{CanonicalValue("lite_gripper_base_link"),
+                                              CanonicalValue("lite_gripper_left_finger"),
+                                              CanonicalValue("lite_gripper_right_finger")})},
+    };
+    if (operator_confirmation) {
+      gripper_configuration.emplace_back("operator_confirmation_validity_ns",
+                                         CanonicalValue(30'000'000'000.0));
+    }
     configuration.emplace_back(
         "gripper_target_configurations",
-        CanonicalValue(CanonicalValue::Array{CanonicalValue(
-            CanonicalValue::Object{
-                {"actuation_kind", CanonicalValue("position_commanded")},
-                {"attach_frame", CanonicalValue("link_tcp")},
-                {"auxiliary_frames",
-                 CanonicalValue(CanonicalValue::Array{
-                     CanonicalValue("lite_gripper_base_link")})},
-                {"closed_state_ref", CanonicalValue("closed")},
-                {"command_duration_s", CanonicalValue(0.8)},
-                {"command_target_id",
-                 CanonicalValue(std::string(kLite6GripperTargetId))},
-                {"controllable_component_id",
-                 CanonicalValue(std::string(controllable_component_id))},
-                {"description",
-                 CanonicalValue(
-                     "Native simulated UFACTORY lite pneumatic gripper.")},
-                {"mount_frame", CanonicalValue("link_eef")},
-                {"open_state_ref", CanonicalValue("open")},
-                {"tcp_frame", CanonicalValue("link_tcp")},
-                {"touch_links",
-                 CanonicalValue(CanonicalValue::Array{
-                     CanonicalValue("lite_gripper_base_link"),
-                     CanonicalValue("lite_gripper_left_finger"),
-                     CanonicalValue("lite_gripper_right_finger")})},
-            })}));
+        CanonicalValue(CanonicalValue::Array{CanonicalValue(std::move(gripper_configuration))}));
   }
   return CanonicalValue(std::move(configuration));
 }
@@ -352,6 +345,8 @@ struct QualifiedControlCatalog final {
   /// Aggregate arm/tool fixtures retain a goal-cancel policy for the gripper
   /// when the arm selects the independently qualified controlled-Stop policy.
   std::optional<QualifiedStopEvidencePolicy> gripper_stop;
+  std::optional<QualifiedCapabilityDefinition> gripper_confirmation{};
+  std::optional<QualifiedCapabilityDefinition> gripper_feedback{};
 };
 
 struct AssistantOverlayFixture final {
@@ -1452,43 +1447,45 @@ qualify_control_catalog(bool chained, bool native_motion = false,
   };
 }
 
-[[nodiscard]] inline QualifiedControlCatalog
-add_aggregate_gripper_catalog(QualifiedControlCatalog catalog,
-                              bool stoppable = false,
-                              std::string_view lifecycle_semantic_digest = {}) {
-  const auto *descriptor =
-      core::find_builtin_capability_definition("tool.gripper.command");
-  if (descriptor == nullptr) {
-    throw std::logic_error(
-        "Lite6 aggregate fixture requires tool.gripper.command");
-  }
-  const std::string capability_bytes =
-      canonical_json(CanonicalValue(CanonicalValue::Object{
-          {"api_version",
-           CanonicalValue(std::string(core::kCapabilityDefinitionApiVersion))},
-          {"capability_id", CanonicalValue("tool.gripper.command")},
-          {"scope",
-           CanonicalValue(std::string(core::to_string(descriptor->scope)))},
-          {"provider_binding_kind", CanonicalValue(std::string(core::to_string(
-                                        descriptor->provider_binding_kind)))},
-          {"capability_definition_revision",
-           CanonicalValue(
-               std::string(descriptor->capability_definition_revision))},
-      }));
-  const core::ContentDigest capability_digest(sha256_digest(capability_bytes));
-  const core::ContentAddressedStoreKey capability_key(
-      catalog_key("capability", capability_digest.value()));
-  const core::CapabilityDefinitionCatalogRecordRefDTO capability_ref{
-      core::CapabilityId("tool.gripper.command"),
-      core::CapabilityDefinitionRevision(
-          std::string(descriptor->capability_definition_revision)),
-      core::SchemaId(std::string(core::kCapabilityDefinitionApiVersion)),
-      schema_revision_for(core::CatalogRecordKind::kCapabilityDefinition),
-      capability_digest,
-      capability_key,
+[[nodiscard]] inline QualifiedControlCatalog add_aggregate_gripper_catalog(
+    QualifiedControlCatalog catalog, bool stoppable = false,
+    std::string_view lifecycle_semantic_digest = {}, bool operator_confirmation = false) {
+  const auto qualify_gripper_capability = [&](std::string_view id) {
+    const auto* descriptor = core::find_builtin_capability_definition(id);
+    if (descriptor == nullptr) {
+      throw std::logic_error("Lite6 aggregate fixture requires tool.gripper.command");
+    }
+    const std::string capability_bytes = canonical_json(CanonicalValue(CanonicalValue::Object{
+        {"api_version", CanonicalValue(std::string(core::kCapabilityDefinitionApiVersion))},
+        {"capability_id", CanonicalValue(std::string(id))},
+        {"scope", CanonicalValue(std::string(core::to_string(descriptor->scope)))},
+        {"provider_binding_kind",
+         CanonicalValue(std::string(core::to_string(descriptor->provider_binding_kind)))},
+        {"capability_definition_revision",
+         CanonicalValue(std::string(descriptor->capability_definition_revision))},
+    }));
+    const core::ContentDigest capability_digest(sha256_digest(capability_bytes));
+    const core::ContentAddressedStoreKey capability_key(
+        catalog_key("capability", capability_digest.value()));
+    const core::CapabilityDefinitionCatalogRecordRefDTO capability_ref{
+        core::CapabilityId(std::string(id)),
+        core::CapabilityDefinitionRevision(std::string(descriptor->capability_definition_revision)),
+        core::SchemaId(std::string(core::kCapabilityDefinitionApiVersion)),
+        schema_revision_for(core::CatalogRecordKind::kCapabilityDefinition),
+        capability_digest,
+        capability_key,
+    };
+    auto qualified =
+        resolve_and_qualify_capability_definition(capability_ref, capability_key, capability_bytes);
+    catalog.artifacts.push_back(
+        catalog_artifact("catalog://capability/" + std::string(id), capability_bytes, qualified));
+    return qualified;
   };
-  auto gripper_capability = resolve_and_qualify_capability_definition(
-      capability_ref, capability_key, capability_bytes);
+  auto gripper_capability = qualify_gripper_capability("tool.gripper.command");
+  if (operator_confirmation) {
+    catalog.gripper_confirmation = qualify_gripper_capability("tool.gripper.confirmation.operator");
+    catalog.gripper_feedback = qualify_gripper_capability("tool.gripper.feedback");
+  }
 
   const std::string command_schema_bytes =
       canonical_json(CanonicalValue(CanonicalValue::Object{
@@ -1558,6 +1555,21 @@ add_aggregate_gripper_catalog(QualifiedControlCatalog catalog,
   })};
   std::vector<QualifiedCapabilityDefinition> capabilities{catalog.capability,
                                                           gripper_capability};
+  CanonicalValue::Array gripper_capabilities;
+  const auto append_gripper_capability = [&](const auto& capability) {
+    gripper_capabilities.emplace_back(CanonicalValue::Object{
+        {"capability_id", CanonicalValue(capability.value().capability_id.value())},
+        {"capability_definition_revision",
+         CanonicalValue(capability.value().capability_definition_revision.value())},
+    });
+  };
+  append_gripper_capability(gripper_capability);
+  for (const auto* capability : {&catalog.gripper_confirmation, &catalog.gripper_feedback}) {
+    if (capability->has_value()) {
+      capabilities.push_back(**capability);
+      append_gripper_capability(**capability);
+    }
+  }
   for (const auto &planner_capability : catalog.planner_capabilities) {
     arm_capabilities.emplace_back(CanonicalValue::Object{
         {"capability_id",
@@ -1570,16 +1582,14 @@ add_aggregate_gripper_catalog(QualifiedControlCatalog catalog,
   }
   const std::string component_bytes = revisioned_document(
       CanonicalValue(CanonicalValue::Object{
-          {"api_version",
-           CanonicalValue(std::string(core::kComponentTypeApiVersion))},
+          {"api_version", CanonicalValue(std::string(core::kComponentTypeApiVersion))},
           {"component_type_id", CanonicalValue("lite6_arm_gripper_component")},
           {"tags", text_array({"articulated-arm", "articulated-gripper"})},
           {"model_roles",
-           CanonicalValue(
-               CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
-                   {"model_role_id", CanonicalValue("arm_model")},
-                   {"cardinality", CanonicalValue("exactly_one")},
-               })})},
+           CanonicalValue(CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+               {"model_role_id", CanonicalValue("arm_model")},
+               {"cardinality", CanonicalValue("exactly_one")},
+           })})},
           {"component_root", CanonicalValue(CanonicalValue::Object{
                                  {"model_role_id", CanonicalValue("arm_model")},
                                  {"frame_role_id", CanonicalValue("root")},
@@ -1588,98 +1598,67 @@ add_aggregate_gripper_catalog(QualifiedControlCatalog catalog,
           {"command_targets",
            CanonicalValue(CanonicalValue::Array{
                CanonicalValue(CanonicalValue::Object{
-                   {"command_target_id",
-                    CanonicalValue(std::string(kLite6ArmTargetId))},
+                   {"command_target_id", CanonicalValue(std::string(kLite6ArmTargetId))},
                    {"model_group_roles",
-                    CanonicalValue(CanonicalValue::Array{
-                        CanonicalValue(CanonicalValue::Object{
-                            {"model_group_role_id",
-                             CanonicalValue("planning_group")},
-                            {"model_role_id", CanonicalValue("arm_model")},
-                            {"asset_model_group_role_id",
-                             CanonicalValue("arm")},
-                        })})},
+                    CanonicalValue(CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+                        {"model_group_role_id", CanonicalValue("planning_group")},
+                        {"model_role_id", CanonicalValue("arm_model")},
+                        {"asset_model_group_role_id", CanonicalValue("arm")},
+                    })})},
                    {"resource_roles",
-                    CanonicalValue(CanonicalValue::Array{
-                        CanonicalValue(CanonicalValue::Object{
-                            {"resource_role_id", CanonicalValue("joints")},
-                            {"source_kind", CanonicalValue("model_role")},
-                            {"model_role_id", CanonicalValue("arm_model")},
-                            {"asset_resource_role_id",
-                             CanonicalValue("arm_joints")},
-                        })})},
-                   {"frame_roles",
-                    CanonicalValue(CanonicalValue::Array{
-                        CanonicalValue(CanonicalValue::Object{
-                            {"frame_role_id", CanonicalValue("base")},
-                            {"model_role_id", CanonicalValue("arm_model")},
-                            {"asset_frame_role_id", CanonicalValue("base")},
-                        }),
-                        CanonicalValue(CanonicalValue::Object{
-                            {"frame_role_id", CanonicalValue("tcp")},
-                            {"model_role_id", CanonicalValue("arm_model")},
-                            {"asset_frame_role_id", CanonicalValue("tcp")},
-                        })})},
+                    CanonicalValue(CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+                        {"resource_role_id", CanonicalValue("joints")},
+                        {"source_kind", CanonicalValue("model_role")},
+                        {"model_role_id", CanonicalValue("arm_model")},
+                        {"asset_resource_role_id", CanonicalValue("arm_joints")},
+                    })})},
+                   {"frame_roles", CanonicalValue(CanonicalValue::Array{
+                                       CanonicalValue(CanonicalValue::Object{
+                                           {"frame_role_id", CanonicalValue("base")},
+                                           {"model_role_id", CanonicalValue("arm_model")},
+                                           {"asset_frame_role_id", CanonicalValue("base")},
+                                       }),
+                                       CanonicalValue(CanonicalValue::Object{
+                                           {"frame_role_id", CanonicalValue("tcp")},
+                                           {"model_role_id", CanonicalValue("arm_model")},
+                                           {"asset_frame_role_id", CanonicalValue("tcp")},
+                                       })})},
                    {"collision_body_roles",
-                    CanonicalValue(CanonicalValue::Array{
-                        CanonicalValue(CanonicalValue::Object{
-                            {"collision_body_role_id",
-                             CanonicalValue("arm_collision")},
-                            {"model_role_id", CanonicalValue("arm_model")},
-                            {"asset_collision_body_role_id",
-                             CanonicalValue("arm_collision")},
-                        })})},
-                   {"capabilities",
-                    CanonicalValue(std::move(arm_capabilities))},
+                    CanonicalValue(CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+                        {"collision_body_role_id", CanonicalValue("arm_collision")},
+                        {"model_role_id", CanonicalValue("arm_model")},
+                        {"asset_collision_body_role_id", CanonicalValue("arm_collision")},
+                    })})},
+                   {"capabilities", CanonicalValue(std::move(arm_capabilities))},
                }),
                CanonicalValue(CanonicalValue::Object{
-                   {"command_target_id",
-                    CanonicalValue(std::string(kLite6GripperTargetId))},
+                   {"command_target_id", CanonicalValue(std::string(kLite6GripperTargetId))},
                    {"model_group_roles",
-                    CanonicalValue(CanonicalValue::Array{
-                        CanonicalValue(CanonicalValue::Object{
-                            {"model_group_role_id",
-                             CanonicalValue("planning_group")},
-                            {"model_role_id", CanonicalValue("arm_model")},
-                            {"asset_model_group_role_id",
-                             CanonicalValue("gripper")},
-                        })})},
+                    CanonicalValue(CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+                        {"model_group_role_id", CanonicalValue("planning_group")},
+                        {"model_role_id", CanonicalValue("arm_model")},
+                        {"asset_model_group_role_id", CanonicalValue("gripper")},
+                    })})},
                    {"resource_roles",
-                    CanonicalValue(CanonicalValue::Array{
-                        CanonicalValue(CanonicalValue::Object{
-                            {"resource_role_id", CanonicalValue("fingers")},
-                            {"source_kind", CanonicalValue("model_role")},
-                            {"model_role_id", CanonicalValue("arm_model")},
-                            {"asset_resource_role_id",
-                             CanonicalValue("gripper_joint")},
-                        })})},
+                    CanonicalValue(CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+                        {"resource_role_id", CanonicalValue("fingers")},
+                        {"source_kind", CanonicalValue("model_role")},
+                        {"model_role_id", CanonicalValue("arm_model")},
+                        {"asset_resource_role_id", CanonicalValue("gripper_joint")},
+                    })})},
                    {"frame_roles",
-                    CanonicalValue(CanonicalValue::Array{
-                        CanonicalValue(CanonicalValue::Object{
-                            {"frame_role_id", CanonicalValue("tcp")},
-                            {"model_role_id", CanonicalValue("arm_model")},
-                            {"asset_frame_role_id", CanonicalValue("tcp")},
-                        })})},
+                    CanonicalValue(CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+                        {"frame_role_id", CanonicalValue("tcp")},
+                        {"model_role_id", CanonicalValue("arm_model")},
+                        {"asset_frame_role_id", CanonicalValue("tcp")},
+                    })})},
                    {"collision_body_roles",
-                    CanonicalValue(CanonicalValue::Array{
-                        CanonicalValue(CanonicalValue::Object{
-                            {"collision_body_role_id",
-                             CanonicalValue("gripper_collision")},
-                            {"model_role_id", CanonicalValue("arm_model")},
-                            {"asset_collision_body_role_id",
-                             CanonicalValue("gripper_collision")},
-                        })})},
-                   {"capabilities",
-                    CanonicalValue(CanonicalValue::Array{
-                        CanonicalValue(CanonicalValue::Object{
-                            {"capability_id",
-                             CanonicalValue(gripper_capability.value()
-                                                .capability_id.value())},
-                            {"capability_definition_revision",
-                             CanonicalValue(
-                                 gripper_capability.value()
-                                     .capability_definition_revision.value())},
-                        })})},
+                    CanonicalValue(CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+                        {"collision_body_role_id", CanonicalValue("gripper_collision")},
+                        {"model_role_id", CanonicalValue("arm_model")},
+                        {"asset_collision_body_role_id", CanonicalValue("gripper_collision")},
+                    })})},
+                   {"capabilities", CanonicalValue(std::move(gripper_capabilities))},
                }),
            })},
           {"attachment_interfaces", CanonicalValue(CanonicalValue::Array{})},
@@ -1817,6 +1796,16 @@ add_aggregate_gripper_catalog(QualifiedControlCatalog catalog,
            gripper_capability.value().capability_definition_revision.value())},
       {"required_endpoint_role_ids", text_array({"command", "state"})},
   })};
+  for (const auto* capability : {&catalog.gripper_confirmation, &catalog.gripper_feedback}) {
+    if (capability->has_value()) {
+      gripper_offers.emplace_back(CanonicalValue::Object{
+          {"capability_id", CanonicalValue((*capability)->value().capability_id.value())},
+          {"capability_definition_revision",
+           CanonicalValue((*capability)->value().capability_definition_revision.value())},
+          {"required_endpoint_role_ids", text_array({"command", "state"})},
+      });
+    }
+  }
   if (!lifecycle_semantic_digest.empty()) {
     append_lifecycle_capability_offers(gripper_offers);
   }
@@ -1918,9 +1907,6 @@ add_aggregate_gripper_catalog(QualifiedControlCatalog catalog,
                      }),
       catalog.artifacts.end());
   catalog.artifacts.push_back(
-      catalog_artifact("catalog://capability/tool.gripper.command",
-                       capability_bytes, gripper_capability));
-  catalog.artifacts.push_back(
       catalog_artifact("catalog://command_schema/gripper.command_position",
                        command_schema_bytes, command_schema));
   catalog.artifacts.push_back(
@@ -2015,21 +2001,18 @@ make_graph(const Lite6StructuralRetentionFixture &structural,
     runtime_units.emplace_back(CanonicalValue::Object{
         {"runtime_unit_id", CanonicalValue(runtime_unit_id)},
         {"runtime_profile_id",
-         CanonicalValue(
-             std::string(ros2_control_execution
-                             ? detail::kRos2ControlExecutionRuntimeProfileId
-                             : detail::kNativeExecutionRuntimeProfileId))},
+         CanonicalValue(std::string(ros2_control_execution
+                                        ? detail::kRos2ControlExecutionRuntimeProfileId
+                                        : detail::kNativeExecutionRuntimeProfileId))},
         {"runtime_profile_revision",
-         CanonicalValue(
-             ros2_control_execution
-                 ? detail::ros2_control_execution_runtime_profile_revision()
-                 : detail::native_execution_runtime_profile_revision())},
-        {"dependency_runtime_unit_ids",
-         CanonicalValue(CanonicalValue::Array{})},
-        {"configuration", ros2_control_execution
-                              ? ros2_control_execution_configuration()
-                              : native_execution_configuration(component_id,
-                                                               aggregate)},
+         CanonicalValue(ros2_control_execution
+                            ? detail::ros2_control_execution_runtime_profile_revision()
+                            : detail::native_execution_runtime_profile_revision())},
+        {"dependency_runtime_unit_ids", CanonicalValue(CanonicalValue::Array{})},
+        {"configuration", ros2_control_execution ? ros2_control_execution_configuration()
+                                                 : native_execution_configuration(
+                                                       component_id, aggregate,
+                                                       catalog.gripper_confirmation.has_value())},
     });
     components.emplace_back(CanonicalValue::Object{
         {"controllable_component_id", CanonicalValue(component_id)},
@@ -2218,6 +2201,24 @@ make_graph(const Lite6StructuralRetentionFixture &structural,
                gripper_stop.value().stop_evidence_policy_revision.value())},
           {"containment_granularity", CanonicalValue("resource")},
       });
+      for (const auto* capability : {&catalog.gripper_confirmation, &catalog.gripper_feedback}) {
+        if (!capability->has_value()) continue;
+        // The same physical owner/route, with a separately qualified source
+        // capability. No new actuator, worker or readiness bypass.
+        auto confirmation_binding = bindings.back().as_object();
+        for (auto& [name, value] : confirmation_binding) {
+          if (name == "control_binding_id") {
+            value = CanonicalValue(capability == &catalog.gripper_confirmation
+                                       ? "lite6_gripper_confirmation"
+                                       : "lite6_gripper_feedback");
+          } else if (name == "capability_id") {
+            value = CanonicalValue((*capability)->value().capability_id.value());
+          } else if (name == "capability_definition_revision") {
+            value = CanonicalValue((*capability)->value().capability_definition_revision.value());
+          }
+        }
+        bindings.emplace_back(std::move(confirmation_binding));
+      }
     }
   }
 
@@ -2583,17 +2584,15 @@ make_applicability_inputs(
 
 } // namespace lite6_controllable_fixture_detail
 
-[[nodiscard]] inline Lite6ControllableRetentionFixture
-make_lite6_controllable_retention_fixture(
-    bool chained = false, bool assistant_enabled = false,
-    std::size_t instance_count = 1U, bool aggregate_gripper = false,
-    bool native_motion = false, std::string_view cell_id = {},
+[[nodiscard]] inline Lite6ControllableRetentionFixture make_lite6_controllable_retention_fixture(
+    bool chained = false, bool assistant_enabled = false, std::size_t instance_count = 1U,
+    bool aggregate_gripper = false, bool native_motion = false, std::string_view cell_id = {},
     bool composer_draft_enabled = false, bool stoppable = false,
     std::string_view containment_granularity = "resource",
     bool qualified_motion_controlled_stop = false,
     std::string_view arm_lifecycle_semantic_digest = {},
-    std::string_view gripper_lifecycle_semantic_digest = {},
-    bool ros2_control_execution = false) {
+    std::string_view gripper_lifecycle_semantic_digest = {}, bool ros2_control_execution = false,
+    bool operator_confirmation = false) {
   namespace fixture_detail = lite6_controllable_fixture_detail;
   if (aggregate_gripper && (chained || instance_count != 1U)) {
     throw std::logic_error(
@@ -2603,6 +2602,9 @@ make_lite6_controllable_retention_fixture(
   if (composer_draft_enabled && !assistant_enabled) {
     throw std::logic_error(
         "Composer Draft fixture requires assistant settings");
+  }
+  if (operator_confirmation && (!aggregate_gripper || !native_motion || ros2_control_execution)) {
+    throw std::logic_error("operator confirmation fixture requires the native gripper owner");
   }
   if (ros2_control_execution && (!native_motion || chained ||
                                  aggregate_gripper || instance_count != 1U)) {
@@ -2638,7 +2640,7 @@ make_lite6_controllable_retention_fixture(
   }
   if (aggregate_gripper) {
     catalog = fixture_detail::add_aggregate_gripper_catalog(
-        std::move(catalog), stoppable, gripper_lifecycle_semantic_digest);
+        std::move(catalog), stoppable, gripper_lifecycle_semantic_digest, operator_confirmation);
   }
   const auto graph = fixture_detail::make_graph(
       structural, catalog, instance_count, cell_id, containment_granularity);
@@ -2673,6 +2675,9 @@ make_lite6_controllable_retention_fixture(
   }
   if (catalog.gripper_stop.has_value()) {
     catalog_records.push_back(catalog.gripper_stop->reference());
+  }
+  for (const auto* capability : {&catalog.gripper_confirmation, &catalog.gripper_feedback}) {
+    if (capability->has_value()) catalog_records.push_back((*capability)->reference());
   }
   for (const auto &planner_capability : catalog.planner_capabilities) {
     catalog_records.push_back(planner_capability.reference());
@@ -2777,6 +2782,9 @@ make_lite6_controllable_retention_fixture(
   std::vector<QualifiedControlInterfaceContract> contracts{catalog.contract};
   std::vector<QualifiedControllerTopology> topologies{catalog.topology};
   std::vector<QualifiedProviderManifest> providers{catalog.provider};
+  for (const auto* capability : {&catalog.gripper_confirmation, &catalog.gripper_feedback}) {
+    if (capability->has_value()) capabilities.push_back(**capability);
+  }
   if (catalog.gripper_capability.has_value()) {
     command_schemas.push_back(*catalog.gripper_command_schema);
     capabilities.push_back(*catalog.gripper_capability);
@@ -2910,12 +2918,13 @@ make_lite6_stop_qualified_native_motion_retention_fixture() {
 }
 
 [[nodiscard]] inline Lite6ControllableRetentionFixture
-make_lite6_native_cclc_product_retention_fixture(
-    std::string_view arm_lifecycle_semantic_digest,
-    std::string_view gripper_lifecycle_semantic_digest) {
-  return make_lite6_controllable_retention_fixture(
-      false, false, 1U, true, true, {}, false, true, "resource", true,
-      arm_lifecycle_semantic_digest, gripper_lifecycle_semantic_digest);
+make_lite6_native_cclc_product_retention_fixture(std::string_view arm_lifecycle_semantic_digest,
+                                                 std::string_view gripper_lifecycle_semantic_digest,
+                                                 bool operator_confirmation = false) {
+  return make_lite6_controllable_retention_fixture(false, false, 1U, true, true, {}, false, true,
+                                                   "resource", true, arm_lifecycle_semantic_digest,
+                                                   gripper_lifecycle_semantic_digest, false,
+                                                   operator_confirmation);
 }
 
 [[nodiscard]] inline Lite6ControllableRetentionFixture

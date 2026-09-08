@@ -19,12 +19,21 @@ from types import MappingProxyType
 from typing import Any, Final
 
 import py_trees
+from manyforge_example_nodes import FrameHeightQuery
+from manyforge_behavior import qualified_node_extensions as extension
 
 from manyforge_behavior.catalog import CatalogEntry
 from manyforge_behavior.node_environment import NodeEnvironment
-from manyforge_behavior.node_registry import ExecutableRegistryRow
+from manyforge_behavior.node_registry import (
+    BUILTIN_EXECUTABLE_PACKAGE_ID,
+    ExecutableRegistryRow,
+)
 from manyforge_behavior.nodes.control_flow import RepeatDecorator, RetryDecorator
-from manyforge_behavior.nodes.v2_owner import OwnerInvocationAdapter, OwnerTaskAdapter
+from manyforge_behavior.nodes.v2_owner import (
+    OwnerInvocationAdapter,
+    OwnerTaskAdapter,
+    GripperStatusWaitAdapter,
+)
 from manyforge_behavior.nodes.v2_pure import (
     GeometryCheckPoseDistance,
     LogicCheckBool,
@@ -80,8 +89,7 @@ class NodeAdapterBuildContext:
         if not isinstance(self.parameters, Mapping):
             raise TypeError("adapter parameters must be a mapping")
         if not isinstance(self.children, tuple) or any(
-            not isinstance(child, py_trees.behaviour.Behaviour)
-            for child in self.children
+            not isinstance(child, py_trees.behaviour.Behaviour) for child in self.children
         ):
             raise TypeError("adapter children must be a tuple of py_trees behaviours")
         object.__setattr__(
@@ -275,10 +283,18 @@ def _owner_invocation_builder(
     *,
     output_key_parameter: str | None = None,
     blackboard_read_parameters: tuple[str, ...] = (),
+    transform_port: Callable[[OwnerInvocationPort], OwnerInvocationPort] | None = None,
 ) -> NodeAdapterBuilder:
     def build(context: NodeAdapterBuildContext) -> py_trees.behaviour.Behaviour:
         port = _required_port(context, port_name)
-        return OwnerInvocationAdapter(
+        if transform_port is not None:
+            port = transform_port(port)
+        adapter = (
+            GripperStatusWaitAdapter
+            if node_id == "gripper.wait_for_status"
+            else OwnerInvocationAdapter
+        )
+        return adapter(
             name=context.name,
             node_id=node_id,
             node_instance_id=context.node_instance_id,
@@ -401,9 +417,7 @@ _DEFERRED_BY_NODE: Final[Mapping[str, tuple[str, tuple[str, ...]]]] = MappingPro
 
 def _output_key_parameter(entry: CatalogEntry) -> str | None:
     if len(entry.blackboard_writes) > 1:
-        raise ExecutableNodeResolverError(
-            f"node {entry.id!r} has multiple output bindings"
-        )
+        raise ExecutableNodeResolverError(f"node {entry.id!r} has multiple output bindings")
     return entry.blackboard_writes[0].key_parameter if entry.blackboard_writes else None
 
 
@@ -411,6 +425,13 @@ def _definition_for(
     row: ExecutableRegistryRow,
     entry: CatalogEntry,
 ) -> _AdapterDefinition:
+    expected_package = (
+        extension.PACKAGE_ID if row.node_id == extension.NODE_ID else BUILTIN_EXECUTABLE_PACKAGE_ID
+    )
+    if row.executable_package_id != expected_package:
+        raise ExecutableNodeResolverError(
+            "node implementation belongs to another qualified package"
+        )
     if row.engine_id != "py_trees":
         raise ExecutableNodeResolverError(
             f"engine {row.engine_id!r} has no build-qualified resolver"
@@ -418,6 +439,22 @@ def _definition_for(
     if entry.runner_implementation_ids.get(row.engine_id) != row.implementation_id:
         raise ExecutableNodeResolverError(
             f"row for {row.node_id!r} disagrees with catalog runner metadata"
+        )
+    if row.executable_package_id == extension.PACKAGE_ID:
+        if (
+            row.node_id != extension.NODE_ID
+            or row.implementation_id != extension.IMPLEMENTATION_ID
+            or entry.execution.owner_api != "model.kinematics"
+        ):
+            raise ExecutableNodeResolverError("extension row has no reviewed adapter")
+        return _AdapterDefinition(
+            row,
+            _owner_invocation_builder(
+                row.node_id, "model_queries", transform_port=FrameHeightQuery
+            ),
+            "model_queries",
+            None,
+            (),
         )
     deferred = _DEFERRED_BY_NODE.get(row.node_id)
     if deferred is not None:
@@ -445,20 +482,16 @@ def _definition_for(
         )
 
     output_key_parameter = _output_key_parameter(entry)
-    blackboard_read_parameters = tuple(
-        binding.key_parameter for binding in entry.blackboard_reads
-    )
+    blackboard_read_parameters = tuple(binding.key_parameter for binding in entry.blackboard_reads)
     task_port = _TASK_OWNER_PORTS.get(entry.execution.owner_api)
     invocation_port = _INVOCATION_OWNER_PORTS.get(entry.execution.owner_api)
     if entry.execution.owner_api == "kernel.command_target":
         if row.node_id == "gripper.command_position":
             task_port = "kernel_operations"
-        elif row.node_id == "gripper.check_status":
+        elif row.node_id in {"gripper.check_status", "gripper.wait_for_status"}:
             invocation_port = "gripper_status"
     if task_port is not None and invocation_port is not None:
-        raise ExecutableNodeResolverError(
-            f"node {row.node_id!r} has ambiguous owner-port binding"
-        )
+        raise ExecutableNodeResolverError(f"node {row.node_id!r} has ambiguous owner-port binding")
     if task_port is not None:
         return _AdapterDefinition(
             row,
@@ -502,9 +535,7 @@ class ExecutableNodeResolver:
             for row in environment.registry.rows
         }
         if len(definitions) != len(environment.registry.rows):
-            raise ExecutableNodeResolverError(
-                "retained environment contains duplicate exact rows"
-            )
+            raise ExecutableNodeResolverError("retained environment contains duplicate exact rows")
         self._environment_digest = environment.environment_digest
         self._definitions = MappingProxyType(definitions)
 
@@ -522,9 +553,7 @@ class ExecutableNodeResolver:
                 unavailable_reason_code=definition.unavailable_reason_code,
                 restoration_gates=definition.restoration_gates,
             )
-            for definition in sorted(
-                self._definitions.values(), key=lambda item: item.row
-            )
+            for definition in sorted(self._definitions.values(), key=lambda item: item.row)
         )
 
     def disposition(self, row: ExecutableRegistryRow) -> ExecutableNodeDisposition:

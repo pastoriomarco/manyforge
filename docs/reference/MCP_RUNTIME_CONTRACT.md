@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py mcp
-  Last regenerated: 2026-09-07 18:27:03 UTC
+  Last regenerated: 2026-09-08 05:09:41 UTC
   Generator source: scripts/regen-public-contracts.py:gen_mcp_api
 -->
 
@@ -1895,6 +1895,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
               "program_runtime_override_promote",
               "program_runtime_blackboard_write",
               "program_manual_result_stage",
+              "gripper_confirm",
               "operation_start",
               "operation_stop",
               "operation_pause",
@@ -2087,11 +2088,78 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
   },
   "description": "Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unchanged REST DTOs. No implicit Apply, retry, confirmation or identity selection. See each action's schema.",
   "inputSchema": {
-    "$defs": {},
+    "$defs": {
+      "SkillExpansionRequest": {
+        "additionalProperties": false,
+        "description": "Effect-free authoring expansion against one selected build environment.",
+        "properties": {
+          "arguments": {
+            "additionalProperties": true,
+            "maxProperties": 32,
+            "title": "Arguments",
+            "type": "object"
+          },
+          "component_roles": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "maxProperties": 32,
+            "title": "Component Roles",
+            "type": "object"
+          },
+          "expected_environment_digest": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Expected Environment Digest",
+            "type": "string"
+          },
+          "instance_prefix": {
+            "pattern": "^[a-z][a-z0-9_.-]{0,127}$",
+            "title": "Instance Prefix",
+            "type": "string"
+          },
+          "program_context": {
+            "additionalProperties": true,
+            "description": "Portable Program declarations without tree/revision or Composer forest/layout fields.",
+            "title": "Program Context",
+            "type": "object"
+          },
+          "schema_version": {
+            "const": "manyforge.skill_expansion_request.v1",
+            "title": "Schema Version",
+            "type": "string"
+          },
+          "skill_id": {
+            "pattern": "^[a-z][a-z0-9_.-]{0,127}$",
+            "title": "Skill Id",
+            "type": "string"
+          },
+          "target_roles": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "maxProperties": 32,
+            "title": "Target Roles",
+            "type": "object"
+          }
+        },
+        "required": [
+          "schema_version",
+          "expected_environment_digest",
+          "skill_id",
+          "instance_prefix",
+          "arguments",
+          "component_roles",
+          "target_roles",
+          "program_context"
+        ],
+        "title": "SkillExpansionRequest",
+        "type": "object"
+      }
+    },
     "oneOf": [
       {
         "additionalProperties": false,
-        "description": "GET /api/catalog",
+        "description": "GET /api/skills",
         "properties": {
           "action": {
             "const": "catalog",
@@ -2100,6 +2168,24 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
         },
         "required": [
           "action"
+        ],
+        "type": "object"
+      },
+      {
+        "additionalProperties": false,
+        "description": "POST /api/skills/expand",
+        "properties": {
+          "action": {
+            "const": "expand",
+            "type": "string"
+          },
+          "body": {
+            "$ref": "#/$defs/SkillExpansionRequest"
+          }
+        },
+        "required": [
+          "action",
+          "body"
         ],
         "type": "object"
       },
@@ -4508,6 +4594,20 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
         "properties": {
           "action": {
             "const": "health",
+            "type": "string"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object"
+      },
+      {
+        "additionalProperties": false,
+        "description": "GET /api/program/diagnostics/health",
+        "properties": {
+          "action": {
+            "const": "program_recorder",
             "type": "string"
           }
         },

@@ -1058,7 +1058,8 @@ describe('HeadlessStateSource delivery scheduling', () => {
     expect(getHeadlessStateQualificationSnapshot().activeSockets).toBe(0);
   });
 
-  it('drops a stranded unapplied viewer callback before current-only reconnect', () => {
+  it.each(['disconnect', 'model rejection', 'explicit reconnect'])(
+    'keeps viewer delivery independent of control health and drops unapplied frames on %s', (recovery) => {
     vi.useFakeTimers();
     const animationFrames = new Map<number, FrameRequestCallback>();
     let nextAnimationFrame = 0;
@@ -1088,7 +1089,10 @@ describe('HeadlessStateSource delivery scheduling', () => {
         this.onerror?.();
         this.onclose?.();
       }
-      close(): void {
+      close(code = 1000): void {
+        if (code !== 1000 && (code < 3000 || code > 4999)) {
+          throw new Error('browser WebSocket.close rejects reserved protocol codes');
+        }
         if (this.readyState !== FakeWebSocket.OPEN) return;
         this.readyState = 3;
         this.onclose?.();
@@ -1127,25 +1131,43 @@ describe('HeadlessStateSource delivery scheduling', () => {
 
     viewer.sendFrame(wireObservation(2));
     expect(animationFrames.size).toBe(1);
-    viewer.fail();
+    const control = FakeWebSocket.instances.find(
+      (socket) => new URL(socket.url).pathname === '/ws/control',
+    )!;
+    control.onerror?.();
+    expect(source.getShellSnapshot().transportStatus).toBe('disconnected');
+    expect(animationFrames.size).toBe(1);
+    const [secondId, secondCallback] = [...animationFrames.entries()][0]!;
+    animationFrames.delete(secondId);
+    secondCallback(32);
+    expect(applied).toEqual([1, 2]);
+
+    viewer.sendFrame(wireObservation(3));
+    if (recovery === 'disconnect') viewer.fail();
+    else if (recovery === 'model rejection') {
+      source.rejectExecutionObservation(source.getLatestExecutionObservation()!);
+    } else source.reconnect();
     expect(animationFrames.size).toBe(0);
-    expect(source.getLatestExecutionObservation()?.sourceSequence).toBe(1);
+    expect(source.getLatestExecutionObservation()?.sourceSequence).toBe(2);
 
     vi.advanceTimersByTime(1_000);
     const replacement = FakeWebSocket.instances.filter(
       (socket) => new URL(socket.url).pathname === '/ws/scene/viewer',
     ).at(-1)!;
     replacement.open();
-    replacement.sendFrame(wireObservation(3));
+    replacement.sendFrame(wireObservation(4));
+    // A repeated unrendered frame is not an applied acknowledgement.
+    replacement.sendFrame(wireObservation(4));
+    expect(replacement.sent).toHaveLength(1);
     expect(animationFrames.size).toBe(1);
     const [currentId, currentCallback] = [...animationFrames.entries()][0]!;
     animationFrames.delete(currentId);
-    currentCallback(32);
+    currentCallback(48);
 
-    expect(applied).toEqual([1, 3]);
-    expect(source.getLatestExecutionObservation()?.sourceSequence).toBe(3);
+    expect(applied).toEqual([1, 2, 4]);
+    expect(source.getLatestExecutionObservation()?.sourceSequence).toBe(4);
     expect(JSON.parse(replacement.sent.at(-1)!)).toMatchObject({
-      last_applied: { source_sequence: 3 },
+      last_applied: { source_sequence: 4 },
     });
     source.dispose();
     expect(vi.getTimerCount()).toBe(0);

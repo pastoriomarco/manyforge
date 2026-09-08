@@ -249,6 +249,9 @@ struct SummaryIdentities final {
 SummaryIdentities SummaryIdentityValues(const CanonicalValue &payload) {
   SummaryIdentities result;
   std::set<std::string> run, operation, condition;
+  const auto* schema = StringMember(payload, "schema_version");
+  const bool producer_identities_only =
+      schema != nullptr && *schema == "manyforge.program_diagnostic.v1";
   std::size_t visited = 0U;
   bool complete = true;
   const auto visit = [&](auto &&self, const CanonicalValue &current, std::size_t depth) -> void {
@@ -264,7 +267,9 @@ SummaryIdentities SummaryIdentityValues(const CanonicalValue &payload) {
           const auto *text = std::get_if<std::string>(&child.storage());
           if (text != nullptr && !text->empty() && target->size() < 2) target->insert(*text);
         }
-        self(self, child, depth + 1);
+        // Blackboard/override values are user data, never producer attribution.
+        // Match the versioned diagnostic's correlation-index contract.
+        if (!producer_identities_only) self(self, child, depth + 1);
         if (!complete) return;
       }
     } else if (current.is_array()) {
@@ -411,38 +416,48 @@ CanonicalValue HistorianPageValue(const HistorianPage &page) {
   });
 }
 
+CanonicalValue HistorianSummaryEventValue(const HistorianEvent& event,
+                                          std::optional<std::int64_t> occurred_at_utc_ns,
+                                          const std::optional<std::string>& clock_owner,
+                                          bool wall_clock_regressed) {
+  const auto identities = SummaryIdentityValues(event.payload);
+  return CanonicalValue(CanonicalValue::Object{
+      {"component", CanonicalValue(event.component)},
+      {"condition_id", OptionalString(identities.condition_id)},
+      {"condition_severity", CanonicalValue(HistorianConditionSeverity(event))},
+      {"clock_owner", OptionalString(clock_owner)},
+      {"event_id", CanonicalValue(event.event_id)},
+      {"event_type", CanonicalValue(event.event_type)},
+      {"message", CanonicalValue(SummaryMessage(event))},
+      {"occurred_at_ns", CanonicalValue(std::to_string(event.occurred_at_ns))},
+      {"occurred_at_wall", CanonicalValue(event.occurred_at_wall)},
+      {"occurred_at_utc_ns", occurred_at_utc_ns
+                                 ? CanonicalValue(std::to_string(*occurred_at_utc_ns))
+                                 : CanonicalValue(nullptr)},
+      {"wall_clock_regressed", CanonicalValue(wall_clock_regressed)},
+      {"operation_id", OptionalString(identities.operation_id)},
+      {"program_run_id", OptionalString(identities.program_run_id)},
+      {"schema_version", CanonicalValue(std::string(kHistorianEventSummarySchemaVersion))},
+      {"severity", CanonicalValue(event.severity)},
+  });
+}
+
 CanonicalValue HistorianSummaryPageValue(const HistorianPage &page) {
   CanonicalValue::Array events;
   events.reserve(page.events.size());
   for (const auto &stored : page.events) {
     ValidateEvent(stored.event);
-    const auto identities = SummaryIdentityValues(stored.event.payload);
     events.emplace_back(CanonicalValue(CanonicalValue::Object{
-        {"event",
-         CanonicalValue(CanonicalValue::Object{
-             {"component", CanonicalValue(stored.event.component)},
-             {"condition_id", OptionalString(identities.condition_id)},
-             {"condition_severity", CanonicalValue(HistorianConditionSeverity(stored.event))},
-             {"clock_owner", OptionalString(stored.clock_owner)},
-             {"event_id", CanonicalValue(stored.event.event_id)},
-             {"event_type", CanonicalValue(stored.event.event_type)},
-             {"message", CanonicalValue(SummaryMessage(stored.event))},
-             {"occurred_at_ns",
-              CanonicalValue(std::to_string(stored.event.occurred_at_ns))},
-             {"occurred_at_wall",
-              CanonicalValue(stored.event.occurred_at_wall)},
-             {"occurred_at_utc_ns", stored.occurred_at_utc_ns
-                 ? CanonicalValue(std::to_string(*stored.occurred_at_utc_ns)) : CanonicalValue(nullptr)},
-             {"wall_clock_regressed", CanonicalValue(stored.wall_clock_regressed)},
-             {"operation_id", OptionalString(identities.operation_id)},
-             {"program_run_id", OptionalString(identities.program_run_id)},
-             {"schema_version",
-              CanonicalValue(std::string(kHistorianEventSummarySchemaVersion))},
-             {"severity", CanonicalValue(stored.event.severity)},
-         })},
+        {"event", HistorianSummaryEventValue(stored.event, stored.occurred_at_utc_ns,
+                                             stored.clock_owner, stored.wall_clock_regressed)},
         {"sequence", Number(stored.sequence, "sequence")},
     }));
   }
+  return HistorianSummaryEnvelopeValue(std::move(events), page);
+}
+
+CanonicalValue HistorianSummaryEnvelopeValue(CanonicalValue::Array events,
+                                             const HistorianPage& page) {
   return CanonicalValue(CanonicalValue::Object{
       {"events", CanonicalValue(std::move(events))},
       {"next_before_sequence",

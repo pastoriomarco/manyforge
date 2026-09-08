@@ -23,9 +23,7 @@ from manyforge_behavior.node_registry import build_node_registry
 
 
 CATALOG_PATH = Path(__file__).parent.parent / "resources" / "node_catalog.yaml"
-EXPECTED_CATALOG_DIGEST = (
-    "sha256:5fce54890158a72df20063dac31531ede96dbf27b01be3a8256099c7e0ba1bb4"
-)
+EXPECTED_CATALOG_DIGEST = "sha256:7c16314aeddbdea7942cdab09aa0e2da6c913e2044adcf5c3d99111c6b280ffd"
 
 
 def _catalog_data() -> dict[str, object]:
@@ -37,9 +35,7 @@ def _write_recomputed(tmp_path: Path, mutation) -> Path:
     mutation(data)
     payload = dict(data)
     payload.pop("catalog_digest", None)
-    data["catalog_digest"] = (
-        "sha256:" + hashlib.sha256(rfc8785.dumps(payload)).hexdigest()
-    )
+    data["catalog_digest"] = "sha256:" + hashlib.sha256(rfc8785.dumps(payload)).hexdigest()
     path = tmp_path / "catalog.yaml"
     path.write_text(
         json.dumps(data, ensure_ascii=False, allow_nan=False),
@@ -55,14 +51,17 @@ def test_shipped_catalog_is_exact_frozen_v2_packet() -> None:
     assert catalog.content_version == EXPECTED_CONTENT_VERSION
     assert catalog.catalog_id == "manyforge_builtin"
     assert catalog.catalog_digest == EXPECTED_CATALOG_DIGEST
-    assert len(catalog.entries) == 50
-    assert len(
-        {
-            (entry.id, engine_id, implementation_id)
-            for entry in catalog.entries
-            for engine_id, implementation_id in entry.runner_implementation_ids.items()
-        }
-    ) == 50
+    assert len(catalog.entries) == 52
+    assert (
+        len(
+            {
+                (entry.id, engine_id, implementation_id)
+                for entry in catalog.entries
+                for engine_id, implementation_id in entry.runner_implementation_ids.items()
+            }
+        )
+        == 52
+    )
 
 
 def test_catalog_exposes_structured_v2_semantics() -> None:
@@ -73,9 +72,7 @@ def test_catalog_exposes_structured_v2_semantics() -> None:
     assert move.category == "motion"
     assert move.min_program_profile == "composable-cell-v1"
     assert move.execution.owner_api == "kernel.operation"
-    assert move.runner_implementation_ids == {
-        "py_trees": "motion_move_to_pose_v1"
-    }
+    assert move.runner_implementation_ids == {"py_trees": "motion_move_to_pose_v1"}
     assert {parameter.id for parameter in move.parameters} == {
         "acceleration_scale",
         "base_frame_role",
@@ -98,8 +95,7 @@ def test_catalog_exposes_structured_v2_semantics() -> None:
         "velocity_scale",
     }
     assert {
-        (requirement.capability_id, requirement.scope)
-        for requirement in move.required_capabilities
+        (requirement.capability_id, requirement.scope) for requirement in move.required_capabilities
     } >= {
         ("planning.motion.pose_goal", "target_binding"),
         ("execution.trajectory.execute", "target_binding"),
@@ -116,22 +112,13 @@ def test_catalog_schema_retains_semantic_role_and_validates_defaults() -> None:
     catalog = NodeCatalog(CATALOG_PATH)
     move = catalog.get("motion.move_to_pose")
     joint_target = catalog.schema_registry.types["joint_target"]
-    target_role = next(
-        parameter for parameter in move.parameters if parameter.id == "target_role"
-    )
+    target_role = next(parameter for parameter in move.parameters if parameter.id == "target_role")
     planning_profile = next(
-        parameter
-        for parameter in move.parameters
-        if parameter.id == "planning_profile"
+        parameter for parameter in move.parameters if parameter.id == "planning_profile"
     )
-    joint_name = catalog.schema_registry.resolve(
-        joint_target.properties["joint_name"]
-    )
+    joint_name = catalog.schema_registry.resolve(joint_target.properties["joint_name"])
 
-    assert (
-        catalog.schema_registry.resolve(target_role.schema).semantic_type
-        == "target_role"
-    )
+    assert catalog.schema_registry.resolve(target_role.schema).semantic_type == "target_role"
     assert joint_target.required == ("joint_name", "position_rad")
     assert joint_name.semantic_type == "source_joint"
     assert planning_profile.has_default is True
@@ -146,11 +133,14 @@ def test_catalog_schema_retains_semantic_role_and_validates_defaults() -> None:
     )
 
     dynamics = catalog.schema_registry.types["per_joint_dynamics_limits"]
-    assert validate_value(
-        dynamics,
-        {"shoulder_pan_joint": {"max_velocity_rad_s": 1.0}},
-        registry=catalog.schema_registry,
-    ) == []
+    assert (
+        validate_value(
+            dynamics,
+            {"shoulder_pan_joint": {"max_velocity_rad_s": 1.0}},
+            registry=catalog.schema_registry,
+        )
+        == []
+    )
     assert validate_value(
         dynamics,
         {"shoulder_pan_joint": {"max_velocity_rad_s": 0.0}},
@@ -171,17 +161,11 @@ def test_catalog_projects_declared_semantic_scope_for_fields_and_array_items() -
     assert "Attached" in detach.description
     assert "Detached" in detach.description
 
-    carrier_schema = catalog.schema_registry.to_json_schema(
-        parameters["carrier_frame_role"].schema
-    )
-    touch_schema = catalog.schema_registry.to_json_schema(
-        parameters["touch_body_roles"].schema
-    )
+    carrier_schema = catalog.schema_registry.to_json_schema(parameters["carrier_frame_role"].schema)
+    touch_schema = catalog.schema_registry.to_json_schema(parameters["touch_body_roles"].schema)
 
     assert carrier_schema["x-manyforge-semantic-scope-parameter"] == "target_role"
-    assert touch_schema["items"]["x-manyforge-semantic-scope-parameter"] == (
-        "target_role"
-    )
+    assert touch_schema["items"]["x-manyforge-semantic-scope-parameter"] == ("target_role")
 
 
 def test_recomputed_catalog_rejects_unknown_semantic_scope_parameter(
@@ -189,9 +173,7 @@ def test_recomputed_catalog_rejects_unknown_semantic_scope_parameter(
 ) -> None:
     def mutate(data: dict[str, object]) -> None:
         attach = next(
-            entry
-            for entry in data["entries"]
-            if entry["id"] == "scene.attach_carried_object"
+            entry for entry in data["entries"] if entry["id"] == "scene.attach_carried_object"
         )
         carrier = next(
             parameter
@@ -223,14 +205,9 @@ def test_translation_catalog_preserves_assistant_and_cpp_pick_place_contracts() 
     assert preview.execution.owner_api == "planning.pick_sequence"
     assert preview.blackboard_writes[0].value_type == "pick_planning_result"
     selected_object = next(
-        parameter
-        for parameter in preview.parameters
-        if parameter.id == "selected_object_id"
+        parameter for parameter in preview.parameters if parameter.id == "selected_object_id"
     )
-    assert (
-        catalog.schema_registry.resolve(selected_object.schema).semantic_type
-        == "scene_resource"
-    )
+    assert catalog.schema_registry.resolve(selected_object.schema).semantic_type == "scene_resource"
 
     for node_id in ("motion.pick_object", "motion.place_object"):
         node = catalog.get(node_id)
@@ -292,8 +269,7 @@ def test_recomputed_packet_change_cannot_reuse_frozen_content_version(
 def test_strict_loader_rejects_duplicate_keys(tmp_path: Path) -> None:
     path = tmp_path / "duplicate.yaml"
     path.write_text(
-        "api_version: manyforge.node_catalog.v2\n"
-        "api_version: manyforge.node_catalog.v2\n",
+        "api_version: manyforge.node_catalog.v2\n" "api_version: manyforge.node_catalog.v2\n",
         encoding="utf-8",
     )
 
@@ -325,9 +301,9 @@ def test_distinct_nodes_may_share_one_registered_implementation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def mutate(data: dict[str, object]) -> None:
-        data["entries"][1]["runners"]["py_trees"]["implementation_id"] = (
-            data["entries"][0]["runners"]["py_trees"]["implementation_id"]
-        )
+        data["entries"][1]["runners"]["py_trees"]["implementation_id"] = data["entries"][0][
+            "runners"
+        ]["py_trees"]["implementation_id"]
 
     path = _write_recomputed(tmp_path, mutate)
     digest = json.loads(path.read_text(encoding="utf-8"))["catalog_digest"]
@@ -339,8 +315,7 @@ def test_distinct_nodes_may_share_one_registered_implementation(
     catalog = NodeCatalog(path)
     registry = build_node_registry(catalog)
     node_ids = [
-        entry["id"]
-        for entry in json.loads(path.read_text(encoding="utf-8"))["entries"][:2]
+        entry["id"] for entry in json.loads(path.read_text(encoding="utf-8"))["entries"][:2]
     ]
 
     assert (
@@ -353,11 +328,7 @@ def test_recomputed_catalog_rejects_wrong_capability_scope(
     tmp_path: Path,
 ) -> None:
     def mutate(data: dict[str, object]) -> None:
-        move = next(
-            entry
-            for entry in data["entries"]
-            if entry["id"] == "motion.move_to_pose"
-        )
+        move = next(entry for entry in data["entries"] if entry["id"] == "motion.move_to_pose")
         move["required_capabilities"][0]["scope"] = "cell_global"
         move["required_capabilities"][0].pop("target_parameter")
 
@@ -371,14 +342,10 @@ def test_recomputed_catalog_rejects_source_joint_without_one_target_scope(
 ) -> None:
     def mutate(data: dict[str, object]) -> None:
         move = next(
-            entry
-            for entry in data["entries"]
-            if entry["id"] == "motion.move_to_joint_target"
+            entry for entry in data["entries"] if entry["id"] == "motion.move_to_joint_target"
         )
         target = next(
-            parameter
-            for parameter in move["parameters"]
-            if parameter["id"] == "target_role"
+            parameter for parameter in move["parameters"] if parameter["id"] == "target_role"
         )
         target["schema"]["semantic_type"] = "component_role"
 
@@ -411,9 +378,7 @@ def test_recomputed_catalog_rejects_authoring_schema_as_persisted_parameter(
     def mutate(data: dict[str, object]) -> None:
         timer = next(entry for entry in data["entries"] if entry["id"] == "timer")
         timer["parameters"][0].pop("schema")
-        timer["parameters"][0]["schema_ref"] = (
-            "#/schema_types/pose_authoring_input"
-        )
+        timer["parameters"][0]["schema_ref"] = "#/schema_types/pose_authoring_input"
 
     path = _write_recomputed(tmp_path, mutate)
     with pytest.raises(CatalogValidationError, match="authoring-only schema"):
@@ -424,9 +389,7 @@ def test_recomputed_catalog_rejects_blackboard_control_protocol(
     tmp_path: Path,
 ) -> None:
     def mutate(data: dict[str, object]) -> None:
-        setter = next(
-            entry for entry in data["entries"] if entry["id"] == "logic.set_bool"
-        )
+        setter = next(entry for entry in data["entries"] if entry["id"] == "logic.set_bool")
         setter["parameters"][0]["id"] = "stop_requested"
         setter["blackboard"]["writes"][0]["key_parameter"] = "stop_requested"
 
@@ -473,16 +436,8 @@ def test_nested_parameter_defaults_are_transitively_read_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def mutate(data: dict[str, object]) -> None:
-        add = next(
-            entry
-            for entry in data["entries"]
-            if entry["id"] == "scene.add_object"
-        )
-        shape = next(
-            parameter
-            for parameter in add["parameters"]
-            if parameter["id"] == "shape"
-        )
+        add = next(entry for entry in data["entries"] if entry["id"] == "scene.add_object")
+        shape = next(parameter for parameter in add["parameters"] if parameter["id"] == "shape")
         shape["default"] = {
             "type": "box",
             "box_dimensions_m": [1.0, 2.0, 3.0],

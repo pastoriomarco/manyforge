@@ -1,6 +1,6 @@
 api_version: manyforge.closed_schema.v1
 schema_id: manyforge.value_schema.runtime.native_execution.v1
-schema_revision: sha256:4be97ca6314af96d083a37a6aed9ef5976ed0e63c02d69ac790377edeb6804fb
+schema_revision: sha256:4405892649681799b9a813fafee4b5d23579d080b5457bf60f51ce2e296fcff8
 schema_purpose: value
 root_definition_id: native_execution_runtime_configuration
 definitions:
@@ -260,6 +260,18 @@ definitions:
                         value: 0
                       - kind: maximum
                         value: 60
+                - field_id: operator_confirmation_validity_ns
+                  presence: optional
+                  default:
+                    kind: absent
+                  value_schema:
+                    kind: scalar
+                    scalar_type: integer
+                    constraints:
+                      - kind: minimum
+                        value: 1
+                      - kind: maximum
+                        value: 3600000000000
                 - field_id: touch_links
                   presence: required
                   default:

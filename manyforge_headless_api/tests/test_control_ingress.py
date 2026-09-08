@@ -118,9 +118,7 @@ def test_rest_and_local_adapters_share_one_ingress_and_result_contract() -> None
     assert [stamp.transport_kind for stamp in stamps] == ["rest", "local"]
     assert stamps[0].trusted_principal_id == "operator.1"
     assert stamps[1].trusted_principal_id == "plc.1"
-    assert stamps[1].received_server_sequence == (
-        stamps[0].received_server_sequence + 1
-    )
+    assert stamps[1].received_server_sequence == (stamps[0].received_server_sequence + 1)
 
 
 def test_expired_ordinary_command_fails_before_dispatch_but_stop_remains_containable() -> None:
@@ -145,6 +143,23 @@ def test_expired_ordinary_command_fails_before_dispatch_but_stop_remains_contain
     assert contained.receipt.code == "program_stop_received"
     assert len(stamps) == 1
     assert stamps[0].transport_kind == "local"
+    assert stamps[0].valid_until_monotonic_ns is None
+
+
+def test_forwarded_deadline_preserves_authenticated_issue_time_not_receipt_time() -> None:
+    clock = _Clock()
+    ingress, stamps = _ingress(clock)
+    request = _request(ingress)
+    issued_at = clock.now_ns
+    clock.now_ns += 200_000_000
+    try:
+        asyncio.run(ingress.submit(request, transport_kind="rest"))
+    finally:
+        ingress.close()
+    assert stamps[0].received_monotonic_ns == clock.now_ns
+    assert stamps[0].valid_until_monotonic_ns == (
+        issued_at + request.command_envelope.freshness.valid_for_ns
+    )
 
 
 def test_stop_is_stamped_at_lane_admission_without_a_program_projection_read() -> None:
@@ -253,6 +268,7 @@ def test_program_stop_dispatch_never_resamples_program_projection() -> None:
 def test_completed_commands_leave_no_live_receipt_history_or_count_limit() -> None:
     clock = _Clock()
     ingress, stamps = _ingress(clock)
+
     async def exercise() -> None:
         for index in range(2_048):
             submission = await ingress.submit(
@@ -364,15 +380,9 @@ def test_native_command_uses_projected_execution_owner_fence_and_surfaces_reject
         command(), stamp
     )
     assert accepted.disposition == "received"
-    assert accepted_service.request.request_context.request_owner_epoch == (
-        "kernel.epoch.4"
-    )
-    assert accepted_service.request.request_context.request_id == (
-        "request.scale.intent"
-    )
-    assert accepted_service.request.request_context.correlation_id == (
-        "request.scale"
-    )
+    assert accepted_service.request.request_context.request_owner_epoch == ("kernel.epoch.4")
+    assert accepted_service.request.request_context.request_id == ("request.scale.intent")
+    assert accepted_service.request.request_context.correlation_id == ("request.scale")
 
     rejected_service = Service(
         {
@@ -452,14 +462,10 @@ def test_standalone_native_control_does_not_require_a_program_runner() -> None:
     )
 
     try:
-        submission = asyncio.run(
-            ingress.submit(command, transport_kind="rest")
-        )
+        submission = asyncio.run(ingress.submit(command, transport_kind="rest"))
     finally:
         ingress.close()
 
     assert submission.receipt.disposition == "received"
     assert submission.receipt.semantic_owner_epoch == "kernel.epoch.standalone"
-    assert service.request.request_context.request_owner_epoch == (
-        "kernel.epoch.standalone"
-    )
+    assert service.request.request_context.request_owner_epoch == ("kernel.epoch.standalone")

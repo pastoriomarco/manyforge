@@ -52,7 +52,8 @@ TOOL_ROUTES: dict[str, dict[str, tuple[str, str]]] = {
         "targets": ("GET", "/api/execution/targets"),
     },
     "manyforge_skills": {
-        "catalog": ("GET", "/api/catalog"),
+        "catalog": ("GET", "/api/skills"),
+        "expand": ("POST", "/api/skills/expand"),
         "assistant_modes": ("GET", "/api/assistant/modes"),
     },
     "manyforge_intervention": {
@@ -86,6 +87,7 @@ TOOL_ROUTES: dict[str, dict[str, tuple[str, str]]] = {
         "history": ("GET", "/api/execution/history"),
         "event": ("GET", "/api/execution/history/{sequence}"),
         "health": ("GET", "/api/execution/history/health"),
+        "program_recorder": ("GET", "/api/program/diagnostics/health"),
     },
     "manyforge_catalog": {
         "list": ("GET", "/api/catalog"),
@@ -236,17 +238,13 @@ def tool_contracts(app: FastAPI) -> list[dict[str, Any]]:
             properties: dict[str, Any] = {"action": {"const": action, "type": "string"}}
             required = ["action"]
             for location in ("path", "query"):
-                parameters = [
-                    p for p in operation.get("parameters", []) if p["in"] == location
-                ]
+                parameters = [p for p in operation.get("parameters", []) if p["in"] == location]
                 if parameters:
                     keys = [p["name"] for p in parameters if p.get("required")]
                     properties[location] = {
                         "type": "object",
                         "additionalProperties": False,
-                        "properties": {
-                            p["name"]: local_refs(p["schema"]) for p in parameters
-                        },
+                        "properties": {p["name"]: local_refs(p["schema"]) for p in parameters},
                         "required": keys,
                     }
                     # URL path components are string-encoded, including counters.
@@ -263,12 +261,13 @@ def tool_contracts(app: FastAPI) -> list[dict[str, Any]]:
                         required.append(location)
             request = operation.get("requestBody", {})
             if "application/json" in request.get("content", {}):
-                properties["body"] = local_refs(
-                    request["content"]["application/json"]["schema"]
-                )
+                properties["body"] = local_refs(request["content"]["application/json"]["schema"])
                 if request.get("required"):
                     required.append("body")
-            read_only &= method == "GET" or path == "/api/program/validate"
+            read_only &= method == "GET" or path in {
+                "/api/program/validate",
+                "/api/skills/expand",
+            }
             variants.append(
                 {
                     "type": "object",
@@ -323,9 +322,9 @@ class ComposerMcpAdapter:
         @server.call_tool(validate_input=False)
         async def call_tool(name: str, arguments: dict[str, Any]):
             response = await self.invoke(name, arguments)
-            if response.is_success and response.headers.get(
-                "content-type", ""
-            ).startswith("image/"):
+            if response.is_success and response.headers.get("content-type", "").startswith(
+                "image/"
+            ):
                 return [
                     types.ImageContent(
                         type="image",
@@ -423,9 +422,7 @@ class ComposerMcpAdapter:
         ) as client:
 
             def encode_body() -> bytes:
-                return json.dumps(
-                    args.body, allow_nan=False, separators=(",", ":")
-                ).encode("utf-8")
+                return json.dumps(args.body, allow_nan=False, separators=(",", ":")).encode("utf-8")
 
             body = None
             if args.body is not None:

@@ -111,6 +111,11 @@ void ValidateScenePayload(const CanonicalValue &payload,
           "logical-scene snapshot belongs to a different cell");
 }
 
+void ValidatePoseSourcesShape(const CanonicalValue& state) {
+  Require(RequiredMember(state, "pose_sources").is_array(),
+          "scene/runtime pose_sources must be an array");
+}
+
 void ValidateSceneRuntimePayload(const CanonicalValue &payload,
                                  const std::string &cell_id) {
   Require(payload.is_object() && payload.as_object().size() == 3U,
@@ -125,9 +130,7 @@ void ValidateSceneRuntimePayload(const CanonicalValue &payload,
                                    kSceneRuntimeStateSnapshotApiVersion,
           "scene/runtime state payload version is unsupported");
   static_cast<void>(RequiredString(state, "state"));
-  Require(std::holds_alternative<CanonicalValue::Array>(
-              RequiredMember(state, "pose_sources").storage()),
-          "scene/runtime pose_sources must be an array");
+  ValidatePoseSourcesShape(state);
 }
 
 enum class Freshness {
@@ -160,6 +163,37 @@ CanonicalValue StringArray(const std::vector<std::string> &values) {
   result.reserve(values.size());
   for (const auto &value : values) {
     result.emplace_back(CanonicalValue(value));
+  }
+  return CanonicalValue(std::move(result));
+}
+
+CanonicalValue ControlPayload(const CanonicalValue& value, const std::string_view kind,
+                              const std::string_view location = "") {
+  if (!value.is_object()) return value;
+  if (kind == "scene-runtime-source.json" && location == "state") ValidatePoseSourcesShape(value);
+  CanonicalValue::Object result;
+  for (const auto& [key, child] : value.as_object()) {
+    if (kind == "manager-source.json" && location == "observed_unit" &&
+        (key == "process_observation_sequence" || key == "source_report_sequence")) {
+      // Malformed ignored counters must not masquerade as valid pulses.
+      if (!child.is_null()) static_cast<void>(content_identity::parse_nonnegative_int64(child));
+      continue;
+    }
+    if (kind == "scene-runtime-source.json" && location == "state" &&
+        (key == "pose_sources" || key == "updated_at_ns"))
+      continue;
+    if (kind == "manager-source.json" && location == "runtime" && key == "observed_units" &&
+        child.is_array()) {
+      CanonicalValue::Array rows;
+      for (const auto& row : child.as_array())
+        rows.push_back(ControlPayload(row, kind, "observed_unit"));
+      result.emplace_back(key, CanonicalValue(std::move(rows)));
+    } else if (location.empty() && ((kind == "manager-source.json" && key == "runtime") ||
+                                    (kind == "scene-runtime-source.json" && key == "state"))) {
+      result.emplace_back(key, ControlPayload(child, kind, key));
+    } else {
+      result.emplace_back(key, child);
+    }
   }
   return CanonicalValue(std::move(result));
 }
@@ -312,6 +346,30 @@ CanonicalValue Scope() {
 }
 
 } // namespace
+
+std::optional<std::pair<std::string, std::int64_t>> ReadControlSourceFileHint(
+    const std::filesystem::path& path) {
+  try {
+    const auto observed =
+        AtomicSourceSnapshotChannel(path.parent_path(), path.filename().string()).ReadObserved();
+    if (!observed) return std::nullopt;
+    const auto& source = observed->snapshot;
+    const auto meaning = CanonicalValue(CanonicalValue::Object{
+        {"payload", ControlPayload(source.payload, path.filename().string())},
+        {"source_owner_epoch", CanonicalValue(source.source_owner_epoch)},
+        {"source_owner_id", CanonicalValue(source.source_owner_id)},
+        {"source_owner_kind", CanonicalValue(source.source_owner_kind)},
+    });
+    return std::pair{content_identity::sha256_digest(content_identity::canonical_json(meaning)),
+                     observed->file_modified_at_unix_ns};
+  } catch (const SourceSnapshotError&) {
+    return std::nullopt;
+  } catch (const RuntimeSnapshotError&) {
+    return std::nullopt;
+  } catch (const std::invalid_argument&) {
+    return std::nullopt;
+  }
+}
 
 RuntimeSnapshotAggregator::RuntimeSnapshotAggregator(
     std::filesystem::path publication_root, std::string cell_id,

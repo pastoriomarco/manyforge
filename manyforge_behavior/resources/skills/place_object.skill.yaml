@@ -1,0 +1,382 @@
+{
+  "api_version": "manyforge.skill.v1",
+  "skill_id": "place_object",
+  "version": "1.0.0",
+  "name": "Place object — logical-gripper template",
+  "description": "Preserves the historical logical-gripper skill: approach, descend, set a Program flag, request the Scene-owned attachment change, and retreat. It does not actuate or confirm a physical gripper. Add an explicit qualified gripper command/confirmation when needed. Scene revisions invalidate affected cache entries automatically; there is no manual cache-reset node.",
+  "compatible_profiles": [
+    "composable-cell-v1"
+  ],
+  "component_roles": {
+    "robot": {
+      "required_component_type_tags": [
+        "articulated-arm"
+      ],
+      "required_model_roles": [
+        "arm_model"
+      ]
+    },
+    "tool": {
+      "required_component_type_tags": [
+        "gripper"
+      ]
+    }
+  },
+  "target_roles": {
+    "arm": {
+      "component_role": "robot",
+      "required_capabilities": [
+        {
+          "capability_id": "execution.feedback.phase_events",
+          "parameters": {},
+          "disposition": "required"
+        },
+        {
+          "capability_id": "execution.trajectory.execute",
+          "parameters": {},
+          "disposition": "required"
+        },
+        {
+          "capability_id": "planning.motion.pose_goal",
+          "parameters": {},
+          "disposition": "required"
+        },
+        {
+          "capability_id": "planning.profile.balanced",
+          "parameters": {},
+          "disposition": "required"
+        },
+        {
+          "capability_id": "planning.trajectory.time_parameterized",
+          "parameters": {},
+          "disposition": "required"
+        },
+        {
+          "capability_id": "state.observed.current",
+          "parameters": {},
+          "disposition": "required"
+        },
+        {
+          "capability_id": "validation.trajectory.non_collision",
+          "parameters": {},
+          "disposition": "required"
+        }
+      ],
+      "required_frame_roles": [
+        "base",
+        "tcp"
+      ],
+      "required_model_roles": [
+        "arm_model"
+      ]
+    },
+    "gripper": {
+      "component_role": "tool",
+      "required_capabilities": [
+        {
+          "capability_id": "model.kinematics.fk",
+          "parameters": {},
+          "disposition": "required"
+        }
+      ],
+      "required_frame_roles": [
+        "tcp"
+      ],
+      "required_collision_body_roles": [
+        "gripper_collision"
+      ]
+    }
+  },
+  "parameters": [
+    {
+      "id": "object_id",
+      "required": true,
+      "schema": {
+        "type": "string"
+      }
+    },
+    {
+      "id": "gripper_state_key",
+      "required": true,
+      "schema": {
+        "type": "string"
+      }
+    },
+    {
+      "id": "approach_height_m",
+      "required": false,
+      "schema": {
+        "type": "float",
+        "constraints": {
+          "min_exclusive": 0
+        }
+      },
+      "default": 0.05
+    },
+    {
+      "id": "tool_orientation_rpy_deg",
+      "required": false,
+      "schema": {
+        "type": "array",
+        "items": {
+          "type": "float"
+        },
+        "length": 3
+      },
+      "default": [
+        180,
+        0,
+        -90
+      ]
+    },
+    {
+      "id": "velocity_scale",
+      "required": false,
+      "schema": {
+        "type": "float",
+        "constraints": {
+          "min_exclusive": 0,
+          "max_inclusive": 1
+        }
+      },
+      "default": 0.5
+    },
+    {
+      "id": "acceleration_scale",
+      "required": false,
+      "schema": {
+        "type": "float",
+        "constraints": {
+          "min_exclusive": 0,
+          "max_inclusive": 1
+        }
+      },
+      "default": 1
+    },
+    {
+      "id": "max_tcp_linear_speed_mps",
+      "required": true,
+      "schema": {
+        "type": "float",
+        "constraints": {
+          "min_exclusive": 0
+        }
+      }
+    },
+    {
+      "id": "place_pose",
+      "required": true,
+      "schema": {
+        "schema_ref": "#/schema_types/motion_pose"
+      }
+    }
+  ],
+  "requires": [
+    "The Program declares the selected scene resource and writable boolean flag",
+    "The mapped arm supports exact pose planning and execution",
+    "Any required physical gripper action/confirmation is provided separately",
+    "Normal Scene-owner attachment admission remains mandatory"
+  ],
+  "provides": [
+    "Scene object detached after owner acceptance",
+    "Logical Program flag false, not physical release evidence",
+    "Arm reaches retreat pose"
+  ],
+  "modifies": [
+    "Arm pose",
+    "Scene-owned carried attachment",
+    "Declared Program boolean flag"
+  ],
+  "body": {
+    "node_id": "sequence",
+    "instance_id": "place",
+    "parameters": {},
+    "children": [
+      {
+        "node_id": "motion.move_to_pose",
+        "instance_id": "approach",
+        "parameters": {
+          "target_role": "${target:arm}",
+          "base_frame_role": "base",
+          "tcp_frame_role": "tcp",
+          "target_mode": "relative",
+          "target_reference": {
+            "type": "pose",
+            "pose": "${param:place_pose}"
+          },
+          "offset_reference": {
+            "type": "frame_role",
+            "frame_role_id": "base"
+          },
+          "goal": {
+            "position_m": [
+              0,
+              0,
+              "${param:approach_height_m}"
+            ],
+            "orientation": {
+              "rpy_deg": "${param:tool_orientation_rpy_deg}"
+            }
+          },
+          "velocity_scale": "${param:velocity_scale}",
+          "acceleration_scale": "${param:acceleration_scale}",
+          "max_tcp_linear_speed_mps": "${param:max_tcp_linear_speed_mps}"
+        },
+        "children": []
+      },
+      {
+        "node_id": "motion.move_to_pose",
+        "instance_id": "descend",
+        "parameters": {
+          "target_role": "${target:arm}",
+          "base_frame_role": "base",
+          "tcp_frame_role": "tcp",
+          "target_mode": "relative",
+          "target_reference": {
+            "type": "pose",
+            "pose": "${param:place_pose}"
+          },
+          "offset_reference": {
+            "type": "frame_role",
+            "frame_role_id": "base"
+          },
+          "goal": {
+            "position_m": [
+              0,
+              0,
+              0
+            ],
+            "orientation": {
+              "rpy_deg": "${param:tool_orientation_rpy_deg}"
+            }
+          },
+          "velocity_scale": "${param:velocity_scale}",
+          "acceleration_scale": "${param:acceleration_scale}",
+          "max_tcp_linear_speed_mps": "${param:max_tcp_linear_speed_mps}"
+        },
+        "children": []
+      },
+      {
+        "node_id": "logic.set_bool",
+        "instance_id": "set_logical_gripper",
+        "parameters": {
+          "key": "${param:gripper_state_key}",
+          "value": false
+        },
+        "children": []
+      },
+      {
+        "node_id": "scene.detach_carried_object",
+        "instance_id": "detach",
+        "parameters": {
+          "scene_resource_id": "${param:object_id}",
+          "target_role": "${target:gripper}"
+        },
+        "children": []
+      },
+      {
+        "node_id": "motion.move_to_pose",
+        "instance_id": "retreat",
+        "parameters": {
+          "target_role": "${target:arm}",
+          "base_frame_role": "base",
+          "tcp_frame_role": "tcp",
+          "target_mode": "relative",
+          "target_reference": {
+            "type": "pose",
+            "pose": "${param:place_pose}"
+          },
+          "offset_reference": {
+            "type": "frame_role",
+            "frame_role_id": "base"
+          },
+          "goal": {
+            "position_m": [
+              0,
+              0,
+              "${param:approach_height_m}"
+            ],
+            "orientation": {
+              "rpy_deg": "${param:tool_orientation_rpy_deg}"
+            }
+          },
+          "velocity_scale": "${param:velocity_scale}",
+          "acceleration_scale": "${param:acceleration_scale}",
+          "max_tcp_linear_speed_mps": "${param:max_tcp_linear_speed_mps}"
+        },
+        "children": []
+      }
+    ]
+  },
+  "example": {
+    "arguments": {
+      "object_id": "graspable",
+      "gripper_state_key": "state.gripper_closed",
+      "max_tcp_linear_speed_mps": 0.1,
+      "place_pose": {
+        "position_m": [
+          0.3,
+          0.3,
+          0.2
+        ],
+        "orientation": {
+          "rpy_deg": [
+            180,
+            0,
+            -90
+          ]
+        }
+      }
+    },
+    "program_declarations": {
+      "blackboard": {
+        "namespaces": [
+          {
+            "namespace_id": "state",
+            "owner": "program"
+          }
+        ],
+        "keys": [
+          {
+            "key": "state.gripper_closed",
+            "type": "bool",
+            "access": "read_write",
+            "persistence": "run"
+          }
+        ]
+      },
+      "scene": [
+        {
+          "scene_resource_id": "graspable",
+          "shape": {
+            "type": "box",
+            "box_dimensions_m": [
+              0.02,
+              0.02,
+              0.02
+            ]
+          },
+          "pose": {
+            "frame_ref": {
+              "kind": "cell_frame"
+            },
+            "position_m": [
+              0.2,
+              0.1,
+              0.1
+            ],
+            "orientation": {
+              "xyzw": [
+                0,
+                0,
+                0,
+                1
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "effect": "Compile a portable five-node subtree. The boolean flag is logical only; actual motion/attachment requires normal owner admission at Run."
+  }
+}

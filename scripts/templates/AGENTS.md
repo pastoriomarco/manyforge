@@ -34,11 +34,21 @@ this template does not start or qualify either provider.
 - Validate without changing Draft: `manyforge_program_validate` with
   `{"action":"source","body":{"authoring":<portable authoring forest>}}`.
 - Browse allowed artifact roots: `manyforge_files` with `{"action":"browse"}`.
+- Discover build-owned skills: `manyforge_skills` with `{"action":"catalog"}`.
+  `action: "expand"` takes the current environment digest, typed arguments,
+  explicit role maps and declaration-only `program_context`. It returns an
+  ordinary subtree and provenance without editing Draft or executing it.
+  Insert through the normal authorized Draft workflow, then validate and
+  compile the Program Binding. A logical-gripper template is not a physical
+  gripper command or confirmation.
 - Read an exact event: `manyforge_debug_export` with
   `{"action":"event","path":{"sequence":"123"}}`.
 - Export the recorded incident trace: `manyforge_debug_export` with
   `{"action":"export","query":{"program_run_id":"<exact run>"}}`.
   Missing/truncated evidence is not evidence that nothing happened.
+- Read Program recorder health: `manyforge_debug_export` with
+  `{"action":"program_recorder"}`. Captures occur at recorded transitions,
+  not every tick; values carry their producer clock and omission/loss counts.
 - Recover only through a currently offered backend action and its exact
   confirmation/fencing contract. Never invent a recovery skill or assume
   gripper command completion proves a grasp.

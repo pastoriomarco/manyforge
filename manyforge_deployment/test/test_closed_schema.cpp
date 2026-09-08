@@ -676,7 +676,7 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
   EXPECT_EQ(qualified_count, 11U);
   EXPECT_EQ(registry.qualification_registry_digest().value(),
             "sha256:"
-            "43087ef20c219f1687f11c2407afb6769bddc896f4a87c8724fe53398dc1ad57");
+            "dbdf99e08d6c8fde086653482d39c48c39ca955e44e4fcdaf01d1f17879c4b60");
   EXPECT_NE(
       registry.find_qualified_value_schema(
           core::SchemaId("manyforge.value_schema.provider_contract.empty.v1"),
@@ -697,13 +697,12 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
                                      "03457d535d31818fedaa7e44f48432a08feb705e4"
                                      "d22c9a8f5e50977c8dbf785")),
             nullptr);
-  EXPECT_NE(
-      registry.find_qualified_value_schema(
-          core::SchemaId("manyforge.value_schema.runtime.native_execution.v1"),
-          core::SchemaRevision("sha256:"
-                               "4be97ca6314af96d083a37a6aed9ef5976ed0e63c02d69ac"
-                               "790377edeb6804fb")),
-      nullptr);
+  EXPECT_NE(registry.find_qualified_value_schema(
+                core::SchemaId("manyforge.value_schema.runtime.native_execution.v1"),
+                core::SchemaRevision("sha256:"
+                                     "4405892649681799b9a813fafee4b5d23579d080b5457bf60"
+                                     "f51ce2e296fcff8")),
+            nullptr);
   EXPECT_EQ(registry.find_qualified_value_schema(
                 core::SchemaId("manyforge.none.v1"),
                 core::SchemaRevision("sha256:"
@@ -764,11 +763,10 @@ TEST(ClosedSchema,
 TEST(ClosedSchema,
      NativeExecutionRuntimeConfigurationIsClosedBoundedAndBuildQualified) {
   const auto &registry = build_qualified_closed_schema_registry();
-  const auto *schema = registry.find_qualified_value_schema(
+  const auto* schema = registry.find_qualified_value_schema(
       core::SchemaId("manyforge.value_schema.runtime.native_execution.v1"),
-      core::SchemaRevision(
-          "sha256:"
-          "4be97ca6314af96d083a37a6aed9ef5976ed0e63c02d69ac790377edeb6804fb"));
+      core::SchemaRevision("sha256:"
+                           "4405892649681799b9a813fafee4b5d23579d080b5457bf60f51ce2e296fcff8"));
   ASSERT_NE(schema, nullptr);
 
   const CanonicalValue valid = value_object({
@@ -827,6 +825,31 @@ TEST(ClosedSchema,
       validate_and_normalize_build_qualified_value(*schema, valid);
   EXPECT_EQ(normalized.normalized_value(), valid);
 
+  const auto with_confirmation_validity = [&](CanonicalValue duration) {
+    auto root = valid.as_object();
+    for (auto& [name, value] : root) {
+      if (name != "gripper_target_configurations") continue;
+      auto targets = value.as_array();
+      auto target = targets.front().as_object();
+      target.emplace_back("operator_confirmation_validity_ns", std::move(duration));
+      targets.front() = CanonicalValue(std::move(target));
+      value = CanonicalValue(std::move(targets));
+    }
+    return CanonicalValue(std::move(root));
+  };
+  for (const double duration : {1.0, 3'600'000'000'000.0}) {
+    const auto configured = with_confirmation_validity(CanonicalValue(duration));
+    EXPECT_EQ(validate_and_normalize_build_qualified_value(*schema, configured).normalized_value(),
+              configured);
+  }
+  for (const auto& invalid :
+       {CanonicalValue(nullptr), CanonicalValue(true), CanonicalValue(0.0), CanonicalValue(-1.0),
+        CanonicalValue(1.5), CanonicalValue("1000"), CanonicalValue(3'600'000'000'001.0)}) {
+    EXPECT_THROW(
+        validate_and_normalize_build_qualified_value(*schema, with_confirmation_validity(invalid)),
+        ClosedSchemaError);
+  }
+
   EXPECT_THROW(
       validate_and_normalize_build_qualified_value(
           *schema,
@@ -853,7 +876,7 @@ TEST(ClosedSchema,
 }
 
 TEST(ClosedSchema, QualifiesEveryAndOnlyTheExactBuiltinCapabilityDefinition) {
-  ASSERT_EQ(core::kBuiltinCapabilityDefinitionRegistry.size(), 69U);
+  ASSERT_EQ(core::kBuiltinCapabilityDefinitionRegistry.size(), 70U);
   CanonicalValue::Array registry_projection;
   registry_projection.reserve(
       core::kBuiltinCapabilityDefinitionRegistry.size());

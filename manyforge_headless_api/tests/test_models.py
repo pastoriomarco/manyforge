@@ -14,12 +14,39 @@ from manyforge_headless_api.models import (
     OperationControlRequest,
     OperationIntentRequest,
     OperationParticipantRequest,
+    ProgramDiagnosticRequest,
     PickSequencePlanningRequest,
     PlaceSequencePlanningRequest,
     RuntimeScaleControlRequest,
     SceneTransactionRequest,
     StopIntentRequest,
 )
+
+
+@pytest.mark.parametrize("value", [float("inf"), float("nan"), 2**53, object()])
+def test_program_diagnostic_values_reject_nonportable_json(value):
+    with pytest.raises(ValidationError):
+        ProgramDiagnosticRequest.model_validate(
+            {
+                "schema_version": "manyforge.program_diagnostic.v1",
+                "program_run_id": "run.1",
+                "owner_epoch": "runner.1",
+                "program_revision": "sha256:" + "a" * 64,
+                "program_binding_id": "sha256:" + "b" * 64,
+                "retained_bundle_id": "sha256:" + "c" * 64,
+                "graph_revision": "sha256:" + "d" * 64,
+                "state": "succeeded",
+                "reason_code": None,
+                "message": "Completed",
+                "occurred_at_ns": "9007199254740993",
+                "occurred_at_wall": "2026-09-08T10:00:00Z",
+                "blackboard": {"value": value},
+                "runtime_overrides": {},
+                "omitted_blackboard_count": 0,
+                "omitted_override_count": 0,
+                "delivery_loss_count": 0,
+            }
+        )
 
 
 def _caller() -> dict[str, object]:
@@ -104,9 +131,7 @@ def _planning_operation(
                 "component_role_id": "tool" if tool else "arm",
                 "target_role_id": "gripper" if tool else "arm",
                 "required_capability_id": (
-                    "tool.gripper.command"
-                    if tool
-                    else "execution.trajectory.execute"
+                    "tool.gripper.command" if tool else "execution.trajectory.execute"
                 ),
                 "action_span": None,
                 "payload": payload,
@@ -219,9 +244,7 @@ def _pick_request() -> dict[str, object]:
                 selected_object_id="workpiece",
             ),
         ),
-        "tool_operation": _planning_operation(
-            "pick.tool", _tool_payload(), tool=True
-        ),
+        "tool_operation": _planning_operation("pick.tool", _tool_payload(), tool=True),
         "retreat_operation": _planning_operation(
             "pick.retreat", _planning_motion("retreat", _cartesian_path())
         ),
@@ -252,9 +275,7 @@ def test_pick_offset_reference_uses_closed_portable_forms(
     parsed = PickSequencePlanningRequest.model_validate(request)
 
     assert parsed.synthesis.pick_offset_reference is not None
-    assert parsed.synthesis.pick_offset_reference.model_dump(mode="json") == (
-        reference
-    )
+    assert parsed.synthesis.pick_offset_reference.model_dump(mode="json") == (reference)
 
 
 def test_pick_place_requests_preserve_defaults_and_phase_boundaries() -> None:
@@ -273,16 +294,12 @@ def test_pick_place_requests_preserve_defaults_and_phase_boundaries() -> None:
     assert parsed.synthesis.pick_offset_reference.type == "runtime_object"
     assert parsed.synthesis.approach_offset_reference is not None
     assert parsed.synthesis.approach_offset_reference.type == "frame_role"
-    assert parsed.descend_operation.participants[0].payload.contact_policy_id == (
-        "pick.contact"
-    )
+    assert parsed.descend_operation.participants[0].payload.contact_policy_id == ("pick.contact")
 
     invalid_contact = _pick_request()
     invalid_contact["retreat_operation"] = _planning_operation(
         "pick.retreat",
-        _planning_motion(
-            "retreat", _cartesian_path(), contact_policy_id="pick.contact"
-        ),
+        _planning_motion("retreat", _cartesian_path(), contact_policy_id="pick.contact"),
     )
     with pytest.raises(ValidationError, match="retreat cannot carry"):
         PickSequencePlanningRequest.model_validate(invalid_contact)
@@ -324,9 +341,7 @@ def test_pick_place_requests_preserve_defaults_and_phase_boundaries() -> None:
         "descend_operation": _planning_operation(
             "place.descend", _planning_motion("descend", _cartesian_path())
         ),
-        "tool_operation": _planning_operation(
-            "place.tool", _tool_payload(), tool=True
-        ),
+        "tool_operation": _planning_operation("place.tool", _tool_payload(), tool=True),
         "retreat_operation": _planning_operation(
             "place.retreat", _planning_motion("retreat", _cartesian_path())
         ),
@@ -334,9 +349,7 @@ def test_pick_place_requests_preserve_defaults_and_phase_boundaries() -> None:
     assert PlaceSequencePlanningRequest.model_validate(place).sequence_id == "place.1"
     place["descend_operation"] = _planning_operation(
         "place.descend",
-        _planning_motion(
-            "descend", _cartesian_path(), contact_policy_id="pick.contact"
-        ),
+        _planning_motion("descend", _cartesian_path(), contact_policy_id="pick.contact"),
     )
     with pytest.raises(ValidationError, match="place motion phases"):
         PlaceSequencePlanningRequest.model_validate(place)
@@ -344,14 +357,10 @@ def test_pick_place_requests_preserve_defaults_and_phase_boundaries() -> None:
 
 def test_motion_payload_accepts_pose_and_cartesian_but_not_joint_contact() -> None:
     pose = MotionParticipantRequest.model_validate(
-        _planning_motion(
-            "pose", {"kind": "pose_goal", "goal": _planning_pose()}
-        )
+        _planning_motion("pose", {"kind": "pose_goal", "goal": _planning_pose()})
     )
     assert pose.motion.kind == "pose_goal"
-    path = MotionParticipantRequest.model_validate(
-        _planning_motion("path", _cartesian_path())
-    )
+    path = MotionParticipantRequest.model_validate(_planning_motion("path", _cartesian_path()))
     assert path.motion.kind == "cartesian_path"
     with pytest.raises(ValidationError, match="joint_goal cannot carry"):
         MotionParticipantRequest.model_validate(
@@ -425,9 +434,7 @@ def test_motion_reference_shape_fails_closed_before_native_admission() -> None:
         },
     )
     relative_joint["target_mode"] = "relative"
-    assert MotionParticipantRequest.model_validate(relative_joint).target_mode == (
-        "relative"
-    )
+    assert MotionParticipantRequest.model_validate(relative_joint).target_mode == ("relative")
 
     stale_runtime_binding = _planning_motion(
         "relative-runtime-object",
@@ -473,18 +480,9 @@ def test_alarm_activation_and_bulk_cardinality_match_owner_profile() -> None:
         "reason": None,
         "confirmed": True,
     }
-    assert (
-        len(
-            AcknowledgeAlarmRequest.model_validate(
-                acknowledgement
-            ).activation_id
-        )
-        == 2_048
-    )
+    assert len(AcknowledgeAlarmRequest.model_validate(acknowledgement).activation_id) == 2_048
     with pytest.raises(ValidationError, match="2048 UTF-8 bytes"):
-        AcknowledgeAlarmRequest.model_validate(
-            {**acknowledgement, "activation_id": "a" * 2_049}
-        )
+        AcknowledgeAlarmRequest.model_validate({**acknowledgement, "activation_id": "a" * 2_049})
 
     members = [
         {
@@ -554,26 +552,27 @@ def test_operation_mutations_are_strict_bounded_and_generation_fenced() -> None:
     }
     assert OperationControlRequest.model_validate(control).reason == "r" * 4096
     with pytest.raises(ValidationError, match="4096 UTF-8 bytes"):
-        OperationControlRequest.model_validate(
-            {**control, "reason": "r" * 4097}
-        )
+        OperationControlRequest.model_validate({**control, "reason": "r" * 4097})
     with pytest.raises(ValidationError):
-        OperationControlRequest.model_validate(
-            {**control, "expected_operation_revision": 0}
-        )
+        OperationControlRequest.model_validate({**control, "expected_operation_revision": 0})
 
     stop_target = {
         "operation_id": "operation-1",
         "expected_operation_revision": 1,
         "expected_stop_generation": 0,
     }
-    assert StopIntentRequest.model_validate(
-        {
-            "request_context": context,
-            "operations": [stop_target],
-            "reason": None,
-        }
-    ).operations[0].expected_stop_generation == 0
+    assert (
+        StopIntentRequest.model_validate(
+            {
+                "request_context": context,
+                "operations": [stop_target],
+                "reason": None,
+            }
+        )
+        .operations[0]
+        .expected_stop_generation
+        == 0
+    )
     multi_stop = StopIntentRequest.model_validate(
         {
             "request_context": context,
@@ -639,9 +638,7 @@ def test_gripper_command_requires_unit_tags_and_matching_nonnegative_effort() ->
                 "max_effort": {"kind": "linear_newton", "value_n": 5.0},
             },
             "completion_timeout_s": 2.0,
-            "caller_options": [
-                {"option_id": "command_duration_s", "value_s": 0.25}
-            ],
+            "caller_options": [{"option_id": "command_duration_s", "value_s": 0.25}],
         },
     }
     parsed = OperationParticipantRequest.model_validate(participant)
@@ -755,10 +752,7 @@ def test_scene_transaction_is_strict_and_cannot_assert_attribution() -> None:
     }
     parsed_reset = SceneTransactionRequest.model_validate(reset)
     assert parsed_reset.program_reset_scene_authorization is not None
-    assert (
-        parsed_reset.program_reset_scene_authorization.cycle_claim_generation
-        == 9
-    )
+    assert parsed_reset.program_reset_scene_authorization.cycle_claim_generation == 9
 
 
 def test_scene_support_declarations_are_portable_and_mode_normalized() -> None:
@@ -871,10 +865,7 @@ def test_scene_upsert_and_current_pose_detach_are_closed_typed_operations() -> N
         "expected_command_target_id": "arm",
     }
     parsed_detach = SceneTransactionRequest.model_validate(detach)
-    assert (
-        parsed_detach.operation.kind
-        == "detach_carried_object_at_current_pose"
-    )
+    assert parsed_detach.operation.kind == "detach_carried_object_at_current_pose"
 
     malformed = deepcopy(detach)
     malformed["operation"]["pose"] = {

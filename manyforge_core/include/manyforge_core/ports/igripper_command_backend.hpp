@@ -5,6 +5,8 @@
 
 namespace manyforge::core {
 
+class RuntimeParticipantBinding;
+
 /// Backend-neutral gripper command authority.
 ///
 /// Implementations own command progression, deadlines, cancellation, and
@@ -24,6 +26,23 @@ class IGripperCommandBackend {
   virtual GripperCommandResultDTO command_gripper(const GripperCommandRequestDTO& request) = 0;
 
   virtual GripperCommandStatusDTO get_gripper_status(const std::string& gripper_id) const = 0;
+
+  /// Internal source-adapter boundary. The native host resolves a currently
+  /// qualified confirmation binding and its explicit freshness policy before
+  /// calling this method. Public callers cannot supply that binding/policy.
+  /// Implementations recheck the current target/route and command atomically.
+  virtual Result<GripperGraspEvidenceDTO> record_grasp_observation(
+      const RuntimeParticipantBinding&, const GripperGraspObservationDTO&, Duration,
+      TimePoint /* admission_deadline_ns */) {
+    return Result<GripperGraspEvidenceDTO>::Err(
+        ErrorDTO{"grasp_confirmation_unavailable",
+                 "This gripper backend has no qualified confirmation source",
+                 {}});
+  }
+
+  /// Retire confirmation when its source becomes unknown. This affects
+  /// evidence only: it must not cancel motion or change command admission.
+  virtual void invalidate_grasp_evidence() noexcept {}
 
   virtual GripperCommandResultDTO mark_gripper_grasp_lost(const std::string& gripper_id,
                                                           std::uint64_t expected_command_id,

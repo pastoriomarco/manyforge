@@ -15,7 +15,8 @@ from manyforge_behavior.orchestration_ports import (
     ProgramRunScopeState,
 )
 from manyforge_behavior.program_run_owner import (
-    ProgramRunOwnerError, ProgramRunOwnerOutcomeUnknownError,
+    ProgramRunOwnerError,
+    ProgramRunOwnerOutcomeUnknownError,
     ProgramRunOwnerRecoveryIncompleteError,
 )
 from manyforge_headless_api.models import (
@@ -282,14 +283,19 @@ class _Owner:
         running = self.rows[program_run_id].state == "running"
         return {
             "selection_revision": 0,
-            "groups": [{
-                "group_id": "all", "node_count": 1, "held_node_count": 0,
-                "state": "running" if running else "unavailable",
-                "stop_allowed": running, "resume_allowed": False,
-                "resume_unavailable_reason": (
-                    "selection_not_held" if running else "program_run_not_running"
-                ),
-            }],
+            "groups": [
+                {
+                    "group_id": "all",
+                    "node_count": 1,
+                    "held_node_count": 0,
+                    "state": "running" if running else "unavailable",
+                    "stop_allowed": running,
+                    "resume_allowed": False,
+                    "resume_unavailable_reason": (
+                        "selection_not_held" if running else "program_run_not_running"
+                    ),
+                }
+            ],
         }
 
 
@@ -298,9 +304,7 @@ class _ObservationOwner(_Owner):
         try:
             return super().read(program_run_id)
         except KeyError as error:
-            raise ProgramRunOwnerError(
-                f"Program run {program_run_id} is not resident"
-            ) from error
+            raise ProgramRunOwnerError(f"Program run {program_run_id} is not resident") from error
 
 
 class _RuntimeControlOwner(_Owner):
@@ -617,9 +621,7 @@ def _reconcile_runtime(
     runtime_owner_epoch: str,
     inventory: dict[str, Any],
 ) -> tuple[ProgramRuntime, ProgramCycleJournal, _Admission]:
-    journal = ProgramCycleJournal(
-        tmp_path / "cycle.sqlite3", owner_epoch=journal_owner_epoch
-    )
+    journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3", owner_epoch=journal_owner_epoch)
     admission = _Admission()
     admission.inventory = deepcopy(inventory)
     execution_run_root = tmp_path / "execution-run"
@@ -638,6 +640,43 @@ def _reconcile_runtime(
     )
     runtime._host.shutdown()  # noqa: SLF001
     return runtime, journal, admission
+
+
+def test_diagnostic_join_failure_still_closes_transport_and_releases_worker(monkeypatch, tmp_path):
+    from manyforge_program_runner.diagnostics import ProgramDiagnosticPublisher
+
+    runtime, _journal, _admission = _reconcile_runtime(
+        tmp_path,
+        journal_owner_epoch="runner.1",
+        runtime_owner_epoch="runner.1",
+        inventory={},
+    )
+    entered, closed = Event(), Event()
+
+    def send(_record):
+        entered.set()
+        assert closed.wait(timeout=2)
+        raise OSError("transport closed during pending delivery")
+
+    publisher = ProgramDiagnosticPublisher(send)
+    runtime._diagnostics = publisher
+    runtime._diagnostic_client = SimpleNamespace(close=closed.set)
+    publisher.submit({"state": "succeeded"})
+    assert entered.wait(timeout=2)
+    thread = publisher._thread
+    join = thread.join
+    # Explicitly hit an expired join while delivery is held; no wall-clock
+    # two-second wait is needed to qualify the cleanup failure branch.
+    monkeypatch.setattr(thread, "join", lambda **_kwargs: None)
+    try:
+        with pytest.raises(ProgramRunnerError, match="shutdown bound"):
+            runtime.shutdown()
+        assert closed.is_set()
+    finally:
+        closed.set()
+        join(timeout=2)
+    assert not thread.is_alive()
+    assert publisher.health()["delivery_failed"]
 
 
 def _program_cycle_claim(owner_epoch: str) -> dict[str, Any]:
@@ -664,17 +703,13 @@ def _program_cycle_claim(owner_epoch: str) -> dict[str, Any]:
     }
 
 
-def _retain_terminal_cycle(
-    journal: ProgramCycleJournal, claim: dict[str, Any]
-) -> str:
+def _retain_terminal_cycle(journal: ProgramCycleJournal, claim: dict[str, Any]) -> str:
     settlement = {
         "schema_version": "manyforge.program_cycle_start_settlement.v1",
         "kind": "proven_no_effect",
         "claim": claim,
         "program_run_id": "program-cycle.1",
-        "prepared_scene": {
-            "schema_version": "manyforge.prepared_program_scene.v1"
-        },
+        "prepared_scene": {"schema_version": "manyforge.prepared_program_scene.v1"},
     }
     reference = ProgramRuntime._digest(settlement)  # noqa: SLF001
     journal.transition(
@@ -720,9 +755,7 @@ def test_manager_recovery_bootstraps_absent_program_runner_without_reconcile(
         },
     )
 
-    runtime._reconcile_manager_liveness(  # noqa: SLF001
-        _DIGEST_A, "manager.1", "manager-owner.1"
-    )
+    runtime._reconcile_manager_liveness(_DIGEST_A, "manager.1", "manager-owner.1")  # noqa: SLF001
 
     assert admission.reconciliations == []
     assert journal.read().owner_epoch == "runner.new"
@@ -749,9 +782,7 @@ def test_manager_recovery_rotates_only_clean_idle_program_runner_owner(
         inventory=inventory,
     )
 
-    runtime._reconcile_manager_liveness(  # noqa: SLF001
-        _DIGEST_A, "manager.1", "manager-owner.1"
-    )
+    runtime._reconcile_manager_liveness(_DIGEST_A, "manager.1", "manager-owner.1")  # noqa: SLF001
 
     assert len(admission.reconciliations) == 1
     request = admission.reconciliations[0]
@@ -762,9 +793,7 @@ def test_manager_recovery_rotates_only_clean_idle_program_runner_owner(
         {"owner_role": "manager", "owner_epoch": "manager-owner.1"},
     ]
     assert request["reconciliation_evidence_digest"] == (
-        cell_admission_owner_epoch_reconciliation_evidence_digest(
-            "program_runner", "runner.new"
-        )
+        cell_admission_owner_epoch_reconciliation_evidence_digest("program_runner", "runner.new")
     )
     assert journal.read().owner_epoch == "runner.new"
     runtime.shutdown()
@@ -781,15 +810,11 @@ def test_manager_recovery_repairs_a_prior_local_first_partial_rotation(
             "status": "unknown",
             "kernel_owner_epoch": "kernel.1",
             "held_claims": [],
-            "current_owner_epochs": [
-                {"owner_role": "program_runner", "owner_epoch": "runner.old"}
-            ],
+            "current_owner_epochs": [{"owner_role": "program_runner", "owner_epoch": "runner.old"}],
         },
     )
 
-    runtime._reconcile_manager_liveness(  # noqa: SLF001
-        _DIGEST_A, "manager.1", "manager-owner.1"
-    )
+    runtime._reconcile_manager_liveness(_DIGEST_A, "manager.1", "manager-owner.1")  # noqa: SLF001
 
     assert len(admission.reconciliations) == 1
     assert admission.reconciliations[0]["current_owner_epochs"] == [
@@ -816,9 +841,7 @@ def test_manager_recovery_finishes_a_prior_kernel_first_partial_rotation(
         },
     )
 
-    runtime._reconcile_manager_liveness(  # noqa: SLF001
-        _DIGEST_A, "manager.1", "manager-owner.1"
-    )
+    runtime._reconcile_manager_liveness(_DIGEST_A, "manager.1", "manager-owner.1")  # noqa: SLF001
 
     assert admission.reconciliations == []
     assert journal.read().owner_epoch == "runner.current"
@@ -836,9 +859,7 @@ def test_manager_recovery_does_not_advance_local_owner_before_kernel(
             "status": "unknown",
             "kernel_owner_epoch": "kernel.1",
             "held_claims": [],
-            "current_owner_epochs": [
-                {"owner_role": "program_runner", "owner_epoch": "runner.old"}
-            ],
+            "current_owner_epochs": [{"owner_role": "program_runner", "owner_epoch": "runner.old"}],
         },
     )
     admission.reconcile_error = RuntimeError("Kernel reconciliation unavailable")
@@ -857,9 +878,7 @@ def test_manager_recovery_does_not_advance_local_owner_before_kernel(
         )
     )
     admission.reconcile_error = None
-    runtime._reconcile_manager_liveness(  # noqa: SLF001
-        _DIGEST_A, "manager.1", "manager-owner.1"
-    )
+    runtime._reconcile_manager_liveness(_DIGEST_A, "manager.1", "manager-owner.1")  # noqa: SLF001
     assert journal.read().owner_epoch == "runner.current"
     runtime.shutdown()
 
@@ -887,9 +906,7 @@ def test_manager_recovery_same_program_runner_epoch_is_transport_noop(
         expected_generation=1,
     )
 
-    runtime._reconcile_manager_liveness(  # noqa: SLF001
-        _DIGEST_A, "manager.1", "manager-owner.1"
-    )
+    runtime._reconcile_manager_liveness(_DIGEST_A, "manager.1", "manager-owner.1")  # noqa: SLF001
 
     assert admission.reconciliations == []
     assert journal.read().owner_epoch == "runner.same"
@@ -908,9 +925,7 @@ def test_manager_recovery_rotates_exactly_released_terminal_predecessor(
             "status": "released_exact",
             "kernel_owner_epoch": "kernel.1",
             "held_claims": [],
-            "current_owner_epochs": [
-                {"owner_role": "program_runner", "owner_epoch": "runner.old"}
-            ],
+            "current_owner_epochs": [{"owner_role": "program_runner", "owner_epoch": "runner.old"}],
         },
     )
     intent = {
@@ -956,9 +971,7 @@ def test_manager_recovery_rotates_exactly_released_terminal_predecessor(
     admission.inventory["matched_claim"] = claim
     admission.inventory["matched_release"] = release
 
-    runtime._reconcile_manager_liveness(  # noqa: SLF001
-        _DIGEST_A, "manager.1", "manager-owner.1"
-    )
+    runtime._reconcile_manager_liveness(_DIGEST_A, "manager.1", "manager-owner.1")  # noqa: SLF001
 
     assert len(admission.reconciliations) == 1
     assert journal.read().owner_epoch == "runner.new"
@@ -979,9 +992,7 @@ def test_manager_recovery_reconciles_terminal_held_claim_then_reset_is_explicit(
             "status": "held_exact",
             "kernel_owner_epoch": "kernel.1",
             "held_claims": [],
-            "current_owner_epochs": [
-                {"owner_role": "program_runner", "owner_epoch": "runner.old"}
-            ],
+            "current_owner_epochs": [{"owner_role": "program_runner", "owner_epoch": "runner.old"}],
         },
     )
     claim = _program_cycle_claim("runner.old")
@@ -995,9 +1006,7 @@ def test_manager_recovery_reconciles_terminal_held_claim_then_reset_is_explicit(
         }
     )
 
-    runtime._reconcile_manager_liveness(  # noqa: SLF001
-        _DIGEST_A, "manager.1", "manager-owner.1"
-    )
+    runtime._reconcile_manager_liveness(_DIGEST_A, "manager.1", "manager-owner.1")  # noqa: SLF001
 
     assert len(admission.reconciliations) == 1
     assert admission.reconciliations[0]["retained_claims"] == [claim]
@@ -1012,14 +1021,10 @@ def test_manager_recovery_reconciles_terminal_held_claim_then_reset_is_explicit(
         "status": "reconciled_exact",
         "kernel_owner_epoch": "kernel.1",
         "held_claims": [],
-        "current_owner_epochs": [
-            {"owner_role": "program_runner", "owner_epoch": "runner.new"}
-        ],
+        "current_owner_epochs": [{"owner_role": "program_runner", "owner_epoch": "runner.new"}],
         "matched_claim": claim,
         "matched_release": None,
-        "matched_reconcile_settlement": _program_reconcile_settlement(
-            claim, "runner.new"
-        ),
+        "matched_reconcile_settlement": _program_reconcile_settlement(claim, "runner.new"),
     }
     runtime._started = True  # noqa: SLF001
     result = runtime.reset_cycle(
@@ -1082,9 +1087,7 @@ def test_manager_recovery_resumes_contained_reset_after_runner_restart(
         "status": "held_exact",
         "kernel_owner_epoch": "kernel.1",
         "held_claims": [claim],
-        "current_owner_epochs": [
-            {"owner_role": "program_runner", "owner_epoch": "runner.old"}
-        ],
+        "current_owner_epochs": [{"owner_role": "program_runner", "owner_epoch": "runner.old"}],
         "matched_claim": claim,
         "matched_release": None,
         "matched_reconcile_settlement": None,
@@ -1120,9 +1123,7 @@ def test_manager_recovery_resumes_contained_reset_after_runner_restart(
         "status": "reconciled_exact",
         "kernel_owner_epoch": "kernel.1",
         "held_claims": [],
-        "current_owner_epochs": [
-            {"owner_role": "program_runner", "owner_epoch": "runner.new"}
-        ],
+        "current_owner_epochs": [{"owner_role": "program_runner", "owner_epoch": "runner.new"}],
         "matched_claim": claim,
         "matched_release": None,
         "matched_reconcile_settlement": _program_reconcile_settlement(
@@ -1166,17 +1167,13 @@ def test_manager_recovery_validates_kernel_first_terminal_settlement(
             "status": "reconciled_exact",
             "kernel_owner_epoch": "kernel.1",
             "held_claims": [],
-            "current_owner_epochs": [
-                {"owner_role": "program_runner", "owner_epoch": "runner.new"}
-            ],
+            "current_owner_epochs": [{"owner_role": "program_runner", "owner_epoch": "runner.new"}],
         },
     )
     claim = _program_cycle_claim("runner.old")
     _retain_terminal_cycle(journal, claim)
-    reconciliation_digest = (
-        cell_admission_owner_epoch_reconciliation_evidence_digest(
-            "program_runner", "runner.new"
-        )
+    reconciliation_digest = cell_admission_owner_epoch_reconciliation_evidence_digest(
+        "program_runner", "runner.new"
     )
     journal.prepare_liveness_reconciliation(
         predecessor_owner_epoch="runner.old",
@@ -1187,9 +1184,7 @@ def test_manager_recovery_validates_kernel_first_terminal_settlement(
         {
             "matched_claim": claim,
             "matched_release": None,
-            "matched_reconcile_settlement": _program_reconcile_settlement(
-                claim, "runner.wrong"
-            ),
+            "matched_reconcile_settlement": _program_reconcile_settlement(claim, "runner.wrong"),
         }
     )
 
@@ -1198,12 +1193,10 @@ def test_manager_recovery_validates_kernel_first_terminal_settlement(
             _DIGEST_A, "manager.1", "manager-owner.1"
         )
 
-    admission.inventory["matched_reconcile_settlement"] = (
-        _program_reconcile_settlement(claim, "runner.new")
+    admission.inventory["matched_reconcile_settlement"] = _program_reconcile_settlement(
+        claim, "runner.new"
     )
-    runtime._reconcile_manager_liveness(  # noqa: SLF001
-        _DIGEST_A, "manager.1", "manager-owner.1"
-    )
+    runtime._reconcile_manager_liveness(_DIGEST_A, "manager.1", "manager-owner.1")  # noqa: SLF001
     assert journal.read().owner_epoch == "runner.new"
     assert admission.reconciliations == []
     runtime.shutdown()
@@ -1220,9 +1213,7 @@ def test_manager_recovery_rotates_terminal_after_prior_settlement_compaction(
             "status": "unknown",
             "kernel_owner_epoch": "kernel.1",
             "held_claims": [],
-            "current_owner_epochs": [
-                {"owner_role": "program_runner", "owner_epoch": "runner.mid"}
-            ],
+            "current_owner_epochs": [{"owner_role": "program_runner", "owner_epoch": "runner.mid"}],
             "matched_claim": None,
             "matched_release": None,
             "matched_reconcile_settlement": None,
@@ -1240,9 +1231,7 @@ def test_manager_recovery_rotates_terminal_after_prior_settlement_compaction(
         require_terminal_release=False,
     )
 
-    runtime._reconcile_manager_liveness(  # noqa: SLF001
-        _DIGEST_A, "manager.1", "manager-owner.1"
-    )
+    runtime._reconcile_manager_liveness(_DIGEST_A, "manager.1", "manager-owner.1")  # noqa: SLF001
 
     assert len(admission.reconciliations) == 1
     assert admission.reconciliations[0]["retained_claims"] == []
@@ -1265,9 +1254,7 @@ def test_manager_recovery_supersedes_stale_terminal_rotation_intent(
             "status": "reconciled_exact",
             "kernel_owner_epoch": "kernel.1",
             "held_claims": [],
-            "current_owner_epochs": [
-                {"owner_role": "program_runner", "owner_epoch": "runner.mid"}
-            ],
+            "current_owner_epochs": [{"owner_role": "program_runner", "owner_epoch": "runner.mid"}],
         },
     )
     claim = _program_cycle_claim("runner.original")
@@ -1294,15 +1281,11 @@ def test_manager_recovery_supersedes_stale_terminal_rotation_intent(
         {
             "matched_claim": claim,
             "matched_release": None,
-            "matched_reconcile_settlement": _program_reconcile_settlement(
-                claim, "runner.mid"
-            ),
+            "matched_reconcile_settlement": _program_reconcile_settlement(claim, "runner.mid"),
         }
     )
 
-    runtime._reconcile_manager_liveness(  # noqa: SLF001
-        _DIGEST_A, "manager.1", "manager-owner.1"
-    )
+    runtime._reconcile_manager_liveness(_DIGEST_A, "manager.1", "manager-owner.1")  # noqa: SLF001
 
     assert len(admission.reconciliations) == 1
     assert admission.reconciliations[0]["retained_claims"] == []
@@ -1323,9 +1306,7 @@ def test_manager_recovery_keeps_uncontained_predecessor_fail_closed(
         "status": "unknown",
         "kernel_owner_epoch": "kernel.1",
         "held_claims": [],
-        "current_owner_epochs": [
-            {"owner_role": "program_runner", "owner_epoch": "runner.old"}
-        ],
+        "current_owner_epochs": [{"owner_role": "program_runner", "owner_epoch": "runner.old"}],
     }
     runtime, journal, admission = _reconcile_runtime(
         tmp_path,
@@ -1376,9 +1357,7 @@ def _start_request(*, request_id: str = "request.start.1") -> ProgramRunStartReq
     )
 
 
-def _retain_no_effect_terminal(
-    journal: ProgramCycleJournal, *, program_run_id: str
-) -> str:
+def _retain_no_effect_terminal(journal: ProgramCycleJournal, *, program_run_id: str) -> str:
     retained = journal.read()
     assert retained.claim is not None
     settlement = {
@@ -1386,9 +1365,7 @@ def _retain_no_effect_terminal(
         "kind": "proven_no_effect",
         "claim": retained.claim,
         "program_run_id": program_run_id,
-        "prepared_scene": {
-            "schema_version": "manyforge.prepared_program_scene.v1"
-        },
+        "prepared_scene": {"schema_version": "manyforge.prepared_program_scene.v1"},
     }
     reference = ProgramRuntime._digest(settlement)  # noqa: SLF001
     journal.transition(
@@ -1542,10 +1519,12 @@ def test_starting_stop_reaches_native_while_capture_registration_is_held(
             stops.append(deepcopy(body))
             assert body["request_context"]["request_owner_epoch"] == "execution.epoch.1"
             return {
-                "ok": True, "owner_epoch": "execution.epoch.1",
+                "ok": True,
+                "owner_epoch": "execution.epoch.1",
                 "accepted": {
                     "request_id": body["request_context"]["request_id"],
-                    "stop_id": "stop.1", "stop_generation": len(stops),
+                    "stop_id": "stop.1",
+                    "stop_generation": len(stops),
                     "replay_status": "accepted_new",
                 },
             }
@@ -1562,7 +1541,8 @@ def test_starting_stop_reaches_native_while_capture_registration_is_held(
     _bypass_scene_preparation(monkeypatch)
     runtime = ProgramRuntime(
         ProgramRunnerConfig(headless_url="http://headless.test", owner_epoch="runner.1"),
-        headless_client=headless, execution_transport=headless,
+        headless_client=headless,
+        execution_transport=headless,
         admission_client=admission,
         cycle_journal=ProgramCycleJournal(tmp_path / "cycle.sqlite3", owner_epoch="runner.1"),
     )
@@ -1594,12 +1574,17 @@ def test_starting_stop_reaches_native_while_capture_registration_is_held(
     try:
         assert entered.wait(5), "Start did not reach the registration gate"
 
-        request = ProgramRunStopRequest.model_validate({
-            "request_id": "stop.during-registration", "request_owner_epoch": "composer.1",
-            "source_label": "operator", "correlation_id": None,
-            "program_run_id": "program-cycle.1", "expected_owner_epoch": "runner.1",
-            "reason": "stop during capture",
-        })
+        request = ProgramRunStopRequest.model_validate(
+            {
+                "request_id": "stop.during-registration",
+                "request_owner_epoch": "composer.1",
+                "source_label": "operator",
+                "correlation_id": None,
+                "program_run_id": "program-cycle.1",
+                "expected_owner_epoch": "runner.1",
+                "reason": "stop during capture",
+            }
+        )
 
         def stop():
             try:
@@ -1705,17 +1690,10 @@ def test_run_prepares_while_idle_then_only_verifies_after_claim(
     assert status["run_revision"] == run["run_revision"]
     assert status["node_status_revision"] == run["node_status_revision"]
     assert status["run"] == run
-    assert status["runtime_controls"]["program_run_id"] == run["capture"][
-        "program_run_id"
-    ]
+    assert status["runtime_controls"]["program_run_id"] == run["capture"]["program_run_id"]
+    assert status["runtime_controls"]["run_revision"] == status["run_revision"]
     assert (
-        status["runtime_controls"]["run_revision"]
-        == status["run_revision"]
-    )
-    assert (
-        status["runtime_controls"]["runtime_controls"][
-            "runtime_control_revision"
-        ]
+        status["runtime_controls"]["runtime_controls"]["runtime_control_revision"]
         == status["runtime_control_revision"]
     )
     runtime.shutdown()
@@ -1815,10 +1793,7 @@ def test_stop_overtakes_start_before_claim_without_launching_tree(
     assert preparation_entered.wait(timeout=1.0)
     starting = runtime.cycle_status()
     assert starting["state"] == "starting"
-    availability = {
-        command["command_kind"]: command
-        for command in starting["allowed_commands"]
-    }
+    availability = {command["command_kind"]: command for command in starting["allowed_commands"]}
     assert availability["program_stop"]["allowed"] is True
     assert availability["program_motion_stop"]["allowed"] is False
     assert availability["program_full_stop"]["allowed"] is False
@@ -1860,12 +1835,8 @@ def test_stop_overtakes_start_before_claim_without_launching_tree(
             "expected_owner_epoch": runtime.owner_epoch,
             "expected_cycle_generation": 1,
             "expected_claim_generation": None,
-            "terminal_reference": terminal[
-                "terminal_or_settlement_reference"
-            ],
-            "settlement_evidence_digest": terminal[
-                "terminal_or_settlement_reference"
-            ],
+            "terminal_reference": terminal["terminal_or_settlement_reference"],
+            "settlement_evidence_digest": terminal["terminal_or_settlement_reference"],
         }
     )
     assert runtime.reset_cycle(reset)["idle_cycle_generation"] == 2
@@ -1885,9 +1856,7 @@ def test_reset_publishes_resetting_until_motion_is_terminal(
     _bypass_scene_preparation(monkeypatch)
     _bypass_reset_scene_preparation(monkeypatch)
     admission = _Admission()
-    journal = ProgramCycleJournal(
-        tmp_path / "cycle.sqlite3", owner_epoch="runner.resetting.1"
-    )
+    journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3", owner_epoch="runner.resetting.1")
     runtime = ProgramRuntime(
         ProgramRunnerConfig(
             headless_url="http://headless.test",
@@ -1977,9 +1946,7 @@ def test_reset_publishes_resetting_until_motion_is_terminal(
     resetting = runtime.cycle_status()
     assert resetting["state"] == "resetting"
     assert resetting["reset_phase"] == "stopping"
-    availability = {
-        row["command_kind"]: row for row in resetting["allowed_commands"]
-    }
+    availability = {row["command_kind"]: row for row in resetting["allowed_commands"]}
     assert availability["program_run"]["allowed"] is False
     assert availability["program_stop"]["allowed"] is False
     assert availability["program_reset"]["allowed"] is False
@@ -2003,9 +1970,7 @@ def test_post_claim_scene_race_records_resettable_no_effect_settlement(
     )
     admission = _Admission()
     runtime = ProgramRuntime(
-        ProgramRunnerConfig(
-            headless_url="http://headless.test", owner_epoch="runner.scene-race.1"
-        ),
+        ProgramRunnerConfig(headless_url="http://headless.test", owner_epoch="runner.scene-race.1"),
         headless_client=_Headless(),  # type: ignore[arg-type]
         execution_transport=_Headless(),  # type: ignore[arg-type]
         admission_client=admission,  # type: ignore[arg-type]
@@ -2016,9 +1981,7 @@ def test_post_claim_scene_race_records_resettable_no_effect_settlement(
     monkeypatch.setattr(
         runtime._scene,  # noqa: SLF001
         "prepare_initial_scene",
-        lambda *_args, **_kwargs: {
-            "schema_version": "manyforge.prepared_program_scene.v1"
-        },
+        lambda *_args, **_kwargs: {"schema_version": "manyforge.prepared_program_scene.v1"},
     )
     monkeypatch.setattr(
         runtime._scene,  # noqa: SLF001
@@ -2052,9 +2015,7 @@ def test_post_claim_scene_race_records_resettable_no_effect_settlement(
             "expected_cycle_generation": status["cycle_generation"],
             "expected_claim_generation": status["cycle_claim_generation"],
             "terminal_reference": status["terminal_or_settlement_reference"],
-            "settlement_evidence_digest": status[
-                "terminal_or_settlement_reference"
-            ],
+            "settlement_evidence_digest": status["terminal_or_settlement_reference"],
         }
     )
     runtime.reset_cycle(reset)
@@ -2073,9 +2034,7 @@ def test_host_start_without_a_result_retains_claim_for_reconciliation(
     )
     _bypass_scene_preparation(monkeypatch)
     admission = _Admission()
-    journal = ProgramCycleJournal(
-        tmp_path / "cycle.sqlite3", owner_epoch="runner.start-unknown.1"
-    )
+    journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3", owner_epoch="runner.start-unknown.1")
     runtime = ProgramRuntime(
         ProgramRunnerConfig(
             headless_url="http://headless.test",
@@ -2139,9 +2098,7 @@ def test_config_pairs_execution_root_exactly_with_cycle_journal(tmp_path) -> Non
 def test_repeated_concurrent_run_observation_is_strictly_read_only(
     tmp_path,
 ) -> None:
-    journal = ProgramCycleJournal(
-        tmp_path / "cycle.sqlite3", owner_epoch="runner.observation"
-    )
+    journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3", owner_epoch="runner.observation")
     history = _Snapshot(
         "run.history",
         owner_id="program-runner.test",
@@ -2192,17 +2149,15 @@ def test_repeated_concurrent_run_observation_is_strictly_read_only(
         try:
             for _ in range(20):
                 all_runs = runtime.runs(active_only=False, limit=10)
-                assert {
-                    value["capture"]["program_run_id"]
-                    for value in all_runs["runs"]
-                } == {
+                assert {value["capture"]["program_run_id"] for value in all_runs["runs"]} == {
                     "run.history",
                     "run.live",
                     "run.resident-terminal",
                 }
-                assert runtime.runs(active_only=True, limit=10)["runs"][0][
-                    "capture"
-                ]["program_run_id"] == "run.live"
+                assert (
+                    runtime.runs(active_only=True, limit=10)["runs"][0]["capture"]["program_run_id"]
+                    == "run.live"
+                )
                 assert runtime.read_run("run.live")["state"] == "running"
                 assert runtime.read_run("run.history")["state"] == "succeeded"
         except BaseException as error:
@@ -2357,14 +2312,11 @@ def test_repeated_run_is_state_rejected_and_keeps_one_active_product_run(
     assert len(stopping_statuses) == 1
     assert stopping_statuses[0]["state"] == "running"
     stopping_commands = {
-        row["command_kind"]: row
-        for row in stopping_statuses[0]["allowed_commands"]
+        row["command_kind"]: row for row in stopping_statuses[0]["allowed_commands"]
     }
     assert stopping_commands["program_motion_stop"]["allowed"] is True
     assert stopping_commands["program_reset"]["allowed"] is True
-    assert host.motion_stop_calls == [
-        ("program-cycle.1", "ordinary operator motion Stop")
-    ]
+    assert host.motion_stop_calls == [("program-cycle.1", "ordinary operator motion Stop")]
     motion_stopped_cycle = runtime.cycle_status()
     assert motion_stopped_cycle["state"] == "running"
 
@@ -2389,9 +2341,7 @@ def test_repeated_run_is_state_rejected_and_keeps_one_active_product_run(
     )
     full_stopped = runtime.full_stop("program-cycle.1", full_stop)
     assert full_stopped["state"] == "full_stopped"
-    assert host.full_stop_calls == [
-        ("program-cycle.1", "ordinary operator Full Stop")
-    ]
+    assert host.full_stop_calls == [("program-cycle.1", "ordinary operator Full Stop")]
     full_stopped_status = runtime.cycle_status()
     assert full_stopped_status["state"] == "running"
     full_stopped_commands = {
@@ -2413,18 +2363,12 @@ def test_repeated_run_is_state_rejected_and_keeps_one_active_product_run(
             "reason": "operator Run after Full Stop",
         }
     )
-    resumed = runtime.resume_full_stop(
-        "program-cycle.1", resume_full_stop
-    )
+    resumed = runtime.resume_full_stop("program-cycle.1", resume_full_stop)
     assert resumed["state"] == "running"
-    assert host.full_stop_resume_calls == [
-        ("program-cycle.1", "operator Run after Full Stop")
-    ]
+    assert host.full_stop_resume_calls == [("program-cycle.1", "operator Run after Full Stop")]
     resumed_status = runtime.cycle_status()
     assert resumed_status["state"] == "running"
-    resumed_commands = {
-        row["command_kind"]: row for row in resumed_status["allowed_commands"]
-    }
+    resumed_commands = {row["command_kind"]: row for row in resumed_status["allowed_commands"]}
     assert resumed_commands["program_resume_full_stop"]["allowed"] is False
     assert resumed_commands["program_discard_full_stop"]["allowed"] is False
     assert resumed_commands["program_motion_stop"]["allowed"] is True
@@ -2479,12 +2423,8 @@ def test_repeated_run_is_state_rejected_and_keeps_one_active_product_run(
             "expected_owner_epoch": runtime.owner_epoch,
             "expected_cycle_generation": 1,
             "expected_claim_generation": 1,
-            "terminal_reference": status[
-                "terminal_or_settlement_reference"
-            ],
-            "settlement_evidence_digest": status[
-                "terminal_or_settlement_reference"
-            ],
+            "terminal_reference": status["terminal_or_settlement_reference"],
+            "settlement_evidence_digest": status["terminal_or_settlement_reference"],
         }
     )
     reset_result = runtime.reset_cycle(reset)
@@ -2506,9 +2446,7 @@ def test_repeated_run_is_state_rejected_and_keeps_one_active_product_run(
             "program_run_id": "program-cycle.2",
         }
     )
-    second_full_stopped = runtime.full_stop(
-        "program-cycle.2", second_full_stop
-    )
+    second_full_stopped = runtime.full_stop("program-cycle.2", second_full_stop)
     current_cycle = runtime.cycle_status()
     discard = ProgramFullStopResetRequest.model_validate(
         {
@@ -2520,9 +2458,7 @@ def test_repeated_run_is_state_rejected_and_keeps_one_active_product_run(
             "expected_owner_epoch": runtime.owner_epoch,
             "expected_run_revision": second_full_stopped["run_revision"],
             "expected_cycle_generation": current_cycle["cycle_generation"],
-            "expected_claim_generation": current_cycle[
-                "cycle_claim_generation"
-            ],
+            "expected_claim_generation": current_cycle["cycle_claim_generation"],
             "reason": "operator Reset discarded Full Stop",
         }
     )
@@ -2542,23 +2478,15 @@ def test_repeated_run_is_state_rejected_and_keeps_one_active_product_run(
             "program_run_id": "program-cycle.2",
             "expected_owner_epoch": runtime.owner_epoch,
             "expected_cycle_generation": terminal_cycle["cycle_generation"],
-            "expected_claim_generation": terminal_cycle[
-                "cycle_claim_generation"
-            ],
-            "terminal_reference": terminal_cycle[
-                "terminal_or_settlement_reference"
-            ],
-            "settlement_evidence_digest": terminal_cycle[
-                "terminal_or_settlement_reference"
-            ],
+            "expected_claim_generation": terminal_cycle["cycle_claim_generation"],
+            "terminal_reference": terminal_cycle["terminal_or_settlement_reference"],
+            "settlement_evidence_digest": terminal_cycle["terminal_or_settlement_reference"],
         }
     )
     runtime.reset_cycle(second_reset)
     assert runtime.cycle_status()["state"] == "idle_after_reset"
 
-    third = runtime.start_run(
-        _start_request(request_id="request.start.after-full-stop-reset")
-    )
+    third = runtime.start_run(_start_request(request_id="request.start.after-full-stop-reset"))
     third_stop = ProgramRunStopRequest.model_validate(
         {
             **stop.model_dump(mode="json"),
@@ -2579,7 +2507,9 @@ def test_repeated_run_is_state_rejected_and_keeps_one_active_product_run(
 
 @pytest.mark.parametrize("case", ["unselected", "incomplete", "unknown"])
 def test_default_resume_routes_only_selected_nodes_and_preserves_partial_outcomes(
-    monkeypatch, tmp_path, case,
+    monkeypatch,
+    tmp_path,
+    case,
 ):
     monkeypatch.setattr(
         "manyforge_program_runner.runtime.build_applied_program_run_admission",
@@ -2625,7 +2555,8 @@ def test_default_resume_routes_only_selected_nodes_and_preserves_partial_outcome
     def selected(*_args, **_kwargs):
         calls.append("selected")
         error = (
-            ProgramRunOwnerRecoveryIncompleteError if case == "incomplete"
+            ProgramRunOwnerRecoveryIncompleteError
+            if case == "incomplete"
             else ProgramRunOwnerOutcomeUnknownError
         )
         raise error("first cleanup accepted; second result " + case)
@@ -2664,9 +2595,12 @@ def test_default_resume_routes_only_selected_nodes_and_preserves_partial_outcome
 @pytest.mark.parametrize(
     ("near_revision_limit", "pending_stop", "failure"),
     [
-        (False, False, None), (True, False, None),
-        (False, True, None), (True, True, None),
-        (False, True, "restore"), (False, True, "release"),
+        (False, False, None),
+        (True, False, None),
+        (False, True, None),
+        (True, True, None),
+        (False, True, "restore"),
+        (False, True, "release"),
     ],
 )
 def test_operator_motion_stop_reset_stops_tree_and_resets_cycle_once(
@@ -2721,8 +2655,10 @@ def test_operator_motion_stop_reset_stops_tree_and_resets_cycle_once(
             nonlocal terminal
             terminal = stop_run(program_run_id, **kwargs)
             stopping = _Snapshot(
-                program_run_id, owner_id=runtime.owner_id,
-                owner_epoch=runtime.owner_epoch, state="stopping",
+                program_run_id,
+                owner_id=runtime.owner_id,
+                owner_epoch=runtime.owner_epoch,
+                state="stopping",
                 revision=terminal.run_revision,
             )
             owner.rows[program_run_id] = stopping
@@ -2742,9 +2678,12 @@ def test_operator_motion_stop_reset_stops_tree_and_resets_cycle_once(
     if near_revision_limit:
         controls = runtime._controls("program-cycle.1")
         controls.stage_override(
-            node_instance_id="move.1", node_attempt_id="attempt.1",
-            parameter_id="velocity_scale", value=0.5,
-            source_observation_id=None, source_owner_generation=None,
+            node_instance_id="move.1",
+            node_attempt_id="attempt.1",
+            parameter_id="velocity_scale",
+            value=0.5,
+            source_observation_id=None,
+            source_owner_generation=None,
             validator=lambda **values: values["value"],
         )
         snapshot = controls.snapshot()
@@ -2755,7 +2694,9 @@ def test_operator_motion_stop_reset_stops_tree_and_resets_cycle_once(
             for index in range(maximum - 257, maximum - 1)
         ]
         capture = runtime.read_run("program-cycle.1")["capture"]
-        runtime._runtime_controls["program-cycle.1"] = ProgramRuntimeControls.restore(capture, snapshot)
+        runtime._runtime_controls["program-cycle.1"] = ProgramRuntimeControls.restore(
+            capture, snapshot
+        )
 
     intervention = SimpleNamespace(
         identity=SimpleNamespace(
@@ -2776,9 +2717,7 @@ def test_operator_motion_stop_reset_stops_tree_and_resets_cycle_once(
     }
     runtime._recovery_offer = (  # type: ignore[method-assign]  # noqa: SLF001
         lambda _run_id, *, cycle_generation, selection_scope=None: (
-            deepcopy(offer)
-            if cycle_generation == 1 and journal.read().state == "running"
-            else None
+            deepcopy(offer) if cycle_generation == 1 and journal.read().state == "running" else None
         )
     )
     request = CycleRecoveryActionRequest.model_validate(
@@ -2797,6 +2736,7 @@ def test_operator_motion_stop_reset_stops_tree_and_resets_cycle_once(
 
     if failure is not None:
         if failure == "restore":
+
             def failed_restore(*_args: Any) -> None:
                 raise ProgramRunnerError("program_scene_unavailable", "restore failed")
 
@@ -2808,7 +2748,8 @@ def test_operator_motion_stop_reset_stops_tree_and_resets_cycle_once(
             with pytest.raises(ProgramRunnerError) as rejected:
                 runtime.apply_recovery_action(request)
             cause = (
-                "program_scene_unavailable" if failure == "restore"
+                "program_scene_unavailable"
+                if failure == "restore"
                 else "program_cycle_reconciliation_required"
             )
             assert rejected.value.code == "program_cycle_recovery_required"
@@ -2831,9 +2772,7 @@ def test_operator_motion_stop_reset_stops_tree_and_resets_cycle_once(
             # The wrapper retires only itself. Canonical Reset retires its
             # known failure, but retains the unresolved release request.
             assert all(row[0] != request.request_id for row in pending)
-            assert [row[1] for row in pending] == (
-                ["reset"] if failure == "release" else []
-            )
+            assert [row[1] for row in pending] == (["reset"] if failure == "release" else [])
         finally:
             runtime.shutdown()
         return
@@ -2849,9 +2788,7 @@ def test_operator_motion_stop_reset_stops_tree_and_resets_cycle_once(
     assert result["run"]["state"] == "stopped"
     assert result["recovery_offer"] is None
     assert result["runtime_controls"] is None
-    assert host.stop_calls == [
-        ("program-cycle.1", "operator requested Program cycle Reset")
-    ]
+    assert host.stop_calls == [("program-cycle.1", "operator requested Program cycle Reset")]
     assert host.reset_calls == ["program-cycle.1"]
     assert cleared_stop_faults == ["program-cycle.1"]
     assert len(admission.releases) == 1
@@ -2865,18 +2802,14 @@ def test_operator_motion_stop_reset_stops_tree_and_resets_cycle_once(
 
 
 def test_cycle_status_projects_pending_acquire_as_starting(tmp_path) -> None:
-    journal = ProgramCycleJournal(
-        tmp_path / "cycle.sqlite3", owner_epoch="runner.1"
-    )
+    journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3", owner_epoch="runner.1")
     journal.begin_acquire(
         expected_generation=1,
         provisional_run_id="program-cycle.1",
         evidence={"request_id": "request.start.1"},
     )
     runtime = ProgramRuntime(
-        ProgramRunnerConfig(
-            headless_url="http://headless.test", owner_epoch="runner.1"
-        ),
+        ProgramRunnerConfig(headless_url="http://headless.test", owner_epoch="runner.1"),
         headless_client=_Headless(),  # type: ignore[arg-type]
         execution_transport=_Headless(),  # type: ignore[arg-type]
         admission_client=_Admission(),  # type: ignore[arg-type]
@@ -2935,6 +2868,10 @@ def test_runtime_controls_are_state_conditioned_and_restore_current_projection(
             "expected_owner_epoch": owner_epoch,
             "expected_run_revision": expected_run_revision,
         }
+
+    commands = {row["command_kind"]: row for row in runtime.cycle_status()["allowed_commands"]}
+    assert commands["gripper_confirm"]["allowed"] is True
+    assert commands["operation_start"]["allowed"] is False
 
     stage_request = RuntimeOverrideStageRequest.model_validate(
         {
@@ -3038,10 +2975,7 @@ def test_runtime_controls_are_state_conditioned_and_restore_current_projection(
     )
     restored.start()
 
-    assert (
-        restored.read_runtime_controls(program_run_id)["runtime_controls"]
-        == expected_controls
-    )
+    assert restored.read_runtime_controls(program_run_id)["runtime_controls"] == expected_controls
     restored.shutdown()
 
 
@@ -3220,9 +3154,7 @@ def test_restart_retries_containment_after_durable_loss_crash_window(
     runtime.start()
 
     assert host.start_admissions == []
-    assert host.stop_calls == [
-        ("program-run.1", "manager_presence_expired")
-    ]
+    assert host.stop_calls == [("program-run.1", "manager_presence_expired")]
     assert replacement.read().state == "terminal_awaiting_reset"
     assert replacement.read().reconciliation_required is True
     assert runtime.liveness_status()["command_fenced"] is True
@@ -3403,9 +3335,11 @@ def test_tree_refinement_never_widens_reconciliation_permissions(tmp_path) -> No
         for command in runtime.cycle_status()["allowed_commands"]
     }
 
-    assert {
-        kind for kind, allowed in permissions.items() if allowed
-    } == {"cell_full_stop", "execution_recovery", "stop_recovery"}
+    assert {kind for kind, allowed in permissions.items() if allowed} == {
+        "cell_full_stop",
+        "execution_recovery",
+        "stop_recovery",
+    }
     runtime.shutdown()
 
 
@@ -3449,9 +3383,7 @@ def test_release_failure_is_visible_and_only_known_rejection_can_resume(
         provisional_run_id="program-run.1",
         claim=claim,
     )
-    terminal_reference = _retain_no_effect_terminal(
-        journal, program_run_id="program-run.1"
-    )
+    terminal_reference = _retain_no_effect_terminal(journal, program_run_id="program-run.1")
     admission = _Admission()
     admission.release_error = CellAdmissionError(
         "settlement_validator_unavailable",
@@ -3487,17 +3419,13 @@ def test_release_failure_is_visible_and_only_known_rejection_can_resume(
     with pytest.raises(ProgramRunnerError) as rejected:
         runtime.reset_cycle(request)
     assert rejected.value.code == "program_cycle_recovery_required"
-    assert rejected.value.details == {
-        "cause_code": "settlement_validator_unavailable"
-    }
+    assert rejected.value.details == {"cause_code": "settlement_validator_unavailable"}
     failed_cycle = journal.read()
     assert failed_cycle.state == "recovery_required"
     assert failed_cycle.reset_phase == "releasing"
     if outcome_unknown:
         assert failed_cycle.reconciliation_required is True
-        assert failed_cycle.failure == {
-            "code": "program_cycle_reconciliation_required"
-        }
+        assert failed_cycle.failure == {"code": "program_cycle_reconciliation_required"}
         reset_availability = {
             command["command_kind"]: command
             for command in runtime.cycle_status()["allowed_commands"]
@@ -3517,8 +3445,7 @@ def test_release_failure_is_visible_and_only_known_rejection_can_resume(
     }
     assert journal.read().release_intent == admission.releases[0]
     reset_availability = {
-        command["command_kind"]: command
-        for command in runtime.cycle_status()["allowed_commands"]
+        command["command_kind"]: command for command in runtime.cycle_status()["allowed_commands"]
     }
     assert reset_availability["program_reset"]["allowed"] is True
 
@@ -3612,9 +3539,12 @@ def test_reset_keeps_backend_fenced_when_scene_convergence_fails(
 
     if phase_write_failure:
         capture = {
-            "program_run_id": "program-cycle.1", "program_id": "program.1",
-            "program_revision": _DIGEST_A, "program_binding_id": _DIGEST_B,
-            "retained_bundle_id": _DIGEST_A, "graph_revision": _DIGEST_B,
+            "program_run_id": "program-cycle.1",
+            "program_id": "program.1",
+            "program_revision": _DIGEST_A,
+            "program_binding_id": _DIGEST_B,
+            "retained_bundle_id": _DIGEST_A,
+            "graph_revision": _DIGEST_B,
             "node_environment_digest": _DIGEST_A,
         }
         snapshot = ProgramRuntimeControls(capture).snapshot()
@@ -3642,9 +3572,7 @@ def test_reset_keeps_backend_fenced_when_scene_convergence_fails(
     with pytest.raises(ProgramRunnerError) as failed:
         runtime.reset_cycle(request)
     assert failed.value.code == "program_cycle_recovery_required"
-    assert failed.value.details == {
-        "cause_code": "program_cycle_reset_scene_preparation_failed"
-    }
+    assert failed.value.details == {"cause_code": "program_cycle_reset_scene_preparation_failed"}
     assert events == ["scene:1"]
     failed_cycle = journal.read()
     assert failed_cycle.state == "recovery_required"
@@ -3653,8 +3581,11 @@ def test_reset_keeps_backend_fenced_when_scene_convergence_fails(
     assert failed_cycle.failure == {
         "code": "program_cycle_reset_scene_preparation_failed",
         "failed_phase": "restoring_scene",
-        "message": ("Reset phase write temporarily unavailable" if phase_write_failure
-                    else "logical scene owner temporarily unavailable"),
+        "message": (
+            "Reset phase write temporarily unavailable"
+            if phase_write_failure
+            else "logical scene owner temporarily unavailable"
+        ),
     }
     assert admission.releases == []
 
@@ -3702,9 +3633,7 @@ def test_rejected_and_completed_resets_do_not_consume_inflight_capacity(
         provisional_run_id="program-run.1",
         claim=claim,
     )
-    terminal_reference = _retain_no_effect_terminal(
-        journal, program_run_id="program-run.1"
-    )
+    terminal_reference = _retain_no_effect_terminal(journal, program_run_id="program-run.1")
     admission = _Admission()
     runtime = ProgramRuntime(
         ProgramRunnerConfig(
@@ -3894,9 +3823,7 @@ def test_draft_applied_mismatch_is_rechecked_without_retained_receipts(
         maximum_inflight_commands=1,
     )
     runtime = ProgramRuntime(
-        ProgramRunnerConfig(
-            headless_url="http://headless.test", owner_epoch="runner.1"
-        ),
+        ProgramRunnerConfig(headless_url="http://headless.test", owner_epoch="runner.1"),
         headless_client=headless,  # type: ignore[arg-type]
         execution_transport=headless,  # type: ignore[arg-type]
         admission_client=admission,  # type: ignore[arg-type]
@@ -3945,13 +3872,9 @@ def test_acquire_success_before_claim_journal_failure_latches_reconciliation(
     )
     _bypass_scene_preparation(monkeypatch)
     admission = _Admission()
-    journal = FailingJournal(
-        tmp_path / "cycle.sqlite3", owner_epoch="runner.1"
-    )
+    journal = FailingJournal(tmp_path / "cycle.sqlite3", owner_epoch="runner.1")
     runtime = ProgramRuntime(
-        ProgramRunnerConfig(
-            headless_url="http://headless.test", owner_epoch="runner.1"
-        ),
+        ProgramRunnerConfig(headless_url="http://headless.test", owner_epoch="runner.1"),
         headless_client=_Headless(),  # type: ignore[arg-type]
         execution_transport=_Headless(),  # type: ignore[arg-type]
         admission_client=admission,  # type: ignore[arg-type]
@@ -3991,15 +3914,11 @@ def test_native_acquire_rejection_is_safe_to_recheck_without_retained_receipt(
     _bypass_scene_preparation(monkeypatch)
     admission = RejectingAdmission()
     runtime = ProgramRuntime(
-        ProgramRunnerConfig(
-            headless_url="http://headless.test", owner_epoch="runner.1"
-        ),
+        ProgramRunnerConfig(headless_url="http://headless.test", owner_epoch="runner.1"),
         headless_client=_Headless(),  # type: ignore[arg-type]
         execution_transport=_Headless(),  # type: ignore[arg-type]
         admission_client=admission,  # type: ignore[arg-type]
-        cycle_journal=ProgramCycleJournal(
-            tmp_path / "cycle.sqlite3", owner_epoch="runner.1"
-        ),
+        cycle_journal=ProgramCycleJournal(tmp_path / "cycle.sqlite3", owner_epoch="runner.1"),
     )
     runtime.start()
     request = _start_request()
@@ -4012,7 +3931,9 @@ def test_native_acquire_rejection_is_safe_to_recheck_without_retained_receipt(
     runtime.shutdown()
 
 
-def test_stop_bypasses_transition_lock_and_full_ordinary_inflight_bound(tmp_path) -> None:
+def test_stop_bypasses_transition_lock_and_full_ordinary_inflight_bound(
+    tmp_path,
+) -> None:
     journal = ProgramCycleJournal(
         tmp_path / "cycle.sqlite3",
         owner_epoch="runner.1",
@@ -4098,10 +4019,7 @@ def test_stop_bypasses_transition_lock_and_full_ordinary_inflight_bound(tmp_path
     runtime._transition_lock.release()  # noqa: SLF001
     thread.join()
     assert host.stop_calls == [("program-run.1", "contain")]
-    assert (
-        runtime.stop_run("program-run.1", request)["state"]
-        == "terminal_awaiting_reset"
-    )
+    assert runtime.stop_run("program-run.1", request)["state"] == "terminal_awaiting_reset"
     assert host.stop_calls == [("program-run.1", "contain")]
     runtime.shutdown()
 
@@ -4311,9 +4229,7 @@ def test_runtime_injects_and_closes_the_focused_simulation_owner() -> None:
     )
 
     assert runtime._ports.simulator_control is simulation  # noqa: SLF001
-    assert runtime._owner_availability[  # noqa: SLF001
-        "simulator_control"
-    ].available
+    assert runtime._owner_availability["simulator_control"].available  # noqa: SLF001
     assert runtime.health()["simulation_control_available"] is True
     runtime.shutdown()
     runtime.shutdown()

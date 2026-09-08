@@ -38,6 +38,7 @@ from manyforge_behavior.node_registry import (
     NodeRegistryError,
     build_node_registry,
 )
+from manyforge_behavior import qualified_node_extensions as extension
 
 
 NODE_ENVIRONMENT_MANIFEST_API = "manyforge.node_environment_manifest.v1"
@@ -52,21 +53,22 @@ MAX_MANIFEST_TEXT_CHARACTERS = 1024
 _IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_.-]*$")
 _SOURCE_ID_RE = re.compile(
     r"^(?:python-module:[a-z][a-z0-9_.]*|"
-    r"python-project:manyforge_behavior)$"
+    r"python-project:[a-z][a-z0-9_.]*|skill-artifact:[a-z][a-z0-9_.-]*|"
+    r"node-extension-descriptor:[a-z][a-z0-9_.-]*)$"
 )
+_QUALIFIED_PACKAGES = frozenset({BUILTIN_EXECUTABLE_PACKAGE_ID, extension.PACKAGE_ID})
 _ZERO_DIGEST = "sha256:" + ("0" * 64)
 _PACKAGE_ROOT = Path(__file__).resolve().parent
 _BEHAVIOR_ROOT = _PACKAGE_ROOT.parent
 AUTHORITATIVE_PROJECT_PATH = _BEHAVIOR_ROOT / "pyproject.toml"
 PACKAGED_PROJECT_SNAPSHOT_PATH = (
-    _PACKAGE_ROOT
-    / "_retained_source"
-    / "manyforge_behavior.pyproject.toml"
+    _PACKAGE_ROOT / "_retained_source" / "manyforge_behavior.pyproject.toml"
 )
 BUILTIN_CATALOG_PATH = _BEHAVIOR_ROOT / "resources" / "node_catalog.yaml"
-BUILTIN_ENVIRONMENT_MANIFEST_PATH = (
-    _BEHAVIOR_ROOT / "resources" / "node_environment_manifest.yaml"
-)
+BUILTIN_SKILLS_PATH = _BEHAVIOR_ROOT / "resources" / "skills"
+BUILTIN_ENVIRONMENT_MANIFEST_PATH = _BEHAVIOR_ROOT / "resources" / "node_environment_manifest.yaml"
+
+
 class NodeEnvironmentBuildError(ValueError):
     """The build-owned node environment is invalid or stale."""
 
@@ -122,15 +124,9 @@ class NodeEnvironmentManifest:
                 "content_version": self.catalog_content_version,
                 "catalog_digest": self.catalog_digest,
             },
-            "executable_registry": [
-                record.to_dict() for record in self.executable_registry
-            ],
-            "executable_packages": [
-                record.to_dict() for record in self.executable_packages
-            ],
-            "source_coverage": [
-                record.to_dict() for record in self.source_coverage
-            ],
+            "executable_registry": [record.to_dict() for record in self.executable_registry],
+            "executable_packages": [record.to_dict() for record in self.executable_packages],
+            "source_coverage": [record.to_dict() for record in self.source_coverage],
         }
 
 
@@ -167,9 +163,7 @@ def _require_text(
     if not isinstance(value, str) or not value:
         raise NodeEnvironmentBuildError(f"{label} must be a non-empty string")
     if len(value) > max_characters:
-        raise NodeEnvironmentBuildError(
-            f"{label} exceeds {max_characters} characters"
-        )
+        raise NodeEnvironmentBuildError(f"{label} exceeds {max_characters} characters")
     if any(unicodedata.category(character) == "Cc" for character in value):
         raise NodeEnvironmentBuildError(f"{label} contains control characters")
     return value
@@ -178,9 +172,7 @@ def _require_text(
 def _require_identifier(value: Any, label: str) -> str:
     text = _require_text(value, label)
     if _IDENTIFIER_RE.fullmatch(text) is None:
-        raise NodeEnvironmentBuildError(
-            f"{label} must be a stable lowercase identifier"
-        )
+        raise NodeEnvironmentBuildError(f"{label} must be a stable lowercase identifier")
     return text
 
 
@@ -200,18 +192,14 @@ def _require_bounded_list(
     if not isinstance(value, list) or not value:
         raise NodeEnvironmentBuildError(f"{label} must be a non-empty list")
     if len(value) > maximum:
-        raise NodeEnvironmentBuildError(
-            f"{label} contains more than {maximum} rows"
-        )
+        raise NodeEnvironmentBuildError(f"{label} contains more than {maximum} rows")
     return value
 
 
 def _source_id(path: Path) -> str:
     relative = path.relative_to(_PACKAGE_ROOT)
     if relative.suffix not in {".py", ".pyi"}:
-        raise NodeEnvironmentBuildError(
-            f"unsupported build-owned source suffix: {relative.suffix}"
-        )
+        raise NodeEnvironmentBuildError(f"unsupported build-owned source suffix: {relative.suffix}")
     module_parts = list(relative.with_suffix("").parts)
     if module_parts[-1] == "__init__":
         module_parts.pop()
@@ -242,35 +230,49 @@ def _current_source_coverage() -> tuple[SourceCoverageRecord, ...]:
                         )
                         for path in source_paths
                     ),
+                    *(
+                        SourceCoverageRecord(
+                            executable_package_id=BUILTIN_EXECUTABLE_PACKAGE_ID,
+                            source_id=f"skill-artifact:{path.name.removesuffix('.skill.yaml')}",
+                            content_digest=raw_sha256_digest(path.read_bytes()),
+                        )
+                        for path in sorted(BUILTIN_SKILLS_PATH.glob("*.skill.yaml"))
+                    ),
                     SourceCoverageRecord(
                         executable_package_id=BUILTIN_EXECUTABLE_PACKAGE_ID,
-                        source_id=(
-                            f"python-project:{BUILTIN_EXECUTABLE_PACKAGE_ID}"
-                        ),
+                        source_id=(f"python-project:{BUILTIN_EXECUTABLE_PACKAGE_ID}"),
                         content_digest=raw_sha256_digest(
                             PACKAGED_PROJECT_SNAPSHOT_PATH.read_bytes()
                         ),
                     ),
+                    *(
+                        SourceCoverageRecord(
+                            extension.PACKAGE_ID,
+                            source_id,
+                            raw_sha256_digest(path.read_bytes()),
+                        )
+                        for source_id, path in extension.source_files()
+                    ),
                 )
             )
         )
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         raise NodeEnvironmentBuildError(
             f"cannot read build-owned executable package source: {exc}"
         ) from exc
     if len(rows) > MAX_SOURCE_COVERAGE_ROWS:
-        raise NodeEnvironmentBuildError(
-            "build-owned package exceeds the source-coverage row limit"
-        )
-    if len({row.source_id for row in rows}) != len(rows):
-        raise NodeEnvironmentBuildError(
-            "build-owned package source IDs are not unique"
-        )
+        raise NodeEnvironmentBuildError("build-owned package exceeds the source-coverage row limit")
+    if len({(row.executable_package_id, row.source_id) for row in rows}) != len(rows):
+        raise NodeEnvironmentBuildError("build-owned package source IDs are not unique")
     return rows
 
 
-def _package_version() -> str:
-    project_path = PACKAGED_PROJECT_SNAPSHOT_PATH
+def _package_version(package_id: str = BUILTIN_EXECUTABLE_PACKAGE_ID) -> str:
+    project_path = (
+        PACKAGED_PROJECT_SNAPSHOT_PATH
+        if package_id == BUILTIN_EXECUTABLE_PACKAGE_ID
+        else extension.PROJECT_SNAPSHOT_PATH
+    )
     try:
         project_data = tomllib.loads(project_path.read_text(encoding="utf-8"))
         project = project_data["project"]
@@ -280,14 +282,10 @@ def _package_version() -> str:
         raise NodeEnvironmentBuildError(
             f"cannot read build-owned package metadata from {project_path}: {exc}"
         ) from exc
-    if declared_name != BUILTIN_EXECUTABLE_PACKAGE_ID:
-        raise NodeEnvironmentBuildError(
-            "build-owned package metadata has the wrong project name"
-        )
+    if declared_name != package_id:
+        raise NodeEnvironmentBuildError("build-owned package metadata has the wrong project name")
     if not isinstance(declared_version, str) or not declared_version:
-        raise NodeEnvironmentBuildError(
-            "build-owned package metadata has no project version"
-        )
+        raise NodeEnvironmentBuildError("build-owned package metadata has no project version")
     return declared_version
 
 
@@ -295,11 +293,12 @@ def _package_content_digest(
     *,
     package_version: str,
     source_coverage: tuple[SourceCoverageRecord, ...],
+    package_id: str = BUILTIN_EXECUTABLE_PACKAGE_ID,
 ) -> str:
     package_document: dict[str, Any] = {
         "api_version": EXECUTABLE_PACKAGE_MANIFEST_API,
         "content_digest": _ZERO_DIGEST,
-        "executable_package_id": BUILTIN_EXECUTABLE_PACKAGE_ID,
+        "executable_package_id": package_id,
         "package_version": package_version,
         "package_format": PYTHON_SOURCE_PACKAGE_FORMAT,
         "sources": [
@@ -308,6 +307,7 @@ def _package_content_digest(
                 "content_digest": row.content_digest,
             }
             for row in source_coverage
+            if row.executable_package_id == package_id
         ],
     }
     return compute_content_identity(
@@ -321,21 +321,27 @@ def _package_content_digest(
 def generate_builtin_node_environment_manifest() -> NodeEnvironmentManifest:
     """Generate the sole build-owned candidate from packaged source inputs."""
 
+    from manyforge_behavior.skill_loader import load_skill_catalog
+
     try:
         catalog = NodeCatalog(BUILTIN_CATALOG_PATH)
         registry = build_node_registry(catalog)
+        load_skill_catalog(BUILTIN_SKILLS_PATH, catalog=catalog)
     except (CatalogValidationError, NodeRegistryError) as exc:
         raise NodeEnvironmentBuildError(str(exc)) from exc
     source_coverage = _current_source_coverage()
-    package_version = _package_version()
-    package = ExecutablePackageRecord(
-        executable_package_id=BUILTIN_EXECUTABLE_PACKAGE_ID,
-        package_version=package_version,
-        package_format=PYTHON_SOURCE_PACKAGE_FORMAT,
-        content_digest=_package_content_digest(
-            package_version=package_version,
-            source_coverage=source_coverage,
-        ),
+    packages = tuple(
+        ExecutablePackageRecord(
+            executable_package_id=package_id,
+            package_version=_package_version(package_id),
+            package_format=PYTHON_SOURCE_PACKAGE_FORMAT,
+            content_digest=_package_content_digest(
+                package_id=package_id,
+                package_version=_package_version(package_id),
+                source_coverage=source_coverage,
+            ),
+        )
+        for package_id in sorted(_QUALIFIED_PACKAGES)
     )
     candidate = NodeEnvironmentManifest(
         environment_digest=_ZERO_DIGEST,
@@ -344,7 +350,7 @@ def generate_builtin_node_environment_manifest() -> NodeEnvironmentManifest:
         catalog_content_version=catalog.content_version,
         catalog_digest=catalog.catalog_digest,
         executable_registry=registry.rows,
-        executable_packages=(package,),
+        executable_packages=packages,
         source_coverage=source_coverage,
     )
     identity = compute_content_identity(
@@ -410,9 +416,7 @@ def _parse_manifest(document: dict[str, Any]) -> NodeEnvironmentManifest:
     if catalog["catalog_id"] != BUILTIN_CATALOG_ID:
         raise NodeEnvironmentBuildError("node environment catalog ID mismatch")
     if catalog["content_version"] != EXPECTED_CONTENT_VERSION:
-        raise NodeEnvironmentBuildError(
-            "node environment catalog content version mismatch"
-        )
+        raise NodeEnvironmentBuildError("node environment catalog content version mismatch")
     catalog_digest = _require_digest(
         catalog["catalog_digest"],
         "node environment catalog.catalog_digest",
@@ -430,9 +434,7 @@ def _parse_manifest(document: dict[str, Any]) -> NodeEnvironmentManifest:
     )
     for index, raw in enumerate(raw_registry):
         if not isinstance(raw, dict):
-            raise NodeEnvironmentBuildError(
-                f"executable_registry[{index}] must be a mapping"
-            )
+            raise NodeEnvironmentBuildError(f"executable_registry[{index}] must be a mapping")
         _require_exact_fields(
             raw,
             {
@@ -465,16 +467,13 @@ def _parse_manifest(document: dict[str, Any]) -> NodeEnvironmentManifest:
         )
     registry = tuple(registry_rows)
     if registry != tuple(sorted(registry)):
-        raise NodeEnvironmentBuildError(
-            "node environment executable_registry is not canonical"
-        )
+        raise NodeEnvironmentBuildError("node environment executable_registry is not canonical")
     if len({(row.node_id, row.engine_id) for row in registry}) != len(registry):
         raise NodeEnvironmentBuildError(
             "node environment executable_registry contains duplicate node/engine rows"
         )
     if any(
-        row.engine_id != "py_trees"
-        or row.executable_package_id != BUILTIN_EXECUTABLE_PACKAGE_ID
+        row.engine_id != "py_trees" or row.executable_package_id not in _QUALIFIED_PACKAGES
         for row in registry
     ):
         raise NodeEnvironmentBuildError(
@@ -490,9 +489,7 @@ def _parse_manifest(document: dict[str, Any]) -> NodeEnvironmentManifest:
     )
     for index, raw in enumerate(raw_packages):
         if not isinstance(raw, dict):
-            raise NodeEnvironmentBuildError(
-                f"executable_packages[{index}] must be a mapping"
-            )
+            raise NodeEnvironmentBuildError(f"executable_packages[{index}] must be a mapping")
         _require_exact_fields(
             raw,
             {
@@ -525,19 +522,14 @@ def _parse_manifest(document: dict[str, Any]) -> NodeEnvironmentManifest:
         )
     package_rows = tuple(packages)
     if package_rows != tuple(sorted(package_rows)):
-        raise NodeEnvironmentBuildError(
-            "node environment executable_packages is not canonical"
-        )
+        raise NodeEnvironmentBuildError("node environment executable_packages is not canonical")
     package_ids = {row.executable_package_id for row in package_rows}
     if len(package_ids) != len(package_rows):
         raise NodeEnvironmentBuildError(
             "node environment executable_packages contains duplicate IDs"
         )
-    if (
-        len(package_rows) != 1
-        or package_rows[0].executable_package_id
-        != BUILTIN_EXECUTABLE_PACKAGE_ID
-        or package_rows[0].package_format != PYTHON_SOURCE_PACKAGE_FORMAT
+    if package_ids != _QUALIFIED_PACKAGES or any(
+        row.package_format != PYTHON_SOURCE_PACKAGE_FORMAT for row in package_rows
     ):
         raise NodeEnvironmentBuildError(
             "node environment executable package is not the qualified "
@@ -552,9 +544,7 @@ def _parse_manifest(document: dict[str, Any]) -> NodeEnvironmentManifest:
     )
     for index, raw in enumerate(raw_coverage):
         if not isinstance(raw, dict):
-            raise NodeEnvironmentBuildError(
-                f"source_coverage[{index}] must be a mapping"
-            )
+            raise NodeEnvironmentBuildError(f"source_coverage[{index}] must be a mapping")
         _require_exact_fields(
             raw,
             {"executable_package_id", "source_id", "content_digest"},
@@ -578,20 +568,13 @@ def _parse_manifest(document: dict[str, Any]) -> NodeEnvironmentManifest:
         )
     coverage_rows = tuple(coverage)
     if coverage_rows != tuple(sorted(coverage_rows)):
-        raise NodeEnvironmentBuildError(
-            "node environment source_coverage is not canonical"
-        )
-    if len(
-        {
-            (row.executable_package_id, row.source_id)
-            for row in coverage_rows
-        }
-    ) != len(coverage_rows):
-        raise NodeEnvironmentBuildError(
-            "node environment source_coverage contains duplicate rows"
-        )
+        raise NodeEnvironmentBuildError("node environment source_coverage is not canonical")
+    if len({(row.executable_package_id, row.source_id) for row in coverage_rows}) != len(
+        coverage_rows
+    ):
+        raise NodeEnvironmentBuildError("node environment source_coverage contains duplicate rows")
     if any(
-        row.executable_package_id != BUILTIN_EXECUTABLE_PACKAGE_ID
+        row.executable_package_id not in _QUALIFIED_PACKAGES
         or _SOURCE_ID_RE.fullmatch(row.source_id) is None
         for row in coverage_rows
     ):
@@ -599,24 +582,22 @@ def _parse_manifest(document: dict[str, Any]) -> NodeEnvironmentManifest:
             "node environment source_coverage contains an unqualified "
             "package or path-like source identity"
         )
-    referenced_packages = {
-        row.executable_package_id for row in registry
-    } | {
+    referenced_packages = {row.executable_package_id for row in registry} | {
         row.executable_package_id for row in coverage_rows
     }
     if referenced_packages != package_ids:
-        raise NodeEnvironmentBuildError(
-            "node environment package joins are not exact and total"
+        raise NodeEnvironmentBuildError("node environment package joins are not exact and total")
+    for package in package_rows:
+        expected_package_digest = _package_content_digest(
+            package_id=package.executable_package_id,
+            package_version=package.package_version,
+            source_coverage=coverage_rows,
         )
-    expected_package_digest = _package_content_digest(
-        package_version=package_rows[0].package_version,
-        source_coverage=coverage_rows,
-    )
-    if package_rows[0].content_digest != expected_package_digest:
-        raise NodeEnvironmentBuildError(
-            "node environment executable-package content digest does not "
-            "match its canonical source coverage"
-        )
+        if package.content_digest != expected_package_digest:
+            raise NodeEnvironmentBuildError(
+                "node environment executable-package content digest does not "
+                "match its canonical source coverage"
+            )
 
     return NodeEnvironmentManifest(
         environment_digest=_require_digest(

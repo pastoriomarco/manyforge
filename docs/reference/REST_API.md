@@ -3,13 +3,13 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py structural-rest
-  Last regenerated: 2026-09-07 18:26:53 UTC
+  Last regenerated: 2026-09-08 00:13:57 UTC
   Generator source: scripts/regen-public-contracts.py:gen_rest_api
 -->
 
 # Composer REST API
 
-This is the structural, authoring, and thin runtime-client Composer surface retained during the composable-cell runtime cutover. Catalog reads, sandboxed artifact browsing, structural URDF assets, health, and the strict revision-fenced Program Draft/Saved workflow remain available. When Headless and the independent Program runner are configured, Composer also forwards scenario, Applied, Program Run, status, explicit Program Stop, and confirmed CCLC lifecycle/route requests without owning their state. Generic `/api/control/state` and `/api/control/commands` expose the same state-conditioned ingress used by the versioned `/ws/control` session; callers submit once and observe backend-owned lifecycle state. Complete product launch and remaining scene/backend capabilities remain unavailable. The catch-all `/api/{unavailable_path}` operations return the typed runtime-unavailable response for former product routes.
+This is the structural, authoring, and thin runtime-client Composer surface retained during the composable-cell runtime cutover. Catalog reads, sandboxed artifact browsing, structural URDF assets, health, and the strict revision-fenced Program Draft/Saved workflow remain available. When Headless and the independent Program runner are configured, Composer also forwards scenario, Applied, Program Run, status, explicit Program Stop, and confirmed CCLC lifecycle/route requests without owning their state. Generic `/api/control/state` and `/api/control/commands` expose the same state-conditioned ingress used by the versioned `/ws/control` session; callers submit once and observe backend-owned lifecycle state. Complete product launch and remaining provider-specific capabilities remain unavailable. Build-owned skills are discovered and expanded into ordinary Program trees through `/api/skills`; expansion does not edit Draft or execute a command. The catch-all `/api/{unavailable_path}` operations return the typed runtime-unavailable response for former product routes.
 
 The live schema is available at `/openapi.json` and `/docs` while the API process is running.
 
@@ -96,6 +96,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `GET` | `/api/program/applied` | headless-runtime-client | Program Applied |
 | `POST` | `/api/program/apply` | composer-draft | Apply Draft |
 | `POST` | `/api/program/cycle/reset` | headless-runtime-client | Program Cycle Reset |
+| `GET` | `/api/program/diagnostics/health` | headless-runtime-client | Program Diagnostic Health |
 | `POST` | `/api/program/discard` | composer-draft | Discard Draft |
 | `GET` | `/api/program/draft` | composer-draft | Read Draft |
 | `POST` | `/api/program/draft/mutations` | composer-draft | Mutate Draft |
@@ -143,6 +144,8 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `GET` | `/api/scene/urdf/models/{model_key}/collision-meshes/{link_name}/{collision_index}` | structural-urdf | Get Model Collision Mesh |
 | `GET` | `/api/scene/urdf/models/{model_key}/meshes/{link_name}/{visual_index}` | structural-urdf | Get Model Mesh |
 | `GET` | `/api/scene/viewer/status` | headless-viewer-observation-client | Viewer Status |
+| `GET` | `/api/skills` | headless-runtime-client | Skills |
+| `POST` | `/api/skills/expand` | headless-runtime-client | Expand Skill |
 | `GET` | `/api/source-model` | headless-runtime-client | Source Model |
 | `DELETE` | `/api/{unavailable_path}` |  | Unavailable Api |
 | `GET` | `/api/{unavailable_path}` |  | Unavailable Api |

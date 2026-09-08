@@ -19,7 +19,14 @@ from typing import Annotated, Any, Callable, Literal, Mapping, Optional
 import unicodedata
 import uuid
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_serializer, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 
 CONTROL_PROTOCOL_VERSION = "manyforge.execution_control.v2"
@@ -59,6 +66,7 @@ ExecutionCommandKind = Literal[
     "program_runtime_override_promote",
     "program_runtime_blackboard_write",
     "program_manual_result_stage",
+    "gripper_confirm",
     "operation_start",
     "operation_stop",
     "operation_pause",
@@ -133,9 +141,7 @@ class ControlFreshnessContextDTO(_StrictDTO):
     context_id: str
     receiver_incarnation: str
     semantic_owner_epoch: str
-    execution_control_revision: Annotated[
-        int, Field(ge=1, le=MAXIMUM_SAFE_INTEGER)
-    ]
+    execution_control_revision: Annotated[int, Field(ge=1, le=MAXIMUM_SAFE_INTEGER)]
     issued_server_sequence: str
     valid_for_ns: Literal[CONTROL_FRESHNESS_VALID_FOR_NS]
 
@@ -163,13 +169,9 @@ class ExecutionCommandEnvelopeDTO(_StrictDTO):
     client_sequence: str | None = None
     freshness: ControlFreshnessContextDTO
     expected_semantic_owner_epoch: str
-    expected_execution_control_revision: Annotated[
-        int, Field(ge=1, le=MAXIMUM_SAFE_INTEGER)
-    ]
+    expected_execution_control_revision: Annotated[int, Field(ge=1, le=MAXIMUM_SAFE_INTEGER)]
 
-    @field_validator(
-        "correlation_id", "control_session_id", "expected_semantic_owner_epoch"
-    )
+    @field_validator("correlation_id", "control_session_id", "expected_semantic_owner_epoch")
     @classmethod
     def validate_identity(cls, value: str | None, info) -> str | None:
         if value is None:
@@ -202,10 +204,7 @@ class ExecutionCommandEnvelopeDTO(_StrictDTO):
             raise ValueError("control_session_id and client_sequence must be paired")
         if self.freshness.semantic_owner_epoch != self.expected_semantic_owner_epoch:
             raise ValueError("freshness owner does not match expected owner")
-        if (
-            self.freshness.execution_control_revision
-            != self.expected_execution_control_revision
-        ):
+        if self.freshness.execution_control_revision != self.expected_execution_control_revision:
             raise ValueError("freshness revision does not match expected revision")
         return self
 
@@ -241,9 +240,7 @@ class ExecutionCommandReceiptDTO(_StrictDTO):
     disposition: ExecutionCommandDisposition
     code: str
     semantic_owner_epoch: str
-    execution_control_revision: Annotated[
-        int, Field(ge=1, le=MAXIMUM_SAFE_INTEGER)
-    ]
+    execution_control_revision: Annotated[int, Field(ge=1, le=MAXIMUM_SAFE_INTEGER)]
     current_identity: dict[str, Any] | None = None
 
     @field_validator(
@@ -263,9 +260,7 @@ class ExecutionCommandReceiptDTO(_StrictDTO):
             maximum_bytes=MAXIMUM_IDENTITY_BYTES,
         )
 
-    @field_validator(
-        "client_sequence", "received_server_sequence", "received_monotonic_ns"
-    )
+    @field_validator("client_sequence", "received_server_sequence", "received_monotonic_ns")
     @classmethod
     def validate_sequence(cls, value: str | None, info) -> str | None:
         if value is None:
@@ -445,9 +440,7 @@ class ControlHeartbeatChallengeDTO(_StrictDTO):
             if self.semantic_reason is not None or self.freshness is None:
                 raise ValueError("current heartbeat requires only freshness")
         elif self.semantic_reason is None or self.freshness is not None:
-            raise ValueError(
-                "non-current heartbeat requires a reason and no freshness"
-            )
+            raise ValueError("non-current heartbeat requires a reason and no freshness")
         if self.semantic_reason is not None:
             _bounded_nfc(
                 self.semantic_reason,
@@ -525,8 +518,9 @@ class ExecutionCommandReceiptMessageDTO(_StrictDTO):
     @model_validator(mode="after")
     def cumulative_receive_watermark(self) -> "ExecutionCommandReceiptMessageDTO":
         _u64_text(self.received_client_sequence, label="received_client_sequence")
-        if (self.control_session_id != self.receipt.control_session_id or
-                int(self.received_client_sequence) < int(self.receipt.client_sequence)):
+        if self.control_session_id != self.receipt.control_session_id or int(
+            self.received_client_sequence
+        ) < int(self.receipt.client_sequence):
             raise ValueError("receipt must name its session and a covered command")
         return self
 
@@ -567,9 +561,7 @@ class ExecutionControlProjectionDTO(_StrictDTO):
     schema_version: Literal["manyforge.execution_control_projection.v1"]
     receiver_incarnation: str
     semantic_owner_epoch: str
-    execution_control_revision: Annotated[
-        int, Field(ge=1, le=MAXIMUM_SAFE_INTEGER)
-    ]
+    execution_control_revision: Annotated[int, Field(ge=1, le=MAXIMUM_SAFE_INTEGER)]
     cycle_state: ProgramCycleState
     cycle_generation: Annotated[int, Field(ge=1, le=MAXIMUM_SAFE_INTEGER)]
     program_run_id: str | None
@@ -631,6 +623,9 @@ class ExecutionIngressStamp:
     received_monotonic_ns: int
     trusted_principal_id: str | None = None
     assurance: str | None = None
+    # Authenticated issue-time expiry in this receiver's monotonic domain.
+    # It is never renewed by queue admission or forwarded public timestamps.
+    valid_until_monotonic_ns: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -749,9 +744,11 @@ class ControlFreshnessAuthority:
             valid_for_ns=valid_for_ns,
         )
         signature = hmac.new(self._secret, claims, hashlib.sha256).digest()
-        context_id = base64.urlsafe_b64encode(
-            issued_at_ns.to_bytes(8, "big") + signature
-        ).decode("ascii").rstrip("=")
+        context_id = (
+            base64.urlsafe_b64encode(issued_at_ns.to_bytes(8, "big") + signature)
+            .decode("ascii")
+            .rstrip("=")
+        )
         return ControlFreshnessContextDTO(
             context_id=context_id,
             receiver_incarnation=self._receiver_incarnation,
@@ -767,7 +764,7 @@ class ControlFreshnessAuthority:
         *,
         current_owner_epoch: str,
         current_control_revision: int,
-    ) -> None:
+    ) -> int:
         now_ns = self._clock_ns()
         try:
             sequence = int(context.issued_server_sequence)
@@ -815,6 +812,7 @@ class ControlFreshnessAuthority:
                 "control_freshness_expired",
                 "freshness context expired before command admission",
             )
+        return issued_at_ns + context.valid_for_ns
 
     def rotate_quiescent(self, *, active_sessions: int, inflight_commands: int) -> None:
         if active_sessions or inflight_commands:

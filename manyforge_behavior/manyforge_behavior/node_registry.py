@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 
 from manyforge_behavior.catalog import NodeCatalog
+from manyforge_behavior import qualified_node_extensions as extension
 
 BUILTIN_EXECUTABLE_PACKAGE_ID = "manyforge_behavior"
 _BUILD_TOKEN = object()
@@ -48,22 +49,16 @@ class NodeRegistry:
         _token: object,
     ):
         if _token is not _BUILD_TOKEN:
-            raise NodeRegistryError(
-                "NodeRegistry is build-owned; use build_node_registry()"
-            )
+            raise NodeRegistryError("NodeRegistry is build-owned; use build_node_registry()")
         if not rows:
             raise NodeRegistryError("executable registry must not be empty")
         if rows != tuple(sorted(rows)):
             raise NodeRegistryError("executable registry rows must be canonical")
         identities = {(row.node_id, row.engine_id) for row in rows}
         if len(identities) != len(rows):
-            raise NodeRegistryError(
-                "executable registry contains duplicate node/engine rows"
-            )
+            raise NodeRegistryError("executable registry contains duplicate node/engine rows")
         self._rows = rows
-        self._by_node_engine = MappingProxyType(
-            {(row.node_id, row.engine_id): row for row in rows}
-        )
+        self._by_node_engine = MappingProxyType({(row.node_id, row.engine_id): row for row in rows})
 
     def record(
         self,
@@ -95,13 +90,21 @@ class NodeRegistry:
 def build_node_registry(catalog: NodeCatalog) -> NodeRegistry:
     """Derive the total canonical built-in registry from catalog runner rows."""
 
+    try:
+        extension.verify_composition(catalog)
+    except (OSError, ValueError) as exc:
+        raise NodeRegistryError(str(exc)) from exc
     rows = tuple(
         sorted(
             ExecutableRegistryRow(
                 node_id=entry.id,
                 engine_id=engine_id,
                 implementation_id=implementation_id,
-                executable_package_id=BUILTIN_EXECUTABLE_PACKAGE_ID,
+                executable_package_id=(
+                    extension.PACKAGE_ID
+                    if entry.id == extension.NODE_ID
+                    else BUILTIN_EXECUTABLE_PACKAGE_ID
+                ),
             )
             for entry in catalog.entries
             for engine_id, implementation_id in entry.runner_implementation_ids.items()

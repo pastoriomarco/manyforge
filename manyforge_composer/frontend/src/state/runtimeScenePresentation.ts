@@ -225,7 +225,7 @@ export function executionObservationRobotPresentation(
         coordinate.source_joint_name === sourceName && coordinate.viewer_joint_name === compiledName
       ));
       if (coordinates.length !== 1 || coordinates[0].coordinate_kind !== observed.coordinateKinds[index]
-        || coordinates[0].unit !== (observed.coordinateKinds[index] === 'angular' ? 'rad' : 'm')
+        || coordinates[0].unit !== (observed.coordinateKinds[index] === 'angular' ? 'radians' : 'meters')
         || !Number.isFinite(value) || compiledPositions.has(compiledName)) return null;
       compiledPositions.set(compiledName, value);
     }
@@ -265,6 +265,16 @@ export function createExecutionRobotPresentationReader(
         descriptor,
         frame === null ? null : (BigInt(frame.receivedAtMonotonicUs) * 1_000n).toString(),
       );
+      if (frame !== null && cachedPresentation === null
+        && sourceModel !== null && manifest !== null && descriptor !== null
+        && sourceModel.cell_id === manifest.cell_id
+        && sourceModel.retained_bundle_id === manifest.retained_bundle_id
+        && sourceModel.graph_revision === manifest.graph_revision) {
+        // A frame for the prior model cannot be applied or honestly ACKed.
+        // Reuse current-only reconnect; otherwise its credit blocks the new
+        // model forever. Incomplete metadata is only a bootstrap wait.
+        reader.rejectExecutionObservation(frame);
+      }
       return cachedPresentation;
     },
     subscribeMeasuredRobotPresentation: reader.subscribeExecutionObservation,

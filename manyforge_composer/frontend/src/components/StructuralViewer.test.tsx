@@ -291,10 +291,10 @@ describe('viewer failure isolation', () => {
     expect(driver).toContain('}, 1_000 / 60);');
     expect(driver).toContain('}, 0);');
     expect(driver).toContain('appliedAfterRenderTimer.current = window.setTimeout');
-    expect(driver).toContain('markMeasuredRobotPresentationApplied(rendered)');
-    expect(driver).toContain('pendingAppliedPresentation.current = current;');
+    expect(driver).toContain('rendered.reader.markMeasuredRobotPresentationApplied(rendered.presentation)');
+    expect(driver).toContain('pendingAppliedPresentation.current = { presentation: current, reader: livePresentation! };');
     expect(driver).toMatch(
-      /pendingAppliedPresentation\.current = current;[\s\S]*?if \(wakeAfterApply\) wake\(\);/,
+      /pendingAppliedPresentation\.current = \{ presentation: current, reader: livePresentation! \};[\s\S]*?if \(wakeAfterApply\) wake\(\);/,
     );
     expect(driver).not.toMatch(/const acceptPresentation[\s\S]*?wake\(\);[\s\S]*?return true;/);
     expect(driver).not.toContain('if (changed) wake();');

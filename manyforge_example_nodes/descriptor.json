@@ -1,0 +1,93 @@
+{
+  "api_version": "manyforge.node_extension.v1",
+  "extension_id": "manyforge_example_nodes",
+  "version": "0.1.0",
+  "catalog_api_version": "manyforge.node_catalog.v2",
+  "catalog_content_version": "2.1.0",
+  "dependencies": [
+    "manyforge_behavior"
+  ],
+  "execution_contract": "read_only_single_invocation",
+  "entries": [
+    {
+      "id": "example.check_frame_height",
+      "name": "Check frame height",
+      "category": "model",
+      "description": "Build-owned extension example: compare a freshly observed frame height in the cell frame.",
+      "stability": "experimental",
+      "tags": [
+        "example",
+        "model"
+      ],
+      "profiles": {
+        "min_program_profile": "composable-cell-v1"
+      },
+      "kind": "leaf",
+      "children": {
+        "min": 0,
+        "max": 0
+      },
+      "parameters": [
+        {
+          "id": "target_role",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "semantic_type": "target_role"
+          }
+        },
+        {
+          "id": "frame_role",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "semantic_type": "frame_role"
+          }
+        },
+        {
+          "id": "minimum_height_m",
+          "required": true,
+          "schema": {
+            "type": "float"
+          }
+        },
+        {
+          "id": "maximum_height_m",
+          "required": true,
+          "schema": {
+            "type": "float"
+          }
+        }
+      ],
+      "required_capabilities": [
+        {
+          "capability_id": "model.kinematics.fk",
+          "scope": "target_binding",
+          "target_parameter": "target_role"
+        },
+        {
+          "capability_id": "state.observed.current",
+          "scope": "target_binding",
+          "target_parameter": "target_role"
+        }
+      ],
+      "execution": {
+        "blocking": true,
+        "cancellable": false,
+        "owner_api": "model.kinematics"
+      },
+      "outcomes": {
+        "success": "height_in_range",
+        "failure": "height_outside_range_or_unavailable"
+      },
+      "runners": {
+        "py_trees": {
+          "implementation_id": "example_check_frame_height_v1"
+        }
+      },
+      "observability": {
+        "event_family": "manyforge.program.node"
+      }
+    }
+  ]
+}

@@ -273,6 +273,8 @@ if(BUILD_TESTING)
     TIMEOUT ${MANYFORGE_HEADLESS_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_event_historian test/test_event_historian.cpp)
+  add_executable(historian_performance_probe test/historian_performance_probe.cpp)
+  target_link_libraries(historian_performance_probe PRIVATE manyforge_event_historian)
   target_link_libraries(test_event_historian PRIVATE
     manyforge_event_historian GTest::gtest_main)
   gtest_discover_tests(test_event_historian
@@ -520,6 +522,31 @@ if(BUILD_TESTING)
     add_custom_target(manyforge_headless_test_assistant_native_package
       DEPENDS "${MANYFORGE_HEADLESS_TEST_ASSISTANT_NATIVE_METADATA}")
 
+    set(MANYFORGE_HEADLESS_TEST_GRIPPER_CONFIRMATION_FIXTURE_ROOT
+      "${CMAKE_CURRENT_BINARY_DIR}/gripper-confirmation-test-fixture")
+    add_custom_command(
+      OUTPUT "${MANYFORGE_HEADLESS_TEST_GRIPPER_CONFIRMATION_FIXTURE_ROOT}/metadata.json"
+      COMMAND "${CMAKE_COMMAND}" -E remove_directory
+        "${MANYFORGE_HEADLESS_TEST_GRIPPER_CONFIRMATION_FIXTURE_ROOT}"
+      COMMAND "${CMAKE_COMMAND}" -E make_directory
+        "${MANYFORGE_HEADLESS_TEST_GRIPPER_CONFIRMATION_FIXTURE_ROOT}"
+      COMMAND "$<TARGET_FILE:manyforge_generate_headless_manager_apply_test_package>"
+        --package-root
+        "${MANYFORGE_HEADLESS_TEST_GRIPPER_CONFIRMATION_FIXTURE_ROOT}/retained-package"
+        --metadata
+        "${MANYFORGE_HEADLESS_TEST_GRIPPER_CONFIRMATION_FIXTURE_ROOT}/metadata.json"
+        --profile operator-confirmation
+      DEPENDS
+        manyforge_generate_headless_manager_apply_test_package
+        "${MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST}"
+        "${MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_WORKER}"
+        "${MANYFORGE_HEADLESS_TEST_LITE6_FIXTURE_ROOT}/model.urdf"
+        "${MANYFORGE_HEADLESS_TEST_LITE6_FIXTURE_ROOT}/model.srdf"
+        ${MANYFORGE_HEADLESS_TEST_LITE6_RESOURCE_INPUTS}
+      VERBATIM)
+    add_custom_target(manyforge_headless_test_gripper_confirmation_package
+      DEPENDS "${MANYFORGE_HEADLESS_TEST_GRIPPER_CONFIRMATION_FIXTURE_ROOT}/metadata.json")
+
     # O1.4g uses a compatible pick/place host to materialize a second package.
     # Its semantic component declaration is admitted independently from the
     # primary host; no executable-proof bundle is involved.
@@ -672,7 +699,8 @@ if(BUILD_TESTING)
   if(MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST)
     add_dependencies(test_manager_daemon_process
       manyforge_headless_test_manager_apply_package
-      manyforge_headless_test_assistant_native_package)
+      manyforge_headless_test_assistant_native_package
+      manyforge_headless_test_gripper_confirmation_package)
     target_compile_definitions(test_manager_daemon_process PRIVATE
       MANYFORGE_HEADLESS_TEST_PYTHON="${Python3_EXECUTABLE}"
       MANYFORGE_HEADLESS_TEST_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/.."

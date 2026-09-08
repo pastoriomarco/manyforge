@@ -1,37 +1,41 @@
-#include <manyforge_collision/manyforge_collision_engine.hpp>
+#include <coal/BVH/BVH_model.h>
+#include <coal/mesh_loader/loader.h>
+#include <coal/shape/convex.h>
+#include <coal/shape/geometric_shapes.h>
+// The pinned urdfdom parser requires these official pointer declarations
+// before its header when co-installed with the distribution's model headers.
+// clang-format off
+#include <urdf_world/types.h>
+#include <urdf_parser/urdf_parser.h>
+// clang-format on
 
 #include <Eigen/Dense>
 #include <algorithm>
 #include <atomic>
-#include <charconv>
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
+#include <manyforge_collision/manyforge_collision_engine.hpp>
 #include <map>
 #include <optional>
-#include <regex>
-#include <set>
-#include <stdexcept>
-#include <sstream>
-#include <tuple>
-#include <utility>
-
-#include <pinocchio/algorithm/geometry.hpp>
 #include <pinocchio/algorithm/frames.hpp>
+#include <pinocchio/algorithm/geometry.hpp>
 #include <pinocchio/algorithm/joint-configuration.hpp>
 #include <pinocchio/algorithm/kinematics.hpp>
 #include <pinocchio/collision/collision.hpp>
 #include <pinocchio/collision/distance.hpp>
 #include <pinocchio/parsers/srdf.hpp>
 #include <pinocchio/parsers/urdf.hpp>
-
-#include <coal/BVH/BVH_model.h>
-#include <coal/mesh_loader/loader.h>
-#include <coal/shape/convex.h>
-#include <coal/shape/geometric_shapes.h>
+#include <regex>
+#include <set>
+#include <sstream>
+#include <stdexcept>
+#include <tuple>
+#include <utility>
 
 #ifndef MANYFORGE_COLLISION_ENGINE_VERSION
 #define MANYFORGE_COLLISION_ENGINE_VERSION "0.1.0+unknown"
@@ -343,13 +347,21 @@ bool link_is_static_wrt_group(const pinocchio::Model& model,
   auto joint_id = model.frames[model.getFrameId(link_name)].parentJoint;
   while (joint_id > 0 &&
          static_cast<std::size_t>(joint_id) < model.parents.size()) {
-    if (static_cast<std::size_t>(joint_id) < model.names.size() &&
-        static_cast<std::size_t>(joint_id) < model.nqs.size() &&
-        model.nqs[joint_id] > 0 &&
-        std::find(group_joint_names.begin(),
-                  group_joint_names.end(),
-                  model.names[joint_id]) != group_joint_names.end()) {
-      return false;
+    // Mimics have zero independent q coordinates but still move. Follow the
+    // existing model dependency as well as physical ancestry, including a
+    // group that names only the independent source on another branch.
+    auto dependency = joint_id;
+    for (std::size_t hop = 0; dependency > 0; ++hop) {
+      if (hop >= model.names.size() || dependency >= model.names.size())
+        return false;  // An invalid dependency must not prune collision work.
+      if (std::find(group_joint_names.begin(), group_joint_names.end(), model.names[dependency]) !=
+          group_joint_names.end())
+        return false;
+      const auto mimic =
+          std::find(model.mimicking_joints.begin(), model.mimicking_joints.end(), dependency);
+      if (mimic == model.mimicking_joints.end()) break;
+      dependency = model.mimicked_joints.at(
+          static_cast<std::size_t>(mimic - model.mimicking_joints.begin()));
     }
     joint_id = model.parents[joint_id];
   }
@@ -741,7 +753,22 @@ ManyForgeCollisionEngine::load_shared_model(
   shared->model_name = model_name;
   shared->package_paths = package_paths;
   shared->group_name = std::move(group_name);
-  pinocchio::urdf::buildModel(urdf_path.string(), shared->model,
+  const auto urdf_bytes = read_text_file(urdf_path);
+  const auto urdf_tree = ::urdf::parseURDF(urdf_bytes);
+  if (!urdf_tree) {
+    throw std::invalid_argument("collision model URDF is invalid");
+  }
+  std::size_t geometry_count = 0;
+  for (const auto& [name, link] : urdf_tree->links_) {
+    const auto count = link->collision_array.size();
+    if (count > kMaximumRetainedCollisionGeometries - geometry_count) {
+      throw std::invalid_argument(
+          "retained collision geometry count exceeds "
+          "qualified cold-model bound");
+    }
+    geometry_count += count;
+  }
+  pinocchio::urdf::buildModel(urdf_tree, shared->model,
                               /*verbose=*/false,
                               /*mimic=*/true);
   std::vector<std::string> package_path_strings;
@@ -749,10 +776,12 @@ ManyForgeCollisionEngine::load_shared_model(
   for (const auto& path : package_paths) {
     package_path_strings.push_back(path.string());
   }
-  pinocchio::urdf::buildGeom(shared->model, urdf_path.string(),
-                             pinocchio::COLLISION,
-                             shared->base_collision_model,
-                             package_path_strings);
+  std::istringstream geometry_source(urdf_bytes);
+  pinocchio::urdf::buildGeom(shared->model, geometry_source, pinocchio::COLLISION,
+                             shared->base_collision_model, package_path_strings);
+  // buildGeom loads shapes, not their pair inventory. SRDF removal must start
+  // from the full inventory or every component self-collision is omitted.
+  shared->base_collision_model.addAllCollisionPairs();
   if (!srdf_path.empty() && std::filesystem::exists(srdf_path)) {
     pinocchio::srdf::removeCollisionPairs(shared->model,
                                           shared->base_collision_model,
@@ -1261,11 +1290,10 @@ ManyForgeCollisionEngine::ManyForgeCollisionEngine(
   capability_.runtime_query_snapshot_change_allocation_upper_bound = 65'536;
   capability_.runtime_query_qualified_wcet_ns = 10'000'000;
   capability_.runtime_query_snapshot_change_qualified_wcet_ns = 50'000'000;
-  capability_.known_unsupported_cases = {
-      "convex_mesh_without_qualified_decomposition",
-      "scene_object_compound_geometry",
-      "contact_points",
-      "continuous_collision"};
+  capability_.known_unsupported_cases = {"retained_model_collision_geometries_above_1024",
+                                         "convex_mesh_without_qualified_decomposition",
+                                         "scene_object_compound_geometry", "contact_points",
+                                         "continuous_collision"};
 }
 
 const void* ManyForgeCollisionEngine::internal_model_identity() const {
@@ -2388,6 +2416,9 @@ std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
   auto prepared = std::make_shared<PreparedScene>();
   prepared->revision = snapshot.revision;
   prepared->collision_model = shared_model_->base_collision_model;
+  // Rebuild the active subset below using the retained SRDF inventory plus
+  // logical-body and motion-relevance filters (including selected subgroups).
+  prepared->collision_model.removeAllCollisionPairs();
 
   std::map<core::CollisionBodyId, const core::CollisionWorldBody*> body_by_id;
   std::map<std::string, core::CollisionBodyId> component_id_by_frame;

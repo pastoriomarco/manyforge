@@ -7,17 +7,15 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
-from queue import Empty, Queue
 import shutil
 import socket
 import subprocess
 import sys
-from threading import Event, Thread
 import time
 from typing import Callable, Iterator
 
 import pytest
-from websockets.sync.client import connect as connect_websocket
+from scripts.qualification.control_client_fixture import composer_snapshot_stream
 
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
 from manyforge_headless_api.program_runner_client import ProgramRunnerHttpClient
@@ -80,20 +78,13 @@ class ProcessStack:
         self.composer_authoring_root = root / "composer-authoring"
         self.composer_authoring_root.mkdir()
         self.authoring_transaction_journal = (
-            self.composer_authoring_root
-            / "composer-authoring-transactions.sqlite3"
+            self.composer_authoring_root / "composer-authoring-transactions.sqlite3"
         )
-        self.program_runner_liveness_socket = (
-            self.manager_run_root / "program-runner-liveness.sock"
-        )
+        self.program_runner_liveness_socket = self.manager_run_root / "program-runner-liveness.sock"
         self.history_database = root / "history.sqlite3"
         self.manager_executable = _required_path("MANYFORGE_MANAGER_DAEMON")
-        self.package_root = package_root or _required_path(
-            "MANYFORGE_CANONICAL_EMPTY_PACKAGE_ROOT"
-        )
-        self.manager_package_root = _required_path(
-            "MANYFORGE_CANONICAL_EMPTY_PACKAGE_ROOT"
-        )
+        self.package_root = package_root or _required_path("MANYFORGE_CANONICAL_EMPTY_PACKAGE_ROOT")
+        self.manager_package_root = _required_path("MANYFORGE_CANONICAL_EMPTY_PACKAGE_ROOT")
         self.manager_admission_filename: str | None = None
         self.fixture_metadata: dict | None = None
         if not self.package_root.exists():
@@ -106,9 +97,7 @@ class ProcessStack:
         self.program_runner_port = _free_loopback_port()
         self.composer_port = _free_loopback_port()
         self.base_url = f"http://127.0.0.1:{self.port}"
-        self.program_runner_url = (
-            f"http://127.0.0.1:{self.program_runner_port}"
-        )
+        self.program_runner_url = f"http://127.0.0.1:{self.program_runner_port}"
         self.composer_url = f"http://127.0.0.1:{self.composer_port}"
         self.manager: subprocess.Popen[bytes] | None = None
         self.api: subprocess.Popen[bytes] | None = None
@@ -133,17 +122,13 @@ class ProcessStack:
         # The environment path names its source metadata, not a second root.
         _required_path(package_environment)
         self.manager_package_root = self.package_root
-        assert (
-            self.manager_package_root / self.manager_admission_filename
-        ).is_file()
+        assert (self.manager_package_root / self.manager_admission_filename).is_file()
 
         installed_root = self.root / "installed-targets"
         installed_root.mkdir()
         installed_sources = {
             "manyforge_manager_daemon": self.manager_executable,
-            "manyforge_native_execution_host": _required_path(
-                "MANYFORGE_NATIVE_EXECUTION_HOST"
-            ),
+            "manyforge_native_execution_host": _required_path("MANYFORGE_NATIVE_EXECUTION_HOST"),
             "manyforge_roboplan_candidate_worker": _required_path(
                 "MANYFORGE_ROBOPLAN_CANDIDATE_WORKER"
             ),
@@ -153,9 +138,7 @@ class ProcessStack:
             shutil.copy2(source, installed_root / installed_name)
         self.manager_executable = installed_root / "manyforge_manager_daemon"
 
-    def start_manager(
-        self, *, publication_root: Path | None = None
-    ) -> None:
+    def start_manager(self, *, publication_root: Path | None = None) -> None:
         assert self.manager is None
         manager_publication_root = publication_root or self.publication_root
         manager_publication_root.mkdir(exist_ok=True)
@@ -293,13 +276,9 @@ class ProcessStack:
         deadline = time.monotonic() + timeout_seconds
         last_error: Exception | None = None
         while time.monotonic() < deadline:
-            if (
-                self.program_runner is not None
-                and self.program_runner.poll() is not None
-            ):
+            if self.program_runner is not None and self.program_runner.poll() is not None:
                 raise RuntimeError(
-                    "Program runner exited with "
-                    f"{self.program_runner.returncode}"
+                    "Program runner exited with " f"{self.program_runner.returncode}"
                 )
             try:
                 with ProgramRunnerHttpClient(
@@ -333,17 +312,14 @@ class ProcessStack:
                     runtime = client.runtime()
                 unavailable = runtime.get("unavailable_sections")
                 section_observed = unavailable_section is None or (
-                    isinstance(unavailable, list)
-                    and unavailable_section in unavailable
+                    isinstance(unavailable, list) and unavailable_section in unavailable
                 )
                 if runtime.get("complete") is expected and section_observed:
                     return runtime
             except HeadlessClientError as exc:
                 last_error = exc
             time.sleep(0.01)
-        raise RuntimeError(
-            f"runtime did not reach complete={expected}: {last_error}"
-        )
+        raise RuntimeError(f"runtime did not reach complete={expected}: {last_error}")
 
     def wait_manager_source(self, timeout_seconds: float = 8.0) -> dict:
         deadline = time.monotonic() + timeout_seconds
@@ -385,17 +361,13 @@ class ProcessStack:
                     or admission.get("authoring_allowed") is expected_allowed
                 ):
                     return admission
-                last_error = RuntimeError(
-                    f"last authoring admission was {admission!r}"
-                )
+                last_error = RuntimeError(f"last authoring admission was {admission!r}")
             except HeadlessClientError as error:
                 last_error = error
             time.sleep(0.01)
-        raise RuntimeError(
-            f"authoring admission did not become available: {last_error}"
-        )
+        raise RuntimeError(f"authoring admission did not become available: {last_error}")
 
-    def start_composer(self) -> None:
+    def start_composer(self, *, startup_scenario: str | None = None) -> None:
         assert self.composer is None
         command = [
             sys.executable,
@@ -414,6 +386,8 @@ class ProcessStack:
         ]
         if self.program_path is not None:
             command.extend(("--program-path", str(self.program_path)))
+        if startup_scenario is not None:
+            command.extend(("--startup-scenario", startup_scenario))
         self.composer = subprocess.Popen(
             command,
             stdout=self.log,
@@ -426,9 +400,7 @@ class ProcessStack:
         last_error: Exception | None = None
         while time.monotonic() < deadline:
             if self.composer is not None and self.composer.poll() is not None:
-                raise RuntimeError(
-                    f"Composer exited with {self.composer.returncode}"
-                )
+                raise RuntimeError(f"Composer exited with {self.composer.returncode}")
             try:
                 with HeadlessHttpClient(
                     self.composer_url,
@@ -468,16 +440,11 @@ class ProcessStack:
         if self.manager is None or self.manager.poll() is not None:
             self.manager = None
             return
-        request = (
-            b'{"api_version":"manyforge.manager_command.v1",'
-            b'"command":"shutdown_runtime"}'
-        )
+        request = b'{"api_version":"manyforge.manager_command.v1",' b'"command":"shutdown_runtime"}'
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as client:
                 client.settimeout(1.0)
-                client.connect(
-                    str(self.manager_run_root / "manager-command.sock")
-                )
+                client.connect(str(self.manager_run_root / "manager-command.sock"))
                 client.sendall(request)
                 response = client.recv(16 * 1024)
                 if b'"ok":true' not in response:
@@ -556,14 +523,15 @@ def _program_surface_stack(root: Path) -> Iterator[ProcessStack]:
 
 @contextmanager
 def _assistant_stack(
-    root: Path, *, package_root: Path | None = None
+    root: Path,
+    *,
+    package_root: Path | None = None,
+    metadata_environment: str = "MANYFORGE_ASSISTANT_NATIVE_METADATA",
+    package_environment: str = "MANYFORGE_ASSISTANT_NATIVE_PACKAGE_ROOT",
+    startup_scenario: str | None = None,
 ) -> Iterator[ProcessStack]:
-    selected_package_root = package_root or _required_path(
-        "MANYFORGE_ASSISTANT_NATIVE_PACKAGE_ROOT"
-    )
-    retained_programs = sorted(
-        (selected_package_root / "programs" / "sha256").glob("*.json")
-    )
+    selected_package_root = package_root or _required_path(package_environment)
+    retained_programs = sorted((selected_package_root / "programs" / "sha256").glob("*.json"))
     assert len(retained_programs) == 1
     stack = ProcessStack(
         root,
@@ -575,8 +543,8 @@ def _assistant_stack(
     )
     try:
         stack.prepare_native_manager_fixture(
-            metadata_environment="MANYFORGE_ASSISTANT_NATIVE_METADATA",
-            package_environment="MANYFORGE_ASSISTANT_NATIVE_PACKAGE_ROOT",
+            metadata_environment=metadata_environment,
+            package_environment=package_environment,
         )
         assert stack.manager_package_root == stack.package_root
         stack.start_manager()
@@ -592,41 +560,25 @@ def _assistant_stack(
         )
         with HeadlessHttpClient(stack.base_url, timeout_seconds=20.0) as client:
             apply_body = {
-                    "request_id": "assistant-native.process.apply",
-                    "request_owner_epoch": initial["source"][
-                        "source_owner_epoch"
-                    ],
-                    "source_label": "assistant_native_process_test",
-                    "correlation_id": "assistant-native.process.apply",
-                    "deployment_artifact_id": metadata[
-                        "physical_deployment_artifact_id"
-                    ],
-                    "deployment_revision": metadata[
-                        "physical_deployment_revision"
-                    ],
-                    "expected_current": {
-                        "graph_revision": metadata[
-                            "predecessor_graph_revision"
-                        ],
-                        "retained_bundle_id": metadata[
-                            "predecessor_retained_bundle_id"
-                        ],
-                    },
-                    "reject_if_affected_busy": True,
-                    "expected_admission_generation": initial_admission[
-                        "admission_generation"
-                    ],
-                }
+                "request_id": "assistant-native.process.apply",
+                "request_owner_epoch": initial["source"]["source_owner_epoch"],
+                "source_label": "assistant_native_process_test",
+                "correlation_id": "assistant-native.process.apply",
+                "deployment_artifact_id": metadata["physical_deployment_artifact_id"],
+                "deployment_revision": metadata["physical_deployment_revision"],
+                "expected_current": {
+                    "graph_revision": metadata["predecessor_graph_revision"],
+                    "retained_bundle_id": metadata["predecessor_retained_bundle_id"],
+                },
+                "reject_if_affected_busy": True,
+                "expected_admission_generation": initial_admission["admission_generation"],
+            }
             preview = client.manager_deployment_candidate_preview(
                 {
-                    "deployment_artifact_id": apply_body[
-                        "deployment_artifact_id"
-                    ],
+                    "deployment_artifact_id": apply_body["deployment_artifact_id"],
                     "deployment_revision": apply_body["deployment_revision"],
                     "expected_current": apply_body["expected_current"],
-                    "expected_admission_generation": apply_body[
-                        "expected_admission_generation"
-                    ],
+                    "expected_admission_generation": apply_body["expected_admission_generation"],
                     "request_owner_epoch": apply_body["request_owner_epoch"],
                 }
             )
@@ -637,9 +589,7 @@ def _assistant_stack(
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
             active = stack.wait_manager_source()["status"]["active"]
-            if active["retained_bundle_id"] == metadata[
-                "physical_candidate_retained_bundle_id"
-            ]:
+            if active["retained_bundle_id"] == metadata["physical_candidate_retained_bundle_id"]:
                 break
             time.sleep(0.02)
         else:
@@ -655,9 +605,7 @@ def _assistant_stack(
                         "request_owner_epoch": "assistant-native.stale.epoch",
                         "source_label": "assistant_native_process_test",
                         "correlation_id": "assistant-native.stale-generation",
-                        "expected_admission_generation": initial_admission[
-                            "admission_generation"
-                        ],
+                        "expected_admission_generation": initial_admission["admission_generation"],
                         "request_payload_digest": "sha256:" + "0" * 64,
                         "owner_transaction_id": "assistant-native.stale",
                     }
@@ -665,146 +613,16 @@ def _assistant_stack(
             assert stale.value.code == "stale_generation"
         assert (stack.execution_run_root / "execution-command.sock").is_socket()
         assert (stack.execution_run_root / "execution-observation.sock").is_socket()
-        assert stack.authoring_transaction_journal.parent == (
-            stack.composer_authoring_root
-        )
-        stack.start_composer()
+        assert stack.authoring_transaction_journal.parent == (stack.composer_authoring_root)
+        stack.start_composer(startup_scenario=startup_scenario)
         stack.wait_composer()
         yield stack
     finally:
         stack.close()
 
 
-@contextmanager
-def _composer_snapshot_stream(
-    stack: ProcessStack, *, client_id: str
-) -> Iterator[Callable[[], dict]]:
-    websocket_url = (
-        stack.composer_url.replace("http://", "ws://", 1)
-        + "/ws/control"
-    )
-    with connect_websocket(
-        websocket_url,
-        open_timeout=2,
-        close_timeout=1,
-        max_size=16 * 1024 * 1024,
-    ) as websocket:
-        websocket.send(
-            json.dumps(
-                {
-                    "schema_version": "manyforge.execution_control.v2",
-                    "message_kind": "client_hello",
-                    "supported_versions": ["manyforge.execution_control.v2"],
-                    "client_incarnation": f"process-test.{client_id}",
-                    "source_label": "process_test",
-                }
-            )
-        )
-        server_hello = json.loads(websocket.recv(timeout=2.0))
-        assert server_hello["message_kind"] == "server_hello"
-        control_session_id = server_hello["control_session_id"]
-        client_sequence = 0
-        stopped = Event()
-        current_shell: Queue[dict | BaseException] = Queue(maxsize=1)
-        applied_shell: dict | None = None
-
-        def publish(value: dict | BaseException) -> None:
-            try:
-                current_shell.get_nowait()
-            except Empty:
-                pass
-            current_shell.put_nowait(value)
-
-        def receive() -> None:
-            nonlocal applied_shell, client_sequence
-            try:
-                while not stopped.is_set():
-                    try:
-                        last_payload = json.loads(websocket.recv(timeout=0.5))
-                    except TimeoutError:
-                        continue
-                    assert isinstance(last_payload, dict)
-                    if last_payload.get("message_kind") == "heartbeat_challenge":
-                        client_sequence += 1
-                        websocket.send(
-                            json.dumps(
-                                {
-                                    "schema_version": (
-                                        "manyforge.execution_control.v2"
-                                    ),
-                                    "message_kind": "heartbeat_echo",
-                                    "control_session_id": control_session_id,
-                                    "client_sequence": str(client_sequence),
-                                    "challenge_sequence": last_payload[
-                                        "challenge_sequence"
-                                    ],
-                                }
-                            )
-                        )
-                        continue
-                    kind = last_payload.get("message_kind")
-                    shell = last_payload.get("shell")
-                    if kind not in {"snapshot", "delta"} or not isinstance(
-                        shell, dict
-                    ):
-                        continue
-                    if kind == "snapshot":
-                        assert shell.get("complete") is True
-                        applied_shell = dict(shell)
-                    else:
-                        assert applied_shell is not None
-                        assert shell.get("complete") is False
-                        applied_shell.update(
-                            {
-                                name: value
-                                for name, value in shell.items()
-                                if name != "complete"
-                            }
-                        )
-                    state_sequence = last_payload.get("state_sequence")
-                    if state_sequence is not None:
-                        websocket.send(
-                            json.dumps(
-                                {
-                                    "schema_version": (
-                                        "manyforge.execution_control.v2"
-                                    ),
-                                    "message_kind": "state_applied",
-                                    "control_session_id": control_session_id,
-                                    "state_sequence": state_sequence,
-                                }
-                            )
-                        )
-                    publish(dict(applied_shell))
-            except BaseException as error:
-                if not stopped.is_set():
-                    publish(error)
-
-        receiver = Thread(
-            target=receive,
-            name="manyforge-process-test-control-receiver",
-            daemon=True,
-        )
-        receiver.start()
-
-        def next_snapshot() -> dict:
-            try:
-                value = current_shell.get(timeout=8.0)
-            except Empty as error:
-                raise RuntimeError(
-                    "Composer did not publish a complete current snapshot"
-                ) from error
-            if isinstance(value, BaseException):
-                raise RuntimeError("Composer control stream failed") from value
-            return value
-
-        try:
-            yield next_snapshot
-        finally:
-            stopped.set()
-            receiver.join(timeout=2.0)
-            if receiver.is_alive():
-                raise RuntimeError("Composer control receiver did not stop")
+def _composer_snapshot_stream(stack: ProcessStack, *, client_id: str):
+    return composer_snapshot_stream(stack.composer_url, client_id=f"process-test.{client_id}")
 
 
 def _composer_fence(
@@ -823,9 +641,7 @@ def _composer_fence(
     }
 
 
-def _matching_composer_snapshot(
-    next_snapshot: Callable[[], dict], draft: dict
-) -> dict:
+def _matching_composer_snapshot(next_snapshot: Callable[[], dict], draft: dict) -> dict:
     for _ in range(32):
         snapshot = next_snapshot()
         if snapshot.get("draft_identity") == {
@@ -920,27 +736,17 @@ def _assistant_callback_body(
     admission_generation: int,
 ) -> dict:
     tool = next(
-        row
-        for row in assistant_mode["tools"]
-        if row["tool_id"] == "scene_draft_add_object"
+        row for row in assistant_mode["tools"] if row["tool_id"] == "scene_draft_add_object"
     )
     return {
         "assistantMode": "composer-assistant",
         "retainedBundleId": node_environment["retained_bundle_id"],
         "graphRevision": node_environment["graph_revision"],
         "nodeEnvironmentDigest": node_environment["environment_digest"],
-        "nodeEnvironmentProjectionDigest": node_environment["source"][
-            "source_content_digest"
-        ],
-        "sourceModelProjectionDigest": source_model["source"][
-            "source_content_digest"
-        ],
-        "assistantProjectionDigest": assistant_mode[
-            "assistant_projection_digest"
-        ],
-        "assistantModeProjectionDigest": assistant_mode["source"][
-            "source_content_digest"
-        ],
+        "nodeEnvironmentProjectionDigest": node_environment["source"]["source_content_digest"],
+        "sourceModelProjectionDigest": source_model["source"]["source_content_digest"],
+        "assistantProjectionDigest": assistant_mode["assistant_projection_digest"],
+        "assistantModeProjectionDigest": assistant_mode["source"]["source_content_digest"],
         "catalogHash": assistant_mode["catalog_hash"],
         "requestedTools": [],
         "fieldPolicy": {},
@@ -1025,9 +831,7 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
             HeadlessHttpClient(stack.composer_url) as composer,
             HeadlessHttpClient(stack.base_url) as headless,
         ):
-            source_context, assistant_mode = _matching_assistant_context(
-                stack, composer
-            )
+            source_context, assistant_mode = _matching_assistant_context(stack, composer)
             node_environment = source_context["node_environment"]
             source_model = source_context["source_model"]
             draft = composer.request("GET", "/api/program/draft")
@@ -1035,18 +839,14 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
             runtime_before = composer.runtime()
             package_before = _plain_package_files(stack.package_root)
             assert stack.fixture_metadata is not None
-            active_bundle = stack.fixture_metadata[
-                "physical_candidate_retained_bundle_id"
-            ]
+            active_bundle = stack.fixture_metadata["physical_candidate_retained_bundle_id"]
             active_graph = stack.fixture_metadata["physical_graph_revision"]
             scenarios = composer.scenarios()
 
-            assert {
-                row["model_instance_id"] for row in source_model["occurrences"]
-            } == {"lite6_fixture_instance"}
-            assert {
-                row["component_id"] for row in source_model["targets"]
-            } == {"lite6_arm"}
+            assert {row["model_instance_id"] for row in source_model["occurrences"]} == {
+                "lite6_fixture_instance"
+            }
+            assert {row["component_id"] for row in source_model["targets"]} == {"lite6_arm"}
             assert node_environment["retained_bundle_id"] == active_bundle
             assert node_environment["graph_revision"] == active_graph
             assert source_model["retained_bundle_id"] == active_bundle
@@ -1070,9 +870,7 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
             # A refreshed owner projection or admission generation changes the
             # exact payload, so every new attempt needs a new idempotency key.
             for attempt in range(8):
-                source_context, assistant_mode = _matching_assistant_context(
-                    stack, composer
-                )
+                source_context, assistant_mode = _matching_assistant_context(stack, composer)
                 node_environment = source_context["node_environment"]
                 source_model = source_context["source_model"]
                 accepted_body = _assistant_callback_body(
@@ -1111,22 +909,19 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
                         raise
             assert accepted["success"] is True
             assert accepted["draftMutated"] is True
-            assert accepted["nextAdmissionGeneration"] > accepted_body[
-                "expectedAdmissionGeneration"
-            ]
+            assert (
+                accepted["nextAdmissionGeneration"] > accepted_body["expectedAdmissionGeneration"]
+            )
 
             after_accepted = composer.request("GET", "/api/program/draft")
             assert after_accepted["draft_revision"] == draft["draft_revision"] + 1
             assert after_accepted["saved"] is False
             assert after_accepted["applied"] is False
             assert "assistant_workpiece" in {
-                row["scene_resource_id"]
-                for row in after_accepted["program"]["scene"]
+                row["scene_resource_id"] for row in after_accepted["program"]["scene"]
             }
             for attempt in range(8):
-                stale_context, stale_mode = _matching_assistant_context(
-                    stack, composer
-                )
+                stale_context, stale_mode = _matching_assistant_context(stack, composer)
                 stale_identity = _assistant_callback_body(
                     draft=after_accepted,
                     node_environment=stale_context["node_environment"],
@@ -1159,9 +954,7 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
             assert stale.value.code == "assistant_callback_context_stale"
 
             for attempt in range(8):
-                invalid_context, invalid_mode = _matching_assistant_context(
-                    stack, composer
-                )
+                invalid_context, invalid_mode = _matching_assistant_context(stack, composer)
                 invalid_edit = _assistant_callback_body(
                     draft=after_accepted,
                     node_environment=invalid_context["node_environment"],
@@ -1194,22 +987,18 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
                         raise
             assert rejected["success"] is False
             assert rejected["draftMutated"] is False
-            assert rejected["nextAdmissionGeneration"] == invalid_edit[
-                "expectedAdmissionGeneration"
-            ]
+            assert (
+                rejected["nextAdmissionGeneration"] == invalid_edit["expectedAdmissionGeneration"]
+            )
             assert rejected["result"]["kind"] == "validation_error"
             assert composer.request("GET", "/api/program/draft") == after_accepted
 
             callback_latencies_s: list[float] = []
             for index in range(12):
                 for attempt in range(8):
-                    read_context, read_mode = _matching_assistant_context(
-                        stack, composer
-                    )
+                    read_context, read_mode = _matching_assistant_context(stack, composer)
                     program_read = next(
-                        row
-                        for row in read_mode["tools"]
-                        if row["tool_id"] == "program_read"
+                        row for row in read_mode["tools"] if row["tool_id"] == "program_read"
                     )
                     read_body = _assistant_callback_body(
                         draft=after_accepted,
@@ -1220,9 +1009,7 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
                         request_id=f"assistant.process.read.{index}.{attempt}",
                         admission_generation=_current_authoring_generation(headless),
                     )
-                    read_body["inputSchemaHash"] = program_read[
-                        "input_schema_hash"
-                    ]
+                    read_body["inputSchemaHash"] = program_read["input_schema_hash"]
                     read_body["arguments"] = {}
                     started = time.perf_counter()
                     try:
@@ -1231,9 +1018,7 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
                             "/api/assistant/bridge/tools/program_read",
                             body=read_body,
                         )
-                        callback_latencies_s.append(
-                            time.perf_counter() - started
-                        )
+                        callback_latencies_s.append(time.perf_counter() - started)
                         break
                     except HeadlessClientError as error:
                         if (
@@ -1250,9 +1035,10 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
                             raise
                 assert read_result["success"] is True
                 assert read_result["draftMutated"] is False
-                assert read_result["nextAdmissionGeneration"] == read_body[
-                    "expectedAdmissionGeneration"
-                ]
+                assert (
+                    read_result["nextAdmissionGeneration"]
+                    == read_body["expectedAdmissionGeneration"]
+                )
             assert max(callback_latencies_s) < 0.5, callback_latencies_s
 
         stack.kill_composer()
@@ -1263,9 +1049,8 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
             HeadlessHttpClient(stack.composer_url) as replacement,
             HeadlessHttpClient(stack.base_url) as headless,
         ):
-            assert replacement.request(
-                "GET", "/api/program/draft"
-            ) == after_accepted
+            assert replacement.request("GET", "/api/program/draft") == after_accepted
+
             def invoke(body: dict) -> tuple[str, str]:
                 try:
                     with HeadlessHttpClient(stack.composer_url) as client:
@@ -1278,9 +1063,7 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
                 except HeadlessClientError as error:
                     return ("rejected", error.code)
 
-            replacement_context, replacement_mode = _matching_assistant_context(
-                stack, replacement
-            )
+            replacement_context, replacement_mode = _matching_assistant_context(stack, replacement)
             concurrent_generation = _current_authoring_generation(headless)
             concurrent_bodies = [
                 _assistant_callback_body(
@@ -1296,9 +1079,7 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
             ]
             with ThreadPoolExecutor(max_workers=2) as executor:
                 concurrent_results = list(executor.map(invoke, concurrent_bodies))
-        accepted_count = sum(
-            kind == "accepted" for kind, _detail in concurrent_results
-        )
+        accepted_count = sum(kind == "accepted" for kind, _detail in concurrent_results)
         assert accepted_count <= 1
         assert all(
             detail
@@ -1315,11 +1096,10 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
             for kind, detail in concurrent_results
             if kind == "rejected"
         ), concurrent_results
-        assert len([
-            detail
-            for kind, detail in concurrent_results
-            if kind == "rejected"
-        ]) == 2 - accepted_count
+        assert (
+            len([detail for kind, detail in concurrent_results if kind == "rejected"])
+            == 2 - accepted_count
+        )
 
         with HeadlessHttpClient(stack.composer_url) as composer:
             final_draft = composer.request("GET", "/api/program/draft")
@@ -1334,16 +1114,13 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
             )
             assert final_draft["saved"] is False
             assert final_draft["applied"] is False
-            assert composer.manager_status()["status"]["active"] == manager_before[
-                "active"
-            ]
+            assert composer.manager_status()["status"]["active"] == manager_before["active"]
             runtime_after = composer.runtime()
-            assert runtime_after["active_retained_bundle_id"] == runtime_before[
-                "active_retained_bundle_id"
-            ]
-            assert runtime_after["active_graph_revision"] == runtime_before[
-                "active_graph_revision"
-            ]
+            assert (
+                runtime_after["active_retained_bundle_id"]
+                == runtime_before["active_retained_bundle_id"]
+            )
+            assert runtime_after["active_graph_revision"] == runtime_before["active_graph_revision"]
             assert _plain_package_files(stack.package_root) == package_before
 
 
@@ -1351,19 +1128,19 @@ def test_real_program_apply_reuses_active_deployment_and_survives_api_restart(
     tmp_path: Path,
 ) -> None:
     package_root = tmp_path / "read-only-package"
-    shutil.copytree(
-        _required_path("MANYFORGE_ASSISTANT_NATIVE_PACKAGE_ROOT"), package_root
-    )
+    shutil.copytree(_required_path("MANYFORGE_ASSISTANT_NATIVE_PACKAGE_ROOT"), package_root)
     package_before = _plain_package_files(package_root)
     with _read_only_tree(package_root):
         with _assistant_stack(tmp_path, package_root=package_root) as stack:
             assert stack.wait_complete(True)["complete"] is True
-            with _composer_snapshot_stream(
-                stack, client_id="process-test-browser"
-            ) as next_snapshot, HeadlessHttpClient(
-                stack.composer_url,
-                timeout_seconds=8.0,
-            ) as composer, HeadlessHttpClient(stack.base_url) as client:
+            with (
+                _composer_snapshot_stream(stack, client_id="process-test-browser") as next_snapshot,
+                HeadlessHttpClient(
+                    stack.composer_url,
+                    timeout_seconds=8.0,
+                ) as composer,
+                HeadlessHttpClient(stack.base_url) as client,
+            ):
                 scenarios = client.scenarios()
                 assert [row["scenario_id"] for row in scenarios["scenarios"]] == [
                     "program_apply_fixture"
@@ -1374,12 +1151,8 @@ def test_real_program_apply_reuses_active_deployment_and_survives_api_restart(
 
                 unloaded_draft = composer.request("GET", "/api/program/draft")
                 for attempt in range(8):
-                    assert composer.request(
-                        "GET", "/api/program/draft"
-                    ) == unloaded_draft
-                    load_snapshot = _matching_composer_snapshot(
-                        next_snapshot, unloaded_draft
-                    )
+                    assert composer.request("GET", "/api/program/draft") == unloaded_draft
+                    load_snapshot = _matching_composer_snapshot(next_snapshot, unloaded_draft)
                     try:
                         loaded = composer.request(
                             "POST",
@@ -1387,14 +1160,10 @@ def test_real_program_apply_reuses_active_deployment_and_survives_api_restart(
                             body={
                                 **_composer_fence(
                                     load_snapshot,
-                                    request_id=(
-                                        f"program-apply.process.load.{attempt}"
-                                    ),
+                                    request_id=(f"program-apply.process.load.{attempt}"),
                                 ),
                                 "scenarioId": "program_apply_fixture",
-                                "scenarioCatalogRevision": scenarios[
-                                    "scenario_catalog_revision"
-                                ],
+                                "scenarioCatalogRevision": scenarios["scenario_catalog_revision"],
                                 "confirmDiscard": False,
                             },
                         )
@@ -1410,18 +1179,12 @@ def test_real_program_apply_reuses_active_deployment_and_survives_api_restart(
                         ):
                             raise
                 assert loaded["status"] == "loaded"
-                assert client.program_applied()["scenario_id"] == (
-                    "program_apply_fixture"
-                )
+                assert client.program_applied()["scenario_id"] == ("program_apply_fixture")
 
                 initial_draft = composer.request("GET", "/api/program/draft")
                 for attempt in range(8):
-                    assert composer.request(
-                        "GET", "/api/program/draft"
-                    ) == initial_draft
-                    initial_snapshot = _matching_composer_snapshot(
-                        next_snapshot, initial_draft
-                    )
+                    assert composer.request("GET", "/api/program/draft") == initial_draft
+                    initial_snapshot = _matching_composer_snapshot(next_snapshot, initial_draft)
                     try:
                         composer.request(
                             "POST",
@@ -1429,9 +1192,7 @@ def test_real_program_apply_reuses_active_deployment_and_survives_api_restart(
                             body={
                                 **_composer_fence(
                                     initial_snapshot,
-                                    request_id=(
-                                        f"program-apply.process.edit.{attempt}"
-                                    ),
+                                    request_id=(f"program-apply.process.edit.{attempt}"),
                                 ),
                                 "mutation": "tree_draft_update_node_params",
                                 "arguments": {
@@ -1467,18 +1228,10 @@ def test_real_program_apply_reuses_active_deployment_and_survives_api_restart(
                     / "sha256"
                     / f"{program['program_revision'][7:]}.json"
                 )
-                publication_binding_path = (
-                    stack.artifact_root
-                    / "program-bindings"
-                    / "sha256"
-                )
+                publication_binding_path = stack.artifact_root / "program-bindings" / "sha256"
                 for attempt in range(8):
-                    assert composer.request(
-                        "GET", "/api/program/draft"
-                    ) == edited_draft
-                    apply_snapshot = _matching_composer_snapshot(
-                        next_snapshot, edited_draft
-                    )
+                    assert composer.request("GET", "/api/program/draft") == edited_draft
+                    apply_snapshot = _matching_composer_snapshot(next_snapshot, edited_draft)
                     try:
                         applied_response = composer.request(
                             "POST",
@@ -1510,9 +1263,7 @@ def test_real_program_apply_reuses_active_deployment_and_survives_api_restart(
                     "schema_version",
                     "status",
                 }
-                assert result["applied"]["program_revision"] == program[
-                    "program_revision"
-                ]
+                assert result["applied"]["program_revision"] == program["program_revision"]
                 first_applied = client.program_applied()
                 assert first_applied == result["applied"]
                 assert publication_program_path.is_file()
@@ -1539,9 +1290,7 @@ def test_real_program_apply_reuses_active_deployment_and_survives_api_restart(
                     stack, client_id="process-test-browser-restarted"
                 ) as restarted_snapshots:
                     for attempt in range(8):
-                        assert composer.request(
-                            "GET", "/api/program/draft"
-                        ) == replay_draft
+                        assert composer.request("GET", "/api/program/draft") == replay_draft
                         replay_snapshot = _matching_composer_snapshot(
                             restarted_snapshots, replay_draft
                         )
@@ -1552,9 +1301,7 @@ def test_real_program_apply_reuses_active_deployment_and_survives_api_restart(
                                 body={
                                     **_composer_fence(
                                         replay_snapshot,
-                                        request_id=(
-                                            f"program-apply.process.2.{attempt}"
-                                        ),
+                                        request_id=(f"program-apply.process.2.{attempt}"),
                                     )
                                 },
                             )
@@ -1572,20 +1319,12 @@ def test_real_program_apply_reuses_active_deployment_and_survives_api_restart(
                                 raise
                 replay = replay_response["headless"]
                 replay_applied = replay["applied"]
-                assert {
-                    key: value
-                    for key, value in replay_applied.items()
-                    if key != "source"
-                } == {
-                    key: value
-                    for key, value in first_applied.items()
-                    if key != "source"
+                assert {key: value for key, value in replay_applied.items() if key != "source"} == {
+                    key: value for key, value in first_applied.items() if key != "source"
                 }
                 assert replay_applied["source"] == {
                     **first_applied["source"],
-                    "source_owner_epoch": replay_applied["source"][
-                        "source_owner_epoch"
-                    ],
+                    "source_owner_epoch": replay_applied["source"]["source_owner_epoch"],
                 }
                 assert replay_applied["source"]["source_owner_epoch"] != (
                     first_applied["source"]["source_owner_epoch"]
@@ -1595,36 +1334,27 @@ def test_real_program_apply_reuses_active_deployment_and_survives_api_restart(
                     try:
                         started = client.program_run_start(
                             {
-                                "request_id": (
-                                    f"program-apply.process.run.1.{attempt}"
-                                ),
-                                "request_owner_epoch": (
-                                    "process-test-browser-restarted"
-                                ),
+                                "request_id": (f"program-apply.process.run.1.{attempt}"),
+                                "request_owner_epoch": ("process-test-browser-restarted"),
                                 "source_label": "program_apply_process_test",
                                 "correlation_id": "program-apply.process.run.1",
                                 "scenario_id": "program_apply_fixture",
-                                "scenario_catalog_revision": scenarios[
-                                    "scenario_catalog_revision"
+                                "scenario_catalog_revision": scenarios["scenario_catalog_revision"],
+                                "expected_applied_record_digest": replay_applied["source"][
+                                    "record_digest"
                                 ],
-                                "expected_applied_record_digest": replay_applied[
-                                    "source"
-                                ]["record_digest"],
-                                "draft_program_revision": replay_applied[
-                                    "program_revision"
-                                ],
+                                "draft_program_revision": replay_applied["program_revision"],
                                 "expected_admission_generation": (
-                                    stack.wait_authoring_admission(
-                                        expected_allowed=True
-                                    )["admission_generation"]
+                                    stack.wait_authoring_admission(expected_allowed=True)[
+                                        "admission_generation"
+                                    ]
                                 ),
                             }
                         )
                         break
                     except HeadlessClientError as error:
                         if (
-                            error.code
-                            not in {"authoring_not_ready", "stale_generation"}
+                            error.code not in {"authoring_not_ready", "stale_generation"}
                             or attempt == 7
                         ):
                             raise
@@ -1633,9 +1363,7 @@ def test_real_program_apply_reuses_active_deployment_and_survives_api_restart(
                 deadline = time.monotonic() + 10.0
                 while terminal["state"] in {"running", "stopping", "finalizing"}:
                     if time.monotonic() >= deadline:
-                        raise RuntimeError(
-                            f"Program run did not settle: {terminal!r}"
-                        )
+                        raise RuntimeError(f"Program run did not settle: {terminal!r}")
                     time.sleep(0.01)
                     terminal = client.program_run(program_run_id)
                 assert terminal["state"] == "succeeded"
@@ -1650,23 +1378,15 @@ def test_real_program_apply_reuses_active_deployment_and_survives_api_restart(
                         "source_label": "program_apply_process_test",
                         "correlation_id": "program-apply.process.run.1",
                         "program_run_id": program_run_id,
-                        "expected_owner_epoch": cycle[
-                            "program_runner_owner_epoch"
-                        ],
-                        "expected_cycle_generation": cycle[
-                            "cycle_generation"
-                        ],
-                        "expected_claim_generation": cycle[
-                            "cycle_claim_generation"
-                        ],
+                        "expected_owner_epoch": cycle["program_runner_owner_epoch"],
+                        "expected_cycle_generation": cycle["cycle_generation"],
+                        "expected_claim_generation": cycle["cycle_claim_generation"],
                         "terminal_reference": terminal_reference,
                         "settlement_evidence_digest": terminal_reference,
                     }
                 )
                 assert reset["program_run_id"] == program_run_id
-                assert client.program_cycle_status()["state"] == (
-                    "idle_after_reset"
-                )
+                assert client.program_cycle_status()["state"] == ("idle_after_reset")
             assert _plain_package_files(stack.package_root) == package_before
 
 
@@ -1729,23 +1449,15 @@ def test_manager_api_cli_and_replacements_preserve_headless_owners(
             assert environment["retained_bundle_id"] == (
                 status["status"]["active"]["retained_bundle_id"]
             )
-            assert environment["graph_revision"] == (
-                status["status"]["active"]["graph_revision"]
-            )
+            assert environment["graph_revision"] == (status["status"]["active"]["graph_revision"])
             assert environment["manifest"]["environment_digest"] == (
                 environment["environment_digest"]
             )
-            assert environment["catalog"]["catalog_digest"] == (
-                environment["catalog_digest"]
-            )
+            assert environment["catalog"]["catalog_digest"] == (environment["catalog_digest"])
             assert environment["availability"]["execution_available"] is False
-            assert client.manager_graph()["cell_graph"]["cell_id"] == (
-                "c1_build_authority_cell"
-            )
+            assert client.manager_graph()["cell_graph"]["cell_id"] == ("c1_build_authority_cell")
             assert client.manager_diff()["converged"] is True
-            assert client.scene()["scene_runtime"]["payload"]["state"]["state"] == (
-                "open"
-            )
+            assert client.scene()["scene_runtime"]["payload"]["state"]["state"] == ("open")
 
             with pytest.raises(HeadlessClientError) as unavailable:
                 client.manager_apply(
@@ -1761,38 +1473,47 @@ def test_manager_api_cli_and_replacements_preserve_headless_owners(
         stack.start_composer()
         assert stack.wait_composer()["projection_owner_epoch"] == owner_identity[0]
         with HeadlessHttpClient(stack.composer_url) as composer:
-            assert composer.manager_graph()["cell_graph"]["cell_id"] == (
-                "c1_build_authority_cell"
+            assert composer.manager_graph()["cell_graph"]["cell_id"] == ("c1_build_authority_cell")
+            assert (
+                _owner_identity(
+                    composer.runtime(),
+                    composer.alarms(limit=128),
+                )
+                == owner_identity
             )
-            assert _owner_identity(
-                composer.runtime(),
-                composer.alarms(limit=128),
-            ) == owner_identity
             assert composer.node_environment()["environment_digest"] == (
                 environment["environment_digest"]
             )
-            assert composer.request("GET", "/api/catalog")[
-                "environmentDigest"
-            ] == environment["environment_digest"]
-            assert composer.request("GET", "/api/nodes/environment")[
-                "active"
-            ]["retainedBundleId"] == environment["retained_bundle_id"]
+            assert (
+                composer.request("GET", "/api/catalog")["environmentDigest"]
+                == environment["environment_digest"]
+            )
+            assert (
+                composer.request("GET", "/api/nodes/environment")["active"]["retainedBundleId"]
+                == environment["retained_bundle_id"]
+            )
 
         stack.kill_composer()
         assert stack.authoring_transaction_journal.is_file()
         with HeadlessHttpClient(stack.base_url) as client:
-            assert _owner_identity(
-                client.runtime(),
-                client.alarms(limit=128),
-            ) == owner_identity
+            assert (
+                _owner_identity(
+                    client.runtime(),
+                    client.alarms(limit=128),
+                )
+                == owner_identity
+            )
 
         stack.start_composer()
         stack.wait_composer()
         with HeadlessHttpClient(stack.composer_url) as replacement_composer:
-            assert _owner_identity(
-                replacement_composer.runtime(),
-                replacement_composer.alarms(limit=128),
-            ) == owner_identity
+            assert (
+                _owner_identity(
+                    replacement_composer.runtime(),
+                    replacement_composer.alarms(limit=128),
+                )
+                == owner_identity
+            )
 
         cli_reads = {
             "health": "manyforge.headless_health.v1",
@@ -1861,9 +1582,7 @@ def test_manager_api_cli_and_replacements_preserve_headless_owners(
             assert composer.runtime()["complete"] is False
             with pytest.raises(HeadlessClientError) as unavailable_environment:
                 composer.request("GET", "/api/catalog")
-            assert unavailable_environment.value.code == (
-                "node_environment_projection_unavailable"
-            )
+            assert unavailable_environment.value.code == ("node_environment_projection_unavailable")
 
         stack.start_manager()
         stack.wait_complete(True)

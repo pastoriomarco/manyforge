@@ -890,7 +890,7 @@ require_configuration(const RetainedBundle &retained_bundle,
         gripper_target_configurations->size());
     for (const auto &entry : *gripper_target_configurations) {
       const auto *object = std::get_if<core::JsonObjectDTO>(&entry.value);
-      if (object == nullptr || object->size() != 12U) {
+      if (object == nullptr || (object->size() != 12U && object->size() != 13U)) {
         throw RetainedBundleError(
             "native runtime configuration has an invalid gripper target configuration");
       }
@@ -944,6 +944,21 @@ require_configuration(const RetainedBundle &retained_bundle,
       const auto component_id = string_member("controllable_component_id");
       const auto target_id = string_member("command_target_id");
       const auto actuation_kind = string_member("actuation_kind");
+      std::optional<std::int64_t> confirmation_validity_ns;
+      const auto confirmation = object->find("operator_confirmation_validity_ns");
+      if (confirmation != object->end()) {
+        const auto* value = std::get_if<double>(&confirmation->second.value);
+        if (value == nullptr || !std::isfinite(*value) || std::trunc(*value) != *value ||
+            *value < 1.0 || *value > 3'600'000'000'000.0) {
+          throw RetainedBundleError(
+              "native runtime configuration has invalid "
+              "operator confirmation validity");
+        }
+        confirmation_validity_ns = static_cast<std::int64_t>(*value);
+      } else if (object->size() != 12U) {
+        throw RetainedBundleError(
+            "native runtime configuration has an unknown gripper target field");
+      }
       if (duration_s == nullptr || !std::isfinite(*duration_s) ||
           *duration_s <= 0.0 || *duration_s > 60.0 ||
           (actuation_kind != "position_commanded" &&
@@ -951,20 +966,12 @@ require_configuration(const RetainedBundle &retained_bundle,
         throw RetainedBundleError(
             "native runtime configuration has invalid gripper target semantics");
       }
-      result.gripper_target_configurations.push_back(
-          Configuration::GripperTargetConfiguration{
-              core::ControllableComponentId(component_id),
-              core::CommandTargetId(target_id),
-              string_member("description"),
-              actuation_kind,
-              string_member("open_state_ref"),
-              string_member("closed_state_ref"),
-              *duration_s,
-              string_array_member("touch_links", true),
-              string_member("mount_frame"),
-              string_member("attach_frame"),
-              string_member("tcp_frame"),
-              string_array_member("auxiliary_frames", false)});
+      result.gripper_target_configurations.push_back(Configuration::GripperTargetConfiguration{
+          core::ControllableComponentId(component_id), core::CommandTargetId(target_id),
+          string_member("description"), actuation_kind, string_member("open_state_ref"),
+          string_member("closed_state_ref"), *duration_s, string_array_member("touch_links", true),
+          string_member("mount_frame"), string_member("attach_frame"), string_member("tcp_frame"),
+          string_array_member("auxiliary_frames", false), confirmation_validity_ns});
     }
     std::sort(result.gripper_target_configurations.begin(),
               result.gripper_target_configurations.end(),

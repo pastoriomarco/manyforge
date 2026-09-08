@@ -71,7 +71,7 @@ function workspaceFixture(): Record<string, unknown> {
     name: 'Fixture',
     catalog: {
       api_version: 'manyforge.node_catalog.v2',
-      content_version: '2.0.0',
+      content_version: '2.1.0',
     },
     component_roles: {},
     target_roles: {},

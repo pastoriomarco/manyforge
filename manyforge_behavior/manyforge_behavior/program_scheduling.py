@@ -62,9 +62,7 @@ class ProgramInterventionRegistry:
         self._runs: dict[str, _RunInterventions] = {}
         self._lock = RLock()
 
-    def register_run(
-        self, program_run_id: str, node_instance_ids: Collection[str]
-    ) -> None:
+    def register_run(self, program_run_id: str, node_instance_ids: Collection[str]) -> None:
         if not isinstance(program_run_id, str) or not program_run_id:
             raise ValueError("program_run_id must be non-empty text")
         if not node_instance_ids or any(
@@ -74,9 +72,7 @@ class ProgramInterventionRegistry:
         nodes = frozenset(node_instance_ids)
         with self._lock:
             if program_run_id in self._runs:
-                raise ProgramSchedulingError(
-                    "Program intervention capture is already registered"
-                )
+                raise ProgramSchedulingError("Program intervention capture is already registered")
             if len(self._runs) >= self._maximum_retained_runs:
                 raise ProgramSchedulingError("intervention retention is full")
             self._runs[program_run_id] = _RunInterventions(nodes)
@@ -84,9 +80,7 @@ class ProgramInterventionRegistry:
     def _run(self, identity: NodeAttemptIdentity) -> _RunInterventions:
         run = self._runs.get(identity.program_run_id)
         if run is None or identity.node_instance_id not in run.node_ids:
-            raise ProgramSchedulingError(
-                "intervention identifies an uncaptured Program node"
-            )
+            raise ProgramSchedulingError("intervention identifies an uncaptured Program node")
         return run
 
     def _entry(self, identity: NodeAttemptIdentity) -> _InterventionEntry:
@@ -155,15 +149,10 @@ class ProgramInterventionRegistry:
                 for entry in run.entries.values()
             )
 
-    def read_all(
-        self, program_run_id: str
-    ) -> tuple[ProgramInterventionSnapshot, ...]:
+    def read_all(self, program_run_id: str) -> tuple[ProgramInterventionSnapshot, ...]:
         with self._lock:
             run = self._runs.get(program_run_id)
-            return (
-                () if run is None
-                else tuple(entry.record for entry in run.entries.values())
-            )
+            return () if run is None else tuple(entry.record for entry in run.entries.values())
 
     def refresh_owner_assessment(
         self,
@@ -198,14 +187,10 @@ class ProgramInterventionRegistry:
             entry = self._entry(identity)
             resolution = (action, deepcopy(result))
             if entry.resolution is not None and entry.resolution != resolution:
-                raise ProgramSchedulingError(
-                    "Program recovery already has another resolution"
-                )
+                raise ProgramSchedulingError("Program recovery already has another resolution")
             entry.resolution = resolution
 
-    def consume_resolution(
-        self, identity: NodeAttemptIdentity
-    ) -> tuple[str, object] | None:
+    def consume_resolution(self, identity: NodeAttemptIdentity) -> tuple[str, object] | None:
         with self._lock:
             run = self._run(identity)
             entry = run.entries.get(identity.node_instance_id)
@@ -247,9 +232,7 @@ class ProgramRunTickHost:
         if (
             isinstance(tick_interval_s, bool)
             or not isinstance(tick_interval_s, (int, float))
-            or not _MIN_TICK_INTERVAL_S
-            <= float(tick_interval_s)
-            <= _MAX_TICK_INTERVAL_S
+            or not _MIN_TICK_INTERVAL_S <= float(tick_interval_s) <= _MAX_TICK_INTERVAL_S
         ):
             raise ValueError("tick interval is outside its fixed bound")
         if (
@@ -257,10 +240,7 @@ class ProgramRunTickHost:
             or not 1 <= maximum_scheduled_runs <= _MAX_SCHEDULED_RUNS
         ):
             raise ValueError("scheduled-run bound is invalid")
-        if (
-            type(maximum_workers) is not int
-            or not 1 <= maximum_workers <= _MAX_TICK_WORKERS
-        ):
+        if type(maximum_workers) is not int or not 1 <= maximum_workers <= _MAX_TICK_WORKERS:
             raise ValueError("tick-worker bound is invalid")
         if not callable(monotonic):
             raise TypeError("monotonic clock must be callable")
@@ -280,9 +260,7 @@ class ProgramRunTickHost:
         # A worker carries the revision it was submitted under, so its older
         # completion cannot remove a wake issued by a concurrent command.
         self._scheduled: dict[str, int] = {}
-        self._inflight: dict[
-            str, tuple[int, Future[ProgramRunSnapshot]]
-        ] = {}
+        self._inflight: dict[str, tuple[int, Future[ProgramRunSnapshot]]] = {}
         self._schedule_revision = 0
         self._condition = Condition(RLock())
         self._thread: Thread | None = None
@@ -297,9 +275,7 @@ class ProgramRunTickHost:
         if self._shutdown:
             raise ProgramSchedulingError("Program tick host is shut down")
         if self._worker_failure is not None:
-            raise ProgramSchedulingError("Program tick worker failed") from (
-                self._worker_failure
-            )
+            raise ProgramSchedulingError("Program tick worker failed") from (self._worker_failure)
 
     def start(self) -> None:
         with self._condition:
@@ -367,8 +343,7 @@ class ProgramRunTickHost:
                 ProgramRunState.FAILED,
             }:
                 raise ProgramSchedulingError(
-                    "Program tick scheduling failed before admitted-run "
-                    "cleanup settled"
+                    "Program tick scheduling failed before admitted-run " "cleanup settled"
                 ) from scheduling_error
             raise
 
@@ -434,7 +409,8 @@ class ProgramRunTickHost:
             # current view even when the release reply was lost. No retries.
             snapshot = self._owner.read(program_run_id)
             if snapshot.state in {
-                ProgramRunState.RUNNING, ProgramRunState.INTERVENTION_REQUIRED,
+                ProgramRunState.RUNNING,
+                ProgramRunState.INTERVENTION_REQUIRED,
             }:
                 self.schedule(program_run_id)
             self._observe_state(snapshot)
@@ -501,13 +477,8 @@ class ProgramRunTickHost:
         """Release scheduler presentation state and the reset resident tree."""
 
         with self._condition:
-            if (
-                program_run_id in self._scheduled
-                or program_run_id in self._inflight
-            ):
-                raise ProgramSchedulingError(
-                    "a scheduled Program run cannot be forgotten"
-                )
+            if program_run_id in self._scheduled or program_run_id in self._inflight:
+                raise ProgramSchedulingError("a scheduled Program run cannot be forgotten")
         self._owner.forget_reset_run(program_run_id)
         with self._condition:
             self._observed_revisions.pop(program_run_id, None)
@@ -583,9 +554,7 @@ class ProgramRunTickHost:
             return True
         return (
             snapshot.state is ProgramRunState.INTERVENTION_REQUIRED
-            and self._owner.operator_stop_observation_required(
-                snapshot.capture.program_run_id
-            )
+            and self._owner.operator_stop_observation_required(snapshot.capture.program_run_id)
         )
 
     def _current_after_worker(
@@ -596,9 +565,7 @@ class ProgramRunTickHost:
 
         current = self._owner.read(completed.capture.program_run_id)
         if current.run_revision < completed.run_revision:
-            raise ProgramSchedulingError(
-                "Program-run owner revision regressed after a tick"
-            )
+            raise ProgramSchedulingError("Program-run owner revision regressed after a tick")
         return current
 
     def advance_ready_once(self) -> tuple[ProgramRunSnapshot, ...]:
@@ -637,8 +604,10 @@ class ProgramRunTickHost:
                 for program_run_id, schedule_revision in remove:
                     if self._scheduled.get(program_run_id) == schedule_revision:
                         self._scheduled.pop(program_run_id, None)
-        self._observe_terminals(snapshots)
-        self._observe_states(snapshots)
+        try:
+            self._observe_terminals(snapshots)
+        finally:
+            self._observe_states(snapshots)
         return tuple(snapshots)
 
     def _observe_state(self, snapshot: ProgramRunSnapshot) -> None:
@@ -651,9 +620,7 @@ class ProgramRunTickHost:
         revision = (snapshot.run_revision, snapshot.node_status_revision)
         with self._condition:
             current = self._observed_revisions.get(program_run_id)
-            if current is not None and (
-                revision[0] <= current[0] and revision[1] <= current[1]
-            ):
+            if current is not None and (revision[0] <= current[0] and revision[1] <= current[1]):
                 return
         try:
             observer(snapshot)
@@ -694,9 +661,7 @@ class ProgramRunTickHost:
             with self._condition:
                 self._worker_failure = error
                 self._condition.notify_all()
-            raise ProgramSchedulingError(
-                "Program terminal observer failed"
-            ) from error
+            raise ProgramSchedulingError("Program terminal observer failed") from error
 
     def _run(self) -> None:
         next_tick = self._monotonic()
@@ -719,10 +684,7 @@ class ProgramRunTickHost:
                         return
                     observed.append(snapshot)
                     if not self._requires_advance(snapshot):
-                        removed = (
-                            self._scheduled.get(program_run_id)
-                            == schedule_revision
-                        )
+                        removed = self._scheduled.get(program_run_id) == schedule_revision
                         if removed:
                             self._scheduled.pop(program_run_id, None)
                         if removed and snapshot.state is not (
@@ -732,18 +694,14 @@ class ProgramRunTickHost:
 
                 now = self._monotonic()
                 delay = next_tick - now
-                if completed:
+                if observed:
                     pass
                 elif not self._scheduled:
                     self._condition.wait()
                 elif delay > 0.0:
-                    self._condition.wait(
-                        timeout=delay
-                    )
+                    self._condition.wait(timeout=delay)
                 else:
-                    for program_run_id, schedule_revision in sorted(
-                        self._scheduled.items()
-                    ):
+                    for program_run_id, schedule_revision in sorted(self._scheduled.items()):
                         if program_run_id in self._inflight:
                             continue
                         future = self._executor.submit(
@@ -754,16 +712,16 @@ class ProgramRunTickHost:
                             schedule_revision,
                             future,
                         )
-                        future.add_done_callback(
-                            lambda _future: self._notify_worker_completion()
-                        )
+                        future.add_done_callback(lambda _future: self._notify_worker_completion())
                     next_tick = now + self._tick_interval_s
             if completed:
                 try:
                     self._observe_terminals(completed)
                 except ProgramSchedulingError:
                     return
-            if observed:
+                finally:
+                    self._observe_states(observed)
+            elif observed:
                 self._observe_states(observed)
 
     def _notify_worker_completion(self) -> None:

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <manyforge_core/time/iclock.hpp>
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 #include <optional>
@@ -103,6 +104,48 @@ struct GripperCommandResultDTO {
   std::optional<ErrorDTO> error;
 };
 
+enum class GraspConfirmationSourceKind {
+  kOperator,
+  kDiscreteInput,
+  kPerception,
+  kForceCurrent,
+};
+
+/// A source adapter's observation, not a Program's assertion that a command
+/// succeeded. observed_at_ns is in the receiving owner's clock domain; remote
+/// operator commands pass the common freshness gate before it is stamped.
+struct GripperGraspObservationDTO final {
+  std::string gripper_id;
+  std::uint64_t command_id{};
+  std::uint64_t generation{};
+  std::uint64_t expected_status_revision{};
+  std::string observation_id;
+  bool confirmed{};
+  TimePoint observed_at_ns{};
+  std::string attribution;
+
+  friend bool operator==(const GripperGraspObservationDTO&,
+                         const GripperGraspObservationDTO&) = default;
+};
+
+/// One bounded, immutable evidence record for the current gripper command.
+/// Its source/time are independent of commanded position and joint samples.
+struct GripperGraspEvidenceDTO final {
+  GraspConfirmationSourceKind source_kind{GraspConfirmationSourceKind::kOperator};
+  ControlBindingId source_id;
+  ControlBindingRevision source_revision;
+  RuntimeEpoch source_epoch;
+  GripperGraspObservationDTO observation;
+  TimePoint expires_at_ns{};
+
+  friend bool operator==(const GripperGraspEvidenceDTO&, const GripperGraspEvidenceDTO&) = default;
+};
+
+[[nodiscard]] inline bool gripper_grasp_evidence_is_fresh(const GripperGraspEvidenceDTO& evidence,
+                                                          TimePoint now_ns) noexcept {
+  return now_ns >= evidence.observation.observed_at_ns && now_ns < evidence.expires_at_ns;
+}
+
 /// Immutable observer snapshot published by the owning gripper adapter.
 /// Reading this DTO must never advance a deadline, mutate command state, or
 /// project a joint into a planner scene.
@@ -128,6 +171,7 @@ struct GripperCommandStatusDTO {
   GripperProjectionState projection_state = GripperProjectionState::kNotRequired;
   std::string projection_reason;
   std::optional<ErrorDTO> error;
+  std::optional<GripperGraspEvidenceDTO> grasp_evidence;
 };
 
 }  // namespace manyforge::core

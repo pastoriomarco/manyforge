@@ -3,14 +3,13 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <manyforge_content_identity/canonical_value.hpp>
+#include <manyforge_headless/source_snapshot.hpp>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
-
-#include <manyforge_content_identity/canonical_value.hpp>
-
-#include <manyforge_headless/source_snapshot.hpp>
+#include <utility>
 
 namespace manyforge::headless {
 
@@ -36,6 +35,12 @@ struct HeadlessRuntimeSnapshot final {
   std::string semantic_content_digest;
   manyforge::content_identity::CanonicalValue root;
 };
+
+/// Bounded verified source-envelope observation for the cold control watcher.
+/// The fixed-size hint ignores only presentation-irrelevant source pulses;
+/// it neither builds a projection nor grants command/owner authority.
+[[nodiscard]] std::optional<std::pair<std::string, std::int64_t>> ReadControlSourceFileHint(
+    const std::filesystem::path& path);
 
 /// Independently restartable, read-only projection over immutable Manager and
 /// logical-scene source publications. It measures freshness from the exact

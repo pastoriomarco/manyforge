@@ -546,67 +546,6 @@ readiness_for(const std::vector<core::RuntimeParticipantExecutionRegistration>
          left.runtime_unit_epochs == right.runtime_unit_epochs;
 }
 
-/// Control-facing capabilities on one command target may have distinct graph
-/// binding/capability identities while still terminating at the same exact
-/// backend occurrence. Keep that relationship separate from Program aliases,
-/// which must preserve the complete control path.
-[[nodiscard]] bool same_backend_owner(
-    const core::RuntimeParticipantBinding &primary,
-    const core::RuntimeParticipantBinding &representative) noexcept {
-  const auto &left = primary.value();
-  const auto &right = representative.value();
-  if (!left.control_path.has_value() || !right.control_path.has_value()) {
-    return false;
-  }
-  const auto &left_path = *left.control_path;
-  const auto &right_path = *right.control_path;
-  return left.retained_bundle_id == right.retained_bundle_id &&
-         left.graph_revision == right.graph_revision &&
-         left.controllable_component_id == right.controllable_component_id &&
-         left.component_type_id == right.component_type_id &&
-         left.component_type_revision == right.component_type_revision &&
-         left.command_target_id == right.command_target_id &&
-         left.model_bindings == right.model_bindings &&
-         left.model_groups == right.model_groups &&
-         left.frame_bindings == right.frame_bindings &&
-         left.resources == right.resources &&
-         left.collision_body_bindings == right.collision_body_bindings &&
-         left.runtime_unit_epochs == right.runtime_unit_epochs &&
-         right.contact_grasp_bindings.empty() &&
-         left_path.control_domain_id == right_path.control_domain_id &&
-         left_path.control_domain_revision ==
-             right_path.control_domain_revision &&
-         left_path.control_interface_contract_id ==
-             right_path.control_interface_contract_id &&
-         left_path.control_interface_revision ==
-             right_path.control_interface_revision &&
-         left_path.controller_topology_id ==
-             right_path.controller_topology_id &&
-         left_path.topology_revision == right_path.topology_revision &&
-         left_path.control_route_id == right_path.control_route_id &&
-         left_path.activation_set_id == right_path.activation_set_id &&
-         left_path.active_control_configuration_id ==
-             right_path.active_control_configuration_id &&
-         left_path.active_control_configuration_generation ==
-             right_path.active_control_configuration_generation &&
-         left_path.provider_instance_id == right_path.provider_instance_id &&
-         left_path.provider_manifest_id == right_path.provider_manifest_id &&
-         left_path.provider_manifest_revision ==
-             right_path.provider_manifest_revision &&
-         left_path.provider_runtime_unit_id ==
-             right_path.provider_runtime_unit_id &&
-         left_path.provider_runtime_epoch ==
-             right_path.provider_runtime_epoch &&
-         left_path.state_authority_id == right_path.state_authority_id &&
-         left_path.state_authority_class == right_path.state_authority_class &&
-         left_path.stop_evidence_policy_id ==
-             right_path.stop_evidence_policy_id &&
-         left_path.stop_evidence_policy_revision ==
-             right_path.stop_evidence_policy_revision &&
-         left_path.containment_granularity ==
-             right_path.containment_granularity;
-}
-
 [[nodiscard]] bool represents_binding(
     const core::RuntimeParticipantBinding &candidate,
     const core::ControlBindingId &binding_id,
@@ -854,12 +793,6 @@ RetainedObservedStateChannelConfig select_retained_state_channel_config(
 
 } // namespace detail
 
-bool retained_bindings_share_backend_owner(
-    const core::RuntimeParticipantBinding &primary,
-    const core::RuntimeParticipantBinding &representative) noexcept {
-  return same_backend_owner(primary, representative);
-}
-
 std::shared_ptr<RetainedNativeRuntime>
 create_retained_native_runtime_participants(
     RetainedNativeRuntimeInput input, RetainedNativeRuntimeConfig config,
@@ -950,12 +883,12 @@ create_retained_native_runtime_participants(
       input.control_binding_representatives.size() +
       input.motion_binding_aliases.size() +
       input.gripper_binding_aliases.size();
-  const auto representative_owner_count = [&](const auto &candidate) {
+  const auto representative_owner_count = [&](const auto& candidate) {
     return static_cast<std::size_t>(
-               same_backend_owner(input.motion_binding, candidate)) +
+               retained_bindings_share_backend_owner(input.motion_binding, candidate)) +
            static_cast<std::size_t>(
                input.gripper_binding.has_value() &&
-               same_backend_owner(*input.gripper_binding, candidate));
+               retained_bindings_share_backend_owner(*input.gripper_binding, candidate));
   };
   const auto contains_exact_representative = [&](const auto &binding) {
     return std::count_if(input.control_binding_representatives.begin(),
@@ -1304,7 +1237,7 @@ create_retained_native_runtime_participants(
                         runtime->gripper_binding_aliases.size());
   for (const auto &representative : runtime->control_binding_representatives) {
     const bool motion_owner =
-        same_backend_owner(runtime->motion_binding, representative);
+        retained_bindings_share_backend_owner(runtime->motion_binding, representative);
     const bool primary = representative.value() ==
                          (motion_owner ? runtime->motion_binding.value()
                                        : runtime->gripper_binding->value());
@@ -1461,6 +1394,66 @@ RetainedNativeRuntime::ReadCurrentPublishedRouteConfiguration(
       readback.value()->active_configuration);
 }
 
+bool RetainedNativeRuntime::GripperSourceIsCurrent(
+    const core::RuntimeParticipantBinding& source) const {
+  if (!gripper || !source.value().control_path.has_value() ||
+      (source.value().capability_id.value() != "tool.gripper.confirmation.operator" &&
+       source.value().capability_id.value() != "tool.gripper.feedback"))
+    return false;
+  const auto& path = *source.value().control_path;
+  const auto current = ReadCurrentPublishedRouteConfiguration(path.control_domain_id);
+  if (!current.ok() || !current.value().has_value()) return false;
+  const auto& configuration = *current.value();
+  if (configuration.state != core::ActiveControlConfigurationStateDTO::kReconciled ||
+      configuration.active_control_configuration_id != path.active_control_configuration_id ||
+      configuration.active_control_configuration_generation !=
+          path.active_control_configuration_generation ||
+      configuration.control_domain_revision != path.control_domain_revision ||
+      configuration.controller_topology_id != path.controller_topology_id ||
+      configuration.topology_revision != path.topology_revision ||
+      configuration.activation_set_id != path.activation_set_id ||
+      std::none_of(configuration.binding_routes.begin(), configuration.binding_routes.end(),
+                   [&](const auto& row) {
+                     return row.control_binding_id == path.control_binding_id &&
+                            row.control_binding_revision == path.control_binding_revision &&
+                            row.control_route_id == path.control_route_id;
+                   }) ||
+      std::none_of(control_binding_representatives.begin(), control_binding_representatives.end(),
+                   [&](const auto& row) { return row.value() == source.value(); }))
+    return false;
+  return true;
+}
+
+core::Result<core::GripperGraspEvidenceDTO> RetainedNativeRuntime::RecordGraspObservation(
+    const core::RuntimeParticipantBinding& source,
+    const core::GripperGraspObservationDTO& observation, const core::Duration freshness_budget_ns,
+    const core::TimePoint admission_deadline_ns) {
+  std::lock_guard lock(route_publication_mutex_);
+  if (!GripperSourceIsCurrent(source) ||
+      source.value().capability_id.value() != "tool.gripper.confirmation.operator")
+    return core::Result<core::GripperGraspEvidenceDTO>::Err(
+        core::ErrorDTO{"grasp_confirmation_source_stale",
+                       "Confirmation source has no exact current native realization",
+                       {}});
+  // An unknown route can be published without rebinding the backend. Keep
+  // this final check and write within the same existing publication lock;
+  // never install evidence and subsequently call that a no-effect rejection.
+  return gripper->record_grasp_observation(source, observation, freshness_budget_ns,
+                                           admission_deadline_ns);
+}
+
+core::Result<core::GripperCommandStatusDTO> RetainedNativeRuntime::ReadGripperStatus(
+    const core::RuntimeParticipantBinding& source) const {
+  std::lock_guard lock(route_publication_mutex_);
+  if (!GripperSourceIsCurrent(source))
+    return core::Result<core::GripperCommandStatusDTO>::Err(
+        core::ErrorDTO{"grasp_confirmation_source_stale",
+                       "Gripper source has no exact current native realization",
+                       {}});
+  return core::Result<core::GripperCommandStatusDTO>::Ok(
+      gripper->get_gripper_status(source.value().command_target_id.value()));
+}
+
 core::Result<void>
 RetainedNativeRuntime::PublishCurrentRetainedRouteConfigurations() {
   std::lock_guard lock(route_publication_mutex_);
@@ -1581,6 +1574,14 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
         addressed_kernel->publish_runtime_route_configuration(configuration);
     if (!published.ok()) {
       return published;
+    }
+    if (gripper && gripper_binding.has_value() &&
+        gripper_binding->value().control_path.has_value() &&
+        gripper_binding->value().control_path->control_domain_id ==
+            configuration.control_domain_id) {
+      // Publication has already retired the source, even if a subsequent
+      // readback fails. Do not let reconciliation resurrect its evidence.
+      gripper->invalidate_grasp_evidence();
     }
     return addressed_kernel->runtime_route_configuration_readback(
         configuration.control_domain_id,
@@ -1750,10 +1751,9 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
                           next_motion_aliases.size() +
                           next_gripper_aliases.size());
     for (const auto &representative : next_representatives) {
-      const bool motion_owner = same_backend_owner(next_motion, representative);
-      const bool gripper_owner =
-          next_gripper.has_value() &&
-          same_backend_owner(*next_gripper, representative);
+      const bool motion_owner = retained_bindings_share_backend_owner(next_motion, representative);
+      const bool gripper_owner = next_gripper.has_value() && retained_bindings_share_backend_owner(
+                                                                 *next_gripper, representative);
       if (motion_owner == gripper_owner) {
         return route_publication_error<
             core::RuntimeRouteConfigurationReadbackDTO>(
@@ -2102,10 +2102,9 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
                           next_motion_aliases.size() +
                           next_gripper_aliases.size());
     for (const auto &representative : next_representatives) {
-      const bool motion_owner = same_backend_owner(next_motion, representative);
-      const bool gripper_owner =
-          next_gripper.has_value() &&
-          same_backend_owner(*next_gripper, representative);
+      const bool motion_owner = retained_bindings_share_backend_owner(next_motion, representative);
+      const bool gripper_owner = next_gripper.has_value() && retained_bindings_share_backend_owner(
+                                                                 *next_gripper, representative);
       if (motion_owner == gripper_owner) {
         return route_publication_error<
             core::RuntimeRouteConfigurationReadbackDTO>(

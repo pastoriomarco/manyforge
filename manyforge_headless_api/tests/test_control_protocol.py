@@ -64,11 +64,12 @@ def test_freshness_is_stateless_signed_and_expires_at_exact_backend_boundary() -
     context = _envelope(authority).freshness
 
     clock.advance(CONTROL_FRESHNESS_VALID_FOR_NS)
-    authority.validate(
+    deadline = authority.validate(
         context,
         current_owner_epoch="runner.1",
         current_control_revision=4,
     )
+    assert deadline == 1_000_000_000 + CONTROL_FRESHNESS_VALID_FOR_NS
     clock.advance(1)
     with pytest.raises(ControlProtocolError) as expired:
         authority.validate(
@@ -87,7 +88,9 @@ def test_freshness_profile_and_delta_shape_are_one_closed_contract() -> None:
             {**context, "valid_for_ns": CONTROL_FRESHNESS_VALID_FOR_NS - 1}
         )
 
-    fixture = json.loads((Path(__file__).parent / "fixtures/control-v2-local-delta.json").read_text())
+    fixture = json.loads(
+        (Path(__file__).parent / "fixtures/control-v2-local-delta.json").read_text()
+    )
     delta = fixture["local_delta"]
     parsed = ExecutionControlDeltaDTO.model_validate(delta)
     assert parsed.model_dump(mode="json") == delta
@@ -161,10 +164,13 @@ def test_sequence_is_lossless_and_rolls_only_at_a_quiescent_boundary() -> None:
         authority.rotate_quiescent(active_sessions=1, inflight_commands=0)
     assert busy.value.code == "control_sequence_rollover_busy"
     authority.rotate_quiescent(active_sessions=0, inflight_commands=0)
-    assert authority.issue(
-        semantic_owner_epoch="runner.1",
-        execution_control_revision=1,
-    ).issued_server_sequence == "1"
+    assert (
+        authority.issue(
+            semantic_owner_epoch="runner.1",
+            execution_control_revision=1,
+        ).issued_server_sequence
+        == "1"
+    )
 
 
 def test_virtual_time_beyond_thirty_years_creates_no_retained_history() -> None:

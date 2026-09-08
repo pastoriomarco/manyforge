@@ -243,7 +243,7 @@ hand-maintained ownership and end-to-end flow map.
 | Composer REST API       | [`docs/reference/REST_API.md`](docs/reference/REST_API.md)                                                                   | FastAPI app's `/openapi.json` (live at `:9000/openapi.json` when Composer is running)                               |
 | MCP runtime contract    | [`docs/reference/MCP_RUNTIME_CONTRACT.md`](docs/reference/MCP_RUNTIME_CONTRACT.md)                                           | Optional Composer MCP adapter and its mapped owner routes; no separate execution authority                          |
 | Assistant-provider HTTP | [`docs/reference/ASSISTANT_PROVIDER_CONTRACT.md`](docs/reference/ASSISTANT_PROVIDER_CONTRACT.md)                             | Historical at `082221...`; live bridge removed and unavailable; retained protocol/supervisor logic is porting input |
-| Viewer data plane       | [`docs/reference/HISTORICAL_COMPOSER_INTERACTION_REFERENCE.md`](docs/reference/HISTORICAL_COMPOSER_INTERACTION_REFERENCE.md) | Pinned historical implementation plus responsibility/test ledger; unavailable                                       |
+| Viewer data plane       | [`docs/reference/ARCHITECTURE.md`](docs/reference/ARCHITECTURE.md#scene-viewer-data-plane) | Current native observed-state stream; historical wire recipes are not its API |
 
 Regenerate the exact named surface (`structural-rest`, `headless-rest`, or
 `mcp`) from its owning application/registry. For example:
@@ -287,7 +287,7 @@ What lives where in this repo, and what it's for:
 | [`manyforge_core/`](manyforge_core/)                                     | C++20 core: planning DTOs, kernel state machine, ports                                                                                     |
 | [`manyforge_content_identity/`](manyforge_content_identity/)             | Shared ROS-free RFC 8785 serialization and domain-separated content-digest primitives                                                      |
 | [`manyforge_persistence/`](manyforge_persistence/)                       | Shared ROS-free mechanical durable-storage safety primitives; no semantic state ownership                                                  |
-| [`manyforge_scene/`](manyforge_scene/)                                   | ROS-free canonical-empty and bounded runtime-only Apply logical-scene owner; no live scene surface                                         |
+| [`manyforge_scene/`](manyforge_scene/)                                   | ROS-free logical-scene owner, revision-bound runtime transactions and carried-object facts; no planner or viewer authority |
 | [`manyforge_deployment/`](manyforge_deployment/)                         | Qualified ROS-free composable-cell compiler and immutable offline retained-product boundary                                                |
 | [`manyforge_component_manager/`](manyforge_component_manager/)           | ROS-free Apply/runtime-convergence owner hosted by the sole-process Manager daemon; current retained product composition also hosts the generic CCLC root |
 | [`manyforge_headless/`](manyforge_headless/)                             | C++ H0 runtime/scene aggregation, scene lifetime, alarm owner, historian, NodeEnvironment projection, and Manager daemon                   |
@@ -303,7 +303,7 @@ What lives where in this repo, and what it's for:
 | [`manyforge_composer/`](manyforge_composer/)                             | Structural FastAPI/React shell plus thin control, lifecycle/route, Stop/recovery, authoring, Program Run, scene, and assistant clients; no runtime authority |
 | [`manyforge_assistant_bridge/`](manyforge_assistant_bridge/)             | Strict bounded direct/`nemoclaw` provider mediation over owner facts and Draft callbacks; no runtime ownership                             |
 | [`manyforge_ros/`](manyforge_ros/)                                       | Retained pure mappings/contracts plus explicit unavailable runtime entry points                                                            |
-| [`agent-skills/manyforge-composer/`](agent-skills/manyforge-composer/)   | Non-activatable historical assistant interaction references                                                                                |
+| [`agent-skills/manyforge-composer/`](agent-skills/manyforge-composer/)   | Historical interaction inputs; maintained current runtime-agent guidance is in `scripts/templates/AGENTS.md` |
 | [`examples/`](examples/)                                                 | Reference `*.program.yaml` + `*.deployment.yaml`                                                                                           |
 | [`scripts/`](scripts/)                                                   | Operator scripts (`demo-assistant-known-good.sh`, `setup-docker.sh`, etc.)                                                                 |
 | [`docs/`](docs/)                                                         | Operator docs (`operations/`, `guides/`, `reference/`)                                                                                     |

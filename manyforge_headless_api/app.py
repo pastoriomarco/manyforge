@@ -40,7 +40,11 @@ from .execution_control import (
     ExecutionControlIngress,
 )
 from .manager import ManagerCommandClient
-from .history_query import HistorianQueryRequest, HistorianDiscoveryRequest, HistorianDebugRequest
+from .history_query import (
+    HistorianQueryRequest,
+    HistorianDiscoveryRequest,
+    HistorianDebugRequest,
+)
 from .models import (
     AcknowledgeAlarmRequest,
     AcknowledgeAllAlarmsRequest,
@@ -56,6 +60,8 @@ from .models import (
     AuthoringOwnerReconciliationRequest,
     ProgramApplyRequest,
     ProgramModelAttemptRequest,
+    ProgramDiagnosticRequest,
+    SkillExpansionRequest,
     ProgramRunStartRequest,
     ProgramRunStopRequest,
     ProgramSelectionStopRequest,
@@ -174,12 +180,9 @@ class RequestBodyLimitMiddleware:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-        maximum_bytes = self.path_maximum_bytes.get(
-            str(scope.get("path", "")), self.maximum_bytes
-        )
+        maximum_bytes = self.path_maximum_bytes.get(str(scope.get("path", "")), self.maximum_bytes)
         recognized_stop = (
-            scope.get("method") == "POST"
-            and scope.get("path") in self.recognized_stop_paths
+            scope.get("method") == "POST" and scope.get("path") in self.recognized_stop_paths
         )
 
         def mark_malformed(reason: str, *, close_connection: bool) -> None:
@@ -204,9 +207,7 @@ class RequestBodyLimitMiddleware:
                 if not recognized_stop:
                     await self._reject(scope, receive, send)
                     return
-                mark_malformed(
-                    "recognized_stop_body_oversized", close_connection=True
-                )
+                mark_malformed("recognized_stop_body_oversized", close_connection=True)
                 declared_oversized = True
 
         body = bytearray()
@@ -226,9 +227,7 @@ class RequestBodyLimitMiddleware:
                     if not recognized_stop:
                         await self._reject(scope, receive, send)
                         return
-                    mark_malformed(
-                        "recognized_stop_body_oversized", close_connection=True
-                    )
+                    mark_malformed("recognized_stop_body_oversized", close_connection=True)
                     body.clear()
                     body.extend(b"{}")
                     break
@@ -237,13 +236,9 @@ class RequestBodyLimitMiddleware:
 
         if recognized_stop and not declared_oversized and not disconnected:
             try:
-                strict_json_object(
-                    bytes(body).decode("utf-8"), label="recognized Stop request"
-                )
+                strict_json_object(bytes(body).decode("utf-8"), label="recognized Stop request")
             except (HeadlessApiError, UnicodeError):
-                mark_malformed(
-                    "recognized_stop_payload_invalid", close_connection=False
-                )
+                mark_malformed("recognized_stop_payload_invalid", close_connection=False)
                 body.clear()
                 body.extend(b"{}")
 
@@ -318,38 +313,37 @@ def _error_status(code: str) -> int:
         "operator_alarm_not_found",
     }:
         return 404
-    if "conflict" in code or "stale" in code or "fence" in code or code in {
-        "invalid_state_transition",
-        "object_already_exists",
-        "program_apply_deployment_not_active",
-        "scene_projection_transition_in_progress",
-        "program_run_admission_failed",
-        "program_run_already_active",
-        "authoring_not_ready",
-        "program_run_draft_applied_mismatch",
-        "deployment_candidate_compiler_busy",
-    }:
-        return 409
     if (
-        "unavailable" in code
-        or code in {
-            "headless_api_closed",
-            "kernel_owner_unavailable",
-            "operator_alarm_state_unavailable",
-            "program_applied_selection_not_active",
-            "program_runner_unavailable",
-            "program_run_scheduling_failed",
-            "request_ledger_full",
-            "scene_projection_commit_uncertain",
-            "execution_control_ingress_busy",
+        "conflict" in code
+        or "stale" in code
+        or "fence" in code
+        or code
+        in {
+            "invalid_state_transition",
+            "object_already_exists",
+            "program_apply_deployment_not_active",
+            "scene_projection_transition_in_progress",
+            "program_run_admission_failed",
+            "program_run_already_active",
+            "authoring_not_ready",
+            "program_run_draft_applied_mismatch",
+            "deployment_candidate_compiler_busy",
         }
     ):
+        return 409
+    if "unavailable" in code or code in {
+        "headless_api_closed",
+        "kernel_owner_unavailable",
+        "operator_alarm_state_unavailable",
+        "program_applied_selection_not_active",
+        "program_runner_unavailable",
+        "program_run_scheduling_failed",
+        "request_ledger_full",
+        "scene_projection_commit_uncertain",
+        "execution_control_ingress_busy",
+    }:
         return 503
-    if (
-        code == "invalid_request"
-        or code.endswith("_invalid")
-        or code.endswith("_rejected")
-    ):
+    if code == "invalid_request" or code.endswith("_invalid") or code.endswith("_rejected"):
         return 400
     if code in {
         "cclc_confirmation_required",
@@ -491,9 +485,7 @@ def create_app(
         cold_watch_paths=cold_watch_paths,
         cold_freshness_paths=cold_freshness_paths,
         cold_freshness_budget_ns=(
-            None
-            if config is None
-            else config.freshness_milliseconds * 1_000_000
+            None if config is None else config.freshness_milliseconds * 1_000_000
         ),
         incident_recorder=getattr(service, "record_client_incident", None),
     )
@@ -554,17 +546,11 @@ def create_app(
             control_revision = 1
         else:
             owner_epoch, control_revision = control_dispatch.owner_projection()
-        freshness = control_ingress.freshness_for(
-            owner_epoch, control_revision
-        )
-        correlation_id = (
-            request_context.correlation_id or request_context.request_id
-        )
+        freshness = control_ingress.freshness_for(owner_epoch, control_revision)
+        correlation_id = request_context.correlation_id or request_context.request_id
         command_payload = dict(payload)
         if requires_execution_owner_fence(command_kind):
-            command_payload["expected_execution_owner_epoch"] = (
-                request_context.request_owner_epoch
-            )
+            command_payload["expected_execution_owner_epoch"] = request_context.request_owner_epoch
         command = ExecutionCommandRequestDTO.model_validate(
             {
                 "command_envelope": {
@@ -581,9 +567,7 @@ def create_app(
                 "payload": command_payload,
             }
         )
-        attribution = _trusted_attribution(
-            transport_request, trusted_principal_adapter
-        )
+        attribution = _trusted_attribution(transport_request, trusted_principal_adapter)
         submission = await control_ingress.submit(
             command,
             transport_kind="rest",
@@ -592,8 +576,7 @@ def create_app(
         )
         control_state_source.notify_control()
         if submission.receipt.disposition == "rejected" and not (
-            isinstance(submission.result, dict)
-            and submission.result.get("ok") is False
+            isinstance(submission.result, dict) and submission.result.get("ok") is False
         ):
             raise HeadlessApiError(
                 submission.receipt.code,
@@ -629,22 +612,17 @@ def create_app(
         version="0.1.0",
         lifespan=lifespan,
     )
-    maximum_body = (
-        config.maximum_request_body_bytes if config is not None else 1024 * 1024
-    )
+    maximum_body = config.maximum_request_body_bytes if config is not None else 1024 * 1024
     app.add_middleware(
         RequestBodyLimitMiddleware,
         maximum_bytes=maximum_body,
         path_maximum_bytes={
             "/api/program/apply": MAX_PROGRAM_APPLY_REQUEST_BYTES,
-            "/api/manager/deployment-candidates/compile": (
-                MAX_DEPLOYMENT_CANDIDATE_REQUEST_BYTES
-            ),
+            "/api/manager/deployment-candidates/compile": (MAX_DEPLOYMENT_CANDIDATE_REQUEST_BYTES),
             "/api/program/model-attempts": MAX_PROGRAM_MODEL_ATTEMPT_BYTES,
+            "/api/program/diagnostics": 64 * 1024,
         },
-        recognized_stop_paths=frozenset(
-            {"/api/execution/stops", "/api/execution/full-stop"}
-        ),
+        recognized_stop_paths=frozenset({"/api/execution/stops", "/api/execution/full-stop"}),
     )
 
     @app.middleware("http")
@@ -704,8 +682,8 @@ def create_app(
                 "recognized_stop_malformed_reason",
                 "recognized_stop_payload_invalid",
             )
-            adapter_request_id = (
-                "malformed-stop." + getattr(request.state, "request_id", uuid.uuid4().hex[:16])
+            adapter_request_id = "malformed-stop." + getattr(
+                request.state, "request_id", uuid.uuid4().hex[:16]
             )
             attribution = _trusted_attribution(
                 request,
@@ -858,6 +836,14 @@ def create_app(
     def node_environment() -> dict[str, Any]:
         return service.node_environment()
 
+    @app.get("/api/skills")
+    def skills() -> dict[str, Any]:
+        return service.skills()
+
+    @app.post("/api/skills/expand")
+    def expand_skill(body: SkillExpansionRequest) -> dict[str, Any]:
+        return service.expand_skill(body)
+
     @app.get("/api/source-model")
     def source_model() -> dict[str, Any]:
         return service.source_model()
@@ -909,6 +895,14 @@ def create_app(
     ) -> dict[str, Any]:
         return service.program_model_attempt(request)
 
+    @app.post("/api/program/diagnostics")
+    def program_diagnostic(request: ProgramDiagnosticRequest) -> dict[str, Any]:
+        return service.core.record_program_diagnostic(request.model_dump(mode="json"))
+
+    @app.get("/api/program/diagnostics/health")
+    def program_diagnostic_health() -> dict[str, Any]:
+        return service.program_diagnostic_health()
+
     @app.get("/api/program/runs")
     def program_runs(
         active_only: bool = False,
@@ -932,9 +926,7 @@ def create_app(
     async def program_scene_prepare(
         request: ProgramScenePreparationRequest,
     ) -> dict[str, Any]:
-        return await json_control_call(
-            lambda: service.program_scene_prepare(request)
-        )
+        return await json_control_call(lambda: service.program_scene_prepare(request))
 
     @app.get("/api/program/runs/{program_run_id}")
     def program_run_read(
@@ -985,7 +977,10 @@ def create_app(
         request: Request,
     ) -> dict[str, Any]:
         if body.program_run_id != program_run_id:
-            raise HeadlessApiError("program_run_path_invalid", "Program-run identity in path and body must match")
+            raise HeadlessApiError(
+                "program_run_path_invalid",
+                "Program-run identity in path and body must match",
+            )
         return await rest_execution_command(
             command_kind="program_motion_resume",
             payload=body.model_dump(mode="json"),
@@ -1054,9 +1049,7 @@ def create_app(
     @app.get("/api/control/state")
     def execution_control_projection() -> dict[str, Any]:
         cycle = service.program_cycle_status()
-        return build_control_projection(cycle, control_ingress).model_dump(
-            mode="json"
-        )
+        return build_control_projection(cycle, control_ingress).model_dump(mode="json")
 
     @app.post("/api/control/commands")
     async def execution_control_command(
@@ -1213,9 +1206,7 @@ def create_app(
 
     def viewer_asset_response(asset: ViewerModelAsset) -> Response:
         cache_control = (
-            "public, max-age=31536000, immutable"
-            if asset.asset_kind == "resource"
-            else "no-store"
+            "public, max-age=31536000, immutable" if asset.asset_kind == "resource" else "no-store"
         )
         return Response(
             content=asset.bytes,
@@ -1231,14 +1222,10 @@ def create_app(
                 "X-ManyForge-Content-Digest": asset.content_digest,
                 "X-ManyForge-Graph-Revision": asset.graph_revision,
                 "X-ManyForge-Product-Contract-ID": asset.product_contract_id,
-                "X-ManyForge-Product-Contract-Revision": (
-                    asset.product_contract_revision
-                ),
+                "X-ManyForge-Product-Contract-Revision": (asset.product_contract_revision),
                 "X-ManyForge-Product-ID": asset.product_id,
                 "X-ManyForge-Retained-Bundle-ID": asset.retained_bundle_id,
-                "X-ManyForge-Viewer-Model-Revision": (
-                    asset.viewer_model_revision
-                ),
+                "X-ManyForge-Viewer-Model-Revision": (asset.viewer_model_revision),
             },
         )
 
@@ -1257,9 +1244,7 @@ def create_app(
             Query(min_length=1, max_length=4096),
         ],
     ) -> Response:
-        return viewer_asset_response(
-            service.viewer_model_resource(retained_bundle_id, logical_uri)
-        )
+        return viewer_asset_response(service.viewer_model_resource(retained_bundle_id, logical_uri))
 
     @app.get("/api/assistant/modes")
     def assistant_modes() -> dict[str, Any]:
@@ -1385,9 +1370,7 @@ def create_app(
             while True:
                 text = await websocket.receive_text()
                 if has_pending_credit or request_in_flight:
-                    raise ValueError(
-                        "only one execution observation credit may be outstanding"
-                    )
+                    raise ValueError("only one execution observation credit may be outstanding")
                 pending_cursor = _execution_observation_cursor(text)
                 has_pending_credit = True
                 credit_ready.set()
@@ -1551,9 +1534,7 @@ def create_app(
     def execution_pick_place_sequence(
         sequence_id: Annotated[str, Path(min_length=1, max_length=96)],
     ) -> JSONResponse:
-        return execution_response(
-            service.execution_pick_place_sequence(sequence_id)
-        )
+        return execution_response(service.execution_pick_place_sequence(sequence_id))
 
     def require_matching_operation(
         path_operation_id: str,
@@ -1613,9 +1594,7 @@ def create_app(
             )
         )
 
-    @app.post(
-        "/api/execution/operations/{operation_id}/acknowledge-completed"
-    )
+    @app.post("/api/execution/operations/{operation_id}/acknowledge-completed")
     async def execution_acknowledge_completed(
         operation_id: Annotated[str, Path(min_length=1, max_length=256)],
         body: OperationControlRequest,
@@ -1702,9 +1681,7 @@ def create_app(
             component_role_id=component_role_id,
             target_role_id=target_role_id,
         )
-        return execution_response(
-            service.execution_get_runtime_scale_control(selector)
-        )
+        return execution_response(service.execution_get_runtime_scale_control(selector))
 
     @app.get("/api/scene")
     def scene() -> dict[str, Any]:
@@ -1779,13 +1756,14 @@ def create_app(
     ) -> JSONResponse:
         # Encode this potentially large bounded page in the synchronous route
         # worker instead of blocking the shared ASGI event loop.
-        return JSONResponse(
-            content=service.history(query)
-        )
+        return JSONResponse(content=service.history(query))
 
     @app.get("/api/execution/history/export")
     def history_export(query: Annotated[HistorianQueryRequest, Query()]) -> JSONResponse:
-        return JSONResponse(content=service.history_export(query), headers={"Content-Disposition": 'attachment; filename="manyforge-events.json"'})
+        return JSONResponse(
+            content=service.history_export(query),
+            headers={"Content-Disposition": 'attachment; filename="manyforge-events.json"'},
+        )
 
     @app.get("/api/execution/history/discovery")
     def history_discovery(query: Annotated[HistorianDiscoveryRequest, Query()]) -> JSONResponse:
@@ -1793,11 +1771,17 @@ def create_app(
 
     @app.get("/api/debug/export")
     def debug_export(query: Annotated[HistorianDebugRequest, Query()]) -> JSONResponse:
-        return JSONResponse(content=service.debug_export(query.history_query()), headers={"Content-Disposition": 'attachment; filename="manyforge-debug.json"'})
+        return JSONResponse(
+            content=service.debug_export(query.history_query()),
+            headers={"Content-Disposition": 'attachment; filename="manyforge-debug.json"'},
+        )
 
     @app.get("/api/debug/export/ros2-medkit")
     def normalized_trace_export(query: Annotated[HistorianDebugRequest, Query()]) -> JSONResponse:
-        return JSONResponse(content=service.debug_export(query.history_query())["normalized_trace"], headers={"Content-Disposition": 'attachment; filename="manyforge-trace.json"'})
+        return JSONResponse(
+            content=service.debug_export(query.history_query())["normalized_trace"],
+            headers={"Content-Disposition": 'attachment; filename="manyforge-trace.json"'},
+        )
 
     @app.get("/api/execution/history/health")
     def historian_health() -> dict[str, Any]:

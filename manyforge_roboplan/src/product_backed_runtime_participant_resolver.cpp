@@ -542,31 +542,44 @@ ProductBackedRuntimeParticipantResolver::ResolveObservationTarget(
   using Target = ResolvedTargetObservation;
   try {
     if (capability_id.value() != "model.kinematics.fk" &&
-        capability_id.value() != "tool.gripper.feedback") {
+        capability_id.value() != "tool.gripper.feedback" &&
+        capability_id.value() != "tool.gripper.confirmation.operator") {
       throw std::invalid_argument("unsupported observation capability");
     }
-    const auto binding = bindings_.get_verified(
-        program_binding_id, *retained_bundle_, retained_model_map_);
-    if (binding == nullptr) {
-      throw std::invalid_argument("no exact retained Program Binding");
-    }
-    const auto program = programs_.get_verified(
-        binding->value().program_id, binding->value().program_revision,
-        *retained_bundle_);
-    if (program == nullptr || program->value().node_environment !=
-                                  binding->value().node_environment) {
-      throw std::invalid_argument("no exact canonical Program");
-    }
-    auto target = deployment::resolve_runtime_program_target(
-        *binding, target_role_id, capability_id, *retained_bundle_,
-        retained_model_map_);
     const bool frame_query = capability_id.value() == "model.kinematics.fk";
-    const auto read_target =
-        frame_query ? deployment::resolve_runtime_program_target(
-                          *binding, target_role_id,
-                          core::CapabilityId("state.observed.current"),
-                          *retained_bundle_, retained_model_map_)
-                    : target;
+    auto selection = observation_selection_.load();
+    if (!selection || selection->target.program_binding_id() != program_binding_id ||
+        selection->target.target_role().target_role_id != target_role_id ||
+        selection->target.capability().capability_id != capability_id) {
+      auto binding = selection && selection->binding->program_binding_id() == program_binding_id
+                         ? selection->binding
+                         : nullptr;
+      if (!binding) {
+        binding =
+            bindings_.get_verified(program_binding_id, *retained_bundle_, retained_model_map_);
+        if (!binding) {
+          throw std::invalid_argument("no exact retained Program Binding");
+        }
+        const auto program = programs_.get_verified(
+            binding->value().program_id, binding->value().program_revision, *retained_bundle_);
+        if (!program || program->value().node_environment != binding->value().node_environment) {
+          throw std::invalid_argument("no exact canonical Program");
+        }
+      }
+      auto target = deployment::resolve_runtime_program_target(
+          *binding, target_role_id, capability_id, *retained_bundle_, retained_model_map_);
+      auto state_target =
+          frame_query ? std::optional{deployment::resolve_runtime_program_target(
+                            *binding, target_role_id, core::CapabilityId("state.observed.current"),
+                            *retained_bundle_, retained_model_map_)}
+                      : std::nullopt;
+      selection = std::make_shared<const ObservationSelection>(
+          std::move(binding), std::move(target), std::move(state_target));
+      observation_selection_.store(selection);
+    }
+    const auto& target = selection->target;
+    const auto& read_target =
+        selection->frame_state_target ? *selection->frame_state_target : target;
     if (!read_target.control_binding())
       throw std::invalid_argument("observation has no exact ControlBinding");
     const auto &selected = *read_target.control_binding();
@@ -634,7 +647,7 @@ ProductBackedRuntimeParticipantResolver::ResolveObservationTarget(
         throw std::invalid_argument(
             "selected FK provider has no current native realization");
     }
-    return core::Result<Target>::Ok({std::move(target), *representative});
+    return core::Result<Target>::Ok({target, *representative});
   } catch (const std::exception &exception) {
     return core::Result<Target>::Err(core::ErrorDTO{
         "execution_target_binding_unavailable", exception.what(), {}});

@@ -112,14 +112,12 @@ materialize_lite6_stop_capable_native_motion_retained_consumer_fixture(
 
 [[nodiscard]] inline DurableLite6RetainedConsumerFixture
 materialize_lite6_native_cclc_product_retained_consumer_fixture(
-    const std::filesystem::path &package_root,
-    std::string_view arm_lifecycle_semantic_digest,
-    std::string_view gripper_lifecycle_semantic_digest) {
+    const std::filesystem::path& package_root, std::string_view arm_lifecycle_semantic_digest,
+    std::string_view gripper_lifecycle_semantic_digest, bool operator_confirmation = false) {
   return materialize_lite6_retained_consumer_fixture_from(
       package_root,
       make_lite6_native_cclc_product_retention_fixture(
-          arm_lifecycle_semantic_digest,
-          gripper_lifecycle_semantic_digest));
+          arm_lifecycle_semantic_digest, gripper_lifecycle_semantic_digest, operator_confirmation));
 }
 
 }  // namespace manyforge::deployment::test

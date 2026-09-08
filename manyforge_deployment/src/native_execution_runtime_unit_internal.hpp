@@ -32,10 +32,9 @@ inline constexpr std::string_view kNativeExecutionRuntimeProfileId =
     native_execution_runtime_contract::kRuntimeProfileId;
 inline constexpr std::string_view kNativeExecutionRuntimeConfigurationSchemaId =
     "manyforge.value_schema.runtime.native_execution.v1";
-inline constexpr std::string_view
-    kNativeExecutionRuntimeConfigurationSchemaRevision =
-        "sha256:"
-        "4be97ca6314af96d083a37a6aed9ef5976ed0e63c02d69ac790377edeb6804fb";
+inline constexpr std::string_view kNativeExecutionRuntimeConfigurationSchemaRevision =
+    "sha256:"
+    "4405892649681799b9a813fafee4b5d23579d080b5457bf60f51ce2e296fcff8";
 inline constexpr std::string_view kNativeExecutionRuntimeRoleId =
     native_execution_runtime_contract::kRuntimeRoleId;
 inline constexpr std::string_view kNativeExecutionRuntimeStatusEndpointRoleId =

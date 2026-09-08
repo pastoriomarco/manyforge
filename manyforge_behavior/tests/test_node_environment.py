@@ -33,12 +33,14 @@ def test_retained_environment_manifest_is_fresh_and_build_owned() -> None:
     assert retained.environment_digest.startswith("sha256:")
     assert retained.catalog_digest == environment.catalog.catalog_digest
     assert retained.executable_registry == environment.registry.rows
-    assert len(retained.executable_registry) == 50
-    assert len(retained.executable_packages) == 1
+    assert len(retained.executable_registry) == 52
+    assert len(retained.executable_packages) == 2
     assert retained.source_coverage
     assert any(
-        row.source_id == "python-project:manyforge_behavior"
-        for row in retained.source_coverage
+        row.source_id == "python-project:manyforge_behavior" for row in retained.source_coverage
+    )
+    assert any(
+        row.source_id == "skill-artifact:move_to_named_config" for row in retained.source_coverage
     )
 
 
@@ -94,9 +96,9 @@ def test_manifest_rejects_unknown_root_and_row_members() -> None:
 def test_manifest_accepts_shared_implementation_id_for_distinct_nodes() -> None:
     raw = node_environment.load_strict_json_yaml(BUILTIN_ENVIRONMENT_MANIFEST_PATH)
     forged = copy.deepcopy(raw)
-    forged["executable_registry"][1]["implementation_id"] = forged[
-        "executable_registry"
-    ][0]["implementation_id"]
+    forged["executable_registry"][1]["implementation_id"] = forged["executable_registry"][0][
+        "implementation_id"
+    ]
     forged["environment_digest"] = "sha256:" + ("0" * 64)
     forged["environment_digest"] = node_environment.compute_content_identity(
         forged,
@@ -115,9 +117,7 @@ def test_manifest_accepts_shared_implementation_id_for_distinct_nodes() -> None:
 def test_manifest_rejects_noncanonical_and_duplicate_registry_rows() -> None:
     raw = node_environment.load_strict_json_yaml(BUILTIN_ENVIRONMENT_MANIFEST_PATH)
     noncanonical = copy.deepcopy(raw)
-    noncanonical["executable_registry"][0:2] = reversed(
-        noncanonical["executable_registry"][0:2]
-    )
+    noncanonical["executable_registry"][0:2] = reversed(noncanonical["executable_registry"][0:2])
     noncanonical["environment_digest"] = "sha256:" + ("0" * 64)
     noncanonical["environment_digest"] = node_environment.compute_content_identity(
         noncanonical,
@@ -146,19 +146,12 @@ def test_manifest_rejects_noncanonical_and_duplicate_registry_rows() -> None:
 
 def test_registry_and_package_joins_are_exact_and_total() -> None:
     manifest = generate_builtin_node_environment_manifest()
-    package_ids = {
-        package.executable_package_id for package in manifest.executable_packages
-    }
+    package_ids = {package.executable_package_id for package in manifest.executable_packages}
 
+    assert {row.executable_package_id for row in manifest.executable_registry} == package_ids
+    assert {row.executable_package_id for row in manifest.source_coverage} == package_ids
     assert {
-        row.executable_package_id for row in manifest.executable_registry
-    } == package_ids
-    assert {
-        row.executable_package_id for row in manifest.source_coverage
-    } == package_ids
-    assert {
-        (row.node_id, row.engine_id, row.implementation_id)
-        for row in manifest.executable_registry
+        (row.node_id, row.engine_id, row.implementation_id) for row in manifest.executable_registry
     } == {
         (entry.id, engine_id, implementation_id)
         for entry in build_node_environment().catalog.entries
@@ -195,18 +188,27 @@ def test_environment_digest_changes_when_covered_source_changes(
 
 def test_source_package_version_comes_from_project_metadata() -> None:
     assert (
-        generate_builtin_node_environment_manifest()
-        .executable_packages[0]
-        .package_version
+        generate_builtin_node_environment_manifest().executable_packages[0].package_version
         == "0.1.0"
     )
 
 
+def test_skill_artifact_tamper_invalidates_the_selected_source_package(
+    tmp_path, monkeypatch
+) -> None:
+    import shutil
+
+    skills = tmp_path / "skills"
+    shutil.copytree(node_environment.BUILTIN_SKILLS_PATH, skills)
+    artifact = skills / "move_to_named_config.skill.yaml"
+    artifact.write_bytes(artifact.read_bytes() + b"\n# Changed build input\n")
+    monkeypatch.setattr(node_environment, "BUILTIN_SKILLS_PATH", skills)
+    with pytest.raises(NodeEnvironmentBuildError, match="manifest is stale"):
+        build_node_environment()
+
+
 def test_packaged_project_snapshot_is_exact_build_evidence() -> None:
-    assert (
-        PACKAGED_PROJECT_SNAPSHOT_PATH.read_bytes()
-        == AUTHORITATIVE_PROJECT_PATH.read_bytes()
-    )
+    assert PACKAGED_PROJECT_SNAPSHOT_PATH.read_bytes() == AUTHORITATIVE_PROJECT_PATH.read_bytes()
 
 
 def test_manifest_rejects_c1_control_characters() -> None:

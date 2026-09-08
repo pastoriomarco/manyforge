@@ -1,110 +1,139 @@
-# ManyForge composable-cell node catalog.
-#
-# Schema: docs/spec/440-node-catalog-format-and-versioning.md
-# Semantics: docs/spec/410-node-catalog-and-orchestration-adapters.md
-# Capability registry: docs/spec/240-supported-backend-capability-profile.md
-# This is the complete built-in catalog contract for the atomic v2 cutover.
-
+# Generated extension composition; edit extension entries in their package descriptor.
 api_version: manyforge.node_catalog.v2
-content_version: 2.0.0
+content_version: 2.1.0
 catalog_id: manyforge_builtin
-catalog_digest: sha256:5fce54890158a72df20063dac31531ede96dbf27b01be3a8256099c7e0ba1bb4
-
+catalog_digest: sha256:7c16314aeddbdea7942cdab09aa0e2da6c913e2044adcf5c3d99111c6b280ffd
 schema_types:
   coordinate_position:
     type: object
     additional_properties: false
-    required: [kind]
+    required:
+    - kind
     properties:
       kind:
         type: enum
-        values: [angular_rad, linear_m]
+        values:
+        - angular_rad
+        - linear_m
       value_rad:
         type: float
-        required_when: {kind: angular_rad}
-        allowed_when: {kind: angular_rad}
+        required_when:
+          kind: angular_rad
+        allowed_when:
+          kind: angular_rad
       value_m:
         type: float
-        required_when: {kind: linear_m}
-        allowed_when: {kind: linear_m}
-
+        required_when:
+          kind: linear_m
+        allowed_when:
+          kind: linear_m
   coordinate_effort_limit:
     type: object
     additional_properties: false
-    required: [kind]
+    required:
+    - kind
     properties:
       kind:
         type: enum
-        values: [angular_newton_meter, linear_newton]
+        values:
+        - angular_newton_meter
+        - linear_newton
       value_nm:
         type: float
-        constraints: {min_inclusive: 0.0}
-        required_when: {kind: angular_newton_meter}
-        allowed_when: {kind: angular_newton_meter}
+        constraints:
+          min_inclusive: 0.0
+        required_when:
+          kind: angular_newton_meter
+        allowed_when:
+          kind: angular_newton_meter
       value_n:
         type: float
-        constraints: {min_inclusive: 0.0}
-        required_when: {kind: linear_newton}
-        allowed_when: {kind: linear_newton}
-
+        constraints:
+          min_inclusive: 0.0
+        required_when:
+          kind: linear_newton
+        allowed_when:
+          kind: linear_newton
   orientation_reference:
     type: object
     additional_properties: false
-    required: [source]
+    required:
+    - source
     properties:
       source:
         type: enum
-        values: [current_pose, scene_resource, target_frame]
+        values:
+        - current_pose
+        - scene_resource
+        - target_frame
       scene_resource_id:
         type: string
         semantic_type: scene_resource
-        required_when: {source: scene_resource}
-        allowed_when: {source: scene_resource}
+        required_when:
+          source: scene_resource
+        allowed_when:
+          source: scene_resource
       target_role:
         type: string
         semantic_type: target_role
-        required_when: {source: target_frame}
-        allowed_when: {source: target_frame}
+        required_when:
+          source: target_frame
+        allowed_when:
+          source: target_frame
       frame_role:
         type: string
         semantic_type: frame_role
-        required_when: {source: target_frame}
-        allowed_when: {source: target_frame}
-
+        required_when:
+          source: target_frame
+        allowed_when:
+          source: target_frame
   pose_frame_ref:
     type: object
     additional_properties: false
-    required: [kind]
+    required:
+    - kind
     properties:
       kind:
         type: enum
-        values: [cell_frame, target_frame, scene_resource]
+        values:
+        - cell_frame
+        - target_frame
+        - scene_resource
       target_role:
         type: string
         semantic_type: target_role
-        required_when: {kind: target_frame}
-        allowed_when: {kind: target_frame}
+        required_when:
+          kind: target_frame
+        allowed_when:
+          kind: target_frame
       frame_role:
         type: string
         semantic_type: frame_role
-        required_when: {kind: target_frame}
-        allowed_when: {kind: target_frame}
+        required_when:
+          kind: target_frame
+        allowed_when:
+          kind: target_frame
       scene_resource_id:
         type: string
         semantic_type: scene_resource
-        required_when: {kind: scene_resource}
-        allowed_when: {kind: scene_resource}
-
+        required_when:
+          kind: scene_resource
+        allowed_when:
+          kind: scene_resource
   stored_pose:
     type: object
     additional_properties: false
-    required: [frame_ref, position_m, orientation]
+    required:
+    - frame_ref
+    - position_m
+    - orientation
     properties:
       frame_ref:
-        schema_ref: "#/schema_types/pose_frame_ref"
+        schema_ref: '#/schema_types/pose_frame_ref'
       position_m:
         type: array
-        items: {type: float}
+        items:
+          type: float
         length: 3
       orientation:
         type: object
@@ -112,25 +141,30 @@ schema_types:
         properties:
           xyzw:
             type: array
-            items: {type: float}
+            items:
+              type: float
             length: 4
           rpy_deg:
             type: array
-            items: {type: float}
+            items:
+              type: float
             length: 3
         exactly_one:
-          - [xyzw, rpy_deg]
-
+        - - xyzw
+          - rpy_deg
   motion_pose:
     type: object
     additional_properties: false
-    required: [position_m, orientation]
+    required:
+    - position_m
+    - orientation
     properties:
       frame_ref:
-        schema_ref: "#/schema_types/pose_frame_ref"
+        schema_ref: '#/schema_types/pose_frame_ref'
       position_m:
         type: array
-        items: {type: float}
+        items:
+          type: float
         length: 3
       orientation:
         type: object
@@ -138,58 +172,78 @@ schema_types:
         properties:
           xyzw:
             type: array
-            items: {type: float}
+            items:
+              type: float
             length: 4
           rpy_deg:
             type: array
-            items: {type: float}
+            items:
+              type: float
             length: 3
         exactly_one:
-          - [xyzw, rpy_deg]
-
+        - - xyzw
+          - rpy_deg
   motion_reference:
     type: object
     additional_properties: false
-    required: [type]
+    required:
+    - type
     properties:
       type:
         type: enum
-        values: [frame_role, component_body_role, scene_resource, runtime_object, pose]
+        values:
+        - frame_role
+        - component_body_role
+        - scene_resource
+        - runtime_object
+        - pose
       frame_role_id:
         type: string
         semantic_type: frame_role
-        required_when: {type: frame_role}
-        allowed_when: {type: frame_role}
+        required_when:
+          type: frame_role
+        allowed_when:
+          type: frame_role
       collision_body_role_id:
         type: string
         semantic_type: collision_body_role
-        required_when: {type: component_body_role}
-        allowed_when: {type: component_body_role}
+        required_when:
+          type: component_body_role
+        allowed_when:
+          type: component_body_role
       scene_resource_id:
         type: string
         semantic_type: scene_resource
-        required_when: {type: scene_resource}
-        allowed_when: {type: scene_resource}
+        required_when:
+          type: scene_resource
+        allowed_when:
+          type: scene_resource
       runtime_object_id:
         type: string
-        required_when: {type: runtime_object}
-        allowed_when: {type: runtime_object}
+        required_when:
+          type: runtime_object
+        allowed_when:
+          type: runtime_object
       pose:
-        schema_ref: "#/schema_types/motion_pose"
-        required_when: {type: pose}
-        allowed_when: {type: pose}
-
+        schema_ref: '#/schema_types/motion_pose'
+        required_when:
+          type: pose
+        allowed_when:
+          type: pose
   pose_authoring_input:
     type: object
     additional_properties: false
-    required: [frame_ref, position_m]
-    resolves_to: "#/schema_types/stored_pose"
+    required:
+    - frame_ref
+    - position_m
+    resolves_to: '#/schema_types/stored_pose'
     properties:
       frame_ref:
-        schema_ref: "#/schema_types/pose_frame_ref"
+        schema_ref: '#/schema_types/pose_frame_ref'
       position_m:
         type: array
-        items: {type: float}
+        items:
+          type: float
         length: 3
       orientation:
         type: object
@@ -197,2596 +251,3710 @@ schema_types:
         properties:
           xyzw:
             type: array
-            items: {type: float}
+            items:
+              type: float
             length: 4
           rpy_deg:
             type: array
-            items: {type: float}
+            items:
+              type: float
             length: 3
         exactly_one:
-          - [xyzw, rpy_deg]
+        - - xyzw
+          - rpy_deg
       rotate_local_rpy_deg:
         type: array
-        items: {type: float}
+        items:
+          type: float
         length: 3
         requires_current_value: true
       rotate_world_rpy_deg:
         type: array
-        items: {type: float}
+        items:
+          type: float
         length: 3
         requires_current_value: true
       rpy_delta_deg:
         type: array
-        items: {type: float}
+        items:
+          type: float
         length: 3
         requires_current_value: true
         description: Component-wise authored RPY field addition, not physical composition.
       orientation_from:
-        schema_ref: "#/schema_types/orientation_reference"
+        schema_ref: '#/schema_types/orientation_reference'
     exactly_one:
-      - [orientation, rotate_local_rpy_deg, rotate_world_rpy_deg,
-         rpy_delta_deg, orientation_from]
-
+    - - orientation
+      - rotate_local_rpy_deg
+      - rotate_world_rpy_deg
+      - rpy_delta_deg
+      - orientation_from
   joint_target:
     type: object
     additional_properties: false
-    required: [joint_name, position_rad]
+    required:
+    - joint_name
+    - position_rad
     properties:
       joint_name:
         type: string
         semantic_type: source_joint
-      position_rad: {type: float}
-
+      position_rad:
+        type: float
   joint_target_list:
     type: array
     min_items: 1
     max_items: 256
     items:
-      schema_ref: "#/schema_types/joint_target"
-
+      schema_ref: '#/schema_types/joint_target'
   joint_dynamics_limit:
     type: object
     additional_properties: false
     properties:
       max_velocity_rad_s:
         type: float
-        constraints: {min_exclusive: 0.0}
+        constraints:
+          min_exclusive: 0.0
       max_acceleration_rad_s2:
         type: float
-        constraints: {min_exclusive: 0.0}
+        constraints:
+          min_exclusive: 0.0
       max_jerk_rad_s3:
         type: float
-        constraints: {min_exclusive: 0.0}
-
+        constraints:
+          min_exclusive: 0.0
   per_joint_dynamics_limits:
     type: object
     additional_properties:
-      schema_ref: "#/schema_types/joint_dynamics_limit"
-
+      schema_ref: '#/schema_types/joint_dynamics_limit'
   cartesian_path:
     type: array
     min_items: 2
     max_items: 4096
     items:
-      schema_ref: "#/schema_types/motion_pose"
-
+      schema_ref: '#/schema_types/motion_pose'
   pose_offset_envelope:
     type: object
     additional_properties: false
-    required: [position_min_m, position_max_m, orientation_rpy_min_deg, orientation_rpy_max_deg]
+    required:
+    - position_min_m
+    - position_max_m
+    - orientation_rpy_min_deg
+    - orientation_rpy_max_deg
     properties:
-      position_min_m: {type: array, items: {type: float}, length: 3}
-      position_max_m: {type: array, items: {type: float}, length: 3}
-      orientation_rpy_min_deg: {type: array, items: {type: float}, length: 3}
-      orientation_rpy_max_deg: {type: array, items: {type: float}, length: 3}
-
+      position_min_m:
+        type: array
+        items:
+          type: float
+        length: 3
+      position_max_m:
+        type: array
+        items:
+          type: float
+        length: 3
+      orientation_rpy_min_deg:
+        type: array
+        items:
+          type: float
+        length: 3
+      orientation_rpy_max_deg:
+        type: array
+        items:
+          type: float
+        length: 3
   value_source:
     type: object
     additional_properties: false
-    required: [kind, reference]
+    required:
+    - kind
+    - reference
     properties:
       kind:
         type: enum
-        values: [program_parameter, blackboard_key, blackboard_field]
+        values:
+        - program_parameter
+        - blackboard_key
+        - blackboard_field
       reference:
         type: string
       field:
         type: string
-        required_when: {kind: blackboard_field}
-        allowed_when: {kind: blackboard_field}
-
+        required_when:
+          kind: blackboard_field
+        allowed_when:
+          kind: blackboard_field
   template_variable_binding:
     type: object
     additional_properties: false
-    required: [variable_id, source]
+    required:
+    - variable_id
+    - source
     properties:
-      variable_id: {type: string}
+      variable_id:
+        type: string
       source:
-        schema_ref: "#/schema_types/value_source"
-
+        schema_ref: '#/schema_types/value_source'
   template_variable_bindings:
     type: array
     max_items: 256
     items:
-      schema_ref: "#/schema_types/template_variable_binding"
-
+      schema_ref: '#/schema_types/template_variable_binding'
   pick_synthesis:
     type: object
     additional_properties: false
-    required: [pick_offset_envelope, approach_offset_envelope]
+    required:
+    - pick_offset_envelope
+    - approach_offset_envelope
     properties:
       pick_offset_envelope:
-        schema_ref: "#/schema_types/pose_offset_envelope"
+        schema_ref: '#/schema_types/pose_offset_envelope'
       approach_offset_envelope:
-        schema_ref: "#/schema_types/pose_offset_envelope"
+        schema_ref: '#/schema_types/pose_offset_envelope'
       pick_offset_reference:
-        schema_ref: "#/schema_types/motion_reference"
+        schema_ref: '#/schema_types/motion_reference'
       approach_offset_reference:
-        schema_ref: "#/schema_types/motion_reference"
+        schema_ref: '#/schema_types/motion_reference'
       base_tool_orientation_rpy_deg:
         type: array
-        items: {type: float}
+        items:
+          type: float
         length: 3
       translation_step_m:
         type: float
-        constraints: {min_exclusive: 0.0}
+        constraints:
+          min_exclusive: 0.0
       rotation_step_deg:
         type: float
-        constraints: {min_exclusive: 0.0}
-      force_vertical_pick: {type: bool}
+        constraints:
+          min_exclusive: 0.0
+      force_vertical_pick:
+        type: bool
       min_tcp_z_m:
         type: float
-        constraints: {min_inclusive: 0.0}
+        constraints:
+          min_inclusive: 0.0
       maximum_candidate_count:
         type: int
-        constraints: {min_inclusive: 1, max_inclusive: 4096}
+        constraints:
+          min_inclusive: 1
+          max_inclusive: 4096
       search_strategy:
         type: enum
-        values: [first_feasible, best_cost]
-
+        values:
+        - first_feasible
+        - best_cost
   pick_motion_options:
     type: object
     additional_properties: false
     properties:
       approach_velocity_scale:
         type: float
-        constraints: {min_exclusive: 0.0, max_inclusive: 1.0}
+        constraints:
+          min_exclusive: 0.0
+          max_inclusive: 1.0
       descend_velocity_scale:
         type: float
-        constraints: {min_exclusive: 0.0, max_inclusive: 1.0}
+        constraints:
+          min_exclusive: 0.0
+          max_inclusive: 1.0
       retreat_velocity_scale:
         type: float
-        constraints: {min_exclusive: 0.0, max_inclusive: 1.0}
+        constraints:
+          min_exclusive: 0.0
+          max_inclusive: 1.0
       acceleration_scale:
         type: float
-        constraints: {min_exclusive: 0.0, max_inclusive: 1.0}
+        constraints:
+          min_exclusive: 0.0
+          max_inclusive: 1.0
       max_tcp_linear_speed_mps:
         type: float
-        constraints: {min_exclusive: 0.0}
+        constraints:
+          min_exclusive: 0.0
       joint_position_tol_rad:
         type: float
-        constraints: {min_inclusive: 0.0}
+        constraints:
+          min_inclusive: 0.0
       translation_tol_m:
         type: float
-        constraints: {min_inclusive: 0.0}
+        constraints:
+          min_inclusive: 0.0
       rotation_tol_rad:
         type: float
-        constraints: {min_inclusive: 0.0}
+        constraints:
+          min_inclusive: 0.0
       planning_timeout_s:
         type: float
-        constraints: {min_exclusive: 0.0}
+        constraints:
+          min_exclusive: 0.0
       execution_timeout_s:
         type: float
-        constraints: {min_exclusive: 0.0}
+        constraints:
+          min_exclusive: 0.0
       cache_mode:
         type: enum
-        values: [default, disable]
-
+        values:
+        - default
+        - disable
   shape:
     type: object
     additional_properties: false
-    required: [type]
+    required:
+    - type
     properties:
       type:
         type: enum
-        values: [box, sphere, cylinder, mesh]
+        values:
+        - box
+        - sphere
+        - cylinder
+        - mesh
       box_dimensions_m:
         type: array
         items:
           type: float
-          constraints: {min_exclusive: 0.0}
+          constraints:
+            min_exclusive: 0.0
         length: 3
-        required_when: {type: box}
-        allowed_when: {type: box}
+        required_when:
+          type: box
+        allowed_when:
+          type: box
       sphere_radius_m:
         type: float
-        constraints: {min_exclusive: 0.0}
-        required_when: {type: sphere}
-        allowed_when: {type: sphere}
+        constraints:
+          min_exclusive: 0.0
+        required_when:
+          type: sphere
+        allowed_when:
+          type: sphere
       cylinder_radius_m:
         type: float
-        constraints: {min_exclusive: 0.0}
-        required_when: {type: cylinder}
-        allowed_when: {type: cylinder}
+        constraints:
+          min_exclusive: 0.0
+        required_when:
+          type: cylinder
+        allowed_when:
+          type: cylinder
       cylinder_height_m:
         type: float
-        constraints: {min_exclusive: 0.0}
-        required_when: {type: cylinder}
-        allowed_when: {type: cylinder}
+        constraints:
+          min_exclusive: 0.0
+        required_when:
+          type: cylinder
+        allowed_when:
+          type: cylinder
       mesh_resource_uri:
         type: string
-        required_when: {type: mesh}
-        allowed_when: {type: mesh}
+        required_when:
+          type: mesh
+        allowed_when:
+          type: mesh
       mesh_scale:
         type: array
         items:
           type: float
-          constraints: {min_exclusive: 0.0}
+          constraints:
+            min_exclusive: 0.0
         length: 3
-        allowed_when: {type: mesh}
-
+        allowed_when:
+          type: mesh
 entries:
-  - id: sequence
-    name: Sequence
-    category: control_flow
-    description: Tick children in order until one fails or all succeed.
-    stability: stable
-    tags: [control_flow, composite]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: composite
-    children: {min: 1, max: 4096}
-    parameters: []
-    required_capabilities: []
-    execution:
-      blocking: false
-      cancellable: false
-      owner_api: orchestration.control_flow
-    runners:
-      py_trees: {implementation_id: sequence_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: fallback
-    name: Fallback
-    category: control_flow
-    description: Tick children in order until one succeeds or all fail.
-    stability: stable
-    tags: [control_flow, composite]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: composite
-    children: {min: 1, max: 4096}
-    parameters: []
-    required_capabilities: []
-    execution:
-      blocking: false
-      cancellable: false
-      owner_api: orchestration.control_flow
-    runners:
-      py_trees: {implementation_id: fallback_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: parallel
-    name: Parallel
-    category: control_flow
-    description: Tick children concurrently under one explicit success policy.
-    stability: stable
-    tags: [control_flow, composite]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: composite
-    children: {min: 1, max: 4096}
-    parameters:
-      - id: success_policy
-        required: false
-        default: all
-        schema: {type: enum, values: [all, one]}
-    required_capabilities: []
-    execution:
-      blocking: false
-      cancellable: false
-      owner_api: orchestration.control_flow
-    runners:
-      py_trees: {implementation_id: parallel_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: inverter
-    name: Inverter
-    category: control_flow
-    description: Invert a child success or failure result.
-    stability: stable
-    tags: [control_flow, decorator]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: decorator
-    children: {min: 1, max: 1}
-    parameters: []
-    required_capabilities: []
-    execution:
-      blocking: false
-      cancellable: false
-      owner_api: orchestration.control_flow
-    runners:
-      py_trees: {implementation_id: inverter_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: repeat
-    name: Repeat
-    category: control_flow
-    description: Repeat one child a finite number of times or indefinitely (-1).
-    stability: stable
-    tags: [control_flow, decorator]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: decorator
-    children: {min: 1, max: 1}
-    parameters:
-      - id: num_cycles
-        required: false
-        default: -1
-        schema:
-          type: int
-          constraints: {min_inclusive: -1, max_inclusive: 1000000, not_equal: 0}
-    required_capabilities: []
-    execution:
-      blocking: false
-      cancellable: true
-      owner_api: orchestration.control_flow
-    runners:
-      py_trees: {implementation_id: repeat_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: retry
-    name: Retry
-    category: control_flow
-    description: Retry one child a finite number of attempts or indefinitely (-1).
-    stability: stable
-    tags: [control_flow, decorator]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: decorator
-    children: {min: 1, max: 1}
-    parameters:
-      - id: num_attempts
-        required: false
-        default: -1
-        schema:
-          type: int
-          constraints: {min_inclusive: -1, max_inclusive: 1000000, not_equal: 0}
-    required_capabilities: []
-    execution:
-      blocking: false
-      cancellable: true
-      owner_api: orchestration.control_flow
-    runners:
-      py_trees: {implementation_id: retry_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: timer
-    name: Timer
-    category: control_flow
-    description: Wait for a bounded duration using the orchestration clock.
-    stability: stable
-    tags: [control_flow, timing]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters:
-      - id: duration_s
-        required: true
-        schema:
-          type: float
-          constraints: {min_exclusive: 0.0, max_inclusive: 86400.0}
-    required_capabilities: []
-    execution:
-      blocking: true
-      cancellable: true
-      owner_api: orchestration.clock
-    outcomes:
-      success: elapsed
-      failure: timer_failed
-      interrupted: cancelled
-    runners:
-      py_trees: {implementation_id: timer_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: motion.move_to_joint_target
-    name: Move to joint target
-    category: motion
-    description: Plan, validate, and execute a target-scoped source-joint goal.
-    stability: stable
-    tags: [motion, planning, execution]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters:
-      - id: target_role
-        required: true
-        schema: {type: string, semantic_type: target_role}
-      - id: base_frame_role
-        required: true
-        schema: {type: string, semantic_type: frame_role}
-      - id: tcp_frame_role
-        required: true
-        schema: {type: string, semantic_type: frame_role}
-      - id: goal
-        required: true
-        schema_ref: "#/schema_types/joint_target_list"
-      - id: target_mode
-        required: false
-        default: absolute
-        schema: {type: enum, values: [absolute, relative]}
-      - id: planning_profile
-        required: false
-        default: balanced
-        schema:
-          type: enum
-          values: [first_feasible, balanced, quality_bounded]
-      - id: velocity_scale
-        required: false
-        default: 1.0
-        schema: {type: float, constraints: {min_exclusive: 0.0, max_inclusive: 1.0}}
-      - id: acceleration_scale
-        required: false
-        default: 1.0
-        schema: {type: float, constraints: {min_exclusive: 0.0, max_inclusive: 1.0}}
-      - id: max_tcp_linear_speed_mps
-        required: false
-        schema: {type: float, constraints: {min_exclusive: 0.0}}
-      - id: per_joint_dynamics_limits
-        required: false
-        default: {}
-        schema_ref: "#/schema_types/per_joint_dynamics_limits"
-      - id: joint_position_tol_rad
-        required: false
-        default: 0.05
-        schema: {type: float, constraints: {min_inclusive: 0.0}}
-      - id: translation_tol_m
-        required: false
-        default: 0.005
-        schema: {type: float, constraints: {min_inclusive: 0.0}}
-      - id: rotation_tol_rad
-        required: false
-        default: 0.05
-        schema: {type: float, constraints: {min_inclusive: 0.0}}
-      - id: planning_timeout_s
-        required: false
-        default: 2.0
-        schema: {type: float, constraints: {min_exclusive: 0.0}}
-      - id: execution_timeout_s
-        required: false
-        default: 10.0
-        schema: {type: float, constraints: {min_exclusive: 0.0}}
-      - id: cache_mode
-        required: false
-        default: default
-        schema: {type: enum, values: [default, disable]}
-    required_capabilities:
-      - capability_id: planning.motion.joint_goal
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: planning.profile.first_feasible
-        scope: target_binding
-        target_parameter: target_role
-        when: {parameter: planning_profile, equals: first_feasible}
-      - capability_id: planning.profile.balanced
-        scope: target_binding
-        target_parameter: target_role
-        when: {parameter: planning_profile, equals: balanced}
-      - capability_id: planning.profile.quality_bounded
-        scope: target_binding
-        target_parameter: target_role
-        when: {parameter: planning_profile, equals: quality_bounded}
-      - capability_id: planning.trajectory.time_parameterized
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: state.observed.current
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: validation.trajectory.non_collision
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: collision.query.pre_execution
-        scope: cell_global
-      - capability_id: execution.trajectory.execute
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: execution.feedback.phase_events
-        scope: target_binding
-        target_parameter: target_role
-    execution:
-      blocking: true
-      cancellable: true
-      owner_api: kernel.operation
-    outcomes:
-      success: operation_succeeded
-      failure: operation_failed
-      interrupted: operation_terminal
-    runners:
-      py_trees: {implementation_id: motion_move_to_joint_target_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: motion.move_to_pose
-    name: Move to pose
-    category: motion
-    description: Plan, validate, and execute a portable pose goal.
-    stability: stable
-    tags: [motion, planning, execution]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters:
-      - id: target_role
-        required: true
-        schema: {type: string, semantic_type: target_role}
-      - id: base_frame_role
-        required: true
-        schema: {type: string, semantic_type: frame_role}
-      - id: tcp_frame_role
-        required: true
-        schema: {type: string, semantic_type: frame_role}
-      - id: goal
-        required: true
-        schema_ref: "#/schema_types/motion_pose"
-      - id: target_mode
-        required: false
-        default: absolute
-        schema: {type: enum, values: [absolute, relative]}
-      - id: target_reference
-        required: false
-        schema_ref: "#/schema_types/motion_reference"
-      - id: offset_reference
-        required: false
-        schema_ref: "#/schema_types/motion_reference"
-      - id: planning_profile
-        required: false
-        default: balanced
-        schema:
-          type: enum
-          values: [first_feasible, balanced, quality_bounded]
-      - id: velocity_scale
-        required: false
-        default: 1.0
-        schema: {type: float, constraints: {min_exclusive: 0.0, max_inclusive: 1.0}}
-      - id: acceleration_scale
-        required: false
-        default: 1.0
-        schema: {type: float, constraints: {min_exclusive: 0.0, max_inclusive: 1.0}}
-      - id: max_tcp_linear_speed_mps
-        required: false
-        schema: {type: float, constraints: {min_exclusive: 0.0}}
-      - id: per_joint_dynamics_limits
-        required: false
-        default: {}
-        schema_ref: "#/schema_types/per_joint_dynamics_limits"
-      - id: joint_position_tol_rad
-        required: false
-        default: 0.05
-        schema: {type: float, constraints: {min_inclusive: 0.0}}
-      - id: translation_tol_m
-        required: false
-        default: 0.005
-        schema: {type: float, constraints: {min_inclusive: 0.0}}
-      - id: rotation_tol_rad
-        required: false
-        default: 0.05
-        schema: {type: float, constraints: {min_inclusive: 0.0}}
-      - id: planning_timeout_s
-        required: false
-        default: 2.0
-        schema: {type: float, constraints: {min_exclusive: 0.0}}
-      - id: execution_timeout_s
-        required: false
-        default: 10.0
-        schema: {type: float, constraints: {min_exclusive: 0.0}}
-      - id: cache_mode
-        required: false
-        default: default
-        schema: {type: enum, values: [default, disable]}
-      - id: contact_policy_id
-        required: false
-        schema: {type: string}
-    required_capabilities:
-      - capability_id: planning.motion.pose_goal
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: planning.profile.first_feasible
-        scope: target_binding
-        target_parameter: target_role
-        when: {parameter: planning_profile, equals: first_feasible}
-      - capability_id: planning.profile.balanced
-        scope: target_binding
-        target_parameter: target_role
-        when: {parameter: planning_profile, equals: balanced}
-      - capability_id: planning.profile.quality_bounded
-        scope: target_binding
-        target_parameter: target_role
-        when: {parameter: planning_profile, equals: quality_bounded}
-      - capability_id: planning.trajectory.time_parameterized
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: state.observed.current
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: validation.trajectory.non_collision
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: collision.query.pre_execution
-        scope: cell_global
-      - capability_id: execution.trajectory.execute
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: execution.feedback.phase_events
-        scope: target_binding
-        target_parameter: target_role
-    execution:
-      blocking: true
-      cancellable: true
-      owner_api: kernel.operation
-    outcomes:
-      success: operation_succeeded
-      failure: operation_failed
-      interrupted: operation_terminal
-    runners:
-      py_trees: {implementation_id: motion_move_to_pose_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: motion.follow_cartesian_path
-    name: Follow Cartesian path
-    category: motion
-    description: Plan, validate, and execute a portable ordered Cartesian path.
-    stability: stable
-    tags: [motion, planning, cartesian]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters:
-      - id: target_role
-        required: true
-        schema: {type: string, semantic_type: target_role}
-      - id: base_frame_role
-        required: true
-        schema: {type: string, semantic_type: frame_role}
-      - id: tcp_frame_role
-        required: true
-        schema: {type: string, semantic_type: frame_role}
-      - id: path
-        required: true
-        schema_ref: "#/schema_types/cartesian_path"
-      - id: target_mode
-        required: false
-        default: absolute
-        schema: {type: enum, values: [absolute, relative]}
-      - id: target_reference
-        required: false
-        schema_ref: "#/schema_types/motion_reference"
-      - id: offset_reference
-        required: false
-        schema_ref: "#/schema_types/motion_reference"
-      - id: planning_profile
-        required: false
-        default: balanced
-        schema:
-          type: enum
-          values: [first_feasible, balanced, quality_bounded]
-      - id: max_translation_step_m
-        required: false
-        default: 0.005
-        schema: {type: float, constraints: {min_exclusive: 0.0}}
-      - id: max_rotation_step_rad
-        required: false
-        default: 0.05
-        schema: {type: float, constraints: {min_exclusive: 0.0}}
-      - id: max_linear_speed_mps
-        required: false
-        default: 0.1
-        schema: {type: float, constraints: {min_exclusive: 0.0}}
-      - id: max_angular_speed_rad_s
-        required: false
-        default: 0.5
-        schema: {type: float, constraints: {min_exclusive: 0.0}}
-      - id: max_linear_acceleration_mps2
-        required: false
-        default: 0.5
-        schema: {type: float, constraints: {min_exclusive: 0.0}}
-      - id: max_angular_acceleration_rad_s2
-        required: false
-        default: 2.5
-        schema: {type: float, constraints: {min_exclusive: 0.0}}
-      - id: fallback_policy
-        required: false
-        default: fail_closed
-        schema: {type: enum, values: [fail_closed, allow_joint_space_fallback]}
-      - id: velocity_scale
-        required: false
-        default: 1.0
-        schema: {type: float, constraints: {min_exclusive: 0.0, max_inclusive: 1.0}}
-      - id: acceleration_scale
-        required: false
-        default: 1.0
-        schema: {type: float, constraints: {min_exclusive: 0.0, max_inclusive: 1.0}}
-      - id: max_tcp_linear_speed_mps
-        required: false
-        schema: {type: float, constraints: {min_exclusive: 0.0}}
-      - id: per_joint_dynamics_limits
-        required: false
-        default: {}
-        schema_ref: "#/schema_types/per_joint_dynamics_limits"
-      - id: joint_position_tol_rad
-        required: false
-        default: 0.05
-        schema: {type: float, constraints: {min_inclusive: 0.0}}
-      - id: translation_tol_m
-        required: false
-        default: 0.005
-        schema: {type: float, constraints: {min_exclusive: 0.0}}
-      - id: rotation_tol_rad
-        required: false
-        default: 0.05
-        schema: {type: float, constraints: {min_exclusive: 0.0}}
-      - id: planning_timeout_s
-        required: false
-        default: 2.0
-        schema: {type: float, constraints: {min_exclusive: 0.0}}
-      - id: execution_timeout_s
-        required: false
-        default: 10.0
-        schema: {type: float, constraints: {min_exclusive: 0.0}}
-      - id: cache_mode
-        required: false
-        default: default
-        schema: {type: enum, values: [default, disable]}
-      - id: contact_policy_id
-        required: false
-        schema: {type: string}
-    required_capabilities:
-      - capability_id: planning.motion.cartesian_path
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: planning.profile.first_feasible
-        scope: target_binding
-        target_parameter: target_role
-        when: {parameter: planning_profile, equals: first_feasible}
-      - capability_id: planning.profile.balanced
-        scope: target_binding
-        target_parameter: target_role
-        when: {parameter: planning_profile, equals: balanced}
-      - capability_id: planning.profile.quality_bounded
-        scope: target_binding
-        target_parameter: target_role
-        when: {parameter: planning_profile, equals: quality_bounded}
-      - capability_id: planning.trajectory.time_parameterized
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: state.observed.current
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: validation.trajectory.non_collision
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: collision.query.pre_execution
-        scope: cell_global
-      - capability_id: execution.trajectory.execute
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: execution.feedback.phase_events
-        scope: target_binding
-        target_parameter: target_role
-    execution:
-      blocking: true
-      cancellable: true
-      owner_api: kernel.operation
-    outcomes:
-      success: operation_succeeded
-      failure: operation_failed
-      interrupted: operation_terminal
-    runners:
-      py_trees: {implementation_id: motion_follow_cartesian_path_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: motion.move_until_signal
-    name: Move until signal
-    category: motion
-    description: Execute a portable motion with one operation-scoped interrupt policy.
-    stability: stable
-    tags: [motion, interrupt]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters:
-      - id: target_role
-        required: true
-        schema: {type: string, semantic_type: target_role}
-      - id: goal
-        required: true
-        schema_ref: "#/schema_types/stored_pose"
-      - id: planning_profile
-        required: false
-        default: balanced
-        schema:
-          type: enum
-          values: [first_feasible, balanced, quality_bounded]
-      - id: interrupt_policy_id
-        required: true
-        schema: {type: string}
-      - id: stop_mode
-        required: true
-        schema:
-          type: enum
-          values: [spring_back_hold, soft_on_path, hard_deceleration]
-      - id: activation_mode
-        required: false
-        default: require_inactive_at_arm
-        schema:
-          type: enum
-          values: [require_inactive_at_arm, fresh_edge_after_arm, trip_if_already_active]
-    required_capabilities:
-      - capability_id: planning.motion.pose_goal
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: planning.profile.first_feasible
-        scope: target_binding
-        target_parameter: target_role
-        when: {parameter: planning_profile, equals: first_feasible}
-      - capability_id: planning.profile.balanced
-        scope: target_binding
-        target_parameter: target_role
-        when: {parameter: planning_profile, equals: balanced}
-      - capability_id: planning.profile.quality_bounded
-        scope: target_binding
-        target_parameter: target_role
-        when: {parameter: planning_profile, equals: quality_bounded}
-      - capability_id: planning.trajectory.time_parameterized
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: state.observed.current
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: validation.trajectory.non_collision
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: collision.query.pre_execution
-        scope: cell_global
-      - capability_id: execution.trajectory.execute
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: execution.feedback.phase_events
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: execution.interrupt.resource_scoped
-        scope: cell_global
-    execution:
-      blocking: true
-      cancellable: true
-      owner_api: kernel.operation
-    outcomes:
-      success: signal_trip_or_allowed_natural_completion
-      failure: operation_failed
-      interrupted: operation_terminal
-    runners:
-      py_trees: {implementation_id: motion_move_until_signal_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: motion.probe_search
-    name: Probe search
-    category: motion
-    description: Execute a precision contact search with a scoped interrupt.
-    stability: stable
-    tags: [motion, interrupt, contact]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters:
-      - id: target_role
-        required: true
-        schema: {type: string, semantic_type: target_role}
-      - id: goal
-        required: true
-        schema_ref: "#/schema_types/stored_pose"
-      - id: planning_profile
-        required: false
-        default: balanced
-        schema:
-          type: enum
-          values: [first_feasible, balanced, quality_bounded]
-      - id: interrupt_policy_id
-        required: true
-        schema: {type: string}
-      - id: contact_policy_id
-        required: true
-        schema: {type: string}
-      - id: stop_mode
-        required: true
-        schema:
-          type: enum
-          values: [spring_back_hold, soft_on_path, hard_deceleration]
-    required_capabilities:
-      - capability_id: planning.motion.pose_goal
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: planning.profile.first_feasible
-        scope: target_binding
-        target_parameter: target_role
-        when: {parameter: planning_profile, equals: first_feasible}
-      - capability_id: planning.profile.balanced
-        scope: target_binding
-        target_parameter: target_role
-        when: {parameter: planning_profile, equals: balanced}
-      - capability_id: planning.profile.quality_bounded
-        scope: target_binding
-        target_parameter: target_role
-        when: {parameter: planning_profile, equals: quality_bounded}
-      - capability_id: planning.trajectory.time_parameterized
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: state.observed.current
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: validation.trajectory.non_collision
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: collision.query.pre_execution
-        scope: cell_global
-      - capability_id: execution.trajectory.execute
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: execution.feedback.phase_events
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: execution.interrupt.resource_scoped
-        scope: cell_global
-      - capability_id: execution.interrupt.contact_policy
-        scope: cell_global
-    execution:
-      blocking: true
-      cancellable: true
-      owner_api: kernel.operation
-    outcomes:
-      success: precision_contact_trip
-      failure: operation_failed
-      interrupted: operation_terminal
-    runners:
-      py_trees: {implementation_id: motion_probe_search_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: scene.add_object
-    name: Add scene object
-    category: scene
-    description: Add one portable logical scene resource.
-    stability: stable
-    tags: [scene]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters:
-      - id: scene_resource_id
-        required: true
-        schema: {type: string, semantic_type: scene_resource}
-      - id: shape
-        required: true
-        schema_ref: "#/schema_types/shape"
-      - id: pose
-        required: true
-        schema_ref: "#/schema_types/stored_pose"
-    required_capabilities:
-      - capability_id: scene.shape.box
-        scope: cell_global
-      - capability_id: scene.shape.sphere
-        scope: cell_global
-      - capability_id: scene.shape.cylinder
-        scope: cell_global
-      - capability_id: scene.shape.mesh
-        scope: cell_global
-      - capability_id: scene.edit.add
-        scope: cell_global
-    execution:
-      blocking: true
-      cancellable: false
-      owner_api: scene.transaction
-    outcomes:
-      success: scene_committed
-      failure: scene_commit_failed
-    runners:
-      py_trees: {implementation_id: scene_add_object_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: scene.upsert_object
-    name: Upsert scene object
-    category: scene
-    description: Add or replace one portable logical scene resource.
-    stability: stable
-    tags: [scene]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters:
-      - id: scene_resource_id
-        required: true
-        schema: {type: string, semantic_type: scene_resource}
-      - id: shape
-        required: true
-        schema_ref: "#/schema_types/shape"
-      - id: pose
-        required: true
-        schema_ref: "#/schema_types/stored_pose"
-    required_capabilities:
-      - capability_id: scene.shape.box
-        scope: cell_global
-      - capability_id: scene.shape.sphere
-        scope: cell_global
-      - capability_id: scene.shape.cylinder
-        scope: cell_global
-      - capability_id: scene.shape.mesh
-        scope: cell_global
-      - capability_id: scene.edit.upsert
-        scope: cell_global
-    execution:
-      blocking: true
-      cancellable: false
-      owner_api: scene.transaction
-    outcomes:
-      success: scene_committed
-      failure: scene_commit_failed
-    runners:
-      py_trees: {implementation_id: scene_upsert_object_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: scene.remove_object
-    name: Remove scene object
-    category: scene
-    description: Remove one logical scene resource.
-    stability: stable
-    tags: [scene]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters:
-      - id: scene_resource_id
-        required: true
-        schema: {type: string, semantic_type: scene_resource}
-    required_capabilities:
-      - capability_id: scene.edit.remove
-        scope: cell_global
-    execution:
-      blocking: true
-      cancellable: false
-      owner_api: scene.transaction
-    outcomes:
-      success: scene_committed
-      failure: scene_commit_failed
-    runners:
-      py_trees: {implementation_id: scene_remove_object_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: scene.update_object_pose
-    name: Update scene object pose
-    category: scene
-    description: Update one logical scene resource pose.
-    stability: stable
-    tags: [scene]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters:
-      - id: scene_resource_id
-        required: true
-        schema: {type: string, semantic_type: scene_resource}
-      - id: pose
-        required: true
-        schema_ref: "#/schema_types/stored_pose"
-    required_capabilities:
-      - capability_id: scene.edit.update_pose
-        scope: cell_global
-    execution:
-      blocking: true
-      cancellable: false
-      owner_api: scene.transaction
-    outcomes:
-      success: scene_committed
-      failure: scene_commit_failed
-    runners:
-      py_trees: {implementation_id: scene_update_object_pose_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: scene.attach_carried_object
-    name: Attach object
-    category: scene
-    description: Attach a scene resource to a declared carrier target and frame role.
-    stability: stable
-    tags: [scene, attachment]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters:
-      - id: scene_resource_id
-        required: true
-        schema: {type: string, semantic_type: scene_resource}
-      - id: target_role
-        required: true
-        schema: {type: string, semantic_type: target_role}
-      - id: carrier_frame_role
-        required: true
-        schema:
-          type: string
-          semantic_type: frame_role
-          semantic_scope_parameter: target_role
-      - id: touch_body_roles
-        required: true
-        schema:
-          type: array
-          min_items: 1
-          max_items: 256
-          items:
-            type: string
-            semantic_type: collision_body_role
-            semantic_scope_parameter: target_role
-    required_capabilities:
-      - capability_id: scene.edit.attach_detach
-        scope: cell_global
-      - capability_id: model.kinematics.fk
-        scope: target_binding
-        target_parameter: target_role
-    execution:
-      blocking: true
-      cancellable: false
-      owner_api: scene.carried_attachment
-    outcomes:
-      success: attachment_committed
-      failure: attachment_failed
-    runners:
-      py_trees: {implementation_id: scene_attach_carried_object_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: scene.detach_carried_object
-    name: Detach object
-    category: scene
-    description: Set a scene-owned Attached object to Detached at its current pose.
-    stability: stable
-    tags: [scene, attachment]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters:
-      - id: scene_resource_id
-        required: true
-        schema: {type: string, semantic_type: scene_resource}
-      - id: target_role
-        required: true
-        schema: {type: string, semantic_type: target_role}
-    required_capabilities:
-      - capability_id: scene.edit.attach_detach
-        scope: cell_global
-    execution:
-      blocking: true
-      cancellable: false
-      owner_api: scene.carried_attachment
-    outcomes:
-      success: attachment_committed
-      failure: attachment_failed
-    runners:
-      py_trees: {implementation_id: scene_detach_carried_object_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: logic.check_bool
-    name: Check boolean
-    category: logic
-    description: Compare one literal or typed-source boolean with an expected value.
-    stability: stable
-    tags: [logic, blackboard]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters:
-      - id: actual_value
-        required: true
-        schema: {type: bool}
-      - id: expected_value
-        required: true
-        schema: {type: bool}
-    required_capabilities: []
-    blackboard:
-      reads: []
-      writes: []
-    execution:
-      blocking: false
-      cancellable: false
-      owner_api: orchestration.blackboard
-    outcomes:
-      success: matched
-      failure: not_matched
-    runners:
-      py_trees: {implementation_id: logic_check_bool_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: logic.set_bool
-    name: Set boolean
-    category: logic
-    description: Set one declared blackboard boolean.
-    stability: stable
-    tags: [logic, blackboard]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters:
-      - id: key
-        required: true
-        schema: {type: string, semantic_type: blackboard_key}
-      - id: value
-        required: true
-        schema: {type: bool}
-    required_capabilities: []
-    blackboard:
-      reads: []
-      writes:
-        - {key_parameter: key, value_type: bool}
-    execution:
-      blocking: false
-      cancellable: false
-      owner_api: orchestration.blackboard
-    outcomes:
-      success: value_written
-      failure: write_failed
-    runners:
-      py_trees: {implementation_id: logic_set_bool_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: logic.wait_for_bool
-    name: Wait for boolean
-    category: logic
-    description: Wait until one declared blackboard boolean matches.
-    stability: stable
-    tags: [logic, blackboard]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters:
-      - id: key
-        required: true
-        schema: {type: string, semantic_type: blackboard_key}
-      - id: expected_value
-        required: true
-        schema: {type: bool}
-    required_capabilities: []
-    blackboard:
-      reads:
-        - {key_parameter: key, value_type: bool, missing_key: wait}
-      writes: []
-    execution:
-      blocking: true
-      cancellable: true
-      owner_api: orchestration.blackboard
-    outcomes:
-      success: matched
-      failure: wait_failed
-      interrupted: cancelled
-    runners:
-      py_trees: {implementation_id: logic_wait_for_bool_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: io.set_output
-    name: Set output
-    category: io
-    description: Set one semantic output resource on a target.
-    stability: stable
-    tags: [io]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters:
-      - id: target_role
-        required: true
-        schema: {type: string, semantic_type: target_role}
-      - id: resource_role
-        required: true
-        schema: {type: string, semantic_type: resource_role}
-      - id: value
-        required: true
-        schema: {type: bool}
-    required_capabilities:
-      - capability_id: io.gpio.set_output
-        scope: target_binding
-        target_parameter: target_role
-    execution:
-      blocking: true
-      cancellable: true
-      owner_api: kernel.command_target
-    outcomes:
-      success: command_succeeded
-      failure: command_failed
-      interrupted: command_terminal
-    runners:
-      py_trees: {implementation_id: io_set_output_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: io.get_input
-    name: Get input
-    category: io
-    description: Read one semantic input resource from a target.
-    stability: stable
-    tags: [io]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters:
-      - id: target_role
-        required: true
-        schema: {type: string, semantic_type: target_role}
-      - id: resource_role
-        required: true
-        schema: {type: string, semantic_type: resource_role}
-      - id: output_key
-        required: true
-        schema: {type: string, semantic_type: blackboard_key}
-    required_capabilities:
-      - capability_id: io.gpio.get_input
-        scope: target_binding
-        target_parameter: target_role
-    blackboard:
-      reads: []
-      writes:
-        - {key_parameter: output_key, value_type: bool}
-    execution:
-      blocking: true
-      cancellable: false
-      owner_api: kernel.command_target
-    outcomes:
-      success: input_read
-      failure: input_failed
-    runners:
-      py_trees: {implementation_id: io_get_input_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: io.wait_for_input
-    name: Wait for input
-    category: io
-    description: Wait for one semantic input resource to reach a value.
-    stability: stable
-    tags: [io]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters:
-      - id: target_role
-        required: true
-        schema: {type: string, semantic_type: target_role}
-      - id: resource_role
-        required: true
-        schema: {type: string, semantic_type: resource_role}
-      - id: expected_value
-        required: true
-        schema: {type: bool}
-      - id: edge
-        required: false
-        default: level
-        schema: {type: enum, values: [level, rising, falling]}
-    required_capabilities:
-      - capability_id: io.gpio.wait_for_input
-        scope: target_binding
-        target_parameter: target_role
-    execution:
-      blocking: true
-      cancellable: true
-      owner_api: kernel.command_target
-    outcomes:
-      success: condition_satisfied
-      failure: input_failed
-      interrupted: command_terminal
-    runners:
-      py_trees: {implementation_id: io_wait_for_input_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: gripper.command_position
-    name: Command gripper position
-    category: gripper
-    description: Command one semantic gripper target position.
-    stability: stable
-    tags: [gripper, tool]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters:
-      - id: target_role
-        required: true
-        schema: {type: string, semantic_type: target_role}
-      - id: position
-        required: true
-        schema_ref: "#/schema_types/coordinate_position"
-      - id: max_effort
-        required: false
-        schema_ref: "#/schema_types/coordinate_effort_limit"
-      - id: command_duration_s
-        required: false
-        schema: {type: float, constraints: {min_inclusive: 0.0}}
-      - id: completion_timeout_s
-        required: false
-        default: 30.0
-        schema: {type: float, constraints: {min_exclusive: 0.0}}
-    required_capabilities:
-      - capability_id: tool.gripper.command
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: tool.gripper.feedback
-        scope: target_binding
-        target_parameter: target_role
-    execution:
-      blocking: true
-      cancellable: true
-      owner_api: kernel.command_target
-    outcomes:
-      success: command_succeeded
-      failure: command_failed
-      interrupted: command_terminal
-    runners:
-      py_trees: {implementation_id: gripper_command_position_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: gripper.check_status
-    name: Check gripper status
-    category: gripper
-    description: Compare immutable gripper-target status with an expected state.
-    stability: stable
-    tags: [gripper, tool]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters:
-      - id: target_role
-        required: true
-        schema: {type: string, semantic_type: target_role}
-      - id: expected_state
-        required: true
-        schema:
-          type: enum
-          values: [idle, moving, reached, grasp_confirmed, failed]
-    required_capabilities:
-      - capability_id: tool.gripper.feedback
-        scope: target_binding
-        target_parameter: target_role
-    execution:
-      blocking: false
-      cancellable: false
-      owner_api: kernel.command_target
-    outcomes:
-      success: matched
-      failure: not_matched
-    runners:
-      py_trees: {implementation_id: gripper_check_status_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: model.get_frame_pose
-    name: Get frame pose
-    category: model
-    description: Resolve one declared frame role from fresh qualified state.
-    stability: stable
-    tags: [model, kinematics]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters:
-      - id: target_role
-        required: true
-        schema: {type: string, semantic_type: target_role}
-      - id: frame_role
-        required: true
-        schema: {type: string, semantic_type: frame_role}
-      - id: output_key
-        required: true
-        schema: {type: string, semantic_type: blackboard_key}
-    required_capabilities:
-      - capability_id: model.kinematics.fk
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: state.observed.current
-        scope: target_binding
-        target_parameter: target_role
-    blackboard:
-      reads: []
-      writes:
-        - {key_parameter: output_key, value_type: stored_pose}
-    execution:
-      blocking: true
-      cancellable: false
-      owner_api: model.kinematics
-    outcomes:
-      success: pose_resolved
-      failure: pose_unavailable
-    runners:
-      py_trees: {implementation_id: model_get_frame_pose_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: geometry.check_pose_distance
-    name: Check pose distance
-    category: geometry
-    description: Compare two declared pose values with portable thresholds.
-    stability: stable
-    tags: [geometry, blackboard]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters:
-      - id: pose_key_a
-        required: true
-        schema: {type: string, semantic_type: blackboard_key}
-      - id: pose_key_b
-        required: true
-        schema: {type: string, semantic_type: blackboard_key}
-      - id: translation_threshold_m
-        required: true
-        schema: {type: float, constraints: {min_inclusive: 0.0}}
-      - id: rotation_threshold_rad
-        required: true
-        schema: {type: float, constraints: {min_inclusive: 0.0}}
-    required_capabilities: []
-    blackboard:
-      reads:
-        - {key_parameter: pose_key_a, value_type: stored_pose, missing_key: failure}
-        - {key_parameter: pose_key_b, value_type: stored_pose, missing_key: failure}
-      writes: []
-    execution:
-      blocking: false
-      cancellable: false
-      owner_api: geometry.compare
-    outcomes:
-      success: within_threshold
-      failure: outside_threshold
-    runners:
-      py_trees: {implementation_id: geometry_check_pose_distance_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: lifecycle.prepare_component
-    name: Prepare component
-    category: lifecycle
-    description: Request one generic CCLC Prepare transaction.
-    stability: stable
-    tags: [lifecycle, component]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters:
-      - id: component_role
-        required: true
-        schema: {type: string, semantic_type: component_role}
-    required_capabilities:
-      - capability_id: component.lifecycle.observe
-        scope: control_domain
-        component_parameter: component_role
-      - capability_id: component.lifecycle.prepare
-        scope: control_domain
-        component_parameter: component_role
-    execution:
-      blocking: true
-      cancellable: false
-      owner_api: cclc.lifecycle
-    outcomes:
-      success: lifecycle_succeeded
-      failure: lifecycle_failed
-    runners:
-      py_trees: {implementation_id: lifecycle_prepare_component_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: lifecycle.enable_component
-    name: Enable component
-    category: lifecycle
-    description: Request one generic CCLC Enable transaction.
-    stability: stable
-    tags: [lifecycle, component]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters:
-      - id: component_role
-        required: true
-        schema: {type: string, semantic_type: component_role}
-    required_capabilities:
-      - capability_id: component.lifecycle.observe
-        scope: control_domain
-        component_parameter: component_role
-      - capability_id: component.lifecycle.enable
-        scope: control_domain
-        component_parameter: component_role
-    execution:
-      blocking: true
-      cancellable: false
-      owner_api: cclc.lifecycle
-    outcomes:
-      success: lifecycle_succeeded
-      failure: lifecycle_failed
-    runners:
-      py_trees: {implementation_id: lifecycle_enable_component_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: lifecycle.disable_component
-    name: Disable component
-    category: lifecycle
-    description: Request CCLC Disable through the Kernel Stop/fence transition.
-    stability: stable
-    tags: [lifecycle, component]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters:
-      - id: component_role
-        required: true
-        schema: {type: string, semantic_type: component_role}
-    required_capabilities:
-      - capability_id: component.lifecycle.observe
-        scope: control_domain
-        component_parameter: component_role
-      - capability_id: component.lifecycle.disable
-        scope: control_domain
-        component_parameter: component_role
-    execution:
-      blocking: true
-      cancellable: false
-      owner_api: cclc.lifecycle
-    outcomes:
-      success: lifecycle_succeeded
-      failure: lifecycle_failed
-    runners:
-      py_trees: {implementation_id: lifecycle_disable_component_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: lifecycle.recover_component
-    name: Recover component
-    category: lifecycle
-    description: Request one generic CCLC Recover transaction.
-    stability: stable
-    tags: [lifecycle, component]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters:
-      - id: component_role
-        required: true
-        schema: {type: string, semantic_type: component_role}
-    required_capabilities:
-      - capability_id: component.lifecycle.observe
-        scope: control_domain
-        component_parameter: component_role
-      - capability_id: component.lifecycle.recover
-        scope: control_domain
-        component_parameter: component_role
-    execution:
-      blocking: true
-      cancellable: false
-      owner_api: cclc.lifecycle
-    outcomes:
-      success: lifecycle_succeeded
-      failure: lifecycle_failed
-    runners:
-      py_trees: {implementation_id: lifecycle_recover_component_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: controller.select_route
-    name: Select control route
-    category: controller
-    description: Request a declared control route through CCLC.
-    stability: stable
-    tags: [controller, route]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters:
-      - id: target_role
-        required: true
-        schema: {type: string, semantic_type: target_role}
-      - id: route_role
-        required: true
-        schema: {type: string}
-    required_capabilities:
-      - capability_id: control_domain.controller.observe
-        scope: control_domain
-        target_parameter: target_role
-      - capability_id: control_domain.controller.switch
-        scope: control_domain
-        target_parameter: target_role
-    execution:
-      blocking: true
-      cancellable: false
-      owner_api: cclc.control_route
-    outcomes:
-      success: route_selected
-      failure: route_selection_failed
-    runners:
-      py_trees: {implementation_id: controller_select_route_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: kernel.stop_operation
-    name: Stop operation
-    category: recovery
-    description: Request Stop for one exact runtime-selected operation scope.
-    stability: stable
-    tags: [kernel, stop]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters:
-      - id: target_role
-        required: true
-        schema: {type: string, semantic_type: target_role}
-    required_capabilities:
-      - capability_id: execution.stop.soft
-        scope: target_binding
-        target_parameter: target_role
-    owner_context:
-      kind: current_operation
-      required: true
-    execution:
-      blocking: true
-      cancellable: false
-      owner_api: kernel.stop
-    outcomes:
-      success: stop_certified
-      failure: stop_failed
-    runners:
-      py_trees: {implementation_id: kernel_stop_operation_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: kernel.full_stop
-    name: Full Stop
-    category: recovery
-    description: Request one explicit cell-wide Full Stop.
-    stability: stable
-    tags: [kernel, stop]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters: []
-    required_capabilities: []
-    execution:
-      blocking: true
-      cancellable: false
-      owner_api: kernel.full_stop
-    outcomes:
-      success: stop_certified
-      failure: stop_failed
-    runners:
-      py_trees: {implementation_id: kernel_full_stop_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: kernel.pause_operation
-    name: Pause operation
-    category: recovery
-    description: Pause one exact runtime-selected operation.
-    stability: stable
-    tags: [kernel, pause]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters:
-      - id: target_role
-        required: true
-        schema: {type: string, semantic_type: target_role}
-    required_capabilities:
-      - capability_id: execution.pause
-        scope: target_binding
-        target_parameter: target_role
-    owner_context:
-      kind: current_operation
-      required: true
-    execution:
-      blocking: true
-      cancellable: false
-      owner_api: kernel.pause
-    outcomes:
-      success: operation_paused
-      failure: pause_failed
-    runners:
-      py_trees: {implementation_id: kernel_pause_operation_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: kernel.resume_operation
-    name: Resume operation
-    category: recovery
-    description: Resume one exact runtime-selected paused operation.
-    stability: stable
-    tags: [kernel, resume]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters:
-      - id: target_role
-        required: true
-        schema: {type: string, semantic_type: target_role}
-    required_capabilities:
-      - capability_id: execution.resume
-        scope: target_binding
-        target_parameter: target_role
-    owner_context:
-      kind: current_operation
-      required: true
-    execution:
-      blocking: true
-      cancellable: false
-      owner_api: kernel.resume
-    outcomes:
-      success: operation_resumed
-      failure: resume_failed
-    runners:
-      py_trees: {implementation_id: kernel_resume_operation_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: kernel.reset_operation
-    name: Reset operation
-    category: recovery
-    description: Reset one exact terminal or recoverable operation scope.
-    stability: stable
-    tags: [kernel, reset]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters:
-      - id: target_role
-        required: true
-        schema: {type: string, semantic_type: target_role}
-    required_capabilities:
-      - capability_id: execution.reset
-        scope: target_binding
-        target_parameter: target_role
-    owner_context:
-      kind: current_operation
-      required: true
-    execution:
-      blocking: true
-      cancellable: false
-      owner_api: kernel.reset
-    outcomes:
-      success: operation_reset
-      failure: reset_failed
-    runners:
-      py_trees: {implementation_id: kernel_reset_operation_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: kernel.set_runtime_scale
-    name: Set runtime scale
-    category: motion
-    description: Set generation-fenced runtime scaling on one selected operation.
-    stability: stable
-    tags: [kernel, scaling]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters:
-      - id: target_role
-        required: true
-        schema: {type: string, semantic_type: target_role}
-      - id: scale
-        required: true
-        schema:
-          type: float
-          constraints: {min_exclusive: 0.0, max_inclusive: 1.0}
-    required_capabilities:
-      - capability_id: execution.runtime_scale.operation_scoped
-        scope: target_binding
-        target_parameter: target_role
-    owner_context:
-      kind: current_operation
-      required: true
-    execution:
-      blocking: true
-      cancellable: false
-      owner_api: kernel.runtime_scaling
-    outcomes:
-      success: scaling_applied
-      failure: scaling_failed
-    runners:
-      py_trees: {implementation_id: kernel_set_runtime_scale_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: simulation.reset
-    name: Reset simulation
-    category: simulation
-    description: Request a bounded reset from the cell-global simulator owner.
-    stability: stable
-    tags: [simulation]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters: []
-    required_capabilities:
-      - capability_id: simulator.control.reset
-        scope: cell_global
-    execution:
-      blocking: true
-      cancellable: true
-      owner_api: simulator.control
-    outcomes:
-      success: simulator_command_succeeded
-      failure: simulator_command_failed
-      interrupted: cancelled
-    runners:
-      py_trees: {implementation_id: simulation_reset_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: simulation.set_state
-    name: Set simulation state
-    category: simulation
-    description: Request simulator play or pause for one selected control domain.
-    stability: stable
-    tags: [simulation]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters:
-      - id: state
-        required: true
-        schema: {type: enum, values: [play, pause]}
-    required_capabilities:
-      - capability_id: simulator.control.pause
-        scope: cell_global
-      - capability_id: simulator.control.play
-        scope: cell_global
-    execution:
-      blocking: true
-      cancellable: true
-      owner_api: simulator.control
-    outcomes:
-      success: simulator_command_succeeded
-      failure: simulator_command_failed
-      interrupted: cancelled
-    runners:
-      py_trees: {implementation_id: simulation_set_state_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: simulation.step
-    name: Step simulation
-    category: simulation
-    description: Advance one selected simulator domain by a bounded step count.
-    stability: stable
-    tags: [simulation]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters:
-      - id: steps
-        required: true
-        schema:
-          type: int
-          constraints: {min_inclusive: 1, max_inclusive: 1000000}
-    required_capabilities:
-      - capability_id: simulator.control.step
-        scope: cell_global
-    execution:
-      blocking: true
-      cancellable: true
-      owner_api: simulator.control
-    outcomes:
-      success: simulator_command_succeeded
-      failure: simulator_command_failed
-      interrupted: cancelled
-    runners:
-      py_trees: {implementation_id: simulation_step_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: simulation.set_entity_pose
-    name: Set simulator entity pose
-    category: simulation
-    description: Set one declared scene resource pose in a simulator domain.
-    stability: stable
-    tags: [simulation, scene]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters:
-      - id: scene_resource_id
-        required: true
-        schema: {type: string, semantic_type: scene_resource}
-      - id: pose
-        required: true
-        schema_ref: "#/schema_types/stored_pose"
-    required_capabilities:
-      - capability_id: simulator.entity_state.set
-        scope: cell_global
-    execution:
-      blocking: true
-      cancellable: true
-      owner_api: simulator.control
-    outcomes:
-      success: simulator_command_succeeded
-      failure: simulator_command_failed
-      interrupted: cancelled
-    runners:
-      py_trees: {implementation_id: simulation_set_entity_pose_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: assistant.query_model
-    name: Query model
-    category: assistant
-    description: Submit a bounded model request using declared portable inputs.
-    stability: stable
-    tags: [assistant, model]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters:
-      - id: model_endpoint_alias
-        required: true
-        schema: {type: string}
-      - id: prompt_template_id
-        required: true
-        schema: {type: string}
-      - id: template_variables
-        required: false
-        default: []
-        schema_ref: "#/schema_types/template_variable_bindings"
-      - id: scene_attachment
-        required: false
-        default: none
-        schema: {type: enum, values: [none, state_json, snapshot_image]}
-      - id: output_key
-        required: true
-        schema: {type: string, semantic_type: blackboard_key}
-      - id: timeout_s
-        required: false
-        default: 30.0
-        schema: {type: float, constraints: {min_exclusive: 0.0}}
-      - id: min_confidence
-        required: false
-        default: 0.0
-        schema: {type: float, constraints: {min_inclusive: 0.0, max_inclusive: 1.0}}
-      - id: model_runtime_failure_policy
-        required: false
-        default: pause_for_operator
-        schema: {type: enum, values: [pause_for_operator, condition_failure]}
-      - id: model_low_confidence_policy
-        required: false
-        default: pause_for_operator
-        schema: {type: enum, values: [pause_for_operator, condition_failure]}
-      - id: retry_on_parse_failure
-        required: false
-        default: false
-        schema: {type: bool}
-      - id: scene_snapshot_transport
-        required: false
-        default: inline_data_url
-        schema: {type: enum, values: [inline_data_url, http_url]}
-      - id: scene_snapshot_width
-        required: false
-        default: 640
-        schema: {type: int, constraints: {min_inclusive: 64, max_inclusive: 1920}}
-      - id: scene_snapshot_height
-        required: false
-        default: 480
-        schema: {type: int, constraints: {min_inclusive: 64, max_inclusive: 1080}}
-      - id: scene_snapshot_format
-        required: false
-        default: jpeg
-        schema: {type: enum, values: [jpeg, png]}
-    required_capabilities: []
-    blackboard:
-      reads: []
-      writes:
-        - {key_parameter: output_key, value_type: model_response}
-    execution:
-      blocking: false
-      cancellable: true
-      owner_api: assistant.model_request
-    outcomes:
-      success: model_response_valid
-      failure: model_request_failed
-      interrupted: cancelled
-    runners:
-      py_trees: {implementation_id: assistant_query_model_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: assistant.build_scene_selection
-    name: Build scene selection
-    category: assistant
-    description: Build a bounded portable object-selection context.
-    stability: stable
-    tags: [assistant, perception]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters:
-      - id: selection_request_text
-        required: true
-        schema: {type: string}
-      - id: output_key
-        required: true
-        schema: {type: string, semantic_type: blackboard_key}
-      - id: object_source
-        required: false
-        default: backend_scene
-        schema: {type: enum, values: [backend_scene]}
-      - id: candidate_object_ids
-        required: false
-        default: []
-        schema:
-          type: array
-          max_items: 4096
-          items: {type: string, semantic_type: scene_resource}
-      - id: image_source
-        required: false
-        default: none
-        schema: {type: enum, values: [none, viewer_snapshot]}
-      - id: image_snapshot_width
-        required: false
-        default: 640
-        schema: {type: int, constraints: {min_inclusive: 64, max_inclusive: 1920}}
-      - id: image_snapshot_height
-        required: false
-        default: 480
-        schema: {type: int, constraints: {min_inclusive: 64, max_inclusive: 1080}}
-      - id: image_snapshot_format
-        required: false
-        default: jpeg
-        schema: {type: enum, values: [jpeg, png]}
-      - id: unavailable_policy
-        required: false
-        default: pause_for_operator
-        schema: {type: enum, values: [pause_for_operator, condition_failure]}
-    required_capabilities: []
-    blackboard:
-      reads: []
-      writes:
-        - {key_parameter: output_key, value_type: scene_selection_context}
-    execution:
-      blocking: true
-      cancellable: true
-      owner_api: assistant.scene_context
-    outcomes:
-      success: context_built
-      failure: context_failed
-      interrupted: cancelled
-    runners:
-      py_trees: {implementation_id: assistant_build_scene_selection_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: assistant.validate_scene_selection
-    name: Validate scene selection
-    category: assistant
-    description: Validate a model selection against a retained scene context.
-    stability: stable
-    tags: [assistant, perception]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters:
-      - id: selection_context_key
-        required: true
-        schema: {type: string, semantic_type: blackboard_key}
-      - id: selection_response_key
-        required: true
-        schema: {type: string, semantic_type: blackboard_key}
-      - id: output_key
-        required: true
-        schema: {type: string, semantic_type: blackboard_key}
-      - id: allow_no_match
-        required: false
-        default: false
-        schema: {type: bool}
-      - id: allow_ambiguous
-        required: false
-        default: false
-        schema: {type: bool}
-    required_capabilities: []
-    blackboard:
-      reads:
-        - {key_parameter: selection_context_key, value_type: scene_selection_context, missing_key: failure}
-        - {key_parameter: selection_response_key, value_type: model_response, missing_key: failure}
-      writes:
-        - {key_parameter: output_key, value_type: scene_selection_result}
-    execution:
-      blocking: true
-      cancellable: true
-      owner_api: assistant.scene_selection
-    outcomes:
-      success: selection_valid
-      failure: selection_invalid
-      interrupted: cancelled
-    runners:
-      py_trees: {implementation_id: assistant_validate_scene_selection_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: planning.plan_pick_sequence
-    name: Plan pick sequence
-    category: motion
-    description: Produce a portable validated pick-sequence candidate for one target role.
-    stability: stable
-    tags: [motion, planning, pick]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters:
-      - id: target_role
-        required: true
-        schema: {type: string, semantic_type: target_role}
-      - id: tool_target_role
-        required: true
-        schema: {type: string, semantic_type: target_role}
-      - id: base_frame_role
-        required: true
-        schema: {type: string, semantic_type: frame_role}
-      - id: tcp_frame_role
-        required: true
-        schema: {type: string, semantic_type: frame_role}
-      - id: carrier_frame_role
-        required: true
-        schema: {type: string, semantic_type: frame_role}
-      - id: selected_object_id
-        required: true
-        schema: {type: string, semantic_type: scene_resource}
-      - id: synthesis
-        required: false
-        default:
-          pick_offset_envelope:
-            position_min_m: [0.0, 0.0, 0.0]
-            position_max_m: [0.0, 0.0, 0.0]
-            orientation_rpy_min_deg: [0.0, 0.0, 0.0]
-            orientation_rpy_max_deg: [0.0, 0.0, 0.0]
-          approach_offset_envelope:
-            position_min_m: [0.0, 0.0, 0.05]
-            position_max_m: [0.0, 0.0, 0.10]
-            orientation_rpy_min_deg: [0.0, 0.0, 0.0]
-            orientation_rpy_max_deg: [0.0, 0.0, 0.0]
-        schema_ref: "#/schema_types/pick_synthesis"
-      - id: planning_profile
-        required: false
-        default: first_feasible
-        schema:
-          type: enum
-          values: [first_feasible, balanced, quality_bounded]
-      - id: motion_options
-        required: false
-        default: {}
-        schema_ref: "#/schema_types/pick_motion_options"
-      - id: tool_position
-        required: true
-        schema_ref: "#/schema_types/coordinate_position"
-      - id: tool_max_effort
-        required: false
-        schema_ref: "#/schema_types/coordinate_effort_limit"
-      - id: tool_command_duration_s
-        required: false
-        default: 0.0
-        schema: {type: float, constraints: {min_inclusive: 0.0}}
-      - id: tool_completion_timeout_s
-        required: false
-        default: 30.0
-        schema: {type: float, constraints: {min_exclusive: 0.0}}
-      - id: output_key
-        required: true
-        schema: {type: string, semantic_type: blackboard_key}
-      - id: contact_policy_id
-        required: true
-        schema: {type: string}
-      - id: no_feasible_plan_policy
-        required: false
-        default: pause_for_operator
-        schema: {type: enum, values: [pause_for_operator, condition_failure]}
-    required_capabilities:
-      - capability_id: planning.motion.pose_goal
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: planning.motion.cartesian_path
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: planning.profile.first_feasible
-        scope: target_binding
-        target_parameter: target_role
-        when: {parameter: planning_profile, equals: first_feasible}
-      - capability_id: planning.profile.balanced
-        scope: target_binding
-        target_parameter: target_role
-        when: {parameter: planning_profile, equals: balanced}
-      - capability_id: planning.profile.quality_bounded
-        scope: target_binding
-        target_parameter: target_role
-        when: {parameter: planning_profile, equals: quality_bounded}
-      - capability_id: planning.trajectory.time_parameterized
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: state.observed.current
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: validation.trajectory.non_collision
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: collision.query.pre_execution
-        scope: cell_global
-      - capability_id: model.kinematics.fk
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: tool.gripper.command
-        scope: target_binding
-        target_parameter: tool_target_role
-      - capability_id: tool.gripper.feedback
-        scope: target_binding
-        target_parameter: tool_target_role
-      - capability_id: scene.edit.attach_detach
-        scope: cell_global
-    blackboard:
-      reads: []
-      writes:
-        - {key_parameter: output_key, value_type: pick_planning_result}
-    execution:
-      blocking: true
-      cancellable: true
-      owner_api: planning.pick_sequence
-    outcomes:
-      success: candidate_planned
-      failure: no_feasible_candidate
-      interrupted: cancelled
-    runners:
-      py_trees: {implementation_id: planning_plan_pick_sequence_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: motion.pick_object
-    name: Pick object
-    category: motion
-    description: Plan and execute one owner-coordinated pick sequence from portable intent.
-    stability: stable
-    tags: [motion, planning, execution, pick]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters:
-      - id: target_role
-        required: true
-        schema: {type: string, semantic_type: target_role}
-      - id: tool_target_role
-        required: true
-        schema: {type: string, semantic_type: target_role}
-      - id: base_frame_role
-        required: true
-        schema: {type: string, semantic_type: frame_role}
-      - id: tcp_frame_role
-        required: true
-        schema: {type: string, semantic_type: frame_role}
-      - id: carrier_frame_role
-        required: true
-        schema: {type: string, semantic_type: frame_role}
-      - id: selected_object_id
-        required: true
-        schema: {type: string, semantic_type: scene_resource}
-      - id: synthesis
-        required: false
-        default:
-          pick_offset_envelope:
-            position_min_m: [0.0, 0.0, 0.0]
-            position_max_m: [0.0, 0.0, 0.0]
-            orientation_rpy_min_deg: [0.0, 0.0, 0.0]
-            orientation_rpy_max_deg: [0.0, 0.0, 0.0]
-          approach_offset_envelope:
-            position_min_m: [0.0, 0.0, 0.05]
-            position_max_m: [0.0, 0.0, 0.10]
-            orientation_rpy_min_deg: [0.0, 0.0, 0.0]
-            orientation_rpy_max_deg: [0.0, 0.0, 0.0]
-        schema_ref: "#/schema_types/pick_synthesis"
-      - id: planning_profile
-        required: false
-        default: first_feasible
-        schema:
-          type: enum
-          values: [first_feasible, balanced, quality_bounded]
-      - id: motion_options
-        required: false
-        default: {}
-        schema_ref: "#/schema_types/pick_motion_options"
-      - id: tool_position
-        required: true
-        schema_ref: "#/schema_types/coordinate_position"
-      - id: tool_max_effort
-        required: false
-        schema_ref: "#/schema_types/coordinate_effort_limit"
-      - id: tool_command_duration_s
-        required: false
-        default: 0.0
-        schema: {type: float, constraints: {min_inclusive: 0.0}}
-      - id: tool_completion_timeout_s
-        required: false
-        default: 30.0
-        schema: {type: float, constraints: {min_exclusive: 0.0}}
-      - id: contact_policy_id
-        required: true
-        schema: {type: string}
-      - id: no_feasible_plan_policy
-        required: false
-        default: pause_for_operator
-        schema: {type: enum, values: [pause_for_operator, condition_failure]}
-    required_capabilities:
-      - capability_id: planning.motion.pose_goal
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: planning.motion.cartesian_path
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: planning.profile.first_feasible
-        scope: target_binding
-        target_parameter: target_role
-        when: {parameter: planning_profile, equals: first_feasible}
-      - capability_id: planning.profile.balanced
-        scope: target_binding
-        target_parameter: target_role
-        when: {parameter: planning_profile, equals: balanced}
-      - capability_id: planning.profile.quality_bounded
-        scope: target_binding
-        target_parameter: target_role
-        when: {parameter: planning_profile, equals: quality_bounded}
-      - capability_id: planning.trajectory.time_parameterized
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: state.observed.current
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: validation.trajectory.non_collision
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: collision.query.pre_execution
-        scope: cell_global
-      - capability_id: execution.trajectory.execute
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: execution.feedback.phase_events
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: model.kinematics.fk
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: tool.gripper.command
-        scope: target_binding
-        target_parameter: tool_target_role
-      - capability_id: tool.gripper.feedback
-        scope: target_binding
-        target_parameter: tool_target_role
-      - capability_id: scene.edit.attach_detach
-        scope: cell_global
-    execution:
-      blocking: true
-      cancellable: true
-      owner_api: kernel.pick_place_sequence
-    outcomes:
-      success: sequence_completed
-      failure: sequence_failed_or_intervention_required
-      interrupted: sequence_terminal
-    runners:
-      py_trees: {implementation_id: motion_pick_object_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: motion.place_object
-    name: Place object
-    category: motion
-    description: Plan and execute one owner-coordinated place sequence from portable intent.
-    stability: stable
-    tags: [motion, planning, execution, place]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters:
-      - id: target_role
-        required: true
-        schema: {type: string, semantic_type: target_role}
-      - id: tool_target_role
-        required: true
-        schema: {type: string, semantic_type: target_role}
-      - id: base_frame_role
-        required: true
-        schema: {type: string, semantic_type: frame_role}
-      - id: tcp_frame_role
-        required: true
-        schema: {type: string, semantic_type: frame_role}
-      - id: carrier_frame_role
-        required: true
-        schema: {type: string, semantic_type: frame_role}
-      - id: selected_object_id
-        required: true
-        schema: {type: string, semantic_type: scene_resource}
-      - id: place_pose
-        required: true
-        schema_ref: "#/schema_types/motion_pose"
-      - id: approach_offset_m
-        required: false
-        default: [0.0, 0.0, 0.05]
-        schema: {type: array, items: {type: float}, length: 3}
-      - id: planning_profile
-        required: false
-        default: first_feasible
-        schema:
-          type: enum
-          values: [first_feasible, balanced, quality_bounded]
-      - id: motion_options
-        required: false
-        default: {}
-        schema_ref: "#/schema_types/pick_motion_options"
-      - id: tool_position
-        required: true
-        schema_ref: "#/schema_types/coordinate_position"
-      - id: tool_max_effort
-        required: false
-        schema_ref: "#/schema_types/coordinate_effort_limit"
-      - id: tool_command_duration_s
-        required: false
-        default: 0.0
-        schema: {type: float, constraints: {min_inclusive: 0.0}}
-      - id: tool_completion_timeout_s
-        required: false
-        default: 30.0
-        schema: {type: float, constraints: {min_exclusive: 0.0}}
-    required_capabilities:
-      - capability_id: planning.motion.pose_goal
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: planning.motion.cartesian_path
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: planning.profile.first_feasible
-        scope: target_binding
-        target_parameter: target_role
-        when: {parameter: planning_profile, equals: first_feasible}
-      - capability_id: planning.profile.balanced
-        scope: target_binding
-        target_parameter: target_role
-        when: {parameter: planning_profile, equals: balanced}
-      - capability_id: planning.profile.quality_bounded
-        scope: target_binding
-        target_parameter: target_role
-        when: {parameter: planning_profile, equals: quality_bounded}
-      - capability_id: planning.trajectory.time_parameterized
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: state.observed.current
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: validation.trajectory.non_collision
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: collision.query.pre_execution
-        scope: cell_global
-      - capability_id: execution.trajectory.execute
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: execution.feedback.phase_events
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: model.kinematics.fk
-        scope: target_binding
-        target_parameter: target_role
-      - capability_id: tool.gripper.command
-        scope: target_binding
-        target_parameter: tool_target_role
-      - capability_id: tool.gripper.feedback
-        scope: target_binding
-        target_parameter: tool_target_role
-      - capability_id: scene.edit.attach_detach
-        scope: cell_global
-    execution:
-      blocking: true
-      cancellable: true
-      owner_api: kernel.pick_place_sequence
-    outcomes:
-      success: sequence_completed
-      failure: sequence_failed_or_intervention_required
-      interrupted: sequence_terminal
-    runners:
-      py_trees: {implementation_id: motion_place_object_v1}
-    observability: {event_family: manyforge.program.node}
-
-  - id: recovery.apply_offered_action
-    name: Apply offered recovery
-    category: recovery
-    description: Submit one exact current owner-published recovery offer.
-    stability: stable
-    tags: [recovery]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters:
-      - id: target_role
-        required: true
-        schema: {type: string, semantic_type: target_role}
-      - id: recovery_action
-        required: true
-        schema:
-          type: enum
-          values: [retry_motion_from_current_state, acknowledge_and_continue, retry_after_scene_repair, replan_from_stopped_state]
-    required_capabilities: []
-    owner_context:
-      kind: current_recovery_offer
-      required: true
-    execution:
-      blocking: true
-      cancellable: false
-      owner_api: kernel.recovery
-    outcomes:
-      success: recovery_accepted
-      failure: recovery_rejected
-    runners:
-      py_trees: {implementation_id: recovery_apply_offered_action_v1}
-    observability: {event_family: manyforge.program.node}
-
+- id: sequence
+  name: Sequence
+  category: control_flow
+  description: Tick children in order until one fails or all succeed.
+  stability: stable
+  tags:
+  - control_flow
+  - composite
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: composite
+  children:
+    min: 1
+    max: 4096
+  parameters: []
+  required_capabilities: []
+  execution:
+    blocking: false
+    cancellable: false
+    owner_api: orchestration.control_flow
+  runners:
+    py_trees:
+      implementation_id: sequence_v1
+  observability:
+    event_family: manyforge.program.node
+- id: fallback
+  name: Fallback
+  category: control_flow
+  description: Tick children in order until one succeeds or all fail.
+  stability: stable
+  tags:
+  - control_flow
+  - composite
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: composite
+  children:
+    min: 1
+    max: 4096
+  parameters: []
+  required_capabilities: []
+  execution:
+    blocking: false
+    cancellable: false
+    owner_api: orchestration.control_flow
+  runners:
+    py_trees:
+      implementation_id: fallback_v1
+  observability:
+    event_family: manyforge.program.node
+- id: parallel
+  name: Parallel
+  category: control_flow
+  description: Tick children concurrently under one explicit success policy.
+  stability: stable
+  tags:
+  - control_flow
+  - composite
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: composite
+  children:
+    min: 1
+    max: 4096
+  parameters:
+  - id: success_policy
+    required: false
+    default: all
+    schema:
+      type: enum
+      values:
+      - all
+      - one
+  required_capabilities: []
+  execution:
+    blocking: false
+    cancellable: false
+    owner_api: orchestration.control_flow
+  runners:
+    py_trees:
+      implementation_id: parallel_v1
+  observability:
+    event_family: manyforge.program.node
+- id: inverter
+  name: Inverter
+  category: control_flow
+  description: Invert a child success or failure result.
+  stability: stable
+  tags:
+  - control_flow
+  - decorator
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: decorator
+  children:
+    min: 1
+    max: 1
+  parameters: []
+  required_capabilities: []
+  execution:
+    blocking: false
+    cancellable: false
+    owner_api: orchestration.control_flow
+  runners:
+    py_trees:
+      implementation_id: inverter_v1
+  observability:
+    event_family: manyforge.program.node
+- id: repeat
+  name: Repeat
+  category: control_flow
+  description: Repeat one child a finite number of times or indefinitely (-1).
+  stability: stable
+  tags:
+  - control_flow
+  - decorator
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: decorator
+  children:
+    min: 1
+    max: 1
+  parameters:
+  - id: num_cycles
+    required: false
+    default: -1
+    schema:
+      type: int
+      constraints:
+        min_inclusive: -1
+        max_inclusive: 1000000
+        not_equal: 0
+  required_capabilities: []
+  execution:
+    blocking: false
+    cancellable: true
+    owner_api: orchestration.control_flow
+  runners:
+    py_trees:
+      implementation_id: repeat_v1
+  observability:
+    event_family: manyforge.program.node
+- id: retry
+  name: Retry
+  category: control_flow
+  description: Retry one child a finite number of attempts or indefinitely (-1).
+  stability: stable
+  tags:
+  - control_flow
+  - decorator
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: decorator
+  children:
+    min: 1
+    max: 1
+  parameters:
+  - id: num_attempts
+    required: false
+    default: -1
+    schema:
+      type: int
+      constraints:
+        min_inclusive: -1
+        max_inclusive: 1000000
+        not_equal: 0
+  required_capabilities: []
+  execution:
+    blocking: false
+    cancellable: true
+    owner_api: orchestration.control_flow
+  runners:
+    py_trees:
+      implementation_id: retry_v1
+  observability:
+    event_family: manyforge.program.node
+- id: timer
+  name: Timer
+  category: control_flow
+  description: Wait for a bounded duration using the orchestration clock.
+  stability: stable
+  tags:
+  - control_flow
+  - timing
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: duration_s
+    required: true
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+        max_inclusive: 86400.0
+  required_capabilities: []
+  execution:
+    blocking: true
+    cancellable: true
+    owner_api: orchestration.clock
+  outcomes:
+    success: elapsed
+    failure: timer_failed
+    interrupted: cancelled
+  runners:
+    py_trees:
+      implementation_id: timer_v1
+  observability:
+    event_family: manyforge.program.node
+- id: motion.move_to_joint_target
+  name: Move to joint target
+  category: motion
+  description: Plan, validate, and execute a target-scoped source-joint goal.
+  stability: stable
+  tags:
+  - motion
+  - planning
+  - execution
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: target_role
+    required: true
+    schema:
+      type: string
+      semantic_type: target_role
+  - id: base_frame_role
+    required: true
+    schema:
+      type: string
+      semantic_type: frame_role
+  - id: tcp_frame_role
+    required: true
+    schema:
+      type: string
+      semantic_type: frame_role
+  - id: goal
+    required: true
+    schema_ref: '#/schema_types/joint_target_list'
+  - id: target_mode
+    required: false
+    default: absolute
+    schema:
+      type: enum
+      values:
+      - absolute
+      - relative
+  - id: planning_profile
+    required: false
+    default: balanced
+    schema:
+      type: enum
+      values:
+      - first_feasible
+      - balanced
+      - quality_bounded
+  - id: velocity_scale
+    required: false
+    default: 1.0
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+        max_inclusive: 1.0
+  - id: acceleration_scale
+    required: false
+    default: 1.0
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+        max_inclusive: 1.0
+  - id: max_tcp_linear_speed_mps
+    required: false
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  - id: per_joint_dynamics_limits
+    required: false
+    default: {}
+    schema_ref: '#/schema_types/per_joint_dynamics_limits'
+  - id: joint_position_tol_rad
+    required: false
+    default: 0.05
+    schema:
+      type: float
+      constraints:
+        min_inclusive: 0.0
+  - id: translation_tol_m
+    required: false
+    default: 0.005
+    schema:
+      type: float
+      constraints:
+        min_inclusive: 0.0
+  - id: rotation_tol_rad
+    required: false
+    default: 0.05
+    schema:
+      type: float
+      constraints:
+        min_inclusive: 0.0
+  - id: planning_timeout_s
+    required: false
+    default: 2.0
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  - id: execution_timeout_s
+    required: false
+    default: 10.0
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  - id: cache_mode
+    required: false
+    default: default
+    schema:
+      type: enum
+      values:
+      - default
+      - disable
+  required_capabilities:
+  - capability_id: planning.motion.joint_goal
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: planning.profile.first_feasible
+    scope: target_binding
+    target_parameter: target_role
+    when:
+      parameter: planning_profile
+      equals: first_feasible
+  - capability_id: planning.profile.balanced
+    scope: target_binding
+    target_parameter: target_role
+    when:
+      parameter: planning_profile
+      equals: balanced
+  - capability_id: planning.profile.quality_bounded
+    scope: target_binding
+    target_parameter: target_role
+    when:
+      parameter: planning_profile
+      equals: quality_bounded
+  - capability_id: planning.trajectory.time_parameterized
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: state.observed.current
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: validation.trajectory.non_collision
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: collision.query.pre_execution
+    scope: cell_global
+  - capability_id: execution.trajectory.execute
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: execution.feedback.phase_events
+    scope: target_binding
+    target_parameter: target_role
+  execution:
+    blocking: true
+    cancellable: true
+    owner_api: kernel.operation
+  outcomes:
+    success: operation_succeeded
+    failure: operation_failed
+    interrupted: operation_terminal
+  runners:
+    py_trees:
+      implementation_id: motion_move_to_joint_target_v1
+  observability:
+    event_family: manyforge.program.node
+- id: motion.move_to_pose
+  name: Move to pose
+  category: motion
+  description: Plan, validate, and execute a portable pose goal.
+  stability: stable
+  tags:
+  - motion
+  - planning
+  - execution
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: target_role
+    required: true
+    schema:
+      type: string
+      semantic_type: target_role
+  - id: base_frame_role
+    required: true
+    schema:
+      type: string
+      semantic_type: frame_role
+  - id: tcp_frame_role
+    required: true
+    schema:
+      type: string
+      semantic_type: frame_role
+  - id: goal
+    required: true
+    schema_ref: '#/schema_types/motion_pose'
+  - id: target_mode
+    required: false
+    default: absolute
+    schema:
+      type: enum
+      values:
+      - absolute
+      - relative
+  - id: target_reference
+    required: false
+    schema_ref: '#/schema_types/motion_reference'
+  - id: offset_reference
+    required: false
+    schema_ref: '#/schema_types/motion_reference'
+  - id: planning_profile
+    required: false
+    default: balanced
+    schema:
+      type: enum
+      values:
+      - first_feasible
+      - balanced
+      - quality_bounded
+  - id: velocity_scale
+    required: false
+    default: 1.0
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+        max_inclusive: 1.0
+  - id: acceleration_scale
+    required: false
+    default: 1.0
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+        max_inclusive: 1.0
+  - id: max_tcp_linear_speed_mps
+    required: false
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  - id: per_joint_dynamics_limits
+    required: false
+    default: {}
+    schema_ref: '#/schema_types/per_joint_dynamics_limits'
+  - id: joint_position_tol_rad
+    required: false
+    default: 0.05
+    schema:
+      type: float
+      constraints:
+        min_inclusive: 0.0
+  - id: translation_tol_m
+    required: false
+    default: 0.005
+    schema:
+      type: float
+      constraints:
+        min_inclusive: 0.0
+  - id: rotation_tol_rad
+    required: false
+    default: 0.05
+    schema:
+      type: float
+      constraints:
+        min_inclusive: 0.0
+  - id: planning_timeout_s
+    required: false
+    default: 2.0
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  - id: execution_timeout_s
+    required: false
+    default: 10.0
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  - id: cache_mode
+    required: false
+    default: default
+    schema:
+      type: enum
+      values:
+      - default
+      - disable
+  - id: contact_policy_id
+    required: false
+    schema:
+      type: string
+  required_capabilities:
+  - capability_id: planning.motion.pose_goal
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: planning.profile.first_feasible
+    scope: target_binding
+    target_parameter: target_role
+    when:
+      parameter: planning_profile
+      equals: first_feasible
+  - capability_id: planning.profile.balanced
+    scope: target_binding
+    target_parameter: target_role
+    when:
+      parameter: planning_profile
+      equals: balanced
+  - capability_id: planning.profile.quality_bounded
+    scope: target_binding
+    target_parameter: target_role
+    when:
+      parameter: planning_profile
+      equals: quality_bounded
+  - capability_id: planning.trajectory.time_parameterized
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: state.observed.current
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: validation.trajectory.non_collision
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: collision.query.pre_execution
+    scope: cell_global
+  - capability_id: execution.trajectory.execute
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: execution.feedback.phase_events
+    scope: target_binding
+    target_parameter: target_role
+  execution:
+    blocking: true
+    cancellable: true
+    owner_api: kernel.operation
+  outcomes:
+    success: operation_succeeded
+    failure: operation_failed
+    interrupted: operation_terminal
+  runners:
+    py_trees:
+      implementation_id: motion_move_to_pose_v1
+  observability:
+    event_family: manyforge.program.node
+- id: motion.follow_cartesian_path
+  name: Follow Cartesian path
+  category: motion
+  description: Plan, validate, and execute a portable ordered Cartesian path.
+  stability: stable
+  tags:
+  - motion
+  - planning
+  - cartesian
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: target_role
+    required: true
+    schema:
+      type: string
+      semantic_type: target_role
+  - id: base_frame_role
+    required: true
+    schema:
+      type: string
+      semantic_type: frame_role
+  - id: tcp_frame_role
+    required: true
+    schema:
+      type: string
+      semantic_type: frame_role
+  - id: path
+    required: true
+    schema_ref: '#/schema_types/cartesian_path'
+  - id: target_mode
+    required: false
+    default: absolute
+    schema:
+      type: enum
+      values:
+      - absolute
+      - relative
+  - id: target_reference
+    required: false
+    schema_ref: '#/schema_types/motion_reference'
+  - id: offset_reference
+    required: false
+    schema_ref: '#/schema_types/motion_reference'
+  - id: planning_profile
+    required: false
+    default: balanced
+    schema:
+      type: enum
+      values:
+      - first_feasible
+      - balanced
+      - quality_bounded
+  - id: max_translation_step_m
+    required: false
+    default: 0.005
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  - id: max_rotation_step_rad
+    required: false
+    default: 0.05
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  - id: max_linear_speed_mps
+    required: false
+    default: 0.1
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  - id: max_angular_speed_rad_s
+    required: false
+    default: 0.5
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  - id: max_linear_acceleration_mps2
+    required: false
+    default: 0.5
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  - id: max_angular_acceleration_rad_s2
+    required: false
+    default: 2.5
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  - id: fallback_policy
+    required: false
+    default: fail_closed
+    schema:
+      type: enum
+      values:
+      - fail_closed
+      - allow_joint_space_fallback
+  - id: velocity_scale
+    required: false
+    default: 1.0
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+        max_inclusive: 1.0
+  - id: acceleration_scale
+    required: false
+    default: 1.0
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+        max_inclusive: 1.0
+  - id: max_tcp_linear_speed_mps
+    required: false
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  - id: per_joint_dynamics_limits
+    required: false
+    default: {}
+    schema_ref: '#/schema_types/per_joint_dynamics_limits'
+  - id: joint_position_tol_rad
+    required: false
+    default: 0.05
+    schema:
+      type: float
+      constraints:
+        min_inclusive: 0.0
+  - id: translation_tol_m
+    required: false
+    default: 0.005
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  - id: rotation_tol_rad
+    required: false
+    default: 0.05
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  - id: planning_timeout_s
+    required: false
+    default: 2.0
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  - id: execution_timeout_s
+    required: false
+    default: 10.0
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  - id: cache_mode
+    required: false
+    default: default
+    schema:
+      type: enum
+      values:
+      - default
+      - disable
+  - id: contact_policy_id
+    required: false
+    schema:
+      type: string
+  required_capabilities:
+  - capability_id: planning.motion.cartesian_path
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: planning.profile.first_feasible
+    scope: target_binding
+    target_parameter: target_role
+    when:
+      parameter: planning_profile
+      equals: first_feasible
+  - capability_id: planning.profile.balanced
+    scope: target_binding
+    target_parameter: target_role
+    when:
+      parameter: planning_profile
+      equals: balanced
+  - capability_id: planning.profile.quality_bounded
+    scope: target_binding
+    target_parameter: target_role
+    when:
+      parameter: planning_profile
+      equals: quality_bounded
+  - capability_id: planning.trajectory.time_parameterized
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: state.observed.current
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: validation.trajectory.non_collision
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: collision.query.pre_execution
+    scope: cell_global
+  - capability_id: execution.trajectory.execute
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: execution.feedback.phase_events
+    scope: target_binding
+    target_parameter: target_role
+  execution:
+    blocking: true
+    cancellable: true
+    owner_api: kernel.operation
+  outcomes:
+    success: operation_succeeded
+    failure: operation_failed
+    interrupted: operation_terminal
+  runners:
+    py_trees:
+      implementation_id: motion_follow_cartesian_path_v1
+  observability:
+    event_family: manyforge.program.node
+- id: motion.move_until_signal
+  name: Move until signal
+  category: motion
+  description: Execute a portable motion with one operation-scoped interrupt policy.
+  stability: stable
+  tags:
+  - motion
+  - interrupt
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: target_role
+    required: true
+    schema:
+      type: string
+      semantic_type: target_role
+  - id: goal
+    required: true
+    schema_ref: '#/schema_types/stored_pose'
+  - id: planning_profile
+    required: false
+    default: balanced
+    schema:
+      type: enum
+      values:
+      - first_feasible
+      - balanced
+      - quality_bounded
+  - id: interrupt_policy_id
+    required: true
+    schema:
+      type: string
+  - id: stop_mode
+    required: true
+    schema:
+      type: enum
+      values:
+      - spring_back_hold
+      - soft_on_path
+      - hard_deceleration
+  - id: activation_mode
+    required: false
+    default: require_inactive_at_arm
+    schema:
+      type: enum
+      values:
+      - require_inactive_at_arm
+      - fresh_edge_after_arm
+      - trip_if_already_active
+  required_capabilities:
+  - capability_id: planning.motion.pose_goal
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: planning.profile.first_feasible
+    scope: target_binding
+    target_parameter: target_role
+    when:
+      parameter: planning_profile
+      equals: first_feasible
+  - capability_id: planning.profile.balanced
+    scope: target_binding
+    target_parameter: target_role
+    when:
+      parameter: planning_profile
+      equals: balanced
+  - capability_id: planning.profile.quality_bounded
+    scope: target_binding
+    target_parameter: target_role
+    when:
+      parameter: planning_profile
+      equals: quality_bounded
+  - capability_id: planning.trajectory.time_parameterized
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: state.observed.current
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: validation.trajectory.non_collision
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: collision.query.pre_execution
+    scope: cell_global
+  - capability_id: execution.trajectory.execute
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: execution.feedback.phase_events
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: execution.interrupt.resource_scoped
+    scope: cell_global
+  execution:
+    blocking: true
+    cancellable: true
+    owner_api: kernel.operation
+  outcomes:
+    success: signal_trip_or_allowed_natural_completion
+    failure: operation_failed
+    interrupted: operation_terminal
+  runners:
+    py_trees:
+      implementation_id: motion_move_until_signal_v1
+  observability:
+    event_family: manyforge.program.node
+- id: motion.probe_search
+  name: Probe search
+  category: motion
+  description: Execute a precision contact search with a scoped interrupt.
+  stability: stable
+  tags:
+  - motion
+  - interrupt
+  - contact
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: target_role
+    required: true
+    schema:
+      type: string
+      semantic_type: target_role
+  - id: goal
+    required: true
+    schema_ref: '#/schema_types/stored_pose'
+  - id: planning_profile
+    required: false
+    default: balanced
+    schema:
+      type: enum
+      values:
+      - first_feasible
+      - balanced
+      - quality_bounded
+  - id: interrupt_policy_id
+    required: true
+    schema:
+      type: string
+  - id: contact_policy_id
+    required: true
+    schema:
+      type: string
+  - id: stop_mode
+    required: true
+    schema:
+      type: enum
+      values:
+      - spring_back_hold
+      - soft_on_path
+      - hard_deceleration
+  required_capabilities:
+  - capability_id: planning.motion.pose_goal
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: planning.profile.first_feasible
+    scope: target_binding
+    target_parameter: target_role
+    when:
+      parameter: planning_profile
+      equals: first_feasible
+  - capability_id: planning.profile.balanced
+    scope: target_binding
+    target_parameter: target_role
+    when:
+      parameter: planning_profile
+      equals: balanced
+  - capability_id: planning.profile.quality_bounded
+    scope: target_binding
+    target_parameter: target_role
+    when:
+      parameter: planning_profile
+      equals: quality_bounded
+  - capability_id: planning.trajectory.time_parameterized
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: state.observed.current
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: validation.trajectory.non_collision
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: collision.query.pre_execution
+    scope: cell_global
+  - capability_id: execution.trajectory.execute
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: execution.feedback.phase_events
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: execution.interrupt.resource_scoped
+    scope: cell_global
+  - capability_id: execution.interrupt.contact_policy
+    scope: cell_global
+  execution:
+    blocking: true
+    cancellable: true
+    owner_api: kernel.operation
+  outcomes:
+    success: precision_contact_trip
+    failure: operation_failed
+    interrupted: operation_terminal
+  runners:
+    py_trees:
+      implementation_id: motion_probe_search_v1
+  observability:
+    event_family: manyforge.program.node
+- id: scene.add_object
+  name: Add scene object
+  category: scene
+  description: Add one portable logical scene resource.
+  stability: stable
+  tags:
+  - scene
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: scene_resource_id
+    required: true
+    schema:
+      type: string
+      semantic_type: scene_resource
+  - id: shape
+    required: true
+    schema_ref: '#/schema_types/shape'
+  - id: pose
+    required: true
+    schema_ref: '#/schema_types/stored_pose'
+  required_capabilities:
+  - capability_id: scene.shape.box
+    scope: cell_global
+  - capability_id: scene.shape.sphere
+    scope: cell_global
+  - capability_id: scene.shape.cylinder
+    scope: cell_global
+  - capability_id: scene.shape.mesh
+    scope: cell_global
+  - capability_id: scene.edit.add
+    scope: cell_global
+  execution:
+    blocking: true
+    cancellable: false
+    owner_api: scene.transaction
+  outcomes:
+    success: scene_committed
+    failure: scene_commit_failed
+  runners:
+    py_trees:
+      implementation_id: scene_add_object_v1
+  observability:
+    event_family: manyforge.program.node
+- id: scene.upsert_object
+  name: Upsert scene object
+  category: scene
+  description: Add or replace one portable logical scene resource.
+  stability: stable
+  tags:
+  - scene
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: scene_resource_id
+    required: true
+    schema:
+      type: string
+      semantic_type: scene_resource
+  - id: shape
+    required: true
+    schema_ref: '#/schema_types/shape'
+  - id: pose
+    required: true
+    schema_ref: '#/schema_types/stored_pose'
+  required_capabilities:
+  - capability_id: scene.shape.box
+    scope: cell_global
+  - capability_id: scene.shape.sphere
+    scope: cell_global
+  - capability_id: scene.shape.cylinder
+    scope: cell_global
+  - capability_id: scene.shape.mesh
+    scope: cell_global
+  - capability_id: scene.edit.upsert
+    scope: cell_global
+  execution:
+    blocking: true
+    cancellable: false
+    owner_api: scene.transaction
+  outcomes:
+    success: scene_committed
+    failure: scene_commit_failed
+  runners:
+    py_trees:
+      implementation_id: scene_upsert_object_v1
+  observability:
+    event_family: manyforge.program.node
+- id: scene.remove_object
+  name: Remove scene object
+  category: scene
+  description: Remove one logical scene resource.
+  stability: stable
+  tags:
+  - scene
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: scene_resource_id
+    required: true
+    schema:
+      type: string
+      semantic_type: scene_resource
+  required_capabilities:
+  - capability_id: scene.edit.remove
+    scope: cell_global
+  execution:
+    blocking: true
+    cancellable: false
+    owner_api: scene.transaction
+  outcomes:
+    success: scene_committed
+    failure: scene_commit_failed
+  runners:
+    py_trees:
+      implementation_id: scene_remove_object_v1
+  observability:
+    event_family: manyforge.program.node
+- id: scene.update_object_pose
+  name: Update scene object pose
+  category: scene
+  description: Update one logical scene resource pose.
+  stability: stable
+  tags:
+  - scene
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: scene_resource_id
+    required: true
+    schema:
+      type: string
+      semantic_type: scene_resource
+  - id: pose
+    required: true
+    schema_ref: '#/schema_types/stored_pose'
+  required_capabilities:
+  - capability_id: scene.edit.update_pose
+    scope: cell_global
+  execution:
+    blocking: true
+    cancellable: false
+    owner_api: scene.transaction
+  outcomes:
+    success: scene_committed
+    failure: scene_commit_failed
+  runners:
+    py_trees:
+      implementation_id: scene_update_object_pose_v1
+  observability:
+    event_family: manyforge.program.node
+- id: scene.attach_carried_object
+  name: Attach object
+  category: scene
+  description: Attach a scene resource to a declared carrier target and frame role.
+  stability: stable
+  tags:
+  - scene
+  - attachment
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: scene_resource_id
+    required: true
+    schema:
+      type: string
+      semantic_type: scene_resource
+  - id: target_role
+    required: true
+    schema:
+      type: string
+      semantic_type: target_role
+  - id: carrier_frame_role
+    required: true
+    schema:
+      type: string
+      semantic_type: frame_role
+      semantic_scope_parameter: target_role
+  - id: touch_body_roles
+    required: true
+    schema:
+      type: array
+      min_items: 1
+      max_items: 256
+      items:
+        type: string
+        semantic_type: collision_body_role
+        semantic_scope_parameter: target_role
+  required_capabilities:
+  - capability_id: scene.edit.attach_detach
+    scope: cell_global
+  - capability_id: model.kinematics.fk
+    scope: target_binding
+    target_parameter: target_role
+  execution:
+    blocking: true
+    cancellable: false
+    owner_api: scene.carried_attachment
+  outcomes:
+    success: attachment_committed
+    failure: attachment_failed
+  runners:
+    py_trees:
+      implementation_id: scene_attach_carried_object_v1
+  observability:
+    event_family: manyforge.program.node
+- id: scene.detach_carried_object
+  name: Detach object
+  category: scene
+  description: Set a scene-owned Attached object to Detached at its current pose.
+  stability: stable
+  tags:
+  - scene
+  - attachment
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: scene_resource_id
+    required: true
+    schema:
+      type: string
+      semantic_type: scene_resource
+  - id: target_role
+    required: true
+    schema:
+      type: string
+      semantic_type: target_role
+  required_capabilities:
+  - capability_id: scene.edit.attach_detach
+    scope: cell_global
+  execution:
+    blocking: true
+    cancellable: false
+    owner_api: scene.carried_attachment
+  outcomes:
+    success: attachment_committed
+    failure: attachment_failed
+  runners:
+    py_trees:
+      implementation_id: scene_detach_carried_object_v1
+  observability:
+    event_family: manyforge.program.node
+- id: logic.check_bool
+  name: Check boolean
+  category: logic
+  description: Compare one literal or typed-source boolean with an expected value.
+  stability: stable
+  tags:
+  - logic
+  - blackboard
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: actual_value
+    required: true
+    schema:
+      type: bool
+  - id: expected_value
+    required: true
+    schema:
+      type: bool
+  required_capabilities: []
+  blackboard:
+    reads: []
+    writes: []
+  execution:
+    blocking: false
+    cancellable: false
+    owner_api: orchestration.blackboard
+  outcomes:
+    success: matched
+    failure: not_matched
+  runners:
+    py_trees:
+      implementation_id: logic_check_bool_v1
+  observability:
+    event_family: manyforge.program.node
+- id: logic.set_bool
+  name: Set boolean
+  category: logic
+  description: Set one declared blackboard boolean.
+  stability: stable
+  tags:
+  - logic
+  - blackboard
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: key
+    required: true
+    schema:
+      type: string
+      semantic_type: blackboard_key
+  - id: value
+    required: true
+    schema:
+      type: bool
+  required_capabilities: []
+  blackboard:
+    reads: []
+    writes:
+    - key_parameter: key
+      value_type: bool
+  execution:
+    blocking: false
+    cancellable: false
+    owner_api: orchestration.blackboard
+  outcomes:
+    success: value_written
+    failure: write_failed
+  runners:
+    py_trees:
+      implementation_id: logic_set_bool_v1
+  observability:
+    event_family: manyforge.program.node
+- id: logic.wait_for_bool
+  name: Wait for boolean
+  category: logic
+  description: Wait until one declared blackboard boolean matches.
+  stability: stable
+  tags:
+  - logic
+  - blackboard
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: key
+    required: true
+    schema:
+      type: string
+      semantic_type: blackboard_key
+  - id: expected_value
+    required: true
+    schema:
+      type: bool
+  required_capabilities: []
+  blackboard:
+    reads:
+    - key_parameter: key
+      value_type: bool
+      missing_key: wait
+    writes: []
+  execution:
+    blocking: true
+    cancellable: true
+    owner_api: orchestration.blackboard
+  outcomes:
+    success: matched
+    failure: wait_failed
+    interrupted: cancelled
+  runners:
+    py_trees:
+      implementation_id: logic_wait_for_bool_v1
+  observability:
+    event_family: manyforge.program.node
+- id: io.set_output
+  name: Set output
+  category: io
+  description: Set one semantic output resource on a target.
+  stability: stable
+  tags:
+  - io
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: target_role
+    required: true
+    schema:
+      type: string
+      semantic_type: target_role
+  - id: resource_role
+    required: true
+    schema:
+      type: string
+      semantic_type: resource_role
+  - id: value
+    required: true
+    schema:
+      type: bool
+  required_capabilities:
+  - capability_id: io.gpio.set_output
+    scope: target_binding
+    target_parameter: target_role
+  execution:
+    blocking: true
+    cancellable: true
+    owner_api: kernel.command_target
+  outcomes:
+    success: command_succeeded
+    failure: command_failed
+    interrupted: command_terminal
+  runners:
+    py_trees:
+      implementation_id: io_set_output_v1
+  observability:
+    event_family: manyforge.program.node
+- id: io.get_input
+  name: Get input
+  category: io
+  description: Read one semantic input resource from a target.
+  stability: stable
+  tags:
+  - io
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: target_role
+    required: true
+    schema:
+      type: string
+      semantic_type: target_role
+  - id: resource_role
+    required: true
+    schema:
+      type: string
+      semantic_type: resource_role
+  - id: output_key
+    required: true
+    schema:
+      type: string
+      semantic_type: blackboard_key
+  required_capabilities:
+  - capability_id: io.gpio.get_input
+    scope: target_binding
+    target_parameter: target_role
+  blackboard:
+    reads: []
+    writes:
+    - key_parameter: output_key
+      value_type: bool
+  execution:
+    blocking: true
+    cancellable: false
+    owner_api: kernel.command_target
+  outcomes:
+    success: input_read
+    failure: input_failed
+  runners:
+    py_trees:
+      implementation_id: io_get_input_v1
+  observability:
+    event_family: manyforge.program.node
+- id: io.wait_for_input
+  name: Wait for input
+  category: io
+  description: Wait for one semantic input resource to reach a value.
+  stability: stable
+  tags:
+  - io
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: target_role
+    required: true
+    schema:
+      type: string
+      semantic_type: target_role
+  - id: resource_role
+    required: true
+    schema:
+      type: string
+      semantic_type: resource_role
+  - id: expected_value
+    required: true
+    schema:
+      type: bool
+  - id: edge
+    required: false
+    default: level
+    schema:
+      type: enum
+      values:
+      - level
+      - rising
+      - falling
+  required_capabilities:
+  - capability_id: io.gpio.wait_for_input
+    scope: target_binding
+    target_parameter: target_role
+  execution:
+    blocking: true
+    cancellable: true
+    owner_api: kernel.command_target
+  outcomes:
+    success: condition_satisfied
+    failure: input_failed
+    interrupted: command_terminal
+  runners:
+    py_trees:
+      implementation_id: io_wait_for_input_v1
+  observability:
+    event_family: manyforge.program.node
+- id: gripper.command_position
+  name: Command gripper position
+  category: gripper
+  description: Command one semantic gripper target position.
+  stability: stable
+  tags:
+  - gripper
+  - tool
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: target_role
+    required: true
+    schema:
+      type: string
+      semantic_type: target_role
+  - id: position
+    required: true
+    schema_ref: '#/schema_types/coordinate_position'
+  - id: max_effort
+    required: false
+    schema_ref: '#/schema_types/coordinate_effort_limit'
+  - id: command_duration_s
+    required: false
+    schema:
+      type: float
+      constraints:
+        min_inclusive: 0.0
+  - id: completion_timeout_s
+    required: false
+    default: 30.0
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  required_capabilities:
+  - capability_id: tool.gripper.command
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: tool.gripper.feedback
+    scope: target_binding
+    target_parameter: target_role
+  execution:
+    blocking: true
+    cancellable: true
+    owner_api: kernel.command_target
+  outcomes:
+    success: command_succeeded
+    failure: command_failed
+    interrupted: command_terminal
+  runners:
+    py_trees:
+      implementation_id: gripper_command_position_v1
+  observability:
+    event_family: manyforge.program.node
+- id: gripper.check_status
+  name: Check gripper status
+  category: gripper
+  description: Compare immutable gripper-target status with an expected state.
+  stability: stable
+  tags:
+  - gripper
+  - tool
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: target_role
+    required: true
+    schema:
+      type: string
+      semantic_type: target_role
+  - id: expected_state
+    required: true
+    schema:
+      type: enum
+      values:
+      - idle
+      - moving
+      - reached
+      - grasp_confirmed
+      - failed
+  required_capabilities:
+  - capability_id: tool.gripper.feedback
+    scope: target_binding
+    target_parameter: target_role
+    when:
+      parameter: expected_state
+      equals: idle
+  - capability_id: tool.gripper.feedback
+    scope: target_binding
+    target_parameter: target_role
+    when:
+      parameter: expected_state
+      equals: moving
+  - capability_id: tool.gripper.feedback
+    scope: target_binding
+    target_parameter: target_role
+    when:
+      parameter: expected_state
+      equals: reached
+  - capability_id: tool.gripper.feedback
+    scope: target_binding
+    target_parameter: target_role
+    when:
+      parameter: expected_state
+      equals: failed
+  - capability_id: tool.gripper.confirmation.operator
+    scope: target_binding
+    target_parameter: target_role
+    when:
+      parameter: expected_state
+      equals: grasp_confirmed
+  execution:
+    blocking: false
+    cancellable: false
+    owner_api: kernel.command_target
+  outcomes:
+    success: matched
+    failure: not_matched
+  runners:
+    py_trees:
+      implementation_id: gripper_check_status_v1
+  observability:
+    event_family: manyforge.program.node
+- id: gripper.wait_for_status
+  name: Wait for gripper status
+  category: gripper
+  description: Wait for the captured gripper command and source, with a bounded timeout.
+    Grasp confirmation is an explicit operator statement, never inferred from movement.
+  stability: stable
+  tags:
+  - gripper
+  - tool
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: target_role
+    required: true
+    schema:
+      type: string
+      semantic_type: target_role
+  - id: expected_state
+    required: true
+    schema:
+      type: enum
+      values:
+      - idle
+      - moving
+      - reached
+      - grasp_confirmed
+      - failed
+  - id: timeout_s
+    required: true
+    schema:
+      type: float
+      constraints:
+        min_inclusive: 0.01
+        max_inclusive: 3600.0
+  required_capabilities:
+  - capability_id: tool.gripper.feedback
+    scope: target_binding
+    target_parameter: target_role
+    when:
+      parameter: expected_state
+      equals: idle
+  - capability_id: tool.gripper.feedback
+    scope: target_binding
+    target_parameter: target_role
+    when:
+      parameter: expected_state
+      equals: moving
+  - capability_id: tool.gripper.feedback
+    scope: target_binding
+    target_parameter: target_role
+    when:
+      parameter: expected_state
+      equals: reached
+  - capability_id: tool.gripper.feedback
+    scope: target_binding
+    target_parameter: target_role
+    when:
+      parameter: expected_state
+      equals: failed
+  - capability_id: tool.gripper.confirmation.operator
+    scope: target_binding
+    target_parameter: target_role
+    when:
+      parameter: expected_state
+      equals: grasp_confirmed
+  execution:
+    blocking: true
+    cancellable: true
+    owner_api: kernel.command_target
+  outcomes:
+    success: matched
+    failure: unavailable_stale_failed_or_timeout
+  runners:
+    py_trees:
+      implementation_id: gripper_wait_for_status_v1
+  observability:
+    event_family: manyforge.program.node
+- id: model.get_frame_pose
+  name: Get frame pose
+  category: model
+  description: Resolve one declared frame role from fresh qualified state.
+  stability: stable
+  tags:
+  - model
+  - kinematics
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: target_role
+    required: true
+    schema:
+      type: string
+      semantic_type: target_role
+  - id: frame_role
+    required: true
+    schema:
+      type: string
+      semantic_type: frame_role
+  - id: output_key
+    required: true
+    schema:
+      type: string
+      semantic_type: blackboard_key
+  required_capabilities:
+  - capability_id: model.kinematics.fk
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: state.observed.current
+    scope: target_binding
+    target_parameter: target_role
+  blackboard:
+    reads: []
+    writes:
+    - key_parameter: output_key
+      value_type: stored_pose
+  execution:
+    blocking: true
+    cancellable: false
+    owner_api: model.kinematics
+  outcomes:
+    success: pose_resolved
+    failure: pose_unavailable
+  runners:
+    py_trees:
+      implementation_id: model_get_frame_pose_v1
+  observability:
+    event_family: manyforge.program.node
+- id: geometry.check_pose_distance
+  name: Check pose distance
+  category: geometry
+  description: Compare two declared pose values with portable thresholds.
+  stability: stable
+  tags:
+  - geometry
+  - blackboard
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: pose_key_a
+    required: true
+    schema:
+      type: string
+      semantic_type: blackboard_key
+  - id: pose_key_b
+    required: true
+    schema:
+      type: string
+      semantic_type: blackboard_key
+  - id: translation_threshold_m
+    required: true
+    schema:
+      type: float
+      constraints:
+        min_inclusive: 0.0
+  - id: rotation_threshold_rad
+    required: true
+    schema:
+      type: float
+      constraints:
+        min_inclusive: 0.0
+  required_capabilities: []
+  blackboard:
+    reads:
+    - key_parameter: pose_key_a
+      value_type: stored_pose
+      missing_key: failure
+    - key_parameter: pose_key_b
+      value_type: stored_pose
+      missing_key: failure
+    writes: []
+  execution:
+    blocking: false
+    cancellable: false
+    owner_api: geometry.compare
+  outcomes:
+    success: within_threshold
+    failure: outside_threshold
+  runners:
+    py_trees:
+      implementation_id: geometry_check_pose_distance_v1
+  observability:
+    event_family: manyforge.program.node
+- id: lifecycle.prepare_component
+  name: Prepare component
+  category: lifecycle
+  description: Request one generic CCLC Prepare transaction.
+  stability: stable
+  tags:
+  - lifecycle
+  - component
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: component_role
+    required: true
+    schema:
+      type: string
+      semantic_type: component_role
+  required_capabilities:
+  - capability_id: component.lifecycle.observe
+    scope: control_domain
+    component_parameter: component_role
+  - capability_id: component.lifecycle.prepare
+    scope: control_domain
+    component_parameter: component_role
+  execution:
+    blocking: true
+    cancellable: false
+    owner_api: cclc.lifecycle
+  outcomes:
+    success: lifecycle_succeeded
+    failure: lifecycle_failed
+  runners:
+    py_trees:
+      implementation_id: lifecycle_prepare_component_v1
+  observability:
+    event_family: manyforge.program.node
+- id: lifecycle.enable_component
+  name: Enable component
+  category: lifecycle
+  description: Request one generic CCLC Enable transaction.
+  stability: stable
+  tags:
+  - lifecycle
+  - component
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: component_role
+    required: true
+    schema:
+      type: string
+      semantic_type: component_role
+  required_capabilities:
+  - capability_id: component.lifecycle.observe
+    scope: control_domain
+    component_parameter: component_role
+  - capability_id: component.lifecycle.enable
+    scope: control_domain
+    component_parameter: component_role
+  execution:
+    blocking: true
+    cancellable: false
+    owner_api: cclc.lifecycle
+  outcomes:
+    success: lifecycle_succeeded
+    failure: lifecycle_failed
+  runners:
+    py_trees:
+      implementation_id: lifecycle_enable_component_v1
+  observability:
+    event_family: manyforge.program.node
+- id: lifecycle.disable_component
+  name: Disable component
+  category: lifecycle
+  description: Request CCLC Disable through the Kernel Stop/fence transition.
+  stability: stable
+  tags:
+  - lifecycle
+  - component
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: component_role
+    required: true
+    schema:
+      type: string
+      semantic_type: component_role
+  required_capabilities:
+  - capability_id: component.lifecycle.observe
+    scope: control_domain
+    component_parameter: component_role
+  - capability_id: component.lifecycle.disable
+    scope: control_domain
+    component_parameter: component_role
+  execution:
+    blocking: true
+    cancellable: false
+    owner_api: cclc.lifecycle
+  outcomes:
+    success: lifecycle_succeeded
+    failure: lifecycle_failed
+  runners:
+    py_trees:
+      implementation_id: lifecycle_disable_component_v1
+  observability:
+    event_family: manyforge.program.node
+- id: lifecycle.recover_component
+  name: Recover component
+  category: lifecycle
+  description: Request one generic CCLC Recover transaction.
+  stability: stable
+  tags:
+  - lifecycle
+  - component
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: component_role
+    required: true
+    schema:
+      type: string
+      semantic_type: component_role
+  required_capabilities:
+  - capability_id: component.lifecycle.observe
+    scope: control_domain
+    component_parameter: component_role
+  - capability_id: component.lifecycle.recover
+    scope: control_domain
+    component_parameter: component_role
+  execution:
+    blocking: true
+    cancellable: false
+    owner_api: cclc.lifecycle
+  outcomes:
+    success: lifecycle_succeeded
+    failure: lifecycle_failed
+  runners:
+    py_trees:
+      implementation_id: lifecycle_recover_component_v1
+  observability:
+    event_family: manyforge.program.node
+- id: controller.select_route
+  name: Select control route
+  category: controller
+  description: Request a declared control route through CCLC.
+  stability: stable
+  tags:
+  - controller
+  - route
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: target_role
+    required: true
+    schema:
+      type: string
+      semantic_type: target_role
+  - id: route_role
+    required: true
+    schema:
+      type: string
+  required_capabilities:
+  - capability_id: control_domain.controller.observe
+    scope: control_domain
+    target_parameter: target_role
+  - capability_id: control_domain.controller.switch
+    scope: control_domain
+    target_parameter: target_role
+  execution:
+    blocking: true
+    cancellable: false
+    owner_api: cclc.control_route
+  outcomes:
+    success: route_selected
+    failure: route_selection_failed
+  runners:
+    py_trees:
+      implementation_id: controller_select_route_v1
+  observability:
+    event_family: manyforge.program.node
+- id: kernel.stop_operation
+  name: Stop operation
+  category: recovery
+  description: Request Stop for one exact runtime-selected operation scope.
+  stability: stable
+  tags:
+  - kernel
+  - stop
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: target_role
+    required: true
+    schema:
+      type: string
+      semantic_type: target_role
+  required_capabilities:
+  - capability_id: execution.stop.soft
+    scope: target_binding
+    target_parameter: target_role
+  owner_context:
+    kind: current_operation
+    required: true
+  execution:
+    blocking: true
+    cancellable: false
+    owner_api: kernel.stop
+  outcomes:
+    success: stop_certified
+    failure: stop_failed
+  runners:
+    py_trees:
+      implementation_id: kernel_stop_operation_v1
+  observability:
+    event_family: manyforge.program.node
+- id: kernel.full_stop
+  name: Full Stop
+  category: recovery
+  description: Request one explicit cell-wide Full Stop.
+  stability: stable
+  tags:
+  - kernel
+  - stop
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters: []
+  required_capabilities: []
+  execution:
+    blocking: true
+    cancellable: false
+    owner_api: kernel.full_stop
+  outcomes:
+    success: stop_certified
+    failure: stop_failed
+  runners:
+    py_trees:
+      implementation_id: kernel_full_stop_v1
+  observability:
+    event_family: manyforge.program.node
+- id: kernel.pause_operation
+  name: Pause operation
+  category: recovery
+  description: Pause one exact runtime-selected operation.
+  stability: stable
+  tags:
+  - kernel
+  - pause
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: target_role
+    required: true
+    schema:
+      type: string
+      semantic_type: target_role
+  required_capabilities:
+  - capability_id: execution.pause
+    scope: target_binding
+    target_parameter: target_role
+  owner_context:
+    kind: current_operation
+    required: true
+  execution:
+    blocking: true
+    cancellable: false
+    owner_api: kernel.pause
+  outcomes:
+    success: operation_paused
+    failure: pause_failed
+  runners:
+    py_trees:
+      implementation_id: kernel_pause_operation_v1
+  observability:
+    event_family: manyforge.program.node
+- id: kernel.resume_operation
+  name: Resume operation
+  category: recovery
+  description: Resume one exact runtime-selected paused operation.
+  stability: stable
+  tags:
+  - kernel
+  - resume
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: target_role
+    required: true
+    schema:
+      type: string
+      semantic_type: target_role
+  required_capabilities:
+  - capability_id: execution.resume
+    scope: target_binding
+    target_parameter: target_role
+  owner_context:
+    kind: current_operation
+    required: true
+  execution:
+    blocking: true
+    cancellable: false
+    owner_api: kernel.resume
+  outcomes:
+    success: operation_resumed
+    failure: resume_failed
+  runners:
+    py_trees:
+      implementation_id: kernel_resume_operation_v1
+  observability:
+    event_family: manyforge.program.node
+- id: kernel.reset_operation
+  name: Reset operation
+  category: recovery
+  description: Reset one exact terminal or recoverable operation scope.
+  stability: stable
+  tags:
+  - kernel
+  - reset
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: target_role
+    required: true
+    schema:
+      type: string
+      semantic_type: target_role
+  required_capabilities:
+  - capability_id: execution.reset
+    scope: target_binding
+    target_parameter: target_role
+  owner_context:
+    kind: current_operation
+    required: true
+  execution:
+    blocking: true
+    cancellable: false
+    owner_api: kernel.reset
+  outcomes:
+    success: operation_reset
+    failure: reset_failed
+  runners:
+    py_trees:
+      implementation_id: kernel_reset_operation_v1
+  observability:
+    event_family: manyforge.program.node
+- id: kernel.set_runtime_scale
+  name: Set runtime scale
+  category: motion
+  description: Set generation-fenced runtime scaling on one selected operation.
+  stability: stable
+  tags:
+  - kernel
+  - scaling
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: target_role
+    required: true
+    schema:
+      type: string
+      semantic_type: target_role
+  - id: scale
+    required: true
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+        max_inclusive: 1.0
+  required_capabilities:
+  - capability_id: execution.runtime_scale.operation_scoped
+    scope: target_binding
+    target_parameter: target_role
+  owner_context:
+    kind: current_operation
+    required: true
+  execution:
+    blocking: true
+    cancellable: false
+    owner_api: kernel.runtime_scaling
+  outcomes:
+    success: scaling_applied
+    failure: scaling_failed
+  runners:
+    py_trees:
+      implementation_id: kernel_set_runtime_scale_v1
+  observability:
+    event_family: manyforge.program.node
+- id: simulation.reset
+  name: Reset simulation
+  category: simulation
+  description: Request a bounded reset from the cell-global simulator owner.
+  stability: stable
+  tags:
+  - simulation
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters: []
+  required_capabilities:
+  - capability_id: simulator.control.reset
+    scope: cell_global
+  execution:
+    blocking: true
+    cancellable: true
+    owner_api: simulator.control
+  outcomes:
+    success: simulator_command_succeeded
+    failure: simulator_command_failed
+    interrupted: cancelled
+  runners:
+    py_trees:
+      implementation_id: simulation_reset_v1
+  observability:
+    event_family: manyforge.program.node
+- id: simulation.set_state
+  name: Set simulation state
+  category: simulation
+  description: Request simulator play or pause for one selected control domain.
+  stability: stable
+  tags:
+  - simulation
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: state
+    required: true
+    schema:
+      type: enum
+      values:
+      - play
+      - pause
+  required_capabilities:
+  - capability_id: simulator.control.pause
+    scope: cell_global
+  - capability_id: simulator.control.play
+    scope: cell_global
+  execution:
+    blocking: true
+    cancellable: true
+    owner_api: simulator.control
+  outcomes:
+    success: simulator_command_succeeded
+    failure: simulator_command_failed
+    interrupted: cancelled
+  runners:
+    py_trees:
+      implementation_id: simulation_set_state_v1
+  observability:
+    event_family: manyforge.program.node
+- id: simulation.step
+  name: Step simulation
+  category: simulation
+  description: Advance one selected simulator domain by a bounded step count.
+  stability: stable
+  tags:
+  - simulation
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: steps
+    required: true
+    schema:
+      type: int
+      constraints:
+        min_inclusive: 1
+        max_inclusive: 1000000
+  required_capabilities:
+  - capability_id: simulator.control.step
+    scope: cell_global
+  execution:
+    blocking: true
+    cancellable: true
+    owner_api: simulator.control
+  outcomes:
+    success: simulator_command_succeeded
+    failure: simulator_command_failed
+    interrupted: cancelled
+  runners:
+    py_trees:
+      implementation_id: simulation_step_v1
+  observability:
+    event_family: manyforge.program.node
+- id: simulation.set_entity_pose
+  name: Set simulator entity pose
+  category: simulation
+  description: Set one declared scene resource pose in a simulator domain.
+  stability: stable
+  tags:
+  - simulation
+  - scene
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: scene_resource_id
+    required: true
+    schema:
+      type: string
+      semantic_type: scene_resource
+  - id: pose
+    required: true
+    schema_ref: '#/schema_types/stored_pose'
+  required_capabilities:
+  - capability_id: simulator.entity_state.set
+    scope: cell_global
+  execution:
+    blocking: true
+    cancellable: true
+    owner_api: simulator.control
+  outcomes:
+    success: simulator_command_succeeded
+    failure: simulator_command_failed
+    interrupted: cancelled
+  runners:
+    py_trees:
+      implementation_id: simulation_set_entity_pose_v1
+  observability:
+    event_family: manyforge.program.node
+- id: assistant.query_model
+  name: Query model
+  category: assistant
+  description: Submit a bounded model request using declared portable inputs.
+  stability: stable
+  tags:
+  - assistant
+  - model
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: model_endpoint_alias
+    required: true
+    schema:
+      type: string
+  - id: prompt_template_id
+    required: true
+    schema:
+      type: string
+  - id: template_variables
+    required: false
+    default: []
+    schema_ref: '#/schema_types/template_variable_bindings'
+  - id: scene_attachment
+    required: false
+    default: none
+    schema:
+      type: enum
+      values:
+      - none
+      - state_json
+      - snapshot_image
+  - id: output_key
+    required: true
+    schema:
+      type: string
+      semantic_type: blackboard_key
+  - id: timeout_s
+    required: false
+    default: 30.0
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  - id: min_confidence
+    required: false
+    default: 0.0
+    schema:
+      type: float
+      constraints:
+        min_inclusive: 0.0
+        max_inclusive: 1.0
+  - id: model_runtime_failure_policy
+    required: false
+    default: pause_for_operator
+    schema:
+      type: enum
+      values:
+      - pause_for_operator
+      - condition_failure
+  - id: model_low_confidence_policy
+    required: false
+    default: pause_for_operator
+    schema:
+      type: enum
+      values:
+      - pause_for_operator
+      - condition_failure
+  - id: retry_on_parse_failure
+    required: false
+    default: false
+    schema:
+      type: bool
+  - id: scene_snapshot_transport
+    required: false
+    default: inline_data_url
+    schema:
+      type: enum
+      values:
+      - inline_data_url
+      - http_url
+  - id: scene_snapshot_width
+    required: false
+    default: 640
+    schema:
+      type: int
+      constraints:
+        min_inclusive: 64
+        max_inclusive: 1920
+  - id: scene_snapshot_height
+    required: false
+    default: 480
+    schema:
+      type: int
+      constraints:
+        min_inclusive: 64
+        max_inclusive: 1080
+  - id: scene_snapshot_format
+    required: false
+    default: jpeg
+    schema:
+      type: enum
+      values:
+      - jpeg
+      - png
+  required_capabilities: []
+  blackboard:
+    reads: []
+    writes:
+    - key_parameter: output_key
+      value_type: model_response
+  execution:
+    blocking: false
+    cancellable: true
+    owner_api: assistant.model_request
+  outcomes:
+    success: model_response_valid
+    failure: model_request_failed
+    interrupted: cancelled
+  runners:
+    py_trees:
+      implementation_id: assistant_query_model_v1
+  observability:
+    event_family: manyforge.program.node
+- id: assistant.build_scene_selection
+  name: Build scene selection
+  category: assistant
+  description: Build a bounded portable object-selection context.
+  stability: stable
+  tags:
+  - assistant
+  - perception
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: selection_request_text
+    required: true
+    schema:
+      type: string
+  - id: output_key
+    required: true
+    schema:
+      type: string
+      semantic_type: blackboard_key
+  - id: object_source
+    required: false
+    default: backend_scene
+    schema:
+      type: enum
+      values:
+      - backend_scene
+  - id: candidate_object_ids
+    required: false
+    default: []
+    schema:
+      type: array
+      max_items: 4096
+      items:
+        type: string
+        semantic_type: scene_resource
+  - id: image_source
+    required: false
+    default: none
+    schema:
+      type: enum
+      values:
+      - none
+      - viewer_snapshot
+  - id: image_snapshot_width
+    required: false
+    default: 640
+    schema:
+      type: int
+      constraints:
+        min_inclusive: 64
+        max_inclusive: 1920
+  - id: image_snapshot_height
+    required: false
+    default: 480
+    schema:
+      type: int
+      constraints:
+        min_inclusive: 64
+        max_inclusive: 1080
+  - id: image_snapshot_format
+    required: false
+    default: jpeg
+    schema:
+      type: enum
+      values:
+      - jpeg
+      - png
+  - id: unavailable_policy
+    required: false
+    default: pause_for_operator
+    schema:
+      type: enum
+      values:
+      - pause_for_operator
+      - condition_failure
+  required_capabilities: []
+  blackboard:
+    reads: []
+    writes:
+    - key_parameter: output_key
+      value_type: scene_selection_context
+  execution:
+    blocking: true
+    cancellable: true
+    owner_api: assistant.scene_context
+  outcomes:
+    success: context_built
+    failure: context_failed
+    interrupted: cancelled
+  runners:
+    py_trees:
+      implementation_id: assistant_build_scene_selection_v1
+  observability:
+    event_family: manyforge.program.node
+- id: assistant.validate_scene_selection
+  name: Validate scene selection
+  category: assistant
+  description: Validate a model selection against a retained scene context.
+  stability: stable
+  tags:
+  - assistant
+  - perception
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: selection_context_key
+    required: true
+    schema:
+      type: string
+      semantic_type: blackboard_key
+  - id: selection_response_key
+    required: true
+    schema:
+      type: string
+      semantic_type: blackboard_key
+  - id: output_key
+    required: true
+    schema:
+      type: string
+      semantic_type: blackboard_key
+  - id: allow_no_match
+    required: false
+    default: false
+    schema:
+      type: bool
+  - id: allow_ambiguous
+    required: false
+    default: false
+    schema:
+      type: bool
+  required_capabilities: []
+  blackboard:
+    reads:
+    - key_parameter: selection_context_key
+      value_type: scene_selection_context
+      missing_key: failure
+    - key_parameter: selection_response_key
+      value_type: model_response
+      missing_key: failure
+    writes:
+    - key_parameter: output_key
+      value_type: scene_selection_result
+  execution:
+    blocking: true
+    cancellable: true
+    owner_api: assistant.scene_selection
+  outcomes:
+    success: selection_valid
+    failure: selection_invalid
+    interrupted: cancelled
+  runners:
+    py_trees:
+      implementation_id: assistant_validate_scene_selection_v1
+  observability:
+    event_family: manyforge.program.node
+- id: planning.plan_pick_sequence
+  name: Plan pick sequence
+  category: motion
+  description: Produce a portable validated pick-sequence candidate for one target
+    role.
+  stability: stable
+  tags:
+  - motion
+  - planning
+  - pick
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: target_role
+    required: true
+    schema:
+      type: string
+      semantic_type: target_role
+  - id: tool_target_role
+    required: true
+    schema:
+      type: string
+      semantic_type: target_role
+  - id: base_frame_role
+    required: true
+    schema:
+      type: string
+      semantic_type: frame_role
+  - id: tcp_frame_role
+    required: true
+    schema:
+      type: string
+      semantic_type: frame_role
+  - id: carrier_frame_role
+    required: true
+    schema:
+      type: string
+      semantic_type: frame_role
+  - id: selected_object_id
+    required: true
+    schema:
+      type: string
+      semantic_type: scene_resource
+  - id: synthesis
+    required: false
+    default:
+      pick_offset_envelope:
+        position_min_m:
+        - 0.0
+        - 0.0
+        - 0.0
+        position_max_m:
+        - 0.0
+        - 0.0
+        - 0.0
+        orientation_rpy_min_deg:
+        - 0.0
+        - 0.0
+        - 0.0
+        orientation_rpy_max_deg:
+        - 0.0
+        - 0.0
+        - 0.0
+      approach_offset_envelope:
+        position_min_m:
+        - 0.0
+        - 0.0
+        - 0.05
+        position_max_m:
+        - 0.0
+        - 0.0
+        - 0.1
+        orientation_rpy_min_deg:
+        - 0.0
+        - 0.0
+        - 0.0
+        orientation_rpy_max_deg:
+        - 0.0
+        - 0.0
+        - 0.0
+    schema_ref: '#/schema_types/pick_synthesis'
+  - id: planning_profile
+    required: false
+    default: first_feasible
+    schema:
+      type: enum
+      values:
+      - first_feasible
+      - balanced
+      - quality_bounded
+  - id: motion_options
+    required: false
+    default: {}
+    schema_ref: '#/schema_types/pick_motion_options'
+  - id: tool_position
+    required: true
+    schema_ref: '#/schema_types/coordinate_position'
+  - id: tool_max_effort
+    required: false
+    schema_ref: '#/schema_types/coordinate_effort_limit'
+  - id: tool_command_duration_s
+    required: false
+    default: 0.0
+    schema:
+      type: float
+      constraints:
+        min_inclusive: 0.0
+  - id: tool_completion_timeout_s
+    required: false
+    default: 30.0
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  - id: output_key
+    required: true
+    schema:
+      type: string
+      semantic_type: blackboard_key
+  - id: contact_policy_id
+    required: true
+    schema:
+      type: string
+  - id: no_feasible_plan_policy
+    required: false
+    default: pause_for_operator
+    schema:
+      type: enum
+      values:
+      - pause_for_operator
+      - condition_failure
+  required_capabilities:
+  - capability_id: planning.motion.pose_goal
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: planning.motion.cartesian_path
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: planning.profile.first_feasible
+    scope: target_binding
+    target_parameter: target_role
+    when:
+      parameter: planning_profile
+      equals: first_feasible
+  - capability_id: planning.profile.balanced
+    scope: target_binding
+    target_parameter: target_role
+    when:
+      parameter: planning_profile
+      equals: balanced
+  - capability_id: planning.profile.quality_bounded
+    scope: target_binding
+    target_parameter: target_role
+    when:
+      parameter: planning_profile
+      equals: quality_bounded
+  - capability_id: planning.trajectory.time_parameterized
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: state.observed.current
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: validation.trajectory.non_collision
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: collision.query.pre_execution
+    scope: cell_global
+  - capability_id: model.kinematics.fk
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: tool.gripper.command
+    scope: target_binding
+    target_parameter: tool_target_role
+  - capability_id: tool.gripper.feedback
+    scope: target_binding
+    target_parameter: tool_target_role
+  - capability_id: scene.edit.attach_detach
+    scope: cell_global
+  blackboard:
+    reads: []
+    writes:
+    - key_parameter: output_key
+      value_type: pick_planning_result
+  execution:
+    blocking: true
+    cancellable: true
+    owner_api: planning.pick_sequence
+  outcomes:
+    success: candidate_planned
+    failure: no_feasible_candidate
+    interrupted: cancelled
+  runners:
+    py_trees:
+      implementation_id: planning_plan_pick_sequence_v1
+  observability:
+    event_family: manyforge.program.node
+- id: motion.pick_object
+  name: Pick object
+  category: motion
+  description: Plan and execute one owner-coordinated pick sequence from portable
+    intent.
+  stability: stable
+  tags:
+  - motion
+  - planning
+  - execution
+  - pick
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: target_role
+    required: true
+    schema:
+      type: string
+      semantic_type: target_role
+  - id: tool_target_role
+    required: true
+    schema:
+      type: string
+      semantic_type: target_role
+  - id: base_frame_role
+    required: true
+    schema:
+      type: string
+      semantic_type: frame_role
+  - id: tcp_frame_role
+    required: true
+    schema:
+      type: string
+      semantic_type: frame_role
+  - id: carrier_frame_role
+    required: true
+    schema:
+      type: string
+      semantic_type: frame_role
+  - id: selected_object_id
+    required: true
+    schema:
+      type: string
+      semantic_type: scene_resource
+  - id: synthesis
+    required: false
+    default:
+      pick_offset_envelope:
+        position_min_m:
+        - 0.0
+        - 0.0
+        - 0.0
+        position_max_m:
+        - 0.0
+        - 0.0
+        - 0.0
+        orientation_rpy_min_deg:
+        - 0.0
+        - 0.0
+        - 0.0
+        orientation_rpy_max_deg:
+        - 0.0
+        - 0.0
+        - 0.0
+      approach_offset_envelope:
+        position_min_m:
+        - 0.0
+        - 0.0
+        - 0.05
+        position_max_m:
+        - 0.0
+        - 0.0
+        - 0.1
+        orientation_rpy_min_deg:
+        - 0.0
+        - 0.0
+        - 0.0
+        orientation_rpy_max_deg:
+        - 0.0
+        - 0.0
+        - 0.0
+    schema_ref: '#/schema_types/pick_synthesis'
+  - id: planning_profile
+    required: false
+    default: first_feasible
+    schema:
+      type: enum
+      values:
+      - first_feasible
+      - balanced
+      - quality_bounded
+  - id: motion_options
+    required: false
+    default: {}
+    schema_ref: '#/schema_types/pick_motion_options'
+  - id: tool_position
+    required: true
+    schema_ref: '#/schema_types/coordinate_position'
+  - id: tool_max_effort
+    required: false
+    schema_ref: '#/schema_types/coordinate_effort_limit'
+  - id: tool_command_duration_s
+    required: false
+    default: 0.0
+    schema:
+      type: float
+      constraints:
+        min_inclusive: 0.0
+  - id: tool_completion_timeout_s
+    required: false
+    default: 30.0
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  - id: contact_policy_id
+    required: true
+    schema:
+      type: string
+  - id: no_feasible_plan_policy
+    required: false
+    default: pause_for_operator
+    schema:
+      type: enum
+      values:
+      - pause_for_operator
+      - condition_failure
+  required_capabilities:
+  - capability_id: planning.motion.pose_goal
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: planning.motion.cartesian_path
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: planning.profile.first_feasible
+    scope: target_binding
+    target_parameter: target_role
+    when:
+      parameter: planning_profile
+      equals: first_feasible
+  - capability_id: planning.profile.balanced
+    scope: target_binding
+    target_parameter: target_role
+    when:
+      parameter: planning_profile
+      equals: balanced
+  - capability_id: planning.profile.quality_bounded
+    scope: target_binding
+    target_parameter: target_role
+    when:
+      parameter: planning_profile
+      equals: quality_bounded
+  - capability_id: planning.trajectory.time_parameterized
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: state.observed.current
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: validation.trajectory.non_collision
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: collision.query.pre_execution
+    scope: cell_global
+  - capability_id: execution.trajectory.execute
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: execution.feedback.phase_events
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: model.kinematics.fk
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: tool.gripper.command
+    scope: target_binding
+    target_parameter: tool_target_role
+  - capability_id: tool.gripper.feedback
+    scope: target_binding
+    target_parameter: tool_target_role
+  - capability_id: scene.edit.attach_detach
+    scope: cell_global
+  execution:
+    blocking: true
+    cancellable: true
+    owner_api: kernel.pick_place_sequence
+  outcomes:
+    success: sequence_completed
+    failure: sequence_failed_or_intervention_required
+    interrupted: sequence_terminal
+  runners:
+    py_trees:
+      implementation_id: motion_pick_object_v1
+  observability:
+    event_family: manyforge.program.node
+- id: motion.place_object
+  name: Place object
+  category: motion
+  description: Plan and execute one owner-coordinated place sequence from portable
+    intent.
+  stability: stable
+  tags:
+  - motion
+  - planning
+  - execution
+  - place
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: target_role
+    required: true
+    schema:
+      type: string
+      semantic_type: target_role
+  - id: tool_target_role
+    required: true
+    schema:
+      type: string
+      semantic_type: target_role
+  - id: base_frame_role
+    required: true
+    schema:
+      type: string
+      semantic_type: frame_role
+  - id: tcp_frame_role
+    required: true
+    schema:
+      type: string
+      semantic_type: frame_role
+  - id: carrier_frame_role
+    required: true
+    schema:
+      type: string
+      semantic_type: frame_role
+  - id: selected_object_id
+    required: true
+    schema:
+      type: string
+      semantic_type: scene_resource
+  - id: place_pose
+    required: true
+    schema_ref: '#/schema_types/motion_pose'
+  - id: approach_offset_m
+    required: false
+    default:
+    - 0.0
+    - 0.0
+    - 0.05
+    schema:
+      type: array
+      items:
+        type: float
+      length: 3
+  - id: planning_profile
+    required: false
+    default: first_feasible
+    schema:
+      type: enum
+      values:
+      - first_feasible
+      - balanced
+      - quality_bounded
+  - id: motion_options
+    required: false
+    default: {}
+    schema_ref: '#/schema_types/pick_motion_options'
+  - id: tool_position
+    required: true
+    schema_ref: '#/schema_types/coordinate_position'
+  - id: tool_max_effort
+    required: false
+    schema_ref: '#/schema_types/coordinate_effort_limit'
+  - id: tool_command_duration_s
+    required: false
+    default: 0.0
+    schema:
+      type: float
+      constraints:
+        min_inclusive: 0.0
+  - id: tool_completion_timeout_s
+    required: false
+    default: 30.0
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  required_capabilities:
+  - capability_id: planning.motion.pose_goal
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: planning.motion.cartesian_path
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: planning.profile.first_feasible
+    scope: target_binding
+    target_parameter: target_role
+    when:
+      parameter: planning_profile
+      equals: first_feasible
+  - capability_id: planning.profile.balanced
+    scope: target_binding
+    target_parameter: target_role
+    when:
+      parameter: planning_profile
+      equals: balanced
+  - capability_id: planning.profile.quality_bounded
+    scope: target_binding
+    target_parameter: target_role
+    when:
+      parameter: planning_profile
+      equals: quality_bounded
+  - capability_id: planning.trajectory.time_parameterized
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: state.observed.current
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: validation.trajectory.non_collision
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: collision.query.pre_execution
+    scope: cell_global
+  - capability_id: execution.trajectory.execute
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: execution.feedback.phase_events
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: model.kinematics.fk
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: tool.gripper.command
+    scope: target_binding
+    target_parameter: tool_target_role
+  - capability_id: tool.gripper.feedback
+    scope: target_binding
+    target_parameter: tool_target_role
+  - capability_id: scene.edit.attach_detach
+    scope: cell_global
+  execution:
+    blocking: true
+    cancellable: true
+    owner_api: kernel.pick_place_sequence
+  outcomes:
+    success: sequence_completed
+    failure: sequence_failed_or_intervention_required
+    interrupted: sequence_terminal
+  runners:
+    py_trees:
+      implementation_id: motion_place_object_v1
+  observability:
+    event_family: manyforge.program.node
+- id: recovery.apply_offered_action
+  name: Apply offered recovery
+  category: recovery
+  description: Submit one exact current owner-published recovery offer.
+  stability: stable
+  tags:
+  - recovery
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: target_role
+    required: true
+    schema:
+      type: string
+      semantic_type: target_role
+  - id: recovery_action
+    required: true
+    schema:
+      type: enum
+      values:
+      - retry_motion_from_current_state
+      - acknowledge_and_continue
+      - retry_after_scene_repair
+      - replan_from_stopped_state
+  required_capabilities: []
+  owner_context:
+    kind: current_recovery_offer
+    required: true
+  execution:
+    blocking: true
+    cancellable: false
+    owner_api: kernel.recovery
+  outcomes:
+    success: recovery_accepted
+    failure: recovery_rejected
+  runners:
+    py_trees:
+      implementation_id: recovery_apply_offered_action_v1
+  observability:
+    event_family: manyforge.program.node
+- id: example.check_frame_height
+  name: Check frame height
+  category: model
+  description: 'Build-owned extension example: compare a freshly observed frame height
+    in the cell frame.'
+  stability: experimental
+  tags:
+  - example
+  - model
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: target_role
+    required: true
+    schema:
+      type: string
+      semantic_type: target_role
+  - id: frame_role
+    required: true
+    schema:
+      type: string
+      semantic_type: frame_role
+  - id: minimum_height_m
+    required: true
+    schema:
+      type: float
+  - id: maximum_height_m
+    required: true
+    schema:
+      type: float
+  required_capabilities:
+  - capability_id: model.kinematics.fk
+    scope: target_binding
+    target_parameter: target_role
+  - capability_id: state.observed.current
+    scope: target_binding
+    target_parameter: target_role
+  execution:
+    blocking: true
+    cancellable: false
+    owner_api: model.kinematics
+  outcomes:
+    success: height_in_range
+    failure: height_outside_range_or_unavailable
+  runners:
+    py_trees:
+      implementation_id: example_check_frame_height_v1
+  observability:
+    event_family: manyforge.program.node
 skill_cross_references: []

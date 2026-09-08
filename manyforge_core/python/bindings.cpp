@@ -16,6 +16,7 @@
 #include <manyforge_core/types/execution_result.hpp>
 #include <manyforge_core/types/execution_status.hpp>
 #include <manyforge_core/types/geometry.hpp>
+#include <manyforge_core/types/gripper.hpp>
 #include <manyforge_core/types/motion_spec.hpp>
 #include <manyforge_core/types/plan_request.hpp>
 #include <manyforge_core/types/robot_state.hpp>
@@ -106,6 +107,42 @@ PYBIND11_MODULE(manyforge_core_py, m) {
       .value("kCacheMiss", manyforge::core::ErrorCode::kCacheMiss)
       .value("kCollisionDetected", manyforge::core::ErrorCode::kCollisionDetected)
       .export_values();
+
+  // ========================================================================
+  // Gripper confirmation DTOs (no runtime owner port is exposed to Python)
+  // ========================================================================
+
+  py::enum_<manyforge::core::GraspConfirmationSourceKind>(m, "GraspConfirmationSourceKind")
+      .value("kOperator", manyforge::core::GraspConfirmationSourceKind::kOperator)
+      .value("kDiscreteInput", manyforge::core::GraspConfirmationSourceKind::kDiscreteInput)
+      .value("kPerception", manyforge::core::GraspConfirmationSourceKind::kPerception)
+      .value("kForceCurrent", manyforge::core::GraspConfirmationSourceKind::kForceCurrent);
+
+  py::class_<manyforge::core::GripperGraspObservationDTO>(m, "GripperGraspObservationDTO")
+      .def(py::init<>())
+      .def_readwrite("gripper_id", &manyforge::core::GripperGraspObservationDTO::gripper_id)
+      .def_readwrite("command_id", &manyforge::core::GripperGraspObservationDTO::command_id)
+      .def_readwrite("generation", &manyforge::core::GripperGraspObservationDTO::generation)
+      .def_readwrite("expected_status_revision",
+                     &manyforge::core::GripperGraspObservationDTO::expected_status_revision)
+      .def_readwrite("observation_id", &manyforge::core::GripperGraspObservationDTO::observation_id)
+      .def_readwrite("confirmed", &manyforge::core::GripperGraspObservationDTO::confirmed)
+      .def_readwrite("observed_at_ns", &manyforge::core::GripperGraspObservationDTO::observed_at_ns)
+      .def_readwrite("attribution", &manyforge::core::GripperGraspObservationDTO::attribution);
+
+  py::class_<manyforge::core::GripperGraspEvidenceDTO>(m, "GripperGraspEvidenceDTO")
+      .def(py::init<manyforge::core::GraspConfirmationSourceKind, manyforge::core::ControlBindingId,
+                    manyforge::core::ControlBindingRevision, manyforge::core::RuntimeEpoch,
+                    manyforge::core::GripperGraspObservationDTO, manyforge::core::TimePoint>(),
+           py::arg("source_kind"), py::arg("source_id"), py::arg("source_revision"),
+           py::arg("source_epoch"), py::arg("observation"), py::arg("expires_at_ns"))
+      .def_readonly("source_kind", &manyforge::core::GripperGraspEvidenceDTO::source_kind)
+      .def_readonly("source_id", &manyforge::core::GripperGraspEvidenceDTO::source_id)
+      .def_readonly("source_revision", &manyforge::core::GripperGraspEvidenceDTO::source_revision)
+      .def_readonly("source_epoch", &manyforge::core::GripperGraspEvidenceDTO::source_epoch)
+      .def_readonly("observation", &manyforge::core::GripperGraspEvidenceDTO::observation)
+      .def_readonly("expires_at_ns", &manyforge::core::GripperGraspEvidenceDTO::expires_at_ns);
+  m.def("gripper_grasp_evidence_is_fresh", &manyforge::core::gripper_grasp_evidence_is_fresh);
 
   // ========================================================================
   // Geometry DTOs

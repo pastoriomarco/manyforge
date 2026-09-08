@@ -30,10 +30,10 @@ from manyforge_behavior.catalog_schema import (
 
 
 EXPECTED_API_VERSION = "manyforge.node_catalog.v2"
-EXPECTED_CONTENT_VERSION = "2.0.0"
+EXPECTED_CONTENT_VERSION = "2.1.0"
 BUILTIN_CATALOG_ID = "manyforge_builtin"
 EXPECTED_BUILTIN_CATALOG_DIGEST = (
-    "sha256:5fce54890158a72df20063dac31531ede96dbf27b01be3a8256099c7e0ba1bb4"
+    "sha256:7c16314aeddbdea7942cdab09aa0e2da6c913e2044adcf5c3d99111c6b280ffd"
 )
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
 _COMPOSABLE_PROFILE_RE = re.compile(r"^composable-cell-v(\d+)$")
@@ -117,6 +117,7 @@ _TARGET_CAPABILITIES = {
     "planning.trajectory.time_parameterized",
     "state.observed.current",
     "tool.gripper.command",
+    "tool.gripper.confirmation.operator",
     "tool.gripper.feedback",
     "validation.trajectory.non_collision",
 }
@@ -338,9 +339,7 @@ def _closed(
     missing = required - set(value)
     unknown = set(value) - allowed
     if missing:
-        raise CatalogValidationError(
-            f"{label} is missing required fields {sorted(missing)}"
-        )
+        raise CatalogValidationError(f"{label} is missing required fields {sorted(missing)}")
     if unknown:
         raise CatalogValidationError(f"{label} has unknown fields {sorted(unknown)}")
 
@@ -359,9 +358,7 @@ def _list(value: Any, label: str) -> list[Any]:
 
 def _identifier(value: Any, label: str) -> str:
     if not isinstance(value, str) or _ID_RE.fullmatch(value) is None:
-        raise CatalogValidationError(
-            f"{label} must be a stable lowercase identifier"
-        )
+        raise CatalogValidationError(f"{label} must be a stable lowercase identifier")
     return value
 
 
@@ -385,8 +382,7 @@ def _integer(value: Any, label: str, *, minimum: int = 0) -> int:
 
 def _unique_identifiers(value: Any, label: str) -> tuple[str, ...]:
     result = tuple(
-        _identifier(item, f"{label}[{index}]")
-        for index, item in enumerate(_list(value, label))
+        _identifier(item, f"{label}[{index}]") for index, item in enumerate(_list(value, label))
     )
     if len(result) != len(set(result)):
         raise CatalogValidationError(f"{label} contains duplicate values")
@@ -397,9 +393,7 @@ def _scan_portable_value(value: Any, label: str) -> None:
     if isinstance(value, dict):
         for key, nested in value.items():
             if key in _FORBIDDEN_PORTABLE_NAMES:
-                raise CatalogValidationError(
-                    f"{label} contains forbidden runtime field {key!r}"
-                )
+                raise CatalogValidationError(f"{label} contains forbidden runtime field {key!r}")
             _scan_portable_value(nested, f"{label}.{key}")
     elif isinstance(value, list):
         for index, nested in enumerate(value):
@@ -414,12 +408,7 @@ def _scan_portable_value(value: Any, label: str) -> None:
 
 def _freeze_json_value(value: Any) -> Any:
     if isinstance(value, dict):
-        return MappingProxyType(
-            {
-                key: _freeze_json_value(nested)
-                for key, nested in value.items()
-            }
-        )
+        return MappingProxyType({key: _freeze_json_value(nested) for key, nested in value.items()})
     if isinstance(value, list):
         return tuple(_freeze_json_value(nested) for nested in value)
     return value
@@ -454,9 +443,7 @@ def _schema_contains_semantic_type(
         )
         or (
             resolved.items is not None
-            and _schema_contains_semantic_type(
-                resolved.items, registry, semantic_type
-            )
+            and _schema_contains_semantic_type(resolved.items, registry, semantic_type)
         )
     )
 
@@ -520,8 +507,7 @@ def _authoring_schema_names(
             target = registry.types[target_name]
         except KeyError as exc:
             raise CatalogValidationError(
-                f"schema_types.{name}.resolves_to references unknown schema "
-                f"{target_name!r}"
+                f"schema_types.{name}.resolves_to references unknown schema " f"{target_name!r}"
             ) from exc
         if target.resolves_to is not None:
             raise CatalogValidationError(
@@ -548,9 +534,7 @@ def _schema_references_authoring(
         if name in authoring_names:
             return True
         if name in stack:
-            raise CatalogValidationError(
-                f"schema reference cycle: {' -> '.join((*stack, name))}"
-            )
+            raise CatalogValidationError(f"schema reference cycle: {' -> '.join((*stack, name))}")
         target = registry.types.get(name)
         if target is None:
             raise CatalogValidationError(f"unknown schema reference {schema.ref!r}")
@@ -577,14 +561,11 @@ def _schema_references_authoring(
         stack=stack,
     ):
         return True
-    return (
-        schema.items is not None
-        and _schema_references_authoring(
-            schema.items,
-            registry,
-            authoring_names,
-            stack=stack,
-        )
+    return schema.items is not None and _schema_references_authoring(
+        schema.items,
+        registry,
+        authoring_names,
+        stack=stack,
     )
 
 
@@ -717,13 +698,9 @@ class NodeCatalog:
             "decorator": (1, 1),
         }.get(kind)
         if expected is not None and (children_min, children_max) != expected:
-            raise CatalogValidationError(
-                f"{label}.{kind} must have children min/max {expected}"
-            )
+            raise CatalogValidationError(f"{label}.{kind} must have children min/max {expected}")
         if kind == "composite" and children_min < 1:
-            raise CatalogValidationError(
-                f"{label}.composite must require at least one child"
-            )
+            raise CatalogValidationError(f"{label}.composite must require at least one child")
 
         parameters = self._parse_parameters(
             raw["parameters"],
@@ -753,16 +730,19 @@ class NodeCatalog:
                         f"{label}.parameters.{parameter.id} semantic scope must "
                         "reference a target_role parameter"
                     )
-        if any(
-            _schema_contains_semantic_type(
-                parameter.schema, self._schema_registry, "source_joint"
+        if (
+            any(
+                _schema_contains_semantic_type(
+                    parameter.schema, self._schema_registry, "source_joint"
+                )
+                for parameter in parameters
             )
-            for parameter in parameters
-        ) and sum(
-            _schema_semantic_type(parameter.schema, self._schema_registry)
-            == "target_role"
-            for parameter in parameters
-        ) != 1:
+            and sum(
+                _schema_semantic_type(parameter.schema, self._schema_registry) == "target_role"
+                for parameter in parameters
+            )
+            != 1
+        ):
             raise CatalogValidationError(
                 f"{label}.parameters with source_joint semantics require "
                 "exactly one target_role parameter"
@@ -778,11 +758,7 @@ class NodeCatalog:
         stability = raw.get("stability", "stable")
         if stability not in _STABILITY_LEVELS:
             raise CatalogValidationError(f"{label}.stability is unsupported")
-        tags = (
-            _unique_identifiers(raw["tags"], f"{label}.tags")
-            if "tags" in raw
-            else ()
-        )
+        tags = _unique_identifiers(raw["tags"], f"{label}.tags") if "tags" in raw else ()
         min_profile = "composable-cell-v1"
         if "profiles" in raw:
             profiles = _mapping(raw["profiles"], f"{label}.profiles")
@@ -822,16 +798,15 @@ class NodeCatalog:
             )
             context_kind = _text(context["kind"], f"{label}.owner_context.kind")
             if context_kind not in {"current_operation", "current_recovery_offer"}:
-                raise CatalogValidationError(
-                    f"{label}.owner_context.kind is unsupported"
+                raise CatalogValidationError(f"{label}.owner_context.kind is unsupported")
+            if (
+                _boolean(
+                    context["required"],
+                    f"{label}.owner_context.required",
                 )
-            if _boolean(
-                context["required"],
-                f"{label}.owner_context.required",
-            ) is not True:
-                raise CatalogValidationError(
-                    f"{label}.owner_context.required must be true"
-                )
+                is not True
+            ):
+                raise CatalogValidationError(f"{label}.owner_context.required must be true")
             owner_context = CatalogOwnerContext(kind=context_kind, required=True)
 
         outcomes: dict[str, str] = {}
@@ -849,9 +824,7 @@ class NodeCatalog:
                     for outcome, status in outcome_map.items()
                 }
         elif "outcomes" in raw:
-            raise CatalogValidationError(
-                f"{label}: non-leaf entries cannot declare outcomes"
-            )
+            raise CatalogValidationError(f"{label}: non-leaf entries cannot declare outcomes")
 
         event_family = None
         if "observability" in raw:
@@ -960,9 +933,7 @@ class NodeCatalog:
                     path=f"{parameter_label}.default",
                 )
                 if issues:
-                    raise CatalogValidationError(
-                        f"{issues[0].path}: {issues[0].message}"
-                    )
+                    raise CatalogValidationError(f"{issues[0].path}: {issues[0].message}")
             parameters.append(
                 CatalogParameter(
                     id=parameter_id,
@@ -1004,9 +975,7 @@ class NodeCatalog:
             )
             expected_scope = CAPABILITY_SCOPES.get(capability_id)
             if expected_scope is None:
-                raise CatalogValidationError(
-                    f"{requirement_label}.capability_id is not registered"
-                )
+                raise CatalogValidationError(f"{requirement_label}.capability_id is not registered")
             scope = _identifier(requirement["scope"], f"{requirement_label}.scope")
             if scope != expected_scope:
                 raise CatalogValidationError(
@@ -1023,15 +992,10 @@ class NodeCatalog:
                     f"{requirement_label}.component_parameter",
                 )
             if scope == "cell_global" and (target is not None or component is not None):
+                raise CatalogValidationError(f"{requirement_label}: cell_global forbids selectors")
+            if scope == "target_binding" and (target is None or component is not None):
                 raise CatalogValidationError(
-                    f"{requirement_label}: cell_global forbids selectors"
-                )
-            if scope == "target_binding" and (
-                target is None or component is not None
-            ):
-                raise CatalogValidationError(
-                    f"{requirement_label}: target_binding requires only "
-                    "target_parameter"
+                    f"{requirement_label}: target_binding requires only " "target_parameter"
                 )
             if scope == "control_domain" and ((target is None) == (component is None)):
                 raise CatalogValidationError(
@@ -1049,10 +1013,7 @@ class NodeCatalog:
                         f"{requirement_label}.{field_name} references unknown "
                         f"parameter {selector!r}"
                     )
-                if (
-                    _schema_semantic_type(parameter.schema, self._schema_registry)
-                    != semantic_type
-                ):
+                if _schema_semantic_type(parameter.schema, self._schema_registry) != semantic_type:
                     raise CatalogValidationError(
                         f"{requirement_label}.{field_name} must select a "
                         f"{semantic_type} parameter"
@@ -1097,9 +1058,7 @@ class NodeCatalog:
                 repr(when_equals),
             )
             if identity in seen:
-                raise CatalogValidationError(
-                    f"{label} contains duplicate requirement {identity!r}"
-                )
+                raise CatalogValidationError(f"{label} contains duplicate requirement {identity!r}")
             seen.add(identity)
             result.append(
                 CatalogCapabilityRequirement(
@@ -1204,17 +1163,16 @@ class NodeCatalog:
                     != "blackboard_key"
                 ):
                     raise CatalogValidationError(
-                        f"{binding_label}.key_parameter must select a "
-                        "blackboard_key parameter"
+                        f"{binding_label}.key_parameter must select a " "blackboard_key parameter"
                     )
                 value_type = _identifier(
                     binding["value_type"],
                     f"{binding_label}.value_type",
                 )
-                if (
-                    {key_parameter.lower(), value_type.lower()}
-                    & _FORBIDDEN_BLACKBOARD_TERMS
-                ):
+                if {
+                    key_parameter.lower(),
+                    value_type.lower(),
+                } & _FORBIDDEN_BLACKBOARD_TERMS:
                     raise CatalogValidationError(
                         f"{binding_label} declares a forbidden execution-control "
                         "blackboard protocol"
@@ -1226,14 +1184,10 @@ class NodeCatalog:
                         f"{binding_label}.missing_key",
                     )
                     if missing_key not in {"failure", "wait"}:
-                        raise CatalogValidationError(
-                            f"{binding_label}.missing_key is unsupported"
-                        )
+                        raise CatalogValidationError(f"{binding_label}.missing_key is unsupported")
                 identity = (key_parameter, value_type)
                 if identity in seen:
-                    raise CatalogValidationError(
-                        f"{label}.{direction} contains duplicate binding"
-                    )
+                    raise CatalogValidationError(f"{label}.{direction} contains duplicate binding")
                 seen.add(identity)
                 bindings.append(
                     CatalogBlackboardBinding(

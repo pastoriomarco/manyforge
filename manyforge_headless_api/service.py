@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 import hashlib
 import json
+import logging
 import time
 from typing import Any, Callable, Sequence
 
@@ -20,7 +21,11 @@ from manyforge_behavior.canonical_artifact import (
     StrictArtifactError,
     verify_content_identity,
 )
-from manyforge_behavior.node_environment import BUILTIN_CATALOG_PATH
+from manyforge_behavior.node_environment import (
+    BUILTIN_CATALOG_PATH,
+    build_node_environment,
+)
+from manyforge_behavior.skill_loader import default_skills_dir, load_skill_catalog
 from manyforge_behavior.program import Program, ProgramValidationError
 
 from .execution import ExecutionPort
@@ -54,6 +59,7 @@ from .models import (
     RuntimeOverridePromotionRequest,
     RuntimeOverrideStageRequest,
     FullStopIntentRequest,
+    GripperConfirmationRequest,
     OperationControlRequest,
     OperationIntentRequest,
     PickSequencePlanningRequest,
@@ -62,6 +68,7 @@ from .models import (
     RuntimeScaleControlSelectorRequest,
     SceneResourcePoseQuery,
     SceneTransactionRequest,
+    SkillExpansionRequest,
     StopIntentRequest,
     StopFaultRecoveryIntentRequest,
 )
@@ -128,21 +135,25 @@ def _history_page(page: dict[str, Any], schema: str) -> dict[str, Any]:
     for stored in events:
         sequence = stored.get("sequence") if isinstance(stored, dict) else None
         if type(sequence) is not int or not 0 < sequence < previous:
-            raise HeadlessApiError("historian_response_invalid", "historian page sequence is invalid")
+            raise HeadlessApiError(
+                "historian_response_invalid", "historian page sequence is invalid"
+            )
         previous = sequence
     expected = events[-1]["sequence"] if page["truncated"] and events else None
     cursor = page.get("next_before_sequence")
-    if (page["truncated"] and not events) or cursor != expected or (cursor is not None and type(cursor) is not int):
-        raise HeadlessApiError("historian_response_invalid", "historian page cursor does not advance")
+    if (
+        (page["truncated"] and not events)
+        or cursor != expected
+        or (cursor is not None and type(cursor) is not int)
+    ):
+        raise HeadlessApiError(
+            "historian_response_invalid", "historian page cursor does not advance"
+        )
     return page
 
 
 def _bounded_text(value: object, *, maximum_bytes: int) -> bool:
-    return (
-        isinstance(value, str)
-        and bool(value)
-        and len(value.encode("utf-8")) <= maximum_bytes
-    )
+    return isinstance(value, str) and bool(value) and len(value.encode("utf-8")) <= maximum_bytes
 
 
 def _sha256_identity(value: object) -> bool:
@@ -159,6 +170,13 @@ def _program_catalog() -> NodeCatalog:
     """Load the build-owned authoring catalog once per headless process."""
 
     return NodeCatalog(BUILTIN_CATALOG_PATH)
+
+
+@lru_cache(maxsize=1)
+def _build_skills():
+    """One installed build input, never a mutable runtime skill registry."""
+    environment = build_node_environment()
+    return environment, load_skill_catalog(default_skills_dir(), catalog=environment.catalog)
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,9 +224,7 @@ class HeadlessService:
         except CellAdmissionError as error:
             raise self._admission_error(error) from error
 
-    def acquire_authoring_mutation(
-        self, request: AuthoringMutationContext
-    ) -> dict[str, Any]:
+    def acquire_authoring_mutation(self, request: AuthoringMutationContext) -> dict[str, Any]:
         intent = {
             "claim_kind": "authoring_mutation",
             "owner_role": "authoring_owner",
@@ -246,9 +262,7 @@ class HeadlessService:
             "owner_transaction_id": intent["owner_transaction_id"],
             "request_id": intent["request_id"],
             "request_payload_digest": intent["request_payload_digest"],
-            "acquired_admission_generation": claim.get(
-                "acquired_admission_generation"
-            ),
+            "acquired_admission_generation": claim.get("acquired_admission_generation"),
             "claim_generation": claim.get("claim_generation"),
             "settlement": {
                 "settlement_kind": request.settlement_kind,
@@ -273,9 +287,7 @@ class HeadlessService:
                 "recovery query does not identify a Composer authoring claim",
             )
         try:
-            return self._cell_admission().recovery_receipt(
-                request.model_dump(mode="json")
-            )
+            return self._cell_admission().recovery_receipt(request.model_dump(mode="json"))
         except CellAdmissionError as error:
             raise self._admission_error(error) from error
 
@@ -283,20 +295,14 @@ class HeadlessService:
         self, request: AuthoringOwnerReconciliationRequest
     ) -> dict[str, Any]:
         owners = request.current_owner_epochs
-        authoring = [
-            item
-            for item in owners
-            if item.get("owner_role") == "authoring_owner"
-        ]
+        authoring = [item for item in owners if item.get("owner_role") == "authoring_owner"]
         if len(authoring) != 1:
             raise HeadlessApiError(
                 "authoring_reconciliation_invalid",
                 "reconciliation must name exactly one authoring owner epoch",
             )
         try:
-            return self._cell_admission().reconcile(
-                request.model_dump(mode="json")
-            )
+            return self._cell_admission().reconcile(request.model_dump(mode="json"))
         except CellAdmissionError as error:
             raise self._admission_error(error) from error
 
@@ -353,14 +359,10 @@ class HeadlessService:
             "owner_transaction_id": intent["owner_transaction_id"],
             "request_id": intent["request_id"],
             "request_payload_digest": intent["request_payload_digest"],
-            "acquired_admission_generation": claim[
-                "acquired_admission_generation"
-            ],
+            "acquired_admission_generation": claim["acquired_admission_generation"],
             "claim_generation": claim["claim_generation"],
             "settlement": {
-                "settlement_kind": (
-                    "owner_commit" if committed else "proven_no_effect"
-                ),
+                "settlement_kind": ("owner_commit" if committed else "proven_no_effect"),
                 "evidence_digest": self._request_digest(result),
             },
         }
@@ -405,9 +407,86 @@ class HeadlessService:
         request: OperationIntentRequest,
         attribution: TrustedAttribution,
     ) -> dict[str, Any]:
-        return self._execution().submit(
-            request, trusted_principal_id=attribution.principal_id
-        )
+        return self._execution().submit(request, trusted_principal_id=attribution.principal_id)
+
+    def execution_confirm_grasp(
+        self,
+        request: GripperConfirmationRequest,
+        attribution: TrustedAttribution,
+        *,
+        origin_epoch: str,
+        received_monotonic_ns: int,
+        valid_until_monotonic_ns: int,
+    ) -> dict[str, Any]:
+        record = {
+            "schema_version": "manyforge.gripper_confirmation_trace.v1",
+            "origin_epoch": origin_epoch,
+            "request_id": request.request_context.request_id,
+            "source_label": request.request_context.source_label,
+            "native_owner_epoch": request.request_context.request_owner_epoch,
+            **request.model_dump(
+                include={
+                    "program_binding_id",
+                    "target_role_id",
+                    "command_id",
+                    "generation",
+                    "expected_status_revision",
+                    "confirmed",
+                }
+            ),
+        }
+        trusted = {
+            "principal_id": attribution.principal_id,
+            "assurance": attribution.assurance,
+        }
+
+        def trace(phase, details):
+            # History is evidence, never command admission. Native queue loss
+            # raises historian health; a broken recorder also stays visible
+            # without changing or concealing the native owner's result.
+            try:
+                recorded = (
+                    self.core.record_gripper_confirmation(
+                        {**record, "phase": phase, "details": details}
+                    ).get("recorded")
+                    is True
+                )
+            except Exception:
+                recorded = False
+            if not recorded:
+                try:
+                    logging.getLogger(__name__).warning(
+                        "gripper_confirmation_trace_unavailable phase=%s request_id=%r",
+                        phase,
+                        record["request_id"],
+                    )
+                except Exception:
+                    pass  # A broken fallback sink is not command admission either.
+            return recorded
+
+        attempted_recorded = trace("attempted", trusted)
+        try:
+            result = self._execution().confirm_grasp(
+                request,
+                trusted_principal_id=attribution.principal_id,
+                origin_epoch=origin_epoch,
+                received_monotonic_ns=received_monotonic_ns,
+                valid_until_monotonic_ns=valid_until_monotonic_ns,
+            )
+        except Exception as error:
+            # Failure at this boundary may be a lost reply. Do not infer
+            # rejection, retry the command, or reconstruct live proof here.
+            trace(
+                "unconfirmed",
+                {
+                    **trusted,
+                    "reason_code": getattr(error, "code", "confirmation_delivery_failed"),
+                    "message": str(error)[:512],
+                },
+            )
+            raise
+        recorded = trace("accepted", {**trusted, "evidence": result["confirmation"]})
+        return {**result, "history_recorded": attempted_recorded and recorded}
 
     def execution_preview_motion(
         self,
@@ -435,40 +514,30 @@ class HeadlessService:
         request: PickSequencePlanningRequest,
         attribution: TrustedAttribution,
     ) -> dict[str, Any]:
-        return self._execution().plan_pick(
-            request, trusted_principal_id=attribution.principal_id
-        )
+        return self._execution().plan_pick(request, trusted_principal_id=attribution.principal_id)
 
     def execution_plan_place(
         self,
         request: PlaceSequencePlanningRequest,
         attribution: TrustedAttribution,
     ) -> dict[str, Any]:
-        return self._execution().plan_place(
-            request, trusted_principal_id=attribution.principal_id
-        )
+        return self._execution().plan_place(request, trusted_principal_id=attribution.principal_id)
 
     def execution_start_pick(
         self,
         request: PickSequencePlanningRequest,
         attribution: TrustedAttribution,
     ) -> dict[str, Any]:
-        return self._execution().start_pick(
-            request, trusted_principal_id=attribution.principal_id
-        )
+        return self._execution().start_pick(request, trusted_principal_id=attribution.principal_id)
 
     def execution_start_place(
         self,
         request: PlaceSequencePlanningRequest,
         attribution: TrustedAttribution,
     ) -> dict[str, Any]:
-        return self._execution().start_place(
-            request, trusted_principal_id=attribution.principal_id
-        )
+        return self._execution().start_place(request, trusted_principal_id=attribution.principal_id)
 
-    def execution_pick_place_sequence(
-        self, sequence_id: str
-    ) -> dict[str, Any]:
+    def execution_pick_place_sequence(self, sequence_id: str) -> dict[str, Any]:
         return self._execution().read_pick_place_sequence(sequence_id)
 
     def execution_pause(
@@ -476,27 +545,21 @@ class HeadlessService:
         request: OperationControlRequest,
         attribution: TrustedAttribution,
     ) -> dict[str, Any]:
-        return self._execution().pause(
-            request, trusted_principal_id=attribution.principal_id
-        )
+        return self._execution().pause(request, trusted_principal_id=attribution.principal_id)
 
     def execution_resume(
         self,
         request: OperationControlRequest,
         attribution: TrustedAttribution,
     ) -> dict[str, Any]:
-        return self._execution().resume(
-            request, trusted_principal_id=attribution.principal_id
-        )
+        return self._execution().resume(request, trusted_principal_id=attribution.principal_id)
 
     def execution_reset(
         self,
         request: OperationControlRequest,
         attribution: TrustedAttribution,
     ) -> dict[str, Any]:
-        return self._execution().reset(
-            request, trusted_principal_id=attribution.principal_id
-        )
+        return self._execution().reset(request, trusted_principal_id=attribution.principal_id)
 
     def execution_acknowledge_completed(
         self,
@@ -512,18 +575,14 @@ class HeadlessService:
         request: StopIntentRequest,
         attribution: TrustedAttribution,
     ) -> dict[str, Any]:
-        return self._execution().stop(
-            request, trusted_principal_id=attribution.principal_id
-        )
+        return self._execution().stop(request, trusted_principal_id=attribution.principal_id)
 
     def execution_full_stop(
         self,
         request: FullStopIntentRequest,
         attribution: TrustedAttribution,
     ) -> dict[str, Any]:
-        return self._execution().full_stop(
-            request, trusted_principal_id=attribution.principal_id
-        )
+        return self._execution().full_stop(request, trusted_principal_id=attribution.principal_id)
 
     def execution_recognized_malformed_stop(
         self,
@@ -722,14 +781,55 @@ class HeadlessService:
             "observed_units": runtime.get("observed_units"),
         }
 
+    def skills(self) -> dict[str, Any]:
+        environment, skills = _build_skills()
+        selected = self.core.node_environment_projection()
+        if (
+            selected.get("schema_version") != "manyforge.node_environment_projection.v2"
+            or selected.get("environment_digest") != environment.environment_digest
+        ):
+            raise HeadlessApiError(
+                "skill_environment_unavailable",
+                "Installed skills do not match the selected retained environment",
+            )
+        return {
+            "schema_version": "manyforge.skill_catalog.v1",
+            "environment_digest": environment.environment_digest,
+            "retained_bundle_id": selected["retained_bundle_id"],
+            "graph_revision": selected["graph_revision"],
+            "source": deepcopy(selected["source"]),
+            "skills": skills.artifacts(),
+        }
+
+    def expand_skill(self, request: SkillExpansionRequest) -> dict[str, Any]:
+        selection = self.skills()
+        if request.expected_environment_digest != selection["environment_digest"]:
+            raise HeadlessApiError(
+                "skill_environment_stale", "Skill expansion selected an old environment"
+            )
+        try:
+            result = _build_skills()[1].expand(
+                **request.model_dump(
+                    exclude={
+                        "schema_version",
+                        "expected_environment_digest",
+                    }
+                )
+            )
+        except ValueError as error:
+            raise HeadlessApiError("skill_expansion_invalid", str(error)) from error
+        return {
+            **result,
+            "environment_digest": selection["environment_digest"],
+            "retained_bundle_id": selection["retained_bundle_id"],
+        }
+
     def node_environment(self) -> dict[str, Any]:
         projection = self.core.node_environment_projection()
         source = projection.get("source")
-        if (
-            projection.get("schema_version")
-            != "manyforge.node_environment_projection.v2"
-            or not isinstance(source, dict)
-        ):
+        if projection.get(
+            "schema_version"
+        ) != "manyforge.node_environment_projection.v2" or not isinstance(source, dict):
             raise HeadlessApiError(
                 "node_environment_projection_invalid",
                 "native core returned an unsupported node environment projection",
@@ -763,8 +863,7 @@ class HeadlessService:
         if (
             not isinstance(runner_projection, dict)
             or set(runner_projection) != {"availability", "schema_version", "source"}
-            or runner_projection.get("schema_version")
-            != "manyforge.program_node_availability.v1"
+            or runner_projection.get("schema_version") != "manyforge.program_node_availability.v1"
             or not isinstance(runner_projection.get("source"), dict)
             or not isinstance(runner_projection.get("availability"), dict)
         ):
@@ -783,9 +882,7 @@ class HeadlessService:
             else None
         )
         source_without_digest = {
-            key: value
-            for key, value in runner_source.items()
-            if key != "content_digest"
+            key: value for key, value in runner_source.items() if key != "content_digest"
         }
         try:
             expected_availability_digest = (
@@ -818,14 +915,10 @@ class HeadlessService:
                 "retained_bundle_id",
                 "scenario_id",
             }
-            or runner_source.get("node_environment_digest")
-            != projection.get("environment_digest")
-            or runner_source.get("retained_bundle_id")
-            != projection.get("retained_bundle_id")
-            or runner_source.get("graph_revision")
-            != projection.get("graph_revision")
-            or runner_source.get("content_digest")
-            != expected_availability_digest
+            or runner_source.get("node_environment_digest") != projection.get("environment_digest")
+            or runner_source.get("retained_bundle_id") != projection.get("retained_bundle_id")
+            or runner_source.get("graph_revision") != projection.get("graph_revision")
+            or runner_source.get("content_digest") != expected_availability_digest
             or not isinstance(applied_source, dict)
             or any(
                 runner_source.get(field) != applied.get(field)
@@ -839,14 +932,12 @@ class HeadlessService:
                     "scenario_id",
                 )
             )
-            or runner_source.get("applied_record_digest")
-            != applied_source.get("record_digest")
+            or runner_source.get("applied_record_digest") != applied_source.get("record_digest")
             or type(runner_source.get("admission_generation")) is not int
             or type(runner_source.get("cycle_generation")) is not int
             or runner_availability.get("schema_version")
             != "manyforge.node_execution_availability.v1"
-            or runner_availability.get("environment_digest")
-            != projection.get("environment_digest")
+            or runner_availability.get("environment_digest") != projection.get("environment_digest")
             or runner_availability.get("program_binding_id")
             != runner_source.get("program_binding_id")
             or not isinstance(implementations, list)
@@ -880,24 +971,13 @@ class HeadlessService:
                     "program_runner_response_invalid",
                     "Program node availability disagrees with the active registry",
                 )
-            projected_rows.append(
-                {
-                    field: runner_row[field]
-                    for field in core_row
-                }
-            )
+            projected_rows.append({field: runner_row[field] for field in core_row})
         projection["availability"] = {
             "binding_context": "applied",
-            "execution_available": runner_availability.get(
-                "execution_available"
-            ),
+            "execution_available": runner_availability.get("execution_available"),
             "implementations": projected_rows,
-            "manager_runtime_converged": core_availability.get(
-                "manager_runtime_converged"
-            ),
-            "portable_authoring_available": runner_availability.get(
-                "portable_authoring_available"
-            ),
+            "manager_runtime_converged": core_availability.get("manager_runtime_converged"),
+            "portable_authoring_available": runner_availability.get("portable_authoring_available"),
             "reason_codes": runner_availability.get("reason_codes"),
             "restoration_gates": sorted(
                 {
@@ -913,11 +993,9 @@ class HeadlessService:
     def source_model(self) -> dict[str, Any]:
         projection = self.core.source_model_projection()
         source = projection.get("source")
-        if (
-            projection.get("schema_version")
-            != "manyforge.source_model_projection.v2"
-            or not isinstance(source, dict)
-        ):
+        if projection.get(
+            "schema_version"
+        ) != "manyforge.source_model_projection.v2" or not isinstance(source, dict):
             raise HeadlessApiError(
                 "source_model_projection_invalid",
                 "native core returned an unsupported source model projection",
@@ -928,8 +1006,7 @@ class HeadlessService:
         context = self.core.source_model_context()
         if (
             not isinstance(context, dict)
-            or set(context)
-            != {"node_environment", "schema_version", "source_model"}
+            or set(context) != {"node_environment", "schema_version", "source_model"}
             or context.get("schema_version") != SOURCE_MODEL_CONTEXT_VERSION
             or not isinstance(context.get("node_environment"), dict)
             or not isinstance(context.get("source_model"), dict)
@@ -976,8 +1053,7 @@ class HeadlessService:
     def scenarios(self) -> dict[str, Any]:
         projection = self.core.scenario_catalog_projection()
         if (
-            set(projection)
-            != {"api_version", "scenario_catalog_revision", "scenarios"}
+            set(projection) != {"api_version", "scenario_catalog_revision", "scenarios"}
             or projection.get("api_version") != "manyforge.scenario_catalog.v1"
             or not isinstance(projection.get("scenario_catalog_revision"), str)
             or not isinstance(projection.get("scenarios"), list)
@@ -1052,9 +1128,7 @@ class HeadlessService:
         self,
         request: ProgramModelAttemptRequest,
     ) -> dict[str, Any]:
-        return self.core.commit_program_model_attempt(
-            request.model_dump(mode="json")
-        )
+        return self.core.commit_program_model_attempt(request.model_dump(mode="json"))
 
     def _program_runner(self) -> ProgramRunnerPort:
         if self.program_runner is None:
@@ -1063,6 +1137,12 @@ class HeadlessService:
                 "independent Program runner is not configured",
             )
         return self.program_runner
+
+    def program_diagnostic_health(self) -> dict[str, Any]:
+        try:
+            return self._program_runner().diagnostic_health()
+        except ProgramRunnerClientError as error:
+            raise self._runner_error(error) from error
 
     @staticmethod
     def _runner_error(error: ProgramRunnerClientError) -> HeadlessApiError:
@@ -1116,12 +1196,8 @@ class HeadlessService:
         active_count = projection.get("active_operation_count")
         reason = projection.get("reason_code")
         node_statuses = projection.get("node_statuses")
-        owner_identities = (
-            capture.get("owner_identities") if isinstance(capture, dict) else None
-        )
-        node_policies = (
-            capture.get("node_policies") if isinstance(capture, dict) else None
-        )
+        owner_identities = capture.get("owner_identities") if isinstance(capture, dict) else None
+        node_policies = capture.get("node_policies") if isinstance(capture, dict) else None
         try:
             calculated_policy_digest = (
                 "sha256:" + hashlib.sha256(rfc8785.dumps(node_policies)).hexdigest()
@@ -1140,8 +1216,7 @@ class HeadlessService:
             or not isinstance(state, str)
             or state not in _PROGRAM_RUN_STATES
             or not isinstance(projection.get("tree_status"), str)
-            or projection.get("tree_status")
-            not in {"invalid", "running", "success", "failure"}
+            or projection.get("tree_status") not in {"invalid", "running", "success", "failure"}
             or type(projection.get("node_status_revision")) is not int
             or not 1 <= projection["node_status_revision"] <= 9_007_199_254_740_991
             or not isinstance(node_statuses, dict)
@@ -1154,23 +1229,15 @@ class HeadlessService:
             )
             or (
                 active_count is not None
-                and (
-                    type(active_count) is not int
-                    or not 0 <= active_count <= 4_096
-                )
+                and (type(active_count) is not int or not 0 <= active_count <= 4_096)
             )
-            or (
-                reason is not None
-                and not _bounded_text(reason, maximum_bytes=256)
-            )
+            or (reason is not None and not _bounded_text(reason, maximum_bytes=256))
             or not isinstance(projection.get("message"), str)
             or len(projection["message"].encode("utf-8")) > 4_096
             or not isinstance(capture, dict)
             or set(capture) != capture_fields
             or capture.get("schema_version") != PROGRAM_RUN_CAPTURE_VERSION
-            or not _bounded_text(
-                capture.get("program_run_id"), maximum_bytes=512
-            )
+            or not _bounded_text(capture.get("program_run_id"), maximum_bytes=512)
             or not _bounded_text(capture.get("scenario_id"), maximum_bytes=128)
             or not _bounded_text(capture.get("program_id"), maximum_bytes=512)
             or any(
@@ -1202,13 +1269,9 @@ class HeadlessService:
             if (
                 not isinstance(identity, dict)
                 or set(identity) != {"owner_epoch", "owner_id", "owner_role"}
-                or not _bounded_text(
-                    identity.get("owner_role"), maximum_bytes=128
-                )
+                or not _bounded_text(identity.get("owner_role"), maximum_bytes=128)
                 or not _bounded_text(identity.get("owner_id"), maximum_bytes=512)
-                or not _bounded_text(
-                    identity.get("owner_epoch"), maximum_bytes=512
-                )
+                or not _bounded_text(identity.get("owner_epoch"), maximum_bytes=512)
             ):
                 raise HeadlessApiError(
                     "program_runner_response_invalid",
@@ -1228,15 +1291,9 @@ class HeadlessService:
                 "Program-run status and captured owner identities disagree",
             )
         if (
-            (
-                expected_program_run_id is not None
-                and capture["program_run_id"] != expected_program_run_id
-            )
-            or (
-                expected_owner_epoch is not None
-                and owner_epoch != expected_owner_epoch
-            )
-        ):
+            expected_program_run_id is not None
+            and capture["program_run_id"] != expected_program_run_id
+        ) or (expected_owner_epoch is not None and owner_epoch != expected_owner_epoch):
             raise HeadlessApiError(
                 "program_runner_response_invalid",
                 "Program runner returned a divergent run identity",
@@ -1296,9 +1353,7 @@ class HeadlessService:
             self._validate_program_run_snapshot(
                 row,
                 expected_owner_epoch=(
-                    owner_epoch
-                    if row.get("state") in _ACTIVE_PROGRAM_RUN_STATES
-                    else None
+                    owner_epoch if row.get("state") in _ACTIVE_PROGRAM_RUN_STATES else None
                 ),
             )
             program_run_ids.append(row["capture"]["program_run_id"])
@@ -1324,11 +1379,9 @@ class HeadlessService:
         source = applied.get("source")
         if (
             not isinstance(source, dict)
-            or source.get("record_digest")
-            != request.expected_applied_record_digest
+            or source.get("record_digest") != request.expected_applied_record_digest
             or applied.get("scenario_id") != request.scenario_id
-            or applied.get("scenario_catalog_revision")
-            != request.scenario_catalog_revision
+            or applied.get("scenario_catalog_revision") != request.scenario_catalog_revision
         ):
             raise HeadlessApiError(
                 "program_run_applied_selection_stale",
@@ -1340,23 +1393,18 @@ class HeadlessService:
                 "authoritative Draft and Applied Program revisions differ",
             )
         try:
-            projection = self._program_runner().start_run(
-                request.model_dump(mode="json")
-            )
+            projection = self._program_runner().start_run(request.model_dump(mode="json"))
         except ProgramRunnerClientError as error:
             raise self._runner_error(error) from error
         snapshot = self._validate_program_run_snapshot(projection)
         capture = snapshot["capture"]
         binding = applied.get("program_binding")
         current_environment = self.node_environment()
-        applied_node_policies = (
-            binding.get("node_policies") if isinstance(binding, dict) else None
-        )
+        applied_node_policies = binding.get("node_policies") if isinstance(binding, dict) else None
         if (
             capture["applied_record_digest"] != source.get("record_digest")
             or capture["node_policies"] != applied_node_policies
-            or capture["node_environment_digest"]
-            != current_environment.get("environment_digest")
+            or capture["node_environment_digest"] != current_environment.get("environment_digest")
             or any(
                 capture[capture_field] != applied.get(applied_field)
                 for capture_field, applied_field in (
@@ -1376,24 +1424,19 @@ class HeadlessService:
             )
         return snapshot
 
-    def program_scene_prepare(
-        self, request: ProgramScenePreparationRequest
-    ) -> dict[str, Any]:
+    def program_scene_prepare(self, request: ProgramScenePreparationRequest) -> dict[str, Any]:
         applied = self.program_applied()
         source = applied.get("source")
         if (
             not isinstance(source, dict)
-            or source.get("record_digest")
-            != request.expected_applied_record_digest
+            or source.get("record_digest") != request.expected_applied_record_digest
         ):
             raise HeadlessApiError(
                 "program_run_applied_selection_stale",
                 "Applied Program changed before scene preparation",
             )
         try:
-            result = self._program_runner().prepare_applied_scene(
-                request.model_dump(mode="json")
-            )
+            result = self._program_runner().prepare_applied_scene(request.model_dump(mode="json"))
         except ProgramRunnerClientError as error:
             raise self._runner_error(error) from error
         proof = result.get("prepared_scene")
@@ -1408,17 +1451,14 @@ class HeadlessService:
                 "schema_version",
                 "status",
             }
-            or result.get("schema_version")
-            != "manyforge.program_scene_preparation.v1"
+            or result.get("schema_version") != "manyforge.program_scene_preparation.v1"
             or result.get("status") != "prepared"
-            or result.get("applied_record_digest")
-            != request.expected_applied_record_digest
+            or result.get("applied_record_digest") != request.expected_applied_record_digest
             or result.get("program_revision") != applied.get("program_revision")
             or type(generation) is not int
             or not 1 <= generation <= 9_007_199_254_740_991
             or not isinstance(proof, dict)
-            or proof.get("schema_version")
-            != "manyforge.prepared_program_scene.v1"
+            or proof.get("schema_version") != "manyforge.prepared_program_scene.v1"
         ):
             raise HeadlessApiError(
                 "program_runner_response_invalid",
@@ -1448,9 +1488,7 @@ class HeadlessService:
             )
         except ProgramRunnerClientError as error:
             raise self._runner_error(error) from error
-        if projection.get("schema_version") == (
-            "manyforge.program_stop_acceptance.v1"
-        ):
+        if projection.get("schema_version") == ("manyforge.program_stop_acceptance.v1"):
             if (
                 set(projection)
                 != {
@@ -1496,11 +1534,14 @@ class HeadlessService:
         )
 
     def program_run_motion_resume(
-        self, program_run_id: str, request: ProgramSelectionResumeRequest,
+        self,
+        program_run_id: str,
+        request: ProgramSelectionResumeRequest,
     ) -> dict[str, Any]:
         try:
             projection = self._program_runner().resume_motion(
-                program_run_id, request.model_dump(mode="json"),
+                program_run_id,
+                request.model_dump(mode="json"),
             )
         except ProgramRunnerClientError as error:
             raise self._runner_error(error) from error
@@ -1582,9 +1623,7 @@ class HeadlessService:
         except ProgramRunnerClientError as error:
             raise self._runner_error(error) from error
 
-    def program_cycle_reset(
-        self, request: ProgramCycleResetRequest
-    ) -> dict[str, Any]:
+    def program_cycle_reset(self, request: ProgramCycleResetRequest) -> dict[str, Any]:
         """Forward one Reset; Program Runner owns every lifecycle phase."""
 
         try:
@@ -1613,47 +1652,30 @@ class HeadlessService:
         except ProgramRunnerClientError as error:
             raise self._runner_error(error) from error
 
-    def cycle_recovery_action(
-        self, request: CycleRecoveryActionRequest
-    ) -> dict[str, Any]:
+    def cycle_recovery_action(self, request: CycleRecoveryActionRequest) -> dict[str, Any]:
         try:
-            return self._program_runner().apply_recovery_action(
-                request.model_dump(mode="json")
-            )
+            return self._program_runner().apply_recovery_action(request.model_dump(mode="json"))
         except ProgramRunnerClientError as error:
             raise self._runner_error(error) from error
 
-    def component_lifecycle_submit(
-        self, request: Any
-    ) -> dict[str, Any]:
+    def component_lifecycle_submit(self, request: Any) -> dict[str, Any]:
         if self.cclc is None:
-            raise HeadlessApiError(
-                "cclc_open_unavailable", "CCLC owner is not configured"
-            )
-        payload = request.model_dump(
-            mode="json", exclude={"confirmed"}, exclude_none=True
-        )
+            raise HeadlessApiError("cclc_open_unavailable", "CCLC owner is not configured")
+        payload = request.model_dump(mode="json", exclude={"confirmed"}, exclude_none=True)
         return self.cclc.submit_lifecycle(payload)
 
-    def component_lifecycle_status(
-        self, transaction_id: str
-    ) -> dict[str, Any] | None:
+    def component_lifecycle_status(self, transaction_id: str) -> dict[str, Any] | None:
         if self.cclc is None:
-            raise HeadlessApiError(
-                "cclc_open_unavailable", "CCLC owner is not configured"
-            )
+            raise HeadlessApiError("cclc_open_unavailable", "CCLC owner is not configured")
         return self.cclc.lifecycle_status(transaction_id)
 
     def route_selection_submit(self, request: Any) -> dict[str, Any]:
         if self.cclc is None:
-            raise HeadlessApiError(
-                "cclc_open_unavailable", "CCLC owner is not configured"
-            )
+            raise HeadlessApiError("cclc_open_unavailable", "CCLC owner is not configured")
         admission = self.authoring_admission()
         if (
             admission.get("authoring_allowed") is not True
-            or admission.get("admission_generation")
-            != request.expected_admission_generation
+            or admission.get("admission_generation") != request.expected_admission_generation
         ):
             raise HeadlessApiError(
                 "authoring_not_ready",
@@ -1699,8 +1721,7 @@ class HeadlessService:
         apply_state = payload.get("apply")
         if (
             isinstance(apply_state, dict)
-            and apply_state.get("unavailable_reason_code")
-            == "full_stack_restart_required"
+            and apply_state.get("unavailable_reason_code") == "full_stack_restart_required"
         ):
             raise HeadlessApiError(
                 "full_stack_restart_required",
@@ -1722,9 +1743,7 @@ class HeadlessService:
             },
         )
 
-    def _program_apply_replay_result(
-        self, replay: dict[str, Any]
-    ) -> dict[str, Any]:
+    def _program_apply_replay_result(self, replay: dict[str, Any]) -> dict[str, Any]:
         preparation = replay.get("preparation")
         applied = replay.get("applied")
         if (
@@ -1789,15 +1808,9 @@ class HeadlessService:
         program_document = program.to_dict()
         claim_intent = request.authoring_claim.get("intent")
         request_owner_epoch = (
-            claim_intent.get("owner_epoch")
-            if isinstance(claim_intent, dict)
-            else None
+            claim_intent.get("owner_epoch") if isinstance(claim_intent, dict) else None
         )
-        request_id = (
-            claim_intent.get("request_id")
-            if isinstance(claim_intent, dict)
-            else None
-        )
+        request_id = claim_intent.get("request_id") if isinstance(claim_intent, dict) else None
         if (
             not isinstance(request_owner_epoch, str)
             or not request_owner_epoch
@@ -1958,10 +1971,7 @@ class HeadlessService:
             )
         except (ProgramValidationError, StrictArtifactError, TypeError, ValueError):
             raise HeadlessApiError(error_code, message)
-        if (
-            identity != applied["program_revision"]
-            or validated.to_dict() != program
-        ):
+        if identity != applied["program_revision"] or validated.to_dict() != program:
             raise HeadlessApiError(error_code, message)
 
     @staticmethod
@@ -2024,8 +2034,7 @@ class HeadlessService:
         projection = self.core.assistant_mode_projection(mode_id)
         source = projection.get("source")
         if (
-            projection.get("schema_version")
-            != "manyforge.assistant_mode_projection.v1"
+            projection.get("schema_version") != "manyforge.assistant_mode_projection.v1"
             or projection.get("mode") != mode_id
             or not isinstance(source, dict)
         ):
@@ -2039,8 +2048,7 @@ class HeadlessService:
         projection = self.core.assistant_mode_index()
         source = projection.get("source")
         if (
-            projection.get("schema_version")
-            != "manyforge.assistant_mode_index.v1"
+            projection.get("schema_version") != "manyforge.assistant_mode_index.v1"
             or not isinstance(projection.get("modes"), list)
             or not isinstance(source, dict)
         ):
@@ -2126,38 +2134,65 @@ class HeadlessService:
         page = _history_page(self.core.history(**arguments), _HISTORY_SUMMARY_PAGE_VERSION)
         # Keep a relative window fixed across Older/Newer navigation. These
         # are the query's actual server UTC bounds, not another source clock.
-        return {**page, "time_window": {key: None if arguments[key] is None else str(arguments[key])
-                                        for key in ("start_utc_ns", "end_utc_ns")}}
+        return {
+            **page,
+            "time_window": {
+                key: None if arguments[key] is None else str(arguments[key])
+                for key in ("start_utc_ns", "end_utc_ns")
+            },
+        }
 
     def history_detail(self, sequence: int) -> dict[str, Any]:
         return self.core.history_detail(sequence)
 
     def history_export(self, query: HistorianQueryRequest) -> dict[str, Any]:
         arguments = query.native_arguments(now_utc_ns=time.time_ns())
-        page = _history_page(self.core.history_export(**arguments), "manyforge.historian_export_page.v1")
-        return {**page, "time_window": {key: None if arguments[key] is None else str(arguments[key])
-                                        for key in ("start_utc_ns", "end_utc_ns")}}
+        page = _history_page(
+            self.core.history_export(**arguments), "manyforge.historian_export_page.v1"
+        )
+        return {
+            **page,
+            "time_window": {
+                key: None if arguments[key] is None else str(arguments[key])
+                for key in ("start_utc_ns", "end_utc_ns")
+            },
+        }
 
     def debug_export(self, query: HistorianQueryRequest) -> dict[str, Any]:
         from .history_diagnostics import forensic_bundle
 
         page = self.history_export(query)
         events = list(page["events"])
-        current = query.model_copy(update={"recent_seconds": None,
-            **{key: int(value) if value is not None else None for key, value in page["time_window"].items()}})
+        current = query.model_copy(
+            update={
+                "recent_seconds": None,
+                **{
+                    key: int(value) if value is not None else None
+                    for key, value in page["time_window"].items()
+                },
+            }
+        )
         for _ in range(7):
             if not page["truncated"] or page["next_before_sequence"] is None:
                 break
             before = page["next_before_sequence"]
             if not events or type(before) is not int or before != events[-1]["sequence"]:
-                raise HeadlessApiError("historian_response_invalid", "export cursor does not advance")
+                raise HeadlessApiError(
+                    "historian_response_invalid", "export cursor does not advance"
+                )
             current = current.model_copy(update={"before_sequence": before})
             page = self.history_export(current)
             if page["events"] and page["events"][0]["sequence"] >= before:
-                raise HeadlessApiError("historian_response_invalid", "export cursor repeated a previous page")
+                raise HeadlessApiError(
+                    "historian_response_invalid",
+                    "export cursor repeated a previous page",
+                )
             events.extend(page["events"])
-        return forensic_bundle({**page, "events": events}, program_run_id=current.program_run_id,
-                               exported_at_ns=time.time_ns())
+        return forensic_bundle(
+            {**page, "events": events},
+            program_run_id=current.program_run_id,
+            exported_at_ns=time.time_ns(),
+        )
 
     def record_client_incident(self, **kwargs: Any) -> dict[str, Any]:
         """Non-blockingly enqueue one strict client-incident transition."""
@@ -2203,8 +2238,7 @@ class HeadlessService:
         ):
             raise HeadlessApiError(
                 "authoring_not_ready",
-                "Deployment candidate compilation requires an exact held "
-                "authoring claim",
+                "Deployment candidate compilation requires an exact held " "authoring claim",
             )
         try:
             replay = self._cell_admission().acquire(intent)
@@ -2218,9 +2252,7 @@ class HeadlessService:
         return {
             "compilation": self.deployment_compiler.compile(
                 scenario_id=request.scenario_id,
-                expected_scenario_catalog_revision=(
-                    request.expected_scenario_catalog_revision
-                ),
+                expected_scenario_catalog_revision=(request.expected_scenario_catalog_revision),
                 deployment=request.deployment,
                 program=request.program,
             )
@@ -2229,9 +2261,7 @@ class HeadlessService:
     def manager_apply(self, request: ManagerApplyRequest) -> dict[str, Any]:
         return self.manager.apply(request)
 
-    def manager_apply_status(
-        self, apply_id: str, apply_generation: int
-    ) -> dict[str, Any]:
+    def manager_apply_status(self, apply_id: str, apply_generation: int) -> dict[str, Any]:
         return self.manager.observe_apply(apply_id, apply_generation)
 
     def scene_commit(
@@ -2247,9 +2277,9 @@ class HeadlessService:
             "set_collision_policy",
         }
         if authored:
-            if (
-                request.expected_admission_generation is None
-            ) == (request.program_reset_scene_authorization is None):
+            if (request.expected_admission_generation is None) == (
+                request.program_reset_scene_authorization is None
+            ):
                 raise HeadlessApiError(
                     "authoring_not_ready",
                     "authored-scene mutation requires exactly one ordinary "
@@ -2290,8 +2320,7 @@ class HeadlessService:
             }
         alarm_health = alarms.get("health")
         alarm_available = (
-            isinstance(alarm_health, dict)
-            and alarm_health.get("state") == "available"
+            isinstance(alarm_health, dict) and alarm_health.get("state") == "available"
         )
         projection_ready = bool(
             runtime.get("complete")

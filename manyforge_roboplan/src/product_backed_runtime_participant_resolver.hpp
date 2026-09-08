@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <filesystem>
 #include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_core/types/active_control_configuration.hpp>
@@ -94,6 +95,14 @@ public:
   operator=(const ProductBackedRuntimeParticipantResolver &) = delete;
 
 private:
+ struct ObservationSelection final {
+   // This exact Binding's Program was verified when the slot was populated.
+   // Changing only role/capability must not reparse the immutable Program.
+   std::shared_ptr<const deployment::ProgramBinding> binding;
+   deployment::RuntimeProgramTargetBinding target;
+   std::optional<deployment::RuntimeProgramTargetBinding> frame_state_target;
+ };
+
   deployment::FilesystemVerifiedProgramSource programs_;
   deployment::FilesystemVerifiedProgramBindingSource bindings_;
   std::shared_ptr<const deployment::RetainedBundle> retained_bundle_;
@@ -103,6 +112,10 @@ private:
   // inferred from an operation label or a precomposed Program alias.
   std::vector<core::ProgramBindingId> intrinsic_direct_bindings_;
   std::vector<core::RuntimeCollisionBodyAliasDTO> collision_body_aliases_;
+  // One immutable resolution per composition, never a live source/sample.
+  // Concurrent misses may duplicate bounded cold work; neither waits for the
+  // other's I/O and replacement cannot grow a service-lifetime cache.
+  mutable std::atomic<std::shared_ptr<const ObservationSelection>> observation_selection_;
 };
 
 } // namespace manyforge::roboplan_backend

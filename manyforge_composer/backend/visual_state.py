@@ -1,25 +1,13 @@
-"""Transport-neutral visual pose helpers and the fenced I9 observer client."""
+"""Transport-neutral rigid-pose helpers; no visual observation owner/client.
+
+The current native viewer consumes execution observations. The historical
+dynamic-snapshot client was replaced, not deferred to a future factory here.
+"""
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Final, NoReturn
-
-
-VISUAL_STATE_UNAVAILABLE_REASON_CODE: Final = (
-    "composable_cell_visual_state_unavailable"
-)
-VISUAL_STATE_RESTORATION_GATE: Final = "I9"
-
-
-class VisualSnapshotUnavailable(RuntimeError):
-    """A visual observation is unavailable without affecting control."""
-
-    def __init__(self, reason: str, detail: str = "") -> None:
-        super().__init__(detail or reason)
-        self.reason = reason
-        self.detail = detail or reason
 
 
 @dataclass(frozen=True)
@@ -96,8 +84,7 @@ def relative_pose_from_world(*, child_pose: VisualPose, parent_pose: VisualPose)
         parent_pose.orientation_xyzw[3],
     )
     delta = tuple(
-        child_pose.position_m[index] - parent_pose.position_m[index]
-        for index in range(3)
+        child_pose.position_m[index] - parent_pose.position_m[index] for index in range(3)
     )
     return VisualPose(
         position_m=_rotate_vector(inverse_orientation, delta),
@@ -108,18 +95,8 @@ def relative_pose_from_world(*, child_pose: VisualPose, parent_pose: VisualPose)
     )
 
 
-def require_visual_state_client() -> NoReturn:
-    raise VisualSnapshotUnavailable(
-        VISUAL_STATE_UNAVAILABLE_REASON_CODE,
-        f"{VISUAL_STATE_UNAVAILABLE_REASON_CODE}: dynamic visual snapshots "
-        "return at I9 from the new observer owner",
-    )
-
-
 __all__ = [
     "VisualPose",
-    "VisualSnapshotUnavailable",
     "compose_pose_in_world",
     "relative_pose_from_world",
-    "require_visual_state_client",
 ]

@@ -106,6 +106,8 @@ struct Configuration final {
     std::string attach_frame;
     std::string tcp_frame;
     std::vector<std::string> auxiliary_frames;
+    // Absent unless an operator source is explicitly selected and qualified.
+    std::optional<std::int64_t> operator_confirmation_validity_ns;
 
     friend bool operator==(const GripperTargetConfiguration &,
                            const GripperTargetConfiguration &) = default;

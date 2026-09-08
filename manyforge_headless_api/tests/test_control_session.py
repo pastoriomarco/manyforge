@@ -38,9 +38,13 @@ from manyforge_headless_api.control_state import (
 )
 from manyforge_headless_api.component_overview import ComponentOverviewFacts
 from manyforge_headless_api.execution_control import ExecutionControlIngress
-from manyforge_headless_api.execution_control import ExecutionControlBusyError, ExecutionControlLane
+from manyforge_headless_api.execution_control import (
+    ExecutionControlBusyError,
+    ExecutionControlLane,
+)
 from manyforge_headless_api.service import HeadlessService
 from manyforge_headless_api import control_state as control_state_module
+from scripts.qualification.source_snapshot_fixture import source_snapshot_text
 
 
 def _cycle() -> dict[str, Any]:
@@ -78,25 +82,57 @@ def _cycle() -> dict[str, Any]:
 def _running_cycle(node_revision: int) -> dict[str, Any]:
     digest = "sha256:" + "a" * 64
     capture = {
-        key: digest for key in (
-            "applied_record_digest", "scenario_catalog_revision", "program_revision",
-            "program_binding_id", "retained_bundle_id", "graph_revision", "node_environment_digest",
+        key: digest
+        for key in (
+            "applied_record_digest",
+            "scenario_catalog_revision",
+            "program_revision",
+            "program_binding_id",
+            "retained_bundle_id",
+            "graph_revision",
+            "node_environment_digest",
         )
     }
-    capture.update({
-        "schema_version": "manyforge.program_run_capture.v1", "program_run_id": "run.1",
-        "scenario_id": "pick", "program_id": "program.pick", "node_policies": [],
-        "node_policy_digest": "sha256:" + hashlib.sha256(b"[]").hexdigest(),
-        "owner_identities": [{"owner_role": "program_runner", "owner_id": "runner", "owner_epoch": "runner.1"}],
-    })
+    capture.update(
+        {
+            "schema_version": "manyforge.program_run_capture.v1",
+            "program_run_id": "run.1",
+            "scenario_id": "pick",
+            "program_id": "program.pick",
+            "node_policies": [],
+            "node_policy_digest": "sha256:" + hashlib.sha256(b"[]").hexdigest(),
+            "owner_identities": [
+                {
+                    "owner_role": "program_runner",
+                    "owner_id": "runner",
+                    "owner_epoch": "runner.1",
+                }
+            ],
+        }
+    )
     run = {
-        "schema_version": "manyforge.program_run_status.v2", "owner_id": "runner", "owner_epoch": "runner.1",
-        "run_revision": 1, "capture": capture, "state": "running", "tree_status": "running",
-        "node_status_revision": node_revision, "node_statuses": {"root": "running"},
-        "active_operation_count": 1, "reason_code": None, "message": "",
+        "schema_version": "manyforge.program_run_status.v2",
+        "owner_id": "runner",
+        "owner_epoch": "runner.1",
+        "run_revision": 1,
+        "capture": capture,
+        "state": "running",
+        "tree_status": "running",
+        "node_status_revision": node_revision,
+        "node_statuses": {"root": "running"},
+        "active_operation_count": 1,
+        "reason_code": None,
+        "message": "",
     }
-    return {**_cycle(), "state": "running", "program_run_id": "run.1", "cycle_claim_generation": 1,
-            "run": run, "run_revision": 1, "node_status_revision": node_revision}
+    return {
+        **_cycle(),
+        "state": "running",
+        "program_run_id": "run.1",
+        "cycle_claim_generation": 1,
+        "run": run,
+        "run_revision": 1,
+        "node_status_revision": node_revision,
+    }
 
 
 def _ingress(stamps: list[Any]) -> ExecutionControlIngress:
@@ -258,9 +294,7 @@ class _CommandSocket(_HandshakeSocket):
                             "control_session_id": self.session_id,
                             "client_sequence": "1",
                             "freshness": control.freshness.model_dump(mode="json"),
-                            "expected_semantic_owner_epoch": (
-                                control.semantic_owner_epoch
-                            ),
+                            "expected_semantic_owner_epoch": (control.semantic_owner_epoch),
                             "expected_execution_control_revision": (
                                 control.execution_control_revision
                             ),
@@ -340,9 +374,7 @@ def _shell_for_cycle(cycle: dict[str, Any]) -> dict[str, Any]:
                 "alarm_generation": 7,
                 "alarm_state_revision": 11,
                 "admission_generation": 13,
-                "program_runner_owner_epoch": cycle[
-                    "program_runner_owner_epoch"
-                ],
+                "program_runner_owner_epoch": cycle["program_runner_owner_epoch"],
                 "program_cycle_generation": cycle["cycle_generation"],
             }
         },
@@ -375,9 +407,7 @@ def test_control_session_starts_with_versioned_current_snapshot() -> None:
     socket = _HandshakeSocket()
     try:
         asyncio.run(
-            ExecutionControlSession(  # type: ignore[arg-type]
-                socket, source, ingress
-            ).serve()
+            ExecutionControlSession(socket, source, ingress).serve()  # type: ignore[arg-type]
         )
     finally:
         ingress.close()
@@ -522,9 +552,7 @@ def test_replaced_sparse_state_retains_facts_the_client_never_applied() -> None:
         control=build_control_projection(idle_cycle, ingress),
         shell=ready_shell,
     )
-    session = ExecutionControlSession(  # type: ignore[arg-type]
-        object(), _Source(initial), ingress
-    )
+    session = ExecutionControlSession(object(), _Source(initial), ingress)  # type: ignore[arg-type]
     try:
         session._put_state(session._delta_message(idle, initial))  # noqa: SLF001
         session._put_state(session._delta_message(ready, idle))  # noqa: SLF001
@@ -546,17 +574,12 @@ def test_websocket_command_uses_the_same_ingress_without_waiting_for_state_poll(
     socket = _CommandSocket(frame)
     try:
         asyncio.run(
-            ExecutionControlSession(  # type: ignore[arg-type]
-                socket, source, ingress
-            ).serve()
+            ExecutionControlSession(socket, source, ingress).serve()  # type: ignore[arg-type]
         )
     finally:
         ingress.close()
 
-    receipts = [
-        message for message in socket.sent
-        if message["message_kind"] == "command_receipt"
-    ]
+    receipts = [message for message in socket.sent if message["message_kind"] == "command_receipt"]
     assert len(receipts) == 1
     assert receipts[0]["receipt"]["correlation_id"] == "request.1"
     assert receipts[0]["receipt"]["disposition"] == "received"
@@ -575,9 +598,7 @@ def test_client_disconnect_during_initial_sync_releases_its_subscription() -> No
     socket = _DisconnectBeforeSnapshotSocket()
     try:
         asyncio.run(
-            ExecutionControlSession(  # type: ignore[arg-type]
-                socket, source, ingress
-            ).serve()
+            ExecutionControlSession(socket, source, ingress).serve()  # type: ignore[arg-type]
         )
     finally:
         ingress.close()
@@ -639,9 +660,7 @@ def test_runtime_scale_and_one_discrete_command_can_progress_independently() -> 
                             "control_session_id": session._session_id,  # noqa: SLF001
                             "client_sequence": str(sequence),
                             "freshness": control.freshness.model_dump(mode="json"),
-                            "expected_semantic_owner_epoch": (
-                                control.semantic_owner_epoch
-                            ),
+                            "expected_semantic_owner_epoch": (control.semantic_owner_epoch),
                             "expected_execution_control_revision": (
                                 control.execution_control_revision
                             ),
@@ -704,12 +723,10 @@ def test_inflight_command_does_not_hold_authoritative_state() -> None:
             session._slots.put_heartbeat("heartbeat")  # noqa: SLF001
             allowed = lambda: session._state_inflight is None  # noqa: E731, SLF001
 
-            assert await session._slots.take(  # noqa: SLF001
-                state_allowed=allowed
-            ) == "heartbeat"
-            assert await session._slots.take(  # noqa: SLF001
-                state_allowed=allowed
-            ) == "newest-state"
+            assert await session._slots.take(state_allowed=allowed) == "heartbeat"  # noqa: SLF001
+            assert (
+                await session._slots.take(state_allowed=allowed) == "newest-state"  # noqa: SLF001
+            )
         finally:
             session._slots.close()  # noqa: SLF001
             ingress.close()
@@ -722,9 +739,7 @@ def test_one_state_credit_bounds_delivery_without_blocking_receipt_or_heartbeat(
         ingress = _ingress([])
         source = _Source(_frame(ingress))
         socket = _HandshakeSocket()
-        session = ExecutionControlSession(  # type: ignore[arg-type]
-            socket, source, ingress
-        )
+        session = ExecutionControlSession(socket, source, ingress)  # type: ignore[arg-type]
         try:
             await session._send_message(  # noqa: SLF001
                 session._snapshot_message(source.frame)  # noqa: SLF001
@@ -736,12 +751,13 @@ def test_one_state_credit_bounds_delivery_without_blocking_receipt_or_heartbeat(
             session._slots.put_receipt("receipt")  # noqa: SLF001
             state_allowed = lambda: session._state_inflight is None  # noqa: E731,SLF001
 
-            assert await session._slots.take(  # noqa: SLF001
-                state_allowed=state_allowed
-            ) == "receipt"
-            assert await session._slots.take(  # noqa: SLF001
-                state_allowed=state_allowed
-            ) == "heartbeat"
+            assert (
+                await session._slots.take(state_allowed=state_allowed) == "receipt"  # noqa: SLF001
+            )
+            assert (
+                await session._slots.take(state_allowed=state_allowed)  # noqa: SLF001
+                == "heartbeat"
+            )
 
             blocked = asyncio.create_task(
                 session._slots.take(state_allowed=state_allowed)  # noqa: SLF001
@@ -786,9 +802,7 @@ def test_heartbeat_keeps_one_challenge_outstanding_and_reclaims_a_dead_peer() ->
         clock_ns=lambda: now_ns,
     )
     try:
-        first = session._next_heartbeat(  # noqa: SLF001
-            now_ns + 250_000_000
-        )
+        first = session._next_heartbeat(now_ns + 250_000_000)  # noqa: SLF001
         assert first is not None
         assert first.challenge_sequence == "1"
         assert first.semantic_status == "current"
@@ -806,9 +820,7 @@ def test_heartbeat_keeps_one_challenge_outstanding_and_reclaims_a_dead_peer() ->
         session._last_echoed_challenge = 1  # noqa: SLF001
         session._last_client_sequence = 1  # noqa: SLF001
         session._last_heartbeat_ns = now_ns + 1_000_000_001  # noqa: SLF001
-        second = session._next_heartbeat(  # noqa: SLF001
-            now_ns + 1_250_000_001
-        )
+        second = session._next_heartbeat(now_ns + 1_250_000_001)  # noqa: SLF001
         assert second is not None
         assert second.challenge_sequence == "2"
         assert second.received_client_sequence == "1"
@@ -817,9 +829,7 @@ def test_heartbeat_keeps_one_challenge_outstanding_and_reclaims_a_dead_peer() ->
 
         with pytest.raises(TimeoutError, match="stopped answering"):
             session._next_heartbeat(  # noqa: SLF001
-                session._last_heartbeat_ns  # noqa: SLF001
-                + _CONTROL_DEAD_PEER_TIMEOUT_NS
-                + 1
+                session._last_heartbeat_ns + _CONTROL_DEAD_PEER_TIMEOUT_NS + 1  # noqa: SLF001
             )
     finally:
         ingress.close()
@@ -843,9 +853,7 @@ def test_semantic_gap_keeps_heartbeat_alive_without_owner_read() -> None:
         clock_ns=lambda: now_ns,
     )
     try:
-        challenge = session._next_heartbeat(  # noqa: SLF001
-            now_ns + 250_000_000
-        )
+        challenge = session._next_heartbeat(now_ns + 250_000_000)  # noqa: SLF001
         assert challenge is not None
         assert challenge.semantic_status == "unavailable"
         assert challenge.semantic_reason == "program_control_source_unavailable"
@@ -867,16 +875,14 @@ def test_delayed_and_stale_heartbeat_are_one_sparse_incident_episode() -> None:
     )
     try:
         assert session._next_heartbeat(now_ns) is not None  # noqa: SLF001
-        assert session._next_heartbeat(  # noqa: SLF001
-            now_ns + CONTROL_HEARTBEAT_DELAYED_NS + 1
-        ) is None
-        assert session._next_heartbeat(  # noqa: SLF001
-            now_ns + CONTROL_HEARTBEAT_STALE_NS + 1
-        ) is None
-        assert [
-            (event["incident_kind"], event["phase"])
-            for event in source.incidents
-        ] == [
+        assert (
+            session._next_heartbeat(now_ns + CONTROL_HEARTBEAT_DELAYED_NS + 1)  # noqa: SLF001
+            is None
+        )
+        assert (
+            session._next_heartbeat(now_ns + CONTROL_HEARTBEAT_STALE_NS + 1) is None  # noqa: SLF001
+        )
+        assert [(event["incident_kind"], event["phase"]) for event in source.incidents] == [
             ("control_delayed", "activated"),
             ("control_stale", "activated"),
         ]
@@ -905,13 +911,8 @@ def test_delayed_and_stale_heartbeat_are_one_sparse_incident_episode() -> None:
             session._delay_level = 0  # noqa: SLF001
         assert len(source.incidents) == 2
         assert len(session._server_incidents) == 2  # noqa: SLF001
-        session._resolve_heartbeat_incidents(  # noqa: SLF001
-            now_ns + 205_000_000_000, 10_000_000
-        )
-        assert [
-            (event["incident_kind"], event["phase"])
-            for event in source.incidents
-        ] == [
+        session._resolve_heartbeat_incidents(now_ns + 205_000_000_000, 10_000_000)  # noqa: SLF001
+        assert [(event["incident_kind"], event["phase"]) for event in source.incidents] == [
             ("control_delayed", "activated"),
             ("control_stale", "activated"),
             ("control_delayed", "resolved"),
@@ -992,9 +993,7 @@ def test_volatile_receiver_counters_do_not_create_a_cold_state_change() -> None:
     later["runtime"]["sections"]["manager"]["receiver_age_ns"] = 900_000_000
     later["runtime"]["sections"]["manager"]["source_generation"] = 81
     later["runtime"]["sections"]["scene_runtime"]["source_generation"] += 1
-    later["runtime"]["sections"]["scene_runtime"][
-        "source_content_digest"
-    ] = "pose-only-change"
+    later["runtime"]["sections"]["scene_runtime"]["source_content_digest"] = "pose-only-change"
     later["alarms"]["state_revision"] = 21
 
     assert _shell_key(later) == _shell_key(first)
@@ -1009,7 +1008,7 @@ def test_source_file_freshness_pulse_does_not_wake_owner_reduction(tmp_path) -> 
 
     def publish(*, generation: int, report: int, health: str = "healthy") -> None:
         source_path.write_text(
-            json.dumps(
+            source_snapshot_text(
                 {
                     "api_version": "manyforge.source_snapshot.v1",
                     "observed_at_ns": report,
@@ -1046,13 +1045,13 @@ def test_source_file_freshness_pulse_does_not_wake_owner_reduction(tmp_path) -> 
     source.notify_cold = lambda: wakes.append(True)  # type: ignore[method-assign]
     try:
         publish(generation=1, report=1)
-        source._refresh_file_watches(notify=False)  # noqa: SLF001
+        asyncio.run(source._refresh_file_watches(notify=False))  # noqa: SLF001
         publish(generation=2, report=2)
-        source._refresh_file_watches(notify=True)  # noqa: SLF001
+        asyncio.run(source._refresh_file_watches(notify=True))  # noqa: SLF001
         assert wakes == []
 
         publish(generation=3, report=3, health="faulted")
-        source._refresh_file_watches(notify=True)  # noqa: SLF001
+        asyncio.run(source._refresh_file_watches(notify=True))  # noqa: SLF001
         assert wakes == [True]
     finally:
         ingress.close()
@@ -1065,7 +1064,7 @@ def test_scene_runtime_pose_only_update_does_not_wake_cold_projection(
 
     def publish(*, generation: int, sequence: int, state: str = "open") -> None:
         source_path.write_text(
-            json.dumps(
+            source_snapshot_text(
                 {
                     "api_version": "manyforge.source_snapshot.v1",
                     "observed_at_ns": sequence,
@@ -1110,13 +1109,13 @@ def test_scene_runtime_pose_only_update_does_not_wake_cold_projection(
     source.notify_cold = lambda: wakes.append(True)  # type: ignore[method-assign]
     try:
         publish(generation=1, sequence=1)
-        source._refresh_file_watches(notify=False)  # noqa: SLF001
+        asyncio.run(source._refresh_file_watches(notify=False))  # noqa: SLF001
         publish(generation=2, sequence=2)
-        source._refresh_file_watches(notify=True)  # noqa: SLF001
+        asyncio.run(source._refresh_file_watches(notify=True))  # noqa: SLF001
         assert wakes == []
 
         publish(generation=3, sequence=3, state="resetting")
-        source._refresh_file_watches(notify=True)  # noqa: SLF001
+        asyncio.run(source._refresh_file_watches(notify=True))  # noqa: SLF001
         assert wakes == [True]
     finally:
         ingress.close()
@@ -1127,9 +1126,7 @@ def test_server_sequence_is_assigned_after_latest_slot_replacement() -> None:
         ingress = _ingress([])
         source = _Source(_frame(ingress))
         socket = _HandshakeSocket()
-        session = ExecutionControlSession(  # type: ignore[arg-type]
-            socket, source, ingress
-        )
+        session = ExecutionControlSession(socket, source, ingress)  # type: ignore[arg-type]
         older_state = session._snapshot_message(source.frame)  # noqa: SLF001
         newer_state = session._snapshot_message(source.frame)  # noqa: SLF001
         session._slots.put_state(older_state)  # noqa: SLF001
@@ -1166,9 +1163,7 @@ def test_owner_replacement_requires_a_new_snapshot_barrier() -> None:
         ingress = _ingress(stamps)
         source = _Source(_frame(ingress))
         socket = _HandshakeSocket()
-        session = ExecutionControlSession(  # type: ignore[arg-type]
-            socket, source, ingress
-        )
+        session = ExecutionControlSession(socket, source, ingress)  # type: ignore[arg-type]
         subscription = await source.subscribe()
         session._subscription = subscription  # noqa: SLF001
         session._latest_frame = source.frame  # noqa: SLF001
@@ -1225,16 +1220,27 @@ def test_no_control_client_creates_no_tasks_reads_or_timers() -> None:
     assert stamps == []
 
 
-@pytest.mark.parametrize("malformed", [
-    {"state": "running"},
-    {**_cycle(), "node_status_revision": 0},
-    {key: value for key, value in _cycle().items() if key != "runtime_controls"},
-    {**_cycle(), "run_revision": 1},
-    {**_cycle(), "runtime_control_revision": 1},
-    *[{**_running_cycle(1), "run": {**_running_cycle(1)["run"], field: value}}
-      for field, value in (("state", []), ("tree_status", {}), ("node_statuses", {"root": []}))],
-])
-def test_program_source_recovers_same_current_cycle_after_malformed_identity(monkeypatch, malformed) -> None:
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        {"state": "running"},
+        {**_cycle(), "node_status_revision": 0},
+        {key: value for key, value in _cycle().items() if key != "runtime_controls"},
+        {**_cycle(), "run_revision": 1},
+        {**_cycle(), "runtime_control_revision": 1},
+        *[
+            {**_running_cycle(1), "run": {**_running_cycle(1)["run"], field: value}}
+            for field, value in (
+                ("state", []),
+                ("tree_status", {}),
+                ("node_statuses", {"root": []}),
+            )
+        ],
+    ],
+)
+def test_program_source_recovers_same_current_cycle_after_malformed_identity(
+    monkeypatch, malformed
+) -> None:
     async def exercise() -> None:
         ingress = _ingress([])
         requests: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
@@ -1258,14 +1264,24 @@ def test_program_source_recovers_same_current_cycle_after_malformed_identity(mon
             async def __anext__(self):
                 cycle = await requests.get()
                 self.sequence += 1
-                return json.dumps({"schema_version": "manyforge.program_control_state.v1",
-                                   "server_sequence": str(self.sequence), "program_cycle": cycle})
+                return json.dumps(
+                    {
+                        "schema_version": "manyforge.program_control_state.v1",
+                        "server_sequence": str(self.sequence),
+                        "program_cycle": cycle,
+                    }
+                )
 
         monkeypatch.setattr(control_state_module, "connect_websocket", lambda *_a, **_k: Upstream())
         monkeypatch.setattr(control_state_module, "_SOURCE_RETRY_INITIAL_SECONDS", 0)
         source = HeadlessControlStateSource(
-            SimpleNamespace(component_overview_facts=lambda *, program_cycle, cancelled=None: _facts_for_cycle(program_cycle)),
-            ingress, program_runner_websocket_url="ws://runner.test/state",
+            SimpleNamespace(
+                component_overview_facts=lambda *, program_cycle, cancelled=None: _facts_for_cycle(
+                    program_cycle
+                )
+            ),
+            ingress,
+            program_runner_websocket_url="ws://runner.test/state",
         )
         first = await source.subscribe()
         second = await source.subscribe()
@@ -1316,9 +1332,14 @@ def test_fallback_read_recovers_and_bursts_use_one_existing_task(monkeypatch) ->
 
         monkeypatch.setattr(control_state_module, "_SOURCE_RETRY_INITIAL_SECONDS", 0)
         source = HeadlessControlStateSource(
-            SimpleNamespace(program_cycle_status=read,
-                            component_overview_facts=lambda *, program_cycle, cancelled=None: _facts_for_cycle(program_cycle)),
-            ingress, program_runner_websocket_url=None,
+            SimpleNamespace(
+                program_cycle_status=read,
+                component_overview_facts=lambda *, program_cycle, cancelled=None: _facts_for_cycle(
+                    program_cycle
+                ),
+            ),
+            ingress,
+            program_runner_websocket_url=None,
         )
         subscription = await source.subscribe()
         try:
@@ -1339,11 +1360,14 @@ def test_fallback_read_recovers_and_bursts_use_one_existing_task(monkeypatch) ->
             assert source._runner_task is None and source._cold_task is None  # noqa: SLF001
             assert source._program_wake is None  # noqa: SLF001
             ingress.close()
+
     asyncio.run(exercise())
 
 
 @pytest.mark.parametrize("missing_fact", [False, True])
-def test_cold_source_failure_recovers_without_a_second_file_event(monkeypatch, missing_fact) -> None:
+def test_cold_source_failure_recovers_without_a_second_file_event(
+    monkeypatch, missing_fact
+) -> None:
     async def exercise() -> None:
         ingress = _ingress([])
         calls = 0
@@ -1353,15 +1377,19 @@ def test_cold_source_failure_recovers_without_a_second_file_event(monkeypatch, m
             calls += 1
             if calls == 1:
                 if missing_fact:
-                    return replace(_facts_for_cycle(program_cycle), runtime=None,
-                                   errors={"runtime": {"code": "runtime_source_unavailable"}})
+                    return replace(
+                        _facts_for_cycle(program_cycle),
+                        runtime=None,
+                        errors={"runtime": {"code": "runtime_source_unavailable"}},
+                    )
                 raise OSError("read temporarily failed")
             return _facts_for_cycle(program_cycle)
 
         monkeypatch.setattr(control_state_module, "_SOURCE_RETRY_INITIAL_SECONDS", 0)
         source = HeadlessControlStateSource(
             SimpleNamespace(program_cycle_status=_cycle, component_overview_facts=facts),
-            ingress, program_runner_websocket_url=None,
+            ingress,
+            program_runner_websocket_url=None,
         )
         records = []
         source.record_incident = lambda **record: records.append(record)  # type: ignore[method-assign]
@@ -1378,14 +1406,19 @@ def test_cold_source_failure_recovers_without_a_second_file_event(monkeypatch, m
         finally:
             await source.unsubscribe(subscription)
             ingress.close()
+
     asyncio.run(exercise())
 
 
-def test_incident_recorder_failure_is_counted_and_logged_once_per_episode(caplog) -> None:
+def test_incident_recorder_failure_is_counted_and_logged_once_per_episode(
+    caplog,
+) -> None:
     ingress = _ingress([])
     source = HeadlessControlStateSource(object(), ingress, program_runner_websocket_url=None)
+
     def fail(**_record):
         raise OSError("history sink failed")
+
     try:
         for _ in range(100):
             source._record_incident_now(fail, {})  # noqa: SLF001
@@ -1400,7 +1433,9 @@ def test_incident_recorder_failure_is_counted_and_logged_once_per_episode(caplog
         ingress.close()
 
 
-def test_file_watcher_failure_invalidates_and_recovers_without_client_churn(monkeypatch, tmp_path) -> None:
+def test_file_watcher_failure_invalidates_and_recovers_without_client_churn(
+    monkeypatch, tmp_path
+) -> None:
     async def exercise() -> None:
         ingress = _ingress([])
         fail = asyncio.Event()
@@ -1420,9 +1455,14 @@ def test_file_watcher_failure_invalidates_and_recovers_without_client_churn(monk
         monkeypatch.setattr(control_state_module, "awatch", watches)
         monkeypatch.setattr(control_state_module, "_SOURCE_RETRY_INITIAL_SECONDS", 0)
         source = HeadlessControlStateSource(
-            SimpleNamespace(program_cycle_status=_cycle,
-                            component_overview_facts=lambda *, program_cycle, cancelled=None: _facts_for_cycle(program_cycle)),
-            ingress, program_runner_websocket_url=None,
+            SimpleNamespace(
+                program_cycle_status=_cycle,
+                component_overview_facts=lambda *, program_cycle, cancelled=None: _facts_for_cycle(
+                    program_cycle
+                ),
+            ),
+            ingress,
+            program_runner_websocket_url=None,
             cold_watch_paths=(tmp_path / "source.json",),
         )
         subscription = await source.subscribe()
@@ -1533,6 +1573,7 @@ def test_last_client_drains_physical_read_and_cancels_remaining_capture() -> Non
                 def read(*_args, **_kwargs):
                     calls.append(name)
                     return {}
+
                 return read
 
         source = HeadlessControlStateSource(Service(), ingress, program_runner_websocket_url=None)
@@ -1567,24 +1608,36 @@ def test_stop_rejection_does_not_require_initial_semantic_snapshot(monkeypatch, 
         source = HeadlessControlStateSource(object(), ingress, program_runner_websocket_url=None)
         session = ExecutionControlSession(_HandshakeSocket(), source, ingress)
         session_id = session._session_id  # noqa: SLF001
-        command = ExecutionControlCommandDTO.model_validate({
-            "schema_version": CONTROL_PROTOCOL_VERSION, "message_kind": "command",
-            "control_session_id": session_id, "client_sequence": "1",
-            "command": {"command_envelope": {
-                "schema_version": EXECUTION_COMMAND_SCHEMA, "command_kind": "program_stop",
-                "correlation_id": "stop.before.snapshot", "source_label": "test",
-                "control_session_id": session_id, "client_sequence": "1",
-                "freshness": ingress.freshness_for("runner.1", 4).model_dump(mode="json"),
-                "expected_semantic_owner_epoch": "runner.1",
-                "expected_execution_control_revision": 4,
-            }, "payload": {}},
-        })
+        command = ExecutionControlCommandDTO.model_validate(
+            {
+                "schema_version": CONTROL_PROTOCOL_VERSION,
+                "message_kind": "command",
+                "control_session_id": session_id,
+                "client_sequence": "1",
+                "command": {
+                    "command_envelope": {
+                        "schema_version": EXECUTION_COMMAND_SCHEMA,
+                        "command_kind": "program_stop",
+                        "correlation_id": "stop.before.snapshot",
+                        "source_label": "test",
+                        "control_session_id": session_id,
+                        "client_sequence": "1",
+                        "freshness": ingress.freshness_for("runner.1", 4).model_dump(mode="json"),
+                        "expected_semantic_owner_epoch": "runner.1",
+                        "expected_execution_control_revision": 4,
+                    },
+                    "payload": {},
+                },
+            }
+        )
         failed = asyncio.get_running_loop().create_future()
+
         def start(*_args, **_kwargs):
             if busy:
                 raise ExecutionControlBusyError(ExecutionControlLane.STOP, 1)
             failed.set_exception(OSError("Stop dispatch unavailable"))
             return failed
+
         monkeypatch.setattr(ingress, "start", start)
         try:
             assert source.semantic_context().status == "synchronizing"
@@ -1600,6 +1653,7 @@ def test_stop_rejection_does_not_require_initial_semantic_snapshot(monkeypatch, 
         finally:
             session._closed = True  # noqa: SLF001
             ingress.close()
+
     asyncio.run(exercise())
 
 
@@ -1608,7 +1662,7 @@ def test_cold_freshness_uses_one_deadline_and_cancels_it_without_clients(
 ) -> None:
     source_path = tmp_path / "manager-source.json"
     source_path.write_text(
-        json.dumps(
+        source_snapshot_text(
             {
                 "api_version": "manyforge.source_snapshot.v1",
                 "payload": {},
@@ -1633,7 +1687,7 @@ def test_cold_freshness_uses_one_deadline_and_cancels_it_without_clients(
         source._loop = asyncio.get_running_loop()  # noqa: SLF001
         subscription = ControlStateSubscription(asyncio.Event())
         source._subscriptions.add(subscription)  # noqa: SLF001
-        source._refresh_file_watches(notify=False)  # noqa: SLF001
+        await source._refresh_file_watches(notify=False)  # noqa: SLF001
         handle = source._cold_expiry_handle  # noqa: SLF001
         assert handle is not None
         await source.unsubscribe(subscription)
@@ -1661,9 +1715,7 @@ def test_control_source_rejects_clients_above_the_fixed_product_cap() -> None:
             program_runner_websocket_url=None,
         )
         for _ in range(CONTROL_MAXIMUM_CLIENTS):
-            source._subscriptions.add(  # noqa: SLF001
-                ControlStateSubscription(asyncio.Event())
-            )
+            source._subscriptions.add(ControlStateSubscription(asyncio.Event()))  # noqa: SLF001
         with pytest.raises(RuntimeError, match="client limit reached"):
             await source.subscribe()
         source._subscriptions.clear()  # noqa: SLF001
@@ -1784,12 +1836,27 @@ def test_incident_enqueue_uses_native_async_boundary_without_executor_queue() ->
         source._loop = asyncio.get_running_loop()  # noqa: SLF001
         source._cycle = _running_cycle(1)  # noqa: SLF001
         source._program_source_current = True  # noqa: SLF001
-        source._facts = SimpleNamespace(runtime={"sections": {"logical_scene": {  # noqa: SLF001
-            "source_owner_epoch": "scene.owner.at.incident", "freshness": "fresh",
-            "payload": {"access": {"active_projection": {"scene_revision": {
-                "scene_id": "scene.at.incident", "revision_id": 4, "content_hash": "sha256:" + "b" * 64,
-            }}}},
-        }}})
+        source._facts = SimpleNamespace(
+            runtime={
+                "sections": {
+                    "logical_scene": {  # noqa: SLF001
+                        "source_owner_epoch": "scene.owner.at.incident",
+                        "freshness": "fresh",
+                        "payload": {
+                            "access": {
+                                "active_projection": {
+                                    "scene_revision": {
+                                        "scene_id": "scene.at.incident",
+                                        "revision_id": 4,
+                                        "content_hash": "sha256:" + "b" * 64,
+                                    }
+                                }
+                            }
+                        },
+                    }
+                }
+            }
+        )
         source.record_incident(incident_id="incident.1", phase="activated")
         assert recorded == []
         source._cycle = _cycle()  # noqa: SLF001
@@ -1969,9 +2036,7 @@ def test_control_source_reduces_new_cycle_from_cached_owner_facts() -> None:
         assert frame is not None
         assert frame.event_class == "critical"
         assert frame.shell["program_cycle"]["cycle_generation"] == 3
-        assert frame.shell["component_overview"]["basis"][
-            "program_cycle_generation"
-        ] == 3
+        assert frame.shell["component_overview"]["basis"]["program_cycle_generation"] == 3
         assert cold_wakes == [None]
         source._subscriptions.clear()  # noqa: SLF001
         await source.close()

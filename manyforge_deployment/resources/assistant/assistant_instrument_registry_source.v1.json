@@ -59,7 +59,20 @@
       "node_id": "timer"
     }
   ],
-  "skills": [],
+  "skills": [
+    {
+      "requires_tools": [],
+      "skill_id": "move_to_named_config"
+    },
+    {
+      "requires_tools": [],
+      "skill_id": "pick_object"
+    },
+    {
+      "requires_tools": [],
+      "skill_id": "place_object"
+    }
+  ],
   "tools": [
     {
       "description": "Read the active headless alarm snapshot.",

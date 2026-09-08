@@ -64,7 +64,7 @@ constexpr std::string_view kExecutablePackageIdentityDomain =
 constexpr std::string_view kBuiltinCatalogApiVersion =
     "manyforge.node_catalog.v2";
 constexpr std::string_view kBuiltinCatalogId = "manyforge_builtin";
-constexpr std::string_view kBuiltinCatalogContentVersion = "2.0.0";
+constexpr std::string_view kBuiltinCatalogContentVersion = "2.1.0";
 constexpr std::string_view kPythonSourcePackageFormat =
     "manyforge.python-source-package.v1";
 constexpr std::string_view kCompositionNamingScheme =
@@ -293,6 +293,10 @@ void require_exact_fields(
 }
 
 [[nodiscard]] bool is_source_id(std::string_view value) noexcept {
+  constexpr std::string_view kSkillPrefix = "skill-artifact:";
+  if (value.starts_with(kSkillPrefix)) {
+    return is_portable_identifier(value.substr(kSkillPrefix.size()));
+  }
   constexpr std::string_view kModulePrefix = "python-module:";
   if (value.starts_with(kModulePrefix)) {
     const std::string_view module = value.substr(kModulePrefix.size());
@@ -307,7 +311,12 @@ void require_exact_fields(
                  byte == '.';
         });
   }
-  return value == "python-project:manyforge_behavior";
+  constexpr std::string_view kExtensionPrefix = "node-extension-descriptor:";
+  if (value.starts_with(kExtensionPrefix)) {
+    return is_portable_identifier(value.substr(kExtensionPrefix.size()));
+  }
+  return value == "python-project:manyforge_behavior" ||
+         value == "python-project:manyforge_example_nodes";
 }
 
 [[nodiscard]] CanonicalValue with_replaced_member(

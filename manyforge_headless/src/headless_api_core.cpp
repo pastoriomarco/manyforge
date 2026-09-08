@@ -943,9 +943,8 @@ CanonicalValue HeadlessApiCore::HistoryQueryPage(const HistorianQuery &query,
   // Keep both the durable read and list projection outside the coordination
   // lock. The summary deliberately omits full payloads; callers fetch one
   // selected event through HistoryDetail instead.
-  const auto page = store->Query(query);
-  return full_records ? HistorianExportPageValue(page)
-                      : HistorianSummaryPageValue(page);
+  return full_records ? HistorianExportPageValue(store->QueryExport(query))
+                      : store->QuerySummaries(query);
 }
 
 CanonicalValue HeadlessApiCore::HistoryDiscovery(const std::string &kind,
@@ -1091,6 +1090,189 @@ CanonicalValue HeadlessApiCore::HistorianHealth() {
   Require(!shutdown_, "headless_api_closed", "headless API core is closed");
   SynchronizeHistorianHealthLocked();
   return AsyncHistorianHealthValue(historian_.Health());
+}
+
+CanonicalValue HeadlessApiCore::RecordGripperConfirmation(CanonicalValue record) {
+  const std::string code = "gripper_confirmation_trace_invalid";
+  const std::set<std::string> fields{"schema_version",
+                                     "origin_epoch",
+                                     "request_id",
+                                     "source_label",
+                                     "native_owner_epoch",
+                                     "program_binding_id",
+                                     "target_role_id",
+                                     "command_id",
+                                     "generation",
+                                     "expected_status_revision",
+                                     "confirmed",
+                                     "phase",
+                                     "details"};
+  Require(record.is_object() && record.as_object().size() == fields.size(), code,
+          "Gripper confirmation trace has invalid fields");
+  for (const auto& [name, value] : record.as_object())
+    Require(fields.contains(name), code, "Gripper confirmation trace has an unknown field");
+  for (const auto name :
+       {"origin_epoch", "request_id", "source_label", "native_owner_epoch", "target_role_id"}) {
+    const auto value = RequiredString(record, name);
+    Require(!value.empty() && value.size() <= 256U && content_identity::is_utf8_nfc(value), code,
+            "Gripper confirmation trace identity is invalid");
+  }
+  Require(RequiredString(record, "schema_version") == "manyforge.gripper_confirmation_trace.v1" &&
+              content_identity::is_sha256_digest(RequiredString(record, "program_binding_id")),
+          code, "Gripper confirmation trace version or binding is invalid");
+  for (const auto name : {"command_id", "generation", "expected_status_revision"}) {
+    const auto value = content_identity::parse_nonnegative_int64(RequiredMember(record, name));
+    Require(value > 0 && value <= static_cast<std::int64_t>(kMaximumSafeInteger), code,
+            "Gripper confirmation trace counter is invalid");
+  }
+  Require(std::holds_alternative<bool>(RequiredMember(record, "confirmed").storage()), code,
+          "Gripper confirmation trace result is not boolean");
+  const auto phase = RequiredString(record, "phase");
+  Require(phase == "attempted" || phase == "accepted" || phase == "unconfirmed", code,
+          "Gripper confirmation trace phase is invalid");
+  Require(RequiredMember(record, "details").is_object() &&
+              content_identity::canonical_json(record).size() <= 8192U,
+          code, "Gripper confirmation trace exceeds its byte bound");
+  auto payload = record.as_object();
+  payload.emplace_back("clock_owner", CanonicalValue("headless:" + config_.owner_epoch));
+  payload.emplace_back("evidence_kind", CanonicalValue("operator_attestation_trace"));
+  auto event =
+      MakeHistorianEvent("manyforge.gripper", "gripper_confirmation_" + phase,
+                         phase == "unconfirmed" ? "ERROR" : "INFO", clocks_.monotonic_time_ns(),
+                         clocks_.wall_time_text(), CanonicalValue(std::move(payload)));
+  const auto event_id = event.event_id;
+  std::lock_guard lock(mutex_);
+  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
+  const bool recorded = historian_.TryEnqueue(std::move(event));
+  if (!recorded)
+    alarm_owner_.MarkHealthUnavailable(std::string(kHistorianOwnerHealthCode),
+                                       "historian queue rejected a gripper confirmation trace");
+  SynchronizeHistorianHealthLocked();
+  return CanonicalValue(CanonicalValue::Object{
+      {"schema_version", CanonicalValue("manyforge.gripper_confirmation_trace_record.v1")},
+      {"event_id", CanonicalValue(event_id)},
+      {"recorded", CanonicalValue(recorded)}});
+}
+
+CanonicalValue HeadlessApiCore::RecordProgramDiagnostic(CanonicalValue record) {
+  const std::string code = "program_diagnostic_invalid";
+  const std::set<std::string> fields{"schema_version",
+                                     "program_run_id",
+                                     "owner_epoch",
+                                     "program_revision",
+                                     "program_binding_id",
+                                     "retained_bundle_id",
+                                     "graph_revision",
+                                     "state",
+                                     "reason_code",
+                                     "message",
+                                     "occurred_at_ns",
+                                     "occurred_at_wall",
+                                     "blackboard",
+                                     "runtime_overrides",
+                                     "omitted_blackboard_count",
+                                     "omitted_override_count",
+                                     "delivery_loss_count"};
+  Require(record.is_object() && record.as_object().size() == fields.size(), code,
+          "Program diagnostic fields are invalid");
+  for (const auto& [name, value] : record.as_object()) {
+    Require(fields.contains(name), code, "Program diagnostic field is unknown");
+  }
+  const auto text = [&](const std::string_view name, std::size_t limit = 512U) {
+    const auto value = RequiredString(record, name);
+    Require(value.size() <= limit && content_identity::is_utf8_nfc(value), code,
+            "Program diagnostic text is invalid");
+    return value;
+  };
+  Require(text("schema_version") == "manyforge.program_diagnostic.v1", code,
+          "Program diagnostic version is unsupported");
+  text("program_run_id");
+  const auto epoch = text("owner_epoch");
+  for (const auto name :
+       {"program_revision", "program_binding_id", "retained_bundle_id", "graph_revision"}) {
+    Require(content_identity::is_sha256_digest(text(name)), code,
+            "Program diagnostic artifact identity is invalid");
+  }
+  const auto state = text("state");
+  Require(state == "succeeded" || state == "failed" || state == "intervention_required", code,
+          "Program diagnostic transition is unsupported");
+  const auto reason = OptionalStringMember(record, "reason_code");
+  Require(!reason || (reason->size() <= 512U && content_identity::is_utf8_nfc(*reason)), code,
+          "Program diagnostic reason is invalid");
+  text("message", 4096U);
+  const auto wall = text("occurred_at_wall", 64U);
+  Require(HistorianRecordedUtcNs(wall).has_value(), code, "Program diagnostic UTC is invalid");
+  const auto monotonic =
+      content_identity::parse_nonnegative_int64(RequiredMember(record, "occurred_at_ns"));
+  const auto bounded_value = [&](const auto& visit, const CanonicalValue& value, std::size_t depth,
+                                 std::size_t& items, std::int64_t& bytes) -> void {
+    bytes -= 2;  // Conservative separators/brackets, as at the producer.
+    Require(++items <= 512U && depth <= 16U && bytes >= 0, code,
+            "Program diagnostic value exceeds traversal or byte bounds");
+    if (value.is_object()) {
+      for (const auto& [key, child] : value.as_object()) {
+        visit(visit, CanonicalValue(key), depth + 1U, items, bytes);
+        visit(visit, child, depth + 1U, items, bytes);
+      }
+    } else if (value.is_array()) {
+      for (const auto& child : value.as_array()) {
+        visit(visit, child, depth + 1U, items, bytes);
+      }
+    } else {
+      const auto* scalar = std::get_if<std::string>(&value.storage());
+      Require(
+          scalar == nullptr || (scalar->size() <= 2048U && content_identity::is_utf8_nfc(*scalar)),
+          code, "Program diagnostic string is invalid");
+      bytes -= static_cast<std::int64_t>(content_identity::canonical_json(value).size());
+      Require(bytes >= 0, code, "Program diagnostic value exceeds byte bound");
+    }
+  };
+  for (const auto name : {"blackboard", "runtime_overrides"}) {
+    const auto& values = RequiredMember(record, name);
+    Require(values.is_object() && values.as_object().size() <= 32U, code,
+            "Program diagnostic values exceed their entry bound");
+    std::int64_t budget = 16 * 1024;
+    for (const auto& [key, value] : values.as_object()) {
+      std::size_t items = 0U;
+      std::int64_t bytes = 16 * 1024 - 2;
+      bounded_value(bounded_value, CanonicalValue(key), 0U, items, bytes);
+      bounded_value(bounded_value, value, 0U, items, bytes);
+      budget -= static_cast<std::int64_t>(
+          content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{{key, value}}))
+              .size());
+      Require(budget >= 0, code, "Program diagnostic section exceeds byte bound");
+    }
+  }
+  for (const auto name :
+       {"omitted_blackboard_count", "omitted_override_count", "delivery_loss_count"}) {
+    const auto value = content_identity::parse_nonnegative_int64(RequiredMember(record, name));
+    Require(value <= (std::string_view(name) == "delivery_loss_count"
+                          ? static_cast<std::int64_t>(kMaximumSafeInteger)
+                          : 100000),
+            code, "Program diagnostic counter is invalid");
+  }
+  Require(content_identity::canonical_json(record).size() <= 64U * 1024U, code,
+          "Program diagnostic exceeds its byte bound");
+  auto payload = record.as_object();
+  payload.emplace_back("clock_owner", CanonicalValue("program_runner:" + epoch));
+  // Attribution is not authentication, command acceptance, or physical proof.
+  payload.emplace_back("evidence_kind", CanonicalValue("attributed_program_values"));
+  auto event = MakeHistorianEvent("manyforge.program_runner", "program_" + state,
+                                  state == "succeeded" ? "INFO" : "ERROR", monotonic, wall,
+                                  CanonicalValue(std::move(payload)));
+  const auto event_id = event.event_id;
+  std::lock_guard lock(mutex_);
+  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
+  const bool recorded = historian_.TryEnqueue(std::move(event));
+  if (!recorded) {
+    alarm_owner_.MarkHealthUnavailable(std::string(kHistorianOwnerHealthCode),
+                                       "historian queue rejected a Program diagnostic");
+  }
+  SynchronizeHistorianHealthLocked();
+  return CanonicalValue(CanonicalValue::Object{
+      {"schema_version", CanonicalValue("manyforge.program_diagnostic_record.v1")},
+      {"event_id", CanonicalValue(event_id)},
+      {"recorded", CanonicalValue(recorded)}});
 }
 
 CanonicalValue HeadlessApiCore::ReconcileHistorianHealth(

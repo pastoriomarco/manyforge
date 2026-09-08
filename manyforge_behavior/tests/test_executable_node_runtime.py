@@ -58,8 +58,7 @@ _DIGEST_A = "sha256:" + "a" * 64
 _DIGEST_B = "sha256:" + "b" * 64
 _DIGEST_C = "sha256:" + "c" * 64
 _MAINTAINED_PROGRAM_INDEX = (
-    _ROOT
-    / "manyforge_deployment/resources/maintained/"
+    _ROOT / "manyforge_deployment/resources/maintained/"
     "maintained_program_role_assignments.v1.json"
 )
 
@@ -95,8 +94,7 @@ def _readiness(binding_id: str) -> NodeExecutionReadiness:
     return NodeExecutionReadiness(
         program_binding_id=binding_id,
         binding_by_node={
-            disposition.row.node_id: AvailabilityFact(True)
-            for disposition in resolver.dispositions
+            disposition.row.node_id: AvailabilityFact(True) for disposition in resolver.dispositions
         },
         owner_by_port={
             owner_port: AvailabilityFact(True)
@@ -197,13 +195,9 @@ class _MaintainedProgramTaskPort(_TaskPort):
     def _output(node_id: str, inputs: OwnerNodeInputs) -> Any:
         if node_id == "assistant.build_scene_selection":
             return {
-                "candidate_object_ids": sorted(
-                    inputs.parameters["candidate_object_ids"]
-                ),
+                "candidate_object_ids": sorted(inputs.parameters["candidate_object_ids"]),
                 "scene_context_json": '{"objects":[]}',
-                "selection_request_text": inputs.parameters[
-                    "selection_request_text"
-                ],
+                "selection_request_text": inputs.parameters["selection_request_text"],
             }
         if node_id == "assistant.validate_scene_selection":
             return _plain(inputs.blackboard["selection_response_key"])
@@ -296,13 +290,13 @@ def _capture(program: Program, *, binding_id: str = _DIGEST_A) -> ProgramRunCapt
     )
 
 
-def test_closed_resolver_exactly_disposes_all_fifty_rows() -> None:
+def test_closed_resolver_exactly_disposes_all_effective_rows() -> None:
     environment = build_node_environment()
     resolver = build_executable_node_resolver(environment)
     dispositions = resolver.dispositions
 
-    assert len(dispositions) == len(environment.registry.rows) == 50
-    assert sum(item.adapter_build_qualified for item in dispositions) == 45
+    assert len(dispositions) == len(environment.registry.rows) == 52
+    assert sum(item.adapter_build_qualified for item in dispositions) == 47
     assert sum(not item.adapter_build_qualified for item in dispositions) == 5
     assert all(
         (
@@ -329,17 +323,14 @@ def test_headless_static_projection_matches_the_closed_deferred_set() -> None:
         for item in resolver.dispositions
         if not item.adapter_build_qualified
     }
-    source = (
-        _ROOT / "manyforge_headless/src/node_environment_projection.cpp"
-    ).read_text(encoding="utf-8")
-    block = source.split("kDeferredAdapters{{", maxsplit=1)[1].split("}};", maxsplit=1)[
-        0
-    ]
+    source = (_ROOT / "manyforge_headless/src/node_environment_projection.cpp").read_text(
+        encoding="utf-8"
+    )
+    block = source.split("kDeferredAdapters{{", maxsplit=1)[1].split("}};", maxsplit=1)[0]
     fields = re.findall(r'"([^"]+)"', block)
     assert len(fields) == 4 * len(expected)
     observed = {
-        fields[index]: tuple(fields[index + 1 : index + 4])
-        for index in range(0, len(fields), 4)
+        fields[index]: tuple(fields[index + 1 : index + 4]) for index in range(0, len(fields), 4)
     }
 
     assert observed == expected
@@ -470,9 +461,7 @@ def test_accepted_task_retries_only_typed_observation_unavailability() -> None:
     catalog = _catalog()
     program = Program.from_dict(_identified(document), catalog)
     task = _OneOutageTaskPort()
-    adapter = build_executable_node_resolver(
-        build_node_environment()
-    ).instantiate(
+    adapter = build_executable_node_resolver(build_node_environment()).instantiate(
         build_node_environment().registry.record("simulation.reset"),
         NodeAdapterBuildContext(
             name="reset_sim",
@@ -523,9 +512,7 @@ def test_terminal_task_remains_running_while_owner_settlement_is_pending() -> No
     catalog = _catalog()
     program = Program.from_dict(_identified(document), catalog)
     task = _SettlingTaskPort()
-    adapter = build_executable_node_resolver(
-        build_node_environment()
-    ).instantiate(
+    adapter = build_executable_node_resolver(build_node_environment()).instantiate(
         build_node_environment().registry.record("simulation.reset"),
         NodeAdapterBuildContext(
             name="reset_sim",
@@ -578,9 +565,7 @@ def test_non_transient_and_identity_changing_observations_still_fail() -> None:
         ),
         (_ObservationFailureTaskPort(None), "owner_task_identity_changed"),
     ):
-        adapter = build_executable_node_resolver(
-            build_node_environment()
-        ).instantiate(
+        adapter = build_executable_node_resolver(build_node_environment()).instantiate(
             build_node_environment().registry.record("simulation.reset"),
             NodeAdapterBuildContext(
                 name="reset_sim",
@@ -646,9 +631,9 @@ def test_availability_keeps_adapter_binding_owner_and_execution_separate() -> No
     )
     assert selected["execution_available"] is True
     assert selected["reason_codes"] == []
-    assert {item["node_id"]: item for item in selected["implementations"]}[
-        "simulation.reset"
-    ]["execution_available"] is True
+    assert {item["node_id"]: item for item in selected["implementations"]}["simulation.reset"][
+        "execution_available"
+    ] is True
 
     incomplete = dict(_readiness(_DIGEST_A).binding_by_node)
     incomplete.pop("sequence")
@@ -716,6 +701,45 @@ def test_top_level_value_source_is_one_attempt_snapshot() -> None:
     assert node.update() is py_trees.common.Status.FAILURE
 
 
+@pytest.mark.parametrize("expected", [False, True])
+def test_logical_gripper_flag_wait_observes_updates_without_physical_owner(
+    expected,
+) -> None:
+    """Old WaitForGripperState was a logical boolean wait, not grasp proof."""
+    document = _minimal_document()
+    document["blackboard"] = {
+        "namespaces": [],
+        "keys": [
+            {
+                "key": "gripper_flag",
+                "type": "bool",
+                "access": "read_write",
+                "persistence": "run",
+            }
+        ],
+    }
+    document["tree"] = {
+        "node_id": "logic.wait_for_bool",
+        "instance_id": "wait_for_gripper_flag",
+        "parameters": {"key": "gripper_flag", "expected_value": expected},
+        "children": [],
+    }
+    program = Program.from_dict(_identified(document), _catalog())
+    run = ExecutableProgramRun(
+        program=program,
+        environment=build_node_environment(),
+        capture=_capture(program),
+        readiness=_readiness(_DIGEST_A),
+        ports=NodeAdapterPorts(),
+    )
+    assert run.tick_once() is py_trees.common.Status.RUNNING
+    run.value_store.write("gripper_flag", not expected)
+    for _ in range(100):
+        assert run.tick_once() is py_trees.common.Status.RUNNING
+    run.value_store.write("gripper_flag", expected)
+    assert run.tick_once() is py_trees.common.Status.SUCCESS
+
+
 def test_runtime_override_changes_only_later_attempt_inputs() -> None:
     catalog = _catalog()
     program = Program(
@@ -723,9 +747,7 @@ def test_runtime_override_changes_only_later_attempt_inputs() -> None:
         catalog,
     )
     move = next(
-        node
-        for node in _walk(program.tree)
-        if node.node_id == "motion.move_to_joint_target"
+        node for node in _walk(program.tree) if node.node_id == "motion.move_to_joint_target"
     )
     store = ProgramValueStore.from_program(program)
     overrides = ProgramRuntimeOverrideStore(program=program, catalog=catalog)
@@ -761,9 +783,7 @@ def test_runtime_override_cannot_replace_captured_binding_selectors() -> None:
         catalog,
     )
     move = next(
-        node
-        for node in _walk(program.tree)
-        if node.node_id == "motion.move_to_joint_target"
+        node for node in _walk(program.tree) if node.node_id == "motion.move_to_joint_target"
     )
     overrides = ProgramRuntimeOverrideStore(program=program, catalog=catalog)
 
@@ -779,11 +799,7 @@ def test_runtime_override_cannot_add_or_change_nested_semantic_selectors() -> No
         _ROOT / "examples/lite6_lite_gripper_pick_and_place.program.yaml",
         catalog,
     )
-    move = next(
-        node
-        for node in _walk(program.tree)
-        if node.instance_id == "move_to_pick_approach"
-    )
+    move = next(node for node in _walk(program.tree) if node.instance_id == "move_to_pick_approach")
     overrides = ProgramRuntimeOverrideStore(program=program, catalog=catalog)
     goal = deepcopy(dict(move.parameters["goal"]))
     goal["frame_ref"] = {"kind": "cell_frame"}
@@ -793,19 +809,13 @@ def test_runtime_override_cannot_add_or_change_nested_semantic_selectors() -> No
 
     changed_position = deepcopy(dict(move.parameters["goal"]))
     changed_position["position_m"] = [0.0, 0.0, 0.2]
-    assert overrides.validate(move.instance_id, "goal", changed_position) == (
-        changed_position
-    )
+    assert overrides.validate(move.instance_id, "goal", changed_position) == (changed_position)
 
 
 def test_nested_model_sources_are_captured_atomically_by_path() -> None:
     catalog = _catalog()
     program = Program(_ROOT / "examples/semantic_shape_pick.program.yaml", catalog)
-    query = next(
-        node
-        for node in _walk(program.tree)
-        if node.instance_id == "choose_scene_object"
-    )
+    query = next(node for node in _walk(program.tree) if node.instance_id == "choose_scene_object")
     store = ProgramValueStore.from_program(program)
     first_context = {
         "candidate_object_ids": ["sphere_part", "cube_part"],
@@ -838,11 +848,7 @@ def test_nested_model_sources_are_captured_atomically_by_path() -> None:
 def test_model_request_preserves_nonblocking_and_atomic_bundle_semantics() -> None:
     catalog = _catalog()
     program = Program(_ROOT / "examples/semantic_shape_pick.program.yaml", catalog)
-    query = next(
-        node
-        for node in _walk(program.tree)
-        if node.instance_id == "choose_scene_object"
-    )
+    query = next(node for node in _walk(program.tree) if node.instance_id == "choose_scene_object")
     store = ProgramValueStore.from_program(program)
     store.write(
         "selection.context",
@@ -945,17 +951,8 @@ def test_all_maintained_program_node_forms_execute_through_the_closed_runner(
         "Timer",
         lambda name, duration: py_trees.behaviours.Success(name=name),
     )
-    index = json.loads(
-        _MAINTAINED_PROGRAM_INDEX.read_text(encoding="utf-8")
-    )
-    sources = tuple(
-        sorted(
-            {
-                assignment["program_source"]
-                for assignment in index["assignments"]
-            }
-        )
-    )
+    index = json.loads(_MAINTAINED_PROGRAM_INDEX.read_text(encoding="utf-8"))
+    sources = tuple(sorted({assignment["program_source"] for assignment in index["assignments"]}))
     assert len(sources) == 11
     environment = build_node_environment()
     exercised: set[str] = set()

@@ -43,8 +43,7 @@ from manyforge_headless_api.service import HeadlessService
 
 _ROOT = Path(__file__).resolve().parents[2]
 _BINDING_FIXTURE = (
-    _ROOT
-    / "manyforge_deployment/resources/program_binding_lite6_native.fixture.json"
+    _ROOT / "manyforge_deployment/resources/program_binding_lite6_native.fixture.json"
 )
 _ADMISSION_GENERATION = 7
 _AUTHORING_DIGEST = "sha256:" + "e" * 64
@@ -131,9 +130,9 @@ def _program_binding(
 ) -> dict[str, Any]:
     binding = json.loads(_BINDING_FIXTURE.read_text(encoding="utf-8"))
     binding["program_binding_id"] = "sha256:" + "0" * 64
-    binding["node_environment"]["environment_digest"] = (
-        build_node_environment().manifest.environment_digest
-    )
+    binding["node_environment"][
+        "environment_digest"
+    ] = build_node_environment().manifest.environment_digest
     binding["program_id"] = program["program_id"]
     binding["program_revision"] = program["program_revision"]
     binding["retained_bundle_id"] = retained_bundle_id
@@ -167,9 +166,7 @@ def _applied_projection(
         "deployment_artifact_id": "cell_a",
         "deployment_revision": "sha256:" + "1" * 64,
         "graph_revision": binding["graph_revision"],
-        "node_environment_digest": binding["node_environment"][
-            "environment_digest"
-        ],
+        "node_environment_digest": binding["node_environment"]["environment_digest"],
         "preparation_digest": "sha256:" + "4" * 64,
         "program": copy.deepcopy(program),
         "program_binding": binding,
@@ -203,9 +200,7 @@ def _scenario_selection(
         "deployment_artifact_id": "cell_a",
         "deployment_revision": "sha256:" + "1" * 64,
         "graph_revision": binding["graph_revision"],
-        "node_environment_digest": binding["node_environment"][
-            "environment_digest"
-        ],
+        "node_environment_digest": binding["node_environment"]["environment_digest"],
         "owner_identities": [],
         "program": copy.deepcopy(program),
         "program_binding": binding,
@@ -241,9 +236,7 @@ def _remove_program_tree_with_valid_identity(value: dict[str, Any]) -> None:
 
 def _malform_binding_frame_with_valid_identity(value: dict[str, Any]) -> None:
     binding = value["program_binding"]
-    binding["target_role_bindings"][0]["frame_role_bindings"][0][
-        "unknown"
-    ] = True
+    binding["target_role_bindings"][0]["frame_role_bindings"][0]["unknown"] = True
     binding["program_binding_id"] = compute_content_identity(
         binding,
         own_field="program_binding_id",
@@ -274,9 +267,9 @@ def test_full_native_applied_program_projection_is_accepted() -> None:
 def test_scenario_program_selection_rejects_rehashed_malformed_binding() -> None:
     core = FakeCore()
     selection = _scenario_selection()
-    selection["program_binding"]["target_role_bindings"][0][
-        "frame_role_bindings"
-    ][0]["unknown"] = True
+    selection["program_binding"]["target_role_bindings"][0]["frame_role_bindings"][0][
+        "unknown"
+    ] = True
     selection["program_binding"]["program_binding_id"] = compute_content_identity(
         selection["program_binding"],
         own_field="program_binding_id",
@@ -308,9 +301,7 @@ def test_scenario_load_selection_uses_effect_free_package_projection() -> None:
         lambda value: value.__setitem__("unknown", True),
         lambda value: value.pop("program"),
         lambda value: value["program"].__setitem__("program_id", "mismatch"),
-        lambda value: value["program"].__setitem__(
-            "program_revision", "sha256:" + "f" * 64
-        ),
+        lambda value: value["program"].__setitem__("program_revision", "sha256:" + "f" * 64),
         _remove_program_tree_with_valid_identity,
         lambda value: value.pop("program_binding"),
         lambda value: value["program_binding"].__setitem__(
@@ -320,9 +311,7 @@ def test_scenario_load_selection_uses_effect_free_package_projection() -> None:
         lambda value: value["program_binding"]["node_environment"].__setitem__(
             "environment_digest", "sha256:" + "f" * 64
         ),
-        lambda value: value["program_binding"].__setitem__(
-            "component_role_bindings", [False]
-        ),
+        lambda value: value["program_binding"].__setitem__("component_role_bindings", [False]),
         _malform_binding_frame_with_valid_identity,
         lambda value: value["source"].pop("semantic_content_digest"),
         lambda value: value["source"].__setitem__("record_digest", "invalid"),
@@ -453,18 +442,14 @@ class FakeCore:
         self.manager_payload = _manager_payload()
         self.program_preparations: list[dict[str, Any]] = []
         self.program_commits: list[tuple[dict[str, Any], str | None]] = []
-        self.program_replays: dict[
-            tuple[str, str], tuple[tuple[object, ...], dict[str, Any]]
-        ] = {}
+        self.program_replays: dict[tuple[str, str], tuple[tuple[object, ...], dict[str, Any]]] = {}
         self.applied_program: dict[str, Any] | None = None
         self.program_target_bundle = "bundle.1"
         self.program_target_graph = "graph.1"
         self.model_attempts: list[dict[str, Any]] = []
         self.source_model_context_override: dict[str, Any] | None = None
         self.scenario_selection_override: dict[str, Any] | None = None
-        self.node_environment_digest = (
-            build_node_environment().manifest.environment_digest
-        )
+        self.node_environment_digest = build_node_environment().manifest.environment_digest
 
     def runtime_snapshot(self) -> dict[str, Any]:
         return {
@@ -474,9 +459,7 @@ class FakeCore:
             "projection_owner_epoch": "projection.epoch.1",
             "reasons": [],
             "sections": {
-                "manager": _section(
-                    "component-manager.cell-a", self.manager_payload
-                ),
+                "manager": _section("component-manager.cell-a", self.manager_payload),
                 "logical_scene": _section(
                     "logical-scene.cell-a",
                     {"api_version": "manyforge.logical_scene_source.v1"},
@@ -641,9 +624,7 @@ class FakeCore:
     ) -> dict[str, Any]:
         assert request_owner_epoch
         assert request_id
-        self.program_commits.append(
-            (copy.deepcopy(preparation), expected_applied_record_digest)
-        )
+        self.program_commits.append((copy.deepcopy(preparation), expected_applied_record_digest))
         record_digest = "sha256:" + "5" * 64
         self.applied_program = _applied_projection(
             self.program_preparations[-1],
@@ -916,9 +897,7 @@ class FakeManager:
                 }
                 for resource_id in request.scene_resource_ids
             ],
-            "projection_revision": (
-                request.expected_projection_revision.model_dump()
-            ),
+            "projection_revision": (request.expected_projection_revision.model_dump()),
         }
 
 
@@ -978,9 +957,7 @@ class FakeExecution:
         trusted_principal_id: str | None,
     ) -> dict[str, Any]:
         self.requests.append(("preview_capability_command", request))
-        self.principals.append(
-            ("preview_capability_command", trusted_principal_id)
-        )
+        self.principals.append(("preview_capability_command", trusted_principal_id))
         return {
             "ok": True,
             "command": "preview_capability_command",
@@ -1062,38 +1039,26 @@ class FakeExecution:
         self.principals.append((kind, trusted_principal_id))
         return {"ok": True, "command": kind, "accepted": {"control": kind}}
 
-    def pause(
-        self, request: object, *, trusted_principal_id: str | None
-    ) -> dict[str, Any]:
+    def pause(self, request: object, *, trusted_principal_id: str | None) -> dict[str, Any]:
         return self._control("pause", request, trusted_principal_id)
 
-    def resume(
-        self, request: object, *, trusted_principal_id: str | None
-    ) -> dict[str, Any]:
+    def resume(self, request: object, *, trusted_principal_id: str | None) -> dict[str, Any]:
         return self._control("resume", request, trusted_principal_id)
 
-    def reset(
-        self, request: object, *, trusted_principal_id: str | None
-    ) -> dict[str, Any]:
+    def reset(self, request: object, *, trusted_principal_id: str | None) -> dict[str, Any]:
         return self._control("reset", request, trusted_principal_id)
 
     def acknowledge_completed(
         self, request: object, *, trusted_principal_id: str | None
     ) -> dict[str, Any]:
-        return self._control(
-            "acknowledge_completed", request, trusted_principal_id
-        )
+        return self._control("acknowledge_completed", request, trusted_principal_id)
 
-    def stop(
-        self, request: object, *, trusted_principal_id: str | None
-    ) -> dict[str, Any]:
+    def stop(self, request: object, *, trusted_principal_id: str | None) -> dict[str, Any]:
         self.requests.append(("stop", request))
         self.principals.append(("stop", trusted_principal_id))
         return {"ok": True, "command": "stop", "accepted": {}}
 
-    def full_stop(
-        self, request: object, *, trusted_principal_id: str | None
-    ) -> dict[str, Any]:
+    def full_stop(self, request: object, *, trusted_principal_id: str | None) -> dict[str, Any]:
         self.requests.append(("full_stop", request))
         self.principals.append(("full_stop", trusted_principal_id))
         return {"ok": True, "command": "full_stop", "accepted": {}}
@@ -1116,9 +1081,7 @@ class FakeExecution:
                 },
             )
         )
-        self.principals.append(
-            ("recognized_malformed_stop", trusted_principal_id)
-        )
+        self.principals.append(("recognized_malformed_stop", trusted_principal_id))
         return {
             "ok": True,
             "command": "stop",
@@ -1144,9 +1107,7 @@ class FakeExecution:
         self, request: object, *, trusted_principal_id: str | None
     ) -> dict[str, Any]:
         self.requests.append(("set_runtime_scale_control", request))
-        self.principals.append(
-            ("set_runtime_scale_control", trusted_principal_id)
-        )
+        self.principals.append(("set_runtime_scale_control", trusted_principal_id))
         return {
             "ok": True,
             "command": "set_runtime_scale_control",
@@ -1193,9 +1154,7 @@ def _program_run_snapshot(*, state: str = "running") -> dict[str, Any]:
             "program_binding_id": binding["program_binding_id"],
             "retained_bundle_id": digest_c,
             "graph_revision": digest_a,
-            "node_environment_digest": binding["node_environment"][
-                "environment_digest"
-            ],
+            "node_environment_digest": binding["node_environment"]["environment_digest"],
             "node_policy_digest": "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
             "node_policies": [],
             "owner_identities": [
@@ -1290,9 +1249,7 @@ class FakeProgramRunner:
     def _snapshot(self, *, state: str = "running") -> dict[str, Any]:
         snapshot = _program_run_snapshot(state=state)
         if self.node_environment_digest is not None:
-            snapshot["capture"]["node_environment_digest"] = (
-                self.node_environment_digest
-            )
+            snapshot["capture"]["node_environment_digest"] = self.node_environment_digest
         return snapshot
 
     def runs(self, *, active_only: bool, limit: int) -> dict[str, Any]:
@@ -1318,9 +1275,7 @@ class FakeProgramRunner:
             "applied_record_digest": body["expected_applied_record_digest"],
             "program_revision": self._snapshot()["capture"]["program_revision"],
             "admission_generation": body["expected_admission_generation"],
-            "prepared_scene": {
-                "schema_version": "manyforge.prepared_program_scene.v1"
-            },
+            "prepared_scene": {"schema_version": "manyforge.prepared_program_scene.v1"},
         }
 
     def read_run(self, program_run_id: str) -> dict[str, Any]:
@@ -1390,8 +1345,7 @@ def _node_availability_fixture(
     readiness = NodeExecutionReadiness(
         program_binding_id=applied["program_binding_id"],
         binding_by_node={
-            disposition.row.node_id: AvailabilityFact(True)
-            for disposition in dispositions
+            disposition.row.node_id: AvailabilityFact(True) for disposition in dispositions
         },
         owner_by_port={
             disposition.owner_port_name: AvailabilityFact(True)
@@ -1458,9 +1412,8 @@ def _node_availability_fixture(
         "availability": availability,
         "source": {
             **source,
-            "content_digest": "sha256:" + hashlib.sha256(
-                rfc8785.dumps({"availability": availability, **source})
-            ).hexdigest(),
+            "content_digest": "sha256:"
+            + hashlib.sha256(rfc8785.dumps({"availability": availability, **source})).hexdigest(),
         },
     }
     return core_projection, runner_projection
@@ -1486,8 +1439,7 @@ class _ResetProgramRunner(FakeProgramRunner):
         self.calls.append(("reset_cycle", copy.deepcopy(body)))
         if (
             self.cycle["state"] not in {"running", "terminal_awaiting_reset"}
-            or self.cycle["cycle_generation"]
-            != body["expected_cycle_generation"]
+            or self.cycle["cycle_generation"] != body["expected_cycle_generation"]
         ):
             raise ProgramRunnerClientError(
                 "program_cycle_reset_stale",
@@ -1525,9 +1477,7 @@ def _cycle_reset_request() -> ProgramCycleResetRequest:
 def test_program_cycle_reset_is_one_thin_owner_command() -> None:
     execution = FakeExecution()
     runner = _ResetProgramRunner()
-    service = _service(
-        FakeCore(), FakeManager(), execution=execution, program_runner=runner
-    )
+    service = _service(FakeCore(), FakeManager(), execution=execution, program_runner=runner)
 
     result = service.program_cycle_reset(_cycle_reset_request())
 
@@ -1540,9 +1490,7 @@ def test_stale_program_cycle_reset_has_no_stop_recovery_effect() -> None:
     execution = FakeExecution()
     runner = _ResetProgramRunner()
     runner.cycle["cycle_generation"] = 5
-    service = _service(
-        FakeCore(), FakeManager(), execution=execution, program_runner=runner
-    )
+    service = _service(FakeCore(), FakeManager(), execution=execution, program_runner=runner)
 
     with pytest.raises(HeadlessApiError) as stale:
         service.program_cycle_reset(_cycle_reset_request())
@@ -1564,9 +1512,7 @@ def test_successor_idle_reset_is_rejected_without_replaying_effects() -> None:
             "terminal_or_settlement_reference": None,
         }
     )
-    service = _service(
-        FakeCore(), FakeManager(), execution=execution, program_runner=runner
-    )
+    service = _service(FakeCore(), FakeManager(), execution=execution, program_runner=runner)
 
     with pytest.raises(HeadlessApiError) as stale:
         service.program_cycle_reset(_cycle_reset_request())
@@ -1585,9 +1531,7 @@ def test_full_stopped_reset_is_one_public_command_with_exact_inner_settlement() 
             "terminal_or_settlement_reference": None,
         }
     )
-    service = _service(
-        FakeCore(), FakeManager(), execution=execution, program_runner=runner
-    )
+    service = _service(FakeCore(), FakeManager(), execution=execution, program_runner=runner)
     request = ProgramFullStopResetRequest.model_validate(
         {
             "request_id": "reset-full-stop.1",
@@ -1652,9 +1596,7 @@ class FakeDeploymentCompiler:
         return {
             "schema_version": "manyforge.deployment_candidate_compilation.v1",
             "scenario_id": kwargs["scenario_id"],
-            "scenario_catalog_revision": kwargs[
-                "expected_scenario_catalog_revision"
-            ],
+            "scenario_catalog_revision": kwargs["expected_scenario_catalog_revision"],
             "deployment_artifact_id": "cell_a",
             "deployment_revision": "sha256:" + "1" * 64,
             "retained_bundle_id": "sha256:" + "2" * 64,
@@ -1669,9 +1611,7 @@ def test_deployment_candidate_compilation_requires_and_replays_exact_claim() -> 
     core = FakeCore()
     manager = FakeManager()
     compiler = FakeDeploymentCompiler()
-    client = TestClient(
-        create_app(service=_service(core, manager, deployment_compiler=compiler))
-    )
+    client = TestClient(create_app(service=_service(core, manager, deployment_compiler=compiler)))
     body = {
         "scenario_id": "cell_a",
         "expected_scenario_catalog_revision": "sha256:" + "6" * 64,
@@ -1680,23 +1620,21 @@ def test_deployment_candidate_compilation_requires_and_replays_exact_claim() -> 
         "authoring_claim": _authoring_claim(),
     }
 
-    response = client.post(
-        "/api/manager/deployment-candidates/compile", json=body
-    )
+    response = client.post("/api/manager/deployment-candidates/compile", json=body)
 
     assert response.status_code == 200, response.text
     assert response.json()["compilation"]["scenario_id"] == "cell_a"
-    assert compiler.calls == [{
-        "scenario_id": "cell_a",
-        "expected_scenario_catalog_revision": "sha256:" + "6" * 64,
-        "deployment": {"api_version": "manyforge.deployment.v1"},
-        "program": {"api_version": "manyforge.program.v2"},
-    }]
+    assert compiler.calls == [
+        {
+            "scenario_id": "cell_a",
+            "expected_scenario_catalog_revision": "sha256:" + "6" * 64,
+            "deployment": {"api_version": "manyforge.deployment.v1"},
+            "program": {"api_version": "manyforge.program.v2"},
+        }
+    ]
 
     body["authoring_claim"] = {"intent": {"claim_kind": "not-authoring"}}
-    rejected = client.post(
-        "/api/manager/deployment-candidates/compile", json=body
-    )
+    rejected = client.post("/api/manager/deployment-candidates/compile", json=body)
     assert rejected.status_code == 409
     assert rejected.json()["detail"]["code"] == "authoring_not_ready"
 
@@ -1726,22 +1664,26 @@ def _route_selection_body(admission_generation: int) -> dict[str, Any]:
             "controller_topology_id": "topology.arm",
             "topology_revision": "topology.revision.1",
             "activation_set_id": "activation.arm",
-            "binding_routes": [{
-                "control_binding_id": "binding.arm",
-                "control_binding_revision": "binding.revision.1",
-                "control_route_id": "route.normal",
-            }],
+            "binding_routes": [
+                {
+                    "control_binding_id": "binding.arm",
+                    "control_binding_revision": "binding.revision.1",
+                    "control_route_id": "route.normal",
+                }
+            ],
         },
         "expected_active_control_configuration": {
             "presence": "absent",
             "active_control_configuration_id": None,
             "active_control_configuration_generation": None,
         },
-        "component_expectations": [{
-            "controllable_component_id": "component.arm",
-            "expected_component_lifecycle_generation": 1,
-            "expected_component_lifecycle_state": "prepared",
-        }],
+        "component_expectations": [
+            {
+                "controllable_component_id": "component.arm",
+                "expected_component_lifecycle_generation": 1,
+                "expected_component_lifecycle_state": "prepared",
+            }
+        ],
         "confirmed": True,
     }
 
@@ -1774,9 +1716,7 @@ def test_route_selection_requires_current_idle_admission_at_backend_boundary() -
 @pytest.mark.parametrize(
     "mutation",
     [
-        lambda context: context.update(
-            {"schema_version": "manyforge.source_model_context.v0"}
-        ),
+        lambda context: context.update({"schema_version": "manyforge.source_model_context.v0"}),
         lambda context: context.update({"extra": True}),
         lambda context: context.pop("source_model"),
         lambda context: context.update({"source_model": []}),
@@ -1813,28 +1753,20 @@ def test_runtime_manager_scene_alarm_history_and_health_are_thin_reads() -> None
         assert client.get("/api/manager/diff").json()["converged"]
         environment = client.get("/api/node-environment").json()
         assert environment["retained_bundle_id"] == "bundle.1"
-        assert environment["source"]["source_owner_id"] == (
-            "headless-api.node-environment"
-        )
+        assert environment["source"]["source_owner_id"] == ("headless-api.node-environment")
         source_model = client.get("/api/source-model").json()
         assert source_model["retained_bundle_id"] == "bundle.1"
         assert source_model["occurrences"] == []
-        assert source_model["source"]["source_owner_id"] == (
-            "headless-api.source-model"
-        )
+        assert source_model["source"]["source_owner_id"] == ("headless-api.source-model")
         context = client.get("/api/source-model-context").json()
         assert context["schema_version"] == "manyforge.source_model_context.v1"
         assert context["node_environment"]["schema_version"] == (
             "manyforge.node_environment_projection.v2"
         )
-        assert context["source_model"]["schema_version"] == (
-            "manyforge.source_model_projection.v2"
-        )
+        assert context["source_model"]["schema_version"] == ("manyforge.source_model_projection.v2")
         scenarios = client.get("/api/scenarios").json()
         assert scenarios["api_version"] == "manyforge.scenario_catalog.v1"
-        assert [row["scenario_id"] for row in scenarios["scenarios"]] == [
-            "cell-pick"
-        ]
+        assert [row["scenario_id"] for row in scenarios["scenarios"]] == ["cell-pick"]
 
         urdf = client.get("/api/viewer-model/urdf")
         assert urdf.status_code == 200
@@ -1853,34 +1785,20 @@ def test_runtime_manager_scene_alarm_history_and_health_are_thin_reads() -> None
             },
         )
         assert resource.status_code == 200
-        assert resource.headers["cache-control"] == (
-            "public, max-age=31536000, immutable"
-        )
+        assert resource.headers["cache-control"] == ("public, max-age=31536000, immutable")
         assert resource.content == b"solid"
         assert resource.headers["content-type"] == "model/stl"
         assert resource.headers["x-manyforge-retained-bundle-id"] == bundle_id
         assistant_modes = client.get("/api/assistant/modes").json()
-        assert [row["mode"] for row in assistant_modes["modes"]] == [
-            "composer-assistant"
-        ]
-        assistant_mode = client.get(
-            "/api/assistant/modes/composer-assistant"
-        ).json()
+        assert [row["mode"] for row in assistant_modes["modes"]] == ["composer-assistant"]
+        assistant_mode = client.get("/api/assistant/modes/composer-assistant").json()
         assert assistant_mode["mode"] == "composer-assistant"
         assert assistant_mode["retained_bundle_id"] == "bundle.1"
-        assistant_context = client.get(
-            "/api/assistant/modes/composer-assistant/context"
-        ).json()
-        assert assistant_context["schema_version"] == (
-            "manyforge.assistant_mode_context.v1"
-        )
-        assert assistant_context["assistant_mode"]["mode"] == (
-            "composer-assistant"
-        )
+        assistant_context = client.get("/api/assistant/modes/composer-assistant/context").json()
+        assert assistant_context["schema_version"] == ("manyforge.assistant_mode_context.v1")
+        assert assistant_context["assistant_mode"]["mode"] == ("composer-assistant")
         assert client.get("/api/scene").status_code == 200
-        assert client.get("/api/execution/alarms").json()[
-            "requested_limit"
-        ] == 32
+        assert client.get("/api/execution/alarms").json()["requested_limit"] == 32
         alarms = client.get(
             "/api/execution/alarms",
             params=[
@@ -1901,9 +1819,10 @@ def test_runtime_manager_scene_alarm_history_and_health_are_thin_reads() -> None
         assert overview["schema_version"] == "manyforge.component_overview.v1"
         assert overview["readiness"] == "degraded"
         assert overview["overview_revision"].startswith("sha256:")
-        assert next(
-            row for row in overview["components"] if row["id"] == "observe_render"
-        )["status"] == "healthy"
+        assert (
+            next(row for row in overview["components"] if row["id"] == "observe_render")["status"]
+            == "healthy"
+        )
 
 
 def test_component_overview_fact_capture_reads_each_source_once() -> None:
@@ -1985,10 +1904,15 @@ def test_node_environment_joins_only_the_exact_applied_runner_offer() -> None:
     }
     assert set(used) == required
     assert all(row["execution_available"] for row in used.values())
-    assert runner.calls == [("node_availability", {
-        "applied": applied,
-        "selection": core.scenario_program_selection(applied["scenario_id"]),
-    })]
+    assert runner.calls == [
+        (
+            "node_availability",
+            {
+                "applied": applied,
+                "selection": core.scenario_program_selection(applied["scenario_id"]),
+            },
+        )
+    ]
 
 
 def test_node_environment_rejects_a_stale_runner_applied_identity() -> None:
@@ -1999,16 +1923,19 @@ def test_node_environment_rejects_a_stale_runner_applied_identity() -> None:
     core.node_environment_projection = lambda: copy.deepcopy(core_projection)  # type: ignore[method-assign]
     runner_projection["source"]["program_revision"] = "sha256:" + "f" * 64
     source = {
-        key: value
-        for key, value in runner_projection["source"].items()
-        if key != "content_digest"
+        key: value for key, value in runner_projection["source"].items() if key != "content_digest"
     }
-    runner_projection["source"]["content_digest"] = "sha256:" + hashlib.sha256(
-        rfc8785.dumps({
-            "availability": runner_projection["availability"],
-            **source,
-        })
-    ).hexdigest()
+    runner_projection["source"]["content_digest"] = (
+        "sha256:"
+        + hashlib.sha256(
+            rfc8785.dumps(
+                {
+                    "availability": runner_projection["availability"],
+                    **source,
+                }
+            )
+        ).hexdigest()
+    )
     service = _service(
         core,
         FakeManager(),
@@ -2029,12 +1956,8 @@ def test_manager_status_and_diff_preserve_offer_digest_fields() -> None:
 
     desired = status["status"]["runtime"]["desired_units"]
     observed = status["status"]["runtime"]["observed_units"]
-    assert desired[0]["selected_runtime_contract_offer_digest"] == (
-        "sha256:" + "c" * 64
-    )
-    assert observed[0]["observed_runtime_contract_offer_digest"] == (
-        "sha256:" + "c" * 64
-    )
+    assert desired[0]["selected_runtime_contract_offer_digest"] == ("sha256:" + "c" * 64)
+    assert observed[0]["observed_runtime_contract_offer_digest"] == ("sha256:" + "c" * 64)
     assert diff["desired_units"] == desired
     assert diff["observed_units"] == observed
 
@@ -2043,9 +1966,7 @@ def test_program_apply_skips_unchanged_deployment_and_publishes_exact_program() 
     client, core, manager = _client()
     core.program_target_bundle = "sha256:" + "b" * 64
     core.program_target_graph = "sha256:" + "c" * 64
-    core.manager_payload["active"]["retained_bundle_id"] = (
-        core.program_target_bundle
-    )
+    core.manager_payload["active"]["retained_bundle_id"] = core.program_target_bundle
     core.manager_payload["active"]["graph_revision"] = core.program_target_graph
     program = copy.deepcopy(_program_document())
     body = {
@@ -2085,9 +2006,7 @@ def test_program_apply_rejects_rehashed_malformed_applied_binding_result() -> No
     core = FakeCore()
     core.program_target_bundle = "sha256:" + "b" * 64
     core.program_target_graph = "sha256:" + "c" * 64
-    core.manager_payload["active"]["retained_bundle_id"] = (
-        core.program_target_bundle
-    )
+    core.manager_payload["active"]["retained_bundle_id"] = core.program_target_bundle
     core.manager_payload["active"]["graph_revision"] = core.program_target_graph
     original_commit = core.commit_program_apply
 
@@ -2104,9 +2023,7 @@ def test_program_apply_rejects_rehashed_malformed_applied_binding_result() -> No
             request_id,
         )
         binding = result["program_binding"]
-        binding["target_role_bindings"][0]["frame_role_bindings"][0][
-            "unknown"
-        ] = True
+        binding["target_role_bindings"][0]["frame_role_bindings"][0]["unknown"] = True
         binding["program_binding_id"] = compute_content_identity(
             binding,
             own_field="program_binding_id",
@@ -2139,9 +2056,7 @@ def test_program_apply_recovers_exact_commit_before_returning_failure() -> None:
     core = FakeCore()
     core.program_target_bundle = "sha256:" + "b" * 64
     core.program_target_graph = "sha256:" + "c" * 64
-    core.manager_payload["active"]["retained_bundle_id"] = (
-        core.program_target_bundle
-    )
+    core.manager_payload["active"]["retained_bundle_id"] = core.program_target_bundle
     core.manager_payload["active"]["graph_revision"] = core.program_target_graph
     original_commit = core.commit_program_apply
 
@@ -2175,9 +2090,7 @@ def test_program_apply_commit_rejection_carries_owner_no_effect_proof() -> None:
     core = FakeCore()
     core.program_target_bundle = "sha256:" + "b" * 64
     core.program_target_graph = "sha256:" + "c" * 64
-    core.manager_payload["active"]["retained_bundle_id"] = (
-        core.program_target_bundle
-    )
+    core.manager_payload["active"]["retained_bundle_id"] = core.program_target_bundle
     core.manager_payload["active"]["graph_revision"] = core.program_target_graph
 
     def reject_commit(*_args, **_kwargs):
@@ -2201,9 +2114,7 @@ def test_program_apply_commit_rejection_carries_owner_no_effect_proof() -> None:
     )
 
     assert response.status_code == 409
-    assert response.json()["detail"]["details"] == {
-        "effect_disposition": "proven_no_effect"
-    }
+    assert response.json()["detail"]["details"] == {"effect_disposition": "proven_no_effect"}
     assert core.applied_program is None
 
 
@@ -2245,9 +2156,7 @@ def test_program_apply_fences_full_stack_restart_raced_by_preparation() -> None:
         scenario_catalog_revision: str,
         program: dict[str, Any],
     ) -> dict[str, Any]:
-        preparation = original_prepare(
-            scenario_id, scenario_catalog_revision, program
-        )
+        preparation = original_prepare(scenario_id, scenario_catalog_revision, program)
         core.manager_payload["apply"] = {
             "mutation_available": False,
             "records": [],
@@ -2255,9 +2164,7 @@ def test_program_apply_fences_full_stack_restart_raced_by_preparation() -> None:
         }
         return preparation
 
-    core.prepare_program_apply = (  # type: ignore[method-assign]
-        prepare_then_publish_restart
-    )
+    core.prepare_program_apply = prepare_then_publish_restart  # type: ignore[method-assign]
     manager = FakeManager()
     client = TestClient(create_app(service=_service(core, manager)))
 
@@ -2309,9 +2216,7 @@ def test_program_runner_surface_is_a_strict_thin_owner_projection() -> None:
     }
 
     with client:
-        selection = client.get(
-            "/api/scenarios/cell-pick/program-selection"
-        )
+        selection = client.get("/api/scenarios/cell-pick/program-selection")
         index = client.get(
             "/api/program/runs",
             params={"active_only": "true", "limit": 1},
@@ -2389,9 +2294,7 @@ def test_program_run_captures_current_environment_not_package_provenance() -> No
     core.applied_program = _applied_for_program_run()
     core.node_environment_digest = current_environment
     runner = FakeProgramRunner(node_environment_digest=current_environment)
-    client = TestClient(
-        create_app(service=_service(core, FakeManager(), program_runner=runner))
-    )
+    client = TestClient(create_app(service=_service(core, FakeManager(), program_runner=runner)))
     source = core.applied_program["source"]
     request = {
         **_caller(),
@@ -2405,9 +2308,7 @@ def test_program_run_captures_current_environment_not_package_provenance() -> No
     response = client.post("/api/program/runs", json=request)
 
     assert response.status_code == 200
-    assert response.json()["capture"]["node_environment_digest"] == (
-        current_environment
-    )
+    assert response.json()["capture"]["node_environment_digest"] == (current_environment)
     assert current_environment != core.applied_program["node_environment_digest"]
 
 
@@ -2452,25 +2353,17 @@ def test_program_run_start_rejects_stale_applied_or_divergent_runner() -> None:
         divergent_response = client.post("/api/program/runs", json=body)
 
     assert stale.status_code == 409
-    assert stale.json()["detail"]["code"] == (
-        "program_run_applied_selection_stale"
-    )
+    assert stale.json()["detail"]["code"] == ("program_run_applied_selection_stale")
     assert divergent_response.status_code == 502
-    assert divergent_response.json()["detail"]["code"] == (
-        "program_runner_response_invalid"
-    )
+    assert divergent_response.json()["detail"]["code"] == ("program_runner_response_invalid")
 
 
 def test_program_only_apply_does_not_mutate_an_active_captured_run() -> None:
     core = FakeCore()
     core.program_target_bundle = "sha256:" + "b" * 64
     core.program_target_graph = "sha256:" + "c" * 64
-    core.manager_payload["active"]["retained_bundle_id"] = (
-        core.program_target_bundle
-    )
-    core.manager_payload["active"]["graph_revision"] = (
-        core.program_target_graph
-    )
+    core.manager_payload["active"]["retained_bundle_id"] = core.program_target_bundle
+    core.manager_payload["active"]["graph_revision"] = core.program_target_graph
     runner = FakeProgramRunner()
     app = create_app(
         service=_service(
@@ -2560,8 +2453,7 @@ def test_program_model_attempt_is_validated_before_native_commit() -> None:
     assert core.model_attempts == [body]
 
 
-def test_program_apply_rejects_inactive_target_without_artifacts_or_manager_apply(
-) -> None:
+def test_program_apply_rejects_inactive_target_without_artifacts_or_manager_apply() -> None:
     core = FakeCore()
     core.program_target_bundle = "sha256:" + "b" * 64
     core.program_target_graph = "sha256:" + "c" * 64
@@ -2580,12 +2472,8 @@ def test_program_apply_rejects_inactive_target_without_artifacts_or_manager_appl
         assert client.get("/api/program/applied").status_code == 404
 
     assert rejected.status_code == 409
-    assert rejected.json()["detail"]["code"] == (
-        "program_apply_deployment_not_active"
-    )
-    assert rejected.json()["detail"]["details"] == {
-        "effect_disposition": "proven_no_effect"
-    }
+    assert rejected.json()["detail"]["code"] == ("program_apply_deployment_not_active")
+    assert rejected.json()["detail"]["details"] == {"effect_disposition": "proven_no_effect"}
     assert core.program_preparations == []
     assert core.program_commits == []
     assert manager.requests == []
@@ -2611,18 +2499,14 @@ def test_program_apply_inactive_target_preserves_prior_applied_selection() -> No
                 "scenario_id": "cell-pick",
                 "scenario_catalog_revision": "sha256:" + "6" * 64,
                 "program": copy.deepcopy(_program_document()),
-                "expected_applied_record_digest": prior["source"][
-                    "record_digest"
-                ],
+                "expected_applied_record_digest": prior["source"]["record_digest"],
                 "authoring_claim": _authoring_claim(),
             },
         )
         still_applied = client.get("/api/program/applied")
 
     assert rejected.status_code == 409
-    assert rejected.json()["detail"]["code"] == (
-        "program_apply_deployment_not_active"
-    )
+    assert rejected.json()["detail"]["code"] == ("program_apply_deployment_not_active")
     assert manager.requests == []
     assert core.program_preparations == []
     assert core.program_commits == []
@@ -2645,9 +2529,7 @@ def test_program_apply_rejects_invalid_program_before_native_preparation() -> No
         )
     assert response.status_code == 400
     assert response.json()["detail"]["code"] == "program_apply_program_invalid"
-    assert response.json()["detail"]["details"] == {
-        "effect_disposition": "proven_no_effect"
-    }
+    assert response.json()["detail"]["details"] == {"effect_disposition": "proven_no_effect"}
     assert core.program_preparations == []
 
 
@@ -2854,9 +2736,7 @@ def test_scene_pose_query_is_read_only_revision_fenced_and_canonical() -> None:
         "part.1",
         "part.2",
     ]
-    assert manager.scene_pose_requests[0].expected_projection_revision.model_dump() == (
-        projection
-    )
+    assert manager.scene_pose_requests[0].expected_projection_revision.model_dump() == (projection)
     assert noncanonical.status_code == 422
 
 
@@ -2883,9 +2763,7 @@ def test_scene_pose_error_preserves_structured_owner_details() -> None:
         )
 
     assert response.status_code == 404
-    assert response.json()["detail"]["details"] == {
-        "reason": "scene_frame_resolution_ambiguous"
-    }
+    assert response.json()["detail"]["details"] == {"reason": "scene_frame_resolution_ambiguous"}
 
 
 def test_scene_support_declaration_crosses_http_without_native_names() -> None:
@@ -2919,12 +2797,13 @@ def test_scene_support_declaration_crosses_http_without_native_names() -> None:
     operation = manager.scene_requests[0][0].operation
     assert operation.support_contacts[0].support_object_id == "table.1"
     assert operation.support_contacts[0].max_contact_penetration_m == 0.002
-    assert "support_contacts" in openapi["components"]["schemas"][
-        "AddSceneObjectRequest"
-    ]["properties"]
-    assert "body_a" not in openapi["components"]["schemas"][
-        "SceneSupportContactRequest"
-    ]["properties"]
+    assert (
+        "support_contacts"
+        in openapi["components"]["schemas"]["AddSceneObjectRequest"]["properties"]
+    )
+    assert (
+        "body_a" not in openapi["components"]["schemas"]["SceneSupportContactRequest"]["properties"]
+    )
 
 
 def test_request_body_bound_is_enforced_before_model_decode() -> None:
@@ -2978,9 +2857,7 @@ def test_streamed_request_body_bound_is_enforced_without_content_length() -> Non
 
 def test_recognized_malformed_stop_promotes_instead_of_returning_validation_error() -> None:
     execution = FakeExecution()
-    app = create_app(
-        service=_service(FakeCore(), FakeManager(), execution)
-    )
+    app = create_app(service=_service(FakeCore(), FakeManager(), execution))
     with TestClient(app) as client:
         response = client.post(
             "/api/execution/stops",
@@ -3075,6 +2952,113 @@ def test_history_detail_is_an_exact_bounded_read() -> None:
         "latency",
     }
     assert invalid.status_code == 422
+
+
+def test_skills_routes_use_exact_selected_environment_and_never_execute():
+    client, core, manager = _client()
+    with client:
+        discovery = client.get("/api/skills")
+        assert discovery.status_code == 200, discovery.text
+        offered = discovery.json()
+        assert offered["schema_version"] == "manyforge.skill_catalog.v1"
+        assert offered["skills"][0]["body"]["node_id"] == "motion.move_to_joint_target"
+        body = {
+            "schema_version": "manyforge.skill_expansion_request.v1",
+            "expected_environment_digest": offered["environment_digest"],
+            "skill_id": "move_to_named_config",
+            "instance_prefix": "skills.home",
+            "arguments": {
+                "configuration_name": "home",
+                "goal": [{"joint_name": "joint1", "position_rad": 0.0}],
+                "velocity_scale": 0.2,
+                "acceleration_scale": 0.3,
+                "max_tcp_linear_speed_mps": 0.1,
+            },
+            "component_roles": {"robot": "robot"},
+            "target_roles": {"arm": "arm"},
+            "program_context": {
+                key: value
+                for key, value in Program(
+                    _ROOT / "examples/lite6_lite_gripper_pick_and_place.program.yaml",
+                    build_node_environment().catalog,
+                )
+                .to_dict()
+                .items()
+                if key not in {"tree", "program_revision"}
+            },
+        }
+        result = client.post("/api/skills/expand", json=body)
+        assert result.status_code == 200, result.text
+        assert result.json()["tree"]["instance_id"] == "skills.home.move"
+        assert result.json()["environment_digest"] == offered["environment_digest"]
+        assert (
+            client.post("/api/skills/expand", json={**body, "python_import": "os"}).status_code
+            == 422
+        )
+        assert (
+            client.post(
+                "/api/skills/expand",
+                json={**body, "expected_environment_digest": "sha256:" + "0" * 64},
+            ).status_code
+            == 409
+        )
+        invalid = {**body, "target_roles": {"arm": "gripper"}}
+        assert client.post("/api/skills/expand", json=invalid).status_code == 400
+        selected = core.node_environment_projection()
+        selected["environment_digest"] = "sha256:" + "0" * 64
+        core.node_environment_projection = lambda: selected
+        assert client.get("/api/skills").status_code == 503
+        assert manager.requests == []
+        assert manager.scene_requests == []
+
+
+def test_program_diagnostic_route_is_bounded_attributed_evidence_only():
+    client, core, _manager = _client()
+    records = []
+
+    def record(value):
+        records.append(value)
+        return {
+            "schema_version": "manyforge.program_diagnostic_record.v1",
+            "recorded": True,
+        }
+
+    core.record_program_diagnostic = record
+    payload = {
+        "schema_version": "manyforge.program_diagnostic.v1",
+        "program_run_id": "run.1",
+        "owner_epoch": "runner.1",
+        "program_revision": "sha256:" + "a" * 64,
+        "program_binding_id": "sha256:" + "b" * 64,
+        "retained_bundle_id": "sha256:" + "c" * 64,
+        "graph_revision": "sha256:" + "d" * 64,
+        "state": "failed",
+        "reason_code": "value_mismatch",
+        "message": "Check failed",
+        "occurred_at_ns": "9007199254740993",
+        "occurred_at_wall": "2026-09-08T10:00:00Z",
+        "blackboard": {"ready": False},
+        "runtime_overrides": {},
+        "omitted_blackboard_count": 0,
+        "omitted_override_count": 0,
+        "delivery_loss_count": 2,
+    }
+    with client:
+        valid = client.post("/api/program/diagnostics", json=payload)
+        assert valid.status_code == 200, valid.text
+        assert records == [payload]
+        for invalid in (
+            {**payload, "accepted": True},
+            {**payload, "occurred_at_ns": str(2**63)},
+            {**payload, "occurred_at_ns": "01"},
+            {**payload, "blackboard": {str(i): i for i in range(33)}},
+            {**payload, "blackboard": {"large": "x" * 3000}},
+            {**payload, "blackboard": {"wide": [0] * 513}},
+            {**payload, "blackboard": {"huge": "x" * 65536}},
+        ):
+            response = client.post("/api/program/diagnostics", json=invalid)
+            assert response.status_code in (413, 422), response.text
+        assert records == [payload]
 
 
 def test_history_list_is_summary_only_and_keeps_exact_detail_on_demand() -> None:
@@ -3222,11 +3206,15 @@ def test_execution_diagnostics_is_explicit_and_status_is_only_compatibility() ->
         compatibility = client.get("/api/execution/status")
 
     assert diagnostics.status_code == 200
-    assert diagnostics.json() == compatibility.json() == {
-        "ok": True,
-        "command": "status",
-        "status": {},
-    }
+    assert (
+        diagnostics.json()
+        == compatibility.json()
+        == {
+            "ok": True,
+            "command": "status",
+            "status": {},
+        }
+    )
 
 
 def test_control_diagnostics_are_bounded_and_do_not_start_source_work() -> None:
@@ -3301,9 +3289,7 @@ def test_execution_observation_websocket_proxies_one_persistent_credited_session
             socket.send_json(
                 {
                     "last_applied": applied_cursor,
-                    "schema_version": (
-                        "manyforge.execution_observation_credit.v1"
-                    ),
+                    "schema_version": ("manyforge.execution_observation_credit.v1"),
                 }
             )
             assert socket.receive_json()["observation"]["source_sequence"] == 2
@@ -3346,9 +3332,7 @@ def test_execution_observation_credit_parser_rejects_oversized_messages() -> Non
 
 def test_motion_preview_is_a_thin_non_effectful_execution_route() -> None:
     execution = FakeExecution()
-    app = create_app(
-        service=_service(FakeCore(), FakeManager(), execution)
-    )
+    app = create_app(service=_service(FakeCore(), FakeManager(), execution))
     body = {
         "request_context": {
             "request_id": "request.preview.1",
@@ -3417,17 +3401,13 @@ def test_motion_preview_is_a_thin_non_effectful_execution_route() -> None:
 
     assert response.status_code == 200, response.text
     assert response.json()["command"] == "preview_motion"
-    assert [kind for kind, _request in execution.requests] == [
-        "preview_motion"
-    ]
+    assert [kind for kind, _request in execution.requests] == ["preview_motion"]
     assert execution.principals == [("preview_motion", None)]
 
 
 def test_capability_command_preview_is_a_thin_non_effectful_execution_route() -> None:
     execution = FakeExecution()
-    app = create_app(
-        service=_service(FakeCore(), FakeManager(), execution)
-    )
+    app = create_app(service=_service(FakeCore(), FakeManager(), execution))
     body = {
         "request_context": {
             "request_id": "request.gripper-preview.1",
@@ -3462,9 +3442,7 @@ def test_capability_command_preview_is_a_thin_non_effectful_execution_route() ->
                         "max_effort": None,
                     },
                     "completion_timeout_s": 2.0,
-                    "caller_options": [
-                        {"option_id": "command_duration_s", "value_s": 0.5}
-                    ],
+                    "caller_options": [{"option_id": "command_duration_s", "value_s": 0.5}],
                 },
             }
         ],
@@ -3472,9 +3450,7 @@ def test_capability_command_preview_is_a_thin_non_effectful_execution_route() ->
     }
 
     with TestClient(app) as client:
-        response = client.post(
-            "/api/execution/capability-command-previews", json=body
-        )
+        response = client.post("/api/execution/capability-command-previews", json=body)
         forged = client.post(
             "/api/execution/capability-command-previews",
             json={**copy.deepcopy(body), "attribution": {"transport": "http"}},
@@ -3483,9 +3459,7 @@ def test_capability_command_preview_is_a_thin_non_effectful_execution_route() ->
     assert response.status_code == 200, response.text
     assert response.json()["command"] == "preview_capability_command"
     assert forged.status_code == 422
-    assert [kind for kind, _request in execution.requests] == [
-        "preview_capability_command"
-    ]
+    assert [kind for kind, _request in execution.requests] == ["preview_capability_command"]
     assert execution.principals == [("preview_capability_command", None)]
 
 
@@ -3513,9 +3487,7 @@ def test_execution_missing_reference_is_a_public_not_found() -> None:
                 },
             }
 
-    app = create_app(
-        service=_service(FakeCore(), FakeManager(), MissingExecution())
-    )
+    app = create_app(service=_service(FakeCore(), FakeManager(), MissingExecution()))
     with TestClient(app) as client:
         response = client.get("/api/execution/operations/operation-retired")
 
@@ -3527,7 +3499,9 @@ def test_operation_controls_and_scale_control_are_thin_fenced_routes() -> None:
     execution = FakeExecution()
     app = create_app(
         service=_service(
-            FakeCore(), FakeManager(), execution,
+            FakeCore(),
+            FakeManager(),
+            execution,
             program_runner=FakeProgramRunner(active=False),
         )
     )
@@ -3573,13 +3547,17 @@ def test_operation_controls_and_scale_control_are_thin_fenced_routes() -> None:
             )
             assert response.status_code == 200, response.text
         assert client.post("/api/execution/stops", json=stop).status_code == 200
-        assert client.post(
-            "/api/execution/runtime-scale-control", json=scale_control
-        ).status_code == 200
-        assert client.get(
-            "/api/execution/runtime-scale-control",
-            params=scale_control["selector"],
-        ).status_code == 200
+        assert (
+            client.post("/api/execution/runtime-scale-control", json=scale_control).status_code
+            == 200
+        )
+        assert (
+            client.get(
+                "/api/execution/runtime-scale-control",
+                params=scale_control["selector"],
+            ).status_code
+            == 200
+        )
 
     assert [kind for kind, _request in execution.requests] == [
         "pause",
@@ -3604,7 +3582,9 @@ def test_full_stop_and_stop_fault_recovery_are_thin_owner_routes() -> None:
     execution = FakeExecution()
     app = create_app(
         service=_service(
-            FakeCore(), FakeManager(), execution,
+            FakeCore(),
+            FakeManager(),
+            execution,
             program_runner=FakeProgramRunner(active=False),
         )
     )
@@ -3644,9 +3624,7 @@ def test_full_stop_and_stop_fault_recovery_are_thin_owner_routes() -> None:
             },
         )
         fault = client.get("/api/execution/stop-fault")
-        recovered = client.post(
-            "/api/execution/stop-fault/recover", json=recovery
-        )
+        recovered = client.post("/api/execution/stop-fault/recover", json=recovery)
 
     assert full.status_code == 200
     assert fault.status_code == 200
@@ -3664,7 +3642,9 @@ def test_execution_mutation_principal_can_only_come_from_trusted_adapter() -> No
     execution = FakeExecution()
     app = create_app(
         service=_service(
-            FakeCore(), FakeManager(), execution,
+            FakeCore(),
+            FakeManager(),
+            execution,
             program_runner=FakeProgramRunner(active=False),
         ),
         trusted_principal_adapter=FakeTrustedAdapter(),
@@ -3695,9 +3675,7 @@ def test_execution_mutation_principal_can_only_come_from_trusted_adapter() -> No
                 },
             },
         )
-        accepted = client.post(
-            "/api/execution/operations/operation-1/pause", json=body
-        )
+        accepted = client.post("/api/execution/operations/operation-1/pause", json=body)
 
     assert forged.status_code == 422
     assert forged_context.status_code == 422
@@ -3709,7 +3687,9 @@ def test_operation_control_paths_accept_bounded_stop_and_promote_mixed_scope() -
     execution = FakeExecution()
     app = create_app(
         service=_service(
-            FakeCore(), FakeManager(), execution,
+            FakeCore(),
+            FakeManager(),
+            execution,
             program_runner=FakeProgramRunner(active=False),
         )
     )
@@ -3780,9 +3760,7 @@ def test_operation_control_paths_accept_bounded_stop_and_promote_mixed_scope() -
         )
 
     assert mismatch.status_code == 400
-    assert mismatch.json()["detail"]["code"] == (
-        "execution_operation_path_invalid"
-    )
+    assert mismatch.json()["detail"]["code"] == ("execution_operation_path_invalid")
     assert broad_stop.status_code == 200
     assert mixed_stop.status_code == 200
     assert invalid_scale.status_code == 422

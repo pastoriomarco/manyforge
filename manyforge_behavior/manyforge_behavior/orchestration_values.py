@@ -125,9 +125,7 @@ def _preserves_runtime_semantics(
                     return False
         return True
     if resolved.schema_type == "array" and resolved.items is not None:
-        if not isinstance(current, (list, tuple)) or not isinstance(
-            candidate, (list, tuple)
-        ):
+        if not isinstance(current, (list, tuple)) or not isinstance(candidate, (list, tuple)):
             return not _schema_carries_fixed_runtime_semantics(
                 resolved.items,
                 registry=registry,
@@ -188,9 +186,7 @@ class ProgramRuntimeOverrideStore:
             None,
         )
         if declaration is None:
-            raise ProgramValueError(
-                f"node {node.node_id!r} has no parameter {parameter_id!r}"
-            )
+            raise ProgramValueError(f"node {node.node_id!r} has no parameter {parameter_id!r}")
         binding_parameters = {
             parameter
             for requirement in entry.required_capabilities
@@ -273,6 +269,19 @@ class ProgramRuntimeOverrideStore:
                 }
             )
 
+    def diagnostic_snapshot(self) -> dict[str, Any]:
+        from .program_diagnostics import diagnostic_values
+        from .canonical_artifact import canonical_json_bytes
+
+        with self._lock:
+            return diagnostic_values(
+                (
+                    (canonical_json_bytes([node, parameter]).decode("utf-8"), value)
+                    for (node, parameter), value in self._active.items()
+                ),
+                total_count=len(self._active),
+            )
+
 
 def _copy_runtime_value(value: Any) -> Any:
     """Thaw immutable catalog/Program JSON without leaking shared containers."""
@@ -307,13 +316,9 @@ class ProgramValueRecord:
         if not isinstance(self.metadata, Mapping):
             raise TypeError("Program value metadata must be a mapping")
         if any(not isinstance(key, str) or not key for key in self.metadata):
-            raise ProgramValueError(
-                "Program value metadata keys must be non-empty text"
-            )
+            raise ProgramValueError("Program value metadata keys must be non-empty text")
         if "status" in self.metadata:
-            raise ProgramValueError(
-                "Program value metadata cannot replace the record status"
-            )
+            raise ProgramValueError("Program value metadata cannot replace the record status")
         object.__setattr__(self, "value", _copy_runtime_value(self.value))
         object.__setattr__(
             self,
@@ -357,9 +362,7 @@ def _validate_fields(
     if not fields:
         return
     if not isinstance(value, Mapping) or set(value) != set(fields):
-        raise ProgramValueError(
-            f"{label} must contain exactly declared fields {sorted(fields)}"
-        )
+        raise ProgramValueError(f"{label} must contain exactly declared fields {sorted(fields)}")
     for field_name, declaration in fields.items():
         field_value = value[field_name]
         empty_selection_identity = (
@@ -380,9 +383,7 @@ def _validate_fields(
             and not empty_model_reason
             and not _matches_scalar_type(field_value, declaration.type)
         ):
-            raise ProgramValueError(
-                f"{label}.{field_name} does not match {declaration.type}"
-            )
+            raise ProgramValueError(f"{label}.{field_name} does not match {declaration.type}")
 
 
 def _validate_blackboard_value(
@@ -504,19 +505,24 @@ class ProgramValueStore:
         with self._lock:
             return key in self._values
 
+    def diagnostic_snapshot(self) -> dict[str, Any]:
+        from .program_diagnostics import diagnostic_values
+
+        with self._lock:
+            return diagnostic_values(
+                ((key, record.value) for key, record in self._values.items()),
+                total_count=len(self._values),
+            )
+
     def snapshot(self, keys: tuple[str, ...]) -> Mapping[str, Any]:
         if keys != tuple(sorted(set(keys))):
-            raise ProgramValueError(
-                "blackboard snapshot keys must be unique and canonical"
-            )
+            raise ProgramValueError("blackboard snapshot keys must be unique and canonical")
         declarations: dict[str, BlackboardKeyDeclaration] = {}
         for key in keys:
             try:
                 declaration = self._declarations[key]
             except KeyError as exc:
-                raise ProgramValueError(
-                    f"blackboard key {key!r} is undeclared"
-                ) from exc
+                raise ProgramValueError(f"blackboard key {key!r} is undeclared") from exc
             if declaration.access not in {"read", "read_write"}:
                 raise ProgramValueError(f"blackboard key {key!r} is not readable")
             declarations[key] = declaration
@@ -525,10 +531,7 @@ class ProgramValueStore:
             if missing:
                 raise KeyError(missing[0])
             return MappingProxyType(
-                {
-                    key: _copy_runtime_value(self._values[key].value)
-                    for key in declarations
-                }
+                {key: _copy_runtime_value(self._values[key].value) for key in declarations}
             )
 
 
@@ -553,9 +556,7 @@ class NodeAttemptInputResolver:
         if runtime_overrides is not None and not isinstance(
             runtime_overrides, ProgramRuntimeOverrideStore
         ):
-            raise TypeError(
-                "runtime_overrides must be one ProgramRuntimeOverrideStore"
-            )
+            raise TypeError("runtime_overrides must be one ProgramRuntimeOverrideStore")
         values = {
             parameter_id: _copy_runtime_value(declaration.default)
             for parameter_id, declaration in program.parameters.items()
@@ -624,9 +625,7 @@ class NodeAttemptInputResolver:
         ) -> None:
             if schema.ref == "#/schema_types/value_source":
                 if not isinstance(value, Mapping):
-                    raise ProgramValueError(
-                        f"embedded value source {path!r} is not a mapping"
-                    )
+                    raise ProgramValueError(f"embedded value source {path!r} is not a mapping")
                 embedded_sources[path] = value
                 return
             concrete = self._catalog.schema_registry.resolve(schema)
@@ -670,9 +669,7 @@ class NodeAttemptInputResolver:
                     f"blackboard key parameter {parameter_id!r} is absent"
                 ) from exc
             if not isinstance(key, str) or not key:
-                raise ProgramValueError(
-                    f"blackboard key parameter {parameter_id!r} is invalid"
-                )
+                raise ProgramValueError(f"blackboard key parameter {parameter_id!r} is invalid")
             blackboard_keys.add(key)
         blackboard_snapshot = self._value_store.snapshot(tuple(sorted(blackboard_keys)))
 
@@ -707,9 +704,7 @@ class NodeAttemptInputResolver:
         # only for this new one-shot attempt snapshot.
         if self._runtime_overrides is not None:
             resolved.update(
-                _copy_runtime_value(
-                    self._runtime_overrides.for_attempt(node_instance_id)
-                )
+                _copy_runtime_value(self._runtime_overrides.for_attempt(node_instance_id))
             )
 
         unknown = set(resolved) - set(by_id)
@@ -723,9 +718,7 @@ class NodeAttemptInputResolver:
             if parameter.required and parameter.id not in resolved
         }
         if missing:
-            raise ProgramValueError(
-                f"node {node_id!r} is missing parameters {sorted(missing)}"
-            )
+            raise ProgramValueError(f"node {node_id!r} is missing parameters {sorted(missing)}")
         for parameter_id, value in resolved.items():
             issues = validate_value(
                 by_id[parameter_id].schema,
@@ -737,19 +730,14 @@ class NodeAttemptInputResolver:
                 first = issues[0]
                 raise ProgramValueError(f"{first.path}: {first.message}")
         declared_blackboard = {
-            parameter_id: _copy_runtime_value(
-                blackboard_snapshot[resolved[parameter_id]]
-            )
+            parameter_id: _copy_runtime_value(blackboard_snapshot[resolved[parameter_id]])
             for parameter_id in blackboard_read_parameters
         }
         return NodeAttemptInputSnapshot(
             parameters=MappingProxyType(_copy_runtime_value(resolved)),
             blackboard=MappingProxyType(declared_blackboard),
             embedded_values=MappingProxyType(
-                {
-                    path: resolve_source(source)
-                    for path, source in embedded_sources.items()
-                }
+                {path: resolve_source(source) for path, source in embedded_sources.items()}
             ),
         )
 

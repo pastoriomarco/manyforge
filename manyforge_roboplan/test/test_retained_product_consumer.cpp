@@ -3,11 +3,13 @@
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 #include <algorithm>
+#include <barrier>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <iterator>
 #include <manyforge_collision/manyforge_collision_engine.hpp>
@@ -46,6 +48,7 @@
 #include <variant>
 #include <vector>
 
+#include "content_identity_internal.hpp"
 #include "lite6_retained_consumer_fixture.hpp"
 #include "managed_kernel_apply_fence_owner.hpp"
 #include "mf2_joint_name_internal.hpp"
@@ -2838,9 +2841,10 @@ TEST(RetainedProductCrossConsumer,
   auto snapshot = make_snapshot(1U, 10.0, 0.2);
 
   const auto compare_configuration = [&](std::string query_id,
-                                         const std::vector<std::string> &names,
-                                         const std::vector<double> &values,
-                                         const bool expected_collision) {
+                                         const std::vector<std::string>& names,
+                                         const std::vector<double>& values,
+                                         const bool expected_collision,
+                                         const bool expected_scene_contact = true) {
     ASSERT_EQ(names.size(), values.size());
     Eigen::VectorXd planning_positions =
         Eigen::VectorXd::Zero(planning_scene.getModel().nq);
@@ -2885,7 +2889,7 @@ TEST(RetainedProductCrossConsumer,
         saw_scene_contact = saw_scene_contact || pair.body_a == scene_body_id ||
                             pair.body_b == scene_body_id;
       }
-      EXPECT_TRUE(saw_scene_contact);
+      EXPECT_EQ(saw_scene_contact, expected_scene_contact);
     } else {
       EXPECT_TRUE(result.normalized_pairs.empty());
     }
@@ -2896,6 +2900,25 @@ TEST(RetainedProductCrossConsumer,
   compare_configuration("lite6-home", arm_joint_names, home, false);
   compare_configuration("lite6-historical-rest", arm_joint_names,
                         historical_rest, false);
+
+  // With the sole scene fixture ten metres away, this must be a real
+  // SRDF-enabled component/component collision, not robot/world coverage.
+  const std::vector<double> self_collision{0.0, -2.5, 0.0, 0.0, 2.0, 0.0};
+  compare_configuration("lite6-true-self-collision", arm_joint_names, self_collision, true, false);
+  ASSERT_EQ(collision_engine.prepare_runtime_query(arm_joint_names),
+            core::RuntimeCollisionQueryPrepareStatus::kReady);
+  ASSERT_EQ(collision_engine.prepare_runtime_snapshot(snapshot),
+            core::RuntimeCollisionQueryPrepareStatus::kReady);
+  const auto runtime_self_collision = collision_engine.check_runtime(
+      snapshot, {self_collision, 0, 50'000'000, core::CollisionDistanceRequestMode::kNone, {}});
+  ASSERT_EQ(runtime_self_collision.engine_status, core::CollisionEngineStatus::kOk);
+  EXPECT_EQ(runtime_self_collision.status, core::RuntimeCollisionQueryStatus::kCollision);
+  ASSERT_FALSE(runtime_self_collision.collision_pairs.empty());
+  for (const auto& observation : runtime_self_collision.collision_pairs) {
+    ASSERT_NE(observation.pair, nullptr);
+    EXPECT_EQ(component_body_ids.count(observation.pair->body_a), 1U);
+    EXPECT_EQ(component_body_ids.count(observation.pair->body_b), 1U);
+  }
 
   const std::string gripper_master =
       compiled_symbol(model_map, deployment::OccurrenceSymbolKind::kJoint,
@@ -2908,6 +2931,97 @@ TEST(RetainedProductCrossConsumer,
   snapshot = make_snapshot(2U, 0.0, 4.0);
   compare_configuration("lite6-positive-collision", arm_joint_names, home,
                         true);
+
+  // A gripper-only query must keep the cross-branch mimic finger while
+  // excluding pairs between bodies that cannot move in this subgroup.
+  // The arm-group engine above would mask a missing mimic dependency because
+  // both finger branches also inherit the moving arm's ancestry.
+  expect_exact_retained_and_roboplan_mimic_semantics(model_map, planning_scene);
+  const std::string gripper_follower =
+      compiled_symbol(model_map, deployment::OccurrenceSymbolKind::kJoint, "left_finger_joint");
+  const std::string gripper_group =
+      compiled_symbol(model_map, deployment::OccurrenceSymbolKind::kSrdfGroup, "lite_gripper");
+  const std::set<std::string> finger_frames{
+      compiled_symbol(model_map, deployment::OccurrenceSymbolKind::kLink,
+                      "lite_gripper_left_finger"),
+      compiled_symbol(model_map, deployment::OccurrenceSymbolKind::kLink,
+                      "lite_gripper_right_finger"),
+  };
+  using NamedCollisionPair = std::pair<std::string, std::string>;
+  std::set<NamedCollisionPair> expected_finger_world_pairs;
+  for (const auto& body : collision_projector.component_projection().component_bodies) {
+    if (finger_frames.count(body.frame_id) == 1U) {
+      expected_finger_world_pairs.insert(
+          {std::min(body.body_id, scene_body_id), std::max(body.body_id, scene_body_id)});
+    }
+  }
+  ASSERT_EQ(expected_finger_world_pairs.size(), 2U);
+  std::size_t expected_gripper_pair_count = 0;
+  const auto& reference_geometry = planning_scene.getCollisionModel();
+  for (const auto& pair : reference_geometry.collisionPairs) {
+    const auto& first = reference_geometry.geometryObjects[pair.first];
+    const auto& second = reference_geometry.geometryObjects[pair.second];
+    const auto& frames = planning_scene.getModel().frames;
+    ASSERT_LT(first.parentFrame, frames.size());
+    ASSERT_LT(second.parentFrame, frames.size());
+    if (finger_frames.count(frames[first.parentFrame].name) == 1U ||
+        finger_frames.count(frames[second.parentFrame].name) == 1U) {
+      ++expected_gripper_pair_count;
+    }
+  }
+  ASSERT_GT(expected_gripper_pair_count, 0U);
+  ASSERT_LT(expected_gripper_pair_count, reference_geometry.collisionPairs.size());
+  auto gripper_collision_model = ManyForgeCollisionEngine::load_shared_model(
+      "retained_lite6_gripper_cross_consumer", stage.loader_urdf_path(), stage.srdf_path(),
+      stage.package_paths(), gripper_group);
+  ManyForgeCollisionEngine gripper_collision_engine(
+      gripper_collision_model,
+      ManyForgeCollisionEngine::make_shared_scene_cache(gripper_collision_model));
+  const std::vector<std::string> gripper_joint_names{gripper_master};
+  ASSERT_EQ(gripper_collision_engine.prepare_runtime_query(gripper_joint_names),
+            core::RuntimeCollisionQueryPrepareStatus::kReady);
+  ASSERT_EQ(gripper_collision_engine.prepare_runtime_snapshot(snapshot),
+            core::RuntimeCollisionQueryPrepareStatus::kReady);
+  for (const double opening : {0.0, 0.004}) {
+    SCOPED_TRACE("gripper opening " + std::to_string(opening));
+    auto positions = Eigen::VectorXd::Zero(planning_scene.getModel().nq).eval();
+    const auto master_id = planning_scene.getModel().getJointId(gripper_master);
+    positions[planning_scene.getModel().idx_qs[master_id]] = opening;
+    planning_scene.setJointPositions(positions);
+    EXPECT_NEAR(mimic_expanded_position(planning_scene, gripper_master), opening, 1e-12);
+    EXPECT_NEAR(mimic_expanded_position(planning_scene, gripper_follower), opening, 1e-12);
+    core::CollisionQuery query;
+    query.query_id = "lite6-gripper-subgroup";
+    query.collision_world_revision = snapshot.revision;
+    query.robot_state.joint_names = gripper_joint_names;
+    query.robot_state.positions_rad = {opening};
+    const auto ordinary = gripper_collision_engine.check(
+        snapshot, query, core::CollisionPolicySnapshot{}, core::CollisionCancellationToken{});
+    ASSERT_EQ(ordinary.engine_status, core::CollisionEngineStatus::kOk);
+    EXPECT_TRUE(ordinary.in_collision);
+    std::set<NamedCollisionPair> ordinary_pairs;
+    for (const auto& pair : ordinary.normalized_pairs) {
+      ordinary_pairs.emplace(pair.body_a, pair.body_b);
+    }
+    EXPECT_EQ(ordinary_pairs, expected_finger_world_pairs);
+    const auto runtime =
+        gripper_collision_engine.check_runtime(snapshot, {query.robot_state.positions_rad,
+                                                          0,
+                                                          50'000'000,
+                                                          core::CollisionDistanceRequestMode::kNone,
+                                                          {}});
+    ASSERT_EQ(runtime.engine_status, core::CollisionEngineStatus::kOk);
+    EXPECT_EQ(runtime.status, core::RuntimeCollisionQueryStatus::kCollision);
+    std::set<NamedCollisionPair> runtime_pairs;
+    for (const auto& observation : runtime.collision_pairs) {
+      ASSERT_NE(observation.pair, nullptr);
+      runtime_pairs.emplace(observation.pair->body_a, observation.pair->body_b);
+    }
+    EXPECT_EQ(runtime_pairs, expected_finger_world_pairs);
+    EXPECT_EQ(gripper_collision_engine.internal_last_query_mechanism_counters()
+                  .active_collision_pair_count,
+              expected_gripper_pair_count);
+  }
 
   const core::CommandTargetId gripper_target_id(
       std::string(deployment::test::kLite6GripperTargetId));
@@ -3777,6 +3891,260 @@ TEST(RetainedProductCrossConsumer,
       added_projection->ProjectionStageStatus(stage_query);
   EXPECT_EQ(activated_status.state,
             core::NativeProjectionStatusState::kActivated);
+}
+
+TEST(RetainedProductCrossConsumer, ObservationSelectionMemoKeepsLiveChecksAndExactAlternatingKeys) {
+  using deployment::CanonicalValue;
+  // Opt-in source-cost qualification reuses this real verified repository and
+  // resolver. Ordinary correctness/race tests keep their small fixture.
+  const bool maximum_program = std::getenv("MANYFORGE_QUALIFY_PROGRAM_BYTES") != nullptr;
+  ScopedTemporaryRoot temporary;
+  const auto package_root = temporary.path() / "retained-package";
+  ASSERT_TRUE(std::filesystem::create_directory(package_root));
+  const auto materialized =
+      deployment::test::materialize_lite6_native_cclc_product_retained_consumer_fixture(
+          package_root, kZeroDigest, kZeroDigest, true);
+  ASSERT_NE(materialized.bundle, nullptr);
+  const auto& bundle = *materialized.bundle;
+  const auto model_map = load_lite6_model_map(
+      package_root, {bundle.retained_bundle_id(),
+                     bundle.value().compiled_products.symbol_role_maps.front().product_id});
+  deployment::FilesystemCatalogArtifactStore catalog_store(package_root);
+  deployment::FilesystemProgramRepository programs(package_root);
+  deployment::FilesystemProgramBindingRepository bindings(package_root);
+
+  const auto target_role = deployment::parse_strict_json_model_yaml(R"({
+    "component_role":"robot",
+    "required_capabilities":[
+      {"capability_id":"tool.gripper.confirmation.operator","parameters":{},"disposition":"required"},
+      {"capability_id":"tool.gripper.feedback","parameters":{},"disposition":"required"}
+    ],
+    "required_frame_roles":["tcp"],
+    "required_resource_roles":["fingers"],
+    "required_collision_body_roles":["gripper_collision"],
+    "required_model_roles":["arm_model"]
+  })")
+                               .root();
+  std::vector<std::shared_ptr<const deployment::ProgramBinding>> selected;
+  for (const auto* program_id : {"observation.memo.a", "observation.memo.b"}) {
+    auto root = deployment::normalize_program_authoring(CanonicalValue(CanonicalValue::Object{
+        {"api_version", CanonicalValue("manyforge.program.v2")},
+        {"program_id", CanonicalValue(program_id)},
+        {"program_revision", CanonicalValue(std::string(kZeroDigest))},
+        {"program_profile", CanonicalValue("composable-cell-v1")},
+        {"name", CanonicalValue("Observation memo fixture")},
+        {"catalog",
+         CanonicalValue(CanonicalValue::Object{
+             {"api_version", CanonicalValue("manyforge.node_catalog.v2")},
+             {"content_version",
+              CanonicalValue(bundle.value().catalogs.node_environment.content_version)}})},
+        {"component_roles", CanonicalValue(CanonicalValue::Object{
+                                {"robot", CanonicalValue(CanonicalValue::Object{})}})},
+        {"target_roles",
+         CanonicalValue(CanonicalValue::Object{{"first", target_role}, {"second", target_role}})},
+        {"tree", CanonicalValue(CanonicalValue::Object{
+                     {"node_id", CanonicalValue("timer")},
+                     {"instance_id", CanonicalValue("root")},
+                     {"parameters",
+                      CanonicalValue(CanonicalValue::Object{{"duration_s", CanonicalValue(1.0)}})},
+                     {"children", CanonicalValue(CanonicalValue::Array{})}})},
+    }));
+    if (maximum_program) {
+      // Three-byte NFC text reaches the C++ 16-MiB encoded boundary while
+      // remaining below Python's 8-Mi-character aggregate and 1-M-character
+      // per-value bounds. This is a portable Program, not an oversized DTO.
+      const auto scalar = [](std::size_t bytes) {
+        std::string value;
+        value.reserve(bytes);
+        for (std::size_t index = 0; index < bytes / 3; ++index) value += "€";
+        value.append(bytes % 3, 'x');
+        return value;
+      };
+      CanonicalValue::Array parameters;
+      for (unsigned index = 0; index < 16; ++index) {
+        parameters.emplace_back(CanonicalValue::Object{
+            {"parameter_id", CanonicalValue("value" + std::to_string(10U + index))},
+            {"type", CanonicalValue("string")},
+            {"runtime_mutability", CanonicalValue("immutable")},
+            {"default", CanonicalValue(scalar(deployment::kMaxArtifactScalarBytes))}});
+      }
+      auto members = root.as_object();
+      members.emplace_back("parameters", CanonicalValue(parameters));
+      const auto excess = deployment::canonical_json(CanonicalValue(members)).size() -
+                          deployment::kMaxArtifactEncodedBytes;
+      ASSERT_LT(excess, deployment::kMaxArtifactScalarBytes);
+      auto last = parameters.back().as_object();
+      for (auto& [key, value] : last)
+        if (key == "default")
+          value = CanonicalValue(scalar(deployment::kMaxArtifactScalarBytes - excess));
+      parameters.back() = CanonicalValue(std::move(last));
+      members.back().second = CanonicalValue(std::move(parameters));
+      root = CanonicalValue(std::move(members));
+      ASSERT_EQ(deployment::canonical_json(root).size(), deployment::kMaxArtifactEncodedBytes);
+    }
+    const auto revision = deployment::detail::compute_content_identity(
+        root, {"program-revision", "manyforge.program.v2", "program_revision"});
+    auto members = root.as_object();
+    for (auto& [name, value] : members)
+      if (name == "program_revision") value = CanonicalValue(revision);
+    const auto canonical_program = deployment::canonical_json(CanonicalValue(std::move(members)));
+    const auto program = deployment::verify_program_binding_contract(canonical_program, bundle);
+    if (maximum_program) {
+      if (const auto* output = std::getenv("MANYFORGE_QUALIFY_PROGRAM_OUTPUT")) {
+        std::ofstream stream(output);
+        stream << canonical_program;
+        ASSERT_TRUE(stream.good());
+      }
+    }
+    ASSERT_TRUE(programs.put_if_absent(program, bundle));
+    auto binding = deployment::compile_program_binding(
+        *program,
+        {{{core::ComponentRoleId("robot"), core::ControllableComponentId(std::string(
+                                               deployment::test::kLite6ControllableComponentId))}},
+         {{core::TargetRoleId("first"),
+           core::CommandTargetId(std::string(deployment::test::kLite6GripperTargetId))},
+          {core::TargetRoleId("second"),
+           core::CommandTargetId(std::string(deployment::test::kLite6GripperTargetId))}}},
+        bundle, model_map, catalog_store);
+    ASSERT_TRUE(bindings.put_if_absent(binding, bundle, model_map));
+    selected.push_back(std::move(binding));
+  }
+
+  std::vector<core::RuntimeParticipantBinding> representatives;
+  for (const auto* capability : {"tool.gripper.feedback", "tool.gripper.confirmation.operator"}) {
+    const auto target = deployment::resolve_runtime_program_target(
+        *selected.front(), core::TargetRoleId("first"), core::CapabilityId(capability), bundle,
+        model_map);
+    ASSERT_TRUE(target.control_binding());
+    ASSERT_TRUE(target.control_domain());
+    ASSERT_TRUE(target.desired_route());
+    const auto& control = *target.control_binding();
+    std::set<core::RuntimeUnitId> runtime_units(target.component().runtime_unit_ids.begin(),
+                                                target.component().runtime_unit_ids.end());
+    runtime_units.insert(target.control_domain()->runtime_unit_ids.begin(),
+                         target.control_domain()->runtime_unit_ids.end());
+    runtime_units.insert(control.provider_runtime_unit_id);
+    std::vector<core::RuntimeUnitEpochBindingDTO> epochs;
+    for (const auto& id : runtime_units)
+      epochs.push_back({id, core::RuntimeEpoch("epoch." + id.value())});
+    auto binding =
+        core::verify_runtime_participant_binding(deployment::build_runtime_participant_binding_dto(
+            target, {*target.desired_route(),
+                     core::ActiveControlConfigurationId("active.native"),
+                     core::ActiveControlConfigurationGeneration(1U),
+                     std::move(epochs),
+                     {{control.provider_instance_id, control.provider_runtime_unit_id,
+                       core::RuntimeEpoch("epoch." + control.provider_runtime_unit_id.value())}}}));
+    ASSERT_TRUE(binding.ok()) << binding.error().message;
+    representatives.push_back(std::move(binding.value()));
+  }
+  const auto physical = representatives.front();
+  ProductBackedRuntimeParticipantResolver resolver(package_root, materialized.bundle, model_map,
+                                                   representatives, {});
+  const auto query = [&](const auto& binding_id, const auto& target_id, const auto& capability_id,
+                         const auto& source,
+                         std::span<const core::RuntimeParticipantBinding> current) {
+    return resolver.ResolveObservationTarget(binding_id, target_id, capability_id, source, current);
+  };
+  const auto binding_id = selected.front()->program_binding_id();
+  const core::TargetRoleId target_id("first");
+  const core::CapabilityId capability_id("tool.gripper.feedback");
+  if (maximum_program) {
+    for (const auto* profile : {"cold", "same_key", "alternating_key"}) {
+      std::vector<double> samples;
+      for (unsigned index = 0; index < (std::string_view(profile) == "cold" ? 1U : 20U); ++index) {
+        const bool alternate = std::string_view(profile) == "alternating_key";
+        const auto& representative = representatives[alternate ? index % 2 : 0];
+        const auto begun = std::chrono::steady_clock::now();
+        const auto result =
+            query(binding_id, alternate && index % 2 ? core::TargetRoleId("second") : target_id,
+                  representative.value().capability_id, physical, representatives);
+        samples.push_back(
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begun)
+                .count());
+        ASSERT_TRUE(result.ok()) << result.error().message;
+      }
+      std::sort(samples.begin(), samples.end());
+      std::cout << "{\"program_bytes\":" << deployment::kMaxArtifactEncodedBytes
+                << ",\"profile\":\"" << profile << "\",\"samples\":" << samples.size()
+                << ",\"p95_ms\":"
+                << samples[std::min(samples.size() - 1, samples.size() * 95 / 100)]
+                << ",\"max_ms\":" << samples.back() << "}" << std::endl;
+    }
+    return;
+  }
+  for (int hit = 0; hit < 2; ++hit) {
+    const auto result = query(binding_id, target_id, capability_id, physical, representatives);
+    ASSERT_TRUE(result.ok()) << result.error().message;
+    EXPECT_EQ(result.value().observation_binding.value(), physical.value());
+  }
+
+  // An unknown route supplies no current representative. A warm immutable
+  // selection must not turn it, or a changed owner, into a valid live read.
+  EXPECT_FALSE(query(binding_id, target_id, capability_id, physical, {}).ok());
+  const auto reject_changed = [&](auto change) {
+    auto changed = representatives;
+    auto value = changed.front().value();
+    change(value);
+    auto sealed = core::verify_runtime_participant_binding(std::move(value));
+    ASSERT_TRUE(sealed.ok()) << sealed.error().message;
+    changed.front() = std::move(sealed.value());
+    EXPECT_FALSE(query(binding_id, target_id, capability_id, physical, changed).ok());
+  };
+  reject_changed([](auto& value) {
+    value.control_path->control_route_id = core::ControlRouteId("changed.route");
+  });
+  reject_changed([](auto& value) {
+    value.control_path->provider_instance_id = core::ProviderInstanceId("changed.provider");
+  });
+  reject_changed([](auto& value) {
+    value.control_path->active_control_configuration_generation =
+        core::ActiveControlConfigurationGeneration(2U);
+  });
+  auto newer = representatives;
+  auto newer_value = newer.front().value();
+  auto& path = *newer_value.control_path;
+  path.active_control_configuration_generation = core::ActiveControlConfigurationGeneration(2U);
+  path.provider_runtime_epoch = core::RuntimeEpoch("epoch.replacement");
+  for (auto& epoch : newer_value.runtime_unit_epochs)
+    if (epoch.runtime_unit_id == path.provider_runtime_unit_id)
+      epoch.runtime_epoch = path.provider_runtime_epoch;
+  auto newer_binding = core::verify_runtime_participant_binding(std::move(newer_value));
+  ASSERT_TRUE(newer_binding.ok()) << newer_binding.error().message;
+  newer.front() = std::move(newer_binding.value());
+  EXPECT_FALSE(query(binding_id, target_id, capability_id, physical, newer).ok());
+  const auto fresh = query(binding_id, target_id, capability_id, newer.front(), newer);
+  ASSERT_TRUE(fresh.ok()) << fresh.error().message;
+  EXPECT_EQ(fresh.value().observation_binding.value(), newer.front().value());
+
+  const auto check_key = [&](const auto& binding, const char* role, const auto& representative) {
+    const auto& capability = representative.value().capability_id;
+    const auto result = query(binding->program_binding_id(), core::TargetRoleId(role), capability,
+                              physical, representatives);
+    ASSERT_TRUE(result.ok()) << result.error().message;
+    EXPECT_EQ(result.value().target.program_binding_id(), binding->program_binding_id());
+    EXPECT_EQ(result.value().target.target_role().target_role_id, core::TargetRoleId(role));
+    EXPECT_EQ(result.value().target.capability().capability_id, capability);
+    EXPECT_EQ(result.value().observation_binding.value(), representative.value());
+  };
+  // Exercise each key axis independently before racing replacement; returned
+  // values must remain pinned even when the capacity-one selection changes.
+  for (const auto& binding : selected)
+    for (const auto* role : {"first", "second"})
+      for (const auto& representative : representatives) check_key(binding, role, representative);
+  std::barrier rendezvous(2);
+  const auto concurrent_reads = [&](std::size_t offset) {
+    for (std::size_t iteration = 0; iteration < 8U; ++iteration) {
+      rendezvous.arrive_and_wait();
+      check_key(selected[(iteration + offset) % selected.size()],
+                iteration % 2U == 0U ? "first" : "second",
+                representatives[(iteration / 2U + offset) % representatives.size()]);
+    }
+  };
+  std::jthread first(concurrent_reads, 0U);
+  std::jthread second(concurrent_reads, 1U);
+  first.join();
+  second.join();
 }
 
 TEST(RetainedProductCrossConsumer,

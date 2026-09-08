@@ -103,9 +103,7 @@ class _Transport:
             "resident": self.resident.get(operation_id, True),
         }
 
-    def _control(
-        self, kind: str, operation_id: str, body: Mapping[str, Any]
-    ) -> dict[str, Any]:
+    def _control(self, kind: str, operation_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
         self.controls.append((kind, operation_id, deepcopy(body)))
         return {
             "ok": True,
@@ -136,9 +134,7 @@ class _Transport:
         return self._control("stop", operation_id, body)
 
     def stop_program_run(self, body: Mapping[str, Any]):
-        self.controls.append(
-            ("stop_program_run", body["program_run_id"], deepcopy(body))
-        )
+        self.controls.append(("stop_program_run", body["program_run_id"], deepcopy(body)))
         stop_id = f"scope-stop-{len(self.stop_states) + 1}"
         self.stop_states[stop_id] = "stopping"
         self.stop_generations[stop_id] = len(self.stop_generations) + 1
@@ -248,9 +244,7 @@ class _ControlTransport(_Transport):
     def set_operation_runtime_scale(self, body):
         self.controls.append(("scale", "controlled", deepcopy(body)))
         self.scale["generation"] = body["expected_runtime_scale_generation"] + 1
-        self.operations["controlled"]["runtime_scale_generation"] = self.scale[
-            "generation"
-        ]
+        self.operations["controlled"]["runtime_scale_generation"] = self.scale["generation"]
         return {
             "ok": True,
             "accepted": {"runtime_scale_generation": self.scale["generation"]},
@@ -288,12 +282,8 @@ def _control_port():
 
 
 @pytest.mark.parametrize("accepted", [True, False, "stale_after_capture"])
-@pytest.mark.parametrize(
-    "independent_stop", [None, "before_assessment", "after_effect"]
-)
-def test_recovery_node_submits_only_the_authored_current_offer_once(
-    accepted, independent_stop
-):
+@pytest.mark.parametrize("independent_stop", [None, "before_assessment", "after_effect"])
+def test_recovery_node_submits_only_the_authored_current_offer_once(accepted, independent_stop):
     owner, transport = _control_port()
     transport.operations["controlled"]["state"] = "stopped"
     operation = transport.operations["controlled"]
@@ -308,9 +298,7 @@ def test_recovery_node_submits_only_the_authored_current_offer_once(
     }
 
     def stop_before_recovery_returns():
-        owner.scope.request_stop(
-            "program-run.1", "independent-stop.1", "new operator Stop"
-        )
+        owner.scope.request_stop("program-run.1", "independent-stop.1", "new operator Stop")
         transport.stop_states["scope-stop-1"] = "succeeded"
 
         def unavailable(_stop_id):
@@ -356,13 +344,9 @@ def test_recovery_node_submits_only_the_authored_current_offer_once(
     result = owner.controls.start(
         "recovery.apply_offered_action",
         identity,
-        OwnerNodeInputs(
-            {"target_role": "arm", "recovery_action": "acknowledge_and_continue"}
-        ),
+        OwnerNodeInputs({"target_role": "arm", "recovery_action": "acknowledge_and_continue"}),
     )
-    assert result.state is (
-        OwnerTaskState.SUCCEEDED if accepted is True else OwnerTaskState.FAILED
-    )
+    assert result.state is (OwnerTaskState.SUCCEEDED if accepted is True else OwnerTaskState.FAILED)
     assert not owner.controls._pending
     assert len(calls) == 1
     operation_id, revision, request = calls[0]
@@ -397,9 +381,7 @@ def test_motion_resume_cannot_release_another_stop_occurrence():
         owner.scope.release_stop("program-run.1", expected_stop=("previous-stop", 1))
     assert not transport.released_scope_stops
     with pytest.raises(ProductionPortError, match="scope is stopped"):
-        owner.operations.start(
-            "motion.move_to_pose", _identity("fresh-motion"), _motion_inputs()
-        )
+        owner.operations.start("motion.move_to_pose", _identity("fresh-motion"), _motion_inputs())
 
 
 @pytest.mark.parametrize(
@@ -448,16 +430,15 @@ def test_recovery_node_rejects_ambiguous_stale_or_unoffered_work_before_effect(f
 def test_control_node_submits_once_then_observes_owner_outcome(node, state):
     owner, transport = _control_port()
     identity = NodeAttemptIdentity("program-run.1", "control", "attempt.1")
-    transport.operations["controlled"]["state"] = (
-        "paused" if "resume" in node else "executing"
-    )
+    transport.operations["controlled"]["state"] = "paused" if "resume" in node else "executing"
     task = owner.controls.start(node, identity, OwnerNodeInputs({"target_role": "arm"}))
     assert task.state is OwnerTaskState.ACTIVE
     assert len(transport.controls) == len(transport.queries) == 1
     request = transport.controls[0][2]
     assert request["expected_operation_revision"] == 7
     assert request["execution_scope"] == {
-        "node_instance_id": "control", "node_attempt_id": "attempt.1",
+        "node_instance_id": "control",
+        "node_attempt_id": "attempt.1",
     }
     assert request["request_context"]["request_owner_epoch"] == "kernel.epoch.7"
     transport.operations["controlled"]["state"] = state
@@ -469,9 +450,7 @@ def test_control_node_submits_once_then_observes_owner_outcome(node, state):
 
 
 @pytest.mark.parametrize("full", [False, True])
-@pytest.mark.parametrize(
-    "terminal,succeeded", [("succeeded", True), ("partial", False)]
-)
+@pytest.mark.parametrize("terminal,succeeded", [("succeeded", True), ("partial", False)])
 def test_stop_control_node_waits_for_exact_stop_certificate(full, terminal, succeeded):
     owner, transport = _control_port()
     identity = NodeAttemptIdentity("program-run.1", "control", "attempt.stop")
@@ -496,9 +475,7 @@ def test_stop_control_node_waits_for_exact_stop_certificate(full, terminal, succ
         ]
     transport.stop_states["control-stop"] = terminal
     result = owner.controls.observe(task.task_id)
-    assert result.state is (
-        OwnerTaskState.SUCCEEDED if succeeded else OwnerTaskState.FAILED
-    )
+    assert result.state is (OwnerTaskState.SUCCEEDED if succeeded else OwnerTaskState.FAILED)
     assert owner.controls._pending == {}
 
 
@@ -560,10 +537,7 @@ def test_control_node_cannot_claim_a_later_controls_completion():
         OwnerNodeInputs({"target_role": "arm"}),
     )
     transport.last_control["request_id"] = "another-reset"
-    assert (
-        owner.controls.observe(task.task_id).reason_code
-        == "operation_control_superseded"
-    )
+    assert owner.controls.observe(task.task_id).reason_code == "operation_control_superseded"
 
 
 def test_full_stop_never_needs_ordinary_read_or_fresh_owner(monkeypatch):
@@ -583,10 +557,7 @@ def test_full_stop_never_needs_ordinary_read_or_fresh_owner(monkeypatch):
     )
     assert len(transport.controls) == 1
     assert transport.controls[0][0] == "full_stop"
-    assert (
-        transport.controls[0][2]["request_context"]["request_owner_epoch"]
-        == "kernel.epoch.7"
-    )
+    assert transport.controls[0][2]["request_context"]["request_owner_epoch"] == "kernel.epoch.7"
 
 
 def test_operation_scale_node_waits_for_application_without_changing_scope_setting():
@@ -699,6 +670,10 @@ def _context() -> ProgramRunPortContext:
                             "capability_id": "tool.gripper.feedback",
                             "command_schema": None,
                         },
+                        {
+                            "capability_id": "tool.gripper.confirmation.operator",
+                            "command_schema": None,
+                        },
                     ],
                 },
             ],
@@ -782,7 +757,17 @@ def test_native_queries_use_one_captured_read_without_effects(
                     "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
                 }
                 if frame
-                else {"state": owner_state, "grasp_confirmed": None}
+                else {
+                    "state": owner_state,
+                    "grasp_confirmed": None,
+                    "command_id": 1,
+                    "generation": 2,
+                    "source_id": "binding.gripper",
+                    "source_revision": _DIGEST_A,
+                    "source_epoch": "provider.1",
+                    "active_control_configuration_id": "route.1",
+                    "active_control_configuration_generation": 3,
+                }
             )
             return {
                 "ok": True,
@@ -807,7 +792,18 @@ def test_native_queries_use_one_captured_read_without_effects(
         node_id, _identity("query"), OwnerNodeInputs(parameters=parameters)
     )
     assert result.succeeded is succeeded
-    assert result.metadata == {"source_epoch": "source.1", "source_sequence": 7}
+    assert result.metadata["source_epoch"] == "source.1"
+    assert result.metadata["source_sequence"] == 7
+    if node_id != "model.get_frame_pose":
+        assert result.metadata["command_scope"] == (
+            1,
+            2,
+            "binding.gripper",
+            _DIGEST_A,
+            "provider.1",
+            "route.1",
+            3,
+        )
     if node_id == "model.get_frame_pose":
         assert result.output == {
             "frame_ref": {"kind": "cell_frame"},
@@ -815,10 +811,64 @@ def test_native_queries_use_one_captured_read_without_effects(
             "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
         }
     if expected_state == "grasp_confirmed":
-        assert result.reason_code == "grasp_confirmation_unavailable"
+        assert result.reason_code == "gripper_status_not_matched"
     assert transport.identity_reads == 1  # bind only, not a second read per query
     assert transport.submissions == []
     assert transport.controls == []
+
+
+@pytest.mark.parametrize("node_id", ["gripper.check_status", "gripper.wait_for_status"])
+@pytest.mark.parametrize("arrival_ns", [99, 100, 101])
+def test_grasp_consumption_does_not_extend_proof_by_http_or_wait_timeout(
+    node_id, arrival_ns, monkeypatch
+):
+    clock = [10]
+    monkeypatch.setattr("manyforge_behavior.production_ports.time.monotonic_ns", lambda: clock[0])
+
+    class QueryTransport(_Transport):
+        def query_target(self, query):
+            # The native sample was valid at 10 ns; transport can consume the
+            # remaining validity without consuming the wait's 10-second budget.
+            clock[0] = arrival_ns
+            return {
+                "ok": True,
+                "target_observation": {
+                    **query,
+                    "schema_version": "manyforge.target_observation.v1",
+                    "source_epoch": "source.1",
+                    "source_sequence": 7,
+                    "value": {
+                        "state": "completed",
+                        "grasp_confirmed": True,
+                        "command_id": 1,
+                        "generation": 2,
+                        "source_id": "binding.gripper",
+                        "source_revision": _DIGEST_A,
+                        "source_epoch": "provider.1",
+                        "active_control_configuration_id": "route.1",
+                        "active_control_configuration_generation": 3,
+                        "evidence": {"observed_at_ns": "10", "expires_at_ns": "100"},
+                    },
+                },
+            }
+
+    transport = QueryTransport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    result = port.queries.invoke(
+        node_id,
+        _identity("query"),
+        OwnerNodeInputs(
+            parameters={
+                "target_role": "gripper",
+                "expected_state": "grasp_confirmed",
+                "timeout_s": 10.0,
+            }
+        ),
+    )
+    assert result.succeeded is (arrival_ns < 100)
+    assert result.reason_code == (None if arrival_ns < 100 else "grasp_confirmation_not_current")
+    assert transport.submissions == []
 
 
 def test_relative_pose_submission_uses_capture_and_preserves_portable_roles() -> None:
@@ -826,9 +876,7 @@ def test_relative_pose_submission_uses_capture_and_preserves_portable_roles() ->
     port = NativeKernelProgramPort(KernelClient(transport))
     port.bind(_context())
 
-    started = port.operations.start(
-        "motion.move_to_pose", _identity(), _motion_inputs()
-    )
+    started = port.operations.start("motion.move_to_pose", _identity(), _motion_inputs())
 
     assert started.state is OwnerTaskState.ACTIVE
     request = transport.submissions[0]
@@ -862,9 +910,7 @@ def test_completed_operation_is_acknowledged_with_exact_revision() -> None:
     port.bind(_context())
     identity = _identity()
     started = port.operations.start("motion.move_to_pose", identity, _motion_inputs())
-    transport.operations[started.task_id].update(
-        {"state": "completed", "operation_revision": 7}
-    )
+    transport.operations[started.task_id].update({"state": "completed", "operation_revision": 7})
 
     observed = port.operations.observe(started.task_id)
     assert isinstance(observed, OwnerTaskSnapshot)
@@ -893,9 +939,7 @@ def test_accepted_operation_owner_unavailability_has_exact_task_port_type() -> N
     transport = _UnavailableTransport()
     port = NativeKernelProgramPort(KernelClient(transport))
     port.bind(_context())
-    started = port.operations.start(
-        "motion.move_to_pose", _identity(), _motion_inputs()
-    )
+    started = port.operations.start("motion.move_to_pose", _identity(), _motion_inputs())
 
     with pytest.raises(OwnerTaskObservationUnavailableError):
         port.operations.observe(started.task_id)
@@ -907,18 +951,14 @@ def test_operation_identity_change_remains_a_terminal_observation_error() -> Non
     transport = _Transport()
     port = NativeKernelProgramPort(KernelClient(transport))
     port.bind(_context())
-    started = port.operations.start(
-        "motion.move_to_pose", _identity(), _motion_inputs()
-    )
+    started = port.operations.start("motion.move_to_pose", _identity(), _motion_inputs())
     transport.operations[started.task_id]["operation_id"] = "operation-other"
 
     with pytest.raises(ProductionPortError, match="changed identity"):
         port.operations.observe(started.task_id)
 
 
-def test_native_context_cleanup_consumes_settled_tasks_but_refuses_active_work() -> (
-    None
-):
+def test_native_context_cleanup_consumes_settled_tasks_but_refuses_active_work() -> None:
     transport = _Transport()
     port = NativeKernelProgramPort(KernelClient(transport))
     port.bind(_context())
@@ -927,39 +967,25 @@ def test_native_context_cleanup_consumes_settled_tasks_but_refuses_active_work()
     with pytest.raises(ProductionPortError, match="active native operations"):
         port.unbind("program-run.1")
 
-    transport.operations[active.task_id].update(
-        {"state": "completed", "operation_revision": 5}
-    )
+    transport.operations[active.task_id].update({"state": "completed", "operation_revision": 5})
     port.unbind("program-run.1")
 
     assert transport.controls[-1][0] == "acknowledge"
     with pytest.raises(ProductionPortError, match="not bound"):
-        port.operations.start(
-            "motion.move_to_pose", _identity("after-cleanup"), _motion_inputs()
-        )
+        port.operations.start("motion.move_to_pose", _identity("after-cleanup"), _motion_inputs())
 
 
 def test_program_scope_stop_is_one_exact_batch_without_operation_reads() -> None:
     transport = _Transport()
     port = NativeKernelProgramPort(KernelClient(transport))
     port.bind(_context())
-    started = port.operations.start(
-        "motion.move_to_pose", _identity(), _motion_inputs()
-    )
-    transport.operations[started.task_id].update(
-        {"state": "executing", "operation_revision": 3}
-    )
-    second = port.operations.start(
-        "motion.move_to_pose", _identity("second"), _motion_inputs()
-    )
-    transport.operations[second.task_id].update(
-        {"state": "executing", "operation_revision": 4}
-    )
+    started = port.operations.start("motion.move_to_pose", _identity(), _motion_inputs())
+    transport.operations[started.task_id].update({"state": "executing", "operation_revision": 3})
+    second = port.operations.start("motion.move_to_pose", _identity("second"), _motion_inputs())
+    transport.operations[second.task_id].update({"state": "executing", "operation_revision": 4})
     reads_before_stop = transport.operation_reads
 
-    first = port.scope.request_stop(
-        "program-run.1", "execution:caller.1:request.1", "Program Stop"
-    )
+    first = port.scope.request_stop("program-run.1", "execution:caller.1:request.1", "Program Stop")
 
     assert first.state is ProgramRunScopeState.ACTIVE
     assert first.active_operation_count == 2
@@ -1020,9 +1046,7 @@ def test_program_scope_stop_joins_inflight_admission_and_fences_fresh_work() -> 
         _identity("already-active"),
         _motion_inputs(),
     )
-    transport.operations[first.task_id].update(
-        {"state": "executing", "operation_revision": 3}
-    )
+    transport.operations[first.task_id].update({"state": "executing", "operation_revision": 3})
     transport.block_next_admission = True
     admission_errors: list[Exception] = []
     stopped: list[ProgramRunScopeSnapshot] = []
@@ -1175,25 +1199,18 @@ def test_distinct_program_stops_refresh_the_native_fence_without_local_replay() 
     transport = _Transport()
     port = NativeKernelProgramPort(KernelClient(transport))
     port.bind(_context())
-    started = port.operations.start(
-        "motion.move_to_pose", _identity(), _motion_inputs()
-    )
-    transport.operations[started.task_id].update(
-        {"state": "executing", "operation_revision": 3}
-    )
+    started = port.operations.start("motion.move_to_pose", _identity(), _motion_inputs())
+    transport.operations[started.task_id].update({"state": "executing", "operation_revision": 3})
 
-    first = port.scope.request_stop(
-        "program-run.1", "motion:caller.1:request.1", "Motion Stop"
-    )
-    repeated = port.scope.request_stop(
-        "program-run.1", "full:caller.1:request.2", "Full Stop"
-    )
+    first = port.scope.request_stop("program-run.1", "motion:caller.1:request.1", "Motion Stop")
+    repeated = port.scope.request_stop("program-run.1", "full:caller.1:request.2", "Full Stop")
 
     assert first.state is ProgramRunScopeState.ACTIVE
     assert repeated.state is ProgramRunScopeState.ACTIVE
-    assert [
-        item[0] for item in transport.controls if item[0] == "stop_program_run"
-    ] == ["stop_program_run", "stop_program_run"]
+    assert [item[0] for item in transport.controls if item[0] == "stop_program_run"] == [
+        "stop_program_run",
+        "stop_program_run",
+    ]
     assert port._scope_stops["program-run.1"].active[:2] == ("scope-stop-2", 2)
     assert transport.stop_status_reads == 0
 
@@ -1217,9 +1234,7 @@ def test_new_stop_overtakes_a_held_resume_handoff_without_waiting():
             if (stop_id, generation) != self.current_fence:
                 raise ProductionPortError("native Program Stop fence changed")
             self.current_fence = None
-            return super().release_program_run_stop_fence(
-                program_run_id, stop_id, generation
-            )
+            return super().release_program_run_stop_fence(program_run_id, stop_id, generation)
 
     transport = FenceTransport()
     port = NativeKernelProgramPort(KernelClient(transport))
@@ -1248,9 +1263,7 @@ def test_new_stop_overtakes_a_held_resume_handoff_without_waiting():
     assert not transport.released_scope_stops
     assert port._scope_stops["program-run.1"].active[:2] == transport.current_fence
     with pytest.raises(ProductionPortError, match="scope is stopped"):
-        port.operations.start(
-            "motion.move_to_pose", _identity("late-motion"), _motion_inputs()
-        )
+        port.operations.start("motion.move_to_pose", _identity("late-motion"), _motion_inputs())
 
 
 @pytest.mark.parametrize("release_newer", [False, True])
@@ -1267,13 +1280,8 @@ def test_reordered_stop_responses_cannot_replace_the_newest_native_fence(release
             if release_newer:
                 transport.stop_states["scope-stop-2"] = "succeeded"
                 with pytest.raises(ProductionPortError, match="still in flight"):
-                    port.scope.release_stop(
-                        "program-run.1", expected_stop=("scope-stop-2", 2)
-                    )
-                assert (
-                    port.scope.observe("program-run.1").state
-                    is ProgramRunScopeState.ACTIVE
-                )
+                    port.scope.release_stop("program-run.1", expected_stop=("scope-stop-2", 2))
+                assert port.scope.observe("program-run.1").state is ProgramRunScopeState.ACTIVE
         return result
 
     transport.stop_program_run = delayed_first
@@ -1303,9 +1311,7 @@ def test_late_stop_reply_cannot_replace_a_new_kernel_incarnation():
     transport = _Transport()
     epoch = ["kernel.old"]
     transport.owner_epoch = epoch[0]
-    port = NativeKernelProgramPort(
-        KernelClient(transport), current_owner_epoch=lambda: epoch[0]
-    )
+    port = NativeKernelProgramPort(KernelClient(transport), current_owner_epoch=lambda: epoch[0])
     original = transport.stop_program_run
 
     def replace_owner(body):
@@ -1335,9 +1341,7 @@ def test_stop_with_stale_attribution_cannot_compare_different_owner_generations(
     transport.owner_epoch = "kernel.replacement"
     with pytest.raises(ProductionPortError, match="incarnation changed"):
         port.scope.request_stop("program-run.1", "new", "Stop")
-    assert (
-        len(transport.stop_states) == 2
-    )  # Stale attribution did not block containment.
+    assert len(transport.stop_states) == 2  # Stale attribution did not block containment.
     assert port.scope.observe("program-run.1").state is ProgramRunScopeState.UNKNOWN
     with pytest.raises(ProductionPortError, match="reconciled"):
         port.scope.release_stop("program-run.1")
@@ -1361,9 +1365,7 @@ def test_bound_stop_can_recapture_replacement_without_rebinding_execution():
     )
     port = NativeKernelProgramPort(
         KernelClient(transport),
-        current_owner_epoch=MethodType(
-            ProgramRuntime._current_kernel_owner_epoch, runtime
-        ),
+        current_owner_epoch=MethodType(ProgramRuntime._current_kernel_owner_epoch, runtime),
     )
     port.bind(_context())
     original_context = port._context("program-run.1")
@@ -1453,9 +1455,7 @@ def test_pending_first_stop_with_no_local_tasks_cannot_report_settlement():
         return result
 
     transport.stop_program_run = hold_reply
-    worker = Thread(
-        target=lambda: port.scope.request_stop("program-run.1", "held", "Stop")
-    )
+    worker = Thread(target=lambda: port.scope.request_stop("program-run.1", "held", "Stop"))
     worker.start()
     try:
         assert entered.wait(timeout=2)
@@ -1528,9 +1528,7 @@ def test_operation_only_stop_does_not_acquire_a_program_scope_handoff():
     transport = _Transport()
     port = NativeKernelProgramPort(KernelClient(transport))
     port.bind(_context())
-    port.operations.start(
-        "motion.move_to_pose", _identity("unrelated"), _motion_inputs()
-    )
+    port.operations.start("motion.move_to_pose", _identity("unrelated"), _motion_inputs())
     assert port.scope.observe("program-run.1").state is ProgramRunScopeState.ACTIVE
     assert port.scope.capture_stop("program-run.1") is None
     assert transport.stop_status_reads == 0
@@ -1540,12 +1538,8 @@ def test_program_scope_reset_releases_terminal_residency_once() -> None:
     transport = _Transport()
     port = NativeKernelProgramPort(KernelClient(transport))
     port.bind(_context())
-    started = port.operations.start(
-        "motion.move_to_pose", _identity(), _motion_inputs()
-    )
-    transport.operations[started.task_id].update(
-        {"state": "stopped", "operation_revision": 4}
-    )
+    started = port.operations.start("motion.move_to_pose", _identity(), _motion_inputs())
+    transport.operations[started.task_id].update({"state": "stopped", "operation_revision": 4})
 
     # Program terminalization releases its captured context but preserves the
     # exact operation identity needed by the later explicit Program Reset.
@@ -1580,20 +1574,12 @@ def test_failed_stop_submission_can_be_retried() -> None:
     transport = _OneStopFailureTransport()
     port = NativeKernelProgramPort(KernelClient(transport))
     port.bind(_context())
-    started = port.operations.start(
-        "motion.move_to_pose", _identity(), _motion_inputs()
-    )
-    transport.operations[started.task_id].update(
-        {"state": "executing", "operation_revision": 3}
-    )
+    started = port.operations.start("motion.move_to_pose", _identity(), _motion_inputs())
+    transport.operations[started.task_id].update({"state": "executing", "operation_revision": 3})
 
     with pytest.raises(RuntimeError, match="temporary Stop"):
-        port.scope.request_stop(
-            "program-run.1", "execution:caller.1:request.1", "Program Stop"
-        )
-    port.scope.request_stop(
-        "program-run.1", "execution:caller.1:request.1", "Program Stop"
-    )
+        port.scope.request_stop("program-run.1", "execution:caller.1:request.1", "Program Stop")
+    port.scope.request_stop("program-run.1", "execution:caller.1:request.1", "Program Stop")
 
     assert [item[0] for item in transport.controls] == ["stop_program_run"]
 
@@ -1667,9 +1653,7 @@ class _PickPlaceTransport(_Transport):
                         {
                             "error": {
                                 "code": "invalid_request",
-                                "details": {
-                                    "reason": "motion_start_state_in_collision"
-                                },
+                                "details": {"reason": "motion_start_state_in_collision"},
                                 "message": "start state is in collision",
                             },
                             "stage": "approach",
@@ -1796,9 +1780,7 @@ def test_pick_planning_assembles_portable_intent_without_prepared_authority() ->
     port.bind(_context())
     identity = _identity("plan-pick")
 
-    result = port.pick_place.start(
-        "planning.plan_pick_sequence", identity, _pick_inputs()
-    )
+    result = port.pick_place.start("planning.plan_pick_sequence", identity, _pick_inputs())
 
     assert result.state is OwnerTaskState.SUCCEEDED
     assert result.output == {
@@ -1839,24 +1821,17 @@ def test_pick_planning_assembles_portable_intent_without_prepared_authority() ->
         0.0,
     ]
     assert intent["synthesis"]["maximum_candidate_count"] == 4096
-    assert intent["descend_operation"]["participants"][0]["payload"][
-        "runtime_object_bindings"
-    ] == [
+    assert intent["descend_operation"]["participants"][0]["payload"]["runtime_object_bindings"] == [
         {
             "runtime_object_id": "selected_object",
             "scene_resource_id": "graspable",
         }
     ]
     assert (
-        intent["approach_operation"]["participants"][0]["payload"][
-            "runtime_object_bindings"
-        ]
-        == []
+        intent["approach_operation"]["participants"][0]["payload"]["runtime_object_bindings"] == []
     )
     assert (
-        intent["tool_operation"]["participants"][0]["payload"][
-            "command_schema_revision"
-        ]
+        intent["tool_operation"]["participants"][0]["payload"]["command_schema_revision"]
         == _DIGEST_E
     )
     request_ids = {
@@ -1986,9 +1961,7 @@ def test_native_motion_stop_projects_exact_operator_recovery_policy(
     assert observed.metadata["active_stop_id"] == "stop.1"
     assert observed.metadata["active_stop_generation"] == 2
     assert observed.metadata["authored_failure_policy"] == "pause_for_operator"
-    assert (
-        observed.metadata["authored_failure_policy_parameter"] == "operator_stop_policy"
-    )
+    assert observed.metadata["authored_failure_policy_parameter"] == "operator_stop_policy"
     port.unbind("program-run.1")
 
 
@@ -2124,9 +2097,7 @@ def test_full_stopped_pick_place_recovers_exact_active_operation_for_run() -> No
     observed = port.pick_place.observe(started.task_id)
     assert observed.state is OwnerTaskState.INTERRUPTED
     assert observed.metadata["active_operation_id"] == operation_id
-    assert observed.metadata["authored_failure_policy_parameter"] == (
-        "operator_stop_policy"
-    )
+    assert observed.metadata["authored_failure_policy_parameter"] == ("operator_stop_policy")
     result = port.pick_place.recover(
         started.task_id,
         identity,
@@ -2266,9 +2237,7 @@ def _fixed_scene_object(
         },
         "provider_evidence": None,
         "support_contacts": (
-            []
-            if support_object_id is None
-            else [{"support_object_id": support_object_id}]
+            [] if support_object_id is None else [{"support_object_id": support_object_id}]
         ),
     }
 
@@ -2289,9 +2258,7 @@ class _SceneTransport:
         self.attachments: list[dict[str, Any]] = []
         if populated:
             self.objects = {
-                "old-part": _fixed_scene_object(
-                    "old-part", support_object_id="old-support"
-                ),
+                "old-part": _fixed_scene_object("old-part", support_object_id="old-support"),
                 "old-support": _fixed_scene_object("old-support"),
             }
             self.objects["old-part"]["placement"] = {
@@ -2351,9 +2318,7 @@ class _SceneTransport:
                         "topology_epoch": 1,
                         "policy_epoch": 1,
                         "configured_collision_policy": {},
-                        "objects": [
-                            deepcopy(self.objects[key]) for key in sorted(self.objects)
-                        ],
+                        "objects": [deepcopy(self.objects[key]) for key in sorted(self.objects)],
                         "carried_object_attachments": deepcopy(self.attachments),
                     },
                 },
@@ -2411,13 +2376,10 @@ class _SceneTransport:
             self.attachments = [
                 row
                 for row in self.attachments
-                if row["carried_object_attachment_id"]
-                != operation["carried_object_attachment_id"]
+                if row["carried_object_attachment_id"] != operation["carried_object_attachment_id"]
             ]
             self.objects[operation["expected_scene_resource_id"]]["placement"] = (
-                _fixed_scene_object(operation["expected_scene_resource_id"])[
-                    "placement"
-                ]
+                _fixed_scene_object(operation["expected_scene_resource_id"])["placement"]
             )
         elif kind == "remove_object":
             self.objects.pop(operation["scene_resource_id"])
@@ -2442,9 +2404,7 @@ class _SceneTransport:
             attachment_revision = _DIGEST_F
             self.attachments.append(
                 {
-                    "carried_object_attachment_id": operation[
-                        "carried_object_attachment_id"
-                    ],
+                    "carried_object_attachment_id": operation["carried_object_attachment_id"],
                     "carried_object_attachment_revision": attachment_revision,
                     "scene_resource_id": operation["scene_resource_id"],
                     "controllable_component_id": operation["controllable_component_id"],
@@ -2457,9 +2417,7 @@ class _SceneTransport:
             self.attachments.sort(key=lambda row: row["carried_object_attachment_id"])
             self.objects[operation["scene_resource_id"]]["placement"] = {
                 "kind": "carried",
-                "carried_object_attachment_id": operation[
-                    "carried_object_attachment_id"
-                ],
+                "carried_object_attachment_id": operation["carried_object_attachment_id"],
                 "carried_object_attachment_revision": attachment_revision,
             }
         else:
@@ -2476,9 +2434,7 @@ class _SceneTransport:
             "update_object_pose",
             "set_collision_policy",
         }:
-            assert request["expected_admission_generation"] == (
-                self.admission_generation
-            )
+            assert request["expected_admission_generation"] == (self.admission_generation)
             self.admission_generation += 2
         context = request["request_context"]
         return {
@@ -2544,8 +2500,7 @@ def test_scene_initialization_adds_pick_resources_last() -> None:
         "remove_object",
     ]
     assert [
-        request["operation"].get("scene_resource_id")
-        for request in transport.submissions[1:]
+        request["operation"].get("scene_resource_id") for request in transport.submissions[1:]
     ] == ["table", "graspable", "old-part", "old-support"]
     table = transport.submissions[1]["operation"]
     assert table["frame_ref"] == {
@@ -2590,9 +2545,7 @@ def test_scene_initialization_forwards_authored_support_contact_policy() -> None
     assert transport.objects["graspable"]["support_contacts"] == [support_contact]
 
 
-def test_scene_initialization_retries_concurrent_pose_revision_without_losing_shape() -> (
-    None
-):
+def test_scene_initialization_retries_concurrent_pose_revision_without_losing_shape() -> None:
     class _StaleRevision(RuntimeError):
         code = "stale_revision"
 
@@ -2631,9 +2584,7 @@ def test_scene_initialization_retries_concurrent_pose_revision_without_losing_sh
     )
 
 
-def test_scene_initialization_retries_no_effect_admission_race_with_new_identity() -> (
-    None
-):
+def test_scene_initialization_retries_no_effect_admission_race_with_new_identity() -> None:
     class _AdmissionNotReady(RuntimeError):
         code = "authoring_not_ready"
 
@@ -2660,10 +2611,7 @@ def test_scene_initialization_retries_no_effect_admission_race_with_new_identity
     committed = transport.submissions[0]
     assert rejected["expected_admission_generation"] == 1
     assert committed["expected_admission_generation"] == 2
-    assert (
-        rejected["request_context"]["request_id"]
-        != committed["request_context"]["request_id"]
-    )
+    assert rejected["request_context"]["request_id"] != committed["request_context"]["request_id"]
 
 
 def test_scene_initialization_upserts_only_the_changed_authored_object() -> None:
@@ -2833,9 +2781,7 @@ def test_scene_nodes_translate_roles_and_detach_at_current_pose() -> None:
     detached = port.invoke(
         "scene.detach_carried_object",
         _identity("detach"),
-        OwnerNodeInputs(
-            parameters={"scene_resource_id": "graspable", "target_role": "arm"}
-        ),
+        OwnerNodeInputs(parameters={"scene_resource_id": "graspable", "target_role": "arm"}),
     )
 
     assert attached.succeeded is True

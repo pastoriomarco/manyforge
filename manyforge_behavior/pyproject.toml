@@ -10,6 +10,7 @@ license = { text = "Apache-2.0" }
 authors = [{ name = "Marco Pastorio" }]
 requires-python = ">=3.11"
 dependencies = [
+    "manyforge_example_nodes==0.1.0",
     "py_trees==2.4.0",
     "pyyaml>=6.0",
     "rfc8785==0.1.4",
@@ -24,6 +25,7 @@ where = ["."]
 [tool.setuptools.package-data]
 manyforge_behavior = [
     "../resources/*.yaml",
+    "../resources/skills/*.skill.yaml",
     "_retained_source/manyforge_behavior.pyproject.toml",
 ]
 

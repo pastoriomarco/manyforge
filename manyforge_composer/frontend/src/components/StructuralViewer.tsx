@@ -1088,7 +1088,7 @@ function MeasuredRuntimeModel({
  * admitted owner sample before one demand-render wake, so links cannot tear or
  * race one another and slower shell projections cannot overwrite live motion.
  */
-function MeasuredRobotFrameDriver({
+export function MeasuredRobotFrameDriver({
   manifestModelKey,
   linkGroups,
   presentation,
@@ -1111,9 +1111,10 @@ function MeasuredRobotFrameDriver({
   const continuationTimer = useRef<number | null>(null);
   const appliedAfterRenderTimer = useRef<number | null>(null);
   const lastAppliedCreditAtMs = useRef<number | null>(null);
-  const pendingAppliedPresentation = useRef<
-    NonNullable<RuntimeScenePresentation['measuredRobot']> | null
-  >(null);
+  const pendingAppliedPresentation = useRef<{
+    presentation: NonNullable<RuntimeScenePresentation['measuredRobot']>;
+    reader: MeasuredRobotPresentationReader;
+  } | null>(null);
   const invalidate = useThree((state) => state.invalidate);
   const wake = useCallback(() => {
     if (continuationTimer.current !== null) {
@@ -1193,7 +1194,7 @@ function MeasuredRobotFrameDriver({
     const accepted = acceptPresentation(current);
     if (!accepted) return false;
     acceptedLiveFrame.current = true;
-    pendingAppliedPresentation.current = current;
+    pendingAppliedPresentation.current = { presentation: current, reader: livePresentation! };
     // Publish the presentation to the render callback before waking it.  An
     // invalidate may be serviced immediately by an already-running Canvas;
     // waking first can therefore render a pose without returning its credit.
@@ -1294,6 +1295,9 @@ function MeasuredRobotFrameDriver({
       // an applied-credit loop that runs at the renderer's absolute maximum
       // leaves no browser-thread headroom for heartbeat or control messages.
       const previousCreditAtMs = lastAppliedCreditAtMs.current;
+      // Pin both values from this render. A model/descriptor refresh can
+      // replace the reader before the after-render task returns its credit.
+      const rendered = pendingAppliedPresentation.current;
       const delayMs = previousCreditAtMs === null
         ? 0
         : Math.max(
@@ -1302,12 +1306,12 @@ function MeasuredRobotFrameDriver({
         );
       appliedAfterRenderTimer.current = window.setTimeout(() => {
         appliedAfterRenderTimer.current = null;
-        const rendered = pendingAppliedPresentation.current;
-        pendingAppliedPresentation.current = null;
-        if (rendered !== null) {
-          lastAppliedCreditAtMs.current = performance.now();
-          livePresentation?.markMeasuredRobotPresentationApplied(rendered);
+        if (pendingAppliedPresentation.current === rendered) {
+          pendingAppliedPresentation.current = null;
         }
+        lastAppliedCreditAtMs.current = performance.now();
+        rendered.reader.markMeasuredRobotPresentationApplied(rendered.presentation);
+        if (pendingAppliedPresentation.current !== null) wake();
       }, delayMs);
     }
   }, -1_000);

@@ -459,6 +459,8 @@ run_headless_python_tests() {
         MANYFORGE_CANONICAL_EMPTY_PACKAGE_ROOT="$build/canonical-empty-test-package" \
         MANYFORGE_ASSISTANT_NATIVE_PACKAGE_ROOT="$build/assistant-native-test-fixture/retained-package" \
         MANYFORGE_ASSISTANT_NATIVE_METADATA="$build/assistant-native-test-fixture/metadata.json" \
+        MANYFORGE_GRIPPER_CONFIRMATION_FIXTURE="$build/gripper-confirmation-test-fixture/retained-package" \
+        MANYFORGE_GRIPPER_CONFIRMATION_METADATA="$build/gripper-confirmation-test-fixture/metadata.json" \
         MANYFORGE_MANAGER_APPLY_PACKAGE_ROOT="$build/manager-apply-test-fixture/retained-package" \
         MANYFORGE_MANAGER_APPLY_METADATA="$build/manager-apply-test-fixture/metadata.json" \
         MANYFORGE_NATIVE_EXECUTION_HOST="$BUILD_DIR/roboplan/manyforge_native_execution_host" \

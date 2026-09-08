@@ -36,11 +36,11 @@ class ProgramRunnerPort(Protocol):
     @property
     def control_state_websocket_url(self) -> str | None: ...
 
-    def node_availability(
-        self, body: Mapping[str, Any]
-    ) -> dict[str, Any]: ...
+    def node_availability(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
     def runs(self, *, active_only: bool, limit: int) -> dict[str, Any]: ...
+
+    def diagnostic_health(self) -> dict[str, Any]: ...
 
     def start_run(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
@@ -72,9 +72,7 @@ class ProgramRunnerPort(Protocol):
         body: Mapping[str, Any],
     ) -> dict[str, Any]: ...
 
-    def resume_motion(
-        self, program_run_id: str, body: Mapping[str, Any]
-    ) -> dict[str, Any]: ...
+    def resume_motion(self, program_run_id: str, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
     def discard_full_stop(
         self,
@@ -119,9 +117,7 @@ class ProgramRunnerHttpClient:
             or bool(parsed.query)
             or bool(parsed.fragment)
         ):
-            raise ValueError(
-                "Program-runner URL must be absolute credential-free HTTP(S)"
-            )
+            raise ValueError("Program-runner URL must be absolute credential-free HTTP(S)")
         self._owns_client = client is None
         self._base_url = base_url.rstrip("/")
         self._client = client or httpx.Client(
@@ -155,9 +151,11 @@ class ProgramRunnerHttpClient:
         details = detail.get("details") if isinstance(detail, Mapping) else None
         return ProgramRunnerClientError(
             code if isinstance(code, str) and code else "program_runner_http_error",
-            message
-            if isinstance(message, str) and message
-            else f"Program runner returned HTTP {status_code}",
+            (
+                message
+                if isinstance(message, str) and message
+                else f"Program runner returned HTTP {status_code}"
+            ),
             status_code,
             details=details if isinstance(details, Mapping) else None,
         )
@@ -173,7 +171,8 @@ class ProgramRunnerHttpClient:
         if (
             not (
                 path.startswith("/api/program/")
-                or path in {
+                or path
+                in {
                     "/api/cycle/status",
                     "/api/cycle/recovery-actions",
                 }
@@ -256,13 +255,14 @@ class ProgramRunnerHttpClient:
     def node_availability(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self._request("POST", "/api/program/node-availability", body=body)
 
+    def diagnostic_health(self) -> dict[str, Any]:
+        return self._request("GET", "/api/program/diagnostics/health")
+
     def start_run(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self._request("POST", "/api/program/runs", body=body)
 
     def prepare_applied_scene(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        return self._request(
-            "POST", "/api/program/scene-preparations", body=body
-        )
+        return self._request("POST", "/api/program/scene-preparations", body=body)
 
     def read_run(self, program_run_id: str) -> dict[str, Any]:
         return self._request("GET", self._run_path(program_run_id))
@@ -289,11 +289,11 @@ class ProgramRunnerHttpClient:
             body=body,
         )
 
-    def resume_motion(
-        self, program_run_id: str, body: Mapping[str, Any]
-    ) -> dict[str, Any]:
+    def resume_motion(self, program_run_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
         return self._request(
-            "POST", f"{self._run_path(program_run_id)}/motion-resume", body=body,
+            "POST",
+            f"{self._run_path(program_run_id)}/motion-resume",
+            body=body,
         )
 
     def full_stop(
@@ -336,9 +336,7 @@ class ProgramRunnerHttpClient:
         return self._request("POST", "/api/program/cycle/reset", body=body)
 
     def runtime_controls(self, program_run_id: str) -> dict[str, Any]:
-        return self._request(
-            "GET", f"{self._run_path(program_run_id)}/runtime-controls"
-        )
+        return self._request("GET", f"{self._run_path(program_run_id)}/runtime-controls")
 
     def runtime_control_action(
         self,

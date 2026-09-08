@@ -98,6 +98,14 @@ def test_reduced_aggregate_has_an_explicit_retained_selector() -> None:
     assert "run_composer_frontend_build" in retained_body
     assert "run_composer_frontend_tests" in retained_body
     assert "manyforge_headless_api/process_tests/" in source
+    assert (
+        'MANYFORGE_GRIPPER_CONFIRMATION_FIXTURE="$build/gripper-confirmation-test-fixture/retained-package"'
+        in source
+    )
+    assert (
+        'MANYFORGE_GRIPPER_CONFIRMATION_METADATA="$build/gripper-confirmation-test-fixture/metadata.json"'
+        in source
+    )
     assert "manyforge_program_runner/tests/" in source
     assert "-p no:cacheprovider" in source
     assert "tests/test_public_contract_entrypoint_reconciliation.py" in source
@@ -132,9 +140,7 @@ def test_direct_benchmark_entrypoint_fails_before_product_import(
         check=False,
     )
 
-    assert source.index('if __name__ == "__main__":') < source.index(
-        "from manyforge_behavior"
-    )
+    assert source.index('if __name__ == "__main__":') < source.index("from manyforge_behavior")
     assert completed.returncode == 78
     assert completed.stdout == ""
     assert completed.stderr.strip() == _BENCHMARK_UNAVAILABLE_MESSAGE
@@ -165,12 +171,10 @@ def test_roboplan_suite_qualifies_only_the_retained_product_consumer() -> None:
     configure = source.split("configure_roboplan_build() {", 1)[1].split(
         "build_headless_roboplan_producer_closure() {", 1
     )[0]
-    producer = source.split("build_headless_roboplan_producer_closure() {", 1)[
-        1
-    ].split("require_headless_native_packages() {", 1)[0]
-    body = source.split("run_roboplan_tests() {", 1)[1].split(
-        "run_headless_cpp_tests() {", 1
+    producer = source.split("build_headless_roboplan_producer_closure() {", 1)[1].split(
+        "require_headless_native_packages() {", 1
     )[0]
+    body = source.split("run_roboplan_tests() {", 1)[1].split("run_headless_cpp_tests() {", 1)[0]
 
     assert configure.index("codemodel-v2") < configure.index('cmake "$WORKSPACE')
     assert configure.index("cmakeFiles-v1") < configure.index('cmake "$WORKSPACE')
@@ -188,12 +192,8 @@ def test_roboplan_suite_qualifies_only_the_retained_product_consumer() -> None:
         in body
     )
     assert "tail -" not in body
-    assert body.index("if ! cmake --build") < body.index(
-        'require_ctest_tests "manyforge_roboplan"'
-    )
-    assert body.index('cd "$build"') < body.index(
-        'require_ctest_tests "manyforge_roboplan"'
-    )
+    assert body.index("if ! cmake --build") < body.index('require_ctest_tests "manyforge_roboplan"')
+    assert body.index('cd "$build"') < body.index('require_ctest_tests "manyforge_roboplan"')
     assert body.count("ctest --output-on-failure") == 1
 
 
@@ -203,10 +203,7 @@ def test_headless_required_process_cases_name_the_current_semantic_tests() -> No
         "run_headless_python_tests() {", 1
     )[0]
 
-    assert (
-        "ManagerDaemonProcess.CompatibleNativeReplacementUsesFreshEpochAfterCleanStop"
-        in body
-    )
+    assert "ManagerDaemonProcess.CompatibleNativeReplacementUsesFreshEpochAfterCleanStop" in body
     assert "DistinctNativePackageUsesFreshManagerGenerationAfterCleanStop" not in body
 
 
@@ -223,36 +220,36 @@ def test_headless_selector_builds_producer_closure_before_native_headless(
     (fake_bin / "cmake").write_text(
         "#!/bin/sh\n"
         "set -eu\n"
-        "if [ \"${1:-}\" = \"--build\" ]; then\n"
-        "  root=\"$2\"\n"
-        "  if [ \"$root\" = \"${MANYFORGE_BUILD_DIR}/roboplan\" ]; then\n"
+        'if [ "${1:-}" = "--build" ]; then\n'
+        '  root="$2"\n'
+        '  if [ "$root" = "${MANYFORGE_BUILD_DIR}/roboplan" ]; then\n'
         "    printf '%s\\n' producer-build >> \"$FAKE_LOG\"\n"
-        "    printf 'producer-targets:%s\\n' \"$*\" >> \"$FAKE_LOG\"\n"
+        '    printf \'producer-targets:%s\\n\' "$*" >> "$FAKE_LOG"\n'
         "    for output in \\\n"
         "      manyforge_native_execution_host \\\n"
         "      manyforge_native_execution_host_pick_place_fixture \\\n"
         "      manyforge_roboplan_candidate_worker; do\n"
-        "      : > \"$root/$output\"\n"
+        '      : > "$root/$output"\n'
         "    done\n"
-        "  elif [ \"$root\" = \"${MANYFORGE_BUILD_DIR}/headless\" ]; then\n"
+        '  elif [ "$root" = "${MANYFORGE_BUILD_DIR}/headless" ]; then\n'
         "    printf '%s\\n' headless-build >> \"$FAKE_LOG\"\n"
-        "    mkdir -p \"$root/manager-apply-test-fixture\" \\\n"
-        "      \"$root/manager-apply-o1-4g-replacement-fixture\" \\\n"
-        "      \"$root/assistant-native-test-fixture\"\n"
-        "    : > \"$root/manager-apply-test-fixture/metadata.json\"\n"
-        "    : > \"$root/manager-apply-o1-4g-replacement-fixture/metadata.json\"\n"
-        "    : > \"$root/assistant-native-test-fixture/metadata.json\"\n"
+        '    mkdir -p "$root/manager-apply-test-fixture" \\\n'
+        '      "$root/manager-apply-o1-4g-replacement-fixture" \\\n'
+        '      "$root/assistant-native-test-fixture"\n'
+        '    : > "$root/manager-apply-test-fixture/metadata.json"\n'
+        '    : > "$root/manager-apply-o1-4g-replacement-fixture/metadata.json"\n'
+        '    : > "$root/assistant-native-test-fixture/metadata.json"\n'
         "  fi\n"
         "  exit 0\n"
         "fi\n"
         "printf 'CMAKE_GENERATOR:INTERNAL=%s\\n' \"$3\" > CMakeCache.txt\n"
-        "case \"$1\" in\n"
+        'case "$1" in\n'
         "  */manyforge_roboplan)\n"
         "    printf '%s\\n' producer-configure >> \"$FAKE_LOG\"\n"
-        "    printf 'producer-args:%s\\n' \"$*\" >> \"$FAKE_LOG\";;\n"
+        '    printf \'producer-args:%s\\n\' "$*" >> "$FAKE_LOG";;\n'
         "  */manyforge_headless)\n"
         "    printf '%s\\n' headless-configure >> \"$FAKE_LOG\"\n"
-        "    printf 'headless-args:%s\\n' \"$*\" >> \"$FAKE_LOG\";;\n"
+        '    printf \'headless-args:%s\\n\' "$*" >> "$FAKE_LOG";;\n'
         "esac\n",
         encoding="utf-8",
     )
@@ -260,12 +257,12 @@ def test_headless_selector_builds_producer_closure_before_native_headless(
     (fake_bin / "ctest").write_text(
         "#!/bin/sh\n"
         "set -eu\n"
-        "printf 'ctest:%s\\n' \"$*\" >> \"$FAKE_LOG\"\n"
-        "if [ \"${1:-}\" = \"-N\" ]; then\n"
+        'printf \'ctest:%s\\n\' "$*" >> "$FAKE_LOG"\n'
+        'if [ "${1:-}" = "-N" ]; then\n'
         "  printf '%s\\n' 'Test #1: ManagerDaemonProcess.RejectsPreManifestRootWithTypedStartupErrorBeforeIngress'\n"
-        "  if [ \"${FAKE_CTEST_OMIT_NATIVE:-0}\" != 1 ]; then\n"
+        '  if [ "${FAKE_CTEST_OMIT_NATIVE:-0}" != 1 ]; then\n'
         "    printf '%s\\n' \\\n"
-            "      'Test #2: ManagerDaemonProcess.CompatibleNativeReplacementUsesFreshEpochAfterCleanStop' \\\n"
+        "      'Test #2: ManagerDaemonProcess.CompatibleNativeReplacementUsesFreshEpochAfterCleanStop' \\\n"
         "      'Test #3: ManagerDaemonProcess.RuntimeOnlyNamedApplyUsesTheRealManagedFenceAndSurvivesReplacement' \\\n"
         "      'Test #4: ManagerDaemonProcess.PhysicalCompositionReopensAfterChildAndManagerReplacement'\n"
         "  fi\n"
@@ -313,18 +310,14 @@ def test_headless_selector_builds_producer_closure_before_native_headless(
     assert events.index("producer-configure") < events.index("producer-build")
     assert events.index("producer-build") < events.index("headless-configure")
     assert events.index("headless-configure") < events.index("headless-build")
-    producer_targets = next(
-        event for event in events if event.startswith("producer-targets:")
-    )
+    producer_targets = next(event for event in events if event.startswith("producer-targets:"))
     assert "stop_qualification" not in producer_targets
     assert "manyforge_roboplan_candidate_worker" in producer_targets
     expected_generator = generator or "Ninja"
     producer_args = next(event for event in events if event.startswith("producer-args:"))
     assert f"-G {expected_generator}" in producer_args
     assert producer_targets.endswith("-- -k 0" if expected_generator == "Ninja" else "-- -k")
-    headless_args = next(
-        event for event in events if event.startswith("headless-args:")
-    )
+    headless_args = next(event for event in events if event.startswith("headless-args:"))
     assert (
         "-DMANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST="
         f"{build_root}/roboplan/manyforge_native_execution_host"
@@ -355,25 +348,47 @@ def test_keep_going_uses_real_configured_generator(tmp_path: Path, generator: st
     build = tmp_path / "build"
     subprocess.run(
         ["cmake", "-S", str(project), "-B", str(build), "-G", generator],
-        check=True, capture_output=True, text=True,
+        check=True,
+        capture_output=True,
+        text=True,
     )
     # Exercise the actual helper against an actual cache/build tool. No
     # product build is needed to detect the original Make '-k 0' failure.
     source = _TEST_ALL.read_text(encoding="utf-8")
-    helper = "set_build_keep_going_args() {" + source.split(
-        "set_build_keep_going_args() {", 1
-    )[1].split("\n}\n", 1)[0] + "\n}\n"
+    helper = (
+        "set_build_keep_going_args() {"
+        + source.split("set_build_keep_going_args() {", 1)[1].split("\n}\n", 1)[0]
+        + "\n}\n"
+    )
     completed = subprocess.run(
-        ["bash", "-eu", "-c", helper + '\nset_build_keep_going_args "$1"\n'
-         'cmake --build "$1" -- "${BUILD_KEEP_GOING_ARGS[@]}"', "test", str(build)],
-        check=False, capture_output=True, text=True,
+        [
+            "bash",
+            "-eu",
+            "-c",
+            helper + '\nset_build_keep_going_args "$1"\n'
+            'cmake --build "$1" -- "${BUILD_KEEP_GOING_ARGS[@]}"',
+            "test",
+            str(build),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
         env={**os.environ, "CMAKE_GENERATOR": "unrelated-shell-value"},
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
     incompatible = subprocess.run(
-        ["cmake", "-S", str(project), "-B", str(build), "-G",
-         "Unix Makefiles" if generator == "Ninja" else "Ninja"],
-        check=False, capture_output=True, text=True,
+        [
+            "cmake",
+            "-S",
+            str(project),
+            "-B",
+            str(build),
+            "-G",
+            "Unix Makefiles" if generator == "Ninja" else "Ninja",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
     )
     assert incompatible.returncode != 0
     assert "Does not match the generator used previously" in incompatible.stderr
@@ -382,8 +397,14 @@ def test_keep_going_uses_real_configured_generator(tmp_path: Path, generator: st
 def test_unsupported_generator_rejects_before_build(tmp_path: Path) -> None:
     completed = subprocess.run(
         ["bash", str(_TEST_ALL), "headless"],
-        env={**os.environ, "CMAKE_GENERATOR": "unsupported", "MANYFORGE_BUILD_DIR": str(tmp_path / "build")},
-        check=False, capture_output=True, text=True,
+        env={
+            **os.environ,
+            "CMAKE_GENERATOR": "unsupported",
+            "MANYFORGE_BUILD_DIR": str(tmp_path / "build"),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
     )
     assert completed.returncode == 2
     assert "Unsupported test build generator" in completed.stderr
@@ -391,17 +412,13 @@ def test_unsupported_generator_rejects_before_build(tmp_path: Path) -> None:
 
 
 def test_compose_retains_explicit_ros_runtime_products_and_build_cache() -> None:
-    compose = yaml.safe_load(
-        (_REPO_ROOT / "docker-compose.yaml").read_text(encoding="utf-8")
-    )
+    compose = yaml.safe_load((_REPO_ROOT / "docker-compose.yaml").read_text(encoding="utf-8"))
     services = compose["services"]
 
     for name in ("dev", "ros-jazzy", "ros-jazzy-full", "composer", "composer-api"):
         assert services[name]["volumes"] == [".:/workspace"]
     assert services["composer-ros"]["restart"] == "no"
-    assert services["composer-ros"]["command"][-1] == (
-        "./scripts/ros/start-composer-ros.sh"
-    )
+    assert services["composer-ros"]["command"][-1] == ("./scripts/ros/start-composer-ros.sh")
     assert services["isaac-topic-control"]["restart"] == "no"
     assert services["isaac-topic-control"]["command"][-1] == (
         "./scripts/ros/launch-isaac-topic-based-control.sh"
@@ -419,9 +436,7 @@ def test_compose_retains_explicit_ros_runtime_products_and_build_cache() -> None
 
 def test_current_build_lanes_use_fresh_container_local_products() -> None:
     source = _TEST_ALL.read_text(encoding="utf-8")
-    local_ci = (_REPO_ROOT / ".github/workflows/local-ci.yml").read_text(
-        encoding="utf-8"
-    )
+    local_ci = (_REPO_ROOT / ".github/workflows/local-ci.yml").read_text(encoding="utf-8")
 
     assert "MANYFORGE_TEST_STAMP" not in source
     assert ".manyforge-tested-" not in source
@@ -514,9 +529,7 @@ def test_assistant_supervisor_wrapper_is_only_a_typed_gate() -> None:
 
 
 def test_hermes_gateway_matrix_cannot_activate_the_deleted_bridge() -> None:
-    matrix_path = (
-        _REPO_ROOT / "scripts" / "hermes" / "managed-tool-gateway-matrix.json"
-    )
+    matrix_path = _REPO_ROOT / "scripts" / "hermes" / "managed-tool-gateway-matrix.json"
     payload = json.loads(matrix_path.read_text(encoding="utf-8"))
     source = matrix_path.read_text(encoding="utf-8")
 
@@ -621,9 +634,7 @@ def test_ros_runtime_wrappers_share_one_explicit_unavailable_boundary(
 
 
 def test_i9_ros2_control_builder_selects_only_current_runtime_products() -> None:
-    source = (
-        _REPO_ROOT / "scripts/ros/build-ros2-control-runtime.sh"
-    ).read_text(encoding="utf-8")
+    source = (_REPO_ROOT / "scripts/ros/build-ros2-control-runtime.sh").read_text(encoding="utf-8")
 
     assert "manyforge_fail_composable_cell_runtime_unavailable" not in source
     assert "MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME=ON" in source
@@ -642,23 +653,17 @@ def test_i9_ros2_control_builder_selects_only_current_runtime_products() -> None
 
 
 def test_i9_isaac_launcher_enforces_the_recorded_topology_and_owner_split() -> None:
-    source = (
-        _REPO_ROOT / "scripts/ros/launch-isaac-topic-based-control.sh"
-    ).read_text(encoding="utf-8")
-    topology_source = (
-        _REPO_ROOT / "config/ros/isaac_i9.env.sh"
-    ).read_text(encoding="utf-8")
+    source = (_REPO_ROOT / "scripts/ros/launch-isaac-topic-based-control.sh").read_text(
+        encoding="utf-8"
+    )
+    topology_source = (_REPO_ROOT / "config/ros/isaac_i9.env.sh").read_text(encoding="utf-8")
 
     assert "manyforge_fail_composable_cell_runtime_unavailable" not in source
     assert 'source "${WORKSPACE}/config/ros/isaac_i9.env.sh"' in source
-    assert 'ROS_DOMAIN_ID:-0' in topology_source
-    assert 'RMW_IMPLEMENTATION:-rmw_fastrtps_cpp' in topology_source
-    assert (
-        'ROS_AUTOMATIC_DISCOVERY_RANGE:-LOCALHOST' in topology_source
-    )
-    assert (
-        'ROS_STATIC_PEERS:-192.168.1.132;192.168.1.68' in topology_source
-    )
+    assert "ROS_DOMAIN_ID:-0" in topology_source
+    assert "RMW_IMPLEMENTATION:-rmw_fastrtps_cpp" in topology_source
+    assert "ROS_AUTOMATIC_DISCOVERY_RANGE:-LOCALHOST" in topology_source
+    assert "ROS_STATIC_PEERS:-192.168.1.132;192.168.1.68" in topology_source
     for stale_override in (
         "FASTRTPS_DEFAULT_PROFILES_FILE",
         "FASTDDS_DEFAULT_PROFILES_FILE",
@@ -670,9 +675,9 @@ def test_i9_isaac_launcher_enforces_the_recorded_topology_and_owner_split() -> N
     assert "build-ros2-control-runtime.sh" in source
     assert "isaac_topic_based_control.launch.py" in source
     assert "simulation_interfaces" in source
-    assert 'runtime_namespace:=${runtime_namespace}' in source
-    assert 'command_gate_owner_namespace:=${runtime_namespace}' in source
-    assert 'manager_run_root:=${MANYFORGE_MANAGER_RUN_ROOT}' in source
+    assert "runtime_namespace:=${runtime_namespace}" in source
+    assert "command_gate_owner_namespace:=${runtime_namespace}" in source
+    assert "manager_run_root:=${MANYFORGE_MANAGER_RUN_ROOT}" in source
     assert "MANYFORGE_MANAGER_STATE_ROOT" not in source
     assert "MANYFORGE_ISAAC_COMPONENT_ID" in source
     for forbidden in (
@@ -724,8 +729,7 @@ def test_i9_topology_input_clears_stale_dds_overrides_and_is_role_free() -> None
     )
 
     assert completed.stdout == (
-        "0|rmw_fastrtps_cpp|LOCALHOST|"
-        "192.168.1.132;192.168.1.68|unset|unset"
+        "0|rmw_fastrtps_cpp|LOCALHOST|" "192.168.1.132;192.168.1.68|unset|unset"
     )
     source = topology.read_text(encoding="utf-8")
     for host_role in ("THOR", "ISAAC_SIM_IP", "ORIN_IP", "MANAGER_IP"):
@@ -760,17 +764,12 @@ def test_unavailable_test_suites_fail_instead_of_skipping_or_mocking(
 
 def test_bindings_selector_routes_to_the_real_i2_builder() -> None:
     source = _TEST_ALL.read_text(encoding="utf-8")
-    body = source.split("run_pybind_tests() {", 1)[1].split(
-        "run_python_tests() {", 1
-    )[0]
+    body = source.split("run_pybind_tests() {", 1)[1].split("run_python_tests() {", 1)[0]
 
     assert "ROS-free pybind11 compiler bindings" in body
-    assert 'MANYFORGE_BINDINGS_PREPARE_ONLY:-0' in body
-    assert 'MANYFORGE_BINDINGS_STAGE_ROOT:-${BUILD_DIR}-bindings-stage' in body
-    assert (
-        'MANYFORGE_BINDINGS_GENERATED_ROOT:-${BUILD_DIR}-bindings-generated'
-        in body
-    )
+    assert "MANYFORGE_BINDINGS_PREPARE_ONLY:-0" in body
+    assert "MANYFORGE_BINDINGS_STAGE_ROOT:-${BUILD_DIR}-bindings-stage" in body
+    assert "MANYFORGE_BINDINGS_GENERATED_ROOT:-${BUILD_DIR}-bindings-generated" in body
     assert '"$WORKSPACE/scripts/ci/run-core-bindings.sh"' in body
     assert '--build-root "$BUILD_DIR"' in body
     assert "arguments+=(--prepare-only)" in body
@@ -779,9 +778,7 @@ def test_bindings_selector_routes_to_the_real_i2_builder() -> None:
 
 def test_retained_bridge_suite_qualifies_protocol_without_live_bridge() -> None:
     source = _TEST_ALL.read_text(encoding="utf-8")
-    body = source.split("run_bridge_tests() {", 1)[1].split(
-        "run_composer_backend_tests() {", 1
-    )[0]
+    body = source.split("run_bridge_tests() {", 1)[1].split("run_composer_backend_tests() {", 1)[0]
 
     assert "manyforge_assistant_bridge/tests/" in body
     assert "pytest" in body
@@ -789,8 +786,6 @@ def test_retained_bridge_suite_qualifies_protocol_without_live_bridge() -> None:
 
 
 def test_deployment_package_participates_in_repository_version_guard() -> None:
-    source = (_REPO_ROOT / "scripts/ci/verify-version-sync.sh").read_text(
-        encoding="utf-8"
-    )
+    source = (_REPO_ROOT / "scripts/ci/verify-version-sync.sh").read_text(encoding="utf-8")
     assert 'check "manyforge_deployment CMakeLists.txt"' in source
     assert "manyforge_program_runner" in source

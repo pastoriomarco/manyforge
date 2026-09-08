@@ -7,10 +7,10 @@
         "tool": "ur10e_robot"
       },
       "deployment_artifact_id": "ur10e_robotiq_assistant_modes_scene_authoring",
-      "deployment_revision": "sha256:f5c71ebdd79e5367399027a7db97bffb5831d849ad573b3d6cacdbe4398578ae",
+      "deployment_revision": "sha256:055921e303dd1f5b959419d3f9c4a4ba1d91cc227db61a516c7ce4d043546da6",
       "deployment_source": "examples/assistant_modes_scene_authoring.deployment.yaml",
       "program_id": "pick_and_place_ur10e_robotiq_demo",
-      "program_revision": "sha256:ce15ba524de796df2626cc423c56cc179ab8778e00edd9872db144ff196a0c12",
+      "program_revision": "sha256:ac9a33f655273e508c845b28904100372ae08c3c3442453f6fb9c5b47d62492d",
       "program_source": "examples/pick_and_place_ur10e_robotiq.program.yaml",
       "scenario_aliases": [
         "assistant-authoring",
@@ -37,7 +37,7 @@
       "deployment_revision": "sha256:a148ac32b1b01eb27b5cef5b2b2bf6555df1a773ed09cc79c40d20c8eb2f4d26",
       "deployment_source": "examples/isaac_lite6_lite_gripper_pick_and_place.deployment.yaml",
       "program_id": "isaac_lite6_lite_gripper_pick_and_place",
-      "program_revision": "sha256:d278ce9318661a172595639ec8ca50650592e0030a1a1955d699b1084feeace0",
+      "program_revision": "sha256:198bf3173e7f94798399f2daa96cbeb898ee3ad4749b3498ff6a619998c01cf0",
       "program_source": "examples/isaac_lite6_lite_gripper_pick_and_place.program.yaml",
       "scenario_aliases": [],
       "scenario_id": "isaac-lite6-pick-place",
@@ -61,7 +61,7 @@
       "deployment_revision": "sha256:0f4710422818e48852644a2fb2437308fdb0dabb9a9965b933a7898c1c41b342",
       "deployment_source": "examples/isaac_manipulator_scene_light_assistant.deployment.yaml",
       "program_id": "isaac_manipulator_scene_light",
-      "program_revision": "sha256:61be8bc427fddde244d409e8dc6e58499bcc981a2e8ae6071a9a252492fd75a9",
+      "program_revision": "sha256:7b2bbb811fb251c9196e3ce9ecd7336564392457bc01ddcbae5abe1799d5bcc2",
       "program_source": "examples/isaac_manipulator_scene_light.program.yaml",
       "scenario_aliases": [
         "isaac-assistant"
@@ -87,7 +87,7 @@
       "deployment_revision": "sha256:9f108d4aa3af5f2502eb29ed1a982f6bc57590c6e9fec6b3e8c6666a70f93579",
       "deployment_source": "examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml",
       "program_id": "isaac_manipulator_scene_light",
-      "program_revision": "sha256:61be8bc427fddde244d409e8dc6e58499bcc981a2e8ae6071a9a252492fd75a9",
+      "program_revision": "sha256:7b2bbb811fb251c9196e3ce9ecd7336564392457bc01ddcbae5abe1799d5bcc2",
       "program_source": "examples/isaac_manipulator_scene_light.program.yaml",
       "scenario_aliases": [
         "isaac-light"
@@ -113,7 +113,7 @@
       "deployment_revision": "sha256:eb58c4bb37e9582b5f1413ce75c2606a9af5bf839b568ad967d367230cbc0407",
       "deployment_source": "examples/isaac_manipulator_scene_light_ros2_control_collision.deployment.yaml",
       "program_id": "isaac_manipulator_scene_light_collision",
-      "program_revision": "sha256:d5a2e83e43161d13cc148cb4f14ad9d9c23325913f9c0f3a808124de780dc790",
+      "program_revision": "sha256:65d73c5ac5e6b5ef03cff712ee048869bf007f5fec36e1a73b41342041598533",
       "program_source": "examples/isaac_manipulator_scene_light_collision.program.yaml",
       "scenario_aliases": [],
       "scenario_id": "isaac-ur10e-light-scene-collision",
@@ -134,10 +134,10 @@
         "tool": "lite6_robot"
       },
       "deployment_artifact_id": "lite6_lite_gripper_pick_and_place",
-      "deployment_revision": "sha256:d0f98bf3d8048079ed2993d69b43ae6c020b4ec92049e4d1c1c44af86485771d",
+      "deployment_revision": "sha256:6c170925a0edf70536350da311c053b418dbe91e98612668bed7f6c9323a51b9",
       "deployment_source": "examples/lite6_lite_gripper_pick_and_place.deployment.yaml",
       "program_id": "lite6_lite_gripper_pick_and_place",
-      "program_revision": "sha256:c4e6a91da2f0c0cc5bdccb7e1e6c84d758bb1ef30073423aaf3d3b5d4ec5f638",
+      "program_revision": "sha256:56b9c501bd60eb7198ec742db18c3c83d7083ecbddb57c87bcd668a78fd94792",
       "program_source": "examples/lite6_lite_gripper_pick_and_place.program.yaml",
       "scenario_aliases": [
         "lite6-pick-place"
@@ -159,10 +159,10 @@
         "robot": "ur5_robot"
       },
       "deployment_artifact_id": "ur5_roboplan_local_pick_place",
-      "deployment_revision": "sha256:f72250d5d5b2bd187d8319e0c3a8ae3160939a4eddfe5b154f84c4c25e1a7b3f",
+      "deployment_revision": "sha256:832eb2b1a32c8ffcd1018eeec8630580d699bed7ac137829266767e29aeb7db5",
       "deployment_source": "examples/pick_and_place.deployment.yaml",
       "program_id": "pick_and_place_demo",
-      "program_revision": "sha256:dd703c32fa2cb59f9e30eb75552b924f1940ed224b99aa931a7b6f1411a02698",
+      "program_revision": "sha256:c0ebb7ea14e7cd43e6c6007702139b9b90578084b013b249a02bdbecf086741d",
       "program_source": "examples/pick_and_place.program.yaml",
       "scenario_aliases": [
         "pick-place",
@@ -181,10 +181,10 @@
         "robot": "ur5_robot"
       },
       "deployment_artifact_id": "ur5_roboplan_local_pick_place",
-      "deployment_revision": "sha256:f72250d5d5b2bd187d8319e0c3a8ae3160939a4eddfe5b154f84c4c25e1a7b3f",
+      "deployment_revision": "sha256:832eb2b1a32c8ffcd1018eeec8630580d699bed7ac137829266767e29aeb7db5",
       "deployment_source": "examples/pick_and_place.deployment.yaml",
       "program_id": "pick_and_place_minimal",
-      "program_revision": "sha256:11b3ce3372733fe1042b4bba315b1815032d45e0d1dda98b55465c7ab286a02d",
+      "program_revision": "sha256:4a1a1afb46cf5b17c1d47805331882bf5b6c4d2eeb088ca3b174d8681c4d4e8f",
       "program_source": "examples/pick_and_place_minimal.program.yaml",
       "scenario_aliases": [
         "ur5-simple-pick-place"
@@ -203,10 +203,10 @@
         "tool": "ur10e_robot"
       },
       "deployment_artifact_id": "ur10e_robotiq_pick_place_preview",
-      "deployment_revision": "sha256:b83128387066431792c858d17f7a282a2361a0a73c642b73f617124e8fce7d6d",
+      "deployment_revision": "sha256:5816bc56f83a35eef92f6389cff662378e7eacbcc6b43714e51e9cec0c2d3916",
       "deployment_source": "examples/pick_and_place_ur10e_robotiq.deployment.yaml",
       "program_id": "pick_and_place_ur10e_robotiq_demo",
-      "program_revision": "sha256:ce15ba524de796df2626cc423c56cc179ab8778e00edd9872db144ff196a0c12",
+      "program_revision": "sha256:ac9a33f655273e508c845b28904100372ae08c3c3442453f6fb9c5b47d62492d",
       "program_source": "examples/pick_and_place_ur10e_robotiq.program.yaml",
       "scenario_aliases": [
         "ur10e",
@@ -230,10 +230,10 @@
         "tool": "ur5_robot"
       },
       "deployment_artifact_id": "ur5_roboplan_local_semantic_shape_pick",
-      "deployment_revision": "sha256:35807b37e4319acd83848cfa29885a9114dbc17e379285a4aa239eb95bb4762e",
+      "deployment_revision": "sha256:04f3e82f9947e433f15521747ffc6ae4f18b5fc87b46dc2902e9865484457261",
       "deployment_source": "examples/semantic_shape_pick.deployment.yaml",
       "program_id": "semantic_shape_pick",
-      "program_revision": "sha256:99216544efe8f05a2701cf44139c21cf7944f6fc5ebd5ad7ba61e4dcc4cbf553",
+      "program_revision": "sha256:9c345e6817c7e57c8b1663ab9fa6a6949916ef92c52537e73886aa535461b6a1",
       "program_source": "examples/semantic_shape_pick.program.yaml",
       "scenario_aliases": [
         "shape-pick",
@@ -260,7 +260,7 @@
       "deployment_revision": "sha256:3fcfb2571a8e47deebc938837fcad3517eee5720873403dfaf1f2965f48b7886",
       "deployment_source": "examples/trocar_lite6_foundationpose_pick.deployment.yaml",
       "program_id": "trocar_lite6_foundationpose_pick",
-      "program_revision": "sha256:464ecd3377ce22fe8d676d89481f7a98b3a1e936a271a2688d5847ed7d31b99a",
+      "program_revision": "sha256:e65504ce57a226ddf7be7a30d9b44ecd41a551205a79f78742e3fdbedf96e81a",
       "program_source": "examples/trocar_lite6_foundationpose_pick.program.yaml",
       "scenario_aliases": [],
       "scenario_id": "isaac-lite6-trocar-foundationpose",
@@ -281,10 +281,10 @@
         "tool": "ur5_robot"
       },
       "deployment_artifact_id": "ur5_roboplan_local_vision_guided_pick",
-      "deployment_revision": "sha256:f88a29e4acc9a5d1144a1780b6ed2552f31898e5e4aca9be059598151dbbead1",
+      "deployment_revision": "sha256:88e09b3960a6ab0a250fadbf8dc64e87ba6548c37279a82cc975a95b760359b7",
       "deployment_source": "examples/vision_guided_bin_pick.deployment.yaml",
       "program_id": "vision_guided_bin_pick",
-      "program_revision": "sha256:3cb1b9a72f03c32b57bf3cca23833995d97e1747da24a3926988d89d24cae900",
+      "program_revision": "sha256:c0b91e423c187379cf07dd05ecd5a79b3149d31fda5e2abda9763ef9cd183fa9",
       "program_source": "examples/vision_guided_bin_pick.program.yaml",
       "scenario_aliases": [],
       "scenario_id": "ur5_vision_guided_bin_pick",
@@ -304,10 +304,10 @@
         "robot": "ur5_robot"
       },
       "deployment_artifact_id": "ur5_roboplan_local_vision_guided_pose_pick",
-      "deployment_revision": "sha256:5872d3bac94211ac09aba8ca7a320313a3213444bb0828503b88fa58bd2424ea",
+      "deployment_revision": "sha256:6d48061d9691499ec9160e110520c50462a90874ea06abac59624cf8ac525992",
       "deployment_source": "examples/vision_guided_pose_pick.deployment.yaml",
       "program_id": "vision_guided_pose_pick",
-      "program_revision": "sha256:b3a8e45113ff4cf9c64b549008c4c64cd9d0a800e26a662272db571d79c047c3",
+      "program_revision": "sha256:6816131a7e2d12e99869eed4b38e57075f12db6b8bc80ba642cb6c2a7e4e578c",
       "program_source": "examples/vision_guided_pose_pick.program.yaml",
       "scenario_aliases": [
         "ur5-vision-pose-pick",

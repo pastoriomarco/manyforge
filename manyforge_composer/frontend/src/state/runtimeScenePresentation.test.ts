@@ -125,7 +125,7 @@ function sourceModel(): SourceModelProjection {
       model_instance_id: 'model-instance-1',
       model_revision: 'model-revision-1',
       coordinates: [
-        { source_joint_name: 'source-joint', viewer_joint_name: 'joint-1', coordinate_kind: 'angular', unit: 'rad' },
+        { source_joint_name: 'source-joint', viewer_joint_name: 'joint-1', coordinate_kind: 'angular', unit: 'radians' },
         { source_joint_name: 'joint-1' },
       ],
     }],
@@ -382,11 +382,20 @@ describe('runtime scene presentation', () => {
     });
     expect(projected?.linkTransforms.tip.position_m[1]).toBeCloseTo(1);
 
+    // Source-model units are retained-map enums, not URDF-manifest labels.
+    const wrongUnits = sourceModel();
+    wrongUnits.occurrences[0].coordinates[0].unit = 'rad';
+    expect(executionObservationRobotPresentation(
+      frame, wrongUnits, manifest(), motionDescriptor(), null,
+    )).toBeNull();
+
     let reads = 0;
+    const rejected: ExecutionObservationFrame[] = [];
     const reader = createExecutionRobotPresentationReader({
       getLatestExecutionObservation: () => { reads += 1; return frame; },
       subscribeExecutionObservation: () => () => undefined,
       markExecutionObservationApplied: () => undefined,
+      rejectExecutionObservation: (value) => { rejected.push(value); },
     }, sourceModel(), manifest(), motionDescriptor());
     const first = reader.readMeasuredRobotPresentation();
     const second = reader.readMeasuredRobotPresentation();
@@ -399,9 +408,12 @@ describe('runtime scene presentation', () => {
 
     frame = { ...frame, targets: [{ ...frame.targets[0], compiledJointNames: ['fixed-tip'] }] };
     expect(reader.readMeasuredRobotPresentation()).toBeNull();
+    expect(reader.readMeasuredRobotPresentation()).toBeNull();
+    expect(rejected).toEqual([frame]);
 
     frame = { ...frame, graphRevision: 'crossed-graph' };
     expect(reader.readMeasuredRobotPresentation()).toBeNull();
+    expect(rejected).toEqual([rejected[0], frame]);
   });
 
   it('moves model-backed gripper master and mimic fingers without an arm update', () => {
@@ -418,7 +430,7 @@ describe('runtime scene presentation', () => {
     model.occurrences.push({
       ...model.occurrences[0], model_instance_id: 'gripper-model',
       coordinates: [{ ...model.occurrences[0].coordinates[0],
-        source_joint_name: 'finger', viewer_joint_name: 'finger-master', coordinate_kind: 'linear', unit: 'm' }],
+        source_joint_name: 'finger', viewer_joint_name: 'finger-master', coordinate_kind: 'linear', unit: 'meters' }],
     });
     model.targets[1].model_groups = [{ ...model.targets[0].model_groups[0],
       model_instance_id: 'gripper-model', commandable_source_joint_names: ['finger'] }];
@@ -442,6 +454,9 @@ describe('runtime scene presentation', () => {
     expect(closed?.linkTransforms.tip).toEqual(open?.linkTransforms.tip);
     expect(closed?.linkTransforms['finger-left'].position_m[1]).toBeCloseTo(0.005);
     expect(closed?.linkTransforms['finger-right'].position_m[1]).toBeCloseTo(-0.005);
+    model.occurrences[1].coordinates[0].unit = 'm';
+    expect(executionObservationRobotPresentation(frame, model, geometry, motionDescriptor(), null)).toBeNull();
+    model.occurrences[1].coordinates[0].unit = 'meters';
     frame.targets[1].coordinateKinds = ['angular'];
     expect(executionObservationRobotPresentation(frame, model, geometry, motionDescriptor(), null)).toBeNull();
     frame.targets[1].coordinateKinds = ['linear'];

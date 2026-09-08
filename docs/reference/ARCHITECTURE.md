@@ -152,41 +152,44 @@ mutate the scene, certify validation, or decide stop/recovery outcomes. It
 consumes immutable facts already published by their authoritative owners.
 
 ```text
-authoritative immutable facts
-        |
-        v
-demand/dirty scheduler -> supervised NRT visual worker
-        |                         |
-        |                         v
-        +--------------> bounded latest-only fanout -> browser scene graph
-                                ^
-                                |
-                   lease/rate/layer demand only
+Native current observation -> Headless credited socket -> Composer latest slot
+                                                               |
+                                                       /ws/scene/viewer
+                                                               |
+                                                    browser stable scene graph
+                                                               |
+                                                   applied-frame credit back
 ```
 
-The wire protocol separates three publication domains:
+The current native protocol is separate from the historical manifest/frame
+worker described in the old viewer schema. `GET /api/source-model` supplies
+the retained model/topology on demand. `/ws/scene/viewer` supplies addressed
+current joint observations; scene facts and other cold operator state arrive
+through `/ws/control`. Neither heartbeat passage nor volatile sample counters
+cause unchanged geometry to be rebuilt.
 
-- a **manifest** describes static topology, geometry, ordering, and
-  capabilities and changes only when its revision changes;
-- a **frame** carries one self-contained generation of current transforms and
-  dynamic visual state; timestamp passage alone does not create a frame; and
-- **diagnostics** carry low-rate worker, queue, loss, and renderer health
-  without consuming frame sequence numbers or resetting frame freshness.
+Cold source-file invalidation uses the existing native canonical source reader,
+including integrity checks, outside the API event loop and Python GIL. It reads
+changed files only and retains small equality hints and exact inode timestamps;
+expiry does not parse source files. Corrupt records wake an authoritative
+refresh instead of masquerading as healthy pulses. Directory replacement
+re-registers the same watcher, and last-client teardown waits for its one
+in-flight read. These hints neither establish runtime truth nor grant control
+authority. Heartbeat traffic remains independent.
 
-Clients hold renewable, bounded demand leases and negotiate visibility, rate,
-and layers. With no demand, visual production stops after a short grace period.
-Each producer/IPC/client boundary retains at most the latest replaceable frame;
-replacement and loss are counted, and a client that misses a generation
-resynchronizes from a manifest plus a self-contained latest frame. A slow or
-malformed client therefore cannot delay control routes or another viewer.
+Each browser grants one credit, then confirms the exact frame it applied.
+Until then, later observations replace the pending current value; they cannot
+form a motion playback queue. A reconnect recaptures current state, never
+replays old motion. There are at most 16 observation clients, and an abandoned
+credit session expires after 45 seconds. With no credit demand, the upstream
+source sleeps; with no clients it closes. There is no periodic HTTP sampler.
 
-The browser builds geometry/material nodes only when the manifest changes and
-applies transform frames to stable Three.js references. Authoring and snapshot
-commands are anchored to the latest authoritative frame, never to an
-interpolated display pose. Visual preparation runs in a supervised NRT process
-on resources outside qualified controller and runtime-collision reservations; its
-crash or saturation may degrade rendering, but cannot affect robot motion,
-collision monitoring, stop, scene authority, or recovery.
+The browser applies the newest joint frame to stable model references during
+its animation tick. The interpolated display is never execution, collision,
+authoring or attachment authority. Stream diagnostics are read on demand at
+`GET /api/scene/viewer/status`. Rendering/transport failures surface separately
+from owner state; process/resource isolation and response-time claims still
+require qualification on the actual platform and workload.
 
 Renderer capability changes presentation policy, never data authority. Every
 WebGL path uses the same bounded observer lease, and a software fallback must
@@ -195,23 +198,10 @@ not trade frame correctness for lower CPU. Hardware-GPU and software-renderer
 measurements remain separate qualification rows because a software browser can
 consume several host cores even when the viewer worker and transport are idle.
 
-Each browser may explicitly override its automatic viewer presentation rate
-within the server's bounded lease limit. This client-local preference controls
-how often the NRT observer pipeline may sample immutable owner publications,
-shape/fan out frames, and render them; it is not program or deployment
-authority. In particular, it is independent of a deployment pose source's
-`max_update_hz`, which controls how often ManyForge acquires new external
-robot/object observations. Raising the viewer rate cannot manufacture fresher
-source observations.
-
-Authored viewer presentation settings follow the program's ordinary
-Draft/Applied/Saved model. The Scene-tab controls, in-view Tools controls, and
-rendered overlays consume one shared frontend draft; `ComposerState`
-materializes only the applied values into the viewer manifest. The ordered
-manifest supplies topology and transform indices, not a competing set of UI
-defaults. Presentation-only Apply republishes the viewer projection without
-rebuilding the runner, kernel, planner, controller, scene authority, or other
-runtime resources.
+Presentation rates and quality are observer concerns, not Program execution
+rates or deployment pose-source sampling authority. Faster rendering cannot
+create newer observed facts. Historical layer negotiation and a supervised
+visual-worker process are not current native protocol requirements.
 
 ### Runtime resource isolation
 
@@ -262,7 +252,13 @@ functions; external plant safety remains independent.
   trajectories as collision-free. Bounded, explicitly-configured contact
   (e.g. a gripper finger touching the object it is about to grasp) is allowed
   only through a named contact policy — never by relaxing general collision
-  checking.
+  checking. The retained model initializes self-collision pairs before SRDF
+  exclusions; prepared queries retain logical-body and selected-group filters,
+  including cross-branch mimic dependencies. Cold loading rejects more than
+  1024 retained collision geometries before Pinocchio's quadratic index
+  allocation. This separate support ceiling does not replace runtime limits
+  of 160 logical bodies, 2048 active pairs and 256 joints, or qualify arbitrary
+  mesh size and cold-load time.
 - **The independent Program runner owns orchestration and run identity.** It
   hosts the validated Behavior tree/node mechanisms, captures one immutable
   Program/Binding selection, sequences nodes, and mints the `ProgramRunId` that
@@ -462,6 +458,20 @@ preview, Isaac bridges, ROS `GripperCommand`, and future device transports keep
 the same `command_gripper` program meaning. The native viewer renders the
 authoritative gripper state it receives; it does not progress a command.
 
+Native read-only target resolution retains one verified immutable selection per
+composition, keyed by Program Binding, target role and capability. It does not
+retain live participants or observations: current provider/route/command and
+freshness checks run on every read. Changing the composition discards the slot;
+concurrent queries pin their own selected value. This avoids repeatedly
+re-verifying unchanged product bytes without adding an observation owner.
+
+Operator grasp confirmation is an explicit, optional qualified source, not
+sensor proof or a consequence of successful gripper motion. The native command
+owner retains its current-command evidence and expiry. Program waits consume
+that evidence with bounded ordinary reads; History records attribution for
+traceability but never grants current grasp or attachment authority. The
+generated [Headless contract](HEADLESS_REST_API.md) defines the public command.
+
 Assistant-provider selection is a separate axis and never changes an execution
 lane's command or state authority:
 
@@ -594,10 +604,16 @@ ______________________________________________________________________
   [`ROBOPLAN_ADAPTER_NOTES.md`](ROBOPLAN_ADAPTER_NOTES.md).
 - **Scene / collision authority** — see
   [`SCENE_AUTHORITY.md`](SCENE_AUTHORITY.md).
-- **Trusted external behavior node** — filesystem-root discovery has been
-  removed. A future extension must enter through the same typed,
-  content-addressed package/compiler boundary as built-in nodes; no runtime
-  path loader or arbitrary Composer/assistant import is supported.
+- **Trusted external behavior node** — use the statically selected
+  [`manyforge_example_nodes`](../../manyforge_example_nodes/README.md) package
+  as the build/owner-adapter example. Its descriptor, actual source and
+  executable binding join the same content-addressed NodeEnvironment as
+  built-in nodes. There is no runtime path loader, plugin discovery or
+  arbitrary Composer/assistant import.
+- **Reusable subtree** — build-owned skill artifacts expand during authoring
+  into ordinary Program nodes, with typed arguments, role mapping and retained
+  provenance. Expansion does not mutate the Draft or execute the subtree;
+  ordinary Program validation and owner admission still apply.
 
 ______________________________________________________________________
 

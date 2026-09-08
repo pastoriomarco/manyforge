@@ -41,6 +41,7 @@ constexpr std::string_view kZeroDigest =
 enum class FixtureKind {
   kApplication,
   kCCLCProduct,
+  kCCLCOperatorConfirmation,
   kCCLCReadiness,
 };
 
@@ -54,7 +55,8 @@ struct GeneratorArguments final {
     throw std::invalid_argument(
         "usage: generate_lite6_native_execution_fixture "
         "--output-root PATH "
-        "[--fixture-kind cclc-product|cclc-readiness]");
+        "[--fixture-kind "
+        "cclc-product|cclc-operator-confirmation|cclc-readiness]");
   }
 
   std::map<std::string, std::filesystem::path, std::less<>> values;
@@ -86,6 +88,8 @@ struct GeneratorArguments final {
   if (fixture_kind.has_value()) {
     if (fixture_kind->string() == "cclc-product") {
       selected_kind = FixtureKind::kCCLCProduct;
+    } else if (fixture_kind->string() == "cclc-operator-confirmation") {
+      selected_kind = FixtureKind::kCCLCOperatorConfirmation;
     } else if (fixture_kind->string() == "cclc-readiness") {
       selected_kind = FixtureKind::kCCLCReadiness;
     } else {
@@ -117,9 +121,9 @@ void write_exact_file(const std::filesystem::path &path,
   }
 }
 
-[[nodiscard]] CanonicalValue
-make_program_root(const deployment::RetainedBundle &bundle,
-                  const bool include_gripper) {
+[[nodiscard]] CanonicalValue make_program_root(const deployment::RetainedBundle& bundle,
+                                               const bool include_gripper,
+                                               const bool operator_confirmation) {
   CanonicalValue::Object target_roles{
       {"arm",
        CanonicalValue(CanonicalValue::Object{
@@ -152,26 +156,30 @@ make_program_root(const deployment::RetainedBundle &bundle,
        })},
   };
   if (include_gripper) {
+    CanonicalValue::Array gripper_capabilities{CanonicalValue(CanonicalValue::Object{
+        {"capability_id", CanonicalValue("tool.gripper.command")},
+        {"parameters", CanonicalValue(CanonicalValue::Object{})},
+        {"disposition", CanonicalValue("required")},
+    })};
+    if (operator_confirmation) {
+      gripper_capabilities.emplace_back(CanonicalValue::Object{
+          {"capability_id", CanonicalValue("tool.gripper.confirmation.operator")},
+          {"parameters", CanonicalValue(CanonicalValue::Object{})},
+          {"disposition", CanonicalValue("required")},
+      });
+    }
     target_roles.emplace_back(
         "gripper",
         CanonicalValue(CanonicalValue::Object{
             {"component_role", CanonicalValue("robot")},
-            {"required_capabilities",
-             CanonicalValue(
-                 CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
-                     {"capability_id", CanonicalValue("tool.gripper.command")},
-                     {"parameters", CanonicalValue(CanonicalValue::Object{})},
-                     {"disposition", CanonicalValue("required")},
-                 })})},
-            {"required_frame_roles",
-             CanonicalValue(CanonicalValue::Array{CanonicalValue("tcp")})},
+            {"required_capabilities", CanonicalValue(std::move(gripper_capabilities))},
+            {"required_frame_roles", CanonicalValue(CanonicalValue::Array{CanonicalValue("tcp")})},
             {"required_resource_roles",
              CanonicalValue(CanonicalValue::Array{CanonicalValue("fingers")})},
             {"required_collision_body_roles",
-             CanonicalValue(
-                 CanonicalValue::Array{CanonicalValue("gripper_collision")})},
-            {"required_model_roles", CanonicalValue(CanonicalValue::Array{
-                                         CanonicalValue("arm_model")})},
+             CanonicalValue(CanonicalValue::Array{CanonicalValue("gripper_collision")})},
+            {"required_model_roles",
+             CanonicalValue(CanonicalValue::Array{CanonicalValue("arm_model")})},
         }));
   }
   return CanonicalValue(CanonicalValue::Object{
@@ -201,10 +209,10 @@ make_program_root(const deployment::RetainedBundle &bundle,
   });
 }
 
-[[nodiscard]] std::string
-make_program_bytes(const deployment::RetainedBundle &bundle,
-                   const bool include_gripper) {
-  CanonicalValue root = make_program_root(bundle, include_gripper);
+[[nodiscard]] std::string make_program_bytes(const deployment::RetainedBundle& bundle,
+                                             const bool include_gripper,
+                                             const bool operator_confirmation) {
+  CanonicalValue root = make_program_root(bundle, include_gripper, operator_confirmation);
   const std::string revision = deployment::detail::compute_content_identity(
       root, deployment::detail::ContentIdentitySpec{
                 .identity_domain = "program-revision",
@@ -269,7 +277,8 @@ int main(int argc, char **argv) {
     std::filesystem::create_directories(manager_state_root);
 
     auto materialized = [&]() {
-      if (arguments.fixture_kind == FixtureKind::kCCLCProduct) {
+      if (arguments.fixture_kind == FixtureKind::kCCLCProduct ||
+          arguments.fixture_kind == FixtureKind::kCCLCOperatorConfirmation) {
         const auto arm_semantic = manyforge::lite6_product::
             compute_lite6_lifecycle_catalog_semantic_digest();
         const auto gripper_semantic = manyforge::lite6_product::
@@ -278,10 +287,9 @@ int main(int argc, char **argv) {
           throw std::logic_error(
               "native CCLC lifecycle semantic digest is unavailable");
         }
-        return deployment::test::
-            materialize_lite6_native_cclc_product_retained_consumer_fixture(
-                package_root, arm_semantic.value().value(),
-                gripper_semantic.value().value());
+        return deployment::test::materialize_lite6_native_cclc_product_retained_consumer_fixture(
+            package_root, arm_semantic.value().value(), gripper_semantic.value().value(),
+            arguments.fixture_kind == FixtureKind::kCCLCOperatorConfirmation);
       }
       if (arguments.fixture_kind == FixtureKind::kCCLCReadiness) {
         return deployment::test::
@@ -311,8 +319,8 @@ int main(int argc, char **argv) {
 
     const bool include_gripper =
         arguments.fixture_kind != FixtureKind::kCCLCReadiness;
-    const std::string program_bytes =
-        make_program_bytes(bundle, include_gripper);
+    const std::string program_bytes = make_program_bytes(
+        bundle, include_gripper, arguments.fixture_kind == FixtureKind::kCCLCOperatorConfirmation);
     const auto program =
         deployment::verify_program_binding_contract(program_bytes, bundle);
     deployment::FilesystemCatalogArtifactStore catalog_store(package_root);
@@ -377,46 +385,37 @@ int main(int argc, char **argv) {
     write_exact_file(output_root / "program_binding.json",
                      std::string(binding->canonical_bytes()));
     const CanonicalValue manifest(CanonicalValue::Object{
-        {"api_version",
-         CanonicalValue("manyforge.i6.native-execution-fixture.v1")},
+        {"api_version", CanonicalValue("manyforge.i6.native-execution-fixture.v1")},
         {"cclc_product",
-         CanonicalValue(arguments.fixture_kind == FixtureKind::kCCLCProduct)},
+         CanonicalValue(arguments.fixture_kind == FixtureKind::kCCLCProduct ||
+                        arguments.fixture_kind == FixtureKind::kCCLCOperatorConfirmation)},
         {"cell_id", CanonicalValue(bundle.value().cell_graph.cell_id.value())},
-        {"retained_bundle_id",
-         CanonicalValue(bundle.retained_bundle_id().value())},
-        {"graph_revision",
-         CanonicalValue(bundle.value().cell_graph.graph_revision.value())},
+        {"retained_bundle_id", CanonicalValue(bundle.retained_bundle_id().value())},
+        {"graph_revision", CanonicalValue(bundle.value().cell_graph.graph_revision.value())},
         {"scene_revision", scene_revision(empty_scene.revision)},
         {"active_publication_generation",
-         CanonicalValue(
-             static_cast<double>(receipt.publication_generation.value()))},
+         CanonicalValue(static_cast<double>(receipt.publication_generation.value()))},
         {"program_id", CanonicalValue(program->value().program_id.value())},
-        {"program_revision",
-         CanonicalValue(program->value().program_revision.value())},
-        {"program_binding_id",
-         CanonicalValue(binding->program_binding_id().value())},
+        {"program_revision", CanonicalValue(program->value().program_revision.value())},
+        {"program_binding_id", CanonicalValue(binding->program_binding_id().value())},
         {"component_role_id", CanonicalValue("robot")},
         {"target_role_id", CanonicalValue("arm")},
         {"gripper_target_role_id", CanonicalValue("gripper")},
-        {"execution_capability_id",
-         CanonicalValue("execution.trajectory.execute")},
-        {"planning_capability_ids",
-         CanonicalValue(CanonicalValue::Array{
-             CanonicalValue("planning.motion.cartesian_path"),
-             CanonicalValue("planning.motion.joint_goal"),
-             CanonicalValue("planning.motion.pose_goal"),
-         })},
+        {"execution_capability_id", CanonicalValue("execution.trajectory.execute")},
+        {"planning_capability_ids", CanonicalValue(CanonicalValue::Array{
+                                        CanonicalValue("planning.motion.cartesian_path"),
+                                        CanonicalValue("planning.motion.joint_goal"),
+                                        CanonicalValue("planning.motion.pose_goal"),
+                                    })},
         {"gripper_capability_id", CanonicalValue("tool.gripper.command")},
         {"gripper_command_schema_id",
          CanonicalValue(std::string(core::kGripperPositionCommandSchemaId))},
         {"gripper_command_schema_revision",
-         CanonicalValue(
-             std::string(core::kGripperPositionCommandSchemaRevision))},
+         CanonicalValue(std::string(core::kGripperPositionCommandSchemaRevision))},
         {"source_joint_names",
-         CanonicalValue(CanonicalValue::Array{
-             CanonicalValue("joint1"), CanonicalValue("joint2"),
-             CanonicalValue("joint3"), CanonicalValue("joint4"),
-             CanonicalValue("joint5"), CanonicalValue("joint6")})},
+         CanonicalValue(CanonicalValue::Array{CanonicalValue("joint1"), CanonicalValue("joint2"),
+                                              CanonicalValue("joint3"), CanonicalValue("joint4"),
+                                              CanonicalValue("joint5"), CanonicalValue("joint6")})},
     });
     write_exact_file(output_root / "manifest.json",
                      deployment::canonical_json(manifest));

@@ -23,47 +23,26 @@ namespace {
 
 using core::RuntimeCapabilityContractRefDTO;
 
-template <std::size_t N>
-[[nodiscard]] std::vector<RuntimeCapabilityContractRefDTO>
-declared_capabilities(const std::array<std::string_view, N>& capability_ids) {
+template <std::size_t... N>
+[[nodiscard]] std::vector<RuntimeCapabilityContractRefDTO> declared_capabilities(
+    const std::array<std::string_view, N>&... groups) {
   std::vector<RuntimeCapabilityContractRefDTO> result;
-  result.reserve(N);
-  for (const auto capability_id : capability_ids) {
-    const auto* definition =
-        core::find_builtin_capability_definition(capability_id);
-    if (definition == nullptr) {
-      throw std::logic_error("runtime contract declaration names unknown "
-                             "capability " +
-                             std::string(capability_id));
+  result.reserve((N + ...));
+  const auto append = [&](const auto& capability_ids) {
+    for (const auto capability_id : capability_ids) {
+      const auto* definition = core::find_builtin_capability_definition(capability_id);
+      if (definition == nullptr) {
+        throw std::logic_error(
+            "runtime contract declaration names unknown "
+            "capability " +
+            std::string(capability_id));
+      }
+      result.emplace_back(core::CapabilityId(std::string(capability_id)),
+                          core::CapabilityDefinitionRevision(
+                              std::string(definition->capability_definition_revision)));
     }
-    result.emplace_back(
-        core::CapabilityId(std::string(capability_id)),
-        core::CapabilityDefinitionRevision(
-            std::string(definition->capability_definition_revision)));
-  }
-  return result;
-}
-
-template <std::size_t N, std::size_t M>
-[[nodiscard]] std::vector<RuntimeCapabilityContractRefDTO>
-declared_capabilities(
-    const std::array<std::string_view, N>& first,
-    const std::array<std::string_view, M>& second) {
-  auto result = declared_capabilities(first);
-  const auto appended = declared_capabilities(second);
-  result.insert(result.end(), appended.begin(), appended.end());
-  return result;
-}
-
-template <std::size_t N, std::size_t M, std::size_t O>
-[[nodiscard]] std::vector<RuntimeCapabilityContractRefDTO>
-declared_capabilities(
-    const std::array<std::string_view, N>& first,
-    const std::array<std::string_view, M>& second,
-    const std::array<std::string_view, O>& third) {
-  auto result = declared_capabilities(first, second);
-  const auto appended = declared_capabilities(third);
-  result.insert(result.end(), appended.begin(), appended.end());
+  };
+  (append(groups), ...);
   return result;
 }
 
@@ -311,47 +290,36 @@ RuntimeContractDeclarationRegistry::make_rows() {
                         detail::kReferenceRuntimeStatusApiContractId,
                         "reference-runtime")}));
   rows.push_back(RuntimeContractDeclaration(
-      core::RuntimeProfileId(
-          std::string(detail::kNativeExecutionRuntimeProfileId)),
-      core::RuntimeProfileRevision(
-          detail::native_execution_runtime_profile_revision()),
-      core::ProductContractId(
-          std::string(detail::kNativeExecutionRuntimeProductContractId)),
+      core::RuntimeProfileId(std::string(detail::kNativeExecutionRuntimeProfileId)),
+      core::RuntimeProfileRevision(detail::native_execution_runtime_profile_revision()),
+      core::ProductContractId(std::string(detail::kNativeExecutionRuntimeProductContractId)),
       core::ProductContractRevision(native_product_revision),
-      make_offer(
-          detail::kNativeExecutionRuntimeImplementationId,
-          {core::ApiContractId(std::string(
-               native_execution_runtime_contract::kRuntimeRoleApiContractId)),
-           core::ApiContractId(std::string(native_execution_runtime_contract::
-                                               kStatusEndpointApiContractId)),
-           core::ApiContractId(
-               std::string(native_execution_runtime_contract::
-                               kProjectionEndpointApiContractId)),
-           core::ApiContractId(
-               std::string(native_execution_runtime_contract::
-                               kLogicalSceneEndpointApiContractId))},
-          declared_capabilities(
-              runtime_contract_capabilities::kExecutionServices,
-              runtime_contract_capabilities::kLogicalSceneServices,
-              std::array<std::string_view, 1U>{
-                  "execution.runtime_scale.operation_scoped"})),
-      {role_mapping(
-          detail::kNativeExecutionRuntimeRoleId,
-          native_execution_runtime_contract::kRuntimeRoleApiContractId,
-          "native-execution-host")},
-      {endpoint_mapping(
-           detail::kNativeExecutionRuntimeStatusEndpointRoleId,
-           native_execution_runtime_contract::kStatusEndpointApiContractId,
-           "native-execution-host"),
-       endpoint_mapping(
-           detail::kNativeExecutionRuntimeProjectionEndpointRoleId,
-           native_execution_runtime_contract::kProjectionEndpointApiContractId,
-           "native-execution-host"),
-       endpoint_mapping(
-           detail::kNativeExecutionRuntimeLogicalSceneEndpointRoleId,
-           native_execution_runtime_contract::
-               kLogicalSceneEndpointApiContractId,
-           "native-execution-host")}));
+      make_offer(detail::kNativeExecutionRuntimeImplementationId,
+                 {core::ApiContractId(
+                      std::string(native_execution_runtime_contract::kRuntimeRoleApiContractId)),
+                  core::ApiContractId(
+                      std::string(native_execution_runtime_contract::kStatusEndpointApiContractId)),
+                  core::ApiContractId(std::string(
+                      native_execution_runtime_contract::kProjectionEndpointApiContractId)),
+                  core::ApiContractId(std::string(
+                      native_execution_runtime_contract::kLogicalSceneEndpointApiContractId))},
+                 declared_capabilities(
+                     runtime_contract_capabilities::kExecutionServices,
+                     runtime_contract_capabilities::kLogicalSceneServices,
+                     std::array<std::string_view, 2U>{"execution.runtime_scale.operation_scoped",
+                                                      "tool.gripper.confirmation.operator"})),
+      {role_mapping(detail::kNativeExecutionRuntimeRoleId,
+                    native_execution_runtime_contract::kRuntimeRoleApiContractId,
+                    "native-execution-host")},
+      {endpoint_mapping(detail::kNativeExecutionRuntimeStatusEndpointRoleId,
+                        native_execution_runtime_contract::kStatusEndpointApiContractId,
+                        "native-execution-host"),
+       endpoint_mapping(detail::kNativeExecutionRuntimeProjectionEndpointRoleId,
+                        native_execution_runtime_contract::kProjectionEndpointApiContractId,
+                        "native-execution-host"),
+       endpoint_mapping(detail::kNativeExecutionRuntimeLogicalSceneEndpointRoleId,
+                        native_execution_runtime_contract::kLogicalSceneEndpointApiContractId,
+                        "native-execution-host")}));
   rows.push_back(RuntimeContractDeclaration(
       core::RuntimeProfileId(
           std::string(detail::kRos2ControlExecutionRuntimeProfileId)),

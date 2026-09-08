@@ -1,4 +1,4 @@
-"""Focused payload-neutral viewer transport coverage during the I9 cutover."""
+"""Retained payload-neutral viewer transport and value coverage."""
 
 from __future__ import annotations
 
@@ -13,7 +13,6 @@ from manyforge_composer.backend.viewer_data_plane import (
 )
 from manyforge_composer.backend.viewer_worker import (
     ViewerWorkerError,
-    ViewerWorkerSupervisor,
     _decode_envelope,
     _encode_envelope,
 )
@@ -110,8 +109,7 @@ def test_fanout_threadsafe_ingress_is_capacity_one() -> None:
         fanout = BoundedViewerFanout()
         await fanout.attach(socket, client_id="observer-a")  # type: ignore[arg-type]
         publications = [
-            ViewerTransportItem(sequence=index, payload=f"payload-{index}")
-            for index in range(1, 4)
+            ViewerTransportItem(sequence=index, payload=f"payload-{index}") for index in range(1, 4)
         ]
 
         assert all(fanout.publish_threadsafe(item) for item in publications)
@@ -223,12 +221,10 @@ def test_visual_pose_composition_round_trips_without_runtime_or_fk_owner() -> No
         child_pose=child_in_parent,
     )
 
-    assert relative_pose_from_world(
-        child_pose=child_world,
-        parent_pose=parent,
-    ) == child_in_parent
-
-
-def test_unavailable_worker_factory_fails_before_process_effects() -> None:
-    with pytest.raises(RuntimeError, match="composable_cell_viewer_worker_unavailable"):
-        ViewerWorkerSupervisor()
+    assert (
+        relative_pose_from_world(
+            child_pose=child_world,
+            parent_pose=parent,
+        )
+        == child_in_parent
+    )

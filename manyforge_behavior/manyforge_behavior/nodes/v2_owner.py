@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import time
 from typing import Any
 
 import py_trees
@@ -46,9 +47,7 @@ class _OwnerAdapter(py_trees.behaviour.Behaviour):
         self._node_instance_id = node_instance_id
         self._attempt_source = attempt_source
         self._parameters = dict(parameters)
-        self._value_sources = {
-            key: dict(source) for key, source in value_sources.items()
-        }
+        self._value_sources = {key: dict(source) for key, source in value_sources.items()}
         self._input_resolver = input_resolver
         self._output_key_parameter = output_key_parameter
         self._blackboard_read_parameters = blackboard_read_parameters
@@ -121,8 +120,7 @@ class _OwnerAdapter(py_trees.behaviour.Behaviour):
         if collisions:
             self._record_failure(
                 "owner_result_invalid",
-                "owner metadata replaces reserved fields "
-                f"{sorted(collisions)}",
+                "owner metadata replaces reserved fields " f"{sorted(collisions)}",
             )
             return False
         try:
@@ -183,9 +181,7 @@ class OwnerTaskAdapter(_OwnerAdapter):
         return {
             "owner_port_name": self._owner_port_name,
             "owner_task_id": self._task.task_id,
-            "owner_assessment": (
-                assessment if isinstance(assessment, Mapping) else None
-            ),
+            "owner_assessment": (assessment if isinstance(assessment, Mapping) else None),
         }
 
     def _settle(self, task: OwnerTaskSnapshot) -> py_trees.common.Status:
@@ -193,8 +189,7 @@ class OwnerTaskAdapter(_OwnerAdapter):
         operator_stop = (
             task.state is OwnerTaskState.INTERRUPTED
             and isinstance(assessment, Mapping)
-            and assessment.get("recovery_class")
-            in PROGRAM_MOTION_STOP_RECOVERY_CLASSES
+            and assessment.get("recovery_class") in PROGRAM_MOTION_STOP_RECOVERY_CLASSES
         )
         if operator_stop and self._operator_stop_state is not None:
             if (
@@ -218,13 +213,9 @@ class OwnerTaskAdapter(_OwnerAdapter):
                 )
                 return py_trees.common.Status.FAILURE
             try:
-                resolution = self._intervention_port.consume_resolution(
-                    self._identity
-                )
+                resolution = self._intervention_port.consume_resolution(self._identity)
             except Exception as exc:
-                self._record_failure(
-                    "program_recovery_resolution_failed", str(exc)
-                )
+                self._record_failure("program_recovery_resolution_failed", str(exc))
                 return py_trees.common.Status.FAILURE
             if resolution is None:
                 return py_trees.common.Status.RUNNING
@@ -248,9 +239,7 @@ class OwnerTaskAdapter(_OwnerAdapter):
                     )
                     else py_trees.common.Status.FAILURE
                 )
-            self._record_failure(
-                "manual_recovery_failure", "operator staged a failed result"
-            )
+            self._record_failure("manual_recovery_failure", "operator staged a failed result")
             return py_trees.common.Status.FAILURE
         if task.state is OwnerTaskState.ACTIVE:
             return py_trees.common.Status.RUNNING
@@ -298,9 +287,7 @@ class OwnerTaskAdapter(_OwnerAdapter):
                         "pause_for_operator requires the production intervention port",
                     )
                     return py_trees.common.Status.FAILURE
-                parameter = task.metadata.get(
-                    "authored_failure_policy_parameter"
-                )
+                parameter = task.metadata.get("authored_failure_policy_parameter")
                 if not isinstance(parameter, str) or not parameter:
                     self._record_failure(
                         "owner_result_invalid",
@@ -311,9 +298,7 @@ class OwnerTaskAdapter(_OwnerAdapter):
                     try:
                         self._intervention_port.require(
                             self._identity,
-                            reason_code=(
-                                task.reason_code or "operator_intervention_required"
-                            ),
+                            reason_code=(task.reason_code or "operator_intervention_required"),
                             message=task.message,
                             policy_parameter=parameter,
                             owner_port_name=self._owner_port_name,
@@ -345,11 +330,7 @@ class OwnerTaskAdapter(_OwnerAdapter):
         return py_trees.common.Status.FAILURE
 
     def update(self) -> py_trees.common.Status:
-        if (
-            self._input_error is not None
-            or self._identity is None
-            or self._owner_inputs is None
-        ):
+        if self._input_error is not None or self._identity is None or self._owner_inputs is None:
             return py_trees.common.Status.FAILURE
         try:
             if self._task is None:
@@ -414,7 +395,8 @@ class OwnerTaskAdapter(_OwnerAdapter):
         """
 
         if not selected_resume and self._owner_port_name not in {
-            "kernel_operations", "pick_place",
+            "kernel_operations",
+            "pick_place",
         }:
             return "unaffected"
         if self._task is None:
@@ -446,8 +428,7 @@ class OwnerTaskAdapter(_OwnerAdapter):
         if (
             task.state is OwnerTaskState.INTERRUPTED
             and isinstance(assessment, Mapping)
-            and assessment.get("recovery_class")
-            in PROGRAM_MOTION_STOP_RECOVERY_CLASSES
+            and assessment.get("recovery_class") in PROGRAM_MOTION_STOP_RECOVERY_CLASSES
         ):
             return "held"
         if task.state is OwnerTaskState.SUCCEEDED:
@@ -482,11 +463,7 @@ class OwnerInvocationAdapter(_OwnerAdapter):
         self._status = py_trees.common.Status.INVALID
 
     def update(self) -> py_trees.common.Status:
-        if (
-            self._input_error is not None
-            or self._identity is None
-            or self._owner_inputs is None
-        ):
+        if self._input_error is not None or self._identity is None or self._owner_inputs is None:
             return py_trees.common.Status.FAILURE
         if self._invoked:
             return self._status
@@ -520,4 +497,72 @@ class OwnerInvocationAdapter(_OwnerAdapter):
         return self._status
 
 
-__all__ = ["OwnerInvocationAdapter", "OwnerTaskAdapter"]
+class GripperStatusWaitAdapter(_OwnerAdapter):
+    """Read one command scope at at most 10 Hz using the existing tree ticks.
+
+    Cancelling a read-only waiter has no physical command to cancel. It never
+    follows a replacement command/source, renews evidence, or owns a worker.
+    """
+
+    def __init__(self, *, port: OwnerInvocationPort, clock=time.monotonic, **kwargs: Any):
+        super().__init__(**kwargs)
+        self._port = port
+        self._clock = clock
+        self._deadline = 0.0
+        self._next_read = 0.0
+        self._scope = None
+
+    def initialise(self) -> None:
+        super().initialise()
+        self._scope = None
+        self._next_read = 0.0
+        self._deadline = self._clock() + (
+            float(self._inputs["timeout_s"]) if self._inputs is not None else 0.0
+        )
+
+    def update(self) -> py_trees.common.Status:
+        if self._input_error is not None or self._identity is None or self._owner_inputs is None:
+            return py_trees.common.Status.FAILURE
+        now = self._clock()
+        if now >= self._deadline:
+            self._record_failure(
+                "gripper_wait_timeout",
+                "Expected gripper state was not observed before the deadline.",
+            )
+            return py_trees.common.Status.FAILURE
+        if now < self._next_read:
+            return py_trees.common.Status.RUNNING
+        try:
+            result = self._port.invoke(self._node_id, self._identity, self._owner_inputs)
+            scope = result.metadata["command_scope"]
+            if not isinstance(scope, tuple) or len(scope) != 7:
+                raise ValueError("gripper query omitted its exact command/source identity")
+        except Exception as exc:
+            self._record_failure("gripper_wait_source_unavailable", str(exc))
+            return py_trees.common.Status.FAILURE
+        self._next_read = self._clock() + 0.1
+        if self._scope is None:
+            self._scope = scope
+        if scope != self._scope:
+            self._record_failure(
+                "gripper_wait_stale", "The captured command or source was replaced."
+            )
+            return py_trees.common.Status.FAILURE
+        if self._clock() >= self._deadline:
+            self._record_failure(
+                "gripper_wait_timeout", "Gripper read completed after the deadline."
+            )
+            return py_trees.common.Status.FAILURE
+        if result.succeeded:
+            return py_trees.common.Status.SUCCESS
+        if (
+            result.reason_code != "gripper_status_not_matched"
+            or result.metadata.get("command_state") == "failed"
+        ):
+            self._record_failure(result.reason_code, result.message)
+            return py_trees.common.Status.FAILURE
+        self.feedback_message = result.message or "Waiting for the captured gripper command."
+        return py_trees.common.Status.RUNNING
+
+
+__all__ = ["OwnerInvocationAdapter", "OwnerTaskAdapter", "GripperStatusWaitAdapter"]

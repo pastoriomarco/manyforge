@@ -115,6 +115,13 @@ HistorianPageValue(const HistorianPage &page);
 /// parse and discard large nested records.
 [[nodiscard]] manyforge::content_identity::CanonicalValue
 HistorianSummaryPageValue(const HistorianPage &page);
+/// Compact projection of an already validated original. Storage binds its
+/// exact bytes to the original digest; list reads never decode full payloads.
+[[nodiscard]] manyforge::content_identity::CanonicalValue HistorianSummaryEventValue(
+    const HistorianEvent& event, std::optional<std::int64_t> occurred_at_utc_ns,
+    const std::optional<std::string>& clock_owner, bool wall_clock_regressed);
+[[nodiscard]] manyforge::content_identity::CanonicalValue HistorianSummaryEnvelopeValue(
+    manyforge::content_identity::CanonicalValue::Array events, const HistorianPage& page);
 [[nodiscard]] manyforge::content_identity::CanonicalValue
 HistorianExportPageValue(const HistorianPage &page);
 [[nodiscard]] manyforge::content_identity::CanonicalValue
@@ -146,8 +153,13 @@ public:
 
   [[nodiscard]] AppendStatus Append(const HistorianEvent &event) override;
   [[nodiscard]] HistorianPage Query(const HistorianQuery &query) override;
-  [[nodiscard]] manyforge::content_identity::CanonicalValue
-  Discover(const std::string &kind, const std::string &after, std::size_t limit);
+  [[nodiscard]] manyforge::content_identity::CanonicalValue QuerySummaries(
+      const HistorianQuery& query);
+  /// Apply the export byte budget before decoding full retained records.
+  [[nodiscard]] HistorianPage QueryExport(const HistorianQuery& query);
+  [[nodiscard]] manyforge::content_identity::CanonicalValue Discover(const std::string& kind,
+                                                                     const std::string& after,
+                                                                     std::size_t limit);
   [[nodiscard]] std::optional<HistorianStoredEvent>
   Read(std::uint64_t sequence) override;
   void Close();

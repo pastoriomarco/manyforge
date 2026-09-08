@@ -330,7 +330,10 @@ core::RuntimeParticipantBindingDTO build_runtime_participant_binding_dto(
         fail("runtime control resource is absent from the Program Binding");
       }
       if (coordinate.coordinates.empty()) {
-        if (!target.capability().command_schema.has_value() ||
+        // Observation bindings use the same retained coordinate without a
+        // command schema. Resolving that resource does not grant command
+        // authority; the exact capability/schema remain part of the DTO.
+        if (target.capability().command_schema.has_value() &&
             target.capability().command_schema->command_schema_id.value() !=
                 core::kGripperPositionCommandSchemaId) {
           fail("component-local runtime resource has no exact scalar command "

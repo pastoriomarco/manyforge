@@ -19,6 +19,7 @@ from typing import Any
 
 from manyforge_behavior.catalog import CatalogEntry, NodeCatalog
 from manyforge_behavior.catalog_schema import CatalogSchema
+from manyforge_behavior.skill_loader import default_skills_dir, load_skill_catalog
 
 
 SOURCE_API_VERSION = "manyforge.assistant_instrument_registry_source.v1"
@@ -28,9 +29,7 @@ IDENTIFIER: dict[str, Any] = {
     "pattern": "^[a-z][a-z0-9_.-]*$",
     "maxLength": 256,
 }
-INSTANCE_OR_ROOT: dict[str, Any] = {
-    "oneOf": [copy.deepcopy(IDENTIFIER), {"const": "@root"}]
-}
+INSTANCE_OR_ROOT: dict[str, Any] = {"oneOf": [copy.deepcopy(IDENTIFIER), {"const": "@root"}]}
 BOUNDED_TEXT: dict[str, Any] = {"type": "string", "maxLength": 4096}
 
 # Exact translation of the maintained pre-cutover scene-authoring allowlist.
@@ -184,10 +183,7 @@ def _strip_descriptions(value: Any, *, in_properties: bool = False) -> Any:
     """Keep field names named description, but remove schema annotations."""
     if isinstance(value, dict):
         if in_properties:
-            return {
-                key: _strip_descriptions(item)
-                for key, item in value.items()
-            }
+            return {key: _strip_descriptions(item) for key, item in value.items()}
         return {
             key: _strip_descriptions(
                 item,
@@ -223,9 +219,7 @@ def _factor_schema(schema: dict[str, Any]) -> dict[str, Any]:
             counts[digest] = counts.get(digest, 0) + 1
             originals.setdefault(digest, value)
         for key, item in value.items():
-            if key in {"properties", "$defs", "definitions"} and isinstance(
-                item, dict
-            ):
+            if key in {"properties", "$defs", "definitions"} and isinstance(item, dict):
                 for child in item.values():
                     if isinstance(child, dict):
                         visit(child)
@@ -253,17 +247,13 @@ def _factor_schema(schema: dict[str, Any]) -> dict[str, Any]:
             return {"$ref": f"#/$defs/{names[digest]}"}
         result: dict[str, Any] = {}
         for key, item in value.items():
-            if key in {"properties", "$defs", "definitions"} and isinstance(
-                item, dict
-            ):
+            if key in {"properties", "$defs", "definitions"} and isinstance(item, dict):
                 result[key] = {
-                    name: render(child) if isinstance(child, dict) else copy.deepcopy(child)
+                    name: (render(child) if isinstance(child, dict) else copy.deepcopy(child))
                     for name, child in item.items()
                 }
             elif key in {"items", "contains", "if", "then", "else", "not"}:
-                result[key] = (
-                    render(item) if isinstance(item, dict) else copy.deepcopy(item)
-                )
+                result[key] = render(item) if isinstance(item, dict) else copy.deepcopy(item)
             elif key == "additionalProperties" and isinstance(item, dict):
                 result[key] = render(item)
             elif key in {"allOf", "anyOf", "oneOf"} and isinstance(item, list):
@@ -310,37 +300,25 @@ def _authoring_patch_schema(
     if not matches:
         return None
     if len(matches) != 1:
-        raise GenerationError(
-            f"multiple authoring schemas resolve to {persisted_schema.ref}"
-        )
+        raise GenerationError(f"multiple authoring schemas resolve to {persisted_schema.ref}")
     authoring = matches[0]
     if authoring.schema_type != "object" or len(authoring.exactly_one) != 1:
         raise GenerationError(
-            f"authoring schema for {persisted_schema.ref} is not one closed "
-            "single-intent object"
+            f"authoring schema for {persisted_schema.ref} is not one closed " "single-intent object"
         )
     rendered = _catalog_schema(catalog, authoring)
     properties = rendered.get("properties")
     if type(properties) is not dict:
-        raise GenerationError(
-            f"authoring schema for {persisted_schema.ref} has no properties"
-        )
+        raise GenerationError(f"authoring schema for {persisted_schema.ref} has no properties")
     intent_fields = authoring.exactly_one[0]
     retained_fields = tuple(sorted(set(properties) - set(intent_fields)))
     if not retained_fields:
         raise GenerationError(
-            f"authoring schema for {persisted_schema.ref} has no patchable "
-            "non-intent field"
+            f"authoring schema for {persisted_schema.ref} has no patchable " "non-intent field"
         )
     no_intent_branch = {
-        "not": {
-            "anyOf": [
-                {"required": [field_name]} for field_name in intent_fields
-            ]
-        },
-        "anyOf": [
-            {"required": [field_name]} for field_name in retained_fields
-        ],
+        "not": {"anyOf": [{"required": [field_name]} for field_name in intent_fields]},
+        "anyOf": [{"required": [field_name]} for field_name in retained_fields],
     }
     result = _object(
         copy.deepcopy(properties),
@@ -370,17 +348,11 @@ def _semantic_types(
     if concrete.items is not None:
         result.update(_semantic_types(catalog, concrete.items, seen=next_seen))
     if concrete.additional_property_schema is not None:
-        result.update(
-            _semantic_types(
-                catalog, concrete.additional_property_schema, seen=next_seen
-            )
-        )
+        result.update(_semantic_types(catalog, concrete.additional_property_schema, seen=next_seen))
     return frozenset(result)
 
 
-def _value_source_parameter_ids(
-    catalog: NodeCatalog, entry: CatalogEntry
-) -> frozenset[str]:
+def _value_source_parameter_ids(catalog: NodeCatalog, entry: CatalogEntry) -> frozenset[str]:
     selectors = {
         selector
         for requirement in entry.required_capabilities
@@ -426,9 +398,7 @@ def _node_configuration_schema(
         for parameter in sorted(entry.parameters, key=lambda item: item.id)
     }
     value_source_ids = _value_source_parameter_ids(catalog, entry)
-    value_source_schema = _catalog_schema(
-        catalog, catalog.schema_registry.types["value_source"]
-    )
+    value_source_schema = _catalog_schema(catalog, catalog.schema_registry.types["value_source"])
     value_source_properties = {
         parameter_id: copy.deepcopy(value_source_schema)
         for parameter_id in sorted(value_source_ids)
@@ -685,15 +655,9 @@ def _scene_pose_authoring_schema(catalog: NodeCatalog) -> dict[str, Any]:
     properties = copy.deepcopy(absolute["properties"])
     properties.update(
         {
-            "rotate_local_rpy_deg": _array(
-                {"type": "number"}, minimum=3, maximum=3
-            ),
-            "rotate_world_rpy_deg": _array(
-                {"type": "number"}, minimum=3, maximum=3
-            ),
-            "rpy_delta_deg": _array(
-                {"type": "number"}, minimum=3, maximum=3
-            ),
+            "rotate_local_rpy_deg": _array({"type": "number"}, minimum=3, maximum=3),
+            "rotate_world_rpy_deg": _array({"type": "number"}, minimum=3, maximum=3),
+            "rpy_delta_deg": _array({"type": "number"}, minimum=3, maximum=3),
             "orientation_from": _catalog_schema(
                 catalog, catalog.schema_registry.types["orientation_reference"]
             ),
@@ -712,9 +676,7 @@ def _scene_pose_authoring_schema(catalog: NodeCatalog) -> dict[str, Any]:
     )
 
 
-def _scene_resource_schema(
-    catalog: NodeCatalog, *, authoring_pose: bool = False
-) -> dict[str, Any]:
+def _scene_resource_schema(catalog: NodeCatalog, *, authoring_pose: bool = False) -> dict[str, Any]:
     return _object(
         {
             "scene_resource_id": copy.deepcopy(IDENTIFIER),
@@ -752,9 +714,7 @@ def _constraints_schema(*, numeric: str | None = None, length: bool = False) -> 
         )
     if length:
         length_bound = {"type": "integer", "minimum": 0, "maximum": MAX_ITEMS}
-        properties.update(
-            {"min_length": length_bound, "max_length": length_bound}
-        )
+        properties.update({"min_length": length_bound, "max_length": length_bound})
     return _object(properties, all_of=all_of)
 
 
@@ -764,13 +724,9 @@ def _program_parameter_schema(catalog: NodeCatalog) -> dict[str, Any]:
         "float64": {"type": "number"},
         "int64": {"type": "integer"},
         "scene_resource": copy.deepcopy(IDENTIFIER),
-        "stored_pose": _catalog_schema(
-            catalog, catalog.schema_registry.types["stored_pose"]
-        ),
+        "stored_pose": _catalog_schema(catalog, catalog.schema_registry.types["stored_pose"]),
         "string": {"type": "string", "maxLength": 1_000_000},
-        "string_list": _array(
-            {"type": "string", "maxLength": 1_000_000}, maximum=MAX_ITEMS
-        ),
+        "string_list": _array({"type": "string", "maxLength": 1_000_000}, maximum=MAX_ITEMS),
     }
     variants: list[dict[str, Any]] = []
     for parameter_type in PROGRAM_TYPES:
@@ -887,7 +843,12 @@ def _tools(catalog: NodeCatalog) -> list[dict[str, Any]]:
         required=("scene_resource",),
     )
     tools = [
-        _tool("alarms_read", "read_only", "Read the active headless alarm snapshot.", no_args),
+        _tool(
+            "alarms_read",
+            "read_only",
+            "Read the active headless alarm snapshot.",
+            no_args,
+        ),
         _tool(
             "catalog_read",
             "read_only",
@@ -955,14 +916,24 @@ def _tools(catalog: NodeCatalog) -> list[dict[str, Any]]:
                 }
             ),
         ),
-        _tool("program_read", "read_only", "Read the current Composer Draft Program.", no_args),
+        _tool(
+            "program_read",
+            "read_only",
+            "Read the current Composer Draft Program.",
+            no_args,
+        ),
         _tool(
             "program_validate",
             "read_only",
             "Validate the current Composer Draft Program without mutation.",
             no_args,
         ),
-        _tool("scene_inspect", "read_only", "Read the active logical-scene snapshot.", no_args),
+        _tool(
+            "scene_inspect",
+            "read_only",
+            "Read the active logical-scene snapshot.",
+            no_args,
+        ),
         _tool(
             "skills_read",
             "read_only",
@@ -974,7 +945,12 @@ def _tools(catalog: NodeCatalog) -> list[dict[str, Any]]:
                 }
             ),
         ),
-        _tool("status_read", "read_only", "Read the active headless runtime status snapshot.", no_args),
+        _tool(
+            "status_read",
+            "read_only",
+            "Read the active headless runtime status snapshot.",
+            no_args,
+        ),
         _tool(
             "propose_scene_object_nodes",
             "proposal",
@@ -1005,11 +981,7 @@ def _tools(catalog: NodeCatalog) -> list[dict[str, Any]]:
                     {
                         "if": {
                             "properties": {
-                                "operations": {
-                                    "contains": {
-                                        "const": "scene.attach_carried_object"
-                                    }
-                                }
+                                "operations": {"contains": {"const": "scene.attach_carried_object"}}
                             },
                             "required": ["operations"],
                         },
@@ -1024,11 +996,7 @@ def _tools(catalog: NodeCatalog) -> list[dict[str, Any]]:
                     {
                         "if": {
                             "properties": {
-                                "operations": {
-                                    "contains": {
-                                        "const": "scene.detach_carried_object"
-                                    }
-                                }
+                                "operations": {"contains": {"const": "scene.detach_carried_object"}}
                             },
                             "required": ["operations"],
                         },
@@ -1289,22 +1257,32 @@ def generate(catalog_path: Path, profile_path: Path) -> dict[str, Any]:
     if tool_ids != sorted(set(tool_ids)):
         raise GenerationError("generated tool IDs are not unique and canonical-sorted")
     _verify_profile(profile_path, set(tool_ids))
+    skills = load_skill_catalog(default_skills_dir(), catalog=catalog, tool_ids=set(tool_ids))
     return {
         "api_version": SOURCE_API_VERSION,
-        "skills": [],
+        "skills": [
+            {
+                "skill_id": row["skill_id"],
+                "requires_tools": sorted(row.get("requires_tools", [])),
+            }
+            for row in skills.artifacts()
+        ],
         "tools": tools,
         "nodes": [{"node_id": node_id} for node_id in ASSISTANT_NODE_IDS],
     }
 
 
 def _render(value: dict[str, Any]) -> str:
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        allow_nan=False,
-        indent=2,
-        sort_keys=True,
-    ) + "\n"
+    return (
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
 
 
 def main() -> int:
@@ -1315,15 +1293,11 @@ def main() -> int:
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
     try:
-        rendered = _render(
-            generate(args.catalog.resolve(), args.assistant_profiles.resolve())
-        )
+        rendered = _render(generate(args.catalog.resolve(), args.assistant_profiles.resolve()))
         if args.check:
             current = args.output.resolve().read_text(encoding="utf-8")
             if current != rendered:
-                raise GenerationError(
-                    f"assistant instrument source is stale: {args.output}"
-                )
+                raise GenerationError(f"assistant instrument source is stale: {args.output}")
         else:
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(rendered, encoding="utf-8")

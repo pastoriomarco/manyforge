@@ -2,8 +2,10 @@
 
 > **Current `dev` boundary:** this retained C++ adapter and its focused tests
 > are library-level inputs only. No native, Isaac/ROS, or real-robot product
-> launcher currently wires it to a qualified runtime owner. The relevant
-> execution and lane gates are I6/N, I9/I, and I10/R.
+> launcher currently wires it to a qualified runtime owner. Native execution
+> is implemented separately in `manyforge_roboplan`; its availability does not
+> make this ROS adapter a product route. Isaac/ROS and physical qualification
+> remain separate lane gates.
 
 `manyforge_ros2_control_execution` is the generic C++ ROS 2 execution
 adapter. It sends `FollowJointTrajectory` goals, observes controller and joint
@@ -23,9 +25,10 @@ The current `manyforge.ros2_control.execution_binding.v0.experimental`
 lifecycle-admission projection, singleton robot/group identities, old
 environment epoch pinning, command-gate topic, and backend-local scene,
 simulation, and gripper semantics are pre-relocation inputs rather than the
-new contract. I6 must consume addressed Program Binding, I7 must supply the
-new lifecycle facts, and I8 must place Stop policy behind the Kernel owner
-before a product route is restored.
+new contract. A product route must consume addressed Program Binding, current
+Manager lifecycle facts and Kernel-owned Stop policy. Those governance owners
+already exist in the native product; this adapter must implement their ports,
+not restore its superseded local owners.
 
 In the captured pre-relocation contract, physical deployments could
 additionally enable an exact controller-binding and lifecycle-admission gate.

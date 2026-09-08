@@ -2,7 +2,8 @@
 
 Historical blob ``7730d7524644c22a3c382f30f6877ba7b27bed19`` at
 ``manyforge@08222188293df8e12f90dc72e204c21f22f92ea1`` contains three cases.
-The camel-case Composer route adapter returns at I9/I.  Scoring already-
+The camel-case route was superseded by the native observation stream and
+current_workbench_browser_collector.py, not a pending restoration. Scoring already-
 normalized observer samples for latency, staleness, fallback, and publisher
 health remains same-role pure behavior and is active now.
 """
@@ -13,9 +14,6 @@ import importlib.util
 from pathlib import Path
 import sys
 from typing import Any, Final
-
-from manyforge_composer.backend.visual_state import VISUAL_STATE_RESTORATION_GATE
-
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -38,9 +36,9 @@ HISTORICAL_CASE_FAMILIES: Final = (
         "composer_route_sample_projection",
         "historical line 23",
         1,
-        ("I9", "I"),
-        "the snake/camel route adapter is recreated only against the new "
-        "observer-owned snapshot contract",
+        (),
+        "superseded by test_execution_observation_stream.py and "
+        "test_current_workbench_browser_collector.py; no historical HTTP sampler",
     ),
     (
         "normalized_latency_staleness_and_no_fallback_scoring",
@@ -54,10 +52,13 @@ HISTORICAL_CASE_FAMILIES: Final = (
 
 
 def test_visual_state_probe_cases_are_fully_disposed() -> None:
-    assert VISUAL_STATE_RESTORATION_GATE == "I9"
     assert sum(family[2] for family in HISTORICAL_CASE_FAMILIES) == 3
-    assert sum(family[2] for family in HISTORICAL_CASE_FAMILIES if family[3]) == 1
-    assert sum(family[2] for family in HISTORICAL_CASE_FAMILIES if not family[3]) == 2
+    assert all(not family[3] for family in HISTORICAL_CASE_FAMILIES)
+    for successor in (
+        "test_execution_observation_stream.py",
+        "test_current_workbench_browser_collector.py",
+    ):
+        assert (Path(__file__).parent / successor).is_file()
 
 
 def test_summary_and_evaluation_fail_on_legacy_stale_and_latency() -> None:

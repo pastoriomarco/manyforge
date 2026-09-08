@@ -2087,6 +2087,7 @@ enum class CommandKind {
   kIdentity,
   kTargets,
   kQueryTarget,
+  kConfirmGrasp,
   kQueryOperation,
   kControlState,
   kObservation,
@@ -2141,6 +2142,16 @@ struct TargetObservationQuery final {
   core::ProgramBindingId program_binding_id;
   core::TargetRoleId target_role_id;
   std::optional<core::FrameRoleId> frame_role_id;
+  bool grasp_confirmation{};
+};
+
+struct GripperConfirmationCommand final {
+  core::PublicRequestContextDTO context;
+  core::ProgramBindingId program_binding_id;
+  core::TargetRoleId target_role_id;
+  core::GripperGraspObservationDTO observation;
+  core::RequestAttributionDTO attribution;
+  core::TimePoint admission_deadline_ns;
 };
 
 struct ProgramOperationQuery final {
@@ -2155,6 +2166,7 @@ struct Command final {
 
   CommandKind kind;
   std::optional<TargetObservationQuery> target_query;
+  std::optional<GripperConfirmationCommand> confirmation;
   std::optional<ProgramOperationQuery> operation_query;
   std::optional<core::OperationIntentDTO> operation;
   std::optional<core::ProgramRunExecutionCaptureDTO> program_capture;
@@ -2275,11 +2287,41 @@ struct Command final {
     RequireExactObjectSize(root, 2U, "targets command");
     return Command{CommandKind::kTargets};
   }
+  if (command == "gripper_confirm") {
+    RequireExactObjectSize(root, 7U, "gripper confirmation command");
+    const auto& request = Member(root, "request");
+    RequireExactObjectSize(request, 8U, "gripper confirmation request");
+    Require(Text(request, "schema_version") == "manyforge.gripper_confirmation_request.v1",
+            "gripper confirmation schema is unsupported");
+    auto context = DecodeRequestContext(Member(request, "request_context"));
+    const auto origin = Text(root, "origin_epoch");
+    Require(!origin.empty() && origin.size() <= 256U, "confirmation ingress origin is invalid");
+    const auto observation_id =
+        content_identity::sha256_digest(canonical_json(CanonicalValue(CanonicalValue::Array{
+            CanonicalValue(origin), CanonicalValue(context.request_id.value())})));
+    Command decoded{CommandKind::kConfirmGrasp};
+    decoded.confirmation = GripperConfirmationCommand{
+        context,
+        core::ProgramBindingId(Text(request, "program_binding_id")),
+        core::TargetRoleId(Text(request, "target_role_id")),
+        core::GripperGraspObservationDTO{
+            {},
+            Counter(request, "command_id", 1U),
+            Counter(request, "generation", 1U),
+            Counter(request, "expected_status_revision", 1U),
+            observation_id,
+            Boolean(request, "confirmed"),
+            content_identity::parse_nonnegative_int64(Member(root, "received_monotonic_ns")),
+            context.source_label},
+        DecodeRequestAttribution(Member(root, "attribution")),
+        content_identity::parse_nonnegative_int64(Member(root, "valid_until_monotonic_ns"))};
+    return decoded;
+  }
   if (command == "query_target") {
     RequireExactObjectSize(root, 3U, "target observation command");
     const auto &query = Member(root, "query");
     const auto kind = Text(query, "kind");
-    Require(kind == "frame_pose" || kind == "gripper_status",
+    Require(kind == "frame_pose" || kind == "gripper_status" || kind == "gripper_confirmation",
             "target observation kind is unsupported");
     RequireExactObjectSize(query, kind == "frame_pose" ? 6U : 5U,
                            "target observation query");
@@ -2291,9 +2333,9 @@ struct Command final {
         core::RequestOwnerEpoch(Text(query, "owner_epoch")),
         core::ProgramBindingId(Text(query, "program_binding_id")),
         core::TargetRoleId(Text(query, "target_role_id")),
-        kind == "frame_pose"
-            ? std::optional(core::FrameRoleId(Text(query, "frame_role_id")))
-            : std::nullopt};
+        kind == "frame_pose" ? std::optional(core::FrameRoleId(Text(query, "frame_role_id")))
+                             : std::nullopt,
+        kind == "gripper_confirmation"};
     return decoded;
   }
   if (command == "query_operation") {
@@ -6015,8 +6057,13 @@ CanonicalNullableText(const std::optional<std::string> &value) {
         [&](const auto &candidate) {
           return candidate.resource_id == resource.resource_id;
         });
-    Require(row != coordinate_map->resources.end() && !row->coordinates.empty(),
+    Require(row != coordinate_map->resources.end(),
             "manual-control gripper descriptor has no exact resource row");
+    Require(resource.source_joint_name.has_value()
+                ? !row->coordinates.empty() && !row->component_local_coordinate_kind.has_value()
+                : row->coordinates.empty() &&
+                      row->component_local_coordinate_kind == resource.coordinate_kind,
+            "manual-control gripper descriptor crosses coordinate semantics");
     for (const auto &coordinate : row->coordinates) {
       if (!coordinate.derived_mimic) {
         continue;
@@ -6283,6 +6330,7 @@ struct Composition final {
   core::JointLimitsDTO direct_control_joint_limits;
   CanonicalValue direct_control_motion_descriptor;
   CanonicalValue direct_control_gripper_descriptor;
+  std::optional<core::Duration> operator_confirmation_validity_ns;
   RetainedPlanningModelStage stage;
   std::shared_ptr<RetainedNativeRuntime> runtime;
   std::shared_ptr<const ProductBackedRuntimeParticipantResolver>
@@ -7253,6 +7301,15 @@ BuildProductComposition(CompositionBuildInput input) {
       input.publication_generation,
       std::move(input.status_motion_target_role_id),
       std::move(input.status_gripper_target_role_id));
+#if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+  for (const auto& target : retained_runtime_configuration.gripper_target_configurations) {
+    const auto& gripper = composition->direct_control_gripper_binding.value();
+    if (target.controllable_component_id == gripper.controllable_component_id &&
+        target.command_target_id == gripper.command_target_id) {
+      composition->operator_confirmation_validity_ns = target.operator_confirmation_validity_ns;
+    }
+  }
+#endif
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
   composition->ros2_control_runtime_handle =
       std::move(ros2_control_runtime_handle);
@@ -9698,12 +9755,64 @@ private:
                            "target route is not reconciled");
     const auto resolved = composition.target_resolver->ResolveObservationTarget(
         query.program_binding_id, query.target_role_id,
-        core::CapabilityId(frame_query ? "model.kinematics.fk"
-                                       : "tool.gripper.feedback"),
+        core::CapabilityId(frame_query                ? "model.kinematics.fk"
+                           : query.grasp_confirmation ? "tool.gripper.confirmation.operator"
+                                                      : "tool.gripper.feedback"),
         observed_binding, representatives.value());
     if (!resolved.ok())
       return ErrorResponse(resolved.error().code, resolved.error().message);
     const auto &target = resolved.value().target.target_role();
+    if (query.grasp_confirmation) {
+      if (!composition.operator_confirmation_validity_ns)
+        return ErrorResponse("grasp_confirmation_unavailable",
+                             "target has no explicit operator confirmation policy");
+      const auto current =
+          composition.runtime->ReadGripperStatus(resolved.value().observation_binding);
+      if (!current.ok()) return ErrorResponse(current.error().code, current.error().message);
+      const auto& status = current.value();
+      if (status.command_id == 0U || status.revision == 0U)
+        return ErrorResponse("gripper_command_unavailable",
+                             "confirmation requires a current gripper command");
+      const auto& source = *resolved.value().observation_binding.value().control_path;
+      const bool fresh =
+          status.grasp_evidence && core::gripper_grasp_evidence_is_fresh(
+                                       *status.grasp_evidence, composition.runtime->clock->now());
+      return CanonicalValue(CanonicalValue::Object{
+          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+          {"command", CanonicalValue("query_target")},
+          {"ok", CanonicalValue(true)},
+          {"target_observation",
+           CanonicalValue(CanonicalValue::Object{
+               {"schema_version", CanonicalValue("manyforge.target_observation.v1")},
+               {"kind", CanonicalValue("gripper_confirmation")},
+               {"owner_epoch", CanonicalValue(owner_epoch_.value())},
+               {"program_binding_id", CanonicalValue(query.program_binding_id.value())},
+               {"target_role_id", CanonicalValue(query.target_role_id.value())},
+               {"source_epoch", CanonicalValue(source.provider_runtime_epoch.value())},
+               {"source_sequence", CanonicalValue(static_cast<double>(status.revision))},
+               {"value",
+                CanonicalValue(CanonicalValue::Object{
+                    {"state", CanonicalValue(core::gripper_command_state_name(status.state))},
+                    {"command_id", CanonicalValue(static_cast<double>(status.command_id))},
+                    {"generation", CanonicalValue(static_cast<double>(status.generation))},
+                    {"revision", CanonicalValue(static_cast<double>(status.revision))},
+                    {"source_id", CanonicalValue(source.control_binding_id.value())},
+                    {"source_revision", CanonicalValue(source.control_binding_revision.value())},
+                    {"source_epoch", CanonicalValue(source.provider_runtime_epoch.value())},
+                    {"active_control_configuration_id",
+                     CanonicalValue(source.active_control_configuration_id.value())},
+                    {"active_control_configuration_generation",
+                     CanonicalValue(static_cast<double>(
+                         source.active_control_configuration_generation.value()))},
+                    {"grasp_confirmed",
+                     fresh ? CanonicalValue(status.grasp_evidence->observation.confirmed)
+                           : CanonicalValue(nullptr)},
+                    {"evidence", status.grasp_evidence ? GraspEvidenceValue(*status.grasp_evidence)
+                                                       : CanonicalValue(nullptr)},
+                })},
+           })},
+      });
+    }
     const auto observed =
         channel->current_state(composition.runtime->clock->now());
     if (!observed.ok())
@@ -9774,20 +9883,27 @@ private:
       if (!composition.runtime->gripper || binding.resources.size() != 1U)
         return ErrorResponse("gripper_feedback_unavailable",
                              "target has no qualified gripper feedback");
-      const auto status = composition.runtime->gripper->get_gripper_status(
-          binding.command_target_id.value());
+      const auto current =
+          composition.runtime->ReadGripperStatus(resolved.value().observation_binding);
+      if (!current.ok()) return ErrorResponse(current.error().code, current.error().message);
+      const auto& status = current.value();
+      const auto& source = *resolved.value().observation_binding.value().control_path;
       value = CanonicalValue(CanonicalValue::Object{
-          {"command_id",
-           CanonicalValue(static_cast<double>(status.command_id))},
-          {"generation",
-           CanonicalValue(static_cast<double>(status.generation))},
+          {"source_id", CanonicalValue(source.control_binding_id.value())},
+          {"source_revision", CanonicalValue(source.control_binding_revision.value())},
+          {"source_epoch", CanonicalValue(source.provider_runtime_epoch.value())},
+          {"active_control_configuration_id",
+           CanonicalValue(source.active_control_configuration_id.value())},
+          {"active_control_configuration_generation",
+           CanonicalValue(
+               static_cast<double>(source.active_control_configuration_generation.value()))},
+          {"command_id", CanonicalValue(static_cast<double>(status.command_id))},
+          {"generation", CanonicalValue(static_cast<double>(status.generation))},
           // No command echo or unqualified evidence label proves a grasp.
           {"grasp_confirmed", CanonicalValue(nullptr)},
-          {"observed_position",
-           CoordinatePositionValue(state.positions.front())},
+          {"observed_position", CoordinatePositionValue(state.positions.front())},
           {"revision", CanonicalValue(static_cast<double>(status.revision))},
-          {"state",
-           CanonicalValue(core::gripper_command_state_name(status.state))},
+          {"state", CanonicalValue(core::gripper_command_state_name(status.state))},
       });
     }
     CanonicalValue::Object result{
@@ -9810,6 +9926,65 @@ private:
         {"command", CanonicalValue("query_target")},
         {"ok", CanonicalValue(true)},
         {"target_observation", CanonicalValue(std::move(result))},
+    });
+  }
+
+  [[nodiscard]] static CanonicalValue GraspEvidenceValue(
+      const core::GripperGraspEvidenceDTO& evidence) {
+    const auto& accepted = evidence.observation;
+    return CanonicalValue(CanonicalValue::Object{
+        {"source_kind", CanonicalValue("operator")},
+        {"source_id", CanonicalValue(evidence.source_id.value())},
+        {"source_revision", CanonicalValue(evidence.source_revision.value())},
+        {"source_epoch", CanonicalValue(evidence.source_epoch.value())},
+        {"observation_id", CanonicalValue(accepted.observation_id)},
+        {"attribution", CanonicalValue(accepted.attribution)},
+        {"command_id", CanonicalValue(static_cast<double>(accepted.command_id))},
+        {"generation", CanonicalValue(static_cast<double>(accepted.generation))},
+        {"confirmed", CanonicalValue(accepted.confirmed)},
+        {"observed_at_ns", content_identity::nonnegative_int64_value(accepted.observed_at_ns)},
+        {"expires_at_ns", content_identity::nonnegative_int64_value(evidence.expires_at_ns)},
+    });
+  }
+
+  [[nodiscard]] CanonicalValue ConfirmGraspResponse(const GripperConfirmationCommand& command,
+                                                    Composition& composition) const {
+    if (command.context.request_owner_epoch != owner_epoch_)
+      return ErrorResponse("stale_request_owner_epoch",
+                           "confirmation names a replaced native owner");
+    if (!composition.operator_confirmation_validity_ns ||
+        !composition.runtime->gripper_state_channel)
+      return ErrorResponse("grasp_confirmation_unavailable",
+                           "target has no explicitly configured operator source");
+    const auto physical = composition.runtime->gripper_state_channel->binding();
+    const auto configuration = composition.runtime->ReadCurrentPublishedRouteConfiguration(
+        physical.value().control_path->control_domain_id);
+    if (!configuration.ok() || !configuration.value())
+      return ErrorResponse("grasp_confirmation_source_stale",
+                           "operator source has no current route configuration");
+    const auto representatives =
+        composition.runtime->ReadCurrentPhysicalParticipants(*configuration.value());
+    if (!representatives.ok())
+      return ErrorResponse(representatives.error().code, representatives.error().message);
+    const auto source = composition.target_resolver->ResolveObservationTarget(
+        command.program_binding_id, command.target_role_id,
+        core::CapabilityId("tool.gripper.confirmation.operator"), physical,
+        representatives.value());
+    if (!source.ok()) return ErrorResponse(source.error().code, source.error().message);
+    auto observation = command.observation;
+    observation.gripper_id = physical.value().command_target_id.value();
+    const auto recorded = composition.runtime->RecordGraspObservation(
+        source.value().observation_binding, observation,
+        *composition.operator_confirmation_validity_ns, command.admission_deadline_ns);
+    if (!recorded.ok()) return ErrorResponse(recorded.error().code, recorded.error().message);
+    return CanonicalValue(CanonicalValue::Object{
+        {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+        {"command", CanonicalValue("gripper_confirm")},
+        {"ok", CanonicalValue(true)},
+        {"owner_epoch", CanonicalValue(owner_epoch_.value())},
+        {"program_binding_id", CanonicalValue(command.program_binding_id.value())},
+        {"target_role_id", CanonicalValue(command.target_role_id.value())},
+        {"confirmation", GraspEvidenceValue(recorded.value())},
     });
   }
 
@@ -10772,6 +10947,9 @@ private:
           {"ok", CanonicalValue(false)},
       });
     }
+    if (command.kind == CommandKind::kConfirmGrasp) {
+      return ConfirmGraspResponse(*command.confirmation, composition);
+    }
     if (command.kind == CommandKind::kPreviewCapabilityCommand) {
       auto preview =
           composition.runtime->addressed_kernel->preview_capability_command(
@@ -11173,6 +11351,7 @@ private:
       case CommandKind::kIdentity:
       case CommandKind::kTargets:
       case CommandKind::kQueryTarget:
+      case CommandKind::kConfirmGrasp:
       case CommandKind::kQueryOperation:
       case CommandKind::kControlState:
       case CommandKind::kObservation:

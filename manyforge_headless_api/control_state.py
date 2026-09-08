@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from contextlib import aclosing
 from dataclasses import dataclass, replace
 from functools import partial
 import json
@@ -130,9 +131,7 @@ def _meaningful_alarm_key(alarms: dict[str, Any]) -> str:
     """Exclude recorder time/counters that do not change alarm meaning."""
 
     payload = {
-        key: value
-        for key, value in alarms.items()
-        if key not in {"state_revision", "timestamp_ns"}
+        key: value for key, value in alarms.items() if key not in {"state_revision", "timestamp_ns"}
     }
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
@@ -141,20 +140,16 @@ def _meaningful_overview_key(overview: dict[str, Any]) -> str:
     """Compare operator status, not reduction/publication bookkeeping."""
 
     payload = {
-        key: value
-        for key, value in overview.items()
-        if key not in {"overview_revision", "basis"}
+        key: value for key, value in overview.items() if key not in {"overview_revision", "basis"}
     }
     components = payload.get("components")
     if isinstance(components, list):
         payload["components"] = [
-            {
-                key: value
-                for key, value in row.items()
-                if key != "generation"
-            }
-            if isinstance(row, dict)
-            else row
+            (
+                {key: value for key, value in row.items() if key != "generation"}
+                if isinstance(row, dict)
+                else row
+            )
             for row in components
         ]
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -163,18 +158,14 @@ def _meaningful_overview_key(overview: dict[str, Any]) -> str:
 def _meaningful_execution_control_key(control_response: Any) -> str:
     """Keep control meaning while motion samples remain Viewer-only."""
 
-    control = (
-        dict(control_response) if isinstance(control_response, dict) else {}
-    )
+    control = dict(control_response) if isinstance(control_response, dict) else {}
     state = control.get("control_state")
     if isinstance(state, dict):
         state = dict(state)
         state.pop("observed_motion", None)
         state.pop("observed_gripper", None)
         control["control_state"] = state
-    return json.dumps(
-        control, sort_keys=True, separators=(",", ":")
-    )
+    return json.dumps(control, sort_keys=True, separators=(",", ":"))
 
 
 def control_shell_fact_key(shell: dict[str, Any], name: str) -> Any:
@@ -187,9 +178,7 @@ def control_shell_fact_key(shell: dict[str, Any], name: str) -> Any:
     if name == "component_overview":
         return _meaningful_overview_key(shell[name])
     if name == "execution_targets":
-        return json.dumps(
-            shell.get(name), sort_keys=True, separators=(",", ":")
-        )
+        return json.dumps(shell.get(name), sort_keys=True, separators=(",", ":"))
     if name == "execution_control_state":
         return _meaningful_execution_control_key(shell.get(name))
     if name == "authoring_admission":
@@ -199,9 +188,7 @@ def control_shell_fact_key(shell: dict[str, Any], name: str) -> Any:
             value.get("admission_generation"),
         )
     if name == "program_cycle":
-        return json.dumps(
-            shell[name], sort_keys=True, separators=(",", ":")
-        )
+        return json.dumps(shell[name], sort_keys=True, separators=(",", ":"))
     return shell.get(name)
 
 
@@ -216,45 +203,11 @@ def _shell_key(shell: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
-def _source_file_semantic_key(path: Path) -> str | None:
-    """Identify owner meaning without treating its freshness pulse as state."""
+def _source_file_observation(path: Path) -> tuple[str | None, int | None]:
+    """Use the existing native codec off-loop, without holding Python's GIL."""
+    from manyforge_headless_py import read_control_source_file_hint
 
-    try:
-        source = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return None
-    if not isinstance(source, dict):
-        return None
-    payload = source.get("payload")
-    if path.name == "manager-source.json" and isinstance(payload, dict):
-        # Manager's two observation counters prove native liveness but do not
-        # alter any operator-visible convergence or command decision.
-        runtime = payload.get("runtime")
-        if isinstance(runtime, dict):
-            observed = runtime.get("observed_units")
-            if isinstance(observed, list):
-                for row in observed:
-                    if isinstance(row, dict):
-                        row.pop("process_observation_sequence", None)
-                        row.pop("source_report_sequence", None)
-    elif path.name == "scene-runtime-source.json" and isinstance(payload, dict):
-        state = payload.get("state")
-        if isinstance(state, dict):
-            # Pose samples are Viewer/scene data, not control-shell health.
-            # Initialization state, identity, error, and counters still wake
-            # this cold path; individual samples and their observation time do
-            # not. A committed object pose also advances logical-scene, whose
-            # own source wake remains authoritative for scene presentation.
-            state.pop("pose_sources", None)
-            state.pop("updated_at_ns", None)
-    meaning = {
-        "api_version": source.get("api_version"),
-        "payload": payload,
-        "source_owner_epoch": source.get("source_owner_epoch"),
-        "source_owner_id": source.get("source_owner_id"),
-        "source_owner_kind": source.get("source_owner_kind"),
-    }
-    return json.dumps(meaning, sort_keys=True, separators=(",", ":"))
+    return read_control_source_file_hint(str(path)) or (None, None)
 
 
 def build_control_projection(
@@ -313,15 +266,9 @@ class HeadlessControlStateSource:
         self._service = service
         self._ingress = ingress
         self._runner_url = program_runner_websocket_url
-        self._watch_paths = tuple(
-            dict.fromkeys(Path(path) for path in cold_watch_paths)
-        )
-        self._watch_roots = tuple(
-            dict.fromkeys(path.parent for path in self._watch_paths)
-        )
-        self._freshness_paths = frozenset(
-            Path(path) for path in cold_freshness_paths
-        )
+        self._watch_paths = tuple(dict.fromkeys(Path(path).absolute() for path in cold_watch_paths))
+        self._watch_roots = tuple(dict.fromkeys(path.parent for path in self._watch_paths))
+        self._freshness_paths = frozenset(Path(path).absolute() for path in cold_freshness_paths)
         if cold_freshness_budget_ns is not None and cold_freshness_budget_ns < 1:
             raise ValueError("cold freshness budget must be positive")
         self._cold_freshness_budget_ns = cold_freshness_budget_ns
@@ -350,9 +297,7 @@ class HeadlessControlStateSource:
             "resync_required": 0,
         }
         self._heartbeat_rtt_ns: deque[int] = deque(maxlen=256)
-        self._active_client_incidents: dict[
-            tuple[str, str], tuple[str, int, str]
-        ] = {}
+        self._active_client_incidents: dict[tuple[str, str], tuple[str, int, str]] = {}
         self._subscriptions: set[ControlStateSubscription] = set()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._runner_task: asyncio.Task[None] | None = None
@@ -360,6 +305,7 @@ class HeadlessControlStateSource:
         self._watch_task: asyncio.Task[None] | None = None
         self._cold_expiry_handle: asyncio.TimerHandle | None = None
         self._watch_keys: dict[Path, str | None] = {}
+        self._watch_modified: dict[Path, int | None] = {}
         self._watch_fresh: dict[Path, bool] = {}
         self._lifecycle_lock = asyncio.Lock()
         self._closed = False
@@ -447,24 +393,70 @@ class HeadlessControlStateSource:
         capture = mapping(mapping(cycle.get("run")).get("capture"))
         runtime = self._facts.runtime if self._facts is not None else None
         scene = mapping(mapping(mapping(runtime).get("sections")).get("logical_scene"))
-        projection = mapping(mapping(mapping(scene.get("payload")).get("access")).get("active_projection"))
+        projection = mapping(
+            mapping(mapping(scene.get("payload")).get("access")).get("active_projection")
+        )
         scene_revision = mapping(projection.get("scene_revision"))
         context: dict[str, str] = {
             "program_source_current": str(self._program_source_current).lower(),
             "cold_source_current": str(self._watch_source_current).lower(),
         }
         for source, names in (
-            (cycle, {key: key for key in ("program_run_id", "program_runner_owner_epoch", "cycle_generation",
-                                         "execution_control_revision", "run_revision", "reset_phase")} | {"state": "cycle_state"}),
-            (capture, {key: key for key in ("program_id", "program_revision", "graph_revision", "retained_bundle_id",
-                                           "program_binding_id", "node_environment_digest")}),
-            (scene, {key: f"scene_{key}" for key in ("source_owner_id", "source_owner_epoch", "source_generation")} |
-                    {"freshness": "scene_source_freshness"}),
-            (scene_revision, {"scene_id": "scene_id", "revision_id": "scene_revision_id", "content_hash": "scene_content_hash"}),
+            (
+                cycle,
+                {
+                    key: key
+                    for key in (
+                        "program_run_id",
+                        "program_runner_owner_epoch",
+                        "cycle_generation",
+                        "execution_control_revision",
+                        "run_revision",
+                        "reset_phase",
+                    )
+                }
+                | {"state": "cycle_state"},
+            ),
+            (
+                capture,
+                {
+                    key: key
+                    for key in (
+                        "program_id",
+                        "program_revision",
+                        "graph_revision",
+                        "retained_bundle_id",
+                        "program_binding_id",
+                        "node_environment_digest",
+                    )
+                },
+            ),
+            (
+                scene,
+                {
+                    key: f"scene_{key}"
+                    for key in (
+                        "source_owner_id",
+                        "source_owner_epoch",
+                        "source_generation",
+                    )
+                }
+                | {"freshness": "scene_source_freshness"},
+            ),
+            (
+                scene_revision,
+                {
+                    "scene_id": "scene_id",
+                    "revision_id": "scene_revision_id",
+                    "content_hash": "scene_content_hash",
+                },
+            ),
         ):
             for name, target in names.items():
                 value = source.get(name)
-                if (isinstance(value, str) and value and len(value.encode("utf-8")) <= 1024) or type(value) is int:
+                if (
+                    isinstance(value, str) and value and len(value.encode("utf-8")) <= 1024
+                ) or type(value) is int:
                     context[target] = str(value)
         return context
 
@@ -641,6 +633,7 @@ class HeadlessControlStateSource:
             self._cold_wake = None
             self._program_wake = None
             self._watch_keys.clear()
+            self._watch_modified.clear()
             self._watch_fresh.clear()
             self._program_source_current = False
             self._watch_source_current = True
@@ -872,11 +865,15 @@ class HeadlessControlStateSource:
                             label="Program control state",
                             maximum_bytes=CONTROL_MAXIMUM_SNAPSHOT_BYTES,
                         )
-                        if set(value) != {
-                            "program_cycle",
-                            "schema_version",
-                            "server_sequence",
-                        } or value.get("schema_version") != _PROGRAM_CONTROL_STATE_SCHEMA:
+                        if (
+                            set(value)
+                            != {
+                                "program_cycle",
+                                "schema_version",
+                                "server_sequence",
+                            }
+                            or value.get("schema_version") != _PROGRAM_CONTROL_STATE_SCHEMA
+                        ):
                             raise ValueError("Program control frame has an invalid shape")
                         sequence_text = value.get("server_sequence")
                         if (
@@ -907,7 +904,13 @@ class HeadlessControlStateSource:
                 self._invalidate_source("program")
             except asyncio.CancelledError:
                 raise
-            except (ConnectionClosed, OSError, TimeoutError, ValueError, HeadlessApiError):
+            except (
+                ConnectionClosed,
+                OSError,
+                TimeoutError,
+                ValueError,
+                HeadlessApiError,
+            ):
                 # Reconnection is source recovery, never command replay. Keep
                 # the newest visual state but stop issuing new frames until a
                 # current owner snapshot arrives.
@@ -922,9 +925,7 @@ class HeadlessControlStateSource:
     async def _capture_facts(self) -> ComponentOverviewFacts:
         cycle = self._cycle
         if cycle is None:
-            raise ControlStateUnavailableError(
-                "program_control_state_synchronizing"
-            )
+            raise ControlStateUnavailableError("program_control_state_synchronizing")
         stop = threading.Event()
         facts = await _drained_owner_read(
             self._service.component_overview_facts,
@@ -936,9 +937,13 @@ class HeadlessControlStateSource:
         # Program may advance while the other independent facts are captured.
         # Replacing that one cached value is sufficient; no owner is reread.
         current_cycle = self._cycle
-        return facts if current_cycle == cycle else replace(
-            facts,
-            program_cycle=current_cycle,
+        return (
+            facts
+            if current_cycle == cycle
+            else replace(
+                facts,
+                program_cycle=current_cycle,
+            )
         )
 
     @staticmethod
@@ -1024,49 +1029,44 @@ class HeadlessControlStateSource:
             if self._watch_source_current:
                 self._source_transition("file_watch", failed=False)
 
-    def _refresh_file_watches(self, *, notify: bool) -> None:
-        """Collapse source pulses and wake only on meaning/freshness changes."""
-
-        now_ns = time.time_ns()
+    async def _refresh_file_watches(
+        self, *, notify: bool, paths: Iterable[Path] | None = None
+    ) -> None:
+        """Read each changed source once, using existing bounded work capacity."""
         changed = False
-        for path in self._watch_paths:
-            key = _source_file_semantic_key(path)
+        selected = self._watch_paths if paths is None else paths
+        for path in selected:
+            key, modified = await _drained_owner_read(_source_file_observation, path=path)
             if path in self._watch_keys and self._watch_keys[path] != key:
                 changed = True
             self._watch_keys[path] = key
-            if path not in self._freshness_paths:
-                continue
-            try:
-                fresh = now_ns - path.stat().st_mtime_ns <= (
-                    self._cold_freshness_budget_ns or 0
-                )
-            except OSError:
-                fresh = False
+            self._watch_modified[path] = modified
+        self._refresh_file_freshness(notify=notify, changed=changed)
+
+    def _refresh_file_freshness(self, *, notify: bool, changed: bool = False) -> None:
+        """One cached deadline; expiry does no file I/O, parsing or hashing."""
+        now_ns = time.time_ns()
+        budget_ns = self._cold_freshness_budget_ns or 0
+        deadlines = []
+        for path in self._freshness_paths:
+            modified = self._watch_modified.get(path)
+            fresh = modified is not None and modified <= now_ns <= modified + budget_ns
             if path in self._watch_fresh and self._watch_fresh[path] != fresh:
                 changed = True
             self._watch_fresh[path] = fresh
+            if fresh:
+                deadlines.append(modified + budget_ns + 1)
 
         if self._cold_expiry_handle is not None:
             self._cold_expiry_handle.cancel()
             self._cold_expiry_handle = None
-        budget_ns = self._cold_freshness_budget_ns
         loop = self._loop
-        if budget_ns is not None and loop is not None and self._subscriptions:
-            deadlines = []
-            for path, fresh in self._watch_fresh.items():
-                if not fresh:
-                    continue
-                try:
-                    deadlines.append(path.stat().st_mtime_ns + budget_ns + 1)
-                except OSError:
-                    changed = True
-                    self._watch_fresh[path] = False
-            if deadlines:
-                delay_ns = max(1, min(deadlines) - time.time_ns())
-                self._cold_expiry_handle = loop.call_later(
-                    delay_ns / 1_000_000_000,
-                    partial(self._refresh_file_watches, notify=True),
-                )
+        if deadlines and loop is not None and self._subscriptions:
+            delay_ns = max(1, min(deadlines) - now_ns)
+            self._cold_expiry_handle = loop.call_later(
+                delay_ns / 1_000_000_000,
+                partial(self._refresh_file_freshness, notify=True),
+            )
         if changed and notify:
             self.notify_cold()
 
@@ -1074,15 +1074,29 @@ class HeadlessControlStateSource:
         retry_seconds = _SOURCE_RETRY_INITIAL_SECONDS
         while self._subscriptions and not self._closed:
             try:
-                self._refresh_file_watches(notify=False)
+                await self._refresh_file_watches(notify=False)
                 self._watch_source_current = True
                 self.notify_cold()  # Recovery captures current owners once.
-                async for _changes in awatch(*self._watch_roots):
-                    if not self._subscriptions or self._closed:
-                        return
-                    self._refresh_file_watches(notify=True)
-                    self._source_transition("file_watch", failed=False)
-                    retry_seconds = _SOURCE_RETRY_INITIAL_SECONDS
+                async with aclosing(awatch(*self._watch_roots)) as watcher:
+                    async for changes in watcher:
+                        if not self._subscriptions or self._closed:
+                            return
+                        paths = {Path(name) for _kind, name in changes}
+                        if any(
+                            root == path or path in root.parents
+                            for root in self._watch_roots
+                            for path in paths
+                        ):
+                            # A root-only remove/rename event invalidates every
+                            # read from that registration. Re-register the same
+                            # watcher and capture current files on recovery.
+                            break
+                        await self._refresh_file_watches(
+                            notify=True,
+                            paths=(path for path in self._watch_paths if path in paths),
+                        )
+                        self._source_transition("file_watch", failed=False)
+                        retry_seconds = _SOURCE_RETRY_INITIAL_SECONDS
                 self._invalidate_source("file_watch")
             except asyncio.CancelledError:
                 raise

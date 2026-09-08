@@ -20,6 +20,12 @@
 
 namespace manyforge::roboplan_backend {
 
+/// Shared exact native realization check. It does not replace current route
+/// reconciliation, qualified-capability selection or observation freshness.
+[[nodiscard]] bool retained_bindings_share_backend_owner(
+    const core::RuntimeParticipantBinding& primary,
+    const core::RuntimeParticipantBinding& representative) noexcept;
+
 class RetainedObservedStateChannelTestAccess;
 
 /// One coalesced notification for the composition's single native viewer

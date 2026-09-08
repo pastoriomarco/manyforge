@@ -175,7 +175,9 @@ def gen_rest_api() -> str:
         "and `/api/control/commands` expose the same state-conditioned ingress "
         "used by the versioned `/ws/control` session; callers submit once and "
         "observe backend-owned lifecycle state. Complete product launch and "
-        "remaining scene/backend capabilities remain unavailable. The "
+        "remaining provider-specific capabilities remain unavailable. Build-owned "
+        "skills are discovered and expanded into ordinary Program trees through "
+        "`/api/skills`; expansion does not edit Draft or execute a command. The "
         "catch-all `/api/{unavailable_path}` operations return the typed "
         "runtime-unavailable response for former product routes.\n\n"
     )
@@ -216,7 +218,42 @@ def gen_headless_rest_api() -> str:
         "bounded at 128, history defaults to and is bounded at 32 records, "
         "ordinary request bodies are bounded at 1 MiB, Program Apply at 17 MiB, "
         "model-attempt audit at 256 KiB, native/HTTP responses at 64 MiB, and "
-        "private Program-runner responses at 32 MiB.\n\n"
+        "private Program-runner responses at 32 MiB. Program diagnostic captures "
+        "are separately limited to 64 KiB and asynchronously written by the existing "
+        "Historian. Their producer-clock values, omissions and delivery losses are "
+        "available through History/debug export and recorder health, not the "
+        "high-rate control/viewer stream. Skill expansion is effect-free, selects "
+        "one exact installed NodeEnvironment and requires ordinary Program/Binding "
+        "validation before any subsequent execution.\n\n"
+    )
+    from manyforge_headless_api.models import GripperConfirmationRequest
+
+    body.extend(
+        [
+            "## Explicit operator gripper confirmation\n\n",
+            "Submit `gripper_confirm` once through `/api/control/commands` or the "
+            "same control WebSocket. Read a current `/api/control/state` freshness "
+            "context and the native execution owner epoch first. The payload uses "
+            "the DTO below plus `expected_execution_owner_epoch`. The transport "
+            "retains `request_context.request_id` but replaces its owner/source "
+            "attribution from the admitted envelope. No caller timestamp, validity "
+            "duration, sensor source or automatic retry is accepted.\n\n",
+            "This requires an explicitly qualified retained "
+            "`tool.gripper.confirmation.operator` binding and configured validity; "
+            "maintained defaults do not enable it. It records an attributed "
+            "operator statement for one completed command, not sensor proof or "
+            "attachment permission. Query `gripper_confirmation` at the existing "
+            "target-observation endpoint; expired evidence is trace only. Program "
+            "`gripper.wait_for_status` consumes the same current evidence.\n\n",
+            "The result carries native confirmation evidence and `history_recorded`. "
+            "That flag means both bounded History submissions were queued, not "
+            "synchronous disk durability. A History failure cannot change native "
+            "acceptance; a lost reply remains unconfirmed and must not be resent "
+            "as a new physical action.\n\n",
+            "```json\n",
+            json.dumps(GripperConfirmationRequest.model_json_schema(), indent=2, sort_keys=True),
+            "\n```\n\n",
+        ]
     )
     _append_openapi_routes(body, spec)
     return "".join(body)
@@ -229,9 +266,7 @@ def gen_mcp_api() -> str:
     from manyforge_composer.backend.state import ComposerState
 
     with tempfile.TemporaryDirectory(prefix="manyforge-mcp-contract-") as state_root:
-        app = create_app(
-            ComposerState(headless_client=object(), authoring_state_root=state_root)
-        )
+        app = create_app(ComposerState(headless_client=object(), authoring_state_root=state_root))
         contracts = tool_contracts(app)
     body = [
         _stamp("gen_mcp_api", "mcp"),
@@ -297,9 +332,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Exit 1 if regeneration would change HEADLESS_REST_API.md.",
     )
-    mcp = subparsers.add_parser(
-        "mcp", help="Regenerate the optional route-derived MCP contract."
-    )
+    mcp = subparsers.add_parser("mcp", help="Regenerate the optional route-derived MCP contract.")
     mcp.add_argument("--check", action="store_true")
     args = parser.parse_args(arguments)
 

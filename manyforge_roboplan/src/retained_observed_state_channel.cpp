@@ -8,6 +8,54 @@
 #include <vector>
 
 namespace manyforge::roboplan_backend {
+/// Control-facing capabilities on one command target may have distinct graph
+/// binding/capability identities while still terminating at the same exact
+/// backend occurrence. Keep that relationship separate from Program aliases,
+/// which must preserve the complete control path.
+[[nodiscard]] bool retained_bindings_share_backend_owner(
+    const core::RuntimeParticipantBinding& primary,
+    const core::RuntimeParticipantBinding& representative) noexcept {
+  const auto& left = primary.value();
+  const auto& right = representative.value();
+  if (!left.control_path.has_value() || !right.control_path.has_value()) {
+    return false;
+  }
+  const auto& left_path = *left.control_path;
+  const auto& right_path = *right.control_path;
+  return left.retained_bundle_id == right.retained_bundle_id &&
+         left.graph_revision == right.graph_revision &&
+         left.controllable_component_id == right.controllable_component_id &&
+         left.component_type_id == right.component_type_id &&
+         left.component_type_revision == right.component_type_revision &&
+         left.command_target_id == right.command_target_id &&
+         left.model_bindings == right.model_bindings && left.model_groups == right.model_groups &&
+         left.frame_bindings == right.frame_bindings && left.resources == right.resources &&
+         left.collision_body_bindings == right.collision_body_bindings &&
+         left.runtime_unit_epochs == right.runtime_unit_epochs &&
+         right.contact_grasp_bindings.empty() &&
+         left_path.control_domain_id == right_path.control_domain_id &&
+         left_path.control_domain_revision == right_path.control_domain_revision &&
+         left_path.control_interface_contract_id == right_path.control_interface_contract_id &&
+         left_path.control_interface_revision == right_path.control_interface_revision &&
+         left_path.controller_topology_id == right_path.controller_topology_id &&
+         left_path.topology_revision == right_path.topology_revision &&
+         left_path.control_route_id == right_path.control_route_id &&
+         left_path.activation_set_id == right_path.activation_set_id &&
+         left_path.active_control_configuration_id == right_path.active_control_configuration_id &&
+         left_path.active_control_configuration_generation ==
+             right_path.active_control_configuration_generation &&
+         left_path.provider_instance_id == right_path.provider_instance_id &&
+         left_path.provider_manifest_id == right_path.provider_manifest_id &&
+         left_path.provider_manifest_revision == right_path.provider_manifest_revision &&
+         left_path.provider_runtime_unit_id == right_path.provider_runtime_unit_id &&
+         left_path.provider_runtime_epoch == right_path.provider_runtime_epoch &&
+         left_path.state_authority_id == right_path.state_authority_id &&
+         left_path.state_authority_class == right_path.state_authority_class &&
+         left_path.stop_evidence_policy_id == right_path.stop_evidence_policy_id &&
+         left_path.stop_evidence_policy_revision == right_path.stop_evidence_policy_revision &&
+         left_path.containment_granularity == right_path.containment_granularity;
+}
+
 namespace {
 
 [[nodiscard]] core::ObservedRobotStateSourceKind

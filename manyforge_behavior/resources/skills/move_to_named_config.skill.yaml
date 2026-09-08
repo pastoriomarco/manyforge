@@ -1,0 +1,68 @@
+api_version: manyforge.skill.v1
+skill_id: move_to_named_config
+version: 1.0.0
+name: Move to named configuration
+description: >-
+  Expand a caller-selected source-model joint configuration into one ordinary
+  motion node. The name is authoring context, not a deployed lookup or authority.
+compatible_profiles: [composable-cell-v1]
+component_roles:
+  robot:
+    required_component_type_tags: [articulated-arm]
+    required_model_roles: [arm_model]
+target_roles:
+  arm:
+    component_role: robot
+    required_capabilities:
+      - {capability_id: execution.feedback.phase_events, parameters: {}, disposition: required}
+      - {capability_id: execution.trajectory.execute, parameters: {}, disposition: required}
+      - {capability_id: planning.motion.joint_goal, parameters: {}, disposition: required}
+      - {capability_id: planning.profile.balanced, parameters: {}, disposition: required}
+      - {capability_id: planning.trajectory.time_parameterized, parameters: {}, disposition: required}
+      - {capability_id: state.observed.current, parameters: {}, disposition: required}
+      - {capability_id: validation.trajectory.non_collision, parameters: {}, disposition: required}
+    required_frame_roles: [base, tcp]
+    required_model_roles: [arm_model]
+parameters:
+  - id: configuration_name
+    required: true
+    schema: {type: string}
+  - id: goal
+    required: true
+    schema: {schema_ref: '#/schema_types/joint_target_list'}
+  - id: velocity_scale
+    required: false
+    default: 1.0
+    schema: {type: float, constraints: {min_exclusive: 0.0, max_inclusive: 1.0}}
+  - id: acceleration_scale
+    required: false
+    default: 1.0
+    schema: {type: float, constraints: {min_exclusive: 0.0, max_inclusive: 1.0}}
+  - id: max_tcp_linear_speed_mps
+    required: true
+    schema: {type: float, constraints: {min_exclusive: 0.0}}
+requires: [Current observed arm state, Exact target Binding, Collision validation before execution]
+provides: [Arm reaches the selected configuration on success]
+modifies: [Arm joint positions]
+body:
+  node_id: motion.move_to_joint_target
+  instance_id: move
+  parameters:
+    target_role: '${target:arm}'
+    base_frame_role: base
+    tcp_frame_role: tcp
+    goal: '${param:goal}'
+    velocity_scale: '${param:velocity_scale}'
+    acceleration_scale: '${param:acceleration_scale}'
+    max_tcp_linear_speed_mps: '${param:max_tcp_linear_speed_mps}'
+  metadata:
+    configuration_name: '${param:configuration_name}'
+  children: []
+example:
+  arguments:
+    configuration_name: home
+    goal: [{joint_name: axis, position_rad: 0.0}]
+    velocity_scale: 0.25
+    max_tcp_linear_speed_mps: 0.1
+  program_declarations: {}
+  effect: Move source-model axis to zero after normal Binding validation and admission.

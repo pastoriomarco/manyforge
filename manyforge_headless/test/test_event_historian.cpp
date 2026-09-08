@@ -74,7 +74,9 @@ HistorianEvent Event(const std::uint64_t index,
       }));
 }
 
-constexpr const char *kRestoreLegacySchema = R"sql(
+constexpr const char* kRestoreLegacySchema = R"sql(
+  ALTER TABLE historian_events DROP COLUMN summary_json;
+  ALTER TABLE historian_events DROP COLUMN summary_digest;
   DROP TABLE historian_search; DROP VIEW historian_search_content;
   DROP TABLE historian_event_keys; DROP TABLE historian_retention;
   DROP INDEX historian_events_utc_idx; DROP INDEX historian_events_clock_idx;
@@ -294,6 +296,43 @@ TEST(EventHistorian, IndexedFiltersFindOlderErrorsAcrossClockDomainsBeforePagina
   ExpectHistorianError([&] { (void)store.Query(query); }, "historian_query_invalid");
   query.clock_owner = "headless.2";
   EXPECT_EQ(store.Query(query).events.size(), 1U);
+}
+
+TEST(EventHistorian, ProgramDiagnosticValuesRemainSearchableButNeverBecomeOwnerIdentities) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "history.sqlite3";
+  const auto event = MakeHistorianEvent(
+      "manyforge.program_runner", "program_failed", "ERROR", 100, "2026-09-08T00:00:00Z",
+      CanonicalValue(CanonicalValue::Object{
+          {"schema_version", CanonicalValue("manyforge.program_diagnostic.v1")},
+          {"program_run_id", CanonicalValue("run.actual")},
+          {"blackboard", CanonicalValue(CanonicalValue::Object{
+                             {"program_run_id", CanonicalValue("run.foreign")}})},
+          {"runtime_overrides", CanonicalValue(CanonicalValue::Object{
+                                    {"operation_id", CanonicalValue("operation.foreign")}})},
+      }));
+  for (const bool reopened : {false, true}) {
+    SqliteEventHistoryStore store(path, 128U);
+    if (!reopened) {
+      EXPECT_EQ(store.Append(event), IEventHistoryStore::AppendStatus::kStored);
+    }
+    HistorianQuery query;
+    query.correlations = {{"program_run_id", "run.actual"}};
+    ASSERT_EQ(store.Query(query).events.size(), 1U);
+    const auto summary_page = store.QuerySummaries(query);
+    const auto& summary =
+        *summary_page.find_object_member("events")->as_array().front().find_object_member("event");
+    EXPECT_EQ(summary.find_object_member("program_run_id")->as_string(), "run.actual");
+    EXPECT_EQ(content_identity::canonical_json(*summary.find_object_member("operation_id")),
+              "null");
+    query.correlations = {{"program_run_id", "run.foreign"}};
+    EXPECT_TRUE(store.Query(query).events.empty());
+    query.correlations = {{"operation_id", "operation.foreign"}};
+    EXPECT_TRUE(store.Query(query).events.empty());
+    query.correlations.clear();
+    query.search = "run.foreign";
+    EXPECT_EQ(store.Query(query).events.size(), 1U);
+  }
 }
 
 TEST(EventHistorian, ClockRegressionsAreNotConfusedWithDelayedOtherOwnersOrOldEvents) {
@@ -596,7 +635,7 @@ TEST(EventHistorian, DiscoveryAndExportUseBoundedExactContinuations) {
   ExpectHistorianError([&] { static_cast<void>(store.Discover("payload_json", "", 32)); }, "historian_query_invalid");
   HistorianQuery query;
   query.limit = 32;
-  const auto exported = HistorianExportPageValue(store.Query(query));
+  const auto exported = HistorianExportPageValue(store.QueryExport(query));
   const auto &rows = exported.find_object_member("events")->as_array();
   ASSERT_EQ(rows.size(), 4U); // the byte bound, not only the row count, owns this page
   EXPECT_TRUE(std::get<bool>(exported.find_object_member("truncated")->storage()));
@@ -695,6 +734,203 @@ TEST(EventHistorian, SummaryPageSelectsListFieldsWithoutPublishingPayload) {
             std::string::npos);
   EXPECT_EQ(encoded.find("diagnostic_blob"), std::string::npos);
   EXPECT_EQ(encoded.find(std::string(1024U, 'x')), std::string::npos);
+}
+
+TEST(EventHistorian, StoredSummariesMatchFullProjectionAcrossFiltersAndPages) {
+  TemporaryDirectory directory;
+  SqliteEventHistoryStore store(directory.path() / "summaries.sqlite3", 2U);
+  for (int i = 1; i <= 6; ++i) {
+    (void)store.Append(MakeHistorianEvent(
+        "manyforge.test", "connection_changed", i % 2 ? "ERROR" : "INFO", i,
+        i == 6 ? "2026-09-08T00:00:00Z" : "2026-09-08T00:00:01Z",
+        CanonicalValue(CanonicalValue::Object{{"clock_owner", CanonicalValue("owner.1")},
+                                              {"program_run_id", CanonicalValue("run.actual")},
+                                              {"message", CanonicalValue("searchable message")}})));
+  }
+  HistorianQuery query;
+  query.limit = 1;
+  for (int filter = 0; filter < 7; ++filter) {
+    if (filter == 1) query.components = {"manyforge."};
+    if (filter == 2) query.event_types = {"connection_changed"};
+    if (filter == 3) query.correlations = {{"program_run_id", "run.actual"}};
+    if (filter == 4) query.search = "searchable";
+    if (filter == 5) query.severities = {"ERROR"};
+    if (filter == 6) query.clock_owner = "owner.1";
+    query.before_sequence.reset();
+    do {
+      const auto full = store.Query(query);
+      EXPECT_EQ(content_identity::canonical_json(store.QuerySummaries(query)),
+                content_identity::canonical_json(HistorianSummaryPageValue(full)));
+      query.before_sequence = full.next_before_sequence;
+    } while (query.before_sequence);
+  }
+}
+
+TEST(EventHistorian, SummaryMigrationPreservesEscapedValuesLossAndStickyClockFacts) {
+  TemporaryDirectory directory;
+  for (const bool corrupt : {false, true}) {
+    const auto path = directory.path() / (corrupt ? "corrupt-v2.sqlite3" : "v2.sqlite3");
+    std::string expected, original;
+    {
+      SqliteEventHistoryStore store(path, 1U);
+      for (int i = 1; i <= 2; ++i) {
+        const std::string escaped(1024, '\1');
+        const auto event = MakeHistorianEvent(
+            escaped, escaped, "ERROR", i, i == 1 ? "2026-09-08T00:00:01Z" : "2026-09-08T00:00:00Z",
+            CanonicalValue(CanonicalValue::Object{{"clock_owner", CanonicalValue(escaped)},
+                                                  {"program_run_id", CanonicalValue(escaped)},
+                                                  {"operation_id", CanonicalValue(escaped)},
+                                                  {"condition_id", CanonicalValue(escaped)},
+                                                  {"message", CanonicalValue(escaped)}}));
+        ASSERT_EQ(store.Append(event), IEventHistoryStore::AppendStatus::kStored);
+        original = content_identity::canonical_json(HistorianPersistenceValue(event));
+      }
+      expected = content_identity::canonical_json(store.QuerySummaries(HistorianQuery{}));
+      EXPECT_GT(expected.size(), 40000U);
+      EXPECT_NE(expected.find("\"wall_clock_regressed\":true"), std::string::npos);
+      EXPECT_NE(expected.find("\"pruned_count\":\"1\""), std::string::npos);
+    }
+    sqlite3* database = nullptr;
+    ASSERT_EQ(sqlite3_open(path.c_str(), &database), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(database,
+                           "ALTER TABLE historian_events DROP COLUMN summary_json;"
+                           "ALTER TABLE historian_events DROP COLUMN summary_digest;"
+                           "UPDATE historian_metadata SET schema_version=2; PRAGMA "
+                           "user_version=2;",
+                           nullptr, nullptr, nullptr),
+              SQLITE_OK);
+    if (corrupt) {
+      ASSERT_EQ(sqlite3_exec(database, "UPDATE historian_events SET payload_json='{}'", nullptr,
+                             nullptr, nullptr),
+                SQLITE_OK);
+    }
+    ASSERT_EQ(sqlite3_close(database), SQLITE_OK);
+    if (!corrupt) {
+      SqliteEventHistoryStore migrated(path, 1U);
+      EXPECT_EQ(content_identity::canonical_json(migrated.QuerySummaries(HistorianQuery{})),
+                expected);
+      EXPECT_EQ(
+          content_identity::canonical_json(HistorianPersistenceValue(migrated.Read(2)->event)),
+          original);
+    } else {
+      ExpectHistorianError([&] { SqliteEventHistoryStore rejected(path, 1U); },
+                           "historian_storage_corrupt");
+      ASSERT_EQ(sqlite3_open(path.c_str(), &database), SQLITE_OK);
+      sqlite3_stmt* version = nullptr;
+      ASSERT_EQ(sqlite3_prepare_v2(database, "PRAGMA user_version", -1, &version, nullptr),
+                SQLITE_OK);
+      ASSERT_EQ(sqlite3_step(version), SQLITE_ROW);
+      EXPECT_EQ(sqlite3_column_int(version, 0), 2);
+      sqlite3_finalize(version);
+      ASSERT_EQ(sqlite3_close(database), SQLITE_OK);
+    }
+  }
+}
+
+TEST(EventHistorian, TamperedSummaryCannotReplaceAnOriginalEvenWithARecomputedDigest) {
+  TemporaryDirectory directory;
+  for (const bool rehashed : {false, true}) {
+    const auto path = directory.path() / (rehashed ? "rehashed.sqlite3" : "tampered.sqlite3");
+    const auto event = Event(1);
+    {
+      SqliteEventHistoryStore store(path);
+      (void)store.Append(event);
+    }
+    const std::string summary = "{}";
+    const auto event_digest = content_identity::sha256_digest(
+        content_identity::canonical_json(HistorianPersistenceValue(event)));
+    const auto digest = content_identity::sha256_digest("manyforge.historian-summary.v1\n1\n" +
+                                                        event_digest + "\n" + summary);
+    sqlite3* database = nullptr;
+    ASSERT_EQ(sqlite3_open(path.c_str(), &database), SQLITE_OK);
+    const std::string sql = "UPDATE historian_events SET summary_json='{}'" +
+                            (rehashed ? ",summary_digest='" + digest + "'" : "");
+    ASSERT_EQ(sqlite3_exec(database, sql.c_str(), nullptr, nullptr, nullptr), SQLITE_OK);
+    ASSERT_EQ(sqlite3_close(database), SQLITE_OK);
+    ExpectHistorianError([&] { SqliteEventHistoryStore rejected(path); },
+                         "historian_storage_corrupt");
+  }
+}
+
+TEST(EventHistorian, V2DiagnosticIndexMigratesOnlyAfterItsHistoricalDerivationIsVerified) {
+  TemporaryDirectory directory;
+  for (const bool corrupt : {false, true}) {
+    const auto path =
+        directory.path() / (corrupt ? "corrupt-index-v2.sqlite3" : "index-v2.sqlite3");
+    const auto event = MakeHistorianEvent(
+        "manyforge.program_runner", "program_failed", "ERROR", 1, "2026-09-08T00:00:00Z",
+        CanonicalValue(CanonicalValue::Object{
+            {"schema_version", CanonicalValue("manyforge.program_diagnostic.v1")},
+            {"program_run_id", CanonicalValue("run.actual")},
+            {"blackboard", CanonicalValue(CanonicalValue::Object{
+                               {"operation_id", CanonicalValue("user.data")}})}}));
+    {
+      SqliteEventHistoryStore store(path);
+      (void)store.Append(event);
+    }
+    sqlite3* database = nullptr;
+    ASSERT_EQ(sqlite3_open(path.c_str(), &database), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(database,
+                           "ALTER TABLE historian_events DROP COLUMN summary_json;"
+                           "ALTER TABLE historian_events DROP COLUMN summary_digest;"
+                           "UPDATE historian_metadata SET schema_version=2; PRAGMA "
+                           "user_version=2;"
+                           "INSERT INTO historian_event_keys(sequence,kind,value) "
+                           "VALUES(1,'operation_id','user.data');",
+                           nullptr, nullptr, nullptr),
+              SQLITE_OK);
+    if (corrupt) {
+      ASSERT_EQ(sqlite3_exec(database,
+                             "UPDATE historian_event_keys SET value='tampered' "
+                             "WHERE kind='operation_id'",
+                             nullptr, nullptr, nullptr),
+                SQLITE_OK);
+    }
+    ASSERT_EQ(sqlite3_close(database), SQLITE_OK);
+    if (corrupt) {
+      ExpectHistorianError([&] { SqliteEventHistoryStore rejected(path); },
+                           "historian_storage_corrupt");
+    } else {
+      SqliteEventHistoryStore migrated(path);
+      HistorianQuery query;
+      query.correlations = {{"operation_id", "user.data"}};
+      EXPECT_TRUE(migrated.Query(query).events.empty());
+      query.correlations = {{"program_run_id", "run.actual"}};
+      EXPECT_EQ(migrated.Query(query).events.size(), 1U);
+      EXPECT_EQ(content_identity::canonical_json(migrated.Read(1)->event.payload),
+                content_identity::canonical_json(event.payload));
+    }
+  }
+}
+
+TEST(EventHistorian, LargeStructuredPayloadsDoNotMakeListOrExportDecodeDiscardedRows) {
+  TemporaryDirectory directory;
+  SqliteEventHistoryStore store(directory.path() / "large-tree.sqlite3");
+  const CanonicalValue payload(CanonicalValue::Object{
+      {"data", CanonicalValue(CanonicalValue::Array(120000, CanonicalValue(0.0)))}});
+  for (int i = 1; i <= 32; ++i) {
+    (void)store.Append(MakeHistorianEvent("manyforge.test", "diagnostic", "INFO", i,
+                                          "2026-09-08T00:00:00Z", payload));
+  }
+  HistorianQuery query;
+  query.limit = 32;
+  const auto summaries = store.QuerySummaries(query);
+  EXPECT_EQ(summaries.find_object_member("events")->as_array().size(), 32U);
+  EXPECT_LT(content_identity::canonical_json(summaries).size(), 32768U);
+  std::uint64_t expected = 32;
+  do {
+    const auto page = store.QueryExport(query);
+    ASSERT_FALSE(page.events.empty());
+    EXPECT_LE(page.events.size(), 4U);
+    for (const auto& row : page.events) EXPECT_EQ(row.sequence, expected--);
+    const auto encoded = HistorianExportPageValue(page);
+    EXPECT_EQ(encoded.find_object_member("events")->as_array().size(), page.events.size());
+    EXPECT_LE(content_identity::canonical_json(encoded).size(), 1024U * 1024U);
+    query.before_sequence = page.next_before_sequence;
+  } while (query.before_sequence);
+  EXPECT_EQ(expected, 0U);
+  EXPECT_EQ(content_identity::canonical_json(store.Read(32)->event.payload),
+            content_identity::canonical_json(payload));
 }
 
 TEST(EventHistorian, DetailPublishesOnlyTypedSourceBackedSections) {
