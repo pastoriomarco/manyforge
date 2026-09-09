@@ -1,4 +1,4 @@
-import { Euler, Quaternion, Vector3 } from 'three';
+import { Euler, Matrix4, Quaternion, Vector3 } from 'three';
 import type { ProgramBindingDocument } from '../types/api';
 import type { PoseTuple } from './poseTransforms';
 
@@ -8,6 +8,21 @@ export interface CartesianMoveDraftOptions {
   orientationMode: MoveToOrientationMode;
   offsetXyzM: [number, number, number];
   offsetRpyRad: [number, number, number];
+}
+
+export const DEFAULT_MOVE_TO_OPTIONS: CartesianMoveDraftOptions = {
+  orientationMode: 'keep-current', offsetXyzM: [0, 0, 0], offsetRpyRad: [0, 0, 0],
+};
+
+export type MoveToDraftSource =
+  | { id: string; kind: 'pose'; pose: PoseTuple }
+  | { id: string; kind: 'joint'; positionsRad: number[] };
+
+export interface MoveToDraft {
+  source: MoveToDraftSource;
+  /** Capture once; live observations must not rotate an authored offset. */
+  currentTcpPose: PoseTuple;
+  options: CartesianMoveDraftOptions;
 }
 
 export interface StoredPoseResolutionContext {
@@ -186,10 +201,45 @@ export function computeCartesianMoveDraft(
   );
   orientation.multiply(delta).normalize();
   const position = new Vector3(...entityPose.position).add(
-    new Vector3(...options.offsetXyzM).applyQuaternion(orientation),
+    new Vector3(...options.offsetXyzM).applyQuaternion(new Quaternion(...entityPose.quaternion).normalize()),
   );
   return {
     position: [position.x, position.y, position.z],
     quaternion: [orientation.x, orientation.y, orientation.z, orientation.w],
+  };
+}
+
+/** Inverse of the manual source-relative draft, not stored Program semantics. */
+export function cartesianMoveOffsetsFromTarget(
+  entityPose: PoseTuple,
+  currentTcpPose: PoseTuple | null,
+  options: CartesianMoveDraftOptions,
+  target: PoseTuple,
+): CartesianMoveDraftOptions | null {
+  if (!finitePose(entityPose) || !finitePose(target)) return null;
+  const reference = selectedOrientation(options.orientationMode, entityPose, currentTcpPose);
+  if (reference === null) return null;
+  const offset = new Vector3(...target.position).sub(new Vector3(...entityPose.position))
+    .applyQuaternion(new Quaternion(...entityPose.quaternion).normalize().invert());
+  const rotation = reference.invert().multiply(new Quaternion(...target.quaternion).normalize()).normalize();
+  const matrix = new Matrix4().makeRotationFromQuaternion(rotation).elements;
+  const cosine = Math.hypot(matrix[0], matrix[4]);
+  const pitch = Math.atan2(matrix[8], cosine);
+  // Unlike display-only Euler extraction, do not flatten a merely near-
+  // singular rotation. At the singularity retain the previous yaw gauge.
+  const yaw = cosine > 1e-10 ? Math.atan2(-matrix[4], matrix[0]) : options.offsetRpyRad[2];
+  const roll = cosine > 1e-10 ? Math.atan2(-matrix[9], matrix[10])
+    : Math.atan2(matrix[6], matrix[5]) - Math.sign(pitch) * yaw;
+  // Choose the nearest equivalent Euler representation to keep the fields
+  // continuous across +/-pi. The target itself always remains a quaternion.
+  const near = (angle: number, previous: number) => angle + 2 * Math.PI * Math.round((previous - angle) / (2 * Math.PI));
+  const candidates = [[roll, pitch, yaw], [roll + Math.PI, Math.PI - pitch, yaw + Math.PI]]
+    .map((angles) => angles.map((angle, index) => near(angle, options.offsetRpyRad[index])));
+  const distance = (angles: number[]) => angles.reduce((sum, angle, index) => sum + (angle - options.offsetRpyRad[index]) ** 2, 0);
+  const angles = distance(candidates[0]) <= distance(candidates[1]) ? candidates[0] : candidates[1];
+  return {
+    ...options,
+    offsetXyzM: [offset.x, offset.y, offset.z],
+    offsetRpyRad: angles as [number, number, number],
   };
 }

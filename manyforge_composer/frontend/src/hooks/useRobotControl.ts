@@ -1,12 +1,13 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useReducer,
   useRef,
   useState,
 } from 'react';
-import { api } from '../api/client';
+import { api, ApiError } from '../api/client';
 import { parseRuntimeScaleControlAccepted } from '../api/parsers';
 import {
   buildPreviewIntent,
@@ -18,10 +19,12 @@ import {
 } from '../state/robotControl';
 import type { ComposerHeadlessState } from '../types/headless';
 import type { HeadlessStateSource } from './useHeadlessState';
-import type { RobotControlState } from '../state/robotControl';
+import type { ManualMotionSettings, RobotControlState } from '../state/robotControl';
 import type { RobotControlMode } from '../state/robotControl';
+import type { CartesianMoveDraftOptions, MoveToDraftSource } from '../utils/moveTo';
 import type {
   DirectControlOperationIntent,
+  ExecutionOwnerStatus,
   Pose3Value,
   RuntimeScaleControlAccepted,
   RuntimeScaleControlStatus,
@@ -36,6 +39,30 @@ function errorMessage(error: unknown, fallback: string): string {
   return error instanceof Error && error.message.trim()
     ? error.message
     : fallback;
+}
+
+/** Expected draft rejection is panel feedback, not an execution incident. */
+export function previewTargetRejection(error: unknown): string | null {
+  if (!(error instanceof ApiError)) return null;
+  const detail = (error.payload as {
+    detail?: { code?: string; details?: { reason?: string } };
+  } | null)?.detail;
+  // The current proxy also uses HTTP 500 for these normal negative results.
+  // Match the owner's exact result, never its broad code or HTTP status alone:
+  // IK/planner transport failures use those same broad codes.
+  if (detail?.code === 'ik_failed' && detail.details?.reason === 'native_ik_no_solution') {
+    return 'No collision-free pose found. The target may be out of reach, outside joint limits, or in collision. Change its position or orientation.';
+  }
+  if (detail?.code === 'planning_failed' && detail.details?.reason === 'native_goal_state_collision') {
+    return 'The robot would collide at the target. Change its position or orientation.';
+  }
+  if (detail?.code === 'planning_failed' && detail.details?.reason === 'native_start_state_collision') {
+    return 'The current robot pose is in collision. Planning cannot start from this pose.';
+  }
+  if (detail?.code === 'planning_failed' && detail.details?.reason === 'native_rrt_failed') {
+    return 'No valid path found for this target. Try another position or orientation.';
+  }
+  return null;
 }
 
 const RUNTIME_SCALE_SEND_INTERVAL_MS = 250;
@@ -111,6 +138,8 @@ export function acceptedRuntimeScaleStatus(
 
 export interface RobotControlController {
   state: RobotControlState;
+  /** Current owner projection, unlike state.status retained for presentation. */
+  currentStatus: ExecutionOwnerStatus | null;
   controlPending: 'stop' | 'pause' | 'resume' | 'reset' | null;
   runtimeScaleStatus: RuntimeScaleControlStatus | null;
   runtimeScaleDraft: number;
@@ -119,10 +148,17 @@ export interface RobotControlController {
   fullStopPending: boolean;
   fullStopError: string | null;
   selectMode: (mode: RobotControlMode) => void;
+  selectMoveToSource: (source: MoveToDraftSource) => void;
+  editMoveToOptions: (update: Partial<CartesianMoveDraftOptions>) => void;
+  beginPoseDrag: () => boolean;
+  finishPoseDrag: (pose: Pose3Value | null) => void;
+  authoringPending: boolean;
+  reportAuthoringPending: (label: string, pending: boolean) => void;
   editMoveToJoints: (positionsRad: number[]) => void;
   editJoint: (jointIndex: number, positionRad: number) => void;
   editPose: (pose: Pose3Value) => void;
   editGripper: (position: number) => void;
+  editMotionSettings: (update: Partial<ManualMotionSettings>) => void;
   approve: () => Promise<void>;
   revert: () => void;
   stop: () => Promise<void>;
@@ -160,6 +196,17 @@ export function useRobotControl(
   const [fullStopError, setFullStopError] = useState<string | null>(null);
   const fullStopRequest = useRef<{ ownerEpoch: string } | null>(null);
   const approveInFlight = useRef<{ ownerEpoch: string; generation: number } | null>(null);
+  const dragGeneration = useRef<number | null>(null);
+  useLayoutEffect(() => {
+    if (!state.poseDragging) dragGeneration.current = null;
+  }, [state.poseDragging, state.generation]);
+  const pendingAuthoringInputs = useRef(new Set<string>());
+  const [authoringPending, setAuthoringPending] = useState(false);
+  const reportAuthoringPending = useCallback((label: string, pending: boolean) => {
+    if (pending) pendingAuthoringInputs.current.add(label);
+    else pendingAuthoringInputs.current.delete(label);
+    setAuthoringPending(pendingAuthoringInputs.current.size > 0);
+  }, []);
   const pendingOperationControl = useRef<{
     control: 'stop' | 'pause' | 'resume' | 'reset'; ownerEpoch: string; operationId: string;
   } | null>(null);
@@ -208,6 +255,7 @@ export function useRobotControl(
       !enabled
       || observeProgramRun
       || state.phase !== 'planning'
+      || state.poseDragging
       || previewStatus === null
     ) return undefined;
     const generation = state.generation;
@@ -218,10 +266,12 @@ export function useRobotControl(
       draftPositionsRad: state.draftPositionsRad,
       draftPose: state.draftPose,
       draftGripperPosition: state.draftGripperPosition,
+      motionSettings: state.motionSettings,
     };
     const controller = new AbortController();
     let current = true;
     const timer = window.setTimeout(() => {
+      if (dragGeneration.current !== null) return;
       let intent: DirectControlOperationIntent;
       try {
         intent = buildPreviewIntent(previewDraft, requestId());
@@ -251,6 +301,7 @@ export function useRobotControl(
               type: 'preview_rejected',
               generation,
               error: errorMessage(error, 'Motion preview failed.'),
+              targetRejection: previewTargetRejection(error),
             });
           }
         });
@@ -266,10 +317,12 @@ export function useRobotControl(
     state.draftPositionsRad,
     state.draftPose,
     state.draftGripperPosition,
+    state.motionSettings,
     state.generation,
     state.mode,
     state.moveToKind,
     state.phase,
+    state.poseDragging,
     // The reducer advances generation when an owner/binding/scene fence changes.
     // Fresh observations alone must not restart a valid in-progress preview.
   ]);
@@ -542,6 +595,27 @@ export function useRobotControl(
     dispatch({ type: 'edit_move_to_joint', positionsRad: [...positionsRad] });
   }, []);
 
+  const selectMoveToSource = useCallback((source: MoveToDraftSource) => {
+    if (!programRunActive.current) dispatch({ type: 'select_move_source', source });
+  }, []);
+  const editMoveToOptions = useCallback((update: Partial<CartesianMoveDraftOptions>) => {
+    if (!programRunActive.current) dispatch({ type: 'edit_move_options', update });
+  }, []);
+  const beginPoseDrag = useCallback(() => {
+    if (programRunActive.current || !enabled || headlessSnapshot?.executionControlStatus == null || state.operation?.resident
+      || robotControlHasActiveOperation(state) || approveInFlight.current !== null
+      || !['pose_goal', 'cartesian_path', 'move_to'].includes(state.mode)
+      || (state.mode === 'move_to' && state.moveToDraft?.source.kind !== 'pose')
+      || pendingAuthoringInputs.current.size > 0 || state.poseDragging) return false;
+    dragGeneration.current = state.generation + 1;
+    dispatch({ type: 'begin_pose_drag' });
+    return true;
+  }, [state, enabled, headlessSnapshot?.executionControlStatus]);
+  const finishPoseDrag = useCallback((pose: Pose3Value | null) => {
+    const generation = dragGeneration.current;
+    if (generation !== null) dispatch({ type: 'finish_pose_drag', generation, pose });
+  }, []);
+
   const editPose = useCallback((pose: Pose3Value) => {
     if (programRunActive.current) return;
     dispatch({ type: 'edit_pose', pose });
@@ -552,9 +626,17 @@ export function useRobotControl(
     dispatch({ type: 'edit_gripper', position });
   }, []);
 
+  const editMotionSettings = useCallback((update: Partial<ManualMotionSettings>) => {
+    if (programRunActive.current) return;
+    dispatch({ type: 'edit_motion_settings', update });
+  }, []);
+
   const approve = useCallback(async () => {
     if (
       approveInFlight.current !== null
+      || dragGeneration.current !== null
+      || state.poseDragging
+      || pendingAuthoringInputs.current.size > 0
       || programRunActive.current
       || state.phase !== 'ready'
       || state.intent === null
@@ -586,7 +668,7 @@ export function useRobotControl(
     } finally {
       if (approveInFlight.current === pending) approveInFlight.current = null;
     }
-  }, [controlSource, state.generation, state.intent, state.phase, state.preview, state.status]);
+  }, [controlSource, state.generation, state.intent, state.phase, state.preview, state.status, state.poseDragging]);
 
   const revert = useCallback(() => {
     if (programRunActive.current) return;
@@ -687,6 +769,7 @@ export function useRobotControl(
 
   return useMemo(() => ({
     state,
+    currentStatus: headlessSnapshot?.executionControlStatus ?? null,
     controlPending,
     runtimeScaleStatus,
     runtimeScaleDraft,
@@ -695,10 +778,17 @@ export function useRobotControl(
     fullStopPending,
     fullStopError,
     selectMode,
+    selectMoveToSource,
+    editMoveToOptions,
+    beginPoseDrag,
+    finishPoseDrag,
+    authoringPending,
+    reportAuthoringPending,
     editMoveToJoints,
     editJoint,
     editPose,
     editGripper,
+    editMotionSettings,
     approve,
     revert,
     stop,
@@ -716,6 +806,7 @@ export function useRobotControl(
     approve,
     controlPending,
     editGripper,
+    editMotionSettings,
     editMoveToJoints,
     editJoint,
     editPose,
@@ -731,9 +822,16 @@ export function useRobotControl(
     runtimeScalePending,
     runtimeScaleStatus,
     selectMode,
+    selectMoveToSource,
+    editMoveToOptions,
+    beginPoseDrag,
+    finishPoseDrag,
+    authoringPending,
+    reportAuthoringPending,
     setRuntimeScale,
     commitRuntimeScale,
     state,
+    headlessSnapshot?.executionControlStatus,
     stop,
     fullStop,
     dismissFullStopError,

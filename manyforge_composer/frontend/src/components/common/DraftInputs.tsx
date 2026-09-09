@@ -21,6 +21,7 @@ type DraftTextInputProps = Omit<
   resetKey?: string | number;
   shiftStepMultiplier?: number;
   commitNativeStep?: boolean;
+  validateOnInput?: boolean;
   dirtyClassName?: string;
 };
 
@@ -33,6 +34,7 @@ export function DraftTextInput({
   resetKey,
   shiftStepMultiplier,
   commitNativeStep,
+  validateOnInput,
   dirtyClassName,
   onBlur,
   onFocus,
@@ -45,7 +47,6 @@ export function DraftTextInput({
   const [invalidMessage, setInvalidMessage] = useState<string | null>(null);
   const skipNextCommit = useRef(false);
   const inputRef = useRef<HTMLInputElement | null>(null);
-  const sawBeforeInput = useRef(false);
   const userEdited = useRef(false);
 
   useEffect(() => {
@@ -96,34 +97,58 @@ export function DraftTextInput({
   useEffect(() => {
     const input = inputRef.current;
     if (!commitNativeStep || input === null) return undefined;
-    const onBeforeInput = () => {
-      sawBeforeInput.current = true;
-    };
     const onInput = (event: Event) => {
       const inputEvent = event as InputEvent;
-      const typedEdit = sawBeforeInput.current || Boolean(inputEvent.inputType);
-      sawBeforeInput.current = false;
-      if (typedEdit) return;
-      const candidate = input.value;
+      // Firefox's number spinner emits insertReplacementText without focusing
+      // the input; Chromium emits a plain input event. Neither is an unfinished
+      // typed draft. Text, paste and IME edits still commit on Enter/blur.
+      const nativeStep = !inputEvent.isComposing
+        && (!inputEvent.inputType || inputEvent.inputType === 'insertReplacementText');
+      let candidate = input.value;
       userEdited.current = true;
+      if (!nativeStep) {
+        const message = validate?.(candidate) ?? null;
+        setDraft(candidate);
+        if (validateOnInput) {
+          setInvalidMessage(message);
+          onInvalidChange?.(message);
+        }
+        onPendingChange?.(candidate !== normalizedValue || message !== null);
+        return;
+      }
+      if (candidate.trim() && Number.isFinite(Number(candidate))) {
+        candidate = String(Math.min(
+          props.max === undefined ? Infinity : Number(props.max),
+          Math.max(props.min === undefined ? -Infinity : Number(props.min), Number(candidate)),
+        ));
+      }
       const message = validate?.(candidate) ?? null;
       setDraft(candidate);
       setInvalidMessage(message);
       onInvalidChange?.(message);
-      if (message === null && candidate !== normalizedValue) onCommit(candidate);
+      if (message === null) {
+        userEdited.current = false;
+        onPendingChange?.(false);
+        if (candidate !== normalizedValue) onCommit(candidate);
+      }
     };
-    input.addEventListener('beforeinput', onBeforeInput);
     input.addEventListener('input', onInput);
     return () => {
-      input.removeEventListener('beforeinput', onBeforeInput);
       input.removeEventListener('input', onInput);
     };
-  }, [commitNativeStep, normalizedValue, onCommit, onInvalidChange, validate]);
+  }, [commitNativeStep, normalizedValue, onCommit, onInvalidChange, onPendingChange,
+    props.min, props.max, validate, validateOnInput]);
 
   return (
     <input
       ref={inputRef}
       {...props}
+      // Native stepping must be relative to the displayed value, not an HTML
+      // grid anchored to a radian-to-degree converted limit. Firefox can round
+      // back to the same grid point indefinitely. Validate typed bounds and
+      // clamp native/keyboard steps above instead (as in the former panel).
+      min={commitNativeStep ? undefined : props.min}
+      max={commitNativeStep ? undefined : props.max}
       className={`${props.className ?? ''}${
         dirtyClassName && draft !== normalizedValue ? ` ${dirtyClassName}` : ''
       }${invalidMessage ? ' draft-input-invalid' : ''}`.trim()}
@@ -135,10 +160,18 @@ export function DraftTextInput({
         onFocus?.(event);
       }}
       onChange={(event) => {
+        // One native input writer for numeric controls; do not let React's
+        // delegated change restore the pre-commit text or mark it pending.
+        if (commitNativeStep) return;
         const next = event.target.value;
         userEdited.current = true;
         setDraft(next);
-        onPendingChange?.(next !== normalizedValue || (validate?.(next) ?? null) !== null);
+        const message = validate?.(next) ?? null;
+        if (validateOnInput) {
+          setInvalidMessage(message);
+          onInvalidChange?.(message);
+        }
+        onPendingChange?.(next !== normalizedValue || message !== null);
       }}
       onBlur={(event) => {
         if (skipNextCommit.current) skipNextCommit.current = false;
@@ -173,7 +206,11 @@ export function DraftTextInput({
               const message = validate?.(next) ?? null;
               setInvalidMessage(message);
               onInvalidChange?.(message);
-              if (message === null && next !== normalizedValue) onCommit(next);
+              if (message === null) {
+                userEdited.current = false;
+                onPendingChange?.(false);
+                if (next !== normalizedValue) onCommit(next);
+              }
             }
             event.preventDefault();
             return;

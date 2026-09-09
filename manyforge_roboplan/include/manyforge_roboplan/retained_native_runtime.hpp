@@ -195,6 +195,8 @@ struct RetainedNativeRuntimeInput final {
   /// Independent Deployment-authored cap for this exact motion target.  It
   /// tightens, but never relabels or weakens, the immutable runtime policy.
   std::optional<double> deployment_maximum_tcp_linear_speed_mps{};
+  /// Retained manual-motion ceilings for the exact motion binding above.
+  core::PerJointDynamicsLimitsDTO direct_control_joint_limits{};
 };
 
 /// Owning native composition root. Destruction order is deliberate: the public
@@ -251,6 +253,7 @@ struct RetainedNativeRuntime final
   /// grant a second policy owner.
   std::optional<core::RuntimeParticipantPolicySelection> motion_runtime_policy;
   std::optional<double> deployment_maximum_tcp_linear_speed_mps;
+  core::PerJointDynamicsLimitsDTO direct_control_joint_limits;
 
   std::shared_ptr<core::ICollisionWorldSnapshotPublisher> collision_publisher;
   std::shared_ptr<core::ICollisionQueryEngine> runtime_collision_engine;

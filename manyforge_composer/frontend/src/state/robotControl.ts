@@ -10,6 +10,9 @@ import type {
   OperationStateName,
   Pose3Value,
 } from '../types/robotControl';
+import { cartesianMoveOffsetsFromTarget, computeCartesianMoveDraft, DEFAULT_MOVE_TO_OPTIONS } from '../utils/moveTo';
+import type { CartesianMoveDraftOptions, MoveToDraft, MoveToDraftSource } from '../utils/moveTo';
+import { poseTupleFromValue, poseValueFromTuple, samePose } from '../utils/poseTransforms';
 
 export const ROBOT_CONTROL_AUTHOR_DEBOUNCE_MS = 150;
 
@@ -51,20 +54,47 @@ const IDENTITY_POSE: Pose3Value = {
   orientation: { x: 0, y: 0, z: 0, w: 1 },
 };
 
+export interface ManualMotionSettings {
+  velocityScale: number;
+  accelerationScale: number;
+  tcpLinearSpeedMps: number;
+  tcpAngularSpeedRadS: number;
+  tcpLinearAccelerationMps2: number;
+  tcpAngularAccelerationRadS2: number;
+  jointLimits: Record<string, {
+    max_velocity_rad_s?: number | null;
+    max_acceleration_rad_s2?: number | null;
+  }>;
+}
+
+const DEFAULT_MANUAL_MOTION_SETTINGS: ManualMotionSettings = {
+  velocityScale: 1,
+  accelerationScale: 1,
+  tcpLinearSpeedMps: 0.1,
+  tcpAngularSpeedRadS: 0.5,
+  tcpLinearAccelerationMps2: 0.5,
+  tcpAngularAccelerationRadS2: 2.5,
+  jointLimits: {},
+};
+
 export interface RobotControlState {
   status: ExecutionOwnerStatus | null;
   phase: RobotControlPhase;
   mode: RobotControlMode;
   moveToKind: 'pose' | 'joint';
+  moveToDraft: MoveToDraft | null;
+  poseDragging: boolean;
   draftPositionsRad: number[];
   draftPose: Pose3Value;
   draftGripperPosition: number | null;
+  motionSettings: ManualMotionSettings;
   generation: number;
   intent: DirectControlOperationIntent | null;
   preview: DirectControlPreviewReceipt | null;
   ghost: MotionPreviewReceipt | null;
   ghostStale: boolean;
   operation: OperationObservation | null;
+  previewIssue: string | null;
   error: string | null;
 }
 
@@ -79,8 +109,13 @@ export type RobotControlAction =
   | { type: 'edit'; positionsRad: number[] }
   | { type: 'edit_joint'; jointIndex: number; positionRad: number }
   | { type: 'edit_move_to_joint'; positionsRad: number[] }
+  | { type: 'select_move_source'; source: MoveToDraftSource }
+  | { type: 'edit_move_options'; update: Partial<CartesianMoveDraftOptions> }
+  | { type: 'begin_pose_drag' }
+  | { type: 'finish_pose_drag'; generation: number; pose: Pose3Value | null }
   | { type: 'edit_pose'; pose: Pose3Value }
   | { type: 'edit_gripper'; position: number }
+  | { type: 'edit_motion_settings'; update: Partial<ManualMotionSettings> }
   | {
       type: 'preview_started';
       generation: number;
@@ -91,7 +126,7 @@ export type RobotControlAction =
       generation: number;
       receipt: DirectControlPreviewReceipt;
     }
-  | { type: 'preview_rejected'; generation: number; error: string }
+  | { type: 'preview_rejected'; generation: number; error: string; targetRejection?: string | null }
   | { type: 'approve_started' }
   | { type: 'approve_rejected'; generation: number; error: string }
   | { type: 'retry_preview' }
@@ -106,15 +141,19 @@ export const initialRobotControlState: RobotControlState = {
   phase: 'loading',
   mode: 'joint',
   moveToKind: 'pose',
+  moveToDraft: null,
+  poseDragging: false,
   draftPositionsRad: [],
   draftPose: IDENTITY_POSE,
   draftGripperPosition: null,
+  motionSettings: DEFAULT_MANUAL_MOTION_SETTINGS,
   generation: 0,
   intent: null,
   preview: null,
   ghost: null,
   ghostStale: false,
   operation: null,
+  previewIssue: null,
   error: null,
 };
 
@@ -127,6 +166,13 @@ function copyPose(pose: Pose3Value): Pose3Value {
 
 export function operationStateIsTerminal(state: OperationStateName): boolean {
   return TERMINAL_OPERATION_STATES.has(state);
+}
+
+/** Presentation only: clean terminal results retire automatically at the owner. */
+export function manualOperationRequiresRecovery(operation: OperationObservation | null): boolean {
+  return operation?.resident === true && operationStateIsTerminal(operation.state)
+    && (operation.terminalError !== null
+      || ['failed', 'interrupted', 'intervention_required'].includes(operation.state));
 }
 
 export function robotControlHasActiveOperation(
@@ -165,6 +211,32 @@ function positionsAreValid(
         && position >= joint.minPositionRad
         && position <= joint.maxPositionRad;
     });
+}
+
+function motionSettingsAreValid(status: ExecutionOwnerStatus, settings: ManualMotionSettings): boolean {
+  const { jointLimits, ...values } = settings;
+  const descriptor = status.directControl.targetDescriptor;
+  return Object.values(values).every((value) => Number.isFinite(value) && value > 0)
+    && settings.velocityScale <= 1 && settings.accelerationScale <= 1
+    && settings.tcpLinearSpeedMps <= (descriptor.operationalLimit?.effectiveMaximumTcpLinearSpeedMps ?? Infinity)
+    && Object.entries(jointLimits).every(([name, limit]) => {
+      const joint = descriptor.joints.find((entry) => entry.sourceJointName === name);
+      if (joint === undefined) return false;
+      const ceiling = descriptor.operationalJointLimits.find((entry) => entry.sourceJointName === name);
+      return Object.values(limit).every((value) => value == null || (Number.isFinite(value) && value > 0))
+        && (limit.max_velocity_rad_s == null
+          || limit.max_velocity_rad_s <= (ceiling?.effectiveMaxVelocityRadS ?? joint.maxVelocityRadS))
+        && (limit.max_acceleration_rad_s2 == null
+          || limit.max_acceleration_rad_s2 <= (ceiling?.effectiveMaxAccelerationRadS2 ?? joint.maxAccelerationRadS2 ?? Infinity));
+    });
+}
+
+function initialMotionSettings(status: ExecutionOwnerStatus): ManualMotionSettings {
+  return {
+    ...DEFAULT_MANUAL_MOTION_SETTINGS,
+    tcpLinearSpeedMps: Math.min(DEFAULT_MANUAL_MOTION_SETTINGS.tcpLinearSpeedMps,
+      status.directControl.targetDescriptor.operationalLimit?.effectiveMaximumTcpLinearSpeedMps ?? Infinity),
+  };
 }
 
 function poseIsValid(pose: Pose3Value): boolean {
@@ -267,6 +339,8 @@ function phaseForOperation(operation: OperationObservation): RobotControlPhase {
 
 function draftFromStatus(status: ExecutionOwnerStatus) {
   return {
+    moveToDraft: null,
+    poseDragging: false,
     draftPositionsRad: [...status.observedMotion.positionsRad],
     draftPose: copyPose(status.observedMotion.currentTcpPose),
     draftGripperPosition: status.observedGripper?.position ?? null,
@@ -275,7 +349,7 @@ function draftFromStatus(status: ExecutionOwnerStatus) {
 
 export function robotControlHasLocalDraft(state: RobotControlState): boolean {
   return state.operation === null
-    && (state.phase === 'planning' || state.phase === 'ready'
+    && (state.poseDragging || state.phase === 'planning' || state.phase === 'ready'
       || state.phase === 'approving' || state.phase === 'blocked');
 }
 
@@ -303,13 +377,11 @@ function resolveStatus(
     || state.status.graphRevision !== status.graphRevision
     || state.status.directControl.programBindingId !== status.directControl.programBindingId
     || state.status.directControlGripper.programBindingId !== status.directControlGripper.programBindingId
-    || state.status.sceneRevision.scene_id !== status.sceneRevision.scene_id
-    || state.status.sceneRevision.revision_id !== status.sceneRevision.revision_id
-    || state.status.sceneRevision.content_hash !== status.sceneRevision.content_hash
   )) {
     return {
       ...initialRobotControlState,
       mode: state.mode,
+      motionSettings: initialMotionSettings(status),
       status,
       phase: resolvedPhase,
       ...draftFromStatus(status),
@@ -318,7 +390,7 @@ function resolveStatus(
       error: projectionError
         ?? (state.status.ownerEpoch !== status.ownerEpoch
           ? 'The execution owner restarted. The prior preview was discarded.'
-          : 'The target binding or scene changed. The prior preview was discarded.'),
+          : 'The target binding changed. The prior preview was discarded.'),
     };
   }
   if (initialize || state.status === null) {
@@ -327,11 +399,13 @@ function resolveStatus(
       status,
       phase: resolvedPhase,
       ...draftFromStatus(status),
+      motionSettings: state.status === null ? initialMotionSettings(status) : state.motionSettings,
       intent: null,
       preview: null,
       ghost: null,
       ghostStale: false,
       operation: resolvedOperation,
+      previewIssue: null,
       error: projectionError ?? resolvedOperation?.terminalError ?? null,
     };
   }
@@ -341,15 +415,27 @@ function resolveStatus(
       status,
       phase: 'blocked',
       operation: null,
+      previewIssue: null,
       error: projectionError,
     };
   }
   // The latest settled result stays visible through the same owner snapshot,
   // but repeated publication must not overwrite a new draft or an approval
   // still waiting for a *new* operation to become visible.
-  if (projectedOperation !== null && !projectedOperation.resident
+  const alreadyPresentedTerminal = projectedOperation !== null && !projectedOperation.resident
     && state.status.manualOperations.some((previous) => !previous.resident
-      && previous.operationId === projectedOperation.operationId)) {
+      && previous.operationId === projectedOperation.operationId);
+  if ((projectedOperation === null || alreadyPresentedTerminal)
+    && (state.phase === 'ready' || state.phase === 'planning'
+      || (state.phase === 'blocked' && state.intent === null))
+    && (state.status.sceneRevision.scene_id !== status.sceneRevision.scene_id
+      || state.status.sceneRevision.revision_id !== status.sceneRevision.revision_id
+      || state.status.sceneRevision.content_hash !== status.sceneRevision.content_hash)) {
+    // Same owner/binding and authored target, new scene evidence. Reuse the
+    // normal trailing preview debounce; never retry approval or an operation.
+    return invalidateDraft(state, { status });
+  }
+  if (alreadyPresentedTerminal) {
     return { ...state, status };
   }
   if (projectedOperation !== null) {
@@ -357,10 +443,14 @@ function resolveStatus(
       ...state,
       status,
       phase: phaseForOperation(projectedOperation),
+      poseDragging: false,
+      moveToDraft: null,
       operation: projectedOperation,
+      previewIssue: null,
       intent: null,
       preview: null,
-      ghostStale: state.ghost !== null || state.ghostStale,
+      ghost: null,
+      ghostStale: false,
       error: projectedOperation.terminalError ?? state.error,
       ...(operationStateIsTerminal(projectedOperation.state)
         ? draftFromStatus(status)
@@ -394,12 +484,14 @@ function invalidateDraft(
   return {
     ...state,
     ...update,
+    poseDragging: false,
     phase: 'planning',
     generation: state.generation + 1,
     intent: null,
     preview: null,
     ghostStale: state.ghost !== null,
     operation: null,
+    previewIssue: null,
     error: null,
   };
 }
@@ -408,7 +500,7 @@ export function robotControlReducer(
   state: RobotControlState,
   action: RobotControlAction,
 ): RobotControlState {
-  if (state.operation?.resident && ['edit', 'edit_joint', 'edit_move_to_joint', 'edit_pose', 'edit_gripper']
+  if (state.operation?.resident && ['edit', 'edit_joint', 'edit_move_to_joint', 'edit_pose', 'edit_gripper', 'edit_motion_settings', 'select_move_source', 'edit_move_options', 'begin_pose_drag', 'finish_pose_drag']
     .includes(action.type)) return state;
   switch (action.type) {
     case 'load':
@@ -445,6 +537,7 @@ export function robotControlReducer(
         ghost: null,
         ghostStale: false,
         operation: null,
+        previewIssue: null,
         error: null,
       };
     case 'select_mode':
@@ -453,6 +546,8 @@ export function robotControlReducer(
         || robotControlHasActiveOperation(state)
         || state.mode === action.mode
       ) return state;
+      // A new editor must not relabel the last settled operation as its own
+      // preview. resolveStatus still retains any resident operation/fault.
       return resolveStatus({
         ...state,
         mode: action.mode,
@@ -465,8 +560,9 @@ export function robotControlReducer(
         ghost: null,
         ghostStale: false,
         operation: null,
+        previewIssue: null,
         error: null,
-      }, state.status, true);
+      }, state.status, false);
     case 'edit':
     case 'edit_joint': {
       if (state.status === null || robotControlHasActiveOperation(state)) {
@@ -488,6 +584,7 @@ export function robotControlReducer(
           intent: null,
           preview: null,
           ghostStale: state.ghost !== null,
+          previewIssue: null,
           error: 'The authored joint target is outside its retained limits.',
         };
       }
@@ -499,6 +596,61 @@ export function robotControlReducer(
         mode: 'joint',
         draftPositionsRad: [...positionsRad],
       });
+    }
+    case 'edit_motion_settings': {
+      if (state.status === null || state.mode === 'gripper' || robotControlHasActiveOperation(state)) return state;
+      const motionSettings = {
+        ...state.motionSettings,
+        ...action.update,
+        jointLimits: { ...state.motionSettings.jointLimits },
+      };
+      for (const [joint, limit] of Object.entries(action.update.jointLimits ?? {})) {
+        motionSettings.jointLimits[joint] = { ...motionSettings.jointLimits[joint], ...limit };
+      }
+      if (!motionSettingsAreValid(state.status, motionSettings)) return state;
+      // Editing limits alone does not invent a target or start a no-op preview.
+      return robotControlHasLocalDraft(state)
+        ? invalidateDraft(state, { motionSettings })
+        : { ...state, motionSettings };
+    }
+    case 'select_move_source': {
+      if (state.status === null || robotControlHasActiveOperation(state)) return state;
+      const moveToDraft: MoveToDraft = {
+        source: structuredClone(action.source),
+        currentTcpPose: poseTupleFromValue(state.status.observedMotion.currentTcpPose),
+        options: structuredClone(state.moveToDraft?.options ?? DEFAULT_MOVE_TO_OPTIONS),
+      };
+      if (action.source.kind === 'joint') {
+        return robotControlReducer({ ...state, moveToDraft }, { type: 'edit_move_to_joint', positionsRad: action.source.positionsRad });
+      }
+      const pose = computeCartesianMoveDraft(action.source.pose, moveToDraft.currentTcpPose, moveToDraft.options);
+      if (pose === null) return state;
+      return invalidateDraft(state, { mode: 'move_to', moveToKind: 'pose', moveToDraft, draftPose: poseValueFromTuple(pose) });
+    }
+    case 'edit_move_options': {
+      const draft = state.moveToDraft;
+      if (state.status === null || state.mode !== 'move_to' || draft?.source.kind !== 'pose'
+        || robotControlHasActiveOperation(state)) return state;
+      const options = { ...draft.options, ...action.update };
+      const pose = computeCartesianMoveDraft(draft.source.pose, draft.currentTcpPose, options);
+      if (pose === null) return state;
+      return invalidateDraft(state, { moveToDraft: { ...draft, options }, draftPose: poseValueFromTuple(pose) });
+    }
+    case 'begin_pose_drag':
+      if (state.status === null || state.poseDragging || robotControlHasActiveOperation(state)
+        || !['pose_goal', 'cartesian_path', 'move_to'].includes(state.mode)
+        || (state.mode === 'move_to' && state.moveToDraft?.source.kind !== 'pose')) return state;
+      return {
+        ...state,
+        draftPose: robotControlHasLocalDraft(state) ? state.draftPose : copyPose(state.status.observedMotion.currentTcpPose),
+        poseDragging: true,
+        generation: state.generation + 1,
+      };
+    case 'finish_pose_drag': {
+      if (!state.poseDragging || action.generation !== state.generation) return state;
+      const settled = { ...state, poseDragging: false };
+      if (action.pose === null || samePose(poseTupleFromValue(state.draftPose), poseTupleFromValue(action.pose))) return settled;
+      return robotControlReducer(settled, { type: 'edit_pose', pose: action.pose });
     }
     case 'edit_move_to_joint': {
       if (state.status === null || robotControlHasActiveOperation(state)) {
@@ -512,6 +664,7 @@ export function robotControlReducer(
           intent: null,
           preview: null,
           ghostStale: state.ghost !== null,
+          previewIssue: null,
           error: 'The stored joint target is outside its retained limits.',
         };
       }
@@ -526,7 +679,7 @@ export function robotControlReducer(
         draftPositionsRad: [...action.positionsRad],
       });
     }
-    case 'edit_pose':
+    case 'edit_pose': {
       if (state.status === null || robotControlHasActiveOperation(state)) {
         return state;
       }
@@ -538,16 +691,23 @@ export function robotControlReducer(
           intent: null,
           preview: null,
           ghostStale: state.ghost !== null,
+          previewIssue: null,
           error: 'The authored TCP pose is invalid.',
         };
       }
       if (posesEqual(robotControlHasLocalDraft(state)
         ? state.draftPose : state.status.observedMotion.currentTcpPose, action.pose)
         && (state.mode !== 'move_to' || state.moveToKind === 'pose')) return state;
+      const draft = state.mode === 'move_to' ? state.moveToDraft : null;
+      const options = draft?.source.kind === 'pose'
+        ? cartesianMoveOffsetsFromTarget(draft.source.pose, draft.currentTcpPose, draft.options, poseTupleFromValue(action.pose))
+        : null;
       return invalidateDraft(state, {
         ...(state.mode === 'move_to' ? { moveToKind: 'pose' as const } : {}),
+        ...(draft !== null && options !== null ? { moveToDraft: { ...draft, options } } : {}),
         draftPose: copyPose(action.pose),
       });
+    }
     case 'edit_gripper':
       if (state.status === null || robotControlHasActiveOperation(state)) {
         return state;
@@ -560,6 +720,7 @@ export function robotControlReducer(
           intent: null,
           preview: null,
           ghostStale: state.ghost !== null,
+          previewIssue: null,
           error: 'The authored gripper target is outside its retained limits.',
         };
       }
@@ -575,12 +736,14 @@ export function robotControlReducer(
     case 'preview_started':
       if (
         action.generation !== state.generation
+        || state.poseDragging
         || state.phase !== 'planning'
       ) return state;
       return { ...state, intent: action.intent };
     case 'preview_resolved':
       if (
         action.generation !== state.generation
+        || state.poseDragging
         || state.phase !== 'planning'
       ) return state;
       if (!receiptMatchesCurrentDraft(state, action.receipt)) {
@@ -605,21 +768,24 @@ export function robotControlReducer(
           === 'manyforge.direct_control_motion_preview.v1'
           ? false
           : state.ghost !== null,
+        previewIssue: null,
         error: null,
       };
     case 'preview_rejected':
-      if (action.generation !== state.generation) return state;
+      if (action.generation !== state.generation || state.poseDragging) return state;
       return {
         ...state,
         phase: 'blocked',
         intent: null,
         preview: null,
         ghostStale: state.ghost !== null,
-        error: action.error,
+        previewIssue: action.targetRejection ?? null,
+        error: action.targetRejection ? null : action.error,
       };
     case 'approve_started':
       if (
         state.phase !== 'ready'
+        || state.poseDragging
         || state.preview === null
         || state.intent === null
       ) return state;
@@ -647,7 +813,8 @@ export function robotControlReducer(
         ...state,
         phase: phaseForOperation(action.operation),
         operation: action.operation,
-        ghostStale: state.ghost !== null,
+        ghost: null,
+        ghostStale: false,
         error: action.operation.terminalError ?? state.error,
       };
     case 'operation_control_failed':
@@ -676,6 +843,7 @@ export function robotControlReducer(
         ghost: null,
         ghostStale: false,
         operation: state.operation?.resident ? state.operation : null,
+        previewIssue: null,
         error: state.operation?.resident ? state.operation.terminalError : null,
       };
     case 'clear':
@@ -711,34 +879,20 @@ function buildMotionIntent(
   status: ExecutionOwnerStatus,
   motion: DirectControlMotionSpec,
   requestId: string,
+  settings: ManualMotionSettings,
 ): DirectControlOperationIntent {
   const capability = `planning.motion.${motion.kind}`;
   requireMotionStatus(status, capability);
   if (requestId.trim() === '') {
     throw new Error('Robot Control request identity must not be empty.');
   }
-  const operationalJointLimits = Object.fromEntries(
-    status.directControl.targetDescriptor.operationalJointLimits.flatMap((limit) => {
-      if (
-        limit.deploymentMaxVelocityRadS === null
-        && limit.deploymentMaxAccelerationRadS2 === null
-        && limit.deploymentMaxJerkRadS3 === null
-      ) return [];
-      return [[limit.sourceJointName, {
-        ...(limit.deploymentMaxVelocityRadS === null
-          ? {}
-          : { max_velocity_rad_s: limit.effectiveMaxVelocityRadS }),
-        ...(limit.deploymentMaxAccelerationRadS2 === null
-          || limit.effectiveMaxAccelerationRadS2 === null
-          ? {}
-          : { max_acceleration_rad_s2: limit.effectiveMaxAccelerationRadS2 }),
-        ...(limit.deploymentMaxJerkRadS3 === null
-          || limit.effectiveMaxJerkRadS3 === null
-          ? {}
-          : { max_jerk_rad_s3: limit.effectiveMaxJerkRadS3 }),
-      }]];
-    }),
-  );
+  if (!motionSettingsAreValid(status, settings)) throw new Error('Manual motion limits are invalid.');
+  // These are optional tighter request caps. Retained Deployment ceilings are
+  // enforced by the owner, not copied into each request by the browser.
+  const jointLimits = Object.fromEntries(Object.entries(settings.jointLimits).flatMap(([name, limit]) => {
+    const values = Object.entries(limit).filter(([, value]) => value != null);
+    return values.length === 0 ? [] : [[name, Object.fromEntries(values)]];
+  }));
   const targetTcpLimit = status.directControl.targetDescriptor.operationalLimit
     ?.effectiveMaximumTcpLinearSpeedMps ?? null;
   const payload: MotionParticipantPayload = {
@@ -752,11 +906,9 @@ function buildMotionIntent(
       rotation_tol_rad: 0.05,
     },
     speed_profile: {
-      velocity_scale: 1,
-      acceleration_scale: 1,
-      max_tcp_linear_speed_mps: motion.kind === 'joint_goal'
-        ? null
-        : targetTcpLimit === null ? 0.1 : Math.min(0.1, targetTcpLimit),
+      velocity_scale: settings.velocityScale,
+      acceleration_scale: settings.accelerationScale,
+      max_tcp_linear_speed_mps: Math.min(settings.tcpLinearSpeedMps, targetTcpLimit ?? Infinity),
     },
     timeouts: {
       planning_timeout_s: 2,
@@ -769,7 +921,7 @@ function buildMotionIntent(
     offset_reference: null,
     motion,
     contact_policy_id: null,
-    per_joint_dynamics_limits: operationalJointLimits,
+    per_joint_dynamics_limits: jointLimits,
     motion_interrupt_scopes: [],
     runtime_object_bindings: [],
   };
@@ -802,6 +954,7 @@ export function buildJointMotionIntent(
   status: ExecutionOwnerStatus,
   positionsRad: number[],
   requestId: string,
+  settings: ManualMotionSettings = initialMotionSettings(status),
 ): DirectControlOperationIntent {
   if (!positionsAreValid(status, positionsRad)) {
     throw new Error('The authored joint target is outside its retained limits.');
@@ -812,7 +965,7 @@ export function buildJointMotionIntent(
       (joint) => joint.sourceJointName,
     ),
     positions_rad: [...positionsRad],
-  }, requestId);
+  }, requestId, settings);
 }
 
 function normalizedPose(pose: Pose3Value): Pose3Value {
@@ -838,17 +991,19 @@ export function buildPoseMotionIntent(
   status: ExecutionOwnerStatus,
   pose: Pose3Value,
   requestId: string,
+  settings: ManualMotionSettings = initialMotionSettings(status),
 ): DirectControlOperationIntent {
   return buildMotionIntent(status, {
     kind: 'pose_goal',
     goal: normalizedPose(pose),
-  }, requestId);
+  }, requestId, settings);
 }
 
 export function buildCartesianMotionIntent(
   status: ExecutionOwnerStatus,
   pose: Pose3Value,
   requestId: string,
+  settings: ManualMotionSettings = initialMotionSettings(status),
 ): DirectControlOperationIntent {
   return buildMotionIntent(status, {
     kind: 'cartesian_path',
@@ -859,12 +1014,12 @@ export function buildCartesianMotionIntent(
     max_translation_step_m: 0.005,
     max_rotation_step_rad: 0.05,
     speed_mode: 'bounded',
-    max_linear_speed_mps: 0.1,
-    max_angular_speed_rad_s: 0.5,
-    max_linear_acceleration_mps2: 0.5,
-    max_angular_acceleration_rad_s2: 2.5,
+    max_linear_speed_mps: settings.tcpLinearSpeedMps,
+    max_angular_speed_rad_s: settings.tcpAngularSpeedRadS,
+    max_linear_acceleration_mps2: settings.tcpLinearAccelerationMps2,
+    max_angular_acceleration_rad_s2: settings.tcpAngularAccelerationRadS2,
     fallback_policy: 'fail_closed',
-  }, requestId);
+  }, requestId, settings);
 }
 
 export function buildGripperCommandIntent(
@@ -947,6 +1102,7 @@ export function buildPreviewIntent(
     | 'draftPositionsRad'
     | 'draftPose'
     | 'draftGripperPosition'
+    | 'motionSettings'
   >,
   requestId: string,
 ): DirectControlOperationIntent {
@@ -959,22 +1115,25 @@ export function buildPreviewIntent(
         state.status,
         state.draftPositionsRad,
         requestId,
+        state.motionSettings,
       );
     case 'pose_goal':
-      return buildPoseMotionIntent(state.status, state.draftPose, requestId);
+      return buildPoseMotionIntent(state.status, state.draftPose, requestId, state.motionSettings);
     case 'move_to':
       return state.moveToKind === 'joint'
         ? buildJointMotionIntent(
             state.status,
             state.draftPositionsRad,
             requestId,
+            state.motionSettings,
           )
-        : buildPoseMotionIntent(state.status, state.draftPose, requestId);
+        : buildPoseMotionIntent(state.status, state.draftPose, requestId, state.motionSettings);
     case 'cartesian_path':
       return buildCartesianMotionIntent(
         state.status,
         state.draftPose,
         requestId,
+        state.motionSettings,
       );
     case 'gripper':
       if (state.draftGripperPosition === null) {

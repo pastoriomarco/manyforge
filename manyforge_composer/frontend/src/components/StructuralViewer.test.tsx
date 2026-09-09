@@ -9,6 +9,8 @@ import {
   DEFAULT_WIREFRAME_VISIBLE,
   VIEWER_CLICK_MAX_DURATION_MS,
   VIEWER_CONTEXT_DRAG_THRESHOLD_PX,
+  clonePreviewMesh,
+  candidateGhostColor,
   frameableContentBounds,
   framedCameraPresentation,
   sceneObjectMaterial,
@@ -41,6 +43,24 @@ function sceneObject(
 }
 
 describe('viewer failure isolation', () => {
+  it('uses independent unlit translucent preview materials and reuses mesh geometry', () => {
+    expect(candidateGhostColor('receipt', false)).toBe('#58ddff');
+    expect(candidateGhostColor('receipt', true)).toBe('#f2bb56');
+    expect(candidateGhostColor(null, true)).toBe('#f2bb56');
+    expect(candidateGhostColor(null, false, true)).toBe('#ff7066');
+    const original = new THREE.Mesh(new THREE.BoxGeometry(), new THREE.MeshStandardMaterial());
+    const preview = clonePreviewMesh(original, '#58ddff', 0.5) as THREE.Mesh<THREE.BoxGeometry, THREE.MeshBasicMaterial>;
+    expect(preview.material).toBeInstanceOf(THREE.MeshBasicMaterial);
+    expect(preview.material.color.getHexString()).toBe('58ddff');
+    expect(preview.material).toMatchObject({ transparent: true, opacity: 0.5,
+      toneMapped: false, depthWrite: false, side: THREE.FrontSide });
+    expect(preview.geometry).toBe(original.geometry);
+    expect(original.material).toMatchObject({ transparent: false, opacity: 1 });
+    expect(preview.material).not.toBe(original.material);
+    preview.material.dispose();
+    original.material.dispose();
+    original.geometry.dispose();
+  });
   it('offers unconstrained scale only for shapes the gizmo can represent safely', () => {
     expect(supportsIndependentSceneScale(sceneObject({
       type: 'box', dimensions_m: { x: 1, y: 1, z: 1 },
@@ -102,6 +122,9 @@ describe('viewer failure isolation', () => {
     expect(source).toContain("(object) => !observedSceneResourceIds.has(object.scene_resource_id)");
     expect(source).toContain('<ObservedLogicalSceneObjects');
     expect(source).toContain('viewer-source-swatch candidate');
+    expect(source).toContain('className="viewer-preview-dot" aria-hidden="true"');
+    expect(source).toContain('A Draft scene or target preview is visible. Open Tools for layer details.');
+    expect(source).not.toContain('viewer-source-active');
     expect(source).not.toContain('Measured state');
     expect(source).not.toContain('Non-live viewer overlays');
   });
@@ -134,7 +157,7 @@ describe('viewer failure isolation', () => {
     const controls = source.indexOf('aria-label="Scene viewport controls"', header);
     const launchers = source.indexOf('className="viewer-surface-launchers"', header);
     const frameAll = source.indexOf('aria-label="Frame all visible content"', controls);
-    const transform = source.indexOf('title="Translate selected object (W)"', controls);
+    const transform = source.indexOf('title="Translate target (W)"', controls);
 
     expect(header).toBeGreaterThan(0);
     expect(controls).toBeLessThan(launchers);
@@ -144,11 +167,11 @@ describe('viewer failure isolation', () => {
     expect(source.indexOf('aria-label="Reset camera"', header)).toBeLessThan(stage);
     expect(frameAll).toBeLessThan(transform);
     expect(transform).toBeLessThan(launchers);
-    expect(source).toContain("{inspectorPanel === 'object' && (");
-    expect(source).toContain("else if (inspectorPanel !== 'object') return;");
+    expect(source.includes("inspectorPanel === 'object' || inspectorPanel === 'robot'")).toBe(true);
+    expect(source.includes('else if (!generalTransformEnabled) return;')).toBe(true);
     expect(css).toMatch(/\.viewer-header-controls\s*\{[^}]*flex:\s*1 1 auto/s);
     expect(css).toMatch(/\.viewer-surface-launchers\s*\{[^}]*margin-left:\s*auto/s);
-    expect(source.match(/aria-pressed=\{inspectorPanel ===/g)).toHaveLength(3);
+    expect(source.slice(launchers, stage).match(/aria-pressed=\{inspectorPanel ===/g)).toHaveLength(3);
     expect(css).toMatch(
       /\.viewer-surface-launchers > button\[aria-pressed='true'\]\s*\{[^}]*border-color:\s*#68cadd;[^}]*background:\s*#153c49;/s,
     );
@@ -213,7 +236,10 @@ describe('viewer failure isolation', () => {
     expect(source).not.toContain('onPointerMissed=');
     expect(source).not.toContain('new THREE.Raycaster()');
     expect(source).toContain("const ignoreViewerRaycast: THREE.Object3D['raycast']");
-    expect(source.match(/raycast=\{ignoreViewerRaycast\}/g)).toHaveLength(7);
+    for (const [axes] of source.matchAll(/<axesHelper[^>]*\/>/g)) {
+      if (!axes.includes('args={[0.45]}')) expect(axes).toContain('raycast={ignoreViewerRaycast}');
+    }
+    expect(source).toContain('<mesh rotation={cylinderRotation} renderOrder={14} raycast={ignoreViewerRaycast}>');
     expect(source).not.toContain('transformRevision');
     expect(source).not.toContain('markTransformChange');
     expect(source).toContain('transformEnabled={transformEnabled && objectEditorActive}');
@@ -479,11 +505,11 @@ describe('viewer failure isolation', () => {
 
     expect(viewer).toContain('candidateTcpEditable');
     expect(viewer).toContain('onEditCandidateTcpPose');
-    expect(viewer).toContain('candidateTcpTransformMode');
-    expect(viewer).toContain('candidateTcpTransformSpace');
+    expect(viewer.includes('gizmoSettings={gizmo.settings}')).toBe(true);
+    expect(viewer.includes('onBeginCandidateTcpDrag')).toBe(true);
     expect(workspace).toContain("robotControl.state.mode === 'pose_goal'");
     expect(workspace).toContain("robotControl.state.mode === 'cartesian_path'");
-    expect(workspace).toContain('onEditCandidatePose={editCandidatePoseInCell}');
+    expect(workspace.includes('onEditCandidateTcpPose={finishCandidateDrag}')).toBe(true);
     expect(workspace).toContain('candidateTcpPoseFromCell(');
   });
 

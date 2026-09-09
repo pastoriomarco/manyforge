@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
 import type { RobotControlController } from '../hooks/useRobotControl';
 import type { CycleRecoveryOffer, ProgramRunStateName } from '../types/api';
+import { statusFixture } from '../testFixtures/robotControl';
 import { ProgramRuntimePanel, ProgramTransportControls } from './ProgramRuntimePanel';
 
 function ordinaryMotionStopOffer(): CycleRecoveryOffer {
@@ -80,6 +81,7 @@ function ordinaryMotionStopControls(): NonNullable<
 
 function robotController(): RobotControlController {
   return {
+    currentStatus: statusFixture(),
     state: {
       phase: 'ready',
       operation: null,
@@ -478,5 +480,73 @@ describe('Program runtime projection', () => {
     expect(transport).toContain('width: 7.5rem;');
     expect(transport).toContain('width: 1.45rem;');
     expect(transport).toContain('width: 6.25rem;');
+  });
+
+  it('exposes manual recovery from the owner projection even in another panel/mode', () => {
+    const robot = robotController();
+    robot.state.status = statusFixture();
+    robot.currentStatus = robot.state.status;
+    const operation = {
+      programRunId: robot.state.status.directControlGripper.programRunId,
+      operationId: 'faulted-gripper', operationRevision: 2, resident: true,
+      state: 'intervention_required' as const, progress: 0.78,
+      terminalError: 'Execution timeout exceeded', activeStopId: null, activeStopGeneration: null,
+    };
+    robot.state.status.manualOperations = [operation];
+    const idle = controller('succeeded', 'idle_after_reset');
+    idle.commandAllowed = vi.fn(() => false);
+    const render = (enabled = true) => renderToStaticMarkup(<ProgramTransportControls
+      enabled={enabled} program={idle} robot={robot} onOpenRobotControls={vi.fn()} />);
+    const markup = render();
+    expect(markup).toContain('Manual gripper recovery required');
+    expect(markup).toContain('Execution timeout exceeded');
+    expect(markup).toContain('Open gripper recovery');
+    expect(markup).toContain('Robot control → Reset operation');
+    expect(markup).toMatch(/class="transport-run"[^>]*disabled=""/);
+    expect(render(false)).toContain('Control status unavailable.');
+    expect(render(false)).not.toContain('Manual gripper recovery required');
+    robot.currentStatus = null;
+    expect(render()).toContain('Robot status unavailable.');
+    expect(render()).not.toContain('Manual gripper recovery required');
+    expect(render()).not.toContain('Open gripper recovery');
+    robot.currentStatus = robot.state.status;
+    operation.resident = false;
+    expect(render()).not.toContain('recovery required');
+    expect(render()).not.toContain('Open gripper recovery');
+    for (const state of ['completed', 'stopped', 'cancelled_pre_dispatch'] as const) {
+      robot.state.status.manualOperations = [{ ...operation, resident: true, state, terminalError: null }];
+      expect(render()).not.toContain('Manual gripper recovery required');
+    }
+  });
+
+  it('points Program faults to recovery and normal terminal runs to Reset', () => {
+    const program = controller('intervention_required', 'recovery_required');
+    program.state.run!.message = 'Participant requires reconciliation';
+    const render = () => renderToStaticMarkup(<ProgramTransportControls
+      enabled program={program} robot={robotController()} />);
+    expect(render()).toContain('Program recovery required.');
+    expect(render()).toContain('Participant requires reconciliation');
+    expect(render()).toContain('Review Program recovery');
+    program.cycleState = 'terminal_awaiting_reset';
+    expect(render()).toContain('Program finished. Use <strong>Reset</strong>');
+    expect(render()).not.toContain('Program recovery required.');
+  });
+
+  it('surfaces a cell-wide latch but never treats a cleared historical latch as blocking', () => {
+    const robot = robotController();
+    robot.state.status = statusFixture();
+    robot.currentStatus = robot.state.status;
+    const fault = {
+      latchId: 'latch', latchGeneration: 1, state: 'latched' as const,
+      trigger: 'physical_rest_unproven' as const, recoveryStatus: 'waiting_for_observation' as const,
+      reasonCode: 'physical_rest_unproven', certificate: null,
+    };
+    robot.state.status.cellStopAction.fault = fault;
+    const render = () => renderToStaticMarkup(<ProgramTransportControls
+      enabled program={controller()} robot={robot} />);
+    expect(render()).toContain('Cell recovery required.');
+    expect(render()).toContain('waiting for observation');
+    robot.state.status.cellStopAction.fault = { ...fault, state: 'cleared' };
+    expect(render()).not.toContain('Cell recovery required.');
   });
 });

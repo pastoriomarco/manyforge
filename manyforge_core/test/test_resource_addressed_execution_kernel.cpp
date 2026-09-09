@@ -2671,6 +2671,8 @@ TEST(ResourceAddressedExecutionKernelTest, ManualNoEffectAndTerminalReleaseRemai
     SCOPED_TRACE(attempt);
     const auto operation = kernel.execute(motion_operation("manual." + std::to_string(attempt)));
     ASSERT_TRUE(operation.ok()) << operation.error().message;
+    ASSERT_TRUE(engine.last_prepared_request.has_value());
+    EXPECT_TRUE(engine.last_prepared_request->execution_request.trajectory_relative_timeout);
     EXPECT_FALSE(kernel.GetAuthoringAdmission().authoring_allowed);
     engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kCompleted);
     if (attempt == 0) {
@@ -6427,6 +6429,51 @@ TEST(ResourceAddressedExecutionKernelTest,
             "planning.motion.cartesian_path");
   EXPECT_EQ(engine.execute_calls, 0);
   EXPECT_EQ(engine.preview_calls, 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest, ManualCeilingsApplyAtBothPreviewAndExecutionBoundaries) {
+  for (const bool manual : {false, true}) {
+    for (const std::optional<double> requested : {std::optional<double>{}, {0.2}, {9.0}}) {
+      SCOPED_TRACE(manual);
+      SCOPED_TRACE(requested.value_or(-1.0));
+      FakeClock clock;
+      ManualScheduler scheduler;
+      FakeParticipantEngine engine;
+      FakeOperationJournal journal;
+      auto target = registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+      target.intrinsic_direct_control = manual;
+      target.direct_control_joint_limits = {{"joint_1", {0.7, 1.2, std::nullopt}}};
+      ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U};
+      config.manager_liveness_required_set = EmptyManagerLivenessSet();
+      ResourceAddressedExecutionKernel kernel({target}, clock, scheduler, journal, config);
+      ASSERT_TRUE(ready_cell_admission(kernel).ok());
+      auto intent = motion_operation("request.manual.caps");
+      auto& motion = std::get<MotionParticipantIntentDTO>(intent.participants.front().payload);
+      motion.per_joint_dynamics_limits.clear();
+      if (requested.has_value()) motion.per_joint_dynamics_limits["joint_1"] = {*requested, *requested, std::nullopt};
+      auto session = kernel.begin_motion_preview_session(intent);
+      ASSERT_TRUE(session.ok()) << session.error().message;
+      const auto prepared = session.value()->prepare_motion(intent);
+      ASSERT_TRUE(prepared.ok()) << prepared.error().message;
+      session.value().reset(); // Release preview's submission lock before execution.
+      const auto accepted = kernel.execute(intent);
+      ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+      ASSERT_TRUE(engine.last_execute.has_value());
+      EXPECT_EQ(engine.last_execute->per_resource_dynamics_limits, prepared.value().per_resource_dynamics_limits);
+      const auto& caps = prepared.value().per_resource_dynamics_limits;
+      if (!manual && !requested.has_value()) {
+        EXPECT_TRUE(caps.empty());
+      } else {
+        ASSERT_EQ(caps.size(), 1U);
+        EXPECT_EQ(caps.front().compiled_joint_name, "mf2_joint_1");
+        EXPECT_DOUBLE_EQ(*caps.front().limit.max_velocity_rad_s,
+                         manual ? std::min(requested.value_or(0.7), 0.7) : *requested);
+        EXPECT_DOUBLE_EQ(*caps.front().limit.max_acceleration_rad_s2,
+                         manual ? std::min(requested.value_or(1.2), 1.2) : *requested);
+      }
+    }
+  }
 }
 
 TEST(ResourceAddressedExecutionKernelTest,

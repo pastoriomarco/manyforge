@@ -768,6 +768,7 @@ make_kernel_participant_resolver(
           physical->default_fault_stop_profile);
       registration.intrinsic_direct_control =
           binding.value().intrinsic_direct_control;
+      registration.direct_control_joint_limits = physical->direct_control_joint_limits;
       return core::Result<core::RuntimeParticipantExecutionRegistration>::Ok(
           std::move(registration));
     } catch (const std::exception &exception) {
@@ -1001,6 +1002,7 @@ create_retained_native_runtime_participants(
   runtime->motion_runtime_policy = motion_runtime_policy;
   runtime->deployment_maximum_tcp_linear_speed_mps =
       input.deployment_maximum_tcp_linear_speed_mps;
+  runtime->direct_control_joint_limits = std::move(input.direct_control_joint_limits);
   runtime->participant_resolver_factory =
       std::move(input.participant_resolver_factory);
   runtime->scene = std::move(input.scene);
@@ -1276,6 +1278,7 @@ create_retained_native_runtime_participants(
       runtime->participant_engine.get(), runtime->execution.get(),
       motion_runtime_policy, motion_operator_stop_profile,
       motion_fault_stop_profile));
+  physical_registrations.back().direct_control_joint_limits = runtime->direct_control_joint_limits;
   if (runtime->gripper_binding.has_value()) {
     physical_registrations.push_back(runtime_registration(
         *runtime->gripper_binding, input.gripper_stop_readiness,
@@ -1741,6 +1744,7 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
         next_motion, motion_readiness, participant_engine.get(),
         execution.get(), motion_runtime_policy, motion_operator_stop_profile,
         motion_fault_stop_profile));
+    physical_registrations.back().direct_control_joint_limits = direct_control_joint_limits;
     if (next_gripper.has_value()) {
       physical_registrations.push_back(runtime_registration(
           *next_gripper, gripper_readiness, gripper_participant_engine.get(),
@@ -2092,6 +2096,7 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
         next_motion, motion_readiness, participant_engine.get(),
         execution.get(), motion_runtime_policy, motion_operator_stop_profile,
         motion_fault_stop_profile));
+    physical_registrations.back().direct_control_joint_limits = direct_control_joint_limits;
     if (next_gripper.has_value()) {
       physical_registrations.push_back(runtime_registration(
           *next_gripper, gripper_readiness, gripper_participant_engine.get(),

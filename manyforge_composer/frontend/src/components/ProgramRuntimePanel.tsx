@@ -6,7 +6,7 @@ import {
 } from '../hooks/useProgramRuntime';
 import type { RobotControlController } from '../hooks/useRobotControl';
 import type { JsonValue } from '../types/api';
-import { robotControlHasActiveOperation } from '../state/robotControl';
+import { manualOperationRequiresRecovery, robotControlHasActiveOperation } from '../state/robotControl';
 import { OverlayPanel } from './OverlayPanel';
 
 
@@ -531,11 +531,13 @@ export function ProgramTransportControls({
   program,
   robot,
   onOpenRuntimeHistory,
+  onOpenRobotControls,
 }: {
   enabled: boolean;
   program: ProgramRuntimeController;
   robot: RobotControlController;
   onOpenRuntimeHistory?: () => void;
+  onOpenRobotControls?: () => void;
 }) {
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [stopMenuOpen, setStopMenuOpen] = useState(false);
@@ -621,10 +623,78 @@ export function ProgramTransportControls({
       ? 'Stop all currently addressed motion in this cell using the exact owner-issued generation fence.'
       : fullCellStop.unavailableReason
         ?? 'The execution owner has not made Full Stop available.';
+  const nativeStatus = robot.currentStatus;
+  const manualRecovery = nativeStatus?.manualOperations
+    .filter(manualOperationRequiresRecovery) ?? [];
+  const cellFault = nativeStatus?.cellStopAction.fault?.state !== 'cleared'
+    ? nativeStatus?.cellStopAction.fault : null;
+  const recoveryOffer = state.controls?.recoveryOffer;
+  const programRecovery = cycleState === 'recovery_required'
+    || (state.run?.state === 'intervention_required'
+      && recoveryOffer != null && recoveryOffer.recoveryClass !== 'ordinary_operator_stop');
+  const resetRequired = cycleState === 'terminal_awaiting_reset';
+  const recoveryRequired = manualRecovery.length > 0 || cellFault != null || programRecovery;
+  const blockedReason = !enabled
+    ? 'Control status unavailable. Commands are disabled until a current backend status is received.'
+    : manualRecovery.length > 0
+      ? 'A manual operation requires recovery. Open Robot recovery and Reset operation.'
+      : cellFault != null
+        ? 'A cell Stop fault still blocks motion. Review the current owner recovery requirements.'
+        : programRecovery
+          ? 'The Program requires recovery. Review the current owner-offered actions.'
+          : resetRequired ? 'Reset the Program before starting another run.'
+            : nativeStatus == null
+              ? 'Robot status unavailable. Last-known manual and cell recovery status is not current.' : null;
 
   return (
     <>
       <div className="viewer-transport" aria-label="Program and motion controls">
+        {blockedReason !== null && (
+          <div
+            className={`transport-guidance${recoveryRequired && enabled ? ' recovery-required' : ''}`}
+            role="status"
+          >
+            {!enabled ? <p>{blockedReason} Last-known recovery status is not current.</p> : <>
+              {nativeStatus == null && <p>
+                Robot status unavailable. Last-known manual and cell recovery status is not current.
+              </p>}
+              {manualRecovery.map((operation) => {
+                const gripper = operation.programRunId === nativeStatus?.directControlGripper.programRunId;
+                const target = gripper ? nativeStatus?.directControlGripper : nativeStatus?.directControl;
+                return (
+                  <div className="transport-guidance-row" key={operation.operationId}>
+                    <p>
+                      <strong>Manual {gripper ? 'gripper' : 'motion'} recovery required</strong>
+                      {' · '}{target?.controllableComponentId} / {target?.commandTargetId}.
+                      {' '}{operation.terminalError ?? operation.state.replaceAll('_', ' ')}.
+                      {' '}Program Run remains blocked. Use Robot control → Reset operation.
+                    </p>
+                    {onOpenRobotControls && <button
+                      type="button"
+                      disabled={motionActive && robot.state.operation?.operationId !== operation.operationId}
+                      title="Open this target's Robot panel. This does not reset or move the robot."
+                      onClick={() => {
+                        robot.selectMode(gripper ? 'gripper' : 'joint');
+                        onOpenRobotControls();
+                      }}
+                    >Open {gripper ? 'gripper' : 'robot'} recovery</button>}
+                  </div>
+                );
+              })}
+              {cellFault != null && <div className="transport-guidance-row">
+                <p><strong>Cell recovery required.</strong> {cellFault.reasonCode.replaceAll('_', ' ')}
+                  {' · '}{cellFault.recoveryStatus.replaceAll('_', ' ')}. Motion remains blocked.</p>
+                <button type="button" onClick={() => setDetailsOpen(true)}>Review cell status</button>
+              </div>}
+              {programRecovery ? <div className="transport-guidance-row">
+                <p><strong>Program recovery required.</strong> {state.run?.message
+                  || recoveryOffer?.reasonCode.replaceAll('_', ' ')
+                  || 'Review the backend recovery requirements before continuing.'}</p>
+                <button type="button" onClick={() => setDetailsOpen(true)}>Review Program recovery</button>
+              </div> : resetRequired && <p>Program finished. Use <strong>Reset</strong> below before another Run.</p>}
+            </>}
+          </div>
+        )}
         {selections.length > 1 && (
           <label className="transport-selection" title={selectedGroup?.resumeUnavailableReason?.replaceAll('_', ' ')}>
             <span>Scope</span>
@@ -653,7 +723,7 @@ export function ProgramTransportControls({
               ? 'Resume only this selection after fresh backend assessment.'
             : canRun
               ? 'Run the exact Applied Program.'
-              : selectedGroup?.resumeUnavailableReason?.replaceAll('_', ' ')
+              : blockedReason ?? selectedGroup?.resumeUnavailableReason?.replaceAll('_', ' ')
                 ?? 'Run requires an Applied Program and an idle, reset runner.'}
           onClick={() => {
             if (canResume) {
@@ -824,8 +894,9 @@ export function ProgramTransportControls({
           ref={detailsButton}
           type="button"
           className="icon-button"
+          data-recovery-required={enabled && recoveryRequired || undefined}
           aria-label="Program run details"
-          title="Program run details"
+          title={blockedReason ?? 'Program run details'}
           onClick={() => setDetailsOpen(true)}
         >i</button>
       </div>

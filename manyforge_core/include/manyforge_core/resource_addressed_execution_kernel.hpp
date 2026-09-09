@@ -87,6 +87,11 @@ struct RuntimeParticipantExecutionRegistration final {
   /// Composition-owned classification from an exact compiler-direct product,
   /// never inferred from missing Program origin or a caller's source label.
   bool intrinsic_direct_control{};
+
+  /// Retained Deployment ceilings for this exact target's manual moves.
+  /// Applied by the shared preview/execute builder only for intrinsic direct
+  /// control; caller omission cannot remove an owner-held ceiling.
+  PerJointDynamicsLimitsDTO direct_control_joint_limits{};
 };
 
 using RuntimeParticipantAdmissionResolver =

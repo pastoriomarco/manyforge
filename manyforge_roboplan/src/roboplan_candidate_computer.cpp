@@ -1020,6 +1020,13 @@ plan_cartesian_candidate(const std::shared_ptr<roboplan::Scene> &scene,
       request.speed_profile.max_tcp_linear_speed_mps.has_value();
   const bool has_joint_caps =
       !caps.velocity_by_joint.empty() || !caps.acceleration_by_joint.empty();
+  // TOPPRA scales the model limits. Apply the same independent scales to
+  // absolute requested caps, so qualification enforces min(model, cap) * scale.
+  // Keep the portable caps unscaled: Cartesian timing resolves its own minima.
+  auto velocity_caps = caps.velocity_by_joint;
+  auto acceleration_caps = caps.acceleration_by_joint;
+  for (auto& [joint, cap] : velocity_caps) cap *= request.speed_profile.velocity_scale;
+  for (auto& [joint, cap] : acceleration_caps) cap *= request.speed_profile.acceleration_scale;
   double final_tcp_speed = 0.0;
   JointCapMeasurement final_joint_caps;
   roboplan::JointTrajectory final_trajectory;
@@ -1056,7 +1063,7 @@ plan_cartesian_candidate(const std::shared_ptr<roboplan::Scene> &scene,
                                 final_trajectory)
             : 0.0;
     final_joint_caps = measure_joint_cap_peaks(
-        final_trajectory, caps.velocity_by_joint, caps.acceleration_by_joint);
+        final_trajectory, velocity_caps, acceleration_caps);
     if (has_joint_caps && !final_joint_caps.samples_complete) {
       return fail<roboplan::JointTrajectory>(
           ErrorCode::kUnsupportedCapability,
@@ -1094,9 +1101,14 @@ plan_cartesian_candidate(const std::shared_ptr<roboplan::Scene> &scene,
           std::min(velocity_factor,
                    kSpeedMargin / std::sqrt(final_joint_caps.worst_acc_ratio));
     }
-    velocity_scale = std::max(0.001, velocity_scale * velocity_factor);
-    acceleration_scale =
-        std::max(0.001, acceleration_scale * acceleration_factor);
+    const auto next_velocity_scale = velocity_scale * velocity_factor;
+    const auto next_acceleration_scale = acceleration_scale * acceleration_factor;
+    if (!finite_positive(next_velocity_scale) || !finite_positive(next_acceleration_scale) ||
+        (next_velocity_scale == velocity_scale && next_acceleration_scale == acceleration_scale)) {
+      break;
+    }
+    velocity_scale = next_velocity_scale;
+    acceleration_scale = next_acceleration_scale;
   }
 
   if (has_tcp_cap &&

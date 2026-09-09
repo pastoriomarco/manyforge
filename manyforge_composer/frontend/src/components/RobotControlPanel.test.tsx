@@ -135,6 +135,8 @@ const controller = vi.hoisted(() => ({
       orientation: { x: 0, y: 0, z: 0, w: 1 },
     },
     draftGripperPosition: 0.02,
+    motionSettings: { velocityScale: 1, accelerationScale: 1, tcpLinearSpeedMps: 0.1,
+      tcpAngularSpeedRadS: 0.5, tcpLinearAccelerationMps2: 0.5, tcpAngularAccelerationRadS2: 2.5, jointLimits: {} },
     generation: 1,
     intent: {},
     preview: {},
@@ -154,6 +156,7 @@ const controller = vi.hoisted(() => ({
   editJoint: vi.fn(),
   editPose: vi.fn(),
   editGripper: vi.fn(),
+  editMotionSettings: vi.fn(),
   approve: vi.fn(),
   revert: vi.fn(),
   stop: vi.fn(),
@@ -167,10 +170,34 @@ const controller = vi.hoisted(() => ({
 }));
 
 vi.mock('../hooks/useRobotControl', () => ({
-  useRobotControl: () => controller,
+  useRobotControl: () => ({ ...controller, currentStatus: controller.state.status }),
 }));
 
 describe('RobotControlPanel layout', () => {
+  it('presents an expected target rejection locally without calling the robot blocked', () => {
+    const state = controller.state as unknown as Record<string, unknown>;
+    const previous = { ...state };
+    try {
+      state.phase = 'blocked';
+      state.preview = null;
+      state.intent = null;
+      state.previewIssue = 'The robot would collide at the target.';
+      const markup = renderToStaticMarkup(<RobotControlPanel enabled />);
+      expect(markup).toContain('robot-control-preview-notice');
+      expect(markup).toContain('role="status"');
+      expect(markup).toContain('Target not executable.');
+      expect(markup).toContain('would collide at the target');
+      expect(markup).not.toContain('Preview is blocked');
+      expect(markup).not.toContain('Retry preview');
+      expect(markup).not.toContain('role="alert"');
+      expect(markup).toContain('aria-label="Hide preview notice"');
+      expect(markup).toMatch(/class="approve-button"[^>]*disabled=""/);
+    } finally {
+      Object.assign(state, previous);
+      delete state.previewIssue;
+    }
+  });
+
   it('keeps the candidate actions outside the bounded editor scroll region', () => {
     const markup = renderToStaticMarkup(<RobotControlPanel enabled />);
     const editor = markup.indexOf('data-testid="robot-control-editor-scroll"');
@@ -216,6 +243,12 @@ describe('RobotControlPanel layout', () => {
     expect(markup).toMatch(/<button type="button" disabled="">Resume<\/button>/);
     expect(markup).toContain('Reset operation');
 
+    state.operation = { ...(state.operation as Record<string, unknown>), state: 'paused' };
+    markup = renderToStaticMarkup(<RobotControlPanel enabled />);
+    expect(markup).toContain('paused · 40%');
+    expect(markup).not.toContain('Executing');
+    expect(markup).toMatch(/<button type="button">Resume<\/button>/);
+
     state.phase = 'completed';
     state.operation = {
       ...(state.operation as Record<string, unknown>),
@@ -225,8 +258,15 @@ describe('RobotControlPanel layout', () => {
     };
     markup = renderToStaticMarkup(<RobotControlPanel enabled />);
     expect(markup).toMatch(
-      /title="Release this exact terminal direct operation[^>]*>Reset operation<\/button>/,
+      /aria-label="Reset operation" title="Release this exact terminal direct operation[^>]*>Reset operation<\/button>/,
     );
+    expect(markup).toContain('Reset operation required.');
+    expect(markup).toContain('History acknowledgement does not release it.');
+    expect(markup.indexOf('aria-label="Reset operation"'))
+      .toBeGreaterThan(markup.indexOf('data-testid="robot-control-candidate-footer"'));
+    state.operation = { ...(state.operation as Record<string, unknown>), resident: false };
+    markup = renderToStaticMarkup(<RobotControlPanel enabled />);
+    expect(markup).not.toContain('Reset operation required.');
 
     state.phase = 'ready';
     state.operation = null;

@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <exception>
 #include <iostream>
+#include <limits>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/cache/trajectory_cache_compatibility.hpp>
 #include <manyforge_core/cache/trajectory_cache_intent.hpp>
@@ -34,6 +35,18 @@
 
 namespace manyforge::core {
 namespace {
+
+void resolve_motion_execution_timeout(ExecuteRequestDTO& request, const TrajectoryDTO& trajectory) {
+  if (!request.trajectory_relative_timeout) return;
+  const double duration = trajectory.waypoints.empty() ? 0.0
+                                                       : trajectory.waypoints.back().time_from_start_s;
+  const double budget = std::max({10.0, request.timeouts.execution_timeout_s, 1.5 * duration + 2.0});
+  if (!std::isfinite(duration) || duration < 0.0 || !std::isfinite(budget) ||
+      budget >= static_cast<double>(std::numeric_limits<std::int64_t>::max()) / 1e9) {
+    throw std::invalid_argument("Manual trajectory completion budget is not representable");
+  }
+  request.timeouts.execution_timeout_s = budget;
+}
 
 ErrorDTO stale_control_command_error() {
   return ErrorDTO{kErrorInvalidRequest,
@@ -85,10 +98,6 @@ class CompletionPublicationGuard {
   std::atomic<std::uint64_t>& owner_;
   std::uint64_t execution_id_;
 };
-
-double clamp_unit_interval(double value) {
-  return std::max(0.0, std::min(1.0, value));
-}
 
 void update_atomic_max(std::atomic<std::uint64_t>& target, std::uint64_t value) noexcept {
   auto current = target.load(std::memory_order_relaxed);
@@ -6511,6 +6520,7 @@ void ExecutionKernel::async_execute_worker(
     RetainedSceneSnapshotLease retained_scene,
     std::optional<SceneSnapshotLease> scene_snapshot_lease,
     std::shared_ptr<PreparedMotionSession> prepared_session) {
+  const double requested_execution_timeout_s = request.timeouts.execution_timeout_s;
   // Worker-local motion-execution state. Lives on this
   // stack frame so two overlapping workers (should never happen under
   // the lifecycle mutex, but defense in depth) cannot share state.
@@ -6632,6 +6642,9 @@ void ExecutionKernel::async_execute_worker(
     const CollisionWorldRevision validation_world_revision =
         validation_phase.collision_world_revision;
 
+    // Owner policy, resolved only after all planning/validation retiming. The
+    // prepared product and the dispatch watchdog must carry the same budget.
+    resolve_motion_execution_timeout(request, trajectory);
     std::shared_ptr<const PreparedOperationParticipantDTO> prepared_participant;
     if (prepared_session) {
       auto prepared = make_and_prepare_motion_participant(request, trajectory, plan_phase,
@@ -6739,7 +6752,7 @@ void ExecutionKernel::async_execute_worker(
     auto execution_handle = std::move(dispatch_phase.execution_handle);
     motion_state.execution_progress_generation = execution_handle.execution_generation;
     const auto exec_start_ns = dispatch_phase.exec_start_ns;
-    const int64_t exec_timeout_ns = dispatch_phase.exec_timeout_ns;
+    int64_t exec_timeout_ns = dispatch_phase.exec_timeout_ns;
     core::ExecutionSnapshot latest_backend_snapshot =
         std::move(dispatch_phase.latest_backend_snapshot);
 
@@ -6854,17 +6867,37 @@ void ExecutionKernel::async_execute_worker(
         pause_in_progress = false;
       }
 
-      if (!paused) {
+      std::optional<ErrorDTO> execution_timing_error;
+      if (!paused && !completed) {
         const int64_t dt_ns = std::max<int64_t>(0, now_ns - last_runtime_scale_sample_ns);
-        const double scale =
-            clamp_unit_interval(runtime_velocity_scale_.load(std::memory_order_acquire));
-        runtime_scaled_execution_ns += static_cast<double>(dt_ns) * scale;
+        try {
+          const auto mechanism = execution_backend_.runtime_velocity_scale_status();
+          const double scale = mechanism.supported ? mechanism.applied_scale : 1.0;
+          if (mechanism.error || (!mechanism.supported && request.initial_runtime_scale) ||
+              !std::isfinite(scale) || scale < 0.0 || scale > 1.0) {
+            execution_timing_error = ErrorDTO{
+                kErrorInvariantViolation, "Execution timing feedback is unavailable or invalid",
+                {{"reason", "runtime_scale_timing_feedback_invalid"},
+                 {"cause", mechanism.error ? mechanism.error->message : "invalid applied scale"}}};
+          } else {
+            runtime_scaled_execution_ns += static_cast<double>(dt_ns) * scale;
+          }
+        } catch (...) {
+          execution_timing_error = ErrorDTO{
+              kErrorInvariantViolation, "Execution timing feedback read failed",
+              {{"reason", "runtime_scale_timing_feedback_failed"}}};
+        }
       }
       last_runtime_scale_sample_ns = now_ns;
 
-      // Check execution timeout (W-1)
-      if (exec_timeout_ns > 0 &&
-          runtime_scaled_execution_ns >= static_cast<double>(exec_timeout_ns)) {
+      // Timing faults use the existing bounded failure/containment path too;
+      // throwing out of an active worker must not leave motion unattended.
+      if (execution_timing_error || (!completed && exec_timeout_ns > 0 &&
+          runtime_scaled_execution_ns >= static_cast<double>(exec_timeout_ns))) {
+        const auto execution_error = execution_timing_error.value_or(ErrorDTO{
+            kErrorExecutionTimeout, "Execution timeout exceeded",
+            {{"execution_budget_s", std::to_string(static_cast<double>(exec_timeout_ns) / 1e9)},
+             {"scaled_elapsed_s", std::to_string(runtime_scaled_execution_ns / 1e9)}}});
         if (operator_stop_worker_.active()) {
           const auto wait_budget =
               config_.operator_stop_profile
@@ -6926,7 +6959,9 @@ void ExecutionKernel::async_execute_worker(
         (void)execution_backend_.stop();
         const bool stop_completed = drain_execution_handle_bounded(execution_handle);
         auto prev = sm_.status().state;
-        sm_.set_last_error(stop_completed ? ErrorCode::kExecutionTimeout : ErrorCode::kStopFailed);
+        sm_.set_last_error(stop_completed ? (execution_timing_error ? ErrorCode::kInvariantViolation
+                                                                  : ErrorCode::kExecutionTimeout)
+                                         : ErrorCode::kStopFailed);
         auto terminal_state =
             stop_completed ? ExecutionState::kFailed : ExecutionState::kInterventionRequired;
         auto timeout_transition = commit_terminal(terminal_state, "execution_timeout_terminal");
@@ -6934,9 +6969,9 @@ void ExecutionKernel::async_execute_worker(
         if (timeout_transition.committed == ExecutionState::kStopped ||
             timeout_transition.committed == ExecutionState::kInterrupted) {
           auto terminal_error =
-              stop_completed ? ErrorDTO{kErrorExecutionTimeout, "Execution timeout exceeded", {}}
+              stop_completed ? execution_error
                              : operator_intervention_error(ErrorCode::kStopFailed,
-                                                           "Execution timeout exceeded "
+                                                           execution_error.message + " "
                                                            "and software stop completion "
                                                            "was not observed",
                                                            "execution_timeout_stop_drain", prev,
@@ -6977,10 +7012,10 @@ void ExecutionKernel::async_execute_worker(
         to_snapshot.move_id = request.move_id;
         to_snapshot.state = terminal_state;
         ErrorDTO terminal_error =
-            stop_completed ? ErrorDTO{kErrorExecutionTimeout, "Execution timeout exceeded", {}}
+            stop_completed ? execution_error
                            : operator_intervention_error(
                                  ErrorCode::kStopFailed,
-                                 "Execution timeout exceeded and software stop "
+                                 execution_error.message + " and software stop "
                                  "completion was not observed",
                                  "execution_timeout_stop_drain", prev, exec_id, request.move_id);
         to_snapshot.error = terminal_error;
@@ -7001,7 +7036,9 @@ void ExecutionKernel::async_execute_worker(
           metrics_.executions_failed++;
         }
         finalize_motion_execution_outcome(motion_state, MotionExecutionTerminalCause::kFailed,
-                                          terminal_error, std::nullopt, "execution_timeout");
+                                          terminal_error, std::nullopt,
+                                          execution_timing_error ? "execution_timing_fault"
+                                                                 : "execution_timeout");
         return;
       }
 
@@ -7476,6 +7513,10 @@ void ExecutionKernel::async_execute_worker(
           }
 
           std::shared_ptr<const PreparedOperationParticipantDTO> resume_participant;
+          if (resume_request.trajectory_relative_timeout) {
+            resume_request.timeouts.execution_timeout_s = requested_execution_timeout_s;
+            resolve_motion_execution_timeout(resume_request, resumed_trajectory);
+          }
           if (prepared_resume) {
             ExecuteWorkerPlanPhaseResult resume_plan_phase;
             resume_plan_phase.trajectory = resumed_trajectory;
@@ -7562,6 +7603,13 @@ void ExecutionKernel::async_execute_worker(
           motion_state.runtime_collision_protection_generation = start_collision_monitoring(
               "resume_dispatch", RuntimeCollisionProtectionPurpose::kMotion,
               &resume_scene.inventory());
+          // A freshly validated manual remainder gets its own duration-based
+          // budget. Authored Program deadlines remain cumulative, unchanged.
+          if (resume_request.trajectory_relative_timeout) {
+            exec_timeout_ns = static_cast<int64_t>(resume_request.timeouts.execution_timeout_s * 1e9);
+            runtime_scaled_execution_ns = 0.0;
+            last_runtime_scale_sample_ns = clock_.now();
+          }
           execution_handle =
               prepared_resume ? execution_backend_.DispatchResume(
                                     *resume_participant, resume_request.binding.controller_goal_id,

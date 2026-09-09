@@ -1,8 +1,30 @@
 import { Matrix4, Quaternion, Vector3 } from 'three';
+import type { Pose3Value } from '../types/robotControl';
 
 export interface PoseTuple {
   position: [number, number, number];
   quaternion: [number, number, number, number];
+}
+
+export function poseTupleFromValue(pose: Pose3Value): PoseTuple {
+  return {
+    position: [pose.position_m.x_m, pose.position_m.y_m, pose.position_m.z_m],
+    quaternion: [pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w],
+  };
+}
+
+export function poseValueFromTuple(pose: PoseTuple): Pose3Value {
+  return {
+    position_m: { x_m: pose.position[0], y_m: pose.position[1], z_m: pose.position[2] },
+    orientation: { x: pose.quaternion[0], y: pose.quaternion[1], z: pose.quaternion[2], w: pose.quaternion[3] },
+  };
+}
+
+/** Transform round-off and q/-q do not constitute an authoring edit. */
+export function samePose(left: PoseTuple, right: PoseTuple): boolean {
+  return new Vector3(...left.position).distanceToSquared(new Vector3(...right.position)) < 1e-18
+    && 1 - Math.abs(new Quaternion(...left.quaternion).normalize()
+      .dot(new Quaternion(...right.quaternion).normalize())) < 1e-14;
 }
 
 function finiteTuple(values: unknown, length: number): number[] | null {

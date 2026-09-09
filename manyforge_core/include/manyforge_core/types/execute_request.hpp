@@ -244,6 +244,11 @@ struct ExecuteRequestDTO {
   /// prevents a prior operation's participant-local scale from leaking into a
   /// newly dispatched operation before the first focused-port update.
   std::optional<ResolvedRuntimeScaleCommandDTO> initial_runtime_scale;
+  /// Composition-owned manual-motion policy; not a public intent field.
+  /// Resolve the completion budget from the final validated trajectory,
+  /// retaining timeouts.execution_timeout_s as its minimum. Program requests
+  /// keep their explicit execution budget (false).
+  bool trajectory_relative_timeout{};
   /// Kernel-owned count of actual carried-versus-detached contacts discovered
   /// from waypoint zero before candidate planning. Public operation intent has
   /// no corresponding field; the value is evidence for the exact retained

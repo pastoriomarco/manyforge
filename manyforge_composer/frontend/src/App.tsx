@@ -221,7 +221,7 @@ export default function App() {
     : null;
   useOperationalErrorMirror({
     source: 'composer.robot_control',
-    title: 'Robot preview or operation command failed',
+    title: 'Robot control request failed',
     message: robotOperationalError,
     onDismiss: robotControl.dismissError,
   });

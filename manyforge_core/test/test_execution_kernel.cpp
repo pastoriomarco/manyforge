@@ -5686,9 +5686,40 @@ TEST_F(ExecutionKernelTest, ControlEpoch_StaleAcknowledgementsRejectBeforeRecove
 }
 
 TEST_F(ExecutionKernelTest, Resume_FromPaused_ReplansFromFreshCurrentState) {
-  ControlledExecution controlled_execution;
-  FakeClock local_clock;
-  ManualScheduler local_scheduler;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  class TimedResumeExecution final : public ControlledExecution {
+   public:
+    explicit TimedResumeExecution(ThreadSafeFakeClock& clock) : clock_(clock) {}
+    std::promise<void> initial_elapsed;
+    int initial_ticks{};
+    int resumed_ticks{};
+    ExecutionHandle execute_trajectory(const TrajectoryDTO& trajectory) override {
+      auto handle = ControlledExecution::execute_trajectory(trajectory);
+      const auto wait = handle.wait_for_completion;
+      handle.wait_for_completion = [this, wait](int64_t timeout) {
+        if (initial_ticks >= 8) return wait(timeout);
+        clock_.advance(1'000'000'000);
+        const bool result = wait(1);
+        if (++initial_ticks == 8) initial_elapsed.set_value();
+        return result;
+      };
+      return handle;
+    }
+    ExecutionHandle resume(const TrajectoryDTO& trajectory) override {
+      auto handle = ControlledExecution::resume(trajectory);
+      const auto wait = handle.wait_for_completion;
+      handle.wait_for_completion = [this, wait](int64_t) {
+        if (wait(1)) return true;
+        clock_.advance(1'000'000'000);
+        if (++resumed_ticks == 31) complete();
+        return wait(1);
+      };
+      return handle;
+    }
+   private:
+    ThreadSafeFakeClock& clock_;
+  } controlled_execution{local_clock};
   TrajectoryCache local_cache{CacheConfig{10}};
   MockCollisionWorldPublisher local_collision_world;
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
@@ -5704,11 +5735,16 @@ TEST_F(ExecutionKernelTest, Resume_FromPaused_ReplansFromFreshCurrentState) {
     events.push_back(event);
   });
 
-  auto result = controlled_kernel.execute(make_test_request());
+  auto request = make_test_request();
+  request.trajectory_relative_timeout = true;
+  request.timeouts.execution_timeout_s = 10.0;
+  auto result = controlled_kernel.execute(request);
   ASSERT_TRUE(result.ok());
   ASSERT_TRUE(controlled_execution.wait_until_execute_called())
       << "wait_until_execute_called timed out";
   ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+  ASSERT_EQ(controlled_execution.initial_elapsed.get_future().wait_for(std::chrono::seconds(2)),
+            std::future_status::ready);
 
   controlled_execution.set_progress(0.5, {0.5, 0.5});
   auto pause_result = controlled_kernel.pause();
@@ -5720,13 +5756,17 @@ TEST_F(ExecutionKernelTest, Resume_FromPaused_ReplansFromFreshCurrentState) {
   context.current_state_value.positions_rad = {0.25, 0.25};
   PlanResultDTO resume_plan_ok;
   resume_plan_ok.trajectory = make_test_trajectory_from({0.25, 0.25}, {1.0, 1.0});
+  resume_plan_ok.trajectory->waypoints.back().time_from_start_s = 20.0;
   planner.next_result = resume_plan_ok;
+  planner.on_plan = [&](int) { local_clock.advance(2'000'000'000); };
 
   auto resume_result = controlled_kernel.resume();
   ASSERT_TRUE(resume_result.accepted);
   ASSERT_TRUE(controlled_execution.wait_until_resume_called())
       << "wait_until_resume_called timed out";
-  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+  ASSERT_TRUE(controlled_kernel.wait_for_completion(2'000'000'000));
+  EXPECT_EQ(controlled_execution.resumed_ticks, 31);
+  EXPECT_EQ(controlled_execution.stop_count_value(), 0);
 
   EXPECT_EQ(planner.plan_count, 2);
   EXPECT_EQ(controlled_execution.sync_observed_state_count, 2);
@@ -5777,8 +5817,6 @@ TEST_F(ExecutionKernelTest, Resume_FromPaused_ReplansFromFreshCurrentState) {
   EXPECT_TRUE(resume_validation_details.contains("collision_ordered_contact_summary_used"));
   EXPECT_TRUE(resume_validation_details.contains("collision_validation_wall_ns"));
 
-  controlled_execution.complete();
-  controlled_kernel.wait_for_completion();
   EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kCompleted);
 }
 
@@ -11881,6 +11919,121 @@ TEST_F(ExecutionKernelTest, EventSubscriberExceptionDoesNotBlockOtherSubscribers
 // =============================================================================
 // Timeout Tests (W-1, W-2)
 // =============================================================================
+
+TEST_F(ExecutionKernelTest, ExecutionTimeout_UsesFinalManualDurationAndAppliedScale) {
+  // Real Kernel worker, fake time. Each backend wait advances one virtual
+  // second; no robot, wall-clock trajectory, or timing-sensitive test sleeps.
+  enum class FeedbackFailure { kNone, kError, kThrow, kLostSupport };
+  class TimedExecution final : public ControlledExecution {
+   public:
+    std::function<void()> tick;
+    double applied_scale{1.0};
+    FeedbackFailure failure{FeedbackFailure::kNone};
+    bool timing_started{false};
+    ExecutionHandle execute_trajectory(const TrajectoryDTO& trajectory) override {
+      auto handle = ControlledExecution::execute_trajectory(trajectory);
+      const auto wait = handle.wait_for_completion;
+      handle.wait_for_completion = [this, wait](int64_t) {
+        if (wait(1)) return true;
+        timing_started = true;
+        tick();
+        return wait(1);
+      };
+      return handle;
+    }
+    RuntimeScaleMechanismStatusDTO runtime_velocity_scale_status() const override {
+      RuntimeScaleMechanismStatusDTO result;
+      result.supported = true;
+      result.active = true;
+      result.commanded_scale = 1.0;
+      result.applied_scale = applied_scale;
+      if (timing_started) {
+        if (failure == FeedbackFailure::kThrow) throw std::runtime_error("timing feedback failed");
+        if (failure == FeedbackFailure::kError) {
+          result.error = ErrorDTO{kErrorInternalError, "timing feedback unavailable", {}};
+        }
+        if (failure == FeedbackFailure::kLostSupport) result.supported = false;
+      }
+      return result;
+    }
+  };
+  struct Case {
+    bool manual;
+    double floor;
+    double scale;
+    int complete_at;
+    int expected_ticks;
+    bool hold_first;
+    FeedbackFailure failure{FeedbackFailure::kNone};
+  };
+  for (const auto& test : {
+           Case{true, 10.0, 1.0, 20, 20, false},   // A 20 s plan is not a 10 s failure.
+           Case{true, 10.0, 1.0, 100, 32, false},  // Missing completion is still bounded.
+           Case{false, 10.0, 1.0, 100, 10, false}, // Authored Program budget is unchanged.
+           Case{true, 10.0, 0.25, 80, 80, false},  // Use applied, not requested scale.
+           Case{true, 10.0, 1.0, 21, 21, true},   // Zero-scale hold consumes no budget.
+           Case{false, 10.0, 1.0, 10, 10, false},  // Completion at the deadline wins.
+           Case{true, 50.0, 1.0, 100, 50, false}, // Preserve a larger requested budget.
+           Case{true, 10.0, std::numeric_limits<double>::quiet_NaN(), 100, 1, false},
+           Case{true, 10.0, 1.0, 100, 1, false, FeedbackFailure::kError},
+           Case{true, 10.0, 1.0, 100, 1, false, FeedbackFailure::kThrow},
+           Case{true, 10.0, 1.0, 100, 1, false, FeedbackFailure::kLostSupport},
+       }) {
+    SCOPED_TRACE(test.expected_ticks);
+    TimedExecution timed;
+    timed.failure = test.failure;
+    ThreadSafeFakeClock ts_clock;
+    ThreadSafeManualScheduler ts_scheduler;
+    TrajectoryCache local_cache{CacheConfig{10}};
+    ExecutionKernel timed_kernel{planner, context, timed, ts_clock, ts_scheduler, local_cache};
+    configure_authoritative_collision_validation(timed_kernel, collision_world_publisher,
+                                                 collision_engine);
+    planner.next_result.trajectory = make_test_trajectory();
+    planner.next_result.trajectory->waypoints.back().time_from_start_s = 20.0;
+    int ticks = 0;
+    timed.tick = [&] {
+      ++ticks;
+      timed.applied_scale = test.hold_first && ticks == 1 ? 0.0 : test.scale;
+      ts_clock.advance(test.hold_first && ticks == 1 ? 1'000'000'000'000 : 1'000'000'000);
+      if (ticks >= test.complete_at) timed.complete();
+    };
+    auto request = make_test_request();
+    request.trajectory_relative_timeout = test.manual;
+    request.timeouts.execution_timeout_s = test.floor;
+    if (test.failure == FeedbackFailure::kLostSupport) {
+      request.binding.runtime_scale_qualification = RuntimeScaleRouteQualificationDTO{
+          request.binding.control_route_id, ScalingDomainId{"test-scaling"},
+          EndpointRoleId{"scale-command"}, EndpointRoleId{"scale-state"}, std::nullopt,
+          RuntimeScaleAcknowledgementKind::kAppliedState, 4.0, 100'000'000};
+      const auto& binding = request.binding;
+      request.initial_runtime_scale = ResolvedRuntimeScaleCommandDTO{
+          binding.operation_id, OperationRevision{1}, binding.participant_id,
+          binding.controllable_component_id, binding.command_target_id, binding.capability_id,
+          binding.control_domain_id, binding.control_domain_revision, binding.control_binding_id,
+          binding.control_binding_revision, binding.controller_goal_id,
+          binding.controller_goal_generation, binding.controller_topology_id,
+          binding.topology_revision, binding.control_route_id, ScalingDomainId{"test-scaling"},
+          std::nullopt, binding.resources, binding.active_control_configuration_id,
+          binding.active_control_configuration_generation, RuntimeScaleGeneration{0},
+          RuntimeScaleGeneration{0}, 1.0};
+    }
+    const auto accepted = timed_kernel.execute(request);
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    ASSERT_TRUE(timed_kernel.wait_for_completion(2'000'000'000));
+    EXPECT_EQ(ticks, test.expected_ticks);
+    if (test.complete_at == test.expected_ticks) {
+      EXPECT_EQ(timed_kernel.get_status().state, ExecutionState::kCompleted);
+      EXPECT_EQ(timed.stop_count_value(), 0);
+    } else {
+      EXPECT_EQ(timed_kernel.get_status().state, ExecutionState::kFailed);
+      ASSERT_TRUE(timed_kernel.get_execution_snapshot().error.has_value());
+      EXPECT_EQ(timed_kernel.get_execution_snapshot().error->code,
+                std::isfinite(test.scale) && test.failure == FeedbackFailure::kNone
+                    ? kErrorExecutionTimeout : kErrorInvariantViolation);
+      EXPECT_GE(timed.stop_count_value(), 1);
+    }
+  }
+}
 
 TEST_F(ExecutionKernelTest, ExecutionTimeout_TransitionsToFailed) {
   // ControlledExecution never completes — timeout should trigger

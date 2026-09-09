@@ -720,7 +720,8 @@ select_disable_active_configurations(
     const OperationId& operation_id, OperationRevision operation_revision,
     const OperationParticipantId& participant_id, const ControllerGoalId& controller_goal_id,
     ControllerGoalGeneration controller_goal_generation,
-    const RuntimeParticipantPolicySelection& runtime_policy, const double initial_runtime_scale) {
+    const RuntimeParticipantExecutionRegistration& registration, const double initial_runtime_scale) {
+  const auto& runtime_policy = *registration.runtime_policy;
   if (binding.model_groups.size() != 1U) {
     return reject<ExecuteRequestDTO>("I6 motion requires exactly one retained model group",
                                      "i6_motion_model_group_cardinality_invalid");
@@ -933,7 +934,28 @@ select_disable_active_configurations(
         "named_target_resolution_unavailable", ErrorCode::kMissingReference);
   }
 
-  for (const auto& [joint_name, limit] : motion.per_joint_dynamics_limits) {
+  auto joint_limits = motion.per_joint_dynamics_limits;
+  if (registration.intrinsic_direct_control) {
+    const auto tighten = [](std::optional<double>& requested, const std::optional<double>& ceiling) {
+      if (ceiling.has_value()) {
+        requested = requested.has_value() ? std::min(*requested, *ceiling) : *ceiling;
+      }
+    };
+    for (const auto& [joint_name, ceiling] : registration.direct_control_joint_limits) {
+      for (const auto& value : {ceiling.max_velocity_rad_s, ceiling.max_acceleration_rad_s2,
+                                ceiling.max_jerk_rad_s3}) {
+        if (value.has_value() && (!std::isfinite(*value) || *value <= 0.0)) {
+          return reject<ExecuteRequestDTO>("retained manual dynamics ceiling is invalid",
+                                           "direct_control_joint_limit_invalid");
+        }
+      }
+      auto& limit = joint_limits[joint_name];
+      tighten(limit.max_velocity_rad_s, ceiling.max_velocity_rad_s);
+      tighten(limit.max_acceleration_rad_s2, ceiling.max_acceleration_rad_s2);
+      tighten(limit.max_jerk_rad_s3, ceiling.max_jerk_rad_s3);
+    }
+  }
+  for (const auto& [joint_name, limit] : joint_limits) {
     const auto* resource = find_source_joint(binding, joint_name);
     if (resource == nullptr || resource->coordinate_kind != CoordinateKind::kAngular) {
       return reject<ExecuteRequestDTO>(
@@ -4275,45 +4297,54 @@ struct ResourceAddressedExecutionKernel::PreviewSession final : IAddressedMotion
 
   [[nodiscard]] Result<RuntimeParticipantBindingDTO> resolve_binding(
       const OperationIntentDTO& intent) const override {
+    auto resolved = resolve_registration(intent);
+    if (!resolved.ok()) return Result<RuntimeParticipantBindingDTO>::Err(resolved.error());
+    return Result<RuntimeParticipantBindingDTO>::Ok(resolved.value().binding.value());
+  }
+
+ private:
+  [[nodiscard]] Result<RuntimeParticipantExecutionRegistration> resolve_registration(
+      const OperationIntentDTO& intent) const {
     auto validation = validate_operation_intent(intent);
     if (!validation.ok()) {
-      return Result<RuntimeParticipantBindingDTO>::Err(validation.error());
+      return Result<RuntimeParticipantExecutionRegistration>::Err(validation.error());
     }
     if (intent.request_context.request_owner_epoch != owner_.config_.request_owner_epoch) {
-      return Result<RuntimeParticipantBindingDTO>::Err(
+      return Result<RuntimeParticipantExecutionRegistration>::Err(
           error("stale_request_owner_epoch", "preview request names a stale Kernel owner epoch",
                 "stale_request_owner_epoch"));
     }
     if (intent.participants.size() != 1U ||
         intent.coordination_policy != OperationCoordinationPolicy::kIndependent) {
-      return reject<RuntimeParticipantBindingDTO>("I6 preview admits one independent participant",
+      return reject<RuntimeParticipantExecutionRegistration>("I6 preview admits one independent participant",
                                                   "i6_preview_single_participant_only");
     }
     auto resolved = owner_.resolve_registration(intent, 0U);
     if (!resolved.ok()) {
-      return Result<RuntimeParticipantBindingDTO>::Err(resolved.error());
+      return Result<RuntimeParticipantExecutionRegistration>::Err(resolved.error());
     }
     if (resolved.value().engine != &primary_engine_) {
-      return reject<RuntimeParticipantBindingDTO>(
+      return reject<RuntimeParticipantExecutionRegistration>(
           "linked preview motions cross their exact execution engine",
           "motion_preview_engine_changed", ErrorCode::kInvariantViolation);
     }
     if (!resolved.value().runtime_policy.has_value() ||
         resolved.value().runtime_policy->value() != primary_runtime_policy_.value()) {
-      return reject<RuntimeParticipantBindingDTO>(
+      return reject<RuntimeParticipantExecutionRegistration>(
           "linked preview motions cross their exact retained runtime policy",
           "motion_preview_runtime_policy_changed", ErrorCode::kInvariantViolation);
     }
-    return Result<RuntimeParticipantBindingDTO>::Ok(resolved.value().binding.value());
+    return resolved;
   }
 
+ public:
   [[nodiscard]] Result<ExecuteRequestDTO> prepare_motion(
       const OperationIntentDTO& intent) override {
-    auto resolved = resolve_binding(intent);
+    auto resolved = resolve_registration(intent);
     if (!resolved.ok()) {
       return Result<ExecuteRequestDTO>::Err(resolved.error());
     }
-    if (!same_linked_preview_participant(resolved.value(), primary_binding_.value())) {
+    if (!same_linked_preview_participant(resolved.value().binding.value(), primary_binding_.value())) {
       return reject<ExecuteRequestDTO>(
           "linked preview motions cross their exact runtime participant",
           "motion_preview_binding_changed");
@@ -4335,9 +4366,9 @@ struct ResourceAddressedExecutionKernel::PreviewSession final : IAddressedMotion
     const ControllerGoalId controller_goal_id(prefix + ":controller-goal:1");
     return build_motion_request(
         intent, intent.participants.front(),
-        std::get<MotionParticipantIntentDTO>(intent.participants.front().payload), resolved.value(),
+        std::get<MotionParticipantIntentDTO>(intent.participants.front().payload), resolved.value().binding.value(),
         operation_id, OperationRevision(1U), participant_id, controller_goal_id,
-        ControllerGoalGeneration(1U), primary_runtime_policy_, 1.0);
+        ControllerGoalGeneration(1U), resolved.value(), 1.0);
   }
 
   [[nodiscard]] Result<RobotStateDTO> current_state() const override {
@@ -5036,11 +5067,12 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
     auto built = build_motion_request(intent, intent.participants.front(), motion, binding,
                                       operation_id, operation_revision, participant_id,
                                       controller_goal_id, controller_goal_generation,
-                                      *resolved.value().runtime_policy, initial_runtime_scale);
+                                      resolved.value(), initial_runtime_scale);
     if (!built.ok()) {
       return Result<OperationAcceptedDTO>::Err(built.error());
     }
     motion_request = std::move(built.value());
+    motion_request->trajectory_relative_timeout = resolved.value().intrinsic_direct_control;
   } else {
     const auto& command = std::get<CapabilityCommandIntentDTO>(intent.participants.front().payload);
     auto built = build_command_request(command, binding);
@@ -5677,7 +5709,7 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
       coordinated_initial_runtime_scale = initial_runtime_scale;
       auto request = build_motion_request(intent, participant_intent, motion, binding, operation_id,
                                           operation_revision, participant_id, controller_goal_id,
-                                          controller_goal_generation, *registration.runtime_policy,
+                                          controller_goal_generation, registration,
                                           initial_runtime_scale);
       if (!request.ok()) {
         return Result<OperationAcceptedDTO>::Err(request.error());

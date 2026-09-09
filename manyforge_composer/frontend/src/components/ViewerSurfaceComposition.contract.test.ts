@@ -26,7 +26,8 @@ describe('UI4 application and viewport composition', () => {
     expect(viewer).toContain('createPortal(');
     expect(viewer).toContain('Maximize viewer inspector');
     expect(viewer).not.toContain('<OverlayPanel');
-    expect(viewer).toContain('{transportControls}');
+    expect(viewer).toContain("typeof transportControls === 'function'");
+    expect(viewer).toContain('}) : transportControls}');
     expect(viewer).toContain("inspectorPanel === 'robot' ? ' robot-inspector-body' : ''");
     expect(viewer).toContain("inspectorPanel === 'robot' && robotControlBlocked");
     expect(viewer).toContain('aria-label="Robot control information"');
@@ -38,7 +39,8 @@ describe('UI4 application and viewport composition', () => {
     expect(styles).toMatch(/\.robot-control-panel \{[^}]*height: 100%;[^}]*flex-direction: column;/);
     expect(styles).toMatch(/\.robot-control-body \{[^}]*display: flex;[^}]*flex-direction: column;[^}]*overflow: hidden;/);
     expect(styles).toMatch(/\.robot-control-editor \{[^}]*flex: 1 1 auto;[^}]*overflow: auto;/);
-    expect(styles).toMatch(/\.robot-control-preview \{[^}]*flex: 0 1 auto;[^}]*max-height: min\(28vh, 16rem\);/);
+    expect(styles).toMatch(/\.robot-control-preview \{[^}]*flex: 0 0 auto;[^}]*max-height: min\(40vh, 24rem, 100%\);/);
+    expect(styles).toMatch(/\.robot-control-preview-notice \{[^}]*position: absolute;/);
     expect(styles).toMatch(/\.robot-control-footer \{\s*flex: 0 0 auto;/);
     expect(styles).toMatch(/\.robot-control-actions \{[\s\S]*?justify-content: center;/);
     expect(styles).toMatch(/\.viewer-inspector-section \.robot-control-modes \{[\s\S]*?justify-content: center;/);

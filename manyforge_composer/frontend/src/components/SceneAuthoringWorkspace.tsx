@@ -7,6 +7,7 @@ import {
   useEffect,
   useLayoutEffect,
   useMemo,
+  useRef,
   useState,
 } from 'react';
 import type { ReactNode } from 'react';
@@ -26,10 +27,8 @@ import type { RobotControlController } from '../hooks/useRobotControl';
 import { ProgramTransportControls } from './ProgramRuntimePanel';
 import { ProgramContactPolicyEditor } from './ProgramContactPolicyEditor';
 import { RobotControlPanelView } from './RobotControlPanel';
-import type {
-  RobotTcpTransformMode,
-  RobotTcpTransformSpace,
-} from './RobotControlPanel';
+import { useGizmoSettings } from './common/GizmoControls';
+import type { GizmoController } from './common/GizmoControls';
 import type { ViewerInspectorPanel } from './StructuralViewer';
 import {
   candidateTcpPoseFromCell,
@@ -56,9 +55,11 @@ import {
 } from '../state/sceneAuthoring';
 import {
   candidateRobotPresentation,
+  candidateToolPresentation,
   createExecutionRobotPresentationReader,
   executionRobotPresentation,
   runtimeScenePresentation,
+  candidateObservationEpoch,
 } from '../state/runtimeScenePresentation';
 import {
   quaternionFromRpyDegrees,
@@ -91,6 +92,7 @@ import type {
 } from '../types/api';
 import type { MotionPreviewReceipt, Pose3Value } from '../types/robotControl';
 import type { PoseTuple } from '../utils/poseTransforms';
+import { poseValueFromTuple } from '../utils/poseTransforms';
 
 const StructuralViewer = lazy(async () => {
   const module = await import('./StructuralViewer');
@@ -1498,11 +1500,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   ghost,
   ghostStale,
   candidatePoseEditable,
-  onEditCandidatePose,
-  tcpTransformMode,
-  tcpTransformSpace,
-  onTcpTransformModeChange,
-  onTcpTransformSpaceChange,
+  gizmo,
   onCommitTransform,
   onDuplicate,
   onRemove,
@@ -1548,11 +1546,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   ghost: Pose3Value | null;
   ghostStale: boolean;
   candidatePoseEditable: boolean;
-  onEditCandidatePose: (pose: Pose3Value) => void;
-  tcpTransformMode: RobotTcpTransformMode;
-  tcpTransformSpace: RobotTcpTransformSpace;
-  onTcpTransformModeChange: (mode: RobotTcpTransformMode) => void;
-  onTcpTransformSpaceChange: (space: RobotTcpTransformSpace) => void;
+  gizmo: GizmoController;
   onCommitTransform: (
     sceneResourceId: string,
     pose: LogicalScenePose,
@@ -1642,11 +1636,6 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
     objects.length,
     draftPreviewObjects.length,
   );
-  const candidateRobot = useMemo(() => (
-    motionPreview === null || readyManifest === null
-      ? null
-      : candidateRobotPresentation(motionPreview, readyManifest)
-  ), [motionPreview, readyManifest]);
   const selectedSceneResourceId = selection?.kind === 'owner_object'
     ? (programDraftPreview ? null : selection.id)
     : selection?.kind === 'program_resource'
@@ -1717,6 +1706,74 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
     ),
     [motionDescriptor, readyManifest, source, sourceValue],
   );
+  const candidates = useMemo(() => {
+    if (readyManifest === null || motionDescriptor === null) return null;
+    const observation = source.getLatestExecutionObservation();
+    // The cold arm-only bootstrap defaults other joints to neutral. A target
+    // ghost needs actual tool coverage, not that presentation-only fallback.
+    if (candidateObservationEpoch(observation, robotControl.state.status) === null) return null;
+    const measured = executionObservationPresentation.readMeasuredRobotPresentation();
+    if (measured === null) return null;
+    const tool = ghost === null || robotControl.state.status === null || sourceValue === null
+        ? null : candidateToolPresentation(
+          ghost, robotControl.state.status, sourceValue, readyManifest, measured.linkTransforms,
+        );
+    const robot = motionPreview === null || robotControl.state.phase !== 'ready'
+      || robotControl.state.poseDragging
+      || robotControl.state.operation !== null || programRuntime.cycleState !== 'idle_after_reset'
+      ? null : candidateRobotPresentation(
+      motionPreview, readyManifest, motionDescriptor, measured.linkTransforms,
+    );
+    return { robot, tool };
+  }, [executionObservationPresentation, ghost, motionDescriptor, motionPreview, readyManifest,
+    robotControl.state.phase, robotControl.state.status, robotControl.state.operation, robotControl.state.poseDragging,
+    programRuntime.cycleState, source, sourceValue]);
+  const dragReference = useRef<string | null>(null);
+  const readCandidateReference = () => {
+    const status = robotControl.currentStatus;
+    if (status === null || sourceValue === null) return null;
+    const observationEpoch = candidateObservationEpoch(source.getLatestExecutionObservation(), status);
+    if (observationEpoch === null) return null;
+    const frames = status.directControl.targetDescriptor.frames;
+    const base = frames.find((frame) => frame.frameRoleId === status.directControl.baseFrameRoleId);
+    const tcp = frames.find((frame) => frame.frameRoleId === status.directControl.tcpFrameRoleId);
+    const transforms = executionObservationPresentation.readMeasuredRobotPresentation()?.linkTransforms;
+    const basePose = base === undefined ? undefined : transforms?.[base.compiledFrameName];
+    const tcpPose = tcp === undefined ? undefined : transforms?.[tcp.compiledFrameName];
+    if (base === undefined || basePose === undefined || tcpPose === undefined) return null;
+    return {
+      key: JSON.stringify([observationEpoch, status.retainedBundleId, status.graphRevision,
+        status.directControl.programBindingId, base, tcp, basePose, tcpPose]),
+      base: { modelInstanceId: base.modelInstanceId, viewerLinkName: base.compiledFrameName,
+        poseInCell: poseValueFromTuple({ position: basePose.position_m, quaternion: basePose.orientation_xyzw }) },
+      status,
+    };
+  };
+  const beginCandidateDrag = () => {
+    const reference = readCandidateReference();
+    if (reference === null || !robotControl.beginPoseDrag()) return false;
+    dragReference.current = reference.key;
+    return true;
+  };
+  const finishCandidateDrag = (pose: Pose3Value | null) => {
+    if (!robotControl.state.poseDragging) {
+      dragReference.current = null;
+      robotControl.finishPoseDrag(null);
+      return;
+    }
+    const reference = readCandidateReference();
+    const valid = reference !== null && reference.key === dragReference.current;
+    dragReference.current = null;
+    if (!valid) {
+      robotControl.finishPoseDrag(null);
+      robotControl.revert();
+      return;
+    }
+    const control = reference.status.directControl;
+    const local = pose === null ? null : candidateTcpPoseFromCell(sourceValue,
+      control.controllableComponentId, control.commandTargetId, control.baseFrameRoleId, pose, reference.base);
+    robotControl.finishPoseDrag(local?.available ? local.pose : null);
+  };
   const frameAxes = useMemo(() => {
     if (sourceValue === null || readyManifest === null) return [];
     const rolesBySourceLink = new Map<string, string[]>();
@@ -1926,10 +1983,17 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
       candidateTcpPose={ghost}
       candidateStale={ghostStale}
       candidateTcpEditable={candidatePoseEditable}
-      onEditCandidateTcpPose={onEditCandidatePose}
-      candidateTcpTransformMode={tcpTransformMode}
-      candidateTcpTransformSpace={tcpTransformSpace}
-      candidateRobot={candidateRobot}
+      onEditCandidateTcpPose={finishCandidateDrag}
+      onBeginCandidateTcpDrag={beginCandidateDrag}
+      candidateContextKey={JSON.stringify([robotControl.state.status?.ownerEpoch,
+        robotControl.state.status?.retainedBundleId, robotControl.state.status?.graphRevision,
+        robotControl.state.status?.directControl.programBindingId, robotControl.state.status?.sceneRevision,
+        robotControl.state.mode, robotControl.state.moveToDraft?.source,
+        programRuntime.cycleState, runtimeEnabled])}
+      gizmo={gizmo}
+      candidateRobot={candidates?.robot ?? null}
+      candidateTool={candidates?.tool ?? null}
+      candidateRejected={robotControl.state.previewIssue !== null}
       runtimePresentation={runtimePresentation}
       executionObservationPresentation={executionObservationPresentation}
       executionObservationTransport={observationTransport}
@@ -1951,10 +2015,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
           draft={programController}
           sourceFrameNames={sourceFrameNames}
           controlBasePoseInCell={controlBasePoseInCell}
-          tcpTransformMode={tcpTransformMode}
-          tcpTransformSpace={tcpTransformSpace}
-          onTcpTransformModeChange={onTcpTransformModeChange}
-          onTcpTransformSpaceChange={onTcpTransformSpaceChange}
+          gizmo={gizmo}
         />
       )}
       robotControlBlocked={robotControl.state.phase === 'blocked'}
@@ -1964,11 +2025,12 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
       onInspectorMinimizedChange={onInspectorMinimizedChange}
       onInspectorMaximize={onInspectorMaximize}
       onInspectorPanelChange={onInspectorPanelChange}
-      transportControls={(
+      transportControls={(openRobotControls) => (
         <ProgramTransportControls
           enabled={runtimeEnabled}
           program={programRuntime}
           robot={robotControl}
+          onOpenRobotControls={openRobotControls}
           onOpenRuntimeHistory={onOpenRuntimeHistory}
         />
       )}
@@ -2066,12 +2128,7 @@ export function SceneAuthoringWorkspace({
     )).join('\u0000'),
     [stableProgramSceneIds, viewer?.scene_resource_axes_visibility],
   );
-  const [tcpTransformMode, setTcpTransformMode] = useState<RobotTcpTransformMode>(
-    'translate',
-  );
-  const [tcpTransformSpace, setTcpTransformSpace] = useState<RobotTcpTransformSpace>(
-    'world',
-  );
+  const gizmo = useGizmoSettings();
   const [commitState, setCommitState] = useState<
     { kind: 'idle' | 'busy' | 'success' | 'error'; message: string | null }
   >({ kind: 'idle', message: null });
@@ -2209,6 +2266,9 @@ export function SceneAuthoringWorkspace({
         }
   ), [candidateViewerBase]);
   const tcpRole = directControl?.tcpFrameRoleId ?? null;
+  const previewAvailable = robotControl.state.operation === null
+    && !robotControlHasActiveOperation(robotControl.state)
+    && programRuntime.cycleState === 'idle_after_reset';
   const ghostVisible = tcpRole === null
     || viewer?.frame_role_visibility?.[tcpRole] !== false;
   const previewGhost = robotControl.state.ghost;
@@ -2216,12 +2276,11 @@ export function SceneAuthoringWorkspace({
     || robotControl.state.mode === 'cartesian_path'
     || (robotControl.state.mode === 'move_to'
       && robotControl.state.moveToKind !== 'joint');
-  const candidateTcp = previewGhost?.finalTcpPose
-    ?? (tcpDraftMode
+  const candidateTcp = tcpDraftMode
       ? robotControlHasLocalDraft(robotControl.state)
         ? robotControl.state.draftPose
         : robotControl.state.status?.observedMotion.currentTcpPose ?? null
-      : null);
+      : previewGhost?.finalTcpPose ?? null;
   const cellGhost = useMemo(() => candidateTcp === null
     ? null
     : candidateTcpPoseInCell(
@@ -2232,25 +2291,16 @@ export function SceneAuthoringWorkspace({
         candidateTcp,
         candidateViewerBase,
       ), [candidateTcp, candidateViewerBase, directControl, sourceValue]);
-  const ghost = tcpDraftMode && ghostVisible && cellGhost?.available
+  const ghost = previewAvailable && tcpDraftMode && ghostVisible && cellGhost?.available
     ? cellGhost.pose
     : null;
   const candidatePoseEditable = ghost !== null
     && (robotControl.state.mode === 'pose_goal'
-      || robotControl.state.mode === 'cartesian_path')
+      || robotControl.state.mode === 'cartesian_path'
+      || (robotControl.state.mode === 'move_to' && robotControl.state.moveToDraft?.source.kind === 'pose'))
+    && !robotControl.authoringPending
+    && robotControl.currentStatus !== null
     && !robotControlHasActiveOperation(robotControl.state);
-  const editRobotControlPose = robotControl.editPose;
-  const editCandidatePoseInCell = useCallback((pose: Pose3Value) => {
-    const local = candidateTcpPoseFromCell(
-      sourceValue,
-      directControl?.controllableComponentId ?? null,
-      directControl?.commandTargetId ?? null,
-      directControl?.baseFrameRoleId ?? null,
-      pose,
-      candidateViewerBase,
-    );
-    if (local.available) editRobotControlPose(local.pose);
-  }, [candidateViewerBase, directControl, editRobotControlPose, sourceValue]);
   const busyDraft = programController.state.status === 'loading'
     || (programController.state.status === 'ready'
       && programController.state.pendingAction !== null);
@@ -2571,7 +2621,7 @@ export function SceneAuthoringWorkspace({
                     <span>{field.toUpperCase()} (m)</span>
                     <input
                       type="number"
-                      step={0.001}
+                      step={gizmo.settings.linearStepM}
                       value={livePose.position_m[field]}
                       disabled={editReason !== null || commitState.kind === 'busy'}
                       onChange={(event) => editLivePose(field, event.currentTarget.valueAsNumber)}
@@ -2759,13 +2809,9 @@ export function SceneAuthoringWorkspace({
       selectionLocked={selectionLocked}
       onSelect={setSelection}
       ghost={ghost}
-      ghostStale={robotControl.state.ghostStale}
+      ghostStale={robotControl.state.ghostStale || robotControl.state.phase === 'blocked'}
       candidatePoseEditable={candidatePoseEditable}
-      onEditCandidatePose={editCandidatePoseInCell}
-      tcpTransformMode={tcpTransformMode}
-      tcpTransformSpace={tcpTransformSpace}
-      onTcpTransformModeChange={setTcpTransformMode}
-      onTcpTransformSpaceChange={setTcpTransformSpace}
+      gizmo={gizmo}
       onCommitTransform={commitTransform}
       onDuplicate={duplicateObject}
       onRemove={removeObject}

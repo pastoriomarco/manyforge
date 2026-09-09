@@ -18,6 +18,8 @@ import type { ExecutionObservationFrame } from '../types/viewerObservation';
 import {
   attachedScenePresentation,
   candidateRobotPresentation,
+  candidateToolPresentation,
+  candidateObservationEpoch,
   createExecutionRobotPresentationReader,
   executionObservationRobotPresentation,
   executionRobotPresentation,
@@ -27,10 +29,12 @@ import {
 
 function executionStatus(): ExecutionOwnerStatus {
   return {
+    ownerEpoch: 'owner-1',
     cellId: 'cell-1',
     graphRevision: 'graph-1',
     retainedBundleId: 'bundle-1',
     directControl: {
+      controllableComponentId: 'robot-1', commandTargetId: 'arm',
       targetDescriptor: {
         controllableComponentId: 'robot-1',
         commandTargetId: 'arm',
@@ -403,7 +407,15 @@ describe('runtime scene presentation', () => {
     expect(first?.observedAtNs).toBe('123000');
     expect(reads).toBe(2);
 
+    const referenceEpoch = candidateObservationEpoch(frame, executionStatus());
+    expect(referenceEpoch).not.toBeNull();
+    expect(candidateObservationEpoch(frame, { ...executionStatus(), ownerEpoch: 'owner-2' })).toBeNull();
+    expect(candidateObservationEpoch({ ...frame, graphRevision: 'other' }, executionStatus())).toBeNull();
+    expect(candidateObservationEpoch({ ...frame, sourceEpoch: 'restarted' }, executionStatus())).not.toBe(referenceEpoch);
+    expect(candidateObservationEpoch({ ...frame, targets: [{ ...frame.targets[0], sourceEpoch: 'restarted-arm' }] }, executionStatus())).not.toBe(referenceEpoch);
+
     frame = { ...frame, sourceSequence: 6, receivedAtMonotonicUs: 9_007_199_254_741 };
+    expect(candidateObservationEpoch(frame, executionStatus())).toBe(referenceEpoch);
     expect(reader.readMeasuredRobotPresentation()?.observedAtNs).toBe('9007199254741000');
 
     frame = { ...frame, targets: [{ ...frame.targets[0], compiledJointNames: ['fixed-tip'] }] };
@@ -446,6 +458,12 @@ describe('runtime scene presentation', () => {
       ],
     };
     const open = executionObservationRobotPresentation(frame, model, geometry, motionDescriptor(), null);
+    const authoringStatus = executionStatus();
+    authoringStatus.directControlGripper = {
+      controllableComponentId: 'robot-1', commandTargetId: 'gripper', sourceKind: 'model_role', sourceCoordinateName: 'finger',
+    } as ExecutionOwnerStatus['directControlGripper'];
+    expect(candidateObservationEpoch(frame, authoringStatus)).not.toBeNull();
+    expect(candidateObservationEpoch({ ...frame, targets: [frame.targets[0]] }, authoringStatus)).toBeNull();
     expect(open?.linkTransforms['finger-left'].position_m[1]).toBeCloseTo(0.025);
     expect(open?.linkTransforms['finger-right'].position_m[1]).toBeCloseTo(-0.025);
     frame.sourceSequence += 1;
@@ -767,20 +785,78 @@ describe('runtime scene presentation', () => {
       receiptDigest: 'receipt-1',
       retainedBundleId: 'bundle-1',
       graphRevision: 'graph-1',
-      sourceJointNames: ['joint-1'],
+      componentRoleId: 'controlled_component',
+      targetRoleId: 'command_target',
+      sourceJointNames: ['source-joint'],
       finalPositionsRad: [Math.PI / 2],
     } as MotionPreviewReceipt;
-    const presentation = candidateRobotPresentation(receipt, manifest());
+    const descriptor = {
+      ...executionStatus().directControl.targetDescriptor,
+      componentRoleId: 'controlled_component', targetRoleId: 'command_target',
+    };
+    const measured = measuredLinkTransforms(manifest(), new Map())!;
+    const presentation = candidateRobotPresentation(receipt, manifest(), descriptor, measured);
     expect(presentation?.receiptDigest).toBe('receipt-1');
     expect(presentation?.linkTransforms.tip.position_m[1]).toBeCloseTo(1);
 
     expect(candidateRobotPresentation({
       ...receipt,
       retainedBundleId: 'other-bundle',
-    }, manifest())).toBeNull();
+    }, manifest(), descriptor, measured)).toBeNull();
     expect(candidateRobotPresentation({
       ...receipt,
       sourceJointNames: ['missing'],
-    }, manifest())).toBeNull();
+    }, manifest(), descriptor, measured)).toBeNull();
+    expect(candidateRobotPresentation({
+      ...receipt, targetRoleId: 'another-target',
+    }, manifest(), descriptor, measured)).toBeNull();
+    expect(presentation?.linkTransforms.base).toBeUndefined();
+
+    const placed = manifest();
+    placed.links.push({ ...placed.links[2], name: 'other-robot' },
+      { ...placed.links[2], name: 'finger' }, { ...placed.links[2], name: 'cross-branch-mimic' });
+    placed.joints.push(joint('other-joint', 'revolute', 'base', 'other-robot', [3, 0, 0]),
+      joint('finger-joint', 'prismatic', 'tip', 'finger', [0, 0, 0]),
+      { ...joint('mimic-joint', 'revolute', 'base', 'cross-branch-mimic', [0, 0, 0]),
+        mimic: { master: 'joint-1', multiplier: 1, offset: 0 } });
+    const observed = measuredLinkTransforms(placed, new Map([['finger-joint', 0.025], ['other-joint', 1]]))!;
+    // The complete occurrence sits on a displaced moving base. The preview
+    // changes only its declared arm coordinates, retaining measured tool state.
+    const placement = new THREE.Matrix4().makeRotationZ(Math.PI / 2).setPosition(10, 0, 0);
+    for (const transform of Object.values(observed)) {
+      const p = new THREE.Vector3(...transform.position_m).applyMatrix4(placement);
+      const q = new THREE.Quaternion().setFromRotationMatrix(placement)
+        .multiply(new THREE.Quaternion(...transform.orientation_xyzw));
+      transform.position_m = [p.x, p.y, p.z];
+      transform.orientation_xyzw = [q.x, q.y, q.z, q.w];
+    }
+    const scoped = candidateRobotPresentation(receipt, placed, descriptor, observed)!;
+    expect(scoped.linkTransforms['other-robot']).toBeUndefined();
+    expect(scoped.linkTransforms.tip.position_m[0]).toBeCloseTo(9);
+    expect(scoped.linkTransforms.tip.position_m[1]).toBeCloseTo(1);
+    expect(scoped.linkTransforms.finger.position_m[2]).toBeCloseTo(0.025);
+    expect(Math.abs(scoped.linkTransforms['cross-branch-mimic'].orientation_xyzw[2])).toBeCloseTo(1);
+    expect(candidateRobotPresentation(receipt, placed, descriptor, {})).toBeNull();
+  });
+
+  it('marks a rejected TCP target with only its exact tool, without inventing an IK solution', () => {
+    const source = sourceModel();
+    source.occurrences[0].links = [{ source_link_name: 'source-tip', viewer_link_name: 'tip' }];
+    source.targets[1].model_groups[0].model_instance_id = 'model-instance-1';
+    const status = executionStatus();
+    status.directControl.tcpFrameRoleId = 'tcp';
+    status.directControl.targetDescriptor = motionDescriptor();
+    status.directControlGripper = { targetDescriptor: {
+      controllableComponentId: 'robot-1', commandTargetId: 'gripper', touchLinks: ['source-tip'],
+    } } as ExecutionOwnerStatus['directControlGripper'];
+    const pose = { position_m: { x_m: 7, y_m: 8, z_m: 9 }, orientation: { x: 0, y: 0, z: 0, w: 1 } };
+    const measured = measuredLinkTransforms(manifest(), new Map())!;
+    const marker = candidateToolPresentation(pose, status, source, manifest(), measured)!;
+    expect(marker.receiptDigest).toBeNull();
+    expect(Object.keys(marker.linkTransforms)).toEqual(['tip']);
+    expect(marker.linkTransforms.tip.position_m).toEqual([7, 8, 9]);
+    expect(candidateToolPresentation(pose, status, { ...source, graph_revision: 'other' }, manifest(), measured)).toBeNull();
+    source.occurrences[0].links.push({ source_link_name: 'source-tip', viewer_link_name: 'other-tip' });
+    expect(candidateToolPresentation(pose, status, source, manifest(), measured)).toBeNull();
   });
 });

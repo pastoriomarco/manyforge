@@ -19,10 +19,13 @@ import {
   Grid,
   OrbitControls,
   PerspectiveCamera,
-  TransformControls,
   useGLTF,
 } from '@react-three/drei';
 import * as THREE from 'three';
+import { AuthoringTransformControls } from './AuthoringTransformControls';
+import { GizmoSteps, useGizmoSettings } from './common/GizmoControls';
+import type { GizmoController } from './common/GizmoControls';
+import type { GizmoSettings } from '../utils/gizmo';
 import { api, resolveStructuralAssetUrl } from '../api/client';
 import {
   subscribeSnapshotObserver,
@@ -132,10 +135,13 @@ interface StructuralViewerProps {
   candidateTcpPose?: Pose3Value | null;
   candidateStale?: boolean;
   candidateTcpEditable?: boolean;
-  onEditCandidateTcpPose?: (pose: Pose3Value) => void;
-  candidateTcpTransformMode?: 'translate' | 'rotate';
-  candidateTcpTransformSpace?: 'local' | 'world';
+  onEditCandidateTcpPose?: (pose: Pose3Value | null) => void;
+  onBeginCandidateTcpDrag?: () => boolean;
+  candidateContextKey?: string;
+  gizmo?: GizmoController;
   candidateRobot?: CandidateRobotPresentation | null;
+  candidateTool?: CandidateRobotPresentation | null;
+  candidateRejected?: boolean;
   runtimePresentation?: RuntimeScenePresentation;
   executionObservationPresentation?: MeasuredRobotPresentationReader;
   executionObservationTransport?: ExecutionObservationTransportStatus;
@@ -178,7 +184,7 @@ interface StructuralViewerProps {
   robotControlSurface?: ReactNode;
   robotControlBlocked?: boolean;
   objectControlSurface?: ReactNode;
-  transportControls?: ReactNode;
+  transportControls?: ReactNode | ((openRobotControls: () => void) => ReactNode);
   runtimeOverlay?: ReactNode;
   inspectorTarget?: HTMLElement | null;
   inspectorMinimized?: boolean;
@@ -675,40 +681,31 @@ function SceneObjectMesh({
     );
 }
 
-function OverlayVisualMesh({
-  url,
-  color,
-  emissive,
-  opacity,
-}: {
-  url: string;
-  color: string;
-  emissive: string;
-  opacity: number;
-}) {
+export function clonePreviewMesh(source: THREE.Object3D, color: string, opacity: number): THREE.Object3D {
+  const root = source.clone(true);
+  root.traverse((object) => {
+    const mesh = object as THREE.Mesh;
+    if (!mesh.isMesh) return;
+    const sourceMaterials = Array.isArray(mesh.material)
+      ? mesh.material
+      : [mesh.material];
+    const materials = sourceMaterials.map(() => new THREE.MeshBasicMaterial({
+      color,
+      transparent: true,
+      opacity,
+      toneMapped: false,
+      depthWrite: false,
+    }));
+    mesh.material = Array.isArray(mesh.material) ? materials : materials[0];
+    mesh.renderOrder = 14;
+    mesh.raycast = ignoreViewerRaycast;
+  });
+  return root;
+}
+
+function OverlayVisualMesh({ url, color, opacity }: { url: string; color: string; opacity: number }) {
   const gltf = useGLTF(resolveStructuralAssetUrl(url));
-  const clone = useMemo(() => {
-    const root = gltf.scene.clone(true);
-    root.traverse((object) => {
-      const mesh = object as THREE.Mesh;
-      if (!mesh.isMesh) return;
-      const sourceMaterials = Array.isArray(mesh.material)
-        ? mesh.material
-        : [mesh.material];
-      const materials = sourceMaterials.map(() => new THREE.MeshStandardMaterial({
-        color,
-        emissive,
-        transparent: true,
-        opacity,
-        wireframe: true,
-        depthWrite: false,
-        side: THREE.DoubleSide,
-      }));
-      mesh.material = Array.isArray(mesh.material) ? materials : materials[0];
-      mesh.renderOrder = 14;
-    });
-    return root;
-  }, [color, emissive, gltf.scene, opacity]);
+  const clone = useMemo(() => clonePreviewMesh(gltf.scene, color, opacity), [color, gltf.scene, opacity]);
   useEffect(() => () => disposeOwnedMaterials(clone), [clone]);
   return <primitive object={clone} />;
 }
@@ -769,12 +766,10 @@ function PrimitiveCollision({ primitive }: { primitive: SceneUrdfPrimitive }) {
 function PrimitiveOverlay({
   primitive,
   color,
-  emissive,
   opacity,
 }: {
   primitive: SceneUrdfPrimitive;
   color: string;
-  emissive: string;
   opacity: number;
 }) {
   const cylinderRotation: [number, number, number] | undefined =
@@ -782,16 +777,14 @@ function PrimitiveOverlay({
     ? [Math.PI / 2, 0, 0]
     : undefined;
   return (
-    <mesh rotation={cylinderRotation} renderOrder={14}>
+    <mesh rotation={cylinderRotation} renderOrder={14} raycast={ignoreViewerRaycast}>
       <PrimitiveGeometry primitive={primitive} />
-      <meshStandardMaterial
+      <meshBasicMaterial
         color={color}
-        emissive={emissive}
         transparent
         opacity={opacity}
-        wireframe
+        toneMapped={false}
         depthWrite={false}
-        side={THREE.DoubleSide}
       />
     </mesh>
   );
@@ -1408,21 +1401,27 @@ function MeasuredRuntimeLink({
   );
 }
 
+export function candidateGhostColor(receiptDigest: string | null, stale: boolean, rejected = false): string {
+  return rejected ? '#ff7066' : stale || receiptDigest === null ? '#f2bb56' : '#58ddff';
+}
+
 function CandidateRobotGhost({
   manifest,
   presentation,
   stale,
+  rejected = false,
   onAssetError,
 }: {
   manifest: SceneUrdfManifest;
   presentation: CandidateRobotPresentation;
   stale: boolean;
+  rejected?: boolean;
   onAssetError: (error: Error) => void;
 }) {
-  const color = stale ? '#ef766f' : '#b7a2ff';
-  const emissive = stale ? '#621d22' : '#38236f';
+  const color = candidateGhostColor(presentation.receiptDigest, stale, rejected);
+  const opacity = stale ? 0.6 : 0.5;
   return (
-    <group name={`candidate-robot:${presentation.receiptDigest}`}>
+    <group name={`candidate-robot:${presentation.receiptDigest ?? 'unvalidated-tool-target'}`}>
       {manifest.links.map((link) => {
         const transform = presentation.linkTransforms[link.name];
         if (transform === undefined) return null;
@@ -1446,8 +1445,7 @@ function CandidateRobotGhost({
                         <OverlayVisualMesh
                           url={visual.mesh_url}
                           color={color}
-                          emissive={emissive}
-                          opacity={stale ? 0.2 : 0.3}
+                          opacity={opacity}
                         />
                       </Suspense>
                     </AssetErrorBoundary>
@@ -1456,8 +1454,7 @@ function CandidateRobotGhost({
                     <PrimitiveOverlay
                       primitive={visual.primitive}
                       color={color}
-                      emissive={emissive}
-                      opacity={stale ? 0.2 : 0.3}
+                      opacity={opacity}
                     />
                   )}
                 </group>
@@ -1517,8 +1514,6 @@ function SceneObjectPrimitive({
   );
 }
 
-type SceneTransformMode = 'translate' | 'rotate' | 'scale';
-type SceneTransformSpace = 'local' | 'world';
 type SceneTransformIdentity = { ownerEpoch: string; generation: number };
 type SceneTransformCommit = (
   sceneResourceId: string,
@@ -1532,8 +1527,7 @@ const ignoreSceneTransformCommit: SceneTransformCommit = async () => false;
 function EditableLogicalSceneObject({
   object,
   selected,
-  transformMode,
-  transformSpace,
+  gizmoSettings,
   transformEnabled,
   transformIdentity,
   onCommitTransform,
@@ -1544,8 +1538,7 @@ function EditableLogicalSceneObject({
 }: {
   object: LogicalSceneObject & { placement: Extract<LogicalSceneObject['placement'], { kind: 'cell_fixed' }> };
   selected: boolean;
-  transformMode: SceneTransformMode;
-  transformSpace: SceneTransformSpace;
+  gizmoSettings: GizmoSettings;
   transformEnabled: boolean;
   transformIdentity: SceneTransformIdentity | undefined;
   onCommitTransform: SceneTransformCommit;
@@ -1632,16 +1625,22 @@ function EditableLogicalSceneObject({
         {children}
       </group>
       {selected && transformEnabled && transformTarget !== null && (
-        <TransformControls
+        <AuthoringTransformControls
           object={transformTarget}
-          mode={transformMode}
-          space={transformSpace}
-          onMouseDown={() => {
+          settings={gizmoSettings}
+          contextKey={JSON.stringify([transformIdentity, sourceKey])}
+          onBegin={() => {
             dragging.current = true;
             onTransformDraggingChange(true);
             dragTransformIdentity.current = transformIdentity;
+            return true;
           }}
-          onMouseUp={() => { void commit(); }}
+          onCommit={() => { void commit(); }}
+          onCancel={() => {
+            dragging.current = false;
+            onTransformDraggingChange(false);
+            latestRestoreOwnerTransform.current();
+          }}
         />
       )}
     </>
@@ -1659,8 +1658,7 @@ function LogicalSceneObjects({
   draftIdentity,
   transformIdentity,
   objectAxesVisibleIds,
-  transformMode,
-  transformSpace,
+  gizmoSettings,
   transformEnabled,
   onCommitTransform,
   onTransformDraggingChange,
@@ -1676,8 +1674,7 @@ function LogicalSceneObjects({
   draftIdentity: StructuralViewerProps['programDraftIdentity'];
   transformIdentity: SceneTransformIdentity | undefined;
   objectAxesVisibleIds: ReadonlySet<string>;
-  transformMode: SceneTransformMode;
-  transformSpace: SceneTransformSpace;
+  gizmoSettings: GizmoSettings;
   transformEnabled: boolean;
   onCommitTransform: SceneTransformCommit;
   onTransformDraggingChange: (dragging: boolean) => void;
@@ -1696,8 +1693,7 @@ function LogicalSceneObjects({
             key={object.scene_resource_id}
             object={object as LogicalSceneObject & { placement: Extract<LogicalSceneObject['placement'], { kind: 'cell_fixed' }> }}
             selected={selected}
-            transformMode={transformMode}
-            transformSpace={transformSpace}
+            gizmoSettings={gizmoSettings}
             transformEnabled={transformEnabled}
             transformIdentity={transformIdentity}
             onCommitTransform={onCommitTransform}
@@ -1822,8 +1818,14 @@ function CandidateTcpGhost({
   stale,
   axesSizeM,
   editable,
-  transformMode,
-  transformSpace,
+  gizmoSettings,
+  contextKey,
+  onBegin,
+  manifest,
+  robot,
+  tool,
+  rejected,
+  onAssetError,
   onEdit,
   onTransformDraggingChange,
 }: {
@@ -1831,14 +1833,26 @@ function CandidateTcpGhost({
   stale: boolean;
   axesSizeM: number;
   editable: boolean;
-  transformMode: Exclude<SceneTransformMode, 'scale'>;
-  transformSpace: SceneTransformSpace;
-  onEdit: (pose: Pose3Value) => void;
+  gizmoSettings: GizmoSettings;
+  contextKey: string;
+  onBegin: () => boolean;
+  manifest: SceneUrdfManifest | null;
+  robot: CandidateRobotPresentation | null;
+  tool: CandidateRobotPresentation | null;
+  rejected: boolean;
+  onAssetError: (error: Error) => void;
+  onEdit: (pose: Pose3Value | null) => void;
   onTransformDraggingChange: (dragging: boolean) => void;
 }) {
   const group = useRef<THREE.Group | null>(null);
   const [target, setTarget] = useState<THREE.Group | null>(null);
   const dragging = useRef(false);
+  const [dragVisible, setDragVisible] = useState(false);
+  const toolOrigin = useMemo(() => new THREE.Matrix4().compose(
+    new THREE.Vector3(pose.position_m.x_m, pose.position_m.y_m, pose.position_m.z_m),
+    new THREE.Quaternion(pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w).normalize(),
+    new THREE.Vector3(1, 1, 1),
+  ).invert(), [pose]);
   const capture = useCallback((node: THREE.Group | null) => {
     group.current = node;
     if (node !== null) setTarget(node);
@@ -1865,6 +1879,7 @@ function CandidateTcpGhost({
     if (current === null) return;
     const orientation = current.quaternion.clone().normalize();
     dragging.current = false;
+    setDragVisible(false);
     onEdit({
       position_m: {
         x_m: current.position.x,
@@ -1896,25 +1911,44 @@ function CandidateTcpGhost({
         <mesh renderOrder={20}>
           <sphereGeometry args={[Math.max(axesSizeM * 0.08, 0.006), 18, 12]} />
           <meshStandardMaterial
-            color={stale ? '#ef766f' : '#b7a2ff'}
-            emissive={stale ? '#621d22' : '#38236f'}
+            color={candidateGhostColor(robot?.receiptDigest ?? null, stale || dragVisible, !dragVisible && rejected)}
+            emissive={dragVisible || robot === null ? '#62421d' : '#153c49'}
             transparent
             opacity={0.82}
             depthWrite={false}
           />
         </mesh>
         <axesHelper args={[axesSizeM]} raycast={ignoreViewerRaycast} />
+        {manifest !== null && tool !== null && (dragVisible || robot === null) && (
+          <group name="candidate-tool-at-target" matrix={toolOrigin} matrixAutoUpdate={false}>
+            <CandidateRobotGhost manifest={manifest} presentation={tool}
+              stale={dragVisible || !rejected} rejected={!dragVisible && rejected} onAssetError={onAssetError} />
+          </group>
+        )}
       </group>
+      {manifest !== null && robot !== null && !dragVisible && (
+        <CandidateRobotGhost manifest={manifest} presentation={robot} stale={stale} onAssetError={onAssetError} />
+      )}
       {editable && target !== null && (
-        <TransformControls
+        <AuthoringTransformControls
           object={target}
-          mode={transformMode}
-          space={transformSpace}
-          onMouseDown={() => {
+          settings={gizmoSettings.mode === 'scale' ? { ...gizmoSettings, mode: 'translate' } : gizmoSettings}
+          contextKey={contextKey}
+          onBegin={() => {
+            if (!onBegin()) return false;
             dragging.current = true;
+            setDragVisible(true);
             onTransformDraggingChange(true);
+            return true;
           }}
-          onMouseUp={commit}
+          onCommit={commit}
+          onCancel={() => {
+            dragging.current = false;
+            setDragVisible(false);
+            restore();
+            onEdit(null);
+            onTransformDraggingChange(false);
+          }}
         />
       )}
     </>
@@ -2365,9 +2399,12 @@ const ViewerCanvas = memo(function ViewerCanvas({
   candidateStale,
   candidateTcpEditable,
   onEditCandidateTcpPose,
-  candidateTcpTransformMode,
-  candidateTcpTransformSpace,
+  onBeginCandidateTcpDrag,
+  candidateContextKey,
+  gizmoSettings,
   candidateRobot,
+  candidateTool,
+  candidateRejected,
   runtimePresentation,
   executionObservationPresentation,
   sceneOwnerIdentity,
@@ -2382,8 +2419,6 @@ const ViewerCanvas = memo(function ViewerCanvas({
   cameraContentRevision,
   onModelMaterialized,
   onViewerCommit,
-  transformMode,
-  transformSpace,
   transformEnabled,
   objectEditorActive,
   robotEditorActive,
@@ -2406,10 +2441,13 @@ const ViewerCanvas = memo(function ViewerCanvas({
   candidateTcpPose: Pose3Value | null;
   candidateStale: boolean;
   candidateTcpEditable: boolean;
-  onEditCandidateTcpPose: (pose: Pose3Value) => void;
-  candidateTcpTransformMode: 'translate' | 'rotate';
-  candidateTcpTransformSpace: 'local' | 'world';
+  onEditCandidateTcpPose: (pose: Pose3Value | null) => void;
+  onBeginCandidateTcpDrag: () => boolean;
+  candidateContextKey: string;
+  gizmoSettings: GizmoSettings;
   candidateRobot: CandidateRobotPresentation | null;
+  candidateTool: CandidateRobotPresentation | null;
+  candidateRejected: boolean;
   runtimePresentation: RuntimeScenePresentation | undefined;
   executionObservationPresentation: MeasuredRobotPresentationReader | undefined;
   sceneOwnerIdentity: StructuralViewerProps['sceneOwnerIdentity'];
@@ -2428,8 +2466,6 @@ const ViewerCanvas = memo(function ViewerCanvas({
     phase: 'mount' | 'update' | 'nested-update',
     actualDuration: number,
   ) => void;
-  transformMode: SceneTransformMode;
-  transformSpace: SceneTransformSpace;
   transformEnabled: boolean;
   objectEditorActive: boolean;
   robotEditorActive: boolean;
@@ -2739,8 +2775,7 @@ const ViewerCanvas = memo(function ViewerCanvas({
           draftIdentity={programDraftIdentity}
           transformIdentity={transformIdentity}
           objectAxesVisibleIds={objectAxesVisibleIds}
-          transformMode={transformMode}
-          transformSpace={transformSpace}
+          gizmoSettings={gizmoSettings}
           transformEnabled={transformEnabled && objectEditorActive}
           onCommitTransform={onCommitSceneTransform}
           onTransformDraggingChange={setTransformDragging}
@@ -2774,13 +2809,19 @@ const ViewerCanvas = memo(function ViewerCanvas({
             stale={candidateStale}
             axesSizeM={viewer?.frame_gizmo_size_m ?? 0.1}
             editable={candidateTcpEditable && robotEditorActive}
-            transformMode={candidateTcpTransformMode}
-            transformSpace={candidateTcpTransformSpace}
+            gizmoSettings={gizmoSettings}
+            contextKey={candidateContextKey}
+            onBegin={onBeginCandidateTcpDrag}
+            manifest={manifest}
+            robot={candidateRobot}
+            tool={candidateTool}
+            rejected={candidateRejected}
+            onAssetError={onIsolatedAssetError}
             onEdit={onEditCandidateTcpPose}
             onTransformDraggingChange={setTransformDragging}
           />
         )}
-        {manifest !== null && candidateRobot !== null && robotEditorActive && (
+        {manifest !== null && candidateRobot !== null && candidateTcpPose === null && robotEditorActive && (
           <CandidateRobotGhost
             manifest={manifest}
             presentation={candidateRobot}
@@ -2826,9 +2867,12 @@ function StructuralViewerContent({
   candidateStale = false,
   candidateTcpEditable = false,
   onEditCandidateTcpPose = () => undefined,
-  candidateTcpTransformMode = 'translate',
-  candidateTcpTransformSpace = 'world',
+  onBeginCandidateTcpDrag = () => false,
+  candidateContextKey = '',
+  gizmo: sharedGizmo,
   candidateRobot = null,
+  candidateTool = null,
+  candidateRejected = false,
   runtimePresentation,
   executionObservationPresentation,
   executionObservationTransport,
@@ -2872,8 +2916,10 @@ function StructuralViewerContent({
   const [assetError, setAssetError] = useState<Error | null>(null);
   const [assetWarning, setAssetWarning] = useState<string | null>(null);
   const [materializationGeneration, setMaterializationGeneration] = useState(0);
-  const [transformMode, setTransformMode] = useState<SceneTransformMode>('translate');
-  const [transformSpace, setTransformSpace] = useState<SceneTransformSpace>('world');
+  const localGizmo = useGizmoSettings();
+  const gizmo = sharedGizmo ?? localGizmo;
+  const transformMode = gizmo.settings.mode;
+  const transformSpace = gizmo.settings.space;
   const [cameraCommand, setCameraCommand] = useState<CameraCommandRequest>({
     id: 0,
     kind: 'frame_all',
@@ -2917,9 +2963,9 @@ function StructuralViewerContent({
     && sceneMutationAvailability?.[selectedObject.scene_resource_id]?.transform === true;
   const candidateTransformEnabled = candidateTcpEditable
     && candidateTcpPose !== null
-    && selectedObject === null;
-  const generalTransformEnabled = transformBaseEnabled || candidateTransformEnabled;
-  const scaleEnabled = transformBaseEnabled
+    && inspectorPanel === 'robot';
+  const generalTransformEnabled = (inspectorPanel === 'object' && transformBaseEnabled) || candidateTransformEnabled;
+  const scaleEnabled = inspectorPanel === 'object' && transformBaseEnabled
     && selectedObjectAvailability?.shape === true
     && supportsIndependentSceneScale(selectedObject);
   const transformEnabled = transformBaseEnabled
@@ -3127,19 +3173,17 @@ function StructuralViewerContent({
         onSelectSceneResource(null);
         onSelectStructure(null);
       }
-      else if (inspectorPanel !== 'object') return;
-      else if (key === 'w') setTransformMode('translate');
-      else if (key === 'e') setTransformMode('rotate');
-      else if (key === 'r' && scaleEnabled) setTransformMode('scale');
-      else if (key === 'q') setTransformSpace((current) => (
-        current === 'world' ? 'local' : 'world'
-      ));
+      else if (!generalTransformEnabled) return;
+      else if (key === 'w') gizmo.update({ mode: 'translate' });
+      else if (key === 'e') gizmo.update({ mode: 'rotate' });
+      else if (key === 'r' && scaleEnabled) gizmo.update({ mode: 'scale' });
+      else if (key === 'q') gizmo.update({ space: transformSpace === 'world' ? 'local' : 'world' });
       else return;
       event.preventDefault();
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [inspectorPanel, onSelectSceneResource, onSelectStructure, scaleEnabled, viewerActive]);
+  }, [generalTransformEnabled, gizmo, transformSpace, onSelectSceneResource, onSelectStructure, scaleEnabled, viewerActive]);
   useEffect(() => {
     if (contextMenu === null) return undefined;
     const dismissOutside = (event: PointerEvent) => {
@@ -3218,36 +3262,41 @@ function StructuralViewerContent({
             >
               <span className="viewer-camera-icon" aria-hidden="true">↺</span>
             </button>
-            {inspectorPanel === 'object' && (
+            {(inspectorPanel === 'object' || inspectorPanel === 'robot') && (
               <>
                 <span className="viewer-tool-separator" />
                 <button
                   type="button"
-                  aria-pressed={transformMode === 'translate'}
+                  aria-pressed={transformMode === 'translate' || (inspectorPanel === 'robot' && transformMode === 'scale')}
                   disabled={!generalTransformEnabled}
-                  onClick={() => setTransformMode('translate')}
-                  title="Translate selected object (W)"
+                  onClick={() => gizmo.update({ mode: 'translate' })}
+                  title="Translate target (W)"
                 >W</button>
                 <button
                   type="button"
                   aria-pressed={transformMode === 'rotate'}
                   disabled={!generalTransformEnabled}
-                  onClick={() => setTransformMode('rotate')}
-                  title="Rotate selected object (E)"
+                  onClick={() => gizmo.update({ mode: 'rotate' })}
+                  title="Rotate target (E)"
                 >E</button>
                 <button
                   type="button"
-                  aria-pressed={transformMode === 'scale'}
+                  aria-pressed={inspectorPanel === 'object' && transformMode === 'scale'}
                   disabled={!scaleEnabled}
-                  onClick={() => setTransformMode('scale')}
+                  onClick={() => gizmo.update({ mode: 'scale' })}
                   title="Scale a selected box or mesh object (R)"
                 >R</button>
                 <button
                   type="button"
-                  className="viewer-space-control"
-                  onClick={() => setTransformSpace((current) => current === 'world' ? 'local' : 'world')}
+                  className="viewer-text-control"
+                  disabled={!generalTransformEnabled}
+                  onClick={() => gizmo.update({ space: transformSpace === 'world' ? 'local' : 'world' })}
                   title="Toggle local/world coordinates (Q)"
                 >{transformSpace}</button>
+                <button type="button" className="viewer-text-control" aria-pressed={gizmo.settings.snap}
+                  disabled={!generalTransformEnabled || (inspectorPanel === 'object' && transformMode === 'scale')}
+                  onClick={() => gizmo.update({ snap: !gizmo.settings.snap })}
+                  title={`Snap by ${gizmo.settings.linearStepM} m / ${gizmo.settings.angularStepDeg} deg from drag start. Scale is unchanged.`}>Snap</button>
               </>
             )}
           </div>
@@ -3265,16 +3314,17 @@ function StructuralViewerContent({
             >Object</button>
             <button
               type="button"
-              className={auxiliaryViewerSourcesActive ? 'viewer-source-active' : undefined}
               aria-pressed={inspectorPanel === 'tools'}
               aria-label={auxiliaryViewerSourcesActive
-                ? 'Viewer tools; non-primary presentation source visible'
+                ? 'Viewer tools; preview layer visible'
                 : 'Viewer tools'}
               title={auxiliaryViewerSourcesActive
-                ? 'Viewer tools · non-primary presentation source visible'
+                ? 'A Draft scene or target preview is visible. Open Tools for layer details.'
                 : 'Viewer tools'}
               onClick={() => toggleInspectorPanel('tools')}
-            >Tools</button>
+            >Tools{auxiliaryViewerSourcesActive && (
+              <span className="viewer-preview-dot" aria-hidden="true" />
+            )}</button>
           </div>
         </div>
       </header>
@@ -3287,6 +3337,11 @@ function StructuralViewerContent({
         data-scene-object-count={sceneObjects.length}
       >
         {runtimeOverlay}
+        {inspectorPanel === 'robot' && candidateTcpPose !== null && candidateTool === null && candidateRobot === null && (
+          <div className="viewer-observation-status" role="status">
+            <span>Target marker only — mapped tool geometry unavailable. Target is unvalidated.</span>
+          </div>
+        )}
         {executionObservationTransport?.phase === 'reconnecting' && (
           <div className="viewer-observation-status" role="status">
             <strong>Live robot view reconnecting</strong>
@@ -3314,9 +3369,12 @@ function StructuralViewerContent({
               candidateStale={candidateStale}
               candidateTcpEditable={candidateTransformEnabled}
               onEditCandidateTcpPose={onEditCandidateTcpPose}
-              candidateTcpTransformMode={candidateTcpTransformMode}
-              candidateTcpTransformSpace={candidateTcpTransformSpace}
+              onBeginCandidateTcpDrag={onBeginCandidateTcpDrag}
+              candidateContextKey={candidateContextKey}
+              gizmoSettings={gizmo.settings}
               candidateRobot={candidateRobot}
+              candidateTool={candidateTool}
+              candidateRejected={candidateRejected}
               runtimePresentation={presentedRuntime}
               executionObservationPresentation={executionObservationPresentation}
               sceneOwnerIdentity={sceneOwnerIdentity}
@@ -3331,8 +3389,6 @@ function StructuralViewerContent({
               cameraContentRevision={cameraContentRevision}
               onModelMaterialized={reportModelMaterialized}
               onViewerCommit={reportViewerCommit}
-              transformMode={transformMode}
-              transformSpace={transformSpace}
               transformEnabled={transformEnabled}
               objectEditorActive={inspectorPanel === 'object'}
               robotEditorActive={inspectorPanel === 'robot'}
@@ -3497,7 +3553,10 @@ function StructuralViewerContent({
           </div>
         )}
 
-        {transportControls}
+        {typeof transportControls === 'function' ? transportControls(() => {
+          setInspectorPanel('robot');
+          onInspectorMinimizedChange?.(false);
+        }) : transportControls}
       </div>
 
       {inspectorTarget !== null && createPortal(
@@ -3516,7 +3575,7 @@ function StructuralViewerContent({
                   ? 'Selected object'
                   : 'Viewer tools'}</strong>
             {inspectorPanel === 'robot' && robotControlBlocked && (
-              <span className="central-inspector-warning">Blocked</span>
+              <span className="central-inspector-warning" title="The current manual target has no executable preview. Check the Robot panel; this is not a Program fault.">Check preview</span>
             )}
             <div className="central-inspector-actions">
               {inspectorPanel === 'robot' && (
@@ -3831,6 +3890,7 @@ function StructuralViewerContent({
                 </div>
               ) : objectControlSurface !== undefined ? (
                 <>
+                  <div className="robot-control-step-controls" aria-label="Object control increments"><GizmoSteps gizmo={gizmo} /></div>
                   <div className="viewer-object-global-actions">
                     <button
                       type="button"
@@ -3860,6 +3920,7 @@ function StructuralViewerContent({
                 </>
               ) : selectedObject !== null ? (
           <div className="viewer-object-quick-panel">
+            <div className="robot-control-step-controls" aria-label="Object control increments"><GizmoSteps gizmo={gizmo} /></div>
             <dl>
               <dt>Scene resource</dt>
               <dd><code>{selectedObject.scene_resource_id}</code></dd>

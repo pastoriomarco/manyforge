@@ -185,6 +185,36 @@ TEST(RoboPlanCandidateComputerTest,
   EXPECT_EQ(result.value().joint_names, fixture.binding.compiled_joint_names);
 }
 
+TEST(RoboPlanCandidateComputerTest, ScalesAbsoluteJointCapsIndependentlyAfterResolvingCeilings) {
+  auto fixture = make_fixture();
+  RoboPlanCandidateComputer computer(fixture.scene, fixture.binding,
+                                     RoboPlanCandidateComputerConfig{0x1234U, 65'536U, 0.01});
+  for (const auto& [velocity_scale, acceleration_scale] :
+       {std::pair{0.25, 0.8}, std::pair{0.8, 0.25}, std::pair{0.0005, 0.8}}) {
+    SCOPED_TRACE(velocity_scale);
+    if (velocity_scale < 0.001) {
+      // A short path keeps this sub-floor regression small. Retiming must
+      // reduce the model-scaled velocity to the tighter cap, never raise it.
+      fixture.goal = fixture.start;
+      fixture.goal[0] += 0.001;
+    }
+    auto input = request(fixture, ResolvedMotionSpecDTO{joint_goal(fixture)});
+    input.speed_profile = {velocity_scale, acceleration_scale, std::nullopt};
+    for (std::size_t index = 0; index < fixture.binding.resources.size(); ++index) {
+      input.dynamics_limits.push_back({fixture.binding.resources[index],
+          fixture.binding.compiled_joint_names[index], {0.7, 1.2, std::nullopt}});
+    }
+    const auto result = computer.compute(input);
+    ASSERT_TRUE(result.ok()) << result.error().message;
+    for (const auto& waypoint : result.value().waypoints) {
+      ASSERT_EQ(waypoint.velocities_rad_s.size(), fixture.binding.resources.size());
+      ASSERT_EQ(waypoint.accelerations_rad_s2.size(), fixture.binding.resources.size());
+      for (const auto velocity : waypoint.velocities_rad_s) EXPECT_LE(std::abs(velocity), 0.7 * velocity_scale);
+      for (const auto acceleration : waypoint.accelerations_rad_s2) EXPECT_LE(std::abs(acceleration), 1.2 * acceleration_scale);
+    }
+  }
+}
+
 TEST(RoboPlanCandidateComputerTest, PoseAndCartesianInputsUseTheSameExactProjection) {
   auto fixture = make_fixture();
   RoboPlanCandidateComputer computer(

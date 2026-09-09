@@ -7108,6 +7108,16 @@ BuildProductComposition(CompositionBuildInput input) {
       std::move(control_binding_representatives);
   runtime_input.deployment_maximum_tcp_linear_speed_mps =
       deployment_motion_target_limit;
+  for (const auto &limit : retained_runtime_configuration.direct_control_joint_limits) {
+    const auto &target = runtime_input.motion_binding.value();
+    if (limit.controllable_component_id == target.controllable_component_id &&
+        limit.command_target_id == target.command_target_id) {
+      runtime_input.direct_control_joint_limits.emplace(
+          limit.source_joint_name,
+          core::JointDynamicsLimitDTO{limit.max_velocity_rad_s,
+                                     limit.max_acceleration_rad_s2, limit.max_jerk_rad_s3});
+    }
+  }
   if (input.planner_scene_projection != nullptr) {
     runtime_input.planning_scene_synchronizer =
         std::make_shared<ManagerPlanningSceneSynchronizer>(

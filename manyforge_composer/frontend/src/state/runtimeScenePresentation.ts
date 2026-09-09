@@ -19,6 +19,7 @@ import type { MotionPreviewReceipt } from '../types/robotControl';
 import type {
   ExecutionOwnerStatus,
   ManualControlMotionDescriptor,
+  Pose3Value,
 } from '../types/robotControl';
 import type {
   ExecutionObservationFrame,
@@ -28,6 +29,26 @@ import type {
 export interface RuntimeLinkTransform {
   position_m: Vector3Tuple;
   orientation_xyzw: QuaternionXyzwTuple;
+}
+
+/** Exact authoring join; the viewer may separately retain older display data. */
+export function candidateObservationEpoch(
+  frame: ExecutionObservationFrame | null,
+  status: ExecutionOwnerStatus | null,
+): string | null {
+  if (frame === null || status === null || frame.ownerEpoch !== status.ownerEpoch
+    || frame.cellId !== status.cellId || frame.retainedBundleId !== status.retainedBundleId
+    || frame.graphRevision !== status.graphRevision) return null;
+  const arm = frame.targets.find((target) => target.controllableComponentId === status.directControl.controllableComponentId
+    && target.commandTargetId === status.directControl.commandTargetId);
+  const gripper = status.directControlGripper;
+  const tool = gripper?.sourceKind !== 'model_role' ? null : frame.targets.find((target) => (
+    target.controllableComponentId === gripper.controllableComponentId
+    && target.commandTargetId === gripper.commandTargetId
+    && target.sourceJointNames.includes(gripper.sourceCoordinateName)
+  ));
+  if (arm === undefined || tool === undefined) return null;
+  return JSON.stringify([frame.ownerEpoch, frame.sourceEpoch, arm.sourceEpoch, tool?.sourceEpoch]);
 }
 
 export interface MeasuredRobotPresentation {
@@ -101,7 +122,7 @@ export interface AttachmentPresentationDiagnostic {
 }
 
 export interface CandidateRobotPresentation {
-  receiptDigest: string;
+  receiptDigest: string | null;
   linkTransforms: Record<string, RuntimeLinkTransform>;
 }
 
@@ -725,30 +746,118 @@ export function runtimeScenePresentation(
 export function candidateRobotPresentation(
   receipt: MotionPreviewReceipt,
   manifest: SceneUrdfManifest,
+  descriptor: ManualControlMotionDescriptor,
+  measured: Readonly<Record<string, RuntimeLinkTransform>>,
 ): CandidateRobotPresentation | null {
   if (
     receipt.retainedBundleId !== manifest.retained_bundle_id
     || receipt.graphRevision !== manifest.graph_revision
     || receipt.sourceJointNames.length !== receipt.finalPositionsRad.length
+    || receipt.componentRoleId !== descriptor.componentRoleId
+    || receipt.targetRoleId !== descriptor.targetRoleId
+    || receipt.sourceJointNames.length !== descriptor.joints.length
     || new Set(receipt.sourceJointNames).size !== receipt.sourceJointNames.length
     || receipt.finalPositionsRad.some((value) => !Number.isFinite(value))
   ) return null;
+  const positions = new Map<string, number>();
+  for (const [index, joint] of descriptor.joints.entries()) {
+    if (joint.sourceJointName !== receipt.sourceJointNames[index]
+      || positions.has(joint.compiledJointName)) return null;
+    positions.set(joint.compiledJointName, receipt.finalPositionsRad[index]);
+  }
   const transforms = measuredLinkTransforms(
     manifest,
-    new Map(receipt.sourceJointNames.map((name, index) => [
-      name,
-      receipt.finalPositionsRad[index],
-    ])),
+    positions,
+    measured,
   );
+  // Only the commanded chain and its carried tool are a candidate. Other
+  // components retain their measured pose and must not acquire a neutral ghost.
+  const changedCoordinates = new Set(positions.keys());
+  const affected = new Set<string>();
+  for (let pass = 0; pass < manifest.joints.length; pass += 1) {
+    const count = affected.size + changedCoordinates.size;
+    for (const joint of manifest.joints) {
+      if (changedCoordinates.has(joint.name)
+        || (joint.mimic !== null && changedCoordinates.has(joint.mimic.master))) {
+        changedCoordinates.add(joint.name);
+        affected.add(joint.child_link);
+      }
+      if (affected.has(joint.parent_link)) affected.add(joint.child_link);
+    }
+    if (count === affected.size + changedCoordinates.size) break;
+  }
   return transforms === null ? null : {
     receiptDigest: receipt.receiptDigest,
-    linkTransforms: transforms,
+    linkTransforms: Object.fromEntries(Object.entries(transforms)
+      .filter(([link]) => affected.has(link))),
   };
+}
+
+function linkMatrix(transform: RuntimeLinkTransform): THREE.Matrix4 {
+  return new THREE.Matrix4().compose(
+    new THREE.Vector3(...transform.position_m),
+    new THREE.Quaternion(...transform.orientation_xyzw).normalize(),
+    new THREE.Vector3(1, 1, 1),
+  );
+}
+
+/** An unvalidated tool target marker, never an IK solution or a motion receipt. */
+export function candidateToolPresentation(
+  poseInCell: Pose3Value,
+  status: ExecutionOwnerStatus,
+  sourceModel: SourceModelProjection,
+  manifest: SceneUrdfManifest,
+  measured: Readonly<Record<string, RuntimeLinkTransform>>,
+): CandidateRobotPresentation | null {
+  if (status.cellId !== sourceModel.cell_id || status.cellId !== manifest.cell_id
+    || status.retainedBundleId !== sourceModel.retained_bundle_id
+    || status.retainedBundleId !== manifest.retained_bundle_id
+    || status.graphRevision !== sourceModel.graph_revision
+    || status.graphRevision !== manifest.graph_revision) return null;
+  const tcpFrames = status.directControl.targetDescriptor.frames.filter(
+    (frame) => frame.frameRoleId === status.directControl.tcpFrameRoleId,
+  );
+  const gripper = status.directControlGripper.targetDescriptor;
+  const targets = sourceModel.targets.filter((target) => (
+    target.component_id === gripper.controllableComponentId
+    && target.target_id === gripper.commandTargetId
+  ));
+  if (tcpFrames.length !== 1 || targets.length !== 1) return null;
+  const tcp = measured[tcpFrames[0].compiledFrameName];
+  if (tcp === undefined) return null;
+  const instances = new Set(targets[0].model_groups.map((group) => group.model_instance_id));
+  const links = sourceModel.occurrences.filter((occurrence) => (
+    occurrence.component_id === gripper.controllableComponentId
+    && instances.has(occurrence.model_instance_id)
+  )).flatMap((occurrence) => occurrence.links);
+  const mapped = gripper.touchLinks.map((sourceName) => links.filter(
+    (link) => link.source_link_name === sourceName,
+  ));
+  if (mapped.length === 0 || mapped.some((matches) => matches.length !== 1)) return null;
+  const delta = linkMatrix({
+    position_m: [poseInCell.position_m.x_m, poseInCell.position_m.y_m, poseInCell.position_m.z_m],
+    orientation_xyzw: [poseInCell.orientation.x, poseInCell.orientation.y, poseInCell.orientation.z, poseInCell.orientation.w],
+  }).multiply(linkMatrix(tcp).invert());
+  const linkTransforms: Record<string, RuntimeLinkTransform> = {};
+  for (const [link] of mapped) {
+    const observed = measured[link.viewer_link_name];
+    if (observed === undefined || !manifest.links.some((row) => row.name === link.viewer_link_name)) return null;
+    const matrix = delta.clone().multiply(linkMatrix(observed));
+    const position = new THREE.Vector3().setFromMatrixPosition(matrix);
+    const orientation = new THREE.Quaternion().setFromRotationMatrix(matrix).normalize();
+    if (![...position, ...orientation].every(Number.isFinite)) return null;
+    linkTransforms[link.viewer_link_name] = {
+      position_m: [position.x, position.y, position.z],
+      orientation_xyzw: [orientation.x, orientation.y, orientation.z, orientation.w],
+    };
+  }
+  return { receiptDigest: null, linkTransforms };
 }
 
 export function measuredLinkTransforms(
   manifest: SceneUrdfManifest,
   observedPositions: ReadonlyMap<string, number>,
+  baseline?: Readonly<Record<string, RuntimeLinkTransform>>,
 ): Record<string, RuntimeLinkTransform> | null {
   const linkNames = new Set(manifest.links.map((link) => link.name));
   const jointByName = new Map(manifest.joints.map((joint) => [joint.name, joint]));
@@ -761,6 +870,7 @@ export function measuredLinkTransforms(
 
   const coordinates = new Map<string, number>();
   const resolving = new Set<string>();
+  const overridden = baseline === undefined ? undefined : new Set(observedPositions.keys());
   const coordinate = (joint: SceneUrdfJoint): number | null => {
     const cached = coordinates.get(joint.name);
     if (cached !== undefined) return cached;
@@ -774,6 +884,7 @@ export function measuredLinkTransforms(
       const masterValue = master === undefined ? null : coordinate(master);
       if (masterValue === null) return null;
       value = (masterValue * joint.mimic.multiplier) + joint.mimic.offset;
+      if (overridden?.has(joint.mimic.master)) overridden.add(joint.name);
     }
     resolving.delete(joint.name);
     if (!Number.isFinite(value)) return null;
@@ -785,7 +896,11 @@ export function measuredLinkTransforms(
   }
 
   const matrices = new Map<string, THREE.Matrix4>();
-  matrices.set(manifest.root_link, new THREE.Matrix4().identity());
+  if (baseline !== undefined && manifest.links.some((link) => baseline[link.name] === undefined)) {
+    return null;
+  }
+  matrices.set(manifest.root_link, baseline === undefined
+    ? new THREE.Matrix4().identity() : linkMatrix(baseline[manifest.root_link]));
   const pending = [...manifest.joints];
   for (let pass = 0; pass <= manifest.joints.length && pending.length > 0; pass += 1) {
     let progressed = false;
@@ -800,9 +915,12 @@ export function measuredLinkTransforms(
         new THREE.Quaternion(...joint.origin.orientation_xyzw).normalize(),
         new THREE.Vector3(1, 1, 1),
       );
+      const local = baseline !== undefined && !overridden?.has(joint.name)
+        ? linkMatrix(baseline[joint.parent_link]).invert().multiply(linkMatrix(baseline[joint.child_link]))
+        : origin.multiply(motion);
       matrices.set(
         joint.child_link,
-        parent.clone().multiply(origin).multiply(motion),
+        parent.clone().multiply(local),
       );
       pending.splice(index, 1);
       progressed = true;

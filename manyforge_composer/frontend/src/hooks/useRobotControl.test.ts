@@ -1,12 +1,40 @@
 import { describe, expect, it } from 'vitest';
+import { ApiError } from '../api/client';
 
 import type { RuntimeScaleControlStatus } from '../types/robotControl';
 import {
   acceptedRuntimeScaleStatus,
   mergeRuntimeScaleStatus,
+  previewTargetRejection,
   runtimeScaleControlScopeFence,
   runtimeScaleFlushDelay,
 } from './useRobotControl';
+
+it('keeps known target rejection local without hiding transport or protocol failures', () => {
+  expect(previewTargetRejection(new ApiError('IK failed', 500, {
+    detail: { code: 'ik_failed', details: { reason: 'native_ik_no_solution' } },
+  }))).toContain('may be out of reach, outside joint limits, or in collision');
+  expect(previewTargetRejection(new ApiError('Collision', 500, {
+    detail: { code: 'planning_failed', details: { reason: 'native_goal_state_collision' } },
+  }))).toContain('would collide at the target');
+  expect(previewTargetRejection(new ApiError('Collision', 500, {
+    detail: { code: 'planning_failed', details: { reason: 'native_start_state_collision' } },
+  }))).toContain('current robot pose is in collision');
+  expect(previewTargetRejection(new ApiError('Wrong result', 500, {
+    detail: { code: 'ik_failed', details: { reason: 'native_goal_state_collision' } },
+  }))).toBeNull();
+  expect(previewTargetRejection(new ApiError('No path', 500, {
+    detail: { code: 'planning_failed', details: { reason: 'native_rrt_failed' } },
+  })))
+    .toContain('No valid path');
+  for (const code of ['ik_failed', 'planning_failed']) {
+    expect(previewTargetRejection(new ApiError('Unavailable', 500, {
+      detail: { code, details: { reason: 'native_ik_transport_failure' } },
+    }))).toBeNull();
+  }
+  expect(previewTargetRejection(new TypeError('Network error'))).toBeNull();
+  expect(previewTargetRejection(new Error('Invalid preview receipt'))).toBeNull();
+});
 
 const status = {
   selector: {
