@@ -385,24 +385,40 @@ def test_known_rejection_is_discarded_but_unresolved_request_never_reexecutes(
         cycle_generation=2,
     )
     assert rejected_identity_is_reusable.disposition == "new"
-    journal.cancel_request(
-        owner_epoch="caller.1", request_id="start.rejected"
-    )
+    journal.cancel_request(owner_epoch="caller.1", request_id="start.rejected")
 
-    assert journal.record_request(
-        owner_epoch="caller.1",
-        request_id="reset.unknown",
-        kind="reset",
-        intent={"revision": 2},
-        cycle_generation=2,
-    ).disposition == "new"
-    assert journal.record_request(
-        owner_epoch="caller.1",
-        request_id="reset.unknown",
-        kind="reset",
-        intent={"revision": 2},
-        cycle_generation=3,
-    ).disposition == "in_progress"
+    assert (
+        journal.record_request(
+            owner_epoch="caller.1",
+            request_id="reset.unknown",
+            kind="reset",
+            intent={"revision": 2},
+            cycle_generation=2,
+        ).disposition
+        == "new"
+    )
+    assert (
+        journal.record_request(
+            owner_epoch="caller.1",
+            request_id="reset.unknown",
+            kind="reset",
+            intent={"revision": 2},
+            cycle_generation=3,
+        ).disposition
+        == "in_progress"
+    )
+    # Reset has its own single reserve; it does not consume or enlarge the
+    # ordinary slot. Runtime state eligibility still rejects Start during Reset.
+    assert (
+        journal.record_request(
+            owner_epoch="caller.1",
+            request_id="ordinary.1",
+            kind="start",
+            intent={"revision": 3},
+            cycle_generation=3,
+        ).disposition
+        == "new"
+    )
     with pytest.raises(OverflowError, match="full"):
         journal.record_request(
             owner_epoch="caller.1",
@@ -599,6 +615,207 @@ def test_each_exact_post_acquire_crash_checkpoint_recovers_terminal(
     assert record.owner_epoch == "runner.stable"
     assert record.terminal_reference is None
     assert record.reconciliation_required is True
+    recovered.close()
+
+
+@pytest.mark.parametrize("prior_uncertain", [False, True])
+@pytest.mark.parametrize("new_uncertain", [False, True])
+def test_reset_failure_never_clears_prior_uncertainty(tmp_path, prior_uncertain, new_uncertain):
+    journal = ProgramCycleJournal(tmp_path / "reset.sqlite3", owner_epoch="runner.1")
+    journal.transition(
+        expected_generation=1,
+        expected_states=("idle_after_reset",),
+        state="terminal_awaiting_reset",
+        program_run_id="run.1",
+        claim={"claim_generation": 1},
+        reconciliation_required=prior_uncertain,
+    )
+    journal.record_request(
+        owner_epoch="operator.1",
+        request_id="uncertain.1",
+        kind="resume_motion",
+        intent={"kind": "resume_motion"},
+        cycle_generation=1,
+    )
+    journal.begin_resetting(expected_generation=1, program_run_id="run.1", correlation_id="reset.1")
+    journal.fail_reset(
+        expected_generation=1,
+        program_run_id="run.1",
+        code="reset_failed",
+        message="Reset failed",
+        reconciliation_required=new_uncertain,
+    )
+    record = journal.read()
+    assert record.state == "recovery_required"
+    assert record.reconciliation_required is (prior_uncertain or new_uncertain)
+    assert record.claim == {"claim_generation": 1}
+    assert record.reset_phase == "stopping"
+    assert (
+        journal.record_request(
+            owner_epoch="operator.1",
+            request_id="uncertain.1",
+            kind="resume_motion",
+            intent={"kind": "resume_motion"},
+            cycle_generation=1,
+        ).disposition
+        == "in_progress"
+    )
+    journal.close()
+
+
+@pytest.mark.parametrize("capacity", [1, 4096])
+def test_one_reset_reserve_does_not_widen_ordinary_capacity(tmp_path, capacity):
+    journal = ProgramCycleJournal(
+        tmp_path / "capacity.sqlite3", owner_epoch="runner.1", maximum_inflight_commands=capacity
+    )
+    # One bounded setup transaction avoids thousands of filesystem syncs.
+    with journal._transaction():
+        journal._database.executemany(
+            "INSERT INTO program_cycle_inflight_commands VALUES(?,?,?,?,?)",
+            (("operator.1", f"move.{i}", "resume_motion", "{}", 1) for i in range(capacity)),
+        )
+    with pytest.raises(OverflowError):
+        journal.record_request(
+            owner_epoch="operator.1",
+            request_id="extra",
+            kind="resume_motion",
+            intent={},
+            cycle_generation=1,
+        )
+    assert (
+        journal.record_request(
+            owner_epoch="operator.1",
+            request_id="reset.1",
+            kind="reset",
+            intent={},
+            cycle_generation=1,
+        ).disposition
+        == "new"
+    )
+    with pytest.raises(OverflowError):
+        journal.record_request(
+            owner_epoch="operator.1",
+            request_id="reset.2",
+            kind="reset",
+            intent={},
+            cycle_generation=1,
+        )
+    assert len(journal.pending_commands()) == capacity + 1
+    assert (
+        journal.record_request(
+            owner_epoch="operator.1",
+            request_id="reset.1",
+            kind="reset",
+            intent={},
+            cycle_generation=1,
+        ).disposition
+        == "in_progress"
+    )
+    journal.close()
+
+
+@pytest.mark.parametrize("crossing", [None, "revision", "liveness", "reconciliation_digest"])
+def test_reset_discharge_is_exact_and_keeps_original_commands(tmp_path, crossing):
+    journal = ProgramCycleJournal(tmp_path / "discharge.sqlite3", owner_epoch="runner.1")
+    journal.transition(
+        expected_generation=1,
+        expected_states=("idle_after_reset",),
+        state="recovery_required",
+        program_run_id="run.1",
+        claim={"claim_generation": 1},
+        reconciliation_required=True,
+    )
+    journal.record_request(
+        owner_epoch="operator.1",
+        request_id="resume.1",
+        kind="resume_motion",
+        intent={},
+        cycle_generation=1,
+    )
+    pending = journal.pending_commands()
+    journal.begin_resetting(
+        expected_generation=1,
+        program_run_id="run.1",
+        correlation_id="reset.1",
+        expected_recovery=journal.read(),
+    )
+    journal.update_reset_phase(
+        expected_generation=1,
+        program_run_id="run.1",
+        expected_phase="stopping",
+        phase="settling",
+        terminal_reference="sha256:" + "a" * 64,
+    )
+    expected = journal.read()
+    if crossing == "revision":
+        journal.update_reset_phase(
+            expected_generation=1,
+            program_run_id="run.1",
+            expected_phase="settling",
+            phase="settling",
+        )
+    elif crossing == "liveness":
+        journal.retain_liveness_loss(
+            expected_generation=1,
+            manager_runtime_epoch="manager.1",
+            manager_owner_epoch="manager.1",
+            fault_reference="manager-lost.1",
+        )
+    elif crossing == "reconciliation_digest":
+        # Liveness/reconciliation changes need not advance the control
+        # revision. Compare the complete retained cycle, not that counter alone.
+        with journal._transaction():
+            journal._database.execute(
+                "UPDATE program_cycle SET reconciliation_evidence_digest=?",
+                ("sha256:" + "b" * 64,),
+            )
+    if crossing:
+        before = journal.read()
+        with pytest.raises(RuntimeError, match="discharge is stale"):
+            journal.settle_reset_recovery(
+                expected=expected, manager_runtime_epoch=None, manager_owner_epoch=None
+            )
+        assert journal.read() == before
+    else:
+        journal.settle_reset_recovery(
+            expected=expected, manager_runtime_epoch=None, manager_owner_epoch=None
+        )
+        assert journal.read().reset_phase == "restoring_scene"
+        assert not journal.read().reconciliation_required
+    assert journal.pending_commands() == pending
+    journal.close()
+
+
+def test_prior_v4_multiple_resets_remain_readable_but_cannot_grow(tmp_path):
+    path = tmp_path / "legacy-resets.sqlite3"
+    journal = ProgramCycleJournal(path, owner_epoch="runner.1")
+    journal.transition(
+        expected_generation=1,
+        expected_states=("idle_after_reset",),
+        state="recovery_required",
+        program_run_id="run.1",
+        claim={"claim_generation": 1},
+        reconciliation_required=True,
+    )
+    with journal._transaction():
+        journal._database.executemany(
+            "INSERT INTO program_cycle_inflight_commands VALUES(?,?,?,?,?)",
+            [("operator.1", f"reset.{index}", "reset", "{}", 1) for index in range(2)],
+        )
+    journal.close()
+    recovered = ProgramCycleJournal(path, owner_epoch="runner.1")
+    before = recovered.pending_commands()
+    assert len(before) == 2
+    for kind in ("reset", "resume_motion"):
+        with pytest.raises(OverflowError):
+            recovered.record_request(
+                owner_epoch="operator.1",
+                request_id="new.1",
+                kind=kind,
+                intent={},
+                cycle_generation=1,
+            )
+        assert recovered.pending_commands() == before
     recovered.close()
 
 

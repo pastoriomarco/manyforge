@@ -50,6 +50,9 @@ struct RouteSelectionIntentDTO final {
   ExpectedActiveControlConfigurationDTO expected_active_control_configuration;
   std::vector<RouteSelectionComponentExpectationDTO> component_expectations;
   RequestAttributionDTO attribution{};
+  /// Absent only in legacy retained records. Every new admission requires it.
+  std::optional<AdmissionGeneration> expected_admission_generation{};
+  std::optional<ProgramNodeAdmissionEvidenceDTO> program_node_evidence{};
 
   [[nodiscard]] bool locally_valid() const noexcept;
   [[nodiscard]] bool replay_equal(const RouteSelectionIntentDTO& other) const noexcept;
@@ -470,6 +473,7 @@ struct CCLCRouteSelectionRequestResultDTO final {
   RequestReplayStatusDTO replay_status;
   std::optional<RouteSelectionAcceptedDTO> acceptance;
   std::optional<RouteSelectionStatusDTO> status;
+  std::optional<ErrorDTO> rejection{};
 
   [[nodiscard]] bool locally_valid() const noexcept;
 

@@ -675,8 +675,7 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
   }
   EXPECT_EQ(qualified_count, 11U);
   EXPECT_EQ(registry.qualification_registry_digest().value(),
-            "sha256:"
-            "dbdf99e08d6c8fde086653482d39c48c39ca955e44e4fcdaf01d1f17879c4b60");
+            sha256_digest(canonical_json(registry.normalized_projection())));
   EXPECT_NE(
       registry.find_qualified_value_schema(
           core::SchemaId("manyforge.value_schema.provider_contract.empty.v1"),
@@ -688,8 +687,8 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
                 core::SchemaId("manyforge.value_schema.provider_contract."
                                "motion_controlled_stop.v1"),
                 core::SchemaRevision("sha256:"
-                                     "afbbcda3b81eabff2bbdffb5658fb1fcd3331cde8"
-                                     "96cadf0681793a2f9db90dd")),
+                                     "58ec6382a268329e9d8001eb53aac31259b5eb95a"
+                                     "3690095aa4bbe12ac51d83b")),
             nullptr);
   EXPECT_NE(registry.find_qualified_value_schema(
                 core::SchemaId("manyforge.value_schema.runtime.empty.v1"),
@@ -697,12 +696,13 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
                                      "03457d535d31818fedaa7e44f48432a08feb705e4"
                                      "d22c9a8f5e50977c8dbf785")),
             nullptr);
-  EXPECT_NE(registry.find_qualified_value_schema(
-                core::SchemaId("manyforge.value_schema.runtime.native_execution.v1"),
-                core::SchemaRevision("sha256:"
-                                     "4405892649681799b9a813fafee4b5d23579d080b5457bf60"
-                                     "f51ce2e296fcff8")),
-            nullptr);
+  EXPECT_NE(
+      registry.find_qualified_value_schema(
+          core::SchemaId("manyforge.value_schema.runtime.native_execution.v1"),
+          core::SchemaRevision("sha256:"
+                               "49b3bbd377ad4cb93e7d27df06ff84b7e9ddbce3f3047e5"
+                               "702c61a9828c62035")),
+      nullptr);
   EXPECT_EQ(registry.find_qualified_value_schema(
                 core::SchemaId("manyforge.none.v1"),
                 core::SchemaRevision("sha256:"
@@ -763,10 +763,11 @@ TEST(ClosedSchema,
 TEST(ClosedSchema,
      NativeExecutionRuntimeConfigurationIsClosedBoundedAndBuildQualified) {
   const auto &registry = build_qualified_closed_schema_registry();
-  const auto* schema = registry.find_qualified_value_schema(
+  const auto *schema = registry.find_qualified_value_schema(
       core::SchemaId("manyforge.value_schema.runtime.native_execution.v1"),
-      core::SchemaRevision("sha256:"
-                           "4405892649681799b9a813fafee4b5d23579d080b5457bf60f51ce2e296fcff8"));
+      core::SchemaRevision(
+          "sha256:"
+          "49b3bbd377ad4cb93e7d27df06ff84b7e9ddbce3f3047e5702c61a9828c62035"));
   ASSERT_NE(schema, nullptr);
 
   const CanonicalValue valid = value_object({
@@ -783,15 +784,19 @@ TEST(ClosedSchema,
       {"execution_tick_hz", CanonicalValue(100.0)},
       {"collision_monitor_period_ms", CanonicalValue(50.0)},
       {"motion_target_limits",
-       CanonicalValue(CanonicalValue::Array{CanonicalValue(
-           CanonicalValue::Object{
+       CanonicalValue(
+           CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
                {"controllable_component_id", CanonicalValue("robot")},
                {"command_target_id", CanonicalValue("arm")},
                {"maximum_tcp_linear_speed_mps", CanonicalValue(0.15)},
+               {"ordinary_motion_jerk", value_object({
+                   {"enabled", CanonicalValue(false)},
+                   {"preset_reference_time_s", CanonicalValue(1.0)},
+                   {"joint_limits", CanonicalValue(CanonicalValue::Array{})}})},
            })})},
       {"direct_control_joint_limits",
-       CanonicalValue(CanonicalValue::Array{CanonicalValue(
-           CanonicalValue::Object{
+       CanonicalValue(
+           CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
                {"controllable_component_id", CanonicalValue("robot")},
                {"command_target_id", CanonicalValue("arm")},
                {"source_joint_name", CanonicalValue("joint1")},
@@ -800,13 +805,12 @@ TEST(ClosedSchema,
                {"max_jerk_rad_s3", CanonicalValue(10.0)},
            })})},
       {"gripper_target_configurations",
-       CanonicalValue(CanonicalValue::Array{CanonicalValue(
-           CanonicalValue::Object{
+       CanonicalValue(
+           CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
                {"actuation_kind", CanonicalValue("position_commanded")},
                {"attach_frame", CanonicalValue("tool_tcp")},
-               {"auxiliary_frames",
-                CanonicalValue(CanonicalValue::Array{
-                    CanonicalValue("tool_base")})},
+               {"auxiliary_frames", CanonicalValue(CanonicalValue::Array{
+                                        CanonicalValue("tool_base")})},
                {"closed_state_ref", CanonicalValue("closed")},
                {"command_duration_s", CanonicalValue(0.8)},
                {"command_target_id", CanonicalValue("gripper")},
@@ -815,10 +819,9 @@ TEST(ClosedSchema,
                {"mount_frame", CanonicalValue("tool_mount")},
                {"open_state_ref", CanonicalValue("open")},
                {"tcp_frame", CanonicalValue("tool_tcp")},
-               {"touch_links",
-                CanonicalValue(CanonicalValue::Array{
-                    CanonicalValue("left_finger"),
-                    CanonicalValue("right_finger")})},
+               {"touch_links", CanonicalValue(CanonicalValue::Array{
+                                   CanonicalValue("left_finger"),
+                                   CanonicalValue("right_finger")})},
            })})},
   });
   const auto normalized =
@@ -827,27 +830,32 @@ TEST(ClosedSchema,
 
   const auto with_confirmation_validity = [&](CanonicalValue duration) {
     auto root = valid.as_object();
-    for (auto& [name, value] : root) {
-      if (name != "gripper_target_configurations") continue;
+    for (auto &[name, value] : root) {
+      if (name != "gripper_target_configurations")
+        continue;
       auto targets = value.as_array();
       auto target = targets.front().as_object();
-      target.emplace_back("operator_confirmation_validity_ns", std::move(duration));
+      target.emplace_back("operator_confirmation_validity_ns",
+                          std::move(duration));
       targets.front() = CanonicalValue(std::move(target));
       value = CanonicalValue(std::move(targets));
     }
     return CanonicalValue(std::move(root));
   };
   for (const double duration : {1.0, 3'600'000'000'000.0}) {
-    const auto configured = with_confirmation_validity(CanonicalValue(duration));
-    EXPECT_EQ(validate_and_normalize_build_qualified_value(*schema, configured).normalized_value(),
+    const auto configured =
+        with_confirmation_validity(CanonicalValue(duration));
+    EXPECT_EQ(validate_and_normalize_build_qualified_value(*schema, configured)
+                  .normalized_value(),
               configured);
   }
-  for (const auto& invalid :
-       {CanonicalValue(nullptr), CanonicalValue(true), CanonicalValue(0.0), CanonicalValue(-1.0),
-        CanonicalValue(1.5), CanonicalValue("1000"), CanonicalValue(3'600'000'000'001.0)}) {
-    EXPECT_THROW(
-        validate_and_normalize_build_qualified_value(*schema, with_confirmation_validity(invalid)),
-        ClosedSchemaError);
+  for (const auto &invalid :
+       {CanonicalValue(nullptr), CanonicalValue(true), CanonicalValue(0.0),
+        CanonicalValue(-1.0), CanonicalValue(1.5), CanonicalValue("1000"),
+        CanonicalValue(3'600'000'000'001.0)}) {
+    EXPECT_THROW(validate_and_normalize_build_qualified_value(
+                     *schema, with_confirmation_validity(invalid)),
+                 ClosedSchemaError);
   }
 
   EXPECT_THROW(

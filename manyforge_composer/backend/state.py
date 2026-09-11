@@ -300,10 +300,14 @@ class ComposerState:
             )
         admission = self.headless_client.authoring_admission()
         generation = admission.get("admission_generation")
-        if admission.get("authoring_allowed") is not True or type(generation) is not int:
+        if (
+            admission.get("authoring_allowed") is not True
+            or type(generation) is not int
+        ):
             raise AuthoringJournalError(
                 "program_scene_preparation_unavailable",
-                "Applied Program scene preparation requires authoritative Idle",
+                "Program is applied, but its scene is not prepared: backend "
+                "authoring readiness is not established",
             )
         preparation_request_id = (
             "program-scene-"
@@ -397,12 +401,19 @@ class ComposerState:
             source["source_owner_epoch"],
         )
 
-    def _optional_applied(self) -> dict[str, Any] | None:
+    def _optional_applied(
+        self, *, allow_inactive: bool = False
+    ) -> dict[str, Any] | None:
         assert self.headless_client is not None
         try:
             return self.headless_client.program_applied()
         except HeadlessClientError as error:
             if error.code == "program_applied_selection_not_found":
+                return None
+            if allow_inactive and error.code == "program_applied_selection_not_active":
+                # An admitted Deployment handover retains the old record digest
+                # for Program Apply's compare-and-set, but that old binding is
+                # no longer a current executable Program.
                 return None
             raise
 
@@ -563,10 +574,9 @@ class ComposerState:
             pre_state["program"] is not None
             and pre_state["program"] == pre_state["saved_document"]
         )
-        current_matches_applied = (
-            applied is not None
-            and pre_state["program"] == applied.get("program")
-        )
+        current_matches_applied = applied is not None and pre_state[
+            "program"
+        ] == applied.get("program")
         if (
             replacing
             and pre_state["program"] is not None
@@ -695,7 +705,7 @@ class ComposerState:
                 "scenario_load_manager_convergence_timeout",
                 "Manager did not publish the target converged Deployment in time",
             )
-        applied = self._optional_applied()
+        applied = self._optional_applied(allow_inactive=True)
         program_result: dict[str, Any] | None = None
         if applied is None or not applied_program_matches_scenario_selection(
             applied, selection
@@ -906,20 +916,28 @@ class ComposerState:
 
         if apply:
             deadline = time.monotonic() + _SCENARIO_LOAD_TIMEOUT_SECONDS
-            while not self._manager_matches_scenario(
-                self.headless_client.manager_status(),
-                self.headless_client.manager_diff(),
-                compilation,
-            ):
+            selection = None
+            while selection is None:
+                if self._manager_matches_scenario(
+                    self.headless_client.manager_status(),
+                    self.headless_client.manager_diff(),
+                    compilation,
+                ):
+                    try:
+                        selection = self.headless_client.scenario_load_selection(
+                            intent["scenario_id"]
+                        )
+                    except HeadlessClientError as error:
+                        if error.code != "scenario_program_selection_unavailable":
+                            raise
+                if selection is not None:
+                    break
                 if time.monotonic() >= deadline:
                     raise AuthoringJournalError(
                         "deployment_candidate_convergence_timeout",
                         "Manager did not converge the authored Deployment",
                     )
                 time.sleep(_SCENARIO_LOAD_POLL_SECONDS)
-            selection = self.headless_client.scenario_load_selection(
-                intent["scenario_id"]
-            )
             correspondences = {
                 "scenario_catalog_revision": "scenario_catalog_revision",
                 "deployment_artifact_id": "deployment_artifact_id",
@@ -930,17 +948,19 @@ class ComposerState:
                 "program_revision": "program_revision",
                 "program_binding_id": "program_binding_id",
             }
-            if any(
-                selection.get(selection_field)
-                != compilation.get(compilation_field)
-                for selection_field, compilation_field in correspondences.items()
-            ) or selection.get("program") != intent["program"]:
+            if (
+                any(
+                    selection.get(selection_field) != compilation.get(compilation_field)
+                    for selection_field, compilation_field in correspondences.items()
+                )
+                or selection.get("program") != intent["program"]
+            ):
                 raise AuthoringJournalError(
                     "deployment_candidate_selection_mismatch",
                     "applied Deployment candidate did not reopen as one exact "
                     "Scenario closure",
                 )
-            applied = self._optional_applied()
+            applied = self._optional_applied(allow_inactive=True)
             if applied is None or not applied_program_matches_scenario_selection(
                 applied, selection
             ):
@@ -1109,9 +1129,10 @@ class ComposerState:
                     == post_state["deployment"]["saved_path"]
                 )
             except DeploymentDraftError as error:
-                if error.code != "deployment_artifact_not_found" and not intent[
-                    "overwrite"
-                ]:
+                if (
+                    error.code != "deployment_artifact_not_found"
+                    and not intent["overwrite"]
+                ):
                     raise AuthoringJournalError(
                         "composer_authoring_save_recovery_conflict",
                         "Deployment Save target cannot be proven exact without overwrite authority",
@@ -1172,9 +1193,10 @@ class ComposerState:
                     and present_path == post_state["saved_path"]
                 )
             except ProgramArtifactError as error:
-                if error.code != "program_artifact_not_found" and not intent[
-                    "overwrite"
-                ]:
+                if (
+                    error.code != "program_artifact_not_found"
+                    and not intent["overwrite"]
+                ):
                     raise AuthoringJournalError(
                         "composer_authoring_save_recovery_conflict",
                         "Save target cannot be proven exact without overwrite authority",

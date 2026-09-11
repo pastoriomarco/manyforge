@@ -420,6 +420,44 @@ def test_scene_client_rejects_mismatched_or_inconsistent_owner_result(
     assert captured.value.code == "manager_command_response_identity_mismatch"
 
 
+def test_scene_result_lookup_is_read_only_and_validates_the_nested_owner_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = ManagerCommandClient(tmp_path)
+    request = _scene_request()
+    commands = []
+    response = {"api_version": "manyforge.manager_command_response.v1", "ok": True,
+                "result": None}
+
+    def exchange(command):
+        commands.append(command)
+        return response
+
+    monkeypatch.setattr(client, "_exchange", exchange)
+    assert client.scene_transaction_status(request)["result"] is None
+    assert commands[0]["command"] == "scene_transaction_status"
+    assert "program_node_evidence" not in commands[0]["transaction"]
+    response["result"] = {
+        "api_version": "manyforge.manager_command_response.v1",
+        "committed_projection_revision": None,
+        "error": {"code": "object_not_found", "details": {}, "message": "absent"},
+        "ok": False, "projection_status": "not_attempted", "replay_status": "replayed_exact",
+        "request_id": request.request_context.request_id,
+        "request_owner_epoch": request.request_context.request_owner_epoch,
+        "transaction_sequence": None, "update_status": None,
+    }
+    assert client.scene_transaction_status(request)["result"]["ok"] is False
+    response["result"]["request_id"] = "another-request"
+    with pytest.raises(HeadlessApiError, match="does not match"):
+        client.scene_transaction_status(request)
+    for malformed in ([], 42, {"ok": True}):
+        response["result"] = malformed
+        with pytest.raises(HeadlessApiError) as captured:
+            client.scene_transaction_status(request)
+        assert captured.value.code == "manager_command_response_invalid"
+    assert all(command["command"] == "scene_transaction_status" for command in commands)
+
+
 def test_scene_pose_client_fences_and_validates_the_owner_projection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

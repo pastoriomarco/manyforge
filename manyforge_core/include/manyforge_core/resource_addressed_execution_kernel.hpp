@@ -124,6 +124,23 @@ struct OperationReadProjectionDTO final {
                          const OperationReadProjectionDTO&) = default;
 };
 
+/// Private, read-only orchestration input. Shared verified products and node
+/// indices identify the tasks to retire; this is not a motion admission offer.
+struct ResolvedManualProgramHandover final {
+  ProgramRunExecutionCaptureDTO capture;
+  std::uint64_t selection_revision{};
+  std::vector<std::uint32_t> producer_node_indices;
+};
+
+/// Current eligibility to prepare direct control, not a dispatch permission.
+/// A held Program may first require existing stopped-task cleanup.
+struct ResolvedManualControlAvailability final {
+  bool available{};
+  std::optional<std::string> unavailable_reason;
+  std::optional<ResolvedManualProgramHandover> handover;
+  bool cleanup_required{};
+};
+
 /// One coherent, read-only projection of the current addressed execution
 /// truth needed by the durable Kernel Disable-handoff owner.  Active
 /// publication and configuration-fence generation remain owned by that
@@ -360,6 +377,10 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   /// Repeated exact registration preserves current admission holds. This is
   /// process-local composition, not a public caller-supplied table interface.
   [[nodiscard]] Result<void> register_program_run_capture(ProgramRunExecutionCaptureDTO capture);
+  [[nodiscard]] Result<std::optional<ResolvedManualProgramHandover>> get_manual_program_handover(
+      const OperationIntentDTO& intent);
+  [[nodiscard]] Result<ResolvedManualControlAvailability> get_manual_control_availability(
+      const OperationIntentDTO& intent);
   [[nodiscard]] Result<ProgramExecutionSelectionAcceptedDTO> stop_program_selection(
       const ProgramExecutionSelectionRequestDTO& request);
   [[nodiscard]] Result<ProgramExecutionScopeStateDTO> get_program_execution_scope(
@@ -548,6 +569,12 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   }
 
  private:
+  [[nodiscard]] Result<std::optional<ResolvedManualProgramHandover>>
+  resolve_manual_program_handover(const OperationIntentDTO& intent);
+  [[nodiscard]] Result<std::optional<ResolvedManualProgramHandover>>
+  resolve_manual_program_handover(const RuntimeParticipantExecutionRegistration& registration);
+  [[nodiscard]] Result<void> validate_manual_program_handover_locked(
+      const ResolvedManualProgramHandover& handover) const;
   struct ReplayEntry;
   struct ControlReplayEntry;
   struct StopReplayEntry;
@@ -573,8 +600,13 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       const RuntimeParticipantBinding& binding) const noexcept;
   [[nodiscard]] Result<RuntimeParticipantExecutionRegistration> resolve_registration(
       const OperationIntentDTO& operation, std::size_t participant_index) const;
+  [[nodiscard]] Result<void> validate_preview_participant(
+      const OperationIntentDTO& intent,
+      const RuntimeParticipantExecutionRegistration& registration);
   [[nodiscard]] StopScopeResolverSnapshotDTO capture_stop_scope_locked(
       const ResourceSlotTableSnapshotDTO& slots) const;
+  [[nodiscard]] Result<void> validate_program_node_claim(
+      const ProgramNodeAdmissionEvidenceDTO& evidence) const;
   [[nodiscard]] Result<void> validate_program_execution_scope_locked(
       const OperationIntentDTO& intent) const;
   [[nodiscard]] Result<void> validate_program_resume_scope_locked(
@@ -603,7 +635,8 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
                                                      IResolvedParticipantExecutionEngine* engine,
                                                      std::uint64_t subordinate_id,
                                                      OperationStateKind state, double progress,
-                                                     std::optional<ErrorDTO> terminal_error);
+                                                     std::optional<ErrorDTO> terminal_error,
+                                                     bool observe_current_motion = false);
   void stamp_operation_capture_locked(ActiveOperation& operation, OperationStateDTO& state);
   [[nodiscard]] Result<bool> record_operation_state_locked(
       std::unique_lock<std::mutex>& state_lock, OperationStateDTO& state,
@@ -630,6 +663,7 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] OperationStateDTO publish_settlement_fault_locked(ActiveOperation& operation);
   [[nodiscard]] Result<void> settle_control_operation_locked(const OperationId& operation_id,
                                                              OperationControlKind control);
+  void clear_motion_continuation_locked(const ActiveOperation& operation);
   [[nodiscard]] std::vector<OperationId> durable_operation_retention_ids_locked() const;
   [[nodiscard]] bool evict_oldest_historical_operation_locked(
       std::span<const OperationId> protected_operation_ids);
@@ -670,6 +704,8 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   void ScheduleStopSurveillance(StopCertificateId certificate_id,
                                 std::int64_t deadline_ns) noexcept;
   [[nodiscard]] std::optional<StopControlWorkToken> allocate_stop_projection_job_locked() noexcept;
+  void latch_stop_fault_locked(StopTransaction& transaction, StopFaultTriggerDTO trigger);
+  void refresh_stop_fault_latch_locked();
   [[nodiscard]] bool commit_stop_terminal_locked(StopTransaction& transaction,
                                                  std::int64_t completed_at_ns) noexcept;
   [[nodiscard]] Result<StopAcceptedDTO> accept_stop(
@@ -731,6 +767,9 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
     RequestOwnerEpoch program_runner_owner_epoch;
     ProgramRevision program_revision;
     std::optional<ProgramRunExecutionCaptureDTO> capture{};
+    struct MotionContinuation;
+    // Aligned with the immutable captured node table, bounded by that table.
+    std::vector<std::shared_ptr<const MotionContinuation>> motion_continuations{};
   };
   [[nodiscard]] Result<std::vector<std::uint32_t>> resolve_program_selection_locked(
       const ProgramExecutionSelectionRequestDTO& request) const;

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <initializer_list>
 #include <limits>
+#include <manyforge_core/stop_timing.hpp>
 #include <manyforge_core/types/interrupt.hpp>
 #include <manyforge_core/types/motion_interrupt.hpp>
 #include <optional>
@@ -18,8 +19,8 @@
 #include <variant>
 #include <vector>
 
-#include "content_identity_internal.hpp"
 #include "compiler_semantic_limits_internal.hpp"
+#include "content_identity_internal.hpp"
 #include "deployment_catalog_codec_internal.hpp"
 #include "manyforge_deployment/closed_schema.hpp"
 #include "manyforge_deployment/content_identity.hpp"
@@ -40,18 +41,18 @@ using core::CapabilityScope;
 using core::CellGlobalCapabilityProviderTargetDTO;
 using core::CellId;
 using core::CommandTargetId;
+using core::CommissionedStopInterfaceDTO;
+using core::CommissionedStopInterfaceId;
+using core::CommissionedStopInterfaceRevision;
 using core::ComponentTypeRevision;
-using core::ControllableComponentId;
 using core::ControlBindingId;
 using core::ControlBindingRevision;
 using core::ControlDomainCapabilityProviderTargetDTO;
 using core::ControlDomainId;
 using core::ControlDomainRevision;
+using core::ControllableComponentId;
 using core::ControllerTopologyId;
 using core::ControlRouteId;
-using core::CommissionedStopInterfaceDTO;
-using core::CommissionedStopInterfaceId;
-using core::CommissionedStopInterfaceRevision;
 using core::DeploymentApplicabilityInputsDTO;
 using core::DesiredControlBindingRouteDTO;
 using core::DesiredControlConfigurationDTO;
@@ -68,9 +69,9 @@ using core::SiteOverlayId;
 using core::SiteOverlayRefDTO;
 using core::SiteOverlayRevision;
 using core::SiteOverlayValueRef;
+using core::StopStageParametersDTO;
 using core::TargetBindingCapabilityProviderTargetDTO;
 using core::TopologyRevision;
-using core::StopStageParametersDTO;
 
 constexpr std::string_view kDeploymentApiVersion = "manyforge.deployment.v1";
 const detail::ContentIdentitySpec kCapabilityProviderBindingIdentitySpec{
@@ -101,66 +102,67 @@ const detail::ContentIdentitySpec kCommissionedStopInterfaceIdentitySpec{
   return std::string(parent) + "[" + std::to_string(index) + "]";
 }
 
-[[nodiscard]] const CanonicalValue::Object& require_object(
-    const CanonicalValue& value, std::string_view path) {
-  const auto* object = std::get_if<CanonicalValue::Object>(&value.storage());
+[[nodiscard]] const CanonicalValue::Object &
+require_object(const CanonicalValue &value, std::string_view path) {
+  const auto *object = std::get_if<CanonicalValue::Object>(&value.storage());
   if (object == nullptr) {
     fail(path, "expected object");
   }
   return *object;
 }
 
-[[nodiscard]] const CanonicalValue::Array& require_array(
-    const CanonicalValue& value, std::string_view path) {
-  const auto* array = std::get_if<CanonicalValue::Array>(&value.storage());
+[[nodiscard]] const CanonicalValue::Array &
+require_array(const CanonicalValue &value, std::string_view path) {
+  const auto *array = std::get_if<CanonicalValue::Array>(&value.storage());
   if (array == nullptr) {
     fail(path, "expected array");
   }
   return *array;
 }
 
-[[nodiscard]] const std::string& require_string(const CanonicalValue& value,
+[[nodiscard]] const std::string &require_string(const CanonicalValue &value,
                                                 std::string_view path) {
-  const auto* text = std::get_if<std::string>(&value.storage());
+  const auto *text = std::get_if<std::string>(&value.storage());
   if (text == nullptr) {
     fail(path, "expected string");
   }
   return *text;
 }
 
-[[nodiscard]] bool require_bool(const CanonicalValue& value,
+[[nodiscard]] bool require_bool(const CanonicalValue &value,
                                 std::string_view path) {
-  const auto* boolean = std::get_if<bool>(&value.storage());
+  const auto *boolean = std::get_if<bool>(&value.storage());
   if (boolean == nullptr) {
     fail(path, "expected boolean");
   }
   return *boolean;
 }
 
-[[nodiscard]] const CanonicalValue& require_member(
-    const CanonicalValue::Object& object, std::string_view name,
-    std::string_view path) {
-  const auto iterator = std::find_if(
-      object.begin(), object.end(),
-      [name](const auto& member) { return member.first == name; });
+[[nodiscard]] const CanonicalValue &
+require_member(const CanonicalValue::Object &object, std::string_view name,
+               std::string_view path) {
+  const auto iterator =
+      std::find_if(object.begin(), object.end(),
+                   [name](const auto &member) { return member.first == name; });
   if (iterator == object.end()) {
     fail(path, "missing required field '" + std::string(name) + "'");
   }
   return iterator->second;
 }
 
-[[nodiscard]] const CanonicalValue* find_member(
-    const CanonicalValue::Object& object, std::string_view name) noexcept {
-  const auto iterator = std::find_if(
-      object.begin(), object.end(),
-      [name](const auto& member) { return member.first == name; });
+[[nodiscard]] const CanonicalValue *
+find_member(const CanonicalValue::Object &object,
+            std::string_view name) noexcept {
+  const auto iterator =
+      std::find_if(object.begin(), object.end(),
+                   [name](const auto &member) { return member.first == name; });
   return iterator == object.end() ? nullptr : &iterator->second;
 }
 
-void require_exact_fields(
-    const CanonicalValue::Object& object,
-    std::initializer_list<std::string_view> expected, std::string_view path) {
-  for (const auto& [name, unused] : object) {
+void require_exact_fields(const CanonicalValue::Object &object,
+                          std::initializer_list<std::string_view> expected,
+                          std::string_view path) {
+  for (const auto &[name, unused] : object) {
     (void)unused;
     if (std::find(expected.begin(), expected.end(), name) == expected.end()) {
       fail(path, "unknown field '" + name + "'");
@@ -171,12 +173,11 @@ void require_exact_fields(
   }
 }
 
-void require_closed_fields(
-    const CanonicalValue::Object& object,
-    std::initializer_list<std::string_view> required,
-    std::initializer_list<std::string_view> optional,
-    std::string_view path) {
-  for (const auto& [name, unused] : object) {
+void require_closed_fields(const CanonicalValue::Object &object,
+                           std::initializer_list<std::string_view> required,
+                           std::initializer_list<std::string_view> optional,
+                           std::string_view path) {
+  for (const auto &[name, unused] : object) {
     (void)unused;
     if (std::find(required.begin(), required.end(), name) == required.end() &&
         std::find(optional.begin(), optional.end(), name) == optional.end()) {
@@ -188,9 +189,10 @@ void require_closed_fields(
   }
 }
 
-[[nodiscard]] std::uint64_t require_bounded_unsigned_integer(
-    const CanonicalValue& value, std::string_view path) {
-  const auto* number = std::get_if<double>(&value.storage());
+[[nodiscard]] std::uint64_t
+require_bounded_unsigned_integer(const CanonicalValue &value,
+                                 std::string_view path) {
+  const auto *number = std::get_if<double>(&value.storage());
   constexpr double kMaximumIJsonInteger = 9007199254740991.0;
   if (number == nullptr || !std::isfinite(*number) || *number < 0.0 ||
       std::trunc(*number) != *number || *number > kMaximumIJsonInteger) {
@@ -199,9 +201,9 @@ void require_closed_fields(
   return static_cast<std::uint64_t>(*number);
 }
 
-[[nodiscard]] std::uint64_t require_integer_in_range(
-    const CanonicalValue& value, std::uint64_t minimum, std::uint64_t maximum,
-    std::string_view path) {
+[[nodiscard]] std::uint64_t
+require_integer_in_range(const CanonicalValue &value, std::uint64_t minimum,
+                         std::uint64_t maximum, std::string_view path) {
   const std::uint64_t parsed = require_bounded_unsigned_integer(value, path);
   if (parsed < minimum || parsed > maximum) {
     fail(path, "integer is outside the supported closed range");
@@ -209,25 +211,23 @@ void require_closed_fields(
   return parsed;
 }
 
-[[nodiscard]] double require_finite_number(const CanonicalValue& value,
+[[nodiscard]] double require_finite_number(const CanonicalValue &value,
                                            std::string_view path) {
-  const auto* number = std::get_if<double>(&value.storage());
+  const auto *number = std::get_if<double>(&value.storage());
   if (number == nullptr || !std::isfinite(*number)) {
     fail(path, "expected finite number");
   }
   return *number;
 }
 
-[[nodiscard]] constexpr bool is_ascii_alphanumeric(
-    unsigned char byte) noexcept {
-  return (byte >= 'a' && byte <= 'z') ||
-         (byte >= 'A' && byte <= 'Z') ||
+[[nodiscard]] constexpr bool
+is_ascii_alphanumeric(unsigned char byte) noexcept {
+  return (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
          (byte >= '0' && byte <= '9');
 }
 
 [[nodiscard]] bool is_portable_token(std::string_view value) noexcept {
-  if (value.empty() ||
-      value.size() > detail::kMaximumPortableIdentityBytes ||
+  if (value.empty() || value.size() > detail::kMaximumPortableIdentityBytes ||
       !is_ascii_alphanumeric(static_cast<unsigned char>(value.front()))) {
     return false;
   }
@@ -238,9 +238,9 @@ void require_closed_fields(
 }
 
 template <typename StrongType>
-[[nodiscard]] StrongType parse_portable_id(const CanonicalValue& value,
+[[nodiscard]] StrongType parse_portable_id(const CanonicalValue &value,
                                            std::string_view path) {
-  const std::string& text = require_string(value, path);
+  const std::string &text = require_string(value, path);
   if (!is_portable_token(text)) {
     fail(path,
          "expected a 1..128 byte portable token beginning with an ASCII "
@@ -250,18 +250,18 @@ template <typename StrongType>
 }
 
 template <typename StrongType>
-[[nodiscard]] StrongType parse_digest(const CanonicalValue& value,
+[[nodiscard]] StrongType parse_digest(const CanonicalValue &value,
                                       std::string_view path) {
-  const std::string& text = require_string(value, path);
+  const std::string &text = require_string(value, path);
   if (!is_sha256_digest(text)) {
     fail(path, "expected lowercase sha256:<64 hex> digest");
   }
   return StrongType(text);
 }
 
-[[nodiscard]] CapabilityScope parse_scope(const CanonicalValue& value,
+[[nodiscard]] CapabilityScope parse_scope(const CanonicalValue &value,
                                           std::string_view path) {
-  const std::string& text = require_string(value, path);
+  const std::string &text = require_string(value, path);
   if (text == "cell_global") {
     return CapabilityScope::kCellGlobal;
   }
@@ -274,9 +274,10 @@ template <typename StrongType>
   fail(path, "scope is outside the closed v1 enum");
 }
 
-[[nodiscard]] ExternalResourceKind parse_external_resource_kind(
-    const CanonicalValue& value, std::string_view path) {
-  const std::string& text = require_string(value, path);
+[[nodiscard]] ExternalResourceKind
+parse_external_resource_kind(const CanonicalValue &value,
+                             std::string_view path) {
+  const std::string &text = require_string(value, path);
   if (text == "model_endpoint") {
     return ExternalResourceKind::kModelEndpoint;
   }
@@ -292,13 +293,13 @@ template <typename StrongType>
   fail(path, "resource kind is outside the closed v1 enum");
 }
 
-[[nodiscard]] DesiredControlBindingRouteDTO parse_desired_route(
-    const CanonicalValue& value, std::string_view path) {
-  const auto& object = require_object(value, path);
-  require_exact_fields(object,
-                       {"control_binding_id", "control_binding_revision",
-                        "control_route_id"},
-                       path);
+[[nodiscard]] DesiredControlBindingRouteDTO
+parse_desired_route(const CanonicalValue &value, std::string_view path) {
+  const auto &object = require_object(value, path);
+  require_exact_fields(
+      object,
+      {"control_binding_id", "control_binding_revision", "control_route_id"},
+      path);
   return {
       parse_portable_id<ControlBindingId>(
           require_member(object, "control_binding_id", path),
@@ -312,26 +313,25 @@ template <typename StrongType>
   };
 }
 
-[[nodiscard]] auto desired_route_key(
-    const DesiredControlBindingRouteDTO& route) {
+[[nodiscard]] auto
+desired_route_key(const DesiredControlBindingRouteDTO &route) {
   return std::tie(route.control_binding_id, route.control_binding_revision,
                   route.control_route_id);
 }
 
-[[nodiscard]] DesiredControlConfigurationDTO parse_desired_configuration(
-    const CanonicalValue& value, std::string_view path) {
-  const auto& object = require_object(value, path);
-  require_exact_fields(
-      object,
-      {"control_domain_id", "control_domain_revision",
-       "controller_topology_id", "topology_revision", "activation_set_id",
-       "binding_routes"},
-      path);
+[[nodiscard]] DesiredControlConfigurationDTO
+parse_desired_configuration(const CanonicalValue &value,
+                            std::string_view path) {
+  const auto &object = require_object(value, path);
+  require_exact_fields(object,
+                       {"control_domain_id", "control_domain_revision",
+                        "controller_topology_id", "topology_revision",
+                        "activation_set_id", "binding_routes"},
+                       path);
 
   const std::string routes_path = child_path(path, "binding_routes");
-  const auto& route_values =
-      require_array(require_member(object, "binding_routes", path),
-                    routes_path);
+  const auto &route_values = require_array(
+      require_member(object, "binding_routes", path), routes_path);
   if (route_values.size() > core::kMaxDeploymentApplicabilityRows) {
     fail(routes_path,
          "binding-route count exceeds the 4096-row deployment ceiling");
@@ -339,17 +339,18 @@ template <typename StrongType>
   std::vector<DesiredControlBindingRouteDTO> routes;
   routes.reserve(route_values.size());
   for (std::size_t index = 0; index < route_values.size(); ++index) {
-    routes.push_back(
-        parse_desired_route(route_values[index], index_path(routes_path, index)));
+    routes.push_back(parse_desired_route(route_values[index],
+                                         index_path(routes_path, index)));
   }
   std::sort(routes.begin(), routes.end(),
-            [](const auto& left, const auto& right) {
+            [](const auto &left, const auto &right) {
               return desired_route_key(left) < desired_route_key(right);
             });
-  if (std::adjacent_find(
-          routes.begin(), routes.end(), [](const auto& left, const auto& right) {
-            return desired_route_key(left) == desired_route_key(right);
-          }) != routes.end()) {
+  if (std::adjacent_find(routes.begin(), routes.end(),
+                         [](const auto &left, const auto &right) {
+                           return desired_route_key(left) ==
+                                  desired_route_key(right);
+                         }) != routes.end()) {
     fail(routes_path, "duplicate complete binding-route identity");
   }
 
@@ -373,76 +374,73 @@ template <typename StrongType>
   };
 }
 
-[[nodiscard]] CapabilityProviderTargetDTO parse_provider_target(
-    CapabilityScope scope, const CanonicalValue& value, std::string_view path) {
-  const auto& object = require_object(value, path);
+[[nodiscard]] CapabilityProviderTargetDTO
+parse_provider_target(CapabilityScope scope, const CanonicalValue &value,
+                      std::string_view path) {
+  const auto &object = require_object(value, path);
   switch (scope) {
-    case CapabilityScope::kCellGlobal:
-      require_exact_fields(object, {"cell_id"}, path);
-      return CellGlobalCapabilityProviderTargetDTO{
-          parse_portable_id<CellId>(require_member(object, "cell_id", path),
-                                    child_path(path, "cell_id"))};
+  case CapabilityScope::kCellGlobal:
+    require_exact_fields(object, {"cell_id"}, path);
+    return CellGlobalCapabilityProviderTargetDTO{parse_portable_id<CellId>(
+        require_member(object, "cell_id", path), child_path(path, "cell_id"))};
 
-    case CapabilityScope::kTargetBinding:
-      require_exact_fields(
-          object,
-          {"controllable_component_id", "component_type_revision",
-           "command_target_id", "control_binding_id",
-           "control_binding_revision"},
-          path);
-      return TargetBindingCapabilityProviderTargetDTO{
-          parse_portable_id<ControllableComponentId>(
-              require_member(object, "controllable_component_id", path),
-              child_path(path, "controllable_component_id")),
-          parse_digest<ComponentTypeRevision>(
-              require_member(object, "component_type_revision", path),
-              child_path(path, "component_type_revision")),
-          parse_portable_id<CommandTargetId>(
-              require_member(object, "command_target_id", path),
-              child_path(path, "command_target_id")),
-          parse_portable_id<ControlBindingId>(
-              require_member(object, "control_binding_id", path),
-              child_path(path, "control_binding_id")),
-          parse_digest<ControlBindingRevision>(
-              require_member(object, "control_binding_revision", path),
-              child_path(path, "control_binding_revision")),
-      };
+  case CapabilityScope::kTargetBinding:
+    require_exact_fields(object,
+                         {"controllable_component_id",
+                          "component_type_revision", "command_target_id",
+                          "control_binding_id", "control_binding_revision"},
+                         path);
+    return TargetBindingCapabilityProviderTargetDTO{
+        parse_portable_id<ControllableComponentId>(
+            require_member(object, "controllable_component_id", path),
+            child_path(path, "controllable_component_id")),
+        parse_digest<ComponentTypeRevision>(
+            require_member(object, "component_type_revision", path),
+            child_path(path, "component_type_revision")),
+        parse_portable_id<CommandTargetId>(
+            require_member(object, "command_target_id", path),
+            child_path(path, "command_target_id")),
+        parse_portable_id<ControlBindingId>(
+            require_member(object, "control_binding_id", path),
+            child_path(path, "control_binding_id")),
+        parse_digest<ControlBindingRevision>(
+            require_member(object, "control_binding_revision", path),
+            child_path(path, "control_binding_revision")),
+    };
 
-    case CapabilityScope::kControlDomain:
-      require_exact_fields(object,
-                           {"control_domain_id", "control_domain_revision",
-                            "controller_topology_id", "topology_revision"},
-                           path);
-      return ControlDomainCapabilityProviderTargetDTO{
-          parse_portable_id<ControlDomainId>(
-              require_member(object, "control_domain_id", path),
-              child_path(path, "control_domain_id")),
-          parse_digest<ControlDomainRevision>(
-              require_member(object, "control_domain_revision", path),
-              child_path(path, "control_domain_revision")),
-          parse_portable_id<ControllerTopologyId>(
-              require_member(object, "controller_topology_id", path),
-              child_path(path, "controller_topology_id")),
-          parse_digest<TopologyRevision>(
-              require_member(object, "topology_revision", path),
-              child_path(path, "topology_revision")),
-      };
+  case CapabilityScope::kControlDomain:
+    require_exact_fields(object,
+                         {"control_domain_id", "control_domain_revision",
+                          "controller_topology_id", "topology_revision"},
+                         path);
+    return ControlDomainCapabilityProviderTargetDTO{
+        parse_portable_id<ControlDomainId>(
+            require_member(object, "control_domain_id", path),
+            child_path(path, "control_domain_id")),
+        parse_digest<ControlDomainRevision>(
+            require_member(object, "control_domain_revision", path),
+            child_path(path, "control_domain_revision")),
+        parse_portable_id<ControllerTopologyId>(
+            require_member(object, "controller_topology_id", path),
+            child_path(path, "controller_topology_id")),
+        parse_digest<TopologyRevision>(
+            require_member(object, "topology_revision", path),
+            child_path(path, "topology_revision")),
+    };
   }
   fail(path, "scope has no target alternative");
 }
 
-[[nodiscard]] CapabilityProviderEndpointBindingDTO parse_endpoint_binding(
-    const CanonicalValue& value, std::string_view path) {
-  const auto& object = require_object(value, path);
-  require_exact_fields(
-      object,
-      {"endpoint_role_id", "source_kind", "source_id",
-       "source_endpoint_role_id"},
-      path);
+[[nodiscard]] CapabilityProviderEndpointBindingDTO
+parse_endpoint_binding(const CanonicalValue &value, std::string_view path) {
+  const auto &object = require_object(value, path);
+  require_exact_fields(object,
+                       {"endpoint_role_id", "source_kind", "source_id",
+                        "source_endpoint_role_id"},
+                       path);
   const std::string source_kind_path = child_path(path, "source_kind");
-  const std::string& source_kind =
-      require_string(require_member(object, "source_kind", path),
-                     source_kind_path);
+  const std::string &source_kind = require_string(
+      require_member(object, "source_kind", path), source_kind_path);
 
   const EndpointRoleId endpoint_role_id = parse_portable_id<EndpointRoleId>(
       require_member(object, "endpoint_role_id", path),
@@ -474,27 +472,23 @@ template <typename StrongType>
   fail(source_kind_path, "source kind is outside the closed v1 enum");
 }
 
-[[nodiscard]] CapabilityProviderBindingDTO parse_provider_binding(
-    const CanonicalValue& value, std::string_view path) {
-  const auto& object = require_object(value, path);
-  require_exact_fields(
-      object,
-      {"capability_provider_binding_id",
-       "capability_provider_binding_revision", "capability_id",
-       "capability_definition_revision", "scope", "target",
-       "provider_instance_id", "provider_manifest_id",
-       "provider_manifest_revision", "endpoint_bindings"},
-      path);
+[[nodiscard]] CapabilityProviderBindingDTO
+parse_provider_binding(const CanonicalValue &value, std::string_view path) {
+  const auto &object = require_object(value, path);
+  require_exact_fields(object,
+                       {"capability_provider_binding_id",
+                        "capability_provider_binding_revision", "capability_id",
+                        "capability_definition_revision", "scope", "target",
+                        "provider_instance_id", "provider_manifest_id",
+                        "provider_manifest_revision", "endpoint_bindings"},
+                       path);
 
-  const CapabilityScope scope =
-      parse_scope(require_member(object, "scope", path),
-                  child_path(path, "scope"));
+  const CapabilityScope scope = parse_scope(
+      require_member(object, "scope", path), child_path(path, "scope"));
   const std::string endpoints_path = child_path(path, "endpoint_bindings");
-  const auto& endpoint_values =
-      require_array(require_member(object, "endpoint_bindings", path),
-                    endpoints_path);
-  if (endpoint_values.size() >
-      core::kMaxCapabilityProviderEndpointBindings) {
+  const auto &endpoint_values = require_array(
+      require_member(object, "endpoint_bindings", path), endpoints_path);
+  if (endpoint_values.size() > core::kMaxCapabilityProviderEndpointBindings) {
     fail(endpoints_path,
          "endpoint binding count exceeds the provider-manifest endpoint-role "
          "ceiling");
@@ -506,14 +500,14 @@ template <typename StrongType>
         endpoint_values[index], index_path(endpoints_path, index)));
   }
   std::sort(endpoints.begin(), endpoints.end(),
-            [](const auto& left, const auto& right) {
+            [](const auto &left, const auto &right) {
               return left.endpoint_role_id < right.endpoint_role_id;
             });
-  if (std::adjacent_find(
-          endpoints.begin(), endpoints.end(),
-          [](const auto& left, const auto& right) {
-            return left.endpoint_role_id == right.endpoint_role_id;
-          }) != endpoints.end()) {
+  if (std::adjacent_find(endpoints.begin(), endpoints.end(),
+                         [](const auto &left, const auto &right) {
+                           return left.endpoint_role_id ==
+                                  right.endpoint_role_id;
+                         }) != endpoints.end()) {
     fail(endpoints_path, "duplicate endpoint_role_id");
   }
 
@@ -546,21 +540,22 @@ template <typename StrongType>
   };
 }
 
-[[nodiscard]] ExternalResourceDTO parse_external_resource(
-    const CanonicalValue& value, std::string_view path) {
-  const auto& object = require_object(value, path);
-  require_exact_fields(
-      object,
-      {"external_resource_alias", "resource_kind", "provider_instance_id",
-       "provider_manifest_id", "provider_manifest_revision",
-       "endpoint_role_id", "site_overlay_value_ref"},
-      path);
+[[nodiscard]] ExternalResourceDTO
+parse_external_resource(const CanonicalValue &value, std::string_view path) {
+  const auto &object = require_object(value, path);
+  require_exact_fields(object,
+                       {"external_resource_alias", "resource_kind",
+                        "provider_instance_id", "provider_manifest_id",
+                        "provider_manifest_revision", "endpoint_role_id",
+                        "site_overlay_value_ref"},
+                       path);
   return {
       parse_portable_id<ExternalResourceAlias>(
           require_member(object, "external_resource_alias", path),
           child_path(path, "external_resource_alias")),
-      parse_external_resource_kind(require_member(object, "resource_kind", path),
-                                   child_path(path, "resource_kind")),
+      parse_external_resource_kind(
+          require_member(object, "resource_kind", path),
+          child_path(path, "resource_kind")),
       parse_portable_id<ProviderInstanceId>(
           require_member(object, "provider_instance_id", path),
           child_path(path, "provider_instance_id")),
@@ -579,14 +574,14 @@ template <typename StrongType>
   };
 }
 
-[[nodiscard]] ProviderContractRefDTO parse_provider_contract_ref(
-    const CanonicalValue& value, std::string_view path) {
-  const auto& object = require_object(value, path);
-  require_exact_fields(
-      object,
-      {"provider_contract_role_id", "contract_schema_id",
-       "contract_schema_revision"},
-      path);
+[[nodiscard]] ProviderContractRefDTO
+parse_provider_contract_ref(const CanonicalValue &value,
+                            std::string_view path) {
+  const auto &object = require_object(value, path);
+  require_exact_fields(object,
+                       {"provider_contract_role_id", "contract_schema_id",
+                        "contract_schema_revision"},
+                       path);
   return {
       parse_portable_id<core::ProviderContractRoleId>(
           require_member(object, "provider_contract_role_id", path),
@@ -600,41 +595,41 @@ template <typename StrongType>
   };
 }
 
-[[nodiscard]] core::JsonValueDTO canonical_to_json_value(
-    const CanonicalValue& value) {
+[[nodiscard]] core::JsonValueDTO
+canonical_to_json_value(const CanonicalValue &value) {
   if (std::holds_alternative<std::nullptr_t>(value.storage())) {
     return {};
   }
-  if (const auto* boolean = std::get_if<bool>(&value.storage())) {
+  if (const auto *boolean = std::get_if<bool>(&value.storage())) {
     return core::JsonValueDTO{*boolean};
   }
-  if (const auto* number = std::get_if<double>(&value.storage())) {
+  if (const auto *number = std::get_if<double>(&value.storage())) {
     return core::JsonValueDTO{*number};
   }
-  if (const auto* text = std::get_if<std::string>(&value.storage())) {
+  if (const auto *text = std::get_if<std::string>(&value.storage())) {
     return core::JsonValueDTO{*text};
   }
-  if (const auto* array =
+  if (const auto *array =
           std::get_if<CanonicalValue::Array>(&value.storage())) {
     core::JsonValueDTO::Array result;
     result.reserve(array->size());
-    for (const auto& item : *array) {
+    for (const auto &item : *array) {
       result.push_back(canonical_to_json_value(item));
     }
     return core::JsonValueDTO{std::move(result)};
   }
-  const auto& object = std::get<CanonicalValue::Object>(value.storage());
+  const auto &object = std::get<CanonicalValue::Object>(value.storage());
   core::JsonObjectDTO result;
-  for (const auto& [name, member] : object) {
+  for (const auto &[name, member] : object) {
     result.emplace(name, canonical_to_json_value(member));
   }
   return core::JsonValueDTO{std::move(result)};
 }
 
-[[nodiscard]] CanonicalValue json_value_to_canonical(
-    const core::JsonValueDTO& value) {
+[[nodiscard]] CanonicalValue
+json_value_to_canonical(const core::JsonValueDTO &value) {
   return std::visit(
-      [](const auto& selected) -> CanonicalValue {
+      [](const auto &selected) -> CanonicalValue {
         using Selected = std::decay_t<decltype(selected)>;
         if constexpr (std::is_same_v<Selected, std::nullptr_t> ||
                       std::is_same_v<Selected, bool> ||
@@ -645,14 +640,14 @@ template <typename StrongType>
                                             core::JsonValueDTO::Array>) {
           CanonicalValue::Array array;
           array.reserve(selected.size());
-          for (const auto& item : selected) {
+          for (const auto &item : selected) {
             array.push_back(json_value_to_canonical(item));
           }
           return CanonicalValue(std::move(array));
         } else {
           CanonicalValue::Object object;
           object.reserve(selected.size());
-          for (const auto& [name, member] : selected) {
+          for (const auto &[name, member] : selected) {
             object.emplace_back(name, json_value_to_canonical(member));
           }
           return CanonicalValue(std::move(object));
@@ -661,27 +656,29 @@ template <typename StrongType>
       value.value);
 }
 
-[[nodiscard]] CanonicalValue json_object_to_canonical(
-    const core::JsonObjectDTO& object) {
+[[nodiscard]] CanonicalValue
+json_object_to_canonical(const core::JsonObjectDTO &object) {
   return json_value_to_canonical(core::JsonValueDTO{object});
 }
 
-[[nodiscard]] core::RetainedArtifactRefDTO parse_retained_artifact_ref(
-    const CanonicalValue& value, std::string_view path) {
-  const auto& object = require_object(value, path);
-  require_exact_fields(
-      object,
-      {"artifact_role_id", "media_type", "byte_size", "content_digest",
-       "content_addressed_store_key"},
-      path);
-  const auto& media_type = require_string(
-      require_member(object, "media_type", path), child_path(path, "media_type"));
-  const auto& store_key = require_string(
+[[nodiscard]] core::RetainedArtifactRefDTO
+parse_retained_artifact_ref(const CanonicalValue &value,
+                            std::string_view path) {
+  const auto &object = require_object(value, path);
+  require_exact_fields(object,
+                       {"artifact_role_id", "media_type", "byte_size",
+                        "content_digest", "content_addressed_store_key"},
+                       path);
+  const auto &media_type =
+      require_string(require_member(object, "media_type", path),
+                     child_path(path, "media_type"));
+  const auto &store_key = require_string(
       require_member(object, "content_addressed_store_key", path),
       child_path(path, "content_addressed_store_key"));
   if (media_type.empty() || media_type.size() > kMaxArtifactScalarBytes ||
       store_key.empty() || store_key.size() > kMaxArtifactScalarBytes) {
-    fail(path, "artifact media type and store key must be non-empty and bounded");
+    fail(path,
+         "artifact media type and store key must be non-empty and bounded");
   }
   return {
       parse_portable_id<core::ArtifactRoleId>(
@@ -698,9 +695,9 @@ template <typename StrongType>
   };
 }
 
-[[nodiscard]] core::StopActionClass parse_stop_action_class(
-    const CanonicalValue& value, std::string_view path) {
-  const auto& token = require_string(value, path);
+[[nodiscard]] core::StopActionClass
+parse_stop_action_class(const CanonicalValue &value, std::string_view path) {
+  const auto &token = require_string(value, path);
   if (token == "controlled") {
     return core::StopActionClass::kControlled;
   }
@@ -714,21 +711,23 @@ template <typename StrongType>
 }
 
 [[nodiscard]] core::SafetySystemRequestActionClass
-parse_safety_system_request_action_class(const CanonicalValue& value,
+parse_safety_system_request_action_class(const CanonicalValue &value,
                                          std::string_view path) {
-  const auto& token = require_string(value, path);
+  const auto &token = require_string(value, path);
   if (token == "protective_stop_request") {
     return core::SafetySystemRequestActionClass::kProtectiveStopRequest;
   }
   if (token == "emergency_stop_request") {
     return core::SafetySystemRequestActionClass::kEmergencyStopRequest;
   }
-  fail(path, "safety-system request action class is outside the closed v1 enum");
+  fail(path,
+       "safety-system request action class is outside the closed v1 enum");
 }
 
-[[nodiscard]] StopStageParametersDTO parse_stop_stage_parameters(
-    const CanonicalValue& value, std::string_view path) {
-  const auto& object = require_object(value, path);
+[[nodiscard]] StopStageParametersDTO
+parse_stop_stage_parameters(const CanonicalValue &value,
+                            std::string_view path) {
+  const auto &object = require_object(value, path);
   require_exact_fields(
       object,
       {"control_domain_id", "control_domain_revision", "control_binding_id",
@@ -740,17 +739,16 @@ parse_safety_system_request_action_class(const CanonicalValue& value,
   const ProviderContractRefDTO contract = parse_provider_contract_ref(
       require_member(object, "provider_contract_ref", path),
       child_path(path, "provider_contract_ref"));
-  const auto* schema = build_qualified_closed_schema_registry()
-                           .find_qualified_value_schema(
-                               contract.contract_schema_id,
-                               contract.contract_schema_revision);
+  const auto *schema =
+      build_qualified_closed_schema_registry().find_qualified_value_schema(
+          contract.contract_schema_id, contract.contract_schema_revision);
   if (schema == nullptr) {
     fail(child_path(path, "provider_contract_ref"),
          "does not select one exact build-qualified value schema");
   }
   const auto normalized = validate_and_normalize_build_qualified_value(
       *schema, require_member(object, "default_contract_parameters", path));
-  const auto* normalized_object = std::get_if<CanonicalValue::Object>(
+  const auto *normalized_object = std::get_if<CanonicalValue::Object>(
       &normalized.normalized_value().storage());
   if (normalized_object == nullptr) {
     fail(child_path(path, "default_contract_parameters"),
@@ -793,28 +791,32 @@ parse_safety_system_request_action_class(const CanonicalValue& value,
   };
 }
 
-[[nodiscard]] CommissionedStopInterfaceDTO parse_commissioned_stop_interface(
-    const CanonicalValue& value, std::string_view path) {
-  const auto& object = require_object(value, path);
+[[nodiscard]] CommissionedStopInterfaceDTO
+parse_commissioned_stop_interface(const CanonicalValue &value,
+                                  std::string_view path) {
+  const auto &object = require_object(value, path);
   require_closed_fields(
       object,
-      {"commissioned_stop_interface_id",
-       "commissioned_stop_interface_revision", "control_domain_id",
-       "control_domain_revision", "control_binding_id",
-       "control_binding_revision", "control_route_id",
-       "provider_instance_id", "provider_manifest_id",
-       "provider_manifest_revision", "registered_command_kind_id",
-       "provider_contract_ref", "endpoint_role_id", "stop_action_class",
+      {"commissioned_stop_interface_id", "commissioned_stop_interface_revision",
+       "control_domain_id", "control_domain_revision", "control_binding_id",
+       "control_binding_revision", "control_route_id", "provider_instance_id",
+       "provider_manifest_id", "provider_manifest_revision",
+       "registered_command_kind_id", "provider_contract_ref",
+       "endpoint_role_id", "stop_action_class",
        "safety_system_request_action_class",
        "commissioning_evidence_artifact_ref"},
       {"external_resource_alias", "external_resource_kind",
        "site_overlay_value_ref"},
       path);
-  const bool has_alias = find_member(object, "external_resource_alias") != nullptr;
-  const bool has_kind = find_member(object, "external_resource_kind") != nullptr;
-  const bool has_value = find_member(object, "site_overlay_value_ref") != nullptr;
+  const bool has_alias =
+      find_member(object, "external_resource_alias") != nullptr;
+  const bool has_kind =
+      find_member(object, "external_resource_kind") != nullptr;
+  const bool has_value =
+      find_member(object, "site_overlay_value_ref") != nullptr;
   if (has_alias != has_kind || has_alias != has_value) {
-    fail(path, "external-resource commissioning fields must be jointly present or absent");
+    fail(path, "external-resource commissioning fields must be jointly present "
+               "or absent");
   }
   std::optional<ExternalResourceAlias> alias;
   std::optional<ExternalResourceKind> kind;
@@ -870,9 +872,8 @@ parse_safety_system_request_action_class(const CanonicalValue& value,
       parse_portable_id<EndpointRoleId>(
           require_member(object, "endpoint_role_id", path),
           child_path(path, "endpoint_role_id")),
-      parse_stop_action_class(
-          require_member(object, "stop_action_class", path),
-          child_path(path, "stop_action_class")),
+      parse_stop_action_class(require_member(object, "stop_action_class", path),
+                              child_path(path, "stop_action_class")),
       parse_safety_system_request_action_class(
           require_member(object, "safety_system_request_action_class", path),
           child_path(path, "safety_system_request_action_class")),
@@ -885,12 +886,11 @@ parse_safety_system_request_action_class(const CanonicalValue& value,
   };
 }
 
-[[nodiscard]] SiteOverlayRefDTO parse_site_overlay_ref(
-    const CanonicalValue& value, std::string_view path) {
-  const auto& object = require_object(value, path);
+[[nodiscard]] SiteOverlayRefDTO
+parse_site_overlay_ref(const CanonicalValue &value, std::string_view path) {
+  const auto &object = require_object(value, path);
   require_exact_fields(
-      object,
-      {"site_overlay_id", "site_overlay_revision", "non_secret_digest"},
+      object, {"site_overlay_id", "site_overlay_revision", "non_secret_digest"},
       path);
   return {
       parse_portable_id<SiteOverlayId>(
@@ -905,11 +905,10 @@ parse_safety_system_request_action_class(const CanonicalValue& value,
   };
 }
 
-[[nodiscard]] CanonicalValue encode_desired_route(
-    const DesiredControlBindingRouteDTO& route) {
+[[nodiscard]] CanonicalValue
+encode_desired_route(const DesiredControlBindingRouteDTO &route) {
   return CanonicalValue(CanonicalValue::Object{
-      {"control_binding_id",
-       CanonicalValue(route.control_binding_id.value())},
+      {"control_binding_id", CanonicalValue(route.control_binding_id.value())},
       {"control_binding_revision",
        CanonicalValue(route.control_binding_revision.value())},
       {"control_route_id", CanonicalValue(route.control_route_id.value())},
@@ -917,10 +916,10 @@ parse_safety_system_request_action_class(const CanonicalValue& value,
 }
 
 [[nodiscard]] CanonicalValue encode_desired_configuration(
-    const DesiredControlConfigurationDTO& configuration) {
+    const DesiredControlConfigurationDTO &configuration) {
   CanonicalValue::Array routes;
   routes.reserve(configuration.binding_routes.size());
-  for (const auto& route : configuration.binding_routes) {
+  for (const auto &route : configuration.binding_routes) {
     routes.push_back(encode_desired_route(route));
   }
   return CanonicalValue(CanonicalValue::Object{
@@ -938,103 +937,99 @@ parse_safety_system_request_action_class(const CanonicalValue& value,
   });
 }
 
-[[nodiscard]] CanonicalValue encode_provider_target(
-    CapabilityScope scope, const CapabilityProviderTargetDTO& target) {
+[[nodiscard]] CanonicalValue
+encode_provider_target(CapabilityScope scope,
+                       const CapabilityProviderTargetDTO &target) {
   switch (scope) {
-    case CapabilityScope::kCellGlobal: {
-      const auto* value =
-          std::get_if<CellGlobalCapabilityProviderTargetDTO>(&target);
-      if (value == nullptr) {
-        fail("capability_provider_bindings.target",
-             "scope and target alternative disagree");
-      }
-      return CanonicalValue(CanonicalValue::Object{
-          {"cell_id", CanonicalValue(value->cell_id.value())},
-      });
+  case CapabilityScope::kCellGlobal: {
+    const auto *value =
+        std::get_if<CellGlobalCapabilityProviderTargetDTO>(&target);
+    if (value == nullptr) {
+      fail("capability_provider_bindings.target",
+           "scope and target alternative disagree");
     }
-    case CapabilityScope::kTargetBinding: {
-      const auto* value =
-          std::get_if<TargetBindingCapabilityProviderTargetDTO>(&target);
-      if (value == nullptr) {
-        fail("capability_provider_bindings.target",
-             "scope and target alternative disagree");
-      }
-      return CanonicalValue(CanonicalValue::Object{
-          {"controllable_component_id",
-           CanonicalValue(value->controllable_component_id.value())},
-          {"component_type_revision",
-           CanonicalValue(value->component_type_revision.value())},
-          {"command_target_id",
-           CanonicalValue(value->command_target_id.value())},
-          {"control_binding_id",
-           CanonicalValue(value->control_binding_id.value())},
-          {"control_binding_revision",
-           CanonicalValue(value->control_binding_revision.value())},
-      });
+    return CanonicalValue(CanonicalValue::Object{
+        {"cell_id", CanonicalValue(value->cell_id.value())},
+    });
+  }
+  case CapabilityScope::kTargetBinding: {
+    const auto *value =
+        std::get_if<TargetBindingCapabilityProviderTargetDTO>(&target);
+    if (value == nullptr) {
+      fail("capability_provider_bindings.target",
+           "scope and target alternative disagree");
     }
-    case CapabilityScope::kControlDomain: {
-      const auto* value =
-          std::get_if<ControlDomainCapabilityProviderTargetDTO>(&target);
-      if (value == nullptr) {
-        fail("capability_provider_bindings.target",
-             "scope and target alternative disagree");
-      }
-      return CanonicalValue(CanonicalValue::Object{
-          {"control_domain_id",
-           CanonicalValue(value->control_domain_id.value())},
-          {"control_domain_revision",
-           CanonicalValue(value->control_domain_revision.value())},
-          {"controller_topology_id",
-           CanonicalValue(value->controller_topology_id.value())},
-          {"topology_revision",
-           CanonicalValue(value->topology_revision.value())},
-      });
+    return CanonicalValue(CanonicalValue::Object{
+        {"controllable_component_id",
+         CanonicalValue(value->controllable_component_id.value())},
+        {"component_type_revision",
+         CanonicalValue(value->component_type_revision.value())},
+        {"command_target_id", CanonicalValue(value->command_target_id.value())},
+        {"control_binding_id",
+         CanonicalValue(value->control_binding_id.value())},
+        {"control_binding_revision",
+         CanonicalValue(value->control_binding_revision.value())},
+    });
+  }
+  case CapabilityScope::kControlDomain: {
+    const auto *value =
+        std::get_if<ControlDomainCapabilityProviderTargetDTO>(&target);
+    if (value == nullptr) {
+      fail("capability_provider_bindings.target",
+           "scope and target alternative disagree");
     }
+    return CanonicalValue(CanonicalValue::Object{
+        {"control_domain_id", CanonicalValue(value->control_domain_id.value())},
+        {"control_domain_revision",
+         CanonicalValue(value->control_domain_revision.value())},
+        {"controller_topology_id",
+         CanonicalValue(value->controller_topology_id.value())},
+        {"topology_revision", CanonicalValue(value->topology_revision.value())},
+    });
+  }
   }
   fail("capability_provider_bindings.target",
        "scope has no target alternative");
 }
 
-[[nodiscard]] CanonicalValue encode_endpoint_binding(
-    const CapabilityProviderEndpointBindingDTO& endpoint) {
+[[nodiscard]] CanonicalValue
+encode_endpoint_binding(const CapabilityProviderEndpointBindingDTO &endpoint) {
   std::string source_id;
   switch (endpoint.source_kind) {
-    case CapabilityEndpointSourceKind::kRuntimeUnit: {
-      const auto* value = std::get_if<RuntimeUnitId>(&endpoint.source_id);
-      if (value == nullptr) {
-        fail("capability_provider_bindings.endpoint_bindings.source_id",
-             "runtime_unit source kind has a non-runtime-unit ID");
-      }
-      source_id = value->value();
-      break;
+  case CapabilityEndpointSourceKind::kRuntimeUnit: {
+    const auto *value = std::get_if<RuntimeUnitId>(&endpoint.source_id);
+    if (value == nullptr) {
+      fail("capability_provider_bindings.endpoint_bindings.source_id",
+           "runtime_unit source kind has a non-runtime-unit ID");
     }
-    case CapabilityEndpointSourceKind::kExternalResource: {
-      const auto* value =
-          std::get_if<ExternalResourceAlias>(&endpoint.source_id);
-      if (value == nullptr) {
-        fail("capability_provider_bindings.endpoint_bindings.source_id",
-             "external_resource source kind has a non-alias ID");
-      }
-      source_id = value->value();
-      break;
+    source_id = value->value();
+    break;
+  }
+  case CapabilityEndpointSourceKind::kExternalResource: {
+    const auto *value = std::get_if<ExternalResourceAlias>(&endpoint.source_id);
+    if (value == nullptr) {
+      fail("capability_provider_bindings.endpoint_bindings.source_id",
+           "external_resource source kind has a non-alias ID");
     }
+    source_id = value->value();
+    break;
+  }
   }
   return CanonicalValue(CanonicalValue::Object{
       {"endpoint_role_id", CanonicalValue(endpoint.endpoint_role_id.value())},
       {"source_kind",
-       CanonicalValue(
-           std::string(core::to_string(endpoint.source_kind)))},
+       CanonicalValue(std::string(core::to_string(endpoint.source_kind)))},
       {"source_id", CanonicalValue(std::move(source_id))},
       {"source_endpoint_role_id",
        CanonicalValue(endpoint.source_endpoint_role_id.value())},
   });
 }
 
-[[nodiscard]] CanonicalValue encode_provider_binding(
-    const CapabilityProviderBindingDTO& binding) {
+[[nodiscard]] CanonicalValue
+encode_provider_binding(const CapabilityProviderBindingDTO &binding) {
   CanonicalValue::Array endpoints;
   endpoints.reserve(binding.endpoint_bindings.size());
-  for (const auto& endpoint : binding.endpoint_bindings) {
+  for (const auto &endpoint : binding.endpoint_bindings) {
     endpoints.push_back(encode_endpoint_binding(endpoint));
   }
   return CanonicalValue(CanonicalValue::Object{
@@ -1057,8 +1052,8 @@ parse_safety_system_request_action_class(const CanonicalValue& value,
   });
 }
 
-[[nodiscard]] CanonicalValue encode_external_resource(
-    const ExternalResourceDTO& resource) {
+[[nodiscard]] CanonicalValue
+encode_external_resource(const ExternalResourceDTO &resource) {
   return CanonicalValue(CanonicalValue::Object{
       {"external_resource_alias",
        CanonicalValue(resource.external_resource_alias.value())},
@@ -1076,8 +1071,8 @@ parse_safety_system_request_action_class(const CanonicalValue& value,
   });
 }
 
-[[nodiscard]] CanonicalValue encode_provider_contract_ref(
-    const ProviderContractRefDTO& contract) {
+[[nodiscard]] CanonicalValue
+encode_provider_contract_ref(const ProviderContractRefDTO &contract) {
   return CanonicalValue(CanonicalValue::Object{
       {"provider_contract_role_id",
        CanonicalValue(contract.provider_contract_role_id.value())},
@@ -1088,11 +1083,10 @@ parse_safety_system_request_action_class(const CanonicalValue& value,
   });
 }
 
-[[nodiscard]] CanonicalValue encode_retained_artifact_ref(
-    const core::RetainedArtifactRefDTO& reference) {
+[[nodiscard]] CanonicalValue
+encode_retained_artifact_ref(const core::RetainedArtifactRefDTO &reference) {
   return CanonicalValue(CanonicalValue::Object{
-      {"artifact_role_id",
-       CanonicalValue(reference.artifact_role_id.value())},
+      {"artifact_role_id", CanonicalValue(reference.artifact_role_id.value())},
       {"media_type", CanonicalValue(reference.media_type)},
       {"byte_size", CanonicalValue(static_cast<double>(reference.byte_size))},
       {"content_digest", CanonicalValue(reference.content_digest.value())},
@@ -1101,8 +1095,8 @@ parse_safety_system_request_action_class(const CanonicalValue& value,
   });
 }
 
-[[nodiscard]] CanonicalValue encode_stop_stage_parameters(
-    const StopStageParametersDTO& row) {
+[[nodiscard]] CanonicalValue
+encode_stop_stage_parameters(const StopStageParametersDTO &row) {
   return CanonicalValue(CanonicalValue::Object{
       {"control_domain_id", CanonicalValue(row.control_domain_id.value())},
       {"control_domain_revision",
@@ -1127,8 +1121,8 @@ parse_safety_system_request_action_class(const CanonicalValue& value,
   });
 }
 
-[[nodiscard]] CanonicalValue encode_commissioned_stop_interface(
-    const CommissionedStopInterfaceDTO& row) {
+[[nodiscard]] CanonicalValue
+encode_commissioned_stop_interface(const CommissionedStopInterfaceDTO &row) {
   CanonicalValue::Object object{
       {"commissioned_stop_interface_id",
        CanonicalValue(row.commissioned_stop_interface_id.value())},
@@ -1163,20 +1157,19 @@ parse_safety_system_request_action_class(const CanonicalValue& value,
   if (row.external_resource_alias.has_value()) {
     object.emplace_back("external_resource_alias",
                         CanonicalValue(row.external_resource_alias->value()));
-    object.emplace_back(
-        "external_resource_kind",
-        CanonicalValue(std::string(core::to_string(*row.external_resource_kind))));
+    object.emplace_back("external_resource_kind",
+                        CanonicalValue(std::string(
+                            core::to_string(*row.external_resource_kind))));
     object.emplace_back("site_overlay_value_ref",
                         CanonicalValue(row.site_overlay_value_ref->value()));
   }
   return CanonicalValue(std::move(object));
 }
 
-[[nodiscard]] CanonicalValue encode_site_overlay_ref(
-    const SiteOverlayRefDTO& reference) {
+[[nodiscard]] CanonicalValue
+encode_site_overlay_ref(const SiteOverlayRefDTO &reference) {
   return CanonicalValue(CanonicalValue::Object{
-      {"site_overlay_id",
-       CanonicalValue(reference.site_overlay_id.value())},
+      {"site_overlay_id", CanonicalValue(reference.site_overlay_id.value())},
       {"site_overlay_revision",
        CanonicalValue(reference.site_overlay_revision.value())},
       {"non_secret_digest",
@@ -1185,42 +1178,41 @@ parse_safety_system_request_action_class(const CanonicalValue& value,
 }
 
 template <typename Value, typename Encoder>
-[[nodiscard]] CanonicalValue encode_array(const std::vector<Value>& values,
+[[nodiscard]] CanonicalValue encode_array(const std::vector<Value> &values,
                                           Encoder encoder) {
   CanonicalValue::Array array;
   array.reserve(values.size());
-  for (const auto& value : values) {
+  for (const auto &value : values) {
     array.push_back(encoder(value));
   }
   return CanonicalValue(std::move(array));
 }
 
-[[nodiscard]] auto desired_configuration_key(
-    const DesiredControlConfigurationDTO& configuration) {
+[[nodiscard]] auto
+desired_configuration_key(const DesiredControlConfigurationDTO &configuration) {
   return std::tie(configuration.control_domain_id,
                   configuration.control_domain_revision);
 }
 
-[[nodiscard]] auto provider_binding_key(
-    const CapabilityProviderBindingDTO& binding) {
+[[nodiscard]] auto
+provider_binding_key(const CapabilityProviderBindingDTO &binding) {
   return std::tie(binding.capability_provider_binding_id,
                   binding.capability_provider_binding_revision);
 }
 
 void normalize_desired_configurations(
-    std::vector<DesiredControlConfigurationDTO>& configurations,
+    std::vector<DesiredControlConfigurationDTO> &configurations,
     std::string_view path) {
   std::sort(configurations.begin(), configurations.end(),
-            [](const auto& left, const auto& right) {
+            [](const auto &left, const auto &right) {
               return desired_configuration_key(left) <
                      desired_configuration_key(right);
             });
-  if (std::adjacent_find(
-          configurations.begin(), configurations.end(),
-          [](const auto& left, const auto& right) {
-            return desired_configuration_key(left) ==
-                   desired_configuration_key(right);
-          }) != configurations.end()) {
+  if (std::adjacent_find(configurations.begin(), configurations.end(),
+                         [](const auto &left, const auto &right) {
+                           return desired_configuration_key(left) ==
+                                  desired_configuration_key(right);
+                         }) != configurations.end()) {
     fail(path, "duplicate complete control-domain identity");
   }
   // ID-only stale/extra selection is occurrence-specific applicability and is
@@ -1228,18 +1220,17 @@ void normalize_desired_configurations(
 }
 
 void normalize_provider_bindings(
-    std::vector<CapabilityProviderBindingDTO>& bindings,
+    std::vector<CapabilityProviderBindingDTO> &bindings,
     std::string_view path) {
   std::sort(bindings.begin(), bindings.end(),
-            [](const auto& left, const auto& right) {
+            [](const auto &left, const auto &right) {
               return provider_binding_key(left) < provider_binding_key(right);
             });
-  if (std::adjacent_find(
-          bindings.begin(), bindings.end(),
-          [](const auto& left, const auto& right) {
-            return provider_binding_key(left) ==
-                   provider_binding_key(right);
-          }) != bindings.end()) {
+  if (std::adjacent_find(bindings.begin(), bindings.end(),
+                         [](const auto &left, const auto &right) {
+                           return provider_binding_key(left) ==
+                                  provider_binding_key(right);
+                         }) != bindings.end()) {
     fail(path, "duplicate complete capability-provider-binding identity");
   }
   // Whether a complete deployment may contain two revisions under one stable
@@ -1247,76 +1238,76 @@ void normalize_provider_bindings(
   // collection key silently invented by this substrate.
 }
 
-void normalize_external_resources(std::vector<ExternalResourceDTO>& resources,
+void normalize_external_resources(std::vector<ExternalResourceDTO> &resources,
                                   std::string_view path) {
   std::sort(resources.begin(), resources.end(),
-            [](const auto& left, const auto& right) {
+            [](const auto &left, const auto &right) {
               return left.external_resource_alias <
                      right.external_resource_alias;
             });
-  if (std::adjacent_find(
-          resources.begin(), resources.end(),
-          [](const auto& left, const auto& right) {
-            return left.external_resource_alias ==
-                   right.external_resource_alias;
-          }) != resources.end()) {
+  if (std::adjacent_find(resources.begin(), resources.end(),
+                         [](const auto &left, const auto &right) {
+                           return left.external_resource_alias ==
+                                  right.external_resource_alias;
+                         }) != resources.end()) {
     fail(path, "duplicate external_resource_alias");
   }
 }
 
-[[nodiscard]] auto stop_stage_parameters_key(
-    const StopStageParametersDTO& row) {
-  return std::tie(
-      row.control_domain_id, row.control_domain_revision,
-      row.control_binding_id, row.control_binding_revision,
-      row.controller_topology_id, row.topology_revision,
-      row.control_route_id, row.stop_evidence_policy_id,
-      row.stop_evidence_policy_revision, row.stop_escalation_stage_id,
-      row.provider_contract_ref.provider_contract_role_id,
-      row.provider_contract_ref.contract_schema_id,
-      row.provider_contract_ref.contract_schema_revision);
+[[nodiscard]] auto
+stop_stage_parameters_key(const StopStageParametersDTO &row) {
+  return std::tie(row.control_domain_id, row.control_domain_revision,
+                  row.control_binding_id, row.control_binding_revision,
+                  row.controller_topology_id, row.topology_revision,
+                  row.control_route_id, row.stop_evidence_policy_id,
+                  row.stop_evidence_policy_revision,
+                  row.stop_escalation_stage_id,
+                  row.provider_contract_ref.provider_contract_role_id,
+                  row.provider_contract_ref.contract_schema_id,
+                  row.provider_contract_ref.contract_schema_revision);
 }
 
-void normalize_stop_stage_parameters(
-    std::vector<StopStageParametersDTO>& rows, std::string_view path) {
-  std::sort(rows.begin(), rows.end(), [](const auto& left, const auto& right) {
+void normalize_stop_stage_parameters(std::vector<StopStageParametersDTO> &rows,
+                                     std::string_view path) {
+  std::sort(rows.begin(), rows.end(), [](const auto &left, const auto &right) {
     return stop_stage_parameters_key(left) < stop_stage_parameters_key(right);
   });
-  if (std::adjacent_find(
-          rows.begin(), rows.end(), [](const auto& left, const auto& right) {
-            return stop_stage_parameters_key(left) ==
-                   stop_stage_parameters_key(right);
-          }) != rows.end()) {
+  if (std::adjacent_find(rows.begin(), rows.end(),
+                         [](const auto &left, const auto &right) {
+                           return stop_stage_parameters_key(left) ==
+                                  stop_stage_parameters_key(right);
+                         }) != rows.end()) {
     fail(path, "duplicate complete Stop-stage-parameters identity");
   }
 }
 
 [[nodiscard]] auto commissioned_stop_interface_subject_key(
-    const CommissionedStopInterfaceDTO& row) {
+    const CommissionedStopInterfaceDTO &row) {
   return std::tie(
       row.control_domain_id, row.control_domain_revision,
       row.control_binding_id, row.control_binding_revision,
-      row.control_route_id, row.provider_instance_id,
-      row.provider_manifest_id, row.provider_manifest_revision,
-      row.registered_command_kind_id,
+      row.control_route_id, row.provider_instance_id, row.provider_manifest_id,
+      row.provider_manifest_revision, row.registered_command_kind_id,
       row.provider_contract_ref.provider_contract_role_id,
       row.provider_contract_ref.contract_schema_id,
-      row.provider_contract_ref.contract_schema_revision,
-      row.endpoint_role_id);
+      row.provider_contract_ref.contract_schema_revision, row.endpoint_role_id);
 }
 
 void validate_commissioned_stop_interface_shape(
-    const CommissionedStopInterfaceDTO& row, std::string_view path) {
+    const CommissionedStopInterfaceDTO &row, std::string_view path) {
   if (row.stop_action_class != core::StopActionClass::kSafetySystemRequest) {
-    fail(path, "commissioned Stop interface must declare safety_system_request");
+    fail(path,
+         "commissioned Stop interface must declare safety_system_request");
   }
-  const auto* definition = core::find_registered_stop_command_definition(
+  const auto *definition = core::find_registered_stop_command_definition(
       row.registered_command_kind_id);
   if (definition == nullptr ||
       definition->stop_action_class != row.stop_action_class ||
       definition->safety_system_request_action_class !=
           row.safety_system_request_action_class) {
-    fail(path, "registered Stop command does not match the commissioned action class");
+    fail(
+        path,
+        "registered Stop command does not match the commissioned action class");
   }
   if (row.commissioning_evidence_artifact_ref.artifact_role_id.value() !=
           core::kStopInterfaceCommissioningArtifactRole ||
@@ -1332,12 +1323,12 @@ void validate_commissioned_stop_interface_shape(
 }
 
 void normalize_commissioned_stop_interfaces(
-    std::vector<CommissionedStopInterfaceDTO>& rows, std::string_view path) {
+    std::vector<CommissionedStopInterfaceDTO> &rows, std::string_view path) {
   for (std::size_t index = 0U; index < rows.size(); ++index) {
-    validate_commissioned_stop_interface_shape(
-        rows[index], index_path(path, index));
+    validate_commissioned_stop_interface_shape(rows[index],
+                                               index_path(path, index));
   }
-  std::sort(rows.begin(), rows.end(), [](const auto& left, const auto& right) {
+  std::sort(rows.begin(), rows.end(), [](const auto &left, const auto &right) {
     return left.commissioned_stop_interface_id <
            right.commissioned_stop_interface_id;
   });
@@ -1347,19 +1338,19 @@ void normalize_commissioned_stop_interfaces(
       fail(path, "duplicate commissioned_stop_interface_id");
     }
   }
-  std::vector<const CommissionedStopInterfaceDTO*> by_subject;
+  std::vector<const CommissionedStopInterfaceDTO *> by_subject;
   by_subject.reserve(rows.size());
-  for (const auto& row : rows) {
+  for (const auto &row : rows) {
     by_subject.push_back(&row);
   }
   std::sort(by_subject.begin(), by_subject.end(),
-            [](const auto* left, const auto* right) {
+            [](const auto *left, const auto *right) {
               return commissioned_stop_interface_subject_key(*left) <
                      commissioned_stop_interface_subject_key(*right);
             });
   if (std::adjacent_find(
-          by_subject.begin(), by_subject.end(), [](const auto* left,
-                                                   const auto* right) {
+          by_subject.begin(), by_subject.end(),
+          [](const auto *left, const auto *right) {
             return commissioned_stop_interface_subject_key(*left) ==
                    commissioned_stop_interface_subject_key(*right);
           }) != by_subject.end()) {
@@ -1368,38 +1359,38 @@ void normalize_commissioned_stop_interfaces(
 }
 
 [[nodiscard]] CanonicalValue encode_desired_configurations(
-    const std::vector<DesiredControlConfigurationDTO>& values) {
+    const std::vector<DesiredControlConfigurationDTO> &values) {
   return encode_array(values, encode_desired_configuration);
 }
 
 [[nodiscard]] CanonicalValue encode_provider_bindings(
-    const std::vector<CapabilityProviderBindingDTO>& values) {
+    const std::vector<CapabilityProviderBindingDTO> &values) {
   return encode_array(values, encode_provider_binding);
 }
 
-[[nodiscard]] CanonicalValue encode_external_resources(
-    const std::vector<ExternalResourceDTO>& values) {
+[[nodiscard]] CanonicalValue
+encode_external_resources(const std::vector<ExternalResourceDTO> &values) {
   return encode_array(values, encode_external_resource);
 }
 
 [[nodiscard]] CanonicalValue encode_stop_stage_parameters(
-    const std::vector<StopStageParametersDTO>& values) {
-  return encode_array(values, [](const auto& value) {
+    const std::vector<StopStageParametersDTO> &values) {
+  return encode_array(values, [](const auto &value) {
     return encode_stop_stage_parameters(value);
   });
 }
 
 [[nodiscard]] CanonicalValue encode_commissioned_stop_interfaces(
-    const std::vector<CommissionedStopInterfaceDTO>& values) {
-  return encode_array(values, [](const auto& value) {
+    const std::vector<CommissionedStopInterfaceDTO> &values) {
+  return encode_array(values, [](const auto &value) {
     return encode_commissioned_stop_interface(value);
   });
 }
 
 [[nodiscard]] CanonicalValue encode_retained_policy_records(
-    const std::vector<core::CatalogRecordRefDTO>& values) {
+    const std::vector<core::CatalogRecordRefDTO> &values) {
   const CanonicalValue catalogs = detail::encode_deployment_catalogs(values);
-  const CanonicalValue* records = catalogs.find_object_member("records");
+  const CanonicalValue *records = catalogs.find_object_member("records");
   if (records == nullptr) {
     fail("$.policies.retained_policy_records",
          "catalog codec omitted its canonical records member");
@@ -1408,14 +1399,15 @@ void normalize_commissioned_stop_interfaces(
 }
 
 [[nodiscard]] CanonicalValue encode_supported_policies(
-    const std::vector<StopStageParametersDTO>& stop_stage_parameters,
-    const std::vector<CommissionedStopInterfaceDTO>&
-        commissioned_stop_interfaces,
-    const std::vector<core::CatalogRecordRefDTO>& retained_policy_records,
-    const CanonicalValue& interrupt_sources,
-    const CanonicalValue& interrupt_policies,
-    const CanonicalValue& interrupt_config) {
-  return CanonicalValue(CanonicalValue::Object{
+    const std::vector<StopStageParametersDTO> &stop_stage_parameters,
+    const std::vector<CommissionedStopInterfaceDTO>
+        &commissioned_stop_interfaces,
+    const std::vector<core::CatalogRecordRefDTO> &retained_policy_records,
+    const CanonicalValue &interrupt_sources,
+    const CanonicalValue &interrupt_policies,
+    const CanonicalValue &interrupt_config,
+    const std::vector<core::StopTimingSelectionDTO> &timings) {
+  CanonicalValue::Object result{
       {"retained_policy_records",
        encode_retained_policy_records(retained_policy_records)},
       {"stop_stage_parameters",
@@ -1425,12 +1417,91 @@ void normalize_commissioned_stop_interfaces(
       {"interrupt_sources", interrupt_sources},
       {"interrupt_policies", interrupt_policies},
       {"interrupt_config", interrupt_config},
-  });
+  };
+  if (!timings.empty()) {
+    result.emplace_back(
+        "stop_timing_parameters", encode_array(timings, [](const auto &row) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"control_binding_id",
+               CanonicalValue(row.control_binding_id.value())},
+              {"control_binding_revision",
+               CanonicalValue(row.control_binding_revision.value())},
+              {"timing", CanonicalValue(CanonicalValue::Object{
+                             {"command_latency_allowance_ns",
+                              CanonicalValue(static_cast<double>(
+                                  row.timing.command_latency_allowance_ns))},
+                             {"settling_allowance_ns",
+                              CanonicalValue(static_cast<double>(
+                                  row.timing.settling_allowance_ns))},
+                             {"operational_timeout_ns",
+                              CanonicalValue(static_cast<double>(
+                                  row.timing.operational_timeout_ns))}})}});
+        }));
+  }
+  return CanonicalValue(std::move(result));
+}
+
+[[nodiscard]] std::vector<core::StopTimingSelectionDTO>
+parse_stop_timings(const CanonicalValue::Object &policies) {
+  const auto *value = find_member(policies, "stop_timing_parameters");
+  if (value == nullptr)
+    return {};
+  const auto &rows = require_array(*value, "$.policies.stop_timing_parameters");
+  if (rows.size() > core::kMaxDeploymentApplicabilityRows)
+    fail("$.policies.stop_timing_parameters",
+         "row count exceeds the deployment ceiling");
+  std::vector<core::StopTimingSelectionDTO> result;
+  for (std::size_t i = 0; i < rows.size(); ++i) {
+    const auto path = index_path("$.policies.stop_timing_parameters", i);
+    const auto &row = require_object(rows[i], path);
+    require_exact_fields(
+        row, {"control_binding_id", "control_binding_revision", "timing"},
+        path);
+    const auto &timing =
+        require_object(require_member(row, "timing", path), path + ".timing");
+    require_exact_fields(timing,
+                         {"command_latency_allowance_ns",
+                          "settling_allowance_ns", "operational_timeout_ns"},
+                         path + ".timing");
+    const auto duration = [&](std::string_view name, std::uint64_t minimum) {
+      return static_cast<std::int64_t>(
+          require_integer_in_range(require_member(timing, name, path), minimum,
+                                   core::kMaxStopEvidencePolicyDurationNs,
+                                   path + ".timing." + std::string(name)));
+    };
+    core::StopTimingParametersDTO parameters{
+        duration("command_latency_allowance_ns", 1),
+        duration("settling_allowance_ns", 0),
+        duration("operational_timeout_ns", 1)};
+    // Even the shortest possible positive profile must fit. Actual profiles
+    // and qualified evidence windows are checked by applicability/Prepare.
+    const auto checked = core::validate_controlled_stop_timing(parameters, 1);
+    if (!checked.ok())
+      fail(path, checked.error().message);
+    result.push_back(
+        {parse_portable_id<ControlBindingId>(
+             require_member(row, "control_binding_id", path), path),
+         parse_digest<ControlBindingRevision>(
+             require_member(row, "control_binding_revision", path), path),
+         parameters});
+  }
+  std::sort(result.begin(), result.end(),
+            [](const auto &left, const auto &right) {
+              return left.control_binding_id < right.control_binding_id;
+            });
+  if (std::adjacent_find(result.begin(), result.end(),
+                         [](const auto &left, const auto &right) {
+                           return left.control_binding_id ==
+                                  right.control_binding_id;
+                         }) != result.end())
+    fail("$.policies.stop_timing_parameters",
+         "duplicate control binding timing");
+  return result;
 }
 
 [[nodiscard]] std::vector<core::CatalogRecordRefDTO>
-parse_retained_policy_records(const CanonicalValue::Object& policies) {
-  const auto& rows = require_array(
+parse_retained_policy_records(const CanonicalValue::Object &policies) {
+  const auto &rows = require_array(
       require_member(policies, "retained_policy_records", "$.policies"),
       "$.policies.retained_policy_records");
   if (rows.size() > core::kMaxDeploymentApplicabilityRows) {
@@ -1441,10 +1512,10 @@ parse_retained_policy_records(const CanonicalValue::Object& policies) {
   try {
     result = detail::decode_deployment_catalogs(CanonicalValue(
         CanonicalValue::Object{{"records", CanonicalValue(rows)}}));
-  } catch (const detail::DeploymentCatalogCodecError& error) {
+  } catch (const detail::DeploymentCatalogCodecError &error) {
     fail("$.policies.retained_policy_records", error.what());
   }
-  for (const auto& record : result) {
+  for (const auto &record : result) {
     const auto kind = core::catalog_record_kind(record);
     if (kind != core::CatalogRecordKind::kContactPolicy &&
         kind != core::CatalogRecordKind::kStopEvidencePolicy &&
@@ -1521,6 +1592,7 @@ parse_interrupt_structured_value(const CanonicalValue &value,
 enum class InterruptCoordinateValueKind : std::uint8_t {
   kAcceleration = 0,
   kVelocity,
+  kJerk,
 };
 
 [[nodiscard]] CanonicalValue
@@ -1541,6 +1613,14 @@ parse_interrupt_coordinate_value(const CanonicalValue &value,
       fail(child_path(path, "coordinate_kind"),
            "value is outside the closed acceleration-coordinate enum");
     }
+  } else if (value_kind == InterruptCoordinateValueKind::kJerk) {
+    if (coordinate_kind == "angular_rad_s3")
+      value_field = "value_rad_s3";
+    else if (coordinate_kind == "linear_m_s3")
+      value_field = "value_m_s3";
+    else
+      fail(child_path(path, "coordinate_kind"),
+           "value is outside the closed jerk-coordinate enum");
   } else if (coordinate_kind == "angular_rad_s") {
     value_field = "value_rad_s";
   } else if (coordinate_kind == "linear_m_s") {
@@ -1591,7 +1671,8 @@ parse_motion_interrupt_stop_profile(const CanonicalValue &value,
                          "allow_natural_completion_on_short_path",
                          "recoverable_substitution_mode",
                          "require_backend_confirmation",
-                         "per_joint_settle_velocity_threshold", "diagnostics"},
+                         "per_joint_settle_velocity_threshold", "diagnostics",
+                         "jerk_limits_enabled", "per_joint_max_jerk"},
                         path);
 
   const std::string profile_id =
@@ -1628,6 +1709,27 @@ parse_motion_interrupt_stop_profile(const CanonicalValue &value,
       {"profile_id", CanonicalValue(profile_id)},
       {"stop_mode", CanonicalValue(stop_mode)},
   };
+  const auto *jerk_enabled = find_member(profile, "jerk_limits_enabled");
+  const auto *jerk_limits = find_member(profile, "per_joint_max_jerk");
+  if (controlled_profile && jerk_enabled == nullptr)
+    fail(child_path(path, "jerk_limits_enabled"),
+         "review and save an explicit controlled-Stop jerk choice; legacy "
+         "omission is not activation");
+  if (!controlled_profile &&
+      (jerk_enabled != nullptr || jerk_limits != nullptr))
+    fail(path, "hard_deceleration does not declare jerk shaping");
+  normalized.emplace_back(
+      "jerk_limits_enabled",
+      CanonicalValue(controlled_profile
+                         ? require_bool(*jerk_enabled,
+                                        child_path(path, "jerk_limits_enabled"))
+                         : false));
+  if (jerk_limits != nullptr)
+    normalized.emplace_back(
+        "per_joint_max_jerk",
+        parse_interrupt_source_joint_map(*jerk_limits,
+                                         child_path(path, "per_joint_max_jerk"),
+                                         InterruptCoordinateValueKind::kJerk));
   if (deceleration != nullptr) {
     const double duration = require_finite_number(
         *deceleration, child_path(path, "deceleration_time_s"));
@@ -1646,14 +1748,15 @@ parse_motion_interrupt_stop_profile(const CanonicalValue &value,
                                 InterruptCoordinateValueKind::kAcceleration));
   }
 
-  if (stop_mode != "soft_on_path" && natural_completion != nullptr) {
-    fail(child_path(path, "allow_natural_completion_on_short_path"),
-         "explicit presence is legal only for soft_on_path");
+  if (stop_mode == "hard_deceleration" && natural_completion != nullptr) {
+    fail(
+        child_path(path, "allow_natural_completion_on_short_path"),
+        "explicit presence is legal only for soft_on_path or spring_back_hold");
   }
   const bool normalized_natural_completion =
-      stop_mode == "soft_on_path"
+      stop_mode != "hard_deceleration"
           ? (natural_completion == nullptr
-                 ? true
+                 ? stop_mode == "soft_on_path"
                  : require_bool(
                        *natural_completion,
                        child_path(path,
@@ -1714,11 +1817,11 @@ require_portable_token_string(const CanonicalValue &value,
   return text;
 }
 
-[[nodiscard]] CanonicalValue parse_canonical_token_set(
-    const CanonicalValue& value, std::string_view path,
-    std::vector<std::string>& normalized_values,
-    bool require_nonempty = false) {
-  const auto& rows = require_array(value, path);
+[[nodiscard]] CanonicalValue
+parse_canonical_token_set(const CanonicalValue &value, std::string_view path,
+                          std::vector<std::string> &normalized_values,
+                          bool require_nonempty = false) {
+  const auto &rows = require_array(value, path);
   if (rows.size() > core::kMaxDeploymentApplicabilityRows ||
       (require_nonempty && rows.empty())) {
     fail(path, require_nonempty
@@ -1738,18 +1841,18 @@ require_portable_token_string(const CanonicalValue &value,
   }
   CanonicalValue::Array normalized;
   normalized.reserve(normalized_values.size());
-  for (const auto& item : normalized_values) {
+  for (const auto &item : normalized_values) {
     normalized.emplace_back(item);
   }
   return CanonicalValue(std::move(normalized));
 }
 
-[[nodiscard]] CanonicalValue parse_ordered_enum_set(
-    const CanonicalValue& value, std::string_view path,
-    std::initializer_list<std::string_view> enum_order,
-    std::vector<std::string>& normalized_values,
-    bool require_nonempty = false) {
-  const auto& rows = require_array(value, path);
+[[nodiscard]] CanonicalValue
+parse_ordered_enum_set(const CanonicalValue &value, std::string_view path,
+                       std::initializer_list<std::string_view> enum_order,
+                       std::vector<std::string> &normalized_values,
+                       bool require_nonempty = false) {
+  const auto &rows = require_array(value, path);
   if (rows.size() > enum_order.size() || (require_nonempty && rows.empty())) {
     fail(path, require_nonempty
                    ? "enum set must be non-empty"
@@ -1758,7 +1861,7 @@ require_portable_token_string(const CanonicalValue &value,
   normalized_values.clear();
   normalized_values.reserve(rows.size());
   for (std::size_t index = 0U; index < rows.size(); ++index) {
-    const auto& token = require_string(rows[index], index_path(path, index));
+    const auto &token = require_string(rows[index], index_path(path, index));
     if (std::find(enum_order.begin(), enum_order.end(), token) ==
         enum_order.end()) {
       fail(index_path(path, index), "value is outside the closed enum");
@@ -1766,7 +1869,7 @@ require_portable_token_string(const CanonicalValue &value,
     normalized_values.push_back(token);
   }
   std::sort(normalized_values.begin(), normalized_values.end(),
-            [&](const auto& left, const auto& right) {
+            [&](const auto &left, const auto &right) {
               return std::find(enum_order.begin(), enum_order.end(), left) <
                      std::find(enum_order.begin(), enum_order.end(), right);
             });
@@ -1776,30 +1879,30 @@ require_portable_token_string(const CanonicalValue &value,
   }
   CanonicalValue::Array normalized;
   normalized.reserve(normalized_values.size());
-  for (const auto& item : normalized_values) {
+  for (const auto &item : normalized_values) {
     normalized.emplace_back(item);
   }
   return CanonicalValue(std::move(normalized));
 }
 
-void append_optional_copy(CanonicalValue::Object& target,
-                          const CanonicalValue::Object& source,
+void append_optional_copy(CanonicalValue::Object &target,
+                          const CanonicalValue::Object &source,
                           std::string_view name) {
-  if (const auto* value = find_member(source, name); value != nullptr) {
+  if (const auto *value = find_member(source, name); value != nullptr) {
     target.emplace_back(std::string(name), *value);
   }
 }
 
-[[nodiscard]] CanonicalValue validate_interrupt_config(
-    const CanonicalValue::Object& policies) {
-  const auto& value =
+[[nodiscard]] CanonicalValue
+validate_interrupt_config(const CanonicalValue::Object &policies) {
+  const auto &value =
       require_member(policies, "interrupt_config", "$.policies");
-  const auto& object = require_object(value, "$.policies.interrupt_config");
-  require_exact_fields(
-      object,
-      {"queue_depth", "cancel_validation_timeout_ns",
-       "motion_scope_arm_timeout_ns", "supervisory_poll_rate_hz"},
-      "$.policies.interrupt_config");
+  const auto &object = require_object(value, "$.policies.interrupt_config");
+  require_exact_fields(object,
+                       {"queue_depth", "cancel_validation_timeout_ns",
+                        "motion_scope_arm_timeout_ns",
+                        "supervisory_poll_rate_hz"},
+                       "$.policies.interrupt_config");
   (void)require_integer_in_range(
       require_member(object, "queue_depth", "$.policies.interrupt_config"), 1U,
       core::kMaxDeploymentApplicabilityRows,
@@ -1823,10 +1926,10 @@ void append_optional_copy(CanonicalValue::Object& target,
 }
 
 [[nodiscard]] CanonicalValue parse_interrupt_sources(
-    const CanonicalValue::Object& policies,
-    const std::vector<CapabilityProviderBindingDTO>& provider_bindings,
-    std::vector<ParsedInterruptSource>& parsed_sources) {
-  const auto& rows =
+    const CanonicalValue::Object &policies,
+    const std::vector<CapabilityProviderBindingDTO> &provider_bindings,
+    std::vector<ParsedInterruptSource> &parsed_sources) {
+  const auto &rows =
       require_array(require_member(policies, "interrupt_sources", "$.policies"),
                     "$.policies.interrupt_sources");
   if (rows.size() > core::kMaxDeploymentApplicabilityRows) {
@@ -1837,14 +1940,14 @@ void append_optional_copy(CanonicalValue::Object& target,
   parsed_sources.reserve(rows.size());
   for (std::size_t index = 0U; index < rows.size(); ++index) {
     const std::string path = index_path("$.policies.interrupt_sources", index);
-    const auto& source = require_object(rows[index], path);
-    require_closed_fields(
-        source,
-        {"source_id", "capability_provider_binding_id", "adapter_capability_id",
-         "signal", "source_class", "kind", "priority"},
-        {"maskable", "freshness_budget_ns", "debounce_ns", "hysteresis_value",
-         "description"},
-        path);
+    const auto &source = require_object(rows[index], path);
+    require_closed_fields(source,
+                          {"source_id", "capability_provider_binding_id",
+                           "adapter_capability_id", "signal", "source_class",
+                           "kind", "priority"},
+                          {"maskable", "freshness_budget_ns", "debounce_ns",
+                           "hysteresis_value", "description"},
+                          path);
     ParsedInterruptSource parsed;
     parsed.source_id =
         require_portable_token_string(require_member(source, "source_id", path),
@@ -1854,7 +1957,7 @@ void append_optional_copy(CanonicalValue::Object& target,
         child_path(path, "capability_provider_binding_id"));
     const auto provider_count =
         std::count_if(provider_bindings.begin(), provider_bindings.end(),
-                      [&](const auto& binding) {
+                      [&](const auto &binding) {
                         return binding.capability_provider_binding_id.value() ==
                                provider_binding_id;
                       });
@@ -1871,7 +1974,7 @@ void append_optional_copy(CanonicalValue::Object& target,
       fail(child_path(path, "adapter_capability_id"),
            "must be a namespaced adapter capability token");
     }
-    const std::string& signal = require_string(
+    const std::string &signal = require_string(
         require_member(source, "signal", path), child_path(path, "signal"));
     constexpr std::size_t kMaximumNormalizedStringBytes = 1048576U;
     if (signal.empty() || signal.size() > kMaximumNormalizedStringBytes) {
@@ -1886,7 +1989,7 @@ void append_optional_copy(CanonicalValue::Object& target,
       fail(child_path(path, "source_class"),
            "value is outside the closed enum");
     }
-    const std::string& kind = require_string(
+    const std::string &kind = require_string(
         require_member(source, "kind", path), child_path(path, "kind"));
     if (kind != "edge" && kind != "level") {
       fail(child_path(path, "kind"), "value is outside the closed enum");
@@ -1894,14 +1997,14 @@ void append_optional_copy(CanonicalValue::Object& target,
     parsed.priority = static_cast<int>(
         require_integer_in_range(require_member(source, "priority", path), 0U,
                                  1000U, child_path(path, "priority")));
-    if (const auto* maskable = find_member(source, "maskable");
+    if (const auto *maskable = find_member(source, "maskable");
         maskable != nullptr) {
       (void)require_bool(*maskable, child_path(path, "maskable"));
     }
     constexpr std::uint64_t kMaximumIJsonInteger = 9007199254740991ULL;
     for (const std::string_view field :
          {"freshness_budget_ns", "debounce_ns"}) {
-      if (const auto* duration = find_member(source, field);
+      if (const auto *duration = find_member(source, field);
           duration != nullptr) {
         (void)require_integer_in_range(*duration, 0U, kMaximumIJsonInteger,
                                        child_path(path, field));
@@ -1940,29 +2043,29 @@ void append_optional_copy(CanonicalValue::Object& target,
     parsed_sources.push_back(std::move(parsed));
   }
   std::sort(parsed_sources.begin(), parsed_sources.end(),
-            [](const auto& left, const auto& right) {
+            [](const auto &left, const auto &right) {
               return left.source_id < right.source_id;
             });
   if (std::adjacent_find(parsed_sources.begin(), parsed_sources.end(),
-                         [](const auto& left, const auto& right) {
+                         [](const auto &left, const auto &right) {
                            return left.source_id == right.source_id;
                          }) != parsed_sources.end()) {
     fail("$.policies.interrupt_sources", "duplicate source_id");
   }
   CanonicalValue::Array normalized;
   normalized.reserve(parsed_sources.size());
-  for (const auto& source : parsed_sources) {
+  for (const auto &source : parsed_sources) {
     normalized.push_back(source.normalized);
   }
   return CanonicalValue(std::move(normalized));
 }
 
-[[nodiscard]] const ParsedInterruptSource& require_interrupt_source(
-    const std::vector<ParsedInterruptSource>& sources,
-    std::string_view source_id, std::string_view path) {
+[[nodiscard]] const ParsedInterruptSource &
+require_interrupt_source(const std::vector<ParsedInterruptSource> &sources,
+                         std::string_view source_id, std::string_view path) {
   const auto source =
       std::lower_bound(sources.begin(), sources.end(), source_id,
-                       [](const auto& left, std::string_view right) {
+                       [](const auto &left, std::string_view right) {
                          return left.source_id < right;
                        });
   if (source == sources.end() || source->source_id != source_id) {
@@ -1972,9 +2075,9 @@ void append_optional_copy(CanonicalValue::Object& target,
 }
 
 [[nodiscard]] CanonicalValue parse_interrupt_policies(
-    const CanonicalValue::Object& policies,
-    const std::vector<ParsedInterruptSource>& parsed_sources) {
-  const auto& rows = require_array(
+    const CanonicalValue::Object &policies,
+    const std::vector<ParsedInterruptSource> &parsed_sources) {
+  const auto &rows = require_array(
       require_member(policies, "interrupt_policies", "$.policies"),
       "$.policies.interrupt_policies");
   if (rows.size() > core::kMaxDeploymentApplicabilityRows) {
@@ -1985,7 +2088,7 @@ void append_optional_copy(CanonicalValue::Object& target,
   parsed_policies.reserve(rows.size());
   for (std::size_t index = 0U; index < rows.size(); ++index) {
     const std::string path = index_path("$.policies.interrupt_policies", index);
-    const auto& policy = require_object(rows[index], path);
+    const auto &policy = require_object(rows[index], path);
     require_closed_fields(
         policy,
         {"policy_id", "source_id", "controllable_component_ids",
@@ -2003,7 +2106,7 @@ void append_optional_copy(CanonicalValue::Object& target,
     parsed.source_id =
         require_portable_token_string(require_member(policy, "source_id", path),
                                       child_path(path, "source_id"));
-    const auto& source = require_interrupt_source(
+    const auto &source = require_interrupt_source(
         parsed_sources, parsed.source_id, child_path(path, "source_id"));
 
     CanonicalValue::Object normalized{
@@ -2036,20 +2139,20 @@ void append_optional_copy(CanonicalValue::Object& target,
     }
     normalized.emplace_back(
         "affected_phases",
-        parse_ordered_enum_set(
-            require_member(policy, "affected_phases", path),
-            child_path(path, "affected_phases"),
-            {"planning", "validating", "dispatching", "executing", "paused",
-             "stopping", "intervention_required"},
-            parsed.affected_phases, true));
+        parse_ordered_enum_set(require_member(policy, "affected_phases", path),
+                               child_path(path, "affected_phases"),
+                               {"planning", "validating", "dispatching",
+                                "executing", "paused", "stopping",
+                                "intervention_required"},
+                               parsed.affected_phases, true));
     parsed.preemption_action =
         require_string(require_member(policy, "preemption_action", path),
                        child_path(path, "preemption_action"));
     constexpr std::array<std::string_view, 6U> kActions{
         "cancel_planning", "cancel_validation", "preempt_trajectory",
-        "latch_held", "latch_faulted", "complete_move_on_signal"};
-    if (std::find(kActions.begin(), kActions.end(),
-                  parsed.preemption_action) == kActions.end()) {
+        "latch_held",      "latch_faulted",     "complete_move_on_signal"};
+    if (std::find(kActions.begin(), kActions.end(), parsed.preemption_action) ==
+        kActions.end()) {
       fail(child_path(path, "preemption_action"),
            "value is outside the closed enum");
     }
@@ -2066,25 +2169,25 @@ void append_optional_copy(CanonicalValue::Object& target,
            "value is outside the closed enum");
     }
     parsed.effective_priority = source.priority;
-    if (const auto* priority = find_member(policy, "priority");
+    if (const auto *priority = find_member(policy, "priority");
         priority != nullptr) {
       parsed.effective_priority = static_cast<int>(require_integer_in_range(
           *priority, 0U, 1000U, child_path(path, "priority")));
     }
-    if (const auto* maskable = find_member(policy, "maskable");
+    if (const auto *maskable = find_member(policy, "maskable");
         maskable != nullptr) {
       (void)require_bool(*maskable, child_path(path, "maskable"));
     }
-    if (const auto* maskable_by = find_member(policy, "maskable_by");
+    if (const auto *maskable_by = find_member(policy, "maskable_by");
         maskable_by != nullptr) {
       normalized.emplace_back(
           "maskable_by",
           parse_canonical_token_set(*maskable_by,
                                     child_path(path, "maskable_by"), values));
     }
-    if (const auto* stop_scope = find_member(policy, "stop_scope");
+    if (const auto *stop_scope = find_member(policy, "stop_scope");
         stop_scope != nullptr) {
-      const auto& token =
+      const auto &token =
           require_string(*stop_scope, child_path(path, "stop_scope"));
       if ((token != "affected_resources" && token != "full_cell") ||
           (parsed.preemption_action != "preempt_trajectory" &&
@@ -2094,7 +2197,7 @@ void append_optional_copy(CanonicalValue::Object& target,
             "is outside the closed enum or is invalid for the selected action");
       }
     }
-    if (const auto* expiry = find_member(policy, "scope_expiry");
+    if (const auto *expiry = find_member(policy, "scope_expiry");
         expiry != nullptr) {
       if (parsed.scope_kind != "operation" ||
           require_string(*expiry, child_path(path, "scope_expiry")) !=
@@ -2103,7 +2206,7 @@ void append_optional_copy(CanonicalValue::Object& target,
              "is legal only as operation_terminal on operation scope");
       }
     }
-    if (const auto* activation =
+    if (const auto *activation =
             find_member(policy, "allowed_activation_modes");
         activation != nullptr) {
       if (parsed.scope_kind != "operation") {
@@ -2118,12 +2221,11 @@ void append_optional_copy(CanonicalValue::Object& target,
                "trip_if_already_active", "maintain_level_with_hysteresis"},
               values));
     }
-    const auto* allowed_stop_modes = find_member(policy, "allowed_stop_modes");
+    const auto *allowed_stop_modes = find_member(policy, "allowed_stop_modes");
     if (parsed.preemption_action == "complete_move_on_signal") {
       if (parsed.scope_kind != "operation" || allowed_stop_modes == nullptr) {
-        fail(path,
-             "complete_move_on_signal requires operation scope and "
-             "allowed_stop_modes");
+        fail(path, "complete_move_on_signal requires operation scope and "
+                   "allowed_stop_modes");
       }
       normalized.emplace_back(
           "allowed_stop_modes",
@@ -2133,9 +2235,8 @@ void append_optional_copy(CanonicalValue::Object& target,
               true));
       if (source.source_class != "fast_execution_relevant" ||
           parsed.post_latch_disposition != "auto_clear_after_motion_outcome") {
-        fail(path,
-             "complete_move_on_signal requires a fast source and "
-             "auto_clear_after_motion_outcome");
+        fail(path, "complete_move_on_signal requires a fast source and "
+                   "auto_clear_after_motion_outcome");
       }
     } else if (allowed_stop_modes != nullptr) {
       fail(child_path(path, "allowed_stop_modes"),
@@ -2165,11 +2266,10 @@ void append_optional_copy(CanonicalValue::Object& target,
     if (parsed.post_latch_disposition == "auto_clear_after_motion_outcome" &&
         (parsed.scope_kind != "operation" ||
          parsed.preemption_action != "complete_move_on_signal")) {
-      fail(path,
-           "auto_clear_after_motion_outcome requires operation "
-           "complete_move_on_signal");
+      fail(path, "auto_clear_after_motion_outcome requires operation "
+                 "complete_move_on_signal");
     }
-    if (const auto* description = find_member(policy, "description");
+    if (const auto *description = find_member(policy, "description");
         description != nullptr) {
       constexpr std::size_t kMaximumNormalizedStringBytes = 1048576U;
       if (require_string(*description, child_path(path, "description")).size() >
@@ -2191,26 +2291,26 @@ void append_optional_copy(CanonicalValue::Object& target,
     parsed_policies.push_back(std::move(parsed));
   }
   std::sort(parsed_policies.begin(), parsed_policies.end(),
-            [](const auto& left, const auto& right) {
+            [](const auto &left, const auto &right) {
               return left.policy_id < right.policy_id;
             });
   if (std::adjacent_find(parsed_policies.begin(), parsed_policies.end(),
-                         [](const auto& left, const auto& right) {
+                         [](const auto &left, const auto &right) {
                            return left.policy_id == right.policy_id;
                          }) != parsed_policies.end()) {
     fail("$.policies.interrupt_policies", "duplicate policy_id");
   }
-  for (const auto& policy : parsed_policies) {
-    const auto& object = policy.normalized.as_object();
-    if (const auto* maskable_by = find_member(object, "maskable_by");
+  for (const auto &policy : parsed_policies) {
+    const auto &object = policy.normalized.as_object();
+    if (const auto *maskable_by = find_member(object, "maskable_by");
         maskable_by != nullptr) {
-      const auto& mask_ids =
+      const auto &mask_ids =
           std::get<CanonicalValue::Array>(maskable_by->storage());
       for (std::size_t index = 0U; index < mask_ids.size(); ++index) {
-        const auto& id = std::get<std::string>(mask_ids[index].storage());
+        const auto &id = std::get<std::string>(mask_ids[index].storage());
         const auto match =
             std::lower_bound(parsed_policies.begin(), parsed_policies.end(), id,
-                             [](const auto& left, const std::string& right) {
+                             [](const auto &left, const std::string &right) {
                                return left.policy_id < right;
                              });
         if (match == parsed_policies.end() || match->policy_id != id) {
@@ -2224,14 +2324,14 @@ void append_optional_copy(CanonicalValue::Object& target,
        ++left_index) {
     for (std::size_t right_index = left_index + 1U;
          right_index < parsed_policies.size(); ++right_index) {
-      const auto& left = parsed_policies[left_index];
-      const auto& right = parsed_policies[right_index];
+      const auto &left = parsed_policies[left_index];
+      const auto &right = parsed_policies[right_index];
       if (left.source_id != right.source_id) {
         continue;
       }
       const bool shares_phase =
           std::any_of(left.affected_phases.begin(), left.affected_phases.end(),
-                      [&](const auto& phase) {
+                      [&](const auto &phase) {
                         return std::find(right.affected_phases.begin(),
                                          right.affected_phases.end(),
                                          phase) != right.affected_phases.end();
@@ -2243,8 +2343,8 @@ void append_optional_copy(CanonicalValue::Object& target,
              "same-source equal-priority overlapping phases have ambiguous "
              "behavior");
       }
-      const auto check_trip_priority = [&](const ParsedInterruptPolicy& trip,
-                                           const ParsedInterruptPolicy& fault) {
+      const auto check_trip_priority = [&](const ParsedInterruptPolicy &trip,
+                                           const ParsedInterruptPolicy &fault) {
         const bool fault_action =
             fault.scope_kind == "static" &&
             (fault.preemption_action == "preempt_trajectory" ||
@@ -2264,28 +2364,27 @@ void append_optional_copy(CanonicalValue::Object& target,
   }
   CanonicalValue::Array normalized;
   normalized.reserve(parsed_policies.size());
-  for (const auto& policy : parsed_policies) {
+  for (const auto &policy : parsed_policies) {
     normalized.push_back(policy.normalized);
   }
   return CanonicalValue(std::move(normalized));
 }
 
-}  // namespace
+} // namespace
 
 TypedDeploymentApplicabilityInputsCandidate
 decode_deployment_applicability_inputs_candidate(
-    const ParsedArtifactCandidate& parsed_deployment) {
-  const auto& root = require_object(parsed_deployment.root(), "$");
-  const std::string& api_version =
-      require_string(require_member(root, "api_version", "$"),
-                     "$.api_version");
+    const ParsedArtifactCandidate &parsed_deployment) {
+  const auto &root = require_object(parsed_deployment.root(), "$");
+  const std::string &api_version =
+      require_string(require_member(root, "api_version", "$"), "$.api_version");
   if (api_version != kDeploymentApiVersion) {
     fail("$.api_version", "expected manyforge.deployment.v1");
   }
 
-  const auto& desired_values = require_array(
-      require_member(root, "desired_control_configurations", "$"),
-      "$.desired_control_configurations");
+  const auto &desired_values =
+      require_array(require_member(root, "desired_control_configurations", "$"),
+                    "$.desired_control_configurations");
   if (desired_values.size() > core::kMaxDeploymentApplicabilityRows) {
     fail("$.desired_control_configurations",
          "configuration count exceeds the 4096-row deployment ceiling");
@@ -2297,12 +2396,11 @@ decode_deployment_applicability_inputs_candidate(
         desired_values[index],
         index_path("$.desired_control_configurations", index)));
   }
-  normalize_desired_configurations(desired,
-                                   "$.desired_control_configurations");
+  normalize_desired_configurations(desired, "$.desired_control_configurations");
 
-  const auto& provider_values = require_array(
-      require_member(root, "capability_provider_bindings", "$"),
-      "$.capability_provider_bindings");
+  const auto &provider_values =
+      require_array(require_member(root, "capability_provider_bindings", "$"),
+                    "$.capability_provider_bindings");
   if (provider_values.size() > core::kMaxDeploymentApplicabilityRows) {
     fail("$.capability_provider_bindings",
          "provider-binding count exceeds the 4096-row deployment ceiling");
@@ -2314,15 +2412,14 @@ decode_deployment_applicability_inputs_candidate(
         provider_values[index],
         index_path("$.capability_provider_bindings", index)));
   }
-  normalize_provider_bindings(providers,
-                              "$.capability_provider_bindings");
+  normalize_provider_bindings(providers, "$.capability_provider_bindings");
 
   std::vector<ExternalResourceDTO> external_resources;
-  const CanonicalValue* external_value =
+  const CanonicalValue *external_value =
       find_member(root, "external_resources");
   const bool external_resources_was_present = external_value != nullptr;
   if (external_value != nullptr) {
-    const auto& external_values =
+    const auto &external_values =
         require_array(*external_value, "$.external_resources");
     if (external_values.size() > core::kMaxDeploymentApplicabilityRows) {
       fail("$.external_resources",
@@ -2331,35 +2428,34 @@ decode_deployment_applicability_inputs_candidate(
     external_resources.reserve(external_values.size());
     for (std::size_t index = 0; index < external_values.size(); ++index) {
       external_resources.push_back(parse_external_resource(
-          external_values[index],
-          index_path("$.external_resources", index)));
+          external_values[index], index_path("$.external_resources", index)));
     }
   }
-  normalize_external_resources(external_resources,
-                               "$.external_resources");
+  normalize_external_resources(external_resources, "$.external_resources");
 
   std::vector<StopStageParametersDTO> stop_stage_parameters;
+  std::vector<core::StopTimingSelectionDTO> stop_timing_parameters;
   std::vector<CommissionedStopInterfaceDTO> commissioned_stop_interfaces;
   std::vector<core::CatalogRecordRefDTO> retained_policy_records;
   std::optional<CanonicalValue> normalized_policies;
-  const CanonicalValue* policies_value = find_member(root, "policies");
+  const CanonicalValue *policies_value = find_member(root, "policies");
   if (policies_value != nullptr) {
-    const auto& policies = require_object(*policies_value, "$.policies");
-    require_exact_fields(
-        policies,
-        {"retained_policy_records", "stop_stage_parameters",
-         "commissioned_stop_interfaces", "interrupt_sources",
-         "interrupt_policies", "interrupt_config"},
-        "$.policies");
+    const auto &policies = require_object(*policies_value, "$.policies");
+    require_closed_fields(policies,
+                          {"retained_policy_records", "stop_stage_parameters",
+                           "commissioned_stop_interfaces", "interrupt_sources",
+                           "interrupt_policies", "interrupt_config"},
+                          {"stop_timing_parameters"}, "$.policies");
+    stop_timing_parameters = parse_stop_timings(policies);
     retained_policy_records = parse_retained_policy_records(policies);
     const CanonicalValue interrupt_config = validate_interrupt_config(policies);
     std::vector<ParsedInterruptSource> parsed_interrupt_sources;
     CanonicalValue normalized_interrupt_sources =
         parse_interrupt_sources(policies, providers, parsed_interrupt_sources);
-    CanonicalValue normalized_interrupt_policies = parse_interrupt_policies(
-        policies, parsed_interrupt_sources);
+    CanonicalValue normalized_interrupt_policies =
+        parse_interrupt_policies(policies, parsed_interrupt_sources);
 
-    const auto& parameter_values = require_array(
+    const auto &parameter_values = require_array(
         require_member(policies, "stop_stage_parameters", "$.policies"),
         "$.policies.stop_stage_parameters");
     if (parameter_values.size() > core::kMaxDeploymentApplicabilityRows) {
@@ -2375,7 +2471,7 @@ decode_deployment_applicability_inputs_candidate(
     normalize_stop_stage_parameters(stop_stage_parameters,
                                     "$.policies.stop_stage_parameters");
 
-    const auto& commissioned_values = require_array(
+    const auto &commissioned_values = require_array(
         require_member(policies, "commissioned_stop_interfaces", "$.policies"),
         "$.policies.commissioned_stop_interfaces");
     constexpr std::size_t kMaxCommissionedStopInterfaces = 256U;
@@ -2385,40 +2481,66 @@ decode_deployment_applicability_inputs_candidate(
     }
     commissioned_stop_interfaces.reserve(commissioned_values.size());
     for (std::size_t index = 0U; index < commissioned_values.size(); ++index) {
-      commissioned_stop_interfaces.push_back(
-          parse_commissioned_stop_interface(
-              commissioned_values[index],
-              index_path("$.policies.commissioned_stop_interfaces", index)));
+      commissioned_stop_interfaces.push_back(parse_commissioned_stop_interface(
+          commissioned_values[index],
+          index_path("$.policies.commissioned_stop_interfaces", index)));
     }
     normalize_commissioned_stop_interfaces(
         commissioned_stop_interfaces,
         "$.policies.commissioned_stop_interfaces");
+    // Draft/Save uses this same normalization boundary, before full Apply
+    // qualification. Check the known complete profile against the same Core
+    // timing rule here too; catalog evidence windows remain an Apply check.
+    for (const auto &selected : stop_timing_parameters) {
+      for (const auto &stage : stop_stage_parameters) {
+        if (stage.control_binding_id != selected.control_binding_id ||
+            stage.control_binding_revision !=
+                selected.control_binding_revision ||
+            stage.provider_contract_ref.contract_schema_id.value() !=
+                core::kMotionControlledStopContractSchemaId ||
+            stage.provider_contract_ref.contract_schema_revision.value() !=
+                core::kMotionControlledStopContractSchemaRevision)
+          continue;
+        const auto duration =
+            stage.default_contract_parameters.find("deceleration_time_s");
+        if (duration == stage.default_contract_parameters.end())
+          continue;
+        const auto *seconds = std::get_if<double>(&duration->second.value);
+        if (seconds == nullptr)
+          fail("$.policies.stop_stage_parameters",
+               "controlled Stop duration is outside its qualified range");
+        const auto duration_ns = core::authored_stop_duration_ns(*seconds);
+        if (!duration_ns.ok())
+          fail("$.policies.stop_stage_parameters", duration_ns.error().message);
+        const auto checked = core::validate_controlled_stop_timing(
+            selected.timing, duration_ns.value());
+        if (!checked.ok())
+          fail("$.policies.stop_timing_parameters", checked.error().message);
+      }
+    }
     normalized_policies = encode_supported_policies(
         stop_stage_parameters, commissioned_stop_interfaces,
-        retained_policy_records,
-        normalized_interrupt_sources, normalized_interrupt_policies,
-        interrupt_config);
+        retained_policy_records, normalized_interrupt_sources,
+        normalized_interrupt_policies, interrupt_config,
+        stop_timing_parameters);
   }
 
   std::optional<SiteOverlayRefDTO> site_overlay_ref;
   std::optional<CanonicalValue> normalized_site_overlay_ref;
   SiteOverlayRefSourcePresence site_overlay_ref_presence =
       SiteOverlayRefSourcePresence::kAbsent;
-  const CanonicalValue* site_overlay_ref_value =
+  const CanonicalValue *site_overlay_ref_value =
       find_member(root, "site_overlay_ref");
   if (site_overlay_ref_value != nullptr) {
     if (std::holds_alternative<std::nullptr_t>(
             site_overlay_ref_value->storage())) {
-      site_overlay_ref_presence =
-          SiteOverlayRefSourcePresence::kExplicitNull;
+      site_overlay_ref_presence = SiteOverlayRefSourcePresence::kExplicitNull;
       normalized_site_overlay_ref.emplace(nullptr);
     } else {
       site_overlay_ref_presence = SiteOverlayRefSourcePresence::kValue;
       site_overlay_ref =
-          parse_site_overlay_ref(*site_overlay_ref_value,
-                                 "$.site_overlay_ref");
-      normalized_site_overlay_ref =
-          encode_site_overlay_ref(*site_overlay_ref);
+          parse_site_overlay_ref(*site_overlay_ref_value, "$.site_overlay_ref");
+      normalized_site_overlay_ref = encode_site_overlay_ref(*site_overlay_ref);
     }
   }
 
@@ -2430,6 +2552,7 @@ decode_deployment_applicability_inputs_candidate(
       std::move(stop_stage_parameters),
       std::move(commissioned_stop_interfaces),
       std::move(retained_policy_records),
+      std::move(stop_timing_parameters),
   };
   CanonicalValue normalized_desired =
       encode_desired_configurations(value.desired_control_configurations);
@@ -2442,16 +2565,16 @@ decode_deployment_applicability_inputs_candidate(
   return TypedDeploymentApplicabilityInputsCandidate(
       std::move(value), std::move(normalized_desired),
       std::move(normalized_providers), std::move(normalized_external),
-      std::move(normalized_policies),
-      site_overlay_ref_presence, std::move(normalized_site_overlay_ref),
-      external_resources_was_present, assistant_settings);
+      std::move(normalized_policies), site_overlay_ref_presence,
+      std::move(normalized_site_overlay_ref), external_resources_was_present,
+      assistant_settings);
 }
 
 RevisionVerifiedDeploymentApplicabilityInputs
 compute_capability_provider_binding_revisions(
-    const TypedDeploymentApplicabilityInputsCandidate& candidate) {
+    const TypedDeploymentApplicabilityInputsCandidate &candidate) {
   DeploymentApplicabilityInputsDTO value = candidate.value();
-  for (auto& binding : value.capability_provider_bindings) {
+  for (auto &binding : value.capability_provider_bindings) {
     const std::string revision = detail::compute_content_identity(
         encode_provider_binding(binding),
         kCapabilityProviderBindingIdentitySpec);
@@ -2463,7 +2586,7 @@ compute_capability_provider_binding_revisions(
   CanonicalValue normalized_providers =
       encode_provider_bindings(value.capability_provider_bindings);
 
-  for (auto& row : value.commissioned_stop_interfaces) {
+  for (auto &row : value.commissioned_stop_interfaces) {
     row.commissioned_stop_interface_revision =
         CommissionedStopInterfaceRevision(detail::compute_content_identity(
             encode_commissioned_stop_interface(row),
@@ -2475,8 +2598,8 @@ compute_capability_provider_binding_revisions(
   std::optional<CanonicalValue> normalized_policies;
   if (candidate.normalized_policies().has_value()) {
     const auto require_normalized_policy_member =
-        [&](std::string_view name) -> const CanonicalValue& {
-      const auto* member =
+        [&](std::string_view name) -> const CanonicalValue & {
+      const auto *member =
           candidate.normalized_policies()->find_object_member(name);
       if (member == nullptr) {
         fail("$.policies",
@@ -2489,7 +2612,8 @@ compute_capability_provider_binding_revisions(
         value.retained_policy_records,
         require_normalized_policy_member("interrupt_sources"),
         require_normalized_policy_member("interrupt_policies"),
-        require_normalized_policy_member("interrupt_config"));
+        require_normalized_policy_member("interrupt_config"),
+        value.stop_timing_parameters);
   }
 
   return RevisionVerifiedDeploymentApplicabilityInputs(
@@ -2498,8 +2622,7 @@ compute_capability_provider_binding_revisions(
           candidate.normalized_desired_control_configurations(),
           std::move(normalized_providers),
           candidate.normalized_external_resources(),
-          std::move(normalized_policies),
-          candidate.site_overlay_ref_presence(),
+          std::move(normalized_policies), candidate.site_overlay_ref_presence(),
           candidate.normalized_site_overlay_ref(),
           candidate.external_resources_was_present(),
           candidate.assistant_settings()));
@@ -2507,12 +2630,10 @@ compute_capability_provider_binding_revisions(
 
 RevisionVerifiedDeploymentApplicabilityInputs
 verify_capability_provider_binding_revisions(
-    const TypedDeploymentApplicabilityInputsCandidate& candidate) {
+    const TypedDeploymentApplicabilityInputsCandidate &candidate) {
   for (std::size_t index = 0;
-       index < candidate.value().capability_provider_bindings.size();
-       ++index) {
-    const auto& binding =
-        candidate.value().capability_provider_bindings[index];
+       index < candidate.value().capability_provider_bindings.size(); ++index) {
+    const auto &binding = candidate.value().capability_provider_bindings[index];
     if (!detail::verify_content_identity(
             encode_provider_binding(binding),
             kCapabilityProviderBindingIdentitySpec)) {
@@ -2523,33 +2644,32 @@ verify_capability_provider_binding_revisions(
   }
 
   for (std::size_t index = 0U;
-       index < candidate.value().commissioned_stop_interfaces.size();
-       ++index) {
+       index < candidate.value().commissioned_stop_interfaces.size(); ++index) {
     if (!detail::verify_content_identity(
             encode_commissioned_stop_interface(
                 candidate.value().commissioned_stop_interfaces[index]),
             kCommissionedStopInterfaceIdentitySpec)) {
       fail(index_path("$.policies.commissioned_stop_interfaces", index),
-           "commissioned_stop_interface_revision does not match the exact normalized row");
+           "commissioned_stop_interface_revision does not match the exact "
+           "normalized row");
     }
   }
 
   return RevisionVerifiedDeploymentApplicabilityInputs(candidate);
 }
 
-QualifiedCommissioningEvidenceRef
-resolve_and_verify_commissioning_evidence_ref(
-    const core::CommissionedStopInterfaceDTO& commissioned_interface,
-    const core::ContentAddressedStoreKey& resolved_store_key,
+QualifiedCommissioningEvidenceRef resolve_and_verify_commissioning_evidence_ref(
+    const core::CommissionedStopInterfaceDTO &commissioned_interface,
+    const core::ContentAddressedStoreKey &resolved_store_key,
     std::string_view stored_bytes) {
-  const auto& artifact =
+  const auto &artifact =
       commissioned_interface.commissioning_evidence_artifact_ref;
   if (artifact.artifact_role_id.value() !=
           core::kStopInterfaceCommissioningArtifactRole ||
-      artifact.media_type !=
-          core::kStopInterfaceCommissioningMediaType) {
+      artifact.media_type != core::kStopInterfaceCommissioningMediaType) {
     fail("$.policies.commissioned_stop_interfaces",
-         "commissioning evidence has the wrong fixed artifact role or media type");
+         "commissioning evidence has the wrong fixed artifact role or media "
+         "type");
   }
   if (!is_sha256_digest(artifact.content_digest.value())) {
     fail("$.policies.commissioned_stop_interfaces",
@@ -2560,20 +2680,18 @@ resolve_and_verify_commissioning_evidence_ref(
   if (artifact.content_addressed_store_key.value() != expected_store_key ||
       resolved_store_key != artifact.content_addressed_store_key) {
     fail("$.policies.commissioned_stop_interfaces",
-         "commissioning evidence did not resolve through its exact safe content-addressed key");
+         "commissioning evidence did not resolve through its exact safe "
+         "content-addressed key");
   }
-  if (stored_bytes.size() >
-          std::numeric_limits<std::uint64_t>::max() ||
-      static_cast<std::uint64_t>(stored_bytes.size()) !=
-          artifact.byte_size ||
+  if (stored_bytes.size() > std::numeric_limits<std::uint64_t>::max() ||
+      static_cast<std::uint64_t>(stored_bytes.size()) != artifact.byte_size ||
       sha256_digest(stored_bytes) != artifact.content_digest.value()) {
     fail("$.policies.commissioned_stop_interfaces",
          "commissioning evidence byte count or stored-byte digest mismatch");
   }
   return QualifiedCommissioningEvidenceRef(
       commissioned_interface.commissioned_stop_interface_id,
-      commissioned_interface.commissioned_stop_interface_revision,
-      artifact);
+      commissioned_interface.commissioned_stop_interface_revision, artifact);
 }
 
-}  // namespace manyforge::deployment
+} // namespace manyforge::deployment

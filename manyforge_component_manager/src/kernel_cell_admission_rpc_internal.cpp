@@ -13,7 +13,7 @@
 namespace manyforge::component_manager::detail {
 namespace core = manyforge::core;
 namespace {
-constexpr std::string_view kMagic = "MFCA1";
+constexpr std::string_view kMagic = "MFCA2";
 constexpr std::size_t kMaxEntries = core::kMaximumCellAdmissionClaims;
 
 [[noreturn]] void Fail(const char *message) {
@@ -174,6 +174,14 @@ void Intent(Writer &w, const core::CellAdmissionClaimIntentDTO &x) {
     Opt(w, v.parent_program_cycle_claim_generation,
         [](Writer &w, const auto &g) { G(w, g); });
   });
+  Opt(w, x.program_node_evidence, [](Writer& w, const auto& v) {
+    S(w, v.program_runner_owner_epoch);
+    S(w, v.program_run_id);
+    G(w, v.parent_program_cycle_claim_generation);
+    w.String(v.node_instance_id);
+    w.String(v.node_attempt_id);
+    w.String(v.owner_api);
+  });
 }
 core::CellAdmissionClaimIntentDTO Intent(Reader &r) {
   core::CellAdmissionClaimIntentDTO x{
@@ -202,6 +210,11 @@ core::CellAdmissionClaimIntentDTO Intent(Reader &r) {
               return G<core::CellAdmissionClaimGeneration>(r);
             })};
       });
+  x.program_node_evidence = Opt<core::ProgramNodeAdmissionEvidenceDTO>(r, [](Reader& r) {
+    return core::ProgramNodeAdmissionEvidenceDTO{
+        S<core::RequestOwnerEpoch>(r), S<core::ProgramRunId>(r),
+        G<core::CellAdmissionClaimGeneration>(r), r.String(), r.String(), r.String()};
+  });
   return x;
 }
 void Claim(Writer &w, const core::CellAdmissionClaimDTO &x) {

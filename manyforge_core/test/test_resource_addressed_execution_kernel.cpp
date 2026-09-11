@@ -12,6 +12,9 @@
 #include <future>
 #include <iterator>
 #include <limits>
+#include <manyforge_core/detail/motion_resume_intent.hpp>
+#include <manyforge_core/detail/coordinated_execution_clock.hpp>
+#include <manyforge_core/detail/coordinated_motion_preparation.hpp>
 #include <manyforge_core/gripper_participant_engine.hpp>
 #include <manyforge_core/manager_liveness_receiver.hpp>
 #include <manyforge_core/ports/imotion_preview.hpp>
@@ -194,6 +197,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     {
       std::lock_guard lock(prepared_motion_mutex_);
       last_prepared_request = request;
+      last_dispatched_participant.reset();
       if (defer_prepare_completion) {
         prepared_snapshot = ResolvedPreparedMotionExecutionSnapshotDTO{
             next_execution_id,
@@ -230,7 +234,9 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
                      "fake prepared execution is unavailable",
                      {{"reason", "prepared_motion_missing"}}});
       }
-      return Result<ResolvedPreparedMotionExecutionSnapshotDTO>::Ok(*prepared_snapshot);
+      auto snapshot = *prepared_snapshot;
+      snapshot.last_dispatched_participant = last_dispatched_participant;
+      return Result<ResolvedPreparedMotionExecutionSnapshotDTO>::Ok(std::move(snapshot));
     }();
     if (observe_prepared_motion_hook) observe_prepared_motion_hook();
     return result;
@@ -254,6 +260,8 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
       prepared_snapshot->state = defer_prepared_dispatch_effect
                                      ? ResolvedPreparedMotionExecutionStateDTO::kDispatchRequested
                                      : ResolvedPreparedMotionExecutionStateDTO::kDispatched;
+      if (!defer_prepared_dispatch_effect)
+        last_dispatched_participant = prepared_snapshot->participant;
       execution_request = last_prepared_request->execution_request;
     }
     if (defer_prepared_dispatch_effect) {
@@ -291,6 +299,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
           request.controller_goal_generation;
       last_prepared_request->ordinary_stop_plan = std::move(request.ordinary_stop_plan);
       last_prepared_request->fault_stop_plan = std::move(request.fault_stop_plan);
+      last_prepared_request->common_timing = std::move(request.common_timing);
       prepared_snapshot = ResolvedPreparedMotionExecutionSnapshotDTO{
           execution_id,
           ResolvedPreparedMotionExecutionStateDTO::kPreparing,
@@ -543,12 +552,16 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
                                                    {{"reason", "controller_stop_rejected"}}}))});
     }
     ++stop_calls;
-    const auto actual_stop_mode =
-        stage.participant_stop_plan.participant_stop_profile.has_value() &&
-                stage.participant_stop_plan.participant_stop_profile->stop_mode ==
-                    MotionInterruptStopMode::kSpringBackHold
-            ? MotionControlledStopMode::kSpringBackHold
-            : MotionControlledStopMode::kSoftOnPath;
+    std::optional<MotionControlledStopMode> actual_stop_mode;
+    if (stage.participant_stop_plan.stage_commands.at(stage.stage_index)
+            .resolved_stage.containment_command.command_kind ==
+        StopContainmentCommandKind::kMotionControlledStop) {
+      actual_stop_mode = stage.participant_stop_plan.participant_stop_profile.has_value() &&
+                                 stage.participant_stop_plan.participant_stop_profile->stop_mode ==
+                                     MotionInterruptStopMode::kSpringBackHold
+                             ? MotionControlledStopMode::kSpringBackHold
+                             : MotionControlledStopMode::kSoftOnPath;
+    }
     auto result = ParticipantStopStageResultDTO{stage,
                                                 StopStageAttemptDispositionDTO::kDispatched,
                                                 next_stop_result.accepted
@@ -836,6 +849,10 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     runtime_scale.active = to == ExecutionState::kExecuting || to == ExecutionState::kPaused;
     const KernelEvent event{
         KernelEventType::kStateTransition, next_execution_id, 0, from, to, std::move(error), {}};
+    deliver_event(event);
+  }
+
+  void deliver_event(const KernelEvent& event) {
     const auto snapshot = callbacks;
     for (const auto& [id, callback] : snapshot) {
       (void)id;
@@ -940,6 +957,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   mutable std::mutex prepared_command_mutex_;
   std::optional<KernelEvent> event_during_execute;
   bool defer_prepare_completion{};
+  bool prepare_bounded_time_law{};
   bool defer_prepared_dispatch_effect{};
   bool defer_resume_prepare_completion{};
   ExecutionState prepared_cancel_terminal_state{ExecutionState::kStopped};
@@ -978,6 +996,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   std::optional<ExecuteRequestDTO> last_execute;
   std::optional<ResolvedPreparedMotionExecutionRequestDTO> last_prepared_request;
   mutable std::optional<ResolvedPreparedMotionExecutionSnapshotDTO> prepared_snapshot;
+  std::shared_ptr<const PreparedOperationParticipantDTO> last_dispatched_participant;
   std::optional<ResolvedPreparedCapabilityCommandExecutionRequestDTO> last_prepared_command_request;
   mutable std::optional<ResolvedPreparedCapabilityCommandSnapshotDTO> prepared_command_snapshot;
   std::optional<ExecuteRequestDTO> last_preview;
@@ -991,7 +1010,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
  private:
   static std::string Digest(char digit) { return "sha256:" + std::string(64U, digit); }
 
-  static Result<PreparedOperationParticipantDTO> MakePreparedMotionParticipant(
+  Result<PreparedOperationParticipantDTO> MakePreparedMotionParticipant(
       const ResolvedPreparedMotionExecutionRequestDTO& authority) {
     const auto& request = authority.execution_request;
     const auto& binding = authority.binding.value();
@@ -1078,6 +1097,13 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     TrajectoryDTO trajectory{request.binding.resources,
                              request.binding.model_group_binding.compiled_joint_names,
                              {{0.0, zeros, {}, {}}, {1.0, zeros, {}, {}}}};
+    if (prepare_bounded_time_law) {
+      trajectory.runtime_scale_bounds = TrajectoryRuntimeScaleBoundsDTO{2.0, 8.0};
+      for (auto& waypoint : trajectory.waypoints) {
+        waypoint.velocities_rad_s = zeros;
+        waypoint.accelerations_rad_s2 = zeros;
+      }
+    }
     PlanResultDTO planning_result{trajectory, std::nullopt, projection};
     CollisionWorldRevision world{1U, Digest('c')};
     CollisionDecision decision;
@@ -1448,6 +1474,7 @@ class FakeOperationJournal final : public IOperationJournal {
       const RequestOwnerEpoch&, const StopFaultRecoveryIntentDTO& recovery_intent,
       const StopFaultRecoveryResultDTO& recovery_result, const StopFaultLatchDTO& cleared_latch,
       const StopStatusDTO& resulting_stop_status) override {
+    if (stop_fault_clear_hook) stop_fault_clear_hook();
     std::lock_guard lock(mutex);
     ++stop_fault_clear_calls;
     calls.push_back("stop_fault_cleared");
@@ -1573,6 +1600,7 @@ class FakeOperationJournal final : public IOperationJournal {
   std::function<void()> operation_acceptance_hook;
   std::function<void()> control_acceptance_hook;
   std::function<void()> stop_acceptance_hook;
+  std::function<void()> stop_fault_clear_hook;
   std::function<void()> cell_admission_acquire_hook;
   std::function<void()> cell_admission_generation_hook;
   std::function<void(std::string_view)> record_hook;
@@ -1733,6 +1761,29 @@ ManagerLivenessRequiredSetDTO EmptyManagerLivenessSet() {
   }
   for (auto& stage : plan.escalation_stages) {
     if (stage.stage_index == 0U) {
+      // The codec golden intentionally carries an opaque placeholder. This
+      // execution fixture selects the real controlled-Stop schema, so its
+      // default-only callers (notably grippers) need a complete typed profile.
+      JsonValueDTO::Array default_limits;
+      for (const auto& resource : binding.resources) {
+        const bool angular = resource.coordinate_kind == CoordinateKind::kAngular;
+        default_limits.emplace_back(JsonObjectDTO{
+            {"resource_id", JsonValueDTO{resource.resource_id.value()}},
+            {"max_deceleration",
+             JsonValueDTO{JsonObjectDTO{
+                 {"coordinate_kind", JsonValueDTO{angular ? "angular_rad_s2" : "linear_m_s2"}},
+                 {angular ? "value_rad_s2" : "value_m_s2", JsonValueDTO{4.0}}}}},
+            {"settle_velocity_threshold",
+             JsonValueDTO{JsonObjectDTO{
+                 {"coordinate_kind", JsonValueDTO{angular ? "angular_rad_s" : "linear_m_s"}},
+                 {angular ? "value_rad_s" : "value_m_s", JsonValueDTO{0.02}}}}}});
+      }
+      stage.default_contract_parameters =
+          JsonObjectDTO{{"stop_mode", JsonValueDTO{"soft_on_path"}},
+                        {"deceleration_time_s", JsonValueDTO{1.0}},
+                        {"jerk_limits_enabled", JsonValueDTO{false}},
+                        {"allow_natural_completion_on_short_path", JsonValueDTO{false}},
+                        {"per_resource_limits", JsonValueDTO{std::move(default_limits)}}};
       auto select_controlled_stop_contract = [](ProviderContractRefDTO& ref) {
         ref.contract_schema_id = SchemaId(std::string(kMotionControlledStopContractSchemaId));
         ref.contract_schema_revision =
@@ -1851,8 +1902,30 @@ ManagerLivenessRequiredSetDTO EmptyManagerLivenessSet() {
 }
 
 [[nodiscard]] RuntimeParticipantExecutionRegistration registration(
-    const RuntimeParticipantBinding& participant, IResolvedParticipantExecutionEngine& engine) {
+    const RuntimeParticipantBinding& participant, IResolvedParticipantExecutionEngine& engine,
+    const bool include_controlled_fallback = false) {
   auto plan = stop_base_plan_for(participant);
+  if (include_controlled_fallback) {
+    auto intermediate = plan.escalation_stages.front();
+    intermediate.stage_index = 1U;
+    intermediate.stage_kind = StopEscalationStageKind::kControlledFallback;
+    intermediate.stop_escalation_stage_id = StopEscalationStageId("stage.intermediate");
+    intermediate.command_qualification.controlled_substitution_contract.reset();
+    intermediate.containment_command.command_phase_id =
+        StopBudgetPhaseId("phase.intermediate.command");
+    auto& evidence = intermediate.evidence_requirements.front().requirement;
+    evidence.phase_id = StopBudgetPhaseId("phase.intermediate.rest");
+    evidence.evidence_item_id = StopEvidenceItemId("evidence.intermediate.rest");
+    plan.escalation_stages.back().stage_index = 2U;
+    plan.escalation_stages.insert(plan.escalation_stages.begin() + 1, std::move(intermediate));
+    plan.deadline_budget.phases.insert(
+        plan.deadline_budget.phases.begin() + 2,
+        {{StopBudgetPhaseId("phase.intermediate.command"), 2'250'000'000},
+         {StopBudgetPhaseId("phase.intermediate.rest"), 2'500'000'000}});
+    auto sealed = MakeResolvedStopBasePlan(std::move(plan));
+    if (!sealed.ok()) throw std::logic_error(sealed.error().message);
+    plan = std::move(sealed.value());
+  }
   auto expected = controller_domain_for(participant, plan);
   auto readiness = verify_runtime_participant_stop_readiness(
       RuntimeParticipantStopReadinessDTO{participant.value().controllable_component_id,
@@ -1894,6 +1967,7 @@ ManagerLivenessRequiredSetDTO EmptyManagerLivenessSet() {
   if (participant.value().capability_id.value() == "execution.trajectory.execute") {
     MotionInterruptStopProfileDTO profile;
     profile.profile_id = "operator_soft_on_path";
+    profile.jerk_limits_enabled = false;
     profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
     profile.deceleration_time_s = 1.0;
     profile.allow_natural_completion_on_short_path = true;
@@ -2521,6 +2595,28 @@ TEST(ResourceAddressedExecutionKernelTest,
 
 [[nodiscard]] ProgramRunExecutionCaptureDTO program_execution_capture() {
   const auto intent = motion_operation();
+  auto binding = std::make_shared<ProgramBindingDTO>(ProgramBindingDTO{
+      std::string(kProgramBindingApiVersion),
+      intent.program_binding_id,
+      intent.program_id,
+      intent.program_revision,
+      intent.expected_retained_bundle_id,
+      intent.expected_graph_revision,
+      {"test.catalog", "1", ContentDigest(test_digest('0')), ContentDigest(test_digest('0'))},
+      {},
+      {},
+      {ContentDigest(test_digest('0')), ContentDigest(test_digest('0')), {}, {}}});
+  const auto physical =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular).value();
+  ProgramTargetRoleBindingDTO target{physical.target_role_id,
+                                     physical.component_role_id,
+                                     physical.controllable_component_id,
+                                     physical.command_target_id,
+                                     {},
+                                     {},
+                                     {},
+                                     {}};
+  binding->target_role_bindings.push_back(std::move(target));
   auto table = std::make_shared<ProgramExecutionTableDTO>();
   table->nodes = {{ProgramNodeInstanceId("move"),
                    "kernel.operation",
@@ -2536,7 +2632,8 @@ TEST(ResourceAddressedExecutionKernelTest,
           intent.program_binding_id,
           intent.expected_retained_bundle_id,
           intent.expected_graph_revision,
-          std::move(table)};
+          std::move(table),
+          std::move(binding)};
 }
 
 [[nodiscard]] Result<AuthoringAdmissionDTO> ready_cell_admission(
@@ -2588,7 +2685,7 @@ TEST(ResourceAddressedExecutionKernelTest,
           RequestOwnerEpoch("program.owner"),
           CellAdmissionClaimGeneration(1U),
           ProgramRunId("run.1"),
-          std::move(group),
+          {std::move(group)},
           {}};
 }
 
@@ -2642,6 +2739,25 @@ TEST(ResourceAddressedExecutionKernelTest, ManualAdmissionExcludesHeldProgramAnd
     }
     auto manual_request = motion_operation();
     manual_request.program_run_id = ProgramRunId("manual.run");
+    if (program_claim) {
+      CellAdmissionClaimIntentDTO forged{
+          CellAdmissionClaimKindDTO::kManualOperation,
+          CellAdmissionOwnerRoleDTO::kManualOperationOwner,
+          config.request_owner_epoch,
+          "forged.manual",
+          RequestId("forged.manual"),
+          ContentDigest(test_digest('1')),
+          kernel.GetAuthoringAdmission().admission_generation,
+          {{ResourceId("arm.joint")}, {}},
+          {},
+          CellAdmissionInterventionEvidenceDTO{
+              CellAdmissionOwnerRoleDTO::kManualOperationOwner, config.request_owner_epoch,
+              "forged.manual", ContentDigest(test_digest('1')), CellAdmissionClaimGeneration(1U)}};
+      ASSERT_TRUE(ValidateCellAdmissionClaimIntent(forged).ok());
+      const auto external = kernel.AcquireCellAdmissionClaim(forged);
+      ASSERT_FALSE(external.ok());
+      EXPECT_EQ(external.error().details.at("reason"), "manual_operation_claim_requires_execute");
+    }
     const auto manual = kernel.execute(manual_request);
     ASSERT_FALSE(manual.ok());
     EXPECT_EQ(manual.error().details.at("reason"), "positive_admission_required");
@@ -3624,6 +3740,11 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_EQ(accepted.value().participant_assignments.size(), 2U);
   EXPECT_EQ(first_engine.prepare_motion_calls, 1);
   EXPECT_EQ(second_engine.prepare_motion_calls, 1);
+  ASSERT_TRUE(first_engine.last_prepared_request);
+  ASSERT_TRUE(second_engine.last_prepared_request);
+  EXPECT_NE(first_engine.last_prepared_request->common_timing, nullptr);
+  EXPECT_EQ(first_engine.last_prepared_request->common_timing,
+            second_engine.last_prepared_request->common_timing);
   EXPECT_EQ(first_engine.dispatch_prepared_motion_calls, 1);
   EXPECT_EQ(second_engine.dispatch_prepared_motion_calls, 1);
   EXPECT_EQ(timeline,
@@ -3639,6 +3760,201 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_TRUE(std::all_of(slots.begin(), slots.end(), [](const auto& slot) {
     return slot.state == ResourceSlotState::kDispatched;
   }));
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     CoordinatedRuntimeScalePublishesOneTargetWithoutPerParticipantEffects) {
+  for (const bool delay_acceptance : {false, true}) {
+    SCOPED_TRACE(delay_acceptance);
+    FakeClock clock;
+    clock.set(1);
+    FakeOperationJournal delayed_journal;
+    IOperationJournal& journal =
+        delay_acceptance ? static_cast<IOperationJournal&>(delayed_journal) : default_journal;
+    ManualScheduler scheduler;
+    FakeParticipantEngine first_engine, second_engine;
+    std::vector<std::string> timeline;
+    first_engine.timeline = second_engine.timeline = &timeline;
+    const auto first =
+        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+    ResourceAddressedExecutionKernel kernel(
+        {registration(first, first_engine),
+         registration(coordinated_occurrence(first, "2"), second_engine)},
+        clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+    const auto accepted = kernel.execute(coordinated_motion_operation("scale.group.accept"));
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    const auto timing = first_engine.last_prepared_request->common_timing;
+    ASSERT_TRUE(timing);
+    const auto first_id =
+        first_engine.last_prepared_request->execution_request.binding.participant_id;
+    const auto second_id =
+        second_engine.last_prepared_request->execution_request.binding.participant_id;
+    const TrajectoryRuntimeScaleBoundsDTO bounds{4.0, 16.0, 1.0, 1.0};
+    auto joining = std::async(std::launch::async,
+                              [&] { return timing->arrive_and_wait(first_id, bounds, {}); });
+    ASSERT_TRUE(timing->arrive_and_wait(second_id, bounds, {}));
+    ASSERT_TRUE(joining.get());
+    const auto shared = timing->execution_clock();
+    ASSERT_TRUE(shared);
+    auto arming = std::async(std::launch::async,
+                             [&] { return shared->start_and_wait(first_id, clock, 1.0, {}); });
+    ASSERT_TRUE(shared->start_and_wait(second_id, clock, 1.0, {}));
+    ASSERT_TRUE(arming.get());
+    first_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+    second_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+    first_engine.runtime_scale.active = second_engine.runtime_scale.active = true;
+    ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+    const auto before = timeline;
+    delayed_journal.record_hook = [&](const std::string_view kind) {
+      if (kind == "runtime_scale_accepted") clock.advance(1'000'000'000);
+    };
+    const auto request = runtime_scale_request("scale.shared.1", accepted.value(), 1U, 0U, 0.25);
+    const auto scaled = kernel.set_runtime_scale(request);
+    ASSERT_TRUE(scaled.ok()) << scaled.error().message;
+    EXPECT_EQ(timeline, before);
+    ASSERT_TRUE(shared->target());
+    if (delay_acceptance) {
+      EXPECT_DOUBLE_EQ(shared->target()->scale, 1.0);
+      EXPECT_FALSE(shared->target()->command);
+      const auto failed = kernel.get_runtime_scale(accepted.value().operation_id);
+      ASSERT_TRUE(failed.ok());
+      EXPECT_EQ(failed.value().state, RuntimeScaleApplicationState::kFailed);
+      for (const auto& row : failed.value().participants) {
+        ASSERT_TRUE(row.error);
+        EXPECT_EQ(row.error->details.at("reason"), "coordinated_runtime_scale_not_ready");
+      }
+      continue;
+    }
+    EXPECT_DOUBLE_EQ(shared->target()->scale, 0.25);
+    ASSERT_TRUE(shared->target()->command);
+    EXPECT_EQ(shared->target()->command->generation, RuntimeScaleGeneration(1U));
+    EXPECT_EQ(shared->target()->command->operation_id, accepted.value().operation_id);
+    const auto status = kernel.get_runtime_scale(accepted.value().operation_id);
+    ASSERT_TRUE(status.ok());
+    EXPECT_EQ(status.value().state, RuntimeScaleApplicationState::kPending);
+    for (const auto& participant : status.value().participants)
+      EXPECT_EQ(participant.accepted_generation, RuntimeScaleGeneration(1U));
+    EXPECT_TRUE(kernel.set_runtime_scale(request).ok());
+    EXPECT_EQ(timeline, before);
+    EXPECT_FALSE(kernel
+                     .set_runtime_scale(runtime_scale_request("scale.shared.stale",
+                                                              accepted.value(), 1U, 0U, 0.75))
+                     .ok());
+    EXPECT_DOUBLE_EQ(shared->target()->scale, 0.25);
+    second_engine.last_runtime_scale_command->requested_runtime_scale_generation =
+        RuntimeScaleGeneration(1U);
+    second_engine.last_runtime_scale_command->requested_scale = 0.25;
+    second_engine.runtime_scale.error = ErrorDTO{"peer_failed", "peer failed", {}};
+    ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+    // A retained failed peer cannot be hidden by accepting another shared target.
+    EXPECT_FALSE(kernel
+                     .set_runtime_scale(runtime_scale_request("scale.shared.failed",
+                                                              accepted.value(), 1U, 1U, 0.75))
+                     .ok());
+    EXPECT_DOUBLE_EQ(shared->target()->scale, 0.25);
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     CoordinatedRuntimeScaleStatusTracksEachParticipantAndRetainsPeerFailure) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine first_engine, second_engine;
+  const auto first =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  ResourceAddressedExecutionKernel kernel(
+      {registration(first, first_engine),
+       registration(coordinated_occurrence(first, "2"), second_engine)},
+      clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  const auto accepted = kernel.execute(coordinated_motion_operation("scale.group.status"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  auto status = kernel.get_runtime_scale(accepted.value().operation_id);
+  ASSERT_TRUE(status.ok()) << status.error().message;
+  ASSERT_EQ(status.value().participants.size(), 2U);
+  EXPECT_EQ(status.value().state, RuntimeScaleApplicationState::kPending);
+  const auto member_control = kernel.get_runtime_scale_control(runtime_scale_control_selector());
+  ASSERT_TRUE(member_control.ok());
+  EXPECT_TRUE(member_control.value().frozen);
+  ASSERT_TRUE(member_control.value().reason);
+  EXPECT_EQ(member_control.value().reason->details.at("reason"),
+            "runtime_scale_group_control_required");
+  const auto member_update = kernel.set_runtime_scale_control(
+      runtime_scale_control_request("scale.member.rejected", 0U, 0.5));
+  EXPECT_FALSE(member_update.ok());
+  EXPECT_EQ(
+      kernel.get_runtime_scale_control(runtime_scale_control_selector()).value().requested_scale,
+      1.0);
+  first_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  second_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  first_engine.runtime_scale.active = true;
+  second_engine.runtime_scale.active = false;
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  status = kernel.get_runtime_scale(accepted.value().operation_id);
+  ASSERT_TRUE(status.ok());
+  EXPECT_EQ(status.value().participants[0].state, RuntimeScaleApplicationState::kApplied);
+  EXPECT_EQ(status.value().participants[1].state, RuntimeScaleApplicationState::kPending);
+  EXPECT_EQ(status.value().state, RuntimeScaleApplicationState::kPending);
+  second_engine.runtime_scale.active = true;
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  EXPECT_EQ(kernel.get_runtime_scale(accepted.value().operation_id).value().state,
+            RuntimeScaleApplicationState::kApplied);
+
+  second_engine.runtime_scale.applied_scale = 0.5;
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  status = kernel.get_runtime_scale(accepted.value().operation_id);
+  ASSERT_TRUE(status.ok());
+  EXPECT_EQ(status.value().state, RuntimeScaleApplicationState::kPending);
+  EXPECT_EQ(status.value().requested_scale, 1.0);
+  EXPECT_EQ(status.value().effective_scale, 0.5);
+  second_engine.runtime_scale.applied_scale = 1.0;
+
+  second_engine.runtime_scale.error = ErrorDTO{"peer_scale_failed", "second engine failed", {}};
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  status = kernel.get_runtime_scale(accepted.value().operation_id);
+  ASSERT_TRUE(status.ok());
+  EXPECT_EQ(status.value().state, RuntimeScaleApplicationState::kFailed);
+  EXPECT_FALSE(status.value().participants[0].error);
+  ASSERT_TRUE(status.value().participants[1].error);
+  EXPECT_EQ(status.value().participants[1].error->code, "peer_scale_failed");
+  // A subsequent healthy first-participant sample cannot hide its peer's failure.
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  EXPECT_EQ(kernel.get_runtime_scale(accepted.value().operation_id).value().state,
+            RuntimeScaleApplicationState::kFailed);
+
+  second_engine.runtime_scale.error.reset();
+  second_engine.last_runtime_scale_command.reset();
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  status = kernel.get_runtime_scale(accepted.value().operation_id);
+  ASSERT_TRUE(status.ok());
+  EXPECT_FALSE(status.value().participants[0].error);
+  ASSERT_TRUE(status.value().participants[1].error);
+  EXPECT_EQ(status.value().participants[1].error->details.at("reason"),
+            "runtime_scale_status_not_initialized");
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     CoordinatedTimeLawsCannotDispatchWithoutCommonPreparation) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine first_engine, second_engine;
+  first_engine.prepare_bounded_time_law = second_engine.prepare_bounded_time_law = true;
+  const auto first =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto second = coordinated_occurrence(first, "2");
+  ResourceAddressedExecutionKernel kernel(
+      {registration(first, first_engine), registration(second, second_engine)}, clock, scheduler,
+      default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  const auto accepted = kernel.execute(coordinated_motion_operation("request.common-time-law"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  EXPECT_EQ(first_engine.dispatch_prepared_motion_calls, 0);
+  EXPECT_EQ(second_engine.dispatch_prepared_motion_calls, 0);
+  const auto state = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(state.ok());
+  ASSERT_FALSE(state.value().participants.empty());
+  ASSERT_TRUE(state.value().participants.front().terminal_error);
+  EXPECT_EQ(state.value().participants.front().terminal_error->details.at("reason"),
+            "coordinated_time_law_preparation_not_qualified");
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -4976,6 +5292,10 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(second_engine.last_execute->binding.controllable_component_id,
             ControllableComponentId("robot.2"));
   EXPECT_EQ(second_engine.last_execute->binding.resources.front(), ResourceId("robot.2.joint_1"));
+  ASSERT_TRUE(first_engine.last_prepared_request);
+  ASSERT_TRUE(second_engine.last_prepared_request);
+  EXPECT_FALSE(first_engine.last_prepared_request->common_timing);
+  EXPECT_FALSE(second_engine.last_prepared_request->common_timing);
   const auto& resolved_goal = std::get<ResolvedJointGoalDTO>(second_engine.last_execute->motion);
   EXPECT_EQ(resolved_goal.joint_names, (std::vector<std::string>{"mf2_robot_2_joint_1"}));
 
@@ -5350,6 +5670,196 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(admitted.ok()) << admitted.error().message;
 }
 
+TEST(ResourceAddressedExecutionKernelTest, ProgramSceneClaimOrdersAgainstStopWithoutDelayingIt) {
+  using namespace std::chrono_literals;
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  config.cell_admission_settlement_validator = [](const auto&, const auto&) {
+    return Result<void>::Ok();
+  };
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, journal, std::move(config));
+  const auto parent = claim_program_execution(kernel);
+  ASSERT_TRUE(parent.ok());
+  auto capture = program_execution_capture();
+  auto table = std::make_shared<ProgramExecutionTableDTO>(*capture.table);
+  table->nodes.front().owner_api = "scene.carried_attachment";
+  capture.table = table;
+  CellAdmissionClaimIntentDTO intent{
+      CellAdmissionClaimKindDTO::kAuthoredScene,
+      CellAdmissionOwnerRoleDTO::kAuthoredSceneOwner,
+      RequestOwnerEpoch("scene.owner"),
+      "scene.transaction",
+      RequestId("scene.claim"),
+      ContentDigest(test_digest('0')),
+      kernel.GetAuthoringAdmission().admission_generation,
+      {},
+      {},
+      {},
+      ProgramNodeAdmissionEvidenceDTO{RequestOwnerEpoch("program.owner"), ProgramRunId("run.1"),
+                                      parent.value().claim_generation, "move", "move.attempt",
+                                      "scene.carried_attachment"}};
+  // First tick can precede Manager's first Starting/Running publication.
+  // Current Idle alone must never authorize a child without its sealed capture.
+  EXPECT_EQ(kernel.AcquireCellAdmissionClaim(intent).error().details.at("reason"),
+            "program_node_parent_not_current");
+  ASSERT_TRUE(kernel.register_program_run_capture(std::move(capture)).ok());
+  const CellAdmissionReadinessSnapshotDTO idle{
+      true,
+      ProgramCycleStatusDTO{RequestOwnerEpoch("program.owner"),
+                            1U,
+                            ProgramCycleStateDTO::kIdleAfterReset,
+                            {},
+                            {},
+                            {}},
+      true,
+      1U,
+      1U,
+      true,
+      true,
+      0U,
+      0U,
+      0U};
+  for (int failure = 0; failure != 7; ++failure) {
+    auto unavailable = idle;
+    switch (failure) {
+      case 0:
+        unavailable.program_cycle_status_current = false;
+        break;
+      case 1:
+        unavailable.program_cycle_status->program_runner_owner_epoch = RequestOwnerEpoch("foreign");
+        break;
+      case 2:
+        unavailable.deployment_status_current = false;
+        break;
+      case 3:
+        unavailable.blocking_fault_count = 1U;
+        break;
+      default:
+        unavailable.program_cycle_status->state =
+            failure == 4   ? ProgramCycleStateDTO::kStopping
+            : failure == 5 ? ProgramCycleStateDTO::kResetting
+                           : ProgramCycleStateDTO::kTerminalAwaitingReset;
+        unavailable.program_cycle_status->program_run_id = ProgramRunId("run.1");
+        unavailable.program_cycle_status->cycle_claim_generation = parent.value().claim_generation;
+        unavailable.program_cycle_status->terminal_or_settlement_reference =
+            ContentDigest(test_digest('0'));
+    }
+    ASSERT_TRUE(kernel.UpdateCellAdmissionReadiness(unavailable).ok());
+    intent.expected_admission_generation = kernel.GetAuthoringAdmission().admission_generation;
+    EXPECT_FALSE(kernel.AcquireCellAdmissionClaim(intent).ok()) << failure;
+  }
+  ASSERT_TRUE(kernel.UpdateCellAdmissionReadiness(idle).ok());
+  intent.expected_admission_generation = kernel.GetAuthoringAdmission().admission_generation;
+  auto wrong_owner = intent;
+  wrong_owner.program_node_evidence->owner_api = "scene.transaction";
+  EXPECT_EQ(kernel.AcquireCellAdmissionClaim(wrong_owner).error().details.at("reason"),
+            "program_execution_scope_unknown");
+  auto stopped = kernel.stop_program_selection(program_selection_request("stop.before", "arm"));
+  ASSERT_TRUE(stopped.ok());
+  EXPECT_EQ(kernel.AcquireCellAdmissionClaim(intent).error().details.at("reason"),
+            "program_node_stop_fence_active");
+  ASSERT_TRUE(kernel
+                  .release_program_selection(program_selection_request("resume.before", "arm"),
+                                             stopped.value().state->selection_revision)
+                  .ok());
+
+  HeldSettlementCall held_write;
+  journal.cell_admission_acquire_hook = [&] { held_write.Hold(); };
+  auto acquiring =
+      std::async(std::launch::async, [&] { return kernel.AcquireCellAdmissionClaim(intent); });
+  const bool entered = held_write.Entered();
+  if (!entered) held_write.Release();
+  ASSERT_TRUE(entered);
+  auto stopping = std::async(std::launch::async, [&] {
+    return kernel.stop_program_selection(program_selection_request("stop.crossed", "arm"));
+  });
+  const bool stop_returned = stopping.wait_for(250ms) == std::future_status::ready;
+  if (!stop_returned) held_write.Release();
+  stopped = stopping.get();
+  EXPECT_TRUE(stop_returned);  // A barrier assertion, not a real-time platform qualification.
+  ASSERT_TRUE(stopped.ok());
+  const auto while_writing =
+      kernel.release_program_selection(program_selection_request("resume.crossed", "arm"),
+                                       stopped.value().state->selection_revision);
+  held_write.Release();
+  const auto child = acquiring.get();
+  ASSERT_TRUE(child.ok()) << child.error().message;
+  ASSERT_FALSE(while_writing.ok());
+  EXPECT_EQ(while_writing.error().details.at("reason"), "program_run_admission_in_flight");
+  EXPECT_EQ(kernel.AcquireCellAdmissionClaim(intent).value(), child.value());
+  EXPECT_EQ(kernel
+                .release_program_selection(program_selection_request("resume.held", "arm"),
+                                           stopped.value().state->selection_revision)
+                .error()
+                .details.at("reason"),
+            "program_children_unsettled");
+  const auto& value = child.value();
+  ASSERT_TRUE(kernel
+                  .ReleaseCellAdmissionClaim({value.intent.owner_role,
+                                              value.intent.owner_epoch,
+                                              value.intent.owner_transaction_id,
+                                              value.intent.request_id,
+                                              value.intent.request_payload_digest,
+                                              value.acquired_admission_generation,
+                                              value.claim_generation,
+                                              {CellAdmissionSettlementKindDTO::kOwnerCommit,
+                                               ContentDigest(test_digest('0'))}})
+                  .ok());
+  EXPECT_TRUE(kernel
+                  .release_program_selection(program_selection_request("resume.settled", "arm"),
+                                             stopped.value().state->selection_revision)
+                  .ok());
+
+  // Reset cleanup must retain the whole-run fence even while Manager's
+  // readiness still says Running. Retiring a settled child is not permission
+  // to start another one before scene restoration and parent-claim release.
+  auto running = idle;
+  running.program_cycle_status->state = ProgramCycleStateDTO::kRunning;
+  running.program_cycle_status->program_run_id = ProgramRunId("run.1");
+  running.program_cycle_status->cycle_claim_generation = parent.value().claim_generation;
+  ASSERT_TRUE(kernel.UpdateCellAdmissionReadiness(running).ok());
+  journal.cell_admission_acquire_hook = {};
+  intent.owner_transaction_id = "scene.before-reset";
+  intent.request_id = RequestId("scene.before-reset.claim");
+  intent.expected_admission_generation = kernel.GetAuthoringAdmission().admission_generation;
+  const auto before_reset = kernel.AcquireCellAdmissionClaim(intent);
+  ASSERT_TRUE(before_reset.ok()) << before_reset.error().message;
+  const auto reset_stop = kernel.stop(program_run_stop_request("reset.containment", "run.1"));
+  ASSERT_TRUE(reset_stop.ok()) << reset_stop.error().message;
+  const auto& pending = before_reset.value();
+  ASSERT_TRUE(kernel
+                  .ReleaseCellAdmissionClaim({pending.intent.owner_role,
+                                              pending.intent.owner_epoch,
+                                              pending.intent.owner_transaction_id,
+                                              pending.intent.request_id,
+                                              pending.intent.request_payload_digest,
+                                              pending.acquired_admission_generation,
+                                              pending.claim_generation,
+                                              {CellAdmissionSettlementKindDTO::kOwnerCommit,
+                                               ContentDigest(test_digest('0'))}})
+                  .ok());
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(reset_stop.value().stop_id);
+    return status.ok() && status.value().state == StopStatusStateDTO::kSucceeded;
+  }));
+  intent.owner_transaction_id = "scene.after-reset-cleanup";
+  intent.request_id = RequestId("scene.after-reset-cleanup.claim");
+  intent.program_node_evidence->node_attempt_id = "move.new-attempt";
+  intent.expected_admission_generation = kernel.GetAuthoringAdmission().admission_generation;
+  const auto late_child = kernel.AcquireCellAdmissionClaim(intent);
+  ASSERT_FALSE(late_child.ok());
+  EXPECT_EQ(late_child.error().details.at("reason"), "program_node_stop_fence_active");
+}
+
 TEST(ResourceAddressedExecutionKernelTest, ProgramSelectionIdleOverlapHasOneHoldAndNoPhysicalStop) {
   FakeClock clock;
   ManualScheduler scheduler;
@@ -5394,9 +5904,8 @@ TEST(ResourceAddressedExecutionKernelTest, ProgramSelectionIdleOverlapHasOneHold
   // The overlapping `all` selection has no remaining independent lock on arm.
   const auto motion = kernel.execute(scoped_motion_operation("fresh.arm"));
   ASSERT_TRUE(motion.ok()) << motion.error().message;
-  const auto logical =
-      kernel.release_program_selection(program_selection_request("resume.remaining", "all"),
-                                       released.value().selection_revision);
+  const auto logical = kernel.release_program_selection(
+      program_selection_request("resume.remaining", "all"), released.value().selection_revision);
   ASSERT_TRUE(logical.ok()) << logical.error().message;
   EXPECT_TRUE(logical.value().held_nodes.empty());
   EXPECT_TRUE(kernel.get_operation_projection(motion.value().operation_id).value().resident);
@@ -5627,6 +6136,595 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(released.value().held_nodes.front().node_index, 1U);
 }
 
+TEST(ResourceAddressedExecutionKernelTest,
+     ProgramGroupUnionIsAcceptedOnceAndDeduplicatesOverlappingSelections) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 16U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal, std::move(config));
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  ASSERT_TRUE(kernel.register_program_run_capture(program_execution_capture()).ok());
+  auto request = program_selection_request("stop.union", "arm");
+  request.group_ids = {"arm", "supervision", "arm"};
+  const auto stopped = kernel.stop_program_selection(request);
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+  EXPECT_FALSE(stopped.value().selection_error);
+  EXPECT_EQ(stopped.value().selected_node_indices, (std::vector<std::uint32_t>{0U, 1U}));
+  EXPECT_TRUE(stopped.value().widened_node_indices.empty());
+  EXPECT_FALSE(stopped.value().fresh_containment);
+  ASSERT_TRUE(stopped.value().state);
+  EXPECT_EQ(stopped.value().state->held_nodes.size(), 2U);
+  const auto replay = kernel.stop_program_selection(request);
+  ASSERT_TRUE(replay.ok());
+  ASSERT_TRUE(replay.value().state);
+  EXPECT_EQ(replay.value().state->selection_revision, stopped.value().state->selection_revision);
+  EXPECT_EQ(engine.stop_calls.load(), 0);
+  auto release = request;
+  release.request_context.request_id = RequestId("release.union");
+  const auto resumed =
+      kernel.release_program_selection(release, stopped.value().state->selection_revision);
+  ASSERT_TRUE(resumed.ok()) << resumed.error().message;
+  EXPECT_TRUE(resumed.value().held_nodes.empty());
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ProgramMemberStopContainsCoordinatedPeersButNotIndependentRobot) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine first_engine, second_engine, independent_engine;
+  const auto base =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 16U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel(
+      {registration(base, first_engine),
+       registration(coordinated_occurrence(base, "2"), second_engine),
+       registration(coordinated_occurrence(base, "3"), independent_engine)},
+      clock, scheduler, default_journal, std::move(config));
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  auto capture = program_execution_capture();
+  auto table = std::make_shared<ProgramExecutionTableDTO>();
+  table->nodes = {{ProgramNodeInstanceId("a"),
+                   "kernel.operation",
+                   {{TargetRoleId("arm"), CapabilityId("execution.trajectory.execute")}}},
+                  {ProgramNodeInstanceId("b"),
+                   "kernel.operation",
+                   {{TargetRoleId("arm_2"), CapabilityId("execution.trajectory.execute")}}},
+                  {ProgramNodeInstanceId("c"),
+                   "kernel.operation",
+                   {{TargetRoleId("arm_3"), CapabilityId("execution.trajectory.execute")}}}};
+  table->named_selections = {{"a", {0U}}, {"both_arms", {0U, 1U}}, {"c", {2U}}};
+  capture.table = table;
+  ASSERT_TRUE(kernel.register_program_run_capture(capture).ok());
+  auto coordinated = coordinated_motion_operation("execute.synchronized");
+  coordinated.participants[0].execution_scope =
+      ProgramNodeExecutionScopeDTO{ProgramNodeInstanceId("a"), "attempt.1"};
+  coordinated.participants[1].execution_scope =
+      ProgramNodeExecutionScopeDTO{ProgramNodeInstanceId("b"), "attempt.1"};
+  const auto admitted = kernel.execute(coordinated);
+  ASSERT_TRUE(admitted.ok()) << admitted.error().message;
+  auto independent = motion_operation("execute.independent");
+  independent.participants.front().component_role_id = ComponentRoleId("robot_3");
+  independent.participants.front().target_role_id = TargetRoleId("arm_3");
+  independent.participants.front().execution_scope =
+      ProgramNodeExecutionScopeDTO{ProgramNodeInstanceId("c"), "attempt.1"};
+  const auto other = kernel.execute(independent);
+  ASSERT_TRUE(other.ok()) << other.error().message;
+  for (auto* engine : {&first_engine, &second_engine, &independent_engine})
+    engine->emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+
+  HeldSettlementCall second_settlement;
+  second_engine.translate_stop_stage_hook = [&] { second_settlement.Hold(); };
+  const auto stopped = kernel.stop_program_selection(program_selection_request("stop.a", "a"));
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+  ASSERT_TRUE(stopped.value().fresh_containment);
+  EXPECT_EQ(stopped.value().selected_node_indices, std::vector<std::uint32_t>{0U});
+  EXPECT_EQ(stopped.value().widened_node_indices, std::vector<std::uint32_t>{1U});
+  ASSERT_TRUE(second_settlement.Entered());
+  ASSERT_TRUE(wait_until([&] { return first_engine.stop_calls.load() == 1; }));
+  EXPECT_EQ(independent_engine.stop_calls.load(), 0);
+  const auto pending = kernel.get_stop_status(stopped.value().fresh_containment->stop_id);
+  ASSERT_TRUE(pending.ok());
+  EXPECT_NE(pending.value().state, StopStatusStateDTO::kSucceeded);
+
+  // An overlapping selector adopts the same containment, not another Stop.
+  const auto overlap =
+      kernel.stop_program_selection(program_selection_request("stop.both", "both_arms"));
+  ASSERT_TRUE(overlap.ok()) << overlap.error().message;
+  EXPECT_FALSE(overlap.value().fresh_containment);
+  second_settlement.Release();
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(stopped.value().fresh_containment->stop_id);
+    return status.ok() && status.value().state == StopStatusStateDTO::kSucceeded;
+  }));
+  const auto scope = kernel.get_program_execution_scope(ProgramRunId("run.1"));
+  ASSERT_TRUE(scope.ok());
+  ASSERT_EQ(scope.value().held_nodes.size(), 2U);
+  for (const auto& node : scope.value().held_nodes) {
+    EXPECT_LT(node.node_index, 2U);
+    EXPECT_EQ(node.state, ProgramNodeHoldStateDTO::kHeld);
+  }
+  EXPECT_EQ(first_engine.stop_calls.load(), 1);
+  EXPECT_EQ(second_engine.stop_calls.load(), 1);
+  EXPECT_EQ(independent_engine.stop_calls.load(), 0);
+  const auto other_state = kernel.get_operation_state(other.value().operation_id);
+  ASSERT_TRUE(other_state.ok());
+  EXPECT_EQ(other_state.value().state, OperationStateKind::kExecuting);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ManualHandoverFindsEveryProducerButNotQueriesOrOtherRobot) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine arm;
+  FakeParticipantEngine tool;
+  FakeOperationJournal journal;
+  auto direct = registration(
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), arm);
+  direct.intrinsic_direct_control = true;
+  const auto tool_binding =
+      make_binding("gripper", "gripper", "tool.gripper.command", CoordinateKind::kLinear);
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel({direct, registration(tool_binding, tool)}, clock,
+                                          scheduler, journal, config);
+  auto manual = motion_operation("manual.inspect");
+  manual.program_run_id = ProgramRunId("manual.run");
+  ASSERT_TRUE(ready_cell_admission(kernel).ok());
+  const auto idle = kernel.get_manual_program_handover(manual);
+  ASSERT_TRUE(idle.ok());
+  EXPECT_FALSE(idle.value());
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  auto capture = program_execution_capture();
+  auto binding = std::make_shared<ProgramBindingDTO>(*capture.binding);
+  auto alias = binding->target_role_bindings.front();
+  alias.target_role_id = TargetRoleId("arm_alias");
+  binding->target_role_bindings.push_back(alias);
+  auto gripper = alias;
+  gripper.target_role_id = tool_binding.value().target_role_id;
+  gripper.component_role_id = tool_binding.value().component_role_id;
+  gripper.controllable_component_id = tool_binding.value().controllable_component_id;
+  gripper.command_target_id = tool_binding.value().command_target_id;
+  binding->target_role_bindings.push_back(gripper);
+  capture.binding = binding;
+  auto table = std::make_shared<ProgramExecutionTableDTO>();
+  table->nodes = {{ProgramNodeInstanceId("move"),
+                   "kernel.operation",
+                   {{TargetRoleId("arm"), CapabilityId("execution.trajectory.execute")}}},
+                  {ProgramNodeInstanceId("read"),
+                   "kernel.command_target",
+                   {{TargetRoleId("arm"), CapabilityId("state.observed.current")}}},
+                  {ProgramNodeInstanceId("second_move"),
+                   "kernel.operation",
+                   {{TargetRoleId("arm_alias"), CapabilityId("execution.trajectory.execute")}}},
+                  {ProgramNodeInstanceId("sleep"), "orchestration.clock", {}},
+                  {ProgramNodeInstanceId("tool"),
+                   "kernel.command_target",
+                   {{TargetRoleId("gripper"), CapabilityId("tool.gripper.command")}}}};
+  table->named_selections = {
+      {"arm_first", {0U}}, {"arm_producers", {0U, 2U}}, {"supervision", {1U, 3U}}};
+  capture.table = table;
+  ASSERT_TRUE(kernel.register_program_run_capture(capture).ok());
+  EXPECT_FALSE(kernel.get_manual_program_handover(manual).ok());
+  ASSERT_TRUE(
+      kernel.stop_program_selection(program_selection_request("hold.first", "arm_first")).ok());
+  EXPECT_FALSE(kernel.get_manual_program_handover(manual).ok());
+  ASSERT_TRUE(
+      kernel.stop_program_selection(program_selection_request("hold.producers", "arm_producers"))
+          .ok());
+  const auto held = kernel.get_manual_program_handover(manual);
+  ASSERT_TRUE(held.ok()) << held.error().message;
+  ASSERT_TRUE(held.value());
+  EXPECT_EQ(held.value()->producer_node_indices, (std::vector<std::uint32_t>{0U, 2U}));
+  EXPECT_EQ(held.value()->capture.table, capture.table);
+  EXPECT_EQ(held.value()->capture.binding, capture.binding);
+  const auto scope = kernel.get_program_execution_scope(capture.program_run_id);
+  ASSERT_TRUE(scope.ok());
+  EXPECT_EQ(scope.value().held_nodes.size(), 2U);  // query/tool branches remain enabled
+  EXPECT_EQ(arm.prepare_motion_calls, 0);
+  EXPECT_EQ(tool.prepare_motion_calls, 0);
+  EXPECT_EQ(arm.execute_calls, 0);
+  EXPECT_EQ(tool.execute_calls, 0);
+  ASSERT_TRUE(
+      kernel.stop_program_selection(program_selection_request("hold.new", "supervision")).ok());
+  const auto newer = kernel.get_manual_program_handover(manual);
+  ASSERT_TRUE(newer.ok());
+  ASSERT_TRUE(newer.value());
+  EXPECT_GT(newer.value()->selection_revision, held.value()->selection_revision);
+}
+
+TEST(ResourceAddressedExecutionKernelTest, ManualUnusedTargetAcceptsInitialSelectionRevision) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine arm;
+  FakeOperationJournal journal;
+  auto direct = registration(
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), arm);
+  direct.intrinsic_direct_control = true;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel({direct}, clock, scheduler, journal, config);
+  ASSERT_TRUE(ready_cell_admission(kernel).ok());
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  auto capture = program_execution_capture();
+  auto table = std::make_shared<ProgramExecutionTableDTO>();
+  table->nodes = {{ProgramNodeInstanceId("read"),
+                   "kernel.command_target",
+                   {{TargetRoleId("arm"), CapabilityId("state.observed.current")}}}};
+  capture.table = table;
+  ASSERT_TRUE(kernel.register_program_run_capture(capture).ok());
+  auto manual = motion_operation("manual.unused.target");
+  manual.program_run_id = ProgramRunId("manual.run");
+  const auto proof = kernel.get_manual_program_handover(manual);
+  ASSERT_TRUE(proof.ok()) << proof.error().message;
+  ASSERT_TRUE(proof.value());
+  EXPECT_EQ(proof.value()->selection_revision, 0U);
+  EXPECT_TRUE(proof.value()->producer_node_indices.empty());
+  manual.manual_handover = ManualProgramHandoverContextDTO{
+      capture.program_runner_owner_epoch, capture.program_run_id, capture.claim_generation, 0U};
+  EXPECT_TRUE(validate_operation_intent(manual).ok());
+  manual.manual_handover->selection_revision = 9007199254740992ULL;
+  EXPECT_FALSE(validate_operation_intent(manual).ok());
+  EXPECT_EQ(arm.prepare_motion_calls, 0);
+  EXPECT_EQ(arm.execute_calls, 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest, ManualAvailabilityDistinguishesSettledCleanupFromBusy) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  const auto physical =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto alias = same_control_scope_program_alias(physical);
+  auto direct = registration(alias, engine);
+  direct.intrinsic_direct_control = true;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel({registration(physical, engine), direct}, clock,
+                                          scheduler, journal, config);
+  ASSERT_TRUE(ready_cell_admission(kernel).ok());
+  auto manual = motion_operation("manual.availability");
+  manual.program_id = alias.value().program_id;
+  manual.program_revision = alias.value().program_revision;
+  manual.program_binding_id = alias.value().program_binding_id;
+  manual.program_run_id = ProgramRunId("manual.run");
+  manual.participants.front().component_role_id = alias.value().component_role_id;
+  manual.participants.front().target_role_id = alias.value().target_role_id;
+  const auto idle = kernel.get_manual_control_availability(manual);
+  ASSERT_TRUE(idle.ok());
+  EXPECT_TRUE(idle.value().available);
+  EXPECT_FALSE(idle.value().handover);
+  const auto parent = claim_program_execution(kernel);
+  ASSERT_TRUE(parent.ok());
+  ASSERT_TRUE(kernel.register_program_run_capture(program_execution_capture()).ok());
+  ASSERT_TRUE(kernel
+                  .UpdateCellAdmissionReadiness(
+                      {true,
+                       ProgramCycleStatusDTO{RequestOwnerEpoch("program.owner"), 2U,
+                                             ProgramCycleStateDTO::kRunning, ProgramRunId("run.1"),
+                                             parent.value().claim_generation, std::nullopt},
+                       true, 1U, 1U, true, true, 0U, 0U, 0U})
+                  .ok());
+  const auto active = kernel.execute(scoped_motion_operation("program.active"));
+  ASSERT_TRUE(active.ok()) << active.error().message;
+  ASSERT_TRUE(wait_until([&] { return engine.execute_calls == 1; }));
+  EXPECT_FALSE(kernel.get_manual_control_availability(manual).value().available);
+  const auto stopped =
+      kernel.stop_program_selection(program_selection_request("manual.hold", "arm"));
+  ASSERT_TRUE(stopped.ok());
+  ASSERT_TRUE(stopped.value().fresh_containment);
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(stopped.value().fresh_containment->stop_id);
+    return status.ok() && status.value().state == StopStatusStateDTO::kSucceeded;
+  }));
+  ASSERT_TRUE(wait_until([&] {
+    const auto value = kernel.get_manual_control_availability(manual);
+    return value.ok() && value.value().available && value.value().cleanup_required;
+  }));
+  EXPECT_EQ(engine.reset_calls, 0);
+  EXPECT_EQ(engine.certified_reset_calls, 0);  // The query never cleans up.
+  const auto current = kernel.get_operation_state(active.value().operation_id);
+  ASSERT_TRUE(current.ok());
+  ASSERT_TRUE(kernel
+                  .reset(control_request("owner.cleanup", active.value(),
+                                         current.value().operation_revision.value()))
+                  .ok());
+  ASSERT_TRUE(wait_until([&] {
+    (void)kernel.reconcile_subordinate_state();
+    const auto value = kernel.get_manual_control_availability(manual);
+    return value.ok() && value.value().available && !value.value().cleanup_required;
+  }));
+  const auto scope = kernel.get_program_execution_scope(ProgramRunId("run.1"));
+  ASSERT_TRUE(scope.ok());
+  ASSERT_EQ(scope.value().held_nodes.size(), 1U);
+  EXPECT_EQ(scope.value().held_nodes.front().node_index, 0U);
+  EXPECT_EQ(scope.value().held_nodes.front().state, ProgramNodeHoldStateDTO::kHeld);
+}
+
+TEST(ResourceAddressedExecutionKernelTest, HeldManualAdmissionRetainsParentAndStopWinsDispatch) {
+  // Clean completion, selected Stop, whole-run Stop, Stop across durable
+  // admission, and related/unrelated Stop during preparation share the owner.
+  for (const int scenario : {0, 1, 2, 3, 4, 5, 6}) {
+    SCOPED_TRACE(scenario);
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine engine;
+    FakeOperationJournal journal;
+    auto direct = registration(
+        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+        engine);
+    direct.intrinsic_direct_control = true;
+    ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                  CellId("cell.test"), 8U};
+    config.manager_liveness_required_set = EmptyManagerLivenessSet();
+    ResourceAddressedExecutionKernel kernel({direct}, clock, scheduler, journal, config);
+    const auto parent = claim_program_execution(kernel);
+    ASSERT_TRUE(parent.ok());
+    ASSERT_TRUE(kernel.register_program_run_capture(program_execution_capture()).ok());
+    const CellAdmissionReadinessSnapshotDTO running{
+        true,
+        ProgramCycleStatusDTO{RequestOwnerEpoch("program.owner"), 2U,
+                              ProgramCycleStateDTO::kRunning, ProgramRunId("run.1"),
+                              parent.value().claim_generation, std::nullopt},
+        true,
+        1U,
+        1U,
+        true,
+        true,
+        0U,
+        0U,
+        0U};
+    ASSERT_TRUE(kernel.UpdateCellAdmissionReadiness(running).ok());
+    auto availability_intent = motion_operation("manual.availability");
+    availability_intent.program_run_id = ProgramRunId("manual.run");
+    const auto blocked = kernel.get_manual_control_availability(availability_intent);
+    ASSERT_TRUE(blocked.ok());
+    EXPECT_FALSE(blocked.value().available);
+    EXPECT_EQ(blocked.value().unavailable_reason, "manual_handover_producer_not_held");
+    const auto stopped =
+        kernel.stop_program_selection(program_selection_request("manual.hold", "arm"));
+    ASSERT_TRUE(stopped.ok());
+    auto manual = motion_operation("manual.held");
+    manual.program_run_id = ProgramRunId("manual.run");
+    const auto query = kernel.get_manual_program_handover(manual);
+    ASSERT_TRUE(query.ok());
+    ASSERT_TRUE(query.value());
+    manual.manual_handover = ManualProgramHandoverContextDTO{
+        RequestOwnerEpoch("program.owner"), ProgramRunId("run.1"), parent.value().claim_generation,
+        query.value()->selection_revision};
+    const auto available = kernel.get_manual_control_availability(manual);
+    ASSERT_TRUE(available.ok());
+    EXPECT_TRUE(available.value().available);
+    EXPECT_FALSE(available.value().cleanup_required);
+    ASSERT_TRUE(available.value().handover);
+    EXPECT_EQ(available.value().handover->selection_revision, query.value()->selection_revision);
+    auto stale = manual;
+    ++stale.manual_handover->selection_revision;
+    EXPECT_FALSE(kernel.execute(stale).ok());
+    EXPECT_EQ(engine.execute_calls, 0);
+    if (scenario == 3) {
+      journal.cell_admission_acquire_hook = [&] {
+        EXPECT_TRUE(
+            kernel.stop_program_selection(program_selection_request("manual.crossing", "arm"))
+                .ok());
+      };
+    }
+    if (scenario == 4 || scenario == 5) engine.defer_prepare_completion = true;
+    const auto admitted = kernel.execute(manual);
+    if (scenario == 3) {
+      EXPECT_FALSE(admitted.ok());
+      EXPECT_EQ(engine.execute_calls, 0);
+      EXPECT_EQ(engine.prepare_motion_calls, 0);
+      const auto current_scope = kernel.get_program_execution_scope(ProgramRunId("run.1"));
+      ASSERT_TRUE(current_scope.ok());
+      ASSERT_TRUE(
+          kernel
+              .release_program_selection(program_selection_request("manual.aborted.release", "arm"),
+                                         current_scope.value().selection_revision)
+              .ok());
+      continue;
+    }
+    const auto occupied = kernel.get_manual_control_availability(manual);
+    ASSERT_TRUE(occupied.ok());
+    EXPECT_FALSE(occupied.value().available);
+    ASSERT_TRUE(admitted.ok()) << admitted.error().message;
+    EXPECT_FALSE(
+        kernel
+            .release_program_selection(program_selection_request("manual.must-not-resume", "arm"),
+                                       query.value()->selection_revision)
+            .ok());
+    const auto replay = kernel.execute(manual);
+    ASSERT_TRUE(replay.ok());
+    EXPECT_EQ(replay.value().replay_status, RequestReplayStatusDTO::kReplayedExact);
+    if (scenario == 0) {
+      ASSERT_TRUE(wait_until([&] {
+        return engine.execute_calls == 1 && engine.get_status().state == ExecutionState::kPlanning;
+      }));
+      engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kCompleted);
+      ASSERT_TRUE(wait_until([&] {
+        (void)kernel.reconcile_subordinate_state();
+        return kernel.reconcile_manual_operation_admission().ok() &&
+               kernel
+                   .release_program_selection(
+                       program_selection_request("manual.resume-after-retirement", "arm"),
+                       query.value()->selection_revision)
+                   .ok();
+      }));
+      EXPECT_FALSE(kernel.GetAuthoringAdmission().authoring_allowed);  // Program claim survives
+      EXPECT_EQ(engine.execute_calls, 1);
+      continue;
+    }
+    if (scenario == 6) {
+      ASSERT_TRUE(wait_until([&] {
+        return engine.execute_calls == 1 && engine.get_status().state == ExecutionState::kPlanning;
+      }));
+      engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+      ASSERT_TRUE(kernel.pause(control_request("manual.pause", admitted.value(), 1U)).ok());
+      ASSERT_TRUE(wait_until([&] {
+        const auto state = kernel.get_operation_state(admitted.value().operation_id);
+        return engine.pause_calls.load() == 1 &&
+               engine.get_status().state == ExecutionState::kStopping && state.ok() &&
+               state.value().state == OperationStateKind::kStopping;
+      }));
+      engine.emit_transition(ExecutionState::kStopping, ExecutionState::kPaused);
+      ASSERT_TRUE(wait_until([&] {
+        (void)kernel.reconcile_subordinate_state();
+        const auto state = kernel.get_operation_state(admitted.value().operation_id);
+        return state.ok() && state.value().state == OperationStateKind::kPaused;
+      }));
+      const auto unrelated = kernel.stop_program_selection(
+          program_selection_request("manual.unrelated", "supervision"));
+      ASSERT_TRUE(unrelated.ok());
+      EXPECT_FALSE(unrelated.value().fresh_containment);
+      std::string resume_error;
+      ASSERT_TRUE(wait_until([&] {
+        (void)kernel.reconcile_subordinate_state();
+        const auto resumed = kernel.resume(control_request("manual.resume", admitted.value(), 2U));
+        if (!resumed.ok()) {
+          resume_error = resumed.error().message;
+          if (resumed.error().details.contains("reason"))
+            resume_error += ": " + resumed.error().details.at("reason");
+        }
+        return resumed.ok();
+      })) << resume_error;
+      EXPECT_EQ(engine.stop_calls.load(), 0);
+      continue;
+    }
+    if (scenario < 4) {
+      ASSERT_TRUE(wait_until([&] { return engine.execute_calls == 1; }));
+    }
+    if (scenario == 2) {
+      const auto full = kernel.stop(program_run_stop_request("manual.full", "run.1"));
+      ASSERT_TRUE(full.ok()) << full.error().message;
+    } else {
+      const auto selected = kernel.stop_program_selection(
+          program_selection_request("manual.selected", scenario == 5 ? "supervision" : "arm"));
+      ASSERT_TRUE(selected.ok());
+      EXPECT_EQ(selected.value().fresh_containment.has_value(), scenario != 5);
+    }
+    if (scenario >= 4) {
+      ASSERT_TRUE(engine.complete_preparation().ok());
+      ASSERT_TRUE(wait_until([&] { return engine.cancel_prepared_motion_calls.load() > 0; }));
+      EXPECT_EQ(engine.execute_calls, 0);
+    } else {
+      ASSERT_TRUE(wait_until([&] { return engine.stop_calls.load() == 1; }));
+    }
+    EXPECT_FALSE(kernel.GetAuthoringAdmission().authoring_allowed);
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     HeldManualExcludesDirectResumeOfIndependentProgramRobot) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine manual_engine;
+  FakeParticipantEngine program_engine;
+  FakeOperationJournal journal;
+  const auto arm =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto other = coordinated_occurrence(arm, "2");
+  auto direct = registration(arm, manual_engine);
+  direct.intrinsic_direct_control = true;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel({direct, registration(other, program_engine)}, clock,
+                                          scheduler, journal, config);
+  const auto parent = claim_program_execution(kernel);
+  ASSERT_TRUE(parent.ok());
+  auto capture = program_execution_capture();
+  auto table = std::make_shared<ProgramExecutionTableDTO>(*capture.table);
+  table->nodes[1] = {
+      ProgramNodeInstanceId("second_move"),
+      "kernel.operation",
+      {{other.value().target_role_id, CapabilityId("execution.trajectory.execute")}}};
+  auto binding = std::make_shared<ProgramBindingDTO>(*capture.binding);
+  auto target = binding->target_role_bindings.front();
+  target.target_role_id = other.value().target_role_id;
+  target.component_role_id = other.value().component_role_id;
+  target.controllable_component_id = other.value().controllable_component_id;
+  target.command_target_id = other.value().command_target_id;
+  binding->target_role_bindings.push_back(std::move(target));
+  capture.table = table;
+  capture.binding = binding;
+  ASSERT_TRUE(kernel.register_program_run_capture(capture).ok());
+  const CellAdmissionReadinessSnapshotDTO running{
+      true,
+      ProgramCycleStatusDTO{RequestOwnerEpoch("program.owner"), 2U, ProgramCycleStateDTO::kRunning,
+                            ProgramRunId("run.1"), parent.value().claim_generation, std::nullopt},
+      true,
+      2U,
+      2U,
+      true,
+      true,
+      0U,
+      0U,
+      0U};
+  ASSERT_TRUE(kernel.UpdateCellAdmissionReadiness(running).ok());
+  auto program = scoped_motion_operation("program.independent");
+  program.participants.front().component_role_id = other.value().component_role_id;
+  program.participants.front().target_role_id = other.value().target_role_id;
+  program.participants.front().execution_scope->node_instance_id =
+      ProgramNodeInstanceId("second_move");
+  const auto executing = kernel.execute(program);
+  ASSERT_TRUE(executing.ok()) << executing.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    return program_engine.execute_calls == 1 &&
+           program_engine.get_status().state == ExecutionState::kPlanning;
+  }));
+  program_engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
+  ASSERT_TRUE(kernel.pause(control_request("program.pause", executing.value(), 1U)).ok());
+  ASSERT_TRUE(wait_until([&] {
+    const auto state = kernel.get_operation_state(executing.value().operation_id);
+    return program_engine.pause_calls.load() == 1 &&
+           program_engine.get_status().state == ExecutionState::kStopping && state.ok() &&
+           state.value().state == OperationStateKind::kStopping;
+  }));
+  program_engine.emit_transition(ExecutionState::kStopping, ExecutionState::kPaused);
+  ASSERT_TRUE(wait_until([&] {
+    (void)kernel.reconcile_subordinate_state();
+    const auto state = kernel.get_operation_state(executing.value().operation_id);
+    return state.ok() && state.value().state == OperationStateKind::kPaused;
+  }));
+  ASSERT_TRUE(
+      kernel.stop_program_selection(program_selection_request("manual.arm.hold", "arm")).ok());
+  auto manual = motion_operation("manual.independent");
+  manual.program_run_id = ProgramRunId("manual.run");
+  const auto held = kernel.get_manual_program_handover(manual);
+  ASSERT_TRUE(held.ok()) << held.error().message;
+  ASSERT_TRUE(held.value());
+  manual.manual_handover = ManualProgramHandoverContextDTO{
+      RequestOwnerEpoch("program.owner"), ProgramRunId("run.1"), parent.value().claim_generation,
+      held.value()->selection_revision};
+  ASSERT_TRUE(kernel.execute(manual).ok());
+  const auto denied = kernel.resume(control_request("program.resume", executing.value(), 2U));
+  ASSERT_FALSE(denied.ok());
+  EXPECT_EQ(denied.error().details.at("reason"), "manual_operation_unsettled");
+  EXPECT_EQ(program_engine.prepare_resume_motion_calls.load(), 0);
+  ASSERT_TRUE(wait_until([&] {
+    return manual_engine.execute_calls == 1 &&
+           manual_engine.get_status().state == ExecutionState::kPlanning;
+  }));
+  manual_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kCompleted);
+  ASSERT_TRUE(wait_until([&] {
+    (void)kernel.reconcile_subordinate_state();
+    return kernel.reconcile_manual_operation_admission().ok() &&
+           kernel.resume(control_request("program.resume", executing.value(), 2U)).ok();
+  }));
+}
+
 TEST(ResourceAddressedExecutionKernelTest, ProgramCaptureIsClaimBoundAndCannotBeRebound) {
   FakeClock clock;
   ManualScheduler scheduler;
@@ -5650,6 +6748,14 @@ TEST(ResourceAddressedExecutionKernelTest, ProgramCaptureIsClaimBoundAndCannotBe
   stale = program_execution_capture();
   stale.claim_generation = CellAdmissionClaimGeneration(2U);
   EXPECT_FALSE(kernel.register_program_run_capture(stale).ok());
+  stale = program_execution_capture();
+  stale.binding.reset();
+  EXPECT_FALSE(kernel.register_program_run_capture(stale).ok());
+  stale = program_execution_capture();
+  auto wrong_binding = std::make_shared<ProgramBindingDTO>(*stale.binding);
+  wrong_binding->program_binding_id = ProgramBindingId(test_digest('9'));
+  stale.binding = wrong_binding;
+  EXPECT_FALSE(kernel.register_program_run_capture(stale).ok());
   EXPECT_FALSE(kernel.execute(scoped_motion_operation("before-capture")).ok());
   auto capture = program_execution_capture();
   ASSERT_TRUE(kernel.register_program_run_capture(capture).ok());
@@ -5661,6 +6767,169 @@ TEST(ResourceAddressedExecutionKernelTest, ProgramCaptureIsClaimBoundAndCannotBe
   ASSERT_FALSE(rebound.ok());
   EXPECT_EQ(rebound.error().details.at("reason"), "program_execution_capture_rebound");
   EXPECT_EQ(engine.execute_calls, 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ProgramMotionContinuationSurvivesFailedPreparationAndClearsOnCompletion) {
+  for (const auto action :
+       {RecoveryAction::kReplanFromStoppedState, RecoveryAction::kRetryMotionFromCurrentState,
+        RecoveryAction::kAcknowledgeAndContinue, RecoveryAction::kRetryAfterSceneRepair}) {
+    SCOPED_TRACE(static_cast<int>(action));
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine engine;
+    ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                  CellId("cell.test"), 16U};
+    config.manager_liveness_required_set = EmptyManagerLivenessSet();
+    ResourceAddressedExecutionKernel kernel(
+        {registration(
+            make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+            engine)},
+        clock, scheduler, default_journal, std::move(config));
+    ASSERT_TRUE(claim_program_execution(kernel).ok());
+    ASSERT_TRUE(kernel.register_program_run_capture(program_execution_capture()).ok());
+    const auto first = kernel.execute(scoped_motion_operation("continuation.first"));
+    ASSERT_TRUE(first.ok()) << first.error().message;
+    ASSERT_TRUE(engine.prepared_snapshot && engine.prepared_snapshot->participant);
+    const auto original =
+        std::get<PreparedMotionExecutionDTO>(engine.prepared_snapshot->participant->payload)
+            .plan_request.motion;
+    engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+    const auto stopped =
+        kernel.stop_program_selection(program_selection_request("continuation.stop", "arm"));
+    ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+    ASSERT_TRUE(wait_until([&] {
+      const auto scope = kernel.get_program_execution_scope(ProgramRunId("run.1"));
+      return scope.ok() && scope.value().pending_effects.empty();
+    }));
+    // Failed ordinary Resume cleared the candidate, not the last actual motion.
+    engine.prepared_snapshot->state = ResolvedPreparedMotionExecutionStateDTO::kPreparationFailed;
+    engine.prepared_snapshot->participant.reset();
+    const auto recover = [&](const OperationAcceptedDTO& operation, std::string id) {
+      const auto state = kernel.get_operation_state(operation.operation_id);
+      EXPECT_TRUE(state.ok());
+      KernelRecoveryActionRequestDTO request{id, action, "program_runner", 1U, 1U, 41U, "",
+                                             "", 0U,     "resume"};
+      engine.next_recovery_result = {id, request.action, true, {}, std::nullopt};
+      return kernel.apply_operation_recovery_action(operation.operation_id,
+                                                    state.value().operation_revision, request);
+    };
+    const auto recovered = recover(first.value(), "continuation.recover.first");
+    ASSERT_TRUE(recovered.ok()) << recovered.error().message;
+    ASSERT_TRUE(recovered.value().accepted);
+    const auto scope = kernel.get_program_execution_scope(ProgramRunId("run.1"));
+    ASSERT_TRUE(scope.ok());
+    ASSERT_TRUE(
+        kernel
+            .release_program_selection(program_selection_request("continuation.resume", "arm"),
+                                       scope.value().selection_revision)
+            .ok());
+    // The old attempt cannot replay itself under a fresh command identity.
+    const auto old_attempt = kernel.execute(scoped_motion_operation("continuation.old-attempt"));
+    ASSERT_FALSE(old_attempt.ok());
+    EXPECT_EQ(old_attempt.error().details.at("reason"), "program_motion_continuation_mismatch");
+    auto next = scoped_motion_operation("continuation.failed-prepare");
+    std::get<JointGoalDTO>(
+        std::get<MotionParticipantIntentDTO>(next.participants.front().payload).motion)
+        .positions_rad = {0.8};
+    next.participants.front().execution_scope->node_attempt_id = "move.attempt.2";
+    auto crossed_frame = next;
+    crossed_frame.request_context.request_id = RequestId("continuation.crossed-frame");
+    std::get<MotionParticipantIntentDTO>(crossed_frame.participants.front().payload)
+        .base_frame_role_id = FrameRoleId("tcp");
+    const auto crossed = kernel.execute(crossed_frame);
+    ASSERT_FALSE(crossed.ok());
+    EXPECT_EQ(crossed.error().details.at("reason"), "program_motion_continuation_mismatch");
+    engine.prepare_call_failure = ErrorDTO{"test", "failed before preparation", {}};
+    const auto failed = kernel.execute(next);
+    ASSERT_TRUE(failed.ok()) << failed.error().message;
+    const auto failed_recovery = recover(failed.value(), "continuation.recover.failed");
+    ASSERT_TRUE(failed_recovery.ok()) << failed_recovery.error().message;
+    ASSERT_TRUE(failed_recovery.value().accepted);
+    engine.prepare_call_failure.reset();
+    next.request_context.request_id = RequestId("continuation.next");
+    next.participants.front().execution_scope->node_attempt_id = "move.attempt.3";
+    const auto resumed = kernel.execute(next);
+    ASSERT_TRUE(resumed.ok()) << resumed.error().message;
+    ASSERT_TRUE(engine.last_prepared_request && engine.last_prepared_request->continuation);
+    EXPECT_EQ(engine.last_prepared_request->continuation->motion, original);
+    engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kCompleted);
+    const auto current = kernel.get_operation_state(resumed.value().operation_id);
+    ASSERT_TRUE(current.ok());
+    ASSERT_TRUE(
+        kernel
+            .acknowledge_completed(control_request("continuation.ack", resumed.value(),
+                                                   current.value().operation_revision.value()))
+            .ok());
+    ASSERT_TRUE(wait_until([&] {
+      return !kernel.get_operation_projection(resumed.value().operation_id).value().resident;
+    }));
+    next.request_context.request_id = RequestId("continuation.new-cycle-visit");
+    next.participants.front().execution_scope->node_attempt_id = "move.attempt.4";
+    ASSERT_TRUE(kernel.execute(next).ok());
+    ASSERT_TRUE(engine.last_prepared_request);
+    EXPECT_FALSE(engine.last_prepared_request->continuation);
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ProgramContinuationObservationFailureHasNoCleanupEffect) {
+  for (const bool throws : {false, true}) {
+    SCOPED_TRACE(throws);
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine engine;
+    ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                  CellId("cell.test"), 16U};
+    config.manager_liveness_required_set = EmptyManagerLivenessSet();
+    ResourceAddressedExecutionKernel kernel(
+        {registration(
+            make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+            engine)},
+        clock, scheduler, default_journal, std::move(config));
+    ASSERT_TRUE(claim_program_execution(kernel).ok());
+    ASSERT_TRUE(kernel.register_program_run_capture(program_execution_capture()).ok());
+    const auto operation = kernel.execute(scoped_motion_operation("capture.failure"));
+    ASSERT_TRUE(operation.ok());
+    engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+    const auto stop = kernel.stop(program_run_stop_request("capture.stop", "run.1"));
+    ASSERT_TRUE(stop.ok());
+    ASSERT_TRUE(wait_until([&] {
+      auto result = kernel.get_stop_status(stop.value().stop_id);
+      return result.ok() && result.value().state == StopStatusStateDTO::kSucceeded;
+    }));
+    const auto before = engine.prepared_snapshot;
+    if (throws)
+      engine.observe_prepared_motion_hook = [] { throw std::runtime_error("observer"); };
+    else
+      engine.prepared_snapshot->execution_id += 1U;
+    const auto state = kernel.get_operation_state(operation.value().operation_id);
+    ASSERT_TRUE(state.ok());
+    KernelRecoveryActionRequestDTO request{"capture.recover",
+                                           RecoveryAction::kReplanFromStoppedState,
+                                           "program_runner",
+                                           1U,
+                                           1U,
+                                           41U,
+                                           "",
+                                           "",
+                                           0U,
+                                           "resume"};
+    engine.next_recovery_result = {request.request_id, request.action, true, {}, std::nullopt};
+    const auto rejected = kernel.apply_operation_recovery_action(
+        operation.value().operation_id, state.value().operation_revision, request);
+    ASSERT_FALSE(rejected.ok());
+    EXPECT_EQ(rejected.error().code, "operation_recovery_invalid");
+    EXPECT_EQ(engine.recovery_action_calls.load(), 0);
+    EXPECT_TRUE(kernel.get_operation_projection(operation.value().operation_id).value().resident);
+    engine.observe_prepared_motion_hook = {};
+    engine.prepared_snapshot = before;
+    const auto retried = kernel.apply_operation_recovery_action(
+        operation.value().operation_id, state.value().operation_revision, request);
+    ASSERT_TRUE(retried.ok()) << retried.error().message;
+    EXPECT_TRUE(retried.value().accepted);
+    EXPECT_EQ(engine.recovery_action_calls.load(), 1);
+  }
 }
 
 TEST(ResourceAddressedExecutionKernelTest, RecoveryWaitsForSharedStopCertificateBeforeRetirement) {
@@ -6387,6 +7656,76 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(journal.calls, std::vector<std::string>{"begin"});
 }
 
+TEST(ResourceAddressedExecutionKernelTest, PreviewConflictsUsePhysicalResourcesAndEngine) {
+  for (const int scenario : {0, 1, 2}) {
+    SCOPED_TRACE(scenario);  // disjoint, same resources, shared engine
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine first_engine;
+    FakeParticipantEngine second_engine;
+    FakeOperationJournal journal;
+    const auto first =
+        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+    const auto second = scenario == 1 ? second_occurrence_sharing_first_resource(first)
+                                      : second_same_type_occurrence(first);
+    auto& preview_engine = scenario == 2 ? first_engine : second_engine;
+    ResourceAddressedExecutionKernel kernel(
+        {registration(first, first_engine), registration(second, preview_engine)}, clock, scheduler,
+        journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    const auto active = kernel.execute(motion_operation("active.arm"));
+    ASSERT_TRUE(active.ok()) << active.error().message;
+    auto preview = motion_operation("preview.other");
+    preview.program_binding_id = second.value().program_binding_id;
+    preview.participants.front().component_role_id = second.value().component_role_id;
+    preview.participants.front().target_role_id = second.value().target_role_id;
+    auto session = kernel.begin_motion_preview_session(preview);
+    ASSERT_EQ(session.ok(), scenario == 0) << (session.ok() ? "" : session.error().message);
+    if (session.ok()) {
+      EXPECT_TRUE(session.value()->prepare_motion(preview).ok());
+    } else {
+      EXPECT_EQ(session.error().details.at("reason"), "motion_preview_operation_busy");
+    }
+    EXPECT_EQ(second_engine.execute_calls, 0);
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest, HeldManualPreviewRechecksContextBetweenLinkedLegs) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  auto direct = registration(
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+  direct.intrinsic_direct_control = true;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel({direct}, clock, scheduler, journal, config);
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  const auto capture = program_execution_capture();
+  ASSERT_TRUE(kernel.register_program_run_capture(capture).ok());
+  auto manual = motion_operation("manual.preview");
+  manual.program_run_id = ProgramRunId("manual.run");
+  EXPECT_FALSE(kernel.begin_motion_preview_session(manual).ok());
+  ASSERT_TRUE(kernel.stop_program_selection(program_selection_request("held", "arm")).ok());
+  EXPECT_FALSE(kernel.begin_motion_preview_session(manual).ok());  // context required
+  const auto held = kernel.get_manual_program_handover(manual);
+  ASSERT_TRUE(held.ok());
+  ASSERT_TRUE(held.value());
+  manual.manual_handover =
+      ManualProgramHandoverContextDTO{capture.program_runner_owner_epoch, capture.program_run_id,
+                                      capture.claim_generation, held.value()->selection_revision};
+  auto session = kernel.begin_motion_preview_session(manual);
+  ASSERT_TRUE(session.ok()) << session.error().message;
+  EXPECT_TRUE(session.value()->prepare_motion(manual).ok());
+  ASSERT_TRUE(kernel.stop_program_selection(program_selection_request("new.stop", "arm")).ok());
+  const auto stale = session.value()->prepare_motion(manual);
+  ASSERT_FALSE(stale.ok());
+  EXPECT_EQ(stale.error().details.at("reason"), "manual_handover_scope_stale");
+  EXPECT_EQ(engine.execute_calls, 0);
+  EXPECT_EQ(engine.prepare_motion_calls, 0);
+}
+
 TEST(ResourceAddressedExecutionKernelTest,
      PreviewSessionAllowsMotionSpecificPlannerProvidersOnOnePinnedParticipant) {
   FakeClock clock;
@@ -6431,6 +7770,60 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(engine.preview_calls, 0);
 }
 
+TEST(ResourceAddressedExecutionKernelTest,
+     OrdinaryJerkPolicyIsSharedByProgramManualPreviewAndExecution) {
+  for (const bool manual : {false, true}) {
+    for (const std::optional<double> requested : {std::optional<double>{}, {5.0}, {11.0}}) {
+      SCOPED_TRACE(manual);
+      SCOPED_TRACE(requested.value_or(-1.0));
+      FakeClock clock;
+      ManualScheduler scheduler;
+      FakeParticipantEngine engine;
+      FakeOperationJournal journal;
+      auto target = registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine);
+      target.intrinsic_direct_control = manual;
+      OrdinaryMotionJerkPolicy profile{true, false, {}};
+      for (const auto& resource : target.binding.value().resources)
+        profile.limits.emplace(*resource.source_joint_name, AngularJerkDTO{10.0});
+      auto policy =
+          apply_deployment_motion_jerk_policy(*target.runtime_policy, target.binding, profile);
+      ASSERT_TRUE(policy.ok());
+      target.runtime_policy = std::move(policy.value());
+      ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                    CellId("cell.test"), 8U};
+      config.manager_liveness_required_set = EmptyManagerLivenessSet();
+      ResourceAddressedExecutionKernel kernel({target}, clock, scheduler, journal, config);
+      ASSERT_TRUE(ready_cell_admission(kernel).ok());
+      auto intent = motion_operation("request.ordinary.jerk");
+      auto& motion = std::get<MotionParticipantIntentDTO>(intent.participants.front().payload);
+      motion.per_joint_dynamics_limits.clear();
+      if (requested) motion.per_joint_dynamics_limits["joint_1"].max_jerk_rad_s3 = *requested;
+      auto session = kernel.begin_motion_preview_session(intent);
+      ASSERT_TRUE(session.ok()) << session.error().message;
+      const auto preview = session.value()->prepare_motion(intent);
+      session.value().reset();
+      const auto execution = kernel.execute(intent);
+      if (requested && *requested > 10.0) {
+        EXPECT_FALSE(preview.ok());
+        EXPECT_FALSE(execution.ok());
+        EXPECT_EQ(engine.execute_calls, 0);
+        continue;
+      }
+      ASSERT_TRUE(preview.ok()) << preview.error().message;
+      ASSERT_TRUE(execution.ok()) << execution.error().message;
+      ASSERT_TRUE(engine.last_execute);
+      EXPECT_EQ(preview.value().per_resource_dynamics_limits,
+                engine.last_execute->per_resource_dynamics_limits);
+      ASSERT_EQ(preview.value().per_resource_dynamics_limits.size(),
+                target.binding.value().resources.size());
+      for (const auto& row : preview.value().per_resource_dynamics_limits)
+        EXPECT_LE(*row.limit.max_jerk_rad_s3, 10.0);
+    }
+  }
+}
+
 TEST(ResourceAddressedExecutionKernelTest, ManualCeilingsApplyAtBothPreviewAndExecutionBoundaries) {
   for (const bool manual : {false, true}) {
     for (const std::optional<double> requested : {std::optional<double>{}, {0.2}, {9.0}}) {
@@ -6441,26 +7834,30 @@ TEST(ResourceAddressedExecutionKernelTest, ManualCeilingsApplyAtBothPreviewAndEx
       FakeParticipantEngine engine;
       FakeOperationJournal journal;
       auto target = registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine);
       target.intrinsic_direct_control = manual;
       target.direct_control_joint_limits = {{"joint_1", {0.7, 1.2, std::nullopt}}};
-      ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U};
+      ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                    CellId("cell.test"), 8U};
       config.manager_liveness_required_set = EmptyManagerLivenessSet();
       ResourceAddressedExecutionKernel kernel({target}, clock, scheduler, journal, config);
       ASSERT_TRUE(ready_cell_admission(kernel).ok());
       auto intent = motion_operation("request.manual.caps");
       auto& motion = std::get<MotionParticipantIntentDTO>(intent.participants.front().payload);
       motion.per_joint_dynamics_limits.clear();
-      if (requested.has_value()) motion.per_joint_dynamics_limits["joint_1"] = {*requested, *requested, std::nullopt};
+      if (requested.has_value())
+        motion.per_joint_dynamics_limits["joint_1"] = {*requested, *requested, std::nullopt};
       auto session = kernel.begin_motion_preview_session(intent);
       ASSERT_TRUE(session.ok()) << session.error().message;
       const auto prepared = session.value()->prepare_motion(intent);
       ASSERT_TRUE(prepared.ok()) << prepared.error().message;
-      session.value().reset(); // Release preview's submission lock before execution.
+      session.value().reset();  // Release preview's submission lock before execution.
       const auto accepted = kernel.execute(intent);
       ASSERT_TRUE(accepted.ok()) << accepted.error().message;
       ASSERT_TRUE(engine.last_execute.has_value());
-      EXPECT_EQ(engine.last_execute->per_resource_dynamics_limits, prepared.value().per_resource_dynamics_limits);
+      EXPECT_EQ(engine.last_execute->per_resource_dynamics_limits,
+                prepared.value().per_resource_dynamics_limits);
       const auto& caps = prepared.value().per_resource_dynamics_limits;
       if (!manual && !requested.has_value()) {
         EXPECT_TRUE(caps.empty());
@@ -7399,6 +8796,31 @@ TEST(ResourceAddressedExecutionKernelTest, CapabilityCommandPreviewRejectsBusyTa
   EXPECT_EQ(engine.execute_calls, 0);
   EXPECT_EQ(journal.calls, (std::vector<std::string>{"begin"}));
   EXPECT_EQ(kernel.resource_snapshot().front().state, ResourceSlotState::kFree);
+}
+
+TEST(ResourceAddressedExecutionKernelTest, CapabilityPreviewAllowsIndependentActiveArm) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine arm;
+  FakeParticipantEngine gripper;
+  gripper.gripper_status.state = GripperCommandState::kIdle;
+  FakeOperationJournal journal;
+  const ProgramCommandSchemaRefDTO schema{
+      CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+           arm),
+       registration(make_binding("gripper", "gripper.target", "tool.gripper.command",
+                                 CoordinateKind::kLinear, schema),
+                    gripper)},
+      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  ASSERT_TRUE(kernel.execute(motion_operation("active.arm")).ok());
+  const auto preview = kernel.preview_capability_command(command_operation("preview.gripper"));
+  ASSERT_TRUE(preview.ok()) << preview.error().message;
+  EXPECT_EQ(gripper.validate_command_calls, 1);
+  EXPECT_EQ(gripper.command_calls, 0);
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -9310,6 +10732,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto executed =
       kernel.execute(coordinated_motion_operation("request.control.coordinated.motion"));
   ASSERT_TRUE(executed.ok()) << executed.error().message;
+  const auto initial_timing = first_engine.last_prepared_request->common_timing;
   first_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
   second_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
 
@@ -9348,6 +10771,10 @@ TEST(ResourceAddressedExecutionKernelTest,
     return first_engine.dispatch_prepared_resume_motion_calls == 1 &&
            second_engine.dispatch_prepared_resume_motion_calls == 1 && resume_returns.load() == 2;
   }));
+  EXPECT_NE(first_engine.last_prepared_request->common_timing, initial_timing);
+  EXPECT_NE(first_engine.last_prepared_request->common_timing, nullptr);
+  EXPECT_EQ(first_engine.last_prepared_request->common_timing,
+            second_engine.last_prepared_request->common_timing);
   first_engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
   second_engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
 
@@ -9372,6 +10799,52 @@ TEST(ResourceAddressedExecutionKernelTest,
     return slot.owner.has_value() && slot.owner->operation_revision == OperationRevision(4U) &&
            slot.state == ResourceSlotState::kTerminal;
   }));
+}
+
+TEST(ResourceAddressedExecutionKernelTest, CoordinatedResumeCannotDispatchAnIndependentTimeLaw) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine first_engine, second_engine;
+  std::atomic<int> pause_returns{};
+  first_engine.pause_return_hook = [&] { ++pause_returns; };
+  second_engine.pause_return_hook = [&] { ++pause_returns; };
+  const auto first =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  ResourceAddressedExecutionKernel kernel(
+      {registration(first, first_engine),
+       registration(coordinated_occurrence(first, "2"), second_engine)},
+      clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  const auto executed =
+      kernel.execute(coordinated_motion_operation("request.resume.time-law.motion"));
+  ASSERT_TRUE(executed.ok()) << executed.error().message;
+  first_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  second_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  ASSERT_TRUE(
+      kernel.pause(control_request("request.resume.time-law.pause", executed.value(), 1U)).ok());
+  ASSERT_TRUE(wait_until([&] { return pause_returns.load() == 2; }));
+  first_engine.emit_transition(ExecutionState::kStopping, ExecutionState::kPaused);
+  second_engine.emit_transition(ExecutionState::kStopping, ExecutionState::kPaused);
+  // A freshly planned Resume must pass the same timing gate as initial motion.
+  // One independently bounded participant is enough to invalidate the group.
+  first_engine.prepare_bounded_time_law = true;
+  ASSERT_TRUE(wait_until([&] {
+    return kernel.resume(control_request("request.resume.time-law.resume", executed.value(), 2U))
+        .ok();
+  }));
+  ASSERT_TRUE(wait_until([&] {
+    const auto state = kernel.get_operation_state(executed.value().operation_id);
+    return state.ok() && state.value().state == OperationStateKind::kInterventionRequired;
+  }));
+  EXPECT_EQ(first_engine.dispatch_prepared_resume_motion_calls, 0);
+  EXPECT_EQ(second_engine.dispatch_prepared_resume_motion_calls, 0);
+  const auto state = kernel.get_operation_state(executed.value().operation_id);
+  ASSERT_TRUE(state.ok());
+  EXPECT_TRUE(std::any_of(
+      state.value().participants.begin(), state.value().participants.end(), [](const auto& row) {
+        return row.terminal_error && row.terminal_error->details.at("reason") ==
+                                         "coordinated_time_law_preparation_not_qualified";
+      }));
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -9562,6 +11035,36 @@ TEST(ResourceAddressedExecutionKernelTest,
     return status.ok() && status.value().state == StopStatusStateDTO::kSucceeded;
   }));
   EXPECT_EQ(engine.pause_calls.load(), 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest, DelayedMotionCallbackCannotRegressCurrentPausedState) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  const auto executed = kernel.execute(motion_operation("callback.order"));
+  ASSERT_TRUE(executed.ok());
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  engine.emit_transition(ExecutionState::kStopping, ExecutionState::kPaused);
+  ASSERT_EQ(kernel.get_operation_state(executed.value().operation_id).value().state,
+            OperationStateKind::kPaused);
+  // Dispatch may snapshot callbacks on two threads. The earlier transition
+  // can arrive after Paused even though the subordinate already reports rest.
+  const KernelEvent delayed{KernelEventType::kStateTransition,
+                            engine.next_execution_id,
+                            0,
+                            ExecutionState::kExecuting,
+                            ExecutionState::kStopping,
+                            {},
+                            {}};
+  engine.deliver_event(delayed);
+  EXPECT_EQ(kernel.get_operation_state(executed.value().operation_id).value().state,
+            OperationStateKind::kPaused);
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -10365,7 +11868,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   ResourceAddressedExecutionKernel kernel(
       {registration(
           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
-          engine)},
+          engine, true)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
   const auto executed = kernel.execute(motion_operation());
@@ -10384,7 +11887,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(state.ok());
   EXPECT_EQ(engine.translate_stop_stage_calls.load(), 2);
   ASSERT_TRUE(engine.last_stop_stage.has_value());
-  EXPECT_EQ(engine.last_stop_stage->stage_index, 1U);
+  EXPECT_EQ(engine.last_stop_stage->stage_index, 2U);
   EXPECT_TRUE(engine.last_stop_stage->capability_provider_binding_id.has_value());
   EXPECT_EQ(engine.last_stop_stage->participant_stop_plan.stage_commands.front()
                 .resolved_stage.containment_command.command_kind,
@@ -10396,57 +11899,169 @@ TEST(ResourceAddressedExecutionKernelTest,
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
-     BlockedNominalStageCannotDelayPreparedStrongerStageWatchdog) {
-  FakeClock clock;
-  ManualScheduler scheduler;
-  FakeParticipantEngine engine;
-  std::promise<void> nominal_entered_promise;
-  auto nominal_entered = nominal_entered_promise.get_future();
-  std::promise<void> release_nominal_promise;
-  const auto release_nominal = release_nominal_promise.get_future().share();
-  std::atomic<std::size_t> calls{};
-  engine.translate_stop_stage_hook = [&] {
-    if (calls.fetch_add(1U) == 0U) {
-      nominal_entered_promise.set_value();
-      release_nominal.wait();
+     CompletedNominalResultAtOrAfterItsDeadlineCannotSuppressEscalation) {
+  // The completion receiver reads the clock while holding the Kernel lock,
+  // after the bounded executor has stored its result. Advance there so the
+  // test cannot accidentally pass through a pending-result watchdog race.
+  class CompletionClock final : public IClock {
+   public:
+    void AdvanceAtNextCallerRead(TimePoint value) {
+      caller_ = std::this_thread::get_id();
+      completion_time_ = value;
+      armed_.store(true, std::memory_order_release);
     }
-  };
-  ResourceAddressedExecutionKernel kernel(
-      {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
-          engine)},
-      clock, scheduler, default_journal,
-      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
-  const auto operation = kernel.execute(motion_operation("request.blocked-stage.execute"));
-  ASSERT_TRUE(operation.ok()) << operation.error().message;
-  const auto stopped =
-      kernel.stop(stop_request("request.blocked-stage.stop", operation.value(), 1U));
-  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
-  const auto entered = nominal_entered.wait_for(std::chrono::seconds(10));
-  if (entered != std::future_status::ready) {
-    release_nominal_promise.set_value();
-    FAIL() << "nominal Stop stage did not reach its injected blocking seam";
-  }
+    TimePoint now() const override {
+      if (armed_.load(std::memory_order_acquire) && caller_ == std::this_thread::get_id() &&
+          armed_.exchange(false)) {
+        current_.store(completion_time_, std::memory_order_release);
+      }
+      return current_.load(std::memory_order_acquire);
+    }
 
-  // The nominal stage's evidence deadline is two seconds in the retained
-  // fixture. The StopControl watchdog observes the owner clock and advances
-  // to the already-prepared software-hard stage without waiting for the
-  // blocked nominal provider lane to return.
-  clock.advance(2'100'000'000);
-  const bool stronger_dispatched = wait_until(
-      [&] { return engine.translate_stop_stage_calls.load() >= 2; }, std::chrono::seconds(4));
-  release_nominal_promise.set_value();
-  ASSERT_TRUE(stronger_dispatched)
-      << "blocked nominal provider delayed the stronger prepared stage";
-  ASSERT_TRUE(wait_until([&] {
-    const auto status = kernel.get_stop_status(stopped.value().stop_id);
-    return status.ok() && status.value().stop_certificate.has_value();
-  }));
-  const auto latch = kernel.get_stop_fault_latch();
-  ASSERT_TRUE(latch.has_value());
-  EXPECT_TRUE(latch->trigger == StopFaultTriggerDTO::kEscalated ||
-              latch->trigger == StopFaultTriggerDTO::kFailedUncontained ||
-              latch->trigger == StopFaultTriggerDTO::kPartial);
+   private:
+    std::thread::id caller_;
+    TimePoint completion_time_{};
+    mutable std::atomic_bool armed_{};
+    mutable std::atomic<TimePoint> current_{};
+  };
+  for (const TimePoint relative_to_deadline : {-1, 0, 1}) {
+    SCOPED_TRACE(relative_to_deadline);
+    CompletionClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine engine;
+    FakeOperationJournal journal;
+    std::atomic<unsigned> calls{};
+    engine.translate_stop_stage_hook = [&] {
+      if (calls.fetch_add(1U) == 0U)
+        clock.AdvanceAtNextCallerRead(2'000'000'000 + relative_to_deadline);
+    };
+    ResourceAddressedExecutionKernel kernel(
+        {registration(
+            make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+            engine)},
+        clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    const auto operation = kernel.execute(motion_operation("request.deadline-result.execute"));
+    ASSERT_TRUE(operation.ok()) << operation.error().message;
+    const auto stopped =
+        kernel.stop(stop_request("request.deadline-result.stop", operation.value(), 1U));
+    ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+    ASSERT_TRUE(wait_until([&] {
+      const auto status = kernel.get_stop_status(stopped.value().stop_id);
+      return status.ok() && status.value().stop_certificate.has_value();
+    }));
+    const auto status = kernel.get_stop_status(stopped.value().stop_id).value();
+    const bool expired = relative_to_deadline >= 0;
+    EXPECT_EQ(engine.translate_stop_stage_calls.load(), expired ? 2 : 1);
+    const auto certificate =
+        kernel.get_stop_certificate(status.stop_certificate->stop_certificate_id);
+    ASSERT_TRUE(certificate.ok());
+    EXPECT_EQ(certificate.value().result, expired ? StopCertificateResultDTO::kSucceededEscalated
+                                                  : StopCertificateResultDTO::kSucceededNominal)
+        << (certificate.value().terminal_error ? certificate.value().terminal_error->message
+                                               : "no terminal diagnostic");
+    ASSERT_FALSE(status.attempted_stage_results.empty());
+    EXPECT_EQ(status.attempted_stage_results.front().authority,
+              expired ? StopStageResultAuthorityDTO::kSupersededLate
+                      : StopStageResultAuthorityDTO::kAuthoritative);
+    EXPECT_EQ(kernel.get_stop_fault_latch().has_value(), expired);
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     BlockedNominalStageCannotDelayPreparedStrongerStageWatchdog) {
+  for (const auto& [timeout, intermediate] :
+       {std::pair{false, false}, {true, false}, {false, true}, {true, true}}) {
+    SCOPED_TRACE(timeout ? "timeout" : "immediate failure");
+    SCOPED_TRACE(intermediate ? "three-stage chain" : "two-stage chain");
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine engine;
+    FakeParticipantEngine unaffected_engine;
+    const auto binding =
+        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+    const auto unaffected_binding = second_same_type_occurrence(binding);
+    ResourceAddressedExecutionKernel kernel(
+        {registration(binding, engine, intermediate),
+         registration(unaffected_binding, unaffected_engine)},
+        clock, scheduler, default_journal,
+        {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    // Release both seams before destroying the Kernel, including assertion failures.
+    HeldSettlementCall nominal, strongest;
+    std::atomic<std::size_t> calls{};
+    if (!timeout)
+      engine.next_stop_result = StopResultDTO{
+          false, ErrorDTO{"controller_stop_rejected", "controller rejected Stop", {}}};
+    engine.translate_stop_stage_hook = [&] {
+      if (calls.fetch_add(1U) == 0U) {
+        if (timeout) nominal.Hold();
+      } else {
+        strongest.Hold();
+      }
+    };
+    const auto operation = kernel.execute(motion_operation("request.blocked-stage.execute"));
+    ASSERT_TRUE(operation.ok()) << operation.error().message;
+    const auto stopped =
+        kernel.stop(stop_request("request.blocked-stage.stop", operation.value(), 1U));
+    ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+    // The nominal stage's evidence deadline is two seconds in the retained
+    // fixture. The StopControl watchdog observes the owner clock and advances
+    // to the already-prepared software-hard stage without waiting for the
+    // blocked nominal provider lane to return.
+    if (timeout) {
+      ASSERT_TRUE(nominal.Entered());
+      clock.advance(2'100'000'000);
+      ASSERT_TRUE(wait_until([&] { return engine.translate_stop_stage_calls.load() >= 2; },
+                             std::chrono::seconds(4)));
+    }
+    ASSERT_TRUE(strongest.Entered())
+        << "blocked nominal provider delayed the stronger prepared stage";
+    ASSERT_TRUE(engine.last_stop_stage.has_value());
+    EXPECT_EQ(engine.last_stop_stage->stage_index, intermediate ? 2U : 1U);
+    EXPECT_EQ(engine.last_stop_stage->participant_stop_plan.stage_commands.back()
+                  .resolved_stage.stage_kind,
+              StopEscalationStageKind::kSoftwareHard);
+    EXPECT_EQ(engine.last_stop_stage->participant_stop_plan.deadline_budget.outer_duration_ns,
+              5'000'000'000);
+    EXPECT_EQ(engine.translate_stop_stage_calls.load(), 2);
+    const auto pending = kernel.get_stop_status(stopped.value().stop_id);
+    ASSERT_TRUE(pending.ok());
+    EXPECT_FALSE(pending.value().stop_certificate.has_value());
+    const auto early_latch = kernel.get_stop_fault_latch();
+    ASSERT_TRUE(early_latch.has_value());
+    EXPECT_FALSE(early_latch->stop_certificate.has_value());
+    EXPECT_EQ(early_latch->trigger, StopFaultTriggerDTO::kEscalated);
+    EXPECT_EQ(pending.value().fault_latch, early_latch);
+    EXPECT_TRUE(kernel.cell_stop_action_projection().fault.has_value());
+    const auto offer = kernel.get_stop_fault_recovery_offer();
+    ASSERT_TRUE(offer.ok());
+    ASSERT_TRUE(offer.value().has_value());
+    EXPECT_EQ(offer.value()->latch, *early_latch);
+    EXPECT_TRUE(offer.value()->configuration_expectations.empty());
+    EXPECT_FALSE(stop_fault_recovery_offer_field_error(*offer.value()).has_value());
+    auto forged_ready = *offer.value();
+    forged_ready.latch.recovery_status = StopFaultRecoveryStatusDTO::kReady;
+    EXPECT_TRUE(stop_fault_recovery_offer_field_error(forged_ready).has_value());
+    auto blocked_intent = motion_operation("request.blocked-stage.unaffected");
+    blocked_intent.program_binding_id = unaffected_binding.value().program_binding_id;
+    const auto blocked = kernel.execute(blocked_intent);
+    ASSERT_FALSE(blocked.ok());
+    EXPECT_EQ(blocked.error().details.at("reason"), "motion_admission_closed");
+    // The rejected nominal call has returned before the strongest lane starts.
+    if (!timeout) engine.next_stop_result = StopResultDTO{true, std::nullopt};
+    strongest.Release();
+    nominal.Release();
+    ASSERT_TRUE(wait_until([&] {
+      const auto status = kernel.get_stop_status(stopped.value().stop_id);
+      return status.ok() && status.value().stop_certificate.has_value();
+    }));
+    const auto latch = kernel.get_stop_fault_latch();
+    ASSERT_TRUE(latch.has_value());
+    EXPECT_EQ(latch->latch_id, early_latch->latch_id);
+    EXPECT_EQ(latch->latch_generation, early_latch->latch_generation);
+    EXPECT_TRUE(latch->stop_certificate.has_value());
+    EXPECT_EQ(latch->trigger, StopFaultTriggerDTO::kEscalated);
+    EXPECT_EQ(latch->state, StopFaultLatchStateDTO::kLatched);
+  }
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -10492,6 +12107,82 @@ TEST(ResourceAddressedExecutionKernelTest,
                journal.stop_acceptance_calls.load() == 2;
       },
       std::chrono::seconds(10)));
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     PendingCellStopFaultPreventsDisjointPrepareAndResumeDispatch) {
+  // Cover a new prepared move, a fresh Resume and a Resume already preparing.
+  for (const int mode : {0, 1, 2}) {
+    SCOPED_TRACE(mode);
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine first_engine, second_engine;
+    FakeOperationJournal journal;
+    const auto first_binding =
+        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+    const auto second_binding = second_same_type_occurrence(first_binding);
+    ResourceAddressedExecutionKernel kernel(
+        {registration(first_binding, first_engine), registration(second_binding, second_engine)},
+        clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
+    HeldSettlementCall strongest;
+    const auto first = kernel.execute(motion_operation("request.fault-gate.first"));
+    ASSERT_TRUE(first.ok());
+    second_engine.defer_prepare_completion = mode == 0;
+    auto intent = motion_operation("request.fault-gate.second");
+    intent.program_binding_id = second_binding.value().program_binding_id;
+    const auto second = kernel.execute(intent);
+    ASSERT_TRUE(second.ok());
+    if (mode != 0) {
+      second_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+      ASSERT_TRUE(
+          kernel.pause(control_request("request.fault-gate.pause", second.value(), 1U)).ok());
+      ASSERT_TRUE(wait_until([&] {
+        const auto state = kernel.get_operation_state(second.value().operation_id);
+        return second_engine.pause_calls.load() == 1 && state.ok() &&
+               state.value().state == OperationStateKind::kStopping;
+      }));
+      second_engine.emit_transition(ExecutionState::kStopping, ExecutionState::kPaused);
+      ASSERT_TRUE(wait_until([&] {
+        const auto state = kernel.get_operation_state(second.value().operation_id);
+        return state.ok() && state.value().state == OperationStateKind::kPaused;
+      }));
+      if (mode == 2) {
+        second_engine.defer_resume_prepare_completion = true;
+        ASSERT_TRUE(wait_until([&] {
+          return kernel.resume(control_request("request.fault-gate.resume", second.value(), 2U))
+              .ok();
+        }));
+        ASSERT_TRUE(
+            wait_until([&] { return second_engine.prepare_resume_motion_calls.load() == 1; }));
+      }
+    }
+    first_engine.next_stop_result =
+        StopResultDTO{false, ErrorDTO{"controller_stop_rejected", "controller rejected Stop", {}}};
+    std::atomic<unsigned> calls{};
+    first_engine.translate_stop_stage_hook = [&] {
+      if (calls.fetch_add(1) > 0) strongest.Hold();
+    };
+    ASSERT_TRUE(kernel.stop(stop_request("request.fault-gate.stop", first.value(), 1U)).ok());
+    ASSERT_TRUE(strongest.Entered());
+    ASSERT_TRUE(kernel.get_stop_fault_latch().has_value());
+    if (mode == 1) {
+      const auto resumed =
+          kernel.resume(control_request("request.fault-gate.resume", second.value(), 2U));
+      ASSERT_FALSE(resumed.ok());
+      EXPECT_EQ(resumed.error().details.at("reason"), "motion_admission_closed");
+    } else {
+      ASSERT_TRUE(second_engine.complete_preparation().ok());
+      ASSERT_TRUE(wait_until([&] {
+        return mode == 0 ? second_engine.cancel_prepared_motion_calls.load() > 0
+                         : second_engine.cancel_prepared_resume_motion_calls.load() > 0;
+      }));
+    }
+    EXPECT_EQ(second_engine.dispatch_prepared_motion_calls.load(), mode == 0 ? 0 : 1);
+    EXPECT_EQ(second_engine.dispatch_prepared_resume_motion_calls.load(), 0);
+    EXPECT_EQ(second_engine.resume_calls.load(), 0);
+    first_engine.next_stop_result = StopResultDTO{true, std::nullopt};
+    strongest.Release();
+  }
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -11416,7 +13107,8 @@ TEST(ResourceAddressedExecutionKernelTest,
             ResourceSlotState::kUnreconciledExternalOrOrphanGoal);
 }
 
-void VerifyStopFaultRecoveryMotionAdmission(const bool latch_manager_liveness_loss) {
+void VerifyStopFaultRecoveryMotionAdmission(const bool latch_manager_liveness_loss,
+                                            const bool concurrent_fault_during_clear = false) {
   FakeClock clock;
   ManualScheduler scheduler;
   clock.set(100);
@@ -11505,6 +13197,22 @@ void VerifyStopFaultRecoveryMotionAdmission(const bool latch_manager_liveness_lo
                                           clock, scheduler, journal, std::move(config));
   const auto operation = kernel.execute(motion_operation("request.surveillance.execute"));
   ASSERT_TRUE(operation.ok()) << operation.error().message;
+  HeldSettlementCall concurrent_strongest;
+  std::optional<OperationAcceptedDTO> concurrent_operation;
+  std::optional<StopAcceptedDTO> concurrent_stop;
+  std::atomic<unsigned> concurrent_calls{};
+  if (concurrent_fault_during_clear) {
+    auto intent = motion_operation("request.surveillance.concurrent");
+    intent.program_binding_id = unaffected_binding.value().program_binding_id;
+    const auto admitted = kernel.execute(intent);
+    ASSERT_TRUE(admitted.ok());
+    concurrent_operation = admitted.value();
+    unaffected_engine.next_stop_result =
+        StopResultDTO{false, ErrorDTO{"controller_stop_rejected", "controller rejected Stop", {}}};
+    unaffected_engine.translate_stop_stage_hook = [&] {
+      if (concurrent_calls.fetch_add(1U) > 0U) concurrent_strongest.Hold();
+    };
+  }
   std::optional<StopAcceptedDTO> stopped;
   if (latch_manager_liveness_loss) {
     kernel.LatchAndContain(ManagerLivenessLossIntentDTO{
@@ -11656,7 +13364,17 @@ void VerifyStopFaultRecoveryMotionAdmission(const bool latch_manager_liveness_lo
   ASSERT_FALSE(failed_clear.ok());
   EXPECT_EQ(kernel.get_stop_fault_latch(), current);
 
+  if (concurrent_fault_during_clear) {
+    journal.stop_fault_clear_hook = [&] {
+      const auto result = kernel.stop(
+          stop_request("request.surveillance.concurrent.stop", *concurrent_operation, 1U));
+      ASSERT_TRUE(result.ok());
+      concurrent_stop = result.value();
+      ASSERT_TRUE(concurrent_strongest.Entered());
+    };
+  }
   const auto cleared = kernel.recover_stop_fault(clear_intent);
+  journal.stop_fault_clear_hook = {};
   ASSERT_TRUE(cleared.ok()) << cleared.error().message;
   EXPECT_TRUE(cleared.value().accepted);
   EXPECT_EQ(cleared.value().latch.state, StopFaultLatchStateDTO::kCleared);
@@ -11665,6 +13383,26 @@ void VerifyStopFaultRecoveryMotionAdmission(const bool latch_manager_liveness_lo
   ASSERT_TRUE(clear_replay.ok()) << clear_replay.error().message;
   EXPECT_EQ(clear_replay.value().replay_status, RequestReplayStatusDTO::kReplayedExact);
   EXPECT_EQ(journal.stop_fault_clear_calls.load(), 2);
+  if (concurrent_fault_during_clear) {
+    ASSERT_TRUE(concurrent_stop.has_value());
+    const auto pending = kernel.get_stop_fault_latch();
+    ASSERT_TRUE(pending.has_value());
+    EXPECT_EQ(pending->stop_id, concurrent_stop->stop_id);
+    EXPECT_FALSE(pending->stop_certificate.has_value());
+    EXPECT_NE(pending->latch_id, cleared.value().latch.latch_id);
+    const auto blocked = kernel.execute(motion_operation("request.surveillance.still-blocked"));
+    ASSERT_FALSE(blocked.ok());
+    EXPECT_EQ(blocked.error().details.at("reason"), "motion_admission_closed");
+    unaffected_engine.next_stop_result = StopResultDTO{true, std::nullopt};
+    concurrent_strongest.Release();
+    ASSERT_TRUE(wait_until([&] {
+      const auto status = kernel.get_stop_status(concurrent_stop->stop_id);
+      return status.ok() && status.value().stop_certificate.has_value();
+    }));
+    EXPECT_EQ(kernel.get_stop_fault_latch()->latch_id, pending->latch_id);
+    EXPECT_TRUE(kernel.cell_stop_action_projection().fault.has_value());
+    return;
+  }
   const auto cleared_offer = kernel.get_stop_fault_recovery_offer();
   ASSERT_TRUE(cleared_offer.ok()) << cleared_offer.error().message;
   EXPECT_FALSE(cleared_offer.value().has_value());
@@ -11715,6 +13453,11 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      ManagerLossInhibitSurvivesOtherwiseValidStopFaultRecovery) {
   VerifyStopFaultRecoveryMotionAdmission(true);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     DurableClearOfOlderStopFaultCannotReopenWhileNewerFaultIsStillContaining) {
+  VerifyStopFaultRecoveryMotionAdmission(false, true);
 }
 
 TEST(ResourceAddressedExecutionKernelTest,

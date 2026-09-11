@@ -4,6 +4,9 @@
 #include <gtest/gtest.h>
 
 #include <manyforge_core/time/fake_clock.hpp>
+#include <manyforge_core/detail/coordinated_execution_clock.hpp>
+#include <manyforge_core/time/manual_scheduler.hpp>
+#include <manyforge_core/trajectory/trajectory_sampler.hpp>
 #include <manyforge_roboplan/native_runtime_support.hpp>
 
 #include <algorithm>
@@ -226,7 +229,8 @@ private:
       core::ContentDigest("scope.digest")};
 }
 
-[[nodiscard]] core::ResolvedParticipantStopStageDTO controlled_stage_fixture() {
+[[nodiscard]] core::ResolvedParticipantStopStageDTO
+controlled_stage_fixture(double jerk_limit = 1'000'000.0) {
   auto stage = direct_stage_fixture();
   auto &plan = stage.participant_stop_plan;
   auto &prepared = plan.stage_commands.front();
@@ -248,6 +252,11 @@ private:
              {"coordinate_kind", core::JsonValueDTO{"angular_rad_s2"}},
              {"value_rad_s2", core::JsonValueDTO{4.0}},
          }}},
+        {"max_jerk",
+         core::JsonValueDTO{core::JsonObjectDTO{
+             {"coordinate_kind", core::JsonValueDTO{"angular_rad_s3"}},
+             {"value_rad_s3", core::JsonValueDTO{jerk_limit}},
+         }}},
         {"settle_velocity_threshold",
          core::JsonValueDTO{core::JsonObjectDTO{
              {"coordinate_kind", core::JsonValueDTO{"angular_rad_s"}},
@@ -257,6 +266,7 @@ private:
   }
   core::JsonObjectDTO parameters{
       {"stop_mode", core::JsonValueDTO{"soft_on_path"}},
+      {"jerk_limits_enabled", core::JsonValueDTO{true}},
       {"deceleration_time_s", core::JsonValueDTO{1.0}},
       {"per_resource_limits", core::JsonValueDTO{std::move(limits)}},
       {"allow_natural_completion_on_short_path", core::JsonValueDTO{true}},
@@ -310,14 +320,205 @@ remaining_budget(const core::ResolvedParticipantStopStageDTO &stage) {
   return budget;
 }
 
+[[nodiscard]] core::ResolvedParticipantStopStageDTO
+software_hard_stage_fixture() {
+  auto stage = controlled_stage_fixture();
+  auto hard = stage.participant_stop_plan.stage_commands.front();
+  auto &command = hard.resolved_stage;
+  const core::ProviderContractRefDTO contract{
+      core::ProviderContractRoleId("software_hard_stop"),
+      core::SchemaId(std::string(detail::kNativeSoftwareHardContractSchemaId)),
+      core::SchemaRevision(
+          std::string(detail::kNativeSoftwareHardContractSchemaRevision))};
+  command.stage_index = 1U;
+  command.stop_escalation_stage_id =
+      core::StopEscalationStageId("software_hard");
+  command.stage_kind = core::StopEscalationStageKind::kSoftwareHard;
+  command.containment_command = {
+      core::StopBudgetPhaseId("hard_command"),
+      core::StopContainmentCommandKind::kRegistered, contract,
+      core::RegisteredStopCommandKindId("manyforge.stop.software_hard")};
+  command.default_contract_parameters = core::JsonObjectDTO{};
+  hard.validated_contract_parameters = core::JsonObjectDTO{};
+  auto &evidence = command.evidence_requirements.front();
+  evidence.requirement.evidence_item_id = core::StopEvidenceItemId("hard.rest");
+  evidence.requirement.phase_id = core::StopBudgetPhaseId("hard_terminal");
+  evidence.requirement.provider_contract_ref = contract;
+  evidence.resolved_source.provider_contract_ref = contract;
+  stage.participant_stop_plan.stage_commands.push_back(std::move(hard));
+  stage.participant_stop_plan.deadline_budget = {
+      500'000'000,
+      50'000'000,
+      {{core::StopBudgetPhaseId("command"), 50'000'000},
+       {core::StopBudgetPhaseId("terminal"), 150'000'000},
+       {core::StopBudgetPhaseId("hard_command"), 200'000'000},
+       {core::StopBudgetPhaseId("hard_terminal"), 400'000'000}}};
+  stage.stage_index = 1U;
+  return stage;
+}
+
+TEST(NativeStopQualificationSeamTest,
+     TerminalGoalStillAcceptsExactHardStopButRequiresFreshRestDwell) {
+  // Fresh rest, one sample, actual motion, Reset, newer execution.
+  for (const int source_case : {0, 1, 2, 3, 4}) {
+    WallClock clock;
+    SimpleScheduler scheduler;
+    const auto binding = fixture::make_binding();
+    auto channel = std::make_shared<fixture::StateChannel>(binding);
+    RecordingProbe probe;
+    auto backend = detail::NativeStopQualificationAccess::construct(
+        binding, channel, clock, {}, probe,
+        source_case == 0 || source_case == 2 ? &scheduler : nullptr);
+    EXPECT_FALSE(
+        backend->stop().accepted); // Legacy idle contract is unchanged.
+    const auto stage = software_hard_stage_fixture();
+    auto execution =
+        backend->execute_trajectory(fixture::trajectory(binding, 5.0));
+    ASSERT_TRUE(wait_until_executing(*backend));
+    detail::NativeStopQualificationAccess::install_prepared_goal_membership(
+        *backend, stage, core::ContentDigest("prepared.terminal-hard"),
+        execution);
+    const auto nominal =
+        backend->execute_controlled_stop(fixture::soft_profile(binding, 0.10));
+    ASSERT_TRUE(nominal.accepted);
+    ASSERT_TRUE(nominal.backend_stop_confirmed);
+    ASSERT_EQ(backend->get_execution_snapshot().state,
+              core::ExecutionState::kStopped);
+    if (source_case == 2)
+      channel->force_observed_velocities({0.5, -0.5});
+    const auto requests =
+        detail::NativeStopQualificationAccess::hard_stop_requests(*backend);
+    const auto reads = channel->state_read_count();
+    auto pending = std::async(std::launch::async, [&] {
+      return backend->TranslateStopStage(stage, remaining_budget(stage), {});
+    });
+    if (source_case == 1 || source_case >= 3) {
+      const auto deadline = std::chrono::steady_clock::now() + 1s;
+      while (channel->state_read_count() == reads &&
+             std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(1ms);
+      ASSERT_GT(channel->state_read_count(), reads);
+      if (source_case == 3) {
+        ASSERT_TRUE(backend->reset().accepted);
+      } else if (source_case == 4) {
+        auto newer =
+            backend->execute_trajectory(fixture::trajectory(binding, 0.02));
+        ASSERT_TRUE(newer.wait_for_completion(2'000'000'000));
+      } else {
+        const auto positions =
+            backend->get_execution_snapshot().joint_positions_rad;
+        const std::vector<double> velocities(positions.size(), 0.0);
+        const auto now = clock.now();
+        ASSERT_TRUE(
+            channel->publish_state(positions, velocities, now, now).applied());
+      }
+    }
+    const auto result = pending.get();
+    EXPECT_EQ(
+        detail::NativeStopQualificationAccess::hard_stop_requests(*backend),
+        requests + (source_case == 3 ? 2U : 1U));
+    EXPECT_EQ(result.attempt_disposition,
+              core::StopStageAttemptDispositionDTO::kDispatched);
+    if (source_case == 0) {
+      ASSERT_EQ(result.outcome,
+                core::ParticipantStopStageOutcomeDTO::kSucceeded)
+          << (result.error ? result.error->message : "no error");
+      const auto &payload = std::get<core::JsonObjectDTO>(
+          result.evidence_items.front().evidence->value);
+      const auto &rest =
+          std::get<core::JsonObjectDTO>(payload.at("post_command_rest").value);
+      EXPECT_NE(std::get<std::string>(rest.at("first_sample_sequence").value),
+                std::get<std::string>(rest.at("last_sample_sequence").value));
+      EXPECT_GE(std::get<double>(rest.at("dwell_ns").value), 10'000'000.0);
+      // An old exact goal must still reject after a newer goal has also ended.
+      auto newer =
+          backend->execute_trajectory(fixture::trajectory(binding, 0.02));
+      ASSERT_TRUE(newer.wait_for_completion(2'000'000'000));
+      const auto before_stale =
+          detail::NativeStopQualificationAccess::hard_stop_requests(*backend);
+      const auto stale =
+          backend->TranslateStopStage(stage, remaining_budget(stage), {});
+      EXPECT_EQ(stale.attempt_disposition,
+                core::StopStageAttemptDispositionDTO::kNotDispatched);
+      EXPECT_EQ(
+          detail::NativeStopQualificationAccess::hard_stop_requests(*backend),
+          before_stale);
+    } else {
+      ASSERT_EQ(result.outcome, core::ParticipantStopStageOutcomeDTO::kFailed);
+      ASSERT_TRUE(result.error);
+      EXPECT_EQ(result.error->details.at("reason"),
+                source_case >= 3 ? "stop_evidence_execution_changed"
+                                 : "stop_evidence_not_at_rest");
+    }
+  }
+}
+
+TEST(NativeStopQualificationSeamTest,
+     HardStageObservesAlreadyCompletedGoalWithoutRewritingItsTerminalEvent) {
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  const auto binding = fixture::make_binding();
+  auto channel = std::make_shared<fixture::StateChannel>(binding);
+  RecordingProbe probe;
+  auto backend = detail::NativeStopQualificationAccess::construct(
+      binding, channel, clock, {}, probe, &scheduler);
+  auto stage = software_hard_stage_fixture();
+  auto terminal = direct_stage_fixture()
+                      .participant_stop_plan.stage_commands.front()
+                      .resolved_stage.evidence_requirements.front();
+  terminal.requirement.phase_id = core::StopBudgetPhaseId("hard_terminal");
+  stage.participant_stop_plan.stage_commands.back()
+      .resolved_stage.evidence_requirements.push_back(std::move(terminal));
+
+  auto execution =
+      backend->execute_trajectory(fixture::trajectory(binding, 0.02));
+  ASSERT_TRUE(probe.wait_for(
+      detail::NativeStopQualificationEvent::kExecutionLoopArmed));
+  clock.advance(30'000'000);
+  ASSERT_TRUE(execution.wait_for_completion(2'000'000'000));
+  const auto completed = backend->get_execution_snapshot();
+  ASSERT_EQ(completed.state, core::ExecutionState::kCompleted);
+  detail::NativeStopQualificationAccess::install_prepared_goal_membership(
+      *backend, stage, core::ContentDigest("prepared.completed-hard"),
+      execution);
+  clock.advance(1'000'000'000); // The transition event is no longer fresh.
+
+  auto pending = std::async(std::launch::async, [&] {
+    return backend->TranslateStopStage(stage, remaining_budget(stage), {});
+  });
+  const auto wall_deadline = std::chrono::steady_clock::now() + 2s;
+  while (pending.wait_for(0ms) != std::future_status::ready &&
+         std::chrono::steady_clock::now() < wall_deadline) {
+    clock.advance(10'000'000);
+    scheduler.advance_to(clock.now());
+    std::this_thread::sleep_for(1ms);
+  }
+  ASSERT_EQ(pending.wait_for(0ms), std::future_status::ready);
+  const auto result = pending.get();
+  ASSERT_EQ(result.outcome, core::ParticipantStopStageOutcomeDTO::kSucceeded)
+      << (result.error ? result.error->message : "no diagnostic");
+  ASSERT_EQ(result.evidence_items.size(), 2U);
+  const auto &goal_evidence = result.evidence_items.back();
+  EXPECT_EQ(goal_evidence.source_sequence, completed.sequence_number);
+  const auto &payload =
+      std::get<core::JsonObjectDTO>(goal_evidence.evidence->value);
+  const auto &observation = std::get<core::JsonObjectDTO>(
+      payload.at("native_goal_observation").value);
+  EXPECT_GE(std::get<double>(observation.at("transition_age_ns").value),
+            1'000'000'000.0);
+  EXPECT_EQ(backend->get_execution_snapshot().state, completed.state);
+  EXPECT_EQ(backend->get_execution_snapshot().timestamp_ns,
+            completed.timestamp_ns);
+  EXPECT_EQ(backend->get_execution_snapshot().sequence_number,
+            completed.sequence_number);
+}
+
 TEST(NativeStopQualificationSeamTest,
      SoftwareHardStopDoesNotWaitForTheRealNominalAdapterMutex) {
   WallClock clock;
   auto binding = fixture::make_binding();
   auto channel = std::make_shared<fixture::StateChannel>(binding);
   RoboPlanExecutionBackendConfig config;
-  config.soft_on_path_max_jerk_rad_s3 = {{"joint_1", 1'000'000.0},
-                                         {"joint_2", 1'000'000.0}};
   RecordingProbe probe;
   auto backend = detail::NativeStopQualificationAccess::construct(
       binding, channel, clock, config, probe);
@@ -432,6 +633,8 @@ TEST(NativeStopQualificationSeamTest,
   auto later_execution =
       backend->execute_trajectory(fixture::trajectory(binding, 5.0));
   ASSERT_TRUE(wait_until_executing(*backend));
+  EXPECT_FALSE(
+      backend->stopped_trajectory_time_s(execution.execution_generation));
   const auto crossed = backend->TranslateStopStage(
       stage, remaining_budget(stage), std::stop_token{});
   EXPECT_EQ(crossed.attempt_disposition,
@@ -448,19 +651,19 @@ TEST(NativeStopQualificationSeamTest,
 TEST(NativeStopQualificationSeamTest,
      ExactPreparedArmStageExecutesOneSecondControlledStopExactlyOnce) {
   WallClock clock;
+  SimpleScheduler scheduler;
   auto binding = fixture::make_binding(/*distinct_compiled_joint_names=*/true);
   auto channel = std::make_shared<fixture::StateChannel>(binding);
   RoboPlanExecutionBackendConfig config;
-  config.soft_on_path_max_jerk_rad_s3 = {
-      {"compiled.robot.joint_1", 1'000'000.0},
-      {"compiled.robot.joint_2", 1'000'000.0}};
   RecordingProbe probe;
   auto backend = detail::NativeStopQualificationAccess::construct(
-      binding, channel, clock, config, probe);
+      binding, channel, clock, config, probe, &scheduler);
   const auto stage = controlled_stage_fixture();
   auto execution =
       backend->execute_trajectory(fixture::trajectory(binding, 5.0));
   ASSERT_TRUE(wait_until_executing(*backend, 0.05));
+  EXPECT_FALSE(
+      backend->stopped_trajectory_time_s(execution.execution_generation));
   detail::NativeStopQualificationAccess::install_prepared_goal_membership(
       *backend, stage, core::ContentDigest("prepared.controlled"), execution);
 
@@ -490,6 +693,80 @@ TEST(NativeStopQualificationSeamTest,
   EXPECT_LT(elapsed, 1500ms);
   EXPECT_EQ(backend->get_execution_snapshot().state,
             core::ExecutionState::kStopped);
+  const auto cursor =
+      backend->stopped_trajectory_time_s(execution.execution_generation);
+  ASSERT_TRUE(cursor);
+  EXPECT_GT(*cursor, 0.25);
+  EXPECT_LT(*cursor, 5.0);
+  const auto original =
+      core::sample_trajectory(fixture::trajectory(binding, 5.0), *cursor);
+  ASSERT_TRUE(original.ok());
+  const auto final_positions =
+      backend->get_execution_snapshot().joint_positions_rad;
+  ASSERT_EQ(original.value().positions_rad.size(), final_positions.size());
+  for (std::size_t i = 0; i < final_positions.size(); ++i)
+    EXPECT_NEAR(original.value().positions_rad[i], final_positions[i], 1e-8);
+  EXPECT_FALSE(
+      backend->stopped_trajectory_time_s(execution.execution_generation + 1U));
+  EXPECT_TRUE(execution.wait_for_completion(2'000'000'000LL));
+}
+
+TEST(NativeStopQualificationSeamTest,
+     TinyCompletedTrajectoryRetainsItsExactEndpointWithFrozenClock) {
+  core::FakeClock clock;
+  auto binding = fixture::make_binding();
+  auto channel = std::make_shared<fixture::StateChannel>(binding);
+  RecordingProbe probe;
+  auto backend = detail::NativeStopQualificationAccess::construct(
+      binding, channel, clock, {}, probe);
+  auto trajectory = fixture::trajectory(binding, 1e-10);
+  trajectory.waypoints.back().positions_rad =
+      trajectory.waypoints.front().positions_rad;
+  auto execution = backend->execute_trajectory(trajectory);
+  ASSERT_TRUE(execution.wait_for_completion(2'000'000'000LL));
+  ASSERT_EQ(backend->get_execution_snapshot().state,
+            core::ExecutionState::kCompleted);
+  const auto cursor =
+      backend->stopped_trajectory_time_s(execution.execution_generation);
+  ASSERT_TRUE(cursor);
+  EXPECT_DOUBLE_EQ(*cursor, trajectory.waypoints.back().time_from_start_s);
+}
+
+TEST(NativeStopQualificationSeamTest,
+     CancelledReplacementDoesNotRetainItsPlannedPathEndpoint) {
+  WallClock clock;
+  auto binding = fixture::make_binding();
+  auto channel = std::make_shared<fixture::StateChannel>(binding);
+  RecordingProbe probe;
+  auto backend = detail::NativeStopQualificationAccess::construct(
+      binding, channel, clock, {}, probe);
+  auto execution =
+      backend->execute_trajectory(fixture::trajectory(binding, 5.0));
+  ASSERT_TRUE(wait_until_executing(*backend, 0.05));
+  std::stop_source cancellation;
+  auto pending = std::async(std::launch::async, [&] {
+    return backend->execute_controlled_stop(
+        fixture::soft_profile(binding, 0.30), cancellation.get_token());
+  });
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  bool replaying = false;
+  while (std::chrono::steady_clock::now() < deadline &&
+         pending.wait_for(0ms) != std::future_status::ready) {
+    replaying = backend->get_execution_snapshot().state ==
+                core::ExecutionState::kStopping;
+    if (replaying)
+      break;
+    std::this_thread::sleep_for(1ms);
+  }
+  cancellation.request_stop();
+  ASSERT_EQ(pending.wait_for(2s), std::future_status::ready);
+  const auto result = pending.get();
+  ASSERT_TRUE(replaying);
+  EXPECT_FALSE(result.backend_stop_confirmed);
+  ASSERT_TRUE(result.error);
+  EXPECT_EQ(result.error->details.at("reason"), "controlled_stop_cancelled");
+  EXPECT_FALSE(
+      backend->stopped_trajectory_time_s(execution.execution_generation));
   EXPECT_TRUE(execution.wait_for_completion(2'000'000'000LL));
 }
 
@@ -499,11 +776,10 @@ TEST(NativeStopQualificationSeamTest,
   auto binding = fixture::make_binding();
   auto channel = std::make_shared<fixture::StateChannel>(binding);
   RoboPlanExecutionBackendConfig config;
-  config.soft_on_path_max_jerk_rad_s3 = {{"joint_1", 0.01}, {"joint_2", 0.01}};
   RecordingProbe probe;
   auto backend = detail::NativeStopQualificationAccess::construct(
       binding, channel, clock, config, probe);
-  const auto stage = controlled_stage_fixture();
+  const auto stage = controlled_stage_fixture(0.01);
   auto execution =
       backend->execute_trajectory(fixture::trajectory(binding, 5.0));
   ASSERT_TRUE(wait_until_executing(*backend, 0.05));
@@ -522,68 +798,128 @@ TEST(NativeStopQualificationSeamTest,
             "soft_on_path_retimer_not_dispatchable");
   EXPECT_EQ(result.error->details.at("recommended_disposition"), "hard_stop");
   EXPECT_EQ(result.error->details.at("details_truncated"), "true");
+  EXPECT_GT(std::stod(result.error->details.at("handoff_path_time_s")), 0.0);
+  EXPECT_LT(std::stod(result.error->details.at("handoff_path_time_s")), 5.0);
   EXPECT_TRUE(backend->stop().accepted);
   EXPECT_TRUE(execution.wait_for_completion(2'000'000'000LL));
 }
 
 TEST(NativeStopQualificationSeamTest,
-     NearEndpointNaturalCompletionUsesTheOriginalGoalWithoutReplacement) {
-  core::FakeClock clock;
+     PreparedOffChoiceIgnoresInactiveJerkValues) {
+  WallClock clock;
   auto binding = fixture::make_binding();
   auto channel = std::make_shared<fixture::StateChannel>(binding);
-  RoboPlanExecutionBackendConfig config;
-  config.soft_on_path_stop_traj_delta_s = 0.02;
-  config.soft_on_path_sample_period_s = 0.01;
-  config.soft_on_path_max_jerk_rad_s3 = {{"joint_1", 1'000'000.0},
-                                         {"joint_2", 1'000'000.0}};
   RecordingProbe probe;
   auto backend = detail::NativeStopQualificationAccess::construct(
-      binding, channel, clock, config, probe);
-  auto stage = controlled_stage_fixture();
-  auto &parameters = *stage.participant_stop_plan.stage_commands.front()
-                          .validated_contract_parameters;
-  parameters["deceleration_time_s"] = core::JsonValueDTO{0.15};
-  stage.participant_stop_plan.stage_commands.front()
-      .resolved_stage.default_contract_parameters = parameters;
-
+      binding, channel, clock, {}, probe);
   auto execution =
-      backend->execute_trajectory(fixture::trajectory(binding, 1.0));
-  ASSERT_TRUE(probe.wait_for(
-      detail::NativeStopQualificationEvent::kExecutionLoopArmed));
-  clock.advance(950'000'000);
-  ASSERT_TRUE(wait_until_executing(*backend, 0.94));
-  detail::NativeStopQualificationAccess::install_prepared_goal_membership(
-      *backend, stage, core::ContentDigest("prepared.natural"), execution);
-
-  auto stopped = std::async(std::launch::async, [&] {
-    return backend->TranslateStopStage(stage, remaining_budget(stage),
-                                       std::stop_token{});
-  });
-  ASSERT_TRUE(probe.wait_for(
-      detail::NativeStopQualificationEvent::kNominalResultWaitEnter));
-  EXPECT_EQ(probe.first_detail(
-                detail::NativeStopQualificationEvent::kNominalResultWaitEnter),
-            "natural_completion");
-  clock.advance(100'000'000);
-  const auto completion_deadline = std::chrono::steady_clock::now() + 2s;
-  while (stopped.wait_for(0ms) != std::future_status::ready &&
-         std::chrono::steady_clock::now() < completion_deadline) {
-    clock.advance(10'000'000);
-    std::this_thread::sleep_for(1ms);
-  }
-  ASSERT_EQ(stopped.wait_for(0ms), std::future_status::ready);
-  const auto result = stopped.get();
-
-  EXPECT_EQ(result.attempt_disposition,
-            core::StopStageAttemptDispositionDTO::kDispatched);
-  EXPECT_EQ(result.outcome, core::ParticipantStopStageOutcomeDTO::kSucceeded);
-  EXPECT_EQ(result.actual_provider_contract_mode,
-            core::MotionControlledStopMode::kSoftOnPath);
-  EXPECT_EQ(
-      probe.count(detail::NativeStopQualificationEvent::kPhysicalDispatch), 0U);
+      backend->execute_trajectory(fixture::trajectory(binding, 5.0));
+  ASSERT_TRUE(wait_until_executing(*backend, 0.05));
+  auto profile = fixture::soft_profile(binding, 0.30);
+  for (auto &[joint, value] : profile.per_joint_max_jerk)
+    value = core::AngularJerkDTO{0.000001};
+  auto on = backend->execute_controlled_stop(profile);
+  EXPECT_FALSE(on.accepted);
+  profile.jerk_limits_enabled = false;
+  auto off = backend->execute_controlled_stop(profile);
+  EXPECT_TRUE(off.accepted)
+      << (off.error ? off.error->message : "no diagnostic");
+  EXPECT_TRUE(off.backend_stop_confirmed);
   EXPECT_EQ(backend->get_execution_snapshot().state,
-            core::ExecutionState::kCompleted);
+            core::ExecutionState::kStopped);
+  if (!off.accepted)
+    (void)backend->stop();
   EXPECT_TRUE(execution.wait_for_completion(2'000'000'000LL));
+}
+
+TEST(NativeStopQualificationSeamTest,
+     NearEndpointNaturalCompletionUsesTheOriginalGoalWithoutReplacement) {
+  for (bool spring_back : {false, true}) {
+    core::FakeClock clock;
+    core::ManualScheduler scheduler;
+    auto binding = fixture::make_binding();
+    auto channel = std::make_shared<fixture::StateChannel>(binding);
+    RoboPlanExecutionBackendConfig config;
+    config.soft_on_path_stop_traj_delta_s = 0.02;
+    config.soft_on_path_sample_period_s = 0.01;
+    RecordingProbe probe;
+    auto backend = detail::NativeStopQualificationAccess::construct(
+        binding, channel, clock, config, probe, &scheduler);
+    auto stage = controlled_stage_fixture();
+    auto &parameters = *stage.participant_stop_plan.stage_commands.front()
+                            .validated_contract_parameters;
+    parameters["deceleration_time_s"] = core::JsonValueDTO{0.15};
+    stage.participant_stop_plan.stage_commands.front()
+        .resolved_stage.evidence_requirements.push_back(
+            direct_stage_fixture()
+                .participant_stop_plan.stage_commands.front()
+                .resolved_stage.evidence_requirements.front());
+    if (spring_back) {
+      // This non-default choice is explicit in the exact prepared contract.
+      parameters["stop_mode"] =
+          core::JsonValueDTO{std::string("spring_back_hold")};
+      parameters.erase("recoverable_substitution_mode");
+    }
+    stage.participant_stop_plan.stage_commands.front()
+        .resolved_stage.default_contract_parameters = parameters;
+
+    auto execution =
+        backend->execute_trajectory(fixture::trajectory(binding, 1.0));
+    ASSERT_TRUE(probe.wait_for(
+        detail::NativeStopQualificationEvent::kExecutionLoopArmed));
+    clock.advance(950'000'000);
+    ASSERT_TRUE(wait_until_executing(*backend, 0.94));
+    detail::NativeStopQualificationAccess::install_prepared_goal_membership(
+        *backend, stage, core::ContentDigest("prepared.natural"), execution);
+
+    auto stopped = std::async(std::launch::async, [&] {
+      return backend->TranslateStopStage(stage, remaining_budget(stage),
+                                         std::stop_token{});
+    });
+    ASSERT_TRUE(probe.wait_for(
+        detail::NativeStopQualificationEvent::kNominalResultWaitEnter));
+    EXPECT_EQ(
+        probe.first_detail(
+            detail::NativeStopQualificationEvent::kNominalResultWaitEnter),
+        "natural_completion");
+    clock.advance(100'000'000);
+    const auto completion_deadline = std::chrono::steady_clock::now() + 2s;
+    while (stopped.wait_for(0ms) != std::future_status::ready &&
+           std::chrono::steady_clock::now() < completion_deadline) {
+      clock.advance(10'000'000);
+      scheduler.advance_to(clock.now());
+      std::this_thread::sleep_for(1ms);
+    }
+    ASSERT_EQ(stopped.wait_for(0ms), std::future_status::ready);
+    const auto result = stopped.get();
+
+    EXPECT_EQ(result.attempt_disposition,
+              core::StopStageAttemptDispositionDTO::kDispatched);
+    ASSERT_EQ(result.outcome, core::ParticipantStopStageOutcomeDTO::kSucceeded)
+        << (result.error ? result.error->message : "no diagnostic");
+    EXPECT_EQ(result.actual_provider_contract_mode,
+              spring_back ? core::MotionControlledStopMode::kSpringBackHold
+                          : core::MotionControlledStopMode::kSoftOnPath);
+    EXPECT_EQ(
+        probe.count(detail::NativeStopQualificationEvent::kPhysicalDispatch),
+        0U);
+    EXPECT_EQ(backend->get_execution_snapshot().state,
+              core::ExecutionState::kCompleted);
+    const auto cursor =
+        backend->stopped_trajectory_time_s(execution.execution_generation);
+    ASSERT_TRUE(cursor);
+    EXPECT_DOUBLE_EQ(*cursor, 1.0);
+    ASSERT_EQ(result.evidence_items.size(), 2U);
+    for (const auto &item : result.evidence_items) {
+      EXPECT_EQ(item.state, core::StopEvidenceItemStateDTO::kSatisfied);
+      ASSERT_TRUE(item.evidence);
+      const auto &evidence =
+          std::get<core::JsonObjectDTO>(item.evidence->value);
+      EXPECT_TRUE(
+          std::get<bool>(evidence.at("completed_by_natural_completion").value));
+    }
+    EXPECT_TRUE(execution.wait_for_completion(2'000'000'000LL));
+  }
 }
 
 TEST(NativeStopQualificationSeamTest,
@@ -592,8 +928,6 @@ TEST(NativeStopQualificationSeamTest,
   auto binding = fixture::make_binding();
   auto channel = std::make_shared<fixture::StateChannel>(binding);
   RoboPlanExecutionBackendConfig config;
-  config.soft_on_path_max_jerk_rad_s3 = {{"joint_1", 1'000'000.0},
-                                         {"joint_2", 1'000'000.0}};
   RecordingProbe probe(detail::NativeStopQualificationEvent::kPhysicalDispatch);
   auto backend = detail::NativeStopQualificationAccess::construct(
       binding, channel, clock, config, probe);
@@ -629,6 +963,366 @@ TEST(NativeStopQualificationSeamTest,
 }
 
 TEST(NativeStopQualificationSeamTest,
+     DelayedPublicationCannotRefreshOldStateOrBackdateNewScale) {
+  class SampleBarrier final : public detail::INativeStopQualificationProbe {
+  public:
+    void observe(detail::NativeStopQualificationEvent event,
+                 std::string_view) override {
+      if (event != detail::NativeStopQualificationEvent::kExecutionSampleReady)
+        return;
+      std::unique_lock lock(mutex_);
+      ++samples_;
+      cv_.notify_all();
+      cv_.wait(lock, [&] { return finished_ || released_ >= samples_; });
+    }
+    bool wait(unsigned count) {
+      std::unique_lock lock(mutex_);
+      return cv_.wait_for(lock, 2s, [&] { return samples_ >= count; });
+    }
+    void release(bool finish = false) {
+      std::lock_guard lock(mutex_);
+      ++released_;
+      finished_ = finish;
+      cv_.notify_all();
+    }
+
+  private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    unsigned samples_{}, released_{};
+    bool finished_{};
+  } probe;
+  core::FakeClock clock;
+  clock.advance(1);
+  auto binding = fixture::make_binding();
+  auto channel = std::make_shared<fixture::StateChannel>(binding);
+  auto backend = detail::NativeStopQualificationAccess::construct(
+      binding, channel, clock, {}, probe);
+  auto release =
+      std::shared_ptr<void>(nullptr, [&](void *) { probe.release(true); });
+  auto execution =
+      backend->execute_trajectory(fixture::trajectory(binding, 5.0));
+  ASSERT_TRUE(probe.wait(1));
+  clock.advance(100'000'000);
+  backend->set_runtime_velocity_scale(0.2);
+  probe.release();
+  ASSERT_TRUE(probe.wait(2));
+  EXPECT_EQ(backend->get_execution_snapshot().timestamp_ns, 1);
+  probe.release();
+  ASSERT_TRUE(probe.wait(3));
+  // The late target begins only at the second sample boundary. The elapsed
+  // 100 ms therefore ran entirely at the original scale, not a backdated ramp.
+  EXPECT_NEAR(
+      backend->runtime_velocity_scale_status().virtual_trajectory_time_s, 0.1,
+      1e-12);
+  EXPECT_DOUBLE_EQ(backend->runtime_velocity_scale_status().applied_scale, 1.0);
+  release.reset();
+  EXPECT_TRUE(backend->stop().accepted);
+  EXPECT_TRUE(execution.wait_for_completion(2'000'000'000));
+}
+
+TEST(NativeStopQualificationSeamTest,
+     CoordinatedWorkersWaitForTheirPeerAndSampleOnePathClock) {
+  core::FakeClock clock;
+  clock.set(1'000'000'000);
+  auto binding = fixture::make_binding();
+  auto first_channel = std::make_shared<fixture::StateChannel>(binding);
+  auto second_channel = std::make_shared<fixture::StateChannel>(binding);
+  RecordingProbe first_probe(
+      detail::NativeStopQualificationEvent::kExecutionLoopArmed);
+  RecordingProbe second_probe(
+      detail::NativeStopQualificationEvent::kExecutionLoopArmed);
+  auto first = detail::NativeStopQualificationAccess::construct(
+      binding, first_channel, clock, {}, first_probe);
+  auto second = detail::NativeStopQualificationAccess::construct(
+      binding, second_channel, clock, {}, second_probe);
+  auto release = std::shared_ptr<void>(nullptr, [&](void *) {
+    first_probe.release();
+    second_probe.release();
+  });
+  const auto trajectory = fixture::trajectory(binding, 5.0);
+  const auto bounds = *trajectory.runtime_scale_bounds;
+  auto common = std::make_shared<core::detail::CoordinatedExecutionClock>(
+      std::vector{core::OperationParticipantId("a"),
+                  core::OperationParticipantId("b")},
+      core::detail::RuntimeScaleBounds{bounds.max_rate_per_s,
+                                       bounds.max_rate_change_per_s2});
+  auto first_execution =
+      detail::NativeStopQualificationAccess::execute_with_clock(
+          *first, trajectory, common, core::OperationParticipantId("a"));
+  ASSERT_TRUE(first_probe.wait_for(
+      detail::NativeStopQualificationEvent::kExecutionLoopArmed));
+  first_probe.release();
+  clock.advance(1'000'000'000);
+  EXPECT_FALSE(common->sample(clock.now()));
+  EXPECT_DOUBLE_EQ(first->get_execution_snapshot().progress, 0.0);
+  auto second_execution =
+      detail::NativeStopQualificationAccess::execute_with_clock(
+          *second, trajectory, common, core::OperationParticipantId("b"));
+  ASSERT_TRUE(second_probe.wait_for(
+      detail::NativeStopQualificationEvent::kExecutionLoopArmed));
+  second_probe.release();
+  ASSERT_TRUE(first_probe.wait_for(
+      detail::NativeStopQualificationEvent::kExecutionSampleReady));
+  ASSERT_TRUE(second_probe.wait_for(
+      detail::NativeStopQualificationEvent::kExecutionSampleReady));
+  const auto origin = common->sample(clock.now());
+  ASSERT_TRUE(origin);
+  EXPECT_DOUBLE_EQ(origin->trajectory_time_s, 0.0);
+  clock.advance(500'000'000);
+  ASSERT_TRUE(wait_until_executing(*first, 0.1));
+  ASSERT_TRUE(wait_until_executing(*second, 0.1));
+  EXPECT_DOUBLE_EQ(
+      first->runtime_velocity_scale_status().virtual_trajectory_time_s, 0.5);
+  EXPECT_DOUBLE_EQ(
+      second->runtime_velocity_scale_status().virtual_trajectory_time_s, 0.5);
+  std::uint64_t scale_generation = 0;
+  const auto retarget = [&](double scale) {
+    return common->retarget(
+        scale,
+        core::CoordinatedRuntimeScaleCommandDTO{
+            core::OperationId("shared.native"), core::OperationRevision(1U),
+            core::RuntimeScaleGeneration(++scale_generation)});
+  };
+  ASSERT_TRUE(retarget(0.25));
+  EXPECT_DOUBLE_EQ(first->runtime_velocity_scale_status().commanded_scale,
+                   0.25);
+  EXPECT_DOUBLE_EQ(second->runtime_velocity_scale_status().commanded_scale,
+                   0.25);
+  ASSERT_TRUE(first->runtime_velocity_scale_status().coordinated_command);
+  ASSERT_TRUE(second->runtime_velocity_scale_status().coordinated_command);
+  EXPECT_EQ(
+      first->runtime_velocity_scale_status().coordinated_command->generation,
+      core::RuntimeScaleGeneration(1U));
+  EXPECT_EQ(first->runtime_velocity_scale_status().coordinated_command,
+            second->runtime_velocity_scale_status().coordinated_command);
+  clock.advance(1'000'000'000);
+  const auto scaled = common->sample_now();
+  ASSERT_TRUE(scaled);
+  ASSERT_TRUE(wait_until_executing(*first, scaled->trajectory_time_s / 5.0));
+  ASSERT_TRUE(wait_until_executing(*second, scaled->trajectory_time_s / 5.0));
+  EXPECT_DOUBLE_EQ(
+      first->runtime_velocity_scale_status().virtual_trajectory_time_s,
+      scaled->trajectory_time_s);
+  EXPECT_DOUBLE_EQ(
+      second->runtime_velocity_scale_status().virtual_trajectory_time_s,
+      scaled->trajectory_time_s);
+  EXPECT_DOUBLE_EQ(first->runtime_velocity_scale_status().applied_scale,
+                   scaled->governor.scale());
+  EXPECT_DOUBLE_EQ(second->runtime_velocity_scale_status().applied_scale,
+                   scaled->governor.scale());
+  ASSERT_TRUE(retarget(0.0));
+  clock.advance(2'000'000'000);
+  const auto held = common->sample_now();
+  ASSERT_TRUE(held);
+  ASSERT_DOUBLE_EQ(held->governor.scale(), 0.0);
+  ASSERT_TRUE(wait_until_executing(*first, held->trajectory_time_s / 5.0));
+  ASSERT_TRUE(wait_until_executing(*second, held->trajectory_time_s / 5.0));
+  const auto held_first = first->get_execution_snapshot().joint_positions_rad;
+  const auto held_second = second->get_execution_snapshot().joint_positions_rad;
+  // A zero shared speed is not completion or a new motion occurrence. Wall
+  // time may pass, but restoring speed must not catch up that held interval.
+  clock.advance(10'000'000'000);
+  const auto still_held = common->sample_now();
+  ASSERT_TRUE(still_held);
+  EXPECT_DOUBLE_EQ(still_held->trajectory_time_s, held->trajectory_time_s);
+  ASSERT_TRUE(retarget(0.5));
+  EXPECT_EQ(first->get_execution_snapshot().joint_positions_rad, held_first);
+  EXPECT_EQ(second->get_execution_snapshot().joint_positions_rad, held_second);
+  clock.advance(500'000'000);
+  const auto resumed_scale = common->sample_now();
+  ASSERT_TRUE(resumed_scale);
+  ASSERT_GT(resumed_scale->trajectory_time_s, held->trajectory_time_s);
+  ASSERT_TRUE(
+      wait_until_executing(*first, resumed_scale->trajectory_time_s / 5.0));
+  ASSERT_TRUE(
+      wait_until_executing(*second, resumed_scale->trajectory_time_s / 5.0));
+  EXPECT_DOUBLE_EQ(
+      first->runtime_velocity_scale_status().virtual_trajectory_time_s,
+      resumed_scale->trajectory_time_s);
+  EXPECT_DOUBLE_EQ(
+      second->runtime_velocity_scale_status().virtual_trajectory_time_s,
+      resumed_scale->trajectory_time_s);
+  ASSERT_TRUE(retarget(0.75));
+  // The FakeClock stays at this retarget boundary: no later worker sample
+  // can certify that Stop's captured pose belongs to the new shared law.
+  const auto uncaptured =
+      first->execute_controlled_stop(fixture::soft_profile(binding, 0.10));
+  EXPECT_FALSE(uncaptured.accepted);
+  ASSERT_TRUE(uncaptured.error);
+  EXPECT_EQ(uncaptured.error->details.at("reason"),
+            "coordinated_stop_snapshot_budget_exceeded");
+  EXPECT_EQ(first_probe.count(
+                detail::NativeStopQualificationEvent::kPhysicalDispatch),
+            0U);
+  detail::NativeStopQualificationAccess::freeze_runtime_scale(*first);
+  EXPECT_FALSE(retarget(0.75));
+  detail::NativeStopQualificationAccess::release_runtime_scale(*first);
+  // Finishing one Stop must not re-open the stopped occurrence's common law.
+  // A fresh prepared Resume uses a different clock.
+  EXPECT_FALSE(retarget(0.75));
+  const auto frozen = common->sample_now();
+  ASSERT_TRUE(frozen);
+  EXPECT_DOUBLE_EQ(frozen->trajectory_time_s, resumed_scale->trajectory_time_s);
+  auto waiting_stop = std::async(std::launch::async, [&] {
+    return second->execute_controlled_stop(fixture::soft_profile(binding, 0.30));
+  });
+  ASSERT_TRUE(second_probe.wait_for(
+      detail::NativeStopQualificationEvent::kNominalProviderEntry));
+  clock.advance(1'000'000'000);
+  const auto captured = waiting_stop.get();
+  EXPECT_TRUE(captured.accepted);
+  EXPECT_TRUE(captured.backend_stop_confirmed);
+  EXPECT_FALSE(captured.error);
+  EXPECT_TRUE(first->stop().accepted);
+  (void)second->stop();
+  EXPECT_TRUE(first_execution.wait_for_completion(2'000'000'000));
+  EXPECT_TRUE(second_execution.wait_for_completion(2'000'000'000));
+  first->set_runtime_velocity_scale(0.4);
+  EXPECT_FALSE(first->runtime_velocity_scale_status().active);
+  EXPECT_DOUBLE_EQ(first->runtime_velocity_scale_status().commanded_scale, 0.4);
+}
+
+TEST(NativeStopQualificationSeamTest,
+     StopReleasesAnUnstartedCoordinatedWorkerWithoutWaitingForItsPeer) {
+  for (bool controlled_freeze : {false, true}) {
+    SCOPED_TRACE(controlled_freeze);
+    core::FakeClock clock;
+    clock.set(1);
+    auto binding = fixture::make_binding();
+    auto channel = std::make_shared<fixture::StateChannel>(binding);
+    RecordingProbe probe;
+    auto backend = detail::NativeStopQualificationAccess::construct(
+        binding, channel, clock, {}, probe);
+    const auto trajectory = fixture::trajectory(binding, 5.0);
+    const auto bounds = *trajectory.runtime_scale_bounds;
+    auto common = std::make_shared<core::detail::CoordinatedExecutionClock>(
+        std::vector{core::OperationParticipantId("a"),
+                    core::OperationParticipantId("b")},
+        core::detail::RuntimeScaleBounds{bounds.max_rate_per_s,
+                                         bounds.max_rate_change_per_s2});
+    auto execution = detail::NativeStopQualificationAccess::execute_with_clock(
+        *backend, trajectory, common, core::OperationParticipantId("a"));
+    ASSERT_TRUE(probe.wait_for(
+        detail::NativeStopQualificationEvent::kExecutionLoopArmed));
+    if (controlled_freeze)
+      detail::NativeStopQualificationAccess::freeze_runtime_scale(*backend);
+    else
+      EXPECT_TRUE(backend->stop().accepted);
+    ASSERT_TRUE(execution.wait_for_completion(2'000'000'000));
+    EXPECT_EQ(execution.get_snapshot().state, core::ExecutionState::kStopped);
+    EXPECT_FALSE(execution.get_snapshot().error);
+    EXPECT_EQ(execution.get_snapshot().joint_positions_rad,
+              trajectory.waypoints.front().positions_rad);
+    EXPECT_FALSE(common->sample_now());
+    if (controlled_freeze)
+      detail::NativeStopQualificationAccess::release_runtime_scale(*backend);
+  }
+}
+
+TEST(NativeStopQualificationSeamTest,
+     ReversedClockFailsWithoutAdvancingTheCommandedPose) {
+  core::FakeClock clock;
+  clock.set(1'000'000'000);
+  auto binding = fixture::make_binding();
+  auto channel = std::make_shared<fixture::StateChannel>(binding);
+  RecordingProbe probe(
+      detail::NativeStopQualificationEvent::kExecutionLoopArmed);
+  auto backend = detail::NativeStopQualificationAccess::construct(
+      binding, channel, clock, {}, probe);
+  auto release =
+      std::shared_ptr<void>(nullptr, [&](void *) { probe.release(); });
+  const auto trajectory = fixture::trajectory(binding, 5.0);
+  auto execution = backend->execute_trajectory(trajectory);
+  ASSERT_TRUE(probe.wait_for(
+      detail::NativeStopQualificationEvent::kExecutionLoopArmed));
+  clock.set(999'999'999);
+  release.reset();
+  ASSERT_TRUE(execution.wait_for_completion(2'000'000'000));
+  const auto snapshot = execution.get_snapshot();
+  EXPECT_EQ(snapshot.state, core::ExecutionState::kFailed);
+  EXPECT_EQ(snapshot.joint_positions_rad,
+            trajectory.waypoints.front().positions_rad);
+  EXPECT_DOUBLE_EQ(snapshot.progress, 0.0);
+  ASSERT_TRUE(snapshot.error);
+  EXPECT_EQ(snapshot.error->details.at("reason"),
+            "native_runtime_scale_advance_invalid");
+}
+
+TEST(NativeStopQualificationSeamTest,
+     StopFreezeDoesNotConsumeAnAlreadyPendingScaleTarget) {
+  core::FakeClock clock;
+  clock.advance(1);
+  auto binding = fixture::make_binding();
+  auto channel = std::make_shared<fixture::StateChannel>(binding);
+  RecordingProbe probe(
+      detail::NativeStopQualificationEvent::kExecutionLoopArmed);
+  auto backend = detail::NativeStopQualificationAccess::construct(
+      binding, channel, clock, {}, probe);
+  auto execution =
+      backend->execute_trajectory(fixture::trajectory(binding, 5.0));
+  const bool armed =
+      probe.wait_for(detail::NativeStopQualificationEvent::kExecutionLoopArmed);
+  if (!armed)
+    probe.release();
+  ASSERT_TRUE(armed);
+  backend->set_runtime_velocity_scale(
+      0.2); // Accepted, but the worker is still at its barrier.
+  detail::NativeStopQualificationAccess::freeze_runtime_scale(*backend);
+  auto freeze = std::shared_ptr<void>(nullptr, [&](void *) {
+    detail::NativeStopQualificationAccess::release_runtime_scale(*backend);
+  });
+  probe.release();
+  clock.advance(100'000'000);
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  while (backend->runtime_velocity_scale_status().virtual_trajectory_time_s <
+             0.1 &&
+         std::chrono::steady_clock::now() < deadline)
+    std::this_thread::yield();
+  const auto frozen = backend->runtime_velocity_scale_status();
+  EXPECT_GE(frozen.virtual_trajectory_time_s, 0.1);
+  EXPECT_DOUBLE_EQ(frozen.applied_scale, 1.0);
+  EXPECT_DOUBLE_EQ(frozen.commanded_scale, 0.2);
+  EXPECT_TRUE(backend->stop().accepted);
+  EXPECT_TRUE(execution.wait_for_completion(2'000'000'000));
+  freeze.reset();
+}
+
+TEST(NativeStopQualificationSeamTest,
+     DelayedStopDispatchCannotReplayAnExpiredLeadIn) {
+  WallClock clock;
+  auto binding = fixture::make_binding();
+  auto channel = std::make_shared<fixture::StateChannel>(binding);
+  RoboPlanExecutionBackendConfig config;
+  RecordingProbe probe(detail::NativeStopQualificationEvent::kPhysicalDispatch);
+  auto backend = detail::NativeStopQualificationAccess::construct(
+      binding, channel, clock, config, probe);
+  auto execution =
+      backend->execute_trajectory(fixture::trajectory(binding, 5.0));
+  ASSERT_TRUE(wait_until_executing(*backend));
+  auto stopped = std::async(std::launch::async, [&] {
+    return backend->execute_controlled_stop(
+        fixture::soft_profile(binding, 0.30));
+  });
+  const bool dispatched =
+      probe.wait_for(detail::NativeStopQualificationEvent::kPhysicalDispatch);
+  if (!dispatched)
+    probe.release();
+  ASSERT_TRUE(dispatched);
+  EXPECT_EQ(stopped.wait_for(30ms), std::future_status::timeout);
+  probe.release();
+  ASSERT_EQ(stopped.wait_for(2s), std::future_status::ready);
+  const auto result = stopped.get();
+  EXPECT_FALSE(result.backend_stop_confirmed);
+  ASSERT_TRUE(result.error);
+  EXPECT_EQ(result.error->details.at("reason"),
+            "native_stop_handoff_budget_exceeded");
+  EXPECT_TRUE(execution.wait_for_completion(2'000'000'000));
+  EXPECT_EQ(backend->get_execution_snapshot().state,
+            core::ExecutionState::kStopped);
+}
+
+TEST(NativeStopQualificationSeamTest,
      PausedScaleChangesDoNotAdvanceMotionOrDependOnMotionFrameFreshness) {
   core::FakeClock clock;
   clock.advance(1);
@@ -655,6 +1349,9 @@ TEST(NativeStopQualificationSeamTest,
            core::ExecutionState::kPaused;
   }));
   const auto before = backend->get_execution_snapshot();
+  const auto cursor =
+      backend->stopped_trajectory_time_s(execution.execution_generation);
+  ASSERT_TRUE(cursor);
   backend->set_runtime_velocity_scale(0.4);
   ASSERT_TRUE(until([&] {
     return backend->runtime_velocity_scale_status().applied_scale == 0.4;
@@ -679,7 +1376,11 @@ TEST(NativeStopQualificationSeamTest,
             before.joint_positions_rad);
   EXPECT_EQ(backend->get_execution_snapshot().state,
             core::ExecutionState::kPaused);
+  EXPECT_EQ(backend->stopped_trajectory_time_s(execution.execution_generation),
+            cursor);
   EXPECT_TRUE(backend->reset().accepted);
+  EXPECT_FALSE(
+      backend->stopped_trajectory_time_s(execution.execution_generation));
   EXPECT_TRUE(execution.wait_for_completion(2'000'000'000LL));
 }
 
@@ -690,8 +1391,6 @@ TEST(NativeStopQualificationSeamTest,
   auto channel = std::make_shared<fixture::StateChannel>(binding);
   channel->force_observed_velocities({0.5, -0.5});
   RoboPlanExecutionBackendConfig config;
-  config.soft_on_path_max_jerk_rad_s3 = {{"joint_1", 1'000'000.0},
-                                         {"joint_2", 1'000'000.0}};
   RecordingProbe probe;
   auto backend = detail::NativeStopQualificationAccess::construct(
       binding, channel, clock, config, probe);
@@ -761,8 +1460,6 @@ TEST(NativeStopQualificationSeamTest,
   auto binding = fixture::make_binding();
   auto channel = std::make_shared<fixture::StateChannel>(binding);
   RoboPlanExecutionBackendConfig config;
-  config.soft_on_path_max_jerk_rad_s3 = {{"joint_1", 1'000'000.0},
-                                         {"joint_2", 1'000'000.0}};
   RecordingProbe probe(
       detail::NativeStopQualificationEvent::kNominalRearmAttempt);
   auto backend = detail::NativeStopQualificationAccess::construct(
@@ -804,8 +1501,6 @@ TEST(NativeStopQualificationSeamTest,
   auto binding = fixture::make_binding();
   auto channel = std::make_shared<fixture::StateChannel>(binding);
   RoboPlanExecutionBackendConfig config;
-  config.soft_on_path_max_jerk_rad_s3 = {{"joint_1", 1'000'000.0},
-                                         {"joint_2", 1'000'000.0}};
   RecordingProbe probe(
       detail::NativeStopQualificationEvent::kWorkerStopObservedBeforeTerminal);
   auto backend = detail::NativeStopQualificationAccess::construct(
@@ -851,58 +1546,96 @@ TEST(NativeStopQualificationSeamTest,
 
 TEST(NativeStopQualificationSeamTest,
      RealLateSoftOnPathSelectsSpringBackBeforeDispatchWithoutScopeDrift) {
-  core::FakeClock clock;
-  auto binding = fixture::make_binding();
-  auto channel = std::make_shared<fixture::StateChannel>(binding);
-  RoboPlanExecutionBackendConfig config;
-  config.soft_on_path_stop_traj_delta_s = 0.02;
-  config.soft_on_path_sample_period_s = 0.01;
-  config.soft_on_path_max_jerk_rad_s3 = {{"joint_1", 1'000'000.0},
-                                         {"joint_2", 1'000'000.0}};
-  RecordingProbe probe;
-  auto backend = detail::NativeStopQualificationAccess::construct(
-      binding, channel, clock, config, probe);
-  const auto original_scope =
-      detail::NativeStopQualificationAccess::scope(*backend);
-  auto execution =
-      backend->execute_trajectory(fixture::trajectory(binding, 1.0));
-  ASSERT_TRUE(wait_until_executing(*backend));
-  ASSERT_TRUE(probe.wait_for(
-      detail::NativeStopQualificationEvent::kExecutionLoopArmed));
-  clock.advance(950'000'000);
-  ASSERT_TRUE(wait_until_executing(*backend, 0.94));
+  // The same short tail must return to the captured trip point when Spring
+  // is requested directly; natural completion is never its precision result.
+  for (const bool explicit_spring : {false, true}) {
+    SCOPED_TRACE(explicit_spring);
+    core::FakeClock clock;
+    auto binding = fixture::make_binding();
+    auto channel = std::make_shared<fixture::StateChannel>(binding);
+    RoboPlanExecutionBackendConfig config;
+    config.soft_on_path_stop_traj_delta_s = 0.02;
+    config.soft_on_path_sample_period_s = 0.01;
+    RecordingProbe probe;
+    auto backend = detail::NativeStopQualificationAccess::construct(
+        binding, channel, clock, config, probe);
+    const auto original_scope =
+        detail::NativeStopQualificationAccess::scope(*backend);
+    // At full scale this very short Spring return would exceed the nominal
+    // velocity envelope. Use a valid 75% case for substitution ordering; the
+    // planner regression separately proves rejection of the full-scale case.
+    backend->set_runtime_velocity_scale(0.75);
+    auto execution =
+        backend->execute_trajectory(fixture::trajectory(binding, 1.0));
+    ASSERT_TRUE(wait_until_executing(*backend));
+    ASSERT_TRUE(probe.wait_for(
+        detail::NativeStopQualificationEvent::kExecutionLoopArmed));
+    clock.advance(1'280'000'000);
+    ASSERT_TRUE(wait_until_executing(*backend, 0.95));
+    const auto trip_positions =
+        backend->get_execution_snapshot().joint_positions_rad;
+    const auto trip_cursor =
+        backend->runtime_velocity_scale_status().virtual_trajectory_time_s;
+    auto profile = fixture::soft_profile(binding, 0.15);
+    if (explicit_spring) {
+      profile.stop_mode = core::MotionInterruptStopMode::kSpringBackHold;
+      profile.allow_natural_completion_on_short_path = false;
+      profile.recoverable_substitution_mode.reset();
+    }
 
-  const auto started = std::chrono::steady_clock::now();
-  const auto controlled =
-      backend->execute_controlled_stop(fixture::soft_profile(binding, 0.15));
-  const auto elapsed = std::chrono::steady_clock::now() - started;
+    const auto started = std::chrono::steady_clock::now();
+    const auto controlled = backend->execute_controlled_stop(profile);
+    const auto elapsed = std::chrono::steady_clock::now() - started;
 
-  ASSERT_TRUE(controlled.accepted);
-  EXPECT_TRUE(controlled.backend_stop_confirmed);
-  EXPECT_EQ(controlled.executed_stop_mode,
-            core::MotionInterruptStopMode::kSpringBackHold);
-  ASSERT_TRUE(controlled.fallback_reason.has_value());
-  EXPECT_EQ(*controlled.fallback_reason, "soft_on_path_remaining_time_short");
-  EXPECT_EQ(core::interrupt_structured_scalar_text(
-                controlled.diagnostics.at("requested_stop_mode")),
-            "soft_on_path");
-  EXPECT_EQ(core::interrupt_structured_scalar_text(
-                controlled.diagnostics.at("fallback_reason")),
-            *controlled.fallback_reason);
-  const auto selection = probe.first_index(
-      detail::NativeStopQualificationEvent::kSubstitutionSelected);
-  const auto dispatch = probe.first_index(
-      detail::NativeStopQualificationEvent::kPhysicalDispatch);
-  ASSERT_TRUE(selection.has_value());
-  ASSERT_TRUE(dispatch.has_value());
-  EXPECT_LT(*selection, *dispatch);
-  EXPECT_EQ(probe.first_detail(
-                detail::NativeStopQualificationEvent::kSubstitutionSelected),
-            "soft_on_path_remaining_time_short");
-  EXPECT_EQ(detail::NativeStopQualificationAccess::scope(*backend),
-            original_scope);
-  EXPECT_LT(elapsed, 500ms);
-  EXPECT_TRUE(execution.wait_for_completion(2'000'000'000LL));
+    ASSERT_TRUE(controlled.accepted)
+        << (controlled.error ? controlled.error->message : "no error");
+    EXPECT_TRUE(controlled.backend_stop_confirmed);
+    EXPECT_EQ(controlled.executed_stop_mode,
+              core::MotionInterruptStopMode::kSpringBackHold);
+    EXPECT_FALSE(controlled.completed_by_natural_completion);
+    const auto cursor =
+        backend->stopped_trajectory_time_s(execution.execution_generation);
+    ASSERT_TRUE(cursor);
+    EXPECT_DOUBLE_EQ(*cursor, trip_cursor);
+    const auto final_positions =
+        backend->get_execution_snapshot().joint_positions_rad;
+    ASSERT_EQ(final_positions.size(), trip_positions.size());
+    for (std::size_t i = 0; i < final_positions.size(); ++i)
+      EXPECT_NEAR(final_positions[i], trip_positions[i], 1e-6);
+    const auto dispatch = probe.first_index(
+        detail::NativeStopQualificationEvent::kPhysicalDispatch);
+    ASSERT_TRUE(dispatch.has_value());
+    if (explicit_spring) {
+      EXPECT_FALSE(controlled.fallback_reason.has_value());
+      EXPECT_FALSE(
+          probe
+              .first_index(
+                  detail::NativeStopQualificationEvent::kSubstitutionSelected)
+              .has_value());
+    } else {
+      ASSERT_TRUE(controlled.fallback_reason.has_value());
+      EXPECT_EQ(*controlled.fallback_reason,
+                "soft_on_path_remaining_time_short");
+      EXPECT_EQ(core::interrupt_structured_scalar_text(
+                    controlled.diagnostics.at("requested_stop_mode")),
+                "soft_on_path");
+      EXPECT_EQ(core::interrupt_structured_scalar_text(
+                    controlled.diagnostics.at("fallback_reason")),
+                *controlled.fallback_reason);
+      const auto selection = probe.first_index(
+          detail::NativeStopQualificationEvent::kSubstitutionSelected);
+      ASSERT_TRUE(selection.has_value());
+      EXPECT_LT(*selection, *dispatch);
+      EXPECT_EQ(
+          probe.first_detail(
+              detail::NativeStopQualificationEvent::kSubstitutionSelected),
+          "soft_on_path_remaining_time_short");
+    }
+    EXPECT_EQ(detail::NativeStopQualificationAccess::scope(*backend),
+              original_scope);
+    EXPECT_LT(elapsed, 500ms);
+    EXPECT_TRUE(execution.wait_for_completion(2'000'000'000LL));
+  }
 }
 
 } // namespace

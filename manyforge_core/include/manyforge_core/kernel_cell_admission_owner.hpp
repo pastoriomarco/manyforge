@@ -12,6 +12,8 @@ namespace manyforge::core {
 
 using CellAdmissionInterventionValidator = std::function<Result<void>(
     const CellAdmissionClaimIntentDTO&, const std::optional<CellAdmissionClaimDTO>&)>;
+using CellAdmissionProgramNodeValidator =
+    std::function<Result<void>(const ProgramNodeAdmissionEvidenceDTO&)>;
 using CellAdmissionSettlementValidator =
     std::function<Result<void>(const CellAdmissionClaimDTO&, const CellAdmissionClaimReleaseDTO&)>;
 using CellAdmissionReconcileValidator = std::function<Result<CellAdmissionReconcileValidationDTO>(
@@ -37,13 +39,23 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
       std::vector<CellAdmissionCurrentOwnerEpochDTO> recovered_current_owners = {},
       std::optional<ManagerLivenessRequiredSetDTO> manager_liveness_required_set = std::nullopt,
       CellAdmissionClaimGeneration recovered_claim_generation_high_water =
-          CellAdmissionClaimGeneration(0U));
+          CellAdmissionClaimGeneration(0U),
+      CellAdmissionProgramNodeValidator program_node_validator = {});
 
   [[nodiscard]] AuthoringAdmissionDTO GetAuthoringAdmission() const override;
   [[nodiscard]] Result<AuthoringAdmissionDTO> UpdateCellAdmissionReadiness(
       const CellAdmissionReadinessSnapshotDTO& snapshot) override;
   [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireCellAdmissionClaim(
       const CellAdmissionClaimIntentDTO& intent) override;
+  /// Process-local Kernel composition: validate its freshly resolved manual
+  /// offer without storing a second pending-offer registry.
+  [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireManualCellAdmissionClaim(
+      const CellAdmissionClaimIntentDTO& intent,
+      const CellAdmissionInterventionValidator& validate_offer);
+  /// Read the same readiness/claim preconditions used by manual acquisition.
+  /// This reserves nothing; the composing Kernel still checks the target hold.
+  [[nodiscard]] Result<void> CheckManualCellAdmissionReadiness(
+      std::optional<CellAdmissionClaimGeneration> parent) const;
   [[nodiscard]] Result<AuthoringAdmissionDTO> ReleaseCellAdmissionClaim(
       const CellAdmissionClaimReleaseDTO& release) override;
   [[nodiscard]] Result<AuthoringAdmissionDTO> ReconcileCellAdmissionClaims(
@@ -61,12 +73,19 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
   /// Current held authority, excluding released and reconciled predecessors.
   [[nodiscard]] std::optional<CellAdmissionClaimDTO> held_claim(
       CellAdmissionClaimKindDTO kind) const;
+  /// Bounded ordinary-release snapshot, never read by physical Stop. An empty
+  /// node identity denotes an unscoped child (e.g. intervention/recovery).
+  [[nodiscard]] std::vector<std::string> unsettled_program_child_nodes(
+      CellAdmissionClaimGeneration parent) const;
   /// Internal successor-owner request using the exact existing ledger inventory.
   /// It grants no release: Reconcile still requires Kernel settlement validation.
   [[nodiscard]] Result<std::optional<CellAdmissionReconcileDTO>>
   manual_owner_reconciliation_request() const;
 
  private:
+  [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireClaim(
+      const CellAdmissionClaimIntentDTO& intent,
+      const CellAdmissionInterventionValidator& validate_offer);
   struct Entry final {
     CellAdmissionClaimDTO claim;
     std::optional<CellAdmissionClaimReleaseDTO> release;
@@ -75,6 +94,7 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
 
   [[nodiscard]] AuthoringAdmissionDTO AdmissionLocked() const noexcept;
   [[nodiscard]] bool NonCycleReadinessLocked() const noexcept;
+  [[nodiscard]] bool ManualParentReadyLocked(const Entry* parent) const noexcept;
   [[nodiscard]] bool BaseReadinessLocked() const noexcept;
   [[nodiscard]] bool MatchingStartingProgramCycleLocked(
       const CellAdmissionClaimIntentDTO& intent) const noexcept;
@@ -104,6 +124,7 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
   CellAdmissionInterventionValidator intervention_validator_;
   CellAdmissionSettlementValidator settlement_validator_;
   CellAdmissionReconcileValidator reconcile_validator_;
+  CellAdmissionProgramNodeValidator program_node_validator_;
   mutable std::mutex mutex_;
   mutable std::mutex liveness_transition_mutex_;
   CellAdmissionReadinessSnapshotDTO readiness_;

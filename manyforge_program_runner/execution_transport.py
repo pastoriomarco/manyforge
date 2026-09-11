@@ -9,7 +9,10 @@ from typing import Annotated, Any, TypeVar
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from manyforge_behavior.orchestration_ports import ProgramSelectionReleaseRejectedError
-from manyforge_headless_api.execution import EXECUTION_COMMAND_VERSION, ExecutionCommandClient
+from manyforge_headless_api.execution import (
+    EXECUTION_COMMAND_VERSION,
+    ExecutionCommandClient,
+)
 from manyforge_headless_api.models import (
     MAX_OPERATION_PARTICIPANTS,
     StrictRequest,
@@ -58,7 +61,8 @@ class _ProgramControl(OperationControlRequest):
 
 class _ProgramOperation(OperationIntentRequest):
     participants: Annotated[
-        list[_ProgramParticipant], Field(min_length=1, max_length=MAX_OPERATION_PARTICIPANTS)
+        list[_ProgramParticipant],
+        Field(min_length=1, max_length=MAX_OPERATION_PARTICIPANTS),
     ]
 
 
@@ -103,10 +107,16 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
         try:
             return self.require_success(response)
         except HeadlessApiError as error:
-            if command.get("command") == "release_program_selection" and error.details.get("reason") in {
-                "program_selection_stale", "program_selection_unknown",
-                "program_selection_revision_stale", "program_selection_not_releasable",
+            if command.get(
+                "command"
+            ) == "release_program_selection" and error.details.get("reason") in {
+                "program_selection_stale",
+                "program_selection_unknown",
+                "program_selection_revision_stale",
+                "program_selection_not_releasable",
                 "program_selection_recovery_required",
+                "program_children_unsettled",
+                "program_run_admission_in_flight",
             }:
                 # These closed Kernel rejections all precede release. A lost,
                 # malformed or exceptional reply remains outcome-unknown.
@@ -158,24 +168,33 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
             }
         )
 
+    def read_manual_handover(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return super().read_manual_handover(
+            self._request(OperationIntentRequest, body), trusted_principal_id=None
+        )
+
     def stop_program_selection(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        return self._exchange_control({
-            "api_version": EXECUTION_COMMAND_VERSION,
-            "command": "stop_program_selection",
-            "attribution": self._request_attribution(None),
-            "request": dict(body),
-        })
+        return self._exchange_control(
+            {
+                "api_version": EXECUTION_COMMAND_VERSION,
+                "command": "stop_program_selection",
+                "attribution": self._request_attribution(None),
+                "request": dict(body),
+            }
+        )
 
     def release_program_selection(
         self, body: Mapping[str, Any], expected_selection_revision: int
     ) -> dict[str, Any]:
-        return self._exchange({
-            "api_version": EXECUTION_COMMAND_VERSION,
-            "command": "release_program_selection",
-            "attribution": self._request_attribution(None),
-            "request": dict(body),
-            "expected_selection_revision": expected_selection_revision,
-        })
+        return self._exchange(
+            {
+                "api_version": EXECUTION_COMMAND_VERSION,
+                "command": "release_program_selection",
+                "attribution": self._request_attribution(None),
+                "request": dict(body),
+                "expected_selection_revision": expected_selection_revision,
+            }
+        )
 
     def query_operation(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return super().query_operation(self._request(ProgramOperationQuery, body))
@@ -209,7 +228,8 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
         body: Mapping[str, Any],
     ) -> dict[str, Any]:
         request = self._request(
-            _ProgramControl if "execution_scope" in body else OperationControlRequest, body
+            _ProgramControl if "execution_scope" in body else OperationControlRequest,
+            body,
         )
         if request.operation_id != operation_id:
             raise HeadlessApiError(

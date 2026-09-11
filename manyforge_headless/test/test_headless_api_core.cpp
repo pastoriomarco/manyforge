@@ -474,6 +474,17 @@ CanonicalValue StopFaultClearProjectionPayload(const std::string &owner_epoch) {
   });
 }
 
+CanonicalValue WithField(const CanonicalValue &value,
+                         const std::string_view key,
+                         CanonicalValue replacement) {
+  auto fields = value.as_object();
+  for (auto &[name, field] : fields) {
+    if (name == key)
+      field = std::move(replacement);
+  }
+  return CanonicalValue(std::move(fields));
+}
+
 CanonicalValue CurrentStopFaultLatch() {
   return CanonicalValue(CanonicalValue::Object{
       {"captured_operation_ids", CanonicalValue(CanonicalValue::Array{
@@ -1442,11 +1453,13 @@ TEST(HeadlessApiCore,
   }
 }
 
-TEST(HeadlessApiCore, GripperConfirmationTraceIsBoundedAttributedAndNeverLiveProof) {
+TEST(HeadlessApiCore,
+     GripperConfirmationTraceIsBoundedAttributedAndNeverLiveProof) {
   TemporaryDirectory directory;
   HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
   CanonicalValue record(CanonicalValue::Object{
-      {"schema_version", CanonicalValue("manyforge.gripper_confirmation_trace.v1")},
+      {"schema_version",
+       CanonicalValue("manyforge.gripper_confirmation_trace.v1")},
       {"origin_epoch", CanonicalValue("control.session.1")},
       {"request_id", CanonicalValue("press.1")},
       {"source_label", CanonicalValue("station.operator")},
@@ -1471,27 +1484,30 @@ TEST(HeadlessApiCore, GripperConfirmationTraceIsBoundedAttributedAndNeverLivePro
   CanonicalValue page;
   do {
     page = core.HistoryPage(query);
-    if (Array(page, "events").size() == 1U) break;
+    if (Array(page, "events").size() == 1U)
+      break;
     std::this_thread::yield();
   } while (std::chrono::steady_clock::now() < deadline);
   ASSERT_EQ(Array(page, "events").size(), 1U);
-  const auto& event = Member(Array(page, "events").front(), "event");
+  const auto &event = Member(Array(page, "events").front(), "event");
   EXPECT_EQ(Text(event, "event_type"), "gripper_confirmation_attempted");
-  const auto& payload = Member(event, "payload");
+  const auto &payload = Member(event, "payload");
   EXPECT_EQ(Text(payload, "origin_epoch"), "control.session.1");
   EXPECT_EQ(Text(payload, "clock_owner"), "headless:api.epoch.1");
   EXPECT_EQ(Text(payload, "evidence_kind"), "operator_attestation_trace");
   EXPECT_EQ(payload.find_object_member("evidence"), nullptr);
-  for (const auto& [field, invalid] : CanonicalValue::Object{
+  for (const auto &[field, invalid] : CanonicalValue::Object{
            {"phase", CanonicalValue("sensor_proof")},
            {"command_id", CanonicalValue(0.0)},
            {"details", CanonicalValue(std::string(9000, 'x'))},
            {"confirmed", CanonicalValue(1.0)},
        }) {
     auto changed = record.as_object();
-    for (auto& [key, value] : changed)
-      if (key == field) value = invalid;
-    EXPECT_THROW(static_cast<void>(core.RecordGripperConfirmation(CanonicalValue(changed))),
+    for (auto &[key, value] : changed)
+      if (key == field)
+        value = invalid;
+    EXPECT_THROW(static_cast<void>(
+                     core.RecordGripperConfirmation(CanonicalValue(changed))),
                  OperatorAlarmError);
   }
 }
@@ -1512,11 +1528,12 @@ TEST(HeadlessApiCore, ProgramDiagnosticRetainsExactProducerValuesAndClock) {
       {"message", CanonicalValue("Program condition not met")},
       {"occurred_at_ns", CanonicalValue("9007199254740993")},
       {"occurred_at_wall", CanonicalValue("2026-09-08T00:00:00Z")},
-      {"blackboard",
-       CanonicalValue(CanonicalValue::Object{{"ready", CanonicalValue(false)},
-                                             {"program_run_id", CanonicalValue("foreign.run")}})},
-      {"runtime_overrides", CanonicalValue(CanonicalValue::Object{
-                                {"[\"move\",\"velocity_scale\"]", CanonicalValue(0.2)}})},
+      {"blackboard", CanonicalValue(CanonicalValue::Object{
+                         {"ready", CanonicalValue(false)},
+                         {"program_run_id", CanonicalValue("foreign.run")}})},
+      {"runtime_overrides",
+       CanonicalValue(CanonicalValue::Object{
+           {"[\"move\",\"velocity_scale\"]", CanonicalValue(0.2)}})},
       {"omitted_blackboard_count", CanonicalValue(2.0)},
       {"omitted_override_count", CanonicalValue(0.0)},
       {"delivery_loss_count", CanonicalValue(3.0)},
@@ -1530,17 +1547,20 @@ TEST(HeadlessApiCore, ProgramDiagnosticRetainsExactProducerValuesAndClock) {
   CanonicalValue page;
   do {
     page = core.HistoryPage(query);
-    if (Array(page, "events").size() == 1U) break;
+    if (Array(page, "events").size() == 1U)
+      break;
     std::this_thread::yield();
   } while (std::chrono::steady_clock::now() < deadline);
   ASSERT_EQ(Array(page, "events").size(), 1U);
-  const auto& stored = Array(page, "events").front();
-  const auto& event = Member(stored, "event");
+  const auto &stored = Array(page, "events").front();
+  const auto &event = Member(stored, "event");
   EXPECT_EQ(Text(event, "occurred_at_ns"), "9007199254740993");
   EXPECT_EQ(Text(event, "severity"), "ERROR");
-  EXPECT_EQ(content_identity::canonical_json(Member(Member(event, "payload"), "blackboard")),
+  EXPECT_EQ(content_identity::canonical_json(
+                Member(Member(event, "payload"), "blackboard")),
             "{\"program_run_id\":\"foreign.run\",\"ready\":false}");
-  EXPECT_EQ(Text(Member(event, "payload"), "clock_owner"), "program_runner:runner.1");
+  EXPECT_EQ(Text(Member(event, "payload"), "clock_owner"),
+            "program_runner:runner.1");
   query.correlations["program_run_id"] = "foreign.run";
   EXPECT_TRUE(Array(core.HistoryPage(query), "events").empty());
   auto near_limit = record.as_object();
@@ -1548,28 +1568,37 @@ TEST(HeadlessApiCore, ProgramDiagnosticRetainsExactProducerValuesAndClock) {
   for (std::size_t index = 0U; index < 8U; ++index) {
     std::string key("a");
     key += std::to_string(index);
-    near_values.emplace_back(std::move(key),
-                             CanonicalValue(std::string(index == 7U ? 1761U : 2040U, 'x')));
+    near_values.emplace_back(
+        std::move(key),
+        CanonicalValue(std::string(index == 7U ? 1761U : 2040U, 'x')));
   }
-  near_values.emplace_back("z", CanonicalValue(CanonicalValue::Array(100, CanonicalValue(0.0))));
-  for (auto& [name, value] : near_limit) {
-    if (name == "blackboard") value = CanonicalValue(near_values);
+  near_values.emplace_back(
+      "z", CanonicalValue(CanonicalValue::Array(100, CanonicalValue(0.0))));
+  for (auto &[name, value] : near_limit) {
+    if (name == "blackboard")
+      value = CanonicalValue(near_values);
   }
   EXPECT_TRUE(std::get<bool>(
-      Member(core.RecordProgramDiagnostic(CanonicalValue(near_limit)), "recorded").storage()));
-  for (const auto& oversized : {CanonicalValue(std::string(3000, 'x')),
-                                CanonicalValue(CanonicalValue::Array(513, CanonicalValue(0.0)))}) {
+      Member(core.RecordProgramDiagnostic(CanonicalValue(near_limit)),
+             "recorded")
+          .storage()));
+  for (const auto &oversized :
+       {CanonicalValue(std::string(3000, 'x')),
+        CanonicalValue(CanonicalValue::Array(513, CanonicalValue(0.0)))}) {
     auto invalid_values = record.as_object();
-    for (auto& [name, value] : invalid_values) {
+    for (auto &[name, value] : invalid_values) {
       if (name == "blackboard")
-        value = CanonicalValue(CanonicalValue::Object{{"oversized", oversized}});
+        value =
+            CanonicalValue(CanonicalValue::Object{{"oversized", oversized}});
     }
-    EXPECT_THROW(static_cast<void>(core.RecordProgramDiagnostic(CanonicalValue(invalid_values))),
+    EXPECT_THROW(static_cast<void>(core.RecordProgramDiagnostic(
+                     CanonicalValue(invalid_values))),
                  OperatorAlarmError);
   }
   auto invalid = record.as_object();
   invalid.emplace_back("accepted", CanonicalValue(true));
-  EXPECT_THROW(static_cast<void>(core.RecordProgramDiagnostic(CanonicalValue(std::move(invalid)))),
+  EXPECT_THROW(static_cast<void>(core.RecordProgramDiagnostic(
+                   CanonicalValue(std::move(invalid)))),
                OperatorAlarmError);
 }
 
@@ -2091,6 +2120,84 @@ TEST(HeadlessApiCore,
   EXPECT_EQ(Text(returned, "lifecycle_state"), "returned_unacknowledged");
   EXPECT_EQ(Text(Member(returned, "details"), "reason"),
             "stop_fault_context_retired");
+}
+
+TEST(HeadlessApiCore,
+     PendingStopFaultIsVisibleBeforeItsCertificateAndNeverAutoAcknowledged) {
+  TemporaryDirectory directory;
+  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+  const std::string epoch = "execution-host.epoch.pending-stop";
+  auto pending = WithField(CurrentStopFaultLatch(), "stop_certificate",
+                           CanonicalValue(nullptr));
+  pending = WithField(pending, "terminal_projection",
+                      WithField(Member(pending, "terminal_projection"), "state",
+                                CanonicalValue("pending")));
+  static_cast<void>(core.CompleteOperationEventSnapshot(epoch, 0U, pending));
+  auto snapshot = core.AlarmSnapshot();
+  EXPECT_EQ(Text(OnlyAlarm(snapshot), "lifecycle_state"),
+            "active_unacknowledged");
+  EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(
+      Member(Member(OnlyAlarm(snapshot), "correlations"), "stop_certificate_id")
+          .storage()));
+  const auto activation = Text(OnlyAlarm(snapshot), "activation_id");
+  EXPECT_THROW(
+      core.CompleteOperationEventSnapshot(
+          epoch, 0U,
+          WithField(pending, "recovery_status", CanonicalValue("ready"))),
+      OperatorAlarmError);
+
+  const auto terminal = StopTerminalProjectionPayload(
+      epoch, "succeeded_escalated", "succeeded", true);
+  static_cast<void>(core.IngestOperationEvent(
+      epoch, 1U, "stop_terminal_projected", std::nullopt, std::nullopt,
+      std::nullopt, 1100U, "2026-08-07T10:00:01.000000001Z", false, terminal,
+      content_identity::sha256_digest(
+          content_identity::canonical_json(terminal))));
+  static_cast<void>(
+      core.CompleteOperationEventSnapshot(epoch, 1U, CurrentStopFaultLatch()));
+  snapshot = core.AlarmSnapshot();
+  EXPECT_EQ(Text(OnlyAlarm(snapshot), "activation_id"), activation);
+  EXPECT_EQ(Text(OnlyAlarm(snapshot), "lifecycle_state"),
+            "active_unacknowledged");
+  EXPECT_EQ(
+      Text(Member(OnlyAlarm(snapshot), "correlations"), "stop_certificate_id"),
+      "stop-certificate.test.1");
+}
+
+TEST(HeadlessApiCore,
+     ClearingTheSelectedStopFaultDoesNotHideAnOlderUnresolvedFault) {
+  TemporaryDirectory directory;
+  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+  const std::string epoch = "execution-host.epoch.two-stop-faults";
+  // The clear fixture names test.1: make it the newer selected fault.
+  const auto older = WithField(CurrentStopFaultLatch(), "latch_id",
+                               CanonicalValue("stop-fault.older"));
+  static_cast<void>(core.CompleteOperationEventSnapshot(epoch, 0U, older));
+  const auto initial = core.AlarmSnapshot();
+  const auto activation = Text(OnlyAlarm(initial), "activation_id");
+  static_cast<void>(
+      core.CompleteOperationEventSnapshot(epoch, 0U, CurrentStopFaultLatch()));
+  // An event page omitting the cached observation is not an authoritative null.
+  static_cast<void>(core.CompleteOperationEventSnapshot(epoch, 0U));
+  auto snapshot = core.AlarmSnapshot();
+  EXPECT_EQ(Text(OnlyAlarm(snapshot), "lifecycle_state"),
+            "active_unacknowledged");
+  const auto cleared = StopFaultClearProjectionPayload(epoch);
+  static_cast<void>(core.IngestOperationEvent(
+      epoch, 1U, "stop_fault_cleared", "stop-fault-reset.test.1", std::nullopt,
+      std::nullopt, 1200U, "2026-08-07T10:00:01.000000002Z", false, cleared,
+      content_identity::sha256_digest(
+          content_identity::canonical_json(cleared))));
+  snapshot = core.AlarmSnapshot();
+  EXPECT_EQ(Text(OnlyAlarm(snapshot), "lifecycle_state"),
+            "active_unacknowledged");
+  static_cast<void>(core.CompleteOperationEventSnapshot(epoch, 1U, older));
+  snapshot = core.AlarmSnapshot();
+  EXPECT_EQ(Text(OnlyAlarm(snapshot), "activation_id"), activation);
+  EXPECT_EQ(Text(OnlyAlarm(snapshot), "lifecycle_state"),
+            "active_unacknowledged");
+  EXPECT_EQ(Text(Member(OnlyAlarm(snapshot), "correlations"), "latch_id"),
+            "stop-fault.older");
 }
 
 TEST(HeadlessApiCore,

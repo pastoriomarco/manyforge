@@ -84,9 +84,7 @@ def _progress_event(
     return event
 
 
-def _stop_projection_event(
-    owner_epoch: str, sequence: int
-) -> dict[str, Any]:
+def _stop_projection_event(owner_epoch: str, sequence: int) -> dict[str, Any]:
     payload = {
         "acceptance": {
             "entry_state": "active",
@@ -375,9 +373,7 @@ def test_execution_client_accepts_stop_terminal_as_stop_scoped_fact(
     terminal["request_id"] = "stop-request.1"
     with pytest.raises(HeadlessApiError) as invalid_request_identity:
         client.events(owner_epoch, 0)
-    assert invalid_request_identity.value.code == (
-        "execution_command_response_invalid"
-    )
+    assert invalid_request_identity.value.code == ("execution_command_response_invalid")
 
 
 def test_execution_client_accepts_stop_fault_clear_as_request_scoped_fact(
@@ -397,9 +393,7 @@ def test_execution_client_accepts_stop_fault_clear_as_request_scoped_fact(
     cleared["request_id"] = None
     with pytest.raises(HeadlessApiError) as invalid_request_identity:
         client.events(owner_epoch, 0)
-    assert invalid_request_identity.value.code == (
-        "execution_command_response_invalid"
-    )
+    assert invalid_request_identity.value.code == ("execution_command_response_invalid")
 
 
 def test_execution_client_requires_backend_residency_projection(
@@ -475,9 +469,7 @@ def test_execution_client_uses_internal_attribution_for_program_run_stop(
     public_client = ExecutionCommandClient(tmp_path)
     with pytest.raises(HeadlessApiError) as unavailable_publicly:
         public_client.stop_program_run(request)
-    assert unavailable_publicly.value.code == (
-        "execution_request_attribution_invalid"
-    )
+    assert unavailable_publicly.value.code == ("execution_request_attribution_invalid")
 
 
 def test_execution_client_reads_one_exact_internal_stop_status(
@@ -516,9 +508,7 @@ def test_execution_client_reads_one_exact_internal_stop_status(
 
     with pytest.raises(HeadlessApiError) as unavailable_publicly:
         ExecutionCommandClient(tmp_path).stop_status("stop.1")
-    assert unavailable_publicly.value.code == (
-        "execution_request_attribution_invalid"
-    )
+    assert unavailable_publicly.value.code == ("execution_request_attribution_invalid")
 
 
 def test_execution_client_releases_one_exact_internal_program_run_fence(
@@ -536,9 +526,10 @@ def test_execution_client_releases_one_exact_internal_program_run_fence(
         }
 
     monkeypatch.setattr(client, "_exchange", exchange)
-    assert client.release_program_run_stop_fence(
-        "program-run.1", "stop.1", 4
-    )["ok"] is True
+    assert (
+        client.release_program_run_stop_fence("program-run.1", "stop.1", 4)["ok"]
+        is True
+    )
     assert captured == {
         "api_version": "manyforge.execution_command.v1",
         "attribution": {
@@ -556,9 +547,7 @@ def test_execution_client_releases_one_exact_internal_program_run_fence(
         ExecutionCommandClient(tmp_path).release_program_run_stop_fence(
             "program-run.1", "stop.1", 4
         )
-    assert unavailable_publicly.value.code == (
-        "execution_request_attribution_invalid"
-    )
+    assert unavailable_publicly.value.code == ("execution_request_attribution_invalid")
 
 
 def test_execution_client_projects_scoped_full_and_fault_recovery_commands(
@@ -618,12 +607,15 @@ def test_execution_client_projects_scoped_full_and_fault_recovery_commands(
     monkeypatch.setattr(client, "_exchange_control", control_exchange)
     assert client.stop(stop, trusted_principal_id=None)["ok"] is True
     assert client.full_stop(full, trusted_principal_id=None)["ok"] is True
-    assert client.recognized_malformed_stop(
-        request_id="malformed-stop.http.1",
-        recognized_route="/api/execution/stops",
-        reason="recognized_stop_payload_invalid",
-        trusted_principal_id=None,
-    )["ok"] is True
+    assert (
+        client.recognized_malformed_stop(
+            request_id="malformed-stop.http.1",
+            recognized_route="/api/execution/stops",
+            reason="recognized_stop_payload_invalid",
+            trusted_principal_id=None,
+        )["ok"]
+        is True
+    )
     assert set(control_commands[0]["request"]) == {
         "components",
         "request_context",
@@ -713,15 +705,13 @@ def test_execution_client_projects_scoped_full_and_fault_recovery_commands(
             "expected_stop_certificate_id": latch["stop_certificate"][
                 "stop_certificate_id"
             ],
-            "expected_stop_certificate_revision": latch[
-                "stop_certificate"
-            ]["stop_certificate_revision"],
+            "expected_stop_certificate_revision": latch["stop_certificate"][
+                "stop_certificate_revision"
+            ],
             "expected_cell_id": latch["cell_id"],
             "expected_retained_bundle_id": latch["retained_bundle_id"],
             "expected_graph_revision": latch["graph_revision"],
-            "configuration_expectations": offer[
-                "configuration_expectations"
-            ],
+            "configuration_expectations": offer["configuration_expectations"],
             "reason": "operator confirmed non-moving clear",
         }
     )
@@ -730,9 +720,32 @@ def test_execution_client_projects_scoped_full_and_fault_recovery_commands(
         "get_stop_fault",
         "recover_stop_fault",
     ]
-    assert normal_commands[1]["request"]["request_context"][
-        "correlation_id"
-    ] is None
+    assert normal_commands[1]["request"]["request_context"]["correlation_id"] is None
+
+    # The same response can publish a fault before containment is settled,
+    # but cannot advertise recovery readiness or fabricated configuration.
+    pending = copy.deepcopy(offer)
+    pending["configuration_expectations"] = []
+    pending["latch"].update(
+        stop_certificate=None,
+        recovery_status="waiting_for_observation",
+        terminal_projection={
+            "error": None,
+            "retry_generation": None,
+            "state": "pending",
+        },
+    )
+    assert client._valid_stop_fault_offer(pending)
+    for key, value in (("recovery_status", "ready"), ("state", "recovery_pending")):
+        invalid = copy.deepcopy(pending)
+        invalid["latch"][key] = value
+        assert not client._valid_stop_fault_offer(invalid)
+    invalid = copy.deepcopy(pending)
+    invalid["configuration_expectations"] = [expectation]
+    assert not client._valid_stop_fault_offer(invalid)
+    invalid = copy.deepcopy(offer)
+    invalid["latch"]["stop_certificate"]["stop_id"] = "wrong-stop"
+    assert not client._valid_stop_fault_offer(invalid)
 
 
 def _direct_motion_request() -> OperationIntentRequest:
@@ -867,9 +880,7 @@ def _direct_command_request() -> OperationIntentRequest:
             "max_effort": None,
         },
         "completion_timeout_s": 2.0,
-        "caller_options": [
-            {"option_id": "command_duration_s", "value_s": 0.5}
-        ],
+        "caller_options": [{"option_id": "command_duration_s", "value_s": 0.5}],
     }
     return OperationIntentRequest.model_validate(value)
 
@@ -896,9 +907,7 @@ def _command_preview_response(operation: dict[str, Any]) -> dict[str, Any]:
         "required_capability_id": "tool.gripper.command",
         "retained_bundle_id": "sha256:bundle",
         "scene_revision": operation["expected_scene_revision"],
-        "schema_version": (
-            "manyforge.direct_control_capability_command_preview.v1"
-        ),
+        "schema_version": ("manyforge.direct_control_capability_command_preview.v1"),
         "source_coordinate_name": "finger_joint",
         "source_kind": "model_role",
         "target_position": 0.03,
@@ -913,6 +922,102 @@ def _command_preview_response(operation: dict[str, Any]) -> dict[str, Any]:
         "ok": True,
         "preview_receipt": receipt,
     }
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "idle",
+        "unused",
+        "held",
+        "large",
+        "stale",
+        "malformed",
+        "extra",
+        "blocked",
+        "cleanup",
+        "cleanup_without_parent",
+        "bad_availability",
+    ],
+)
+def test_manual_handover_query_is_one_bounded_identity_checked_read(
+    tmp_path, monkeypatch, case
+):
+    client = ExecutionCommandClient(tmp_path)
+    request = _direct_motion_request()
+    captured = []
+
+    def exchange(command):
+        captured.append(command)
+        operation = command["operation"]
+        result = {
+            "api_version": "manyforge.execution_command_response.v1",
+            "command": "read_manual_handover",
+            "ok": True,
+            "availability": {
+                "available": True,
+                "cleanup_required": False,
+                "unavailable_reason": None,
+            },
+            "request_id": request.request_context.request_id,
+            "request_owner_epoch": request.request_context.request_owner_epoch,
+            "intent_digest": "sha256:"
+            + hashlib.sha256(rfc8785.dumps(operation)).hexdigest(),
+            "handover": (
+                None
+                if case == "idle"
+                else {
+                    "context": {
+                        "program_runner_owner_epoch": "runner.1",
+                        "program_run_id": "parent.1",
+                        "claim_generation": 1,
+                        "selection_revision": 0 if case == "unused" else 3,
+                    },
+                    "producer_node_indices": (
+                        []
+                        if case == "unused"
+                        else list(range(100_000)) if case == "large" else [1, 3]
+                    ),
+                }
+            ),
+        }
+        if case == "stale":
+            result["intent_digest"] = "sha256:" + "0" * 64
+        elif case == "malformed":
+            result["handover"]["producer_node_indices"] = [True]
+        elif case == "extra":
+            result["permission"] = True
+        elif case == "blocked":
+            result["availability"] = {
+                "available": False,
+                "cleanup_required": False,
+                "unavailable_reason": "manual_control_target_busy",
+            }
+        elif case in {"cleanup", "cleanup_without_parent"}:
+            result["availability"]["cleanup_required"] = True
+            if case == "cleanup_without_parent":
+                result["handover"] = None
+        elif case == "bad_availability":
+            result["availability"]["unavailable_reason"] = "contradictory"
+        assert len(rfc8785.dumps(result)) < 4 * 1024 * 1024
+        return result
+
+    monkeypatch.setattr(client, "_exchange", exchange)
+    if case in {
+        "stale",
+        "malformed",
+        "extra",
+        "cleanup_without_parent",
+        "bad_availability",
+    }:
+        with pytest.raises(HeadlessApiError):
+            client.read_manual_handover(request, trusted_principal_id=None)
+    else:
+        result = client.read_manual_handover(request, trusted_principal_id=None)
+        assert (result["handover"] is None) == (case == "idle")
+    assert len(captured) == 1
+    assert captured[0]["command"] == "read_manual_handover"
+    assert captured[0]["operation"] == request.model_dump(mode="json")
 
 
 def test_execution_client_verifies_complete_motion_preview_receipt(
@@ -1006,9 +1111,7 @@ def test_execution_client_verifies_capability_command_preview_receipt(
         return _command_preview_response(command["operation"])
 
     monkeypatch.setattr(client, "_exchange", exchange)
-    response = client.preview_capability_command(
-        request, trusted_principal_id=None
-    )
+    response = client.preview_capability_command(request, trusted_principal_id=None)
 
     assert captured["command"] == "preview_capability_command"
     assert response["preview_receipt"]["target_position"] == 0.03
@@ -1030,15 +1133,11 @@ def test_execution_client_verifies_capability_command_preview_receipt(
     local_response = client.preview_capability_command(
         request, trusted_principal_id=None
     )
-    assert local_response["preview_receipt"]["source_kind"] == (
-        "component_local"
-    )
+    assert local_response["preview_receipt"]["source_kind"] == ("component_local")
 
     def stale_schema(command: dict[str, Any]) -> dict[str, Any]:
         response = _command_preview_response(command["operation"])
-        response["preview_receipt"]["command_schema_revision"] = (
-            "sha256:stale"
-        )
+        response["preview_receipt"]["command_schema_revision"] = "sha256:stale"
         return response
 
     monkeypatch.setattr(client, "_exchange", stale_schema)
@@ -1399,7 +1498,9 @@ def test_event_pump_wakes_cold_state_when_idle_kernel_admission_advances() -> No
     assert execution.events_calls == 0
 
 
-def test_event_pump_reconciles_idle_after_owner_retirement_at_event_high_water() -> None:
+def test_event_pump_reconciles_idle_after_owner_retirement_at_event_high_water() -> (
+    None
+):
     core = _RecordingCore()
     execution = _RetiringExecution()
     pump = ExecutionEventPump(  # type: ignore[arg-type]
@@ -1502,9 +1603,7 @@ def test_event_pump_preserves_terminal_stop_projection_and_digest() -> None:
     assert core.ingested[0]["payload_json"] == rfc8785.dumps(
         execution.event["payload"]
     ).decode("utf-8")
-    assert core.ingested[0]["payload_digest"] == execution.event[
-        "payload_digest"
-    ]
+    assert core.ingested[0]["payload_digest"] == execution.event["payload_digest"]
 
 
 def test_event_pump_marks_a_lost_current_source_unknown() -> None:

@@ -1,8 +1,16 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <manyforge_core/detail/runtime_scale_governor.hpp>
+#include <manyforge_core/ports/iexecution_backend.hpp>
+#include <manyforge_core/prepared_execution_membership.hpp>
+#include <manyforge_core/runtime_participant_binding.hpp>
+#include <manyforge_core/time/iclock.hpp>
+#include <manyforge_core/time/ischeduler.hpp>
+#include <manyforge_roboplan/retained_observed_state_channel.hpp>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -13,12 +21,6 @@
 #include <thread>
 #include <tuple>
 #include <vector>
-
-#include <manyforge_core/ports/iexecution_backend.hpp>
-#include <manyforge_core/runtime_participant_binding.hpp>
-#include <manyforge_core/time/iclock.hpp>
-#include <manyforge_core/time/ischeduler.hpp>
-#include <manyforge_roboplan/retained_observed_state_channel.hpp>
 
 namespace manyforge::roboplan_backend {
 
@@ -41,7 +43,6 @@ struct RoboPlanExecutionBackendConfig {
   double soft_on_path_sample_period_s = 0.01;
   std::optional<double> soft_on_path_max_initial_path_deviation_rad;
   std::optional<double> soft_on_path_max_initial_velocity_deviation_rad_s;
-  std::map<std::string, double> soft_on_path_max_jerk_rad_s3;
 };
 
 struct RoboPlanSceneProjectionMetrics {
@@ -73,7 +74,13 @@ public:
   ~RoboPlanExecutionBackend() override;
 
   core::PrepareParticipantResultDTO
-  Prepare(const core::PreparedOperationParticipantDTO &participant) override;
+  Prepare(const core::PreparedOperationParticipantDTO &participant,
+          std::uint64_t execution_id) override;
+  core::Result<void> BindPreparedExecutionClock(
+      const core::PreparedOperationParticipantDTO &participant,
+      std::shared_ptr<core::detail::CoordinatedExecutionClock> clock) override;
+  core::Result<void>
+  RetirePreparedExecution(std::uint64_t execution_id) override;
   core::ExecutionHandle
   Dispatch(const core::PreparedOperationParticipantDTO &participant,
            const core::ControllerGoalId &controller_goal_id,
@@ -91,6 +98,8 @@ public:
   core::ExecutionHandle resume(const core::TrajectoryDTO &trajectory) override;
   core::ResetResultDTO reset() override;
   core::ExecutionSnapshot get_execution_snapshot() const override;
+  std::optional<double>
+  stopped_trajectory_time_s(std::uint64_t execution_generation) const override;
   const core::ObservedRobotStatePublication *
   observed_robot_state_publication() const noexcept override {
     const auto *publication =
@@ -121,6 +130,7 @@ public:
   core::RuntimeScaleMechanismStatusDTO
   runtime_velocity_scale_status() const override;
 
+  // Advertised upper bound; the exact trajectory preparation may be slower.
   [[nodiscard]] static constexpr double
   qualified_runtime_scale_slew_per_second() noexcept {
     return 4.0;
@@ -164,8 +174,20 @@ private:
     std::atomic<bool> pause_requested{false};
     std::atomic<bool> natural_completion_stop_requested{false};
     std::shared_ptr<const core::TrajectoryDTO> active_trajectory;
+    std::uint64_t active_trajectory_generation{};
+    bool original_path_cursor_valid{};
     double active_trajectory_time_s = 0.0;
     double active_runtime_velocity_scale = 1.0;
+    double active_runtime_scale_rate_per_s = 0.0;
+    double active_runtime_scale_target = 1.0;
+  };
+
+  struct TimeLawSample {
+    double trajectory_time_s;
+    core::detail::RuntimeScaleGovernor &governor;
+    std::int64_t timestamp_ns;
+    double available_target_scale;
+    bool valid{true};
   };
 
   enum class SceneUpdateMode {
@@ -176,7 +198,8 @@ private:
   std::int64_t
   publish_snapshot(core::ExecutionState state, double progress,
                    const std::vector<double> &joint_positions,
-                   std::optional<core::ErrorDTO> error = std::nullopt);
+                   std::optional<core::ErrorDTO> error = std::nullopt,
+                   TimeLawSample *time_law = nullptr);
   RetainedStateProjectionResult
   publish_observed_state_authority(std::span<const double> positions,
                                    std::span<const double> velocities,
@@ -192,16 +215,30 @@ private:
                               SceneUpdateMode mode = SceneUpdateMode::kBlocking,
                               std::int64_t source_timestamp_ns = 0);
   void execution_worker(std::stop_token st, core::TrajectoryDTO trajectory,
-                        std::uint64_t execution_generation);
+                        std::uint64_t execution_generation,
+                        std::shared_ptr<core::detail::CoordinatedExecutionClock> common_clock,
+                        core::OperationParticipantId participant_id);
+  core::ExecutionHandle execute_with_clock(
+      const core::TrajectoryDTO &trajectory,
+      std::shared_ptr<core::detail::CoordinatedExecutionClock> common_clock,
+      core::OperationParticipantId participant_id);
   void request_execution_worker_stop() noexcept;
+  bool issue_software_hard_stop(
+      std::optional<std::uint64_t> expected_execution = std::nullopt) noexcept;
+  void request_execution_worker_stop_locked() noexcept;
   void publish_execution_inactive() noexcept;
   core::ControlledStopResultDTO execute_controlled_stop_impl(
       const core::MotionInterruptStopProfileDTO &profile,
-      std::stop_token stop_token, std::uint64_t hard_stop_request_generation);
+      std::stop_token stop_token, std::uint64_t hard_stop_request_generation,
+      std::chrono::steady_clock::time_point command_deadline);
+  core::ControlledStopResultDTO execute_controlled_stop_until(
+      const core::MotionInterruptStopProfileDTO &profile,
+      std::stop_token stop_token,
+      std::chrono::steady_clock::time_point command_deadline);
   void request_active_controlled_stop();
   void observe_stop_qualification(detail::NativeStopQualificationEvent event,
                                   std::string_view detail = {});
-  void begin_controlled_stop_runtime_scale_freeze();
+  std::optional<std::int64_t> begin_controlled_stop_runtime_scale_freeze();
   bool end_controlled_stop_runtime_scale_freeze();
   void record_scene_projection_success(std::int64_t source_timestamp_ns);
   void record_scene_projection_miss();
@@ -233,14 +270,15 @@ private:
   std::unique_ptr<core::ExecutionProgressPublication>
       execution_progress_publication_;
   std::atomic<std::uint64_t> next_execution_progress_generation_{1};
-  // Exact currently-running native execution occurrence. Prepared goal
-  // cancellation compares against this generation before it can affect the
-  // worker, so an old goal can never stop a later execution.
-  std::atomic<std::uint64_t> active_execution_generation_{0};
+  // Latest admitted occurrence, retained through controlled replay and goal
+  // terminality until Reset or a newer dispatch. Goal terminality is not rest.
+  // Check/issue and replacement are serialized by execution_mutex_.
+  std::atomic<std::uint64_t> last_execution_generation_{0};
   std::vector<double> observed_at_rest_velocities_;
 
   mutable std::mutex execution_mutex_;
   mutable std::mutex state_mutex_;
+  std::condition_variable_any stop_snapshot_cv_;
   // On-demand observations of the native scaler itself, independent of the
   // motion stream (which intentionally has no ticks while paused).
   mutable std::uint64_t runtime_scale_observation_sequence_{};
@@ -261,6 +299,9 @@ private:
   // pairs with memory_order_acquire on the worker's per-tick read.
   std::atomic<double> runtime_velocity_scale_{1.0};
   mutable std::mutex runtime_velocity_scale_mutex_;
+  // Guarded by runtime_velocity_scale_mutex_, not prepared membership.
+  std::shared_ptr<core::detail::CoordinatedExecutionClock>
+      active_execution_clock_;
   int controlled_stop_runtime_scale_freeze_depth_ = 0;
   std::optional<double> deferred_runtime_velocity_scale_;
   std::atomic<std::uint64_t> scene_projection_misses_total_{0};
@@ -279,6 +320,7 @@ private:
       pending_terminal_scene_projection_;
 
   struct PreparedGoalRecord final {
+    core::ControllerGoalId goal_id;
     core::ControllerGoalGeneration generation;
     core::ContentDigest prepared_contract_digest;
     // Retain only the Stop-visible projection of the prepared participant.
@@ -308,13 +350,10 @@ private:
     std::vector<core::PreparedParticipantStopPlanDTO> stop_plans;
     core::ExecutionHandle handle;
   };
-  static constexpr std::size_t kPreparedReplayCapacity = 4096U;
   mutable std::mutex prepared_execution_mutex_;
-  std::map<std::tuple<core::OperationId, core::OperationRevision,
-                      core::OperationParticipantId>,
-           core::ContentDigest>
-      prepared_participants_;
-  std::map<core::ControllerGoalId, PreparedGoalRecord> prepared_goals_;
+  core::PreparedExecutionMembership prepared_membership_;
+  std::optional<PreparedGoalRecord> prepared_goal_;
+  std::shared_ptr<core::detail::CoordinatedExecutionClock> prepared_execution_clock_;
   std::jthread terminal_scene_projection_retry_thread_;
 
   friend class detail::NativeStopQualificationAccess;

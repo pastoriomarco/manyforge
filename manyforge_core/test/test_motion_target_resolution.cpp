@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <limits>
+#include <manyforge_core/detail/motion_resume_intent.hpp>
 #include <manyforge_core/motion_target_resolution.hpp>
 #include <manyforge_core/testing/addressed_request_fixtures.hpp>
 #include <map>
@@ -15,8 +17,80 @@ Pose3DTO pose_at(double x_m, double y_m, double z_m) {
   return pose;
 }
 
+TEST(MotionResumeIntentTest, RetainsResolvedJointAndPoseDestinationsWithoutCursor) {
+  const auto current = pose_at(9.0, 8.0, 7.0);
+  for (const ResolvedMotionSpecDTO& source : std::vector<ResolvedMotionSpecDTO>{
+           ResolvedJointGoalDTO{{ResourceId("joint")}, {"joint"}, {0.5}},
+           PoseGoalDTO{pose_at(0.1, 0.2, 0.3)}}) {
+    auto retained = detail::capture_motion_resume_intent(source, {}, std::nullopt);
+    ASSERT_TRUE(retained.ok());
+    const auto resumed = detail::resume_motion_from_current_tcp(retained.value(), current);
+    EXPECT_EQ(resumed, source);
+  }
+}
+
+TEST(MotionResumeIntentTest, ReplacesOnlyConsumedCartesianPrefixAndKeepsConstraints) {
+  CartesianPathDTO source;
+  source.waypoints = {pose_at(0, 0, 0), pose_at(1, 0, 0), pose_at(2, 0, 0), pose_at(1, 0, 0)};
+  source.max_linear_speed_mps = 0.037;
+  source.max_angular_acceleration_rad_s2 = 0.123;
+  TrajectoryDTO trajectory;
+  trajectory.waypoints = {{0.0, {0.0}, {}, {}}, {3.0, {1.0}, {}, {}}};
+  trajectory.cartesian_waypoint_times_s = {0.0, 1.0, 2.0, 3.0};
+  auto retained = detail::capture_motion_resume_intent(source, trajectory, 1.5);
+  ASSERT_TRUE(retained.ok());
+  EXPECT_EQ(retained.value().next_cartesian_waypoint, 2U);
+  const auto current = pose_at(0.3, 0.4, 0.5);
+  const auto resumed = detail::resume_motion_from_current_tcp(retained.value(), current);
+  auto expected = source;
+  expected.waypoints = {current, source.waypoints[2], source.waypoints[3]};
+  EXPECT_EQ(std::get<CartesianPathDTO>(resumed), expected);
+  EXPECT_EQ(std::get<CartesianPathDTO>(retained.value().motion), source);
+}
+
+TEST(MotionResumeIntentTest, ExactMilestonesConsumeDuplicatesButRetainInterruptedFinalTarget) {
+  CartesianPathDTO source;
+  source.waypoints = {pose_at(0, 0, 0), pose_at(1, 0, 0), pose_at(1, 0, 0), pose_at(0, 0, 0)};
+  TrajectoryDTO trajectory;
+  trajectory.waypoints = {{0.0, {0.0}, {}, {}}, {2.0, {0.0}, {}, {}}};
+  trajectory.cartesian_waypoint_times_s = {0.0, 1.0, 1.0, 2.0};
+  const auto before =
+      detail::capture_motion_resume_intent(source, trajectory, std::nextafter(1.0, 0.0));
+  ASSERT_TRUE(before.ok());
+  EXPECT_EQ(before.value().next_cartesian_waypoint, 1U);
+  const auto reached = detail::capture_motion_resume_intent(source, trajectory, 1.0);
+  ASSERT_TRUE(reached.ok());
+  EXPECT_EQ(reached.value().next_cartesian_waypoint, 3U);
+  const auto complete = detail::capture_motion_resume_intent(source, trajectory, 2.0);
+  ASSERT_TRUE(complete.ok());
+  EXPECT_EQ(complete.value().next_cartesian_waypoint, 3U);
+  for (const auto& current : {source.waypoints.back(), pose_at(8, 9, 10)}) {
+    const auto resumed = detail::resume_motion_from_current_tcp(complete.value(), current);
+    const auto& path = std::get<CartesianPathDTO>(resumed);
+    ASSERT_EQ(path.waypoints.size(), 2U);
+    EXPECT_EQ(path.waypoints.front(), current);
+    EXPECT_EQ(path.waypoints.back(), source.waypoints.back());
+  }
+}
+
+TEST(MotionResumeIntentTest, MissingOrCrossedProgressNeverGuessesRemainingDestinations) {
+  CartesianPathDTO source;
+  source.waypoints = {pose_at(0, 0, 0), pose_at(1, 0, 0), pose_at(2, 0, 0)};
+  TrajectoryDTO trajectory;
+  trajectory.waypoints = {{0.0, {0.0}, {}, {}}, {2.0, {1.0}, {}, {}}};
+  trajectory.cartesian_waypoint_times_s = {0.0, 1.0, 2.0};
+  for (const auto cursor : std::vector<std::optional<double>>{
+           std::nullopt, -1.0, 2.1, std::numeric_limits<double>::quiet_NaN()})
+    EXPECT_FALSE(detail::capture_motion_resume_intent(source, trajectory, cursor).ok());
+  for (const auto& times : std::vector<std::vector<double>>{
+           {}, {0.0, 2.0}, {0.0, 2.0, 1.0}, {0.1, 1.0, 2.0}, {0.0, 1.0, 3.0}}) {
+    trajectory.cartesian_waypoint_times_s = times;
+    EXPECT_FALSE(detail::capture_motion_resume_intent(source, trajectory, 0.5).ok());
+  }
+}
+
 class ReferenceResolver final : public IReferencePoseResolver {
-public:
+ public:
   mutable int call_count = 0;
   std::map<std::string, Pose3DTO> poses;
 
@@ -176,5 +250,5 @@ TEST(MotionTargetResolution, NamedTargetsAreAbsoluteOnly) {
             "relative_named_target_unsupported");
 }
 
-} // namespace
-} // namespace manyforge::core
+}  // namespace
+}  // namespace manyforge::core

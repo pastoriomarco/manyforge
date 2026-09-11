@@ -118,10 +118,14 @@ def test_rest_and_local_adapters_share_one_ingress_and_result_contract() -> None
     assert [stamp.transport_kind for stamp in stamps] == ["rest", "local"]
     assert stamps[0].trusted_principal_id == "operator.1"
     assert stamps[1].trusted_principal_id == "plc.1"
-    assert stamps[1].received_server_sequence == (stamps[0].received_server_sequence + 1)
+    assert stamps[1].received_server_sequence == (
+        stamps[0].received_server_sequence + 1
+    )
 
 
-def test_expired_ordinary_command_fails_before_dispatch_but_stop_remains_containable() -> None:
+def test_expired_ordinary_command_fails_before_dispatch_but_stop_remains_containable() -> (
+    None
+):
     clock = _Clock()
     ingress, stamps = _ingress(clock)
     ordinary = _request(ingress, kind="program_run")
@@ -146,7 +150,9 @@ def test_expired_ordinary_command_fails_before_dispatch_but_stop_remains_contain
     assert stamps[0].valid_until_monotonic_ns is None
 
 
-def test_forwarded_deadline_preserves_authenticated_issue_time_not_receipt_time() -> None:
+def test_forwarded_deadline_preserves_authenticated_issue_time_not_receipt_time() -> (
+    None
+):
     clock = _Clock()
     ingress, stamps = _ingress(clock)
     request = _request(ingress)
@@ -310,7 +316,9 @@ def test_control_sequences_rotate_together_only_after_the_last_session_closes() 
         ingress.close()
 
 
-def test_native_command_uses_projected_execution_owner_fence_and_surfaces_rejection() -> None:
+def test_native_command_uses_projected_execution_owner_fence_and_surfaces_rejection() -> (
+    None
+):
     class Service:
         def __init__(self, result: dict[str, Any]) -> None:
             self.result = result
@@ -380,8 +388,12 @@ def test_native_command_uses_projected_execution_owner_fence_and_surfaces_reject
         command(), stamp
     )
     assert accepted.disposition == "received"
-    assert accepted_service.request.request_context.request_owner_epoch == ("kernel.epoch.4")
-    assert accepted_service.request.request_context.request_id == ("request.scale.intent")
+    assert accepted_service.request.request_context.request_owner_epoch == (
+        "kernel.epoch.4"
+    )
+    assert accepted_service.request.request_context.request_id == (
+        "request.scale.intent"
+    )
     assert accepted_service.request.request_context.correlation_id == ("request.scale")
 
     rejected_service = Service(
@@ -396,6 +408,176 @@ def test_native_command_uses_projected_execution_owner_fence_and_surfaces_reject
     assert rejected.disposition == "rejected"
     assert rejected.code == "stale_request_owner_epoch"
     assert result == rejected_service.result
+
+
+@pytest.mark.parametrize(
+    "kind,case",
+    [
+        ("operation_pause", "current"),
+        ("operation_resume", "current"),
+        ("operation_reset", "current"),
+        ("operation_acknowledge_completed", "current"),
+        ("operation_resume", "other_operation"),
+        ("operation_resume", "old_revision"),
+        ("operation_resume", "old_owner"),
+        ("operation_resume", "retired"),
+        ("operation_resume", "not_allowed"),
+        ("operation_reset", "recovery"),
+    ],
+)
+def test_running_program_controls_only_exact_native_manual_operation(kind, case):
+    calls = []
+
+    class Service:
+        @staticmethod
+        def program_cycle_status():
+            return {
+                "program_runner_owner_epoch": "runner.1",
+                "execution_control_revision": 7,
+                "cycle_generation": 3,
+                "program_run_id": "program.1",
+                "state": "recovery_required" if case == "recovery" else "running",
+                "allowed_commands": [
+                    {
+                        "command_kind": kind,
+                        "allowed": case != "not_allowed",
+                        "disabled_reason": "program_cycle_state_resetting",
+                    }
+                ],
+            }
+
+        @staticmethod
+        def execution_control_state():
+            calls.append("projection")
+            return {
+                "identity": {
+                    "owner_epoch": "old" if case == "old_owner" else "kernel.1"
+                },
+                "control_state": {
+                    "schema_version": "manyforge.execution_control_state.v4",
+                    "manual_operations": [
+                        {
+                            "resident": case != "retired",
+                            "operation": {
+                                "operation_id": (
+                                    "other" if case == "other_operation" else "manual.1"
+                                ),
+                                "operation_revision": (
+                                    2 if case == "old_revision" else 3
+                                ),
+                            },
+                        }
+                    ],
+                },
+            }
+
+        @staticmethod
+        def execute_control(request, attribution):
+            del attribution
+            calls.append("effect")
+            assert request.operation_id == "manual.1"
+            assert request.expected_operation_revision == 3
+            assert request.request_context.request_owner_epoch == "kernel.1"
+            return {"ok": True, "accepted": {}}
+
+        execution_pause = execution_resume = execution_reset = (
+            execution_acknowledge_completed
+        ) = execute_control
+
+    ingress, _ = _ingress(_Clock())
+    try:
+        request = _request(ingress, kind=kind).model_copy(
+            update={
+                "payload": {
+                    "expected_execution_owner_epoch": "kernel.1",
+                    "operation_id": "manual.1",
+                    "expected_operation_revision": 3,
+                }
+            }
+        )
+    finally:
+        ingress.close()
+    result, _ = HeadlessExecutionControlDispatch(Service())(
+        request,
+        ExecutionIngressStamp(
+            transport_kind="websocket",
+            receiver_incarnation="receiver.1",
+            received_server_sequence=1,
+            received_monotonic_ns=1,
+        ),
+    )
+    if case in {"current", "recovery"}:
+        assert result.disposition == "received"
+        assert calls == ["projection", "effect"]
+    else:
+        assert result.disposition == "rejected"
+        assert calls == ([] if case == "not_allowed" else ["projection"])
+
+
+@pytest.mark.parametrize("context_present", [False, True])
+def test_held_manual_start_requires_context_and_native_decision(context_present):
+    from manyforge_headless_api.tests.test_execution_events import (
+        _direct_command_request,
+    )
+
+    submitted = []
+
+    class Service:
+        @staticmethod
+        def program_cycle_status():
+            return {
+                "program_runner_owner_epoch": "runner.1",
+                "execution_control_revision": 7,
+                "cycle_generation": 3,
+                "program_run_id": "program.1",
+                "state": "running",
+                "allowed_commands": [
+                    {
+                        "command_kind": "operation_start",
+                        "allowed": True,
+                        "disabled_reason": None,
+                    }
+                ],
+            }
+
+        @staticmethod
+        def execution_submit(request, attribution):
+            del attribution
+            submitted.append(request)
+            # A copied context is not permission. The native owner's exact
+            # rejection must survive dispatch rather than become acceptance.
+            return {"ok": False, "error": {"code": "manual_handover_scope_stale"}}
+
+    payload = _direct_command_request().model_dump(mode="json")
+    payload["expected_execution_owner_epoch"] = "kernel.1"
+    if context_present:
+        payload["manual_handover"] = {
+            "program_runner_owner_epoch": "runner.1",
+            "program_run_id": "program.1",
+            "claim_generation": 1,
+            "selection_revision": 0,
+        }
+    ingress, _ = _ingress(_Clock())
+    try:
+        request = _request(ingress, kind="operation_start").model_copy(
+            update={"payload": payload}
+        )
+    finally:
+        ingress.close()
+    result, _ = HeadlessExecutionControlDispatch(Service())(
+        request,
+        ExecutionIngressStamp(
+            transport_kind="websocket",
+            receiver_incarnation="receiver.1",
+            received_server_sequence=1,
+            received_monotonic_ns=1,
+        ),
+    )
+    assert result.disposition == "rejected"
+    assert result.code == (
+        "manual_handover_scope_stale" if context_present else "manual_handover_required"
+    )
+    assert len(submitted) == int(context_present)
 
 
 def test_standalone_native_control_does_not_require_a_program_runner() -> None:
@@ -468,4 +650,6 @@ def test_standalone_native_control_does_not_require_a_program_runner() -> None:
 
     assert submission.receipt.disposition == "received"
     assert submission.receipt.semantic_owner_epoch == "kernel.epoch.standalone"
-    assert service.request.request_context.request_owner_epoch == ("kernel.epoch.standalone")
+    assert service.request.request_context.request_owner_epoch == (
+        "kernel.epoch.standalone"
+    )

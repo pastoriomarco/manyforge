@@ -12,6 +12,38 @@ import pytest
 core = pytest.importorskip("manyforge_core_py")
 
 
+def test_stop_timing_keeps_ramp_allowances_and_operational_timeout_distinct():
+    timing = core.StopTimingParametersDTO(250_000_000, 750_000_000, 2_000_000_000)
+    assert timing.command_latency_allowance_ns == 250_000_000
+    assert timing.settling_allowance_ns == 750_000_000
+    assert timing.operational_timeout_ns == 2_000_000_000
+    assert core.validate_controlled_stop_timing(timing, 1_000_000_000) is None
+    error = core.validate_controlled_stop_timing(timing, 1_000_000_001)
+    assert error.details["minimum_timeout_ns"] == "2000000001"
+    with pytest.raises(AttributeError):
+        timing.operational_timeout_ns = 1
+    selection = core.StopTimingSelectionDTO(
+        core.ControlBindingId("arm"),
+        core.ControlBindingRevision("sha256:" + "a" * 64),
+        timing,
+    )
+    inputs = core.DeploymentApplicabilityInputsDTO(
+        None, [], [], [], [], [], [], [selection]
+    )
+    assert inputs.stop_timing_parameters == [selection]
+    assert inputs.stop_timing_parameters[0].timing == timing
+    with pytest.raises(AttributeError):
+        selection.timing = core.StopTimingParametersDTO(1, 0, 2)
+
+
+def test_authored_stop_duration_uses_the_same_decimal_rounding_as_deadlines():
+    assert core.authored_stop_duration_ns(1.1) == 1_100_000_000
+    assert core.authored_stop_duration_ns(1.100000001) == 1_100_000_001
+    for invalid in (0, -1, float("nan"), float("inf"), 2.1):
+        with pytest.raises(ValueError):
+            core.authored_stop_duration_ns(invalid)
+
+
 def test_gripper_evidence_preserves_provenance_and_pure_expiry():
     observation = core.GripperGraspObservationDTO()
     observation.gripper_id = "tool.gripper"
@@ -31,7 +63,9 @@ def test_gripper_evidence_preserves_provenance_and_pure_expiry():
         expires_at_ns=observation.observed_at_ns + 100,
     )
     assert core.gripper_grasp_evidence_is_fresh(evidence, observation.observed_at_ns)
-    assert not core.gripper_grasp_evidence_is_fresh(evidence, observation.observed_at_ns - 1)
+    assert not core.gripper_grasp_evidence_is_fresh(
+        evidence, observation.observed_at_ns - 1
+    )
     assert not core.gripper_grasp_evidence_is_fresh(evidence, evidence.expires_at_ns)
     assert evidence.observation.observed_at_ns == observation.observed_at_ns
     assert evidence.observation.expected_status_revision == 3
@@ -40,7 +74,9 @@ def test_gripper_evidence_preserves_provenance_and_pure_expiry():
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
-CLOSED_SCHEMA_RESOURCES = REPOSITORY_ROOT / "manyforge_deployment" / "resources" / "closed_schema"
+CLOSED_SCHEMA_RESOURCES = (
+    REPOSITORY_ROOT / "manyforge_deployment" / "resources" / "closed_schema"
+)
 
 STRONG_STRING_TYPES = (
     "CellId",
@@ -295,7 +331,9 @@ def _control_interface_contract_document(
         b"\x00catalog-record-revision/control_interface_contract"
         b"\x00manyforge.control_interface_contract.v1\x00" + canonical_payload.encode()
     )
-    payload["control_interface_revision"] = "sha256:" + hashlib.sha256(preimage).hexdigest()
+    payload["control_interface_revision"] = (
+        "sha256:" + hashlib.sha256(preimage).hexdigest()
+    )
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
@@ -303,7 +341,9 @@ def _control_interface_contract_reference(document: str, contract_id: str):
     parsed = json.loads(document)
     return core.ControlInterfaceContractCatalogRecordRefDTO(
         record_id=core.ControlInterfaceContractId(contract_id),
-        record_revision=core.ControlInterfaceRevision(parsed["control_interface_revision"]),
+        record_revision=core.ControlInterfaceRevision(
+            parsed["control_interface_revision"]
+        ),
         schema_id=core.SchemaId("manyforge.control_interface_contract.v1"),
         schema_revision=core.SchemaRevision(
             "sha256:4abdf2c402d8e6e818bc26df59ce1c9cdc911d1e807144bdf525d2f69d0a449d"
@@ -392,7 +432,9 @@ def _stop_evidence_policy_document(
                         "registered_command_kind_id": "software_hard_stop",
                         "provider_contract_ref": {
                             "provider_contract_role_id": "software_hard_stop",
-                            "contract_schema_id": ("manyforge.stop_provider_contract.v1"),
+                            "contract_schema_id": (
+                                "manyforge.stop_provider_contract.v1"
+                            ),
                             "contract_schema_revision": ZERO_DIGEST,
                         },
                     },
@@ -431,7 +473,9 @@ def _stop_evidence_policy_document(
         b"\x00catalog-record-revision/stop_evidence_policy"
         b"\x00manyforge.stop_evidence_policy.v2\x00" + canonical_payload.encode()
     )
-    payload["stop_evidence_policy_revision"] = "sha256:" + hashlib.sha256(preimage).hexdigest()
+    payload["stop_evidence_policy_revision"] = (
+        "sha256:" + hashlib.sha256(preimage).hexdigest()
+    )
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
@@ -439,7 +483,9 @@ def _stop_evidence_policy_reference(document: str, policy_id: str):
     parsed = json.loads(document)
     return core.StopEvidencePolicyCatalogRecordRefDTO(
         record_id=core.StopEvidencePolicyId(policy_id),
-        record_revision=core.StopEvidencePolicyRevision(parsed["stop_evidence_policy_revision"]),
+        record_revision=core.StopEvidencePolicyRevision(
+            parsed["stop_evidence_policy_revision"]
+        ),
         schema_id=core.SchemaId("manyforge.stop_evidence_policy.v2"),
         schema_revision=core.SchemaRevision(
             "sha256:c75dcdd59f2101b1c47ccc020cc61b28037256a40dc71fe896f0e4d912f4a970"
@@ -447,7 +493,9 @@ def _stop_evidence_policy_reference(document: str, policy_id: str):
         content_digest=core.ContentDigest(
             "sha256:" + hashlib.sha256(document.encode()).hexdigest()
         ),
-        content_addressed_store_key=core.ContentAddressedStoreKey("sha256/stop-policy-python"),
+        content_addressed_store_key=core.ContentAddressedStoreKey(
+            "sha256/stop-policy-python"
+        ),
     )
 
 
@@ -507,7 +555,9 @@ def _cell_graph():
         controllable_component_id=component.controllable_component_id,
         command_target_id=core.CommandTargetId("target/arm"),
         capability_id=core.CapabilityId("execution.trajectory.execute"),
-        capability_definition_revision=core.CapabilityDefinitionRevision("sha256:capability"),
+        capability_definition_revision=core.CapabilityDefinitionRevision(
+            "sha256:capability"
+        ),
         control_domain_id=domain.control_domain_id,
         resource_bindings=[
             core.ResourceBindingDTO(
@@ -515,7 +565,9 @@ def _cell_graph():
                 resource_id=core.ResourceId("arm_joint1"),
             )
         ],
-        control_interface_contract_id=core.ControlInterfaceContractId("interface/position"),
+        control_interface_contract_id=core.ControlInterfaceContractId(
+            "interface/position"
+        ),
         control_interface_revision=core.ControlInterfaceRevision("sha256:interface"),
         controller_topology_id=domain.controller_topology_id,
         topology_revision=domain.topology_revision,
@@ -524,11 +576,15 @@ def _cell_graph():
         provider_instance_id=core.ProviderInstanceId("provider/fake"),
         provider_runtime_unit_id=runtime_unit.runtime_unit_id,
         provider_manifest_id=core.ProviderManifestId("provider/xarm"),
-        provider_manifest_revision=core.ProviderManifestRevision("sha256:provider-manifest"),
+        provider_manifest_revision=core.ProviderManifestRevision(
+            "sha256:provider-manifest"
+        ),
         state_authority_id=core.StateAuthorityId("state/measured"),
         state_authority_class=core.StateAuthorityClass.kMeasured,
         stop_evidence_policy_id=core.StopEvidencePolicyId("stop/measured-rest"),
-        stop_evidence_policy_revision=core.StopEvidencePolicyRevision("sha256:stop-policy"),
+        stop_evidence_policy_revision=core.StopEvidencePolicyRevision(
+            "sha256:stop-policy"
+        ),
         containment_granularity=core.ContainmentGranularity.kControlDomain,
     )
     parent = core.ComponentAttachmentEndpointDTO(
@@ -541,7 +597,9 @@ def _cell_graph():
     )
     attachment = core.ComponentAttachmentEdgeDTO(
         component_attachment_id=core.ComponentAttachmentId("attachment/tool"),
-        component_attachment_revision=core.ComponentAttachmentRevision("sha256:attachment"),
+        component_attachment_revision=core.ComponentAttachmentRevision(
+            "sha256:attachment"
+        ),
         parent=parent,
         child=child,
         child_interface_pose_in_parent_interface=placement_pose,
@@ -604,14 +662,20 @@ def _applicability_constructor_fixture():
         source_endpoint_role_id=core.EndpointRoleId("source_endpoint"),
     )
     provider_kwargs = {
-        "capability_provider_binding_id": core.CapabilityProviderBindingId("provider_binding"),
+        "capability_provider_binding_id": core.CapabilityProviderBindingId(
+            "provider_binding"
+        ),
         "capability_provider_binding_revision": (
             core.CapabilityProviderBindingRevision(ZERO_DIGEST)
         ),
         "capability_id": core.CapabilityId("capability"),
-        "capability_definition_revision": core.CapabilityDefinitionRevision(ZERO_DIGEST),
+        "capability_definition_revision": core.CapabilityDefinitionRevision(
+            ZERO_DIGEST
+        ),
         "scope": core.CapabilityScope.kCellGlobal,
-        "target": core.CellGlobalCapabilityProviderTargetDTO(cell_id=core.CellId("cell")),
+        "target": core.CellGlobalCapabilityProviderTargetDTO(
+            cell_id=core.CellId("cell")
+        ),
         "provider_instance_id": core.ProviderInstanceId("provider"),
         "provider_manifest_id": core.ProviderManifestId("manifest"),
         "provider_manifest_revision": core.ProviderManifestRevision(ZERO_DIGEST),
@@ -794,7 +858,12 @@ def test_catalog_record_ref_runtime_union_and_registry_are_closed():
     assert union_members == tuple(core.CatalogRecordRefTypes)
     assert len(union_members) == len(CATALOG_REF_CASES) == 11
     assert len(core.CATALOG_RECORD_TYPE_REGISTRY) == 11
-    assert len({descriptor.record_kind for descriptor in core.CATALOG_RECORD_TYPE_REGISTRY}) == 11
+    assert (
+        len(
+            {descriptor.record_kind for descriptor in core.CATALOG_RECORD_TYPE_REGISTRY}
+        )
+        == 11
+    )
 
     invalid_family = _catalog_ref(
         CATALOG_REF_CASES[0], schema_family="manyforge.runtime_profile.v1"
@@ -823,14 +892,20 @@ def test_catalog_record_ref_runtime_union_and_registry_are_closed():
 
 
 def test_capability_definition_registry_and_qualified_referent_are_exact():
-    assert core.CAPABILITY_DEFINITION_API_VERSION == "manyforge.capability_definition.v1"
+    assert (
+        core.CAPABILITY_DEFINITION_API_VERSION == "manyforge.capability_definition.v1"
+    )
     registry = core.BUILTIN_CAPABILITY_DEFINITION_REGISTRY
     assert isinstance(registry, tuple)
     assert len(registry) == 70
     assert len({row.capability_id for row in registry}) == 70
-    assert sum(row.scope == core.CapabilityScope.kTargetBinding for row in registry) == 34
+    assert (
+        sum(row.scope == core.CapabilityScope.kTargetBinding for row in registry) == 34
+    )
     assert sum(row.scope == core.CapabilityScope.kCellGlobal for row in registry) == 28
-    assert sum(row.scope == core.CapabilityScope.kControlDomain for row in registry) == 8
+    assert (
+        sum(row.scope == core.CapabilityScope.kControlDomain for row in registry) == 8
+    )
     assert (
         sum(
             row.provider_binding_kind
@@ -841,7 +916,8 @@ def test_capability_definition_registry_and_qualified_referent_are_exact():
     )
     assert (
         sum(
-            row.provider_binding_kind == core.CapabilityProviderBindingKind.kControlBinding
+            row.provider_binding_kind
+            == core.CapabilityProviderBindingKind.kControlBinding
             for row in registry
         )
         == 23
@@ -857,15 +933,22 @@ def test_capability_definition_registry_and_qualified_referent_are_exact():
     value = core.materialize_capability_definition(descriptor)
     assert isinstance(value, core.CapabilityDefinitionDTO)
     assert value.capability_id.value == descriptor.capability_id
-    assert value.capability_definition_revision.value == descriptor.capability_definition_revision
+    assert (
+        value.capability_definition_revision.value
+        == descriptor.capability_definition_revision
+    )
     stored_bytes = json.dumps(
         {
             "api_version": "manyforge.capability_definition.v1",
             "capability_id": descriptor.capability_id,
-            "capability_definition_revision": (descriptor.capability_definition_revision),
+            "capability_definition_revision": (
+                descriptor.capability_definition_revision
+            ),
             "scope": core.capability_scope_to_string(descriptor.scope),
             "provider_binding_kind": (
-                core.capability_provider_binding_kind_to_string(descriptor.provider_binding_kind)
+                core.capability_provider_binding_kind_to_string(
+                    descriptor.provider_binding_kind
+                )
             ),
         },
         sort_keys=True,
@@ -881,15 +964,21 @@ def test_capability_definition_registry_and_qualified_referent_are_exact():
         core.SchemaRevision(
             "sha256:" "2de23ede0e941349e90f0a3a344b7d240426703d250234f86e788343213727e0"
         ),
-        core.ContentDigest(f"sha256:{hashlib.sha256(stored_bytes.encode()).hexdigest()}"),
+        core.ContentDigest(
+            f"sha256:{hashlib.sha256(stored_bytes.encode()).hexdigest()}"
+        ),
         store_key,
     )
-    qualified = core.resolve_and_qualify_capability_definition(reference, store_key, stored_bytes)
+    qualified = core.resolve_and_qualify_capability_definition(
+        reference, store_key, stored_bytes
+    )
     assert isinstance(qualified, core.QualifiedCapabilityDefinition)
     assert qualified.value == value
     assert json.loads(qualified.normalized_canonical_json) == json.loads(stored_bytes)
 
-    with pytest.raises(core.CapabilityDefinitionCodecError, match="different store key"):
+    with pytest.raises(
+        core.CapabilityDefinitionCodecError, match="different store key"
+    ):
         core.resolve_and_qualify_capability_definition(
             reference,
             core.ContentAddressedStoreKey("sha256/other"),
@@ -898,7 +987,10 @@ def test_capability_definition_registry_and_qualified_referent_are_exact():
 
 
 def test_control_interface_contract_is_typed_ordered_and_exactly_qualified():
-    assert core.CONTROL_INTERFACE_CONTRACT_API_VERSION == "manyforge.control_interface_contract.v1"
+    assert (
+        core.CONTROL_INTERFACE_CONTRACT_API_VERSION
+        == "manyforge.control_interface_contract.v1"
+    )
     assert core.MAX_CONTROL_INTERFACE_CONTRACT_ITEMS == 4096
     command = [
         core.ResourceInterfaceClaimDTO(core.ResourceRoleId("arm"), "position"),
@@ -910,7 +1002,9 @@ def test_control_interface_contract_is_typed_ordered_and_exactly_qualified():
         core.ResourceInterfaceClaimDTO(core.ResourceRoleId("tool"), "position"),
     ]
     dto = core.ControlInterfaceContractDTO(
-        control_interface_contract_id=core.ControlInterfaceContractId("application_specific"),
+        control_interface_contract_id=core.ControlInterfaceContractId(
+            "application_specific"
+        ),
         control_interface_revision=core.ControlInterfaceRevision(ZERO_DIGEST),
         command_interfaces=command,
         state_interfaces=state,
@@ -942,7 +1036,9 @@ def test_control_interface_contract_is_typed_ordered_and_exactly_qualified():
     )
     reference = _control_interface_contract_reference(document, "application_specific")
     store_key = core.ContentAddressedStoreKey("sha256/control-interface-python")
-    qualified = core.resolve_and_qualify_control_interface_contract(reference, store_key, document)
+    qualified = core.resolve_and_qualify_control_interface_contract(
+        reference, store_key, document
+    )
     assert isinstance(qualified, core.QualifiedControlInterfaceContract)
     assert qualified.value.control_interface_contract_id.value == "application_specific"
     assert [
@@ -1017,9 +1113,13 @@ def test_control_interface_contract_rejects_cross_field_semantic_defects(
 
 def test_control_interface_contract_rejects_referent_identity_mismatches():
     document = _control_interface_contract_document()
-    reference = _control_interface_contract_reference(document, "arm_position_trajectory")
+    reference = _control_interface_contract_reference(
+        document, "arm_position_trajectory"
+    )
     store_key = core.ContentAddressedStoreKey("sha256/control-interface-python")
-    with pytest.raises(core.ControlInterfaceContractCodecError, match="different store key"):
+    with pytest.raises(
+        core.ControlInterfaceContractCodecError, match="different store key"
+    ):
         core.resolve_and_qualify_control_interface_contract(
             reference,
             core.ContentAddressedStoreKey("sha256/other"),
@@ -1035,7 +1135,9 @@ def test_control_interface_contract_rejects_referent_identity_mismatches():
         content_addressed_store_key=reference.content_addressed_store_key,
     )
     with pytest.raises(core.ControlInterfaceContractCodecError):
-        core.resolve_and_qualify_control_interface_contract(wrong_id, store_key, document)
+        core.resolve_and_qualify_control_interface_contract(
+            wrong_id, store_key, document
+        )
 
     wrong_digest = core.ControlInterfaceContractCatalogRecordRefDTO(
         record_id=reference.record_id,
@@ -1046,7 +1148,9 @@ def test_control_interface_contract_rejects_referent_identity_mismatches():
         content_addressed_store_key=reference.content_addressed_store_key,
     )
     with pytest.raises(core.ControlInterfaceContractCodecError):
-        core.resolve_and_qualify_control_interface_contract(wrong_digest, store_key, document)
+        core.resolve_and_qualify_control_interface_contract(
+            wrong_digest, store_key, document
+        )
 
 
 def test_stop_evidence_policy_is_typed_immutable_and_exactly_qualified():
@@ -1102,7 +1206,9 @@ def test_stop_evidence_policy_is_typed_immutable_and_exactly_qualified():
         command_phase_id=core.StopBudgetPhaseId("hard_command"),
         command_kind=core.StopContainmentCommandKind.kRegistered,
         provider_contract_ref=contract,
-        registered_command_kind_id=core.RegisteredStopCommandKindId("software_hard_stop"),
+        registered_command_kind_id=core.RegisteredStopCommandKindId(
+            "software_hard_stop"
+        ),
     )
     hard_evidence = core.StopEvidenceRequirementDTO(
         evidence_item_id=core.StopEvidenceItemId("hard_acknowledged"),
@@ -1137,14 +1243,20 @@ def test_stop_evidence_policy_is_typed_immutable_and_exactly_qualified():
     with pytest.raises(AttributeError):
         dto.escalation_stages = []
     with pytest.raises(AttributeError):
-        evidence.evidence_kind = core.StopEvidenceRequirementKind.kControllerGoalTerminal
+        evidence.evidence_kind = (
+            core.StopEvidenceRequirementKind.kControllerGoalTerminal
+        )
 
     document = _stop_evidence_policy_document()
     reference = _stop_evidence_policy_reference(document, "measured_rest")
     store_key = core.ContentAddressedStoreKey("sha256/stop-policy-python")
-    qualified = core.resolve_and_qualify_stop_evidence_policy(reference, store_key, document)
+    qualified = core.resolve_and_qualify_stop_evidence_policy(
+        reference, store_key, document
+    )
     assert isinstance(qualified, core.QualifiedStopEvidencePolicy)
-    assert qualified.value.stop_evidence_policy_id == core.StopEvidencePolicyId("measured_rest")
+    assert qualified.value.stop_evidence_policy_id == core.StopEvidencePolicyId(
+        "measured_rest"
+    )
     assert (
         qualified.value.escalation_stages[0].evidence_requirements[0].evidence_kind
         == core.StopEvidenceRequirementKind.kControllerGoalTerminal
@@ -1159,7 +1271,9 @@ def test_stop_evidence_policy_rejects_cross_field_and_referent_defects():
         source_kind="provider_evidence",
         observation_kind="post_command_dwell",
     )
-    invalid_reference = _stop_evidence_policy_reference(invalid_document, "invalid_matrix")
+    invalid_reference = _stop_evidence_policy_reference(
+        invalid_document, "invalid_matrix"
+    )
     store_key = core.ContentAddressedStoreKey("sha256/stop-policy-python")
     with pytest.raises(core.StopEvidencePolicyCodecError):
         core.resolve_and_qualify_stop_evidence_policy(
@@ -1223,7 +1337,9 @@ def test_json_value_is_explicit_recursive_and_immutable():
         (1.5, 1.5, float),
     ),
 )
-def test_json_value_dispatch_preserves_exact_scalar_kind(source, expected, expected_type):
+def test_json_value_dispatch_preserves_exact_scalar_kind(
+    source, expected, expected_type
+):
     projected = core.JsonValueDTO(source).value
     assert projected == expected
     assert type(projected) is expected_type
@@ -1302,8 +1418,12 @@ def test_all_six_graph_records_and_envelope_round_trip_read_only():
     assert graph.controllable_components == [values["component"]]
     assert graph.control_domains == [values["domain"]]
     assert graph.control_bindings == [values["binding"]]
-    assert values["binding"].provider_instance_id == core.ProviderInstanceId("provider/fake")
-    assert values["binding"].provider_manifest_id == core.ProviderManifestId("provider/xarm")
+    assert values["binding"].provider_instance_id == core.ProviderInstanceId(
+        "provider/fake"
+    )
+    assert values["binding"].provider_manifest_id == core.ProviderManifestId(
+        "provider/xarm"
+    )
     assert values["binding"].runtime_scale_route_qualifications == []
     assert graph.component_attachments == [values["attachment"]]
     assert values["model_instance"].root_pose_in_cell is None
@@ -1434,7 +1554,9 @@ def test_runtime_scale_route_qualification_preserves_strong_id_types():
     )
 
     assert qualification.scaling_domain_id == core.ScalingDomainId("scale/arm")
-    assert qualification.coordinated_barrier_id == core.CoordinatedScalingBarrierId("barrier/cell")
+    assert qualification.coordinated_barrier_id == core.CoordinatedScalingBarrierId(
+        "barrier/cell"
+    )
     assert qualification.maximum_slew_per_second == 4.0
     assert qualification.freshness_budget_ns == 100_000_000
 
@@ -1454,7 +1576,9 @@ def test_active_control_configuration_is_complete_typed_and_read_only():
         contributing_control_bindings=[binding_source],
         provider_instance_id=core.ProviderInstanceId("provider/fake"),
         provider_manifest_id=core.ProviderManifestId("provider/xarm"),
-        provider_manifest_revision=core.ProviderManifestRevision("sha256:provider-manifest"),
+        provider_manifest_revision=core.ProviderManifestRevision(
+            "sha256:provider-manifest"
+        ),
         state_authority_id=core.StateAuthorityId("state/measured"),
         state_authority_class=core.StateAuthorityClass.kMeasured,
         publication_source=core.ObservedStateSourceKind.kJointState,
@@ -1471,7 +1595,9 @@ def test_active_control_configuration_is_complete_typed_and_read_only():
         source_runtime_epoch=core.RuntimeEpoch("epoch/1"),
         source_sequence=7,
         kinematic_resource_source_projections=[projection],
-        active_control_configuration_generation=(core.ActiveControlConfigurationGeneration(3)),
+        active_control_configuration_generation=(
+            core.ActiveControlConfigurationGeneration(3)
+        ),
         state=core.ActiveControlConfigurationStateDTO.kReconciled,
     )
 
@@ -1510,6 +1636,16 @@ def test_public_stop_contract_dtos_are_typed_and_authority_rows_are_read_only():
         deceleration_time_s=0.2,
         per_resource_limits=[controlled_limit],
     )
+    assert spring.allow_natural_completion_on_short_path is False
+    assert (
+        core.SpringBackHoldStopParametersDTO(
+            stop_mode=core.MotionControlledStopMode.kSpringBackHold,
+            deceleration_time_s=0.2,
+            per_resource_limits=[controlled_limit],
+            allow_natural_completion_on_short_path=True,
+        ).allow_natural_completion_on_short_path
+        is True
+    )
     hard = core.HardDecelerationStopParametersDTO(
         stop_mode=core.MotionControlledStopMode.kHardDeceleration,
         per_resource_limits=[hard_limit],
@@ -1523,7 +1659,10 @@ def test_public_stop_contract_dtos_are_typed_and_authority_rows_are_read_only():
     assert soft.per_resource_limits == (controlled_limit,)
     assert spring.per_resource_limits == (controlled_limit,)
     assert hard.per_resource_limits == (hard_limit,)
-    assert soft.recoverable_substitution_mode == core.MotionControlledStopMode.kSpringBackHold
+    assert (
+        soft.recoverable_substitution_mode
+        == core.MotionControlledStopMode.kSpringBackHold
+    )
 
     definitions = core.registered_stop_command_definitions()
     assert isinstance(definitions, tuple)
@@ -1593,12 +1732,18 @@ def test_deployment_trust_phase_failures_map_to_value_error():
     assert issubclass(core.ArtifactCodecError, ValueError)
     assert issubclass(core.CellGraphCodecError, ValueError)
 
-    with pytest.raises(core.ArtifactCodecError, match="duplicate mapping key") as parse_error:
+    with pytest.raises(
+        core.ArtifactCodecError, match="duplicate mapping key"
+    ) as parse_error:
         core.parse_strict_json_model_yaml("key: one\nkey: two\n")
     assert type(parse_error.value) is core.ArtifactCodecError
 
-    incomplete = core.parse_strict_json_model_yaml("api_version: manyforge.cell_graph.v1\n")
-    with pytest.raises(core.CellGraphCodecError, match="missing required field") as decode_error:
+    incomplete = core.parse_strict_json_model_yaml(
+        "api_version: manyforge.cell_graph.v1\n"
+    )
+    with pytest.raises(
+        core.CellGraphCodecError, match="missing required field"
+    ) as decode_error:
         core.decode_cell_graph_candidate(incomplete)
     assert type(decode_error.value) is core.CellGraphCodecError
 
@@ -1622,21 +1767,27 @@ component_attachments: []
 """
         )
     )
-    with pytest.raises(core.CellGraphCodecError, match="dangling reference") as validation_error:
+    with pytest.raises(
+        core.CellGraphCodecError, match="dangling reference"
+    ) as validation_error:
         core.validate_intrinsic_cell_graph_candidate(dangling_runtime)
     assert type(validation_error.value) is core.CellGraphCodecError
 
 
 def test_closed_schema_trust_phases_and_registry_are_immutable():
     descriptor_yaml = (
-        CLOSED_SCHEMA_RESOURCES / "examples" / "manyforge.closed_schema.example_command.v1.yaml"
+        CLOSED_SCHEMA_RESOURCES
+        / "examples"
+        / "manyforge.closed_schema.example_command.v1.yaml"
     ).read_text(encoding="utf-8")
     schema = core.compile_closed_schema_descriptor(
         core.parse_strict_json_model_yaml(descriptor_yaml)
     )
 
     assert isinstance(schema, core.CompiledClosedSchema)
-    assert schema.schema_id == core.SchemaId("manyforge.closed_schema.example_command.v1")
+    assert schema.schema_id == core.SchemaId(
+        "manyforge.closed_schema.example_command.v1"
+    )
     assert schema.schema_revision == core.SchemaRevision(
         "sha256:37985bd40f1c50cca9a82e3952bf407ddecca0d1c32d7787cd903bfffbf5fce7"
     )
@@ -1711,7 +1862,8 @@ target: 0.5
     )
     assert len(registry.value_schemas) == 5
     assert {
-        (entry.schema_id.value, entry.schema_revision.value) for entry in registry.value_schemas
+        (entry.schema_id.value, entry.schema_revision.value)
+        for entry in registry.value_schemas
     } == {
         (
             "manyforge.value_schema.provider_contract.empty.v1",
@@ -1719,7 +1871,7 @@ target: 0.5
         ),
         (
             "manyforge.value_schema.provider_contract.motion_controlled_stop.v1",
-            "sha256:afbbcda3b81eabff2bbdffb5658fb1fcd3331cde896cadf0681793a2f9db90dd",
+            "sha256:58ec6382a268329e9d8001eb53aac31259b5eb95a3690095aa4bbe12ac51d83b",
         ),
         (
             "manyforge.value_schema.runtime.empty.v1",
@@ -1727,15 +1879,19 @@ target: 0.5
         ),
         (
             "manyforge.value_schema.runtime.native_execution.v1",
-            "sha256:4405892649681799b9a813fafee4b5d23579d080b5457bf60f51ce2e296fcff8",
+            "sha256:49b3bbd377ad4cb93e7d27df06ff84b7e9ddbce3f3047e5702c61a9828c62035",
         ),
         (
             "manyforge.value_schema.runtime.ros2_control_execution.v1",
             "sha256:4ff0c6d3d2e4cf9eae515f0ba3343404e3f30939a08f886aadfe26fa57fe173d",
         ),
     }
-    assert registry.qualification_registry_digest.value == (
-        "sha256:dbdf99e08d6c8fde086653482d39c48c39ca955e44e4fcdaf01d1f17879c4b60"
+    assert (
+        registry.qualification_registry_digest.value
+        == "sha256:"
+        + hashlib.sha256(
+            registry.normalized_projection_canonical_json.encode("utf-8")
+        ).hexdigest()
     )
     assert (
         json.loads(registry.normalized_projection_canonical_json)["catalog_schemas"][0][
@@ -1774,12 +1930,16 @@ def test_closed_schema_failures_map_to_value_error():
     assert issubclass(core.ClosedSchemaError, ValueError)
 
     descriptor_yaml = (
-        CLOSED_SCHEMA_RESOURCES / "examples" / "manyforge.closed_schema.example_command.v1.yaml"
+        CLOSED_SCHEMA_RESOURCES
+        / "examples"
+        / "manyforge.closed_schema.example_command.v1.yaml"
     ).read_text(encoding="utf-8")
     schema = core.compile_closed_schema_descriptor(
         core.parse_strict_json_model_yaml(descriptor_yaml)
     )
-    with pytest.raises(core.ClosedSchemaError, match="above maximum") as normalization_error:
+    with pytest.raises(
+        core.ClosedSchemaError, match="above maximum"
+    ) as normalization_error:
         core.validate_and_normalize_unqualified_artifact_candidate(
             schema,
             core.parse_strict_json_model_yaml(
@@ -1795,7 +1955,9 @@ target: 2
 
 def test_graph_revision_trust_surface_is_staged_narrow_and_immutable():
     intrinsic = core.validate_intrinsic_cell_graph_candidate(
-        core.decode_cell_graph_candidate(core.parse_strict_json_model_yaml(EMPTY_GRAPH_YAML))
+        core.decode_cell_graph_candidate(
+            core.parse_strict_json_model_yaml(EMPTY_GRAPH_YAML)
+        )
     )
     ready = core.prepare_cell_graph_identity(intrinsic, [])
     assert isinstance(ready, core.GraphIdentityReadyCellGraphCandidate)

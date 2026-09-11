@@ -349,6 +349,7 @@ core::ResolvedParticipantStopStageDTO controlled_stage_fixture() {
   });
   core::JsonObjectDTO parameters{
       {"stop_mode", core::JsonValueDTO{"soft_on_path"}},
+      {"jerk_limits_enabled", core::JsonValueDTO{false}},
       {"deceleration_time_s", core::JsonValueDTO{1.0}},
       {"per_resource_limits", core::JsonValueDTO{std::move(limits)}},
       {"allow_natural_completion_on_short_path", core::JsonValueDTO{true}},

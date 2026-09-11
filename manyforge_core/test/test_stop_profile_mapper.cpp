@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <limits>
 #include <manyforge_core/motion_interrupt/stop_profile_mapper.hpp>
 
 namespace manyforge::core {
@@ -16,6 +17,7 @@ RuntimeResourceBindingDTO resource(std::string source_joint, std::string resourc
 MotionInterruptStopProfileDTO soft_profile() {
   MotionInterruptStopProfileDTO profile;
   profile.profile_id = "soft.profile.v1";
+  profile.jerk_limits_enabled = false;
   profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
   profile.deceleration_time_s = 0.25;
   profile.per_joint_max_deceleration = {
@@ -42,6 +44,86 @@ std::vector<HardStopResourceLimitDTO> defaults() {
 
 std::string reason(const ErrorDTO& error) {
   return error.details.at("reason");
+}
+
+TEST(StopProfileMapper, ExplicitJerkActivationResolvesOnceWithMatchingUnits) {
+  auto profile = soft_profile();
+  profile.jerk_limits_enabled = true;
+  profile.per_joint_max_jerk = {{"joint_1", AngularJerkDTO{12.0}}};
+  auto frozen = resolve_motion_interrupt_stop_jerk_limits(profile);
+  ASSERT_TRUE(frozen.ok()) << frozen.error().message;
+  EXPECT_DOUBLE_EQ(
+      std::get<AngularJerkDTO>(frozen.value().per_joint_max_jerk.at("joint_1")).value_rad_s3, 12.0);
+  EXPECT_DOUBLE_EQ(
+      std::get<LinearJerkDTO>(frozen.value().per_joint_max_jerk.at("axis_z")).value_m_s3,
+      motion_jerk_preset_limit(0.5, 0.25));
+  EXPECT_EQ(profile.per_joint_max_jerk.size(), 1U);  // Authored provenance remains unchanged.
+  EXPECT_EQ(resolve_motion_interrupt_stop_jerk_limits(frozen.value()).value(), frozen.value());
+  auto changed_ramp = frozen.value();
+  changed_ramp.deceleration_time_s = 0.10;
+  EXPECT_EQ(resolve_motion_interrupt_stop_jerk_limits(changed_ramp).value().per_joint_max_jerk,
+            frozen.value().per_joint_max_jerk);
+  const auto mapped = map_motion_interrupt_stop_profile_to_contract_parameters(
+      frozen.value(), MotionInterruptNodeCategory::kGeneric, resources(), defaults());
+  ASSERT_TRUE(mapped.ok());
+  EXPECT_TRUE(std::get<SoftOnPathStopParametersDTO>(mapped.value()).jerk_limits_enabled);
+  EXPECT_DOUBLE_EQ(std::get<AngularJerkDTO>(*std::get<SoftOnPathStopParametersDTO>(mapped.value())
+                                                 .per_resource_limits.front()
+                                                 .max_jerk)
+                       .value_rad_s3,
+                   12.0);
+  const auto projected =
+      project_motion_interrupt_stop_profile_to_compiled_resources(frozen.value(), resources());
+  ASSERT_TRUE(projected.ok());
+  EXPECT_TRUE(projected.value().per_joint_max_jerk.contains("compiled.resource.a"));
+}
+
+TEST(StopProfileMapper, OffDoesNotInventLimitsAndUnreviewedHistoryCannotBePrepared) {
+  EXPECT_FALSE(MotionInterruptStopProfileDTO{}.jerk_limits_enabled.has_value());
+  auto profile = soft_profile();
+  ASSERT_EQ(profile.jerk_limits_enabled, false);
+  const auto off = resolve_motion_interrupt_stop_jerk_limits(profile);
+  ASSERT_TRUE(off.ok());
+  EXPECT_TRUE(off.value().per_joint_max_jerk.empty());
+  EXPECT_TRUE(off.value().diagnostics.empty());
+  profile.jerk_limits_enabled.reset();
+  const auto old = map_motion_interrupt_stop_profile_to_contract_parameters(
+      profile, MotionInterruptNodeCategory::kGeneric, resources(), defaults());
+  ASSERT_FALSE(old.ok());
+  EXPECT_EQ(reason(old.error()), "motion_controlled_stop_jerk_activation_required");
+}
+
+TEST(StopProfileMapper, JerkRejectsUnknownWrongUnitNonFiniteAndHardProfiles) {
+  for (const auto& value :
+       {CoordinateJerkDTO{LinearJerkDTO{10.0}}, CoordinateJerkDTO{AngularJerkDTO{-1.0}},
+        CoordinateJerkDTO{AngularJerkDTO{std::numeric_limits<double>::infinity()}}}) {
+    auto profile = soft_profile();
+    profile.jerk_limits_enabled = true;
+    profile.per_joint_max_jerk["joint_1"] = value;
+    EXPECT_FALSE(resolve_motion_interrupt_stop_jerk_limits(profile).ok());
+  }
+  auto profile = soft_profile();
+  profile.per_joint_max_jerk["other"] = AngularJerkDTO{1.0};
+  EXPECT_FALSE(resolve_motion_interrupt_stop_jerk_limits(profile).ok());
+  profile = {};
+  profile.profile_id = "hard";
+  profile.stop_mode = MotionInterruptStopMode::kHardDeceleration;
+  profile.jerk_limits_enabled = true;
+  EXPECT_FALSE(resolve_motion_interrupt_stop_jerk_limits(profile).ok());
+}
+
+TEST(StopProfileMapper, SpringPresetUsesOneFrozenHalfDurationCeiling) {
+  auto profile = soft_profile();
+  profile.jerk_limits_enabled = true;
+  const auto soft = resolve_motion_interrupt_stop_jerk_limits(profile);
+  profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
+  const auto spring = resolve_motion_interrupt_stop_jerk_limits(profile);
+  ASSERT_TRUE(soft.ok());
+  ASSERT_TRUE(spring.ok());
+  EXPECT_DOUBLE_EQ(
+      std::get<AngularJerkDTO>(spring.value().per_joint_max_jerk.at("joint_1")).value_rad_s3,
+      motion_jerk_preset_limit(2.0, 0.125));
+  EXPECT_NE(soft.value().per_joint_max_jerk, spring.value().per_joint_max_jerk);
 }
 
 TEST(StopProfileMapper, MapsTypedMixedCoordinatesToCanonicalResources) {
@@ -95,6 +177,13 @@ TEST(StopProfileMapper, SpringBackUsesHistoricalDefaultAndDropsSoftFields) {
   const auto& mapped = std::get<SpringBackHoldStopParametersDTO>(result.value());
   EXPECT_DOUBLE_EQ(mapped.deceleration_time_s, kDefaultDecelerationTimeS);
   EXPECT_EQ(mapped.per_resource_limits.size(), 2U);
+  EXPECT_FALSE(mapped.allow_natural_completion_on_short_path);
+  profile.allow_natural_completion_on_short_path = true;
+  result = map_motion_interrupt_stop_profile_to_contract_parameters(
+      profile, MotionInterruptNodeCategory::kGeneric, resource_rows, default_rows);
+  ASSERT_TRUE(result.ok());
+  EXPECT_TRUE(std::get<SpringBackHoldStopParametersDTO>(result.value())
+                  .allow_natural_completion_on_short_path);
 }
 
 TEST(StopProfileMapper, HardDecelerationUsesOnlyRetainedSettleTable) {
@@ -218,6 +307,17 @@ TEST(StopProfileMapper, RejectsUnqualifiedOrPrecisionSubstitution) {
       precision, MotionInterruptNodeCategory::kPrecisionContact, resource_rows, default_rows);
   ASSERT_FALSE(result.ok());
   EXPECT_EQ(reason(result.error()), "motion_interrupt_substitution_precision_contact_forbidden");
+  precision.recoverable_substitution_mode.reset();
+  precision.allow_natural_completion_on_short_path = true;
+  for (const auto mode :
+       {MotionInterruptStopMode::kSoftOnPath, MotionInterruptStopMode::kSpringBackHold}) {
+    precision.stop_mode = mode;
+    result = map_motion_interrupt_stop_profile_to_contract_parameters(
+        precision, MotionInterruptNodeCategory::kPrecisionContact, resource_rows, default_rows);
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(reason(result.error()),
+              "motion_interrupt_natural_completion_precision_contact_forbidden");
+  }
 }
 
 TEST(StopProfileMapper, ReconstructsExactPreparedBackendProfile) {
@@ -261,6 +361,7 @@ TEST(StopProfileMapper, ReconstructsExactPreparedBackendProfile) {
   }
   const JsonObjectDTO prepared{
       {"stop_mode", JsonValueDTO{"soft_on_path"}},
+      {"jerk_limits_enabled", JsonValueDTO{false}},
       {"deceleration_time_s", JsonValueDTO{0.25}},
       {"per_resource_limits", JsonValueDTO{std::move(limits)}},
       {"allow_natural_completion_on_short_path", JsonValueDTO{true}},

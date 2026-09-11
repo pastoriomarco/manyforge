@@ -42,4 +42,49 @@ ReduceManagerCellAdmissionReadiness(
   };
 }
 
+// Idle, Starting and Running may be observed at different publication points.
+// Forward progress does not revoke an already-held Program parent. Keep the
+// previous current facts during this renewal; Kernel still checks the exact
+// parent/capture and current node Stop fence before admitting each child.
+[[nodiscard]] inline bool IsSameProgramAdmissionProgress(
+    const manyforge::core::CellAdmissionReadinessSnapshotDTO &before,
+    const manyforge::core::CellAdmissionReadinessSnapshotDTO &after) {
+  using manyforge::core::ProgramCycleStateDTO;
+  if (!before.program_cycle_status_current ||
+      !after.program_cycle_status_current || !before.program_cycle_status ||
+      !after.program_cycle_status) {
+    return false;
+  }
+  const auto &old_cycle = *before.program_cycle_status;
+  const auto &new_cycle = *after.program_cycle_status;
+  if ((new_cycle.state != ProgramCycleStateDTO::kStarting &&
+       new_cycle.state != ProgramCycleStateDTO::kRunning) ||
+      old_cycle.program_runner_owner_epoch !=
+          new_cycle.program_runner_owner_epoch ||
+      old_cycle.cycle_generation != new_cycle.cycle_generation ||
+      !new_cycle.program_run_id || old_cycle.terminal_or_settlement_reference ||
+      new_cycle.terminal_or_settlement_reference) {
+    return false;
+  }
+  if (old_cycle.state == ProgramCycleStateDTO::kIdleAfterReset) {
+    if (old_cycle.program_run_id || old_cycle.cycle_claim_generation ||
+        (new_cycle.state == ProgramCycleStateDTO::kRunning &&
+         !new_cycle.cycle_claim_generation)) {
+      return false;
+    }
+  } else if (old_cycle.state != ProgramCycleStateDTO::kStarting ||
+             old_cycle.program_run_id != new_cycle.program_run_id ||
+             !new_cycle.cycle_claim_generation ||
+             (new_cycle.state == ProgramCycleStateDTO::kStarting &&
+              old_cycle.cycle_claim_generation) ||
+             (old_cycle.cycle_claim_generation &&
+              old_cycle.cycle_claim_generation !=
+                  new_cycle.cycle_claim_generation)) {
+    return false;
+  }
+  auto comparable = before;
+  comparable.program_cycle_status = after.program_cycle_status;
+  return comparable == after;
+}
+
 } // namespace manyforge::headless

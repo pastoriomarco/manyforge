@@ -14,8 +14,8 @@
 namespace manyforge::core {
 
 inline constexpr std::string_view kOperationJournalSchemaId =
-    "manyforge.internal.execution.operation-journal.o1.5.v12";
-inline constexpr std::int64_t kOperationJournalSchemaVersion = 12;
+    "manyforge.internal.execution.operation-journal.o1.5.v13";
+inline constexpr std::int64_t kOperationJournalSchemaVersion = 13;
 inline constexpr std::int64_t kOperationJournalSqliteApplicationId = 0x4D46454A;
 inline constexpr std::string_view kOperationJournalFilename = "operation-journal.sqlite3";
 inline constexpr std::size_t kMaximumOperationJournalHistory = 4096U;

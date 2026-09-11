@@ -34,6 +34,8 @@ from manyforge_behavior.orchestration_ports import (
     PROGRAM_MOTION_STOP_RECOVERY_CLASSES,
     NodeAttemptIdentity,
     OwnerInvocationResult,
+    OwnerInvocationPendingError,
+    OwnerInvocationHeldError,
     OwnerNodeInputs,
     OwnerTaskObservationUnavailableError,
     OwnerTaskSettlementPendingError,
@@ -43,7 +45,11 @@ from manyforge_behavior.orchestration_ports import (
     ProgramRunScopeSnapshot,
     ProgramRunScopeState,
 )
-from manyforge_behavior.scene_client import SceneClient
+from manyforge_behavior.scene_client import (
+    SceneClient,
+    SceneOutcomeUnknownError,
+    SceneTransactionRejectedError,
+)
 
 
 _ACTIVE_STATES: Final = frozenset(
@@ -1902,13 +1908,18 @@ class NativeKernelProgramPort:
                 if task.identity.program_run_id == program_run_id
             )
         if scope_stop is not None:
-            stop_id, _stop_generation, retained_count = scope_stop
+            stop_id, stop_generation, retained_count = scope_stop
             try:
                 status = _mapping(
                     self._kernel.stop_status(stop_id).get("stop_status"),
                     field="aggregate Stop status",
                 )
                 state = _text(status.get("state"), field="Stop status state")
+                if (
+                    type(status.get("stop_generation")) is not int
+                    or status["stop_generation"] != stop_generation
+                ):
+                    raise ProductionPortError("program_run_stop_generation_mismatch")
             except Exception as exc:
                 return ProgramRunScopeSnapshot(
                     program_run_id=program_run_id,
@@ -2141,7 +2152,9 @@ class NativeKernelProgramPort:
                 if task.identity.program_run_id == program_run_id
             )
         if not tasks:
-            self._release_scope_stop(program_run_id)
+            settled = self._finish_scope_stop(program_run_id, release_fence=False)
+            if settled.state is not ProgramRunScopeState.SETTLED:
+                raise ProductionPortError("Program-run Stop changed during Reset cleanup")
             with self._lock:
                 self._pick_place_tasks = {
                     task_id: task
@@ -2198,7 +2211,9 @@ class NativeKernelProgramPort:
             with self._lock:
                 self._tasks.pop(task.operation_id, None)
 
-        self._release_scope_stop(program_run_id)
+        settled = self._finish_scope_stop(program_run_id, release_fence=False)
+        if settled.state is not ProgramRunScopeState.SETTLED:
+            raise ProductionPortError("Program-run Stop changed during Reset cleanup")
         with self._lock:
             self._pick_place_tasks = {
                 task_id: task
@@ -2212,10 +2227,19 @@ class NativeKernelProgramPort:
             0,
         )
 
-    def _release_scope_stop(
-        self, program_run_id: str, *, expected_stop: tuple[str, int] | None = None
+    def _finish_scope_stop(
+        self,
+        program_run_id: str,
+        *,
+        release_fence: bool,
+        expected_stop: tuple[str, int] | None = None,
     ) -> ProgramRunScopeSnapshot:
-        """Forget only a proved terminal Stop handoff before fresh attempts."""
+        """Retire a proved handoff; only Resume reopens Kernel admission.
+
+        Destructive cycle Reset keeps the existing whole-run fence through
+        scene restoration. The parent claim's release retires that fence and
+        capture; local receipt cleanup is not permission for fresh node work.
+        """
 
         with self._lock:
             stop = self._scope_stops.get(program_run_id)
@@ -2239,11 +2263,17 @@ class NativeKernelProgramPort:
             )
             if status.get("state") != "succeeded":
                 raise ProductionPortError("Program-run Stop cannot be released before settlement")
-            self._kernel.release_program_run_stop_fence(
-                program_run_id,
-                stop_id,
-                stop_generation,
-            )
+            if (
+                type(status.get("stop_generation")) is not int
+                or status["stop_generation"] != stop_generation
+            ):
+                raise ProductionPortError("Program-run Stop settlement generation is stale")
+            if release_fence:
+                self._kernel.release_program_run_stop_fence(
+                    program_run_id,
+                    stop_id,
+                    stop_generation,
+                )
             with self._lock:
                 if self._scope_stops.get(program_run_id) is stop and stop.active == scope_stop:
                     stop.active = None
@@ -3051,7 +3081,9 @@ class _NativeKernelProgramScopePort:
     def release_stop(
         self, program_run_id: str, *, expected_stop: tuple[str, int] | None = None
     ) -> ProgramRunScopeSnapshot:
-        return self._owner._release_scope_stop(program_run_id, expected_stop=expected_stop)
+        return self._owner._finish_scope_stop(
+            program_run_id, release_fence=True, expected_stop=expected_stop
+        )
 
     def reset(self, program_run_id: str) -> ProgramRunScopeSnapshot:
         return self._owner._reset_scope(program_run_id)
@@ -3065,7 +3097,14 @@ class HeadlessSceneProgramPort:
     every preparation, verification, or node attempt.
     """
 
-    def __init__(self, transport: _SceneProgramTransport) -> None:
+    def __init__(
+        self,
+        transport: _SceneProgramTransport,
+        *,
+        program_node_evidence: (
+            Callable[[NodeAttemptIdentity, str], Mapping[str, Any]] | None
+        ) = None,
+    ) -> None:
         for method in (
             "authoring_admission",
             "scene",
@@ -3075,6 +3114,11 @@ class HeadlessSceneProgramPort:
             if not callable(getattr(transport, method, None)):
                 raise TypeError(f"scene transport has no callable {method}")
         self._transport = transport
+        self._program_node_evidence = program_node_evidence
+        if program_node_evidence is not None and not callable(
+            getattr(transport, "scene_transaction_status", None)
+        ):
+            raise TypeError("runtime Scene transport has no exact result lookup")
         self._scene = SceneClient(transport)
         self._contexts: dict[str, _SceneBoundContext] = {}
         self._prepared: dict[str, dict[str, Any]] = {}
@@ -3339,6 +3383,7 @@ class HeadlessSceneProgramPort:
         expected_projection_revision: Mapping[str, Any],
         operation: Mapping[str, Any],
         program_reset_scene_authorization: Mapping[str, Any] | None = None,
+        program_node_evidence: Mapping[str, Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         body: dict[str, Any] = {
             "request_context": {
@@ -3350,7 +3395,9 @@ class HeadlessSceneProgramPort:
             "expected_projection_revision": dict(expected_projection_revision),
             "operation": dict(operation),
         }
-        if operation.get("kind") in _AUTHORED_SCENE_OPERATIONS:
+        if program_node_evidence is not None:
+            body["program_node_evidence"] = dict(program_node_evidence)
+        if operation.get("kind") in _AUTHORED_SCENE_OPERATIONS or program_node_evidence is not None:
             if program_reset_scene_authorization is not None:
                 authorization = dict(program_reset_scene_authorization)
                 if set(authorization) != {
@@ -3399,7 +3446,55 @@ class HeadlessSceneProgramPort:
                 body["request_context"]["request_id"] = _request_identity(
                     "scene-admission", request_id, str(generation)
                 )
-        response = self._scene.commit(body)
+        try:
+            response = self._scene.commit(body)
+        except SceneOutcomeUnknownError as error:
+            if program_node_evidence is None:
+                raise
+
+            # Retain this one exact call in its node adapter. A later tick only
+            # reads its result; it never sends the transaction a second time.
+            def observe() -> OwnerInvocationResult | None:
+                try:
+                    response = self._scene.receipt(body)
+                except SceneTransactionRejectedError as rejected:
+                    self._raise_if_stop_prevented_admission(rejected)
+                    return OwnerInvocationResult(
+                        False, reason_code=rejected.code, message=str(rejected)
+                    )
+                if response is None:
+                    return None
+                committed = self._committed_revision(
+                    context, expected_projection_revision, response
+                )
+                return OwnerInvocationResult(
+                    True,
+                    output={"committed_projection_revision": committed},
+                    metadata={
+                        "transaction_sequence": response.get("transaction_sequence"),
+                        "update_status": response.get("update_status"),
+                    },
+                )
+
+            raise OwnerInvocationPendingError(
+                "Scene transaction outcome is unconfirmed", observe
+            ) from error
+        return self._committed_revision(context, expected_projection_revision, response), response
+
+    @staticmethod
+    def _raise_if_stop_prevented_admission(error: SceneTransactionRejectedError) -> None:
+        details = error.response["error"].get("details", {})
+        if isinstance(details, dict) and details.get("reason") == "program_node_stop_fence_active":
+            revision = details.get("selection_revision")
+            if isinstance(revision, str) and revision.isdecimal() and len(revision) <= 16:
+                raise OwnerInvocationHeldError(int(revision)) from error
+
+    @staticmethod
+    def _committed_revision(
+        context: _SceneBoundContext,
+        expected_projection_revision: Mapping[str, Any],
+        response: Mapping[str, Any],
+    ) -> dict[str, Any]:
         committed = dict(
             _mapping(
                 response.get("committed_projection_revision"),
@@ -3421,7 +3516,7 @@ class HeadlessSceneProgramPort:
             raise ProductionPortError(
                 "scene commit changed captured structural or lineage identity"
             )
-        return committed, response
+        return committed
 
     @staticmethod
     def _initial_pose_and_frame(
@@ -3935,6 +4030,14 @@ class HeadlessSceneProgramPort:
     ) -> OwnerInvocationResult:
         try:
             context = self._context(identity.program_run_id)
+            if self._program_node_evidence is None:
+                raise ProductionPortError("runtime Scene node admission is unavailable")
+            owner_api = (
+                "scene.carried_attachment"
+                if node_id in {"scene.attach_carried_object", "scene.detach_carried_object"}
+                else "scene.transaction"
+            )
+            evidence = self._program_node_evidence(identity, owner_api)
             view = self._read_view(context)
             parameters = inputs.parameters
             if node_id in {"scene.add_object", "scene.upsert_object"}:
@@ -4081,6 +4184,7 @@ class HeadlessSceneProgramPort:
                         request_owner_epoch=view.request_owner_epoch,
                         expected_projection_revision=view.projection_revision,
                         operation=operation,
+                        program_node_evidence=evidence,
                     )
                 except Exception as error:
                     if (
@@ -4105,7 +4209,11 @@ class HeadlessSceneProgramPort:
                     },
                 )
             raise AssertionError("scene-node retry loop did not terminate")
+        except OwnerInvocationPendingError:
+            raise
         except Exception as exc:
+            if isinstance(exc, SceneTransactionRejectedError):
+                self._raise_if_stop_prevented_admission(exc)
             reason_code = getattr(exc, "code", None)
             if not isinstance(reason_code, str) or not reason_code:
                 reason_code = "scene_program_request_failed"

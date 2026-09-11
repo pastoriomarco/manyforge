@@ -791,10 +791,10 @@ TEST(ComponentManagerPortContracts, TransitionEvidenceRowsCannotContradictLocalP
   staged_row.state = ProjectionTransitionRowEvidenceState::kStagedNoActiveEffect;
   EXPECT_TRUE(evidence.phase_consistent(ProjectionTransitionEvidenceState::kStaged));
 
-  staged_row.resulting_health.active_projection_revision = candidate;
+  staged_row.resulting_health->active_projection_revision = candidate;
   EXPECT_FALSE(evidence.phase_consistent(ProjectionTransitionEvidenceState::kStaged));
-  staged_row.resulting_health.active_projection_revision.reset();
-  staged_row.resulting_health.state = ProjectionHealthState::kUnavailable;
+  staged_row.resulting_health->active_projection_revision.reset();
+  staged_row.resulting_health->state = ProjectionHealthState::kUnavailable;
   EXPECT_FALSE(evidence.phase_consistent(ProjectionTransitionEvidenceState::kStaged));
 
   const auto predecessor = Projection();
@@ -822,13 +822,58 @@ TEST(ComponentManagerPortContracts, TransitionEvidenceRowsCannotContradictLocalP
 
   auto finalized = FinalizedTransitionEvidence();
   ASSERT_TRUE(finalized.valid());
-  finalized.transition_rows.back().resulting_health.staged_candidate = ProjectionStagedCandidateDTO{
+  finalized.transition_rows.back().resulting_health->staged_candidate = ProjectionStagedCandidateDTO{
       finalized.apply_id,
       finalized.apply_generation,
       finalized.projection_stage_generation,
       finalized.candidate_projection_revision,
   };
   EXPECT_FALSE(finalized.valid());
+}
+
+TEST(ComponentManagerPortContracts, ManagedWithdrawalIsNotNativeHealthOrCleanAbort) {
+  auto evidence = TransitionEvidence();
+  const auto binding = NativeBinding();
+  const ManagedRuntimeWithdrawalDTO receipt{evidence.apply_id,
+                                            evidence.apply_generation,
+                                            ContentDigest(std::string(kDigest)),
+                                            binding.runtime_unit_id,
+                                            binding.runtime_epoch,
+                                            ContentDigest(std::string(kDigest)),
+                                            ContentDigest(std::string(kOtherDigest)),
+                                            "manager-supervisor",
+                                            7U};
+  evidence.transition_rows.push_back({{binding, ProjectionTransitionDisposition::kRemoved,
+                                       evidence.predecessor_projection_revision, receipt},
+                                      ProjectionTransitionRowEvidenceState::kRemovedRetired,
+                                      std::nullopt,
+                                      std::nullopt,
+                                      std::nullopt,
+                                      std::nullopt});
+  for (const auto phase : {ProjectionTransitionEvidenceState::kStaged,
+                           ProjectionTransitionEvidenceState::kActivatedAndRetired,
+                           ProjectionTransitionEvidenceState::kFinalized}) {
+    evidence.state = phase;
+    EXPECT_TRUE(evidence.valid());
+  }
+  evidence.state = ProjectionTransitionEvidenceState::kAborted;
+  EXPECT_FALSE(evidence.valid());
+  evidence.state = ProjectionTransitionEvidenceState::kStaged;
+  auto& row = evidence.transition_rows.front();
+  row.resulting_health = HealthyProjection(evidence.predecessor_projection_revision);
+  EXPECT_FALSE(evidence.valid());
+  row.resulting_health.reset();
+  row.transition_row.disposition = ProjectionTransitionDisposition::kRetained;
+  EXPECT_FALSE(evidence.valid());
+  row.transition_row.disposition = ProjectionTransitionDisposition::kRemoved;
+  row.transition_row.managed_withdrawal->apply_generation = ApplyGeneration(2U);
+  EXPECT_FALSE(evidence.valid());
+  row.transition_row.managed_withdrawal = receipt;
+  evidence.state = ProjectionTransitionEvidenceState::kUncertain;
+  evidence.error = ErrorDTO{"candidate_failed", "replacement failed", {}};
+  EXPECT_TRUE(evidence.valid());
+  row.transition_row.managed_withdrawal.reset();
+  EXPECT_FALSE(evidence.valid());
 }
 
 TEST(ComponentManagerPortContracts, TransitionInputAndEvidenceRowsRequireCanonicalUniqueBindings) {

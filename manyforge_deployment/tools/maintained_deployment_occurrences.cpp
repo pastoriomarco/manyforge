@@ -2100,29 +2100,35 @@ void verify_scenarios(const std::filesystem::path &root,
       expected_runtime_configuration.emplace(
           "direct_control_joint_limits",
           core::JsonValueDTO{core::JsonValueDTO::Array{}});
+      core::JsonObjectDTO expected_motion_target{
+          {"command_target_id", core::JsonValueDTO{std::string("arm")}},
+          {"controllable_component_id",
+           core::JsonValueDTO{graph.controllable_components.front()
+                                  .controllable_component_id.value()}},
+          {"maximum_tcp_linear_speed_mps",
+           core::JsonValueDTO{expected_target_speed_limit}},
+          {"ordinary_motion_jerk",
+           core::JsonValueDTO{core::JsonObjectDTO{
+               {"enabled", core::JsonValueDTO{false}},
+               {"preset_reference_time_s", core::JsonValueDTO{1.0}},
+               {"joint_limits",
+                core::JsonValueDTO{core::JsonValueDTO::Array{}}}}}}};
       expected_runtime_configuration.emplace(
           "motion_target_limits",
-          core::JsonValueDTO{core::JsonValueDTO::Array{core::JsonValueDTO{
-              core::JsonObjectDTO{
-                  {"command_target_id", core::JsonValueDTO{std::string("arm")}},
-                  {"controllable_component_id",
-                   core::JsonValueDTO{graph.controllable_components.front()
-                                          .controllable_component_id.value()}},
-                  {"maximum_tcp_linear_speed_mps",
-                   core::JsonValueDTO{expected_target_speed_limit}}}}}});
-      if (scenario.family_id ==
-          std::string_view("lite6_lite_gripper")) {
+          core::JsonValueDTO{core::JsonValueDTO::Array{
+              core::JsonValueDTO{std::move(expected_motion_target)}}});
+      if (scenario.family_id == std::string_view("lite6_lite_gripper")) {
         expected_runtime_configuration.emplace(
             "gripper_target_configurations",
-            core::JsonValueDTO{core::JsonValueDTO::Array{core::JsonValueDTO{
-                core::JsonObjectDTO{
+            core::JsonValueDTO{core::JsonValueDTO::Array{
+                core::JsonValueDTO{core::JsonObjectDTO{
                     {"actuation_kind",
                      core::JsonValueDTO{std::string("position_commanded")}},
                     {"attach_frame",
                      core::JsonValueDTO{std::string("link_tcp")}},
                     {"auxiliary_frames",
-                     core::JsonValueDTO{core::JsonValueDTO::Array{
-                         core::JsonValueDTO{
+                     core::JsonValueDTO{
+                         core::JsonValueDTO::Array{core::JsonValueDTO{
                              std::string("lite_gripper_base_link")}}}},
                     {"closed_state_ref",
                      core::JsonValueDTO{std::string("closed")}},
@@ -2130,17 +2136,16 @@ void verify_scenarios(const std::filesystem::path &root,
                     {"command_target_id",
                      core::JsonValueDTO{std::string("gripper")}},
                     {"controllable_component_id",
-                     core::JsonValueDTO{graph.controllable_components.front()
-                                            .controllable_component_id.value()}},
-                    {"description",
-                     core::JsonValueDTO{std::string(
-                         "Native simulated UFACTORY lite pneumatic gripper.")}},
+                     core::JsonValueDTO{
+                         graph.controllable_components.front()
+                             .controllable_component_id.value()}},
+                    {"description", core::JsonValueDTO{std::string(
+                                        "Native simulated UFACTORY lite "
+                                        "pneumatic gripper.")}},
                     {"mount_frame",
                      core::JsonValueDTO{std::string("link_eef")}},
-                    {"open_state_ref",
-                     core::JsonValueDTO{std::string("open")}},
-                    {"tcp_frame",
-                     core::JsonValueDTO{std::string("link_tcp")}},
+                    {"open_state_ref", core::JsonValueDTO{std::string("open")}},
+                    {"tcp_frame", core::JsonValueDTO{std::string("link_tcp")}},
                     {"touch_links",
                      core::JsonValueDTO{core::JsonValueDTO::Array{
                          core::JsonValueDTO{
@@ -2322,7 +2327,7 @@ void verify_scenarios(const std::filesystem::path &root,
       throw std::invalid_argument(
           "same-family profiles select different models");
     }
-  }
+    }
   if (family_identities.size() != 5U || family_models.size() != 3U) {
     throw std::logic_error("maintained scenarios do not cover three families");
   }

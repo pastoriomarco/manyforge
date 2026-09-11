@@ -22,6 +22,7 @@
 namespace manyforge::core {
 
 struct ComponentLifecycleCoordinatorConfig final {
+  /// Startup-unique seed. The journal mints the advertised request namespace.
   RequestOwnerEpoch request_owner_epoch;
   std::size_t request_membership_capacity;
   std::size_t lifecycle_worker_count;
@@ -77,11 +78,17 @@ class ComponentLifecycleCoordinator final {
   [[nodiscard]] Result<CCLCLifecycleRequestResultDTO> SubmitLifecycle(
       const ComponentLifecycleIntentDTO& intent);
 
+  [[nodiscard]] Result<std::optional<CCLCLifecycleRequestResultDTO>> ReadLifecycleRequestResult(
+      const ComponentLifecycleIntentDTO& intent);
+
   [[nodiscard]] Result<std::optional<ComponentLifecycleStatusDTO>> LoadLifecycleStatus(
       const LifecycleTransactionId& lifecycle_transaction_id);
 
   [[nodiscard]] Result<CCLCRouteSelectionRequestResultDTO> SubmitRouteSelection(
       const RouteSelectionIntentDTO& intent);
+
+  [[nodiscard]] Result<std::optional<CCLCRouteSelectionRequestResultDTO>>
+  ReadRouteSelectionRequestResult(const RouteSelectionIntentDTO& intent);
 
   [[nodiscard]] Result<std::optional<RouteSelectionStatusDTO>> LoadRouteSelectionStatus(
       const RouteSelectionTransactionId& route_selection_transaction_id);

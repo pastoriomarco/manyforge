@@ -16,6 +16,7 @@ from .authoring_admission import (
     AuthoringMutationEnvelope,
     headless_client_http_exception,
 )
+from .authoring_transaction_journal import AuthoringJournalError
 from .deployment_artifacts import (
     load_deployment_artifact,
     normalize_deployment_save_path,
@@ -64,7 +65,10 @@ class UpdateDeploymentRequest(_Fence):
 
 
 class UpdateControlledStopRequest(_Fence):
-    profile: dict[str, Any]
+    control_binding_id: str = Field(min_length=1, max_length=256)
+    control_binding_revision: str = Field(min_length=1, max_length=256)
+    profile: dict[str, Any] | None
+    timing: dict[str, Any] | None
 
 
 class UpdateMotionTargetLimitRequest(_Fence):
@@ -99,6 +103,14 @@ class ApplyDeploymentCandidateRequest(_Fence):
 
 
 def _raise(error: Exception) -> NoReturn:
+    if (
+        isinstance(error, AuthoringJournalError)
+        and error.code == "program_scene_preparation_unavailable"
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail={"code": error.code, "message": str(error)},
+        ) from error
     if isinstance(error, DeploymentDraftError):
         raise HTTPException(
             status_code=error.status_code,
@@ -165,23 +177,56 @@ def _workspace(state: ComposerState) -> dict[str, Any]:
         except HeadlessClientError as error:
             unavailable.append(error.code)
     draft_revision = draft["deploymentRevision"]
-    applied_revision = current.get("deployment_revision") if current is not None else None
+    applied_revision = (
+        current.get("deployment_revision") if current is not None else None
+    )
     run_ready = draft_revision is None or draft_revision == applied_revision
+    candidates: dict[str, dict[str, Any] | None] = {}
+
+    def candidate(row: dict[str, Any]) -> dict[str, Any] | None:
+        # The catalog owns the pairing, not copied Program identity fields.
+        # Resolve only matching Draft/Saved entries through the existing pure
+        # selection read, once per workspace response (never on heartbeat).
+        scenario_id = row["scenario_id"]
+        if scenario_id not in candidates:
+            candidates[scenario_id] = None
+            try:
+                selection = state.headless_client.scenario_load_selection(scenario_id)
+                if selection[
+                    "scenario_catalog_revision"
+                ] != scenario_catalog_revision or any(
+                    selection.get(key) != row.get(key)
+                    for key in (
+                        "scenario_id",
+                        "deployment_artifact_id",
+                        "deployment_revision",
+                        "retained_bundle_id",
+                        "program_binding_id",
+                    )
+                ):
+                    unavailable.append("scenario_candidate_selection_mismatch")
+                else:
+                    candidates[scenario_id] = {
+                        "scenarioId": scenario_id,
+                        "scenarioCatalogRevision": scenario_catalog_revision,
+                        "deploymentArtifactId": row["deployment_artifact_id"],
+                        "deploymentRevision": row["deployment_revision"],
+                        "retainedBundleId": row["retained_bundle_id"],
+                        "programId": selection["program_id"],
+                        "programRevision": selection["program_revision"],
+                        "programBindingId": row["program_binding_id"],
+                        "description": row.get("description"),
+                    }
+            except HeadlessClientError as error:
+                unavailable.append(error.code)
+        return candidates[scenario_id]
+
     matching_scenarios = [
-        {
-            "scenarioId": row.get("scenario_id"),
-            "scenarioCatalogRevision": scenario_catalog_revision,
-            "deploymentArtifactId": row.get("deployment_artifact_id"),
-            "deploymentRevision": row.get("deployment_revision"),
-            "retainedBundleId": row.get("retained_bundle_id"),
-            "programId": row.get("program_id"),
-            "programRevision": row.get("program_revision"),
-            "programBindingId": row.get("program_binding_id"),
-            "description": row.get("description"),
-        }
+        resolved
         for row in scenarios
         if row.get("deployment_artifact_id") == draft["deploymentArtifactId"]
         and row.get("deployment_revision") == draft_revision
+        and (resolved := candidate(row)) is not None
     ]
     retained = state.deployment_draft_session.retained_state()
     saved_document = retained.get("saved_document")
@@ -196,26 +241,19 @@ def _workspace(state: ComposerState) -> dict[str, Any]:
         else None
     )
     saved_scenarios = [
-        {
-            "scenarioId": row.get("scenario_id"),
-            "scenarioCatalogRevision": scenario_catalog_revision,
-            "deploymentArtifactId": row.get("deployment_artifact_id"),
-            "deploymentRevision": row.get("deployment_revision"),
-            "retainedBundleId": row.get("retained_bundle_id"),
-            "programId": row.get("program_id"),
-            "programRevision": row.get("program_revision"),
-            "programBindingId": row.get("program_binding_id"),
-            "description": row.get("description"),
-        }
+        resolved
         for row in scenarios
         if row.get("deployment_artifact_id") == saved_artifact_id
         and row.get("deployment_revision") == saved_revision
+        and (resolved := candidate(row)) is not None
     ]
     workspace.update(
         {
             "managerApplied": {
                 "deploymentRevision": applied_revision,
-                "scenarioId": current.get("scenario_id") if current is not None else None,
+                "scenarioId": (
+                    current.get("scenario_id") if current is not None else None
+                ),
             },
             "runAdmission": {
                 "ready": run_ready,
@@ -347,6 +385,9 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             prepared["compiled"] = (
                 state.deployment_draft_session.preview_controlled_stop_update(
                     body.profile,
+                    control_binding_id=body.control_binding_id,
+                    control_binding_revision=body.control_binding_revision,
+                    timing=body.timing,
                     draft_id=body.draft_id,
                     expected_revision=body.expected_draft_revision,
                 )
@@ -379,9 +420,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                 state.deployment_draft_session.preview_motion_target_limit_update(
                     controllable_component_id=body.controllable_component_id,
                     command_target_id=body.command_target_id,
-                    maximum_tcp_linear_speed_mps=(
-                        body.maximum_tcp_linear_speed_mps
-                    ),
+                    maximum_tcp_linear_speed_mps=(body.maximum_tcp_linear_speed_mps),
                     draft_id=body.draft_id,
                     expected_revision=body.expected_draft_revision,
                 )
@@ -411,7 +450,9 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
         current_path = snapshot["saved"]["path"]
         if isinstance(body, SaveDeploymentAsRequest):
             target = normalize_deployment_save_path(body.path)
-            resolved = str(Path(target).expanduser().parent.resolve() / Path(target).name)
+            resolved = str(
+                Path(target).expanduser().parent.resolve() / Path(target).name
+            )
             overwrite = body.confirm_overwrite or resolved == current_path
         else:
             if current_path is None:
@@ -428,7 +469,9 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             draft_id=body.draft_id,
             expected_revision=body.expected_draft_revision,
         )
-        target_resolved = str(Path(target).expanduser().parent.resolve() / Path(target).name)
+        target_resolved = str(
+            Path(target).expanduser().parent.resolve() / Path(target).name
+        )
         deployment_post = state.deployment_draft_session.retained_state()
         deployment_post["saved_path"] = target_resolved
         deployment_post["saved_document"] = deepcopy(snapshot["draft"]["document"])
@@ -573,9 +616,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                     "graph_revision": active["graph_revision"],
                     "retained_bundle_id": active["retained_bundle_id"],
                 },
-                "expected_admission_generation": (
-                    body.expected_admission_generation
-                ),
+                "expected_admission_generation": (body.expected_admission_generation),
                 "request_owner_epoch": manager_epoch,
             }
         )
@@ -594,9 +635,12 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             deployment_post["draft_revision"] += 1
         deployment_post["document"] = deepcopy(saved)
         post_state["deployment"] = deployment_post
-        manager_request_id = "deployment-revert-" + hashlib.sha256(
-            f"{body.request_owner_epoch}:{body.request_id}".encode("utf-8")
-        ).hexdigest()[:32]
+        manager_request_id = (
+            "deployment-revert-"
+            + hashlib.sha256(
+                f"{body.request_owner_epoch}:{body.request_id}".encode("utf-8")
+            ).hexdigest()[:32]
+        )
         intent = {
             "schema_version": "manyforge.composer_authoring_effect.v1",
             "operation_kind": "revert_deployment",
@@ -643,8 +687,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
         )
 
     def authored_candidate(
-        body: PreviewDeploymentCandidateRequest
-        | ApplyDeploymentCandidateRequest,
+        body: PreviewDeploymentCandidateRequest | ApplyDeploymentCandidateRequest,
         *,
         apply: bool,
     ) -> dict[str, Any]:
@@ -683,9 +726,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             )
         current_projection = state.current_scenario()
         current = current_projection.get("current_scenario")
-        if current_projection.get("ready") is not True or not isinstance(
-            current, dict
-        ):
+        if current_projection.get("ready") is not True or not isinstance(current, dict):
             _raise(
                 DeploymentDraftError(
                     "deployment_current_scenario_unavailable",
@@ -734,9 +775,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                 else "deployment_candidate_preview"
             ),
             "scenario_id": current["scenario_id"],
-            "expected_scenario_catalog_revision": current[
-                "scenario_catalog_revision"
-            ],
+            "expected_scenario_catalog_revision": current["scenario_catalog_revision"],
             "deployment": deepcopy(deployment),
             "program": deepcopy(program),
             "expected_applied_record_digest": record_digest,
@@ -776,8 +815,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                 latest_current != current
                 or latest_applied.get("program") != program
                 or latest_digest != record_digest
-                or (latest_bundle, latest_graph)
-                != (current_bundle, current_graph)
+                or (latest_bundle, latest_graph) != (current_bundle, current_graph)
             ):
                 raise DeploymentDraftError(
                     "deployment_candidate_source_changed",
@@ -805,12 +843,14 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             validate=validate,
             effect=effect,
             after_release=(
-                lambda: state.prepare_current_applied_scene(
-                    request_owner_epoch=body.request_owner_epoch,
-                    request_id=body.request_id,
+                lambda: (
+                    state.prepare_current_applied_scene(
+                        request_owner_epoch=body.request_owner_epoch,
+                        request_id=body.request_id,
+                    )
+                    if apply
+                    else None
                 )
-                if apply
-                else None
             ),
         )
 

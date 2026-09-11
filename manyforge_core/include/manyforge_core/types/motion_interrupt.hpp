@@ -4,21 +4,20 @@
 #include <cmath>
 #include <cstdint>
 #include <iomanip>
-#include <map>
-#include <optional>
-#include <sstream>
-#include <set>
-#include <string>
-#include <string_view>
-#include <vector>
-
+#include <manyforge_core/types/action_span.hpp>
 #include <manyforge_core/types/collision.hpp>
 #include <manyforge_core/types/coordinate_state.hpp>
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/geometry.hpp>
 #include <manyforge_core/types/interrupt.hpp>
-#include <manyforge_core/types/action_span.hpp>
 #include <manyforge_core/types/robot_state.hpp>
+#include <map>
+#include <optional>
+#include <set>
+#include <sstream>
+#include <string>
+#include <string_view>
+#include <vector>
 
 namespace manyforge::core {
 
@@ -49,6 +48,7 @@ struct MotionInterruptSoftOnPathPlannerConfigDTO {
   std::optional<double> max_initial_velocity_deviation_rad_s;
   std::map<std::string, double> per_joint_max_jerk_rad_s3;
   bool allow_model_velocity_fallback = false;
+  bool jerk_limits_enabled = true;
 };
 
 /// Controlled-stop capability surface declared by an execution backend
@@ -68,8 +68,7 @@ struct MotionInterruptStopCapabilityDTO {
   /// older test backends; production backends SHOULD populate this so
   /// arm-time feasibility and trip-time execution use the same timing
   /// and drift/jerk limits.
-  std::optional<MotionInterruptSoftOnPathPlannerConfigDTO>
-      soft_on_path_planner_config;
+  std::optional<MotionInterruptSoftOnPathPlannerConfigDTO> soft_on_path_planner_config;
   /// Hard-stop floor the backend can prove for critical fallback logic. This
   /// is intentionally a string capability rather than a stop-mode enum because
   /// "immediate" / controller-native brake semantics are backend-family facts,
@@ -104,7 +103,9 @@ struct MotionInterruptStopProfileDTO {
   /// catalog selector or runtime lookup key.
   std::string profile_id;
   MotionInterruptStopMode stop_mode = MotionInterruptStopMode::kSpringBackHold;
-  /// Requested ramp duration for `kSpringBackHold` and `kSoftOnPath`.
+  /// Soft-on-path ramp duration, excluding its bounded command lead-in.
+  /// Spring-back retains its whole replacement duration (lead-in included),
+  /// split equally between forward braking and return.
   /// Required for `kSoftOnPath`; deployments MAY provide defaults for
   /// `kSpringBackHold`. For on-path spring-back the value is split into equal
   /// forward-deceleration and reverse-return halves.
@@ -113,13 +114,12 @@ struct MotionInterruptStopProfileDTO {
   /// target-joint coverage for soft_on_path and spring_back_hold; forbidden
   /// for hard_deceleration. Kernel Prepare resolves these source names to
   /// exact resource identities without changing their coordinate meaning.
-  std::map<std::string, CoordinateAccelerationDTO>
-      per_joint_max_deceleration;
-  /// When `kSoftOnPath` is requested and the remaining accepted
+  std::map<std::string, CoordinateAccelerationDTO> per_joint_max_deceleration;
+  /// When a soft-on-path or spring-back profile is requested and the remaining accepted
   /// trajectory would finish before a useful wall-time stop ramp
   /// can be accepted, allow the motion to complete naturally
-  /// instead of requiring a stop-mode fallback. Default true keeps
-  /// operator-stop semantics resumable: short remaining moves finish
+  /// instead of requiring a stop-mode fallback. Soft defaults on; Spring
+  /// defaults off to preserve its precision return. With explicit opt-in, short moves finish
   /// normally while the kernel/backend report Stopping until terminal.
   /// Source decoding normalizes omission to true for soft_on_path and false
   /// for the other modes; this DTO stores that normalized value.
@@ -137,11 +137,20 @@ struct MotionInterruptStopProfileDTO {
   /// wrong-unit, unknown, duplicate, or incomplete meaning. A present map MUST
   /// be non-empty, so the normalized DTO preserves authored omission versus an
   /// invalid explicitly empty object.
-  std::optional<std::map<std::string, CoordinateVelocityDTO>>
-      per_joint_settle_velocity_threshold;
+  std::optional<std::map<std::string, CoordinateVelocityDTO>> per_joint_settle_velocity_threshold;
   /// Bounded JSON-safe profile metadata (controller family / version
   /// / qualification artifact id).
   InterruptStructuredValue diagnostics;
+  /// Explicit controlled-attempt requirement, independent of ordinary motion.
+  /// Hard containment makes no jerk guarantee. Source decoding requires an
+  /// explicit choice; omission must neither activate nor waive a limit.
+  /// Absent is an unreviewed declaration or pre-choice history; it cannot be
+  /// prepared for a new controlled attempt.
+  std::optional<bool> jerk_limits_enabled;
+  /// Source-joint overrides before preparation; exact, frozen limits afterward.
+  /// Missing enabled values are resolved by the cold profile mapper, never by
+  /// changing limits to make a Stop-time candidate feasible.
+  std::map<std::string, CoordinateJerkDTO> per_joint_max_jerk;
   friend bool operator==(const MotionInterruptStopProfileDTO&,
                          const MotionInterruptStopProfileDTO&) = default;
 };
@@ -151,23 +160,26 @@ inline double motion_interrupt_deceleration_time_or_default(
   return profile.deceleration_time_s.value_or(kDefaultDecelerationTimeS);
 }
 
-inline bool motion_interrupt_stop_profile_id_valid(
-    std::string_view profile_id) {
+/// Existing ManyForge shaping preset, not a manufacturer/equipment limit.
+/// The caller supplies validated positive inputs and freezes the result at
+/// preparation. Ordinary profiles use a stable configured reference duration.
+inline double motion_jerk_preset_limit(double acceleration_limit, double reference_time_s) {
+  const double ramp_s = std::min(std::max(0.15 * reference_time_s, 0.02), reference_time_s / 3.0);
+  return acceleration_limit / std::max(ramp_s, 1e-9);
+}
+
+inline bool motion_interrupt_stop_profile_id_valid(std::string_view profile_id) {
   const auto ascii_alphanumeric = [](char character) {
-    return (character >= '0' && character <= '9') ||
-           (character >= 'A' && character <= 'Z') ||
+    return (character >= '0' && character <= '9') || (character >= 'A' && character <= 'Z') ||
            (character >= 'a' && character <= 'z');
   };
-  if (profile_id.empty() || profile_id.size() > 128U ||
-      !ascii_alphanumeric(profile_id.front())) {
+  if (profile_id.empty() || profile_id.size() > 128U || !ascii_alphanumeric(profile_id.front())) {
     return false;
   }
-  return std::all_of(profile_id.begin() + 1, profile_id.end(),
-                     [&](char character) {
-                       return ascii_alphanumeric(character) ||
-                              character == '.' || character == '_' ||
-                              character == '-';
-                     });
+  return std::all_of(profile_id.begin() + 1, profile_id.end(), [&](char character) {
+    return ascii_alphanumeric(character) || character == '.' || character == '_' ||
+           character == '-';
+  });
 }
 
 inline std::string motion_interrupt_max_deceleration_time_label() {
@@ -175,8 +187,7 @@ inline std::string motion_interrupt_max_deceleration_time_label() {
   out << std::setprecision(15) << kMaxControlledStopDecelerationTimeS;
   std::string label = out.str();
   const bool has_exponent =
-      label.find('e') != std::string::npos ||
-      label.find('E') != std::string::npos;
+      label.find('e') != std::string::npos || label.find('E') != std::string::npos;
   const auto dot = label.find('.');
   if (dot == std::string::npos && !has_exponent) {
     label += ".0";
@@ -189,8 +200,7 @@ inline std::string motion_interrupt_max_deceleration_time_label() {
 }
 
 inline std::string motion_interrupt_deceleration_time_max_error() {
-  return "deceleration_time_s must be <= " +
-         motion_interrupt_max_deceleration_time_label();
+  return "deceleration_time_s must be <= " + motion_interrupt_max_deceleration_time_label();
 }
 
 /// Validate the mode-specific REQUIRED fields of a stop profile at the
@@ -209,26 +219,23 @@ inline std::string motion_interrupt_stop_profile_field_error(
   }
   if (profile.stop_mode == MotionInterruptStopMode::kSoftOnPath ||
       profile.stop_mode == MotionInterruptStopMode::kSpringBackHold) {
-    if (profile.stop_mode == MotionInterruptStopMode::kSoftOnPath &&
-        !profile.deceleration_time_s) {
+    if (profile.stop_mode == MotionInterruptStopMode::kSoftOnPath && !profile.deceleration_time_s) {
       return "soft_on_path requires a finite positive deceleration_time_s";
     }
     if (profile.deceleration_time_s &&
-        (!std::isfinite(*profile.deceleration_time_s) ||
-         *profile.deceleration_time_s <= 0.0)) {
+        (!std::isfinite(*profile.deceleration_time_s) || *profile.deceleration_time_s <= 0.0)) {
       return "soft_on_path/spring_back_hold requires a finite positive "
              "deceleration_time_s";
     }
-    if (profile.deceleration_time_s && *profile.deceleration_time_s >
-        kMaxControlledStopDecelerationTimeS) {
+    if (profile.deceleration_time_s &&
+        *profile.deceleration_time_s > kMaxControlledStopDecelerationTimeS) {
       return motion_interrupt_deceleration_time_max_error();
     }
     if (profile.per_joint_max_deceleration.empty()) {
       return "soft_on_path/spring_back_hold requires a non-empty "
              "per_joint_max_deceleration";
     }
-    for (const auto& [joint, limit] :
-         profile.per_joint_max_deceleration) {
+    for (const auto& [joint, limit] : profile.per_joint_max_deceleration) {
       const double value = std::visit(
           [](const auto& typed) {
             if constexpr (requires { typed.value_rad_s2; }) {
@@ -246,19 +253,36 @@ inline std::string motion_interrupt_stop_profile_field_error(
     }
   }
   if (profile.stop_mode == MotionInterruptStopMode::kHardDeceleration &&
-      (!profile.per_joint_max_deceleration.empty() ||
-       profile.deceleration_time_s.has_value())) {
+      (!profile.per_joint_max_deceleration.empty() || profile.deceleration_time_s.has_value())) {
     return "hard_deceleration forbids deceleration_time_s and "
            "per_joint_max_deceleration";
   }
-  if (profile.stop_mode != MotionInterruptStopMode::kSoftOnPath &&
+  if (profile.stop_mode == MotionInterruptStopMode::kHardDeceleration &&
+      (profile.jerk_limits_enabled == true || !profile.per_joint_max_jerk.empty()))
+    return "hard_deceleration forbids jerk shaping";
+  for (const auto& [joint, jerk] : profile.per_joint_max_jerk) {
+    const double value = std::visit(
+        [](const auto& typed) {
+          if constexpr (requires { typed.value_rad_s3; })
+            return typed.value_rad_s3;
+          else
+            return typed.value_m_s3;
+        },
+        jerk);
+    const auto acceleration = profile.per_joint_max_deceleration.find(joint);
+    if (acceleration == profile.per_joint_max_deceleration.end() ||
+        coordinate_kind(jerk) != coordinate_kind(acceleration->second) || !std::isfinite(value) ||
+        value <= 0.0) {
+      return "per_joint_max_jerk must contain positive limits with matching joint units";
+    }
+  }
+  if (profile.stop_mode == MotionInterruptStopMode::kHardDeceleration &&
       profile.allow_natural_completion_on_short_path) {
-    return "natural completion is legal only for soft_on_path";
+    return "natural completion is legal only for soft_on_path or spring_back_hold";
   }
   if (profile.recoverable_substitution_mode.has_value() &&
       (profile.stop_mode != MotionInterruptStopMode::kSoftOnPath ||
-       *profile.recoverable_substitution_mode !=
-           MotionInterruptStopMode::kSpringBackHold)) {
+       *profile.recoverable_substitution_mode != MotionInterruptStopMode::kSpringBackHold)) {
     return "recoverable_substitution_mode is only soft_on_path to "
            "spring_back_hold";
   }
@@ -266,8 +290,7 @@ inline std::string motion_interrupt_stop_profile_field_error(
     if (profile.per_joint_settle_velocity_threshold->empty()) {
       return "per_joint_settle_velocity_threshold must be omitted or non-empty";
     }
-    for (const auto& [joint, threshold] :
-         *profile.per_joint_settle_velocity_threshold) {
+    for (const auto& [joint, threshold] : *profile.per_joint_settle_velocity_threshold) {
       const double value = std::visit(
           [](const auto& typed) {
             if constexpr (requires { typed.value_rad_s; }) {
@@ -307,7 +330,8 @@ struct ControlledStopResultDTO {
   /// backend cannot execute the requested or any fallback mode.
   bool accepted = false;
   /// `true` only for the explicit short-path policy where
-  /// `kSoftOnPath` was requested, no useful wall-time replacement ramp
+  /// `kSoftOnPath` or explicitly opted-in `kSpringBackHold` was requested,
+  /// no useful wall-time replacement ramp
   /// can be accepted before the original trajectory endpoint, and the
   /// stop profile allows natural completion. No controlled stop is
   /// claimed in this case; the kernel records `terminal_cause =
@@ -315,8 +339,7 @@ struct ControlledStopResultDTO {
   bool completed_by_natural_completion = false;
   /// Mode the backend actually executed. Set even when `accepted=false`
   /// so the audit trail records what the backend tried.
-  MotionInterruptStopMode executed_stop_mode =
-      MotionInterruptStopMode::kSpringBackHold;
+  MotionInterruptStopMode executed_stop_mode = MotionInterruptStopMode::kSpringBackHold;
   /// Surface that issued the stop. `kDiagnosticOther` MUST carry a
   /// stable backend reason in `diagnostics`.
   MotionInterruptStopCommandSource stop_command_source =
@@ -363,10 +386,8 @@ struct ControlledStopResultDTO {
 /// evidence. It does not authorize a stronger Kernel stage; a mode mismatch is
 /// only provenance for the Kernel's already-prepared escalation/substitution
 /// rules.
-[[nodiscard]] inline std::optional<std::string>
-controlled_stop_result_field_error(
-    const MotionInterruptStopProfileDTO& requested_profile,
-    const ControlledStopResultDTO& result) {
+[[nodiscard]] inline std::optional<std::string> controlled_stop_result_field_error(
+    const MotionInterruptStopProfileDTO& requested_profile, const ControlledStopResultDTO& result) {
   const auto known_mode = [](MotionInterruptStopMode mode) {
     switch (mode) {
       case MotionInterruptStopMode::kSpringBackHold:
@@ -376,8 +397,7 @@ controlled_stop_result_field_error(
     }
     return false;
   };
-  const auto known_command_source =
-      [](MotionInterruptStopCommandSource source) {
+  const auto known_command_source = [](MotionInterruptStopCommandSource source) {
     switch (source) {
       case MotionInterruptStopCommandSource::kFjtPreemptHold:
       case MotionInterruptStopCommandSource::kFjtPreemptPathRamp:
@@ -410,8 +430,7 @@ controlled_stop_result_field_error(
       !finite_nonnegative(result.initial_path_deviation_rad)) {
     return "controlled_stop_numeric_evidence_invalid";
   }
-  if (const auto diagnostics_error =
-          interrupt_structured_value_error(result.diagnostics)) {
+  if (const auto diagnostics_error = interrupt_structured_value_error(result.diagnostics)) {
     return "controlled_stop_diagnostics_" + *diagnostics_error;
   }
   if (!result.accepted && !result.error.has_value()) {
@@ -420,13 +439,11 @@ controlled_stop_result_field_error(
   if (!result.accepted && result.backend_stop_confirmed) {
     return "rejected_result_cannot_be_confirmed";
   }
-  if (result.error.has_value() &&
-      (result.error->code.empty() || result.error->message.empty())) {
+  if (result.error.has_value() && (result.error->code.empty() || result.error->message.empty())) {
     return "controlled_stop_error_invalid";
   }
 
-  const bool mode_differs =
-      result.executed_stop_mode != requested_profile.stop_mode;
+  const bool mode_differs = result.executed_stop_mode != requested_profile.stop_mode;
   if (mode_differs) {
     if (result.accepted && result.fallback_reason.has_value() &&
         !motion_interrupt_stop_profile_id_valid(*result.fallback_reason)) {
@@ -437,17 +454,14 @@ controlled_stop_result_field_error(
   }
 
   if (result.completed_by_natural_completion &&
-      (requested_profile.stop_mode != MotionInterruptStopMode::kSoftOnPath ||
-       result.executed_stop_mode != MotionInterruptStopMode::kSoftOnPath ||
-       !requested_profile.allow_natural_completion_on_short_path ||
-       !result.accepted || !result.backend_stop_confirmed ||
-       result.error.has_value() || mode_differs)) {
+      (requested_profile.stop_mode == MotionInterruptStopMode::kHardDeceleration ||
+       !requested_profile.allow_natural_completion_on_short_path || !result.accepted ||
+       !result.backend_stop_confirmed || result.error.has_value() || mode_differs)) {
     return "natural_completion_result_invalid";
   }
 
   if (result.accepted && result.backend_stop_confirmed && !mode_differs &&
-      result.stop_command_source ==
-          MotionInterruptStopCommandSource::kDiagnosticOther) {
+      result.stop_command_source == MotionInterruptStopCommandSource::kDiagnosticOther) {
     const auto carries_stable_reason = [&](std::string_view key) {
       const auto found = result.diagnostics.find(std::string(key));
       if (found == result.diagnostics.end()) {
@@ -456,8 +470,7 @@ controlled_stop_result_field_error(
       const auto* text = std::get_if<std::string>(&found->second);
       return text != nullptr && motion_interrupt_stop_profile_id_valid(*text);
     };
-    if (!carries_stable_reason("command_source") &&
-        !carries_stable_reason("reason")) {
+    if (!carries_stable_reason("command_source") && !carries_stable_reason("reason")) {
       return "diagnostic_command_source_reason_missing";
     }
   }
@@ -503,11 +516,9 @@ struct MotionInterruptScopeDTO {
   /// `kGeneric` matches `MoveUntilSignal`-class nodes;
   /// `kPrecisionContact` matches `ProbeSearchMove`-class nodes and rejects a
   /// recoverable substitution at arm time.
-  MotionInterruptNodeCategory node_category =
-      MotionInterruptNodeCategory::kGeneric;
+  MotionInterruptNodeCategory node_category = MotionInterruptNodeCategory::kGeneric;
   InterruptStructuredValue metadata;
-  friend bool operator==(const MotionInterruptScopeDTO&,
-                         const MotionInterruptScopeDTO&) = default;
+  friend bool operator==(const MotionInterruptScopeDTO&, const MotionInterruptScopeDTO&) = default;
 };
 
 /// Source from which the kernel captured a controlled stop snapshot
@@ -528,8 +539,7 @@ enum class ExecutionStopSnapshotSource {
 /// outcome, not an in-flight progress sample.
 struct ExecutionStopSnapshotDTO {
   std::int64_t captured_at_ns = 0;
-  ExecutionStopSnapshotSource source =
-      ExecutionStopSnapshotSource::kExecutionBackendFeedback;
+  ExecutionStopSnapshotSource source = ExecutionStopSnapshotSource::kExecutionBackendFeedback;
   RobotStateDTO robot_state;
   std::optional<Pose3DTO> tcp_pose;
   std::optional<double> trajectory_time_from_start_s;
@@ -569,8 +579,7 @@ struct MotionTripOutcomeDTO {
   /// qualified `soft_on_path` to `spring_back_hold` recoverable substitution.
   /// Default `kSpringBackHold` is a schema placeholder;
   /// real values are populated by the trip-handling path.
-  MotionInterruptStopMode executed_stop_mode =
-      MotionInterruptStopMode::kSpringBackHold;
+  MotionInterruptStopMode executed_stop_mode = MotionInterruptStopMode::kSpringBackHold;
   /// Which backend/controller surface issued the stop.
   /// `kDiagnosticOther` MUST include a stable backend reason in
   /// `diagnostics`.
@@ -641,8 +650,7 @@ struct MotionExecutionOutcomeDTO {
   std::string move_id;
   std::optional<ActionSpanDTO> action_span;
   std::string contact_policy_id;
-  MotionExecutionTerminalCause terminal_cause =
-      MotionExecutionTerminalCause::kCompletedNormally;
+  MotionExecutionTerminalCause terminal_cause = MotionExecutionTerminalCause::kCompletedNormally;
   /// Present iff `terminal_cause == kSignalTrip`.
   std::optional<MotionTripOutcomeDTO> trip;
   /// Present iff `terminal_cause == kFailed`.

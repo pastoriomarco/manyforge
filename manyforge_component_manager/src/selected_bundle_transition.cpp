@@ -79,7 +79,9 @@ SameHealth(const manyforge::core::ProjectionHealthDTO &left,
         lhs.acknowledged_staged_candidate_revision !=
             rhs.acknowledged_staged_candidate_revision ||
         lhs.observed_local_active != rhs.observed_local_active ||
-        !SameHealth(lhs.resulting_health, rhs.resulting_health) ||
+        lhs.resulting_health.has_value() != rhs.resulting_health.has_value() ||
+        (lhs.resulting_health &&
+         !SameHealth(*lhs.resulting_health, *rhs.resulting_health)) ||
         !SameError(lhs.error, rhs.error)) {
       return false;
     }

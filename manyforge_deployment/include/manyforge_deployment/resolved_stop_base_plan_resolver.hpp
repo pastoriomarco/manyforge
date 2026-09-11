@@ -43,7 +43,7 @@ resolve_verified_stop_base_plan(
 /// a substitute for independent readback.
 [[nodiscard]] core::Result<core::RuntimeParticipantStopReadiness>
 store_and_verify_runtime_participant_stop_readiness(
-    core::ResolvedStopBasePlanDTO plan,
+    const RetainedBundle &retained_bundle, core::ResolvedStopBasePlanDTO plan,
     core::ComponentLifecycleGeneration component_lifecycle_generation,
     const core::ControllerLifecycleExpectedDomain &expected_domain,
     const core::RuntimeParticipantBinding &participant_binding,
@@ -51,14 +51,14 @@ store_and_verify_runtime_participant_stop_readiness(
 
 [[nodiscard]] inline core::Result<core::RuntimeParticipantStopReadiness>
 store_and_verify_runtime_participant_stop_readiness(
-    core::ResolvedStopBasePlanDTO plan,
+    const RetainedBundle &retained_bundle, core::ResolvedStopBasePlanDTO plan,
     core::ComponentLifecycleGeneration component_lifecycle_generation,
     const VerifiedControllerLifecycleExpectedDomain &expected_domain,
     const core::RuntimeParticipantBinding &participant_binding,
     core::IResolvedStopBasePlanRepository &repository) {
   return store_and_verify_runtime_participant_stop_readiness(
-      std::move(plan), component_lifecycle_generation, expected_domain.sealed(),
-      participant_binding, repository);
+      retained_bundle, std::move(plan), component_lifecycle_generation,
+      expected_domain.sealed(), participant_binding, repository);
 }
 
 /// One exact selected-binding result produced before Kernel registration.
@@ -115,17 +115,17 @@ resolve_store_and_verify_route_readiness_batch(
     std::span<const core::RuntimeParticipantBinding> participant_bindings,
     core::IResolvedStopBasePlanRepository &repository);
 
-[[nodiscard]] inline
-    core::Result<std::vector<VerifiedRouteReadinessParticipant>>
-    resolve_store_and_verify_route_readiness_batch(
-        const RetainedBundle &retained_bundle,
-        const IVerifiedRetainedProductArtifactSource &artifact_source,
-        const VerifiedControllerLifecycleExpectedDomain &expected_domain,
-        const core::ActiveControlConfigurationDTO &active_configuration,
-        std::span<const core::RouteSelectionComponentExpectationDTO>
-            component_expectations,
-        std::span<const core::RuntimeParticipantBinding> participant_bindings,
-        core::IResolvedStopBasePlanRepository &repository) {
+[[nodiscard]] inline core::Result<
+    std::vector<VerifiedRouteReadinessParticipant>>
+resolve_store_and_verify_route_readiness_batch(
+    const RetainedBundle &retained_bundle,
+    const IVerifiedRetainedProductArtifactSource &artifact_source,
+    const VerifiedControllerLifecycleExpectedDomain &expected_domain,
+    const core::ActiveControlConfigurationDTO &active_configuration,
+    std::span<const core::RouteSelectionComponentExpectationDTO>
+        component_expectations,
+    std::span<const core::RuntimeParticipantBinding> participant_bindings,
+    core::IResolvedStopBasePlanRepository &repository) {
   return resolve_store_and_verify_route_readiness_batch(
       retained_bundle, artifact_source, expected_domain.sealed(),
       active_configuration, component_expectations, participant_bindings,

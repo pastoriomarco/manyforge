@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
 from threading import RLock
@@ -13,6 +13,8 @@ import unicodedata
 from .orchestration_ports import (
     NodeAttemptIdentity,
     OwnerNodeInputs,
+    OwnerInvocationHeldError,
+    OwnerTaskObservationUnavailableError,
     OwnerTaskSnapshot,
     OwnerTaskState,
     ProgramRunPortContext,
@@ -36,23 +38,25 @@ class CCLCProgramClient(Protocol):
 
     def cclc_owner_identity(self) -> dict[str, Any]: ...
 
+    def authoring_admission(self) -> dict[str, Any]: ...
+
+    def component_lifecycle_request_result(
+        self, body: Mapping[str, Any]
+    ) -> dict[str, Any]: ...
+
     def cclc_component(self, component_id: str) -> dict[str, Any]: ...
 
     def cclc_route_templates(self, component_id: str) -> dict[str, Any]: ...
 
-    def submit_component_lifecycle(
-        self, body: Mapping[str, Any]
-    ) -> dict[str, Any]: ...
+    def submit_component_lifecycle(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
-    def component_lifecycle_status(
-        self, transaction_id: str
-    ) -> dict[str, Any]: ...
+    def component_lifecycle_status(self, transaction_id: str) -> dict[str, Any]: ...
 
-    def submit_route_selection(
-        self, body: Mapping[str, Any]
-    ) -> dict[str, Any]: ...
+    def submit_route_selection(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
     def route_selection_status(self, transaction_id: str) -> dict[str, Any]: ...
+
+    def route_selection_request_result(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
 
 class CCLCProgramPortError(RuntimeError):
@@ -85,6 +89,8 @@ class _Task:
     kind: str
     transaction_id: str | None
     snapshot: OwnerTaskSnapshot
+    request: Mapping[str, Any] | None = None
+    start_args: tuple[str, NodeAttemptIdentity, OwnerNodeInputs] | None = None
 
 
 def _text(value: Any, *, field: str) -> str:
@@ -159,7 +165,65 @@ def _failure(task_id: str, code: str, message: str) -> OwnerTaskSnapshot:
         state=OwnerTaskState.FAILED,
         reason_code=code,
         message=message,
+        metadata={"finish_current_settled": True},
     )
+
+
+def _known_rejection(
+    task_id: str, error: Mapping[str, Any]
+) -> OwnerTaskSnapshot | None:
+    details = error.get("details")
+    if not isinstance(details, Mapping) or details.get("effect") != "not_started":
+        return None
+    code = error.get("code")
+    message = error.get("message")
+    if not isinstance(code, str) or not code or not isinstance(message, str):
+        return None
+    if (
+        code == "cclc_request_admission_deferred"
+        and details.get("reason") == "request_namespace_busy"
+    ) or (
+        code == "cclc_request_namespace_refreshed"
+        and details.get("reason") == "settled_request_namespace_checkpoint"
+    ):
+        return OwnerTaskSnapshot(
+            task_id,
+            OwnerTaskState.ACTIVE,
+            metadata={"admission_deferred": True},
+            message=message,
+        )
+    revision = details.get("selection_revision")
+    if (
+        code == "invalid_state_transition"
+        and details.get("reason") == "program_node_stop_fence_active"
+    ):
+        if (
+            not isinstance(revision, str)
+            or not revision.isascii()
+            or not revision.isdecimal()
+            or int(revision) > 9_007_199_254_740_991
+        ):
+            return None
+        raise OwnerInvocationHeldError(int(revision))
+    return _failure(task_id, code, message)
+
+
+def _error_payload(error: Exception) -> dict[str, Any]:
+    response = getattr(error, "response", None)
+    failure = response.get("error") if isinstance(response, Mapping) else None
+    return {
+        "code": (
+            failure.get("code")
+            if isinstance(failure, Mapping)
+            else getattr(error, "code", None)
+        ),
+        "details": (
+            failure.get("details")
+            if isinstance(failure, Mapping)
+            else getattr(error, "details", None)
+        ),
+        "message": str(error),
+    }
 
 
 class CCLCProgramTaskPort:
@@ -175,6 +239,9 @@ class CCLCProgramTaskPort:
         client: CCLCProgramClient,
         *,
         maximum_retained_tasks: int = _MAX_IDENTITIES,
+        program_node_evidence: (
+            Callable[[NodeAttemptIdentity, str], Mapping[str, Any]] | None
+        ) = None,
     ) -> None:
         if not all(
             callable(getattr(client, method, None))
@@ -190,6 +257,14 @@ class CCLCProgramTaskPort:
         ):
             raise TypeError("client must expose the complete CCLC Headless surface")
         self._client = client
+        self._program_node_evidence = program_node_evidence
+        if program_node_evidence is not None and not all(
+            callable(getattr(client, name, None))
+            for name in ("authoring_admission", "component_lifecycle_request_result", "route_selection_request_result")
+        ):
+            raise TypeError(
+                "Runtime CCLC requires admission and exact request-result lookup"
+            )
         if (
             type(maximum_retained_tasks) is not int
             or not 1 <= maximum_retained_tasks <= _MAX_IDENTITIES
@@ -218,8 +293,7 @@ class CCLCProgramTaskPort:
             component = _text(
                 row.get("controllable_component_id"),
                 field=(
-                    f"component_role_bindings[{index}]."
-                    "controllable_component_id"
+                    f"component_role_bindings[{index}]." "controllable_component_id"
                 ),
             )
             if role in components:
@@ -247,10 +321,7 @@ class CCLCProgramTaskPort:
             )
             component_id = _text(
                 row.get("controllable_component_id"),
-                field=(
-                    f"target_role_bindings[{index}]."
-                    "controllable_component_id"
-                ),
+                field=(f"target_role_bindings[{index}]." "controllable_component_id"),
             )
             if components.get(component_role) != component_id:
                 raise CCLCProgramPortError(
@@ -292,9 +363,7 @@ class CCLCProgramTaskPort:
                     "cclc_program_binding_invalid",
                     "Program Binding repeats a target role",
                 )
-            targets[target_role] = _Target(
-                component_id, tuple(sorted(binding_ids))
-            )
+            targets[target_role] = _Target(component_id, tuple(sorted(binding_ids)))
         return _BoundContext(
             context.program_run_id,
             context.program_id,
@@ -445,9 +514,7 @@ class CCLCProgramTaskPort:
                         field="active_control_configuration_id",
                     ),
                     "active_control_configuration_generation": _positive_integer(
-                        active_row.get(
-                            "active_control_configuration_generation"
-                        ),
+                        active_row.get("active_control_configuration_generation"),
                         field="active_control_configuration_generation",
                     ),
                 }
@@ -523,7 +590,19 @@ class CCLCProgramTaskPort:
             "reason": "applied-program-node",
             "confirmed": True,
         }
-        return "lifecycle", self._client.submit_component_lifecycle(body)
+        if self._program_node_evidence is None:
+            raise CCLCProgramPortError(
+                "program_node_parent_missing",
+                "Runtime lifecycle has no exact Program parent",
+            )
+        body["program_node_evidence"] = dict(
+            self._program_node_evidence(identity, "cclc.lifecycle")
+        )
+        body["expected_admission_generation"] = _positive_integer(
+            self._client.authoring_admission().get("admission_generation"),
+            field="admission_generation",
+        )
+        return "lifecycle", body
 
     def _start_route(
         self,
@@ -532,12 +611,8 @@ class CCLCProgramTaskPort:
         context: _BoundContext,
         request_id: str,
     ) -> tuple[str, dict[str, Any]]:
-        target_role = _text(
-            inputs.parameters.get("target_role"), field="target_role"
-        )
-        route_role = _text(
-            inputs.parameters.get("route_role"), field="route_role"
-        )
+        target_role = _text(inputs.parameters.get("target_role"), field="target_role")
+        route_role = _text(inputs.parameters.get("route_role"), field="route_role")
         try:
             target = context.targets[target_role]
         except KeyError as exc:
@@ -582,8 +657,7 @@ class CCLCProgramTaskPort:
             )
             if any(
                 isinstance(route, Mapping)
-                and route.get("control_binding_id")
-                in target.control_binding_ids
+                and route.get("control_binding_id") in target.control_binding_ids
                 and route.get("control_route_id") == route_role
                 for route in routes
             ):
@@ -605,18 +679,25 @@ class CCLCProgramTaskPort:
             "request_context": request_context,
             "expected_retained_bundle_id": context.retained_bundle_id,
             "expected_graph_revision": context.graph_revision,
-            "desired_configuration": _thaw(
-                selected.get("desired_configuration")
-            ),
+            "desired_configuration": _thaw(selected.get("desired_configuration")),
             "expected_active_control_configuration": _thaw(
                 selected.get("expected_active_control_configuration")
             ),
-            "component_expectations": _thaw(
-                selected.get("component_expectations")
-            ),
+            "component_expectations": _thaw(selected.get("component_expectations")),
             "confirmed": True,
         }
-        return "route", self._client.submit_route_selection(body)
+        if self._program_node_evidence is None:
+            raise CCLCProgramPortError(
+                "program_node_parent_missing", "Runtime route selection has no exact Program parent"
+            )
+        body["program_node_evidence"] = dict(
+            self._program_node_evidence(identity, "cclc.control_route")
+        )
+        body["expected_admission_generation"] = _positive_integer(
+            self._client.authoring_admission().get("admission_generation"),
+            field="admission_generation",
+        )
+        return "route", body
 
     @staticmethod
     def _snapshot_from_result(
@@ -625,6 +706,22 @@ class CCLCProgramTaskPort:
         request_id: str,
         result: Mapping[str, Any],
     ) -> tuple[str | None, OwnerTaskSnapshot]:
+        if result.get("rejection") is not None:
+            if (
+                not isinstance(result["rejection"], Mapping)
+                or result.get("replay_status") not in {"accepted_new", "replayed_exact"}
+                or result.get("acceptance") is not None
+                or result.get("status") is not None
+            ):
+                raise CCLCProgramPortError(
+                    "cclc_projection_invalid", "Contradictory no-admission result"
+                )
+            rejected = _known_rejection(task_id, result["rejection"])
+            if rejected is None:
+                raise CCLCProgramPortError(
+                    "cclc_projection_invalid", "Invalid no-admission result"
+                )
+            return None, rejected
         replay_status = result.get("replay_status")
         if replay_status not in {
             "accepted_new",
@@ -704,9 +801,7 @@ class CCLCProgramTaskPort:
             "reconciliation_required": status.get("reconciliation_required"),
         }
         if terminal is None:
-            return OwnerTaskSnapshot(
-                task_id, OwnerTaskState.ACTIVE, metadata=metadata
-            )
+            return OwnerTaskSnapshot(task_id, OwnerTaskState.ACTIVE, metadata=metadata)
         if terminal == "succeeded":
             return OwnerTaskSnapshot(
                 task_id,
@@ -730,7 +825,7 @@ class CCLCProgramTaskPort:
         return OwnerTaskSnapshot(
             task_id,
             OwnerTaskState.FAILED,
-            metadata=metadata,
+            metadata={**metadata, "finish_current_settled": True},
             reason_code=f"cclc_{terminal}",
             message=message,
         )
@@ -740,6 +835,16 @@ class CCLCProgramTaskPort:
         node_id: str,
         identity: NodeAttemptIdentity,
         inputs: OwnerNodeInputs,
+    ) -> OwnerTaskSnapshot:
+        return self._start(node_id, identity, inputs)
+
+    def _start(
+        self,
+        node_id: str,
+        identity: NodeAttemptIdentity,
+        inputs: OwnerNodeInputs,
+        *,
+        previous_task: _Task | None = None,
     ) -> OwnerTaskSnapshot:
         if not isinstance(identity, NodeAttemptIdentity) or not isinstance(
             inputs, OwnerNodeInputs
@@ -752,27 +857,81 @@ class CCLCProgramTaskPort:
         context = self._context(identity.program_run_id)
         request_id = _request_id(node_id, identity)
         task_id = request_id
-        self._reserve(task_id, identity.program_run_id)
+        with self._lock:
+            if previous_task is not None:
+                if self._tasks.get(task_id) is not previous_task:
+                    raise OwnerTaskObservationUnavailableError(
+                        "CCLC admission is already being reconciled"
+                    )
+                self._tasks.pop(task_id)
+            self._reserve(task_id, identity.program_run_id)
+        body: dict[str, Any] | None = None
+        submitted = False
         try:
-            if node_id in _LIFECYCLE_INTENTS:
-                kind, raw_result = self._start_lifecycle(
-                    node_id, identity, inputs, context, request_id
-                )
-            else:
-                kind, raw_result = self._start_route(
-                    identity, inputs, context, request_id
-                )
+            for refresh in range(2):
+                if node_id in _LIFECYCLE_INTENTS:
+                    kind, body = self._start_lifecycle(
+                        node_id, identity, inputs, context, request_id
+                    )
+                else:
+                    kind, body = self._start_route(
+                        identity, inputs, context, request_id
+                    )
+                submitted = True
+                try:
+                    raw_result = (
+                        self._client.submit_component_lifecycle(body)
+                        if kind == "lifecycle"
+                        else self._client.submit_route_selection(body)
+                    )
+                    break
+                except Exception as error:
+                    failure = _error_payload(error)
+                    # The receiver explicitly proved this request unstarted
+                    # before retiring its settled namespace. Re-read all
+                    # binding/admission facts once; never retry a lost reply,
+                    # expired result, generic stale epoch, or unknown effect.
+                    if (
+                        refresh == 0
+                        and failure["code"] == "cclc_request_namespace_refreshed"
+                        and isinstance(failure["details"], Mapping)
+                        and failure["details"].get("effect") == "not_started"
+                        and failure["details"].get("reason")
+                        == "settled_request_namespace_checkpoint"
+                    ):
+                        submitted = False
+                        continue
+                    raise
             result = _mapping(raw_result, field="CCLC admission")
             transaction_id, snapshot = self._snapshot_from_result(
                 task_id, kind, request_id, result
             )
+        except OwnerInvocationHeldError:
+            with self._lock:
+                self._reserved_tasks.pop(task_id, None)
+            raise
         except Exception as error:
+            try:
+                rejected = _known_rejection(task_id, _error_payload(error))
+            except OwnerInvocationHeldError:
+                with self._lock:
+                    self._reserved_tasks.pop(task_id, None)
+                raise
             kind = "route" if node_id == "controller.select_route" else "lifecycle"
             transaction_id = None
-            snapshot = _failure(
-                task_id,
-                getattr(error, "code", "cclc_request_failed"),
-                str(error) or type(error).__name__,
+            snapshot = rejected or (
+                OwnerTaskSnapshot(
+                    task_id,
+                    OwnerTaskState.ACTIVE,
+                    metadata={"kind": kind, "outcome_unconfirmed": True},
+                    message="Lifecycle transaction outcome remains unconfirmed",
+                )
+                if submitted
+                else _failure(
+                    task_id,
+                    getattr(error, "code", "cclc_request_failed"),
+                    str(error) or type(error).__name__,
+                )
             )
         with self._lock:
             self._reserved_tasks.pop(task_id, None)
@@ -782,6 +941,8 @@ class CCLCProgramTaskPort:
                     kind,
                     transaction_id,
                     snapshot,
+                    body if submitted else None,
+                    (node_id, identity, inputs) if transaction_id is None else None,
                 )
         return snapshot
 
@@ -798,44 +959,80 @@ class CCLCProgramTaskPort:
                 return task.snapshot
             transaction_id = task.transaction_id
             kind = task.kind
-        if transaction_id is None:
-            raise CCLCProgramPortError(
-                "cclc_projection_invalid", "active CCLC task has no transaction"
-            )
+        if (
+            task.snapshot.metadata.get("admission_deferred")
+            and task.start_args is not None
+        ):
+            # This is not replay of uncertain work. The prior owner result
+            # proves no admission. Reuse this task's existing observation wake
+            # for one fresh attempt; Kernel still orders it against Stop.
+            return self._start(*task.start_args, previous_task=task)
         try:
+            if transaction_id is None:
+                if task.request is None:
+                    raise OwnerTaskObservationUnavailableError(
+                        "CCLC submission outcome is unknown"
+                    )
+                response = (
+                    self._client.component_lifecycle_request_result(task.request)
+                    if kind == "lifecycle"
+                    else self._client.route_selection_request_result(task.request)
+                )
+                result = _mapping(response, field="CCLC result response").get("result")
+                if not isinstance(result, Mapping) or result.get(
+                    "replay_status"
+                ) not in {"accepted_new", "replayed_exact"}:
+                    raise OwnerTaskObservationUnavailableError(
+                        "CCLC submission outcome is unknown"
+                    )
+                transaction_id, snapshot = self._snapshot_from_result(
+                    task_id, kind, task_id, result
+                )
+                with self._lock:
+                    if self._tasks.get(task_id) is task:
+                        task.transaction_id = transaction_id
+                        task.snapshot = snapshot
+                return snapshot
             response = (
                 self._client.component_lifecycle_status(transaction_id)
                 if kind == "lifecycle"
                 else self._client.route_selection_status(transaction_id)
             )
-            raw_status = _mapping(response, field="CCLC status response").get(
-                "status"
-            )
+            raw_status = _mapping(response, field="CCLC status response").get("status")
             if raw_status is None:
-                snapshot = _failure(
-                    task_id,
-                    "cclc_status_missing",
-                    "accepted CCLC transaction has no current status",
+                raise OwnerTaskObservationUnavailableError(
+                    "Accepted CCLC status is unavailable"
                 )
             else:
                 snapshot = self._status_snapshot(
                     task_id, kind, transaction_id, raw_status
                 )
+        except OwnerInvocationHeldError:
+            with self._lock:
+                self._tasks.pop(task_id, None)
+            raise
         except Exception as error:
-            snapshot = _failure(
-                task_id,
-                getattr(error, "code", "cclc_status_failed"),
-                str(error) or type(error).__name__,
-            )
+            try:
+                rejected = _known_rejection(task_id, _error_payload(error))
+            except OwnerInvocationHeldError:
+                with self._lock:
+                    self._tasks.pop(task_id, None)
+                raise
+            if rejected is not None:
+                with self._lock:
+                    if self._tasks.get(task_id) is task:
+                        task.snapshot = rejected
+                return rejected
+            raise OwnerTaskObservationUnavailableError(
+                "CCLC transaction outcome remains unconfirmed"
+            ) from error
         with self._lock:
             current = self._tasks.get(task_id)
             if current is not None and current.transaction_id == transaction_id:
                 current.snapshot = snapshot
         return snapshot
 
-    def cancel(
-        self, task_id: str, identity: NodeAttemptIdentity
-    ) -> None:
+    def cancel(self, task_id: str, identity: NodeAttemptIdentity) -> None:
         """CCLC transactions are non-cancellable; this performs no owner call."""
 
         task_id = _text(task_id, field="task_id")
@@ -848,9 +1045,7 @@ class CCLCProgramTaskPort:
                     "cclc_task_missing", "CCLC Program task is not retained"
                 )
 
-    def acknowledge(
-        self, task_id: str, identity: NodeAttemptIdentity
-    ) -> None:
+    def acknowledge(self, task_id: str, identity: NodeAttemptIdentity) -> None:
         task_id = _text(task_id, field="task_id")
         if not isinstance(identity, NodeAttemptIdentity):
             raise TypeError("identity must be a NodeAttemptIdentity")

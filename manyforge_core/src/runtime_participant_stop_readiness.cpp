@@ -135,6 +135,12 @@ Result<RuntimeParticipantStopReadiness> verify_runtime_participant_stop_readines
   constexpr std::uint64_t kMaximumIJsonInteger = 9'007'199'254'740'991ULL;
   const auto& binding = participant.value();
   const auto& plan = value.resolved_stop_base_plan;
+  if (value.maximum_controlled_stop_duration_ns &&
+      (*value.maximum_controlled_stop_duration_ns <= 0 ||
+       *value.maximum_controlled_stop_duration_ns > kMaxStopEvidencePolicyDurationNs)) {
+    return invalid<RuntimeParticipantStopReadiness>(
+        "runtime_participant_stop_duration_ceiling_invalid");
+  }
   if (value.expected_controller_domain != expected_controller_domain.value()) {
     return invalid<RuntimeParticipantStopReadiness>(
         "runtime_participant_stop_controller_domain_referent_mismatch");

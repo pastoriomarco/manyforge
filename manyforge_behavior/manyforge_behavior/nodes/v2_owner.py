@@ -13,6 +13,8 @@ from manyforge_behavior.orchestration_ports import (
     NodeAttemptIdentity,
     NodeAttemptSource,
     OwnerInvocationPort,
+    OwnerInvocationPendingError,
+    OwnerInvocationHeldError,
     OwnerNodeInputs,
     OwnerTaskObservationUnavailableError,
     OwnerTaskPort,
@@ -57,8 +59,11 @@ class _OwnerAdapter(py_trees.behaviour.Behaviour):
         self._input_error: str | None = None
         self._failure_reason_code: str | None = None
         self._failure_message = ""
+        self._operator_stop_state: OperatorMotionStopState | None = None
+        self._held_before_admission: int | None = None
 
     def initialise(self) -> None:
+        self._held_before_admission = None
         self._inputs = None
         self._owner_inputs = None
         self._identity = None
@@ -142,6 +147,32 @@ class _OwnerAdapter(py_trees.behaviour.Behaviour):
         self._failure_reason_code = reason
         self._failure_message = message
         self.feedback_message = f"{reason}: {message}".rstrip()
+
+    def _wait_for_admission_release(self) -> bool:
+        if self._held_before_admission is None:
+            return False
+        state = self._operator_stop_state
+        scope = None if state is None else state.snapshot()
+        if (scope is None or state.observation_error() is not None
+            or scope.selection_revision <= self._held_before_admission
+            or self._node_instance_id in scope.held_nodes):
+            return True
+        self.initialise()  # Proven-unstarted work, fresh attempt after owner release.
+        return False
+
+    def _hold_before_admission(self, error: OwnerInvocationHeldError) -> None:
+        self._held_before_admission = error.selection_revision
+        self.feedback_message = str(error)
+        if self._operator_stop_state is not None:
+            try:
+                self._operator_stop_state.refresh()
+            except Exception:
+                pass  # Retain the exact fence until an authoritative newer release.
+
+    @property
+    def presented_status(self) -> py_trees.common.Status:
+        return (py_trees.common.Status.INVALID if self._held_before_admission is not None
+                else self.status)
 
 
 class OwnerTaskAdapter(_OwnerAdapter):
@@ -330,6 +361,8 @@ class OwnerTaskAdapter(_OwnerAdapter):
         return py_trees.common.Status.FAILURE
 
     def update(self) -> py_trees.common.Status:
+        if self._wait_for_admission_release():
+            return py_trees.common.Status.RUNNING
         if self._input_error is not None or self._identity is None or self._owner_inputs is None:
             return py_trees.common.Status.FAILURE
         try:
@@ -358,6 +391,10 @@ class OwnerTaskAdapter(_OwnerAdapter):
                 if observed.state is not self._task.state and self._operator_stop_state is not None:
                     self._operator_stop_state.note_task_observation_change()
                 self._task = observed
+        except OwnerInvocationHeldError as error:
+            self._task = None
+            self._hold_before_admission(error)
+            return py_trees.common.Status.RUNNING
         except Exception as exc:
             self._record_failure("owner_request_failed", str(exc))
             return py_trees.common.Status.FAILURE
@@ -366,7 +403,8 @@ class OwnerTaskAdapter(_OwnerAdapter):
     def observe_while_operator_stop_held(self) -> None:
         """Refresh only an already accepted task while its subtree is held."""
 
-        if self._task is None or self._identity is None:
+        if self._task is None or self._identity is None or self.status in {
+            py_trees.common.Status.SUCCESS, py_trees.common.Status.FAILURE}:
             return
         try:
             if self._task.state is OwnerTaskState.ACTIVE:
@@ -380,9 +418,14 @@ class OwnerTaskAdapter(_OwnerAdapter):
                 if observed.state is not self._task.state and self._operator_stop_state is not None:
                     self._operator_stop_state.note_task_observation_change()
                 self._task = observed
-            self._settle(self._task)
+            status = self._settle(self._task)
+            if status is not py_trees.common.Status.RUNNING:
+                self.stop(status)
         except OwnerTaskObservationUnavailableError:
             return
+        except OwnerInvocationHeldError as error:
+            self._task = None
+            self._hold_before_admission(error)
         except Exception as exc:
             self._record_failure("owner_request_failed", str(exc))
 
@@ -412,7 +455,12 @@ class OwnerTaskAdapter(_OwnerAdapter):
         """Read status without settling tasks, acknowledging or writing outputs."""
         task = self._task
         if task is not None and task.state is OwnerTaskState.ACTIVE:
-            observed = self._port.observe(task.task_id)
+            try:
+                observed = self._port.observe(task.task_id)
+            except OwnerInvocationHeldError as error:
+                self._task = None
+                self._hold_before_admission(error)
+                return "inactive"
             if observed.task_id != task.task_id:
                 raise ValueError("owner observation selected another task")
             task = observed
@@ -431,7 +479,9 @@ class OwnerTaskAdapter(_OwnerAdapter):
             and assessment.get("recovery_class") in PROGRAM_MOTION_STOP_RECOVERY_CLASSES
         ):
             return "held"
-        if task.state is OwnerTaskState.SUCCEEDED:
+        if task.state is OwnerTaskState.SUCCEEDED or (
+            task.state is OwnerTaskState.FAILED and task.metadata.get("finish_current_settled") is True
+        ):
             return "settled"
         return "unrecoverable"
 
@@ -451,33 +501,54 @@ class OwnerTaskAdapter(_OwnerAdapter):
 class OwnerInvocationAdapter(_OwnerAdapter):
     """Issue one bounded synchronous owner request per node attempt."""
 
-    def __init__(self, *, port: OwnerInvocationPort, **kwargs: Any) -> None:
+    def __init__(self, *, port: OwnerInvocationPort,
+                 operator_stop_state: OperatorMotionStopState | None = None, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._port = port
         self._invoked = False
         self._status = py_trees.common.Status.INVALID
+        self._pending_observation = None
+        self._operator_stop_state = operator_stop_state
 
     def initialise(self) -> None:
         super().initialise()
         self._invoked = False
         self._status = py_trees.common.Status.INVALID
+        self._pending_observation = None
 
     def update(self) -> py_trees.common.Status:
+        if self._wait_for_admission_release():
+            return py_trees.common.Status.RUNNING
         if self._input_error is not None or self._identity is None or self._owner_inputs is None:
             return py_trees.common.Status.FAILURE
-        if self._invoked:
+        if self._invoked and self._pending_observation is None:
             return self._status
-        self._invoked = True
         try:
-            result = self._port.invoke(
-                self._node_id,
-                self._identity,
-                self._owner_inputs,
-            )
+            if self._pending_observation is not None:
+                result = self._pending_observation()
+                if result is None:
+                    return py_trees.common.Status.RUNNING
+            else:
+                self._invoked = True
+                result = self._port.invoke(self._node_id, self._identity, self._owner_inputs)
+        except OwnerInvocationHeldError as error:
+            self._pending_observation = None
+            self._invoked = False
+            self._hold_before_admission(error)
+            return py_trees.common.Status.RUNNING
+        except OwnerInvocationPendingError as error:
+            self._pending_observation = error.observe
+            self.feedback_message = str(error)
+            return py_trees.common.Status.RUNNING
         except Exception as exc:
+            if self._pending_observation is not None:
+                # Lookup/transport failure cannot settle a submitted effect.
+                self.feedback_message = "Owner transaction outcome remains unconfirmed"
+                return py_trees.common.Status.RUNNING
             self._record_failure("owner_request_failed", str(exc))
             self._status = py_trees.common.Status.FAILURE
             return self._status
+        self._pending_observation = None
         if result.succeeded:
             self._status = (
                 py_trees.common.Status.SUCCESS
@@ -495,6 +566,28 @@ class OwnerInvocationAdapter(_OwnerAdapter):
             self._record_failure(result.reason_code, result.message)
             self._status = py_trees.common.Status.FAILURE
         return self._status
+
+    @property
+    def has_active_task(self) -> bool:
+        return self._pending_observation is not None
+
+    def observe_control_state(self) -> str:
+        return "active" if self.has_active_task else "settled" if self._invoked else "inactive"
+
+    def reconcile_full_stop_task(self, *, selected_resume: bool = False) -> str:
+        # A selected Resume must not reopen admission while a previously sent
+        # transaction is still in flight. Full tree Stop uses the permanent
+        # run fence and the owner's child claim; it does not cancel this call.
+        if not selected_resume:
+            return "unaffected"
+        self.observe_while_operator_stop_held()
+        return self.observe_control_state()
+
+    def observe_while_operator_stop_held(self) -> None:
+        if self._pending_observation is not None:
+            status = self.update()
+            if status is not py_trees.common.Status.RUNNING:
+                self.stop(status)
 
 
 class GripperStatusWaitAdapter(_OwnerAdapter):

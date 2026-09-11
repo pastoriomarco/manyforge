@@ -506,7 +506,8 @@ bool CCLCTransactionEffectSequenceWatermarkDTO::locally_valid() const noexcept {
 }
 
 bool CCLCJournalRecoveryDTO::locally_valid() const noexcept {
-  if (component_watermarks.size() > kMaximumCCLCComponentWatermarks ||
+  if (!bounded_identity(request_owner_epoch) ||
+      component_watermarks.size() > kMaximumCCLCComponentWatermarks ||
       interrupted_transactions.size() > kMaximumCCLCActiveTransactions ||
       effect_sequence_watermarks.size() > kMaximumCCLCActiveTransactions ||
       unresolved_effect_attempts.size() > kMaximumCCLCActiveTransactions ||
@@ -515,7 +516,7 @@ bool CCLCJournalRecoveryDTO::locally_valid() const noexcept {
       interrupted_route_selections.size() > kMaximumCCLCActiveTransactions ||
       route_effect_sequence_watermarks.size() > kMaximumCCLCActiveTransactions ||
       unresolved_route_effect_attempts.size() > kMaximumCCLCActiveTransactions ||
-      lifecycle_claims.size() > kMaximumCCLCActiveTransactions ||
+      cell_claims.size() > kMaximumCCLCActiveTransactions ||
       interrupted_transactions.size() + interrupted_route_selections.size() >
           kMaximumCCLCActiveTransactions ||
       !std::is_sorted(component_watermarks.begin(), component_watermarks.end(),
@@ -574,7 +575,7 @@ bool CCLCJournalRecoveryDTO::locally_valid() const noexcept {
           })) {
     return false;
   }
-  for (const auto& row : lifecycle_claims) {
+  for (const auto& row : cell_claims) {
     if (!ValidateCellAdmissionClaimIntent(row.intent).ok() ||
         (row.claim.has_value() &&
          (!ValidateCellAdmissionClaimIntent(row.claim->intent).ok() ||
@@ -776,6 +777,11 @@ bool CCLCLifecycleRequestResultDTO::locally_valid() const noexcept {
   }
   const bool accepted = replay_status == RequestReplayStatusDTO::kAcceptedNew ||
                         replay_status == RequestReplayStatusDTO::kReplayedExact;
+  if (rejection) {
+    return accepted && !acceptance && !status && error_valid(rejection) &&
+           rejection->details.contains("effect") &&
+           rejection->details.at("effect") == "not_started";
+  }
   if (!accepted) {
     return !acceptance.has_value() && !status.has_value();
   }
@@ -840,6 +846,9 @@ bool ComponentLifecycleIntentDTO::locally_valid() const noexcept {
       !known(intent) || !bounded_identity(expected_graph_revision) ||
       !expected_component_lifecycle_generation.nonzero() || expected_control_domains.empty() ||
       !expected_admission_generation.nonzero() ||
+      (program_node_evidence.has_value() &&
+       (!program_node_evidence->locally_valid() ||
+        program_node_evidence->owner_api != "cclc.lifecycle")) ||
       expected_control_domains.size() > kMaxLifecycleExpectedDomains ||
       (reason.has_value() && reason->size() > kMaxLifecycleReasonBytes) ||
       !attribution.locally_valid() ||
@@ -872,7 +881,8 @@ bool ComponentLifecycleIntentDTO::replay_equal(
          expected_graph_revision == other.expected_graph_revision &&
          expected_component_lifecycle_generation == other.expected_component_lifecycle_generation &&
          expected_control_domains == other.expected_control_domains && reason == other.reason &&
-         expected_admission_generation == other.expected_admission_generation;
+         expected_admission_generation == other.expected_admission_generation &&
+         program_node_evidence == other.program_node_evidence;
 }
 
 bool ComponentLifecycleAcceptedDTO::locally_valid() const noexcept {

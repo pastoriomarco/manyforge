@@ -11,6 +11,21 @@ _SCENE_ID = "sha256:" + ("2" * 64)
 _SCENE_CONTENT_DIGEST = "sha256:" + ("3" * 64)
 
 
+def test_program_node_admission_and_no_admission_result_are_bound():
+    evidence = core.ProgramNodeAdmissionEvidenceDTO(
+        core.RequestOwnerEpoch("runner.1"), core.ProgramRunId("run.1"),
+        core.CellAdmissionClaimGeneration(7), "enable", "enable.1", "cclc.lifecycle")
+    assert evidence.locally_valid()
+    assert evidence.parent_program_cycle_claim_generation.value == 7
+    assert core.AdmissionGeneration(9).value == 9
+    rejected = core.CCLCLifecycleRequestResultDTO(
+        core.RequestReplayStatusDTO.kReplayedExact,
+        rejection=core.ErrorDTO("stale_generation", "Changed", {"effect": "not_started"}))
+    assert rejected.locally_valid()
+    assert rejected.acceptance is None and rejected.status is None
+    assert rejected.rejection.details["effect"] == "not_started"
+
+
 def _expected_configuration(*, present: bool = False):
     if not present:
         return core.ExpectedActiveControlConfigurationDTO(
@@ -21,6 +36,31 @@ def _expected_configuration(*, present: bool = False):
         core.ActiveControlConfigurationId("configuration-1"),
         core.ActiveControlConfigurationGeneration(2),
     )
+
+
+def test_route_intent_preserves_exact_node_evidence_and_legacy_absence():
+    context = core.PublicRequestContextDTO(core.RequestId("route.1"), core.RequestOwnerEpoch("cclc.1"), "test")
+    desired = core.DesiredControlConfigurationDTO(
+        core.ControlDomainId("domain.1"), core.ControlDomainRevision(_MANIFEST_REVISION),
+        core.ControllerTopologyId("topology.1"), core.TopologyRevision(_MANIFEST_REVISION),
+        core.ActivationSetId("activation.1"),
+        [core.DesiredControlBindingRouteDTO(core.ControlBindingId("binding.1"),
+            core.ControlBindingRevision(_MANIFEST_REVISION), core.ControlRouteId("route.1"))])
+    components = [core.RouteSelectionComponentExpectationDTO(core.ControllableComponentId("arm"),
+        core.ComponentLifecycleGeneration(4), core.ComponentLifecycleStateDTO.kPrepared)]
+    args = (context, core.RetainedBundleId("bundle.1"), core.GraphRevision("graph.1"),
+            desired, _expected_configuration(), components, core.RequestAttributionDTO())
+    legacy = core.RouteSelectionIntentDTO(*args)
+    assert legacy.locally_valid() and legacy.expected_admission_generation is None
+    node = core.ProgramNodeAdmissionEvidenceDTO(core.RequestOwnerEpoch("runner.1"), core.ProgramRunId("run.1"),
+        core.CellAdmissionClaimGeneration(7), "route", "route.1", "cclc.control_route")
+    current = core.RouteSelectionIntentDTO(*args, core.AdmissionGeneration(9), node)
+    assert current.locally_valid() and current.program_node_evidence == node
+    assert isinstance(current.component_expectations, tuple)
+    assert not current.replay_equal(legacy)
+    assert not core.RouteSelectionIntentDTO(*args, None, node).locally_valid()
+    with pytest.raises(AttributeError):
+        current.expected_admission_generation = core.AdmissionGeneration(10)
 
 
 def _expected_domain():

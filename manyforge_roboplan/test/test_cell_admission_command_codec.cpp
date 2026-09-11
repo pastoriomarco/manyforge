@@ -158,6 +158,37 @@ TEST(CellAdmissionCommandCodec, DecodesAllSixStrictCommands) {
   EXPECT_EQ(kernel.calls, 6U);
 }
 
+TEST(CellAdmissionCommandCodec, ProgramNodeEvidenceIsExactAcrossBothTransports) {
+  auto fields = Intent().as_object();
+  for (auto& [key, value] : fields) {
+    if (key == "claim_kind") value = Value("authored_scene");
+    if (key == "owner_role") value = Value("authored_scene_owner");
+  }
+  fields.emplace_back("program_node_evidence", Value(Value::Object{
+      {"program_runner_owner_epoch", Value("runner.owner")},
+      {"program_run_id", Value("run.1")},
+      {"parent_program_cycle_claim_generation", Value(7.0)},
+      {"node_instance_id", Value("attach")},
+      {"node_attempt_id", Value(std::string(512U, 'a'))},
+      {"owner_api", Value("scene.carried_attachment")}}));
+  const auto packet = TryDecodeCellAdmissionCommand(ci::canonical_json(
+      Envelope("cell_admission_acquire", Value(fields))));
+  ASSERT_TRUE(packet.has_value());
+  const auto binary = cm::EncodeKernelCellAdmissionRpcRequest(*packet);
+  EXPECT_EQ(cm::DecodeKernelCellAdmissionRpcRequest(binary).request, packet->request);
+  auto old_version = binary;
+  old_version[4] = '1';
+  EXPECT_THROW(cm::DecodeKernelCellAdmissionRpcRequest(old_version), std::invalid_argument);
+  RecordingKernel kernel;
+  const auto response = cm::DispatchKernelCellAdmissionRpc(kernel, *packet);
+  const auto json = CellAdmissionResponseValue(packet->command, response);
+  EXPECT_EQ(DecodeCellAdmissionClaim(ci::canonical_json(*json.find_object_member("claim"))),
+            std::get<core::CellAdmissionClaimDTO>(response));
+  fields.back().second = Value(nullptr);
+  EXPECT_THROW(TryDecodeCellAdmissionCommand(ci::canonical_json(
+      Envelope("cell_admission_acquire", Value(fields)))), std::invalid_argument);
+}
+
 TEST(CellAdmissionCommandCodec, RejectsUnknownExtraTypeRangeEnumAndOversize) {
   EXPECT_FALSE(TryDecodeCellAdmissionCommand(
                    R"({"api_version":"manyforge.execution_command.v1","command":"status"})")

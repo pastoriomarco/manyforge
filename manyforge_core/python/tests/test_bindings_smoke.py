@@ -189,6 +189,21 @@ def test_trajectory_dto():
     assert t.joint_names == ["j1", "j2"]
     assert len(t.waypoints) == 2
     assert t.empty() is False
+    assert t.runtime_scale_bounds is None
+    t.runtime_scale_bounds = manyforge_core_py.TrajectoryRuntimeScaleBoundsDTO(2.0, 8.0)
+    assert t.runtime_scale_bounds.max_rate_per_s == 2.0
+    assert t.runtime_scale_bounds.max_rate_change_per_s2 == 8.0
+    assert t.runtime_scale_bounds.max_stop_path_rate == 1.0
+    assert t.runtime_scale_bounds.nominal_time_multiplier is None
+    t.runtime_scale_bounds = manyforge_core_py.TrajectoryRuntimeScaleBoundsDTO(2.0, 8.0, 1.5)
+    assert t.runtime_scale_bounds.max_stop_path_rate == 1.5
+    t.runtime_scale_bounds = manyforge_core_py.TrajectoryRuntimeScaleBoundsDTO(
+        2.0, 8.0, 1.5, 2.5
+    )
+    assert t.runtime_scale_bounds.nominal_time_multiplier == 2.5
+    assert t.cartesian_waypoint_times_s == []
+    t.cartesian_waypoint_times_s = [0.0, 1.0]
+    assert t.cartesian_waypoint_times_s == [0.0, 1.0]
 
 
 def test_execution_status():

@@ -16,12 +16,10 @@
 
 namespace manyforge::core {
 
-inline constexpr std::string_view
-    kMotionControlledStopContractSchemaId =
-        "manyforge.value_schema.provider_contract.motion_controlled_stop.v1";
-inline constexpr std::string_view
-    kMotionControlledStopContractSchemaRevision =
-        "sha256:afbbcda3b81eabff2bbdffb5658fb1fcd3331cde896cadf0681793a2f9db90dd";
+inline constexpr std::string_view kMotionControlledStopContractSchemaId =
+    "manyforge.value_schema.provider_contract.motion_controlled_stop.v1";
+inline constexpr std::string_view kMotionControlledStopContractSchemaRevision =
+    "sha256:58ec6382a268329e9d8001eb53aac31259b5eb95a3690095aa4bbe12ac51d83b";
 inline constexpr std::size_t kMaxMotionControlledStopResourceLimits = 256U;
 
 enum class MotionControlledStopMode : std::uint8_t {
@@ -30,8 +28,7 @@ enum class MotionControlledStopMode : std::uint8_t {
   kHardDeceleration,
 };
 
-[[nodiscard]] constexpr std::string_view to_string(
-    MotionControlledStopMode value) noexcept {
+[[nodiscard]] constexpr std::string_view to_string(MotionControlledStopMode value) noexcept {
   switch (value) {
     case MotionControlledStopMode::kSoftOnPath:
       return "soft_on_path";
@@ -47,6 +44,7 @@ struct ControlledStopResourceLimitDTO final {
   ResourceId resource_id;
   CoordinateAccelerationDTO max_deceleration;
   CoordinateVelocityDTO settle_velocity_threshold;
+  std::optional<CoordinateJerkDTO> max_jerk;
 
   friend bool operator==(const ControlledStopResourceLimitDTO&,
                          const ControlledStopResourceLimitDTO&) = default;
@@ -66,24 +64,25 @@ struct SoftOnPathStopParametersDTO final {
   std::vector<ControlledStopResourceLimitDTO> per_resource_limits;
   bool allow_natural_completion_on_short_path{};
   std::optional<MotionControlledStopMode> recoverable_substitution_mode;
+  bool jerk_limits_enabled{false};
 
   friend bool operator==(const SoftOnPathStopParametersDTO&,
                          const SoftOnPathStopParametersDTO&) = default;
 };
 
 struct SpringBackHoldStopParametersDTO final {
-  MotionControlledStopMode stop_mode{
-      MotionControlledStopMode::kSpringBackHold};
+  MotionControlledStopMode stop_mode{MotionControlledStopMode::kSpringBackHold};
   double deceleration_time_s{};
   std::vector<ControlledStopResourceLimitDTO> per_resource_limits;
+  bool allow_natural_completion_on_short_path{false};
+  bool jerk_limits_enabled{false};
 
   friend bool operator==(const SpringBackHoldStopParametersDTO&,
                          const SpringBackHoldStopParametersDTO&) = default;
 };
 
 struct HardDecelerationStopParametersDTO final {
-  MotionControlledStopMode stop_mode{
-      MotionControlledStopMode::kHardDeceleration};
+  MotionControlledStopMode stop_mode{MotionControlledStopMode::kHardDeceleration};
   std::vector<HardStopResourceLimitDTO> per_resource_limits;
 
   friend bool operator==(const HardDecelerationStopParametersDTO&,
@@ -91,8 +90,7 @@ struct HardDecelerationStopParametersDTO final {
 };
 
 using MotionControlledStopContractParametersDTO =
-    std::variant<SoftOnPathStopParametersDTO,
-                 SpringBackHoldStopParametersDTO,
+    std::variant<SoftOnPathStopParametersDTO, SpringBackHoldStopParametersDTO,
                  HardDecelerationStopParametersDTO>;
 
 enum class StopActionClass : std::uint8_t {
@@ -106,8 +104,7 @@ enum class SafetySystemRequestActionClass : std::uint8_t {
   kEmergencyStopRequest,
 };
 
-[[nodiscard]] constexpr std::string_view to_string(
-    StopActionClass value) noexcept {
+[[nodiscard]] constexpr std::string_view to_string(StopActionClass value) noexcept {
   switch (value) {
     case StopActionClass::kControlled:
       return "controlled";
@@ -119,8 +116,7 @@ enum class SafetySystemRequestActionClass : std::uint8_t {
   return {};
 }
 
-[[nodiscard]] constexpr std::string_view to_string(
-    SafetySystemRequestActionClass value) noexcept {
+[[nodiscard]] constexpr std::string_view to_string(SafetySystemRequestActionClass value) noexcept {
   switch (value) {
     case SafetySystemRequestActionClass::kProtectiveStopRequest:
       return "protective_stop_request";
@@ -133,8 +129,7 @@ enum class SafetySystemRequestActionClass : std::uint8_t {
 struct RegisteredStopCommandDefinitionDTO final {
   RegisteredStopCommandKindId registered_command_kind_id;
   StopActionClass stop_action_class;
-  std::optional<SafetySystemRequestActionClass>
-      safety_system_request_action_class;
+  std::optional<SafetySystemRequestActionClass> safety_system_request_action_class;
 
   friend bool operator==(const RegisteredStopCommandDefinitionDTO&,
                          const RegisteredStopCommandDefinitionDTO&) = default;
@@ -142,19 +137,16 @@ struct RegisteredStopCommandDefinitionDTO final {
 
 /// Complete immutable table fixed by spec 240. Consumers classify a
 /// registered command only through this table, never through token spelling.
-inline const std::array<RegisteredStopCommandDefinitionDTO, 4U>
-    kRegisteredStopCommandDefinitions{{
-        {RegisteredStopCommandKindId("manyforge.stop.controlled.provider"),
-         StopActionClass::kControlled, std::nullopt},
-        {RegisteredStopCommandKindId("manyforge.stop.safety.emergency_request"),
-         StopActionClass::kSafetySystemRequest,
-         SafetySystemRequestActionClass::kEmergencyStopRequest},
-        {RegisteredStopCommandKindId("manyforge.stop.safety.protective_request"),
-         StopActionClass::kSafetySystemRequest,
-         SafetySystemRequestActionClass::kProtectiveStopRequest},
-        {RegisteredStopCommandKindId("manyforge.stop.software_hard"),
-         StopActionClass::kSoftwareHard, std::nullopt},
-    }};
+inline const std::array<RegisteredStopCommandDefinitionDTO, 4U> kRegisteredStopCommandDefinitions{{
+    {RegisteredStopCommandKindId("manyforge.stop.controlled.provider"),
+     StopActionClass::kControlled, std::nullopt},
+    {RegisteredStopCommandKindId("manyforge.stop.safety.emergency_request"),
+     StopActionClass::kSafetySystemRequest, SafetySystemRequestActionClass::kEmergencyStopRequest},
+    {RegisteredStopCommandKindId("manyforge.stop.safety.protective_request"),
+     StopActionClass::kSafetySystemRequest, SafetySystemRequestActionClass::kProtectiveStopRequest},
+    {RegisteredStopCommandKindId("manyforge.stop.software_hard"), StopActionClass::kSoftwareHard,
+     std::nullopt},
+}};
 
 [[nodiscard]] inline std::span<const RegisteredStopCommandDefinitionDTO>
 registered_stop_command_definitions() noexcept {
@@ -164,13 +156,13 @@ registered_stop_command_definitions() noexcept {
 [[nodiscard]] inline const RegisteredStopCommandDefinitionDTO*
 find_registered_stop_command_definition(
     const RegisteredStopCommandKindId& registered_command_kind_id) noexcept {
-  const auto found = std::lower_bound(
-      kRegisteredStopCommandDefinitions.begin(),
-      kRegisteredStopCommandDefinitions.end(), registered_command_kind_id,
-      [](const RegisteredStopCommandDefinitionDTO& candidate,
-         const RegisteredStopCommandKindId& key) {
-        return candidate.registered_command_kind_id < key;
-      });
+  const auto found =
+      std::lower_bound(kRegisteredStopCommandDefinitions.begin(),
+                       kRegisteredStopCommandDefinitions.end(), registered_command_kind_id,
+                       [](const RegisteredStopCommandDefinitionDTO& candidate,
+                          const RegisteredStopCommandKindId& key) {
+                         return candidate.registered_command_kind_id < key;
+                       });
   return found == kRegisteredStopCommandDefinitions.end() ||
                  found->registered_command_kind_id != registered_command_kind_id
              ? nullptr
@@ -187,14 +179,11 @@ inline constexpr std::string_view kStopInterfaceCommissioningMediaType =
 /// qualified.
 struct ControlledStopSubstitutionContractDTO final {
   ProviderContractRefDTO provider_contract_ref;
-  MotionControlledStopMode requested_stop_mode{
-      MotionControlledStopMode::kSoftOnPath};
-  MotionControlledStopMode executed_stop_mode{
-      MotionControlledStopMode::kSpringBackHold};
+  MotionControlledStopMode requested_stop_mode{MotionControlledStopMode::kSoftOnPath};
+  MotionControlledStopMode executed_stop_mode{MotionControlledStopMode::kSpringBackHold};
 
-  friend bool operator==(
-      const ControlledStopSubstitutionContractDTO&,
-      const ControlledStopSubstitutionContractDTO&) = default;
+  friend bool operator==(const ControlledStopSubstitutionContractDTO&,
+                         const ControlledStopSubstitutionContractDTO&) = default;
 };
 
 struct StopStageParametersDTO final {
@@ -211,8 +200,7 @@ struct StopStageParametersDTO final {
   ProviderContractRefDTO provider_contract_ref;
   JsonObjectDTO default_contract_parameters;
 
-  friend bool operator==(const StopStageParametersDTO&,
-                         const StopStageParametersDTO&) = default;
+  friend bool operator==(const StopStageParametersDTO&, const StopStageParametersDTO&) = default;
 };
 
 }  // namespace manyforge::core

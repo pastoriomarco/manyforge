@@ -1501,10 +1501,39 @@ core::ProgramResetSceneAuthorizationDTO DecodeProgramResetSceneAuthorization(
   return result;
 }
 
+CanonicalValue
+ProgramNodeEvidence(const core::ProgramNodeAdmissionEvidenceDTO &evidence) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"program_runner_owner_epoch",
+       CanonicalValue(evidence.program_runner_owner_epoch.value())},
+      {"program_run_id", CanonicalValue(evidence.program_run_id.value())},
+      {"parent_program_cycle_claim_generation",
+       CanonicalValue(static_cast<double>(
+           evidence.parent_program_cycle_claim_generation.value()))},
+      {"node_instance_id", CanonicalValue(evidence.node_instance_id)},
+      {"node_attempt_id", CanonicalValue(evidence.node_attempt_id)},
+      {"owner_api", CanonicalValue(evidence.owner_api)}});
+}
+
+core::ProgramNodeAdmissionEvidenceDTO
+DecodeProgramNodeEvidence(const CanonicalValue &value) {
+  ExactObject(value, 6U, "Program node evidence");
+  return {core::RequestOwnerEpoch(String(
+              Member(value, "program_runner_owner_epoch"), "Runner owner")),
+          core::ProgramRunId(
+              String(Member(value, "program_run_id"), "Program run")),
+          core::CellAdmissionClaimGeneration(DecodeUnsigned(
+              Member(value, "parent_program_cycle_claim_generation"),
+              "parent claim")),
+          String(Member(value, "node_instance_id"), "node instance"),
+          String(Member(value, "node_attempt_id"), "node attempt"),
+          String(Member(value, "owner_api"), "owner API")};
+}
+
 } // namespace
 
 std::string EncodeRequest(const core::SceneTransactionRequestDTO &request) {
-  return ci::canonical_json(CanonicalValue(CanonicalValue::Object{
+  CanonicalValue::Object fields{
       {"attribution", Attribution(request.attribution)},
       {"expected_admission_generation",
        request.expected_admission_generation.has_value()
@@ -1520,12 +1549,16 @@ std::string EncodeRequest(const core::SceneTransactionRequestDTO &request) {
                  *request.program_reset_scene_authorization)
            : CanonicalValue(nullptr)},
       {"request_context", RequestContext(request.request_context)},
-  }));
+  };
+  if (request.program_node_evidence.has_value())
+    fields.emplace_back("program_node_evidence",
+                        ProgramNodeEvidence(*request.program_node_evidence));
+  return ci::canonical_json(CanonicalValue(std::move(fields)));
 }
 
 std::string
 EncodeRequestDigestInput(const core::SceneTransactionRequestDTO &request) {
-  return ci::canonical_json(CanonicalValue(CanonicalValue::Object{
+  CanonicalValue::Object fields{
       {"expected_projection_revision",
        Projection(request.expected_projection_revision)},
       {"operation", RequestOperation(request.operation)},
@@ -1535,7 +1568,11 @@ EncodeRequestDigestInput(const core::SceneTransactionRequestDTO &request) {
                  *request.program_reset_scene_authorization)
            : CanonicalValue(nullptr)},
       {"request_context", RequestContext(request.request_context)},
-  }));
+  };
+  if (request.program_node_evidence.has_value())
+    fields.emplace_back("program_node_evidence",
+                        ProgramNodeEvidence(*request.program_node_evidence));
+  return ci::canonical_json(CanonicalValue(std::move(fields)));
 }
 
 core::SceneTransactionRequestDTO DecodeRequest(const std::string_view bytes) {
@@ -1544,7 +1581,9 @@ core::SceneTransactionRequestDTO DecodeRequest(const std::string_view bytes) {
   if (ci::canonical_json(root) != bytes) {
     Fail("scene transaction request is not canonical JSON");
   }
-  ExactObject(root, 6U, "scene transaction request");
+  const auto *node_evidence = root.find_object_member("program_node_evidence");
+  ExactObject(root, node_evidence == nullptr ? 6U : 7U,
+              "scene transaction request");
   std::optional<core::AdmissionGeneration> expected_admission_generation;
   const auto &encoded_admission =
       Member(root, "expected_admission_generation");
@@ -1567,6 +1606,9 @@ core::SceneTransactionRequestDTO DecodeRequest(const std::string_view bytes) {
       DecodeRequestOperation(Member(root, "operation")),
       expected_admission_generation,
       program_reset_scene_authorization,
+      node_evidence == nullptr
+          ? std::nullopt
+          : std::optional{DecodeProgramNodeEvidence(*node_evidence)},
   };
   if (!request.attribution.locally_valid() ||
       !request.expected_projection_revision.valid()) {
@@ -1634,6 +1676,57 @@ core::LogicalSceneSnapshotDTO DecodeSnapshot(const std::string_view bytes) {
     }
   }
   return snapshot;
+}
+
+std::string
+EncodeManagedWithdrawal(const core::ManagedRuntimeWithdrawalDTO &receipt) {
+  if (!receipt.valid())
+    Fail("invalid managed withdrawal");
+  return ci::canonical_json(CanonicalValue(CanonicalValue::Object{
+      {"apply_id", CanonicalValue(receipt.apply_id.value())},
+      {"apply_generation",
+       Unsigned(receipt.apply_generation.value(), "Apply generation")},
+      {"runtime_convergence_intent_digest",
+       CanonicalValue(receipt.runtime_convergence_intent_digest.value())},
+      {"runtime_unit_id", CanonicalValue(receipt.runtime_unit_id.value())},
+      {"runtime_epoch", CanonicalValue(receipt.runtime_epoch.value())},
+      {"product_identity", CanonicalValue(receipt.product_identity.value())},
+      {"configuration_identity",
+       CanonicalValue(receipt.configuration_identity.value())},
+      {"process_observer_instance_id",
+       CanonicalValue(receipt.process_observer_instance_id)},
+      {"process_observation_sequence",
+       Unsigned(receipt.process_observation_sequence,
+                "process observation sequence")}}));
+}
+
+core::ManagedRuntimeWithdrawalDTO
+DecodeManagedWithdrawal(std::string_view bytes) {
+  if (bytes.size() > 4096U)
+    Fail("managed withdrawal exceeds its byte bound");
+  const auto parsed = deployment::parse_strict_json_model_yaml(bytes);
+  const auto &root = parsed.root();
+  ExactObject(root, 9U, "managed withdrawal");
+  core::ManagedRuntimeWithdrawalDTO receipt{
+      core::ApplyId(String(Member(root, "apply_id"), "apply_id")),
+      core::ApplyGeneration(
+          DecodeUnsigned(Member(root, "apply_generation"), "apply_generation")),
+      core::ContentDigest(String(
+          Member(root, "runtime_convergence_intent_digest"), "intent digest")),
+      core::RuntimeUnitId(
+          String(Member(root, "runtime_unit_id"), "runtime_unit_id")),
+      core::RuntimeEpoch(
+          String(Member(root, "runtime_epoch"), "runtime_epoch")),
+      core::ContentDigest(
+          String(Member(root, "product_identity"), "product_identity")),
+      core::ContentDigest(String(Member(root, "configuration_identity"),
+                                 "configuration_identity")),
+      String(Member(root, "process_observer_instance_id"), "observer"),
+      DecodeUnsigned(Member(root, "process_observation_sequence"),
+                     "process sequence")};
+  if (!receipt.valid() || EncodeManagedWithdrawal(receipt) != bytes)
+    Fail("stored managed withdrawal is not exact canonical evidence");
+  return receipt;
 }
 
 std::string

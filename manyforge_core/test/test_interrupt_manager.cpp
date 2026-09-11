@@ -4,6 +4,7 @@
 
 #include <limits>
 #include <optional>
+#include <type_traits>
 
 namespace manyforge::core {
 namespace {
@@ -860,6 +861,7 @@ MotionInterruptStopProfileDTO trip_stop_profile(
     MotionInterruptStopMode mode = MotionInterruptStopMode::kSpringBackHold) {
   MotionInterruptStopProfileDTO p;
   p.profile_id = "test_spring_back_hold";
+  p.jerk_limits_enabled = false;
   p.stop_mode = mode;
   if (mode != MotionInterruptStopMode::kHardDeceleration) {
     p.per_joint_max_deceleration = {
@@ -1660,6 +1662,16 @@ TEST(InterruptManagerMotionScopedTest,
   EXPECT_FALSE(arm.ok());
   EXPECT_EQ(arm.error().details.at("reason"),
             "recoverable_substitution_not_allowed_for_node_category");
+  scope.stop_profile->recoverable_substitution_mode.reset();
+  scope.stop_profile->allow_natural_completion_on_short_path = true;
+  for (const auto mode :
+       {MotionInterruptStopMode::kSoftOnPath, MotionInterruptStopMode::kSpringBackHold}) {
+    scope.stop_profile->stop_mode = mode;
+    arm = manager.arm_motion_interrupt_scopes(100, "probe_move", {scope}, 1'020);
+    ASSERT_FALSE(arm.ok());
+    EXPECT_EQ(arm.error().details.at("reason"), "natural_completion_not_allowed_for_node_category");
+    EXPECT_TRUE(manager.active_motion_interrupt_scopes().empty());
+  }
 }
 
 TEST(InterruptManagerMotionScopedTest,
@@ -1856,6 +1868,7 @@ TEST(InterruptManagerMotionScopedTest,
   InterruptManager manager;
   MotionInterruptStopProfileDTO p;
   p.profile_id = "max_decel";
+  p.jerk_limits_enabled = false;
   p.stop_mode = MotionInterruptStopMode::kSpringBackHold;
   p.deceleration_time_s = kMaxControlledStopDecelerationTimeS;
   p.per_joint_max_deceleration = {
@@ -1958,6 +1971,7 @@ TEST(InterruptManagerMotionScopedTest,
   scope.policy_id = "probe_trip";
   scope.stop_profile = MotionInterruptStopProfileDTO{};
   scope.stop_profile->profile_id = "good_soft";
+  scope.stop_profile->jerk_limits_enabled = false;
   scope.stop_profile->stop_mode = MotionInterruptStopMode::kSoftOnPath;
   scope.stop_profile->deceleration_time_s = 0.05;
   scope.stop_profile->per_joint_max_deceleration = {
@@ -2027,6 +2041,8 @@ TEST(InterruptManagerFaultStopProfileTest,
   MotionInterruptStopProfileDTO sp;
   sp.profile_id = "fault_spring_back_v1";
   sp.stop_mode = MotionInterruptStopMode::kSpringBackHold;
+  sp.jerk_limits_enabled = false;
+  sp.per_joint_max_deceleration = {{"j1", AngularAccelerationDTO{4.0}}};
   def.stop_profile = std::make_shared<MotionInterruptStopProfileDTO>(sp);
 
   EXPECT_TRUE(manager.register_policy(def).ok());
@@ -2086,8 +2102,21 @@ TEST(InterruptManagerFaultStopProfileTest,
   MotionInterruptStopProfileDTO sp;
   sp.profile_id = "fault_spring_back_v1";
   sp.stop_mode = MotionInterruptStopMode::kSpringBackHold;
-  def.stop_profile = std::make_shared<MotionInterruptStopProfileDTO>(sp);
+  sp.per_joint_max_deceleration = {{"j1", AngularAccelerationDTO{4.0}}};
+  const auto authored_profile = std::make_shared<MotionInterruptStopProfileDTO>(sp);
+  def.stop_profile = authored_profile;
+  const auto unreviewed = manager.register_policy(def);
+  ASSERT_FALSE(unreviewed.ok());
+  EXPECT_EQ(unreviewed.error().details.at("reason"),
+            "motion_controlled_stop_jerk_activation_required");
+  authored_profile->jerk_limits_enabled = true;
   ASSERT_TRUE(manager.register_policy(def).ok());
+  EXPECT_TRUE(def.stop_profile->per_joint_max_jerk.empty());
+  authored_profile->jerk_limits_enabled = false;  // Cannot change the registered contract.
+  static_assert(std::is_const_v<decltype(def.stop_profile)::element_type>);
+  const auto snapshot = manager.policy_by_id(def.policy_id);
+  ASSERT_TRUE(snapshot.has_value());
+  EXPECT_EQ(snapshot->stop_profile->jerk_limits_enabled, true);
 
   // No latch yet → active_policy returns nullopt.
   EXPECT_FALSE(manager.active_policy().has_value());
@@ -2095,16 +2124,16 @@ TEST(InterruptManagerFaultStopProfileTest,
   // Latch the policy. After ingest, active_policy returns it with the
   // stop_profile intact so the kernel can route through
   // execute_controlled_stop.
-  manager.ingest(update("runtime_src"),
-                 InterruptSourceClass::kFastExecutionRelevant,
+  manager.ingest(update("runtime_src"), InterruptSourceClass::kFastExecutionRelevant,
                  validation_context(), 2'000);
   const auto active = manager.active_policy();
   ASSERT_TRUE(active.has_value());
   EXPECT_EQ(active->policy_id, "runtime_fault_with_profile");
   ASSERT_TRUE(static_cast<bool>(active->stop_profile));
   EXPECT_EQ(active->stop_profile->profile_id, "fault_spring_back_v1");
-  EXPECT_EQ(active->stop_profile->stop_mode,
-            MotionInterruptStopMode::kSpringBackHold);
+  EXPECT_EQ(active->stop_profile->stop_mode, MotionInterruptStopMode::kSpringBackHold);
+  EXPECT_EQ(active->stop_profile->jerk_limits_enabled, true);
+  EXPECT_EQ(active->stop_profile->per_joint_max_jerk.size(), 1U);
 }
 
 }  // namespace

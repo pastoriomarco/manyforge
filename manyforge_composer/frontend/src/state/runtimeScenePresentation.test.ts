@@ -167,7 +167,8 @@ function sourceModel(): SourceModelProjection {
 
 function motionDescriptor(): ManualControlMotionDescriptor {
   return {
-    schemaVersion: 'manyforge.manual_control_motion_descriptor.v3',
+    schemaVersion: 'manyforge.manual_control_motion_descriptor.v4',
+    ordinaryJerk: null,
     controllableComponentId: 'robot-1',
     commandTargetId: 'arm',
     frames: [{

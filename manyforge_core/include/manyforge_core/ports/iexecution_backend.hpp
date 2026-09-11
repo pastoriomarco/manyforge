@@ -10,8 +10,12 @@
 #include <manyforge_core/types/runtime_scale.hpp>
 #include <manyforge_core/types/trajectory_dto.hpp>
 #include <stop_token>
+#include <memory>
 
 namespace manyforge::core {
+namespace detail {
+class CoordinatedExecutionClock;
+}
 
 /// Execution backend interface (spec 220 §4)
 ///
@@ -31,10 +35,27 @@ class IExecutionBackend : public IControlDomainExecutionPort {
   virtual ~IExecutionBackend() = default;
 
   /// Side-effect-free exact participant preparation. Implementations accept
-  /// only the motion_execution payload and retain bounded digest replay
-  /// membership; preparation never sends a transport command.
-  virtual PrepareParticipantResultDTO Prepare(
-      const PreparedOperationParticipantDTO& participant) = 0;
+  /// only the motion_execution payload. execution_id is the owning Kernel's
+  /// existing monotonic execution ID, unchanged across its Resume attempts.
+  /// The backend and that ID owner share a lifetime. Retain current membership
+  /// only; preparation never sends a transport command.
+  virtual PrepareParticipantResultDTO Prepare(const PreparedOperationParticipantDTO& participant,
+                                              std::uint64_t execution_id) = 0;
+
+  /// Side-effect-free binding for an exact prepared coordinated product.
+  /// Unsupported adapters reject before dispatch; independent motion does not
+  /// call this method. This clock cannot replace sealed dispatch authority.
+  virtual Result<void> BindPreparedExecutionClock(
+      const PreparedOperationParticipantDTO&,
+      std::shared_ptr<detail::CoordinatedExecutionClock>) {
+    return Result<void>::Err(ErrorCode::kUnsupportedCapability);
+  }
+
+  /// Owner-authorized retirement after worker, dispatch, Stop and recovery
+  /// quiescence. Never stops motion or resets observed state. Old requests must
+  /// not reopen retired membership, and stale retirement cannot clear a newer
+  /// execution. Failure retains membership and prevents owner release.
+  virtual Result<void> RetirePreparedExecution(std::uint64_t execution_id) = 0;
 
   /// Dispatch one already-prepared participant under the Kernel-minted goal.
   /// Exact repetition returns the same goal-bound handle and never sends a
@@ -119,6 +140,15 @@ class IExecutionBackend : public IControlDomainExecutionPort {
   /// null result means generation-fenced runtime lookahead is unavailable.
   virtual const ExecutionProgressPublication* execution_progress_publication() const noexcept {
     return nullptr;
+  }
+
+  /// Original accepted-trajectory cursor retained at Pause/completed Stop.
+  /// This bounded local read is scoped to the exact dispatch generation. It
+  /// does not renew lookahead liveness or prove settlement/admission. Missing
+  /// or uncertain correspondence returns nullopt, never replacement progress.
+  virtual std::optional<double> stopped_trajectory_time_s(
+      std::uint64_t /*execution_generation*/) const {
+    return std::nullopt;
   }
 
   /// Retire exactly one backend progress generation after the kernel has

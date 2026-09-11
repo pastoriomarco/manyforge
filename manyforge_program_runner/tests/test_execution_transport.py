@@ -11,7 +11,10 @@ from pydantic import ValidationError
 
 from manyforge_headless_api.execution import ExecutionCommandClient
 from manyforge_headless_api.native import HeadlessApiError
-from manyforge_headless_api.models import OperationControlRequest, OperationIntentRequest
+from manyforge_headless_api.models import (
+    OperationControlRequest,
+    OperationIntentRequest,
+)
 from manyforge_program_runner.execution_transport import (
     ProgramRunnerExecutionTransport,
 )
@@ -30,26 +33,45 @@ def _stop_body() -> dict[str, Any]:
     }
 
 
-@pytest.mark.parametrize("failure", ["command", "group", "release_revision"])
-def test_selection_results_must_identify_the_requested_transition(monkeypatch, tmp_path, failure):
+@pytest.mark.parametrize(
+    "failure",
+    ["command", "group", "missing_groups", "empty_groups", "release_revision"],
+)
+def test_selection_results_must_identify_the_requested_transition(
+    monkeypatch, tmp_path, failure
+):
     from manyforge_behavior.kernel_client import KernelClient, KernelClientResponseError
 
     transport = ProgramRunnerExecutionTransport(tmp_path, timeout_seconds=1.0)
     kernel = KernelClient(transport)
-    request = {"group_id": "arm"}
+    request = {"group_ids": ["arm", "grippers"]}
     response = {
-        "ok": True, "command": "stop_program_selection",
-        "accepted": {"state": {}, "group_id": "arm", "replay_status": "accepted_new"},
+        "ok": True,
+        "command": "stop_program_selection",
+        "accepted": {
+            "state": {},
+            "group_ids": ["arm", "grippers"],
+            "replay_status": "accepted_new",
+        },
     }
     monkeypatch.setattr(transport, "_exchange_on", lambda *_: response)
-    assert kernel.stop_program_selection(request)["group_id"] == "arm"
+    assert kernel.stop_program_selection(request)["group_ids"] == ["arm", "grippers"]
     if failure == "command":
         response["command"] = "unrelated_command"
     elif failure == "group":
-        response["accepted"]["group_id"] = "gripper"
+        response["accepted"]["group_ids"] = ["grippers"]
+    elif failure == "missing_groups":
+        del request["group_ids"]
+        del response["accepted"]["group_ids"]
+    elif failure == "empty_groups":
+        request["group_ids"] = []
+        response["accepted"]["group_ids"] = []
     else:
-        response = {"ok": True, "command": "release_program_selection",
-                    "scope": {"selection_revision": 3}}
+        response = {
+            "ok": True,
+            "command": "release_program_selection",
+            "scope": {"selection_revision": 3},
+        }
         assert kernel.release_program_selection(request, 2)["selection_revision"] == 3
         response["scope"]["selection_revision"] = 2
     with pytest.raises(KernelClientResponseError):
@@ -59,18 +81,42 @@ def test_selection_results_must_identify_the_requested_transition(monkeypatch, t
             kernel.stop_program_selection(request)
 
 
-@pytest.mark.parametrize("reason", ["program_selection_revision_stale", "unexpected_exception"])
-def test_selection_release_distinguishes_no_effect_refusal_from_unknown(monkeypatch, tmp_path, reason):
-    from manyforge_behavior.orchestration_ports import ProgramSelectionReleaseRejectedError
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "program_selection_revision_stale",
+        "program_children_unsettled",
+        "program_run_admission_in_flight",
+        "unexpected_exception",
+    ],
+)
+def test_selection_release_distinguishes_no_effect_refusal_from_unknown(
+    monkeypatch, tmp_path, reason
+):
+    from manyforge_behavior.orchestration_ports import (
+        ProgramSelectionReleaseRejectedError,
+    )
 
-    monkeypatch.setattr(ExecutionCommandClient, "_exchange_on", lambda *_: {
-        "ok": False, "error": {"code": "invalid_state_transition", "message": "release refused",
-                                 "details": {"reason": reason}},
-    })
+    monkeypatch.setattr(
+        ExecutionCommandClient,
+        "_exchange_on",
+        lambda *_: {
+            "ok": False,
+            "error": {
+                "code": "invalid_state_transition",
+                "message": "release refused",
+                "details": {"reason": reason},
+            },
+        },
+    )
     transport = ProgramRunnerExecutionTransport(tmp_path, timeout_seconds=1.0)
-    expected = ProgramSelectionReleaseRejectedError if reason == "program_selection_revision_stale" else HeadlessApiError
+    expected = (
+        HeadlessApiError
+        if reason == "unexpected_exception"
+        else ProgramSelectionReleaseRejectedError
+    )
     with pytest.raises(expected, match="release refused"):
-        transport.release_program_selection({"group_id": "all"}, 2)
+        transport.release_program_selection({"group_ids": ["all"]}, 2)
 
 
 def test_transport_reuses_the_owner_client_with_internal_attribution(
@@ -121,9 +167,10 @@ def test_transport_reuses_the_owner_client_with_internal_attribution(
     assert transport.identity()["ok"] is True
     assert transport.stop_program_run(_stop_body())["ok"] is True
     assert transport.stop_status("stop.1")["stop_status"]["state"] == "succeeded"
-    assert transport.release_program_run_stop_fence(
-        "program-run.1", "stop.1", 1
-    )["ok"] is True
+    assert (
+        transport.release_program_run_stop_fence("program-run.1", "stop.1", 1)["ok"]
+        is True
+    )
     assert commands[1]["attribution"] == {
         "transport": "internal",
         "assurance": "unverified",
@@ -181,10 +228,16 @@ def test_transport_preserves_validation_and_owner_error_codes(
 @pytest.mark.parametrize("details", [None, [], "owner_epoch_mismatch"])
 def test_transport_rejects_malformed_owner_error_details(details: Any) -> None:
     with pytest.raises(HeadlessApiError) as invalid:
-        ExecutionCommandClient.require_success({
-            "ok": False,
-            "error": {"code": "rejected", "message": "Rejected", "details": details},
-        })
+        ExecutionCommandClient.require_success(
+            {
+                "ok": False,
+                "error": {
+                    "code": "rejected",
+                    "message": "Rejected",
+                    "details": details,
+                },
+            }
+        )
     assert invalid.value.code == "execution_command_response_invalid"
 
 
@@ -205,8 +258,10 @@ def test_capture_registration_sends_identities_and_checks_the_returned_claim(
     }
     commands = []
     response = {
-        "ok": True, "command": "register_program_run_capture",
-        "program_run_id": "run.1", "claim_generation": 4,
+        "ok": True,
+        "command": "register_program_run_capture",
+        "program_run_id": "run.1",
+        "claim_generation": 4,
     }
 
     def exchange(_client, command, _socket_path):
@@ -216,10 +271,13 @@ def test_capture_registration_sends_identities_and_checks_the_returned_claim(
     monkeypatch.setattr(ExecutionCommandClient, "_exchange_on", exchange)
     transport = ProgramRunnerExecutionTransport(tmp_path, timeout_seconds=1)
     assert transport.register_program_run_capture(capture) == response
-    assert commands == [{
-        "api_version": "manyforge.execution_command.v1",
-        "command": "register_program_run_capture", "capture": capture,
-    }]
+    assert commands == [
+        {
+            "api_version": "manyforge.execution_command.v1",
+            "command": "register_program_run_capture",
+            "capture": capture,
+        }
+    ]
     response["claim_generation"] = 5
     with pytest.raises(HeadlessApiError, match="registered claim"):
         transport.register_program_run_capture(capture)
@@ -230,20 +288,28 @@ def test_control_origin_is_forwarded_privately_and_forbidden_publicly(
 ) -> None:
     request = {
         "request_context": _stop_body()["request_context"],
-        "operation_id": "operation.1", "expected_operation_revision": 2,
-        "reason": "Program Resume", "execution_scope": {
-            "node_instance_id": "resume", "node_attempt_id": "resume.1",
+        "operation_id": "operation.1",
+        "expected_operation_revision": 2,
+        "reason": "Program Resume",
+        "execution_scope": {
+            "node_instance_id": "resume",
+            "node_attempt_id": "resume.1",
         },
     }
     commands = []
 
     def exchange(_client, command, _socket_path):
         commands.append(command)
-        return {"ok": True, "command": "resume", "accepted": {
-            "request_id": request["request_context"]["request_id"],
-            "operation_id": "operation.1", "control": "resume",
-            "accepted_against_revision": 2,
-        }}
+        return {
+            "ok": True,
+            "command": "resume",
+            "accepted": {
+                "request_id": request["request_context"]["request_id"],
+                "operation_id": "operation.1",
+                "control": "resume",
+                "accepted_against_revision": 2,
+            },
+        }
 
     monkeypatch.setattr(ExecutionCommandClient, "_exchange_on", exchange)
     transport = ProgramRunnerExecutionTransport(tmp_path, timeout_seconds=1)
@@ -258,32 +324,50 @@ def test_program_origin_is_required_privately_and_forbidden_publicly(
 ) -> None:
     operation = {
         "request_context": _stop_body()["request_context"],
-        "program_id": "pick", "program_revision": "revision",
-        "program_binding_id": "binding", "program_run_id": "program-run.1",
-        "expected_graph_revision": "graph", "expected_retained_bundle_id": "bundle",
-        "expected_scene_revision": None, "coordination_policy": "independent",
-        "participants": [{
-            "component_role_id": "tool", "target_role_id": "gripper",
-            "required_capability_id": "tool.gripper.command", "action_span": None,
-            "execution_scope": {"node_instance_id": "close", "node_attempt_id": "close.1"},
-            "payload": {
-                "kind": "capability_command", "command_schema_id": "gripper.position",
-                "command_schema_revision": "revision", "completion_timeout_s": 1,
-                "caller_options": [], "command_value": {
-                    "kind": "gripper_position",
-                    "position": {"kind": "angular_rad", "value_rad": 0.3},
-                    "max_effort": None,
+        "program_id": "pick",
+        "program_revision": "revision",
+        "program_binding_id": "binding",
+        "program_run_id": "program-run.1",
+        "expected_graph_revision": "graph",
+        "expected_retained_bundle_id": "bundle",
+        "expected_scene_revision": None,
+        "coordination_policy": "independent",
+        "participants": [
+            {
+                "component_role_id": "tool",
+                "target_role_id": "gripper",
+                "required_capability_id": "tool.gripper.command",
+                "action_span": None,
+                "execution_scope": {
+                    "node_instance_id": "close",
+                    "node_attempt_id": "close.1",
                 },
-            },
-        }],
+                "payload": {
+                    "kind": "capability_command",
+                    "command_schema_id": "gripper.position",
+                    "command_schema_revision": "revision",
+                    "completion_timeout_s": 1,
+                    "caller_options": [],
+                    "command_value": {
+                        "kind": "gripper_position",
+                        "position": {"kind": "angular_rad", "value_rad": 0.3},
+                        "max_effort": None,
+                    },
+                },
+            }
+        ],
     }
     commands = []
 
     def exchange(_client, command, _socket_path):
         commands.append(command)
-        return {"ok": True, "command": "submit", "accepted": {
-            "request_id": operation["request_context"]["request_id"],
-        }}
+        return {
+            "ok": True,
+            "command": "submit",
+            "accepted": {
+                "request_id": operation["request_context"]["request_id"],
+            },
+        }
 
     monkeypatch.setattr(ExecutionCommandClient, "_exchange_on", exchange)
     transport = ProgramRunnerExecutionTransport(tmp_path, timeout_seconds=1)

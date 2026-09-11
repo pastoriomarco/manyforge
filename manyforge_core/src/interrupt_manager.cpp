@@ -1,4 +1,5 @@
 #include <manyforge_core/interrupt/interrupt_manager.hpp>
+#include <manyforge_core/motion_interrupt/stop_profile_mapper.hpp>
 
 #include <manyforge_content_identity/canonical_value.hpp>
 
@@ -165,6 +166,14 @@ std::optional<std::string> validate_stop_profile_shape(
   if (const auto diagnostics_error =
           interrupt_structured_value_error(profile.diagnostics)) {
     return *diagnostics_error;
+  }
+  if (profile.stop_mode != MotionInterruptStopMode::kHardDeceleration &&
+      !profile.jerk_limits_enabled.has_value()) {
+    return "motion_controlled_stop_jerk_activation_required";
+  }
+  if (profile.jerk_limits_enabled == true &&
+      profile.per_joint_max_jerk.size() != profile.per_joint_max_deceleration.size()) {
+    return "motion_controlled_stop_jerk_limits_not_prepared";
   }
   return std::nullopt;
 }
@@ -360,17 +369,26 @@ Result<void> InterruptManager::register_policy(
   // `kLatchHeld` or `kCompleteMoveOnSignal` policy would otherwise
   // sit ignored, masking the operator's intent.
   if (policy.stop_profile &&
-      policy.preemption_action !=
-          InterruptPreemptionAction::kPreemptTrajectory) {
-    return Result<void>::Err(interrupt_error(
-        "stop_profile_requires_preempt_trajectory",
-        "stop_profile is only valid on preempt_trajectory policies"));
+      policy.preemption_action != InterruptPreemptionAction::kPreemptTrajectory) {
+    return Result<void>::Err(
+        interrupt_error("stop_profile_requires_preempt_trajectory",
+                        "stop_profile is only valid on preempt_trajectory policies"));
   }
   // Move-scoped invariants (spec/260 §2.2).
   if (auto vr = validate_move_scoped_policy_locked(policy); !vr.ok()) {
     return Result<void>::Err(vr.error());
   }
-  policies_by_id_.emplace(policy.policy_id, policy);
+  auto retained_policy = policy;
+  if (policy.stop_profile) {
+    auto prepared = resolve_motion_interrupt_stop_jerk_limits(*policy.stop_profile);
+    if (!prepared.ok()) return Result<void>::Err(prepared.error());
+    if (const auto error = validate_stop_profile_shape(prepared.value())) {
+      return Result<void>::Err(interrupt_error(*error, "Invalid fault Stop profile"));
+    }
+    retained_policy.stop_profile =
+        std::make_shared<MotionInterruptStopProfileDTO>(std::move(prepared.value()));
+  }
+  policies_by_id_.emplace(policy.policy_id, std::move(retained_policy));
   policy_ids_by_source_[policy.source_id].push_back(policy.policy_id);
   std::sort(policy_ids_by_source_[policy.source_id].begin(),
             policy_ids_by_source_[policy.source_id].end());
@@ -1779,6 +1797,12 @@ InterruptManager::build_scope_binding_locked(
       return Result<ActiveScopeBinding>::Err(interrupt_error(
           "recoverable_substitution_not_allowed_for_node_category",
           "precision-contact node categories forbid stop substitution"));
+    }
+    if (scope.node_category == MotionInterruptNodeCategory::kPrecisionContact &&
+        profile.allow_natural_completion_on_short_path) {
+      return Result<ActiveScopeBinding>::Err(interrupt_error(
+          "natural_completion_not_allowed_for_node_category",
+          "precision-contact node categories require a controlled stop, not natural completion"));
     }
   } else if (scope.stop_profile) {
     // Defense in depth: stop_profile only makes sense for

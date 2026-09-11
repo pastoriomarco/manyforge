@@ -123,9 +123,10 @@ struct StopFaultRecoveryConfigurationExpectationDTO final {
                          const StopFaultRecoveryConfigurationExpectationDTO&) = default;
 };
 
-/// Atomic read-only projection needed to construct one exact recovery intent.
-/// The configuration table is derived from the same resident terminal status
-/// as the latch and is never supplied by a caller or assembled across reads.
+/// Atomic current fault/recovery context. Before a certificate exists this
+/// carries only the waiting latch and an empty configuration table: it does
+/// not authorize recovery. The actionable table derives from the same exact
+/// resident terminal status, never from caller input or separate reads.
 struct StopFaultRecoveryOfferDTO final {
   StopFaultLatchDTO latch;
   std::vector<StopFaultRecoveryConfigurationExpectationDTO> configuration_expectations;

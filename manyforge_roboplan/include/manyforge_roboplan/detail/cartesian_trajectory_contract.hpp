@@ -4,20 +4,18 @@
 // the deleted Cartesian planner request body is intentionally absent.
 
 #include <cstddef>
-#include <memory>
-#include <optional>
-#include <span>
-#include <string>
-#include <vector>
-
-#include <roboplan/core/scene.hpp>
-#include <roboplan/core/types.hpp>
-
+#include <manyforge_core/detail/runtime_scale_governor.hpp>
 #include <manyforge_core/types/joint_dynamics_limits.hpp>
 #include <manyforge_core/types/motion_spec.hpp>
 #include <manyforge_core/types/speed_profile.hpp>
-
 #include <manyforge_roboplan/cartesian_planning_contract.hpp>
+#include <memory>
+#include <optional>
+#include <roboplan/core/scene.hpp>
+#include <roboplan/core/types.hpp>
+#include <span>
+#include <string>
+#include <vector>
 
 namespace manyforge::roboplan_backend::detail {
 
@@ -35,6 +33,10 @@ struct CartesianJointDynamicsEnvelope {
   bool complete = true;
   double velocity_ratio = 1.0;
   double acceleration_ratio = 1.0;
+  // Ordered by trajectory.joint_names, valid only when complete. Retain these
+  // extrema for cold-path runtime-scale preparation instead of rescanning the
+  // trajectory on each slider edit. This alone does not enable jerk support.
+  std::vector<core::detail::TrajectoryDerivativeBounds> joint_derivatives;
 };
 
 struct CartesianFrameDynamicsEnvelope {
@@ -58,6 +60,7 @@ struct CartesianKinematicMotionBounds {
 
 struct CartesianInterpolantPath {
   std::vector<Eigen::Matrix4d> poses;
+  std::vector<double> times_s;
   /// Conservative motion still possible between adjacent sampled poses. The
   /// fidelity checker reserves these margins instead of treating samples as
   /// the continuous controller path.
@@ -92,7 +95,7 @@ measure_cartesian_joint_dynamics_envelope(
 core::Result<CartesianFrameDynamicsEnvelope>
 measure_cartesian_frame_dynamics_envelope(
     const CartesianTrajectoryContractInput& request,
-    const core::CartesianPathDTO& path,
+    const core::CartesianPathDTO* path,
     const std::shared_ptr<roboplan::Scene>& scene,
     const roboplan::JointTrajectory& trajectory,
     const CartesianPlanningControl& control);

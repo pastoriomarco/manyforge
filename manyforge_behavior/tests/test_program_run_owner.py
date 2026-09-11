@@ -61,7 +61,9 @@ _DIGEST_C = "sha256:" + "c" * 64
 
 
 def test_owner_captures_values_before_later_writes_without_changing_status_wire():
-    owner, admission, _task, _scope, _events = _fixture(initial_task_state=OwnerTaskState.SUCCEEDED)
+    owner, admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
     document = admission.program.to_dict()
     document["blackboard"] = {
         "namespaces": [],
@@ -87,7 +89,9 @@ def test_owner_captures_values_before_later_writes_without_changing_status_wire(
     run_id = started.capture.program_run_id
     run = owner._runs[run_id].run
     # The existing declared store is the producer, not a later History query.
-    owner.write_runtime_blackboard(run_id, key="recorded_value", value=True, request_id="write.1")
+    owner.write_runtime_blackboard(
+        run_id, key="recorded_value", value=True, request_id="write.1"
+    )
     for _ in range(4):
         snapshot = owner.advance_once(run_id)
         if snapshot.state is ProgramRunState.SUCCEEDED:
@@ -131,7 +135,9 @@ class _TaskPort:
         return OwnerTaskSnapshot(
             task_id=f"task-{self.starts}",
             state=self._initial_state,
-            reason_code=("owner_failed" if self._initial_state is OwnerTaskState.FAILED else None),
+            reason_code=(
+                "owner_failed" if self._initial_state is OwnerTaskState.FAILED else None
+            ),
         )
 
     def observe(self, task_id: str) -> OwnerTaskSnapshot:
@@ -388,7 +394,10 @@ class _ScopePort:
         }
 
     def stop_selection(self, request):
-        self.request_stop(request["program_run_id"], request["request_context"]["request_id"], None)
+        self.last_selection_stop = request
+        self.request_stop(
+            request["program_run_id"], request["request_context"]["request_id"], None
+        )
         if self.state is ProgramRunScopeState.UNKNOWN:
             raise RuntimeError("kernel_scope_unknown")
         return {
@@ -397,6 +406,7 @@ class _ScopePort:
         }
 
     def release_selection(self, request, expected_selection_revision):
+        self.last_selection_release = request
         if self.selection_revision != expected_selection_revision:
             raise ProgramSelectionReleaseRejectedError("selection revision changed")
         if self.state is not ProgramRunScopeState.SETTLED:
@@ -427,6 +437,7 @@ class _ScopePort:
         _reason: str | None,
     ) -> ProgramRunScopeSnapshot:
         self.stop_requests += 1
+        self.last_stop_request = (program_run_id, _stop_request_id, _reason)
         self.held = True
         self.selection_revision += 1
         self._events.append("scope_stop")
@@ -438,7 +449,9 @@ class _ScopePort:
     def capture_stop(self, program_run_id):
         return ("stop.1", 1) if self.stop_requests else None
 
-    def release_stop(self, program_run_id: str, *, expected_stop=None) -> ProgramRunScopeSnapshot:
+    def release_stop(
+        self, program_run_id: str, *, expected_stop=None
+    ) -> ProgramRunScopeSnapshot:
         self.release_requests += 1
         self.held = False
         self.selection_revision += 1
@@ -457,7 +470,8 @@ def _readiness(binding_id: str) -> NodeExecutionReadiness:
     return NodeExecutionReadiness(
         program_binding_id=binding_id,
         binding_by_node={
-            disposition.row.node_id: AvailabilityFact(True) for disposition in resolver.dispositions
+            disposition.row.node_id: AvailabilityFact(True)
+            for disposition in resolver.dispositions
         },
         owner_by_port={
             owner_port: AvailabilityFact(True)
@@ -482,7 +496,11 @@ def _fixture(
     events: list[str] = []
     if context_port is not None:
         context_port.events = events
-    task = _TaskPort(events, initial_task_state) if task_factory is None else task_factory(events)
+    task = (
+        _TaskPort(events, initial_task_state)
+        if task_factory is None
+        else task_factory(events)
+    )
     invocation = _InvocationPort()
     scope = _ScopePort(events)
     ports = NodeAdapterPorts(
@@ -496,7 +514,9 @@ def _fixture(
         kernel_controls=invocation,
         program_run_scope=scope,
         program_run_context=(
-            scope if context_port is None else CompositeProgramRunContextPort(scope, context_port)
+            scope
+            if context_port is None
+            else CompositeProgramRunContextPort(scope, context_port)
         ),
         program_interventions=interventions,
     )
@@ -585,7 +605,9 @@ def _admission_for_program(
 
 
 def test_start_captures_the_exact_scenario_closure_before_the_first_tick() -> None:
-    owner, admission, task, _scope, _events = _fixture(initial_task_state=OwnerTaskState.SUCCEEDED)
+    owner, admission, task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
 
     started = owner.start(admission)
     assert started.state is ProgramRunState.RUNNING
@@ -600,7 +622,9 @@ def test_start_captures_the_exact_scenario_closure_before_the_first_tick() -> No
     assert started.capture.program_binding_id == _DIGEST_A
     assert started.capture.retained_bundle_id == _DIGEST_B
     assert started.capture.graph_revision == _DIGEST_C
-    assert started.capture.node_environment_digest == (admission.environment.environment_digest)
+    assert started.capture.node_environment_digest == (
+        admission.environment.environment_digest
+    )
     assert [identity.owner_role for identity in started.capture.owner_identities] == [
         "kernel_operations",
         "program_runner",
@@ -616,7 +640,9 @@ def test_start_captures_the_exact_scenario_closure_before_the_first_tick() -> No
 
 
 def test_start_captures_exact_nondefault_policy_and_immutable_lookup() -> None:
-    owner, admission, _task, _scope, _events = _fixture(initial_task_state=OwnerTaskState.SUCCEEDED)
+    owner, admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
     program = _program_with_policies(admission)
     source_rows = [policy.to_dict() for policy in program_node_policies(program)]
     admitted = _admission_for_program(admission, program, source_rows)
@@ -708,7 +734,9 @@ def test_program_run_admission_rejects_nonexact_policy_vectors(
         replace(admission, program=program, program_binding=binding)
 
 
-def test_program_run_admission_rejects_policy_skills_and_wrong_program_identity() -> None:
+def test_program_run_admission_rejects_policy_skills_and_wrong_program_identity() -> (
+    None
+):
     _owner, admission, _task, _scope, _events = _fixture(
         initial_task_state=OwnerTaskState.SUCCEEDED
     )
@@ -737,7 +765,9 @@ def test_owner_exposes_one_bounded_local_run_index_without_downstream_reads() ->
     bounded, truncated = owner.list_snapshots(limit=1)
     active, active_truncated = owner.list_snapshots(active_only=True, limit=8)
 
-    assert [row.capture.program_run_id for row in bounded] == [first.capture.program_run_id]
+    assert [row.capture.program_run_id for row in bounded] == [
+        first.capture.program_run_id
+    ]
     assert truncated is True
     assert [row.capture.program_run_id for row in active] == [
         first.capture.program_run_id,
@@ -747,7 +777,9 @@ def test_owner_exposes_one_bounded_local_run_index_without_downstream_reads() ->
 
     owner.advance_once(first.capture.program_run_id)
     still_active, _ = owner.list_snapshots(active_only=True, limit=8)
-    assert [row.capture.program_run_id for row in still_active] == [second.capture.program_run_id]
+    assert [row.capture.program_run_id for row in still_active] == [
+        second.capture.program_run_id
+    ]
 
 
 def test_start_binds_exact_client_context_before_tree_construction() -> None:
@@ -849,7 +881,9 @@ def test_slow_admission_does_not_block_existing_program_run_reads() -> None:
     assert entered.wait(timeout=1.0)
 
     read_results: list[object] = []
-    reader = Thread(target=lambda: read_results.append(owner.read(first.capture.program_run_id)))
+    reader = Thread(
+        target=lambda: read_results.append(owner.read(first.capture.program_run_id))
+    )
     reader.start()
     reader.join(timeout=0.2)
     assert not reader.is_alive()
@@ -895,7 +929,9 @@ def test_terminal_cleanup_is_retryable_before_the_run_claims_completion() -> Non
 
 
 def test_failed_tree_projects_the_exact_focused_owner_failure() -> None:
-    owner, admission, _task, _scope, _events = _fixture(initial_task_state=OwnerTaskState.FAILED)
+    owner, admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.FAILED
+    )
     started = owner.start(admission)
 
     failed = owner.advance_once(started.capture.program_run_id)
@@ -907,7 +943,9 @@ def test_failed_tree_projects_the_exact_focused_owner_failure() -> None:
 
 
 def test_terminal_run_reset_releases_exact_kernel_scope() -> None:
-    owner, admission, _task, scope, events = _fixture(initial_task_state=OwnerTaskState.SUCCEEDED)
+    owner, admission, _task, scope, events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
     started = owner.start(admission)
     completed = owner.advance_once(started.capture.program_run_id)
     assert completed.state is ProgramRunState.SUCCEEDED
@@ -939,7 +977,9 @@ def test_durable_reset_forgets_resident_tree_and_reuses_concurrent_capacity() ->
 
 
 def test_active_run_cannot_reset_kernel_scope() -> None:
-    owner, admission, _task, scope, _events = _fixture(initial_task_state=OwnerTaskState.ACTIVE)
+    owner, admission, _task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
     started = owner.start(admission)
 
     with pytest.raises(ProgramRunOwnerError, match="only after settlement"):
@@ -975,7 +1015,9 @@ def test_authored_pause_requires_intervention_without_redispatch() -> None:
 
 
 def test_tick_host_advances_each_scheduled_run_and_removes_terminal_work() -> None:
-    owner, admission, task, _scope, _events = _fixture(initial_task_state=OwnerTaskState.SUCCEEDED)
+    owner, admission, task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
     host = ProgramRunTickHost(owner, tick_interval_s=0.01)
 
     started = host.start_run(admission)
@@ -984,8 +1026,169 @@ def test_tick_host_advances_each_scheduled_run_and_removes_terminal_work() -> No
     assert [snapshot.state for snapshot in completed] == [ProgramRunState.SUCCEEDED]
     assert task.starts == 1
     assert host.advance_ready_once() == ()
-    assert host.read(started.capture.program_run_id).state is (ProgramRunState.SUCCEEDED)
+    assert host.read(started.capture.program_run_id).state is (
+        ProgramRunState.SUCCEEDED
+    )
     host.shutdown()
+
+
+@pytest.mark.parametrize(
+    "outcome", [ProgramRunScopeState.SETTLED, ProgramRunScopeState.UNKNOWN]
+)
+def test_terminal_reset_observes_scope_without_reopening_or_ticking_tree(outcome):
+    owner, admission, task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
+    host = ProgramRunTickHost(owner)
+    started = host.start_run(admission)
+    run_id = started.capture.program_run_id
+    terminal = host.advance_ready_once()[0]
+    scope.state = ProgramRunScopeState.ACTIVE
+    try:
+        assert (
+            owner.begin_reset_containment(run_id, stop_request_id="reset.1") == terminal
+        )
+        assert scope.last_stop_request == (
+            run_id,
+            "reset.1",
+            "operator requested Program cycle Reset",
+        )
+        host.schedule(run_id)
+        assert host.advance_ready_once() == (terminal,)
+        assert owner.reset_containment_pending(run_id)
+        scope.state = outcome
+        assert host.advance_ready_once() == (terminal,)
+        assert not owner.reset_containment_pending(run_id)
+        assert host.advance_ready_once() == ()
+        if outcome is ProgramRunScopeState.SETTLED:
+            assert (
+                host.wait_terminal(run_id, require_reset_containment=True) == terminal
+            )
+        else:
+            with pytest.raises(ProgramRunOwnerOutcomeUnknownError):
+                host.wait_terminal(run_id, require_reset_containment=True)
+        assert host.read(run_id) == terminal
+        assert task.starts == 1
+        assert scope.stop_requests == 1
+        assert scope.release_requests == scope.reset_requests == 0
+    finally:
+        host.shutdown()
+
+
+def test_terminal_reset_lost_reply_does_not_reuse_previous_settlement():
+    owner, admission, task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
+    run_id = owner.start(admission).capture.program_run_id
+    terminal = owner.advance_once(run_id)
+    owner.begin_reset_containment(run_id, stop_request_id="reset.first")
+    assert owner.reset_containment_settled(run_id)
+
+    def lost_reply(*_args, **_kwargs):
+        raise RuntimeError("response lost")
+
+    scope.request_stop = lost_reply
+    with pytest.raises(ProgramRunOwnerOutcomeUnknownError):
+        owner.begin_reset_containment(run_id, stop_request_id="reset.second")
+    with pytest.raises(ProgramRunOwnerOutcomeUnknownError):
+        owner.reset_containment_settled(run_id)
+    assert owner.read(run_id) == terminal and task.starts == 1
+
+
+def test_terminal_reset_waiter_uses_worker_notifications():
+    owner, admission, task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
+    host = ProgramRunTickHost(owner, tick_interval_s=0.001)
+    run_id = host.start_run(admission).capture.program_run_id
+    terminal = host.advance_ready_once()[0]
+    entered, release = Event(), Event()
+    read = scope.observe
+
+    def delayed_scope(program_run_id):
+        entered.set()
+        assert release.wait(2.0)
+        scope.state = ProgramRunScopeState.SETTLED
+        return read(program_run_id)
+
+    scope.state = ProgramRunScopeState.ACTIVE
+    scope.observe = delayed_scope
+    results = []
+    errors = []
+
+    def reset_wait():
+        try:
+            results.append(
+                host.contain_reset_run(run_id, stop_request_id="reset.1", timeout_s=2)
+            )
+        except Exception as error:
+            errors.append(error)
+
+    host.start()
+    waiter = Thread(target=reset_wait)
+    waiter.start()
+    try:
+        assert entered.wait(2.0)
+        assert waiter.is_alive() and host.read(run_id) == terminal
+        release.set()
+        waiter.join(2.0)
+        assert not waiter.is_alive()
+        assert not errors and results == [terminal]
+        assert task.starts == 1 and scope.stop_requests == 1
+        host.reset_run(run_id)
+        host.forget_reset_run(run_id)
+    finally:
+        release.set()
+        waiter.join(2.0)
+        host.shutdown()
+
+
+def test_first_tree_tick_can_wait_for_running_publication_without_another_worker() -> (
+    None
+):
+    owner, admission, task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
+    host = ProgramRunTickHost(owner, tick_interval_s=0.01)
+    started = host.start_run(admission, defer_ticks=True)
+    assert host.advance_ready_once() == ()
+    assert task.starts == 0
+    host.schedule(started.capture.program_run_id)
+    assert host.advance_ready_once()[0].state is ProgramRunState.SUCCEEDED
+    assert task.starts == 1
+    host.shutdown()
+
+
+def test_settled_scope_read_failure_retries_on_the_existing_tree_worker() -> None:
+    from manyforge_behavior.nodes.stop_policy import (
+        OperatorMotionStopSnapshot,
+        OperatorMotionStopState,
+    )
+
+    owner, admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
+    started = owner.start(admission)
+    run = owner._entry(started.capture.program_run_id).run
+    calls = 0
+
+    def read_scope():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("temporary projection read failure")
+        return OperatorMotionStopSnapshot(1)
+
+    state = OperatorMotionStopState({"scene": ()}, read_scope=read_scope)
+    run._operator_stop_state = state
+    with pytest.raises(RuntimeError, match="temporary"):
+        state.refresh()
+    assert not state.snapshot().stopping_nodes
+    assert run.pending_selected_observation()
+    run.refresh_pending_stop_settlement()
+    assert state.observation_error() is None
+    assert not run.pending_selected_observation()
+    assert calls == 2
 
 
 def test_tick_host_does_not_schedule_an_ordinary_held_intervention() -> None:
@@ -1063,7 +1266,10 @@ def test_tick_host_retains_resume_after_a_stale_intervention_worker(
 
     def controlled_advance(program_run_id: str):
         snapshot = advance_once(program_run_id)
-        if block_stale_worker.is_set() and snapshot.state is ProgramRunState.INTERVENTION_REQUIRED:
+        if (
+            block_stale_worker.is_set()
+            and snapshot.state is ProgramRunState.INTERVENTION_REQUIRED
+        ):
             stale_worker_entered.set()
             assert release_stale_worker.wait(timeout=2.0)
         return snapshot
@@ -1079,7 +1285,9 @@ def test_tick_host_retains_resume_after_a_stale_intervention_worker(
     program_run_id = started.capture.program_run_id
     try:
         deadline = time.monotonic() + 2.0
-        while owner.read(program_run_id).state is not (ProgramRunState.INTERVENTION_REQUIRED):
+        while owner.read(program_run_id).state is not (
+            ProgramRunState.INTERVENTION_REQUIRED
+        ):
             assert time.monotonic() < deadline
             time.sleep(0.001)
 
@@ -1121,7 +1329,9 @@ def test_tick_host_never_loses_repeated_operator_stop_recovery() -> None:
     try:
         for recovery_index in range(64):
             deadline = time.monotonic() + 2.0
-            while owner.read(program_run_id).state is not (ProgramRunState.INTERVENTION_REQUIRED):
+            while owner.read(program_run_id).state is not (
+                ProgramRunState.INTERVENTION_REQUIRED
+            ):
                 assert time.monotonic() < deadline
                 time.sleep(0.001)
 
@@ -1152,13 +1362,28 @@ def test_tick_host_never_loses_repeated_operator_stop_recovery() -> None:
         host.shutdown()
 
 
-def test_motion_stop_holds_the_current_node_and_resume_hands_off_its_exact_fence() -> None:
+@pytest.mark.parametrize("groups", ["all", ["arm", "tools", "arm"]])
+def test_motion_stop_holds_the_current_node_and_resume_hands_off_its_exact_fence(
+    groups,
+) -> None:
     interventions = ProgramInterventionRegistry(maximum_retained_runs=8)
     owner, admission, task, scope, _events = _fixture(
         initial_task_state=OwnerTaskState.ACTIVE,
         task_factory=_OperatorStopTaskPort,
         interventions=interventions,
     )
+    if isinstance(groups, list):
+        document = admission.program.to_dict()
+        document["tree"]["execution_groups"] = ["arm", "tools"]
+        document["program_revision"] = compute_content_identity(
+            document,
+            own_field="program_revision",
+            identity_domain="program-revision",
+            api_version="manyforge.program.v2",
+        )
+        admission = _admission_for_program(
+            admission, Program.from_dict(document, admission.environment.catalog), []
+        )
     host = ProgramRunTickHost(owner, tick_interval_s=0.01)
     started = host.start_run(admission)
 
@@ -1167,10 +1392,13 @@ def test_motion_stop_holds_the_current_node_and_resume_hands_off_its_exact_fence
     stopped = host.stop_motion(
         started.capture.program_run_id,
         reason="ordinary operator motion Stop",
+        group_id=groups,
     )
     assert stopped.state is ProgramRunState.RUNNING
     assert stopped.tree_status == "running"
     assert scope.stop_requests == 1
+    expected_groups = [groups] if isinstance(groups, str) else groups
+    assert scope.last_selection_stop["group_ids"] == expected_groups
 
     held = host.advance_ready_once()[0]
     assert held.state is ProgramRunState.INTERVENTION_REQUIRED
@@ -1181,17 +1409,137 @@ def test_motion_stop_holds_the_current_node_and_resume_hands_off_its_exact_fence
     scope.state = ProgramRunScopeState.SETTLED
     resumed = host.resume_motion(
         started.capture.program_run_id,
+        expected_run_revision=owner.read(started.capture.program_run_id).run_revision,
         expected_selection_revision=scope.selection_revision,
         request_id="resume-motion.1",
+        group_id=groups,
         reason=None,
     )
     assert resumed.state is ProgramRunState.RUNNING
     assert scope.release_requests == 1
+    assert scope.last_selection_release["group_ids"] == expected_groups
+    assert len(task.recoveries) == 1
     assert host.advance_ready_once()[0].state is ProgramRunState.RUNNING
     assert task.starts == 2
 
     host.stop_run(started.capture.program_run_id)
     host.shutdown()
+
+
+@pytest.mark.parametrize("new_stop", [False, True])
+def test_manual_handover_reuses_cleanup_without_releasing_or_repeating_work(new_stop):
+    interventions = ProgramInterventionRegistry(maximum_retained_runs=1)
+    owner, admission, task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE,
+        task_factory=_OperatorStopTaskPort,
+        interventions=interventions,
+    )
+    run_id = owner.start(admission).capture.program_run_id
+    owner.advance_once(run_id)
+    scope.state = ProgramRunScopeState.ACTIVE
+    owner.stop_motion(run_id)
+    owner.advance_once(run_id)
+    intervention = interventions.read(run_id)
+    assert intervention is not None
+    node_index = sorted(admission.program.execution_selections["all"]).index(
+        intervention.identity.node_instance_id
+    )
+    scope.state = ProgramRunScopeState.SETTLED
+    recover = task.recover
+
+    def cleanup(*args, **kwargs):
+        result = recover(*args, **kwargs)
+        if new_stop:
+            scope.selection_revision += 1
+            scope.state = ProgramRunScopeState.ACTIVE
+        return result
+
+    task.recover = cleanup
+    request = dict(
+        node_indices=(node_index,),
+        expected_run_revision=owner.read(run_id).run_revision,
+        expected_selection_revision=scope.selection_revision,
+        request_id="manual.handover.1",
+    )
+    if new_stop:
+        with pytest.raises(ProgramRunOwnerError, match="hold changed"):
+            owner.prepare_manual_handover(run_id, **request)
+    else:
+        prepared = owner.prepare_manual_handover(run_id, **request)
+        assert prepared.state is ProgramRunState.RUNNING
+    assert len(task.recoveries) == 1
+    assert scope.release_requests == 0 and scope.held
+    owner.advance_once(run_id)
+    assert task.starts == 1
+    scope.state = ProgramRunScopeState.SETTLED
+    owner.advance_once(run_id)
+    owner.resume_motion(
+        run_id,
+        expected_run_revision=owner.read(run_id).run_revision,
+        expected_selection_revision=scope.selection_revision,
+        request_id="manual.explicit.resume",
+    )
+    owner.advance_once(run_id)
+    assert scope.release_requests == 1 and task.starts == 2
+    assert len(task.recoveries) == 1
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "unknown_node",
+        "not_held",
+        "stopping",
+        "stale_revision",
+        "negative",
+        "boolean",
+        "duplicate",
+        "empty",
+    ],
+)
+def test_manual_handover_rejects_inexact_scope_before_cleanup(invalid):
+    interventions = ProgramInterventionRegistry(maximum_retained_runs=1)
+    owner, admission, task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE,
+        task_factory=_OperatorStopTaskPort,
+        interventions=interventions,
+    )
+    run_id = owner.start(admission).capture.program_run_id
+    owner.advance_once(run_id)
+    scope.state = ProgramRunScopeState.ACTIVE
+    owner.stop_motion(run_id)
+    owner.advance_once(run_id)
+    intervention = interventions.read(run_id)
+    assert intervention is not None
+    scope.state = ProgramRunScopeState.SETTLED
+    node_index = sorted(admission.program.execution_selections["all"]).index(
+        intervention.identity.node_instance_id
+    )
+    indices = (node_index,)
+    if invalid == "unknown_node":
+        indices = (len(admission.program.execution_selections["all"]),)
+    elif invalid == "negative":
+        indices = (-1,)
+    elif invalid == "boolean":
+        indices = (True,)
+    elif invalid == "duplicate":
+        indices = (node_index, node_index)
+    elif invalid == "empty":
+        indices = ()
+    elif invalid == "not_held":
+        scope.held = False
+    elif invalid == "stopping":
+        scope.state = ProgramRunScopeState.ACTIVE
+    with pytest.raises(ProgramRunOwnerError):
+        owner.prepare_manual_handover(
+            run_id,
+            node_indices=indices,
+            expected_run_revision=owner.read(run_id).run_revision,
+            expected_selection_revision=scope.selection_revision
+            - (invalid == "stale_revision"),
+            request_id="invalid.manual.handover",
+        )
+    assert not task.recoveries and scope.release_requests == 0 and task.starts == 1
 
 
 @pytest.mark.parametrize(
@@ -1250,6 +1598,7 @@ def test_motion_recovery_cannot_resume_across_a_new_stop_or_failed_handoff(
         with pytest.raises(ProgramRunOwnerError):
             host.resume_motion(
                 run_id,
+                expected_run_revision=owner.read(run_id).run_revision,
                 expected_selection_revision=scope.selection_revision,
                 request_id="resume.1",
                 reason=None,
@@ -1288,6 +1637,7 @@ def test_recovery_preflights_only_its_exact_program_stop(program_scope):
         with pytest.raises(ProgramRunOwnerError, match="still stopping"):
             host.resume_motion(
                 run_id,
+                expected_run_revision=owner.read(run_id).run_revision,
                 expected_selection_revision=scope.selection_revision,
                 request_id="too-early",
                 reason=None,
@@ -1298,6 +1648,7 @@ def test_recovery_preflights_only_its_exact_program_stop(program_scope):
         assert (
             host.resume_motion(
                 run_id,
+                expected_run_revision=owner.read(run_id).run_revision,
                 expected_selection_revision=scope.selection_revision,
                 request_id="settled",
             ).state
@@ -1346,7 +1697,9 @@ def test_explicit_stop_recaptures_a_lost_reply_through_the_native_scope(full):
     transport.stop_program_run = lost
     request = owner.full_stop if full else owner.stop
     first = request(run_id, stop_request_id="lost")
-    assert first.state is (ProgramRunState.FULL_STOPPING if full else ProgramRunState.STOPPING)
+    assert first.state is (
+        ProgramRunState.FULL_STOPPING if full else ProgramRunState.STOPPING
+    )
     assert native.scope.observe(run_id).state is ProgramRunScopeState.UNKNOWN
     owner.advance_once(run_id)  # passive reconciliation must not retry an effect
     assert len(transport.controls) == 1
@@ -1355,7 +1708,9 @@ def test_explicit_stop_recaptures_a_lost_reply_through_the_native_scope(full):
     assert len(transport.controls) == 2
     transport.stop_states["scope-stop-2"] = "succeeded"
     settled = owner.advance_once(run_id)
-    assert settled.state is (ProgramRunState.FULL_STOPPED if full else ProgramRunState.STOPPED)
+    assert settled.state is (
+        ProgramRunState.FULL_STOPPED if full else ProgramRunState.STOPPED
+    )
     if full:
         owner.stop(run_id, stop_request_id="finish-preserved-run")
         transport.stop_states["scope-stop-3"] = "succeeded"
@@ -1374,7 +1729,10 @@ def test_full_stop_overtakes_a_held_full_stop_resume_without_releasing_its_fence
     host = ProgramRunTickHost(owner, tick_interval_s=0.01)
     run_id = host.start_run(admission).capture.program_run_id
     host.advance_ready_once()
-    assert host.full_stop(run_id, stop_request_id="first").state is ProgramRunState.FULL_STOPPING
+    assert (
+        host.full_stop(run_id, stop_request_id="first").state
+        is ProgramRunState.FULL_STOPPING
+    )
     assert host.advance_ready_once()[0].state is ProgramRunState.FULL_STOPPED
     entered, finish, stop_done = Event(), Event(), Event()
     recover, errors, stopped = task.recover, [], []
@@ -1412,7 +1770,9 @@ def test_full_stop_overtakes_a_held_full_stop_resume_without_releasing_its_fence
         resuming.join(timeout=2)
         stopping.join(timeout=2)
     assert not resuming.is_alive() and not stopping.is_alive()
-    assert len(errors) == 1 and isinstance(errors[0], ProgramRunOwnerOutcomeUnknownError)
+    assert len(errors) == 1 and isinstance(
+        errors[0], ProgramRunOwnerOutcomeUnknownError
+    )
     assert scope.release_requests == 0 and task.starts == 1
     scope.state = ProgramRunScopeState.SETTLED
     host.stop_run(run_id)
@@ -1477,7 +1837,9 @@ def test_motion_stop_retains_escalated_stop_for_backend_recovery() -> None:
 
     assert host.advance_ready_once()[0].state is ProgramRunState.RUNNING
     scope.state = ProgramRunScopeState.ACTIVE
-    assert host.stop_motion(started.capture.program_run_id).state is (ProgramRunState.RUNNING)
+    assert host.stop_motion(started.capture.program_run_id).state is (
+        ProgramRunState.RUNNING
+    )
 
     held = host.advance_ready_once()[0]
     assert held.state is ProgramRunState.INTERVENTION_REQUIRED
@@ -1538,7 +1900,9 @@ def test_motion_stop_does_not_wait_for_blocked_tree_dispatch() -> None:
 
 
 def test_selection_status_never_settles_an_observed_completed_task():
-    owner, admission, task, scope, events = _fixture(initial_task_state=OwnerTaskState.ACTIVE)
+    owner, admission, task, scope, events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
     run_id = owner.start(admission).capture.program_run_id
     owner.advance_once(run_id)
     owner.stop_motion(run_id)
@@ -1554,8 +1918,184 @@ def test_selection_status_never_settles_an_observed_completed_task():
     assert task.starts == 1 and task.cancels == 0
 
 
+def test_late_stop_reply_preserves_a_completed_run_projection():
+    owner, admission, task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
+    run_id = owner.start(admission).capture.program_run_id
+    owner.advance_once(run_id)
+    stop = scope.stop_selection
+    terminal = []
+
+    def complete_before_reply(request):
+        accepted = stop(request)
+        task.observe = lambda task_id: OwnerTaskSnapshot(
+            task_id, OwnerTaskState.SUCCEEDED
+        )
+        terminal.append(owner.advance_once(run_id))
+        return accepted
+
+    scope.stop_selection = complete_before_reply
+    with pytest.raises(ProgramRunOwnerOutcomeUnknownError, match="state changed"):
+        owner.stop_motion(run_id)
+    assert terminal[0].state is ProgramRunState.SUCCEEDED
+    assert terminal[0].active_operation_count == 0
+    assert owner.read(run_id) == terminal[0]
+
+
+def test_selection_projection_captures_run_after_waiting_for_tree_transition():
+    owner, admission, task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
+    run_id = owner.start(admission).capture.program_run_id
+    entered, release = Event(), Event()
+    original_lock = owner._runs[run_id].transition_lock
+
+    class ProjectionBarrier:
+        def __enter__(self):
+            entered.set()
+            assert release.wait(timeout=1)
+            original_lock.acquire()
+
+        def __exit__(self, *_args):
+            original_lock.release()
+
+    owner._runs[run_id].transition_lock = ProjectionBarrier()
+    result = []
+    thread = Thread(target=lambda: result.append(owner.read_selection_controls(run_id)))
+    thread.start()
+    try:
+        assert entered.wait(timeout=1)
+        owner._runs[run_id].transition_lock = original_lock
+        advanced = owner.advance_once(run_id)
+    finally:
+        release.set()
+        thread.join(timeout=2)
+    assert not thread.is_alive()
+    snapshot, controls = result[0]
+    assert snapshot == advanced
+    assert controls["groups"][0]["state"] == "running"
+    assert task.starts == 1
+
+
+def test_stop_command_publication_does_not_advance_revision_again_on_unchanged_tick():
+    owner, admission, task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
+    run_id = owner.start(admission).capture.program_run_id
+    owner.advance_once(run_id)
+    stopped = owner.stop_motion(run_id)
+    assert owner.advance_once(run_id).run_revision == stopped.run_revision
+    assert task.starts == 1
+
+
+@pytest.mark.parametrize("settles_during_preflight", [False, True])
+def test_logical_resume_publication_does_not_advance_revision_again_on_tick(
+    settles_during_preflight,
+):
+    owner, admission, task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
+    run_id = owner.start(admission).capture.program_run_id
+    if settles_during_preflight:
+        scope.state = ProgramRunScopeState.ACTIVE
+    owner.stop_motion(run_id)
+    held = owner.advance_once(run_id)
+    scope.state = ProgramRunScopeState.SETTLED
+    resumed = owner.resume_motion(
+        run_id,
+        expected_run_revision=held.run_revision,
+        expected_selection_revision=scope.selection_revision,
+        request_id="logical.resume",
+    )
+    assert owner.advance_once(run_id).run_revision == resumed.run_revision
+    assert task.starts == 1
+
+
+def test_rejected_resume_does_not_publish_unrevisioned_settlement():
+    owner, admission, task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
+    run_id = owner.start(admission).capture.program_run_id
+    scope.state = ProgramRunScopeState.ACTIVE
+    owner.stop_motion(run_id)
+    stopping = owner.advance_once(run_id)
+    before = owner.operator_stop_scope(run_id)
+    assert before.stopping_nodes
+    scope.state = ProgramRunScopeState.SETTLED
+    with pytest.raises(ProgramRunOwnerError, match="stale selection"):
+        owner.resume_motion(
+            run_id,
+            expected_run_revision=stopping.run_revision,
+            expected_selection_revision=scope.selection_revision - 1,
+            request_id="stale.selection",
+        )
+    assert owner.operator_stop_scope(run_id) == before
+    assert owner.read(run_id) == stopping
+    settled = owner.advance_once(run_id)
+    assert settled.run_revision == stopping.run_revision + 1
+    assert not owner.operator_stop_scope(run_id).stopping_nodes
+    assert owner.advance_once(run_id) == settled
+    assert task.starts == 0 and scope.release_requests == 0
+
+
+def test_resume_rechecks_run_revision_after_waiting_without_owner_effects():
+    owner, admission, task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
+    run_id = owner.start(admission).capture.program_run_id
+    stopped = owner.stop_motion(run_id)
+    entered, release = Event(), Event()
+    original_lock = owner._runs[run_id].transition_lock
+
+    class ResumeBarrier:
+        def __enter__(self):
+            entered.set()
+            assert release.wait(timeout=1)
+            original_lock.acquire()
+
+        def __exit__(self, *_args):
+            original_lock.release()
+
+    owner._runs[run_id].transition_lock = ResumeBarrier()
+    errors = []
+
+    def resume():
+        try:
+            owner.resume_motion(
+                run_id,
+                expected_run_revision=stopped.run_revision,
+                expected_selection_revision=scope.selection_revision,
+                request_id="resume.crossed",
+            )
+        except ProgramRunOwnerError as error:
+            errors.append(error)
+
+    thread = Thread(target=resume)
+    thread.start()
+    try:
+        assert entered.wait(timeout=1)
+        owner._runs[run_id].transition_lock = original_lock
+        changed = owner.note_runtime_control_change(run_id)
+    finally:
+        release.set()
+        thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    assert errors[0].code == "program_runtime_control_stale"
+    assert errors[0].details == {
+        "expected_run_revision": stopped.run_revision,
+        "current_run_revision": changed.run_revision,
+    }
+    assert scope.release_requests == 0 and scope.held
+    assert task.starts == 0
+    assert owner.read(run_id) == changed
+
+
 def test_pending_selection_read_failure_does_not_fail_the_tree_or_poll_after_settlement():
-    owner, admission, task, scope, events = _fixture(initial_task_state=OwnerTaskState.ACTIVE)
+    owner, admission, task, scope, events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
     run_id = owner.start(admission).capture.program_run_id
     scope.state = ProgramRunScopeState.ACTIVE
     owner.stop_motion(run_id)
@@ -1571,7 +2111,10 @@ def test_pending_selection_read_failure_does_not_fail_the_tree_or_poll_after_set
 
     scope.execution_scope = observe
     assert owner.advance_once(run_id).state is ProgramRunState.RUNNING
-    assert owner.execution_selection_controls(run_id)["groups"][0]["state"] == "unavailable"
+    assert (
+        owner.execution_selection_controls(run_id)["groups"][0]["state"]
+        == "unavailable"
+    )
     scope.state = ProgramRunScopeState.SETTLED
     settled = owner.advance_once(run_id)
     assert owner.execution_selection_controls(run_id)["groups"][0]["state"] == "held"
@@ -1581,7 +2124,9 @@ def test_pending_selection_read_failure_does_not_fail_the_tree_or_poll_after_set
 
 
 def test_motion_stop_with_zero_local_tasks_waits_for_scope_certificate():
-    owner, admission, task, scope, _events = _fixture(initial_task_state=OwnerTaskState.ACTIVE)
+    owner, admission, task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
     run_id = owner.start(admission).capture.program_run_id
     controls = owner.execution_selection_controls(run_id)
     assert controls["groups"][0]["state"] == "running"
@@ -1603,6 +2148,7 @@ def test_motion_stop_with_zero_local_tasks_waits_for_scope_certificate():
         owner.resume_motion(
             run_id,
             request_id="still-settling",
+            expected_run_revision=owner.read(run_id).run_revision,
             expected_selection_revision=scope.selection_revision,
         )
     assert owner.advance_once(run_id).state is ProgramRunState.RUNNING
@@ -1616,6 +2162,7 @@ def test_motion_stop_with_zero_local_tasks_waits_for_scope_certificate():
         owner.resume_motion(
             run_id,
             request_id="settled",
+            expected_run_revision=owner.read(run_id).run_revision,
             expected_selection_revision=scope.selection_revision,
         ).state
         is ProgramRunState.RUNNING
@@ -1657,7 +2204,12 @@ def test_selected_resume_keeps_cleanup_once_across_release_failure(failure):
             else ProgramRunOwnerOutcomeUnknownError
         )
         with pytest.raises(expected_error):
-            host.resume_motion(run_id, expected_selection_revision=revision, request_id="resume.1")
+            host.resume_motion(
+                run_id,
+                expected_run_revision=owner.read(run_id).run_revision,
+                expected_selection_revision=revision,
+                request_id="resume.1",
+            )
         assert len(task.recoveries) == 1
         assert interventions.read_all(run_id) == ()
         assert owner.read(run_id).state is ProgramRunState.RUNNING
@@ -1667,16 +2219,25 @@ def test_selected_resume_keeps_cleanup_once_across_release_failure(failure):
         if failure != "unchanged_reply":
             with pytest.raises(ProgramRunOwnerError, match="stale selection"):
                 host.resume_motion(
-                    run_id, expected_selection_revision=revision, request_id="reconcile"
+                    run_id,
+                    expected_run_revision=owner.read(run_id).run_revision,
+                    expected_selection_revision=revision,
+                    request_id="reconcile",
                 )
         if scope.held:
             host.resume_motion(
                 run_id,
+                expected_run_revision=owner.read(run_id).run_revision,
                 expected_selection_revision=scope.selection_revision,
                 request_id="resume.current",
             )
         host.advance_ready_once()
-        assert task.starts == 2
+        # A stale preflight cannot open scheduling after an unconfirmed
+        # release. The Runner requires explicit reconciliation/Reset for that
+        # outcome; only a confirmed current release resumes ordinary work.
+        assert task.starts == (1 if failure == "lost_reply" else 2)
+        if failure == "lost_reply":
+            assert owner.operator_stop_scope(run_id).held_nodes
         assert len(task.recoveries) == 1
         assert scope.release_requests == 1
     finally:
@@ -1685,7 +2246,9 @@ def test_selected_resume_keeps_cleanup_once_across_release_failure(failure):
 
 
 def test_old_scope_settlement_cannot_complete_a_newer_full_stop():
-    owner, admission, _task, scope, _events = _fixture(initial_task_state=OwnerTaskState.ACTIVE)
+    owner, admission, _task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
     run_id = owner.start(admission).capture.program_run_id
     scope.state = ProgramRunScopeState.ACTIVE
     owner.full_stop(run_id, stop_request_id="first")
@@ -1730,6 +2293,7 @@ def test_motion_stop_between_operations_preserves_the_tree_boundary() -> None:
 
     resumed = host.resume_motion(
         program_run_id,
+        expected_run_revision=owner.read(program_run_id).run_revision,
         expected_selection_revision=scope.selection_revision,
         request_id="run-after-boundary-stop.1",
     )
@@ -1841,11 +2405,16 @@ def test_parallel_stop_records_both_attempts_before_full_stop_recovery() -> None
     assert task.starts == 2
     assert owner.full_stop(run_id).state is ProgramRunState.FULL_STOPPING
     assert owner.reconcile_full_stop(run_id).state is ProgramRunState.FULL_STOPPED
-    assert {row.identity.node_instance_id for row in interventions.read_all(run_id)} == {
+    assert {
+        row.identity.node_instance_id for row in interventions.read_all(run_id)
+    } == {
         "parallel.0",
         "parallel.1",
     }
-    assert owner.resume_full_stop(run_id, request_id="resume-both").state is ProgramRunState.RUNNING
+    assert (
+        owner.resume_full_stop(run_id, request_id="resume-both").state
+        is ProgramRunState.RUNNING
+    )
     assert len(task.recoveries) == 2
     assert interventions.read_all(run_id) == ()
     owner.advance_once(run_id)
@@ -1894,7 +2463,9 @@ def test_selected_resume_refreshes_siblings_and_retains_partial_cleanup(policy) 
         assessment = {**snapshot.metadata["recovery_assessment"]}
         if not ready:
             assessment["allowed_actions"] = []
-        return replace(snapshot, metadata={**snapshot.metadata, "recovery_assessment": assessment})
+        return replace(
+            snapshot, metadata={**snapshot.metadata, "recovery_assessment": assessment}
+        )
 
     task.observe = current_assessment
     run_id = owner.start(admission).capture.program_run_id
@@ -1909,7 +2480,8 @@ def test_selected_resume_refreshes_siblings_and_retains_partial_cleanup(policy) 
     assert second.node_status_revision == first.node_status_revision
     assert len(interventions.read_all(run_id)) == 2
     assert all(
-        not item.owner_assessment["allowed_actions"] for item in interventions.read_all(run_id)
+        not item.owner_assessment["allowed_actions"]
+        for item in interventions.read_all(run_id)
     )
     assert not owner.execution_selection_controls(run_id)["groups"][0]["resume_allowed"]
     ready = True
@@ -1928,9 +2500,12 @@ def test_selected_resume_refreshes_siblings_and_retains_partial_cleanup(policy) 
         return recover(task_id, *args, **kwargs)
 
     task.recover = recover_current
-    with pytest.raises(ProgramRunOwnerRecoveryIncompleteError, match="second-owner rejection"):
+    with pytest.raises(
+        ProgramRunOwnerRecoveryIncompleteError, match="second-owner rejection"
+    ):
         owner.resume_motion(
             run_id,
+            expected_run_revision=owner.read(run_id).run_revision,
             expected_selection_revision=scope.selection_revision,
             request_id="first",
         )
@@ -1939,6 +2514,7 @@ def test_selected_resume_refreshes_siblings_and_retains_partial_cleanup(policy) 
     assert (
         owner.resume_motion(
             run_id,
+            expected_run_revision=owner.read(run_id).run_revision,
             expected_selection_revision=scope.selection_revision,
             request_id="second",
         ).state
@@ -2043,7 +2619,9 @@ def test_operator_stop_without_exact_identity_fails_before_held_tree_progress() 
     )
     started = owner.start(admission)
 
-    assert owner.advance_once(started.capture.program_run_id).state is (ProgramRunState.RUNNING)
+    assert owner.advance_once(started.capture.program_run_id).state is (
+        ProgramRunState.RUNNING
+    )
     failed = owner.advance_once(started.capture.program_run_id)
 
     assert failed.state is ProgramRunState.FAILED
@@ -2053,7 +2631,9 @@ def test_operator_stop_without_exact_identity_fails_before_held_tree_progress() 
 
 
 def test_tick_host_delivers_terminal_without_polling_or_blocking_stop() -> None:
-    owner, admission, _task, _scope, _events = _fixture(initial_task_state=OwnerTaskState.SUCCEEDED)
+    owner, admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
     observer_entered = Event()
     release_observer = Event()
     observed: list[ProgramRunState] = []
@@ -2112,7 +2692,9 @@ def test_first_intervention_is_published_before_host_becomes_idle():
 
 @pytest.mark.parametrize("background", [False, True])
 def test_tick_host_latches_terminal_observer_failure(background) -> None:
-    owner, admission, _task, _scope, _events = _fixture(initial_task_state=OwnerTaskState.SUCCEEDED)
+    owner, admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
 
     def reject(_snapshot) -> None:
         raise RuntimeError("journal unavailable")
@@ -2157,7 +2739,9 @@ def test_tick_host_cleans_an_admitted_run_if_bounded_scheduling_rejects_it() -> 
 
     assert owner.read("program-run-2").state is ProgramRunState.STOPPED
     assert context.unbound == ["program-run-2"]
-    assert host.stop_run(first.capture.program_run_id).state is (ProgramRunState.STOPPED)
+    assert host.stop_run(first.capture.program_run_id).state is (
+        ProgramRunState.STOPPED
+    )
     host.shutdown()
 
 
@@ -2221,27 +2805,37 @@ def test_tick_host_does_not_let_one_slow_run_starve_another_run() -> None:
         assert second_completed.wait(timeout=1.0)
         deadline = time.monotonic() + 1.0
         while (
-            host.read(second.capture.program_run_id).state is not ProgramRunState.SUCCEEDED
+            host.read(second.capture.program_run_id).state
+            is not ProgramRunState.SUCCEEDED
             and time.monotonic() < deadline
         ):
             time.sleep(0.001)
-        assert host.read(second.capture.program_run_id).state is (ProgramRunState.SUCCEEDED)
+        assert host.read(second.capture.program_run_id).state is (
+            ProgramRunState.SUCCEEDED
+        )
 
         release_first.set()
         deadline = time.monotonic() + 1.0
         while (
-            host.read(first.capture.program_run_id).state is not ProgramRunState.SUCCEEDED
+            host.read(first.capture.program_run_id).state
+            is not ProgramRunState.SUCCEEDED
             and time.monotonic() < deadline
         ):
             time.sleep(0.001)
-        assert host.read(first.capture.program_run_id).state is (ProgramRunState.SUCCEEDED)
+        assert host.read(first.capture.program_run_id).state is (
+            ProgramRunState.SUCCEEDED
+        )
     finally:
         release_first.set()
         host.shutdown()
 
 
-def test_stop_reaches_kernel_scope_before_tree_invalidation_and_waits_for_proof() -> None:
-    owner, admission, task, scope, events = _fixture(initial_task_state=OwnerTaskState.ACTIVE)
+def test_stop_reaches_kernel_scope_before_tree_invalidation_and_waits_for_proof() -> (
+    None
+):
+    owner, admission, task, scope, events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
     started = owner.start(admission)
     running = owner.advance_once(started.capture.program_run_id)
     assert running.state is ProgramRunState.RUNNING
@@ -2315,7 +2909,9 @@ def test_stop_cannot_race_a_tick_and_dispatch_after_the_kernel_stop_request() ->
 
 
 def test_failure_is_not_relabelled_as_stopped_while_kernel_work_settles() -> None:
-    owner, admission, _task, scope, _events = _fixture(initial_task_state=OwnerTaskState.FAILED)
+    owner, admission, _task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.FAILED
+    )
     started = owner.start(admission)
     scope.state = ProgramRunScopeState.ACTIVE
 
@@ -2326,14 +2922,18 @@ def test_failure_is_not_relabelled_as_stopped_while_kernel_work_settles() -> Non
     assert repeated.state is ProgramRunState.STOPPING
 
     scope.state = ProgramRunScopeState.SETTLED
-    assert owner.read(started.capture.program_run_id).state is (ProgramRunState.STOPPING)
+    assert owner.read(started.capture.program_run_id).state is (
+        ProgramRunState.STOPPING
+    )
     failed = owner.advance_once(started.capture.program_run_id)
     assert failed.state is ProgramRunState.FAILED
     assert failed.reason_code == "program_terminal_scope_not_settled"
 
 
 def test_unknown_kernel_scope_never_reports_stopped_and_recovers_cleanly() -> None:
-    owner, admission, _task, scope, _events = _fixture(initial_task_state=OwnerTaskState.ACTIVE)
+    owner, admission, _task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
     started = owner.start(admission)
     scope.state = ProgramRunScopeState.UNKNOWN
 
@@ -2343,7 +2943,9 @@ def test_unknown_kernel_scope_never_reports_stopped_and_recovers_cleanly() -> No
     assert unknown.reason_code == "kernel_scope_unknown"
 
     scope.state = ProgramRunScopeState.SETTLED
-    assert owner.read(started.capture.program_run_id).state is (ProgramRunState.STOPPING)
+    assert owner.read(started.capture.program_run_id).state is (
+        ProgramRunState.STOPPING
+    )
     stopped = owner.advance_once(started.capture.program_run_id)
     assert stopped.state is ProgramRunState.STOPPED
     assert stopped.active_operation_count == 0
@@ -2352,7 +2954,9 @@ def test_unknown_kernel_scope_never_reports_stopped_and_recovers_cleanly() -> No
 
 
 def test_retained_terminal_scope_can_reset_without_rebuilding_its_tree() -> None:
-    owner, _admission, _task, scope, events = _fixture(initial_task_state=OwnerTaskState.SUCCEEDED)
+    owner, _admission, _task, scope, events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
 
     owner.reset_retained_effects("program-run.retained")
 
@@ -2361,7 +2965,9 @@ def test_retained_terminal_scope_can_reset_without_rebuilding_its_tree() -> None
 
 
 def test_program_run_snapshot_is_a_closed_serializable_owner_projection() -> None:
-    owner, admission, _task, _scope, _events = _fixture(initial_task_state=OwnerTaskState.SUCCEEDED)
+    owner, admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
     value: dict[str, Any] = owner.start(admission).to_dict()
 
     assert set(value) == {
@@ -2439,7 +3045,9 @@ def test_native_selection_join_rejects_a_catalog_change_before_construction() ->
     admitted = build_program_run_admission(
         selection,
         expected_scenario_id=fixture_admission.scenario_id,
-        expected_scenario_catalog_revision=(fixture_admission.scenario_catalog_revision),
+        expected_scenario_catalog_revision=(
+            fixture_admission.scenario_catalog_revision
+        ),
         environment=environment,
         owner_availability=fixture_admission.readiness.owner_by_port,
     )
@@ -2482,7 +3090,9 @@ def test_native_selection_join_accepts_compatible_producer_environment() -> None
         owner_availability=admission.readiness.owner_by_port,
     )
 
-    assert joined.environment.environment_digest == (admission.environment.environment_digest)
+    assert joined.environment.environment_digest == (
+        admission.environment.environment_digest
+    )
     assert joined.program_binding["node_environment"]["environment_digest"] == (
         producer_environment
     )

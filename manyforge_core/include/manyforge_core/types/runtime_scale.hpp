@@ -98,6 +98,17 @@ struct RuntimeScaleControlStatusDTO final {
 /// Private subordinate-mechanism observation. Exact public identities and
 /// generations are joined by the resource-addressed Kernel; a backend cannot
 /// mint or select them.
+/// Identity of the one command installed in an exact coordinated product's
+/// shared time law. It is observation, not another participant acceptance.
+struct CoordinatedRuntimeScaleCommandDTO final {
+  OperationId operation_id;
+  OperationRevision operation_revision;
+  RuntimeScaleGeneration generation;
+
+  friend bool operator==(const CoordinatedRuntimeScaleCommandDTO&,
+                         const CoordinatedRuntimeScaleCommandDTO&) = default;
+};
+
 struct RuntimeScaleMechanismStatusDTO final {
   bool supported{};
   bool active{};
@@ -107,6 +118,7 @@ struct RuntimeScaleMechanismStatusDTO final {
   std::uint64_t acknowledgement_sequence{};
   std::int64_t acknowledgement_timestamp_ns{};
   std::optional<ErrorDTO> error;
+  std::optional<CoordinatedRuntimeScaleCommandDTO> coordinated_command{};
 };
 
 struct RuntimeScaleRequestDTO final {

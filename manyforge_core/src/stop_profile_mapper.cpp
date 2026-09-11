@@ -86,6 +86,19 @@ namespace {
   return CoordinateVelocityDTO{LinearVelocityDTO{*magnitude}};
 }
 
+[[nodiscard]] std::optional<CoordinateJerkDTO> jerk(const JsonObjectDTO& value,
+                                                    CoordinateKind expected_kind) {
+  const bool angular = expected_kind == CoordinateKind::kAngular;
+  const auto* kind = text(member(value, "coordinate_kind"));
+  const auto* scalar = number(member(value, angular ? "value_rad_s3" : "value_m_s3"));
+  if (value.size() != 2U || kind == nullptr ||
+      *kind != (angular ? "angular_rad_s3" : "linear_m_s3") || scalar == nullptr ||
+      !std::isfinite(*scalar) || *scalar <= 0.0)
+    return std::nullopt;
+  if (angular) return CoordinateJerkDTO{AngularJerkDTO{*scalar}};
+  return CoordinateJerkDTO{LinearJerkDTO{*scalar}};
+}
+
 template <typename T>
 [[nodiscard]] double magnitude(const T& value) {
   return std::visit(
@@ -124,11 +137,47 @@ struct ResolvedResource final {
 
 }  // namespace
 
+Result<MotionInterruptStopProfileDTO> resolve_motion_interrupt_stop_jerk_limits(
+    const MotionInterruptStopProfileDTO& source) {
+  if (const auto error = motion_interrupt_stop_profile_field_error(source); !error.empty())
+    return invalid_profile("motion_interrupt_stop_profile_invalid", error);
+  auto profile = source;
+  if (!profile.jerk_limits_enabled.has_value() &&
+      profile.stop_mode != MotionInterruptStopMode::kHardDeceleration)
+    return invalid_profile("motion_controlled_stop_jerk_activation_required",
+                           "Review and save an explicit controlled-Stop jerk choice");
+  if (profile.stop_mode == MotionInterruptStopMode::kHardDeceleration)
+    profile.jerk_limits_enabled = false;
+  if (profile.jerk_limits_enabled != true)
+    return Result<MotionInterruptStopProfileDTO>::Ok(std::move(profile));
+  const double reference_s =
+      motion_interrupt_deceleration_time_or_default(profile) *
+      (profile.stop_mode == MotionInterruptStopMode::kSpringBackHold ? 0.5 : 1.0);
+  for (const auto& [joint, acceleration] : profile.per_joint_max_deceleration) {
+    if (profile.per_joint_max_jerk.contains(joint)) continue;
+    const double limit = motion_jerk_preset_limit(magnitude(acceleration), reference_s);
+    if (!std::isfinite(limit) || limit <= 0.0)
+      return invalid_profile("motion_interrupt_jerk_preset_invalid",
+                             "Jerk preset is not finite and positive");
+    profile.per_joint_max_jerk.emplace(joint,
+                                       coordinate_kind(acceleration) == CoordinateKind::kAngular
+                                           ? CoordinateJerkDTO{AngularJerkDTO{limit}}
+                                           : CoordinateJerkDTO{LinearJerkDTO{limit}});
+  }
+  return Result<MotionInterruptStopProfileDTO>::Ok(std::move(profile));
+}
+
 Result<MotionControlledStopContractParametersDTO>
 map_motion_interrupt_stop_profile_to_contract_parameters(
-    const MotionInterruptStopProfileDTO& profile, MotionInterruptNodeCategory node_category,
+    const MotionInterruptStopProfileDTO& source, MotionInterruptNodeCategory node_category,
     std::span<const RuntimeResourceBindingDTO> resources,
     std::span<const HardStopResourceLimitDTO> retained_default_limits) {
+  if (!motion_interrupt_stop_profile_id_valid(source.profile_id))
+    return invalid("motion_interrupt_stop_profile_id_invalid",
+                   "profile_id must be a 1-128 byte portable token");
+  const auto frozen = resolve_motion_interrupt_stop_jerk_limits(source);
+  if (!frozen.ok()) return Result<MotionControlledStopContractParametersDTO>::Err(frozen.error());
+  const auto& profile = frozen.value();
   if (!motion_interrupt_stop_profile_id_valid(profile.profile_id)) {
     return invalid("motion_interrupt_stop_profile_id_invalid",
                    "profile_id must be a 1-128 byte portable token");
@@ -157,6 +206,11 @@ map_motion_interrupt_stop_profile_to_contract_parameters(
       profile.recoverable_substitution_mode.has_value()) {
     return invalid("motion_interrupt_substitution_precision_contact_forbidden",
                    "precision-contact profiles forbid recoverable substitution");
+  }
+  if (node_category == MotionInterruptNodeCategory::kPrecisionContact &&
+      profile.allow_natural_completion_on_short_path) {
+    return invalid("motion_interrupt_natural_completion_precision_contact_forbidden",
+                   "precision-contact profiles require a controlled stop, not natural completion");
   }
 
   std::map<std::string, const RuntimeResourceBindingDTO*, std::less<>> resource_by_source_joint;
@@ -254,14 +308,18 @@ map_motion_interrupt_stop_profile_to_contract_parameters(
   std::vector<ControlledStopResourceLimitDTO> limits;
   limits.reserve(resolved.size());
   for (const auto& row : resolved) {
-    limits.push_back({row.binding->resource_id,
-                      acceleration_by_resource.at(row.binding->resource_id), row.settle_threshold});
+    const auto jerk = profile.per_joint_max_jerk.find(*row.binding->source_joint_name);
+    limits.push_back(
+        {row.binding->resource_id, acceleration_by_resource.at(row.binding->resource_id),
+         row.settle_threshold,
+         jerk == profile.per_joint_max_jerk.end() ? std::nullopt : std::optional(jerk->second)});
   }
   if (profile.stop_mode == MotionInterruptStopMode::kSoftOnPath) {
     SoftOnPathStopParametersDTO mapped;
     mapped.deceleration_time_s = *profile.deceleration_time_s;
     mapped.per_resource_limits = std::move(limits);
     mapped.allow_natural_completion_on_short_path = profile.allow_natural_completion_on_short_path;
+    mapped.jerk_limits_enabled = profile.jerk_limits_enabled == true;
     if (profile.recoverable_substitution_mode.has_value()) {
       mapped.recoverable_substitution_mode = MotionControlledStopMode::kSpringBackHold;
     }
@@ -272,6 +330,8 @@ map_motion_interrupt_stop_profile_to_contract_parameters(
   SpringBackHoldStopParametersDTO mapped;
   mapped.deceleration_time_s = motion_interrupt_deceleration_time_or_default(profile);
   mapped.per_resource_limits = std::move(limits);
+  mapped.allow_natural_completion_on_short_path = profile.allow_natural_completion_on_short_path;
+  mapped.jerk_limits_enabled = profile.jerk_limits_enabled == true;
   return Result<MotionControlledStopContractParametersDTO>::Ok(
       MotionControlledStopContractParametersDTO{std::move(mapped)});
 }
@@ -314,12 +374,18 @@ Result<MotionInterruptStopProfileDTO> map_motion_controlled_stop_contract_parame
     profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
   } else if (*mode == "hard_deceleration") {
     profile.stop_mode = MotionInterruptStopMode::kHardDeceleration;
+    profile.jerk_limits_enabled = false;
   } else {
     return invalid_profile("motion_controlled_stop_mode_invalid",
                            "controlled Stop mode is not supported");
   }
 
   if (profile.stop_mode != MotionInterruptStopMode::kHardDeceleration) {
+    const auto* enabled = boolean(member(parameters, "jerk_limits_enabled"));
+    if (enabled == nullptr)
+      return invalid_profile("motion_controlled_stop_jerk_activation_required",
+                             "Review and save an explicit controlled-Stop jerk choice");
+    profile.jerk_limits_enabled = *enabled;
     const auto* duration = number(member(parameters, "deceleration_time_s"));
     if (duration == nullptr || !std::isfinite(*duration) || *duration <= 0.0) {
       return invalid_profile("motion_controlled_stop_duration_invalid",
@@ -327,16 +393,17 @@ Result<MotionInterruptStopProfileDTO> map_motion_controlled_stop_contract_parame
     }
     profile.deceleration_time_s = *duration;
   }
-  if (profile.stop_mode == MotionInterruptStopMode::kSoftOnPath) {
+  if (profile.stop_mode != MotionInterruptStopMode::kHardDeceleration) {
     const auto* natural = boolean(member(parameters, "allow_natural_completion_on_short_path"));
     if (natural == nullptr) {
       return invalid_profile("motion_controlled_stop_natural_completion_invalid",
-                             "Soft on-path natural-completion policy is absent");
+                             "Controlled Stop natural-completion policy is absent");
     }
     profile.allow_natural_completion_on_short_path = *natural;
     if (const auto* substitute = text(member(parameters, "recoverable_substitution_mode"));
         substitute != nullptr) {
-      if (*substitute != "spring_back_hold") {
+      if (profile.stop_mode != MotionInterruptStopMode::kSoftOnPath ||
+          *substitute != "spring_back_hold") {
         return invalid_profile("motion_controlled_stop_substitution_invalid",
                                "controlled Stop substitution is invalid");
       }
@@ -379,6 +446,15 @@ Result<MotionInterruptStopProfileDTO> map_motion_controlled_stop_contract_parame
       }
       profile.per_joint_max_deceleration.emplace(*expected->second->source_joint_name,
                                                  *decoded_deceleration);
+      if (const auto* encoded_jerk = member(*row, "max_jerk")) {
+        const auto* value = object(encoded_jerk);
+        const auto decoded = value == nullptr ? std::optional<CoordinateJerkDTO>{}
+                                              : jerk(*value, expected->second->coordinate_kind);
+        if (!decoded)
+          return invalid_profile("motion_controlled_stop_jerk_limit_invalid",
+                                 "Jerk must be positive and match the exact resource units");
+        profile.per_joint_max_jerk.emplace(*expected->second->source_joint_name, *decoded);
+      }
     }
   }
   profile.per_joint_settle_velocity_threshold = std::move(settle_thresholds);
@@ -415,6 +491,7 @@ Result<MotionInterruptStopProfileDTO> project_motion_interrupt_stop_profile_to_c
 
   MotionInterruptStopProfileDTO projected = profile;
   projected.per_joint_max_deceleration.clear();
+  projected.per_joint_max_jerk.clear();
   for (const auto& [source_joint, limit] : profile.per_joint_max_deceleration) {
     const auto compiled = compiled_by_source.find(source_joint);
     if (compiled == compiled_by_source.end()) {
@@ -423,6 +500,14 @@ Result<MotionInterruptStopProfileDTO> project_motion_interrupt_stop_profile_to_c
                              "joint projection");
     }
     projected.per_joint_max_deceleration.emplace(compiled->second, limit);
+  }
+  for (const auto& [source_joint, limit] : profile.per_joint_max_jerk) {
+    const auto compiled = compiled_by_source.find(source_joint);
+    if (compiled == compiled_by_source.end())
+      return invalid_profile(
+          "motion_controlled_stop_joint_projection_mismatch",
+          "Controlled Stop jerk scope differs from the retained joint projection");
+    projected.per_joint_max_jerk.emplace(compiled->second, limit);
   }
 
   if (profile.per_joint_settle_velocity_threshold.has_value()) {

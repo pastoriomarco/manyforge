@@ -410,6 +410,7 @@ enum class CommandKind {
   kApply,
   kApplyStatus,
   kSceneCommit,
+  kSceneTransactionStatus,
   kSceneOwnerRead,
   kSceneCandidatePreview,
   kScenePoseQuery,
@@ -433,6 +434,7 @@ RequiresCurrentPackageGeneration(const CommandKind command) noexcept {
   case CommandKind::kReconcile:
     return true;
   case CommandKind::kSceneOwnerRead:
+  case CommandKind::kSceneTransactionStatus:
   case CommandKind::kApply:
   case CommandKind::kApplyStatus:
   case CommandKind::kScenePoseQuery:
@@ -826,7 +828,7 @@ ProgramRunnerLivenessRenewal RenewProgramRunnerLiveness(
     const ProgramRunnerLivenessIdentity &receiver,
     const core::ManagerLivenessRequiredSetDTO &required_set,
     const std::uint64_t sequence,
-    const core::ContentDigest &reconciliation_digest) {
+    const std::optional<core::ContentDigest> &reconciliation_digest) {
   const auto response = ExchangeProgramRunnerLivenessPacket(
       path,
       CanonicalValue(CanonicalValue::Object{
@@ -848,7 +850,9 @@ ProgramRunnerLivenessRenewal RenewProgramRunnerLiveness(
           {"receiver_runtime_unit_id",
            CanonicalValue(receiver.runtime_unit_id.value())},
           {"reconciliation_digest",
-           CanonicalValue(reconciliation_digest.value())},
+           reconciliation_digest.has_value()
+               ? CanonicalValue(reconciliation_digest->value())
+               : CanonicalValue(nullptr)},
           {"required_runtime_set_digest",
            CanonicalValue(required_set.required_runtime_set_digest.value())},
           {"runtime_policy_id",
@@ -864,6 +868,9 @@ ProgramRunnerLivenessRenewal RenewProgramRunnerLiveness(
       RequiredUnsigned(RequiredMember(response, "receiver_status_sequence"),
                        "Program Runner receiver status sequence");
   const auto fault_reference = OptionalString(response, "fault_reference");
+  const auto state = RequiredString(response, "state");
+  const auto fenced = RequiredBool(response, "command_fenced");
+  const auto current = state == "current" && !fenced;
   Require(RequiredString(response, "api_version") ==
                   kProgramRunnerLivenessApiVersion &&
               RequiredString(response, "schema_version") ==
@@ -896,8 +903,8 @@ ProgramRunnerLivenessRenewal RenewProgramRunnerLiveness(
               RequiredUnsigned(
                   RequiredMember(response, "last_accepted_heartbeat_sequence"),
                   "Program Runner heartbeat sequence") == sequence &&
-              RequiredString(response, "state") == "current" &&
-              !RequiredBool(response, "command_fenced") &&
+              (current || (!reconciliation_digest.has_value() &&
+                           state == "unreconciled" && fenced)) &&
               (!fault_reference.has_value() ||
                (fault_reference->starts_with("sha256:") &&
                 fault_reference->size() == 71U)),
@@ -910,7 +917,9 @@ ProgramRunnerLivenessRenewal RenewProgramRunnerLiveness(
        core::RuntimePolicyRevision(
            std::string(kProgramRunnerLivenessPolicyRevision)),
        sequence, receiver_status_sequence, static_cast<std::int64_t>(local_age),
-       core::ManagerLivenessStateDTO::kCurrent, false,
+       current ? core::ManagerLivenessStateDTO::kCurrent
+               : core::ManagerLivenessStateDTO::kUnreconciled,
+       fenced,
        fault_reference.has_value() ? std::optional<core::ContentDigest>(
                                          core::ContentDigest(*fault_reference))
                                    : std::nullopt},
@@ -1176,12 +1185,13 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
             std::nullopt,
             std::nullopt};
   }
-  if (command == "scene_commit") {
+  if (command == "scene_commit" || command == "scene_transaction_status") {
     RequireExactObjectSize(root, 3U, "scene commit command");
     auto transaction = scene::DecodeCanonicalSceneTransactionRequest(
         content_identity::canonical_json(RequiredMember(root, "transaction")));
     return {
-        CommandKind::kSceneCommit,
+        command == "scene_commit" ? CommandKind::kSceneCommit
+                                  : CommandKind::kSceneTransactionStatus,
         transaction.request_context.request_id.value(),
         transaction.request_context.request_owner_epoch.value(),
         transaction.request_context.source_label,
@@ -2169,7 +2179,7 @@ public:
     // public pointer before replaying an incomplete Apply that must query its
     // Kernel-held admission claim or fence.
     static_cast<void>(ReconcileAndPublish());
-    if (TryRecoverIncompleteApply()) {
+    if (TryAdvanceApplyBeforeReconcile()) {
       static_cast<void>(ReconcileAndPublish());
     }
   }
@@ -2460,12 +2470,14 @@ private:
     const auto runtime = active_runtime_.Reconcile();
     last_runtime_ = runtime;
     kernel_apply_available_ = HasConvergedKernelApplyOwner(runtime);
-    if (kernel_apply_available_ &&
-        !scene_admission_reconciled_.load(std::memory_order_acquire)) {
+    if (kernel_apply_available_ && !scene_admission_reconciled_.exchange(
+                                       true, std::memory_order_acq_rel)) {
+      // Consume before I/O: a concurrent failed Commit may mark it dirty
+      // again, and must not be overwritten by this successful reconciliation.
       const auto reconciled =
           scene_owner_.ReconcileAuthoredSceneAdmissionClaims();
-      if (reconciled.ok()) {
-        scene_admission_reconciled_.store(true, std::memory_order_release);
+      if (!reconciled.ok()) {
+        scene_admission_reconciled_.store(false, std::memory_order_release);
       }
     }
     const auto bundle_id =
@@ -2634,7 +2646,8 @@ private:
     try {
       SubmitCellAdmissionReadiness(closed);
     } catch (...) {
-      // Withhold renewal as well; Kernel liveness independently expires.
+      // Kernel readiness remains unavailable. Independent Runner presence
+      // renewal must continue even when this publication cannot be delivered.
     }
   }
 
@@ -2679,6 +2692,26 @@ private:
     if (config_.program_runner_liveness_socket.empty()) {
       return;
     }
+    // Verify immutable product policy on the publication lane. Even a cached
+    // package lookup shares its lock with cold verification during Apply and
+    // must never run on the heartbeat lane.
+    const auto &retained_policy = deployment::
+        native_execution_runtime_contract::manager_liveness_policy();
+    for (const auto &row : snapshot.runtime.plan.runtime_units) {
+      if (row.process_adapter_contract_id !=
+          deployment::native_execution_runtime_contract::
+              kProcessAdapterContractId)
+        continue;
+      const auto product = verified_package_.runtime_unit_product(
+          *snapshot.active_bundle, row.runtime_unit_id);
+      Require(product.has_value() &&
+                  product->retained_bundle_id() ==
+                      snapshot.active_bundle->retained_bundle_id() &&
+                  product->product_identity() == row.product_identity &&
+                  product->manager_liveness_policy().has_value() &&
+                  *product->manager_liveness_policy() == retained_policy,
+              "active native runtime has no exact retained liveness policy");
+    }
     bool wake = false;
     {
       std::lock_guard lock(manager_liveness_lane_mutex_);
@@ -2716,36 +2749,25 @@ private:
 
   void TryRenewNativeManagerLiveness(
       const NativeManagerLivenessSnapshot &snapshot, const bool forced_closed,
-      const std::uint64_t readiness_barrier) noexcept {
+      const std::uint64_t readiness_barrier, const bool allow_native) noexcept {
     const auto &runtime = snapshot.runtime;
     const auto &active_bundle = *snapshot.active_bundle;
-    const auto now_ns = ElapsedNs();
-    if (!manager_liveness_retry_gate_.attempt_allowed(now_ns)) {
-      return;
-    }
     std::optional<core::ProgramCycleStatusDTO> probed_cycle_status;
-    using BatchProgress = component_manager::detail::ManagerLivenessBatchProgress;
+    using BatchProgress =
+        component_manager::detail::ManagerLivenessBatchProgress;
     auto native_batch = BatchProgress::kNotStarted;
     const auto record_attempt_failure = [&] {
-      manager_liveness_retry_gate_.RecordAttemptFailure(native_batch, ElapsedNs(),
-          static_cast<std::uint64_t>(deployment::native_execution_runtime_contract::manager_liveness_policy().expiry_timeout_ns));
+      manager_liveness_retry_gate_.RecordAttemptFailure(
+          native_batch, ElapsedNs(),
+          static_cast<std::uint64_t>(
+              deployment::native_execution_runtime_contract::
+                  manager_liveness_policy()
+                      .expiry_timeout_ns));
     };
     try {
       const auto runner = ProbeProgramRunnerLiveness(
           config_.program_runner_liveness_socket, admission_.cell_id());
       probed_cycle_status = runner.program_cycle_status;
-      const auto probed_readiness = BuildCellAdmissionReadiness(
-          runtime, *probed_cycle_status, snapshot.unsettled_effect_count,
-          forced_closed);
-      if (last_submitted_readiness_.has_value() &&
-          *last_submitted_readiness_ != probed_readiness) {
-        // Close first so a later renewal/submission failure cannot leave the
-        // previous optimistic reduction installed.
-        SubmitFailClosedReadiness(probed_cycle_status);
-        Require(last_submitted_readiness_.has_value() &&
-                    !last_submitted_readiness_->program_cycle_status_current,
-                "Kernel could not be closed before a readiness transition");
-      }
       std::vector<core::RequiredManagerLivenessReceiverDTO> native_receivers;
       native_receivers.reserve(runtime.plan.runtime_units.size());
       const auto &retained_policy = deployment::
@@ -2761,17 +2783,6 @@ private:
         if (observation == nullptr || observation->runtime_epoch().empty()) {
           throw std::runtime_error(
               "required native liveness receiver is not observable");
-        }
-        const auto product = verified_package_.runtime_unit_product(
-            active_bundle, row.runtime_unit_id);
-        if (!product.has_value() ||
-            product->retained_bundle_id() !=
-                active_bundle.retained_bundle_id() ||
-            product->product_identity() != row.product_identity ||
-            !product->manager_liveness_policy().has_value() ||
-            *product->manager_liveness_policy() != retained_policy) {
-          throw std::runtime_error(
-              "active native runtime has no exact retained liveness policy");
         }
         native_receivers.push_back(core::RequiredManagerLivenessReceiverDTO{
             row.runtime_unit_id,
@@ -2810,6 +2821,33 @@ private:
             "Manager cannot mint the exact native liveness required set");
       }
       ++manager_heartbeat_sequence_;
+      // Renew the independent Runner before any native retry/backoff or
+      // readiness work. Apply may deliberately retire a native receiver;
+      // that is not evidence that this Manager process has disappeared.
+      auto runner_renewal = RenewProgramRunnerLiveness(
+          config_.program_runner_liveness_socket, runner, required_set,
+          manager_heartbeat_sequence_, std::nullopt);
+      Require(IsCurrentProgramRunnerOwner(runner_renewal.program_cycle_status,
+                                          runner.runtime_epoch),
+              "Program cycle is not issued by the current Program Runner");
+      probed_cycle_status = runner_renewal.program_cycle_status;
+      if (!allow_native ||
+          !manager_liveness_retry_gate_.attempt_allowed(ElapsedNs())) {
+        SubmitFailClosedReadiness(probed_cycle_status);
+        return;
+      }
+      const auto probed_readiness = BuildCellAdmissionReadiness(
+          runtime, *probed_cycle_status, snapshot.unsettled_effect_count,
+          forced_closed);
+      if (last_submitted_readiness_.has_value() &&
+          *last_submitted_readiness_ != probed_readiness &&
+          !IsSameProgramAdmissionProgress(*last_submitted_readiness_,
+                                          probed_readiness)) {
+        SubmitFailClosedReadiness(probed_cycle_status);
+        Require(last_submitted_readiness_.has_value() &&
+                    !last_submitted_readiness_->program_cycle_status_current,
+                "Kernel could not be closed before a readiness transition");
+      }
       const core::ManagerHeartbeatDTO heartbeat{
           required_set.cell_id,
           required_set.manager_runtime_unit_id,
@@ -2860,7 +2898,8 @@ private:
                  .durable_public_pointer_content_digest,
              required_set, retained_policy, heartbeat, reconciliation});
       }
-      if (!requests.empty()) native_batch = BatchProgress::kInFlight;
+      if (!requests.empty())
+        native_batch = BatchProgress::kInFlight;
       const auto responses =
           requests.empty()
               ? std::vector<core::ManagerLivenessObservationDTO>{}
@@ -2897,12 +2936,18 @@ private:
       native_batch = BatchProgress::kValidated;
       if (!reconciliation.has_value()) {
         throw std::runtime_error(
-            "Program Runner liveness requires converged reconciliation");
+            "Execution readiness requires converged reconciliation");
       }
-      const auto runner_renewal = RenewProgramRunnerLiveness(
-          config_.program_runner_liveness_socket, runner, required_set,
-          manager_heartbeat_sequence_,
-          reconciliation->reconciliation_evidence_digest);
+      if (runner_renewal.observation.status.state !=
+          core::ManagerLivenessStateDTO::kCurrent) {
+        Require(manager_heartbeat_sequence_ <
+                    core::kMaximumManagerLivenessCounter,
+                "Manager heartbeat sequence is exhausted");
+        runner_renewal = RenewProgramRunnerLiveness(
+            config_.program_runner_liveness_socket, runner, required_set,
+            ++manager_heartbeat_sequence_,
+            reconciliation->reconciliation_evidence_digest);
+      }
       // The Program Runner owns cycle progression. A Start or terminal event
       // may legitimately occur between the preflight probe and this renewal;
       // require the private receiver's exact process identity and publish the
@@ -2922,14 +2967,9 @@ private:
       const auto readiness = BuildCellAdmissionReadiness(
           runtime, *probed_cycle_status, snapshot.unsettled_effect_count,
           forced_closed);
-      if (last_submitted_readiness_.has_value() &&
-          *last_submitted_readiness_ != readiness &&
-          last_submitted_readiness_->program_cycle_status_current) {
-        SubmitFailClosedReadiness(probed_cycle_status);
-        Require(last_submitted_readiness_.has_value() &&
-                    !last_submitted_readiness_->program_cycle_status_current,
-                "Kernel could not be closed before owner renewal publication");
-      }
+      // Renewal and owner identity are now validated. Publish the complete
+      // reduction atomically; an artificial close/reopen here would expose a
+      // false outage to already-running Program children.
       if (!last_submitted_readiness_.has_value() ||
           *last_submitted_readiness_ != readiness) {
         {
@@ -3018,6 +3058,8 @@ private:
             .heartbeat_period_ns);
     std::unique_lock lock(manager_liveness_lane_mutex_);
     while (!manager_liveness_lane_stop_) {
+      const auto next_heartbeat =
+          std::chrono::steady_clock::now() + heartbeat_period;
       const auto snapshot = manager_liveness_snapshot_;
       const auto superseded_publication =
           manager_liveness_superseded_publication_;
@@ -3025,9 +3067,10 @@ private:
       const auto readiness_barrier = manager_liveness_readiness_barrier_;
       const auto wake_generation = manager_liveness_wake_generation_;
       lock.unlock();
-      if (snapshot.has_value() && (!superseded_publication.has_value() ||
-                                   snapshot->runtime.plan.active_publication !=
-                                       *superseded_publication)) {
+      if (snapshot.has_value()) {
+        const auto allow_native = !superseded_publication.has_value() ||
+                                  snapshot->runtime.plan.active_publication !=
+                                      *superseded_publication;
         if (!manager_liveness_attempted_publication_.has_value() ||
             *manager_liveness_attempted_publication_ !=
                 snapshot->runtime.plan.active_publication) {
@@ -3038,13 +3081,13 @@ private:
               snapshot->runtime.plan.active_publication;
         }
         TryRenewNativeManagerLiveness(*snapshot, forced_closed,
-                                      readiness_barrier);
+                                      readiness_barrier, allow_native);
       } else {
         SubmitFailClosedReadiness();
       }
       lock.lock();
-      static_cast<void>(manager_liveness_lane_condition_.wait_for(
-          lock, heartbeat_period, [&] {
+      static_cast<void>(manager_liveness_lane_condition_.wait_until(
+          lock, next_heartbeat, [&] {
             return manager_liveness_lane_stop_ ||
                    manager_liveness_wake_generation_ != wake_generation;
           }));
@@ -3090,10 +3133,11 @@ private:
   void TryPeriodicReconcile() noexcept {
     try {
       RequireCurrentPackageGeneration();
-      if (TryRecoverIncompleteApply()) {
+      if (TryAdvanceApplyBeforeReconcile()) {
         static_cast<void>(ReconcileAndPublish());
+      } else {
+        TrySubmitFailClosedReadiness();
       }
-      static_cast<void>(ReconcileAndPublish());
     } catch (const ManagerPackageGenerationRestartRequired &error) {
       TrySubmitFailClosedReadiness();
       PublishPackageRestartRequired();
@@ -3110,9 +3154,16 @@ private:
     }
   }
 
-  bool TryRecoverIncompleteApply() noexcept {
+  bool TryAdvanceApplyBeforeReconcile() noexcept {
     try {
-      return named_apply_.RecoverIncompleteApply().has_value();
+      const auto result = named_apply_.RecoverIncompleteApply();
+      // During replacement the public pointer can still name the withdrawn
+      // predecessor. Only Apply owns that transition; active reconciliation
+      // must not try to restore or assess the old product against the new
+      // child.
+      return !result ||
+             result->state ==
+                 component_manager::ManagerNamedApplyResultState::kSucceeded;
     } catch (const std::exception &error) {
       std::cerr << "Manager daemon incomplete Apply recovery remains "
                    "fail-closed: "
@@ -3626,6 +3677,12 @@ private:
               command.expected_admission_generation,
               command.parent_authoring_claim,
           });
+          TrySendResponse(client.get(), ApplyResponse(command, result));
+          if (result.state ==
+              component_manager::ManagerNamedApplyResultState::kPending) {
+            TrySubmitFailClosedReadiness();
+            return false;
+          }
           // Apply durability is authoritative. A source-publication failure is
           // logged and retried by the periodic strand; it cannot turn a
           // successful Apply into a second mutation on client retry.
@@ -3637,7 +3694,6 @@ private:
                          "Apply: "
                       << error.what() << '\n';
           }
-          TrySendResponse(client.get(), ApplyResponse(command, result));
         } catch (const component_manager::ManagerNamedApplyBusyError &error) {
           TrySendResponse(
               client.get(),
@@ -3675,7 +3731,23 @@ private:
       case CommandKind::kSceneCommit: {
         Require(command.scene_transaction.has_value(),
                 "decoded scene command lacks its transaction");
-        const auto result = scene_owner_.Commit(*command.scene_transaction);
+        const auto result = [&] {
+          try {
+            const auto committed =
+                scene_owner_.Commit(*command.scene_transaction);
+            if (!committed.success) {
+              scene_admission_reconciled_.store(false,
+                                                std::memory_order_release);
+            }
+            return committed;
+          } catch (...) {
+            // A durable outcome may precede a lost Kernel release reply.
+            // Retry settlement through existing reconciliation, not result
+            // reads.
+            scene_admission_reconciled_.store(false, std::memory_order_release);
+            throw;
+          }
+        }();
         if (result.success) {
           // The durable scene result remains authoritative if this projection
           // write fails. Periodic reconciliation republishes it, and exact
@@ -3684,6 +3756,22 @@ private:
           TryPublishLogicalScene();
         }
         TrySendResponse(client.get(), SceneCommitResponse(command, result));
+        return false;
+      }
+      case CommandKind::kSceneTransactionStatus: {
+        Require(command.scene_transaction.has_value(),
+                "Scene result lookup lacks its request");
+        const auto result =
+            scene_owner_.ReadCommitResult(*command.scene_transaction);
+        TrySendResponse(
+            client.get(),
+            CanonicalValue(CanonicalValue::Object{
+                {"api_version", CanonicalValue(std::string(
+                                    kManagerCommandResponseApiVersion))},
+                {"ok", CanonicalValue(true)},
+                {"result", result.has_value()
+                               ? SceneCommitResponse(command, *result)
+                               : CanonicalValue(nullptr)}}));
         return false;
       }
       case CommandKind::kSceneOwnerRead: {

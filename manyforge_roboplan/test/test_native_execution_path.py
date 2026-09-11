@@ -241,6 +241,7 @@ def _submit_native_cclc_routes(
     request_prefix: str = "process.route",
 ) -> None:
     client = CCLCOpenRequestClient(execution_run_root, timeout_seconds=5.0)
+    admission = CellAdmissionClient(execution_run_root, timeout_seconds=5.0)
 
     def context(request_id: str, owner_epoch: str) -> dict[str, Any]:
         return {
@@ -272,6 +273,9 @@ def _submit_native_cclc_routes(
                     f"{request_prefix}.{domain_id}", owner_epoch
                 ),
                 "expected_retained_bundle_id": template_set["retained_bundle_id"],
+                "expected_admission_generation": admission.get()[
+                    "admission_generation"
+                ],
                 "expected_graph_revision": template_set["graph_revision"],
                 "desired_configuration": template["desired_configuration"],
                 "expected_active_control_configuration": template[
@@ -379,7 +383,9 @@ def _start_host(
     if fake_worker_marker is not None:
         environment["MANYFORGE_FAKE_WORKER_MARKER"] = str(fake_worker_marker)
     if fake_worker_failure_gate is not None:
-        environment["MANYFORGE_FAKE_WORKER_FAILURE_GATE"] = str(fake_worker_failure_gate)
+        environment["MANYFORGE_FAKE_WORKER_FAILURE_GATE"] = str(
+            fake_worker_failure_gate
+        )
     if reconciliation_test_marker is not None:
         environment["MANYFORGE_RECONCILIATION_TEST_MARKER"] = str(
             reconciliation_test_marker
@@ -1264,7 +1270,9 @@ def test_reconciliation_exception_uses_caught_host_failure_path(
 def test_private_program_capture_is_claim_bound_and_cannot_mint_node_effects(
     tmp_path: Path,
 ) -> None:
-    from manyforge_program_runner.execution_transport import ProgramRunnerExecutionTransport
+    from manyforge_program_runner.execution_transport import (
+        ProgramRunnerExecutionTransport,
+    )
 
     fixture_root = tmp_path / "fixture"
     shutil.copytree(_required_path("MANYFORGE_I6_NATIVE_FIXTURE_ROOT"), fixture_root)
@@ -1283,30 +1291,39 @@ def test_private_program_capture_is_claim_bound_and_cannot_mint_node_effects(
             "program_runner_owner_epoch": "standalone-admission-fixture.program-runner",
             "claim_generation": 1,
             "program_run_id": "program-capture.1",
-            **{key: manifest[key] for key in (
-                "program_id", "program_revision", "program_binding_id",
-                "retained_bundle_id", "graph_revision",
-            )},
+            **{
+                key: manifest[key]
+                for key in (
+                    "program_id",
+                    "program_revision",
+                    "program_binding_id",
+                    "retained_bundle_id",
+                    "graph_revision",
+                )
+            },
         }
         with pytest.raises(HeadlessApiError) as unclaimed:
             client.register_program_run_capture(capture)
         assert unclaimed.value.details["reason"] == "program_execution_capture_stale"
         current = admission.get()
         assert current["authoring_allowed"] is True
-        claim = admission.acquire({
-            "claim_kind": "program_cycle", "owner_role": "program_runner",
-            "owner_epoch": capture["program_runner_owner_epoch"],
-            "owner_transaction_id": capture["program_run_id"],
-            "request_id": "claim.program-capture.1",
-            "request_payload_digest": "sha256:" + "a" * 64,
-            "expected_admission_generation": current["admission_generation"],
-            "scope": {"resources": [], "configurations": []},
-            "program_cycle_evidence": {
-                "draft_program_revision": capture["program_revision"],
-                "applied_program_revision": capture["program_revision"],
-            },
-            "intervention_evidence": None,
-        })
+        claim = admission.acquire(
+            {
+                "claim_kind": "program_cycle",
+                "owner_role": "program_runner",
+                "owner_epoch": capture["program_runner_owner_epoch"],
+                "owner_transaction_id": capture["program_run_id"],
+                "request_id": "claim.program-capture.1",
+                "request_payload_digest": "sha256:" + "a" * 64,
+                "expected_admission_generation": current["admission_generation"],
+                "scope": {"resources": [], "configurations": []},
+                "program_cycle_evidence": {
+                    "draft_program_revision": capture["program_revision"],
+                    "applied_program_revision": capture["program_revision"],
+                },
+                "intervention_evidence": None,
+            }
+        )
         capture["claim_generation"] = claim["claim_generation"]
         accepted = client.register_program_run_capture(capture)
         assert client.register_program_run_capture(capture) == accepted
@@ -1319,41 +1336,116 @@ def test_private_program_capture_is_claim_bound_and_cannot_mint_node_effects(
             with pytest.raises(HeadlessApiError):
                 client.register_program_run_capture({**capture, **changed})
 
+        # Both authored groups contain the same logical root. Exercise the
+        # real control socket: one union acceptance, exact retry, one release.
+        kernel = KernelClient(client)
+        before = kernel.read_program_execution_scope(capture["program_run_id"])
+        selection = {
+            "schema_version": "manyforge.program_execution_selection.v2",
+            **{
+                key: capture[key]
+                for key in (
+                    "program_runner_owner_epoch",
+                    "claim_generation",
+                    "program_run_id",
+                )
+            },
+            "group_ids": ["selection.a", "selection.b", "selection.a"],
+            "request_context": {
+                "request_id": "selection.stop.1",
+                "request_owner_epoch": identity["owner_epoch"],
+                "source_label": "native-capture-test",
+                "correlation_id": None,
+            },
+        }
+        stopped = kernel.stop_program_selection(selection)
+        assert stopped["group_ids"] == selection["group_ids"]
+        assert stopped["selection_error"] is None
+        assert stopped["widened_node_indices"] == []
+        assert stopped["state"]["held_node_indices"] == [0]
+        assert stopped["state"]["pending_effects"] == []
+        revision = stopped["state"]["selection_revision"]
+        assert revision == before["selection_revision"] + 1
+        replay = kernel.stop_program_selection(selection)
+        assert replay["replay_status"] == "replayed_exact"
+        assert replay["state"]["selection_revision"] == revision
+        released = kernel.release_program_selection(
+            {
+                **selection,
+                "request_context": {
+                    **selection["request_context"],
+                    "request_id": "selection.resume.1",
+                },
+            },
+            revision,
+        )
+        assert released["held_node_indices"] == []
+
         direct = client.targets()["targets"]["direct_control"]
         observation = client.observation()["observation"]["targets"][0]
         operation = _direct_control_joint_operation(
-            identity, direct, request_id="forged-node-effect",
+            identity,
+            direct,
+            request_id="forged-node-effect",
             positions_rad=list(observation["positions_si"]),
         )
-        operation.update({key: capture[key] for key in (
-            "program_id", "program_revision", "program_binding_id", "program_run_id",
-        )})
+        operation.update(
+            {
+                key: capture[key]
+                for key in (
+                    "program_id",
+                    "program_revision",
+                    "program_binding_id",
+                    "program_run_id",
+                )
+            }
+        )
         operation["participants"][0]["execution_scope"] = {
-            "node_instance_id": "root", "node_attempt_id": "root.1",
+            "node_instance_id": "root",
+            "node_attempt_id": "root.1",
         }
-        # The sealed fixture has a logical root only. A valid claim and a
+        # The sealed fixture's root is logical. A valid claim and a
         # physically valid target cannot turn that node into an effect owner.
         with pytest.raises(HeadlessApiError) as logical:
             client.submit(operation)
         assert logical.value.details["reason"] == "program_execution_scope_unknown"
         raw = ExecutionCommandClient(run_root, timeout_seconds=2.0)
-        denied = raw._exchange({
-            "api_version": EXECUTION_COMMAND_VERSION, "command": "submit",
-            "operation": operation,
-            "attribution": {"transport": "http", "assurance": "unverified", "principal_id": None},
-        })
+        denied = raw._exchange(
+            {
+                "api_version": EXECUTION_COMMAND_VERSION,
+                "command": "submit",
+                "operation": operation,
+                "attribution": {
+                    "transport": "http",
+                    "assurance": "unverified",
+                    "principal_id": None,
+                },
+            }
+        )
         assert denied["ok"] is False
         assert denied["error"]["code"] == "execution_command_invalid"
-        assert "Program origin requires the private owner-client path" in denied["error"]["message"]
+        assert (
+            "Program origin requires the private owner-client path"
+            in denied["error"]["message"]
+        )
         without_origin = copy.deepcopy(operation)
         without_origin["participants"][0].pop("execution_scope")
-        missing = raw._exchange({
-            "api_version": EXECUTION_COMMAND_VERSION, "command": "submit",
-            "operation": without_origin,
-            "attribution": {"transport": "http", "assurance": "unverified", "principal_id": None},
-        })
+        missing = raw._exchange(
+            {
+                "api_version": EXECUTION_COMMAND_VERSION,
+                "command": "submit",
+                "operation": without_origin,
+                "attribution": {
+                    "transport": "http",
+                    "assurance": "unverified",
+                    "principal_id": None,
+                },
+            }
+        )
         assert missing["ok"] is False
-        assert missing["error"]["details"]["reason"] == "program_execution_scope_missing"
+        assert (
+            missing["error"]["details"]["reason"] == "program_execution_scope_missing"
+        )
         # A different run cannot evade the capture by dropping its origin.
         without_origin["program_run_id"] = "unclaimed-foreign-run"
         foreign = raw.submit(
@@ -1361,9 +1453,13 @@ def test_private_program_capture_is_claim_bound_and_cannot_mint_node_effects(
             trusted_principal_id=None,
         )
         assert foreign["ok"] is False
-        assert foreign["error"]["details"]["reason"] == "program_execution_scope_missing"
+        assert (
+            foreign["error"]["details"]["reason"] == "program_execution_scope_missing"
+        )
         forged_direct = _direct_control_joint_operation(
-            identity, direct, request_id="forged-direct-product",
+            identity,
+            direct,
+            request_id="forged-direct-product",
             positions_rad=list(observation["positions_si"]),
         )
         forged_direct["program_id"] = "forged-direct-program"
@@ -1374,11 +1470,14 @@ def test_private_program_capture_is_claim_bound_and_cannot_mint_node_effects(
         assert forged["ok"] is False
         assert forged["error"]["details"]["reason"] == "direct_control_product_mismatch"
         scoped_direct = _direct_control_joint_operation(
-            identity, direct, request_id="scoped-direct-product",
+            identity,
+            direct,
+            request_id="scoped-direct-product",
             positions_rad=list(observation["positions_si"]),
         )
         scoped_direct["participants"][0]["execution_scope"] = {
-            "node_instance_id": "root", "node_attempt_id": "root.1",
+            "node_instance_id": "root",
+            "node_attempt_id": "root.1",
         }
         with pytest.raises(HeadlessApiError) as scoped:
             client.submit(scoped_direct)
@@ -1386,29 +1485,47 @@ def test_private_program_capture_is_claim_bound_and_cannot_mint_node_effects(
         mixed = copy.deepcopy(operation)
         mixed["participants"].append(without_origin["participants"][0])
         mixed["coordination_policy"] = "coordinated_all"
-        mixed_result = raw._exchange({
-            "api_version": EXECUTION_COMMAND_VERSION, "command": "submit",
-            "operation": mixed,
-            "attribution": {"transport": "internal", "assurance": "unverified", "principal_id": None},
-        })
+        mixed_result = raw._exchange(
+            {
+                "api_version": EXECUTION_COMMAND_VERSION,
+                "command": "submit",
+                "operation": mixed,
+                "attribution": {
+                    "transport": "internal",
+                    "assurance": "unverified",
+                    "principal_id": None,
+                },
+            }
+        )
         assert mixed_result["ok"] is False
-        assert mixed_result["error"]["details"]["reason"] == "program_execution_scope_missing"
-        stopped = client.stop_program_run({
-            "request_context": {
-                "request_id": "stop.program-capture.1",
-                "request_owner_epoch": identity["owner_epoch"],
-                "source_label": "native-capture-test", "correlation_id": None,
-            },
-            "program_run_id": capture["program_run_id"],
-            "reason": "Stop before any node effect",
-        })
+        assert (
+            mixed_result["error"]["details"]["reason"]
+            == "program_execution_scope_missing"
+        )
+        stopped = client.stop_program_run(
+            {
+                "request_context": {
+                    "request_id": "stop.program-capture.1",
+                    "request_owner_epoch": identity["owner_epoch"],
+                    "source_label": "native-capture-test",
+                    "correlation_id": None,
+                },
+                "program_run_id": capture["program_run_id"],
+                "reason": "Stop before any node effect",
+            }
+        )
         assert stopped["ok"] is True
         assert client.register_program_run_capture(capture) == accepted
         with pytest.raises(HeadlessApiError) as held:
             client.submit(operation)
         assert held.value.details["reason"] == "program_run_stop_fence_active"
         with sqlite3.connect(state_root / "operation-journal.sqlite3") as database:
-            assert database.execute("SELECT COUNT(*) FROM operation_snapshots").fetchone()[0] == 0
+            assert (
+                database.execute("SELECT COUNT(*) FROM operation_snapshots").fetchone()[
+                    0
+                ]
+                == 0
+            )
     finally:
         _stop_host(process)
 
@@ -1842,7 +1959,7 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
         )
         motion_descriptor = direct["target_descriptor"]
         assert motion_descriptor["schema_version"] == (
-            "manyforge.manual_control_motion_descriptor.v3"
+            "manyforge.manual_control_motion_descriptor.v4"
         )
         assert (
             motion_descriptor["controllable_component_id"]
@@ -1874,18 +1991,14 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
         assert operational_limits[0]["deployment_max_acceleration_rad_s2"] == (
             pytest.approx(2.5)
         )
-        assert operational_limits[0]["deployment_max_jerk_rad_s3"] == (
-            pytest.approx(10.0)
-        )
+        assert operational_limits[0]["deployment_max_jerk_rad_s3"] is None
         assert operational_limits[0]["effective_max_velocity_rad_s"] == (
             pytest.approx(1.5)
         )
         assert operational_limits[0]["effective_max_acceleration_rad_s2"] == (
             pytest.approx(2.5)
         )
-        assert operational_limits[0]["effective_max_jerk_rad_s3"] == (
-            pytest.approx(10.0)
-        )
+        assert operational_limits[0]["effective_max_jerk_rad_s3"] is None
         assert all(
             limit["deployment_max_velocity_rad_s"] is None
             and limit["deployment_max_acceleration_rad_s2"] is None
@@ -2181,7 +2294,7 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
                 joint_names=("arm_joints",),
                 positions=(0.05,),
             )
-        assert rejected.value.code == "execution_rejected"
+        assert rejected.value.code == "execution_rejected", vars(rejected.value)
         assert rejected.value.status_code == 400
         assert recording.last_submission is not None
         raw_rejection = raw_api.post(
@@ -2472,9 +2585,10 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
             "program_run_id": "n3-program-run-1",
             "target_role_id": manifest["target_role_id"],
         }
-        assert current_query.query_operation(controlled_query)["operation"][
-            "operation_id"
-        ] == controlled_id
+        assert (
+            current_query.query_operation(controlled_query)["operation"]["operation_id"]
+            == controlled_id
+        )
         assert stopped["active_stop_id"] == stop_accepted["accepted"]["stop_id"]
         assert stop_acceptance_elapsed_s < 0.5
         projected_stop = headless.execution_diagnostics()["status"]["cell_stop_action"]
@@ -2904,19 +3018,41 @@ def test_gripper_only_motion_updates_the_shared_native_observation_stream(
                 assert gripper["source_joint_names"] == [
                     resource["source_coordinate_name"]
                 ]
-                request = OperationIntentRequest.model_validate(
-                    _direct_control_gripper_operation(
-                        status,
-                        request_id=f"request.gripper.observation.{attempt}",
-                        position=goal,
-                    )
+                operation = _direct_control_gripper_operation(
+                    status,
+                    request_id=f"request.gripper.observation.{attempt}",
+                    position=goal,
                 )
+                if attempt == 0:
+                    operation["participants"][0]["payload"]["caller_options"][0][
+                        "value_s"
+                    ] = 1.0
+                request = OperationIntentRequest.model_validate(operation)
                 preview = client.preview_capability_command(
                     request, trusted_principal_id=None
                 )
                 assert preview["ok"] is True, preview
                 accepted = client.submit(request, trusted_principal_id=None)
                 assert accepted["ok"] is True, accepted
+                if attempt == 0:
+                    assert (
+                        client.read(accepted["accepted"]["operation_id"])["resident"]
+                        is True
+                    )
+                    arm_preview = OperationIntentRequest.model_validate(
+                        _direct_control_joint_operation(
+                            status,
+                            status["direct_control"],
+                            request_id="preview.independent.arm",
+                            positions_rad=list(motion["positions_si"]),
+                        )
+                    )
+                    # Planning for the idle arm must not be blocked by the
+                    # independent gripper command. This never approves motion.
+                    planned = client.preview_motion(
+                        arm_preview, trusted_principal_id=None
+                    )
+                    assert planned["ok"] is True, planned
                 latest = first
                 while latest["targets"][1]["positions_si"] != pytest.approx([goal]):
                     cursor = {
@@ -2991,6 +3127,60 @@ def test_cell_admission_crosses_real_execution_seqpacket_surface(
             "ok",
         }
         assert first["command"] == "cell_admission_get"
+
+        status = client.diagnostics()["status"]
+        direct = status["direct_control"]
+        operation = _direct_control_joint_operation(
+            status,
+            direct,
+            request_id="handover.query",
+            positions_rad=list(direct["observed_state"]["positions_rad"]),
+        )
+        proof = client.read_manual_handover(
+            OperationIntentRequest.model_validate(operation),
+            trusted_principal_id=None,
+        )
+        assert proof["ok"] is True and proof["handover"] is None
+        assert proof["availability"] == {
+            "available": True,
+            "cleanup_required": False,
+            "unavailable_reason": None,
+        }
+        # A supplied context is only a precondition. Reading cannot acquire a
+        # claim or invent a held parent, including the valid initial revision 0.
+        operation["manual_handover"] = {
+            "program_runner_owner_epoch": "absent.runner",
+            "program_run_id": "absent.parent",
+            "claim_generation": 1,
+            "selection_revision": 0,
+        }
+        proof = client.read_manual_handover(
+            OperationIntentRequest.model_validate(operation),
+            trusted_principal_id=None,
+        )
+        assert proof["ok"] is True and proof["handover"] is None
+        for field, value in (
+            ("selection_revision", True),
+            ("selection_revision", -1),
+            ("selection_revision", float(2**53)),
+            ("extra", 0),
+        ):
+            malformed_operation = copy.deepcopy(operation)
+            malformed_operation["manual_handover"][field] = value
+            invalid = client._exchange(
+                {
+                    "api_version": EXECUTION_COMMAND_VERSION,
+                    "command": "read_manual_handover",
+                    "operation": malformed_operation,
+                    "attribution": {
+                        "transport": "http",
+                        "assurance": "unverified",
+                        "principal_id": None,
+                    },
+                }
+            )
+            assert invalid["ok"] is False
+        assert client._exchange(get) == first
 
         malformed = client._exchange(
             {
@@ -3324,7 +3514,8 @@ def test_slow_preview_cannot_delay_the_standard_stop_path(tmp_path: Path) -> Non
 
 @pytest.mark.parametrize("stopped_target", ["arm", "gripper", "both"])
 def test_native_arm_and_gripper_scoped_stop_do_not_cross_lifecycles(
-    tmp_path: Path, stopped_target: str,
+    tmp_path: Path,
+    stopped_target: str,
 ) -> None:
     fixture_root = tmp_path / "fixture"
     shutil.copytree(_required_path("MANYFORGE_I6_NATIVE_FIXTURE_ROOT"), fixture_root)
@@ -3340,15 +3531,20 @@ def test_native_arm_and_gripper_scoped_stop_do_not_cross_lifecycles(
         positions[0] += 0.4
         intents = {
             "arm": _direct_control_joint_operation(
-                status, status["direct_control"], request_id="independent-arm",
+                status,
+                status["direct_control"],
+                request_id="independent-arm",
                 positions_rad=positions,
             ),
             "gripper": _direct_control_gripper_operation(
-                status, request_id="independent-gripper",
+                status,
+                request_id="independent-gripper",
                 position=status["direct_control_gripper"]["resource"]["max_position"],
             ),
         }
-        intents["arm"]["participants"][0]["payload"]["speed_profile"]["velocity_scale"] = 0.1
+        intents["arm"]["participants"][0]["payload"]["speed_profile"][
+            "velocity_scale"
+        ] = 0.1
         # This tests explicit owner Reset, not the manual-control host's
         # automatic terminal retirement. Give each independent operation a
         # non-manual run identity so both owners cannot race the same Reset.
@@ -3377,19 +3573,26 @@ def test_native_arm_and_gripper_scoped_stop_do_not_cross_lifecycles(
             operations[target] = response["accepted"]["operation_id"]
             wait_state(operations[target], {"executing"})
         if stopped_target == "both":
-            stopped = client.full_stop(FullStopIntentRequest.model_validate({
-                "request_context": {
-                    "request_id": "stop-both-participants",
-                    "request_owner_epoch": status["owner_epoch"],
-                    "source_label": "native-isolation-test",
-                },
-                "expected_stop_generation": 0,
-            }), trusted_principal_id=None)
+            stopped = client.full_stop(
+                FullStopIntentRequest.model_validate(
+                    {
+                        "request_context": {
+                            "request_id": "stop-both-participants",
+                            "request_owner_epoch": status["owner_epoch"],
+                            "source_label": "native-isolation-test",
+                        },
+                        "expected_stop_generation": 0,
+                    }
+                ),
+                trusted_principal_id=None,
+            )
             assert stopped["ok"] is True, stopped
             for operation_id in operations.values():
                 contained = wait_state(operation_id, {"stopped"})["operation"]
                 assert contained["active_stop_id"] == stopped["accepted"]["stop_id"]
-                assert all(row["terminal_error"] is None for row in contained["participants"])
+                assert all(
+                    row["terminal_error"] is None for row in contained["participants"]
+                )
             return
         other = "gripper" if stopped_target == "arm" else "arm"
         before = client.read(operations[other])["operation"]
@@ -3400,14 +3603,23 @@ def test_native_arm_and_gripper_scoped_stop_do_not_cross_lifecycles(
             "request_owner_epoch": status["owner_epoch"],
             "source_label": "native-isolation-test",
         }
-        stopped = client.stop(StopIntentRequest.model_validate({
-            "request_context": context,
-            "operations": [{
-                "operation_id": operations[stopped_target],
-                "expected_operation_revision": selected["operation_revision"],
-                "expected_stop_generation": 0,
-            }],
-        }), trusted_principal_id=None)
+        stopped = client.stop(
+            StopIntentRequest.model_validate(
+                {
+                    "request_context": context,
+                    "operations": [
+                        {
+                            "operation_id": operations[stopped_target],
+                            "expected_operation_revision": selected[
+                                "operation_revision"
+                            ],
+                            "expected_stop_generation": 0,
+                        }
+                    ],
+                }
+            ),
+            trusted_principal_id=None,
+        )
         assert stopped["ok"] is True, stopped
         selected = wait_state(operations[stopped_target], {"stopped"})["operation"]
         continued = client.read(operations[other])["operation"]
@@ -3416,12 +3628,20 @@ def test_native_arm_and_gripper_scoped_stop_do_not_cross_lifecycles(
         assert continued["participants"][0]["controller_goal_generation"] == (
             before["participants"][0]["controller_goal_generation"]
         )
-        reset = client.reset(OperationControlRequest.model_validate({
-            "request_context": {**context, "request_id": f"reset-only-{stopped_target}"},
-            "operation_id": operations[stopped_target],
-            "expected_operation_revision": selected["operation_revision"],
-            "reason": "retire only the stopped target",
-        }), trusted_principal_id=None)
+        reset = client.reset(
+            OperationControlRequest.model_validate(
+                {
+                    "request_context": {
+                        **context,
+                        "request_id": f"reset-only-{stopped_target}",
+                    },
+                    "operation_id": operations[stopped_target],
+                    "expected_operation_revision": selected["operation_revision"],
+                    "reason": "retire only the stopped target",
+                }
+            ),
+            trusted_principal_id=None,
+        )
         assert reset["ok"] is True, reset
         completed = wait_state(operations[other], {"completed"})["operation"]
         assert all(row["terminal_error"] is None for row in completed["participants"])
@@ -3431,9 +3651,9 @@ def test_native_arm_and_gripper_scoped_stop_do_not_cross_lifecycles(
         if other == "arm":
             assert observed["targets"][0]["positions_si"] == pytest.approx(positions)
         else:
-            assert observed["targets"][1]["positions_si"] == pytest.approx([
-                status["direct_control_gripper"]["resource"]["max_position"]
-            ])
+            assert observed["targets"][1]["positions_si"] == pytest.approx(
+                [status["direct_control_gripper"]["resource"]["max_position"]]
+            )
     finally:
         _stop_host(process)
 
@@ -3453,9 +3673,13 @@ def test_native_coordinated_planner_failure_cancels_arm_and_gripper_without_moti
     process = None
     try:
         process = _start_host(
-            fixture_root, state_root, run_root, manifest,
+            fixture_root,
+            state_root,
+            run_root,
+            manifest,
             candidate_worker=_required_path("MANYFORGE_ROBOPLAN_FAKE_WORKER"),
-            fake_worker_marker=marker, fake_worker_failure_gate=gate,
+            fake_worker_marker=marker,
+            fake_worker_failure_gate=gate,
         )
         client = ExecutionCommandClient(run_root, timeout_seconds=3.0)
         status = client.diagnostics()["status"]
@@ -3464,11 +3688,14 @@ def test_native_coordinated_planner_failure_cancels_arm_and_gripper_without_moti
         positions = list(status["direct_control"]["observed_state"]["positions_rad"])
         positions[0] += 0.1
         intent = _direct_control_joint_operation(
-            status, status["direct_control"], request_id="native-coordinated-failure",
+            status,
+            status["direct_control"],
+            request_id="native-coordinated-failure",
             positions_rad=positions,
         )
         tool = _direct_control_gripper_operation(
-            status, request_id="native-coordinated-failure",
+            status,
+            request_id="native-coordinated-failure",
             position=status["direct_control_gripper"]["resource"]["max_position"],
         )
         # Both actual native targets belong to this compiled Program binding.
@@ -3488,27 +3715,41 @@ def test_native_coordinated_planner_failure_cancels_arm_and_gripper_without_moti
             (intent["participants"], "independent"),
             (intent["participants"], "invented"),
         ):
-            rejected = client._exchange({
-                "api_version": EXECUTION_COMMAND_VERSION,
-                "attribution": client._request_attribution(None),
-                "command": "submit",
-                "operation": {**intent, "participants": participants,
-                              "coordination_policy": policy},
-            })
+            rejected = client._exchange(
+                {
+                    "api_version": EXECUTION_COMMAND_VERSION,
+                    "attribution": client._request_attribution(None),
+                    "command": "submit",
+                    "operation": {
+                        **intent,
+                        "participants": participants,
+                        "coordination_policy": policy,
+                    },
+                }
+            )
             assert rejected["ok"] is False, rejected
             assert not marker.exists()
         crossed = copy.deepcopy(intent)
         crossed["participants"][1]["action_span"] = {
-            "action_source": "system", "action_span_id": "span.wrong-run",
-            "program_run_id": "another-run", "node_instance_id": None,
-            "node_attempt_id": None, "parent_node_attempt_id": None,
+            "action_source": "system",
+            "action_span_id": "span.wrong-run",
+            "program_run_id": "another-run",
+            "node_instance_id": None,
+            "node_attempt_id": None,
+            "parent_node_attempt_id": None,
         }
-        rejected = client._exchange({
-            "api_version": EXECUTION_COMMAND_VERSION,
-            "attribution": client._request_attribution(None),
-            "command": "submit", "operation": crossed,
-        })
-        assert rejected["error"]["details"]["reason"] == "operation_action_span_run_mismatch"
+        rejected = client._exchange(
+            {
+                "api_version": EXECUTION_COMMAND_VERSION,
+                "attribution": client._request_attribution(None),
+                "command": "submit",
+                "operation": crossed,
+            }
+        )
+        assert (
+            rejected["error"]["details"]["reason"]
+            == "operation_action_span_run_mismatch"
+        )
         assert not marker.exists()
         accepted = client.submit(
             OperationIntentRequest.model_validate(intent), trusted_principal_id=None
@@ -3529,10 +3770,14 @@ def test_native_coordinated_planner_failure_cancels_arm_and_gripper_without_moti
         assert terminal["coordination_policy"] == "coordinated_all"
         assert len(terminal["participants"]) == 2
         assert all(row["state"] != "completed" for row in terminal["participants"])
-        errors = [row["terminal_error"] for row in terminal["participants"]
-                  if row["terminal_error"] is not None]
-        assert any(error["details"].get("reason") == "test_planner_failure"
-                   for error in errors), errors
+        errors = [
+            row["terminal_error"]
+            for row in terminal["participants"]
+            if row["terminal_error"] is not None
+        ]
+        assert any(
+            error["details"].get("reason") == "test_planner_failure" for error in errors
+        ), errors
         with client.open_observation_session() as stream:
             after = stream.next(None, threading.Event())["observation"]
         assert [row["positions_si"] for row in after["targets"]] == [
@@ -3547,7 +3792,8 @@ def test_native_coordinated_planner_failure_cancels_arm_and_gripper_without_moti
         row = database.execute(
             "SELECT j.payload_json FROM operation_snapshots s "
             "JOIN journal_records j ON j.sequence=s.snapshot_sequence "
-            "WHERE s.operation_id=?", (operation_id,),
+            "WHERE s.operation_id=?",
+            (operation_id,),
         ).fetchone()
     assert row is not None
     persisted = json.loads(row[0])["operation_state"]

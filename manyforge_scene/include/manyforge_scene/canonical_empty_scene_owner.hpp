@@ -27,8 +27,8 @@ inline constexpr std::string_view kCanonicalEmptySceneStoreSchemaId =
     "manyforge.internal.logical-scene.i4.v2";
 inline constexpr std::int64_t kCanonicalEmptySceneStoreSchemaVersion = 2;
 inline constexpr std::string_view kLogicalSceneStoreSchemaId =
-    "manyforge.internal.logical-scene.n5c.v6";
-inline constexpr std::int64_t kLogicalSceneStoreSchemaVersion = 6;
+    "manyforge.internal.logical-scene.ui6i.v7";
+inline constexpr std::int64_t kLogicalSceneStoreSchemaVersion = 7;
 inline constexpr std::int64_t kCanonicalEmptySceneSqliteApplicationId =
     1296454467; // "MFSC"
 inline constexpr std::size_t kMaximumSceneStoreIdentifierBytes = 256U;
@@ -279,6 +279,10 @@ public:
   ReconcileAuthoredSceneAdmissionClaims();
   [[nodiscard]] manyforge::core::SceneCommitResultDTO
   Commit(const manyforge::core::SceneTransactionRequestDTO &request) override;
+  /// Exact result lookup only: never submit/retry a Scene effect. Absence is
+  /// unresolved, not proof of no effect (the original request may be in flight).
+  [[nodiscard]] std::optional<manyforge::core::SceneCommitResultDTO>
+  ReadCommitResult(const manyforge::core::SceneTransactionRequestDTO& request) const;
   [[nodiscard]] manyforge::core::Result<manyforge::core::SceneCandidatePreviewDTO>
   PreviewResolvedSceneCandidate(
       const manyforge::core::ResolvedSceneCandidatePreviewRequestDTO &request)

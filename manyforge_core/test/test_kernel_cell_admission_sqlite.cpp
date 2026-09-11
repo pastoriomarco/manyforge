@@ -145,6 +145,89 @@ std::int64_t CountRows(const std::filesystem::path& database_path, const char* t
   return result;
 }
 
+TEST(KernelCellAdmissionSqlite, ProgramNodeAttributionSurvivesOwnerReplacement) {
+  TemporaryDirectory temporary;
+  const auto database = temporary.path() / std::string(kOperationJournalFilename);
+  auto claim = Claim();
+  claim.intent.claim_kind = CellAdmissionClaimKindDTO::kAuthoredScene;
+  claim.intent.owner_role = CellAdmissionOwnerRoleDTO::kAuthoredSceneOwner;
+  claim.intent.program_node_evidence = ProgramNodeAdmissionEvidenceDTO{
+      RequestOwnerEpoch("program.owner"), ProgramRunId("run.1"), CellAdmissionClaimGeneration(7U),
+      "attach", std::string(512U, 'a'), "scene.carried_attachment"};
+  {
+    SqliteOperationJournal journal(database, CellId("cell.1"));
+    ASSERT_TRUE(journal.BeginOwnerEpoch(RequestOwnerEpoch("kernel.1"), 1, 8U, {}).ok());
+    ASSERT_TRUE(journal.RecordCellAdmissionClaimAcquired(RequestOwnerEpoch("kernel.1"), claim).ok());
+  }
+  SqliteOperationJournal journal(database, CellId("cell.1"));
+  const auto recovery = journal.BeginOwnerEpoch(RequestOwnerEpoch("kernel.2"), 2, 8U, {});
+  ASSERT_TRUE(recovery.ok()) << recovery.error().message;
+  ASSERT_EQ(recovery.value().recovered_cell_admission_claims.size(), 1U);
+  EXPECT_EQ(recovery.value().recovered_cell_admission_claims.front().claim, claim);
+  EXPECT_EQ(recovery.value().recovered_cell_admission_membership.front().semantic_intent_digest,
+            CellAdmissionClaimIntentDigest(claim.intent).value());
+}
+
+TEST(KernelCellAdmissionSqlite, HeldManualParentAndOfferSurviveOwnerReplacement) {
+  TemporaryDirectory temporary;
+  const auto database = temporary.path() / std::string(kOperationJournalFilename);
+  auto claim = Claim();
+  claim.intent.claim_kind = CellAdmissionClaimKindDTO::kManualOperation;
+  claim.intent.owner_role = CellAdmissionOwnerRoleDTO::kManualOperationOwner;
+  claim.intent.owner_epoch = RequestOwnerEpoch("kernel.1");
+  claim.intent.intervention_evidence = CellAdmissionInterventionEvidenceDTO{
+      claim.intent.owner_role, claim.intent.owner_epoch, claim.intent.owner_transaction_id,
+      ContentDigest(kDigestB), CellAdmissionClaimGeneration(7U)};
+  ASSERT_TRUE(ValidateCellAdmissionClaimIntent(claim.intent).ok());
+  {
+    SqliteOperationJournal journal(database, CellId("cell.1"));
+    ASSERT_TRUE(journal.BeginOwnerEpoch(RequestOwnerEpoch("kernel.1"), 1, 8U, {}).ok());
+    ASSERT_TRUE(
+        journal.RecordCellAdmissionClaimAcquired(RequestOwnerEpoch("kernel.1"), claim).ok());
+  }
+  SqliteOperationJournal journal(database, CellId("cell.1"));
+  const auto recovery = journal.BeginOwnerEpoch(RequestOwnerEpoch("kernel.2"), 2, 8U, {});
+  ASSERT_TRUE(recovery.ok()) << recovery.error().message;
+  ASSERT_EQ(recovery.value().recovered_cell_admission_claims.size(), 1U);
+  const auto& recovered = recovery.value().recovered_cell_admission_claims.front();
+  EXPECT_EQ(recovered.claim, claim);
+  EXPECT_FALSE(recovered.release.has_value());
+  EXPECT_FALSE(recovered.reconcile_settlement.has_value());
+  EXPECT_EQ(recovery.value().recovered_cell_admission_membership.front().semantic_intent_digest,
+            CellAdmissionClaimIntentDigest(claim.intent).value());
+}
+
+TEST(KernelCellAdmissionSqlite, V12ClaimsRetainTheirExactIdentityAfterAttributionMigration) {
+  TemporaryDirectory temporary;
+  const auto database = temporary.path() / std::string(kOperationJournalFilename);
+  const auto claim = Claim();
+  {
+    SqliteOperationJournal journal(database, CellId("cell.1"));
+    ASSERT_TRUE(journal.BeginOwnerEpoch(RequestOwnerEpoch("kernel.1"), 1, 8U, {}).ok());
+    ASSERT_TRUE(journal.RecordCellAdmissionClaimAcquired(RequestOwnerEpoch("kernel.1"), claim).ok());
+  }
+  sqlite3* legacy = nullptr;
+  ASSERT_EQ(sqlite3_open(database.c_str(), &legacy), SQLITE_OK);
+  const auto downgraded = sqlite3_exec(legacy,
+      "ALTER TABLE cell_admission_claims DROP COLUMN program_node_runner_owner_epoch;"
+      "ALTER TABLE cell_admission_claims DROP COLUMN program_node_run_id;"
+      "ALTER TABLE cell_admission_claims DROP COLUMN program_node_instance_id;"
+      "ALTER TABLE cell_admission_claims DROP COLUMN program_node_attempt_id;"
+      "ALTER TABLE cell_admission_claims DROP COLUMN program_node_owner_api;"
+      "PRAGMA user_version=12; UPDATE journal_metadata SET schema_version=12,"
+      "schema_id='manyforge.internal.execution.operation-journal.o1.5.v12';",
+      nullptr, nullptr, nullptr);
+  sqlite3_close(legacy);
+  ASSERT_EQ(downgraded, SQLITE_OK);
+  SqliteOperationJournal journal(database, CellId("cell.1"));
+  const auto recovery = journal.BeginOwnerEpoch(RequestOwnerEpoch("kernel.2"), 2, 8U, {});
+  ASSERT_TRUE(recovery.ok()) << recovery.error().message;
+  ASSERT_EQ(recovery.value().recovered_cell_admission_claims.size(), 1U);
+  EXPECT_EQ(recovery.value().recovered_cell_admission_claims.front().claim, claim);
+  EXPECT_EQ(recovery.value().recovered_cell_admission_membership.front().semantic_intent_digest,
+            CellAdmissionClaimIntentDigest(claim.intent).value());
+}
+
 TEST(KernelCellAdmissionSqlite, AcquireAndReleaseCrashWindowsRehydrateExactTruth) {
   TemporaryDirectory temporary;
   const auto database = temporary.path() / std::string(kOperationJournalFilename);

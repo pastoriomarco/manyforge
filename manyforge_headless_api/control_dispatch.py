@@ -36,6 +36,7 @@ from .models import (
     ProgramRunStopRequest,
     ProgramSelectionStopRequest,
     ProgramSelectionResumeRequest,
+    ProgramManualHandoverRequest,
     RuntimeScaleControlRequest,
     RuntimeBlackboardWriteRequest,
     RuntimeOverrideActionRequest,
@@ -67,6 +68,14 @@ _NATIVE_EXECUTION_COMMANDS = frozenset(
 _EXPECTED_EXECUTION_OWNER_FIELD = "expected_execution_owner_epoch"
 _STANDALONE_EXECUTION_CONTROL_REVISION = 1
 _MISSING = object()
+_MANUAL_OPERATION_CONTROLS = frozenset(
+    {
+        "operation_pause",
+        "operation_resume",
+        "operation_reset",
+        "operation_acknowledge_completed",
+    }
+)
 
 
 def requires_execution_owner_fence(command_kind: str) -> bool:
@@ -85,6 +94,53 @@ class HeadlessExecutionControlDispatch:
         """Return whether this Headless instance intentionally has no runner."""
 
         return getattr(self._service, "program_runner", _MISSING) is None
+
+    def _manual_scope_conflict(
+        self, request: ExecutionCommandRequestDTO, cycle: Mapping[str, Any]
+    ) -> str | None:
+        """Select native manual authority, never infer rest or lifecycle permission."""
+        kind = request.command_envelope.command_kind
+        if cycle.get("state") == "idle_after_reset":
+            return None
+        if kind == "operation_start":
+            # The strict intent model and native product resolver validate the
+            # context and intrinsic direct-control binding before any effect.
+            return (
+                None
+                if isinstance(request.payload.get("manual_handover"), Mapping)
+                else "manual_handover_required"
+            )
+        if kind not in _MANUAL_OPERATION_CONTROLS:
+            return None
+        projection = self._service.execution_control_state()
+        identity = projection.get("identity", {})
+        state = projection.get("control_state", {})
+        if (
+            not isinstance(identity, Mapping)
+            or identity.get("owner_epoch")
+            != request.payload.get(_EXPECTED_EXECUTION_OWNER_FIELD)
+            or not isinstance(state, Mapping)
+            or state.get("schema_version") != "manyforge.execution_control_state.v4"
+            or request.payload.get("execution_scope") is not None
+        ):
+            return "manual_operation_scope_stale"
+        operations = state.get("manual_operations")
+        if not isinstance(operations, list):
+            return "manual_operation_scope_stale"
+        matches = [
+            row
+            for row in operations
+            if isinstance(row, Mapping)
+            and row.get("resident") is True
+            and isinstance(row.get("operation"), Mapping)
+            and row["operation"].get("operation_id")
+            == request.payload.get("operation_id")
+            and row["operation"].get("operation_revision")
+            == request.payload.get("expected_operation_revision")
+        ]
+        # The projection is native-owned. A concurrent retirement/revision
+        # change still rejects in the command's exact Kernel check.
+        return None if len(matches) == 1 else "manual_operation_scope_stale"
 
     def _standalone_execution_projection(self) -> tuple[str, int, dict[str, Any]]:
         response = self._service.execution_identity()
@@ -114,7 +170,12 @@ class HeadlessExecutionControlDispatch:
         cycle = self._service.program_cycle_status()
         owner = cycle.get("program_runner_owner_epoch")
         revision = cycle.get("execution_control_revision")
-        if not isinstance(owner, str) or not owner or type(revision) is not int or revision < 1:
+        if (
+            not isinstance(owner, str)
+            or not owner
+            or type(revision) is not int
+            or revision < 1
+        ):
             raise HeadlessApiError(
                 "execution_control_projection_invalid",
                 "Program owner omitted its execution-control identity",
@@ -130,7 +191,9 @@ class HeadlessExecutionControlDispatch:
         envelope = request.command_envelope
         payload_request_id = request.payload.get("request_id")
         nested_context = request.payload.get("request_context")
-        if not isinstance(payload_request_id, str) and isinstance(nested_context, Mapping):
+        if not isinstance(payload_request_id, str) and isinstance(
+            nested_context, Mapping
+        ):
             payload_request_id = nested_context.get("request_id")
         if not isinstance(payload_request_id, str):
             payload_request_id = envelope.correlation_id
@@ -234,7 +297,9 @@ class HeadlessExecutionControlDispatch:
         )
 
     @staticmethod
-    def _availability(cycle: Mapping[str, Any], command_kind: str) -> tuple[bool, str | None]:
+    def _availability(
+        cycle: Mapping[str, Any], command_kind: str
+    ) -> tuple[bool, str | None]:
         commands = cycle.get("allowed_commands")
         if not isinstance(commands, list):
             raise HeadlessApiError(
@@ -308,6 +373,9 @@ class HeadlessExecutionControlDispatch:
             allowed, reason = self._availability(cycle_before, envelope.command_kind)
             if not allowed:
                 return self._reduce_unavailable(request, cycle_before, reason)
+            conflict = self._manual_scope_conflict(request, cycle_before)
+            if conflict is not None:
+                return self._reduce_unavailable(request, cycle_before, conflict)
 
         context = self._caller_context(
             request,
@@ -356,26 +424,51 @@ class HeadlessExecutionControlDispatch:
                 )
                 model = request_type.model_validate({**payload, **context})
                 if kind == "program_motion_stop":
-                    result = self._service.program_run_motion_stop(model.program_run_id, model)
+                    result = self._service.program_run_motion_stop(
+                        model.program_run_id, model
+                    )
                 elif kind == "program_full_stop":
-                    result = self._service.program_run_full_stop(model.program_run_id, model)
+                    result = self._service.program_run_full_stop(
+                        model.program_run_id, model
+                    )
                 else:
                     result = self._service.program_run_stop(model.program_run_id, model)
             elif kind == "program_motion_resume":
-                model = ProgramSelectionResumeRequest.model_validate({**payload, **context})
-                result = self._service.program_run_motion_resume(model.program_run_id, model)
+                model = ProgramSelectionResumeRequest.model_validate(
+                    {**payload, **context}
+                )
+                result = self._service.program_run_motion_resume(
+                    model.program_run_id, model
+                )
+            elif kind == "program_manual_handover":
+                model = ProgramManualHandoverRequest.model_validate(
+                    {**payload, **context}
+                )
+                result = self._service.program_run_manual_handover(
+                    model.program_run_id, model
+                )
             elif kind == "program_reset":
                 result = self._service.program_cycle_reset(
                     ProgramCycleResetRequest.model_validate({**payload, **context})
                 )
             elif kind == "program_resume_full_stop":
-                model = ProgramFullStopResumeRequest.model_validate({**payload, **context})
-                result = self._service.program_run_resume_full_stop(model.program_run_id, model)
+                model = ProgramFullStopResumeRequest.model_validate(
+                    {**payload, **context}
+                )
+                result = self._service.program_run_resume_full_stop(
+                    model.program_run_id, model
+                )
             elif kind == "program_discard_full_stop":
-                model = ProgramFullStopResetRequest.model_validate({**payload, **context})
-                result = self._service.program_run_reset_full_stop(model.program_run_id, model)
+                model = ProgramFullStopResetRequest.model_validate(
+                    {**payload, **context}
+                )
+                result = self._service.program_run_reset_full_stop(
+                    model.program_run_id, model
+                )
             elif kind == "program_runtime_override_stage":
-                model = RuntimeOverrideStageRequest.model_validate({**payload, **context})
+                model = RuntimeOverrideStageRequest.model_validate(
+                    {**payload, **context}
+                )
                 result = self._service.program_runtime_control_action(
                     model.program_run_id, "runtime-overrides", model
                 )
@@ -383,7 +476,9 @@ class HeadlessExecutionControlDispatch:
                 "program_runtime_override_activate",
                 "program_runtime_override_clear",
             }:
-                model = RuntimeOverrideActionRequest.model_validate({**payload, **context})
+                model = RuntimeOverrideActionRequest.model_validate(
+                    {**payload, **context}
+                )
                 suffix = (
                     "runtime-overrides/activate"
                     if kind == "program_runtime_override_activate"
@@ -393,12 +488,16 @@ class HeadlessExecutionControlDispatch:
                     model.program_run_id, suffix, model
                 )
             elif kind == "program_runtime_override_promote":
-                model = RuntimeOverridePromotionRequest.model_validate({**payload, **context})
+                model = RuntimeOverridePromotionRequest.model_validate(
+                    {**payload, **context}
+                )
                 result = self._service.program_runtime_control_action(
                     model.program_run_id, "runtime-overrides/promote", model
                 )
             elif kind == "program_runtime_blackboard_write":
-                model = RuntimeBlackboardWriteRequest.model_validate({**payload, **context})
+                model = RuntimeBlackboardWriteRequest.model_validate(
+                    {**payload, **context}
+                )
                 result = self._service.program_runtime_control_action(
                     model.program_run_id, "blackboard-values", model
                 )
@@ -424,7 +523,9 @@ class HeadlessExecutionControlDispatch:
                 )
             elif kind == "operation_start":
                 result = self._service.execution_submit(
-                    OperationIntentRequest.model_validate({**payload, "request_context": context}),
+                    OperationIntentRequest.model_validate(
+                        {**payload, "request_context": context}
+                    ),
                     attribution,
                 )
             elif kind in {
@@ -443,10 +544,14 @@ class HeadlessExecutionControlDispatch:
                 elif kind == "operation_reset":
                     result = self._service.execution_reset(model, attribution)
                 else:
-                    result = self._service.execution_acknowledge_completed(model, attribution)
+                    result = self._service.execution_acknowledge_completed(
+                        model, attribution
+                    )
             elif kind == "operation_stop":
                 result = self._service.execution_stop(
-                    StopIntentRequest.model_validate({**payload, "request_context": context}),
+                    StopIntentRequest.model_validate(
+                        {**payload, "request_context": context}
+                    ),
                     attribution,
                 )
             elif kind == "pick_sequence_start":
@@ -465,7 +570,9 @@ class HeadlessExecutionControlDispatch:
                 )
             elif kind == "cell_full_stop":
                 result = self._service.execution_full_stop(
-                    FullStopIntentRequest.model_validate({**payload, "request_context": context}),
+                    FullStopIntentRequest.model_validate(
+                        {**payload, "request_context": context}
+                    ),
                     attribution,
                 )
             elif kind == "execution_recovery":
@@ -530,7 +637,11 @@ class HeadlessExecutionControlDispatch:
             return (
                 owner_result(
                     "rejected",
-                    (code if isinstance(code, str) and code else "execution_command_rejected"),
+                    (
+                        code
+                        if isinstance(code, str) and code
+                        else "execution_command_rejected"
+                    ),
                 ),
                 result,
             )

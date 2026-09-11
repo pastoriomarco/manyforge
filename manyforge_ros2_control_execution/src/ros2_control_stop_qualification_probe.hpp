@@ -19,7 +19,8 @@ inline constexpr std::string_view kRos2ControlSoftwareHardContractSchemaId =
     "manyforge.value_schema.provider_contract.empty.v1";
 inline constexpr std::string_view
     kRos2ControlSoftwareHardContractSchemaRevision =
-        "sha256:fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270";
+        "sha256:"
+        "fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270";
 
 /// Internal observation points used only by the explicit offline Stop runner.
 ///
@@ -51,8 +52,7 @@ class Ros2ControlStopQualificationAccess final {
 public:
   static void install_probe(Ros2ControlExecutionBackend &backend,
                             IRos2ControlStopQualificationProbe &probe) {
-    backend.stop_qualification_probe_.store(&probe,
-                                            std::memory_order_release);
+    backend.stop_qualification_probe_.store(&probe, std::memory_order_release);
   }
 
   [[nodiscard]] static std::unique_lock<std::mutex>
@@ -60,10 +60,10 @@ public:
     return std::unique_lock<std::mutex>(backend.state_mutex_);
   }
 
-  static void seed_observed_joint_sample(
-      Ros2ControlExecutionBackend &backend,
-      std::vector<std::string> joint_names, std::vector<double> positions,
-      std::vector<double> velocities) {
+  static void seed_observed_joint_sample(Ros2ControlExecutionBackend &backend,
+                                         std::vector<std::string> joint_names,
+                                         std::vector<double> positions,
+                                         std::vector<double> velocities) {
     backend.testing_store_latest_joint_sample_impl(
         std::move(joint_names), std::move(positions),
         std::chrono::steady_clock::now(), std::move(velocities),
@@ -105,39 +105,37 @@ public:
         stage.controller_goal_generation,
         prepared_contract_digest};
     std::lock_guard<std::mutex> lock(backend.prepared_execution_mutex_);
-    backend.prepared_goals_.erase(stage.controller_goal_id);
-    backend.prepared_goals_.emplace(
+    backend.prepared_goal_ = Ros2ControlExecutionBackend::PreparedGoalRecord{
         stage.controller_goal_id,
-        Ros2ControlExecutionBackend::PreparedGoalRecord{
-            stage.controller_goal_generation,
-            std::move(prepared_contract_digest),
-            stage.operation_id,
-            stage.operation_revision,
-            stage.participant_id,
-            stage.controllable_component_id,
-            stage.command_target_id,
-            stage.capability_id,
-            stage.control_domain_id,
-            stage.control_domain_revision,
-            stage.control_binding_id,
-            stage.control_binding_revision,
-            stage.controller_topology_id,
-            stage.topology_revision,
-            stage.control_route_id,
-            stage.active_control_configuration_id,
-            stage.active_control_configuration_generation,
-            stage.provider_runtime_epoch,
-            stage.resources,
-            stage.stop_evidence_policy_id,
-            stage.stop_evidence_policy_revision,
-            {stage.participant_stop_plan},
-            std::move(handle)});
+        stage.controller_goal_generation,
+        std::move(prepared_contract_digest),
+        stage.operation_id,
+        stage.operation_revision,
+        stage.participant_id,
+        stage.controllable_component_id,
+        stage.command_target_id,
+        stage.capability_id,
+        stage.control_domain_id,
+        stage.control_domain_revision,
+        stage.control_binding_id,
+        stage.control_binding_revision,
+        stage.controller_topology_id,
+        stage.topology_revision,
+        stage.control_route_id,
+        stage.active_control_configuration_id,
+        stage.active_control_configuration_generation,
+        stage.provider_runtime_epoch,
+        stage.resources,
+        stage.stop_evidence_policy_id,
+        stage.stop_evidence_policy_revision,
+        {stage.participant_stop_plan},
+        std::move(handle)};
   }
 
-  static void arm_forced_managed_terminal_for_test(
-      Ros2ControlExecutionBackend &backend,
-      std::uint64_t execution_generation,
-      std::uint64_t managed_generation) {
+  static void
+  arm_forced_managed_terminal_for_test(Ros2ControlExecutionBackend &backend,
+                                       std::uint64_t execution_generation,
+                                       std::uint64_t managed_generation) {
     std::lock_guard<std::mutex> lock(backend.managed_fjt_mutex_);
     backend.forced_managed_stop_execution_generation_ = execution_generation;
     backend.forced_managed_stop_generation_ = managed_generation;

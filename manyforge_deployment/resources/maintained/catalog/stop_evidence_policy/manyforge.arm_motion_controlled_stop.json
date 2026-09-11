@@ -31,7 +31,7 @@
           "command_kind": "motion_controlled_stop",
           "provider_contract_ref": {
             "contract_schema_id": "manyforge.value_schema.provider_contract.motion_controlled_stop.v1",
-            "contract_schema_revision": "sha256:afbbcda3b81eabff2bbdffb5658fb1fcd3331cde896cadf0681793a2f9db90dd",
+            "contract_schema_revision": "sha256:58ec6382a268329e9d8001eb53aac31259b5eb95a3690095aa4bbe12ac51d83b",
             "provider_contract_role_id": "stop_contract"
           }
         },
@@ -45,7 +45,7 @@
             "evidence_kind": "motion_rest",
             "provider_contract_ref": {
               "contract_schema_id": "manyforge.value_schema.provider_contract.motion_controlled_stop.v1",
-              "contract_schema_revision": "sha256:afbbcda3b81eabff2bbdffb5658fb1fcd3331cde896cadf0681793a2f9db90dd",
+              "contract_schema_revision": "sha256:58ec6382a268329e9d8001eb53aac31259b5eb95a3690095aa4bbe12ac51d83b",
               "provider_contract_role_id": "stop_contract"
             }
           },
@@ -118,5 +118,5 @@
     }
   ],
   "stop_evidence_policy_id": "manyforge.arm_motion_controlled_stop",
-  "stop_evidence_policy_revision": "sha256:dd90ffd42eb0945c87457005c8a148ceed5c76ba9a8b40f3d227c823148df37a"
+  "stop_evidence_policy_revision": "sha256:6e49f21b6dd2586c1ccff4864f6a6416526e4dec99e55bef3a9a2f9e05728ad1"
 }

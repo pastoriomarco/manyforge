@@ -103,6 +103,26 @@ class RecoveryAwareNode(py_trees.decorators.Decorator):
         self._held = True
         return py_trees.common.Status.RUNNING
 
+    @property
+    def presented_status(self) -> py_trees.common.Status:
+        if self.status is not py_trees.common.Status.RUNNING:
+            return self.status
+        return getattr(self.decorated, "presented_status", self.decorated.status)
+
+    def observe_while_operator_stop_held(self) -> None:
+        # A child-before-parent observation pass has already settled the exact
+        # leaf. Propagate/register its result without ticking a new attempt or
+        # consuming a recovery decision while its scope is held.
+        if self.status is py_trees.common.Status.RUNNING and not self._held and self.decorated.status in {
+            py_trees.common.Status.SUCCESS, py_trees.common.Status.FAILURE}:
+            self.status = self.update()
+
+    def tick_held_results(self) -> Iterator[py_trees.behaviour.Behaviour]:
+        if self._held:
+            yield self
+        else:
+            yield from super().tick()
+
 
 def recovery_policy_is_actionable(policy: ProgramNodePolicy) -> bool:
     recovery = policy.recovery_policy

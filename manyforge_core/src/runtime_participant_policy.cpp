@@ -76,6 +76,75 @@ using MotionScopeKey = std::tuple<std::string_view, std::string_view, std::strin
 
 }  // namespace
 
+Result<RuntimeParticipantPolicySelection> apply_deployment_motion_jerk_policy(
+    const RuntimeParticipantPolicySelection& selection, const RuntimeParticipantBinding& binding,
+    OrdinaryMotionJerkPolicy profile) {
+  const auto& target = binding.value();
+  if (selection.value().controllable_component_id != target.controllable_component_id ||
+      selection.value().command_target_id != target.command_target_id ||
+      (profile.machine_required && !profile.enabled) ||
+      profile.limits.size() > target.resources.size() ||
+      (profile.enabled && profile.limits.size() != target.resources.size()))
+    return invalid<RuntimeParticipantPolicySelection>(
+        "ordinary jerk policy is incomplete, crosses its target or disables required limits",
+        "ordinary_motion_jerk_policy_invalid");
+  for (const auto& [joint, limit] : profile.limits) {
+    const auto resource =
+        std::find_if(target.resources.begin(), target.resources.end(),
+                     [&](const auto& row) { return row.source_joint_name == joint; });
+    const auto* angular = std::get_if<AngularJerkDTO>(&limit);
+    // The existing ordinary per-joint dynamics port is angular. Do not
+    // reinterpret a linear value as radians to admit an unsupported target.
+    if (resource == target.resources.end() ||
+        resource->coordinate_kind != CoordinateKind::kAngular || angular == nullptr ||
+        !std::isfinite(angular->value_rad_s3) || angular->value_rad_s3 <= 0.0)
+      return invalid<RuntimeParticipantPolicySelection>(
+          "ordinary jerk limit has an invalid joint, coordinate kind or value",
+          "ordinary_motion_jerk_limit_invalid");
+  }
+  if (const auto& required = selection.value().ordinary_motion_jerk;
+      required && required->machine_required) {
+    if (!profile.enabled || !profile.machine_required ||
+        std::any_of(required->limits.begin(), required->limits.end(), [&](const auto& row) {
+          const auto found = profile.limits.find(row.first);
+          return found == profile.limits.end() ||
+                 std::get<AngularJerkDTO>(found->second).value_rad_s3 >
+                     std::get<AngularJerkDTO>(row.second).value_rad_s3;
+        }))
+      return invalid<RuntimeParticipantPolicySelection>(
+          "ordinary jerk policy cannot weaken an existing required limit",
+          "ordinary_motion_jerk_policy_weakens_required");
+  }
+  auto value = selection.value();
+  value.ordinary_motion_jerk = std::move(profile);
+  return Result<RuntimeParticipantPolicySelection>::Ok(
+      RuntimeParticipantPolicySelection(std::move(value)));
+}
+
+Result<PerJointDynamicsLimitsDTO> apply_runtime_participant_motion_jerk_policy(
+    const RuntimeParticipantPolicySelection& selection, PerJointDynamicsLimitsDTO requested) {
+  const auto& profile = selection.value().ordinary_motion_jerk;
+  if (!profile) return Result<PerJointDynamicsLimitsDTO>::Ok(std::move(requested));
+  if (!profile->enabled) {
+    if (std::any_of(requested.begin(), requested.end(),
+                    [](const auto& row) { return row.second.max_jerk_rad_s3.has_value(); }))
+      return invalid<PerJointDynamicsLimitsDTO>(
+          "ordinary-motion jerk shaping is disabled in the applied Deployment",
+          "ordinary_motion_jerk_disabled");
+    return Result<PerJointDynamicsLimitsDTO>::Ok(std::move(requested));
+  }
+  for (const auto& [joint, limit] : profile->limits) {
+    const double maximum = std::get<AngularJerkDTO>(limit).value_rad_s3;
+    auto& cap = requested[joint].max_jerk_rad_s3;
+    if (cap && (!std::isfinite(*cap) || *cap <= 0.0 || *cap > maximum))
+      return invalid<PerJointDynamicsLimitsDTO>(
+          "requested jerk exceeds the applied Deployment limit for " + joint,
+          "ordinary_motion_jerk_limit_exceeded");
+    if (!cap) cap = maximum;
+  }
+  return Result<PerJointDynamicsLimitsDTO>::Ok(std::move(requested));
+}
+
 Result<RuntimeParticipantPolicySelection> verify_runtime_participant_policy_selection(
     RuntimePolicyCatalogRecordRefDTO source_artifact, RuntimePolicyDTO policy,
     const RuntimeParticipantBinding& participant) {
@@ -182,14 +251,12 @@ Result<RuntimeParticipantPolicySelection> verify_runtime_participant_policy_sele
           ? (exact_target_limit.has_value() ? std::min(*cell_limit, *exact_target_limit)
                                             : *cell_limit)
           : *exact_target_limit;
-  const auto& selected_limit = exact_target_limit_row.has_value()
-                                   ? *exact_target_limit_row
-                                   : *cell_limit_row;
+  const auto& selected_limit =
+      exact_target_limit_row.has_value() ? *exact_target_limit_row : *cell_limit_row;
   return Result<RuntimeParticipantPolicySelection>::Ok(
       RuntimeParticipantPolicySelection(RuntimeParticipantPolicySelectionDTO{
-          participant.value().controllable_component_id,
-          participant.value().command_target_id, std::move(source_artifact),
-          std::move(policy), selected_limit, effective}));
+          participant.value().controllable_component_id, participant.value().command_target_id,
+          std::move(source_artifact), std::move(policy), selected_limit, effective}));
 }
 
 Result<SpeedProfileDTO> apply_runtime_participant_motion_speed_policy(
@@ -209,24 +276,21 @@ Result<SpeedProfileDTO> apply_runtime_participant_motion_speed_policy(
   return Result<SpeedProfileDTO>::Ok(std::move(requested));
 }
 
-Result<RuntimeParticipantPolicySelection>
-apply_deployment_motion_speed_ceiling(
+Result<RuntimeParticipantPolicySelection> apply_deployment_motion_speed_ceiling(
     const RuntimeParticipantPolicySelection& selection,
     const double deployment_maximum_tcp_linear_speed_mps) {
   if (!std::isfinite(deployment_maximum_tcp_linear_speed_mps) ||
       deployment_maximum_tcp_linear_speed_mps <= 0.0 ||
       deployment_maximum_tcp_linear_speed_mps > 1000.0 ||
-      !std::isfinite(
-          selection.value().effective_maximum_tcp_linear_speed_mps) ||
+      !std::isfinite(selection.value().effective_maximum_tcp_linear_speed_mps) ||
       selection.value().effective_maximum_tcp_linear_speed_mps <= 0.0) {
     return invalid<RuntimeParticipantPolicySelection>(
         "Deployment motion ceiling is outside the closed finite range",
         "deployment_motion_limit_value_invalid");
   }
   auto value = selection.value();
-  value.effective_maximum_tcp_linear_speed_mps =
-      std::min(value.effective_maximum_tcp_linear_speed_mps,
-               deployment_maximum_tcp_linear_speed_mps);
+  value.effective_maximum_tcp_linear_speed_mps = std::min(
+      value.effective_maximum_tcp_linear_speed_mps, deployment_maximum_tcp_linear_speed_mps);
   return Result<RuntimeParticipantPolicySelection>::Ok(
       RuntimeParticipantPolicySelection(std::move(value)));
 }

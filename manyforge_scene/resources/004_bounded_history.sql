@@ -1,4 +1,4 @@
--- ManyForge N5c bounded logical-scene history extension, version 6.
+-- ManyForge UI6-I logical-scene history and withdrawal schema, version 7.
 --
 -- Version 4 owns durable scene transactions and version 5 owns native-runtime
 -- recovery.  This overlay adds one bounded checkpoint/control row.  A
@@ -8,14 +8,14 @@
 -- runtime set plus at most one pending replacement while preserving a durable
 -- monotonic generation watermark.
 
-PRAGMA user_version = 6;
+PRAGMA user_version = 7;
 
 CREATE TABLE IF NOT EXISTS logical_scene_bounded_history_migrations (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     schema_id TEXT NOT NULL CHECK (
-        schema_id = 'manyforge.internal.logical-scene.n5c.v6'
+        schema_id = 'manyforge.internal.logical-scene.ui6i.v7'
     ),
-    schema_version INTEGER NOT NULL CHECK (schema_version = 6),
+    schema_version INTEGER NOT NULL CHECK (schema_version = 7),
     migration_artifact_digest TEXT NOT NULL CHECK (
         length(migration_artifact_digest) = 71
         AND substr(migration_artifact_digest, 1, 7) = 'sha256:'

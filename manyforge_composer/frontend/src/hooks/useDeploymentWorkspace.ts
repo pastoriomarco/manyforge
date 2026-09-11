@@ -5,7 +5,7 @@ import { errorMessage } from '../state/structuralResource';
 import type {
   DeploymentWorkspaceResponse,
   DeploymentCandidateOperationResponse,
-  DeploymentControlledStopProfile,
+  DeploymentControlledStopUpdate,
   DraftFenceRequest,
   JsonValue,
 } from '../types/api';
@@ -37,6 +37,10 @@ export function useDeploymentWorkspace(
   const [workspace, setWorkspace] = useState<DeploymentWorkspaceResponse | null>(null);
   const [loading, setLoading] = useState(enabled);
   const [busy, setBusy] = useState(false);
+  const [completedAdmission, setCompletedAdmission] = useState<{
+    receiverEpoch: string;
+    generation: number;
+  } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
   const [candidate, setCandidate] = useState<
@@ -94,6 +98,9 @@ export function useDeploymentWorkspace(
       ? 'Backend status is disconnected or has not arrived.'
       : snapshot.programCycle.state !== 'idle_after_reset'
         ? `Program execution is ${snapshot.programCycle.state.replaceAll('_', ' ')}; Deployment authoring requires Idle.`
+        : completedAdmission?.receiverEpoch === snapshot.receiverEpoch
+          && snapshot.authoringAdmission.admissionGeneration <= completedAdmission.generation
+          ? 'Waiting for updated backend authoring permissions.'
         : !snapshot.authoringAdmission.authoringAllowed
           ? 'The backend has not admitted authoring; execution must be Idle and required components healthy.'
           : workspace === null
@@ -117,7 +124,7 @@ export function useDeploymentWorkspace(
     message: string,
   ) => {
     const requestFence = fence();
-    if (requestFence === null || inFlight.current) return null;
+    if (requestFence === null || snapshot === null || inFlight.current) return null;
     inFlight.current = true;
     setBusy(true);
     setError(null);
@@ -126,6 +133,12 @@ export function useDeploymentWorkspace(
     try {
       const next = await operation(requestFence);
       if (mounted.current) {
+        // The HTTP post-image can arrive before the shared status stream.
+        // Never submit the next edit with the just-consumed admission fence.
+        setCompletedAdmission({
+          receiverEpoch: snapshot.receiverEpoch,
+          generation: requestFence.expectedAdmissionGeneration,
+        });
         // A read that started before this mutation may still be in flight and
         // must not replace the newer owner-issued post-image when it arrives.
         refreshSequence.current += 1;
@@ -147,7 +160,7 @@ export function useDeploymentWorkspace(
       inFlight.current = false;
       if (mounted.current) setBusy(false);
     }
-  }, [fence, refresh]);
+  }, [fence, refresh, snapshot]);
 
   const runCandidate = useCallback(async (
     operation: (
@@ -156,7 +169,7 @@ export function useDeploymentWorkspace(
     message: string,
   ) => {
     const requestFence = fence();
-    if (requestFence === null || inFlight.current) return null;
+    if (requestFence === null || snapshot === null || inFlight.current) return null;
     inFlight.current = true;
     setBusy(true);
     setError(null);
@@ -165,6 +178,10 @@ export function useDeploymentWorkspace(
     try {
       const response = await operation(requestFence);
       if (mounted.current) {
+        setCompletedAdmission({
+          receiverEpoch: snapshot.receiverEpoch,
+          generation: requestFence.expectedAdmissionGeneration,
+        });
         refreshSequence.current += 1;
         setWorkspace(response.workspace);
         setCandidate(response.result.status === 'previewed' ? response.result : null);
@@ -187,7 +204,7 @@ export function useDeploymentWorkspace(
       inFlight.current = false;
       if (mounted.current) setBusy(false);
     }
-  }, [fence, refresh]);
+  }, [fence, refresh, snapshot]);
 
   const actions = useMemo(() => ({
     open: (path: string, confirmDiscard: boolean) => run(
@@ -206,9 +223,9 @@ export function useDeploymentWorkspace(
       ),
       'Deployment Draft updated; Manager Applied was unchanged.',
     ),
-    updateControlledStop: (profile: DeploymentControlledStopProfile) => run(
+    updateControlledStop: (update: DeploymentControlledStopUpdate) => run(
       (requestFence) => api.deploymentWorkspace.updateControlledStop(
-        requestFence, profile,
+        requestFence, update,
       ),
       'Controlled Stop Draft updated atomically; Manager Applied was unchanged.',
     ),

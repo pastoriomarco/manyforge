@@ -5,8 +5,10 @@
 #include <functional>
 #include <manyforge_component_manager/runtime_observation.hpp>
 #include <manyforge_core/types/active_bundle_publication.hpp>
-#include <manyforge_core/types/runtime_contract_manifest.hpp>
+#include <manyforge_core/types/configuration_fence.hpp>
+#include <manyforge_core/types/managed_runtime_withdrawal.hpp>
 #include <manyforge_core/types/retained_product.hpp>
+#include <manyforge_core/types/runtime_contract_manifest.hpp>
 #include <manyforge_core/types/runtime_profile.hpp>
 #include <optional>
 #include <string>
@@ -55,10 +57,8 @@ struct RuntimeUnitConvergencePlanRowDTO final {
   std::uint64_t launchable_byte_size;
   std::string operating_system;
   std::string shell_contract;
-  manyforge::core::RuntimeContractRequirementDTO
-      runtime_contract_requirement;
-  manyforge::core::RuntimeContractOfferDigest
-      runtime_contract_offer_digest;
+  manyforge::core::RuntimeContractRequirementDTO runtime_contract_requirement;
+  manyforge::core::RuntimeContractOfferDigest runtime_contract_offer_digest;
 
   [[nodiscard]] bool valid() const noexcept;
 
@@ -132,6 +132,9 @@ struct RuntimeUnitConvergenceQueryDTO final {
   manyforge::core::GraphRevision candidate_graph_revision;
   manyforge::core::ContentDigest runtime_convergence_intent_digest;
   RuntimeUnitConvergencePlanRowDTO plan;
+  // Only the fenced Apply coordinator supplies this. Active reconciliation
+  // and bootstrap cannot replace a different live product implicitly.
+  std::optional<manyforge::core::ApplyFenceRehydrateDTO> replacement;
 
   RuntimeUnitConvergenceQueryDTO(
       manyforge::core::ApplyId apply_id,
@@ -187,6 +190,15 @@ public:
   EnsureRunning(const RuntimeUnitConvergenceQueryDTO &query) = 0;
   [[nodiscard]] virtual ProcessPresenceObservation
   EnsureStopped(const RuntimeUnitConvergenceQueryDTO &query) = 0;
+
+  /// Returns only positive replacement evidence for this exact Apply query.
+  /// Absence is not proof that a predecessor was retired. Adapters which do
+  /// not replace a managed process have no such evidence.
+  [[nodiscard]] virtual std::optional<
+      manyforge::core::ManagedRuntimeWithdrawalDTO>
+  ReadPredecessorWithdrawal(const RuntimeUnitConvergenceQueryDTO &) {
+    return std::nullopt;
+  }
 };
 
 /// Direct source-attested runtime progress adapter.
@@ -238,6 +250,8 @@ struct RuntimeUnitStagedReadyEvidenceDTO final {
   std::uint64_t progress_age_ns;
   manyforge::core::RuntimeContractOfferDigest
       observed_runtime_contract_offer_digest;
+  std::optional<manyforge::core::ManagedRuntimeWithdrawalDTO>
+      predecessor_withdrawal{};
 
   [[nodiscard]] bool valid() const noexcept;
 

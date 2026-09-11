@@ -11,6 +11,8 @@ import { api, ApiError } from '../api/client';
 import { parseRuntimeScaleControlAccepted } from '../api/parsers';
 import {
   buildPreviewIntent,
+  buildJointMotionIntent,
+  buildGripperCommandIntent,
   initialRobotControlState,
   operationStateIsTerminal,
   ROBOT_CONTROL_AUTHOR_DEBOUNCE_MS,
@@ -25,6 +27,7 @@ import type { CartesianMoveDraftOptions, MoveToDraftSource } from '../utils/move
 import type {
   DirectControlOperationIntent,
   ExecutionOwnerStatus,
+  ManualControlAvailability,
   Pose3Value,
   RuntimeScaleControlAccepted,
   RuntimeScaleControlStatus,
@@ -136,10 +139,30 @@ export function acceptedRuntimeScaleStatus(
   };
 }
 
+/** Cold ownership/hold revisions only; never pose samples or node tick status. */
+export function manualAvailabilityScopeFence(snapshot: ComposerHeadlessState | null, mode: RobotControlMode): string | null {
+  const status = snapshot?.executionControlStatus;
+  if (status == null || snapshot == null) return null;
+  const cycle = snapshot.programCycle;
+  const target = mode === 'gripper' ? status.directControlGripper : status.directControl;
+  return JSON.stringify([
+    status.ownerEpoch, status.retainedBundleId, status.graphRevision,
+    target.programBindingId, target.programRunId,
+    snapshot.authoringAdmission.admissionGeneration,
+    cycle.programRunnerOwnerEpoch, cycle.cycleGeneration, cycle.state,
+    cycle.executionControlRevision,
+    cycle.runtimeControls?.executionSelections,
+    status.runtimeScaleControl?.activeControlConfigurationGeneration,
+    status.manualOperations.map((operation) => [operation.operationId, operation.operationRevision, operation.resident]),
+  ]);
+}
+
 export interface RobotControlController {
   state: RobotControlState;
   /** Current owner projection, unlike state.status retained for presentation. */
   currentStatus: ExecutionOwnerStatus | null;
+  manualControlAllowed: boolean;
+  manualControlUnavailableReason: string | null;
   controlPending: 'stop' | 'pause' | 'resume' | 'reset' | null;
   runtimeScaleStatus: RuntimeScaleControlStatus | null;
   runtimeScaleDraft: number;
@@ -218,11 +241,63 @@ export function useRobotControl(
   const runtimeScaleFlush = useRef<() => void>(() => undefined);
   const runtimeScaleStopActive = useRef(programStopActive);
   runtimeScaleStopActive.current = programStopActive;
-  const programRunActive = useRef(observeProgramRun);
-  programRunActive.current = observeProgramRun;
+  const [availability, setAvailability] = useState<{
+    scope: string; result: ManualControlAvailability | null; error: string | null;
+  } | null>(null);
+  const [availabilityRefresh, refreshAvailability] = useReducer((value: number) => value + 1, 0);
+  const [cleanupFailure, setCleanupFailure] = useState<string | null>(null);
+  const cleanupInFlight = useRef<Promise<void> | null>(null);
+  const latestSnapshot = useRef(headlessSnapshot);
+  latestSnapshot.current = headlessSnapshot;
+  const availabilityScope = observeProgramRun ? manualAvailabilityScopeFence(headlessSnapshot, state.mode) : null;
+  const currentAvailability = availability?.scope === availabilityScope ? availability.result : null;
+  const manualControlAllowed = !observeProgramRun || (currentAvailability?.available === true && cleanupFailure === null);
+  const manualControlUnavailableReason = manualControlAllowed ? null : cleanupFailure
+    ?? (availability?.scope === availabilityScope ? availability.error : null)
+    ?? currentAvailability?.unavailableReason?.replaceAll('_', ' ')
+    ?? 'Checking backend manual-control availability.';
+  const manualControlBlocked = useRef(!manualControlAllowed);
+  manualControlBlocked.current = !manualControlAllowed;
   const projectedOwnerRef = useRef<string | null>(null);
   const previewStatusRef = useRef(state.status);
   previewStatusRef.current = state.status;
+
+  useEffect(() => {
+    // An old owner's response cannot block or reject a successor's draft.
+    cleanupInFlight.current = null;
+    setCleanupFailure(null);
+  }, [headlessSnapshot?.executionControlStatus?.ownerEpoch,
+    headlessSnapshot?.programCycle?.programRunnerOwnerEpoch,
+    headlessSnapshot?.programCycle?.programRunId]);
+
+  useEffect(() => {
+    if (!enabled || !observeProgramRun || availabilityScope === null) return;
+    const status = latestSnapshot.current?.executionControlStatus;
+    if (status == null) return;
+    const controller = new AbortController();
+    let current = true;
+    const read = async () => {
+      try {
+        if (state.mode === 'gripper' && status.observedGripper === null) {
+          throw new Error('Gripper observation is unavailable.');
+        }
+        const intent = state.mode === 'gripper'
+          ? buildGripperCommandIntent(status, status.observedGripper!.position, requestId())
+          : buildJointMotionIntent(status, status.observedMotion.positionsRad, requestId());
+        const result = await api.execution.manualAvailability(intent, controller.signal);
+        if (current) setAvailability({ scope: availabilityScope, result, error: null });
+      } catch (error: unknown) {
+        if (current) setAvailability({ scope: availabilityScope, result: null,
+          error: errorMessage(error, 'Backend manual-control availability is unavailable.') });
+      }
+    };
+    void read();
+    return () => { current = false; controller.abort(); };
+  }, [enabled, observeProgramRun, availabilityScope, availabilityRefresh, state.mode]);
+
+  useEffect(() => {
+    if (observeProgramRun) dispatch({ type: 'manual_scope_changed' });
+  }, [observeProgramRun, availabilityScope]);
 
   useEffect(() => {
     if (!enabled) {
@@ -240,20 +315,16 @@ export function useRobotControl(
     const initialize = projectedOwnerRef.current === null;
     projectedOwnerRef.current = status.ownerEpoch;
     dispatch({
-      type: observeProgramRun
-        ? 'program_status_refreshed'
-        : initialize
-          ? 'status_resolved'
-          : 'status_refreshed',
+      type: initialize ? 'status_resolved' : 'status_refreshed',
       status,
     });
-  }, [enabled, headlessSnapshot?.executionControlStatus, observeProgramRun]);
+  }, [enabled, headlessSnapshot?.executionControlStatus]);
 
   useEffect(() => {
     const previewStatus = previewStatusRef.current;
     if (
       !enabled
-      || observeProgramRun
+      || !manualControlAllowed
       || state.phase !== 'planning'
       || state.poseDragging
       || previewStatus === null
@@ -285,13 +356,53 @@ export function useRobotControl(
         }
         return;
       }
-      dispatch({ type: 'preview_started', generation, intent });
-      const preview = intent.participants[0].payload.kind === 'motion'
-        ? api.execution.previewMotion(intent, controller.signal)
-        : api.execution.previewCapabilityCommand(intent, controller.signal);
-      void preview
+      const preparePreview = async () => {
+        if (observeProgramRun) {
+          const context = currentAvailability?.manualHandover;
+          if (!currentAvailability?.available || context == null) {
+            throw new Error('The backend has not made this held target available.');
+          }
+          intent = { ...intent, manual_handover: context };
+          if (currentAvailability.cleanupRequired) {
+            if (cleanupInFlight.current === null) {
+              const cycle = latestSnapshot.current?.programCycle;
+              if (controlSource === null || cycle?.programRunId !== context.program_run_id
+                || cycle.programRunnerOwnerEpoch !== context.program_runner_owner_epoch
+                || cycle.runRevision == null) {
+                throw new Error('The held Program changed before manual cleanup.');
+              }
+              const cleanupId = requestId();
+              const pending = controlSource.sendExecutionCommand('program_manual_handover', {
+                request_id: cleanupId, program_run_id: context.program_run_id,
+                expected_owner_epoch: context.program_runner_owner_epoch,
+                expected_run_revision: cycle.runRevision, operation: intent,
+              }, cleanupId).then(() => undefined);
+              cleanupInFlight.current = pending;
+              void pending.then(() => {
+                if (cleanupInFlight.current !== pending) return;
+                setAvailability(null);
+                refreshAvailability();
+              }, (error: unknown) => {
+                if (cleanupInFlight.current !== pending) return;
+                // Never automatically retry an effect with an uncertain result.
+                setCleanupFailure(errorMessage(error, 'Manual handover failed. Check Program recovery.'));
+              }).finally(() => { if (cleanupInFlight.current === pending) cleanupInFlight.current = null; });
+            }
+            await cleanupInFlight.current;
+            // Fresh owner availability wakes this same pending draft after
+            // cleanup. It is not a second preview or an implicit dispatch.
+            return null;
+          }
+        }
+        if (!current) return null;
+        dispatch({ type: 'preview_started', generation, intent });
+        return intent.participants[0].payload.kind === 'motion'
+          ? api.execution.previewMotion(intent, controller.signal)
+          : api.execution.previewCapabilityCommand(intent, controller.signal);
+      };
+      void preparePreview()
         .then((receipt) => {
-          if (current) {
+          if (current && receipt !== null) {
             dispatch({ type: 'preview_resolved', generation, receipt });
           }
         })
@@ -314,6 +425,9 @@ export function useRobotControl(
   }, [
     enabled,
     observeProgramRun,
+    manualControlAllowed,
+    currentAvailability,
+    controlSource,
     state.draftPositionsRad,
     state.draftPose,
     state.draftGripperPosition,
@@ -328,7 +442,6 @@ export function useRobotControl(
   ]);
 
   const selectMode = useCallback((mode: RobotControlMode) => {
-    if (programRunActive.current) return;
     dispatch({ type: 'select_mode', mode });
   }, []);
 
@@ -584,25 +697,25 @@ export function useRobotControl(
   }, []);
 
   const editJoint = useCallback((jointIndex: number, positionRad: number) => {
-    if (programRunActive.current) return;
+    if (manualControlBlocked.current) return;
     // Accumulate against the reducer's current draft, including several
     // joint edits delivered in one React batch.
     dispatch({ type: 'edit_joint', jointIndex, positionRad });
   }, []);
 
   const editMoveToJoints = useCallback((positionsRad: number[]) => {
-    if (programRunActive.current) return;
+    if (manualControlBlocked.current) return;
     dispatch({ type: 'edit_move_to_joint', positionsRad: [...positionsRad] });
   }, []);
 
   const selectMoveToSource = useCallback((source: MoveToDraftSource) => {
-    if (!programRunActive.current) dispatch({ type: 'select_move_source', source });
+    if (!manualControlBlocked.current) dispatch({ type: 'select_move_source', source });
   }, []);
   const editMoveToOptions = useCallback((update: Partial<CartesianMoveDraftOptions>) => {
-    if (!programRunActive.current) dispatch({ type: 'edit_move_options', update });
+    if (!manualControlBlocked.current) dispatch({ type: 'edit_move_options', update });
   }, []);
   const beginPoseDrag = useCallback(() => {
-    if (programRunActive.current || !enabled || headlessSnapshot?.executionControlStatus == null || state.operation?.resident
+    if (manualControlBlocked.current || !enabled || headlessSnapshot?.executionControlStatus == null || state.operation?.resident
       || robotControlHasActiveOperation(state) || approveInFlight.current !== null
       || !['pose_goal', 'cartesian_path', 'move_to'].includes(state.mode)
       || (state.mode === 'move_to' && state.moveToDraft?.source.kind !== 'pose')
@@ -617,17 +730,17 @@ export function useRobotControl(
   }, []);
 
   const editPose = useCallback((pose: Pose3Value) => {
-    if (programRunActive.current) return;
+    if (manualControlBlocked.current) return;
     dispatch({ type: 'edit_pose', pose });
   }, []);
 
   const editGripper = useCallback((position: number) => {
-    if (programRunActive.current) return;
+    if (manualControlBlocked.current) return;
     dispatch({ type: 'edit_gripper', position });
   }, []);
 
   const editMotionSettings = useCallback((update: Partial<ManualMotionSettings>) => {
-    if (programRunActive.current) return;
+    if (manualControlBlocked.current) return;
     dispatch({ type: 'edit_motion_settings', update });
   }, []);
 
@@ -637,7 +750,7 @@ export function useRobotControl(
       || dragGeneration.current !== null
       || state.poseDragging
       || pendingAuthoringInputs.current.size > 0
-      || programRunActive.current
+      || manualControlBlocked.current
       || state.phase !== 'ready'
       || state.intent === null
       || state.preview === null
@@ -671,7 +784,7 @@ export function useRobotControl(
   }, [controlSource, state.generation, state.intent, state.phase, state.preview, state.status, state.poseDragging]);
 
   const revert = useCallback(() => {
-    if (programRunActive.current) return;
+    if (manualControlBlocked.current) return;
     dispatch({ type: 'revert' });
   }, []);
 
@@ -754,7 +867,12 @@ export function useRobotControl(
   }, [sendOperationControl, state.operation, state.status]);
 
   const retry = useCallback(() => {
-    if (programRunActive.current) return;
+    if (manualControlBlocked.current) {
+      setCleanupFailure(null);
+      setAvailability(null);
+      refreshAvailability();
+      return;
+    }
     dispatch({ type: 'retry_preview' });
   }, []);
   const dismissFullStopError = useCallback(() => {
@@ -770,6 +888,8 @@ export function useRobotControl(
   return useMemo(() => ({
     state,
     currentStatus: headlessSnapshot?.executionControlStatus ?? null,
+    manualControlAllowed,
+    manualControlUnavailableReason,
     controlPending,
     runtimeScaleStatus,
     runtimeScaleDraft,
@@ -832,6 +952,8 @@ export function useRobotControl(
     commitRuntimeScale,
     state,
     headlessSnapshot?.executionControlStatus,
+    manualControlAllowed,
+    manualControlUnavailableReason,
     stop,
     fullStop,
     dismissFullStopError,

@@ -8,6 +8,14 @@ namespace manyforge::core::detail {
 
 inline constexpr std::size_t kMaximumComponentLifecycleJournalRecordBytes = 64U * 1024U * 1024U;
 
+[[nodiscard]] std::string EncodeProgramNodeAdmissionEvidence(
+    const ProgramNodeAdmissionEvidenceDTO& evidence);
+[[nodiscard]] ProgramNodeAdmissionEvidenceDTO DecodeProgramNodeAdmissionEvidence(
+    std::string_view bytes);
+
+[[nodiscard]] std::string EncodeCCLCAdmissionRejection(const ErrorDTO& error);
+[[nodiscard]] ErrorDTO DecodeCCLCAdmissionRejection(std::string_view bytes);
+
 [[nodiscard]] std::string EncodeComponentLifecycleStatus(const ComponentLifecycleStatusDTO& status);
 
 [[nodiscard]] ComponentLifecycleStatusDTO DecodeComponentLifecycleStatus(std::string_view bytes);

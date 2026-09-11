@@ -6,9 +6,13 @@
 #include <iostream>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/deployment_authoring.hpp>
+#include <map>
+#include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace {
 
@@ -19,28 +23,55 @@ enum class Mode { kCheck, kPrint, kUpdate };
 struct Options final {
   Mode mode;
   std::filesystem::path input;
+  std::optional<bool> migrate_controlled_stop_jerk;
+  std::map<std::string, std::string> import_options;
 };
 
 [[nodiscard]] Options parse_options(int argc, char **argv) {
-  if (argc != 4 || std::string_view(argv[2]) != "--input" ||
+  constexpr auto usage =
+      "usage: manyforge_deployment_revision "
+      "(--check|--print|--update) --input <deployment.yaml> "
+      "[--migrate-controlled-stop-jerk on|off | "
+      "--import-moveit-jerk <joint_limits.yaml> --source-id <package/path> "
+      "--runtime-unit <id> --component <id> --target <id> "
+      "--joints <source-joint,...>]";
+  if (argc < 4 || argc % 2 != 0 || std::string_view(argv[2]) != "--input" ||
       std::string_view(argv[3]).empty()) {
-    throw std::invalid_argument(
-        "usage: manyforge_deployment_revision "
-        "(--check|--print|--update) --input <deployment.yaml>");
+    throw std::invalid_argument(usage);
   }
   const std::string_view mode(argv[1]);
+  std::optional<bool> migration;
+  std::map<std::string, std::string> imports;
+  if (argc == 6 &&
+      std::string_view(argv[4]) == "--migrate-controlled-stop-jerk") {
+    const std::string_view choice(argv[5]);
+    if (std::string_view(argv[4]) != "--migrate-controlled-stop-jerk" ||
+        (choice != "on" && choice != "off") || mode == "--check")
+      throw std::invalid_argument(usage);
+    migration = choice == "on";
+  } else if (argc > 4) {
+    for (int index = 4; index < argc; index += 2) {
+      const std::string key(argv[index]);
+      if (std::string_view(argv[index + 1]).empty() ||
+          (key != "--import-moveit-jerk" && key != "--source-id" &&
+           key != "--runtime-unit" && key != "--component" &&
+           key != "--target" && key != "--joints") ||
+          !imports.emplace(key, argv[index + 1]).second)
+        throw std::invalid_argument(usage);
+    }
+    if (imports.size() != 6U || mode == "--check")
+      throw std::invalid_argument(usage);
+  }
   if (mode == "--check") {
-    return Options{Mode::kCheck, argv[3]};
+    return Options{Mode::kCheck, argv[3], migration, imports};
   }
   if (mode == "--print") {
-    return Options{Mode::kPrint, argv[3]};
+    return Options{Mode::kPrint, argv[3], migration, imports};
   }
   if (mode == "--update") {
-    return Options{Mode::kUpdate, argv[3]};
+    return Options{Mode::kUpdate, argv[3], migration, imports};
   }
-  throw std::invalid_argument(
-      "usage: manyforge_deployment_revision "
-      "(--check|--print|--update) --input <deployment.yaml>");
+  throw std::invalid_argument(usage);
 }
 
 [[nodiscard]] std::string read_file(const std::filesystem::path &path) {
@@ -178,7 +209,25 @@ int main(int argc, char **argv) {
       return 0;
     }
 
-    const auto produced = deployment::compile_deployment_draft(bytes);
+    const auto produced = [&] {
+      if (!options.import_options.empty()) {
+        const auto &selected = options.import_options;
+        std::vector<std::string> joints;
+        std::istringstream names(selected.at("--joints"));
+        for (std::string joint; std::getline(names, joint, ',');)
+          joints.push_back(joint);
+        if (selected.at("--joints").back() == ',')
+          joints.emplace_back();
+        return deployment::import_moveit_angular_jerk_limits(
+            bytes, read_file(selected.at("--import-moveit-jerk")),
+            selected.at("--source-id"), selected.at("--runtime-unit"),
+            selected.at("--component"), selected.at("--target"), joints);
+      }
+      return options.migrate_controlled_stop_jerk.has_value()
+                 ? deployment::migrate_controlled_stop_jerk_choice(
+                       bytes, *options.migrate_controlled_stop_jerk)
+                 : deployment::compile_deployment_draft(bytes);
+    }();
     if (options.mode == Mode::kPrint) {
       std::cout << produced.deployment_revision << '\n';
       return 0;

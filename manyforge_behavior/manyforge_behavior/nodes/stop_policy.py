@@ -48,9 +48,14 @@ class OperatorMotionStopState:
         self._held_subtrees: frozenset[str] = frozenset()
         self._observation_changed = False
         self._observation_error: str | None = None
+        # Tree-worker-only traversal guard. Nested held wrappers share one
+        # observation pass; this is neither an owner flag nor a group latch.
+        self.draining_results = False
         self._lock = RLock()
 
-    def publish(self, snapshot: OperatorMotionStopSnapshot) -> None:
+    def publish(
+        self, snapshot: OperatorMotionStopSnapshot, *, notify_observation: bool = True
+    ) -> None:
         if (
             not isinstance(snapshot, OperatorMotionStopSnapshot)
             or type(snapshot.selection_revision) is not int
@@ -68,20 +73,23 @@ class OperatorMotionStopState:
                 return
             if snapshot.selection_revision == self._snapshot.selection_revision:
                 if snapshot.held_nodes != self._snapshot.held_nodes:
-                    raise ValueError(
-                        "operator Stop projection changed without a revision"
-                    )
+                    raise ValueError("operator Stop projection changed without a revision")
                 # Within one selection, settlement is monotonic. A crossing
                 # older read cannot put settled work back into Stopping or
                 # erase a fault. Release/reset has a new selection revision.
-                if (not snapshot.stopping_nodes <= self._snapshot.stopping_nodes
-                    or not self._snapshot.faulted_nodes <= snapshot.faulted_nodes):
+                if (
+                    not snapshot.stopping_nodes <= self._snapshot.stopping_nodes
+                    or not self._snapshot.faulted_nodes <= snapshot.faulted_nodes
+                ):
                     return
-                if not (snapshot.faulted_nodes - self._snapshot.faulted_nodes) <= self._snapshot.stopping_nodes:
+                if (
+                    not (snapshot.faulted_nodes - self._snapshot.faulted_nodes)
+                    <= self._snapshot.stopping_nodes
+                ):
                     raise ValueError("settled operator Stop changed its terminal outcome")
                 if self._observation_error is not None:
                     self._observation_error = None
-                    self._observation_changed = True
+                    self._observation_changed |= notify_observation
                 if snapshot == self._snapshot:
                     return
             if snapshot.held_nodes != self._snapshot.held_nodes:
@@ -94,7 +102,9 @@ class OperatorMotionStopState:
                 self._held_subtrees = frozenset(held_subtrees)
             self._snapshot = snapshot
             self._observation_error = None
-            self._observation_changed = True
+            # Commands advance the Run revision themselves. Do not count the
+            # same publication again, or erase a crossing real observation.
+            self._observation_changed |= notify_observation
 
     def note_task_observation_change(self) -> None:
         """Coalesce a held task's terminal change into the existing Run wake."""
@@ -149,22 +159,75 @@ class OperatorMotionStopPolicy(py_trees.decorators.Decorator):
         child: py_trees.behaviour.Behaviour,
         node_instance_id: str,
         stop_state: OperatorMotionStopState,
+        drain_children: bool = False,
     ) -> None:
         super().__init__(name=f"operator-stop:{node_instance_id}", child=child)
         self._node_instance_id = node_instance_id
         self._stop_state = stop_state
+        self._terminal_forwarded = False
+        self._drain_children = drain_children
 
-    def _observe_active_tasks(self) -> None:
+    def _observe_active_tasks(self) -> bool:
+        changed = False
         for node in self.decorated.iterate():
             observe = getattr(node, "observe_while_operator_stop_held", None)
             if callable(observe):
+                before = node.status
                 observe()
+                changed |= node.status is not before
+            if isinstance(node, OperatorMotionStopPolicy):
+                # Selected recovery may have observed a terminal result before
+                # this tree tick. It still needs forwarding exactly once.
+                changed |= not node._terminal_forwarded and node.decorated.status in {
+                    py_trees.common.Status.SUCCESS,
+                    py_trees.common.Status.FAILURE,
+                }
+        return changed
+
+    @property
+    def presented_status(self) -> py_trees.common.Status:
+        # A new iteration can be held without repainting the last completed
+        # action as Running. The scope projection separately reports the hold.
+        return getattr(self.decorated, "presented_status", self.decorated.status)
 
     def tick(self) -> Iterator[py_trees.behaviour.Behaviour]:
         if not self._stop_state.holds_subtree(self._node_instance_id):
             yield from super().tick()
+            self._terminal_forwarded = self.status in {
+                py_trees.common.Status.SUCCESS,
+                py_trees.common.Status.FAILURE,
+            }
             return
-        self._observe_active_tasks()
+        changed = False if self._stop_state.draining_results else self._observe_active_tasks()
+        if self.decorated.status in {
+            py_trees.common.Status.SUCCESS,
+            py_trees.common.Status.FAILURE,
+        }:
+            if not self._terminal_forwarded:
+                self._terminal_forwarded = True
+                self.status = self.decorated.status
+                yield self
+                return
+        elif self._drain_children and (changed or self._stop_state.draining_results):
+            # Only local result propagation. Every selected child still has
+            # its own pre-tick hold; no new action or iteration can start.
+            already_draining = self._stop_state.draining_results
+            self._stop_state.draining_results = True
+            try:
+                drain = getattr(self.decorated, "tick_held_results", None)
+                if callable(drain):
+                    yield from drain()
+                    self.status = self.decorated.status
+                    yield self
+                else:
+                    yield from super().tick()
+                self._terminal_forwarded = self.status in {
+                    py_trees.common.Status.SUCCESS,
+                    py_trees.common.Status.FAILURE,
+                }
+            finally:
+                self._stop_state.draining_results = already_draining
+            return
         self.status = py_trees.common.Status.RUNNING
         yield self
 

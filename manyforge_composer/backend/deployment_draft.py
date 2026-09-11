@@ -69,7 +69,10 @@ def compile_deployment_document(source: str) -> CompiledDeploymentDocument:
             status_code=502,
         )
     canonical = result["canonical_json"]
-    if not isinstance(canonical, str) or len(canonical.encode("utf-8")) > _MAX_DOCUMENT_BYTES:
+    if (
+        not isinstance(canonical, str)
+        or len(canonical.encode("utf-8")) > _MAX_DOCUMENT_BYTES
+    ):
         _fail(
             "deployment_compiler_response_invalid",
             "the Deployment compiler returned invalid canonical bytes",
@@ -139,7 +142,11 @@ def _edit_at_path(
     candidate = deepcopy(document)
     current: Any = candidate
     for segment in path[:-1]:
-        if isinstance(segment, str) and isinstance(current, dict) and segment in current:
+        if (
+            isinstance(segment, str)
+            and isinstance(current, dict)
+            and segment in current
+        ):
             current = current[segment]
         elif (
             type(segment) is int
@@ -149,27 +156,44 @@ def _edit_at_path(
         ):
             current = current[segment]
         else:
-            _fail("deployment_draft_path_invalid", "Deployment edit path does not exist")
+            _fail(
+                "deployment_draft_path_invalid", "Deployment edit path does not exist"
+            )
     final = path[-1]
     if operation == "append":
-        target = current.get(final) if isinstance(final, str) and isinstance(current, dict) else (
-            current[final]
-            if type(final) is int and isinstance(current, list) and 0 <= final < len(current)
-            else None
+        target = (
+            current.get(final)
+            if isinstance(final, str) and isinstance(current, dict)
+            else (
+                current[final]
+                if type(final) is int
+                and isinstance(current, list)
+                and 0 <= final < len(current)
+                else None
+            )
         )
         if not isinstance(target, list):
-            _fail("deployment_draft_path_invalid", "Deployment append target is not a list")
+            _fail(
+                "deployment_draft_path_invalid",
+                "Deployment append target is not a list",
+            )
         target.append(deepcopy(value))
         return candidate
     if isinstance(final, str) and isinstance(current, dict):
         if operation == "remove":
             if final not in current:
-                _fail("deployment_draft_path_invalid", "Deployment remove target does not exist")
+                _fail(
+                    "deployment_draft_path_invalid",
+                    "Deployment remove target does not exist",
+                )
             del current[final]
         elif operation == "set":
             current[final] = deepcopy(value)
         else:
-            _fail("deployment_draft_operation_invalid", "Deployment edit operation is invalid")
+            _fail(
+                "deployment_draft_operation_invalid",
+                "Deployment edit operation is invalid",
+            )
     elif (
         type(final) is int
         and 0 <= final <= _MAX_COLLECTION_INDEX
@@ -181,24 +205,71 @@ def _edit_at_path(
         elif operation == "set":
             current[final] = deepcopy(value)
         else:
-            _fail("deployment_draft_operation_invalid", "Deployment edit operation is invalid")
+            _fail(
+                "deployment_draft_operation_invalid",
+                "Deployment edit operation is invalid",
+            )
     else:
         _fail("deployment_draft_path_invalid", "Deployment edit target does not exist")
     return candidate
 
 
 def _edit_controlled_stop_profile(
-    document: dict[str, Any], profile: dict[str, Any]
+    document: dict[str, Any],
+    profile: dict[str, Any] | None,
+    *,
+    control_binding_id: str,
+    control_binding_revision: str,
+    timing: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    """Replace one normalized operator Stop profile across derived route rows.
+    """Edit one exact binding's Stop profile/timing across its derived routes.
 
     Deployment compilation still validates every expanded row.  This focused
     mutation prevents the browser from editing those compiler-expanded copies
     independently or leaving them inconsistent.
     """
 
+    graph = document.get("graph", {})
+    bindings = graph.get("control_bindings", []) if isinstance(graph, dict) else []
+    selected = [
+        row
+        for row in bindings
+        if isinstance(row, dict) and row.get("control_binding_id") == control_binding_id
+    ]
+    if (
+        len(selected) != 1
+        or selected[0].get("control_binding_revision") != control_binding_revision
+    ):
+        _fail(
+            "deployment_controlled_stop_scope_mismatch",
+            "Controlled Stop target no longer matches this Deployment Draft",
+            status_code=409,
+        )
+    if timing is not None and (
+        not isinstance(timing, dict)
+        or set(timing)
+        != {
+            "command_latency_allowance_ns",
+            "settling_allowance_ns",
+            "operational_timeout_ns",
+        }
+        or any(
+            type(value) is not int or not 0 <= value <= 9_007_199_254_740_991
+            for value in timing.values()
+        )
+    ):
+        _fail(
+            "deployment_controlled_stop_invalid",
+            "Stop timing must contain the three integer nanosecond values",
+        )
+    if profile is None:
+        return _with_stop_timing(
+            document, control_binding_id, control_binding_revision, timing
+        )
+
     expected = {
         "allow_natural_completion_on_short_path",
+        "jerk_limits_enabled",
         "deceleration_time_s",
         "per_resource_limits",
         "stop_mode",
@@ -218,15 +289,20 @@ def _edit_controlled_stop_profile(
             "deployment_controlled_stop_invalid",
             "Controlled Stop natural-completion choice must be boolean",
         )
+    if type(profile["jerk_limits_enabled"]) is not bool:
+        _fail(
+            "deployment_controlled_stop_invalid",
+            "Choose explicitly whether Controlled Stop enforces jerk limits",
+        )
     deceleration = profile["deceleration_time_s"]
     if (
         type(deceleration) not in {int, float}
         or not math.isfinite(float(deceleration))
-        or not 0.0 < float(deceleration) <= 60.0
+        or not 0.0 < float(deceleration) <= 2.0
     ):
         _fail(
             "deployment_controlled_stop_invalid",
-            "Controlled Stop deceleration time must be in (0, 60] seconds",
+            "Controlled Stop deceleration time must be in (0, 2] seconds",
         )
     limits = profile["per_resource_limits"]
     if not isinstance(limits, list) or not 1 <= len(limits) <= 256:
@@ -236,22 +312,33 @@ def _edit_controlled_stop_profile(
         )
     by_resource: dict[str, dict[str, Any]] = {}
     for row in limits:
-        if not isinstance(row, dict) or set(row) != {
+        required_fields = {
             "max_deceleration",
             "resource_id",
             "settle_velocity_threshold",
-        }:
+        }
+        if (
+            not isinstance(row, dict)
+            or not required_fields <= set(row)
+            or not set(row) <= required_fields | {"max_jerk"}
+        ):
             _fail(
                 "deployment_controlled_stop_invalid",
                 "Controlled Stop resource limit has an invalid shape",
             )
         resource_id = row["resource_id"]
-        if not isinstance(resource_id, str) or not resource_id or resource_id in by_resource:
+        if (
+            not isinstance(resource_id, str)
+            or not resource_id
+            or resource_id in by_resource
+        ):
             _fail(
                 "deployment_controlled_stop_invalid",
                 "Controlled Stop resource identities must be nonempty and unique",
             )
-        for field in ("max_deceleration", "settle_velocity_threshold"):
+        for field in ("max_deceleration", "settle_velocity_threshold", "max_jerk"):
+            if field not in row:
+                continue
             value = row[field]
             if not isinstance(value, dict) or set(value) != {
                 "coordinate_kind",
@@ -267,7 +354,7 @@ def _edit_controlled_stop_profile(
                 or type(number) not in {int, float}
                 or not math.isfinite(float(number))
                 or float(number) < 0.0
-                or (field == "max_deceleration" and float(number) <= 0.0)
+                or (field != "settle_velocity_threshold" and float(number) <= 0.0)
             ):
                 _fail(
                     "deployment_controlled_stop_invalid",
@@ -288,18 +375,37 @@ def _edit_controlled_stop_profile(
     updated = 0
     expected_resource_ids = set(by_resource)
     for row in candidate_rows:
-        if not isinstance(row, dict) or row.get("stop_escalation_stage_id") != "motion_controlled_stop":
+        if (
+            not isinstance(row, dict)
+            or row.get("control_binding_id") != control_binding_id
+            or row.get("stop_escalation_stage_id") != "motion_controlled_stop"
+        ):
             continue
+        if row.get("control_binding_revision") != control_binding_revision:
+            _fail(
+                "deployment_controlled_stop_scope_mismatch",
+                "Controlled Stop route has a stale binding revision",
+                status_code=409,
+            )
         provider = row.get("provider_contract_ref")
-        if not isinstance(provider, dict) or provider.get("provider_contract_role_id") != "stop_contract":
+        if (
+            not isinstance(provider, dict)
+            or provider.get("provider_contract_role_id") != "stop_contract"
+        ):
             continue
         current = row.get("default_contract_parameters")
-        current_limits = current.get("per_resource_limits") if isinstance(current, dict) else None
-        if not isinstance(current_limits, list) or {
-            item.get("resource_id")
-            for item in current_limits
-            if isinstance(item, dict)
-        } != expected_resource_ids:
+        current_limits = (
+            current.get("per_resource_limits") if isinstance(current, dict) else None
+        )
+        if (
+            not isinstance(current_limits, list)
+            or {
+                item.get("resource_id")
+                for item in current_limits
+                if isinstance(item, dict)
+            }
+            != expected_resource_ids
+        ):
             _fail(
                 "deployment_controlled_stop_scope_mismatch",
                 "Controlled Stop resource scope differs across derived route rows",
@@ -336,15 +442,41 @@ def _edit_controlled_stop_profile(
                     "coordinate_kind": requested["coordinate_kind"],
                     value_field: float(requested_number),
                 }
+            if "max_jerk" in replacement:
+                kind, value_field = {
+                    "angular_rad_s2": ("angular_rad_s3", "value_rad_s3"),
+                    "linear_m_s2": ("linear_m_s3", "value_m_s3"),
+                }.get(replacement["max_deceleration"]["coordinate_kind"], (None, None))
+                requested = replacement["max_jerk"]
+                if kind is None or requested["coordinate_kind"] != kind:
+                    _fail(
+                        "deployment_controlled_stop_scope_mismatch",
+                        "Jerk units differ from the compiled resource",
+                        status_code=409,
+                    )
+                replacement["max_jerk"] = {
+                    "coordinate_kind": kind,
+                    value_field: float(requested["value"]),
+                }
             materialized_limits.append(replacement)
         row["default_contract_parameters"] = {
             "allow_natural_completion_on_short_path": profile[
                 "allow_natural_completion_on_short_path"
             ],
             "deceleration_time_s": float(deceleration),
+            "jerk_limits_enabled": profile["jerk_limits_enabled"],
             "per_resource_limits": materialized_limits,
             "stop_mode": profile["stop_mode"],
         }
+        # This editor does not author provider substitution policy. Preserve an
+        # existing qualified Soft substitution while editing its other fields.
+        if (
+            profile["stop_mode"] == "soft_on_path"
+            and current.get("recoverable_substitution_mode") == "spring_back_hold"
+        ):
+            row["default_contract_parameters"][
+                "recoverable_substitution_mode"
+            ] = "spring_back_hold"
         updated += 1
     if updated == 0:
         _fail(
@@ -352,6 +484,50 @@ def _edit_controlled_stop_profile(
             "Deployment has no editable Controlled Stop stage",
             status_code=409,
         )
+    return _with_stop_timing(
+        candidate, control_binding_id, control_binding_revision, timing
+    )
+
+
+def _with_stop_timing(
+    document: dict[str, Any],
+    control_binding_id: str,
+    control_binding_revision: str,
+    timing: dict[str, Any] | None,
+) -> dict[str, Any]:
+    candidate = deepcopy(document)
+    policies = candidate.get("policies")
+    if not isinstance(policies, dict):
+        _fail(
+            "deployment_controlled_stop_unavailable",
+            "Deployment has no Stop policy inventory",
+        )
+    timings = policies.get("stop_timing_parameters", [])
+    if not isinstance(timings, list):
+        _fail(
+            "deployment_controlled_stop_invalid", "Stop timing inventory is malformed"
+        )
+    if any(not isinstance(row, dict) for row in timings):
+        _fail(
+            "deployment_controlled_stop_invalid", "Stop timing inventory is malformed"
+        )
+    timings = [
+        row for row in timings if row.get("control_binding_id") != control_binding_id
+    ]
+    if timing is not None:
+        timings.append(
+            {
+                "control_binding_id": control_binding_id,
+                "control_binding_revision": control_binding_revision,
+                "timing": deepcopy(timing),
+            }
+        )
+    if timings:
+        candidate["policies"]["stop_timing_parameters"] = timings
+    else:
+        candidate["policies"].pop("stop_timing_parameters", None)
+    # The single C++ compiler owns full-profile minimums and qualified phase/
+    # dwell checks; this authoring adapter does not implement timing policy.
     return candidate
 
 
@@ -407,8 +583,7 @@ def _edit_motion_target_limit(
         for row in limits:
             if (
                 isinstance(row, dict)
-                and row.get("controllable_component_id")
-                == controllable_component_id
+                and row.get("controllable_component_id") == controllable_component_id
                 and row.get("command_target_id") == command_target_id
             ):
                 matches.append(row)
@@ -418,16 +593,16 @@ def _edit_motion_target_limit(
             "Deployment must contain exactly one limit for the addressed motion target",
             status_code=409,
         )
-    matches[0]["maximum_tcp_linear_speed_mps"] = float(
-        maximum_tcp_linear_speed_mps
-    )
+    matches[0]["maximum_tcp_linear_speed_mps"] = float(maximum_tcp_linear_speed_mps)
     return candidate
 
 
 class DeploymentDraftSession:
     """Own one optional exact Deployment Draft and Saved baseline."""
 
-    def __init__(self, *, compiler: DeploymentCompiler = compile_deployment_document) -> None:
+    def __init__(
+        self, *, compiler: DeploymentCompiler = compile_deployment_document
+    ) -> None:
         self._lock = threading.RLock()
         self._compiler = compiler
         self._draft_id = f"deployment-draft-{uuid.uuid4().hex}"
@@ -499,8 +674,11 @@ class DeploymentDraftSession:
 
     def preview_controlled_stop_update(
         self,
-        profile: dict[str, Any],
+        profile: dict[str, Any] | None,
         *,
+        control_binding_id: str,
+        control_binding_revision: str,
+        timing: dict[str, Any] | None,
         draft_id: str,
         expected_revision: int,
     ) -> CompiledDeploymentDocument:
@@ -513,7 +691,11 @@ class DeploymentDraftSession:
                     status_code=404,
                 )
             candidate = _edit_controlled_stop_profile(
-                self._compiled.document, profile
+                self._compiled.document,
+                profile,
+                control_binding_id=control_binding_id,
+                control_binding_revision=control_binding_revision,
+                timing=timing,
             )
         return self._compiler(_source(candidate))
 
@@ -595,8 +777,14 @@ class DeploymentDraftSession:
             or not state["draft_id"]
             or type(state["draft_revision"]) is not int
             or state["draft_revision"] < 0
-            or (state["saved_path"] is not None and not isinstance(state["saved_path"], str))
-            or (state["saved_document"] is not None and not isinstance(state["saved_document"], dict))
+            or (
+                state["saved_path"] is not None
+                and not isinstance(state["saved_path"], str)
+            )
+            or (
+                state["saved_document"] is not None
+                and not isinstance(state["saved_document"], dict)
+            )
         ):
             _fail(
                 "deployment_retained_draft_invalid",
@@ -651,9 +839,7 @@ class DeploymentDraftSession:
             self._saved_document = deepcopy(compiled.document)
             self._revision += 1
 
-    def mark_saved(
-        self, path: str, *, draft_id: str, expected_revision: int
-    ) -> None:
+    def mark_saved(self, path: str, *, draft_id: str, expected_revision: int) -> None:
         with self._lock:
             self._require_current(draft_id, expected_revision)
             if self._compiled is None:
@@ -687,14 +873,20 @@ class DeploymentDraftSession:
                     "revision": self._revision,
                     "document": document,
                     "deploymentArtifactId": (
-                        compiled.deployment_artifact_id if compiled is not None else None
+                        compiled.deployment_artifact_id
+                        if compiled is not None
+                        else None
                     ),
                     "deploymentRevision": (
                         compiled.deployment_revision if compiled is not None else None
                     ),
-                    "graphRevision": compiled.graph_revision if compiled is not None else None,
+                    "graphRevision": (
+                        compiled.graph_revision if compiled is not None else None
+                    ),
                     "differsFromSaved": (
-                        document != self._saved_document if document is not None else False
+                        document != self._saved_document
+                        if document is not None
+                        else False
                     ),
                 },
                 "saved": {

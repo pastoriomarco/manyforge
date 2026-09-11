@@ -25,6 +25,8 @@ from .models import (
     OperationControlRequest,
     OperationRecoveryActionRequest,
     OperationIntentRequest,
+    ManualProgramHandover,
+    ManualControlAvailability,
     Pose3Request,
     PickSequencePlanningRequest,
     PlaceSequencePlanningRequest,
@@ -82,7 +84,9 @@ def _valid_operation_event_identity(event: dict[str, Any]) -> bool:
         )
     if event.get("record_kind") == "stop_terminal_projected":
         return (
-            operation_id is None and operation_revision is None and event.get("request_id") is None
+            operation_id is None
+            and operation_revision is None
+            and event.get("request_id") is None
         )
     return (
         isinstance(operation_id, str)
@@ -98,7 +102,9 @@ MAX_EXECUTION_RESPONSE_BYTES = 4 * 1024 * 1024
 # are removed as their control event is ingested, so this is a concurrent
 # owner-state bound rather than lifetime retention.
 MAXIMUM_RESIDENT_OPERATION_CONTROL_KEYS = 4096
-MOTION_PREVIEW_RESPONSE_KEYS = frozenset({"api_version", "command", "ok", "preview_receipt"})
+MOTION_PREVIEW_RESPONSE_KEYS = frozenset(
+    {"api_version", "command", "ok", "preview_receipt"}
+)
 MOTION_PREVIEW_RECEIPT_KEYS = frozenset(
     {
         "collision_world_revision",
@@ -191,6 +197,13 @@ class ExecutionPort(Protocol):
     ) -> dict[str, Any]: ...
 
     def preview_motion(
+        self,
+        request: OperationIntentRequest,
+        *,
+        trusted_principal_id: str | None,
+    ) -> dict[str, Any]: ...
+
+    def read_manual_handover(
         self,
         request: OperationIntentRequest,
         *,
@@ -367,7 +380,9 @@ def _decode_execution_response(payload: bytes, flags: int) -> dict[str, Any]:
     return response
 
 
-class ExecutionObservationSession(AbstractContextManager["ExecutionObservationSession"]):
+class ExecutionObservationSession(
+    AbstractContextManager["ExecutionObservationSession"]
+):
     """One demand-driven native observation session; no timer or state cache."""
 
     def __init__(
@@ -443,7 +458,9 @@ class ExecutionObservationSession(AbstractContextManager["ExecutionObservationSe
             "api_version": EXECUTION_COMMAND_VERSION,
             "after_owner_epoch": None if cursor is None else cursor["owner_epoch"],
             "after_source_epoch": None if cursor is None else cursor["source_epoch"],
-            "after_source_sequence": (None if cursor is None else cursor["source_sequence"]),
+            "after_source_sequence": (
+                None if cursor is None else cursor["source_sequence"]
+            ),
             "command": "observation",
         }
         encoded = _canonical_json(command)
@@ -540,11 +557,15 @@ class ExecutionCommandClient:
             ) from error
         self._socket_path = self._run_root.path / EXECUTION_SOCKET_FILE
         self._control_socket_path = self._run_root.path / EXECUTION_CONTROL_SOCKET_FILE
-        self._observation_socket_path = self._run_root.path / EXECUTION_OBSERVATION_SOCKET_FILE
+        self._observation_socket_path = (
+            self._run_root.path / EXECUTION_OBSERVATION_SOCKET_FILE
+        )
         self._timeout_seconds = timeout_seconds
         self._attribution_transport = attribution_transport
 
-    def _exchange_on(self, command: dict[str, Any], socket_path: Path) -> dict[str, Any]:
+    def _exchange_on(
+        self, command: dict[str, Any], socket_path: Path
+    ) -> dict[str, Any]:
         encoded = _canonical_json(command)
         if len(encoded) > MAX_EXECUTION_PACKET_BYTES:
             raise HeadlessApiError(
@@ -639,7 +660,10 @@ class ExecutionCommandClient:
                 or len(value.encode("utf-8")) > 2_048
             ):
                 raise ValueError(f"{label} must be bounded non-empty NFC text")
-        if type(stop_generation) is not int or not 1 <= stop_generation <= MAXIMUM_SAFE_INTEGER:
+        if (
+            type(stop_generation) is not int
+            or not 1 <= stop_generation <= MAXIMUM_SAFE_INTEGER
+        ):
             raise ValueError("Stop generation is outside its safe bound")
         response = self._exchange(
             {
@@ -727,7 +751,8 @@ class ExecutionCommandClient:
     def _request_attribution(self, trusted_principal_id: str | None) -> dict[str, Any]:
         if trusted_principal_id is not None and (
             not trusted_principal_id
-            or unicodedata.normalize("NFC", trusted_principal_id) != trusted_principal_id
+            or unicodedata.normalize("NFC", trusted_principal_id)
+            != trusted_principal_id
             or len(trusted_principal_id.encode("utf-8")) > 256
         ):
             raise HeadlessApiError(
@@ -748,13 +773,17 @@ class ExecutionCommandClient:
         return {
             "transport": "http",
             "assurance": (
-                "externally_authenticated" if trusted_principal_id is not None else "unverified"
+                "externally_authenticated"
+                if trusted_principal_id is not None
+                else "unverified"
             ),
             "principal_id": trusted_principal_id,
         }
 
     @staticmethod
-    def _validate_projection_response(command: str, response: dict[str, Any]) -> dict[str, Any]:
+    def _validate_projection_response(
+        command: str, response: dict[str, Any]
+    ) -> dict[str, Any]:
         if response.get("ok") is True and response.get("command") != command:
             raise HeadlessApiError(
                 "execution_command_response_invalid",
@@ -774,7 +803,9 @@ class ExecutionCommandClient:
     def _read_projection(self, command: str) -> dict[str, Any]:
         return self._validate_projection_response(
             command,
-            self._exchange({"api_version": EXECUTION_COMMAND_VERSION, "command": command}),
+            self._exchange(
+                {"api_version": EXECUTION_COMMAND_VERSION, "command": command}
+            ),
         )
 
     def diagnostics(self) -> dict[str, Any]:
@@ -851,7 +882,8 @@ class ExecutionCommandClient:
             or accepted.get("operation_id") != request.operation_id
             or accepted.get("operation_revision") != request.expected_operation_revision
             or type(accepted.get("runtime_scale_generation")) is not int
-            or accepted["runtime_scale_generation"] != request.expected_runtime_scale_generation + 1
+            or accepted["runtime_scale_generation"]
+            != request.expected_runtime_scale_generation + 1
             or accepted.get("requested_scale") != request.scale
         ):
             raise HeadlessApiError(
@@ -877,8 +909,12 @@ class ExecutionCommandClient:
                     "request": request.model_dump(mode="json"),
                     "attribution": self._request_attribution(trusted_principal_id),
                     "origin_epoch": origin_epoch,
-                    "received_monotonic_ns": nonnegative_int64_value(received_monotonic_ns),
-                    "valid_until_monotonic_ns": nonnegative_int64_value(valid_until_monotonic_ns),
+                    "received_monotonic_ns": nonnegative_int64_value(
+                        received_monotonic_ns
+                    ),
+                    "valid_until_monotonic_ns": nonnegative_int64_value(
+                        valid_until_monotonic_ns
+                    ),
                 }
             )
         )
@@ -914,7 +950,8 @@ class ExecutionCommandClient:
             }
             or response.get("api_version") != EXECUTION_RESPONSE_VERSION
             or response.get("command") != "gripper_confirm"
-            or response.get("owner_epoch") != request.request_context.request_owner_epoch
+            or response.get("owner_epoch")
+            != request.request_context.request_owner_epoch
             or response.get("program_binding_id") != request.program_binding_id
             or response.get("target_role_id") != request.target_role_id
             or not isinstance(confirmation, dict)
@@ -947,7 +984,8 @@ class ExecutionCommandClient:
         if (
             response.get("command") != "query_target"
             or not isinstance(observation, dict)
-            or set(observation) != set(expected) | {"source_epoch", "source_sequence", "value"}
+            or set(observation)
+            != set(expected) | {"source_epoch", "source_sequence", "value"}
             or any(observation.get(key) != value for key, value in expected.items())
             or not isinstance(observation.get("source_epoch"), str)
             or not observation["source_epoch"]
@@ -975,9 +1013,13 @@ class ExecutionCommandClient:
                     )
                 )
                 if abs(norm_squared - 1.0) > 1e-6:
-                    raise ValueError("native frame orientation is not a unit quaternion")
+                    raise ValueError(
+                        "native frame orientation is not a unit quaternion"
+                    )
             elif request.kind == "gripper_confirmation":
-                status = GripperConfirmationStatusObservation.model_validate(observation["value"])
+                status = GripperConfirmationStatusObservation.model_validate(
+                    observation["value"]
+                )
                 if (
                     observation["source_epoch"] != status.source_epoch
                     or observation["source_sequence"] != status.revision
@@ -988,7 +1030,9 @@ class ExecutionCommandClient:
                     # This private owner and Headless share the host monotonic
                     # clock. A delayed sample is not current grasp evidence.
                     if not (
-                        evidence.observed_at_ns <= time.monotonic_ns() < evidence.expires_at_ns
+                        evidence.observed_at_ns
+                        <= time.monotonic_ns()
+                        < evidence.expires_at_ns
                     ):
                         raise ValueError("confirmation expired before receipt")
             else:
@@ -1021,7 +1065,9 @@ class ExecutionCommandClient:
             and error["message"]
             and isinstance(error.get("details", {}), dict)
         ):
-            raise HeadlessApiError(error["code"], error["message"], details=error.get("details"))
+            raise HeadlessApiError(
+                error["code"], error["message"], details=error.get("details")
+            )
         raise HeadlessApiError(
             "execution_command_response_invalid",
             "native execution owner returned an invalid error response",
@@ -1085,7 +1131,9 @@ class ExecutionCommandClient:
         previous = after_sequence
         for event in page["events"]:
             try:
-                nonnegative_int64(event.get("occurred_at_ns") if isinstance(event, dict) else None)
+                nonnegative_int64(
+                    event.get("occurred_at_ns") if isinstance(event, dict) else None
+                )
             except ValueError as error:
                 raise HeadlessApiError(
                     "execution_command_response_invalid",
@@ -1154,6 +1202,73 @@ class ExecutionCommandClient:
             )
         return response
 
+    def read_manual_handover(
+        self,
+        request: OperationIntentRequest,
+        *,
+        trusted_principal_id: str | None,
+    ) -> dict[str, Any]:
+        """Read exact Kernel cleanup input; this does not grant manual admission."""
+        operation = request.model_dump(mode="json")
+        response = self._exchange(
+            {
+                "api_version": EXECUTION_COMMAND_VERSION,
+                "attribution": self._request_attribution(trusted_principal_id),
+                "command": "read_manual_handover",
+                "operation": operation,
+            }
+        )
+        if response.get("ok") is not True:
+            return response
+        if (
+            set(response)
+            != {
+                "api_version",
+                "command",
+                "ok",
+                "handover",
+                "availability",
+                "intent_digest",
+                "request_id",
+                "request_owner_epoch",
+            }
+            or response.get("command") != "read_manual_handover"
+            or response.get("request_id") != request.request_context.request_id
+            or response.get("request_owner_epoch")
+            != request.request_context.request_owner_epoch
+            or response.get("intent_digest")
+            != "sha256:" + hashlib.sha256(_canonical_json(operation)).hexdigest()
+        ):
+            raise HeadlessApiError(
+                "execution_command_response_identity_mismatch",
+                "manual handover response differs from its request",
+            )
+        try:
+            availability = ManualControlAvailability.model_validate(
+                response["availability"]
+            )
+            if availability.cleanup_required and response["handover"] is None:
+                raise ValueError("manual cleanup requires an exact held Program")
+        except ValueError as error:
+            raise HeadlessApiError(
+                "execution_command_response_invalid",
+                "manual availability response is malformed",
+            ) from error
+        if response["handover"] is not None:
+            try:
+                parsed = ManualProgramHandover.model_validate(response["handover"])
+            except ValueError as error:
+                raise HeadlessApiError(
+                    "execution_command_response_invalid",
+                    "manual handover response is malformed",
+                ) from error
+            if parsed.context.program_run_id == request.program_run_id:
+                raise HeadlessApiError(
+                    "execution_command_response_identity_mismatch",
+                    "manual operation cannot be its own Program parent",
+                )
+        return response
+
     def preview_motion(
         self,
         request: OperationIntentRequest,
@@ -1173,7 +1288,9 @@ class ExecutionCommandClient:
             return response
         receipt = response.get("preview_receipt")
         participant = operation["participants"][0]
-        expected_intent_digest = "sha256:" + hashlib.sha256(_canonical_json(operation)).hexdigest()
+        expected_intent_digest = (
+            "sha256:" + hashlib.sha256(_canonical_json(operation)).hexdigest()
+        )
         expected_scene = operation["expected_scene_revision"]
         if (
             set(response) != MOTION_PREVIEW_RESPONSE_KEYS
@@ -1186,7 +1303,8 @@ class ExecutionCommandClient:
             )
         if (
             response.get("command") != "preview_motion"
-            or receipt.get("schema_version") != "manyforge.direct_control_motion_preview.v1"
+            or receipt.get("schema_version")
+            != "manyforge.direct_control_motion_preview.v1"
             or receipt.get("commit_eligible") is not True
             or receipt.get("intent_digest") != expected_intent_digest
             or receipt.get("request_id") != operation["request_context"]["request_id"]
@@ -1197,11 +1315,13 @@ class ExecutionCommandClient:
             or receipt.get("program_binding_id") != operation["program_binding_id"]
             or receipt.get("program_run_id") != operation["program_run_id"]
             or receipt.get("graph_revision") != operation["expected_graph_revision"]
-            or receipt.get("retained_bundle_id") != operation["expected_retained_bundle_id"]
+            or receipt.get("retained_bundle_id")
+            != operation["expected_retained_bundle_id"]
             or receipt.get("scene_revision") != expected_scene
             or receipt.get("component_role_id") != participant["component_role_id"]
             or receipt.get("target_role_id") != participant["target_role_id"]
-            or receipt.get("required_capability_id") != participant["required_capability_id"]
+            or receipt.get("required_capability_id")
+            != participant["required_capability_id"]
         ):
             raise HeadlessApiError(
                 "execution_command_response_identity_mismatch",
@@ -1211,7 +1331,8 @@ class ExecutionCommandClient:
         submitted_motion = participant["payload"].get("motion")
         submitted_source_names = (
             submitted_motion.get("joint_names")
-            if isinstance(submitted_motion, dict) and submitted_motion.get("kind") == "joint_goal"
+            if isinstance(submitted_motion, dict)
+            and submitted_motion.get("kind") == "joint_goal"
             else None
         )
         start_positions = receipt.get("start_positions_rad")
@@ -1222,7 +1343,10 @@ class ExecutionCommandClient:
             or not source_names
             or not all(isinstance(name, str) and name for name in source_names)
             or len(source_names) != len(set(source_names))
-            or (submitted_source_names is not None and source_names != submitted_source_names)
+            or (
+                submitted_source_names is not None
+                and source_names != submitted_source_names
+            )
             or not isinstance(start_positions, list)
             or not isinstance(final_positions, list)
             or len(start_positions) != len(source_names)
@@ -1285,8 +1409,12 @@ class ExecutionCommandClient:
         participant = operation["participants"][0]
         payload = participant["payload"]
         command_value = payload.get("command_value")
-        position = command_value.get("position") if isinstance(command_value, dict) else None
-        expected_intent_digest = "sha256:" + hashlib.sha256(_canonical_json(operation)).hexdigest()
+        position = (
+            command_value.get("position") if isinstance(command_value, dict) else None
+        )
+        expected_intent_digest = (
+            "sha256:" + hashlib.sha256(_canonical_json(operation)).hexdigest()
+        )
         if (
             set(response) != CAPABILITY_COMMAND_PREVIEW_RESPONSE_KEYS
             or not isinstance(receipt, dict)
@@ -1310,13 +1438,16 @@ class ExecutionCommandClient:
             or receipt.get("program_binding_id") != operation["program_binding_id"]
             or receipt.get("program_run_id") != operation["program_run_id"]
             or receipt.get("graph_revision") != operation["expected_graph_revision"]
-            or receipt.get("retained_bundle_id") != operation["expected_retained_bundle_id"]
+            or receipt.get("retained_bundle_id")
+            != operation["expected_retained_bundle_id"]
             or receipt.get("scene_revision") != operation["expected_scene_revision"]
             or receipt.get("component_role_id") != participant["component_role_id"]
             or receipt.get("target_role_id") != participant["target_role_id"]
-            or receipt.get("required_capability_id") != participant["required_capability_id"]
+            or receipt.get("required_capability_id")
+            != participant["required_capability_id"]
             or receipt.get("command_schema_id") != payload.get("command_schema_id")
-            or receipt.get("command_schema_revision") != payload.get("command_schema_revision")
+            or receipt.get("command_schema_revision")
+            != payload.get("command_schema_revision")
         ):
             raise HeadlessApiError(
                 "execution_command_response_identity_mismatch",
@@ -1417,7 +1548,8 @@ class ExecutionCommandClient:
         if response.get("ok") is True and (
             response.get("command") != "get_operation_recovery"
             or not isinstance(assessment, dict)
-            or assessment.get("schema_version") != "manyforge.kernel_recovery_assessment.v1"
+            or assessment.get("schema_version")
+            != "manyforge.kernel_recovery_assessment.v1"
             or type(assessment.get("assessment_revision")) is not int
             or assessment["assessment_revision"] < 1
             or type(assessment.get("control_command_epoch")) is not int
@@ -1427,7 +1559,10 @@ class ExecutionCommandClient:
             or response["operation_revision"] < 1
             or not isinstance(participants, list)
             or not participants
-            or (response.get("stop_id") is None and response.get("stop_generation") is not None)
+            or (
+                response.get("stop_id") is None
+                and response.get("stop_generation") is not None
+            )
             or (
                 response.get("stop_id") is not None
                 and (
@@ -1502,7 +1637,8 @@ class ExecutionCommandClient:
             if (
                 response.get("command") != command
                 or not isinstance(result, dict)
-                or result.get("schema_version") != "manyforge.pick_place_planning_result.v1"
+                or result.get("schema_version")
+                != "manyforge.pick_place_planning_result.v1"
                 or result.get("sequence_id") != request.sequence_id
                 or result.get("kind") != expected_kind
                 or result.get("selected_object_id") != request.selected_object_id
@@ -1516,9 +1652,18 @@ class ExecutionCommandClient:
                     and result["attempted_candidate_count"] > 0
                     and not isinstance(result.get("last_attempted_candidate"), dict)
                 )
-                or (expected_kind == "place" and result.get("last_attempted_candidate") is not None)
-                or (result["status"] == "planned" and not isinstance(result.get("plan"), dict))
-                or (result["status"] == "no_feasible_candidate" and result.get("plan") is not None)
+                or (
+                    expected_kind == "place"
+                    and result.get("last_attempted_candidate") is not None
+                )
+                or (
+                    result["status"] == "planned"
+                    and not isinstance(result.get("plan"), dict)
+                )
+                or (
+                    result["status"] == "no_feasible_candidate"
+                    and result.get("plan") is not None
+                )
             ):
                 raise HeadlessApiError(
                     "execution_command_response_identity_mismatch",
@@ -1680,7 +1825,8 @@ class ExecutionCommandClient:
             or accepted.get("request_id") != request.request_context.request_id
             or accepted.get("operation_id") != request.operation_id
             or accepted.get("control") != command
-            or accepted.get("accepted_against_revision") != request.expected_operation_revision
+            or accepted.get("accepted_against_revision")
+            != request.expected_operation_revision
         ):
             raise HeadlessApiError(
                 "execution_command_response_identity_mismatch",
@@ -1694,7 +1840,9 @@ class ExecutionCommandClient:
         *,
         trusted_principal_id: str | None,
     ) -> dict[str, Any]:
-        return self._control("pause", request, trusted_principal_id=trusted_principal_id)
+        return self._control(
+            "pause", request, trusted_principal_id=trusted_principal_id
+        )
 
     def resume(
         self,
@@ -1702,7 +1850,9 @@ class ExecutionCommandClient:
         *,
         trusted_principal_id: str | None,
     ) -> dict[str, Any]:
-        return self._control("resume", request, trusted_principal_id=trusted_principal_id)
+        return self._control(
+            "resume", request, trusted_principal_id=trusted_principal_id
+        )
 
     def reset(
         self,
@@ -1710,7 +1860,9 @@ class ExecutionCommandClient:
         *,
         trusted_principal_id: str | None,
     ) -> dict[str, Any]:
-        return self._control("reset", request, trusted_principal_id=trusted_principal_id)
+        return self._control(
+            "reset", request, trusted_principal_id=trusted_principal_id
+        )
 
     def acknowledge_completed(
         self,
@@ -1851,10 +2003,14 @@ class ExecutionCommandClient:
             "retained_bundle_id",
             "stop_id",
         )
-        if any(not isinstance(latch.get(key), str) or not latch[key] for key in required_text):
+        if any(
+            not isinstance(latch.get(key), str) or not latch[key]
+            for key in required_text
+        ):
             return False
         if any(
-            type(latch.get(key)) is not int or not 1 <= latch[key] <= MAXIMUM_SAFE_INTEGER
+            type(latch.get(key)) is not int
+            or not 1 <= latch[key] <= MAXIMUM_SAFE_INTEGER
             for key in (
                 "latch_generation",
                 "recovery_assessment_revision",
@@ -1891,7 +2047,7 @@ class ExecutionCommandClient:
             ):
                 return False
         certificate = latch.get("stop_certificate")
-        if (
+        if certificate is not None and (
             not isinstance(certificate, dict)
             or set(certificate)
             != {
@@ -1909,6 +2065,8 @@ class ExecutionCommandClient:
                 or not 1 <= certificate[key] <= MAXIMUM_SAFE_INTEGER
                 for key in ("stop_certificate_revision", "stop_generation")
             )
+            or certificate["stop_id"] != latch["stop_id"]
+            or certificate["stop_generation"] != latch["stop_generation"]
         ):
             return False
         for key in ("terminal_projection", "clear_projection"):
@@ -1952,10 +2110,20 @@ class ExecutionCommandClient:
                 or not isinstance(row.get("active_control_configuration_id"), str)
                 or not row["active_control_configuration_id"]
                 or type(row.get("active_control_configuration_generation")) is not int
-                or not 1 <= row["active_control_configuration_generation"] <= MAXIMUM_SAFE_INTEGER
+                or not 1
+                <= row["active_control_configuration_generation"]
+                <= MAXIMUM_SAFE_INTEGER
             ):
                 return False
             prior = row["control_domain_id"]
+        if certificate is None:
+            return (
+                not expectations
+                and latch["state"] == "latched"
+                and latch["recovery_status"] == "waiting_for_observation"
+                and latch["terminal_projection"]["state"] == "pending"
+                and latch["clear_projection"]["state"] == "not_applicable"
+            )
         return bool(expectations)
 
     def stop_fault(self) -> dict[str, Any]:
@@ -2277,7 +2445,9 @@ class ExecutionEventPump:
             cursor = (source_owner_epoch, through_source_sequence)
             if cursor == condition_cursor and now < next_condition_poll_at:
                 return {}
-            response = ExecutionCommandClient.require_success(self._execution.stop_fault())
+            response = ExecutionCommandClient.require_success(
+                self._execution.stop_fault()
+            )
             offer = response["stop_fault"]
             latch = offer["latch"] if isinstance(offer, dict) else None
             condition_cursor = cursor
@@ -2304,14 +2474,18 @@ class ExecutionEventPump:
             try:
                 if owner_epoch is None:
                     identity_response = self._execution.identity()
-                    next_admission_generation = self._admission_generation(identity_response)
+                    next_admission_generation = self._admission_generation(
+                        identity_response
+                    )
                     if admission_generation != next_admission_generation:
                         admission_generation = next_admission_generation
                         control_projection_changed = True
                     if identity_response.get("ok") is not True:
                         idle_epoch = self._idle_owner_epoch(identity_response)
                         if idle_epoch is None:
-                            ExecutionCommandClient._raise_error_response(identity_response)
+                            ExecutionCommandClient._raise_error_response(
+                                identity_response
+                            )
                         if source_high_water_epoch != idle_epoch:
                             source_high_water_epoch = idle_epoch
                             source_high_water = 0
@@ -2326,7 +2500,9 @@ class ExecutionEventPump:
                         self._stop.wait(self._poll_seconds)
                         continue
                     status = identity_response.get("identity")
-                    next_epoch = status.get("owner_epoch") if isinstance(status, dict) else None
+                    next_epoch = (
+                        status.get("owner_epoch") if isinstance(status, dict) else None
+                    )
                     if not isinstance(next_epoch, str) or not next_epoch:
                         raise HeadlessApiError(
                             "execution_command_response_invalid",

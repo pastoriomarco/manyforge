@@ -34,6 +34,7 @@ from .models import (
     ProgramScenePreparationRequest,
     ProgramSelectionStopRequest,
     ProgramSelectionResumeRequest,
+    ProgramManualHandoverRequest,
     RuntimeBlackboardWriteRequest,
     RuntimeOverrideActionRequest,
     RuntimeOverridePromotionRequest,
@@ -172,7 +173,8 @@ async def _serve_program_control_state(
             cycle, observed_ns = await asyncio.to_thread(source.snapshot)
             control_revision = cycle.get("execution_control_revision")
             node_only = (
-                last_control_revision is not None and control_revision == last_control_revision
+                last_control_revision is not None
+                and control_revision == last_control_revision
             )
             remaining_ns = _NODE_PROGRESS_PERIOD_NS - (observed_ns - last_node_send_ns)
             if node_only and remaining_ns > 0:
@@ -207,10 +209,14 @@ async def _serve_program_control_state(
                 sort_keys=True,
             )
             if len(payload.encode("utf-8")) > _MAXIMUM_PROGRAM_CONTROL_MESSAGE_BYTES:
-                await websocket.close(code=1009, reason="Program control state oversized")
+                await websocket.close(
+                    code=1009, reason="Program control state oversized"
+                )
                 return
             await websocket.send_text(payload)
-            last_control_revision = control_revision if isinstance(control_revision, int) else None
+            last_control_revision = (
+                control_revision if isinstance(control_revision, int) else None
+            )
             last_node_send_ns = observed_ns
     except (WebSocketDisconnect, RuntimeError):
         pass
@@ -234,13 +240,17 @@ class ProgramRunnerApplicationPort(Protocol):
 
     def diagnostic_health(self) -> dict[str, Any]: ...
 
-    def node_availability(self, request: ProgramNodeAvailabilityRequest) -> dict[str, Any]: ...
+    def node_availability(
+        self, request: ProgramNodeAvailabilityRequest
+    ) -> dict[str, Any]: ...
 
     def runs(self, *, active_only: bool, limit: int) -> dict[str, Any]: ...
 
     def start_run(self, request: ProgramRunStartRequest) -> dict[str, Any]: ...
 
-    def prepare_applied_scene(self, request: ProgramScenePreparationRequest) -> dict[str, Any]: ...
+    def prepare_applied_scene(
+        self, request: ProgramScenePreparationRequest
+    ) -> dict[str, Any]: ...
 
     def read_run(self, program_run_id: str) -> dict[str, Any]: ...
 
@@ -258,6 +268,12 @@ class ProgramRunnerApplicationPort(Protocol):
 
     def resume_motion(
         self, program_run_id: str, request: ProgramSelectionResumeRequest
+    ) -> dict[str, Any]: ...
+
+    def prepare_manual_handover(
+        self,
+        program_run_id: str,
+        request: ProgramManualHandoverRequest,
     ) -> dict[str, Any]: ...
 
     def full_stop(
@@ -308,7 +324,9 @@ class ProgramRunnerApplicationPort(Protocol):
         self, program_run_id: str, request: ManualResultStageRequest
     ) -> dict[str, Any]: ...
 
-    def apply_recovery_action(self, request: CycleRecoveryActionRequest) -> dict[str, Any]: ...
+    def apply_recovery_action(
+        self, request: CycleRecoveryActionRequest
+    ) -> dict[str, Any]: ...
 
 
 def _status(code: str) -> int:
@@ -349,7 +367,9 @@ def create_app(runtime: ProgramRunnerApplicationPort) -> FastAPI:
         thread_name_prefix="manyforge_program_runner_control",
     )
     try:
-        control_state_source: ProgramControlStateSource | None = ProgramControlStateSource(runtime)
+        control_state_source: ProgramControlStateSource | None = (
+            ProgramControlStateSource(runtime)
+        )
     except TypeError:
         control_state_source = None
 
@@ -487,7 +507,22 @@ def create_app(runtime: ProgramRunnerApplicationPort) -> FastAPI:
             raise ProgramRunnerError(
                 "program_run_path_invalid", "Program-run path and body must match"
             )
-        return await control_call(lambda: runtime.resume_motion(program_run_id, request))
+        return await control_call(
+            lambda: runtime.resume_motion(program_run_id, request)
+        )
+
+    @app.post("/api/program/runs/{program_run_id}/manual-handover")
+    async def prepare_manual_handover(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        request: ProgramManualHandoverRequest,
+    ) -> dict[str, Any]:
+        if request.program_run_id != program_run_id:
+            raise ProgramRunnerError(
+                "program_run_path_invalid", "Program-run path and body must match"
+            )
+        return await control_call(
+            lambda: runtime.prepare_manual_handover(program_run_id, request)
+        )
 
     @app.post("/api/program/runs/{program_run_id}/full-stop")
     async def full_stop(
@@ -514,7 +549,9 @@ def create_app(runtime: ProgramRunnerApplicationPort) -> FastAPI:
                 "program_run_path_invalid",
                 "Program-run identity in path and body must match",
             )
-        return await control_call(lambda: runtime.resume_full_stop(program_run_id, request))
+        return await control_call(
+            lambda: runtime.resume_full_stop(program_run_id, request)
+        )
 
     @app.post("/api/program/runs/{program_run_id}/discard-full-stop")
     async def discard_full_stop(
@@ -526,7 +563,9 @@ def create_app(runtime: ProgramRunnerApplicationPort) -> FastAPI:
                 "program_run_path_invalid",
                 "Program-run identity in path and body must match",
             )
-        return await control_call(lambda: runtime.discard_full_stop(program_run_id, request))
+        return await control_call(
+            lambda: runtime.discard_full_stop(program_run_id, request)
+        )
 
     @app.get("/api/program/runs/{program_run_id}/runtime-controls")
     def read_runtime_controls(
@@ -539,7 +578,9 @@ def create_app(runtime: ProgramRunnerApplicationPort) -> FastAPI:
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
         request: RuntimeOverrideStageRequest,
     ) -> dict[str, Any]:
-        return await control_call(lambda: runtime.stage_runtime_override(program_run_id, request))
+        return await control_call(
+            lambda: runtime.stage_runtime_override(program_run_id, request)
+        )
 
     @app.post("/api/program/runs/{program_run_id}/runtime-overrides/activate")
     async def activate_runtime_override(
@@ -555,28 +596,36 @@ def create_app(runtime: ProgramRunnerApplicationPort) -> FastAPI:
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
         request: RuntimeOverrideActionRequest,
     ) -> dict[str, Any]:
-        return await control_call(lambda: runtime.clear_runtime_override(program_run_id, request))
+        return await control_call(
+            lambda: runtime.clear_runtime_override(program_run_id, request)
+        )
 
     @app.post("/api/program/runs/{program_run_id}/runtime-overrides/promote")
     async def promote_runtime_override(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
         request: RuntimeOverridePromotionRequest,
     ) -> dict[str, Any]:
-        return await control_call(lambda: runtime.promote_runtime_override(program_run_id, request))
+        return await control_call(
+            lambda: runtime.promote_runtime_override(program_run_id, request)
+        )
 
     @app.post("/api/program/runs/{program_run_id}/blackboard-values")
     async def write_runtime_blackboard(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
         request: RuntimeBlackboardWriteRequest,
     ) -> dict[str, Any]:
-        return await control_call(lambda: runtime.write_runtime_blackboard(program_run_id, request))
+        return await control_call(
+            lambda: runtime.write_runtime_blackboard(program_run_id, request)
+        )
 
     @app.post("/api/program/runs/{program_run_id}/manual-result")
     async def stage_manual_result(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
         request: ManualResultStageRequest,
     ) -> dict[str, Any]:
-        return await control_call(lambda: runtime.stage_manual_result(program_run_id, request))
+        return await control_call(
+            lambda: runtime.stage_manual_result(program_run_id, request)
+        )
 
     @app.post("/api/cycle/recovery-actions")
     async def apply_recovery_action(

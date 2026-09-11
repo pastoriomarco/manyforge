@@ -15,6 +15,9 @@ class CompilerQualifiedCellIr;
 
 namespace detail {
 
+[[nodiscard]] native_execution_runtime_contract::OrdinaryMotionJerkSettings
+decode_ordinary_motion_jerk_settings(const core::JsonObjectDTO& source);
+
 inline constexpr std::string_view kNativeExecutionRuntimeManifestApiVersion =
     "manyforge.native_execution_runtime_manifest.v1";
 inline constexpr std::string_view kNativeExecutionRuntimeProductContractId =
@@ -34,7 +37,7 @@ inline constexpr std::string_view kNativeExecutionRuntimeConfigurationSchemaId =
     "manyforge.value_schema.runtime.native_execution.v1";
 inline constexpr std::string_view kNativeExecutionRuntimeConfigurationSchemaRevision =
     "sha256:"
-    "4405892649681799b9a813fafee4b5d23579d080b5457bf60f51ce2e296fcff8";
+    "49b3bbd377ad4cb93e7d27df06ff84b7e9ddbce3f3047e5702c61a9828c62035";
 inline constexpr std::string_view kNativeExecutionRuntimeRoleId =
     native_execution_runtime_contract::kRuntimeRoleId;
 inline constexpr std::string_view kNativeExecutionRuntimeStatusEndpointRoleId =

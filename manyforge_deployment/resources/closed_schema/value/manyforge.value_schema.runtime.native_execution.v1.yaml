@@ -1,6 +1,6 @@
 api_version: manyforge.closed_schema.v1
 schema_id: manyforge.value_schema.runtime.native_execution.v1
-schema_revision: sha256:4405892649681799b9a813fafee4b5d23579d080b5457bf60f51ce2e296fcff8
+schema_revision: sha256:49b3bbd377ad4cb93e7d27df06ff84b7e9ddbce3f3047e5702c61a9828c62035
 schema_purpose: value
 root_definition_id: native_execution_runtime_configuration
 definitions:
@@ -95,6 +95,14 @@ definitions:
                         value: 0
                       - kind: maximum
                         value: 1000
+                - field_id: ordinary_motion_jerk
+                  presence: optional
+                  default:
+                    kind: materialized
+                    value: {enabled: false, preset_reference_time_s: 1, joint_limits: []}
+                  value_schema:
+                    kind: local_ref
+                    definition_id: ordinary_motion_jerk
         - field_id: direct_control_joint_limits
           presence: required
           default:
@@ -358,3 +366,78 @@ definitions:
                 value: 0
               - kind: maximum
                 value: 60000
+  - definition_id: ordinary_motion_jerk
+    value_schema:
+      kind: object
+      fields:
+        - field_id: enabled
+          presence: required
+          default: {kind: absent}
+          value_schema: {kind: scalar, scalar_type: boolean, constraints: []}
+        - field_id: preset_reference_time_s
+          presence: required
+          default: {kind: absent}
+          value_schema: {kind: local_ref, definition_id: positive_jerk_number}
+        - field_id: joint_limits
+          presence: required
+          default: {kind: absent}
+          value_schema:
+            kind: array
+            min_items: 0
+            max_items: 256
+            collection: {kind: keyed_record_set, key_paths: [[source_joint_name]]}
+            item_schema: {kind: local_ref, definition_id: joint_jerk_setting}
+  - definition_id: joint_jerk_setting
+    value_schema:
+      kind: object
+      fields:
+        - field_id: source_joint_name
+          presence: required
+          default: {kind: absent}
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints: [{kind: min_length, value: 1}, {kind: max_length, value: 1024}]
+        - field_id: override_rad_s3
+          presence: optional
+          default: {kind: absent}
+          value_schema: {kind: local_ref, definition_id: positive_jerk_number}
+        - field_id: imported
+          presence: optional
+          default: {kind: absent}
+          value_schema: {kind: local_ref, definition_id: imported_joint_jerk}
+  - definition_id: imported_joint_jerk
+    value_schema:
+      kind: object
+      fields:
+        - field_id: maximum_rad_s3
+          presence: required
+          default: {kind: absent}
+          value_schema: {kind: local_ref, definition_id: positive_jerk_number}
+        - field_id: enabled
+          presence: required
+          default: {kind: absent}
+          value_schema: {kind: scalar, scalar_type: boolean, constraints: []}
+        - field_id: machine_required
+          presence: required
+          default: {kind: absent}
+          value_schema: {kind: scalar, scalar_type: boolean, constraints: []}
+        - field_id: source_id
+          presence: required
+          default: {kind: absent}
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints: [{kind: min_length, value: 1}, {kind: max_length, value: 4096}]
+        - field_id: source_digest
+          presence: required
+          default: {kind: absent}
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints: [{kind: string_format, value: sha256_digest}]
+  - definition_id: positive_jerk_number
+    value_schema:
+      kind: scalar
+      scalar_type: number
+      constraints: [{kind: exclusive_minimum, value: 0}]

@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <limits>
+#include <manyforge_core/prepared_execution_membership.hpp>
 #include <manyforge_core/types/prepared_execution.hpp>
 
 namespace manyforge::core {
@@ -211,6 +213,68 @@ TEST(PreparedExecutionTest, BackendStatusEnforcesStateAndEvidencePresence) {
                                           ExecutionBackendStateDTO::kExecuting, 0.5, 1.1, 15U,
                                           80'000'000LL)
                    .ok());
+}
+
+TEST(PreparedExecutionMembershipTest, RetiredRequestsNeverReopenOrClearANewerExecution) {
+  PreparedExecutionMembership membership;
+  auto participant = PreparedParticipant();
+  EXPECT_TRUE(membership.prepare(0U, participant));
+  ASSERT_FALSE(membership.prepare(1U, participant));
+  EXPECT_TRUE(membership.matches(participant));
+  EXPECT_FALSE(membership.prepare(1U, participant));
+  auto conflict = participant;
+  conflict.prepared_contract_digest = ContentDigest(Digest('b'));
+  EXPECT_TRUE(membership.prepare(1U, conflict));
+  EXPECT_TRUE(membership.prepare(2U, participant));
+  EXPECT_FALSE(membership.retire(2U));
+  EXPECT_TRUE(membership.matches(participant));
+  ASSERT_TRUE(membership.retire(1U));
+  EXPECT_FALSE(membership.matches(participant));
+  EXPECT_TRUE(membership.prepare(1U, participant));
+  ASSERT_FALSE(membership.prepare(2U, participant));
+  EXPECT_TRUE(membership.retire(1U));
+  EXPECT_TRUE(membership.matches(participant));
+  EXPECT_EQ(membership.active_execution_id(), 2U);
+}
+
+TEST(PreparedExecutionMembershipTest, RepeatedExecutionsAndResumesUseOneCurrentEntry) {
+  PreparedExecutionMembership membership;
+  auto participant = PreparedParticipant();
+  for (std::uint64_t execution = 1U; execution <= 8192U; ++execution) {
+    ASSERT_FALSE(membership.prepare(execution, participant));
+    ASSERT_TRUE(membership.matches(participant));
+    ASSERT_TRUE(membership.retire(execution));
+    ASSERT_FALSE(membership.active_execution_id());
+  }
+  ASSERT_FALSE(membership.prepare(8193U, participant));
+  for (std::uint64_t revision = 4U; revision <= 8192U; ++revision) {
+    const auto prior = participant;
+    participant.operation_revision = OperationRevision(revision);
+    ASSERT_FALSE(membership.prepare(8193U, participant));
+    ASSERT_TRUE(membership.prepare(8193U, prior));
+    ASSERT_TRUE(membership.matches(participant));
+  }
+  ASSERT_TRUE(membership.retire(8193U));
+  const auto maximum = std::numeric_limits<std::uint64_t>::max();
+  ASSERT_FALSE(membership.prepare(maximum, participant));
+  ASSERT_TRUE(membership.retire(maximum));
+  EXPECT_TRUE(membership.prepare(maximum, participant));
+  EXPECT_TRUE(membership.prepare(0U, participant));
+}
+
+TEST(PreparedExecutionMembershipTest, ClosingCancelledPreparationFencesItsDelayedArrival) {
+  PreparedExecutionMembership membership;
+  auto participant = PreparedParticipant();
+  ASSERT_TRUE(membership.retire(7U));
+  EXPECT_TRUE(membership.prepare(7U, participant));
+  ASSERT_FALSE(membership.prepare(8U, participant));
+  auto other = participant;
+  other.operation_id = OperationId("another.operation");
+  EXPECT_TRUE(membership.prepare(8U, other));
+  EXPECT_FALSE(membership.retire(9U));
+  EXPECT_TRUE(membership.matches(participant));
+  ASSERT_TRUE(membership.retire(8U));
+  EXPECT_FALSE(membership.prepare(9U, other));
 }
 
 }  // namespace

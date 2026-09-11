@@ -1,6 +1,6 @@
 api_version: manyforge.closed_schema.v1
 schema_id: manyforge.value_schema.provider_contract.motion_controlled_stop.v1
-schema_revision: sha256:afbbcda3b81eabff2bbdffb5658fb1fcd3331cde896cadf0681793a2f9db90dd
+schema_revision: sha256:58ec6382a268329e9d8001eb53aac31259b5eb95a3690095aa4bbe12ac51d83b
 schema_purpose: value
 root_definition_id: motion_controlled_stop_parameters
 definitions:
@@ -25,6 +25,14 @@ definitions:
     value_schema:
       kind: object
       fields:
+        - field_id: jerk_limits_enabled
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: boolean
+            constraints: []
         - field_id: stop_mode
           presence: required
           default:
@@ -78,6 +86,22 @@ definitions:
     value_schema:
       kind: object
       fields:
+        - field_id: jerk_limits_enabled
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: boolean
+            constraints: []
+        - field_id: allow_natural_completion_on_short_path
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: boolean
+            constraints: []
         - field_id: stop_mode
           presence: required
           default:
@@ -175,6 +199,13 @@ definitions:
           value_schema:
             kind: local_ref
             definition_id: max_deceleration
+        - field_id: max_jerk
+          presence: optional
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: max_jerk
         - field_id: settle_velocity_threshold
           presence: required
           default:
@@ -203,6 +234,69 @@ definitions:
           value_schema:
             kind: local_ref
             definition_id: settle_velocity_threshold
+  - definition_id: max_jerk
+    value_schema:
+      kind: tagged_union
+      tag_field: coordinate_kind
+      alternatives:
+        - tag_value: angular_rad_s3
+          value_schema:
+            kind: local_ref
+            definition_id: angular_max_jerk
+        - tag_value: linear_m_s3
+          value_schema:
+            kind: local_ref
+            definition_id: linear_max_jerk
+  - definition_id: angular_max_jerk
+    value_schema:
+      kind: object
+      fields:
+        - field_id: coordinate_kind
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - angular_rad_s3
+        - field_id: value_rad_s3
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: number
+            constraints:
+              - kind: exclusive_minimum
+                value: 0
+  - definition_id: linear_max_jerk
+    value_schema:
+      kind: object
+      fields:
+        - field_id: coordinate_kind
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - linear_m_s3
+        - field_id: value_m_s3
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: number
+            constraints:
+              - kind: exclusive_minimum
+                value: 0
   - definition_id: max_deceleration
     value_schema:
       kind: tagged_union

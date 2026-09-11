@@ -1,9 +1,9 @@
 #pragma once
 
+#include <manyforge_core/types/strong_id.hpp>
+#include <optional>
 #include <string>
 #include <vector>
-
-#include <manyforge_core/types/strong_id.hpp>
 
 namespace manyforge::core {
 
@@ -15,6 +15,20 @@ struct TrajectoryWaypointDTO {
   std::vector<double> accelerations_rad_s2; // optional
 };
 
+/// Immutable, candidate-derived time-law preparation for this exact curve.
+/// Part of its canonical identity, not a caller-selected execution setting.
+struct TrajectoryRuntimeScaleBoundsDTO {
+  double max_rate_per_s;
+  double max_rate_change_per_s2;
+  /// Cold, effective joint/TCP velocity certificate for the exact curve.
+  /// Only a proved same-path Stop interpolant may use it. Ordinary runtime
+  /// scaling remains [0,1]. Legacy absence grants no authority above one.
+  double max_stop_path_rate{1.0};
+  /// Producer-applied dilation from its nominal schedule. Absence is unknown,
+  /// not an assumed factor of one, and cannot support coordinated retiming.
+  std::optional<double> nominal_time_multiplier{};
+};
+
 /// A planned trajectory (spec §3.5)
 struct TrajectoryDTO {
   /// Exact ordered operation resources represented by `joint_names`.
@@ -23,6 +37,10 @@ struct TrajectoryDTO {
   std::vector<ResourceId> resources;
   std::vector<std::string> joint_names;
   std::vector<TrajectoryWaypointDTO> waypoints;
+  std::optional<TrajectoryRuntimeScaleBoundsDTO> runtime_scale_bounds{};
+  /// Producer-proved source Cartesian waypoint milestones on this exact curve.
+  /// Ordinal matches the prepared Cartesian request; no post-Stop path guessing.
+  std::vector<double> cartesian_waypoint_times_s{};
 
   bool empty() const { return waypoints.empty(); }
 };

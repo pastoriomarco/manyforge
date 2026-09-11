@@ -5,8 +5,10 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import replace
 from threading import Event, Thread
+from types import SimpleNamespace
 from typing import Any, Mapping
 
+import py_trees
 import pytest
 
 from manyforge_behavior.assistant_program_port import (
@@ -14,6 +16,12 @@ from manyforge_behavior.assistant_program_port import (
     ProgramAssistantPort,
 )
 from manyforge_behavior.kernel_client import KernelClient
+from manyforge_behavior.nodes.stop_policy import (
+    OperatorMotionStopPolicy,
+    OperatorMotionStopSnapshot,
+    OperatorMotionStopState,
+)
+from manyforge_behavior.nodes.v2_owner import OwnerInvocationAdapter
 from manyforge_behavior.orchestration_ports import (
     CompositeProgramRunContextPort,
     NodeAttemptIdentity,
@@ -164,6 +172,7 @@ class _Transport:
             "stop_status": {
                 "stop_id": stop_id,
                 "state": self.stop_states[stop_id],
+                "stop_generation": self.stop_generations[stop_id],
             },
         }
 
@@ -207,11 +216,6 @@ class _ControlTransport(_Transport):
             "control_pending": self.control_pending,
         }
 
-    def stop_status(self, stop_id):
-        response = super().stop_status(stop_id)
-        response["stop_status"]["stop_generation"] = 5
-        return response
-
     def query_operation(self, body):
         self.queries.append(deepcopy(body))
         return {
@@ -231,6 +235,7 @@ class _ControlTransport(_Transport):
     def stop(self, body):
         self.controls.append(("stop", "controlled", deepcopy(body)))
         self.stop_states["control-stop"] = "stopping"
+        self.stop_generations["control-stop"] = 5
         return {
             "ok": True,
             "accepted": {"stop_id": "control-stop", "stop_generation": 5},
@@ -1534,12 +1539,29 @@ def test_operation_only_stop_does_not_acquire_a_program_scope_handoff():
     assert transport.stop_status_reads == 0
 
 
-def test_program_scope_reset_releases_terminal_residency_once() -> None:
+def test_terminal_reset_stop_reuses_identical_native_payload():
+    from manyforge_behavior.program_run_owner import PROGRAM_RESET_STOP_REASON
+
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    port.scope.request_stop("program-run.1", "reset.1", PROGRAM_RESET_STOP_REASON)
+    transport.stop_states["scope-stop-1"] = "succeeded"
+    port.unbind("program-run.1")
+    port.scope.request_stop("program-run.1", "reset.1", PROGRAM_RESET_STOP_REASON)
+    assert transport.controls[0] == transport.controls[1]
+
+
+@pytest.mark.parametrize("program_stop", [False, True])
+def test_program_scope_reset_releases_terminal_residency_once(program_stop) -> None:
     transport = _Transport()
     port = NativeKernelProgramPort(KernelClient(transport))
     port.bind(_context())
     started = port.operations.start("motion.move_to_pose", _identity(), _motion_inputs())
     transport.operations[started.task_id].update({"state": "stopped", "operation_revision": 4})
+    if program_stop:
+        port.scope.request_stop("program-run.1", "reset-owned-stop", "Reset containment")
+        transport.stop_states["scope-stop-1"] = "succeeded"
 
     # Program terminalization releases its captured context but preserves the
     # exact operation identity needed by the later explicit Program Reset.
@@ -1557,6 +1579,54 @@ def test_program_scope_reset_releases_terminal_residency_once() -> None:
     assert body["request_context"]["request_owner_epoch"] == "kernel.epoch.7"
     assert body["request_context"]["correlation_id"] == "program-run.1"
     assert transport.resident[started.task_id] is False
+    assert not transport.released_scope_stops
+    assert "program-run.1" not in port._scope_stops
+
+
+@pytest.mark.parametrize("generation", [None, True, 0, 2])
+def test_program_scope_reset_retains_unproven_stop_generation(generation):
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    port.scope.request_stop("program-run.1", "first", "Reset containment")
+    transport.stop_states["scope-stop-1"] = "succeeded"
+    read = transport.stop_status
+
+    def mismatched_status(stop_id):
+        result = read(stop_id)
+        result["stop_status"]["stop_generation"] = generation
+        return result
+
+    transport.stop_status = mismatched_status
+    observed = port.scope.observe("program-run.1")
+    assert observed.state is ProgramRunScopeState.UNKNOWN
+    assert observed.reason_code == "program_run_stop_generation_mismatch"
+    with pytest.raises(ProductionPortError, match="settlement generation is stale"):
+        port.scope.reset("program-run.1")
+    assert port._scope_stops["program-run.1"].active[:2] == ("scope-stop-1", 1)
+    assert not transport.released_scope_stops
+
+
+def test_program_scope_reset_retains_a_crossing_new_stop():
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    port.scope.request_stop("program-run.1", "first", "Reset containment")
+    transport.stop_states["scope-stop-1"] = "succeeded"
+    read = transport.stop_status
+
+    def crossed_status(stop_id):
+        result = read(stop_id)
+        if stop_id == "scope-stop-1":
+            port.scope.request_stop("program-run.1", "second", "newer Stop")
+        return result
+
+    transport.stop_status = crossed_status
+    with pytest.raises(ProductionPortError, match="changed during Reset cleanup"):
+        port.scope.reset("program-run.1")
+    assert port._scope_stops["program-run.1"].active[:2] == ("scope-stop-2", 2)
+    assert port.scope.observe("program-run.1").state is ProgramRunScopeState.ACTIVE
+    assert not transport.released_scope_stops
 
 
 def test_failed_stop_submission_can_be_retried() -> None:
@@ -2450,6 +2520,43 @@ class _SceneTransport:
             "update_status": "geometry_changed",
         }
 
+    def scene_transaction_status(self, body):
+        return {"api_version": "manyforge.manager_command_response.v1", "ok": True, "result": None}
+
+
+def _scene_port(transport):
+    def captured_node(identity, owner_api):
+        return {
+            "program_runner_owner_epoch": "runner.owner",
+            "program_run_id": identity.program_run_id,
+            "parent_program_cycle_claim_generation": 1,
+            "node_instance_id": identity.node_instance_id,
+            "node_attempt_id": identity.node_attempt_id,
+            "owner_api": owner_api,
+        }
+
+    return HeadlessSceneProgramPort(transport, program_node_evidence=captured_node)
+
+
+def _scene_rejection(body, code, message):
+    from manyforge_behavior.scene_client import SceneTransactionRejectedError
+
+    context = body["request_context"]
+    return SceneTransactionRejectedError(
+        {
+            "api_version": "manyforge.manager_command_response.v1",
+            "ok": False,
+            "request_id": context["request_id"],
+            "request_owner_epoch": context["request_owner_epoch"],
+            "projection_status": "not_attempted",
+            "committed_projection_revision": None,
+            "error": {"code": code, "message": message, "details": {}},
+            "replay_status": "accepted_new",
+            "transaction_sequence": None,
+            "update_status": None,
+        }
+    )
+
 
 def _authored_scene() -> list[dict[str, Any]]:
     return [
@@ -2488,7 +2595,7 @@ def _authored_scene() -> list[dict[str, Any]]:
 
 def test_scene_initialization_adds_pick_resources_last() -> None:
     transport = _SceneTransport(populated=True)
-    port = HeadlessSceneProgramPort(transport)
+    port = _scene_port(transport)
 
     port.prepare_initial_scene(_scene_context(), _authored_scene())
 
@@ -2514,7 +2621,7 @@ def test_scene_initialization_adds_pick_resources_last() -> None:
 
 def test_scene_initialization_forwards_authored_support_contact_policy() -> None:
     transport = _SceneTransport()
-    port = HeadlessSceneProgramPort(transport)
+    port = _scene_port(transport)
     scene = _authored_scene()
     support_contact = {
         "support_object_id": "table",
@@ -2546,9 +2653,6 @@ def test_scene_initialization_forwards_authored_support_contact_policy() -> None
 
 
 def test_scene_initialization_retries_concurrent_pose_revision_without_losing_shape() -> None:
-    class _StaleRevision(RuntimeError):
-        code = "stale_revision"
-
     class _ConcurrentPoseTransport(_SceneTransport):
         def __init__(self) -> None:
             super().__init__()
@@ -2568,11 +2672,13 @@ def test_scene_initialization_retries_concurrent_pose_revision_without_losing_sh
                 self.injected_stale = True
                 self.rejected_requests.append(deepcopy(dict(body)))
                 self._advance_pose_revision()
-                raise _StaleRevision("external pose update advanced the scene")
+                raise _scene_rejection(
+                    body, "stale_revision", "external pose update advanced the scene"
+                )
             return super().commit_scene_transaction(body)
 
     transport = _ConcurrentPoseTransport()
-    port = HeadlessSceneProgramPort(transport)
+    port = _scene_port(transport)
 
     port.prepare_initial_scene(_scene_context(), _authored_scene())
 
@@ -2585,9 +2691,6 @@ def test_scene_initialization_retries_concurrent_pose_revision_without_losing_sh
 
 
 def test_scene_initialization_retries_no_effect_admission_race_with_new_identity() -> None:
-    class _AdmissionNotReady(RuntimeError):
-        code = "authoring_not_ready"
-
     class _AdmissionRaceTransport(_SceneTransport):
         def __init__(self) -> None:
             super().__init__()
@@ -2597,11 +2700,13 @@ def test_scene_initialization_retries_no_effect_admission_race_with_new_identity
             if not self.rejected_requests:
                 self.rejected_requests.append(deepcopy(dict(body)))
                 self.admission_generation += 1
-                raise _AdmissionNotReady("Idle admission projection advanced")
+                raise _scene_rejection(
+                    body, "authoring_not_ready", "Idle admission projection advanced"
+                )
             return super().commit_scene_transaction(body)
 
     transport = _AdmissionRaceTransport()
-    port = HeadlessSceneProgramPort(transport)
+    port = _scene_port(transport)
 
     port.prepare_initial_scene(_scene_context(), [_authored_scene()[0]])
 
@@ -2617,7 +2722,7 @@ def test_scene_initialization_retries_no_effect_admission_race_with_new_identity
 def test_scene_initialization_upserts_only_the_changed_authored_object() -> None:
     transport = _SceneTransport()
     scene = [_authored_scene()[0]]
-    port = HeadlessSceneProgramPort(transport)
+    port = _scene_port(transport)
     port.prepare_initial_scene(_scene_context(), scene)
     transport.submissions.clear()
     transport.objects["graspable"]["placement"]["pose_in_cell"]["position_m"] = {
@@ -2646,12 +2751,12 @@ def test_scene_initialization_upserts_only_the_changed_authored_object() -> None
 def test_exact_cell_frame_initial_scene_is_a_read_only_fast_path() -> None:
     transport = _SceneTransport()
     scene = [_authored_scene()[0]]
-    first = HeadlessSceneProgramPort(transport)
+    first = _scene_port(transport)
     first.prepare_initial_scene(_scene_context(), scene)
     assert len(transport.submissions) == 1
 
     transport.submissions.clear()
-    replacement = HeadlessSceneProgramPort(transport)
+    replacement = _scene_port(transport)
     proof = replacement.prepare_initial_scene(_scene_context(), scene)
 
     assert transport.submissions == []
@@ -2660,7 +2765,7 @@ def test_exact_cell_frame_initial_scene_is_a_read_only_fast_path() -> None:
 
 def test_prepared_scene_verification_rejects_an_intervening_owner_revision() -> None:
     transport = _SceneTransport()
-    port = HeadlessSceneProgramPort(transport)
+    port = _scene_port(transport)
     context = _scene_context()
     scene = [_authored_scene()[0]]
     proof = port.prepare_initial_scene(context, scene)
@@ -2677,7 +2782,7 @@ def test_prepared_scene_verification_rejects_an_intervening_owner_revision() -> 
 
 def test_scene_context_can_bind_atomically_before_initialization_and_release() -> None:
     transport = _SceneTransport()
-    port = HeadlessSceneProgramPort(transport)
+    port = _scene_port(transport)
     context = _scene_context()
 
     port.bind(context)
@@ -2694,6 +2799,163 @@ def test_scene_context_can_bind_atomically_before_initialization_and_release() -
     )
     assert result.succeeded is False
     assert "not initialized" in result.message
+
+
+def test_lost_scene_reply_is_observed_while_held_without_replaying_the_action() -> None:
+    class LostReply(_SceneTransport):
+        lose_reply = False
+        receipt_ready = False
+        receipt = None
+
+        def commit_scene_transaction(self, body):
+            result = super().commit_scene_transaction(body)
+            if self.lose_reply:
+                self.receipt = result
+                raise TimeoutError("accepted transaction reply was lost")
+            return result
+
+        def scene_transaction_status(self, body):
+            assert body == self.submissions[-1]
+            return {
+                "api_version": "manyforge.manager_command_response.v1",
+                "ok": True,
+                "result": self.receipt if self.receipt_ready else None,
+            }
+
+    transport = LostReply()
+    port = _scene_port(transport)
+    context = _scene_context()
+    port.prepare_initial_scene(context, _authored_scene())
+    port.bind(context)
+    before = len(transport.submissions)
+    transport.lose_reply = True
+    action = OwnerInvocationAdapter(
+        name="remove",
+        node_id="scene.remove_object",
+        node_instance_id="remove",
+        port=port,
+        parameters={"scene_resource_id": "graspable"},
+        value_sources={},
+        attempt_source=SimpleNamespace(begin=lambda node: _identity(node)),
+        input_resolver=SimpleNamespace(
+            snapshot=lambda **kwargs: SimpleNamespace(
+                parameters=kwargs["parameters"], blackboard={}, embedded_values={}
+            )
+        ),
+    )
+    next_action = py_trees.behaviours.Success("next")
+    state = OperatorMotionStopState({"remove": (), "next": (), "root": ("remove", "next")})
+    leaves = [
+        OperatorMotionStopPolicy(child=child, node_instance_id=child.name, stop_state=state)
+        for child in (action, next_action)
+    ]
+    root = OperatorMotionStopPolicy(
+        child=py_trees.composites.Sequence("sequence", memory=True, children=leaves),
+        node_instance_id="root",
+        stop_state=state,
+        drain_children=True,
+    )
+    list(root.tick())
+    assert action.has_active_task
+    assert "graspable" not in transport.objects
+    state.publish(OperatorMotionStopSnapshot(1, frozenset({"remove", "next", "root"})))
+    assert action.reconcile_full_stop_task(selected_resume=True) == "active"
+    list(root.tick())
+    assert next_action.status is py_trees.common.Status.INVALID
+    transport.receipt_ready = True
+    assert action.reconcile_full_stop_task(selected_resume=True) == "settled"
+    list(root.tick())
+    assert leaves[0].presented_status is py_trees.common.Status.SUCCESS
+    assert next_action.status is py_trees.common.Status.INVALID
+    state.publish(OperatorMotionStopSnapshot(2))
+    list(root.tick())
+    assert root.status is py_trees.common.Status.SUCCESS
+    assert len(transport.submissions) == before + 1
+
+
+@pytest.mark.parametrize("lose_reply", [False, True])
+def test_scene_rejected_by_stop_stays_unstarted_until_a_newer_release(lose_reply) -> None:
+    class StopWins(_SceneTransport):
+        held = False
+        rejections = []
+        receipt = None
+
+        def commit_scene_transaction(self, body):
+            if not self.held:
+                return super().commit_scene_transaction(body)
+            self.rejections.append(deepcopy(body))
+            error = _scene_rejection(body, "invalid_state_transition", "held by Stop")
+            error.response["error"]["details"] = {
+                "reason": "program_node_stop_fence_active",
+                "selection_revision": "1",
+            }
+            self.receipt = error.response
+            if lose_reply:
+                raise TimeoutError("rejection reply lost")
+            raise error
+
+        def scene_transaction_status(self, body):
+            assert body == self.rejections[-1]
+            return {
+                "api_version": "manyforge.manager_command_response.v1",
+                "ok": True,
+                "result": self.receipt,
+            }
+
+    transport = StopWins()
+    port = _scene_port(transport)
+    context = _scene_context()
+    port.prepare_initial_scene(context, _authored_scene())
+    port.bind(context)
+    before = len(transport.submissions)
+    transport.held = True
+    scope = OperatorMotionStopSnapshot(1, frozenset({"remove"}))
+    state = OperatorMotionStopState({"remove": ()}, read_scope=lambda: scope)
+    attempts = []
+
+    def begin(node):
+        identity = _identity(f"{node}:{len(attempts)}")
+        identity = replace(identity, node_instance_id=node)
+        attempts.append(identity)
+        return identity
+
+    action = OwnerInvocationAdapter(
+        name="remove",
+        node_id="scene.remove_object",
+        node_instance_id="remove",
+        port=port,
+        parameters={"scene_resource_id": "graspable"},
+        value_sources={},
+        operator_stop_state=state,
+        attempt_source=SimpleNamespace(begin=begin),
+        input_resolver=SimpleNamespace(
+            snapshot=lambda **kwargs: SimpleNamespace(
+                parameters=kwargs["parameters"], blackboard={}, embedded_values={}
+            )
+        ),
+    )
+    list(action.tick())
+    if lose_reply:
+        action.observe_while_operator_stop_held()
+    assert not action.has_active_task
+    assert action.presented_status is py_trees.common.Status.INVALID
+    assert action.failure_reason_code is None
+    for _ in range(3):
+        list(action.tick())  # Even an explicit continue policy cannot resubmit.
+    assert len(transport.rejections) == 1
+    assert "graspable" in transport.objects
+    assert action.reconcile_full_stop_task(selected_resume=True) == "inactive"
+    scope = OperatorMotionStopSnapshot(2)
+    state.publish(scope)
+    transport.held = False
+    list(action.tick())
+    assert action.status is py_trees.common.Status.SUCCESS
+    assert len(transport.submissions) == before + 1
+    assert len(attempts) == 2 and attempts[0] != attempts[1]
+    assert (
+        transport.submissions[-1]["request_context"]["request_id"]
+        != transport.rejections[0]["request_context"]["request_id"]
+    )
 
 
 def test_three_production_context_ports_rollback_as_one_before_dispatch() -> None:
@@ -2732,7 +2994,7 @@ def test_three_production_context_ports_rollback_as_one_before_dispatch() -> Non
     kernel_transport = _Transport()
     scene_transport = _SceneTransport()
     native = NativeKernelProgramPort(KernelClient(kernel_transport))
-    scene = HeadlessSceneProgramPort(scene_transport)
+    scene = _scene_port(scene_transport)
     assistant = ProgramAssistantPort(
         _NoModelTransport(),  # type: ignore[arg-type]
         HeadlessProgramSceneSource(scene_transport),
@@ -2762,7 +3024,7 @@ def test_three_production_context_ports_rollback_as_one_before_dispatch() -> Non
 def test_scene_nodes_translate_roles_and_detach_at_current_pose() -> None:
     transport = _SceneTransport()
     transport.objects["graspable"] = _fixed_scene_object("graspable")
-    port = HeadlessSceneProgramPort(transport)
+    port = _scene_port(transport)
     port.prepare_initial_scene(_scene_context(), [_authored_scene()[0]])
     transport.submissions.clear()
 
@@ -2797,9 +3059,6 @@ def test_scene_nodes_translate_roles_and_detach_at_current_pose() -> None:
 
 
 def test_scene_node_retries_a_concurrent_pose_revision_with_one_correlation() -> None:
-    class _StaleRevision(RuntimeError):
-        code = "stale_revision"
-
     class _ConcurrentPoseTransport(_SceneTransport):
         def __init__(self) -> None:
             super().__init__()
@@ -2816,11 +3075,13 @@ def test_scene_node_retries_a_concurrent_pose_revision_with_one_correlation() ->
                     "revision_id": revision_id,
                     "content_hash": "sha256:" + f"{revision_id:064x}"[-64:],
                 }
-                raise _StaleRevision("external pose update advanced the scene")
+                raise _scene_rejection(
+                    body, "stale_revision", "external pose update advanced the scene"
+                )
             return super().commit_scene_transaction(body)
 
     transport = _ConcurrentPoseTransport()
-    port = HeadlessSceneProgramPort(transport)
+    port = _scene_port(transport)
     port.prepare_initial_scene(_scene_context(), [_authored_scene()[0]])
     transport.submissions.clear()
     transport.reject_next_node = True
@@ -2850,7 +3111,7 @@ def test_scene_node_retries_a_concurrent_pose_revision_with_one_correlation() ->
 
 def test_scene_resource_relative_pose_is_forwarded_to_the_scene_owner() -> None:
     transport = _SceneTransport()
-    port = HeadlessSceneProgramPort(transport)
+    port = _scene_port(transport)
     port.prepare_initial_scene(_scene_context(), _authored_scene())
     transport.submissions.clear()
 
@@ -2887,7 +3148,7 @@ def test_scene_resource_relative_pose_is_forwarded_to_the_scene_owner() -> None:
 
 def test_stale_scene_projection_fails_before_a_node_commit() -> None:
     transport = _SceneTransport()
-    port = HeadlessSceneProgramPort(transport)
+    port = _scene_port(transport)
     port.prepare_initial_scene(_scene_context(), [])
     transport.submissions.clear()
     transport.revision["graph_revision"] = _DIGEST_F

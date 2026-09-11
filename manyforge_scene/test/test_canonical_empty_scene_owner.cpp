@@ -166,9 +166,22 @@ ContentDigest Digest(const char digit) {
 
 class TestCellAdmissionPort final : public core::IKernelCellAdmissionPort {
 public:
+  enum class LostReply { kNone, kAcquire, kRelease };
+  void LoseNextReply(LostReply reply) { lost_reply_ = reply; }
+  void RejectNextClaim(ErrorDTO error) { next_rejection_ = std::move(error); }
+
   void RejectProgramResetSceneAuthorization(bool reject) {
     std::lock_guard lock(mutex_);
     reject_program_reset_scene_authorization_ = reject;
+  }
+
+  [[nodiscard]] std::vector<core::CellAdmissionClaimDTO> Claims() const {
+    std::lock_guard lock(mutex_);
+    std::vector<core::CellAdmissionClaimDTO> claims;
+    for (const auto &entry : entries_) {
+      claims.push_back(entry.claim);
+    }
+    return claims;
   }
 
   [[nodiscard]] core::AuthoringAdmissionDTO
@@ -209,6 +222,10 @@ public:
   AcquireCellAdmissionClaim(
       const core::CellAdmissionClaimIntentDTO &intent) override {
     std::lock_guard lock(mutex_);
+    if (next_rejection_.has_value()) {
+      return core::Result<core::CellAdmissionClaimDTO>::Err(
+          *std::exchange(next_rejection_, std::nullopt));
+    }
     if (intent.expected_admission_generation !=
         core::AdmissionGeneration(1U)) {
       return core::Result<core::CellAdmissionClaimDTO>::Err(
@@ -240,6 +257,11 @@ public:
                             1},
                         std::nullopt});
     held_index_ = entries_.size() - 1U;
+    if (lost_reply_ == LostReply::kAcquire) {
+      lost_reply_ = LostReply::kNone;
+      return core::Result<core::CellAdmissionClaimDTO>::Err(
+          {"kernel_owner_unavailable", "acquisition reply lost", {}});
+    }
     return core::Result<core::CellAdmissionClaimDTO>::Ok(
         entries_.back().claim);
   }
@@ -248,6 +270,11 @@ public:
   ReleaseCellAdmissionClaim(
       const core::CellAdmissionClaimReleaseDTO &release) override {
     std::lock_guard lock(mutex_);
+    if (lost_reply_ == LostReply::kRelease) {
+      lost_reply_ = LostReply::kNone;
+      return core::Result<core::AuthoringAdmissionDTO>::Err(
+          {"kernel_owner_unavailable", "release unavailable", {}});
+    }
     if (!held_index_.has_value()) {
       return core::Result<core::AuthoringAdmissionDTO>::Err(
           ErrorDTO{"test_admission_not_held",
@@ -349,6 +376,8 @@ private:
   std::optional<std::size_t> held_index_;
   std::uint64_t next_claim_generation_{1U};
   bool reject_program_reset_scene_authorization_{};
+  LostReply lost_reply_{LostReply::kNone};
+  std::optional<ErrorDTO> next_rejection_;
 };
 
 class ControlledPublicationReader final
@@ -1854,6 +1883,197 @@ TEST(LogicalSceneTransactionCodec,
   EXPECT_NE(logical_scene_codec_internal::EncodeRequestDigestInput(
                 reset_request),
             logical_scene_codec_internal::EncodeRequestDigestInput(request));
+
+  auto node_request = request;
+  node_request.program_node_evidence = core::ProgramNodeAdmissionEvidenceDTO{
+      RequestOwnerEpoch("runner.2"),
+      core::ProgramRunId("program.2"),
+      core::CellAdmissionClaimGeneration(9U),
+      "attach",
+      std::string(512U, 'a'),
+      "scene.transaction"};
+  const auto node_bytes =
+      logical_scene_codec_internal::EncodeRequest(node_request);
+  const auto node_decoded = DecodeCanonicalSceneTransactionRequest(node_bytes);
+  EXPECT_EQ(node_decoded.program_node_evidence,
+            node_request.program_node_evidence);
+  EXPECT_EQ(logical_scene_codec_internal::EncodeRequest(node_decoded),
+            node_bytes);
+  EXPECT_NE(
+      logical_scene_codec_internal::EncodeRequestDigestInput(node_request),
+      logical_scene_codec_internal::EncodeRequestDigestInput(request));
+}
+
+TEST(CanonicalEmptySceneOwner,
+     ProgramTransactionResultLookupIsExactAndReadOnly) {
+  TemporaryDirectory directory("scene-program-result");
+  const auto admission = LoadAdmission();
+  ControlledPublicationReader publication_reader;
+  TestCellAdmissionPort cell_admission;
+  CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
+                                 admission, publication_reader, cell_admission);
+  const auto active =
+      FinalizeCanonicalBootstrap(owner, publication_reader, admission)
+          .canonical_empty_target;
+  auto request =
+      AddBoxRequest(active, admission.cell_id(), "scene-program-add");
+  request.program_node_evidence = core::ProgramNodeAdmissionEvidenceDTO{
+      RequestOwnerEpoch("runner.2"),
+      core::ProgramRunId("program.2"),
+      core::CellAdmissionClaimGeneration(9U),
+      "add",
+      "add:attempt.1",
+      "scene.transaction"};
+  EXPECT_FALSE(owner.ReadCommitResult(request).has_value());
+  EXPECT_TRUE(cell_admission.Claims().empty());
+  const auto result = owner.Commit(request);
+  ASSERT_TRUE(result.success)
+      << (result.error ? result.error->message : "missing error");
+  const auto claims = cell_admission.Claims();
+  ASSERT_EQ(claims.size(), 1U);
+  EXPECT_EQ(claims.front().intent.program_node_evidence,
+            request.program_node_evidence);
+  EXPECT_TRUE(cell_admission.GetAuthoringAdmission().authoring_allowed);
+  const auto before = owner.VerifyIntegrity();
+  const auto retained = owner.ReadCommitResult(request);
+  ASSERT_TRUE(retained.has_value());
+  EXPECT_TRUE(retained->success);
+  EXPECT_EQ(retained->replay_status,
+            core::RequestReplayStatusDTO::kReplayedExact);
+  EXPECT_EQ(retained->committed_projection_revision,
+            result.committed_projection_revision);
+  EXPECT_EQ(cell_admission.Claims().size(), 1U);
+  EXPECT_EQ(owner.VerifyIntegrity().request_outcome_count,
+            before.request_outcome_count);
+  auto conflicting = request;
+  conflicting.program_node_evidence->node_attempt_id = "add:attempt.2";
+  EXPECT_THROW(owner.ReadCommitResult(conflicting),
+               CanonicalEmptySceneOwnerConflictError);
+  auto missing = request;
+  missing.request_context.request_id = core::RequestId("scene-program-missing");
+  EXPECT_FALSE(owner.ReadCommitResult(missing).has_value());
+}
+
+TEST(CanonicalEmptySceneOwner,
+     ProgramClaimsReconcileAfterLostAcquireOrReleaseReply) {
+  for (const auto loss : {TestCellAdmissionPort::LostReply::kAcquire,
+                          TestCellAdmissionPort::LostReply::kRelease}) {
+    TemporaryDirectory directory("scene-program-claim-reply");
+    const auto admission = LoadAdmission();
+    ControlledPublicationReader publication_reader;
+    TestCellAdmissionPort cell_admission;
+    CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
+                                   admission, publication_reader,
+                                   cell_admission);
+    const auto active =
+        FinalizeCanonicalBootstrap(owner, publication_reader, admission)
+            .canonical_empty_target;
+    auto request =
+        AddBoxRequest(active, admission.cell_id(), "scene-program-add");
+    request.program_node_evidence = core::ProgramNodeAdmissionEvidenceDTO{
+        RequestOwnerEpoch("runner.2"),
+        core::ProgramRunId("program.2"),
+        core::CellAdmissionClaimGeneration(9U),
+        "add",
+        "add:attempt.1",
+        "scene.transaction"};
+    cell_admission.LoseNextReply(loss);
+    if (loss == TestCellAdmissionPort::LostReply::kAcquire) {
+      EXPECT_FALSE(owner.Commit(request).success);
+    } else {
+      EXPECT_THROW(owner.Commit(request), std::runtime_error);
+    }
+    EXPECT_FALSE(cell_admission.GetAuthoringAdmission().authoring_allowed);
+    const auto result = owner.ReadCommitResult(request);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->success,
+              loss == TestCellAdmissionPort::LostReply::kRelease);
+    EXPECT_FALSE(cell_admission.GetAuthoringAdmission().authoring_allowed);
+    const auto reconciled = owner.ReconcileAuthoredSceneAdmissionClaims();
+    ASSERT_TRUE(reconciled.ok()) << reconciled.error().message;
+    EXPECT_TRUE(cell_admission.GetAuthoringAdmission().authoring_allowed);
+    EXPECT_EQ(cell_admission.Claims().size(), 1U);
+    EXPECT_EQ(owner.GetSceneObjects().size(), result->success ? 1U : 0U);
+  }
+}
+
+TEST(CanonicalEmptySceneOwner,
+     InvalidProgramEvidenceNeverEntersDurableSceneState) {
+  TemporaryDirectory directory("scene-program-evidence");
+  const auto admission = LoadAdmission();
+  ControlledPublicationReader publication_reader;
+  TestCellAdmissionPort cell_admission;
+  const auto path = directory.path() / "logical-scene.sqlite3";
+  {
+    CanonicalEmptySceneOwner owner(path, admission, publication_reader,
+                                   cell_admission);
+    const auto active =
+        FinalizeCanonicalBootstrap(owner, publication_reader, admission)
+            .canonical_empty_target;
+    auto request =
+        AddBoxRequest(active, admission.cell_id(), "scene-program-add");
+    request.program_node_evidence = core::ProgramNodeAdmissionEvidenceDTO{
+        RequestOwnerEpoch("runner.2"),
+        core::ProgramRunId("program.2"),
+        core::CellAdmissionClaimGeneration(9U),
+        "add",
+        "",
+        "scene.transaction"};
+    for (const auto &attempt : {std::string{}, std::string(513U, 'a')}) {
+      request.program_node_evidence->node_attempt_id = attempt;
+      const auto rejected = owner.Commit(request);
+      ASSERT_FALSE(rejected.success);
+      ASSERT_TRUE(rejected.error.has_value());
+      EXPECT_EQ(rejected.error->code, "invalid_request");
+    }
+    request.program_node_evidence->node_attempt_id = "add:attempt.1";
+    request.program_node_evidence->parent_program_cycle_claim_generation =
+        core::CellAdmissionClaimGeneration(0U);
+    EXPECT_FALSE(owner.Commit(request).success);
+    EXPECT_EQ(owner.VerifyIntegrity().transaction_intent_count, 0);
+    EXPECT_EQ(owner.VerifyIntegrity().request_outcome_count, 0);
+    EXPECT_TRUE(cell_admission.Claims().empty());
+  }
+  CanonicalEmptySceneOwner reopened(path, admission, publication_reader,
+                                    cell_admission);
+  EXPECT_TRUE(reopened.ReconcileAuthoredSceneAdmissionClaims().ok());
+  EXPECT_TRUE(reopened.GetSceneObjects().empty());
+}
+
+TEST(CanonicalEmptySceneOwner,
+     StopBeforeProgramAdmissionIsExactAndHasNoEffect) {
+  TemporaryDirectory directory("scene-program-held");
+  const auto admission = LoadAdmission();
+  ControlledPublicationReader publication_reader;
+  TestCellAdmissionPort cell_admission;
+  CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
+                                 admission, publication_reader, cell_admission);
+  const auto active =
+      FinalizeCanonicalBootstrap(owner, publication_reader, admission)
+          .canonical_empty_target;
+  auto request =
+      AddBoxRequest(active, admission.cell_id(), "scene-program-add");
+  request.program_node_evidence = core::ProgramNodeAdmissionEvidenceDTO{
+      RequestOwnerEpoch("runner.2"),
+      core::ProgramRunId("program.2"),
+      core::CellAdmissionClaimGeneration(9U),
+      "add",
+      "add:attempt.1",
+      "scene.transaction"};
+  const ErrorDTO held{"invalid_state_transition",
+                      "not started; held by Stop",
+                      {{"reason", "program_node_stop_fence_active"},
+                       {"selection_revision", "7"}}};
+  cell_admission.RejectNextClaim(held);
+  const auto rejected = owner.Commit(request);
+  ASSERT_FALSE(rejected.success);
+  EXPECT_EQ(rejected.error, held);
+  EXPECT_EQ(rejected.projection_status,
+            core::SceneProjectionCommitStatusDTO::kNotAttempted);
+  EXPECT_TRUE(owner.GetSceneObjects().empty());
+  ASSERT_TRUE(owner.ReadCommitResult(request).has_value());
+  EXPECT_EQ(owner.ReadCommitResult(request)->error, held);
+  EXPECT_TRUE(cell_admission.Claims().empty());
 }
 
 TEST(LogicalSceneTransactionCodec,
@@ -3156,6 +3376,129 @@ RebindRuntimeEpochs(
 }
 
 TEST(CanonicalEmptySceneOwner,
+     ManagedWithdrawalSurvivesRestartWithoutAnOldClient) {
+  for (const bool discard : {false, true}) {
+    TemporaryDirectory directory("scene-managed-withdrawal");
+    const auto package_root = directory.path() / "packages";
+    CopyCanonicalEmptyPackage(package_root);
+    const auto admission = LoadAdmission(package_root);
+    const auto candidate = deployment::test::
+        materialize_lite6_native_motion_retained_consumer_fixture_for_cell(
+            package_root, admission.cell_id().value());
+    const auto old_bindings =
+        NativeRuntimeBindings(candidate.bundle->value(), "old-runtime");
+    const auto new_bindings =
+        NativeRuntimeBindings(candidate.bundle->value(), "new-runtime");
+    auto old_projections = MakeFakeProjections(old_bindings);
+    auto new_projections = MakeFakeProjections(new_bindings);
+    FakePlannerSceneProjectionResolver resolver(
+        ProjectionClients(old_projections));
+    ControlledPublicationReader publication_reader;
+    deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
+        package_root);
+    TestCellAdmissionPort cell_admission;
+    const auto path = directory.path() / "scene.sqlite3";
+    std::optional<core::ProjectionApplyStageResultDTO> staged;
+    {
+      CanonicalEmptySceneOwner owner(path, admission, publication_reader,
+                                     bundle_source, resolver, cell_admission);
+      const auto predecessor = FinalizeNativeCandidate(
+          owner, publication_reader, admission, *candidate.bundle, old_bindings,
+          "initial-native");
+      resolver.ReplaceWith(ProjectionClients(new_projections));
+      std::vector<core::ProjectionTransitionRowDTO> rows;
+      for (const auto &binding : old_bindings) {
+        rows.push_back(
+            {binding, core::ProjectionTransitionDisposition::kRemoved,
+             predecessor,
+             core::ManagedRuntimeWithdrawalDTO{
+                 ApplyId("replace-native"), ApplyGeneration(1U), Digest('7'),
+                 binding.runtime_unit_id, binding.runtime_epoch, Digest('8'),
+                 Digest('9'), "manager-supervisor", 12U}});
+      }
+      for (const auto &binding : new_bindings)
+        rows.push_back({binding, core::ProjectionTransitionDisposition::kAdded,
+                        std::nullopt});
+      std::sort(
+          rows.begin(), rows.end(), [](const auto &left, const auto &right) {
+            return core::CanonicalProjectionNativeBindingLess(
+                left.native_runtime_binding, right.native_runtime_binding);
+          });
+      ProjectionApplyStageDTO request{
+          ApplyId("replace-native"), ApplyGeneration(1U),       predecessor,
+          candidate.bundle->value(), candidate.bundle->value(), rows};
+      auto wrong_epoch = request;
+      for (auto &row : wrong_epoch.native_transition_rows) {
+        if (!row.managed_withdrawal)
+          continue;
+        row.native_runtime_binding.runtime_epoch =
+            core::RuntimeEpoch("foreign-runtime");
+        row.managed_withdrawal->runtime_epoch =
+            row.native_runtime_binding.runtime_epoch;
+      }
+      std::sort(wrong_epoch.native_transition_rows.begin(),
+                wrong_epoch.native_transition_rows.end(),
+                [](const auto &left, const auto &right) {
+                  return core::CanonicalProjectionNativeBindingLess(
+                      left.native_runtime_binding,
+                      right.native_runtime_binding);
+                });
+      EXPECT_EQ(owner.StageCandidateProjection(wrong_epoch).state,
+                ProjectionApplyStageResultState::kRejected);
+      auto no_proof = request;
+      for (auto &row : no_proof.native_transition_rows)
+        row.managed_withdrawal.reset();
+      EXPECT_NE(owner.StageCandidateProjection(no_proof).state,
+                ProjectionApplyStageResultState::kStaged);
+      staged = owner.StageCandidateProjection(request);
+      ASSERT_EQ(staged->state, ProjectionApplyStageResultState::kStaged)
+          << (staged->error ? staged->error->message : "missing error");
+      EXPECT_FALSE(owner.ReadAccessStatus().scene_writes_open);
+      owner.Close();
+    }
+    CanonicalEmptySceneOwner owner(path, admission, publication_reader,
+                                   bundle_source, resolver, cell_admission);
+    const auto status = owner.ProjectionApplyStatus(
+        {ApplyId("replace-native"), ApplyGeneration(1U)});
+    ASSERT_EQ(status.state, ProjectionApplyStatusState::kStaged);
+    ASSERT_TRUE(status.transition_evidence);
+    for (const auto &row : status.transition_evidence->transition_rows)
+      if (row.transition_row.managed_withdrawal) {
+        EXPECT_FALSE(row.resulting_health);
+        EXPECT_EQ(row.state,
+                  core::ProjectionTransitionRowEvidenceState::kRemovedRetired);
+      }
+    if (discard) {
+      const auto result =
+          owner.DiscardStagedProjection(DiscardRequest(*staged));
+      EXPECT_EQ(
+          result.state,
+          core::ProjectionApplyDiscardResultState::kFailedProjectionUncertain);
+      EXPECT_FALSE(owner.ReadAccessStatus().scene_writes_open);
+      EXPECT_FALSE(owner.ReadAccessStatus().projection_leases_open);
+    } else {
+      const auto activated =
+          owner.ActivateStagedProjection(ActivationRequest(*staged));
+      ASSERT_EQ(activated.state,
+                ProjectionApplyActivationResultState::kActivated);
+      const auto receipt = NamedPublicationReceipt(*staged, 2U, 3U);
+      publication_reader.SetCurrent(receipt);
+      const auto finalized = owner.FinalizeProjectionTransition(
+          NamedFinalizeRequest(*staged, receipt));
+      ASSERT_EQ(finalized.state,
+                ProjectionApplyFinalizeResultState::kFinalized);
+      EXPECT_TRUE(owner.ReadAccessStatus().scene_writes_open);
+      EXPECT_EQ(owner
+                    .ProjectionApplyStatus(
+                        {staged->apply_id, staged->apply_generation})
+                    .state,
+                ProjectionApplyStatusState::kFinalized);
+    }
+    EXPECT_NO_THROW(static_cast<void>(owner.VerifyIntegrity()));
+  }
+}
+
+TEST(CanonicalEmptySceneOwner,
      SustainedSceneUpdatesCheckpointAndRotateOnlyTheRequestEpoch) {
   TemporaryDirectory directory("scene-sustained-history");
   const auto package_root = directory.path() / "packages";
@@ -3965,6 +4308,14 @@ TEST(CanonicalEmptySceneOwner,
       },
       std::nullopt,
   };
+  attach.expected_admission_generation = core::AdmissionGeneration(1U);
+  attach.program_node_evidence = core::ProgramNodeAdmissionEvidenceDTO{
+      RequestOwnerEpoch("runner.2"),
+      core::ProgramRunId("program.2"),
+      core::CellAdmissionClaimGeneration(9U),
+      "attach",
+      "attach:attempt.1",
+      "scene.carried_attachment"};
   const auto integrity_before_preview = owner.VerifyIntegrity();
   const auto projection_calls_before_preview = projection.calls();
   const auto preview_policy_calls_before =
@@ -4019,6 +4370,10 @@ TEST(CanonicalEmptySceneOwner,
       << (attached.error.has_value() ? attached.error->message
                                      : "missing error");
   ASSERT_TRUE(attached.committed_projection_revision.has_value());
+  ASSERT_FALSE(cell_admission.Claims().empty());
+  EXPECT_EQ(cell_admission.Claims().back().intent.program_node_evidence,
+            attach.program_node_evidence);
+  EXPECT_TRUE(cell_admission.GetAuthoringAdmission().authoring_allowed);
   active = *attached.committed_projection_revision;
   snapshot = owner.LogicalSnapshot();
   EXPECT_EQ(*snapshot, *preview.value().logical_scene);

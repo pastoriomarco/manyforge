@@ -15,6 +15,11 @@
 
 namespace manyforge::core {
 
+namespace detail {
+struct MotionResumeIntent;
+class CoordinatedMotionPreparation;
+}
+
 /// Complete owner-issued authority for preparing one motion participant.
 ///
 /// The addressed Kernel mints operation/participant/goal identity and owns the
@@ -31,6 +36,9 @@ struct ResolvedPreparedMotionExecutionRequestDTO final {
   MotionInterruptNodeCategory stop_node_category{MotionInterruptNodeCategory::kGeneric};
   std::shared_ptr<const PreparedParticipantStopPlanDTO> ordinary_stop_plan;
   std::shared_ptr<const PreparedParticipantStopPlanDTO> fault_stop_plan;
+  // Existing owner supplies semantic destinations only, never old dispatch authority.
+  std::shared_ptr<const detail::MotionResumeIntent> continuation{};
+  std::shared_ptr<detail::CoordinatedMotionPreparation> common_timing{};
 };
 
 /// Owner-minted authority for one fresh Resume of an already-dispatched
@@ -45,6 +53,7 @@ struct ResolvedPreparedMotionResumeRequestDTO final {
   ControllerGoalGeneration controller_goal_generation{0U};
   std::shared_ptr<const PreparedParticipantStopPlanDTO> ordinary_stop_plan;
   std::shared_ptr<const PreparedParticipantStopPlanDTO> fault_stop_plan;
+  std::shared_ptr<detail::CoordinatedMotionPreparation> common_timing{};
 };
 
 enum class ResolvedPreparedMotionExecutionStateDTO : std::uint8_t {
@@ -66,6 +75,14 @@ struct ResolvedPreparedMotionExecutionSnapshotDTO final {
   std::shared_ptr<const PreparedOperationParticipantDTO> participant;
   std::optional<PrepareParticipantResultDTO> backend_prepare_result;
   std::optional<ErrorDTO> error;
+  /// Exact trajectory position for last_dispatched_participant, NOT an
+  /// unexecuted current candidate (which may belong to a failed Resume);
+  /// absent while moving, after an uncertain replacement, or without support.
+  /// This is continuation data, not a Stop certificate or dispatch permission.
+  std::optional<double> stopped_trajectory_time_s{};
+  /// Last verified dispatch, distinct from an unexecuted Resume candidate.
+  /// Shared immutable reference only; no additional product copy or authority.
+  std::shared_ptr<const PreparedOperationParticipantDTO> last_dispatched_participant{};
 };
 
 /// Complete owner-issued authority for preparing one non-trajectory command

@@ -82,6 +82,8 @@ function ordinaryMotionStopControls(): NonNullable<
 function robotController(): RobotControlController {
   return {
     currentStatus: statusFixture(),
+    manualControlAllowed: true,
+    manualControlUnavailableReason: null,
     state: {
       phase: 'ready',
       operation: null,
@@ -434,6 +436,24 @@ describe('Program runtime projection', () => {
 
     expect(markup).toMatch(/type="range"[^>]*value="0.5"/);
     expect(markup).not.toMatch(/type="range"[^>]*disabled=/);
+  });
+
+  it('blocks Program Resume for a resident manual operation in the other editor mode', () => {
+    const program = controller();
+    program.state.controls = ordinaryMotionStopControls();
+    const robot = robotController();
+    robot.currentStatus!.manualOperations = [{
+      programRunId: robot.currentStatus!.directControlGripper.programRunId,
+      operationId: 'manual-gripper', operationRevision: 1, resident: true,
+      state: 'executing', progress: 0.5, activeStopId: null,
+      activeStopGeneration: null, terminalError: null,
+    }];
+    expect(robot.state.operation).toBeNull();
+    const blocked = renderToStaticMarkup(<ProgramTransportControls enabled program={program} robot={robot} />);
+    expect(blocked).toMatch(/class="transport-run"[^>]*disabled=""/);
+    robot.currentStatus!.manualOperations[0].resident = false;
+    const released = renderToStaticMarkup(<ProgramTransportControls enabled program={program} robot={robot} />);
+    expect(released).not.toMatch(/class="transport-run"[^>]*disabled=""/);
   });
 
   it('does not delay Run while a coalesced velocity update is pending', () => {

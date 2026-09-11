@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py headless-rest
-  Last regenerated: 2026-09-08 05:03:14 UTC
+  Last regenerated: 2026-09-10 23:46:35 UTC
   Generator source: scripts/regen-public-contracts.py:gen_headless_rest_api
 -->
 
@@ -131,9 +131,11 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `GET` | `/api/cclc/components/{component_id}` |  | Cclc Component Snapshot |
 | `GET` | `/api/cclc/components/{component_id}/route-templates` |  | Cclc Route Templates |
 | `POST` | `/api/cclc/lifecycle/requests` |  | Cclc Lifecycle Submit |
+| `POST` | `/api/cclc/lifecycle/requests/result` |  | Cclc Lifecycle Request Result |
 | `GET` | `/api/cclc/lifecycle/transactions/{transaction_id}` |  | Cclc Lifecycle Status |
 | `GET` | `/api/cclc/owner` |  | Cclc Owner Identity |
 | `POST` | `/api/cclc/routes/requests` |  | Cclc Route Submit |
+| `POST` | `/api/cclc/routes/requests/result` |  | Cclc Route Request Result |
 | `GET` | `/api/cclc/routes/transactions/{transaction_id}` |  | Cclc Route Status |
 | `GET` | `/api/cell/authoring-admission` |  | Authoring Admission |
 | `GET` | `/api/component-overview` |  | Component Overview |
@@ -159,6 +161,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `POST` | `/api/execution/history/reconcile` |  | Historian Reconcile |
 | `GET` | `/api/execution/history/{sequence}` |  | History Detail |
 | `GET` | `/api/execution/identity` |  | Execution Identity |
+| `POST` | `/api/execution/manual-handover` |  | Execution Read Manual Handover |
 | `POST` | `/api/execution/motion-previews` |  | Execution Preview Motion |
 | `POST` | `/api/execution/operations` |  | Execution Submit |
 | `GET` | `/api/execution/operations/{operation_id}` |  | Execution Read |
@@ -202,6 +205,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `GET` | `/api/program/runs/{program_run_id}` |  | Program Run Read |
 | `POST` | `/api/program/runs/{program_run_id}/blackboard-values` |  | Write Runtime Blackboard |
 | `POST` | `/api/program/runs/{program_run_id}/full-stop` |  | Program Run Full Stop |
+| `POST` | `/api/program/runs/{program_run_id}/manual-handover` |  | Program Run Manual Handover |
 | `POST` | `/api/program/runs/{program_run_id}/manual-result` |  | Stage Manual Result |
 | `POST` | `/api/program/runs/{program_run_id}/motion-stop` |  | Program Run Motion Stop |
 | `POST` | `/api/program/runs/{program_run_id}/reset` |  | Program Run Reset Full Stop |
@@ -221,6 +225,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `GET` | `/api/scene` |  | Scene |
 | `POST` | `/api/scene/resource-poses/query` |  | Scene Resource Poses |
 | `POST` | `/api/scene/transactions` |  | Scene Commit |
+| `POST` | `/api/scene/transactions/status` |  | Scene Transaction Status |
 | `GET` | `/api/skills` |  | Skills |
 | `POST` | `/api/skills/expand` |  | Expand Skill |
 | `GET` | `/api/source-model` |  | Source Model |

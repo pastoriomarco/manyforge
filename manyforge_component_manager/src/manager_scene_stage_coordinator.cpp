@@ -141,11 +141,12 @@ ObservePredecessorNativeHealth(
     if (!health.matches_named_apply(
             named->apply_id, named->apply_generation,
             named->projection_stage_generation,
-            current_publication.request.candidate_projection_revision) ||
-        !health.healthy_for_target(expected_predecessor)) {
-      Fail("current named Apply does not provide exact healthy active native "
-           "predecessor evidence");
-    }
+            current_publication.request.candidate_projection_revision))
+      Fail("current named Apply native predecessor identity differs from the "
+           "active publication");
+    // These rows carry Scene's exact active membership even if a replaced
+    // child is now unavailable. Derivation requires either live target health
+    // for each row or its exact, already durable Manager withdrawal receipt.
     return health.native_projection_health;
   } catch (const ManagerSceneStageCoordinatorError &) {
     throw;

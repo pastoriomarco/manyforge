@@ -276,7 +276,8 @@ ManagerNamedApplyCoordinator::ManagerNamedApplyCoordinator(
                                        runtime_composition,
                                        manager_runtime_epoch_),
       selected_bundle_coordinator_(apply_journal_, retained_bundle_source_,
-                                   publication_store, scene_owner),
+                                   publication_store, scene_owner,
+                                   &artifact_source),
       fence_release_coordinator_(apply_journal_, kernel_fence_,
                                  manager_runtime_epoch_) {
   Require(!manager_runtime_epoch_.empty(),

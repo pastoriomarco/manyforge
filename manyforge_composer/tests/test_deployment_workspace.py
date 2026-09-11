@@ -6,16 +6,23 @@ import json
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
+import pytest
 
 from manyforge_composer.backend.deployment_draft import (
     CompiledDeploymentDocument,
     DeploymentDraftError,
     DeploymentDraftSession,
+    _edit_controlled_stop_profile,
+    compile_deployment_document,
 )
 from manyforge_composer.backend.routes_deployment_draft import (
+    _raise,
     create_deployment_draft_router,
+)
+from manyforge_composer.backend.authoring_transaction_journal import (
+    AuthoringJournalError,
 )
 from manyforge_composer.backend.routes_headless import create_headless_router
 from manyforge_composer.backend.state import ComposerState
@@ -24,9 +31,441 @@ from manyforge_composer.backend.state import ComposerState
 _DIGEST = "sha256:" + "1" * 64
 
 
+def test_scene_preparation_unavailable_keeps_typed_http_error() -> None:
+    failure = AuthoringJournalError(
+        "program_scene_preparation_unavailable",
+        "Program is applied, but backend authoring readiness is not established",
+    )
+    with pytest.raises(HTTPException) as error:
+        _raise(failure)
+    assert error.value.status_code == 503
+    assert error.value.detail == {"code": failure.code, "message": str(failure)}
+
+
+def _import_jerk_source():
+    document = json.loads(
+        (
+            Path(__file__).resolve().parents[2]
+            / "examples/lite6_lite_gripper_pick_and_place.deployment.yaml"
+        ).read_text()
+    )
+    runtime = document["graph"]["runtime_units"][0]
+    target = runtime["configuration"]["motion_target_limits"][0]
+    return (
+        document,
+        target["ordinary_motion_jerk"],
+        (
+            runtime["runtime_unit_id"],
+            target["controllable_component_id"],
+            target["command_target_id"],
+            [f"joint{index}" for index in range(1, 7)],
+        ),
+    )
+
+
+def test_moveit_jerk_import_preserves_activation_overrides_and_source_metadata():
+    import manyforge_headless_py as native
+
+    document, settings, selection = _import_jerk_source()
+    settings["joint_limits"] = [{"source_joint_name": "joint1", "override_rad_s3": 10}]
+    raw = """joint_limits:
+  joint1: {has_jerk_limits: true, max_jerk: 12}
+  joint2: {has_jerk_limits: false, max_jerk: 99}
+  joint3: {has_jerk_limits: false, max_jerk: 0}
+  unrelated: {has_jerk_limits: true, max_jerk: 100}
+"""
+    original = json.dumps(document)
+    source_id = "robot_moveit_config/config/joint_limits.yaml"
+    result = native.import_moveit_angular_jerk_limits(
+        original, raw, source_id, *selection
+    )
+    assert result == native.compile_deployment_draft(result["canonical_json"])
+    assert result == native.import_moveit_angular_jerk_limits(
+        result["canonical_json"], raw, source_id, *selection
+    )
+    imported = json.loads(result["canonical_json"])
+    target = imported["graph"]["runtime_units"][0]["configuration"][
+        "motion_target_limits"
+    ][0]
+    assert target["ordinary_motion_jerk"]["enabled"] is False
+    assert target["ordinary_motion_jerk"]["preset_reference_time_s"] == 1
+    rows = target["ordinary_motion_jerk"]["joint_limits"]
+    assert [row["source_joint_name"] for row in rows] == ["joint1", "joint2"]
+    assert rows[0]["override_rad_s3"] == 10
+    for row, enabled, maximum in zip(rows, [True, False], [12, 99], strict=True):
+        assert row["imported"] == {
+            "enabled": enabled,
+            "maximum_rad_s3": maximum,
+            "machine_required": False,
+            "source_id": source_id,
+            "source_digest": "sha256:" + hashlib.sha256(raw.encode()).hexdigest(),
+        }
+    assert imported["policies"] == document["policies"]
+    assert json.dumps(document) == original
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        "{has_jerk_limits: true}",
+        "{has_jerk_limits: true, max_jerk: 0}",
+        "{has_jerk_limits: 'true', max_jerk: 12}",
+        "{has_jerk_limits: true, max_jerk: true}",
+        "{has_jerk_limits: false, max_jerk: -1}",
+        "{max_jerk: 12, max_jerk: 14}",
+    ],
+)
+def test_moveit_jerk_import_rejects_malformed_limits(row):
+    import manyforge_headless_py as native
+
+    document, _settings, selection = _import_jerk_source()
+    with pytest.raises(Exception):
+        native.import_moveit_angular_jerk_limits(
+            json.dumps(document),
+            "joint_limits:\n  joint1: " + row,
+            "robot/config/joint_limits.yaml",
+            *selection,
+        )
+
+
+def test_moveit_import_cannot_weaken_required_limits_or_overrides():
+    import manyforge_headless_py as native
+
+    document, settings, selection = _import_jerk_source()
+    settings["enabled"] = True
+    settings["joint_limits"] = [
+        {
+            "source_joint_name": "joint1",
+            "override_rad_s3": 10,
+            "imported": {
+                "maximum_rad_s3": 12,
+                "enabled": True,
+                "machine_required": True,
+                "source_id": "robot/config/joint_limits.yaml",
+                "source_digest": _DIGEST,
+            },
+        }
+    ]
+    for row in [
+        "{}",
+        "{has_jerk_limits: false, max_jerk: 12}",
+        "{has_jerk_limits: true, max_jerk: 13}",
+        "{has_jerk_limits: true, max_jerk: 9}",
+    ]:
+        with pytest.raises(Exception, match="required limit|override"):
+            native.import_moveit_angular_jerk_limits(
+                json.dumps(document),
+                "joint_limits:\n  joint1: " + row,
+                "robot/config/joint_limits.yaml",
+                *selection,
+            )
+    with pytest.raises(Exception, match="unique"):
+        native.import_moveit_angular_jerk_limits(
+            json.dumps(document),
+            "joint_limits: {}",
+            "robot/config/joint_limits.yaml",
+            *selection[:3],
+            ["joint1", "joint1"],
+        )
+    with pytest.raises(Exception, match="motion target"):
+        native.import_moveit_angular_jerk_limits(
+            json.dumps(document),
+            "joint_limits: {}",
+            "robot/config/joint_limits.yaml",
+            *selection[:2],
+            "foreign-target",
+            selection[3],
+        )
+
+
+def test_pinned_lite6_moveit_source_without_jerk_does_not_invent_limits():
+    import manyforge_headless_py as native
+
+    document, _settings, selection = _import_jerk_source()
+    source_id = "xarm_moveit_config/config/lite6/joint_limits.yaml"
+    raw = (
+        Path(__file__).resolve().parents[2]
+        / "manyforge_example_models/models"
+        / "lite6_lite_gripper/upstream_source"
+        / source_id
+    ).read_text()
+    result = native.import_moveit_angular_jerk_limits(
+        json.dumps(document), raw, source_id, *selection
+    )
+    assert result == native.compile_deployment_draft(json.dumps(document))
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_ordinary_jerk_source_roundtrip_preserves_choice_and_provenance(
+    tmp_path, enabled
+):
+    source = json.loads(
+        (
+            Path(__file__).resolve().parents[2]
+            / "examples/lite6_lite_gripper_pick_and_place.deployment.yaml"
+        ).read_text()
+    )
+    target = source["graph"]["runtime_units"][0]["configuration"][
+        "motion_target_limits"
+    ][0]
+    assert target["ordinary_motion_jerk"]["enabled"] is False
+    settings = {
+        "enabled": enabled,
+        "preset_reference_time_s": 1.25,
+        "joint_limits": [
+            {
+                "source_joint_name": "joint1",
+                "override_rad_s3": 10.0,
+                "imported": {
+                    "maximum_rad_s3": 12.0,
+                    "enabled": True,
+                    "machine_required": False,
+                    "source_id": "robot_moveit_config/config/joint_limits.yaml",
+                    "source_digest": _DIGEST,
+                },
+            }
+        ],
+    }
+    target["ordinary_motion_jerk"] = settings
+    compiled = compile_deployment_document(json.dumps(source))
+    saved = tmp_path / "jerk.deployment.yaml"
+    saved.write_text(compiled.canonical_json)
+    reopened = compile_deployment_document(saved.read_text())
+    assert reopened.canonical_json == compiled.canonical_json
+    assert (
+        reopened.document["graph"]["runtime_units"][0]["configuration"][
+            "motion_target_limits"
+        ][0]["ordinary_motion_jerk"]
+        == settings
+    )
+    # Off retains the numbers but does not activate them; the independent
+    # controlled-Stop choices are unchanged in either case.
+    assert reopened.document["policies"] == source["policies"]
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_explicit_stop_jerk_migration_recompiles_and_preserves_existing_settings(
+    enabled,
+):
+    import manyforge_headless_py
+
+    source = json.loads(
+        (
+            Path(__file__).resolve().parents[2]
+            / "examples/lite6_lite_gripper_pick_and_place.deployment.yaml"
+        ).read_text()
+    )
+    rows = [
+        row
+        for row in source["policies"]["stop_stage_parameters"]
+        if row["provider_contract_ref"]["contract_schema_id"]
+        == "manyforge.value_schema.provider_contract.motion_controlled_stop.v1"
+    ]
+    assert len(rows) >= 2
+    preserved = deepcopy(source)
+    for row in rows:
+        del row["default_contract_parameters"]["jerk_limits_enabled"]
+        row["provider_contract_ref"][
+            "contract_schema_revision"
+        ] = "sha256:afbbcda3b81eabff2bbdffb5658fb1fcd3331cde896cadf0681793a2f9db90dd"
+    # A reviewed choice must survive migration of another route/target.
+    rows[0]["default_contract_parameters"]["jerk_limits_enabled"] = not enabled
+    original = json.dumps(source)
+    with pytest.raises(Exception):
+        manyforge_headless_py.compile_deployment_draft(original)
+    result = manyforge_headless_py.migrate_controlled_stop_jerk_choice(
+        original, enabled
+    )
+    compiled = manyforge_headless_py.compile_deployment_draft(result["canonical_json"])
+    assert result == compiled
+    migrated = json.loads(result["canonical_json"])
+    expected = deepcopy(preserved)
+    expected_rows = [
+        row
+        for row in expected["policies"]["stop_stage_parameters"]
+        if row["provider_contract_ref"]["contract_schema_id"]
+        == "manyforge.value_schema.provider_contract.motion_controlled_stop.v1"
+    ]
+    for index, row in enumerate(expected_rows):
+        row["default_contract_parameters"]["jerk_limits_enabled"] = (
+            not enabled if index == 0 else enabled
+        )
+    expected_result = manyforge_headless_py.compile_deployment_draft(
+        json.dumps(expected)
+    )
+    assert migrated == json.loads(expected_result["canonical_json"])
+    assert json.dumps(source) == original
+    # Idempotent even with the opposite migration choice: explicit values win.
+    assert (
+        manyforge_headless_py.migrate_controlled_stop_jerk_choice(
+            result["canonical_json"], not enabled
+        )
+        == result
+    )
+    rows[0]["provider_contract_ref"]["contract_schema_revision"] = _DIGEST
+    with pytest.raises(Exception, match="recognized schema revision"):
+        manyforge_headless_py.migrate_controlled_stop_jerk_choice(
+            json.dumps(source), enabled
+        )
+    with pytest.raises(TypeError):
+        manyforge_headless_py.migrate_controlled_stop_jerk_choice(original, "on")
+
+
+def test_cpp_draft_normalizer_reports_minimum_for_a_decimal_stop_duration():
+    document = json.loads(
+        (
+            Path(__file__).resolve().parents[2]
+            / "examples/lite6_lite_gripper_pick_and_place.deployment.yaml"
+        ).read_text()
+    )
+    binding_revisions = {
+        row["control_binding_id"]: row["control_binding_revision"]
+        for row in document["graph"]["control_bindings"]
+    }
+    assert document["policies"]["stop_timing_parameters"]
+    for selected in document["policies"]["stop_timing_parameters"]:
+        assert (
+            selected["control_binding_revision"]
+            == binding_revisions[selected["control_binding_id"]]
+        )
+    binding = next(
+        row
+        for row in document["graph"]["control_bindings"]
+        if row["capability_id"] == "execution.trajectory.execute"
+    )
+    for row in document["policies"]["stop_stage_parameters"]:
+        if (
+            row["control_binding_id"] == binding["control_binding_id"]
+            and row["stop_escalation_stage_id"] == "motion_controlled_stop"
+        ):
+            row["default_contract_parameters"]["deceleration_time_s"] = 1.1
+    document["policies"]["stop_timing_parameters"] = [
+        {
+            "control_binding_id": binding["control_binding_id"],
+            "control_binding_revision": binding["control_binding_revision"],
+            "timing": {
+                "command_latency_allowance_ns": 250_000_000,
+                "settling_allowance_ns": 750_000_000,
+                "operational_timeout_ns": 2_100_000_000,
+            },
+        }
+    ]
+    compiled = compile_deployment_document(json.dumps(document))
+    assert (
+        compiled.document["policies"]["stop_timing_parameters"]
+        == document["policies"]["stop_timing_parameters"]
+    )
+    document["policies"]["stop_timing_parameters"][0]["timing"][
+        "operational_timeout_ns"
+    ] -= 1
+    with pytest.raises(DeploymentDraftError, match="minimum 2.100000000 s"):
+        compile_deployment_document(json.dumps(document))
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_jerk_draft_choice_preserves_units_inactive_values_and_substitution(enabled):
+    source = _focused_document()
+    for row in source["policies"]["stop_stage_parameters"][:2]:
+        row["default_contract_parameters"][
+            "recoverable_substitution_mode"
+        ] = "spring_back_hold"
+    profile = {
+        "stop_mode": "soft_on_path",
+        "deceleration_time_s": 1.0,
+        "allow_natural_completion_on_short_path": True,
+        "jerk_limits_enabled": enabled,
+        "per_resource_limits": [
+            {
+                "resource_id": "robot.arm.coordinate.000000",
+                "max_deceleration": {"coordinate_kind": "angular_rad_s2", "value": 4.0},
+                "settle_velocity_threshold": {
+                    "coordinate_kind": "angular_rad_s",
+                    "value": 0.01,
+                },
+                "max_jerk": {"coordinate_kind": "angular_rad_s3", "value": 20.0},
+            }
+        ],
+    }
+    selection = {
+        "control_binding_id": "arm_binding",
+        "control_binding_revision": _DIGEST,
+        "timing": None,
+    }
+    result = _edit_controlled_stop_profile(source, profile, **selection)
+    for row in result["policies"]["stop_stage_parameters"][:2]:
+        parameters = row["default_contract_parameters"]
+        assert parameters["jerk_limits_enabled"] is enabled
+        assert parameters["recoverable_substitution_mode"] == "spring_back_hold"
+        assert parameters["per_resource_limits"][0]["max_jerk"] == {
+            "coordinate_kind": "angular_rad_s3",
+            "value_rad_s3": 20.0,
+        }
+    profile["jerk_limits_enabled"] = None
+    with pytest.raises(DeploymentDraftError, match="explicitly"):
+        _edit_controlled_stop_profile(source, profile, **selection)
+    profile["jerk_limits_enabled"] = enabled
+    profile["per_resource_limits"][0]["max_jerk"]["coordinate_kind"] = "linear_m_s3"
+    with pytest.raises(DeploymentDraftError, match="units"):
+        _edit_controlled_stop_profile(source, profile, **selection)
+
+
+def test_stop_timing_edit_preserves_other_binding_and_explicit_null_removes_only_selection():
+    source = _focused_document()
+    other_binding = deepcopy(source["graph"]["control_bindings"][0])
+    other_binding["control_binding_id"] = "other_binding"
+    source["graph"]["control_bindings"].append(other_binding)
+    other_stage = deepcopy(source["policies"]["stop_stage_parameters"][0])
+    other_stage["control_binding_id"] = "other_binding"
+    source["policies"]["stop_stage_parameters"].append(other_stage)
+    timing = {
+        "command_latency_allowance_ns": 250_000_000,
+        "settling_allowance_ns": 750_000_000,
+        "operational_timeout_ns": 3_000_000_000,
+    }
+    other = {
+        "control_binding_id": "other_binding",
+        "control_binding_revision": _DIGEST,
+        "timing": timing,
+    }
+    source["policies"]["stop_timing_parameters"] = [deepcopy(other)]
+    saved_source = deepcopy(source)
+    selection = {
+        "control_binding_id": "arm_binding",
+        "control_binding_revision": _DIGEST,
+    }
+    # A timing-only edit does not require a fictitious motion profile.
+    result = _edit_controlled_stop_profile(source, None, **selection, timing=timing)
+    assert source == saved_source
+    assert (
+        result["policies"]["stop_stage_parameters"]
+        == source["policies"]["stop_stage_parameters"]
+    )
+    assert result["policies"]["stop_timing_parameters"] == [
+        other,
+        {**selection, "timing": timing},
+    ]
+    restored = _edit_controlled_stop_profile(result, None, **selection, timing=None)
+    assert restored == source
+    with pytest.raises(DeploymentDraftError, match="no longer matches"):
+        _edit_controlled_stop_profile(
+            source,
+            None,
+            control_binding_id="arm_binding",
+            control_binding_revision="sha256:" + "2" * 64,
+            timing=timing,
+        )
+    with pytest.raises(DeploymentDraftError, match="integer nanosecond"):
+        _edit_controlled_stop_profile(
+            source, None, **selection, timing={**timing, "settling_allowance_ns": True}
+        )
+
+
 def _compile(source: str) -> CompiledDeploymentDocument:
     document = json.loads(source)
-    if not isinstance(document, dict) or document.get("api_version") != "manyforge.deployment.v1":
+    if (
+        not isinstance(document, dict)
+        or document.get("api_version") != "manyforge.deployment.v1"
+    ):
         raise DeploymentDraftError(
             "deployment_draft_invalid", "unsupported Deployment document"
         )
@@ -68,6 +507,15 @@ def _document() -> dict[str, Any]:
 
 def _focused_document() -> dict[str, Any]:
     document = _document()
+    document["graph"]["control_bindings"] = [
+        {
+            "control_binding_id": "arm_binding",
+            "control_binding_revision": _DIGEST,
+            "controllable_component_id": "robot",
+            "command_target_id": "arm",
+            "legal_control_route_ids": ["route-a", "route-b"],
+        }
+    ]
     document["graph"]["runtime_units"] = [
         {
             "runtime_unit_id": "robot.native_execution",
@@ -89,6 +537,7 @@ def _focused_document() -> dict[str, Any]:
     ]
     stop_parameters = {
         "allow_natural_completion_on_short_path": True,
+        "jerk_limits_enabled": True,
         "deceleration_time_s": 1.0,
         "per_resource_limits": [
             {
@@ -108,23 +557,25 @@ def _focused_document() -> dict[str, Any]:
     document["policies"] = {
         "stop_stage_parameters": [
             {
-                "control_binding_id": "route-a",
+                "control_binding_id": "arm_binding",
+                "control_binding_revision": _DIGEST,
+                "control_route_id": "route-a",
                 "stop_escalation_stage_id": "motion_controlled_stop",
-                "provider_contract_ref": {
-                    "provider_contract_role_id": "stop_contract"
-                },
+                "provider_contract_ref": {"provider_contract_role_id": "stop_contract"},
                 "default_contract_parameters": deepcopy(stop_parameters),
             },
             {
-                "control_binding_id": "route-b",
+                "control_binding_id": "arm_binding",
+                "control_binding_revision": _DIGEST,
+                "control_route_id": "route-b",
                 "stop_escalation_stage_id": "motion_controlled_stop",
-                "provider_contract_ref": {
-                    "provider_contract_role_id": "stop_contract"
-                },
+                "provider_contract_ref": {"provider_contract_role_id": "stop_contract"},
                 "default_contract_parameters": deepcopy(stop_parameters),
             },
             {
-                "control_binding_id": "route-a",
+                "control_binding_id": "arm_binding",
+                "control_binding_revision": _DIGEST,
+                "control_route_id": "route-a",
                 "stop_escalation_stage_id": "software_hard",
                 "provider_contract_ref": {
                     "provider_contract_role_id": "software_hard_stop"
@@ -172,7 +623,10 @@ def _request(workspace: dict[str, Any], **extra: Any) -> dict[str, Any]:
         "expectedDraftRevision": workspace["draft"]["revision"],
         "expectedAdmissionGeneration": 1,
         "requestOwnerEpoch": "browser-test",
-        "requestId": "request-" + str(workspace["draft"]["revision"]) + "-" + extra.pop("kind", "edit"),
+        "requestId": "request-"
+        + str(workspace["draft"]["revision"])
+        + "-"
+        + extra.pop("kind", "edit"),
         **extra,
     }
 
@@ -228,7 +682,10 @@ def test_deployment_open_edit_save_discard_share_one_revision_fenced_workspace(
     assert response.status_code == 200, response.text
     workspace = response.json()
     assert workspace["saved"]["path"].endswith("saved.deployment.yaml")
-    assert json.loads((tmp_path / "saved.deployment.yaml").read_text())["name"] == "Edited cell"
+    assert (
+        json.loads((tmp_path / "saved.deployment.yaml").read_text())["name"]
+        == "Edited cell"
+    )
 
     response = client.post(
         "/api/deployment/draft/mutations",
@@ -241,7 +698,10 @@ def test_deployment_open_edit_save_discard_share_one_revision_fenced_workspace(
     )
     assert response.status_code == 200, response.text
     assert response.json()["draft"]["document"]["name"] == "Edited cell"
-    assert state.authoring_retained_state()["schema_version"] == "manyforge.composer_authoring_workspace.v2"
+    assert (
+        state.authoring_retained_state()["schema_version"]
+        == "manyforge.composer_authoring_workspace.v2"
+    )
 
 
 def test_invalid_or_stale_deployment_mutation_never_changes_the_draft(
@@ -283,9 +743,10 @@ def test_invalid_or_stale_deployment_mutation_never_changes_the_draft(
     )
     assert stale.status_code == 409
     assert stale.json()["detail"]["code"] == "deployment_draft_stale"
-    assert client.get("/api/deployment/workspace").json()["draft"]["document"][
-        "name"
-    ] == "Current"
+    assert (
+        client.get("/api/deployment/workspace").json()["draft"]["document"]["name"]
+        == "Current"
+    )
 
 
 def test_authored_deployment_preview_then_apply_preserves_the_exact_program(
@@ -297,9 +758,7 @@ def test_authored_deployment_preview_then_apply_preserves_the_exact_program(
     initial = client.get("/api/deployment/workspace").json()
     opened = client.post(
         "/api/deployment/open-draft",
-        json=_request(
-            initial, path=str(source), confirmDiscard=False, kind="open"
-        ),
+        json=_request(initial, path=str(source), confirmDiscard=False, kind="open"),
     ).json()
     base_revision = opened["draft"]["deploymentRevision"]
     edited = client.post(
@@ -373,11 +832,13 @@ def test_authored_deployment_preview_then_apply_preserves_the_exact_program(
             "program_binding_id": "sha256:" + "b" * 64,
         }
         if apply:
-            current.update({
-                key: value
-                for key, value in compilation.items()
-                if key != "schema_version"
-            })
+            current.update(
+                {
+                    key: value
+                    for key, value in compilation.items()
+                    if key != "schema_version"
+                }
+            )
         return {
             "status": "applied" if apply else "previewed",
             "compilation": compilation,
@@ -442,9 +903,12 @@ def test_focused_motion_target_limit_updates_one_exact_target_atomically(
     )
     assert updated.status_code == 200, updated.text
     current = updated.json()
-    assert current["draft"]["document"]["graph"]["runtime_units"][0][
-        "configuration"
-    ]["motion_target_limits"][0]["maximum_tcp_linear_speed_mps"] == 0.1
+    assert (
+        current["draft"]["document"]["graph"]["runtime_units"][0]["configuration"][
+            "motion_target_limits"
+        ][0]["maximum_tcp_linear_speed_mps"]
+        == 0.1
+    )
     assert current["draft"]["revision"] == opened["draft"]["revision"] + 1
 
     rejected = client.post(
@@ -464,12 +928,21 @@ def test_focused_motion_target_limit_updates_one_exact_target_atomically(
     assert client.get("/api/deployment/workspace").json()["draft"] == current["draft"]
 
 
+@pytest.mark.parametrize("natural_completion", [False, True])
 def test_focused_controlled_stop_updates_all_derived_routes_and_not_hard_stop(
     tmp_path: Path,
+    natural_completion: bool,
 ) -> None:
     client, _state = _client(tmp_path)
     source = tmp_path / "cell_a.deployment.yaml"
-    source.write_text(json.dumps(_focused_document()), encoding="utf-8")
+    document = _focused_document()
+    other_binding = deepcopy(document["graph"]["control_bindings"][0])
+    other_binding["control_binding_id"] = "other_binding"
+    document["graph"]["control_bindings"].append(other_binding)
+    other_stage = deepcopy(document["policies"]["stop_stage_parameters"][0])
+    other_stage["control_binding_id"] = "other_binding"
+    document["policies"]["stop_stage_parameters"].append(other_stage)
+    source.write_text(json.dumps(document), encoding="utf-8")
     initial = client.get("/api/deployment/workspace").json()
     opened = client.post(
         "/api/deployment/open-draft",
@@ -477,8 +950,9 @@ def test_focused_controlled_stop_updates_all_derived_routes_and_not_hard_stop(
     ).json()
     profile = {
         "stop_mode": "spring_back_hold",
+        "jerk_limits_enabled": False,
         "deceleration_time_s": 1.25,
-        "allow_natural_completion_on_short_path": False,
+        "allow_natural_completion_on_short_path": natural_completion,
         "per_resource_limits": [
             {
                 "resource_id": "robot.arm.coordinate.000000",
@@ -495,20 +969,33 @@ def test_focused_controlled_stop_updates_all_derived_routes_and_not_hard_stop(
     }
     updated = client.post(
         "/api/deployment/draft/controlled-stop",
-        json=_request(opened, profile=profile, kind="controlled-stop"),
+        json=_request(
+            opened,
+            profile=profile,
+            kind="controlled-stop",
+            control_binding_id="arm_binding",
+            control_binding_revision=_DIGEST,
+            timing={
+                "command_latency_allowance_ns": 250_000_000,
+                "settling_allowance_ns": 750_000_000,
+                "operational_timeout_ns": 3_000_000_000,
+            },
+        ),
     )
     assert updated.status_code == 200, updated.text
-    rows = updated.json()["draft"]["document"]["policies"][
-        "stop_stage_parameters"
-    ]
+    rows = updated.json()["draft"]["document"]["policies"]["stop_stage_parameters"]
     controlled = [
-        row for row in rows
+        row
+        for row in rows
         if row["stop_escalation_stage_id"] == "motion_controlled_stop"
+        and row["control_binding_id"] == "arm_binding"
     ]
     assert len(controlled) == 2
     assert all(
-        row["default_contract_parameters"] == {
-            "allow_natural_completion_on_short_path": False,
+        row["default_contract_parameters"]
+        == {
+            "allow_natural_completion_on_short_path": natural_completion,
+            "jerk_limits_enabled": False,
             "deceleration_time_s": 1.25,
             "per_resource_limits": [
                 {
@@ -528,6 +1015,32 @@ def test_focused_controlled_stop_updates_all_derived_routes_and_not_hard_stop(
         for row in controlled
     )
     assert rows[2]["default_contract_parameters"] == {}
+    assert rows[3] == other_stage
+    workspace = updated.json()
+    saved = client.post(
+        "/api/deployment/save-as",
+        json=_request(
+            workspace,
+            path=str(tmp_path / "saved.deployment.yaml"),
+            confirmOverwrite=False,
+            kind="save-stop",
+        ),
+    )
+    assert saved.status_code == 200, saved.text
+    reopened = client.post(
+        "/api/deployment/open-draft",
+        json=_request(
+            saved.json(),
+            path=str(tmp_path / "saved.deployment.yaml"),
+            confirmDiscard=False,
+            kind="reopen-stop",
+        ),
+    )
+    assert reopened.status_code == 200, reopened.text
+    assert (
+        reopened.json()["draft"]["document"]["policies"]
+        == workspace["draft"]["document"]["policies"]
+    )
 
 
 def test_deployment_artifacts_remain_confined_and_save_as_requires_overwrite(
@@ -574,9 +1087,9 @@ def test_deployment_artifacts_remain_confined_and_save_as_requires_overwrite(
             "deployment_artifact_overwrite_confirmation_required"
         )
         assert existing.read_text(encoding="utf-8") == "unchanged\n"
-        assert client.get("/api/deployment/workspace").json()["draft"] == opened[
-            "draft"
-        ]
+        assert (
+            client.get("/api/deployment/workspace").json()["draft"] == opened["draft"]
+        )
     finally:
         outside.unlink(missing_ok=True)
 
@@ -645,21 +1158,34 @@ def test_named_scenario_candidates_project_the_complete_exact_pairing(
     deployment_revision = opened["draft"]["deploymentRevision"]
     state.headless_client.scenarios = lambda: {  # type: ignore[method-assign]
         "scenario_catalog_revision": _DIGEST,
-        "scenarios": [{
-            "scenario_id": "cell-a",
-            "description": "Cell A",
-            "deployment_artifact_id": "cell_a",
-            "deployment_revision": deployment_revision,
-            "retained_bundle_id": _DIGEST,
-            "program_id": "pick",
-            "program_revision": _DIGEST,
-            "program_binding_id": _DIGEST,
-        }],
+        "scenarios": [
+            {
+                "scenario_id": "cell-a",
+                "description": "Cell A",
+                "deployment_artifact_id": "cell_a",
+                "deployment_revision": deployment_revision,
+                "retained_bundle_id": _DIGEST,
+                "program_binding_id": _DIGEST,
+            }
+        ],
     }
 
-    candidate = client.get("/api/deployment/workspace").json()[
-        "scenarioCandidates"
-    ][0]
+    reads = []
+
+    def selection(scenario_id):
+        reads.append(scenario_id)
+        return {
+            **state.headless_client.scenarios()["scenarios"][0],
+            "scenario_catalog_revision": _DIGEST,
+            "program_id": "pick",
+            "program_revision": _DIGEST,
+        }
+
+    state.headless_client.scenario_load_selection = selection
+    result = client.get("/api/deployment/workspace").json()
+    candidate = result["scenarioCandidates"][0]
+    assert result["savedScenarioCandidates"] == [candidate]
+    assert reads == ["cell-a"]  # Draft and Saved reuse the one exact read.
     assert candidate == {
         "scenarioId": "cell-a",
         "scenarioCatalogRevision": _DIGEST,
@@ -671,6 +1197,13 @@ def test_named_scenario_candidates_project_the_complete_exact_pairing(
         "programBindingId": _DIGEST,
         "description": "Cell A",
     }
+    state.headless_client.scenario_load_selection = lambda scenario_id: {
+        **selection(scenario_id),
+        "program_binding_id": "sha256:" + "f" * 64,
+    }
+    crossed = client.get("/api/deployment/workspace").json()
+    assert crossed["scenarioCandidates"] == crossed["savedScenarioCandidates"] == []
+    assert "scenario_candidate_selection_mismatch" in crossed["unavailableReasons"]
 
 
 def test_run_rejects_a_loaded_deployment_draft_that_is_not_manager_applied():
@@ -712,7 +1245,10 @@ def test_run_rejects_a_loaded_deployment_draft_that_is_not_manager_applied():
         },
     )
     assert response.status_code == 409
-    assert response.json()["detail"]["code"] == "program_run_deployment_draft_applied_mismatch"
+    assert (
+        response.json()["detail"]["code"]
+        == "program_run_deployment_draft_applied_mismatch"
+    )
 
 
 def test_run_uses_the_existing_transport_when_deployment_draft_matches_applied():

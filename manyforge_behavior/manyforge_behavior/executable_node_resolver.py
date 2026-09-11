@@ -305,6 +305,8 @@ def _owner_invocation_builder(
             port=port,  # type: ignore[arg-type]
             output_key_parameter=output_key_parameter,
             blackboard_read_parameters=blackboard_read_parameters,
+            **({"operator_stop_state": context.operator_stop_state}
+               if adapter is OwnerInvocationAdapter else {}),
         )
 
     return build

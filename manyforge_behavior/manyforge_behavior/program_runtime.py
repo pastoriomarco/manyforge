@@ -146,15 +146,20 @@ class ProgramRunCapture:
             != self.owner_identities
             or len({identity.owner_role for identity in self.owner_identities})
             != len(self.owner_identities)
-            or "program_runner" not in {identity.owner_role for identity in self.owner_identities}
+            or "program_runner"
+            not in {identity.owner_role for identity in self.owner_identities}
         ):
             raise ValueError(
-                "owner_identities must be unique, role-sorted, and include " "program_runner"
+                "owner_identities must be unique, role-sorted, and include "
+                "program_runner"
             )
         if (
             not isinstance(self.node_policies, tuple)
             or len(self.node_policies) > 100_000
-            or any(not isinstance(policy, ProgramNodePolicy) for policy in self.node_policies)
+            or any(
+                not isinstance(policy, ProgramNodePolicy)
+                for policy in self.node_policies
+            )
             or tuple(
                 sorted(
                     self.node_policies,
@@ -162,15 +167,22 @@ class ProgramRunCapture:
                 )
             )
             != self.node_policies
-            or len({policy.instance_id for policy in self.node_policies}) != len(self.node_policies)
+            or len({policy.instance_id for policy in self.node_policies})
+            != len(self.node_policies)
         ):
-            raise ValueError("node_policies must be one bounded unique instance-sorted tuple")
+            raise ValueError(
+                "node_policies must be one bounded unique instance-sorted tuple"
+            )
         object.__setattr__(
             self,
             "_node_policy_lookup",
-            MappingProxyType({policy.instance_id: policy for policy in self.node_policies}),
+            MappingProxyType(
+                {policy.instance_id: policy for policy in self.node_policies}
+            ),
         )
-        policy_bytes = rfc8785.dumps([policy.to_dict() for policy in self.node_policies])
+        policy_bytes = rfc8785.dumps(
+            [policy.to_dict() for policy in self.node_policies]
+        )
         object.__setattr__(
             self,
             "node_policy_digest",
@@ -192,7 +204,9 @@ class ProgramRunCapture:
             "node_environment_digest": self.node_environment_digest,
             "node_policies": [policy.to_dict() for policy in self.node_policies],
             "node_policy_digest": self.node_policy_digest,
-            "owner_identities": [identity.to_dict() for identity in self.owner_identities],
+            "owner_identities": [
+                identity.to_dict() for identity in self.owner_identities
+            ],
         }
 
     @property
@@ -258,7 +272,9 @@ class ExecutableProgramRun:
         if program.program_id != capture.program_id:
             raise ProgramRuntimeError("captured Program ID does not match the Program")
         if program.program_revision != capture.program_revision:
-            raise ProgramRuntimeError("captured Program revision does not match the Program")
+            raise ProgramRuntimeError(
+                "captured Program revision does not match the Program"
+            )
         if environment.environment_digest != capture.node_environment_digest:
             raise ProgramRuntimeError(
                 "captured node environment does not match the retained environment"
@@ -305,7 +321,9 @@ class ExecutableProgramRun:
         def capture_topology(node: ProgramTreeNode) -> None:
             for child in node.children:
                 capture_topology(child)
-            node_children[node.instance_id] = tuple(child.instance_id for child in node.children)
+            node_children[node.instance_id] = tuple(
+                child.instance_id for child in node.children
+            )
 
         capture_topology(program.tree)
         self._scope_node_ids = tuple(sorted(node_children))
@@ -337,7 +355,11 @@ class ExecutableProgramRun:
             effective_stop_policy = (
                 "continue"
                 if root
-                else (inherited_stop_policy if entry.kind in {"composite", "decorator"} else "hold")
+                else (
+                    inherited_stop_policy
+                    if entry.kind in {"composite", "decorator"}
+                    else "hold"
+                )
             )
         else:
             effective_stop_policy = authored_stop_policy
@@ -382,6 +404,7 @@ class ExecutableProgramRun:
                 child=built,
                 node_instance_id=node.instance_id,
                 stop_state=self._operator_stop_state,
+                drain_children=entry.kind in {"composite", "decorator"},
             )
         self._authored_nodes[node.instance_id] = built
         return built
@@ -415,8 +438,11 @@ class ExecutableProgramRun:
                 {
                     instance_id: (
                         "idle"
-                        if behaviour.status is py_trees.common.Status.INVALID
-                        else behaviour.status.name.lower()
+                        if getattr(behaviour, "presented_status", behaviour.status)
+                        is py_trees.common.Status.INVALID
+                        else getattr(
+                            behaviour, "presented_status", behaviour.status
+                        ).name.lower()
                     )
                     for instance_id, behaviour in self._authored_nodes.items()
                 }
@@ -460,7 +486,9 @@ class ExecutableProgramRun:
         next parallel held task without ticking or submitting new work.
         """
 
-        states = tuple(self.task_control_states(node_ids=node_ids, settle=True).values())
+        states = tuple(
+            self.task_control_states(node_ids=node_ids, settle=True).values()
+        )
         return (
             states.count("active"),
             states.count("held"),
@@ -500,7 +528,9 @@ class ExecutableProgramRun:
             scope_port.execution_scope(self._capture.program_run_id)
         )
 
-    def _decode_operator_stop_scope(self, scope: Mapping[str, Any]) -> OperatorMotionStopSnapshot:
+    def _decode_operator_stop_scope(
+        self, scope: Mapping[str, Any]
+    ) -> OperatorMotionStopSnapshot:
         runner_epoch = next(
             (
                 owner.owner_epoch
@@ -529,7 +559,9 @@ class ExecutableProgramRun:
             scope["claim_generation"],
         )
         if self._scope_identity is not None and identity != self._scope_identity:
-            raise ProgramRuntimeError("operator Stop projection changed its owner/claim")
+            raise ProgramRuntimeError(
+                "operator Stop projection changed its owner/claim"
+            )
         held: set[str] = set()
         phases: dict[str, frozenset[str]] = {}
         for field in (
@@ -538,12 +570,20 @@ class ExecutableProgramRun:
             "faulted_node_indices",
         ):
             indices = scope.get(field)
-            if not isinstance(indices, (list, tuple)) or len(indices) > len(self._scope_node_ids):
-                raise ProgramRuntimeError("operator Stop projection has invalid node indices")
+            if not isinstance(indices, (list, tuple)) or len(indices) > len(
+                self._scope_node_ids
+            ):
+                raise ProgramRuntimeError(
+                    "operator Stop projection has invalid node indices"
+                )
             previous = -1
             for index in indices:
-                if type(index) is not int or not previous < index < len(self._scope_node_ids):
-                    raise ProgramRuntimeError("operator Stop projection has invalid node indices")
+                if type(index) is not int or not previous < index < len(
+                    self._scope_node_ids
+                ):
+                    raise ProgramRuntimeError(
+                        "operator Stop projection has invalid node indices"
+                    )
                 node_id = self._scope_node_ids[index]
                 if node_id in held:
                     raise ProgramRuntimeError("operator Stop projection repeats a node")
@@ -560,7 +600,10 @@ class ExecutableProgramRun:
 
     def refresh_pending_stop_settlement(self) -> None:
         """Use the existing tree worker only until accepted containment settles."""
-        if self._operator_stop_state.snapshot().stopping_nodes:
+        if (
+            self._operator_stop_state.snapshot().stopping_nodes
+            or self._operator_stop_state.observation_error() is not None
+        ):
             try:
                 self._operator_stop_state.refresh()
             except Exception:
@@ -578,13 +621,17 @@ class ExecutableProgramRun:
     def pending_selected_observation(self) -> bool:
         """Cached scheduling query; never reads an owner or grants admission."""
         scope = self._operator_stop_state.snapshot()
-        if scope.stopping_nodes:
+        if (
+            scope.stopping_nodes
+            or self._operator_stop_state.observation_error() is not None
+        ):
             return True
         if not scope.held_nodes:
             return False
         with self._lock:
             return any(
-                node.name in scope.held_nodes and getattr(node, "has_active_task", False)
+                node.name in scope.held_nodes
+                and getattr(node, "has_active_task", False)
                 for node in self._tree.root.iterate()
             )
 
@@ -594,11 +641,12 @@ class ExecutableProgramRun:
         self._operator_stop_state.refresh()
 
     def read_operator_stop_scope(self) -> Mapping[str, Any]:
+        """Validate fresh Resume evidence without publishing a worker observation."""
         scope_port = self._ports.program_run_scope
         if scope_port is None:
             raise ProgramRuntimeError("operator Stop requires a Kernel scope port")
         scope = scope_port.execution_scope(self._capture.program_run_id)
-        self.publish_operator_stop_scope(scope)
+        self._decode_operator_stop_scope(scope)
         return scope
 
     def operator_stop_scope(self) -> OperatorMotionStopSnapshot:
@@ -614,37 +662,52 @@ class ExecutableProgramRun:
         *,
         expected_revision: int | None = None,
         released_nodes: frozenset[str] = frozenset(),
+        notify_observation: bool = True,
     ) -> None:
         """Apply the accepted owner result without a tree lock or another read."""
         snapshot = self._decode_operator_stop_scope(scope)
         if (
-            expected_revision is not None and snapshot.selection_revision != expected_revision
+            expected_revision is not None
+            and snapshot.selection_revision != expected_revision
         ) or released_nodes & snapshot.held_nodes:
-            raise ProgramRuntimeError("selection release did not release its exact scope")
-        self._operator_stop_state.publish(snapshot)
+            raise ProgramRuntimeError(
+                "selection release did not release its exact scope"
+            )
+        self._operator_stop_state.publish(
+            snapshot, notify_observation=notify_observation
+        )
 
-    def execution_selection(self, group_id: str) -> frozenset[str]:
+    def execution_selection(self, group_id: str | list[str]) -> frozenset[str]:
         try:
-            return frozenset(self._program.execution_selections[group_id])
+            groups = [group_id] if isinstance(group_id, str) else group_id
+            return frozenset(
+                node
+                for group in groups
+                for node in self._program.execution_selections[group]
+            )
         except KeyError as error:
-            raise ProgramRuntimeError("execution selection is not in this capture") from error
+            raise ProgramRuntimeError(
+                "execution selection is not in this capture"
+            ) from error
 
     @property
     def execution_selections(self) -> Mapping[str, tuple[str, ...]]:
         return self._program.execution_selections
 
-    def execution_selection_request(self, group_id: str, request_id: str) -> dict[str, Any]:
+    def execution_selection_request(
+        self, group_id: str | list[str], request_id: str
+    ) -> dict[str, Any]:
         if self._scope_identity is None:
             raise ProgramRuntimeError("Program execution scope is not captured")
         kernel_epoch, runner_epoch, claim = self._scope_identity
         # Do not resolve Stop membership here: the Kernel owns conservative
         # containment of an unknown selection as well as valid selections.
         return {
-            "schema_version": "manyforge.program_execution_selection.v1",
+            "schema_version": "manyforge.program_execution_selection.v2",
             "program_runner_owner_epoch": runner_epoch,
             "claim_generation": claim,
             "program_run_id": self._capture.program_run_id,
-            "group_id": group_id,
+            "group_ids": [group_id] if isinstance(group_id, str) else list(group_id),
             "request_context": {
                 "request_id": request_id,
                 "request_owner_epoch": kernel_epoch,

@@ -200,14 +200,13 @@ VerifyRuntimeProducts(
 }
 
 [[nodiscard]] std::vector<RuntimeUnitConvergencePlanRowDTO> BuildCandidatePlan(
-    const RetainedBundle &predecessor, const RetainedBundle &candidate,
+    const std::map<std::string, RuntimeUnitConvergencePlanRowDTO>
+        &predecessor_plans,
+    const RetainedBundle &candidate,
     const manyforge::deployment::IVerifiedRetainedProductArtifactSource
         &artifact_source,
     const std::string_view operating_system,
     const std::vector<std::string> &launch_environment_contracts) {
-  auto predecessor_plans =
-      VerifyRuntimeProducts(predecessor, artifact_source, operating_system,
-                            launch_environment_contracts);
   auto candidate_plans =
       VerifyRuntimeProducts(candidate, artifact_source, operating_system,
                             launch_environment_contracts);
@@ -560,8 +559,11 @@ ManagerApplyRuntimeConvergenceCoordinator::ConvergeOrRecover(
   VerifyApplyInputs(apply_intent, predecessor, candidate);
   const auto initial_publication = VerifyCurrentPredecessor(
       publication_reader_, apply_intent, predecessor_publication_generation);
+  const auto predecessor_plans =
+      VerifyRuntimeProducts(predecessor, artifact_source_, operating_system_,
+                            launch_environment_contracts_);
   auto runtime_plans =
-      BuildCandidatePlan(predecessor, candidate, artifact_source_,
+      BuildCandidatePlan(predecessor_plans, candidate, artifact_source_,
                          operating_system_, launch_environment_contracts_);
   const auto dependency_order = DependencyOrder(runtime_plans);
 
@@ -622,10 +624,11 @@ ManagerApplyRuntimeConvergenceCoordinator::ConvergeOrRecover(
     expectations.push_back(MakeExpectation(plan));
   }
   RuntimeObservationReducer reducer(clock_ns_, std::move(declared_runtime_ids));
+  std::map<std::string, manyforge::core::ManagedRuntimeWithdrawalDTO> withdrawals;
 
   for (const auto index : dependency_order) {
     const auto &plan = convergence_intent.runtime_units[index];
-    const RuntimeUnitConvergenceQueryDTO query{
+    RuntimeUnitConvergenceQueryDTO query{
         apply_intent.apply_id,
         apply_intent.apply_generation,
         candidate.retained_bundle_id(),
@@ -633,6 +636,16 @@ ManagerApplyRuntimeConvergenceCoordinator::ConvergeOrRecover(
         durable_intent.record.runtime_convergence_intent_digest,
         plan,
     };
+    const auto old = predecessor_plans.find(plan.runtime_unit_id.value());
+    if (old != predecessor_plans.end() &&
+        plan.lifecycle_control ==
+            manyforge::core::RuntimeLifecycleControl::kManagerManaged &&
+        (old->second.product_identity != plan.product_identity ||
+         old->second.configuration_identity != plan.configuration_identity ||
+         old->second.runtime_contract_offer_digest !=
+             plan.runtime_contract_offer_digest)) {
+      query.replacement = fence.rehydrate_request;
+    }
     if (!query.valid()) {
       Fail("Manager produced an invalid runtime convergence query");
     }
@@ -666,6 +679,33 @@ ManagerApplyRuntimeConvergenceCoordinator::ConvergeOrRecover(
       } catch (...) {
         throw ManagerRuntimeProcessEffectUncertainError(
             "managed runtime Ensure outcome is uncertain", query);
+      }
+    }
+    if (query.replacement) {
+      auto withdrawal = process_port_.ReadPredecessorWithdrawal(query);
+      if (!withdrawal && prior_staged_ready) {
+        const auto &prior_rows = prior_staged_ready->staged_ready.runtime_units;
+        const auto prior = std::find_if(
+            prior_rows.begin(), prior_rows.end(), [&](const auto &row) {
+              return row.runtime_unit_id == plan.runtime_unit_id;
+            });
+        if (prior != prior_rows.end())
+          withdrawal = prior->predecessor_withdrawal;
+      }
+      if (withdrawal) {
+        if (!withdrawal->valid() ||
+            withdrawal->apply_id != apply_intent.apply_id ||
+            withdrawal->apply_generation != apply_intent.apply_generation ||
+            withdrawal->runtime_convergence_intent_digest !=
+                durable_intent.record.runtime_convergence_intent_digest ||
+            withdrawal->runtime_unit_id != plan.runtime_unit_id ||
+            withdrawal->product_identity != old->second.product_identity ||
+            withdrawal->configuration_identity !=
+                old->second.configuration_identity ||
+            withdrawal->runtime_epoch.value() == process.process_incarnation())
+          Fail("predecessor withdrawal differs from the exact fenced "
+               "replacement");
+        withdrawals.emplace(plan.runtime_unit_id.value(), *withdrawal);
       }
     }
     if (process.state() == ProcessPresenceState::kPresent) {
@@ -719,6 +759,9 @@ ManagerApplyRuntimeConvergenceCoordinator::ConvergeOrRecover(
       Fail("runtime reducer returned an undeclared observation");
     }
     staged_rows.push_back(MakeStagedEvidence(*found, observation));
+    const auto withdrawal = withdrawals.find(observation.runtime_unit_id());
+    if (withdrawal != withdrawals.end())
+      staged_rows.back().predecessor_withdrawal = withdrawal->second;
   }
   std::sort(staged_rows.begin(), staged_rows.end(),
             [](const auto &left, const auto &right) {

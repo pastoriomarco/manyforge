@@ -113,7 +113,7 @@ def test_client_rejects_owner_error_and_noncanonical_response(tmp_path: Path) ->
                 "command": request["command"],
                 "error": {
                     "code": "missing_reference",
-                    "details": {},
+                    "details": {"effect": "not_started"},
                     "message": "component is absent",
                 },
                 "ok": False,
@@ -125,6 +125,7 @@ def test_client_rejects_owner_error_and_noncanonical_response(tmp_path: Path) ->
     with pytest.raises(HeadlessApiError, match="component is absent") as captured:
         CCLCOpenRequestClient(tmp_path).component_snapshot("component.arm")
     assert captured.value.code == "missing_reference"
+    assert captured.value.details == {"effect": "not_started"}
     thread.join(timeout=2)
     (tmp_path / CCLC_SOCKET_FILE).unlink()
 
@@ -196,13 +197,41 @@ class FakeCCLC:
 
     def submit_lifecycle(self, intent: dict[str, Any]) -> dict[str, Any]:
         self.lifecycle.append(intent)
-        return {"acceptance": None, "replay_status": "request_id_conflict", "status": None}
+        return {
+            "acceptance": None,
+            "replay_status": "request_id_conflict",
+            "status": None,
+        }
 
     def lifecycle_status(self, transaction_id: str) -> dict[str, Any] | None:
         return None
 
+    def lifecycle_request_result(self, intent):
+        return {
+            "replay_status": "replayed_exact",
+            "acceptance": None,
+            "status": None,
+            "rejection": {
+                "code": "invalid_state_transition",
+                "message": "Held",
+                "details": {
+                    "effect": "not_started",
+                    "reason": "program_node_stop_fence_active",
+                    "selection_revision": "7",
+                },
+            },
+        }
+
     def submit_route(self, intent: dict[str, Any]) -> dict[str, Any]:
-        return {"acceptance": None, "replay_status": "request_ledger_full", "status": None}
+        return {
+            "acceptance": None,
+            "replay_status": "request_ledger_full",
+            "status": None,
+        }
+
+    def route_request_result(self, intent):
+        self.route_result_request = intent
+        return None
 
     def route_status(self, transaction_id: str) -> dict[str, Any] | None:
         return None
@@ -245,15 +274,67 @@ def test_http_lifecycle_route_is_thin_and_requires_confirmation() -> None:
     assert fake.lifecycle[0]["expected_admission_generation"] == 7
     assert len(fake.lifecycle) == 1
     assert "confirmed" not in fake.lifecycle[0]
+    result = client.post(
+        "/api/cclc/lifecycle/requests/result", json=_lifecycle_request(confirmed=False)
+    )
+    assert result.status_code == 200
+    assert result.json()["result"]["rejection"]["details"]["selection_revision"] == "7"
+    assert len(fake.lifecycle) == 1  # The lookup must never call submit.
+
+    route_request = {
+        "request_context": _lifecycle_request(confirmed=False)["request_context"],
+        "expected_admission_generation": 7,
+        "expected_retained_bundle_id": "bundle.1",
+        "expected_graph_revision": "graph.1",
+        "desired_configuration": {
+            "control_domain_id": "domain.arm",
+            "control_domain_revision": "domain.revision.1",
+            "controller_topology_id": "topology.arm",
+            "topology_revision": "topology.revision.1",
+            "activation_set_id": "activation.arm",
+            "binding_routes": [
+                {
+                    "control_binding_id": "binding.arm",
+                    "control_binding_revision": "binding.revision.1",
+                    "control_route_id": "route.arm",
+                }
+            ],
+        },
+        "expected_active_control_configuration": {"presence": "absent"},
+        "component_expectations": [
+            {
+                "controllable_component_id": "component.arm",
+                "expected_component_lifecycle_generation": 4,
+                "expected_component_lifecycle_state": "active",
+            }
+        ],
+        "confirmed": False,
+    }
+    # This service fixture has no authoring read. Result observation must not
+    # ask for current Idle, confirm or resubmit the original command.
+    route = client.post("/api/cclc/routes/requests/result", json=route_request)
+    assert route.status_code == 200, route.text
+    assert route.json() == {"result": None}
+    assert (
+        fake.route_result_request["request_context"]["request_owner_epoch"]
+        == "cli.epoch.1"
+    )
+    assert "confirmed" not in fake.route_result_request
+    assert fake.route_result_request["expected_admission_generation"] == 7
+    # Legacy lookup preserves absence; it is not a new command or a request
+    # to silently substitute the current generation.
+    del route_request["expected_admission_generation"]
+    assert client.post("/api/cclc/routes/requests/result", json=route_request).status_code == 200
+    assert "expected_admission_generation" not in fake.route_result_request
+    route_request["confirmed"] = True
+    assert client.post("/api/cclc/routes/requests", json=route_request).status_code == 422
 
     snapshot = client.get("/api/cclc/components/component.arm")
     assert snapshot.json() == {"controllable_component_id": "component.arm"}
     assert client.get("/api/cclc/owner").json() == {
         "request_owner_epoch": "cclc-owner.http-test"
     }
-    templates = client.get(
-        "/api/cclc/components/component.arm/route-templates"
-    )
+    templates = client.get("/api/cclc/components/component.arm/route-templates")
     assert templates.json()["templates"] == []
     assert client.get("/api/cclc/lifecycle/transactions/lifecycle.1").json() == {
         "status": None
@@ -261,7 +342,4 @@ def test_http_lifecycle_route_is_thin_and_requires_confirmation() -> None:
 
     invalid = _lifecycle_request(confirmed=True)
     invalid["caller_asserted_principal"] = "operator"
-    assert (
-        client.post("/api/cclc/lifecycle/requests", json=invalid).status_code
-        == 422
-    )
+    assert client.post("/api/cclc/lifecycle/requests", json=invalid).status_code == 422

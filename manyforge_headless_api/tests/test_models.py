@@ -9,18 +9,38 @@ from manyforge_headless_api.models import (
     AcknowledgeAlarmRequest,
     AcknowledgeAllAlarmsRequest,
     ManagerApplyRequest,
+    ManualProgramHandover,
+    ManualProgramHandoverContext,
     MotionParticipantRequest,
     MAX_OPERATION_PARTICIPANTS,
     OperationControlRequest,
     OperationIntentRequest,
     OperationParticipantRequest,
     ProgramDiagnosticRequest,
+    ProgramSelectionStopRequest,
     PickSequencePlanningRequest,
     PlaceSequencePlanningRequest,
     RuntimeScaleControlRequest,
     SceneTransactionRequest,
     StopIntentRequest,
 )
+
+
+@pytest.mark.parametrize("groups", [["arm", "grippers"], [], ["bad group"], "arm"])
+def test_program_stop_group_list_is_bounded_and_explicit(groups):
+    body = {
+        "request_id": "stop.groups",
+        "request_owner_epoch": "caller.1",
+        "source_label": "operator_ui",
+        "program_run_id": "run.1",
+        "expected_owner_epoch": "runner.1",
+        "group_ids": groups,
+    }
+    if groups == ["arm", "grippers"]:
+        assert ProgramSelectionStopRequest.model_validate(body).group_ids == groups
+    else:
+        with pytest.raises(ValidationError):
+            ProgramSelectionStopRequest.model_validate(body)
 
 
 @pytest.mark.parametrize("value", [float("inf"), float("nan"), 2**53, object()])
@@ -139,6 +159,64 @@ def _planning_operation(
         ],
         "coordination_policy": "independent",
     }
+
+
+def test_manual_context_is_optional_and_does_not_change_ordinary_wire():
+    body = _planning_operation("manual.1", _tool_payload(), tool=True)
+    ordinary = OperationIntentRequest.model_validate(body)
+    assert ordinary.model_dump(mode="json") == body
+    body["manual_handover"] = {
+        "program_runner_owner_epoch": "runner.1",
+        "program_run_id": "parent.1",
+        "claim_generation": 1,
+        "selection_revision": 0,
+    }
+    assert OperationIntentRequest.model_validate(body).model_dump(mode="json") == body
+    body["manual_handover"]["program_run_id"] = body["program_run_id"]
+    with pytest.raises(ValidationError, match="own Run"):
+        OperationIntentRequest.model_validate(body)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"claim_generation": 0},
+        {"selection_revision": -1},
+        {"selection_revision": 2**53},
+        {"selection_revision": True},
+        {"program_run_id": ""},
+        {"program_run_id": "x" * 129},
+        {"program_runner_owner_epoch": "a\0b"},
+        {"unknown": 1},
+    ],
+)
+def test_manual_context_rejects_invalid_coordinates(change):
+    with pytest.raises(ValidationError):
+        ManualProgramHandoverContext.model_validate(
+            {
+                "program_runner_owner_epoch": "runner.1",
+                "program_run_id": "parent.1",
+                "claim_generation": 1,
+                "selection_revision": 0,
+                **change,
+            }
+        )
+
+
+@pytest.mark.parametrize("indices", [[1, 0], [0, 0], [-1], [100_000], [True]])
+def test_manual_producer_indices_are_closed_and_canonical(indices):
+    with pytest.raises(ValidationError):
+        ManualProgramHandover.model_validate(
+            {
+                "context": {
+                    "program_runner_owner_epoch": "runner.1",
+                    "program_run_id": "parent.1",
+                    "claim_generation": 1,
+                    "selection_revision": 0,
+                },
+                "producer_node_indices": indices,
+            }
+        )
 
 
 def _tool_payload() -> dict[str, object]:
@@ -294,12 +372,16 @@ def test_pick_place_requests_preserve_defaults_and_phase_boundaries() -> None:
     assert parsed.synthesis.pick_offset_reference.type == "runtime_object"
     assert parsed.synthesis.approach_offset_reference is not None
     assert parsed.synthesis.approach_offset_reference.type == "frame_role"
-    assert parsed.descend_operation.participants[0].payload.contact_policy_id == ("pick.contact")
+    assert parsed.descend_operation.participants[0].payload.contact_policy_id == (
+        "pick.contact"
+    )
 
     invalid_contact = _pick_request()
     invalid_contact["retreat_operation"] = _planning_operation(
         "pick.retreat",
-        _planning_motion("retreat", _cartesian_path(), contact_policy_id="pick.contact"),
+        _planning_motion(
+            "retreat", _cartesian_path(), contact_policy_id="pick.contact"
+        ),
     )
     with pytest.raises(ValidationError, match="retreat cannot carry"):
         PickSequencePlanningRequest.model_validate(invalid_contact)
@@ -349,7 +431,9 @@ def test_pick_place_requests_preserve_defaults_and_phase_boundaries() -> None:
     assert PlaceSequencePlanningRequest.model_validate(place).sequence_id == "place.1"
     place["descend_operation"] = _planning_operation(
         "place.descend",
-        _planning_motion("descend", _cartesian_path(), contact_policy_id="pick.contact"),
+        _planning_motion(
+            "descend", _cartesian_path(), contact_policy_id="pick.contact"
+        ),
     )
     with pytest.raises(ValidationError, match="place motion phases"):
         PlaceSequencePlanningRequest.model_validate(place)
@@ -360,7 +444,9 @@ def test_motion_payload_accepts_pose_and_cartesian_but_not_joint_contact() -> No
         _planning_motion("pose", {"kind": "pose_goal", "goal": _planning_pose()})
     )
     assert pose.motion.kind == "pose_goal"
-    path = MotionParticipantRequest.model_validate(_planning_motion("path", _cartesian_path()))
+    path = MotionParticipantRequest.model_validate(
+        _planning_motion("path", _cartesian_path())
+    )
     assert path.motion.kind == "cartesian_path"
     with pytest.raises(ValidationError, match="joint_goal cannot carry"):
         MotionParticipantRequest.model_validate(
@@ -434,7 +520,9 @@ def test_motion_reference_shape_fails_closed_before_native_admission() -> None:
         },
     )
     relative_joint["target_mode"] = "relative"
-    assert MotionParticipantRequest.model_validate(relative_joint).target_mode == ("relative")
+    assert MotionParticipantRequest.model_validate(relative_joint).target_mode == (
+        "relative"
+    )
 
     stale_runtime_binding = _planning_motion(
         "relative-runtime-object",
@@ -480,9 +568,14 @@ def test_alarm_activation_and_bulk_cardinality_match_owner_profile() -> None:
         "reason": None,
         "confirmed": True,
     }
-    assert len(AcknowledgeAlarmRequest.model_validate(acknowledgement).activation_id) == 2_048
+    assert (
+        len(AcknowledgeAlarmRequest.model_validate(acknowledgement).activation_id)
+        == 2_048
+    )
     with pytest.raises(ValidationError, match="2048 UTF-8 bytes"):
-        AcknowledgeAlarmRequest.model_validate({**acknowledgement, "activation_id": "a" * 2_049})
+        AcknowledgeAlarmRequest.model_validate(
+            {**acknowledgement, "activation_id": "a" * 2_049}
+        )
 
     members = [
         {
@@ -554,7 +647,9 @@ def test_operation_mutations_are_strict_bounded_and_generation_fenced() -> None:
     with pytest.raises(ValidationError, match="4096 UTF-8 bytes"):
         OperationControlRequest.model_validate({**control, "reason": "r" * 4097})
     with pytest.raises(ValidationError):
-        OperationControlRequest.model_validate({**control, "expected_operation_revision": 0})
+        OperationControlRequest.model_validate(
+            {**control, "expected_operation_revision": 0}
+        )
 
     stop_target = {
         "operation_id": "operation-1",

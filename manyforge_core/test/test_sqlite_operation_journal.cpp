@@ -528,6 +528,11 @@ TEST(SqliteOperationJournalTest, V9ThroughV11CutoverPreservesHistoricalPayloadBy
     ASSERT_EQ(sqlite3_open(database.c_str(), &legacy), SQLITE_OK);
     const auto legacy_schema =
         std::string(
+            "ALTER TABLE cell_admission_claims DROP COLUMN program_node_runner_owner_epoch;"
+            "ALTER TABLE cell_admission_claims DROP COLUMN program_node_run_id;"
+            "ALTER TABLE cell_admission_claims DROP COLUMN program_node_instance_id;"
+            "ALTER TABLE cell_admission_claims DROP COLUMN program_node_attempt_id;"
+            "ALTER TABLE cell_admission_claims DROP COLUMN program_node_owner_api;"
             "ALTER TABLE operation_participants DROP COLUMN execution_node_instance_id;"
             "ALTER TABLE operation_participants DROP COLUMN execution_node_attempt_id;") +
         (version < 11 ? "ALTER TABLE operation_snapshots DROP COLUMN journal_capture_order;" : "") +
@@ -572,6 +577,11 @@ TEST(SqliteOperationJournalTest, CorruptV9CutoverLeavesIdentityAndEvidenceUntouc
     ASSERT_EQ(
         sqlite3_exec(
             legacy,
+            "ALTER TABLE cell_admission_claims DROP COLUMN program_node_runner_owner_epoch;"
+            "ALTER TABLE cell_admission_claims DROP COLUMN program_node_run_id;"
+            "ALTER TABLE cell_admission_claims DROP COLUMN program_node_instance_id;"
+            "ALTER TABLE cell_admission_claims DROP COLUMN program_node_attempt_id;"
+            "ALTER TABLE cell_admission_claims DROP COLUMN program_node_owner_api;"
             "ALTER TABLE operation_participants DROP COLUMN execution_node_instance_id;"
             "ALTER TABLE operation_participants DROP COLUMN execution_node_attempt_id;"
             "ALTER TABLE operation_snapshots DROP COLUMN journal_capture_order;"
@@ -627,6 +637,11 @@ TEST(SqliteOperationJournalTest, CorruptV11CaptureOrderCannotCommitTheSchemaUpgr
     sqlite3* legacy = nullptr;
     ASSERT_EQ(sqlite3_open(database.c_str(), &legacy), SQLITE_OK);
     const auto downgrade =
+        "ALTER TABLE cell_admission_claims DROP COLUMN program_node_runner_owner_epoch;"
+        "ALTER TABLE cell_admission_claims DROP COLUMN program_node_run_id;"
+        "ALTER TABLE cell_admission_claims DROP COLUMN program_node_instance_id;"
+        "ALTER TABLE cell_admission_claims DROP COLUMN program_node_attempt_id;"
+        "ALTER TABLE cell_admission_claims DROP COLUMN program_node_owner_api;"
         "ALTER TABLE operation_participants DROP COLUMN execution_node_instance_id;"
         "ALTER TABLE operation_participants DROP COLUMN execution_node_attempt_id;"
         "PRAGMA user_version=11; UPDATE journal_metadata SET schema_version=11,"
@@ -1133,7 +1148,10 @@ TEST(SqliteOperationJournalTest,
   const CellId cell_id("cell.1");
   const std::vector<ResourceId> inventory{ResourceId("robot.gripper")};
   const RequestOwnerEpoch first_epoch("execution-host.epoch.1");
-  const auto intent = CommandIntent("request.command.1", first_epoch.value());
+  auto intent = CommandIntent("request.command.1", first_epoch.value());
+  intent.manual_handover = ManualProgramHandoverContextDTO{RequestOwnerEpoch("program.owner"),
+                                                           ProgramRunId("held.program"),
+                                                           CellAdmissionClaimGeneration(7U), 9U};
   auto state =
       OperationState("operation:execution-host.epoch.1:1", OperationStateKind::kExecuting, 10);
   {
@@ -1142,6 +1160,15 @@ TEST(SqliteOperationJournalTest,
     ASSERT_TRUE(
         journal.RecordOperationAccepted(first_epoch, intent, Acceptance(intent, state), state)
             .ok());
+    const auto history = journal.ReadEvents(first_epoch, 0U);
+    ASSERT_TRUE(history.ok());
+    EXPECT_TRUE(std::any_of(
+        history.value().events.begin(), history.value().events.end(), [](const auto& event) {
+          return event.payload_json.find(
+                     "\"manual_handover\":{\"claim_generation\":7,\"program_run_id\":\"held."
+                     "program\",\"program_runner_owner_epoch\":\"program.owner\",\"selection_"
+                     "revision\":9}") != std::string::npos;
+        }));
     state.state = OperationStateKind::kCompleted;
     state.participants.front().state = OperationStateKind::kCompleted;
     state.participants.front().progress = 1.0;
@@ -1525,6 +1552,53 @@ TEST(SqliteOperationJournalTest,
   EXPECT_EQ(projected.error->code, "operation_journal_stop_projection_unavailable");
   EXPECT_EQ(projected.error->details.at("retryable"), "true");
   EXPECT_TRUE(admission_result.ok());
+}
+
+TEST(SqliteOperationJournalTest, CleanExecutionCloseRetainsIndependentAuthoringClaims) {
+  for (const auto kind : {CellAdmissionClaimKindDTO::kAuthoringMutation,
+                          CellAdmissionClaimKindDTO::kManagerApply,
+                          CellAdmissionClaimKindDTO::kManualOperation}) {
+    ScopedTemporaryDirectory temporary;
+    const auto database = temporary.path() / std::string(kOperationJournalFilename);
+    const RequestOwnerEpoch epoch("execution-host.epoch.clean-apply");
+    const std::vector<ResourceId> inventory{ResourceId("robot.gripper")};
+    const auto role = kind == CellAdmissionClaimKindDTO::kAuthoringMutation
+                          ? CellAdmissionOwnerRoleDTO::kAuthoringOwner
+                      : kind == CellAdmissionClaimKindDTO::kManagerApply
+                          ? CellAdmissionOwnerRoleDTO::kManager
+                          : CellAdmissionOwnerRoleDTO::kManualOperationOwner;
+    SqliteOperationJournal journal(database, CellId("cell.1"), 8U);
+    const auto initial = journal.BeginOwnerEpoch(epoch, 1, 8U, inventory);
+    ASSERT_TRUE(initial.ok());
+    const CellAdmissionClaimDTO claim{{kind,
+                                       role,
+                                       RequestOwnerEpoch("external.owner"),
+                                       "transaction.1",
+                                       RequestId("request.claim.1"),
+                                       Digest('e'),
+                                       initial.value().cell_admission_generation_high_water,
+                                       {},
+                                       std::nullopt,
+                                       std::nullopt},
+                                      CellAdmissionClaimGeneration(1U),
+                                      initial.value().cell_admission_generation_high_water,
+                                      2};
+    ASSERT_TRUE(journal.RecordCellAdmissionClaimAcquired(epoch, claim).ok());
+    const bool clean = kind != CellAdmissionClaimKindDTO::kManualOperation;
+    EXPECT_EQ(journal.CloseOwnerEpoch(epoch, 3).ok(), clean);
+    journal.Close();
+    SqliteOperationJournal successor(database, CellId("cell.1"), 8U);
+    const auto recovered = successor.BeginOwnerEpoch(
+        RequestOwnerEpoch("execution-host.epoch.successor"), 4, 8U, inventory);
+    ASSERT_TRUE(recovered.ok()) << recovered.error().message;
+    EXPECT_EQ(recovered.value().unreconciled_resources.empty(), clean);
+    EXPECT_EQ(recovered.value().replaced_unclosed_owner_epoch.has_value(), !clean);
+    ASSERT_EQ(recovered.value().recovered_cell_admission_claims.size(), 1U);
+    const auto& retained = recovered.value().recovered_cell_admission_claims.front();
+    EXPECT_EQ(retained.claim, claim);
+    EXPECT_FALSE(retained.release.has_value());
+    EXPECT_FALSE(retained.reconcile_settlement.has_value());
+  }
 }
 
 TEST(SqliteOperationJournalTest, RejectsNoncanonicalAffectedStateWithoutAppendingProjection) {

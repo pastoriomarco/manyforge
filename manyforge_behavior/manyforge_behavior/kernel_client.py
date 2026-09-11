@@ -30,9 +30,13 @@ class ExecutionTransport(Protocol):
 
     def submit(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
-    def register_program_run_capture(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
+    def register_program_run_capture(
+        self, body: Mapping[str, Any]
+    ) -> dict[str, Any]: ...
 
     def read_program_execution_scope(self, program_run_id: str) -> dict[str, Any]: ...
+
+    def read_manual_handover(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
     def stop_program_selection(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
@@ -390,6 +394,15 @@ class KernelClient:
             raise KernelClientResponseError("execution scope changed its Program run")
         return scope
 
+    def read_manual_handover(self, request: Mapping[str, Any]) -> dict[str, Any] | None:
+        response = self._successful(
+            self._transport.read_manual_handover(request), label="manual handover"
+        )
+        handover = response.get("handover")
+        if handover is not None and not isinstance(handover, dict):
+            raise KernelClientResponseError("manual handover has an invalid shape")
+        return handover
+
     def stop_program_selection(self, request: Mapping[str, Any]) -> Mapping[str, Any]:
         response = self._successful(
             self._transport.stop_program_selection(request),
@@ -399,7 +412,9 @@ class KernelClient:
         if (
             response.get("command") != "stop_program_selection"
             or not isinstance(accepted, Mapping)
-            or accepted.get("group_id") != request.get("group_id")
+            or not isinstance(accepted.get("group_ids"), list)
+            or not accepted["group_ids"]
+            or accepted.get("group_ids") != request.get("group_ids")
             or accepted.get("replay_status") not in {"accepted_new", "replayed_exact"}
             or not isinstance(accepted.get("state"), Mapping)
         ):
@@ -410,7 +425,9 @@ class KernelClient:
         self, request: Mapping[str, Any], expected_selection_revision: int
     ) -> Mapping[str, Any]:
         response = self._successful(
-            self._transport.release_program_selection(request, expected_selection_revision),
+            self._transport.release_program_selection(
+                request, expected_selection_revision
+            ),
             label="Program selection Resume",
         )
         scope = response.get("scope")
@@ -420,7 +437,9 @@ class KernelClient:
             or type(scope.get("selection_revision")) is not int
             or scope["selection_revision"] != expected_selection_revision + 1
         ):
-            raise KernelClientResponseError("Program selection Resume omitted its scope")
+            raise KernelClientResponseError(
+                "Program selection Resume omitted its scope"
+            )
         return scope
 
     def release_program_run_stop_fence(

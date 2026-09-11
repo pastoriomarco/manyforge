@@ -61,6 +61,11 @@ def test_parallel_recovery_never_reinvokes_an_unresolved_sibling(action):
     assert [child.calls for child in children] == [1, 1]
     assert children[1].attempt_identity == second.identity
     assert registry.read_all("run") == (second,)
+    if action == "manual_success":
+        assert held[0].presented_status is py_trees.common.Status.SUCCESS
+        held[0].observe_while_operator_stop_held()
+        assert held[0].status is py_trees.common.Status.SUCCESS
+        assert registry.read_all("run") == (second,)
     list(root.tick())
     assert children[0].calls == (2 if action == "retry" else 1)
     assert children[1].calls == 1

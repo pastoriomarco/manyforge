@@ -151,6 +151,19 @@ TEST(StopScopeResolverTest, ResolvesExactOperationWithoutWideningToIndependentWo
   EXPECT_TRUE(result.value().stale_diagnostics.empty());
 }
 
+TEST(StopScopeResolverTest, ProgramStopIncludesAttachedManualWithoutChangingItsRunIdentity) {
+  auto snapshot = independent_snapshot();
+  snapshot.operations[1].state = OperationStateKind::kExecuting;
+  snapshot.operations[1].parent_program_run_id = ProgramRunId("program-run.a");
+  const auto result = resolve_stop_scope(program_run_stop(), snapshot);
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(result.value().operations,
+            (std::vector<OperationId>{OperationId("operation.a"), OperationId("operation.b")}));
+  EXPECT_EQ(snapshot.operations[1].program_run_id, ProgramRunId("program-run.b"));
+  snapshot.operations[1].parent_program_run_id = ProgramRunId("");
+  EXPECT_FALSE(resolve_stop_scope(program_run_stop(), snapshot).ok());
+}
+
 TEST(StopScopeResolverTest, MalformedIngressSelectorIdentityIsStableAndRouteBound) {
   const MalformedStopIngressDTO ingress{
       RequestId("malformed-stop.http.1"), RequestOwnerEpoch("kernel.epoch.current"),
@@ -298,8 +311,7 @@ TEST(StopScopeResolverTest, InternalProgramRunSelectorCapturesOnlyCurrentRun) {
   idle.known_program_runs = {ProgramRunId("program-run.a")};
   const auto known_idle = resolve_stop_scope(program_run_stop(), idle);
   ASSERT_TRUE(known_idle.ok()) << known_idle.error().message;
-  EXPECT_EQ(known_idle.value().disposition,
-            StopResolutionDispositionDTO::kAlreadyTerminalNoEffect);
+  EXPECT_EQ(known_idle.value().disposition, StopResolutionDispositionDTO::kAlreadyTerminalNoEffect);
   EXPECT_FALSE(known_idle.value().full_stop);
   EXPECT_TRUE(known_idle.value().operations.empty());
 }

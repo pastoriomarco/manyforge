@@ -21,9 +21,7 @@ from .liveness import RetainedLiveness
 
 LEGACY_SCHEMA_VERSION: Final = 3
 SCHEMA_VERSION: Final = 4
-_LEGACY_TABLE_SHAPES: Final[
-    dict[str, tuple[tuple[str, str, int, int], ...]]
-] = {
+_LEGACY_TABLE_SHAPES: Final[dict[str, tuple[tuple[str, str, int, int], ...]]] = {
     "program_cycle_metadata": (
         ("singleton", "INTEGER", 0, 1),
         ("schema_version", "INTEGER", 1, 0),
@@ -124,9 +122,7 @@ _LEGACY_TABLE_SQL: Final[dict[str, str]] = {
         )
     """,
 }
-_REQUIRED_TABLE_SHAPES: Final[
-    dict[str, tuple[tuple[str, str, int, int], ...]]
-] = {
+_REQUIRED_TABLE_SHAPES: Final[dict[str, tuple[tuple[str, str, int, int], ...]]] = {
     "program_cycle_metadata": (
         ("singleton", "INTEGER", 0, 1),
         ("schema_version", "INTEGER", 1, 0),
@@ -213,9 +209,9 @@ _REQUIRED_TABLE_SQL: Final[dict[str, str]] = {
     "program_runner_liveness": _LEGACY_TABLE_SQL["program_runner_liveness"],
     "program_run_history": _LEGACY_TABLE_SQL["program_run_history"],
 }
-_SCHEMA_SQL: Final = ";\n".join(
-    statement.strip() for statement in _REQUIRED_TABLE_SQL.values()
-) + ";"
+_SCHEMA_SQL: Final = (
+    ";\n".join(statement.strip() for statement in _REQUIRED_TABLE_SQL.values()) + ";"
+)
 STATES: Final = frozenset(
     {
         "idle_after_reset",
@@ -240,6 +236,7 @@ _REQUEST_KINDS: Final = frozenset(
         "recovery_action",
         "resume_full_stop",
         "resume_motion",
+        "prepare_manual_handover",
         "discard_full_stop",
     }
 )
@@ -259,7 +256,9 @@ def _bounded_identity(value: object) -> bool:
     )
 
 
-def _strict_object(value: str | None, *, required: bool = False) -> dict[str, Any] | None:
+def _strict_object(
+    value: str | None, *, required: bool = False
+) -> dict[str, Any] | None:
     if value is None:
         if required:
             raise RuntimeError("Program-cycle journal JSON value is absent")
@@ -370,12 +369,9 @@ class ProgramCycleJournal:
                 or not stat.S_ISDIR(opened.st_mode)
                 or opened.st_uid != os.geteuid()
                 or opened.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-                or opened.st_mode & required_owner_access
-                != required_owner_access
+                or opened.st_mode & required_owner_access != required_owner_access
             ):
-                raise RuntimeError(
-                    "Program-cycle journal parent changed while opening"
-                )
+                raise RuntimeError("Program-cycle journal parent changed while opening")
             yield descriptor
             after = parent.lstat()
             if (
@@ -383,12 +379,9 @@ class ProgramCycleJournal:
                 or not stat.S_ISDIR(after.st_mode)
                 or after.st_uid != os.geteuid()
                 or after.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-                or after.st_mode & required_owner_access
-                != required_owner_access
+                or after.st_mode & required_owner_access != required_owner_access
             ):
-                raise RuntimeError(
-                    "Program-cycle journal parent changed during open"
-                )
+                raise RuntimeError("Program-cycle journal parent changed during open")
         except OSError as error:
             raise RuntimeError(
                 f"Program-cycle journal parent changed during open: {error}"
@@ -432,11 +425,7 @@ class ProgramCycleJournal:
     def _copy_open_file(source: int, destination: Path) -> None:
         destination_descriptor = os.open(
             destination,
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
-            | os.O_CLOEXEC
-            | os.O_NOFOLLOW,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
             0o600,
         )
         try:
@@ -477,8 +466,7 @@ class ProgramCycleJournal:
             pass
         except OSError as error:
             raise RuntimeError(
-                "Program-cycle rollback journal cannot be inspected: "
-                f"{error}"
+                "Program-cycle rollback journal cannot be inspected: " f"{error}"
             ) from error
         else:
             raise RuntimeError(
@@ -498,9 +486,7 @@ class ProgramCycleJournal:
             label="shared-memory sidecar",
         )
         if wal_metadata is None and shm_metadata is not None:
-            raise RuntimeError(
-                "Program-cycle journal has shared memory without a WAL"
-            )
+            raise RuntimeError("Program-cycle journal has shared memory without a WAL")
 
         main_descriptor = -1
         wal_descriptor = -1
@@ -511,15 +497,14 @@ class ProgramCycleJournal:
                 dir_fd=parent_descriptor,
             )
             opened_main = os.fstat(main_descriptor)
-            if (
-                (opened_main.st_dev, opened_main.st_ino)
-                != (main_metadata.st_dev, main_metadata.st_ino)
-                or (opened_main.st_size, opened_main.st_mtime_ns)
-                != (main_metadata.st_size, main_metadata.st_mtime_ns)
+            if (opened_main.st_dev, opened_main.st_ino) != (
+                main_metadata.st_dev,
+                main_metadata.st_ino,
+            ) or (opened_main.st_size, opened_main.st_mtime_ns) != (
+                main_metadata.st_size,
+                main_metadata.st_mtime_ns,
             ):
-                raise RuntimeError(
-                    "Program-cycle journal changed before snapshot"
-                )
+                raise RuntimeError("Program-cycle journal changed before snapshot")
             opened_wal: os.stat_result | None = None
             if wal_metadata is not None:
                 wal_descriptor = os.open(
@@ -528,11 +513,12 @@ class ProgramCycleJournal:
                     dir_fd=parent_descriptor,
                 )
                 opened_wal = os.fstat(wal_descriptor)
-                if (
-                    (opened_wal.st_dev, opened_wal.st_ino)
-                    != (wal_metadata.st_dev, wal_metadata.st_ino)
-                    or (opened_wal.st_size, opened_wal.st_mtime_ns)
-                    != (wal_metadata.st_size, wal_metadata.st_mtime_ns)
+                if (opened_wal.st_dev, opened_wal.st_ino) != (
+                    wal_metadata.st_dev,
+                    wal_metadata.st_ino,
+                ) or (opened_wal.st_size, opened_wal.st_mtime_ns) != (
+                    wal_metadata.st_size,
+                    wal_metadata.st_mtime_ns,
                 ):
                     raise RuntimeError(
                         "Program-cycle journal WAL changed before snapshot"
@@ -548,9 +534,7 @@ class ProgramCycleJournal:
                         Path(f"{snapshot}-wal"),
                     )
                 after_main = os.fstat(main_descriptor)
-                after_wal = (
-                    os.fstat(wal_descriptor) if wal_descriptor >= 0 else None
-                )
+                after_wal = os.fstat(wal_descriptor) if wal_descriptor >= 0 else None
                 current_main = ProgramCycleJournal._sidecar_metadata(
                     parent_descriptor,
                     path.name,
@@ -584,28 +568,60 @@ class ProgramCycleJournal:
                 if (
                     rollback_appeared
                     or current_main is None
-                    or (after_main.st_dev, after_main.st_ino, after_main.st_size,
-                        after_main.st_mtime_ns)
-                    != (main_metadata.st_dev, main_metadata.st_ino,
-                        main_metadata.st_size, main_metadata.st_mtime_ns)
-                    or (current_main.st_dev, current_main.st_ino,
-                        current_main.st_size, current_main.st_mtime_ns)
-                    != (main_metadata.st_dev, main_metadata.st_ino,
-                        main_metadata.st_size, main_metadata.st_mtime_ns)
+                    or (
+                        after_main.st_dev,
+                        after_main.st_ino,
+                        after_main.st_size,
+                        after_main.st_mtime_ns,
+                    )
+                    != (
+                        main_metadata.st_dev,
+                        main_metadata.st_ino,
+                        main_metadata.st_size,
+                        main_metadata.st_mtime_ns,
+                    )
+                    or (
+                        current_main.st_dev,
+                        current_main.st_ino,
+                        current_main.st_size,
+                        current_main.st_mtime_ns,
+                    )
+                    != (
+                        main_metadata.st_dev,
+                        main_metadata.st_ino,
+                        main_metadata.st_size,
+                        main_metadata.st_mtime_ns,
+                    )
                     or ((current_wal is None) != (wal_metadata is None))
                     or (
                         current_wal is not None
                         and wal_metadata is not None
                         and after_wal is not None
                         and (
-                            (after_wal.st_dev, after_wal.st_ino,
-                             after_wal.st_size, after_wal.st_mtime_ns)
-                            != (wal_metadata.st_dev, wal_metadata.st_ino,
-                                wal_metadata.st_size, wal_metadata.st_mtime_ns)
-                            or (current_wal.st_dev, current_wal.st_ino,
-                                current_wal.st_size, current_wal.st_mtime_ns)
-                            != (wal_metadata.st_dev, wal_metadata.st_ino,
-                                wal_metadata.st_size, wal_metadata.st_mtime_ns)
+                            (
+                                after_wal.st_dev,
+                                after_wal.st_ino,
+                                after_wal.st_size,
+                                after_wal.st_mtime_ns,
+                            )
+                            != (
+                                wal_metadata.st_dev,
+                                wal_metadata.st_ino,
+                                wal_metadata.st_size,
+                                wal_metadata.st_mtime_ns,
+                            )
+                            or (
+                                current_wal.st_dev,
+                                current_wal.st_ino,
+                                current_wal.st_size,
+                                current_wal.st_mtime_ns,
+                            )
+                            != (
+                                wal_metadata.st_dev,
+                                wal_metadata.st_ino,
+                                wal_metadata.st_size,
+                                wal_metadata.st_mtime_ns,
+                            )
                         )
                     )
                     or (
@@ -621,7 +637,9 @@ class ProgramCycleJournal:
                     raise RuntimeError(
                         "Program-cycle journal changed while snapshotting"
                     )
-                suffix = "?mode=ro" if wal_metadata is not None else "?mode=ro&immutable=1"
+                suffix = (
+                    "?mode=ro" if wal_metadata is not None else "?mode=ro&immutable=1"
+                )
                 yield f"{snapshot.as_uri()}{suffix}"
         except OSError as error:
             raise RuntimeError(
@@ -682,8 +700,7 @@ class ProgramCycleJournal:
                 )
             except (OSError, sqlite3.Error, ValueError) as error:
                 raise RuntimeError(
-                    "Program-cycle journal cannot be opened read-only: "
-                    f"{error}"
+                    "Program-cycle journal cannot be opened read-only: " f"{error}"
                 ) from error
             database.execute("PRAGMA query_only=ON")
             check = database.execute("PRAGMA quick_check").fetchall()
@@ -724,8 +741,7 @@ class ProgramCycleJournal:
             for table, expected_shape in expected_shapes.items():
                 rows = database.execute(f"PRAGMA table_info({table})").fetchall()
                 shape = tuple(
-                    (row[1], str(row[2]).upper(), row[3], row[5])
-                    for row in rows
+                    (row[1], str(row[2]).upper(), row[3], row[5]) for row in rows
                 )
                 schema_sql = schema_rows.get(table)
                 if (
@@ -779,9 +795,7 @@ class ProgramCycleJournal:
                         for value in cycle_rows[0][15:19]
                     )
                 ):
-                    raise RuntimeError(
-                        "Program-cycle control identity is corrupt"
-                    )
+                    raise RuntimeError("Program-cycle control identity is corrupt")
                 _strict_object(cycle_rows[0][19])
                 if cycle_rows[0][20] is not None and not _bounded_identity(
                     cycle_rows[0][20]
@@ -802,12 +816,21 @@ class ProgramCycleJournal:
                 else "request_owner_epoch,request_id,request_kind,intent_json,"
                 "cycle_generation"
             )
+            reset_request_count = 0
             for request in database.execute(
                 f"SELECT {selected_columns} FROM {command_table}"
             ):
                 request_count += 1
+                reset_request_count += request[2] == "reset"
                 if (
-                    request_count > 4_096
+                    (
+                        request_count > 4_096
+                        and (
+                            schema_version != SCHEMA_VERSION
+                            or request_count > 4_097
+                            or reset_request_count != 1
+                        )
+                    )
                     or not _bounded_identity(request[0])
                     or not _bounded_identity(request[1])
                     or request[2] not in _REQUEST_KINDS
@@ -819,9 +842,7 @@ class ProgramCycleJournal:
                         and request[6] is not None
                     )
                 ):
-                    raise RuntimeError(
-                        "Program-cycle request ledger is corrupt"
-                    )
+                    raise RuntimeError("Program-cycle request ledger is corrupt")
                 _strict_object(request[3], required=True)
                 if schema_version == LEGACY_SCHEMA_VERSION:
                     _strict_object(request[5])
@@ -876,8 +897,7 @@ class ProgramCycleJournal:
                 follow_symlinks=False,
             )
             if (
-                (after.st_dev, after.st_ino)
-                != (metadata.st_dev, metadata.st_ino)
+                (after.st_dev, after.st_ino) != (metadata.st_dev, metadata.st_ino)
                 or not stat.S_ISREG(after.st_mode)
                 or after.st_uid != os.geteuid()
                 or after.st_nlink != 1
@@ -974,8 +994,7 @@ class ProgramCycleJournal:
                     if orphaned_sidecars:
                         raise RuntimeError(
                             "Program-cycle journal main database is absent but "
-                            "orphan sidecars remain: "
-                            + ", ".join(orphaned_sidecars)
+                            "orphan sidecars remain: " + ", ".join(orphaned_sidecars)
                         )
                     try:
                         descriptor = os.open(
@@ -1019,9 +1038,7 @@ class ProgramCycleJournal:
                     or current.st_mode & (stat.S_IRUSR | stat.S_IWUSR)
                     != (stat.S_IRUSR | stat.S_IWUSR)
                 ):
-                    raise RuntimeError(
-                        "Program-cycle journal changed after preflight"
-                    )
+                    raise RuntimeError("Program-cycle journal changed after preflight")
                 try:
                     parent_capability = os.dup(parent_descriptor)
                     descriptor_path = (
@@ -1246,9 +1263,7 @@ class ProgramCycleJournal:
                 )
                 """
             )
-            self._database.execute(
-                "INSERT INTO program_cycle_metadata_v4 VALUES(1,4)"
-            )
+            self._database.execute("INSERT INTO program_cycle_metadata_v4 VALUES(1,4)")
             self._database.execute("DROP TABLE program_cycle_metadata")
             self._database.execute(
                 "ALTER TABLE program_cycle_metadata_v4 "
@@ -1571,6 +1586,24 @@ class ProgramCycleJournal:
             if changed != 1:
                 raise RuntimeError("Program-cycle release intent is stale")
 
+    def pending_commands(self) -> tuple[dict[str, Any], ...]:
+        """Bounded current unresolved evidence, never an execution/retry queue."""
+        with self._lock:
+            self._validate_storage()
+            return tuple(
+                {
+                    "request_owner_epoch": row[0],
+                    "request_id": row[1],
+                    "kind": row[2],
+                    "intent": self._load(row[3]),
+                    "cycle_generation": row[4],
+                }
+                for row in self._database.execute(
+                    "SELECT request_owner_epoch,request_id,request_kind,intent_json,cycle_generation "
+                    "FROM program_cycle_inflight_commands ORDER BY request_owner_epoch,request_id"
+                )
+            )
+
     def record_request(
         self,
         *,
@@ -1598,10 +1631,16 @@ class ProgramCycleJournal:
                         "request identity was reused with different intent"
                     )
                 return RequestRecord("in_progress")
-            count = self._database.execute(
-                "SELECT COUNT(*) FROM program_cycle_inflight_commands"
-            ).fetchone()[0]
-            if count >= self._maximum_inflight_commands:
+            total, resets = self._database.execute(
+                "SELECT COUNT(*),COALESCE(SUM(request_kind='reset'),0) "
+                "FROM program_cycle_inflight_commands"
+            ).fetchone()
+            count = resets if kind == "reset" else total - resets
+            # Exactly one Reset occurrence remains admissible when the
+            # ordinary guard is full. An uncertain Reset must be continued,
+            # not appended repeatedly into this reserved slot.
+            capacity = 1 if kind == "reset" else self._maximum_inflight_commands
+            if count >= capacity or resets > 1:
                 raise OverflowError("Program-cycle in-flight command bound is full")
             self._database.execute(
                 """
@@ -1788,13 +1827,10 @@ class ProgramCycleJournal:
             terminal = self._database.execute(
                 "SELECT 1 FROM program_run_history WHERE terminal=1 LIMIT 1"
             ).fetchone()
-        if (
-            count is None
-            or (count[0] >= self._maximum_retained_runs and terminal is None)
+        if count is None or (
+            count[0] >= self._maximum_retained_runs and terminal is None
         ):
-            raise OverflowError(
-                "Program-run history has no resolved row to rotate"
-            )
+            raise OverflowError("Program-run history has no resolved row to rotate")
 
     def read_run_snapshot(self, program_run_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -1805,9 +1841,7 @@ class ProgramCycleJournal:
             ).fetchone()
         return None if row is None else self._load(row[0])
 
-    def read_runtime_controls(
-        self, program_run_id: str
-    ) -> dict[str, Any] | None:
+    def read_runtime_controls(self, program_run_id: str) -> dict[str, Any] | None:
         """Read only the current run's bounded durable control snapshot."""
 
         if not _bounded_identity(program_run_id):
@@ -1891,7 +1925,7 @@ class ProgramCycleJournal:
         session_id: str | None = None,
         client_sequence: str | None = None,
     ) -> None:
-        """Atomically close a current Run/Start before containment proceeds."""
+        """Close current work before containment, retaining any uncertainty."""
         with self._transaction():
             row = self._database.execute(
                 """
@@ -1909,13 +1943,16 @@ class ProgramCycleJournal:
                 """
                 UPDATE program_cycle SET state='stopping',
                     execution_control_revision=execution_control_revision+
-                      CASE WHEN state IN ('starting','running') THEN 1 ELSE 0 END,
+                      CASE WHEN state IN ('starting','running','recovery_required') THEN 1 ELSE 0 END,
                     current_command_kind='program_stop',
                     causal_correlation_id=COALESCE(?,causal_correlation_id),
                     causal_session_id=COALESCE(?,causal_session_id),
                     causal_client_sequence=COALESCE(?,causal_client_sequence)
                 WHERE singleton=1 AND cycle_generation=? AND program_run_id=?
-                  AND state IN ('starting','running','stopping')
+                  AND (state IN ('starting','running','stopping') OR
+                    (state='recovery_required' AND reset_phase IS NULL
+                     AND release_intent_json IS NULL AND acquisition_pending_json IS NULL
+                     AND claim_json IS NOT NULL))
                 """,
                 (
                     correlation_id,
@@ -1936,10 +1973,22 @@ class ProgramCycleJournal:
         correlation_id: str,
         session_id: str | None = None,
         client_sequence: str | None = None,
+        expected_recovery: CycleRecord | None = None,
     ) -> bool:
         """Atomically close ordinary admission before Reset performs Stop."""
 
         with self._transaction():
+            if expected_recovery is not None and (
+                self.read() != expected_recovery
+                or not expected_recovery.reconciliation_required
+                or expected_recovery.state
+                not in {"recovery_required", "terminal_awaiting_reset"}
+                or expected_recovery.reset_phase not in {None, "stopping", "settling"}
+                or expected_recovery.acquisition_pending is not None
+                or expected_recovery.release_intent is not None
+                or expected_recovery.claim is None
+            ):
+                raise RuntimeError("Program-cycle recovery Reset is stale")
             row = self._database.execute(
                 """
                 SELECT state,program_run_id,causal_correlation_id
@@ -1950,10 +1999,10 @@ class ProgramCycleJournal:
             ).fetchone()
             if row == ("resetting", program_run_id, correlation_id):
                 return False
-            if row is None or row[0] not in {
-                "running",
-                "terminal_awaiting_reset",
-            } or row[1] != program_run_id:
+            eligible_states = {"running", "terminal_awaiting_reset"}
+            if expected_recovery is not None:
+                eligible_states.add("recovery_required")
+            if row is None or row[0] not in eligible_states or row[1] != program_run_id:
                 raise RuntimeError("Program-cycle Reset transition is stale")
             changed = self._database.execute(
                 """
@@ -1964,7 +2013,7 @@ class ProgramCycleJournal:
                     causal_client_sequence=?,current_command_kind='program_reset',
                     failure_json=NULL
                 WHERE singleton=1 AND cycle_generation=? AND program_run_id=?
-                  AND state IN ('running','terminal_awaiting_reset')
+                  AND state IN ('running','terminal_awaiting_reset','recovery_required')
                 """,
                 (
                     correlation_id,
@@ -1977,6 +2026,38 @@ class ProgramCycleJournal:
             if changed != 1:
                 raise RuntimeError("Program-cycle Reset transition is stale")
             return True
+
+    def settle_reset_recovery(
+        self,
+        *,
+        expected: CycleRecord,
+        manager_runtime_epoch: str | None,
+        manager_owner_epoch: str | None,
+    ) -> None:
+        """Persist an externally proved containment join, not guessed outcomes."""
+        if (
+            expected.state != "resetting"
+            or expected.reset_phase != "settling"
+            or not expected.reconciliation_required
+            or expected.claim is None
+            or expected.acquisition_pending is not None
+            or expected.release_intent is not None
+        ):
+            raise RuntimeError("Program-cycle containment discharge is invalid")
+        with self._transaction():
+            live = self.liveness()
+            if (
+                self.read() != expected
+                or live.expired
+                or live.manager_runtime_epoch != manager_runtime_epoch
+                or live.manager_owner_epoch != manager_owner_epoch
+            ):
+                raise RuntimeError("Program-cycle containment discharge is stale")
+            self._database.execute(
+                "UPDATE program_cycle SET reset_phase='restoring_scene', "
+                "reconciliation_required=0,failure_json=NULL, "
+                "execution_control_revision=execution_control_revision+1 WHERE singleton=1"
+            )
 
     def update_reset_phase(
         self,
@@ -2040,7 +2121,7 @@ class ProgramCycleJournal:
             changed = self._database.execute(
                 """
                 UPDATE program_cycle SET state='recovery_required',failure_json=?,
-                    reconciliation_required=?,
+                    reconciliation_required=MAX(reconciliation_required,?),
                     execution_control_revision=execution_control_revision+1
                 WHERE singleton=1 AND cycle_generation=? AND program_run_id=?
                   AND state='resetting'
@@ -2104,11 +2185,7 @@ class ProgramCycleJournal:
                 or failure.get("code") != expected_failure_code
                 or (
                     not legacy_scene_failure
-                    and (
-                        bool(row[2])
-                        or row[1] != phase
-                        or failed_phase != phase
-                    )
+                    and (bool(row[2]) or row[1] != phase or failed_phase != phase)
                 )
             ):
                 raise RuntimeError("Program-cycle Reset recovery is not retryable")
@@ -2245,10 +2322,7 @@ class ProgramCycleJournal:
                 )
             if row[2] is not None:
                 raise RuntimeError("unknown Program-cycle acquisition is unresolved")
-            if (
-                require_terminal_release
-                and row[0] == "terminal_awaiting_reset"
-            ):
+            if require_terminal_release and row[0] == "terminal_awaiting_reset":
                 release = self._database.execute(
                     "SELECT release_intent_json FROM program_cycle WHERE singleton=1"
                 ).fetchone()
@@ -2282,8 +2356,7 @@ class ProgramCycleJournal:
             or len(evidence_digest) != 71
             or not evidence_digest.startswith("sha256:")
             or any(
-                character not in "0123456789abcdef"
-                for character in evidence_digest[7:]
+                character not in "0123456789abcdef" for character in evidence_digest[7:]
             )
         ):
             raise ValueError("reconciliation evidence must be a SHA-256 digest")

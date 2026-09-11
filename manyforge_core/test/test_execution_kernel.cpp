@@ -943,7 +943,9 @@ class MockExecution : public IExecutionBackend {
   /// the explicit acknowledgement paths.
   std::optional<ExecutionState> next_terminal_state;
 
-  PrepareParticipantResultDTO Prepare(const PreparedOperationParticipantDTO& participant) override {
+  Result<void> RetirePreparedExecution(std::uint64_t) override { return Result<void>::Ok(); }
+  PrepareParticipantResultDTO Prepare(const PreparedOperationParticipantDTO& participant,
+                                      std::uint64_t) override {
     const auto result = MakePrepareParticipantResult(
         participant,
         std::holds_alternative<PreparedMotionExecutionDTO>(participant.payload)
@@ -1170,7 +1172,9 @@ class ControlledExecution : public IExecutionBackend {
   bool block_sync_observed_state = false;
   bool release_blocked_sync_observed_state = false;
 
-  PrepareParticipantResultDTO Prepare(const PreparedOperationParticipantDTO& participant) override {
+  Result<void> RetirePreparedExecution(std::uint64_t) override { return Result<void>::Ok(); }
+  PrepareParticipantResultDTO Prepare(const PreparedOperationParticipantDTO& participant,
+                                      std::uint64_t) override {
     const auto result = MakePrepareParticipantResult(
         participant,
         std::holds_alternative<PreparedMotionExecutionDTO>(participant.payload)
@@ -5285,6 +5289,7 @@ TEST_F(ExecutionKernelTest, ControlEpoch_ResetBumpedWhileWaitingDoesNotResetBack
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   MotionInterruptStopProfileDTO op_profile;
+  op_profile.jerk_limits_enabled = false;
   op_profile.profile_id = "operator_stop_soft_on_path";
   op_profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
   op_profile.deceleration_time_s = 0.3;
@@ -5717,6 +5722,7 @@ TEST_F(ExecutionKernelTest, Resume_FromPaused_ReplansFromFreshCurrentState) {
       };
       return handle;
     }
+
    private:
     ThreadSafeFakeClock& clock_;
   } controlled_execution{local_clock};
@@ -5817,6 +5823,73 @@ TEST_F(ExecutionKernelTest, Resume_FromPaused_ReplansFromFreshCurrentState) {
   EXPECT_TRUE(resume_validation_details.contains("collision_ordered_contact_summary_used"));
   EXPECT_TRUE(resume_validation_details.contains("collision_validation_wall_ns"));
 
+  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kCompleted);
+}
+
+TEST_F(ExecutionKernelTest, CartesianResumeUsesFreshTcpAndCurrentCurveRemainingDestinations) {
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  class CursorExecution final : public ControlledExecution {
+   public:
+    std::atomic<double> cursor_s{0.5};
+    std::optional<double> stopped_trajectory_time_s(std::uint64_t generation) const override {
+      const auto* source = execution_progress_publication();
+      return generation != 0U && source && source->acquire().execution_generation == generation
+                 ? std::optional<double>{cursor_s.load()}
+                 : std::nullopt;
+    }
+  } controlled_execution;
+  controlled_execution.enable_execution_progress_publication();
+  TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel controlled_kernel{planner,     context,         controlled_execution,
+                                    local_clock, local_scheduler, local_cache};
+  configure_authoritative_collision_validation(controlled_kernel, local_collision_world,
+                                               local_collision_engine);
+  auto request = make_test_request();
+  request.cache_mode = CacheMode::kDisable;
+  CartesianPathDTO source;
+  source.waypoints = {make_pose(0, 0, 0), make_pose(0.4, 0, 0), make_pose(1, 0, 0)};
+  source.max_linear_speed_mps = 0.037;
+  request.motion = source;
+  request.binding.planner_capability_binding.capability_id =
+      CapabilityId("planning.motion.cartesian_path");
+  planner.next_result.trajectory->cartesian_waypoint_times_s = {0.0, 0.4, 1.0};
+  ASSERT_TRUE(controlled_kernel.execute(request).ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+
+  for (const auto& [position, cursor] :
+       {std::pair{0.25, 0.5}, std::pair{0.55, 0.5}, std::pair{1.0, 1.0}, std::pair{0.7, 1.0}}) {
+    SCOPED_TRACE(position);
+    ASSERT_TRUE(controlled_kernel.pause().accepted);
+    local_scheduler.advance_to(local_clock.now());
+    ASSERT_TRUE(controlled_execution.wait_until_paused());
+    ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kPaused));
+    controlled_execution.cursor_s.store(cursor);
+    context.current_state_value.positions_rad = {position, position};
+    context.next_fk = position == 1.0 ? source.waypoints.back() : make_pose(position, 0.3, 0.1);
+    planner.next_result.trajectory = make_test_trajectory_from({position, position}, {1.0, 1.0});
+    planner.next_result.trajectory->cartesian_waypoint_times_s = {0.0, 1.0};
+    ASSERT_TRUE(controlled_kernel.resume().accepted);
+    ASSERT_TRUE(controlled_execution.wait_until_resume_called())
+        << (controlled_kernel.get_execution_snapshot().error
+                ? controlled_kernel.get_execution_snapshot().error->message
+                : "no backend error");
+    ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+    const auto* resumed = std::get_if<CartesianPathDTO>(&planner.last_request.motion);
+    ASSERT_NE(resumed, nullptr);
+    ASSERT_EQ(resumed->waypoints.size(), 2U);
+    EXPECT_EQ(resumed->waypoints.front(), context.next_fk);
+    EXPECT_EQ(resumed->waypoints.back(), source.waypoints.back());
+    EXPECT_DOUBLE_EQ(resumed->max_linear_speed_mps, source.max_linear_speed_mps);
+    EXPECT_EQ(context.last_fk_request.robot_state.positions_rad,
+              (std::vector<double>{position, position}));
+  }
+  EXPECT_EQ(planner.plan_count, 5);
+  controlled_execution.complete();
+  EXPECT_TRUE(controlled_kernel.wait_for_completion(2'000'000'000LL));
   EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kCompleted);
 }
 
@@ -6438,6 +6511,7 @@ TEST_F(ExecutionKernelTest, CollisionLookahead_FutureCollisionSignalsAuthorityBe
   config.runtime_collision_lookahead_workers_declared = true;
   config.runtime_collision_lookahead_min_waypoints_for_parallel = 2;
   MotionInterruptStopProfileDTO fault_profile;
+  fault_profile.jerk_limits_enabled = false;
   fault_profile.profile_id = "lookahead_late_completion_race";
   fault_profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
   config.default_fault_stop_profile =
@@ -6805,6 +6879,7 @@ TEST_F(ExecutionKernelTest, ApplyRecoveryActionRejectsPendingFaultPreemptWithout
   config.collision_monitor_period_ns = 10'000'000;
   config.runtime_collision_immediate_query_budget_ns = 10'000'000;
   MotionInterruptStopProfileDTO fault_profile;
+  fault_profile.jerk_limits_enabled = false;
   fault_profile.profile_id = "pending_retry_guard";
   fault_profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
   config.default_fault_stop_profile =
@@ -6898,6 +6973,7 @@ TEST_F(ExecutionKernelTest, ApplyRecoveryActionRejectsDefinitivePreemptWhileStop
   config.collision_monitor_period_ns = 10'000'000;
   config.runtime_collision_immediate_query_budget_ns = 10'000'000;
   MotionInterruptStopProfileDTO fault_profile;
+  fault_profile.jerk_limits_enabled = false;
   fault_profile.profile_id = "active_stop_retry_guard";
   fault_profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
   fault_profile.deceleration_time_s = 0.01;
@@ -7019,6 +7095,7 @@ TEST_F(ExecutionKernelTest,
   config.collision_monitor_period_ns = 10'000'000;
   config.runtime_collision_immediate_query_budget_ns = 10'000'000;
   MotionInterruptStopProfileDTO fault_profile;
+  fault_profile.jerk_limits_enabled = false;
   fault_profile.profile_id = "failed_preempt_retry_guard";
   fault_profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
   config.default_fault_stop_profile =
@@ -7216,6 +7293,7 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_FaultControlledStopRunsOffSafety
   config.collision_monitor_period_ns = 10'000'000;
   config.runtime_collision_immediate_query_budget_ns = 10'000'000;
   MotionInterruptStopProfileDTO fault_profile;
+  fault_profile.jerk_limits_enabled = false;
   fault_profile.profile_id = "runtime_collision_fault_stop";
   fault_profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
   config.default_fault_stop_profile =
@@ -7356,6 +7434,7 @@ TEST_F(ExecutionKernelTest,
   // fault interrupts that don't carry a per-policy stop_profile (which
   // includes the kernel's built-in runtime_collision_fault policy).
   MotionInterruptStopProfileDTO fault_profile;
+  fault_profile.jerk_limits_enabled = false;
   fault_profile.profile_id = "default_fault_spring_back";
   fault_profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
   config.default_fault_stop_profile =
@@ -7423,6 +7502,7 @@ TEST_F(ExecutionKernelTest, FaultStopProfile_PerPolicyOverridesKernelDefault) {
   // policy profile below requests hard_deceleration. The latter must
   // win.
   MotionInterruptStopProfileDTO kernel_default;
+  kernel_default.jerk_limits_enabled = false;
   kernel_default.profile_id = "kernel_default_spring_back";
   kernel_default.stop_mode = MotionInterruptStopMode::kSpringBackHold;
   config.default_fault_stop_profile =
@@ -7454,6 +7534,7 @@ TEST_F(ExecutionKernelTest, FaultStopProfile_PerPolicyOverridesKernelDefault) {
   user_policy.preemption_action = InterruptPreemptionAction::kPreemptTrajectory;
   user_policy.post_latch_disposition = InterruptPostLatchDisposition::kAwaitOperatorAck;
   MotionInterruptStopProfileDTO per_policy;
+  per_policy.jerk_limits_enabled = false;
   per_policy.profile_id = "per_policy_hard_decel";
   per_policy.stop_mode = MotionInterruptStopMode::kHardDeceleration;
   user_policy.stop_profile = std::make_shared<MotionInterruptStopProfileDTO>(per_policy);
@@ -7493,6 +7574,7 @@ TEST_F(ExecutionKernelTest, Stop_OperatorStopProfileRoutesThroughControlledStop)
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   MotionInterruptStopProfileDTO op_profile;
+  op_profile.jerk_limits_enabled = false;
   op_profile.profile_id = "operator_stop_soft_on_path";
   op_profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
   // soft_on_path needs per-joint deceleration limits and a
@@ -7565,6 +7647,7 @@ TEST_F(ExecutionKernelTest, Stop_SuccessfulOperatorControlledStopReleasesRuntime
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   MotionInterruptStopProfileDTO op_profile;
+  op_profile.jerk_limits_enabled = false;
   op_profile.profile_id = "operator_stop_soft_on_path";
   op_profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
   op_profile.deceleration_time_s = 0.3;
@@ -7608,6 +7691,7 @@ TEST_F(ExecutionKernelTest, Stop_OperatorStopProfileReturnsBeforeControlledStopC
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   MotionInterruptStopProfileDTO op_profile;
+  op_profile.jerk_limits_enabled = false;
   op_profile.profile_id = "operator_stop_soft_on_path";
   op_profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
   op_profile.deceleration_time_s = 0.3;
@@ -7653,6 +7737,7 @@ TEST_F(ExecutionKernelTest, Stop_ActiveMonitorRearmReusesSessionWithoutPreparing
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   MotionInterruptStopProfileDTO op_profile;
+  op_profile.jerk_limits_enabled = false;
   op_profile.profile_id = "operator_stop_soft_on_path";
   op_profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
   op_profile.deceleration_time_s = 0.3;
@@ -7730,6 +7815,7 @@ TEST_F(ExecutionKernelTest, Stop_OperatorStopProfileKeepsMonitorArmedDuringDecel
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   MotionInterruptStopProfileDTO op_profile;
+  op_profile.jerk_limits_enabled = false;
   op_profile.profile_id = "operator_stop_soft_on_path";
   op_profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
   op_profile.deceleration_time_s = 0.3;
@@ -7833,6 +7919,7 @@ TEST_F(ExecutionKernelTest, Stop_OriginalGoalCompletionCannotStealOperatorStopTe
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   MotionInterruptStopProfileDTO op_profile;
+  op_profile.jerk_limits_enabled = false;
   op_profile.profile_id = "operator_stop_soft_on_path";
   op_profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
   op_profile.deceleration_time_s = 0.3;
@@ -7916,6 +8003,7 @@ TEST_F(ExecutionKernelTest, Stop_OperatorConfirmedStopWaitsForMeasuredSettleLag)
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   MotionInterruptStopProfileDTO op_profile;
+  op_profile.jerk_limits_enabled = false;
   op_profile.profile_id = "operator_stop_soft_on_path";
   op_profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
   op_profile.deceleration_time_s = 0.3;
@@ -7963,6 +8051,7 @@ TEST_F(ExecutionKernelTest, Stop_OperatorCommandAuthoritativeStopDoesNotFailOnFe
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   MotionInterruptStopProfileDTO op_profile;
+  op_profile.jerk_limits_enabled = false;
   op_profile.profile_id = "operator_stop_soft_on_path";
   op_profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
   op_profile.deceleration_time_s = 0.3;
@@ -8003,6 +8092,7 @@ TEST_F(ExecutionKernelTest, Stop_OperatorConfirmedButMeasuredNotAtRestRequiresIn
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   MotionInterruptStopProfileDTO op_profile;
+  op_profile.jerk_limits_enabled = false;
   op_profile.profile_id = "operator_stop_soft_on_path";
   op_profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
   op_profile.deceleration_time_s = 0.3;
@@ -8055,6 +8145,7 @@ TEST_F(ExecutionKernelTest, Stop_OperatorDeadlineWatchdogHardStopsBeforeBackendR
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   MotionInterruptStopProfileDTO op_profile;
+  op_profile.jerk_limits_enabled = false;
   op_profile.profile_id = "operator_stop_soft_on_path";
   op_profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
   op_profile.deceleration_time_s = 0.05;
@@ -8118,6 +8209,7 @@ TEST_F(ExecutionKernelTest, Stop_RuntimeVelocityScaleChangesDuringControlledStop
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   MotionInterruptStopProfileDTO op_profile;
+  op_profile.jerk_limits_enabled = false;
   op_profile.profile_id = "operator_stop_soft_on_path";
   op_profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
   op_profile.deceleration_time_s = 0.3;
@@ -8192,6 +8284,7 @@ TEST_F(ExecutionKernelTest, Stop_RuntimeVelocityScaleDeferredWriteReleasesAfterI
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   MotionInterruptStopProfileDTO op_profile;
+  op_profile.jerk_limits_enabled = false;
   op_profile.profile_id = "operator_stop_soft_on_path";
   op_profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
   op_profile.deceleration_time_s = 0.3;
@@ -8237,6 +8330,7 @@ TEST_F(ExecutionKernelTest, Stop_SecondStopDuringOperatorControlledStopIsIdempot
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   MotionInterruptStopProfileDTO op_profile;
+  op_profile.jerk_limits_enabled = false;
   op_profile.profile_id = "operator_stop_soft_on_path";
   op_profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
   op_profile.deceleration_time_s = 0.3;
@@ -8280,6 +8374,7 @@ TEST_F(ExecutionKernelTest, Reset_WaitsForBlockedOperatorControlledStopThenReset
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   MotionInterruptStopProfileDTO op_profile;
+  op_profile.jerk_limits_enabled = false;
   op_profile.profile_id = "operator_stop_soft_on_path";
   op_profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
   op_profile.deceleration_time_s = 0.3;
@@ -8339,6 +8434,7 @@ TEST_F(ExecutionKernelTest, Reset_FromExecutingUsesOperatorControlledStopThenRes
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   MotionInterruptStopProfileDTO op_profile;
+  op_profile.jerk_limits_enabled = false;
   op_profile.profile_id = "operator_stop_soft_on_path";
   op_profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
   op_profile.deceleration_time_s = 0.3;
@@ -8388,6 +8484,7 @@ TEST_F(ExecutionKernelTest, Reset_OperatorControlledStopKeepsRuntimeMonitorArmed
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   MotionInterruptStopProfileDTO op_profile;
+  op_profile.jerk_limits_enabled = false;
   op_profile.profile_id = "operator_stop_soft_on_path";
   op_profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
   op_profile.deceleration_time_s = 0.3;
@@ -8448,6 +8545,7 @@ TEST_F(ExecutionKernelTest, Reset_EscalatesToHardStopWhenOperatorControlledStopM
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   MotionInterruptStopProfileDTO op_profile;
+  op_profile.jerk_limits_enabled = false;
   op_profile.profile_id = "operator_stop_soft_on_path";
   op_profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
   op_profile.deceleration_time_s = 0.025;
@@ -8681,6 +8779,7 @@ TEST_F(ExecutionKernelTest, Stop_OperatorProfileRefused_EmergencyLegacyFallback)
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   MotionInterruptStopProfileDTO op_profile;
+  op_profile.jerk_limits_enabled = false;
   op_profile.profile_id = "operator_soft_on_path";
   op_profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
   op_profile.deceleration_time_s = 0.3;
@@ -8733,6 +8832,7 @@ TEST_F(ExecutionKernelTest, Stop_OperatorProfileAndLegacyBothFail_EntersInterven
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   MotionInterruptStopProfileDTO op_profile;
+  op_profile.jerk_limits_enabled = false;
   op_profile.profile_id = "operator_soft_on_path";
   op_profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
   op_profile.deceleration_time_s = 0.3;
@@ -8965,6 +9065,7 @@ TEST_F(ExecutionKernelTest, InternalHardStop_DoesNotUseOperatorStopProfile) {
   // Operator profile IS configured (would route ExecutionKernel::stop()
   // through controlled-stop)…
   MotionInterruptStopProfileDTO op_profile;
+  op_profile.jerk_limits_enabled = false;
   op_profile.profile_id = "operator_soft_on_path";
   op_profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
   op_profile.deceleration_time_s = 0.3;
@@ -9041,6 +9142,7 @@ TEST_F(ExecutionKernelTest, FaultStopProfile_ControlledStopRefused_EmergencyLega
   config.collision_monitor_period_ns = 10'000'000;
   config.runtime_collision_immediate_query_budget_ns = 10'000'000;
   MotionInterruptStopProfileDTO fault_profile;
+  fault_profile.jerk_limits_enabled = false;
   fault_profile.profile_id = "fault_spring_back";
   fault_profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
   config.default_fault_stop_profile =
@@ -9147,6 +9249,7 @@ TEST_F(ExecutionKernelTest, FaultStopProfile_DeadlineWatchdogCancelsControlledSt
   config.collision_monitor_period_ns = 10'000'000;
   config.runtime_collision_immediate_query_budget_ns = 10'000'000;
   MotionInterruptStopProfileDTO fault_profile;
+  fault_profile.jerk_limits_enabled = false;
   fault_profile.profile_id = "fault_spring_back";
   fault_profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
   fault_profile.deceleration_time_s = 0.05;
@@ -9275,6 +9378,7 @@ TEST_F(ExecutionKernelTest, FaultStopProfile_RuntimeCollisionDuringFaultPreemptS
   // RT-8C publishes qualified observed state.
   config.recovery_require_measured_observation = false;
   MotionInterruptStopProfileDTO fault_profile;
+  fault_profile.jerk_limits_enabled = false;
   fault_profile.profile_id = "fault_spring_back_collision_window";
   fault_profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
   fault_profile.deceleration_time_s = 0.3;
@@ -9440,6 +9544,7 @@ TEST_F(ExecutionKernelTest, FaultStopProfile_TotalPreemptFailureRequiresInterven
   config.runtime_dynamic_body_max_age_cap_ns = 5'000'000'000;
   config.recovery_require_measured_observation = false;
   MotionInterruptStopProfileDTO fault_profile;
+  fault_profile.jerk_limits_enabled = false;
   fault_profile.profile_id = "fault_total_failure";
   fault_profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
   fault_profile.deceleration_time_s = 0.01;
@@ -9504,6 +9609,7 @@ TEST_F(ExecutionKernelTest, FaultPreemptPendingTimeoutHardStopsWhenPreemptWorker
   config.collision_monitor_period_ns = 10'000'000;
   config.runtime_collision_immediate_query_budget_ns = 10'000'000;
   MotionInterruptStopProfileDTO fault_profile;
+  fault_profile.jerk_limits_enabled = false;
   fault_profile.profile_id = "fault_pending_bound";
   fault_profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
   fault_profile.deceleration_time_s = 0.01;
@@ -11967,13 +12073,13 @@ TEST_F(ExecutionKernelTest, ExecutionTimeout_UsesFinalManualDurationAndAppliedSc
     FeedbackFailure failure{FeedbackFailure::kNone};
   };
   for (const auto& test : {
-           Case{true, 10.0, 1.0, 20, 20, false},   // A 20 s plan is not a 10 s failure.
-           Case{true, 10.0, 1.0, 100, 32, false},  // Missing completion is still bounded.
-           Case{false, 10.0, 1.0, 100, 10, false}, // Authored Program budget is unchanged.
-           Case{true, 10.0, 0.25, 80, 80, false},  // Use applied, not requested scale.
-           Case{true, 10.0, 1.0, 21, 21, true},   // Zero-scale hold consumes no budget.
-           Case{false, 10.0, 1.0, 10, 10, false},  // Completion at the deadline wins.
-           Case{true, 50.0, 1.0, 100, 50, false}, // Preserve a larger requested budget.
+           Case{true, 10.0, 1.0, 20, 20, false},    // A 20 s plan is not a 10 s failure.
+           Case{true, 10.0, 1.0, 100, 32, false},   // Missing completion is still bounded.
+           Case{false, 10.0, 1.0, 100, 10, false},  // Authored Program budget is unchanged.
+           Case{true, 10.0, 0.25, 80, 80, false},   // Use applied, not requested scale.
+           Case{true, 10.0, 1.0, 21, 21, true},     // Zero-scale hold consumes no budget.
+           Case{false, 10.0, 1.0, 10, 10, false},   // Completion at the deadline wins.
+           Case{true, 50.0, 1.0, 100, 50, false},   // Preserve a larger requested budget.
            Case{true, 10.0, std::numeric_limits<double>::quiet_NaN(), 100, 1, false},
            Case{true, 10.0, 1.0, 100, 1, false, FeedbackFailure::kError},
            Case{true, 10.0, 1.0, 100, 1, false, FeedbackFailure::kThrow},
@@ -12001,21 +12107,40 @@ TEST_F(ExecutionKernelTest, ExecutionTimeout_UsesFinalManualDurationAndAppliedSc
     request.trajectory_relative_timeout = test.manual;
     request.timeouts.execution_timeout_s = test.floor;
     if (test.failure == FeedbackFailure::kLostSupport) {
-      request.binding.runtime_scale_qualification = RuntimeScaleRouteQualificationDTO{
-          request.binding.control_route_id, ScalingDomainId{"test-scaling"},
-          EndpointRoleId{"scale-command"}, EndpointRoleId{"scale-state"}, std::nullopt,
-          RuntimeScaleAcknowledgementKind::kAppliedState, 4.0, 100'000'000};
+      request.binding.runtime_scale_qualification =
+          RuntimeScaleRouteQualificationDTO{request.binding.control_route_id,
+                                            ScalingDomainId{"test-scaling"},
+                                            EndpointRoleId{"scale-command"},
+                                            EndpointRoleId{"scale-state"},
+                                            std::nullopt,
+                                            RuntimeScaleAcknowledgementKind::kAppliedState,
+                                            4.0,
+                                            100'000'000};
       const auto& binding = request.binding;
-      request.initial_runtime_scale = ResolvedRuntimeScaleCommandDTO{
-          binding.operation_id, OperationRevision{1}, binding.participant_id,
-          binding.controllable_component_id, binding.command_target_id, binding.capability_id,
-          binding.control_domain_id, binding.control_domain_revision, binding.control_binding_id,
-          binding.control_binding_revision, binding.controller_goal_id,
-          binding.controller_goal_generation, binding.controller_topology_id,
-          binding.topology_revision, binding.control_route_id, ScalingDomainId{"test-scaling"},
-          std::nullopt, binding.resources, binding.active_control_configuration_id,
-          binding.active_control_configuration_generation, RuntimeScaleGeneration{0},
-          RuntimeScaleGeneration{0}, 1.0};
+      request.initial_runtime_scale =
+          ResolvedRuntimeScaleCommandDTO{binding.operation_id,
+                                         OperationRevision{1},
+                                         binding.participant_id,
+                                         binding.controllable_component_id,
+                                         binding.command_target_id,
+                                         binding.capability_id,
+                                         binding.control_domain_id,
+                                         binding.control_domain_revision,
+                                         binding.control_binding_id,
+                                         binding.control_binding_revision,
+                                         binding.controller_goal_id,
+                                         binding.controller_goal_generation,
+                                         binding.controller_topology_id,
+                                         binding.topology_revision,
+                                         binding.control_route_id,
+                                         ScalingDomainId{"test-scaling"},
+                                         std::nullopt,
+                                         binding.resources,
+                                         binding.active_control_configuration_id,
+                                         binding.active_control_configuration_generation,
+                                         RuntimeScaleGeneration{0},
+                                         RuntimeScaleGeneration{0},
+                                         1.0};
     }
     const auto accepted = timed_kernel.execute(request);
     ASSERT_TRUE(accepted.ok()) << accepted.error().message;
@@ -12029,10 +12154,76 @@ TEST_F(ExecutionKernelTest, ExecutionTimeout_UsesFinalManualDurationAndAppliedSc
       ASSERT_TRUE(timed_kernel.get_execution_snapshot().error.has_value());
       EXPECT_EQ(timed_kernel.get_execution_snapshot().error->code,
                 std::isfinite(test.scale) && test.failure == FeedbackFailure::kNone
-                    ? kErrorExecutionTimeout : kErrorInvariantViolation);
+                    ? kErrorExecutionTimeout
+                    : kErrorInvariantViolation);
       EXPECT_GE(timed.stop_count_value(), 1);
     }
   }
+}
+
+TEST_F(ExecutionKernelTest, RuntimeScaleStatusUsesTheExactSharedCommandWithoutAnotherSetter) {
+  struct SharedExecution : MockExecution {
+    RuntimeScaleMechanismStatusDTO scale{true, true, 1.0, 1.0, 0.0, 1U, 1, std::nullopt};
+    RuntimeScaleMechanismStatusDTO runtime_velocity_scale_status() const override { return scale; }
+  } shared;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernel shared_kernel{planner, context, shared, clock, scheduler, local_cache};
+  configure_authoritative_collision_validation(shared_kernel, collision_world_publisher,
+                                               collision_engine);
+  auto request = make_test_request();
+  const auto& binding = request.binding;
+  request.binding.runtime_scale_qualification =
+      RuntimeScaleRouteQualificationDTO{binding.control_route_id,
+                                        ScalingDomainId("shared.scale"),
+                                        EndpointRoleId("scale-command"),
+                                        EndpointRoleId("scale-state"),
+                                        CoordinatedScalingBarrierId("shared.barrier"),
+                                        RuntimeScaleAcknowledgementKind::kAppliedState,
+                                        4.0,
+                                        100'000'000};
+  request.initial_runtime_scale =
+      ResolvedRuntimeScaleCommandDTO{binding.operation_id,
+                                     OperationRevision(1U),
+                                     binding.participant_id,
+                                     binding.controllable_component_id,
+                                     binding.command_target_id,
+                                     binding.capability_id,
+                                     binding.control_domain_id,
+                                     binding.control_domain_revision,
+                                     binding.control_binding_id,
+                                     binding.control_binding_revision,
+                                     binding.controller_goal_id,
+                                     binding.controller_goal_generation,
+                                     binding.controller_topology_id,
+                                     binding.topology_revision,
+                                     binding.control_route_id,
+                                     ScalingDomainId("shared.scale"),
+                                     CoordinatedScalingBarrierId("shared.barrier"),
+                                     binding.resources,
+                                     binding.active_control_configuration_id,
+                                     binding.active_control_configuration_generation,
+                                     RuntimeScaleGeneration(0U),
+                                     RuntimeScaleGeneration(0U),
+                                     1.0};
+  const auto admitted = shared_kernel.execute(request);
+  ASSERT_TRUE(admitted.ok()) << admitted.error().message;
+  ASSERT_TRUE(shared_kernel.wait_for_completion(2'000'000'000));
+  shared.scale.coordinated_command = CoordinatedRuntimeScaleCommandDTO{
+      binding.operation_id, OperationRevision(1U), RuntimeScaleGeneration(1U)};
+  shared.scale.commanded_scale = 0.25;
+  auto status =
+      shared_kernel.runtime_scale_status(binding.operation_id, binding.control_binding_id);
+  ASSERT_TRUE(status.ok()) << status.error().message;
+  EXPECT_EQ(status.value().accepted_generation, RuntimeScaleGeneration(1U));
+  EXPECT_EQ(status.value().state, RuntimeScaleApplicationState::kPending);
+  shared.scale.applied_scale = 0.25;
+  status = shared_kernel.runtime_scale_status(binding.operation_id, binding.control_binding_id);
+  ASSERT_TRUE(status.ok()) << status.error().message;
+  EXPECT_EQ(status.value().state, RuntimeScaleApplicationState::kApplied);
+  shared.scale.coordinated_command->operation_id = OperationId("unrelated.operation");
+  status = shared_kernel.runtime_scale_status(binding.operation_id, binding.control_binding_id);
+  ASSERT_FALSE(status.ok());
+  EXPECT_EQ(status.error().details.at("reason"), "coordinated_runtime_scale_command_mismatch");
 }
 
 TEST_F(ExecutionKernelTest, ExecutionTimeout_TransitionsToFailed) {
@@ -12376,6 +12567,7 @@ InterruptPolicyDefinition make_move_trip_policy(std::string policy_id, std::stri
 MotionInterruptStopProfileDTO make_stop_profile(
     MotionInterruptStopMode mode = MotionInterruptStopMode::kSpringBackHold) {
   MotionInterruptStopProfileDTO p;
+  p.jerk_limits_enabled = false;
   p.profile_id = "test_stop_profile";
   p.stop_mode = mode;
   if (mode != MotionInterruptStopMode::kHardDeceleration) {
@@ -13297,6 +13489,7 @@ TEST_F(ExecutionKernelTest, Stop_DuringScopedTripStopCancelsTripWithoutSecondCon
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   MotionInterruptStopProfileDTO op_profile;
+  op_profile.jerk_limits_enabled = false;
   op_profile.profile_id = "operator_stop_spring_back";
   op_profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
   config.operator_stop_profile = std::make_shared<MotionInterruptStopProfileDTO>(op_profile);
@@ -14353,6 +14546,7 @@ TEST_F(ExecutionKernelTest, Execute_OperatorStopProfileRejectsUnsupportedBackend
       MotionInterruptStopMode::kSpringBackHold};
 
   MotionInterruptStopProfileDTO op_profile;
+  op_profile.jerk_limits_enabled = false;
   op_profile.profile_id = "operator_hard_decel";
   op_profile.stop_mode = MotionInterruptStopMode::kHardDeceleration;
   ExecutionKernelConfig config;
@@ -14381,11 +14575,43 @@ TEST_F(ExecutionKernelTest, Execute_OperatorStopProfileRejectsUnsupportedBackend
   EXPECT_EQ(outcome->error->details.at("profile_slot"), "operator_stop_profile");
 }
 
+TEST_F(ExecutionKernelTest, Execute_UnreviewedStopChoiceRejectsBeforeMotion) {
+  using namespace motion_45c;
+  for (const auto choice : {std::optional<bool>{}, std::optional<bool>{true}}) {
+    auto profile = make_soft_on_path_profile(false);
+    profile.jerk_limits_enabled = choice;
+    ExecutionKernelConfig config;
+    const auto authored = std::make_shared<MotionInterruptStopProfileDTO>(profile);
+    config.operator_stop_profile = authored;
+
+    FakeClock local_clock;
+    ManualScheduler local_scheduler;
+    TrajectoryCache local_cache{CacheConfig{10}};
+    ExecutionKernel local_kernel{planner,         context,     execution, local_clock,
+                                 local_scheduler, local_cache, config};
+    authored->jerk_limits_enabled = false;  // Cannot waive the captured requirement.
+    configure_authoritative_collision_validation(local_kernel, collision_world_publisher,
+                                                 collision_engine);
+    const int execute_calls_before = execution.execute_count;
+    const auto result = local_kernel.execute(make_test_request("unreviewed_stop_choice"));
+    ASSERT_TRUE(result.ok());
+    local_kernel.wait_for_completion();
+    EXPECT_EQ(execution.execute_count, execute_calls_before);
+    const auto outcome = local_kernel.get_execution_outcome(result.value());
+    ASSERT_TRUE(outcome.has_value());
+    ASSERT_TRUE(outcome->error.has_value());
+    EXPECT_EQ(outcome->error->details.at("reason"),
+              choice.has_value() ? "motion_controlled_stop_jerk_limits_not_prepared"
+                                 : "motion_controlled_stop_jerk_activation_required");
+  }
+}
+
 TEST_F(ExecutionKernelTest, Execute_DefaultFaultStopProfileRejectsUnsupportedSubstitutionMode) {
   execution.motion_interrupt_stop_capability.supported_stop_modes = {
       MotionInterruptStopMode::kSoftOnPath};
 
   MotionInterruptStopProfileDTO fault_profile;
+  fault_profile.jerk_limits_enabled = false;
   fault_profile.profile_id = "fault_soft_with_spring_substitution";
   fault_profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
   fault_profile.deceleration_time_s = 0.2;

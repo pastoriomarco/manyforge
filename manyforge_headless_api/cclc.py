@@ -21,9 +21,7 @@ CCLC_OPEN_REQUEST_VERSION = "manyforge.cclc_open_request.v1"
 CCLC_OPEN_RESPONSE_VERSION = "manyforge.cclc_open_response.v1"
 MAX_CCLC_REQUEST_BYTES = 4 * 1024 * 1024
 MAX_CCLC_RESPONSE_BYTES = 8 * 1024 * 1024
-_RESPONSE_FIELDS = frozenset(
-    {"api_version", "command", "error", "ok", "result"}
-)
+_RESPONSE_FIELDS = frozenset({"api_version", "command", "error", "ok", "result"})
 
 
 class CCLCOpenPort(Protocol):
@@ -35,22 +33,24 @@ class CCLCOpenPort(Protocol):
 
     def route_templates(self, component_id: str) -> dict[str, Any]: ...
 
-    def submit_lifecycle(
-        self, intent: Mapping[str, Any]
-    ) -> dict[str, Any]: ...
+    def submit_lifecycle(self, intent: Mapping[str, Any]) -> dict[str, Any]: ...
 
-    def lifecycle_status(
-        self, transaction_id: str
+    def lifecycle_status(self, transaction_id: str) -> dict[str, Any] | None: ...
+
+    def lifecycle_request_result(
+        self, intent: Mapping[str, Any]
     ) -> dict[str, Any] | None: ...
 
     def submit_route(self, intent: Mapping[str, Any]) -> dict[str, Any]: ...
 
+    def route_request_result(
+        self, intent: Mapping[str, Any]
+    ) -> dict[str, Any] | None: ...
+
     def route_status(self, transaction_id: str) -> dict[str, Any] | None: ...
 
 
-def _canonical_json(
-    value: Mapping[str, Any], *, error_code: str, label: str
-) -> bytes:
+def _canonical_json(value: Mapping[str, Any], *, error_code: str, label: str) -> bytes:
     try:
         return rfc8785.dumps(dict(value))
     except (rfc8785.CanonicalizationError, UnicodeError, ValueError) as exc:
@@ -94,9 +94,7 @@ class CCLCOpenRequestClient:
                 "CCLC request exceeds its byte bound",
             )
         try:
-            with self._run_root.socket_address(
-                CCLC_SOCKET_FILE
-            ) as socket_address:
+            with self._run_root.socket_address(CCLC_SOCKET_FILE) as socket_address:
                 with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as client:
                     client.setsockopt(
                         socket.SOL_SOCKET,
@@ -173,8 +171,7 @@ class CCLCOpenRequestClient:
                 or not error["message"]
                 or not isinstance(error.get("details"), dict)
                 or not all(
-                    isinstance(key, str)
-                    and isinstance(value, str)
+                    isinstance(key, str) and isinstance(value, str)
                     for key, value in error["details"].items()
                 )
             ):
@@ -182,7 +179,9 @@ class CCLCOpenRequestClient:
                     "cclc_open_response_invalid",
                     "CCLC error response is invalid",
                 )
-            raise HeadlessApiError(error["code"], error["message"])
+            raise HeadlessApiError(
+                error["code"], error["message"], details=error["details"]
+            )
         if response.get("error") is not None:
             raise HeadlessApiError(
                 "cclc_open_response_invalid",
@@ -267,9 +266,7 @@ class CCLCOpenRequestClient:
             )
         return result
 
-    def submit_lifecycle(
-        self, intent: Mapping[str, Any]
-    ) -> dict[str, Any]:
+    def submit_lifecycle(self, intent: Mapping[str, Any]) -> dict[str, Any]:
         result = self._require_object(
             self._exchange("lifecycle_submit", intent),
             command="lifecycle_submit",
@@ -277,12 +274,9 @@ class CCLCOpenRequestClient:
         acceptance = result.get("acceptance")
         context = intent.get("request_context")
         request_id = context.get("request_id") if isinstance(context, dict) else None
-        if (
-            acceptance is not None
-            and (
-                not isinstance(acceptance, dict)
-                or acceptance.get("request_id") != request_id
-            )
+        if acceptance is not None and (
+            not isinstance(acceptance, dict)
+            or acceptance.get("request_id") != request_id
         ):
             raise HeadlessApiError(
                 "cclc_open_response_identity_mismatch",
@@ -290,9 +284,32 @@ class CCLCOpenRequestClient:
             )
         return result
 
-    def lifecycle_status(
-        self, transaction_id: str
+    def lifecycle_request_result(
+        self, intent: Mapping[str, Any]
     ) -> dict[str, Any] | None:
+        return self._request_result("lifecycle_request_result", intent)
+
+    def route_request_result(self, intent: Mapping[str, Any]) -> dict[str, Any] | None:
+        return self._request_result("route_request_result", intent)
+
+    def _request_result(
+        self, command: str, intent: Mapping[str, Any]
+    ) -> dict[str, Any] | None:
+        result = self._exchange(command, intent)
+        if result is not None:
+            acceptance = result.get("acceptance")
+            if acceptance is not None and (
+                not isinstance(acceptance, dict)
+                or acceptance.get("request_id")
+                != intent["request_context"]["request_id"]
+            ):
+                raise HeadlessApiError(
+                    "cclc_open_response_identity_mismatch",
+                    "CCLC result names another request",
+                )
+        return result
+
+    def lifecycle_status(self, transaction_id: str) -> dict[str, Any] | None:
         result = self._exchange(
             "lifecycle_status",
             {"lifecycle_transaction_id": transaction_id},
@@ -316,12 +333,9 @@ class CCLCOpenRequestClient:
         acceptance = result.get("acceptance")
         context = intent.get("request_context")
         request_id = context.get("request_id") if isinstance(context, dict) else None
-        if (
-            acceptance is not None
-            and (
-                not isinstance(acceptance, dict)
-                or acceptance.get("request_id") != request_id
-            )
+        if acceptance is not None and (
+            not isinstance(acceptance, dict)
+            or acceptance.get("request_id") != request_id
         ):
             raise HeadlessApiError(
                 "cclc_open_response_identity_mismatch",
@@ -338,8 +352,7 @@ class CCLCOpenRequestClient:
             acceptance = result.get("acceptance")
             if (
                 not isinstance(acceptance, dict)
-                or acceptance.get("route_selection_transaction_id")
-                != transaction_id
+                or acceptance.get("route_selection_transaction_id") != transaction_id
             ):
                 raise HeadlessApiError(
                     "cclc_open_response_identity_mismatch",

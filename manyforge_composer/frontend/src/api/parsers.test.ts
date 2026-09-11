@@ -145,7 +145,8 @@ function deploymentWorkspaceFixture(): Record<string, unknown> {
         api_version: 'manyforge.deployment.v1',
         deployment_artifact_id: 'deployment.fixture',
         deployment_revision: digestA,
-        graph: { graph_revision: digestC },
+        graph: { runtime_units: [], model_instances: [], controllable_components: [],
+          control_domains: [], control_bindings: [], component_attachments: [] },
       },
       deploymentArtifactId: 'deployment.fixture',
       deploymentRevision: digestA,
@@ -972,8 +973,10 @@ describe('Program product projections', () => {
 });
 
 describe('Deployment workspace parser', () => {
-  it('accepts one exact Draft, Binding, and named Scenario projection', () => {
+  it('accepts the authored graph without embedding its compiler-issued revision', () => {
     const parsed = parseDeploymentWorkspaceResponse(deploymentWorkspaceFixture());
+    expect(parsed.draft.document?.graph).not.toHaveProperty('graph_revision');
+    expect(parsed.draft.graphRevision).toBe(`sha256:${'c'.repeat(64)}`);
     expect(parsed.binding?.component_role_bindings.length).toBeGreaterThan(0);
     expect(parsed.scenarioCandidates.map((row) => row.scenarioId)).toEqual(['fixture']);
     expect(parsed.runAdmission.ready).toBe(true);
@@ -2007,7 +2010,8 @@ describe('addressed Robot Control parsers', () => {
             max_acceleration_rad_s2: null,
           }],
           target_descriptor: {
-            schema_version: 'manyforge.manual_control_motion_descriptor.v3',
+            schema_version: 'manyforge.manual_control_motion_descriptor.v4',
+            ordinary_jerk: null,
             controllable_component_id: 'robot-a',
             command_target_id: 'arm',
             component_role_id: 'controlled_component',
@@ -2317,6 +2321,27 @@ describe('addressed Robot Control parsers', () => {
     expect(() => parseExecutionOwnerStatus(dishonestLimit)).toThrow(
       /exact conservative Deployment\/model minimum/,
     );
+
+    const ordinary = structuredClone(response);
+    const jerkRow = {
+      source_joint_name: 'joint1', source: 'imported', maximum_rad_s3: 6,
+      preset_rad_s3: null,
+      imported: { maximum_rad_s3: 6, enabled: true, machine_required: false,
+        source_id: 'robot_moveit_config/config/joint_limits.yaml', source_digest: exactRevision },
+    };
+    Object.assign(ordinary.status.direct_control.target_descriptor, {
+      ordinary_jerk: { enabled: true, preset_reference_time_s: 1, joint_limits: [jerkRow] },
+    });
+    Object.assign(ordinary.status.direct_control.target_descriptor.operational_joint_limits[0], {
+      deployment_max_jerk_rad_s3: null, effective_max_jerk_rad_s3: 6,
+    });
+    expect(parseExecutionOwnerStatus(ordinary).directControl.targetDescriptor.ordinaryJerk)
+      .toMatchObject({ enabled: true, jointLimits: [{ maximumRadS3: 6, source: 'imported' }] });
+    jerkRow.maximum_rad_s3 = 7;
+    expect(() => parseExecutionOwnerStatus(ordinary)).toThrow(/effective jerk limits/);
+    jerkRow.maximum_rad_s3 = 6;
+    jerkRow.source_joint_name = 'foreign-joint';
+    expect(() => parseExecutionOwnerStatus(ordinary)).toThrow(/exact ordered model joints/);
   });
 
   it('accepts only a no-motion receipt with equal source arrays', () => {

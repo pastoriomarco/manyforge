@@ -101,8 +101,7 @@ struct RetainedCatalogDTO final {
   std::vector<RetainedSchemaArtifactRefDTO> schema_artifacts;
   RetainedNodeEnvironmentDTO node_environment;
 
-  friend bool operator==(const RetainedCatalogDTO&,
-                         const RetainedCatalogDTO&) = default;
+  friend bool operator==(const RetainedCatalogDTO&, const RetainedCatalogDTO&) = default;
 };
 
 /// One canonical non-empty product group owned by a control domain.
@@ -132,8 +131,7 @@ struct RetainedRuntimeContractRequirementDTO final {
   RuntimeContractRequirementDTO requirement;
 
   friend bool operator==(const RetainedRuntimeContractRequirementDTO&,
-                         const RetainedRuntimeContractRequirementDTO&) =
-      default;
+                         const RetainedRuntimeContractRequirementDTO&) = default;
 };
 
 /// Complete closed v1 compiled-product placement table.
@@ -163,60 +161,50 @@ struct TypedRetainedSourceRecordDTO final {
 };
 
 using RetainedModelAssetSourceRecordDTO =
-    TypedRetainedSourceRecordDTO<CatalogRecordKind::kModelAsset, ModelAssetId,
-                                 ModelRevision>;
+    TypedRetainedSourceRecordDTO<CatalogRecordKind::kModelAsset, ModelAssetId, ModelRevision>;
 using RetainedRuntimeProfileSourceRecordDTO =
-    TypedRetainedSourceRecordDTO<CatalogRecordKind::kRuntimeProfile,
-                                 RuntimeProfileId, RuntimeProfileRevision>;
+    TypedRetainedSourceRecordDTO<CatalogRecordKind::kRuntimeProfile, RuntimeProfileId,
+                                 RuntimeProfileRevision>;
 using RetainedComponentTypeSourceRecordDTO =
-    TypedRetainedSourceRecordDTO<CatalogRecordKind::kComponentType,
-                                 ComponentTypeId, ComponentTypeRevision>;
+    TypedRetainedSourceRecordDTO<CatalogRecordKind::kComponentType, ComponentTypeId,
+                                 ComponentTypeRevision>;
 using RetainedControlInterfaceContractSourceRecordDTO =
-    TypedRetainedSourceRecordDTO<
-        CatalogRecordKind::kControlInterfaceContract,
-        ControlInterfaceContractId, ControlInterfaceRevision>;
+    TypedRetainedSourceRecordDTO<CatalogRecordKind::kControlInterfaceContract,
+                                 ControlInterfaceContractId, ControlInterfaceRevision>;
 using RetainedControllerTopologySourceRecordDTO =
-    TypedRetainedSourceRecordDTO<CatalogRecordKind::kControllerTopology,
-                                 ControllerTopologyId, TopologyRevision>;
+    TypedRetainedSourceRecordDTO<CatalogRecordKind::kControllerTopology, ControllerTopologyId,
+                                 TopologyRevision>;
 using RetainedProviderManifestSourceRecordDTO =
-    TypedRetainedSourceRecordDTO<CatalogRecordKind::kProviderManifest,
-                                 ProviderManifestId,
+    TypedRetainedSourceRecordDTO<CatalogRecordKind::kProviderManifest, ProviderManifestId,
                                  ProviderManifestRevision>;
 using RetainedCommandSchemaSourceRecordDTO =
-    TypedRetainedSourceRecordDTO<CatalogRecordKind::kCommandSchema,
-                                 CommandSchemaId, CommandSchemaRevision>;
+    TypedRetainedSourceRecordDTO<CatalogRecordKind::kCommandSchema, CommandSchemaId,
+                                 CommandSchemaRevision>;
 using RetainedCapabilityDefinitionSourceRecordDTO =
-    TypedRetainedSourceRecordDTO<
-        CatalogRecordKind::kCapabilityDefinition, CapabilityId,
-        CapabilityDefinitionRevision>;
+    TypedRetainedSourceRecordDTO<CatalogRecordKind::kCapabilityDefinition, CapabilityId,
+                                 CapabilityDefinitionRevision>;
 using RetainedContactPolicySourceRecordDTO =
-    TypedRetainedSourceRecordDTO<CatalogRecordKind::kContactPolicy,
-                                 ContactPolicyId, ContactPolicyRevision>;
+    TypedRetainedSourceRecordDTO<CatalogRecordKind::kContactPolicy, ContactPolicyId,
+                                 ContactPolicyRevision>;
 using RetainedStopEvidencePolicySourceRecordDTO =
-    TypedRetainedSourceRecordDTO<CatalogRecordKind::kStopEvidencePolicy,
-                                 StopEvidencePolicyId,
+    TypedRetainedSourceRecordDTO<CatalogRecordKind::kStopEvidencePolicy, StopEvidencePolicyId,
                                  StopEvidencePolicyRevision>;
 using RetainedRuntimePolicySourceRecordDTO =
-    TypedRetainedSourceRecordDTO<CatalogRecordKind::kRuntimePolicy,
-                                 RuntimePolicyId, RuntimePolicyRevision>;
+    TypedRetainedSourceRecordDTO<CatalogRecordKind::kRuntimePolicy, RuntimePolicyId,
+                                 RuntimePolicyRevision>;
 
 /// Closed source-provenance union. The selected record kind fixes the strong
 /// source ID and revision domains.
-using RetainedSourceRecordDTO = std::variant<
-    RetainedModelAssetSourceRecordDTO,
-    RetainedRuntimeProfileSourceRecordDTO,
-    RetainedComponentTypeSourceRecordDTO,
-    RetainedControlInterfaceContractSourceRecordDTO,
-    RetainedControllerTopologySourceRecordDTO,
-    RetainedProviderManifestSourceRecordDTO,
-    RetainedCommandSchemaSourceRecordDTO,
-    RetainedCapabilityDefinitionSourceRecordDTO,
-    RetainedContactPolicySourceRecordDTO,
-    RetainedStopEvidencePolicySourceRecordDTO,
-    RetainedRuntimePolicySourceRecordDTO>;
+using RetainedSourceRecordDTO =
+    std::variant<RetainedModelAssetSourceRecordDTO, RetainedRuntimeProfileSourceRecordDTO,
+                 RetainedComponentTypeSourceRecordDTO,
+                 RetainedControlInterfaceContractSourceRecordDTO,
+                 RetainedControllerTopologySourceRecordDTO, RetainedProviderManifestSourceRecordDTO,
+                 RetainedCommandSchemaSourceRecordDTO, RetainedCapabilityDefinitionSourceRecordDTO,
+                 RetainedContactPolicySourceRecordDTO, RetainedStopEvidencePolicySourceRecordDTO,
+                 RetainedRuntimePolicySourceRecordDTO>;
 
-static_assert(std::variant_size_v<RetainedSourceRecordDTO> ==
-              kCatalogRecordTypeRegistry.size());
+static_assert(std::variant_size_v<RetainedSourceRecordDTO> == kCatalogRecordTypeRegistry.size());
 
 /// Exact offline generator provenance row.
 struct RetainedGeneratorRecordDTO final {
@@ -262,8 +250,7 @@ struct RetainedBundleDTO final {
   DeploymentRevision deployment_revision;
   CellGraphDTO cell_graph;
   RetainedCatalogDTO catalogs;
-  std::vector<DesiredControlConfigurationDTO>
-      desired_control_configurations;
+  std::vector<DesiredControlConfigurationDTO> desired_control_configurations;
   std::vector<CapabilityProviderBindingDTO> capability_provider_bindings;
   std::vector<CatalogRecordRefDTO> retained_policy_records;
   RetainedCompiledProductsDTO compiled_products;
@@ -271,11 +258,10 @@ struct RetainedBundleDTO final {
   std::optional<SiteOverlayRefDTO> selected_site_overlay_ref;
   std::vector<ExternalResourceDTO> external_resources;
   std::optional<RetainedAssistantProjectionDTO> assistant;
-  std::vector<RetainedRuntimeContractRequirementDTO>
-      runtime_contract_requirements;
+  std::vector<RetainedRuntimeContractRequirementDTO> runtime_contract_requirements;
+  std::vector<StopTimingSelectionDTO> stop_timing_parameters{};
 
-  friend bool operator==(const RetainedBundleDTO&,
-                         const RetainedBundleDTO&) = default;
+  friend bool operator==(const RetainedBundleDTO&, const RetainedBundleDTO&) = default;
 };
 
 }  // namespace manyforge::core

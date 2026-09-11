@@ -1092,7 +1092,8 @@ CanonicalValue HeadlessApiCore::HistorianHealth() {
   return AsyncHistorianHealthValue(historian_.Health());
 }
 
-CanonicalValue HeadlessApiCore::RecordGripperConfirmation(CanonicalValue record) {
+CanonicalValue
+HeadlessApiCore::RecordGripperConfirmation(CanonicalValue record) {
   const std::string code = "gripper_confirmation_trace_invalid";
   const std::set<std::string> fields{"schema_version",
                                      "origin_epoch",
@@ -1107,49 +1108,61 @@ CanonicalValue HeadlessApiCore::RecordGripperConfirmation(CanonicalValue record)
                                      "confirmed",
                                      "phase",
                                      "details"};
-  Require(record.is_object() && record.as_object().size() == fields.size(), code,
-          "Gripper confirmation trace has invalid fields");
-  for (const auto& [name, value] : record.as_object())
-    Require(fields.contains(name), code, "Gripper confirmation trace has an unknown field");
-  for (const auto name :
-       {"origin_epoch", "request_id", "source_label", "native_owner_epoch", "target_role_id"}) {
+  Require(record.is_object() && record.as_object().size() == fields.size(),
+          code, "Gripper confirmation trace has invalid fields");
+  for (const auto &[name, value] : record.as_object())
+    Require(fields.contains(name), code,
+            "Gripper confirmation trace has an unknown field");
+  for (const auto name : {"origin_epoch", "request_id", "source_label",
+                          "native_owner_epoch", "target_role_id"}) {
     const auto value = RequiredString(record, name);
-    Require(!value.empty() && value.size() <= 256U && content_identity::is_utf8_nfc(value), code,
-            "Gripper confirmation trace identity is invalid");
+    Require(!value.empty() && value.size() <= 256U &&
+                content_identity::is_utf8_nfc(value),
+            code, "Gripper confirmation trace identity is invalid");
   }
-  Require(RequiredString(record, "schema_version") == "manyforge.gripper_confirmation_trace.v1" &&
-              content_identity::is_sha256_digest(RequiredString(record, "program_binding_id")),
+  Require(RequiredString(record, "schema_version") ==
+                  "manyforge.gripper_confirmation_trace.v1" &&
+              content_identity::is_sha256_digest(
+                  RequiredString(record, "program_binding_id")),
           code, "Gripper confirmation trace version or binding is invalid");
-  for (const auto name : {"command_id", "generation", "expected_status_revision"}) {
-    const auto value = content_identity::parse_nonnegative_int64(RequiredMember(record, name));
-    Require(value > 0 && value <= static_cast<std::int64_t>(kMaximumSafeInteger), code,
-            "Gripper confirmation trace counter is invalid");
+  for (const auto name :
+       {"command_id", "generation", "expected_status_revision"}) {
+    const auto value =
+        content_identity::parse_nonnegative_int64(RequiredMember(record, name));
+    Require(value > 0 &&
+                value <= static_cast<std::int64_t>(kMaximumSafeInteger),
+            code, "Gripper confirmation trace counter is invalid");
   }
-  Require(std::holds_alternative<bool>(RequiredMember(record, "confirmed").storage()), code,
-          "Gripper confirmation trace result is not boolean");
+  Require(std::holds_alternative<bool>(
+              RequiredMember(record, "confirmed").storage()),
+          code, "Gripper confirmation trace result is not boolean");
   const auto phase = RequiredString(record, "phase");
-  Require(phase == "attempted" || phase == "accepted" || phase == "unconfirmed", code,
-          "Gripper confirmation trace phase is invalid");
+  Require(phase == "attempted" || phase == "accepted" || phase == "unconfirmed",
+          code, "Gripper confirmation trace phase is invalid");
   Require(RequiredMember(record, "details").is_object() &&
               content_identity::canonical_json(record).size() <= 8192U,
           code, "Gripper confirmation trace exceeds its byte bound");
   auto payload = record.as_object();
-  payload.emplace_back("clock_owner", CanonicalValue("headless:" + config_.owner_epoch));
-  payload.emplace_back("evidence_kind", CanonicalValue("operator_attestation_trace"));
-  auto event =
-      MakeHistorianEvent("manyforge.gripper", "gripper_confirmation_" + phase,
-                         phase == "unconfirmed" ? "ERROR" : "INFO", clocks_.monotonic_time_ns(),
-                         clocks_.wall_time_text(), CanonicalValue(std::move(payload)));
+  payload.emplace_back("clock_owner",
+                       CanonicalValue("headless:" + config_.owner_epoch));
+  payload.emplace_back("evidence_kind",
+                       CanonicalValue("operator_attestation_trace"));
+  auto event = MakeHistorianEvent(
+      "manyforge.gripper", "gripper_confirmation_" + phase,
+      phase == "unconfirmed" ? "ERROR" : "INFO", clocks_.monotonic_time_ns(),
+      clocks_.wall_time_text(), CanonicalValue(std::move(payload)));
   const auto event_id = event.event_id;
   std::lock_guard lock(mutex_);
   Require(!shutdown_, "headless_api_closed", "headless API core is closed");
   const bool recorded = historian_.TryEnqueue(std::move(event));
   if (!recorded)
-    alarm_owner_.MarkHealthUnavailable(std::string(kHistorianOwnerHealthCode),
-                                       "historian queue rejected a gripper confirmation trace");
+    alarm_owner_.MarkHealthUnavailable(
+        std::string(kHistorianOwnerHealthCode),
+        "historian queue rejected a gripper confirmation trace");
   SynchronizeHistorianHealthLocked();
   return CanonicalValue(CanonicalValue::Object{
-      {"schema_version", CanonicalValue("manyforge.gripper_confirmation_trace_record.v1")},
+      {"schema_version",
+       CanonicalValue("manyforge.gripper_confirmation_trace_record.v1")},
       {"event_id", CanonicalValue(event_id)},
       {"recorded", CanonicalValue(recorded)}});
 }
@@ -1173,9 +1186,9 @@ CanonicalValue HeadlessApiCore::RecordProgramDiagnostic(CanonicalValue record) {
                                      "omitted_blackboard_count",
                                      "omitted_override_count",
                                      "delivery_loss_count"};
-  Require(record.is_object() && record.as_object().size() == fields.size(), code,
-          "Program diagnostic fields are invalid");
-  for (const auto& [name, value] : record.as_object()) {
+  Require(record.is_object() && record.as_object().size() == fields.size(),
+          code, "Program diagnostic fields are invalid");
+  for (const auto &[name, value] : record.as_object()) {
     Require(fields.contains(name), code, "Program diagnostic field is unknown");
   }
   const auto text = [&](const std::string_view name, std::size_t limit = 512U) {
@@ -1188,64 +1201,72 @@ CanonicalValue HeadlessApiCore::RecordProgramDiagnostic(CanonicalValue record) {
           "Program diagnostic version is unsupported");
   text("program_run_id");
   const auto epoch = text("owner_epoch");
-  for (const auto name :
-       {"program_revision", "program_binding_id", "retained_bundle_id", "graph_revision"}) {
+  for (const auto name : {"program_revision", "program_binding_id",
+                          "retained_bundle_id", "graph_revision"}) {
     Require(content_identity::is_sha256_digest(text(name)), code,
             "Program diagnostic artifact identity is invalid");
   }
   const auto state = text("state");
-  Require(state == "succeeded" || state == "failed" || state == "intervention_required", code,
-          "Program diagnostic transition is unsupported");
+  Require(state == "succeeded" || state == "failed" ||
+              state == "intervention_required",
+          code, "Program diagnostic transition is unsupported");
   const auto reason = OptionalStringMember(record, "reason_code");
-  Require(!reason || (reason->size() <= 512U && content_identity::is_utf8_nfc(*reason)), code,
-          "Program diagnostic reason is invalid");
+  Require(!reason || (reason->size() <= 512U &&
+                      content_identity::is_utf8_nfc(*reason)),
+          code, "Program diagnostic reason is invalid");
   text("message", 4096U);
   const auto wall = text("occurred_at_wall", 64U);
-  Require(HistorianRecordedUtcNs(wall).has_value(), code, "Program diagnostic UTC is invalid");
-  const auto monotonic =
-      content_identity::parse_nonnegative_int64(RequiredMember(record, "occurred_at_ns"));
-  const auto bounded_value = [&](const auto& visit, const CanonicalValue& value, std::size_t depth,
-                                 std::size_t& items, std::int64_t& bytes) -> void {
-    bytes -= 2;  // Conservative separators/brackets, as at the producer.
+  Require(HistorianRecordedUtcNs(wall).has_value(), code,
+          "Program diagnostic UTC is invalid");
+  const auto monotonic = content_identity::parse_nonnegative_int64(
+      RequiredMember(record, "occurred_at_ns"));
+  const auto bounded_value = [&](const auto &visit, const CanonicalValue &value,
+                                 std::size_t depth, std::size_t &items,
+                                 std::int64_t &bytes) -> void {
+    bytes -= 2; // Conservative separators/brackets, as at the producer.
     Require(++items <= 512U && depth <= 16U && bytes >= 0, code,
             "Program diagnostic value exceeds traversal or byte bounds");
     if (value.is_object()) {
-      for (const auto& [key, child] : value.as_object()) {
+      for (const auto &[key, child] : value.as_object()) {
         visit(visit, CanonicalValue(key), depth + 1U, items, bytes);
         visit(visit, child, depth + 1U, items, bytes);
       }
     } else if (value.is_array()) {
-      for (const auto& child : value.as_array()) {
+      for (const auto &child : value.as_array()) {
         visit(visit, child, depth + 1U, items, bytes);
       }
     } else {
-      const auto* scalar = std::get_if<std::string>(&value.storage());
-      Require(
-          scalar == nullptr || (scalar->size() <= 2048U && content_identity::is_utf8_nfc(*scalar)),
-          code, "Program diagnostic string is invalid");
-      bytes -= static_cast<std::int64_t>(content_identity::canonical_json(value).size());
+      const auto *scalar = std::get_if<std::string>(&value.storage());
+      Require(scalar == nullptr || (scalar->size() <= 2048U &&
+                                    content_identity::is_utf8_nfc(*scalar)),
+              code, "Program diagnostic string is invalid");
+      bytes -= static_cast<std::int64_t>(
+          content_identity::canonical_json(value).size());
       Require(bytes >= 0, code, "Program diagnostic value exceeds byte bound");
     }
   };
   for (const auto name : {"blackboard", "runtime_overrides"}) {
-    const auto& values = RequiredMember(record, name);
+    const auto &values = RequiredMember(record, name);
     Require(values.is_object() && values.as_object().size() <= 32U, code,
             "Program diagnostic values exceed their entry bound");
     std::int64_t budget = 16 * 1024;
-    for (const auto& [key, value] : values.as_object()) {
+    for (const auto &[key, value] : values.as_object()) {
       std::size_t items = 0U;
       std::int64_t bytes = 16 * 1024 - 2;
       bounded_value(bounded_value, CanonicalValue(key), 0U, items, bytes);
       bounded_value(bounded_value, value, 0U, items, bytes);
       budget -= static_cast<std::int64_t>(
-          content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{{key, value}}))
+          content_identity::canonical_json(
+              CanonicalValue(CanonicalValue::Object{{key, value}}))
               .size());
-      Require(budget >= 0, code, "Program diagnostic section exceeds byte bound");
+      Require(budget >= 0, code,
+              "Program diagnostic section exceeds byte bound");
     }
   }
-  for (const auto name :
-       {"omitted_blackboard_count", "omitted_override_count", "delivery_loss_count"}) {
-    const auto value = content_identity::parse_nonnegative_int64(RequiredMember(record, name));
+  for (const auto name : {"omitted_blackboard_count", "omitted_override_count",
+                          "delivery_loss_count"}) {
+    const auto value =
+        content_identity::parse_nonnegative_int64(RequiredMember(record, name));
     Require(value <= (std::string_view(name) == "delivery_loss_count"
                           ? static_cast<std::int64_t>(kMaximumSafeInteger)
                           : 100000),
@@ -1254,23 +1275,28 @@ CanonicalValue HeadlessApiCore::RecordProgramDiagnostic(CanonicalValue record) {
   Require(content_identity::canonical_json(record).size() <= 64U * 1024U, code,
           "Program diagnostic exceeds its byte bound");
   auto payload = record.as_object();
-  payload.emplace_back("clock_owner", CanonicalValue("program_runner:" + epoch));
+  payload.emplace_back("clock_owner",
+                       CanonicalValue("program_runner:" + epoch));
   // Attribution is not authentication, command acceptance, or physical proof.
-  payload.emplace_back("evidence_kind", CanonicalValue("attributed_program_values"));
-  auto event = MakeHistorianEvent("manyforge.program_runner", "program_" + state,
-                                  state == "succeeded" ? "INFO" : "ERROR", monotonic, wall,
-                                  CanonicalValue(std::move(payload)));
+  payload.emplace_back("evidence_kind",
+                       CanonicalValue("attributed_program_values"));
+  auto event =
+      MakeHistorianEvent("manyforge.program_runner", "program_" + state,
+                         state == "succeeded" ? "INFO" : "ERROR", monotonic,
+                         wall, CanonicalValue(std::move(payload)));
   const auto event_id = event.event_id;
   std::lock_guard lock(mutex_);
   Require(!shutdown_, "headless_api_closed", "headless API core is closed");
   const bool recorded = historian_.TryEnqueue(std::move(event));
   if (!recorded) {
-    alarm_owner_.MarkHealthUnavailable(std::string(kHistorianOwnerHealthCode),
-                                       "historian queue rejected a Program diagnostic");
+    alarm_owner_.MarkHealthUnavailable(
+        std::string(kHistorianOwnerHealthCode),
+        "historian queue rejected a Program diagnostic");
   }
   SynchronizeHistorianHealthLocked();
   return CanonicalValue(CanonicalValue::Object{
-      {"schema_version", CanonicalValue("manyforge.program_diagnostic_record.v1")},
+      {"schema_version",
+       CanonicalValue("manyforge.program_diagnostic_record.v1")},
       {"event_id", CanonicalValue(event_id)},
       {"recorded", CanonicalValue(recorded)}});
 }
@@ -1850,12 +1876,15 @@ CanonicalValue HeadlessApiCore::CompleteOperationEventSnapshot(
       "headless_operation_event_snapshot_incomplete",
       "operation event snapshot completion is ahead of or behind ingestion");
 
+  const bool current_fault_active =
+      current_stop_fault.has_value() &&
+      !std::holds_alternative<std::nullptr_t>(current_stop_fault->storage());
   if (current_stop_fault.has_value()) {
-    observed_stop_faults_.clear();
-    if (!std::holds_alternative<std::nullptr_t>(
-            current_stop_fault->storage())) {
+    if (current_fault_active) {
       ObserveCurrentStopFaultLocked(*current_stop_fault,
                                     through_source_sequence);
+    } else {
+      current_stop_fault_fingerprint_.clear();
     }
   }
 
@@ -1931,9 +1960,13 @@ CanonicalValue HeadlessApiCore::CompleteOperationEventSnapshot(
   }
   retired.clear();
   for (const auto &[latch, subject] : active_stop_faults_) {
-    if (observed_stop_faults_.contains(latch)) {
+    // A selected current latch is not a complete set of unresolved faults.
+    // Keep older identities until exact clear or an authoritative null
+    // snapshot.
+    if (!current_stop_fault.has_value() || current_fault_active) {
       continue;
     }
+    retired.push_back(latch);
     Require(operation_adapter_.source_sequence < kMaximumSafeInteger,
             "headless_adapter_sequence_exhausted",
             "operation alarm adapter sequence is exhausted");
@@ -1959,7 +1992,6 @@ CanonicalValue HeadlessApiCore::CompleteOperationEventSnapshot(
     };
     const auto mutation = alarm_owner_.Submit(std::move(update));
     static_cast<void>(DeliverFactsLocked(mutation.lifecycle_facts));
-    retired.push_back(latch);
   }
   for (const auto &latch : retired) {
     active_stop_faults_.erase(latch);
@@ -2569,7 +2601,7 @@ void HeadlessApiCore::RegisterOperationEpochLocked(
   operation_native_record_digest_.clear();
   observed_operation_faults_.clear();
   observed_runtime_collisions_.clear();
-  observed_stop_faults_.clear();
+  current_stop_fault_fingerprint_.clear();
 }
 
 void HeadlessApiCore::ReconcileRuntimeCollisionStopLocked(
@@ -2831,12 +2863,12 @@ void HeadlessApiCore::ReconcileStopFaultLocked(
                state == "cleared"),
           "headless_operation_event_invalid",
           "Stop fault projection state does not match its event kind");
+  current_stop_fault_fingerprint_.clear();
 
   AlarmSubject subject;
   if (active) {
     subject = AlarmSubject{"cell", cell_id, {}};
     active_stop_faults_.insert_or_assign(latch_id, subject);
-    observed_stop_faults_.insert(latch_id);
   } else {
     const auto found = active_stop_faults_.find(latch_id);
     if (found == active_stop_faults_.end()) {
@@ -2844,7 +2876,11 @@ void HeadlessApiCore::ReconcileStopFaultLocked(
     }
     subject = found->second;
     active_stop_faults_.erase(found);
-    observed_stop_faults_.erase(latch_id);
+    if (std::any_of(
+            active_stop_faults_.begin(), active_stop_faults_.end(),
+            [&](const auto &entry) { return entry.second == subject; })) {
+      return;
+    }
   }
 
   Require(operation_adapter_.source_sequence < kMaximumSafeInteger,
@@ -2905,6 +2941,8 @@ void HeadlessApiCore::ObserveCurrentStopFaultLocked(
   const auto stop_generation =
       RequiredCounter(fault_latch, "stop_generation", 1U);
   const auto &certificate = RequiredMember(fault_latch, "stop_certificate");
+  const bool certificate_pending =
+      std::holds_alternative<std::nullptr_t>(certificate.storage());
   Require(
       cell_id == config_.cell_id &&
           (state == "latched" || state == "recovery_pending") &&
@@ -2932,22 +2970,31 @@ void HeadlessApiCore::ObserveCurrentStopFaultLocked(
           !RequiredString(fault_latch, "graph_revision").empty() &&
           !RequiredString(fault_latch, "reason_code").empty() &&
           !RequiredString(fault_latch, "retained_bundle_id").empty() &&
-          certificate.is_object() && certificate.as_object().size() == 4U &&
-          RequiredString(certificate, "stop_id") == stop_id &&
-          RequiredCounter(certificate, "stop_generation", 1U) ==
-              stop_generation &&
-          RequiredCounter(certificate, "stop_certificate_revision", 1U) != 0U &&
-          !RequiredString(certificate, "stop_certificate_id").empty(),
+          ((certificate_pending && state == "latched" &&
+            recovery_status == "waiting_for_observation" &&
+            RequiredString(RequiredMember(fault_latch, "terminal_projection"),
+                           "state") == "pending" &&
+            RequiredString(RequiredMember(fault_latch, "clear_projection"),
+                           "state") == "not_applicable") ||
+           (certificate.is_object() && certificate.as_object().size() == 4U &&
+            RequiredString(certificate, "stop_id") == stop_id &&
+            RequiredCounter(certificate, "stop_generation", 1U) ==
+                stop_generation &&
+            RequiredCounter(certificate, "stop_certificate_revision", 1U) !=
+                0U &&
+            !RequiredString(certificate, "stop_certificate_id").empty())),
       "headless_operation_event_invalid",
       "current Stop-fault condition is internally inconsistent");
 
   const AlarmSubject subject{"cell", cell_id, {}};
-  observed_stop_faults_.insert(latch_id);
+  const auto payload_digest = content_identity::sha256_digest(
+      content_identity::canonical_json(fault_latch));
   const auto found = active_stop_faults_.find(latch_id);
   if (found != active_stop_faults_.end()) {
     Require(found->second == subject, "headless_operation_event_invalid",
             "current Stop-fault condition changed subject identity");
-    return;
+    if (current_stop_fault_fingerprint_ == payload_digest)
+      return;
   }
 
   active_stop_faults_.insert_or_assign(latch_id, subject);
@@ -2955,8 +3002,6 @@ void HeadlessApiCore::ObserveCurrentStopFaultLocked(
           "headless_adapter_sequence_exhausted",
           "operation alarm adapter sequence is exhausted");
   ++operation_adapter_.source_sequence;
-  const auto payload_digest = content_identity::sha256_digest(
-      content_identity::canonical_json(fault_latch));
   AlarmConditionUpdate update{
       "manyforge.motion.stop_fault",
       subject,
@@ -2979,15 +3024,20 @@ void HeadlessApiCore::ObserveCurrentStopFaultLocked(
           {"cell_id", CanonicalValue(cell_id)},
           {"latch_id", CanonicalValue(latch_id)},
           {"stop_certificate_id",
-           RequiredMember(certificate, "stop_certificate_id")},
+           certificate_pending
+               ? CanonicalValue(nullptr)
+               : RequiredMember(certificate, "stop_certificate_id")},
           {"stop_certificate_revision",
-           RequiredMember(certificate, "stop_certificate_revision")},
+           certificate_pending
+               ? CanonicalValue(nullptr)
+               : RequiredMember(certificate, "stop_certificate_revision")},
           {"stop_generation", RequiredMember(fault_latch, "stop_generation")},
           {"stop_id", RequiredMember(fault_latch, "stop_id")},
       }),
   };
   const auto mutation = alarm_owner_.Submit(std::move(update));
   static_cast<void>(DeliverFactsLocked(mutation.lifecycle_facts));
+  current_stop_fault_fingerprint_ = payload_digest;
 }
 
 void HeadlessApiCore::RegisterAdapterEpochLocked(AdapterCursor &cursor,

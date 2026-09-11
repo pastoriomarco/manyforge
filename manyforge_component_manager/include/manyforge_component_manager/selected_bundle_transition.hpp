@@ -39,6 +39,8 @@ enum class ObsoleteManagedCommandSurfaceDisposition {
 
 /// Exact terminal observation for one obsolete ManyForge-managed command
 /// surface. The first admitted runtime-only transition has no such rows.
+/// For native kNonselectable replacement, runtime_epoch/source_report_sequence
+/// identify the exact successor proving the old product no longer selectable.
 struct ObsoleteManagedCommandSurfaceEvidenceDTO final {
   manyforge::core::RuntimeUnitId runtime_unit_id;
   manyforge::core::RuntimeEpoch runtime_epoch;

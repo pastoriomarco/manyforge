@@ -11,7 +11,7 @@
 namespace manyforge::core {
 
 inline constexpr std::string_view kCCLCJournalSchemaId = "manyforge.internal.cclc.journal.v5";
-inline constexpr std::int64_t kCCLCJournalSchemaVersion = 6;
+inline constexpr std::int64_t kCCLCJournalSchemaVersion = 9;
 inline constexpr std::int64_t kCCLCJournalSqliteApplicationId = 0x4D464C4A;
 inline constexpr std::string_view kCCLCJournalFilename = "cclc-journal.sqlite3";
 inline constexpr std::size_t kDefaultCCLCExactResultHistory = 128U;
@@ -36,29 +36,37 @@ class SqliteCCLCJournal final : public ICCLCJournal {
 
   [[nodiscard]] Result<CCLCJournalRecoveryDTO> BeginOwnerEpoch(
       const RequestOwnerEpoch& owner_epoch, std::int64_t started_at_ns,
-      std::size_t request_membership_capacity) override;
+      std::size_t request_membership_capacity,
+      const std::optional<RequestOwnerEpoch>& quiescent_predecessor = std::nullopt) override;
 
   [[nodiscard]] Result<std::optional<CCLCLifecycleRequestResultDTO>> InspectLifecycleRequest(
       const RequestOwnerEpoch& active_owner_epoch,
       const ComponentLifecycleIntentDTO& intent) override;
 
+  [[nodiscard]] Result<std::optional<CCLCLifecycleRequestResultDTO>> ReadLifecycleRequestResult(
+      const ComponentLifecycleIntentDTO& intent) override;
+
+  [[nodiscard]] Result<CCLCLifecycleRequestResultDTO> RecordLifecycleRejection(
+      const RequestOwnerEpoch&, const ComponentLifecycleIntentDTO&, const ErrorDTO&,
+      const std::optional<CellAdmissionClaimIntentDTO>&) override;
+
   [[nodiscard]] Result<CCLCLifecycleRequestResultDTO> AcceptOrReplayLifecycle(
       const RequestOwnerEpoch& active_owner_epoch, const ComponentLifecycleIntentDTO& intent,
       const ComponentLifecycleAcceptedDTO& candidate_acceptance,
       const ComponentLifecycleStatusDTO& candidate_initial_status) override;
-  [[nodiscard]] Result<void> RecordLifecycleClaimAttempt(
-      const RequestOwnerEpoch&, const CellAdmissionClaimIntentDTO&) override;
-  [[nodiscard]] Result<void> RecordLifecycleClaimAcquired(
-      const RequestOwnerEpoch&, const CellAdmissionClaimDTO&) override;
+  [[nodiscard]] Result<void> RecordCellClaimAttempt(const RequestOwnerEpoch&,
+                                                    const CellAdmissionClaimIntentDTO&) override;
+  [[nodiscard]] Result<void> RecordCellClaimAcquired(const RequestOwnerEpoch&,
+                                                     const CellAdmissionClaimDTO&) override;
   [[nodiscard]] Result<std::uint64_t> RecordLifecycleTerminalAndClaimRelease(
       const RequestOwnerEpoch&, const ComponentLifecycleStatusDTO&,
       const CellAdmissionClaimReleaseDTO&) override;
-  [[nodiscard]] Result<void> RecordLifecycleClaimReleaseReceipt(
+  [[nodiscard]] Result<void> RecordCellClaimReleaseReceipt(
       const RequestOwnerEpoch&, const CellAdmissionClaimReleaseDTO&,
       const CellAdmissionRecoveryReceiptDTO&) override;
-  [[nodiscard]] Result<void> RecordUnacceptedLifecycleClaimRelease(
+  [[nodiscard]] Result<void> RecordUnacceptedCellClaimRelease(
       const RequestOwnerEpoch&, const CellAdmissionClaimReleaseDTO&) override;
-  [[nodiscard]] Result<void> RecordLifecycleClaimNotAcquired(
+  [[nodiscard]] Result<void> RecordCellClaimNotAcquired(
       const RequestOwnerEpoch&, const CellAdmissionClaimIntentDTO&) override;
 
   [[nodiscard]] Result<std::uint64_t> RecordEffectPrepared(
@@ -92,6 +100,13 @@ class SqliteCCLCJournal final : public ICCLCJournal {
   InspectRouteSelectionRequest(const RequestOwnerEpoch& active_owner_epoch,
                                const RouteSelectionIntentDTO& intent) override;
 
+  [[nodiscard]] Result<std::optional<CCLCRouteSelectionRequestResultDTO>>
+  ReadRouteSelectionRequestResult(const RouteSelectionIntentDTO& intent) override;
+
+  [[nodiscard]] Result<CCLCRouteSelectionRequestResultDTO> RecordRouteSelectionRejection(
+      const RequestOwnerEpoch& owner, const RouteSelectionIntentDTO& intent, const ErrorDTO& error,
+      const std::optional<CellAdmissionClaimIntentDTO>& unacquired) override;
+
   [[nodiscard]] Result<CCLCRouteSelectionRequestResultDTO> AcceptOrReplayRouteSelection(
       const RequestOwnerEpoch& active_owner_epoch, const RouteSelectionIntentDTO& intent,
       const RouteSelectionAcceptedDTO& candidate_acceptance,
@@ -106,6 +121,14 @@ class SqliteCCLCJournal final : public ICCLCJournal {
       const RequestOwnerEpoch& active_owner_epoch,
       const CCLCRouteEffectAttemptDTO& completed_attempt,
       const RouteSelectionStatusDTO& successor_status) override;
+
+  [[nodiscard]] Result<std::uint64_t> RecordRouteEffectCompletedAndClaimRelease(
+      const RequestOwnerEpoch& owner, const CCLCRouteEffectAttemptDTO& completed,
+      const RouteSelectionStatusDTO& status, const CellAdmissionClaimReleaseDTO& release) override;
+
+  [[nodiscard]] Result<std::uint64_t> RecordRouteTerminalAndClaimRelease(
+      const RequestOwnerEpoch& owner, const RouteSelectionStatusDTO& status,
+      const CellAdmissionClaimReleaseDTO& release) override;
 
   [[nodiscard]] Result<std::uint64_t> RecordRouteSelectionStatus(
       const RequestOwnerEpoch& active_owner_epoch, const RouteSelectionStatusDTO& status) override;
@@ -125,15 +148,14 @@ class SqliteCCLCJournal final : public ICCLCJournal {
 
 /// Verify one exact lifecycle-owner settlement without initializing schema,
 /// acquiring a write transaction, checkpointing, or mutating the journal.
-[[nodiscard]] Result<void> ValidateLifecycleCellAdmissionSettlementReadOnly(
+[[nodiscard]] Result<void> ValidateCCLCCellAdmissionSettlementReadOnly(
     const std::filesystem::path& database_path, const CellId& cell_id,
-    const CellAdmissionClaimDTO& claim,
-    const CellAdmissionClaimReleaseDTO& release);
+    const CellAdmissionClaimDTO& claim, const CellAdmissionClaimReleaseDTO& release);
 
 /// Authorize only an exact active CCLC owner epoch and quiescent durable
 /// lifecycle claim settlements. The reader never performs recovery or repair.
 [[nodiscard]] Result<CellAdmissionReconcileValidationDTO>
-ValidateLifecycleCellAdmissionReconciliationReadOnly(
+ValidateCCLCCellAdmissionReconciliationReadOnly(
     const std::filesystem::path& database_path, const CellId& cell_id,
     const std::vector<CellAdmissionClaimDTO>& held_claims,
     const std::vector<CellAdmissionCurrentOwnerEpochDTO>& current_owner_epochs,

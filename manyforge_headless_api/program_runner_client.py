@@ -72,7 +72,13 @@ class ProgramRunnerPort(Protocol):
         body: Mapping[str, Any],
     ) -> dict[str, Any]: ...
 
-    def resume_motion(self, program_run_id: str, body: Mapping[str, Any]) -> dict[str, Any]: ...
+    def resume_motion(
+        self, program_run_id: str, body: Mapping[str, Any]
+    ) -> dict[str, Any]: ...
+
+    def prepare_manual_handover(
+        self, program_run_id: str, body: Mapping[str, Any]
+    ) -> dict[str, Any]: ...
 
     def discard_full_stop(
         self,
@@ -117,7 +123,9 @@ class ProgramRunnerHttpClient:
             or bool(parsed.query)
             or bool(parsed.fragment)
         ):
-            raise ValueError("Program-runner URL must be absolute credential-free HTTP(S)")
+            raise ValueError(
+                "Program-runner URL must be absolute credential-free HTTP(S)"
+            )
         self._owns_client = client is None
         self._base_url = base_url.rstrip("/")
         self._client = client or httpx.Client(
@@ -289,11 +297,20 @@ class ProgramRunnerHttpClient:
             body=body,
         )
 
-    def resume_motion(self, program_run_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
+    def resume_motion(
+        self, program_run_id: str, body: Mapping[str, Any]
+    ) -> dict[str, Any]:
         return self._request(
             "POST",
             f"{self._run_path(program_run_id)}/motion-resume",
             body=body,
+        )
+
+    def prepare_manual_handover(
+        self, program_run_id: str, body: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST", f"{self._run_path(program_run_id)}/manual-handover", body=body
         )
 
     def full_stop(
@@ -336,7 +353,9 @@ class ProgramRunnerHttpClient:
         return self._request("POST", "/api/program/cycle/reset", body=body)
 
     def runtime_controls(self, program_run_id: str) -> dict[str, Any]:
-        return self._request("GET", f"{self._run_path(program_run_id)}/runtime-controls")
+        return self._request(
+            "GET", f"{self._run_path(program_run_id)}/runtime-controls"
+        )
 
     def runtime_control_action(
         self,

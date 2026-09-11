@@ -55,12 +55,28 @@ class ProgramRunOwnerError(RuntimeError):
     """A Program-run owner request is invalid, stale, or unavailable."""
 
 
+class ProgramRunOwnerStaleRevisionError(ProgramRunOwnerError):
+    """A revision-fenced request was rejected before any owner effect."""
+
+    code = "program_runtime_control_stale"
+
+    def __init__(self, expected: int, current: int) -> None:
+        super().__init__("Program run changed before motion Resume admission")
+        self.details = {
+            "expected_run_revision": expected,
+            "current_run_revision": current,
+        }
+
+
 class ProgramRunOwnerOutcomeUnknownError(ProgramRunOwnerError):
     """An addressed owner effect returned without a trustworthy result."""
 
 
 class ProgramRunOwnerRecoveryIncompleteError(ProgramRunOwnerError):
     """Some cleanup succeeded; the selected hold was not released."""
+
+
+PROGRAM_RESET_STOP_REASON = "operator requested Program cycle Reset"
 
 
 class ProgramRunState(Enum):
@@ -170,7 +186,10 @@ class ProgramRunAdmission:
             != self.owner_identities
             or len({identity.owner_role for identity in self.owner_identities})
             != len(self.owner_identities)
-            or any(identity.owner_role == "program_runner" for identity in self.owner_identities)
+            or any(
+                identity.owner_role == "program_runner"
+                for identity in self.owner_identities
+            )
         ):
             raise ValueError(
                 "admitted owner identities must be unique, role-sorted, and "
@@ -178,7 +197,9 @@ class ProgramRunAdmission:
             )
         if not isinstance(self.program_parameter_values, Mapping):
             raise TypeError("program_parameter_values must be a mapping")
-        if any(not isinstance(key, str) or not key for key in self.program_parameter_values):
+        if any(
+            not isinstance(key, str) or not key for key in self.program_parameter_values
+        ):
             raise ValueError("Program parameter IDs must be non-empty text")
         object.__setattr__(
             self,
@@ -249,7 +270,10 @@ class ProgramRunSnapshot:
             "failure",
         }:
             raise ValueError("tree_status is invalid")
-        if type(self.node_status_revision) is not int or not 1 <= self.node_status_revision:
+        if (
+            type(self.node_status_revision) is not int
+            or not 1 <= self.node_status_revision
+        ):
             raise ValueError("node_status_revision must be positive")
         if (
             not isinstance(self.node_statuses, Mapping)
@@ -269,7 +293,10 @@ class ProgramRunSnapshot:
             raise ValueError("active_operation_count is outside its bound")
         if self.reason_code is not None:
             _text(self.reason_code, field="reason_code", maximum_bytes=256)
-        if not isinstance(self.message, str) or len(self.message.encode("utf-8")) > 4_096:
+        if (
+            not isinstance(self.message, str)
+            or len(self.message.encode("utf-8")) > 4_096
+        ):
             raise ValueError("message must be bounded text")
 
     def to_dict(self) -> dict[str, Any]:
@@ -309,6 +336,7 @@ class _RunEntry:
     state_after_finalize_reason_code: str | None = None
     state_after_finalize_message: str = ""
     resources_released: bool = False
+    reset_containment: ProgramRunScopeSnapshot | None = None
     transition_lock: RLock = field(default_factory=RLock, repr=False)
     motion_stop_lock: RLock = field(default_factory=RLock, repr=False)
 
@@ -430,7 +458,9 @@ class ProgramRunOwner:
             with self._lock:
                 entry = self._entry(program_run_id)
                 if errors:
-                    message = "; ".join(str(error) or type(error).__name__ for error in errors)
+                    message = "; ".join(
+                        str(error) or type(error).__name__ for error in errors
+                    )
                     if (
                         entry.reason_code != "program_run_cleanup_failed"
                         or entry.message != message
@@ -456,7 +486,10 @@ class ProgramRunOwner:
         if not isinstance(admission, ProgramRunAdmission):
             raise TypeError("start requires one exact Program-run admission")
         with self._lock:
-            if len(self._runs) + len(self._starting_run_ids) >= self._maximum_retained_runs:
+            if (
+                len(self._runs) + len(self._starting_run_ids)
+                >= self._maximum_retained_runs
+            ):
                 raise ProgramRunOwnerError("Program-run retention is full")
             admitted_program_run_id = _text(
                 (self._run_id_factory() if program_run_id is None else program_run_id),
@@ -516,7 +549,9 @@ class ProgramRunOwner:
                 run.refresh_operator_stop_scope()
                 entry = _RunEntry(run=run, node_statuses=run.node_statuses)
                 if interventions is not None:
-                    interventions.register_run(admitted_program_run_id, entry.node_statuses.keys())
+                    interventions.register_run(
+                        admitted_program_run_id, entry.node_statuses.keys()
+                    )
                     interventions_bound = True
                 with self._lock:
                     if admitted_program_run_id in self._runs:
@@ -605,7 +640,10 @@ class ProgramRunOwner:
         """Refresh one held Stop assessment only when its offer is read."""
 
         intervention = self.intervention(program_run_id)
-        if intervention is None or intervention.policy_parameter != "operator_stop_policy":
+        if (
+            intervention is None
+            or intervention.policy_parameter != "operator_stop_policy"
+        ):
             return
         try:
             self._refresh_stop_assessment(intervention)
@@ -627,9 +665,12 @@ class ProgramRunOwner:
             task.task_id != intervention.owner_task_id
             or task.state is not OwnerTaskState.INTERRUPTED
             or not isinstance(assessment, Mapping)
-            or assessment.get("recovery_class") not in PROGRAM_MOTION_STOP_RECOVERY_CLASSES
+            or assessment.get("recovery_class")
+            not in PROGRAM_MOTION_STOP_RECOVERY_CLASSES
         ):
-            raise ProgramRunOwnerError("stopped task has no current exact recovery assessment")
+            raise ProgramRunOwnerError(
+                "stopped task has no current exact recovery assessment"
+            )
         port = self._ports.program_interventions
         if port is None:
             raise ProgramRunOwnerError("stopped task lost its intervention registry")
@@ -668,16 +709,23 @@ class ProgramRunOwner:
             if (
                 policy is None
                 or policy.modification_policy["runtime_override"] == "forbidden"
-                or "runtime_override" not in policy.recovery_policy["allowed_recovery_actions"]
+                or "runtime_override"
+                not in policy.recovery_policy["allowed_recovery_actions"]
             ):
-                raise ProgramRunOwnerError("the captured node policy forbids runtime override")
-            intervention = self.intervention(program_run_id, node_attempt_id=node_attempt_id)
+                raise ProgramRunOwnerError(
+                    "the captured node policy forbids runtime override"
+                )
+            intervention = self.intervention(
+                program_run_id, node_attempt_id=node_attempt_id
+            )
             if (
                 intervention is None
                 or intervention.identity.node_instance_id != node_instance_id
                 or intervention.identity.node_attempt_id != node_attempt_id
             ):
-                raise ProgramRunOwnerError("runtime override identifies a stale node attempt")
+                raise ProgramRunOwnerError(
+                    "runtime override identifies a stale node attempt"
+                )
             store = entry.run.runtime_overrides
         try:
             return store.validate(node_instance_id, parameter_id, value)
@@ -702,7 +750,9 @@ class ProgramRunOwner:
         )
         with self._lock:
             entry = self._entry(program_run_id)
-            entry.run.runtime_overrides.activate(node_instance_id, parameter_id, validated)
+            entry.run.runtime_overrides.activate(
+                node_instance_id, parameter_id, validated
+            )
             entry.revision += 1
             return self._snapshot(entry)
 
@@ -720,7 +770,9 @@ class ProgramRunOwner:
                 or policy.recovery_policy["persistence_ceiling"] != "draft_patch"
                 or policy.modification_policy["persistent_edit"] == "forbidden"
             ):
-                raise ProgramRunOwnerError("captured node policy forbids Draft promotion")
+                raise ProgramRunOwnerError(
+                    "captured node policy forbids Draft promotion"
+                )
             store = entry.run.runtime_overrides
         try:
             return store.node_id(node_instance_id)
@@ -806,8 +858,13 @@ class ProgramRunOwner:
             entry = self._entry(program_run_id)
             if entry.state is not ProgramRunState.INTERVENTION_REQUIRED:
                 raise ProgramRunOwnerError("Program recovery is not current")
-            intervention = self.intervention(program_run_id, node_attempt_id=node_attempt_id)
-            if intervention is None or intervention.identity.node_attempt_id != node_attempt_id:
+            intervention = self.intervention(
+                program_run_id, node_attempt_id=node_attempt_id
+            )
+            if (
+                intervention is None
+                or intervention.identity.node_attempt_id != node_attempt_id
+            ):
                 raise ProgramRunOwnerError("Program recovery attempt is stale")
             port.resolve(intervention.identity, action=action, result=result)
             entry.state = ProgramRunState.RUNNING
@@ -829,7 +886,9 @@ class ProgramRunOwner:
 
         with self._lock:
             entry = self._entry(program_run_id)
-            intervention = self.intervention(program_run_id, node_attempt_id=node_attempt_id)
+            intervention = self.intervention(
+                program_run_id, node_attempt_id=node_attempt_id
+            )
             if (
                 entry.state is not ProgramRunState.INTERVENTION_REQUIRED
                 or intervention is None
@@ -841,11 +900,15 @@ class ProgramRunOwner:
             port = getattr(self._ports, intervention.owner_port_name, None)
             recover = getattr(port, "recover", None)
             if not callable(recover):
-                raise ProgramRunOwnerError("held task owner does not expose addressed recovery")
+                raise ProgramRunOwnerError(
+                    "held task owner does not expose addressed recovery"
+                )
             task_id = intervention.owner_task_id
             identity = intervention.identity
             if identity.node_instance_id in entry.run.operator_stop_scope().held_nodes:
-                raise ProgramRunOwnerError("a selected Stop requires selected-batch Resume")
+                raise ProgramRunOwnerError(
+                    "a selected Stop requires selected-batch Resume"
+                )
         result = recover(
             task_id,
             identity,
@@ -854,7 +917,9 @@ class ProgramRunOwner:
             reason=reason,
         )
         if not isinstance(result, Mapping) or type(result.get("accepted")) is not bool:
-            raise ProgramRunOwnerOutcomeUnknownError("owner recovery returned an invalid result")
+            raise ProgramRunOwnerOutcomeUnknownError(
+                "owner recovery returned an invalid result"
+            )
         assessment = result.get("resulting_assessment")
         if isinstance(assessment, Mapping):
             port = self._ports.program_interventions
@@ -1050,7 +1115,7 @@ class ProgramRunOwner:
         self,
         program_run_id: str,
         *,
-        group_id: str = "all",
+        group_id: str | list[str] = "all",
         reason: str | None = None,
         stop_request_id: str | None = None,
     ) -> ProgramRunSnapshot:
@@ -1068,29 +1133,32 @@ class ProgramRunOwner:
                     ProgramRunState.RUNNING,
                     ProgramRunState.INTERVENTION_REQUIRED,
                 }:
-                    raise ProgramRunOwnerError("motion Stop requires a current running Program")
+                    raise ProgramRunOwnerError(
+                        "motion Stop requires a current running Program"
+                    )
                 run = entry.run
             stop_identity = stop_request_id or f"owner-motion-stop:{uuid4().hex}"
             try:
                 accepted = self._scope.stop_selection(
                     run.execution_selection_request(group_id, stop_identity)
                 )
-                # Acceptance already contains the authoritative holds, even
-                # with no task yet. Never wait for an interrupted leaf or an
-                # ordinary scope read to publish them to the scheduler.
-                run.publish_operator_stop_scope(accepted["state"])
             except Exception as exc:
                 raise ProgramRunOwnerOutcomeUnknownError(
                     str(exc) or "Kernel motion Stop outcome is unknown"
                 ) from exc
-            if accepted.get("selection_error") is not None:
-                raise ProgramRunOwnerOutcomeUnknownError(
-                    "Kernel conservatively contained an invalid selection: "
-                    + str(accepted["selection_error"])
-                )
             with self._lock:
+                # Publish the accepted holds and their Run revision together.
+                # This short local lock never waits for tree work or owner I/O.
+                try:
+                    run.publish_operator_stop_scope(
+                        accepted["state"], notify_observation=False
+                    )
+                except Exception as exc:
+                    raise ProgramRunOwnerOutcomeUnknownError(
+                        str(exc) or "Kernel motion Stop projection is unknown"
+                    ) from exc
                 entry = self._entry(program_run_id)
-                if entry.state not in {
+                if entry.run is not run or entry.state not in {
                     ProgramRunState.RUNNING,
                     ProgramRunState.INTERVENTION_REQUIRED,
                 }:
@@ -1099,6 +1167,11 @@ class ProgramRunOwner:
                     )
                 entry.active_operation_count = None
                 entry.revision += 1
+                if accepted.get("selection_error") is not None:
+                    raise ProgramRunOwnerOutcomeUnknownError(
+                        "Kernel conservatively contained an invalid selection: "
+                        + str(accepted["selection_error"])
+                    )
                 # The existing tick host schedules settlement. No tree/owner
                 # read may extend this command or retain Stop serialization.
                 return self._snapshot(entry)
@@ -1124,7 +1197,9 @@ class ProgramRunOwner:
         interventions = self._ports.program_interventions
         batch = []
         current = (
-            () if interventions is None else interventions.read_all(run.capture.program_run_id)
+            ()
+            if interventions is None
+            else interventions.read_all(run.capture.program_run_id)
         )
         for item in current:
             node_id = item.identity.node_instance_id
@@ -1160,6 +1235,11 @@ class ProgramRunOwner:
         return tuple(batch), blocked
 
     def execution_selection_controls(self, program_run_id: str) -> dict[str, Any]:
+        return self.read_selection_controls(program_run_id)[1]
+
+    def read_selection_controls(
+        self, program_run_id: str
+    ) -> tuple[ProgramRunSnapshot, dict[str, Any]]:
         """Derive one bounded control projection; no per-group state is retained."""
         with self._lock:
             entry = self._entry(program_run_id)
@@ -1167,20 +1247,27 @@ class ProgramRunOwner:
         with transition_lock:
             with self._lock:
                 current = self._entry(program_run_id)
+                live = self._snapshot(current)
                 eligible = current.run is run and current.state in {
                     ProgramRunState.RUNNING,
                     ProgramRunState.INTERVENTION_REQUIRED,
                 }
-            snapshot = run.operator_stop_scope()
+                snapshot = run.operator_stop_scope()
             held = snapshot.held_nodes
             stopping, faulted = snapshot.stopping_nodes, snapshot.faulted_nodes
-            unavailable = run.stop_observation_error if eligible else "program_run_not_running"
+            unavailable = (
+                run.stop_observation_error if eligible else "program_run_not_running"
+            )
             blocked = {}
             if eligible and held:
                 try:
-                    _batch, blocked = self._selection_recovery_candidates(run, held, settle=False)
+                    _batch, blocked = self._selection_recovery_candidates(
+                        run, held, settle=False
+                    )
                     if run.operator_stop_scope() != snapshot:
-                        raise ProgramRunOwnerError("selection changed during projection")
+                        raise ProgramRunOwnerError(
+                            "selection changed during projection"
+                        )
                 except Exception:
                     unavailable = "program_selection_observation_unavailable"
             groups = []
@@ -1216,18 +1303,86 @@ class ProgramRunOwner:
                         "resume_unavailable_reason": reason,
                     }
                 )
-            return {"selection_revision": snapshot.selection_revision, "groups": groups}
+            return live, {
+                "selection_revision": snapshot.selection_revision,
+                "groups": groups,
+            }
 
     def resume_motion(
         self,
         program_run_id: str,
         *,
+        expected_run_revision: int,
         expected_selection_revision: int,
         request_id: str,
-        group_id: str = "all",
+        group_id: str | list[str] = "all",
         reason: str | None = None,
     ) -> ProgramRunSnapshot:
-        """Recover one frozen selected batch, then release its Kernel hold.
+        """Recover one frozen selected batch, then release its Kernel hold."""
+        return self._recover_motion_selection(
+            program_run_id,
+            expected_run_revision=expected_run_revision,
+            expected_selection_revision=expected_selection_revision,
+            request_id=request_id,
+            group_id=group_id,
+            reason=reason,
+        )
+
+    def prepare_manual_handover(
+        self,
+        program_run_id: str,
+        *,
+        node_indices: tuple[int, ...],
+        expected_run_revision: int,
+        expected_selection_revision: int,
+        request_id: str,
+        reason: str | None = None,
+    ) -> ProgramRunSnapshot:
+        """Retire selected stopped attempts without releasing any Program hold.
+
+        The caller supplies the Kernel-derived conflicting producer indices. This
+        is cleanup only: Kernel manual admission must independently recheck the
+        current hold, owners and resources. No manual or Program motion starts.
+        """
+        if (
+            not isinstance(node_indices, tuple)
+            or not node_indices
+            or len(node_indices) > 100_000
+            or any(type(index) is not int or index < 0 for index in node_indices)
+            or any(left >= right for left, right in zip(node_indices, node_indices[1:]))
+        ):
+            raise ProgramRunOwnerError(
+                "manual handover requires canonical Program node indices"
+            )
+        with self._lock:
+            try:
+                node_ids = self._entry(program_run_id).run.scope_node_ids(node_indices)
+            except IndexError as error:
+                raise ProgramRunOwnerError(
+                    "manual handover index is outside its captured Program"
+                ) from error
+        return self._recover_motion_selection(
+            program_run_id,
+            expected_run_revision=expected_run_revision,
+            expected_selection_revision=expected_selection_revision,
+            request_id=request_id,
+            group_id="all",
+            reason=reason,
+            held_nodes=node_ids,
+        )
+
+    def _recover_motion_selection(
+        self,
+        program_run_id: str,
+        *,
+        expected_run_revision: int,
+        expected_selection_revision: int,
+        request_id: str,
+        group_id: str | list[str],
+        reason: str | None,
+        held_nodes: frozenset[str] | None = None,
+    ) -> ProgramRunSnapshot:
+        """Use the same exact cleanup for Resume and held-cycle handover.
 
         Cleanup can retire old effects but cannot start new motion. Scheduling
         stays held until the single revision-fenced release succeeds. A newer
@@ -1239,13 +1394,28 @@ class ProgramRunOwner:
         with transition_lock:
             with self._lock:
                 entry = self._entry(program_run_id)
+                if (
+                    type(expected_run_revision) is not int
+                    or entry.revision != expected_run_revision
+                ):
+                    raise ProgramRunOwnerStaleRevisionError(
+                        expected_run_revision, entry.revision
+                    )
                 if entry.state not in {
                     ProgramRunState.RUNNING,
                     ProgramRunState.INTERVENTION_REQUIRED,
                 }:
-                    raise ProgramRunOwnerError("motion Resume requires a current running Program")
+                    raise ProgramRunOwnerError(
+                        "motion Resume requires a current running Program"
+                    )
                 run, run_revision = entry.run, entry.revision
             selected = run.execution_selection(group_id)
+            if held_nodes is not None:
+                if not held_nodes <= selected:
+                    raise ProgramRunOwnerError(
+                        "manual handover names unknown Program nodes"
+                    )
+                selected = held_nodes
             scope = run.read_operator_stop_scope()
             if (
                 type(expected_selection_revision) is not int
@@ -1256,7 +1426,10 @@ class ProgramRunOwner:
                 (*scope["stopping_node_indices"], *scope["faulted_node_indices"])
             ):
                 raise ProgramRunOwnerError("selected work is still stopping or faulted")
-            selected &= run.scope_node_ids(scope["held_node_indices"])
+            held = run.scope_node_ids(scope["held_node_indices"])
+            if held_nodes is not None and not selected <= held:
+                raise ProgramRunOwnerError("manual handover producers are not all held")
+            selected &= held
             if not selected:
                 raise ProgramRunOwnerError("selected scope is not held")
             interventions = self._ports.program_interventions
@@ -1273,11 +1446,16 @@ class ProgramRunOwner:
                         action="replan_from_stopped_state",
                         request_id="selection-resume:"
                         + sha256(
-                            (request_id + ":" + item.identity.node_attempt_id).encode("utf-8")
+                            (request_id + ":" + item.identity.node_attempt_id).encode(
+                                "utf-8"
+                            )
                         ).hexdigest(),
                         reason=reason,
                     )
-                    if not isinstance(result, Mapping) or type(result.get("accepted")) is not bool:
+                    if (
+                        not isinstance(result, Mapping)
+                        or type(result.get("accepted")) is not bool
+                    ):
                         raise ProgramRunOwnerOutcomeUnknownError(
                             "selected owner recovery outcome is unknown"
                         )
@@ -1301,22 +1479,42 @@ class ProgramRunOwner:
                         raise ProgramRunOwnerError(
                             "Program changed during selected recovery; holds remain"
                         )
-                try:
-                    released = self._scope.release_selection(
-                        run.execution_selection_request(group_id, request_id),
-                        expected_selection_revision,
-                    )
-                    run.publish_operator_stop_scope(
-                        released,
-                        expected_revision=expected_selection_revision + 1,
-                        released_nodes=selected,
-                    )
-                except ProgramSelectionReleaseRejectedError as error:
-                    raise ProgramRunOwnerError(str(error)) from error
-                except Exception as error:
-                    raise ProgramRunOwnerOutcomeUnknownError(
-                        f"selected release outcome is unconfirmed: {error}"
-                    ) from error
+                if held_nodes is not None:
+                    current_scope = run.read_operator_stop_scope()
+                    if (
+                        current_scope["selection_revision"]
+                        != expected_selection_revision
+                        or not selected
+                        <= run.scope_node_ids(current_scope["held_node_indices"])
+                        or selected
+                        & run.scope_node_ids(
+                            (
+                                *current_scope["stopping_node_indices"],
+                                *current_scope["faulted_node_indices"],
+                            )
+                        )
+                    ):
+                        raise ProgramRunOwnerError(
+                            "Program hold changed during manual handover"
+                        )
+                else:
+                    try:
+                        released = self._scope.release_selection(
+                            run.execution_selection_request(group_id, request_id),
+                            expected_selection_revision,
+                        )
+                        run.publish_operator_stop_scope(
+                            released,
+                            expected_revision=expected_selection_revision + 1,
+                            released_nodes=selected,
+                            notify_observation=False,
+                        )
+                    except ProgramSelectionReleaseRejectedError as error:
+                        raise ProgramRunOwnerError(str(error)) from error
+                    except Exception as error:
+                        raise ProgramRunOwnerOutcomeUnknownError(
+                            f"selected release outcome is unconfirmed: {error}"
+                        ) from error
             except ProgramRunOwnerOutcomeUnknownError:
                 raise
             except ProgramRunOwnerError as error:
@@ -1338,14 +1536,18 @@ class ProgramRunOwner:
                         # intervention latched. Holds remain in the last exact
                         # view until a current owner result proves release.
                         remaining = (
-                            None if interventions is None else interventions.read(program_run_id)
+                            None
+                            if interventions is None
+                            else interventions.read(program_run_id)
                         )
                         entry.state = (
                             ProgramRunState.INTERVENTION_REQUIRED
                             if remaining is not None
                             else ProgramRunState.RUNNING
                         )
-                        entry.reason_code = None if remaining is None else remaining.reason_code
+                        entry.reason_code = (
+                            None if remaining is None else remaining.reason_code
+                        )
                         entry.message = "" if remaining is None else remaining.message
                         entry.revision += 1
             return self.read(program_run_id)
@@ -1439,7 +1641,9 @@ class ProgramRunOwner:
                     entry.reason_code = None
                     entry.message = ""
                 elif entry.state is not ProgramRunState.FULL_STOPPING:
-                    raise ProgramRunOwnerError("Full Stop requires a current Program run")
+                    raise ProgramRunOwnerError(
+                        "Full Stop requires a current Program run"
+                    )
                 entry.revision += 1
                 request_revision = entry.revision
             # This is an explicit command, not passive reconciliation. Let
@@ -1450,7 +1654,9 @@ class ProgramRunOwner:
                     stop_request_id or f"owner-full-stop:{uuid4().hex}",
                     reason,
                 )
-                active_count, _settled, scope_reason = self._scope_fields(scope, program_run_id)
+                active_count, _settled, scope_reason = self._scope_fields(
+                    scope, program_run_id
+                )
             except Exception as error:
                 with self._lock:
                     entry = self._entry(program_run_id)
@@ -1484,7 +1690,9 @@ class ProgramRunOwner:
                 captured_revision = entry.revision
             try:
                 scope = self._scope.observe(program_run_id)
-                active_count, settled, scope_reason = self._scope_fields(scope, program_run_id)
+                active_count, settled, scope_reason = self._scope_fields(
+                    scope, program_run_id
+                )
             except Exception as error:
                 with self._lock:
                     entry = self._entry(program_run_id)
@@ -1504,7 +1712,9 @@ class ProgramRunOwner:
                     entry.message = "Kernel Program-run scope is unknown"
                     settled = False
             return (
-                self._complete_full_stop(program_run_id, expected_revision=captured_revision)
+                self._complete_full_stop(
+                    program_run_id, expected_revision=captured_revision
+                )
                 if settled
                 else self.read(program_run_id)
             )
@@ -1547,7 +1757,11 @@ class ProgramRunOwner:
                     raise ProgramRunOwnerError(
                         "preserved Full Stop work has no fresh-state recovery"
                     )
-                intervention = None if interventions is None else interventions.read(program_run_id)
+                intervention = (
+                    None
+                    if interventions is None
+                    else interventions.read(program_run_id)
+                )
                 if held == 0:
                     if intervention is not None:
                         raise ProgramRunOwnerOutcomeUnknownError(
@@ -1582,7 +1796,10 @@ class ProgramRunOwner:
                     request_id=recovery_request_id,
                     reason=reason,
                 )
-                if not isinstance(result, Mapping) or type(result.get("accepted")) is not bool:
+                if (
+                    not isinstance(result, Mapping)
+                    or type(result.get("accepted")) is not bool
+                ):
                     raise ProgramRunOwnerOutcomeUnknownError(
                         "Full Stop owner recovery returned an invalid result"
                     )
@@ -1590,7 +1807,8 @@ class ProgramRunOwner:
                     error = result.get("error")
                     message = (
                         error.get("message")
-                        if isinstance(error, Mapping) and isinstance(error.get("message"), str)
+                        if isinstance(error, Mapping)
+                        and isinstance(error.get("message"), str)
                         else "fresh current-state recovery was rejected"
                     )
                     raise ProgramRunOwnerError(message)
@@ -1622,7 +1840,9 @@ class ProgramRunOwner:
                 if expected_stop is not None
                 else self._scope.observe(program_run_id)
             )
-            active_count, settled, scope_reason = self._scope_fields(released, program_run_id)
+            active_count, settled, scope_reason = self._scope_fields(
+                released, program_run_id
+            )
             if not settled or scope_reason is not None:
                 raise ProgramRunOwnerOutcomeUnknownError(
                     scope_reason or "Full Stop handoff did not release"
@@ -1645,11 +1865,84 @@ class ProgramRunOwner:
                 entry.revision += 1
                 return self._snapshot(entry)
 
+    def begin_reset_containment(
+        self, program_run_id: str, *, stop_request_id: str
+    ) -> ProgramRunSnapshot:
+        """Close a terminal Run's Kernel scope without changing its history."""
+        with self._lock:
+            transition_lock = self._entry(program_run_id).transition_lock
+        with transition_lock:
+            with self._lock:
+                entry = self._entry(program_run_id)
+                if entry.state not in {
+                    ProgramRunState.STOPPED,
+                    ProgramRunState.SUCCEEDED,
+                    ProgramRunState.FAILED,
+                }:
+                    raise ProgramRunOwnerError(
+                        "Reset containment requires a terminal Run"
+                    )
+                entry.reset_containment = None
+            try:
+                scope = self._scope.request_stop(
+                    program_run_id, stop_request_id, PROGRAM_RESET_STOP_REASON
+                )
+                self._scope_fields(scope, program_run_id)
+            except Exception as error:
+                with self._lock:
+                    entry.reset_containment = ProgramRunScopeSnapshot(
+                        program_run_id,
+                        ProgramRunScopeState.UNKNOWN,
+                        None,
+                        "reset_containment_outcome_unknown",
+                    )
+                raise ProgramRunOwnerOutcomeUnknownError(
+                    "Reset containment outcome is unknown"
+                ) from error
+            with self._lock:
+                entry.reset_containment = scope
+                return self._snapshot(entry)
+
+    def reset_containment_pending(self, program_run_id: str) -> bool:
+        """Scheduling only: do not read an external owner here."""
+        with self._lock:
+            scope = self._entry(program_run_id).reset_containment
+            return scope is not None and scope.state is ProgramRunScopeState.ACTIVE
+
+    def reset_containment_settled(self, program_run_id: str) -> bool:
+        with self._lock:
+            scope = self._entry(program_run_id).reset_containment
+        if scope is None:
+            raise ProgramRunOwnerError("Reset containment has not been requested")
+        if scope.state is ProgramRunScopeState.UNKNOWN:
+            raise ProgramRunOwnerOutcomeUnknownError(
+                scope.reason_code or "Reset containment outcome is unknown"
+            )
+        return scope.state is ProgramRunScopeState.SETTLED
+
+    def _observe_reset_containment(self, program_run_id: str) -> ProgramRunSnapshot:
+        try:
+            scope = self._scope.observe(program_run_id)
+            self._scope_fields(scope, program_run_id)
+        except Exception as error:
+            scope = ProgramRunScopeSnapshot(
+                program_run_id,
+                ProgramRunScopeState.UNKNOWN,
+                None,
+                (str(error) or type(error).__name__)[:256],
+            )
+        with self._lock:
+            entry = self._entry(program_run_id)
+            entry.reset_containment = scope
+            return self._snapshot(entry)
+
     def _reset_scope_effects(self, program_run_id: str) -> None:
         snapshot = self._scope.reset(program_run_id)
         _active_count, settled, reason = self._scope_fields(snapshot, program_run_id)
         if not settled:
-            raise ProgramRunOwnerError(reason or "Kernel Program-run scope did not reset")
+            raise ProgramRunOwnerError(
+                reason or "Kernel Program-run scope did not reset"
+            )
 
     def reset_retained_effects(self, program_run_id: str) -> None:
         """Reset a durably terminal run after its resident tree owner rotated."""
@@ -1702,7 +1995,9 @@ class ProgramRunOwner:
                     ProgramRunState.SUCCEEDED,
                     ProgramRunState.FAILED,
                 }:
-                    raise ProgramRunOwnerError("only a terminal Program run can be forgotten")
+                    raise ProgramRunOwnerError(
+                        "only a terminal Program run can be forgotten"
+                    )
                 if not entry.resources_released:
                     raise ProgramRunOwnerError("Program-run resources are not released")
                 self._runs.pop(program_run_id)
@@ -1757,6 +2052,14 @@ class ProgramRunOwner:
             entry = self._entry(program_run_id)
             transition_lock = entry.transition_lock
         with transition_lock:
+            if (
+                entry.reset_containment is not None
+                and entry.reset_containment.state is ProgramRunScopeState.ACTIVE
+            ):
+                # A finished tree must not tick again merely because Reset
+                # awaits an asynchronous Kernel certificate. Its immutable
+                # terminal snapshot and revisions remain unchanged.
+                return self._observe_reset_containment(program_run_id)
             observe_only = False
             with self._lock:
                 entry = self._entry(program_run_id)
@@ -1961,7 +2264,9 @@ def build_program_run_admission(
     assistant_mode = selection["assistant_mode"]
     assistant_projection = selection.get("assistant_projection")
     if assistant_projection is not None and not isinstance(assistant_projection, dict):
-        raise ProgramRunOwnerError("scenario assistant projection must be null or an object")
+        raise ProgramRunOwnerError(
+            "scenario assistant projection must be null or an object"
+        )
     if assistant_mode == "required" and assistant_projection is None:
         raise ProgramRunOwnerError("scenario requires an absent assistant projection")
     if assistant_mode == "forbidden" and assistant_projection is not None:
@@ -2016,7 +2321,9 @@ def build_program_run_admission(
         "catalog_digest",
         "environment_digest",
     }:
-        raise ProgramRunOwnerError("scenario Program Binding has an invalid node environment")
+        raise ProgramRunOwnerError(
+            "scenario Program Binding has an invalid node environment"
+        )
     if (
         binding_environment.get("catalog_id") != environment.manifest.catalog_id
         or binding_environment.get("content_version")
@@ -2035,7 +2342,9 @@ def build_program_run_admission(
         or binding_value.get("graph_revision") != graph_revision
         or binding_environment.get("environment_digest") != node_environment_digest
     ):
-        raise ProgramRunOwnerError("scenario Program, binding, and retained identities disagree")
+        raise ProgramRunOwnerError(
+            "scenario Program, binding, and retained identities disagree"
+        )
 
     raw_owner_identities = selection.get("owner_identities")
     if not isinstance(raw_owner_identities, list):
@@ -2047,7 +2356,9 @@ def build_program_run_admission(
             "owner_id",
             "owner_epoch",
         }:
-            raise ProgramRunOwnerError("scenario selection has a malformed owner identity")
+            raise ProgramRunOwnerError(
+                "scenario selection has a malformed owner identity"
+            )
         parsed_owner_identities.append(
             ProgramRunOwnerIdentity(
                 owner_role=raw_identity["owner_role"],
@@ -2062,7 +2373,9 @@ def build_program_run_admission(
     owner_identities = tuple(
         sorted(parsed_owner_identities, key=lambda identity: identity.owner_role)
     )
-    if len({identity.owner_role for identity in owner_identities}) != len(owner_identities):
+    if len({identity.owner_role for identity in owner_identities}) != len(
+        owner_identities
+    ):
         raise ProgramRunOwnerError("scenario selection repeats an owner role")
 
     resolver = build_executable_node_resolver(environment)
@@ -2074,13 +2387,17 @@ def build_program_run_admission(
     if (
         not isinstance(owner_availability, Mapping)
         or set(owner_availability) != expected_ports
-        or any(not isinstance(fact, AvailabilityFact) for fact in owner_availability.values())
+        or any(
+            not isinstance(fact, AvailabilityFact)
+            for fact in owner_availability.values()
+        )
     ):
         raise ProgramRunOwnerError("Program owner availability facts are not exact")
     readiness = NodeExecutionReadiness(
         program_binding_id=program_binding_id,
         binding_by_node={
-            disposition.row.node_id: AvailabilityFact(True) for disposition in resolver.dispositions
+            disposition.row.node_id: AvailabilityFact(True)
+            for disposition in resolver.dispositions
         },
         owner_by_port=owner_availability,
     )
@@ -2142,7 +2459,9 @@ def build_applied_program_run_admission(
         raise ProgramRunOwnerError("Applied Program selection has wrong fields")
     if applied.get("schema_version") != APPLIED_PROGRAM_SELECTION_API:
         raise ProgramRunOwnerError("Applied Program selection version is unsupported")
-    _digest(applied.get("baseline_program_binding_id"), field="baseline_program_binding_id")
+    _digest(
+        applied.get("baseline_program_binding_id"), field="baseline_program_binding_id"
+    )
     _digest(applied.get("preparation_digest"), field="preparation_digest")
     source = applied.get("source")
     if not isinstance(source, Mapping):
@@ -2163,13 +2482,19 @@ def build_applied_program_run_admission(
         "typed_parameter_overrides",
     ):
         if live_scenario_selection.get(field_name) != applied.get(field_name):
-            raise ProgramRunOwnerError("Applied Program and live scenario occurrence disagree")
+            raise ProgramRunOwnerError(
+                "Applied Program and live scenario occurrence disagree"
+            )
     owner_identities = live_scenario_selection.get("owner_identities")
     if not isinstance(owner_identities, list):
-        raise ProgramRunOwnerError("live scenario selection has no exact owner identities")
+        raise ProgramRunOwnerError(
+            "live scenario selection has no exact owner identities"
+        )
     normalized_selection = {
         "applied_record_digest": source["record_digest"],
-        "assistant_projection": deepcopy(live_scenario_selection.get("assistant_projection")),
+        "assistant_projection": deepcopy(
+            live_scenario_selection.get("assistant_projection")
+        ),
         "assistant_mode": applied["assistant_mode"],
         "deployment_artifact_id": applied["deployment_artifact_id"],
         "deployment_revision": applied["deployment_revision"],

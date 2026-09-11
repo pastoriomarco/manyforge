@@ -632,6 +632,17 @@ void write_trajectory(Encoder& encoder, const core::TrajectoryDTO& value) {
         write_double_vector(out, waypoint.velocities_rad_s);
         write_double_vector(out, waypoint.accelerations_rad_s2);
       });
+  encoder.optional(value.runtime_scale_bounds,
+                   [](Encoder &out, const auto &bounds) {
+                     out.floating(bounds.max_rate_per_s);
+                     out.floating(bounds.max_rate_change_per_s2);
+                     out.floating(bounds.max_stop_path_rate);
+                     out.optional(bounds.nominal_time_multiplier,
+                                  [](Encoder& nested, double multiplier) {
+                                    nested.floating(multiplier);
+                                  });
+                   });
+  write_double_vector(encoder, value.cartesian_waypoint_times_s);
 }
 
 [[nodiscard]] core::TrajectoryDTO read_trajectory(Decoder& decoder) {
@@ -644,6 +655,16 @@ void write_trajectory(Encoder& encoder, const core::TrajectoryDTO& value) {
             input.floating(), read_double_vector(input),
             read_double_vector(input), read_double_vector(input)};
       });
+  value.runtime_scale_bounds =
+      decoder.optional<core::TrajectoryRuntimeScaleBoundsDTO>(
+          [](Decoder &input) {
+            return core::TrajectoryRuntimeScaleBoundsDTO{input.floating(),
+                                                         input.floating(), input.floating(),
+                                                         input.optional<double>([](Decoder& nested) {
+                                                           return nested.floating();
+                                                         })};
+          });
+  value.cartesian_waypoint_times_s = read_double_vector(decoder);
   return value;
 }
 

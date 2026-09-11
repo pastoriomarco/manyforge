@@ -17,6 +17,7 @@ import {
   parseManagerGraphProjection,
   parseManagerStatusProjection,
   parseMotionPreviewResponse,
+  parseManualControlAvailability,
   parseNodeEnvironmentResponse,
   parseObjectResponse,
   parseProgramWorkspaceResponse,
@@ -50,7 +51,7 @@ import type {
   ManagerDeploymentCandidatePreviewResponse,
   DraftFenceRequest,
   DraftMutationResponse,
-  DeploymentControlledStopProfile,
+  DeploymentControlledStopUpdate,
   DeploymentCandidateOperationResponse,
   DeploymentWorkspaceResponse,
   FileBrowserResponse,
@@ -85,6 +86,7 @@ import type {
   DirectControlOperationIntent,
   ExecutionIdentity,
   MotionPreviewReceipt,
+  ManualControlAvailability,
 } from '../types/robotControl';
 import type {
   AssistantModeIndex,
@@ -586,7 +588,7 @@ export const api = {
     ),
     updateControlledStop: (
       fence: DraftFenceRequest,
-      profile: DeploymentControlledStopProfile,
+      update: DeploymentControlledStopUpdate,
       signal?: AbortSignal,
     ): Promise<DeploymentWorkspaceResponse> => requestJson(
       '/api/deployment/draft/controlled-stop',
@@ -594,7 +596,7 @@ export const api = {
       signal,
       {
         method: 'POST',
-        body: JSON.stringify({ ...fence, profile }),
+        body: JSON.stringify({ ...fence, ...update }),
       },
     ),
     updateMotionTargetLimit: (
@@ -840,6 +842,22 @@ export const api = {
         parseExecutionIdentity,
         signal,
       ),
+    manualAvailability: (
+      intent: DirectControlOperationIntent,
+      signal?: AbortSignal,
+    ): Promise<ManualControlAvailability> => requestJson(
+      '/api/execution/manual-handover',
+      (value) => {
+        const result = parseManualControlAvailability(value);
+        if (result.requestId !== intent.request_context.request_id
+          || result.requestOwnerEpoch !== intent.request_context.request_owner_epoch) {
+          throw new Error('Manual availability does not match the requested owner and target query.');
+        }
+        return result;
+      },
+      signal,
+      { method: 'POST', body: JSON.stringify(intent) },
+    ),
     previewMotion: (
       intent: DirectControlOperationIntent,
       signal?: AbortSignal,

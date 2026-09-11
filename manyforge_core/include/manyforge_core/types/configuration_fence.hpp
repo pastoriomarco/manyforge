@@ -739,6 +739,8 @@ struct ApplyFenceRehydrateDTO final {
            persisted_configuration_fence_generation.nonzero() && persisted_scope.valid() &&
            !last_durable_phase.empty() && !manager_runtime_epoch.empty();
   }
+
+  friend bool operator==(const ApplyFenceRehydrateDTO&, const ApplyFenceRehydrateDTO&) = default;
 };
 
 enum class ApplyFenceReconcileState {

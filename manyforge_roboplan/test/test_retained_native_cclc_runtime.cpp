@@ -1039,8 +1039,7 @@ private:
                  trajectory.waypoints.back().time_from_start_s,
                  std::vector<double>(trajectory.joint_names.size(), 0.5),
                  std::vector<double>(trajectory.joint_names.size(), 0.0), 0.1}},
-         world,
-         CollisionPolicyRevision{1U, Sha('d')}, decision},
+         world, CollisionPolicyRevision{1U, Sha('d')}, decision},
         std::move(contact_policy),
         {authority.runtime_policy.value().source_artifact,
          authority.runtime_policy.value().selected_motion_speed_limit},
@@ -1499,10 +1498,12 @@ TEST(RetainedNativeCCLCRuntime,
       catalogs, {{occurrence, brand_port}}, {runtime.binding}, kernel_ports,
       kernel_ports, kernel_ports, publication_owner, clock, scheduler);
   ASSERT_TRUE(composition.ok()) << composition.error().message;
+  const auto current_request_owner =
+      composition.value()->coordinator().request_owner_epoch();
 
   core::ComponentLifecycleIntentDTO prepare{
-      {core::RequestId("prepare.native.readiness"), owner, "test",
-       std::nullopt},
+      {core::RequestId("prepare.native.readiness"), current_request_owner,
+       "test", std::nullopt},
       runtime.component->controllable_component_id,
       core::ComponentLifecycleIntentKindDTO::kPrepare,
       bundle->value().cell_graph.graph_revision,
@@ -1511,6 +1512,8 @@ TEST(RetainedNativeCCLCRuntime,
       std::nullopt,
       {core::RequestTransportDTO::kInternal,
        core::RequestAssuranceDTO::kUnverified, std::nullopt}};
+  prepare.expected_admission_generation =
+      kernel_ports.GetAuthoringAdmission().admission_generation;
   const auto lifecycle =
       composition.value()->coordinator().SubmitLifecycle(prepare);
   ASSERT_TRUE(lifecycle.ok()) << lifecycle.error().message;
@@ -1531,7 +1534,8 @@ TEST(RetainedNativeCCLCRuntime,
   EXPECT_EQ(brand_port->dispatch_count(), 1U);
 
   core::RouteSelectionIntentDTO route{
-      {core::RequestId("route.native.readiness"), owner, "test", std::nullopt},
+      {core::RequestId("route.native.readiness"), current_request_owner, "test",
+       std::nullopt},
       bundle->retained_bundle_id(),
       bundle->value().cell_graph.graph_revision,
       *runtime.desired,
@@ -1541,7 +1545,8 @@ TEST(RetainedNativeCCLCRuntime,
         lifecycle_status.value()->acceptance.component_lifecycle_generation,
         core::ComponentLifecycleStateDTO::kPrepared}},
       {core::RequestTransportDTO::kInternal,
-       core::RequestAssuranceDTO::kUnverified, std::nullopt}};
+       core::RequestAssuranceDTO::kUnverified, std::nullopt},
+      kernel_ports.GetAuthoringAdmission().admission_generation};
   const auto route_result =
       composition.value()->coordinator().SubmitRouteSelection(route);
   ASSERT_TRUE(route_result.ok()) << route_result.error().message;

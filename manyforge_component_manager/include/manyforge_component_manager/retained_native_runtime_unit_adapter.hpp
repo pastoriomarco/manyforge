@@ -89,6 +89,8 @@ public:
   EnsureRunning(const RuntimeUnitConvergenceQueryDTO &query) override;
   [[nodiscard]] ProcessPresenceObservation
   EnsureStopped(const RuntimeUnitConvergenceQueryDTO &query) override;
+  [[nodiscard]] std::optional<manyforge::core::ManagedRuntimeWithdrawalDTO>
+  ReadPredecessorWithdrawal(const RuntimeUnitConvergenceQueryDTO &query) override;
   [[nodiscard]] std::optional<RuntimeUnitSourceReport>
   ObserveProgress(const RuntimeUnitConvergenceQueryDTO &query,
                   const manyforge::core::RuntimeEpoch &runtime_epoch) override;

@@ -4,6 +4,7 @@ import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorksp
 import type { StructuralResourceState } from '../state/structuralResource';
 import type {
   DeploymentControlledStopProfile,
+  DeploymentStopTiming,
   JsonValue,
   SourceModelProjection,
 } from '../types/api';
@@ -27,6 +28,7 @@ interface RuntimeConfiguration {
 
 interface MotionTargetLimit {
   runtimeIndex: number;
+  rowIndex: number;
   componentId: string;
   targetId: string;
   value: number;
@@ -88,7 +90,7 @@ function motionTargetLimits(runtimes: RuntimeConfiguration[]): MotionTargetLimit
   return runtimes.flatMap((runtime) => {
     const rows = runtime.configuration.motion_target_limits;
     if (!Array.isArray(rows)) return [];
-    return rows.flatMap((value) => {
+    return rows.flatMap((value, rowIndex) => {
       const row = objectValue(value);
       const componentId = row?.controllable_component_id;
       const targetId = row?.command_target_id;
@@ -96,7 +98,7 @@ function motionTargetLimits(runtimes: RuntimeConfiguration[]): MotionTargetLimit
       return typeof componentId === 'string'
         && typeof targetId === 'string'
         && limit !== null
-        ? [{ runtimeIndex: runtime.index, componentId, targetId, value: limit }]
+        ? [{ runtimeIndex: runtime.index, rowIndex, componentId, targetId, value: limit }]
         : [];
     });
   });
@@ -203,12 +205,58 @@ function gripperConfigurationValue(
   };
 }
 
-function normalizedStopProfile(
-  document: Record<string, JsonValue> | null,
-): { profile: DeploymentControlledStopProfile; derivedRows: number } | null {
+interface ControlledStopTarget {
+  bindingId: string;
+  bindingRevision: string;
+  label: string;
+  rows: JsonValue[];
+  timing: DeploymentStopTiming | null;
+}
+
+function controlledStopTargets(document: Record<string, JsonValue> | null): ControlledStopTarget[] {
   const policies = objectValue(document?.policies);
   const rows = policies?.stop_stage_parameters;
-  if (!Array.isArray(rows)) return null;
+  const graph = objectValue(document?.graph);
+  if (!Array.isArray(rows) || !Array.isArray(graph?.control_bindings)) return [];
+  const byBinding = new Map<string, JsonValue[]>();
+  for (const value of rows) {
+    const row = objectValue(value);
+    if (typeof row?.control_binding_id !== 'string') continue;
+    const group = byBinding.get(row.control_binding_id) ?? [];
+    group.push(value);
+    byBinding.set(row.control_binding_id, group);
+  }
+  const timings = new Map<string, Record<string, JsonValue>>();
+  for (const value of Array.isArray(policies?.stop_timing_parameters) ? policies.stop_timing_parameters : []) {
+    const row = objectValue(value);
+    if (typeof row?.control_binding_id === 'string') timings.set(row.control_binding_id, row);
+  }
+  return graph.control_bindings.flatMap((value) => {
+    const binding = objectValue(value);
+    const id = binding?.control_binding_id;
+    const revision = binding?.control_binding_revision;
+    const targetRows = typeof id === 'string' ? byBinding.get(id) : undefined;
+    if (!binding || typeof id !== 'string' || typeof revision !== 'string' || !targetRows?.length) return [];
+    const selected = timings.get(id);
+    const timing = selected?.control_binding_revision === revision ? objectValue(selected.timing) : null;
+    if (selected && (!timing
+      || typeof timing.command_latency_allowance_ns !== 'number'
+      || typeof timing.settling_allowance_ns !== 'number'
+      || typeof timing.operational_timeout_ns !== 'number')) return [];
+    return [{ bindingId: id, bindingRevision: revision,
+      label: `${binding.controllable_component_id} · ${binding.command_target_id} · ${binding.capability_id ?? id}`,
+      rows: targetRows,
+      timing: timing ? {
+        command_latency_allowance_ns: timing.command_latency_allowance_ns as number,
+        settling_allowance_ns: timing.settling_allowance_ns as number,
+        operational_timeout_ns: timing.operational_timeout_ns as number,
+      } : null }];
+  });
+}
+
+function normalizedStopProfile(
+  rows: JsonValue[],
+): { profile: DeploymentControlledStopProfile; derivedRows: number } | null {
   const profiles = rows.flatMap((value) => {
     const row = objectValue(value);
     const provider = objectValue(row?.provider_contract_ref);
@@ -231,6 +279,10 @@ function normalizedStopProfile(
       const limit = objectValue(limitValue);
       const maximum = objectValue(limit?.max_deceleration);
       const threshold = objectValue(limit?.settle_velocity_threshold);
+      const jerk = objectValue(limit?.max_jerk);
+      const jerkEntry = Object.entries(jerk ?? {}).find(
+        ([key, candidate]) => key.startsWith('value_') && typeof candidate === 'number',
+      );
       const maximumEntry = Object.entries(maximum ?? {}).find(
         ([key, candidate]) => key.startsWith('value_') && typeof candidate === 'number',
       );
@@ -252,6 +304,9 @@ function normalizedStopProfile(
               coordinate_kind: threshold.coordinate_kind,
               value: thresholdEntry[1] as number,
             },
+            ...(typeof jerk?.coordinate_kind === 'string' && jerkEntry !== undefined ? {
+              max_jerk: { coordinate_kind: jerk.coordinate_kind, value: jerkEntry[1] as number },
+            } : {}),
           }]
         : [];
     });
@@ -260,10 +315,12 @@ function normalizedStopProfile(
       stop_mode: mode,
       deceleration_time_s: deceleration,
       allow_natural_completion_on_short_path: natural,
+      jerk_limits_enabled: typeof parameters?.jerk_limits_enabled === 'boolean'
+        ? parameters.jerk_limits_enabled : null,
       per_resource_limits: normalizedLimits,
     } satisfies DeploymentControlledStopProfile];
   });
-  if (profiles.length === 0) return null;
+  if (profiles.length === 0 || profiles.length !== rows.length) return null;
   const first = JSON.stringify(profiles[0]);
   if (profiles.some((profile) => JSON.stringify(profile) !== first)) return null;
   return { profile: profiles[0], derivedRows: profiles.length };
@@ -281,6 +338,7 @@ function shortIdentity(value: string | null | undefined): string {
 
 function NumberDraft({
   label,
+  title,
   value,
   unit,
   min,
@@ -290,6 +348,7 @@ function NumberDraft({
   onCommit,
 }: {
   label: string;
+  title?: string;
   value: number;
   unit?: string;
   min?: number;
@@ -319,7 +378,7 @@ function NumberDraft({
     setInvalid(result === null);
   };
   return (
-    <label className={`deployment-focused-field${invalid ? ' invalid' : ''}`}>
+    <label className={`deployment-focused-field${invalid ? ' invalid' : ''}`} title={title}>
       <span>{label}</span>
       <span className="deployment-number-with-unit">
         <input
@@ -356,12 +415,16 @@ function OptionalNumberDraft({
   unit,
   disabled,
   onCommit,
+  maximum,
+  placeholder = 'model only',
 }: {
   label: string;
   value: number | null;
   unit: string;
   disabled: boolean;
   onCommit: (value: number | null) => Promise<unknown> | unknown;
+  maximum?: number;
+  placeholder?: string;
 }) {
   const [draft, setDraft] = useState(value === null ? '' : String(value));
   const [invalid, setInvalid] = useState(false);
@@ -371,7 +434,7 @@ function OptionalNumberDraft({
   }, [value]);
   const commit = async () => {
     const parsed = draft.trim() === '' ? null : Number(draft);
-    if (parsed !== null && (!Number.isFinite(parsed) || parsed <= 0 || parsed > 1000)) {
+    if (parsed !== null && (!Number.isFinite(parsed) || parsed <= 0 || (maximum !== undefined && parsed > maximum))) {
       setInvalid(true);
       return;
     }
@@ -387,9 +450,9 @@ function OptionalNumberDraft({
           type="number"
           value={draft}
           min="0.000001"
-          max="1000"
+          max={maximum}
           step="any"
-          placeholder="model only"
+          placeholder={placeholder}
           disabled={disabled}
           onChange={(event) => {
             setDraft(event.target.value);
@@ -407,7 +470,10 @@ function OptionalNumberDraft({
         />
         <small>{unit}</small>
       </span>
-      {invalid && <small className="deployment-field-error">Enter a positive value, or leave blank.</small>}
+      {invalid && <small className="deployment-field-error">
+        {maximum === undefined ? 'Enter a positive value, or leave blank.'
+          : `Enter a positive value at most ${maximum}; the imported ceiling cannot be exceeded.`}
+      </small>}
     </label>
   );
 }
@@ -509,6 +575,7 @@ function DirectControlJointLimitsEditor({
                 <OptionalNumberDraft
                   label="Maximum velocity"
                   value={draft?.maxVelocityRadS ?? null}
+                  maximum={limit.modelMaxVelocityRadS}
                   unit="rad/s"
                   disabled={disabled}
                   onCommit={(value) => commit(limit.sourceJointName, 'maxVelocityRadS', value)}
@@ -516,6 +583,7 @@ function DirectControlJointLimitsEditor({
                 <OptionalNumberDraft
                   label="Maximum acceleration"
                   value={draft?.maxAccelerationRadS2 ?? null}
+                  maximum={limit.modelMaxAccelerationRadS2 ?? undefined}
                   unit="rad/s²"
                   disabled={disabled}
                   onCommit={(value) => commit(limit.sourceJointName, 'maxAccelerationRadS2', value)}
@@ -544,6 +612,78 @@ function DirectControlJointLimitsEditor({
   );
 }
 
+function OrdinaryMotionJerkEditor({ controller, runtime, limit, descriptor }: {
+  controller: DeploymentWorkspaceController;
+  runtime: RuntimeConfiguration;
+  limit: MotionTargetLimit;
+  descriptor: ManualControlMotionDescriptor | null;
+}) {
+  const rows = runtime.configuration.motion_target_limits;
+  const target = Array.isArray(rows) ? objectValue(rows[limit.rowIndex]) : null;
+  const settings = objectValue(target?.ordinary_motion_jerk) ?? {
+    enabled: false, preset_reference_time_s: 1, joint_limits: [],
+  };
+  const applied = descriptor?.ordinaryJerk ?? null;
+  const disabled = !controller.mutationAvailable || controller.busy || applied === null;
+  const enabled = settings.enabled === true;
+  const joints = Array.isArray(settings.joint_limits) ? settings.joint_limits : [];
+  const required = joints.some((row) => objectValue(objectValue(row)?.imported)?.machine_required === true);
+  const commit = (changes: Record<string, JsonValue>) => controller.mutate(
+    ['graph', 'runtime_units', runtime.index, 'configuration', 'motion_target_limits', limit.rowIndex, 'ordinary_motion_jerk'],
+    'set', { ...settings, ...changes },
+  );
+  const override = (sourceJointName: string, value: number | null) => {
+    const existing = joints.map(objectValue).find((row) => row?.source_joint_name === sourceJointName);
+    const next = { ...(existing ?? { source_joint_name: sourceJointName }) };
+    if (value === null) delete next.override_rad_s3;
+    else next.override_rad_s3 = value;
+    return commit({ joint_limits: [
+      ...joints.filter((row) => objectValue(row)?.source_joint_name !== sourceJointName),
+      ...(next.imported !== undefined || value !== null ? [next] : []),
+    ] });
+  };
+  return (
+    <section className="deployment-joint-caps">
+      <div className="deployment-focused-form-grid">
+        <label className="deployment-focused-field"
+          title={applied === null ? 'No qualified ordinary jerk capability is reported for this target.'
+            : 'Applies to Program and manual trajectories. Controlled Stop has its own setting. Save and Apply to activate.'}>
+          <span>Ordinary motion jerk</span>
+          <select aria-label={`${limit.componentId} / ${limit.targetId} ordinary motion jerk`}
+            disabled={disabled} value={enabled ? 'on' : 'off'}
+            onChange={(event) => { void commit({ enabled: event.target.value === 'on' }); }}>
+            <option value="off" disabled={required}>Off</option>
+            <option value="on">Enforce limits</option>
+          </select>
+        </label>
+        <NumberDraft label="Preset reference time" unit="s" min={0.000001} max={1000}
+          value={numberValue(settings.preset_reference_time_s) ?? 1} disabled={disabled || !enabled}
+          onCommit={(value) => commit({ preset_reference_time_s: value })} />
+      </div>
+      {applied !== null && <details>
+        <summary>Ordinary joint jerk limits</summary>
+        {applied.jointLimits.map((joint) => {
+          const draft = joints.map(objectValue).find((row) => row?.source_joint_name === joint.sourceJointName);
+          const imported = objectValue(draft?.imported);
+          const ceiling = imported?.enabled === true ? numberValue(imported.maximum_rad_s3) ?? undefined : undefined;
+          return <section className="deployment-joint-cap" key={joint.sourceJointName}>
+            <OptionalNumberDraft label={joint.sourceJointName} unit="rad/s³"
+              value={numberValue(draft?.override_rad_s3)} disabled={disabled || !enabled}
+              maximum={ceiling} placeholder={ceiling === undefined ? 'ManyForge preset' : `Imported: ${ceiling}`}
+              onCommit={(value) => override(joint.sourceJointName, value)} />
+            <small title={joint.imported ? `${joint.imported.sourceId}\n${joint.imported.sourceDigest}`
+              : 'ManyForge preset uses the model acceleration and saved reference time; it is not manufacturer data.'}>
+              Applied: {joint.maximumRadS3 === null ? 'off' : `${format(joint.maximumRadS3)} rad/s³ · ${joint.source}`}
+              {' · '}Preset: {format(joint.presetRadS3)} rad/s³
+              {joint.imported?.machineRequired && ' · machine-required'}
+            </small>
+          </section>;
+        })}
+      </details>}
+    </section>
+  );
+}
+
 function ModelAndTargetSection({
   controller,
   sourceModel,
@@ -555,32 +695,50 @@ function ModelAndTargetSection({
   runtimes: RuntimeConfiguration[];
 }) {
   const source = sourceModel.status === 'ready' ? sourceModel.data : null;
-  const componentId = motionDescriptor?.controllableComponentId ?? limits[0]?.componentId;
-  const occurrence = source?.occurrences.find((item) => item.component_id === componentId)
-    ?? source?.occurrences[0]
-    ?? null;
+  const [selectedTarget, setSelectedTarget] = useState('');
+  const targetKey = (limit: MotionTargetLimit) => JSON.stringify([limit.componentId, limit.targetId]);
+  const target = limits.find((limit) => targetKey(limit) === selectedTarget)
+    ?? limits.find((limit) => limit.componentId === motionDescriptor?.controllableComponentId
+      && limit.targetId === motionDescriptor.commandTargetId)
+    ?? limits[0];
+  const selectedDescriptor = target?.componentId === motionDescriptor?.controllableComponentId
+    && target?.targetId === motionDescriptor?.commandTargetId ? motionDescriptor : null;
+  const modelTarget = source?.targets.find((item) => item.component_id === target?.componentId
+    && item.target_id === target?.targetId);
+  const occurrences = source?.occurrences.filter((item) => modelTarget?.model_groups.some(
+    (group) => group.model_instance_id === item.model_instance_id,
+  )) ?? [];
   const editingDisabled = !controller.mutationAvailable || controller.busy;
   return (
     <details className="deployment-focused-section" open>
       <summary>Robot model and target limits</summary>
       <div className="deployment-focused-body">
+        {limits.length > 1 && target && <label className="deployment-focused-field">
+          <span>Target</span>
+          <select aria-label="Motion limits target" value={targetKey(target)}
+            disabled={controller.busy} onChange={(event) => setSelectedTarget(event.target.value)}>
+            {limits.map((limit) => <option key={targetKey(limit)} value={targetKey(limit)}>
+              {limit.componentId} / {limit.targetId}
+            </option>)}
+          </select>
+        </label>}
         <div className="deployment-resolved-grid">
-          <span><small>Robot source</small><strong>{occurrence?.source_robot_name ?? 'Unavailable'}</strong></span>
-          <span><small>Model</small><strong>{occurrence?.source_model_name ?? 'Unavailable'}</strong></span>
-          <span title={occurrence?.model_revision}><small>Model revision</small><strong>{shortIdentity(occurrence?.model_revision)}</strong></span>
-          <span><small>Planning groups</small><strong>{occurrence?.srdf_groups.map((group) => group.source_group_name).join(', ') || 'not declared'}</strong></span>
+          <span><small>Robot source</small><strong>{occurrences.map((item) => item.source_robot_name).join(', ') || 'Unavailable'}</strong></span>
+          <span><small>Model</small><strong>{occurrences.map((item) => item.source_model_name).join(', ') || 'Unavailable'}</strong></span>
+          <span title={occurrences.map((item) => item.model_revision).join('\n')}><small>Model revision</small><strong>{occurrences.map((item) => shortIdentity(item.model_revision)).join(', ') || 'not declared'}</strong></span>
+          <span><small>Planning groups</small><strong>{modelTarget?.model_groups.map((group) => group.source_group_name).join(', ') || 'not declared'}</strong></span>
         </div>
         {sourceModel.status !== 'ready' && (
           <p className="muted">
             {sourceModel.status === 'loading' ? 'Reading source-model facts.' : sourceModel.message}
           </p>
         )}
-        {motionDescriptor !== null && (
+        {selectedDescriptor !== null && (
           <div className="deployment-limit-table" role="table" aria-label="Source model joint limits">
             <div className="deployment-limit-row heading" role="row">
               <span>Joint</span><span>Position</span><span>Velocity</span><span>Acceleration</span>
             </div>
-            {motionDescriptor.joints.map((joint) => (
+            {selectedDescriptor.joints.map((joint) => (
               <div className="deployment-limit-row" role="row" key={joint.sourceJointName}>
                 <strong>{joint.sourceJointName}</strong>
                 <span>{format(joint.minPositionRad)} to {format(joint.maxPositionRad)} rad</span>
@@ -592,12 +750,8 @@ function ModelAndTargetSection({
         )}
         <div className="deployment-target-limits">
           {limits.length === 0 && <p className="muted">No Deployment-owned motion target cap is declared.</p>}
-          {limits.map((limit) => {
-            const matching = motionDescriptor !== null
-              && motionDescriptor.controllableComponentId === limit.componentId
-              && motionDescriptor.commandTargetId === limit.targetId
-              ? motionDescriptor.operationalLimit
-              : null;
+          {(target ? [target] : []).map((limit) => {
+            const matching = selectedDescriptor?.operationalLimit ?? null;
             const runtime = runtimes.find((item) => item.index === limit.runtimeIndex);
             return (
               <div className="deployment-target-limit" key={`${limit.componentId}:${limit.targetId}`}>
@@ -605,6 +759,9 @@ function ModelAndTargetSection({
                   <strong>{limit.componentId} / {limit.targetId}</strong>
                   <small>Compiler-validated Deployment input</small>
                 </header>
+                {selectedDescriptor === null && <p className="muted">
+                  No current motion descriptor for this target. Jerk activation and joint caps are unavailable.
+                </p>}
                 <NumberDraft
                   label="Maximum TCP linear speed"
                   value={limit.value}
@@ -618,7 +775,10 @@ function ModelAndTargetSection({
                     value,
                   )}
                 />
-                {matching !== null && motionDescriptor !== null && (
+                {runtime !== undefined && <OrdinaryMotionJerkEditor
+                  controller={controller} runtime={runtime} limit={limit}
+                  descriptor={selectedDescriptor} />}
+                {matching !== null && selectedDescriptor !== null && (
                   <>
                     <div className="deployment-resolved-grid compact">
                       <span><small>Catalog policy</small><strong>{format(matching.catalogPolicyMaximumTcpLinearSpeedMps)} m/s</strong></span>
@@ -629,7 +789,7 @@ function ModelAndTargetSection({
                       <DirectControlJointLimitsEditor
                         controller={controller}
                         runtime={runtime}
-                        descriptor={motionDescriptor}
+                        descriptor={selectedDescriptor}
                       />
                     )}
                   </>
@@ -734,28 +894,56 @@ function NativeRuntimeSection({
 
 function ControlledStopSection({
   controller,
-  normalized,
+  targets,
 }: {
   controller: DeploymentWorkspaceController;
-  normalized: { profile: DeploymentControlledStopProfile; derivedRows: number } | null;
+  targets: ControlledStopTarget[];
 }) {
+  const [selectedId, setSelectedId] = useState('');
+  const target = targets.find((row) => row.bindingId === selectedId) ?? targets[0];
+  return (
+    <details className="deployment-focused-section">
+      <summary>Stop settings</summary>
+      <div className="deployment-focused-body">
+        {target ? <>
+          <label className="deployment-focused-field">
+            <span>Target</span>
+            <select aria-label="Controlled Stop target" value={target.bindingId}
+              disabled={controller.busy} onChange={(event) => setSelectedId(event.target.value)}>
+              {targets.map((row) => <option key={row.bindingId} value={row.bindingId}>{row.label}</option>)}
+            </select>
+          </label>
+          <ControlledStopEditor key={`${target.bindingId}:${target.bindingRevision}`}
+            controller={controller} target={target} />
+        </> : <p className="muted">No editable Stop contract is declared.</p>}
+      </div>
+    </details>
+  );
+}
+
+function ControlledStopEditor({ controller, target }: {
+  controller: DeploymentWorkspaceController;
+  target: ControlledStopTarget;
+}) {
+  const controlledRows = useMemo(() => target.rows.filter((value) => {
+    const row = objectValue(value);
+    return row?.stop_escalation_stage_id === 'motion_controlled_stop'
+      && objectValue(row.provider_contract_ref)?.provider_contract_role_id === 'stop_contract';
+  }), [target.rows]);
+  const normalized = useMemo(() => normalizedStopProfile(controlledRows), [controlledRows]);
   const [draft, setDraft] = useState<DeploymentControlledStopProfile | null>(
     normalized?.profile ?? null,
   );
+  const [timing, setTiming] = useState<DeploymentStopTiming | null>(target.timing);
   useEffect(() => {
     setDraft(normalized?.profile ?? null);
-  }, [normalized]);
-  const disabled = !controller.mutationAvailable || controller.busy;
-  if (draft === null) {
-    return (
-      <details className="deployment-focused-section">
-        <summary>Controlled Stop</summary>
-        <div className="deployment-focused-body"><p className="muted">No coherent editable Controlled Stop contract is declared.</p></div>
-      </details>
-    );
-  }
-  const changed = normalized !== null
-    && JSON.stringify(draft) !== JSON.stringify(normalized.profile);
+    setTiming(target.timing);
+  }, [normalized, target.timing]);
+  const disabled = !controller.mutationAvailable || controller.busy
+    || (controlledRows.length > 0 && normalized?.profile.jerk_limits_enabled == null);
+  const changed = (normalized !== null && JSON.stringify(draft) !== JSON.stringify(normalized.profile))
+    || JSON.stringify(timing) !== JSON.stringify(target.timing);
+  const requiresMigration = controlledRows.length > 0 && normalized?.profile.jerk_limits_enabled == null;
   const updateLimit = (
     index: number,
     field: 'max_deceleration' | 'settle_velocity_threshold',
@@ -767,13 +955,9 @@ function ControlledStopSection({
     return next;
   });
   return (
-    <details className="deployment-focused-section">
-      <summary>Controlled Stop</summary>
-      <div className="deployment-focused-body">
-        <p className="field-help">
-          One normalized profile controls {normalized?.derivedRows ?? 0} compiler-expanded route rows atomically. It is independent of nominal motion acceleration.
-        </p>
+    <>
         <div className="deployment-focused-form-grid">
+          {draft && <>
           <label className="deployment-focused-field">
             <span>Stop mode</span>
             <select
@@ -782,6 +966,7 @@ function ControlledStopSection({
               onChange={(event) => setDraft({
                 ...draft,
                 stop_mode: event.target.value as DeploymentControlledStopProfile['stop_mode'],
+                allow_natural_completion_on_short_path: event.target.value === 'soft_on_path',
               })}
             >
               <option value="soft_on_path">Soft on path</option>
@@ -789,18 +974,45 @@ function ControlledStopSection({
             </select>
           </label>
           <NumberDraft
-            label="Deceleration time"
+            label={draft.stop_mode === 'spring_back_hold' ? 'Brake + return time' : 'Deceleration time'}
             value={draft.deceleration_time_s}
             unit="s"
             min={0.001}
-            max={60}
+            max={2}
             disabled={disabled}
             onCommit={(value) => {
               setDraft({ ...draft, deceleration_time_s: value });
               return true;
             }}
           />
-          <label className="deployment-focused-checkbox">
+          </>}
+          <label className="deployment-focused-checkbox" title="Unselected uses this target's qualified policy timing. Selecting creates explicit editable values in the Draft; Save and Apply are still required.">
+            <input type="checkbox" checked={timing !== null} disabled={disabled}
+              onChange={(event) => setTiming(event.target.checked ? {
+                command_latency_allowance_ns: 250_000_000,
+                settling_allowance_ns: 750_000_000,
+                operational_timeout_ns: 3_000_000_000,
+              } : null)} />
+            Explicit Stop timing
+          </label>
+          {timing === null ? <p className="muted">Using qualified policy timings.</p> : <>
+            <NumberDraft label="Command latency" value={timing.command_latency_allowance_ns / 1e9}
+              title="Allowance for Stop preparation, delivery and controller handoff. It does not shorten the braking ramp."
+              unit="s" min={0.001} max={9_007_199} disabled={disabled}
+              onCommit={(value) => { setTiming({ ...timing, command_latency_allowance_ns: Math.round(value * 1e9) }); return true; }} />
+            <NumberDraft label="Settling allowance" value={timing.settling_allowance_ns / 1e9}
+              title="Additional time for motion to settle and fresh rest evidence, after the full commanded ramp."
+              unit="s" min={0} max={9_007_199} disabled={disabled}
+              onCommit={(value) => { setTiming({ ...timing, settling_allowance_ns: Math.round(value * 1e9) }); return true; }} />
+            <NumberDraft label="Stop timeout" value={timing.operational_timeout_ns / 1e9}
+              title="At this time without proven rest, fault and request the strongest authorized stop. Must cover the full profile plus latency and settling."
+              unit="s" min={0.001} max={9_007_199} disabled={disabled}
+              onCommit={(value) => { setTiming({ ...timing, operational_timeout_ns: Math.round(value * 1e9) }); return true; }} />
+          </>}
+          {draft && <>
+          <label className="deployment-focused-checkbox" title={draft.stop_mode === 'spring_back_hold'
+            ? 'Off by default: brake and return to the stop-trigger position. Enabling permits a short remaining move to finish at its endpoint instead; that is not a precision return.'
+            : 'On by default: a sufficiently short remaining move may finish at its endpoint, with rest confirmed within the Stop deadline.'}>
             <input
               type="checkbox"
               checked={draft.allow_natural_completion_on_short_path}
@@ -812,8 +1024,23 @@ function ControlledStopSection({
             />
             Allow natural completion on a short remaining path
           </label>
+          <label className="deployment-focused-field" title="Constrains the controlled attempt only, not ordinary moves or hard containment. Missing per-joint values use the explicit ManyForge preset at preparation.">
+            <span>Controlled Stop jerk</span>
+            <select
+              aria-label="Controlled Stop jerk limits"
+              value={draft.jerk_limits_enabled === null ? '' : draft.jerk_limits_enabled ? 'on' : 'off'}
+              disabled={disabled || requiresMigration}
+              onChange={(event) => setDraft({ ...draft, jerk_limits_enabled: event.target.value === 'on' })}
+            >
+              <option value="" disabled>Review required — choose</option>
+              <option value="off">Off</option>
+              <option value="on">Enforce jerk limits</option>
+            </select>
+          </label>
+          </>}
         </div>
-        <div className="deployment-stop-limits">
+        {requiresMigration && <p className="field-help">This older Stop contract needs explicit migration before editing. Runtime Stop remains unchanged.</p>}
+        {draft && <div className="deployment-stop-limits">
           <div className="deployment-stop-limit heading">
             <span>Resource</span><span>Maximum deceleration</span><span>Settled below</span>
           </div>
@@ -840,23 +1067,52 @@ function ControlledStopSection({
               />
             </div>
           ))}
-        </div>
+        </div>}
+        {draft?.jerk_limits_enabled === true && (
+          <details>
+            <summary>Joint jerk limits</summary>
+            {draft.per_resource_limits.map((limit, index) => (
+              <label className="deployment-focused-field" key={limit.resource_id}>
+                <span>{limit.resource_id.split('.').at(-1)} ({limit.max_deceleration.coordinate_kind === 'angular_rad_s2' ? 'rad/s³' : 'm/s³'})</span>
+                <input
+                  type="number" min="0.000001" step="any" disabled={disabled}
+                  aria-label={`${limit.resource_id} maximum jerk`}
+                  placeholder="ManyForge preset" value={limit.max_jerk?.value ?? ''}
+                  title="Empty uses the ManyForge acceleration/ramp preset. Explicit values are saved with this Deployment."
+                  onChange={(event) => {
+                    const next = structuredClone(draft);
+                    if (event.target.value === '') delete next.per_resource_limits[index].max_jerk;
+                    else next.per_resource_limits[index].max_jerk = {
+                      coordinate_kind: limit.max_deceleration.coordinate_kind === 'angular_rad_s2' ? 'angular_rad_s3' : 'linear_m_s3',
+                      value: Number(event.target.value),
+                    };
+                    setDraft(next);
+                  }}
+                />
+              </label>
+            ))}
+          </details>
+        )}
         <div className="button-row">
           <button
             type="button"
             className="primary-action"
-            disabled={disabled || !changed}
-            onClick={() => { void controller.updateControlledStop(draft); }}
+            disabled={disabled || !changed || requiresMigration}
+            onClick={() => { void controller.updateControlledStop({
+              control_binding_id: target.bindingId, control_binding_revision: target.bindingRevision,
+              profile: draft, timing,
+            }); }}
           >Update Controlled Stop Draft</button>
           <button
             type="button"
-            disabled={disabled || !changed || normalized === null}
-            onClick={() => setDraft(normalized?.profile ?? null)}
+            disabled={disabled || !changed}
+            onClick={() => { setDraft(normalized?.profile ?? null); setTiming(target.timing); }}
           >Discard Stop edits</button>
         </div>
-        <p className="field-help">Maximum Stop time, lead-in, sample period, jerk, and provider fallback are not declared as editable inputs by this native provider. Supported modes and hard-stop floors remain provider-owned.</p>
-      </div>
-    </details>
+        <p className="field-help" title={`Updates ${normalized?.derivedRows ?? 0} route rows for this target only. The timeout must cover the complete profile plus latency and settling. Expiry or nominal failure faults and requests strongest authorized containment.`}>
+          Save records these choices; Apply activates them.
+        </p>
+    </>
   );
 }
 
@@ -1094,7 +1350,7 @@ export function DeploymentFocusedEditor({
   const document = controller.workspace?.draft.document ?? null;
   const runtimes = useMemo(() => runtimeConfigurations(document), [document]);
   const limits = useMemo(() => motionTargetLimits(runtimes), [runtimes]);
-  const controlledStop = useMemo(() => normalizedStopProfile(document), [document]);
+  const controlledStop = useMemo(() => controlledStopTargets(document), [document]);
   if (document === null) {
     return <div className="panel-state">Open a Deployment artifact to edit its Draft.</div>;
   }
@@ -1114,7 +1370,7 @@ export function DeploymentFocusedEditor({
         runtimes={runtimes}
       />
       <NativeRuntimeSection controller={controller} runtimes={runtimes} />
-      <ControlledStopSection controller={controller} normalized={controlledStop} />
+      <ControlledStopSection controller={controller} targets={controlledStop} />
       <GripperSection controller={controller} descriptor={gripperDescriptor} runtimes={runtimes} />
     </section>
   );

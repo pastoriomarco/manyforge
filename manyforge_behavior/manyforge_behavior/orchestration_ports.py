@@ -7,7 +7,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
-from typing import Any, Final, Protocol
+from typing import Any, Callable, Final, Protocol
 
 
 PROGRAM_MOTION_STOP_RECOVERY_CLASSES: Final = frozenset(
@@ -357,6 +357,25 @@ class OwnerInvocationResult:
         )
 
 
+class OwnerInvocationPendingError(RuntimeError):
+    """Retain one call's read-only continuation, never a resubmission closure."""
+
+    def __init__(self, message: str,
+                 observe: Callable[[], OwnerInvocationResult | None]) -> None:
+        super().__init__(message)
+        self.observe = observe
+
+
+class OwnerInvocationHeldError(RuntimeError):
+    """The owner proved Stop prevented admission; no effect was started."""
+
+    def __init__(self, selection_revision: int) -> None:
+        super().__init__("Not started — held by Stop")
+        if type(selection_revision) is not int or not 0 <= selection_revision <= 9_007_199_254_740_991:
+            raise ValueError("held invocation requires an exact Stop selection revision")
+        self.selection_revision = selection_revision
+
+
 class OwnerInvocationPort(Protocol):
     """One focused owner family whose public request settles synchronously."""
 
@@ -581,6 +600,8 @@ __all__ = [
     "OwnerNodeInputs",
     "OwnerInvocationPort",
     "OwnerInvocationResult",
+    "OwnerInvocationPendingError",
+    "OwnerInvocationHeldError",
     "OwnerTaskPort",
     "OwnerTaskObservationUnavailableError",
     "OwnerTaskSettlementPendingError",

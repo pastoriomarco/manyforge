@@ -2,10 +2,10 @@
 
 #include <manyforge_roboplan/cartesian_planning_contract.hpp>
 #include <manyforge_roboplan/detail/cartesian_trajectory_contract.hpp>
-#include <manyforge_roboplan/joint_cap_contract.hpp>
 #include <manyforge_roboplan/roboplan_planner_options.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <map>
@@ -239,37 +239,11 @@ void anchor_trajectory_endpoints(roboplan::JointTrajectory &trajectory,
   }
 }
 
-[[nodiscard]] double
-maximum_tcp_speed(const std::shared_ptr<roboplan::Scene> &scene,
-                  std::string_view group_name, std::string_view base_frame,
-                  std::string_view tcp_frame,
-                  const roboplan::JointTrajectory &trajectory) {
-  double maximum = 0.0;
-  Eigen::Vector3d previous = Eigen::Vector3d::Zero();
-  bool have_previous = false;
-  for (std::size_t index = 0U; index < trajectory.times.size(); ++index) {
-    const Eigen::VectorXd full = scene->toFullJointPositions(
-        std::string(group_name), trajectory.positions[index]);
-    const Eigen::Matrix4d pose = scene->forwardKinematics(
-        full, std::string(tcp_frame), std::string(base_frame));
-    const Eigen::Vector3d current = pose.block<3, 1>(0, 3);
-    if (have_previous) {
-      const double duration =
-          trajectory.times[index] - trajectory.times[index - 1U];
-      if (duration > 0.0) {
-        maximum = std::max(maximum, (current - previous).norm() / duration);
-      }
-    }
-    previous = current;
-    have_previous = true;
-  }
-  return maximum;
-}
-
 [[nodiscard]] core::Result<core::TrajectoryDTO>
 portable_trajectory(const roboplan::JointTrajectory &native,
                     const RoboPlanCandidateBindingDTO &binding,
-                    std::size_t maximum_samples) {
+                    std::size_t maximum_samples,
+                    core::TrajectoryRuntimeScaleBoundsDTO scale_bounds) {
   const std::size_t sample_count = native.positions.size();
   if (native.joint_names != binding.compiled_joint_names ||
       native.times.size() != sample_count || sample_count < 2U ||
@@ -288,6 +262,7 @@ portable_trajectory(const roboplan::JointTrajectory &native,
   core::TrajectoryDTO result;
   result.resources = binding.resources;
   result.joint_names = binding.compiled_joint_names;
+  result.runtime_scale_bounds = scale_bounds;
   result.waypoints.reserve(sample_count);
   double previous_time = -1.0;
   for (std::size_t index = 0U; index < sample_count; ++index) {
@@ -471,8 +446,6 @@ validate_request_binding(const RoboPlanCandidateBindingDTO &binding,
 }
 
 struct ResolvedDynamicsCaps final {
-  std::map<std::string, double> velocity_by_joint;
-  std::map<std::string, double> acceleration_by_joint;
   core::PerJointDynamicsLimitsDTO portable_by_joint;
 };
 
@@ -516,24 +489,6 @@ resolve_dynamics_caps(const RoboPlanCandidateBindingDTO &binding,
           "invalid_joint_dynamics_limit",
           {{"resource_id", entry.resource_id.value()},
            {"compiled_joint_name", entry.compiled_joint_name}});
-    }
-    if (limit.max_jerk_rad_s3.has_value()) {
-      return fail<ResolvedDynamicsCaps>(
-          ErrorCode::kUnsupportedCapability,
-          "RoboPlan TOPP-RA cannot enforce a per-resource jerk cap",
-          "unsupported_joint_dynamics_limit",
-          {{"resource_id", entry.resource_id.value()},
-           {"compiled_joint_name", entry.compiled_joint_name},
-           {"dimension", "jerk"},
-           {"backend", "roboplan_toppra"}});
-    }
-    if (limit.max_velocity_rad_s.has_value()) {
-      result.velocity_by_joint.emplace(entry.compiled_joint_name,
-                                       *limit.max_velocity_rad_s);
-    }
-    if (limit.max_acceleration_rad_s2.has_value()) {
-      result.acceleration_by_joint.emplace(entry.compiled_joint_name,
-                                           *limit.max_acceleration_rad_s2);
     }
     result.portable_by_joint.emplace(entry.compiled_joint_name, limit);
   }
@@ -694,25 +649,6 @@ densify_cartesian_path(const core::CartesianPathDTO &path,
   return core::Result<DensifiedCartesianPath>::Ok(std::move(result));
 }
 
-struct CartesianTrajectoryEnvelope final {
-  bool complete{true};
-  double joint_velocity_ratio{1.0};
-  double joint_acceleration_ratio{1.0};
-  double linear_speed_ratio{1.0};
-  double angular_speed_ratio{1.0};
-  double linear_acceleration_ratio{1.0};
-  double angular_acceleration_ratio{1.0};
-};
-
-[[nodiscard]] double
-required_time_scale(const CartesianTrajectoryEnvelope &envelope) {
-  return std::max({1.0, envelope.joint_velocity_ratio,
-                   envelope.linear_speed_ratio, envelope.angular_speed_ratio,
-                   std::sqrt(envelope.joint_acceleration_ratio),
-                   std::sqrt(envelope.linear_acceleration_ratio),
-                   std::sqrt(envelope.angular_acceleration_ratio)});
-}
-
 void scale_trajectory_time(roboplan::JointTrajectory &trajectory,
                            double scale) {
   const double acceleration_scale = scale * scale;
@@ -725,16 +661,6 @@ void scale_trajectory_time(roboplan::JointTrajectory &trajectory,
   for (auto &acceleration : trajectory.accelerations) {
     acceleration /= acceleration_scale;
   }
-}
-
-void scale_envelope_time(CartesianTrajectoryEnvelope &envelope, double scale) {
-  const double acceleration_scale = scale * scale;
-  envelope.joint_velocity_ratio /= scale;
-  envelope.linear_speed_ratio /= scale;
-  envelope.angular_speed_ratio /= scale;
-  envelope.joint_acceleration_ratio /= acceleration_scale;
-  envelope.linear_acceleration_ratio /= acceleration_scale;
-  envelope.angular_acceleration_ratio /= acceleration_scale;
 }
 
 [[nodiscard]] detail::CartesianTrajectoryContractInput
@@ -754,16 +680,25 @@ cartesian_control(const RoboPlanCandidateControl &control) {
                                   control.deadline_expired};
 }
 
-[[nodiscard]] core::Result<CartesianTrajectoryEnvelope>
-measure_cartesian_envelope(
+// Certify the final P/V/A curve once, then stretch all its coordinates
+// together. TOPPRA remains the geometric/timing producer; this is not another
+// planner.
+[[nodiscard]] core::Result<core::TrajectoryRuntimeScaleBoundsDTO>
+prepare_candidate_time_law(
     const detail::CartesianTrajectoryContractInput &contract,
-    const core::CartesianPathDTO &path,
+    const core::CartesianPathDTO *path,
     const std::shared_ptr<roboplan::Scene> &scene,
-    const roboplan::JointTrajectory &trajectory,
+    roboplan::JointTrajectory &trajectory,
     const Eigen::VectorXd &model_velocity_limits,
     const Eigen::VectorXd &model_acceleration_limits,
-    const CartesianPlanningControl &control) {
-  CartesianTrajectoryEnvelope envelope;
+    const CartesianPlanningControl &control,
+    std::vector<double>* cartesian_waypoint_times_s = nullptr) {
+  const auto incomplete = [] {
+    return fail<core::TrajectoryRuntimeScaleBoundsDTO>(
+        ErrorCode::kValidationLimitsViolation,
+        "Trajectory lacks a complete runtime dynamics preparation",
+        "native_runtime_scale_preparation_invalid");
+  };
   if (trajectory.positions.size() < 2U ||
       trajectory.times.size() != trajectory.positions.size() ||
       trajectory.velocities.size() != trajectory.positions.size() ||
@@ -772,9 +707,14 @@ measure_cartesian_envelope(
           static_cast<Eigen::Index>(trajectory.joint_names.size()) ||
       model_acceleration_limits.size() !=
           static_cast<Eigen::Index>(trajectory.joint_names.size())) {
-    envelope.complete = false;
-    return core::Result<CartesianTrajectoryEnvelope>::Ok(std::move(envelope));
+    return incomplete();
   }
+  if (trajectory.times.front() != 0.0 ||
+      !trajectory.velocities.front().isZero(0.0) ||
+      !trajectory.velocities.back().isZero(0.0) ||
+      !trajectory.accelerations.front().isZero(0.0) ||
+      !trajectory.accelerations.back().isZero(0.0))
+    return incomplete();
   auto joint = detail::measure_cartesian_joint_dynamics_envelope(
       contract, trajectory,
       std::span<const double>(
@@ -785,25 +725,103 @@ measure_cartesian_envelope(
           static_cast<std::size_t>(model_acceleration_limits.size())),
       control);
   if (!joint.ok()) {
-    return core::Result<CartesianTrajectoryEnvelope>::Err(joint.error());
+    return core::Result<core::TrajectoryRuntimeScaleBoundsDTO>::Err(
+        joint.error());
   }
-  auto frame = detail::measure_cartesian_frame_dynamics_envelope(
-      contract, path, scene, trajectory, control);
-  if (!frame.ok()) {
-    return core::Result<CartesianTrajectoryEnvelope>::Err(frame.error());
+  if (!joint.value().complete)
+    return incomplete();
+  auto derivatives = std::move(joint.value().joint_derivatives);
+  std::vector<core::detail::TrajectoryDerivativeLimits> limits;
+  limits.reserve(trajectory.joint_names.size() + 2U);
+  for (std::size_t index = 0; index < trajectory.joint_names.size(); ++index) {
+    double velocity =
+        std::abs(model_velocity_limits[static_cast<Eigen::Index>(index)]);
+    double acceleration =
+        std::abs(model_acceleration_limits[static_cast<Eigen::Index>(index)]);
+    std::optional<double> jerk;
+    const auto found =
+        contract.per_joint_dynamics_limits.find(trajectory.joint_names[index]);
+    if (found != contract.per_joint_dynamics_limits.end()) {
+      if (found->second.max_velocity_rad_s)
+        velocity = std::min(velocity, *found->second.max_velocity_rad_s);
+      if (found->second.max_acceleration_rad_s2)
+        acceleration =
+            std::min(acceleration, *found->second.max_acceleration_rad_s2);
+      jerk = found->second.max_jerk_rad_s3;
+    }
+    limits.push_back({velocity * contract.speed_profile.velocity_scale,
+                      acceleration * contract.speed_profile.acceleration_scale,
+                      jerk});
   }
-  if (!joint.value().complete || !frame.value().complete) {
-    envelope.complete = false;
-    return core::Result<CartesianTrajectoryEnvelope>::Ok(std::move(envelope));
+  double frame_velocity_ratio = 0.0;
+  if (path || contract.speed_profile.max_tcp_linear_speed_mps) {
+    auto frame = detail::measure_cartesian_frame_dynamics_envelope(
+        contract, path, scene, trajectory, control);
+    if (!frame.ok())
+      return core::Result<core::TrajectoryRuntimeScaleBoundsDTO>::Err(
+          frame.error());
+    if (!frame.value().complete)
+      return incomplete();
+    frame_velocity_ratio = std::max(frame.value().linear_speed_ratio,
+                                    frame.value().angular_speed_ratio);
+    if (path) {
+      const double linear_velocity =
+          std::min(path->max_linear_speed_mps,
+                   contract.speed_profile.max_tcp_linear_speed_mps.value_or(
+                       path->max_linear_speed_mps)) *
+          contract.speed_profile.velocity_scale;
+      const double angular_velocity =
+          path->max_angular_speed_rad_s * contract.speed_profile.velocity_scale;
+      const double linear_acceleration =
+          path->max_linear_acceleration_mps2 *
+          contract.speed_profile.acceleration_scale;
+      const double angular_acceleration =
+          path->max_angular_acceleration_rad_s2 *
+          contract.speed_profile.acceleration_scale;
+      derivatives.push_back(
+          {frame.value().linear_speed_ratio * linear_velocity,
+           frame.value().linear_acceleration_ratio * linear_acceleration, 0.0});
+      limits.push_back({linear_velocity, linear_acceleration, std::nullopt});
+      derivatives.push_back(
+          {frame.value().angular_speed_ratio * angular_velocity,
+           frame.value().angular_acceleration_ratio * angular_acceleration,
+           0.0});
+      limits.push_back({angular_velocity, angular_acceleration, std::nullopt});
+    }
   }
-  envelope.joint_velocity_ratio = joint.value().velocity_ratio;
-  envelope.joint_acceleration_ratio = joint.value().acceleration_ratio;
-  envelope.linear_speed_ratio = frame.value().linear_speed_ratio;
-  envelope.angular_speed_ratio = frame.value().angular_speed_ratio;
-  envelope.linear_acceleration_ratio = frame.value().linear_acceleration_ratio;
-  envelope.angular_acceleration_ratio =
-      frame.value().angular_acceleration_ratio;
-  return core::Result<CartesianTrajectoryEnvelope>::Ok(std::move(envelope));
+  // One implementation constant, not an extra operator setting. Reserving 20%
+  // avoids spending the complete acceleration/jerk budget on nominal timing.
+  // 4/s retains the prior rate ceiling; 16/s² removes its rate discontinuity.
+  if (!std::isfinite(frame_velocity_ratio))
+    return incomplete();
+  const std::array envelopes{core::detail::TrajectoryDynamicsEnvelope{
+      derivatives, limits, std::max(1.0, frame_velocity_ratio)}};
+  const auto prepared =
+      core::detail::prepare_runtime_scaling(envelopes, 0.20, {4.0, 16.0});
+  if (!prepared)
+    return incomplete();
+  // Retain velocity authority from the exact clipped/scaled limits and the
+  // continuous curve envelopes. R/B describe live scaling, not Stop headroom.
+  double velocity_ratio = frame_velocity_ratio;
+  for (std::size_t i = 0; i < derivatives.size(); ++i)
+    velocity_ratio =
+        std::max(velocity_ratio, derivatives[i].velocity / limits[i].velocity);
+  const double multiplier = prepared->trajectory_time_multiplier;
+  const double raw_stop_path_rate =
+      velocity_ratio > 0.0 ? multiplier / velocity_ratio : 1.0;
+  if (!std::isfinite(velocity_ratio) || !finite_positive(multiplier) ||
+      !std::isfinite(raw_stop_path_rate))
+    return incomplete();
+  const double stop_path_rate =
+      std::max(1.0, std::nextafter(raw_stop_path_rate, 0.0));
+  scale_trajectory_time(trajectory, multiplier);
+  if (cartesian_waypoint_times_s)
+    for (auto& time : *cartesian_waypoint_times_s) time *= multiplier;
+  if (!finite_positive(trajectory.times.back()))
+    return incomplete();
+  return core::Result<core::TrajectoryRuntimeScaleBoundsDTO>::Ok(
+      {prepared->scale_bounds.max_rate_per_s,
+       prepared->scale_bounds.max_rate_change_per_s2, stop_path_rate, multiplier});
 }
 
 [[nodiscard]] core::Result<roboplan::JointTrajectory>
@@ -813,7 +831,9 @@ plan_cartesian_candidate(const std::shared_ptr<roboplan::Scene> &scene,
                          const core::CartesianPathDTO &path,
                          const ResolvedDynamicsCaps &caps,
                          const RoboPlanCandidateComputerConfig &config,
-                         const RoboPlanCandidateControl &control) {
+                         const RoboPlanCandidateControl &control,
+                         core::TrajectoryRuntimeScaleBoundsDTO &scale_bounds,
+                         std::vector<double>& waypoint_times_s) {
   if (!finite_positive(request.tolerances.translation_tol_m) ||
       !finite_positive(request.tolerances.rotation_tol_rad)) {
     return fail<roboplan::JointTrajectory>(
@@ -896,13 +916,38 @@ plan_cartesian_candidate(const std::shared_ptr<roboplan::Scene> &scene,
       error.has_value()) {
     return core::Result<roboplan::JointTrajectory>::Err(std::move(*error));
   }
-  roboplan::CartesianPathPlanner planner(scene, options);
-  const roboplan::CartesianPath native_path(
-      {core::compiled_frame_name(request.base_frame)},
-      {core::compiled_frame_name(request.tcp_frame)}, {dense.value().poses});
-  roboplan::JointConfiguration native_start;
-  native_start.positions = full_start;
-  auto planned = planner.plan(native_path, native_start);
+  auto planned = [&] {
+    // RoboPlan's Cartesian tracker cannot parameterize a zero-length pose
+    // path. Reuse its ordinary stationary joint timing instead. This is only
+    // floating-point equality, not permission to omit small authored moves
+    // merely because they fit within the goal tolerance.
+    const bool stationary =
+        std::all_of(dense.value().poses.begin(), dense.value().poses.end(),
+                    [&](const auto &target) {
+                      return target.isApprox(actual_start, 1e-12);
+                    });
+    if (stationary) {
+      roboplan::PathParameterizerTOPPRA parameterizer(
+          scene, binding.compiled_group_name);
+      roboplan::TOPPRAOptions timing;
+      timing.dt = config.trajectory_sample_period_s;
+      timing.mode = roboplan::SplineFittingMode::Hermite;
+      timing.velocity_scale = options.velocity_scale;
+      timing.acceleration_scale = options.acceleration_scale;
+      timing.max_output_samples = config.maximum_trajectory_samples;
+      return parameterizer.generate(
+          roboplan::JointPath{binding.compiled_joint_names,
+                              {group_start, group_start}},
+          timing);
+    }
+    roboplan::CartesianPathPlanner planner(scene, options);
+    const roboplan::CartesianPath native_path(
+        {core::compiled_frame_name(request.base_frame)},
+        {core::compiled_frame_name(request.tcp_frame)}, {dense.value().poses});
+    roboplan::JointConfiguration native_start;
+    native_start.positions = full_start;
+    return planner.plan(native_path, native_start);
+  }();
   if (!planned.has_value()) {
     if (auto error = control_error(control, "cartesian_tracking");
         error.has_value()) {
@@ -944,7 +989,8 @@ plan_cartesian_candidate(const std::shared_ptr<roboplan::Scene> &scene,
   }
   auto fidelity = verify_cartesian_path_fidelity_controlled(
       dense.value().poses, interpolant.value().poses, certified_translation,
-      certified_rotation, contract_control);
+      certified_rotation, contract_control,
+      dense.value().source_waypoint_dense_indices);
   if (!fidelity.ok()) {
     return core::Result<roboplan::JointTrajectory>::Err(fidelity.error());
   }
@@ -968,168 +1014,80 @@ plan_cartesian_candidate(const std::shared_ptr<roboplan::Scene> &scene,
                    "cartesian_path_tolerance_exceeded", std::move(details)));
   }
 
-  auto envelope = measure_cartesian_envelope(
-      contract, path, scene, trajectory, model_velocity_limits->second,
-      model_acceleration_limits->second, contract_control);
-  if (!envelope.ok()) {
-    return core::Result<roboplan::JointTrajectory>::Err(envelope.error());
-  }
-  if (!envelope.value().complete) {
+  const auto &matches = fidelity.value().waypoint_actual_sample_indices;
+  if (matches.size() != path.waypoints.size() ||
+      interpolant.value().times_s.size() != interpolant.value().poses.size())
     return fail<roboplan::JointTrajectory>(
-        ErrorCode::kValidationLimitsViolation,
-        "Cartesian trajectory does not have a complete dynamics envelope",
-        "cartesian_trajectory_envelope_incomplete");
+        ErrorCode::kCartesianIncomplete,
+        "Cartesian source waypoint correspondence is incomplete",
+        "cartesian_waypoint_correspondence_invalid");
+  waypoint_times_s.clear();
+  waypoint_times_s.reserve(matches.size());
+  for (std::size_t i = 0; i < matches.size(); ++i) {
+    if (matches[i] >= interpolant.value().poses.size())
+      return fail<roboplan::JointTrajectory>(
+          ErrorCode::kCartesianIncomplete,
+          "Cartesian source waypoint has no reached trajectory sample",
+          "cartesian_waypoint_correspondence_invalid");
+    const auto &actual = interpolant.value().poses[matches[i]];
+    const auto &requested =
+        dense.value().poses[dense.value().source_waypoint_dense_indices[i]];
+    if ((actual.block<3, 1>(0, 3) - requested.block<3, 1>(0, 3)).norm() >
+            request.tolerances.translation_tol_m ||
+        rotation_distance(actual.block<3, 3>(0, 0),
+                          requested.block<3, 3>(0, 0)) >
+            request.tolerances.rotation_tol_rad)
+      return fail<roboplan::JointTrajectory>(
+          ErrorCode::kCartesianIncomplete,
+          "Cartesian waypoint milestone is outside its pose tolerance",
+          "cartesian_waypoint_correspondence_invalid");
+    waypoint_times_s.push_back(interpolant.value().times_s[matches[i]]);
   }
-  constexpr double kNumericalTolerance = 1.0 + 1.0e-6;
-  constexpr double kRetimeHeadroom = 1.001;
-  const double scale = required_time_scale(envelope.value());
-  if (scale > kNumericalTolerance) {
-    const double applied = scale * kRetimeHeadroom;
-    scale_trajectory_time(trajectory, applied);
-    scale_envelope_time(envelope.value(), applied);
-  }
-  if (!envelope.value().complete ||
-      required_time_scale(envelope.value()) > kNumericalTolerance) {
-    return fail<roboplan::JointTrajectory>(
-        ErrorCode::kValidationLimitsViolation,
-        "Cartesian trajectory exceeds a requested dynamics limit after "
-        "retiming",
-        "cartesian_trajectory_limit_violation");
-  }
+  auto prepared = prepare_candidate_time_law(
+      contract, &path, scene, trajectory, model_velocity_limits->second,
+      model_acceleration_limits->second, contract_control, &waypoint_times_s);
+  if (!prepared.ok())
+    return core::Result<roboplan::JointTrajectory>::Err(prepared.error());
+  scale_bounds = prepared.value();
   return core::Result<roboplan::JointTrajectory>::Ok(std::move(trajectory));
 }
 
-[[nodiscard]] core::Result<roboplan::JointTrajectory> retime_joint_candidate(
+[[nodiscard]] core::Result<roboplan::JointTrajectory> time_joint_candidate(
     const std::shared_ptr<roboplan::Scene> &scene,
     const RoboPlanCandidateBindingDTO &binding,
     const RoboPlanCandidateRequestDTO &request,
-    const ResolvedDynamicsCaps &caps,
     const RoboPlanCandidateComputerConfig &config,
     const RoboPlanCandidateControl &control, const roboplan::JointPath &path,
     const Eigen::VectorXd &start, const Eigen::VectorXd &goal) {
+  if (auto error = control_error(control, "joint_time_parameterization");
+      error.has_value())
+    return core::Result<roboplan::JointTrajectory>::Err(std::move(*error));
+
   roboplan::PathParameterizerTOPPRA parameterizer(scene,
                                                   binding.compiled_group_name);
-  constexpr double kModelLimitQualificationMargin = 0.995;
-  constexpr double kSpeedMargin = 0.99;
-  constexpr int kMaximumRetimeIterations = 32;
-  double velocity_scale =
-      request.speed_profile.velocity_scale * kModelLimitQualificationMargin;
-  double acceleration_scale =
-      request.speed_profile.acceleration_scale * kModelLimitQualificationMargin;
-  const bool has_tcp_cap =
-      request.speed_profile.max_tcp_linear_speed_mps.has_value();
-  const bool has_joint_caps =
-      !caps.velocity_by_joint.empty() || !caps.acceleration_by_joint.empty();
-  // TOPPRA scales the model limits. Apply the same independent scales to
-  // absolute requested caps, so qualification enforces min(model, cap) * scale.
-  // Keep the portable caps unscaled: Cartesian timing resolves its own minima.
-  auto velocity_caps = caps.velocity_by_joint;
-  auto acceleration_caps = caps.acceleration_by_joint;
-  for (auto& [joint, cap] : velocity_caps) cap *= request.speed_profile.velocity_scale;
-  for (auto& [joint, cap] : acceleration_caps) cap *= request.speed_profile.acceleration_scale;
-  double final_tcp_speed = 0.0;
-  JointCapMeasurement final_joint_caps;
-  roboplan::JointTrajectory final_trajectory;
-  for (int iteration = 0; iteration < kMaximumRetimeIterations; ++iteration) {
-    if (auto error = control_error(control, "joint_time_parameterization");
-        error.has_value()) {
-      return core::Result<roboplan::JointTrajectory>::Err(std::move(*error));
-    }
-    roboplan::TOPPRAOptions options;
-    options.dt = config.trajectory_sample_period_s;
-    options.mode = roboplan::SplineFittingMode::Hermite;
-    options.velocity_scale = velocity_scale;
-    options.acceleration_scale = acceleration_scale;
-    options.max_output_samples = config.maximum_trajectory_samples;
-    auto generated = parameterizer.generate(path, options);
-    if (!generated.has_value()) {
-      return fail<roboplan::JointTrajectory>(
-          ErrorCode::kPlanningFailed,
-          "RoboPlan TOPP-RA could not time-parameterize the candidate",
-          "native_time_parameterization_failed",
-          {{"planner_error", generated.error()}});
-    }
-    final_trajectory = std::move(generated.value());
-    anchor_trajectory_endpoints(final_trajectory, start, goal);
-    if (auto error = control_error(control, "joint_dynamics_validation");
-        error.has_value()) {
-      return core::Result<roboplan::JointTrajectory>::Err(std::move(*error));
-    }
-    final_tcp_speed =
-        has_tcp_cap
-            ? maximum_tcp_speed(scene, binding.compiled_group_name,
-                                core::compiled_frame_name(request.base_frame),
-                                core::compiled_frame_name(request.tcp_frame),
-                                final_trajectory)
-            : 0.0;
-    final_joint_caps = measure_joint_cap_peaks(
-        final_trajectory, velocity_caps, acceleration_caps);
-    if (has_joint_caps && !final_joint_caps.samples_complete) {
-      return fail<roboplan::JointTrajectory>(
-          ErrorCode::kUnsupportedCapability,
-          "Trajectory lacks samples needed to prove a dynamics cap",
-          "unsupported_joint_dynamics_limit",
-          {{"dimension", final_joint_caps.incomplete_dimension},
-           {"compiled_joint_name", final_joint_caps.incomplete_joint}});
-    }
-    const bool tcp_ok =
-        !has_tcp_cap ||
-        final_tcp_speed <= *request.speed_profile.max_tcp_linear_speed_mps;
-    const bool joints_ok = final_joint_caps.worst_vel_ratio <= 1.0 &&
-                           final_joint_caps.worst_acc_ratio <= 1.0;
-    if (tcp_ok && joints_ok) {
-      return core::Result<roboplan::JointTrajectory>::Ok(
-          std::move(final_trajectory));
-    }
-
-    double velocity_factor = 1.0;
-    double acceleration_factor = 1.0;
-    if (!tcp_ok) {
-      velocity_factor = std::min(
-          velocity_factor,
-          (*request.speed_profile.max_tcp_linear_speed_mps * kSpeedMargin) /
-              final_tcp_speed);
-    }
-    if (final_joint_caps.worst_vel_ratio > 1.0) {
-      velocity_factor = std::min(
-          velocity_factor, kSpeedMargin / final_joint_caps.worst_vel_ratio);
-    }
-    if (final_joint_caps.worst_acc_ratio > 1.0) {
-      acceleration_factor = std::min(
-          acceleration_factor, kSpeedMargin / final_joint_caps.worst_acc_ratio);
-      velocity_factor =
-          std::min(velocity_factor,
-                   kSpeedMargin / std::sqrt(final_joint_caps.worst_acc_ratio));
-    }
-    const auto next_velocity_scale = velocity_scale * velocity_factor;
-    const auto next_acceleration_scale = acceleration_scale * acceleration_factor;
-    if (!finite_positive(next_velocity_scale) || !finite_positive(next_acceleration_scale) ||
-        (next_velocity_scale == velocity_scale && next_acceleration_scale == acceleration_scale)) {
-      break;
-    }
-    velocity_scale = next_velocity_scale;
-    acceleration_scale = next_acceleration_scale;
-  }
-
-  if (has_tcp_cap &&
-      final_tcp_speed > *request.speed_profile.max_tcp_linear_speed_mps) {
+  roboplan::TOPPRAOptions options;
+  options.dt = config.trajectory_sample_period_s;
+  options.mode = roboplan::SplineFittingMode::Hermite;
+  options.velocity_scale = request.speed_profile.velocity_scale;
+  options.acceleration_scale = request.speed_profile.acceleration_scale;
+  options.max_output_samples = config.maximum_trajectory_samples;
+  auto generated = parameterizer.generate(path, options);
+  if (auto error = control_error(control, "joint_time_parameterization");
+      error.has_value())
+    return core::Result<roboplan::JointTrajectory>::Err(std::move(*error));
+  if (!generated.has_value())
     return fail<roboplan::JointTrajectory>(
-        ErrorCode::kValidationLimitsViolation,
-        "TCP speed cap could not be enforced within the retiming budget",
-        "tcp_linear_speed_limit_violation",
-        {{"measured_mps", std::to_string(final_tcp_speed)},
-         {"limit_mps",
-          std::to_string(*request.speed_profile.max_tcp_linear_speed_mps)}});
-  }
-  return fail<roboplan::JointTrajectory>(
-      ErrorCode::kUnsupportedCapability,
-      "Per-resource dynamics cap could not be enforced within the retiming "
-      "budget",
-      "unsupported_joint_dynamics_limit",
-      {{"worst_velocity_ratio",
-        std::to_string(final_joint_caps.worst_vel_ratio)},
-       {"worst_acceleration_ratio",
-        std::to_string(final_joint_caps.worst_acc_ratio)}});
+        ErrorCode::kPlanningFailed,
+        "RoboPlan TOPP-RA could not time-parameterize the candidate",
+        "native_time_parameterization_failed",
+        {{"planner_error", generated.error()}});
+
+  auto trajectory = std::move(generated.value());
+  anchor_trajectory_endpoints(trajectory, start, goal);
+  // The caller certifies the final interpolant and applies one common time
+  // dilation for joint/TCP caps, optional jerk and live-scaling headroom.
+  // Re-running TOPPRA against sampled peaks would duplicate that stronger gate.
+  return core::Result<roboplan::JointTrajectory>::Ok(std::move(trajectory));
 }
 
 [[nodiscard]] core::Result<std::vector<double>> solve_ik_locked(
@@ -1300,14 +1258,21 @@ RoboPlanCandidateComputer::compute(const RoboPlanCandidateRequestDTO &request,
 
     if (const auto *cartesian =
             std::get_if<core::CartesianPathDTO>(&request.motion)) {
-      auto trajectory =
-          plan_cartesian_candidate(planning_scene, binding_, request,
-                                   *cartesian, caps.value(), config_, control);
+      core::TrajectoryRuntimeScaleBoundsDTO scale_bounds;
+      std::vector<double> waypoint_times_s;
+      auto trajectory = plan_cartesian_candidate(
+          planning_scene, binding_, request, *cartesian, caps.value(), config_,
+          control, scale_bounds, waypoint_times_s);
       if (!trajectory.ok()) {
         return core::Result<core::TrajectoryDTO>::Err(trajectory.error());
       }
-      return portable_trajectory(trajectory.value(), binding_,
-                                 config_.maximum_trajectory_samples);
+      auto portable =
+          portable_trajectory(trajectory.value(), binding_,
+                              config_.maximum_trajectory_samples, scale_bounds);
+      if (portable.ok())
+        portable.value().cartesian_waypoint_times_s =
+            std::move(waypoint_times_s);
+      return portable;
     }
 
     roboplan::JointConfiguration native_goal;
@@ -1431,8 +1396,8 @@ RoboPlanCandidateComputer::compute(const RoboPlanCandidateRequestDTO &request,
         return core::Result<core::TrajectoryDTO>::Err(std::move(*error));
       }
     }
-    auto trajectory = retime_joint_candidate(
-        planning_scene, binding_, request, caps.value(), config_, control,
+    auto trajectory = time_joint_candidate(
+        planning_scene, binding_, request, config_, control,
         candidate_path, native_start.positions, native_goal.positions);
     if (!trajectory.ok()) {
       return core::Result<core::TrajectoryDTO>::Err(trajectory.error());
@@ -1441,8 +1406,25 @@ RoboPlanCandidateComputer::compute(const RoboPlanCandidateRequestDTO &request,
         error.has_value()) {
       return core::Result<core::TrajectoryDTO>::Err(std::move(*error));
     }
+    const auto model_velocity =
+        planning_scene->getVelocityLimitVectors(binding_.compiled_group_name);
+    const auto model_acceleration = planning_scene->getAccelerationLimitVectors(
+        binding_.compiled_group_name);
+    if (!model_velocity || !model_acceleration) {
+      return fail<core::TrajectoryDTO>(
+          ErrorCode::kUnsupportedCapability,
+          "Runtime scaling requires retained model dynamics limits",
+          "native_model_dynamics_limits_unavailable");
+    }
+    auto prepared = prepare_candidate_time_law(
+        cartesian_contract_input(binding_, request, caps.value()), nullptr,
+        planning_scene, trajectory.value(), model_velocity->second,
+        model_acceleration->second, cartesian_control(control));
+    if (!prepared.ok())
+      return core::Result<core::TrajectoryDTO>::Err(prepared.error());
     return portable_trajectory(trajectory.value(), binding_,
-                               config_.maximum_trajectory_samples);
+                               config_.maximum_trajectory_samples,
+                               prepared.value());
   } catch (const std::exception &error) {
     return fail<core::TrajectoryDTO>(ErrorCode::kPlanningFailed,
                                      "RoboPlan candidate adapter failed: " +

@@ -1046,10 +1046,15 @@ void validate_motion_payload(const PreparedMotionExecutionDTO& motion,
                              const RuntimeParticipantStopReadinessDTO& readiness,
                              const RuntimeParticipantPolicySelectionDTO& runtime_policy,
                              std::span<const HardStopResourceLimitDTO> defaults) {
+  if (!motion.trajectory.cartesian_waypoint_times_s.empty()) {
+    const auto* path = std::get_if<CartesianPathDTO>(&motion.plan_request.motion);
+    if (path == nullptr ||
+        path->waypoints.size() != motion.trajectory.cartesian_waypoint_times_s.size())
+      fail("prepared_cartesian_waypoint_milestones_mismatch");
+  }
   const auto metrics_valid = [](const std::vector<double>& values) {
-    return std::all_of(values.begin(), values.end(), [](const double item) {
-      return std::isfinite(item) && item >= 0.0;
-    });
+    return std::all_of(values.begin(), values.end(),
+                       [](const double item) { return std::isfinite(item) && item >= 0.0; });
   };
   const auto* trajectory_metrics =
       motion.validation_evidence.noncollision_result.trajectory_metrics
@@ -1178,7 +1183,7 @@ void validate_motion_payload(const PreparedMotionExecutionDTO& motion,
             ParticipantStopProfilePurposeDTO::kMotionInterruptScope ||
         scope.stop_plan.motion_interrupt_scope_id !=
             std::optional<std::string>(scope.scope_id.value()) ||
-        VerifyPreparedParticipantStopPlan(readiness.resolved_stop_base_plan, scope.stop_plan,
+        VerifyPreparedParticipantStopPlan(readiness, scope.stop_plan,
                                           binding_resource_span(binding), defaults,
                                           scope.node_category)
                 .ok() == false) {
@@ -1419,9 +1424,9 @@ Result<PreparedOperationParticipantDTO> MakePreparedOperationParticipant(
         candidate.ordinary_stop_plan.participant_stop_profile_purpose,
         std::nullopt,
         node_category};
-    auto ordinary = MakePreparedParticipantStopPlan(
-        readiness.resolved_stop_base_plan, std::move(ordinary_context),
-        binding_resource_span(binding), retained_default_limits);
+    auto ordinary =
+        MakePreparedParticipantStopPlan(readiness, std::move(ordinary_context),
+                                        binding_resource_span(binding), retained_default_limits);
     if (!ordinary.ok()) fail("ordinary_stop_plan_make_failed");
     candidate.ordinary_stop_plan = std::move(ordinary.value());
 
@@ -1438,8 +1443,7 @@ Result<PreparedOperationParticipantDTO> MakePreparedOperationParticipant(
           fault.participant_stop_profile_purpose != ParticipantStopProfilePurposeDTO::kFault ||
           fault.motion_interrupt_scope_id.has_value() ||
           !fault.participant_stop_profile.has_value() ||
-          !VerifyPreparedParticipantStopPlan(readiness.resolved_stop_base_plan, fault,
-                                             binding_resource_span(binding),
+          !VerifyPreparedParticipantStopPlan(readiness, fault, binding_resource_span(binding),
                                              retained_default_limits, node_category)
                .ok()) {
         fail("fault_stop_plan_invalid");

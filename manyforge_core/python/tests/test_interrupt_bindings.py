@@ -4,6 +4,50 @@ import manyforge_core_py as core
 import pytest
 
 
+def test_explicit_jerk_settings_resolve_without_changing_the_authored_profile():
+    profile = core.MotionInterruptStopProfileDTO(
+        profile_id="jerk.profile",
+        stop_mode=core.MotionInterruptStopMode.kSoftOnPath,
+        deceleration_time_s=1.0,
+        per_joint_max_deceleration={
+            "joint": core.AngularAccelerationDTO(4.0),
+            "slide": core.LinearAccelerationDTO(0.5),
+        },
+        jerk_limits_enabled=True,
+        per_joint_max_jerk={"joint": core.AngularJerkDTO(20.0)},
+    )
+    frozen = core.resolve_motion_interrupt_stop_jerk_limits(profile)
+    assert len(profile.per_joint_max_jerk) == 1
+    assert frozen.per_joint_max_jerk["joint"].value_rad_s3 == 20.0
+    assert frozen.per_joint_max_jerk["slide"].value_m_s3 == pytest.approx(
+        core.motion_jerk_preset_limit(0.5, 1.0)
+    )
+    profile.jerk_limits_enabled = False
+    assert (
+        len(core.resolve_motion_interrupt_stop_jerk_limits(profile).per_joint_max_jerk)
+        == 1
+    )
+    profile.jerk_limits_enabled = None
+    with pytest.raises(ValueError, match="explicit"):
+        core.resolve_motion_interrupt_stop_jerk_limits(profile)
+
+
+def test_omitted_jerk_choice_cannot_silently_waive_a_limit() -> None:
+    profile = core.MotionInterruptStopProfileDTO(
+        profile_id="unreviewed.profile",
+        stop_mode=core.MotionInterruptStopMode.kSoftOnPath,
+        deceleration_time_s=1.0,
+        per_joint_max_deceleration={"joint": core.AngularAccelerationDTO(4.0)},
+    )
+    assert profile.jerk_limits_enabled is None
+    with pytest.raises(ValueError, match="explicit"):
+        core.resolve_motion_interrupt_stop_jerk_limits(profile)
+    profile.jerk_limits_enabled = False
+    assert not core.resolve_motion_interrupt_stop_jerk_limits(
+        profile
+    ).per_joint_max_jerk
+
+
 def test_typed_stop_profile_round_trip_and_validation() -> None:
     profile = core.MotionInterruptStopProfileDTO(
         profile_id="soft.profile.v2",
@@ -14,9 +58,7 @@ def test_typed_stop_profile_round_trip_and_validation() -> None:
             "slide_z": core.LinearAccelerationDTO(0.4),
         },
         allow_natural_completion_on_short_path=True,
-        recoverable_substitution_mode=(
-            core.MotionInterruptStopMode.kSpringBackHold
-        ),
+        recoverable_substitution_mode=(core.MotionInterruptStopMode.kSpringBackHold),
         require_backend_confirmation=True,
         per_joint_settle_velocity_threshold={
             "joint_a": core.AngularVelocityDTO(0.01),
@@ -38,18 +80,13 @@ def test_typed_stop_profile_round_trip_and_validation() -> None:
     assert profile.per_joint_max_deceleration["joint_a"].value_rad_s2 == 2.0
     assert profile.per_joint_max_deceleration["slide_z"].value_m_s2 == 0.4
     assert profile.per_joint_settle_velocity_threshold is not None
-    assert (
-        profile.per_joint_settle_velocity_threshold["joint_a"].value_rad_s
-        == 0.01
-    )
+    assert profile.per_joint_settle_velocity_threshold["joint_a"].value_rad_s == 0.01
     assert profile.diagnostics == {
         "qualified": True,
         "revision": "v2",
         "tolerance": 0.5,
     }
-    assert core.project_interrupt_structured_value_to_text(
-        profile.diagnostics
-    ) == {
+    assert core.project_interrupt_structured_value_to_text(profile.diagnostics) == {
         "qualified": "true",
         "revision": "v2",
         "tolerance": "0.500000",
@@ -75,9 +112,7 @@ def test_profile_and_closed_structured_value_fail_closed() -> None:
     invalid_substitution = core.MotionInterruptStopProfileDTO(
         profile_id="hard.profile",
         stop_mode=core.MotionInterruptStopMode.kHardDeceleration,
-        recoverable_substitution_mode=(
-            core.MotionInterruptStopMode.kSpringBackHold
-        ),
+        recoverable_substitution_mode=(core.MotionInterruptStopMode.kSpringBackHold),
     )
     assert "only soft_on_path" in core.motion_interrupt_stop_profile_field_error(
         invalid_substitution

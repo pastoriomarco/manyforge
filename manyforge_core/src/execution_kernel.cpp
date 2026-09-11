@@ -10,6 +10,8 @@
 #include <manyforge_core/cache/trajectory_cache_compatibility.hpp>
 #include <manyforge_core/cache/trajectory_cache_intent.hpp>
 #include <manyforge_core/collision/collision_world_snapshot_builder.hpp>
+#include <manyforge_core/detail/motion_resume_intent.hpp>
+#include <manyforge_core/detail/coordinated_motion_preparation.hpp>
 #include <manyforge_core/execution_admission_support.hpp>
 #include <manyforge_core/execution_collision_support.hpp>
 #include <manyforge_core/execution_interrupt_support.hpp>
@@ -18,6 +20,7 @@
 #include <manyforge_core/geometry/pose_math.hpp>
 #include <manyforge_core/logical_scene_identity.hpp>
 #include <manyforge_core/motion_interrupt/soft_on_path_stop_planner.hpp>
+#include <manyforge_core/motion_interrupt/stop_profile_mapper.hpp>
 #include <manyforge_core/motion_target_resolution.hpp>
 #include <manyforge_core/prepared_operation_participant_codec.hpp>
 #include <manyforge_core/prepared_participant_stop_plan_codec.hpp>
@@ -38,9 +41,10 @@ namespace {
 
 void resolve_motion_execution_timeout(ExecuteRequestDTO& request, const TrajectoryDTO& trajectory) {
   if (!request.trajectory_relative_timeout) return;
-  const double duration = trajectory.waypoints.empty() ? 0.0
-                                                       : trajectory.waypoints.back().time_from_start_s;
-  const double budget = std::max({10.0, request.timeouts.execution_timeout_s, 1.5 * duration + 2.0});
+  const double duration =
+      trajectory.waypoints.empty() ? 0.0 : trajectory.waypoints.back().time_from_start_s;
+  const double budget =
+      std::max({10.0, request.timeouts.execution_timeout_s, 1.5 * duration + 2.0});
   if (!std::isfinite(duration) || duration < 0.0 || !std::isfinite(budget) ||
       budget >= static_cast<double>(std::numeric_limits<std::int64_t>::max()) / 1e9) {
     throw std::invalid_argument("Manual trajectory completion budget is not representable");
@@ -731,6 +735,8 @@ struct ExecutionKernel::PreparedMotionSession final {
   mutable std::mutex mutex;
   std::condition_variable changed;
   std::uint64_t execution_id{};
+  std::uint64_t backend_execution_generation{};
+  std::shared_ptr<const PreparedOperationParticipantDTO> last_dispatched_participant;
   ResolvedPreparedMotionExecutionStateDTO state{
       ResolvedPreparedMotionExecutionStateDTO::kPreparing};
   std::shared_ptr<const PreparedOperationParticipantDTO> participant;
@@ -741,6 +747,25 @@ struct ExecutionKernel::PreparedMotionSession final {
   bool cancel_requested{};
   bool resume_cycle{};
 };
+
+namespace {
+Result<void> apply_coordinated_candidate_timing(
+    TrajectoryDTO& trajectory, const ResolvedPreparedMotionExecutionRequestDTO& authority,
+    std::stop_token stop) {
+  if (!authority.common_timing) return Result<void>::Ok();
+  if (trajectory.runtime_scale_bounds) {
+    const auto common = authority.common_timing->arrive_and_wait(
+        authority.execution_request.binding.participant_id, *trajectory.runtime_scale_bounds, stop);
+    if (common && detail::apply_common_runtime_scaling(trajectory, *common))
+      return Result<void>::Ok();
+  }
+  authority.common_timing->cancel();
+  return Result<void>::Err(ErrorDTO{
+      std::string(to_string(ErrorCode::kExecutionRejected)),
+      "Common motion timing preparation failed or was cancelled",
+      {{"reason", "coordinated_time_law_preparation_failed"}}});
+}
+}  // namespace
 
 ExecutionKernel::ExecutionKernel(IPlannerBackend& planner, ExecutionKernelPorts ports,
                                  IExecutionBackend& execution_backend, IClock& clock,
@@ -798,6 +823,15 @@ ExecutionKernel::ExecutionKernel(IPlannerBackend& planner, ExecutionKernelPorts 
                    sm_.status().state == ExecutionState::kPaused || motion_trip_stop_.active() ||
                    operator_stop_worker_.active() || fault_preempt_stop_active();
           }) {
+  // Detach authored aliases once; control/Stop readers share immutable values.
+  if (config_.operator_stop_profile) {
+    config_.operator_stop_profile =
+        std::make_shared<const MotionInterruptStopProfileDTO>(*config_.operator_stop_profile);
+  }
+  if (config_.default_fault_stop_profile) {
+    config_.default_fault_stop_profile =
+        std::make_shared<const MotionInterruptStopProfileDTO>(*config_.default_fault_stop_profile);
+  }
   runtime_collision_monitor_.set_fail_closed_dump_hook(
       [this]() { (void)flight_recorder_.dump_now("runtime_monitor_drain_timeout"); });
   if (config_.collision_monitor_period_ns <= 0) {
@@ -2169,6 +2203,17 @@ void ExecutionKernel::request_active_validation_cancel(std::string reason) {
 }
 
 void ExecutionKernel::request_active_planning_cancel() {
+  std::shared_ptr<PreparedMotionSession> session;
+  {
+    std::lock_guard lock(prepared_motion_session_mutex_);
+    session = active_prepared_motion_session_;
+  }
+  std::shared_ptr<detail::CoordinatedMotionPreparation> common;
+  if (session) {
+    std::lock_guard lock(session->mutex);
+    common = session->authority.common_timing;
+  }
+  if (common) common->cancel();
   planner_.request_cancel();
 }
 
@@ -2829,6 +2874,27 @@ Result<void> ExecutionKernel::arm_motion_scopes_for_dispatch(const ExecuteReques
       [&capability](const MotionInterruptStopProfileDTO& profile, const std::string& profile_slot,
                     const std::string& scope_id,
                     const std::string& policy_id) -> std::optional<ErrorDTO> {
+    if (profile.stop_mode != MotionInterruptStopMode::kHardDeceleration &&
+        !profile.jerk_limits_enabled.has_value()) {
+      return ErrorDTO{kErrorMotionInterruptArmFailed,
+                      "Review and save an explicit controlled-Stop jerk choice before motion",
+                      {{"reason", "motion_controlled_stop_jerk_activation_required"},
+                       {"profile_slot", profile_slot},
+                       {"scope_id", scope_id},
+                       {"policy_id", policy_id}}};
+    }
+    if (profile.jerk_limits_enabled == true) {
+      const auto prepared = resolve_motion_interrupt_stop_jerk_limits(profile);
+      if (!prepared.ok()) return prepared.error();
+      if (prepared.value().per_joint_max_jerk != profile.per_joint_max_jerk) {
+        return ErrorDTO{kErrorMotionInterruptArmFailed,
+                        "Resolve the controlled-Stop jerk table before passing it to execution",
+                        {{"reason", "motion_controlled_stop_jerk_limits_not_prepared"},
+                         {"profile_slot", profile_slot},
+                         {"scope_id", scope_id},
+                         {"policy_id", policy_id}}};
+      }
+    }
     if (!capability.supported_stop_modes.contains(profile.stop_mode)) {
       std::map<std::string, std::string> details{
           {"reason", "stop_mode_not_supported_by_backend"},
@@ -3448,7 +3514,7 @@ void ExecutionKernel::handle_motion_trip_latch(const ExecuteRequestDTO& request,
   // backend proves the original motion is terminal. Precision-contact
   // nodes and profiles without the explicit policy fail closed.
   if (stop_result.completed_by_natural_completion) {
-    if (profile.stop_mode != MotionInterruptStopMode::kSoftOnPath ||
+    if (profile.stop_mode == MotionInterruptStopMode::kHardDeceleration ||
         !profile.allow_natural_completion_on_short_path ||
         node_category == MotionInterruptNodeCategory::kPrecisionContact || !stop_result.accepted ||
         stop_result.error.has_value()) {
@@ -4440,6 +4506,29 @@ void ExecutionKernel::finish_execute_worker() {
   worker_signals_.mark_complete();
 }
 
+Result<void> ExecutionKernel::retire_prepared_motion_membership() {
+  // Called with lifecycle serialization after the execution worker has joined
+  // and the owning cleanup has established settlement. Never a Stop callback.
+  std::shared_ptr<PreparedMotionSession> session;
+  {
+    std::lock_guard lock(prepared_motion_session_mutex_);
+    session = active_prepared_motion_session_;
+  }
+  if (!session) return Result<void>::Ok();
+  const auto retired = execution_backend_.RetirePreparedExecution(session->execution_id);
+  if (!retired.ok()) return retired;
+  std::lock_guard lock(prepared_motion_session_mutex_);
+  if (active_prepared_motion_session_ == session) active_prepared_motion_session_.reset();
+  return Result<void>::Ok();
+}
+
+ResetResultDTO ExecutionKernel::reset_execution_backend() {
+  auto reset = execution_backend_.reset();
+  if (!reset.accepted) return reset;
+  const auto retired = retire_prepared_motion_membership();
+  return retired.ok() ? reset : ResetResultDTO{false, retired.error()};
+}
+
 void ExecutionKernel::notify_execution_waiters() {
   worker_signals_.notify();
 }
@@ -4691,7 +4780,7 @@ bool ExecutionKernel::finalize_competing_terminal_authority(const ExecuteRequest
 }
 
 ExecutionKernel::ExecuteWorkerPlanPhaseResult ExecutionKernel::execute_worker_plan_phase(
-    std::stop_token st, const ExecuteRequestDTO& request,
+    std::stop_token st, ExecuteRequestDTO& request,
     const CollisionWorldLeaseInventory& projection_inventory, std::uint64_t exec_id,
     std::optional<TrajectoryDTO> cached_trajectory, bool cache_revalidation_candidate,
     ExecutionState worker_entry_state, ActiveMotionExecution& motion_state,
@@ -4758,7 +4847,10 @@ ExecutionKernel::ExecuteWorkerPlanPhaseResult ExecutionKernel::execute_worker_pl
         deadline, [this]() { stop_policy_.request_hard_stop(); }, SchedulerPriority::Monitoring);
   }
 
-  auto plan_result = plan_trajectory_with_evidence(request, projection_inventory);
+  auto plan_result = prepared_session && prepared_session->authority.continuation
+                         ? plan_motion_continuation(request, projection_inventory,
+                                                    *prepared_session->authority.continuation)
+                         : plan_trajectory_with_evidence(request, projection_inventory);
   const bool planning_timed_out =
       planning_timeout_ns > 0 && (clock_.now() - planning_start_ns) >= planning_timeout_ns;
 
@@ -5402,6 +5494,39 @@ ExecutionKernel::execute_worker_validate_replan_phase(
     retry_validating_snapshot.progress = 0.0;
     publish_execution_snapshot(std::move(retry_validating_snapshot));
   }
+  if (val_result.ok() && prepared_session && prepared_session->authority.common_timing) {
+    // Retain the independently validated candidate, before another
+    // participant's timing budget changes it. Cache reuse still revalidates.
+    if (!active_trajectory_from_cache || cache_revalidation_candidate)
+      store_validated_candidate(
+          request, exec_id, trajectory,
+          scene_snapshot_lease_inventory.projection_binding.projection_revision,
+          val_result.value().collision_world_revision, cache_revalidation_candidate);
+    auto timing = apply_coordinated_candidate_timing(trajectory, prepared_session->authority, st);
+    if (!timing.ok()) {
+      val_result = Result<CollisionValidationSuccess>::Err(timing.error());
+    } else {
+      // The ordinary collision-replan loop selected this candidate. Validate
+      // the actual common timing once; never reuse the earlier receipt or
+      // independently replan after the all-participant timing decision.
+      if (!planning_result || !planning_result->trajectory) {
+        prepared_session->authority.common_timing->cancel();
+        val_result = Result<CollisionValidationSuccess>::Err(ErrorDTO{
+            kErrorInternalError, "Common timing lost its planning evidence",
+            {{"reason", "coordinated_planning_evidence_missing"}}});
+      } else {
+        planning_result->trajectory = trajectory;
+        val_result = validate_trajectory(trajectory, request, scene_snapshot_lease_inventory,
+                                         scene_snapshot_lease);
+      }
+    }
+    if (finalize_prepared_motion_cancellation_if_requested(
+            prepared_session, request, exec_id, motion_state,
+            "prepared_motion_cancelled_during_common_timing")) {
+      phase_result.status = ExecuteWorkerPhaseStatus::kTerminal;
+      return phase_result;
+    }
+  }
   if (val_result.ok()) {
     auto projection_result = build_runtime_collision_state_projection(
         trajectory, val_result.value().collision_trajectory);
@@ -5604,9 +5729,36 @@ ExecutionKernel::execute_worker_validate_replan_phase(
   return phase_result;
 }
 
+void ExecutionKernel::store_validated_candidate(
+    const ExecuteRequestDTO& request, std::uint64_t exec_id, const TrajectoryDTO& trajectory,
+    const ProjectionRevisionDTO& projection_revision,
+    const CollisionWorldRevision& validation_revision, bool revalidated_cache_candidate) {
+  // The exact resolved intent and validation revision remain cache authority;
+  // operation-local common timing is deliberately not retained here.
+  const auto key = trajectory_cache_key(request);
+  if (request.cache_mode == CacheMode::kDisable || !key.valid() ||
+      !collision_world_revision_is_set(validation_revision))
+    return;
+  cache_.store(key, trajectory,
+               TrajectoryCacheRevisionEvidence{projection_revision, validation_revision},
+               trajectory_cache_intent_identity(request));
+  if (revalidated_cache_candidate) {
+    emit_event({KernelEventType::kCacheRevalidated,
+                exec_id,
+                clock_.now(),
+                {},
+                {},
+                std::nullopt,
+                {{"move_id", request.move_id},
+                 {"revision_id", std::to_string(validation_revision.revision_id)}}});
+    std::lock_guard<std::mutex> lock(metrics_mutex_);
+    metrics_.cache_revalidations_succeeded++;
+  }
+}
+
 ExecutionKernel::ExecuteWorkerDispatchPhaseResult ExecutionKernel::execute_worker_dispatch_phase(
     const ExecuteRequestDTO& request, std::uint64_t exec_id, const TrajectoryDTO& trajectory,
-    bool active_trajectory_from_cache, bool cache_revalidation_candidate,
+    bool active_trajectory_from_cache, bool cache_revalidation_candidate, bool store_candidate,
     const ProjectionLeaseBindingDTO& projection_binding,
     const CollisionWorldLeaseInventory& scene_snapshot_lease_inventory,
     const CollisionWorldRevision& validation_world_revision,
@@ -5795,33 +5947,9 @@ ExecutionKernel::ExecuteWorkerDispatchPhaseResult ExecutionKernel::execute_worke
     }
   }
 
-  // Store against both the exact validation revision and the resolved planner
-  // intent. This prevents same-endpoint Cartesian paths, speed profiles, or
-  // per-joint cap variants from sharing a move_id cache entry.
-  const auto dispatch_cache_key = trajectory_cache_key(request);
-  if (request.cache_mode != CacheMode::kDisable && dispatch_cache_key.valid() &&
-      (!active_trajectory_from_cache || cache_revalidation_candidate) &&
-      collision_world_revision_is_set(validation_world_revision)) {
-    // Tag every cache entry with the immutable snapshot revision that
-    // validation actually used. If live pose-source updates publish newer
-    // revisions before the next lookup, lookup_with_revision declines the hit.
-    cache_.store(dispatch_cache_key, trajectory,
-                 TrajectoryCacheRevisionEvidence{projection_binding.projection_revision,
-                                                 validation_world_revision},
-                 trajectory_cache_intent_identity(request));
-    if (cache_revalidation_candidate) {
-      emit_event({KernelEventType::kCacheRevalidated,
-                  exec_id,
-                  clock_.now(),
-                  {},
-                  {},
-                  std::nullopt,
-                  {{"move_id", request.move_id},
-                   {"revision_id", std::to_string(validation_world_revision.revision_id)}}});
-      std::lock_guard<std::mutex> metrics_lock(metrics_mutex_);
-      metrics_.cache_revalidations_succeeded++;
-    }
-  }
+  if (store_candidate && (!active_trajectory_from_cache || cache_revalidation_candidate))
+    store_validated_candidate(request, exec_id, trajectory, projection_binding.projection_revision,
+                              validation_world_revision, cache_revalidation_candidate);
 
   {
     auto arm_result = arm_motion_scopes_for_dispatch(request, exec_id, motion_state);
@@ -6337,9 +6465,9 @@ ExecutionKernel::make_and_prepare_motion_participant(
         ParticipantStopProfilePurposeDTO::kMotionInterruptScope,
         scope.scope_id,
         scope.node_category};
-    auto stop_plan = MakePreparedParticipantStopPlan(
-        authority.stop_readiness.value().resolved_stop_base_plan, std::move(stop_context),
-        binding.resources, authority.retained_default_stop_limits);
+    auto stop_plan =
+        MakePreparedParticipantStopPlan(authority.stop_readiness.value(), std::move(stop_context),
+                                        binding.resources, authority.retained_default_stop_limits);
     if (!stop_plan.ok()) {
       return Result<std::shared_ptr<const PreparedOperationParticipantDTO>>::Err(stop_plan.error());
     }
@@ -6475,7 +6603,8 @@ ExecutionKernel::make_and_prepare_motion_participant(
 
   Result<PrepareParticipantResultDTO> backend_result = [&]() {
     try {
-      return Result<PrepareParticipantResultDTO>::Ok(execution_backend_.Prepare(*participant));
+      return Result<PrepareParticipantResultDTO>::Ok(
+          execution_backend_.Prepare(*participant, prepared_session->execution_id));
     } catch (const std::exception& error) {
       return MakePrepareParticipantResult(
           *participant, PrepareParticipantResultStateDTO::kRejected,
@@ -6511,6 +6640,15 @@ ExecutionKernel::make_and_prepare_motion_participant(
                                                        "Execution backend rejected prepared motion",
                                                        {{"reason", "backend_prepare_rejected"}}}));
   }
+  if (authority.common_timing) {
+    auto common_clock = authority.common_timing->execution_clock();
+    if (!common_clock)
+      return reject("coordinated_execution_clock_unavailable",
+                    "Coordinated preparation was cancelled before clock binding");
+    auto bound = execution_backend_.BindPreparedExecutionClock(*participant, std::move(common_clock));
+    if (!bound.ok())
+      return Result<std::shared_ptr<const PreparedOperationParticipantDTO>>::Err(bound.error());
+  }
   return Result<std::shared_ptr<const PreparedOperationParticipantDTO>>::Ok(std::move(participant));
 }
 
@@ -6541,6 +6679,8 @@ void ExecutionKernel::async_execute_worker(
         bool notify = false;
         {
           std::lock_guard lock(prepared_session->mutex);
+          if (prepared_session->authority.common_timing)
+            prepared_session->authority.common_timing->cancel();
           if (prepared_session->state == ResolvedPreparedMotionExecutionStateDTO::kPreparing ||
               prepared_session->state == ResolvedPreparedMotionExecutionStateDTO::kPrepared ||
               prepared_session->state ==
@@ -6739,6 +6879,7 @@ void ExecutionKernel::async_execute_worker(
 
     auto dispatch_phase = execute_worker_dispatch_phase(
         request, exec_id, trajectory, active_trajectory_from_cache, cache_revalidation_candidate,
+        !(prepared_session && prepared_session->authority.common_timing),
         projection_binding, retained_scene.inventory(), validation_world_revision,
         validation_phase.scene_snapshot_lease, std::move(validation_phase.collision_trajectory),
         prepared_participant, motion_state);
@@ -6747,6 +6888,9 @@ void ExecutionKernel::async_execute_worker(
     }
     if (prepared_session) {
       std::lock_guard lock(prepared_session->mutex);
+      prepared_session->backend_execution_generation =
+          dispatch_phase.execution_handle.execution_generation;
+      prepared_session->last_dispatched_participant = prepared_session->participant;
       prepared_session->state = ResolvedPreparedMotionExecutionStateDTO::kDispatched;
     }
     auto execution_handle = std::move(dispatch_phase.execution_handle);
@@ -6876,26 +7020,29 @@ void ExecutionKernel::async_execute_worker(
           if (mechanism.error || (!mechanism.supported && request.initial_runtime_scale) ||
               !std::isfinite(scale) || scale < 0.0 || scale > 1.0) {
             execution_timing_error = ErrorDTO{
-                kErrorInvariantViolation, "Execution timing feedback is unavailable or invalid",
+                kErrorInvariantViolation,
+                "Execution timing feedback is unavailable or invalid",
                 {{"reason", "runtime_scale_timing_feedback_invalid"},
                  {"cause", mechanism.error ? mechanism.error->message : "invalid applied scale"}}};
           } else {
             runtime_scaled_execution_ns += static_cast<double>(dt_ns) * scale;
           }
         } catch (...) {
-          execution_timing_error = ErrorDTO{
-              kErrorInvariantViolation, "Execution timing feedback read failed",
-              {{"reason", "runtime_scale_timing_feedback_failed"}}};
+          execution_timing_error = ErrorDTO{kErrorInvariantViolation,
+                                            "Execution timing feedback read failed",
+                                            {{"reason", "runtime_scale_timing_feedback_failed"}}};
         }
       }
       last_runtime_scale_sample_ns = now_ns;
 
       // Timing faults use the existing bounded failure/containment path too;
       // throwing out of an active worker must not leave motion unattended.
-      if (execution_timing_error || (!completed && exec_timeout_ns > 0 &&
-          runtime_scaled_execution_ns >= static_cast<double>(exec_timeout_ns))) {
+      if (execution_timing_error ||
+          (!completed && exec_timeout_ns > 0 &&
+           runtime_scaled_execution_ns >= static_cast<double>(exec_timeout_ns))) {
         const auto execution_error = execution_timing_error.value_or(ErrorDTO{
-            kErrorExecutionTimeout, "Execution timeout exceeded",
+            kErrorExecutionTimeout,
+            "Execution timeout exceeded",
             {{"execution_budget_s", std::to_string(static_cast<double>(exec_timeout_ns) / 1e9)},
              {"scaled_elapsed_s", std::to_string(runtime_scaled_execution_ns / 1e9)}}});
         if (operator_stop_worker_.active()) {
@@ -6960,8 +7107,8 @@ void ExecutionKernel::async_execute_worker(
         const bool stop_completed = drain_execution_handle_bounded(execution_handle);
         auto prev = sm_.status().state;
         sm_.set_last_error(stop_completed ? (execution_timing_error ? ErrorCode::kInvariantViolation
-                                                                  : ErrorCode::kExecutionTimeout)
-                                         : ErrorCode::kStopFailed);
+                                                                    : ErrorCode::kExecutionTimeout)
+                                          : ErrorCode::kStopFailed);
         auto terminal_state =
             stop_completed ? ExecutionState::kFailed : ExecutionState::kInterventionRequired;
         auto timeout_transition = commit_terminal(terminal_state, "execution_timeout_terminal");
@@ -6971,9 +7118,10 @@ void ExecutionKernel::async_execute_worker(
           auto terminal_error =
               stop_completed ? execution_error
                              : operator_intervention_error(ErrorCode::kStopFailed,
-                                                           execution_error.message + " "
-                                                           "and software stop completion "
-                                                           "was not observed",
+                                                           execution_error.message +
+                                                               " "
+                                                               "and software stop completion "
+                                                               "was not observed",
                                                            "execution_timeout_stop_drain", prev,
                                                            exec_id, request.move_id);
           if (finalize_overridden_terminal_authority(
@@ -7013,11 +7161,12 @@ void ExecutionKernel::async_execute_worker(
         to_snapshot.state = terminal_state;
         ErrorDTO terminal_error =
             stop_completed ? execution_error
-                           : operator_intervention_error(
-                                 ErrorCode::kStopFailed,
-                                 execution_error.message + " and software stop "
-                                 "completion was not observed",
-                                 "execution_timeout_stop_drain", prev, exec_id, request.move_id);
+                           : operator_intervention_error(ErrorCode::kStopFailed,
+                                                         execution_error.message +
+                                                             " and software stop "
+                                                             "completion was not observed",
+                                                         "execution_timeout_stop_drain", prev,
+                                                         exec_id, request.move_id);
         to_snapshot.error = terminal_error;
         publish_execution_snapshot(std::move(to_snapshot));
 
@@ -7035,10 +7184,9 @@ void ExecutionKernel::async_execute_worker(
           std::lock_guard<std::mutex> lock(metrics_mutex_);
           metrics_.executions_failed++;
         }
-        finalize_motion_execution_outcome(motion_state, MotionExecutionTerminalCause::kFailed,
-                                          terminal_error, std::nullopt,
-                                          execution_timing_error ? "execution_timing_fault"
-                                                                 : "execution_timeout");
+        finalize_motion_execution_outcome(
+            motion_state, MotionExecutionTerminalCause::kFailed, terminal_error, std::nullopt,
+            execution_timing_error ? "execution_timing_fault" : "execution_timeout");
         return;
       }
 
@@ -7207,6 +7355,9 @@ void ExecutionKernel::async_execute_worker(
               resume_request = prepared_session->authority.execution_request;
             }
           }
+          // The worker retains the last resolved intent even when the private
+          // prepared session has advanced its goal and cleared the old product.
+          resume_request.motion = request.motion;
           auto finish_resume_interrupted = [&](ExecutionState terminal_state, ErrorDTO error,
                                                const char* reap_reason) {
             sm_.set_last_error(error_code_from_dto(error));
@@ -7369,8 +7520,9 @@ void ExecutionKernel::async_execute_worker(
           }
           auto resume_scene_snapshot_lease =
               build_scene_snapshot_lease(resume_scene.inventory(), resume_request, exec_id);
-          auto resume_plan =
-              plan_resume_trajectory_with_evidence(resume_request, resume_scene.inventory());
+          auto resume_plan = plan_resume_trajectory_with_evidence(
+              resume_request, resume_scene.inventory(), trajectory,
+              execution_backend_.stopped_trajectory_time_s(execution_handle.execution_generation));
           if (!resume_plan.ok()) {
             fail_resume_closed(resume_plan.error(), "resume planning failed",
                                "resume_planning_failed", true, false);
@@ -7378,6 +7530,16 @@ void ExecutionKernel::async_execute_worker(
           }
 
           auto resumed_trajectory = *resume_plan.value().result.trajectory;
+          if (prepared_resume) {
+            auto timing = apply_coordinated_candidate_timing(
+                resumed_trajectory, prepared_session->authority, st);
+            if (!timing.ok()) {
+              fail_resume_closed(timing.error(), "resume common timing failed",
+                                 "resume_common_timing_failed", true, false);
+              return;
+            }
+            resume_plan.value().result.trajectory = resumed_trajectory;
+          }
           emit_event({KernelEventType::kPlanCompleted,
                       exec_id,
                       clock_.now(),
@@ -7606,7 +7768,8 @@ void ExecutionKernel::async_execute_worker(
           // A freshly validated manual remainder gets its own duration-based
           // budget. Authored Program deadlines remain cumulative, unchanged.
           if (resume_request.trajectory_relative_timeout) {
-            exec_timeout_ns = static_cast<int64_t>(resume_request.timeouts.execution_timeout_s * 1e9);
+            exec_timeout_ns =
+                static_cast<int64_t>(resume_request.timeouts.execution_timeout_s * 1e9);
             runtime_scaled_execution_ns = 0.0;
             last_runtime_scale_sample_ns = clock_.now();
           }
@@ -7630,6 +7793,9 @@ void ExecutionKernel::async_execute_worker(
             }
             {
               std::lock_guard session_lock(prepared_session->mutex);
+              prepared_session->backend_execution_generation =
+                  execution_handle.execution_generation;
+              prepared_session->last_dispatched_participant = prepared_session->participant;
               prepared_session->state = ResolvedPreparedMotionExecutionStateDTO::kDispatched;
               prepared_session->resume_cycle = false;
             }
@@ -7694,6 +7860,10 @@ void ExecutionKernel::async_execute_worker(
                                           std::move(resume_collision_trajectory),
                                           resume_request.contact_policy_id,
                                           resume_scene.inventory());
+          // A second Pause/Resume must use this new curve's timeline and
+          // remaining destinations, not the initial execution's milestones.
+          request.motion = std::move(resume_request.motion);
+          trajectory = std::move(resumed_trajectory);
         }
 
         if (completed) {
@@ -8031,8 +8201,8 @@ Result<std::uint64_t> ExecutionKernel::PrepareMotion(
                  {{"reason", "prepared_motion_authority_mismatch"}}});
   }
   auto verified_stop = VerifyPreparedParticipantStopPlan(
-      request.stop_readiness.value().resolved_stop_base_plan, *request.ordinary_stop_plan,
-      binding.resources, request.retained_default_stop_limits, request.stop_node_category);
+      request.stop_readiness.value(), *request.ordinary_stop_plan, binding.resources,
+      request.retained_default_stop_limits, request.stop_node_category);
   if (!verified_stop.ok() || request.ordinary_stop_plan->operation_id != resolved.operation_id ||
       request.ordinary_stop_plan->operation_revision != request.operation_revision ||
       request.ordinary_stop_plan->participant_id != resolved.participant_id ||
@@ -8046,8 +8216,8 @@ Result<std::uint64_t> ExecutionKernel::PrepareMotion(
   }
   if (request.fault_stop_plan) {
     const auto verified_fault = VerifyPreparedParticipantStopPlan(
-        request.stop_readiness.value().resolved_stop_base_plan, *request.fault_stop_plan,
-        binding.resources, request.retained_default_stop_limits, request.stop_node_category);
+        request.stop_readiness.value(), *request.fault_stop_plan, binding.resources,
+        request.retained_default_stop_limits, request.stop_node_category);
     if (!verified_fault.ok() || request.fault_stop_plan->operation_id != resolved.operation_id ||
         request.fault_stop_plan->operation_revision != request.operation_revision ||
         request.fault_stop_plan->participant_id != resolved.participant_id ||
@@ -8098,10 +8268,41 @@ Result<ResolvedPreparedMotionExecutionSnapshotDTO> ExecutionKernel::ObservePrepa
                  "Prepared motion execution identity is stale",
                  {{"reason", "prepared_motion_execution_id_mismatch"}}});
   }
+  if ((session->backend_execution_generation != 0U) !=
+      static_cast<bool>(session->last_dispatched_participant))
+    return Result<ResolvedPreparedMotionExecutionSnapshotDTO>::Err(
+        ErrorDTO{kErrorInvariantViolation,
+                 "Dispatched motion source is inconsistent",
+                 {{"reason", "prepared_motion_dispatch_source_invalid"}}});
+  if (session->dispatch_gate.load(std::memory_order_acquire) ==
+          PreparedMotionDispatchGate::kCommitted &&
+      session->state != ResolvedPreparedMotionExecutionStateDTO::kDispatched)
+    return Result<ResolvedPreparedMotionExecutionSnapshotDTO>::Err(
+        ErrorDTO{kErrorInvariantViolation,
+                 "A committed dispatch has not produced a verified motion source",
+                 {{"reason", "prepared_motion_dispatch_outcome_unresolved"}}});
+  const auto cursor =
+      session->last_dispatched_participant
+          ? execution_backend_.stopped_trajectory_time_s(session->backend_execution_generation)
+          : std::nullopt;
+  if (cursor) {
+    const auto* motion = session->last_dispatched_participant
+                             ? std::get_if<PreparedMotionExecutionDTO>(
+                                   &session->last_dispatched_participant->payload)
+                             : nullptr;
+    if (session->backend_execution_generation == 0U || !std::isfinite(*cursor) || *cursor < 0.0 ||
+        !motion || motion->trajectory.waypoints.empty() ||
+        *cursor > motion->trajectory.waypoints.back().time_from_start_s)
+      return Result<ResolvedPreparedMotionExecutionSnapshotDTO>::Err(
+          ErrorDTO{kErrorInvariantViolation,
+                   "Backend returned an invalid original trajectory cursor",
+                   {{"reason", "prepared_motion_cursor_invalid"}}});
+  }
   return Result<ResolvedPreparedMotionExecutionSnapshotDTO>::Ok(
       ResolvedPreparedMotionExecutionSnapshotDTO{session->execution_id, session->state,
                                                  session->participant,
-                                                 session->backend_prepare_result, session->error});
+                                                 session->backend_prepare_result, session->error,
+                                                 cursor, session->last_dispatched_participant});
 }
 
 Result<void> ExecutionKernel::DispatchPreparedMotion(
@@ -8193,17 +8394,15 @@ Result<void> ExecutionKernel::PrepareResumeMotion(const std::uint64_t execution_
                  {{"reason", "prepared_resume_authority_mismatch"}}});
   }
   const auto verified_stop = VerifyPreparedParticipantStopPlan(
-      prior.stop_readiness.value().resolved_stop_base_plan, *request.ordinary_stop_plan,
-      prior.binding.value().resources, prior.retained_default_stop_limits,
-      prior.stop_node_category);
+      prior.stop_readiness.value(), *request.ordinary_stop_plan, prior.binding.value().resources,
+      prior.retained_default_stop_limits, prior.stop_node_category);
   if (!verified_stop.ok()) {
     return Result<void>::Err(verified_stop.error());
   }
   if (request.fault_stop_plan) {
     const auto verified_fault = VerifyPreparedParticipantStopPlan(
-        prior.stop_readiness.value().resolved_stop_base_plan, *request.fault_stop_plan,
-        prior.binding.value().resources, prior.retained_default_stop_limits,
-        prior.stop_node_category);
+        prior.stop_readiness.value(), *request.fault_stop_plan, prior.binding.value().resources,
+        prior.retained_default_stop_limits, prior.stop_node_category);
     if (!verified_fault.ok()) {
       return Result<void>::Err(verified_fault.error());
     }
@@ -8215,6 +8414,7 @@ Result<void> ExecutionKernel::PrepareResumeMotion(const std::uint64_t execution_
   updated.execution_request.binding.controller_goal_generation = request.controller_goal_generation;
   updated.ordinary_stop_plan = std::move(request.ordinary_stop_plan);
   updated.fault_stop_plan = std::move(request.fault_stop_plan);
+  updated.common_timing = std::move(request.common_timing);
   auto transition = stop_policy_.request_resume();
   if (!transition.ok()) {
     return Result<void>::Err(transition.error());
@@ -8298,6 +8498,7 @@ Result<void> ExecutionKernel::CancelPreparedResumeMotion(const std::uint64_t exe
     }
     session->cancel_requested = true;
     session->state = ResolvedPreparedMotionExecutionStateDTO::kCancelledPreDispatch;
+    if (session->authority.common_timing) session->authority.common_timing->cancel();
   }
   session->changed.notify_all();
   request_active_planning_cancel();
@@ -8335,6 +8536,7 @@ Result<void> ExecutionKernel::CancelPreparedMotion(const std::uint64_t execution
     }
     session->cancel_requested = true;
     session->state = ResolvedPreparedMotionExecutionStateDTO::kCancelledPreDispatch;
+    if (session->authority.common_timing) session->authority.common_timing->cancel();
   }
   session->changed.notify_all();
   request_active_planning_cancel();
@@ -8424,6 +8626,13 @@ Result<uint64_t> ExecutionKernel::execute_impl(
                                            {"state", to_string(sm_.status().state)}}});
   }
 
+  const auto cleanup_state = sm_.status().state;
+  if (cleanup_state == ExecutionState::kIdle || cleanup_state == ExecutionState::kFailed ||
+      cleanup_state == ExecutionState::kStopped) {
+    if (const auto retired = retire_prepared_motion_membership(); !retired.ok()) {
+      return Result<uint64_t>::Err(retired.error());
+    }
+  }
   if (sm_.status().state == ExecutionState::kFailed ||
       sm_.status().state == ExecutionState::kStopped) {
     const auto prev_state = sm_.status().state;
@@ -8470,10 +8679,16 @@ Result<uint64_t> ExecutionKernel::execute_impl(
                   {"execution_timeout_s", std::to_string(request.timeouts.execution_timeout_s)}}});
   }
 
+  const uint64_t exec_id = next_execution_id_.load(std::memory_order_relaxed);
+  if (exec_id == std::numeric_limits<std::uint64_t>::max()) {
+    return Result<uint64_t>::Err(ErrorDTO{kErrorExecutionRejected,
+                                          "Execution identity space is exhausted",
+                                          {{"reason", "execution_id_exhausted"}}});
+  }
   terminal_stop_authority_asserted_.store(false, std::memory_order_release);
   terminal_fault_authority_asserted_.store(false, std::memory_order_release);
   addressed_stop_fence_execution_id_.store(0U, std::memory_order_release);
-  uint64_t exec_id = next_execution_id_++;
+  next_execution_id_.store(exec_id + 1U, std::memory_order_relaxed);
   auto prev_state = sm_.status().state;
   sm_.set_execution_id(exec_id);
   set_active_request_correlation(request);
@@ -8633,7 +8848,8 @@ Result<uint64_t> ExecutionKernel::execute_impl(
   }
 
   std::optional<ProgramFrameResolutionContextDTO> resolution_context;
-  if (request.target_mode == MotionTargetModeDTO::kRelative) {
+  const auto continuation = prepared_session ? prepared_session->authority.continuation : nullptr;
+  if (!continuation && request.target_mode == MotionTargetModeDTO::kRelative) {
     if (!synced_state.has_value()) {
       return reject_admission(ErrorDTO{kErrorStartStateMismatch,
                                        "Relative motion requires an authority-selected start state",
@@ -8683,9 +8899,11 @@ Result<uint64_t> ExecutionKernel::execute_impl(
                    {{"reason", "program_frame_resolution_context_invalid"}}});
     }
   }
-  auto resolved_motion = resolve_motion_target(
-      request, resolution_context.has_value() ? &*resolution_context : nullptr,
-      reference_resolver_);
+  auto resolved_motion =
+      continuation ? Result<ResolvedMotionSpecDTO>::Ok(continuation->motion)
+                   : resolve_motion_target(
+                         request, resolution_context.has_value() ? &*resolution_context : nullptr,
+                         reference_resolver_);
   if (!resolved_motion.ok()) {
     const auto cache_key = trajectory_cache_key(request);
     if (request.cache_mode != CacheMode::kDisable && cache_.contains(cache_key)) {
@@ -8703,6 +8921,7 @@ Result<uint64_t> ExecutionKernel::execute_impl(
     return reject_admission(resolved_motion.error());
   }
   resolved_request.motion = std::move(resolved_motion.value());
+  if (continuation) resolved_request.cache_mode = CacheMode::kDisable;
 
   if (!synced_state.has_value()) {
     return reject_admission(ErrorDTO{kErrorStartStateMismatch,
@@ -8721,7 +8940,7 @@ Result<uint64_t> ExecutionKernel::execute_impl(
   const TrajectoryCacheRevisionEvidence active_cache_evidence{
       projection_binding.projection_revision, active_collision_world_revision};
   const auto cache_key = trajectory_cache_key(resolved_request);
-  if (request.cache_mode != CacheMode::kDisable) {
+  if (resolved_request.cache_mode != CacheMode::kDisable) {
     // Exact-revision entries are cache hits. A same-intent older-revision entry
     // is only a current-snapshot revalidation candidate; it carries no stale
     // proof and cannot dispatch until the ordinary validation gate restamps it.
@@ -8772,7 +8991,7 @@ Result<uint64_t> ExecutionKernel::execute_impl(
     // worker yet; reset can clear the admission without touching any selected
     // stop profile. Active operator stops are handled by reset() in Stopping.
     invalidate_gripper_authority(GripperInvalidationReason::kReset);
-    auto backend_reset = execution_backend_.reset();
+    auto backend_reset = reset_execution_backend();
     if (!backend_reset.accepted) {
       return fail_admission(backend_reset.error.value_or(
           ErrorDTO{kErrorResetFailed,
@@ -9817,7 +10036,7 @@ ResetResultDTO ExecutionKernel::reset(std::optional<std::uint64_t> expected_epoc
     if (auto stale = reject_if_stale()) {
       return *stale;
     }
-    auto backend_reset = execution_backend_.reset();
+    auto backend_reset = reset_execution_backend();
     if (!backend_reset.accepted) {
       return enter_reset_intervention(
           backend_reset.error.value_or(operator_intervention_error(
@@ -9852,7 +10071,7 @@ ResetResultDTO ExecutionKernel::reset(std::optional<std::uint64_t> expected_epoc
     if (auto stale = reject_if_stale()) {
       return *stale;
     }
-    auto backend_reset = execution_backend_.reset();
+    auto backend_reset = reset_execution_backend();
     if (!backend_reset.accepted) {
       return backend_reset;
     }
@@ -10073,7 +10292,7 @@ ResetResultDTO ExecutionKernel::reset_after_certified_containment(
   if (!control_command_epoch_matches(expected_epoch)) {
     return ResetResultDTO{false, stale_control_command_error()};
   }
-  auto backend_reset = execution_backend_.reset();
+  auto backend_reset = reset_execution_backend();
   if (!backend_reset.accepted) {
     return backend_reset;
   }
@@ -10122,7 +10341,7 @@ ResetResultDTO ExecutionKernel::reset_after_certified_containment(
 AcknowledgeCompletedResultDTO ExecutionKernel::acknowledge_completed(
     uint64_t execution_id, std::optional<std::uint64_t> expected_epoch) {
   EventDeferralScope event_scope(*this);
-  std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+  std::unique_lock<std::mutex> lifecycle_lock(lifecycle_mutex_);
 
   if (!control_command_epoch_matches(expected_epoch)) {
     return AcknowledgeCompletedResultDTO{false, stale_control_command_error()};
@@ -10151,6 +10370,19 @@ AcknowledgeCompletedResultDTO ExecutionKernel::acknowledge_completed(
                          {"execution_id", std::to_string(execution_id)}}}};
   }
 
+  if (!retire_execute_worker(lifecycle_lock)) {
+    return AcknowledgeCompletedResultDTO{
+        false, ErrorDTO{kErrorExecutionRejected,
+                        "Completed worker has not retired",
+                        {{"reason_code", reason_codes::kTerminalPublicationInProgress},
+                         {"retryable", "true"}}}};
+  }
+  if (!control_command_epoch_matches(expected_epoch)) {
+    return AcknowledgeCompletedResultDTO{false, stale_control_command_error()};
+  }
+  if (const auto retired = retire_prepared_motion_membership(); !retired.ok()) {
+    return AcknowledgeCompletedResultDTO{false, retired.error()};
+  }
   auto result = sm_.reset();
   if (!result.ok()) {
     return AcknowledgeCompletedResultDTO{false, result.error()};
@@ -11855,17 +12087,18 @@ Result<TrajectoryDTO> ExecutionKernel::plan_trajectory(
   return Result<TrajectoryDTO>::Ok(std::move(*planned.value().result.trajectory));
 }
 
-Result<TrajectoryDTO> ExecutionKernel::plan_resume_trajectory(
-    const ExecuteRequestDTO& request, const CollisionWorldLeaseInventory& projection_inventory) {
-  auto planned = plan_resume_trajectory_with_evidence(request, projection_inventory);
-  if (!planned.ok()) {
-    return Result<TrajectoryDTO>::Err(planned.error());
-  }
-  return Result<TrajectoryDTO>::Ok(std::move(*planned.value().result.trajectory));
+Result<ExecutionKernel::PlanningSuccess> ExecutionKernel::plan_resume_trajectory_with_evidence(
+    ExecuteRequestDTO& request, const CollisionWorldLeaseInventory& projection_inventory,
+    const TrajectoryDTO& interrupted_trajectory, std::optional<double> original_cursor_s) {
+  auto retained = detail::capture_motion_resume_intent(request.motion, interrupted_trajectory,
+                                                       original_cursor_s);
+  if (!retained.ok()) return Result<PlanningSuccess>::Err(retained.error());
+  return plan_motion_continuation(request, projection_inventory, retained.value());
 }
 
-Result<ExecutionKernel::PlanningSuccess> ExecutionKernel::plan_resume_trajectory_with_evidence(
-    const ExecuteRequestDTO& request, const CollisionWorldLeaseInventory& projection_inventory) {
+Result<ExecutionKernel::PlanningSuccess> ExecutionKernel::plan_motion_continuation(
+    ExecuteRequestDTO& request, const CollisionWorldLeaseInventory& projection_inventory,
+    const detail::MotionResumeIntent& continuation) {
   auto sync_result = execution_backend_.sync_observed_state_before_planning();
   if (!sync_result.ok()) {
     auto error = sync_result.error();
@@ -11874,7 +12107,18 @@ Result<ExecutionKernel::PlanningSuccess> ExecutionKernel::plan_resume_trajectory
   }
 
   try {
-    auto planned = plan_trajectory_with_evidence(request, projection_inventory);
+    auto fresh_start = observed_state_.current_state(clock_.now());
+    if (!fresh_start.ok()) return Result<PlanningSuccess>::Err(fresh_start.error());
+    request.motion = continuation.motion;
+    if (std::holds_alternative<CartesianPathDTO>(continuation.motion)) {
+      auto tcp = kinematics_.forward_kinematics(
+          FkRequestDTO{fresh_start.value(), compiled_frame_name(request.binding.tcp_frame),
+                       compiled_frame_name(request.binding.base_frame)});
+      if (!tcp.ok()) return Result<PlanningSuccess>::Err(tcp.error());
+      request.motion = detail::resume_motion_from_current_tcp(continuation, tcp.value());
+    }
+    auto planned =
+        plan_trajectory_with_evidence(request, projection_inventory, 0U, &fresh_start.value());
     if (!planned.ok()) {
       auto error = planned.error();
       error.details["resume_phase"] = "planning";
@@ -12563,6 +12807,20 @@ Result<ResolvedRuntimeScaleStatusDTO> ExecutionKernel::runtime_scale_status(
   }
 
   auto mechanism = execution_backend_.runtime_velocity_scale_status();
+  if (mechanism.coordinated_command) {
+    const auto& shared = *mechanism.coordinated_command;
+    if (shared.operation_id != command->operation_id ||
+        shared.operation_revision < command->operation_revision ||
+        shared.generation < command->requested_runtime_scale_generation) {
+      return Result<ResolvedRuntimeScaleStatusDTO>::Err(
+          ErrorDTO{std::string(to_string(ErrorCode::kInvariantViolation)),
+                   "shared runtime-scale command does not match the active operation",
+                   {{"reason", "coordinated_runtime_scale_command_mismatch"}}});
+    }
+    command->operation_revision = shared.operation_revision;
+    command->requested_runtime_scale_generation = shared.generation;
+    command->requested_scale = mechanism.commanded_scale;
+  }
   RuntimeScaleApplicationState application_state = RuntimeScaleApplicationState::kPending;
   if (!mechanism.supported) {
     application_state = RuntimeScaleApplicationState::kRejected;

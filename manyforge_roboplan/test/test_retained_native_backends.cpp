@@ -1075,7 +1075,8 @@ TEST(RetainedExecutionStateSinkTest,
       std::move(resources),
       std::move(joint_names),
       {TrajectoryWaypointDTO{0.0, {0.0, 0.0}, {0.0, 0.0}, {0.0, 0.0}},
-       TrajectoryWaypointDTO{duration_s, {0.2, -0.3}, {0.0, 0.0}, {0.0, 0.0}}}};
+       TrajectoryWaypointDTO{duration_s, {0.2, -0.3}, {0.0, 0.0}, {0.0, 0.0}}},
+      TrajectoryRuntimeScaleBoundsDTO{4.0, 16.0}};
 }
 
 [[nodiscard]] RuntimeParticipantBinding confirmation_source(

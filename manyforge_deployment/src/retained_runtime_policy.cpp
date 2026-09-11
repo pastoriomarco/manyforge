@@ -1,3 +1,4 @@
+#include "stop_timing_resolution_internal.hpp"
 #include <algorithm>
 #include <manyforge_deployment/retained_runtime_policy.hpp>
 #include <manyforge_deployment/stop_evidence_policy_codec.hpp>
@@ -22,7 +23,7 @@ resolve_retained_stop_deadline_budget(
     required.emplace(binding.stop_evidence_policy_id,
                      binding.stop_evidence_policy_revision);
   }
-  std::optional<core::StopDeadlineBudgetDTO> envelope;
+  std::vector<QualifiedStopEvidencePolicy> policies;
   for (const auto &record : bundle.value().catalogs.records) {
     const auto *reference =
         std::get_if<core::StopEvidencePolicyCatalogRecordRefDTO>(&record);
@@ -34,31 +35,25 @@ resolve_retained_stop_deadline_budget(
     if (!bytes.has_value())
       throw RetainedRuntimePolicyError(
           "retained Stop policy artifact is unavailable");
-    const auto policy = resolve_and_qualify_stop_evidence_policy(
+    auto policy = resolve_and_qualify_stop_evidence_policy(
         *reference, reference->content_addressed_store_key, *bytes);
     if (policy.reference() != *reference)
       throw RetainedRuntimePolicyError("retained Stop policy readback differs");
     required.erase({reference->record_id, reference->record_revision});
-    if (policy.value().disposition ==
-        core::StopEvidenceDisposition::kNotStoppable)
-      continue;
-    if (!policy.value().deadline_budget.has_value())
-      throw RetainedRuntimePolicyError(
-          "stoppable policy has no deadline envelope");
-    auto candidate = *policy.value().deadline_budget;
-    candidate.phases.clear();
-    if (envelope.has_value() &&
-        (envelope->outer_duration_ns != candidate.outer_duration_ns ||
-         envelope->kernel_completion_reserve_ns !=
-             candidate.kernel_completion_reserve_ns)) {
-      throw RetainedRuntimePolicyError(
-          "retained Stop policies do not share one cell deadline envelope");
-    }
-    envelope = std::move(candidate);
+    policies.push_back(std::move(policy));
   }
   if (!required.empty())
     throw RetainedRuntimePolicyError(
         "retained Stop policy is absent from the catalog");
+  const auto budgets = detail::resolve_binding_stop_timing(
+      bundle.value().cell_graph.control_bindings, policies,
+      bundle.value().stop_timing_parameters);
+  if (!budgets.ok())
+    throw RetainedRuntimePolicyError(budgets.error().message);
+  if (budgets.value().empty())
+    return std::nullopt;
+  auto envelope = budgets.value().begin()->second;
+  envelope.phases.clear();
   return envelope;
 }
 

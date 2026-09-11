@@ -122,25 +122,22 @@ TEST(RuntimeParticipantPolicy, DeploymentCeilingOnlyTightensWithoutRelabelingPol
   const auto participant = binding();
   auto source = policy();
   const auto source_reference = policy_reference(source);
-  auto selected = verify_runtime_participant_policy_selection(
-      source_reference, std::move(source), participant);
+  auto selected =
+      verify_runtime_participant_policy_selection(source_reference, std::move(source), participant);
   ASSERT_TRUE(selected.ok()) << selected.error().message;
   const auto original = selected.value().value();
 
   auto tightened = apply_deployment_motion_speed_ceiling(selected.value(), 0.1);
   ASSERT_TRUE(tightened.ok()) << tightened.error().message;
-  EXPECT_DOUBLE_EQ(
-      tightened.value().value().effective_maximum_tcp_linear_speed_mps, 0.1);
-  EXPECT_EQ(tightened.value().value().source_artifact,
-            original.source_artifact);
+  EXPECT_DOUBLE_EQ(tightened.value().value().effective_maximum_tcp_linear_speed_mps, 0.1);
+  EXPECT_EQ(tightened.value().value().source_artifact, original.source_artifact);
   EXPECT_EQ(tightened.value().value().policy, original.policy);
   EXPECT_EQ(tightened.value().value().selected_motion_speed_limit,
             original.selected_motion_speed_limit);
 
   auto weaker = apply_deployment_motion_speed_ceiling(selected.value(), 0.4);
   ASSERT_TRUE(weaker.ok()) << weaker.error().message;
-  EXPECT_DOUBLE_EQ(weaker.value().value().effective_maximum_tcp_linear_speed_mps,
-                   0.25);
+  EXPECT_DOUBLE_EQ(weaker.value().value().effective_maximum_tcp_linear_speed_mps, 0.25);
   EXPECT_FALSE(apply_deployment_motion_speed_ceiling(selected.value(), 0.0).ok());
   EXPECT_FALSE(apply_deployment_motion_speed_ceiling(selected.value(), 1000.1).ok());
 }
@@ -191,6 +188,77 @@ TEST(RuntimeParticipantPolicy, EnforcesCanonicalShapeAndInterruptMembership) {
       validate_runtime_participant_interrupt_policy_selection(selected.value(), {&allowed, 1U});
   ASSERT_FALSE(rejected.ok());
   EXPECT_EQ(rejected.error().details.at("reason"), "runtime_policy_interrupt_policy_not_selected");
+}
+
+TEST(RuntimeParticipantPolicy, OrdinaryJerkPolicyFillsOmissionsAndRejectsWeakerRequests) {
+  const auto participant = binding();
+  const auto source = policy();
+  const auto base =
+      verify_runtime_participant_policy_selection(policy_reference(source), source, participant);
+  ASSERT_TRUE(base.ok());
+  OrdinaryMotionJerkPolicy profile{true, false, {{"joint_1", AngularJerkDTO{10.0}}}};
+  const auto selected = apply_deployment_motion_jerk_policy(base.value(), participant, profile);
+  ASSERT_TRUE(selected.ok());
+  profile.limits.at("joint_1") = AngularJerkDTO{100.0};
+  const auto filled = apply_runtime_participant_motion_jerk_policy(selected.value(), {});
+  ASSERT_TRUE(filled.ok());
+  EXPECT_EQ(filled.value().at("joint_1").max_jerk_rad_s3, 10.0);
+  PerJointDynamicsLimitsDTO requested{{"joint_1", {1.0, 2.0, 5.0}}};
+  const auto tightened = apply_runtime_participant_motion_jerk_policy(selected.value(), requested);
+  ASSERT_TRUE(tightened.ok());
+  EXPECT_EQ(tightened.value(), requested);
+  requested.at("joint_1").max_jerk_rad_s3 = 11.0;
+  const auto rejected = apply_runtime_participant_motion_jerk_policy(selected.value(), requested);
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.error().details.at("reason"), "ordinary_motion_jerk_limit_exceeded");
+  EXPECT_FALSE(base.value().value().ordinary_motion_jerk);
+}
+
+TEST(RuntimeParticipantPolicy, OrdinaryJerkOffDoesNotActivateRetainedValuesOrWaiveRequiredLimits) {
+  const auto participant = binding();
+  const auto source = policy();
+  const auto base =
+      verify_runtime_participant_policy_selection(policy_reference(source), source, participant);
+  ASSERT_TRUE(base.ok());
+  OrdinaryMotionJerkPolicy profile{false, false, {{"joint_1", AngularJerkDTO{10.0}}}};
+  const auto selected = apply_deployment_motion_jerk_policy(base.value(), participant, profile);
+  ASSERT_TRUE(selected.ok());
+  EXPECT_TRUE(apply_runtime_participant_motion_jerk_policy(selected.value(), {}).value().empty());
+  const auto rejected =
+      apply_runtime_participant_motion_jerk_policy(selected.value(), {{"joint_1", {{}, {}, 5.0}}});
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.error().details.at("reason"), "ordinary_motion_jerk_disabled");
+  profile.machine_required = true;
+  EXPECT_FALSE(apply_deployment_motion_jerk_policy(base.value(), participant, profile).ok());
+  profile.enabled = true;
+  const auto required = apply_deployment_motion_jerk_policy(base.value(), participant, profile);
+  ASSERT_TRUE(required.ok());
+  profile.machine_required = false;
+  EXPECT_FALSE(apply_deployment_motion_jerk_policy(required.value(), participant, profile).ok());
+  profile.machine_required = true;
+  profile.limits.at("joint_1") = AngularJerkDTO{11.0};
+  EXPECT_FALSE(apply_deployment_motion_jerk_policy(required.value(), participant, profile).ok());
+  profile.limits.at("joint_1") = AngularJerkDTO{5.0};
+  EXPECT_TRUE(apply_deployment_motion_jerk_policy(required.value(), participant, profile).ok());
+}
+
+TEST(RuntimeParticipantPolicy, OrdinaryJerkPolicyRejectsIncompleteCrossedAndWrongUnitLimits) {
+  const auto participant = binding();
+  const auto source = policy();
+  const auto base =
+      verify_runtime_participant_policy_selection(policy_reference(source), source, participant);
+  ASSERT_TRUE(base.ok());
+  EXPECT_FALSE(
+      apply_deployment_motion_jerk_policy(base.value(), participant, {true, false, {}}).ok());
+  EXPECT_FALSE(apply_deployment_motion_jerk_policy(base.value(), participant,
+                                                   {true, false, {{"other", AngularJerkDTO{10.0}}}})
+                   .ok());
+  EXPECT_FALSE(apply_deployment_motion_jerk_policy(
+                   base.value(), participant, {true, false, {{"joint_1", LinearJerkDTO{10.0}}}})
+                   .ok());
+  EXPECT_FALSE(apply_deployment_motion_jerk_policy(
+                   base.value(), participant, {true, false, {{"joint_1", AngularJerkDTO{0.0}}}})
+                   .ok());
 }
 
 }  // namespace

@@ -43,30 +43,40 @@ namespace core = manyforge::core;
   return query;
 }
 
-[[nodiscard]] bool ExactFinalizedActiveState(
-    const core::ConfigurationFenceStatusDTO& status,
-    const core::ConfigurationFenceStatusQueryDTO& query,
-    const PersistedManagerApplySceneFinalized& finalized,
-    const PersistedManagerApplyPublicationReceipt& publication) {
-  const auto& evidence = status.reconciliation_evidence;
-  const auto& finalized_result = finalized.scene_finalized.finalized_result;
-  const auto& publication_receipt = publication.publication.publication_receipt;
-  return status.matches(query) &&
-         evidence.active_projection_revision == finalized_result.candidate_projection_revision &&
-         evidence.active_graph_revision ==
-             finalized_result.candidate_projection_revision.graph_revision &&
-         evidence.active_publication_generation == publication_receipt.publication_generation &&
-         evidence.active_public_pointer_digest ==
-             publication_receipt.durable_public_pointer_content_digest &&
-         evidence.affected_queued_operation_count == 0U &&
-         evidence.affected_active_operation_count == 0U;
+[[nodiscard]] std::string FinalizedActiveStateMismatch(
+    const core::ConfigurationFenceStatusDTO &status,
+    const core::ConfigurationFenceStatusQueryDTO &query,
+    const PersistedManagerApplySceneFinalized &finalized,
+    const PersistedManagerApplyPublicationReceipt &publication) {
+  const auto &evidence = status.reconciliation_evidence;
+  const auto &finalized_result = finalized.scene_finalized.finalized_result;
+  const auto &publication_receipt = publication.publication.publication_receipt;
+  if (!status.matches(query))
+    return "fence identity/scope";
+  if (evidence.active_projection_revision !=
+      finalized_result.candidate_projection_revision)
+    return "active projection";
+  if (evidence.active_graph_revision !=
+      finalized_result.candidate_projection_revision.graph_revision)
+    return "active graph";
+  if (evidence.active_publication_generation !=
+      publication_receipt.publication_generation)
+    return "publication generation";
+  if (evidence.active_public_pointer_digest !=
+      publication_receipt.durable_public_pointer_content_digest)
+    return "public pointer digest";
+  if (evidence.affected_queued_operation_count != 0U ||
+      evidence.affected_active_operation_count != 0U)
+    return "affected operations still present";
+  return {};
 }
 
-[[nodiscard]] ManagerApplyTerminalOutcomeWriteResult PersistTerminal(
-    SqliteManagerApplyJournal& journal, const PersistedManagerApplySceneFinalized& finalized,
-    const PersistedManagerApplyPublicationReceipt& publication,
-    const PersistedManagerApplyFenceReleased& released) {
-  const auto& result = finalized.scene_finalized.finalized_result;
+[[nodiscard]] ManagerApplyTerminalOutcomeWriteResult
+PersistTerminal(SqliteManagerApplyJournal &journal,
+                const PersistedManagerApplySceneFinalized &finalized,
+                const PersistedManagerApplyPublicationReceipt &publication,
+                const PersistedManagerApplyFenceReleased &released) {
+  const auto &result = finalized.scene_finalized.finalized_result;
   return journal.EnsureTerminalOutcome({
       result.apply_id,
       result.apply_generation,
@@ -205,20 +215,25 @@ ManagerApplyFenceReleaseResult ManagerApplyFenceReleaseCoordinator::ReleaseOrRec
                       : std::nullopt);
   }
 
-  if (!ExactFinalizedActiveState(*status, query, *finalized, *publication)) {
+  const auto mismatch =
+      FinalizedActiveStateMismatch(*status, query, *finalized, *publication);
+  if (!mismatch.empty()) {
     FailUncertain(
         "Kernel status does not prove the exact finalized active projection "
-        "with zero affected operations",
+        "with zero affected operations: " +
+            mismatch,
         false, query,
         existing_intent.has_value()
-            ? std::optional<core::ConfigurationFenceReleaseDTO>{existing_intent
-                                                                    ->fence_release_intent
-                                                                    .release_request}
+            ? std::optional<
+                  core::ConfigurationFenceReleaseDTO>{existing_intent
+                                                          ->fence_release_intent
+                                                          .release_request}
             : std::nullopt,
         *status);
   }
 
-  if (existing_intent.has_value() && status->state == core::ConfigurationFenceState::kReleased) {
+  if (existing_intent.has_value() &&
+      status->state == core::ConfigurationFenceState::kReleased) {
     if (!status->release_receipt.has_value() ||
         status->release_receipt->request != existing_intent->fence_release_intent.release_request) {
       FailUncertain(

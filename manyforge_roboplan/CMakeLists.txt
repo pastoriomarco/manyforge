@@ -223,8 +223,7 @@ target_link_libraries(manyforge_roboplan_native_execution PUBLIC
 # planning boundary; no duplicate test-only copy remains.
 add_library(manyforge_roboplan_planning_contracts STATIC
   src/cartesian_planning_contract.cpp
-  src/roboplan_cartesian_trajectory_dynamics.cpp
-  src/joint_cap_contract.cpp)
+  src/roboplan_cartesian_trajectory_dynamics.cpp)
 target_include_directories(manyforge_roboplan_planning_contracts PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
@@ -593,11 +592,6 @@ if(BUILD_TESTING)
     target_compile_definitions(test_cartesian_planning_contract PRIVATE
       COAL_DISABLE_HPP_FCL_WARNINGS)
     target_link_libraries(test_cartesian_planning_contract PRIVATE
-      manyforge_roboplan_planning_contracts GTest::gtest_main)
-
-    add_executable(test_joint_cap_contract
-      test/test_joint_cap_contract.cpp)
-    target_link_libraries(test_joint_cap_contract PRIVATE
       manyforge_roboplan_planning_contracts GTest::gtest_main)
 
     add_executable(test_roboplan_candidate_computer
@@ -1089,10 +1083,6 @@ if(BUILD_TESTING)
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
     gtest_discover_tests(test_cartesian_planning_contract
-      PROPERTIES
-        ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
-        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
-    gtest_discover_tests(test_joint_cap_contract
       PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})

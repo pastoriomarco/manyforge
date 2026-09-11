@@ -98,6 +98,17 @@ struct OperationParticipantIntentDTO final {
                          const OperationParticipantIntentDTO&) = default;
 };
 
+/// Exact held Program selected before manual cleanup/approval. This is a
+/// precondition, never permission: the Kernel rechecks producers and settlement.
+struct ManualProgramHandoverContextDTO final {
+  RequestOwnerEpoch program_runner_owner_epoch;
+  ProgramRunId program_run_id;
+  CellAdmissionClaimGeneration claim_generation;
+  std::uint64_t selection_revision{};
+  friend bool operator==(const ManualProgramHandoverContextDTO&,
+                         const ManualProgramHandoverContextDTO&) = default;
+};
+
 struct OperationIntentDTO final {
   PublicRequestContextDTO request_context;
   ProgramId program_id;
@@ -111,6 +122,7 @@ struct OperationIntentDTO final {
   OperationCoordinationPolicy coordination_policy{OperationCoordinationPolicy::kIndependent};
   /// Receiving-adapter provenance. Public payloads cannot populate this field.
   RequestAttributionDTO attribution{};
+  std::optional<ManualProgramHandoverContextDTO> manual_handover{};
   friend bool operator==(const OperationIntentDTO&, const OperationIntentDTO&) = default;
 };
 

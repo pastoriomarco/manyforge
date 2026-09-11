@@ -125,15 +125,15 @@ constexpr std::string_view kFenceAcceptanceDigestDomain =
 constexpr std::string_view kRuntimeConvergenceIntentDigestDomain =
     "manyforge.component-manager-runtime-convergence-intent.v2";
 constexpr std::string_view kRuntimeStagedReadyDigestDomain =
-    "manyforge.component-manager-runtime-staged-ready.v2";
+    "manyforge.component-manager-runtime-staged-ready.v3";
 constexpr std::string_view kSceneStageIntentDigestDomain =
-    "manyforge.component-manager-scene-stage-intent.v1";
+    "manyforge.component-manager-scene-stage-intent.v2";
 constexpr std::string_view kSceneStagedEvidenceDigestDomain =
-    "manyforge.component-manager-scene-staged-evidence.v1";
+    "manyforge.component-manager-scene-staged-evidence.v2";
 constexpr std::string_view kActivationSelectionDigestDomain =
     "manyforge.component-manager-activation-selection.v1";
 constexpr std::string_view kSceneActivatedEvidenceDigestDomain =
-    "manyforge.component-manager-scene-activated-evidence.v1";
+    "manyforge.component-manager-scene-activated-evidence.v2";
 constexpr std::string_view kPrivateMaterializationDigestDomain =
     "manyforge.component-manager-private-selected-bundle.v1";
 constexpr std::string_view kRetiredCommandSurfacesDigestDomain =
@@ -141,7 +141,7 @@ constexpr std::string_view kRetiredCommandSurfacesDigestDomain =
 constexpr std::string_view kPublicationReceiptDigestDomain =
     "manyforge.component-manager-apply-publication-receipt.v1";
 constexpr std::string_view kSceneFinalizedEvidenceDigestDomain =
-    "manyforge.component-manager-scene-finalized-evidence.v1";
+    "manyforge.component-manager-scene-finalized-evidence.v2";
 constexpr std::string_view kFenceReleaseIntentDigestDomain =
     "manyforge.component-manager-fence-release-intent.v1";
 constexpr std::string_view kFenceReleasedDigestDomain =
@@ -1754,10 +1754,53 @@ std::string EncodeDependencyEpochs(
   return EncodeTokens(tokens);
 }
 
+std::string EncodeManagedWithdrawal(
+    const std::optional<core::ManagedRuntimeWithdrawalDTO> &receipt) {
+  if (!receipt)
+    return {};
+  if (!receipt->valid())
+    throw std::invalid_argument("invalid managed withdrawal");
+  return EncodeTokens({receipt->apply_id.value(),
+                       std::to_string(receipt->apply_generation.value()),
+                       receipt->runtime_convergence_intent_digest.value(),
+                       receipt->runtime_unit_id.value(),
+                       receipt->runtime_epoch.value(),
+                       receipt->product_identity.value(),
+                       receipt->configuration_identity.value(),
+                       receipt->process_observer_instance_id,
+                       std::to_string(receipt->process_observation_sequence)});
+}
+
+std::optional<core::ManagedRuntimeWithdrawalDTO>
+DecodeManagedWithdrawal(const std::string &encoding) {
+  if (encoding.empty())
+    return std::nullopt;
+  const auto receipt =
+      DecodeTokens(encoding, 9U, "managed predecessor withdrawal");
+  if (receipt.size() != 9U)
+    throw ManagerApplyJournalIntegrityError(
+        "stored withdrawal cardinality is invalid");
+  core::ManagedRuntimeWithdrawalDTO result{
+      ApplyId(receipt[0]),
+      ApplyGeneration(
+          ParseCanonicalUnsigned(receipt[1], "withdrawal Apply generation")),
+      ContentDigest(receipt[2]),
+      RuntimeUnitId(receipt[3]),
+      RuntimeEpoch(receipt[4]),
+      ContentDigest(receipt[5]),
+      ContentDigest(receipt[6]),
+      receipt[7],
+      ParseCanonicalUnsigned(receipt[8], "withdrawal observation sequence")};
+  if (!result.valid())
+    throw ManagerApplyJournalIntegrityError(
+        "stored managed withdrawal is invalid");
+  return result;
+}
+
 std::string EncodeRuntimeStagedReadyRows(
     const std::vector<RuntimeUnitStagedReadyEvidenceDTO> &runtime_units) {
   std::vector<std::string> tokens;
-  tokens.reserve(runtime_units.size() * 19U);
+  tokens.reserve(runtime_units.size() * 20U);
   for (const auto &row : runtime_units) {
     if (!row.valid()) {
       throw std::invalid_argument("runtime staged-ready row is invalid");
@@ -1781,6 +1824,7 @@ std::string EncodeRuntimeStagedReadyRows(
     tokens.push_back(std::to_string(row.report_age_ns));
     tokens.push_back(std::to_string(row.progress_age_ns));
     tokens.push_back(row.observed_runtime_contract_offer_digest.value());
+    tokens.push_back(EncodeManagedWithdrawal(row.predecessor_withdrawal));
   }
   return EncodeTokens(tokens);
 }
@@ -1812,7 +1856,7 @@ DecodeRuntimeCommandSurface(const std::string_view value) {
 
 std::vector<RuntimeUnitStagedReadyEvidenceDTO>
 DecodeRuntimeStagedReadyRows(const std::string &encoding) {
-  constexpr std::size_t kFieldsPerRow = 19U;
+  constexpr std::size_t kFieldsPerRow = 20U;
   const auto tokens =
       DecodeTokens(encoding, kMaximumRuntimeUnits * kFieldsPerRow,
                    "runtime staged-ready evidence");
@@ -1867,6 +1911,7 @@ DecodeRuntimeStagedReadyRows(const std::string &encoding) {
         ParseCanonicalUnsigned(tokens[index + 17U], "progress age"),
         core::RuntimeContractOfferDigest(tokens[index + 18U]),
     };
+    row.predecessor_withdrawal = DecodeManagedWithdrawal(tokens[index + 19U]);
     if (!row.valid()) {
       throw ManagerApplyJournalIntegrityError(
           "stored runtime staged-ready row is invalid");
@@ -2066,6 +2111,7 @@ void AppendTransitionRowTokens(std::vector<std::string> &tokens,
   tokens.push_back(binding.runtime_epoch.value());
   tokens.emplace_back(core::to_string(row.disposition));
   AppendOptionalProjectionTokens(tokens, row.expected_local_active);
+  tokens.push_back(EncodeManagedWithdrawal(row.managed_withdrawal));
 }
 
 ProjectionTransitionRowDTO
@@ -2081,6 +2127,7 @@ DecodeTransitionRowTokens(const std::vector<std::string> &tokens,
       DecodeTransitionDisposition(tokens.at(begin + 4U)),
       DecodeOptionalProjectionTokens(tokens, begin + 5U,
                                      "transition expected active revision"),
+      DecodeManagedWithdrawal(tokens.at(begin + 11U)),
   };
   if (!row.valid()) {
     throw ManagerApplyJournalIntegrityError(
@@ -2097,7 +2144,7 @@ EncodeTransitionRows(const std::vector<ProjectionTransitionRowDTO> &rows) {
         "scene transition rows are noncanonical or exceed their bound");
   }
   std::vector<std::string> tokens;
-  tokens.reserve(rows.size() * 11U);
+  tokens.reserve(rows.size() * 12U);
   for (const auto &row : rows) {
     AppendTransitionRowTokens(tokens, row);
   }
@@ -2106,7 +2153,7 @@ EncodeTransitionRows(const std::vector<ProjectionTransitionRowDTO> &rows) {
 
 std::vector<ProjectionTransitionRowDTO>
 DecodeTransitionRows(const std::string &encoding) {
-  constexpr std::size_t kFieldsPerRow = 11U;
+  constexpr std::size_t kFieldsPerRow = 12U;
   const auto tokens = DecodeTokens(
       encoding, kMaximumManagerApplySceneTransitionRows * kFieldsPerRow,
       "scene transition rows");
@@ -2270,6 +2317,25 @@ DecodeOptionalDigestTokens(const std::vector<std::string> &tokens,
   return std::nullopt;
 }
 
+bool WithdrawalsMatchRuntimeStage(
+    const ManagerApplySceneStageIntentDTO &intent,
+    const ManagerApplyRuntimeStagedReadyDTO &ready) {
+  for (const auto &row : intent.native_transition_rows) {
+    if (!row.managed_withdrawal)
+      continue;
+    const auto found =
+        std::find_if(ready.runtime_units.begin(), ready.runtime_units.end(),
+                     [&](const auto &runtime) {
+                       return runtime.runtime_unit_id ==
+                              row.native_runtime_binding.runtime_unit_id;
+                     });
+    if (found == ready.runtime_units.end() ||
+        found->predecessor_withdrawal != row.managed_withdrawal)
+      return false;
+  }
+  return true;
+}
+
 std::string EncodeTransitionEvidenceRows(
     const std::vector<ProjectionTransitionRowEvidenceDTO> &rows) {
   if (rows.size() > kMaximumManagerApplySceneTransitionRows) {
@@ -2277,10 +2343,10 @@ std::string EncodeTransitionEvidenceRows(
         "scene staged evidence exceeds its transition-row bound");
   }
   std::vector<std::string> tokens;
-  tokens.reserve(rows.size() * 45U);
+  tokens.reserve(rows.size() * 46U);
   for (const auto &row : rows) {
     if (!row.valid() || row.error.has_value() ||
-        row.resulting_health.error.has_value()) {
+        (row.resulting_health && row.resulting_health->error.has_value())) {
       throw std::invalid_argument(
           "successful scene staged row carries invalid or error evidence");
     }
@@ -2289,23 +2355,27 @@ std::string EncodeTransitionEvidenceRows(
     AppendOptionalProjectionTokens(tokens,
                                    row.acknowledged_staged_candidate_revision);
     AppendOptionalProjectionTokens(tokens, row.observed_local_active);
-    tokens.push_back(std::to_string(row.resulting_health.source_sequence));
-    tokens.emplace_back(core::to_string(row.resulting_health.state));
+    if (!row.resulting_health) {
+      tokens.insert(tokens.end(), 21U, std::string{});
+      continue;
+    }
+    tokens.push_back(std::to_string(row.resulting_health->source_sequence));
+    tokens.emplace_back(core::to_string(row.resulting_health->state));
     AppendOptionalProjectionTokens(
-        tokens, row.resulting_health.active_projection_revision);
+        tokens, row.resulting_health->active_projection_revision);
     AppendOptionalStagedCandidateTokens(tokens,
-                                        row.resulting_health.staged_candidate);
+                                        row.resulting_health->staged_candidate);
     AppendOptionalUnsignedTokens(
-        tokens, row.resulting_health.native_projection_generation);
+        tokens, row.resulting_health->native_projection_generation);
     AppendOptionalDigestTokens(tokens,
-                               row.resulting_health.projection_content_digest);
+                               row.resulting_health->projection_content_digest);
   }
   return EncodeTokens(tokens);
 }
 
 std::vector<ProjectionTransitionRowEvidenceDTO>
 DecodeTransitionEvidenceRows(const std::string &encoding) {
-  constexpr std::size_t kFieldsPerRow = 45U;
+  constexpr std::size_t kFieldsPerRow = 46U;
   const auto tokens = DecodeTokens(
       encoding, kMaximumManagerApplySceneTransitionRows * kFieldsPerRow,
       "scene staged transition evidence");
@@ -2317,25 +2387,34 @@ DecodeTransitionEvidenceRows(const std::string &encoding) {
   rows.reserve(tokens.size() / kFieldsPerRow);
   for (std::size_t index = 0U; index < tokens.size(); index += kFieldsPerRow) {
     auto transition_row = DecodeTransitionRowTokens(tokens, index);
-    ProjectionHealthDTO health{
-        transition_row.native_runtime_binding,
-        ParseCanonicalUnsigned(tokens[index + 24U],
-                               "projection health source sequence"),
-        DecodeProjectionHealthState(tokens[index + 25U]),
-        DecodeOptionalProjectionTokens(tokens, index + 26U,
-                                       "health active projection revision"),
-        DecodeOptionalStagedCandidateTokens(tokens, index + 32U),
-        DecodeOptionalUnsignedTokens(tokens, index + 41U,
-                                     "native projection generation"),
-        DecodeOptionalDigestTokens(tokens, index + 43U),
-        std::nullopt,
-    };
+    std::optional<ProjectionHealthDTO> health;
+    if (tokens[index + 25U].empty()) {
+      if (std::any_of(tokens.begin() + index + 25U,
+                      tokens.begin() + index + kFieldsPerRow,
+                      [](const auto &value) { return !value.empty(); }))
+        throw ManagerApplyJournalIntegrityError(
+            "absent native health has payload");
+    } else {
+      health = ProjectionHealthDTO{
+          transition_row.native_runtime_binding,
+          ParseCanonicalUnsigned(tokens[index + 25U],
+                                 "projection health source sequence"),
+          DecodeProjectionHealthState(tokens[index + 26U]),
+          DecodeOptionalProjectionTokens(tokens, index + 27U,
+                                         "health active projection revision"),
+          DecodeOptionalStagedCandidateTokens(tokens, index + 33U),
+          DecodeOptionalUnsignedTokens(tokens, index + 42U,
+                                       "native projection generation"),
+          DecodeOptionalDigestTokens(tokens, index + 44U),
+          std::nullopt,
+      };
+    }
     ProjectionTransitionRowEvidenceDTO row{
         std::move(transition_row),
-        DecodeTransitionRowEvidenceState(tokens[index + 11U]),
-        DecodeOptionalProjectionTokens(tokens, index + 12U,
+        DecodeTransitionRowEvidenceState(tokens[index + 12U]),
+        DecodeOptionalProjectionTokens(tokens, index + 13U,
                                        "staged candidate acknowledgement"),
-        DecodeOptionalProjectionTokens(tokens, index + 18U,
+        DecodeOptionalProjectionTokens(tokens, index + 19U,
                                        "observed local active projection"),
         std::move(health),
         std::nullopt,
@@ -4094,6 +4173,7 @@ public:
           LatestRuntimeStagedReadyLocked(apply_id, apply_generation);
       const auto parent = IntentLocked(apply_id, apply_generation);
       if (encoded.digest != stored_digest || !latest.has_value() ||
+          !WithdrawalsMatchRuntimeStage(intent, latest->staged_ready) ||
           latest->staged_ready_digest != intent.runtime_staged_ready_digest ||
           latest->staged_ready.predecessor_publication_generation !=
               intent.predecessor_publication_generation ||
@@ -6244,6 +6324,7 @@ SqliteManagerApplyJournal::EnsureSceneStageIntent(
   const auto parent = impl_->IntentLocked(scene_stage_intent.apply_id,
                                           encoded.apply_generation);
   if (!latest.has_value() ||
+      !WithdrawalsMatchRuntimeStage(scene_stage_intent, latest->staged_ready) ||
       latest->staged_ready_digest !=
           scene_stage_intent.runtime_staged_ready_digest ||
       latest->staged_ready.predecessor_publication_generation !=

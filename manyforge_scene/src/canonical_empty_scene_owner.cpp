@@ -141,6 +141,16 @@ public:
   using std::runtime_error::runtime_error;
 };
 
+class CellAdmissionClaimRejected final : public std::runtime_error {
+public:
+  explicit CellAdmissionClaimRejected(core::ErrorDTO error)
+      : std::runtime_error(error.message), error_(std::move(error)) {}
+  const core::ErrorDTO &error() const noexcept { return error_; }
+
+private:
+  core::ErrorDTO error_;
+};
+
 [[noreturn]] void ThrowCellAdmissionFailure(
     const std::string_view context, const core::ErrorDTO &error) {
   const auto message = std::string(context) + ": " + error.message;
@@ -569,7 +579,7 @@ std::string CurrentSchemaArtifactDigest() {
       std::string(detail::kEmbeddedLogicalSceneTransactionMigration) +
       "\n--v5--\n" +
       std::string(detail::kEmbeddedNativeProjectionHandoffMigration) +
-      "\n--v6--\n" + std::string(detail::kEmbeddedBoundedHistoryMigration));
+      "\n--v7--\n" + std::string(detail::kEmbeddedBoundedHistoryMigration));
 }
 
 struct AcceptedState final {
@@ -787,6 +797,7 @@ DecodeProjectionStatus(std::string_view value);
       {},
       std::nullopt,
       std::nullopt,
+      request.program_node_evidence,
   };
   if (!core::ValidateCellAdmissionClaimIntent(intent).ok()) {
     throw CanonicalEmptySceneOwnerIntegrityError(
@@ -816,8 +827,7 @@ DecodeProjectionStatus(std::string_view value);
   }
   const auto acquired = admission.AcquireCellAdmissionClaim(intent);
   if (!acquired.ok()) {
-    ThrowCellAdmissionFailure("authored scene admission was rejected",
-                              acquired.error());
+    throw CellAdmissionClaimRejected(acquired.error());
   }
   return acquired.value();
 }
@@ -849,10 +859,12 @@ void SettleAuthoredSceneClaimIfHeld(
     const SceneTransactionRequestDTO &request,
     const ContentDigest &request_digest, const bool success,
     const SceneProjectionCommitStatusDTO projection_status) {
-  if (!IsAuthoredSceneMutation(request) ||
+  if ((!IsAuthoredSceneMutation(request) &&
+       !request.program_node_evidence.has_value()) ||
       !request.expected_admission_generation.has_value() ||
-      (!success && projection_status !=
-                       SceneProjectionCommitStatusDTO::kRejectedRollbackProven &&
+      (!success &&
+       projection_status !=
+           SceneProjectionCommitStatusDTO::kRejectedRollbackProven &&
        projection_status != SceneProjectionCommitStatusDTO::kNotAttempted)) {
     return;
   }
@@ -3280,7 +3292,7 @@ NativeSceneProviderBindings(const RetainedBundleDTO &bundle) {
 struct NativeTransitionParticipant final {
   core::ProjectionTransitionRowDTO transition_row;
   std::shared_ptr<core::IPlannerSceneProjection> projection;
-  core::ProjectionHealthDTO observed_health;
+  std::optional<core::ProjectionHealthDTO> observed_health;
 };
 
 [[nodiscard]] RequiredSceneProjection ResolveRequiredProjection(
@@ -3656,6 +3668,13 @@ ObserveNativeTransitionParticipants(
   std::vector<NativeTransitionParticipant> result;
   result.reserve(rows.size());
   for (const auto &row : rows) {
+    if (row.managed_withdrawal) {
+      if (!row.valid())
+        throw CanonicalEmptySceneOwnerConflictError(
+            "invalid managed withdrawal row");
+      result.push_back({row, nullptr, std::nullopt});
+      continue;
+    }
     auto observed =
         ResolveRequiredProjection(row.native_runtime_binding, resolver);
     result.push_back({row, std::move(observed.projection),
@@ -3988,7 +4007,7 @@ ReadNativeTransitionRows(sqlite3 *database, const ApplyId &apply_id,
       "provider_binding_revision,runtime_unit_id,runtime_epoch,disposition,"
       "expected_local_retained_bundle_id,expected_local_graph_revision,"
       "expected_local_scene_id,expected_local_scene_revision_id,"
-      "expected_local_scene_content_hash "
+      "expected_local_scene_content_hash,managed_withdrawal_json "
       "FROM logical_scene_named_apply_native_transition_rows "
       "WHERE apply_id=? AND apply_generation=? AND "
       "projection_stage_generation=? ORDER BY transition_ordinal LIMIT 257");
@@ -4062,10 +4081,19 @@ ReadNativeTransitionRows(sqlite3 *database, const ApplyId &apply_id,
             core::RuntimeUnitId(runtime_unit_id),
             core::RuntimeEpoch(runtime_epoch)},
         disposition, std::move(expected_local)};
+    if (!statement.IsNull(11))
+      row.managed_withdrawal =
+          logical_scene_codec_internal::DecodeManagedWithdrawal(
+              statement.Text(11));
     if (!row.valid() || !row.matches_predecessor(predecessor)) {
       throw CanonicalEmptySceneOwnerIntegrityError(
           "stored native transition row is invalid for its predecessor");
     }
+    if (row.managed_withdrawal &&
+        (row.managed_withdrawal->apply_id != apply_id ||
+         row.managed_withdrawal->apply_generation != apply_generation))
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "stored withdrawal belongs to another Apply");
     rows.push_back(std::move(row));
   }
   if (rows.size() != expected_count ||
@@ -5222,7 +5250,7 @@ void ValidateDatabase(
   ValidateMechanicalDatabaseIntegrity(database);
   if (ReadSchemaObjects(database) != ExpectedSchemaObjects()) {
     throw CanonicalEmptySceneOwnerIntegrityError(
-        "logical-scene schema differs from its exact v6 artifacts");
+        "logical-scene schema differs from its exact v7 artifacts");
   }
   ValidateMetadata(database, fixed_query, admission_digest);
   ValidateMigrationMetadata(database);
@@ -5846,16 +5874,40 @@ ProjectionTransitionEvidenceDTO NativeTransitionEvidence(
 }
 
 core::ProjectionTransitionRowEvidenceDTO
+ManagedWithdrawalEvidence(const core::ProjectionTransitionRowDTO &row,
+                          std::optional<ErrorDTO> error = std::nullopt) {
+  core::ProjectionTransitionRowEvidenceDTO evidence{
+      row,          core::ProjectionTransitionRowEvidenceState::kRemovedRetired,
+      std::nullopt, std::nullopt,
+      std::nullopt, std::move(error)};
+  if (!row.managed_withdrawal || !evidence.valid())
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "invalid managed withdrawal evidence");
+  return evidence;
+}
+
+bool HasManagedWithdrawal(const NamedApplyStageState &stage) {
+  return std::any_of(
+      stage.native_transition_rows.begin(), stage.native_transition_rows.end(),
+      [](const auto &row) { return row.managed_withdrawal.has_value(); });
+}
+
+core::ProjectionTransitionRowEvidenceDTO
 UncertainTransitionRowEvidence(const core::ProjectionTransitionRowDTO &row,
-                               core::ProjectionHealthDTO health,
+                               std::optional<core::ProjectionHealthDTO> health,
                                ErrorDTO error) {
-  health.state = ProjectionHealthState::kUnavailable;
-  health.error = error;
+  if (row.managed_withdrawal)
+    return ManagedWithdrawalEvidence(row, std::move(error));
+  if (!health)
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "native transition has no observation");
+  health->state = ProjectionHealthState::kUnavailable;
+  health->error = error;
   core::ProjectionTransitionRowEvidenceDTO evidence{
       row,
       core::ProjectionTransitionRowEvidenceState::kUncertain,
       std::nullopt,
-      health.active_projection_revision,
+      health->active_projection_revision,
       std::move(health),
       std::move(error),
   };
@@ -6040,7 +6092,7 @@ ProjectionAggregateHealthDTO CandidateAggregateHealth(
   for (const auto &row : rows) {
     if (row.transition_row.disposition !=
         core::ProjectionTransitionDisposition::kRemoved) {
-      candidate_health.push_back(row.resulting_health);
+      candidate_health.push_back(*row.resulting_health);
     }
   }
   ProjectionAggregateHealthDTO aggregate{
@@ -6104,6 +6156,13 @@ ProjectionTransitionEvidenceDTO ObserveNativeTransitionEvidence(
   std::vector<core::ProjectionTransitionRowEvidenceDTO> rows;
   rows.reserve(participants.size());
   for (const auto &participant : participants) {
+    if (participant.transition_row.managed_withdrawal) {
+      if (evidence_state == ProjectionTransitionEvidenceState::kAborted)
+        throw CanonicalEmptySceneOwnerConflictError(
+            "withdrawn predecessor cannot prove clean abort");
+      rows.push_back(ManagedWithdrawalEvidence(participant.transition_row));
+      continue;
+    }
     const bool removed = participant.transition_row.disposition ==
                          core::ProjectionTransitionDisposition::kRemoved;
     switch (evidence_state) {
@@ -6161,6 +6220,10 @@ UnavailableNativeTransitionEvidence(const NamedApplyStageState &stage,
   std::vector<core::ProjectionTransitionRowEvidenceDTO> rows;
   rows.reserve(stage.native_transition_rows.size());
   for (const auto &row : stage.native_transition_rows) {
+    if (row.managed_withdrawal) {
+      rows.push_back(ManagedWithdrawalEvidence(row, error));
+      continue;
+    }
     core::ProjectionHealthDTO unavailable{
         row.native_runtime_binding,
         1U,
@@ -6758,8 +6821,8 @@ void InsertNativeApplyIntent(
         "runtime_unit_id,runtime_epoch,disposition,"
         "expected_local_retained_bundle_id,expected_local_graph_revision,"
         "expected_local_scene_id,expected_local_scene_revision_id,"
-        "expected_local_scene_content_hash) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+        "expected_local_scene_content_hash,managed_withdrawal_json) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
     insert.Bind(1, stage.apply_id.value());
     insert.Bind(2, CheckedSafeCounter(stage.apply_generation.value(),
                                       "native Apply generation"));
@@ -6784,6 +6847,11 @@ void InsertNativeApplyIntent(
         insert.BindNull(index);
       }
     }
+    if (row.managed_withdrawal)
+      insert.Bind(15, logical_scene_codec_internal::EncodeManagedWithdrawal(
+                          *row.managed_withdrawal));
+    else
+      insert.BindNull(15);
     if (insert.Step()) {
       throw CanonicalEmptySceneOwnerIntegrityError(
           "native Apply transition-row insert unexpectedly returned a row");
@@ -7984,6 +8052,17 @@ CanonicalEmptySceneOwner::StageCandidateProjection(
     return StagedResult(*stage);
   }
 
+  if (new_stage && HasManagedWithdrawal(*stage)) {
+    std::vector<core::ProjectionNativeRuntimeBindingDTO> predecessor_bindings;
+    for (const auto &row : stage->native_transition_rows)
+      if (row.disposition != core::ProjectionTransitionDisposition::kAdded)
+        predecessor_bindings.push_back(row.native_runtime_binding);
+    if (predecessor_bindings != ActiveNativeRuntimeBindings(state))
+      return RejectedStageResult(request,
+                                 "managed_withdrawal_predecessor_mismatch",
+                                 "withdrawal rows do not match the exact "
+                                 "active predecessor processes");
+  }
   std::vector<NativeTransitionParticipant> participants;
   try {
     participants = ObserveNativeTransitionParticipants(
@@ -8055,7 +8134,9 @@ CanonicalEmptySceneOwner::StageCandidateProjection(
   if (new_stage) {
     for (const auto &participant : participants) {
       const auto &row = participant.transition_row;
-      const auto &health = participant.observed_health;
+      if (row.managed_withdrawal)
+        continue;
+      const auto &health = *participant.observed_health;
       const bool predecessor_exact =
           row.expected_local_active.has_value()
               ? health.healthy_for_target(stage->predecessor)
@@ -8128,6 +8209,11 @@ CanonicalEmptySceneOwner::StageCandidateProjection(
   for (std::size_t index = 0U; index < participants.size(); ++index) {
     const auto &participant = participants[index];
     try {
+      if (participant.transition_row.managed_withdrawal) {
+        staged_rows.push_back(
+            ManagedWithdrawalEvidence(participant.transition_row));
+        continue;
+      }
       if (participant.transition_row.disposition ==
           core::ProjectionTransitionDisposition::kRemoved) {
         staged_rows.push_back(PredecessorUnchangedRowEvidence(
@@ -8190,6 +8276,11 @@ CanonicalEmptySceneOwner::StageCandidateProjection(
     for (std::size_t index = 0U; index < participants.size(); ++index) {
       const auto &participant = participants[index];
       try {
+        if (participant.transition_row.managed_withdrawal) {
+          aborted_rows.push_back(
+              ManagedWithdrawalEvidence(participant.transition_row));
+          continue;
+        }
         if (participant.transition_row.disposition ==
             core::ProjectionTransitionDisposition::kRemoved) {
           aborted_rows.push_back(PredecessorUnchangedRowEvidence(
@@ -8226,6 +8317,12 @@ CanonicalEmptySceneOwner::StageCandidateProjection(
         return uncertain_result(std::move(aborted_rows), index + 1U, failure);
       }
     }
+    if (HasManagedWithdrawal(*stage))
+      return uncertain_result(std::move(aborted_rows), participants.size(),
+                              ErrorDTO{"predecessor_runtime_withdrawn",
+                                       "candidate cleanup completed, but the "
+                                       "predecessor process is gone",
+                                       {}});
     Transaction completion(database, "BEGIN IMMEDIATE");
     auto current = ReadCompleteDurableState(database, impl_->fixed_query_);
     const auto *persisted =
@@ -8477,6 +8574,11 @@ CanonicalEmptySceneOwner::ActivateStagedProjection(
   for (std::size_t index = 0U; index < participants.size(); ++index) {
     const auto &participant = participants[index];
     try {
+      if (participant.transition_row.managed_withdrawal) {
+        activated_rows.push_back(
+            ManagedWithdrawalEvidence(participant.transition_row));
+        continue;
+      }
       if (participant.transition_row.disposition ==
           core::ProjectionTransitionDisposition::kRemoved) {
         auto status = ReadNativeRetireStatus(stage, participant);
@@ -8716,6 +8818,11 @@ CanonicalEmptySceneOwner::DiscardStagedProjection(
   for (std::size_t index = 0U; index < participants.size(); ++index) {
     const auto &participant = participants[index];
     try {
+      if (participant.transition_row.managed_withdrawal) {
+        aborted_rows.push_back(
+            ManagedWithdrawalEvidence(participant.transition_row));
+        continue;
+      }
       if (participant.transition_row.disposition ==
           core::ProjectionTransitionDisposition::kRemoved) {
         aborted_rows.push_back(PredecessorUnchangedRowEvidence(
@@ -8752,6 +8859,13 @@ CanonicalEmptySceneOwner::DiscardStagedProjection(
     }
   }
 
+  if (HasManagedWithdrawal(stage))
+    return uncertain_result(
+        std::move(aborted_rows), participants.size(),
+        ErrorDTO{
+            "predecessor_runtime_withdrawn",
+            "candidate cleanup completed, but the predecessor process is gone",
+            {}});
   auto evidence = NativeTransitionEvidence(
       stage, ProjectionTransitionEvidenceState::kAborted,
       std::move(aborted_rows));
@@ -9739,7 +9853,28 @@ CanonicalEmptySceneOwner::Commit(const SceneTransactionRequestDTO &request) {
                   error.what());
   }
 
-  const bool authored_mutation = IsAuthoredSceneMutation(request);
+  const bool runtime_node = request.program_node_evidence.has_value();
+  if (runtime_node) {
+    const bool carried =
+        std::holds_alternative<core::AttachCarriedObjectRequestDTO>(
+            request.operation) ||
+        std::holds_alternative<core::DetachCarriedObjectRequestDTO>(
+            request.operation) ||
+        std::holds_alternative<
+            core::DetachCarriedObjectAtCurrentPoseRequestDTO>(
+            request.operation);
+    const auto &evidence = *request.program_node_evidence;
+    if (request.program_reset_scene_authorization.has_value() ||
+        evidence.owner_api !=
+            (carried ? "scene.carried_attachment" : "scene.transaction") ||
+        (!carried && !IsAuthoredSceneMutation(request))) {
+      return reject(
+          core::RequestReplayStatusDTO::kAcceptedNew, "invalid_request",
+          "runtime Scene transaction differs from its Program owner API");
+    }
+  }
+  const bool authored_mutation =
+      IsAuthoredSceneMutation(request) || runtime_node;
   const bool program_reset_mutation =
       authored_mutation &&
       request.program_reset_scene_authorization.has_value();
@@ -9763,6 +9898,7 @@ CanonicalEmptySceneOwner::Commit(const SceneTransactionRequestDTO &request) {
   std::string request_json;
   std::string request_digest_input;
   ContentDigest request_digest(std::string{});
+  std::optional<core::CellAdmissionClaimIntentDTO> claim_intent;
   try {
     request_json = logical_scene_codec_internal::EncodeRequest(request);
     if (request_json.empty() ||
@@ -9775,6 +9911,11 @@ CanonicalEmptySceneOwner::Commit(const SceneTransactionRequestDTO &request) {
         logical_scene_codec_internal::EncodeRequestDigestInput(request);
     request_digest = ContentDigest(
         manyforge::content_identity::sha256_digest(request_digest_input));
+    // Validate native/private input before it can enter durable Scene state.
+    // Reuse this exact derived intent at the single admission boundary.
+    if (authored_mutation && !program_reset_mutation) {
+      claim_intent = AuthoredSceneClaimIntent(request, request_digest);
+    }
   } catch (const std::exception &error) {
     return reject(core::RequestReplayStatusDTO::kAcceptedNew, "invalid_request",
                   error.what());
@@ -10007,23 +10148,25 @@ CanonicalEmptySceneOwner::Commit(const SceneTransactionRequestDTO &request) {
   std::optional<core::CellAdmissionClaimDTO> authored_claim;
   if (authored_mutation && !program_reset_mutation) {
     try {
-      authored_claim = RequireAuthoredSceneClaim(
-          *impl_->cell_admission_,
-          AuthoredSceneClaimIntent(request, request_digest));
+      authored_claim =
+          RequireAuthoredSceneClaim(*impl_->cell_admission_, *claim_intent);
     } catch (const std::exception &error) {
+      const auto *rejected =
+          dynamic_cast<const CellAdmissionClaimRejected *>(&error);
+      const auto rejection =
+          rejected != nullptr ? rejected->error()
+                              : SceneError("authoring_not_ready", error.what());
       Transaction outcome(database, "BEGIN IMMEDIATE");
-      InsertSceneOutcome(database,
-                         request.request_context.request_owner_epoch.value(),
-                         request.request_context.request_id, request_digest,
-                         scene_transaction.transaction_sequence, false,
-                         SceneProjectionCommitStatusDTO::kNotAttempted, 0U,
-                         SceneError("authoring_not_ready", error.what()));
+      InsertSceneOutcome(
+          database, request.request_context.request_owner_epoch.value(),
+          request.request_context.request_id, request_digest,
+          scene_transaction.transaction_sequence, false,
+          SceneProjectionCommitStatusDTO::kNotAttempted, 0U, rejection);
       outcome.Commit();
-      return FailedSceneResult(
-          request.request_context.request_id,
-          core::RequestReplayStatusDTO::kAcceptedNew,
-          SceneError("authoring_not_ready", error.what()),
-          SceneProjectionCommitStatusDTO::kNotAttempted);
+      return FailedSceneResult(request.request_context.request_id,
+                               core::RequestReplayStatusDTO::kAcceptedNew,
+                               rejection,
+                               SceneProjectionCommitStatusDTO::kNotAttempted);
     }
   }
   if (!projections.empty()) {
@@ -10179,6 +10322,27 @@ CanonicalEmptySceneOwner::Commit(const SceneTransactionRequestDTO &request) {
         "successful scene commit cannot form a valid public result");
   }
   return result;
+}
+
+std::optional<SceneCommitResultDTO> CanonicalEmptySceneOwner::ReadCommitResult(
+    const SceneTransactionRequestDTO &request) const {
+  ValidateBoundedIdentity(request.request_context.request_id.value(),
+                          "request_id");
+  ValidateBoundedIdentity(request.request_context.request_owner_epoch.value(),
+                          "request_owner_epoch");
+  const ContentDigest digest(manyforge::content_identity::sha256_digest(
+      logical_scene_codec_internal::EncodeRequestDigestInput(request)));
+  std::lock_guard lock(impl_->mutex_);
+  const auto result = ReadOutcomeForRequest(
+      impl_->database(), request.request_context.request_owner_epoch.value(),
+      request.request_context.request_id);
+  if (!result.has_value())
+    return std::nullopt;
+  if (result->request_digest != digest)
+    throw CanonicalEmptySceneOwnerConflictError(
+        "scene result lookup changed the exact request");
+  return ResultFromStoredOutcome(impl_->database(), *result,
+                                 core::RequestReplayStatusDTO::kReplayedExact);
 }
 
 core::Result<void>
@@ -10592,17 +10756,21 @@ core::Result<void> ValidateAuthoredSceneCellAdmissionSettlementReadOnly(
     const auto expected_kind =
         success ? core::CellAdmissionSettlementKindDTO::kOwnerCommit
                 : core::CellAdmissionSettlementKindDTO::kProvenNoEffect;
-    if (!IsAuthoredSceneMutation(request) ||
+    if ((!IsAuthoredSceneMutation(request) &&
+         !request.program_node_evidence.has_value()) ||
+        request.program_node_evidence != claim.intent.program_node_evidence ||
         request.expected_admission_generation !=
             std::optional<core::AdmissionGeneration>{
                 claim.intent.expected_admission_generation} ||
-        request.request_context.request_owner_epoch != claim.intent.owner_epoch ||
+        request.request_context.request_owner_epoch !=
+            claim.intent.owner_epoch ||
         request.request_context.request_id != claim.intent.request_id ||
         request_digest != claim.intent.request_payload_digest.value() ||
         release.settlement.evidence_digest.value() != request_digest ||
         release.settlement.settlement_kind != expected_kind ||
-        (!success && projection_status !=
-                         SceneProjectionCommitStatusDTO::kRejectedRollbackProven &&
+        (!success &&
+         projection_status !=
+             SceneProjectionCommitStatusDTO::kRejectedRollbackProven &&
          projection_status != SceneProjectionCommitStatusDTO::kNotAttempted)) {
       return rejected("authored_scene_terminal_evidence_mismatch");
     }

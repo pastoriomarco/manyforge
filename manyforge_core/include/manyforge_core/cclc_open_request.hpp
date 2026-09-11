@@ -59,6 +59,11 @@ class ICCLCOpenRequestPort {
   [[nodiscard]] virtual RequestOwnerEpoch ReadRequestOwnerEpoch() const = 0;
   [[nodiscard]] virtual Result<CCLCLifecycleRequestResultDTO> SubmitLifecycle(
       const ComponentLifecycleIntentDTO& intent) = 0;
+  [[nodiscard]] virtual Result<std::optional<CCLCLifecycleRequestResultDTO>>
+  ReadLifecycleRequestResult(const ComponentLifecycleIntentDTO&) {
+    return Result<std::optional<CCLCLifecycleRequestResultDTO>>::Err(
+        {"cclc_result_lookup_unavailable", "lifecycle result lookup is not composed", {}});
+  }
   [[nodiscard]] virtual Result<std::optional<ComponentLifecycleStatusDTO>> LoadLifecycleStatus(
       const LifecycleTransactionId& transaction_id) = 0;
   [[nodiscard]] virtual Result<ComponentLifecycleCurrentSnapshotDTO> ReadCurrentComponent(
@@ -67,6 +72,11 @@ class ICCLCOpenRequestPort {
       const ControllableComponentId& component_id) const = 0;
   [[nodiscard]] virtual Result<CCLCRouteSelectionRequestResultDTO> SubmitRouteSelection(
       const RouteSelectionIntentDTO& intent) = 0;
+  [[nodiscard]] virtual Result<std::optional<CCLCRouteSelectionRequestResultDTO>>
+  ReadRouteSelectionRequestResult(const RouteSelectionIntentDTO&) {
+    return Result<std::optional<CCLCRouteSelectionRequestResultDTO>>::Err(
+        {"cclc_result_lookup_unavailable", "route result lookup is not composed", {}});
+  }
   [[nodiscard]] virtual Result<std::optional<RouteSelectionStatusDTO>> LoadRouteSelectionStatus(
       const RouteSelectionTransactionId& transaction_id) = 0;
 };
@@ -83,6 +93,8 @@ class ComponentLifecycleCoordinatorOpenRequestPort final : public ICCLCOpenReque
   [[nodiscard]] RequestOwnerEpoch ReadRequestOwnerEpoch() const override;
   [[nodiscard]] Result<CCLCLifecycleRequestResultDTO> SubmitLifecycle(
       const ComponentLifecycleIntentDTO& intent) override;
+  [[nodiscard]] Result<std::optional<CCLCLifecycleRequestResultDTO>> ReadLifecycleRequestResult(
+      const ComponentLifecycleIntentDTO& intent) override;
   [[nodiscard]] Result<std::optional<ComponentLifecycleStatusDTO>> LoadLifecycleStatus(
       const LifecycleTransactionId& transaction_id) override;
   [[nodiscard]] Result<ComponentLifecycleCurrentSnapshotDTO> ReadCurrentComponent(
@@ -91,6 +103,8 @@ class ComponentLifecycleCoordinatorOpenRequestPort final : public ICCLCOpenReque
       const ControllableComponentId& component_id) const override;
   [[nodiscard]] Result<CCLCRouteSelectionRequestResultDTO> SubmitRouteSelection(
       const RouteSelectionIntentDTO& intent) override;
+  [[nodiscard]] Result<std::optional<CCLCRouteSelectionRequestResultDTO>>
+  ReadRouteSelectionRequestResult(const RouteSelectionIntentDTO& intent) override;
   [[nodiscard]] Result<std::optional<RouteSelectionStatusDTO>> LoadRouteSelectionStatus(
       const RouteSelectionTransactionId& transaction_id) override;
 

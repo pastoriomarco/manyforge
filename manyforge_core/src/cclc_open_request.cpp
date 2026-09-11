@@ -220,13 +220,37 @@ template <typename StrongCounter>
   return result;
 }
 
+[[nodiscard]] std::optional<ProgramNodeAdmissionEvidenceDTO> program_node_evidence(
+    const CanonicalValue& object) {
+  const auto* value = object.find_object_member("program_node_evidence");
+  if (!value) return std::nullopt;
+  exact_object(
+      *value,
+      {"program_runner_owner_epoch", "program_run_id", "parent_program_cycle_claim_generation",
+       "node_instance_id", "node_attempt_id", "owner_api"},
+      {}, "Program node evidence");
+  const auto field = [&](std::string_view name) -> const CanonicalValue& {
+    return member(*value, name, "Program node evidence");
+  };
+  ProgramNodeAdmissionEvidenceDTO result{
+      RequestOwnerEpoch(text(field("program_runner_owner_epoch"), "Program owner")),
+      ProgramRunId(text(field("program_run_id"), "Program run")),
+      CellAdmissionClaimGeneration(
+          unsigned_integer(field("parent_program_cycle_claim_generation"), "Program parent claim")),
+      text(field("node_instance_id"), "node instance"),
+      text(field("node_attempt_id"), "node attempt"),
+      text(field("owner_api"), "owner API")};
+  if (!result.locally_valid()) fail("Program node admission evidence is invalid");
+  return result;
+}
+
 [[nodiscard]] ComponentLifecycleIntentDTO lifecycle_intent(const CanonicalValue& value,
                                                            RequestAttributionDTO attribution) {
   exact_object(value,
                {"request_context", "controllable_component_id", "intent", "expected_graph_revision",
                 "expected_component_lifecycle_generation", "expected_control_domains",
                 "expected_admission_generation"},
-               {"reason"}, "component lifecycle intent");
+               {"reason", "program_node_evidence"}, "component lifecycle intent");
   std::vector<ExpectedControlDomainRevisionDTO> domains;
   const auto& encoded =
       bounded_array(member(value, "expected_control_domains", "component lifecycle intent"),
@@ -261,7 +285,8 @@ template <typename StrongCounter>
       std::move(attribution),
       AdmissionGeneration(unsigned_integer(
           member(value, "expected_admission_generation", "component lifecycle intent"),
-          "expected admission generation"))};
+          "expected admission generation")),
+      program_node_evidence(value)};
   if (!result.locally_valid()) {
     fail("component lifecycle intent is invalid");
   }
@@ -341,7 +366,7 @@ template <typename StrongCounter>
       value,
       {"request_context", "expected_retained_bundle_id", "expected_graph_revision",
        "desired_configuration", "expected_active_control_configuration", "component_expectations"},
-      {}, "route selection intent");
+      {"expected_admission_generation", "program_node_evidence"}, "route selection intent");
   std::vector<RouteSelectionComponentExpectationDTO> components;
   const auto& encoded =
       bounded_array(member(value, "component_expectations", "route selection intent"),
@@ -361,6 +386,11 @@ template <typename StrongCounter>
           member(value, "expected_active_control_configuration", "route selection intent")),
       std::move(components),
       std::move(attribution)};
+  if (const auto* generation = value.find_object_member("expected_admission_generation")) {
+    result.expected_admission_generation =
+        AdmissionGeneration(unsigned_integer(*generation, "expected admission generation"));
+  }
+  result.program_node_evidence = program_node_evidence(value);
   if (!result.locally_valid()) {
     fail("route selection intent is invalid");
   }
@@ -673,12 +703,14 @@ template <typename StrongCounter>
 }
 
 [[nodiscard]] CanonicalValue lifecycle_result_value(const CCLCLifecycleRequestResultDTO& value) {
-  return CanonicalValue(CanonicalValue::Object{
+  CanonicalValue::Object fields{
       {"acceptance", value.acceptance.has_value() ? lifecycle_acceptance_value(*value.acceptance)
                                                   : CanonicalValue(nullptr)},
       {"replay_status", CanonicalValue(std::string(to_string(value.replay_status)))},
-      {"status", value.status.has_value() ? lifecycle_status_value(*value.status)
-                                          : CanonicalValue(nullptr)}});
+      {"status",
+       value.status.has_value() ? lifecycle_status_value(*value.status) : CanonicalValue(nullptr)}};
+  if (value.rejection) fields.emplace_back("rejection", error_value(*value.rejection));
+  return CanonicalValue(std::move(fields));
 }
 
 [[nodiscard]] CanonicalValue route_acceptance_value(const RouteSelectionAcceptedDTO& value) {
@@ -731,12 +763,14 @@ template <typename StrongCounter>
 }
 
 [[nodiscard]] CanonicalValue route_result_value(const CCLCRouteSelectionRequestResultDTO& value) {
-  return CanonicalValue(CanonicalValue::Object{
+  CanonicalValue::Object fields{
       {"acceptance", value.acceptance.has_value() ? route_acceptance_value(*value.acceptance)
                                                   : CanonicalValue(nullptr)},
       {"replay_status", CanonicalValue(std::string(to_string(value.replay_status)))},
       {"status",
-       value.status.has_value() ? route_status_value(*value.status) : CanonicalValue(nullptr)}});
+       value.status.has_value() ? route_status_value(*value.status) : CanonicalValue(nullptr)}};
+  if (value.rejection) fields.emplace_back("rejection", error_value(*value.rejection));
+  return CanonicalValue(std::move(fields));
 }
 
 [[nodiscard]] CanonicalValue component_snapshot_value(
@@ -892,6 +926,18 @@ Result<CCLCLifecycleRequestResultDTO> ComponentLifecycleCoordinatorOpenRequestPo
   return coordinator_.SubmitLifecycle(intent);
 }
 
+Result<std::optional<CCLCLifecycleRequestResultDTO>>
+ComponentLifecycleCoordinatorOpenRequestPort::ReadLifecycleRequestResult(
+    const ComponentLifecycleIntentDTO& intent) {
+  return coordinator_.ReadLifecycleRequestResult(intent);
+}
+
+Result<std::optional<CCLCRouteSelectionRequestResultDTO>>
+ComponentLifecycleCoordinatorOpenRequestPort::ReadRouteSelectionRequestResult(
+    const RouteSelectionIntentDTO& intent) {
+  return coordinator_.ReadRouteSelectionRequestResult(intent);
+}
+
 Result<std::optional<ComponentLifecycleStatusDTO>>
 ComponentLifecycleCoordinatorOpenRequestPort::LoadLifecycleStatus(
     const LifecycleTransactionId& transaction_id) {
@@ -992,6 +1038,16 @@ Result<std::string> ExecuteCanonicalCCLCOpenRequest(const std::string_view canon
       }
       return encode_response(response_value(command, lifecycle_result_value(result.value())));
     }
+    if (command == "lifecycle_request_result") {
+      auto result =
+          port.ReadLifecycleRequestResult(lifecycle_intent(payload, transport_attribution));
+      if (!result.ok()) return encode_response(error_response_value(command, result.error()));
+      if (result.value() && !result.value()->locally_valid())
+        fail("CCLC lifecycle result is invalid");
+      return encode_response(response_value(command, result.value()
+                                                         ? lifecycle_result_value(*result.value())
+                                                         : CanonicalValue(nullptr)));
+    }
     if (command == "lifecycle_status") {
       exact_object(payload, {"lifecycle_transaction_id"}, {}, "lifecycle status request");
       auto result = port.LoadLifecycleStatus(LifecycleTransactionId(
@@ -1013,6 +1069,14 @@ Result<std::string> ExecuteCanonicalCCLCOpenRequest(const std::string_view canon
         fail("CCLC route result is invalid");
       }
       return encode_response(response_value(command, route_result_value(result.value())));
+    }
+    if (command == "route_request_result") {
+      auto result =
+          port.ReadRouteSelectionRequestResult(route_intent(payload, transport_attribution));
+      if (!result.ok()) return encode_response(error_response_value(command, result.error()));
+      if (result.value() && !result.value()->locally_valid()) fail("CCLC route result is invalid");
+      return encode_response(response_value(
+          command, result.value() ? route_result_value(*result.value()) : CanonicalValue(nullptr)));
     }
     if (command == "route_status") {
       exact_object(payload, {"route_selection_transaction_id"}, {}, "route status request");

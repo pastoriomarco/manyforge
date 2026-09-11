@@ -172,27 +172,33 @@ struct CCLCJournalRecoveryDTO final {
   std::vector<RouteSelectionStatusDTO> interrupted_route_selections;
   std::vector<CCLCRouteEffectSequenceWatermarkDTO> route_effect_sequence_watermarks;
   std::vector<CCLCRouteEffectAttemptDTO> unresolved_route_effect_attempts;
-  struct LifecycleClaimRecovery final {
+  struct CellClaimRecovery final {
     CellAdmissionClaimIntentDTO intent;
     std::optional<CellAdmissionClaimDTO> claim;
     std::optional<CellAdmissionClaimReleaseDTO> release_intent;
     bool release_receipt_recorded{};
-    bool lifecycle_accepted{};
+    bool transaction_accepted{};
   };
-  std::vector<LifecycleClaimRecovery> lifecycle_claims;
+  std::vector<CellClaimRecovery> cell_claims;
+  /// Journal-minted namespace; the caller's startup-unique seed is not the
+  /// public request epoch. Preserved counters prevent reuse after compaction.
+  RequestOwnerEpoch request_owner_epoch{""};
 
   [[nodiscard]] bool locally_valid() const noexcept;
 };
 
 /// Atomic outcome of lifecycle request-ledger admission.
 ///
-/// Accepted-new and exact-replay outcomes carry the exact owner-minted
-/// acceptance plus the latest retained status. The other four outcomes carry
-/// neither; they are bounded admission facts and never create an effect.
+/// Accepted-new and exact-replay describe membership in the request journal:
+/// they carry either owner-minted acceptance plus status, or a proven
+/// no-admission rejection. The other outcomes carry neither. Reading any
+/// result never creates or retries an effect.
 struct CCLCLifecycleRequestResultDTO final {
   RequestReplayStatusDTO replay_status;
   std::optional<ComponentLifecycleAcceptedDTO> acceptance;
   std::optional<ComponentLifecycleStatusDTO> status;
+  /// Exact known no-admission outcome; no transaction identity was minted.
+  std::optional<ErrorDTO> rejection{};
 
   [[nodiscard]] bool locally_valid() const noexcept;
 };
@@ -223,12 +229,17 @@ class ICCLCJournal : public ICCLCCurrentFactReader {
  public:
   ~ICCLCJournal() override = default;
 
-  /// Starts one never-before-used receiver epoch and returns all nonterminal
-  /// transactions left by prior owners. New admission remains closed until
-  /// CCLC has reconciled those transactions.
+  /// Mints one never-before-used receiver namespace from a startup-unique seed
+  /// plus the durable epoch counter, and returns it with prior nonterminal
+  /// work. The supplied seed is not a caller-selected namespace. New admission
+  /// remains closed until CCLC has reconciled those transactions and the exact
+  /// Kernel owner mapping. Live callers must establish quiescence first.
+  /// A live checkpoint supplies the exact predecessor: the journal then
+  /// rejects atomically if any transaction, claim or effect is unresolved.
   [[nodiscard]] virtual Result<CCLCJournalRecoveryDTO> BeginOwnerEpoch(
-      const RequestOwnerEpoch& owner_epoch, std::int64_t started_at_ns,
-      std::size_t request_membership_capacity) = 0;
+      const RequestOwnerEpoch& unique_seed, std::int64_t started_at_ns,
+      std::size_t request_membership_capacity,
+      const std::optional<RequestOwnerEpoch>& quiescent_predecessor = std::nullopt) = 0;
 
   /// Classifies only the owner-wide request membership/replay promise. A
   /// null optional is a previously unseen request in the current owner epoch.
@@ -239,6 +250,23 @@ class ICCLCJournal : public ICCLCCurrentFactReader {
   InspectLifecycleRequest(const RequestOwnerEpoch& active_owner_epoch,
                           const ComponentLifecycleIntentDTO& intent) = 0;
 
+  /// Read the original request's retained result even after owner replacement.
+  /// Absence/compaction is unknown, never permission to submit another effect.
+  [[nodiscard]] virtual Result<std::optional<CCLCLifecycleRequestResultDTO>>
+  ReadLifecycleRequestResult(const ComponentLifecycleIntentDTO&) {
+    return Result<std::optional<CCLCLifecycleRequestResultDTO>>::Err(
+        {"cclc_result_lookup_unavailable", "lifecycle result lookup is not composed", {}});
+  }
+
+  [[nodiscard]] virtual Result<CCLCLifecycleRequestResultDTO> RecordLifecycleRejection(
+      const RequestOwnerEpoch&, const ComponentLifecycleIntentDTO&, const ErrorDTO&,
+      const std::optional<CellAdmissionClaimIntentDTO>&) {
+    return Result<CCLCLifecycleRequestResultDTO>::Err(
+        {"cclc_rejection_persistence_unavailable",
+         "no-admission result persistence is unavailable",
+         {}});
+  }
+
   /// Atomically accepts a new request or returns its exact bounded replay
   /// disposition. `accepted_new` candidates must already be fully validated;
   /// exact duplicates ignore their newly proposed identities and return the
@@ -248,18 +276,16 @@ class ICCLCJournal : public ICCLCCurrentFactReader {
       const ComponentLifecycleAcceptedDTO& candidate_acceptance,
       const ComponentLifecycleStatusDTO& candidate_initial_status) = 0;
 
-  [[nodiscard]] virtual Result<void> RecordLifecycleClaimAttempt(
-      const RequestOwnerEpoch& active_owner_epoch,
-      const CellAdmissionClaimIntentDTO& intent) {
+  [[nodiscard]] virtual Result<void> RecordCellClaimAttempt(
+      const RequestOwnerEpoch& active_owner_epoch, const CellAdmissionClaimIntentDTO& intent) {
     (void)active_owner_epoch;
     (void)intent;
     return Result<void>::Err(
         {"component_lifecycle_claim_journal_unavailable",
          "CCLC journal has no lifecycle claim persistence", {}});
   }
-  [[nodiscard]] virtual Result<void> RecordLifecycleClaimAcquired(
-      const RequestOwnerEpoch& active_owner_epoch,
-      const CellAdmissionClaimDTO& claim) {
+  [[nodiscard]] virtual Result<void> RecordCellClaimAcquired(
+      const RequestOwnerEpoch& active_owner_epoch, const CellAdmissionClaimDTO& claim) {
     (void)active_owner_epoch;
     (void)claim;
     return Result<void>::Err(
@@ -278,9 +304,8 @@ class ICCLCJournal : public ICCLCCurrentFactReader {
         {"component_lifecycle_claim_journal_unavailable",
          "CCLC journal has no lifecycle claim persistence", {}});
   }
-  [[nodiscard]] virtual Result<void> RecordLifecycleClaimReleaseReceipt(
-      const RequestOwnerEpoch& active_owner_epoch,
-      const CellAdmissionClaimReleaseDTO& release,
+  [[nodiscard]] virtual Result<void> RecordCellClaimReleaseReceipt(
+      const RequestOwnerEpoch& active_owner_epoch, const CellAdmissionClaimReleaseDTO& release,
       const CellAdmissionRecoveryReceiptDTO& receipt) {
     (void)active_owner_epoch;
     (void)release;
@@ -289,18 +314,16 @@ class ICCLCJournal : public ICCLCCurrentFactReader {
         {"component_lifecycle_claim_journal_unavailable",
          "CCLC journal has no lifecycle claim persistence", {}});
   }
-  [[nodiscard]] virtual Result<void> RecordUnacceptedLifecycleClaimRelease(
-      const RequestOwnerEpoch& active_owner_epoch,
-      const CellAdmissionClaimReleaseDTO& release) {
+  [[nodiscard]] virtual Result<void> RecordUnacceptedCellClaimRelease(
+      const RequestOwnerEpoch& active_owner_epoch, const CellAdmissionClaimReleaseDTO& release) {
     (void)active_owner_epoch;
     (void)release;
     return Result<void>::Err(
         {"component_lifecycle_claim_journal_unavailable",
          "CCLC journal has no unaccepted-claim recovery", {}});
   }
-  [[nodiscard]] virtual Result<void> RecordLifecycleClaimNotAcquired(
-      const RequestOwnerEpoch& active_owner_epoch,
-      const CellAdmissionClaimIntentDTO& intent) {
+  [[nodiscard]] virtual Result<void> RecordCellClaimNotAcquired(
+      const RequestOwnerEpoch& active_owner_epoch, const CellAdmissionClaimIntentDTO& intent) {
     (void)active_owner_epoch;
     (void)intent;
     return Result<void>::Err(
@@ -355,6 +378,23 @@ class ICCLCJournal : public ICCLCCurrentFactReader {
   InspectRouteSelectionRequest(const RequestOwnerEpoch& active_owner_epoch,
                                const RouteSelectionIntentDTO& intent) = 0;
 
+  /// Read the exact original route result, including a retained predecessor
+  /// namespace. No admission, epoch rotation or controller call is performed.
+  [[nodiscard]] virtual Result<std::optional<CCLCRouteSelectionRequestResultDTO>>
+  ReadRouteSelectionRequestResult(const RouteSelectionIntentDTO&) {
+    return Result<std::optional<CCLCRouteSelectionRequestResultDTO>>::Err(
+        {"cclc_result_lookup_unavailable", "route result lookup is not composed", {}});
+  }
+
+  [[nodiscard]] virtual Result<CCLCRouteSelectionRequestResultDTO> RecordRouteSelectionRejection(
+      const RequestOwnerEpoch&, const RouteSelectionIntentDTO&, const ErrorDTO&,
+      const std::optional<CellAdmissionClaimIntentDTO>&) {
+    return Result<CCLCRouteSelectionRequestResultDTO>::Err(
+        {"cclc_rejection_persistence_unavailable",
+         "route no-admission persistence is unavailable",
+         {}});
+  }
+
   [[nodiscard]] virtual Result<CCLCRouteSelectionRequestResultDTO> AcceptOrReplayRouteSelection(
       const RequestOwnerEpoch& active_owner_epoch, const RouteSelectionIntentDTO& intent,
       const RouteSelectionAcceptedDTO& candidate_acceptance,
@@ -369,6 +409,22 @@ class ICCLCJournal : public ICCLCCurrentFactReader {
       const RequestOwnerEpoch& active_owner_epoch,
       const CCLCRouteEffectAttemptDTO& completed_attempt,
       const RouteSelectionStatusDTO& successor_status) = 0;
+
+  [[nodiscard]] virtual Result<std::uint64_t> RecordRouteEffectCompletedAndClaimRelease(
+      const RequestOwnerEpoch&, const CCLCRouteEffectAttemptDTO&, const RouteSelectionStatusDTO&,
+      const CellAdmissionClaimReleaseDTO&) {
+    return Result<std::uint64_t>::Err({"component_lifecycle_claim_journal_unavailable",
+                                       "CCLC route terminal claim release is unavailable",
+                                       {}});
+  }
+
+  [[nodiscard]] virtual Result<std::uint64_t> RecordRouteTerminalAndClaimRelease(
+      const RequestOwnerEpoch&, const RouteSelectionStatusDTO&,
+      const CellAdmissionClaimReleaseDTO&) {
+    return Result<std::uint64_t>::Err({"component_lifecycle_claim_journal_unavailable",
+                                       "CCLC route terminal claim release is unavailable",
+                                       {}});
+  }
 
   [[nodiscard]] virtual Result<std::uint64_t> RecordRouteSelectionStatus(
       const RequestOwnerEpoch& active_owner_epoch, const RouteSelectionStatusDTO& status) = 0;

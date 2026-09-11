@@ -19,6 +19,8 @@ let publish: (status: ExecutionOwnerStatus) => void;
 let publishProgram: (active: boolean) => void;
 let showPanel: (visible: boolean) => void;
 let showTransport: (visible: boolean) => void;
+let showGroups: () => void;
+const groupCommands: string[][] = [];
 let setNativeAvailable: (available: boolean) => void;
 let currentStatus = statusFixture();
 currentStatus.directControl.targetDescriptor.operationalLimit = {
@@ -27,6 +29,10 @@ currentStatus.directControl.targetDescriptor.operationalLimit = {
   selectedScope: 'command_target', sourceContentDigest: 'sha256:tcp-limits',
 };
 let previewCount = 0;
+let availabilityCount = 0;
+let manualReady = false;
+let cleanupRequired = false;
+let selectionRevision = 0;
 let holdPreviews = false;
 const heldPreviews: (() => void)[] = [];
 let rejectPreview = false;
@@ -37,18 +43,31 @@ const source = {
     if (commands.length >= 32) throw new Error('Test command bound exceeded');
     return new Promise((resolve, reject) => commands.push({
       kind, payload,
-      resolve: () => resolve(kind === 'runtime_scale' ? { result: {
+      resolve: () => { if (kind === 'program_manual_handover') cleanupRequired = false; resolve(kind === 'runtime_scale' ? { result: {
         ok: true, api_version: 'v1', command: 'set_runtime_scale_control', accepted: {
         accepted_at_ns: '1234',
         request_id: requestId, replay_status: 'accepted_new', selector: payload.selector,
         control_generation: Number(payload.expected_control_generation) + 1,
         requested_scale: payload.scale, active_operation_id: null,
         active_operation_revision: null, active_operation_scale_generation: null,
-      } } } : {}), reject: () => reject(new Error('deliberate delayed rejection')),
+      } } } : {}); }, reject: () => reject(new Error('deliberate delayed rejection')),
     }));
   },
   reconnect() { throw new Error('Local preview retry must not reconnect'); },
 } as unknown as HeadlessStateSource;
+
+api.execution.manualAvailability = async (intent) => {
+  availabilityCount += 1;
+  const available = manualReady && !currentStatus.manualOperations.some((operation) => operation.resident);
+  return {
+    requestId: intent.request_context.request_id, requestOwnerEpoch: currentStatus.ownerEpoch,
+    intentDigest: `sha256:${'a'.repeat(64)}`, available,
+    unavailableReason: available ? null : 'manual_handover_producer_not_held',
+    cleanupRequired: available && cleanupRequired,
+    manualHandover: available ? { program_runner_owner_epoch: 'runner.1',
+      program_run_id: 'program.1', claim_generation: 1, selection_revision: selectionRevision } : null,
+  };
+};
 
 api.execution.previewMotion = async (intent) => {
   previewCount += 1;
@@ -79,21 +98,36 @@ function App() {
   const [programActive, setProgramActive] = useState(false);
   const [panelVisible, setPanelVisible] = useState(true);
   const [transportVisible, setTransportVisible] = useState(false);
+  const [groupsVisible, setGroupsVisible] = useState(false);
   const [nativeAvailable, updateNativeAvailable] = useState(true);
   const result = useRobotControl(true, programActive, false,
-    { executionControlStatus: nativeAvailable ? status : null } as ComposerHeadlessState, source);
+    { executionControlStatus: nativeAvailable ? status : null,
+      authoringAdmission: { authoringAllowed: !programActive, admissionGeneration: 1 },
+      programCycle: {
+        programRunnerOwnerEpoch: 'runner.1', cycleGeneration: 1,
+        state: programActive ? 'running' : 'idle_after_reset',
+        programRunId: programActive ? 'program.1' : null, runRevision: 1,
+        executionControlRevision: selectionRevision + 1,
+      },
+    } as ComposerHeadlessState, source);
   useLayoutEffect(() => {
     publish = (next) => { currentStatus = next; setStatus(next); };
     publishProgram = setProgramActive;
     showPanel = setPanelVisible;
     showTransport = setTransportVisible;
+    showGroups = () => { setGroupsVisible(true); setTransportVisible(true); setPanelVisible(false); };
     setNativeAvailable = updateNativeAvailable;
     controller = result;
   }, [result]);
   const program = {
     cycleState: programActive ? 'running' : 'idle_after_reset',
-    state: { runnerAvailable: true, applied: null, pending: null, controlPending: null, run: null, controls: null },
-    commandAllowed: () => false,
+    state: { runnerAvailable: true, applied: null, pending: null, controlPending: null,
+      run: groupsVisible ? { state: 'running', capture: { programRunId: 'groups.1' } } : null,
+      controls: groupsVisible ? { executionSelections: { groups: ['all', 'arm', 'grippers'].map((groupId) => ({
+        groupId, state: 'running', stopAllowed: true, resumeAllowed: false,
+      })) } } : null },
+    commandAllowed: (command: string) => groupsVisible && command === 'program_motion_stop',
+    stopMotion: (groups: string[]) => { groupCommands.push([...groups]); },
   } as unknown as ProgramRuntimeController;
   return <>
   {panelVisible && <div className="central-inspector-section viewer-inspector-section" style={{ width: '360px', height: '640px' }}>
@@ -109,12 +143,15 @@ function App() {
 }
 
 const harness = {
+  showGroups() { showGroups(); },
+  groupCommands() { return groupCommands; },
   snapshot() { return {
     phase: controller.state.phase, positions: controller.state.draftPositionsRad,
     ghost: controller.state.ghost !== null, ghostStale: controller.state.ghostStale,
     error: controller.state.error, controlPending: controller.controlPending,
     previewIssue: controller.state.previewIssue,
     operation: controller.state.operation, previewCount,
+    availabilityCount, manualControlAllowed: controller.manualControlAllowed,
     intent: controller.state.intent, motionSettings: controller.state.motionSettings,
     fullStopPending: controller.fullStopPending, fullStopError: controller.fullStopError,
     runtimeScalePending: controller.runtimeScalePending, runtimeScaleError: controller.runtimeScaleError,
@@ -151,6 +188,12 @@ const harness = {
       orientation: { x: 0, y: 0, z: 0, w: 1 } },
   }, observedGripper: { ...currentStatus.observedGripper!, position: 0.3 } }); },
   program(active: boolean) { publishProgram(active); },
+  manualReady(ready: boolean, cleanup = false) {
+    manualReady = ready;
+    cleanupRequired = cleanup;
+    selectionRevision += 1;
+    publish({ ...currentStatus });
+  },
   setPreviewFailure(failed: boolean, reason: string | null = null) {
     rejectPreview = failed;
     previewFailureReason = reason;

@@ -317,7 +317,7 @@ struct InterruptPolicyDefinition {
   /// circular include. The shared_ptr works with the forward
   /// declaration immediately above; the kernel constructs the
   /// concrete value via `std::make_shared` at registration.
-  std::shared_ptr<MotionInterruptStopProfileDTO> stop_profile;
+  std::shared_ptr<const MotionInterruptStopProfileDTO> stop_profile;
   std::optional<std::string> description;
 };
 

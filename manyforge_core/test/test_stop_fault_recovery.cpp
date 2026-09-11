@@ -239,6 +239,19 @@ TEST(StopFaultRecoveryTest, ReadyAssessmentIsStableUntilSemanticFactsChange) {
   EXPECT_EQ(changed.value().recovery_assessment_revision, 3U);
 }
 
+TEST(StopFaultRecoveryTest, TerminalFaultMustCarryItsExactCertificateBeforeAssessment) {
+  auto status = Status();
+  const auto facts = Facts(status);
+  status.fault_latch->stop_certificate.reset();
+  EXPECT_TRUE(stop_status_field_error(status).has_value());
+  EXPECT_FALSE(AssessStopFaultRecovery(status, facts).ok());
+  status.fault_latch->stop_certificate = facts.stop_certificate;
+  status.fault_latch->stop_certificate->stop_certificate_id =
+      StopCertificateId("wrong-certificate");
+  EXPECT_TRUE(stop_status_field_error(status).has_value());
+  EXPECT_FALSE(AssessStopFaultRecovery(status, facts).ok());
+}
+
 TEST(StopFaultRecoveryTest, EligibleEvaluationReturnsUnpublishedClearedStatusCandidate) {
   const auto status = ReadyStatus();
   const auto intent = Intent(*status.fault_latch);

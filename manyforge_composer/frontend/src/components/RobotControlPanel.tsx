@@ -352,12 +352,12 @@ export function RobotControlPanelView({
     state.mode, inputRebase].join('\u0000');
   const inputContext = useMemo(() => ({ resetKey: inputResetKey, reportPending }), [inputResetKey, reportPending]);
   const operationActive = robotControlHasActiveOperation(state);
-  const active = operationActive || programActive;
+  const active = operationActive || !controller.manualControlAllowed;
   const authoringBlocked = active || state.operation?.resident === true;
   const previewNoticeKey = [status?.ownerEpoch, state.generation, state.error, state.previewIssue].join('\u0000');
   const expectedTargetRejection = state.previewIssue != null;
   const previewRejectionLabel = expectedTargetRejection ? 'Target not executable' : 'Preview unavailable';
-  const canApprove = !programActive && !state.poseDragging && pendingInputs.size === 0 && state.phase === 'ready'
+  const canApprove = controller.manualControlAllowed && !state.poseDragging && pendingInputs.size === 0 && state.phase === 'ready'
     && state.preview !== null
     && state.intent !== null;
   const canRevert = !active && (
@@ -668,10 +668,11 @@ export function RobotControlPanelView({
 
       {enabled && status !== null && displayedTarget !== undefined && (
         <>
-          {programActive && (
+          {programActive && !controller.manualControlAllowed && !state.operation?.resident && (
             <p className="central-inspector-notice" role="status">
-              <strong>Manual Robot Control is paused.</strong>{' '}
-              The backend Program lifecycle currently owns robot motion.
+              <strong>Manual control unavailable.</strong>{' '}
+              {controller.manualControlUnavailableReason}
+              {' '}<button type="button" onClick={retry}>Check again</button>
             </p>
           )}
           {!state.poseDragging && state.phase === 'blocked' && dismissedPreviewNotice !== previewNoticeKey && (
@@ -702,7 +703,7 @@ export function RobotControlPanelView({
                 type="button"
                 title={mode === 'cartesian_path' ? 'Cartesian path: move the TCP along a straight path' : label}
                 aria-pressed={state.mode === mode}
-                disabled={active || !modeAvailable(mode)}
+                disabled={operationActive || !modeAvailable(mode)}
                 onClick={() => selectMode(mode)}
               >
                 {label}

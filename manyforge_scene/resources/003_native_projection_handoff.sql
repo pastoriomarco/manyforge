@@ -95,6 +95,10 @@ CREATE TABLE IF NOT EXISTS logical_scene_named_apply_native_transition_rows (
     expected_local_scene_id TEXT,
     expected_local_scene_revision_id INTEGER,
     expected_local_scene_content_hash TEXT,
+    managed_withdrawal_json TEXT CHECK (
+        managed_withdrawal_json IS NULL OR
+        (disposition = 'removed' AND length(managed_withdrawal_json) <= 4096)
+    ),
     PRIMARY KEY (
         apply_id, apply_generation, projection_stage_generation,
         transition_ordinal

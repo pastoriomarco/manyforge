@@ -2424,44 +2424,54 @@ TEST(RetainedProductCrossConsumer,
   const auto runtime_policy = deployment::resolve_retained_runtime_policy(
       *materialized.bundle, runtime_policy_store);
   ASSERT_TRUE(runtime_policy.has_value());
-  auto runtime = create_retained_native_runtime(
-      RetainedNativeRuntimeInput{
-          arm_binding,
-          gripper_binding,
-          {},
-          {},
-          {},
-          {},
-          scene,
-          scene_mutex,
-          state_projector,
-          projection,
-          shared_collision_model,
-          std::move(planner),
-          [&](const auto &channels) {
-            std::vector<RetainedSceneFrameStateSourceInput> state_sources;
-            state_sources.reserve(channels.size());
-            for (const auto &channel : channels) {
-              state_sources.push_back(RetainedSceneFrameStateSourceInput{
-                  channel->query_context(), channel->source_kind(),
-                  std::shared_ptr<const core::IObservedStateProvider>(
-                      channel, channel->addressed_publication())});
-            }
-            return RetainedSceneFrameResolver::create_verified(
-                shared_collision_model, *materialized.bundle, model_map,
-                retained, local_runtime.runtime_unit_id,
-                local_runtime.runtime_epoch, std::move(state_sources));
-          },
-          {},
-          {},
-          &admission_gate,
-          runtime_policy->value(),
-          runtime_policy->reference(),
-          {},
-          {},
-          {},
-          {}},
-      std::move(runtime_config));
+  auto runtime_input = RetainedNativeRuntimeInput{
+      arm_binding,
+      gripper_binding,
+      {},
+      {},
+      {},
+      {},
+      scene,
+      scene_mutex,
+      state_projector,
+      projection,
+      shared_collision_model,
+      std::move(planner),
+      [&](const auto &channels) {
+        std::vector<RetainedSceneFrameStateSourceInput> state_sources;
+        state_sources.reserve(channels.size());
+        for (const auto &channel : channels) {
+          state_sources.push_back(RetainedSceneFrameStateSourceInput{
+              channel->query_context(), channel->source_kind(),
+              std::shared_ptr<const core::IObservedStateProvider>(
+                  channel, channel->addressed_publication())});
+        }
+        return RetainedSceneFrameResolver::create_verified(
+            shared_collision_model, *materialized.bundle, model_map, retained,
+            local_runtime.runtime_unit_id, local_runtime.runtime_epoch,
+            std::move(state_sources));
+      },
+      {},
+      {},
+      &admission_gate,
+      runtime_policy->value(),
+      runtime_policy->reference(),
+      {},
+      {},
+      {},
+      {}};
+  core::OrdinaryMotionJerkPolicy jerk_profile{true, false, {}};
+  for (const auto &resource : arm_binding.value().resources)
+    jerk_profile.limits.emplace(*resource.source_joint_name,
+                                core::AngularJerkDTO{50.0});
+  runtime_input.ordinary_motion_jerk =
+      deployment::native_execution_runtime_contract::OrdinaryMotionJerkSettings{
+          true, 1.0, {}};
+  for (const auto &[joint, limit] : jerk_profile.limits)
+    runtime_input.ordinary_motion_jerk->joint_limits.push_back(
+        {joint, std::get<core::AngularJerkDTO>(limit).value_rad_s3, {}});
+  auto runtime = create_retained_native_runtime(std::move(runtime_input),
+                                                std::move(runtime_config));
 
   ASSERT_NE(runtime, nullptr);
   ASSERT_NE(runtime->addressed_kernel, nullptr);
@@ -2483,6 +2493,10 @@ TEST(RetainedProductCrossConsumer,
                    0.15);
   EXPECT_EQ(motion_registration->runtime_policy->value().source_artifact,
             runtime_policy->reference());
+  ASSERT_TRUE(
+      motion_registration->runtime_policy->value().ordinary_motion_jerk);
+  EXPECT_EQ(*motion_registration->runtime_policy->value().ordinary_motion_jerk,
+            jerk_profile);
   ASSERT_TRUE(std::holds_alternative<core::RuntimePolicyCommandTargetScopeDTO>(
       motion_registration->runtime_policy->value()
           .selected_motion_speed_limit.scope));
@@ -4039,13 +4053,34 @@ TEST(RetainedProductCrossConsumer, ObservationSelectionMemoKeepsLiveChecksAndExa
     representatives.push_back(std::move(binding.value()));
   }
   const auto physical = representatives.front();
-  ProductBackedRuntimeParticipantResolver resolver(package_root, materialized.bundle, model_map,
-                                                   representatives, {});
-  const auto query = [&](const auto& binding_id, const auto& target_id, const auto& capability_id,
-                         const auto& source,
-                         std::span<const core::RuntimeParticipantBinding> current) {
-    return resolver.ResolveObservationTarget(binding_id, target_id, capability_id, source, current);
-  };
+  ProductBackedRuntimeParticipantResolver resolver(
+      package_root, materialized.bundle, model_map, representatives, {});
+  const auto &selected_program = selected.front()->value();
+  const core::ProgramRunExecutionCaptureDTO capture_request{
+      core::RequestOwnerEpoch("kernel.capture"),
+      core::RequestOwnerEpoch("runner.capture"),
+      core::CellAdmissionClaimGeneration(1U),
+      core::ProgramRunId("run.capture"),
+      selected_program.program_id,
+      selected_program.program_revision,
+      selected_program.program_binding_id,
+      selected_program.retained_bundle_id,
+      selected_program.graph_revision,
+      {}};
+  const auto capture = resolver.ResolveProgramCapture(capture_request);
+  ASSERT_TRUE(capture.ok()) << capture.error().message;
+  ASSERT_TRUE(capture.value().table);
+  ASSERT_TRUE(capture.value().binding);
+  EXPECT_EQ(*capture.value().binding, selected_program);
+  // Identity-only ingress cannot supply a table or a pre-resolved Binding.
+  EXPECT_FALSE(resolver.ResolveProgramCapture(capture.value()).ok());
+  const auto query =
+      [&](const auto &binding_id, const auto &target_id,
+          const auto &capability_id, const auto &source,
+          std::span<const core::RuntimeParticipantBinding> current) {
+        return resolver.ResolveObservationTarget(
+            binding_id, target_id, capability_id, source, current);
+      };
   const auto binding_id = selected.front()->program_binding_id();
   const core::TargetRoleId target_id("first");
   const core::CapabilityId capability_id("tool.gripper.feedback");

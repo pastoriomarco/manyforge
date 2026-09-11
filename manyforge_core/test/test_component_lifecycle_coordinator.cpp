@@ -8,6 +8,7 @@
 #include <deque>
 #include <filesystem>
 #include <functional>
+#include <future>
 #include <limits>
 #include <manyforge_core/component_lifecycle_admission.hpp>
 #include <manyforge_core/component_lifecycle_coordinator.hpp>
@@ -25,6 +26,7 @@
 #include <thread>
 
 #include "../src/component_lifecycle_journal_codec_internal.hpp"
+#include "cclc_test_admission_port.hpp"
 
 namespace manyforge::core {
 namespace {
@@ -39,13 +41,13 @@ namespace {
       acceptance.lifecycle_transaction_id.value(), intent.request_context.request_id,
       ContentDigest(detail::ComponentLifecycleSemanticIntentDigest(intent)),
       AdmissionGeneration(1U), {}, std::nullopt, std::nullopt};
-  auto recorded = journal.RecordLifecycleClaimAttempt(owner, claim_intent);
+  auto recorded = journal.RecordCellClaimAttempt(owner, claim_intent);
   if (!recorded.ok()) {
     return Result<CellAdmissionClaimDTO>::Err(recorded.error());
   }
   CellAdmissionClaimDTO claim{claim_intent, CellAdmissionClaimGeneration(1U),
                               AdmissionGeneration(1U), 0};
-  auto acquired = journal.RecordLifecycleClaimAcquired(owner, claim);
+  auto acquired = journal.RecordCellClaimAcquired(owner, claim);
   return acquired.ok() ? Result<CellAdmissionClaimDTO>::Ok(std::move(claim))
                        : Result<CellAdmissionClaimDTO>::Err(acquired.error());
 }
@@ -214,8 +216,8 @@ class ScopedTemporaryDirectory final {
   return PrepareCatalog();
 }
 
-[[nodiscard]] ComponentLifecycleIntentDTO PrepareIntent() {
-  return {{RequestId("request.1"), RequestOwnerEpoch("cclc-owner.1"), "test", std::nullopt},
+[[nodiscard]] ComponentLifecycleIntentDTO PrepareIntent(const RequestOwnerEpoch& owner) {
+  return {{RequestId("request.1"), owner, "test", std::nullopt},
           ControllableComponentId("component.1"),
           ComponentLifecycleIntentKindDTO::kPrepare,
           GraphRevision("graph.1"),
@@ -225,8 +227,8 @@ class ScopedTemporaryDirectory final {
           {RequestTransportDTO::kInternal, RequestAssuranceDTO::kUnverified, std::nullopt}};
 }
 
-[[nodiscard]] ComponentLifecycleIntentDTO DisableIntent() {
-  return {{RequestId("disable-request.1"), RequestOwnerEpoch("cclc-owner.1"), "test", std::nullopt},
+[[nodiscard]] ComponentLifecycleIntentDTO DisableIntent(const RequestOwnerEpoch& owner) {
+  return {{RequestId("disable-request.1"), owner, "test", std::nullopt},
           ControllableComponentId("component.1"),
           ComponentLifecycleIntentKindDTO::kDisable,
           GraphRevision("graph.1"),
@@ -313,6 +315,11 @@ class FakeSnapshotSource final : public ICCLCCurrentComponentSnapshotSource {
   [[nodiscard]] std::size_t read_count() const {
     std::lock_guard lock(mutex_);
     return read_count_;
+  }
+
+  void SetSnapshot(ComponentLifecycleCurrentSnapshotDTO snapshot) {
+    std::lock_guard lock(mutex_);
+    snapshots_ = {std::move(snapshot)};
   }
 
  private:
@@ -586,169 +593,7 @@ class RoutedResolver final : public ICCLCBrandLifecyclePortResolver {
   std::vector<ResolvedLifecycleProviderOccurrenceDTO> providers_;
 };
 
-class FakeCellAdmissionPort : public IKernelCellAdmissionPort {
- private:
-  struct Entry final {
-    CellAdmissionClaimDTO claim;
-    std::optional<CellAdmissionClaimReleaseDTO> release;
-  };
-
-  static bool ReleaseMatchesClaim(const CellAdmissionClaimReleaseDTO& release,
-                                  const CellAdmissionClaimDTO& claim) {
-    return release.owner_role == claim.intent.owner_role &&
-           release.owner_epoch == claim.intent.owner_epoch &&
-           release.owner_transaction_id == claim.intent.owner_transaction_id &&
-           release.request_id == claim.intent.request_id &&
-           release.request_payload_digest == claim.intent.request_payload_digest &&
-           release.acquired_admission_generation == claim.acquired_admission_generation &&
-           release.claim_generation == claim.claim_generation;
-  }
-
-  void RetainCurrentOwnerLocked(const CellAdmissionClaimIntentDTO& intent) {
-    const auto current = std::find_if(current_owners_.begin(), current_owners_.end(),
-                                      [&](const auto& owner) {
-                                        return owner.owner_role == intent.owner_role;
-                                      });
-    if (current == current_owners_.end()) {
-      current_owners_.push_back({intent.owner_role, intent.owner_epoch});
-      std::sort(current_owners_.begin(), current_owners_.end(),
-                [](const auto& lhs, const auto& rhs) {
-                  return lhs.owner_role < rhs.owner_role;
-                });
-    } else {
-      current->owner_epoch = intent.owner_epoch;
-    }
-  }
-
- public:
-  void RetainClaim(CellAdmissionClaimDTO claim) {
-    std::lock_guard lock(mutex_);
-    const auto existing =
-        std::find_if(entries_.begin(), entries_.end(), [&](const auto& entry) {
-          return entry.claim.claim_generation == claim.claim_generation;
-        });
-    if (existing == entries_.end()) {
-      entries_.push_back({claim, std::nullopt});
-    } else {
-      existing->claim = claim;
-      existing->release.reset();
-    }
-    next_claim_generation_ = CellAdmissionClaimGeneration(
-        std::max(next_claim_generation_.value(), claim.claim_generation.value() + 1U));
-    RetainCurrentOwnerLocked(claim.intent);
-  }
-
-  AuthoringAdmissionDTO GetAuthoringAdmission() const override {
-    return {true, AdmissionGeneration(1U)};
-  }
-  Result<AuthoringAdmissionDTO> UpdateCellAdmissionReadiness(
-      const CellAdmissionReadinessSnapshotDTO&) override {
-    return Result<AuthoringAdmissionDTO>::Ok(GetAuthoringAdmission());
-  }
-  Result<CellAdmissionClaimDTO> AcquireCellAdmissionClaim(
-      const CellAdmissionClaimIntentDTO& intent) override {
-    std::lock_guard lock(mutex_);
-    const auto replay = std::find_if(entries_.begin(), entries_.end(), [&](const auto& entry) {
-      return entry.claim.intent.owner_epoch == intent.owner_epoch &&
-             entry.claim.intent.request_id == intent.request_id;
-    });
-    if (replay != entries_.end()) {
-      if (replay->claim.intent != intent || replay->release.has_value()) {
-        return Result<CellAdmissionClaimDTO>::Err(
-            ErrorDTO{"request_id_conflict", "cell-admission request reuse conflict", {}});
-      }
-      return Result<CellAdmissionClaimDTO>::Ok(replay->claim);
-    }
-    CellAdmissionClaimDTO claim{intent, next_claim_generation_,
-                                intent.expected_admission_generation, 1};
-    next_claim_generation_ =
-        CellAdmissionClaimGeneration(next_claim_generation_.value() + 1U);
-    entries_.push_back({claim, std::nullopt});
-    RetainCurrentOwnerLocked(intent);
-    return Result<CellAdmissionClaimDTO>::Ok(std::move(claim));
-  }
-  Result<AuthoringAdmissionDTO> ReleaseCellAdmissionClaim(
-      const CellAdmissionClaimReleaseDTO& release) override {
-    std::lock_guard lock(mutex_);
-    const auto held = std::find_if(entries_.begin(), entries_.end(), [&](const auto& entry) {
-      return !entry.release.has_value() && ReleaseMatchesClaim(release, entry.claim);
-    });
-    if (held == entries_.end()) {
-      return Result<AuthoringAdmissionDTO>::Err(
-          ErrorDTO{"stale_generation", "cell-admission release is not exact", {}});
-    }
-    held->release = release;
-    return Result<AuthoringAdmissionDTO>::Ok(GetAuthoringAdmission());
-  }
-  Result<AuthoringAdmissionDTO> ReconcileCellAdmissionClaims(
-      const CellAdmissionReconcileDTO& reconcile) override {
-    std::lock_guard lock(mutex_);
-    std::vector<CellAdmissionClaimDTO> held_claims;
-    for (const auto& entry : entries_) {
-      if (!entry.release.has_value()) {
-        held_claims.push_back(entry.claim);
-      }
-    }
-    std::sort(held_claims.begin(), held_claims.end(), [](const auto& lhs, const auto& rhs) {
-      return lhs.claim_generation < rhs.claim_generation;
-    });
-    if (held_claims != reconcile.retained_claims) {
-      return Result<AuthoringAdmissionDTO>::Err(
-          ErrorDTO{"reconcile_inventory_not_exact",
-                   "cell-admission reconcile inventory is not exact", {}});
-    }
-    current_owners_ = reconcile.current_owner_epochs;
-    return Result<AuthoringAdmissionDTO>::Ok(GetAuthoringAdmission());
-  }
-  Result<CellAdmissionRecoveryReceiptDTO> GetCellAdmissionRecoveryReceipt(
-      const CellAdmissionRecoveryReceiptQueryDTO& query) const override {
-    std::lock_guard lock(mutex_);
-    CellAdmissionRecoveryReceiptDTO receipt{
-        CellAdmissionRecoveryReceiptStatusDTO::kUnknown,
-        RequestOwnerEpoch("kernel.1"),
-        AdmissionGeneration(1U),
-        std::nullopt,
-        std::nullopt,
-        std::nullopt,
-        {},
-        current_owners_};
-    for (const auto& entry : entries_) {
-      if (!entry.release.has_value()) {
-        receipt.held_claims.push_back(entry.claim);
-      }
-    }
-    std::sort(receipt.held_claims.begin(), receipt.held_claims.end(),
-              [](const auto& lhs, const auto& rhs) {
-                return lhs.claim_generation < rhs.claim_generation;
-              });
-    const auto matched = std::find_if(entries_.begin(), entries_.end(), [&](const auto& entry) {
-      return entry.claim.intent.owner_epoch == query.intent.owner_epoch &&
-             entry.claim.intent.request_id == query.intent.request_id;
-    });
-    if (matched == entries_.end()) {
-      return Result<CellAdmissionRecoveryReceiptDTO>::Ok(std::move(receipt));
-    }
-    if (matched->claim.intent != query.intent ||
-        (query.expected_claim.has_value() && query.expected_claim.value() != matched->claim) ||
-        (query.expected_release.has_value() && matched->release.has_value() &&
-         query.expected_release.value() != matched->release.value())) {
-      receipt.status = CellAdmissionRecoveryReceiptStatusDTO::kConflicting;
-      return Result<CellAdmissionRecoveryReceiptDTO>::Ok(std::move(receipt));
-    }
-    receipt.matched_claim = matched->claim;
-    receipt.matched_release = matched->release;
-    receipt.status = matched->release.has_value()
-                         ? CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact
-                         : CellAdmissionRecoveryReceiptStatusDTO::kHeldExact;
-    return Result<CellAdmissionRecoveryReceiptDTO>::Ok(std::move(receipt));
-  }
-
- private:
-  mutable std::mutex mutex_;
-  std::vector<Entry> entries_;
-  std::vector<CellAdmissionCurrentOwnerEpochDTO> current_owners_;
-  CellAdmissionClaimGeneration next_claim_generation_{1U};
-};
+using test::FakeCellAdmissionPort;
 
 class UnusedKernelPort final : public ICCLCKernelDisableHandoffPort,
                                public FakeCellAdmissionPort {
@@ -1200,7 +1045,7 @@ struct PreparedBrandRecoverySeed final {
 [[nodiscard]] PreparedBrandRecoverySeed SeedPreparedBrandRecovery(
     SqliteCCLCJournal& journal, const RequestOwnerEpoch& owner,
     const BrandLifecyclePlanCatalogDTO& catalog, std::string transaction_id) {
-  const auto intent = PrepareIntent();
+  const auto intent = PrepareIntent(owner);
   const auto snapshot = Snapshot("snapshot.1", ComponentLifecycleStateDTO::kDeclared,
                                  ComponentLifecycleGeneration(3U), catalog);
   const auto prepared = PrepareComponentLifecycleAdmission(
@@ -1306,7 +1151,7 @@ struct PreparedBrandRecoverySeed final {
   return attempt;
 }
 
-TEST(ComponentLifecycleCoordinator, PersistsBeforeDispatchAndCompletesPreparedTransition) {
+TEST(ComponentLifecycleCoordinator, PersistsBeforeDispatchAndReconcilesLostReleaseReply) {
   ScopedTemporaryDirectory temporary;
   SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
                             8U);
@@ -1325,7 +1170,9 @@ TEST(ComponentLifecycleCoordinator, PersistsBeforeDispatchAndCompletesPreparedTr
                                             resolver, kernel, clock, scheduler);
 
   ASSERT_TRUE(coordinator.Start().ok());
-  const auto accepted = coordinator.SubmitLifecycle(PrepareIntent());
+  kernel.LoseNextReleaseReply();
+  const auto accepted =
+      coordinator.SubmitLifecycle(PrepareIntent(coordinator.request_owner_epoch()));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
   ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
 
@@ -1338,6 +1185,192 @@ TEST(ComponentLifecycleCoordinator, PersistsBeforeDispatchAndCompletesPreparedTr
   EXPECT_EQ(port->dispatch_count(), 1U);
   EXPECT_TRUE(port->saw_prepared_status());
   EXPECT_TRUE(reservations.snapshot().empty());
+  EXPECT_TRUE(coordinator.accepting_new_requests());
+}
+
+TEST(ComponentLifecycleCoordinator, ProgramNodeStopRejectionDoesNotPoisonOwnerOrConsumeGeneration) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
+                            8U);
+  CCLCDomainReservationTable reservations;
+  FakeSnapshotSource snapshots({Snapshot(), Snapshot(), Snapshot(), Snapshot()});
+  FakeCatalogSource catalogs(PrepareCatalog());
+  auto port = std::make_shared<FakeBrandPort>(
+      journal, std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kDeclared,
+                                                       ComponentLifecycleStateDTO::kPrepared});
+  FakeResolver resolver(port);
+  UnusedKernelPort kernel;
+  FakeClock clock;
+  clock.set(100);
+  ManualScheduler scheduler;
+  ComponentLifecycleCoordinator coordinator(Config(), journal, reservations, snapshots, catalogs,
+                                            resolver, kernel, clock, scheduler);
+  ASSERT_TRUE(coordinator.Start().ok());
+  auto intent = PrepareIntent(coordinator.request_owner_epoch());
+  intent.program_node_evidence = ProgramNodeAdmissionEvidenceDTO{RequestOwnerEpoch("runner.1"),
+                                                                 ProgramRunId("run.1"),
+                                                                 CellAdmissionClaimGeneration(7U),
+                                                                 "prepare",
+                                                                 "prepare.1",
+                                                                 "cclc.lifecycle"};
+  kernel.RejectNextClaim(
+      {"invalid_state_transition",
+       "Not started — held by Stop",
+       {{"reason", "program_node_stop_fence_active"}, {"selection_revision", "9"}}});
+  const auto rejected = coordinator.SubmitLifecycle(intent);
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.error().details.at("selection_revision"), "9");
+  EXPECT_TRUE(coordinator.accepting_new_requests());
+  EXPECT_EQ(port->dispatch_count(), 0U);
+  EXPECT_TRUE(reservations.snapshot().empty());
+  const auto absent = coordinator.ReadLifecycleRequestResult(intent);
+  ASSERT_TRUE(absent.ok());
+  ASSERT_TRUE(absent.value());
+  ASSERT_TRUE(absent.value()->rejection);
+  EXPECT_EQ(absent.value()->rejection->details.at("selection_revision"), "9");
+
+  // A newer owner release allows a fresh node attempt, not replay of a command
+  // with an uncertain effect. The first real transaction still has generation 1.
+  intent.request_context.request_id = RequestId("prepare.after-release");
+  intent.program_node_evidence->node_attempt_id = "prepare.2";
+  const auto accepted = coordinator.SubmitLifecycle(intent);
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
+  EXPECT_EQ(accepted.value().acceptance->lifecycle_transaction_generation.value(), 1U);
+  const auto result = coordinator.ReadLifecycleRequestResult(intent);
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(result.value());
+  ASSERT_TRUE(result.value()->status);
+  EXPECT_EQ(result.value()->status->accepted_intent.program_node_evidence,
+            intent.program_node_evidence);
+  EXPECT_EQ(result.value()->status->terminal_result,
+            ComponentLifecycleTerminalResultDTO::kSucceeded);
+  EXPECT_EQ(port->dispatch_count(), 1U);
+  auto conflict = intent;
+  conflict.program_node_evidence->node_attempt_id = "foreign.3";
+  const auto wrong = coordinator.ReadLifecycleRequestResult(conflict);
+  ASSERT_TRUE(wrong.ok());
+  ASSERT_TRUE(wrong.value());
+  EXPECT_EQ(wrong.value()->replay_status, RequestReplayStatusDTO::kRequestIdConflict);
+  EXPECT_EQ(port->dispatch_count(), 1U);
+  intent.request_context.request_id = RequestId("prepare.unknown-acquire");
+  intent.expected_component_lifecycle_generation =
+      accepted.value().acceptance->component_lifecycle_generation;
+  snapshots.SetSnapshot(Snapshot("after.prepare", ComponentLifecycleStateDTO::kPrepared,
+                                 intent.expected_component_lifecycle_generation));
+  kernel.RejectNextClaim({"owner_unavailable", "acquire reply unknown", {}});
+  const auto unknown = coordinator.SubmitLifecycle(intent);
+  ASSERT_FALSE(unknown.ok());
+  EXPECT_EQ(unknown.error().code, "owner_unavailable");
+  EXPECT_FALSE(coordinator.accepting_new_requests());
+  EXPECT_EQ(port->dispatch_count(), 1U);
+}
+
+TEST(ComponentLifecycleCoordinator, FullSettledLedgerRotatesTwiceAndJoinsLostReconcileReply) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
+                            1U);
+  CCLCDomainReservationTable reservations;
+  FakeSnapshotSource snapshots({Snapshot()});
+  FakeCatalogSource catalogs(PrepareCatalog());
+  auto port = std::make_shared<FakeBrandPort>(
+      journal, std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kPrepared});
+  FakeResolver resolver(port);
+  UnusedKernelPort kernel;
+  FakeClock clock;
+  clock.set(100);
+  ManualScheduler scheduler;
+  auto config = Config();
+  config.request_membership_capacity = 2U;
+  ComponentLifecycleCoordinator coordinator(config, journal, reservations, snapshots, catalogs,
+                                            resolver, kernel, clock, scheduler);
+  ASSERT_TRUE(coordinator.Start().ok());
+  std::vector<RequestOwnerEpoch> namespaces{coordinator.request_owner_epoch()};
+  for (std::uint64_t index = 0; index != 6U; ++index) {
+    snapshots.SetSnapshot(Snapshot("snapshot." + std::to_string(index),
+                                   ComponentLifecycleStateDTO::kPrepared,
+                                   ComponentLifecycleGeneration(3U + index)));
+    auto intent = PrepareIntent(coordinator.request_owner_epoch());
+    intent.request_context.request_id = RequestId("request." + std::to_string(index));
+    intent.expected_component_lifecycle_generation = ComponentLifecycleGeneration(3U + index);
+    if (index == 2U) kernel.LoseNextReconcileReply();
+    if (index == 4U) kernel.RejectNextReconcileInventory();
+    auto accepted = coordinator.SubmitLifecycle(intent);
+    if (index == 2U || index == 4U) {
+      ASSERT_FALSE(accepted.ok());
+      EXPECT_EQ(accepted.error().code, "cclc_request_namespace_refreshed");
+      EXPECT_EQ(accepted.error().details.at("effect"), "not_started");
+      EXPECT_TRUE(coordinator.accepting_new_requests());
+      EXPECT_NE(coordinator.request_owner_epoch(), namespaces.back());
+      namespaces.push_back(coordinator.request_owner_epoch());
+      // Only the explicit no-effect result permits a fresh receiver-bound
+      // request. An unknown response must not take this branch.
+      intent.request_context.request_owner_epoch = coordinator.request_owner_epoch();
+      accepted = coordinator.SubmitLifecycle(intent);
+    }
+    ASSERT_TRUE(accepted.ok()) << accepted.error().code << ": " << accepted.error().message;
+    ASSERT_TRUE(accepted.value().acceptance);
+    EXPECT_EQ(accepted.value().acceptance->lifecycle_transaction_generation.value(), index + 1U);
+    ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
+    EXPECT_TRUE(reservations.snapshot().empty());
+  }
+  EXPECT_EQ(namespaces.size(), 3U);
+  EXPECT_EQ(port->dispatch_count(), 0U);  // Already-satisfied Prepare, not fabricated motion.
+}
+
+TEST(ComponentLifecycleCoordinator, FullButRunningIsProvenUnstartedNotAnUnknownEffect) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
+                            1U);
+  CCLCDomainReservationTable reservations;
+  FakeSnapshotSource snapshots({Snapshot()});
+  FakeCatalogSource catalogs(PrepareCatalog());
+  std::promise<void> entered;
+  std::promise<void> release;
+  auto released = release.get_future().share();
+  auto port = std::make_shared<FakeBrandPort>(
+      journal,
+      std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kDeclared,
+                                              ComponentLifecycleStateDTO::kPrepared},
+      DispatchMode::kKnownSuccess, 1U, std::vector<LifecycleFactDTO>{}, [&] {
+        entered.set_value();
+        released.wait();
+      });
+  FakeResolver resolver(port);
+  UnusedKernelPort kernel;
+  FakeClock clock;
+  clock.set(100);
+  ManualScheduler scheduler;
+  auto config = Config();
+  config.request_membership_capacity = 1U;
+  ComponentLifecycleCoordinator coordinator(config, journal, reservations, snapshots, catalogs,
+                                            resolver, kernel, clock, scheduler);
+  ASSERT_TRUE(coordinator.Start().ok());
+  const auto old = coordinator.request_owner_epoch();
+  const auto first = coordinator.SubmitLifecycle(PrepareIntent(old));
+  const auto running = entered.get_future().wait_for(std::chrono::seconds(2));
+  auto waiting = PrepareIntent(old);
+  waiting.request_context.request_id = RequestId("capacity.waiting");
+  const auto deferred = coordinator.SubmitLifecycle(waiting);
+  const auto proof = coordinator.ReadLifecycleRequestResult(waiting);
+  release.set_value();  // Always release the fixture worker before assertions can return.
+  ASSERT_TRUE(first.ok());
+  EXPECT_EQ(running, std::future_status::ready);
+  ASSERT_FALSE(deferred.ok());
+  EXPECT_EQ(deferred.error().code, "cclc_request_admission_deferred");
+  EXPECT_EQ(deferred.error().details.at("effect"), "not_started");
+  ASSERT_FALSE(proof.ok());
+  EXPECT_EQ(proof.error().code, "cclc_request_admission_deferred");
+  EXPECT_EQ(coordinator.request_owner_epoch(), old);
+  ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
+  const auto cutover = coordinator.SubmitLifecycle(waiting);
+  ASSERT_FALSE(cutover.ok());
+  EXPECT_EQ(cutover.error().code, "cclc_request_namespace_refreshed");
+  const auto after = coordinator.ReadLifecycleRequestResult(waiting);
+  ASSERT_FALSE(after.ok());
+  EXPECT_EQ(after.error().details.at("effect"), "not_started");
+  EXPECT_NE(coordinator.request_owner_epoch(), old);
+  EXPECT_EQ(port->dispatch_count(), 1U);
 }
 
 TEST(ComponentLifecycleCoordinator, EvidenceAtExactDeadlineCannotCompleteLifecycleTransition) {
@@ -1362,7 +1395,8 @@ TEST(ComponentLifecycleCoordinator, EvidenceAtExactDeadlineCannotCompleteLifecyc
                                             resolver, kernel, clock, scheduler);
 
   ASSERT_TRUE(coordinator.Start().ok());
-  const auto accepted = coordinator.SubmitLifecycle(PrepareIntent());
+  const auto accepted =
+      coordinator.SubmitLifecycle(PrepareIntent(coordinator.request_owner_epoch()));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
   ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
 
@@ -1397,15 +1431,18 @@ TEST(ComponentLifecycleCoordinator, UnrepresentableDeadlineFailsBeforeDurableAcc
                                             resolver, kernel, clock, scheduler);
 
   ASSERT_TRUE(coordinator.Start().ok());
-  const auto intent = PrepareIntent();
+  const auto intent = PrepareIntent(coordinator.request_owner_epoch());
   const auto accepted = coordinator.SubmitLifecycle(intent);
   ASSERT_FALSE(accepted.ok());
   EXPECT_EQ(accepted.error().code, "component_lifecycle_deadline_overflow");
   EXPECT_TRUE(reservations.snapshot().empty());
   EXPECT_EQ(port->dispatch_count(), 0U);
-  const auto inspected = journal.InspectLifecycleRequest(Config().request_owner_epoch, intent);
+  const auto inspected = journal.InspectLifecycleRequest(coordinator.request_owner_epoch(), intent);
   ASSERT_TRUE(inspected.ok());
-  EXPECT_FALSE(inspected.value().has_value());
+  ASSERT_TRUE(inspected.value());
+  EXPECT_FALSE(inspected.value()->acceptance);
+  ASSERT_TRUE(inspected.value()->rejection);
+  EXPECT_EQ(inspected.value()->rejection->details.at("effect"), "not_started");
 }
 
 TEST(ComponentLifecycleCoordinator,
@@ -1427,11 +1464,11 @@ TEST(ComponentLifecycleCoordinator,
                                             resolver, kernel, clock, scheduler);
 
   ASSERT_TRUE(coordinator.Start().ok());
-  const auto first = coordinator.SubmitLifecycle(PrepareIntent());
+  const auto first = coordinator.SubmitLifecycle(PrepareIntent(coordinator.request_owner_epoch()));
   ASSERT_TRUE(first.ok());
   ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
   coordinator.CloseAdmission();
-  const auto replay = coordinator.SubmitLifecycle(PrepareIntent());
+  const auto replay = coordinator.SubmitLifecycle(PrepareIntent(coordinator.request_owner_epoch()));
   ASSERT_TRUE(replay.ok()) << replay.error().message;
   EXPECT_EQ(replay.value().replay_status, RequestReplayStatusDTO::kReplayedExact);
   EXPECT_EQ(replay.value().acceptance->lifecycle_transaction_id,
@@ -1459,7 +1496,7 @@ TEST(ComponentLifecycleCoordinator, SnapshotChangeAfterReservationRejectsAndRele
                                             resolver, kernel, clock, scheduler);
 
   ASSERT_TRUE(coordinator.Start().ok());
-  const auto result = coordinator.SubmitLifecycle(PrepareIntent());
+  const auto result = coordinator.SubmitLifecycle(PrepareIntent(coordinator.request_owner_epoch()));
   ASSERT_FALSE(result.ok());
   EXPECT_EQ(result.error().code, "component_lifecycle_snapshot_changed_during_admission");
   EXPECT_TRUE(reservations.snapshot().empty());
@@ -1471,8 +1508,8 @@ TEST(ComponentLifecycleCoordinator,
   ScopedTemporaryDirectory temporary;
   SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
                             8U);
-  const auto first = DisjointComponent("a", "concurrent-request.a");
-  const auto second = DisjointComponent("b", "concurrent-request.b");
+  auto first = DisjointComponent("a", "concurrent-request.a");
+  auto second = DisjointComponent("b", "concurrent-request.b");
   ASSERT_TRUE(first.snapshot.locally_valid());
   ASSERT_TRUE(first.intent.locally_valid());
   ASSERT_TRUE(second.snapshot.locally_valid());
@@ -1494,6 +1531,8 @@ TEST(ComponentLifecycleCoordinator,
                                               resolver, kernel, clock, scheduler);
 
     ASSERT_TRUE(coordinator.Start().ok());
+    first.intent.request_context.request_owner_epoch = coordinator.request_owner_epoch();
+    second.intent.request_context.request_owner_epoch = coordinator.request_owner_epoch();
     std::optional<Result<CCLCLifecycleRequestResultDTO>> first_result;
     std::optional<Result<CCLCLifecycleRequestResultDTO>> second_result;
     std::thread first_submitter(
@@ -1558,7 +1597,7 @@ TEST(ComponentLifecycleCoordinator,
                                             resolver, kernel, clock, scheduler);
 
   ASSERT_TRUE(coordinator.Start().ok());
-  const auto intent = PrepareIntent();
+  const auto intent = PrepareIntent(coordinator.request_owner_epoch());
   std::optional<Result<CCLCLifecycleRequestResultDTO>> submitted;
   std::thread submitter([&] { submitted.emplace(coordinator.SubmitLifecycle(intent)); });
   const bool reread_blocked = snapshots.WaitForBlockedReread(std::chrono::seconds(2));
@@ -1575,9 +1614,57 @@ TEST(ComponentLifecycleCoordinator,
   EXPECT_EQ(submitted->error().code, "component_lifecycle_admission_closed");
   EXPECT_TRUE(reservations.snapshot().empty());
   EXPECT_EQ(port->dispatch_count(), 0U);
-  const auto inspected = journal.InspectLifecycleRequest(Config().request_owner_epoch, intent);
+  const auto inspected = journal.InspectLifecycleRequest(coordinator.request_owner_epoch(), intent);
   ASSERT_TRUE(inspected.ok()) << inspected.error().code << ": " << inspected.error().message;
-  EXPECT_FALSE(inspected.value().has_value());
+  ASSERT_TRUE(inspected.value());
+  EXPECT_FALSE(inspected.value()->acceptance);
+  ASSERT_TRUE(inspected.value()->rejection);
+  EXPECT_EQ(inspected.value()->rejection->details.at("effect"), "not_started");
+}
+
+TEST(ComponentLifecycleCoordinator, ConcurrentDuplicateJoinsBeforeAnotherPreflight) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
+                            8U);
+  CCLCDomainReservationTable reservations;
+  BlockingRereadSnapshotSource snapshots(Snapshot());
+  FakeCatalogSource catalogs(PrepareCatalog());
+  auto port = std::make_shared<FakeBrandPort>(
+      journal, std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kDeclared,
+                                                       ComponentLifecycleStateDTO::kPrepared});
+  FakeResolver resolver(port);
+  UnusedKernelPort kernel;
+  FakeClock clock;
+  clock.set(100);
+  ManualScheduler scheduler;
+  ComponentLifecycleCoordinator coordinator(Config(), journal, reservations, snapshots, catalogs,
+                                            resolver, kernel, clock, scheduler);
+  ASSERT_TRUE(coordinator.Start().ok());
+  const auto intent = PrepareIntent(coordinator.request_owner_epoch());
+  auto first = std::async(std::launch::async, [&] { return coordinator.SubmitLifecycle(intent); });
+  const bool crossing = snapshots.WaitForBlockedReread(std::chrono::seconds(2));
+  EXPECT_TRUE(crossing);
+  std::promise<void> duplicate_started;
+  auto duplicate = std::async(std::launch::async, [&] {
+    duplicate_started.set_value();
+    return coordinator.SubmitLifecycle(intent);
+  });
+  // Preflight and its outcome now share one gate with checkpointing.
+  duplicate_started.get_future().wait();
+  EXPECT_EQ(duplicate.wait_for(std::chrono::milliseconds(0)), std::future_status::timeout);
+  snapshots.ReleaseReread();
+  const auto accepted = first.get();
+  const auto joined = duplicate.get();
+  ASSERT_TRUE(accepted.ok());
+  ASSERT_TRUE(joined.ok()) << joined.error().message;
+  ASSERT_TRUE(accepted.value().acceptance);
+  ASSERT_TRUE(joined.value().acceptance);
+  EXPECT_EQ(accepted.value().acceptance->lifecycle_transaction_id,
+            joined.value().acceptance->lifecycle_transaction_id);
+  ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
+  EXPECT_TRUE(coordinator.accepting_new_requests());
+  EXPECT_TRUE(reservations.snapshot().empty());
+  EXPECT_EQ(port->dispatch_count(), 1U);
 }
 
 TEST(ComponentLifecycleCoordinator,
@@ -1602,7 +1689,8 @@ TEST(ComponentLifecycleCoordinator,
                                             resolver, kernel, clock, scheduler);
 
   ASSERT_TRUE(coordinator.Start().ok());
-  const auto accepted = coordinator.SubmitLifecycle(PrepareIntent());
+  const auto accepted =
+      coordinator.SubmitLifecycle(PrepareIntent(coordinator.request_owner_epoch()));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
   ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
   const auto status =
@@ -1634,7 +1722,8 @@ TEST(ComponentLifecycleCoordinator,
                                             resolver, kernel, clock, scheduler);
 
   ASSERT_TRUE(coordinator.Start().ok());
-  const auto accepted = coordinator.SubmitLifecycle(DisableIntent());
+  const auto accepted =
+      coordinator.SubmitLifecycle(DisableIntent(coordinator.request_owner_epoch()));
   ASSERT_TRUE(accepted.ok()) << accepted.error().code << ": " << accepted.error().message;
   ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
 
@@ -1697,9 +1786,9 @@ TEST(ComponentLifecycleCoordinator,
   ComponentLifecycleCoordinator coordinator(Config(), journal, reservations, snapshots, catalogs,
                                             resolver, kernel, clock, scheduler);
 
-  auto intent = DisableIntent();
-  intent.request_context.request_id = RequestId("disable-under-fence-config-mismatch.1");
   ASSERT_TRUE(coordinator.Start().ok());
+  auto intent = DisableIntent(coordinator.request_owner_epoch());
+  intent.request_context.request_id = RequestId("disable-under-fence-config-mismatch.1");
   const auto accepted = coordinator.SubmitLifecycle(intent);
   ASSERT_TRUE(accepted.ok()) << accepted.error().code << ": " << accepted.error().message;
   ASSERT_TRUE(accepted.value().acceptance.has_value());
@@ -1741,11 +1830,11 @@ TEST(ComponentLifecycleCoordinator, ResolvedStaleDisableContainsAndReleasesWitho
   ComponentLifecycleCoordinator coordinator(Config(), journal, reservations, snapshots, catalogs,
                                             resolver, kernel, clock, scheduler);
 
-  auto intent = DisableIntent();
+  ASSERT_TRUE(coordinator.Start().ok());
+  auto intent = DisableIntent(coordinator.request_owner_epoch());
   intent.request_context.request_id = RequestId("disable-stale.1");
   intent.expected_component_lifecycle_generation = ComponentLifecycleGeneration(2U);
   ASSERT_TRUE(intent.locally_valid());
-  ASSERT_TRUE(coordinator.Start().ok());
   const auto accepted = coordinator.SubmitLifecycle(intent);
   ASSERT_TRUE(accepted.ok()) << accepted.error().code << ": " << accepted.error().message;
   EXPECT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
@@ -1790,9 +1879,9 @@ TEST(ComponentLifecycleCoordinator,
   ComponentLifecycleCoordinator coordinator(Config(), journal, reservations, snapshots, catalogs,
                                             resolver, kernel, clock, scheduler);
 
-  auto intent = DisableIntent();
-  intent.request_context.request_id = RequestId("disable-catalog-unavailable.1");
   ASSERT_TRUE(coordinator.Start().ok());
+  auto intent = DisableIntent(coordinator.request_owner_epoch());
+  intent.request_context.request_id = RequestId("disable-catalog-unavailable.1");
   const auto accepted = coordinator.SubmitLifecycle(intent);
   ASSERT_TRUE(accepted.ok()) << accepted.error().code << ": " << accepted.error().message;
   ASSERT_TRUE(accepted.value().acceptance.has_value());
@@ -1844,9 +1933,9 @@ TEST(ComponentLifecycleCoordinator, ExactDisableCanQualifyCatalogUnderHeldFenceA
   ComponentLifecycleCoordinator coordinator(Config(), journal, reservations, snapshots, catalogs,
                                             resolver, kernel, clock, scheduler);
 
-  auto intent = DisableIntent();
-  intent.request_context.request_id = RequestId("disable-catalog-late.1");
   ASSERT_TRUE(coordinator.Start().ok());
+  auto intent = DisableIntent(coordinator.request_owner_epoch());
+  intent.request_context.request_id = RequestId("disable-catalog-late.1");
   const auto accepted = coordinator.SubmitLifecycle(intent);
   ASSERT_TRUE(accepted.ok()) << accepted.error().code << ": " << accepted.error().message;
   ASSERT_TRUE(accepted.value().acceptance.has_value());
@@ -1890,9 +1979,9 @@ TEST(ComponentLifecycleCoordinator,
   ComponentLifecycleCoordinator coordinator(Config(), journal, reservations, snapshots, catalogs,
                                             resolver, kernel, clock, scheduler);
 
-  auto intent = DisableIntent();
-  intent.request_context.request_id = RequestId("disable-promoted-full.1");
   ASSERT_TRUE(coordinator.Start().ok());
+  auto intent = DisableIntent(coordinator.request_owner_epoch());
+  intent.request_context.request_id = RequestId("disable-promoted-full.1");
   const auto accepted = coordinator.SubmitLifecycle(intent);
   ASSERT_TRUE(accepted.ok()) << accepted.error().code << ": " << accepted.error().message;
   ASSERT_TRUE(accepted.value().acceptance.has_value());
@@ -1939,16 +2028,16 @@ TEST(ComponentLifecycleCoordinator,
   ComponentLifecycleCoordinator coordinator(Config(), journal, reservations, snapshots, catalogs,
                                             resolver, kernel, clock, scheduler);
 
-  auto disable = DisableIntent();
-  disable.request_context.request_id = RequestId("disable-promoted-full-gate.1");
   ASSERT_TRUE(coordinator.Start().ok());
+  auto disable = DisableIntent(coordinator.request_owner_epoch());
+  disable.request_context.request_id = RequestId("disable-promoted-full-gate.1");
   const auto accepted = coordinator.SubmitLifecycle(disable);
   ASSERT_TRUE(accepted.ok()) << accepted.error().code << ": " << accepted.error().message;
   ASSERT_TRUE(accepted.value().acceptance.has_value());
   ASSERT_TRUE(scheduler.WaitForScheduled(1U, std::chrono::seconds(2)));
   EXPECT_FALSE(coordinator.accepting_new_requests());
 
-  const auto unseen = coordinator.SubmitLifecycle(PrepareIntent());
+  const auto unseen = coordinator.SubmitLifecycle(PrepareIntent(coordinator.request_owner_epoch()));
   ASSERT_FALSE(unseen.ok());
   EXPECT_EQ(unseen.error().code, "component_lifecycle_admission_closed");
   const auto replay = coordinator.SubmitLifecycle(disable);
@@ -1981,9 +2070,9 @@ TEST(ComponentLifecycleCoordinator,
   ComponentLifecycleCoordinator coordinator(Config(), journal, reservations, snapshots, catalogs,
                                             resolver, kernel, clock, scheduler);
 
-  auto intent = DisableIntent();
-  intent.request_context.request_id = RequestId("disable-stopping.1");
   ASSERT_TRUE(coordinator.Start().ok());
+  auto intent = DisableIntent(coordinator.request_owner_epoch());
+  intent.request_context.request_id = RequestId("disable-stopping.1");
   const auto accepted = coordinator.SubmitLifecycle(intent);
   ASSERT_TRUE(accepted.ok()) << accepted.error().code << ": " << accepted.error().message;
   ASSERT_TRUE(scheduler.WaitForScheduled(1U, std::chrono::seconds(2)));
@@ -2035,9 +2124,9 @@ TEST(ComponentLifecycleCoordinator,
   auto coordinator = std::make_unique<ComponentLifecycleCoordinator>(
       Config(), journal, reservations, snapshots, catalogs, resolver, kernel, clock, scheduler);
 
-  auto intent = DisableIntent();
-  intent.request_context.request_id = RequestId("disable-shutdown-publication-race.1");
   ASSERT_TRUE(coordinator->Start().ok());
+  auto intent = DisableIntent(coordinator->request_owner_epoch());
+  intent.request_context.request_id = RequestId("disable-shutdown-publication-race.1");
   const auto accepted = coordinator->SubmitLifecycle(intent);
   ASSERT_TRUE(accepted.ok()) << accepted.error().code << ": " << accepted.error().message;
   ASSERT_TRUE(scheduler.WaitForScheduleEntered(std::chrono::seconds(2)));
@@ -2101,7 +2190,8 @@ TEST(ComponentLifecycleCoordinator, ShutdownFailsClosedWhenTheLifecycleScheduler
         if (!coordinator->Start().ok()) {
           ::_exit(0);
         }
-        const auto accepted = coordinator->SubmitLifecycle(PrepareIntent());
+        const auto accepted =
+            coordinator->SubmitLifecycle(PrepareIntent(coordinator->request_owner_epoch()));
         if (!accepted.ok() || !scheduler.WaitForScheduled(1U, std::chrono::seconds(2))) {
           ::_exit(0);
         }
@@ -2116,11 +2206,12 @@ TEST(ComponentLifecycleCoordinator,
   ScopedTemporaryDirectory temporary;
   SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
                             8U);
-  const RequestOwnerEpoch first_owner("cclc-owner.1");
-  ASSERT_TRUE(journal.BeginOwnerEpoch(first_owner, 1, 8U).ok());
-  const auto intent = PrepareIntent();
+  const auto begun = journal.BeginOwnerEpoch(RequestOwnerEpoch("cclc-owner.1"), 1, 8U);
+  ASSERT_TRUE(begun.ok());
+  const auto first_owner = begun.value().request_owner_epoch;
+  const auto intent = PrepareIntent(first_owner);
   const auto prepared = PrepareComponentLifecycleAdmission(
-      intent, RecoveryAdmissionCandidate("recovery-no-effect.1", Snapshot(), {PrepareCatalog()}));
+      intent, RecoveryAdmissionCandidate("lifecycle.1", Snapshot(), {PrepareCatalog()}));
   ASSERT_TRUE(prepared.ok()) << prepared.error().code << ": " << prepared.error().message;
   const auto seeded_claim =
       SeedLifecycleClaim(journal, first_owner, intent, prepared.value().acceptance);
@@ -2152,7 +2243,7 @@ TEST(ComponentLifecycleCoordinator,
       coordinator.LoadLifecycleStatus(prepared.value().acceptance.lifecycle_transaction_id);
   ASSERT_TRUE(status.ok());
   ASSERT_TRUE(status.value().has_value());
-  EXPECT_EQ(status.value()->status_owner_epoch, config.request_owner_epoch);
+  EXPECT_EQ(status.value()->status_owner_epoch, coordinator.request_owner_epoch());
   EXPECT_EQ(status.value()->phase, ComponentLifecycleTransactionPhaseDTO::kFailed);
   EXPECT_EQ(status.value()->terminal_result,
             ComponentLifecycleTerminalResultDTO::kFailedKnownNoEffect);
@@ -2169,12 +2260,12 @@ TEST(ComponentLifecycleCoordinator,
   ScopedTemporaryDirectory temporary;
   SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
                             8U);
-  const RequestOwnerEpoch first_owner("cclc-owner.1");
-  ASSERT_TRUE(journal.BeginOwnerEpoch(first_owner, 1, 8U).ok());
-  const auto intent = PrepareIntent();
+  const auto begun = journal.BeginOwnerEpoch(RequestOwnerEpoch("cclc-owner.1"), 1, 8U);
+  ASSERT_TRUE(begun.ok());
+  const auto first_owner = begun.value().request_owner_epoch;
+  const auto intent = PrepareIntent(first_owner);
   const auto prepared = PrepareComponentLifecycleAdmission(
-      intent,
-      RecoveryAdmissionCandidate("recovery-prepared-brand.1", Snapshot(), {PrepareCatalog()}));
+      intent, RecoveryAdmissionCandidate("lifecycle.1", Snapshot(), {PrepareCatalog()}));
   ASSERT_TRUE(prepared.ok()) << prepared.error().code << ": " << prepared.error().message;
   const auto seeded_claim =
       SeedLifecycleClaim(journal, first_owner, intent, prepared.value().acceptance);
@@ -2220,7 +2311,7 @@ TEST(ComponentLifecycleCoordinator,
       coordinator.LoadLifecycleStatus(prepared.value().acceptance.lifecycle_transaction_id);
   ASSERT_TRUE(status.ok());
   ASSERT_TRUE(status.value().has_value());
-  EXPECT_EQ(status.value()->status_owner_epoch, config.request_owner_epoch);
+  EXPECT_EQ(status.value()->status_owner_epoch, coordinator.request_owner_epoch());
   EXPECT_EQ(status.value()->phase, ComponentLifecycleTransactionPhaseDTO::kSucceeded);
   EXPECT_EQ(status.value()->terminal_result, ComponentLifecycleTerminalResultDTO::kSucceeded);
   EXPECT_EQ(catalogs.load_count(), 1U);
@@ -2259,11 +2350,11 @@ TEST_P(RecoveredBrandClassificationTest, ClassifiesFreshEvidenceWithoutRedispatc
   ScopedTemporaryDirectory temporary;
   SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
                             8U);
-  const RequestOwnerEpoch first_owner("cclc-owner.1");
-  ASSERT_TRUE(journal.BeginOwnerEpoch(first_owner, 1, 8U).ok());
-  const auto seed = SeedPreparedBrandRecovery(
-      journal, first_owner, GetParam().catalog,
-      std::string("recovery-classification-") + std::string(GetParam().name));
+  const auto begun = journal.BeginOwnerEpoch(RequestOwnerEpoch("cclc-owner.1"), 1, 8U);
+  ASSERT_TRUE(begun.ok());
+  const auto first_owner = begun.value().request_owner_epoch;
+  const auto seed =
+      SeedPreparedBrandRecovery(journal, first_owner, GetParam().catalog, "lifecycle.1");
 
   CCLCDomainReservationTable reservations;
   FakeSnapshotSource snapshots({Snapshot()});
@@ -2334,11 +2425,11 @@ TEST(ComponentLifecycleCoordinator,
   ScopedTemporaryDirectory temporary;
   SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
                             8U);
-  const RequestOwnerEpoch first_owner("cclc-owner.1");
-  ASSERT_TRUE(journal.BeginOwnerEpoch(first_owner, 1, 8U).ok());
+  const auto begun = journal.BeginOwnerEpoch(RequestOwnerEpoch("cclc-owner.1"), 1, 8U);
+  ASSERT_TRUE(begun.ok());
+  const auto first_owner = begun.value().request_owner_epoch;
   const auto catalog = FactBearingPrepareCatalog();
-  const auto seed =
-      SeedPreparedBrandRecovery(journal, first_owner, catalog, "recovery-fact-uncertain.1");
+  const auto seed = SeedPreparedBrandRecovery(journal, first_owner, catalog, "lifecycle.1");
 
   CCLCDomainReservationTable reservations;
   FakeSnapshotSource snapshots({Snapshot()});
@@ -2379,15 +2470,16 @@ TEST(ComponentLifecycleCoordinator,
   ScopedTemporaryDirectory temporary;
   SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
                             8U);
-  const RequestOwnerEpoch first_owner("cclc-owner.1");
-  ASSERT_TRUE(journal.BeginOwnerEpoch(first_owner, 1, 8U).ok());
+  const auto begun = journal.BeginOwnerEpoch(RequestOwnerEpoch("cclc-owner.1"), 1, 8U);
+  ASSERT_TRUE(begun.ok());
+  const auto first_owner = begun.value().request_owner_epoch;
   const auto snapshot = Snapshot("snapshot.before.1", ComponentLifecycleStateDTO::kActive,
                                  ComponentLifecycleGeneration(3U));
   const auto disable_admission = RecoveryDisableAdmission(snapshot);
   ASSERT_TRUE(disable_admission.ok()) << disable_admission.error().message;
-  const auto intent = DisableIntent();
+  const auto intent = DisableIntent(first_owner);
   const auto prepared = PrepareComponentLifecycleAdmission(
-      intent, RecoveryAdmissionCandidate("recovery-ready-disable.1", snapshot, {DisableCatalog()},
+      intent, RecoveryAdmissionCandidate("lifecycle.1", snapshot, {DisableCatalog()},
                                          disable_admission.value()));
   ASSERT_TRUE(prepared.ok()) << prepared.error().code << ": " << prepared.error().message;
   const auto seeded_claim =
@@ -2478,7 +2570,7 @@ TEST(ComponentLifecycleCoordinator,
   EXPECT_EQ(kernel.admission_observation_count(), 1U);
   EXPECT_EQ(kernel.release_count(), 1U);
   EXPECT_TRUE(kernel.saw_release_prepared());
-  EXPECT_EQ(status.value()->status_owner_epoch, config.request_owner_epoch);
+  EXPECT_EQ(status.value()->status_owner_epoch, coordinator.request_owner_epoch());
   EXPECT_EQ(status.value()->phase, ComponentLifecycleTransactionPhaseDTO::kFailed);
   EXPECT_EQ(status.value()->terminal_result,
             ComponentLifecycleTerminalResultDTO::kFailedKnownNoEffect);

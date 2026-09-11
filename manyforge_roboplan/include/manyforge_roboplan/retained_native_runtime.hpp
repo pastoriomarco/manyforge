@@ -11,6 +11,7 @@
 #include <manyforge_core/resource_addressed_execution_kernel.hpp>
 #include <manyforge_core/sqlite_operation_journal.hpp>
 #include <manyforge_deployment/route_configuration_publication.hpp>
+#include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #include <manyforge_roboplan/native_runtime_support.hpp>
 #include <manyforge_roboplan/retained_collision_world_publisher.hpp>
 #include <manyforge_roboplan/retained_focused_adapters.hpp>
@@ -197,6 +198,9 @@ struct RetainedNativeRuntimeInput final {
   std::optional<double> deployment_maximum_tcp_linear_speed_mps{};
   /// Retained manual-motion ceilings for the exact motion binding above.
   core::PerJointDynamicsLimitsDTO direct_control_joint_limits{};
+  /// Saved settings, resolved once against the immutable model at activation.
+  std::optional<deployment::native_execution_runtime_contract::OrdinaryMotionJerkSettings>
+      ordinary_motion_jerk{};
 };
 
 /// Owning native composition root. Destruction order is deliberate: the public

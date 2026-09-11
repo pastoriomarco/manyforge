@@ -11,6 +11,8 @@
 
 namespace manyforge::core {
 
+struct ProgramBindingDTO;
+
 inline constexpr std::string_view kProgramApiVersion = "manyforge.program.v2";
 inline constexpr std::string_view kComposableCellProgramProfile = "composable-cell-v1";
 inline constexpr std::size_t kMaxProgramContractRoles = 4096U;
@@ -111,6 +113,10 @@ struct ProgramRunExecutionCaptureDTO final {
   RetainedBundleId retained_bundle_id;
   GraphRevision graph_revision;
   std::shared_ptr<const ProgramExecutionTableDTO> table;
+  /// Alias of the same verified Binding used by the composition boundary.
+  /// Required at Kernel installation; public registration carries IDs only
+  /// and cannot populate either this reference or the execution table.
+  std::shared_ptr<const ProgramBindingDTO> binding{};
 };
 
 enum class ProgramModificationPolicyValue : std::uint8_t {

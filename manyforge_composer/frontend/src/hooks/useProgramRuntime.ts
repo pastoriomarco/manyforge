@@ -836,21 +836,22 @@ export function useProgramRuntime(
   ]);
 
   const selectionCommand = useCallback(async (
-    pending: 'motion-stop' | 'resume-motion', groupId: string,
+    pending: 'motion-stop' | 'resume-motion', groupIds: string[],
   ) => {
     const resume = pending === 'resume-motion';
     const controls = state.controls;
     if (
-      !state.run
+      groupIds.length === 0
+      || !state.run
       || !['running', 'intervention_required'].includes(state.run.state)
       || !state.runnerAvailable
       || ['stop', 'full-stop', 'reset']
         .includes(state.pending ?? '')
       || (resume && (state.pending !== null || state.controlPending !== null
         || !controlsMatchRun(controls, state.run)
-        || !controls.executionSelections.groups.some(
-          (group) => group.groupId === groupId && group.resumeAllowed,
-        )))
+        || !groupIds.every((id) => controls.executionSelections.groups.some(
+          (group) => group.groupId === id && group.resumeAllowed,
+        ))))
     ) return;
     const requestId = identity(`program-${pending}`);
     if (controlSource === null) return;
@@ -865,7 +866,7 @@ export function useProgramRuntime(
           correlation_id: requestId,
           program_run_id: state.run.capture.programRunId,
           expected_owner_epoch: state.run.ownerEpoch,
-          group_id: groupId,
+          group_ids: groupIds,
           ...(resume && controls !== null ? {
             expected_run_revision: controls.runRevision,
             expected_selection_revision: controls.executionSelections.selectionRevision,
@@ -893,8 +894,8 @@ export function useProgramRuntime(
     state.pending, state.controlPending, state.controls, state.run, state.runnerAvailable,
   ]);
 
-  const stopMotion = useCallback((groupId = 'all') => selectionCommand('motion-stop', groupId), [selectionCommand]);
-  const resumeMotion = useCallback((groupId = 'all') => selectionCommand('resume-motion', groupId), [selectionCommand]);
+  const stopMotion = useCallback((groups: string | string[] = 'all') => selectionCommand('motion-stop', typeof groups === 'string' ? [groups] : groups), [selectionCommand]);
+  const resumeMotion = useCallback((groups: string | string[] = 'all') => selectionCommand('resume-motion', typeof groups === 'string' ? [groups] : groups), [selectionCommand]);
 
   const fullStop = useCallback(async () => {
     if (

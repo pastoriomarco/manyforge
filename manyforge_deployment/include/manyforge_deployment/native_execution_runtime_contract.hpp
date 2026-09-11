@@ -1,9 +1,12 @@
 #pragma once
 
 #include <cstdint>
+#include <manyforge_core/runtime_participant_policy.hpp>
 #include <manyforge_core/types/manager_liveness.hpp>
+#include <manyforge_core/types/validation.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -71,11 +74,47 @@ inline constexpr std::string_view kManagerLivenessLocalSafeContractId =
 /// The retained bundle remains the only configuration authority. Consumers
 /// use this projection instead of reparsing a manifest or accepting launch-
 /// time replacements for product-owned runtime semantics.
+struct ImportedJointJerkLimit final {
+  double maximum_rad_s3{};
+  bool enabled{};
+  bool machine_required{};
+  std::string source_id;
+  core::ContentDigest source_digest;
+  friend bool operator==(const ImportedJointJerkLimit &,
+                         const ImportedJointJerkLimit &) = default;
+};
+
+struct JointJerkSetting final {
+  std::string source_joint_name;
+  std::optional<double> override_rad_s3;
+  std::optional<ImportedJointJerkLimit> imported;
+  friend bool operator==(const JointJerkSetting &,
+                         const JointJerkSetting &) = default;
+};
+
+struct OrdinaryMotionJerkSettings final {
+  bool enabled{};
+  double preset_reference_time_s{1.0};
+  std::vector<JointJerkSetting> joint_limits;
+  friend bool operator==(const OrdinaryMotionJerkSettings &,
+                         const OrdinaryMotionJerkSettings &) = default;
+};
+
+/// Cold resolution against the immutable model, never a trajectory's duration.
+/// Imports/overrides retain their source identity in the saved settings; the
+/// returned private policy contains only the limits needed for admission.
+[[nodiscard]] core::Result<core::OrdinaryMotionJerkPolicy>
+resolve_ordinary_motion_jerk_policy(
+    const OrdinaryMotionJerkSettings &settings,
+    std::span<const core::RuntimeResourceBindingDTO> resources,
+    const core::JointLimitsDTO &model_limits);
+
 struct Configuration final {
   struct MotionTargetLimit final {
     core::ControllableComponentId controllable_component_id;
     core::CommandTargetId command_target_id;
     double maximum_tcp_linear_speed_mps{};
+    OrdinaryMotionJerkSettings ordinary_motion_jerk{};
 
     friend bool operator==(const MotionTargetLimit &,
                            const MotionTargetLimit &) = default;

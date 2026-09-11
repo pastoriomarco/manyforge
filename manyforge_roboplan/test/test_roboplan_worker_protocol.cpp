@@ -200,14 +200,29 @@ TEST(RoboPlanWorkerProtocolTest,
       binding().resources,
       binding().compiled_joint_names,
       {TrajectoryWaypointDTO{0.0, {0.0, 0.1}, {0.0, 0.0}, {0.0, 0.0}},
-       TrajectoryWaypointDTO{1.0, {0.2, 0.3}, {0.0, 0.0},
-                             {0.0, 0.0}}}};
+       TrajectoryWaypointDTO{1.0, {0.2, 0.3}, {0.0, 0.0}, {0.0, 0.0}}},
+      TrajectoryRuntimeScaleBoundsDTO{2.0, 8.0, 1.5, 2.5}};
+  trajectory.cartesian_waypoint_times_s = {0.0, 0.5, 1.0};
   const auto decoded_success = decode_trajectory_result(
       encode_trajectory_result(Result<TrajectoryDTO>::Ok(trajectory)));
   ASSERT_TRUE(decoded_success.ok());
   EXPECT_EQ(decoded_success.value().resources, trajectory.resources);
   EXPECT_EQ(decoded_success.value().joint_names, trajectory.joint_names);
+  EXPECT_EQ(decoded_success.value().cartesian_waypoint_times_s,
+            trajectory.cartesian_waypoint_times_s);
   ASSERT_EQ(decoded_success.value().waypoints.size(), 2U);
+  ASSERT_TRUE(decoded_success.value().runtime_scale_bounds);
+  EXPECT_EQ(decoded_success.value().runtime_scale_bounds->max_rate_per_s, 2.0);
+  EXPECT_EQ(decoded_success.value().runtime_scale_bounds->max_stop_path_rate, 1.5);
+  EXPECT_EQ(decoded_success.value().runtime_scale_bounds->nominal_time_multiplier, 2.5);
+  trajectory.runtime_scale_bounds->nominal_time_multiplier.reset();
+  const auto legacy = decode_trajectory_result(
+      encode_trajectory_result(Result<TrajectoryDTO>::Ok(trajectory)));
+  ASSERT_TRUE(legacy.ok());
+  EXPECT_FALSE(legacy.value().runtime_scale_bounds->nominal_time_multiplier);
+  EXPECT_EQ(
+      decoded_success.value().runtime_scale_bounds->max_rate_change_per_s2,
+      8.0);
   EXPECT_EQ(decoded_success.value().waypoints[1].positions_rad,
             trajectory.waypoints[1].positions_rad);
 

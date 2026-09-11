@@ -136,7 +136,8 @@ CandidateBindings(const std::vector<ProviderRequirement> &requirements,
 [[nodiscard]] std::vector<ProjectionNativeRuntimeBindingDTO>
 PredecessorBindings(const std::vector<ProviderRequirement> &requirements,
                     const ProjectionRevisionDTO &predecessor_revision,
-                    const std::span<const ProjectionHealthDTO> health) {
+                    const std::span<const ProjectionHealthDTO> health,
+                    const ManagerApplyRuntimeStagedReadyDTO &ready) {
   if (requirements.empty()) {
     if (!health.empty()) {
       Fail("zero-native predecessor has unexpected live projection health");
@@ -155,11 +156,20 @@ PredecessorBindings(const std::vector<ProviderRequirement> &requirements,
   std::vector<ProjectionNativeRuntimeBindingDTO> result;
   result.reserve(health.size());
   for (const auto &observation : health) {
-    if (!observation.healthy_for_target(predecessor_revision)) {
+    const auto &binding = observation.native_runtime_binding;
+    const bool withdrawn =
+        std::any_of(ready.runtime_units.begin(), ready.runtime_units.end(),
+                    [&](const auto &runtime) {
+                      return runtime.predecessor_withdrawal &&
+                             runtime.predecessor_withdrawal->runtime_unit_id ==
+                                 binding.runtime_unit_id &&
+                             runtime.predecessor_withdrawal->runtime_epoch ==
+                                 binding.runtime_epoch;
+                    });
+    if (!withdrawn && !observation.healthy_for_target(predecessor_revision)) {
       Fail("predecessor native projection is not healthy at the current "
            "active revision");
     }
-    const auto &binding = observation.native_runtime_binding;
     const auto found = expected.find(
         {binding.provider_binding_id, binding.provider_binding_revision});
     if (found == expected.end() ||
@@ -252,7 +262,7 @@ std::vector<ProjectionTransitionRowDTO> DeriveNativeProjectionTransitionRows(
     const ProjectionRevisionDTO &predecessor_revision,
     const std::span<const ProjectionHealthDTO> predecessor_health,
     const ManagerApplyRuntimeStagedReadyDTO &candidate_staged_ready) {
-  if (!predecessor_revision.valid() ||
+  if (!predecessor_revision.valid() || !candidate_staged_ready.valid() ||
       predecessor.retained_bundle_id !=
           predecessor_revision.retained_bundle_id ||
       predecessor.cell_graph.graph_revision !=
@@ -260,8 +270,9 @@ std::vector<ProjectionTransitionRowDTO> DeriveNativeProjectionTransitionRows(
     Fail("predecessor bundle and active revision differ");
   }
 
-  const auto predecessor_bindings = PredecessorBindings(
-      Requirements(predecessor), predecessor_revision, predecessor_health);
+  const auto predecessor_bindings =
+      PredecessorBindings(Requirements(predecessor), predecessor_revision,
+                          predecessor_health, candidate_staged_ready);
   const auto candidate_bindings =
       CandidateBindings(Requirements(candidate), candidate_staged_ready);
 
@@ -300,6 +311,20 @@ std::vector<ProjectionTransitionRowDTO> DeriveNativeProjectionTransitionRows(
       rows.push_back({candidate_binding,
                       ProjectionTransitionDisposition::kAdded, std::nullopt});
       ++candidate_index;
+    }
+  }
+  for (auto &row : rows) {
+    if (row.disposition != ProjectionTransitionDisposition::kRemoved)
+      continue;
+    for (const auto &runtime : candidate_staged_ready.runtime_units) {
+      if (runtime.predecessor_withdrawal &&
+          runtime.predecessor_withdrawal->runtime_unit_id ==
+              row.native_runtime_binding.runtime_unit_id &&
+          runtime.predecessor_withdrawal->runtime_epoch ==
+              row.native_runtime_binding.runtime_epoch) {
+        row.managed_withdrawal = runtime.predecessor_withdrawal;
+        break;
+      }
     }
   }
   if (!core::CanonicalProjectionTransitionRows(rows)) {

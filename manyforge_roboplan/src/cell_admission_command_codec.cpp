@@ -37,10 +37,11 @@ void Exact(const Value &v, std::size_t size) {
   Require(v.is_object() && v.as_object().size() == size,
           "cell-admission DTO has an unknown or missing field");
 }
-std::string Text(const Value &v, std::string_view name) {
+std::string Text(const Value &v, std::string_view name,
+                 std::size_t maximum = core::kMaximumCellAdmissionIdentityBytes) {
   const auto &x = Member(v, name);
   Require(x.is_string(), "cell-admission text field has the wrong type");
-  Require(x.as_string().size() <= core::kMaximumCellAdmissionIdentityBytes,
+  Require(x.as_string().size() <= maximum,
           "cell-admission text field is oversized");
   return x.as_string();
 }
@@ -152,7 +153,8 @@ core::CellAdmissionScopeDTO Scope(const Value &v) {
   return result;
 }
 core::CellAdmissionClaimIntentDTO Intent(const Value &v) {
-  Exact(v, 10U);
+  const bool program_node = v.is_object() && v.find_object_member("program_node_evidence") != nullptr;
+  Exact(v, program_node ? 11U : 10U);
   core::CellAdmissionClaimIntentDTO result{
       ClaimKind(Text(v, "claim_kind")),
       OwnerRole(Text(v, "owner_role")),
@@ -193,6 +195,15 @@ core::CellAdmissionClaimIntentDTO Intent(const Value &v) {
                           static_cast<std::uint64_t>(n.as_number()));
                     })};
           });
+  if (program_node) {
+    const auto& x = Member(v, "program_node_evidence");
+    Exact(x, 6U);
+    result.program_node_evidence = core::ProgramNodeAdmissionEvidenceDTO{
+        core::RequestOwnerEpoch(Text(x, "program_runner_owner_epoch")),
+        core::ProgramRunId(Text(x, "program_run_id")),
+        core::CellAdmissionClaimGeneration(Counter(x, "parent_program_cycle_claim_generation", 1U)),
+        Text(x, "node_instance_id"), Text(x, "node_attempt_id", 512U), Text(x, "owner_api")};
+  }
   Require(core::ValidateCellAdmissionClaimIntent(result).ok(),
           "cell-admission claim intent is invalid");
   return result;
@@ -334,7 +345,7 @@ Value ScopeValue(const core::CellAdmissionScopeDTO &v) {
                              {"resources", Value(std::move(resources))}});
 }
 Value IntentValue(const core::CellAdmissionClaimIntentDTO &v) {
-  return Value(Value::Object{
+  Value::Object fields{
       {"claim_kind", Value(std::string(core::to_string(v.claim_kind)))},
       {"expected_admission_generation",
        Value(static_cast<double>(v.expected_admission_generation.value()))},
@@ -364,7 +375,20 @@ Value IntentValue(const core::CellAdmissionClaimIntentDTO &v) {
        })},
       {"request_id", Value(v.request_id.value())},
       {"request_payload_digest", Value(v.request_payload_digest.value())},
-      {"scope", ScopeValue(v.scope)}});
+      {"scope", ScopeValue(v.scope)}};
+  if (v.program_node_evidence.has_value()) {
+    const auto& x = *v.program_node_evidence;
+    fields.emplace_back("program_node_evidence", Value(Value::Object{
+        {"program_runner_owner_epoch", Value(x.program_runner_owner_epoch.value())},
+        {"program_run_id", Value(x.program_run_id.value())},
+        {"parent_program_cycle_claim_generation",
+         Value(static_cast<double>(x.parent_program_cycle_claim_generation.value()))},
+        {"node_instance_id", Value(x.node_instance_id)},
+        {"node_attempt_id", Value(x.node_attempt_id)},
+        {"owner_api", Value(x.owner_api)},
+    }));
+  }
+  return Value(std::move(fields));
 }
 Value ClaimValue(const core::CellAdmissionClaimDTO &v) {
   return Value(Value::Object{

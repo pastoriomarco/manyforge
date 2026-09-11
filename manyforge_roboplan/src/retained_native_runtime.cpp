@@ -332,8 +332,18 @@ retained_controlled_stop_profiles(
     throw std::invalid_argument("retained fault Stop profile is invalid: " +
                                 error);
   }
-  return RetainedControlledStopProfiles{std::move(operator_profile),
-                                        std::move(fault_profile)};
+  // Resolve each configured mode before execution. In particular, the fault
+  // Spring preset uses its half-duration, not a copied Soft ramp's preset.
+  auto frozen_operator =
+      core::resolve_motion_interrupt_stop_jerk_limits(operator_profile);
+  auto frozen_fault =
+      core::resolve_motion_interrupt_stop_jerk_limits(fault_profile);
+  if (!frozen_operator.ok() || !frozen_fault.ok())
+    throw std::invalid_argument(!frozen_operator.ok()
+                                    ? frozen_operator.error().message
+                                    : frozen_fault.error().message);
+  return RetainedControlledStopProfiles{std::move(frozen_operator.value()),
+                                        std::move(frozen_fault.value())};
 }
 
 [[nodiscard]] core::RuntimeParticipantExecutionRegistration
@@ -768,7 +778,8 @@ make_kernel_participant_resolver(
           physical->default_fault_stop_profile);
       registration.intrinsic_direct_control =
           binding.value().intrinsic_direct_control;
-      registration.direct_control_joint_limits = physical->direct_control_joint_limits;
+      registration.direct_control_joint_limits =
+          physical->direct_control_joint_limits;
       return core::Result<core::RuntimeParticipantExecutionRegistration>::Ok(
           std::move(registration));
     } catch (const std::exception &exception) {
@@ -884,12 +895,12 @@ create_retained_native_runtime_participants(
       input.control_binding_representatives.size() +
       input.motion_binding_aliases.size() +
       input.gripper_binding_aliases.size();
-  const auto representative_owner_count = [&](const auto& candidate) {
-    return static_cast<std::size_t>(
-               retained_bindings_share_backend_owner(input.motion_binding, candidate)) +
-           static_cast<std::size_t>(
-               input.gripper_binding.has_value() &&
-               retained_bindings_share_backend_owner(*input.gripper_binding, candidate));
+  const auto representative_owner_count = [&](const auto &candidate) {
+    return static_cast<std::size_t>(retained_bindings_share_backend_owner(
+               input.motion_binding, candidate)) +
+           static_cast<std::size_t>(input.gripper_binding.has_value() &&
+                                    retained_bindings_share_backend_owner(
+                                        *input.gripper_binding, candidate));
   };
   const auto contains_exact_representative = [&](const auto &binding) {
     return std::count_if(input.control_binding_representatives.begin(),
@@ -991,6 +1002,13 @@ create_retained_native_runtime_participants(
     }
   }
 
+  if (input.ordinary_motion_jerk) {
+    if (!motion_runtime_policy ||
+        (input.ordinary_motion_jerk->enabled && input.backend_factory))
+      throw std::invalid_argument(
+          "ordinary jerk profile requires a qualified native execution policy");
+  }
+
   auto runtime = std::make_shared<RetainedNativeRuntime>(input.motion_binding,
                                                          input.gripper_binding);
   runtime->motion_binding_aliases = std::move(input.motion_binding_aliases);
@@ -1002,7 +1020,8 @@ create_retained_native_runtime_participants(
   runtime->motion_runtime_policy = motion_runtime_policy;
   runtime->deployment_maximum_tcp_linear_speed_mps =
       input.deployment_maximum_tcp_linear_speed_mps;
-  runtime->direct_control_joint_limits = std::move(input.direct_control_joint_limits);
+  runtime->direct_control_joint_limits =
+      std::move(input.direct_control_joint_limits);
   runtime->participant_resolver_factory =
       std::move(input.participant_resolver_factory);
   runtime->scene = std::move(input.scene);
@@ -1046,6 +1065,38 @@ create_retained_native_runtime_participants(
           runtime->motion_state_channel->publication());
   runtime->kinematics = std::make_unique<RetainedRoboPlanKinematicsAdapter>(
       runtime->motion_binding, runtime->scene, runtime->scene_mutex);
+  if (input.ordinary_motion_jerk) {
+    auto limits = runtime->kinematics->joint_limits(
+        motion_value.controllable_component_id.value(),
+        motion_value.command_target_id.value());
+    if (!limits.ok())
+      throw std::invalid_argument(limits.error().message);
+    auto profile = deployment::native_execution_runtime_contract::
+        resolve_ordinary_motion_jerk_policy(
+            *input.ordinary_motion_jerk,
+            runtime->motion_binding.value().resources, limits.value());
+    if (!profile.ok())
+      throw std::invalid_argument(profile.error().message);
+    for (const auto &[joint, cap] : runtime->direct_control_joint_limits) {
+      if (!cap.max_jerk_rad_s3)
+        continue;
+      const auto found = profile.value().limits.find(joint);
+      if (!profile.value().enabled || found == profile.value().limits.end() ||
+          !std::isfinite(*cap.max_jerk_rad_s3) || *cap.max_jerk_rad_s3 <= 0.0 ||
+          *cap.max_jerk_rad_s3 >
+              std::get<core::AngularJerkDTO>(found->second).value_rad_s3)
+        throw std::invalid_argument(
+            "manual jerk cap conflicts with the ordinary-motion policy for " +
+            joint);
+    }
+    auto selected = core::apply_deployment_motion_jerk_policy(
+        *motion_runtime_policy, runtime->motion_binding,
+        std::move(profile.value()));
+    if (!selected.ok())
+      throw std::invalid_argument(selected.error().message);
+    motion_runtime_policy = std::move(selected.value());
+    runtime->motion_runtime_policy = motion_runtime_policy;
+  }
   runtime->trajectory_validator = RoboPlanTrajectoryValidator::create(
       runtime->motion_binding, runtime->scene, runtime->scene_mutex);
   runtime->collision_trajectory_projector =
@@ -1238,8 +1289,8 @@ create_retained_native_runtime_participants(
                         runtime->motion_binding_aliases.size() +
                         runtime->gripper_binding_aliases.size());
   for (const auto &representative : runtime->control_binding_representatives) {
-    const bool motion_owner =
-        retained_bindings_share_backend_owner(runtime->motion_binding, representative);
+    const bool motion_owner = retained_bindings_share_backend_owner(
+        runtime->motion_binding, representative);
     const bool primary = representative.value() ==
                          (motion_owner ? runtime->motion_binding.value()
                                        : runtime->gripper_binding->value());
@@ -1278,7 +1329,8 @@ create_retained_native_runtime_participants(
       runtime->participant_engine.get(), runtime->execution.get(),
       motion_runtime_policy, motion_operator_stop_profile,
       motion_fault_stop_profile));
-  physical_registrations.back().direct_control_joint_limits = runtime->direct_control_joint_limits;
+  physical_registrations.back().direct_control_joint_limits =
+      runtime->direct_control_joint_limits;
   if (runtime->gripper_binding.has_value()) {
     physical_registrations.push_back(runtime_registration(
         *runtime->gripper_binding, input.gripper_stop_readiness,
@@ -1398,55 +1450,68 @@ RetainedNativeRuntime::ReadCurrentPublishedRouteConfiguration(
 }
 
 bool RetainedNativeRuntime::GripperSourceIsCurrent(
-    const core::RuntimeParticipantBinding& source) const {
+    const core::RuntimeParticipantBinding &source) const {
   if (!gripper || !source.value().control_path.has_value() ||
-      (source.value().capability_id.value() != "tool.gripper.confirmation.operator" &&
+      (source.value().capability_id.value() !=
+           "tool.gripper.confirmation.operator" &&
        source.value().capability_id.value() != "tool.gripper.feedback"))
     return false;
-  const auto& path = *source.value().control_path;
-  const auto current = ReadCurrentPublishedRouteConfiguration(path.control_domain_id);
-  if (!current.ok() || !current.value().has_value()) return false;
-  const auto& configuration = *current.value();
-  if (configuration.state != core::ActiveControlConfigurationStateDTO::kReconciled ||
-      configuration.active_control_configuration_id != path.active_control_configuration_id ||
+  const auto &path = *source.value().control_path;
+  const auto current =
+      ReadCurrentPublishedRouteConfiguration(path.control_domain_id);
+  if (!current.ok() || !current.value().has_value())
+    return false;
+  const auto &configuration = *current.value();
+  if (configuration.state !=
+          core::ActiveControlConfigurationStateDTO::kReconciled ||
+      configuration.active_control_configuration_id !=
+          path.active_control_configuration_id ||
       configuration.active_control_configuration_generation !=
           path.active_control_configuration_generation ||
       configuration.control_domain_revision != path.control_domain_revision ||
       configuration.controller_topology_id != path.controller_topology_id ||
       configuration.topology_revision != path.topology_revision ||
       configuration.activation_set_id != path.activation_set_id ||
-      std::none_of(configuration.binding_routes.begin(), configuration.binding_routes.end(),
-                   [&](const auto& row) {
+      std::none_of(configuration.binding_routes.begin(),
+                   configuration.binding_routes.end(),
+                   [&](const auto &row) {
                      return row.control_binding_id == path.control_binding_id &&
-                            row.control_binding_revision == path.control_binding_revision &&
+                            row.control_binding_revision ==
+                                path.control_binding_revision &&
                             row.control_route_id == path.control_route_id;
                    }) ||
-      std::none_of(control_binding_representatives.begin(), control_binding_representatives.end(),
-                   [&](const auto& row) { return row.value() == source.value(); }))
+      std::none_of(control_binding_representatives.begin(),
+                   control_binding_representatives.end(), [&](const auto &row) {
+                     return row.value() == source.value();
+                   }))
     return false;
   return true;
 }
 
-core::Result<core::GripperGraspEvidenceDTO> RetainedNativeRuntime::RecordGraspObservation(
-    const core::RuntimeParticipantBinding& source,
-    const core::GripperGraspObservationDTO& observation, const core::Duration freshness_budget_ns,
+core::Result<core::GripperGraspEvidenceDTO>
+RetainedNativeRuntime::RecordGraspObservation(
+    const core::RuntimeParticipantBinding &source,
+    const core::GripperGraspObservationDTO &observation,
+    const core::Duration freshness_budget_ns,
     const core::TimePoint admission_deadline_ns) {
   std::lock_guard lock(route_publication_mutex_);
   if (!GripperSourceIsCurrent(source) ||
-      source.value().capability_id.value() != "tool.gripper.confirmation.operator")
-    return core::Result<core::GripperGraspEvidenceDTO>::Err(
-        core::ErrorDTO{"grasp_confirmation_source_stale",
-                       "Confirmation source has no exact current native realization",
-                       {}});
+      source.value().capability_id.value() !=
+          "tool.gripper.confirmation.operator")
+    return core::Result<core::GripperGraspEvidenceDTO>::Err(core::ErrorDTO{
+        "grasp_confirmation_source_stale",
+        "Confirmation source has no exact current native realization",
+        {}});
   // An unknown route can be published without rebinding the backend. Keep
   // this final check and write within the same existing publication lock;
   // never install evidence and subsequently call that a no-effect rejection.
-  return gripper->record_grasp_observation(source, observation, freshness_budget_ns,
-                                           admission_deadline_ns);
+  return gripper->record_grasp_observation(
+      source, observation, freshness_budget_ns, admission_deadline_ns);
 }
 
-core::Result<core::GripperCommandStatusDTO> RetainedNativeRuntime::ReadGripperStatus(
-    const core::RuntimeParticipantBinding& source) const {
+core::Result<core::GripperCommandStatusDTO>
+RetainedNativeRuntime::ReadGripperStatus(
+    const core::RuntimeParticipantBinding &source) const {
   std::lock_guard lock(route_publication_mutex_);
   if (!GripperSourceIsCurrent(source))
     return core::Result<core::GripperCommandStatusDTO>::Err(
@@ -1744,7 +1809,8 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
         next_motion, motion_readiness, participant_engine.get(),
         execution.get(), motion_runtime_policy, motion_operator_stop_profile,
         motion_fault_stop_profile));
-    physical_registrations.back().direct_control_joint_limits = direct_control_joint_limits;
+    physical_registrations.back().direct_control_joint_limits =
+        direct_control_joint_limits;
     if (next_gripper.has_value()) {
       physical_registrations.push_back(runtime_registration(
           *next_gripper, gripper_readiness, gripper_participant_engine.get(),
@@ -1755,9 +1821,11 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
                           next_motion_aliases.size() +
                           next_gripper_aliases.size());
     for (const auto &representative : next_representatives) {
-      const bool motion_owner = retained_bindings_share_backend_owner(next_motion, representative);
-      const bool gripper_owner = next_gripper.has_value() && retained_bindings_share_backend_owner(
-                                                                 *next_gripper, representative);
+      const bool motion_owner =
+          retained_bindings_share_backend_owner(next_motion, representative);
+      const bool gripper_owner =
+          next_gripper.has_value() &&
+          retained_bindings_share_backend_owner(*next_gripper, representative);
       if (motion_owner == gripper_owner) {
         return route_publication_error<
             core::RuntimeRouteConfigurationReadbackDTO>(
@@ -2096,7 +2164,8 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
         next_motion, motion_readiness, participant_engine.get(),
         execution.get(), motion_runtime_policy, motion_operator_stop_profile,
         motion_fault_stop_profile));
-    physical_registrations.back().direct_control_joint_limits = direct_control_joint_limits;
+    physical_registrations.back().direct_control_joint_limits =
+        direct_control_joint_limits;
     if (next_gripper.has_value()) {
       physical_registrations.push_back(runtime_registration(
           *next_gripper, gripper_readiness, gripper_participant_engine.get(),
@@ -2107,9 +2176,11 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
                           next_motion_aliases.size() +
                           next_gripper_aliases.size());
     for (const auto &representative : next_representatives) {
-      const bool motion_owner = retained_bindings_share_backend_owner(next_motion, representative);
-      const bool gripper_owner = next_gripper.has_value() && retained_bindings_share_backend_owner(
-                                                                 *next_gripper, representative);
+      const bool motion_owner =
+          retained_bindings_share_backend_owner(next_motion, representative);
+      const bool gripper_owner =
+          next_gripper.has_value() &&
+          retained_bindings_share_backend_owner(*next_gripper, representative);
       if (motion_owner == gripper_owner) {
         return route_publication_error<
             core::RuntimeRouteConfigurationReadbackDTO>(

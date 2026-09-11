@@ -1290,6 +1290,35 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
 }
 
 TEST(ManagerApplyRuntimeConvergenceCoordinator,
+     ReplacementQueryRequiresMatchingManagedApplyAndHeldFenceIdentity) {
+  ScopedPackageRoot root;
+  CoordinatorFixture fixture(root.path());
+  const auto result = fixture.Run();
+  ASSERT_TRUE(fixture.runtime_ports.last_query);
+  auto query = *fixture.runtime_ports.last_query;
+  EXPECT_FALSE(query.replacement);
+  query.replacement = result.fence.rehydrate_request;
+  query.replacement->expected_old_retained_bundle_id =
+      RetainedBundleId(std::string(kDigestTwo));
+  ASSERT_TRUE(query.valid());
+  auto crossed = query;
+  crossed.replacement->apply_generation = ApplyGeneration(99U);
+  EXPECT_FALSE(crossed.valid());
+  crossed = query;
+  crossed.replacement->expected_old_retained_bundle_id =
+      query.candidate_retained_bundle_id;
+  EXPECT_FALSE(crossed.valid());
+  crossed = query;
+  crossed.owner = RuntimeUnitConvergenceBootstrapOwnerDTO{
+      BootstrapId("bootstrap"), BootstrapGeneration(1U)};
+  EXPECT_FALSE(crossed.valid());
+  crossed = query;
+  crossed.plan.lifecycle_control =
+      core::RuntimeLifecycleControl::kExternallyManaged;
+  EXPECT_FALSE(crossed.valid());
+}
+
+TEST(ManagerApplyRuntimeConvergenceCoordinator,
      LostStartResponseRecoversByObservationWithoutDuplicateStart) {
   ScopedPackageRoot root;
   CoordinatorFixture fixture(root.path());

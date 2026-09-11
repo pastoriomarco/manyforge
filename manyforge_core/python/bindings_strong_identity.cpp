@@ -191,6 +191,8 @@ void register_strong_identity_bindings(py::module_& module) {
   bind_strong_counter<LifecycleTransactionGeneration>(module, "LifecycleTransactionGeneration");
   bind_strong_counter<ComponentLifecycleGeneration>(module, "ComponentLifecycleGeneration");
   bind_strong_counter<OperationRevision>(module, "OperationRevision");
+  bind_strong_counter<AdmissionGeneration>(module, "AdmissionGeneration");
+  bind_strong_counter<CellAdmissionClaimGeneration>(module, "CellAdmissionClaimGeneration");
   bind_strong_counter<ConfigurationFenceGeneration>(module, "ConfigurationFenceGeneration");
   bind_strong_counter<StopGeneration>(module, "StopGeneration");
   bind_strong_counter<StopCertificateRevision>(module, "StopCertificateRevision");

@@ -1721,7 +1721,21 @@ DecodeProgramExecutionScope(const CanonicalValue &value,
 [[nodiscard]] core::OperationIntentDTO
 DecodeOperation(const CanonicalValue &value,
                 const core::RequestAttributionDTO &attribution) {
-  RequireExactObjectSize(value, 10U, "operation intent");
+  const auto *manual_context = value.find_object_member("manual_handover");
+  RequireExactObjectSize(value, manual_context == nullptr ? 10U : 11U,
+                         "operation intent");
+  std::optional<core::ManualProgramHandoverContextDTO> manual_handover;
+  if (manual_context != nullptr &&
+      !std::holds_alternative<std::nullptr_t>(manual_context->storage())) {
+    RequireExactObjectSize(*manual_context, 4U, "manual handover context");
+    manual_handover = core::ManualProgramHandoverContextDTO{
+        core::RequestOwnerEpoch(
+            Text(*manual_context, "program_runner_owner_epoch")),
+        core::ProgramRunId(Text(*manual_context, "program_run_id")),
+        core::CellAdmissionClaimGeneration(
+            Counter(*manual_context, "claim_generation", 1U)),
+        Counter(*manual_context, "selection_revision", 0U)};
+  }
   const auto &request = Member(value, "request_context");
   const auto &participant_values = Array(value, "participants");
   Require(!participant_values.empty() &&
@@ -1761,7 +1775,7 @@ DecodeOperation(const CanonicalValue &value,
   if (!std::holds_alternative<std::nullptr_t>(scene.storage())) {
     expected_scene = DecodeSceneRevision(scene);
   }
-  return core::OperationIntentDTO{
+  core::OperationIntentDTO result{
       DecodeRequestContext(request),
       core::ProgramId(Text(value, "program_id")),
       core::ProgramRevision(Text(value, "program_revision")),
@@ -1772,7 +1786,13 @@ DecodeOperation(const CanonicalValue &value,
       std::move(expected_scene),
       std::move(participants),
       policy,
-      attribution};
+      attribution,
+      std::move(manual_handover)};
+  if (result.manual_handover) {
+    const auto valid = core::validate_operation_intent(result);
+    Require(valid.ok(), valid.ok() ? "" : valid.error().message);
+  }
+  return result;
 }
 
 [[nodiscard]] std::array<double, 3U> DecodeTriple(const CanonicalValue &root,
@@ -2093,6 +2113,7 @@ enum class CommandKind {
   kObservation,
   kEvents,
   kPreviewMotion,
+  kReadManualHandover,
   kPreviewCapabilityCommand,
   kRegisterProgramCapture,
   kSubmit,
@@ -2230,7 +2251,7 @@ struct Command final {
     const auto &request = Member(root, "request");
     RequireExactObjectSize(request, 6U, "Program selection request");
     Require(Text(request, "schema_version") ==
-                "manyforge.program_execution_selection.v1",
+                "manyforge.program_execution_selection.v2",
             "Program selection request schema is unsupported");
     Command decoded{release ? CommandKind::kReleaseProgramSelection
                             : CommandKind::kStopProgramSelection};
@@ -2240,7 +2261,7 @@ struct Command final {
         core::CellAdmissionClaimGeneration(
             Counter(request, "claim_generation", 1U)),
         core::ProgramRunId(Text(request, "program_run_id")),
-        Text(request, "group_id"),
+        TextArray(request, "group_ids", core::kMaxProgramExecutionGroups),
         attribution};
     if (release)
       decoded.expected_selection_revision =
@@ -2446,12 +2467,14 @@ struct Command final {
     decoded.operation = DecodeOperation(Member(root, "operation"), attribution);
     return decoded;
   }
-  if (command == "preview_motion") {
+  if (command == "preview_motion" || command == "read_manual_handover") {
     RequireExactObjectSize(root, 4U, "motion preview command");
     const auto attribution =
         DecodeRequestAttribution(Member(root, "attribution"));
     const auto &operation = Member(root, "operation");
-    Command decoded{CommandKind::kPreviewMotion};
+    Command decoded{command == "preview_motion"
+                        ? CommandKind::kPreviewMotion
+                        : CommandKind::kReadManualHandover};
     decoded.operation = DecodeOperation(operation, attribution);
     decoded.operation_digest =
         core::ContentDigest(content_identity::sha256_digest(
@@ -3507,7 +3530,10 @@ ProgramExecutionScopeValue(const core::ProgramExecutionScopeStateDTO &value) {
 
 [[nodiscard]] CanonicalValue ProgramSelectionAcceptedValue(
     const core::ProgramExecutionSelectionAcceptedDTO &value,
-    const std::string &group_id) {
+    const std::vector<std::string> &group_ids) {
+  CanonicalValue::Array groups;
+  for (const auto &group : group_ids)
+    groups.emplace_back(group);
   const auto indices = [](const auto &source) {
     CanonicalValue::Array result;
     for (const auto index : source)
@@ -3530,7 +3556,7 @@ ProgramExecutionScopeValue(const core::ProgramExecutionScopeStateDTO &value) {
       {"state", value.state.has_value()
                     ? ProgramExecutionScopeValue(*value.state)
                     : CanonicalValue(nullptr)},
-      {"group_id", CanonicalValue(group_id)},
+      {"group_ids", CanonicalValue(std::move(groups))},
       {"widened_node_indices", indices(value.widened_node_indices)},
       {"fresh_containment", std::move(containment)},
       {"selection_error", value.selection_error.has_value()
@@ -3905,6 +3931,23 @@ StopHistoryScopeKeyArray(const std::vector<core::StopScopeEntryKeyDTO> &keys) {
 
 [[nodiscard]] CanonicalValue
 StopHistoryProfileValue(const core::MotionInterruptStopProfileDTO &profile) {
+  CanonicalValue::Object jerk;
+  for (const auto &[joint, limit] : profile.per_joint_max_jerk) {
+    jerk.emplace_back(
+        joint,
+        std::visit(
+            [](const auto &value) -> CanonicalValue {
+              if constexpr (requires { value.value_rad_s3; })
+                return CanonicalValue(CanonicalValue::Object{
+                    {"coordinate_kind", CanonicalValue("angular_rad_s3")},
+                    {"value_rad_s3", CanonicalValue(value.value_rad_s3)}});
+              else
+                return CanonicalValue(CanonicalValue::Object{
+                    {"coordinate_kind", CanonicalValue("linear_m_s3")},
+                    {"value_m_s3", CanonicalValue(value.value_m_s3)}});
+            },
+            limit));
+  }
   CanonicalValue::Object deceleration;
   deceleration.reserve(profile.per_joint_max_deceleration.size());
   for (const auto &[joint, limit] : profile.per_joint_max_deceleration) {
@@ -3927,6 +3970,10 @@ StopHistoryProfileValue(const core::MotionInterruptStopProfileDTO &profile) {
                                   ? CanonicalValue(*profile.deceleration_time_s)
                                   : CanonicalValue(nullptr)},
       {"diagnostics", StopHistoryStructuredValue(profile.diagnostics)},
+      {"jerk_limits_enabled", profile.jerk_limits_enabled.has_value()
+                                  ? CanonicalValue(*profile.jerk_limits_enabled)
+                                  : CanonicalValue(nullptr)},
+      {"per_joint_max_jerk", CanonicalValue(std::move(jerk))},
       {"per_joint_max_deceleration", CanonicalValue(std::move(deceleration))},
       {"per_joint_settle_velocity_threshold", std::move(settle)},
       {"profile_id", CanonicalValue(profile.profile_id)},
@@ -5878,6 +5925,8 @@ CanonicalNullableText(const std::optional<std::string> &value) {
     const std::optional<core::RuntimeParticipantPolicySelection>
         &motion_runtime_policy,
     const std::optional<double> &deployment_maximum_tcp_linear_speed_mps,
+    const deployment::native_execution_runtime_contract::
+        OrdinaryMotionJerkSettings *ordinary_jerk_settings,
     const std::vector<deployment::native_execution_runtime_contract::
                           Configuration::DirectControlJointLimit>
         &direct_control_joint_limits,
@@ -5961,6 +6010,7 @@ CanonicalNullableText(const std::optional<std::string> &value) {
     });
   }
   CanonicalValue::Array operational_joint_limits;
+  CanonicalValue::Array ordinary_jerk_joints;
   operational_joint_limits.reserve(motion.resources.size());
   for (std::size_t index = 0U; index < motion.resources.size(); ++index) {
     const auto &resource = motion.resources[index];
@@ -5997,6 +6047,73 @@ CanonicalNullableText(const std::optional<std::string> &value) {
       effective_velocity =
           std::min(effective_velocity, authored_velocity.value());
     }
+    auto effective_jerk = CanonicalNullableNumber(authored_jerk);
+    if (motion_runtime_policy &&
+        motion_runtime_policy->value().ordinary_motion_jerk) {
+      const auto &profile =
+          *motion_runtime_policy->value().ordinary_motion_jerk;
+      if (!profile.enabled) {
+        effective_jerk = CanonicalValue(nullptr);
+      } else {
+        const double ceiling =
+            std::get<core::AngularJerkDTO>(
+                profile.limits.at(*resource.source_joint_name))
+                .value_rad_s3;
+        effective_jerk = CanonicalValue(
+            authored_jerk ? std::min(*authored_jerk, ceiling) : ceiling);
+      }
+    }
+    if (ordinary_jerk_settings != nullptr) {
+      Require(motion_runtime_policy &&
+                  motion_runtime_policy->value().ordinary_motion_jerk,
+              "ordinary jerk descriptor requires its resolved policy");
+      const auto &profile =
+          *motion_runtime_policy->value().ordinary_motion_jerk;
+      const auto &settings = *ordinary_jerk_settings;
+      const auto setting = std::find_if(
+          settings.joint_limits.begin(), settings.joint_limits.end(),
+          [&](const auto &row) {
+            return row.source_joint_name == *resource.source_joint_name;
+          });
+      const auto *imported =
+          setting != settings.joint_limits.end() && setting->imported
+              ? &*setting->imported
+              : nullptr;
+      const char *source =
+          !profile.enabled ? "off"
+          : setting != settings.joint_limits.end() && setting->override_rad_s3
+              ? "override"
+          : imported != nullptr && imported->enabled ? "imported"
+                                                     : "preset";
+      ordinary_jerk_joints.emplace_back(CanonicalValue::Object{
+          {"source_joint_name", CanonicalValue(*resource.source_joint_name)},
+          {"source", CanonicalValue(source)},
+          {"maximum_rad_s3",
+           profile.enabled
+               ? CanonicalValue(
+                     std::get<core::AngularJerkDTO>(
+                         profile.limits.at(*resource.source_joint_name))
+                         .value_rad_s3)
+               : CanonicalValue(nullptr)},
+          {"preset_rad_s3",
+           model_acceleration
+               ? CanonicalValue(core::motion_jerk_preset_limit(
+                     *model_acceleration, settings.preset_reference_time_s))
+               : CanonicalValue(nullptr)},
+          {"imported",
+           imported != nullptr
+               ? CanonicalValue(CanonicalValue::Object{
+                     {"maximum_rad_s3",
+                      CanonicalValue(imported->maximum_rad_s3)},
+                     {"enabled", CanonicalValue(imported->enabled)},
+                     {"machine_required",
+                      CanonicalValue(imported->machine_required)},
+                     {"source_id", CanonicalValue(imported->source_id)},
+                     {"source_digest",
+                      CanonicalValue(imported->source_digest.value())}})
+               : CanonicalValue(nullptr)},
+      });
+    }
     operational_joint_limits.emplace_back(CanonicalValue::Object{
         {"deployment_max_acceleration_rad_s2",
          CanonicalNullableNumber(authored_acceleration)},
@@ -6005,7 +6122,7 @@ CanonicalNullableText(const std::optional<std::string> &value) {
          CanonicalNullableNumber(authored_velocity)},
         {"effective_max_acceleration_rad_s2",
          CanonicalNullableNumber(effective_acceleration)},
-        {"effective_max_jerk_rad_s3", CanonicalNullableNumber(authored_jerk)},
+        {"effective_max_jerk_rad_s3", std::move(effective_jerk)},
         {"effective_max_velocity_rad_s", CanonicalValue(effective_velocity)},
         {"model_max_acceleration_rad_s2",
          CanonicalNullableNumber(model_acceleration)},
@@ -6039,8 +6156,18 @@ CanonicalNullableText(const std::optional<std::string> &value) {
       {"operational_joint_limits",
        CanonicalValue(std::move(operational_joint_limits))},
       {"operational_limit", std::move(operational_limit)},
+      {"ordinary_jerk",
+       ordinary_jerk_settings != nullptr
+           ? CanonicalValue(CanonicalValue::Object{
+                 {"enabled", CanonicalValue(ordinary_jerk_settings->enabled)},
+                 {"preset_reference_time_s",
+                  CanonicalValue(
+                      ordinary_jerk_settings->preset_reference_time_s)},
+                 {"joint_limits",
+                  CanonicalValue(std::move(ordinary_jerk_joints))}})
+           : CanonicalValue(nullptr)},
       {"schema_version",
-       CanonicalValue("manyforge.manual_control_motion_descriptor.v3")},
+       CanonicalValue("manyforge.manual_control_motion_descriptor.v4")},
       {"target_role_id", CanonicalValue(motion.target_role_id.value())},
   });
 
@@ -6567,7 +6694,7 @@ BuildOwnerSettlementValidator(
               ValidateManagerApplyCellAdmissionSettlementReadOnly(
                   manager_apply_journal, cell_id, claim, release);
         case core::CellAdmissionClaimKindDTO::kComponentLifecycle:
-          return core::ValidateLifecycleCellAdmissionSettlementReadOnly(
+          return core::ValidateCCLCCellAdmissionSettlementReadOnly(
               lifecycle_journal, cell_id, claim, release);
         case core::CellAdmissionClaimKindDTO::kAuthoredScene:
           return scene::ValidateAuthoredSceneCellAdmissionSettlementReadOnly(
@@ -6649,7 +6776,7 @@ BuildOwnerReconciliationValidator(
           authoring_transaction_journal, held_claims, current_owner_epochs,
           reconcile);
     case core::CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner:
-      return core::ValidateLifecycleCellAdmissionReconciliationReadOnly(
+      return core::ValidateCCLCCellAdmissionReconciliationReadOnly(
           lifecycle_journal, cell_id, held_claims, current_owner_epochs,
           reconcile);
     default:
@@ -7108,6 +7235,9 @@ BuildProductComposition(CompositionBuildInput input) {
       std::move(control_binding_representatives);
   runtime_input.deployment_maximum_tcp_linear_speed_mps =
       deployment_motion_target_limit;
+#if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+  runtime_input.ordinary_motion_jerk = motion_limit->ordinary_motion_jerk;
+#endif
   for (const auto &limit : retained_runtime_configuration.direct_control_joint_limits) {
     const auto &target = runtime_input.motion_binding.value();
     if (limit.controllable_component_id == target.controllable_component_id &&
@@ -7294,6 +7424,11 @@ BuildProductComposition(CompositionBuildInput input) {
       direct_control_joint_limits.value(), runtime->gripper_position_limits,
       runtime->motion_runtime_policy,
       runtime->deployment_maximum_tcp_linear_speed_mps,
+#if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+      &motion_limit->ordinary_motion_jerk,
+#else
+      nullptr,
+#endif
       retained_runtime_configuration.direct_control_joint_limits,
       retained_runtime_configuration.gripper_target_configurations,
       input.model_map, manual_control_documents);
@@ -7836,17 +7971,6 @@ TryBuildCurrentManagedCompositionInput(
     return std::nullopt;
   }
 
-  const auto &products = bundle->value().compiled_products;
-  Require(products.symbol_role_maps.size() == 1U,
-          "managed native composition requires one exact retained model map");
-  const deployment::FilesystemVerifiedRetainedModelMapSource map_source(
-      config.package_root);
-  auto model_map = map_source.get_verified(deployment::RetainedModelMapQuery{
-      bundle->retained_bundle_id(),
-      products.symbol_role_maps.front().product_id});
-  Require(model_map.has_value(),
-          "managed active retained model map is absent or invalid");
-
   const core::CapabilityProviderBindingDTO *joint_planner = nullptr;
   for (const auto &provider : bundle->value().capability_provider_bindings) {
     if (provider.capability_id.value() != "planning.motion.joint_goal" ||
@@ -7900,6 +8024,19 @@ TryBuildCurrentManagedCompositionInput(
   if (projection == nullptr) {
     return std::nullopt;
   }
+  // Pending Apply still publishes the predecessor. Do not reload its model
+  // map on every Manager RPC while this child has no usable projection.
+  // The exact map remains mandatory before a composition can be built.
+  const auto &products = bundle->value().compiled_products;
+  Require(products.symbol_role_maps.size() == 1U,
+          "managed native composition requires one exact retained model map");
+  const deployment::FilesystemVerifiedRetainedModelMapSource map_source(
+      config.package_root);
+  auto model_map = map_source.get_verified(deployment::RetainedModelMapQuery{
+      bundle->retained_bundle_id(),
+      products.symbol_role_maps.front().product_id});
+  Require(model_map.has_value(),
+          "managed active retained model map is absent or invalid");
   auto collision_model = projection->collision_shared_model();
   Require(collision_model != nullptr,
           "managed active projection has no collision model");
@@ -8970,6 +9107,18 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       if (!require_durable_current_publication().has_value()) {
         return component_manager::detail::EncodeManagerLivenessRpcRejection(
             "superseded_active_publication");
+      }
+      // A replaced native process may first receive liveness after its
+      // candidate was published. It has no predecessor receiver to rebind,
+      // but must perform the same deferred lifecycle attachment. Bootstrap
+      // without an installed composition is still handled by its builder.
+      {
+        std::lock_guard lock(managed_composition_mutex);
+        if (active_managed_composition != nullptr &&
+            active_managed_composition->publication_generation ==
+                decoded.active_publication_generation) {
+          TryAttachManagedCCLC(*active_managed_composition, config, fence_owner);
+        }
       }
       const auto installed =
           stable_kernel_owner->ReplaceManagerLivenessRequiredSet(
@@ -10688,7 +10837,7 @@ private:
           {"ok", CanonicalValue(true)},
           {"accepted",
            ProgramSelectionAcceptedValue(
-               result.value(), command.program_selection->group_id)}});
+               result.value(), command.program_selection->group_ids)}});
     }
     const bool ordinary = (command.kind == CommandKind::kStop ||
                            command.kind == CommandKind::kStopProgramRun) &&
@@ -10980,6 +11129,57 @@ private:
                preview.value(), *command.operation, *command.operation_digest,
                composition.runtime->gripper_position_limits, owner_epoch_)},
       });
+    }
+    if (command.kind == CommandKind::kReadManualHandover) {
+      const auto result =
+          composition.runtime->addressed_kernel
+              ->get_manual_control_availability(*command.operation);
+      if (!result.ok()) {
+        return CanonicalValue(CanonicalValue::Object{
+            {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+            {"error", ErrorValue(result.error())},
+            {"ok", CanonicalValue(false)}});
+      }
+      CanonicalValue handover(nullptr);
+      if (result.value().handover) {
+        const auto &held = *result.value().handover;
+        const auto &capture = held.capture;
+        CanonicalValue::Array indices;
+        indices.reserve(held.producer_node_indices.size());
+        for (const auto index : held.producer_node_indices)
+          indices.emplace_back(static_cast<double>(index));
+        handover = CanonicalValue(CanonicalValue::Object{
+            {"context",
+             CanonicalValue(CanonicalValue::Object{
+                 {"claim_generation", CanonicalValue(static_cast<double>(
+                                          capture.claim_generation.value()))},
+                 {"program_run_id",
+                  CanonicalValue(capture.program_run_id.value())},
+                 {"program_runner_owner_epoch",
+                  CanonicalValue(capture.program_runner_owner_epoch.value())},
+                 {"selection_revision", CanonicalValue(static_cast<double>(
+                                            held.selection_revision))}})},
+            {"producer_node_indices", CanonicalValue(std::move(indices))}});
+      }
+      return CanonicalValue(CanonicalValue::Object{
+          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+          {"command", CanonicalValue("read_manual_handover")},
+          {"availability",
+           CanonicalValue(CanonicalValue::Object{
+               {"available", CanonicalValue(result.value().available)},
+               {"cleanup_required",
+                CanonicalValue(result.value().cleanup_required)},
+               {"unavailable_reason",
+                result.value().unavailable_reason
+                    ? CanonicalValue(*result.value().unavailable_reason)
+                    : CanonicalValue(nullptr)}})},
+          {"handover", std::move(handover)},
+          {"intent_digest", CanonicalValue(command.operation_digest->value())},
+          {"ok", CanonicalValue(true)},
+          {"request_id",
+           CanonicalValue(
+               command.operation->request_context.request_id.value())},
+          {"request_owner_epoch", CanonicalValue(owner_epoch_.value())}});
     }
     if (command.kind == CommandKind::kPreviewMotion) {
       auto preview_intent = *command.operation;
@@ -11367,6 +11567,7 @@ private:
       case CommandKind::kObservation:
       case CommandKind::kEvents:
       case CommandKind::kPreviewMotion:
+      case CommandKind::kReadManualHandover:
       case CommandKind::kPreviewCapabilityCommand:
       case CommandKind::kRegisterProgramCapture:
       case CommandKind::kSubmit:

@@ -57,6 +57,12 @@ ProcessPresenceObservation RuntimeUnitAdapterRouter::EnsureRunning(
   return Select(query).process_port->EnsureRunning(query);
 }
 
+std::optional<manyforge::core::ManagedRuntimeWithdrawalDTO>
+RuntimeUnitAdapterRouter::ReadPredecessorWithdrawal(
+    const RuntimeUnitConvergenceQueryDTO &query) {
+  return Select(query).process_port->ReadPredecessorWithdrawal(query);
+}
+
 ProcessPresenceObservation RuntimeUnitAdapterRouter::EnsureStopped(
     const RuntimeUnitConvergenceQueryDTO &query) {
   return Select(query).process_port->EnsureStopped(query);

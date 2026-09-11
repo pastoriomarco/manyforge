@@ -1286,11 +1286,28 @@ rebind_runtime_participant_to_active_configuration(
 
 core::Result<core::RuntimeParticipantStopReadiness>
 store_and_verify_runtime_participant_stop_readiness(
-    core::ResolvedStopBasePlanDTO plan,
+    const RetainedBundle &retained_bundle, core::ResolvedStopBasePlanDTO plan,
     core::ComponentLifecycleGeneration component_lifecycle_generation,
     const core::ControllerLifecycleExpectedDomain &expected_domain,
     const core::RuntimeParticipantBinding &participant_binding,
     core::IResolvedStopBasePlanRepository &repository) {
+  if (!verify_retained_bundle_identity(retained_bundle) ||
+      plan.retained_bundle_id != retained_bundle.retained_bundle_id())
+    return readiness_error<core::RuntimeParticipantStopReadiness>(
+        "stop_readiness_retained_timing_mismatch",
+        "Stop readiness requires the exact retained bundle");
+  std::optional<std::int64_t> maximum_duration;
+  for (const auto &selected : retained_bundle.value().stop_timing_parameters) {
+    if (selected.control_binding_id != plan.control_binding_id)
+      continue;
+    if (selected.control_binding_revision != plan.control_binding_revision)
+      return readiness_error<core::RuntimeParticipantStopReadiness>(
+          "stop_readiness_retained_timing_mismatch",
+          "Stop timing differs from the exact binding revision");
+    maximum_duration = selected.timing.operational_timeout_ns -
+                       selected.timing.command_latency_allowance_ns -
+                       selected.timing.settling_allowance_ns;
+  }
   const auto verified = core::VerifyResolvedStopBasePlan(plan);
   if (!verified.ok()) {
     return core::Result<core::RuntimeParticipantStopReadiness>::Err(
@@ -1327,7 +1344,7 @@ store_and_verify_runtime_participant_stop_readiness(
       core::RuntimeParticipantStopReadinessDTO{
           participant_binding.value().controllable_component_id,
           component_lifecycle_generation, expected_domain.value(),
-          std::move(loaded.value())},
+          std::move(loaded.value()), maximum_duration},
       participant_binding, expected_domain);
 }
 
@@ -1448,8 +1465,9 @@ resolve_store_and_verify_route_readiness_batch(
     for (auto &candidate : pending) {
       const auto plan_id = candidate.plan.resolved_stop_base_plan_id;
       auto readiness = store_and_verify_runtime_participant_stop_readiness(
-          std::move(candidate.plan), candidate.component_generation,
-          expected_domain, candidate.binding, repository);
+          retained_bundle, std::move(candidate.plan),
+          candidate.component_generation, expected_domain, candidate.binding,
+          repository);
       if (!readiness.ok()) {
         return core::Result<std::vector<VerifiedRouteReadinessParticipant>>::
             Err(readiness.error());

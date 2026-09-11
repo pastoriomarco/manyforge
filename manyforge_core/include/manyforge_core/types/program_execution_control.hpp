@@ -12,7 +12,8 @@ struct ProgramExecutionSelectionRequestDTO final {
   RequestOwnerEpoch program_runner_owner_epoch;
   CellAdmissionClaimGeneration claim_generation;
   ProgramRunId program_run_id;
-  std::string group_id;
+  // One bounded selection union, resolved atomically by the captured owner.
+  std::vector<std::string> group_ids;
   RequestAttributionDTO attribution;
   friend bool operator==(const ProgramExecutionSelectionRequestDTO&,
                          const ProgramExecutionSelectionRequestDTO&) = default;

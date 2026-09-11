@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import signal
@@ -37,9 +38,7 @@ from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClien
 WORKSPACE = Path("/workspace")
 CACHE_ROOT = Path("/runner")
 BUILD_ROOT = CACHE_ROOT / "build"
-STATE_ROOT = Path(
-    os.environ.get("MANYFORGE_DEV_STATE_ROOT", "/tmp/manyforge-state")
-)
+STATE_ROOT = Path(os.environ.get("MANYFORGE_DEV_STATE_ROOT", "/tmp/manyforge-state"))
 HEADLESS_BUILD = BUILD_ROOT / "headless"
 ROBOPLAN_BUILD = BUILD_ROOT / "roboplan"
 DEPLOYMENT_AUTHORING_BUILD = BUILD_ROOT / "deployment-authoring"
@@ -84,9 +83,7 @@ def _run(command: Sequence[str], *, cwd: Path | None = None) -> None:
 
 
 def _qualified_root() -> Path:
-    return Path(
-        os.environ.get("MANYFORGE_DEV_QUALIFIED_ROOT", "/manyforge-qualified")
-    )
+    return Path(os.environ.get("MANYFORGE_DEV_QUALIFIED_ROOT", "/manyforge-qualified"))
 
 
 def _import_package() -> None:
@@ -145,7 +142,9 @@ def _ensure_current_backend() -> Path:
         )
         pybind11_dir = completed.stdout.strip()
         if completed.returncode != 0 or not pybind11_dir:
-            raise WorkbenchError("cannot resolve the development pybind11 CMake package")
+            raise WorkbenchError(
+                "cannot resolve the development pybind11 CMake package"
+            )
         _run(
             (
                 "cmake",
@@ -179,9 +178,7 @@ def _ensure_current_backend() -> Path:
     _regular_file(MANAGER_BINARY, "current Manager", executable=True)
     extensions = sorted(HEADLESS_BUILD.glob("manyforge_headless_py*.so"))
     if len(extensions) != 1:
-        raise WorkbenchError(
-            "current Headless Python extension is absent or ambiguous"
-        )
+        raise WorkbenchError("current Headless Python extension is absent or ambiguous")
     _regular_file(extensions[0], "current Headless Python extension")
     return extensions[0]
 
@@ -222,9 +219,7 @@ def _ensure_current_native_backend() -> tuple[Path, Path]:
     _regular_file(
         NATIVE_EXECUTION_HOST, "current native execution host", executable=True
     )
-    _regular_file(
-        NATIVE_CANDIDATE_WORKER, "current candidate worker", executable=True
-    )
+    _regular_file(NATIVE_CANDIDATE_WORKER, "current candidate worker", executable=True)
     return NATIVE_EXECUTION_HOST, NATIVE_CANDIDATE_WORKER
 
 
@@ -300,27 +295,23 @@ def _remove_stale_socket(path: Path, label: str) -> None:
 
 def _require_current_workspace_deployment(
     scenario: dict[str, Any],
+    deployment_path: Path | None = None,
 ) -> Path:
     """Reject an imported package that predates its current source contract."""
 
-    deployment_path = (
-        WORKSPACE
-        / "examples"
-        / f"{scenario['deployment_artifact_id']}.deployment.yaml"
+    deployment_path = deployment_path or (
+        WORKSPACE / "examples" / f"{scenario['deployment_artifact_id']}.deployment.yaml"
     )
     _regular_file(deployment_path, "matching workspace Deployment")
     try:
         deployment = json.loads(deployment_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise WorkbenchError(
-            "matching workspace Deployment is invalid: "
-            f"{deployment_path}: {error}"
+            "matching workspace Deployment is invalid: " f"{deployment_path}: {error}"
         ) from error
     if (
-        deployment.get("deployment_artifact_id")
-        != scenario["deployment_artifact_id"]
-        or deployment.get("deployment_revision")
-        != scenario["deployment_revision"]
+        deployment.get("deployment_artifact_id") != scenario["deployment_artifact_id"]
+        or deployment.get("deployment_revision") != scenario["deployment_revision"]
     ):
         raise WorkbenchError(
             "imported maintained Scenario package is stale relative to its "
@@ -336,9 +327,7 @@ def _require_current_workspace_node_environment(
 
     _regular_file(NODE_ENVIRONMENT_MANIFEST, "workspace node environment")
     try:
-        manifest = json.loads(
-            NODE_ENVIRONMENT_MANIFEST.read_text(encoding="utf-8")
-        )
+        manifest = json.loads(NODE_ENVIRONMENT_MANIFEST.read_text(encoding="utf-8"))
         catalog = manifest["catalog"]
         expected = {
             "catalog_digest": catalog["catalog_digest"],
@@ -359,22 +348,31 @@ def _require_current_workspace_node_environment(
     return NODE_ENVIRONMENT_MANIFEST
 
 
+def _compiler_build_profile(bundle: dict[str, Any]) -> str:
+    digest = bundle["provenance"]["compiler_build_digest"]
+    if (
+        not isinstance(digest, str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None
+    ):
+        raise ValueError("Scenario compiler build digest is invalid")
+    path = PACKAGE_ROOT / "build-manifests/compiler_build" / f"{digest[7:]}.json"
+    _regular_file(path, "Scenario compiler build manifest")
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    if manifest.get("compiler_build_digest") != digest:
+        raise ValueError(
+            "Scenario compiler manifest does not match its exact reference"
+        )
+    profile = manifest["build_profile"]
+    if not isinstance(profile, str):
+        raise ValueError("compiler build profile must be text")
+    return profile
+
+
 def _load_scenario(scenario_id: str) -> dict[str, Any]:
     catalog_path = PACKAGE_ROOT / "maintained.scenario-catalog.yaml"
     _regular_file(catalog_path, "maintained Scenario catalog")
     try:
         catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
-        build_manifests = list(
-            (PACKAGE_ROOT / "build-manifests/compiler_build").glob("*.json")
-        )
-        if len(build_manifests) != 1:
-            raise ValueError("package must contain one compiler build manifest")
-        build_manifest = json.loads(
-            build_manifests[0].read_text(encoding="utf-8")
-        )
-        build_profile = build_manifest["build_profile"]
-        if not isinstance(build_profile, str):
-            raise ValueError("compiler build profile must be text")
         rows = [
             row
             for row in catalog["scenarios"]
@@ -400,6 +398,7 @@ def _load_scenario(scenario_id: str) -> dict[str, Any]:
         _regular_file(bundle_path, "Scenario retained bundle")
         binding = json.loads(binding_path.read_text(encoding="utf-8"))
         bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+        build_profile = _compiler_build_profile(bundle)
         program_path = (
             PACKAGE_ROOT
             / "programs/sha256"
@@ -418,8 +417,7 @@ def _load_scenario(scenario_id: str) -> dict[str, Any]:
         binding.get("program_binding_id") != row["program_binding_id"]
         or binding.get("retained_bundle_id") != row["retained_bundle_id"]
         or binding.get("graph_revision") != graph.get("graph_revision")
-        or bundle.get("deployment_artifact_id")
-        != row["deployment_artifact_id"]
+        or bundle.get("deployment_artifact_id") != row["deployment_artifact_id"]
         or bundle.get("deployment_revision") != row["deployment_revision"]
         or program.get("program_id") != binding.get("program_id")
         or program.get("program_revision") != binding.get("program_revision")
@@ -434,9 +432,7 @@ def _load_scenario(scenario_id: str) -> dict[str, Any]:
         )
     admission_filename = f"canonical-empty-admission.{graph['cell_id']}.json"
     _regular_file(PACKAGE_ROOT / admission_filename, "canonical-empty admission")
-    workspace_program = (
-        WORKSPACE / "examples" / f"{program['program_id']}.program.yaml"
-    )
+    workspace_program = WORKSPACE / "examples" / f"{program['program_id']}.program.yaml"
     _regular_file(workspace_program, "matching workspace Program")
     _require_current_workspace_deployment(row)
     _require_current_workspace_node_environment(binding)
@@ -444,9 +440,11 @@ def _load_scenario(scenario_id: str) -> dict[str, Any]:
     # compares its semantic Program revision with the retained selection.  Do
     # not add a stricter byte-format identity in the process launcher.
     component_ids = [
-        component.get("controllable_component_id")
-        if isinstance(component, dict)
-        else None
+        (
+            component.get("controllable_component_id")
+            if isinstance(component, dict)
+            else None
+        )
         for component in controllable_components
     ]
     if (
@@ -522,9 +520,7 @@ def _wait_until(
     raise WorkbenchError(f"timed out waiting for {description}{suffix}")
 
 
-def _manager_projection_ready(
-    status: dict[str, Any], diff: dict[str, Any]
-) -> bool:
+def _manager_projection_ready(status: dict[str, Any], diff: dict[str, Any]) -> bool:
     """Accept only the existing fully converged Manager baseline."""
 
     source = status.get("source")
@@ -548,9 +544,7 @@ def _manager_projection_ready(
     )
 
 
-def _active_configuration_matches(
-    active: object, desired: object
-) -> bool:
+def _active_configuration_matches(active: object, desired: object) -> bool:
     """Compare only the retained route fields; owner facts remain projections."""
 
     if not isinstance(active, dict) or not isinstance(desired, dict):
@@ -727,9 +721,7 @@ def _converge_component(
         )
         snapshot = client.cclc_component(component_id)
         if snapshot.get("component_lifecycle_state") != expected_state:
-            raise WorkbenchError(
-                f"CCLC {component_id} did not become {expected_state}"
-            )
+            raise WorkbenchError(f"CCLC {component_id} did not become {expected_state}")
 
     if snapshot.get("component_lifecycle_state") != "active":
         raise WorkbenchError(f"CCLC component {component_id} is not active")
@@ -739,9 +731,11 @@ def _converge_component(
         raise WorkbenchError(f"CCLC component {component_id} has no route templates")
     rows = sorted(
         rows,
-        key=lambda row: row.get("desired_configuration", {}).get(
-            "control_domain_id", ""
-        ) if isinstance(row, dict) else "",
+        key=lambda row: (
+            row.get("desired_configuration", {}).get("control_domain_id", "")
+            if isinstance(row, dict)
+            else ""
+        ),
     )
     snapshot_domains = {
         domain.get("control_domain_id"): domain
@@ -751,16 +745,12 @@ def _converge_component(
     desired_rows = [
         (
             row,
-            row.get("desired_configuration")
-            if isinstance(row, dict)
-            else None,
+            row.get("desired_configuration") if isinstance(row, dict) else None,
         )
         for row in rows
     ]
     desired_domain_ids = [
-        desired.get("control_domain_id")
-        if isinstance(desired, dict)
-        else None
+        desired.get("control_domain_id") if isinstance(desired, dict) else None
         for _row, desired in desired_rows
     ]
     if desired_domain_ids != sorted(snapshot_domains):
@@ -798,9 +788,7 @@ def _converge_component(
                     "correlation_id": scenario_id,
                 },
                 "expected_admission_generation": admission,
-                "expected_retained_bundle_id": templates.get(
-                    "retained_bundle_id"
-                ),
+                "expected_retained_bundle_id": templates.get("retained_bundle_id"),
                 "expected_graph_revision": templates.get("graph_revision"),
                 "desired_configuration": desired,
                 "expected_active_control_configuration": row.get(
@@ -826,9 +814,7 @@ def _converge_component(
             if isinstance(domain, dict)
         }
         if not _active_configuration_matches(
-            snapshot_domains.get(domain_id, {}).get(
-                "active_control_configuration"
-            ),
+            snapshot_domains.get(domain_id, {}).get("active_control_configuration"),
             desired,
         ):
             raise WorkbenchError(f"CCLC route {domain_id} did not reconcile")
@@ -856,7 +842,9 @@ def _converge_control_management(
         return mode
 
     mode = _wait_until(
-        "execution control management", current_mode, processes,
+        "execution control management",
+        current_mode,
+        processes,
         timeout_seconds=30.0,
     )
     if mode == "direct":
@@ -909,9 +897,7 @@ def _startup_cycle_state(client: HeadlessHttpClient) -> str:
     cycle = client.program_cycle_status()
     state = cycle.get("state")
     if state not in {"idle_after_reset", "terminal_awaiting_reset"}:
-        raise WorkbenchError(
-            f"Program cycle is not contained at startup: {state!r}"
-        )
+        raise WorkbenchError(f"Program cycle is not contained at startup: {state!r}")
     return state
 
 
@@ -924,12 +910,14 @@ class Workbench:
         runner_port: int,
         composer_port: int,
         frontend_port: int,
+        artifact_root: Path | None = None,
     ) -> None:
         self.scenario_id = scenario_id
         self.headless_port = headless_port
         self.runner_port = runner_port
         self.composer_port = composer_port
         self.frontend_port = frontend_port
+        self.artifact_root = artifact_root or WORKSPACE / "examples"
         self.metadata: dict[str, Any] = {}
         self.processes: list[tuple[str, subprocess.Popen[bytes]]] = []
         self.stop_requested = False
@@ -1004,8 +992,7 @@ class Workbench:
         _remove_stale_socket(manager_socket, "Manager command socket")
         _remove_stale_socket(runner_socket, "Program runner liveness socket")
         authoring_journal = (
-            paths["composer_authoring"]
-            / "composer-authoring-transactions.sqlite3"
+            paths["composer_authoring"] / "composer-authoring-transactions.sqlite3"
         )
         # Bring up the two reconciliation services before Manager.  A new
         # Manager must be able to reconcile the retained Program Runner owner
@@ -1015,39 +1002,72 @@ class Workbench:
         self._spawn(
             "Program runner",
             (
-                sys.executable, "-m", "manyforge_program_runner",
-                "--host", "127.0.0.1", "--port", str(self.runner_port),
-                "--headless-url", f"http://127.0.0.1:{self.headless_port}",
-                "--execution-run-root", str(paths["execution_run"]),
-                "--cycle-journal-path", str(STATE_ROOT / "program-cycle.sqlite3"),
-                "--manager-liveness-socket", str(runner_socket),
-                "--cell-id", self.metadata["cell_id"],
-                "--owner-id", "program-runner.development-workbench",
+                sys.executable,
+                "-m",
+                "manyforge_program_runner",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(self.runner_port),
+                "--headless-url",
+                f"http://127.0.0.1:{self.headless_port}",
+                "--execution-run-root",
+                str(paths["execution_run"]),
+                "--cycle-journal-path",
+                str(STATE_ROOT / "program-cycle.sqlite3"),
+                "--manager-liveness-socket",
+                str(runner_socket),
+                "--cell-id",
+                self.metadata["cell_id"],
+                "--owner-id",
+                "program-runner.development-workbench",
             ),
         )
         self._spawn(
             "Headless API",
             (
-                sys.executable, "-m", "manyforge_headless_api", "serve",
-                "--host", "127.0.0.1", "--port", str(self.headless_port),
-                "--projection-root", str(paths["publications"]),
-                "--install-root", str(PACKAGE_ROOT),
-                "--artifact-root", str(paths["artifacts"]),
-                "--program-selection-state-root", str(paths["program_selection"]),
-                "--node-catalog-path", str(NODE_CATALOG),
+                sys.executable,
+                "-m",
+                "manyforge_headless_api",
+                "serve",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(self.headless_port),
+                "--projection-root",
+                str(paths["publications"]),
+                "--install-root",
+                str(PACKAGE_ROOT),
+                "--artifact-root",
+                str(paths["artifacts"]),
+                "--program-selection-state-root",
+                str(paths["program_selection"]),
+                "--node-catalog-path",
+                str(NODE_CATALOG),
                 "--node-environment-manifest-path",
                 str(NODE_ENVIRONMENT_MANIFEST),
-                "--alarm-catalog-path", str(ALARM_CATALOG),
-                "--historian-database-path", str(STATE_ROOT / "history.sqlite3"),
-                "--manager-run-root", str(paths["manager_run"]),
-                "--execution-run-root", str(paths["execution_run"]),
-                "--cell-id", self.metadata["cell_id"],
-                "--owner-id", "headless-api.development-workbench",
-                "--freshness-ms", "2000",
-                "--manager-timeout-s", "15",
-                "--program-runner-url", f"http://127.0.0.1:{self.runner_port}",
-                "--deployment-compiler", str(deployment_compiler),
-                "--deployment-compiler-workspace-root", str(WORKSPACE),
+                "--alarm-catalog-path",
+                str(ALARM_CATALOG),
+                "--historian-database-path",
+                str(STATE_ROOT / "history.sqlite3"),
+                "--manager-run-root",
+                str(paths["manager_run"]),
+                "--execution-run-root",
+                str(paths["execution_run"]),
+                "--cell-id",
+                self.metadata["cell_id"],
+                "--owner-id",
+                "headless-api.development-workbench",
+                "--freshness-ms",
+                "2000",
+                "--manager-timeout-s",
+                "15",
+                "--program-runner-url",
+                f"http://127.0.0.1:{self.runner_port}",
+                "--deployment-compiler",
+                str(deployment_compiler),
+                "--deployment-compiler-workspace-root",
+                str(WORKSPACE),
                 *(
                     argument
                     for family_id, prepared_root in prepared_models
@@ -1067,10 +1087,7 @@ class Workbench:
                 runner = client.request("GET", "/api/program/health")
             with HeadlessHttpClient(base_url, timeout_seconds=0.5) as client:
                 api = client.runtime()
-            return bool(
-                runner.get("started") is True
-                and api.get("schema_version")
-            )
+            return bool(runner.get("started") is True and api.get("schema_version"))
 
         _wait_until(
             "Program Runner and Headless reconciliation services",
@@ -1081,19 +1098,30 @@ class Workbench:
             "Manager",
             (
                 str(manager),
-                "--install-root", str(PACKAGE_ROOT),
-                "--candidate-package-root", str(paths["artifacts"]),
-                "--manager-state-root", str(paths["manager_state"]),
-                "--manager-run-root", str(paths["manager_run"]),
-                "--execution-state-root", str(paths["execution_state"]),
-                "--execution-run-root", str(paths["execution_run"]),
-                "--logical-scene-database", str(STATE_ROOT / "logical-scene.sqlite3"),
-                "--program-cycle-journal", str(STATE_ROOT / "program-cycle.sqlite3"),
-                "--authoring-transaction-journal", str(authoring_journal),
-                "--projection-root", str(paths["publications"]),
+                "--install-root",
+                str(PACKAGE_ROOT),
+                "--candidate-package-root",
+                str(paths["artifacts"]),
+                "--manager-state-root",
+                str(paths["manager_state"]),
+                "--manager-run-root",
+                str(paths["manager_run"]),
+                "--execution-state-root",
+                str(paths["execution_state"]),
+                "--execution-run-root",
+                str(paths["execution_run"]),
+                "--logical-scene-database",
+                str(STATE_ROOT / "logical-scene.sqlite3"),
+                "--program-cycle-journal",
+                str(STATE_ROOT / "program-cycle.sqlite3"),
+                "--authoring-transaction-journal",
+                str(authoring_journal),
+                "--projection-root",
+                str(paths["publications"]),
                 "--canonical-empty-admission-filename",
                 self.metadata["admission_filename"],
-                "--program-runner-liveness-socket", str(runner_socket),
+                "--program-runner-liveness-socket",
+                str(runner_socket),
             ),
         )
         _wait_until(
@@ -1110,9 +1138,7 @@ class Workbench:
                     return status
             return None
 
-        _wait_until(
-            "fresh converged Manager baseline", manager_ready, self.processes
-        )
+        _wait_until("fresh converged Manager baseline", manager_ready, self.processes)
 
         def node_environment_ready() -> dict[str, Any] | None:
             # Manager convergence and Program Runner availability are
@@ -1157,12 +1183,10 @@ class Workbench:
             f"http://localhost:{self.frontend_port},"
             f"http://127.0.0.1:{self.frontend_port}"
         )
-        composer_environment["MANYFORGE_FS_ROOTS"] = str(WORKSPACE / "examples")
-        composer_environment["MANYFORGE_PROGRAM_WRITE_ROOTS"] = str(
-            WORKSPACE / "examples"
-        )
+        composer_environment["MANYFORGE_FS_ROOTS"] = str(self.artifact_root)
+        composer_environment["MANYFORGE_PROGRAM_WRITE_ROOTS"] = str(self.artifact_root)
         composer_environment["MANYFORGE_DEPLOYMENT_WRITE_ROOTS"] = str(
-            WORKSPACE / "examples"
+            self.artifact_root
         )
         print("starting Composer backend", flush=True)
         # Composer owns recovery of its durable authoring transactions. Start
@@ -1171,12 +1195,21 @@ class Workbench:
         # waiting for admission first would prevent the sole recovery owner
         # from ever running.
         composer_command = [
-            sys.executable, "-m", "manyforge_composer",
-            "--host", "127.0.0.1", "--port", str(self.composer_port),
-            "--program-path", self.metadata["program_path"],
-            "--headless-api-url", base_url,
-            "--headless-api-timeout-s", "20",
-            "--authoring-state-root", str(paths["composer_authoring"]),
+            sys.executable,
+            "-m",
+            "manyforge_composer",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(self.composer_port),
+            "--program-path",
+            self.metadata["program_path"],
+            "--headless-api-url",
+            base_url,
+            "--headless-api-timeout-s",
+            "20",
+            "--authoring-state-root",
+            str(paths["composer_authoring"]),
         ]
         if startup_cycle_state == "idle_after_reset":
             composer_command.extend(("--startup-scenario", self.scenario_id))
@@ -1210,9 +1243,7 @@ class Workbench:
                     scenario_id=self.metadata["scenario_id"],
                     processes=self.processes,
                 )
-            _wait_until(
-                "idle authoring admission", authoring_ready, self.processes
-            )
+            _wait_until("idle authoring admission", authoring_ready, self.processes)
         vite_environment = os.environ.copy()
         vite_environment["MANYFORGE_COMPOSER_PROXY_TARGET"] = (
             f"http://127.0.0.1:{self.composer_port}"
@@ -1220,9 +1251,12 @@ class Workbench:
         print("starting Vite HMR", flush=True)
         vite = subprocess.Popen(
             (
-                "node", str(FRONTEND_ROOT / "node_modules/vite/bin/vite.js"),
-                "--host", "0.0.0.0",
-                "--port", str(self.frontend_port),
+                "node",
+                str(FRONTEND_ROOT / "node_modules/vite/bin/vite.js"),
+                "--host",
+                "0.0.0.0",
+                "--port",
+                str(self.frontend_port),
             ),
             cwd=FRONTEND_ROOT,
             env=vite_environment,
@@ -1291,11 +1325,7 @@ class Workbench:
         """Let the runner durably observe Manager loss before it exits."""
 
         runner = next(
-            (
-                process
-                for name, process in self.processes
-                if name == "Program runner"
-            ),
+            (process for name, process in self.processes if name == "Program runner"),
             None,
         )
         if runner is None or runner.poll() is not None:
@@ -1305,9 +1335,7 @@ class Workbench:
             with HeadlessHttpClient(
                 f"http://127.0.0.1:{self.runner_port}", timeout_seconds=0.2
             ) as client:
-                status = client.request(
-                    "GET", "/api/program/liveness/status"
-                )
+                status = client.request("GET", "/api/program/liveness/status")
                 cycle = client.program_cycle_status()
             return bool(
                 status.get("state") == "expired"

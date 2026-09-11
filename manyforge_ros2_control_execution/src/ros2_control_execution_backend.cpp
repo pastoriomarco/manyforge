@@ -906,7 +906,8 @@ void Ros2ControlExecutionBackend::validate_config() const {
 }
 
 core::PrepareParticipantResultDTO Ros2ControlExecutionBackend::Prepare(
-    const core::PreparedOperationParticipantDTO &participant) {
+    const core::PreparedOperationParticipantDTO &participant,
+    const std::uint64_t execution_id) {
   const auto reject = [&](std::string reason) {
     auto result = core::MakePrepareParticipantResult(
         participant, core::PrepareParticipantResultStateDTO::kRejected,
@@ -950,31 +951,48 @@ core::PrepareParticipantResultDTO Ros2ControlExecutionBackend::Prepare(
   }
   const auto &motion =
       std::get<core::PreparedMotionExecutionDTO>(participant.payload);
+  if (motion.trajectory.runtime_scale_bounds) {
+    return reject("controller_runtime_time_law_not_qualified");
+  }
   if (motion.trajectory.resources != participant.resources ||
       motion.trajectory.joint_names != config_.required_joints) {
     return reject("prepared_trajectory_scope_mismatch");
   }
 
-  const auto key =
-      std::make_tuple(participant.operation_id, participant.operation_revision,
-                      participant.participant_id);
-  const auto found = prepared_participants_.find(key);
-  if (found != prepared_participants_.end()) {
-    if (found->second != participant.prepared_contract_digest) {
-      return reject("prepared_contract_conflict");
-    }
-  } else {
-    if (prepared_participants_.size() >= kPreparedReplayCapacity) {
-      return reject("prepared_replay_capacity_exhausted");
-    }
-    prepared_participants_.emplace(key, participant.prepared_contract_digest);
-  }
   auto result = core::MakePrepareParticipantResult(
       participant, core::PrepareParticipantResultStateDTO::kPrepared);
   if (!result.ok()) {
     throw std::invalid_argument(result.error().message);
   }
+  if (const auto invalid =
+          prepared_membership_.prepare(execution_id, participant))
+    return reject(std::string(*invalid));
   return std::move(result.value());
+}
+
+core::Result<void> Ros2ControlExecutionBackend::RetirePreparedExecution(
+    const std::uint64_t execution_id) {
+  std::lock_guard prepared_lock(prepared_execution_mutex_);
+  const auto active = prepared_membership_.active_execution_id();
+  if (active == execution_id) {
+    std::lock_guard execution_lock(execution_mutex_);
+    if (running_ || !terminal_ || controlled_stop_preempt_in_progress_ ||
+        prepared_stop_stage_activity_.load(std::memory_order_acquire) != 0U) {
+      return core::Result<void>::Err(core::ErrorDTO{
+          core::kErrorExecutionRejected,
+          "Prepared execution still has active motion or Stop work",
+          {{"reason", "prepared_execution_not_quiescent"}}});
+    }
+  }
+  if (!prepared_membership_.retire(execution_id)) {
+    return core::Result<void>::Err(
+        core::ErrorDTO{core::kErrorInvalidRequest,
+                       "Prepared retirement names an unknown execution",
+                       {{"reason", "prepared_execution_stale"}}});
+  }
+  if (active == execution_id)
+    prepared_goal_.reset();
+  return core::Result<void>::Ok();
 }
 
 core::ExecutionHandle Ros2ControlExecutionBackend::dispatch_prepared(
@@ -1032,25 +1050,16 @@ core::ExecutionHandle Ros2ControlExecutionBackend::dispatch_prepared(
       }
     }
   }
-  const auto prepared_key =
-      std::make_tuple(participant.operation_id, participant.operation_revision,
-                      participant.participant_id);
-  const auto prepared = prepared_participants_.find(prepared_key);
-  if (prepared == prepared_participants_.end() ||
-      prepared->second != participant.prepared_contract_digest) {
+  if (!prepared_membership_.matches(participant)) {
     return rejected("prepared_participant_not_admitted");
   }
-  const auto replay = prepared_goals_.find(controller_goal_id);
-  if (replay != prepared_goals_.end()) {
-    if (replay->second.generation == controller_goal_generation &&
-        replay->second.prepared_contract_digest ==
+  if (prepared_goal_ && prepared_goal_->goal_id == controller_goal_id) {
+    if (prepared_goal_->generation == controller_goal_generation &&
+        prepared_goal_->prepared_contract_digest ==
             participant.prepared_contract_digest) {
-      return replay->second.handle;
+      return prepared_goal_->handle;
     }
     return rejected("controller_goal_identity_conflict");
-  }
-  if (prepared_goals_.size() >= kPreparedReplayCapacity) {
-    return rejected("controller_goal_replay_capacity_exhausted");
   }
 
   const auto &trajectory =
@@ -1061,6 +1070,9 @@ core::ExecutionHandle Ros2ControlExecutionBackend::dispatch_prepared(
   handle.controller_goal_id = controller_goal_id;
   handle.controller_goal_generation = controller_goal_generation;
   handle.prepared_contract_digest = participant.prepared_contract_digest;
+  if (core::prepared_execution_handle_field_error(
+          handle, participant, controller_goal_id, controller_goal_generation))
+    return handle;
   std::vector<core::PreparedParticipantStopPlanDTO> stop_plans;
   stop_plans.push_back(participant.ordinary_stop_plan);
   if (participant.fault_stop_plan.has_value()) {
@@ -1071,9 +1083,9 @@ core::ExecutionHandle Ros2ControlExecutionBackend::dispatch_prepared(
            .interrupt_scopes) {
     stop_plans.push_back(scope.stop_plan);
   }
-  prepared_goals_.emplace(
-      controller_goal_id,
-      PreparedGoalRecord{controller_goal_generation,
+  prepared_goal_ =
+      PreparedGoalRecord{controller_goal_id,
+                         controller_goal_generation,
                          participant.prepared_contract_digest,
                          participant.operation_id,
                          participant.operation_revision,
@@ -1095,7 +1107,7 @@ core::ExecutionHandle Ros2ControlExecutionBackend::dispatch_prepared(
                          participant.stop_evidence_policy_id,
                          participant.stop_evidence_policy_revision,
                          std::move(stop_plans),
-                         handle});
+                         handle};
   return handle;
 }
 
@@ -1170,15 +1182,16 @@ core::Result<void> Ros2ControlExecutionBackend::RebindRoute(
     std::lock_guard<std::mutex> prepared_lock(prepared_execution_mutex_);
     {
       std::lock_guard<std::mutex> execution_lock(execution_mutex_);
-      if (running_ || !terminal_) {
+      if (running_ || !terminal_ ||
+          prepared_membership_.active_execution_id() ||
+          prepared_stop_stage_activity_.load(std::memory_order_acquire) != 0U) {
         return error(core::ErrorCode::kExecutionRejected,
                      "ros2_control_motion_route_rebind_busy",
                      "ros2_control route publication cannot rebind an active "
                      "motion backend");
       }
     }
-    prepared_participants_.clear();
-    prepared_goals_.clear();
+    prepared_goal_.reset();
     prepared_participant_binding_.store(std::move(retained),
                                         std::memory_order_release);
     prepared_participant_aliases_.store(std::move(retained_aliases),
@@ -6277,6 +6290,11 @@ Ros2ControlExecutionBackend::TranslateStopStage(
     const core::ResolvedParticipantStopStageDTO &stage,
     const core::RemainingStopBudgetDTO &budget,
     const std::stop_token cancellation) {
+  prepared_stop_stage_activity_.fetch_add(1U, std::memory_order_acq_rel);
+  struct StopActivity {
+    std::atomic<std::uint32_t> &count;
+    ~StopActivity() { count.fetch_sub(1U, std::memory_order_acq_rel); }
+  } activity{prepared_stop_stage_activity_};
   const auto started_at = clock_.now();
   const auto steady_started_at = std::chrono::steady_clock::now();
   if (cancellation.stop_requested()) {
@@ -6374,9 +6392,8 @@ Ros2ControlExecutionBackend::TranslateStopStage(
   std::optional<PreparedGoalRecord> prepared_goal;
   {
     std::lock_guard<std::mutex> lock(prepared_execution_mutex_);
-    const auto found = prepared_goals_.find(stage.controller_goal_id);
-    if (found != prepared_goals_.end()) {
-      prepared_goal = found->second;
+    if (prepared_goal_ && prepared_goal_->goal_id == stage.controller_goal_id) {
+      prepared_goal = prepared_goal_;
     }
   }
   if (!prepared_goal.has_value() ||

@@ -5,6 +5,7 @@
 #include <optional>
 #include <span>
 #include <string_view>
+#include <vector>
 
 #include <Eigen/Core>
 
@@ -31,6 +32,9 @@ struct CartesianPathFidelityReport {
   double max_rotation_error_rad = 0.0;
   std::size_t interval_checks = 0;
   std::optional<double> unresolved_rotation_error_upper_bound_rad;
+  /// Actual sample at/after each requested waypoint in the verified ordered
+  /// correspondence. Populated only on complete fidelity and explicit demand.
+  std::vector<std::size_t> waypoint_actual_sample_indices;
 };
 
 CartesianPathFidelityReport verify_cartesian_path_fidelity(
@@ -45,7 +49,8 @@ verify_cartesian_path_fidelity_controlled(
     std::span<const Eigen::Matrix4d> requested_path,
     std::span<const Eigen::Matrix4d> actual_path,
     double translation_tolerance_m, double rotation_tolerance_rad,
-    const CartesianPlanningControl& control);
+    const CartesianPlanningControl& control,
+    std::span<const std::size_t> waypoint_indices = {});
 
 core::ErrorDTO map_cartesian_backend_failure(
     std::string_view planner_error, double fraction_completed,

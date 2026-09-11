@@ -975,25 +975,67 @@ template <typename T, typename Decode>
   for (const auto& [joint, limit] : v.per_joint_max_deceleration) {
     acceleration.emplace_back(arr({V(joint), coordinate_acceleration_value(limit)}));
   }
-  return arr({V(v.profile_id), enc(v.stop_mode),
-              opt(v.deceleration_time_s, [](const double item) { return V(item); }),
-              V(std::move(acceleration)), V(v.allow_natural_completion_on_short_path),
-              opt(v.recoverable_substitution_mode, [](const auto item) { return enc(item); }),
-              V(v.require_backend_confirmation),
-              opt(v.per_joint_settle_velocity_threshold,
-                  [](const auto& limits) {
-                    A rows;
-                    rows.reserve(limits.size());
-                    for (const auto& [joint, limit] : limits) {
-                      rows.emplace_back(arr({V(joint), coordinate_velocity_value(limit)}));
-                    }
-                    return V(std::move(rows));
-                  }),
-              structured_value(v.diagnostics)});
+  A fields{V(v.profile_id),
+           enc(v.stop_mode),
+           opt(v.deceleration_time_s, [](const double item) { return V(item); }),
+           V(std::move(acceleration)),
+           V(v.allow_natural_completion_on_short_path),
+           opt(v.recoverable_substitution_mode, [](const auto item) { return enc(item); }),
+           V(v.require_backend_confirmation),
+           opt(v.per_joint_settle_velocity_threshold,
+               [](const auto& limits) {
+                 A rows;
+                 rows.reserve(limits.size());
+                 for (const auto& [joint, limit] : limits) {
+                   rows.emplace_back(arr({V(joint), coordinate_velocity_value(limit)}));
+                 }
+                 return V(std::move(rows));
+               }),
+           structured_value(v.diagnostics)};
+  // Preserve the exact nine-field historical record. It is read-only history,
+  // not permission to prepare a new Stop with an implicit jerk policy.
+  if (v.jerk_limits_enabled) {
+    fields.emplace_back(*v.jerk_limits_enabled);
+    A limits;
+    for (const auto& [joint, limit] : v.per_joint_max_jerk) {
+      limits.emplace_back(arr({V(joint), std::visit(
+                                             [](const auto& typed) -> V {
+                                               if constexpr (requires { typed.value_rad_s3; })
+                                                 return arr({V(0.0), V(typed.value_rad_s3)});
+                                               else
+                                                 return arr({V(1.0), V(typed.value_m_s3)});
+                                             },
+                                             limit)}));
+    }
+    fields.emplace_back(std::move(limits));
+  } else if (!v.per_joint_max_jerk.empty()) {
+    bad("unreviewed Stop profile cannot carry new jerk limits");
+  }
+  return V(std::move(fields));
 }
 
 [[nodiscard]] MotionInterruptStopProfileDTO motion_profile_from(const V& v) {
-  const auto& f = exact(v, 9U, "motion interrupt Stop profile");
+  if (!v.is_array() || (v.as_array().size() != 9U && v.as_array().size() != 11U))
+    bad("motion interrupt Stop profile has the wrong structural arity");
+  const auto& f = v.as_array();
+  std::optional<bool> enabled;
+  std::map<std::string, CoordinateJerkDTO> jerk;
+  if (f.size() == 11U) {
+    enabled = boolean(f[9], "Stop jerk activation");
+    if (!f[10].is_array()) bad("per-joint jerk is not an array");
+    for (const auto& item : f[10].as_array()) {
+      const auto& row = exact(item, 2U, "per-joint jerk row");
+      const auto& coordinate = exact(row[1], 2U, "coordinate jerk");
+      const auto kind = u64(coordinate[0], "coordinate jerk kind");
+      if (kind > 1U) bad("coordinate jerk kind is invalid");
+      const double scalar = number(coordinate[1], "coordinate jerk");
+      if (!jerk.emplace(str(row[0], "joint name"), kind == 0U
+                                                       ? CoordinateJerkDTO{AngularJerkDTO{scalar}}
+                                                       : CoordinateJerkDTO{LinearJerkDTO{scalar}})
+               .second)
+        bad("per-joint jerk contains duplicate joints");
+    }
+  }
   if (!f[3].is_array()) bad("per-joint deceleration is not an array");
   std::map<std::string, CoordinateAccelerationDTO> acceleration;
   for (const auto& item : f[3].as_array()) {
@@ -1027,7 +1069,9 @@ template <typename T, typename Decode>
                                     }),
       boolean(f[6], "require backend confirmation"),
       std::move(settle),
-      structured_from(f[8])};
+      structured_from(f[8]),
+      enabled,
+      std::move(jerk)};
 }
 
 [[nodiscard]] V prepared_stage_value(const PreparedStopStageCommandDTO& v) {

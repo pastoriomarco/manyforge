@@ -4,6 +4,7 @@
 #include <exception>
 #include <limits>
 #include <manyforge_deployment/content_identity.hpp>
+#include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #include <memory>
 #include <utility>
 
@@ -88,8 +89,13 @@ template <typename Row, typename IdAccessor>
   return found == rows.end() ? nullptr : &*found;
 }
 
-void RequireNoObsoleteManagedCommandSurface(const RetainedBundle &predecessor,
-                                            const RetainedBundle &candidate) {
+std::vector<ObsoleteManagedCommandSurfaceEvidenceDTO>
+ObserveObsoleteManagedCommandSurfaces(
+    const RetainedBundle &predecessor, const RetainedBundle &candidate,
+    const deployment::IVerifiedRetainedProductArtifactSource *artifact_source,
+    const PersistedManagerApplyRuntimeStagedReady *staged_ready,
+    const core::ContentDigest &expected_staged_ready_digest) {
+  std::vector<ObsoleteManagedCommandSurfaceEvidenceDTO> result;
   const auto &predecessor_units = predecessor.value().cell_graph.runtime_units;
   const auto &candidate_units = candidate.value().cell_graph.runtime_units;
   const auto &predecessor_products =
@@ -114,12 +120,55 @@ void RequireNoObsoleteManagedCommandSurface(const RetainedBundle &predecessor,
                    return row.runtime_unit_id;
                  });
     if (candidate_unit == nullptr || predecessor_product == nullptr ||
-        candidate_product == nullptr || *candidate_unit != predecessor_unit ||
-        *candidate_product != *predecessor_product) {
+        candidate_product == nullptr) {
       Fail("obsolete or replaced managed runtime command surfaces require a "
            "qualified retirement adapter before selection");
     }
+    if (*candidate_unit == predecessor_unit &&
+        *candidate_product == *predecessor_product)
+      continue;
+    if (!artifact_source || !staged_ready ||
+        staged_ready->staged_ready_digest != expected_staged_ready_digest)
+      Fail("native command-surface retirement lacks exact candidate readiness");
+    const auto old = deployment::verify_runtime_unit_product(
+        predecessor, predecessor_unit.runtime_unit_id, *artifact_source);
+    const auto next = deployment::verify_runtime_unit_product(
+        candidate, candidate_unit->runtime_unit_id, *artifact_source);
+    constexpr auto native_adapter = deployment::
+        native_execution_runtime_contract::kProcessAdapterContractId;
+    if (!old || !next || old->process_adapter_contract_id() != native_adapter ||
+        next->process_adapter_contract_id() != native_adapter ||
+        old->product_contract_id() != next->product_contract_id() ||
+        old->product_contract_revision() != next->product_contract_revision())
+      Fail("runtime command-surface replacement has no qualified native "
+           "retirement contract");
+    if (old->product_identity() == next->product_identity() &&
+        old->configuration_identity() == next->configuration_identity())
+      continue;
+    const auto *observed =
+        FindById(staged_ready->staged_ready.runtime_units, runtime_id,
+                 [](const auto &row) -> const core::RuntimeUnitId & {
+                   return row.runtime_unit_id;
+                 });
+    if (!observed || !observed->valid() ||
+        observed->lifecycle_control !=
+            core::RuntimeLifecycleControl::kManagerManaged ||
+        observed->observed_product_identity != next->product_identity() ||
+        observed->observed_configuration_identity !=
+            next->configuration_identity())
+      Fail("native replacement readiness does not attest the exact candidate "
+           "product");
+    // This qualified adapter has one direct child per runtime unit and reaps
+    // its predecessor before starting a different product. The successor's
+    // source epoch therefore proves the old product is no longer selectable;
+    // it is not a fabricated final report from the retired process.
+    result.push_back(
+        {predecessor_unit.runtime_unit_id, observed->runtime_epoch,
+         old->product_identity(), old->configuration_identity(),
+         observed->source_report_sequence,
+         ObsoleteManagedCommandSurfaceDisposition::kNonselectable});
   }
+  return result;
 }
 
 [[nodiscard]] bool ExactPredecessorPublication(
@@ -295,10 +344,13 @@ ManagerSelectedBundleTransitionCoordinator::
         SqliteManagerApplyJournal &apply_journal,
         const deployment::IVerifiedRetainedBundleSource &retained_bundle_source,
         core::IActiveBundlePublicationStore &publication_store,
-        core::IManagerSceneProjectionHandoffPort &scene_owner)
+        core::IManagerSceneProjectionHandoffPort &scene_owner,
+        const deployment::IVerifiedRetainedProductArtifactSource
+            *artifact_source)
     : apply_journal_(apply_journal),
       retained_bundle_source_(retained_bundle_source),
-      publication_store_(publication_store), scene_owner_(scene_owner) {}
+      publication_store_(publication_store), scene_owner_(scene_owner),
+      artifact_source_(artifact_source) {}
 
 ManagerSelectedBundleTransitionResult
 ManagerSelectedBundleTransitionCoordinator::AdvanceOrRecover(
@@ -322,7 +374,12 @@ ManagerSelectedBundleTransitionCoordinator::AdvanceOrRecover(
                                    apply->intent.candidate_retained_bundle_id);
   VerifyBundleBindings(apply->intent, activated->scene_activated, *predecessor,
                        *candidate);
-  RequireNoObsoleteManagedCommandSurface(*predecessor, *candidate);
+  const auto staged_ready =
+      apply_journal_.ReadLatestRuntimeStagedReady(apply_id, apply_generation);
+  auto retired_surfaces = ObserveObsoleteManagedCommandSurfaces(
+      *predecessor, *candidate, artifact_source_,
+      staged_ready ? &*staged_ready : nullptr,
+      stage_intent->scene_stage_intent.runtime_staged_ready_digest);
 
   const auto canonical_bytes = candidate->canonical_bytes();
   if (canonical_bytes.empty() ||
@@ -353,7 +410,7 @@ ManagerSelectedBundleTransitionCoordinator::AdvanceOrRecover(
       materialization.record.private_materialization_content_digest,
       apply_id,
       apply_generation,
-      {},
+      std::move(retired_surfaces),
   });
 
   const auto &activation = activated->scene_activated.activation_result;

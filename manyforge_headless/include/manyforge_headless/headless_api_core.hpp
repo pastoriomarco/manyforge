@@ -228,7 +228,8 @@ public:
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   HistoryQueryPage(const HistorianQuery &query, bool full_records = false);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
-  HistoryDiscovery(const std::string &kind, const std::string &after, std::size_t limit);
+  HistoryDiscovery(const std::string &kind, const std::string &after,
+                   std::size_t limit);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   HistoryDetail(std::uint64_t sequence);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
@@ -246,16 +247,20 @@ public:
                            AlarmCallerAttribution caller);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   CommitProgramModelAttempt(manyforge::content_identity::CanonicalValue record);
-  [[nodiscard]] manyforge::content_identity::CanonicalValue RecordProgramDiagnostic(
-      manyforge::content_identity::CanonicalValue record);
-  [[nodiscard]] manyforge::content_identity::CanonicalValue RecordGripperConfirmation(
-      manyforge::content_identity::CanonicalValue record);
-  [[nodiscard]] manyforge::content_identity::CanonicalValue IngestOperationEvent(
-      std::string source_owner_epoch, std::uint64_t source_sequence, std::string record_kind,
-      std::optional<std::string> request_id, std::optional<std::string> operation_id,
-      std::optional<std::uint64_t> operation_revision, std::int64_t occurred_at_ns,
-      std::string occurred_at_wall, bool effect_pending,
-      manyforge::content_identity::CanonicalValue journal_payload, std::string payload_digest);
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
+  RecordProgramDiagnostic(manyforge::content_identity::CanonicalValue record);
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
+  RecordGripperConfirmation(manyforge::content_identity::CanonicalValue record);
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
+  IngestOperationEvent(
+      std::string source_owner_epoch, std::uint64_t source_sequence,
+      std::string record_kind, std::optional<std::string> request_id,
+      std::optional<std::string> operation_id,
+      std::optional<std::uint64_t> operation_revision,
+      std::int64_t occurred_at_ns, std::string occurred_at_wall,
+      bool effect_pending,
+      manyforge::content_identity::CanonicalValue journal_payload,
+      std::string payload_digest);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   CompleteOperationEventSnapshot(
       std::string source_owner_epoch, std::uint64_t through_source_sequence,
@@ -372,7 +377,7 @@ private:
   std::map<std::string, AlarmSubject> active_runtime_collisions_;
   std::set<std::string> observed_runtime_collisions_;
   std::map<std::string, AlarmSubject> active_stop_faults_;
-  std::set<std::string> observed_stop_faults_;
+  std::string current_stop_fault_fingerprint_;
   mutable std::mutex mutex_;
   std::uint64_t node_environment_generation_{};
   std::string previous_node_environment_digest_;

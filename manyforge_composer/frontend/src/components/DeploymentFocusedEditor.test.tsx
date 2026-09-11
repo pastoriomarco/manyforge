@@ -2,7 +2,9 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorkspace';
+import type { SourceModelProjection } from '../types/api';
 import { DeploymentFocusedEditor } from './DeploymentFocusedEditor';
+import { statusFixture } from '../testFixtures/robotControl';
 
 const digest = `sha256:${'1'.repeat(64)}`;
 
@@ -20,6 +22,8 @@ function controller(): DeploymentWorkspaceController {
           cell_id: 'cell-a',
           name: 'Cell A',
           graph: {
+            control_bindings: [{ control_binding_id: 'arm_binding', control_binding_revision: digest,
+              controllable_component_id: 'robot', command_target_id: 'arm', capability_id: 'execution.trajectory.execute' }],
             runtime_units: [{
               runtime_unit_id: 'robot.native_execution',
               configuration: {
@@ -53,12 +57,14 @@ function controller(): DeploymentWorkspaceController {
           },
           policies: {
             stop_stage_parameters: [{
+              control_binding_id: 'arm_binding', control_binding_revision: digest,
               stop_escalation_stage_id: 'motion_controlled_stop',
               provider_contract_ref: { provider_contract_role_id: 'stop_contract' },
               default_contract_parameters: {
                 stop_mode: 'soft_on_path',
                 deceleration_time_s: 1,
                 allow_natural_completion_on_short_path: true,
+                jerk_limits_enabled: true,
                 per_resource_limits: [{
                   resource_id: 'robot.arm.coordinate.000000',
                   max_deceleration: {
@@ -111,13 +117,121 @@ function controller(): DeploymentWorkspaceController {
 }
 
 describe('DeploymentFocusedEditor', () => {
+  it('selects the exact described target instead of borrowing the first target limits', () => {
+    const value = controller();
+    const document = value.workspace!.draft.document as unknown as {
+      graph: { runtime_units: Array<{ configuration: { motion_target_limits: unknown[] } }> };
+    };
+    document.graph.runtime_units[0].configuration.motion_target_limits.push({
+      controllable_component_id: 'robot-b', command_target_id: 'arm',
+      maximum_tcp_linear_speed_mps: 0.25,
+    });
+    const descriptor = statusFixture().directControl.targetDescriptor;
+    descriptor.controllableComponentId = 'robot-b';
+    const sourceModel = {
+      occurrences: [
+        { component_id: 'robot-b', model_instance_id: 'unrelated-tool',
+          source_robot_name: 'Unrelated tool', source_model_name: 'Wrong model', model_revision: digest },
+        { component_id: 'robot-b', model_instance_id: 'selected-arm',
+          source_robot_name: 'Selected robot', source_model_name: 'Selected arm', model_revision: digest },
+      ],
+      targets: [{ component_id: 'robot-b', target_id: 'arm',
+        model_groups: [{ model_instance_id: 'selected-arm', source_group_name: 'Selected group' }] }],
+    } as SourceModelProjection;
+    const markup = renderToStaticMarkup(<DeploymentFocusedEditor controller={value}
+      sourceModel={{ status: 'ready', data: sourceModel }} motionDescriptor={descriptor} gripperDescriptor={null} />);
+    expect(markup).toContain('aria-label="Motion limits target"');
+    expect(markup).toMatch(/<option[^>]*selected=""[^>]*>robot-b \/ arm<\/option>/);
+    expect(markup).toContain('value="0.25"');
+    expect(markup).not.toContain('value="0.15"');
+    expect(markup).toContain('aria-label="Source model joint limits"');
+    expect(markup).not.toContain('No current motion descriptor for this target.');
+    expect(markup).toContain('Selected robot');
+    expect(markup).toContain('Selected arm');
+    expect(markup).toContain('Selected group');
+    expect(markup).not.toContain('Unrelated tool');
+    expect(markup).not.toContain('Wrong model');
+  });
+
+  it('does not show another component model or joint caps for an undescribed target', () => {
+    const markup = renderToStaticMarkup(<DeploymentFocusedEditor controller={controller()}
+      sourceModel={{ status: 'loading' }}
+      motionDescriptor={statusFixture().directControl.targetDescriptor} gripperDescriptor={null} />);
+    expect(markup).toContain('No current motion descriptor for this target.');
+    expect(markup).not.toContain('aria-label="Source model joint limits"');
+    expect(markup).not.toContain('Robot Control joint caps');
+    expect(markup).not.toContain('aria-label="Motion limits target"');
+    expect(markup).toContain('value="0.15"');
+  });
+
+  it('distinguishes capability bindings and shows saved timing without inventing values for absent settings', () => {
+    const value = controller();
+    const document = value.workspace!.draft!.document as unknown as {
+      graph: { control_bindings: Array<Record<string, unknown>> };
+      policies: { stop_stage_parameters: Array<Record<string, unknown>>; stop_timing_parameters?: unknown[] };
+    };
+    document.graph.control_bindings.push({ ...document.graph.control_bindings[0],
+      control_binding_id: 'arm_contact', capability_id: 'execution.contact.geometric' });
+    document.policies.stop_stage_parameters.push({ ...document.policies.stop_stage_parameters[0], control_binding_id: 'arm_contact' });
+    const render = () => renderToStaticMarkup(<DeploymentFocusedEditor controller={value}
+      sourceModel={{ status: 'loading' }} motionDescriptor={null} gripperDescriptor={null} />);
+    let markup = render();
+    expect(markup).toContain('robot · arm · execution.trajectory.execute');
+    expect(markup).toContain('robot · arm · execution.contact.geometric');
+    expect(markup).toContain('Using qualified policy timings.');
+    expect(markup).not.toContain('value="0.25"');
+    document.policies.stop_timing_parameters = [{ control_binding_id: 'arm_binding',
+      control_binding_revision: digest, timing: { command_latency_allowance_ns: 250_000_000,
+        settling_allowance_ns: 750_000_000, operational_timeout_ns: 3_000_000_000 } }];
+    markup = render();
+    expect(markup).toContain('Command latency');
+    expect(markup).toContain('Settling allowance');
+    expect(markup).toContain('Stop timeout');
+    expect(markup).toContain('value="0.25"');
+    expect(markup).toContain('value="0.75"');
+    expect(markup).not.toContain('Using qualified policy timings.');
+  });
+
+  it.each([false, true])('shows Spring brake-and-return timing and the saved natural-completion choice (%s)', (natural) => {
+    const value = controller();
+    const document = value.workspace!.draft!.document as unknown as {
+      policies: { stop_stage_parameters: Array<{ default_contract_parameters: Record<string, unknown> }> };
+    };
+    const profile = document.policies.stop_stage_parameters[0].default_contract_parameters;
+    profile.stop_mode = 'spring_back_hold';
+    profile.allow_natural_completion_on_short_path = natural;
+    const markup = renderToStaticMarkup(<DeploymentFocusedEditor controller={value}
+      sourceModel={{ status: 'loading' }} motionDescriptor={null} gripperDescriptor={null} />);
+    expect(markup).toContain('Brake + return time');
+    expect(markup).toContain('Allow natural completion');
+    expect(markup).toContain('Off by default: brake and return');
+    expect(markup).toMatch(natural ? /type="checkbox"[^>]*checked/ : /type="checkbox"(?![^>]*checked)[^>]*>/);
+  });
+
+  it('keeps an older unreviewed Stop contract read-only', () => {
+    const value = controller();
+    const document = value.workspace!.draft!.document as unknown as {
+      policies: { stop_stage_parameters: Array<{ default_contract_parameters: Record<string, unknown> }> };
+    };
+    delete document.policies.stop_stage_parameters[0].default_contract_parameters.jerk_limits_enabled;
+    const markup = renderToStaticMarkup(<DeploymentFocusedEditor controller={value}
+      sourceModel={{ status: 'loading' }} motionDescriptor={null} gripperDescriptor={null} />);
+    expect(markup).toContain('older Stop contract needs explicit migration');
+    expect(markup).toMatch(/<select[^>]+aria-label="Controlled Stop jerk limits"[^>]+disabled/);
+    expect(markup).toMatch(/<button[^>]+disabled[^>]*>Update Controlled Stop Draft/);
+  });
+
   it('presents canonical target, native runtime, and normalized Stop inputs', () => {
     const markup = renderToStaticMarkup(
       <DeploymentFocusedEditor
         controller={controller()}
         sourceModel={{ status: 'loading' }}
         motionDescriptor={{
-          schemaVersion: 'manyforge.manual_control_motion_descriptor.v3',
+          schemaVersion: 'manyforge.manual_control_motion_descriptor.v4',
+          ordinaryJerk: { enabled: false, presetReferenceTimeS: 1, jointLimits: [{
+            sourceJointName: 'joint1', source: 'off', maximumRadS3: null,
+            presetRadS3: 12, imported: null,
+          }] },
           controllableComponentId: 'robot',
           commandTargetId: 'arm',
           componentRoleId: 'robot',
@@ -159,8 +273,17 @@ describe('DeploymentFocusedEditor', () => {
     expect(markup).toContain('Execution cadence');
     expect(markup).toContain('Initial joint state');
     expect(markup).toContain('Robot Control joint caps');
+    expect(markup).toMatch(/Maximum velocity<\/span>[\s\S]*?<input[^>]*max="2"/);
+    expect(markup).toMatch(/Maximum acceleration<\/span>[\s\S]*?<input[^>]*max="3"/);
+    expect(markup).toContain('Ordinary motion jerk');
+    expect(markup).toContain('Preset reference time');
+    expect(markup).toContain('Applied: off');
+    expect(markup).toContain('Preset: 12');
     expect(markup).toContain('Maximum acceleration');
     expect(markup).toContain('Controlled Stop');
+    expect(markup).toContain('Controlled Stop jerk limits');
+    expect(markup).toContain('Joint jerk limits');
+    expect(markup).toContain('ManyForge preset');
     expect(markup).toContain('Soft on path');
     expect(markup).toContain('Update Controlled Stop Draft');
     expect(markup).toContain('No current addressed gripper descriptor is available.');

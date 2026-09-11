@@ -43,6 +43,7 @@ from manyforge_behavior.production_ports import (
     NativeKernelProgramPort,
 )
 from manyforge_behavior.program_run_owner import (
+    PROGRAM_RESET_STOP_REASON,
     ProgramRunOwner,
     ProgramRunOwnerError,
     ProgramRunOwnerOutcomeUnknownError,
@@ -57,6 +58,7 @@ from manyforge_behavior.program_scheduling import (
 )
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
 from manyforge_headless_api.models import (
+    ManualProgramHandover,
     ProgramRunStartRequest,
     ProgramRunStopRequest,
     ProgramScenePreparationRequest,
@@ -86,6 +88,7 @@ from .models import (
     ProgramNodeAvailabilityRequest,
     ProgramSelectionStopRequest,
     ProgramSelectionResumeRequest,
+    ProgramManualHandoverRequest,
     RuntimeBlackboardWriteRequest,
     RuntimeOverrideActionRequest,
     RuntimeOverridePromotionRequest,
@@ -144,7 +147,9 @@ class ProgramRunnerConfig:
             or bool(parsed.query)
             or bool(parsed.fragment)
         ):
-            raise ValueError("headless_url must be an absolute credential-free HTTP(S) URL")
+            raise ValueError(
+                "headless_url must be an absolute credential-free HTTP(S) URL"
+            )
         for field_name in ("owner_id",):
             value = getattr(self, field_name)
             if (
@@ -177,11 +182,16 @@ class ProgramRunnerConfig:
                 raise ValueError(f"{field_name} must be in [1, 4096]")
         enabled = self.execution_run_root is not None
         if enabled != (self.cycle_journal_path is not None):
-            raise ValueError("execution run root and cycle journal must be configured together")
+            raise ValueError(
+                "execution run root and cycle journal must be configured together"
+            )
         if enabled and (
-            not self.execution_run_root.is_absolute() or not self.cycle_journal_path.is_absolute()
+            not self.execution_run_root.is_absolute()
+            or not self.cycle_journal_path.is_absolute()
         ):
-            raise ValueError("execution run root and cycle journal must be stable absolute paths")
+            raise ValueError(
+                "execution run root and cycle journal must be stable absolute paths"
+            )
         if enabled:
             try:
                 execution_run_root = self.execution_run_root.resolve(strict=False)
@@ -194,7 +204,9 @@ class ProgramRunnerConfig:
                 cycle_journal_path == execution_run_root
                 or execution_run_root in cycle_journal_path.parents
             ):
-                raise ValueError("cycle journal must be outside disposable execution run storage")
+                raise ValueError(
+                    "cycle journal must be outside disposable execution run storage"
+                )
         liveness_enabled = self.manager_liveness_socket is not None
         if liveness_enabled != (self.cell_id is not None):
             raise ValueError(
@@ -277,7 +289,9 @@ class ProgramRuntime:
         )
         if execution_transport is None:
             if config.execution_run_root is None:
-                raise ValueError("Program runtime requires the private execution run root")
+                raise ValueError(
+                    "Program runtime requires the private execution run root"
+                )
             execution_transport = ProgramRunnerExecutionTransport(
                 config.execution_run_root,
                 timeout_seconds=min(config.headless_timeout_seconds, 30.0),
@@ -300,17 +314,22 @@ class ProgramRuntime:
                 "unbind",
             )
         ):
-            raise TypeError("simulation_control must implement task, context, and close ports")
+            raise TypeError(
+                "simulation_control must implement task, context, and close ports"
+            )
         self._simulation_control = simulation_control
         self._environment = build_node_environment()
         self._native = NativeKernelProgramPort(
             self._kernel,
             current_owner_epoch=self._current_kernel_owner_epoch,
         )
-        self._scene = HeadlessSceneProgramPort(self._headless)
+        self._scene = HeadlessSceneProgramPort(
+            self._headless, program_node_evidence=self._program_node_admission_evidence
+        )
         self._cclc = CCLCProgramTaskPort(
             self._headless,
             maximum_retained_tasks=config.maximum_retained_runs,
+            program_node_evidence=self._program_node_admission_evidence,
         )
         self._assistant = (
             None
@@ -461,9 +480,13 @@ class ProgramRuntime:
             del evidence_digest
             retained = journal.liveness()
             cycle = journal.read()
-            liveness_status = None if self._liveness is None else self._liveness.status()
+            liveness_status = (
+                None if self._liveness is None else self._liveness.status()
+            )
             fault_reference = (
-                None if liveness_status is None else liveness_status.get("fault_reference")
+                None
+                if liveness_status is None
+                else liveness_status.get("fault_reference")
             )
             if (
                 cycle.reconciliation_required
@@ -476,10 +499,16 @@ class ProgramRuntime:
                     fault_reference=fault_reference,
                 )
                 cycle = journal.read()
-            if not retained.expired and isinstance(fault_reference, str) and fault_reference:
+            if (
+                not retained.expired
+                and isinstance(fault_reference, str)
+                and fault_reference
+            ):
                 cycle = journal.read()
                 journal.retain_liveness_loss(
-                    manager_runtime_epoch=(retained.manager_runtime_epoch or "unknown-manager"),
+                    manager_runtime_epoch=(
+                        retained.manager_runtime_epoch or "unknown-manager"
+                    ),
                     manager_owner_epoch=retained.manager_owner_epoch,
                     fault_reference=fault_reference,
                     expected_generation=cycle.cycle_generation,
@@ -497,7 +526,9 @@ class ProgramRuntime:
                 cycle.state == "terminal_awaiting_reset" or contained_reset_recovery
             )
             if cycle.state != "idle_after_reset" and not contained_owner_state:
-                raise RuntimeError("active Program cycle is not contained for reconciliation")
+                raise RuntimeError(
+                    "active Program cycle is not contained for reconciliation"
+                )
             if cycle.acquisition_pending is not None:
                 raise RuntimeError("unknown Program-cycle acquisition is unresolved")
 
@@ -522,7 +553,8 @@ class ProgramRuntime:
             program_owners = [
                 owner
                 for owner in owners
-                if isinstance(owner, dict) and owner.get("owner_role") == "program_runner"
+                if isinstance(owner, dict)
+                and owner.get("owner_role") == "program_runner"
             ]
             held_program_claims = [
                 claim
@@ -590,8 +622,13 @@ class ProgramRuntime:
                     or cycle.claim is not None
                     or (cycle.state != "idle_after_reset" and not claimless_contained)
                 ):
-                    raise RuntimeError("absent Program Runner owner is not a clean bootstrap")
-                if cycle.owner_epoch != self.owner_epoch or cycle.reconciliation_required:
+                    raise RuntimeError(
+                        "absent Program Runner owner is not a clean bootstrap"
+                    )
+                if (
+                    cycle.owner_epoch != self.owner_epoch
+                    or cycle.reconciliation_required
+                ):
                     journal.reconcile_liveness(
                         owner_epoch=self.owner_epoch,
                         evidence_digest=current_reconciliation_digest,
@@ -601,7 +638,10 @@ class ProgramRuntime:
             elif len(program_owners) != 1:
                 raise RuntimeError("Kernel Program Runner owner is not exact")
             elif program_owners[0].get("owner_epoch") == self.owner_epoch:
-                if cycle.owner_epoch != self.owner_epoch or cycle.reconciliation_required:
+                if (
+                    cycle.owner_epoch != self.owner_epoch
+                    or cycle.reconciliation_required
+                ):
                     if contained_owner_state:
                         intent = require_terminal_evidence()
                         if cycle.release_intent is not None:
@@ -609,16 +649,21 @@ class ProgramRuntime:
                                 held_program_claims
                                 or receipt.get("status") != "released_exact"
                                 or receipt.get("matched_claim") != cycle.claim
-                                or receipt.get("matched_release") != cycle.release_intent
+                                or receipt.get("matched_release")
+                                != cycle.release_intent
                             ):
-                                raise RuntimeError("terminal Program-cycle release is not exact")
+                                raise RuntimeError(
+                                    "terminal Program-cycle release is not exact"
+                                )
                         elif intent.get("owner_epoch") == self.owner_epoch:
                             if (
                                 held_program_claims != [cycle.claim]
                                 or receipt.get("status") != "held_exact"
                                 or receipt.get("matched_claim") != cycle.claim
                             ):
-                                raise RuntimeError("terminal Program-cycle claim is not exact")
+                                raise RuntimeError(
+                                    "terminal Program-cycle claim is not exact"
+                                )
                         elif not (
                             reconciled_receipt_is_exact(self.owner_epoch)
                             or (
@@ -629,7 +674,8 @@ class ProgramRuntime:
                             )
                         ):
                             raise RuntimeError(
-                                "terminal Program-cycle reconciliation settlement " "is not exact"
+                                "terminal Program-cycle reconciliation settlement "
+                                "is not exact"
                             )
                     journal.reconcile_liveness(
                         owner_epoch=self.owner_epoch,
@@ -640,7 +686,9 @@ class ProgramRuntime:
             else:
                 predecessor = program_owners[0].get("owner_epoch")
                 if not isinstance(predecessor, str) or not predecessor:
-                    raise RuntimeError("predecessor Program Runner ownership is unresolved")
+                    raise RuntimeError(
+                        "predecessor Program Runner ownership is unresolved"
+                    )
                 if contained_owner_state:
                     intent = require_terminal_evidence()
                     if cycle.release_intent is not None:
@@ -650,7 +698,9 @@ class ProgramRuntime:
                             or receipt.get("matched_claim") != cycle.claim
                             or receipt.get("matched_release") != cycle.release_intent
                         ):
-                            raise RuntimeError("terminal predecessor release is not exact")
+                            raise RuntimeError(
+                                "terminal predecessor release is not exact"
+                            )
                     elif held_program_claims:
                         if (
                             held_program_claims != [cycle.claim]
@@ -658,7 +708,9 @@ class ProgramRuntime:
                             or receipt.get("matched_claim") != cycle.claim
                             or intent.get("owner_epoch") != predecessor
                         ):
-                            raise RuntimeError("terminal predecessor claim is not exact")
+                            raise RuntimeError(
+                                "terminal predecessor claim is not exact"
+                            )
                     else:
                         predecessor_digest = (
                             cell_admission_owner_epoch_reconciliation_evidence_digest(
@@ -670,13 +722,17 @@ class ProgramRuntime:
                             and intent.get("owner_epoch") != predecessor
                             and (
                                 cycle.reconciliation_required
-                                or cycle.reconciliation_evidence_digest == predecessor_digest
+                                or cycle.reconciliation_evidence_digest
+                                == predecessor_digest
                             )
                         )
                         if not local_predecessor_is_exact or not (
-                            reconciled_receipt_is_exact(predecessor) or unknown_receipt_is_exact()
+                            reconciled_receipt_is_exact(predecessor)
+                            or unknown_receipt_is_exact()
                         ):
-                            raise RuntimeError("terminal predecessor settlement is not exact")
+                            raise RuntimeError(
+                                "terminal predecessor settlement is not exact"
+                            )
                 elif cycle.claim is not None or held_program_claims:
                     raise RuntimeError("idle predecessor retains a Program-cycle claim")
                 journal.prepare_liveness_reconciliation(
@@ -701,7 +757,9 @@ class ProgramRuntime:
                         "kernel_owner_epoch": receipt["kernel_owner_epoch"],
                         "retained_claims": held,
                         "current_owner_epochs": successor_owners,
-                        "reconciliation_evidence_digest": (current_reconciliation_digest),
+                        "reconciliation_evidence_digest": (
+                            current_reconciliation_digest
+                        ),
                     }
                 )
                 # The Kernel is authoritative.  Rotate it first, then catch
@@ -734,7 +792,9 @@ class ProgramRuntime:
                 retained = journal.liveness()
                 if cycle is not None:
                     journal.retain_liveness_loss(
-                        manager_runtime_epoch=(retained.manager_runtime_epoch or "unknown-manager"),
+                        manager_runtime_epoch=(
+                            retained.manager_runtime_epoch or "unknown-manager"
+                        ),
                         manager_owner_epoch=retained.manager_owner_epoch,
                         fault_reference=fault_reference,
                         expected_generation=cycle.cycle_generation,
@@ -757,7 +817,9 @@ class ProgramRuntime:
                         active_only=True,
                         limit=self.config.maximum_retained_runs,
                     )
-                    run_ids.extend(snapshot.capture.program_run_id for snapshot in snapshots)
+                    run_ids.extend(
+                        snapshot.capture.program_run_id for snapshot in snapshots
+                    )
                 except Exception:
                     pass
             for program_run_id in dict.fromkeys(run_ids):
@@ -807,7 +869,10 @@ class ProgramRuntime:
         if not isinstance(retained, Mapping):
             return False
         capture = retained.get("capture")
-        if not isinstance(capture, Mapping) or capture.get("program_run_id") != program_run_id:
+        if (
+            not isinstance(capture, Mapping)
+            or capture.get("program_run_id") != program_run_id
+        ):
             return False
         state = retained.get("state")
         if state in {"stopped", "succeeded", "failed"}:
@@ -852,7 +917,9 @@ class ProgramRuntime:
                 "state": "stopped",
                 "tree_status": "invalid",
                 "node_status_revision": (
-                    node_revision + 1 if dict(statuses) != stopped_statuses else node_revision
+                    node_revision + 1
+                    if dict(statuses) != stopped_statuses
+                    else node_revision
                 ),
                 "node_statuses": stopped_statuses,
                 "active_operation_count": 0,
@@ -863,7 +930,8 @@ class ProgramRuntime:
         self._record_terminal_snapshot(terminal)
         cycle = journal.read()
         return bool(
-            cycle.state == "terminal_awaiting_reset" and cycle.program_run_id == program_run_id
+            cycle.state == "terminal_awaiting_reset"
+            and cycle.program_run_id == program_run_id
         )
 
     def _build_owner_availability(self) -> dict[str, AvailabilityFact]:
@@ -978,6 +1046,30 @@ class ProgramRuntime:
             )
         return self._admission, self._journal
 
+    def _program_node_admission_evidence(
+        self, identity: Any, owner_api: str
+    ) -> dict[str, Any]:
+        _admission, journal = self._require_cycle_owner()
+        cycle = journal.read()
+        if (
+            cycle.owner_epoch != self.owner_epoch
+            or cycle.program_run_id != identity.program_run_id
+            or cycle.state != "running"
+            or cycle.claim is None
+        ):
+            raise ProgramRunnerError(
+                "program_node_parent_not_current",
+                "Node transaction has no current running Program claim",
+            )
+        return {
+            "program_runner_owner_epoch": cycle.owner_epoch,
+            "program_run_id": cycle.program_run_id,
+            "parent_program_cycle_claim_generation": cycle.claim["claim_generation"],
+            "node_instance_id": identity.node_instance_id,
+            "node_attempt_id": identity.node_attempt_id,
+            "owner_api": owner_api,
+        }
+
     def _current_kernel_owner_epoch(self) -> str:
         """Read the stable Kernel identity without requiring a robot product."""
 
@@ -1018,7 +1110,8 @@ class ProgramRuntime:
         failed_phase = cycle.failure.get("failed_phase")
         if (
             (allow_reconciliation or not cycle.reconciliation_required)
-            and cycle.reset_phase in {"stopping", "settling", "restoring_scene", "releasing"}
+            and cycle.reset_phase
+            in {"stopping", "settling", "restoring_scene", "releasing"}
             and failed_phase == cycle.reset_phase
             and isinstance(failure_code, str)
             and failure_code
@@ -1045,6 +1138,148 @@ class ProgramRuntime:
             cycle,
             allow_reconciliation=False,
         )
+
+    def _current_cycle_recovery_stop(self, cycle: Any) -> bool:
+        """Contain current-owner work without claiming uncertainty resolved."""
+        claim = cycle.claim
+        intent = claim.get("intent") if isinstance(claim, Mapping) else None
+        return bool(
+            cycle.state == "recovery_required"
+            and cycle.owner_epoch == self.owner_epoch
+            and isinstance(cycle.program_run_id, str)
+            and bool(cycle.program_run_id)
+            and isinstance(intent, Mapping)
+            and intent.get("owner_role") == "program_runner"
+            and intent.get("claim_kind") == "program_cycle"
+            and intent.get("owner_epoch") == self.owner_epoch
+            and intent.get("owner_transaction_id") == cycle.program_run_id
+            and type(claim.get("claim_generation")) is int
+            and 1 <= claim["claim_generation"] <= 9_007_199_254_740_991
+            and cycle.acquisition_pending is None
+            and cycle.reset_phase is None
+            and cycle.release_intent is None
+        )
+
+    def _current_cycle_recovery_reset(self, cycle: Any, pending=None) -> bool:
+        """Recognize only retained, current-owner command uncertainty."""
+        claim = cycle.claim
+        intent = claim.get("intent") if isinstance(claim, Mapping) else None
+        if not (
+            cycle.reconciliation_required
+            and cycle.state in {"recovery_required", "terminal_awaiting_reset"}
+            and cycle.owner_epoch == self.owner_epoch
+            and cycle.program_run_id
+            and cycle.reset_phase in {None, "stopping", "settling"}
+            and cycle.start_settlement is None
+            and cycle.acquisition_pending is None
+            and cycle.release_intent is None
+            and isinstance(intent, Mapping)
+            and intent.get("owner_role") == "program_runner"
+            and intent.get("claim_kind") == "program_cycle"
+            and intent.get("owner_epoch") == self.owner_epoch
+            and intent.get("owner_transaction_id") == cycle.program_run_id
+            and type(claim.get("claim_generation")) is int
+            and 1 <= claim["claim_generation"] <= 9_007_199_254_740_991
+        ):
+            return False
+        journal = self._require_cycle_owner()[1]
+        if journal.liveness().expired:
+            return False
+        rows = journal.pending_commands() if pending is None else pending
+        resets = [row for row in rows if row["kind"] == "reset"]
+        if not rows or len(resets) > 1:
+            return False
+        for row in rows:
+            command = row["intent"]
+            if (
+                row["cycle_generation"] != cycle.cycle_generation
+                or command.get("expected_owner_epoch") != self.owner_epoch
+            ):
+                return False
+            if row["kind"] in {
+                "resume_motion",
+                "resume_full_stop",
+                "prepare_manual_handover",
+                "reset",
+            }:
+                if command.get("program_run_id") != cycle.program_run_id:
+                    return False
+                if row["kind"] == "reset" and (
+                    command.get("expected_cycle_generation") != cycle.cycle_generation
+                    or command.get("expected_claim_generation")
+                    != claim["claim_generation"]
+                ):
+                    return False
+            elif row["kind"] == "recovery_action":
+                if command.get("action_id") == "reset_cycle" and len(resets) == 1:
+                    # The existing stopped-motion Reset offer creates this
+                    # exact nested Reset. It is not arbitrary owner recovery.
+                    nested_id = self._digest(
+                        {
+                            "kind": "operator_stop_reset_cycle",
+                            "request_owner_epoch": row["request_owner_epoch"],
+                            "request_id": row["request_id"],
+                            "program_run_id": cycle.program_run_id,
+                        }
+                    )
+                    if (resets[0]["request_id"], resets[0]["request_owner_epoch"]) != (
+                        nested_id,
+                        row["request_owner_epoch"],
+                    ):
+                        return False
+                elif command.get("action_id") != "replan_from_stopped_state":
+                    return False
+            else:
+                return False
+        return True
+
+    def _prove_reset_recovery(self, cycle, *, kernel_owner_epoch: str) -> None:
+        """Join current terminal/tree and exact Kernel-held parent/children."""
+        admission, journal = self._require_cycle_owner()
+        terminal = self._project_run(self._owner.read(cycle.program_run_id).to_dict())
+        claim = cycle.claim
+        if (
+            terminal.get("owner_epoch") != self.owner_epoch
+            or terminal.get("active_operation_count") != 0
+            or not self._cycle_terminal_evidence_is_exact(journal, cycle)
+            or terminal != journal.read_run_snapshot(cycle.program_run_id)
+        ):
+            raise RuntimeError("Reset has no exact current terminal Run")
+        receipt = admission.recovery_receipt(
+            {
+                "intent": claim["intent"],
+                "expected_claim": claim,
+                "expected_release": None,
+            }
+        )
+        program_owners = [
+            owner
+            for owner in receipt.get("current_owner_epochs", [])
+            if owner.get("owner_role") == "program_runner"
+        ]
+        held = receipt.get("held_claims")
+        if not (
+            receipt.get("kernel_owner_epoch") == kernel_owner_epoch
+            and receipt.get("status") == "held_exact"
+            and receipt.get("matched_claim") == claim
+            and receipt.get("matched_release") is None
+            and receipt.get("matched_reconcile_settlement") is None
+            and program_owners
+            == [{"owner_role": "program_runner", "owner_epoch": self.owner_epoch}]
+            and isinstance(held, list)
+            and held.count(claim) == 1
+        ):
+            raise RuntimeError("Reset parent claim/Kernel owner is not exact")
+        for child in held:
+            child_intent = child.get("intent", {})
+            for key in ("program_node_evidence", "intervention_evidence"):
+                evidence = child_intent.get(key)
+                if (
+                    isinstance(evidence, Mapping)
+                    and evidence.get("parent_program_cycle_claim_generation")
+                    == claim["claim_generation"]
+                ):
+                    raise RuntimeError("Reset still has an unsettled child transaction")
 
     def _cycle_status_core(self) -> dict[str, Any]:
         """Return the closed, dependency-free Manager liveness projection."""
@@ -1084,18 +1319,21 @@ class ProgramRuntime:
             "program_run_id": cycle.program_run_id,
         }
         reset_retry_phase = self._reset_retry_phase(cycle)
+        recovery_stop = self._current_cycle_recovery_stop(cycle)
+        recovery_reset = self._current_cycle_recovery_reset(cycle)
         allowed_by_state = {
             "program_run": cycle.state == "idle_after_reset",
             "program_motion_stop": cycle.state in {"starting", "running"},
             "program_motion_resume": cycle.state == "running",
             "program_full_stop": cycle.state in {"starting", "running"},
-            "program_stop": cycle.state in {"starting", "running"},
+            "program_stop": cycle.state in {"starting", "running"} or recovery_stop,
             "program_reset": cycle.state
             in {
                 "running",
                 "terminal_awaiting_reset",
             }
-            or reset_retry_phase is not None,
+            or reset_retry_phase is not None
+            or recovery_reset,
             # The dependency-free liveness projection cannot inspect the
             # retained Program tree. The complete cycle_status() projection
             # enables these only after proving the tree is Full-stopped.
@@ -1107,6 +1345,9 @@ class ProgramRuntime:
             "program_runtime_override_promote": cycle.state == "running",
             "program_runtime_blackboard_write": cycle.state == "running",
             "program_manual_result_stage": cycle.state == "running",
+            # Only the Kernel-selected held tasks may be retired; the owner
+            # rechecks the exact capture and keeps all Program holds intact.
+            "program_manual_handover": cycle.state == "running",
             # Evidence input remains available while a Program waits for it.
             # The native owner decides exact command/source/CAS eligibility.
             "gripper_confirm": cycle.state
@@ -1115,12 +1356,15 @@ class ProgramRuntime:
                 "running",
                 "terminal_awaiting_reset",
             },
-            "operation_start": cycle.state == "idle_after_reset",
+            # These are coarse lifecycle prerequisites, not target permission.
+            # During a Program, shared ingress requires exact native manual
+            # identity/context; the Kernel retains final admission authority.
+            "operation_start": cycle.state in {"idle_after_reset", "running"},
             "operation_stop": cycle.state != "resetting",
-            "operation_pause": cycle.state == "idle_after_reset",
-            "operation_resume": cycle.state == "idle_after_reset",
-            "operation_reset": cycle.state == "idle_after_reset",
-            "operation_acknowledge_completed": (cycle.state == "idle_after_reset"),
+            "operation_pause": cycle.state in {"idle_after_reset", "running"},
+            "operation_resume": cycle.state in {"idle_after_reset", "running"},
+            "operation_reset": cycle.state != "starting",
+            "operation_acknowledge_completed": cycle.state != "starting",
             "pick_sequence_start": cycle.state == "idle_after_reset",
             "place_sequence_start": cycle.state == "idle_after_reset",
             "cell_full_stop": True,
@@ -1139,8 +1383,16 @@ class ProgramRuntime:
                     "cell_full_stop",
                     "execution_recovery",
                     "stop_recovery",
+                    # Exact native manual retirement is needed to release an
+                    # unresolved child before Program recovery can complete.
+                    "operation_reset",
+                    "operation_acknowledge_completed",
                 }
-                or (kind == "program_reset" and reset_retry_phase is not None)
+                or (
+                    kind == "program_reset"
+                    and (reset_retry_phase is not None or recovery_reset)
+                )
+                or (kind == "program_stop" and recovery_stop)
                 for kind in allowed_by_state
             }
         allowed_commands = [
@@ -1185,23 +1437,42 @@ class ProgramRuntime:
     def cycle_status(self) -> dict[str, Any]:
         result = self._cycle_status_core()
         program_run_id = result["program_run_id"]
+        controls = (
+            None if program_run_id is None else self._optional_controls(program_run_id)
+        )
+        recovery_offer = self._recovery_offer(
+            program_run_id,
+            cycle_generation=result["cycle_generation"],
+        )
         run = None
+        selections = None
         if program_run_id is not None:
             try:
-                run = self.read_run(program_run_id)
+                if controls is None:
+                    run = self.read_run(program_run_id)
+                else:
+                    live, selections = self._owner.read_selection_controls(
+                        program_run_id
+                    )
+                    run = self._project_run(live.to_dict())
+            except ProgramRunOwnerError:
+                # Retired runs have a journal snapshot but no live controls.
+                try:
+                    run = self.read_run(program_run_id)
+                except ProgramRunnerError:
+                    run = None
             except (KeyError, ProgramRunnerError):
                 # The cycle journal deliberately outlives an in-memory run.
                 # Revision hints are nullable and must not make an otherwise
                 # valid terminal/reconciliation cycle unreadable.
                 run = None
         result["run_revision"] = None if run is None else run["run_revision"]
-        result["node_status_revision"] = None if run is None else run["node_status_revision"]
-        controls = None if program_run_id is None else self._optional_controls(program_run_id)
-        recovery_offer = self._recovery_offer(
-            program_run_id,
-            cycle_generation=result["cycle_generation"],
+        result["node_status_revision"] = (
+            None if run is None else run["node_status_revision"]
         )
-        result["runtime_control_revision"] = None if controls is None else controls.revision
+        result["runtime_control_revision"] = (
+            None if controls is None else controls.revision
+        )
         result["recovery_offer"] = recovery_offer
         # This is the single shared browser observation. Publishing the exact
         # projections here prevents every connected browser from re-reading
@@ -1209,12 +1480,13 @@ class ProgramRuntime:
         result["run"] = run
         result["runtime_controls"] = (
             None
-            if run is None or controls is None or program_run_id is None
+            if run is None or controls is None or selections is None
             else self._runtime_controls_projection(
                 program_run_id,
                 live=run,
                 controls=controls,
                 recovery_offer=recovery_offer,
+                execution_selections=selections,
             )
         )
         # Refine Program-tree-dependent availability in the complete owner
@@ -1224,7 +1496,8 @@ class ProgramRuntime:
         run_state = None if run is None else run.get("state")
         cycle_running = result["state"] == "running"
         base_permissions = {
-            command["command_kind"]: command["allowed"] for command in result["allowed_commands"]
+            command["command_kind"]: command["allowed"]
+            for command in result["allowed_commands"]
         }
         reconciliation_fenced = any(
             command["disabled_reason"] == "program_cycle_reconciliation_required"
@@ -1232,11 +1505,21 @@ class ProgramRuntime:
         )
 
         def run_allows(kind: str, *states: str) -> bool:
-            return bool(base_permissions.get(kind, False) and cycle_running and run_state in states)
+            return bool(
+                base_permissions.get(kind, False)
+                and cycle_running
+                and run_state in states
+            )
 
         stoppable = ("running", "intervention_required")
         exact_run_permissions = {
             "program_motion_resume": run_allows("program_motion_resume", *stoppable),
+            # A nominal held Stop may retain an interrupted task awaiting
+            # cleanup. Its intervention state must not prevent that cleanup;
+            # the exact Kernel proof still rejects faulted or unsettled work.
+            "program_manual_handover": run_allows(
+                "program_manual_handover", *stoppable
+            ),
             "program_motion_stop": run_allows("program_motion_stop", *stoppable),
             "program_full_stop": run_allows("program_full_stop", *stoppable),
             # Starting has no retained Program tree yet, so its authoritative
@@ -1247,17 +1530,26 @@ class ProgramRuntime:
                 result["state"] == "starting"
                 or cycle_running
                 and run_state in {"running", "intervention_required", "full_stopping"}
+                or result["state"] == "recovery_required"
+                and selections is not None
+                and run_state
+                in {"running", "intervention_required", "full_stopping", "full_stopped"}
             ),
             "program_reset": base_permissions.get("program_reset", False)
+            and (not reconciliation_fenced or selections is not None)
             and (
                 not cycle_running
                 or run_state in {"running", "intervention_required", "full_stopped"}
             ),
             "program_resume_full_stop": (
-                not reconciliation_fenced and cycle_running and run_state == "full_stopped"
+                not reconciliation_fenced
+                and cycle_running
+                and run_state == "full_stopped"
             ),
             "program_discard_full_stop": (
-                not reconciliation_fenced and cycle_running and run_state == "full_stopped"
+                not reconciliation_fenced
+                and cycle_running
+                and run_state == "full_stopped"
             ),
             **{
                 kind: run_allows(kind, "running")
@@ -1362,7 +1654,9 @@ class ProgramRuntime:
             live = self._owner.read(program_run_id)
         except ProgramRunOwnerError:
             return None
-        policy = live.capture.node_policy_by_instance_id.get(intervention.identity.node_instance_id)
+        policy = live.capture.node_policy_by_instance_id.get(
+            intervention.identity.node_instance_id
+        )
         selection_revision = None
         if intervention.policy_parameter == "operator_stop_policy":
             if selection_scope is None:
@@ -1402,7 +1696,9 @@ class ProgramRuntime:
             "source_owner_generation": None,
         }
 
-    def _runtime_override_observation_candidate(self, program_run_id: str) -> dict[str, Any]:
+    def _runtime_override_observation_candidate(
+        self, program_run_id: str
+    ) -> dict[str, Any]:
         """Project one exact owner-derived Robot snapshot staging candidate."""
 
         try:
@@ -1445,7 +1741,10 @@ class ProgramRuntime:
             return self._runtime_override_candidate_unavailable(
                 program_run_id,
                 reason_code="robot_snapshot_override_not_supported",
-                reason=("The held node does not accept an absolute Robot snapshot " "as its goal."),
+                reason=(
+                    "The held node does not accept an absolute Robot snapshot "
+                    "as its goal."
+                ),
                 node_instance_id=node_instance_id,
                 node_attempt_id=node_attempt_id,
                 node_id=node_id,
@@ -1466,7 +1765,9 @@ class ProgramRuntime:
         control = control_projection.get("control_state")
         identity = targets_projection.get("identity")
         direct = targets.get("direct_control") if isinstance(targets, Mapping) else None
-        observed = control.get("observed_motion") if isinstance(control, Mapping) else None
+        observed = (
+            control.get("observed_motion") if isinstance(control, Mapping) else None
+        )
         capture = live.capture
         if (
             targets_projection.get("ok") is not True
@@ -1530,7 +1831,9 @@ class ProgramRuntime:
             pose = observed.get("current_tcp_pose")
             position = pose.get("position_m") if isinstance(pose, Mapping) else None
             orientation = pose.get("orientation") if isinstance(pose, Mapping) else None
-            if not isinstance(position, Mapping) or not isinstance(orientation, Mapping):
+            if not isinstance(position, Mapping) or not isinstance(
+                orientation, Mapping
+            ):
                 return self._runtime_override_candidate_unavailable(
                     program_run_id,
                     reason_code="robot_observation_value_invalid",
@@ -1541,7 +1844,9 @@ class ProgramRuntime:
                 )
             try:
                 position_value = [position[field] for field in ("x_m", "y_m", "z_m")]
-                orientation_value = [orientation[field] for field in ("x", "y", "z", "w")]
+                orientation_value = [
+                    orientation[field] for field in ("x", "y", "z", "w")
+                ]
             except KeyError:
                 return self._runtime_override_candidate_unavailable(
                     program_run_id,
@@ -1613,7 +1918,9 @@ class ProgramRuntime:
     ) -> dict[str, int]:
         source = applied.get("source")
         status = execution.get("identity")
-        scene_revision = status.get("scene_revision") if isinstance(status, Mapping) else None
+        scene_revision = (
+            status.get("scene_revision") if isinstance(status, Mapping) else None
+        )
         if (
             execution.get("ok") is not True
             or not isinstance(source, Mapping)
@@ -1658,7 +1965,9 @@ class ProgramRuntime:
             return
         if current.claim is None:
             if current.state != "stopping" or not isinstance(scene_proof, Mapping):
-                journal.require_reconciliation(expected_generation=current.cycle_generation)
+                journal.require_reconciliation(
+                    expected_generation=current.cycle_generation
+                )
                 return
             settlement = {
                 "schema_version": "manyforge.program_cycle_start_settlement.v1",
@@ -1691,9 +2000,13 @@ class ProgramRuntime:
         terminal_snapshot: dict[str, Any] | None = None
         if started_snapshot is not None:
             capture = started_snapshot.get("capture")
-            started_run_id = capture.get("program_run_id") if isinstance(capture, Mapping) else None
+            started_run_id = (
+                capture.get("program_run_id") if isinstance(capture, Mapping) else None
+            )
             if not isinstance(started_run_id, str) or not started_run_id:
-                journal.require_reconciliation(expected_generation=current.cycle_generation)
+                journal.require_reconciliation(
+                    expected_generation=current.cycle_generation
+                )
                 return
             try:
                 stopped = self._host.stop_run(
@@ -1701,10 +2014,14 @@ class ProgramRuntime:
                     reason="Program Start settlement failed",
                 ).to_dict()
             except Exception:
-                journal.require_reconciliation(expected_generation=current.cycle_generation)
+                journal.require_reconciliation(
+                    expected_generation=current.cycle_generation
+                )
                 return
             if stopped.get("state") not in {"stopped", "succeeded", "failed"}:
-                journal.require_reconciliation(expected_generation=current.cycle_generation)
+                journal.require_reconciliation(
+                    expected_generation=current.cycle_generation
+                )
                 return
             settlement = {
                 **settlement,
@@ -1732,7 +2049,9 @@ class ProgramRuntime:
             )
         except Exception as error:
             try:
-                journal.require_reconciliation(expected_generation=current.cycle_generation)
+                journal.require_reconciliation(
+                    expected_generation=current.cycle_generation
+                )
             except Exception:
                 pass
             raise ProgramRunnerError(
@@ -1740,7 +2059,9 @@ class ProgramRuntime:
                 "failed Program Start settlement was not durably retained",
             ) from error
 
-    def _cycle_terminal_evidence_is_exact(self, journal: ProgramCycleJournal, cycle: Any) -> bool:
+    def _cycle_terminal_evidence_is_exact(
+        self, journal: ProgramCycleJournal, cycle: Any
+    ) -> bool:
         reference = cycle.terminal_reference
         program_run_id = cycle.program_run_id
         if not isinstance(reference, str) or not isinstance(program_run_id, str):
@@ -1749,11 +2070,14 @@ class ProgramRuntime:
         if settlement is not None:
             prepared_scene = settlement.get("prepared_scene")
             if (
-                settlement.get("schema_version") != "manyforge.program_cycle_start_settlement.v1"
+                settlement.get("schema_version")
+                != "manyforge.program_cycle_start_settlement.v1"
                 or settlement.get("claim") != cycle.claim
                 or not isinstance(prepared_scene, Mapping)
-                or prepared_scene.get("schema_version") != "manyforge.prepared_program_scene.v1"
-                or settlement.get("kind") not in {"proven_no_effect", "terminal_effects_settled"}
+                or prepared_scene.get("schema_version")
+                != "manyforge.prepared_program_scene.v1"
+                or settlement.get("kind")
+                not in {"proven_no_effect", "terminal_effects_settled"}
                 or self._digest(settlement) != reference
             ):
                 return False
@@ -1840,7 +2164,9 @@ class ProgramRuntime:
             )
         scenario_id = applied.get("scenario_id")
         scenario_catalog_revision = applied.get("scenario_catalog_revision")
-        if not isinstance(scenario_id, str) or not isinstance(scenario_catalog_revision, str):
+        if not isinstance(scenario_id, str) or not isinstance(
+            scenario_catalog_revision, str
+        ):
             raise ProgramRunnerError(
                 "program_run_applied_selection_stale",
                 "Applied Program omitted its Scenario identity",
@@ -1864,7 +2190,9 @@ class ProgramRuntime:
                 context, initial_scene, proof = self._prepare_run_scene(
                     run_admission,
                     context_id,
-                    program_reset_scene_authorization=(program_reset_scene_authorization),
+                    program_reset_scene_authorization=(
+                        program_reset_scene_authorization
+                    ),
                 )
             self._verify_run_scene(context, initial_scene, proof)
             if self._headless.program_applied() != applied:
@@ -1898,6 +2226,7 @@ class ProgramRuntime:
                     "request_id": request.request_id,
                     "request_owner_epoch": request.request_owner_epoch,
                     "program_run_id": request.program_run_id,
+                    "program_runner_owner_epoch": request.expected_owner_epoch,
                     "reset_cycle_generation": request.expected_cycle_generation,
                     "terminal_reference": request.terminal_reference,
                 }
@@ -1952,7 +2281,9 @@ class ProgramRuntime:
                 )
             latch = offer.get("latch")
             expectations = offer.get("configuration_expectations")
-            certificate = latch.get("stop_certificate") if isinstance(latch, Mapping) else None
+            certificate = (
+                latch.get("stop_certificate") if isinstance(latch, Mapping) else None
+            )
             identity = self._kernel.identity().get("identity")
             if (
                 not isinstance(latch, Mapping)
@@ -1990,7 +2321,9 @@ class ProgramRuntime:
                     "expected_recovery_assessment_revision": latch.get(
                         "recovery_assessment_revision"
                     ),
-                    "expected_stop_certificate_id": certificate.get("stop_certificate_id"),
+                    "expected_stop_certificate_id": certificate.get(
+                        "stop_certificate_id"
+                    ),
                     "expected_stop_certificate_revision": certificate.get(
                         "stop_certificate_revision"
                     ),
@@ -2001,7 +2334,10 @@ class ProgramRuntime:
                     "reason": "Program cycle Reset settled its controlled Stop",
                 }
             ).get("result")
-            if not isinstance(result, Mapping) or type(result.get("accepted")) is not bool:
+            if (
+                not isinstance(result, Mapping)
+                or type(result.get("accepted")) is not bool
+            ):
                 raise ProgramRunnerError(
                     "program_cycle_reset_stop_recovery_invalid",
                     "Kernel returned an invalid Stop recovery result",
@@ -2011,11 +2347,15 @@ class ProgramRuntime:
             "Kernel Stop recovery did not settle within its bounded attempts",
         )
 
-    def prepare_applied_scene(self, request: ProgramScenePreparationRequest) -> dict[str, Any]:
+    def prepare_applied_scene(
+        self, request: ProgramScenePreparationRequest
+    ) -> dict[str, Any]:
         """Converge the current Applied Program scene without acquiring Run."""
 
         if not isinstance(request, ProgramScenePreparationRequest):
-            raise TypeError("prepare_applied_scene requires one ProgramScenePreparationRequest")
+            raise TypeError(
+                "prepare_applied_scene requires one ProgramScenePreparationRequest"
+            )
         if self._closed or not self._started:
             raise ProgramRunnerError(
                 "program_runner_unavailable",
@@ -2052,7 +2392,9 @@ class ProgramRuntime:
                     {
                         "request_id": request.request_id,
                         "request_owner_epoch": request.request_owner_epoch,
-                        "applied_record_digest": (request.expected_applied_record_digest),
+                        "applied_record_digest": (
+                            request.expected_applied_record_digest
+                        ),
                     }
                 )[7:39]
             )
@@ -2061,7 +2403,9 @@ class ProgramRuntime:
                     expected_record_digest=request.expected_applied_record_digest,
                     context_id=context_id,
                 )
-                resulting_generation = self._admission_generation(admission_client.get())
+                resulting_generation = self._admission_generation(
+                    admission_client.get()
+                )
                 return {
                     "schema_version": "manyforge.program_scene_preparation.v1",
                     "status": "prepared",
@@ -2110,7 +2454,9 @@ class ProgramRuntime:
             "simulation_control_available": self._simulation_control is not None,
         }
 
-    def node_availability(self, request: ProgramNodeAvailabilityRequest) -> dict[str, Any]:
+    def node_availability(
+        self, request: ProgramNodeAvailabilityRequest
+    ) -> dict[str, Any]:
         """Project the exact availability already enforced by Run admission."""
 
         if self._closed or not self._started:
@@ -2126,8 +2472,12 @@ class ProgramRuntime:
             applied = request.applied
             scenario_id = applied.get("scenario_id")
             scenario_revision = applied.get("scenario_catalog_revision")
-            if not isinstance(scenario_id, str) or not isinstance(scenario_revision, str):
-                raise ProgramRunOwnerError("Applied Program omitted its Scenario identity")
+            if not isinstance(scenario_id, str) or not isinstance(
+                scenario_revision, str
+            ):
+                raise ProgramRunOwnerError(
+                    "Applied Program omitted its Scenario identity"
+                )
             live = request.selection
             owner_availability = self._current_node_owner_availability(
                 applied,
@@ -2177,7 +2527,9 @@ class ProgramRuntime:
             "schema_version": "manyforge.program_node_availability.v1",
             "source": {
                 **source_value,
-                "content_digest": self._digest({"availability": availability, **source_value}),
+                "content_digest": self._digest(
+                    {"availability": availability, **source_value}
+                ),
             },
             "availability": availability,
         }
@@ -2231,7 +2583,11 @@ class ProgramRuntime:
         }
 
     def _record_terminal_snapshot(self, snapshot: Any) -> None:
-        value = snapshot.to_dict() if callable(getattr(snapshot, "to_dict", None)) else snapshot
+        value = (
+            snapshot.to_dict()
+            if callable(getattr(snapshot, "to_dict", None))
+            else snapshot
+        )
         if isinstance(value, Mapping):
             value = self._project_run(value)
         if (
@@ -2254,7 +2610,9 @@ class ProgramRuntime:
         with self._terminal_observation_lock:
             cycle = self._journal.read()
             if cycle.state == "starting":
-                if len(self._pending_terminal_snapshots) >= (self.config.maximum_retained_runs):
+                if len(self._pending_terminal_snapshots) >= (
+                    self.config.maximum_retained_runs
+                ):
                     raise ProgramRunnerError(
                         "program_run_terminal_observer_unavailable",
                         "pending terminal observation retention is full",
@@ -2345,12 +2703,16 @@ class ProgramRuntime:
                     return
                 if not acquire_attempted:
                     try:
-                        journal.cancel_rejected_acquire(expected_generation=cycle.cycle_generation)
+                        journal.cancel_rejected_acquire(
+                            expected_generation=cycle.cycle_generation
+                        )
                     finally:
                         starting_committed = False
                     return
                 try:
-                    journal.require_reconciliation(expected_generation=cycle.cycle_generation)
+                    journal.require_reconciliation(
+                        expected_generation=cycle.cycle_generation
+                    )
                 finally:
                     starting_committed = False
 
@@ -2392,7 +2754,9 @@ class ProgramRuntime:
                 try:
                     journal.require_run_history_capacity()
                 except OverflowError as error:
-                    raise ProgramRunnerError("program_run_history_full", str(error)) from error
+                    raise ProgramRunnerError(
+                        "program_run_history_full", str(error)
+                    ) from error
                 owner_admission = admission_client.get()
                 generation = self._admission_generation(owner_admission)
                 if generation != request.expected_admission_generation:
@@ -2404,9 +2768,11 @@ class ProgramRuntime:
                 source = applied.get("source")
                 if (
                     not isinstance(source, Mapping)
-                    or source.get("record_digest") != request.expected_applied_record_digest
+                    or source.get("record_digest")
+                    != request.expected_applied_record_digest
                     or applied.get("scenario_id") != request.scenario_id
-                    or applied.get("scenario_catalog_revision") != request.scenario_catalog_revision
+                    or applied.get("scenario_catalog_revision")
+                    != request.scenario_catalog_revision
                 ):
                     raise ProgramRunnerError(
                         "program_run_applied_selection_stale",
@@ -2422,7 +2788,9 @@ class ProgramRuntime:
                     applied,
                     live,
                     expected_scenario_id=request.scenario_id,
-                    expected_scenario_catalog_revision=(request.scenario_catalog_revision),
+                    expected_scenario_catalog_revision=(
+                        request.scenario_catalog_revision
+                    ),
                     environment=self._environment,
                     owner_availability=self._owner_availability,
                 )
@@ -2438,7 +2806,9 @@ class ProgramRuntime:
                     "owner_epoch": self.owner_epoch,
                     "owner_transaction_id": program_run_id,
                     "request_id": request.request_id,
-                    "request_payload_digest": self._digest(request.model_dump(mode="json")),
+                    "request_payload_digest": self._digest(
+                        request.model_dump(mode="json")
+                    ),
                     "expected_admission_generation": generation,
                     "scope": {"resources": [], "configurations": []},
                     "program_cycle_evidence": {
@@ -2493,14 +2863,20 @@ class ProgramRuntime:
                     acquired_for_request = True
                 except CellAdmissionError as error:
                     if error.outcome_unknown:
-                        journal.mark_acquire_unknown(expected_generation=cycle.cycle_generation)
+                        journal.mark_acquire_unknown(
+                            expected_generation=cycle.cycle_generation
+                        )
                     else:
                         abort_if_stop_won()
-                        journal.cancel_rejected_acquire(expected_generation=cycle.cycle_generation)
+                        journal.cancel_rejected_acquire(
+                            expected_generation=cycle.cycle_generation
+                        )
                         starting_committed = False
                     raise
                 except Exception:
-                    journal.mark_acquire_unknown(expected_generation=cycle.cycle_generation)
+                    journal.mark_acquire_unknown(
+                        expected_generation=cycle.cycle_generation
+                    )
                     raise
                 try:
                     journal.remember_acquired_claim(
@@ -2510,7 +2886,9 @@ class ProgramRuntime:
                     )
                 except Exception as error:
                     try:
-                        journal.require_reconciliation(expected_generation=cycle.cycle_generation)
+                        journal.require_reconciliation(
+                            expected_generation=cycle.cycle_generation
+                        )
                     except Exception:
                         pass
                     raise ProgramRunnerError(
@@ -2539,7 +2917,9 @@ class ProgramRuntime:
                 self._kernel.register_program_run_capture(
                     {
                         "schema_version": "manyforge.program_run_execution_capture.v1",
-                        "request_owner_epoch": execution_identity["identity"]["owner_epoch"],
+                        "request_owner_epoch": execution_identity["identity"][
+                            "owner_epoch"
+                        ],
                         "program_runner_owner_epoch": self.owner_epoch,
                         "claim_generation": claim["claim_generation"],
                         "program_run_id": program_run_id,
@@ -2556,6 +2936,7 @@ class ProgramRuntime:
                 snapshot = self._host.start_run(
                     run_admission,
                     program_run_id=program_run_id,
+                    defer_ticks=True,
                 )
                 if snapshot.capture.program_run_id != program_run_id:
                     raise ProgramRunnerError(
@@ -2615,6 +2996,9 @@ class ProgramRuntime:
                     )
                     if pending_terminal is not None:
                         self._record_terminal_snapshot(pending_terminal)
+                # Capture first, then publish the durable Running owner state,
+                # and only then enable the first effectful tree tick.
+                self._host.schedule(program_run_id)
                 journal.complete_request(
                     owner_epoch=request.request_owner_epoch,
                     request_id=request.request_id,
@@ -2720,6 +3104,7 @@ class ProgramRuntime:
         live: Mapping[str, Any],
         controls: ProgramRuntimeControls,
         recovery_offer: dict[str, Any] | None,
+        execution_selections: dict[str, Any],
     ) -> dict[str, Any]:
         return {
             "schema_version": "manyforge.program_runtime_control_projection.v4",
@@ -2729,30 +3114,40 @@ class ProgramRuntime:
             "run_revision": live["run_revision"],
             "runtime_controls": controls.snapshot(),
             "recovery_offer": recovery_offer,
-            "execution_selections": self._owner.execution_selection_controls(program_run_id),
+            "execution_selections": execution_selections,
             "observation_override_candidate": (
                 self._runtime_override_observation_candidate(program_run_id)
             ),
         }
 
     def read_runtime_controls(self, program_run_id: str) -> dict[str, Any]:
-        live = self.read_run(program_run_id)
+        if self._closed:
+            raise ProgramRunnerError(
+                "program_runner_unavailable", "Program runner is closed"
+            )
         controls = self._controls(program_run_id)
         cycle = self._journal.read() if self._journal is not None else None
         cycle_generation = 1 if cycle is None else cycle.cycle_generation
+        recovery_offer = self._recovery_offer(
+            program_run_id, cycle_generation=cycle_generation
+        )
+        try:
+            live, selections = self._owner.read_selection_controls(program_run_id)
+        except ProgramRunOwnerError as error:
+            raise ProgramRunnerError("program_run_not_found", str(error)) from error
         return self._runtime_controls_projection(
             program_run_id,
-            live=live,
+            live=live.to_dict(),
             controls=controls,
-            recovery_offer=self._recovery_offer(
-                program_run_id,
-                cycle_generation=cycle_generation,
-            ),
+            recovery_offer=recovery_offer,
+            execution_selections=selections,
         )
 
     def _control_effect(self, request, *, kind: str, effect) -> dict[str, Any]:
         if self._closed or not self._started:
-            raise ProgramRunnerError("program_runner_unavailable", "Program runner is not started")
+            raise ProgramRunnerError(
+                "program_runner_unavailable", "Program runner is not started"
+            )
         self._require_manager_current()
         with self._transition_lock:
             self._require_manager_current()
@@ -2798,7 +3193,10 @@ class ProgramRuntime:
                 cycle.program_run_id != request.program_run_id
                 or cycle.state not in {"running", "stopping"}
                 or cycle.reconciliation_required
-                or (kind == "resume_motion" and cycle.state != "running")
+                or (
+                    kind in {"resume_motion", "prepare_manual_handover"}
+                    and cycle.state != "running"
+                )
             ):
                 reject(
                     ProgramRunnerError(
@@ -2815,13 +3213,19 @@ class ProgramRuntime:
                     ProgramRunnerError(
                         "program_runtime_control_stale",
                         "Program run changed before runtime control admission",
+                        details={
+                            "expected_run_revision": request.expected_run_revision,
+                            "current_run_revision": live.run_revision,
+                        },
                     )
                 )
             effect_completed = False
 
             def unresolved(error: Exception) -> NoReturn:
                 try:
-                    journal.require_reconciliation(expected_generation=cycle.cycle_generation)
+                    journal.require_reconciliation(
+                        expected_generation=cycle.cycle_generation
+                    )
                 except Exception:
                     pass
                 # Keep the exact command in-flight; deleting it would falsely
@@ -2834,14 +3238,18 @@ class ProgramRuntime:
             try:
                 payload = effect()
                 effect_completed = True
-                projected = self._project_run(self._owner.read(request.program_run_id).to_dict())
+                projected = self._project_run(
+                    self._owner.read(request.program_run_id).to_dict()
+                )
                 result = {
                     "schema_version": "manyforge.program_runtime_control_result.v1",
                     "request_id": request.request_id,
                     "accepted": True,
                     "result": payload,
                     "run": projected,
-                    "runtime_controls": self.read_runtime_controls(request.program_run_id),
+                    "runtime_controls": self.read_runtime_controls(
+                        request.program_run_id
+                    ),
                 }
                 journal.complete_control_request(
                     owner_epoch=request.request_owner_epoch,
@@ -2864,7 +3272,11 @@ class ProgramRuntime:
                 if effect_completed:
                     unresolved(error)
                 code = getattr(error, "code", "program_runtime_control_rejected")
-                reject(ProgramRunnerError(code, str(error)))
+                reject(
+                    ProgramRunnerError(
+                        code, str(error), details=getattr(error, "details", None)
+                    )
+                )
             except Exception as error:
                 # Unexpected exceptions are not a trustworthy no-effect
                 # result: a local transition may already have happened.
@@ -2889,15 +3301,20 @@ class ProgramRuntime:
                     or candidate.get("node_attempt_id") != request.node_attempt_id
                     or candidate.get("parameter_id") != request.parameter_id
                     or candidate.get("value") != request.value
-                    or candidate.get("source_observation_id") != request.source_observation_id
-                    or candidate.get("source_owner_generation") != request.source_owner_generation
+                    or candidate.get("source_observation_id")
+                    != request.source_observation_id
+                    or candidate.get("source_owner_generation")
+                    != request.source_owner_generation
                 ):
                     raise ProgramRunnerError(
                         "program_runtime_observation_stale",
                         (
                             candidate.get("reason")
                             if isinstance(candidate.get("reason"), str)
-                            else ("Robot observation changed before runtime override " "staging")
+                            else (
+                                "Robot observation changed before runtime override "
+                                "staging"
+                            )
                         ),
                     )
             before = controls.revision
@@ -2922,7 +3339,9 @@ class ProgramRuntime:
                     ) from error
             return record
 
-        return self._control_effect(request, kind="runtime_override_stage", effect=effect)
+        return self._control_effect(
+            request, kind="runtime_override_stage", effect=effect
+        )
 
     def activate_runtime_override(
         self, program_run_id: str, request: RuntimeOverrideActionRequest
@@ -2958,7 +3377,9 @@ class ProgramRuntime:
                 ),
             )
 
-        return self._control_effect(request, kind="runtime_override_activate", effect=effect)
+        return self._control_effect(
+            request, kind="runtime_override_activate", effect=effect
+        )
 
     def clear_runtime_override(
         self, program_run_id: str, request: RuntimeOverrideActionRequest
@@ -2994,7 +3415,9 @@ class ProgramRuntime:
                 ),
             )
 
-        return self._control_effect(request, kind="runtime_override_clear", effect=effect)
+        return self._control_effect(
+            request, kind="runtime_override_clear", effect=effect
+        )
 
     def promote_runtime_override(
         self, program_run_id: str, request: RuntimeOverridePromotionRequest
@@ -3044,7 +3467,9 @@ class ProgramRuntime:
                     ) from error
             return proposal
 
-        return self._control_effect(request, kind="runtime_override_promote", effect=effect)
+        return self._control_effect(
+            request, kind="runtime_override_promote", effect=effect
+        )
 
     def write_runtime_blackboard(
         self, program_run_id: str, request: RuntimeBlackboardWriteRequest
@@ -3067,7 +3492,9 @@ class ProgramRuntime:
             controls.audit_value("runtime_blackboard_written", key=request.key)
             return {"key": request.key, "status": "written"}
 
-        return self._control_effect(request, kind="runtime_blackboard_write", effect=effect)
+        return self._control_effect(
+            request, kind="runtime_blackboard_write", effect=effect
+        )
 
     def stage_manual_result(
         self, program_run_id: str, request: ManualResultStageRequest
@@ -3082,7 +3509,9 @@ class ProgramRuntime:
         def effect():
             intervention = self._owner.intervention(program_run_id)
             live = self._owner.read(program_run_id)
-            policy = live.capture.node_policy_by_instance_id.get(request.node_instance_id)
+            policy = live.capture.node_policy_by_instance_id.get(
+                request.node_instance_id
+            )
             if (
                 intervention is None
                 or intervention.identity.node_attempt_id != request.node_attempt_id
@@ -3110,7 +3539,11 @@ class ProgramRuntime:
             snapshot = self._host.resume_recovery(
                 program_run_id,
                 node_attempt_id=request.node_attempt_id,
-                action=("manual_success" if request.outcome == "succeeded" else "manual_failure"),
+                action=(
+                    "manual_success"
+                    if request.outcome == "succeeded"
+                    else "manual_failure"
+                ),
                 result=request.output,
             )
             controls.audit_value(
@@ -3128,11 +3561,15 @@ class ProgramRuntime:
 
         return self._control_effect(request, kind="manual_result_stage", effect=effect)
 
-    def apply_recovery_action(self, request: CycleRecoveryActionRequest) -> dict[str, Any]:
+    def apply_recovery_action(
+        self, request: CycleRecoveryActionRequest
+    ) -> dict[str, Any]:
         if not isinstance(request, CycleRecoveryActionRequest):
             raise TypeError("recovery requires one CycleRecoveryActionRequest")
         if self._closed or not self._started:
-            raise ProgramRunnerError("program_runner_unavailable", "Program runner is not started")
+            raise ProgramRunnerError(
+                "program_runner_unavailable", "Program runner is not started"
+            )
         self._require_manager_current()
         with self._transition_lock:
             self._require_manager_current()
@@ -3199,7 +3636,11 @@ class ProgramRuntime:
                 None
                 if offer is None
                 else next(
-                    (row for row in offer["actions"] if row["action_id"] == request.action_id),
+                    (
+                        row
+                        for row in offer["actions"]
+                        if row["action_id"] == request.action_id
+                    ),
                     None,
                 )
             )
@@ -3230,7 +3671,9 @@ class ProgramRuntime:
 
             def unresolved(error: Exception) -> NoReturn:
                 try:
-                    journal.require_reconciliation(expected_generation=cycle.cycle_generation)
+                    journal.require_reconciliation(
+                        expected_generation=cycle.cycle_generation
+                    )
                 except Exception:
                     pass
                 # Keep the request in-progress. The same request identity is
@@ -3245,7 +3688,10 @@ class ProgramRuntime:
                 cycle_resumed = False
                 controls.require_event_revisions(
                     events=(
-                        1 if request.action_id in {"acknowledge_and_continue", "reset_cycle"} else 2
+                        1
+                        if request.action_id
+                        in {"acknowledge_and_continue", "reset_cycle"}
+                        else 2
                     ),
                     reserved_after=0 if request.action_id == "reset_cycle" else 1,
                 )
@@ -3253,7 +3699,9 @@ class ProgramRuntime:
                     request.action_id not in {"reset_cycle", "acknowledge_and_continue"}
                     and intervention.policy_parameter != "operator_stop_policy"
                 ):
-                    controls.require_retry_capacity(intervention.identity.node_instance_id)
+                    controls.require_retry_capacity(
+                        intervention.identity.node_instance_id
+                    )
                 if request.action_id == "reset_cycle":
                     # The offer only authorizes the action. The ordinary Reset
                     # state machine owns stopping, settlement and restoration.
@@ -3263,19 +3711,25 @@ class ProgramRuntime:
                             "request_id": self._digest(
                                 {
                                     "kind": "operator_stop_reset_cycle",
-                                    "request_owner_epoch": (request.request_owner_epoch),
+                                    "request_owner_epoch": (
+                                        request.request_owner_epoch
+                                    ),
                                     "request_id": request.request_id,
                                     "program_run_id": program_run_id,
                                 }
                             ),
                             "request_owner_epoch": request.request_owner_epoch,
                             "source_label": request.source_label,
-                            "correlation_id": (request.correlation_id or request.request_id),
+                            "correlation_id": (
+                                request.correlation_id or request.request_id
+                            ),
                             "program_run_id": program_run_id,
                             "expected_owner_epoch": self.owner_epoch,
                             "expected_cycle_generation": cycle.cycle_generation,
                             "expected_claim_generation": (
-                                None if cycle.claim is None else cycle.claim["claim_generation"]
+                                None
+                                if cycle.claim is None
+                                else cycle.claim["claim_generation"]
                             ),
                             "session_id": request.session_id,
                             "client_sequence": request.client_sequence,
@@ -3324,12 +3778,16 @@ class ProgramRuntime:
                     cycle_resumed = True
                 elif (
                     intervention.policy_parameter == "operator_stop_policy"
-                    and intervention.identity.node_instance_id in selection_scope.held_nodes
+                    and intervention.identity.node_instance_id
+                    in selection_scope.held_nodes
                     and request.action_id == "replan_from_stopped_state"
                 ):
                     effect_started = True
                     snapshot = self._host.resume_motion(
                         program_run_id,
+                        expected_run_revision=self._owner.read(
+                            program_run_id
+                        ).run_revision,
                         expected_selection_revision=selection_scope.selection_revision,
                         request_id=request.request_id,
                         reason=request.reason,
@@ -3353,18 +3811,22 @@ class ProgramRuntime:
                         error = owner_result.get("error")
                         code = (
                             error.get("code")
-                            if isinstance(error, Mapping) and isinstance(error.get("code"), str)
+                            if isinstance(error, Mapping)
+                            and isinstance(error.get("code"), str)
                             else "cycle_recovery_action_rejected"
                         )
                         message = (
                             error.get("message")
-                            if isinstance(error, Mapping) and isinstance(error.get("message"), str)
+                            if isinstance(error, Mapping)
+                            and isinstance(error.get("message"), str)
                             else "addressed owner rejected recovery"
                         )
                         reject(ProgramRunnerError(code, message))
                     owner_effect_accepted = True
                     if request.action_id == "acknowledge_and_continue":
-                        snapshot = self._owner.note_runtime_control_change(program_run_id)
+                        snapshot = self._owner.note_runtime_control_change(
+                            program_run_id
+                        )
                     else:
                         snapshot = self._host.resume_recovery(
                             program_run_id,
@@ -3438,6 +3900,7 @@ class ProgramRuntime:
                     ProgramRunnerError(
                         getattr(error, "code", "cycle_recovery_action_rejected"),
                         str(error),
+                        details=getattr(error, "details", None),
                     )
                 )
             except Exception as error:
@@ -3502,14 +3965,18 @@ class ProgramRuntime:
         try:
             _admission, journal = self._require_cycle_owner()
             cycle = journal.read()
-            if cycle.owner_epoch != self.owner_epoch or cycle.program_run_id != program_run_id:
+            if (
+                cycle.owner_epoch != self.owner_epoch
+                or cycle.program_run_id != program_run_id
+            ):
                 raise ProgramRunnerError(
                     "program_run_not_found",
                     "Program Stop does not identify the current Program cycle",
                 )
 
             state_before = cycle.state
-            if state_before in {"starting", "running"}:
+            recovery_stop = self._current_cycle_recovery_stop(cycle)
+            if state_before in {"starting", "running"} or recovery_stop:
                 journal.mark_stopping(
                     expected_generation=cycle.cycle_generation,
                     program_run_id=program_run_id,
@@ -3544,7 +4011,10 @@ class ProgramRuntime:
                 if cycle.claim is not None:
                     self._native.scope.request_stop(
                         program_run_id,
-                        ("execution:" f"{request.request_owner_epoch}:{request.request_id}"),
+                        (
+                            "execution:"
+                            f"{request.request_owner_epoch}:{request.request_id}"
+                        ),
                         request.reason,
                     )
                 result = {
@@ -3554,12 +4024,13 @@ class ProgramRuntime:
                     "state": "stopping",
                     "execution_control_revision": (cycle.execution_control_revision),
                 }
-            elif state_before == "running":
+            elif state_before == "running" or recovery_stop:
                 snapshot = self._host.stop_run(
                     program_run_id,
                     reason=request.reason,
                     stop_request_id=(
-                        "execution:" f"{request.request_owner_epoch}:{request.request_id}"
+                        "execution:"
+                        f"{request.request_owner_epoch}:{request.request_id}"
                     ),
                 )
                 result = self._project_run(snapshot.to_dict())
@@ -3592,7 +4063,9 @@ class ProgramRuntime:
                         journal.mark_stopping(
                             expected_generation=cycle.cycle_generation,
                             program_run_id=program_run_id,
-                            correlation_id=(request.correlation_id or request.request_id),
+                            correlation_id=(
+                                request.correlation_id or request.request_id
+                            ),
                             session_id=request.session_id,
                             client_sequence=request.client_sequence,
                         )
@@ -3607,7 +4080,9 @@ class ProgramRuntime:
 
         if stopping_committed:
             try:
-                journal.require_reconciliation(expected_generation=cycle.cycle_generation)
+                journal.require_reconciliation(
+                    expected_generation=cycle.cycle_generation
+                )
             except Exception:
                 pass
             outcome = ProgramRunnerError(
@@ -3686,9 +4161,11 @@ class ProgramRuntime:
             # work; a partly held Program remains a running cycle.
             snapshot = self._host.stop_motion(
                 program_run_id,
-                group_id=request.group_id,
+                group_id=request.group_ids,
                 reason=request.reason,
-                stop_request_id=("motion:" f"{request.request_owner_epoch}:{request.request_id}"),
+                stop_request_id=(
+                    "motion:" f"{request.request_owner_epoch}:{request.request_id}"
+                ),
             )
             result = self._project_run(snapshot.to_dict())
         except ProgramRunOwnerOutcomeUnknownError as error:
@@ -3731,15 +4208,18 @@ class ProgramRuntime:
         if not isinstance(request, ProgramSelectionResumeRequest):
             raise TypeError("resume_motion requires one ProgramSelectionResumeRequest")
         if request.program_run_id != program_run_id:
-            raise ProgramRunnerError("program_run_path_invalid", "motion Resume changed its Run")
+            raise ProgramRunnerError(
+                "program_run_path_invalid", "motion Resume changed its Run"
+            )
 
         def effect() -> dict[str, Any]:
             try:
                 snapshot = self._host.resume_motion(
                     program_run_id,
+                    expected_run_revision=request.expected_run_revision,
                     expected_selection_revision=request.expected_selection_revision,
                     request_id=request.request_id,
-                    group_id=request.group_id,
+                    group_id=request.group_ids,
                     reason=request.reason,
                 )
             except ProgramRunOwnerRecoveryIncompleteError as error:
@@ -3756,6 +4236,63 @@ class ProgramRuntime:
         # Reuse ordinary current-run command ordering, attribution and outcome
         # retention. Unknown effects enter its existing reconciliation path.
         result = self._control_effect(request, kind="resume_motion", effect=effect)
+        return self._project_run(result["run"])
+
+    def prepare_manual_handover(
+        self,
+        program_run_id: str,
+        request: ProgramManualHandoverRequest,
+    ) -> dict[str, Any]:
+        if not isinstance(request, ProgramManualHandoverRequest):
+            raise TypeError("manual handover requires one ProgramManualHandoverRequest")
+        if request.program_run_id != program_run_id:
+            raise ProgramRunnerError(
+                "program_run_path_invalid", "manual handover changed its Program"
+            )
+
+        def effect() -> dict[str, Any]:
+            # This read cannot retire work. Even a lost/malformed query reply
+            # is a known no-effect failure, not an uncertain cleanup result.
+            try:
+                raw = self._kernel.read_manual_handover(
+                    request.operation.model_dump(mode="json")
+                )
+                proof = ManualProgramHandover.model_validate(raw)
+            except Exception as error:
+                raise ProgramRunnerError(
+                    "manual_handover_query_unavailable", str(error)
+                ) from error
+            if proof.context != request.operation.manual_handover:
+                raise ProgramRunnerError(
+                    "manual_handover_scope_stale",
+                    "Kernel held Program changed before cleanup",
+                )
+            if not proof.producer_node_indices:
+                snapshot = self._owner.read(program_run_id)
+            else:
+                try:
+                    snapshot = self._host.prepare_manual_handover(
+                        program_run_id,
+                        node_indices=tuple(proof.producer_node_indices),
+                        expected_run_revision=request.expected_run_revision,
+                        expected_selection_revision=proof.context.selection_revision,
+                        request_id=request.request_id,
+                        reason=request.reason,
+                    )
+                except ProgramRunOwnerRecoveryIncompleteError as error:
+                    raise ProgramRunnerError(
+                        "manual_handover_cleanup_incomplete",
+                        str(error),
+                        details={"cleanup_accepted": True},
+                    ) from error
+            return {
+                "state": snapshot.state.value,
+                "run_revision": snapshot.run_revision,
+            }
+
+        result = self._control_effect(
+            request, kind="prepare_manual_handover", effect=effect
+        )
         return self._project_run(result["run"])
 
     def full_stop(
@@ -3822,7 +4359,9 @@ class ProgramRuntime:
             snapshot = self._host.full_stop(
                 program_run_id,
                 reason=request.reason,
-                stop_request_id=("full:" f"{request.request_owner_epoch}:{request.request_id}"),
+                stop_request_id=(
+                    "full:" f"{request.request_owner_epoch}:{request.request_id}"
+                ),
             )
             result = self._project_run(snapshot.to_dict())
         except ProgramRunOwnerOutcomeUnknownError as error:
@@ -3872,7 +4411,9 @@ class ProgramRuntime:
         """Resume one exact preserved tree through fresh-state recovery."""
 
         if not isinstance(request, ProgramFullStopResumeRequest):
-            raise TypeError("resume_full_stop requires one ProgramFullStopResumeRequest")
+            raise TypeError(
+                "resume_full_stop requires one ProgramFullStopResumeRequest"
+            )
         if request.program_run_id != program_run_id:
             raise ProgramRunnerError(
                 "program_run_path_invalid",
@@ -3911,7 +4452,9 @@ class ProgramRuntime:
         """Discard one preserved tree as the first phase of one Reset."""
 
         if not isinstance(request, ProgramFullStopResetRequest):
-            raise TypeError("discard_full_stop requires one ProgramFullStopResetRequest")
+            raise TypeError(
+                "discard_full_stop requires one ProgramFullStopResetRequest"
+            )
         if request.program_run_id != program_run_id:
             raise ProgramRunnerError(
                 "program_run_path_invalid",
@@ -3977,7 +4520,8 @@ class ProgramRuntime:
             except ProgramRunOwnerError as error:
                 reject(ProgramRunnerError("program_run_not_found", str(error)))
             if (
-                getattr(live.state, "value", live.state) != ProgramRunState.FULL_STOPPED.value
+                getattr(live.state, "value", live.state)
+                != ProgramRunState.FULL_STOPPED.value
                 or live.run_revision != request.expected_run_revision
             ):
                 reject(
@@ -3994,7 +4538,8 @@ class ProgramRuntime:
                     program_run_id,
                     reason=request.reason or "operator Reset discarded Full Stop",
                     stop_request_id=(
-                        "full-stop-reset:" f"{request.request_owner_epoch}:{request.request_id}"
+                        "full-stop-reset:"
+                        f"{request.request_owner_epoch}:{request.request_id}"
                     ),
                 )
                 if getattr(terminal.state, "value", terminal.state) not in {
@@ -4024,7 +4569,9 @@ class ProgramRuntime:
             except Exception as error:
                 if effect_started:
                     try:
-                        journal.require_reconciliation(expected_generation=cycle.cycle_generation)
+                        journal.require_reconciliation(
+                            expected_generation=cycle.cycle_generation
+                        )
                     except Exception:
                         pass
                     raise ProgramRunnerError(
@@ -4042,20 +4589,33 @@ class ProgramRuntime:
         if not isinstance(request, ProgramCycleResetRequest):
             raise TypeError("reset_cycle requires one ProgramCycleResetRequest")
         if self._closed or not self._started:
-            raise ProgramRunnerError("program_runner_unavailable", "Program runner is not started")
+            raise ProgramRunnerError(
+                "program_runner_unavailable", "Program runner is not started"
+            )
         self._require_manager_current()
         with self._transition_lock:
             self._require_manager_current()
             admission, journal = self._require_cycle_owner()
             cycle = journal.read()
+            pending = journal.pending_commands()
+            requested_intent = request.model_dump(mode="json")
             try:
-                record = journal.record_request(
-                    owner_epoch=request.request_owner_epoch,
-                    request_id=request.request_id,
-                    kind="reset",
-                    intent=request.model_dump(mode="json"),
-                    cycle_generation=request.expected_cycle_generation,
-                )
+                if any(
+                    (row["request_owner_epoch"], row["request_id"])
+                    == (request.request_owner_epoch, request.request_id)
+                    for row in pending
+                ):
+                    # An identical unresolved request is not a fresh operator
+                    # confirmation; a conflicting identity must not delete it.
+                    self._require_new_command(
+                        journal.record_request(
+                            owner_epoch=request.request_owner_epoch,
+                            request_id=request.request_id,
+                            kind="reset",
+                            intent=requested_intent,
+                            cycle_generation=request.expected_cycle_generation,
+                        )
+                    )
             except (ValueError, OverflowError) as error:
                 raise ProgramRunnerError(
                     (
@@ -4065,13 +4625,19 @@ class ProgramRuntime:
                     ),
                     str(error),
                 ) from error
-            self._require_new_command(record)
             reset_accepted = False
+            record_created = False
+            recovery_reset = self._current_cycle_recovery_reset(cycle, pending)
+            confirmation_request = request
+            stop_request_identity = (
+                f"program-reset:{request.request_owner_epoch}:{request.request_id}"
+            )
 
             def reject(error: ProgramRunnerError) -> NoReturn:
                 if reset_accepted:
-                    reconciliation_required = error.code == "program_cycle_reconciliation_required"
-                    failure_recorded = False
+                    reconciliation_required = (
+                        error.code == "program_cycle_reconciliation_required"
+                    )
                     try:
                         journal.fail_reset(
                             expected_generation=cycle.cycle_generation,
@@ -4080,31 +4646,23 @@ class ProgramRuntime:
                             message=str(error),
                             reconciliation_required=reconciliation_required,
                         )
-                        failure_recorded = True
                     except Exception:
                         pass
-                    if failure_recorded and not reconciliation_required:
-                        # The durable phase/failure projection is now the
-                        # authority. This command has a known outcome and must
-                        # not consume the bounded unresolved-command guard.
-                        try:
-                            journal.cancel_request(
-                                owner_epoch=request.request_owner_epoch,
-                                request_id=request.request_id,
-                            )
-                        except Exception:
-                            pass
+                    # Keep one Reset occurrence through known/unknown phase
+                    # failures. Fresh confirmations continue it; they never
+                    # grow the reserved slot or lose its original identity.
                     raise ProgramRunnerError(
                         "program_cycle_recovery_required",
                         str(error),
                         details={"cause_code": error.code},
                     ) from error
-                self._retain_rejection(
-                    journal,
-                    owner_epoch=request.request_owner_epoch,
-                    request_id=request.request_id,
-                    error=error,
-                )
+                if record_created:
+                    self._retain_rejection(
+                        journal,
+                        owner_epoch=request.request_owner_epoch,
+                        request_id=request.request_id,
+                        error=error,
+                    )
                 raise error
 
             reset_retry_phase = self._reset_retry_phase(cycle)
@@ -4113,14 +4671,21 @@ class ProgramRuntime:
                 claim is None
                 and request.expected_claim_generation is None
                 and self._cycle_terminal_evidence_is_exact(journal, cycle)
-                and (cycle.state == "terminal_awaiting_reset" or reset_retry_phase is not None)
+                and (
+                    cycle.state == "terminal_awaiting_reset"
+                    or reset_retry_phase is not None
+                )
             )
             if (
                 cycle.owner_epoch != request.expected_owner_epoch
                 or cycle.owner_epoch != self.owner_epoch
                 or cycle.cycle_generation != request.expected_cycle_generation
                 or cycle.program_run_id != request.program_run_id
-                or (cycle.reconciliation_required and reset_retry_phase is None)
+                or (
+                    cycle.reconciliation_required
+                    and reset_retry_phase is None
+                    and not recovery_reset
+                )
                 or (not isinstance(claim, Mapping) and not claimless_reset)
                 or request.expected_claim_generation
                 != (None if claim is None else claim.get("claim_generation"))
@@ -4128,7 +4693,8 @@ class ProgramRuntime:
                     cycle.state in {"terminal_awaiting_reset", "recovery_required"}
                     and (
                         request.terminal_reference != cycle.terminal_reference
-                        or request.settlement_evidence_digest != cycle.terminal_reference
+                        or request.settlement_evidence_digest
+                        != cycle.terminal_reference
                     )
                 )
                 or (
@@ -4156,13 +4722,57 @@ class ProgramRuntime:
                 "running",
                 "terminal_awaiting_reset",
                 "recovery_required",
-            } or (cycle.state == "recovery_required" and reset_retry_phase is None):
+            } or (
+                cycle.state == "recovery_required"
+                and reset_retry_phase is None
+                and not recovery_reset
+            ):
                 reject(
                     ProgramRunnerError(
                         "program_cycle_reset_stale",
                         "Reset is not eligible in the current Program state",
                     )
                 )
+            retained_resets = [row for row in pending if row["kind"] == "reset"]
+            if len(retained_resets) > 1 or any(
+                row["cycle_generation"] != cycle.cycle_generation
+                or row["intent"].get("program_run_id") != request.program_run_id
+                for row in retained_resets
+            ):
+                reject(
+                    ProgramRunnerError(
+                        "program_cycle_reconciliation_required",
+                        "Retained Reset occurrence is ambiguous",
+                    )
+                )
+            if recovery_reset:
+                try:
+                    resident = self._owner.read(request.program_run_id)
+                    if resident.owner_epoch != self.owner_epoch:
+                        raise RuntimeError("Reset requires the current resident Run")
+                    recovery_kernel_epoch = self._current_kernel_owner_epoch()
+                    recovery_liveness = journal.liveness()
+                except Exception as error:
+                    reject(
+                        ProgramRunnerError(
+                            "program_cycle_reconciliation_required", str(error)
+                        )
+                    )
+            if not retained_resets:
+                try:
+                    record = journal.record_request(
+                        owner_epoch=request.request_owner_epoch,
+                        request_id=request.request_id,
+                        kind="reset",
+                        intent=requested_intent,
+                        cycle_generation=request.expected_cycle_generation,
+                    )
+                    self._require_new_command(record)
+                    record_created = True
+                except (ValueError, OverflowError) as error:
+                    raise ProgramRunnerError(
+                        "execution_control_ingress_busy", str(error)
+                    ) from error
             try:
                 initial_state = cycle.state
                 if reset_retry_phase is None:
@@ -4172,6 +4782,7 @@ class ProgramRuntime:
                         correlation_id=request.correlation_id or request.request_id,
                         session_id=request.session_id,
                         client_sequence=request.client_sequence,
+                        expected_recovery=cycle if recovery_reset else None,
                     )
                 else:
                     failure_code = cycle.failure.get("code")
@@ -4187,6 +4798,18 @@ class ProgramRuntime:
                         allow_legacy_scene_failure=(cycle.reset_phase == "failed"),
                     )
                 reset_accepted = True
+                if retained_resets:
+                    # Restoration and publication belong to the retained
+                    # occurrence. Only this explicit confirmation's Stop is
+                    # fresh; overlapping containment retains its old deadline.
+                    request = request.model_copy(
+                        update={
+                            "request_owner_epoch": retained_resets[0][
+                                "request_owner_epoch"
+                            ],
+                            "request_id": retained_resets[0]["request_id"],
+                        }
+                    )
                 cycle = journal.read()
                 if cycle.reset_phase == "stopping" and initial_state in {
                     "running",
@@ -4194,10 +4817,8 @@ class ProgramRuntime:
                 }:
                     terminal = self._host.stop_run(
                         request.program_run_id,
-                        reason="operator requested Program cycle Reset",
-                        stop_request_id=(
-                            "program-reset:" f"{request.request_owner_epoch}:{request.request_id}"
-                        ),
+                        reason=PROGRAM_RESET_STOP_REASON,
+                        stop_request_id=stop_request_identity,
                     )
                     if getattr(terminal.state, "value", terminal.state) not in {
                         ProgramRunState.STOPPED.value,
@@ -4206,10 +4827,7 @@ class ProgramRuntime:
                     }:
                         terminal = self._host.wait_terminal(
                             request.program_run_id,
-                            timeout_s=min(
-                                self.config.headless_timeout_seconds,
-                                5.0,
-                            ),
+                            timeout_s=self.config.headless_timeout_seconds,
                         )
                     terminal_result = self._project_run(terminal.to_dict())
                     if terminal_result.get("state") not in {
@@ -4229,15 +4847,20 @@ class ProgramRuntime:
                             "state": terminal_result.get("state"),
                         }
                     )
-                    journal.update_reset_phase(
-                        expected_generation=cycle.cycle_generation,
-                        program_run_id=request.program_run_id,
-                        expected_phase="stopping",
-                        phase="settling",
-                        terminal_reference=reference,
-                    )
                 elif cycle.reset_phase == "stopping":
                     reference = cycle.terminal_reference
+                if cycle.reset_phase == "stopping":
+                    if (
+                        isinstance(claim, Mapping)
+                        and isinstance(claim.get("intent"), Mapping)
+                        and claim["intent"].get("owner_epoch") == self.owner_epoch
+                        and cycle.start_settlement is None
+                    ):
+                        self._host.contain_reset_run(
+                            request.program_run_id,
+                            stop_request_id=stop_request_identity,
+                            timeout_s=self.config.headless_timeout_seconds,
+                        )
                     journal.update_reset_phase(
                         expected_generation=cycle.cycle_generation,
                         program_run_id=request.program_run_id,
@@ -4247,7 +4870,7 @@ class ProgramRuntime:
                     )
                 # Any entrypoint must reconcile the exact Kernel Stop-fault
                 # latch before publishing Idle for the next Run.
-                self._clear_reset_stop_fault(request)
+                self._clear_reset_stop_fault(confirmation_request)
                 cycle = journal.read()
                 request = request.model_copy(
                     update={
@@ -4260,7 +4883,16 @@ class ProgramRuntime:
                 )
             except ProgramRunnerError as error:
                 reject(error)
-            except (ProgramRunOwnerError, ProgramSchedulingError) as error:
+            except (
+                ProgramRunOwnerOutcomeUnknownError,
+                ProgramSchedulingError,
+            ) as error:
+                reject(
+                    ProgramRunnerError(
+                        "program_cycle_reconciliation_required", str(error)
+                    )
+                )
+            except ProgramRunOwnerError as error:
                 reject(
                     ProgramRunnerError(
                         "program_cycle_reset_stop_failed",
@@ -4286,7 +4918,8 @@ class ProgramRuntime:
                 or (claim is None and request.expected_claim_generation is not None)
                 or (
                     isinstance(claim, Mapping)
-                    and claim.get("claim_generation") != request.expected_claim_generation
+                    and claim.get("claim_generation")
+                    != request.expected_claim_generation
                 )
             ):
                 reject(
@@ -4319,7 +4952,9 @@ class ProgramRuntime:
                     "owner_transaction_id": intent["owner_transaction_id"],
                     "request_id": intent["request_id"],
                     "request_payload_digest": intent["request_payload_digest"],
-                    "acquired_admission_generation": claim["acquired_admission_generation"],
+                    "acquired_admission_generation": claim[
+                        "acquired_admission_generation"
+                    ],
                     "claim_generation": claim["claim_generation"],
                     "settlement": {
                         "settlement_kind": "explicit_reset",
@@ -4327,8 +4962,10 @@ class ProgramRuntime:
                     },
                 }
             )
-            reconciliation_digest = cell_admission_owner_epoch_reconciliation_evidence_digest(
-                "program_runner", self.owner_epoch
+            reconciliation_digest = (
+                cell_admission_owner_epoch_reconciliation_evidence_digest(
+                    "program_runner", self.owner_epoch
+                )
             )
             claim_was_settled_by_recovery = bool(
                 claim is not None
@@ -4338,7 +4975,9 @@ class ProgramRuntime:
             run_owner_was_replaced = bool(
                 claim is not None and intent.get("owner_epoch") != cycle.owner_epoch
             )
-            if cycle.reconciliation_required or cycle.owner_epoch != self.owner_epoch:
+            if (
+                cycle.reconciliation_required and not recovery_reset
+            ) or cycle.owner_epoch != self.owner_epoch:
                 reject(
                     ProgramRunnerError(
                         "program_cycle_reconciliation_required",
@@ -4365,7 +5004,8 @@ class ProgramRuntime:
                         for retained_claim in receipt.get("held_claims", [])
                         if isinstance(retained_claim, Mapping)
                         and isinstance(retained_claim.get("intent"), Mapping)
-                        and retained_claim["intent"].get("owner_role") == "program_runner"
+                        and retained_claim["intent"].get("owner_role")
+                        == "program_runner"
                     ]
                     expected_settlement = {
                         "predecessor_claim": claim,
@@ -4400,7 +5040,9 @@ class ProgramRuntime:
                         )
                     )
                     if not receipt_is_exact:
-                        raise RuntimeError("reconciled Program-cycle claim is not exact")
+                        raise RuntimeError(
+                            "reconciled Program-cycle claim is not exact"
+                        )
                     released = admission.get()
                 except Exception as error:
                     reject(
@@ -4418,14 +5060,32 @@ class ProgramRuntime:
                         self._host.reset_retained_run(request.program_run_id)
                     elif retained_run is not None:
                         self._host.reset_run(request.program_run_id)
-                    journal.update_reset_phase(
-                        expected_generation=cycle.cycle_generation,
-                        program_run_id=request.program_run_id,
-                        expected_phase="settling",
-                        phase="restoring_scene",
-                        terminal_reference=request.terminal_reference,
-                    )
+                    if recovery_reset:
+                        try:
+                            self._prove_reset_recovery(
+                                cycle, kernel_owner_epoch=recovery_kernel_epoch
+                            )
+                            self._require_manager_current()
+                            journal.settle_reset_recovery(
+                                expected=cycle,
+                                manager_runtime_epoch=recovery_liveness.manager_runtime_epoch,
+                                manager_owner_epoch=recovery_liveness.manager_owner_epoch,
+                            )
+                        except Exception as error:
+                            raise ProgramRunnerError(
+                                "program_cycle_reconciliation_required", str(error)
+                            ) from error
+                    else:
+                        journal.update_reset_phase(
+                            expected_generation=cycle.cycle_generation,
+                            program_run_id=request.program_run_id,
+                            expected_phase="settling",
+                            phase="restoring_scene",
+                            terminal_reference=request.terminal_reference,
+                        )
                     cycle = journal.read()
+                except ProgramRunnerError as error:
+                    reject(error)
                 except (ProgramRunOwnerError, ProgramSchedulingError) as error:
                     reject(
                         ProgramRunnerError(
@@ -4517,7 +5177,9 @@ class ProgramRuntime:
                             reject(ProgramRunnerError(error.code, str(error)))
                         reject(ProgramRunnerError(error.code, str(error)))
                     except Exception:
-                        journal.require_reconciliation(expected_generation=cycle.cycle_generation)
+                        journal.require_reconciliation(
+                            expected_generation=cycle.cycle_generation
+                        )
                         reject(
                             ProgramRunnerError(
                                 "program_cycle_reconciliation_required",
@@ -4543,7 +5205,9 @@ class ProgramRuntime:
                 )
             except Exception as error:
                 try:
-                    journal.require_reconciliation(expected_generation=cycle.cycle_generation)
+                    journal.require_reconciliation(
+                        expected_generation=cycle.cycle_generation
+                    )
                 except Exception:
                     pass
                 reject(

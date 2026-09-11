@@ -66,6 +66,7 @@ ExecutionCommandKind = Literal[
     "program_runtime_override_promote",
     "program_runtime_blackboard_write",
     "program_manual_result_stage",
+    "program_manual_handover",
     "gripper_confirm",
     "operation_start",
     "operation_stop",
@@ -169,9 +170,13 @@ class ExecutionCommandEnvelopeDTO(_StrictDTO):
     client_sequence: str | None = None
     freshness: ControlFreshnessContextDTO
     expected_semantic_owner_epoch: str
-    expected_execution_control_revision: Annotated[int, Field(ge=1, le=MAXIMUM_SAFE_INTEGER)]
+    expected_execution_control_revision: Annotated[
+        int, Field(ge=1, le=MAXIMUM_SAFE_INTEGER)
+    ]
 
-    @field_validator("correlation_id", "control_session_id", "expected_semantic_owner_epoch")
+    @field_validator(
+        "correlation_id", "control_session_id", "expected_semantic_owner_epoch"
+    )
     @classmethod
     def validate_identity(cls, value: str | None, info) -> str | None:
         if value is None:
@@ -204,7 +209,10 @@ class ExecutionCommandEnvelopeDTO(_StrictDTO):
             raise ValueError("control_session_id and client_sequence must be paired")
         if self.freshness.semantic_owner_epoch != self.expected_semantic_owner_epoch:
             raise ValueError("freshness owner does not match expected owner")
-        if self.freshness.execution_control_revision != self.expected_execution_control_revision:
+        if (
+            self.freshness.execution_control_revision
+            != self.expected_execution_control_revision
+        ):
             raise ValueError("freshness revision does not match expected revision")
         return self
 
@@ -260,7 +268,9 @@ class ExecutionCommandReceiptDTO(_StrictDTO):
             maximum_bytes=MAXIMUM_IDENTITY_BYTES,
         )
 
-    @field_validator("client_sequence", "received_server_sequence", "received_monotonic_ns")
+    @field_validator(
+        "client_sequence", "received_server_sequence", "received_monotonic_ns"
+    )
     @classmethod
     def validate_sequence(cls, value: str | None, info) -> str | None:
         if value is None:
@@ -481,7 +491,9 @@ class ExecutionControlDeltaDTO(_StrictDTO):
     def paired_owner_state(self) -> "ExecutionControlDeltaDTO":
         if self.control is None:
             if {"state_sequence", "received_client_sequence"} & self.model_fields_set:
-                raise ValueError("local Draft delta cannot claim owner state or receipt")
+                raise ValueError(
+                    "local Draft delta cannot claim owner state or receipt"
+                )
             if self.event_class != "cold":
                 raise ValueError("local Draft delta must be cold")
         else:
@@ -491,7 +503,9 @@ class ExecutionControlDeltaDTO(_StrictDTO):
             if "received_client_sequence" not in self.model_fields_set:
                 raise ValueError("owner delta requires its receive watermark")
             if self.received_client_sequence is not None:
-                _u64_text(self.received_client_sequence, label="received_client_sequence")
+                _u64_text(
+                    self.received_client_sequence, label="received_client_sequence"
+                )
         if self.shell.get("complete") is not False:
             raise ValueError("delta shell must be explicitly incomplete")
         return self
@@ -547,7 +561,9 @@ class AllowedExecutionCommandDTO(_StrictDTO):
     @model_validator(mode="after")
     def exact_disabled_reason(self) -> "AllowedExecutionCommandDTO":
         if self.allowed == (self.disabled_reason is not None):
-            raise ValueError("allowed commands omit a disabled reason only when allowed")
+            raise ValueError(
+                "allowed commands omit a disabled reason only when allowed"
+            )
         if self.disabled_reason is not None:
             _bounded_nfc(
                 self.disabled_reason,

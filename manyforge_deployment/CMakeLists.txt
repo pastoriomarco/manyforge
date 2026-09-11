@@ -606,10 +606,11 @@ if(TARGET manyforge_core)
   set(MANYFORGE_RUNTIME_CONTRACT_CODEC_TARGET manyforge_core)
 else()
   # Deployment is also qualified as a standalone CMake package. Reuse the
-  # exact O1.4b Core translation unit in that package rather than inventing a
-  # second runtime-contract codec or requiring the full Core link closure.
+  # exact Core codec and cold timing translation units rather than inventing
+  # parallel algorithms or requiring the full Kernel link closure.
   add_library(manyforge_deployment_runtime_contract_codec STATIC
-    "${MANYFORGE_RUNTIME_CONTRACT_CODEC_SOURCE}")
+    "${MANYFORGE_RUNTIME_CONTRACT_CODEC_SOURCE}"
+    "${_MANYFORGE_WORKSPACE_ROOT}/manyforge_core/src/stop_timing.cpp")
   set_target_properties(manyforge_deployment_runtime_contract_codec
     PROPERTIES POSITION_INDEPENDENT_CODE ON)
   target_include_directories(manyforge_deployment_runtime_contract_codec
@@ -648,6 +649,8 @@ add_library(manyforge_deployment_verification_core
   src/model_asset_codec.cpp
   src/model_source.cpp
   src/native_execution_runtime_unit_internal.cpp
+  src/ordinary_motion_jerk.cpp
+  src/deployment_jerk_import.cpp
   src/ros2_control_execution_runtime_unit_internal.cpp
   src/planning_resource_map_internal.cpp
   src/posix_read_only_internal.cpp
@@ -1763,6 +1766,11 @@ if(BUILD_TESTING)
   target_link_libraries(test_runtime_contract_registry PRIVATE
     manyforge_deployment GTest::gtest_main)
   gtest_discover_tests(test_runtime_contract_registry
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_ordinary_motion_jerk test/test_ordinary_motion_jerk.cpp)
+  target_link_libraries(test_ordinary_motion_jerk PRIVATE manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_ordinary_motion_jerk
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_build_manifest

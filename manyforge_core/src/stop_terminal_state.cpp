@@ -263,7 +263,13 @@ std::optional<std::string_view> stop_fault_recovery_offer_field_error(
     const StopFaultRecoveryOfferDTO& offer) noexcept {
   if (stop_fault_latch_field_error(offer.latch).has_value() ||
       offer.latch.state == StopFaultLatchStateDTO::kCleared ||
-      !offer.latch.stop_certificate.has_value() || offer.configuration_expectations.empty() ||
+      (offer.latch.stop_certificate.has_value() && offer.configuration_expectations.empty()) ||
+      (!offer.latch.stop_certificate.has_value() &&
+       (!offer.configuration_expectations.empty() ||
+        offer.latch.state != StopFaultLatchStateDTO::kLatched ||
+        offer.latch.recovery_status != StopFaultRecoveryStatusDTO::kWaitingForObservation ||
+        offer.latch.terminal_projection.state != StopDurableProjectionStateDTO::kPending ||
+        offer.latch.clear_projection.state != StopDurableProjectionStateDTO::kNotApplicable)) ||
       offer.configuration_expectations.size() > kMaximumStopTerminalScopeEntries ||
       !canonical(offer.configuration_expectations,
                  [](const auto& left, const auto& right) {
@@ -352,7 +358,15 @@ std::optional<std::string_view> stop_status_field_error(const StopStatusDTO& sta
        (status.surveillance_projection.state != StopDurableProjectionStateDTO::kNotApplicable)) ||
       (status.fault_latch.has_value() &&
        (status.fault_latch->stop_id != status.accepted.stop_id ||
-        status.fault_latch->stop_generation != status.accepted.stop_generation)) ||
+        status.fault_latch->stop_generation != status.accepted.stop_generation ||
+        status.fault_latch->stop_certificate != status.stop_certificate ||
+        (!terminal && (status.fault_latch->state != StopFaultLatchStateDTO::kLatched ||
+                       status.fault_latch->recovery_status !=
+                           StopFaultRecoveryStatusDTO::kWaitingForObservation ||
+                       status.fault_latch->terminal_projection.state !=
+                           StopDurableProjectionStateDTO::kPending ||
+                       status.fault_latch->clear_projection.state !=
+                           StopDurableProjectionStateDTO::kNotApplicable)))) ||
       (status.surveillance.has_value() &&
        (status.surveillance->stop_id != status.accepted.stop_id ||
         status.surveillance->stop_generation != status.accepted.stop_generation))) {

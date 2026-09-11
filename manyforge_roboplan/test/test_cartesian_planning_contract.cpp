@@ -1,21 +1,21 @@
 #include <gtest/gtest.h>
 
-#include <manyforge_roboplan/cartesian_planning_contract.hpp>
-#include <manyforge_roboplan/detail/cartesian_trajectory_contract.hpp>
-
+#include <Eigen/Dense>
+#include <Eigen/Geometry>
+#include <array>
 #include <cmath>
 #include <limits>
+#include <manyforge_roboplan/cartesian_planning_contract.hpp>
+#include <manyforge_roboplan/detail/cartesian_trajectory_contract.hpp>
 #include <memory>
+#include <roboplan/core/scene.hpp>
+#include <roboplan/core/types.hpp>
 #include <string>
 #include <vector>
 
-#include <Eigen/Dense>
-#include <Eigen/Geometry>
-#include <roboplan/core/scene.hpp>
-#include <roboplan/core/types.hpp>
-
 using namespace manyforge::roboplan_backend;
 using namespace manyforge::core;
+namespace trajectory_detail = manyforge::roboplan_backend::detail;
 
 TEST(CartesianPathFidelityTest,
      AcceptsEquivalentPathWithDifferentSamplingDensity) {
@@ -39,6 +39,62 @@ TEST(CartesianPathFidelityTest,
   EXPECT_GT(report.interval_checks, 0U);
   EXPECT_LE(report.max_translation_error_m, 1e-12);
   EXPECT_LE(report.max_rotation_error_rad, 1e-12);
+}
+
+TEST(CartesianPathFidelityTest,
+     WaypointCorrespondencePreservesRetracingAndDuplicateVisits) {
+  const auto pose = [](double x) {
+    Eigen::Matrix4d result = Eigen::Matrix4d::Identity();
+    result(0, 3) = x;
+    return result;
+  };
+  const std::vector<Eigen::Matrix4d> requested{pose(0), pose(1), pose(1),
+                                               pose(0), pose(1)};
+  const std::vector<Eigen::Matrix4d> actual{
+      pose(0), pose(0.5), pose(1), pose(0.5), pose(0), pose(0.5), pose(1)};
+  const std::vector<std::size_t> indices{0, 1, 2, 3, 4};
+  const auto result = verify_cartesian_path_fidelity_controlled(
+      requested, actual, 1e-6, 1e-6, {}, indices);
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(result.value().complete);
+  EXPECT_EQ(result.value().waypoint_actual_sample_indices,
+            (std::vector<std::size_t>{0, 2, 2, 4, 6}));
+  const auto invalid = verify_cartesian_path_fidelity_controlled(
+      requested, actual, 1e-6, 1e-6, {}, std::array<std::size_t, 2>{2, 1});
+  EXPECT_FALSE(invalid.ok());
+  auto detour = actual;
+  detour[3](1, 3) = 0.1;
+  const auto failed = verify_cartesian_path_fidelity_controlled(
+      requested, detour, 1e-6, 1e-6, {}, indices);
+  ASSERT_TRUE(failed.ok());
+  EXPECT_FALSE(failed.value().complete);
+  EXPECT_TRUE(failed.value().waypoint_actual_sample_indices.empty());
+}
+
+TEST(CartesianPathFidelityTest,
+     RotationOnlyAndStationaryWaypointOrderIsRetained) {
+  const auto pose = [](double angle) {
+    Eigen::Matrix4d result = Eigen::Matrix4d::Identity();
+    result.block<3, 3>(0, 0) =
+        Eigen::AngleAxisd(angle, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+    return result;
+  };
+  const std::vector<Eigen::Matrix4d> requested{pose(0), pose(0.3), pose(0),
+                                               pose(0.3)};
+  const auto result = verify_cartesian_path_fidelity_controlled(
+      requested, requested, 1e-6, 1e-3, {},
+      std::array<std::size_t, 4>{0, 1, 2, 3});
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  ASSERT_TRUE(result.value().complete);
+  EXPECT_EQ(result.value().waypoint_actual_sample_indices,
+            (std::vector<std::size_t>{0, 1, 2, 3}));
+  const std::vector<Eigen::Matrix4d> still(3, pose(0));
+  const auto stationary = verify_cartesian_path_fidelity_controlled(
+      still, still, 1e-6, 1e-6, {}, std::array<std::size_t, 3>{0, 1, 2});
+  ASSERT_TRUE(stationary.ok());
+  ASSERT_TRUE(stationary.value().complete);
+  EXPECT_EQ(stationary.value().waypoint_actual_sample_indices,
+            (std::vector<std::size_t>{0, 0, 2}));
 }
 
 TEST(CartesianPathFidelityTest,
@@ -139,7 +195,7 @@ TEST(CartesianTrajectoryContractTest,
   invalid_start.velocities.front()[0] =
       std::numeric_limits<double>::quiet_NaN();
   const auto start_error =
-      detail::validate_and_normalize_cartesian_trajectory_output(
+      trajectory_detail::validate_and_normalize_cartesian_trajectory_output(
           invalid_start, invalid_start.joint_names, control);
   ASSERT_TRUE(start_error.has_value());
   EXPECT_EQ(start_error->details.at("reason"),
@@ -150,7 +206,7 @@ TEST(CartesianTrajectoryContractTest,
   invalid_end.accelerations.back()[0] =
       std::numeric_limits<double>::infinity();
   const auto end_error =
-      detail::validate_and_normalize_cartesian_trajectory_output(
+      trajectory_detail::validate_and_normalize_cartesian_trajectory_output(
           invalid_end, invalid_end.joint_names, control);
   ASSERT_TRUE(end_error.has_value());
   EXPECT_EQ(end_error->details.at("reason"),
@@ -172,8 +228,9 @@ TEST(CartesianTrajectoryContractTest,
   const CartesianPlanningControl control{[] { return false; },
                                          [] { return false; }};
 
-  const auto error = detail::validate_and_normalize_cartesian_trajectory_output(
-      trajectory, trajectory.joint_names, control);
+  const auto error =
+      trajectory_detail::validate_and_normalize_cartesian_trajectory_output(
+          trajectory, trajectory.joint_names, control);
 
   EXPECT_FALSE(error.has_value());
   EXPECT_TRUE(trajectory.velocities.front().isZero());
@@ -194,7 +251,7 @@ TEST(CartesianTrajectoryContractTest,
   trajectory.accelerations = {Eigen::VectorXd::Zero(1),
                               Eigen::VectorXd::Zero(1)};
 
-  detail::CartesianTrajectoryContractInput request;
+  trajectory_detail::CartesianTrajectoryContractInput request;
   request.speed_profile.velocity_scale = 1.0;
   request.speed_profile.acceleration_scale = 1.0;
   JointDynamicsLimitDTO limits;
@@ -206,15 +263,70 @@ TEST(CartesianTrajectoryContractTest,
   const CartesianPlanningControl control{[] { return false; },
                                          [] { return false; }};
 
-  const auto envelope = detail::measure_cartesian_joint_dynamics_envelope(
-      request, trajectory, model_velocity_limits, model_acceleration_limits,
-      control);
+  const auto envelope =
+      trajectory_detail::measure_cartesian_joint_dynamics_envelope(
+          request, trajectory, model_velocity_limits, model_acceleration_limits,
+          control);
 
   ASSERT_TRUE(envelope.ok()) << envelope.error().message;
   ASSERT_TRUE(envelope.value().complete);
   EXPECT_NEAR(envelope.value().velocity_ratio, 1.875, 1e-10);
   EXPECT_NEAR(envelope.value().acceleration_ratio,
               10.0 / std::sqrt(3.0), 1e-9);
+  ASSERT_EQ(envelope.value().joint_derivatives.size(), 1U);
+  const auto &derivatives = envelope.value().joint_derivatives.front();
+  EXPECT_NEAR(derivatives.velocity, 1.875, 1e-10);
+  EXPECT_NEAR(derivatives.acceleration, 10.0 / std::sqrt(3.0), 1e-9);
+  EXPECT_NEAR(derivatives.jerk, 60.0, 1e-9);
+
+  // The common continuous gate also replaces the old sampled-cap helper's
+  // missing-derivative checks; absent data must never certify a zero peak.
+  for (int missing = 0; missing < 3; ++missing) {
+    auto incomplete = trajectory;
+    if (missing == 0)
+      incomplete.velocities.clear();
+    if (missing == 1)
+      incomplete.accelerations.clear();
+    if (missing == 2)
+      incomplete.velocities.back().resize(0);
+    const auto invalid =
+        trajectory_detail::measure_cartesian_joint_dynamics_envelope(
+            request, incomplete, model_velocity_limits,
+            model_acceleration_limits, control);
+    ASSERT_TRUE(invalid.ok());
+    EXPECT_FALSE(invalid.value().complete);
+  }
+}
+
+TEST(CartesianTrajectoryContractTest,
+     JerkEnvelopeFindsInteriorPeakAndScalesCubically) {
+  // q(t)=t^4/24-t^5/60 on [0,1] has jerk t-t^2: both endpoint jerks
+  // are zero while the interior peak is 1/4. Dilation must preserve that.
+  for (double dilation : {1.0, 2.0, 4.0}) {
+    roboplan::JointTrajectory trajectory;
+    trajectory.joint_names = {"joint_1"};
+    trajectory.times = {0.0, dilation};
+    trajectory.positions = {Eigen::VectorXd::Zero(1),
+                            Eigen::VectorXd::Constant(1, 1.0 / 40.0)};
+    trajectory.velocities = {
+        Eigen::VectorXd::Zero(1),
+        Eigen::VectorXd::Constant(1, 1.0 / (12.0 * dilation))};
+    trajectory.accelerations = {
+        Eigen::VectorXd::Zero(1),
+        Eigen::VectorXd::Constant(1, 1.0 / (6.0 * dilation * dilation))};
+    trajectory_detail::CartesianTrajectoryContractInput request;
+    request.speed_profile.velocity_scale = 1.0;
+    request.speed_profile.acceleration_scale = 1.0;
+    const std::array<double, 1U> limits{1.0};
+    const auto result =
+        trajectory_detail::measure_cartesian_joint_dynamics_envelope(
+            request, trajectory, limits, limits, {});
+    ASSERT_TRUE(result.ok());
+    ASSERT_TRUE(result.value().complete);
+    ASSERT_EQ(result.value().joint_derivatives.size(), 1U);
+    EXPECT_NEAR(result.value().joint_derivatives.front().jerk,
+                0.25 / dilation / dilation / dilation, 1e-11);
+  }
 }
 
 TEST(CartesianTrajectoryContractTest,
@@ -252,13 +364,14 @@ TEST(CartesianTrajectoryContractTest,
   ASSERT_TRUE(group.has_value()) << group.error();
   ASSERT_EQ(group->joint_names, std::vector<std::string>{"source"});
 
-  const auto bounds = detail::resolve_cartesian_kinematic_motion_bounds(
-      scene, "arm", group->joint_names);
+  const auto bounds =
+      trajectory_detail::resolve_cartesian_kinematic_motion_bounds(
+          scene, "arm", group->joint_names);
   ASSERT_TRUE(bounds.ok()) << bounds.error().message;
   EXPECT_DOUBLE_EQ(
       static_cast<double>(bounds.value().prismatic_amplification[0]), 9.0);
 
-  detail::CartesianTrajectoryContractInput request;
+  trajectory_detail::CartesianTrajectoryContractInput request;
   request.compiled_group_name = "arm";
   request.compiled_base_frame = "base";
   request.compiled_tcp_frame = "tip";
@@ -281,8 +394,9 @@ TEST(CartesianTrajectoryContractTest,
   const CartesianPlanningControl control{[] { return false; },
                                          [] { return false; }};
 
-  const auto envelope = detail::measure_cartesian_frame_dynamics_envelope(
-      request, path, scene, trajectory, control);
+  const auto envelope =
+      trajectory_detail::measure_cartesian_frame_dynamics_envelope(
+          request, &path, scene, trajectory, control);
 
   ASSERT_TRUE(envelope.ok()) << envelope.error().message;
   ASSERT_TRUE(envelope.value().complete);
@@ -292,6 +406,16 @@ TEST(CartesianTrajectoryContractTest,
   EXPECT_GE(envelope.value().linear_speed_ratio *
                 path.max_linear_speed_mps,
             kExactPeakLinearSpeedMps * 0.999);
+  request.speed_profile.max_tcp_linear_speed_mps = path.max_linear_speed_mps;
+  const auto linear_only = trajectory_detail::measure_cartesian_frame_dynamics_envelope(
+      request, nullptr, scene, trajectory, control);
+  ASSERT_TRUE(linear_only.ok()) << linear_only.error().message;
+  ASSERT_TRUE(linear_only.value().complete);
+  EXPECT_GE(linear_only.value().linear_speed_ratio * path.max_linear_speed_mps,
+            kExactPeakLinearSpeedMps * 0.999);
+  EXPECT_DOUBLE_EQ(linear_only.value().angular_speed_ratio, 0.0);
+  EXPECT_DOUBLE_EQ(linear_only.value().linear_acceleration_ratio, 0.0);
+  EXPECT_DOUBLE_EQ(linear_only.value().angular_acceleration_ratio, 0.0);
 }
 
 TEST(CartesianBackendErrorMappingTest,

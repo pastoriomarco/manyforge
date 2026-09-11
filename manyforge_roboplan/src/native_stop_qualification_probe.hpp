@@ -31,6 +31,7 @@ inline constexpr std::string_view kNativeSoftwareHardContractSchemaRevision =
 enum class NativeStopQualificationEvent : std::uint8_t {
   kNominalProviderEntry = 0,
   kExecutionLoopArmed,
+  kExecutionSampleReady,
   kNominalAdapterLockAttempt,
   kNominalResultWaitEnter,
   kWorkerStopObservedBeforeTerminal,
@@ -67,16 +68,41 @@ public:
   construct(core::RuntimeParticipantBinding binding,
             std::shared_ptr<IRetainedObservedStateChannel> state_channel,
             core::IClock &clock, RoboPlanExecutionBackendConfig config,
-            INativeStopQualificationProbe &probe) {
+            INativeStopQualificationProbe &probe,
+            core::IScheduler *scheduler = nullptr) {
     return std::unique_ptr<RoboPlanExecutionBackend>(
         new RoboPlanExecutionBackend(std::move(binding),
                                      std::move(state_channel), clock,
-                                     std::move(config), nullptr, &probe));
+                                     std::move(config), scheduler, &probe));
+  }
+
+  static std::uint64_t
+  hard_stop_requests(const RoboPlanExecutionBackend &backend) {
+    return backend.hard_stop_request_generation_.load(
+        std::memory_order_acquire);
+  }
+
+  // Exercise the real worker rendezvous without claiming canonical prepared
+  // product/admission qualification. The public path binds this same clock
+  // only after verifying exact prepared membership.
+  static core::ExecutionHandle execute_with_clock(
+      RoboPlanExecutionBackend &backend, const core::TrajectoryDTO &trajectory,
+      std::shared_ptr<core::detail::CoordinatedExecutionClock> clock,
+      core::OperationParticipantId participant) {
+    return backend.execute_with_clock(trajectory, std::move(clock), std::move(participant));
   }
 
   [[nodiscard]] static std::unique_lock<std::mutex>
   lock_nominal_adapter(RoboPlanExecutionBackend &backend) {
     return std::unique_lock<std::mutex>(backend.state_mutex_);
+  }
+
+  static void freeze_runtime_scale(RoboPlanExecutionBackend &backend) {
+    backend.begin_controlled_stop_runtime_scale_freeze();
+  }
+  static void release_runtime_scale(RoboPlanExecutionBackend &backend) {
+    (void)backend.end_controlled_stop_runtime_scale_freeze();
+    backend.execution_cv_.notify_all();
   }
 
   [[nodiscard]] static NativeStopQualificationScope
@@ -104,33 +130,31 @@ public:
       core::ContentDigest prepared_contract_digest,
       core::ExecutionHandle handle) {
     std::lock_guard<std::mutex> lock(backend.prepared_execution_mutex_);
-    backend.prepared_goals_.erase(stage.controller_goal_id);
-    backend.prepared_goals_.emplace(
+    backend.prepared_goal_ = RoboPlanExecutionBackend::PreparedGoalRecord{
         stage.controller_goal_id,
-        RoboPlanExecutionBackend::PreparedGoalRecord{
-            stage.controller_goal_generation,
-            std::move(prepared_contract_digest),
-            stage.operation_id,
-            stage.operation_revision,
-            stage.participant_id,
-            stage.controllable_component_id,
-            stage.command_target_id,
-            stage.capability_id,
-            stage.control_domain_id,
-            stage.control_domain_revision,
-            stage.control_binding_id,
-            stage.control_binding_revision,
-            stage.controller_topology_id,
-            stage.topology_revision,
-            stage.control_route_id,
-            stage.active_control_configuration_id,
-            stage.active_control_configuration_generation,
-            stage.provider_runtime_epoch,
-            stage.resources,
-            stage.stop_evidence_policy_id,
-            stage.stop_evidence_policy_revision,
-            {stage.participant_stop_plan},
-            std::move(handle)});
+        stage.controller_goal_generation,
+        std::move(prepared_contract_digest),
+        stage.operation_id,
+        stage.operation_revision,
+        stage.participant_id,
+        stage.controllable_component_id,
+        stage.command_target_id,
+        stage.capability_id,
+        stage.control_domain_id,
+        stage.control_domain_revision,
+        stage.control_binding_id,
+        stage.control_binding_revision,
+        stage.controller_topology_id,
+        stage.topology_revision,
+        stage.control_route_id,
+        stage.active_control_configuration_id,
+        stage.active_control_configuration_generation,
+        stage.provider_runtime_epoch,
+        stage.resources,
+        stage.stop_evidence_policy_id,
+        stage.stop_evidence_policy_revision,
+        {stage.participant_stop_plan},
+        std::move(handle)};
   }
 };
 

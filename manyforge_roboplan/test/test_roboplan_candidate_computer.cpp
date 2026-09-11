@@ -1,19 +1,20 @@
 #include <gtest/gtest.h>
 
-#include <manyforge_roboplan/roboplan_candidate_computer.hpp>
-
+#include <Eigen/Core>
+#include <Eigen/Geometry>
 #include <algorithm>
 #include <filesystem>
+#include <manyforge_core/motion_interrupt/soft_on_path_stop_planner.hpp>
+#include <manyforge_core/trajectory/trajectory_sampler.hpp>
+#include <manyforge_roboplan/detail/cartesian_trajectory_contract.hpp>
+#include <manyforge_roboplan/roboplan_candidate_computer.hpp>
 #include <memory>
 #include <optional>
+#include <roboplan/core/scene.hpp>
+#include <roboplan_example_models/resources.hpp>
 #include <string>
 #include <utility>
 #include <vector>
-
-#include <Eigen/Core>
-#include <Eigen/Geometry>
-#include <roboplan/core/scene.hpp>
-#include <roboplan_example_models/resources.hpp>
 
 namespace manyforge::roboplan_backend {
 namespace {
@@ -153,6 +154,9 @@ TEST(RoboPlanCandidateComputerTest,
       request(fixture, ResolvedMotionSpecDTO{joint_goal(fixture)}));
 
   ASSERT_TRUE(result.ok()) << result.error().message;
+  ASSERT_TRUE(result.value().runtime_scale_bounds);
+  ASSERT_TRUE(result.value().runtime_scale_bounds->nominal_time_multiplier);
+  EXPECT_GE(*result.value().runtime_scale_bounds->nominal_time_multiplier, 1.0);
   EXPECT_EQ(result.value().resources, fixture.binding.resources);
   EXPECT_EQ(result.value().joint_names,
             fixture.binding.compiled_joint_names);
@@ -161,6 +165,154 @@ TEST(RoboPlanCandidateComputerTest,
             values(fixture.start));
   EXPECT_EQ(result.value().waypoints.back().positions_rad,
             values(fixture.goal));
+}
+
+TEST(RoboPlanCandidateComputerTest,
+     FinalInterpolantJerkCapReservesLiveScalingHeadroom) {
+  auto fixture = make_fixture();
+  RoboPlanCandidateComputer computer(fixture.scene, fixture.binding,
+                                     {0x1234U, 65'536U, 0.01});
+  auto input = request(fixture, ResolvedMotionSpecDTO{joint_goal(fixture)});
+  for (std::size_t index = 0; index < fixture.binding.resources.size();
+       ++index) {
+    JointDynamicsLimitDTO limit;
+    limit.max_jerk_rad_s3 = 10.0;
+    input.dynamics_limits.push_back(
+        {fixture.binding.resources[index],
+         fixture.binding.compiled_joint_names[index], limit});
+  }
+  const auto result = computer.compute(input);
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  ASSERT_TRUE(result.value().runtime_scale_bounds);
+  roboplan::JointTrajectory native;
+  native.joint_names = result.value().joint_names;
+  for (const auto &waypoint : result.value().waypoints) {
+    native.times.push_back(waypoint.time_from_start_s);
+    native.positions.emplace_back(Eigen::Map<const Eigen::VectorXd>(
+        waypoint.positions_rad.data(), waypoint.positions_rad.size()));
+    native.velocities.emplace_back(Eigen::Map<const Eigen::VectorXd>(
+        waypoint.velocities_rad_s.data(), waypoint.velocities_rad_s.size()));
+    native.accelerations.emplace_back(Eigen::Map<const Eigen::VectorXd>(
+        waypoint.accelerations_rad_s2.data(),
+        waypoint.accelerations_rad_s2.size()));
+  }
+  const auto model_v = fixture.scene->getVelocityLimitVectors("arm");
+  const auto model_a = fixture.scene->getAccelerationLimitVectors("arm");
+  ASSERT_TRUE(model_v && model_a);
+  detail::CartesianTrajectoryContractInput contract{
+      "arm", "base", "tool0", input.speed_profile, {}};
+  const auto measured = detail::measure_cartesian_joint_dynamics_envelope(
+      contract, native, values(model_v->second), values(model_a->second), {});
+  ASSERT_TRUE(measured.ok());
+  ASSERT_TRUE(measured.value().complete);
+  const auto &bounds = *result.value().runtime_scale_bounds;
+  EXPECT_GE(bounds.max_stop_path_rate, 1.0);
+  for (std::size_t i = 0; i < measured.value().joint_derivatives.size(); ++i) {
+    EXPECT_LE(measured.value().joint_derivatives[i].velocity *
+                  bounds.max_stop_path_rate,
+              model_v->second[static_cast<Eigen::Index>(i)] *
+                      input.speed_profile.velocity_scale +
+                  1e-9);
+  }
+  core::detail::RuntimeScaleGovernor scale(
+      1.0, {bounds.max_rate_per_s, bounds.max_rate_change_per_s2});
+  ASSERT_TRUE(scale.retarget(0.2));
+  RecordProperty(
+      "trajectory_duration_s",
+      std::to_string(result.value().waypoints.back().time_from_start_s));
+  RecordProperty("scale_100_to_20_percent_s",
+                 std::to_string(scale.remaining_transition_s()));
+  for (const auto &derivative : measured.value().joint_derivatives) {
+    EXPECT_LE(derivative.jerk, 8.0 + 1e-6);
+    EXPECT_LE(derivative.jerk +
+                  3.0 * derivative.acceleration * bounds.max_rate_per_s +
+                  derivative.velocity * bounds.max_rate_change_per_s2,
+              10.0 + 1e-6);
+  }
+}
+
+TEST(RoboPlanCandidateComputerTest,
+     JointMoveStopHeadroomIncludesItsTcpSpeedCap) {
+  auto fixture = make_fixture();
+  RoboPlanCandidateComputer computer(fixture.scene, fixture.binding,
+                                     {0x1234U, 65'536U, 0.01});
+  auto input = request(fixture, ResolvedMotionSpecDTO{joint_goal(fixture)});
+  input.speed_profile.max_tcp_linear_speed_mps = 0.05;
+  const auto result = computer.compute(input);
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  ASSERT_TRUE(result.value().runtime_scale_bounds);
+  const double rate = result.value().runtime_scale_bounds->max_stop_path_rate;
+  ASSERT_GE(rate, 1.0);
+  // Re-measure the final curve traversed at the maximum certified Stop rate.
+  // This exercises the complete producer, not just a hand-written DTO.
+  roboplan::JointTrajectory native;
+  native.joint_names = result.value().joint_names;
+  for (const auto &waypoint : result.value().waypoints) {
+    native.times.push_back(waypoint.time_from_start_s / rate);
+    native.positions.emplace_back(Eigen::Map<const Eigen::VectorXd>(
+        waypoint.positions_rad.data(), waypoint.positions_rad.size()));
+    native.velocities.emplace_back(
+        rate *
+        Eigen::Map<const Eigen::VectorXd>(waypoint.velocities_rad_s.data(),
+                                          waypoint.velocities_rad_s.size()));
+    native.accelerations.emplace_back(
+        rate * rate *
+        Eigen::Map<const Eigen::VectorXd>(
+            waypoint.accelerations_rad_s2.data(),
+            waypoint.accelerations_rad_s2.size()));
+  }
+  detail::CartesianTrajectoryContractInput contract{
+      "arm", "base", "tool0", input.speed_profile, {}};
+  const auto envelope = detail::measure_cartesian_frame_dynamics_envelope(
+      contract, nullptr, fixture.scene, native, {});
+  ASSERT_TRUE(envelope.ok()) << envelope.error().message;
+  ASSERT_TRUE(envelope.value().complete);
+  // Independently subdividing the dilated curve has a different conservative
+  // residual, bounded by the primitive's declared adaptive resolution.
+  EXPECT_LE(envelope.value().linear_speed_ratio, 1.02 + 1e-10);
+}
+
+TEST(RoboPlanCandidateComputerTest,
+     EarlyAndSteadyStopUseActualRoboPlanOutputWithJerkOff) {
+  auto fixture = make_fixture();
+  RoboPlanCandidateComputer computer(fixture.scene, fixture.binding,
+                                     {0x1234U, 65'536U, 0.01});
+  const auto candidate = computer.compute(
+      request(fixture, ResolvedMotionSpecDTO{joint_goal(fixture)}));
+  ASSERT_TRUE(candidate.ok()) << candidate.error().message;
+  const auto &trajectory = candidate.value();
+  MotionInterruptStopProfileDTO profile;
+  profile.profile_id = "test-stop";
+  profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
+  profile.deceleration_time_s = 1.0;
+  for (const auto &joint : trajectory.joint_names)
+    profile.per_joint_max_deceleration.emplace(joint,
+                                               AngularAccelerationDTO{4.0});
+  SoftOnPathPlannerConfig config;
+  config.allow_model_velocity_fallback = true;
+  config.jerk_limits_enabled = false;
+  config.stop_traj_delta_s = 0.02;
+  for (double fraction : {0.02, 0.4}) {
+    const double cursor =
+        trajectory.waypoints.back().time_from_start_s * fraction;
+    const auto current = sample_trajectory(trajectory, cursor);
+    ASSERT_TRUE(current.ok());
+    SoftOnPathInitialStateDTO initial;
+    initial.state = {trajectory.joint_names, current.value().positions_rad,
+                     current.value().velocities_rad_s};
+    initial.trajectory_time_from_start_s = cursor;
+    initial.velocity_source = SoftOnPathStateSource::kModelDerived;
+    initial.runtime_scale_target_at_trip = 1.0;
+    const auto stopped =
+        plan_soft_on_path_stop(trajectory, profile, initial, config);
+    ASSERT_TRUE(stopped.ok())
+        << "fraction=" << fraction << ": " << stopped.error().message;
+    EXPECT_EQ(stopped.value().jerk_limit_source, "disabled");
+    for (double velocity : stopped.value()
+                               .replacement_trajectory.waypoints.back()
+                               .velocities_rad_s)
+      EXPECT_NEAR(velocity, 0.0, 1e-10);
+  }
 }
 
 TEST(RoboPlanCandidateComputerTest,
@@ -201,21 +353,102 @@ TEST(RoboPlanCandidateComputerTest, ScalesAbsoluteJointCapsIndependentlyAfterRes
     auto input = request(fixture, ResolvedMotionSpecDTO{joint_goal(fixture)});
     input.speed_profile = {velocity_scale, acceleration_scale, std::nullopt};
     for (std::size_t index = 0; index < fixture.binding.resources.size(); ++index) {
-      input.dynamics_limits.push_back({fixture.binding.resources[index],
-          fixture.binding.compiled_joint_names[index], {0.7, 1.2, std::nullopt}});
+      input.dynamics_limits.push_back(
+          {fixture.binding.resources[index],
+           fixture.binding.compiled_joint_names[index],
+           {0.7, 1.2, std::nullopt}});
     }
     const auto result = computer.compute(input);
     ASSERT_TRUE(result.ok()) << result.error().message;
-    for (const auto& waypoint : result.value().waypoints) {
-      ASSERT_EQ(waypoint.velocities_rad_s.size(), fixture.binding.resources.size());
-      ASSERT_EQ(waypoint.accelerations_rad_s2.size(), fixture.binding.resources.size());
-      for (const auto velocity : waypoint.velocities_rad_s) EXPECT_LE(std::abs(velocity), 0.7 * velocity_scale);
-      for (const auto acceleration : waypoint.accelerations_rad_s2) EXPECT_LE(std::abs(acceleration), 1.2 * acceleration_scale);
+    ASSERT_TRUE(result.value().runtime_scale_bounds);
+    const double stop_rate =
+        result.value().runtime_scale_bounds->max_stop_path_rate;
+    for (const auto &waypoint : result.value().waypoints) {
+      ASSERT_EQ(waypoint.velocities_rad_s.size(),
+                fixture.binding.resources.size());
+      ASSERT_EQ(waypoint.accelerations_rad_s2.size(),
+                fixture.binding.resources.size());
+      for (const auto velocity : waypoint.velocities_rad_s)
+        EXPECT_LE(std::abs(velocity), 0.7 * velocity_scale);
+      for (const auto velocity : waypoint.velocities_rad_s)
+        EXPECT_LE(stop_rate * std::abs(velocity), 0.7 * velocity_scale + 1e-10);
+      for (const auto acceleration : waypoint.accelerations_rad_s2)
+        EXPECT_LE(std::abs(acceleration), 1.2 * acceleration_scale);
     }
   }
 }
 
-TEST(RoboPlanCandidateComputerTest, PoseAndCartesianInputsUseTheSameExactProjection) {
+TEST(RoboPlanCandidateComputerTest,
+     AlreadyAtTargetUsesOrdinaryStationaryTrajectory) {
+  auto fixture = make_fixture();
+  fixture.goal = fixture.start;
+  RoboPlanCandidateComputer computer(
+      fixture.scene, fixture.binding,
+      RoboPlanCandidateComputerConfig{0x4321U, 65'536U, 0.01});
+  const auto current =
+      pose(fixture.scene->forwardKinematics(fixture.start, "tool0", "base"));
+  CartesianPathDTO path;
+  path.waypoints = {current, current};
+  for (const auto &motion : std::vector<ResolvedMotionSpecDTO>{
+           joint_goal(fixture), PoseGoalDTO{current}, path}) {
+    SCOPED_TRACE(motion.index());
+    const auto result = computer.compute(request(fixture, motion));
+    EXPECT_TRUE(result.ok()) << result.error().message;
+    if (!result.ok())
+      continue;
+    ASSERT_GE(result.value().waypoints.size(), 2U);
+    const double duration = result.value().waypoints.back().time_from_start_s;
+    EXPECT_GT(duration, 0.0);
+    if (std::holds_alternative<CartesianPathDTO>(motion)) {
+      EXPECT_EQ(result.value().cartesian_waypoint_times_s,
+                (std::vector<double>{0.0, duration}));
+    }
+    for (const auto &waypoint : result.value().waypoints) {
+      ASSERT_EQ(waypoint.positions_rad.size(),
+                static_cast<std::size_t>(fixture.start.size()));
+      for (std::size_t joint = 0U; joint < waypoint.positions_rad.size();
+           ++joint)
+        EXPECT_NEAR(waypoint.positions_rad[joint],
+                    fixture.start[static_cast<Eigen::Index>(joint)], 1e-8);
+    }
+  }
+}
+
+TEST(RoboPlanCandidateComputerTest,
+     ReturningToStartDoesNotDiscardIntermediateCartesianDestination) {
+  auto fixture = make_fixture();
+  fixture.start = fixture.goal;
+  RoboPlanCandidateComputer computer(
+      fixture.scene, fixture.binding,
+      RoboPlanCandidateComputerConfig{0x4321U, 65'536U, 0.01});
+  const Eigen::Matrix4d start =
+      fixture.scene->forwardKinematics(fixture.start, "tool0", "base");
+  Eigen::Matrix4d middle = start;
+  middle(0, 3) += 0.01;
+  CartesianPathDTO path;
+  path.waypoints = {pose(start), pose(middle), pose(start)};
+  path.max_translation_step_m = 0.005;
+  path.max_rotation_step_rad = 0.05;
+  const auto candidate_request = request(fixture, path);
+  const auto result = computer.compute(candidate_request);
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  ASSERT_EQ(result.value().cartesian_waypoint_times_s.size(), 3U);
+  EXPECT_GT(result.value().cartesian_waypoint_times_s[1], 0.0);
+  EXPECT_LT(result.value().cartesian_waypoint_times_s[1],
+            result.value().cartesian_waypoint_times_s.back());
+  const auto sample = sample_trajectory(
+      result.value(), result.value().cartesian_waypoint_times_s[1]);
+  ASSERT_TRUE(sample.ok());
+  const auto positions = Eigen::Map<const Eigen::VectorXd>(
+      sample.value().positions_rad.data(), sample.value().positions_rad.size());
+  const auto actual = fixture.scene->forwardKinematics(
+      fixture.scene->toFullJointPositions("arm", positions), "tool0", "base");
+  EXPECT_LE((actual.block<3, 1>(0, 3) - middle.block<3, 1>(0, 3)).norm(),
+            candidate_request.tolerances.translation_tol_m);
+}
+
+TEST(RoboPlanCandidateComputerTest,
+     PoseAndCartesianInputsUseTheSameExactProjection) {
   auto fixture = make_fixture();
   RoboPlanCandidateComputer computer(
       fixture.scene, fixture.binding,
@@ -230,12 +463,14 @@ TEST(RoboPlanCandidateComputerTest, PoseAndCartesianInputsUseTheSameExactProject
 
   const Eigen::VectorXd cartesian_start =
       fixture.scene->getCurrentJointPositions();
-  const Eigen::Matrix4d start_pose = fixture.scene->forwardKinematics(
-      cartesian_start, "tool0", "base");
+  const Eigen::Matrix4d start_pose =
+      fixture.scene->forwardKinematics(cartesian_start, "tool0", "base");
   Eigen::Matrix4d end_pose = start_pose;
   end_pose(0, 3) += 0.01;
+  Eigen::Matrix4d middle_pose = start_pose;
+  middle_pose(0, 3) += 0.005;
   CartesianPathDTO path;
-  path.waypoints = {pose(start_pose), pose(end_pose)};
+  path.waypoints = {pose(start_pose), pose(middle_pose), pose(end_pose)};
   path.max_translation_step_m = 0.005;
   path.max_rotation_step_rad = 0.05;
   path.max_linear_speed_mps = 0.05;
@@ -245,10 +480,26 @@ TEST(RoboPlanCandidateComputerTest, PoseAndCartesianInputsUseTheSameExactProject
   const auto cartesian_result = computer.compute(request(
       fixture, ResolvedMotionSpecDTO{std::move(path)}, &cartesian_start));
   ASSERT_TRUE(cartesian_result.ok()) << cartesian_result.error().message;
-  EXPECT_EQ(cartesian_result.value().resources,
-            fixture.binding.resources);
+  EXPECT_EQ(cartesian_result.value().resources, fixture.binding.resources);
   EXPECT_EQ(cartesian_result.value().joint_names,
             fixture.binding.compiled_joint_names);
+  const auto &milestones = cartesian_result.value().cartesian_waypoint_times_s;
+  ASSERT_EQ(milestones.size(), 3U);
+  EXPECT_DOUBLE_EQ(milestones.front(), 0.0);
+  EXPECT_DOUBLE_EQ(milestones.back(),
+                   cartesian_result.value().waypoints.back().time_from_start_s);
+  ASSERT_GT(milestones[1], 0.0);
+  ASSERT_LT(milestones[1], milestones.back());
+  const auto sample =
+      sample_trajectory(cartesian_result.value(), milestones[1]);
+  ASSERT_TRUE(sample.ok());
+  const auto positions = Eigen::Map<const Eigen::VectorXd>(
+      sample.value().positions_rad.data(), sample.value().positions_rad.size());
+  const auto actual = fixture.scene->forwardKinematics(
+      fixture.scene->toFullJointPositions("arm", positions), "tool0", "base");
+  EXPECT_LE((actual.block<3, 1>(0, 3) - middle_pose.block<3, 1>(0, 3)).norm(),
+            5e-3);
+  EXPECT_TRUE(pose_result.value().cartesian_waypoint_times_s.empty());
 }
 
 TEST(RoboPlanCandidateComputerTest,
@@ -275,7 +526,7 @@ TEST(RoboPlanCandidateComputerTest,
 }
 
 TEST(RoboPlanCandidateComputerTest,
-     UnresolvedTargetsUnsupportedCapsAndCancellationFailClosed) {
+     UnresolvedTargetsInvalidCapsAndCancellationFailClosed) {
   auto fixture = make_fixture();
   RoboPlanCandidateComputer computer(fixture.scene, fixture.binding,
                                      {0x1234U, 65'536U, 0.01});
@@ -289,24 +540,34 @@ TEST(RoboPlanCandidateComputerTest,
   auto capped = request(fixture,
                         ResolvedMotionSpecDTO{joint_goal(fixture)});
   JointDynamicsLimitDTO jerk;
-  jerk.max_jerk_rad_s3 = 1.0;
+  jerk.max_jerk_rad_s3 = -1.0;
   capped.dynamics_limits.push_back(ResolvedResourceDynamicsLimitDTO{
       fixture.binding.resources.front(),
       fixture.binding.compiled_joint_names.front(), jerk});
   const auto cap_result = computer.compute(capped);
   ASSERT_FALSE(cap_result.ok());
   EXPECT_EQ(cap_result.error().details.at("reason"),
+            "invalid_joint_dynamics_limit");
+
+  capped.dynamics_limits.front().limit.max_jerk_rad_s3 = 1.0;
+  capped.dynamics_limits.front().compiled_joint_name = "absent_joint";
+  const auto absent_joint = computer.compute(capped);
+  ASSERT_FALSE(absent_joint.ok());
+  EXPECT_EQ(absent_joint.error().details.at("reason"),
+            "invalid_joint_dynamics_limit");
+  capped.dynamics_limits.front().resource_id = ResourceId("absent_resource");
+  const auto absent_resource = computer.compute(capped);
+  ASSERT_FALSE(absent_resource.ok());
+  EXPECT_EQ(absent_resource.error().details.at("reason"),
             "unsupported_joint_dynamics_limit");
-  EXPECT_EQ(cap_result.error().details.at("dimension"), "jerk");
 
   const RoboPlanCandidateControl cancelled{[] { return true; }, {}};
   const auto cancelled_result = computer.compute(
-      request(fixture, ResolvedMotionSpecDTO{joint_goal(fixture)}),
-      cancelled);
+      request(fixture, ResolvedMotionSpecDTO{joint_goal(fixture)}), cancelled);
   ASSERT_FALSE(cancelled_result.ok());
   EXPECT_EQ(cancelled_result.error().details.at("reason"),
             "planning_cancelled_by_interrupt");
 }
 
-}  // namespace
-}  // namespace manyforge::roboplan_backend
+} // namespace
+} // namespace manyforge::roboplan_backend

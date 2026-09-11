@@ -126,13 +126,10 @@ class ProgramRunnerLivenessReceiver:
                 "liveness run capability changed while opening"
             ) from error
         identity = (before.st_dev, before.st_ino)
-        if (
-            canonical != root
-            or any(
-                not self._safe_run_root(metadata)
-                or (metadata.st_dev, metadata.st_ino) != identity
-                for metadata in (before, opened, after)
-            )
+        if canonical != root or any(
+            not self._safe_run_root(metadata)
+            or (metadata.st_dev, metadata.st_ino) != identity
+            for metadata in (before, opened, after)
         ):
             os.close(descriptor)
             raise ProgramRunnerLivenessError(
@@ -156,9 +153,7 @@ class ProgramRunnerLivenessReceiver:
             or (opened.st_dev, opened.st_ino) != identity
             or (current.st_dev, current.st_ino) != identity
         ):
-            raise ProgramRunnerLivenessError(
-                "liveness run capability was replaced"
-            )
+            raise ProgramRunnerLivenessError("liveness run capability was replaced")
 
     def _endpoint_status(self, descriptor: int) -> os.stat_result:
         return os.stat(
@@ -296,8 +291,7 @@ class ProgramRunnerLivenessReceiver:
                         + self._runtime_epoch
                     )
                     reference = (
-                        "sha256:"
-                        + hashlib.sha256(material.encode()).hexdigest()
+                        "sha256:" + hashlib.sha256(material.encode()).hexdigest()
                     )
                 try:
                     reference = self._on_expiry(reference)
@@ -407,9 +401,7 @@ class ProgramRunnerLivenessReceiver:
                     credentials = connection.getsockopt(
                         socket.SOL_SOCKET, socket.SO_PEERCRED, 12
                     )
-                    _peer_pid, peer_uid, _peer_gid = struct.unpack(
-                        "3i", credentials
-                    )
+                    _peer_pid, peer_uid, _peer_gid = struct.unpack("3i", credentials)
                     if peer_uid != os.geteuid():
                         raise ProgramRunnerLivenessError("foreign peer uid")
                     packet, _ancillary, flags, _address = connection.recvmsg(
@@ -449,9 +441,10 @@ class ProgramRunnerLivenessReceiver:
             value = json.loads(text)
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ProgramRunnerLivenessError("packet is not strict JSON") from error
-        if not isinstance(value, dict) or ProgramRunnerLivenessReceiver._encode(
-            value
-        ) != packet:
+        if (
+            not isinstance(value, dict)
+            or ProgramRunnerLivenessReceiver._encode(value) != packet
+        ):
             raise ProgramRunnerLivenessError("packet is not canonical JSON")
         return value
 
@@ -528,17 +521,19 @@ class ProgramRunnerLivenessReceiver:
         ):
             raise ProgramRunnerLivenessError("malformed idle Program cycle")
         recovery = state == "recovery_required"
-        if not idle and not recovery and (
-            not isinstance(run_id, str)
-            or not run_id
-            or len(run_id.encode("utf-8")) > 256
+        if (
+            not idle
+            and not recovery
+            and (
+                not isinstance(run_id, str)
+                or not run_id
+                or len(run_id.encode("utf-8")) > 256
+            )
         ):
             raise ProgramRunnerLivenessError("malformed Program-cycle run identity")
         if claim_generation is not None and not isinstance(run_id, str):
             raise ProgramRunnerLivenessError("malformed Program-cycle run identity")
-        claimless_terminal = (
-            state == "terminal_awaiting_reset" and terminal is not None
-        )
+        claimless_terminal = state == "terminal_awaiting_reset" and terminal is not None
         if (
             not idle
             and claim_generation is None
@@ -668,7 +663,9 @@ class ProgramRunnerLivenessReceiver:
             needs_reconciliation = self._state != "current"
             if self._manager_runtime_epoch is not None:
                 if incoming_manager != self._manager_runtime_epoch:
-                    if not self._predecessor_expired:
+                    if not self._predecessor_expired or (
+                        self._last_accepted_ns is not None and self._state != "expired"
+                    ):
                         raise ProgramRunnerLivenessError(
                             "predecessor Manager has not expired"
                         )
@@ -677,8 +674,7 @@ class ProgramRunnerLivenessReceiver:
                 else:
                     if (
                         self._manager_owner_epoch is not None
-                        and request["manager_owner_epoch"]
-                        != self._manager_owner_epoch
+                        and request["manager_owner_epoch"] != self._manager_owner_epoch
                     ):
                         raise ProgramRunnerLivenessError(
                             "Manager owner epoch changed without runtime expiry"
@@ -687,18 +683,12 @@ class ProgramRunnerLivenessReceiver:
                         self._last_sequence is not None
                         and sequence <= self._last_sequence
                     ):
-                        raise ProgramRunnerLivenessError(
-                            "stale heartbeat sequence"
-                        )
-            if reconciliation is None:
-                raise ProgramRunnerLivenessError(
-                    "Runner renewal requires exact Manager reconciliation"
-                )
+                        raise ProgramRunnerLivenessError("stale heartbeat sequence")
             if self._receiver_status_sequence >= MAXIMUM_SEQUENCE:
                 raise ProgramRunnerLivenessError(
                     "receiver status sequence is exhausted"
                 )
-            if needs_reconciliation:
+            if needs_reconciliation and reconciliation is not None:
                 self._on_reconciliation(
                     reconciliation,
                     incoming_manager,
@@ -710,9 +700,15 @@ class ProgramRunnerLivenessReceiver:
             self._last_sequence = sequence
             self._last_accepted_ns = self._clock()
             self._receiver_status_sequence += 1
-            self._predecessor_expired = False
-            self._state = "current"
-            self._fenced = False
+            # Receipt proves peer liveness, not runtime readiness. During Apply
+            # a healthy Manager may have no reconciled native projection yet.
+            if reconciliation is not None:
+                self._predecessor_expired = False
+                self._state = "current"
+                self._fenced = False
+            elif needs_reconciliation:
+                self._state = "unreconciled"
+                self._fenced = True
         status = self.status()
         return {
             **status,
@@ -720,9 +716,7 @@ class ProgramRunnerLivenessReceiver:
             "api_version": API_VERSION,
             "kind": "heartbeat_ack",
             "program_cycle_status": self._project_cycle_status(),
-            "required_runtime_set_digest": request[
-                "required_runtime_set_digest"
-            ],
+            "required_runtime_set_digest": request["required_runtime_set_digest"],
             "receiver_status_digest": self._status_digest(status),
         }
 
@@ -741,16 +735,12 @@ class ProgramRunnerLivenessReceiver:
                     and (
                         self._manager_runtime_epoch is None
                         or self._predecessor_expired
-                        or self._clock() - self._started_ns
-                        <= EXPIRY_TIMEOUT_NS
+                        or self._clock() - self._started_ns <= EXPIRY_TIMEOUT_NS
                     )
                 )
                 or (
                     accepted is not None
-                    and (
-                        self._state != "current"
-                        or self._clock() - accepted <= EXPIRY_TIMEOUT_NS
-                    )
+                    and (self._clock() - accepted <= EXPIRY_TIMEOUT_NS)
                 )
             ):
                 return False
@@ -760,6 +750,8 @@ class ProgramRunnerLivenessReceiver:
             self._predecessor_expired = True
             if self._receiver_status_sequence < MAXIMUM_SEQUENCE:
                 self._receiver_status_sequence += 1
+            expired_sequence = self._last_sequence
+            expired_age = None if accepted is None else self._clock() - accepted
         material = (
             "manyforge.program-runner.manager-loss.v1\0"
             + manager_epoch
@@ -773,6 +765,13 @@ class ProgramRunnerLivenessReceiver:
             reference = fallback
         with self._lock:
             self._fault_reference = reference
+        # Containment and durable fault publication precede best-effort logs.
+        logging.getLogger(__name__).error(
+            "Manager heartbeat expired: epoch=%s sequence=%s age_ns=%s",
+            manager_epoch,
+            expired_sequence,
+            expired_age,
+        )
         return True
 
 

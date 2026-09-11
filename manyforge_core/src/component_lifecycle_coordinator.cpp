@@ -203,6 +203,11 @@ class FixedWorkerPool final {
     return drained_.wait_for(lock, timeout, [&] { return queued_.empty() && running_ == 0U; });
   }
 
+  [[nodiscard]] bool IsIdle() {
+    std::lock_guard lock(mutex_);
+    return queued_.empty() && running_ == 0U;
+  }
+
  private:
   void Run(std::stop_token cancellation) noexcept {
     while (!cancellation.stop_requested()) {
@@ -429,6 +434,7 @@ class ComponentLifecycleCoordinator::Impl final {
        IScheduler& scheduler, IKernelCellAdmissionPort* kernel_cell_admission_port,
        std::optional<ComponentLifecycleCoordinatorRouteServices> route_services)
       : config_(std::move(config)),
+        request_epoch_(std::make_shared<const RequestOwnerEpoch>(config_.request_owner_epoch)),
         journal_(journal),
         domain_reservations_(domain_reservations),
         current_snapshot_source_(current_snapshot_source),
@@ -520,7 +526,7 @@ class ComponentLifecycleCoordinator::Impl final {
         recovered.ok() &&
         std::any_of(recovered.value().interrupted_transactions.begin(),
                     recovered.value().interrupted_transactions.end(), [&](const auto& status) {
-                      return status.status_owner_epoch == config_.request_owner_epoch;
+                      return status.status_owner_epoch == recovered.value().request_owner_epoch;
                     });
     if (!recovered.ok() || !recovered.value().locally_valid() || current_owner_interrupted) {
       Shutdown();
@@ -532,7 +538,10 @@ class ComponentLifecycleCoordinator::Impl final {
                                                             : "recovery_shape_invalid")
               : recovered.error());
     }
-    for (auto& row : recovered.value().lifecycle_claims) {
+    request_epoch_.store(
+        std::make_shared<const RequestOwnerEpoch>(recovered.value().request_owner_epoch),
+        std::memory_order_release);
+    for (auto& row : recovered.value().cell_claims) {
       Result<CellAdmissionRecoveryReceiptDTO> receipt =
           Result<CellAdmissionRecoveryReceiptDTO>::Err(coordinator_error(
               "component_lifecycle_claim_recovery_unknown",
@@ -548,8 +557,7 @@ class ComponentLifecycleCoordinator::Impl final {
           receipt.value().matched_claim.has_value() &&
           receipt.value().matched_claim->intent == row.intent) {
         recovered_claim = receipt.value().matched_claim;
-        if (!journal_.RecordLifecycleClaimAcquired(config_.request_owner_epoch, *recovered_claim)
-                 .ok()) {
+        if (!journal_.RecordCellClaimAcquired(CurrentOwnerEpoch(), *recovered_claim).ok()) {
           Shutdown();
           return Result<void>::Err(coordinator_error(
               "component_lifecycle_claim_recovery_unknown",
@@ -560,8 +568,7 @@ class ComponentLifecycleCoordinator::Impl final {
       if (!recovered_claim.has_value()) {
         if (!receipt.ok() ||
             receipt.value().status != CellAdmissionRecoveryReceiptStatusDTO::kUnknown ||
-            !journal_.RecordLifecycleClaimNotAcquired(config_.request_owner_epoch, row.intent)
-                 .ok()) {
+            !journal_.RecordCellClaimNotAcquired(CurrentOwnerEpoch(), row.intent).ok()) {
           Shutdown();
           return Result<void>::Err(coordinator_error(
               "component_lifecycle_claim_recovery_unknown",
@@ -569,7 +576,7 @@ class ComponentLifecycleCoordinator::Impl final {
         }
         continue;
       }
-      if (row.lifecycle_accepted && !row.release_intent.has_value()) {
+      if (row.transaction_accepted && !row.release_intent.has_value()) {
         if (!receipt.ok() ||
             receipt.value().status != CellAdmissionRecoveryReceiptStatusDTO::kHeldExact ||
             receipt.value().matched_claim != recovered_claim) {
@@ -582,19 +589,18 @@ class ComponentLifecycleCoordinator::Impl final {
         continue;
       }
       std::optional<CellAdmissionClaimReleaseDTO> recovery_release = row.release_intent;
-      if (!row.lifecycle_accepted && !recovery_release.has_value()) {
-        recovery_release = CellAdmissionClaimReleaseDTO{
-            row.intent.owner_role,
-            row.intent.owner_epoch,
-            row.intent.owner_transaction_id,
-            row.intent.request_id,
-            row.intent.request_payload_digest,
-            recovered_claim->acquired_admission_generation,
-            recovered_claim->claim_generation,
-            {CellAdmissionSettlementKindDTO::kProvenNoEffect, row.intent.request_payload_digest}};
-        if (!journal_
-                 .RecordUnacceptedLifecycleClaimRelease(config_.request_owner_epoch,
-                                                        *recovery_release)
+      if (!row.transaction_accepted) {
+        if (!recovery_release)
+          recovery_release = CellAdmissionClaimReleaseDTO{
+              row.intent.owner_role,
+              row.intent.owner_epoch,
+              row.intent.owner_transaction_id,
+              row.intent.request_id,
+              row.intent.request_payload_digest,
+              recovered_claim->acquired_admission_generation,
+              recovered_claim->claim_generation,
+              {CellAdmissionSettlementKindDTO::kProvenNoEffect, row.intent.request_payload_digest}};
+        if (!journal_.RecordUnacceptedCellClaimRelease(CurrentOwnerEpoch(), *recovery_release)
                  .ok()) {
           Shutdown();
           return Result<void>::Err(
@@ -617,8 +623,8 @@ class ComponentLifecycleCoordinator::Impl final {
           (receipt.value().status != CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact &&
            receipt.value().status != CellAdmissionRecoveryReceiptStatusDTO::kReconciledExact) ||
           !journal_
-               .RecordLifecycleClaimReleaseReceipt(config_.request_owner_epoch, *recovery_release,
-                                                   receipt.value())
+               .RecordCellClaimReleaseReceipt(CurrentOwnerEpoch(), *recovery_release,
+                                              receipt.value())
                .ok()) {
         Shutdown();
         return Result<void>::Err(coordinator_error(
@@ -707,12 +713,12 @@ class ComponentLifecycleCoordinator::Impl final {
           auto runtime = std::make_shared<RuntimeState>(status, std::nullopt, false, std::nullopt,
                                                         std::move(domains));
           const auto recovered_claim =
-              std::find_if(recovered.value().lifecycle_claims.begin(),
-                           recovered.value().lifecycle_claims.end(), [&](const auto& row) {
+              std::find_if(recovered.value().cell_claims.begin(),
+                           recovered.value().cell_claims.end(), [&](const auto& row) {
                              return row.intent.owner_transaction_id ==
                                     status.acceptance.lifecycle_transaction_id.value();
                            });
-          if (recovered_claim == recovered.value().lifecycle_claims.end() ||
+          if (recovered_claim == recovered.value().cell_claims.end() ||
               !recovered_claim->claim.has_value()) {
             Shutdown();
             return Result<void>::Err(
@@ -797,7 +803,7 @@ class ComponentLifecycleCoordinator::Impl final {
       return Result<void>::Ok();
     }
     if (recovered.value().interrupted_transactions.empty()) {
-      if (!RotateLifecycleOwnerEpoch()) {
+      if (!ReconcileLifecycleOwnerEpoch(CurrentOwnerEpoch())) {
         Shutdown();
         return Result<void>::Err(
             coordinator_error("component_lifecycle_owner_epoch_reconciliation_failed",
@@ -811,6 +817,31 @@ class ComponentLifecycleCoordinator::Impl final {
 
   [[nodiscard]] Result<CCLCLifecycleRequestResultDTO> SubmitLifecycle(
       const ComponentLifecycleIntentDTO& intent) {
+    return ResolveAdmission([&] { return SubmitLifecycleResolved(intent); });
+  }
+
+  [[nodiscard]] Result<CCLCLifecycleRequestResultDTO> SubmitLifecycleResolved(
+      const ComponentLifecycleIntentDTO& intent) {
+    bool known_unstarted = false;
+    auto result = SubmitLifecycleAttempt(intent, known_unstarted);
+    if (!result.ok() && known_unstarted) {
+      // The same gate covers preflight, acceptance and rejection: neither
+      // a duplicate nor a namespace checkpoint can cross this decision.
+      auto error = result.error();
+      error.details["effect"] = "not_started";
+      auto retained =
+          journal_.RecordLifecycleRejection(CurrentOwnerEpoch(), intent, error, std::nullopt);
+      result = retained.ok() ? ReplayResult(retained.value()) : retained;
+    }
+    if (!result.ok() && result.error().code == "request_ledger_full") {
+      return Result<CCLCLifecycleRequestResultDTO>::Err(
+          CheckpointFullRequestNamespace(intent.request_context.request_owner_epoch));
+    }
+    return result;
+  }
+
+  [[nodiscard]] Result<CCLCLifecycleRequestResultDTO> SubmitLifecycleAttempt(
+      const ComponentLifecycleIntentDTO& intent, bool& known_unstarted) {
     if (!intent.locally_valid()) {
       return Result<CCLCLifecycleRequestResultDTO>::Err(coordinator_error(
           "component_lifecycle_intent_invalid",
@@ -830,7 +861,7 @@ class ComponentLifecycleCoordinator::Impl final {
             "component_lifecycle_journal_inspection_failed",
             "the lifecycle journal inspection raised an exception", "journal_exception"));
     try {
-      inspected = journal_.InspectLifecycleRequest(config_.request_owner_epoch, intent);
+      inspected = journal_.InspectLifecycleRequest(CurrentOwnerEpoch(), intent);
     } catch (...) {
     }
     if (!inspected.ok()) {
@@ -839,6 +870,7 @@ class ComponentLifecycleCoordinator::Impl final {
     if (inspected.value().has_value()) {
       return ReplayResult(*inspected.value());
     }
+    known_unstarted = true;
     std::uint64_t admission_gate_generation = 0U;
     {
       std::lock_guard lock(admission_mutex_);
@@ -863,7 +895,8 @@ class ComponentLifecycleCoordinator::Impl final {
       if (!facts.ok()) {
         return Result<CCLCLifecycleRequestResultDTO>::Err(facts.error());
       }
-      const auto admitted = CommitAdmission(intent, facts.value(), admission_gate_generation);
+      const auto admitted =
+          CommitAdmission(intent, facts.value(), admission_gate_generation, known_unstarted);
       if (admitted.ok()) {
         return admitted;
       }
@@ -880,6 +913,30 @@ class ComponentLifecycleCoordinator::Impl final {
                           "admission_resolution_attempts_exhausted"));
   }
 
+  [[nodiscard]] Result<std::optional<CCLCLifecycleRequestResultDTO>> ReadLifecycleRequestResult(
+      const ComponentLifecycleIntentDTO& intent) {
+    if (!intent.locally_valid()) {
+      return Result<std::optional<CCLCLifecycleRequestResultDTO>>::Err(
+          coordinator_error("component_lifecycle_intent_invalid",
+                            "lifecycle result query is invalid", "intent_invalid"));
+    }
+    try {
+      return ResolveAdmission([&] {
+        auto result = journal_.ReadLifecycleRequestResult(intent);
+        if (result.ok() && result.value() &&
+            result.value()->replay_status == RequestReplayStatusDTO::kRequestLedgerFull) {
+          return Result<std::optional<CCLCLifecycleRequestResultDTO>>::Err(
+              UnstartedCapacityDeferral());
+        }
+        return result;
+      });
+    } catch (...) {
+      return Result<std::optional<CCLCLifecycleRequestResultDTO>>::Err(
+          coordinator_error("component_lifecycle_journal_inspection_failed",
+                            "lifecycle result lookup failed", "journal_exception"));
+    }
+  }
+
   [[nodiscard]] Result<std::optional<ComponentLifecycleStatusDTO>> LoadLifecycleStatus(
       const LifecycleTransactionId& lifecycle_transaction_id) {
     try {
@@ -891,8 +948,54 @@ class ComponentLifecycleCoordinator::Impl final {
     }
   }
 
+  [[nodiscard]] Result<std::optional<CCLCRouteSelectionRequestResultDTO>>
+  ReadRouteSelectionRequestResult(const RouteSelectionIntentDTO& intent) {
+    if (!intent.locally_valid()) {
+      return Result<std::optional<CCLCRouteSelectionRequestResultDTO>>::Err(coordinator_error(
+          "route_selection_intent_invalid", "route result query is invalid", "intent_invalid"));
+    }
+    try {
+      return ResolveAdmission([&] {
+        auto result = journal_.ReadRouteSelectionRequestResult(intent);
+        if (result.ok() && result.value() &&
+            result.value()->replay_status == RequestReplayStatusDTO::kRequestLedgerFull) {
+          return Result<std::optional<CCLCRouteSelectionRequestResultDTO>>::Err(
+              UnstartedCapacityDeferral());
+        }
+        return result;
+      });
+    } catch (...) {
+      return Result<std::optional<CCLCRouteSelectionRequestResultDTO>>::Err(
+          coordinator_error("component_lifecycle_journal_inspection_failed",
+                            "route result lookup failed", "journal_exception"));
+    }
+  }
+
   [[nodiscard]] Result<CCLCRouteSelectionRequestResultDTO> SubmitRouteSelection(
       const RouteSelectionIntentDTO& intent) {
+    return ResolveAdmission([&] { return SubmitRouteSelectionResolved(intent); });
+  }
+
+  [[nodiscard]] Result<CCLCRouteSelectionRequestResultDTO> SubmitRouteSelectionResolved(
+      const RouteSelectionIntentDTO& intent) {
+    bool known_unstarted = false;
+    auto result = SubmitRouteSelectionAttempt(intent, known_unstarted);
+    if (!result.ok() && known_unstarted) {
+      auto error = result.error();
+      error.details["effect"] = "not_started";
+      auto retained =
+          journal_.RecordRouteSelectionRejection(CurrentOwnerEpoch(), intent, error, std::nullopt);
+      result = retained.ok() ? ReplayRouteResult(retained.value()) : retained;
+    }
+    if (!result.ok() && result.error().code == "request_ledger_full") {
+      return Result<CCLCRouteSelectionRequestResultDTO>::Err(
+          CheckpointFullRequestNamespace(intent.request_context.request_owner_epoch));
+    }
+    return result;
+  }
+
+  [[nodiscard]] Result<CCLCRouteSelectionRequestResultDTO> SubmitRouteSelectionAttempt(
+      const RouteSelectionIntentDTO& intent, bool& known_unstarted) {
     if (!intent.locally_valid()) {
       return Result<CCLCRouteSelectionRequestResultDTO>::Err(
           coordinator_error("route_selection_intent_invalid",
@@ -917,7 +1020,7 @@ class ComponentLifecycleCoordinator::Impl final {
             "route_selection_journal_inspection_failed",
             "the route journal inspection raised an exception", "journal_exception"));
     try {
-      inspected = journal_.InspectRouteSelectionRequest(config_.request_owner_epoch, intent);
+      inspected = journal_.InspectRouteSelectionRequest(CurrentOwnerEpoch(), intent);
     } catch (...) {
     }
     if (!inspected.ok()) {
@@ -925,6 +1028,12 @@ class ComponentLifecycleCoordinator::Impl final {
     }
     if (inspected.value().has_value()) {
       return ReplayRouteResult(*inspected.value());
+    }
+    known_unstarted = true;
+    if (!intent.expected_admission_generation) {
+      return Result<CCLCRouteSelectionRequestResultDTO>::Err(coordinator_error(
+          "route_selection_intent_invalid", "new route requests require admission generation",
+          "admission_generation_required"));
     }
 
     std::uint64_t admission_gate_generation = 0U;
@@ -937,7 +1046,7 @@ class ComponentLifecycleCoordinator::Impl final {
       }
       admission_gate_generation = admission_gate_generation_;
     }
-    return CommitRouteAdmission(intent, admission_gate_generation);
+    return CommitRouteAdmission(intent, admission_gate_generation, known_unstarted);
   }
 
   [[nodiscard]] Result<std::optional<RouteSelectionStatusDTO>> LoadRouteSelectionStatus(
@@ -955,8 +1064,10 @@ class ComponentLifecycleCoordinator::Impl final {
     return accepting_.load(std::memory_order_acquire);
   }
 
-  [[nodiscard]] RequestOwnerEpoch request_owner_epoch() const {
-    return config_.request_owner_epoch;
+  [[nodiscard]] RequestOwnerEpoch request_owner_epoch() const { return CurrentOwnerEpoch(); }
+
+  [[nodiscard]] RequestOwnerEpoch CurrentOwnerEpoch() const {
+    return *request_epoch_.load(std::memory_order_acquire);
   }
 
   void CloseAdmission() noexcept {
@@ -983,17 +1094,37 @@ class ComponentLifecycleCoordinator::Impl final {
   }
 
  private:
-  [[nodiscard]] bool RotateLifecycleOwnerEpoch() noexcept {
+  template <typename Function>
+  std::invoke_result_t<Function> ResolveAdmission(Function&& function) {
+    std::unique_lock lock(admission_mutex_);
+    admission_resolution_ready_.wait(lock, [&] { return !admission_resolution_active_; });
+    admission_resolution_active_ = true;
+    ScopeExit resolved([&] {
+      lock.lock();
+      admission_resolution_active_ = false;
+      admission_resolution_ready_.notify_all();
+    });
+    lock.unlock();
+    return function();
+  }
+
+  static ErrorDTO UnstartedCapacityDeferral() {
+    return {"cclc_request_admission_deferred",
+            "CCLC is finishing accepted work before retiring its full request namespace",
+            {{"reason", "request_namespace_busy"}, {"effect", "not_started"}}};
+  }
+
+  [[nodiscard]] bool ReconcileLifecycleOwnerEpoch(const RequestOwnerEpoch& epoch) noexcept {
     const auto probe_digest =
         ContentDigest("sha256:0000000000000000000000000000000000000000000000000000000000000000");
     const auto reconciliation_digest = CellAdmissionOwnerEpochReconciliationEvidenceDigest(
-        CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner, config_.request_owner_epoch);
+        CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner, epoch);
     if (!reconciliation_digest.ok()) {
       return false;
     }
     const CellAdmissionClaimIntentDTO probe{CellAdmissionClaimKindDTO::kComponentLifecycle,
                                             CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner,
-                                            config_.request_owner_epoch,
+                                            epoch,
                                             "cclc-owner-epoch-probe",
                                             RequestId("cclc-owner-epoch-probe"),
                                             probe_digest,
@@ -1001,34 +1132,128 @@ class ComponentLifecycleCoordinator::Impl final {
                                             {},
                                             std::nullopt,
                                             std::nullopt};
-    Result<CellAdmissionRecoveryReceiptDTO> receipt =
-        Result<CellAdmissionRecoveryReceiptDTO>::Err(coordinator_error(
-            "component_lifecycle_owner_epoch_reconciliation_failed",
-            "Kernel lifecycle-owner receipt raised an exception", "recovery_receipt_exception"));
+    for (std::size_t attempt = 0; attempt != kMaximumAdmissionResolutionAttempts; ++attempt) {
+      Result<CellAdmissionRecoveryReceiptDTO> receipt =
+          Result<CellAdmissionRecoveryReceiptDTO>::Err(coordinator_error(
+              "component_lifecycle_owner_epoch_reconciliation_failed",
+              "Kernel lifecycle-owner receipt raised an exception", "recovery_receipt_exception"));
+      try {
+        receipt = kernel_cell_admission_port_->GetCellAdmissionRecoveryReceipt(
+            {probe, std::nullopt, std::nullopt});
+      } catch (...) {
+      }
+      if (!receipt.ok()) {
+        return false;
+      }
+      const auto matches = [&](const CellAdmissionRecoveryReceiptDTO& value) {
+        return value.kernel_owner_epoch == receipt.value().kernel_owner_epoch &&
+               std::find(value.current_owner_epochs.begin(), value.current_owner_epochs.end(),
+                         CellAdmissionCurrentOwnerEpochDTO{
+                             CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner, epoch}) !=
+                   value.current_owner_epochs.end();
+      };
+      // A lost reconcile response must not rebuild a different claim inventory
+      // under the same digest. The current authoritative owner mapping proves
+      // that this exact namespace was already installed.
+      if (matches(receipt.value())) return true;
+      auto owners = receipt.value().current_owner_epochs;
+      std::erase_if(owners, [](const auto& owner) {
+        return owner.owner_role == CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner;
+      });
+      owners.push_back({CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner, epoch});
+      std::sort(owners.begin(), owners.end(),
+                [](const auto& lhs, const auto& rhs) { return lhs.owner_role < rhs.owner_role; });
+      const CellAdmissionReconcileDTO reconcile{receipt.value().kernel_owner_epoch,
+                                                receipt.value().held_claims, std::move(owners),
+                                                reconciliation_digest.value()};
+      try {
+        const auto applied = kernel_cell_admission_port_->ReconcileCellAdmissionClaims(reconcile);
+        if (applied.ok()) return true;
+        const auto reason = applied.error().details.find("reason");
+        if (applied.error().code == "authoring_not_ready" &&
+            reason != applied.error().details.end() &&
+            reason->second == "reconcile_inventory_not_exact") {
+          // Another owner's claim changed after our read. Kernel explicitly
+          // made no change; only this refusal permits a fresh inventory.
+          continue;
+        }
+      } catch (...) {
+      }
+      try {
+        const auto observed = kernel_cell_admission_port_->GetCellAdmissionRecoveryReceipt(
+            {probe, std::nullopt, std::nullopt});
+        return observed.ok() && matches(observed.value());
+      } catch (...) {
+        return false;
+      }
+    }
+    return false;
+  }
+
+  [[nodiscard]] ErrorDTO CheckpointFullRequestNamespace(const RequestOwnerEpoch& predecessor) {
+    std::unique_lock admission_lock(admission_mutex_);
+    auto refreshed = [] {
+      return ErrorDTO{
+          "cclc_request_namespace_refreshed",
+          "CCLC retired a full settled request namespace; refresh before a new submission",
+          {{"reason", "settled_request_namespace_checkpoint"}, {"effect", "not_started"}}};
+    };
+    // This call is reachable only after exact inspection found this request
+    // unseen in a full namespace. A concurrent checkpoint may already have
+    // retired it; no effectful retry was made.
+    if (CurrentOwnerEpoch() != predecessor) return refreshed();
+    if (!accepting_.load(std::memory_order_acquire) || admission_persistence_active_ ||
+        owner_wide_containment_gate_count_ != 0U || unresolved_effect_admission_gate_count_ != 0U) {
+      return replay_error(RequestReplayStatusDTO::kRequestLedgerFull);
+    }
+    admission_lock.unlock();
+    {
+      std::lock_guard lock(state_mutex_);
+      if (recovery_in_progress_ || !active_transactions_.empty() ||
+          !active_route_transactions_.empty()) {
+        return UnstartedCapacityDeferral();
+      }
+    }
+    {
+      std::lock_guard lock(schedule_mutex_);
+      if (schedule_publications_in_flight_ != 0U ||
+          std::any_of(scheduled_handles_.begin(), scheduled_handles_.end(), [](const auto& item) {
+            return !item.second->load(std::memory_order_acquire);
+          })) {
+        return UnstartedCapacityDeferral();
+      }
+    }
+    if (!worker_pool_.IsIdle() || !kernel_worker_pool_.IsIdle()) {
+      return UnstartedCapacityDeferral();
+    }
+    admission_lock.lock();
+    if (!accepting_.load(std::memory_order_acquire)) {
+      return replay_error(RequestReplayStatusDTO::kRequestLedgerFull);
+    }
+    accepting_.store(false, std::memory_order_release);
+    admission_lock.unlock();
     try {
-      receipt = kernel_cell_admission_port_->GetCellAdmissionRecoveryReceipt(
-          {probe, std::nullopt, std::nullopt});
+      const auto checkpoint =
+          journal_.BeginOwnerEpoch(config_.request_owner_epoch, clock_.now(),
+                                   config_.request_membership_capacity, predecessor);
+      if (checkpoint.ok() && checkpoint.value().locally_valid() &&
+          ReconcileLifecycleOwnerEpoch(checkpoint.value().request_owner_epoch)) {
+        admission_lock.lock();
+        request_epoch_.store(
+            std::make_shared<const RequestOwnerEpoch>(checkpoint.value().request_owner_epoch),
+            std::memory_order_release);
+        if (!admission_fault_closed_ && !shutting_down_.load(std::memory_order_acquire)) {
+          accepting_.store(true, std::memory_order_release);
+        }
+        return refreshed();
+      }
     } catch (...) {
     }
-    if (!receipt.ok()) {
-      return false;
-    }
-    auto owners = receipt.value().current_owner_epochs;
-    std::erase_if(owners, [](const auto& owner) {
-      return owner.owner_role == CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner;
-    });
-    owners.push_back(
-        {CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner, config_.request_owner_epoch});
-    std::sort(owners.begin(), owners.end(),
-              [](const auto& lhs, const auto& rhs) { return lhs.owner_role < rhs.owner_role; });
-    const CellAdmissionReconcileDTO reconcile{receipt.value().kernel_owner_epoch,
-                                              receipt.value().held_claims, std::move(owners),
-                                              reconciliation_digest.value()};
-    try {
-      return kernel_cell_admission_port_->ReconcileCellAdmissionClaims(reconcile).ok();
-    } catch (...) {
-      return false;
-    }
+    admission_lock.lock();
+    CloseAdmissionLocked();
+    return coordinator_error("component_lifecycle_owner_epoch_reconciliation_failed",
+                             "CCLC request namespace checkpoint could not be proven complete",
+                             "owner_epoch_reconciliation_failed");
   }
 
   struct AdmissionFacts final {
@@ -1102,6 +1327,8 @@ class ComponentLifecycleCoordinator::Impl final {
     std::optional<RouteConfigurationFenceAdmissionSnapshotDTO> fence_admission;
     std::vector<ControlDomainId> reserved_domains;
     std::shared_ptr<IControllerLifecyclePort> controller_port;
+    std::optional<CellAdmissionClaimDTO> cell_claim;
+    std::optional<CellAdmissionClaimReleaseDTO> cell_claim_release;
     std::uint64_t effect_sequence{};
     std::optional<CCLCRouteEffectAttemptDTO> unresolved_recovery_effect;
     std::int64_t effective_deadline_ns{};
@@ -1117,6 +1344,7 @@ class ComponentLifecycleCoordinator::Impl final {
           "component_lifecycle_journal_result_invalid",
           "the lifecycle journal returned an invalid request result", "journal_result_invalid"));
     }
+    if (result.rejection) return Result<CCLCLifecycleRequestResultDTO>::Err(*result.rejection);
     if (result.replay_status == RequestReplayStatusDTO::kAcceptedNew ||
         result.replay_status == RequestReplayStatusDTO::kReplayedExact) {
       return Result<CCLCLifecycleRequestResultDTO>::Ok(result);
@@ -1131,6 +1359,7 @@ class ComponentLifecycleCoordinator::Impl final {
           "route_selection_journal_result_invalid",
           "the route journal returned an invalid request result", "journal_result_invalid"));
     }
+    if (result.rejection) return Result<CCLCRouteSelectionRequestResultDTO>::Err(*result.rejection);
     if (result.replay_status == RequestReplayStatusDTO::kAcceptedNew ||
         result.replay_status == RequestReplayStatusDTO::kReplayedExact) {
       return Result<CCLCRouteSelectionRequestResultDTO>::Ok(result);
@@ -1148,18 +1377,74 @@ class ComponentLifecycleCoordinator::Impl final {
             configuration->active_control_configuration_generation};
   }
 
-  [[nodiscard]] Result<CCLCRouteSelectionRequestResultDTO> CommitRouteAdmission(
-      const RouteSelectionIntentDTO& intent, std::uint64_t admission_gate_generation) {
-    std::unique_lock admission_lock(admission_mutex_);
-    admission_resolution_ready_.wait(admission_lock, [&] { return !admission_resolution_active_; });
-    admission_resolution_active_ = true;
-    ScopeExit resolution_guard([&] {
-      if (!admission_lock.owns_lock()) {
-        admission_lock.lock();
+  template <typename RecordRejection>
+  [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireDurableCellClaim(
+      const CellAdmissionClaimIntentDTO& intent, RecordRejection&& record_rejection) {
+    // This submit owns the persistence flag. Closing must not wait for itself.
+    const auto close = [&] {
+      std::lock_guard lock(admission_mutex_);
+      CloseAdmissionLocked();
+    };
+    try {
+      auto attempt = journal_.RecordCellClaimAttempt(CurrentOwnerEpoch(), intent);
+      if (!attempt.ok()) {
+        close();
+        return Result<CellAdmissionClaimDTO>::Err(attempt.error());
       }
-      admission_resolution_active_ = false;
-      admission_resolution_ready_.notify_all();
-    });
+      auto acquired = kernel_cell_admission_port_->AcquireCellAdmissionClaim(intent);
+      if (!acquired.ok() || acquired.value().intent != intent) {
+        const bool unstarted =
+            !acquired.ok() && (acquired.error().code == "stale_generation" ||
+                               acquired.error().code == "authoring_not_ready" ||
+                               acquired.error().code == "invalid_state_transition" ||
+                               acquired.error().code == "invalid_request");
+        auto error = acquired.ok() ? coordinator_error("component_lifecycle_claim_acquire_invalid",
+                                                       "Kernel returned a foreign CCLC claim",
+                                                       "claim_receipt_mismatch")
+                                   : acquired.error();
+        if (unstarted) {
+          error.details["effect"] = "not_started";
+          const auto recorded = record_rejection(error);
+          if (recorded.ok() && recorded.value().rejection == error &&
+              !recorded.value().acceptance && !recorded.value().status) {
+            return Result<CellAdmissionClaimDTO>::Err(std::move(error));
+          }
+          if (!recorded.ok()) error = recorded.error();
+        }
+        close();
+        return Result<CellAdmissionClaimDTO>::Err(std::move(error));
+      }
+      auto retained = journal_.RecordCellClaimAcquired(CurrentOwnerEpoch(), acquired.value());
+      if (!retained.ok()) {
+        close();
+        return Result<CellAdmissionClaimDTO>::Err(retained.error());
+      }
+      return acquired;
+    } catch (...) {
+      close();
+      return Result<CellAdmissionClaimDTO>::Err(coordinator_error(
+          "component_lifecycle_claim_acquire_unknown", "CCLC claim acquisition outcome is unknown",
+          "claim_acquire_exception"));
+    }
+  }
+
+  [[nodiscard]] static CellAdmissionClaimReleaseDTO TerminalCellClaimRelease(
+      const CellAdmissionClaimDTO& claim, std::string digest) {
+    return {claim.intent.owner_role,
+            claim.intent.owner_epoch,
+            claim.intent.owner_transaction_id,
+            claim.intent.request_id,
+            claim.intent.request_payload_digest,
+            claim.acquired_admission_generation,
+            claim.claim_generation,
+            {CellAdmissionSettlementKindDTO::kTerminalEffectsSettled,
+             ContentDigest(std::move(digest))}};
+  }
+
+  [[nodiscard]] Result<CCLCRouteSelectionRequestResultDTO> CommitRouteAdmission(
+      const RouteSelectionIntentDTO& intent, std::uint64_t admission_gate_generation,
+      bool& known_unstarted) {
+    std::unique_lock admission_lock(admission_mutex_);
 
     if (!accepting_.load(std::memory_order_acquire) ||
         admission_gate_generation != admission_gate_generation_) {
@@ -1197,7 +1482,7 @@ class ComponentLifecycleCoordinator::Impl final {
             "route_selection_journal_inspection_failed",
             "the route journal inspection raised an exception", "journal_exception"));
     try {
-      reinspection = journal_.InspectRouteSelectionRequest(config_.request_owner_epoch, intent);
+      reinspection = journal_.InspectRouteSelectionRequest(CurrentOwnerEpoch(), intent);
     } catch (...) {
     }
     if (!reinspection.ok()) {
@@ -1384,14 +1669,39 @@ class ComponentLifecycleCoordinator::Impl final {
       }
     };
 
+    const CellAdmissionClaimIntentDTO claim_intent{
+        CellAdmissionClaimKindDTO::kComponentLifecycle,
+        CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner,
+        CurrentOwnerEpoch(),
+        transaction_id.value(),
+        intent.request_context.request_id,
+        ContentDigest(detail::RouteSelectionSemanticIntentDigest(intent)),
+        *intent.expected_admission_generation,
+        {},
+        {},
+        {},
+        intent.program_node_evidence};
     admission_persistence_active_ = true;
+    known_unstarted = false;
     admission_lock.unlock();
+    const auto acquired = AcquireDurableCellClaim(claim_intent, [&](const ErrorDTO& error) {
+      return journal_.RecordRouteSelectionRejection(CurrentOwnerEpoch(), intent, error,
+                                                    claim_intent);
+    });
+    if (!acquired.ok()) {
+      admission_lock.lock();
+      admission_persistence_active_ = false;
+      admission_resolution_ready_.notify_all();
+      rollback_watermark();
+      return Result<CCLCRouteSelectionRequestResultDTO>::Err(acquired.error());
+    }
+    runtime->cell_claim = acquired.value();
     Result<CCLCRouteSelectionRequestResultDTO> accepted =
         Result<CCLCRouteSelectionRequestResultDTO>::Err(coordinator_error(
             "route_selection_journal_accept_failed",
             "the route journal acceptance raised an exception", "journal_exception"));
     try {
-      accepted = journal_.AcceptOrReplayRouteSelection(config_.request_owner_epoch, intent,
+      accepted = journal_.AcceptOrReplayRouteSelection(CurrentOwnerEpoch(), intent,
                                                        prepared.value().acceptance,
                                                        prepared.value().initial_status);
     } catch (...) {
@@ -1401,6 +1711,7 @@ class ComponentLifecycleCoordinator::Impl final {
     admission_resolution_ready_.notify_all();
     if (!accepted.ok()) {
       rollback_watermark();
+      CloseAdmissionLocked();
       return Result<CCLCRouteSelectionRequestResultDTO>::Err(accepted.error());
     }
     if (!accepted.value().locally_valid()) {
@@ -1465,7 +1776,7 @@ class ComponentLifecycleCoordinator::Impl final {
       return false;
     }
     ++status.status_sequence;
-    status.status_owner_epoch = config_.request_owner_epoch;
+    status.status_owner_epoch = CurrentOwnerEpoch();
     status.phase = phase;
     status.latest_updated_at_ns = now_ns;
     status.remaining_duration_ns =
@@ -1483,7 +1794,15 @@ class ComponentLifecycleCoordinator::Impl final {
         "route_selection_journal_status_failed",
         "the route journal status write raised an exception", "journal_exception"));
     try {
-      recorded = journal_.RecordRouteSelectionStatus(config_.request_owner_epoch, status);
+      if (status.terminal_result && runtime->cell_claim) {
+        const auto release = TerminalCellClaimRelease(
+            *runtime->cell_claim, detail::RouteSelectionStatusReleasePreconditionDigest(status));
+        recorded =
+            journal_.RecordRouteTerminalAndClaimRelease(CurrentOwnerEpoch(), status, release);
+        if (recorded.ok()) runtime->cell_claim_release = release;
+      } else {
+        recorded = journal_.RecordRouteSelectionStatus(CurrentOwnerEpoch(), status);
+      }
     } catch (...) {
     }
     if (!recorded.ok()) {
@@ -1506,7 +1825,7 @@ class ComponentLifecycleCoordinator::Impl final {
         coordinator_error("route_selection_journal_effect_failed",
                           "the route effect preparation raised an exception", "journal_exception"));
     try {
-      recorded = journal_.RecordRouteEffectPrepared(config_.request_owner_epoch, attempt, status);
+      recorded = journal_.RecordRouteEffectPrepared(CurrentOwnerEpoch(), attempt, status);
     } catch (...) {
     }
     if (!recorded.ok()) {
@@ -1530,7 +1849,15 @@ class ComponentLifecycleCoordinator::Impl final {
         coordinator_error("route_selection_journal_effect_failed",
                           "the route effect completion raised an exception", "journal_exception"));
     try {
-      recorded = journal_.RecordRouteEffectCompleted(config_.request_owner_epoch, attempt, status);
+      if (status.terminal_result && runtime->cell_claim) {
+        const auto release = TerminalCellClaimRelease(
+            *runtime->cell_claim, detail::RouteSelectionStatusReleasePreconditionDigest(status));
+        recorded = journal_.RecordRouteEffectCompletedAndClaimRelease(CurrentOwnerEpoch(), attempt,
+                                                                      status, release);
+        if (recorded.ok()) runtime->cell_claim_release = release;
+      } else {
+        recorded = journal_.RecordRouteEffectCompleted(CurrentOwnerEpoch(), attempt, status);
+      }
     } catch (...) {
     }
     if (!recorded.ok()) {
@@ -2209,6 +2536,16 @@ class ComponentLifecycleCoordinator::Impl final {
   }
 
   void CompleteRoute(const std::shared_ptr<RouteRuntimeState>& runtime) noexcept {
+    if (runtime->cell_claim) {
+      if (!runtime->cell_claim_release ||
+          !ReleaseDurableClaim(runtime, *runtime->cell_claim_release)) {
+        CloseAdmission();
+        return;
+      }
+    } else if (runtime->status.accepted_intent.expected_admission_generation) {
+      CloseAdmission();
+      return;
+    }
     if (!runtime->reserved_domains.empty()) {
       Result<void> released = Result<void>::Err(coordinator_error(
           "route_selection_domain_release_failed", "the route domain release raised an exception",
@@ -2240,7 +2577,7 @@ class ComponentLifecycleCoordinator::Impl final {
           unresolved_effect_admission_gate_count_ == 0U && !admission_fault_closed_ &&
           !shutting_down_.load(std::memory_order_acquire) &&
           !accepting_.load(std::memory_order_acquire)) {
-        if (!RotateLifecycleOwnerEpoch()) {
+        if (!ReconcileLifecycleOwnerEpoch(CurrentOwnerEpoch())) {
           admission_fault_closed_ = true;
           return;
         }
@@ -2340,6 +2677,28 @@ class ComponentLifecycleCoordinator::Impl final {
         restored_reservations.emplace_back(owner, domains);
         auto runtime = std::make_shared<RouteRuntimeState>(status, std::move(snapshot.value()),
                                                            std::nullopt, std::move(domains));
+        const auto claim = std::find_if(
+            recovery.cell_claims.begin(), recovery.cell_claims.end(), [&](const auto& row) {
+              return row.intent.owner_transaction_id ==
+                     status.acceptance.route_selection_transaction_id.value();
+            });
+        if (status.accepted_intent.expected_admission_generation) {
+          if (claim == recovery.cell_claims.end() || !claim->claim) {
+            for (const auto& restored : restored_reservations)
+              static_cast<void>(domain_reservations_.release(restored.first, restored.second));
+            return Result<void>::Err(coordinator_error(
+                "component_lifecycle_claim_recovery_missing",
+                "interrupted route has no exact Kernel claim", "claim_recovery_missing"));
+          }
+          runtime->cell_claim = claim->claim;
+          runtime->cell_claim_release = claim->release_intent;
+        } else if (claim != recovery.cell_claims.end()) {
+          for (const auto& restored : restored_reservations)
+            static_cast<void>(domain_reservations_.release(restored.first, restored.second));
+          return Result<void>::Err(coordinator_error(
+              "component_lifecycle_claim_recovery_missing",
+              "legacy route cannot gain a retrospective claim", "legacy_route_claim_conflict"));
+        }
         runtime->recovering = true;
         runtime->controller_source_replaced_before_transition =
             controller_source_replaced_before_transition;
@@ -2388,7 +2747,7 @@ class ComponentLifecycleCoordinator::Impl final {
 
   [[nodiscard]] bool AdoptRouteRecoveryOwner(
       const std::shared_ptr<RouteRuntimeState>& runtime) noexcept {
-    if (runtime->status.status_owner_epoch == config_.request_owner_epoch) {
+    if (runtime->status.status_owner_epoch == CurrentOwnerEpoch()) {
       return true;
     }
     auto status = runtime->status;
@@ -2870,24 +3229,16 @@ class ComponentLifecycleCoordinator::Impl final {
 
   [[nodiscard]] Result<CCLCLifecycleRequestResultDTO> CommitAdmission(
       const ComponentLifecycleIntentDTO& intent, const AdmissionFacts& facts,
-      std::uint64_t admission_gate_generation) {
+      std::uint64_t admission_gate_generation, bool& known_unstarted) {
+    known_unstarted = false;
     std::unique_lock admission_lock(admission_mutex_);
-    admission_resolution_ready_.wait(admission_lock, [&] { return !admission_resolution_active_; });
-    admission_resolution_active_ = true;
-    ScopeExit resolution_guard([&] {
-      if (!admission_lock.owns_lock()) {
-        admission_lock.lock();
-      }
-      admission_resolution_active_ = false;
-      admission_resolution_ready_.notify_all();
-    });
     admission_lock.unlock();
     Result<std::optional<CCLCLifecycleRequestResultDTO>> reinspection =
         Result<std::optional<CCLCLifecycleRequestResultDTO>>::Err(coordinator_error(
             "component_lifecycle_journal_inspection_failed",
             "the lifecycle journal inspection raised an exception", "journal_exception"));
     try {
-      reinspection = journal_.InspectLifecycleRequest(config_.request_owner_epoch, intent);
+      reinspection = journal_.InspectLifecycleRequest(CurrentOwnerEpoch(), intent);
     } catch (...) {
     }
     admission_lock.lock();
@@ -2897,6 +3248,7 @@ class ComponentLifecycleCoordinator::Impl final {
     if (reinspection.value().has_value()) {
       return ReplayResult(*reinspection.value());
     }
+    known_unstarted = true;
     if (!accepting_.load(std::memory_order_acquire) ||
         admission_gate_generation != admission_gate_generation_) {
       return Result<CCLCLifecycleRequestResultDTO>::Err(coordinator_error(
@@ -3071,57 +3423,28 @@ class ComponentLifecycleCoordinator::Impl final {
     CellAdmissionClaimIntentDTO claim_intent{
         CellAdmissionClaimKindDTO::kComponentLifecycle,
         CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner,
-        config_.request_owner_epoch,
+        CurrentOwnerEpoch(),
         prepared.value().acceptance.lifecycle_transaction_id.value(),
         intent.request_context.request_id,
         ContentDigest(semantic_digest),
         intent.expected_admission_generation,
         {},
         std::nullopt,
-        std::nullopt};
+        std::nullopt,
+        intent.program_node_evidence};
     admission_persistence_active_ = true;
+    known_unstarted = false;
     admission_lock.unlock();
-    const auto claim_attempt =
-        journal_.RecordLifecycleClaimAttempt(config_.request_owner_epoch, claim_intent);
-    if (!claim_attempt.ok()) {
+    const auto acquired = AcquireDurableCellClaim(claim_intent, [&](const ErrorDTO& error) {
+      return journal_.RecordLifecycleRejection(CurrentOwnerEpoch(), intent, error, claim_intent);
+    });
+    if (!acquired.ok()) {
       admission_lock.lock();
       admission_persistence_active_ = false;
       admission_resolution_ready_.notify_all();
       rollback_provisional_watermark();
       release_on_failure();
-      CloseAdmissionLocked();
-      return Result<CCLCLifecycleRequestResultDTO>::Err(claim_attempt.error());
-    }
-    Result<CellAdmissionClaimDTO> acquired = Result<CellAdmissionClaimDTO>::Err(coordinator_error(
-        "component_lifecycle_claim_acquire_unknown",
-        "Kernel lifecycle claim acquire raised an exception", "claim_acquire_exception"));
-    try {
-      acquired = kernel_cell_admission_port_->AcquireCellAdmissionClaim(claim_intent);
-    } catch (...) {
-    }
-    if (!acquired.ok() || acquired.value().intent != claim_intent) {
-      admission_lock.lock();
-      admission_persistence_active_ = false;
-      admission_resolution_ready_.notify_all();
-      rollback_provisional_watermark();
-      release_on_failure();
-      CloseAdmissionLocked();
-      return Result<CCLCLifecycleRequestResultDTO>::Err(
-          acquired.ok() ? coordinator_error("component_lifecycle_claim_acquire_invalid",
-                                            "Kernel returned a foreign lifecycle claim",
-                                            "claim_receipt_mismatch")
-                        : acquired.error());
-    }
-    const auto recorded_claim =
-        journal_.RecordLifecycleClaimAcquired(config_.request_owner_epoch, acquired.value());
-    if (!recorded_claim.ok()) {
-      admission_lock.lock();
-      admission_persistence_active_ = false;
-      admission_resolution_ready_.notify_all();
-      rollback_provisional_watermark();
-      release_on_failure();
-      CloseAdmissionLocked();
-      return Result<CCLCLifecycleRequestResultDTO>::Err(recorded_claim.error());
+      return Result<CCLCLifecycleRequestResultDTO>::Err(acquired.error());
     }
     runtime->cell_claim = acquired.value();
     Result<CCLCLifecycleRequestResultDTO> accepted =
@@ -3129,9 +3452,9 @@ class ComponentLifecycleCoordinator::Impl final {
             "component_lifecycle_journal_accept_failed",
             "the lifecycle journal acceptance raised an exception", "journal_exception"));
     try {
-      accepted = journal_.AcceptOrReplayLifecycle(config_.request_owner_epoch, intent,
-                                                  prepared.value().acceptance,
-                                                  prepared.value().initial_status);
+      accepted =
+          journal_.AcceptOrReplayLifecycle(CurrentOwnerEpoch(), intent, prepared.value().acceptance,
+                                           prepared.value().initial_status);
     } catch (...) {
     }
     admission_lock.lock();
@@ -3139,6 +3462,7 @@ class ComponentLifecycleCoordinator::Impl final {
     admission_resolution_ready_.notify_all();
     if (!accepted.ok()) {
       rollback_provisional_watermark();
+      CloseAdmissionLocked();
       release_on_failure();
       return Result<CCLCLifecycleRequestResultDTO>::Err(accepted.error());
     }
@@ -3261,7 +3585,7 @@ class ComponentLifecycleCoordinator::Impl final {
   }
 
   [[nodiscard]] bool AdoptRecoveredStatus(const std::shared_ptr<RuntimeState>& runtime) {
-    if (runtime->status.status_owner_epoch == config_.request_owner_epoch) {
+    if (runtime->status.status_owner_epoch == CurrentOwnerEpoch()) {
       return true;
     }
     auto adopted = runtime->status;
@@ -3273,7 +3597,7 @@ class ComponentLifecycleCoordinator::Impl final {
     adopted.error = OwnerReplacementError("recovery_observation_required");
     adopted.remaining_duration_ns = 0;
     if (!adopted.locally_valid() ||
-        !journal_.RecordLifecycleStatus(config_.request_owner_epoch, adopted).ok()) {
+        !journal_.RecordLifecycleStatus(CurrentOwnerEpoch(), adopted).ok()) {
       CloseAdmission();
       return false;
     }
@@ -3446,9 +3770,7 @@ class ComponentLifecycleCoordinator::Impl final {
     completed_attempt.state = CCLCEffectAttemptStateDTO::kCompleted;
     completed_attempt.lifecycle_primitive_result = result;
     if (!completed_status.locally_valid() ||
-        !journal_
-             .RecordEffectCompleted(config_.request_owner_epoch, completed_attempt,
-                                    completed_status)
+        !journal_.RecordEffectCompleted(CurrentOwnerEpoch(), completed_attempt, completed_status)
              .ok()) {
       CloseAdmission();
       return;
@@ -3603,7 +3925,7 @@ class ComponentLifecycleCoordinator::Impl final {
       return;
     }
     const auto recorded_reconciliation =
-        journal_.RecordLifecycleStatus(config_.request_owner_epoch, reconciled);
+        journal_.RecordLifecycleStatus(CurrentOwnerEpoch(), reconciled);
     if (!recorded_reconciliation.ok()) {
       CloseAdmission();
       return;
@@ -3650,8 +3972,7 @@ class ComponentLifecycleCoordinator::Impl final {
       CloseAdmission();
       return false;
     }
-    const auto recorded_resolution =
-        journal_.RecordLifecycleStatus(config_.request_owner_epoch, resolved);
+    const auto recorded_resolution = journal_.RecordLifecycleStatus(CurrentOwnerEpoch(), resolved);
     if (!recorded_resolution.ok()) {
       CloseAdmission();
       return false;
@@ -3757,8 +4078,8 @@ class ComponentLifecycleCoordinator::Impl final {
     ClearResolvedOwnerReplacementMarker(prepared_status);
     const auto prepared_attempt =
         PreparedDisableHandoffAttempt(request.value(), effect_sequence.value());
-    const auto prepared = journal_.RecordEffectPrepared(config_.request_owner_epoch,
-                                                        prepared_attempt, prepared_status);
+    const auto prepared =
+        journal_.RecordEffectPrepared(CurrentOwnerEpoch(), prepared_attempt, prepared_status);
     if (!prepared.ok()) {
       CloseAdmission();
       return;
@@ -3821,7 +4142,7 @@ class ComponentLifecycleCoordinator::Impl final {
         completed_attempt.state = CCLCEffectAttemptStateDTO::kCompleted;
         completed_attempt.disable_handoff_result = DisableHandoffEffectResultDTO{
             request, DisableHandoffEffectDispositionDTO::kProvenNotSeen, std::nullopt};
-        const auto completed = journal_.RecordEffectCompleted(config_.request_owner_epoch,
+        const auto completed = journal_.RecordEffectCompleted(CurrentOwnerEpoch(),
                                                               completed_attempt, completed_status);
         if (!completed.ok()) {
           CloseAdmission();
@@ -3957,8 +4278,8 @@ class ComponentLifecycleCoordinator::Impl final {
     completed_attempt.state = CCLCEffectAttemptStateDTO::kCompleted;
     completed_attempt.disable_handoff_result = DisableHandoffEffectResultDTO{
         request, DisableHandoffEffectDispositionDTO::kAccepted, acceptance};
-    const auto completed = journal_.RecordEffectCompleted(config_.request_owner_epoch,
-                                                          completed_attempt, completed_status);
+    const auto completed =
+        journal_.RecordEffectCompleted(CurrentOwnerEpoch(), completed_attempt, completed_status);
     if (!completed.ok()) {
       CloseAdmission();
       return;
@@ -4012,7 +4333,7 @@ class ComponentLifecycleCoordinator::Impl final {
     successor.configuration_fence = current.state == DisableHandoffStateDTO::kReady
                                         ? std::optional(current.configuration_fence_handle)
                                         : std::nullopt;
-    if (!journal_.RecordLifecycleStatus(config_.request_owner_epoch, successor).ok()) {
+    if (!journal_.RecordLifecycleStatus(CurrentOwnerEpoch(), successor).ok()) {
       CloseAdmission();
       return;
     }
@@ -4319,7 +4640,7 @@ class ComponentLifecycleCoordinator::Impl final {
           "the fresh Full-Stop snapshot cannot form a closed lifecycle reconciliation status",
           "promoted_full_status_invalid"));
     }
-    const auto recorded = journal_.RecordLifecycleStatus(config_.request_owner_epoch, reconciled);
+    const auto recorded = journal_.RecordLifecycleStatus(CurrentOwnerEpoch(), reconciled);
     if (!recorded.ok()) {
       return Result<void>::Err(recorded.error());
     }
@@ -4344,7 +4665,7 @@ class ComponentLifecycleCoordinator::Impl final {
     resolved.reconciliation_required = false;
     resolved.error = error;
     if (!resolved.locally_valid() ||
-        !journal_.RecordLifecycleStatus(config_.request_owner_epoch, resolved).ok()) {
+        !journal_.RecordLifecycleStatus(CurrentOwnerEpoch(), resolved).ok()) {
       CloseAdmission();
       return;
     }
@@ -4481,8 +4802,8 @@ class ComponentLifecycleCoordinator::Impl final {
     ClearResolvedOwnerReplacementMarker(prepared_status);
     const auto prepared_attempt =
         PreparedDisableFenceReleaseAttempt(request.value(), effect_sequence.value());
-    const auto persisted = journal_.RecordEffectPrepared(config_.request_owner_epoch,
-                                                         prepared_attempt, prepared_status);
+    const auto persisted =
+        journal_.RecordEffectPrepared(CurrentOwnerEpoch(), prepared_attempt, prepared_status);
     if (!persisted.ok()) {
       CloseAdmission();
       return;
@@ -4556,8 +4877,7 @@ class ComponentLifecycleCoordinator::Impl final {
         completed_attempt.disable_fence_release_result = DisableFenceReleaseEffectResultDTO{
             request, DisableFenceReleaseEffectDispositionDTO::kProvenNotReleasedHeld, std::nullopt};
         if (!journal_
-                 .RecordEffectCompleted(config_.request_owner_epoch, completed_attempt,
-                                        completed_status)
+                 .RecordEffectCompleted(CurrentOwnerEpoch(), completed_attempt, completed_status)
                  .ok()) {
           CloseAdmission();
           return;
@@ -4662,8 +4982,8 @@ class ComponentLifecycleCoordinator::Impl final {
              detail::ComponentLifecycleStatusReleasePreconditionDigest(terminal_status))}};
     if (!terminal_status.locally_valid() ||
         !journal_
-             .RecordEffectCompletedAndLifecycleClaimRelease(
-                 config_.request_owner_epoch, completed_attempt, terminal_status, claim_release)
+             .RecordEffectCompletedAndLifecycleClaimRelease(CurrentOwnerEpoch(), completed_attempt,
+                                                            terminal_status, claim_release)
              .ok()) {
       CloseAdmission();
       return;
@@ -4843,8 +5163,8 @@ class ComponentLifecycleCoordinator::Impl final {
                                           std::nullopt,
                                           std::nullopt,
                                           std::nullopt};
-    const auto prepared = journal_.RecordEffectPrepared(config_.request_owner_epoch,
-                                                        prepared_attempt, prepared_status);
+    const auto prepared =
+        journal_.RecordEffectPrepared(CurrentOwnerEpoch(), prepared_attempt, prepared_status);
     if (!prepared.ok()) {
       CloseAdmission();
       return;
@@ -4917,8 +5237,8 @@ class ComponentLifecycleCoordinator::Impl final {
     if (completed_domain.effect == ComponentLifecycleDomainEffectDTO::kEffectUncertain) {
       AcquireUnresolvedEffectAdmissionGate(runtime);
     }
-    const auto completed = journal_.RecordEffectCompleted(config_.request_owner_epoch,
-                                                          completed_attempt, completed_status);
+    const auto completed =
+        journal_.RecordEffectCompleted(CurrentOwnerEpoch(), completed_attempt, completed_status);
     if (!completed.ok()) {
       CloseAdmission();
       return;
@@ -5028,7 +5348,7 @@ class ComponentLifecycleCoordinator::Impl final {
         case UncertainEffectResolution::kUnresolved:
           break;
       }
-      const auto recorded = journal_.RecordLifecycleStatus(config_.request_owner_epoch, reconciled);
+      const auto recorded = journal_.RecordLifecycleStatus(CurrentOwnerEpoch(), reconciled);
       if (!recorded.ok()) {
         CloseAdmission();
         return;
@@ -5086,7 +5406,7 @@ class ComponentLifecycleCoordinator::Impl final {
                  ComponentLifecycleDomainEffectDTO::kPartialEffectObserved) {
         progressed_domain.effect = ComponentLifecycleDomainEffectDTO::kEffectObserved;
       }
-      const auto recorded = journal_.RecordLifecycleStatus(config_.request_owner_epoch, progressed);
+      const auto recorded = journal_.RecordLifecycleStatus(CurrentOwnerEpoch(), progressed);
       if (!recorded.ok()) {
         CloseAdmission();
         return;
@@ -5174,7 +5494,7 @@ class ComponentLifecycleCoordinator::Impl final {
                      ComponentLifecycleTransactionPhaseDTO phase) const {
     const auto now_ns = std::max(clock_.now(), status.latest_updated_at_ns);
     ++status.status_sequence;
-    status.status_owner_epoch = config_.request_owner_epoch;
+    status.status_owner_epoch = CurrentOwnerEpoch();
     status.phase = phase;
     status.latest_updated_at_ns = now_ns;
     status.remaining_duration_ns = RemainingDuration(runtime, now_ns);
@@ -5233,8 +5553,8 @@ class ComponentLifecycleCoordinator::Impl final {
         claim.claim_generation,
         {CellAdmissionSettlementKindDTO::kTerminalEffectsSettled,
          ContentDigest(detail::ComponentLifecycleStatusReleasePreconditionDigest(status))}};
-    const auto retained = journal_.RecordLifecycleTerminalAndClaimRelease(
-        config_.request_owner_epoch, status, release);
+    const auto retained =
+        journal_.RecordLifecycleTerminalAndClaimRelease(CurrentOwnerEpoch(), status, release);
     if (!retained.ok()) {
       CloseAdmission();
       return false;
@@ -5244,18 +5564,18 @@ class ComponentLifecycleCoordinator::Impl final {
     return ReleaseDurableClaim(runtime, release);
   }
 
-  [[nodiscard]] bool ReleaseDurableClaim(const std::shared_ptr<RuntimeState>& runtime,
+  template <typename Runtime>
+  [[nodiscard]] bool ReleaseDurableClaim(const std::shared_ptr<Runtime>& runtime,
                                          const CellAdmissionClaimReleaseDTO& release) {
     if (!runtime->cell_claim.has_value()) {
       CloseAdmission();
       return false;
     }
     const auto& claim = *runtime->cell_claim;
-    Result<AuthoringAdmissionDTO> released = Result<AuthoringAdmissionDTO>::Err(coordinator_error(
-        "component_lifecycle_claim_release_unknown",
-        "Kernel lifecycle claim release raised an exception", "claim_release_exception"));
     try {
-      released = kernel_cell_admission_port_->ReleaseCellAdmissionClaim(release);
+      // The exact retained receipt below is authoritative even if this reply
+      // is lost after the Kernel has durably released the claim.
+      static_cast<void>(kernel_cell_admission_port_->ReleaseCellAdmissionClaim(release));
     } catch (...) {
     }
     const CellAdmissionRecoveryReceiptQueryDTO query{claim.intent, claim, release};
@@ -5267,11 +5587,9 @@ class ComponentLifecycleCoordinator::Impl final {
       receipt = kernel_cell_admission_port_->GetCellAdmissionRecoveryReceipt(query);
     } catch (...) {
     }
-    if (!released.ok() || !receipt.ok() ||
+    if (!receipt.ok() ||
         receipt.value().status != CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact ||
-        !journal_
-             .RecordLifecycleClaimReleaseReceipt(config_.request_owner_epoch, release,
-                                                 receipt.value())
+        !journal_.RecordCellClaimReleaseReceipt(CurrentOwnerEpoch(), release, receipt.value())
              .ok()) {
       CloseAdmission();
       return false;
@@ -5298,7 +5616,7 @@ class ComponentLifecycleCoordinator::Impl final {
           domain.error = error;
         }
       }
-      if (journal_.RecordLifecycleStatus(config_.request_owner_epoch, status).ok()) {
+      if (journal_.RecordLifecycleStatus(CurrentOwnerEpoch(), status).ok()) {
         runtime->status = std::move(status);
         SchedulePoll(runtime);
       } else {
@@ -5402,7 +5720,7 @@ class ComponentLifecycleCoordinator::Impl final {
           unresolved_effect_admission_gate_count_ == 0U && !admission_fault_closed_ &&
           !shutting_down_.load(std::memory_order_acquire) &&
           !accepting_.load(std::memory_order_acquire)) {
-        if (!RotateLifecycleOwnerEpoch()) {
+        if (!ReconcileLifecycleOwnerEpoch(CurrentOwnerEpoch())) {
           admission_fault_closed_ = true;
           return;
         }
@@ -5548,7 +5866,7 @@ class ComponentLifecycleCoordinator::Impl final {
       handle = scheduler_.schedule(
           deadline,
           [fired, callback = std::move(callback)] {
-            fired->store(true, std::memory_order_release);
+            ScopeExit finished([&] { fired->store(true, std::memory_order_release); });
             callback();
           },
           SchedulerPriority::Lifecycle);
@@ -5589,6 +5907,9 @@ class ComponentLifecycleCoordinator::Impl final {
   }
 
   const ComponentLifecycleCoordinatorConfig config_;
+  // One synchronized namespace value; effects keep their exact persisted
+  // identities, and rotation is permitted only at the ordinary quiescent gate.
+  std::atomic<std::shared_ptr<const RequestOwnerEpoch>> request_epoch_;
   ICCLCJournal& journal_;
   CCLCDomainReservationTable& domain_reservations_;
   const ICCLCCurrentComponentSnapshotSource& current_snapshot_source_;
@@ -5657,9 +5978,21 @@ Result<CCLCLifecycleRequestResultDTO> ComponentLifecycleCoordinator::SubmitLifec
   return impl_->SubmitLifecycle(intent);
 }
 
+Result<std::optional<CCLCLifecycleRequestResultDTO>>
+ComponentLifecycleCoordinator::ReadLifecycleRequestResult(
+    const ComponentLifecycleIntentDTO& intent) {
+  return impl_->ReadLifecycleRequestResult(intent);
+}
+
 Result<CCLCRouteSelectionRequestResultDTO> ComponentLifecycleCoordinator::SubmitRouteSelection(
     const RouteSelectionIntentDTO& intent) {
   return impl_->SubmitRouteSelection(intent);
+}
+
+Result<std::optional<CCLCRouteSelectionRequestResultDTO>>
+ComponentLifecycleCoordinator::ReadRouteSelectionRequestResult(
+    const RouteSelectionIntentDTO& intent) {
+  return impl_->ReadRouteSelectionRequestResult(intent);
 }
 
 Result<std::optional<RouteSelectionStatusDTO>>

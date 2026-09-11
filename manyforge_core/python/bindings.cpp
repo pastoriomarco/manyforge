@@ -423,6 +423,19 @@ PYBIND11_MODULE(manyforge_core_py, m) {
             .format(w.time_from_start_s, py::cast(w.positions_rad));
       });
 
+  py::class_<manyforge::core::TrajectoryRuntimeScaleBoundsDTO>(m, "TrajectoryRuntimeScaleBoundsDTO")
+      .def(py::init<double, double, double, std::optional<double>>(), py::arg("max_rate_per_s"),
+           py::arg("max_rate_change_per_s2"), py::arg("max_stop_path_rate") = 1.0,
+           py::arg("nominal_time_multiplier") = std::nullopt)
+      .def_readonly("max_rate_per_s",
+                    &manyforge::core::TrajectoryRuntimeScaleBoundsDTO::max_rate_per_s)
+      .def_readonly("max_rate_change_per_s2",
+                    &manyforge::core::TrajectoryRuntimeScaleBoundsDTO::max_rate_change_per_s2)
+      .def_readonly("max_stop_path_rate",
+                    &manyforge::core::TrajectoryRuntimeScaleBoundsDTO::max_stop_path_rate)
+      .def_readonly("nominal_time_multiplier",
+                    &manyforge::core::TrajectoryRuntimeScaleBoundsDTO::nominal_time_multiplier);
+
   py::class_<manyforge::core::TrajectoryDTO>(m, "TrajectoryDTO")
       .def(py::init<>())
       .def(py::init<std::vector<manyforge::core::ResourceId>, std::vector<std::string>,
@@ -431,6 +444,9 @@ PYBIND11_MODULE(manyforge_core_py, m) {
       .def_readwrite("resources", &manyforge::core::TrajectoryDTO::resources)
       .def_readwrite("joint_names", &manyforge::core::TrajectoryDTO::joint_names)
       .def_readwrite("waypoints", &manyforge::core::TrajectoryDTO::waypoints)
+      .def_readwrite("runtime_scale_bounds", &manyforge::core::TrajectoryDTO::runtime_scale_bounds)
+      .def_readwrite("cartesian_waypoint_times_s",
+                     &manyforge::core::TrajectoryDTO::cartesian_waypoint_times_s)
       .def("empty", &manyforge::core::TrajectoryDTO::empty)
       .def("__repr__", [](const manyforge::core::TrajectoryDTO& t) {
         return py::str("TrajectoryDTO(joint_names={}, waypoints={})")

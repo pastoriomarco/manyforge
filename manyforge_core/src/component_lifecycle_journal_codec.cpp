@@ -18,12 +18,16 @@ namespace manyforge::core::detail {
 namespace {
 
 constexpr std::string_view kStatusMagic = "MF-CCLC-STATUS-V1";
+constexpr std::string_view kProgramStatusMagic = "MF-CCLC-STATUS-V2";
+constexpr std::string_view kProgramNodeMagic = "MF-PROGRAM-NODE-ADMISSION-V1";
 constexpr std::string_view kIntentMagic = "MF-CCLC-INTENT-V1";
 constexpr std::string_view kPrimitiveIntentMagic = "MF-CCLC-PRIMITIVE-INTENT-V1";
 constexpr std::string_view kPrimitiveResultMagic = "MF-CCLC-PRIMITIVE-RESULT-V1";
 constexpr std::string_view kEffectAttemptMagic = "MF-CCLC-EFFECT-ATTEMPT-V1";
 constexpr std::string_view kRouteStatusMagic = "MF-CCLC-ROUTE-STATUS-V2";
+constexpr std::string_view kRouteAdmissionStatusMagic = "MF-CCLC-ROUTE-STATUS-V3";
 constexpr std::string_view kRouteIntentMagic = "MF-CCLC-ROUTE-INTENT-V1";
+constexpr std::string_view kRouteAdmissionIntentMagic = "MF-CCLC-ROUTE-INTENT-V2";
 constexpr std::string_view kRouteEffectAttemptMagic = "MF-CCLC-ROUTE-EFFECT-ATTEMPT-V1";
 constexpr std::string_view kActiveControlConfigurationMagic = "MF-CCLC-ACTIVE-CONFIG-V1";
 constexpr std::string_view kRouteFenceAdmissionSnapshotMagic =
@@ -1309,7 +1313,8 @@ void PutRouteFenceReleaseResult(Writer& writer,
 }
 
 void PutRouteStatus(Writer& writer, const RouteSelectionStatusDTO& value) {
-  writer.String(kRouteStatusMagic);
+  writer.String(value.accepted_intent.expected_admission_generation ? kRouteAdmissionStatusMagic
+                                                                    : kRouteStatusMagic);
   PutRouteAccepted(writer, value.acceptance);
   PutRouteIntent(writer, value.accepted_intent, true);
   writer.U64(value.status_sequence);
@@ -1345,41 +1350,55 @@ void PutRouteStatus(Writer& writer, const RouteSelectionStatusDTO& value) {
   writer.I64(value.accepted_at_ns);
   writer.I64(value.latest_updated_at_ns);
   writer.I64(value.remaining_duration_ns);
+  if (value.accepted_intent.expected_admission_generation) {
+    writer.Counter(*value.accepted_intent.expected_admission_generation);
+    writer.Optional<ProgramNodeAdmissionEvidenceDTO>(
+        value.accepted_intent.program_node_evidence,
+        [&](const auto& evidence) { writer.String(EncodeProgramNodeAdmissionEvidence(evidence)); });
+  }
 }
 
 [[nodiscard]] RouteSelectionStatusDTO GetRouteStatus(Reader& reader) {
-  if (reader.String() != kRouteStatusMagic) {
+  const auto magic = reader.String();
+  if (magic != kRouteStatusMagic && magic != kRouteAdmissionStatusMagic) {
     throw CodecFailure("CCLC route status magic is invalid");
   }
-  return {GetRouteAccepted(reader),
-          GetRouteIntent(reader),
-          reader.U64(),
-          reader.Identity<RequestOwnerEpoch>(),
-          reader.EnumValue<RouteSelectionTransactionPhaseDTO>(),
-          reader.EnumValue<RouteSelectionEffectDTO>(),
-          reader.Vector<ControlBindingId>([&]() { return reader.Identity<ControlBindingId>(); }),
-          reader.Vector<ControllerRoleId>([&]() { return reader.Identity<ControllerRoleId>(); }),
-          reader.Optional<ControllerLifecycleObservationDTO>(
-              [&]() { return GetControllerObservation(reader); }),
-          reader.Optional<ControllerLifecycleReconciliationDTO>(
-              [&]() { return GetControllerReconciliation(reader); }),
-          reader.Optional<ControllerLifecycleTransitionPlanDTO>(
-              [&]() { return GetControllerTransitionPlan(reader); }),
-          reader.Vector<ControllerLifecycleTransitionResultDTO>(
-              [&]() { return GetControllerTransitionResult(reader); }),
-          reader.Optional<RouteConfigurationFenceAcceptedDTO>(
-              [&]() { return GetRouteFenceAccepted(reader); }),
-          reader.Optional<RouteConfigurationFenceReleasedDTO>(
-              [&]() { return GetRouteFenceReleased(reader); }),
-          reader.Optional<ActiveControlConfigurationDTO>(
-              [&]() { return GetActiveConfiguration(reader); }),
-          reader.Bool(),
-          reader.Optional<RouteSelectionTerminalResultDTO>(
-              [&]() { return reader.EnumValue<RouteSelectionTerminalResultDTO>(); }),
-          reader.Optional<ErrorDTO>([&]() { return GetError(reader); }),
-          reader.I64(),
-          reader.I64(),
-          reader.I64()};
+  RouteSelectionStatusDTO result{
+      GetRouteAccepted(reader),
+      GetRouteIntent(reader),
+      reader.U64(),
+      reader.Identity<RequestOwnerEpoch>(),
+      reader.EnumValue<RouteSelectionTransactionPhaseDTO>(),
+      reader.EnumValue<RouteSelectionEffectDTO>(),
+      reader.Vector<ControlBindingId>([&]() { return reader.Identity<ControlBindingId>(); }),
+      reader.Vector<ControllerRoleId>([&]() { return reader.Identity<ControllerRoleId>(); }),
+      reader.Optional<ControllerLifecycleObservationDTO>(
+          [&]() { return GetControllerObservation(reader); }),
+      reader.Optional<ControllerLifecycleReconciliationDTO>(
+          [&]() { return GetControllerReconciliation(reader); }),
+      reader.Optional<ControllerLifecycleTransitionPlanDTO>(
+          [&]() { return GetControllerTransitionPlan(reader); }),
+      reader.Vector<ControllerLifecycleTransitionResultDTO>(
+          [&]() { return GetControllerTransitionResult(reader); }),
+      reader.Optional<RouteConfigurationFenceAcceptedDTO>(
+          [&]() { return GetRouteFenceAccepted(reader); }),
+      reader.Optional<RouteConfigurationFenceReleasedDTO>(
+          [&]() { return GetRouteFenceReleased(reader); }),
+      reader.Optional<ActiveControlConfigurationDTO>(
+          [&]() { return GetActiveConfiguration(reader); }),
+      reader.Bool(),
+      reader.Optional<RouteSelectionTerminalResultDTO>(
+          [&]() { return reader.EnumValue<RouteSelectionTerminalResultDTO>(); }),
+      reader.Optional<ErrorDTO>([&]() { return GetError(reader); }),
+      reader.I64(),
+      reader.I64(),
+      reader.I64()};
+  if (magic == kRouteAdmissionStatusMagic) {
+    result.accepted_intent.expected_admission_generation = reader.Counter<AdmissionGeneration>();
+    result.accepted_intent.program_node_evidence = reader.Optional<ProgramNodeAdmissionEvidenceDTO>(
+        [&] { return DecodeProgramNodeAdmissionEvidence(reader.String()); });
+  }
+  return result;
 }
 
 void PutRouteEffectAttempt(Writer& writer, const CCLCRouteEffectAttemptDTO& value) {
@@ -1864,8 +1883,34 @@ void PutDomainStatus(Writer& writer, const ComponentLifecycleDomainStatusDTO& va
       reader.Optional<ErrorDTO>([&]() { return GetError(reader); })};
 }
 
+void PutProgramNode(Writer& writer, const ProgramNodeAdmissionEvidenceDTO& value) {
+  writer.String(kProgramNodeMagic);
+  writer.Identity(value.program_runner_owner_epoch);
+  writer.Identity(value.program_run_id);
+  writer.Counter(value.parent_program_cycle_claim_generation);
+  writer.String(value.node_instance_id);
+  writer.String(value.node_attempt_id);
+  writer.String(value.owner_api);
+}
+
+[[nodiscard]] ProgramNodeAdmissionEvidenceDTO GetProgramNode(Reader& reader) {
+  if (reader.String() != kProgramNodeMagic) {
+    throw CodecFailure("Program node admission magic is invalid");
+  }
+  ProgramNodeAdmissionEvidenceDTO result{reader.Identity<RequestOwnerEpoch>(),
+                                         reader.Identity<ProgramRunId>(),
+                                         reader.Counter<CellAdmissionClaimGeneration>(),
+                                         reader.String(),
+                                         reader.String(),
+                                         reader.String()};
+  if (!result.locally_valid()) {
+    throw CodecFailure("Program node admission evidence is invalid");
+  }
+  return result;
+}
+
 void PutStatus(Writer& writer, const ComponentLifecycleStatusDTO& value) {
-  writer.String(kStatusMagic);
+  writer.String(value.accepted_intent.program_node_evidence ? kProgramStatusMagic : kStatusMagic);
   PutAccepted(writer, value.acceptance);
   PutIntent(writer, value.accepted_intent, true);
   writer.U64(value.status_sequence);
@@ -1891,13 +1936,17 @@ void PutStatus(Writer& writer, const ComponentLifecycleStatusDTO& value) {
   writer.I64(value.accepted_at_ns);
   writer.I64(value.latest_updated_at_ns);
   writer.I64(value.remaining_duration_ns);
+  if (value.accepted_intent.program_node_evidence) {
+    PutProgramNode(writer, *value.accepted_intent.program_node_evidence);
+  }
 }
 
 [[nodiscard]] ComponentLifecycleStatusDTO GetStatus(Reader& reader) {
-  if (reader.String() != kStatusMagic) {
+  const auto magic = reader.String();
+  if (magic != kStatusMagic && magic != kProgramStatusMagic) {
     throw CodecFailure("component lifecycle journal status magic is invalid");
   }
-  return ComponentLifecycleStatusDTO{
+  ComponentLifecycleStatusDTO result{
       GetAccepted(reader),
       GetIntent(reader),
       reader.U64(),
@@ -1919,9 +1968,55 @@ void PutStatus(Writer& writer, const ComponentLifecycleStatusDTO& value) {
       reader.I64(),
       reader.I64(),
       reader.I64()};
+  if (magic == kProgramStatusMagic) {
+    result.accepted_intent.program_node_evidence = GetProgramNode(reader);
+  }
+  return result;
 }
 
 }  // namespace
+
+std::string EncodeProgramNodeAdmissionEvidence(const ProgramNodeAdmissionEvidenceDTO& evidence) {
+  if (!evidence.locally_valid()) {
+    throw CodecFailure("Program node admission evidence is invalid");
+  }
+  Writer writer;
+  PutProgramNode(writer, evidence);
+  return std::move(writer).Finish();
+}
+
+std::string EncodeCCLCAdmissionRejection(const ErrorDTO& error) {
+  if (!CCLCLifecycleRequestResultDTO{RequestReplayStatusDTO::kAcceptedNew, std::nullopt,
+                                     std::nullopt, error}
+           .locally_valid()) {
+    throw CodecFailure("CCLC no-admission result is invalid");
+  }
+  Writer writer;
+  writer.String("MF-CCLC-REJECTION-V1");
+  PutError(writer, error);
+  return std::move(writer).Finish();
+}
+
+ErrorDTO DecodeCCLCAdmissionRejection(std::string_view bytes) {
+  Reader reader(bytes);
+  if (reader.String() != "MF-CCLC-REJECTION-V1")
+    throw CodecFailure("CCLC rejection magic is invalid");
+  auto error = GetError(reader);
+  reader.RequireEnd();
+  if (!CCLCLifecycleRequestResultDTO{RequestReplayStatusDTO::kAcceptedNew, std::nullopt,
+                                     std::nullopt, error}
+           .locally_valid()) {
+    throw CodecFailure("CCLC no-admission result is invalid");
+  }
+  return error;
+}
+
+ProgramNodeAdmissionEvidenceDTO DecodeProgramNodeAdmissionEvidence(std::string_view bytes) {
+  Reader reader(bytes);
+  auto evidence = GetProgramNode(reader);
+  reader.RequireEnd();
+  return evidence;
+}
 
 std::string EncodeComponentLifecycleStatus(const ComponentLifecycleStatusDTO& status) {
   if (!status.locally_valid()) {
@@ -1957,6 +2052,9 @@ std::string ComponentLifecycleSemanticIntentDigest(const ComponentLifecycleInten
   Writer writer;
   writer.String(kIntentMagic);
   PutIntent(writer, intent, false);
+  if (intent.program_node_evidence) {
+    PutProgramNode(writer, *intent.program_node_evidence);
+  }
   return content_identity::sha256_digest(std::move(writer).Finish());
 }
 
@@ -2079,8 +2177,15 @@ std::string RouteSelectionSemanticIntentDigest(const RouteSelectionIntentDTO& in
     throw CodecFailure("CCLC route intent is invalid at journal ingress");
   }
   Writer writer;
-  writer.String(kRouteIntentMagic);
+  writer.String(intent.expected_admission_generation ? kRouteAdmissionIntentMagic
+                                                     : kRouteIntentMagic);
   PutRouteIntent(writer, intent, false);
+  if (intent.expected_admission_generation) {
+    writer.Counter(*intent.expected_admission_generation);
+    writer.Optional<ProgramNodeAdmissionEvidenceDTO>(
+        intent.program_node_evidence,
+        [&](const auto& evidence) { writer.String(EncodeProgramNodeAdmissionEvidence(evidence)); });
+  }
   return content_identity::sha256_digest(std::move(writer).Finish());
 }
 

@@ -72,7 +72,7 @@ value_schemas:
     relative_path: value/manyforge.value_schema.provider_contract.empty.v1.yaml
     qualification: qualified
   - schema_id: manyforge.value_schema.provider_contract.motion_controlled_stop.v1
-    schema_revision: sha256:afbbcda3b81eabff2bbdffb5658fb1fcd3331cde896cadf0681793a2f9db90dd
+    schema_revision: sha256:58ec6382a268329e9d8001eb53aac31259b5eb95a3690095aa4bbe12ac51d83b
     relative_path: value/manyforge.value_schema.provider_contract.motion_controlled_stop.v1.yaml
     qualification: qualified
   - schema_id: manyforge.value_schema.runtime.empty.v1
@@ -80,7 +80,7 @@ value_schemas:
     relative_path: value/manyforge.value_schema.runtime.empty.v1.yaml
     qualification: qualified
   - schema_id: manyforge.value_schema.runtime.native_execution.v1
-    schema_revision: sha256:4405892649681799b9a813fafee4b5d23579d080b5457bf60f51ce2e296fcff8
+    schema_revision: sha256:49b3bbd377ad4cb93e7d27df06ff84b7e9ddbce3f3047e5702c61a9828c62035
     relative_path: value/manyforge.value_schema.runtime.native_execution.v1.yaml
     qualification: qualified
   - schema_id: manyforge.value_schema.runtime.ros2_control_execution.v1

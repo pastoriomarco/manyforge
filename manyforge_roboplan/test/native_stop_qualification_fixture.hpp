@@ -208,15 +208,16 @@ public:
   core::Result<core::ObservedStateSnapshotDTO>
   current_state(std::int64_t) const override {
     std::lock_guard lock(mutex_);
+    ++state_read_count_;
     auto observed_velocities = state_.velocities;
     if (forced_observed_velocities_.has_value()) {
       observed_velocities.emplace();
       observed_velocities->reserve(forced_observed_velocities_->size());
-      for (std::size_t index = 0U;
-           index < forced_observed_velocities_->size(); ++index) {
-        observed_velocities->push_back(tagged_velocity(
-            context_.coordinate_kinds[index],
-            (*forced_observed_velocities_)[index]));
+      for (std::size_t index = 0U; index < forced_observed_velocities_->size();
+           ++index) {
+        observed_velocities->push_back(
+            tagged_velocity(context_.coordinate_kinds[index],
+                            (*forced_observed_velocities_)[index]));
       }
     }
     return core::Result<core::ObservedStateSnapshotDTO>::Ok(
@@ -273,8 +274,7 @@ public:
     return core::Result<core::ControlledStateDTO>::Ok(state_);
   }
 
-  core::ObservedStateQueryContextDTO
-  query_context() const override {
+  core::ObservedStateQueryContextDTO query_context() const override {
     return context_;
   }
 
@@ -313,6 +313,11 @@ public:
     forced_observed_velocities_ = std::move(velocities);
   }
 
+  std::uint64_t state_read_count() const {
+    std::lock_guard lock(mutex_);
+    return state_read_count_;
+  }
+
   bool wait_for_fresh_state(std::chrono::nanoseconds) const override {
     std::lock_guard lock(mutex_);
     if (!refresh_source_on_wait_) {
@@ -340,6 +345,7 @@ private:
   mutable std::mutex mutex_;
   core::ControlledStateDTO state_;
   mutable std::uint64_t sequence_{};
+  mutable std::uint64_t state_read_count_{};
   std::int64_t source_timestamp_ns_{};
   mutable std::int64_t received_timestamp_ns_{};
   mutable core::RuntimeEpoch source_epoch_{context_.runtime_epoch};
@@ -361,7 +367,8 @@ trajectory(const core::RuntimeParticipantBinding &binding, double duration_s) {
       std::move(joint_names),
       {core::TrajectoryWaypointDTO{0.0, {0.0, 0.0}, {0.0, 0.0}, {0.0, 0.0}},
        core::TrajectoryWaypointDTO{
-           duration_s, {0.2, -0.3}, {0.0, 0.0}, {0.0, 0.0}}}};
+           duration_s, {0.2, -0.3}, {0.0, 0.0}, {0.0, 0.0}}},
+      core::TrajectoryRuntimeScaleBoundsDTO{4.0, 16.0}};
 }
 
 [[nodiscard]] inline core::MotionInterruptStopProfileDTO
@@ -371,6 +378,7 @@ soft_profile(const core::RuntimeParticipantBinding &binding,
   profile.profile_id = "native_stop_qualification_soft";
   profile.stop_mode = core::MotionInterruptStopMode::kSoftOnPath;
   profile.deceleration_time_s = deceleration_s;
+  profile.jerk_limits_enabled = true;
   profile.allow_natural_completion_on_short_path = false;
   profile.recoverable_substitution_mode =
       core::MotionInterruptStopMode::kSpringBackHold;
@@ -382,6 +390,8 @@ soft_profile(const core::RuntimeParticipantBinding &binding,
     }
     profile.per_joint_max_deceleration.emplace(
         *resource.source_joint_name, core::AngularAccelerationDTO{100.0});
+    profile.per_joint_max_jerk.emplace(*resource.source_joint_name,
+                                       core::AngularJerkDTO{1'000'000.0});
   }
   return profile;
 }

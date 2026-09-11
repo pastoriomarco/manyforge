@@ -658,7 +658,7 @@ core::Result<core::ProgramRunExecutionCaptureDTO>
 ProductBackedRuntimeParticipantResolver::ResolveProgramCapture(
     core::ProgramRunExecutionCaptureDTO capture) const {
   try {
-    if (capture.table != nullptr ||
+    if (capture.table != nullptr || capture.binding != nullptr ||
         capture.retained_bundle_id != retained_bundle_->retained_bundle_id() ||
         capture.graph_revision !=
             retained_bundle_->value().cell_graph.graph_revision) {
@@ -687,6 +687,8 @@ ProductBackedRuntimeParticipantResolver::ResolveProgramCapture(
     }
     capture.table = std::shared_ptr<const core::ProgramExecutionTableDTO>(
         program, &program->execution_table());
+    capture.binding = std::shared_ptr<const core::ProgramBindingDTO>(
+        binding, &binding->value());
     return core::Result<core::ProgramRunExecutionCaptureDTO>::Ok(
         std::move(capture));
   } catch (const std::exception &exception) {

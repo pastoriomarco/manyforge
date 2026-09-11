@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <manyforge_core/prepared_execution_membership.hpp>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -240,7 +241,10 @@ public:
   ~Ros2ControlExecutionBackend() override;
 
   core::PrepareParticipantResultDTO
-  Prepare(const core::PreparedOperationParticipantDTO &participant) override;
+  Prepare(const core::PreparedOperationParticipantDTO &participant,
+          std::uint64_t execution_id) override;
+  core::Result<void>
+  RetirePreparedExecution(std::uint64_t execution_id) override;
   core::ExecutionHandle
   Dispatch(const core::PreparedOperationParticipantDTO &participant,
            const core::ControllerGoalId &controller_goal_id,
@@ -529,10 +533,9 @@ public:
         stage.controller_goal_generation,
         prepared_contract_digest};
     std::lock_guard<std::mutex> lock(prepared_execution_mutex_);
-    prepared_goals_.erase(stage.controller_goal_id);
-    prepared_goals_.emplace(
-        stage.controller_goal_id,
-        PreparedGoalRecord{stage.controller_goal_generation,
+    prepared_goal_ =
+        PreparedGoalRecord{stage.controller_goal_id,
+                           stage.controller_goal_generation,
                            std::move(prepared_contract_digest),
                            stage.operation_id,
                            stage.operation_revision,
@@ -554,7 +557,7 @@ public:
                            stage.stop_evidence_policy_id,
                            stage.stop_evidence_policy_revision,
                            {stage.participant_stop_plan},
-                           std::move(handle)});
+                           std::move(handle)};
   }
 
   void testing_store_action_feedback_sample(
@@ -1166,6 +1169,7 @@ private:
   Ros2ControlExecutionBackendConfig config_;
 
   struct PreparedGoalRecord final {
+    core::ControllerGoalId goal_id;
     core::ControllerGoalGeneration generation;
     core::ContentDigest prepared_contract_digest;
     // Retain the exact Stop-visible projection of the sealed participant used
@@ -1197,13 +1201,10 @@ private:
     std::vector<core::PreparedParticipantStopPlanDTO> stop_plans;
     core::ExecutionHandle handle;
   };
-  static constexpr std::size_t kPreparedReplayCapacity = 4096U;
   mutable std::mutex prepared_execution_mutex_;
-  std::map<std::tuple<core::OperationId, core::OperationRevision,
-                      core::OperationParticipantId>,
-           core::ContentDigest>
-      prepared_participants_;
-  std::map<core::ControllerGoalId, PreparedGoalRecord> prepared_goals_;
+  core::PreparedExecutionMembership prepared_membership_;
+  std::optional<PreparedGoalRecord> prepared_goal_;
+  std::atomic<std::uint32_t> prepared_stop_stage_activity_{0U};
   std::atomic<std::shared_ptr<const core::RuntimeParticipantBinding>>
       prepared_participant_binding_;
   std::atomic<

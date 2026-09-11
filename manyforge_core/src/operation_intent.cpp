@@ -218,6 +218,22 @@ Result<void> validate_operation_intent(const OperationIntentDTO& intent) {
     return invalid("operation participant count is outside the fixed bound",
                    "operation_participant_count_invalid");
   }
+  if (intent.manual_handover) {
+    const auto& context = *intent.manual_handover;
+    if (context.program_runner_owner_epoch.empty() || context.program_run_id.empty() ||
+        !context.claim_generation.nonzero() ||
+        context.claim_generation.value() > 9007199254740991ULL ||
+        context.selection_revision > 9007199254740991ULL ||
+        context.program_runner_owner_epoch.value().size() > 128U ||
+        context.program_run_id.value().size() > 128U ||
+        context.program_runner_owner_epoch.value().find('\0') != std::string::npos ||
+        context.program_run_id.value().find('\0') != std::string::npos ||
+        context.program_run_id == intent.program_run_id || intent.participants.size() != 1U ||
+        intent.coordination_policy != OperationCoordinationPolicy::kIndependent ||
+        intent.participants.front().execution_scope) {
+      return invalid("manual handover context is invalid", "manual_handover_context_invalid");
+    }
+  }
   for (const auto& participant : intent.participants) {
     if (participant.component_role_id.empty() || participant.target_role_id.empty() ||
         participant.required_capability_id.empty()) {

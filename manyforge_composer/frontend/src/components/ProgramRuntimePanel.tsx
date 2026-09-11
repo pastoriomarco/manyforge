@@ -541,28 +541,34 @@ export function ProgramTransportControls({
 }) {
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [stopMenuOpen, setStopMenuOpen] = useState(false);
-  const [selection, setSelection] = useState({ runId: '', groupId: 'all' });
+  const [selection, setSelection] = useState({ runId: '', groupIds: ['all'] });
   const detailsButton = useRef<HTMLButtonElement>(null);
   const { state, cycleState } = program;
   const runId = state.run?.capture.programRunId ?? '';
   const selections = state.controls?.executionSelections.groups ?? [];
-  const selectedGroup = selections.find((group) => group.groupId === (
-    selection.runId === runId ? selection.groupId : 'all'
-  )) ?? selections.find((group) => group.groupId === 'all');
+  const groupIds = selection.runId === runId ? selection.groupIds : ['all'];
+  const selectedGroups = selections.filter((group) => groupIds.includes(group.groupId));
+  const selectedGroup = selectedGroups.find((group) => group.resumeUnavailableReason)
+    ?? selectedGroups[0];
   const motionActive = robotControlHasActiveOperation(robot.state);
   const motionPaused = robot.state.operation?.state === 'paused';
+  // Includes the other manual mode, not just the operation currently shown
+  // in Robot Control. The native owner independently fences Program Resume.
+  const manualResident = robot.currentStatus?.manualOperations.some((operation) => operation.resident) === true;
   const programMotionRunning = ['running', 'intervention_required'].includes(state.run?.state ?? '');
   const programStarting = cycleState === 'starting';
   const programStopping = cycleState === 'stopping';
   const programFullStopping = state.run?.state === 'full_stopping';
   const programFullStopped = state.run?.state === 'full_stopped';
   const canRun = enabled
+    && !manualResident
     && state.runnerAvailable
     && state.applied !== null
     && state.pending === null
     && !programMotionRunning
     && program.commandAllowed('program_run');
-  const motionStopSettled = selectedGroup?.state === 'held' && programMotionRunning;
+  const motionStopSettled = selectedGroups.length > 0
+    && selectedGroups.every((group) => group.state === 'held') && programMotionRunning;
   const motionStopped = motionStopSettled
     || programFullStopped
     || state.run?.state === 'stopped'
@@ -576,15 +582,17 @@ export function ProgramTransportControls({
     && !stopCommandPending
     && !programStopping
     && !motionStopSettled
-    && selectedGroup?.state !== 'stopping'
+    && groupIds.length > 0
     && (
       (state.runnerAvailable && (programStarting || (programMotionRunning
         && program.commandAllowed('program_motion_stop')
-        && (selectedGroup?.stopAllowed ?? true))))
+        && (selectedGroups.some((group) => group.stopAllowed) || selections.length === 0))))
       || (robot.controlPending === null && motionActive)
     );
   const canResumeOperatorStop = enabled
-    && selectedGroup?.resumeAllowed === true
+    && !manualResident
+    && selectedGroups.length === groupIds.length && groupIds.length > 0
+    && selectedGroups.every((group) => group.resumeAllowed)
     && program.commandAllowed('program_motion_resume')
     && state.pending === null
     && state.controlPending === null;
@@ -593,6 +601,7 @@ export function ProgramTransportControls({
     && state.pending === null
     && robot.controlPending === null;
   const canResumeFullStop = enabled
+    && !manualResident
     && programFullStopped
     && state.pending === null;
   const canRunOrResume = canRun || canResume || canResumeOperatorStop
@@ -696,20 +705,23 @@ export function ProgramTransportControls({
           </div>
         )}
         {selections.length > 1 && (
-          <label className="transport-selection" title={selectedGroup?.resumeUnavailableReason?.replaceAll('_', ' ')}>
-            <span>Scope</span>
-            <select
-              aria-label="Motion control group"
-              value={selectedGroup?.groupId ?? 'all'}
-              onChange={(event) => setSelection({ runId, groupId: event.target.value })}
-            >
+          <details className="transport-selection">
+            <summary aria-label="Motion control groups">
+              {groupIds.includes('all') ? 'All nodes' : `${groupIds.length} groups`}
+            </summary>
+            <div className="transport-selection-options">
               {selections.map((group) => (
-                <option key={group.groupId} value={group.groupId}>
+                <label key={group.groupId}>
+                  <input type="checkbox" value={group.groupId} checked={groupIds.includes(group.groupId)}
+                    onChange={(event) => setSelection({ runId, groupIds: event.target.checked
+                      ? group.groupId === 'all' ? ['all']
+                        : [...groupIds.filter((id) => id !== 'all'), group.groupId]
+                      : groupIds.filter((id) => id !== group.groupId) })} />
                   {group.groupId === 'all' ? 'All nodes' : group.groupId} · {group.state}
-                </option>
+                </label>
               ))}
-            </select>
-          </label>
+            </div>
+          </details>
         )}
         <button
           type="button"
@@ -731,7 +743,7 @@ export function ProgramTransportControls({
             } else if (canResumeFullStop) {
               void program.resumeFullStop();
             } else if (canResumeOperatorStop) {
-              void program.resumeMotion(selectedGroup?.groupId);
+              void program.resumeMotion(groupIds);
             } else {
               void program.run();
             }
@@ -782,13 +794,13 @@ export function ProgramTransportControls({
               if (programStarting) {
                 void program.stop();
               } else if (programMotionRunning) {
-                void program.stopMotion(selectedGroup?.groupId);
+                void program.stopMotion(groupIds);
               } else {
                 void robot.stop();
               }
             }}
           >
-            {programStopping || selectedGroup?.state === 'stopping'
+            {programStopping || selectedGroups.some((group) => group.state === 'stopping')
               ? 'Stopping'
               : robot.controlPending === 'stop'
               ? 'Sending Stop'

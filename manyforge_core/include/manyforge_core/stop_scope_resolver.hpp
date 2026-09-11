@@ -33,6 +33,8 @@ struct StopScopeOperationSnapshotDTO final {
   bool effect_uncertain{};
   std::vector<ControllableComponentId> controllable_components;
   std::vector<ResourceId> resources;
+  /// Exact Kernel-owned attachment; manual work retains its own Run identity.
+  std::optional<ProgramRunId> parent_program_run_id{};
 
   friend bool operator==(const StopScopeOperationSnapshotDTO&,
                          const StopScopeOperationSnapshotDTO&) = default;

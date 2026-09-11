@@ -339,7 +339,7 @@ class CellAdmissionClient:
         return value
 
     def acquire(self, intent: Mapping[str, Any]) -> dict[str, Any]:
-        if set(intent) != _INTENT_KEYS:
+        if set(intent) not in (_INTENT_KEYS, _INTENT_KEYS | {"program_node_evidence"}):
             raise ValueError("claim intent is not the exact A1 projection")
         result = self._call("cell_admission_acquire", intent)
         try:

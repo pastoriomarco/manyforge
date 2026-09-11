@@ -3,6 +3,7 @@
 #include <pybind11/stl.h>
 
 #include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
+#include <manyforge_core/ports/icclc_journal.hpp>
 #include <manyforge_core/types/component_lifecycle.hpp>
 
 #include "binding_registrations.hpp"
@@ -332,15 +333,36 @@ void register_component_lifecycle_bindings(py::module_& module) {
       .def(py::self == py::self)
       .def(py::self != py::self);
 
+  py::class_<ProgramNodeAdmissionEvidenceDTO>(module, "ProgramNodeAdmissionEvidenceDTO",
+                                              py::is_final())
+      .def(py::init<RequestOwnerEpoch, ProgramRunId, CellAdmissionClaimGeneration, std::string,
+                    std::string, std::string>(),
+           py::arg("program_runner_owner_epoch"), py::arg("program_run_id"),
+           py::arg("parent_program_cycle_claim_generation"), py::arg("node_instance_id"),
+           py::arg("node_attempt_id"), py::arg("owner_api"))
+      .def_readonly("program_runner_owner_epoch",
+                    &ProgramNodeAdmissionEvidenceDTO::program_runner_owner_epoch)
+      .def_readonly("program_run_id", &ProgramNodeAdmissionEvidenceDTO::program_run_id)
+      .def_readonly("parent_program_cycle_claim_generation",
+                    &ProgramNodeAdmissionEvidenceDTO::parent_program_cycle_claim_generation)
+      .def_readonly("node_instance_id", &ProgramNodeAdmissionEvidenceDTO::node_instance_id)
+      .def_readonly("node_attempt_id", &ProgramNodeAdmissionEvidenceDTO::node_attempt_id)
+      .def_readonly("owner_api", &ProgramNodeAdmissionEvidenceDTO::owner_api)
+      .def("locally_valid", &ProgramNodeAdmissionEvidenceDTO::locally_valid)
+      .def(py::self == py::self);
+
   py::class_<ComponentLifecycleIntentDTO>(module, "ComponentLifecycleIntentDTO", py::is_final())
       .def(py::init<PublicRequestContextDTO, ControllableComponentId,
                     ComponentLifecycleIntentKindDTO, GraphRevision, ComponentLifecycleGeneration,
                     std::vector<ExpectedControlDomainRevisionDTO>, std::optional<std::string>,
-                    RequestAttributionDTO>(),
+                    RequestAttributionDTO, AdmissionGeneration,
+                    std::optional<ProgramNodeAdmissionEvidenceDTO>>(),
            py::arg("request_context"), py::arg("controllable_component_id"), py::arg("intent"),
            py::arg("expected_graph_revision"), py::arg("expected_component_lifecycle_generation"),
            py::arg("expected_control_domains"), py::arg("reason") = std::nullopt,
-           py::arg("attribution") = RequestAttributionDTO{})
+           py::arg("attribution") = RequestAttributionDTO{},
+           py::arg("expected_admission_generation") = AdmissionGeneration(1U),
+           py::arg("program_node_evidence") = std::nullopt)
       .def_readonly("request_context", &ComponentLifecycleIntentDTO::request_context)
       .def_readonly("controllable_component_id",
                     &ComponentLifecycleIntentDTO::controllable_component_id)
@@ -355,6 +377,9 @@ void register_component_lifecycle_bindings(py::module_& module) {
                              })
       .def_readonly("reason", &ComponentLifecycleIntentDTO::reason)
       .def_readonly("attribution", &ComponentLifecycleIntentDTO::attribution)
+      .def_readonly("expected_admission_generation",
+                    &ComponentLifecycleIntentDTO::expected_admission_generation)
+      .def_readonly("program_node_evidence", &ComponentLifecycleIntentDTO::program_node_evidence)
       .def("locally_valid", &ComponentLifecycleIntentDTO::locally_valid)
       .def("replay_equal", &ComponentLifecycleIntentDTO::replay_equal)
       .def(py::self == py::self)
@@ -1264,6 +1289,62 @@ void register_component_lifecycle_bindings(py::module_& module) {
       .def("locally_valid", &ComponentLifecycleStatusDTO::locally_valid)
       .def(py::self == py::self)
       .def(py::self != py::self);
+
+  py::class_<CCLCLifecycleRequestResultDTO>(module, "CCLCLifecycleRequestResultDTO", py::is_final())
+      .def(py::init<RequestReplayStatusDTO, std::optional<ComponentLifecycleAcceptedDTO>,
+                    std::optional<ComponentLifecycleStatusDTO>, std::optional<ErrorDTO>>(),
+           py::arg("replay_status"), py::arg("acceptance") = std::nullopt,
+           py::arg("status") = std::nullopt, py::arg("rejection") = std::nullopt)
+      .def_readonly("replay_status", &CCLCLifecycleRequestResultDTO::replay_status)
+      .def_readonly("acceptance", &CCLCLifecycleRequestResultDTO::acceptance)
+      .def_readonly("status", &CCLCLifecycleRequestResultDTO::status)
+      .def_readonly("rejection", &CCLCLifecycleRequestResultDTO::rejection)
+      .def("locally_valid", &CCLCLifecycleRequestResultDTO::locally_valid);
+
+  py::class_<RouteSelectionComponentExpectationDTO>(module, "RouteSelectionComponentExpectationDTO",
+                                                    py::is_final())
+      .def(py::init<ControllableComponentId, ComponentLifecycleGeneration,
+                    ComponentLifecycleStateDTO>(),
+           py::arg("controllable_component_id"), py::arg("expected_component_lifecycle_generation"),
+           py::arg("expected_component_lifecycle_state"))
+      .def_readonly("controllable_component_id",
+                    &RouteSelectionComponentExpectationDTO::controllable_component_id)
+      .def_readonly("expected_component_lifecycle_generation",
+                    &RouteSelectionComponentExpectationDTO::expected_component_lifecycle_generation)
+      .def_readonly("expected_component_lifecycle_state",
+                    &RouteSelectionComponentExpectationDTO::expected_component_lifecycle_state)
+      .def("locally_valid", &RouteSelectionComponentExpectationDTO::locally_valid)
+      .def(py::self == py::self);
+
+  py::class_<RouteSelectionIntentDTO>(module, "RouteSelectionIntentDTO", py::is_final())
+      .def(py::init<PublicRequestContextDTO, RetainedBundleId, GraphRevision,
+                    DesiredControlConfigurationDTO, ExpectedActiveControlConfigurationDTO,
+                    std::vector<RouteSelectionComponentExpectationDTO>, RequestAttributionDTO,
+                    std::optional<AdmissionGeneration>,
+                    std::optional<ProgramNodeAdmissionEvidenceDTO>>(),
+           py::arg("request_context"), py::arg("expected_retained_bundle_id"),
+           py::arg("expected_graph_revision"), py::arg("desired_configuration"),
+           py::arg("expected_active_control_configuration"), py::arg("component_expectations"),
+           py::arg("attribution"), py::arg("expected_admission_generation") = std::nullopt,
+           py::arg("program_node_evidence") = std::nullopt)
+      .def_readonly("request_context", &RouteSelectionIntentDTO::request_context)
+      .def_readonly("expected_retained_bundle_id",
+                    &RouteSelectionIntentDTO::expected_retained_bundle_id)
+      .def_readonly("expected_graph_revision", &RouteSelectionIntentDTO::expected_graph_revision)
+      .def_readonly("desired_configuration", &RouteSelectionIntentDTO::desired_configuration)
+      .def_readonly("expected_active_control_configuration",
+                    &RouteSelectionIntentDTO::expected_active_control_configuration)
+      .def_property_readonly("component_expectations",
+                             [](const RouteSelectionIntentDTO& value) {
+                               return immutable_snapshot(value.component_expectations);
+                             })
+      .def_readonly("attribution", &RouteSelectionIntentDTO::attribution)
+      .def_readonly("expected_admission_generation",
+                    &RouteSelectionIntentDTO::expected_admission_generation)
+      .def_readonly("program_node_evidence", &RouteSelectionIntentDTO::program_node_evidence)
+      .def("locally_valid", &RouteSelectionIntentDTO::locally_valid)
+      .def("replay_equal", &RouteSelectionIntentDTO::replay_equal)
+      .def(py::self == py::self);
 }
 
 }  // namespace manyforge::core::python

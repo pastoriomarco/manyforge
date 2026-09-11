@@ -288,6 +288,8 @@ import type {
   OperationStateName,
   ResourceSourceKind,
   SceneRevisionValue,
+  ManualControlAvailability,
+  ManualProgramHandoverContext,
 } from '../types/robotControl';
 import {
   parseProgramBindingTransport,
@@ -2573,7 +2575,10 @@ export function parseDeploymentWorkspaceResponse(
       document.api_version,
       `${path}.draft.document.api_version`,
     );
-    const graph = objectAt(document.graph, `${path}.draft.document.graph`);
+    // This is the normalized authored document, not the compiled cell graph.
+    // Its graph revision is the compiler-issued sibling above, joined to the
+    // Binding below; authored graph content contains no graph_revision field.
+    objectAt(document.graph, `${path}.draft.document.graph`);
     if (
       apiVersion !== 'manyforge.deployment.v1'
       || stringAt(
@@ -2584,10 +2589,6 @@ export function parseDeploymentWorkspaceResponse(
         document.deployment_revision,
         `${path}.draft.document.deployment_revision`,
       ) !== deploymentRevision
-      || digestAt(
-        graph.graph_revision,
-        `${path}.draft.document.graph.graph_revision`,
-      ) !== graphRevision
     ) {
       return fail(`${path}.draft`, 'one exact compiled Deployment identity');
     }
@@ -6716,10 +6717,10 @@ function manualControlMotionDescriptorAt(
   exactKeysAt(record, [
     'command_target_id', 'component_role_id', 'contracts',
     'controllable_component_id', 'frames', 'joints', 'operational_joint_limits',
-    'operational_limit', 'schema_version', 'target_role_id',
+    'operational_limit', 'ordinary_jerk', 'schema_version', 'target_role_id',
   ], path);
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.manual_control_motion_descriptor.v3') {
+  if (schemaVersion !== 'manyforge.manual_control_motion_descriptor.v4') {
     return fail(`${path}.schema_version`, 'the supported motion descriptor');
   }
   const operationalLimit = record.operational_limit === null
@@ -6815,6 +6816,55 @@ function manualControlMotionDescriptorAt(
       return fail(`${path}.joints[${index}]`, 'ordered finite limits');
     }
   }
+  const ordinaryJerk: ManualControlMotionDescriptor['ordinaryJerk'] = record.ordinary_jerk === null
+    ? null : (() => {
+      const base = `${path}.ordinary_jerk`;
+      const profile = objectAt(record.ordinary_jerk, base);
+      exactKeysAt(profile, ['enabled', 'preset_reference_time_s', 'joint_limits'], base);
+      const enabled = booleanAt(profile.enabled, `${base}.enabled`);
+      const jointLimits = boundedArrayAt(profile.joint_limits, `${base}.joint_limits`, 1024)
+        .map((value, index) => {
+          const itemPath = `${base}.joint_limits[${index}]`;
+          const row = objectAt(value, itemPath);
+          exactKeysAt(row, ['source_joint_name', 'source', 'maximum_rad_s3', 'preset_rad_s3', 'imported'], itemPath);
+          const source = stringAt(row.source, `${itemPath}.source`);
+          if (!['off', 'override', 'imported', 'preset'].includes(source)) {
+            return fail(itemPath, 'a known jerk-limit source');
+          }
+          const maximumRadS3 = nullableNumberAt(row.maximum_rad_s3, `${itemPath}.maximum_rad_s3`);
+          const presetRadS3 = nullableNumberAt(row.preset_rad_s3, `${itemPath}.preset_rad_s3`);
+          const imported = row.imported === null ? null : (() => {
+            const importedPath = `${itemPath}.imported`;
+            const info = objectAt(row.imported, importedPath);
+            exactKeysAt(info, ['maximum_rad_s3', 'enabled', 'machine_required', 'source_id', 'source_digest'], importedPath);
+            return {
+              maximumRadS3: positiveNumberAt(info.maximum_rad_s3, `${importedPath}.maximum_rad_s3`),
+              enabled: booleanAt(info.enabled, `${importedPath}.enabled`),
+              machineRequired: booleanAt(info.machine_required, `${importedPath}.machine_required`),
+              sourceId: stringAt(info.source_id, `${importedPath}.source_id`),
+              sourceDigest: digestAt(info.source_digest, `${importedPath}.source_digest`),
+            };
+          })();
+          if ((enabled ? maximumRadS3 === null || source === 'off' : maximumRadS3 !== null || source !== 'off')
+            || (maximumRadS3 !== null && maximumRadS3 <= 0)
+            || (presetRadS3 !== null && presetRadS3 <= 0)
+            || (source === 'preset' && maximumRadS3 !== presetRadS3)
+            || (source === 'imported' && (!imported?.enabled || maximumRadS3 !== imported.maximumRadS3))
+            || (imported?.enabled && maximumRadS3 !== null && maximumRadS3 > imported.maximumRadS3)
+            || (imported?.machineRequired && (!enabled || !imported.enabled))) {
+            return fail(itemPath, 'consistent effective jerk limits and provenance');
+          }
+          return {
+            sourceJointName: stringAt(row.source_joint_name, `${itemPath}.source_joint_name`),
+            source: source as 'off' | 'override' | 'imported' | 'preset',
+            maximumRadS3, presetRadS3, imported,
+          };
+        });
+      if (jointLimits.length !== joints.length || jointLimits.some((row, index) => row.sourceJointName !== joints[index].sourceJointName)) {
+        return fail(base, 'jerk limits joined to the exact ordered model joints');
+      }
+      return { enabled, presetReferenceTimeS: positiveNumberAt(profile.preset_reference_time_s, `${base}.preset_reference_time_s`), jointLimits };
+    })();
   const operationalJointLimits = boundedArrayAt(
     record.operational_joint_limits,
     `${path}.operational_joint_limits`,
@@ -6883,7 +6933,11 @@ function manualControlMotionDescriptorAt(
     if (
       result.effectiveMaxVelocityRadS !== expectedVelocity
       || result.effectiveMaxAccelerationRadS2 !== expectedAcceleration
-      || result.effectiveMaxJerkRadS3 !== result.deploymentMaxJerkRadS3
+      || result.effectiveMaxJerkRadS3 !== (ordinaryJerk === null
+        ? result.deploymentMaxJerkRadS3
+        : !ordinaryJerk.enabled ? null
+          : Math.min(result.deploymentMaxJerkRadS3 ?? Infinity,
+            ordinaryJerk.jointLimits[index].maximumRadS3!))
     ) {
       return fail(itemPath, 'the exact conservative Deployment/model minimum');
     }
@@ -6908,6 +6962,7 @@ function manualControlMotionDescriptorAt(
     frames,
     joints,
     operationalJointLimits,
+    ordinaryJerk,
     operationalLimit,
     contracts: manualControlContractsAt(record.contracts, `${path}.contracts`),
   };
@@ -8069,6 +8124,45 @@ function poseAt(value: unknown, path: string): MotionPreviewReceipt['finalTcpPos
       z: numberAt(orientation.z, `${path}.orientation.z`),
       w: numberAt(orientation.w, `${path}.orientation.w`),
     },
+  };
+}
+
+export function parseManualControlAvailability(value: unknown): ManualControlAvailability {
+  const path = 'manualControlAvailability';
+  const envelope = objectAt(value, path);
+  exactKeysAt(envelope, ['api_version', 'command', 'ok', 'request_id',
+    'request_owner_epoch', 'intent_digest', 'availability', 'manual_handover'], path);
+  if (envelope.api_version !== 'manyforge.execution_command_response.v1'
+    || envelope.command !== 'read_manual_handover' || envelope.ok !== true) {
+    return fail(path, 'a successful manual availability response');
+  }
+  const flags = objectAt(envelope.availability, `${path}.availability`);
+  exactKeysAt(flags, ['available', 'unavailable_reason', 'cleanup_required'], `${path}.availability`);
+  const available = booleanAt(flags.available, `${path}.available`);
+  const unavailableReason = nullableStringAt(flags.unavailable_reason, `${path}.unavailable_reason`);
+  const cleanupRequired = booleanAt(flags.cleanup_required, `${path}.cleanup_required`);
+  let manualHandover: ManualProgramHandoverContext | null = null;
+  if (envelope.manual_handover !== null) {
+    const context = objectAt(envelope.manual_handover, `${path}.manual_handover`);
+    exactKeysAt(context, ['program_runner_owner_epoch', 'program_run_id',
+      'claim_generation', 'selection_revision'], `${path}.manual_handover`);
+    const selection = integerAt(context.selection_revision, `${path}.selection_revision`);
+    manualHandover = {
+      program_runner_owner_epoch: stringAt(context.program_runner_owner_epoch, `${path}.program_runner_owner_epoch`),
+      program_run_id: stringAt(context.program_run_id, `${path}.program_run_id`),
+      claim_generation: positiveIntegerAt(context.claim_generation, `${path}.claim_generation`),
+      selection_revision: selection,
+    };
+  }
+  if (available === (unavailableReason !== null)
+    || (cleanupRequired && (!available || manualHandover === null))) {
+    return fail(path, 'consistent availability, reason and cleanup context');
+  }
+  return {
+    requestId: stringAt(envelope.request_id, `${path}.request_id`),
+    requestOwnerEpoch: stringAt(envelope.request_owner_epoch, `${path}.request_owner_epoch`),
+    intentDigest: digestAt(envelope.intent_digest, `${path}.intent_digest`),
+    available, unavailableReason, cleanupRequired, manualHandover,
   };
 }
 

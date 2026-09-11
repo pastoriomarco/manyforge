@@ -234,7 +234,8 @@ static_assert(!ExposesRouteFenceStop<ICCLCKernelRouteConfigurationFencePort>);
           Desired(),
           ExpectedCurrent(),
           Components(),
-          {RequestTransportDTO::kInternal, RequestAssuranceDTO::kUnverified, std::nullopt}};
+          {RequestTransportDTO::kInternal, RequestAssuranceDTO::kUnverified, std::nullopt},
+          AdmissionGeneration(1U)};
 }
 
 [[nodiscard]] RouteConfigurationFenceAdmissionSnapshotDTO FenceSnapshot(std::uint64_t queued = 0U,

@@ -2244,6 +2244,7 @@ struct InputOptions final {
               "nominal", provider_contract_ref(),
               CanonicalValue(CanonicalValue::Object{
                   {"stop_mode", CanonicalValue("soft_on_path")},
+                  {"jerk_limits_enabled", CanonicalValue(false)},
                   {"deceleration_time_s", CanonicalValue(0.25)},
                   {"per_resource_limits",
                    CanonicalValue(std::move(resource_limits))},

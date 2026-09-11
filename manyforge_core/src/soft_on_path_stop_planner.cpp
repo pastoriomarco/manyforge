@@ -1,17 +1,19 @@
-#include <manyforge_core/motion_interrupt/soft_on_path_stop_planner.hpp>
-
-#include <manyforge_core/trajectory/trajectory_sampler.hpp>
-
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <limits>
+#include <manyforge_core/detail/runtime_scale_governor.hpp>
+#include <manyforge_core/motion_interrupt/soft_on_path_stop_planner.hpp>
+#include <manyforge_core/trajectory/trajectory_sampler.hpp>
 #include <map>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
+
+#include "affine_path_stop_internal.hpp"
 
 namespace manyforge::core {
 namespace {
@@ -36,34 +38,27 @@ const char* source_string(SoftOnPathStateSource source) {
   return "unknown";
 }
 
-Result<SoftOnPathStopPlanDTO> err(
-    std::string reason,
-    std::string message,
-    std::map<std::string, std::string> details = {}) {
+Result<SoftOnPathStopPlanDTO> err(std::string reason, std::string message,
+                                  std::map<std::string, std::string> details = {}) {
   details["reason"] = reason;
-  return Result<SoftOnPathStopPlanDTO>::Err(ErrorDTO{
-      std::string(to_string(ErrorCode::kMotionInterruptBackendStopFailed)),
-      std::move(message),
-      std::move(details)});
+  return Result<SoftOnPathStopPlanDTO>::Err(
+      ErrorDTO{std::string(to_string(ErrorCode::kMotionInterruptBackendStopFailed)),
+               std::move(message), std::move(details)});
 }
 
-Result<SoftOnPathStopPlanDTO> err_structured(
-    std::string reason,
-    std::string message,
-    InterruptStructuredValue details) {
+Result<SoftOnPathStopPlanDTO> err_structured(std::string reason, std::string message,
+                                             InterruptStructuredValue details) {
   details["reason"] = interrupt_structured_string(reason);
-  return Result<SoftOnPathStopPlanDTO>::Err(ErrorDTO{
-      std::string(to_string(ErrorCode::kMotionInterruptBackendStopFailed)),
-      std::move(message),
-      project_interrupt_structured_value_to_text(details)});
+  return Result<SoftOnPathStopPlanDTO>::Err(
+      ErrorDTO{std::string(to_string(ErrorCode::kMotionInterruptBackendStopFailed)),
+               std::move(message), project_interrupt_structured_value_to_text(details)});
 }
 
 bool finite_positive(double value) {
   return std::isfinite(value) && value > 0.0;
 }
 
-std::optional<std::map<std::string, double>>
-angular_deceleration_limits(
+std::optional<std::map<std::string, double>> angular_deceleration_limits(
     const MotionInterruptStopProfileDTO& profile) {
   std::map<std::string, double> limits;
   for (const auto& [joint, typed] : profile.per_joint_max_deceleration) {
@@ -77,9 +72,8 @@ angular_deceleration_limits(
 }
 
 bool all_finite(const std::vector<double>& values) {
-  return std::all_of(values.begin(), values.end(), [](double value) {
-    return std::isfinite(value);
-  });
+  return std::all_of(values.begin(), values.end(),
+                     [](double value) { return std::isfinite(value); });
 }
 
 double norm(const std::vector<double>& values) {
@@ -99,8 +93,7 @@ double dot(const std::vector<double>& a, const std::vector<double>& b) {
   return sum;
 }
 
-std::vector<double> subtract(const std::vector<double>& a,
-                             const std::vector<double>& b) {
+std::vector<double> subtract(const std::vector<double>& a, const std::vector<double>& b) {
   std::vector<double> out(a.size(), 0.0);
   for (size_t i = 0; i < a.size(); ++i) {
     out[i] = a[i] - b[i];
@@ -108,8 +101,7 @@ std::vector<double> subtract(const std::vector<double>& a,
   return out;
 }
 
-std::optional<size_t> find_joint(const std::vector<std::string>& names,
-                                 const std::string& target) {
+std::optional<size_t> find_joint(const std::vector<std::string>& names, const std::string& target) {
   const auto it = std::find(names.begin(), names.end(), target);
   if (it == names.end()) {
     return std::nullopt;
@@ -123,14 +115,12 @@ struct OrderedState {
   bool has_velocity = false;
 };
 
-Result<OrderedState> order_state_for_trajectory(
-    const RobotStateDTO& state,
-    const std::vector<std::string>& joint_names) {
+Result<OrderedState> order_state_for_trajectory(const RobotStateDTO& state,
+                                                const std::vector<std::string>& joint_names) {
   if (joint_names.empty()) {
-    return Result<OrderedState>::Err(ErrorDTO{
-        std::string(to_string(ErrorCode::kInvalidRequest)),
-        "soft_on_path trajectory has no joint names",
-        {{"reason", "trajectory_joint_names_empty"}}});
+    return Result<OrderedState>::Err(ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
+                                              "soft_on_path trajectory has no joint names",
+                                              {{"reason", "trajectory_joint_names_empty"}}});
   }
   OrderedState ordered;
   ordered.positions.resize(joint_names.size(), 0.0);
@@ -138,27 +128,26 @@ Result<OrderedState> order_state_for_trajectory(
 
   if (state.joint_names.empty()) {
     if (state.positions_rad.size() != joint_names.size()) {
-      return Result<OrderedState>::Err(ErrorDTO{
-          std::string(to_string(ErrorCode::kInvalidRequest)),
-          "soft_on_path observed position size does not match trajectory joints",
-          {{"reason", "observed_position_size_mismatch"},
-           {"joint_count", std::to_string(joint_names.size())},
-           {"position_count", std::to_string(state.positions_rad.size())}}});
+      return Result<OrderedState>::Err(
+          ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
+                   "soft_on_path observed position size does not match trajectory joints",
+                   {{"reason", "observed_position_size_mismatch"},
+                    {"joint_count", std::to_string(joint_names.size())},
+                    {"position_count", std::to_string(state.positions_rad.size())}}});
     }
     ordered.positions = state.positions_rad;
     if (!all_finite(ordered.positions)) {
-      return Result<OrderedState>::Err(ErrorDTO{
-          std::string(to_string(ErrorCode::kInvalidRequest)),
-          "soft_on_path observed positions must be finite",
-          {{"reason", "observed_position_not_finite"}}});
+      return Result<OrderedState>::Err(ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
+                                                "soft_on_path observed positions must be finite",
+                                                {{"reason", "observed_position_not_finite"}}});
     }
     if (state.velocities_rad_s.size() == joint_names.size()) {
       ordered.velocities = state.velocities_rad_s;
       if (!all_finite(ordered.velocities)) {
-        return Result<OrderedState>::Err(ErrorDTO{
-            std::string(to_string(ErrorCode::kInvalidRequest)),
-            "soft_on_path observed velocities must be finite",
-            {{"reason", "observed_velocity_not_finite"}}});
+        return Result<OrderedState>::Err(
+            ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
+                     "soft_on_path observed velocities must be finite",
+                     {{"reason", "observed_velocity_not_finite"}}});
       }
       ordered.has_velocity = true;
     }
@@ -166,40 +155,36 @@ Result<OrderedState> order_state_for_trajectory(
   }
 
   if (state.positions_rad.size() != state.joint_names.size()) {
-    return Result<OrderedState>::Err(ErrorDTO{
-        std::string(to_string(ErrorCode::kInvalidRequest)),
-        "soft_on_path observed state joint/position sizes differ",
-        {{"reason", "observed_state_size_mismatch"},
-         {"state_joint_count", std::to_string(state.joint_names.size())},
-         {"position_count", std::to_string(state.positions_rad.size())}}});
+    return Result<OrderedState>::Err(
+        ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
+                 "soft_on_path observed state joint/position sizes differ",
+                 {{"reason", "observed_state_size_mismatch"},
+                  {"state_joint_count", std::to_string(state.joint_names.size())},
+                  {"position_count", std::to_string(state.positions_rad.size())}}});
   }
-  const bool state_has_velocity =
-      state.velocities_rad_s.size() == state.joint_names.size();
+  const bool state_has_velocity = state.velocities_rad_s.size() == state.joint_names.size();
   for (size_t i = 0; i < joint_names.size(); ++i) {
     const auto idx = find_joint(state.joint_names, joint_names[i]);
     if (!idx.has_value()) {
-      return Result<OrderedState>::Err(ErrorDTO{
-          std::string(to_string(ErrorCode::kInvalidRequest)),
-          "soft_on_path observed state is missing a trajectory joint",
-          {{"reason", "observed_state_missing_joint"},
-           {"joint", joint_names[i]}}});
+      return Result<OrderedState>::Err(
+          ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
+                   "soft_on_path observed state is missing a trajectory joint",
+                   {{"reason", "observed_state_missing_joint"}, {"joint", joint_names[i]}}});
     }
     ordered.positions[i] = state.positions_rad[*idx];
     if (!std::isfinite(ordered.positions[i])) {
-      return Result<OrderedState>::Err(ErrorDTO{
-          std::string(to_string(ErrorCode::kInvalidRequest)),
-          "soft_on_path observed positions must be finite",
-          {{"reason", "observed_position_not_finite"},
-           {"joint", joint_names[i]}}});
+      return Result<OrderedState>::Err(
+          ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
+                   "soft_on_path observed positions must be finite",
+                   {{"reason", "observed_position_not_finite"}, {"joint", joint_names[i]}}});
     }
     if (state_has_velocity) {
       ordered.velocities[i] = state.velocities_rad_s[*idx];
       if (!std::isfinite(ordered.velocities[i])) {
-        return Result<OrderedState>::Err(ErrorDTO{
-            std::string(to_string(ErrorCode::kInvalidRequest)),
-            "soft_on_path observed velocities must be finite",
-            {{"reason", "observed_velocity_not_finite"},
-             {"joint", joint_names[i]}}});
+        return Result<OrderedState>::Err(
+            ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
+                     "soft_on_path observed velocities must be finite",
+                     {{"reason", "observed_velocity_not_finite"}, {"joint", joint_names[i]}}});
       }
     }
   }
@@ -209,62 +194,57 @@ Result<OrderedState> order_state_for_trajectory(
 
 Result<void> validate_trajectory_shape(const TrajectoryDTO& trajectory) {
   if (trajectory.joint_names.empty()) {
-    return Result<void>::Err(ErrorDTO{
-        std::string(to_string(ErrorCode::kInvalidRequest)),
-        "soft_on_path requires trajectory joint names",
-        {{"reason", "trajectory_joint_names_empty"}}});
+    return Result<void>::Err(ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
+                                      "soft_on_path requires trajectory joint names",
+                                      {{"reason", "trajectory_joint_names_empty"}}});
   }
   if (trajectory.waypoints.size() < 2) {
-    return Result<void>::Err(ErrorDTO{
-        std::string(to_string(ErrorCode::kInvalidRequest)),
-        "soft_on_path requires at least two trajectory waypoints",
-        {{"reason", "trajectory_too_short"}}});
+    return Result<void>::Err(ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
+                                      "soft_on_path requires at least two trajectory waypoints",
+                                      {{"reason", "trajectory_too_short"}}});
   }
   double previous_time = -std::numeric_limits<double>::infinity();
   for (size_t i = 0; i < trajectory.waypoints.size(); ++i) {
     const auto& wp = trajectory.waypoints[i];
-    if (!std::isfinite(wp.time_from_start_s) ||
-        wp.time_from_start_s <= previous_time) {
-      return Result<void>::Err(ErrorDTO{
-          std::string(to_string(ErrorCode::kInvalidRequest)),
-          "soft_on_path trajectory waypoint times must be finite and increasing",
-          {{"reason", "trajectory_time_not_strictly_increasing"},
-           {"waypoint_index", std::to_string(i)}}});
+    if (!std::isfinite(wp.time_from_start_s) || wp.time_from_start_s <= previous_time) {
+      return Result<void>::Err(
+          ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
+                   "soft_on_path trajectory waypoint times must be finite and increasing",
+                   {{"reason", "trajectory_time_not_strictly_increasing"},
+                    {"waypoint_index", std::to_string(i)}}});
     }
     if (wp.positions_rad.size() != trajectory.joint_names.size()) {
-      return Result<void>::Err(ErrorDTO{
-          std::string(to_string(ErrorCode::kInvalidRequest)),
-          "soft_on_path waypoint position size does not match joint names",
-          {{"reason", "trajectory_position_size_mismatch"},
-           {"waypoint_index", std::to_string(i)}}});
+      return Result<void>::Err(
+          ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
+                   "soft_on_path waypoint position size does not match joint names",
+                   {{"reason", "trajectory_position_size_mismatch"},
+                    {"waypoint_index", std::to_string(i)}}});
     }
     if (!wp.velocities_rad_s.empty() &&
         wp.velocities_rad_s.size() != trajectory.joint_names.size()) {
-      return Result<void>::Err(ErrorDTO{
-          std::string(to_string(ErrorCode::kInvalidRequest)),
-          "soft_on_path waypoint velocity size does not match joint names",
-          {{"reason", "trajectory_velocity_size_mismatch"},
-           {"waypoint_index", std::to_string(i)}}});
+      return Result<void>::Err(
+          ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
+                   "soft_on_path waypoint velocity size does not match joint names",
+                   {{"reason", "trajectory_velocity_size_mismatch"},
+                    {"waypoint_index", std::to_string(i)}}});
     }
     if (!wp.accelerations_rad_s2.empty() &&
         wp.accelerations_rad_s2.size() != trajectory.joint_names.size()) {
-      return Result<void>::Err(ErrorDTO{
-          std::string(to_string(ErrorCode::kInvalidRequest)),
-          "soft_on_path waypoint acceleration size does not match joint names",
-          {{"reason", "trajectory_acceleration_size_mismatch"},
-           {"waypoint_index", std::to_string(i)}}});
+      return Result<void>::Err(
+          ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
+                   "soft_on_path waypoint acceleration size does not match joint names",
+                   {{"reason", "trajectory_acceleration_size_mismatch"},
+                    {"waypoint_index", std::to_string(i)}}});
     }
     // Non-finite values defeat every downstream limit check (NaN compares
     // false against any threshold), so a poisoned trajectory would pass the
     // accel/jerk gates and could reach dispatch. Reject it here instead.
-    if (!all_finite(wp.positions_rad) ||
-        !all_finite(wp.velocities_rad_s) ||
+    if (!all_finite(wp.positions_rad) || !all_finite(wp.velocities_rad_s) ||
         !all_finite(wp.accelerations_rad_s2)) {
       return Result<void>::Err(ErrorDTO{
           std::string(to_string(ErrorCode::kInvalidRequest)),
           "soft_on_path waypoint values must be finite",
-          {{"reason", "trajectory_value_not_finite"},
-           {"waypoint_index", std::to_string(i)}}});
+          {{"reason", "trajectory_value_not_finite"}, {"waypoint_index", std::to_string(i)}}});
     }
     previous_time = wp.time_from_start_s;
   }
@@ -275,7 +255,120 @@ struct PathSample {
   std::vector<double> position;
   std::vector<double> d_position_dt;
   std::vector<double> d2_position_dt2;
+  std::vector<double> d3_position_dt3;
 };
+
+void path_waypoint(const PathSample& path, double time, double rate, double acceleration,
+                   TrajectoryWaypointDTO& out) {
+  out.time_from_start_s = time;
+  out.positions_rad = path.position;
+  out.velocities_rad_s.resize(path.position.size());
+  out.accelerations_rad_s2.resize(path.position.size());
+  for (size_t j = 0; j < path.position.size(); ++j) {
+    out.velocities_rad_s[j] = path.d_position_dt[j] * rate;
+    out.accelerations_rad_s2[j] =
+        path.d2_position_dt2[j] * rate * rate + path.d_position_dt[j] * acceleration;
+  }
+}
+
+// One-sided jerk of the shared Hermite interpolation, expressed in normalized
+// segment time r. Its quadratic extrema also give a cheap continuous check of
+// the emitted quintic, independent of the planner's integration/sample period.
+struct SegmentJerk {
+  double c0 = 0.0;
+  double c1 = 0.0;
+  double c2 = 0.0;
+  double at(double r) const { return c0 + r * (c1 + r * c2); }
+};
+
+SegmentJerk segment_jerk(const TrajectoryWaypointDTO& left, const TrajectoryWaypointDTO& right,
+                         size_t joint, unsigned degree) {
+  const double span = right.time_from_start_s - left.time_from_start_s;
+  const double delta = right.positions_rad[joint] - left.positions_rad[joint];
+  const double v0 = span * left.velocities_rad_s[joint];
+  const double v1 = span * right.velocities_rad_s[joint];
+  const double span3 = span * span * span;
+  if (degree == 3) return {(-12.0 * delta + 6.0 * (v0 + v1)) / span3, 0.0, 0.0};
+  const double a0 = span * span * left.accelerations_rad_s2[joint];
+  const double a1 = span * span * right.accelerations_rad_s2[joint];
+  return {(60.0 * delta - 36.0 * v0 - 24.0 * v1 - 9.0 * a0 + 3.0 * a1) / span3,
+          (-360.0 * delta + 192.0 * v0 + 168.0 * v1 + 36.0 * a0 - 24.0 * a1) / span3,
+          (360.0 * delta - 180.0 * v0 - 180.0 * v1 - 30.0 * a0 + 30.0 * a1) / span3};
+}
+
+struct SegmentLimitFailure {
+  const char* reason;
+  size_t joint;
+  double peak;
+  double limit;
+
+  bool is_jerk() const { return std::string_view(reason) == "interpolated_jerk_limit_exceeded"; }
+  bool is_acceleration() const {
+    return std::string_view(reason) == "interpolated_acceleration_limit_exceeded";
+  }
+};
+
+std::optional<SegmentLimitFailure> segment_limit_failure(const TrajectoryWaypointDTO& left,
+                                                         const TrajectoryWaypointDTO& right,
+                                                         const std::vector<double>& max_accel,
+                                                         const std::vector<double>& max_jerk) {
+  const double span = right.time_from_start_s - left.time_from_start_s;
+  constexpr double tolerance = 1e-6;
+  const auto complete = [&](const auto& point) {
+    return point.positions_rad.size() == max_accel.size() &&
+           point.velocities_rad_s.size() == max_accel.size() &&
+           point.accelerations_rad_s2.size() == max_accel.size();
+  };
+  if (!finite_positive(span) || !complete(left) || !complete(right) ||
+      (!max_jerk.empty() && max_jerk.size() != max_accel.size()))
+    return SegmentLimitFailure{"emitted_trajectory_sample_invalid", 0, 0.0, 0.0};
+  for (size_t j = 0; j < max_accel.size(); ++j) {
+    const auto jerk = segment_jerk(left, right, j, 5);
+    if (!std::isfinite(jerk.c0) || !std::isfinite(jerk.c1) || !std::isfinite(jerk.c2))
+      return SegmentLimitFailure{"emitted_trajectory_sample_invalid", j, 0.0, 0.0};
+    // An absent table is genuine jerk-off, not an invented large ceiling.
+    if (!max_jerk.empty()) {
+      double peak_jerk = std::max(std::abs(jerk.at(0.0)), std::abs(jerk.at(1.0)));
+      if (jerk.c2 != 0.0) {
+        const double r = -0.5 * jerk.c1 / jerk.c2;
+        if (r > 0.0 && r < 1.0) peak_jerk = std::max(peak_jerk, std::abs(jerk.at(r)));
+      }
+      if (!std::isfinite(peak_jerk) || peak_jerk > max_jerk[j] + tolerance)
+        return SegmentLimitFailure{"interpolated_jerk_limit_exceeded", j, peak_jerk, max_jerk[j]};
+    }
+
+    double peak_accel =
+        std::max(std::abs(left.accelerations_rad_s2[j]), std::abs(right.accelerations_rad_s2[j]));
+    const auto check_accel = [&](double r) {
+      if (r > 0.0 && r < 1.0) {
+        const double a = left.accelerations_rad_s2[j] +
+                         span * r * (jerk.c0 + r * (jerk.c1 / 2.0 + r * jerk.c2 / 3.0));
+        peak_accel = std::isfinite(a) ? std::max(peak_accel, std::abs(a))
+                                      : std::numeric_limits<double>::infinity();
+      }
+    };
+    // Acceleration extrema are the real roots of jerk. Normalize before the
+    // discriminant and use the stable quadratic form to avoid cancellation.
+    const double scale = std::max({std::abs(jerk.c0), std::abs(jerk.c1), std::abs(jerk.c2)});
+    if (scale > 0.0) {
+      const double a = jerk.c2 / scale, b = jerk.c1 / scale, c = jerk.c0 / scale;
+      if (a == 0.0) {
+        if (b != 0.0) check_accel(-c / b);
+      } else {
+        const double disc = b * b - 4.0 * a * c;
+        if (disc >= 0.0) {
+          const double q = -0.5 * (b + std::copysign(std::sqrt(disc), b));
+          check_accel(q / a);
+          if (q != 0.0) check_accel(c / q);
+        }
+      }
+    }
+    if (!std::isfinite(peak_accel) || peak_accel > max_accel[j] + tolerance)
+      return SegmentLimitFailure{"interpolated_acceleration_limit_exceeded", j, peak_accel,
+                                 max_accel[j]};
+  }
+  return std::nullopt;
+}
 
 PathSample sample_path(const TrajectoryDTO& trajectory, double time_s) {
   // Transitional shim: forward to the shared trajectory sampler and
@@ -329,8 +422,7 @@ struct Projection {
   double distance_rad = 0.0;
 };
 
-Projection project_to_path(const TrajectoryDTO& trajectory,
-                           const std::vector<double>& q) {
+Projection project_to_path(const TrajectoryDTO& trajectory, const std::vector<double>& q) {
   // Index-based scalar accumulation: same math and accumulation order as
   // the vector-temporary formulation, with zero heap traffic per segment.
   Projection best;
@@ -339,8 +431,7 @@ Projection project_to_path(const TrajectoryDTO& trajectory,
   for (size_t i = 1; i < trajectory.waypoints.size(); ++i) {
     const auto& prev = trajectory.waypoints[i - 1];
     const auto& next = trajectory.waypoints[i];
-    const size_t joint_count =
-        std::min({n, prev.positions_rad.size(), next.positions_rad.size()});
+    const size_t joint_count = std::min({n, prev.positions_rad.size(), next.positions_rad.size()});
     double denom = 0.0;
     double along = 0.0;
     for (size_t j = 0; j < joint_count; ++j) {
@@ -348,8 +439,7 @@ Projection project_to_path(const TrajectoryDTO& trajectory,
       denom += seg * seg;
       along += (q[j] - prev.positions_rad[j]) * seg;
     }
-    const double alpha =
-        denom <= kEpsilon ? 0.0 : std::clamp(along / denom, 0.0, 1.0);
+    const double alpha = denom <= kEpsilon ? 0.0 : std::clamp(along / denom, 0.0, 1.0);
     double dist2 = 0.0;
     for (size_t j = 0; j < joint_count; ++j) {
       const double seg = next.positions_rad[j] - prev.positions_rad[j];
@@ -360,8 +450,7 @@ Projection project_to_path(const TrajectoryDTO& trajectory,
     if (distance < best.distance_rad) {
       best.distance_rad = distance;
       best.time_from_start_s =
-          prev.time_from_start_s +
-          alpha * (next.time_from_start_s - prev.time_from_start_s);
+          prev.time_from_start_s + alpha * (next.time_from_start_s - prev.time_from_start_s);
     }
   }
   return best;
@@ -389,10 +478,10 @@ class PathCursor {
     out.position.assign(joint_count_, 0.0);
     out.d_position_dt.assign(joint_count_, 0.0);
     out.d2_position_dt2.assign(joint_count_, 0.0);
+    out.d3_position_dt3.assign(joint_count_, 0.0);
     bool sampled = false;
     if (prevalidated_) {
-      sampled =
-          sample_trajectory_prevalidated(*trajectory_, time_s, scratch_).ok();
+      sampled = sample_trajectory_prevalidated(*trajectory_, time_s, scratch_).ok();
     } else {
       auto result = sample_trajectory(*trajectory_, time_s);
       if (result.ok()) {
@@ -409,6 +498,18 @@ class PathCursor {
       }
       if (scratch_.accelerations_rad_s2.size() == joint_count_) {
         out.d2_position_dt2 = scratch_.accelerations_rad_s2;
+      }
+      // Differentiate the same one-sided Hermite segment as the shared
+      // sampler. Differencing acceleration across neighboring segments would
+      // smear a knot and give the retimer the wrong instantaneous jerk budget.
+      if (scratch_.segment_index && scratch_.degree >= 3) {
+        const auto& left = trajectory_->waypoints[*scratch_.segment_index];
+        const auto& right = trajectory_->waypoints[*scratch_.segment_index + 1];
+        const double span = right.time_from_start_s - left.time_from_start_s;
+        const double r = (time_s - left.time_from_start_s) / span;
+        for (size_t j = 0; j < joint_count_; ++j) {
+          out.d3_position_dt3[j] = segment_jerk(left, right, j, scratch_.degree).at(r);
+        }
       }
     }
     memo_ = out;
@@ -433,10 +534,7 @@ class PathCursor {
 };
 
 double default_jerk_limit(double accel_limit, double effective_ramp_s) {
-  const double jerk_ramp_s =
-      std::min(std::max(0.15 * effective_ramp_s, 0.02),
-               effective_ramp_s / 3.0);
-  return accel_limit / std::max(jerk_ramp_s, kEpsilon);
+  return motion_jerk_preset_limit(accel_limit, effective_ramp_s);
 }
 
 bool planner_reason_allows_spring_back_fallback(const std::string& reason) {
@@ -492,6 +590,60 @@ double ramp_acceleration_factor(double r) {
   return -30.0 * r2 + 60.0 * r2 * r - 30.0 * r2 * r2;
 }
 
+// Hermite basis for nonzero incoming scale rate. g(0)=g(1)=0,
+// g'(0)=1, g'(1)=0 and g''(0)=g''(1)=0. Adding r0*T*g to the
+// velocity ramp preserves the incoming acceleration and ends at rest.
+double rate_position_factor(double r) {
+  const double r2 = r * r;
+  const double r4 = r2 * r2;
+  return 0.5 * r2 - 1.5 * r4 + 1.6 * r4 * r - 0.5 * r4 * r2;
+}
+double rate_velocity_factor(double r) {
+  const double r3 = r * r * r;
+  return r - 6.0 * r3 + 8.0 * r3 * r - 3.0 * r3 * r * r;
+}
+double rate_acceleration_factor(double r) {
+  const double r2 = r * r;
+  return 1.0 - 18.0 * r2 + 32.0 * r2 * r - 15.0 * r2 * r2;
+}
+
+bool ramp_rate_within_unit_range(double rate, double rate_accel, double duration) {
+  const double scaled_accel = rate_accel * duration;
+  const auto valid = [&](double r) {
+    const double value = rate * ramp_velocity_factor(r) + scaled_accel * rate_velocity_factor(r);
+    return std::isfinite(value) && value >= -1e-12 && value <= 1.0 + 1e-12;
+  };
+  if (!valid(0.0) || !valid(1.0)) return false;
+  // d(rate)/dr = (1-r)^2 * (a*r^2 + b*r + c). Check its exact
+  // interior extrema, not only the emitted sample grid.
+  const double a = -30.0 * rate - 15.0 * scaled_accel;
+  const double b = 2.0 * scaled_accel;
+  const double c = scaled_accel;
+  const auto root_valid = [&](double r) {
+    return !std::isfinite(r) ? false : (r <= 0.0 || r >= 1.0 || valid(r));
+  };
+  if (a == 0.0) return b == 0.0 || root_valid(-c / b);
+  const double discriminant = b * b - 4.0 * a * c;
+  if (!std::isfinite(discriminant)) return false;
+  if (discriminant < 0.0) return true;
+  const double q = -0.5 * (b + std::copysign(std::sqrt(discriminant), b));
+  if (q == 0.0) return root_valid(-b / (2.0 * a));
+  return root_valid(q / a) && root_valid(c / q);
+}
+
+bool constant_jerk_rate_within_unit_range(double rate, double accel, double jerk, double duration) {
+  const auto valid = [&](double time) {
+    const double value = rate + time * (accel + 0.5 * jerk * time);
+    return std::isfinite(value) && value >= -1e-12 && value <= 1.0 + 1e-12;
+  };
+  if (!std::isfinite(duration) || duration < 0.0 || !std::isfinite(accel) || !std::isfinite(jerk) ||
+      !valid(0.0) || !valid(duration))
+    return false;
+  if (jerk == 0.0) return true;
+  const double extremum = -accel / jerk;
+  return extremum <= 0.0 || extremum >= duration || valid(extremum);
+}
+
 struct AliStopProfileDTO {
   std::vector<JerkLimitedStopSampleDTO> samples;
   double achieved_stop_time_s = 0.0;
@@ -509,10 +661,9 @@ struct AliStopProfileDTO {
   TrajectoryDTO emitted;
 };
 
-TrajectoryDTO build_path_rate_trajectory(
-    PathCursor& cursor,
-    const std::vector<std::string>& joint_names,
-    const std::vector<JerkLimitedStopSampleDTO>& samples) {
+TrajectoryDTO build_path_rate_trajectory(PathCursor& cursor,
+                                         const std::vector<std::string>& joint_names,
+                                         const std::vector<JerkLimitedStopSampleDTO>& samples) {
   TrajectoryDTO trajectory;
   trajectory.joint_names = joint_names;
   const size_t joint_count = joint_names.size();
@@ -526,11 +677,9 @@ TrajectoryDTO build_path_rate_trajectory(
     wp.velocities_rad_s.resize(joint_count, 0.0);
     wp.accelerations_rad_s2.resize(joint_count, 0.0);
     for (size_t j = 0; j < joint_count; ++j) {
-      wp.velocities_rad_s[j] =
-          path_sample.d_position_dt[j] * sample.path_rate;
+      wp.velocities_rad_s[j] = path_sample.d_position_dt[j] * sample.path_rate;
       wp.accelerations_rad_s2[j] =
-          path_sample.d2_position_dt2[j] * sample.path_rate *
-              sample.path_rate +
+          path_sample.d2_position_dt2[j] * sample.path_rate * sample.path_rate +
           path_sample.d_position_dt[j] * sample.path_rate_accel;
     }
     trajectory.waypoints.push_back(std::move(wp));
@@ -539,21 +688,13 @@ TrajectoryDTO build_path_rate_trajectory(
 }
 
 void validate_path_rate_stop_profile(
-    const TrajectoryDTO& accepted_trajectory,
-    PathCursor& path_cursor,
+    const TrajectoryDTO& accepted_trajectory, PathCursor& path_cursor,
     const std::map<std::string, double>& per_joint_max_deceleration_rad_s2,
-    const std::map<std::string, double>& per_joint_max_jerk_rad_s3,
-    double start_path_time_s,
-    double start_path_rate,
-    double start_path_rate_accel,
-    double target_stop_time_s,
-    double sample_period_s,
-    AliStopProfileDTO& profile) {
+    const std::map<std::string, double>& per_joint_max_jerk_rad_s3, double start_path_time_s,
+    double start_path_rate, double start_path_rate_accel, double target_stop_time_s,
+    double sample_period_s, AliStopProfileDTO& profile) {
   constexpr double kTerminalTolerance = 1e-3;
-  constexpr double kAccelTolerance = 1e-6;
-  constexpr double kJerkTolerance = 1e-6;
-  const double target_time_tolerance_s =
-      std::max(2.0 * sample_period_s, 1e-3);
+  const double target_time_tolerance_s = std::max(2.0 * sample_period_s, 1e-3);
   const size_t joint_count = accepted_trajectory.joint_names.size();
   auto mark_invalid = [&](const std::string& reason) {
     if (profile.validation_failure_reason.empty()) {
@@ -563,11 +704,9 @@ void validate_path_rate_stop_profile(
   };
 
   profile.hits_target_time =
-      std::abs(profile.achieved_stop_time_s - target_stop_time_s) <=
-      target_time_tolerance_s;
+      std::abs(profile.achieved_stop_time_s - target_stop_time_s) <= target_time_tolerance_s;
   profile.terminal_state_zero = false;
-  profile.within_budget =
-      profile.reaches_rest_on_path && profile.samples.size() >= 2;
+  profile.within_budget = profile.reaches_rest_on_path && profile.samples.size() >= 2;
   if (profile.samples.empty()) {
     profile.dispatchable = false;
     return;
@@ -583,27 +722,32 @@ void validate_path_rate_stop_profile(
   for (size_t i = 1; i < profile.samples.size(); ++i) {
     const auto& prev = profile.samples[i - 1];
     const auto& curr = profile.samples[i];
-    if (!std::isfinite(curr.time_from_ramp_start_s) ||
-        !std::isfinite(curr.path_time_s) ||
-        !std::isfinite(curr.path_rate) ||
-        !std::isfinite(curr.path_rate_accel) ||
-        curr.time_from_ramp_start_s <=
-            prev.time_from_ramp_start_s + kEpsilon ||
+    if (!std::isfinite(curr.time_from_ramp_start_s) || !std::isfinite(curr.path_time_s) ||
+        !std::isfinite(curr.path_rate) || !std::isfinite(curr.path_rate_accel) ||
+        curr.time_from_ramp_start_s <= prev.time_from_ramp_start_s + kEpsilon ||
         curr.path_time_s + 1e-8 < prev.path_time_s) {
       mark_invalid("sample_time_or_value_invalid");
+    }
+    if (accepted_trajectory.runtime_scale_bounds) {
+      const double dt = curr.time_from_ramp_start_s - prev.time_from_ramp_start_s;
+      if (curr.path_rate < -1e-12 || curr.path_rate > 1.0 + 1e-12 ||
+          !constant_jerk_rate_within_unit_range(prev.path_rate, prev.path_rate_accel,
+                                                (curr.path_rate_accel - prev.path_rate_accel) / dt,
+                                                dt)) {
+        mark_invalid("path_rate_limit_exceeded");
+      }
     }
   }
 
   const auto& terminal = profile.samples.back();
-  profile.terminal_state_zero =
-      std::abs(terminal.path_rate) <= kTerminalTolerance &&
-      std::abs(terminal.path_rate_accel) <= kTerminalTolerance;
+  profile.terminal_state_zero = std::abs(terminal.path_rate) <= kTerminalTolerance &&
+                                std::abs(terminal.path_rate_accel) <= kTerminalTolerance;
   if (!profile.terminal_state_zero) {
     mark_invalid("terminal_state_not_zero");
   }
 
-  profile.emitted = build_path_rate_trajectory(
-      path_cursor, accepted_trajectory.joint_names, profile.samples);
+  profile.emitted =
+      build_path_rate_trajectory(path_cursor, accepted_trajectory.joint_names, profile.samples);
   const auto shape = validate_trajectory_shape(profile.emitted);
   if (!shape.ok()) {
     mark_invalid("emitted_trajectory_shape_invalid");
@@ -611,105 +755,54 @@ void validate_path_rate_stop_profile(
     return;
   }
 
-  // Per-joint limits hoisted into index-aligned vectors: the oversample
-  // loop below reads them per joint per step.
+  // The same continuous per-segment check applies to every Stop candidate;
+  // a sampling floor or averaged acceleration difference cannot prove jerk.
   std::vector<double> accel_limits(joint_count, 0.0);
   std::vector<double> jerk_limits_by_index(joint_count, 0.0);
   for (size_t j = 0; j < joint_count; ++j) {
-    accel_limits[j] =
-        per_joint_max_deceleration_rad_s2.at(accepted_trajectory.joint_names[j]);
-    jerk_limits_by_index[j] =
-        per_joint_max_jerk_rad_s3.at(accepted_trajectory.joint_names[j]);
+    accel_limits[j] = per_joint_max_deceleration_rad_s2.at(accepted_trajectory.joint_names[j]);
+    jerk_limits_by_index[j] = per_joint_max_jerk_rad_s3.at(accepted_trajectory.joint_names[j]);
   }
 
-  const double validate_dt =
-      std::max(sample_period_s / 4.0, target_stop_time_s / 2000.0);
-  const size_t steps = std::max<size_t>(
-      1, static_cast<size_t>(std::ceil(profile.achieved_stop_time_s /
-                                       std::max(validate_dt, kEpsilon))));
-  // Shape validation above implies the sampler's structural validation, so
-  // the oversample loop uses the prevalidated entry with a reused buffer.
-  TrajectorySampleResult sampled;
-  std::vector<double> prev_accel;
-  double prev_t = 0.0;
-  for (size_t i = 0; i <= steps; ++i) {
-    const double t_sample =
-        profile.achieved_stop_time_s * static_cast<double>(i) /
-        static_cast<double>(steps);
-    const bool sample_ok =
-        sample_trajectory_prevalidated(profile.emitted, t_sample, sampled).ok();
-    if (!sample_ok ||
-        sampled.accelerations_rad_s2.size() != joint_count) {
-      mark_invalid("emitted_trajectory_sample_invalid");
-      continue;
-    }
-    const auto& accel = sampled.accelerations_rad_s2;
-    for (size_t j = 0; j < joint_count; ++j) {
-      if (!std::isfinite(accel[j]) ||
-          std::abs(accel[j]) > accel_limits[j] + kAccelTolerance) {
-        mark_invalid("interpolated_acceleration_limit_exceeded");
-      }
-    }
-    if (!prev_accel.empty()) {
-      const double dt_check = t_sample - prev_t;
-      if (dt_check > kEpsilon) {
-        for (size_t j = 0; j < joint_count; ++j) {
-          const double jerk = (accel[j] - prev_accel[j]) / dt_check;
-          if (!std::isfinite(jerk) ||
-              std::abs(jerk) > jerk_limits_by_index[j] + kJerkTolerance) {
-            mark_invalid("interpolated_jerk_limit_exceeded");
-          }
-        }
-      }
-    }
-    prev_accel = accel;
-    prev_t = t_sample;
-  }
+  const auto& points = profile.emitted.waypoints;
+  for (size_t i = 1; i < points.size(); ++i)
+    if (const auto failure =
+            segment_limit_failure(points[i - 1], points[i], accel_limits, jerk_limits_by_index))
+      mark_invalid(failure->reason);
 
-  profile.dispatchable = profile.reaches_rest_on_path &&
-                         profile.hits_target_time &&
-                         profile.terminal_state_zero &&
-                         profile.within_budget;
+  profile.dispatchable = profile.reaches_rest_on_path && profile.hits_target_time &&
+                         profile.terminal_state_zero && profile.within_budget;
 }
 
 Result<AliStopProfileDTO> compute_ali_backtracking_stop_profile(
-    const TrajectoryDTO& accepted_trajectory,
-    double start_path_time_s,
-    double start_path_rate,
-    double start_path_rate_accel,
-    double target_stop_time_s,
+    const TrajectoryDTO& accepted_trajectory, double start_path_time_s, double start_path_rate,
+    double start_path_rate_accel, double target_stop_time_s,
     const std::map<std::string, double>& per_joint_max_deceleration_rad_s2,
-    const std::map<std::string, double>& per_joint_max_jerk_rad_s3,
-    double sample_period_s) {
+    const std::map<std::string, double>& per_joint_max_jerk_rad_s3, double sample_period_s) {
   const auto valid_shape = validate_trajectory_shape(accepted_trajectory);
   if (!valid_shape.ok()) {
     return Result<AliStopProfileDTO>::Err(valid_shape.error());
   }
   auto invalid = [](std::string reason, std::string message) {
-    return Result<AliStopProfileDTO>::Err(ErrorDTO{
-        std::string(to_string(ErrorCode::kInvalidRequest)), std::move(message),
-        {{"reason", std::move(reason)}}});
+    return Result<AliStopProfileDTO>::Err(
+        ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
+                 std::move(message),
+                 {{"reason", std::move(reason)}}});
   };
   if (!std::isfinite(start_path_rate) || start_path_rate <= 0.0) {
-    return invalid("invalid_start_path_rate",
-                   "ALI retimer requires a positive start_path_rate");
+    return invalid("invalid_start_path_rate", "ALI retimer requires a positive start_path_rate");
   }
   if (!std::isfinite(start_path_rate_accel)) {
-    return invalid("invalid_start_path_rate_accel",
-                   "start_path_rate_accel must be finite");
+    return invalid("invalid_start_path_rate_accel", "start_path_rate_accel must be finite");
   }
-  if (!finite_positive(target_stop_time_s) ||
-      !finite_positive(sample_period_s)) {
+  if (!finite_positive(target_stop_time_s) || !finite_positive(sample_period_s)) {
     return invalid("invalid_ali_timing",
                    "ALI retimer requires positive target_stop_time_s and "
                    "sample_period_s");
   }
-  const double path_start_s =
-      accepted_trajectory.waypoints.front().time_from_start_s;
-  const double path_end_s =
-      accepted_trajectory.waypoints.back().time_from_start_s;
-  if (!std::isfinite(start_path_time_s) ||
-      start_path_time_s < path_start_s - kEpsilon ||
+  const double path_start_s = accepted_trajectory.waypoints.front().time_from_start_s;
+  const double path_end_s = accepted_trajectory.waypoints.back().time_from_start_s;
+  if (!std::isfinite(start_path_time_s) || start_path_time_s < path_start_s - kEpsilon ||
       start_path_time_s > path_end_s + kEpsilon) {
     return invalid("invalid_start_path_time",
                    "start_path_time_s must be finite and inside the accepted "
@@ -718,14 +811,10 @@ Result<AliStopProfileDTO> compute_ali_backtracking_stop_profile(
   for (const auto& joint_name : accepted_trajectory.joint_names) {
     const auto d_it = per_joint_max_deceleration_rad_s2.find(joint_name);
     const auto j_it = per_joint_max_jerk_rad_s3.find(joint_name);
-    if (d_it == per_joint_max_deceleration_rad_s2.end() ||
-        !finite_positive(d_it->second) ||
-        j_it == per_joint_max_jerk_rad_s3.end() ||
-        !finite_positive(j_it->second)) {
-      return invalid(
-          "missing_per_joint_limit",
-          "per-joint deceleration and jerk limits are required for " +
-              joint_name);
+    if (d_it == per_joint_max_deceleration_rad_s2.end() || !finite_positive(d_it->second) ||
+        j_it == per_joint_max_jerk_rad_s3.end() || !finite_positive(j_it->second)) {
+      return invalid("missing_per_joint_limit",
+                     "per-joint deceleration and jerk limits are required for " + joint_name);
     }
   }
 
@@ -738,8 +827,7 @@ Result<AliStopProfileDTO> compute_ali_backtracking_stop_profile(
   };
 
   if (std::abs(start_path_rate_accel) > 1e-6) {
-    return Result<AliStopProfileDTO>::Ok(
-        failure_profile("ali_nonzero_start_accel_unsupported"));
+    return Result<AliStopProfileDTO>::Ok(failure_profile("ali_nonzero_start_accel_unsupported"));
   }
 
   PathCursor path_cursor(accepted_trajectory);
@@ -749,101 +837,81 @@ Result<AliStopProfileDTO> compute_ali_backtracking_stop_profile(
   // a future bottleneck, then hold until the requested stop horizon, but only
   // if the emitted derivative-complete trajectory passes the same oversampled
   // accel/jerk validation used by the other candidates.
-  auto build_triangular_scurve_candidate =
-      [&](double brake_time_s, size_t backtracking_iterations) {
-        AliStopProfileDTO profile;
-        profile.achieved_stop_time_s = target_stop_time_s;
-        profile.motion_stop_time_s = brake_time_s;
-        profile.backtracking_iterations = backtracking_iterations;
-        profile.samples.reserve(
-            static_cast<size_t>(std::ceil(target_stop_time_s /
-                                          sample_period_s)) +
-            2);
+  auto build_triangular_scurve_candidate = [&](double brake_time_s,
+                                               size_t backtracking_iterations) {
+    AliStopProfileDTO profile;
+    profile.achieved_stop_time_s = target_stop_time_s;
+    profile.motion_stop_time_s = brake_time_s;
+    profile.backtracking_iterations = backtracking_iterations;
+    profile.samples.reserve(static_cast<size_t>(std::ceil(target_stop_time_s / sample_period_s)) +
+                            2);
 
-        const double path_jerk =
-            4.0 * start_path_rate / (brake_time_s * brake_time_s);
-        const double peak_path_accel = 0.5 * path_jerk * brake_time_s;
-        const double half_t = 0.5 * brake_time_s;
-        const double v_mid = 0.5 * start_path_rate;
-        const double s_mid =
-            start_path_rate * half_t -
-            (path_jerk * half_t * half_t * half_t) / 6.0;
-        const double stop_distance = 0.5 * start_path_rate * brake_time_s;
+    const double path_jerk = 4.0 * start_path_rate / (brake_time_s * brake_time_s);
+    const double peak_path_accel = 0.5 * path_jerk * brake_time_s;
+    const double half_t = 0.5 * brake_time_s;
+    const double v_mid = 0.5 * start_path_rate;
+    const double s_mid = start_path_rate * half_t - (path_jerk * half_t * half_t * half_t) / 6.0;
+    const double stop_distance = 0.5 * start_path_rate * brake_time_s;
 
-        const size_t brake_steps = std::max<size_t>(
-            2, static_cast<size_t>(std::ceil(brake_time_s /
-                                             sample_period_s)));
-        for (size_t i = 0; i <= brake_steps; ++i) {
-          const double t =
-              brake_time_s * static_cast<double>(i) /
-              static_cast<double>(brake_steps);
-          double v = 0.0;
-          double a = 0.0;
-          double s_rel = 0.0;
-          if (t <= half_t) {
-            a = -path_jerk * t;
-            v = start_path_rate - 0.5 * path_jerk * t * t;
-            s_rel =
-                start_path_rate * t -
-                (path_jerk * t * t * t) / 6.0;
-          } else {
-            const double tau = t - half_t;
-            a = -peak_path_accel + path_jerk * tau;
-            v = v_mid - peak_path_accel * tau +
-                0.5 * path_jerk * tau * tau;
-            s_rel = s_mid + v_mid * tau -
-                    0.5 * peak_path_accel * tau * tau +
-                    (path_jerk * tau * tau * tau) / 6.0;
-          }
-          if (i == brake_steps) {
-            v = 0.0;
-            a = 0.0;
-            s_rel = stop_distance;
-          }
-          profile.samples.push_back(
-              {t, start_path_time_s + s_rel, std::max(0.0, v), a});
-        }
+    const size_t brake_steps =
+        std::max<size_t>(2, static_cast<size_t>(std::ceil(brake_time_s / sample_period_s)));
+    for (size_t i = 0; i <= brake_steps; ++i) {
+      const double t = brake_time_s * static_cast<double>(i) / static_cast<double>(brake_steps);
+      double v = 0.0;
+      double a = 0.0;
+      double s_rel = 0.0;
+      if (t <= half_t) {
+        a = -path_jerk * t;
+        v = start_path_rate - 0.5 * path_jerk * t * t;
+        s_rel = start_path_rate * t - (path_jerk * t * t * t) / 6.0;
+      } else {
+        const double tau = t - half_t;
+        a = -peak_path_accel + path_jerk * tau;
+        v = v_mid - peak_path_accel * tau + 0.5 * path_jerk * tau * tau;
+        s_rel = s_mid + v_mid * tau - 0.5 * peak_path_accel * tau * tau +
+                (path_jerk * tau * tau * tau) / 6.0;
+      }
+      if (i == brake_steps) {
+        v = 0.0;
+        a = 0.0;
+        s_rel = stop_distance;
+      }
+      profile.samples.push_back({t, start_path_time_s + s_rel, std::max(0.0, v), a});
+    }
 
-        const double stop_path_time = start_path_time_s + stop_distance;
-        if (stop_path_time > path_end_s + kEpsilon) {
-          profile.validation_failure_reason = "ali_stop_runs_past_path_end";
-          return profile;
-        }
+    const double stop_path_time = start_path_time_s + stop_distance;
+    if (stop_path_time > path_end_s + kEpsilon) {
+      profile.validation_failure_reason = "ali_stop_runs_past_path_end";
+      return profile;
+    }
 
-        double next_hold_time =
-            profile.samples.back().time_from_ramp_start_s + sample_period_s;
-        while (next_hold_time < target_stop_time_s - kEpsilon) {
-          profile.samples.push_back({next_hold_time, stop_path_time, 0.0, 0.0});
-          next_hold_time += sample_period_s;
-        }
-        if (target_stop_time_s >
-            profile.samples.back().time_from_ramp_start_s + kEpsilon) {
-          profile.samples.push_back(
-              {target_stop_time_s, stop_path_time, 0.0, 0.0});
-        }
+    double next_hold_time = profile.samples.back().time_from_ramp_start_s + sample_period_s;
+    while (next_hold_time < target_stop_time_s - kEpsilon) {
+      profile.samples.push_back({next_hold_time, stop_path_time, 0.0, 0.0});
+      next_hold_time += sample_period_s;
+    }
+    if (target_stop_time_s > profile.samples.back().time_from_ramp_start_s + kEpsilon) {
+      profile.samples.push_back({target_stop_time_s, stop_path_time, 0.0, 0.0});
+    }
 
-        profile.reaches_rest_on_path = true;
-        validate_path_rate_stop_profile(
-            accepted_trajectory, path_cursor,
-            per_joint_max_deceleration_rad_s2,
-            per_joint_max_jerk_rad_s3, start_path_time_s, start_path_rate,
-            start_path_rate_accel, target_stop_time_s, sample_period_s,
-            profile);
-        return profile;
-      };
+    profile.reaches_rest_on_path = true;
+    validate_path_rate_stop_profile(accepted_trajectory, path_cursor,
+                                    per_joint_max_deceleration_rad_s2, per_joint_max_jerk_rad_s3,
+                                    start_path_time_s, start_path_rate, start_path_rate_accel,
+                                    target_stop_time_s, sample_period_s, profile);
+    return profile;
+  };
 
   const size_t kCandidateCount = 32;
   AliStopProfileDTO best_failure = failure_profile("ali_no_candidate");
   for (size_t i = 0; i <= kCandidateCount; ++i) {
     const double fraction =
-        1.0 - 0.9 * static_cast<double>(i) /
-                  static_cast<double>(kCandidateCount);
+        1.0 - 0.9 * static_cast<double>(i) / static_cast<double>(kCandidateCount);
     const double brake_time_s = target_stop_time_s * fraction;
     if (brake_time_s <= 2.0 * sample_period_s) {
       continue;
     }
-    auto candidate =
-        build_triangular_scurve_candidate(brake_time_s, i);
+    auto candidate = build_triangular_scurve_candidate(brake_time_s, i);
     if (candidate.dispatchable) {
       return Result<AliStopProfileDTO>::Ok(std::move(candidate));
     }
@@ -860,22 +928,96 @@ Result<AliStopProfileDTO> compute_ali_backtracking_stop_profile(
 
 }  // namespace
 
+bool natural_completion_fits_stop_window(const TrajectoryDTO& trajectory,
+                                         const MotionInterruptStopProfileDTO& profile,
+                                         const SoftOnPathInitialStateDTO& initial,
+                                         const SoftOnPathPlannerConfig& config) {
+  if (!profile.allow_natural_completion_on_short_path ||
+      (profile.stop_mode != MotionInterruptStopMode::kSoftOnPath &&
+       profile.stop_mode != MotionInterruptStopMode::kSpringBackHold) ||
+      !trajectory.runtime_scale_bounds || trajectory.waypoints.empty() ||
+      trajectory.joint_names.empty() || initial.state.joint_names != trajectory.joint_names ||
+      initial.state.positions_rad.size() != trajectory.joint_names.size() ||
+      std::any_of(initial.state.positions_rad.begin(), initial.state.positions_rad.end(),
+                  [](double x) { return !std::isfinite(x); }) ||
+      !initial.trajectory_time_from_start_s || !initial.runtime_scale_target_at_trip ||
+      initial.velocity_source != SoftOnPathStateSource::kModelDerived ||
+      !config.allow_model_velocity_fallback)
+    return false;
+  const auto& bounds = *trajectory.runtime_scale_bounds;
+  const double cursor = *initial.trajectory_time_from_start_s;
+  const double end = trajectory.waypoints.back().time_from_start_s;
+  const double window = motion_interrupt_deceleration_time_or_default(profile);
+  if (!std::isfinite(cursor) || !std::isfinite(end) || cursor < 0.0 || cursor > end ||
+      !finite_positive(window))
+    return false;
+  const auto& terminal = trajectory.waypoints.back();
+  if (terminal.velocities_rad_s.size() != trajectory.joint_names.size() ||
+      terminal.accelerations_rad_s2.size() != trajectory.joint_names.size() ||
+      std::any_of(terminal.velocities_rad_s.begin(), terminal.velocities_rad_s.end(),
+                  [](double v) { return v != 0.0; }) ||
+      std::any_of(terminal.accelerations_rad_s2.begin(), terminal.accelerations_rad_s2.end(),
+                  [](double a) { return a != 0.0; }))
+    return false;
+  try {
+    detail::RuntimeScaleGovernor continuation(
+        initial.runtime_velocity_scale_at_trip,
+        {bounds.max_rate_per_s, bounds.max_rate_change_per_s2},
+        initial.runtime_scale_rate_per_s_at_trip, *initial.runtime_scale_target_at_trip);
+    const auto advance = continuation.advance(window);
+    if (!advance || *advance <= 0.0 || *advance < end - cursor) return false;
+  } catch (const std::exception&) {
+    return false;
+  }
+  if (config.max_initial_path_deviation_rad || config.max_initial_velocity_deviation_rad_s) {
+    // The exact command cursor is already known. Checking that one sample is
+    // sufficient for eligibility; no whole-path projection or certificate is
+    // needed on this fast path. A failed check still permits the normal Stop
+    // planner to diagnose the state and select its stronger fallback.
+    TrajectorySampleResult sample;
+    if (!sample_trajectory_prevalidated(trajectory, cursor, sample).ok()) return false;
+    if (config.max_initial_path_deviation_rad) {
+      const double limit = *config.max_initial_path_deviation_rad;
+      if (!std::isfinite(limit) || limit < 0.0 ||
+          norm(subtract(initial.state.positions_rad, sample.positions_rad)) > limit)
+        return false;
+    }
+    if (config.max_initial_velocity_deviation_rad_s) {
+      const double limit = *config.max_initial_velocity_deviation_rad_s;
+      if (!std::isfinite(limit) || limit < 0.0) return false;
+      // Model-derived state with no measured velocities has no independent
+      // residual to compare (the ordinary planner uses that same rule).
+      if (initial.state.velocities_rad_s.empty()) return true;
+      if (initial.state.velocities_rad_s.size() != trajectory.joint_names.size()) return false;
+      double error2 = 0.0;
+      for (std::size_t index = 0; index < trajectory.joint_names.size(); ++index) {
+        const double error =
+            initial.state.velocities_rad_s[index] -
+            sample.velocities_rad_s[index] * initial.runtime_velocity_scale_at_trip;
+        error2 += error * error;
+      }
+      if (!std::isfinite(error2) || std::sqrt(error2) > limit) return false;
+    }
+  }
+  // This continues the already-admitted ordinary trajectory and its frozen
+  // time law. Replacement Stop limits do not retroactively apply to it; its
+  // ordinary constraints remain in force. Settlement still belongs to the
+  // existing Stop evidence owner, not this prediction.
+  return true;
+}
+
 Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
-    const TrajectoryDTO& accepted_trajectory,
-    const MotionInterruptStopProfileDTO& stop_profile,
-    const SoftOnPathInitialStateDTO& initial_state,
-    const SoftOnPathPlannerConfig& config) {
+    const TrajectoryDTO& accepted_trajectory, const MotionInterruptStopProfileDTO& stop_profile,
+    const SoftOnPathInitialStateDTO& initial_state, const SoftOnPathPlannerConfig& config) {
   if (stop_profile.stop_mode != MotionInterruptStopMode::kSoftOnPath) {
     return err("stop_mode_not_soft_on_path",
                "soft_on_path planner called for a non-soft_on_path profile");
   }
-  if (!stop_profile.deceleration_time_s ||
-      !finite_positive(*stop_profile.deceleration_time_s)) {
+  if (!stop_profile.deceleration_time_s || !finite_positive(*stop_profile.deceleration_time_s)) {
     return err("soft_on_path_deceleration_time_required",
                "soft_on_path requires a positive deceleration_time_s");
   }
-  if (!std::isfinite(config.stop_traj_delta_s) ||
-      config.stop_traj_delta_s < 0.0) {
+  if (!std::isfinite(config.stop_traj_delta_s) || config.stop_traj_delta_s < 0.0) {
     return err("invalid_stop_traj_delta_s",
                "soft_on_path stop_traj_delta_s must be finite and >= 0");
   }
@@ -887,51 +1029,42 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
   if (!valid_shape.ok()) {
     return Result<SoftOnPathStopPlanDTO>::Err(valid_shape.error());
   }
-  const auto ordered_state_result = order_state_for_trajectory(
-      initial_state.state, accepted_trajectory.joint_names);
+  const auto ordered_state_result =
+      order_state_for_trajectory(initial_state.state, accepted_trajectory.joint_names);
   if (!ordered_state_result.ok()) {
     return Result<SoftOnPathStopPlanDTO>::Err(ordered_state_result.error());
   }
   const OrderedState& ordered_state = ordered_state_result.value();
   const size_t joint_count = accepted_trajectory.joint_names.size();
-  const double path_start_s =
-      accepted_trajectory.waypoints.front().time_from_start_s;
-  const double path_end_s =
-      accepted_trajectory.waypoints.back().time_from_start_s;
+  const double path_start_s = accepted_trajectory.waypoints.front().time_from_start_s;
+  const double path_end_s = accepted_trajectory.waypoints.back().time_from_start_s;
 
-  const double effective_ramp_s =
-      *stop_profile.deceleration_time_s - config.stop_traj_delta_s;
+  const double effective_ramp_s = *stop_profile.deceleration_time_s;
   if (effective_ramp_s <= kEpsilon) {
-    return err("deceleration_time_not_larger_than_handoff",
-               "soft_on_path deceleration_time_s must exceed stop_traj_delta_s",
-               {{"deceleration_time_s",
-                 format_double(*stop_profile.deceleration_time_s)},
+    return err("deceleration_time_below_numerical_resolution",
+               "soft_on_path deceleration_time_s is below the planner's numerical resolution",
+               {{"deceleration_time_s", format_double(*stop_profile.deceleration_time_s)},
                 {"stop_traj_delta_s", format_double(config.stop_traj_delta_s)},
                 {"recommended_disposition", "hard_stop"}});
   }
 
-  const auto typed_acceleration_limits =
-      angular_deceleration_limits(stop_profile);
+  const auto typed_acceleration_limits = angular_deceleration_limits(stop_profile);
   if (!typed_acceleration_limits.has_value()) {
     return err("soft_on_path_coordinate_kind_unsupported",
                "legacy angular planner cannot consume a linear coordinate");
   }
-  const auto& per_joint_max_deceleration_rad_s2 =
-      *typed_acceleration_limits;
+  const auto& per_joint_max_deceleration_rad_s2 = *typed_acceleration_limits;
   for (const auto& joint_name : accepted_trajectory.joint_names) {
     const auto it = per_joint_max_deceleration_rad_s2.find(joint_name);
-    if (it == per_joint_max_deceleration_rad_s2.end() ||
-        !finite_positive(it->second)) {
+    if (it == per_joint_max_deceleration_rad_s2.end() || !finite_positive(it->second)) {
       return err("missing_joint_deceleration_limit",
                  "soft_on_path requires positive per-joint acceleration limits",
                  {{"joint", joint_name}});
     }
   }
 
-  const Projection projection = project_to_path(
-      accepted_trajectory, ordered_state.positions);
-  if (!std::isfinite(projection.distance_rad) ||
-      !std::isfinite(projection.time_from_start_s)) {
+  const Projection projection = project_to_path(accepted_trajectory, ordered_state.positions);
+  if (!std::isfinite(projection.distance_rad) || !std::isfinite(projection.time_from_start_s)) {
     return err("initial_path_projection_failed",
                "soft_on_path could not project observed feedback onto the "
                "accepted path; escalate to hard stop",
@@ -939,17 +1072,16 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
   }
   if (config.max_initial_path_deviation_rad.has_value() &&
       projection.distance_rad > *config.max_initial_path_deviation_rad) {
-    return err("initial_path_deviation_exceeds_limit",
-               "soft_on_path observed state is outside the configured path drift limit",
-               {{"initial_path_deviation_rad", format_double(projection.distance_rad)},
-                {"max_initial_path_deviation_rad",
-                 format_double(*config.max_initial_path_deviation_rad)},
-                {"recommended_fallback", "spring_back_hold"}});
+    return err(
+        "initial_path_deviation_exceeds_limit",
+        "soft_on_path observed state is outside the configured path drift limit",
+        {{"initial_path_deviation_rad", format_double(projection.distance_rad)},
+         {"max_initial_path_deviation_rad", format_double(*config.max_initial_path_deviation_rad)},
+         {"recommended_fallback", "spring_back_hold"}});
   }
 
   PathCursor cursor(accepted_trajectory);
-  const PathSample projected_sample =
-      cursor.sample(projection.time_from_start_s);
+  const PathSample projected_sample = cursor.sample(projection.time_from_start_s);
   const bool use_model_velocity =
       !ordered_state.has_velocity ||
       initial_state.velocity_source == SoftOnPathStateSource::kModelDerived;
@@ -1011,8 +1143,7 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
       path_time_rate = 0.0;
     } else {
       path_time_rate =
-          dot(ordered_state.velocities, projected_sample.d_position_dt) /
-          tangent_norm2;
+          dot(ordered_state.velocities, projected_sample.d_position_dt) / tangent_norm2;
       if (!std::isfinite(path_time_rate)) {
         return err("invalid_projected_velocity",
                    "soft_on_path could not project observed velocity onto the path");
@@ -1028,15 +1159,21 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
           ? norm(subtract(ordered_state.velocities, projected_velocity))
           : 0.0;
   if (config.max_initial_velocity_deviation_rad_s.has_value() &&
-      initial_velocity_deviation >
-          *config.max_initial_velocity_deviation_rad_s) {
+      initial_velocity_deviation > *config.max_initial_velocity_deviation_rad_s) {
     return err("initial_velocity_deviation_exceeds_limit",
                "soft_on_path observed velocity is not coherent with the accepted path",
-               {{"initial_velocity_deviation_rad_s",
-                 format_double(initial_velocity_deviation)},
+               {{"initial_velocity_deviation_rad_s", format_double(initial_velocity_deviation)},
                 {"max_initial_velocity_deviation_rad_s",
                  format_double(*config.max_initial_velocity_deviation_rad_s)},
                 {"recommended_fallback", "spring_back_hold"}});
+  }
+
+  if (natural_completion_fits_stop_window(accepted_trajectory, stop_profile, initial_state,
+                                          config)) {
+    return err("soft_on_path_remaining_time_short",
+               "Accepted trajectory can finish within the Stop window under its frozen time law",
+               {{"recommended_disposition", "natural_completion"},
+                {"natural_completion_basis", "accepted_trajectory_and_frozen_time_law"}});
   }
 
   // Exact-time feasibility gate: refuse (escalate to hard stop) a soft stop
@@ -1045,22 +1182,19 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
   // fastest budget-respecting on-path stop (T_min) from the trip rate.
   {
     const auto min_stop = compute_soft_on_path_min_stop_time(
-        accepted_trajectory, seam_cursor_s, path_time_rate,
-        per_joint_max_deceleration_rad_s2);
+        accepted_trajectory, seam_cursor_s, path_time_rate, per_joint_max_deceleration_rad_s2);
     if (min_stop.ok()) {
       // Cannot stop on-path within the budget at all: even the fastest
       // budget-respecting stop overruns the remaining path. This is at least as
       // serious as "cannot stop fast enough" — escalate to a hard stop unless
       // the policy permits letting the original motion run to its natural
       // completion (handled by the short-path check below).
-      if (!min_stop.value().reaches_rest_on_path &&
-          !stop_profile.allow_natural_completion_on_short_path) {
+      if (!min_stop.value().reaches_rest_on_path) {
         return err(
             "soft_on_path_cannot_stop_on_path_within_budget",
             "soft_on_path cannot bring the robot to rest on the remaining path "
             "within the per-joint deceleration budget; escalate to hard stop",
-            {{"min_stop_distance_path_s",
-              format_double(min_stop.value().stop_distance_path_s)},
+            {{"min_stop_distance_path_s", format_double(min_stop.value().stop_distance_path_s)},
              {"recommended_disposition", "hard_stop"}});
       }
       // Requested time shorter than the fastest feasible on-path stop (T_min):
@@ -1069,52 +1203,76 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
       // quintic ramp below when nothing binds, or a future redistributed
       // profile.)
       if (min_stop.value().reaches_rest_on_path &&
-          *stop_profile.deceleration_time_s + kEpsilon <
-              min_stop.value().min_stop_time_s) {
-        return err(
-            "soft_on_path_deceleration_time_infeasible",
-            "soft_on_path deceleration_time_s is shorter than the minimum "
-            "budget-respecting on-path stop time; escalate to hard stop",
-            {{"deceleration_time_s",
-              format_double(*stop_profile.deceleration_time_s)},
-             {"min_stop_time_s",
-              format_double(min_stop.value().min_stop_time_s)},
-             {"recommended_disposition", "hard_stop"}});
+          *stop_profile.deceleration_time_s + kEpsilon < min_stop.value().min_stop_time_s) {
+        return err("soft_on_path_deceleration_time_infeasible",
+                   "soft_on_path deceleration_time_s is shorter than the minimum "
+                   "budget-respecting on-path stop time; escalate to hard stop",
+                   {{"deceleration_time_s", format_double(*stop_profile.deceleration_time_s)},
+                    {"min_stop_time_s", format_double(min_stop.value().min_stop_time_s)},
+                    {"recommended_disposition", "hard_stop"}});
       }
     }
   }
 
-  const double handoff_path_time =
-      seam_cursor_s + path_time_rate * config.stop_traj_delta_s;
-  const double stop_path_time =
-      handoff_path_time + 0.5 * path_time_rate * effective_ramp_s;
+  std::optional<detail::RuntimeScaleGovernor> continuation;
+  double handoff_path_time = seam_cursor_s + path_time_rate * config.stop_traj_delta_s;
+  double handoff_rate = path_time_rate;
+  double handoff_rate_accel = 0.0;
+  if (initial_state.runtime_scale_target_at_trip) {
+    if (!use_model_velocity || !accepted_trajectory.runtime_scale_bounds) {
+      return err("runtime_scale_continuation_unavailable",
+                 "Stop requires the exact accepted time-law bounds for its captured continuation");
+    }
+    const auto& bounds = *accepted_trajectory.runtime_scale_bounds;
+    try {
+      continuation.emplace(
+          path_time_rate,
+          detail::RuntimeScaleBounds{bounds.max_rate_per_s, bounds.max_rate_change_per_s2},
+          initial_state.runtime_scale_rate_per_s_at_trip,
+          *initial_state.runtime_scale_target_at_trip);
+    } catch (const std::exception&) {
+      return err("runtime_scale_continuation_invalid",
+                 "Stop captured an invalid time-law continuation");
+    }
+    auto handoff = *continuation;
+    const auto advance = handoff.advance(config.stop_traj_delta_s);
+    if (!advance)
+      return err("runtime_scale_continuation_invalid", "Stop lead-in is not representable");
+    handoff_path_time = seam_cursor_s + *advance;
+    handoff_rate = handoff.scale();
+    handoff_rate_accel = handoff.rate_per_s();
+  } else if (!std::isfinite(initial_state.runtime_scale_rate_per_s_at_trip) ||
+             initial_state.runtime_scale_rate_per_s_at_trip != 0.0) {
+    return err("runtime_scale_continuation_unavailable",
+               "A changing scale requires its captured continuation");
+  }
+  if (accepted_trajectory.runtime_scale_bounds &&
+      !ramp_rate_within_unit_range(handoff_rate, handoff_rate_accel, effective_ramp_s)) {
+    return err("soft_on_path_scale_ramp_infeasible",
+               "Requested Stop ramp would exceed the accepted velocity envelope",
+               {{"recommended_disposition", "hard_stop"}});
+  }
+  const double stop_path_time = handoff_path_time + 0.5 * handoff_rate * effective_ramp_s +
+                                0.1 * handoff_rate_accel * effective_ramp_s * effective_ramp_s;
   if (stop_path_time > path_end_s + kEpsilon) {
     InterruptStructuredValue details{
         {"projected_time_from_start_s", format_double(projection.time_from_start_s)},
         {"stop_path_time_s", format_double(stop_path_time)},
         {"trajectory_end_time_s", format_double(path_end_s)}};
-    if (stop_profile.allow_natural_completion_on_short_path) {
-      details["recommended_disposition"] =
-          interrupt_structured_string("natural_completion");
-    } else {
-      details["recommended_fallback"] =
-          interrupt_structured_string("spring_back_hold");
-    }
-    return err_structured(
-        "soft_on_path_remaining_time_short",
-        "soft_on_path stop ramp would pass the accepted trajectory end",
-        std::move(details));
+    details["recommended_fallback"] = interrupt_structured_string("spring_back_hold");
+    return err_structured("soft_on_path_remaining_time_short",
+                          "soft_on_path stop ramp would pass the accepted trajectory end",
+                          std::move(details));
   }
 
   std::map<std::string, double> jerk_limits;
   bool any_default_jerk = false;
   bool any_deployment_jerk = false;
   for (const auto& joint_name : accepted_trajectory.joint_names) {
-    const double accel_limit =
-        per_joint_max_deceleration_rad_s2.at(joint_name);
+    if (!config.jerk_limits_enabled) break;
+    const double accel_limit = per_joint_max_deceleration_rad_s2.at(joint_name);
     const auto jerk_it = config.per_joint_max_jerk_rad_s3.find(joint_name);
-    if (jerk_it != config.per_joint_max_jerk_rad_s3.end() &&
-        finite_positive(jerk_it->second)) {
+    if (jerk_it != config.per_joint_max_jerk_rad_s3.end() && finite_positive(jerk_it->second)) {
       jerk_limits[joint_name] = jerk_it->second;
       any_deployment_jerk = true;
     } else {
@@ -1124,6 +1282,8 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
   }
 
   SoftOnPathStopPlanDTO plan;
+  plan.command_path_time_s = seam_cursor_s;
+  plan.forward_stop_path_time_s = stop_path_time;
   plan.projected_time_from_start_s = projection.time_from_start_s;
   plan.effective_ramp_s = effective_ramp_s;
   plan.stop_traj_delta_s = config.stop_traj_delta_s;
@@ -1136,27 +1296,27 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
   plan.position_source = source_string(initial_state.position_source);
   plan.velocity_source =
       use_model_velocity ? "model_derived" : source_string(initial_state.velocity_source);
-  plan.jerk_limit_source =
-      any_default_jerk && any_deployment_jerk
-          ? "mixed"
-          : (any_deployment_jerk ? "deployment" : "default");
+  plan.jerk_limit_source = !config.jerk_limits_enabled ? "disabled"
+                           : any_default_jerk && any_deployment_jerk
+                               ? "mixed"
+                               : (any_deployment_jerk ? "deployment" : "default");
   plan.diagnostics["position_source"] = plan.position_source;
   plan.diagnostics["velocity_source"] = plan.velocity_source;
-  plan.diagnostics["used_model_velocity"] =
-      interrupt_structured_bool(plan.used_model_velocity);
+  plan.diagnostics["used_model_velocity"] = interrupt_structured_bool(plan.used_model_velocity);
   plan.diagnostics["sample_age_ns"] = std::to_string(initial_state.sample_age_ns);
   plan.diagnostics["runtime_velocity_scale_at_trip"] =
       format_double(plan.runtime_velocity_scale_at_trip);
+  plan.diagnostics["runtime_scale_rate_per_s_at_trip"] =
+      format_double(initial_state.runtime_scale_rate_per_s_at_trip);
+  plan.diagnostics["handoff_scale_rate_per_s"] = format_double(handoff_rate_accel);
   plan.diagnostics["stop_traj_delta_s"] = format_double(plan.stop_traj_delta_s);
   plan.diagnostics["effective_ramp_s"] = format_double(plan.effective_ramp_s);
   // Seam cursor (where the lead-in/ramp anchor) vs the measured-position
   // projection: their difference is the command-vs-measured tracking lag the
   // command-frame seam corrects for.
   plan.diagnostics["seam_cursor_s"] = format_double(seam_cursor_s);
-  plan.diagnostics["measured_projection_s"] =
-      format_double(projection.time_from_start_s);
-  plan.diagnostics["initial_path_deviation_rad"] =
-      format_double(plan.initial_path_deviation_rad);
+  plan.diagnostics["measured_projection_s"] = format_double(projection.time_from_start_s);
+  plan.diagnostics["initial_path_deviation_rad"] = format_double(plan.initial_path_deviation_rad);
   plan.diagnostics["initial_velocity_deviation_rad_s"] =
       format_double(plan.initial_velocity_deviation_rad_s);
   plan.diagnostics["jerk_limit_source"] = plan.jerk_limit_source;
@@ -1176,16 +1336,25 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
   // move may legitimately run faster than the stop decel). Measured feedback is
   // retained only as a monitor (initial path/velocity deviation, sample age, stop
   // confirmation), computed above and unaffected by this seam.
-  plan.diagnostics["seam"] =
-      interrupt_structured_string("command_frame_lead_in");
+  plan.diagnostics["seam"] = interrupt_structured_string("command_frame_lead_in");
   const double lead_in_s = config.stop_traj_delta_s;
-  const size_t lead_in_samples = std::max<size_t>(
-      1, static_cast<size_t>(std::ceil(lead_in_s / config.sample_period_s)));
+  const size_t lead_in_samples =
+      std::max<size_t>(1, static_cast<size_t>(std::ceil(lead_in_s / config.sample_period_s)));
   PathSample lead_sample;
   for (size_t i = 0; i < lead_in_samples; ++i) {
-    const double tau =
-        lead_in_s * static_cast<double>(i) / static_cast<double>(lead_in_samples);
-    const double path_time = seam_cursor_s + path_time_rate * tau;
+    const double tau = lead_in_s * static_cast<double>(i) / static_cast<double>(lead_in_samples);
+    double path_time = seam_cursor_s + path_time_rate * tau;
+    double lead_rate = path_time_rate;
+    double lead_rate_accel = 0.0;
+    if (continuation) {
+      auto lead = *continuation;
+      const auto advance = lead.advance(tau);
+      if (!advance)
+        return err("runtime_scale_continuation_invalid", "Stop lead-in is not representable");
+      path_time = seam_cursor_s + *advance;
+      lead_rate = lead.scale();
+      lead_rate_accel = lead.rate_per_s();
+    }
     cursor.sample(path_time, lead_sample);
     TrajectoryWaypointDTO wp;
     wp.time_from_start_s = tau;
@@ -1193,9 +1362,9 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
     wp.velocities_rad_s.resize(joint_count, 0.0);
     wp.accelerations_rad_s2.resize(joint_count, 0.0);
     for (size_t j = 0; j < joint_count; ++j) {
-      wp.velocities_rad_s[j] = lead_sample.d_position_dt[j] * path_time_rate;
-      wp.accelerations_rad_s2[j] =
-          lead_sample.d2_position_dt2[j] * path_time_rate * path_time_rate;
+      wp.velocities_rad_s[j] = lead_sample.d_position_dt[j] * lead_rate;
+      wp.accelerations_rad_s2[j] = lead_sample.d2_position_dt2[j] * lead_rate * lead_rate +
+                                   lead_sample.d_position_dt[j] * lead_rate_accel;
     }
     plan.replacement_trajectory.waypoints.push_back(std::move(wp));
   }
@@ -1204,8 +1373,7 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
   // diagnostics stay untouched until after the loop), so the retimer/ALI
   // fallback snapshot is reconstructed lazily by truncating back to the
   // lead-in prefix instead of deep-copying the plan on the happy path.
-  const size_t lead_in_waypoint_count =
-      plan.replacement_trajectory.waypoints.size();
+  const size_t lead_in_waypoint_count = plan.replacement_trajectory.waypoints.size();
   const auto base_plan_before_ramp = [&]() {
     SoftOnPathStopPlanDTO base = plan;
     base.replacement_trajectory.waypoints.resize(lead_in_waypoint_count);
@@ -1213,59 +1381,57 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
   };
   auto try_jerk_limited_retimer =
       [&](std::string trigger_reason,
-          InterruptStructuredValue trigger_details)
-      -> Result<SoftOnPathStopPlanDTO> {
+          InterruptStructuredValue trigger_details) -> Result<SoftOnPathStopPlanDTO> {
+    trigger_details["handoff_path_time_s"] = format_double(handoff_path_time);
+    if (!config.jerk_limits_enabled) {
+      trigger_details["recommended_disposition"] = interrupt_structured_string("hard_stop");
+      return err_structured(std::move(trigger_reason),
+                            "Controlled Stop ramp cannot meet its path/acceleration constraints; "
+                            "advance the declared fallback chain",
+                            std::move(trigger_details));
+    }
     auto retimed = compute_jerk_limited_stop_profile(
-        accepted_trajectory, handoff_path_time, path_time_rate,
-        /*start_path_rate_accel=*/0.0, effective_ramp_s,
-        per_joint_max_deceleration_rad_s2, jerk_limits,
-        config.sample_period_s);
+        accepted_trajectory, handoff_path_time, handoff_rate, handoff_rate_accel, effective_ramp_s,
+        per_joint_max_deceleration_rad_s2, jerk_limits, config.sample_period_s);
     if (!retimed.ok()) {
       return Result<SoftOnPathStopPlanDTO>::Err(retimed.error());
     }
     const auto& profile = retimed.value();
     if (!profile.dispatchable) {
       auto ali = compute_ali_backtracking_stop_profile(
-          accepted_trajectory, handoff_path_time, path_time_rate,
-          /*start_path_rate_accel=*/0.0, effective_ramp_s,
-          per_joint_max_deceleration_rad_s2, jerk_limits,
-          config.sample_period_s);
+          accepted_trajectory, handoff_path_time, handoff_rate, handoff_rate_accel,
+          effective_ramp_s, per_joint_max_deceleration_rad_s2, jerk_limits, config.sample_period_s);
       if (!ali.ok()) {
         return Result<SoftOnPathStopPlanDTO>::Err(ali.error());
       }
       const auto& ali_profile = ali.value();
       if (ali_profile.dispatchable) {
         SoftOnPathStopPlanDTO ali_plan = base_plan_before_ramp();
+        ali_plan.forward_stop_path_time_s = ali_profile.samples.back().path_time_s;
         ali_plan.diagnostics["soft_on_path_retimer"] =
             interrupt_structured_string("ali_backtracking");
         ali_plan.diagnostics["retimer_trigger_reason"] = trigger_reason;
-        ali_plan.diagnostics["prior_retimer"] =
-            interrupt_structured_string("jerk_limited");
+        ali_plan.diagnostics["prior_retimer"] = interrupt_structured_string("jerk_limited");
         ali_plan.diagnostics["prior_retimer_validation_failure_reason"] =
             profile.validation_failure_reason;
         ali_plan.diagnostics["ali_achieved_stop_time_s"] =
             format_double(ali_profile.achieved_stop_time_s);
         ali_plan.diagnostics["ali_motion_stop_time_s"] =
             format_double(ali_profile.motion_stop_time_s);
-        ali_plan.diagnostics["ali_hold_time_s"] =
-            format_double(std::max(0.0, ali_profile.achieved_stop_time_s -
-                                            ali_profile.motion_stop_time_s));
-        ali_plan.diagnostics["ali_stopped_before_requested_time"] =
-            interrupt_structured_bool(
-                ali_profile.motion_stop_time_s + kEpsilon <
-                ali_profile.achieved_stop_time_s);
+        ali_plan.diagnostics["ali_hold_time_s"] = format_double(
+            std::max(0.0, ali_profile.achieved_stop_time_s - ali_profile.motion_stop_time_s));
+        ali_plan.diagnostics["ali_stopped_before_requested_time"] = interrupt_structured_bool(
+            ali_profile.motion_stop_time_s + kEpsilon < ali_profile.achieved_stop_time_s);
         ali_plan.diagnostics["ali_backtracking_iterations"] =
             std::to_string(ali_profile.backtracking_iterations);
         // The validated profile already carries the emitted joint waypoints
         // (1:1 with samples, same path-sampling math); reuse them with the
         // lead-in time shift instead of resampling the path per sample.
-        const size_t first_ali_sample =
-            config.stop_traj_delta_s <= kEpsilon ? 1 : 0;
+        const size_t first_ali_sample = config.stop_traj_delta_s <= kEpsilon ? 1 : 0;
         for (size_t i = first_ali_sample; i < ali_profile.samples.size(); ++i) {
           TrajectoryWaypointDTO wp = ali_profile.emitted.waypoints[i];
           wp.time_from_start_s =
-              config.stop_traj_delta_s +
-              ali_profile.samples[i].time_from_ramp_start_s;
+              config.stop_traj_delta_s + ali_profile.samples[i].time_from_ramp_start_s;
           ali_plan.replacement_trajectory.waypoints.push_back(std::move(wp));
         }
         ali_plan.diagnostics["handoff_path_deviation_max_rad"] =
@@ -1278,47 +1444,39 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
             std::to_string(ali_plan.replacement_trajectory.waypoints.size());
         return Result<SoftOnPathStopPlanDTO>::Ok(std::move(ali_plan));
       }
-      trigger_details["reason"] = interrupt_structured_string(
-          "soft_on_path_retimer_not_dispatchable");
+      trigger_details["reason"] =
+          interrupt_structured_string("soft_on_path_retimer_not_dispatchable");
       trigger_details["trigger_reason"] = trigger_reason;
-      trigger_details["retimer_validation_failure_reason"] =
-          profile.validation_failure_reason;
-      trigger_details["retimer_achieved_stop_time_s"] =
-          format_double(profile.achieved_stop_time_s);
+      trigger_details["retimer_validation_failure_reason"] = profile.validation_failure_reason;
+      trigger_details["retimer_achieved_stop_time_s"] = format_double(profile.achieved_stop_time_s);
       trigger_details["retimer_used_backward_envelope"] =
           interrupt_structured_bool(profile.used_backward_envelope);
       trigger_details["retimer_reaches_rest_on_path"] =
           interrupt_structured_bool(profile.reaches_rest_on_path);
       trigger_details["retimer_hits_target_time"] =
           interrupt_structured_bool(profile.hits_target_time);
-      trigger_details["ali_validation_failure_reason"] =
-          ali_profile.validation_failure_reason;
-      trigger_details["ali_achieved_stop_time_s"] =
-          format_double(ali_profile.achieved_stop_time_s);
-      trigger_details["ali_motion_stop_time_s"] =
-          format_double(ali_profile.motion_stop_time_s);
-      trigger_details["ali_hold_time_s"] =
-          format_double(std::max(0.0, ali_profile.achieved_stop_time_s -
-                                          ali_profile.motion_stop_time_s));
+      trigger_details["ali_validation_failure_reason"] = ali_profile.validation_failure_reason;
+      trigger_details["ali_achieved_stop_time_s"] = format_double(ali_profile.achieved_stop_time_s);
+      trigger_details["ali_motion_stop_time_s"] = format_double(ali_profile.motion_stop_time_s);
+      trigger_details["ali_hold_time_s"] = format_double(
+          std::max(0.0, ali_profile.achieved_stop_time_s - ali_profile.motion_stop_time_s));
       trigger_details["ali_backtracking_iterations"] =
           std::to_string(ali_profile.backtracking_iterations);
       trigger_details["ali_reaches_rest_on_path"] =
           interrupt_structured_bool(ali_profile.reaches_rest_on_path);
       trigger_details["ali_hits_target_time"] =
           interrupt_structured_bool(ali_profile.hits_target_time);
-      trigger_details["recommended_disposition"] =
-          interrupt_structured_string("hard_stop");
-      return err_structured(
-          "soft_on_path_retimer_not_dispatchable",
-          "soft_on_path fixed ramp exceeded a limit and the jerk-limited "
-          "retimer plus ALI backtracking could not prove a dispatchable "
-          "replacement; escalate to hard stop",
-          std::move(trigger_details));
+      trigger_details["recommended_disposition"] = interrupt_structured_string("hard_stop");
+      return err_structured("soft_on_path_retimer_not_dispatchable",
+                            "soft_on_path fixed ramp exceeded a limit and the jerk-limited "
+                            "retimer plus ALI backtracking could not prove a dispatchable "
+                            "replacement; escalate to hard stop",
+                            std::move(trigger_details));
     }
 
     SoftOnPathStopPlanDTO retimed_plan = base_plan_before_ramp();
-    retimed_plan.diagnostics["soft_on_path_retimer"] =
-        interrupt_structured_string("jerk_limited");
+    retimed_plan.forward_stop_path_time_s = profile.samples.back().path_time_s;
+    retimed_plan.diagnostics["soft_on_path_retimer"] = interrupt_structured_string("jerk_limited");
     retimed_plan.diagnostics["retimer_trigger_reason"] = trigger_reason;
     retimed_plan.diagnostics["retimer_achieved_stop_time_s"] =
         format_double(profile.achieved_stop_time_s);
@@ -1329,12 +1487,10 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
     // The validated profile already carries the emitted joint waypoints
     // (1:1 with samples, same path-sampling math); reuse them with the
     // lead-in time shift instead of resampling the path per sample.
-    const size_t first_retimer_sample =
-        config.stop_traj_delta_s <= kEpsilon ? 1 : 0;
+    const size_t first_retimer_sample = config.stop_traj_delta_s <= kEpsilon ? 1 : 0;
     for (size_t i = first_retimer_sample; i < profile.samples.size(); ++i) {
       TrajectoryWaypointDTO wp = profile.emitted_trajectory.waypoints[i];
-      wp.time_from_start_s =
-          config.stop_traj_delta_s + profile.samples[i].time_from_ramp_start_s;
+      wp.time_from_start_s = config.stop_traj_delta_s + profile.samples[i].time_from_ramp_start_s;
       retimed_plan.replacement_trajectory.waypoints.push_back(std::move(wp));
     }
     retimed_plan.diagnostics["handoff_path_deviation_max_rad"] =
@@ -1351,28 +1507,32 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
   // Per-joint limits hoisted into index-aligned vectors: the ramp loop
   // below reads them per joint per waypoint.
   std::vector<double> accel_limits(joint_count, 0.0);
-  std::vector<double> jerk_limits_by_index(joint_count, 0.0);
+  std::vector<double> jerk_limits_by_index(config.jerk_limits_enabled ? joint_count : 0, 0.0);
   for (size_t j = 0; j < joint_count; ++j) {
-    accel_limits[j] = per_joint_max_deceleration_rad_s2.at(
-        accepted_trajectory.joint_names[j]);
-    jerk_limits_by_index[j] = jerk_limits.at(accepted_trajectory.joint_names[j]);
+    accel_limits[j] = per_joint_max_deceleration_rad_s2.at(accepted_trajectory.joint_names[j]);
+    if (config.jerk_limits_enabled)
+      jerk_limits_by_index[j] = jerk_limits.at(accepted_trajectory.joint_names[j]);
   }
 
   const size_t ramp_samples = std::max<size_t>(
       1, static_cast<size_t>(std::ceil(effective_ramp_s / config.sample_period_s)));
-  std::vector<double> previous_accel;
-  double previous_time = 0.0;
   PathSample path_sample;
   const size_t first_ramp_sample = config.stop_traj_delta_s <= kEpsilon ? 1 : 0;
   for (size_t i = first_ramp_sample; i <= ramp_samples; ++i) {
     const double r = static_cast<double>(i) / static_cast<double>(ramp_samples);
     const double tau = r * effective_ramp_s;
     const double path_time =
-        handoff_path_time +
-        path_time_rate * effective_ramp_s * ramp_position_factor(r);
-    const double u_dot = path_time_rate * ramp_velocity_factor(r);
-    const double u_ddot =
-        path_time_rate / effective_ramp_s * ramp_acceleration_factor(r);
+        handoff_path_time + handoff_rate * effective_ramp_s * ramp_position_factor(r) +
+        handoff_rate_accel * effective_ramp_s * effective_ramp_s * rate_position_factor(r);
+    const double u_dot = handoff_rate * ramp_velocity_factor(r) +
+                         handoff_rate_accel * effective_ramp_s * rate_velocity_factor(r);
+    const double u_ddot = handoff_rate / effective_ramp_s * ramp_acceleration_factor(r) +
+                          handoff_rate_accel * rate_acceleration_factor(r);
+    if (!std::isfinite(path_time) || !std::isfinite(u_dot) || !std::isfinite(u_ddot) ||
+        u_dot < -kEpsilon || path_time < handoff_path_time - kEpsilon ||
+        path_time > path_end_s + kEpsilon) {
+      return try_jerk_limited_retimer("soft_on_path_scale_ramp_infeasible", {});
+    }
     cursor.sample(path_time, path_sample);
 
     TrajectoryWaypointDTO wp;
@@ -1383,56 +1543,41 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
     for (size_t j = 0; j < joint_count; ++j) {
       wp.velocities_rad_s[j] = path_sample.d_position_dt[j] * u_dot;
       wp.accelerations_rad_s2[j] =
-          path_sample.d2_position_dt2[j] * u_dot * u_dot +
-          path_sample.d_position_dt[j] * u_ddot;
-      if (std::abs(wp.accelerations_rad_s2[j]) > accel_limits[j] + 1e-8) {
+          path_sample.d2_position_dt2[j] * u_dot * u_dot + path_sample.d_position_dt[j] * u_ddot;
+    }
+    // Exclude the already-accepted lead-in, but include the first complete
+    // ramp segment and its P/V/A seam even when the lead-in is zero.
+    if (i > 0) {
+      const auto& previous = plan.replacement_trajectory.waypoints.back();
+      if (const auto failure =
+              segment_limit_failure(previous, wp, accel_limits, jerk_limits_by_index)) {
         return try_jerk_limited_retimer(
-            "soft_on_path_acceleration_limit_exceeded",
-            {{"joint", accepted_trajectory.joint_names[j]},
-             {"acceleration_rad_s2",
-              format_double(wp.accelerations_rad_s2[j])},
-             {"limit_rad_s2", format_double(accel_limits[j])}});
-      }
-      if (!previous_accel.empty()) {
-        const double dt = wp.time_from_start_s - previous_time;
-        if (dt > kEpsilon) {
-          const double jerk =
-              (wp.accelerations_rad_s2[j] - previous_accel[j]) / dt;
-          if (std::abs(jerk) > jerk_limits_by_index[j] + 1e-8) {
-            return try_jerk_limited_retimer(
-                "soft_on_path_jerk_limit_exceeded",
-                {{"joint", accepted_trajectory.joint_names[j]},
-                 {"jerk_rad_s3", format_double(jerk)},
-                 {"limit_rad_s3", format_double(jerk_limits_by_index[j])}});
-          }
-        }
+            failure->is_jerk()           ? "soft_on_path_jerk_limit_exceeded"
+            : failure->is_acceleration() ? "soft_on_path_acceleration_limit_exceeded"
+                                         : "soft_on_path_interpolation_invalid",
+            {{"joint", accepted_trajectory.joint_names[failure->joint]},
+             {"interpolation_check", failure->reason},
+             {"segment_start_s", format_double(previous.time_from_start_s)},
+             {"segment_end_s", format_double(wp.time_from_start_s)},
+             {"peak_value", format_double(failure->peak)},
+             {"limit", format_double(failure->limit)}});
       }
     }
-    plan.path_deviation_max_rad =
-        std::max(plan.path_deviation_max_rad, projection.distance_rad);
-    previous_accel = wp.accelerations_rad_s2;
-    previous_time = wp.time_from_start_s;
+    plan.path_deviation_max_rad = std::max(plan.path_deviation_max_rad, projection.distance_rad);
     plan.replacement_trajectory.waypoints.push_back(std::move(wp));
   }
 
-  plan.diagnostics["handoff_path_deviation_max_rad"] =
-      format_double(plan.path_deviation_max_rad);
-  plan.diagnostics["path_deviation_max_rad"] =
-      format_double(plan.path_deviation_max_rad);
-  plan.diagnostics["soft_on_path_retimer"] =
-      interrupt_structured_string("quintic");
-  plan.diagnostics["projected_time_from_start_s"] =
-      format_double(plan.projected_time_from_start_s);
-  plan.diagnostics["waypoint_count"] =
-      std::to_string(plan.replacement_trajectory.waypoints.size());
+  plan.diagnostics["handoff_path_deviation_max_rad"] = format_double(plan.path_deviation_max_rad);
+  plan.diagnostics["path_deviation_max_rad"] = format_double(plan.path_deviation_max_rad);
+  plan.diagnostics["soft_on_path_retimer"] = interrupt_structured_string("quintic");
+  plan.diagnostics["projected_time_from_start_s"] = format_double(plan.projected_time_from_start_s);
+  plan.diagnostics["waypoint_count"] = std::to_string(plan.replacement_trajectory.waypoints.size());
   return Result<SoftOnPathStopPlanDTO>::Ok(std::move(plan));
 }
 
 Result<SoftOnPathStopPlanDTO> plan_spring_back_on_path_stop(
-    const TrajectoryDTO& accepted_trajectory,
-    const MotionInterruptStopProfileDTO& stop_profile,
-    const SoftOnPathInitialStateDTO& initial_state,
-    const SoftOnPathPlannerConfig& config) {
+    const TrajectoryDTO& accepted_trajectory, const MotionInterruptStopProfileDTO& stop_profile,
+    const SoftOnPathInitialStateDTO& initial_state, const SoftOnPathPlannerConfig& config) {
   if (stop_profile.stop_mode != MotionInterruptStopMode::kSpringBackHold) {
     return err("stop_mode_not_spring_back_hold",
                "spring_back_hold planner called for a non-spring_back_hold profile",
@@ -1445,8 +1590,7 @@ Result<SoftOnPathStopPlanDTO> plan_spring_back_on_path_stop(
                "spring_back_hold requires a positive deceleration_time_s",
                {{"recommended_disposition", "hard_stop"}});
   }
-  if (!std::isfinite(config.stop_traj_delta_s) ||
-      config.stop_traj_delta_s < 0.0) {
+  if (!std::isfinite(config.stop_traj_delta_s) || config.stop_traj_delta_s < 0.0) {
     return err("invalid_stop_traj_delta_s",
                "spring_back_hold stop_traj_delta_s must be finite and >= 0",
                {{"recommended_disposition", "hard_stop"}});
@@ -1457,32 +1601,42 @@ Result<SoftOnPathStopPlanDTO> plan_spring_back_on_path_stop(
                {{"recommended_disposition", "hard_stop"}});
   }
 
+  const auto valid_shape = validate_trajectory_shape(accepted_trajectory);
+  if (!valid_shape.ok()) return Result<SoftOnPathStopPlanDTO>::Err(valid_shape.error());
   const double total_time_s = requested_deceleration_time_s;
+  if (natural_completion_fits_stop_window(accepted_trajectory, stop_profile, initial_state,
+                                          config)) {
+    return err("soft_on_path_remaining_time_short",
+               "Accepted trajectory can finish without the spring-back replacement",
+               {{"recommended_disposition", "natural_completion"},
+                {"natural_completion_basis", "accepted_trajectory_and_frozen_time_law"}});
+  }
   const double phase_time_s = 0.5 * total_time_s;
   if (phase_time_s <= config.stop_traj_delta_s + kEpsilon) {
-    return err(
-        "spring_back_phase_time_not_larger_than_handoff",
-        "spring_back_hold deceleration_time_s must leave room for the "
-        "command-frame lead-in inside the forward half",
-        {{"recommended_disposition", "hard_stop"},
-         {"deceleration_time_s", format_double(total_time_s)},
-         {"forward_phase_time_s", format_double(phase_time_s)},
-         {"stop_traj_delta_s", format_double(config.stop_traj_delta_s)}});
+    return err("spring_back_phase_time_not_larger_than_handoff",
+               "spring_back_hold deceleration_time_s must leave room for the "
+               "command-frame lead-in inside the forward half",
+               {{"recommended_disposition", "hard_stop"},
+                {"deceleration_time_s", format_double(total_time_s)},
+                {"forward_phase_time_s", format_double(phase_time_s)},
+                {"stop_traj_delta_s", format_double(config.stop_traj_delta_s)}});
   }
 
   MotionInterruptStopProfileDTO forward_profile = stop_profile;
   forward_profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
-  forward_profile.deceleration_time_s = phase_time_s;
+  // Spring-back retains its whole-duration contract. Its forward half
+  // includes the lead-in, unlike a directly requested soft Stop ramp.
+  forward_profile.deceleration_time_s = phase_time_s - config.stop_traj_delta_s;
   // The spring-back planner is itself a fallback/stop mode. If the forward
   // half cannot be generated, fail closed and let the kernel/backend hard-stop
   // floor decide; do not recursively fall back to spring_back_hold.
   forward_profile.recoverable_substitution_mode.reset();
-  auto forward = plan_soft_on_path_stop(
-      accepted_trajectory, forward_profile, initial_state, config);
+  forward_profile.allow_natural_completion_on_short_path = false;
+  auto forward =
+      plan_soft_on_path_stop(accepted_trajectory, forward_profile, initial_state, config);
   if (!forward.ok()) {
     ErrorDTO error = forward.error();
-    error.message = "spring_back_hold forward on-path deceleration failed: " +
-                    error.message;
+    error.message = "spring_back_hold forward on-path deceleration failed: " + error.message;
     error.details["spring_back_phase"] = "forward_deceleration";
     error.details["requested_stop_mode"] = "spring_back_hold";
     error.details["recommended_disposition"] = "hard_stop";
@@ -1497,83 +1651,127 @@ Result<SoftOnPathStopPlanDTO> plan_spring_back_on_path_stop(
                {{"recommended_disposition", "hard_stop"}});
   }
 
+  // A fallback retimer may settle slightly before its target. Hold that proven
+  // rest until the exact phase boundary; never overlap/backdate a forward leg
+  // that exceeded it. The reverse leg keeps its independently fixed duration.
+  std::optional<size_t> adjusted_forward_end;
+  auto& forward_end = plan.replacement_trajectory.waypoints.back();
+  if (forward_end.time_from_start_s > phase_time_s + kEpsilon) {
+    return err(
+        "spring_back_forward_phase_duration_exceeded",
+        "spring_back_hold forward profile exceeded its fixed half-duration",
+        {{"recommended_disposition", "hard_stop"}, {"spring_back_phase", "forward_deceleration"}});
+  }
+  if (forward_end.time_from_start_s != phase_time_s) {
+    const auto is_rest = [&](const auto& values) {
+      return values.size() == accepted_trajectory.joint_names.size() &&
+             std::all_of(values.begin(), values.end(), [](double value) { return value == 0.0; });
+    };
+    if (!is_rest(forward_end.velocities_rad_s) || !is_rest(forward_end.accelerations_rad_s2)) {
+      return err("spring_back_forward_phase_not_at_rest",
+                 "spring_back_hold cannot join its return to an unsettled forward profile",
+                 {{"recommended_disposition", "hard_stop"}});
+    }
+    if (forward_end.time_from_start_s < phase_time_s - kEpsilon) {
+      auto hold = forward_end;
+      hold.time_from_start_s = phase_time_s;
+      plan.replacement_trajectory.waypoints.push_back(std::move(hold));
+    } else {
+      forward_end.time_from_start_s = phase_time_s;
+      adjusted_forward_end = plan.replacement_trajectory.waypoints.size() - 1;
+    }
+  }
+
   const size_t joint_count = accepted_trajectory.joint_names.size();
-  const TrajectoryWaypointDTO trip_waypoint =
-      plan.replacement_trajectory.waypoints.front();
-  const TrajectoryWaypointDTO stop_waypoint =
-      plan.replacement_trajectory.waypoints.back();
-  const Projection trip_projection =
-      project_to_path(accepted_trajectory, trip_waypoint.positions_rad);
-  const Projection stop_projection =
-      project_to_path(accepted_trajectory, stop_waypoint.positions_rad);
-  double return_distance_s =
-      stop_projection.time_from_start_s - trip_projection.time_from_start_s;
+  const double trip_path_time_s = plan.command_path_time_s;
+  const double stop_path_time_s = plan.forward_stop_path_time_s;
+  double return_distance_s = stop_path_time_s - trip_path_time_s;
   if (!std::isfinite(return_distance_s) || return_distance_s < -kEpsilon) {
     return err("spring_back_invalid_return_distance",
                "spring_back_hold forward stop point is behind the trip point",
                {{"recommended_disposition", "hard_stop"},
-                {"trip_path_time_s",
-                 format_double(trip_projection.time_from_start_s)},
-                {"stop_path_time_s",
-                 format_double(stop_projection.time_from_start_s)}});
+                {"trip_path_time_s", format_double(trip_path_time_s)},
+                {"stop_path_time_s", format_double(stop_path_time_s)}});
   }
   return_distance_s = std::max(0.0, return_distance_s);
+  // The return quintic has exact peak normalized speed 15/8. Respect the
+  // admitted nominal velocity envelope in reverse as well as forward. Higher
+  // Stop acceleration/jerk caps must not silently permit an overspeed return.
+  const double peak_return_rate = 1.875 * return_distance_s / phase_time_s;
+  if (accepted_trajectory.runtime_scale_bounds &&
+      (!std::isfinite(peak_return_rate) || peak_return_rate > 1.0 + kEpsilon)) {
+    return err("spring_back_return_velocity_envelope_exceeded",
+               "spring_back_hold return would exceed the accepted velocity envelope",
+               {{"recommended_disposition", "hard_stop"},
+                {"spring_back_phase", "reverse_return"},
+                {"peak_return_path_rate", format_double(peak_return_rate)}});
+  }
 
   std::map<std::string, double> jerk_limits;
   bool any_default_jerk = false;
   bool any_deployment_jerk = false;
-  const auto typed_acceleration_limits =
-      angular_deceleration_limits(stop_profile);
+  const auto typed_acceleration_limits = angular_deceleration_limits(stop_profile);
   if (!typed_acceleration_limits.has_value()) {
     return err("spring_back_coordinate_kind_unsupported",
                "legacy angular planner cannot consume a linear coordinate");
   }
-  const auto& per_joint_max_deceleration_rad_s2 =
-      *typed_acceleration_limits;
+  const auto& per_joint_max_deceleration_rad_s2 = *typed_acceleration_limits;
   for (const auto& joint_name : accepted_trajectory.joint_names) {
-    const auto accel_it =
-        per_joint_max_deceleration_rad_s2.find(joint_name);
-    if (accel_it == per_joint_max_deceleration_rad_s2.end() ||
-        !finite_positive(accel_it->second)) {
+    const auto accel_it = per_joint_max_deceleration_rad_s2.find(joint_name);
+    if (accel_it == per_joint_max_deceleration_rad_s2.end() || !finite_positive(accel_it->second)) {
       return err("missing_joint_deceleration_limit",
                  "spring_back_hold requires positive per-joint acceleration limits",
-                 {{"recommended_disposition", "hard_stop"},
-                  {"joint", joint_name}});
+                 {{"recommended_disposition", "hard_stop"}, {"joint", joint_name}});
     }
+    if (!config.jerk_limits_enabled) continue;
     const auto jerk_it = config.per_joint_max_jerk_rad_s3.find(joint_name);
-    if (jerk_it != config.per_joint_max_jerk_rad_s3.end() &&
-        finite_positive(jerk_it->second)) {
+    if (jerk_it != config.per_joint_max_jerk_rad_s3.end() && finite_positive(jerk_it->second)) {
       jerk_limits[joint_name] = jerk_it->second;
       any_deployment_jerk = true;
     } else {
-      jerk_limits[joint_name] =
-          default_jerk_limit(accel_it->second, phase_time_s);
+      jerk_limits[joint_name] = default_jerk_limit(accel_it->second, phase_time_s);
       any_default_jerk = true;
     }
   }
 
   // Per-joint limits hoisted into index-aligned vectors for the reverse loop.
   std::vector<double> accel_limits(joint_count, 0.0);
-  std::vector<double> jerk_limits_by_index(joint_count, 0.0);
+  std::vector<double> jerk_limits_by_index(config.jerk_limits_enabled ? joint_count : 0, 0.0);
   for (size_t j = 0; j < joint_count; ++j) {
-    accel_limits[j] = per_joint_max_deceleration_rad_s2.at(
-        accepted_trajectory.joint_names[j]);
-    jerk_limits_by_index[j] = jerk_limits.at(accepted_trajectory.joint_names[j]);
+    accel_limits[j] = per_joint_max_deceleration_rad_s2.at(accepted_trajectory.joint_names[j]);
+    if (config.jerk_limits_enabled)
+      jerk_limits_by_index[j] = jerk_limits.at(accepted_trajectory.joint_names[j]);
   }
 
-  std::vector<double> previous_accel(joint_count, 0.0);
-  if (stop_waypoint.accelerations_rad_s2.size() == joint_count) {
-    previous_accel = stop_waypoint.accelerations_rad_s2;
+  // Even a roundoff-sized timestamp adjustment changes the polynomial.
+  // Recheck only that segment, using the forward phase's original limits.
+  if (adjusted_forward_end && *adjusted_forward_end > 0) {
+    auto forward_jerk_limits = jerk_limits_by_index;
+    if (config.jerk_limits_enabled)
+      for (size_t j = 0; j < joint_count; ++j) {
+        const auto limit =
+            config.per_joint_max_jerk_rad_s3.find(accepted_trajectory.joint_names[j]);
+        if (limit == config.per_joint_max_jerk_rad_s3.end() || !finite_positive(limit->second))
+          forward_jerk_limits[j] = default_jerk_limit(accel_limits[j], plan.effective_ramp_s);
+      }
+    const auto& points = plan.replacement_trajectory.waypoints;
+    if (const auto failure =
+            segment_limit_failure(points[*adjusted_forward_end - 1], points[*adjusted_forward_end],
+                                  accel_limits, forward_jerk_limits))
+      return err("spring_back_forward_interpolation_invalid",
+                 "spring_back_hold forward phase is invalid at its exact return boundary",
+                 {{"recommended_disposition", "hard_stop"},
+                  {"spring_back_phase", "forward_deceleration"},
+                  {"interpolation_check", failure->reason}});
   }
-  double previous_time_s = phase_time_s;
-  const size_t reverse_samples = std::max<size_t>(
-      1, static_cast<size_t>(std::ceil(phase_time_s / config.sample_period_s)));
+
+  const size_t reverse_samples =
+      std::max<size_t>(1, static_cast<size_t>(std::ceil(phase_time_s / config.sample_period_s)));
 
   PathCursor reverse_cursor(accepted_trajectory);
   PathSample path_sample;
   for (size_t i = 1; i <= reverse_samples; ++i) {
-    const double r =
-        static_cast<double>(i) / static_cast<double>(reverse_samples);
+    const double r = static_cast<double>(i) / static_cast<double>(reverse_samples);
     const double r2 = r * r;
     const double r3 = r2 * r;
     const double r4 = r3 * r;
@@ -1582,12 +1780,9 @@ Result<SoftOnPathStopPlanDTO> plan_spring_back_on_path_stop(
     const double s_dot = 30.0 * r2 - 60.0 * r3 + 30.0 * r4;
     const double s_ddot = 60.0 * r - 180.0 * r2 + 120.0 * r3;
     const double tau = r * phase_time_s;
-    const double path_time =
-        stop_projection.time_from_start_s - return_distance_s * s;
-    const double path_rate =
-        -return_distance_s / phase_time_s * s_dot;
-    const double path_accel =
-        -return_distance_s / (phase_time_s * phase_time_s) * s_ddot;
+    const double path_time = stop_path_time_s - return_distance_s * s;
+    const double path_rate = -return_distance_s / phase_time_s * s_dot;
+    const double path_accel = -return_distance_s / (phase_time_s * phase_time_s) * s_ddot;
     reverse_cursor.sample(path_time, path_sample);
 
     TrajectoryWaypointDTO wp;
@@ -1596,98 +1791,70 @@ Result<SoftOnPathStopPlanDTO> plan_spring_back_on_path_stop(
     wp.velocities_rad_s.resize(joint_count, 0.0);
     wp.accelerations_rad_s2.resize(joint_count, 0.0);
     for (size_t j = 0; j < joint_count; ++j) {
-      const auto& joint_name = accepted_trajectory.joint_names[j];
       wp.velocities_rad_s[j] = path_sample.d_position_dt[j] * path_rate;
-      wp.accelerations_rad_s2[j] =
-          path_sample.d2_position_dt2[j] * path_rate * path_rate +
-          path_sample.d_position_dt[j] * path_accel;
-      const double accel_limit = accel_limits[j];
-      if (std::abs(wp.accelerations_rad_s2[j]) > accel_limit + 1e-8) {
-        return err(
-            "spring_back_return_acceleration_limit_exceeded",
-            "spring_back_hold return phase exceeds a per-joint acceleration limit",
-            {{"recommended_disposition", "hard_stop"},
-             {"spring_back_phase", "reverse_return"},
-             {"joint", joint_name},
-             {"acceleration_rad_s2", format_double(wp.accelerations_rad_s2[j])},
-             {"limit_rad_s2", format_double(accel_limit)}});
-      }
-      const double dt = wp.time_from_start_s - previous_time_s;
-      if (dt > kEpsilon) {
-        const double jerk = (wp.accelerations_rad_s2[j] - previous_accel[j]) / dt;
-        const double jerk_limit = jerk_limits_by_index[j];
-        if (std::abs(jerk) > jerk_limit + 1e-8) {
-          return err(
-              "spring_back_return_jerk_limit_exceeded",
-              "spring_back_hold return phase exceeds a per-joint jerk limit",
-              {{"recommended_disposition", "hard_stop"},
-               {"spring_back_phase", "reverse_return"},
-               {"joint", joint_name},
-               {"jerk_rad_s3", format_double(jerk)},
-               {"limit_rad_s3", format_double(jerk_limit)}});
-        }
-      }
+      wp.accelerations_rad_s2[j] = path_sample.d2_position_dt2[j] * path_rate * path_rate +
+                                   path_sample.d_position_dt[j] * path_accel;
     }
-    previous_accel = wp.accelerations_rad_s2;
-    previous_time_s = wp.time_from_start_s;
+    const auto& previous = plan.replacement_trajectory.waypoints.back();
+    if (const auto failure =
+            segment_limit_failure(previous, wp, accel_limits, jerk_limits_by_index)) {
+      return err(failure->is_jerk()           ? "spring_back_return_jerk_limit_exceeded"
+                 : failure->is_acceleration() ? "spring_back_return_acceleration_limit_exceeded"
+                                              : "spring_back_return_interpolation_invalid",
+                 "spring_back_hold return interpolation exceeds a per-joint limit",
+                 {{"recommended_disposition", "hard_stop"},
+                  {"spring_back_phase", "reverse_return"},
+                  {"joint", accepted_trajectory.joint_names[failure->joint]},
+                  {"interpolation_check", failure->reason},
+                  {"segment_start_s", format_double(previous.time_from_start_s)},
+                  {"segment_end_s", format_double(wp.time_from_start_s)},
+                  {"peak_value", format_double(failure->peak)},
+                  {"limit", format_double(failure->limit)}});
+    }
     plan.replacement_trajectory.waypoints.push_back(std::move(wp));
   }
 
   plan.effective_ramp_s = total_time_s;
-  plan.jerk_limit_source =
-      any_default_jerk && any_deployment_jerk
-          ? "mixed"
-          : (any_deployment_jerk ? "deployment" : "default");
-  plan.diagnostics["stop_mode"] =
-      interrupt_structured_string("spring_back_hold");
-  plan.diagnostics["spring_back_mode"] =
-      interrupt_structured_string("on_path_two_phase");
-  plan.diagnostics["spring_back_forward_time_s"] =
-      format_double(phase_time_s);
-  plan.diagnostics["spring_back_reverse_time_s"] =
-      format_double(phase_time_s);
-  plan.diagnostics["spring_back_total_time_s"] =
-      format_double(total_time_s);
-  plan.diagnostics["spring_back_trip_path_time_s"] =
-      format_double(trip_projection.time_from_start_s);
-  plan.diagnostics["spring_back_stop_path_time_s"] =
-      format_double(stop_projection.time_from_start_s);
-  plan.diagnostics["spring_back_return_distance_path_s"] =
-      format_double(return_distance_s);
+  plan.jerk_limit_source = !config.jerk_limits_enabled ? "disabled"
+                           : any_default_jerk && any_deployment_jerk
+                               ? "mixed"
+                               : (any_deployment_jerk ? "deployment" : "default");
+  plan.diagnostics["stop_mode"] = interrupt_structured_string("spring_back_hold");
+  plan.diagnostics["spring_back_mode"] = interrupt_structured_string("on_path_two_phase");
+  plan.diagnostics["spring_back_forward_time_s"] = format_double(phase_time_s);
+  plan.diagnostics["spring_back_reverse_time_s"] = format_double(phase_time_s);
+  plan.diagnostics["spring_back_total_time_s"] = format_double(total_time_s);
+  plan.diagnostics["spring_back_trip_path_time_s"] = format_double(trip_path_time_s);
+  plan.diagnostics["spring_back_stop_path_time_s"] = format_double(stop_path_time_s);
+  plan.diagnostics["spring_back_return_distance_path_s"] = format_double(return_distance_s);
   plan.diagnostics["spring_back_return_profile"] =
       interrupt_structured_string("quintic_rest_to_rest");
   plan.diagnostics["effective_ramp_s"] = format_double(total_time_s);
-  plan.diagnostics["waypoint_count"] =
-      std::to_string(plan.replacement_trajectory.waypoints.size());
+  plan.diagnostics["waypoint_count"] = std::to_string(plan.replacement_trajectory.waypoints.size());
   return Result<SoftOnPathStopPlanDTO>::Ok(std::move(plan));
 }
 
-Result<SoftOnPathFeasibilityEnvelopeDTO>
-validate_soft_on_path_feasibility_envelope(
-    const TrajectoryDTO& accepted_trajectory,
-    const MotionInterruptStopProfileDTO& stop_profile,
+Result<SoftOnPathFeasibilityEnvelopeDTO> validate_soft_on_path_feasibility_envelope(
+    const TrajectoryDTO& accepted_trajectory, const MotionInterruptStopProfileDTO& stop_profile,
     const SoftOnPathPlannerConfig& config) {
   const auto valid_shape = validate_trajectory_shape(accepted_trajectory);
   if (!valid_shape.ok()) {
     return Result<SoftOnPathFeasibilityEnvelopeDTO>::Err(valid_shape.error());
   }
   if (!finite_positive(config.sample_period_s)) {
-    return Result<SoftOnPathFeasibilityEnvelopeDTO>::Err(ErrorDTO{
-        std::string(to_string(ErrorCode::kInvalidRequest)),
-        "soft_on_path feasibility envelope requires a finite positive sample_period_s",
-        {{"reason", "invalid_sample_period_s"}}});
+    return Result<SoftOnPathFeasibilityEnvelopeDTO>::Err(
+        ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
+                 "soft_on_path feasibility envelope requires a finite positive sample_period_s",
+                 {{"reason", "invalid_sample_period_s"}}});
   }
 
   SoftOnPathPlannerConfig envelope_config = config;
   envelope_config.allow_model_velocity_fallback = true;
 
-  const double start_time =
-      accepted_trajectory.waypoints.front().time_from_start_s;
-  const double end_time =
-      accepted_trajectory.waypoints.back().time_from_start_s;
+  const double start_time = accepted_trajectory.waypoints.front().time_from_start_s;
+  const double end_time = accepted_trajectory.waypoints.back().time_from_start_s;
   const size_t sample_count = std::max<size_t>(
-      1, static_cast<size_t>(
-             std::ceil((end_time - start_time) / config.sample_period_s)));
+      1, static_cast<size_t>(std::ceil((end_time - start_time) / config.sample_period_s)));
 
   SoftOnPathFeasibilityEnvelopeDTO envelope;
   envelope.first_sample_time_from_start_s = start_time;
@@ -1697,8 +1864,7 @@ validate_soft_on_path_feasibility_envelope(
     const double t =
         i == sample_count
             ? end_time
-            : std::min(end_time,
-                       start_time + static_cast<double>(i) * config.sample_period_s);
+            : std::min(end_time, start_time + static_cast<double>(i) * config.sample_period_s);
     const auto sample = sample_path(accepted_trajectory, t);
 
     SoftOnPathInitialStateDTO initial;
@@ -1708,14 +1874,14 @@ validate_soft_on_path_feasibility_envelope(
     initial.position_source = SoftOnPathStateSource::kModelDerived;
     initial.velocity_source = SoftOnPathStateSource::kModelDerived;
     initial.runtime_velocity_scale_at_trip = 1.0;
+    if (accepted_trajectory.runtime_scale_bounds) initial.runtime_scale_target_at_trip = 1.0;
 
-    auto planned = plan_soft_on_path_stop(
-        accepted_trajectory, stop_profile, initial, envelope_config);
+    auto planned =
+        plan_soft_on_path_stop(accepted_trajectory, stop_profile, initial, envelope_config);
     if (!planned.ok()) {
       ErrorDTO error = planned.error();
       const auto reason_it = error.details.find("reason");
-      const std::string planner_reason =
-          reason_it == error.details.end() ? "" : reason_it->second;
+      const std::string planner_reason = reason_it == error.details.end() ? "" : reason_it->second;
       const bool natural_completion_allowed =
           stop_profile.allow_natural_completion_on_short_path &&
           soft_on_path_error_recommends_natural_completion(error);
@@ -1726,8 +1892,7 @@ validate_soft_on_path_feasibility_envelope(
         continue;
       }
       error.code = kErrorMotionInterruptArmFailed;
-      error.message =
-          "soft_on_path feasibility envelope rejected a qualified trip point";
+      error.message = "soft_on_path feasibility envelope rejected a qualified trip point";
       error.details["reason"] = "soft_on_path_feasibility_envelope_infeasible";
       error.details["planner_reason"] = planner_reason;
       error.details["first_infeasible_time_from_start_s"] = format_double(t);
@@ -1743,11 +1908,11 @@ validate_soft_on_path_feasibility_envelope(
 
     envelope.checked_samples += 1;
     envelope.last_sample_time_from_start_s = t;
-    envelope.max_path_deviation_rad = std::max(
-        envelope.max_path_deviation_rad, planned.value().path_deviation_max_rad);
-    envelope.max_initial_velocity_deviation_rad_s = std::max(
-        envelope.max_initial_velocity_deviation_rad_s,
-        planned.value().initial_velocity_deviation_rad_s);
+    envelope.max_path_deviation_rad =
+        std::max(envelope.max_path_deviation_rad, planned.value().path_deviation_max_rad);
+    envelope.max_initial_velocity_deviation_rad_s =
+        std::max(envelope.max_initial_velocity_deviation_rad_s,
+                 planned.value().initial_velocity_deviation_rad_s);
     if (envelope.jerk_limit_source.empty()) {
       envelope.jerk_limit_source = planned.value().jerk_limit_source;
     } else if (envelope.jerk_limit_source != planned.value().jerk_limit_source) {
@@ -1755,69 +1920,58 @@ validate_soft_on_path_feasibility_envelope(
     }
   }
 
-  envelope.diagnostics["checked_samples"] =
-      std::to_string(envelope.checked_samples);
+  envelope.diagnostics["checked_samples"] = std::to_string(envelope.checked_samples);
   envelope.diagnostics["natural_completion_samples"] =
       std::to_string(envelope.natural_completion_samples);
   envelope.diagnostics["first_sample_time_from_start_s"] =
       format_double(envelope.first_sample_time_from_start_s);
   envelope.diagnostics["last_sample_time_from_start_s"] =
       format_double(envelope.last_sample_time_from_start_s);
-  envelope.diagnostics["max_path_deviation_rad"] =
-      format_double(envelope.max_path_deviation_rad);
+  envelope.diagnostics["max_path_deviation_rad"] = format_double(envelope.max_path_deviation_rad);
   envelope.diagnostics["max_initial_velocity_deviation_rad_s"] =
       format_double(envelope.max_initial_velocity_deviation_rad_s);
   envelope.diagnostics["jerk_limit_source"] = envelope.jerk_limit_source;
   return Result<SoftOnPathFeasibilityEnvelopeDTO>::Ok(std::move(envelope));
 }
 
-bool soft_on_path_error_recommends_natural_completion(
-    const ErrorDTO& error) {
+bool soft_on_path_error_recommends_natural_completion(const ErrorDTO& error) {
   const auto reason_it = error.details.find("reason");
   const auto disposition_it = error.details.find("recommended_disposition");
   return reason_it != error.details.end() &&
          reason_it->second == "soft_on_path_remaining_time_short" &&
-         disposition_it != error.details.end() &&
-         disposition_it->second == "natural_completion";
+         disposition_it != error.details.end() && disposition_it->second == "natural_completion";
 }
 
 bool soft_on_path_error_recommends_hard_stop(const ErrorDTO& error) {
   const auto disposition_it = error.details.find("recommended_disposition");
-  return disposition_it != error.details.end() &&
-         disposition_it->second == "hard_stop";
+  return disposition_it != error.details.end() && disposition_it->second == "hard_stop";
 }
 
-Result<double> measure_soft_on_path_path_deviation(
-    const TrajectoryDTO& accepted_trajectory,
-    const RobotStateDTO& observed_state) {
+Result<double> measure_soft_on_path_path_deviation(const TrajectoryDTO& accepted_trajectory,
+                                                   const RobotStateDTO& observed_state) {
   const auto valid_shape = validate_trajectory_shape(accepted_trajectory);
   if (!valid_shape.ok()) {
     return Result<double>::Err(valid_shape.error());
   }
   const auto ordered_state_result =
-      order_state_for_trajectory(observed_state,
-                                 accepted_trajectory.joint_names);
+      order_state_for_trajectory(observed_state, accepted_trajectory.joint_names);
   if (!ordered_state_result.ok()) {
     return Result<double>::Err(ordered_state_result.error());
   }
-  const Projection projection = project_to_path(
-      accepted_trajectory, ordered_state_result.value().positions);
+  const Projection projection =
+      project_to_path(accepted_trajectory, ordered_state_result.value().positions);
   if (!std::isfinite(projection.distance_rad)) {
-    return Result<double>::Err(ErrorDTO{
-        std::string(to_string(ErrorCode::kMotionInterruptStopStateInvalid)),
-        "soft_on_path could not project observed feedback onto the accepted path",
-        {{"reason", "path_deviation_projection_failed"}}});
+    return Result<double>::Err(
+        ErrorDTO{std::string(to_string(ErrorCode::kMotionInterruptStopStateInvalid)),
+                 "soft_on_path could not project observed feedback onto the accepted path",
+                 {{"reason", "path_deviation_projection_failed"}}});
   }
   return Result<double>::Ok(projection.distance_rad);
 }
 
 Result<TrajectoryDTO> shift_soft_stop_for_dispatch_latency(
-    const TrajectoryDTO& planned,
-    double compute_latency_s,
-    double lead_in_budget_s,
-    const TrajectoryDTO& accepted_trajectory,
-    double command_cursor_s,
-    double path_time_rate,
+    const TrajectoryDTO& planned, double compute_latency_s, double lead_in_budget_s,
+    const TrajectoryDTO& accepted_trajectory, double command_cursor_s, double path_time_rate,
     const DispatchLatencyShiftConfig& config) {
   const auto valid_shape = validate_trajectory_shape(planned);
   if (!valid_shape.ok()) {
@@ -1828,34 +1982,31 @@ Result<TrajectoryDTO> shift_soft_stop_for_dispatch_latency(
     return Result<TrajectoryDTO>::Err(valid_accepted.error());
   }
   if (!std::isfinite(compute_latency_s) || compute_latency_s < 0.0) {
-    return Result<TrajectoryDTO>::Err(ErrorDTO{
-        std::string(to_string(ErrorCode::kInvalidRequest)),
-        "dispatch-latency shift requires a finite, non-negative compute latency",
-        {{"reason", "invalid_compute_latency_s"},
-         {"compute_latency_s", format_double(compute_latency_s)}}});
+    return Result<TrajectoryDTO>::Err(
+        ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
+                 "dispatch-latency shift requires a finite, non-negative compute latency",
+                 {{"reason", "invalid_compute_latency_s"},
+                  {"compute_latency_s", format_double(compute_latency_s)}}});
   }
   if (!finite_positive(lead_in_budget_s)) {
-    return Result<TrajectoryDTO>::Err(ErrorDTO{
-        std::string(to_string(ErrorCode::kInvalidRequest)),
-        "dispatch-latency shift requires a finite, positive lead-in budget",
-        {{"reason", "invalid_lead_in_budget_s"},
-         {"lead_in_budget_s", format_double(lead_in_budget_s)}}});
+    return Result<TrajectoryDTO>::Err(
+        ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
+                 "dispatch-latency shift requires a finite, positive lead-in budget",
+                 {{"reason", "invalid_lead_in_budget_s"},
+                  {"lead_in_budget_s", format_double(lead_in_budget_s)}}});
   }
   if (!std::isfinite(path_time_rate) || path_time_rate < 0.0) {
     return Result<TrajectoryDTO>::Err(ErrorDTO{
         std::string(to_string(ErrorCode::kInvalidRequest)),
         "dispatch-latency shift requires a finite, non-negative path_time_rate",
-        {{"reason", "invalid_path_time_rate"},
-         {"path_time_rate", format_double(path_time_rate)}}});
+        {{"reason", "invalid_path_time_rate"}, {"path_time_rate", format_double(path_time_rate)}}});
   }
-  if (!std::isfinite(config.anchor_negative_time_s) ||
-      config.anchor_negative_time_s >= 0.0) {
-    return Result<TrajectoryDTO>::Err(ErrorDTO{
-        std::string(to_string(ErrorCode::kInvalidRequest)),
-        "dispatch-latency anchor time must be finite and negative",
-        {{"reason", "invalid_anchor_negative_time_s"},
-         {"anchor_negative_time_s",
-          format_double(config.anchor_negative_time_s)}}});
+  if (!std::isfinite(config.anchor_negative_time_s) || config.anchor_negative_time_s >= 0.0) {
+    return Result<TrajectoryDTO>::Err(
+        ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
+                 "dispatch-latency anchor time must be finite and negative",
+                 {{"reason", "invalid_anchor_negative_time_s"},
+                  {"anchor_negative_time_s", format_double(config.anchor_negative_time_s)}}});
   }
 
   // Reliability guard: if the compute+dispatch latency consumed the command-frame
@@ -1864,13 +2015,13 @@ Result<TrajectoryDTO> shift_soft_stop_for_dispatch_latency(
   // (a slow planner — e.g. the ALI/backtracking tail — or a too-small lead-in),
   // not the common few-ms case.
   if (compute_latency_s >= lead_in_budget_s) {
-    return Result<TrajectoryDTO>::Err(ErrorDTO{
-        std::string(to_string(ErrorCode::kMotionInterruptBackendStopFailed)),
-        "dispatch latency consumed the lead-in budget; escalate to hard stop",
-        {{"reason", "dispatch_latency_exceeds_lead_in"},
-         {"recommended_disposition", "hard_stop"},
-         {"compute_latency_s", format_double(compute_latency_s)},
-         {"lead_in_budget_s", format_double(lead_in_budget_s)}}});
+    return Result<TrajectoryDTO>::Err(
+        ErrorDTO{std::string(to_string(ErrorCode::kMotionInterruptBackendStopFailed)),
+                 "dispatch latency consumed the lead-in budget; escalate to hard stop",
+                 {{"reason", "dispatch_latency_exceeds_lead_in"},
+                  {"recommended_disposition", "hard_stop"},
+                  {"compute_latency_s", format_double(compute_latency_s)},
+                  {"lead_in_budget_s", format_double(lead_in_budget_s)}}});
   }
 
   const size_t joint_count = planned.joint_names.size();
@@ -1883,10 +2034,8 @@ Result<TrajectoryDTO> shift_soft_stop_for_dispatch_latency(
   // full q, qdot, qddot sampled from the accepted trajectory — command-frame, not
   // a measured or partial (qddot=0) state — so stock JTC's spline starts through
   // the live command frame.
-  const double advanced_cursor_s =
-      command_cursor_s + path_time_rate * compute_latency_s;
-  const PathSample pin_sample =
-      sample_path(accepted_trajectory, advanced_cursor_s);
+  const double advanced_cursor_s = command_cursor_s + path_time_rate * compute_latency_s;
+  const PathSample pin_sample = sample_path(accepted_trajectory, advanced_cursor_s);
   TrajectoryWaypointDTO anchor_wp;
   anchor_wp.time_from_start_s = config.anchor_negative_time_s;
   anchor_wp.positions_rad = pin_sample.position;
@@ -1914,21 +2063,19 @@ Result<TrajectoryDTO> shift_soft_stop_for_dispatch_latency(
   }
 
   if (kept == 0) {
-    return Result<TrajectoryDTO>::Err(ErrorDTO{
-        std::string(to_string(ErrorCode::kMotionInterruptBackendStopFailed)),
-        "dispatch latency consumed every replacement waypoint; escalate to hard stop",
-        {{"reason", "dispatch_latency_consumed_all_waypoints"},
-         {"recommended_disposition", "hard_stop"},
-         {"compute_latency_s", format_double(compute_latency_s)}}});
+    return Result<TrajectoryDTO>::Err(
+        ErrorDTO{std::string(to_string(ErrorCode::kMotionInterruptBackendStopFailed)),
+                 "dispatch latency consumed every replacement waypoint; escalate to hard stop",
+                 {{"reason", "dispatch_latency_consumed_all_waypoints"},
+                  {"recommended_disposition", "hard_stop"},
+                  {"compute_latency_s", format_double(compute_latency_s)}}});
   }
 
   return Result<TrajectoryDTO>::Ok(std::move(shifted));
 }
 
 Result<SoftOnPathMinStopTimeDTO> compute_soft_on_path_min_stop_time(
-    const TrajectoryDTO& accepted_trajectory,
-    double trip_path_time_s,
-    double trip_path_rate,
+    const TrajectoryDTO& accepted_trajectory, double trip_path_time_s, double trip_path_rate,
     const std::map<std::string, double>& per_joint_max_deceleration_rad_s2,
     double integration_step_s) {
   const auto valid_shape = validate_trajectory_shape(accepted_trajectory);
@@ -1936,39 +2083,32 @@ Result<SoftOnPathMinStopTimeDTO> compute_soft_on_path_min_stop_time(
     return Result<SoftOnPathMinStopTimeDTO>::Err(valid_shape.error());
   }
   auto invalid = [](std::string reason, std::string message) {
-    return Result<SoftOnPathMinStopTimeDTO>::Err(ErrorDTO{
-        std::string(to_string(ErrorCode::kInvalidRequest)), std::move(message),
-        {{"reason", std::move(reason)}}});
+    return Result<SoftOnPathMinStopTimeDTO>::Err(
+        ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
+                 std::move(message),
+                 {{"reason", std::move(reason)}}});
   };
   if (!std::isfinite(trip_path_rate) || trip_path_rate < 0.0) {
-    return invalid("invalid_trip_path_rate",
-                   "trip_path_rate must be finite and non-negative");
+    return invalid("invalid_trip_path_rate", "trip_path_rate must be finite and non-negative");
   }
   if (!finite_positive(integration_step_s)) {
-    return invalid("invalid_integration_step_s",
-                   "integration_step_s must be finite and positive");
+    return invalid("invalid_integration_step_s", "integration_step_s must be finite and positive");
   }
   const size_t joint_count = accepted_trajectory.joint_names.size();
   std::vector<double> max_decel(joint_count, 0.0);
   for (size_t j = 0; j < joint_count; ++j) {
-    const auto it = per_joint_max_deceleration_rad_s2.find(
-        accepted_trajectory.joint_names[j]);
-    if (it == per_joint_max_deceleration_rad_s2.end() ||
-        !finite_positive(it->second)) {
-      return invalid(
-          "missing_per_joint_max_deceleration",
-          "per-joint max deceleration missing or non-positive for " +
-              accepted_trajectory.joint_names[j]);
+    const auto it = per_joint_max_deceleration_rad_s2.find(accepted_trajectory.joint_names[j]);
+    if (it == per_joint_max_deceleration_rad_s2.end() || !finite_positive(it->second)) {
+      return invalid("missing_per_joint_max_deceleration",
+                     "per-joint max deceleration missing or non-positive for " +
+                         accepted_trajectory.joint_names[j]);
     }
     max_decel[j] = it->second;
   }
 
-  const double path_start_s =
-      accepted_trajectory.waypoints.front().time_from_start_s;
-  const double path_end_s =
-      accepted_trajectory.waypoints.back().time_from_start_s;
-  if (!std::isfinite(trip_path_time_s) ||
-      trip_path_time_s < path_start_s - kEpsilon ||
+  const double path_start_s = accepted_trajectory.waypoints.front().time_from_start_s;
+  const double path_end_s = accepted_trajectory.waypoints.back().time_from_start_s;
+  if (!std::isfinite(trip_path_time_s) || trip_path_time_s < path_start_s - kEpsilon ||
       trip_path_time_s > path_end_s + kEpsilon) {
     return invalid("invalid_trip_path_time",
                    "trip_path_time_s must be finite and inside the accepted "
@@ -2060,8 +2200,7 @@ Result<SoftOnPathMinStopTimeDTO> compute_soft_on_path_min_stop_time(
     by_name[j] = j;
   }
   std::sort(by_name.begin(), by_name.end(), [&](size_t a, size_t b) {
-    return accepted_trajectory.joint_names[a] <
-           accepted_trajectory.joint_names[b];
+    return accepted_trajectory.joint_names[a] < accepted_trajectory.joint_names[b];
   });
   int best = 0;
   for (const size_t j : by_name) {
@@ -2074,44 +2213,36 @@ Result<SoftOnPathMinStopTimeDTO> compute_soft_on_path_min_stop_time(
 }
 
 Result<JerkLimitedStopProfileDTO> compute_jerk_limited_stop_profile(
-    const TrajectoryDTO& accepted_trajectory,
-    double start_path_time_s,
-    double start_path_rate,
-    double start_path_rate_accel,
-    double target_stop_time_s,
+    const TrajectoryDTO& accepted_trajectory, double start_path_time_s, double start_path_rate,
+    double start_path_rate_accel, double target_stop_time_s,
     const std::map<std::string, double>& per_joint_max_deceleration_rad_s2,
-    const std::map<std::string, double>& per_joint_max_jerk_rad_s3,
-    double sample_period_s) {
+    const std::map<std::string, double>& per_joint_max_jerk_rad_s3, double sample_period_s) {
   const auto valid_shape = validate_trajectory_shape(accepted_trajectory);
   if (!valid_shape.ok()) {
     return Result<JerkLimitedStopProfileDTO>::Err(valid_shape.error());
   }
   auto invalid = [](std::string reason, std::string message) {
-    return Result<JerkLimitedStopProfileDTO>::Err(ErrorDTO{
-        std::string(to_string(ErrorCode::kInvalidRequest)), std::move(message),
-        {{"reason", std::move(reason)}}});
+    return Result<JerkLimitedStopProfileDTO>::Err(
+        ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
+                 std::move(message),
+                 {{"reason", std::move(reason)}}});
   };
   if (!std::isfinite(start_path_rate) || start_path_rate <= 0.0) {
     return invalid("invalid_start_path_rate",
                    "jerk-limited retimer requires a positive start_path_rate");
   }
   if (!std::isfinite(start_path_rate_accel)) {
-    return invalid("invalid_start_path_rate_accel",
-                   "start_path_rate_accel must be finite");
+    return invalid("invalid_start_path_rate_accel", "start_path_rate_accel must be finite");
   }
-  const double path_start_s =
-      accepted_trajectory.waypoints.front().time_from_start_s;
-  const double path_end_s =
-      accepted_trajectory.waypoints.back().time_from_start_s;
-  if (!std::isfinite(start_path_time_s) ||
-      start_path_time_s < path_start_s - kEpsilon ||
+  const double path_start_s = accepted_trajectory.waypoints.front().time_from_start_s;
+  const double path_end_s = accepted_trajectory.waypoints.back().time_from_start_s;
+  if (!std::isfinite(start_path_time_s) || start_path_time_s < path_start_s - kEpsilon ||
       start_path_time_s > path_end_s + kEpsilon) {
     return invalid("invalid_start_path_time",
                    "start_path_time_s must be finite and inside the accepted "
                    "trajectory time range");
   }
-  if (!finite_positive(target_stop_time_s) ||
-      !finite_positive(sample_period_s)) {
+  if (!finite_positive(target_stop_time_s) || !finite_positive(sample_period_s)) {
     return invalid("invalid_retimer_timing",
                    "jerk-limited retimer requires positive target_stop_time_s "
                    "and sample_period_s");
@@ -2123,47 +2254,66 @@ Result<JerkLimitedStopProfileDTO> compute_jerk_limited_stop_profile(
     const auto& name = accepted_trajectory.joint_names[j];
     const auto d_it = per_joint_max_deceleration_rad_s2.find(name);
     const auto j_it = per_joint_max_jerk_rad_s3.find(name);
-    if (d_it == per_joint_max_deceleration_rad_s2.end() ||
-        !finite_positive(d_it->second) ||
-        j_it == per_joint_max_jerk_rad_s3.end() ||
-        !finite_positive(j_it->second)) {
-      return invalid(
-          "missing_per_joint_limit",
-          "per-joint deceleration and jerk limits are required for " + name);
+    if (d_it == per_joint_max_deceleration_rad_s2.end() || !finite_positive(d_it->second) ||
+        j_it == per_joint_max_jerk_rad_s3.end() || !finite_positive(j_it->second)) {
+      return invalid("missing_per_joint_limit",
+                     "per-joint deceleration and jerk limits are required for " + name);
     }
     max_decel[j] = d_it->second;
     max_jerk[j] = j_it->second;
   }
   constexpr double kBig = 1e18;
-  const double target_time_tolerance_s =
-      std::max(2.0 * sample_period_s, 1e-3);
+  const double target_time_tolerance_s = std::max(2.0 * sample_period_s, 1e-3);
   constexpr double kTerminalTolerance = 1e-3;
   constexpr double kAccelTolerance = 1e-6;
   constexpr double kJerkTolerance = 1e-6;
   constexpr double kEnvelopeSafetyMargin = 0.8;
 
+  if (auto candidate = detail::affine_path_stop_candidate(
+          accepted_trajectory, start_path_time_s, start_path_rate, start_path_rate_accel,
+          target_stop_time_s, max_decel, max_jerk)) {
+    const auto& points = candidate->emitted_trajectory.waypoints;
+    bool within_limits = validate_trajectory_shape(candidate->emitted_trajectory).ok();
+    for (size_t i = 1; within_limits && i < points.size(); ++i)
+      within_limits = !segment_limit_failure(points[i - 1], points[i], max_decel, max_jerk);
+    if (within_limits) {
+      candidate->within_budget = candidate->dispatchable = true;
+      return Result<JerkLimitedStopProfileDTO>::Ok(std::move(*candidate));
+    }
+  }
+
   PathCursor path_cursor(accepted_trajectory);
 
-  // Path-rate accel budget [lo, hi] and a conservative path-rate jerk bound at
-  // (sample, v). The jerk bound limits |q'·d(ü)/dt| <= J_j (the controllable
-  // term); residual analytic jerk terms are caught by the output check below.
-  auto budgets = [&](const PathSample& smp, double v, double* lo, double* hi,
-                     double* jpath) -> bool {
-    *lo = 0.0;
-    *hi = 0.0;
-    *jpath = kBig;
+  // Intersect signed path-acceleration and path-jerk intervals for every joint:
+  // q_ddot = q'' v² + q' a; q_jerk = q''' v³ + 3 q'' v a + q' jerk.
+  // The residual terms can add to OR cancel the controllable term. These
+  // instantaneous budgets guide the search; emitted-curve validation below
+  // still checks the whole replacement, including segment boundaries.
+  auto budgets = [&](const PathSample& smp, double v, double a, double* lo, double* hi,
+                     double* jerk_lo, double* jerk_hi) -> bool {
+    *lo = -kBig;
+    *hi = kBig;
+    *jerk_lo = -kBig;
+    *jerk_hi = kBig;
     bool found = false;
     for (size_t j = 0; j < joint_count; ++j) {
       const double qp = smp.d_position_dt[j];
       const double curvature = smp.d2_position_dt2[j] * v * v;
       const double accel_budget = kEnvelopeSafetyMargin * max_decel[j];
+      const double residual_jerk =
+          smp.d3_position_dt3[j] * v * v * v + 3.0 * smp.d2_position_dt2[j] * v * a;
+      const double jerk_budget = kEnvelopeSafetyMargin * max_jerk[j];
+      if (!std::isfinite(qp) || !std::isfinite(curvature) || !std::isfinite(residual_jerk)) {
+        *lo = 1.0;
+        *hi = 0.0;
+        return true;
+      }
       if (std::abs(qp) <= kEpsilon) {
-        if (std::abs(curvature) > accel_budget + kAccelTolerance) {
-          // No path-rate acceleration can help this joint: q' is zero, while
-          // q'' * u_dot^2 already violates the joint acceleration budget.
+        if (std::abs(curvature) > accel_budget + kAccelTolerance ||
+            std::abs(residual_jerk) > jerk_budget + kJerkTolerance) {
+          // A zero tangent cannot compensate a residual derivative violation.
           *lo = 1.0;
           *hi = 0.0;
-          *jpath = 0.0;
           return true;
         }
         continue;
@@ -2176,14 +2326,16 @@ Result<JerkLimitedStopProfileDTO> compute_jerk_limited_stop_profile(
       if (!found || std::max(bound_a, bound_b) < *hi) {
         *hi = std::max(bound_a, bound_b);
       }
-      *jpath = std::min(*jpath, max_jerk[j] / std::abs(qp));
+      const double jerk_a = (-jerk_budget - residual_jerk) / qp;
+      const double jerk_b = (jerk_budget - residual_jerk) / qp;
+      *jerk_lo = std::max(*jerk_lo, std::min(jerk_a, jerk_b));
+      *jerk_hi = std::min(*jerk_hi, std::max(jerk_a, jerk_b));
       found = true;
     }
     return found;
   };
 
-  auto solve_velocity_zero = [](double v, double a, double j,
-                                double fallback_dt) {
+  auto solve_velocity_zero = [](double v, double a, double j, double fallback_dt) {
     if (std::abs(j) <= kEpsilon) {
       return a < -kEpsilon ? std::max(0.0, -v / a) : fallback_dt;
     }
@@ -2209,43 +2361,18 @@ Result<JerkLimitedStopProfileDTO> compute_jerk_limited_stop_profile(
     double max_path_rate = 0.0;
   };
 
-  // Envelope-point scratch buffers: the rate cap needs the point sample
-  // plus the two finite-difference neighbors. The neighbor samples depend
-  // only on `s`, not on the joint, so they are taken once per point and
-  // shared by every joint's third-derivative estimate (previously they
-  // were re-sampled per joint: (1 + 2·J) samples per point instead of 3).
+  // The backward envelope is an acceleration search hint, not a jerk proof.
+  // A q'''-only rate cap would exclude valid cancellation by the other two
+  // chain-rule terms. Jerk is budgeted together at the actual forward state.
   PathSample cap_sample;
-  PathSample cap_left;
-  PathSample cap_right;
 
   auto local_rate_cap = [&](double s) {
     path_cursor.sample(s, cap_sample);
-    const double span = std::max(path_end_s - path_start_s, kEpsilon);
-    const double h = std::min(std::max(sample_period_s, 1e-3), 0.01 * span);
-    const double left = std::max(path_start_s, s - h);
-    const double right = std::min(path_end_s, s + h);
-    const bool fd_valid = right > left + kEpsilon;
-    if (fd_valid) {
-      path_cursor.sample(left, cap_left);
-      path_cursor.sample(right, cap_right);
-    }
-    double cap = kBig;
+    double cap = accepted_trajectory.runtime_scale_bounds ? 1.0 : kBig;
     for (size_t j = 0; j < joint_count; ++j) {
       const double curvature = std::abs(cap_sample.d2_position_dt2[j]);
       if (curvature > kEpsilon) {
-        cap = std::min(
-            cap, std::sqrt((kEnvelopeSafetyMargin * max_decel[j]) / curvature));
-      }
-      double third = 0.0;
-      if (fd_valid && j < cap_left.d2_position_dt2.size() &&
-          j < cap_right.d2_position_dt2.size()) {
-        third = (cap_right.d2_position_dt2[j] - cap_left.d2_position_dt2[j]) /
-                (right - left);
-      }
-      const double q3 = std::abs(third);
-      if (q3 > kEpsilon) {
-        cap = std::min(
-            cap, std::cbrt((kEnvelopeSafetyMargin * max_jerk[j]) / q3));
+        cap = std::min(cap, std::sqrt((kEnvelopeSafetyMargin * max_decel[j]) / curvature));
       }
     }
     return cap;
@@ -2268,11 +2395,9 @@ Result<JerkLimitedStopProfileDTO> compute_jerk_limited_stop_profile(
   {
     const double remaining = path_end_s - start_path_time_s;
     if (remaining > kEpsilon) {
-      const double nominal_step =
-          std::max(0.002, sample_period_s * std::max(start_path_rate, 0.1));
+      const double nominal_step = std::max(0.002, sample_period_s * std::max(start_path_rate, 0.1));
       const size_t steps = std::max<size_t>(
-          1, std::min<size_t>(
-                 4000, static_cast<size_t>(std::ceil(remaining / nominal_step))));
+          1, std::min<size_t>(4000, static_cast<size_t>(std::ceil(remaining / nominal_step))));
       backward_envelope.resize(steps + 1);
       for (size_t i = 0; i <= steps; ++i) {
         const double alpha = static_cast<double>(i) / static_cast<double>(steps);
@@ -2282,18 +2407,15 @@ Result<JerkLimitedStopProfileDTO> compute_jerk_limited_stop_profile(
       }
       backward_envelope.back().max_path_rate = 0.0;
       for (size_t i = steps; i-- > 0;) {
-        const double ds = std::max(
-            0.0, backward_envelope[i + 1].path_time_s -
-                     backward_envelope[i].path_time_s);
-        const double decel_cap = local_path_decel_cap(
-            backward_envelope[i].path_time_s);
+        const double ds =
+            std::max(0.0, backward_envelope[i + 1].path_time_s - backward_envelope[i].path_time_s);
+        const double decel_cap = local_path_decel_cap(backward_envelope[i].path_time_s);
         const double reachable =
             decel_cap >= kBig / 2.0
                 ? backward_envelope[i + 1].max_path_rate
-                : std::sqrt(std::max(
-                      0.0, backward_envelope[i + 1].max_path_rate *
-                                 backward_envelope[i + 1].max_path_rate +
-                             2.0 * decel_cap * ds));
+                : std::sqrt(std::max(0.0, backward_envelope[i + 1].max_path_rate *
+                                                  backward_envelope[i + 1].max_path_rate +
+                                              2.0 * decel_cap * ds));
         backward_envelope[i].max_path_rate =
             std::min(backward_envelope[i].max_path_rate, reachable);
       }
@@ -2312,9 +2434,7 @@ Result<JerkLimitedStopProfileDTO> compute_jerk_limited_stop_profile(
     }
     auto it = std::lower_bound(
         backward_envelope.begin(), backward_envelope.end(), s,
-        [](const BackwardEnvelopePoint& point, double value) {
-          return point.path_time_s < value;
-        });
+        [](const BackwardEnvelopePoint& point, double value) { return point.path_time_s < value; });
     if (it == backward_envelope.begin()) {
       return it->max_path_rate;
     }
@@ -2322,8 +2442,7 @@ Result<JerkLimitedStopProfileDTO> compute_jerk_limited_stop_profile(
     const auto& left = *(it - 1);
     const double span = std::max(right.path_time_s - left.path_time_s, kEpsilon);
     const double alpha = std::clamp((s - left.path_time_s) / span, 0.0, 1.0);
-    return left.max_path_rate +
-           alpha * (right.max_path_rate - left.max_path_rate);
+    return left.max_path_rate + alpha * (right.max_path_rate - left.max_path_rate);
   };
 
   // Forward-integrate with target path-rate deceleration `a_decel`: slew ü
@@ -2331,10 +2450,8 @@ Result<JerkLimitedStopProfileDTO> compute_jerk_limited_stop_profile(
   // zero on the S-curve approach to rest (start when ramping ü->0 lands exactly
   // at u̇=0). Records (t, s, u̇, ü) samples; returns (stop_time, reaches_rest).
   PathSample integrate_sample;
-  auto integrate = [&](double a_decel,
-                       std::vector<JerkLimitedStopSampleDTO>* out,
-                       bool* used_envelope)
-      -> std::pair<double, bool> {
+  auto integrate = [&](double a_decel, std::vector<JerkLimitedStopSampleDTO>* out,
+                       bool* used_envelope) -> std::pair<double, bool> {
     double s = start_path_time_s;
     double v = start_path_rate;
     double a = start_path_rate_accel;
@@ -2350,11 +2467,11 @@ Result<JerkLimitedStopProfileDTO> compute_jerk_limited_stop_profile(
       const PathSample& smp = integrate_sample;
       double lo = 0.0;
       double hi = 0.0;
-      double jpath = kBig;
-      if (!budgets(smp, v, &lo, &hi, &jpath)) {
+      double jerk_lo = -kBig;
+      double jerk_hi = kBig;
+      if (!budgets(smp, v, a, &lo, &hi, &jerk_lo, &jerk_hi)) {
         if (out) {
-          if (out->empty() ||
-              std::abs(out->back().time_from_ramp_start_s - t) > kEpsilon) {
+          if (out->empty() || std::abs(out->back().time_from_ramp_start_s - t) > kEpsilon) {
             out->push_back({t, s, 0.0, 0.0});
           } else {
             out->back() = {t, s, 0.0, 0.0};
@@ -2363,14 +2480,10 @@ Result<JerkLimitedStopProfileDTO> compute_jerk_limited_stop_profile(
         return {t, true};
       }
       const double hi_eff = std::min(hi, 0.0);
-      if (lo > hi_eff + kAccelTolerance) {
+      if (lo > hi_eff + kAccelTolerance || jerk_lo > jerk_hi) {
         return {t, false};
       }
-      // Use a fraction of the path-rate jerk bound so the finite-difference
-      // jerk of the executed acceleration (which also picks up q''/q''' terms)
-      // keeps margin under the per-joint limit.
-      const double jpath_eff = 0.5 * jpath;
-      if (!finite_positive(jpath_eff)) {
+      if (!std::isfinite(jerk_lo) || !std::isfinite(jerk_hi)) {
         return {t, false};
       }
       double jerk = 0.0;
@@ -2381,10 +2494,9 @@ Result<JerkLimitedStopProfileDTO> compute_jerk_limited_stop_profile(
         const double required_accel_now = -2.0 * v / remaining_to_target;
         const double jerk_to_zero_at_target = -a / remaining_to_target;
         const double accel_margin =
-            std::abs(required_accel_now) * 0.05 + jpath_eff * dt;
-        if (a <= required_accel_now + accel_margin &&
-            jerk_to_zero_at_target >= -kEpsilon &&
-            jerk_to_zero_at_target <= jpath_eff + kEpsilon) {
+            std::abs(required_accel_now) * 0.05 + std::max(0.0, jerk_hi) * dt;
+        if (a <= required_accel_now + accel_margin && jerk_to_zero_at_target >= jerk_lo &&
+            jerk_to_zero_at_target <= jerk_hi) {
           // Target-aware terminal branch: ramp path acceleration to zero at the
           // requested stop time. Bisection tunes the preceding decel so velocity
           // reaches zero at the same instant.
@@ -2395,60 +2507,54 @@ Result<JerkLimitedStopProfileDTO> compute_jerk_limited_stop_profile(
           }
         }
       }
-      if (a < -kEpsilon && v > kEpsilon) {
-        const double terminal_velocity_at_max_jerk =
-            (a * a) / (2.0 * jpath_eff);
-        const double one_step_velocity_margin =
-            std::abs(a) * dt + 0.5 * jpath_eff * dt * dt;
+      if (a < -kEpsilon && v > kEpsilon && jerk_hi > kEpsilon) {
+        const double terminal_velocity_at_max_jerk = (a * a) / (2.0 * jerk_hi);
+        const double one_step_velocity_margin = std::abs(a) * dt + 0.5 * jerk_hi * dt * dt;
         if (!target_terminal_branch &&
-            v <= terminal_velocity_at_max_jerk +
-                     one_step_velocity_margin + kEpsilon) {
+            v <= terminal_velocity_at_max_jerk + one_step_velocity_margin + kEpsilon) {
           // Terminal S-curve branch. Wait until the max-jerk terminal envelope
           // is close, then use the exact jerk when it is within the bound. This
           // avoids starting an extremely gentle endpoint ramp while the robot is
           // still far from rest.
           const double endpoint_jerk = (a * a) / (2.0 * v);
-          jerk = std::min(endpoint_jerk, jpath_eff);
+          jerk = std::clamp(endpoint_jerk, jerk_lo, jerk_hi);
         }
       }
       const double envelope_rate =
-          std::min(envelope_rate_at(s),
-                   envelope_rate_at(std::min(path_end_s, s + v * dt_step)));
+          std::min(envelope_rate_at(s), envelope_rate_at(std::min(path_end_s, s + v * dt_step)));
       double desired = -a_decel;
       const bool envelope_binding =
           std::isfinite(envelope_rate) &&
           (v > envelope_rate + std::max(1e-6, 0.01 * envelope_rate) ||
-           v + desired * dt_step >
-               envelope_rate + std::max(1e-6, 0.01 * envelope_rate));
+           v + desired * dt_step > envelope_rate + std::max(1e-6, 0.01 * envelope_rate));
       if (envelope_binding) {
         if (used_envelope != nullptr) {
           *used_envelope = true;
         }
         // Search and emitted integration must use identical dynamics;
         // requesting a diagnostic must never change the candidate.
-        desired = std::min(desired, (envelope_rate - v) /
-                                        std::max(dt_step, kEpsilon));
+        desired = std::min(desired, (envelope_rate - v) / std::max(dt_step, kEpsilon));
       }
       if (std::abs(jerk) <= kEpsilon) {
-        const double slew = jpath_eff * dt_step;
         const double target = std::clamp(desired, std::min(lo, hi_eff), hi_eff);
-        jerk = std::clamp(target - a, -slew, slew) /
-               std::max(dt_step, kEpsilon);
+        jerk = std::clamp((target - a) / std::max(dt_step, kEpsilon), jerk_lo, jerk_hi);
       }
 
       const double a_next = a + jerk * dt_step;
-      const double v_next =
-          v + a * dt_step + 0.5 * jerk * dt_step * dt_step;
+      const double v_next = v + a * dt_step + 0.5 * jerk * dt_step * dt_step;
+      if (accepted_trajectory.runtime_scale_bounds) {
+        const double rate_interval =
+            v_next <= 0.0 ? std::clamp(solve_velocity_zero(v, a, jerk, dt_step), 0.0, dt_step)
+                          : dt_step;
+        if (!constant_jerk_rate_within_unit_range(v, a, jerk, rate_interval)) return {t, false};
+      }
       if (target_terminal_branch && dt_step < dt + kEpsilon &&
           std::abs(remaining_to_target - dt_step) <= kEpsilon &&
-          std::abs(v_next) <= kTerminalTolerance &&
-          std::abs(a_next) <= kTerminalTolerance) {
-        s += v * dt_step + 0.5 * a * dt_step * dt_step +
-             (jerk * dt_step * dt_step * dt_step) / 6.0;
+          std::abs(v_next) <= kTerminalTolerance && std::abs(a_next) <= kTerminalTolerance) {
+        s += v * dt_step + 0.5 * a * dt_step * dt_step + (jerk * dt_step * dt_step * dt_step) / 6.0;
         t += dt_step;
         if (out) {
-          if (out->empty() ||
-              t > out->back().time_from_ramp_start_s + kEpsilon) {
+          if (out->empty() || t > out->back().time_from_ramp_start_s + kEpsilon) {
             out->push_back({t, s, 0.0, 0.0});
           } else {
             out->back() = {t, s, 0.0, 0.0};
@@ -2457,22 +2563,18 @@ Result<JerkLimitedStopProfileDTO> compute_jerk_limited_stop_profile(
         return {t, s <= path_end_s + kEpsilon};
       }
       if (v_next <= 0.0) {
-        const double dt_zero = std::clamp(
-            solve_velocity_zero(v, a, jerk, dt_step), 0.0, dt_step);
-        s += v * dt_zero + 0.5 * a * dt_zero * dt_zero +
-             (jerk * dt_zero * dt_zero * dt_zero) / 6.0;
+        const double dt_zero = std::clamp(solve_velocity_zero(v, a, jerk, dt_step), 0.0, dt_step);
+        s += v * dt_zero + 0.5 * a * dt_zero * dt_zero + (jerk * dt_zero * dt_zero * dt_zero) / 6.0;
         t += dt_zero;
         const double terminal_accel = a + jerk * dt_zero;
         const bool stop_time_matches_target =
             std::abs(t - target_stop_time_s) <= target_time_tolerance_s;
         const double emitted_accel =
-            (stop_time_matches_target ||
-             std::abs(terminal_accel) <= kTerminalTolerance)
+            (stop_time_matches_target || std::abs(terminal_accel) <= kTerminalTolerance)
                 ? 0.0
                 : terminal_accel;
         if (out) {
-          if (out->empty() ||
-              t > out->back().time_from_ramp_start_s + kEpsilon) {
+          if (out->empty() || t > out->back().time_from_ramp_start_s + kEpsilon) {
             out->push_back({t, s, 0.0, emitted_accel});
           } else {
             out->back() = {t, s, 0.0, emitted_accel};
@@ -2481,8 +2583,7 @@ Result<JerkLimitedStopProfileDTO> compute_jerk_limited_stop_profile(
         return {t, s <= path_end_s + kEpsilon};
       }
 
-      s += v * dt_step + 0.5 * a * dt_step * dt_step +
-           (jerk * dt_step * dt_step * dt_step) / 6.0;
+      s += v * dt_step + 0.5 * a * dt_step * dt_step + (jerk * dt_step * dt_step * dt_step) / 6.0;
       t += dt_step;
       v = v_next;
       a = a_next;
@@ -2497,29 +2598,19 @@ Result<JerkLimitedStopProfileDTO> compute_jerk_limited_stop_profile(
   };
 
   PathSample build_sample;
-  auto build_joint_trajectory =
-      [&](const std::vector<JerkLimitedStopSampleDTO>& samples) {
-        TrajectoryDTO trajectory;
-        trajectory.joint_names = accepted_trajectory.joint_names;
-        trajectory.waypoints.reserve(samples.size());
-        for (const auto& smp : samples) {
-          path_cursor.sample(smp.path_time_s, build_sample);
-          const PathSample& ps = build_sample;
-          TrajectoryWaypointDTO wp;
-          wp.time_from_start_s = smp.time_from_ramp_start_s;
-          wp.positions_rad = ps.position;
-          wp.velocities_rad_s.resize(joint_count, 0.0);
-          wp.accelerations_rad_s2.resize(joint_count, 0.0);
-          for (size_t j = 0; j < joint_count; ++j) {
-            wp.velocities_rad_s[j] = ps.d_position_dt[j] * smp.path_rate;
-            wp.accelerations_rad_s2[j] =
-                ps.d2_position_dt2[j] * smp.path_rate * smp.path_rate +
-                ps.d_position_dt[j] * smp.path_rate_accel;
-          }
-          trajectory.waypoints.push_back(std::move(wp));
-        }
-        return trajectory;
-      };
+  auto build_joint_trajectory = [&](const std::vector<JerkLimitedStopSampleDTO>& samples) {
+    TrajectoryDTO trajectory;
+    trajectory.joint_names = accepted_trajectory.joint_names;
+    trajectory.waypoints.reserve(samples.size());
+    for (const auto& smp : samples) {
+      path_cursor.sample(smp.path_time_s, build_sample);
+      const PathSample& ps = build_sample;
+      TrajectoryWaypointDTO wp;
+      path_waypoint(ps, smp.time_from_ramp_start_s, smp.path_rate, smp.path_rate_accel, wp);
+      trajectory.waypoints.push_back(std::move(wp));
+    }
+    return trajectory;
+  };
 
   auto validate_dispatch_trajectory = [&](JerkLimitedStopProfileDTO& profile) {
     auto mark_invalid = [&](const std::string& reason) {
@@ -2530,11 +2621,9 @@ Result<JerkLimitedStopProfileDTO> compute_jerk_limited_stop_profile(
     };
     profile.hits_target_time =
         profile.reaches_rest_on_path &&
-        std::abs(profile.achieved_stop_time_s - target_stop_time_s) <=
-            target_time_tolerance_s;
+        std::abs(profile.achieved_stop_time_s - target_stop_time_s) <= target_time_tolerance_s;
     profile.terminal_state_zero = false;
-    profile.within_budget =
-        profile.reaches_rest_on_path && profile.samples.size() >= 2;
+    profile.within_budget = profile.reaches_rest_on_path && profile.samples.size() >= 2;
     if (profile.samples.empty()) {
       profile.dispatchable = false;
       return;
@@ -2550,20 +2639,25 @@ Result<JerkLimitedStopProfileDTO> compute_jerk_limited_stop_profile(
     for (size_t i = 1; i < profile.samples.size(); ++i) {
       const auto& prev = profile.samples[i - 1];
       const auto& curr = profile.samples[i];
-      if (!std::isfinite(curr.time_from_ramp_start_s) ||
-          !std::isfinite(curr.path_time_s) ||
-          !std::isfinite(curr.path_rate) ||
-          !std::isfinite(curr.path_rate_accel) ||
-          curr.time_from_ramp_start_s <=
-              prev.time_from_ramp_start_s + kEpsilon) {
+      if (!std::isfinite(curr.time_from_ramp_start_s) || !std::isfinite(curr.path_time_s) ||
+          !std::isfinite(curr.path_rate) || !std::isfinite(curr.path_rate_accel) ||
+          curr.time_from_ramp_start_s <= prev.time_from_ramp_start_s + kEpsilon) {
         mark_invalid("sample_time_or_value_invalid");
+      }
+      if (accepted_trajectory.runtime_scale_bounds) {
+        const double dt = curr.time_from_ramp_start_s - prev.time_from_ramp_start_s;
+        if (curr.path_rate < -1e-12 || curr.path_rate > 1.0 + 1e-12 ||
+            !constant_jerk_rate_within_unit_range(
+                prev.path_rate, prev.path_rate_accel,
+                (curr.path_rate_accel - prev.path_rate_accel) / dt, dt)) {
+          mark_invalid("path_rate_limit_exceeded");
+        }
       }
     }
 
     const auto& terminal = profile.samples.back();
-    profile.terminal_state_zero =
-        std::abs(terminal.path_rate) <= kTerminalTolerance &&
-        std::abs(terminal.path_rate_accel) <= kTerminalTolerance;
+    profile.terminal_state_zero = std::abs(terminal.path_rate) <= kTerminalTolerance &&
+                                  std::abs(terminal.path_rate_accel) <= kTerminalTolerance;
     if (!profile.terminal_state_zero) {
       mark_invalid("terminal_state_not_zero");
     }
@@ -2576,157 +2670,15 @@ Result<JerkLimitedStopProfileDTO> compute_jerk_limited_stop_profile(
       return;
     }
 
-    const double validate_dt =
-        std::max(sample_period_s / 4.0, target_stop_time_s / 2000.0);
-    const size_t steps = std::max<size_t>(
-        1, static_cast<size_t>(std::ceil(profile.achieved_stop_time_s /
-                                         std::max(validate_dt, kEpsilon))));
-    // Shape validation above implies the sampler's structural validation,
-    // so the oversample loop uses the prevalidated entry with a reused
-    // buffer.
-    TrajectorySampleResult sampled;
-    std::vector<double> prev_accel;
-    double prev_t = 0.0;
-    for (size_t i = 0; i <= steps; ++i) {
-      const double t_sample =
-          profile.achieved_stop_time_s * static_cast<double>(i) /
-          static_cast<double>(steps);
-      const bool sample_ok =
-          sample_trajectory_prevalidated(profile.emitted_trajectory, t_sample,
-                                         sampled)
-              .ok();
-      if (!sample_ok ||
-          sampled.accelerations_rad_s2.size() != joint_count) {
-        mark_invalid("emitted_trajectory_sample_invalid");
-        continue;
-      }
-      const auto& accel = sampled.accelerations_rad_s2;
-      for (size_t j = 0; j < joint_count; ++j) {
-        if (!std::isfinite(accel[j]) ||
-            std::abs(accel[j]) > max_decel[j] + kAccelTolerance) {
-          mark_invalid("interpolated_acceleration_limit_exceeded");
-        }
-      }
-      if (!prev_accel.empty()) {
-        const double dt_check = t_sample - prev_t;
-        if (dt_check > kEpsilon) {
-          for (size_t j = 0; j < joint_count; ++j) {
-            const double jerk = (accel[j] - prev_accel[j]) / dt_check;
-            if (!std::isfinite(jerk) ||
-                std::abs(jerk) > max_jerk[j] + kJerkTolerance) {
-              mark_invalid("interpolated_jerk_limit_exceeded");
-            }
-          }
-        }
-      }
-      prev_accel = accel;
-      prev_t = t_sample;
+    const auto& points = profile.emitted_trajectory.waypoints;
+    for (size_t i = 1; i < points.size(); ++i) {
+      if (const auto failure = segment_limit_failure(points[i - 1], points[i], max_decel, max_jerk))
+        mark_invalid(failure->reason);
     }
 
-    profile.dispatchable = profile.reaches_rest_on_path &&
-                           profile.hits_target_time &&
-                           profile.terminal_state_zero &&
-                           profile.within_budget;
+    profile.dispatchable = profile.reaches_rest_on_path && profile.hits_target_time &&
+                           profile.terminal_state_zero && profile.within_budget;
   };
-
-  auto straight_scurve_candidate = [&]() -> std::optional<JerkLimitedStopProfileDTO> {
-    if (std::abs(start_path_rate_accel) > kTerminalTolerance) {
-      return std::nullopt;
-    }
-    const PathSample start_sample = path_cursor.sample(start_path_time_s);
-    const double peak_path_accel =
-        2.0 * start_path_rate / target_stop_time_s;
-    const double path_jerk =
-        4.0 * start_path_rate /
-        (target_stop_time_s * target_stop_time_s);
-    double path_accel_limit = kBig;
-    double path_jerk_limit = kBig;
-    bool found_tangent = false;
-    for (size_t j = 0; j < joint_count; ++j) {
-      if (std::abs(start_sample.d2_position_dt2[j]) > kTerminalTolerance) {
-        return std::nullopt;
-      }
-      const double qp = start_sample.d_position_dt[j];
-      if (std::abs(qp) <= kEpsilon) {
-        continue;
-      }
-      path_accel_limit =
-          std::min(path_accel_limit, max_decel[j] / std::abs(qp));
-      path_jerk_limit =
-          std::min(path_jerk_limit, max_jerk[j] / std::abs(qp));
-      found_tangent = true;
-    }
-    if (!found_tangent ||
-        peak_path_accel > path_accel_limit + kAccelTolerance ||
-        path_jerk > path_jerk_limit + kJerkTolerance) {
-      return std::nullopt;
-    }
-
-    const double stop_distance = 0.5 * start_path_rate * target_stop_time_s;
-    const double stop_path_time = start_path_time_s + stop_distance;
-    if (stop_path_time > path_end_s + kEpsilon) {
-      return std::nullopt;
-    }
-    const PathSample mid_sample =
-        path_cursor.sample(start_path_time_s + 0.5 * stop_distance);
-    const PathSample stop_sample = path_cursor.sample(stop_path_time);
-    for (size_t j = 0; j < joint_count; ++j) {
-      if (std::abs(mid_sample.d2_position_dt2[j]) > kTerminalTolerance ||
-          std::abs(stop_sample.d2_position_dt2[j]) > kTerminalTolerance ||
-          std::abs(mid_sample.d_position_dt[j] -
-                   start_sample.d_position_dt[j]) > 1e-6 ||
-          std::abs(stop_sample.d_position_dt[j] -
-                   start_sample.d_position_dt[j]) > 1e-6) {
-        return std::nullopt;
-      }
-    }
-
-    JerkLimitedStopProfileDTO candidate;
-    candidate.target_decel_path_rate = peak_path_accel;
-    candidate.achieved_stop_time_s = target_stop_time_s;
-    candidate.reaches_rest_on_path = true;
-    const size_t steps = std::max<size_t>(
-        2, static_cast<size_t>(std::ceil(target_stop_time_s /
-                                         sample_period_s)));
-    const double half_t = 0.5 * target_stop_time_s;
-    const double v_mid = 0.5 * start_path_rate;
-    const double s_mid =
-        start_path_rate * half_t - (path_jerk * half_t * half_t * half_t) / 6.0;
-    for (size_t i = 0; i <= steps; ++i) {
-      const double t =
-          target_stop_time_s * static_cast<double>(i) /
-          static_cast<double>(steps);
-      double v = 0.0;
-      double a = 0.0;
-      double s_rel = 0.0;
-      if (t <= half_t) {
-        a = -path_jerk * t;
-        v = start_path_rate - 0.5 * path_jerk * t * t;
-        s_rel = start_path_rate * t - (path_jerk * t * t * t) / 6.0;
-      } else {
-        const double tau = t - half_t;
-        a = -peak_path_accel + path_jerk * tau;
-        v = v_mid - peak_path_accel * tau + 0.5 * path_jerk * tau * tau;
-        s_rel = s_mid + v_mid * tau -
-                0.5 * peak_path_accel * tau * tau +
-                (path_jerk * tau * tau * tau) / 6.0;
-      }
-      if (i == steps) {
-        v = 0.0;
-        a = 0.0;
-        s_rel = stop_distance;
-      }
-      candidate.samples.push_back(
-          {t, start_path_time_s + s_rel, std::max(0.0, v), a});
-    }
-    validate_dispatch_trajectory(candidate);
-    return candidate;
-  };
-
-  if (auto candidate = straight_scurve_candidate();
-      candidate.has_value() && candidate->dispatchable) {
-    return Result<JerkLimitedStopProfileDTO>::Ok(std::move(*candidate));
-  }
 
   // Bisection on the target deceleration so the ramp lands rest at
   // target_stop_time_s (stop time decreases as the target grows; an unreachable
@@ -2747,8 +2699,7 @@ Result<JerkLimitedStopProfileDTO> compute_jerk_limited_stop_profile(
   }
   double a_min = a_max;
   double t_at_a_min = t_at_a_max;
-  for (int shrink = 0; shrink < 80 && t_at_a_min < target_stop_time_s;
-       ++shrink) {
+  for (int shrink = 0; shrink < 80 && t_at_a_min < target_stop_time_s; ++shrink) {
     a_min *= 0.5;
     t_at_a_min = stop_time(a_min);
   }
@@ -2769,17 +2720,15 @@ Result<JerkLimitedStopProfileDTO> compute_jerk_limited_stop_profile(
 
   const double t_min_candidate = t_at_a_min;
   const double t_max_candidate = t_at_a_max;
-  const double selected_decel =
-      std::abs(t_min_candidate - target_stop_time_s) <
-              std::abs(t_max_candidate - target_stop_time_s)
-          ? a_min
-          : a_max;
+  const double selected_decel = std::abs(t_min_candidate - target_stop_time_s) <
+                                        std::abs(t_max_candidate - target_stop_time_s)
+                                    ? a_min
+                                    : a_max;
 
   JerkLimitedStopProfileDTO out;
   out.target_decel_path_rate = selected_decel;
   bool used_backward_envelope = false;
-  const auto [achieved, reached] =
-      integrate(selected_decel, &out.samples, &used_backward_envelope);
+  const auto [achieved, reached] = integrate(selected_decel, &out.samples, &used_backward_envelope);
   out.achieved_stop_time_s = achieved;
   out.reaches_rest_on_path = reached;
   out.used_backward_envelope = used_backward_envelope;

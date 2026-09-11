@@ -26,7 +26,38 @@ inline constexpr char kDigestB[] =
   if (!value.empty() && value.back() == '\n') value.pop_back();
   auto decoded = DecodeResolvedStopBasePlan(value);
   EXPECT_TRUE(decoded.ok());
-  return std::move(decoded.value());
+  auto base = std::move(decoded.value());
+  auto& nominal = base.escalation_stages.front();
+  const ProviderContractRefDTO contract{
+      ProviderContractRoleId("stop_contract"),
+      SchemaId(std::string(kMotionControlledStopContractSchemaId)),
+      SchemaRevision(std::string(kMotionControlledStopContractSchemaRevision))};
+  nominal.containment_command.provider_contract_ref = contract;
+  if (nominal.command_qualification.controlled_substitution_contract)
+    nominal.command_qualification.controlled_substitution_contract->provider_contract_ref =
+        contract;
+  JsonValueDTO::Array limits;
+  for (const auto* id : {"joint.1", "joint.2"}) {
+    limits.emplace_back(JsonObjectDTO{
+        {"resource_id", JsonValueDTO{std::string(id)}},
+        {"max_deceleration",
+         JsonValueDTO{JsonObjectDTO{{"coordinate_kind", JsonValueDTO{"angular_rad_s2"}},
+                                    {"value_rad_s2", JsonValueDTO{2.0}}}}},
+        {"settle_velocity_threshold",
+         JsonValueDTO{JsonObjectDTO{{"coordinate_kind", JsonValueDTO{"angular_rad_s"}},
+                                    {"value_rad_s", JsonValueDTO{0.02}}}}},
+    });
+  }
+  nominal.default_contract_parameters = JsonObjectDTO{
+      {"stop_mode", JsonValueDTO{"soft_on_path"}},
+      {"deceleration_time_s", JsonValueDTO{0.5}},
+      {"jerk_limits_enabled", JsonValueDTO{false}},
+      {"allow_natural_completion_on_short_path", JsonValueDTO{true}},
+      {"per_resource_limits", JsonValueDTO{std::move(limits)}},
+  };
+  auto current = MakeResolvedStopBasePlan(std::move(base));
+  EXPECT_TRUE(current.ok()) << current.error().message;
+  return std::move(current.value());
 }
 
 [[nodiscard]] RuntimeParticipantBinding Binding(const ResolvedStopBasePlanDTO& base) {
@@ -88,7 +119,8 @@ inline constexpr char kDigestB[] =
   return std::move(binding.value());
 }
 
-[[nodiscard]] ParticipantStopStageResultDTO SuccessfulStage() {
+[[nodiscard]] ParticipantStopStageResultDTO SuccessfulStage(
+    std::optional<MotionInterruptStopProfileDTO> profile = std::nullopt) {
   auto base = BasePlan();
   auto binding = Binding(base);
   auto plan = MakePreparedParticipantStopPlan(
@@ -97,9 +129,13 @@ inline constexpr char kDigestB[] =
           OperationId("operation.1"), OperationRevision(4U),
           OperationParticipantId("participant.1"), binding.value().program_id,
           binding.value().program_revision, binding.value().program_binding_id,
-          ProgramRunId("program-run.1"), std::nullopt, ParticipantStopProfilePurposeDTO::kOrdinary,
+          ProgramRunId("program-run.1"), profile,
+          profile ? ParticipantStopProfilePurposeDTO::kOperator
+                  : ParticipantStopProfilePurposeDTO::kOrdinary,
           std::nullopt, MotionInterruptNodeCategory::kGeneric},
-      binding.value().resources, {});
+      binding.value().resources,
+      std::vector<HardStopResourceLimitDTO>{{ResourceId("joint.1"), AngularVelocityDTO{0.02}},
+                                            {ResourceId("joint.2"), AngularVelocityDTO{0.02}}});
   EXPECT_TRUE(plan.ok());
   const auto& selected = plan.value().stage_commands.front().resolved_stage;
   const auto provider_runtime_epoch = selected.command_target.provider_runtime_epoch;
@@ -154,8 +190,9 @@ inline constexpr char kDigestB[] =
   return result;
 }
 
-[[nodiscard]] StopJournalTerminalProjectionDTO TerminalProjection() {
-  auto stage_result = SuccessfulStage();
+[[nodiscard]] StopJournalTerminalProjectionDTO TerminalProjection(
+    std::optional<MotionInterruptStopProfileDTO> profile = std::nullopt) {
+  auto stage_result = SuccessfulStage(std::move(profile));
   const auto stage = stage_result.request;
   const StopScopeEntryKeyDTO key{
       stage.stop_id, stage.stop_generation,
@@ -422,6 +459,27 @@ TEST(StopJournalProjectionCodecTest, RoundTripsEveryEmbeddedTerminalStageFieldCa
   const auto reencoded = EncodeStopJournalTerminalProjection(decoded.value());
   ASSERT_TRUE(reencoded.ok());
   EXPECT_EQ(reencoded.value(), encoded.value());
+}
+
+TEST(StopJournalProjectionCodecTest, RetainsExplicitOffAndOnJerkProfilesExactly) {
+  for (const bool enabled : {false, true}) {
+    MotionInterruptStopProfileDTO profile;
+    profile.profile_id = "journal.jerk";
+    profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
+    profile.deceleration_time_s = 0.5;
+    profile.jerk_limits_enabled = enabled;
+    profile.per_joint_max_deceleration = {{"joint_1", AngularAccelerationDTO{2.0}},
+                                          {"joint_2", AngularAccelerationDTO{2.0}}};
+    profile.per_joint_max_jerk = {{"joint_1", AngularJerkDTO{20.0}},
+                                  {"joint_2", AngularJerkDTO{21.0}}};
+    const auto projection = TerminalProjection(profile);
+    const auto encoded = EncodeStopJournalTerminalProjection(projection);
+    ASSERT_TRUE(encoded.ok()) << encoded.error().message;
+    const auto decoded = DecodeStopJournalTerminalProjection(encoded.value());
+    ASSERT_TRUE(decoded.ok()) << decoded.error().message;
+    EXPECT_EQ(decoded.value(), projection);
+    EXPECT_EQ(EncodeStopJournalTerminalProjection(decoded.value()).value(), encoded.value());
+  }
 }
 
 TEST(StopJournalProjectionCodecTest, RoundTripsInternalProgramRunSelectorCanonically) {

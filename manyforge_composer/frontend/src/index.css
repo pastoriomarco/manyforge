@@ -7074,6 +7074,7 @@ svg.viewer-camera-icon {
 }
 
 .transport-selection {
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 0.1rem;
@@ -7081,11 +7082,33 @@ svg.viewer-camera-icon {
   min-width: 0;
 }
 
-.transport-selection select {
+.transport-selection summary {
   width: 10rem;
   max-width: 22vw;
   padding: 0.25rem;
   font-size: 0.8rem;
+}
+
+.transport-selection-options {
+  position: absolute;
+  bottom: calc(100% + 0.5rem);
+  left: 0;
+  z-index: 20;
+  min-width: 14rem;
+  max-height: 16rem;
+  overflow: auto;
+  padding: 0.5rem;
+  background: #10232d;
+  border: 1px solid #426573;
+  border-radius: 0.5rem;
+}
+
+.transport-selection-options label {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.3rem;
+  white-space: nowrap;
 }
 
 .transport-velocity {

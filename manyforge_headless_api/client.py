@@ -337,7 +337,9 @@ class HeadlessHttpClient:
         decoded here so Composer preserves the normal typed HTTP failure.
         """
 
-        payload, status_code, maximum = self._request_payload("GET", path, params=params)
+        payload, status_code, maximum = self._request_payload(
+            "GET", path, params=params
+        )
         if status_code >= 400:
             value = self._decode_response(
                 payload,
@@ -411,13 +413,17 @@ class HeadlessHttpClient:
                     "cell_id": headers.get("x-manyforge-cell-id"),
                     "content_digest": headers.get("x-manyforge-content-digest"),
                     "graph_revision": headers.get("x-manyforge-graph-revision"),
-                    "product_contract_id": headers.get("x-manyforge-product-contract-id"),
+                    "product_contract_id": headers.get(
+                        "x-manyforge-product-contract-id"
+                    ),
                     "product_contract_revision": headers.get(
                         "x-manyforge-product-contract-revision"
                     ),
                     "product_id": headers.get("x-manyforge-product-id"),
                     "retained_bundle_id": headers.get("x-manyforge-retained-bundle-id"),
-                    "viewer_model_revision": headers.get("x-manyforge-viewer-model-revision"),
+                    "viewer_model_revision": headers.get(
+                        "x-manyforge-viewer-model-revision"
+                    ),
                 }
                 if metadata["asset_kind"] != expected_kind:
                     raise HeadlessClientError(
@@ -445,7 +451,10 @@ class HeadlessHttpClient:
                     "viewer_model_revision",
                 ):
                     value = metadata[field]
-                    if not isinstance(value, str) or _SHA256_PATTERN.fullmatch(value) is None:
+                    if (
+                        not isinstance(value, str)
+                        or _SHA256_PATTERN.fullmatch(value) is None
+                    ):
                         raise HeadlessClientError(
                             "headless_http_response_invalid",
                             f"headless viewer-model {field} is invalid",
@@ -456,7 +465,8 @@ class HeadlessHttpClient:
                     or metadata["product_contract_id"] != "manyforge.viewer_model"
                     or (
                         expected_retained_bundle_id is not None
-                        and metadata["retained_bundle_id"] != expected_retained_bundle_id
+                        and metadata["retained_bundle_id"]
+                        != expected_retained_bundle_id
                     )
                 ):
                     raise HeadlessClientError(
@@ -517,7 +527,9 @@ class HeadlessHttpClient:
         return self.request("POST", "/api/program/authoring-transactions", body=body)
 
     def settle_authoring_transaction(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        return self.request("POST", "/api/program/authoring-transactions/settle", body=body)
+        return self.request(
+            "POST", "/api/program/authoring-transactions/settle", body=body
+        )
 
     def recover_authoring_transaction(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request(
@@ -554,7 +566,9 @@ class HeadlessHttpClient:
         return f"{prefix}/{identity}"
 
     def cclc_component(self, component_id: str) -> dict[str, Any]:
-        return self.request("GET", self._cclc_identity_path("/api/cclc/components", component_id))
+        return self.request(
+            "GET", self._cclc_identity_path("/api/cclc/components", component_id)
+        )
 
     def cclc_owner_identity(self) -> dict[str, Any]:
         return self.request("GET", "/api/cclc/owner")
@@ -562,20 +576,31 @@ class HeadlessHttpClient:
     def cclc_route_templates(self, component_id: str) -> dict[str, Any]:
         return self.request(
             "GET",
-            self._cclc_identity_path("/api/cclc/components", component_id) + "/route-templates",
+            self._cclc_identity_path("/api/cclc/components", component_id)
+            + "/route-templates",
         )
 
     def submit_component_lifecycle(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/cclc/lifecycle/requests", body=body)
 
+    def component_lifecycle_request_result(
+        self, body: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return self.request("POST", "/api/cclc/lifecycle/requests/result", body=body)
+
     def component_lifecycle_status(self, transaction_id: str) -> dict[str, Any]:
         return self.request(
             "GET",
-            self._cclc_identity_path("/api/cclc/lifecycle/transactions", transaction_id),
+            self._cclc_identity_path(
+                "/api/cclc/lifecycle/transactions", transaction_id
+            ),
         )
 
     def submit_route_selection(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/cclc/routes/requests", body=body)
+
+    def route_selection_request_result(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return self.request("POST", "/api/cclc/routes/requests/result", body=body)
 
     def route_selection_status(self, transaction_id: str) -> dict[str, Any]:
         return self.request(
@@ -805,7 +830,9 @@ class HeadlessHttpClient:
         )
 
     def program_runtime_controls(self, program_run_id: str) -> dict[str, Any]:
-        return self.request("GET", f"{self._program_run_path(program_run_id)}/runtime-controls")
+        return self.request(
+            "GET", f"{self._program_run_path(program_run_id)}/runtime-controls"
+        )
 
     def program_runtime_control_action(
         self,
@@ -891,16 +918,24 @@ class HeadlessHttpClient:
             raise ValueError("assistant mode identity is invalid")
         return self.request("GET", f"/api/assistant/modes/{mode_id}/context")
 
-    def manager_deployment_candidate_preview(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        return self.request("POST", "/api/manager/deployment-candidates/preview", body=body)
+    def manager_deployment_candidate_preview(
+        self, body: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return self.request(
+            "POST", "/api/manager/deployment-candidates/preview", body=body
+        )
 
     def compile_deployment_candidate(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        return self.request("POST", "/api/manager/deployment-candidates/compile", body=body)
+        return self.request(
+            "POST", "/api/manager/deployment-candidates/compile", body=body
+        )
 
     def manager_apply(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/manager/apply", body=body)
 
-    def manager_apply_status(self, apply_id: str, apply_generation: int) -> dict[str, Any]:
+    def manager_apply_status(
+        self, apply_id: str, apply_generation: int
+    ) -> dict[str, Any]:
         if (
             not isinstance(apply_id, str)
             or not apply_id
@@ -947,8 +982,13 @@ class HeadlessHttpClient:
     def preview_motion(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/execution/motion-previews", body=body)
 
+    def read_manual_handover(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return self.request("POST", "/api/execution/manual-handover", body=body)
+
     def preview_capability_command(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        return self.request("POST", "/api/execution/capability-command-previews", body=body)
+        return self.request(
+            "POST", "/api/execution/capability-command-previews", body=body
+        )
 
     def plan_pick(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/execution/pick-place/plans/pick", body=body)
@@ -957,10 +997,14 @@ class HeadlessHttpClient:
         return self.request("POST", "/api/execution/pick-place/plans/place", body=body)
 
     def start_pick(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        return self.request("POST", "/api/execution/pick-place/sequences/pick", body=body)
+        return self.request(
+            "POST", "/api/execution/pick-place/sequences/pick", body=body
+        )
 
     def start_place(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        return self.request("POST", "/api/execution/pick-place/sequences/place", body=body)
+        return self.request(
+            "POST", "/api/execution/pick-place/sequences/place", body=body
+        )
 
     @staticmethod
     def _pick_place_sequence_path(sequence_id: str) -> str:
@@ -996,13 +1040,19 @@ class HeadlessHttpClient:
             body=body,
         )
 
-    def pause_operation(self, operation_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
+    def pause_operation(
+        self, operation_id: str, body: Mapping[str, Any]
+    ) -> dict[str, Any]:
         return self._operation_control(operation_id, "pause", body)
 
-    def resume_operation(self, operation_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
+    def resume_operation(
+        self, operation_id: str, body: Mapping[str, Any]
+    ) -> dict[str, Any]:
         return self._operation_control(operation_id, "resume", body)
 
-    def reset_operation(self, operation_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
+    def reset_operation(
+        self, operation_id: str, body: Mapping[str, Any]
+    ) -> dict[str, Any]:
         return self._operation_control(operation_id, "reset", body)
 
     def acknowledge_completed_operation(
@@ -1057,6 +1107,9 @@ class HeadlessHttpClient:
 
     def commit_scene_transaction(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/scene/transactions", body=body)
+
+    def scene_transaction_status(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return self.request("POST", "/api/scene/transactions/status", body=body)
 
     def alarms(
         self,

@@ -333,6 +333,36 @@ in diagnostics rather than used silently.
 
 ______________________________________________________________________
 
+## Offline ordinary jerk import
+
+The Deployment revision tool can import explicit angular `max_jerk` and
+`has_jerk_limits` fields from a selected MoveIt `joint_limits.yaml`. Run the
+installed tool in the qualified development environment, using the target's
+source-model joint names, not compiled prefixes:
+
+```bash
+manyforge_deployment_revision --update --input cell.deployment.yaml \
+  --import-moveit-jerk robot_moveit_config/config/joint_limits.yaml \
+  --source-id robot_moveit_config/config/joint_limits.yaml \
+  --runtime-unit robot.native_execution --component robot --target arm \
+  --joints joint1,joint2,joint3,joint4,joint5,joint6
+```
+
+`--print` previews only the resulting revision without writing. The same pure
+transformation is exposed as `manyforge_headless_py.import_moveit_angular_jerk_limits`.
+It preserves ordinary activation, preset time, overrides and independent Stop
+settings. A source flag does not activate ManyForge shaping or declare a
+machine-required limit. Positive disabled values retain their inactive metadata;
+absent/disabled-zero values acquire no invented imported limit. Import replaces
+the selected joints' previous import metadata, while keeping explicit overrides
+and rejecting removal/weakening of a reviewed required limit. The saved source
+identifier and SHA-256 identify the supplied bytes, not controller qualification.
+
+This authoring path supports the native angular profile; it does not reinterpret
+linear limits. The exact bound model and final capabilities are still checked
+at activation. Ordinary limits become effective through normal Save/Apply, not
+through a live file watch or an importer-owned runtime action.
+
 ## Deployment lanes
 
 The same public contracts drive three lanes; they differ only in what sits

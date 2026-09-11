@@ -9,6 +9,12 @@
 
 namespace manyforge::core {
 
+/// Cold-only preset resolution. Explicit limits win; missing enabled limits
+/// use the declared profile's ramp (Soft) or half-duration (Spring). A single
+/// frozen ceiling covers both Spring phases; no candidate-dependent inflation.
+[[nodiscard]] Result<MotionInterruptStopProfileDTO> resolve_motion_interrupt_stop_jerk_limits(
+    const MotionInterruptStopProfileDTO& profile);
+
 [[nodiscard]] constexpr MotionControlledStopMode provider_contract_stop_mode(
     MotionInterruptStopMode value) noexcept {
   switch (value) {

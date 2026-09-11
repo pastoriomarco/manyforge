@@ -2,6 +2,7 @@
 
 #include <manyforge_core/cache/trajectory_cache.hpp>
 #include <manyforge_core/cache/trajectory_cache_intent.hpp>
+#include <manyforge_core/detail/runtime_scale_governor.hpp>
 #include <manyforge_core/testing/addressed_request_fixtures.hpp>
 #include <optional>
 #include <utility>
@@ -83,6 +84,26 @@ protected:
 };
 
 // --- Store and lookup ---
+
+TEST_F(TrajectoryCacheTest, CommonTimingDoesNotContaminateIndependentCandidateReuse) {
+  TrajectoryDTO independent{
+      {ResourceId("joint.1"), ResourceId("joint.2")}, {"joint1", "joint2"},
+      {{0.0, {0.0, 0.0}, {0.0, 0.0}, {0.0, 0.0}},
+       {1.0, {0.5, -0.5}, {0.0, 0.0}, {0.0, 0.0}}},
+      TrajectoryRuntimeScaleBoundsDTO{2.0, 8.0, 1.5, 2.0}, {0.0, 1.0}};
+  const auto revision = make_revision();
+  store("move_1", independent, revision);
+  auto coordinated = lookup("move_1", revision);
+  ASSERT_TRUE(coordinated);
+  ASSERT_TRUE(detail::apply_common_runtime_scaling(*coordinated, {6.0, {1.0, 4.0}}));
+  EXPECT_DOUBLE_EQ(coordinated->waypoints.back().time_from_start_s, 3.0);
+  const auto reused = lookup("move_1", revision);
+  ASSERT_TRUE(reused && reused->runtime_scale_bounds);
+  EXPECT_DOUBLE_EQ(reused->waypoints.back().time_from_start_s, 1.0);
+  EXPECT_EQ(reused->runtime_scale_bounds->nominal_time_multiplier, 2.0);
+  EXPECT_DOUBLE_EQ(reused->runtime_scale_bounds->max_rate_per_s, 2.0);
+  EXPECT_EQ(reused->cartesian_waypoint_times_s, independent.cartesian_waypoint_times_s);
+}
 TEST_F(TrajectoryCacheTest, StoreAndLookup) {
   store("move_1", make_trajectory("t1"), make_revision());
   auto result = cache.peek_unvalidated(key("move_1"));

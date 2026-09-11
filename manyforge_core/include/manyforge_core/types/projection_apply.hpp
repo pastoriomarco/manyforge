@@ -1,13 +1,13 @@
 #pragma once
 
 #include <cstddef>
+#include <manyforge_core/types/active_bundle_publication.hpp>
+#include <manyforge_core/types/managed_runtime_withdrawal.hpp>
+#include <manyforge_core/types/projection_common.hpp>
+#include <manyforge_core/types/retained_product.hpp>
 #include <optional>
 #include <string_view>
 #include <vector>
-
-#include <manyforge_core/types/active_bundle_publication.hpp>
-#include <manyforge_core/types/projection_common.hpp>
-#include <manyforge_core/types/retained_product.hpp>
 
 namespace manyforge::core {
 
@@ -17,8 +17,8 @@ enum class ProjectionTransitionDisposition {
   kRemoved,
 };
 
-[[nodiscard]] constexpr std::string_view
-to_string(ProjectionTransitionDisposition disposition) noexcept {
+[[nodiscard]] constexpr std::string_view to_string(
+    ProjectionTransitionDisposition disposition) noexcept {
   switch (disposition) {
     case ProjectionTransitionDisposition::kRetained:
       return "retained";
@@ -36,24 +36,27 @@ struct ProjectionTransitionRowDTO final {
   ProjectionNativeRuntimeBindingDTO native_runtime_binding;
   ProjectionTransitionDisposition disposition;
   std::optional<ProjectionRevisionDTO> expected_local_active;
+  std::optional<ManagedRuntimeWithdrawalDTO> managed_withdrawal{};
 
   [[nodiscard]] bool valid() const noexcept {
+    if (managed_withdrawal &&
+        (disposition != ProjectionTransitionDisposition::kRemoved || !managed_withdrawal->valid() ||
+         managed_withdrawal->runtime_unit_id != native_runtime_binding.runtime_unit_id ||
+         managed_withdrawal->runtime_epoch != native_runtime_binding.runtime_epoch))
+      return false;
     switch (disposition) {
       case ProjectionTransitionDisposition::kRetained:
       case ProjectionTransitionDisposition::kRemoved:
-        return native_runtime_binding.valid() &&
-               expected_local_active.has_value() &&
+        return native_runtime_binding.valid() && expected_local_active.has_value() &&
                expected_local_active->valid();
       case ProjectionTransitionDisposition::kAdded:
-        return native_runtime_binding.valid() &&
-               !expected_local_active.has_value();
+        return native_runtime_binding.valid() && !expected_local_active.has_value();
       default:
         return false;
     }
   }
 
-  [[nodiscard]] bool matches_predecessor(
-      const ProjectionRevisionDTO& predecessor) const noexcept {
+  [[nodiscard]] bool matches_predecessor(const ProjectionRevisionDTO& predecessor) const noexcept {
     if (!valid() || !predecessor.valid()) {
       return false;
     }
@@ -78,9 +81,8 @@ struct ProjectionTransitionRowDTO final {
       return false;
     }
     if (index != 0U &&
-        !CanonicalProjectionNativeBindingLess(
-            rows[index - 1U].native_runtime_binding,
-            rows[index].native_runtime_binding)) {
+        !CanonicalProjectionNativeBindingLess(rows[index - 1U].native_runtime_binding,
+                                              rows[index].native_runtime_binding)) {
       return false;
     }
   }
@@ -97,8 +99,8 @@ enum class ProjectionTransitionRowEvidenceState {
   kUncertain,
 };
 
-[[nodiscard]] constexpr std::string_view
-to_string(ProjectionTransitionRowEvidenceState state) noexcept {
+[[nodiscard]] constexpr std::string_view to_string(
+    ProjectionTransitionRowEvidenceState state) noexcept {
   switch (state) {
     case ProjectionTransitionRowEvidenceState::kPending:
       return "pending";
@@ -121,10 +123,9 @@ to_string(ProjectionTransitionRowEvidenceState state) noexcept {
 struct ProjectionTransitionRowEvidenceDTO final {
   ProjectionTransitionRowDTO transition_row;
   ProjectionTransitionRowEvidenceState state;
-  std::optional<ProjectionRevisionDTO>
-      acknowledged_staged_candidate_revision;
+  std::optional<ProjectionRevisionDTO> acknowledged_staged_candidate_revision;
   std::optional<ProjectionRevisionDTO> observed_local_active;
-  ProjectionHealthDTO resulting_health;
+  std::optional<ProjectionHealthDTO> resulting_health;
   std::optional<ErrorDTO> error;
 
   [[nodiscard]] bool valid() const noexcept {
@@ -140,14 +141,18 @@ struct ProjectionTransitionRowEvidenceDTO final {
       default:
         return false;
     }
-    return transition_row.valid() &&
+    if (transition_row.managed_withdrawal) {
+      return transition_row.valid() && !resulting_health &&
+             !acknowledged_staged_candidate_revision && !observed_local_active &&
+             (state == ProjectionTransitionRowEvidenceState::kRemovedRetired ||
+              (state == ProjectionTransitionRowEvidenceState::kUncertain && error));
+    }
+    return transition_row.valid() && resulting_health &&
            (!acknowledged_staged_candidate_revision.has_value() ||
             acknowledged_staged_candidate_revision->valid()) &&
-           (!observed_local_active.has_value() ||
-            observed_local_active->valid()) &&
-           resulting_health.valid() &&
-           resulting_health.native_runtime_binding ==
-               transition_row.native_runtime_binding;
+           (!observed_local_active.has_value() || observed_local_active->valid()) &&
+           resulting_health->valid() &&
+           resulting_health->native_runtime_binding == transition_row.native_runtime_binding;
   }
 };
 
@@ -159,8 +164,8 @@ enum class ProjectionTransitionEvidenceState {
   kUncertain,
 };
 
-[[nodiscard]] constexpr std::string_view
-to_string(ProjectionTransitionEvidenceState state) noexcept {
+[[nodiscard]] constexpr std::string_view to_string(
+    ProjectionTransitionEvidenceState state) noexcept {
   switch (state) {
     case ProjectionTransitionEvidenceState::kStaged:
       return "staged";
@@ -188,10 +193,8 @@ struct ProjectionTransitionEvidenceDTO final {
 
   /// Structural validation used internally before phase semantics.
   [[nodiscard]] bool structurally_valid() const noexcept {
-    if (apply_id.empty() || !apply_generation.nonzero() ||
-        !projection_stage_generation.nonzero() ||
-        !predecessor_projection_revision.valid() ||
-        !candidate_projection_revision.valid()) {
+    if (apply_id.empty() || !apply_generation.nonzero() || !projection_stage_generation.nonzero() ||
+        !predecessor_projection_revision.valid() || !candidate_projection_revision.valid()) {
       return false;
     }
     switch (state) {
@@ -208,35 +211,27 @@ struct ProjectionTransitionEvidenceDTO final {
     for (std::size_t index = 0U; index < transition_rows.size(); ++index) {
       const auto& row = transition_rows[index];
       if (!row.valid() ||
-          !row.transition_row.matches_predecessor(
-              predecessor_projection_revision)) {
+          !row.transition_row.matches_predecessor(predecessor_projection_revision)) {
         return false;
       }
-      if (index != 0U &&
-          !CanonicalProjectionNativeBindingLess(
-              transition_rows[index - 1U]
-                  .transition_row.native_runtime_binding,
-              row.transition_row.native_runtime_binding)) {
+      if (index != 0U && !CanonicalProjectionNativeBindingLess(
+                             transition_rows[index - 1U].transition_row.native_runtime_binding,
+                             row.transition_row.native_runtime_binding)) {
         return false;
       }
-      has_uncertainty_error =
-          has_uncertainty_error || row.error.has_value() ||
-          row.resulting_health.error.has_value();
+      has_uncertainty_error = has_uncertainty_error || row.error.has_value() ||
+                              (row.resulting_health && row.resulting_health->error.has_value());
     }
-    return state != ProjectionTransitionEvidenceState::kUncertain ||
-           has_uncertainty_error;
+    return state != ProjectionTransitionEvidenceState::kUncertain || has_uncertainty_error;
   }
 
-  [[nodiscard]] bool valid() const noexcept {
-    return phase_consistent(state);
-  }
+  [[nodiscard]] bool valid() const noexcept { return phase_consistent(state); }
 
-  [[nodiscard]] bool matches_apply(
-      const ApplyId& expected_apply_id,
-      ApplyGeneration expected_apply_generation,
-      ProjectionStageGeneration expected_stage_generation,
-      const ProjectionRevisionDTO& expected_predecessor,
-      const ProjectionRevisionDTO& expected_candidate) const noexcept {
+  [[nodiscard]] bool matches_apply(const ApplyId& expected_apply_id,
+                                   ApplyGeneration expected_apply_generation,
+                                   ProjectionStageGeneration expected_stage_generation,
+                                   const ProjectionRevisionDTO& expected_predecessor,
+                                   const ProjectionRevisionDTO& expected_candidate) const noexcept {
     return valid() && apply_id == expected_apply_id &&
            apply_generation == expected_apply_generation &&
            projection_stage_generation == expected_stage_generation &&
@@ -276,108 +271,89 @@ struct ProjectionTransitionEvidenceDTO final {
         candidate_projection_revision,
     };
     for (const auto& row : transition_rows) {
+      if (row.transition_row.managed_withdrawal) {
+        const auto& receipt = *row.transition_row.managed_withdrawal;
+        if (receipt.apply_id != apply_id || receipt.apply_generation != apply_generation ||
+            expected_state == ProjectionTransitionEvidenceState::kAborted ||
+            (expected_state != ProjectionTransitionEvidenceState::kUncertain &&
+             (row.error || row.state != ProjectionTransitionRowEvidenceState::kRemovedRetired)))
+          return false;
+        has_uncertainty_error = has_uncertainty_error || row.error.has_value();
+        continue;
+      }
       if (row.acknowledged_staged_candidate_revision.has_value() &&
-          *row.acknowledged_staged_candidate_revision !=
-              candidate_projection_revision) {
+          *row.acknowledged_staged_candidate_revision != candidate_projection_revision) {
         return false;
       }
-      if (row.resulting_health.active_projection_revision !=
-              row.observed_local_active ||
-          (row.resulting_health.staged_candidate.has_value() &&
-           *row.resulting_health.staged_candidate !=
-               expected_staged_candidate)) {
+      if (row.resulting_health->active_projection_revision != row.observed_local_active ||
+          (row.resulting_health->staged_candidate.has_value() &&
+           *row.resulting_health->staged_candidate != expected_staged_candidate)) {
         return false;
       }
-      has_uncertainty_error =
-          has_uncertainty_error || row.error.has_value() ||
-          row.resulting_health.error.has_value();
-      if (expected_state ==
-          ProjectionTransitionEvidenceState::kUncertain) {
+      has_uncertainty_error = has_uncertainty_error || row.error.has_value() ||
+                              (row.resulting_health && row.resulting_health->error.has_value());
+      if (expected_state == ProjectionTransitionEvidenceState::kUncertain) {
         continue;
       }
       if (row.error.has_value() ||
-          row.resulting_health.error.has_value()) {
+          (row.resulting_health && row.resulting_health->error.has_value())) {
         return false;
       }
       if ((row.observed_local_active.has_value() &&
-           row.resulting_health.state !=
-               ProjectionHealthState::kHealthy) ||
+           row.resulting_health->state != ProjectionHealthState::kHealthy) ||
           (!row.observed_local_active.has_value() &&
-           row.resulting_health.state !=
-               ProjectionHealthState::kHealthy &&
-           row.resulting_health.state !=
-               ProjectionHealthState::kUninitialized)) {
+           row.resulting_health->state != ProjectionHealthState::kHealthy &&
+           row.resulting_health->state != ProjectionHealthState::kUninitialized)) {
         return false;
       }
       const bool candidate_row =
-          row.transition_row.disposition !=
-          ProjectionTransitionDisposition::kRemoved;
+          row.transition_row.disposition != ProjectionTransitionDisposition::kRemoved;
       if (expected_state == ProjectionTransitionEvidenceState::kStaged) {
         if (candidate_row) {
-          if (row.state !=
-                  ProjectionTransitionRowEvidenceState::
-                      kStagedNoActiveEffect ||
+          if (row.state != ProjectionTransitionRowEvidenceState::kStagedNoActiveEffect ||
               !row.acknowledged_staged_candidate_revision.has_value() ||
-              row.observed_local_active !=
-                  row.transition_row.expected_local_active ||
-              row.resulting_health.staged_candidate !=
-                  std::optional<ProjectionStagedCandidateDTO>{
-                      expected_staged_candidate}) {
+              row.observed_local_active != row.transition_row.expected_local_active ||
+              row.resulting_health->staged_candidate !=
+                  std::optional<ProjectionStagedCandidateDTO>{expected_staged_candidate}) {
             return false;
           }
-        } else if (
-            row.state !=
-                ProjectionTransitionRowEvidenceState::
-                    kPredecessorUnchanged ||
-            row.acknowledged_staged_candidate_revision.has_value() ||
-            row.observed_local_active !=
-                row.transition_row.expected_local_active ||
-            row.resulting_health.staged_candidate.has_value()) {
+        } else if (row.state != ProjectionTransitionRowEvidenceState::kPredecessorUnchanged ||
+                   row.acknowledged_staged_candidate_revision.has_value() ||
+                   row.observed_local_active != row.transition_row.expected_local_active ||
+                   row.resulting_health->staged_candidate.has_value()) {
           return false;
         }
         continue;
       }
       if (expected_state == ProjectionTransitionEvidenceState::kAborted) {
         if ((candidate_row &&
-             row.state !=
-                 ProjectionTransitionRowEvidenceState::
-                     kCandidateStageDiscarded) ||
+             row.state != ProjectionTransitionRowEvidenceState::kCandidateStageDiscarded) ||
             (!candidate_row &&
-             row.state !=
-                 ProjectionTransitionRowEvidenceState::
-                     kPredecessorUnchanged) ||
-            (!candidate_row &&
-             row.acknowledged_staged_candidate_revision.has_value()) ||
-            row.observed_local_active !=
-                row.transition_row.expected_local_active ||
-            row.resulting_health.staged_candidate.has_value()) {
+             row.state != ProjectionTransitionRowEvidenceState::kPredecessorUnchanged) ||
+            (!candidate_row && row.acknowledged_staged_candidate_revision.has_value()) ||
+            row.observed_local_active != row.transition_row.expected_local_active ||
+            row.resulting_health->staged_candidate.has_value()) {
           return false;
         }
         continue;
       }
       if (candidate_row) {
-        if (row.state !=
-                ProjectionTransitionRowEvidenceState::kCandidateActive ||
+        if (row.state != ProjectionTransitionRowEvidenceState::kCandidateActive ||
             !row.acknowledged_staged_candidate_revision.has_value() ||
             row.observed_local_active !=
-                std::optional<ProjectionRevisionDTO>{
-                    candidate_projection_revision} ||
-            row.resulting_health.staged_candidate.has_value() ||
-            !row.resulting_health.healthy_for_target(
-                candidate_projection_revision)) {
+                std::optional<ProjectionRevisionDTO>{candidate_projection_revision} ||
+            row.resulting_health->staged_candidate.has_value() ||
+            !row.resulting_health->healthy_for_target(candidate_projection_revision)) {
           return false;
         }
-      } else if (
-          row.state !=
-              ProjectionTransitionRowEvidenceState::kRemovedRetired ||
-          row.acknowledged_staged_candidate_revision.has_value() ||
-          row.observed_local_active.has_value() ||
-          row.resulting_health.staged_candidate.has_value()) {
+      } else if (row.state != ProjectionTransitionRowEvidenceState::kRemovedRetired ||
+                 row.acknowledged_staged_candidate_revision.has_value() ||
+                 row.observed_local_active.has_value() ||
+                 row.resulting_health->staged_candidate.has_value()) {
         return false;
       }
     }
-    return expected_state != ProjectionTransitionEvidenceState::kUncertain ||
-           has_uncertainty_error;
+    return expected_state != ProjectionTransitionEvidenceState::kUncertain || has_uncertainty_error;
   }
 
   /// Compares the locally supplied retained+added binding projection with a
@@ -390,8 +366,7 @@ struct ProjectionTransitionEvidenceDTO final {
     }
     std::size_t candidate_count = 0U;
     for (const auto& row : transition_rows) {
-      if (row.transition_row.disposition !=
-          ProjectionTransitionDisposition::kRemoved) {
+      if (row.transition_row.disposition != ProjectionTransitionDisposition::kRemoved) {
         ++candidate_count;
       }
     }
@@ -400,13 +375,11 @@ struct ProjectionTransitionEvidenceDTO final {
     }
     std::size_t aggregate_index = 0U;
     for (const auto& row : transition_rows) {
-      if (row.transition_row.disposition ==
-          ProjectionTransitionDisposition::kRemoved) {
+      if (row.transition_row.disposition == ProjectionTransitionDisposition::kRemoved) {
         continue;
       }
       if (row.transition_row.native_runtime_binding !=
-          aggregate.native_projection_health[aggregate_index]
-              .native_runtime_binding) {
+          aggregate.native_projection_health[aggregate_index].native_runtime_binding) {
         return false;
       }
       ++aggregate_index;
@@ -420,8 +393,7 @@ struct ProjectionTransitionEvidenceDTO final {
   /// the scene owner; the local phase value itself may not contradict the
   /// phase claimed by a result or status.
   [[nodiscard]] bool matches_apply_phase(
-      const ApplyId& expected_apply_id,
-      ApplyGeneration expected_apply_generation,
+      const ApplyId& expected_apply_id, ApplyGeneration expected_apply_generation,
       ProjectionStageGeneration expected_stage_generation,
       const ProjectionRevisionDTO& expected_predecessor,
       const ProjectionRevisionDTO& expected_candidate,
@@ -433,10 +405,8 @@ struct ProjectionTransitionEvidenceDTO final {
       case ProjectionTransitionEvidenceState::kFinalized:
       case ProjectionTransitionEvidenceState::kUncertain:
         return phase_consistent(expected_state) &&
-               matches_apply(
-                   expected_apply_id, expected_apply_generation,
-                   expected_stage_generation, expected_predecessor,
-                   expected_candidate);
+               matches_apply(expected_apply_id, expected_apply_generation,
+                             expected_stage_generation, expected_predecessor, expected_candidate);
     }
     return false;
   }
@@ -471,8 +441,10 @@ struct ProjectionApplyStageDTO final {
       return false;
     }
     for (const auto& row : native_transition_rows) {
-      if (!row.matches_predecessor(
-              expected_active_projection_revision)) {
+      if (!row.matches_predecessor(expected_active_projection_revision) ||
+          (row.managed_withdrawal &&
+           (row.managed_withdrawal->apply_id != apply_id ||
+            row.managed_withdrawal->apply_generation != apply_generation))) {
         return false;
       }
     }
@@ -518,29 +490,24 @@ struct ProjectionApplyStageResultDTO final {
     if (has_candidate && !candidate_projection_revision->valid()) {
       return false;
     }
-    if (has_evidence &&
-        !transition_evidence->matches_apply(
-            apply_id, apply_generation, *projection_stage_generation,
-            expected_active_projection_revision,
-            *candidate_projection_revision)) {
+    if (has_evidence && !transition_evidence->matches_apply(
+                            apply_id, apply_generation, *projection_stage_generation,
+                            expected_active_projection_revision, *candidate_projection_revision)) {
       return false;
     }
     switch (state) {
       case ProjectionApplyStageResultState::kStaged:
         return has_stage && has_candidate &&
-               transition_evidence->phase_consistent(
-                   ProjectionTransitionEvidenceState::kStaged) &&
+               transition_evidence->phase_consistent(ProjectionTransitionEvidenceState::kStaged) &&
                !error.has_value();
       case ProjectionApplyStageResultState::kRejected:
         return error.has_value() &&
                (!has_evidence ||
-                transition_evidence->phase_consistent(
-                    ProjectionTransitionEvidenceState::kAborted));
+                transition_evidence->phase_consistent(ProjectionTransitionEvidenceState::kAborted));
       case ProjectionApplyStageResultState::kFailedProjectionUncertain:
         return error.has_value() &&
-               (!has_evidence ||
-                transition_evidence->phase_consistent(
-                    ProjectionTransitionEvidenceState::kUncertain));
+               (!has_evidence || transition_evidence->phase_consistent(
+                                     ProjectionTransitionEvidenceState::kUncertain));
     }
     return false;
   }
@@ -555,8 +522,7 @@ struct ProjectionApplyActivationDTO final {
 
   [[nodiscard]] bool valid() const noexcept {
     return !apply_id.empty() && apply_generation.nonzero() &&
-           expected_active_projection_revision.valid() &&
-           projection_stage_generation.nonzero() &&
+           expected_active_projection_revision.valid() && projection_stage_generation.nonzero() &&
            candidate_projection_revision.valid();
   }
 };
@@ -574,49 +540,37 @@ struct ProjectionApplyActivationResultDTO final {
   ProjectionStageGeneration projection_stage_generation;
   ProjectionRevisionDTO candidate_projection_revision;
   ProjectionApplyActivationResultState state;
-  std::optional<ProjectionRevisionDTO>
-      acknowledged_candidate_projection_revision;
+  std::optional<ProjectionRevisionDTO> acknowledged_candidate_projection_revision;
   ProjectionTransitionEvidenceDTO transition_evidence;
   std::optional<ErrorDTO> error;
 
   [[nodiscard]] bool presence_valid() const noexcept {
     if (apply_id.empty() || !apply_generation.nonzero() ||
-        !expected_active_projection_revision.valid() ||
-        !projection_stage_generation.nonzero() ||
+        !expected_active_projection_revision.valid() || !projection_stage_generation.nonzero() ||
         !candidate_projection_revision.valid()) {
       return false;
     }
     switch (state) {
       case ProjectionApplyActivationResultState::kActivated:
         return transition_evidence.matches_apply_phase(
-                   apply_id, apply_generation,
-                   projection_stage_generation,
-                   expected_active_projection_revision,
-                   candidate_projection_revision,
-                   ProjectionTransitionEvidenceState::
-                       kActivatedAndRetired) &&
+                   apply_id, apply_generation, projection_stage_generation,
+                   expected_active_projection_revision, candidate_projection_revision,
+                   ProjectionTransitionEvidenceState::kActivatedAndRetired) &&
                acknowledged_candidate_projection_revision.has_value() &&
-               *acknowledged_candidate_projection_revision ==
-                   candidate_projection_revision &&
+               *acknowledged_candidate_projection_revision == candidate_projection_revision &&
                !error.has_value();
       case ProjectionApplyActivationResultState::kStale:
         return transition_evidence.matches_apply_phase(
-                   apply_id, apply_generation,
-                   projection_stage_generation,
-                   expected_active_projection_revision,
-                   candidate_projection_revision,
+                   apply_id, apply_generation, projection_stage_generation,
+                   expected_active_projection_revision, candidate_projection_revision,
                    ProjectionTransitionEvidenceState::kAborted) &&
-               !acknowledged_candidate_projection_revision.has_value() &&
-               error.has_value();
+               !acknowledged_candidate_projection_revision.has_value() && error.has_value();
       case ProjectionApplyActivationResultState::kFailedProjectionUncertain:
         return transition_evidence.matches_apply_phase(
-                   apply_id, apply_generation,
-                   projection_stage_generation,
-                   expected_active_projection_revision,
-                   candidate_projection_revision,
+                   apply_id, apply_generation, projection_stage_generation,
+                   expected_active_projection_revision, candidate_projection_revision,
                    ProjectionTransitionEvidenceState::kUncertain) &&
-               !acknowledged_candidate_projection_revision.has_value() &&
-               error.has_value();
+               !acknowledged_candidate_projection_revision.has_value() && error.has_value();
     }
     return false;
   }
@@ -631,8 +585,7 @@ struct ProjectionApplyDiscardDTO final {
 
   [[nodiscard]] bool valid() const noexcept {
     return !apply_id.empty() && apply_generation.nonzero() &&
-           projection_stage_generation.nonzero() &&
-           candidate_projection_revision.valid() &&
+           projection_stage_generation.nonzero() && candidate_projection_revision.valid() &&
            expected_predecessor_projection_revision.valid();
   }
 };
@@ -654,8 +607,7 @@ struct ProjectionApplyDiscardResultDTO final {
   std::optional<ErrorDTO> error;
 
   [[nodiscard]] bool presence_valid() const noexcept {
-    if (apply_id.empty() || !apply_generation.nonzero() ||
-        !projection_stage_generation.nonzero() ||
+    if (apply_id.empty() || !apply_generation.nonzero() || !projection_stage_generation.nonzero() ||
         !candidate_projection_revision.valid() ||
         !expected_predecessor_projection_revision.valid()) {
       return false;
@@ -664,18 +616,14 @@ struct ProjectionApplyDiscardResultDTO final {
       case ProjectionApplyDiscardResultState::kDiscarded:
       case ProjectionApplyDiscardResultState::kAlreadyAbsent:
         return transition_evidence.matches_apply_phase(
-                   apply_id, apply_generation,
-                   projection_stage_generation,
-                   expected_predecessor_projection_revision,
-                   candidate_projection_revision,
+                   apply_id, apply_generation, projection_stage_generation,
+                   expected_predecessor_projection_revision, candidate_projection_revision,
                    ProjectionTransitionEvidenceState::kAborted) &&
                !error.has_value();
       case ProjectionApplyDiscardResultState::kFailedProjectionUncertain:
         return transition_evidence.matches_apply_phase(
-                   apply_id, apply_generation,
-                   projection_stage_generation,
-                   expected_predecessor_projection_revision,
-                   candidate_projection_revision,
+                   apply_id, apply_generation, projection_stage_generation,
+                   expected_predecessor_projection_revision, candidate_projection_revision,
                    ProjectionTransitionEvidenceState::kUncertain) &&
                error.has_value();
     }
@@ -692,11 +640,10 @@ struct ProjectionApplyFinalizeDTO final {
 
   [[nodiscard]] bool valid() const noexcept {
     return !apply_id.empty() && apply_generation.nonzero() &&
-           projection_stage_generation.nonzero() &&
-           candidate_projection_revision.valid() &&
-           publication_receipt.matches_named_apply(
-               apply_id, apply_generation, projection_stage_generation,
-               candidate_projection_revision);
+           projection_stage_generation.nonzero() && candidate_projection_revision.valid() &&
+           publication_receipt.matches_named_apply(apply_id, apply_generation,
+                                                   projection_stage_generation,
+                                                   candidate_projection_revision);
   }
 };
 
@@ -713,51 +660,42 @@ struct ProjectionApplyFinalizeResultDTO final {
   ProjectionRevisionDTO candidate_projection_revision;
   ActiveBundlePublicationReceiptDTO publication_receipt;
   ProjectionApplyFinalizeResultState state;
-  std::optional<ProjectionRevisionDTO>
-      acknowledged_candidate_projection_revision;
+  std::optional<ProjectionRevisionDTO> acknowledged_candidate_projection_revision;
   ProjectionTransitionEvidenceDTO transition_evidence;
   ProjectionAggregateHealthDTO candidate_aggregate_health;
   std::optional<ErrorDTO> error;
 
   [[nodiscard]] bool presence_valid() const noexcept {
-    if (apply_id.empty() || !apply_generation.nonzero() ||
-        !projection_stage_generation.nonzero() ||
+    if (apply_id.empty() || !apply_generation.nonzero() || !projection_stage_generation.nonzero() ||
         !candidate_projection_revision.valid() ||
-        !publication_receipt.matches_named_apply(
-            apply_id, apply_generation, projection_stage_generation,
-            candidate_projection_revision) ||
-        !transition_evidence.matches_apply(
-            apply_id, apply_generation, projection_stage_generation,
-            transition_evidence.predecessor_projection_revision,
-            candidate_projection_revision) ||
-        !candidate_aggregate_health.matches_named_apply(
-            apply_id, apply_generation, projection_stage_generation,
-            candidate_projection_revision)) {
+        !publication_receipt.matches_named_apply(apply_id, apply_generation,
+                                                 projection_stage_generation,
+                                                 candidate_projection_revision) ||
+        !transition_evidence.matches_apply(apply_id, apply_generation, projection_stage_generation,
+                                           transition_evidence.predecessor_projection_revision,
+                                           candidate_projection_revision) ||
+        !candidate_aggregate_health.matches_named_apply(apply_id, apply_generation,
+                                                        projection_stage_generation,
+                                                        candidate_projection_revision)) {
       return false;
     }
     switch (state) {
       case ProjectionApplyFinalizeResultState::kFinalized:
         return transition_evidence.phase_consistent(
                    ProjectionTransitionEvidenceState::kFinalized) &&
-               transition_evidence.candidate_bindings_match(
-                   candidate_aggregate_health) &&
-               candidate_aggregate_health.healthy_for_target(
-                   candidate_projection_revision) &&
+               transition_evidence.candidate_bindings_match(candidate_aggregate_health) &&
+               candidate_aggregate_health.healthy_for_target(candidate_projection_revision) &&
                acknowledged_candidate_projection_revision.has_value() &&
-               *acknowledged_candidate_projection_revision ==
-                   candidate_projection_revision &&
+               *acknowledged_candidate_projection_revision == candidate_projection_revision &&
                !error.has_value();
       case ProjectionApplyFinalizeResultState::kStale:
         return transition_evidence.phase_consistent(
-                   ProjectionTransitionEvidenceState::
-                       kActivatedAndRetired) &&
-               !acknowledged_candidate_projection_revision.has_value() &&
-               error.has_value();
+                   ProjectionTransitionEvidenceState::kActivatedAndRetired) &&
+               !acknowledged_candidate_projection_revision.has_value() && error.has_value();
       case ProjectionApplyFinalizeResultState::kFailedProjectionUncertain:
         return transition_evidence.phase_consistent(
                    ProjectionTransitionEvidenceState::kUncertain) &&
-               !acknowledged_candidate_projection_revision.has_value() &&
-               error.has_value();
+               !acknowledged_candidate_projection_revision.has_value() && error.has_value();
     }
     return false;
   }
@@ -819,80 +757,66 @@ struct ProjectionApplyStatusDTO final {
          !predecessor_projection_revision->valid())) {
       return false;
     }
-    if (has_evidence &&
-        !transition_evidence->matches_apply(
-            apply_id, apply_generation, *projection_stage_generation,
-            *predecessor_projection_revision,
-            *candidate_projection_revision)) {
+    if (has_evidence && !transition_evidence->matches_apply(
+                            apply_id, apply_generation, *projection_stage_generation,
+                            *predecessor_projection_revision, *candidate_projection_revision)) {
       return false;
     }
     if (publication_receipt.has_value() &&
-        (!has_candidate ||
-         !publication_receipt->matches_named_apply(
-             apply_id, apply_generation, *projection_stage_generation,
-             *candidate_projection_revision))) {
+        (!has_candidate || !publication_receipt->matches_named_apply(
+                               apply_id, apply_generation, *projection_stage_generation,
+                               *candidate_projection_revision))) {
       return false;
     }
     if (candidate_aggregate_health.has_value() &&
-        (!has_candidate ||
-         !candidate_aggregate_health->matches_named_apply(
-             apply_id, apply_generation, *projection_stage_generation,
-             *candidate_projection_revision))) {
+        (!has_candidate || !candidate_aggregate_health->matches_named_apply(
+                               apply_id, apply_generation, *projection_stage_generation,
+                               *candidate_projection_revision))) {
       return false;
     }
     switch (state) {
       case ProjectionApplyStatusState::kAbsent:
-        return !predecessor_projection_revision.has_value() && !has_stage &&
-               !has_candidate && !publication_receipt.has_value() &&
-               !candidate_aggregate_health.has_value() && !error.has_value();
+        return !predecessor_projection_revision.has_value() && !has_stage && !has_candidate &&
+               !publication_receipt.has_value() && !candidate_aggregate_health.has_value() &&
+               !error.has_value();
       case ProjectionApplyStatusState::kQuiescing:
-        return has_stage && !has_candidate &&
-               !publication_receipt.has_value() &&
+        return has_stage && !has_candidate && !publication_receipt.has_value() &&
                !candidate_aggregate_health.has_value() && !error.has_value();
       case ProjectionApplyStatusState::kStaged:
         return has_stage && has_candidate &&
-               transition_evidence->phase_consistent(
-                   ProjectionTransitionEvidenceState::kStaged) &&
-               !publication_receipt.has_value() &&
-               !candidate_aggregate_health.has_value() && !error.has_value();
+               transition_evidence->phase_consistent(ProjectionTransitionEvidenceState::kStaged) &&
+               !publication_receipt.has_value() && !candidate_aggregate_health.has_value() &&
+               !error.has_value();
       case ProjectionApplyStatusState::kActivated:
         return has_stage && has_candidate &&
                transition_evidence->phase_consistent(
-                   ProjectionTransitionEvidenceState::
-                       kActivatedAndRetired) &&
-               !publication_receipt.has_value() &&
-               !candidate_aggregate_health.has_value() && !error.has_value();
+                   ProjectionTransitionEvidenceState::kActivatedAndRetired) &&
+               !publication_receipt.has_value() && !candidate_aggregate_health.has_value() &&
+               !error.has_value();
       case ProjectionApplyStatusState::kPublished:
         return has_stage && has_candidate &&
                transition_evidence->phase_consistent(
-                   ProjectionTransitionEvidenceState::
-                       kActivatedAndRetired) &&
-               publication_receipt.has_value() &&
-               !candidate_aggregate_health.has_value() && !error.has_value();
+                   ProjectionTransitionEvidenceState::kActivatedAndRetired) &&
+               publication_receipt.has_value() && !candidate_aggregate_health.has_value() &&
+               !error.has_value();
       case ProjectionApplyStatusState::kFinalized:
         return has_stage && has_candidate &&
                transition_evidence->phase_consistent(
                    ProjectionTransitionEvidenceState::kFinalized) &&
-               publication_receipt.has_value() &&
-               candidate_aggregate_health.has_value() &&
-               transition_evidence->candidate_bindings_match(
-                   *candidate_aggregate_health) &&
-               candidate_aggregate_health->healthy_for_target(
-                   *candidate_projection_revision) &&
+               publication_receipt.has_value() && candidate_aggregate_health.has_value() &&
+               transition_evidence->candidate_bindings_match(*candidate_aggregate_health) &&
+               candidate_aggregate_health->healthy_for_target(*candidate_projection_revision) &&
                !error.has_value();
       case ProjectionApplyStatusState::kDiscarded:
         return has_stage && has_candidate &&
-               transition_evidence->phase_consistent(
-                   ProjectionTransitionEvidenceState::kAborted) &&
-               !publication_receipt.has_value() &&
-               !candidate_aggregate_health.has_value() && !error.has_value();
+               transition_evidence->phase_consistent(ProjectionTransitionEvidenceState::kAborted) &&
+               !publication_receipt.has_value() && !candidate_aggregate_health.has_value() &&
+               !error.has_value();
       case ProjectionApplyStatusState::kFailedProjectionUncertain:
-        return error.has_value() &&
-               !candidate_aggregate_health.has_value() &&
+        return error.has_value() && !candidate_aggregate_health.has_value() &&
                (!publication_receipt.has_value() || has_candidate) &&
-               (!has_evidence ||
-                transition_evidence->phase_consistent(
-                    ProjectionTransitionEvidenceState::kUncertain));
+               (!has_evidence || transition_evidence->phase_consistent(
+                                     ProjectionTransitionEvidenceState::kUncertain));
     }
     return false;
   }

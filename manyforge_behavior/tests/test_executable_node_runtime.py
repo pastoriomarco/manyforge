@@ -32,6 +32,7 @@ from manyforge_behavior.orchestration_ports import (
     NodeAdapterPorts,
     NodeAttemptIdentity,
     OwnerInvocationResult,
+    OwnerInvocationHeldError,
     OwnerNodeInputs,
     OwnerTaskObservationUnavailableError,
     OwnerTaskSettlementPendingError,
@@ -44,6 +45,7 @@ from manyforge_behavior.orchestration_values import (
     ProgramValueError,
     ProgramValueStore,
 )
+from manyforge_behavior.nodes.stop_policy import OperatorMotionStopState, OperatorMotionStopSnapshot
 from manyforge_behavior.program import Program, ProgramTreeNode
 from manyforge_behavior.program_runtime import (
     ExecutableProgramRun,
@@ -484,6 +486,49 @@ def test_accepted_task_retries_only_typed_observation_unavailability() -> None:
     assert len(task.starts) == 1
     assert task.observations == ["task-1", "task-1"]
     assert task.acknowledgements == [("task-1", task.starts[0][1])]
+
+
+@pytest.mark.parametrize("unstarted", [False, True])
+def test_held_task_observation_distinguishes_unstarted_from_settled_failure(unstarted):
+    class Port(_TaskPort):
+        def observe(self, task_id):
+            if unstarted:
+                raise OwnerInvocationHeldError(4)
+            return OwnerTaskSnapshot(task_id=task_id, state=OwnerTaskState.FAILED,
+                                     metadata={"finish_current_settled": True}, reason_code="refused")
+
+    document = _minimal_document()
+    document["tree"] = {"node_id": "simulation.reset", "instance_id": "action",
+                        "parameters": {}, "children": []}
+    catalog = _catalog()
+    program = Program.from_dict(_identified(document), catalog)
+    task = Port((OwnerTaskState.ACTIVE,))
+    state = OperatorMotionStopState({"action": ()})
+    environment = build_node_environment()
+    adapter = build_executable_node_resolver(environment).instantiate(
+        environment.registry.record("simulation.reset"), NodeAdapterBuildContext(
+            name="action", node_instance_id="action", parameters={},
+            input_resolver=NodeAttemptInputResolver(program=program, catalog=catalog,
+                value_store=ProgramValueStore.from_program(program)),
+            attempt_source=ProgramRunAttemptSource("run.held"),
+            ports=NodeAdapterPorts(simulator_control=task), operator_stop_state=state))
+    list(adapter.tick())
+    assert len(task.starts) == 1
+    state.publish(OperatorMotionStopSnapshot(4, frozenset({"action"})))
+    adapter.observe_while_operator_stop_held()
+    if unstarted:
+        assert adapter.presented_status is py_trees.common.Status.INVALID
+        assert adapter.observe_control_state() == "inactive"
+        list(adapter.tick())
+        assert len(task.starts) == 1
+        state.publish(OperatorMotionStopSnapshot(5))
+        list(adapter.tick())
+        assert len(task.starts) == 2  # Fresh attempt only after authoritative release.
+        assert task.starts[0][1] != task.starts[1][1]
+    else:
+        assert adapter.status is py_trees.common.Status.FAILURE
+        assert adapter.observe_control_state() == "settled"
+        assert not task.acknowledgements and not task.cancellations
 
 
 def test_terminal_task_remains_running_while_owner_settlement_is_pending() -> None:

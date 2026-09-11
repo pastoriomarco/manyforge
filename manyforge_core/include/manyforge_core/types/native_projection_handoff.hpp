@@ -122,6 +122,7 @@ struct NativeProjectionStageDTO final {
   [[nodiscard]] bool valid() const noexcept {
     return !apply_id.empty() && apply_generation.nonzero() &&
            projection_stage_generation.nonzero() && transition_row.valid() &&
+           !transition_row.managed_withdrawal &&
            transition_row.disposition != ProjectionTransitionDisposition::kRemoved &&
            transition_row.matches_predecessor(expected_predecessor_projection_revision) &&
            candidate_projection_revision.valid() &&
@@ -168,7 +169,7 @@ struct NativeProjectionStageResultDTO final {
 
   [[nodiscard]] bool presence_valid() const noexcept {
     if (apply_id.empty() || !apply_generation.nonzero() || !projection_stage_generation.nonzero() ||
-        !transition_row.valid() ||
+        !transition_row.valid() || transition_row.managed_withdrawal ||
         transition_row.disposition == ProjectionTransitionDisposition::kRemoved ||
         !transition_row.matches_predecessor(expected_predecessor_projection_revision) ||
         !candidate_projection_revision.valid() || !resulting_health.valid() ||
@@ -211,6 +212,7 @@ struct NativeProjectionActivationDTO final {
   [[nodiscard]] bool valid() const noexcept {
     return !apply_id.empty() && apply_generation.nonzero() &&
            projection_stage_generation.nonzero() && transition_row.valid() &&
+           !transition_row.managed_withdrawal &&
            transition_row.disposition != ProjectionTransitionDisposition::kRemoved &&
            transition_row.matches_predecessor(expected_predecessor_projection_revision) &&
            candidate_projection_revision.valid();
@@ -267,6 +269,7 @@ struct NativeProjectionRetireDTO final {
   [[nodiscard]] bool valid() const noexcept {
     return !apply_id.empty() && apply_generation.nonzero() &&
            projection_stage_generation.nonzero() && transition_row.valid() &&
+           !transition_row.managed_withdrawal &&
            transition_row.disposition == ProjectionTransitionDisposition::kRemoved &&
            transition_row.matches_predecessor(expected_predecessor_projection_revision) &&
            candidate_projection_revision.valid();
@@ -368,6 +371,7 @@ struct NativeProjectionDiscardDTO final {
   [[nodiscard]] bool valid() const noexcept {
     return !apply_id.empty() && apply_generation.nonzero() &&
            projection_stage_generation.nonzero() && transition_row.valid() &&
+           !transition_row.managed_withdrawal &&
            transition_row.disposition != ProjectionTransitionDisposition::kRemoved &&
            candidate_projection_revision.valid();
   }
@@ -415,6 +419,7 @@ struct NativeProjectionStatusQueryDTO final {
   [[nodiscard]] bool valid() const noexcept {
     return !apply_id.empty() && apply_generation.nonzero() &&
            projection_stage_generation.nonzero() && transition_row.valid() &&
+           !transition_row.managed_withdrawal &&
            transition_row.disposition != ProjectionTransitionDisposition::kRemoved;
   }
 };

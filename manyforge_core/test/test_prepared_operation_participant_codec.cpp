@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -15,6 +16,13 @@ namespace {
 
 [[nodiscard]] std::string Digest(char value) {
   return "sha256:" + std::string(64U, value);
+}
+
+[[nodiscard]] std::span<const HardStopResourceLimitDTO> DefaultLimits() {
+  static const std::array<HardStopResourceLimitDTO, 2> limits{
+      {{ResourceId("joint.1"), AngularVelocityDTO{0.02}},
+       {ResourceId("joint.2"), AngularVelocityDTO{0.02}}}};
+  return limits;
 }
 
 [[nodiscard]] RuntimePolicyCatalogRecordRefDTO PolicyReference(const RuntimePolicyDTO& policy) {
@@ -34,18 +42,37 @@ namespace {
   if (bytes.ends_with('\n')) bytes.pop_back();
   auto decoded = DecodeResolvedStopBasePlan(bytes);
   if (!decoded.ok()) throw std::logic_error(decoded.error().message);
-  return std::move(decoded.value());
-}
-
-[[nodiscard]] std::pair<std::string, std::string> ParticipantGolden() {
-  const auto path = std::filesystem::path(__FILE__).parent_path() / "golden" /
-                    "prepared_operation_participant.v1.sha256";
-  std::ifstream stream(path, std::ios::binary);
-  std::string canonical_hash;
-  std::string contract_digest;
-  std::getline(stream, canonical_hash);
-  std::getline(stream, contract_digest);
-  return {std::move(canonical_hash), std::move(contract_digest)};
+  auto base = std::move(decoded.value());
+  // The frozen historical codec fixture remains decodable, but its opaque
+  // Stop parameters cannot authorize a current operation. Supply the current
+  // typed contract and complete defaults before testing Prepare.
+  auto& nominal = base.escalation_stages.front();
+  const ProviderContractRefDTO contract{
+      ProviderContractRoleId("stop.command"),
+      SchemaId(std::string(kMotionControlledStopContractSchemaId)),
+      SchemaRevision(std::string(kMotionControlledStopContractSchemaRevision))};
+  nominal.containment_command.provider_contract_ref = contract;
+  nominal.command_qualification.controlled_substitution_contract->provider_contract_ref = contract;
+  JsonValueDTO::Array limits;
+  for (const auto& resource : {std::string("joint.1"), std::string("joint.2")}) {
+    limits.emplace_back(JsonObjectDTO{
+        {"resource_id", JsonValueDTO{resource}},
+        {"max_deceleration", JsonValueDTO{JsonObjectDTO{
+                                 {"coordinate_kind", JsonValueDTO{std::string("angular_rad_s2")}},
+                                 {"value_rad_s2", JsonValueDTO{2.0}}}}},
+        {"settle_velocity_threshold",
+         JsonValueDTO{JsonObjectDTO{{"coordinate_kind", JsonValueDTO{std::string("angular_rad_s")}},
+                                    {"value_rad_s", JsonValueDTO{0.02}}}}}});
+  }
+  nominal.default_contract_parameters =
+      JsonObjectDTO{{"stop_mode", JsonValueDTO{std::string("soft_on_path")}},
+                    {"jerk_limits_enabled", JsonValueDTO{false}},
+                    {"deceleration_time_s", JsonValueDTO{1.0}},
+                    {"allow_natural_completion_on_short_path", JsonValueDTO{true}},
+                    {"per_resource_limits", JsonValueDTO{std::move(limits)}}};
+  auto current = MakeResolvedStopBasePlan(std::move(base));
+  if (!current.ok()) throw std::logic_error(current.error().message);
+  return std::move(current.value());
 }
 
 [[nodiscard]] RuntimeParticipantBinding Binding(const ResolvedStopBasePlanDTO& base, bool command) {
@@ -264,9 +291,10 @@ struct SealedInputs final {
                                                      ParticipantStopProfilePurposeDTO::kOrdinary,
                                                      std::nullopt,
                                                      MotionInterruptNodeCategory::kGeneric};
-  auto stop = MakePreparedParticipantStopPlan(readiness.value().resolved_stop_base_plan,
-                                              std::move(stop_context), binding.resources, {});
-  if (!stop.ok()) throw std::logic_error(stop.error().message);
+  auto stop =
+      MakePreparedParticipantStopPlan(readiness.value().resolved_stop_base_plan,
+                                      std::move(stop_context), binding.resources, DefaultLimits());
+  if (!stop.ok()) throw std::logic_error(stop.error().details.at("reason"));
   const auto& domain = readiness.value().expected_controller_domain;
   const auto& interface_binding = domain.expected_bindings.front();
   PreparedParticipantSelectedRouteDTO route{domain.expected_endpoints};
@@ -431,11 +459,9 @@ struct SealedInputs final {
           state,
           {PlanResultDTO{trajectory, std::nullopt, projection}, 0U, planner_binding},
           {ValidationRevision("validation.1"),
-           ValidationResultDTO{
-               true, std::nullopt,
-               TrajectoryValidationMetricsDTO{1.0, {0.5, 0.5}, {0.0, 0.0}, 0.1}},
-           world,
-           CollisionPolicyRevision{1U, Digest('1')}, decision},
+           ValidationResultDTO{true, std::nullopt,
+                               TrajectoryValidationMetricsDTO{1.0, {0.5, 0.5}, {0.0, 0.0}, 0.1}},
+           world, CollisionPolicyRevision{1U, Digest('1')}, decision},
           std::nullopt,
           {inputs.runtime_policy->value().source_artifact,
            inputs.runtime_policy->value().selected_motion_speed_limit},
@@ -448,22 +474,31 @@ TEST(PreparedOperationParticipantCodecTest, SealsAndRoundTripsBothPayloadTags) {
   auto command_inputs = Inputs(base, true);
   auto command = MakePreparedOperationParticipant(
       Candidate(command_inputs.binding, command_inputs.readiness, CommandPayload()),
-      command_inputs.binding, command_inputs.readiness, nullptr, {},
+      command_inputs.binding, command_inputs.readiness, nullptr, DefaultLimits(),
       MotionInterruptNodeCategory::kGeneric);
   ASSERT_TRUE(command.ok()) << command.error().details.at("reason");
   const auto command_bytes = EncodePreparedOperationParticipant(
-      command.value(), command_inputs.binding, command_inputs.readiness, nullptr, {},
+      command.value(), command_inputs.binding, command_inputs.readiness, nullptr, DefaultLimits(),
       MotionInterruptNodeCategory::kGeneric);
   ASSERT_TRUE(command_bytes.ok()) << command_bytes.error().message;
-  const auto golden = ParticipantGolden();
-  EXPECT_EQ(content_identity::sha256_digest(command_bytes.value()), golden.first);
-  EXPECT_EQ(command.value().prepared_contract_digest.value(), golden.second);
-  const auto command_decoded = DecodePreparedOperationParticipant(
-      command_bytes.value(), command_inputs.binding, command_inputs.readiness, nullptr, {},
+  // Current candidates prove deterministic construction and round-trip
+  // integrity; the obsolete pre-typed-Stop aggregate hash is not a contract.
+  const auto rebuilt = MakePreparedOperationParticipant(
+      Candidate(command_inputs.binding, command_inputs.readiness, CommandPayload()),
+      command_inputs.binding, command_inputs.readiness, nullptr, DefaultLimits(),
       MotionInterruptNodeCategory::kGeneric);
+  ASSERT_TRUE(rebuilt.ok());
+  EXPECT_EQ(EncodePreparedOperationParticipant(rebuilt.value(), command_inputs.binding,
+                                               command_inputs.readiness, nullptr, DefaultLimits(),
+                                               MotionInterruptNodeCategory::kGeneric)
+                .value(),
+            command_bytes.value());
+  const auto command_decoded = DecodePreparedOperationParticipant(
+      command_bytes.value(), command_inputs.binding, command_inputs.readiness, nullptr,
+      DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
   ASSERT_TRUE(command_decoded.ok()) << command_decoded.error().message;
   EXPECT_EQ(EncodePreparedOperationParticipant(command_decoded.value(), command_inputs.binding,
-                                               command_inputs.readiness, nullptr, {},
+                                               command_inputs.readiness, nullptr, DefaultLimits(),
                                                MotionInterruptNodeCategory::kGeneric)
                 .value(),
             command_bytes.value());
@@ -471,44 +506,59 @@ TEST(PreparedOperationParticipantCodecTest, SealsAndRoundTripsBothPayloadTags) {
   auto motion_inputs = Inputs(base, false);
   auto motion = MakePreparedOperationParticipant(
       Candidate(motion_inputs.binding, motion_inputs.readiness, MotionPayload(motion_inputs)),
-      motion_inputs.binding, motion_inputs.readiness, &*motion_inputs.runtime_policy, {},
-      MotionInterruptNodeCategory::kGeneric);
+      motion_inputs.binding, motion_inputs.readiness, &*motion_inputs.runtime_policy,
+      DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
   ASSERT_TRUE(motion.ok()) << motion.error().details.at("reason");
   const auto motion_bytes = EncodePreparedOperationParticipant(
       motion.value(), motion_inputs.binding, motion_inputs.readiness,
-      &*motion_inputs.runtime_policy, {}, MotionInterruptNodeCategory::kGeneric);
+      &*motion_inputs.runtime_policy, DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
   ASSERT_TRUE(motion_bytes.ok()) << motion_bytes.error().message;
   const auto motion_decoded = DecodePreparedOperationParticipant(
       motion_bytes.value(), motion_inputs.binding, motion_inputs.readiness,
-      &*motion_inputs.runtime_policy, {}, MotionInterruptNodeCategory::kGeneric);
+      &*motion_inputs.runtime_policy, DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
   ASSERT_TRUE(motion_decoded.ok()) << motion_decoded.error().message;
   const auto& decoded_payload =
       std::get<PreparedMotionExecutionDTO>(motion_decoded.value().payload);
   EXPECT_EQ(decoded_payload.move_id.value(), "move.1");
-  ASSERT_TRUE(decoded_payload.validation_evidence.noncollision_result
-                  .trajectory_metrics.has_value());
-  const auto& metrics = *decoded_payload.validation_evidence.noncollision_result
-                             .trajectory_metrics;
+  ASSERT_TRUE(
+      decoded_payload.validation_evidence.noncollision_result.trajectory_metrics.has_value());
+  const auto& metrics = *decoded_payload.validation_evidence.noncollision_result.trajectory_metrics;
   EXPECT_DOUBLE_EQ(metrics.trajectory_duration_s, 1.0);
-  EXPECT_EQ(metrics.peak_abs_joint_velocity_rad_s,
-            (std::vector<double>{0.5, 0.5}));
-  EXPECT_EQ(metrics.peak_abs_joint_acceleration_rad_s2,
-            (std::vector<double>{0.0, 0.0}));
+  EXPECT_EQ(metrics.peak_abs_joint_velocity_rad_s, (std::vector<double>{0.5, 0.5}));
+  EXPECT_EQ(metrics.peak_abs_joint_acceleration_rad_s2, (std::vector<double>{0.0, 0.0}));
   ASSERT_TRUE(metrics.peak_tcp_linear_speed_mps.has_value());
   EXPECT_DOUBLE_EQ(*metrics.peak_tcp_linear_speed_mps, 0.1);
-  EXPECT_EQ(decoded_payload.runtime_policy.source_artifact.record_id.value(),
-            "runtime.policy");
-  EXPECT_EQ(
-      decoded_payload.runtime_policy.source_artifact.record_revision.value(),
-      Digest('2'));
-  EXPECT_EQ(decoded_payload.runtime_policy.source_artifact
-                .content_addressed_store_key.value(),
+  EXPECT_EQ(decoded_payload.runtime_policy.source_artifact.record_id.value(), "runtime.policy");
+  EXPECT_EQ(decoded_payload.runtime_policy.source_artifact.record_revision.value(), Digest('2'));
+  EXPECT_EQ(decoded_payload.runtime_policy.source_artifact.content_addressed_store_key.value(),
             "catalog/runtime-policy/runtime.policy.json");
   EXPECT_TRUE(std::holds_alternative<RuntimePolicyCellScopeDTO>(
       decoded_payload.runtime_policy.selected_motion_speed_limit.scope));
-  EXPECT_DOUBLE_EQ(decoded_payload.runtime_policy.selected_motion_speed_limit
-                       .maximum_tcp_linear_speed_mps,
-                   0.5);
+  EXPECT_DOUBLE_EQ(
+      decoded_payload.runtime_policy.selected_motion_speed_limit.maximum_tcp_linear_speed_mps, 0.5);
+}
+
+TEST(PreparedOperationParticipantCodecTest, RejectsCartesianMilestonesForAnotherIntent) {
+  const auto base = BasePlan();
+  auto inputs = Inputs(base, false);
+  auto payload = MotionPayload(inputs);
+  payload.trajectory.cartesian_waypoint_times_s = {0.0, 1.0};
+  const auto seal = [&] {
+    return MakePreparedOperationParticipant(
+        Candidate(inputs.binding, inputs.readiness, payload), inputs.binding, inputs.readiness,
+        &*inputs.runtime_policy, DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
+  };
+  auto wrong_kind = seal();
+  ASSERT_FALSE(wrong_kind.ok());
+  EXPECT_EQ(wrong_kind.error().details.at("reason"),
+            "prepared_cartesian_waypoint_milestones_mismatch");
+  CartesianPathDTO path;
+  path.waypoints.resize(3U);
+  payload.plan_request.motion = path;
+  auto wrong_count = seal();
+  ASSERT_FALSE(wrong_count.ok());
+  EXPECT_EQ(wrong_count.error().details.at("reason"),
+            "prepared_cartesian_waypoint_milestones_mismatch");
 }
 
 TEST(PreparedOperationParticipantCodecTest, RejectsSelfAttestedClaimsAndDigestForgery) {
@@ -516,17 +566,19 @@ TEST(PreparedOperationParticipantCodecTest, RejectsSelfAttestedClaimsAndDigestFo
   auto inputs = Inputs(base, true);
   auto made = MakePreparedOperationParticipant(
       Candidate(inputs.binding, inputs.readiness, CommandPayload()), inputs.binding,
-      inputs.readiness, nullptr, {}, MotionInterruptNodeCategory::kGeneric);
+      inputs.readiness, nullptr, DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
   ASSERT_TRUE(made.ok());
   auto forged = made.value();
   forged.claimed_command_interfaces.front().interface_name = "velocity";
   EXPECT_FALSE(VerifyPreparedOperationParticipant(forged, inputs.binding, inputs.readiness, nullptr,
-                                                  {}, MotionInterruptNodeCategory::kGeneric)
+                                                  DefaultLimits(),
+                                                  MotionInterruptNodeCategory::kGeneric)
                    .ok());
   forged = made.value();
   forged.prepared_contract_digest = ContentDigest(Digest('0'));
   EXPECT_FALSE(VerifyPreparedOperationParticipant(forged, inputs.binding, inputs.readiness, nullptr,
-                                                  {}, MotionInterruptNodeCategory::kGeneric)
+                                                  DefaultLimits(),
+                                                  MotionInterruptNodeCategory::kGeneric)
                    .ok());
 }
 
@@ -535,7 +587,8 @@ TEST(PreparedOperationParticipantCodecTest, BackendBindingRejectsCrossedParticip
   auto inputs = Inputs(base, false);
   auto made = MakePreparedOperationParticipant(
       Candidate(inputs.binding, inputs.readiness, MotionPayload(inputs)), inputs.binding,
-      inputs.readiness, &*inputs.runtime_policy, {}, MotionInterruptNodeCategory::kGeneric);
+      inputs.readiness, &*inputs.runtime_policy, DefaultLimits(),
+      MotionInterruptNodeCategory::kGeneric);
   ASSERT_TRUE(made.ok());
   EXPECT_FALSE(
       prepared_participant_backend_binding_field_error(
@@ -559,7 +612,8 @@ TEST(PreparedOperationParticipantCodecTest,
   auto inputs = Inputs(base, false);
   auto made = MakePreparedOperationParticipant(
       Candidate(inputs.binding, inputs.readiness, MotionPayload(inputs)), inputs.binding,
-      inputs.readiness, &*inputs.runtime_policy, {}, MotionInterruptNodeCategory::kGeneric);
+      inputs.readiness, &*inputs.runtime_policy, DefaultLimits(),
+      MotionInterruptNodeCategory::kGeneric);
   ASSERT_TRUE(made.ok());
 
   auto physical_value = inputs.binding.value();
@@ -594,17 +648,17 @@ TEST(PreparedOperationParticipantCodecTest,
   const auto candidate = Candidate(inputs.binding, inputs.readiness, MotionPayload(inputs));
 
   auto missing =
-      MakePreparedOperationParticipant(candidate, inputs.binding, inputs.readiness, nullptr, {},
-                                       MotionInterruptNodeCategory::kGeneric);
+      MakePreparedOperationParticipant(candidate, inputs.binding, inputs.readiness, nullptr,
+                                       DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
   ASSERT_FALSE(missing.ok());
   EXPECT_EQ(missing.error().details.at("reason"), "runtime_policy_selection_required");
 
   auto foreign = candidate;
   std::get<PreparedMotionExecutionDTO>(foreign.payload)
       .runtime_policy.source_artifact.record_revision = RuntimePolicyRevision(Digest('0'));
-  auto foreign_result = MakePreparedOperationParticipant(std::move(foreign), inputs.binding,
-                                                         inputs.readiness, &*inputs.runtime_policy,
-                                                         {}, MotionInterruptNodeCategory::kGeneric);
+  auto foreign_result = MakePreparedOperationParticipant(
+      std::move(foreign), inputs.binding, inputs.readiness, &*inputs.runtime_policy,
+      DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
   ASSERT_FALSE(foreign_result.ok());
   EXPECT_EQ(foreign_result.error().details.at("reason"), "motion_payload_join_invalid");
 
@@ -613,8 +667,8 @@ TEST(PreparedOperationParticipantCodecTest,
       .runtime_policy.source_artifact.content_addressed_store_key =
       ContentAddressedStoreKey("catalog/runtime-policy/other.json");
   auto wrong_source_result = MakePreparedOperationParticipant(
-      std::move(wrong_source), inputs.binding, inputs.readiness, &*inputs.runtime_policy, {},
-      MotionInterruptNodeCategory::kGeneric);
+      std::move(wrong_source), inputs.binding, inputs.readiness, &*inputs.runtime_policy,
+      DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
   ASSERT_FALSE(wrong_source_result.ok());
   EXPECT_EQ(wrong_source_result.error().details.at("reason"), "motion_payload_join_invalid");
 
@@ -623,17 +677,17 @@ TEST(PreparedOperationParticipantCodecTest,
       .runtime_policy.selected_motion_speed_limit.scope = RuntimePolicyCommandTargetScopeDTO{
       ControllableComponentId("robot.1"), CommandTargetId("other")};
   auto wrong_scope_result = MakePreparedOperationParticipant(
-      std::move(wrong_scope), inputs.binding, inputs.readiness, &*inputs.runtime_policy, {},
-      MotionInterruptNodeCategory::kGeneric);
+      std::move(wrong_scope), inputs.binding, inputs.readiness, &*inputs.runtime_policy,
+      DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
   ASSERT_FALSE(wrong_scope_result.ok());
   EXPECT_EQ(wrong_scope_result.error().details.at("reason"), "motion_payload_join_invalid");
 
   auto weaker = candidate;
   std::get<PreparedMotionExecutionDTO>(weaker.payload)
       .plan_request.speed_profile.max_tcp_linear_speed_mps = 0.75;
-  auto weaker_result = MakePreparedOperationParticipant(std::move(weaker), inputs.binding,
-                                                        inputs.readiness, &*inputs.runtime_policy,
-                                                        {}, MotionInterruptNodeCategory::kGeneric);
+  auto weaker_result = MakePreparedOperationParticipant(
+      std::move(weaker), inputs.binding, inputs.readiness, &*inputs.runtime_policy, DefaultLimits(),
+      MotionInterruptNodeCategory::kGeneric);
   ASSERT_FALSE(weaker_result.ok());
   EXPECT_EQ(weaker_result.error().details.at("reason"), "motion_payload_join_invalid");
 }

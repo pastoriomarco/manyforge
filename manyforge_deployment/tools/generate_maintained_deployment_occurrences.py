@@ -32,9 +32,11 @@ DESCRIPTION_API: Final = "manyforge.maintained_deployment_sources.v1"
 ASSISTANT_API: Final = "manyforge.maintained_assistant_profiles.v1"
 ROLE_ASSIGNMENTS_API: Final = "manyforge.maintained_program_role_assignments.v1"
 CONTENT_IDENTITY_PREFIX: Final = b"manyforge.content-identity.v1\0"
-NATIVE_RUNTIME_CONFIGURATION_SCHEMA_ID: Final = "manyforge.value_schema.runtime.native_execution.v1"
+NATIVE_RUNTIME_CONFIGURATION_SCHEMA_ID: Final = (
+    "manyforge.value_schema.runtime.native_execution.v1"
+)
 NATIVE_RUNTIME_CONFIGURATION_SCHEMA_REVISION: Final = (
-    "sha256:4405892649681799b9a813fafee4b5d23579d080b5457bf60f51ce2e296fcff8"
+    "sha256:49b3bbd377ad4cb93e7d27df06ff84b7e9ddbce3f3047e5702c61a9828c62035"
 )
 ROS2_CONTROL_RUNTIME_CONFIGURATION_SCHEMA_ID: Final = (
     "manyforge.value_schema.runtime.ros2_control_execution.v1"
@@ -42,7 +44,9 @@ ROS2_CONTROL_RUNTIME_CONFIGURATION_SCHEMA_ID: Final = (
 ROS2_CONTROL_RUNTIME_CONFIGURATION_SCHEMA_REVISION: Final = (
     "sha256:4ff0c6d3d2e4cf9eae515f0ba3343404e3f30939a08f886aadfe26fa57fe173d"
 )
-EMPTY_PROVIDER_CONTRACT_SCHEMA_ID: Final = "manyforge.value_schema.provider_contract.empty.v1"
+EMPTY_PROVIDER_CONTRACT_SCHEMA_ID: Final = (
+    "manyforge.value_schema.provider_contract.empty.v1"
+)
 EMPTY_PROVIDER_CONTRACT_SCHEMA_REVISION: Final = (
     "sha256:fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270"
 )
@@ -50,7 +54,7 @@ MOTION_CONTROLLED_STOP_SCHEMA_ID: Final = (
     "manyforge.value_schema.provider_contract.motion_controlled_stop.v1"
 )
 MOTION_CONTROLLED_STOP_SCHEMA_REVISION: Final = (
-    "sha256:afbbcda3b81eabff2bbdffb5658fb1fcd3331cde896cadf0681793a2f9db90dd"
+    "sha256:58ec6382a268329e9d8001eb53aac31259b5eb95a3690095aa4bbe12ac51d83b"
 )
 LIFECYCLE_CATALOG_API_VERSION: Final = "manyforge.brand_lifecycle_plan_catalog.v1"
 LITE6_LIFECYCLE_PROVIDER_ID: Final = "lite6_arm_provider"
@@ -385,13 +389,15 @@ class GenerationError(ValueError):
 
 
 def canonical_bytes(value: object) -> bytes:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode(
-        "utf-8"
-    )
+    return json.dumps(
+        value, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
 
 
 def pretty_bytes(value: object) -> bytes:
-    return (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    return (
+        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
 
 
 def sha256_digest(payload: bytes) -> str:
@@ -567,10 +573,15 @@ def component_type_document(
 ) -> dict[str, Any]:
     family_id = family["model_family_id"]
     semantics = family["semantics"]
-    group_roles = {row["model_group_role_id"] for row in semantics["model_group_role_bindings"]}
-    resource_roles = {row["resource_role_id"] for row in semantics["resource_role_bindings"]}
+    group_roles = {
+        row["model_group_role_id"] for row in semantics["model_group_role_bindings"]
+    }
+    resource_roles = {
+        row["resource_role_id"] for row in semantics["resource_role_bindings"]
+    }
     collision_roles = {
-        row["collision_body_role_id"] for row in semantics["collision_body_role_bindings"]
+        row["collision_body_role_id"]
+        for row in semantics["collision_body_role_bindings"]
     }
     physical_gripper = "gripper" in group_roles and "fingers" in resource_roles
     arm_collision_roles = [
@@ -673,7 +684,8 @@ def component_type_document(
                     }
                 ],
                 "capabilities": [
-                    capability_selector(capability_id) for capability_id in GRIPPER_CAPABILITIES
+                    capability_selector(capability_id)
+                    for capability_id in GRIPPER_CAPABILITIES
                 ],
             },
         ],
@@ -693,7 +705,9 @@ def control_contract(target: str, runtime_kind: str = "native") -> dict[str, Any
     value = {
         "api_version": "manyforge.control_interface_contract.v1",
         "control_interface_contract_id": f"manyforge.{prefix}_{target}_position",
-        "command_interfaces": [{"resource_role_id": role, "interface_name": "position"}],
+        "command_interfaces": [
+            {"resource_role_id": role, "interface_name": "position"}
+        ],
         "state_interfaces": [{"resource_role_id": role, "interface_name": "position"}],
         "ordering": [role],
     }
@@ -792,7 +806,9 @@ def controller_topology(
         "legal_routes": [
             {
                 "control_route_id": route,
-                "control_interface_contract_id": contract["control_interface_contract_id"],
+                "control_interface_contract_id": contract[
+                    "control_interface_contract_id"
+                ],
                 "control_interface_revision": contract["control_interface_revision"],
                 "ordered_controller_role_ids": route_roles,
                 "compatible_activation_set_ids": [activation],
@@ -898,7 +914,9 @@ def lifecycle_token(value: str) -> dict[str, Any]:
     return {"kind": "token", "token_value": value}
 
 
-def lifecycle_predicate(states: list[str], facts: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def lifecycle_predicate(
+    states: list[str], facts: dict[str, dict[str, Any]]
+) -> dict[str, Any]:
     state_order = {
         state: index
         for index, state in enumerate(
@@ -1028,7 +1046,9 @@ def lite6_lifecycle_plans() -> list[dict[str, Any]]:
                     ),
                     enabled_stopped,
                 ),
-                lifecycle_transition("xarm.select_joint_servo_mode", enabled_stopped, prepared),
+                lifecycle_transition(
+                    "xarm.select_joint_servo_mode", enabled_stopped, prepared
+                ),
             ],
         },
         {
@@ -1144,7 +1164,9 @@ def lifecycle_product(
         + b"\0"
         + canonical_bytes(semantic_projection)
     )
-    lifecycle_capabilities = tuple(f"component.lifecycle.{intent}" for intent in LIFECYCLE_INTENTS)
+    lifecycle_capabilities = tuple(
+        f"component.lifecycle.{intent}" for intent in LIFECYCLE_INTENTS
+    )
     manifest = revisioned_document(
         {
             "api_version": "manyforge.provider_manifest.v1",
@@ -1208,14 +1230,18 @@ def lite6_gripper_lifecycle_plans() -> list[dict[str, Any]]:
             "requested_state": "prepared",
             "requested_postcondition": prepared,
             "timeout_duration_ns": timeout_ns,
-            "transitions": [lifecycle_transition("native.gripper.prepare", declared, prepared)],
+            "transitions": [
+                lifecycle_transition("native.gripper.prepare", declared, prepared)
+            ],
         },
         {
             "intent": "enable",
             "requested_state": "active",
             "requested_postcondition": active,
             "timeout_duration_ns": timeout_ns,
-            "transitions": [lifecycle_transition("native.gripper.enable", prepared, active)],
+            "transitions": [
+                lifecycle_transition("native.gripper.enable", prepared, active)
+            ],
         },
         {
             "intent": "disable",
@@ -1225,7 +1251,9 @@ def lite6_gripper_lifecycle_plans() -> list[dict[str, Any]]:
             "transitions": [
                 lifecycle_transition(
                     "native.gripper.disable",
-                    lifecycle_predicate(["prepared", "active", "degraded", "faulted"], {}),
+                    lifecycle_predicate(
+                        ["prepared", "active", "degraded", "faulted"], {}
+                    ),
                     disabled,
                 )
             ],
@@ -1250,7 +1278,9 @@ def lite6_gripper_lifecycle_plans() -> list[dict[str, Any]]:
 
 
 def lite6_gripper_lifecycle_product() -> tuple[dict[str, Any], dict[str, Any]]:
-    return lifecycle_product(LITE6_GRIPPER_LIFECYCLE_PROVIDER_ID, lite6_gripper_lifecycle_plans())
+    return lifecycle_product(
+        LITE6_GRIPPER_LIFECYCLE_PROVIDER_ID, lite6_gripper_lifecycle_plans()
+    )
 
 
 def native_lite6_provider_manifest(
@@ -1260,7 +1290,8 @@ def native_lite6_provider_manifest(
     include_motion_controlled_stop: bool,
 ) -> dict[str, Any]:
     lifecycle_capabilities = {
-        offer["capability_id"]: offer for offer in lifecycle_manifest["offered_capabilities"]
+        offer["capability_id"]: offer
+        for offer in lifecycle_manifest["offered_capabilities"]
     }
     offered_capabilities = list(lifecycle_capabilities.values())
     offered_capabilities.extend(
@@ -1283,7 +1314,9 @@ def native_lite6_provider_manifest(
             "provider_manifest_id": lifecycle_manifest["provider_manifest_id"],
             "offered_capabilities": offered_capabilities,
             "provider_contracts": provider_contracts,
-            "lifecycle_plan_catalog": copy.deepcopy(lifecycle_manifest["lifecycle_plan_catalog"]),
+            "lifecycle_plan_catalog": copy.deepcopy(
+                lifecycle_manifest["lifecycle_plan_catalog"]
+            ),
         },
         domain="catalog-record-revision/provider_manifest",
         api_version="manyforge.provider_manifest.v1",
@@ -1372,8 +1405,14 @@ def ros2_control_provider_manifest(
         for intent in ("disable", "enable", "observe", "prepare", "recover")
     )
     endpoint_roles = {
-        **{capability_id: ["command", "state"] for capability_id in control_capabilities},
-        **{capability_id: ["planner_scene_projection"] for capability_id in planner_capabilities},
+        **{
+            capability_id: ["command", "state"]
+            for capability_id in control_capabilities
+        },
+        **{
+            capability_id: ["planner_scene_projection"]
+            for capability_id in planner_capabilities
+        },
         **{capability_id: [] for capability_id in lifecycle_capabilities},
     }
     return revisioned_document(
@@ -1392,7 +1431,9 @@ def ros2_control_provider_manifest(
                     motion_controlled_stop_provider_contract(),
                     software_hard_provider_contract(),
                 ],
-                key=lambda row: row["provider_contract_ref"]["provider_contract_role_id"],
+                key=lambda row: row["provider_contract_ref"][
+                    "provider_contract_role_id"
+                ],
             ),
             "lifecycle_plan_catalog": {
                 "catalog_api_version": LIFECYCLE_CATALOG_API_VERSION,
@@ -1405,7 +1446,9 @@ def ros2_control_provider_manifest(
     )
 
 
-def lite6_lifecycle_identity_header(manifest: dict[str, Any], catalog: dict[str, Any]) -> bytes:
+def lite6_lifecycle_identity_header(
+    manifest: dict[str, Any], catalog: dict[str, Any]
+) -> bytes:
     semantic_digest = manifest["lifecycle_plan_catalog"]["semantic_digest"]
     return (
         "// Generated by generate_maintained_deployment_occurrences.py; do not edit.\n"
@@ -1459,7 +1502,9 @@ def controller_goal_cancel_stop_policy() -> dict[str, Any]:
                             "source_kind": "controller_goal_status",
                             "freshness_budget_ns": 100_000_000,
                         },
-                        "observation_semantics": {"observation_kind": "post_command_sample"},
+                        "observation_semantics": {
+                            "observation_kind": "post_command_sample"
+                        },
                     }
                 ],
             },
@@ -1639,7 +1684,9 @@ def ros2_control_runtime_profile() -> dict[str, Any]:
             "schema_revision": ROS2_CONTROL_RUNTIME_CONFIGURATION_SCHEMA_REVISION,
         },
         "process_contract": {"lifecycle_control": "manager_managed"},
-        "supervision_contract": {"status_endpoint_role_id": "ros2_control_execution_status"},
+        "supervision_contract": {
+            "status_endpoint_role_id": "ros2_control_execution_status"
+        },
         "offered_runtime_role_ids": ["ros2_control_execution"],
         "source_endpoint_role_ids": [
             "logical_scene_services",
@@ -1655,7 +1702,9 @@ def ros2_control_runtime_profile() -> dict[str, Any]:
     )
 
 
-def deployment_runtime_policy(deployment: dict[str, Any], *, ros2_control: bool) -> dict[str, Any]:
+def deployment_runtime_policy(
+    deployment: dict[str, Any], *, ros2_control: bool
+) -> dict[str, Any]:
     speed_inputs = [
         row
         for row in deployment["policy_restoration_inputs"]
@@ -1673,10 +1722,14 @@ def deployment_runtime_policy(deployment: dict[str, Any], *, ros2_control: bool)
         for assignment in deployment["program_role_assignments"]
     }
     component_ids = {
-        assignment["component_roles"][assignment["target_roles"][target_role_id]["component_role"]]
+        assignment["component_roles"][
+            assignment["target_roles"][target_role_id]["component_role"]
+        ]
         for assignment in deployment["program_role_assignments"]
     }
-    if target_ids != {"arm"} or component_ids != {deployment["component_occurrence_id"]}:
+    if target_ids != {"arm"} or component_ids != {
+        deployment["component_occurrence_id"]
+    }:
         raise GenerationError(
             f"deployment {deployment['deployment_source']} has an ambiguous "
             "target TCP speed-limit scope"
@@ -1808,7 +1861,9 @@ def catalog_sources(
         )
     )
     lifecycle_manifest, lifecycle_catalog = lite6_lifecycle_product()
-    gripper_lifecycle_manifest, _gripper_lifecycle_catalog = lite6_gripper_lifecycle_product()
+    gripper_lifecycle_manifest, _gripper_lifecycle_catalog = (
+        lite6_gripper_lifecycle_product()
+    )
     native_arm_capabilities = tuple(
         sorted(
             capability_id
@@ -1942,7 +1997,9 @@ def catalog_sources(
         for profile in description["runtime_restoration_profiles"]
     }
     for deployment in description["deployments"]:
-        restoration = runtime_profiles_by_id[deployment["runtime_restoration_profile_id"]]
+        restoration = runtime_profiles_by_id[
+            deployment["runtime_restoration_profile_id"]
+        ]
         runtime_policy = deployment_runtime_policy(
             deployment,
             ros2_control="ros2_control_runtime" in restoration,
@@ -2012,7 +2069,9 @@ def catalog_sources(
                 value=fixed,
             )
 
-    command_path = root / "manyforge_deployment/resources/catalog/gripper.command_position.v1.yaml"
+    command_path = (
+        root / "manyforge_deployment/resources/catalog/gripper.command_position.v1.yaml"
+    )
     command = read_yaml(command_path, "gripper command schema")
     command_payload = command_path.read_bytes()
     sources["command_schema"] = (
@@ -2095,17 +2154,25 @@ def graph_and_applicability(
         "ros2_control_runtime" if ros2_control else "native_runtime"
     ]
     key_prefix = "ros2_control:" if ros2_control else ""
-    native_lite6_lifecycle = not ros2_control and family_id == LITE6_NATIVE_MODEL_FAMILY_ID
-    component_ref = refs[f"component:{'fixed_scale:' if ros2_control else ''}{family_id}"]
+    native_lite6_lifecycle = (
+        not ros2_control and family_id == LITE6_NATIVE_MODEL_FAMILY_ID
+    )
+    component_ref = refs[
+        f"component:{'fixed_scale:' if ros2_control else ''}{family_id}"
+    ]
     model_ref = refs[f"model:{family_id}"]
     runtime_ref = refs[f"runtime{':ros2_control' if ros2_control else ''}"]
     arm_stop_ref = refs["stop:arm"]
     goal_cancel_stop_ref = refs["stop:goal_cancel"]
     control_ref = refs["provider:ros2_control" if ros2_control else "provider:control"]
-    planning_ref = refs["provider:ros2_control" if ros2_control else "provider:planning"]
+    planning_ref = refs[
+        "provider:ros2_control" if ros2_control else "provider:planning"
+    ]
     logical_scene_ref = refs["provider:logical_scene"]
     runtime_unit_id = (
-        f"{occurrence}.ros2_control_execution" if ros2_control else f"{occurrence}.native_execution"
+        f"{occurrence}.ros2_control_execution"
+        if ros2_control
+        else f"{occurrence}.native_execution"
     )
     physical_provider_instance_id = (
         f"{occurrence}.ros2_control" if ros2_control else f"{occurrence}.native_control"
@@ -2157,7 +2224,9 @@ def graph_and_applicability(
             if CAPABILITIES[capability_id][2] != "control_binding":
                 continue
             binding = {
-                "control_binding_id": control_binding_id(occurrence, target, capability_id),
+                "control_binding_id": control_binding_id(
+                    occurrence, target, capability_id
+                ),
                 "control_binding_revision": ZERO_DIGEST,
                 "controllable_component_id": occurrence,
                 "command_target_id": target,
@@ -2259,10 +2328,16 @@ def graph_and_applicability(
                 "control_domain_revision": ZERO_DIGEST,
                 "runtime_unit_ids": [runtime_unit_id],
                 "control_coordinator_endpoint_role": (
-                    "ros2_control_execution_status" if ros2_control else "native_execution_status"
+                    "ros2_control_execution_status"
+                    if ros2_control
+                    else "native_execution_status"
                 ),
-                "controller_topology_id": refs[f"topology:{key_prefix}{target}"]["record_id"],
-                "topology_revision": refs[f"topology:{key_prefix}{target}"]["record_revision"],
+                "controller_topology_id": refs[f"topology:{key_prefix}{target}"][
+                    "record_id"
+                ],
+                "topology_revision": refs[f"topology:{key_prefix}{target}"][
+                    "record_revision"
+                ],
                 "containment_granularity": "resource",
             }
             for target in ("arm", "gripper")
@@ -2386,7 +2461,9 @@ def operator_stop_contract_parameters(
     acceleration = profile["per_joint_max_deceleration_rad_s2"]
     if family["model_family_id"] == LITE6_NATIVE_MODEL_FAMILY_ID:
         expected_acceleration = {joint: 4.0 for joint in source_joints}
-        fault_profile = runtime_restoration_profile["stop_profiles"]["default_fault_stop_profile"]
+        fault_profile = runtime_restoration_profile["stop_profiles"][
+            "default_fault_stop_profile"
+        ]
         if (
             profile.get("deceleration_time_s") != 1.0
             or profile.get("allow_natural_completion_on_short_path") is not True
@@ -2395,7 +2472,8 @@ def operator_stop_contract_parameters(
             or fault_profile.get("profile_id") != "fault_spring_back_hold"
             or fault_profile.get("stop_mode") != "spring_back_hold"
             or fault_profile.get("deceleration_time_s") != 1.0
-            or fault_profile.get("per_joint_max_deceleration_rad_s2") != expected_acceleration
+            or fault_profile.get("per_joint_max_deceleration_rad_s2")
+            != expected_acceleration
             or fault_profile.get("require_backend_confirmation", True) is not True
         ):
             raise GenerationError(
@@ -2405,7 +2483,9 @@ def operator_stop_contract_parameters(
     if len(source_joints) != len(resources) or any(
         joint not in acceleration for joint in source_joints
     ):
-        raise GenerationError("operator Stop acceleration limits do not cover the exact arm scope")
+        raise GenerationError(
+            "operator Stop acceleration limits do not cover the exact arm scope"
+        )
     resource_limits = [
         {
             "resource_id": resource["resource_id"],
@@ -2423,12 +2503,19 @@ def operator_stop_contract_parameters(
     resource_limits.sort(key=lambda row: row["resource_id"])
     result = {
         "stop_mode": "soft_on_path",
+        # Explicitly preserve the old maintained examples' Stop-only shaping.
+        # User Deployments without this choice require migration/review.
+        "jerk_limits_enabled": True,
         "deceleration_time_s": profile["deceleration_time_s"],
         "per_resource_limits": resource_limits,
-        "allow_natural_completion_on_short_path": profile["allow_natural_completion_on_short_path"],
+        "allow_natural_completion_on_short_path": profile[
+            "allow_natural_completion_on_short_path"
+        ],
     }
     if "recoverable_substitution_mode" in profile:
-        result["recoverable_substitution_mode"] = profile["recoverable_substitution_mode"]
+        result["recoverable_substitution_mode"] = profile[
+            "recoverable_substitution_mode"
+        ]
     return result
 
 
@@ -2454,9 +2541,13 @@ def stop_policy_projection(
                         "topology_revision": binding["topology_revision"],
                         "control_route_id": route_id,
                         "stop_evidence_policy_id": binding["stop_evidence_policy_id"],
-                        "stop_evidence_policy_revision": binding["stop_evidence_policy_revision"],
+                        "stop_evidence_policy_revision": binding[
+                            "stop_evidence_policy_revision"
+                        ],
                         "stop_escalation_stage_id": "motion_controlled_stop",
-                        "provider_contract_ref": (motion_controlled_stop_provider_contract_ref()),
+                        "provider_contract_ref": (
+                            motion_controlled_stop_provider_contract_ref()
+                        ),
                         "default_contract_parameters": (
                             operator_stop_contract_parameters(
                                 family, runtime_restoration_profile, binding
@@ -2474,7 +2565,9 @@ def stop_policy_projection(
                     "topology_revision": binding["topology_revision"],
                     "control_route_id": route_id,
                     "stop_evidence_policy_id": binding["stop_evidence_policy_id"],
-                    "stop_evidence_policy_revision": binding["stop_evidence_policy_revision"],
+                    "stop_evidence_policy_revision": binding[
+                        "stop_evidence_policy_revision"
+                    ],
                     "stop_escalation_stage_id": "software_hard",
                     "provider_contract_ref": software_hard_provider_contract_ref(),
                     "default_contract_parameters": {},
@@ -2491,6 +2584,27 @@ def stop_policy_projection(
     return {
         "retained_policy_records": [copy.deepcopy(runtime_policy_ref)],
         "stop_stage_parameters": stop_stage_parameters,
+        # Explicit new example settings, not a reinterpretation of the old
+        # catalog's outer envelope. ROS/controller-backed examples retain a
+        # larger settling allowance; provider qualification is still required.
+        "stop_timing_parameters": [
+            {
+                "control_binding_id": binding["control_binding_id"],
+                "control_binding_revision": binding["control_binding_revision"],
+                "timing": {
+                    "command_latency_allowance_ns": 250_000_000,
+                    "settling_allowance_ns": (
+                        1_500_000_000
+                        if "ros2_control_runtime" in runtime_restoration_profile
+                        else 750_000_000
+                    ),
+                    "operational_timeout_ns": 3_000_000_000,
+                },
+            }
+            for binding in sorted(
+                graph["control_bindings"], key=lambda row: row["control_binding_id"]
+            )
+        ],
         "commissioned_stop_interfaces": [],
         "interrupt_sources": [],
         "interrupt_policies": [],
@@ -2503,7 +2617,9 @@ def stop_policy_projection(
     }
 
 
-def site_overlay(root: Path, profiles: dict[str, Any]) -> tuple[Path, bytes, dict[str, str]]:
+def site_overlay(
+    root: Path, profiles: dict[str, Any]
+) -> tuple[Path, bytes, dict[str, str]]:
     values: dict[str, dict[str, Any]] = {}
     for profile in profiles["profiles"]:
         for endpoint in profile["model_endpoints"]:
@@ -2585,7 +2701,9 @@ def assistant_projection(
     if provider is not None:
         provider_aliases[provider["provider_alias_id"]] = {
             "provider_kind": provider["provider_kind"],
-            "bridge_external_resource_alias": provider["bridge_external_resource_alias"],
+            "bridge_external_resource_alias": provider[
+                "bridge_external_resource_alias"
+            ],
         }
         external_resources.append(
             {
@@ -2646,11 +2764,15 @@ def deployment_candidate(
         refs,
     )
     family_id = family["model_family_id"]
-    native_lite6_lifecycle = not ros2_control and family_id == LITE6_NATIVE_MODEL_FAMILY_ID
+    native_lite6_lifecycle = (
+        not ros2_control and family_id == LITE6_NATIVE_MODEL_FAMILY_ID
+    )
     catalog_keys = {
         *(
             f"capability:{capability_id}"
-            for capability_id in (ARM_CAPABILITIES if ros2_control else NATIVE_ARM_CAPABILITIES)
+            for capability_id in (
+                ARM_CAPABILITIES if ros2_control else NATIVE_ARM_CAPABILITIES
+            )
         ),
         *(f"capability:{capability_id}" for capability_id in GRIPPER_CAPABILITIES),
         *(f"capability:{capability_id}" for capability_id in CELL_CAPABILITIES),
@@ -2723,7 +2845,9 @@ def deployment_candidate(
         "compatibility": copy.deepcopy(deployment["compatibility"]),
     }
     if profile_id is not None:
-        assistant, resources = assistant_projection(profiles_by_id[profile_id], profiles, refs)
+        assistant, resources = assistant_projection(
+            profiles_by_id[profile_id], profiles, refs
+        )
         value["site_overlay_ref"] = copy.deepcopy(overlay_ref)
         value["external_resources"] = resources
         value["assistant"] = assistant
@@ -2732,12 +2856,16 @@ def deployment_candidate(
 
 def refresh_cross_revisions(path: Path) -> None:
     value = read_json(path, "first-pass deployment")
-    domains = {row["control_domain_id"]: row for row in value["graph"]["control_domains"]}
-    bindings = {row["control_binding_id"]: row for row in value["graph"]["control_bindings"]}
+    domains = {
+        row["control_domain_id"]: row for row in value["graph"]["control_domains"]
+    }
+    bindings = {
+        row["control_binding_id"]: row for row in value["graph"]["control_bindings"]
+    }
     for configuration in value["desired_control_configurations"]:
-        configuration["control_domain_revision"] = domains[configuration["control_domain_id"]][
-            "control_domain_revision"
-        ]
+        configuration["control_domain_revision"] = domains[
+            configuration["control_domain_id"]
+        ]["control_domain_revision"]
         for route in configuration["binding_routes"]:
             route["control_binding_revision"] = bindings[route["control_binding_id"]][
                 "control_binding_revision"
@@ -2753,6 +2881,10 @@ def refresh_cross_revisions(path: Path) -> None:
         domain = domains[parameters["control_domain_id"]]
         parameters["control_binding_revision"] = binding["control_binding_revision"]
         parameters["control_domain_revision"] = domain["control_domain_revision"]
+    for selected in value["policies"].get("stop_timing_parameters", []):
+        selected["control_binding_revision"] = bindings[selected["control_binding_id"]][
+            "control_binding_revision"
+        ]
     replace_file(path, pretty_bytes(value))
 
 
@@ -2770,7 +2902,9 @@ def run_revision_tool(tool: Path, mode: str, source: Path) -> None:
         )
 
 
-def sealed_deployment_bytes(tool: Path, candidate: dict[str, Any], temporary_root: Path) -> bytes:
+def sealed_deployment_bytes(
+    tool: Path, candidate: dict[str, Any], temporary_root: Path
+) -> bytes:
     source = temporary_root / "candidate.deployment.json"
     source.write_bytes(pretty_bytes(candidate))
     run_revision_tool(tool, "--update", source)
@@ -2790,7 +2924,9 @@ def role_assignments(
         deployment_source = deployment["deployment_source"]
         deployment_value = sealed[deployment_source]
         for assignment in deployment["program_role_assignments"]:
-            program = read_yaml(root / assignment["program_source"], "maintained Program")
+            program = read_yaml(
+                root / assignment["program_source"], "maintained Program"
+            )
             rows.append(
                 {
                     "scenario_id": assignment["scenario_id"],
@@ -2810,9 +2946,13 @@ def role_assignments(
 
 
 def historical_capability_closure() -> dict[str, Any]:
-    active_ids = sorted(set(ARM_CAPABILITIES + GRIPPER_CAPABILITIES + CELL_CAPABILITIES))
+    active_ids = sorted(
+        set(ARM_CAPABILITIES + GRIPPER_CAPABILITIES + CELL_CAPABILITIES)
+    )
     if len(active_ids) != 36:
-        raise GenerationError("historical capability closure must contain exactly 36 active IDs")
+        raise GenerationError(
+            "historical capability closure must contain exactly 36 active IDs"
+        )
     rows: list[dict[str, Any]] = []
     for capability_id in active_ids:
         scope = CAPABILITIES[capability_id][1]
@@ -2859,7 +2999,9 @@ def historical_capability_closure() -> dict[str, Any]:
                 "applicability": applicability,
                 "owner_boundary": owner_boundary,
                 "acceptance_steps": acceptance_steps,
-                "runtime_claim_gate": ("I8/P5" if capability_id == "execution.stop.soft" else "N7"),
+                "runtime_claim_gate": (
+                    "I8/P5" if capability_id == "execution.stop.soft" else "N7"
+                ),
                 "disposition": "retained_binding_only_until_runtime_claim_gate",
             }
         )
@@ -2897,8 +3039,12 @@ def generate(args: argparse.Namespace) -> None:
     overlay_path, overlay_payload, overlay_ref = site_overlay(root, profiles)
     outputs.append((overlay_path, overlay_payload, "maintained site overlay"))
 
-    family_by_id = {family["model_family_id"]: family for family in description["model_families"]}
-    profiles_by_id = {profile["profile_id"]: profile for profile in profiles["profiles"]}
+    family_by_id = {
+        family["model_family_id"]: family for family in description["model_families"]
+    }
+    profiles_by_id = {
+        profile["profile_id"]: profile for profile in profiles["profiles"]
+    }
     runtime_profiles_by_id = {
         profile["runtime_restoration_profile_id"]: profile
         for profile in description["runtime_restoration_profiles"]
@@ -2963,7 +3109,9 @@ def main() -> int:
     try:
         generate(args)
     except (GenerationError, SourceDescriptionError, OSError) as error:
-        print(f"generate_maintained_deployment_occurrences: {error}", file=os.sys.stderr)
+        print(
+            f"generate_maintained_deployment_occurrences: {error}", file=os.sys.stderr
+        )
         return 2
     return 0
 

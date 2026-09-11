@@ -48,6 +48,7 @@ from .models import (
     ProgramRunStopRequest,
     ProgramSelectionStopRequest,
     ProgramSelectionResumeRequest,
+    ProgramManualHandoverRequest,
     ProgramFullStopResetRequest,
     ProgramFullStopResumeRequest,
     ProgramScenePreparationRequest,
@@ -153,7 +154,11 @@ def _history_page(page: dict[str, Any], schema: str) -> dict[str, Any]:
 
 
 def _bounded_text(value: object, *, maximum_bytes: int) -> bool:
-    return isinstance(value, str) and bool(value) and len(value.encode("utf-8")) <= maximum_bytes
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and len(value.encode("utf-8")) <= maximum_bytes
+    )
 
 
 def _sha256_identity(value: object) -> bool:
@@ -176,7 +181,9 @@ def _program_catalog() -> NodeCatalog:
 def _build_skills():
     """One installed build input, never a mutable runtime skill registry."""
     environment = build_node_environment()
-    return environment, load_skill_catalog(default_skills_dir(), catalog=environment.catalog)
+    return environment, load_skill_catalog(
+        default_skills_dir(), catalog=environment.catalog
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,7 +231,9 @@ class HeadlessService:
         except CellAdmissionError as error:
             raise self._admission_error(error) from error
 
-    def acquire_authoring_mutation(self, request: AuthoringMutationContext) -> dict[str, Any]:
+    def acquire_authoring_mutation(
+        self, request: AuthoringMutationContext
+    ) -> dict[str, Any]:
         intent = {
             "claim_kind": "authoring_mutation",
             "owner_role": "authoring_owner",
@@ -287,7 +296,9 @@ class HeadlessService:
                 "recovery query does not identify a Composer authoring claim",
             )
         try:
-            return self._cell_admission().recovery_receipt(request.model_dump(mode="json"))
+            return self._cell_admission().recovery_receipt(
+                request.model_dump(mode="json")
+            )
         except CellAdmissionError as error:
             raise self._admission_error(error) from error
 
@@ -295,7 +306,9 @@ class HeadlessService:
         self, request: AuthoringOwnerReconciliationRequest
     ) -> dict[str, Any]:
         owners = request.current_owner_epochs
-        authoring = [item for item in owners if item.get("owner_role") == "authoring_owner"]
+        authoring = [
+            item for item in owners if item.get("owner_role") == "authoring_owner"
+        ]
         if len(authoring) != 1:
             raise HeadlessApiError(
                 "authoring_reconciliation_invalid",
@@ -362,7 +375,9 @@ class HeadlessService:
             "acquired_admission_generation": claim["acquired_admission_generation"],
             "claim_generation": claim["claim_generation"],
             "settlement": {
-                "settlement_kind": ("owner_commit" if committed else "proven_no_effect"),
+                "settlement_kind": (
+                    "owner_commit" if committed else "proven_no_effect"
+                ),
                 "evidence_digest": self._request_digest(result),
             },
         }
@@ -407,7 +422,9 @@ class HeadlessService:
         request: OperationIntentRequest,
         attribution: TrustedAttribution,
     ) -> dict[str, Any]:
-        return self._execution().submit(request, trusted_principal_id=attribution.principal_id)
+        return self._execution().submit(
+            request, trusted_principal_id=attribution.principal_id
+        )
 
     def execution_confirm_grasp(
         self,
@@ -480,7 +497,9 @@ class HeadlessService:
                 "unconfirmed",
                 {
                     **trusted,
-                    "reason_code": getattr(error, "code", "confirmation_delivery_failed"),
+                    "reason_code": getattr(
+                        error, "code", "confirmation_delivery_failed"
+                    ),
                     "message": str(error)[:512],
                 },
             )
@@ -496,6 +515,25 @@ class HeadlessService:
         return self._execution().preview_motion(
             request, trusted_principal_id=attribution.principal_id
         )
+
+    def execution_read_manual_handover(
+        self,
+        request: OperationIntentRequest,
+        attribution: TrustedAttribution,
+    ) -> dict[str, Any]:
+        response = self._execution().read_manual_handover(
+            request, trusted_principal_id=attribution.principal_id
+        )
+        if response.get("ok") is not True:
+            return response
+        # Captured producer indices are private Runner cleanup input. The
+        # browser needs only eligibility and the opaque current precondition,
+        # not a potentially 100,000-node list on each control-state change.
+        handover = response["handover"]
+        return {
+            **{key: value for key, value in response.items() if key != "handover"},
+            "manual_handover": None if handover is None else handover["context"],
+        }
 
     def execution_preview_capability_command(
         self,
@@ -514,28 +552,36 @@ class HeadlessService:
         request: PickSequencePlanningRequest,
         attribution: TrustedAttribution,
     ) -> dict[str, Any]:
-        return self._execution().plan_pick(request, trusted_principal_id=attribution.principal_id)
+        return self._execution().plan_pick(
+            request, trusted_principal_id=attribution.principal_id
+        )
 
     def execution_plan_place(
         self,
         request: PlaceSequencePlanningRequest,
         attribution: TrustedAttribution,
     ) -> dict[str, Any]:
-        return self._execution().plan_place(request, trusted_principal_id=attribution.principal_id)
+        return self._execution().plan_place(
+            request, trusted_principal_id=attribution.principal_id
+        )
 
     def execution_start_pick(
         self,
         request: PickSequencePlanningRequest,
         attribution: TrustedAttribution,
     ) -> dict[str, Any]:
-        return self._execution().start_pick(request, trusted_principal_id=attribution.principal_id)
+        return self._execution().start_pick(
+            request, trusted_principal_id=attribution.principal_id
+        )
 
     def execution_start_place(
         self,
         request: PlaceSequencePlanningRequest,
         attribution: TrustedAttribution,
     ) -> dict[str, Any]:
-        return self._execution().start_place(request, trusted_principal_id=attribution.principal_id)
+        return self._execution().start_place(
+            request, trusted_principal_id=attribution.principal_id
+        )
 
     def execution_pick_place_sequence(self, sequence_id: str) -> dict[str, Any]:
         return self._execution().read_pick_place_sequence(sequence_id)
@@ -545,21 +591,27 @@ class HeadlessService:
         request: OperationControlRequest,
         attribution: TrustedAttribution,
     ) -> dict[str, Any]:
-        return self._execution().pause(request, trusted_principal_id=attribution.principal_id)
+        return self._execution().pause(
+            request, trusted_principal_id=attribution.principal_id
+        )
 
     def execution_resume(
         self,
         request: OperationControlRequest,
         attribution: TrustedAttribution,
     ) -> dict[str, Any]:
-        return self._execution().resume(request, trusted_principal_id=attribution.principal_id)
+        return self._execution().resume(
+            request, trusted_principal_id=attribution.principal_id
+        )
 
     def execution_reset(
         self,
         request: OperationControlRequest,
         attribution: TrustedAttribution,
     ) -> dict[str, Any]:
-        return self._execution().reset(request, trusted_principal_id=attribution.principal_id)
+        return self._execution().reset(
+            request, trusted_principal_id=attribution.principal_id
+        )
 
     def execution_acknowledge_completed(
         self,
@@ -575,14 +627,18 @@ class HeadlessService:
         request: StopIntentRequest,
         attribution: TrustedAttribution,
     ) -> dict[str, Any]:
-        return self._execution().stop(request, trusted_principal_id=attribution.principal_id)
+        return self._execution().stop(
+            request, trusted_principal_id=attribution.principal_id
+        )
 
     def execution_full_stop(
         self,
         request: FullStopIntentRequest,
         attribution: TrustedAttribution,
     ) -> dict[str, Any]:
-        return self._execution().full_stop(request, trusted_principal_id=attribution.principal_id)
+        return self._execution().full_stop(
+            request, trusted_principal_id=attribution.principal_id
+        )
 
     def execution_recognized_malformed_stop(
         self,
@@ -863,7 +919,8 @@ class HeadlessService:
         if (
             not isinstance(runner_projection, dict)
             or set(runner_projection) != {"availability", "schema_version", "source"}
-            or runner_projection.get("schema_version") != "manyforge.program_node_availability.v1"
+            or runner_projection.get("schema_version")
+            != "manyforge.program_node_availability.v1"
             or not isinstance(runner_projection.get("source"), dict)
             or not isinstance(runner_projection.get("availability"), dict)
         ):
@@ -882,7 +939,9 @@ class HeadlessService:
             else None
         )
         source_without_digest = {
-            key: value for key, value in runner_source.items() if key != "content_digest"
+            key: value
+            for key, value in runner_source.items()
+            if key != "content_digest"
         }
         try:
             expected_availability_digest = (
@@ -915,8 +974,10 @@ class HeadlessService:
                 "retained_bundle_id",
                 "scenario_id",
             }
-            or runner_source.get("node_environment_digest") != projection.get("environment_digest")
-            or runner_source.get("retained_bundle_id") != projection.get("retained_bundle_id")
+            or runner_source.get("node_environment_digest")
+            != projection.get("environment_digest")
+            or runner_source.get("retained_bundle_id")
+            != projection.get("retained_bundle_id")
             or runner_source.get("graph_revision") != projection.get("graph_revision")
             or runner_source.get("content_digest") != expected_availability_digest
             or not isinstance(applied_source, dict)
@@ -932,12 +993,14 @@ class HeadlessService:
                     "scenario_id",
                 )
             )
-            or runner_source.get("applied_record_digest") != applied_source.get("record_digest")
+            or runner_source.get("applied_record_digest")
+            != applied_source.get("record_digest")
             or type(runner_source.get("admission_generation")) is not int
             or type(runner_source.get("cycle_generation")) is not int
             or runner_availability.get("schema_version")
             != "manyforge.node_execution_availability.v1"
-            or runner_availability.get("environment_digest") != projection.get("environment_digest")
+            or runner_availability.get("environment_digest")
+            != projection.get("environment_digest")
             or runner_availability.get("program_binding_id")
             != runner_source.get("program_binding_id")
             or not isinstance(implementations, list)
@@ -976,8 +1039,12 @@ class HeadlessService:
             "binding_context": "applied",
             "execution_available": runner_availability.get("execution_available"),
             "implementations": projected_rows,
-            "manager_runtime_converged": core_availability.get("manager_runtime_converged"),
-            "portable_authoring_available": runner_availability.get("portable_authoring_available"),
+            "manager_runtime_converged": core_availability.get(
+                "manager_runtime_converged"
+            ),
+            "portable_authoring_available": runner_availability.get(
+                "portable_authoring_available"
+            ),
             "reason_codes": runner_availability.get("reason_codes"),
             "restoration_gates": sorted(
                 {
@@ -1196,8 +1263,12 @@ class HeadlessService:
         active_count = projection.get("active_operation_count")
         reason = projection.get("reason_code")
         node_statuses = projection.get("node_statuses")
-        owner_identities = capture.get("owner_identities") if isinstance(capture, dict) else None
-        node_policies = capture.get("node_policies") if isinstance(capture, dict) else None
+        owner_identities = (
+            capture.get("owner_identities") if isinstance(capture, dict) else None
+        )
+        node_policies = (
+            capture.get("node_policies") if isinstance(capture, dict) else None
+        )
         try:
             calculated_policy_digest = (
                 "sha256:" + hashlib.sha256(rfc8785.dumps(node_policies)).hexdigest()
@@ -1216,7 +1287,8 @@ class HeadlessService:
             or not isinstance(state, str)
             or state not in _PROGRAM_RUN_STATES
             or not isinstance(projection.get("tree_status"), str)
-            or projection.get("tree_status") not in {"invalid", "running", "success", "failure"}
+            or projection.get("tree_status")
+            not in {"invalid", "running", "success", "failure"}
             or type(projection.get("node_status_revision")) is not int
             or not 1 <= projection["node_status_revision"] <= 9_007_199_254_740_991
             or not isinstance(node_statuses, dict)
@@ -1353,7 +1425,9 @@ class HeadlessService:
             self._validate_program_run_snapshot(
                 row,
                 expected_owner_epoch=(
-                    owner_epoch if row.get("state") in _ACTIVE_PROGRAM_RUN_STATES else None
+                    owner_epoch
+                    if row.get("state") in _ACTIVE_PROGRAM_RUN_STATES
+                    else None
                 ),
             )
             program_run_ids.append(row["capture"]["program_run_id"])
@@ -1381,7 +1455,8 @@ class HeadlessService:
             not isinstance(source, dict)
             or source.get("record_digest") != request.expected_applied_record_digest
             or applied.get("scenario_id") != request.scenario_id
-            or applied.get("scenario_catalog_revision") != request.scenario_catalog_revision
+            or applied.get("scenario_catalog_revision")
+            != request.scenario_catalog_revision
         ):
             raise HeadlessApiError(
                 "program_run_applied_selection_stale",
@@ -1393,18 +1468,23 @@ class HeadlessService:
                 "authoritative Draft and Applied Program revisions differ",
             )
         try:
-            projection = self._program_runner().start_run(request.model_dump(mode="json"))
+            projection = self._program_runner().start_run(
+                request.model_dump(mode="json")
+            )
         except ProgramRunnerClientError as error:
             raise self._runner_error(error) from error
         snapshot = self._validate_program_run_snapshot(projection)
         capture = snapshot["capture"]
         binding = applied.get("program_binding")
         current_environment = self.node_environment()
-        applied_node_policies = binding.get("node_policies") if isinstance(binding, dict) else None
+        applied_node_policies = (
+            binding.get("node_policies") if isinstance(binding, dict) else None
+        )
         if (
             capture["applied_record_digest"] != source.get("record_digest")
             or capture["node_policies"] != applied_node_policies
-            or capture["node_environment_digest"] != current_environment.get("environment_digest")
+            or capture["node_environment_digest"]
+            != current_environment.get("environment_digest")
             or any(
                 capture[capture_field] != applied.get(applied_field)
                 for capture_field, applied_field in (
@@ -1424,7 +1504,9 @@ class HeadlessService:
             )
         return snapshot
 
-    def program_scene_prepare(self, request: ProgramScenePreparationRequest) -> dict[str, Any]:
+    def program_scene_prepare(
+        self, request: ProgramScenePreparationRequest
+    ) -> dict[str, Any]:
         applied = self.program_applied()
         source = applied.get("source")
         if (
@@ -1436,7 +1518,9 @@ class HeadlessService:
                 "Applied Program changed before scene preparation",
             )
         try:
-            result = self._program_runner().prepare_applied_scene(request.model_dump(mode="json"))
+            result = self._program_runner().prepare_applied_scene(
+                request.model_dump(mode="json")
+            )
         except ProgramRunnerClientError as error:
             raise self._runner_error(error) from error
         proof = result.get("prepared_scene")
@@ -1453,7 +1537,8 @@ class HeadlessService:
             }
             or result.get("schema_version") != "manyforge.program_scene_preparation.v1"
             or result.get("status") != "prepared"
-            or result.get("applied_record_digest") != request.expected_applied_record_digest
+            or result.get("applied_record_digest")
+            != request.expected_applied_record_digest
             or result.get("program_revision") != applied.get("program_revision")
             or type(generation) is not int
             or not 1 <= generation <= 9_007_199_254_740_991
@@ -1542,6 +1627,23 @@ class HeadlessService:
             projection = self._program_runner().resume_motion(
                 program_run_id,
                 request.model_dump(mode="json"),
+            )
+        except ProgramRunnerClientError as error:
+            raise self._runner_error(error) from error
+        return self._validate_program_run_snapshot(
+            projection,
+            expected_program_run_id=program_run_id,
+            expected_owner_epoch=request.expected_owner_epoch,
+        )
+
+    def program_run_manual_handover(
+        self,
+        program_run_id: str,
+        request: ProgramManualHandoverRequest,
+    ) -> dict[str, Any]:
+        try:
+            projection = self._program_runner().prepare_manual_handover(
+                program_run_id, request.model_dump(mode="json")
             )
         except ProgramRunnerClientError as error:
             raise self._runner_error(error) from error
@@ -1652,41 +1754,64 @@ class HeadlessService:
         except ProgramRunnerClientError as error:
             raise self._runner_error(error) from error
 
-    def cycle_recovery_action(self, request: CycleRecoveryActionRequest) -> dict[str, Any]:
+    def cycle_recovery_action(
+        self, request: CycleRecoveryActionRequest
+    ) -> dict[str, Any]:
         try:
-            return self._program_runner().apply_recovery_action(request.model_dump(mode="json"))
+            return self._program_runner().apply_recovery_action(
+                request.model_dump(mode="json")
+            )
         except ProgramRunnerClientError as error:
             raise self._runner_error(error) from error
 
     def component_lifecycle_submit(self, request: Any) -> dict[str, Any]:
         if self.cclc is None:
-            raise HeadlessApiError("cclc_open_unavailable", "CCLC owner is not configured")
-        payload = request.model_dump(mode="json", exclude={"confirmed"}, exclude_none=True)
+            raise HeadlessApiError(
+                "cclc_open_unavailable", "CCLC owner is not configured"
+            )
+        payload = request.model_dump(
+            mode="json", exclude={"confirmed"}, exclude_none=True
+        )
         return self.cclc.submit_lifecycle(payload)
 
     def component_lifecycle_status(self, transaction_id: str) -> dict[str, Any] | None:
         if self.cclc is None:
-            raise HeadlessApiError("cclc_open_unavailable", "CCLC owner is not configured")
+            raise HeadlessApiError(
+                "cclc_open_unavailable", "CCLC owner is not configured"
+            )
         return self.cclc.lifecycle_status(transaction_id)
+
+    def component_lifecycle_request_result(self, request: Any) -> dict[str, Any] | None:
+        if self.cclc is None:
+            raise HeadlessApiError(
+                "cclc_open_unavailable", "CCLC owner is not configured"
+            )
+        return self.cclc.lifecycle_request_result(
+            request.model_dump(mode="json", exclude={"confirmed"}, exclude_none=True)
+        )
 
     def route_selection_submit(self, request: Any) -> dict[str, Any]:
         if self.cclc is None:
-            raise HeadlessApiError("cclc_open_unavailable", "CCLC owner is not configured")
-        admission = self.authoring_admission()
-        if (
-            admission.get("authoring_allowed") is not True
-            or admission.get("admission_generation") != request.expected_admission_generation
-        ):
             raise HeadlessApiError(
-                "authoring_not_ready",
-                "route selection requires the current Idle admission generation",
+                "cclc_open_unavailable", "CCLC owner is not configured"
             )
         payload = request.model_dump(
             mode="json",
-            exclude={"confirmed", "expected_admission_generation"},
+            exclude={"confirmed"},
             exclude_none=True,
         )
         return self.cclc.submit_route(payload)
+
+    def route_selection_request_result(self, request: Any) -> dict[str, Any] | None:
+        if self.cclc is None:
+            raise HeadlessApiError(
+                "cclc_open_unavailable", "CCLC owner is not configured"
+            )
+        # Preserve the original intent, including absent fields on legacy
+        # requests. Only Core may decide admission or replay membership.
+        return self.cclc.route_request_result(
+            request.model_dump(mode="json", exclude={"confirmed"}, exclude_none=True)
+        )
 
     def _program_apply_manager_selection(
         self,
@@ -1721,7 +1846,8 @@ class HeadlessService:
         apply_state = payload.get("apply")
         if (
             isinstance(apply_state, dict)
-            and apply_state.get("unavailable_reason_code") == "full_stack_restart_required"
+            and apply_state.get("unavailable_reason_code")
+            == "full_stack_restart_required"
         ):
             raise HeadlessApiError(
                 "full_stack_restart_required",
@@ -1810,7 +1936,9 @@ class HeadlessService:
         request_owner_epoch = (
             claim_intent.get("owner_epoch") if isinstance(claim_intent, dict) else None
         )
-        request_id = claim_intent.get("request_id") if isinstance(claim_intent, dict) else None
+        request_id = (
+            claim_intent.get("request_id") if isinstance(claim_intent, dict) else None
+        )
         if (
             not isinstance(request_owner_epoch, str)
             or not request_owner_epoch
@@ -2131,7 +2259,9 @@ class HeadlessService:
         query: HistorianQueryRequest,
     ) -> dict[str, Any]:
         arguments = query.native_arguments(now_utc_ns=time.time_ns())
-        page = _history_page(self.core.history(**arguments), _HISTORY_SUMMARY_PAGE_VERSION)
+        page = _history_page(
+            self.core.history(**arguments), _HISTORY_SUMMARY_PAGE_VERSION
+        )
         # Keep a relative window fixed across Older/Newer navigation. These
         # are the query's actual server UTC bounds, not another source clock.
         return {
@@ -2176,7 +2306,11 @@ class HeadlessService:
             if not page["truncated"] or page["next_before_sequence"] is None:
                 break
             before = page["next_before_sequence"]
-            if not events or type(before) is not int or before != events[-1]["sequence"]:
+            if (
+                not events
+                or type(before) is not int
+                or before != events[-1]["sequence"]
+            ):
                 raise HeadlessApiError(
                     "historian_response_invalid", "export cursor does not advance"
                 )
@@ -2238,7 +2372,8 @@ class HeadlessService:
         ):
             raise HeadlessApiError(
                 "authoring_not_ready",
-                "Deployment candidate compilation requires an exact held " "authoring claim",
+                "Deployment candidate compilation requires an exact held "
+                "authoring claim",
             )
         try:
             replay = self._cell_admission().acquire(intent)
@@ -2252,7 +2387,9 @@ class HeadlessService:
         return {
             "compilation": self.deployment_compiler.compile(
                 scenario_id=request.scenario_id,
-                expected_scenario_catalog_revision=(request.expected_scenario_catalog_revision),
+                expected_scenario_catalog_revision=(
+                    request.expected_scenario_catalog_revision
+                ),
                 deployment=request.deployment,
                 program=request.program,
             )
@@ -2261,7 +2398,9 @@ class HeadlessService:
     def manager_apply(self, request: ManagerApplyRequest) -> dict[str, Any]:
         return self.manager.apply(request)
 
-    def manager_apply_status(self, apply_id: str, apply_generation: int) -> dict[str, Any]:
+    def manager_apply_status(
+        self, apply_id: str, apply_generation: int
+    ) -> dict[str, Any]:
         return self.manager.observe_apply(apply_id, apply_generation)
 
     def scene_commit(
@@ -2276,7 +2415,16 @@ class HeadlessService:
             "update_object_pose",
             "set_collision_policy",
         }
-        if authored:
+        if request.program_node_evidence is not None:
+            if (
+                request.expected_admission_generation is None
+                or request.program_reset_scene_authorization is not None
+            ):
+                raise HeadlessApiError(
+                    "invalid_request",
+                    "runtime Scene transaction needs exact child admission",
+                )
+        elif authored:
             if (request.expected_admission_generation is None) == (
                 request.program_reset_scene_authorization is None
             ):
@@ -2294,6 +2442,11 @@ class HeadlessService:
             request,
             trusted_principal_id=attribution.principal_id,
         )
+
+    def scene_transaction_status(
+        self, request: SceneTransactionRequest
+    ) -> dict[str, Any]:
+        return self.manager.scene_transaction_status(request)
 
     def health(self) -> dict[str, Any]:
         runtime = self.runtime()

@@ -111,6 +111,22 @@ struct ProgramCycleAdmissionEvidenceDTO final {
                          const ProgramCycleAdmissionEvidenceDTO&) = default;
 };
 
+/// One runtime Scene/CCLC transaction, attributed to its sealed Program node.
+/// This is a child of the existing cycle claim, never authoring permission.
+struct ProgramNodeAdmissionEvidenceDTO final {
+  RequestOwnerEpoch program_runner_owner_epoch;
+  ProgramRunId program_run_id;
+  CellAdmissionClaimGeneration parent_program_cycle_claim_generation;
+  std::string node_instance_id;
+  std::string node_attempt_id;
+  std::string owner_api;
+
+  [[nodiscard]] bool locally_valid() const noexcept;
+
+  friend bool operator==(const ProgramNodeAdmissionEvidenceDTO&,
+                         const ProgramNodeAdmissionEvidenceDTO&) = default;
+};
+
 struct CellAdmissionClaimIntentDTO final {
   CellAdmissionClaimKindDTO claim_kind{CellAdmissionClaimKindDTO::kAuthoringMutation};
   CellAdmissionOwnerRoleDTO owner_role{CellAdmissionOwnerRoleDTO::kAuthoringOwner};
@@ -122,10 +138,20 @@ struct CellAdmissionClaimIntentDTO final {
   CellAdmissionScopeDTO scope;
   std::optional<ProgramCycleAdmissionEvidenceDTO> program_cycle_evidence;
   std::optional<CellAdmissionInterventionEvidenceDTO> intervention_evidence;
+  std::optional<ProgramNodeAdmissionEvidenceDTO> program_node_evidence{};
 
   friend bool operator==(const CellAdmissionClaimIntentDTO&,
                          const CellAdmissionClaimIntentDTO&) = default;
 };
+
+[[nodiscard]] inline std::optional<CellAdmissionClaimGeneration> parent_program_cycle_claim(
+    const CellAdmissionClaimIntentDTO& intent) noexcept {
+  if (intent.program_node_evidence.has_value())
+    return intent.program_node_evidence->parent_program_cycle_claim_generation;
+  return intent.intervention_evidence.has_value()
+             ? intent.intervention_evidence->parent_program_cycle_claim_generation
+             : std::nullopt;
+}
 
 struct CellAdmissionClaimDTO final {
   CellAdmissionClaimIntentDTO intent;

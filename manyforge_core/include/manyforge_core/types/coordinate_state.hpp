@@ -17,8 +17,7 @@ enum class CoordinateKind : std::uint8_t {
   kLinear,
 };
 
-[[nodiscard]] constexpr std::string_view to_string(
-    CoordinateKind value) noexcept {
+[[nodiscard]] constexpr std::string_view to_string(CoordinateKind value) noexcept {
   switch (value) {
     case CoordinateKind::kAngular:
       return "angular";
@@ -30,89 +29,90 @@ enum class CoordinateKind : std::uint8_t {
 
 struct AngularPositionDTO final {
   double value_rad{};
-  friend bool operator==(const AngularPositionDTO&,
-                         const AngularPositionDTO&) = default;
+  friend bool operator==(const AngularPositionDTO&, const AngularPositionDTO&) = default;
 };
 
 struct LinearPositionDTO final {
   double value_m{};
-  friend bool operator==(const LinearPositionDTO&,
-                         const LinearPositionDTO&) = default;
+  friend bool operator==(const LinearPositionDTO&, const LinearPositionDTO&) = default;
 };
 
-using CoordinatePositionDTO =
-    std::variant<AngularPositionDTO, LinearPositionDTO>;
+using CoordinatePositionDTO = std::variant<AngularPositionDTO, LinearPositionDTO>;
 
 struct AngularVelocityDTO final {
   double value_rad_s{};
-  friend bool operator==(const AngularVelocityDTO&,
-                         const AngularVelocityDTO&) = default;
+  friend bool operator==(const AngularVelocityDTO&, const AngularVelocityDTO&) = default;
 };
 
 struct LinearVelocityDTO final {
   double value_m_s{};
-  friend bool operator==(const LinearVelocityDTO&,
-                         const LinearVelocityDTO&) = default;
+  friend bool operator==(const LinearVelocityDTO&, const LinearVelocityDTO&) = default;
 };
 
-using CoordinateVelocityDTO =
-    std::variant<AngularVelocityDTO, LinearVelocityDTO>;
+using CoordinateVelocityDTO = std::variant<AngularVelocityDTO, LinearVelocityDTO>;
 
 struct AngularAccelerationDTO final {
   double value_rad_s2{};
-  friend bool operator==(const AngularAccelerationDTO&,
-                         const AngularAccelerationDTO&) = default;
+  friend bool operator==(const AngularAccelerationDTO&, const AngularAccelerationDTO&) = default;
 };
 
 struct LinearAccelerationDTO final {
   double value_m_s2{};
-  friend bool operator==(const LinearAccelerationDTO&,
-                         const LinearAccelerationDTO&) = default;
+  friend bool operator==(const LinearAccelerationDTO&, const LinearAccelerationDTO&) = default;
 };
 
-using CoordinateAccelerationDTO =
-    std::variant<AngularAccelerationDTO, LinearAccelerationDTO>;
+using CoordinateAccelerationDTO = std::variant<AngularAccelerationDTO, LinearAccelerationDTO>;
+
+struct AngularJerkDTO final {
+  double value_rad_s3{};
+  friend bool operator==(const AngularJerkDTO&, const AngularJerkDTO&) = default;
+};
+
+struct LinearJerkDTO final {
+  double value_m_s3{};
+  friend bool operator==(const LinearJerkDTO&, const LinearJerkDTO&) = default;
+};
+
+using CoordinateJerkDTO = std::variant<AngularJerkDTO, LinearJerkDTO>;
 
 struct AngularEffortDTO final {
   double value_nm{};
-  friend bool operator==(const AngularEffortDTO&,
-                         const AngularEffortDTO&) = default;
+  friend bool operator==(const AngularEffortDTO&, const AngularEffortDTO&) = default;
 };
 
 struct LinearEffortDTO final {
   double value_n{};
-  friend bool operator==(const LinearEffortDTO&,
-                         const LinearEffortDTO&) = default;
+  friend bool operator==(const LinearEffortDTO&, const LinearEffortDTO&) = default;
 };
 
 using CoordinateEffortDTO = std::variant<AngularEffortDTO, LinearEffortDTO>;
 
 [[nodiscard]] constexpr CoordinateKind coordinate_kind(
     const CoordinatePositionDTO& value) noexcept {
-  return std::holds_alternative<AngularPositionDTO>(value)
-             ? CoordinateKind::kAngular
-             : CoordinateKind::kLinear;
+  return std::holds_alternative<AngularPositionDTO>(value) ? CoordinateKind::kAngular
+                                                           : CoordinateKind::kLinear;
 }
 
 [[nodiscard]] constexpr CoordinateKind coordinate_kind(
     const CoordinateVelocityDTO& value) noexcept {
-  return std::holds_alternative<AngularVelocityDTO>(value)
-             ? CoordinateKind::kAngular
-             : CoordinateKind::kLinear;
+  return std::holds_alternative<AngularVelocityDTO>(value) ? CoordinateKind::kAngular
+                                                           : CoordinateKind::kLinear;
 }
 
 [[nodiscard]] constexpr CoordinateKind coordinate_kind(
     const CoordinateAccelerationDTO& value) noexcept {
-  return std::holds_alternative<AngularAccelerationDTO>(value)
-             ? CoordinateKind::kAngular
-             : CoordinateKind::kLinear;
+  return std::holds_alternative<AngularAccelerationDTO>(value) ? CoordinateKind::kAngular
+                                                               : CoordinateKind::kLinear;
 }
 
-[[nodiscard]] constexpr CoordinateKind coordinate_kind(
-    const CoordinateEffortDTO& value) noexcept {
-  return std::holds_alternative<AngularEffortDTO>(value)
-             ? CoordinateKind::kAngular
-             : CoordinateKind::kLinear;
+[[nodiscard]] constexpr CoordinateKind coordinate_kind(const CoordinateJerkDTO& value) noexcept {
+  return std::holds_alternative<AngularJerkDTO>(value) ? CoordinateKind::kAngular
+                                                       : CoordinateKind::kLinear;
+}
+
+[[nodiscard]] constexpr CoordinateKind coordinate_kind(const CoordinateEffortDTO& value) noexcept {
+  return std::holds_alternative<AngularEffortDTO>(value) ? CoordinateKind::kAngular
+                                                         : CoordinateKind::kLinear;
 }
 
 struct ControlledStateDTO final {
@@ -132,8 +132,7 @@ struct ControlledStateDTO final {
   std::vector<CoordinatePositionDTO> positions;
   std::optional<std::vector<CoordinateVelocityDTO>> velocities;
 
-  friend bool operator==(const ControlledStateDTO&,
-                         const ControlledStateDTO&) = default;
+  friend bool operator==(const ControlledStateDTO&, const ControlledStateDTO&) = default;
 };
 
 enum class ObservedStateSourceKind : std::uint8_t {
@@ -144,8 +143,7 @@ enum class ObservedStateSourceKind : std::uint8_t {
   kPredictedState,
 };
 
-[[nodiscard]] constexpr std::string_view to_string(
-    ObservedStateSourceKind value) noexcept {
+[[nodiscard]] constexpr std::string_view to_string(ObservedStateSourceKind value) noexcept {
   switch (value) {
     case ObservedStateSourceKind::kActionFeedback:
       return "action_feedback";
@@ -198,14 +196,13 @@ struct ObservedStateSnapshotDTO final {
 
 /// Validate the shape, finiteness, unit agreement, and immutable addressed
 /// identity fields of one controlled-state value.
-[[nodiscard]] Result<void> validate_controlled_state(
-    const ControlledStateDTO& state);
+[[nodiscard]] Result<void> validate_controlled_state(const ControlledStateDTO& state);
 
 /// Validate one observed-state publication, including source/authority and
 /// measured-freshness rules. `now_ns` is the receiver's injected monotonic
 /// time; negative values reject.
-[[nodiscard]] Result<void> validate_observed_state_snapshot(
-    const ObservedStateSnapshotDTO& state, std::int64_t now_ns);
+[[nodiscard]] Result<void> validate_observed_state_snapshot(const ObservedStateSnapshotDTO& state,
+                                                            std::int64_t now_ns);
 
 /// Produce the legacy all-angular value projection required by the existing
 /// TrajectoryDTO/planner subset. Mixed or linear state fails closed.

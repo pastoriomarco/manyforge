@@ -70,6 +70,8 @@ class ManagerPort(Protocol):
         trusted_principal_id: str | None,
     ) -> dict[str, Any]: ...
 
+    def scene_transaction_status(self, request: SceneTransactionRequest) -> dict[str, Any]: ...
+
     def resolve_scene_resources(
         self,
         request: SceneResourcePoseQuery,
@@ -326,7 +328,9 @@ class ManagerCommandClient:
             "update_status",
         }
         context = request.request_context
-        if set(response) != expected_fields:
+        if (not isinstance(response, dict) or set(response) != expected_fields
+            or response.get("api_version") != MANAGER_RESPONSE_VERSION
+            or type(response.get("ok")) is not bool):
             raise HeadlessApiError(
                 "manager_command_response_invalid",
                 "scene commit response has an unknown or missing field",
@@ -457,6 +461,8 @@ class ManagerCommandClient:
             "transport": "http",
         }
         transaction = request.model_dump(mode="json")
+        if transaction.get("program_node_evidence") is None:
+            transaction.pop("program_node_evidence", None)
         transaction["attribution"] = attribution
         response = self._exchange(
             {
@@ -466,6 +472,23 @@ class ManagerCommandClient:
             }
         )
         self._validate_scene_response(response, request)
+        return response
+
+    def scene_transaction_status(self, request: SceneTransactionRequest) -> dict[str, Any]:
+        transaction = request.model_dump(mode="json")
+        if transaction.get("program_node_evidence") is None:
+            transaction.pop("program_node_evidence", None)
+        # Attribution is not mutation intent. Lookup performs no Scene write.
+        transaction["attribution"] = {
+            "assurance": "unverified", "principal_id": None, "transport": "http"}
+        response = self._exchange({"api_version": MANAGER_COMMAND_VERSION,
+                                   "command": "scene_transaction_status", "transaction": transaction})
+        if (set(response) != {"api_version", "ok", "result"}
+            or response.get("api_version") != MANAGER_RESPONSE_VERSION
+            or response.get("ok") is not True):
+            raise HeadlessApiError("manager_command_response_invalid", "Scene result lookup is malformed")
+        if response["result"] is not None:
+            self._validate_scene_response(response["result"], request)
         return response
 
     def resolve_scene_resources(

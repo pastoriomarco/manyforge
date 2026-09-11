@@ -7,6 +7,7 @@
 #include <manyforge_core/controller_lifecycle_evaluator.hpp>
 #include <manyforge_core/resolved_stop_base_plan_codec.hpp>
 #include <manyforge_deployment/resolved_stop_base_plan_resolver.hpp>
+#include <manyforge_deployment/retained_runtime_policy.hpp>
 #include <manyforge_deployment/route_configuration_publication.hpp>
 #include <set>
 #include <span>
@@ -19,6 +20,7 @@
 #include "build_manifest_internal.hpp"
 #include "content_identity_internal.hpp"
 #include "lite6_retained_consumer_fixture.hpp"
+#include "stop_timing_resolution_internal.hpp"
 #include "verified_retained_bundle_internal.hpp"
 
 namespace manyforge::deployment {
@@ -55,7 +57,7 @@ private:
   std::filesystem::path path_;
 };
 
- template <typename Range, typename Predicate>
+template <typename Range, typename Predicate>
 [[nodiscard]] const typename Range::value_type &
 require_one(const Range &values, Predicate predicate,
             std::string_view description) {
@@ -443,6 +445,59 @@ private:
 };
 
 TEST(ResolvedStopBasePlanResolverTest,
+     SavedTimingSurvivesCompilationDurableReloadAndReadiness) {
+  ScopedTrustedRoot root;
+  const core::StopTimingParametersDTO timing{250'000'000, 750'000'000,
+                                             3'000'000'000};
+  const auto retained = test::materialize_lite6_retained_consumer_fixture_from(
+      root.path(),
+      test::make_lite6_stop_qualified_native_motion_retention_fixture(
+          {timing}));
+  ASSERT_EQ(retained.bundle->value().stop_timing_parameters.size(), 1U);
+  EXPECT_EQ(retained.bundle->value().stop_timing_parameters.front().timing,
+            timing);
+  FilesystemVerifiedRetainedProductArtifactSource source(root.path());
+  const auto runtime = make_runtime_context(*retained.bundle);
+  const auto expected = load_verified_controller_lifecycle_expected_domain(
+      *retained.bundle, source, runtime.desired_configuration,
+      runtime.source_runtime_unit_id, runtime.source_runtime_epoch);
+  const auto plan = resolve_verified_stop_base_plan(
+      *retained.bundle, source, expected, runtime.active_configuration,
+      runtime.binding);
+  EXPECT_EQ(plan.deadline_budget.phases.front().deadline_offset_ns,
+            250'000'000);
+  EXPECT_EQ(plan.deadline_budget.phases[1].deadline_offset_ns, 3'000'000'000);
+  FilesystemCatalogArtifactStore catalogs(root.path());
+  const auto envelope =
+      resolve_retained_stop_deadline_budget(*retained.bundle, catalogs);
+  ASSERT_TRUE(envelope);
+  EXPECT_EQ(envelope->outer_duration_ns,
+            plan.deadline_budget.outer_duration_ns);
+  MemoryPlanRepository repository;
+  const auto readiness = store_and_verify_runtime_participant_stop_readiness(
+      *retained.bundle, plan, core::ComponentLifecycleGeneration(11U), expected,
+      runtime.binding, repository);
+  ASSERT_TRUE(readiness.ok()) << readiness.error().message;
+  EXPECT_EQ(readiness.value().value().maximum_controlled_stop_duration_ns,
+            2'000'000'000);
+  const auto different_settling =
+      test::materialize_lite6_retained_consumer_fixture_from(
+          root.path(),
+          test::make_lite6_stop_qualified_native_motion_retention_fixture(
+              {{250'000'000, 500'000'000, 3'000'000'000}}));
+  EXPECT_NE(different_settling.bundle->retained_bundle_id(),
+            retained.bundle->retained_bundle_id());
+  EXPECT_FALSE(store_and_verify_runtime_participant_stop_readiness(
+                   *different_settling.bundle, plan,
+                   core::ComponentLifecycleGeneration(11U), expected,
+                   runtime.binding, repository)
+                   .ok());
+  EXPECT_THROW(test::make_lite6_stop_qualified_native_motion_retention_fixture(
+                   {{250'000'000, 750'000'000, 1'999'999'999}}),
+               DeploymentApplicabilityCodecError);
+}
+
+TEST(ResolvedStopBasePlanResolverTest,
      ResolvesExactActiveProductAndPublishesOnlyAfterIndependentReadback) {
   ScopedTrustedRoot root;
   const auto retained = test::
@@ -465,28 +520,80 @@ TEST(ResolvedStopBasePlanResolverTest,
   ASSERT_EQ(plan.escalation_stages.size(), 2U);
   EXPECT_EQ(plan.escalation_stages.front().stage_kind,
             core::StopEscalationStageKind::kNominal);
-  EXPECT_TRUE(plan.escalation_stages.front()
-                  .command_qualification.controlled_substitution_contract
-                  .has_value());
+  EXPECT_TRUE(
+      plan.escalation_stages.front()
+          .command_qualification.controlled_substitution_contract.has_value());
   EXPECT_EQ(plan.escalation_stages.back().stage_kind,
             core::StopEscalationStageKind::kSoftwareHard);
-  EXPECT_EQ(plan.escalation_stages.back().command_qualification.stop_action_class,
-            core::StopActionClass::kSoftwareHard);
+  EXPECT_EQ(
+      plan.escalation_stages.back().command_qualification.stop_action_class,
+      core::StopActionClass::kSoftwareHard);
 
   MemoryPlanRepository repository;
   auto readiness = store_and_verify_runtime_participant_stop_readiness(
-      plan, core::ComponentLifecycleGeneration(11U), expected, runtime.binding,
-      repository);
+      *retained.bundle, plan, core::ComponentLifecycleGeneration(11U), expected,
+      runtime.binding, repository);
   ASSERT_TRUE(readiness.ok()) << readiness.error().message;
   EXPECT_EQ(readiness.value().value().resolved_stop_base_plan, plan);
+  EXPECT_FALSE(readiness.value().value().maximum_controlled_stop_duration_ns);
 
   repository.corrupt_readback_ = true;
   readiness = store_and_verify_runtime_participant_stop_readiness(
-      plan, core::ComponentLifecycleGeneration(11U), expected, runtime.binding,
-      repository);
+      *retained.bundle, plan, core::ComponentLifecycleGeneration(11U), expected,
+      runtime.binding, repository);
   ASSERT_FALSE(readiness.ok());
   EXPECT_EQ(readiness.error().details.at("reason"),
             "resolved_stop_base_plan_repository_readback_mismatch");
+}
+
+TEST(ResolvedStopBasePlanResolverTest,
+     IndependentDomainCutoffsSurviveOneRetainedEnvelope) {
+  ScopedTrustedRoot root;
+  auto fixture = test::make_lite6_controllable_retention_fixture(
+      false, false, 2U, false, false, {}, false, true, "resource", false, {},
+      {}, false, false,
+      {{250'000'000, 750'000'000, 3'000'000'000},
+       {200'000'000, 500'000'000, 4'000'000'000}});
+  const auto &stops =
+      fixture.qualified.compiler_ir().applicability().stop_applicability();
+  ASSERT_EQ(stops.size(), 2U);
+  const auto &first = std::get<LogicalStoppableApplicabilityTemplate>(stops[0]);
+  const auto &second =
+      std::get<LogicalStoppableApplicabilityTemplate>(stops[1]);
+  EXPECT_EQ(first.deadline_budget.outer_duration_ns,
+            second.deadline_budget.outer_duration_ns);
+  std::set<std::int64_t> cutoffs{
+      first.deadline_budget.phases[1].deadline_offset_ns,
+      second.deadline_budget.phases[1].deadline_offset_ns};
+  EXPECT_EQ(cutoffs, (std::set<std::int64_t>{3'000'000'000, 4'000'000'000}));
+  const auto &applicability = fixture.qualified.compiler_ir().applicability();
+  const auto &bindings =
+      fixture.qualified.deployment().graph().graph().control_bindings;
+  auto selections =
+      applicability.deployment_inputs().value().stop_timing_parameters;
+  ASSERT_EQ(selections.size(), 2U);
+  const auto omitted_id = selections.back().control_binding_id;
+  selections.pop_back();
+  const auto mixed = detail::resolve_binding_stop_timing(
+      bindings, applicability.stop_evidence_policies(), selections);
+  ASSERT_TRUE(mixed.ok()) << mixed.error().message;
+  EXPECT_EQ(mixed.value().at(omitted_id).phases[1].deadline_offset_ns,
+            300'000'000);
+  EXPECT_GT(mixed.value().at(omitted_id).outer_duration_ns, 3'000'000'000);
+  selections.front().control_binding_revision =
+      core::ControlBindingRevision(std::string(kZeroDigest));
+  EXPECT_FALSE(detail::resolve_binding_stop_timing(
+                   bindings, applicability.stop_evidence_policies(), selections)
+                   .ok());
+  const auto retained = test::materialize_lite6_retained_consumer_fixture_from(
+      root.path(), std::move(fixture));
+  ASSERT_EQ(retained.bundle->value().cell_graph.control_domains.size(), 2U);
+  ASSERT_EQ(retained.bundle->value().stop_timing_parameters.size(), 2U);
+  FilesystemCatalogArtifactStore catalogs(root.path());
+  const auto envelope =
+      resolve_retained_stop_deadline_budget(*retained.bundle, catalogs);
+  ASSERT_TRUE(envelope);
+  EXPECT_GT(envelope->outer_duration_ns, 4'000'000'000);
 }
 
 TEST(ResolvedStopBasePlanResolverTest,

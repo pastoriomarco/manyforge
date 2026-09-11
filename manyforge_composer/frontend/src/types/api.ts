@@ -406,6 +406,8 @@ export interface DeploymentControlledStopProfile {
   stop_mode: 'soft_on_path' | 'spring_back_hold';
   deceleration_time_s: number;
   allow_natural_completion_on_short_path: boolean;
+  /** null is an older Draft that still requires an explicit migration choice. */
+  jerk_limits_enabled: boolean | null;
   per_resource_limits: Array<{
     resource_id: string;
     max_deceleration: {
@@ -416,7 +418,22 @@ export interface DeploymentControlledStopProfile {
       coordinate_kind: string;
       value: number;
     };
+    max_jerk?: { coordinate_kind: string; value: number };
   }>;
+}
+
+export interface DeploymentStopTiming {
+  command_latency_allowance_ns: number;
+  settling_allowance_ns: number;
+  operational_timeout_ns: number;
+}
+
+export interface DeploymentControlledStopUpdate {
+  control_binding_id: string;
+  control_binding_revision: string;
+  /** null keeps the selected target's profile unchanged (including non-motion targets). */
+  profile: DeploymentControlledStopProfile | null;
+  timing: DeploymentStopTiming | null;
 }
 
 export interface ScenarioCatalogEntry {

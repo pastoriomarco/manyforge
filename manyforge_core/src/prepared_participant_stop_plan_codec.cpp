@@ -5,6 +5,7 @@
 #include <manyforge_core/motion_interrupt/stop_profile_mapper.hpp>
 #include <manyforge_core/prepared_participant_stop_plan_codec.hpp>
 #include <manyforge_core/resolved_stop_base_plan_codec.hpp>
+#include <manyforge_core/stop_timing.hpp>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -141,6 +142,19 @@ void require_identifier(std::string_view value, std::string reason) {
       velocity);
 }
 
+[[nodiscard]] JsonObjectDTO jerk_value(const CoordinateJerkDTO& jerk) {
+  return std::visit(
+      [](const auto& value) -> JsonObjectDTO {
+        if constexpr (requires { value.value_rad_s3; })
+          return {{"coordinate_kind", JsonValueDTO{std::string("angular_rad_s3")}},
+                  {"value_rad_s3", JsonValueDTO{value.value_rad_s3}}};
+        else
+          return {{"coordinate_kind", JsonValueDTO{std::string("linear_m_s3")}},
+                  {"value_m_s3", JsonValueDTO{value.value_m_s3}}};
+      },
+      jerk);
+}
+
 [[nodiscard]] JsonObjectDTO contract_parameters_value(
     const MotionControlledStopContractParametersDTO& parameters) {
   return std::visit(
@@ -157,16 +171,18 @@ void require_identifier(std::string_view value, std::string reason) {
           if constexpr (!std::is_same_v<Selected, HardDecelerationStopParametersDTO>) {
             row.emplace("max_deceleration",
                         JsonValueDTO{acceleration_value(limit.max_deceleration)});
+            if (limit.max_jerk) row.emplace("max_jerk", JsonValueDTO{jerk_value(*limit.max_jerk)});
           }
           limits.emplace_back(JsonValueDTO{std::move(row)});
         }
         result.emplace("per_resource_limits", JsonValueDTO{std::move(limits)});
         if constexpr (!std::is_same_v<Selected, HardDecelerationStopParametersDTO>) {
           result.emplace("deceleration_time_s", JsonValueDTO{selected.deceleration_time_s});
-        }
-        if constexpr (std::is_same_v<Selected, SoftOnPathStopParametersDTO>) {
+          result.emplace("jerk_limits_enabled", JsonValueDTO{selected.jerk_limits_enabled});
           result.emplace("allow_natural_completion_on_short_path",
                          JsonValueDTO{selected.allow_natural_completion_on_short_path});
+        }
+        if constexpr (std::is_same_v<Selected, SoftOnPathStopParametersDTO>) {
           if (selected.recoverable_substitution_mode.has_value()) {
             result.emplace(
                 "recoverable_substitution_mode",
@@ -193,6 +209,14 @@ void require_identifier(std::string_view value, std::string reason) {
       {"allow_natural_completion_on_short_path",
        CanonicalValue(profile.allow_natural_completion_on_short_path)},
       {"require_backend_confirmation", CanonicalValue(profile.require_backend_confirmation)}};
+  if (profile.jerk_limits_enabled)
+    fields.emplace_back("jerk_limits_enabled", CanonicalValue(*profile.jerk_limits_enabled));
+  if (!profile.per_joint_max_jerk.empty()) {
+    CanonicalValue::Object limits;
+    for (const auto& [joint, limit] : profile.per_joint_max_jerk)
+      limits.emplace_back(joint, json_object(jerk_value(limit)));
+    fields.emplace_back("per_joint_max_jerk", CanonicalValue(std::move(limits)));
+  }
   if (profile.deceleration_time_s.has_value()) {
     fields.emplace_back("deceleration_time_s", CanonicalValue(*profile.deceleration_time_s));
   }
@@ -348,15 +372,37 @@ void require_closed_object(const CanonicalValue& value,
 }
 
 [[nodiscard]] MotionInterruptStopProfileDTO parse_profile(const CanonicalValue& value) {
-  require_closed_object(
-      value,
-      {"profile_id", "stop_mode", "allow_natural_completion_on_short_path",
-       "require_backend_confirmation"},
-      {"deceleration_time_s", "per_joint_max_deceleration", "recoverable_substitution_mode",
-       "per_joint_settle_velocity_threshold", "diagnostics"},
-      "prepared Stop profile object is invalid");
+  require_closed_object(value,
+                        {"profile_id", "stop_mode", "allow_natural_completion_on_short_path",
+                         "require_backend_confirmation"},
+                        {"deceleration_time_s", "per_joint_max_deceleration",
+                         "recoverable_substitution_mode", "per_joint_settle_velocity_threshold",
+                         "diagnostics", "per_joint_max_jerk", "jerk_limits_enabled"},
+                        "prepared Stop profile object is invalid");
 
   MotionInterruptStopProfileDTO profile;
+  profile.jerk_limits_enabled =
+      value.find_object_member("jerk_limits_enabled")
+          ? std::optional(required_bool(value, "jerk_limits_enabled",
+                                        "prepared Stop jerk activation is invalid"))
+          : std::nullopt;
+  if (const auto* limits = value.find_object_member("per_joint_max_jerk")) {
+    if (!limits->is_object() || limits->as_object().empty() ||
+        limits->as_object().size() > kMaximumSourceJointRows)
+      fail("prepared Stop jerk map is invalid");
+    for (const auto& [joint, limit] : limits->as_object()) {
+      if (!content_identity::is_source_symbol(joint)) fail("prepared Stop source joint is invalid");
+      const auto kind =
+          required_string(limit, "coordinate_kind", "prepared Stop jerk kind is invalid");
+      const bool angular = kind == "angular_rad_s3";
+      if (!angular && kind != "linear_m_s3") fail("prepared Stop jerk kind is invalid");
+      const std::string_view key = angular ? "value_rad_s3" : "value_m_s3";
+      require_closed_object(limit, {"coordinate_kind", key}, {}, "prepared Stop jerk is invalid");
+      const auto scalar = required_positive_number(limit, key, "prepared Stop jerk is invalid");
+      profile.per_joint_max_jerk.emplace(joint, angular ? CoordinateJerkDTO{AngularJerkDTO{scalar}}
+                                                        : CoordinateJerkDTO{LinearJerkDTO{scalar}});
+    }
+  }
   profile.profile_id = required_string(value, "profile_id", "prepared Stop profile ID is invalid");
   profile.stop_mode = parse_profile_mode(
       required_string(value, "stop_mode", "prepared Stop profile mode is invalid"));
@@ -566,6 +612,9 @@ Result<PreparedParticipantStopPlanDTO> MakePreparedParticipantStopPlan(
 
     std::optional<JsonObjectDTO> mapped_parameters;
     if (context.participant_stop_profile.has_value()) {
+      auto frozen = resolve_motion_interrupt_stop_jerk_limits(*context.participant_stop_profile);
+      if (!frozen.ok()) fail(frozen.error().message);
+      context.participant_stop_profile = std::move(frozen.value());
       const auto& nominal = verified_base_plan.escalation_stages.front();
       if (nominal.containment_command.command_kind !=
               StopContainmentCommandKind::kMotionControlledStop ||
@@ -618,6 +667,21 @@ Result<PreparedParticipantStopPlanDTO> MakePreparedParticipantStopPlan(
           }
           prepared.validated_contract_parameters = resolved.default_contract_parameters;
           prepared.parameter_source = StopStageParameterSourceDTO::kDeploymentDefault;
+          if (resolved.containment_command.command_kind ==
+              StopContainmentCommandKind::kMotionControlledStop) {
+            const auto& contract = *resolved.containment_command.provider_contract_ref;
+            if (contract.contract_schema_id.value() != kMotionControlledStopContractSchemaId ||
+                contract.contract_schema_revision.value() !=
+                    kMotionControlledStopContractSchemaRevision)
+              fail("controlled default does not select the qualified motion contract");
+            const auto profile = map_motion_controlled_stop_contract_parameters_to_profile(
+                *resolved.default_contract_parameters, resources, "deployment_default");
+            if (!profile.ok()) fail(profile.error().message);
+            const auto mapped = map_motion_interrupt_stop_profile_to_contract_parameters(
+                profile.value(), context.node_category, resources, retained_default_limits);
+            if (!mapped.ok()) fail(mapped.error().message);
+            prepared.validated_contract_parameters = contract_parameters_value(mapped.value());
+          }
         }
       }
       plan.stage_commands.push_back(std::move(prepared));
@@ -654,6 +718,59 @@ Result<void> VerifyPreparedParticipantStopPlan(
                  {{"reason", "prepared_participant_stop_plan_mismatch"}}});
   }
   return Result<void>::Ok();
+}
+
+namespace {
+Result<void> validate_profile_timing(const RuntimeParticipantStopReadinessDTO& readiness,
+                                     const PreparedParticipantStopPlanDTO& plan) {
+  const auto maximum = readiness.maximum_controlled_stop_duration_ns;
+  if (!maximum) return Result<void>::Ok();
+  if (*maximum <= 0 || *maximum > kMaxStopEvidencePolicyDurationNs)
+    return reject<void>("stop_profile_duration_ceiling_invalid");
+  for (const auto& stage : plan.stage_commands) {
+    if (stage.resolved_stage.containment_command.command_kind !=
+            StopContainmentCommandKind::kMotionControlledStop ||
+        !stage.validated_contract_parameters)
+      continue;
+    const auto found = stage.validated_contract_parameters->find("deceleration_time_s");
+    if (found == stage.validated_contract_parameters->end()) continue;  // hard profile has no ramp
+    const auto* duration = std::get_if<double>(&found->second.value);
+    // The complete Soft ramp / Spring brake-and-return, also used by the
+    // sole authorized nominal substitution; never halve it.
+    const auto duration_ns = authored_stop_duration_ns(duration ? *duration : 0);
+    if (!duration_ns.ok() || duration_ns.value() > *maximum)
+      return Result<void>::Err(
+          {"invalid_request",
+           "Stop profile exceeds the saved timeout after latency and settling allowances",
+           {{"reason", "stop_profile_exceeds_operational_timing"},
+            {"maximum_full_profile_duration_ns", std::to_string(*maximum)}}});
+  }
+  return Result<void>::Ok();
+}
+}  // namespace
+
+Result<PreparedParticipantStopPlanDTO> MakePreparedParticipantStopPlan(
+    const RuntimeParticipantStopReadinessDTO& readiness,
+    PreparedParticipantStopPlanContextDTO context,
+    std::span<const RuntimeResourceBindingDTO> resources,
+    std::span<const HardStopResourceLimitDTO> retained_default_limits) {
+  auto plan = MakePreparedParticipantStopPlan(readiness.resolved_stop_base_plan, std::move(context),
+                                              resources, retained_default_limits);
+  if (!plan.ok()) return plan;
+  const auto timing = validate_profile_timing(readiness, plan.value());
+  if (!timing.ok()) return Result<PreparedParticipantStopPlanDTO>::Err(timing.error());
+  return plan;
+}
+
+Result<void> VerifyPreparedParticipantStopPlan(
+    const RuntimeParticipantStopReadinessDTO& readiness, const PreparedParticipantStopPlanDTO& plan,
+    std::span<const RuntimeResourceBindingDTO> resources,
+    std::span<const HardStopResourceLimitDTO> retained_default_limits,
+    MotionInterruptNodeCategory node_category) {
+  const auto verified = VerifyPreparedParticipantStopPlan(
+      readiness.resolved_stop_base_plan, plan, resources, retained_default_limits, node_category);
+  if (!verified.ok()) return verified;
+  return validate_profile_timing(readiness, plan);
 }
 
 Result<std::string> EncodePreparedParticipantStopPlan(

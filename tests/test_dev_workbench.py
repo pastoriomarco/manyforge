@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import importlib.util
+import json
 from pathlib import Path
 import socket
 from types import SimpleNamespace
@@ -18,6 +19,39 @@ SPEC = importlib.util.spec_from_file_location(
 assert SPEC is not None and SPEC.loader is not None
 dev_workbench = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(dev_workbench)
+
+
+def test_compiler_profile_follows_bundle_reference_not_package_file_count(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(dev_workbench, "PACKAGE_ROOT", tmp_path)
+    directory = tmp_path / "build-manifests/compiler_build"
+    directory.mkdir(parents=True)
+    for digit, profile in [("1", "Debug"), ("2", "Release")]:
+        (directory / f"{digit * 64}.json").write_text(
+            json.dumps(
+                {
+                    "compiler_build_digest": "sha256:" + digit * 64,
+                    "build_profile": profile,
+                }
+            )
+        )
+    bundle = {"provenance": {"compiler_build_digest": "sha256:" + "2" * 64}}
+    assert dev_workbench._compiler_build_profile(bundle) == "Release"
+    (directory / f"{'2' * 64}.json").write_text(
+        json.dumps(
+            {
+                "compiler_build_digest": "sha256:" + "1" * 64,
+                "build_profile": "Release",
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="exact reference"):
+        dev_workbench._compiler_build_profile(bundle)
+    with pytest.raises(ValueError, match="digest is invalid"):
+        dev_workbench._compiler_build_profile(
+            {"provenance": {"compiler_build_digest": "../../outside"}}
+        )
 
 
 def test_status_reads_the_backend_derived_scenario_without_reducing_it_again(
@@ -94,9 +128,7 @@ def test_status_command_reads_the_current_scenario_without_package_mutation(
 ) -> None:
     observed: list[str | None] = []
 
-    def query_status(
-        *, scenario_id: str | None, composer_port: int
-    ) -> dict[str, Any]:
+    def query_status(*, scenario_id: str | None, composer_port: int) -> dict[str, Any]:
         assert composer_port == 9020
         observed.append(scenario_id)
         return {
@@ -119,9 +151,7 @@ def test_status_command_reads_the_current_scenario_without_package_mutation(
     assert "another-native-scenario" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize(
-    "state", ["idle_after_reset", "terminal_awaiting_reset"]
-)
+@pytest.mark.parametrize("state", ["idle_after_reset", "terminal_awaiting_reset"])
 def test_startup_accepts_contained_idle_and_resettable_terminal_cycles(
     state: str,
 ) -> None:
@@ -171,7 +201,7 @@ def test_scenario_load_rejects_a_stale_workspace_deployment(
     deployment.parent.mkdir(parents=True)
     deployment.write_text(
         '{"deployment_artifact_id":"example",'
-        '"deployment_revision":"sha256:' + ('1' * 64) + '"}',
+        '"deployment_revision":"sha256:' + ("1" * 64) + '"}',
         encoding="utf-8",
     )
     monkeypatch.setattr(dev_workbench, "WORKSPACE", workspace)
@@ -196,9 +226,7 @@ def test_scenario_load_rejects_a_stale_workspace_node_environment(
         '{"catalog":{"catalog_digest":"sha256:'
         + ("1" * 64)
         + '","catalog_id":"manyforge_builtin","content_version":"1.1.0"},'
-        '"environment_digest":"sha256:'
-        + ("2" * 64)
-        + '"}',
+        '"environment_digest":"sha256:' + ("2" * 64) + '"}',
         encoding="utf-8",
     )
     monkeypatch.setattr(dev_workbench, "NODE_ENVIRONMENT_MANIFEST", manifest)
@@ -233,9 +261,7 @@ def test_scenario_load_accepts_the_exact_workspace_node_environment(
         '{"catalog":{"catalog_digest":"'
         + expected["catalog_digest"]
         + '","catalog_id":"manyforge_builtin","content_version":"1.1.0"},'
-        '"environment_digest":"'
-        + expected["environment_digest"]
-        + '"}',
+        '"environment_digest":"' + expected["environment_digest"] + '"}',
         encoding="utf-8",
     )
     monkeypatch.setattr(dev_workbench, "NODE_ENVIRONMENT_MANIFEST", manifest)
@@ -309,9 +335,7 @@ def test_native_build_uses_current_source_and_only_runtime_targets(
 
     monkeypatch.setattr(dev_workbench, "ROBOPLAN_BUILD", build)
     monkeypatch.setattr(dev_workbench, "NATIVE_EXECUTION_HOST", native_host)
-    monkeypatch.setattr(
-        dev_workbench, "NATIVE_CANDIDATE_WORKER", candidate_worker
-    )
+    monkeypatch.setattr(dev_workbench, "NATIVE_CANDIDATE_WORKER", candidate_worker)
     monkeypatch.setattr(dev_workbench, "_run", run)
     monkeypatch.setenv("MANYFORGE_DEV_BUILD_JOBS", "3")
 
@@ -354,14 +378,20 @@ def test_startup_requires_the_existing_manager_baseline_to_be_fully_converged() 
     }
 
     assert dev_workbench._manager_projection_ready(status, diff) is True
-    assert dev_workbench._manager_projection_ready(
-        status,
-        {**diff, "converged": False},
-    ) is False
-    assert dev_workbench._manager_projection_ready(
-        {**status, "status": {**status["status"], "manager_ready": False}},
-        diff,
-    ) is False
+    assert (
+        dev_workbench._manager_projection_ready(
+            status,
+            {**diff, "converged": False},
+        )
+        is False
+    )
+    assert (
+        dev_workbench._manager_projection_ready(
+            {**status, "status": {**status["status"], "manager_ready": False}},
+            diff,
+        )
+        is False
+    )
 
 
 class _LifecycleClient:
@@ -417,19 +447,13 @@ class _LifecycleClient:
     def authoring_admission(self) -> dict[str, Any]:
         return {"authoring_allowed": False, "admission_generation": 7}
 
-    def submit_component_lifecycle(
-        self, request: dict[str, Any]
-    ) -> dict[str, Any]:
+    def submit_component_lifecycle(self, request: dict[str, Any]) -> dict[str, Any]:
         self.lifecycle_requests.append(deepcopy(request))
         return {
-            "acceptance": {
-                "lifecycle_transaction_id": f"lifecycle.{request['intent']}"
-            }
+            "acceptance": {"lifecycle_transaction_id": f"lifecycle.{request['intent']}"}
         }
 
-    def component_lifecycle_status(
-        self, transaction_id: str
-    ) -> dict[str, Any]:
+    def component_lifecycle_status(self, transaction_id: str) -> dict[str, Any]:
         intent = transaction_id.removeprefix("lifecycle.")
         self.state = "prepared" if intent == "prepare" else "active"
         self.generation += 1
@@ -459,15 +483,9 @@ class _LifecycleClient:
             ],
         }
 
-    def submit_route_selection(
-        self, request: dict[str, Any]
-    ) -> dict[str, Any]:
+    def submit_route_selection(self, request: dict[str, Any]) -> dict[str, Any]:
         self.route_requests.append(deepcopy(request))
-        return {
-            "acceptance": {
-                "route_selection_transaction_id": "route-selection.1"
-            }
-        }
+        return {"acceptance": {"route_selection_transaction_id": "route-selection.1"}}
 
     def route_selection_status(self, transaction_id: str) -> dict[str, Any]:
         assert transaction_id == "route-selection.1"
@@ -526,10 +544,7 @@ def test_simulated_scenario_start_converges_only_missing_lifecycle_and_routes() 
 
     assert len(client.lifecycle_requests) == 2
     assert len(client.route_requests) == 2
-    assert (
-        client.route_requests[1]["request_context"]["request_id"]
-        != first_request_id
-    )
+    assert client.route_requests[1]["request_context"]["request_id"] != first_request_id
 
 
 class _ControlManagementClient(_LifecycleClient):
@@ -602,9 +617,7 @@ def test_stale_socket_cleanup_rejects_non_socket_state(tmp_path: Path) -> None:
 
 
 def test_launcher_pins_the_image_and_separates_its_cache() -> None:
-    launcher = (REPOSITORY_ROOT / "scripts/compose-dev.sh").read_text(
-        encoding="utf-8"
-    )
+    launcher = (REPOSITORY_ROOT / "scripts/compose-dev.sh").read_text(encoding="utf-8")
 
     assert "docker image inspect -f '{{.Id}}'" in launcher
     assert 'cache_root="$cache_base/images/$image_key"' in launcher
@@ -632,9 +645,7 @@ def test_cleanup_uses_bounded_reverse_owner_order(monkeypatch: Any) -> None:
         "_terminate",
         lambda process: observed.append(
             next(
-                name
-                for name, candidate in workbench.processes
-                if candidate is process
+                name for name, candidate in workbench.processes if candidate is process
             )
         ),
     )

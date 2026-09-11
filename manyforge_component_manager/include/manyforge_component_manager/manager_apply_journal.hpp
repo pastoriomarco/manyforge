@@ -20,8 +20,8 @@
 namespace manyforge::component_manager {
 
 inline constexpr std::string_view kManagerApplyJournalSchemaId =
-    "manyforge.internal.component-manager.apply-journal.o1.5.v9";
-inline constexpr std::int64_t kManagerApplyJournalSchemaVersion = 9;
+    "manyforge.internal.component-manager.apply-journal.o1.5.v10";
+inline constexpr std::int64_t kManagerApplyJournalSchemaVersion = 10;
 inline constexpr std::int64_t kManagerApplyJournalSqliteApplicationId =
     1296450128;
 inline constexpr std::size_t kMaximumManagerApplyIntents = 256U;

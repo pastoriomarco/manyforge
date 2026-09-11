@@ -14,6 +14,9 @@ from manyforge_composer.backend.draft_session import (
 )
 from manyforge_composer.backend.deployment_draft import DeploymentDraftSession
 from manyforge_composer.backend.state import ComposerState
+from manyforge_composer.backend.authoring_transaction_journal import (
+    AuthoringJournalError,
+)
 from manyforge_headless_api.client import HeadlessClientError
 
 
@@ -219,6 +222,66 @@ def _state(
     return state
 
 
+def test_scene_preparation_retains_readiness_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    program = Program(str(_PROGRAM_PATH), build_node_environment().catalog)
+    headless = _Headless(_selection(program.to_dict()))
+    headless.applied = _applied(headless.selection)
+    monkeypatch.setattr(
+        headless,
+        "authoring_admission",
+        lambda: {"admission_generation": 38, "authoring_allowed": False},
+    )
+    monkeypatch.setattr(
+        headless,
+        "program_scene_prepare",
+        lambda _body: pytest.fail("unready scene preparation must not be submitted"),
+    )
+    state = _state(headless, _Coordinator(), program=None)
+    with pytest.raises(AuthoringJournalError, match="authoring readiness") as error:
+        state.prepare_current_applied_scene(
+            request_owner_epoch="test-owner",
+            request_id="test-apply",
+        )
+    assert error.value.code == "program_scene_preparation_unavailable"
+    assert not headless.program_apply_bodies
+
+
+def test_admitted_handover_rebinds_inactive_program(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    program = Program(str(_PROGRAM_PATH), build_node_environment().catalog)
+    headless = _Headless(_selection(program.to_dict()))
+    headless.applied = _applied(headless.selection)
+    prior_digest = headless.applied["source"]["record_digest"]
+    original = headless.program_applied
+
+    def current_applied() -> dict[str, Any]:
+        if headless.manager_target and not headless.program_apply_bodies:
+            raise HeadlessClientError(
+                "program_applied_selection_not_active",
+                "old Deployment binding",
+                status_code=409,
+            )
+        return original()
+
+    monkeypatch.setattr(headless, "program_applied", current_applied)
+    # Reuse this file's orchestration-only response fixture; wire validation
+    # is exercised by the native browser workflow, not this stub.
+    monkeypatch.setattr(
+        "manyforge_composer.backend.state.validate_program_apply_result",
+        lambda value: value,
+    )
+    state = _state(headless, _Coordinator(), program=None)
+    state.load_startup_scenario(headless.selection["scenario_id"])
+    assert len(headless.program_apply_bodies) == 1
+    assert (
+        headless.program_apply_bodies[0]["expected_applied_record_digest"]
+        == prior_digest
+    )
+
+
 def test_startup_load_activates_deployment_then_program(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -244,13 +307,13 @@ def test_startup_load_activates_deployment_then_program(
     assert coordinator.executions[0]["operation_kind"] == "load_scenario"
     assert coordinator.executions[0]["prepared"]["external_kind"] == "scenario_load"
     assert len(headless.manager_apply_bodies) == 1
+    assert headless.manager_apply_bodies[0]["request_owner_epoch"] == "manager-owner-1"
     assert (
-        headless.manager_apply_bodies[0]["request_owner_epoch"]
-        == "manager-owner-1"
+        headless.manager_apply_bodies[0]["parent_authoring_claim"]["intent"][
+            "claim_kind"
+        ]
+        == "authoring_mutation"
     )
-    assert headless.manager_apply_bodies[0]["parent_authoring_claim"]["intent"][
-        "claim_kind"
-    ] == "authoring_mutation"
     assert len(headless.program_apply_bodies) == 1
     assert len(headless.scene_preparations) == 1
     assert headless.program_apply_bodies[0]["program"] == selection["program"]

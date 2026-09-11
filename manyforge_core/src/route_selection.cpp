@@ -298,7 +298,13 @@ bool RouteSelectionIntentDTO::locally_valid() const noexcept {
          bounded_identity(expected_graph_revision) &&
          desired_configuration_valid(desired_configuration) &&
          expected_active_control_configuration.locally_valid() &&
-         component_expectations_valid(component_expectations) && attribution.locally_valid();
+         component_expectations_valid(component_expectations) && attribution.locally_valid() &&
+         (!expected_admission_generation ||
+          (expected_admission_generation->nonzero() &&
+           expected_admission_generation->value() <= 9'007'199'254'740'991ULL)) &&
+         (!program_node_evidence ||
+          (expected_admission_generation && program_node_evidence->locally_valid() &&
+           program_node_evidence->owner_api == "cclc.control_route"));
 }
 
 bool RouteSelectionIntentDTO::replay_equal(const RouteSelectionIntentDTO& other) const noexcept {
@@ -307,7 +313,9 @@ bool RouteSelectionIntentDTO::replay_equal(const RouteSelectionIntentDTO& other)
          expected_graph_revision == other.expected_graph_revision &&
          desired_configuration == other.desired_configuration &&
          expected_active_control_configuration == other.expected_active_control_configuration &&
-         component_expectations == other.component_expectations;
+         component_expectations == other.component_expectations &&
+         expected_admission_generation == other.expected_admission_generation &&
+         program_node_evidence == other.program_node_evidence;
 }
 
 bool RouteConfigurationFenceAdmissionQueryDTO::locally_valid() const noexcept {
@@ -877,6 +885,11 @@ bool CCLCRouteSelectionRequestResultDTO::locally_valid() const noexcept {
   }
   const bool accepted = replay_status == RequestReplayStatusDTO::kAcceptedNew ||
                         replay_status == RequestReplayStatusDTO::kReplayedExact;
+  if (rejection) {
+    return accepted && !acceptance && !status && error_valid(*rejection) &&
+           rejection->details.contains("effect") &&
+           rejection->details.at("effect") == "not_started";
+  }
   if (!accepted) {
     return !acceptance.has_value() && !status.has_value();
   }
@@ -891,7 +904,8 @@ bool CCLCRouteSelectionRequestResultDTO::locally_valid() const noexcept {
 
 Result<PreparedRouteSelectionAdmission> PrepareRouteSelectionAdmission(
     const RouteSelectionIntentDTO& intent, const RouteSelectionAdmissionCandidate& candidate) {
-  if (!intent.locally_valid() || !bounded_identity(candidate.route_selection_transaction_id) ||
+  if (!intent.locally_valid() || !intent.expected_admission_generation ||
+      !bounded_identity(candidate.route_selection_transaction_id) ||
       !candidate.route_selection_transaction_generation.nonzero() ||
       !bounded_identity(candidate.candidate_active_control_configuration_id) ||
       !candidate.candidate_active_control_configuration_generation.nonzero() ||

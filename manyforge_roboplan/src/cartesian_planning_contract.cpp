@@ -659,6 +659,7 @@ measure_cartesian_joint_dynamics_envelope(
   }
 
   std::size_t work_index = 0;
+  envelope.joint_derivatives.resize(joint_count);
   for (std::size_t joint = 0; joint < joint_count; ++joint) {
     double velocity_limit = std::abs(model_velocity_limits[joint]);
     double acceleration_limit = std::abs(model_acceleration_limits[joint]);
@@ -715,6 +716,12 @@ measure_cartesian_joint_dynamics_envelope(
       const double duration =
           trajectory.times[sample] - trajectory.times[sample - 1];
       const double duration_squared = duration * duration;
+      const double duration_cubed = duration_squared * duration;
+      if (!finite_positive(duration_cubed)) {
+        envelope.complete = false;
+        return core::Result<CartesianJointDynamicsEnvelope>::Ok(
+            std::move(envelope));
+      }
       const double position_from = from_positions[joint_index];
       const double position_to = to_positions[joint_index];
       const double velocity_from = from_velocities[joint_index];
@@ -767,6 +774,8 @@ measure_cartesian_joint_dynamics_envelope(
         }
         envelope.velocity_ratio = std::max(
             envelope.velocity_ratio, std::abs(velocity) / velocity_limit);
+        envelope.joint_derivatives[joint].velocity = std::max(
+            envelope.joint_derivatives[joint].velocity, std::abs(velocity));
         return true;
       };
       if (!record_velocity(0.0) || !record_velocity(1.0)) {
@@ -795,6 +804,9 @@ measure_cartesian_joint_dynamics_envelope(
         envelope.acceleration_ratio =
             std::max(envelope.acceleration_ratio,
                      std::abs(acceleration) / acceleration_limit);
+        envelope.joint_derivatives[joint].acceleration =
+            std::max(envelope.joint_derivatives[joint].acceleration,
+                     std::abs(acceleration));
         return true;
       };
       if (!record_acceleration(0.0) || !record_acceleration(1.0)) {
@@ -807,6 +819,46 @@ measure_cartesian_joint_dynamics_envelope(
               std::move(envelope));
         }
       }
+      // Quintic P/V/A interpolation has quadratic jerk. Its only possible
+      // interior extremum is the zero of its linear derivative (snap).
+      const std::array<double, 3U> jerk_coefficients{
+          6.0 * (*position_coefficients)[3], 24.0 * (*position_coefficients)[4],
+          60.0 * (*position_coefficients)[5]};
+      const auto record_jerk = [&](double progress) {
+        const double jerk =
+            evaluate_polynomial(jerk_coefficients, progress) / duration_cubed;
+        if (!std::isfinite(jerk)) {
+          envelope.complete = false;
+          return false;
+        }
+        envelope.joint_derivatives[joint].jerk =
+            std::max(envelope.joint_derivatives[joint].jerk, std::abs(jerk));
+        return true;
+      };
+      if (!record_jerk(0.0) || !record_jerk(1.0)) {
+        return core::Result<CartesianJointDynamicsEnvelope>::Ok(
+            std::move(envelope));
+      }
+      if (jerk_coefficients[2] != 0.0) {
+        const double extremum =
+            -0.5 * (jerk_coefficients[1] / jerk_coefficients[2]);
+        if (extremum > 0.0 && extremum < 1.0 && !record_jerk(extremum)) {
+          return core::Result<CartesianJointDynamicsEnvelope>::Ok(
+              std::move(envelope));
+        }
+      }
+    }
+    auto &bounds = envelope.joint_derivatives[joint];
+    // Numerical headroom for the existing bounded root solver and coefficient
+    // evaluation. Zero derivatives remain zero (stationary joints add no cap).
+    bounds.velocity *= 1.0 + 1e-12;
+    bounds.acceleration *= 1.0 + 1e-12;
+    bounds.jerk *= 1.0 + 1e-12;
+    if (!std::isfinite(bounds.velocity) ||
+        !std::isfinite(bounds.acceleration) || !std::isfinite(bounds.jerk)) {
+      envelope.complete = false;
+      return core::Result<CartesianJointDynamicsEnvelope>::Ok(
+          std::move(envelope));
     }
   }
   return core::Result<CartesianJointDynamicsEnvelope>::Ok(
@@ -882,12 +934,14 @@ core::Result<CartesianInterpolantPath> sample_cartesian_interpolant_path(
   CartesianInterpolantPath result;
   result.poses.reserve(std::min(kMaxInterpolantPathSamples,
                                sample_count * static_cast<std::size_t>(2)));
-  const auto append_pose = [&](const Eigen::VectorXd& group_positions)
+  result.times_s.reserve(result.poses.capacity());
+  const auto append_pose = [&](const Eigen::VectorXd& group_positions, double time_s)
       -> std::optional<core::ErrorDTO> {
-    if (!group_positions.allFinite()) {
+    if (!group_positions.allFinite() || !std::isfinite(time_s) || time_s < 0.0 ||
+        (!result.times_s.empty() && time_s <= result.times_s.back())) {
       return core::ErrorDTO{
           core::kErrorCartesianIncomplete,
-          "Cartesian trajectory interpolant contains a non-finite position",
+          "Cartesian trajectory interpolant has invalid positions or sample times",
           {{"reason", "cartesian_trajectory_interpolant_invalid"},
            {"failure_stage", "cartesian_output_validation"}}};
     }
@@ -905,9 +959,10 @@ core::Result<CartesianInterpolantPath> sample_cartesian_interpolant_path(
            {"failure_stage", "cartesian_output_validation"}}};
     }
     result.poses.push_back(pose);
+    result.times_s.push_back(time_s);
     return std::nullopt;
   };
-  if (auto error = append_pose(trajectory.positions.front());
+  if (auto error = append_pose(trajectory.positions.front(), trajectory.times.front());
       error.has_value()) {
     return core::Result<CartesianInterpolantPath>::Err(std::move(*error));
   }
@@ -1019,7 +1074,11 @@ core::Result<CartesianInterpolantPath> sample_cartesian_interpolant_path(
               evaluate_polynomial(coefficients[joint], progress);
         }
       }
-      if (auto error = append_pose(group_positions); error.has_value()) {
+      const double time_s = step == subdivisions
+                                ? trajectory.times[sample]
+                                : trajectory.times[sample - 1] + duration *
+                                      (static_cast<double>(step) / static_cast<double>(subdivisions));
+      if (auto error = append_pose(group_positions, time_s); error.has_value()) {
         return core::Result<CartesianInterpolantPath>::Err(
             std::move(*error));
       }
@@ -1087,14 +1146,23 @@ struct ControlledCartesianPathFidelityResult {
   std::optional<core::ErrorDTO> error;
 };
 
-ControlledCartesianPathFidelityResult
-verify_cartesian_path_fidelity_impl(
+ControlledCartesianPathFidelityResult verify_cartesian_path_fidelity_impl(
     std::span<const Eigen::Matrix4d> requested_path,
     std::span<const Eigen::Matrix4d> actual_path,
     double translation_tolerance_m, double rotation_tolerance_rad,
-    const CartesianPlanningControl* control) {
+    const CartesianPlanningControl *control,
+    std::span<const std::size_t> waypoint_indices = {}) {
   ControlledCartesianPathFidelityResult result;
-  auto& report = result.report;
+  auto &report = result.report;
+  if (waypoint_indices.size() > 4096U ||
+      !std::is_sorted(waypoint_indices.begin(), waypoint_indices.end()) ||
+      (!waypoint_indices.empty() &&
+       waypoint_indices.back() >= requested_path.size())) {
+    result.error = cartesian_incomplete_error(
+        "Cartesian waypoint correspondence indices are invalid",
+        "cartesian_waypoint_correspondence_invalid", 0.0, 0U);
+    return result;
+  }
   if (requested_path.empty() || actual_path.empty() ||
       !finite_positive(translation_tolerance_m) ||
       !finite_positive(rotation_tolerance_rad)) {
@@ -1298,16 +1366,31 @@ verify_cartesian_path_fidelity_impl(
   report.complete = !report.first_failing_path_sample_index.has_value();
   if (report.complete) {
     report.fraction_completed = 1.0;
+    report.waypoint_actual_sample_indices.reserve(waypoint_indices.size());
+    for (const auto index : waypoint_indices) {
+      // The existing fidelity proof establishes this ordered correspondence.
+      // Retain the upper actual sample, not an interpolated time estimate.
+      const auto match =
+          std::lower_bound(actual_parameter->begin(), actual_parameter->end(),
+                           (*requested_parameter)[index]);
+      report.waypoint_actual_sample_indices.push_back(
+          index == 0U ? 0U
+          : index + 1U == requested_path.size() ||
+                  match == actual_parameter->end()
+              ? actual_path.size() - 1U
+              : static_cast<std::size_t>(match - actual_parameter->begin()));
+    }
   }
   return result;
 }
 
-}  // namespace
+} // namespace
 
-CartesianPathFidelityReport verify_cartesian_path_fidelity(
-    std::span<const Eigen::Matrix4d> requested_path,
-    std::span<const Eigen::Matrix4d> actual_path,
-    double translation_tolerance_m, double rotation_tolerance_rad) {
+CartesianPathFidelityReport
+verify_cartesian_path_fidelity(std::span<const Eigen::Matrix4d> requested_path,
+                               std::span<const Eigen::Matrix4d> actual_path,
+                               double translation_tolerance_m,
+                               double rotation_tolerance_rad) {
   return verify_cartesian_path_fidelity_impl(
              requested_path, actual_path, translation_tolerance_m,
              rotation_tolerance_rad, nullptr)
@@ -1319,10 +1402,11 @@ verify_cartesian_path_fidelity_controlled(
     std::span<const Eigen::Matrix4d> requested_path,
     std::span<const Eigen::Matrix4d> actual_path,
     double translation_tolerance_m, double rotation_tolerance_rad,
-    const CartesianPlanningControl& control) {
+    const CartesianPlanningControl& control,
+    std::span<const std::size_t> waypoint_indices) {
   auto result = verify_cartesian_path_fidelity_impl(
       requested_path, actual_path, translation_tolerance_m,
-      rotation_tolerance_rad, &control);
+      rotation_tolerance_rad, &control, waypoint_indices);
   if (result.error.has_value()) {
     return core::Result<CartesianPathFidelityReport>::Err(
         std::move(*result.error));

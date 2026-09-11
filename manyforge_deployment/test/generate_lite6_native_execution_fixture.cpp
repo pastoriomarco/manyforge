@@ -203,6 +203,9 @@ void write_exact_file(const std::filesystem::path &path,
       {"tree", CanonicalValue(CanonicalValue::Object{
                    {"node_id", CanonicalValue("sequence")},
                    {"instance_id", CanonicalValue("root")},
+                   {"execution_groups", CanonicalValue(CanonicalValue::Array{
+                                            CanonicalValue("selection.a"),
+                                            CanonicalValue("selection.b")})},
                    {"parameters", CanonicalValue(CanonicalValue::Object{})},
                    {"children", CanonicalValue(CanonicalValue::Array{})},
                })},

@@ -59,7 +59,7 @@ export interface ManualControlContracts {
 }
 
 export interface ManualControlMotionDescriptor {
-  schemaVersion: 'manyforge.manual_control_motion_descriptor.v3';
+  schemaVersion: 'manyforge.manual_control_motion_descriptor.v4';
   controllableComponentId: string;
   commandTargetId: string;
   componentRoleId: string;
@@ -72,6 +72,23 @@ export interface ManualControlMotionDescriptor {
   }>;
   joints: Array<DirectControlJoint & { compiledJointName: string; unit: 'rad' }>;
   operationalJointLimits: DirectControlOperationalJointLimit[];
+  ordinaryJerk: {
+    enabled: boolean;
+    presetReferenceTimeS: number;
+    jointLimits: Array<{
+      sourceJointName: string;
+      source: 'off' | 'override' | 'imported' | 'preset';
+      maximumRadS3: number | null;
+      presetRadS3: number | null;
+      imported: {
+        maximumRadS3: number;
+        enabled: boolean;
+        machineRequired: boolean;
+        sourceId: string;
+        sourceDigest: string;
+      } | null;
+    }>;
+  } | null;
   operationalLimit: {
     catalogPolicyMaximumTcpLinearSpeedMps: number;
     deploymentMaximumTcpLinearSpeedMps: number | null;
@@ -350,6 +367,24 @@ export interface CapabilityCommandParticipantPayload {
   caller_options: [{ option_id: 'command_duration_s'; value_s: number }];
 }
 
+/** Opaque Kernel coordinates; copied into the intent, never minted by the UI. */
+export interface ManualProgramHandoverContext {
+  program_runner_owner_epoch: string;
+  program_run_id: string;
+  claim_generation: number;
+  selection_revision: number;
+}
+
+export interface ManualControlAvailability {
+  requestId: string;
+  requestOwnerEpoch: string;
+  intentDigest: string;
+  available: boolean;
+  unavailableReason: string | null;
+  cleanupRequired: boolean;
+  manualHandover: ManualProgramHandoverContext | null;
+}
+
 export interface DirectControlOperationIntent {
   request_context: {
     request_id: string;
@@ -372,6 +407,7 @@ export interface DirectControlOperationIntent {
     payload: MotionParticipantPayload | CapabilityCommandParticipantPayload;
   }];
   coordination_policy: 'independent';
+  manual_handover?: ManualProgramHandoverContext;
 }
 
 export type JointMotionOperationIntent = DirectControlOperationIntent;

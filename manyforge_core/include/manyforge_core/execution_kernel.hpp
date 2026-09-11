@@ -223,7 +223,7 @@ struct ExecutionKernelConfig {
   // is otherwise unconfigured, so deployments can either opt the whole
   // kernel into controlled-stop semantics here or override on a per-
   // policy basis.
-  std::shared_ptr<MotionInterruptStopProfileDTO> default_fault_stop_profile;
+  std::shared_ptr<const MotionInterruptStopProfileDTO> default_fault_stop_profile;
 
   // Deployment-default operator-stop profile. Used by
   // `ExecutionKernel::stop()` (the operator stop-button path) to route
@@ -239,7 +239,7 @@ struct ExecutionKernelConfig {
   // safely" (default spring-back to known state), while an operator
   // stop is "I am taking back control, decelerate cleanly along the
   // current path" (default soft-on-path).
-  std::shared_ptr<MotionInterruptStopProfileDTO> operator_stop_profile;
+  std::shared_ptr<const MotionInterruptStopProfileDTO> operator_stop_profile;
 
   // The maintained addressed runtime owns the sole public Stop transaction.
   // In that composition the subordinate still detects and publishes runtime
@@ -552,6 +552,8 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
 
  private:
   struct PreparedMotionSession;
+  [[nodiscard]] Result<void> retire_prepared_motion_membership();
+  [[nodiscard]] ResetResultDTO reset_execution_backend();
   struct PlanningSuccess;
   struct ExecuteWorkerPlanPhaseResult;
   struct ExecuteWorkerValidationPhaseResult;
@@ -570,10 +572,12 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
                                         const CollisionWorldLeaseInventory& projection_inventory,
                                         std::uint32_t planning_attempt_index = 0,
                                         const RobotStateDTO* start_state_override = nullptr);
-  Result<TrajectoryDTO> plan_resume_trajectory(
-      const ExecuteRequestDTO& request, const CollisionWorldLeaseInventory& projection_inventory);
   Result<PlanningSuccess> plan_resume_trajectory_with_evidence(
-      const ExecuteRequestDTO& request, const CollisionWorldLeaseInventory& projection_inventory);
+      ExecuteRequestDTO& request, const CollisionWorldLeaseInventory& projection_inventory,
+      const TrajectoryDTO& interrupted_trajectory, std::optional<double> original_cursor_s);
+  Result<PlanningSuccess> plan_motion_continuation(
+      ExecuteRequestDTO& request, const CollisionWorldLeaseInventory& projection_inventory,
+      const detail::MotionResumeIntent& continuation);
   Result<std::size_t> discover_dynamic_carried_start_contacts(
       CollisionWorldLeaseInventory& projection_inventory, const RobotStateDTO& observed_start,
       std::uint64_t execution_id);
@@ -870,7 +874,7 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
                                              const char* reason);
 
   ExecuteWorkerPlanPhaseResult execute_worker_plan_phase(
-      std::stop_token st, const ExecuteRequestDTO& request,
+      std::stop_token st, ExecuteRequestDTO& request,
       const CollisionWorldLeaseInventory& projection_inventory, std::uint64_t exec_id,
       std::optional<TrajectoryDTO> cached_trajectory, bool cache_revalidation_candidate,
       ExecutionState worker_entry_state, ActiveMotionExecution& motion_state,
@@ -888,7 +892,7 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
 
   ExecuteWorkerDispatchPhaseResult execute_worker_dispatch_phase(
       const ExecuteRequestDTO& request, std::uint64_t exec_id, const TrajectoryDTO& trajectory,
-      bool active_trajectory_from_cache, bool cache_revalidation_candidate,
+      bool active_trajectory_from_cache, bool cache_revalidation_candidate, bool store_candidate,
       const ProjectionLeaseBindingDTO& projection_binding,
       const CollisionWorldLeaseInventory& scene_snapshot_lease_inventory,
       const CollisionWorldRevision& validation_world_revision,
@@ -896,6 +900,12 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
       std::shared_ptr<const TrajectoryDTO> collision_trajectory,
       std::shared_ptr<const PreparedOperationParticipantDTO> prepared_participant,
       ActiveMotionExecution& motion_state);
+
+  void store_validated_candidate(const ExecuteRequestDTO& request, std::uint64_t exec_id,
+                                 const TrajectoryDTO& trajectory,
+                                 const ProjectionRevisionDTO& projection_revision,
+                                 const CollisionWorldRevision& validation_revision,
+                                 bool revalidated_cache_candidate);
 
   void execute_worker_finalize_phase(const ExecuteRequestDTO& request, std::uint64_t exec_id,
                                      ExecutionHandle& execution_handle,

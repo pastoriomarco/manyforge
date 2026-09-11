@@ -318,6 +318,7 @@ adopt_durable_route_configurations(
 
 [[nodiscard]] core::Result<void> reconcile_runtime_epoch_routes(
     deployment::CCLCRuntimeComposition &composition,
+    core::IKernelCellAdmissionPort &cell_admission,
     const std::vector<RuntimeEpochRouteReconciliation> &reconciliations) {
   auto &port = composition.open_request_port();
   const auto owner_epoch = port.ReadRequestOwnerEpoch();
@@ -349,7 +350,8 @@ adopt_durable_route_configurations(
         selected->expected_active_control_configuration,
         selected->component_expectations,
         {core::RequestTransportDTO::kInternal,
-         core::RequestAssuranceDTO::kUnverified, std::nullopt}};
+         core::RequestAssuranceDTO::kUnverified, std::nullopt},
+        cell_admission.GetAuthoringAdmission().admission_generation};
     auto submitted = port.SubmitRouteSelection(intent);
     if (!submitted.ok()) {
       return core::Result<void>::Err(submitted.error());
@@ -802,8 +804,8 @@ CreateRetainedNativeCCLCRuntime(
   if (!composition.ok()) {
     return composition;
   }
-  auto reconciled =
-      reconcile_runtime_epoch_routes(*composition.value(), adopted.value());
+  auto reconciled = reconcile_runtime_epoch_routes(
+      *composition.value(), kernel_cell_admission_port, adopted.value());
   if (!reconciled.ok()) {
     return core::Result<std::unique_ptr<deployment::CCLCRuntimeComposition>>::
         Err(reconciled.error());

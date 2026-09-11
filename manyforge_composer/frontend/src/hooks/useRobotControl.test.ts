@@ -8,7 +8,33 @@ import {
   previewTargetRejection,
   runtimeScaleControlScopeFence,
   runtimeScaleFlushDelay,
+  manualAvailabilityScopeFence,
 } from './useRobotControl';
+import { statusFixture } from '../testFixtures/robotControl';
+import type { ComposerHeadlessState } from '../types/headless';
+
+it('manual availability follows owner and hold changes, not observed poses or node ticks', () => {
+  const snapshot = {
+    executionControlStatus: statusFixture(), authoringAdmission: { admissionGeneration: 1 },
+    programCycle: { programRunnerOwnerEpoch: 'runner.1', cycleGeneration: 1, state: 'running',
+      executionControlRevision: 1, nodeStatusRevision: 1,
+      runtimeControls: { executionSelections: { selectionRevision: 1,
+        groups: [{ groupId: 'all', state: 'stopping' }] } },
+    },
+  } as unknown as ComposerHeadlessState;
+  const initial = manualAvailabilityScopeFence(snapshot, 'joint');
+  snapshot.executionControlStatus!.observedMotion.positionsRad = [0.5, 0.6];
+  snapshot.executionControlStatus!.observedMotion.sequence += 1;
+  snapshot.programCycle.nodeStatusRevision = 2;
+  expect(manualAvailabilityScopeFence(snapshot, 'joint')).toBe(initial);
+  expect(manualAvailabilityScopeFence(snapshot, 'pose_goal')).toBe(initial);
+  expect(manualAvailabilityScopeFence(snapshot, 'gripper')).not.toBe(initial);
+  snapshot.programCycle.runtimeControls!.executionSelections.groups[0].state = 'held';
+  expect(manualAvailabilityScopeFence(snapshot, 'joint')).not.toBe(initial);
+  const held = manualAvailabilityScopeFence(snapshot, 'joint');
+  snapshot.executionControlStatus!.ownerEpoch = 'replacement';
+  expect(manualAvailabilityScopeFence(snapshot, 'joint')).not.toBe(held);
+});
 
 it('keeps known target rejection local without hiding transport or protocol failures', () => {
   expect(previewTargetRejection(new ApiError('IK failed', 500, {

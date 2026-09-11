@@ -763,7 +763,7 @@ require_configuration(const RetainedBundle &retained_bundle,
   result.motion_target_limits.reserve(motion_target_limits->size());
   for (const auto &entry : *motion_target_limits) {
     const auto *object = std::get_if<core::JsonObjectDTO>(&entry.value);
-    if (object == nullptr || object->size() != 3U) {
+    if (object == nullptr || object->size() != 4U) {
       throw RetainedBundleError(
           "native runtime configuration has an invalid motion target limit");
     }
@@ -775,20 +775,25 @@ require_configuration(const RetainedBundle &retained_bundle,
       throw RetainedBundleError(
           "native runtime configuration has an incomplete motion target limit");
     }
-    const auto *component_id = std::get_if<std::string>(&component->second.value);
+    const auto *component_id =
+        std::get_if<std::string>(&component->second.value);
     const auto *target_id = std::get_if<std::string>(&target->second.value);
     const auto *maximum = std::get_if<double>(&limit->second.value);
-    if (component_id == nullptr || component_id->empty() || target_id == nullptr ||
-        target_id->empty() || maximum == nullptr || !std::isfinite(*maximum) ||
-        *maximum <= 0.0 || *maximum > 1000.0) {
-      throw RetainedBundleError(
-          "native runtime configuration has an invalid motion target limit value");
+    if (component_id == nullptr || component_id->empty() ||
+        target_id == nullptr || target_id->empty() || maximum == nullptr ||
+        !std::isfinite(*maximum) || *maximum <= 0.0 || *maximum > 1000.0) {
+      throw RetainedBundleError("native runtime configuration has an invalid "
+                                "motion target limit value");
     }
     result.motion_target_limits.push_back(Configuration::MotionTargetLimit{
         core::ControllableComponentId(*component_id),
-        core::CommandTargetId(*target_id), *maximum});
+        core::CommandTargetId(*target_id), *maximum,
+        detail::decode_ordinary_motion_jerk_settings(
+            std::get<core::JsonObjectDTO>(
+                object->at("ordinary_motion_jerk").value))});
   }
-  std::sort(result.motion_target_limits.begin(), result.motion_target_limits.end(),
+  std::sort(result.motion_target_limits.begin(),
+            result.motion_target_limits.end(),
             [](const auto &left, const auto &right) {
               return std::tie(left.controllable_component_id,
                               left.command_target_id) <
@@ -796,7 +801,8 @@ require_configuration(const RetainedBundle &retained_bundle,
                               right.command_target_id);
             });
   if (std::adjacent_find(
-          result.motion_target_limits.begin(), result.motion_target_limits.end(),
+          result.motion_target_limits.begin(),
+          result.motion_target_limits.end(),
           [](const auto &left, const auto &right) {
             return left.controllable_component_id ==
                        right.controllable_component_id &&

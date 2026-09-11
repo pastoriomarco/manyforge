@@ -26,7 +26,9 @@ class SnapshotExecutionBackend final : public IExecutionBackend {
     snapshot_.state_source = "measured_feedback";
   }
 
-  PrepareParticipantResultDTO Prepare(const PreparedOperationParticipantDTO& participant) override {
+  Result<void> RetirePreparedExecution(std::uint64_t) override { return Result<void>::Ok(); }
+  PrepareParticipantResultDTO Prepare(const PreparedOperationParticipantDTO& participant,
+                                      std::uint64_t) override {
     return MakePrepareParticipantResult(
                participant, PrepareParticipantResultStateDTO::kRejected,
                ErrorDTO{std::string(kErrorInvalidRequest),

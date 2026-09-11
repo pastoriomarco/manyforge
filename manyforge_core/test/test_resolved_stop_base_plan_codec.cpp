@@ -6,6 +6,7 @@
 #include <iterator>
 #include <limits>
 #include <manyforge_content_identity/content_identity.hpp>
+#include <manyforge_core/motion_interrupt/stop_profile_mapper.hpp>
 #include <manyforge_core/prepared_participant_stop_plan_codec.hpp>
 #include <manyforge_core/resolved_stop_base_plan_codec.hpp>
 #include <string>
@@ -35,6 +36,7 @@ namespace {
 [[nodiscard]] MotionInterruptStopProfileDTO StopProfile() {
   MotionInterruptStopProfileDTO profile;
   profile.profile_id = "scope.soft.v1";
+  profile.jerk_limits_enabled = false;
   profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
   profile.deceleration_time_s = 0.25;
   profile.per_joint_max_deceleration = {
@@ -155,8 +157,8 @@ namespace {
           {StopBudgetPhaseId("phase.nominal.command"),
            StopContainmentCommandKind::kMotionControlledStop, Contract(), std::nullopt},
           std::move(parameters),
-          {StopActionClass::kControlled, Substitution(), std::nullopt,
-           std::nullopt, std::nullopt, std::nullopt},
+          {StopActionClass::kControlled, Substitution(), std::nullopt, std::nullopt, std::nullopt,
+           std::nullopt},
           Target("command.stop", "command.stop"),
           ResolvedStopResourceContainmentScopeDTO{ActivationSetId("activation.main"),
                                                   {ResourceId("joint.1"), ResourceId("joint.2")}},
@@ -172,8 +174,8 @@ namespace {
           {StopBudgetPhaseId("phase.hard.command"), StopContainmentCommandKind::kRegistered,
            Contract(), RegisteredStopCommandKindId("manyforge.stop.software_hard")},
           JsonObjectDTO{},
-          {StopActionClass::kSoftwareHard, std::nullopt, std::nullopt,
-           std::nullopt, std::nullopt, std::nullopt},
+          {StopActionClass::kSoftwareHard, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+           std::nullopt},
           Target("command.stop", "command.stop"),
           ResolvedStopControllerSetContainmentScopeDTO{
               ActivationSetId("activation.main"),
@@ -265,6 +267,7 @@ namespace {
   }
   nominal.default_contract_parameters = JsonObjectDTO{
       {"stop_mode", JsonValueDTO{std::string("soft_on_path")}},
+      {"jerk_limits_enabled", JsonValueDTO{false}},
       {"deceleration_time_s", JsonValueDTO{0.5}},
       {"per_resource_limits", JsonValueDTO{std::move(limits)}},
       {"allow_natural_completion_on_short_path", JsonValueDTO{true}},
@@ -474,7 +477,6 @@ TEST(ResolvedStopBasePlanCodec, RejectsConditionalEndpointAndOverlayFields) {
   complete.site_overlay_non_secret_digest = ContentDigest(Digest('2'));
   complete.site_overlay_value_ref = SiteOverlayValueRef("robot.service");
   EXPECT_TRUE(MakeResolvedStopBasePlan(std::move(complete_overlay)).ok());
-
 }
 
 TEST(ResolvedStopBasePlanCodec, RejectsSourceAndQualificationConfusion) {
@@ -689,9 +691,9 @@ TEST(PreparedParticipantStopPlanCodec, FreezesProfileMappingAndDeploymentDefault
             std::string::npos);
   EXPECT_NE(encoded.value().find("\"parameter_source\":\"deployment_default\""), std::string::npos);
   EXPECT_EQ(content_identity::sha256_digest(encoded.value()),
-            "sha256:d31024e63864c16891f69fe14b18745330220924a991a90acc6c93d498164d4a");
+            "sha256:b52156d4da6ecf586177c0533011329c2ec17e498973a93187b3137530a2b903");
   EXPECT_EQ(plan.participant_stop_invocation_plan_digest.value(),
-            "sha256:c7a5c39cf6ddb3f5a7aa6ea9e142cc0824a9f69e1f7285e74c479dbafdaa6f8f");
+            "sha256:960198ca5da9b7d114858f1b2bc18cfa6bac701db4aa4086df45808a4767029f");
 }
 
 TEST(PreparedParticipantStopPlanCodec, KeepsOrdinaryAndScopePlansDistinctAndRejectsForgery) {
@@ -705,7 +707,8 @@ TEST(PreparedParticipantStopPlanCodec, KeepsOrdinaryAndScopePlansDistinctAndReje
   ordinary_context.participant_stop_profile.reset();
   ordinary_context.participant_stop_profile_purpose = ParticipantStopProfilePurposeDTO::kOrdinary;
   ordinary_context.motion_interrupt_scope_id.reset();
-  auto ordinary = MakePreparedParticipantStopPlan(base, std::move(ordinary_context), {}, {});
+  auto ordinary =
+      MakePreparedParticipantStopPlan(base, std::move(ordinary_context), resources, defaults);
   ASSERT_TRUE(ordinary.ok());
   EXPECT_NE(ordinary.value().participant_stop_invocation_plan_digest,
             profiled.value().participant_stop_invocation_plan_digest);
@@ -734,6 +737,129 @@ TEST(PreparedParticipantStopPlanCodec, KeepsOrdinaryAndScopePlansDistinctAndReje
   EXPECT_FALSE(VerifyPreparedParticipantStopPlan(base, forged, resources, defaults,
                                                  MotionInterruptNodeCategory::kGeneric)
                    .ok());
+}
+
+TEST(PreparedParticipantStopPlanCodec, ReadinessBoundsFullProfileAndRejectsPrebuiltTimingBypass) {
+  const auto base = PreparedBasePlan();
+  // This pure codec check uses the DTO projection. The deployment/registration
+  // tests separately seal the complete current controller-domain referent.
+  RuntimeParticipantStopReadinessDTO readiness{
+      ControllableComponentId("arm"),
+      ComponentLifecycleGeneration(1U),
+      {base.control_domain_id,
+       base.control_domain_revision,
+       base.controller_topology_id,
+       base.topology_revision,
+       ProductId("product"),
+       ProductContractId("contract"),
+       ProductContractRevision(Digest('1')),
+       ContentDigest(Digest('2')),
+       ContentDigest(Digest('3')),
+       base.source_runtime_unit_id,
+       base.source_runtime_epoch,
+       {base.controller_topology_id, base.topology_revision, {}, {}, {}, {}},
+       {base.control_domain_id,
+        base.control_domain_revision,
+        base.controller_topology_id,
+        base.topology_revision,
+        base.activation_set_id,
+        {}},
+       {},
+       {},
+       {}},
+      base,
+      250'000'000};
+  auto context = PreparedContext();
+  const auto resources = Resources();
+  const auto defaults = DefaultLimits();
+  EXPECT_TRUE(MakePreparedParticipantStopPlan(readiness, context, resources, defaults).ok());
+  context.participant_stop_profile->deceleration_time_s = 0.5;
+  for (const auto mode :
+       {MotionInterruptStopMode::kSoftOnPath, MotionInterruptStopMode::kSpringBackHold}) {
+    context.participant_stop_profile->stop_mode = mode;
+    if (mode == MotionInterruptStopMode::kSpringBackHold) {
+      context.participant_stop_profile->allow_natural_completion_on_short_path = false;
+      context.participant_stop_profile->recoverable_substitution_mode.reset();
+    }
+    const auto prebuilt = MakePreparedParticipantStopPlan(readiness.resolved_stop_base_plan,
+                                                          context, resources, defaults);
+    ASSERT_TRUE(prebuilt.ok()) << prebuilt.error().message;
+    EXPECT_FALSE(MakePreparedParticipantStopPlan(readiness, context, resources, defaults).ok());
+    EXPECT_FALSE(VerifyPreparedParticipantStopPlan(readiness, prebuilt.value(), resources, defaults,
+                                                   context.node_category)
+                     .ok());
+    // Historic bytes remain inspectable, not preparation authority.
+    EXPECT_TRUE(EncodePreparedParticipantStopPlan(readiness.resolved_stop_base_plan,
+                                                  prebuilt.value(), resources, defaults,
+                                                  context.node_category)
+                    .ok());
+  }
+  context.participant_stop_profile.reset();
+  context.participant_stop_profile_purpose = ParticipantStopProfilePurposeDTO::kOrdinary;
+  context.motion_interrupt_scope_id.reset();
+  EXPECT_FALSE(MakePreparedParticipantStopPlan(readiness, context, resources, defaults).ok());
+  readiness.maximum_controlled_stop_duration_ns.reset();
+  EXPECT_TRUE(MakePreparedParticipantStopPlan(readiness, context, resources, defaults).ok());
+
+  context = PreparedContext();
+  context.participant_stop_profile->deceleration_time_s = 1.1;
+  readiness.maximum_controlled_stop_duration_ns = 1'100'000'000;
+  EXPECT_TRUE(MakePreparedParticipantStopPlan(readiness, context, resources, defaults).ok());
+  readiness.maximum_controlled_stop_duration_ns = 1'099'999'999;
+  EXPECT_FALSE(MakePreparedParticipantStopPlan(readiness, context, resources, defaults).ok());
+}
+
+TEST(PreparedParticipantStopPlanCodec, FreezesJerkPolicyInProfileContractAndIdentity) {
+  const auto base = PreparedBasePlan();
+  const auto resources = Resources();
+  const auto defaults = DefaultLimits();
+  auto context = PreparedContext();
+  context.participant_stop_profile->jerk_limits_enabled = true;
+  const auto on = MakePreparedParticipantStopPlan(base, context, resources, defaults);
+  ASSERT_TRUE(on.ok()) << on.error().message;
+  EXPECT_EQ(on.value().participant_stop_profile->per_joint_max_jerk.size(), resources.size());
+  const auto encoded = EncodePreparedParticipantStopPlan(base, on.value(), resources, defaults,
+                                                         MotionInterruptNodeCategory::kGeneric);
+  ASSERT_TRUE(encoded.ok());
+  const auto decoded = DecodePreparedParticipantStopPlan(encoded.value(), base, resources, defaults,
+                                                         MotionInterruptNodeCategory::kGeneric);
+  ASSERT_TRUE(decoded.ok()) << decoded.error().message;
+  EXPECT_EQ(decoded.value(), on.value());
+  context.participant_stop_profile->jerk_limits_enabled = false;
+  const auto off = MakePreparedParticipantStopPlan(base, context, resources, defaults);
+  ASSERT_TRUE(off.ok());
+  EXPECT_TRUE(off.value().participant_stop_profile->per_joint_max_jerk.empty());
+  EXPECT_NE(on.value().participant_stop_invocation_plan_digest,
+            off.value().participant_stop_invocation_plan_digest);
+}
+
+TEST(PreparedParticipantStopPlanCodec, FreezesDefaultJerkBeforeDispatchWithoutAnOverride) {
+  auto candidate = PreparedBasePlan();
+  candidate.escalation_stages.front().default_contract_parameters->at("jerk_limits_enabled") =
+      JsonValueDTO{true};
+  const auto base = MakeResolvedStopBasePlan(candidate);
+  ASSERT_TRUE(base.ok());
+  auto context = PreparedContext();
+  context.participant_stop_profile.reset();
+  context.participant_stop_profile_purpose = ParticipantStopProfilePurposeDTO::kOrdinary;
+  context.motion_interrupt_scope_id.reset();
+  const auto prepared =
+      MakePreparedParticipantStopPlan(base.value(), context, Resources(), DefaultLimits());
+  ASSERT_TRUE(prepared.ok()) << prepared.error().message;
+  const auto& stage = prepared.value().stage_commands.front();
+  EXPECT_EQ(stage.parameter_source, StopStageParameterSourceDTO::kDeploymentDefault);
+  const auto decoded = map_motion_controlled_stop_contract_parameters_to_profile(
+      *stage.validated_contract_parameters, Resources(), "default.profile");
+  ASSERT_TRUE(decoded.ok());
+  EXPECT_EQ(decoded.value().per_joint_max_jerk.size(), 2U);
+  EXPECT_DOUBLE_EQ(
+      std::get<AngularJerkDTO>(decoded.value().per_joint_max_jerk.at("joint_1")).value_rad_s3,
+      motion_jerk_preset_limit(2.0, 0.5));
+  candidate.escalation_stages.front().default_contract_parameters->erase("jerk_limits_enabled");
+  const auto legacy = MakeResolvedStopBasePlan(candidate);
+  ASSERT_TRUE(legacy.ok());
+  EXPECT_FALSE(
+      MakePreparedParticipantStopPlan(legacy.value(), context, Resources(), DefaultLimits()).ok());
 }
 
 TEST(PreparedParticipantStopPlanCodec, RejectsPurposeCoverageAndSubstitutionConfusion) {

@@ -5,8 +5,9 @@
 #include <manyforge_core/types/capability_definition.hpp>
 #include <manyforge_core/types/catalog.hpp>
 #include <manyforge_core/types/cell_graph.hpp>
-#include <manyforge_core/types/strong_id.hpp>
 #include <manyforge_core/types/stop_control.hpp>
+#include <manyforge_core/types/stop_timing.hpp>
+#include <manyforge_core/types/strong_id.hpp>
 #include <optional>
 #include <string_view>
 #include <variant>
@@ -46,8 +47,7 @@ struct CellGlobalCapabilityProviderTargetDTO final {
   CellId cell_id;
 
   friend bool operator==(const CellGlobalCapabilityProviderTargetDTO&,
-                         const CellGlobalCapabilityProviderTargetDTO&) =
-      default;
+                         const CellGlobalCapabilityProviderTargetDTO&) = default;
 };
 
 /// Complete `target_binding` applicability target.
@@ -59,8 +59,7 @@ struct TargetBindingCapabilityProviderTargetDTO final {
   ControlBindingRevision control_binding_revision;
 
   friend bool operator==(const TargetBindingCapabilityProviderTargetDTO&,
-                         const TargetBindingCapabilityProviderTargetDTO&) =
-      default;
+                         const TargetBindingCapabilityProviderTargetDTO&) = default;
 };
 
 /// Complete `control_domain` applicability target.
@@ -71,13 +70,11 @@ struct ControlDomainCapabilityProviderTargetDTO final {
   TopologyRevision topology_revision;
 
   friend bool operator==(const ControlDomainCapabilityProviderTargetDTO&,
-                         const ControlDomainCapabilityProviderTargetDTO&) =
-      default;
+                         const ControlDomainCapabilityProviderTargetDTO&) = default;
 };
 
 using CapabilityProviderTargetDTO =
-    std::variant<CellGlobalCapabilityProviderTargetDTO,
-                 TargetBindingCapabilityProviderTargetDTO,
+    std::variant<CellGlobalCapabilityProviderTargetDTO, TargetBindingCapabilityProviderTargetDTO,
                  ControlDomainCapabilityProviderTargetDTO>;
 
 enum class CapabilityEndpointSourceKind : std::uint8_t {
@@ -85,8 +82,7 @@ enum class CapabilityEndpointSourceKind : std::uint8_t {
   kExternalResource,
 };
 
-[[nodiscard]] constexpr std::string_view to_string(
-    CapabilityEndpointSourceKind value) noexcept {
+[[nodiscard]] constexpr std::string_view to_string(CapabilityEndpointSourceKind value) noexcept {
   switch (value) {
     case CapabilityEndpointSourceKind::kRuntimeUnit:
       return "runtime_unit";
@@ -96,8 +92,7 @@ enum class CapabilityEndpointSourceKind : std::uint8_t {
   return {};
 }
 
-using CapabilityEndpointSourceIdDTO =
-    std::variant<RuntimeUnitId, ExternalResourceAlias>;
+using CapabilityEndpointSourceIdDTO = std::variant<RuntimeUnitId, ExternalResourceAlias>;
 
 /// One exact logical endpoint-role source for a capability-provider binding.
 ///
@@ -111,8 +106,7 @@ struct CapabilityProviderEndpointBindingDTO final {
   EndpointRoleId source_endpoint_role_id;
 
   friend bool operator==(const CapabilityProviderEndpointBindingDTO&,
-                         const CapabilityProviderEndpointBindingDTO&) =
-      default;
+                         const CapabilityProviderEndpointBindingDTO&) = default;
 };
 
 /// The reusable provider-manifest inventory has at most 256 endpoint roles.
@@ -150,8 +144,7 @@ enum class ExternalResourceKind : std::uint8_t {
   kServiceEndpoint,
 };
 
-[[nodiscard]] constexpr std::string_view to_string(
-    ExternalResourceKind value) noexcept {
+[[nodiscard]] constexpr std::string_view to_string(ExternalResourceKind value) noexcept {
   switch (value) {
     case ExternalResourceKind::kModelEndpoint:
       return "model_endpoint";
@@ -175,8 +168,7 @@ struct SiteOverlayRefDTO final {
   SiteOverlayRevision site_overlay_revision;
   ContentDigest non_secret_digest;
 
-  friend bool operator==(const SiteOverlayRefDTO&,
-                         const SiteOverlayRefDTO&) = default;
+  friend bool operator==(const SiteOverlayRefDTO&, const SiteOverlayRefDTO&) = default;
 };
 
 /// One value-free site-overlay key that may satisfy an external-resource row.
@@ -205,8 +197,7 @@ struct ExternalResourceDTO final {
   EndpointRoleId endpoint_role_id;
   SiteOverlayValueRef site_overlay_value_ref;
 
-  friend bool operator==(const ExternalResourceDTO&,
-                         const ExternalResourceDTO&) = default;
+  friend bool operator==(const ExternalResourceDTO&, const ExternalResourceDTO&) = default;
 };
 
 /// Explicit deployment-owned proof that one final registered safety-system
@@ -253,6 +244,7 @@ struct DeploymentApplicabilityInputsDTO final {
   /// preserves the strong ID/revision pair; only contact, Stop-evidence, and
   /// runtime-policy alternatives are legal at this boundary.
   std::vector<CatalogRecordRefDTO> retained_policy_records;
+  std::vector<StopTimingSelectionDTO> stop_timing_parameters{};
 
   friend bool operator==(const DeploymentApplicabilityInputsDTO&,
                          const DeploymentApplicabilityInputsDTO&) = default;

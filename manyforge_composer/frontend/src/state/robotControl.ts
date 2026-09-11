@@ -102,7 +102,7 @@ export type RobotControlAction =
   | { type: 'load' }
   | { type: 'status_resolved'; status: ExecutionOwnerStatus }
   | { type: 'status_refreshed'; status: ExecutionOwnerStatus }
-  | { type: 'program_status_refreshed'; status: ExecutionOwnerStatus }
+  | { type: 'manual_scope_changed' }
   | { type: 'load_failed'; error: string }
   | { type: 'program_activity_changed' }
   | { type: 'select_mode'; mode: RobotControlMode }
@@ -511,11 +511,8 @@ export function robotControlReducer(
       return resolveStatus(state, action.status, true);
     case 'status_refreshed':
       return resolveStatus(state, action.status, false);
-    case 'program_status_refreshed':
-      // The common owner projection also contains Program-owned resident
-      // operations. Robot Control must retain the fresh status for its later
-      // rebase without adopting those operations as manual-control work.
-      return { ...state, status: action.status };
+    case 'manual_scope_changed':
+      return robotControlHasLocalDraft(state) ? invalidateDraft(state, {}) : state;
     case 'load_failed':
       return state.status === null
         ? { ...state, phase: 'unavailable', error: action.error }

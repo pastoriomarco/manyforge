@@ -29,24 +29,22 @@ static_assert(
     !std::is_same_v<core::ExternalResourceAlias, core::SiteOverlayValueRef>);
 static_assert(
     !std::is_aggregate_v<TypedDeploymentApplicabilityInputsCandidate>);
-static_assert(
-    !std::is_default_constructible_v<
-        TypedDeploymentApplicabilityInputsCandidate>);
+static_assert(!std::is_default_constructible_v<
+              TypedDeploymentApplicabilityInputsCandidate>);
 static_assert(
     !std::is_aggregate_v<RevisionVerifiedDeploymentApplicabilityInputs>);
-static_assert(
-    !std::is_default_constructible_v<
-        RevisionVerifiedDeploymentApplicabilityInputs>);
+static_assert(!std::is_default_constructible_v<
+              RevisionVerifiedDeploymentApplicabilityInputs>);
 
-[[nodiscard]] std::string minimal_document(
-    std::string desired = "[]", std::string providers = "[]",
-    std::string external = "[]", bool include_external = true,
-    std::optional<std::string> site_overlay_ref = std::nullopt) {
+[[nodiscard]] std::string
+minimal_document(std::string desired = "[]", std::string providers = "[]",
+                 std::string external = "[]", bool include_external = true,
+                 std::optional<std::string> site_overlay_ref = std::nullopt) {
   std::string document =
       "{\"api_version\":\"manyforge.deployment.v1\","
       "\"desired_control_configurations\":" +
-      std::move(desired) + ",\"capability_provider_bindings\":" +
-      std::move(providers);
+      std::move(desired) +
+      ",\"capability_provider_bindings\":" + std::move(providers);
   if (include_external) {
     document += ",\"external_resources\":" + std::move(external);
   }
@@ -66,11 +64,11 @@ static_assert(
   return document;
 }
 
-[[nodiscard]] std::string interrupt_config(
-    std::string_view queue_depth = "64",
-    std::string_view cancel_validation_timeout_ns = "1000000",
-    std::string_view motion_scope_arm_timeout_ns = "2000000",
-    std::string_view supervisory_poll_rate_hz = "10") {
+[[nodiscard]] std::string
+interrupt_config(std::string_view queue_depth = "64",
+                 std::string_view cancel_validation_timeout_ns = "1000000",
+                 std::string_view motion_scope_arm_timeout_ns = "2000000",
+                 std::string_view supervisory_poll_rate_hz = "10") {
   return "{\"queue_depth\":" + std::string(queue_depth) +
          ",\"cancel_validation_timeout_ns\":" +
          std::string(cancel_validation_timeout_ns) +
@@ -95,15 +93,15 @@ static_assert(
          std::string(optional_fields) + "}";
 }
 
-[[nodiscard]] std::string interrupt_policy(
-    std::string_view policy_id, std::string_view source_id,
-    std::string_view affected_phases = "[\"executing\"]",
-    std::string_view action = "preempt_trajectory",
-    std::string_view disposition = "await_recovery_action",
-    std::string_view scope_kind = "static",
-    std::string_view control_domain_ids = "[\"arm_domain\"]",
-    std::string_view resource_ids = "[]",
-    std::string_view optional_fields = "") {
+[[nodiscard]] std::string
+interrupt_policy(std::string_view policy_id, std::string_view source_id,
+                 std::string_view affected_phases = "[\"executing\"]",
+                 std::string_view action = "preempt_trajectory",
+                 std::string_view disposition = "await_recovery_action",
+                 std::string_view scope_kind = "static",
+                 std::string_view control_domain_ids = "[\"arm_domain\"]",
+                 std::string_view resource_ids = "[]",
+                 std::string_view optional_fields = "") {
   return "{\"policy_id\":\"" + std::string(policy_id) + "\",\"source_id\":\"" +
          std::string(source_id) +
          "\",\"controllable_component_ids\":[],\"command_target_ids\":[],"
@@ -118,12 +116,11 @@ static_assert(
          std::string(optional_fields) + "}";
 }
 
-[[nodiscard]] std::string interrupt_policy_envelope(
-    std::string sources, std::string policies,
-    std::string config = interrupt_config(),
-    std::string retained_policy_records = "[]") {
-  return "{\"retained_policy_records\":" +
-         std::move(retained_policy_records) +
+[[nodiscard]] std::string
+interrupt_policy_envelope(std::string sources, std::string policies,
+                          std::string config = interrupt_config(),
+                          std::string retained_policy_records = "[]") {
+  return "{\"retained_policy_records\":" + std::move(retained_policy_records) +
          ",\"stop_stage_parameters\":[],"
          "\"commissioned_stop_interfaces\":[],\"interrupt_sources\":[" +
          std::move(sources) + "],\"interrupt_policies\":[" +
@@ -131,13 +128,13 @@ static_assert(
          "}";
 }
 
-[[nodiscard]] std::string catalog_record(
-    std::string_view kind, std::string_view id, std::string_view schema_id,
-    std::string_view revision = kZeroDigest,
-    std::string_view schema_revision = kOneDigest) {
-  return "{\"record_kind\":\"" + std::string(kind) +
-         "\",\"record_id\":\"" + std::string(id) +
-         "\",\"record_revision\":\"" + std::string(revision) +
+[[nodiscard]] std::string
+catalog_record(std::string_view kind, std::string_view id,
+               std::string_view schema_id,
+               std::string_view revision = kZeroDigest,
+               std::string_view schema_revision = kOneDigest) {
+  return "{\"record_kind\":\"" + std::string(kind) + "\",\"record_id\":\"" +
+         std::string(id) + "\",\"record_revision\":\"" + std::string(revision) +
          "\",\"schema_id\":\"" + std::string(schema_id) +
          "\",\"schema_revision\":\"" + std::string(schema_revision) +
          "\",\"content_digest\":\"" + std::string(kZeroDigest) +
@@ -145,33 +142,30 @@ static_assert(
          std::string(64U, '0') + "\"}";
 }
 
-[[nodiscard]] std::string site_overlay_ref(
-    std::string_view id = "plant_a",
-    std::string_view revision = kZeroDigest,
-    std::string_view non_secret_digest = kOneDigest) {
+[[nodiscard]] std::string
+site_overlay_ref(std::string_view id = "plant_a",
+                 std::string_view revision = kZeroDigest,
+                 std::string_view non_secret_digest = kOneDigest) {
   return "{\"site_overlay_id\":\"" + std::string(id) +
          "\",\"site_overlay_revision\":\"" + std::string(revision) +
-         "\",\"non_secret_digest\":\"" +
-         std::string(non_secret_digest) + "\"}";
+         "\",\"non_secret_digest\":\"" + std::string(non_secret_digest) + "\"}";
 }
 
-[[nodiscard]] std::string desired_route(
-    std::string_view binding_id = "arm_binding",
-    std::string_view binding_revision = kZeroDigest,
-    std::string_view route_id = "standard_route") {
+[[nodiscard]] std::string
+desired_route(std::string_view binding_id = "arm_binding",
+              std::string_view binding_revision = kZeroDigest,
+              std::string_view route_id = "standard_route") {
   return "{\"control_binding_id\":\"" + std::string(binding_id) +
-         "\",\"control_binding_revision\":\"" +
-         std::string(binding_revision) + "\",\"control_route_id\":\"" +
-         std::string(route_id) + "\"}";
+         "\",\"control_binding_revision\":\"" + std::string(binding_revision) +
+         "\",\"control_route_id\":\"" + std::string(route_id) + "\"}";
 }
 
-[[nodiscard]] std::string desired_configuration(
-    std::string_view domain_id = "arm_domain",
-    std::string_view domain_revision = kZeroDigest,
-    std::string routes = desired_route()) {
+[[nodiscard]] std::string
+desired_configuration(std::string_view domain_id = "arm_domain",
+                      std::string_view domain_revision = kZeroDigest,
+                      std::string routes = desired_route()) {
   return "{\"control_domain_id\":\"" + std::string(domain_id) +
-         "\",\"control_domain_revision\":\"" +
-         std::string(domain_revision) +
+         "\",\"control_domain_revision\":\"" + std::string(domain_revision) +
          "\",\"controller_topology_id\":\"standard_topology\","
          "\"topology_revision\":\"" +
          std::string(kZeroDigest) +
@@ -202,20 +196,19 @@ static_assert(
          std::string(kZeroDigest) + "\"}";
 }
 
-[[nodiscard]] std::string provider_binding(
-    std::string_view binding_id = "planner_binding",
-    std::string_view binding_revision = kZeroDigest,
-    std::string_view scope = "target_binding",
-    std::string target = target_binding_target(),
-    std::string endpoints = endpoint_binding()) {
-  return "{\"capability_provider_binding_id\":\"" +
-         std::string(binding_id) +
+[[nodiscard]] std::string
+provider_binding(std::string_view binding_id = "planner_binding",
+                 std::string_view binding_revision = kZeroDigest,
+                 std::string_view scope = "target_binding",
+                 std::string target = target_binding_target(),
+                 std::string endpoints = endpoint_binding()) {
+  return "{\"capability_provider_binding_id\":\"" + std::string(binding_id) +
          "\",\"capability_provider_binding_revision\":\"" +
          std::string(binding_revision) +
          "\",\"capability_id\":\"planning.motion.pose_goal\","
          "\"capability_definition_revision\":\"" +
-         std::string(kZeroDigest) + "\",\"scope\":\"" +
-         std::string(scope) + "\",\"target\":" + std::move(target) +
+         std::string(kZeroDigest) + "\",\"scope\":\"" + std::string(scope) +
+         "\",\"target\":" + std::move(target) +
          ",\"provider_instance_id\":\"planner_provider\","
          "\"provider_manifest_id\":\"planner_manifest\","
          "\"provider_manifest_revision\":\"" +
@@ -223,10 +216,10 @@ static_assert(
          std::move(endpoints) + "]}";
 }
 
-[[nodiscard]] std::string external_resource(
-    std::string_view alias = "planner_endpoint",
-    std::string_view kind = "service_endpoint",
-    std::string_view overlay_ref = "resources.planner.endpoint") {
+[[nodiscard]] std::string
+external_resource(std::string_view alias = "planner_endpoint",
+                  std::string_view kind = "service_endpoint",
+                  std::string_view overlay_ref = "resources.planner.endpoint") {
   return "{\"external_resource_alias\":\"" + std::string(alias) +
          "\",\"resource_kind\":\"" + std::string(kind) +
          "\",\"provider_instance_id\":\"planner_provider\","
@@ -234,12 +227,12 @@ static_assert(
          "\"provider_manifest_revision\":\"" +
          std::string(kZeroDigest) +
          "\",\"endpoint_role_id\":\"motion_plan_service\","
-         "\"site_overlay_value_ref\":\"" + std::string(overlay_ref) +
-         "\"}";
+         "\"site_overlay_value_ref\":\"" +
+         std::string(overlay_ref) + "\"}";
 }
 
-[[nodiscard]] TypedDeploymentApplicabilityInputsCandidate decode(
-    std::string_view document) {
+[[nodiscard]] TypedDeploymentApplicabilityInputsCandidate
+decode(std::string_view document) {
   return decode_deployment_applicability_inputs_candidate(
       parse_strict_json_model_yaml(document));
 }
@@ -249,7 +242,7 @@ void expect_decode_error_containing(std::string document,
   try {
     (void)decode(document);
     FAIL() << "expected DeploymentApplicabilityCodecError";
-  } catch (const DeploymentApplicabilityCodecError& error) {
+  } catch (const DeploymentApplicabilityCodecError &error) {
     EXPECT_NE(std::string_view(error.what()).find(expected_fragment),
               std::string_view::npos)
         << error.what();
@@ -257,31 +250,30 @@ void expect_decode_error_containing(std::string document,
 }
 
 [[nodiscard]] std::string document_from_verified(
-    const RevisionVerifiedDeploymentApplicabilityInputs& verified) {
+    const RevisionVerifiedDeploymentApplicabilityInputs &verified) {
   return minimal_document(
-      canonical_json(
-          verified.normalized_desired_control_configurations()),
+      canonical_json(verified.normalized_desired_control_configurations()),
       canonical_json(verified.normalized_capability_provider_bindings()),
       canonical_json(verified.normalized_external_resources()),
       verified.external_resources_was_present(),
       verified.normalized_site_overlay_ref().has_value()
-          ? std::optional<std::string>(canonical_json(
-                *verified.normalized_site_overlay_ref()))
+          ? std::optional<std::string>(
+                canonical_json(*verified.normalized_site_overlay_ref()))
           : std::nullopt);
 }
 
-[[nodiscard]] const CanonicalValue& first_array_item(
-    const CanonicalValue& value) {
-  const auto& array = std::get<CanonicalValue::Array>(value.storage());
+[[nodiscard]] const CanonicalValue &
+first_array_item(const CanonicalValue &value) {
+  const auto &array = std::get<CanonicalValue::Array>(value.storage());
   EXPECT_FALSE(array.empty());
   return array.front();
 }
 
-[[nodiscard]] std::string independent_provider_binding_identity(
-    const CanonicalValue& binding) {
+[[nodiscard]] std::string
+independent_provider_binding_identity(const CanonicalValue &binding) {
   CanonicalValue::Object payload;
   bool own_field_found = false;
-  for (const auto& [name, value] : binding.as_object()) {
+  for (const auto &[name, value] : binding.as_object()) {
     if (name == "capability_provider_binding_revision") {
       own_field_found = true;
       continue;
@@ -300,9 +292,8 @@ void expect_decode_error_containing(std::string document,
   return sha256_digest(preimage);
 }
 
-[[nodiscard]] std::string replace_first(std::string source,
-                                        std::string_view from,
-                                        std::string_view to) {
+[[nodiscard]] std::string
+replace_first(std::string source, std::string_view from, std::string_view to) {
   const std::size_t position = source.find(from);
   EXPECT_NE(position, std::string::npos);
   if (position != std::string::npos) {
@@ -340,27 +331,24 @@ TEST(DeploymentApplicabilityCodec,
       endpoint_binding("a_role", "runtime_unit", "planner_runtime",
                        "a_source_role");
   const std::string providers =
-      "[" + provider_binding("z_provider_binding", kZeroDigest,
-                             "target_binding", target_binding_target(),
-                             endpoints) +
+      "[" +
+      provider_binding("z_provider_binding", kZeroDigest, "target_binding",
+                       target_binding_target(), endpoints) +
       "," +
       provider_binding("a_provider_binding", kOneDigest, "cell_global",
                        "{\"cell_id\":\"cell_a\"}", "") +
       "]";
-  const std::string external =
-      "[" + external_resource("z_endpoint") + "," +
-      external_resource("a_endpoint", "model_endpoint",
-                        "resources.site_a.endpoint") +
-      "]";
+  const std::string external = "[" + external_resource("z_endpoint") + "," +
+                               external_resource("a_endpoint", "model_endpoint",
+                                                 "resources.site_a.endpoint") +
+                               "]";
 
-  const auto candidate =
-      decode(minimal_document(desired, providers, external));
-  const auto& value = candidate.value();
+  const auto candidate = decode(minimal_document(desired, providers, external));
+  const auto &value = candidate.value();
   ASSERT_EQ(value.desired_control_configurations.size(), 2U);
   EXPECT_EQ(value.desired_control_configurations[0].control_domain_id.value(),
             "a_domain");
-  ASSERT_EQ(value.desired_control_configurations[1].binding_routes.size(),
-            2U);
+  ASSERT_EQ(value.desired_control_configurations[1].binding_routes.size(), 2U);
   EXPECT_EQ(value.desired_control_configurations[1]
                 .binding_routes[0]
                 .control_binding_id.value(),
@@ -370,7 +358,7 @@ TEST(DeploymentApplicabilityCodec,
   EXPECT_EQ(value.capability_provider_bindings[0]
                 .capability_provider_binding_id.value(),
             "a_provider_binding");
-  const auto& target_binding = value.capability_provider_bindings[1];
+  const auto &target_binding = value.capability_provider_bindings[1];
   ASSERT_EQ(target_binding.endpoint_bindings.size(), 2U);
   EXPECT_EQ(target_binding.endpoint_bindings[0].endpoint_role_id.value(),
             "a_role");
@@ -379,8 +367,7 @@ TEST(DeploymentApplicabilityCodec,
   EXPECT_TRUE(std::holds_alternative<core::ExternalResourceAlias>(
       target_binding.endpoint_bindings[1].source_id));
   EXPECT_TRUE(
-      std::holds_alternative<
-          core::TargetBindingCapabilityProviderTargetDTO>(
+      std::holds_alternative<core::TargetBindingCapabilityProviderTargetDTO>(
           target_binding.target));
 
   ASSERT_EQ(value.external_resources.size(), 2U);
@@ -403,24 +390,22 @@ TEST(DeploymentApplicabilityCodec,
 TEST(DeploymentApplicabilityCodec,
      RvalueTransfersPreserveTypedAndRevisionVerifiedInputsForReuse) {
   const auto typed = decode(minimal_document(
-      "[" + desired_configuration() + "]",
-      "[" + provider_binding() + "]",
+      "[" + desired_configuration() + "]", "[" + provider_binding() + "]",
       "[" + external_resource() + "]", true, site_overlay_ref()));
-  const auto projection = [](const auto& value) {
-    return std::tuple{
-        value.value(),
-        value.normalized_desired_control_configurations(),
-        value.normalized_capability_provider_bindings(),
-        value.normalized_external_resources(),
-        value.site_overlay_ref_presence(),
-        value.normalized_site_overlay_ref(),
-        value.external_resources_was_present()};
+  const auto projection = [](const auto &value) {
+    return std::tuple{value.value(),
+                      value.normalized_desired_control_configurations(),
+                      value.normalized_capability_provider_bindings(),
+                      value.normalized_external_resources(),
+                      value.site_overlay_ref_presence(),
+                      value.normalized_site_overlay_ref(),
+                      value.external_resources_was_present()};
   };
   test::expect_source_preserving_rvalue_transfers(typed, projection);
   test::expect_immutable_shared_copy_storage(
       typed,
-      [](const TypedDeploymentApplicabilityInputsCandidate& value)
-          -> const core::DeploymentApplicabilityInputsDTO& {
+      [](const TypedDeploymentApplicabilityInputsCandidate &value)
+          -> const core::DeploymentApplicabilityInputsDTO & {
         return value.value();
       });
 
@@ -432,12 +417,11 @@ TEST(DeploymentApplicabilityCodec,
   EXPECT_EQ(first_verified.value(), second_verified.value());
   EXPECT_EQ(projection(first_verified), projection(second_verified));
 
-  test::expect_source_preserving_rvalue_transfers(first_verified,
-                                                   projection);
+  test::expect_source_preserving_rvalue_transfers(first_verified, projection);
   test::expect_immutable_shared_copy_storage(
       first_verified,
-      [](const RevisionVerifiedDeploymentApplicabilityInputs& value)
-          -> const core::DeploymentApplicabilityInputsDTO& {
+      [](const RevisionVerifiedDeploymentApplicabilityInputs &value)
+          -> const core::DeploymentApplicabilityInputsDTO & {
         return value.value();
       });
 
@@ -468,27 +452,24 @@ TEST(DeploymentApplicabilityCodec,
           endpoint_binding("domain_status", "runtime_unit",
                            "controller_runtime", "controller_status")) +
       "," +
-      provider_binding(
-          "target_provider", kZeroDigest, "target_binding",
-          target_binding_target(),
-          endpoint_binding("planning", "external_resource",
-                           "planner_endpoint", "planning_service")) +
+      provider_binding("target_provider", kZeroDigest, "target_binding",
+                       target_binding_target(),
+                       endpoint_binding("planning", "external_resource",
+                                        "planner_endpoint",
+                                        "planning_service")) +
       "]";
 
-  const auto candidate =
-      decode(minimal_document("[]", providers,
-                              "[" + external_resource() + "]"));
+  const auto candidate = decode(
+      minimal_document("[]", providers, "[" + external_resource() + "]"));
   ASSERT_EQ(candidate.value().capability_provider_bindings.size(), 3U);
   EXPECT_TRUE(
       std::holds_alternative<core::CellGlobalCapabilityProviderTargetDTO>(
           candidate.value().capability_provider_bindings[0].target));
   EXPECT_TRUE(
-      std::holds_alternative<
-          core::ControlDomainCapabilityProviderTargetDTO>(
+      std::holds_alternative<core::ControlDomainCapabilityProviderTargetDTO>(
           candidate.value().capability_provider_bindings[1].target));
   EXPECT_TRUE(
-      std::holds_alternative<
-          core::TargetBindingCapabilityProviderTargetDTO>(
+      std::holds_alternative<core::TargetBindingCapabilityProviderTargetDTO>(
           candidate.value().capability_provider_bindings[2].target));
 }
 
@@ -500,7 +481,7 @@ TEST(DeploymentApplicabilityCodec,
       compute_capability_provider_binding_revisions(candidate);
   ASSERT_EQ(produced.value().capability_provider_bindings.size(), 1U);
 
-  const CanonicalValue& normalized_binding =
+  const CanonicalValue &normalized_binding =
       first_array_item(produced.normalized_capability_provider_bindings());
   const std::string independent =
       independent_provider_binding_identity(normalized_binding);
@@ -514,9 +495,8 @@ TEST(DeploymentApplicabilityCodec,
   EXPECT_NO_THROW(
       (void)verify_capability_provider_binding_revisions(consumer_candidate));
 
-  const std::string stale_document =
-      replace_first(verified_document, "motion_plan_service",
-                    "different_source_role");
+  const std::string stale_document = replace_first(
+      verified_document, "motion_plan_service", "different_source_role");
   const auto stale_candidate = decode(stale_document);
   EXPECT_THROW(
       (void)verify_capability_provider_binding_revisions(stale_candidate),
@@ -545,15 +525,15 @@ TEST(DeploymentApplicabilityCodec,
   expect_stale_binding("\"planner_provider\"", "\"foreign_provider\"");
   expect_stale_binding("\"planner_binding\"", "\"foreign_binding\"");
   expect_stale_binding("\"arm_target\"", "\"foreign_target\"");
-  const auto alternate_target = canonical_json(
-      parse_strict_json_model_yaml(
-          "{\"control_domain_id\":\"arm_domain\","
-          "\"control_domain_revision\":\"" +
-          std::string(kZeroDigest) +
-          "\",\"controller_topology_id\":\"standard_topology\","
-          "\"topology_revision\":\"" +
-          std::string(kZeroDigest) + "\"}")
-          .root());
+  const auto alternate_target =
+      canonical_json(parse_strict_json_model_yaml(
+                         "{\"control_domain_id\":\"arm_domain\","
+                         "\"control_domain_revision\":\"" +
+                         std::string(kZeroDigest) +
+                         "\",\"controller_topology_id\":\"standard_topology\","
+                         "\"topology_revision\":\"" +
+                         std::string(kZeroDigest) + "\"}")
+                         .root());
   const auto canonical_target = canonical_json(
       parse_strict_json_model_yaml(target_binding_target()).root());
   const auto alternate_scope_document = replace_first(
@@ -561,10 +541,9 @@ TEST(DeploymentApplicabilityCodec,
                     "\"scope\":\"control_domain\""),
       "\"target\":" + canonical_target, "\"target\":" + alternate_target);
   const auto alternate_scope = decode(alternate_scope_document);
-  EXPECT_THROW(
-      static_cast<void>(
-          verify_capability_provider_binding_revisions(alternate_scope)),
-      DeploymentApplicabilityCodecError);
+  EXPECT_THROW(static_cast<void>(verify_capability_provider_binding_revisions(
+                   alternate_scope)),
+               DeploymentApplicabilityCodecError);
 }
 
 TEST(DeploymentApplicabilityCodec,
@@ -576,19 +555,19 @@ TEST(DeploymentApplicabilityCodec,
       endpoint_binding("z", "external_resource", "external_z", "source_z") +
       "," + endpoint_binding("a", "runtime_unit", "runtime_a", "source_a");
 
-  const auto forward = compute_capability_provider_binding_revisions(
-      decode(minimal_document(
+  const auto forward =
+      compute_capability_provider_binding_revisions(decode(minimal_document(
           "[]",
-          "[" + provider_binding("provider", kZeroDigest, "target_binding",
-                                 target_binding_target(),
-                                 forward_endpoints) +
+          "[" +
+              provider_binding("provider", kZeroDigest, "target_binding",
+                               target_binding_target(), forward_endpoints) +
               "]")));
-  const auto reverse = compute_capability_provider_binding_revisions(
-      decode(minimal_document(
+  const auto reverse =
+      compute_capability_provider_binding_revisions(decode(minimal_document(
           "[]",
-          "[" + provider_binding("provider", kOneDigest, "target_binding",
-                                 target_binding_target(),
-                                 reverse_endpoints) +
+          "[" +
+              provider_binding("provider", kOneDigest, "target_binding",
+                               target_binding_target(), reverse_endpoints) +
               "]")));
 
   EXPECT_EQ(forward.value(), reverse.value());
@@ -598,8 +577,7 @@ TEST(DeploymentApplicabilityCodec,
 
 TEST(DeploymentApplicabilityCodec,
      OptionalExternalTablePreservesSourcePresence) {
-  const auto absent =
-      decode(minimal_document("[]", "[]", "[]", false));
+  const auto absent = decode(minimal_document("[]", "[]", "[]", false));
   EXPECT_FALSE(absent.external_resources_was_present());
   EXPECT_TRUE(absent.value().external_resources.empty());
   EXPECT_EQ(canonical_json(absent.normalized_external_resources()), "[]");
@@ -628,13 +606,12 @@ TEST(DeploymentApplicabilityCodec,
   EXPECT_FALSE(explicit_null.value().site_overlay_ref.has_value());
   EXPECT_EQ(absent.value(), explicit_null.value());
 
-  const auto exact = decode(minimal_document(
-      "[]", "[]", "[]", true, site_overlay_ref()));
+  const auto exact =
+      decode(minimal_document("[]", "[]", "[]", true, site_overlay_ref()));
   EXPECT_EQ(exact.site_overlay_ref_presence(),
             SiteOverlayRefSourcePresence::kValue);
   ASSERT_TRUE(exact.value().site_overlay_ref.has_value());
-  EXPECT_EQ(exact.value().site_overlay_ref->site_overlay_id.value(),
-            "plant_a");
+  EXPECT_EQ(exact.value().site_overlay_ref->site_overlay_id.value(), "plant_a");
   EXPECT_EQ(exact.value().site_overlay_ref->site_overlay_revision.value(),
             kZeroDigest);
   EXPECT_EQ(exact.value().site_overlay_ref->non_secret_digest.value(),
@@ -646,8 +623,7 @@ TEST(DeploymentApplicabilityCodec,
                 "\"site_overlay_revision\":\"" +
                 std::string(kZeroDigest) + "\"}");
 
-  const auto verified =
-      verify_capability_provider_binding_revisions(exact);
+  const auto verified = verify_capability_provider_binding_revisions(exact);
   EXPECT_EQ(verified.site_overlay_ref_presence(),
             SiteOverlayRefSourcePresence::kValue);
   EXPECT_EQ(verified.normalized_site_overlay_ref(),
@@ -656,101 +632,82 @@ TEST(DeploymentApplicabilityCodec,
 
 TEST(DeploymentApplicabilityCodec,
      FocusedProjectionRequiresItsVersionAndTwoRequiredTables) {
-  EXPECT_THROW(
-      (void)decode(
-          "{\"desired_control_configurations\":[],"
-          "\"capability_provider_bindings\":[]}"),
-      DeploymentApplicabilityCodecError);
-  EXPECT_THROW(
-      (void)decode(
-          "{\"api_version\":\"manyforge.deployment.v0\","
-          "\"desired_control_configurations\":[],"
-          "\"capability_provider_bindings\":[]}"),
-      DeploymentApplicabilityCodecError);
-  EXPECT_THROW(
-      (void)decode(
-          "{\"api_version\":\"manyforge.deployment.v1\","
-          "\"capability_provider_bindings\":[]}"),
-      DeploymentApplicabilityCodecError);
-  EXPECT_THROW(
-      (void)decode(
-          "{\"api_version\":\"manyforge.deployment.v1\","
-          "\"desired_control_configurations\":[]}"),
-      DeploymentApplicabilityCodecError);
+  EXPECT_THROW((void)decode("{\"desired_control_configurations\":[],"
+                            "\"capability_provider_bindings\":[]}"),
+               DeploymentApplicabilityCodecError);
+  EXPECT_THROW((void)decode("{\"api_version\":\"manyforge.deployment.v0\","
+                            "\"desired_control_configurations\":[],"
+                            "\"capability_provider_bindings\":[]}"),
+               DeploymentApplicabilityCodecError);
+  EXPECT_THROW((void)decode("{\"api_version\":\"manyforge.deployment.v1\","
+                            "\"capability_provider_bindings\":[]}"),
+               DeploymentApplicabilityCodecError);
+  EXPECT_THROW((void)decode("{\"api_version\":\"manyforge.deployment.v1\","
+                            "\"desired_control_configurations\":[]}"),
+               DeploymentApplicabilityCodecError);
 }
 
 TEST(DeploymentApplicabilityCodec,
      ExactShapesAndClosedEnumsRejectMalformedRows) {
   const std::string valid_provider = provider_binding();
   EXPECT_THROW(
+      (void)decode(minimal_document("[" +
+                                        replace_first(desired_configuration(),
+                                                      "\"binding_routes\"",
+                                                      "\"unknown_routes\"") +
+                                        "]",
+                                    "[]")),
+      DeploymentApplicabilityCodecError);
+  EXPECT_THROW((void)decode(minimal_document(
+                   "[]", "[" +
+                             replace_first(valid_provider, "\"target_binding\"",
+                                           "\"unknown_scope\"") +
+                             "]")),
+               DeploymentApplicabilityCodecError);
+  EXPECT_THROW((void)decode(minimal_document(
+                   "[]", "[" +
+                             replace_first(valid_provider, "\"target\":{",
+                                           "\"target\":{\"cell_id\":\"cell_a\","
+                                           "\"unexpected\":\"x\",") +
+                             "]")),
+               DeploymentApplicabilityCodecError);
+  EXPECT_THROW((void)decode(minimal_document(
+                   "[]", "[" +
+                             replace_first(valid_provider, "\"runtime_unit\"",
+                                           "\"unknown_source\"") +
+                             "]")),
+               DeploymentApplicabilityCodecError);
+  EXPECT_THROW(
       (void)decode(minimal_document(
-          "[" + replace_first(desired_configuration(), "\"binding_routes\"",
-                              "\"unknown_routes\"") +
-              "]",
-          "[]")),
+          "[]", "[" +
+                    replace_first(valid_provider, "\"planner_runtime\"",
+                                  "\"bad/runtime\"") +
+                    "]")),
       DeploymentApplicabilityCodecError);
   EXPECT_THROW(
       (void)decode(minimal_document(
-          "[]",
-          "[" +
-              replace_first(valid_provider, "\"target_binding\"",
-                            "\"unknown_scope\"") +
-              "]")),
-      DeploymentApplicabilityCodecError);
-  EXPECT_THROW(
-      (void)decode(minimal_document(
-          "[]",
-          "[" +
-              replace_first(valid_provider, "\"target\":{",
-                            "\"target\":{\"cell_id\":\"cell_a\","
-                            "\"unexpected\":\"x\",") +
-              "]")),
-      DeploymentApplicabilityCodecError);
-  EXPECT_THROW(
-      (void)decode(minimal_document(
-          "[]",
-          "[" +
-              replace_first(valid_provider, "\"runtime_unit\"",
-                            "\"unknown_source\"") +
-              "]")),
-      DeploymentApplicabilityCodecError);
-  EXPECT_THROW(
-      (void)decode(minimal_document(
-          "[]",
-          "[" +
-              replace_first(valid_provider, "\"planner_runtime\"",
-                            "\"bad/runtime\"") +
-              "]")),
+          "[]", "[]", "[" + external_resource("alias", "unknown_kind") + "]")),
       DeploymentApplicabilityCodecError);
   EXPECT_THROW(
       (void)decode(minimal_document(
           "[]", "[]",
-          "[" + external_resource("alias", "unknown_kind") + "]")),
-      DeploymentApplicabilityCodecError);
-  EXPECT_THROW(
-      (void)decode(minimal_document(
-          "[]", "[]", "[" + external_resource("alias", "service_endpoint", "") +
-                          "]")),
+          "[" + external_resource("alias", "service_endpoint", "") + "]")),
       DeploymentApplicabilityCodecError);
   EXPECT_THROW((void)decode(minimal_document("[]", "[]", "null")),
                DeploymentApplicabilityCodecError);
   EXPECT_THROW(
-      (void)decode(minimal_document(
-          "[]", "[]", "[]", true,
-          "{\"site_overlay_id\":\"plant_a\","
-          "\"site_overlay_revision\":\"" +
-              std::string(kZeroDigest) + "\"}")),
+      (void)decode(minimal_document("[]", "[]", "[]", true,
+                                    "{\"site_overlay_id\":\"plant_a\","
+                                    "\"site_overlay_revision\":\"" +
+                                        std::string(kZeroDigest) + "\"}")),
       DeploymentApplicabilityCodecError);
-  EXPECT_THROW(
-      (void)decode(minimal_document(
-          "[]", "[]", "[]", true,
-          site_overlay_ref("bad/site"))),
-      DeploymentApplicabilityCodecError);
-  EXPECT_THROW(
-      (void)decode(minimal_document(
-          "[]", "[]", "[]", true,
-          site_overlay_ref("plant_a", kZeroDigest, "not-a-digest"))),
-      DeploymentApplicabilityCodecError);
+  EXPECT_THROW((void)decode(minimal_document("[]", "[]", "[]", true,
+                                             site_overlay_ref("bad/site"))),
+               DeploymentApplicabilityCodecError);
+  EXPECT_THROW((void)decode(minimal_document(
+                   "[]", "[]", "[]", true,
+                   site_overlay_ref("plant_a", kZeroDigest, "not-a-digest"))),
+               DeploymentApplicabilityCodecError);
 
   const std::string uppercase_digest =
       "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -819,9 +776,9 @@ TEST(DeploymentApplicabilityCodec,
       "]";
 
   const auto candidate = decode(with_policies(
-      minimal_document(), interrupt_policy_envelope("", "", interrupt_config(),
-                                                    retained)));
-  const auto& references = candidate.value().retained_policy_records;
+      minimal_document(),
+      interrupt_policy_envelope("", "", interrupt_config(), retained)));
+  const auto &references = candidate.value().retained_policy_records;
   ASSERT_EQ(references.size(), 3U);
   EXPECT_TRUE(std::holds_alternative<core::ContactPolicyCatalogRecordRefDTO>(
       references[0]));
@@ -859,9 +816,8 @@ TEST(DeploymentApplicabilityCodec,
                                   "manyforge.component_type.v1")),
       "outside the closed policy-family set");
 
-  const std::string duplicate =
-      catalog_record("runtime_policy", "runtime.alpha",
-                     "manyforge.runtime_policy.v1");
+  const std::string duplicate = catalog_record(
+      "runtime_policy", "runtime.alpha", "manyforge.runtime_policy.v1");
   expect_decode_error_containing(document_for(duplicate + "," + duplicate),
                                  "duplicate complete catalog-record identity");
 }
@@ -888,11 +844,11 @@ TEST(DeploymentApplicabilityCodec,
                    interrupt_policy("policy", "missing")),
       "references an unknown interrupt source");
   expect_decode_error_containing(
-      document_for(
-          interrupt_source("source", "signal"),
-          interrupt_policy("policy", "source", "[\"executing\"]",
-                           "preempt_trajectory", "await_recovery_action",
-                           "static", "[]", "[]")),
+      document_for(interrupt_source("source", "signal"),
+                   interrupt_policy("policy", "source", "[\"executing\"]",
+                                    "preempt_trajectory",
+                                    "await_recovery_action", "static", "[]",
+                                    "[]")),
       "requires at least one control domain or resource");
   expect_decode_error_containing(
       document_for(interrupt_source("source", "signal"),
@@ -901,21 +857,21 @@ TEST(DeploymentApplicabilityCodec,
                                     "await_recovery_action", "operation")),
       "operation policy must include executing");
   expect_decode_error_containing(
-      document_for(
-          interrupt_source("source", "signal"),
-          interrupt_policy("policy_a", "source", "[\"executing\"]",
-                           "preempt_trajectory", "await_recovery_action") +
-              "," +
-              interrupt_policy("policy_b", "source", "[\"executing\"]",
-                               "latch_faulted", "fault_terminal")),
+      document_for(interrupt_source("source", "signal"),
+                   interrupt_policy("policy_a", "source", "[\"executing\"]",
+                                    "preempt_trajectory",
+                                    "await_recovery_action") +
+                       "," +
+                       interrupt_policy("policy_b", "source", "[\"executing\"]",
+                                        "latch_faulted", "fault_terminal")),
       "same-source equal-priority overlapping phases");
   expect_decode_error_containing(
-      document_for(
-          interrupt_source("source", "signal"),
-          interrupt_policy("policy", "source", "[\"executing\"]",
-                           "preempt_trajectory", "await_recovery_action",
-                           "static", "[\"arm_domain\"]", "[]",
-                           ",\"maskable_by\":[\"missing\"]")),
+      document_for(interrupt_source("source", "signal"),
+                   interrupt_policy("policy", "source", "[\"executing\"]",
+                                    "preempt_trajectory",
+                                    "await_recovery_action", "static",
+                                    "[\"arm_domain\"]", "[]",
+                                    ",\"maskable_by\":[\"missing\"]")),
       "references an unknown interrupt policy");
 }
 
@@ -949,6 +905,7 @@ TEST(DeploymentApplicabilityCodec,
   const std::string provider = "[" + provider_binding("signal") + "]";
   const std::string profile =
       "{\"profile_id\":\"guard.soft\",\"stop_mode\":\"soft_on_path\","
+      "\"jerk_limits_enabled\":true,"
       "\"deceleration_time_s\":1.25,\"per_joint_max_deceleration\":{"
       "\"z_slide\":{\"coordinate_kind\":\"linear_m_s2\",\"value_m_s2\":2.5},"
       "\"a_joint\":{\"coordinate_kind\":\"angular_rad_s2\","
@@ -1022,16 +979,21 @@ TEST(DeploymentApplicabilityCodec,
   expect_decode_error_containing(
       document_for_profile(
           "{\"profile_id\":\"spring\",\"stop_mode\":\"spring_back_hold\","
+          "\"jerk_limits_enabled\":false,"
           "\"per_joint_max_deceleration\":{\"joint\":{"
           "\"coordinate_kind\":\"angular_rad_s2\",\"value_m_s2\":1}}}"),
       "unknown field 'value_m_s2'");
+  EXPECT_NO_THROW((void)decode(document_for_profile(
+      "{\"profile_id\":\"spring\",\"stop_mode\":\"spring_back_hold\","
+      "\"jerk_limits_enabled\":false,"
+      "\"per_joint_max_deceleration\":{\"joint\":{"
+      "\"coordinate_kind\":\"angular_rad_s2\",\"value_rad_s2\":1}},"
+      "\"allow_natural_completion_on_short_path\":true}")));
   expect_decode_error_containing(
       document_for_profile(
-          "{\"profile_id\":\"spring\",\"stop_mode\":\"spring_back_hold\","
-          "\"per_joint_max_deceleration\":{\"joint\":{"
-          "\"coordinate_kind\":\"angular_rad_s2\",\"value_rad_s2\":1}},"
+          "{\"profile_id\":\"hard\",\"stop_mode\":\"hard_deceleration\","
           "\"allow_natural_completion_on_short_path\":false}"),
-      "explicit presence is legal only for soft_on_path");
+      "explicit presence is legal only for soft_on_path or spring_back_hold");
   expect_decode_error_containing(
       document_for_profile(
           "{\"profile_id\":\"soft\",\"stop_mode\":\"soft_on_path\","
@@ -1055,30 +1017,27 @@ TEST(DeploymentApplicabilityCodec,
   const std::string endpoint = endpoint_binding();
   EXPECT_THROW(
       (void)decode(minimal_document(
-          "[]",
-          "[" + provider_binding("provider", kZeroDigest, "target_binding",
-                                 target_binding_target(),
-                                 endpoint + "," + endpoint) +
-              "]")),
+          "[]", "[" +
+                    provider_binding("provider", kZeroDigest, "target_binding",
+                                     target_binding_target(),
+                                     endpoint + "," + endpoint) +
+                    "]")),
       DeploymentApplicabilityCodecError);
 
   const std::string desired = desired_configuration();
   EXPECT_THROW(
-      (void)decode(minimal_document("[" + desired + "," + desired + "]",
-                                    "[]")),
+      (void)decode(minimal_document("[" + desired + "," + desired + "]", "[]")),
       DeploymentApplicabilityCodecError);
 
   const std::string provider = provider_binding();
-  EXPECT_THROW(
-      (void)decode(minimal_document(
-          "[]", "[" + provider + "," + provider + "]")),
-      DeploymentApplicabilityCodecError);
+  EXPECT_THROW((void)decode(minimal_document("[]", "[" + provider + "," +
+                                                       provider + "]")),
+               DeploymentApplicabilityCodecError);
 
   const std::string external = external_resource();
-  EXPECT_THROW(
-      (void)decode(minimal_document(
-          "[]", "[]", "[" + external + "," + external + "]")),
-      DeploymentApplicabilityCodecError);
+  EXPECT_THROW((void)decode(minimal_document(
+                   "[]", "[]", "[" + external + "," + external + "]")),
+               DeploymentApplicabilityCodecError);
 }
 
 TEST(DeploymentApplicabilityCodec,
@@ -1089,25 +1048,25 @@ TEST(DeploymentApplicabilityCodec,
       if (!first_256.empty()) {
         first_256.push_back(',');
       }
-      first_256 += endpoint_binding(
-          "role_" + std::to_string(index), "runtime_unit", "runtime",
-          "source_" + std::to_string(index));
+      first_256 +=
+          endpoint_binding("role_" + std::to_string(index), "runtime_unit",
+                           "runtime", "source_" + std::to_string(index));
     }
   }
   const std::string endpoints =
       first_256 + "," +
       endpoint_binding("role_256", "runtime_unit", "runtime", "source_256");
   EXPECT_NO_THROW((void)decode(minimal_document(
-      "[]",
-      "[" + provider_binding("provider", kZeroDigest, "target_binding",
-                             target_binding_target(), first_256) +
-          "]")));
+      "[]", "[" +
+                provider_binding("provider", kZeroDigest, "target_binding",
+                                 target_binding_target(), first_256) +
+                "]")));
   EXPECT_THROW(
       (void)decode(minimal_document(
-          "[]",
-          "[" + provider_binding("provider", kZeroDigest, "target_binding",
-                                 target_binding_target(), endpoints) +
-              "]")),
+          "[]", "[" +
+                    provider_binding("provider", kZeroDigest, "target_binding",
+                                     target_binding_target(), endpoints) +
+                    "]")),
       DeploymentApplicabilityCodecError);
 }
 
@@ -1131,45 +1090,40 @@ TEST(DeploymentApplicabilityCodec,
   const auto candidate = decode(minimal_document(
       "[]", "[" + provider_binding("provider", kZeroDigest) + "," +
                 provider_binding("provider", kOneDigest) + "]"));
-  EXPECT_THROW(
-      (void)compute_capability_provider_binding_revisions(candidate),
-      DeploymentApplicabilityCodecError);
+  EXPECT_THROW((void)compute_capability_provider_binding_revisions(candidate),
+               DeploymentApplicabilityCodecError);
 }
 
 TEST(DeploymentApplicabilityCodec,
      SiteOverlayValueRefsUseTheExactPortableV1Grammar) {
-  const std::string maximum_ref =
-      "a" + std::string(127U, 'z');
+  const std::string maximum_ref = "a" + std::string(127U, 'z');
   const auto candidate = decode(minimal_document(
       "[]", "[]",
       "[" + external_resource("endpoint", "service_endpoint", maximum_ref) +
           "]"));
   ASSERT_EQ(candidate.value().external_resources.size(), 1U);
-  EXPECT_EQ(candidate.value()
-                .external_resources[0]
-                .site_overlay_value_ref.value(),
-            maximum_ref);
+  EXPECT_EQ(
+      candidate.value().external_resources[0].site_overlay_value_ref.value(),
+      maximum_ref);
 
   for (const std::string_view invalid :
-       {"", ".leading", "resources/site", "resources site",
-        "resources[0]", "resources:site"}) {
+       {"", ".leading", "resources/site", "resources site", "resources[0]",
+        "resources:site"}) {
     EXPECT_THROW(
         (void)decode(minimal_document(
             "[]", "[]",
-            "[" + external_resource("endpoint", "service_endpoint",
-                                    invalid) +
+            "[" + external_resource("endpoint", "service_endpoint", invalid) +
                 "]")),
         DeploymentApplicabilityCodecError)
         << invalid;
   }
-  EXPECT_THROW(
-      (void)decode(minimal_document(
-          "[]", "[]",
-          "[" +
-              external_resource("endpoint", "service_endpoint",
-                                "a" + std::string(128U, 'z')) +
-              "]")),
-      DeploymentApplicabilityCodecError);
+  EXPECT_THROW((void)decode(minimal_document(
+                   "[]", "[]",
+                   "[" +
+                       external_resource("endpoint", "service_endpoint",
+                                         "a" + std::string(128U, 'z')) +
+                       "]")),
+               DeploymentApplicabilityCodecError);
 }
 
 TEST(DeploymentApplicabilityCodec,
@@ -1185,10 +1139,9 @@ TEST(DeploymentApplicabilityCodec,
   const auto candidate =
       decode(minimal_document("[]", "[]", table_for_alias(maximum_alias)));
   ASSERT_EQ(candidate.value().external_resources.size(), 1U);
-  EXPECT_EQ(candidate.value()
-                .external_resources[0]
-                .external_resource_alias.value(),
-            maximum_alias);
+  EXPECT_EQ(
+      candidate.value().external_resources[0].external_resource_alias.value(),
+      maximum_alias);
 
   constexpr std::string_view kAliasPath =
       "$.external_resources[0].external_resource_alias: expected a 1..128 "
@@ -1199,8 +1152,7 @@ TEST(DeploymentApplicabilityCodec,
         R"(\u00e9ndpoint)"}) {
     SCOPED_TRACE(invalid);
     expect_decode_error_containing(
-        minimal_document("[]", "[]", table_for_alias(invalid)),
-        kAliasPath);
+        minimal_document("[]", "[]", table_for_alias(invalid)), kAliasPath);
   }
 
   expect_decode_error_containing(
@@ -1223,24 +1175,23 @@ TEST(DeploymentApplicabilityCodec,
           "resources.endpoint_" + std::to_string(index));
     }
   }
-  EXPECT_NO_THROW((void)decode(
-      minimal_document("[]", "[]", "[" + first_4096 + "]")));
-  EXPECT_THROW(
-      (void)decode(minimal_document(
-          "[]", "[]",
-          "[" + first_4096 + "," +
-              external_resource("resource_4096", "service_endpoint",
-                                "resources.endpoint_4096") +
-              "]")),
-      DeploymentApplicabilityCodecError);
+  EXPECT_NO_THROW(
+      (void)decode(minimal_document("[]", "[]", "[" + first_4096 + "]")));
+  EXPECT_THROW((void)decode(minimal_document(
+                   "[]", "[]",
+                   "[" + first_4096 + "," +
+                       external_resource("resource_4096", "service_endpoint",
+                                         "resources.endpoint_4096") +
+                       "]")),
+               DeploymentApplicabilityCodecError);
 }
 
 TEST(DeploymentApplicabilityCodec,
      DesiredConfigurationCeilingAccepts4096AndRejects4097) {
   const std::string boundary_rows = comma_joined_rows(
       core::kMaxDeploymentApplicabilityRows, [](std::size_t index) {
-        return desired_configuration(
-            "domain_" + std::to_string(index), kZeroDigest, "");
+        return desired_configuration("domain_" + std::to_string(index),
+                                     kZeroDigest, "");
       });
 
   const auto accepted =
@@ -1269,10 +1220,8 @@ TEST(DeploymentApplicabilityCodec,
             core::kMaxDeploymentApplicabilityRows);
 
   expect_decode_error_containing(
-      minimal_document(
-          "[]",
-          "[" + boundary_rows + "," + provider_binding("provider_4096") +
-              "]"),
+      minimal_document("[]", "[" + boundary_rows + "," +
+                                 provider_binding("provider_4096") + "]"),
       "$.capability_provider_bindings: provider-binding count exceeds");
 }
 
@@ -1280,15 +1229,12 @@ TEST(DeploymentApplicabilityCodec,
      DesiredBindingRouteCeilingAccepts4096AndRejects4097) {
   const std::string boundary_rows = comma_joined_rows(
       core::kMaxDeploymentApplicabilityRows, [](std::size_t index) {
-        return desired_route("binding_" + std::to_string(index),
-                             kZeroDigest,
+        return desired_route("binding_" + std::to_string(index), kZeroDigest,
                              "route_" + std::to_string(index));
       });
 
   const auto accepted = decode(minimal_document(
-      "[" +
-          desired_configuration("domain", kZeroDigest, boundary_rows) +
-          "]",
+      "[" + desired_configuration("domain", kZeroDigest, boundary_rows) + "]",
       "[]"));
   ASSERT_EQ(accepted.value().desired_control_configurations.size(), 1U);
   EXPECT_EQ(
@@ -1296,18 +1242,63 @@ TEST(DeploymentApplicabilityCodec,
       core::kMaxDeploymentApplicabilityRows);
 
   expect_decode_error_containing(
-      minimal_document(
-          "[" +
-              desired_configuration(
-                  "domain", kZeroDigest,
-                  boundary_rows + "," +
-                      desired_route("binding_4096", kZeroDigest,
-                                    "route_4096")) +
-              "]",
-          "[]"),
+      minimal_document("[" +
+                           desired_configuration(
+                               "domain", kZeroDigest,
+                               boundary_rows + "," +
+                                   desired_route("binding_4096", kZeroDigest,
+                                                 "route_4096")) +
+                           "]",
+                       "[]"),
       "$.desired_control_configurations[0].binding_routes: binding-route "
       "count exceeds");
 }
 
-}  // namespace
-}  // namespace manyforge::deployment
+TEST(DeploymentApplicabilityCodec,
+     StopTimingIsClosedCanonicalAndPreservesAbsence) {
+  auto policies = interrupt_policy_envelope("", "");
+  const auto absent = decode(with_policies(minimal_document(), policies));
+  EXPECT_TRUE(absent.value().stop_timing_parameters.empty());
+  EXPECT_EQ(absent.normalized_policies()->find_object_member(
+                "stop_timing_parameters"),
+            nullptr);
+  const auto row = [](std::string id, std::string timeout = "3000000000") {
+    return "{\"control_binding_id\":\"" + id +
+           "\",\"control_binding_revision\":\"" + std::string(kZeroDigest) +
+           "\",\"timing\":{\"command_latency_allowance_ns\":250000000,"
+           "\"settling_allowance_ns\":750000000,\"operational_timeout_ns\":" +
+           timeout + "}}";
+  };
+  const auto source = [&](std::string rows) {
+    auto with_timing = policies;
+    with_timing.pop_back();
+    return with_policies(minimal_document(),
+                         with_timing + ",\"stop_timing_parameters\":[" + rows +
+                             "]}");
+  };
+  const auto parsed = decode(source(row("z") + "," + row("a")));
+  ASSERT_EQ(parsed.value().stop_timing_parameters.size(), 2U);
+  EXPECT_EQ(
+      parsed.value().stop_timing_parameters.front().control_binding_id.value(),
+      "a");
+  EXPECT_EQ(parsed.value()
+                .stop_timing_parameters.front()
+                .timing.operational_timeout_ns,
+            3'000'000'000);
+  const auto round_trip = decode(with_policies(
+      minimal_document(), canonical_json(*parsed.normalized_policies())));
+  EXPECT_EQ(round_trip.value().stop_timing_parameters,
+            parsed.value().stop_timing_parameters);
+  expect_decode_error_containing(source(row("a") + "," + row("a")),
+                                 "duplicate control binding timing");
+  expect_decode_error_containing(source(row("a", "1000000000")),
+                                 "shorter than the complete profile");
+  expect_decode_error_containing(source(row("a", "3000000000.5")),
+                                 "I-JSON-safe integer");
+  auto unknown = row("a");
+  unknown.insert(unknown.size() - 1, ",\"other_timeout_ns\":4000000000");
+  expect_decode_error_containing(source(unknown), "unknown field");
+}
+
+} // namespace
+} // namespace manyforge::deployment

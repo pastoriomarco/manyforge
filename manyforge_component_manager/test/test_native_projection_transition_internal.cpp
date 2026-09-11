@@ -392,6 +392,46 @@ TEST(NativeProjectionTransition,
 }
 
 TEST(NativeProjectionTransition,
+     ExactWithdrawalReplacesOnlyTheRetiredEpochHealth) {
+  const auto predecessor =
+      NativeBundle("bundle.predecessor", "graph.predecessor");
+  const auto candidate = NativeBundle("bundle.candidate", "graph.candidate");
+  auto health = HealthyPredecessor("epoch.old");
+  health.state = ProjectionHealthState::kUnavailable;
+  health.error = ErrorDTO{"missing_reference", "old process is gone", {}};
+  auto ready = StagedReady({StagedRuntime("runtime.native", "epoch.new")});
+  auto &runtime = ready.runtime_units.front();
+  runtime.candidate_disposition =
+      RuntimeUnitCandidateDisposition::kRetainedExact;
+  const auto derive = [&] {
+    return DeriveNativeProjectionTransitionRows(
+        predecessor, candidate, PredecessorRevision(),
+        std::span<const ProjectionHealthDTO>(&health, 1U), ready);
+  };
+  EXPECT_THROW(static_cast<void>(derive()), std::invalid_argument);
+  runtime.predecessor_withdrawal =
+      ManagedRuntimeWithdrawalDTO{ready.apply_id,
+                                  ready.apply_generation,
+                                  ready.runtime_convergence_intent_digest,
+                                  runtime.runtime_unit_id,
+                                  RuntimeEpoch("epoch.old"),
+                                  ContentDigest(std::string(kDigestOne)),
+                                  ContentDigest(std::string(kDigestTwo)),
+                                  "manager-supervisor",
+                                  12U};
+  const auto rows = derive();
+  ASSERT_EQ(rows.size(), 2U);
+  for (const auto &row : rows) {
+    if (row.disposition == ProjectionTransitionDisposition::kRemoved)
+      EXPECT_EQ(row.managed_withdrawal, runtime.predecessor_withdrawal);
+    else
+      EXPECT_FALSE(row.managed_withdrawal);
+  }
+  runtime.predecessor_withdrawal->runtime_epoch = RuntimeEpoch("epoch.other");
+  EXPECT_THROW(static_cast<void>(derive()), std::invalid_argument);
+}
+
+TEST(NativeProjectionTransition,
      PredecessorEpochMustComeFromExactFinalizedOwnerHealth) {
   const auto predecessor =
       NativeBundle("bundle.predecessor", "graph.predecessor");

@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <manyforge_core/types/catalog.hpp>
+#include <manyforge_core/types/stop_control.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/closed_schema.hpp>
 #include <manyforge_deployment/content_identity.hpp>
@@ -136,6 +137,77 @@ CompiledDeploymentDraft verify_deployment_draft(const std::string_view source) {
   const auto profile_storage = SelectedBuildProfiles(parsed.root());
   return Result(verify_deployment_artifact_revision(
       parsed, std::span<const QualifiedRuntimeProfile>(profile_storage)));
+}
+
+CompiledDeploymentDraft
+migrate_controlled_stop_jerk_choice(const std::string_view source,
+                                    const bool enabled) {
+  // Strict parsing rejects duplicate fields and preserves the same byte/node
+  // limits as ordinary authoring. Only this explicit entrypoint accepts an
+  // omitted choice; runtime decoding and normal compilation stay unchanged.
+  const auto parsed = parse_strict_json_model_yaml(source);
+  auto root = parsed.root().as_object();
+  const auto policies =
+      std::find_if(root.begin(), root.end(),
+                   [](const auto &row) { return row.first == "policies"; });
+  if (policies == root.end())
+    return compile_deployment_draft(source);
+  auto policy_fields = policies->second.as_object();
+  const auto stages = std::find_if(
+      policy_fields.begin(), policy_fields.end(),
+      [](const auto &row) { return row.first == "stop_stage_parameters"; });
+  if (stages == policy_fields.end())
+    return compile_deployment_draft(source);
+  auto rows = stages->second.as_array();
+  for (auto &row : rows) {
+    const auto *contract = row.find_object_member("provider_contract_ref");
+    const auto *schema =
+        contract == nullptr
+            ? nullptr
+            : contract->find_object_member("contract_schema_id");
+    if (schema == nullptr || !schema->is_string() ||
+        schema->as_string() != core::kMotionControlledStopContractSchemaId)
+      continue;
+    const auto *revision =
+        contract->find_object_member("contract_schema_revision");
+    constexpr std::string_view legacy_revision =
+        "sha256:"
+        "afbbcda3b81eabff2bbdffb5658fb1fcd3331cde896cadf0681793a2f9db90dd";
+    if (revision == nullptr || !revision->is_string() ||
+        (revision->as_string() != legacy_revision &&
+         revision->as_string() !=
+             core::kMotionControlledStopContractSchemaRevision))
+      throw DeploymentArtifactCodecError(
+          "controlled-Stop migration requires a recognized schema revision");
+    auto fields = row.as_object();
+    const auto parameters =
+        std::find_if(fields.begin(), fields.end(), [](const auto &field) {
+          return field.first == "default_contract_parameters";
+        });
+    if (parameters == fields.end())
+      continue; // The compiler diagnoses malformed rows.
+    if (parameters->second.find_object_member("jerk_limits_enabled") ==
+        nullptr) {
+      auto values = parameters->second.as_object();
+      values.emplace_back("jerk_limits_enabled", CanonicalValue(enabled));
+      parameters->second = CanonicalValue(std::move(values));
+    }
+    auto reference = contract->as_object();
+    for (auto &[name, value] : reference) {
+      if (name == "contract_schema_revision")
+        value = CanonicalValue(
+            std::string(core::kMotionControlledStopContractSchemaRevision));
+    }
+    for (auto &[name, value] : fields) {
+      if (name == "provider_contract_ref")
+        value = CanonicalValue(std::move(reference));
+    }
+    row = CanonicalValue(std::move(fields));
+  }
+  stages->second = CanonicalValue(std::move(rows));
+  policies->second = CanonicalValue(std::move(policy_fields));
+  return compile_deployment_draft(
+      canonical_json(CanonicalValue(std::move(root))));
 }
 
 }  // namespace manyforge::deployment

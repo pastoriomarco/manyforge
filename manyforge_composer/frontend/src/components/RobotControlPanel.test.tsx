@@ -38,7 +38,8 @@ const controller = vi.hoisted(() => ({
           maxAccelerationRadS2: 3,
         }],
         targetDescriptor: {
-          schemaVersion: 'manyforge.manual_control_motion_descriptor.v3',
+          schemaVersion: 'manyforge.manual_control_motion_descriptor.v4',
+          ordinaryJerk: null,
           controllableComponentId: 'robot-1', commandTargetId: 'arm',
           componentRoleId: 'controlled_component', targetRoleId: 'command_target',
           frames: [
@@ -170,7 +171,8 @@ const controller = vi.hoisted(() => ({
 }));
 
 vi.mock('../hooks/useRobotControl', () => ({
-  useRobotControl: () => ({ ...controller, currentStatus: controller.state.status }),
+  useRobotControl: () => ({ ...controller, currentStatus: controller.state.status,
+    manualControlAllowed: true, manualControlUnavailableReason: null }),
 }));
 
 describe('RobotControlPanel layout', () => {

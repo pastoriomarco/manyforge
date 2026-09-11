@@ -5,6 +5,7 @@
 #include "manyforge_component_manager/kernel_cell_admission_rpc_internal.hpp"
 #include "native_projection_rpc_internal.hpp"
 #include "selected_runtime_composition_rpc_internal.hpp"
+#include <manyforge_deployment/apply_affected_scope.hpp>
 
 #include <fcntl.h>
 #include <poll.h>
@@ -772,6 +773,8 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     std::set<ProjectionBindingKey> admitted_projection_bindings;
     std::map<ProjectionBindingKey, ProjectionPreparation>
         prepared_projection_products;
+    std::optional<manyforge::core::ManagedRuntimeWithdrawalDTO>
+        predecessor_withdrawal;
 
     Child(pid_t child_pid, RuntimeEpoch child_epoch, UniqueFd child_channel,
           std::string selected_product_identity,
@@ -989,6 +992,58 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     return target;
   }
 
+  [[nodiscard]] bool
+  ApprovedPredecessor(const RuntimeUnitConvergenceQueryDTO &query,
+                      const RetainedBundle &candidate, const Child &child) {
+    if (!query.replacement)
+      return false;
+    const auto predecessor = bundle_source.get_verified(
+        query.replacement->expected_old_retained_bundle_id);
+    if (!predecessor ||
+        predecessor->value().cell_graph.graph_revision !=
+            query.replacement->expected_old_graph_revision ||
+        manyforge::deployment::derive_apply_configuration_fence_scope(
+            *predecessor, candidate) != query.replacement->persisted_scope)
+      Fail("native replacement does not carry the exact whole-Apply scope");
+    const auto old = VerifyNativeExecutionRuntimeUnitForHost(
+        *predecessor, query.plan.runtime_unit_id, artifact_source,
+        operating_system, launch_environment_contracts);
+    return old &&
+           old->product().product_contract_id() ==
+               query.plan.product_contract_id &&
+           old->product().product_contract_revision() ==
+               query.plan.product_contract_revision &&
+           old->runtime_contract_offer_digest() ==
+               query.plan.runtime_contract_offer_digest.value() &&
+           SameChildProduct(*old, child.product_identity,
+                            child.configuration_identity,
+                            child.runtime_contract_offer_digest);
+  }
+
+  void RequireHeldReplacementFence(
+      Child &child,
+      const manyforge::core::ApplyFenceRehydrateDTO &replacement) {
+    const auto held =
+        ExchangeKernelFence<manyforge::core::ApplyFenceReconcileResultDTO>(
+            child, replacement);
+    if (!held.matches(replacement) || held.admission_fenced || held.error ||
+        held.execution_host_epoch.runtime_epoch != child.runtime_epoch ||
+        held.fence_results.size() != 1U ||
+        held.fence_results.front().state !=
+            manyforge::core::ApplyFenceReconcileState::kMatched)
+      Fail("native replacement requires the current exact held Apply fence");
+    const manyforge::core::ConfigurationFenceAdmissionQueryDTO query{
+        replacement.persisted_scope, replacement.manager_runtime_epoch};
+    const auto idle = ExchangeKernelFence<
+        manyforge::core::ConfigurationFenceAdmissionSnapshotDTO>(child, query);
+    if (!idle.matches(query) ||
+        idle.execution_host_epoch.runtime_epoch != child.runtime_epoch ||
+        idle.affected_active_operation_count != 0U ||
+        idle.affected_queued_operation_count != 0U)
+      Fail("native replacement requires the current exact held idle Apply "
+           "fence");
+  }
+
   [[nodiscard]] std::uint64_t NextObservationSequence() {
     if (observation_sequence == std::numeric_limits<std::uint64_t>::max()) {
       Fail("native runtime process observation sequence is exhausted");
@@ -1136,14 +1191,19 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
       EraseChild(found);
       Fail("managed Kernel child exited before its fence response");
     }
+    return ExchangeKernelFence<Response>(found->second, request);
+  }
+
+  template <typename Response, typename Request>
+  [[nodiscard]] Response ExchangeKernelFence(Child &child,
+                                             const Request &request) {
     const auto encoded = detail::EncodeKernelApplyFenceRpcRequest(
         detail::KernelApplyFenceRpcRequest(request));
-    SendPacket(found->second.channel.get(), encoded, kStatusTimeout);
-    const auto packet =
-        ReceivePacket(found->second.channel.get(), kStatusTimeout);
+    SendPacket(child.channel.get(), encoded, kStatusTimeout);
+    const auto packet = ReceivePacket(child.channel.get(), kStatusTimeout);
     if (!packet.has_value()) {
-      found->second.channel.Reset();
-      StopChildNoThrow(found->second);
+      child.channel.Reset();
+      StopChildNoThrow(child);
       Fail("managed Kernel Apply-fence response timed out");
     }
     auto response = detail::DecodeKernelApplyFenceRpcResponse(*packet);
@@ -1706,7 +1766,21 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
                           found->second.configuration_identity,
                           found->second.runtime_contract_offer_digest)) {
       if (ChildIsLive(found->second)) {
-        Fail("live native runtime child differs from the selected product");
+        if (!ApprovedPredecessor(query, *bundle, found->second))
+          Fail("live native runtime child differs from the selected product: " +
+               query.plan.runtime_unit_id.value() + " at " +
+               found->second.runtime_epoch.value() + "; expected product=" +
+               admission.product().product_identity().value() +
+               ", configuration=" +
+               admission.product().configuration_identity().value() +
+               ", offer=" + admission.runtime_contract_offer_digest() +
+               "; observed product=" + found->second.product_identity +
+               ", configuration=" + found->second.configuration_identity +
+               ", offer=" + found->second.runtime_contract_offer_digest);
+        // Presence is not candidate readiness. EnsureRunning must replace
+        // this exact predecessor before a candidate source report is usable.
+        return Presence(query, ProcessPresenceState::kPresent,
+                        found->second.runtime_epoch.value());
       }
       EraseChild(found);
       return Presence(query, ProcessPresenceState::kAbsent);
@@ -1724,13 +1798,31 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     auto [bundle, admission] = Admission(query);
     std::lock_guard lock(mutex);
     const auto runtime_id = query.plan.runtime_unit_id.value();
+    std::optional<manyforge::core::ManagedRuntimeWithdrawalDTO> withdrawal;
     auto found = children.find(runtime_id);
     if (found != children.end()) {
       if (!SameChildProduct(admission, found->second.product_identity,
                             found->second.configuration_identity,
                             found->second.runtime_contract_offer_digest)) {
         if (ChildIsLive(found->second)) {
-          Fail("cannot replace a live native child with another product");
+          if (!ApprovedPredecessor(query, *bundle, found->second))
+            Fail("cannot replace a live native child with another product");
+          RequireHeldReplacementFence(found->second, *query.replacement);
+          const auto &owner =
+              std::get<RuntimeUnitConvergenceApplyOwnerDTO>(query.owner);
+          withdrawal = manyforge::core::ManagedRuntimeWithdrawalDTO{
+              owner.apply_id,
+              owner.apply_generation,
+              query.runtime_convergence_intent_digest,
+              query.plan.runtime_unit_id,
+              found->second.runtime_epoch,
+              manyforge::core::ContentDigest(found->second.product_identity),
+              manyforge::core::ContentDigest(
+                  found->second.configuration_identity),
+              observer_instance_id,
+              0U};
+          StopChild(found->second);
+          withdrawal->process_observation_sequence = NextObservationSequence();
         }
         EraseChild(found);
       } else if (ChildIsLive(found->second)) {
@@ -1743,6 +1835,9 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
       }
     }
     auto launched = LaunchChild(admission, *bundle);
+    // One receipt travels with the replacement, not an accumulating registry.
+    // A failed launch or a crash before the journal records it stays unknown.
+    launched.predecessor_withdrawal = std::move(withdrawal);
     auto [inserted, unique] =
         children.try_emplace(runtime_id, std::move(launched));
     if (!unique) {
@@ -1771,6 +1866,28 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     StopChild(found->second);
     EraseChild(found);
     return Presence(query, ProcessPresenceState::kAbsent);
+  }
+
+  [[nodiscard]] std::optional<manyforge::core::ManagedRuntimeWithdrawalDTO>
+  ReadPredecessorWithdrawal(const RuntimeUnitConvergenceQueryDTO &query) {
+    auto [bundle, admission] = Admission(query);
+    static_cast<void>(bundle);
+    std::lock_guard lock(mutex);
+    const auto found = children.find(query.plan.runtime_unit_id.value());
+    const auto *owner =
+        std::get_if<RuntimeUnitConvergenceApplyOwnerDTO>(&query.owner);
+    if (owner == nullptr || found == children.end() ||
+        !SameChildProduct(admission, found->second.product_identity,
+                          found->second.configuration_identity,
+                          found->second.runtime_contract_offer_digest))
+      return std::nullopt;
+    const auto &receipt = found->second.predecessor_withdrawal;
+    if (!receipt || !receipt->valid() || receipt->apply_id != owner->apply_id ||
+        receipt->apply_generation != owner->apply_generation ||
+        receipt->runtime_convergence_intent_digest !=
+            query.runtime_convergence_intent_digest)
+      return std::nullopt;
+    return receipt;
   }
 
   [[nodiscard]] std::optional<RuntimeUnitSourceReport>
@@ -2119,6 +2236,12 @@ ProcessPresenceObservation RetainedNativeRuntimeUnitAdapter::EnsureRunning(
 ProcessPresenceObservation RetainedNativeRuntimeUnitAdapter::EnsureStopped(
     const RuntimeUnitConvergenceQueryDTO &query) {
   return impl_->EnsureStopped(query);
+}
+
+std::optional<manyforge::core::ManagedRuntimeWithdrawalDTO>
+RetainedNativeRuntimeUnitAdapter::ReadPredecessorWithdrawal(
+    const RuntimeUnitConvergenceQueryDTO &query) {
+  return impl_->ReadPredecessorWithdrawal(query);
 }
 
 std::optional<RuntimeUnitSourceReport>

@@ -616,8 +616,7 @@ std::optional<std::string_view> stop_scope_snapshot_field_error(
       !canonical_rows(snapshot.operations, [](const auto& row) { return row.operation_id; })) {
     return "stop_scope_operations_not_canonical";
   }
-  if (snapshot.known_program_runs.size() >
-          kMaximumStopScopeSnapshotProgramRuns ||
+  if (snapshot.known_program_runs.size() > kMaximumStopScopeSnapshotProgramRuns ||
       !canonical_id_set(snapshot.known_program_runs)) {
     return "stop_scope_program_runs_not_canonical";
   }
@@ -671,6 +670,7 @@ std::optional<std::string_view> stop_scope_snapshot_field_error(
   for (const auto& operation : snapshot.operations) {
     if (!bounded_identity(operation.operation_id) || !operation.operation_revision.nonzero() ||
         !bounded_identity(operation.program_run_id) ||
+        (operation.parent_program_run_id && !bounded_identity(*operation.parent_program_run_id)) ||
         !safe_counter(operation.operation_revision) || !safe_counter(operation.stop_generation) ||
         !known_operation_state(operation.state)) {
       return "stop_scope_operation_invalid";
@@ -809,11 +809,12 @@ Result<StopScopeResolutionDTO> resolve_stop_scope(const StopIntentDTO& intent,
           }
         } else {
           for (const auto& target : targets) {
-            bool known = std::binary_search(snapshot.known_program_runs.begin(),
-                                            snapshot.known_program_runs.end(),
-                                            target.program_run_id);
+            bool known =
+                std::binary_search(snapshot.known_program_runs.begin(),
+                                   snapshot.known_program_runs.end(), target.program_run_id);
             for (const auto& operation : snapshot.operations) {
-              if (operation.program_run_id != target.program_run_id) {
+              if (operation.program_run_id != target.program_run_id &&
+                  operation.parent_program_run_id != target.program_run_id) {
                 continue;
               }
               known = true;
@@ -1354,7 +1355,8 @@ std::optional<std::string_view> stop_accepted_field_error(
   if (!accepted.joined_predecessor_stops.empty() &&
       accepted.resolution_disposition != StopResolutionDispositionDTO::kPromotedToFull &&
       !((accepted.resolution_disposition == StopResolutionDispositionDTO::kExact ||
-         accepted.resolution_disposition == StopResolutionDispositionDTO::kStaleButUnambiguouslyResolved) &&
+         accepted.resolution_disposition ==
+             StopResolutionDispositionDTO::kStaleButUnambiguouslyResolved) &&
         accepted.resolution_reason == StopScopeResolutionReasonDTO::kExplicitFullStop)) {
     return "stop_accepted_predecessor_resolution_invalid";
   }

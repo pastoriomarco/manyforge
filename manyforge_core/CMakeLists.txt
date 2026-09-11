@@ -107,6 +107,9 @@ add_library(manyforge_core
   src/runtime_participant_policy.cpp
   src/runtime_participant_stop_readiness.cpp
   src/runtime_participant_registry.cpp
+  src/runtime_scale_governor.cpp
+  src/coordinated_motion_preparation.cpp
+  src/coordinated_execution_clock.cpp
   src/runtime_collision_query_session.cpp
   src/runtime_collision_lookahead_session.cpp
   src/scene_snapshot_lease.cpp
@@ -133,7 +136,9 @@ add_library(manyforge_core
   src/logical_scene_projection.cpp
   src/interrupt_manager.cpp
   src/soft_on_path_stop_planner.cpp
+  src/affine_path_stop.cpp
   src/stop_profile_mapper.cpp
+  src/stop_timing.cpp
   src/execution_kernel.cpp
 )
 target_include_directories(manyforge_core PUBLIC
@@ -377,6 +382,11 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_stop_profile_mapper
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_stop_timing test/test_stop_timing.cpp)
+  target_link_libraries(test_stop_timing PRIVATE manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_stop_timing
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
   add_executable(test_coordinate_state
     test/test_coordinate_state.cpp)
   target_link_libraries(test_coordinate_state PRIVATE
@@ -466,6 +476,11 @@ if(BUILD_TESTING)
   target_link_libraries(test_stop_terminal_reducer PRIVATE
     manyforge_core manyforge::content_identity GTest::gtest_main)
   gtest_discover_tests(test_stop_terminal_reducer
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_runtime_scale_governor test/test_runtime_scale_governor.cpp)
+  target_link_libraries(test_runtime_scale_governor PRIVATE manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_runtime_scale_governor
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_stop_terminal_state

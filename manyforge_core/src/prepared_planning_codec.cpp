@@ -125,6 +125,42 @@ void validate_trajectory(const TrajectoryDTO& value) {
     }
     prior = waypoint.time_from_start_s;
   }
+  const auto& milestones = value.cartesian_waypoint_times_s;
+  if (!milestones.empty() &&
+      (milestones.size() < 2U || milestones.size() > 4096U || milestones.front() != 0.0 ||
+       milestones.back() != value.waypoints.back().time_from_start_s ||
+       value.waypoints.front().time_from_start_s != 0.0 ||
+       !std::is_sorted(milestones.begin(), milestones.end()) ||
+       !std::all_of(milestones.begin(), milestones.end(),
+                    [](double time) { return std::isfinite(time) && time >= 0.0; })))
+    fail("trajectory_cartesian_milestones_invalid");
+  if (value.runtime_scale_bounds) {
+    const auto& bounds = *value.runtime_scale_bounds;
+    if (!std::isfinite(bounds.max_rate_per_s) || bounds.max_rate_per_s <= 0.0 ||
+        !std::isfinite(bounds.max_rate_change_per_s2) || bounds.max_rate_change_per_s2 <= 0.0 ||
+        !std::isfinite(bounds.max_stop_path_rate) || bounds.max_stop_path_rate < 1.0 ||
+        (bounds.nominal_time_multiplier &&
+         (!std::isfinite(*bounds.nominal_time_multiplier) || *bounds.nominal_time_multiplier < 1.0)) ||
+        value.waypoints.front().time_from_start_s != 0.0) {
+      fail("trajectory_runtime_scale_bounds_invalid");
+    }
+    for (const auto& waypoint : value.waypoints) {
+      if (waypoint.velocities_rad_s.size() != width ||
+          waypoint.accelerations_rad_s2.size() != width) {
+        fail("trajectory_runtime_scale_derivatives_incomplete");
+      }
+    }
+    const auto rest = [](const auto& waypoint) {
+      const auto zero = [](double x) { return x == 0.0; };
+      return std::all_of(waypoint.velocities_rad_s.begin(), waypoint.velocities_rad_s.end(),
+                         zero) &&
+             std::all_of(waypoint.accelerations_rad_s2.begin(), waypoint.accelerations_rad_s2.end(),
+                         zero);
+    };
+    if (!rest(value.waypoints.front()) || !rest(value.waypoints.back())) {
+      fail("trajectory_runtime_scale_rest_boundary_required");
+    }
+  }
 }
 CanonicalValue trajectory_value(const TrajectoryDTO& value) {
   validate_trajectory(value);
@@ -139,13 +175,42 @@ CanonicalValue trajectory_value(const TrajectoryDTO& value) {
       row.emplace_back("accelerations_rad_s2", numbers(waypoint.accelerations_rad_s2));
     waypoints.emplace_back(std::move(row));
   }
-  return CanonicalValue(
-      CanonicalValue::Object{{"resources", ids(value.resources)},
-                             {"joint_names", strings(value.joint_names)},
-                             {"waypoints", CanonicalValue(std::move(waypoints))}});
+  CanonicalValue::Object result{{"resources", ids(value.resources)},
+                                {"joint_names", strings(value.joint_names)},
+                                {"waypoints", CanonicalValue(std::move(waypoints))}};
+  if (!value.cartesian_waypoint_times_s.empty())
+    result.emplace_back("cartesian_waypoint_times_s", numbers(value.cartesian_waypoint_times_s));
+  if (value.runtime_scale_bounds) {
+    CanonicalValue::Object bounds{
+        {"max_rate_per_s", CanonicalValue(value.runtime_scale_bounds->max_rate_per_s)},
+        {"max_rate_change_per_s2",
+         CanonicalValue(value.runtime_scale_bounds->max_rate_change_per_s2)}};
+    if (value.runtime_scale_bounds->max_stop_path_rate != 1.0)
+      bounds.emplace_back("max_stop_path_rate",
+                          CanonicalValue(value.runtime_scale_bounds->max_stop_path_rate));
+    if (value.runtime_scale_bounds->nominal_time_multiplier)
+      bounds.emplace_back("nominal_time_multiplier",
+                          CanonicalValue(*value.runtime_scale_bounds->nominal_time_multiplier));
+    result.emplace_back("runtime_scale_bounds", CanonicalValue(std::move(bounds)));
+  }
+  return CanonicalValue(std::move(result));
 }
 TrajectoryDTO get_trajectory(const CanonicalValue& value) {
-  exact(value, {"resources", "joint_names", "waypoints"});
+  const auto* scale = value.find_object_member("runtime_scale_bounds");
+  const auto* milestones = value.find_object_member("cartesian_waypoint_times_s");
+  if (scale)
+    exact(value, milestones
+                     ? std::initializer_list<std::string_view>{"resources", "joint_names",
+                                                               "waypoints", "runtime_scale_bounds",
+                                                               "cartesian_waypoint_times_s"}
+                     : std::initializer_list<std::string_view>{
+                           "resources", "joint_names", "waypoints", "runtime_scale_bounds"});
+  else
+    exact(value,
+          milestones
+              ? std::initializer_list<std::string_view>{"resources", "joint_names", "waypoints",
+                                                        "cartesian_waypoint_times_s"}
+              : std::initializer_list<std::string_view>{"resources", "joint_names", "waypoints"});
   const auto& rows = member(value, "waypoints");
   if (!rows.is_array()) fail("trajectory_waypoints_array_required");
   TrajectoryDTO result{get_ids<ResourceId>(member(value, "resources")),
@@ -172,6 +237,22 @@ TrajectoryDTO get_trajectory(const CanonicalValue& value) {
         {number(member(row, "time_from_start_s")), get_numbers(member(row, "positions_rad")),
          velocity ? get_numbers(member(row, "velocities_rad_s")) : std::vector<double>{},
          acceleration ? get_numbers(member(row, "accelerations_rad_s2")) : std::vector<double>{}});
+  }
+  if (scale) {
+    const auto* stop_rate = scale->find_object_member("max_stop_path_rate");
+    const auto* multiplier = scale->find_object_member("nominal_time_multiplier");
+    const auto& fields = object(*scale);
+    if (fields.size() != 2U + static_cast<std::size_t>(stop_rate != nullptr)
+                              + static_cast<std::size_t>(multiplier != nullptr))
+      fail("unknown_or_missing_member");
+    result.runtime_scale_bounds = TrajectoryRuntimeScaleBoundsDTO{
+        number(member(*scale, "max_rate_per_s")), number(member(*scale, "max_rate_change_per_s2")),
+        stop_rate ? number(*stop_rate) : 1.0,
+        multiplier ? std::optional(number(*multiplier)) : std::nullopt};
+  }
+  if (milestones) {
+    result.cartesian_waypoint_times_s = get_numbers(*milestones);
+    if (result.cartesian_waypoint_times_s.empty()) fail("trajectory_cartesian_milestones_invalid");
   }
   validate_trajectory(result);
   return result;

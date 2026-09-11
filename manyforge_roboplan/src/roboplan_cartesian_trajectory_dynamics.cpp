@@ -370,11 +370,11 @@ resolve_cartesian_kinematic_motion_bounds(
 
 core::Result<CartesianFrameDynamicsEnvelope>
 measure_cartesian_frame_dynamics_envelope(
-    const CartesianTrajectoryContractInput& request,
-    const core::CartesianPathDTO& path,
-    const std::shared_ptr<roboplan::Scene>& scene,
-    const roboplan::JointTrajectory& trajectory,
-    const CartesianPlanningControl& control) {
+    const CartesianTrajectoryContractInput &request,
+    const core::CartesianPathDTO *path,
+    const std::shared_ptr<roboplan::Scene> &scene,
+    const roboplan::JointTrajectory &trajectory,
+    const CartesianPlanningControl &control) {
   CartesianFrameDynamicsEnvelope envelope;
   const std::size_t joint_count = trajectory.joint_names.size();
   const std::size_t sample_count = trajectory.positions.size();
@@ -386,19 +386,14 @@ measure_cartesian_frame_dynamics_envelope(
     return core::Result<CartesianFrameDynamicsEnvelope>::Ok(
         std::move(envelope));
   }
-  const auto group_info =
-      scene->getJointGroupInfo(request.compiled_group_name);
-  const auto tip_frame_id =
-      scene->getFrameId(request.compiled_tcp_frame);
-  const auto base_frame_id =
-      scene->getFrameId(request.compiled_base_frame);
+  const auto group_info = scene->getJointGroupInfo(request.compiled_group_name);
+  const auto tip_frame_id = scene->getFrameId(request.compiled_tcp_frame);
+  const auto base_frame_id = scene->getFrameId(request.compiled_base_frame);
   if (!group_info.has_value() || !tip_frame_id.has_value() ||
       !base_frame_id.has_value() ||
       group_info->joint_names != trajectory.joint_names ||
-      group_info->q_indices.size() !=
-          static_cast<Eigen::Index>(joint_count) ||
-      group_info->v_indices.size() !=
-          static_cast<Eigen::Index>(joint_count)) {
+      group_info->q_indices.size() != static_cast<Eigen::Index>(joint_count) ||
+      group_info->v_indices.size() != static_cast<Eigen::Index>(joint_count)) {
     envelope.complete = false;
     return core::Result<CartesianFrameDynamicsEnvelope>::Ok(
         std::move(envelope));
@@ -409,33 +404,40 @@ measure_cartesian_frame_dynamics_envelope(
     return core::Result<CartesianFrameDynamicsEnvelope>::Err(
         amplification.error());
   }
-  const auto& motion_bounds = amplification.value();
+  const auto &motion_bounds = amplification.value();
 
-  double linear_speed_limit = path.max_linear_speed_mps;
+  // Non-Cartesian moves can also have a TCP linear-speed ceiling. Qualify
+  // that same continuous curve without inventing angular/acceleration caps.
+  double linear_speed_limit =
+      path ? path->max_linear_speed_mps
+           : request.speed_profile.max_tcp_linear_speed_mps.value_or(0.0);
   if (request.speed_profile.max_tcp_linear_speed_mps.has_value()) {
     linear_speed_limit = std::min(
-        linear_speed_limit,
-        *request.speed_profile.max_tcp_linear_speed_mps);
+        linear_speed_limit, *request.speed_profile.max_tcp_linear_speed_mps);
   }
   linear_speed_limit *= request.speed_profile.velocity_scale;
   const double angular_speed_limit =
-      path.max_angular_speed_rad_s * request.speed_profile.velocity_scale;
+      path
+          ? path->max_angular_speed_rad_s * request.speed_profile.velocity_scale
+          : 0.0;
   const double linear_acceleration_limit =
-      path.max_linear_acceleration_mps2 *
-      request.speed_profile.acceleration_scale;
+      path ? path->max_linear_acceleration_mps2 *
+                 request.speed_profile.acceleration_scale
+           : 0.0;
   const double angular_acceleration_limit =
-      path.max_angular_acceleration_rad_s2 *
-      request.speed_profile.acceleration_scale;
+      path ? path->max_angular_acceleration_rad_s2 *
+                 request.speed_profile.acceleration_scale
+           : 0.0;
   if (!finite_positive(linear_speed_limit) ||
-      !finite_positive(angular_speed_limit) ||
-      !finite_positive(linear_acceleration_limit) ||
-      !finite_positive(angular_acceleration_limit)) {
+      (path && (!finite_positive(angular_speed_limit) ||
+                !finite_positive(linear_acceleration_limit) ||
+                !finite_positive(angular_acceleration_limit)))) {
     envelope.complete = false;
     return core::Result<CartesianFrameDynamicsEnvelope>::Ok(
         std::move(envelope));
   }
 
-  const auto& model = scene->getModel();
+  const auto &model = scene->getModel();
   pinocchio::Data data(model);
   Eigen::VectorXd group_positions(static_cast<Eigen::Index>(joint_count));
   Eigen::VectorXd group_velocities(static_cast<Eigen::Index>(joint_count));
@@ -770,23 +772,23 @@ measure_cartesian_frame_dynamics_envelope(
           linear_speed_upper <=
               observed_peak.linear_speed_mps +
                   kResidualBudgetFraction * linear_speed_limit &&
-          angular_speed_upper <=
-              observed_peak.angular_speed_rad_s +
-                  kResidualBudgetFraction * angular_speed_limit &&
-          linear_acceleration_upper <=
-              observed_peak.linear_acceleration_mps2 +
-                  kResidualBudgetFraction * linear_acceleration_limit &&
-          angular_acceleration_upper <=
-              observed_peak.angular_acceleration_rad_s2 +
-                  kResidualBudgetFraction * angular_acceleration_limit;
+          (!path ||
+           (angular_speed_upper <=
+                observed_peak.angular_speed_rad_s +
+                    kResidualBudgetFraction * angular_speed_limit &&
+            linear_acceleration_upper <=
+                observed_peak.linear_acceleration_mps2 +
+                    kResidualBudgetFraction * linear_acceleration_limit &&
+            angular_acceleration_upper <=
+                observed_peak.angular_acceleration_rad_s2 +
+                    kResidualBudgetFraction * angular_acceleration_limit));
       if (!sufficiently_resolved) {
         const double midpoint =
             interval.lower + (interval.upper - interval.lower) * 0.5;
         if (interval.depth >= kMaxDynamicsSubdivisionDepth ||
             midpoint <= interval.lower || midpoint >= interval.upper) {
           return core::Result<CartesianFrameDynamicsEnvelope>::Err(
-              dynamics_resource_error(segment_index,
-                                      envelope.interval_checks));
+              dynamics_resource_error(segment_index, envelope.interval_checks));
         }
         const auto midpoint_sample = evaluate_sample(midpoint);
         if (!midpoint_sample.has_value()) {
@@ -800,9 +802,8 @@ measure_cartesian_frame_dynamics_envelope(
               std::move(envelope));
         }
         record_observed(*midpoint_sample);
-        pending.push_back(Interval{midpoint, interval.upper,
-                                   *midpoint_sample, interval.upper_sample,
-                                   interval.depth + 1});
+        pending.push_back(Interval{midpoint, interval.upper, *midpoint_sample,
+                                   interval.upper_sample, interval.depth + 1});
         pending.push_back(Interval{interval.lower, midpoint,
                                    interval.lower_sample, *midpoint_sample,
                                    interval.depth + 1});
@@ -812,21 +813,22 @@ measure_cartesian_frame_dynamics_envelope(
       envelope.linear_speed_ratio = std::max(
           envelope.linear_speed_ratio,
           static_cast<double>(linear_speed_upper / linear_speed_limit));
+      if (!path)
+        continue;
       envelope.angular_speed_ratio = std::max(
           envelope.angular_speed_ratio,
           static_cast<double>(angular_speed_upper / angular_speed_limit));
-      envelope.linear_acceleration_ratio = std::max(
-          envelope.linear_acceleration_ratio,
-          static_cast<double>(linear_acceleration_upper /
-                              linear_acceleration_limit));
-      envelope.angular_acceleration_ratio = std::max(
-          envelope.angular_acceleration_ratio,
-          static_cast<double>(angular_acceleration_upper /
-                              angular_acceleration_limit));
+      envelope.linear_acceleration_ratio =
+          std::max(envelope.linear_acceleration_ratio,
+                   static_cast<double>(linear_acceleration_upper /
+                                       linear_acceleration_limit));
+      envelope.angular_acceleration_ratio =
+          std::max(envelope.angular_acceleration_ratio,
+                   static_cast<double>(angular_acceleration_upper /
+                                       angular_acceleration_limit));
     }
   }
-  return core::Result<CartesianFrameDynamicsEnvelope>::Ok(
-      std::move(envelope));
+  return core::Result<CartesianFrameDynamicsEnvelope>::Ok(std::move(envelope));
 }
 
-}  // namespace manyforge::roboplan_backend::detail
+} // namespace manyforge::roboplan_backend::detail

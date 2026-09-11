@@ -168,6 +168,27 @@ build-owned native runtime profile only when the graph selects that profile.
 It does not qualify catalog referents, compile retained products, or admit a
 deployment to runtime.
 
+For pre-explicit-jerk controlled-Stop contracts, use the same offline tool with
+an explicit choice after reviewing the machine's operating limits:
+
+```bash
+manyforge_deployment_revision --print --input example.deployment.yaml --migrate-controlled-stop-jerk on
+manyforge_deployment_revision --update --input example.deployment.yaml --migrate-controlled-stop-jerk on
+manyforge_deployment_revision --check --input example.deployment.yaml
+```
+
+Choose `on` to enforce controlled-Stop jerk, or `off` to disable that shaping.
+The flag fills only missing choices and upgrades the recognized pre-choice
+contract schema. Existing explicit choices, numeric limits, natural-completion
+and fallback settings are preserved. Unknown schema revisions and invalid
+profiles reject. `--print` computes the resulting revision without writing;
+`--update` explicitly replaces the source after independent verification.
+Back up or version the file before updating. Review the resulting diff, then
+open/Save/Apply through the normal workflow. This does not update a running
+deployment, waive equipment limits, enable ordinary-motion jerk, or qualify
+the artifact's external catalog referents. There is no implicit migration on
+normal load, compilation, or runtime startup.
+
 The one human/LLM authoring input for the seven N6 deployments is
 `resources/maintained/maintained_deployment_sources.v1.json`. Its strict check
 pins the three shared model-family sources and their exact frame, group, joint,

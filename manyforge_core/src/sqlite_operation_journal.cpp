@@ -220,6 +220,11 @@ CREATE TABLE cell_admission_claims (
   offer_transaction_id TEXT,
   offer_digest TEXT,
   parent_program_cycle_claim_generation INTEGER,
+  program_node_runner_owner_epoch TEXT,
+  program_node_run_id TEXT,
+  program_node_instance_id TEXT,
+  program_node_attempt_id TEXT,
+  program_node_owner_api TEXT,
   release_owner_role TEXT,
   release_owner_epoch TEXT,
   release_owner_transaction_id TEXT,
@@ -979,7 +984,7 @@ void AddExecutionScope(CanonicalValue::Object& row,
     AddExecutionScope(row, participant.execution_scope);
     participants.emplace_back(std::move(row));
   }
-  return CanonicalValue(CanonicalValue::Object{
+  CanonicalValue::Object result{
       {"coordination_policy",
        CanonicalValue(std::string(CoordinationName(intent.coordination_policy)))},
       {"expected_graph_revision", CanonicalValue(intent.expected_graph_revision.value())},
@@ -992,7 +997,21 @@ void AddExecutionScope(CanonicalValue::Object& row,
       {"program_run_id", CanonicalValue(intent.program_run_id.value())},
       {"request_attribution", RequestAttributionValue(intent.attribution)},
       {"request_context", RequestContextValue(intent.request_context)},
-  });
+  };
+  if (intent.manual_handover) {
+    const auto& context = *intent.manual_handover;
+    result.emplace_back(
+        "manual_handover",
+        CanonicalValue(CanonicalValue::Object{
+            {"claim_generation", Number(context.claim_generation.value(), "manual parent claim")},
+            {"program_run_id", CanonicalValue(context.program_run_id.value())},
+            {"program_runner_owner_epoch",
+             CanonicalValue(context.program_runner_owner_epoch.value())},
+            {"selection_revision", Number(context.selection_revision, "manual hold revision")}}));
+    std::sort(result.begin(), result.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+  }
+  return CanonicalValue(std::move(result));
 }
 
 [[nodiscard]] CanonicalValue OperationAcceptedValue(const OperationAcceptedDTO& accepted) {
@@ -2547,7 +2566,9 @@ void StoreOperationSnapshotMonotonic(sqlite3* database, const RequestOwnerEpoch&
       "offering_owner_epoch,offer_transaction_id,offer_digest,"
       "parent_program_cycle_claim_generation,release_owner_role,release_owner_epoch,"
       "release_owner_transaction_id,release_request_id,release_request_payload_digest,"
-      "release_acquired_admission_generation,release_settlement_kind,release_evidence_digest "
+      "release_acquired_admission_generation,release_settlement_kind,release_evidence_digest,"
+      "program_node_runner_owner_epoch,program_node_run_id,program_node_instance_id,"
+      "program_node_attempt_id,program_node_owner_api "
       "FROM cell_admission_claims WHERE claim_generation=?");
   row.Bind(1, static_cast<std::int64_t>(generation));
   Require(row.Step(), "operation_journal_corrupt", "cell-admission claim row is missing");
@@ -2575,6 +2596,20 @@ void StoreOperationSnapshotMonotonic(sqlite3* database, const RequestOwnerEpoch&
           PositiveIdentifier(row.Integer(15), "parent cell-admission claim generation"));
     }
     intent.intervention_evidence = std::move(evidence);
+  }
+  const bool program_node = !row.IsNull(24);
+  for (int index = 25; index <= 28; ++index) {
+    Require(row.IsNull(index) != program_node, "operation_journal_corrupt",
+            "incomplete Program node claim attribution");
+  }
+  if (program_node) {
+    Require(!row.IsNull(15), "operation_journal_corrupt", "Program node claim has no parent");
+    intent.program_node_evidence = ProgramNodeAdmissionEvidenceDTO{
+        RequestOwnerEpoch(row.Text(24)), ProgramRunId(row.Text(25)),
+        CellAdmissionClaimGeneration(PositiveIdentifier(row.Integer(15), "parent claim generation")),
+        row.Text(26), row.Text(27), row.Text(28)};
+  } else if (!intent.intervention_evidence.has_value()) {
+    Require(row.IsNull(15), "operation_journal_corrupt", "orphan parent claim attribution");
   }
   Statement resources(database,
                       "SELECT resource_id FROM cell_admission_claim_resources "
@@ -2880,7 +2915,7 @@ class SqliteOperationJournal::Impl final {
     // Validate before adding the private capture order. Legacy canonical
     // payload bytes, sequence numbers and hashes are never rewritten.
     const auto legacy_version = ScalarInteger(database_, "PRAGMA user_version");
-    if (legacy_version == 9 || legacy_version == 10 || legacy_version == 11) {
+    if (legacy_version >= 9 && legacy_version <= 12) {
       {
         Statement legacy(database_,
                          "SELECT schema_id,schema_version,cell_id,history_capacity FROM "
@@ -2899,10 +2934,17 @@ class SqliteOperationJournal::Impl final {
              "ALTER TABLE operation_snapshots ADD COLUMN journal_capture_order "
              "INTEGER NOT NULL DEFAULT 0 CHECK(journal_capture_order >= 0)");
       }
-      Exec(database_,
-           "ALTER TABLE operation_participants ADD COLUMN execution_node_instance_id TEXT");
-      Exec(database_,
-           "ALTER TABLE operation_participants ADD COLUMN execution_node_attempt_id TEXT");
+      if (legacy_version < 12) {
+        Exec(database_,
+             "ALTER TABLE operation_participants ADD COLUMN execution_node_instance_id TEXT");
+        Exec(database_,
+             "ALTER TABLE operation_participants ADD COLUMN execution_node_attempt_id TEXT");
+      }
+      for (const auto column : {"program_node_runner_owner_epoch", "program_node_run_id",
+                                "program_node_instance_id", "program_node_attempt_id",
+                                "program_node_owner_api"}) {
+        Exec(database_, "ALTER TABLE cell_admission_claims ADD COLUMN " + std::string(column) + " TEXT");
+      }
       Statement snapshots(database_,
                           "SELECT operation_id,journal_capture_order FROM operation_snapshots");
       while (snapshots.Step()) {
@@ -4186,10 +4228,11 @@ std::uint64_t SqliteOperationJournal::Impl::CloseOwnerEpoch(const RequestOwnerEp
   Statement claim_blockers(
       database_,
       "SELECT COUNT(*) FROM cell_admission_claims WHERE release_owner_role IS NULL "
-      "AND reconciled_sequence IS NULL");
+      "AND reconciled_sequence IS NULL "
+      "AND claim_kind NOT IN ('authoring_mutation','manager_apply')");
   Require(claim_blockers.Step() && claim_blockers.Integer(0) == 0 && !claim_blockers.Step(),
           "operation_journal_owner_close_blocked",
-          "owner close is blocked by unresolved cell-admission claims");
+          "owner close is blocked by unresolved execution/effect claims");
   const auto payload = content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
       {"closed_at_ns", Timestamp(closed_at_ns, "owner close timestamp")},
       {"owner_epoch", CanonicalValue(owner_epoch.value())},
@@ -4429,8 +4472,9 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimAcquired(
       "owner_transaction_id,request_id,request_payload_digest,expected_admission_generation,"
       "acquired_admission_generation,accepted_at_ns,draft_program_revision,"
       "applied_program_revision,offering_owner_role,offering_owner_epoch,offer_transaction_id,"
-      "offer_digest,parent_program_cycle_claim_generation) "
-      "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+      "offer_digest,parent_program_cycle_claim_generation,program_node_runner_owner_epoch,"
+      "program_node_run_id,program_node_instance_id,program_node_attempt_id,program_node_owner_api) "
+      "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
   insert.Bind(1, static_cast<std::int64_t>(claim.claim_generation.value()));
   insert.Bind(2, owner_epoch.value());
   insert.Bind(3, to_string(claim.intent.claim_kind));
@@ -4463,6 +4507,17 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimAcquired(
     }
   } else {
     for (int index = 14; index <= 18; ++index) insert.BindNull(index);
+  }
+  if (claim.intent.program_node_evidence.has_value()) {
+    const auto& evidence = *claim.intent.program_node_evidence;
+    insert.Bind(18, static_cast<std::int64_t>(evidence.parent_program_cycle_claim_generation.value()));
+    insert.Bind(19, evidence.program_runner_owner_epoch.value());
+    insert.Bind(20, evidence.program_run_id.value());
+    insert.Bind(21, evidence.node_instance_id);
+    insert.Bind(22, evidence.node_attempt_id);
+    insert.Bind(23, evidence.owner_api);
+  } else {
+    for (int index = 19; index <= 23; ++index) insert.BindNull(index);
   }
   Require(!insert.Step(), "operation_journal_corrupt",
           "cell-admission claim insert returned an unexpected row");

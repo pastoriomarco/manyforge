@@ -1,4 +1,5 @@
--- ManyForge O1.5 typed named-Apply journal, version 9.
+-- ManyForge O1.5 typed named-Apply journal, version 10.
+-- Runtime staged-ready rows retain exact managed predecessor withdrawal.
 --
 -- This schema stores immutable named-Apply intents, their exact generation-
 -- bound whole-Apply affected scopes, configuration-fence attempts, and
@@ -12,12 +13,12 @@
 -- It is deliberately not a mutable phase/event journal.
 
 PRAGMA application_id = 1296450128;
-PRAGMA user_version = 9;
+PRAGMA user_version = 10;
 
 CREATE TABLE IF NOT EXISTS apply_journal_metadata (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     schema_id TEXT NOT NULL,
-    schema_version INTEGER NOT NULL CHECK (schema_version = 9),
+    schema_version INTEGER NOT NULL CHECK (schema_version = 10),
     schema_artifact_digest TEXT NOT NULL,
     cell_id TEXT NOT NULL,
     maximum_apply_intents INTEGER NOT NULL

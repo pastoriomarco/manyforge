@@ -18,6 +18,9 @@ struct RuntimeParticipantStopReadinessDTO final {
   ComponentLifecycleGeneration component_lifecycle_generation;
   ControllerLifecycleExpectedDomainDTO expected_controller_domain;
   ResolvedStopBasePlanDTO resolved_stop_base_plan;
+  /// Exact saved timeout minus latency and settling. Absent retains the
+  /// qualified policy defaults. Cold authority only, not another deadline.
+  std::optional<std::int64_t> maximum_controlled_stop_duration_ns{std::nullopt};
 
   friend bool operator==(const RuntimeParticipantStopReadinessDTO&,
                          const RuntimeParticipantStopReadinessDTO&) = default;

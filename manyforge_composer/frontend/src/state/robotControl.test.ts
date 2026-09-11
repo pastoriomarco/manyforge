@@ -681,7 +681,7 @@ describe('addressed Robot Control state', () => {
     );
 
     const observed = robotControlReducer(ready, {
-      type: 'program_status_refreshed',
+      type: 'status_refreshed',
       status,
     });
 

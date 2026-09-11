@@ -116,6 +116,93 @@ TEST(ManagerCellAdmissionReadinessReducer,
       after, core::RuntimeEpoch("runner-successor")));
 }
 
+TEST(ManagerCellAdmissionReadinessReducer,
+     IdleToCapturedRunDoesNotInventAnAdmissionOutage) {
+  const auto before = ReduceManagerCellAdmissionReadiness(
+      {true, IdleCycleStatus(), true, 3U, 3U, true, true, 0U, 0U, 0U});
+  auto after = before;
+  auto &cycle = *after.program_cycle_status;
+  cycle.state = core::ProgramCycleStateDTO::kStarting;
+  cycle.program_run_id = core::ProgramRunId("run");
+  EXPECT_TRUE(IsSameProgramAdmissionProgress(before, after));
+  cycle.cycle_claim_generation = core::CellAdmissionClaimGeneration(9U);
+  EXPECT_TRUE(IsSameProgramAdmissionProgress(before, after));
+  cycle.state = core::ProgramCycleStateDTO::kRunning;
+  EXPECT_TRUE(IsSameProgramAdmissionProgress(before, after));
+  EXPECT_FALSE(IsSameProgramAdmissionProgress(after, before));
+  for (const auto state : {core::ProgramCycleStateDTO::kStopping,
+                           core::ProgramCycleStateDTO::kResetting,
+                           core::ProgramCycleStateDTO::kTerminalAwaitingReset,
+                           core::ProgramCycleStateDTO::kRecoveryRequired}) {
+    auto changed = after;
+    changed.program_cycle_status->state = state;
+    EXPECT_FALSE(IsSameProgramAdmissionProgress(before, changed));
+  }
+  auto changed = after;
+  changed.program_cycle_status->program_runner_owner_epoch =
+      core::RequestOwnerEpoch("foreign");
+  EXPECT_FALSE(IsSameProgramAdmissionProgress(before, changed));
+  changed = after;
+  ++changed.program_cycle_status->cycle_generation;
+  EXPECT_FALSE(IsSameProgramAdmissionProgress(before, changed));
+  changed = after;
+  changed.blocking_fault_count = 1U;
+  EXPECT_FALSE(IsSameProgramAdmissionProgress(before, changed));
+  changed = after;
+  changed.program_cycle_status_current = false;
+  EXPECT_FALSE(IsSameProgramAdmissionProgress(before, changed));
+}
+
+TEST(ManagerCellAdmissionReadinessReducer,
+     StartingToRunningDoesNotInventAnAdmissionOutage) {
+  auto starting = IdleCycleStatus();
+  starting.state = core::ProgramCycleStateDTO::kStarting;
+  starting.program_run_id = core::ProgramRunId("run");
+  auto before = ReduceManagerCellAdmissionReadiness(
+      {true, starting, true, 3U, 3U, true, true, 0U, 0U, 0U});
+  auto after = before;
+  after.program_cycle_status->state = core::ProgramCycleStateDTO::kRunning;
+  after.program_cycle_status->cycle_claim_generation =
+      core::CellAdmissionClaimGeneration(9U);
+  EXPECT_TRUE(IsSameProgramAdmissionProgress(before, after));
+  auto claimed_starting = after;
+  claimed_starting.program_cycle_status->state =
+      core::ProgramCycleStateDTO::kStarting;
+  EXPECT_TRUE(IsSameProgramAdmissionProgress(before, claimed_starting));
+  EXPECT_TRUE(IsSameProgramAdmissionProgress(claimed_starting, after));
+  auto replaced_claim = claimed_starting;
+  replaced_claim.program_cycle_status->cycle_claim_generation =
+      core::CellAdmissionClaimGeneration(10U);
+  EXPECT_FALSE(
+      IsSameProgramAdmissionProgress(claimed_starting, replaced_claim));
+  for (const auto state :
+       {core::ProgramCycleStateDTO::kStopping,
+        core::ProgramCycleStateDTO::kResetting,
+        core::ProgramCycleStateDTO::kTerminalAwaitingReset}) {
+    auto changed = after;
+    changed.program_cycle_status->state = state;
+    EXPECT_FALSE(IsSameProgramAdmissionProgress(before, changed));
+  }
+  auto changed = after;
+  changed.program_cycle_status->program_runner_owner_epoch =
+      core::RequestOwnerEpoch("other");
+  EXPECT_FALSE(IsSameProgramAdmissionProgress(before, changed));
+  changed = after;
+  changed.program_cycle_status->program_run_id = core::ProgramRunId("other");
+  EXPECT_FALSE(IsSameProgramAdmissionProgress(before, changed));
+  changed = after;
+  ++changed.program_cycle_status->cycle_generation;
+  EXPECT_FALSE(IsSameProgramAdmissionProgress(before, changed));
+  changed = after;
+  changed.blocking_fault_count = 1;
+  EXPECT_FALSE(IsSameProgramAdmissionProgress(before, changed));
+  changed = after;
+  changed.deployment_status_current = false;
+  EXPECT_FALSE(IsSameProgramAdmissionProgress(before, changed));
+  before.program_cycle_status_current = false;
+  EXPECT_FALSE(IsSameProgramAdmissionProgress(before, after));
+}
+
 constexpr std::string_view kDeploymentRevision =
     "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 

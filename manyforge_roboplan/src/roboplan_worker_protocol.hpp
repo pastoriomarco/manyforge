@@ -10,7 +10,7 @@
 namespace manyforge::roboplan_backend::worker_protocol {
 
 inline constexpr std::uint32_t kFrameMagic = 0x4d465750U;  // MFWP
-inline constexpr std::uint16_t kProtocolVersion = 1U;
+inline constexpr std::uint16_t kProtocolVersion = 5U;
 inline constexpr int kProtocolDescriptor = 3;
 
 enum class MessageType : std::uint16_t {

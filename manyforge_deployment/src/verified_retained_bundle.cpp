@@ -15,9 +15,11 @@
 #include <variant>
 
 #include "compiler_semantic_limits_internal.hpp"
+#include "composed_model_symbol_role_map_internal.hpp"
 #include "content_identity_internal.hpp"
 #include "control_domain_control_internal.hpp"
 #include "deployment_catalog_codec_internal.hpp"
+#include "manyforge_core/runtime_contract_manifest_codec.hpp"
 #include "manyforge_core/types/command_schema.hpp"
 #include "manyforge_deployment/artifact_codec.hpp"
 #include "manyforge_deployment/assistant_settings_codec.hpp"
@@ -25,15 +27,13 @@
 #include "manyforge_deployment/closed_schema.hpp"
 #include "manyforge_deployment/content_identity.hpp"
 #include "manyforge_deployment/deployment_applicability_codec.hpp"
-#include "manyforge_core/runtime_contract_manifest_codec.hpp"
-#include "manyforge_deployment/runtime_profile_codec.hpp"
 #include "manyforge_deployment/runtime_contract_registry.hpp"
+#include "manyforge_deployment/runtime_profile_codec.hpp"
 #include "manyforge_deployment/structural_model_preparation.hpp"
-#include "composed_model_symbol_role_map_internal.hpp"
 #include "native_execution_runtime_unit_internal.hpp"
-#include "ros2_control_execution_runtime_unit_internal.hpp"
 #include "planning_resource_map_internal.hpp"
 #include "reference_runtime_unit_internal.hpp"
+#include "ros2_control_execution_runtime_unit_internal.hpp"
 #include "verified_retained_bundle_internal.hpp"
 
 #include <manyforge_core/types/stop_control.hpp>
@@ -47,8 +47,7 @@ constexpr std::string_view kFlattenedModelContractId =
     "manyforge.flattened_model";
 constexpr std::string_view kFlattenedModelPlacement =
     "cell_planning_collision_model";
-constexpr std::string_view kViewerModelContractId =
-    "manyforge.viewer_model";
+constexpr std::string_view kViewerModelContractId = "manyforge.viewer_model";
 constexpr std::string_view kViewerModelPlacement = "cell_viewer_model";
 constexpr std::string_view kControlDomainControlPlacement = "control_domain";
 constexpr std::string_view kReferenceRuntimePlacement = "runtime_unit";
@@ -117,8 +116,7 @@ is_ascii_alphanumeric(unsigned char byte) noexcept {
 }
 
 [[nodiscard]] bool is_portable_identity(std::string_view value) noexcept {
-  if (value.empty() ||
-      value.size() > detail::kMaximumPortableIdentityBytes ||
+  if (value.empty() || value.size() > detail::kMaximumPortableIdentityBytes ||
       !is_ascii_alphanumeric(static_cast<unsigned char>(value.front()))) {
     return false;
   }
@@ -131,44 +129,43 @@ is_ascii_alphanumeric(unsigned char byte) noexcept {
 [[nodiscard]] bool is_lower_hex(std::string_view value) noexcept {
   return !value.empty() &&
          std::all_of(value.begin(), value.end(), [](unsigned char byte) {
-           return (byte >= '0' && byte <= '9') ||
-                  (byte >= 'a' && byte <= 'f');
+           return (byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f');
          });
 }
 
-[[nodiscard]] const CanonicalValue::Object&
-require_object(const CanonicalValue& value, std::string_view field) {
-  const auto* object = std::get_if<CanonicalValue::Object>(&value.storage());
+[[nodiscard]] const CanonicalValue::Object &
+require_object(const CanonicalValue &value, std::string_view field) {
+  const auto *object = std::get_if<CanonicalValue::Object>(&value.storage());
   if (object == nullptr) {
     detail::fail_retained_bundle(std::string(field) + " must be an object");
   }
   return *object;
 }
 
-[[nodiscard]] const CanonicalValue::Array&
-require_array(const CanonicalValue& value, std::string_view field) {
-  const auto* array = std::get_if<CanonicalValue::Array>(&value.storage());
+[[nodiscard]] const CanonicalValue::Array &
+require_array(const CanonicalValue &value, std::string_view field) {
+  const auto *array = std::get_if<CanonicalValue::Array>(&value.storage());
   if (array == nullptr) {
     detail::fail_retained_bundle(std::string(field) + " must be an array");
   }
   return *array;
 }
 
-[[nodiscard]] const std::string&
-require_string(const CanonicalValue& value, std::string_view field) {
-  const auto* text = std::get_if<std::string>(&value.storage());
+[[nodiscard]] const std::string &require_string(const CanonicalValue &value,
+                                                std::string_view field) {
+  const auto *text = std::get_if<std::string>(&value.storage());
   if (text == nullptr) {
     detail::fail_retained_bundle(std::string(field) + " must be a string");
   }
   return *text;
 }
 
-[[nodiscard]] const CanonicalValue&
-require_member(const CanonicalValue::Object& object, std::string_view name,
+[[nodiscard]] const CanonicalValue &
+require_member(const CanonicalValue::Object &object, std::string_view name,
                std::string_view field) {
-  const auto found = std::find_if(
-      object.begin(), object.end(),
-      [name](const auto& member) { return member.first == name; });
+  const auto found =
+      std::find_if(object.begin(), object.end(),
+                   [name](const auto &member) { return member.first == name; });
   if (found == object.end()) {
     detail::fail_retained_bundle(std::string(field) +
                                  " is missing required member " +
@@ -177,15 +174,14 @@ require_member(const CanonicalValue::Object& object, std::string_view name,
   return found->second;
 }
 
-void require_exact_fields(
-    const CanonicalValue::Object& object,
-    std::initializer_list<std::string_view> expected,
-    std::string_view field) {
+void require_exact_fields(const CanonicalValue::Object &object,
+                          std::initializer_list<std::string_view> expected,
+                          std::string_view field) {
   if (object.size() != expected.size()) {
     detail::fail_retained_bundle(std::string(field) +
                                  " has an incorrect closed field count");
   }
-  for (const auto& [name, unused] : object) {
+  for (const auto &[name, unused] : object) {
     (void)unused;
     if (std::find(expected.begin(), expected.end(), name) == expected.end()) {
       detail::fail_retained_bundle(std::string(field) +
@@ -198,11 +194,10 @@ void require_exact_fields(
 }
 
 void require_required_and_optional_fields(
-    const CanonicalValue::Object& object,
+    const CanonicalValue::Object &object,
     std::initializer_list<std::string_view> required,
-    std::initializer_list<std::string_view> optional,
-    std::string_view field) {
-  for (const auto& [name, unused] : object) {
+    std::initializer_list<std::string_view> optional, std::string_view field) {
+  for (const auto &[name, unused] : object) {
     (void)unused;
     if (std::find(required.begin(), required.end(), name) == required.end() &&
         std::find(optional.begin(), optional.end(), name) == optional.end()) {
@@ -215,27 +210,25 @@ void require_required_and_optional_fields(
   }
 }
 
-[[nodiscard]] std::uint64_t require_i_json_size(const CanonicalValue& value,
+[[nodiscard]] std::uint64_t require_i_json_size(const CanonicalValue &value,
                                                 std::string_view field) {
-  const auto* number = std::get_if<double>(&value.storage());
+  const auto *number = std::get_if<double>(&value.storage());
   if (number == nullptr || !std::isfinite(*number) || *number < 0.0 ||
       std::trunc(*number) != *number ||
       *number > static_cast<double>(detail::kMaximumIJsonInteger)) {
-    detail::fail_retained_bundle(
-        std::string(field) +
-        " must be a non-negative I-JSON safe integer");
+    detail::fail_retained_bundle(std::string(field) +
+                                 " must be a non-negative I-JSON safe integer");
   }
   return static_cast<std::uint64_t>(*number);
 }
 
 [[nodiscard]] CanonicalValue artifact_role_projection(
-    const detail::QualifiedRetainedProductArtifactRole& role) {
+    const detail::QualifiedRetainedProductArtifactRole &role) {
   return CanonicalValue(CanonicalValue::Object{
       {"artifact_role_id", CanonicalValue(std::string(role.artifact_role_id))},
       {"media_type", CanonicalValue(std::string(role.media_type))},
-      {"cardinality",
-       CanonicalValue(role.required ? "required_exactly_one"
-                                    : "optional_at_most_one")},
+      {"cardinality", CanonicalValue(role.required ? "required_exactly_one"
+                                                   : "optional_at_most_one")},
   });
 }
 
@@ -247,14 +240,13 @@ void require_required_and_optional_fields(
     std::string_view revision) {
   CanonicalValue::Array roles;
   roles.reserve(artifact_roles.size());
-  for (const auto& role : artifact_roles) {
+  for (const auto &role : artifact_roles) {
     roles.push_back(artifact_role_projection(role));
   }
   return CanonicalValue(CanonicalValue::Object{
       {"api_version",
        CanonicalValue(std::string(core::kProductContractApiVersion))},
-      {"product_contract_id",
-       CanonicalValue(std::string(contract_id))},
+      {"product_contract_id", CanonicalValue(std::string(contract_id))},
       {"product_contract_revision", CanonicalValue(std::string(revision))},
       {"product_kind",
        CanonicalValue(std::string(core::to_string(product_kind)))},
@@ -268,7 +260,7 @@ struct QualifiedProductContractState final {
   CanonicalValue descriptor;
 };
 
-[[nodiscard]] const QualifiedProductContractState&
+[[nodiscard]] const QualifiedProductContractState &
 qualified_product_contract_state(
     std::string_view contract_id, core::RetainedProductKind product_kind,
     std::string_view placement,
@@ -351,7 +343,8 @@ qualified_product_contract_state(
   if (contract_id == detail::kComposedModelSymbolRoleMapContractId &&
       product_kind == core::RetainedProductKind::kSymbolRoleMap &&
       placement == kSymbolRoleMapPlacement &&
-      artifact_roles.data() == kComposedModelSymbolRoleMapArtifactRoles.data() &&
+      artifact_roles.data() ==
+          kComposedModelSymbolRoleMapArtifactRoles.data() &&
       artifact_roles.size() ==
           kComposedModelSymbolRoleMapArtifactRoles.size()) {
     static const QualifiedProductContractState state = build_state();
@@ -360,8 +353,8 @@ qualified_product_contract_state(
   throw std::logic_error("unknown built-in product contract state");
 }
 
-[[nodiscard]] CanonicalValue retained_artifact_projection(
-    const core::RetainedArtifactRefDTO& artifact) {
+[[nodiscard]] CanonicalValue
+retained_artifact_projection(const core::RetainedArtifactRefDTO &artifact) {
   return CanonicalValue(CanonicalValue::Object{
       {"artifact_role_id", CanonicalValue(artifact.artifact_role_id.value())},
       {"media_type", CanonicalValue(artifact.media_type)},
@@ -372,9 +365,10 @@ qualified_product_contract_state(
   });
 }
 
-[[nodiscard]] std::string domain_separated_canonical_digest(
-    std::string_view domain, std::string_view schema_tag,
-    const CanonicalValue& value) {
+[[nodiscard]] std::string
+domain_separated_canonical_digest(std::string_view domain,
+                                  std::string_view schema_tag,
+                                  const CanonicalValue &value) {
   std::string preimage;
   const std::string payload = canonical_json(value);
   preimage.reserve(kContentIdentityPrefix.size() + domain.size() +
@@ -389,60 +383,58 @@ qualified_product_contract_state(
   return sha256_digest(preimage);
 }
 
-[[nodiscard]] core::RetainedProductDTO parse_retained_product(
-    const CanonicalValue& value, std::string_view field,
-    core::RetainedProductKind expected_kind) {
-  const auto& object = require_object(value, field);
+[[nodiscard]] core::RetainedProductDTO
+parse_retained_product(const CanonicalValue &value, std::string_view field,
+                       core::RetainedProductKind expected_kind) {
+  const auto &object = require_object(value, field);
   require_exact_fields(object,
-                       {"product_id", "product_kind",
-                        "product_contract_id", "product_contract_revision",
-                        "artifact_refs"},
+                       {"product_id", "product_kind", "product_contract_id",
+                        "product_contract_revision", "artifact_refs"},
                        field);
 
-  const std::string& product_id =
+  const std::string &product_id =
       require_string(require_member(object, "product_id", field),
                      std::string(field) + ".product_id");
-  const std::string& product_kind =
+  const std::string &product_kind =
       require_string(require_member(object, "product_kind", field),
                      std::string(field) + ".product_kind");
   if (product_kind != core::to_string(expected_kind)) {
-    detail::fail_retained_bundle(
-        std::string(field) + " has an invalid product_kind");
+    detail::fail_retained_bundle(std::string(field) +
+                                 " has an invalid product_kind");
   }
-  const std::string& contract_id = require_string(
-      require_member(object, "product_contract_id", field),
-      std::string(field) + ".product_contract_id");
-  const std::string& contract_revision = require_string(
-      require_member(object, "product_contract_revision", field),
-      std::string(field) + ".product_contract_revision");
+  const std::string &contract_id =
+      require_string(require_member(object, "product_contract_id", field),
+                     std::string(field) + ".product_contract_id");
+  const std::string &contract_revision =
+      require_string(require_member(object, "product_contract_revision", field),
+                     std::string(field) + ".product_contract_revision");
   detail::require_retained_digest(contract_revision,
                                   "product_contract_revision");
 
   std::vector<core::RetainedArtifactRefDTO> artifacts;
-  const auto& artifact_values =
+  const auto &artifact_values =
       require_array(require_member(object, "artifact_refs", field),
                     std::string(field) + ".artifact_refs");
   artifacts.reserve(artifact_values.size());
   for (std::size_t index = 0U; index < artifact_values.size(); ++index) {
-    const std::string path = std::string(field) + ".artifact_refs[" +
-                             std::to_string(index) + "]";
-    const auto& artifact = require_object(artifact_values[index], path);
-    require_exact_fields(
-        artifact,
-        {"artifact_role_id", "media_type", "byte_size", "content_digest",
-         "content_addressed_store_key"},
-        path);
+    const std::string path =
+        std::string(field) + ".artifact_refs[" + std::to_string(index) + "]";
+    const auto &artifact = require_object(artifact_values[index], path);
+    require_exact_fields(artifact,
+                         {"artifact_role_id", "media_type", "byte_size",
+                          "content_digest", "content_addressed_store_key"},
+                         path);
     artifacts.push_back(core::RetainedArtifactRefDTO{
-        core::ArtifactRoleId(require_string(
-            require_member(artifact, "artifact_role_id", path),
-            path + ".artifact_role_id")),
+        core::ArtifactRoleId(
+            require_string(require_member(artifact, "artifact_role_id", path),
+                           path + ".artifact_role_id")),
         require_string(require_member(artifact, "media_type", path),
                        path + ".media_type"),
         require_i_json_size(require_member(artifact, "byte_size", path),
                             path + ".byte_size"),
-        core::ContentDigest(require_string(
-            require_member(artifact, "content_digest", path),
-            path + ".content_digest")),
+        core::ContentDigest(
+            require_string(require_member(artifact, "content_digest", path),
+                           path + ".content_digest")),
         core::ContentAddressedStoreKey(require_string(
             require_member(artifact, "content_addressed_store_key", path),
             path + ".content_addressed_store_key")),
@@ -458,27 +450,25 @@ qualified_product_contract_state(
   };
   detail::require_current_retained_product_conformance(product);
   if (detail::retained_product_projection(product) != value) {
-    detail::fail_retained_bundle(
-        std::string(field) + " differs from its exact typed projection");
+    detail::fail_retained_bundle(std::string(field) +
+                                 " differs from its exact typed projection");
   }
   return product;
 }
 
-[[nodiscard]] GraphRevisionVerifiedCellGraph
-verify_structural_graph_projection(
-    const CanonicalValue& graph_value,
+[[nodiscard]] GraphRevisionVerifiedCellGraph verify_structural_graph_projection(
+    const CanonicalValue &graph_value,
     std::span<const QualifiedRuntimeProfile> runtime_profiles) {
   const auto typed = decode_cell_graph_candidate(
       parse_strict_json_model_yaml(canonical_json(graph_value)));
   const auto intrinsic = validate_intrinsic_cell_graph_candidate(typed);
-  const auto ready = prepare_cell_graph_identity(
-      intrinsic, runtime_profiles);
+  const auto ready = prepare_cell_graph_identity(intrinsic, runtime_profiles);
   const auto verified = verify_graph_revision(ready);
   if (verified.normalized_root() != graph_value) {
     detail::fail_retained_bundle(
         "retained cell_graph differs from its exact verified projection");
   }
-  const auto& graph = verified.graph();
+  const auto &graph = verified.graph();
   if (!graph.component_attachments.empty()) {
     detail::fail_retained_bundle(
         "retained cell_graph is outside the structural no-attachment subset");
@@ -487,19 +477,17 @@ verify_structural_graph_projection(
                        graph.control_domains.empty() &&
                        graph.control_bindings.empty();
   if (passive) {
-    if (std::any_of(
-            graph.model_instances.begin(), graph.model_instances.end(),
-            [](const core::ModelInstanceDTO& instance) {
-              return !instance.root_pose_in_cell.has_value();
-            })) {
+    if (std::any_of(graph.model_instances.begin(), graph.model_instances.end(),
+                    [](const core::ModelInstanceDTO &instance) {
+                      return !instance.root_pose_in_cell.has_value();
+                    })) {
       detail::fail_retained_bundle(
           "passive retained model instances require explicit placement");
     }
     return verified;
   }
-  if (graph.model_instances.empty() ||
-      graph.controllable_components.empty() || graph.control_domains.empty() ||
-      graph.control_bindings.empty()) {
+  if (graph.model_instances.empty() || graph.controllable_components.empty() ||
+      graph.control_domains.empty() || graph.control_bindings.empty()) {
     detail::fail_retained_bundle(
         "retained native control graph requires non-empty model, component, "
         "domain, and binding tables");
@@ -532,23 +520,23 @@ verify_structural_graph_projection(
   const bool has_execution_runtime = !execution_runtime_units.empty();
 
   std::set<core::ModelInstanceId> owned_models;
-  for (const auto& component : graph.controllable_components) {
+  for (const auto &component : graph.controllable_components) {
     if (!component.root_pose_in_cell.has_value() ||
-        component.model_role_bindings.empty() ||
-        !has_execution_runtime || component.runtime_unit_ids.empty() ||
+        component.model_role_bindings.empty() || !has_execution_runtime ||
+        component.runtime_unit_ids.empty() ||
         !std::all_of(component.runtime_unit_ids.begin(),
                      component.runtime_unit_ids.end(),
-                     [&](const auto& runtime_unit_id) {
+                     [&](const auto &runtime_unit_id) {
                        return execution_runtime_units.contains(runtime_unit_id);
                      })) {
       detail::fail_retained_bundle(
           "retained native component requires a direct cell placement, at "
           "least one model role, and qualified execution-runtime owners");
     }
-    for (const auto& role : component.model_role_bindings) {
+    for (const auto &role : component.model_role_bindings) {
       const auto model = std::find_if(
           graph.model_instances.begin(), graph.model_instances.end(),
-          [&role](const core::ModelInstanceDTO& value) {
+          [&role](const core::ModelInstanceDTO &value) {
             return value.model_instance_id == role.model_instance_id;
           });
       if (model == graph.model_instances.end() ||
@@ -560,7 +548,7 @@ verify_structural_graph_projection(
       }
     }
   }
-  for (const auto& model : graph.model_instances) {
+  for (const auto &model : graph.model_instances) {
     if (!owned_models.contains(model.model_instance_id) &&
         !model.root_pose_in_cell.has_value()) {
       detail::fail_retained_bundle(
@@ -573,7 +561,7 @@ verify_structural_graph_projection(
     if (!has_execution_runtime || domain.runtime_unit_ids.empty() ||
         !std::all_of(domain.runtime_unit_ids.begin(),
                      domain.runtime_unit_ids.end(),
-                     [&](const auto& runtime_unit_id) {
+                     [&](const auto &runtime_unit_id) {
                        return execution_runtime_units.contains(runtime_unit_id);
                      })) {
       detail::fail_retained_bundle(
@@ -581,17 +569,17 @@ verify_structural_graph_projection(
           "owner set");
     }
   }
-  for (const auto& binding : graph.control_bindings) {
-    const auto component = std::find_if(
-        graph.controllable_components.begin(),
-        graph.controllable_components.end(),
-        [&binding](const core::ControllableComponentDTO& value) {
-          return value.controllable_component_id ==
-                 binding.controllable_component_id;
-        });
+  for (const auto &binding : graph.control_bindings) {
+    const auto component =
+        std::find_if(graph.controllable_components.begin(),
+                     graph.controllable_components.end(),
+                     [&binding](const core::ControllableComponentDTO &value) {
+                       return value.controllable_component_id ==
+                              binding.controllable_component_id;
+                     });
     const auto domain = std::find_if(
         graph.control_domains.begin(), graph.control_domains.end(),
-        [&binding](const core::ControlDomainDTO& value) {
+        [&binding](const core::ControlDomainDTO &value) {
           return value.control_domain_id == binding.control_domain_id;
         });
     if (component == graph.controllable_components.end() ||
@@ -607,7 +595,8 @@ verify_structural_graph_projection(
                   component->runtime_unit_ids.end(),
                   binding.provider_runtime_unit_id) ==
             component->runtime_unit_ids.end() ||
-        std::find(domain->runtime_unit_ids.begin(), domain->runtime_unit_ids.end(),
+        std::find(domain->runtime_unit_ids.begin(),
+                  domain->runtime_unit_ids.end(),
                   binding.provider_runtime_unit_id) ==
             domain->runtime_unit_ids.end()) {
       detail::fail_retained_bundle(
@@ -619,22 +608,20 @@ verify_structural_graph_projection(
 }
 
 [[nodiscard]] std::vector<core::CatalogRecordRefDTO>
-parse_catalog_records_projection(const CanonicalValue& records_value) {
+parse_catalog_records_projection(const CanonicalValue &records_value) {
   const CanonicalValue catalogs(CanonicalValue::Object{
       {"records", records_value},
   });
   std::vector<core::CatalogRecordRefDTO> records;
   try {
     records = detail::decode_deployment_catalogs(catalogs);
-  } catch (const detail::DeploymentCatalogCodecError& error) {
+  } catch (const detail::DeploymentCatalogCodecError &error) {
     detail::fail_retained_bundle(
         std::string("retained catalog record table is invalid: ") +
         error.what());
   }
-  const CanonicalValue encoded =
-      detail::encode_deployment_catalogs(records);
-  const CanonicalValue* encoded_records =
-      encoded.find_object_member("records");
+  const CanonicalValue encoded = detail::encode_deployment_catalogs(records);
+  const CanonicalValue *encoded_records = encoded.find_object_member("records");
   if (encoded_records == nullptr || *encoded_records != records_value) {
     detail::fail_retained_bundle(
         "retained catalog records differ from their exact typed projection");
@@ -646,55 +633,48 @@ using CatalogIdentity =
     std::tuple<core::CatalogRecordKind, std::string, std::string>;
 
 void require_structural_catalog_closure(
-    const core::CellGraphDTO& graph,
+    const core::CellGraphDTO &graph,
     std::span<const core::CapabilityProviderBindingDTO> provider_bindings,
     std::span<const core::ExternalResourceDTO> external_resources,
     std::span<const core::CatalogRecordRefDTO> retained_policy_records,
     std::span<const core::CatalogRecordRefDTO> records) {
   std::set<CatalogIdentity> graph_records;
-  for (const auto& instance : graph.model_instances) {
-    graph_records.emplace(
-        core::CatalogRecordKind::kModelAsset,
-        instance.model_asset_id.value(), instance.model_revision.value());
+  for (const auto &instance : graph.model_instances) {
+    graph_records.emplace(core::CatalogRecordKind::kModelAsset,
+                          instance.model_asset_id.value(),
+                          instance.model_revision.value());
   }
-  for (const auto& unit : graph.runtime_units) {
+  for (const auto &unit : graph.runtime_units) {
     graph_records.emplace(core::CatalogRecordKind::kRuntimeProfile,
                           unit.runtime_profile_id.value(),
                           unit.runtime_profile_revision.value());
   }
-  for (const auto& component : graph.controllable_components) {
-    graph_records.emplace(
-        core::CatalogRecordKind::kComponentType,
-        component.component_type_id.value(),
-        component.component_type_revision.value());
+  for (const auto &component : graph.controllable_components) {
+    graph_records.emplace(core::CatalogRecordKind::kComponentType,
+                          component.component_type_id.value(),
+                          component.component_type_revision.value());
   }
-  for (const auto& domain : graph.control_domains) {
-    graph_records.emplace(
-        core::CatalogRecordKind::kControllerTopology,
-        domain.controller_topology_id.value(),
-        domain.topology_revision.value());
+  for (const auto &domain : graph.control_domains) {
+    graph_records.emplace(core::CatalogRecordKind::kControllerTopology,
+                          domain.controller_topology_id.value(),
+                          domain.topology_revision.value());
   }
-  for (const auto& binding : graph.control_bindings) {
-    graph_records.emplace(
-        core::CatalogRecordKind::kCapabilityDefinition,
-        binding.capability_id.value(),
-        binding.capability_definition_revision.value());
-    graph_records.emplace(
-        core::CatalogRecordKind::kControlInterfaceContract,
-        binding.control_interface_contract_id.value(),
-        binding.control_interface_revision.value());
-    graph_records.emplace(
-        core::CatalogRecordKind::kControllerTopology,
-        binding.controller_topology_id.value(),
-        binding.topology_revision.value());
-    graph_records.emplace(
-        core::CatalogRecordKind::kProviderManifest,
-        binding.provider_manifest_id.value(),
-        binding.provider_manifest_revision.value());
-    graph_records.emplace(
-        core::CatalogRecordKind::kStopEvidencePolicy,
-        binding.stop_evidence_policy_id.value(),
-        binding.stop_evidence_policy_revision.value());
+  for (const auto &binding : graph.control_bindings) {
+    graph_records.emplace(core::CatalogRecordKind::kCapabilityDefinition,
+                          binding.capability_id.value(),
+                          binding.capability_definition_revision.value());
+    graph_records.emplace(core::CatalogRecordKind::kControlInterfaceContract,
+                          binding.control_interface_contract_id.value(),
+                          binding.control_interface_revision.value());
+    graph_records.emplace(core::CatalogRecordKind::kControllerTopology,
+                          binding.controller_topology_id.value(),
+                          binding.topology_revision.value());
+    graph_records.emplace(core::CatalogRecordKind::kProviderManifest,
+                          binding.provider_manifest_id.value(),
+                          binding.provider_manifest_revision.value());
+    graph_records.emplace(core::CatalogRecordKind::kStopEvidencePolicy,
+                          binding.stop_evidence_policy_id.value(),
+                          binding.stop_evidence_policy_revision.value());
     if (binding.capability_id.value() == "tool.gripper.command") {
       graph_records.emplace(
           core::CatalogRecordKind::kCommandSchema,
@@ -702,7 +682,7 @@ void require_structural_catalog_closure(
           std::string(core::kGripperPositionCommandSchemaRevision));
     }
   }
-  for (const auto& binding : provider_bindings) {
+  for (const auto &binding : provider_bindings) {
     graph_records.emplace(core::CatalogRecordKind::kCapabilityDefinition,
                           binding.capability_id.value(),
                           binding.capability_definition_revision.value());
@@ -710,12 +690,12 @@ void require_structural_catalog_closure(
                           binding.provider_manifest_id.value(),
                           binding.provider_manifest_revision.value());
   }
-  for (const auto& resource : external_resources) {
+  for (const auto &resource : external_resources) {
     graph_records.emplace(core::CatalogRecordKind::kProviderManifest,
                           resource.provider_manifest_id.value(),
                           resource.provider_manifest_revision.value());
   }
-  for (const auto& policy : retained_policy_records) {
+  for (const auto &policy : retained_policy_records) {
     graph_records.emplace(core::catalog_record_kind(policy),
                           core::catalog_record_id_value(policy),
                           core::catalog_record_revision_value(policy));
@@ -727,24 +707,23 @@ void require_structural_catalog_closure(
   }
 
   std::set<CatalogIdentity> catalog_records;
-  for (const auto& record : records) {
-    const CatalogIdentity identity{
-        core::catalog_record_kind(record),
-        core::catalog_record_id_value(record),
-        core::catalog_record_revision_value(record)};
+  for (const auto &record : records) {
+    const CatalogIdentity identity{core::catalog_record_kind(record),
+                                   core::catalog_record_id_value(record),
+                                   core::catalog_record_revision_value(record)};
     if (!catalog_records.insert(identity).second) {
       detail::fail_retained_bundle(
           "retained structural catalogs contain a duplicate identity");
     }
   }
-  for (const auto& required : graph_records) {
+  for (const auto &required : graph_records) {
     if (!catalog_records.contains(required)) {
       detail::fail_retained_bundle(
           "retained catalogs omit a graph/applicability-selected structural "
           "referent");
     }
   }
-  for (const auto& selected : catalog_records) {
+  for (const auto &selected : catalog_records) {
     if (!graph_records.contains(selected) &&
         std::get<0>(selected) !=
             core::CatalogRecordKind::kCapabilityDefinition) {
@@ -757,19 +736,18 @@ void require_structural_catalog_closure(
 
 [[nodiscard]] std::vector<core::RetainedSchemaArtifactRefDTO>
 parse_structural_schema_artifacts(
-    const CanonicalValue& value,
+    const CanonicalValue &value,
     std::span<const core::CatalogRecordRefDTO> records) {
   using SchemaIdentity = std::pair<std::string, std::string>;
-  std::map<SchemaIdentity, core::RetainedSchemaArtifactRefDTO>
-      expected_schemas;
-  const auto& registry = build_qualified_closed_schema_registry();
-  for (const auto& record : records) {
+  std::map<SchemaIdentity, core::RetainedSchemaArtifactRefDTO> expected_schemas;
+  const auto &registry = build_qualified_closed_schema_registry();
+  for (const auto &record : records) {
     const auto kind = core::catalog_record_kind(record);
-    const auto schema_id = std::visit(
-        [](const auto& typed) { return typed.schema_id; }, record);
+    const auto schema_id =
+        std::visit([](const auto &typed) { return typed.schema_id; }, record);
     const auto schema_revision = std::visit(
-        [](const auto& typed) { return typed.schema_revision; }, record);
-    const auto* schema = registry.find_qualified_catalog_schema(
+        [](const auto &typed) { return typed.schema_revision; }, record);
+    const auto *schema = registry.find_qualified_catalog_schema(
         kind, schema_id, schema_revision);
     if (schema == nullptr || schema->compiled_schema() == nullptr) {
       detail::fail_retained_bundle(
@@ -785,8 +763,7 @@ parse_structural_schema_artifacts(
         core::ContentAddressedStoreKey(
             detail::retained_store_key_for_digest(schema_digest.value())),
     };
-    const SchemaIdentity identity{
-        schema_id.value(), schema_revision.value()};
+    const SchemaIdentity identity{schema_id.value(), schema_revision.value()};
     const auto [position, inserted] =
         expected_schemas.emplace(identity, expected);
     if (!inserted && position->second != expected) {
@@ -796,45 +773,38 @@ parse_structural_schema_artifacts(
     }
   }
 
-  const auto& rows =
+  const auto &rows =
       require_array(value, "retained_bundle.catalogs.schema_artifacts");
   std::vector<core::RetainedSchemaArtifactRefDTO> parsed;
   parsed.reserve(rows.size());
   std::optional<SchemaIdentity> previous_identity;
   for (std::size_t index = 0U; index < rows.size(); ++index) {
-    const std::string path =
-        "retained_bundle.catalogs.schema_artifacts[" +
-        std::to_string(index) + "]";
-    const auto& row = require_object(rows[index], path);
-    require_exact_fields(
-        row,
-        {"schema_id", "schema_revision", "content_digest",
-         "content_addressed_store_key"},
-        path);
-    const std::string& schema_id = require_string(
+    const std::string path = "retained_bundle.catalogs.schema_artifacts[" +
+                             std::to_string(index) + "]";
+    const auto &row = require_object(rows[index], path);
+    require_exact_fields(row,
+                         {"schema_id", "schema_revision", "content_digest",
+                          "content_addressed_store_key"},
+                         path);
+    const std::string &schema_id = require_string(
         require_member(row, "schema_id", path), path + ".schema_id");
-    const std::string& schema_revision = require_string(
-        require_member(row, "schema_revision", path),
-        path + ".schema_revision");
-    const std::string& content_digest = require_string(
-        require_member(row, "content_digest", path),
-        path + ".content_digest");
-    const std::string& store_key = require_string(
-        require_member(row, "content_addressed_store_key", path),
-        path + ".content_addressed_store_key");
-    detail::require_retained_portable_identity(schema_id,
-                                               path + ".schema_id");
-    detail::require_retained_digest(schema_revision,
-                                    path + ".schema_revision");
-    detail::require_retained_digest(content_digest,
-                                    path + ".content_digest");
+    const std::string &schema_revision =
+        require_string(require_member(row, "schema_revision", path),
+                       path + ".schema_revision");
+    const std::string &content_digest = require_string(
+        require_member(row, "content_digest", path), path + ".content_digest");
+    const std::string &store_key =
+        require_string(require_member(row, "content_addressed_store_key", path),
+                       path + ".content_addressed_store_key");
+    detail::require_retained_portable_identity(schema_id, path + ".schema_id");
+    detail::require_retained_digest(schema_revision, path + ".schema_revision");
+    detail::require_retained_digest(content_digest, path + ".content_digest");
     if (store_key != detail::retained_store_key_for_digest(content_digest)) {
       detail::fail_retained_bundle(
           path + " does not use a digest-derived retained CAS key");
     }
     const SchemaIdentity identity{schema_id, schema_revision};
-    if (previous_identity.has_value() &&
-        *previous_identity >= identity) {
+    if (previous_identity.has_value() && *previous_identity >= identity) {
       detail::fail_retained_bundle(
           "retained schema artifacts are not strictly canonical-sorted");
     }
@@ -853,11 +823,10 @@ parse_structural_schema_artifacts(
         "schema "
         "closure");
   }
-  for (const auto& schema : parsed) {
+  for (const auto &schema : parsed) {
     const auto expected = expected_schemas.find(
         {schema.schema_id.value(), schema.schema_revision.value()});
-    if (expected == expected_schemas.end() ||
-        expected->second != schema) {
+    if (expected == expected_schemas.end() || expected->second != schema) {
       detail::fail_retained_bundle(
           "retained schema artifact differs from its build-qualified "
           "descriptor");
@@ -868,23 +837,24 @@ parse_structural_schema_artifacts(
 
 [[nodiscard]] std::vector<core::RetainedSourceRecordDTO>
 parse_structural_source_records(
-    const CanonicalValue& value,
+    const CanonicalValue &value,
     std::span<const core::CatalogRecordRefDTO> records) {
   std::vector<core::RetainedSourceRecordDTO> expected;
   expected.reserve(records.size());
-  for (const auto& record : records) {
+  for (const auto &record : records) {
     expected.push_back(std::visit(
-        [](const auto& typed) -> core::RetainedSourceRecordDTO {
+        [](const auto &typed) -> core::RetainedSourceRecordDTO {
           using Record = std::remove_cvref_t<decltype(typed)>;
-          using Source = core::TypedRetainedSourceRecordDTO<
-              Record::kRecordKind, typename Record::IdType,
-              typename Record::RevisionType>;
+          using Source =
+              core::TypedRetainedSourceRecordDTO<Record::kRecordKind,
+                                                 typename Record::IdType,
+                                                 typename Record::RevisionType>;
           return Source{typed.record_id, typed.record_revision};
         },
         record));
   }
 
-  const auto& rows =
+  const auto &rows =
       require_array(value, "retained_bundle.provenance.source_records");
   if (rows.size() != expected.size()) {
     detail::fail_retained_bundle(
@@ -894,27 +864,23 @@ parse_structural_source_records(
   std::vector<core::RetainedSourceRecordDTO> parsed;
   parsed.reserve(rows.size());
   for (std::size_t index = 0U; index < rows.size(); ++index) {
-    const std::string path =
-        "retained_bundle.provenance.source_records[" +
-        std::to_string(index) + "]";
-    const auto& row = require_object(rows[index], path);
-    require_exact_fields(
-        row, {"record_kind", "record_id", "revision"}, path);
-    const std::string& record_kind = require_string(
+    const std::string path = "retained_bundle.provenance.source_records[" +
+                             std::to_string(index) + "]";
+    const auto &row = require_object(rows[index], path);
+    require_exact_fields(row, {"record_kind", "record_id", "revision"}, path);
+    const std::string &record_kind = require_string(
         require_member(row, "record_kind", path), path + ".record_kind");
-    const std::string& record_id = require_string(
+    const std::string &record_id = require_string(
         require_member(row, "record_id", path), path + ".record_id");
-    const std::string& revision = require_string(
+    const std::string &revision = require_string(
         require_member(row, "revision", path), path + ".revision");
-    detail::require_retained_portable_identity(record_id,
-                                               path + ".record_id");
+    detail::require_retained_portable_identity(record_id, path + ".record_id");
     detail::require_retained_digest(revision, path + ".revision");
-    const auto& catalog_record = records[index];
-    if (record_kind != core::to_string(
-                           core::catalog_record_kind(catalog_record)) ||
+    const auto &catalog_record = records[index];
+    if (record_kind !=
+            core::to_string(core::catalog_record_kind(catalog_record)) ||
         record_id != core::catalog_record_id_value(catalog_record) ||
-        revision !=
-            core::catalog_record_revision_value(catalog_record)) {
+        revision != core::catalog_record_revision_value(catalog_record)) {
       detail::fail_retained_bundle(
           "retained source provenance differs from the exact catalog "
           "projection");
@@ -925,10 +891,10 @@ parse_structural_source_records(
 }
 
 [[nodiscard]] std::vector<core::RetainedGeneratorRecordDTO>
-parse_structural_generator_records(
-    const CanonicalValue& value, std::size_t selected_asset_count) {
-  const auto& rows = require_array(
-      value, "retained_bundle.provenance.generator_records");
+parse_structural_generator_records(const CanonicalValue &value,
+                                   std::size_t selected_asset_count) {
+  const auto &rows =
+      require_array(value, "retained_bundle.provenance.generator_records");
   if ((selected_asset_count == 0U && !rows.empty()) ||
       (selected_asset_count != 0U &&
        (rows.empty() || rows.size() > selected_asset_count))) {
@@ -942,41 +908,33 @@ parse_structural_generator_records(
   std::vector<core::RetainedGeneratorRecordDTO> parsed;
   parsed.reserve(rows.size());
   for (std::size_t index = 0U; index < rows.size(); ++index) {
-    const std::string path =
-        "retained_bundle.provenance.generator_records[" +
-        std::to_string(index) + "]";
-    const auto& row = require_object(rows[index], path);
-    require_exact_fields(
-        row,
-        {"generator_id", "generator_version", "build_digest",
-         "configuration_digest"},
-        path);
-    const std::string& generator_id = require_string(
-        require_member(row, "generator_id", path),
-        path + ".generator_id");
-    const std::string& generator_version = require_string(
-        require_member(row, "generator_version", path),
-        path + ".generator_version");
-    const std::string& build_digest = require_string(
-        require_member(row, "build_digest", path),
-        path + ".build_digest");
-    const std::string& configuration_digest = require_string(
-        require_member(row, "configuration_digest", path),
-        path + ".configuration_digest");
-    if (generator_id !=
-            kStructuralModelPreparationGeneratorId ||
-        generator_version !=
-            kStructuralModelPreparationGeneratorVersion) {
+    const std::string path = "retained_bundle.provenance.generator_records[" +
+                             std::to_string(index) + "]";
+    const auto &row = require_object(rows[index], path);
+    require_exact_fields(row,
+                         {"generator_id", "generator_version", "build_digest",
+                          "configuration_digest"},
+                         path);
+    const std::string &generator_id = require_string(
+        require_member(row, "generator_id", path), path + ".generator_id");
+    const std::string &generator_version =
+        require_string(require_member(row, "generator_version", path),
+                       path + ".generator_version");
+    const std::string &build_digest = require_string(
+        require_member(row, "build_digest", path), path + ".build_digest");
+    const std::string &configuration_digest =
+        require_string(require_member(row, "configuration_digest", path),
+                       path + ".configuration_digest");
+    if (generator_id != kStructuralModelPreparationGeneratorId ||
+        generator_version != kStructuralModelPreparationGeneratorVersion) {
       detail::fail_retained_bundle(
           path + " selects an unqualified structural generator");
     }
-    detail::require_retained_digest(
-        build_digest, path + ".build_digest");
-    detail::require_retained_digest(
-        configuration_digest, path + ".configuration_digest");
-    Identity identity{
-        generator_id, generator_version, build_digest,
-        configuration_digest};
+    detail::require_retained_digest(build_digest, path + ".build_digest");
+    detail::require_retained_digest(configuration_digest,
+                                    path + ".configuration_digest");
+    Identity identity{generator_id, generator_version, build_digest,
+                      configuration_digest};
     if (previous.has_value() && *previous >= identity) {
       detail::fail_retained_bundle(
           "retained generator records are not strictly canonical-sorted");
@@ -992,17 +950,16 @@ parse_structural_generator_records(
   return parsed;
 }
 
-void verify_node_environment_projection(const CanonicalValue& value) {
-  const auto& object = require_object(value, "catalogs.node_environment");
+void verify_node_environment_projection(const CanonicalValue &value) {
+  const auto &object = require_object(value, "catalogs.node_environment");
   require_exact_fields(
       object,
-      {"catalog_id", "content_version", "catalog_digest",
-       "environment_digest"},
+      {"catalog_id", "content_version", "catalog_digest", "environment_digest"},
       "catalogs.node_environment");
   detail::require_retained_portable_identity(
-      require_string(require_member(object, "catalog_id",
-                                    "catalogs.node_environment"),
-                     "catalogs.node_environment.catalog_id"),
+      require_string(
+          require_member(object, "catalog_id", "catalogs.node_environment"),
+          "catalogs.node_environment.catalog_id"),
       "catalogs.node_environment.catalog_id");
   detail::require_retained_portable_identity(
       require_string(require_member(object, "content_version",
@@ -1010,9 +967,9 @@ void verify_node_environment_projection(const CanonicalValue& value) {
                      "catalogs.node_environment.content_version"),
       "catalogs.node_environment.content_version");
   detail::require_retained_digest(
-      require_string(require_member(object, "catalog_digest",
-                                    "catalogs.node_environment"),
-                     "catalogs.node_environment.catalog_digest"),
+      require_string(
+          require_member(object, "catalog_digest", "catalogs.node_environment"),
+          "catalogs.node_environment.catalog_digest"),
       "catalogs.node_environment.catalog_digest");
   detail::require_retained_digest(
       require_string(require_member(object, "environment_digest",
@@ -1027,7 +984,7 @@ verify_structural_applicability_projection(
     const CanonicalValue &retained_policy_records_value,
     const CanonicalValue *site_overlay_ref_value,
     const CanonicalValue *external_resources_value,
-    const core::CellGraphDTO &graph,
+    const CanonicalValue *stop_timing_value, const core::CellGraphDTO &graph,
     std::span<const QualifiedRuntimeProfile> runtime_profiles) {
   CanonicalValue::Object root_members{
       {"api_version", CanonicalValue("manyforge.deployment.v1")},
@@ -1053,6 +1010,14 @@ verify_structural_applicability_projection(
   if (site_overlay_ref_value != nullptr) {
     root_members.emplace_back("site_overlay_ref", *site_overlay_ref_value);
   }
+  if (stop_timing_value != nullptr) {
+    auto member =
+        std::find_if(root_members.begin(), root_members.end(),
+                     [](const auto &row) { return row.first == "policies"; });
+    auto policies = std::get<CanonicalValue::Object>(member->second.storage());
+    policies.emplace_back("stop_timing_parameters", *stop_timing_value);
+    member->second = CanonicalValue(std::move(policies));
+  }
   if (external_resources_value != nullptr) {
     root_members.emplace_back("external_resources", *external_resources_value);
   }
@@ -1071,18 +1036,32 @@ verify_structural_applicability_projection(
     detail::fail_retained_bundle(
         "retained external_resources must be omitted when empty");
   }
+  if (stop_timing_value != nullptr) {
+    const auto *normalized = verified.normalized_policies()->find_object_member(
+        "stop_timing_parameters");
+    if (normalized == nullptr || *normalized != *stop_timing_value)
+      detail::fail_retained_bundle(
+          "retained Stop timing must be nonempty and exactly normalized");
+  }
+  for (const auto &selected : verified.value().stop_timing_parameters) {
+    if (std::none_of(graph.control_bindings.begin(),
+                     graph.control_bindings.end(), [&](const auto &binding) {
+                       return binding.control_binding_id ==
+                                  selected.control_binding_id &&
+                              binding.control_binding_revision ==
+                                  selected.control_binding_revision;
+                     }))
+      detail::fail_retained_bundle("retained Stop timing has no exact binding");
+  }
   if (!verified.value().external_resources.empty() &&
       !verified.value().site_overlay_ref.has_value()) {
     detail::fail_retained_bundle(
         "retained external resources require a selected site overlay");
   }
-  if (verified.normalized_desired_control_configurations() !=
-          desired_value ||
-      verified.normalized_capability_provider_bindings() !=
-          provider_value ||
+  if (verified.normalized_desired_control_configurations() != desired_value ||
+      verified.normalized_capability_provider_bindings() != provider_value ||
       (external_resources_value != nullptr &&
-       verified.normalized_external_resources() !=
-           *external_resources_value) ||
+       verified.normalized_external_resources() != *external_resources_value) ||
       (external_resources_value == nullptr &&
        !verified.value().external_resources.empty()) ||
       (site_overlay_ref_value != nullptr &&
@@ -1091,15 +1070,15 @@ verify_structural_applicability_projection(
       (site_overlay_ref_value == nullptr &&
        verified.value().site_overlay_ref.has_value()) ||
       verified.value().retained_policy_records !=
-          detail::decode_deployment_catalogs(CanonicalValue(
-              CanonicalValue::Object{{"records",
-                                      retained_policy_records_value}}))) {
+          detail::decode_deployment_catalogs(
+              CanonicalValue(CanonicalValue::Object{
+                  {"records", retained_policy_records_value}}))) {
     detail::fail_retained_bundle(
         "retained applicability differs from its exact revision-verified "
         "projection");
   }
-  const auto& desired = verified.value().desired_control_configurations;
-  const auto& providers = verified.value().capability_provider_bindings;
+  const auto &desired = verified.value().desired_control_configurations;
+  const auto &providers = verified.value().capability_provider_bindings;
   if (graph.control_domains.empty()) {
     if (!desired.empty() || !providers.empty()) {
       detail::fail_retained_bundle(
@@ -1115,14 +1094,14 @@ verify_structural_applicability_projection(
         "configuration per control domain");
   }
 
-  for (const auto& domain : graph.control_domains) {
+  for (const auto &domain : graph.control_domains) {
     const auto selected = std::find_if(
-        desired.begin(), desired.end(), [&domain](const auto& value) {
+        desired.begin(), desired.end(), [&domain](const auto &value) {
           return value.control_domain_id == domain.control_domain_id;
         });
     const auto binding_count = static_cast<std::size_t>(std::count_if(
         graph.control_bindings.begin(), graph.control_bindings.end(),
-        [&domain](const core::ControlBindingDTO& binding) {
+        [&domain](const core::ControlBindingDTO &binding) {
           return binding.control_domain_id == domain.control_domain_id;
         }));
     if (selected == desired.end() || binding_count == 0U ||
@@ -1135,13 +1114,13 @@ verify_structural_applicability_projection(
           "domain projection");
     }
 
-    for (const auto& binding : graph.control_bindings) {
+    for (const auto &binding : graph.control_bindings) {
       if (binding.control_domain_id != domain.control_domain_id) {
         continue;
       }
       const auto route = std::find_if(
           selected->binding_routes.begin(), selected->binding_routes.end(),
-          [&binding](const core::DesiredControlBindingRouteDTO& value) {
+          [&binding](const core::DesiredControlBindingRouteDTO &value) {
             return value.control_binding_id == binding.control_binding_id;
           });
       if (route == selected->binding_routes.end() ||
@@ -1215,25 +1194,31 @@ verify_structural_applicability_projection(
       }
     }
     std::visit(
-        [&](const auto& target) {
+        [&](const auto &target) {
           using Target = std::decay_t<decltype(target)>;
-          if constexpr (std::is_same_v<Target, core::CellGlobalCapabilityProviderTargetDTO>) {
+          if constexpr (std::is_same_v<
+                            Target,
+                            core::CellGlobalCapabilityProviderTargetDTO>) {
             if (provider.scope != core::CapabilityScope::kCellGlobal ||
                 target.cell_id != graph.cell_id) {
               detail::fail_retained_bundle(
                   "retained cell-global capability provider does not target "
                   "the exact retained cell");
             }
-          } else if constexpr (std::is_same_v<Target,
-                                              core::ControlDomainCapabilityProviderTargetDTO>) {
+          } else if constexpr (
+              std::is_same_v<Target,
+                             core::ControlDomainCapabilityProviderTargetDTO>) {
             const auto domain = std::find_if(
-                graph.control_domains.begin(), graph.control_domains.end(), [&](const auto& value) {
+                graph.control_domains.begin(), graph.control_domains.end(),
+                [&](const auto &value) {
                   return value.control_domain_id == target.control_domain_id;
                 });
             if (provider.scope != core::CapabilityScope::kControlDomain ||
                 domain == graph.control_domains.end() ||
-                domain->control_domain_revision != target.control_domain_revision ||
-                domain->controller_topology_id != target.controller_topology_id ||
+                domain->control_domain_revision !=
+                    target.control_domain_revision ||
+                domain->controller_topology_id !=
+                    target.controller_topology_id ||
                 domain->topology_revision != target.topology_revision) {
               detail::fail_retained_bundle(
                   "retained control-domain capability provider does not "
@@ -1241,21 +1226,25 @@ verify_structural_applicability_projection(
             }
           } else {
             const auto component = std::find_if(
-                graph.controllable_components.begin(), graph.controllable_components.end(),
-                [&](const auto& value) {
-                  return value.controllable_component_id == target.controllable_component_id;
+                graph.controllable_components.begin(),
+                graph.controllable_components.end(), [&](const auto &value) {
+                  return value.controllable_component_id ==
+                         target.controllable_component_id;
                 });
-            const auto binding =
-                std::find_if(graph.control_bindings.begin(), graph.control_bindings.end(),
-                             [&](const auto& value) {
-                               return value.control_binding_id == target.control_binding_id;
-                             });
+            const auto binding = std::find_if(
+                graph.control_bindings.begin(), graph.control_bindings.end(),
+                [&](const auto &value) {
+                  return value.control_binding_id == target.control_binding_id;
+                });
             if (provider.scope != core::CapabilityScope::kTargetBinding ||
                 component == graph.controllable_components.end() ||
                 binding == graph.control_bindings.end() ||
-                component->component_type_revision != target.component_type_revision ||
-                binding->control_binding_revision != target.control_binding_revision ||
-                binding->controllable_component_id != target.controllable_component_id ||
+                component->component_type_revision !=
+                    target.component_type_revision ||
+                binding->control_binding_revision !=
+                    target.control_binding_revision ||
+                binding->controllable_component_id !=
+                    target.controllable_component_id ||
                 binding->command_target_id != target.command_target_id) {
               detail::fail_retained_bundle(
                   "retained target capability provider does not target the "
@@ -1269,8 +1258,8 @@ verify_structural_applicability_projection(
 }
 
 [[nodiscard]] core::RetainedBundleDTO
-verify_current_retained_bundle_projection(const CanonicalValue& root) {
-  const auto& object = require_object(root, "retained_bundle");
+verify_current_retained_bundle_projection(const CanonicalValue &root) {
+  const auto &object = require_object(root, "retained_bundle");
   require_required_and_optional_fields(
       object,
       {"api_version", "retained_bundle_id", "deployment_artifact_id",
@@ -1278,7 +1267,8 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
        "desired_control_configurations", "capability_provider_bindings",
        "retained_policy_records", "runtime_contract_requirements",
        "compiled_products", "provenance"},
-      {"site_overlay_ref", "external_resources", "assistant"},
+      {"site_overlay_ref", "external_resources", "assistant",
+       "stop_timing_parameters"},
       "retained_bundle");
   if (require_string(require_member(object, "api_version", "retained_bundle"),
                      "retained_bundle.api_version") !=
@@ -1286,54 +1276,52 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
     detail::fail_retained_bundle(
         "retained_bundle.api_version is not the exact v1 API");
   }
-  const std::string& retained_bundle_id = require_string(
+  const std::string &retained_bundle_id = require_string(
       require_member(object, "retained_bundle_id", "retained_bundle"),
       "retained_bundle.retained_bundle_id");
   detail::require_retained_digest(retained_bundle_id,
                                   "retained_bundle.retained_bundle_id");
-  const std::string& deployment_artifact_id = require_string(
+  const std::string &deployment_artifact_id = require_string(
       require_member(object, "deployment_artifact_id", "retained_bundle"),
       "retained_bundle.deployment_artifact_id");
   detail::require_retained_portable_identity(
       deployment_artifact_id, "retained_bundle.deployment_artifact_id");
-  const std::string& deployment_revision = require_string(
+  const std::string &deployment_revision = require_string(
       require_member(object, "deployment_revision", "retained_bundle"),
       "retained_bundle.deployment_revision");
   detail::require_retained_digest(deployment_revision,
                                   "retained_bundle.deployment_revision");
-  const auto& catalogs =
+  const auto &catalogs =
       require_object(require_member(object, "catalogs", "retained_bundle"),
                      "retained_bundle.catalogs");
-  require_exact_fields(
-      catalogs,
-      {"dialect_api_version", "bootstrap_contract_digest",
-       "qualification_registry_digest", "records", "schema_artifacts",
-       "node_environment"},
-      "retained_bundle.catalogs");
-  const std::string& dialect_api_version = require_string(
-      require_member(catalogs, "dialect_api_version",
-                     "retained_bundle.catalogs"),
-      "retained_bundle.catalogs.dialect_api_version");
+  require_exact_fields(catalogs,
+                       {"dialect_api_version", "bootstrap_contract_digest",
+                        "qualification_registry_digest", "records",
+                        "schema_artifacts", "node_environment"},
+                       "retained_bundle.catalogs");
+  const std::string &dialect_api_version =
+      require_string(require_member(catalogs, "dialect_api_version",
+                                    "retained_bundle.catalogs"),
+                     "retained_bundle.catalogs.dialect_api_version");
   if (dialect_api_version != kClosedSchemaApiVersion) {
     detail::fail_retained_bundle(
         "retained catalog dialect does not match this build");
   }
-  const std::string& bootstrap_contract_digest = require_string(
-      require_member(catalogs, "bootstrap_contract_digest",
-                     "retained_bundle.catalogs"),
-      "retained_bundle.catalogs.bootstrap_contract_digest");
+  const std::string &bootstrap_contract_digest =
+      require_string(require_member(catalogs, "bootstrap_contract_digest",
+                                    "retained_bundle.catalogs"),
+                     "retained_bundle.catalogs.bootstrap_contract_digest");
   if (bootstrap_contract_digest != kClosedSchemaBootstrapContractDigest) {
     detail::fail_retained_bundle(
         "retained bootstrap contract does not match this build");
   }
-  const std::string& qualification_registry_digest = require_string(
-      require_member(catalogs, "qualification_registry_digest",
-                     "retained_bundle.catalogs"),
-      "retained_bundle.catalogs.qualification_registry_digest");
-  if (qualification_registry_digest !=
-      build_qualified_closed_schema_registry()
-          .qualification_registry_digest()
-          .value()) {
+  const std::string &qualification_registry_digest =
+      require_string(require_member(catalogs, "qualification_registry_digest",
+                                    "retained_bundle.catalogs"),
+                     "retained_bundle.catalogs.qualification_registry_digest");
+  if (qualification_registry_digest != build_qualified_closed_schema_registry()
+                                           .qualification_registry_digest()
+                                           .value()) {
     detail::fail_retained_bundle(
         "retained qualification registry does not match this build");
   }
@@ -1341,8 +1329,8 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
       require_member(catalogs, "records", "retained_bundle.catalogs"));
   std::vector<QualifiedRuntimeProfile> runtime_profiles;
   try {
-    for (const auto& record : catalog_records) {
-      const auto* profile =
+    for (const auto &record : catalog_records) {
+      const auto *profile =
           std::get_if<core::RuntimeProfileCatalogRecordRefDTO>(&record);
       if (profile == nullptr) {
         continue;
@@ -1360,7 +1348,8 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
       } else if (profile->record_id.value() ==
                      detail::kRos2ControlExecutionRuntimeProfileId &&
                  profile->record_revision.value() ==
-                     detail::ros2_control_execution_runtime_profile_revision()) {
+                     detail::
+                         ros2_control_execution_runtime_profile_revision()) {
         profile_document =
             detail::ros2_control_execution_runtime_profile_document();
       } else {
@@ -1370,19 +1359,22 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
       runtime_profiles.push_back(resolve_and_qualify_runtime_profile(
           *profile, profile->content_addressed_store_key, profile_document));
     }
-  } catch (const RuntimeProfileCodecError& error) {
+  } catch (const RuntimeProfileCodecError &error) {
     detail::fail_retained_bundle(
         std::string("retained runtime profile is not build-qualified: ") +
         error.what());
   }
   const auto verified_graph = verify_structural_graph_projection(
-      require_member(object, "cell_graph", "retained_bundle"), runtime_profiles);
+      require_member(object, "cell_graph", "retained_bundle"),
+      runtime_profiles);
   const auto applicability = verify_structural_applicability_projection(
-      require_member(object, "desired_control_configurations", "retained_bundle"),
+      require_member(object, "desired_control_configurations",
+                     "retained_bundle"),
       require_member(object, "capability_provider_bindings", "retained_bundle"),
       require_member(object, "retained_policy_records", "retained_bundle"),
       root.find_object_member("site_overlay_ref"),
-      root.find_object_member("external_resources"), verified_graph.graph(),
+      root.find_object_member("external_resources"),
+      root.find_object_member("stop_timing_parameters"), verified_graph.graph(),
       runtime_profiles);
   require_structural_catalog_closure(
       verified_graph.graph(),
@@ -1390,52 +1382,48 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
       applicability.value().external_resources,
       applicability.value().retained_policy_records, catalog_records);
   const auto schema_artifacts = parse_structural_schema_artifacts(
-      require_member(catalogs, "schema_artifacts",
-                     "retained_bundle.catalogs"),
+      require_member(catalogs, "schema_artifacts", "retained_bundle.catalogs"),
       catalog_records);
-  const CanonicalValue& node_environment_value = require_member(
-      catalogs, "node_environment", "retained_bundle.catalogs");
+  const CanonicalValue &node_environment_value =
+      require_member(catalogs, "node_environment", "retained_bundle.catalogs");
   verify_node_environment_projection(node_environment_value);
-  const auto& node_environment =
+  const auto &node_environment =
       require_object(node_environment_value, "catalogs.node_environment");
 
   std::optional<core::RetainedAssistantProjectionDTO> assistant;
-  if (const CanonicalValue* retained_assistant =
+  if (const CanonicalValue *retained_assistant =
           root.find_object_member("assistant");
       retained_assistant != nullptr) {
     try {
       const QualifiedAssistantSettings qualified_assistant =
           verify_retained_assistant_projection(
-              *retained_assistant,
-              applicability.value().external_resources);
+              *retained_assistant, applicability.value().external_resources);
       assistant = qualified_assistant.retained_projection();
-    } catch (const AssistantSettingsCodecError& error) {
+    } catch (const AssistantSettingsCodecError &error) {
       detail::fail_retained_bundle(
           std::string("retained assistant projection is invalid: ") +
           error.what());
     }
   }
 
-  const auto& requirement_values = require_array(
-      require_member(object, "runtime_contract_requirements",
-                     "retained_bundle"),
-      "retained_bundle.runtime_contract_requirements");
+  const auto &requirement_values =
+      require_array(require_member(object, "runtime_contract_requirements",
+                                   "retained_bundle"),
+                    "retained_bundle.runtime_contract_requirements");
   std::vector<core::RetainedRuntimeContractRequirementDTO>
       runtime_contract_requirements;
   runtime_contract_requirements.reserve(requirement_values.size());
   for (std::size_t index = 0U; index < requirement_values.size(); ++index) {
-    const std::string path =
-        "retained_bundle.runtime_contract_requirements[" +
-        std::to_string(index) + "]";
-    const auto& row = require_object(requirement_values[index], path);
+    const std::string path = "retained_bundle.runtime_contract_requirements[" +
+                             std::to_string(index) + "]";
+    const auto &row = require_object(requirement_values[index], path);
     require_exact_fields(row, {"runtime_unit_id", "requirement"}, path);
     const std::string runtime_unit_id =
         require_string(require_member(row, "runtime_unit_id", path),
                        path + ".runtime_unit_id");
-    detail::require_retained_portable_identity(
-        runtime_unit_id, path + ".runtime_unit_id");
-    const auto& requirement_value =
-        require_member(row, "requirement", path);
+    detail::require_retained_portable_identity(runtime_unit_id,
+                                               path + ".runtime_unit_id");
+    const auto &requirement_value = require_member(row, "requirement", path);
     const auto decoded = core::DecodeRuntimeContractRequirement(
         canonical_json(requirement_value));
     if (!decoded.ok()) {
@@ -1453,15 +1441,14 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
         {core::RuntimeUnitId(runtime_unit_id), decoded.value()});
   }
 
-  const auto& products = require_object(
+  const auto &products = require_object(
       require_member(object, "compiled_products", "retained_bundle"),
       "retained_bundle.compiled_products");
-  require_exact_fields(
-      products,
-      {"planning_collision_model", "viewer_model",
-       "control_domain_products", "symbol_role_maps",
-       "runtime_unit_products"},
-      "retained_bundle.compiled_products");
+  require_exact_fields(products,
+                       {"planning_collision_model", "viewer_model",
+                        "control_domain_products", "symbol_role_maps",
+                        "runtime_unit_products"},
+                       "retained_bundle.compiled_products");
   const core::RetainedProductDTO planning = parse_retained_product(
       require_member(products, "planning_collision_model",
                      "retained_bundle.compiled_products"),
@@ -1532,10 +1519,10 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
         core::ControlDomainId(control_domain_id),
         std::vector<core::RetainedProductDTO>{std::move(product)}});
   }
-  const auto& symbol_role_map_values = require_array(
-      require_member(products, "symbol_role_maps",
-                     "retained_bundle.compiled_products"),
-      "retained_bundle.compiled_products.symbol_role_maps");
+  const auto &symbol_role_map_values =
+      require_array(require_member(products, "symbol_role_maps",
+                                   "retained_bundle.compiled_products"),
+                    "retained_bundle.compiled_products.symbol_role_maps");
   std::vector<core::RetainedProductDTO> symbol_role_maps;
   if (verified_graph.graph().model_instances.empty()) {
     if (!symbol_role_map_values.empty()) {
@@ -1558,10 +1545,10 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
           "composed-model symbol/role map has the wrong stable product ID");
     }
   }
-  const auto& runtime_group_values = require_array(
-      require_member(products, "runtime_unit_products",
-                     "retained_bundle.compiled_products"),
-      "retained_bundle.compiled_products.runtime_unit_products");
+  const auto &runtime_group_values =
+      require_array(require_member(products, "runtime_unit_products",
+                                   "retained_bundle.compiled_products"),
+                    "retained_bundle.compiled_products.runtime_unit_products");
   if (runtime_group_values.size() !=
       verified_graph.graph().runtime_units.size()) {
     detail::fail_retained_bundle(
@@ -1574,13 +1561,14 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
     const std::string path =
         "retained_bundle.compiled_products.runtime_unit_products[" +
         std::to_string(index) + "]";
-    const auto& group = require_object(runtime_group_values[index], path);
+    const auto &group = require_object(runtime_group_values[index], path);
     require_exact_fields(group, {"runtime_unit_id", "products"}, path);
-    const std::string& runtime_unit_id =
+    const std::string &runtime_unit_id =
         require_string(require_member(group, "runtime_unit_id", path),
                        path + ".runtime_unit_id");
-    detail::require_retained_portable_identity(runtime_unit_id, path + ".runtime_unit_id");
-    const auto& expected_unit = verified_graph.graph().runtime_units[index];
+    detail::require_retained_portable_identity(runtime_unit_id,
+                                               path + ".runtime_unit_id");
+    const auto &expected_unit = verified_graph.graph().runtime_units[index];
     const bool expected_reference_unit =
         expected_unit.runtime_profile_id.value() ==
             detail::kReferenceRuntimeProfileId &&
@@ -1609,8 +1597,8 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
           "retained runtime-unit product group differs from its graph "
           "subject");
     }
-    const auto& group_products =
-        require_array(require_member(group, "products", path), path + ".products");
+    const auto &group_products = require_array(
+        require_member(group, "products", path), path + ".products");
     if (group_products.size() != 1U) {
       detail::fail_retained_bundle(
           "each qualified runtime unit requires exactly one runtime product");
@@ -1671,59 +1659,58 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
   const bool requirements_match =
       independently_derived_requirements.size() ==
           runtime_contract_requirements.size() &&
-      std::equal(
-          independently_derived_requirements.begin(),
-          independently_derived_requirements.end(),
-          runtime_contract_requirements.begin(),
-          [](const auto& derived, const auto& retained) {
-            // Implementation identity, catalog revisions, and the digest that
-            // includes them are diagnostic provenance. The semantic
-            // requirement is the exact runtime unit plus its derived API and
-            // immutable capability-ID sets.
-            const auto& derived_capabilities =
-                derived.requirement.required_capabilities;
-            const auto& retained_capabilities =
-                retained.requirement.required_capabilities;
-            return derived.runtime_unit_id == retained.runtime_unit_id &&
-                   derived.requirement.required_api_contract_ids ==
-                       retained.requirement.required_api_contract_ids &&
-                   derived_capabilities.size() ==
-                       retained_capabilities.size() &&
-                   std::equal(
-                       derived_capabilities.begin(),
-                       derived_capabilities.end(),
-                       retained_capabilities.begin(),
-                       [](const auto& derived_capability,
-                          const auto& retained_capability) {
-                         return derived_capability.capability_id ==
-                                retained_capability.capability_id;
-                       });
-          });
+      std::equal(independently_derived_requirements.begin(),
+                 independently_derived_requirements.end(),
+                 runtime_contract_requirements.begin(),
+                 [](const auto &derived, const auto &retained) {
+                   // Implementation identity, catalog revisions, and the digest
+                   // that includes them are diagnostic provenance. The semantic
+                   // requirement is the exact runtime unit plus its derived API
+                   // and immutable capability-ID sets.
+                   const auto &derived_capabilities =
+                       derived.requirement.required_capabilities;
+                   const auto &retained_capabilities =
+                       retained.requirement.required_capabilities;
+                   return derived.runtime_unit_id == retained.runtime_unit_id &&
+                          derived.requirement.required_api_contract_ids ==
+                              retained.requirement.required_api_contract_ids &&
+                          derived_capabilities.size() ==
+                              retained_capabilities.size() &&
+                          std::equal(
+                              derived_capabilities.begin(),
+                              derived_capabilities.end(),
+                              retained_capabilities.begin(),
+                              [](const auto &derived_capability,
+                                 const auto &retained_capability) {
+                                return derived_capability.capability_id ==
+                                       retained_capability.capability_id;
+                              });
+                 });
   if (!requirements_match) {
     detail::fail_retained_bundle(
         "retained runtime-contract requirements differ from independent "
         "rederivation");
   }
 
-  const auto& provenance =
+  const auto &provenance =
       require_object(require_member(object, "provenance", "retained_bundle"),
                      "retained_bundle.provenance");
-  require_exact_fields(
-      provenance,
-      {"compiler_contract_digest", "compiler_build_digest",
-       "source_records", "generator_records", "output_records"},
-      "retained_bundle.provenance");
-  const std::string& compiler_contract_digest = require_string(
-      require_member(provenance, "compiler_contract_digest",
-                     "retained_bundle.provenance"),
-      "retained_bundle.provenance.compiler_contract_digest");
+  require_exact_fields(provenance,
+                       {"compiler_contract_digest", "compiler_build_digest",
+                        "source_records", "generator_records",
+                        "output_records"},
+                       "retained_bundle.provenance");
+  const std::string &compiler_contract_digest =
+      require_string(require_member(provenance, "compiler_contract_digest",
+                                    "retained_bundle.provenance"),
+                     "retained_bundle.provenance.compiler_contract_digest");
   detail::require_retained_digest(
       compiler_contract_digest,
       "retained_bundle.provenance.compiler_contract_digest");
-  const std::string& compiler_build_digest = require_string(
-      require_member(provenance, "compiler_build_digest",
-                     "retained_bundle.provenance"),
-      "retained_bundle.provenance.compiler_build_digest");
+  const std::string &compiler_build_digest =
+      require_string(require_member(provenance, "compiler_build_digest",
+                                    "retained_bundle.provenance"),
+                     "retained_bundle.provenance.compiler_build_digest");
   detail::require_retained_digest(
       compiler_build_digest,
       "retained_bundle.provenance.compiler_build_digest");
@@ -1731,19 +1718,18 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
       require_member(provenance, "source_records",
                      "retained_bundle.provenance"),
       catalog_records);
-  const std::size_t selected_model_asset_count =
-      static_cast<std::size_t>(std::count_if(
-          catalog_records.begin(), catalog_records.end(),
-          [](const core::CatalogRecordRefDTO& record) {
-            return core::catalog_record_kind(record) ==
-                   core::CatalogRecordKind::kModelAsset;
-          }));
+  const std::size_t selected_model_asset_count = static_cast<std::size_t>(
+      std::count_if(catalog_records.begin(), catalog_records.end(),
+                    [](const core::CatalogRecordRefDTO &record) {
+                      return core::catalog_record_kind(record) ==
+                             core::CatalogRecordKind::kModelAsset;
+                    }));
   const auto generator_records = parse_structural_generator_records(
       require_member(provenance, "generator_records",
                      "retained_bundle.provenance"),
       selected_model_asset_count);
 
-  const auto& outputs =
+  const auto &outputs =
       require_array(require_member(provenance, "output_records",
                                    "retained_bundle.provenance"),
                     "retained_bundle.provenance.output_records");
@@ -1757,13 +1743,13 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
   for (const auto &product : symbol_role_maps) {
     expected_outputs.push_back(&product);
   }
-  for (const auto& group : runtime_unit_products) {
-    for (const auto& product : group.products) {
+  for (const auto &group : runtime_unit_products) {
+    for (const auto &product : group.products) {
       expected_outputs.push_back(&product);
     }
   }
   std::sort(expected_outputs.begin(), expected_outputs.end(),
-            [](const auto* left, const auto* right) {
+            [](const auto *left, const auto *right) {
               return left->product_id.value() < right->product_id.value();
             });
   if (outputs.size() != expected_outputs.size()) {
@@ -1773,13 +1759,12 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
   std::vector<core::RetainedOutputRecordDTO> output_records;
   output_records.reserve(outputs.size());
   for (std::size_t index = 0U; index < outputs.size(); ++index) {
-    const std::string path =
-        "retained_bundle.provenance.output_records[" +
-        std::to_string(index) + "]";
-    const auto& output = require_object(outputs[index], path);
+    const std::string path = "retained_bundle.provenance.output_records[" +
+                             std::to_string(index) + "]";
+    const auto &output = require_object(outputs[index], path);
     require_exact_fields(
         output, {"product_id", "product_kind", "content_digest"}, path);
-    const auto& expected = *expected_outputs[index];
+    const auto &expected = *expected_outputs[index];
     const core::ContentDigest digest =
         detail::retained_product_output_digest(expected);
     if (require_string(require_member(output, "product_id", path), path) !=
@@ -1808,14 +1793,12 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
           catalog_records,
           schema_artifacts,
           core::RetainedNodeEnvironmentDTO{
-              require_string(
-                  require_member(node_environment, "catalog_id",
-                                 "catalogs.node_environment"),
-                  "catalogs.node_environment.catalog_id"),
-              require_string(
-                  require_member(node_environment, "content_version",
-                                 "catalogs.node_environment"),
-                  "catalogs.node_environment.content_version"),
+              require_string(require_member(node_environment, "catalog_id",
+                                            "catalogs.node_environment"),
+                             "catalogs.node_environment.catalog_id"),
+              require_string(require_member(node_environment, "content_version",
+                                            "catalogs.node_environment"),
+                             "catalogs.node_environment.content_version"),
               core::ContentDigest(require_string(
                   require_member(node_environment, "catalog_digest",
                                  "catalogs.node_environment"),
@@ -1847,10 +1830,11 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
       applicability.value().external_resources,
       std::move(assistant),
       std::move(runtime_contract_requirements),
+      applicability.value().stop_timing_parameters,
   };
 }
 
-}  // namespace
+} // namespace
 
 namespace detail {
 
@@ -1858,7 +1842,7 @@ std::string_view flattened_model_product_contract_id() noexcept {
   return kFlattenedModelContractId;
 }
 
-const core::ProductContractRevision&
+const core::ProductContractRevision &
 flattened_model_product_contract_revision() {
   return qualified_product_contract_state(
              kFlattenedModelContractId,
@@ -1872,7 +1856,7 @@ flattened_model_product_artifact_roles() noexcept {
   return kFlattenedModelArtifactRoles;
 }
 
-const CanonicalValue& flattened_model_product_contract_descriptor() {
+const CanonicalValue &flattened_model_product_contract_descriptor() {
   return qualified_product_contract_state(
              kFlattenedModelContractId,
              core::RetainedProductKind::kPlanningCollisionModel,
@@ -1884,11 +1868,9 @@ std::string_view viewer_model_product_contract_id() noexcept {
   return kViewerModelContractId;
 }
 
-const core::ProductContractRevision&
-viewer_model_product_contract_revision() {
+const core::ProductContractRevision &viewer_model_product_contract_revision() {
   return qualified_product_contract_state(
-             kViewerModelContractId,
-             core::RetainedProductKind::kViewerModel,
+             kViewerModelContractId, core::RetainedProductKind::kViewerModel,
              kViewerModelPlacement, kViewerModelArtifactRoles)
       .revision;
 }
@@ -1898,10 +1880,9 @@ viewer_model_product_artifact_roles() noexcept {
   return kViewerModelArtifactRoles;
 }
 
-const CanonicalValue& viewer_model_product_contract_descriptor() {
+const CanonicalValue &viewer_model_product_contract_descriptor() {
   return qualified_product_contract_state(
-             kViewerModelContractId,
-             core::RetainedProductKind::kViewerModel,
+             kViewerModelContractId, core::RetainedProductKind::kViewerModel,
              kViewerModelPlacement, kViewerModelArtifactRoles)
       .descriptor;
 }
@@ -1936,7 +1917,7 @@ std::string_view reference_runtime_product_contract_id() noexcept {
   return kReferenceRuntimeProductContractId;
 }
 
-const core::ProductContractRevision&
+const core::ProductContractRevision &
 reference_runtime_product_contract_revision() {
   return qualified_product_contract_state(
              kReferenceRuntimeProductContractId,
@@ -1950,7 +1931,7 @@ reference_runtime_product_artifact_roles() noexcept {
   return kReferenceRuntimeArtifactRoles;
 }
 
-const CanonicalValue& reference_runtime_product_contract_descriptor() {
+const CanonicalValue &reference_runtime_product_contract_descriptor() {
   return qualified_product_contract_state(
              kReferenceRuntimeProductContractId,
              core::RetainedProductKind::kRuntimeUnitConfiguration,
@@ -1984,8 +1965,7 @@ const CanonicalValue &native_execution_runtime_product_contract_descriptor() {
       .descriptor;
 }
 
-std::string_view
-ros2_control_execution_runtime_product_contract_id() noexcept {
+std::string_view ros2_control_execution_runtime_product_contract_id() noexcept {
   return kRos2ControlExecutionRuntimeProductContractId;
 }
 
@@ -2018,12 +1998,11 @@ std::string_view composed_model_symbol_role_map_product_contract_id() noexcept {
   return kComposedModelSymbolRoleMapContractId;
 }
 
-const core::ProductContractRevision&
+const core::ProductContractRevision &
 composed_model_symbol_role_map_product_contract_revision() {
   return qualified_product_contract_state(
              kComposedModelSymbolRoleMapContractId,
-             core::RetainedProductKind::kSymbolRoleMap,
-             kSymbolRoleMapPlacement,
+             core::RetainedProductKind::kSymbolRoleMap, kSymbolRoleMapPlacement,
              kComposedModelSymbolRoleMapArtifactRoles)
       .revision;
 }
@@ -2033,12 +2012,11 @@ composed_model_symbol_role_map_product_artifact_roles() noexcept {
   return kComposedModelSymbolRoleMapArtifactRoles;
 }
 
-const CanonicalValue&
+const CanonicalValue &
 composed_model_symbol_role_map_product_contract_descriptor() {
   return qualified_product_contract_state(
              kComposedModelSymbolRoleMapContractId,
-             core::RetainedProductKind::kSymbolRoleMap,
-             kSymbolRoleMapPlacement,
+             core::RetainedProductKind::kSymbolRoleMap, kSymbolRoleMapPlacement,
              kComposedModelSymbolRoleMapArtifactRoles)
       .descriptor;
 }
@@ -2050,17 +2028,15 @@ composed_model_symbol_role_map_product_contract_descriptor() {
 void require_retained_portable_identity(std::string_view value,
                                         std::string_view field) {
   if (!is_portable_identity(value)) {
-    fail_retained_bundle(
-        std::string(field) +
-        " must use the portable 1..128-byte identity grammar");
+    fail_retained_bundle(std::string(field) +
+                         " must use the portable 1..128-byte identity grammar");
   }
 }
 
 void require_retained_digest(std::string_view value, std::string_view field) {
   if (!is_sha256_digest(value)) {
-    fail_retained_bundle(
-        std::string(field) +
-        " must be an exact lowercase sha256:<64 hex> digest");
+    fail_retained_bundle(std::string(field) +
+                         " must be an exact lowercase sha256:<64 hex> digest");
   }
 }
 
@@ -2090,9 +2066,9 @@ std::string retained_digest_from_hex(std::string_view hex) {
   return std::string(kDigestPrefix) + std::string(hex);
 }
 
-std::optional<std::string_view> retained_raw_key_hex(
-    const core::ContentAddressedStoreKey& key,
-    const core::ContentDigest& expected_digest) noexcept {
+std::optional<std::string_view>
+retained_raw_key_hex(const core::ContentAddressedStoreKey &key,
+                     const core::ContentDigest &expected_digest) noexcept {
   const auto hex = retained_digest_hex(expected_digest.value());
   if (!hex.has_value() ||
       key.value() != std::string(kStoreKeyPrefix) + std::string(*hex)) {
@@ -2102,7 +2078,7 @@ std::optional<std::string_view> retained_raw_key_hex(
 }
 
 void require_current_retained_product_conformance(
-    const core::RetainedProductDTO& product) {
+    const core::RetainedProductDTO &product) {
   require_retained_portable_identity(product.product_id.value(), "product_id");
   std::span<const QualifiedRetainedProductArtifactRole> artifact_roles;
   if (product.product_contract_id.value() == kFlattenedModelContractId &&
@@ -2130,13 +2106,12 @@ void require_current_retained_product_conformance(
              product.product_kind ==
                  core::RetainedProductKind::kSymbolRoleMap) {
     artifact_roles = kComposedModelSymbolRoleMapArtifactRoles;
-  } else if (
-      product.product_contract_id.value() ==
-          kReferenceRuntimeProductContractId &&
-      product.product_contract_revision ==
-          reference_runtime_product_contract_revision() &&
-      product.product_kind ==
-          core::RetainedProductKind::kRuntimeUnitConfiguration) {
+  } else if (product.product_contract_id.value() ==
+                 kReferenceRuntimeProductContractId &&
+             product.product_contract_revision ==
+                 reference_runtime_product_contract_revision() &&
+             product.product_kind ==
+                 core::RetainedProductKind::kRuntimeUnitConfiguration) {
     artifact_roles = kReferenceRuntimeArtifactRoles;
   } else if (product.product_contract_id.value() ==
                  kNativeExecutionRuntimeProductContractId &&
@@ -2162,7 +2137,7 @@ void require_current_retained_product_conformance(
 
   std::set<std::string> present_roles;
   std::string previous_role;
-  for (const auto& artifact : product.artifact_refs) {
+  for (const auto &artifact : product.artifact_refs) {
     require_retained_portable_identity(artifact.artifact_role_id.value(),
                                        "artifact_role_id");
     if (!previous_role.empty() &&
@@ -2173,7 +2148,7 @@ void require_current_retained_product_conformance(
     previous_role = artifact.artifact_role_id.value();
     const auto expected = std::find_if(
         artifact_roles.begin(), artifact_roles.end(),
-        [&artifact](const QualifiedRetainedProductArtifactRole& role) {
+        [&artifact](const QualifiedRetainedProductArtifactRole &role) {
           return role.artifact_role_id == artifact.artifact_role_id.value();
         });
     if (expected == artifact_roles.end()) {
@@ -2184,12 +2159,10 @@ void require_current_retained_product_conformance(
       fail_retained_bundle(
           "retained artifact media type does not match its contract");
     }
-    require_retained_digest(artifact.content_digest.value(),
-                            "content_digest");
+    require_retained_digest(artifact.content_digest.value(), "content_digest");
     if (artifact.content_addressed_store_key.value() !=
         retained_store_key_for_digest(artifact.content_digest.value())) {
-      fail_retained_bundle(
-          "retained artifact store key is not digest-derived");
+      fail_retained_bundle("retained artifact store key is not digest-derived");
     }
     if (artifact.byte_size > detail::kMaximumIJsonInteger) {
       fail_retained_bundle(
@@ -2197,7 +2170,7 @@ void require_current_retained_product_conformance(
     }
     present_roles.insert(artifact.artifact_role_id.value());
   }
-  for (const auto& expected : artifact_roles) {
+  for (const auto &expected : artifact_roles) {
     if (expected.required &&
         !present_roles.contains(std::string(expected.artifact_role_id))) {
       fail_retained_bundle(
@@ -2207,11 +2180,11 @@ void require_current_retained_product_conformance(
 }
 
 CanonicalValue
-retained_product_projection(const core::RetainedProductDTO& product) {
+retained_product_projection(const core::RetainedProductDTO &product) {
   require_current_retained_product_conformance(product);
   CanonicalValue::Array artifacts;
   artifacts.reserve(product.artifact_refs.size());
-  for (const auto& artifact : product.artifact_refs) {
+  for (const auto &artifact : product.artifact_refs) {
     artifacts.push_back(retained_artifact_projection(artifact));
   }
   return CanonicalValue(CanonicalValue::Object{
@@ -2227,7 +2200,7 @@ retained_product_projection(const core::RetainedProductDTO& product) {
 }
 
 core::ContentDigest
-retained_product_output_digest(const core::RetainedProductDTO& product) {
+retained_product_output_digest(const core::RetainedProductDTO &product) {
   return core::ContentDigest(domain_separated_canonical_digest(
       kRetainedProductOutputDomain, kRetainedProductSchemaTag,
       retained_product_projection(product)));
@@ -2235,23 +2208,22 @@ retained_product_output_digest(const core::RetainedProductDTO& product) {
 
 std::shared_ptr<const RetainedBundle>
 RetainedBundleConstructionAuthority::construct(
-    core::RetainedBundleId retained_bundle_id,
-    core::RetainedBundleDTO value, CanonicalValue normalized_root,
-    std::string canonical_bytes) {
+    core::RetainedBundleId retained_bundle_id, core::RetainedBundleDTO value,
+    CanonicalValue normalized_root, std::string canonical_bytes) {
   return std::shared_ptr<const RetainedBundle>(new RetainedBundle(
       std::move(retained_bundle_id), std::move(value),
       std::move(normalized_root), std::move(canonical_bytes)));
 }
 
-}  // namespace detail
+} // namespace detail
 
-bool verify_retained_bundle_identity(const RetainedBundle& bundle) {
+bool verify_retained_bundle_identity(const RetainedBundle &bundle) {
   try {
     const core::RetainedBundleDTO parsed =
         verify_current_retained_bundle_projection(bundle.normalized_root());
-    const CanonicalValue* declared_id =
+    const CanonicalValue *declared_id =
         bundle.normalized_root().find_object_member("retained_bundle_id");
-    const auto* declared_id_string =
+    const auto *declared_id_string =
         declared_id == nullptr
             ? nullptr
             : std::get_if<std::string>(&declared_id->storage());
@@ -2270,7 +2242,7 @@ bool verify_retained_bundle_identity(const RetainedBundle& bundle) {
       return false;
     }
     return true;
-  } catch (const std::exception&) {
+  } catch (const std::exception &) {
     return false;
   }
 }
@@ -2288,8 +2260,7 @@ detail::RetainedBundleReloadAuthority::reload(
     }
     core::RetainedBundleDTO value =
         verify_current_retained_bundle_projection(root);
-    const core::RetainedBundleId retained_bundle_id =
-        value.retained_bundle_id;
+    const core::RetainedBundleId retained_bundle_id = value.retained_bundle_id;
     auto bundle = RetainedBundleConstructionAuthority::construct(
         retained_bundle_id, std::move(value), std::move(root),
         std::string(canonical_bytes));
@@ -2299,19 +2270,19 @@ detail::RetainedBundleReloadAuthority::reload(
           "identity");
     }
     return bundle;
-  } catch (const CanonicalValueError& error) {
+  } catch (const CanonicalValueError &error) {
     fail_retained_bundle(
         std::string("retained-bundle repository bytes are invalid: ") +
         error.what());
-  } catch (const ArtifactCodecError& error) {
+  } catch (const ArtifactCodecError &error) {
     fail_retained_bundle(
         std::string("retained-bundle repository bytes are invalid: ") +
         error.what());
-  } catch (const CellGraphCodecError& error) {
+  } catch (const CellGraphCodecError &error) {
     fail_retained_bundle(
         std::string("retained-bundle repository bytes are invalid: ") +
         error.what());
   }
 }
 
-}  // namespace manyforge::deployment
+} // namespace manyforge::deployment

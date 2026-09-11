@@ -45,7 +45,7 @@ template <typename Value>
               BinaryString(configuration.active_configuration_id.value()) +
               sizeof(std::uint64_t);
   }
-  result += 2U;
+  result += 3U;
   if (intent.program_cycle_evidence.has_value()) {
     result += BinaryString(
                   intent.program_cycle_evidence->draft_program_revision.value()) +
@@ -61,6 +61,13 @@ template <typename Value>
     if (evidence.parent_program_cycle_claim_generation.has_value()) {
       result += sizeof(std::uint64_t);
     }
+  }
+  if (intent.program_node_evidence.has_value()) {
+    const auto& evidence = *intent.program_node_evidence;
+    result += BinaryString(evidence.program_runner_owner_epoch.value()) +
+              BinaryString(evidence.program_run_id.value()) + sizeof(std::uint64_t) +
+              BinaryString(evidence.node_instance_id) + BinaryString(evidence.node_attempt_id) +
+              BinaryString(evidence.owner_api);
   }
   return result;
 }
@@ -275,6 +282,18 @@ Result<void> ValidateCellAdmissionScope(const CellAdmissionScopeDTO& scope) {
   return Result<void>::Ok();
 }
 
+bool ProgramNodeAdmissionEvidenceDTO::locally_valid() const noexcept {
+  return BoundedIdentity(program_runner_owner_epoch.value()) &&
+         BoundedIdentity(program_run_id.value()) &&
+         parent_program_cycle_claim_generation.nonzero() &&
+         parent_program_cycle_claim_generation.value() <= kMaximumSafeCounter &&
+         BoundedIdentity(node_instance_id) && !node_attempt_id.empty() &&
+         node_attempt_id.size() <= 512U && node_instance_id.find('\0') == std::string::npos &&
+         node_attempt_id.find('\0') == std::string::npos &&
+         (owner_api == "scene.transaction" || owner_api == "scene.carried_attachment" ||
+          owner_api == "cclc.lifecycle" || owner_api == "cclc.control_route");
+}
+
 Result<void> ValidateCellAdmissionClaimIntent(const CellAdmissionClaimIntentDTO& intent) {
   if (to_string(intent.claim_kind).empty() || to_string(intent.owner_role).empty() ||
       !OwnerMatchesKind(intent.claim_kind, intent.owner_role) ||
@@ -289,9 +308,10 @@ Result<void> ValidateCellAdmissionClaimIntent(const CellAdmissionClaimIntentDTO&
   if (!scope.ok()) {
     return scope;
   }
-  const bool intervention =
-      intent.claim_kind == CellAdmissionClaimKindDTO::kInterventionOrRecovery;
-  if (intervention != intent.intervention_evidence.has_value()) {
+  const bool intervention = intent.claim_kind == CellAdmissionClaimKindDTO::kInterventionOrRecovery;
+  const bool held_manual = intent.claim_kind == CellAdmissionClaimKindDTO::kManualOperation &&
+                           intent.intervention_evidence.has_value();
+  if ((intervention || held_manual) != intent.intervention_evidence.has_value()) {
     return Invalid<void>("intervention_evidence_presence_invalid");
   }
   const bool program_cycle = intent.claim_kind == CellAdmissionClaimKindDTO::kProgramCycle;
@@ -311,6 +331,26 @@ Result<void> ValidateCellAdmissionClaimIntent(const CellAdmissionClaimIntentDTO&
         (evidence.parent_program_cycle_claim_generation.has_value() &&
          !evidence.parent_program_cycle_claim_generation->nonzero())) {
       return Invalid<void>("intervention_evidence_invalid");
+    }
+    if (held_manual &&
+        (evidence.offering_owner_role != CellAdmissionOwnerRoleDTO::kManualOperationOwner ||
+         evidence.offering_owner_epoch != intent.owner_epoch ||
+         evidence.offer_transaction_id != intent.owner_transaction_id ||
+         !evidence.parent_program_cycle_claim_generation || intent.scope.resources.empty())) {
+      return Invalid<void>("manual_handover_evidence_invalid");
+    }
+  }
+  if (intent.program_node_evidence.has_value()) {
+    const auto& evidence = *intent.program_node_evidence;
+    const bool scene = intent.claim_kind == CellAdmissionClaimKindDTO::kAuthoredScene &&
+                       (evidence.owner_api == "scene.transaction" ||
+                        evidence.owner_api == "scene.carried_attachment");
+    const bool lifecycle =
+        intent.claim_kind == CellAdmissionClaimKindDTO::kComponentLifecycle &&
+        (evidence.owner_api == "cclc.lifecycle" || evidence.owner_api == "cclc.control_route");
+    if ((!scene && !lifecycle) || intent.program_cycle_evidence.has_value() ||
+        intent.intervention_evidence.has_value() || !evidence.locally_valid()) {
+      return Invalid<void>("program_node_evidence_invalid");
     }
   }
   return Result<void>::Ok();
@@ -646,7 +686,7 @@ Result<ContentDigest> CellAdmissionClaimIntentDigest(const CellAdmissionClaimInt
          CanonicalValue(intent.program_cycle_evidence->draft_program_revision.value())},
     });
   }
-  const CanonicalValue value(CanonicalValue::Object{
+  CanonicalValue::Object fields{
       {"claim_kind", CanonicalValue(std::string(to_string(intent.claim_kind)))},
       {"expected_admission_generation",
        CanonicalValue(static_cast<double>(intent.expected_admission_generation.value()))},
@@ -658,7 +698,25 @@ Result<ContentDigest> CellAdmissionClaimIntentDigest(const CellAdmissionClaimInt
       {"request_id", CanonicalValue(intent.request_id.value())},
       {"request_payload_digest", CanonicalValue(intent.request_payload_digest.value())},
       {"scope", ScopeValue(intent.scope)},
-  });
+  };
+  // Preserve existing claim identities on journal migration. New attribution
+  // is identity-bearing only when present; it cannot be removed on replay.
+  if (intent.program_node_evidence.has_value()) {
+    const auto& evidence = *intent.program_node_evidence;
+    fields.emplace_back("program_node_evidence",
+                        CanonicalValue(CanonicalValue::Object{
+                            {"program_runner_owner_epoch",
+                             CanonicalValue(evidence.program_runner_owner_epoch.value())},
+                            {"program_run_id", CanonicalValue(evidence.program_run_id.value())},
+                            {"parent_program_cycle_claim_generation",
+                             CanonicalValue(static_cast<double>(
+                                 evidence.parent_program_cycle_claim_generation.value()))},
+                            {"node_instance_id", CanonicalValue(evidence.node_instance_id)},
+                            {"node_attempt_id", CanonicalValue(evidence.node_attempt_id)},
+                            {"owner_api", CanonicalValue(evidence.owner_api)},
+                        }));
+  }
+  const CanonicalValue value(std::move(fields));
   return Result<ContentDigest>::Ok(ContentDigest(content_identity::framed_sha256(
       "cell-admission-claim-intent-digest", "1.0", value)));
 }

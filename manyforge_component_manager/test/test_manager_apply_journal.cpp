@@ -2042,6 +2042,110 @@ TEST(ManagerApplyRuntimeJournal,
 }
 
 TEST(ManagerApplyRuntimeJournal,
+     RetainsExactPredecessorWithdrawalAcrossRestart) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "withdrawal.sqlite3";
+  std::optional<PersistedManagerApplyRuntimeStagedReady> expected;
+  std::optional<PersistedManagerApplySceneStaged> expected_scene;
+  {
+    SqliteManagerApplyJournal journal(path, CellId("cell-1"));
+    const auto accepted = EnsureAcceptedApply(journal);
+    auto intent = RuntimeIntent(accepted.acceptance.acceptance_digest);
+    intent.runtime_units.front().candidate_disposition =
+        RuntimeUnitCandidateDisposition::kRetainedExact;
+    const auto durable = journal.EnsureRuntimeConvergenceIntent(
+        accepted.intent.intent_digest, intent);
+    auto ready = RuntimeStagedReady(
+        durable.record.runtime_convergence_intent_digest, 1U);
+    auto &row = ready.runtime_units.front();
+    row.candidate_disposition = RuntimeUnitCandidateDisposition::kRetainedExact;
+    row.predecessor_withdrawal = core::ManagedRuntimeWithdrawalDTO{
+        ready.apply_id,
+        ready.apply_generation,
+        ready.runtime_convergence_intent_digest,
+        row.runtime_unit_id,
+        RuntimeEpoch("retired-native-epoch"),
+        ContentDigest(std::string(kDigestTwo)),
+        ContentDigest(std::string(kDigestOne)),
+        "supervisor-before-restart",
+        12U};
+    ASSERT_TRUE(ready.valid());
+    const auto reject = [&](const auto &mutate) {
+      auto bad = ready;
+      mutate(bad.runtime_units.front());
+      EXPECT_FALSE(bad.valid());
+      EXPECT_THROW(static_cast<void>(journal.EnsureRuntimeStagedReady(bad)),
+                   std::invalid_argument);
+    };
+    reject([](auto &bad) {
+      bad.predecessor_withdrawal->process_observation_sequence = 0U;
+    });
+    reject([](auto &bad) {
+      bad.predecessor_withdrawal->apply_id = ApplyId("other-apply");
+    });
+    reject([](auto &bad) {
+      bad.predecessor_withdrawal->apply_generation = ApplyGeneration(2U);
+    });
+    reject([](auto &bad) {
+      bad.predecessor_withdrawal->runtime_convergence_intent_digest =
+          ContentDigest(std::string(kDigestOne));
+    });
+    reject([](auto &bad) {
+      bad.predecessor_withdrawal->runtime_unit_id =
+          RuntimeUnitId("other-runtime");
+    });
+    reject([](auto &bad) {
+      bad.predecessor_withdrawal->runtime_epoch = bad.runtime_epoch;
+    });
+    reject([](auto &bad) {
+      bad.candidate_disposition = RuntimeUnitCandidateDisposition::kAdded;
+    });
+    reject([](auto &bad) {
+      bad.lifecycle_control = core::RuntimeLifecycleControl::kExternallyManaged;
+    });
+    expected = journal.EnsureRuntimeStagedReady(ready).record;
+    EXPECT_EQ(journal.EnsureRuntimeStagedReady(ready).record, expected);
+    auto scene_intent = SceneStageIntent(expected->staged_ready_digest);
+    auto &removed = scene_intent.native_transition_rows.back();
+    removed.native_runtime_binding.runtime_epoch =
+        row.predecessor_withdrawal->runtime_epoch;
+    removed.managed_withdrawal = row.predecessor_withdrawal;
+    auto foreign = scene_intent;
+    foreign.native_transition_rows.back()
+        .managed_withdrawal->process_observation_sequence++;
+    EXPECT_THROW(static_cast<void>(journal.EnsureSceneStageIntent(foreign)),
+                 ManagerApplyJournalConflictError);
+    const auto staged_intent = journal.EnsureSceneStageIntent(scene_intent);
+    auto scene = SceneStaged(staged_intent.record.scene_stage_intent_digest);
+    auto &retired =
+        scene.staged_result.transition_evidence->transition_rows.back();
+    retired.transition_row = removed;
+    retired.state = ProjectionTransitionRowEvidenceState::kRemovedRetired;
+    retired.observed_local_active.reset();
+    retired.resulting_health.reset();
+    ASSERT_TRUE(scene.valid());
+    expected_scene = journal.EnsureSceneStaged(scene).record;
+  }
+  SqliteManagerApplyJournal reopened(path, CellId("cell-1"));
+  EXPECT_EQ(reopened.ReadLatestRuntimeStagedReady(ApplyId("apply-1"),
+                                                  ApplyGeneration(1U)),
+            expected);
+  EXPECT_EQ(reopened.VerifyIntegrity().runtime_staged_ready_count, 1);
+  const auto scene =
+      reopened.ReadSceneStaged(ApplyId("apply-1"), ApplyGeneration(1U));
+  ASSERT_TRUE(scene);
+  EXPECT_EQ(scene->scene_staged_digest, expected_scene->scene_staged_digest);
+  const auto &retired = scene->scene_staged.staged_result.transition_evidence
+                            ->transition_rows.back();
+  EXPECT_EQ(
+      retired.transition_row.managed_withdrawal,
+      expected->staged_ready.runtime_units.front().predecessor_withdrawal);
+  EXPECT_FALSE(retired.resulting_health);
+  EXPECT_EQ(retired.state,
+            ProjectionTransitionRowEvidenceState::kRemovedRetired);
+}
+
+TEST(ManagerApplyRuntimeJournal,
      RequiresAcceptedParentAndRejectsConflictingReplay) {
   TemporaryDirectory directory;
   SqliteManagerApplyJournal journal(directory.path() / "runtime.sqlite3",
@@ -2241,8 +2345,8 @@ TEST(ManagerApplySceneJournal,
       row.acknowledged_staged_candidate_revision->graph_revision =
           GraphRevision("candidate-graph-other");
     }
-    if (row.resulting_health.staged_candidate.has_value()) {
-      row.resulting_health.staged_candidate->candidate_projection_revision
+    if (row.resulting_health->staged_candidate.has_value()) {
+      row.resulting_health->staged_candidate->candidate_projection_revision
           .graph_revision = GraphRevision("candidate-graph-other");
     }
   }

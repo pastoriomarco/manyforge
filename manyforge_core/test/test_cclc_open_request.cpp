@@ -52,8 +52,8 @@ using content_identity::CanonicalValue;
       {"request_context", ContextValue("request.lifecycle.1")}});
 }
 
-[[nodiscard]] CanonicalValue RouteIntentValue() {
-  return CanonicalValue(CanonicalValue::Object{
+[[nodiscard]] CanonicalValue RouteIntentValue(bool admission = true) {
+  CanonicalValue::Object fields{
       {"component_expectations",
        CanonicalValue(CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
            {"controllable_component_id", CanonicalValue("component.arm")},
@@ -75,7 +75,9 @@ using content_identity::CanonicalValue;
        CanonicalValue(CanonicalValue::Object{{"presence", CanonicalValue("absent")}})},
       {"expected_graph_revision", CanonicalValue("graph.revision.1")},
       {"expected_retained_bundle_id", CanonicalValue("bundle.1")},
-      {"request_context", ContextValue("request.route.1")}});
+      {"request_context", ContextValue("request.route.1")}};
+  if (admission) fields.emplace_back("expected_admission_generation", CanonicalValue(9.0));
+  return CanonicalValue(std::move(fields));
 }
 
 [[nodiscard]] const CanonicalValue& Member(const CanonicalValue& value,
@@ -133,8 +135,15 @@ class FakeOpenPort final : public ICCLCOpenRequestPort {
     return Result<std::optional<RouteSelectionStatusDTO>>::Ok(std::nullopt);
   }
 
+  Result<std::optional<CCLCRouteSelectionRequestResultDTO>> ReadRouteSelectionRequestResult(
+      const RouteSelectionIntentDTO& intent) override {
+    route_result_intent = intent;
+    return Result<std::optional<CCLCRouteSelectionRequestResultDTO>>::Ok(std::nullopt);
+  }
+
   std::optional<ComponentLifecycleIntentDTO> lifecycle_intent;
   std::optional<RouteSelectionIntentDTO> route_intent;
+  std::optional<RouteSelectionIntentDTO> route_result_intent;
   std::optional<LifecycleTransactionId> lifecycle_status_id;
   std::optional<RouteSelectionTransactionId> route_status_id;
   mutable std::optional<ControllableComponentId> component_id_read;
@@ -179,6 +188,7 @@ TEST(CCLCOpenRequest, PreservesCompleteRouteIntentAndReturnsBoundedAdmissionFact
       {RequestTransportDTO::kRos, RequestAssuranceDTO::kUnverified, std::nullopt});
   ASSERT_TRUE(result.ok()) << result.error().message;
   ASSERT_TRUE(port.route_intent.has_value());
+  EXPECT_EQ(port.route_intent->expected_admission_generation, AdmissionGeneration(9U));
   EXPECT_EQ(port.route_intent->attribution.transport, RequestTransportDTO::kRos);
   EXPECT_EQ(port.route_intent->desired_configuration.control_domain_id,
             ControlDomainId("domain.arm"));
@@ -187,10 +197,20 @@ TEST(CCLCOpenRequest, PreservesCompleteRouteIntentAndReturnsBoundedAdmissionFact
   const auto response = content_identity::parse_canonical_json(result.value());
   EXPECT_TRUE(Member(response, "ok").as_bool());
   EXPECT_EQ(Member(Member(response, "result"), "replay_status").as_string(), "request_ledger_full");
+  EXPECT_EQ(Member(response, "result").as_object().size(), 3U);
+  EXPECT_EQ(Member(response, "result").find_object_member("rejection"), nullptr);
 }
 
 TEST(CCLCOpenRequest, StatusAndSnapshotReadsCarryNoClientOwnedTruth) {
   FakeOpenPort port;
+  const auto original = ExecuteCanonicalCCLCOpenRequest(
+      Request("route_request_result", RouteIntentValue(false)), port, {});
+  ASSERT_TRUE(original.ok());
+  EXPECT_TRUE(Member(content_identity::parse_canonical_json(original.value()), "result").is_null());
+  ASSERT_TRUE(port.route_result_intent);
+  EXPECT_FALSE(port.route_result_intent->expected_admission_generation);
+  EXPECT_EQ(port.route_result_intent->request_context.request_id, RequestId("request.route.1"));
+  EXPECT_FALSE(port.route_intent);  // No submit/admission call during observation.
   const auto lifecycle = ExecuteCanonicalCCLCOpenRequest(
       Request("lifecycle_status",
               CanonicalValue(CanonicalValue::Object{

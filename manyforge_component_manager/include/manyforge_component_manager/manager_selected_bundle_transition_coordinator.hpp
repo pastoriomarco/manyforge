@@ -75,25 +75,30 @@ struct ManagerSelectedBundleTransitionResult final {
 /// authoritative durable head/scene status before retrying that exact effect.
 class ManagerSelectedBundleTransitionCoordinator final {
  public:
-  ManagerSelectedBundleTransitionCoordinator(
-      SqliteManagerApplyJournal& apply_journal,
-      const manyforge::deployment::IVerifiedRetainedBundleSource& retained_bundle_source,
-      manyforge::core::IActiveBundlePublicationStore& publication_store,
-      manyforge::core::IManagerSceneProjectionHandoffPort& scene_owner);
+   ManagerSelectedBundleTransitionCoordinator(
+       SqliteManagerApplyJournal &apply_journal,
+       const manyforge::deployment::IVerifiedRetainedBundleSource
+           &retained_bundle_source,
+       manyforge::core::IActiveBundlePublicationStore &publication_store,
+       manyforge::core::IManagerSceneProjectionHandoffPort &scene_owner,
+       const manyforge::deployment::IVerifiedRetainedProductArtifactSource
+           *artifact_source = nullptr);
 
-  [[nodiscard]] ManagerSelectedBundleTransitionResult AdvanceOrRecover(
-      const manyforge::core::ApplyId& apply_id, manyforge::core::ApplyGeneration apply_generation);
+   [[nodiscard]] ManagerSelectedBundleTransitionResult
+   AdvanceOrRecover(const manyforge::core::ApplyId &apply_id,
+                    manyforge::core::ApplyGeneration apply_generation);
 
-  ManagerSelectedBundleTransitionCoordinator(const ManagerSelectedBundleTransitionCoordinator&) =
-      delete;
-  ManagerSelectedBundleTransitionCoordinator& operator=(
-      const ManagerSelectedBundleTransitionCoordinator&) = delete;
+   ManagerSelectedBundleTransitionCoordinator(
+       const ManagerSelectedBundleTransitionCoordinator &) = delete;
+   ManagerSelectedBundleTransitionCoordinator &
+   operator=(const ManagerSelectedBundleTransitionCoordinator &) = delete;
 
  private:
   SqliteManagerApplyJournal& apply_journal_;
   const manyforge::deployment::IVerifiedRetainedBundleSource& retained_bundle_source_;
   manyforge::core::IActiveBundlePublicationStore& publication_store_;
   manyforge::core::IManagerSceneProjectionHandoffPort& scene_owner_;
+  const manyforge::deployment::IVerifiedRetainedProductArtifactSource* artifact_source_;
   std::mutex operation_mutex_;
 };
 

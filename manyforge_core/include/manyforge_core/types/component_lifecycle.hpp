@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <manyforge_core/types/active_bundle_publication.hpp>
 #include <manyforge_core/types/active_control_configuration.hpp>
+#include <manyforge_core/types/cell_admission.hpp>
 #include <manyforge_core/types/configuration_fence.hpp>
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/stop_certificate.hpp>
@@ -272,6 +273,7 @@ struct ComponentLifecycleIntentDTO final {
   std::optional<std::string> reason;
   RequestAttributionDTO attribution{};
   AdmissionGeneration expected_admission_generation{1U};
+  std::optional<ProgramNodeAdmissionEvidenceDTO> program_node_evidence{};
 
   [[nodiscard]] bool locally_valid() const noexcept;
   [[nodiscard]] bool replay_equal(const ComponentLifecycleIntentDTO& other) const noexcept;
